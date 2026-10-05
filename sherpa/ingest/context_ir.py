@@ -1,11 +1,10 @@
-"""Evidence IRから検索用の文書・領域・record文脈を決定的に組み立てる。
+"""Evidence IR から検索用の文書・領域・record 文脈（Context IR）を決定的に組み立てる。
 
-Evidence IRは原値と原本位置の証拠であり、このmoduleはそれを変更しない。XLSXでは横方向の
-結合見出しから論理領域を分け、DOCXでは見出し階層と表境界、PPTXではslideとgraphicFrame境界を保つ。各形式で領域ごとのheader row、
-header path、業務record keyを推定する。曖昧な小表はheaderを断定せず``coordinate_fallback``へ縮退する。
-
-全cellを別objectへ複製すると巨大表でmemoryを再び増幅するため、Context IRが保持するのは領域定義と
-row単位のrecord metadataだけである。field本体はrendererがEvidence elementを参照する。
+Evidence IR（原値と原本位置の証拠）は変更しない。XLSX は横方向の結合見出しで論理領域を分け、
+DOCX は見出し階層と表境界、PPTX は slide と graphicFrame 境界を保つ。領域ごとに header row・header path・
+業務 record key を推定し、曖昧な小表は header を断定せず ``coordinate_fallback`` へ縮退する。
+Context IR が持つのは領域定義と row 単位の record metadata だけで、field 本体は renderer が Evidence element を参照する。
+設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
 """
 from __future__ import annotations
 
@@ -29,8 +28,7 @@ PDF_CONTEXT_ANALYZER_VERSION = "pdf-context-rules-v1"
 IDENTIFIER_ROLE_ANALYZER_VERSION = "identifier-role-rules-v1"
 IDENTIFIER_METADATA_SCHEMA_VERSION = "identifier-metadata-v1"
 IDENTIFIER_MAX_CHARS = 256
-# Elasticsearchのnested object数とretrieval時の監査量を、原本サイズに依存せず有界にする。
-# 値を変える場合はRAG signature/index contractも変わるため、既存世代へ混在させない。
+# ES の nested object 数と検索時の監査量を有界にする上限（値を変えると RAG signature/index contract が変わる）
 IDENTIFIER_MAX_MENTIONS_PER_CHUNK = 128
 _KEY_WORDS = ("id", "コード", "番号", "連番", "キー", "no", "ｎｏ")
 _ID_RE = re.compile(r"^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_.:/-]{3,}$")
@@ -69,9 +67,8 @@ class RecordKey:
 class IdentifierMention:
     """原本上の識別子出現と、その根拠付き役割。
 
-    ``value`` は原値の部分文字列を一切変更しない。``normalized_value`` は候補検索専用であり、
-    回答支持の完全一致判定には使ってはならない。明示的なfield labelやinline markerのない
-    出現は推測でidentityへ上げず``unclassified``とする。
+    ``value`` は原値のまま。``normalized_value`` は候補検索専用で、回答支持の完全一致判定には使わない。
+    明示的な field label や inline marker のない出現は ``unclassified`` とする。
     """
 
     value: str
@@ -86,7 +83,7 @@ class IdentifierMention:
 
 @dataclass(frozen=True)
 class IdentifierMentionBatch:
-    """有界に保持した識別子出現と、保持しなかった件数を分離する。"""
+    """有界に保持した識別子出現と、保持しなかった件数を分けて持つ。"""
 
     mentions: tuple[IdentifierMention, ...]
     mention_count: int
@@ -149,9 +146,6 @@ class ContextIR:
     element_sections: dict[str, tuple[str, ...]] = field(default_factory=dict)
     element_identifier_mentions: dict[str, tuple[IdentifierMention, ...]] = field(default_factory=dict)
 
-    def records_by_region_row(self) -> dict[tuple[str, int], ContextRecord]:
-        return {(record.region_id, record.row): record for record in self.records}
-
 
 def _stable_id(prefix: str, *parts: Any) -> str:
     raw = json.dumps(parts, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -167,12 +161,12 @@ def _text(value: Any) -> str:
 
 
 def normalize_identifier_candidate(value: str) -> str:
-    """識別子候補検索用のみにNFKC/casefoldする。原値の支持判定には使わない。"""
+    """識別子候補検索用だけに NFKC/casefold する（原値の支持判定には使わない）。"""
     return unicodedata.normalize("NFKC", value).casefold()
 
 
 def _identifier_locator(locator: evidence_ir.Locator) -> dict[str, Any]:
-    """extension全体を複製せず、原本へ戻るための決定的locatorだけを保持する。"""
+    """extension 全体を複製せず、原本へ戻るための決定的 locator だけを保持する。"""
     out: dict[str, Any] = {"part": locator.part}
     for key in ("sheet", "slide", "page", "cell_range", "object_id", "bbox"):
         value = getattr(locator, key)
@@ -182,7 +176,7 @@ def _identifier_locator(locator: evidence_ir.Locator) -> dict[str, Any]:
 
 
 def _inline_reference_marker(text_before: str) -> str | None:
-    """次の候補を含む、有界なinline参照listの明示markerを返す。"""
+    """有界な inline 参照 list の明示 marker を返す。"""
     for match in reversed(list(_INLINE_REFERENCE_MARKER_RE.finditer(text_before))):
         tail = text_before[match.end():]
         if not tail:
@@ -212,7 +206,7 @@ def _identifier_role(field_label: str, text_before: str, *, allow_record_identit
         if marker in compact_label:
             return "reference", f"{IDENTIFIER_ROLE_ANALYZER_VERSION}:field_reference:{marker}"
 
-    # occurrence直前の明示markerは、周囲のidentity field labelより強い根拠である。
+    # 直前の明示 marker は、周囲の identity field label より強い根拠
     inline_marker = _inline_reference_marker(text_before)
     if inline_marker is not None:
         return "reference", f"{IDENTIFIER_ROLE_ANALYZER_VERSION}:inline_reference_marker:{inline_marker}"
@@ -244,16 +238,12 @@ def identifier_mentions_with_metadata(
 ) -> IdentifierMentionBatch:
     """原値文字列から識別子候補を抽出し、明示根拠だけで役割を付ける。
 
-    数字もseparatorも無い通常の英単語は候補にしない。一方、``P-0005``、``E-X023-01``、
-    ``ACCOUNT_NO``のような業務識別子は原表記とoffsetを保って抽出する。候補数は最後まで数えるが、
-    objectとして保持するのは``max_mentions``件までとし、超過を明示する。
-
-    ``match_start``/``match_end``を指定した場合もtoken照合は原値全体で行い、候補の開始位置で
-    対象chunkを決める。これにより巨大cellの分割境界をまたぐ識別子を失わない。
+    数字も separator も無い通常の英単語は候補にしない。候補数は最後まで数え、保持するのは ``max_mentions`` 件まで。
+    ``match_start``/``match_end`` を指定しても token 照合は原値全体で行い、候補の開始位置で対象 chunk を決める。
     """
     if isinstance(max_mentions, bool) or not isinstance(max_mentions, int) or max_mentions < 0:
         raise ValueError("max_mentions must be a non-negative integer")
-    # ``_text``のstripはheader判定には便利だが、原値内offsetをずらす。ここでは文字列原値をそのまま使う。
+    # `_text` の strip は原値内の offset をずらすため、原値文字列をそのまま使う
     text = value if isinstance(value, str) else ("" if value is None else str(value))
     range_start = 0 if match_start is None else max(0, match_start)
     range_end = len(text) if match_end is None else min(len(text), max(range_start, match_end))
@@ -275,7 +265,7 @@ def identifier_mentions_with_metadata(
         if len(mentions) >= max_mentions:
             continue
         if "/" in normalized_candidate:
-            # slashはidentifier内部文字と列挙separatorを区別できないためidentityへ昇格しない。
+            # slash は識別子内部文字と列挙 separator を区別できないため identity にしない
             role = "unclassified"
             role_basis = f"{IDENTIFIER_ROLE_ANALYZER_VERSION}:ambiguous_slash_compound"
         else:
@@ -308,7 +298,7 @@ def identifier_mentions(
     text_offset: int = 0,
     allow_record_identity: bool = False,
 ) -> tuple[IdentifierMention, ...]:
-    """互換用の有界tuple API。完全性が必要な索引生成はmetadata APIを使う。"""
+    """互換用の有界 tuple API。完全性が必要な索引生成は metadata API を使う。"""
     return identifier_mentions_with_metadata(
         value,
         field_label=field_label,
@@ -370,11 +360,7 @@ def _sheet_titles(cells: list[evidence_ir.EvidenceElement]) -> dict[str, str]:
 
 
 def _docx_outline(ir: evidence_ir.EvidenceIR) -> tuple[str | None, dict[str, tuple[str, ...]]]:
-    """DOCX bodyの物理順から、見出し階層と各要素の所属節を作る。
-
-    DrawingMLを後段で追加したobjectはbody orderと同じ座標軸を持たない。それを無理に文章の間へ
-    差し込まず、現行Document IRからadaptした本文要素だけでoutlineを確定する。
-    """
+    """DOCX body の物理順から、見出し階層と各要素の所属節を作る（現行 Document IR 由来の本文要素だけで確定する）。"""
     body = [
         element for element in ir.elements
         if element.parent_id is None
@@ -400,7 +386,7 @@ def _docx_outline(ir: evidence_ir.EvidenceIR) -> tuple[str | None, dict[str, tup
 
 
 def _pptx_titles(ir: evidence_ir.EvidenceIR) -> dict[str, str]:
-    """各slideのタイトルshapeを、原本上端の位置と名称から決定的に選ぶ。"""
+    """各 slide のタイトル shape を、原本上端の位置と名称から決定的に選ぶ。"""
     candidates: dict[int, list[tuple[float, float, int, str]]] = defaultdict(list)
     for element in ir.elements:
         if element.type != "shape" or element.extension.get("origin") == "document-ir-v2-adapter":
@@ -420,7 +406,7 @@ def _pptx_titles(ir: evidence_ir.EvidenceIR) -> dict[str, str]:
 
 
 def _pdf_titles(ir: evidence_ir.EvidenceIR) -> dict[str, str]:
-    """各page上端のpositioned textを文書タイトル候補にする。"""
+    """各 page 上端の positioned text を文書タイトル候補にする。"""
     candidates: dict[int, list[tuple[float, float, int, str]]] = defaultdict(list)
     for element in ir.elements:
         if element.type != "positioned_text" or element.locator.page is None:
@@ -434,12 +420,10 @@ def _pdf_titles(ir: evidence_ir.EvidenceIR) -> dict[str, str]:
 
 
 def _region_specs(
-    table_id: str,
     cells: list[evidence_ir.EvidenceElement],
 ) -> list[tuple[int, int, int | None, str | None]]:
     positions = [(_row_column(cell), cell) for cell in cells if _row_column(cell)[0] is not None]
     min_row = min(position[0] for position, _ in positions)
-    max_row = max(position[0] for position, _ in positions)
     min_column = min(position[1] for position, _ in positions)
     max_column = max(position[1] + _span(cell, "column_span") - 1 for position, cell in positions)
     width = max_column - min_column + 1
@@ -498,7 +482,7 @@ def _header_row(
         row_cells = [cell for cell in cells if _row_column(cell)[0] == row and _text(cell.value)]
         if not row_cells:
             continue
-        # 縦結合labelで文章を束ねる小表をheader表と誤認しない。
+        # 縦結合 label で文章を束ねる小表を header 表と誤認しない
         if any(_span(cell, "row_span") > 1 for cell in row_cells):
             continue
         texts = [_text(cell.value) for cell in row_cells]
@@ -551,7 +535,7 @@ def _header_paths(
         if title_row is not None:
             for row in range(title_row + 1, header_row):
                 value = _covering_value(cells, row, column)
-                # 中間行は、複数列を束ねる見出しだけをheader pathにする。個別のkey/value metadataは除外。
+                # 中間行は、複数列を束ねる見出しだけを header path にする
                 if value:
                     owner = next((cell for cell in cells if _row_column(cell)[0] == row
                                   and _row_column(cell)[1] is not None
@@ -650,11 +634,10 @@ def _continuation_predecessor(
     title: str | None,
     detected_header_row: int | None,
 ) -> ContextRegion | None:
-    """空白行で別tableへ分断された、見出しを再掲しない縦続き領域を見つける。
+    """空白行で別 table へ分断された、見出しを再掲しない縦続き領域を見つける。
 
-    単に同じ列位置というだけでは別表を誤結合するため、現在segmentの先頭行がheaderとして検出され、かつ
-    数値/業務IDを2つ以上含む「data rowらしい」ことに加え、直前行からの連番とID参照の双方が連続する場合
-    だけ直前header regionを継承する。独立した根拠が揃わない曖昧な領域は、誤ったheaderを付けずfallbackする。
+    現在 segment の先頭行が header として検出され、data row らしく（数値/業務 ID を2つ以上含む）、
+    直前行からの連番と ID 参照が連続するときだけ直前 header region を継承する。根拠が揃わなければ fallback する。
     """
     if title is not None or detected_header_row != min_row:
         return None
@@ -710,9 +693,8 @@ def _continuation_predecessor(
 
 
 def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
-    """XLSX/DOCX/PPTX Evidence IRから小さなContext IRを作る。他形式は文書contextだけを返す。"""
-    # 旧Officeは前段変換後のlocatorを持つ。原本identity（xls/doc/ppt）は保ったまま、context規則だけ
-    # normalized OOXML形式へ合わせる。変換来歴とlocator_basisはEvidence側に明示される。
+    """XLSX/DOCX/PPTX Evidence IR から Context IR を作る。他形式は文書 context だけを返す。"""
+    # 旧 Office は変換後の locator を持つ。原本 identity は保ったまま、context 規則だけ OOXML 形式へ合わせる
     source_type = {"xls": "xlsx", "doc": "docx", "ppt": "pptx"}.get(
         ir.source.file_type, ir.source.file_type)
     cells = [element for element in ir.elements if element.type == "cell"]
@@ -775,7 +757,7 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
         if not rows:
             continue
         min_row, max_row = min(rows), max(rows)
-        for start_column, end_column, title_row, title in _region_specs(table_id, table_cells):
+        for start_column, end_column, title_row, title in _region_specs(table_cells):
             if source_type in {"pptx", "pdf"} and title is None and table is not None:
                 title = _text(table.extension.get("name")) or None
             region_cells = _cells_in_region(table_cells, start_column, end_column)
@@ -812,8 +794,7 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
                     if _row_column(cell)[0] == min_row and _text(cell.value)
                 ]
                 if title is None and header_row == min_row and _data_like_count(first_row_values) >= 2:
-                    # 先頭data rowをheaderと誤認した可能性が高い。継続根拠もtitleもない場合は、値を
-                    # column labelへ昇格させず座標fallbackにする。
+                    # 先頭 data row を header と誤認した可能性が高い（継続根拠も title もない）ため座標 fallback にする
                     header_row = None
                     confidence = 0.0
                 header_paths = (
@@ -861,8 +842,7 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
     for records in by_identifier.values():
         if len(records) < 2 or len(records) > 20:
             continue
-        # v1は同じ原本行に並ぶ別論理領域だけを確定linkにする。繰返しコードや遷移先による
-        # 別行linkは候補が増えやすいため、graph/LLMへ渡さず安全側に倒す。
+        # 確定 link にするのは同じ原本行に並ぶ別論理領域だけ（別行 link は graph/LLM へ渡さない）
         for record in records:
             source_region = region_by_id[record.region_id]
             for target in records:

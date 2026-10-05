@@ -1,23 +1,17 @@
-"""`worker.sync()` の evidence/rag drift 軽量再生成分岐（RAG-KV-001）を pin する。
+"""`worker.sync()` の evidence/rag drift 軽量再生成分岐を pin する。
 
-実際の tmp world（本物の xlsx を `office_md.build_derived()` で派生生成）を使い、`worker.sync()`
-を通して `office_md` の実装を実際に駆動する。monkeypatch するのは DB/Neo4j/ES（`store.*`／
-`es_index.rag_es_enabled`／`es_index.index_world`／`es_index.needs_reindex`）と、全再構築本体
-（`worker.run`／`worker._run_locked`）だけに限る。
+実際の tmp world（本物の xlsx を `office_md.build_derived()` で派生生成）を `worker.sync()` 経由で
+駆動する。monkeypatch するのは DB/Neo4j/ES（`store.*`／`es_index.*`）と全再構築本体
+（`worker.run`／`worker._run_locked`）だけ。
 
 分岐の優先順:
-  ⓪ force=True または prev!=sig → 常に `run()`（全再構築・変更なし）。
-  ① arms drift（`_derived_stale`）→ 常に `run()`（変更なし）。
-  ②③④ ⓪①のどちらにも該当しない時だけ `_refresh_derived_representations()` を評価する:
-     - sidecar 欠落（生成時マニフェストと現物の不一致）は drift の有無によらず常に先に確認する →
-       `"needs_full_run"`。欠落検知〜全再構築（`_run_locked`）〜`.rag_sig` 削除は同一
-       `store.world_lock` 区間で行う（公開 `run()` を呼ぶと自身の非再入 lock と衝突するため、
-       lock-free 版の `_run_locked` を直接呼ぶ）。
-     - evidence drift → `refresh_evidence_ir()` のみ（`refresh_rag()` は呼ばない）。
-     - rag drift のみ → `refresh_rag()` のみ。
-     - RAG_ES 有効時は refresh 成功後に `index_world(content_sig=sig)` を呼び、成功時だけ
-       `write_rag_sig_marker()` で確定する（マーカー保留方式）。
-     - drift 無し → 既存の backfill/ES `needs_reindex` 自己修復経路をそのまま維持する。
+  ⓪ force=True または prev!=sig → 常に `run()`。
+  ① arms drift（`_derived_stale`）→ 常に `run()`。
+  ②③④ ⓪①に該当しない時だけ `_refresh_derived_representations()` を評価する:
+     - sidecar 欠落は drift の有無によらず先に確認 → 同一 `store.world_lock` 区間で `_run_locked`＋`.rag_sig` 削除。
+     - evidence drift → `refresh_evidence_ir()` のみ／rag drift のみ → `refresh_rag()` のみ。
+     - RAG_ES 有効時は refresh 成功後に `index_world(content_sig=sig)`、成功時だけ `.rag_sig` を確定（保留方式）。
+     - drift 無し → 既存の backfill/ES `needs_reindex` 自己修復経路。
 """
 from __future__ import annotations
 
@@ -51,16 +45,28 @@ def _bump_marker(dmd, name):
 
 
 def _fake_es_meta_req(calls: list):
-    """`es_index._req` の外部境界フェイク（実 ES への通信を遮断する・
-    `tests/integration/test_worker_rag_refresh.py::_fake_es_meta_req` と同じ流儀）。`index_world`
-    自体は個別に差し替えて短絡するため、ここまで来るのは bulk 成功後に
-    `index_world_with_human_md_holdback` が呼ぶ `es_index.confirm_human_md_meta`
-    （`_index_meta` の GET→`_meta` 書き直しの PUT）だけの想定。呼び出しを `(method, path)` で
-    記録し、テスト側で「フェイクだけで完結した」ことを確認できるようにする。"""
+    # 外部境界（実 ES への通信）を遮断する。`index_world` を短絡しても bulk 成功後の
+    # `confirm_human_md_meta` が GET→PUT で `_req` を呼ぶため、(method, path) を記録する。
     def _req(method, path, body=None, **kw):
         calls.append((method, path))
         return {}
     return _req
+
+
+def _index_world_returns(monkeypatch, **result):
+    monkeypatch.setattr(es_index, "index_world",
+                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1, **result})
+
+
+def _capture_finish(monkeypatch) -> list:
+    finished: list[dict] = []
+    monkeypatch.setattr(store, "finish_ingest_run",
+                        lambda run_id, **kw: finished.append({"run_id": run_id, **kw}))
+    return finished
+
+
+def _flag_reasons(finished) -> list:
+    return [f.get("reason") for f in finished[0]["extraction_snapshot"].get("flags", [])]
 
 
 @pytest.fixture
@@ -70,21 +76,15 @@ def _stub(monkeypatch, tmp_path):
     calls: dict[str, list] = {"run": [], "index_world": [], "needs_reindex": [], "reflect_graph": [],
                               "req": []}
 
-    # rv-s2-mention #1: 軽量再生成が成功すると `_reflect_graph_after_rag_rewrite`
-    # （`build_world_graph`→`world_neo4j.load_world`）が呼ばれるようになった——本ファイルの
-    # 対象は ES/マーカーの分岐配線であり Neo4j 反映自体の中身は対象外（実 Neo4j に触れない、
-    # という本ファイルの docstring の前提を保つ）。呼ばれたことだけを記録する。
+    # Neo4j 反映（`_reflect_graph_after_rag_rewrite`）とグラフ修復（`check_graph_counts`）は実 Neo4j に
+    # 触れるため差し替える（後者は整合済み None を返し、本ファイルの対象外の修復分岐を発火させない）。
     monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite",
                         lambda world: calls["reflect_graph"].append(world))
-    # グラフ修復（`check_graph_counts`）も実 Neo4j に触れる——この world_id はどの世界にも
-    # 実在しないため、モックしなければ実 Neo4j 上で「スタンプ無し」と判定され、本ファイルが
-    # 対象としない不変分岐のグラフ修復が意図せず発火する（`reflect_graph` の呼び出し回数が
-    # 崩れる）。整合済み（None）を返し、この経路を評価対象外に保つ。
     monkeypatch.setattr(world_neo4j, "check_graph_counts", lambda *a, **kw: None)
 
     monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
     monkeypatch.setattr(store, "get_world",
-                         lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
+                        lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
     monkeypatch.setattr(worlds, "world_dir", lambda world: wd)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
@@ -94,10 +94,6 @@ def _stub(monkeypatch, tmp_path):
         yield
     monkeypatch.setattr(store, "world_lock", _noop_lock)
 
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)   # 本番の値（常時 rag）で走らせる
-    # `index_world` を短絡しても、bulk 成功後の `confirm_human_md_meta`（`_meta.human_md_sig` の
-    # 書き直し）は `es_index._req` で実 ES へ GET/PUT する別経路——通信の境界（`_req`）自体を
-    # フェイクへ差し替え、実 ES の索引メタデータを書き換えないようにする（Codex RV 2巡目是正）。
     monkeypatch.setattr(es_index, "_req", _fake_es_meta_req(calls["req"]))
 
     def _index_world(world, content_sig=None, **kw):
@@ -111,8 +107,7 @@ def _stub(monkeypatch, tmp_path):
     monkeypatch.setattr(es_index, "needs_reindex", _needs_reindex)
 
     def _run(world, **kw):
-        # `run()`（⓪①分岐）と `_run_locked()`（sidecar欠落フォールバック）のどちらから呼ばれても
-        # 同じ形で記録する（呼び出しkwargsはreflect以外に created_by/scan_root を持つことがある）。
+        # `run()`（⓪①）と `_run_locked()`（sidecar 欠落）のどちらでも同じ形で記録する
         calls["run"].append({"reflect": kw.get("reflect", True)})
         return {"status": "auto_published", "ledger": 0, "flags": []}
     monkeypatch.setattr(worker, "run", _run)
@@ -121,54 +116,70 @@ def _stub(monkeypatch, tmp_path):
     return {"calls": calls, "wd": wd, "dmd": dmd}
 
 
+def _rag_md(stub) -> str:
+    return (stub["dmd"].parent / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8")
+
+
 # ---- ⓪①: 全再構築の優先分岐 ----
 
-def test_sync_force_true_always_runs_full(_stub):
-    """`force=True` は drift 状態と無関係に `run()`。"""
-    res = worker.sync("w", force=True)
-    assert _stub["calls"]["run"] == [{"reflect": True}]
-    assert res["changed"] is True
-
-
-def test_sync_prev_sig_mismatch_always_runs_full(_stub, monkeypatch):
-    """`prev != sig` は drift 状態と無関係に `run()`。"""
-    monkeypatch.setattr(store, "get_world", lambda world: {"last_sig": "old", "last_manifest": {},
-                                                            "last_doc_count": 0})
-    res = worker.sync("w")
+@pytest.mark.parametrize("kwargs, prev", [
+    pytest.param({"force": True}, "sig", id="force-true"),
+    pytest.param({}, "old", id="prev-sig-mismatch"),
+])
+def test_sync_always_runs_full(_stub, monkeypatch, kwargs, prev):
+    monkeypatch.setattr(store, "get_world", lambda world: {"last_sig": prev, "last_manifest": {},
+                                                           "last_doc_count": 0})
+    res = worker.sync("w", **kwargs)
     assert _stub["calls"]["run"] == [{"reflect": True}]
     assert res["changed"] is True
 
 
 def test_sync_arms_drift_runs_full_via_derived_stale(_stub, monkeypatch):
-    """`prev==sig`・`force=False`・arms drift（`_derived_stale`）→ `run()`。軽量refreshは評価しない。"""
     monkeypatch.setattr(worker, "_derived_stale", lambda world: True)
-    old_rag_md = (_stub["dmd"].parent / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8")
+    old_rag_md = _rag_md(_stub)
     res = worker.sync("w")
     assert _stub["calls"]["run"] == [{"reflect": True}]
-    assert (_stub["dmd"].parent / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8") == old_rag_md  # 軽量refreshは実行されない
+    assert _rag_md(_stub) == old_rag_md   # 軽量 refresh は実行されない
     assert res["changed"] is True
 
 
-# ---- ②③: evidence/rag drift の排他分岐（実 office_md を実際に駆動する） ----
+# ---- ②③: evidence/rag drift の排他分岐 ----
 
-def test_sync_rag_drift_only_regenerates_via_real_refresh_rag(_stub):
+def test_sync_rag_drift_only_regenerates_via_real_refresh_rag_and_confirms_markers(_stub, monkeypatch):
     dmd = _stub["dmd"]
     _bump_marker(dmd, ".rag_sig")
     assert office_md.rag_sig_drift(dmd) is True
-    res = worker.sync("w")
-    assert office_md.rag_sig_drift(dmd) is False    # RAG_ES有効＝ES(index_world)成功後にworkerが確定する
-    assert office_md.evidence_ir_sig_drift(dmd) is False   # evidence側は無関係のまま変化しない
+    finished = _capture_finish(monkeypatch)
+
+    res = worker.sync("w", run_id=999)
+
+    assert office_md.rag_sig_drift(dmd) is False                 # RAG_ES 有効＝ES 成功後に worker が確定する
+    assert office_md.evidence_ir_sig_drift(dmd) is False         # evidence 側は無関係
     assert _stub["calls"]["run"] == []
     assert res["status"] == "unchanged" and res["changed"] is False
-    assert _stub["calls"]["reflect_graph"] == ["w"]  # rv-s2-mention #1: rag.md書換え成功後にグラフも追随させる
-    # 実 ES へは一切通信していない（フェイクの GET/PUT だけで confirm_human_md_meta が完結した）。
+    assert _stub["calls"]["reflect_graph"] == ["w"]              # rag.md 書換え成功後にグラフも追随
+    # 実 ES へは通信せず、フェイクの GET/PUT だけで confirm_human_md_meta が完結する
     mapping_path = f"/{es_index._index('w')}/_mapping"
     assert _stub["calls"]["req"] == [("GET", mapping_path), ("PUT", mapping_path)]
+    assert _stub["calls"]["index_world"] == ["sig"]              # refresh 内部で content_sig 明示・1 回だけ
+    assert _stub["calls"]["needs_reindex"] == ["sig"]            # 外側の明示チェックは False＝再索引しない
+    marker = dmd / ".human_md_es_sig"                            # bulk 成功で human_md も確定
+    assert marker.read_text(encoding="utf-8").strip() == office_md._current_human_md_sig()
+
+    # 内部再索引の結果を同じ run の snapshot へ畳み込む（stage_timings の各段に時刻と elapsed）
+    assert len(finished) == 1
+    snap = finished[0]["extraction_snapshot"]
+    for stage in ("scanning", "refresh_derived", "es_index"):
+        assert stage in snap["stage_timings"], f"stage_timings に {stage} が無い"
+        st = snap["stage_timings"][stage]
+        assert st["started_at"] and st["finished_at"]
+        assert st["elapsed_ms"] >= 0
+    assert snap["counts"]["es_indexed"] == 1
+    assert "embedded_chunks" not in snap["counts"]               # 返していない項目はキーごと省略
 
 
 def test_sync_evidence_drift_regenerates_via_real_refresh_evidence_ir_only(_stub):
-    """evidence drift → `refresh_evidence_ir()` のみが走り、rag側も一緒に確定する
-    （`refresh_evidence_ir()` は rag もまとめて再生成する契約・`refresh_rag()` は呼ばれない）。"""
+    # `refresh_evidence_ir()` は rag もまとめて再生成する契約（`refresh_rag()` は呼ばれない）。
     dmd = _stub["dmd"]
     _bump_marker(dmd, ".evidence_ir_sig")
     _bump_marker(dmd, ".rag_sig")
@@ -201,7 +212,7 @@ def _old_route_world_with_failed_wmf_job(_stub):
     wb.active.add_image(XImage(str(png)), "B2")
     wb.save(wd / "a.xlsx")
     assert office_md.build_derived(wd, dmd)["evidence_ir_failed"] == 0
-    # 画像の実体を WMF のバイト列へ差し替え、Evidence の hash も合わせる（実環境の WMF 図と同じ状態）。
+    # 画像の実体を WMF のバイト列へ差し替え、Evidence の hash も合わせる（実環境の WMF 図と同じ状態）
     wmf = b"\xd7\xcd\xc6\x9a" + b"\x00" * 32
     asset = next((dmd.parent / "rag" / "a.xlsx.assets").iterdir())
     old_hash = asset.stem
@@ -221,14 +232,15 @@ def _old_route_world_with_failed_wmf_job(_stub):
                                  "router_profile": "evidence-raster-router-v3"}), encoding="utf-8")
     (dmd / ".world_sig").write_text("sig\n", encoding="utf-8")
     generation = derived_generation.generation_id_for("sig")
-    ocr_jobs.enqueue_job(
-        world="w", source_rel_path="a.xlsx", canonical_generation_id=generation,
-        source_content_hash=manifest.source_content_hash, route_manifest_hash=manifest.route_manifest_hash,
-        route_input={"route_input_id": route_input_id, "input_kind": "asset", "status": "selected",
-                     "asset_rel_path": "x.wmf"},
-        engine_profile_hash="sha256:" + "e" * 64,
-    )
+    ocr_jobs._ensure()
     with ocr_jobs._connect() as connection:
+        ocr_jobs._insert_job(connection, ocr_jobs._job_values(
+            world="w", source_rel_path="a.xlsx", canonical_generation_id=generation,
+            source_content_hash=manifest.source_content_hash, route_manifest_hash=manifest.route_manifest_hash,
+            route_input={"route_input_id": route_input_id, "input_kind": "asset", "status": "selected",
+                         "asset_rel_path": "x.wmf"},
+            engine_profile_hash="sha256:" + "e" * 64,
+        ), 0, 3)
         connection.execute(
             "UPDATE ocr_jobs SET status='failed', error_code='engine_failure' WHERE world='w'")
     return route, route_input_id, generation
@@ -243,8 +255,8 @@ def _job_state(generation):
 
 
 def test_sync_rewrites_old_route_and_cancels_old_failed_job_without_touching_rag(_stub, monkeypatch):
-    """ルート版 v3 で公開済みの資料フォルダ: 通常の sync がルートだけを現行版へ書き直し、読めない画像に
-    なった入力の過去の failed job を cancelled に終端してからマーカーを確定する。Evidence/rag は再生成しない。"""
+    # ルートだけを現行版へ書き直し、読めない画像になった入力の過去の failed job を cancelled に終端してから
+    # マーカーを確定する。Evidence/rag は再生成しない。
     import json
     from sherpa.ingest import ocr_router
     from sherpa.store import ocr_jobs
@@ -315,268 +327,168 @@ def test_route_generation_failure_in_build_leaves_marker_unwritten_and_next_sync
 
 
 def test_sync_no_drift_keeps_existing_backfill_and_es_repair(_stub, monkeypatch):
-    """drift が何も無ければ軽量refreshは呼ばれず、既存の backfill/ES `needs_reindex` 経路が維持される。"""
-    dmd = _stub["dmd"]
-    old_rag_md = (dmd.parent / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8")
+    old_rag_md = _rag_md(_stub)
     res = worker.sync("w")
-    assert (dmd.parent / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8") == old_rag_md
-    assert _stub["calls"]["needs_reindex"] == ["sig"]        # 既存のES自己修復チェックは変わらず走る
+    assert _rag_md(_stub) == old_rag_md
+    assert _stub["calls"]["needs_reindex"] == ["sig"]        # 既存の ES 自己修復チェックは走る
     assert res["status"] == "unchanged" and res["changed"] is False
-    assert _stub["calls"]["reflect_graph"] == []   # rag.md自体が書き換わっていない＝グラフ反映も不要
+    assert _stub["calls"]["reflect_graph"] == []             # rag.md が書き換わっていない＝グラフ反映も不要
 
-    # `reflect=False` は他段（台帳だけ確定・Neo4j 未反映）と同じくグラフ照合にも入らない
-    # （`check_graph_counts` 自体を呼ばない＝`_stub` の既定モックより厳しく「未呼出」を確認する）。
+    # `reflect=False` はグラフ照合（`check_graph_counts`）にも入らない
     graph_check_calls = []
-    monkeypatch.setattr(world_neo4j, "check_graph_counts",
-                        lambda *a, **kw: graph_check_calls.append(1))
+    monkeypatch.setattr(world_neo4j, "check_graph_counts", lambda *a, **kw: graph_check_calls.append(1))
     res2 = worker.sync("w", reflect=False)
     assert res2["status"] == "unchanged" and res2["changed"] is False
     assert graph_check_calls == []
 
 
-def test_sync_unchanged_backfills_legacy_scan_report_missing_new_fields(_stub, monkeypatch):
-    """無変更同期（unchanged 経路）で、保存済み `last_scan_report` が旧形式（`sensitive_excluded`/
-    `unreachable_as_text`/`unreachable_as_text_by_ext` を持たない）なら、sig が一致していても
-    scan_report を再実行して補完する（`corpus_docs.scan_report_missing_fields` が欠落を検知する）。"""
-    legacy = {"scanned": 1, "indexed": 1, "by_doctype": {}, "office_md": 0, "skipped_office": 0,
-             "office_failed": 0, "skipped_other": 0, "skipped_ext": {}, "analyzer_declined": 0,
-             "analyzer_declined_as_document": 0, "unreadable": 0}
-    row = {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0, "last_scan_report": legacy}
-    monkeypatch.setattr(store, "get_world", lambda world: row)
-
-    calls = []
-    monkeypatch.setattr(store, "set_scan_report",
-                        lambda world, report: calls.append((world, report)))
-
-    res = worker.sync("w")
-    assert res["status"] == "unchanged"
-    assert len(calls) == 1
-    saved_world, saved_report = calls[0]
-    assert saved_world == "w"
-    assert {"sensitive_excluded", "unreachable_as_text", "unreachable_as_text_by_ext"} <= saved_report.keys()
-
-
-def test_sync_unchanged_does_not_rebackfill_current_format_scan_report(_stub, monkeypatch):
-    """新形式（3項目を既に持つ）の `last_scan_report` は無変更同期のたびに再走査しない
-    （既存の「1回きりのバックフィル」契約を維持する・毎回の再走査は無駄なコスト）。"""
+@pytest.mark.parametrize("legacy", [True, False], ids=["legacy-format-backfilled", "current-format-not-rebackfilled"])
+def test_sync_unchanged_scan_report_backfill(_stub, monkeypatch, legacy):
+    # 旧形式（3 項目を持たない）の last_scan_report だけ、sig 一致でも scan_report を再実行して補完する。
     from sherpa import corpus_docs
-    current = {**corpus_docs.empty_scan_report(), "scanned": 1, "indexed": 1}
-    row = {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0, "last_scan_report": current}
+    if legacy:
+        report = {"scanned": 1, "indexed": 1, "by_doctype": {}, "office_md": 0, "skipped_office": 0,
+                  "office_failed": 0, "skipped_other": 0, "skipped_ext": {}, "analyzer_declined": 0,
+                  "analyzer_declined_as_document": 0, "unreadable": 0}
+    else:
+        report = {**corpus_docs.empty_scan_report(), "scanned": 1, "indexed": 1}
+    row = {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0, "last_scan_report": report}
     monkeypatch.setattr(store, "get_world", lambda world: row)
-
     calls = []
-    monkeypatch.setattr(store, "set_scan_report",
-                        lambda world, report: calls.append((world, report)))
+    monkeypatch.setattr(store, "set_scan_report", lambda world, rep: calls.append((world, rep)))
 
     res = worker.sync("w")
     assert res["status"] == "unchanged"
-    assert calls == []
+    if legacy:
+        assert len(calls) == 1
+        saved_world, saved_report = calls[0]
+        assert saved_world == "w"
+        assert {"sensitive_excluded", "unreachable_as_text", "unreachable_as_text_by_ext"} <= saved_report.keys()
+    else:
+        assert calls == []
 
 
 def test_sync_human_md_only_drift_still_reaches_es_repair_same_call(_stub, monkeypatch):
-    """human_md drift だけが起きた場合、`refresh_human_md` が `"handled"` を返しても、同じ
-    `sync()` 呼び出し内で ES の `needs_reindex` 自己修復まで到達する（human_md は RAG_ES の
-    ON/OFF に関わらず ES の索引元に影響しうる——rag_chunks が無効/劣化した文書は legacy
-    `{rel}.md` へ縮退するため。ここで打ち切ると ES が古いまま次回 sync まで取り残される）。"""
+    # human_md drift で `refresh_human_md` が "handled" を返しても、同じ sync 内で ES の自己修復まで到達する
+    # （rag_chunks が無効な文書は legacy `{rel}.md` へ縮退するため、ここで打ち切ると ES が古いまま残る）。
     dmd = _stub["dmd"]
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "bumped-human-md-version")
     assert office_md.human_md_sig_drift(_stub["wd"], dmd) is True
-
-    calls = {"index_world": []}
     monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: True)
 
-    def _index_world(world, content_sig=None, **kw):
-        calls["index_world"].append(content_sig)
-        return {"available": True, "indexed": 1, "chunks": 1}
-    monkeypatch.setattr(es_index, "index_world", _index_world)
-
     res = worker.sync("w")
-    assert office_md.human_md_sig_drift(_stub["wd"], dmd) is False       # human_md 側は追随した
-    assert calls["index_world"] == ["sig"]                               # 同じ sync 呼び出し内でESまで到達
+    assert office_md.human_md_sig_drift(_stub["wd"], dmd) is False
+    assert _stub["calls"]["index_world"] == ["sig"]
     assert res["status"] == "unchanged" and res["changed"] is False
 
 
 def test_sync_unchanged_es_repair_progress_throttled_and_dedupes_same_value(_stub, monkeypatch):
-    """RV是正（rv-periphery #4・2026-09-05）: unchanged 分岐の ES 自己修復
-    （`index_world_with_human_md_holdback` の progress コールバック）に、`_run_locked` 側の
-    `_es_progress` と同じ「100件間隔の間引き＋同値抑止」（rv-periphery #3(c)）を適用する——
-    旧実装は doc グループ（flush）単位の呼び出しをそのまま DB 書込みへ転送しており、間引きが
-    掛かっていなかった。連続する同値（1,1／150,150／300,300）は2回目を書かない。"""
+    # unchanged 分岐の ES 自己修復の progress は `_run_locked` 側と同じ「100 件間隔の間引き＋同値抑止」を適用する。
     monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: True)
 
     def _index_world_holdback(world, *, content_sig=None, run_id=None, progress=None):
-        for done in (0, 1, 1, 2, 150, 150, 300, 300):     # es_index.index_world の実呼び出し列を模す
+        for done in (0, 1, 1, 2, 150, 150, 300, 300):
             progress(done, 300)
         return {"available": True, "indexed": 300, "chunks": 300}
     monkeypatch.setattr(worker, "index_world_with_human_md_holdback", _index_world_holdback)
 
     recorded: list[dict] = []
-    monkeypatch.setattr(store, "update_ingest_run_progress",
-                        lambda run_id, payload: recorded.append(payload))
+    monkeypatch.setattr(store, "update_ingest_run_progress", lambda run_id, payload: recorded.append(payload))
     monkeypatch.setattr(store, "finish_ingest_run", lambda *a, **k: None)
     monkeypatch.setattr(worker.webhooks, "notify_run_terminal", lambda *a, **k: None)
 
     res = worker.sync("w", run_id=999)
     assert res["status"] == "unchanged"
-    # `total == 300` で絞る＝直前の無条件なステージ遷移記録（`_progress("es_index", done=0,
-    # total=None)`・本テストの対象外）を除外し、ホールドバックの progress コールバックが実際に
-    # 書いた値だけを見る。1/1/2 は 100件間隔未満のため間引かれ、150/150・300/300 は同値の2回目が
-    # 抑止される。
+    # total == 300 で絞り、直前のステージ遷移記録（total=None）を除外する
     done_values = [r["done"] for r in recorded if r["stage"] == "es_index" and r["total"] == 300]
     assert done_values == [0, 150, 300]
 
 
-def test_sync_self_heal_success_confirms_human_md_es_marker(_stub, monkeypatch):
-    """ES 自己修復（unchanged 分岐）の `index_world` が成功（bulk_errors 等の失敗が無い）したら、
-    `office_md.confirm_human_md_es_sig` で `.human_md_es_sig` マーカーを確定し、続けて
-    `es_index.confirm_human_md_meta` で ES 自身の `_meta.human_md_sig` も現行署名へ書き直す
-    （RAG-KV の `.rag_sig` と同型のホールドバック方式・マーカーだけ確定して meta を放置すると
-    次回 sync が meta の古い値を検知して無駄な再索引を繰り返し続ける・収束しない）。"""
+def test_sync_self_heal_success_confirms_human_md_markers_and_finalizes_run(_stub, monkeypatch):
+    # ES 自己修復の index_world 成功で `.human_md_es_sig` と ES の `_meta.human_md_sig` を確定する
+    # （meta を放置すると次回 sync が古い値を検知して再索引し続け、収束しない）。受付 run は auto_published。
     dmd = _stub["dmd"]
+    finished = _capture_finish(monkeypatch)
     monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: True)
-    monkeypatch.setattr(es_index, "index_world",
-                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
     meta_calls: list[str] = []
     monkeypatch.setattr(es_index, "confirm_human_md_meta", lambda world: meta_calls.append(world) or True)
 
-    res = worker.sync("w")
+    res = worker.sync("w", run_id=999)
+
     assert res["status"] == "unchanged"
     marker = dmd / ".human_md_es_sig"
     assert marker.is_file()
     assert marker.read_text(encoding="utf-8").strip() == office_md._current_human_md_sig()
     assert meta_calls == ["w"]
+    assert len(finished) == 1 and finished[0]["run_id"] == 999
+    assert finished[0]["status"] == "auto_published"
+    # 実行した工程の所要時間と取得できた計数を snapshot に残す。返していない embedded はキーごと省略
+    snap = finished[0]["extraction_snapshot"]
+    assert "scanning" in snap["stage_timings"] and "es_index" in snap["stage_timings"]
+    assert snap["stage_timings"]["scanning"]["elapsed_ms"] >= 0
+    assert snap["counts"]["es_indexed"] == 1
+    assert snap["counts"]["scanned"] == 0                   # `world_state` フェイクの manifest={} 由来
+    assert "embedded_chunks" not in snap["counts"]
 
 
 def test_sync_self_heal_bulk_errors_skips_marker_and_records_failure(_stub, monkeypatch):
-    """ES 自己修復の `index_world` が部分失敗（`bulk_errors` 等）を返したら、`.human_md_es_sig`
-    マーカーを確定せず（pending のまま次回 sync が自動的に再試行する）、失敗を `ingest_runs` へ
-    記録する。直った次回は marker が確定する。"""
+    # 部分失敗なら `.human_md_es_sig` を確定せず（次回 sync が再試行）、失敗を ingest_runs へ記録する。
     dmd = _stub["dmd"]
     recorded: list[dict] = []
     monkeypatch.setattr(store, "add_ingest_run", lambda world, **kw: recorded.append({"world": world, **kw}))
     monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: True)
-
-    should_fail = {"v": True}
-
-    def _index_world(world, content_sig=None, **kw):
-        if should_fail["v"]:
-            return {"available": True, "indexed": 1, "chunks": 1, "error": "bulk_errors"}
-        return {"available": True, "indexed": 1, "chunks": 1}
-    monkeypatch.setattr(es_index, "index_world", _index_world)
+    _index_world_returns(monkeypatch, error="bulk_errors")
 
     res = worker.sync("w")
     assert res["status"] == "unchanged"
     marker = dmd / ".human_md_es_sig"
-    assert not marker.is_file()                          # 部分失敗＝確定しない
+    assert not marker.is_file()
     assert len(recorded) == 1
     assert recorded[0]["status"] == "failed"
     assert recorded[0]["extraction_snapshot"]["error"] == "bulk_errors"
 
-    should_fail["v"] = False                              # 次回 sync で直ったとする
-    res = worker.sync("w")
-    assert res["status"] == "unchanged"
-    assert marker.is_file()                               # 今回は確定する
-    assert len(recorded) == 1                              # 失敗記録は増えない（成功時は記録しない）
+    _index_world_returns(monkeypatch)   # 次回 sync で直る
+    assert worker.sync("w")["status"] == "unchanged"
+    assert marker.is_file()
+    assert len(recorded) == 1           # 成功時は失敗記録を増やさない
 
 
 def test_sync_self_heal_failure_with_run_id_folds_into_same_run_not_a_new_one(_stub, monkeypatch):
-    """`run_id`（受付run）指定時、unchanged 分岐の ES 自己修復失敗は別 run を作らず、
-    受付 run 自身の終端（`finish_ingest_run`）へ畳み込む——`add_ingest_run`（新規行）は呼ばれない。"""
     new_runs: list[dict] = []
     monkeypatch.setattr(store, "add_ingest_run", lambda world, **kw: new_runs.append({"world": world, **kw}))
-    finished: list[dict] = []
-    monkeypatch.setattr(store, "finish_ingest_run",
-                         lambda run_id, **kw: finished.append({"run_id": run_id, **kw}))
+    finished = _capture_finish(monkeypatch)
     monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: True)
     monkeypatch.setattr(es_index, "index_world",
-                         lambda world, content_sig=None, **kw: {"available": True, "error": "bulk_errors"})
+                        lambda world, content_sig=None, **kw: {"available": True, "error": "bulk_errors"})
 
     res = worker.sync("w", run_id=999)
     assert res["status"] == "unchanged"
     assert new_runs == []                                  # 別 run は作られない
     assert len(finished) == 1 and finished[0]["run_id"] == 999
     assert finished[0]["status"] == "failed"
-    reasons = [f.get("reason") for f in finished[0]["extraction_snapshot"].get("flags", [])]
-    assert any(r and r.startswith("es_repair_failed") for r in reasons)
-
-
-def test_sync_self_heal_success_with_run_id_finalizes_as_auto_published(_stub, monkeypatch):
-    """対照ケース: ES 自己修復が成功すれば、受付 run は通常どおり `auto_published` で
-    終端する（畳み込みの追加が成功パスを壊していないことの確認）。"""
-    finished: list[dict] = []
-    monkeypatch.setattr(store, "finish_ingest_run",
-                         lambda run_id, **kw: finished.append({"run_id": run_id, **kw}))
-    monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: True)
-    monkeypatch.setattr(es_index, "index_world",
-                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
-    monkeypatch.setattr(es_index, "confirm_human_md_meta", lambda world: True)
-
-    res = worker.sync("w", run_id=999)
-    assert res["status"] == "unchanged"
-    assert len(finished) == 1 and finished[0]["run_id"] == 999
-    assert finished[0]["status"] == "auto_published"
-
-
-def test_sync_unchanged_es_repair_saves_stage_timings_and_counts(_stub, monkeypatch):
-    """C5 是正: 原本不変（unchanged）で ES 自己修復まで走った run でも、`_run_locked`（全再構築）
-    経由の run と同じく実行した工程の所要時間（`stage_timings`）と取得できた計数（`counts`）を
-    `extraction_snapshot` へ残す——是正前は unchanged 分岐がこれらを一切保存しなかった
-    （`snap = {"changed": False}` のみ）。取れない項目（今回 embedded は返さない）はキーごと
-    省略する契約（`_counts_summary` と同じ）は維持する。"""
-    finished: list[dict] = []
-    monkeypatch.setattr(store, "finish_ingest_run",
-                        lambda run_id, **kw: finished.append({"run_id": run_id, **kw}))
-    monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: True)
-    monkeypatch.setattr(es_index, "index_world",
-                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
-    monkeypatch.setattr(es_index, "confirm_human_md_meta", lambda world: True)
-
-    res = worker.sync("w", run_id=999)
-    assert res["status"] == "unchanged"
-    snap = finished[0]["extraction_snapshot"]
-    # 実行した工程（走査・ES 自己修復）の所要時間が載る。
-    assert "scanning" in snap["stage_timings"] and "es_index" in snap["stage_timings"]
-    assert snap["stage_timings"]["scanning"]["elapsed_ms"] >= 0
-    # ES 索引の計数（`index_world` の戻り値由来）が載るが、返していない `embedded` はキーごと無い。
-    assert snap["counts"]["es_indexed"] == 1
-    assert snap["counts"]["scanned"] == 0                   # `world_state` フェイクの manifest={} 由来
-    assert "embedded_chunks" not in snap["counts"]
+    assert any(r and r.startswith("es_repair_failed") for r in _flag_reasons(finished))
 
 
 def test_index_world_holdback_drops_marker_before_reindex_prevents_stale_confirmation(_stub, monkeypatch):
-    """二段階更新の穴: 以前の成功で `.human_md_es_sig` が既に確定済みの状態から、（human_md とは
-    無関係な別次元の変化などで）別の再索引が走り、その bulk が部分失敗しても、再索引前に
-    マーカーを無効化しているため meta には確定値が残らず pending のまま——次回の呼び出しも
-    reindex 対象であり続ける（複数回 sync しても、bulk が直るまで再索引され続けることの確認）。
-    マーカーを先に落とさず `ensure_index` を呼ぶ（旧実装相当）と、bulk 前の時点で「pending で
-    ない」現行版が meta へ書かれてしまい、bulk が部分失敗しても meta が確定値のまま固定される。"""
+    # 確定済みの `.human_md_es_sig` から別の再索引が走り bulk が部分失敗しても、再索引前にマーカーを
+    # 無効化しているので確定値は残らず、bulk が直るまで pending のまま再索引され続ける。
     wd, dmd = _stub["wd"], _stub["dmd"]
-    assert office_md.confirm_human_md_es_sig(wd, dmd) is True   # 「以前の成功」を模す
+    assert office_md.confirm_human_md_es_sig(wd, dmd) is True
     assert office_md.human_md_es_sig_drift(dmd) is False
 
-    monkeypatch.setattr(es_index, "index_world",
-                         lambda world, content_sig=None, **kw:
-                         {"available": True, "indexed": 1, "chunks": 1, "error": "bulk_errors"})
+    _index_world_returns(monkeypatch, error="bulk_errors")
+    for _ in range(2):
+        esr = worker.index_world_with_human_md_holdback("w", content_sig="sig")
+        assert esr.get("error") == "bulk_errors"
+        assert office_md.human_md_es_sig_drift(dmd) is True
 
-    esr = worker.index_world_with_human_md_holdback("w", content_sig="sig")
-    assert esr.get("error") == "bulk_errors"
-    assert office_md.human_md_es_sig_drift(dmd) is True         # 無効化されたまま再確定されない
-
-    # 2回目（次回 sync 相当）も bulk がまだ失敗していれば同様に pending のまま。
-    esr2 = worker.index_world_with_human_md_holdback("w", content_sig="sig")
-    assert esr2.get("error") == "bulk_errors"
-    assert office_md.human_md_es_sig_drift(dmd) is True
-
-    # bulk が直れば次回は確定する。
-    monkeypatch.setattr(es_index, "index_world",
-                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
+    _index_world_returns(monkeypatch)
     esr3 = worker.index_world_with_human_md_holdback("w", content_sig="sig")
     assert not esr3.get("error")
     assert office_md.human_md_es_sig_drift(dmd) is False
 
 
 def test_derived_dir_missing_skips_sidecar_and_drift_check(_stub, monkeypatch):
-    """`dmd.exists()` が False（text/code のみの world）なら sidecar/drift 判定自体をスキップする。"""
     empty_dir = _stub["dmd"].parent / "no-such-derived-dir"
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: empty_dir)
     res = worker.sync("w")
@@ -587,13 +499,8 @@ def test_derived_dir_missing_skips_sidecar_and_drift_check(_stub, monkeypatch):
 # ---- document_ir drift 連鎖（document_ir→evidence→rag・失敗分離とマーカー確定順） ----
 
 def test_document_ir_partial_failure_still_cascades_to_evidence_and_rag(_stub, monkeypatch):
-    """document_ir が失敗しても、それだけで evidence→rag への連鎖を打ち切らない（打ち切ると、
-    その文書が直らない限り World 全体の RAG/ES まで永久に旧世代のまま固定されてしまう）。
-    `.document_ir_sig` は world 単位で1つのマーカーしか持たないため、失敗が残る限り次回 sync も
-    対象 OOXML 文書を全件（この文書だけでなく）再実行し、それに伴い evidence/rag（RAG_ES 有効時
-    は ES 索引も）も document_ir drift が続く限り毎回再実行される（1文書だけを狙い撃つ選択的な
-    再試行や、evidence/rag側の要否判定によるスキップは無い＝sync が既定でポーリング駆動でない
-    ため、この冗長さを個別最適化する必要は無いと判断している）。"""
+    # document_ir が失敗しても evidence→rag への連鎖は打ち切らない（打ち切ると World 全体の RAG/ES が
+    # 永久に旧世代のまま固定される）。`.document_ir_sig` は world 単位 1 つなので、失敗が残る限り次回も再実行される。
     dmd = _stub["dmd"]
     _bump_marker(dmd, ".document_ir_sig")
     original_refresh_document_ir = office_md.refresh_document_ir
@@ -604,38 +511,31 @@ def test_document_ir_partial_failure_still_cascades_to_evidence_and_rag(_stub, m
     monkeypatch.setattr(office_md, "refresh_document_ir", _failing)
 
     res = worker.sync("w")
-    assert office_md.document_ir_sig_drift(dmd) is True          # 失敗のまま＝次回sync再試行
-    assert office_md.evidence_ir_sig_drift(dmd) is False         # それでもevidence/ragの連鎖は実行され成功する
+    assert office_md.document_ir_sig_drift(dmd) is True          # 失敗のまま＝次回 sync 再試行
+    assert office_md.evidence_ir_sig_drift(dmd) is False         # evidence/rag の連鎖は実行され成功する
     assert office_md.rag_sig_drift(dmd) is False
     assert res["status"] == "unchanged" and res["changed"] is False
 
-    # 次回 sync: document_ir drift がまだ残っているため evidence/rag への連鎖も（既に確定済みで
-    # あっても）もう一度再実行される。document_ir が復旧すれば今度こそ全体が収束する。
     monkeypatch.setattr(office_md, "refresh_document_ir", original_refresh_document_ir)
     worker.sync("w")
     assert office_md.document_ir_sig_drift(dmd) is False
 
 
 def test_document_ir_marker_confirm_waits_for_downstream_holdback_success(_stub, monkeypatch):
-    """document_ir 版だけが独立に上がった状況で RAG_ES=1 の時、evidence 側の `.rag_sig`
-    ホールドバック削除（生成着手前の事前 unlink）が失敗すると、document_ir 自体の生成は
-    成功していても document_ir マーカーを確定してはいけない——先に確定すると、次回 sync では
-    document_ir drift が既に False になり、evidence/rag/ES の再試行の入口そのものを失って
-    恒久的に旧世代のまま固定される。"""
+    # RAG_ES=1 で evidence 側の `.rag_sig` ホールドバック削除が失敗したら、document_ir 自体が成功でも
+    # マーカーを確定しない（先に確定すると次回 sync で再試行の入口を失い、恒久的に旧世代のまま固定される）。
     dmd = _stub["dmd"]
     _bump_marker(dmd, ".document_ir_sig")
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     original_drop = office_md.drop_rag_sig_marker
-    monkeypatch.setattr(office_md, "drop_rag_sig_marker", lambda dr: False)   # holdback unlink失敗を模す
+    monkeypatch.setattr(office_md, "drop_rag_sig_marker", lambda dr: False)
 
     res = worker.sync("w")
-    assert _stub["calls"]["index_world"] == []                    # evidence側が着手前に打ち切り＝ESも呼ばない
-    assert office_md.document_ir_sig_drift(dmd) is True           # document_ir自体は成功してもマーカーは未確定
-    assert office_md.evidence_ir_sig_drift(dmd) is False          # 触られていない（着手前に打ち切り）
-    assert office_md.rag_sig_drift(dmd) is False                  # 同上
+    assert _stub["calls"]["index_world"] == []                    # evidence 側が着手前に打ち切り＝ES も呼ばない
+    assert office_md.document_ir_sig_drift(dmd) is True
+    assert office_md.evidence_ir_sig_drift(dmd) is False
+    assert office_md.rag_sig_drift(dmd) is False
     assert res["status"] == "unchanged"
 
-    # 次回 sync: holdback unlinkが復旧すれば document_ir drift が再検知されて連鎖が完走し収束する。
     monkeypatch.setattr(office_md, "drop_rag_sig_marker", original_drop)
     worker.sync("w")
     assert office_md.document_ir_sig_drift(dmd) is False
@@ -643,128 +543,69 @@ def test_document_ir_marker_confirm_waits_for_downstream_holdback_success(_stub,
 
 
 def test_evidence_only_marker_missing_rag_marker_current_es_failure_retried(_stub, monkeypatch):
-    """`.evidence_ir_sig` マーカーのみ欠落（`.rag_sig` マーカーは現在値と一致＝rag 自身は単体
-    では drift していない）状態で RAG_ES=1 の `index_world` が失敗すると、ホールドバックの
-    事前 unlink により `.rag_sig` も未確定へ戻り、次回 sync が rag 側だけを正しく再試行する
-    （両マーカーが同時に drift していないと検知できない退行のケース）。"""
+    # `.evidence_ir_sig` のみ欠落（`.rag_sig` は現在値と一致）で index_world が失敗すると、ホールドバックの
+    # 事前 unlink で `.rag_sig` も未確定へ戻り、次回 sync が rag 側だけを再試行する。
     dmd = _stub["dmd"]
     (dmd / ".evidence_ir_sig").unlink()
     assert office_md.evidence_ir_sig_drift(dmd) is True
-    assert office_md.rag_sig_drift(dmd) is False                  # rag自身は現在値と一致（単体ではdriftしない）
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
-    monkeypatch.setattr(es_index, "index_world", lambda world, content_sig=None, **kw:
-                         {"available": True, "indexed": 0, "chunks": 0, "error": "bulk_failed"})
+    assert office_md.rag_sig_drift(dmd) is False
+    _index_world_returns(monkeypatch, indexed=0, chunks=0, error="bulk_failed")
 
     res = worker.sync("w")
-    assert office_md.evidence_ir_sig_drift(dmd) is False           # evidence自体は生成成功→確定
-    assert office_md.rag_sig_drift(dmd) is True                    # holdbackの事前unlinkで未確定へ戻る
+    assert office_md.evidence_ir_sig_drift(dmd) is False
+    assert office_md.rag_sig_drift(dmd) is True
     assert res["status"] == "unchanged"
 
-    # 次回 sync: evidence側は既に確定済み＝rag driftのみとして再試行され、ESが復旧すれば収束する。
-    monkeypatch.setattr(es_index, "index_world", lambda world, content_sig=None, **kw:
-                         {"available": True, "indexed": 1, "chunks": 1})
+    _index_world_returns(monkeypatch)
     worker.sync("w")
     assert office_md.rag_sig_drift(dmd) is False
 
 
-# ---- RAG_ES 接続（マーカー保留方式・実 index_world 呼び出しのみ mock） ----
-
-def test_sync_refresh_success_with_rag_es_confirms_marker(_stub, monkeypatch):
-    dmd = _stub["dmd"]
-    _bump_marker(dmd, ".rag_sig")
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
-    worker.sync("w")
-    assert _stub["calls"]["index_world"] == ["sig"]           # content_sig明示・1回だけ
-    assert office_md.rag_sig_drift(dmd) is False               # ES成功→workerが確定
-    # human_md は RAG_ES の設定に関わらず ES 反映に影響しうるため、この bulk 成功
-    # でも `.human_md_es_sig` を確定する（render 側は fixture の世界が既に追随済み）。
-    assert (dmd / ".human_md_es_sig").is_file()
-    assert (dmd / ".human_md_es_sig").read_text(encoding="utf-8").strip() == office_md._current_human_md_sig()
-
-
-def test_sync_rag_drift_with_rag_es_folds_internal_reindex_into_same_run_stats(_stub, monkeypatch):
-    """C7 是正（Codex RV 2巡目）: RAG_ES 有効時、rag drift を検知した
-    `_refresh_derived_representations` が内部で実行する ES 再索引（holdback 分岐）の結果を、
-    同じ run の `extraction_snapshot` へ畳み込む——是正前は直後の `es_index.needs_reindex`
-    が（既に索引済みのため）`_stub` の既定どおり False を返し、`es_summary=None` のまま
-    索引件数・工程時間が丸ごと欠落していた。stage_timings の各段（scanning/refresh_derived/
-    es_index）に started_at/finished_at/elapsed_ms が揃うことも合わせて固定する（C8）。"""
-    dmd = _stub["dmd"]
-    _bump_marker(dmd, ".rag_sig")
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
-
-    finished: list[dict] = []
-    monkeypatch.setattr(store, "finish_ingest_run",
-                        lambda run_id, **kw: finished.append({"run_id": run_id, **kw}))
-
-    res = worker.sync("w", run_id=999)
-    assert res["status"] == "unchanged"
-    assert _stub["calls"]["index_world"] == ["sig"]            # 内部（refresh_derived）で1回だけ再索引した
-    assert _stub["calls"]["needs_reindex"] == ["sig"]          # 外側の明示チェックは走るが False＝再索引しない
-    assert len(finished) == 1
-    snap = finished[0]["extraction_snapshot"]
-
-    st = snap["stage_timings"]
-    for stage in ("scanning", "refresh_derived", "es_index"):
-        assert stage in st, f"stage_timings に {stage} が無い"
-        assert st[stage]["started_at"] and st[stage]["finished_at"]
-        assert st[stage]["elapsed_ms"] >= 0
-
-    # 内部再索引（`index_world` の戻り値 indexed=1/chunks=1）由来の計数が載る。
-    assert snap["counts"]["es_indexed"] == 1
-    assert "embedded_chunks" not in snap["counts"]             # 返していない項目はキーごと省略
-
+# ---- RAG_ES 接続（マーカー保留方式） ----
 
 def test_sync_index_world_failure_leaves_marker_unconfirmed_then_retries(_stub, monkeypatch):
     dmd = _stub["dmd"]
     _bump_marker(dmd, ".rag_sig")
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
-    monkeypatch.setattr(es_index, "index_world", lambda world, content_sig=None, **kw:
-                         {"available": True, "indexed": 0, "chunks": 0, "error": "bulk_failed"})
+    _index_world_returns(monkeypatch, indexed=0, chunks=0, error="bulk_failed")
     res = worker.sync("w")
-    assert office_md.rag_sig_drift(dmd) is True                # マーカー保留・次回sync再試行
+    assert office_md.rag_sig_drift(dmd) is True                # マーカー保留・次回 sync 再試行
     assert res["status"] == "unchanged"
 
-    # 次回 sync で ES が復旧すれば収束する（マーカー保留方式の自己修復を実際に2回のsyncで確認）
-    monkeypatch.setattr(es_index, "index_world", lambda world, content_sig=None, **kw:
-                         {"available": True, "indexed": 1, "chunks": 1})
+    _index_world_returns(monkeypatch)
     worker.sync("w")
     assert office_md.rag_sig_drift(dmd) is False
 
 
 def test_sync_refresh_failure_skips_es_and_marker(_stub, monkeypatch):
-    """refresh 自体が失敗（failure counter > 0）した場合は ES を呼ばずマーカーも確定しない。"""
     dmd = _stub["dmd"]
     _bump_marker(dmd, ".rag_sig")
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     monkeypatch.setattr(office_md, "refresh_rag",
-                         lambda wd_, dmd_, **kw: {"rag_generated": 0, "rag_failed": 1,
-                                                   "rag_failures": [{"doc": "x", "reason": "write_failed"}]})
+                        lambda wd_, dmd_, **kw: {"rag_generated": 0, "rag_failed": 1,
+                                                  "rag_failures": [{"doc": "x", "reason": "write_failed"}]})
     worker.sync("w")
     assert _stub["calls"]["index_world"] == []
     assert office_md.rag_sig_drift(dmd) is True
 
 
-def test_holdback_unlink_failure_aborts_before_generation_and_keeps_marker(_stub, monkeypatch):
-    """holdback（生成開始前の `.rag_sig` 削除）が実際に OSError で失敗すると、refresh は着手せず
-    既存の `.rag_sig`／既存の `.rag.md` はどちらも無傷のまま残る（chmod で実際に unlink を失敗させる）。"""
+def test_holdback_unlink_failure_aborts_before_generation_and_keeps_marker(_stub):
+    # holdback（生成開始前の `.rag_sig` 削除）が実際に OSError で失敗すると、refresh は着手せず
+    # 既存の `.rag_sig`／`.rag.md` は無傷（chmod で unlink を失敗させる）。
     dmd = _stub["dmd"]
     _bump_marker(dmd, ".rag_sig")
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     old_marker = (dmd / ".rag_sig").read_text(encoding="utf-8")
-    old_rag_md = (dmd.parent / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8")
-    dmd.chmod(0o555)                     # ディレクトリ書込不可＝`.rag_sig`のunlinkがOSErrorで失敗する
+    old_rag_md = _rag_md(_stub)
+    dmd.chmod(0o555)
     try:
         res = worker.sync("w")
     finally:
         dmd.chmod(0o755)
-    assert _stub["calls"]["index_world"] == []                                    # 生成未着手＝ESも呼ばない
-    assert (dmd / ".rag_sig").read_text(encoding="utf-8") == old_marker            # マーカー現状維持
-    assert (dmd.parent / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8") == old_rag_md       # 既存成果物も無傷
+    assert _stub["calls"]["index_world"] == []
+    assert (dmd / ".rag_sig").read_text(encoding="utf-8") == old_marker
+    assert _rag_md(_stub) == old_rag_md
     assert res["status"] == "unchanged"
 
 
-# ---- sidecar 欠落フォールバック（実ファイルを削除/非regular file化して検知させる） ----
+# ---- sidecar 欠落フォールバック ----
 
 def _replace_with_directory(path):
     path.unlink()
@@ -777,8 +618,7 @@ def _replace_with_broken_symlink(path):
 
 
 def _sidecar_path(dmd, rel_stem, suffix):
-    """§8.1 三階層のフォルダ分離: `.evidence.json` は ir 層、それ以外（`.md`/`.md.meta.json`）は
-    dmd（md 層）そのもの。"""
+    # `.evidence.json` は ir 層、それ以外（`.md`/`.md.meta.json`）は dmd（md 層）
     if suffix == ".evidence.json":
         return dmd.parent / "ir" / f"{rel_stem}{suffix}"
     return dmd / f"{rel_stem}{suffix}"
@@ -791,10 +631,9 @@ def _sidecar_path(dmd, rel_stem, suffix):
     _replace_with_broken_symlink,
 ], ids=["missing", "directory", "broken_symlink"])
 def test_sidecar_missing_falls_back_to_full_run(_stub, suffix, mutate):
-    """sidecar欠落（削除・ディレクトリ化・壊れたシンボリックリンク化のいずれか）を、`.evidence.json`
-    だけでなく分岐②が前提にする `.md`／`.md.meta.json` についても検知したら、軽量refreshを使わず
-    全再構築へフォールバックする（`rag_sidecars_missing` の存在判定は `is_file()`＝ディレクトリ／
-    壊れた symlink も「無い」扱いになる契約）。"""
+    # 存在判定は `is_file()`（ディレクトリ／壊れた symlink も「無い」扱い）。バージョン drift が無くても検知する。
+    assert office_md.rag_sig_drift(_stub["dmd"]) is False
+    assert office_md.evidence_ir_sig_drift(_stub["dmd"]) is False
     mutate(_sidecar_path(_stub["dmd"], "a.xlsx", suffix))
     res = worker.sync("w")
     assert _stub["calls"]["run"] == [{"reflect": True}]
@@ -802,17 +641,9 @@ def test_sidecar_missing_falls_back_to_full_run(_stub, suffix, mutate):
 
 
 def test_sidecar_missing_fallback_runs_inside_same_lock_as_detection(_stub, monkeypatch):
-    """欠落検知〜全再構築〜`.rag_sig`削除は同一 `store.world_lock` 区間で行う（`run()` を呼ぶと
-    自身の非再入 lock と衝突するため、lock-free 版の `_run_locked` を lock 保持中に直接呼ぶ）。
-    さらに検知（`rag_sidecars_missing`）→全再構築（`_run_locked`）→マーカー削除
-    （`drop_rag_sig_marker`）の順序も固定する（順序が入れ替わると、検知結果を使わずに削除だけ
-    先行する等の非一貫性を生みうる）。
-
-    lock を一度解放してから全再構築を呼ぶ設計だと、その間隙に他プロセスの sync が割り込んで
-    全再構築が重複したり、`.rag_sig` 削除だけが lock 外に取り残されたりする非原子性を生む。
-    """
+    # 検知→全再構築→`.rag_sig` 削除は同一 `world_lock` 区間・この順序（lock を解放すると他プロセスの sync が
+    # 割り込み、全再構築の重複や削除の取り残しが起きる）。公開 `run()` は非再入 lock と衝突するため `_run_locked` を直接呼ぶ。
     (_stub["dmd"].parent / "ir" / "a.xlsx.evidence.json").unlink()
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     lock_active = {"value": False}
     events: list[str] = []
 
@@ -836,7 +667,7 @@ def test_sidecar_missing_fallback_runs_inside_same_lock_as_detection(_stub, monk
 
     def _run_locked(world, **kw):
         events.append("run")
-        run_seen_lock_active.append(lock_active["value"])   # 全再構築の実行中、lockはまだ保持されている
+        run_seen_lock_active.append(lock_active["value"])
         _stub["calls"]["run"].append({"reflect": kw.get("reflect", True)})
         return {"status": "auto_published", "ledger": 0, "flags": []}
     monkeypatch.setattr(worker, "_run_locked", _run_locked)
@@ -846,37 +677,18 @@ def test_sidecar_missing_fallback_runs_inside_same_lock_as_detection(_stub, monk
 
     def _drop(dr):
         events.append("drop")
-        drop_seen_lock_active.append(lock_active["value"])  # `.rag_sig`削除もlock保持中に行う
+        drop_seen_lock_active.append(lock_active["value"])
         return orig_drop(dr)
     monkeypatch.setattr(office_md, "drop_rag_sig_marker", _drop)
 
     res = worker.sync("w")
-    assert events == ["detect", "run", "drop"]              # 検知→全再構築→マーカー削除の順序を固定
+    assert events == ["detect", "run", "drop"]
     assert run_seen_lock_active == [True]
     assert drop_seen_lock_active == [True]
-    assert lock_active["value"] is False                    # sync() 復帰後はlockを手放している
+    assert lock_active["value"] is False                    # sync() 復帰後は lock を手放している
     assert _stub["calls"]["run"] == [{"reflect": True}]
     assert res["changed"] is True
-
-
-def test_sidecar_missing_fallback_drops_rag_sig_when_rag_es_enabled(_stub, monkeypatch):
-    (_stub["dmd"].parent / "ir" / "a.xlsx.evidence.json").unlink()
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
-    worker.sync("w")
-    # run() 自体は mock なので派生物は復元されないが、`.rag_sig` は実際に drop_rag_sig_marker で
-    # 削除される（次回 sync が分岐③へ確実に入るようにするため）。
-    assert not (_stub["dmd"] / ".rag_sig").is_file()
-
-
-def test_sidecar_missing_detected_even_without_version_drift(_stub):
-    """バージョン定数は不変（drift 無し）のまま sidecar だけが外部要因で欠落したケースでも、
-    drift 判定に先立って検知され全再構築へフォールバックする。"""
-    assert office_md.rag_sig_drift(_stub["dmd"]) is False
-    assert office_md.evidence_ir_sig_drift(_stub["dmd"]) is False
-    (_stub["dmd"].parent / "ir" / "a.xlsx.evidence.json").unlink()          # markerはそのまま・sidecarだけ欠落
-    res = worker.sync("w")
-    assert _stub["calls"]["run"] == [{"reflect": True}]
-    assert res["changed"] is True
+    assert not (_stub["dmd"] / ".rag_sig").is_file()        # RAG_ES 有効時は `.rag_sig` が実際に削除される
 
 
 def test_merge_es_runs_accumulates_embedding_and_elapsed_and_keeps_first_start():
@@ -889,45 +701,29 @@ def test_merge_es_runs_accumulates_embedding_and_elapsed_and_keeps_first_start()
     assert s["embedded"] == 7 and s["embed_elapsed_ms"] == 500 and s["indexed"] == 3
     assert t["started_at"] == prev_t["started_at"] and t["finished_at"] == new_t["finished_at"]
     assert t["elapsed_ms"] == 1800
-    # 初回が無ければ新しい値をそのまま
-    assert W._merge_es_runs(None, None, new_s, new_t) == (new_s, new_t)
+    assert W._merge_es_runs(None, None, new_s, new_t) == (new_s, new_t)   # 初回が無ければ新しい値のまま
 
 
-def test_sync_rag_refresh_failure_with_run_id_finalizes_as_failed(_stub, monkeypatch):
-    """rag drift の軽量再生成が一部失敗（`rag_failed>0`）したら、受付 run は `auto_published`
-    ではなく `failed`＋理由 flag で終端する（ES/Neo4j 未反映が成功に見えない）。"""
-    finished: list[dict] = []
-    monkeypatch.setattr(store, "finish_ingest_run",
-                         lambda run_id, **kw: finished.append({"run_id": run_id, **kw}))
-    monkeypatch.setattr(office_md, "rag_sig_drift", lambda dmd, **kw: True)
-    monkeypatch.setattr(office_md, "refresh_rag",
-                         lambda wd, dmd, **kw: {"rag_failed": 1, "rag_regenerated": 0})
+@pytest.mark.parametrize("drift_attr, refresh_attr, refresh_result, reason_check", [
+    pytest.param("rag_sig_drift", "refresh_rag", {"rag_failed": 1, "rag_regenerated": 0},
+                 lambda r: r.startswith("rag_refresh_failed"), id="rag-refresh-failed"),
+    pytest.param("document_ir_sig_drift", "refresh_document_ir",
+                 {"document_ir_failed": 1, "document_ir_regenerated": 2},
+                 lambda r: "document_ir_refresh_failed" in r, id="document-ir-partial-failure"),
+])
+def test_sync_refresh_failure_with_run_id_finalizes_as_failed(
+        _stub, monkeypatch, drift_attr, refresh_attr, refresh_result, reason_check):
+    # 軽量再生成が一部失敗したら、後段が成功しても受付 run は auto_published ではなく failed＋理由 flag で終端する。
+    finished = _capture_finish(monkeypatch)
+    monkeypatch.setattr(office_md, drift_attr, lambda dmd, **kw: True)
+    monkeypatch.setattr(office_md, refresh_attr, lambda wd, dmd, **kw: refresh_result)
+    if refresh_attr == "refresh_document_ir":
+        monkeypatch.setattr(office_md, "refresh_evidence_ir",
+                            lambda wd, dmd, **kw: {"evidence_ir_failed": 0, "rag_failed": 0})
     monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: False)
 
     res = worker.sync("w", run_id=999)
     assert res["status"] == "unchanged"
     assert len(finished) == 1 and finished[0]["run_id"] == 999
     assert finished[0]["status"] == "failed"
-    reasons = [f.get("reason") for f in finished[0]["extraction_snapshot"].get("flags", [])]
-    assert any(r and r.startswith("rag_refresh_failed") for r in reasons)
-
-
-def test_sync_document_ir_partial_failure_with_run_id_finalizes_as_failed(_stub, monkeypatch):
-    """document_ir の軽量再生成が一部失敗（`document_ir_failed>0`）し、後段の evidence/rag/ES が
-    成功しても、受付 run は `auto_published` ではなく `failed`＋理由 flag で終端する。"""
-    finished: list[dict] = []
-    monkeypatch.setattr(store, "finish_ingest_run",
-                         lambda run_id, **kw: finished.append({"run_id": run_id, **kw}))
-    monkeypatch.setattr(office_md, "document_ir_sig_drift", lambda dmd, **kw: True)
-    monkeypatch.setattr(office_md, "refresh_document_ir",
-                         lambda wd, dmd, **kw: {"document_ir_failed": 1, "document_ir_regenerated": 2})
-    monkeypatch.setattr(office_md, "refresh_evidence_ir",
-                         lambda wd, dmd, **kw: {"evidence_ir_failed": 0, "rag_failed": 0})
-    monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: False)
-
-    res = worker.sync("w", run_id=999)
-    assert res["status"] == "unchanged"
-    assert len(finished) == 1 and finished[0]["run_id"] == 999
-    assert finished[0]["status"] == "failed"
-    reasons = [f.get("reason") for f in finished[0]["extraction_snapshot"].get("flags", [])]
-    assert any(r and "document_ir_refresh_failed" in r for r in reasons)
+    assert any(r and reason_check(r) for r in _flag_reasons(finished))

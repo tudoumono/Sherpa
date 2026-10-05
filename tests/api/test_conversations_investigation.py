@@ -6,7 +6,7 @@
 - `format=md`（既定）は人が読む Markdown・`format=json` は保存した3つ（manifest/items/coverage）を
   そのまま返す。いずれも固定の一般名で `Content-Disposition: attachment`。
 
-未ログインは 401（test_auth_snapshot.py で snapshot 済み）。要 Postgres。DB 不可は SKIP。
+未ログインは 401（test_authz_matrix.py で固定済み）。要 Postgres。DB 不可は SKIP。
 """
 from __future__ import annotations
 

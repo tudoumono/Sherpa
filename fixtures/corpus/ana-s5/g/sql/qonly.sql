@@ -1,0 +1,3 @@
+CREATE TABLE Q.Y (
+    ID INT
+);

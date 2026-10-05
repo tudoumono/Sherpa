@@ -46,7 +46,7 @@ Scene("21-新しい図", "graph.html",        # 画像名（.png なし）／対
 ### 11. 使い方：範囲とAIの切り替え
 - `11-knowledge-toggle.png` — 「社内資料」トグル（既定オン）
 - `11-scope-brain.png` — **範囲**（フォルダ）と**頭脳**（AI）の選択
-- `11-settings.png` — 設定画面（AI 接続：OpenAI/Gemini/Ollama/Codex のキー・モデル）
+- `11-settings.png` — 設定画面（AI 接続：頭脳の選択・キー・接続先）
 
 ### 20. 管理：資料の取り込み
 - `20-ingest-new.png` — 「資料フォルダ」画面（フォルダ登録→取り込み）
@@ -55,7 +55,6 @@ Scene("21-新しい図", "graph.html",        # 画像名（.png なし）／対
 ### 21. 管理：グラフと検索
 - `21-graph.png` — ナレッジグラフ（色分け・近傍・名前検索）
 - `21-graph-search.png` — 関係/条件でのグラフ検索の結果
-- `21-graph-ask.png` — グラフへの自然言語質問（管理チャット）と根拠ノード
 - `21-es-search.png` — 「取り込み状況」内の**全文検索パネル**（ヒット一覧）
 
 > 備考: デモデータが小規模なため、`21-graph.png`（cytoscape の力学レイアウト）はノード配置が

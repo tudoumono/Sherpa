@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import json
 
-from sherpa import agentic_search as A
+from sherpa import tool_dispatch
+from sherpa.parts.read import tools as read_tools
 from sherpa import corpus_docs, es_index, grep_tool, worlds
 from sherpa.ingest.analyzers import registry
 from sherpa.ingest.analyzers._base import Analyzer, DefResult, RefResult
@@ -64,15 +65,15 @@ def test_accept_vs_decline_classification_agrees_across_grep_agentic_es(monkeypa
     assert code_hits == {"accepted.txt"}
     assert docs_hits == {"declined.txt"}
 
-    # ---- agentic_search._safe_doc_path: 同じ確定判定で層外を拒否する（read_around の実行ゲート） ----
-    assert A._safe_doc_path(world, "accepted.txt", layer="code") is not None
-    assert A._safe_doc_path(world, "accepted.txt", layer="docs") is None
-    assert A._safe_doc_path(world, "declined.txt", layer="docs") is not None
-    assert A._safe_doc_path(world, "declined.txt", layer="code") is None
+    # ---- parts/read/tools._safe_doc_path: 同じ確定判定で層外を拒否する（read_around の実行ゲート） ----
+    assert read_tools._safe_doc_path(world, "accepted.txt", layer="code") is not None
+    assert read_tools._safe_doc_path(world, "accepted.txt", layer="docs") is None
+    assert read_tools._safe_doc_path(world, "declined.txt", layer="docs") is not None
+    assert read_tools._safe_doc_path(world, "declined.txt", layer="code") is None
 
     # ---- agentic_search list_docs ツール: 同じ確定判定（doc_ledger の branch）で一覧を絞る ----
-    res_code, _, _, _ = A.run_tool("list_docs", {"limit": 50}, world, None, layer="code")
-    res_docs, _, _, _ = A.run_tool("list_docs", {"limit": 50}, world, None, layer="docs")
+    res_code, _, _, _ = tool_dispatch.run_tool("list_docs", {"limit": 50}, world, None, layer="code")
+    res_docs, _, _, _ = tool_dispatch.run_tool("list_docs", {"limit": 50}, world, None, layer="docs")
     assert {d["rel_path"] for d in res_code["docs"]} == {"accepted.txt"}
     assert {d["rel_path"] for d in res_docs["docs"]} == {"declined.txt"}
 

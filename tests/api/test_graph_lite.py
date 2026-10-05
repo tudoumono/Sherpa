@@ -85,7 +85,7 @@ def test_if_none_match_mismatch_returns_200():
 
 
 def test_default_limit_applies_without_param():
-    """limit 未指定でも env 既定（SHERPA_GRAPH_NODE_LIMIT）が効く（総数は total_nodes で分かる）。"""
+    """limit 未指定でも既定件数が効く（総数は total_nodes で分かる）。"""
     c = _client()
     r = c.get("/graph", params={"world": V})               # limit 省略＝サーバ既定
     assert r.status_code == 200
@@ -107,18 +107,3 @@ def test_graph_view_failure_returns_503_not_silent(monkeypatch):
     assert r.status_code == 503
 
 
-def test_graph_ask_status_summary_failure_returns_503_with_graph_message(monkeypatch):
-    """GRA-1是正RV2#1: `graph_ask` の前段（`_knowledge_status_summary`→`graph_view`）が
-    ValueError 以外の例外を出しても、生の 500 ではなくログ付き 503 にする。文言は AI/Neo4j の
-    障害用ではなく `/graph` と同じ `_GRAPH_UNAVAILABLE_MESSAGE`（グラフ状態の取得に失敗）を使い、
-    利用者が AI 障害と取り違えないようにする。"""
-    from sherpa.routers import graph as graph_router
-
-    def _boom(wid, scope_paths=None):
-        raise RuntimeError("db down")
-
-    monkeypatch.setattr(graph_router, "_knowledge_status_summary", _boom)
-    c = _client()
-    r = c.post("/graph/ask", json={"question": "消費税率について", "world": V})
-    assert r.status_code == 503
-    assert r.json()["detail"] == graph_router._GRAPH_UNAVAILABLE_MESSAGE

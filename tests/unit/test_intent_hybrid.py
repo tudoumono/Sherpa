@@ -35,7 +35,7 @@ def test_confident_skips_llm():
 def test_ambiguous_uses_llm_when_confident():
     orig = _patch(lambda m, s, **kw: {"lens": "impact", "confident": True})
     try:
-        d = C._build_router([], "v1", {"openai_api_key": "k"}, can_ask=True)(_CONFLICT)
+        d = C._build_router([], "v1", {"agent": "codex", "openai_api_key": "k"}, can_ask=True)(_CONFLICT)
         assert d["lens"] == "impact" and d["confident"] is True and "AI判定" in d["reason"]
     finally:
         intent_llm.classify = orig
@@ -44,7 +44,7 @@ def test_ambiguous_uses_llm_when_confident():
 def test_ambiguous_clarify_when_llm_unsure_and_can_ask():
     orig = _patch(lambda m, s, **kw: None)                       # LLM 未接続/不明
     try:
-        d = C._build_router([], "v1", {}, can_ask=True)(_CONFLICT)
+        d = C._build_router([], "v1", {"agent": "codex"}, can_ask=True)(_CONFLICT)
         assert d["lens"] == "clarify" and d["question"]["type"] == "question"
     finally:
         intent_llm.classify = orig
@@ -59,10 +59,33 @@ def test_ambiguous_qa_fallback_when_cannot_ask():
         intent_llm.classify = orig
 
 
+def test_simple_agent_never_calls_intent_llm_and_fixes_ambiguous_to_qa():
+    """簡易は管理者設定の AI 以外へ送らない＝曖昧でも意図分類 LLM を呼ばず、確認も挟まず qa に固定する。"""
+    calls = []
+    orig = _patch(lambda m, s, **kw: calls.append(m) or {"lens": "impact", "confident": True})
+    try:
+        d = C._build_router([], "v1", {"agent": "simple"}, can_ask=True)(_CONFLICT)
+        assert d["lens"] == "qa" and d["confident"] is True and calls == []
+    finally:
+        intent_llm.classify = orig
+
+
+def test_simple_selected_by_auto_default_also_skips_intent_llm(monkeypatch):
+    """保存済み agent が無く自動選択で簡易が選ばれる場合も、意図分類 LLM を呼ばない。"""
+    monkeypatch.setattr("sherpa.agent_constructs.default_agent", lambda *a, **k: "simple")
+    calls = []
+    orig = _patch(lambda m, s, **kw: calls.append(m) or {"lens": "impact", "confident": True})
+    try:
+        d = C._build_router([], "v1", {}, can_ask=True)(_CONFLICT)
+        assert d["lens"] == "qa" and calls == []
+    finally:
+        intent_llm.classify = orig
+
+
 def test_llm_low_confidence_goes_to_clarify():
     orig = _patch(lambda m, s, **kw: {"lens": "impact", "confident": False})   # LLM も自信なし
     try:
-        d = C._build_router([], "v1", {}, can_ask=True)(_CONFLICT)
+        d = C._build_router([], "v1", {"agent": "codex"}, can_ask=True)(_CONFLICT)
         assert d["lens"] == "clarify"
     finally:
         intent_llm.classify = orig
@@ -72,7 +95,7 @@ def test_per_turn_memoize_single_classify():
     calls = []
     orig = _patch(lambda m, s, **kw: calls.append(m) or None)
     try:
-        r = C._build_router([], "v1", {}, can_ask=False)
+        r = C._build_router([], "v1", {"agent": "codex"}, can_ask=False)
         r(_CONFLICT)
         r(_CONFLICT)                                        # 同ターンの再 route（_GenProvider）でも
         assert len(calls) == 1                              # LLM 分類は1回だけ（二重実行しない）

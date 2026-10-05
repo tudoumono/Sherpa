@@ -1,4 +1,5 @@
-// ログイン画面（Slice3）。POST /auth/login → 成功で next= or /ui/chat.html へ redirect。
+// ログイン画面。POST /auth/login → 成功で next= or /ui/chat.html へ redirect。
+// 設計: docs/design/users.md「ログインとセッション」
 // セキュリティ: esc() は textContent 専用のため innerHTML に使わない。エラー文言は固定文字列のみ。
 'use strict';
 

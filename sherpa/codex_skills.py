@@ -1,17 +1,9 @@
-"""Codex authoring 実行前に authoring/.agents/skills へ配備するスキル
-（Codex 強化計画 Phase1・P1-b・§5c 決定＝案A′ ベース＋個人オーバーレイ）。
+"""Codex 実行前に authoring/.agents/skills へスキルを配備する。
 
-ベーススキル（`sherpa/skills_base/{xlsx,docx,pptx}/`・Sherpa 管理・自作・リポジトリ管理の READ-ONLY 原本）
-＋ 個人スキル（`users/{uid}/workspace/skills/<name>/`・本人のみ書込）を、Codex 実行の直前に
-`authoring/.agents/skills/` へ**毎回作り直し**でコピーする。同名スキルは個人が base を置換する
-（"各自でブラッシュアップできないのは問題" という FB を踏まえた設計）。
-
-symlink は一切追従しない（読み取り側で fail-closed・Codex 実行の封じ込め recipe の一部）。
-knowledge=ON の Codex 実行**全部**で配備する（author レンズに限定しない＝progressive disclosure で
-軽量・description に一致しなければ Codex はスキル本文を読まないため他レンズへの悪影響は無い）。
-
-呼び出し側で try/except すること（AGENTS.md 同様ベストエフォート・fail-open。配備に失敗しても
-プロンプト側の指示だけで Codex 実行自体は継続してよい）。
+ベーススキル（`sherpa/skills_base/{xlsx,docx,pptx}/`）＋個人スキル（`users/{uid}/workspace/skills/<name>/`）を、
+実行の直前に毎回作り直しでコピーする（同名は個人が置換）。symlink は一切追従しない。
+呼び出し側で try/except すること（配備に失敗しても Codex 実行は継続してよい）。
+設計: docs/design/codex.md「実行の構成」
 """
 from __future__ import annotations
 
@@ -21,7 +13,7 @@ from pathlib import Path
 
 _log = logging.getLogger("sherpa")
 
-# ベーススキル原本（リポジトリ管理・自作＝外部スキルのコピー禁止）。
+# ベーススキル原本（リポジトリ管理・READ-ONLY）
 BASE_SKILLS_DIR = Path(__file__).resolve().parent / "skills_base"
 
 
@@ -30,7 +22,7 @@ def _has_symlink_inside(root: Path) -> bool:
     try:
         return any(p.is_symlink() for p in root.rglob("*"))
     except OSError:
-        return True   # 走査自体に失敗＝安全側（symlink ありとみなして拒否）
+        return True
 
 
 def _copy_skill_dir(src: Path, dst: Path) -> bool:
@@ -52,15 +44,9 @@ def _copy_skill_dir(src: Path, dst: Path) -> bool:
 def deploy_skills(authoring: Path, uid: str, users_dir: Path, *, skip_prefix: str | None = None) -> None:
     """authoring/.agents/skills を毎回作り直し、base→個人オーバーレイの順で配備する。
 
-    `authoring` は Codex の cwd（既存の封じ込め recipe そのまま・sandbox profile 変更ゼロ）。
-
-    `skip_prefix`（既定 None）: 指定すると、この文字列で始まる名前のスキル（base／個人どちらも）を
-    配備しない——素の Codex モード（`plain`・docs/archive/2026-09-24-素のCodexモード.md §1.2）が
-    `"investigate-"` を渡し、調査スキル（原本を Python で開く前提の手順書）を置かない。
+    `skip_prefix` を指定すると、その名前で始まるスキル（base・個人とも）を配備しない。
     """
-    # RV HIGH: 親 `.agents` 自体の symlink も拒否する。Codex は authoring に書けるため、前回実行で
-    # `.agents -> ../files` 等にすり替えられていると、下の rmtree/copytree が authoring 外
-    # （ユーザーデータ）を削除・書込してしまう。symlink なら unlink して実ディレクトリで作り直す。
+    # 親 `.agents` 自体の symlink も拒否する（authoring 外の削除・書込を防ぐ）。symlink なら unlink して作り直す
     agents_dir = authoring / ".agents"
     if agents_dir.is_symlink():
         agents_dir.unlink()
@@ -74,14 +60,14 @@ def deploy_skills(authoring: Path, uid: str, users_dir: Path, *, skip_prefix: st
     def _skip(name: str) -> bool:
         return skip_prefix is not None and name.startswith(skip_prefix)
 
-    # ベース（リポジトリ管理・自作）を先に配備。
+    # ベースを先に配備
     if BASE_SKILLS_DIR.is_dir():
         for base_skill in sorted(p for p in BASE_SKILLS_DIR.iterdir() if p.is_dir()):
             if _skip(base_skill.name):
                 continue
             _copy_skill_dir(base_skill, dest_root / base_skill.name)
 
-    # 個人オーバーレイ（同名スキルは個人が置換）。存在しなくても正常（個人スキル未作成が既定）。
+    # 個人オーバーレイ（同名は個人が置換。無くても正常）
     personal_root = users_dir / uid / "workspace" / "skills"
     if personal_root.is_symlink() or not personal_root.is_dir():
         return

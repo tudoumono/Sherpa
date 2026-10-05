@@ -1,0 +1,7 @@
+CREATE TABLE M (
+    ID INT
+);
+
+CREATE TABLE S.M (
+    ID INT
+);

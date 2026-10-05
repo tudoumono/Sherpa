@@ -10,15 +10,9 @@ snapshot で固定する。
   - `dir(sherpa.agents)` から dunder 名（`__xxx__`）を除外する。
     理由: モジュール→パッケージ化で `__path__` 等パッケージ固有の dunder が新規に現れ、
     分割そのもの（挙動不変のはず）とは無関係にスナップショットが壊れるため。
-  - 値が `inspect.ismodule()` の属性（stdlib/3rd-party の import そのもの。例: os/re/json/logging・
-    `anthropic`・`urllib`（`import urllib.request` 由来）・`codex_agents_md`/`codex_skills`/`llm`
-    （`from . import ...`）を除外する。
-    理由: どのモジュールがどの stdlib/隣接モジュールを import するかは実装都合であり、S2〜S11 で
-    スライスが進むたびに変わりうる（例: urllib は現状 agents.py 直下だが、分割後は codex/provider.py
-    や codex/mcp.py 側に移る）。ドメイン関数・定数・クラスなど「意味のある」公開名だけを対象にする。
-    `urllib` はこの規則で golden から除外されるため、`urllib` バインドの存在は別の
-    `test_agents_urllib_is_module_bound_on_facade` で個別 pin する
-    （`tests/unit/test_usage_capture.py` が `A.urllib.request.urlopen` を patch するため）。
+  - 値が `inspect.ismodule()` の属性（stdlib/3rd-party の import そのもの）を除外する。
+    理由: どのモジュールがどの stdlib/隣接モジュールを import するかは実装都合であり、
+    ドメイン関数・定数・クラスなど「意味のある」公開名だけを対象にする。
   - 上記2条件に該当しない名前（public 関数・定数・クラス・facade で re-export された非モジュール値）は
     private 名（`_` 始まり）であっても**すべて対象**にする。tests/ や sherpa/ が直接参照/monkeypatch する
     私的名（`REQUIRED_PRIVATE_OR_PUBLIC_NAMES` 参照）が golden から漏れないことを本テストで担保する
@@ -60,6 +54,9 @@ pytestmark = pytest.mark.unit
 
 from sherpa import agents as A
 from sherpa import worlds as W
+from sherpa.providers import prompts as PROMPTS
+from sherpa.providers.codex import sandbox as SB
+from sherpa.providers.codex import turn_consts as TURN_CONSTS
 
 _SURFACE_GOLDEN = pathlib.Path(__file__).resolve().parent / "goldens" / "agents_surface.txt"
 
@@ -67,20 +64,11 @@ _SURFACE_GOLDEN = pathlib.Path(__file__).resolve().parent / "goldens" / "agents_
 # 参照/monkeypatch する名前（事前分析・依頼元の棚卸しに基づく）。golden から漏れていないかの
 # allowlist（golden 自体は dir() スナップショットなので、これは golden の下位互換チェック）。
 REQUIRED_NAMES = (
-    # production: 外部（routers/health.py 等）・テストが参照する公開/私的名
-    "AGENT_PROVIDERS", "Ctx", "get_provider", "provider_info",
-    "BedrockProvider", "BEDROCK_MODEL_CHOICES", "BEDROCK_MODEL_ID_RE",
-    "_BEDROCK_MODEL", "_bedrock_auth_available", "_bedrock_profile_label",
-    "_redact_bedrock_secret", "_web_search_admin_allowed",
-    "list_bedrock_inference_profiles", "_bedrock_region", "_bedrock_error_detail",
-    "_codex_sandbox_enabled", "_kb_read_roots", "_write_codex_authoring_config",
-    # テストが patch/直接参照する名前（urllib は ismodule 除外のため別テストで pin）
-    "_gather", "CodexProvider", "HeuristicProvider", "OpenAIProvider",
-    "OllamaProvider", "GeminiProvider", "_GenProvider", "_plain_run", "_facts",
-    "_kb_hint", "_mcp_env", "_mcp_config_args", "_mcp_neighbors_from",
-    "_apply_codex_neighbors", "_codex_ask_question",
-    "_codex_ask_capture", "_codex_mcp_enabled", "_marp_bin", "_detect_chrome_path",
-    "_select_provider", "_SKILLS_BASE",
+    # 製品コードが参照する名前
+    "AGENT_PROVIDERS", "Ctx", "CodexProvider", "get_provider", "provider_info",
+    "_web_search_admin_allowed", "_codex_sandbox_enabled",
+    # providers が実行時に facade 経由で解決する名前（テストで差し替える口）
+    "SimpleProvider", "_UnwiredProvider", "_gather",
 )
 
 
@@ -121,18 +109,6 @@ def test_agents_surface_includes_names_referenced_by_tests_and_sherpa():
     assert not missing, f"agents の公開名一覧から漏れている（tests/sherpa が直接参照する）: {missing}"
 
 
-def test_agents_urllib_is_module_bound_on_facade():
-    """`urllib`（`import urllib.request` 由来）はフィルタ規則で golden から除外されるが、
-    facade（`sherpa.agents`）に module として存在し続けることを別途 pin する。
-
-    `tests/unit/test_usage_capture.py` が `A.urllib.request.urlopen` を monkeypatch するため、
-    分割後も agents.py（facade）に `import urllib.request` が残っている必要がある。
-    """
-    assert hasattr(A, "urllib"), "agents.urllib が無い（urllib.request の facade 束縛が消えている）"
-    assert inspect.ismodule(A.urllib), "agents.urllib がモジュールでない"
-    assert hasattr(A.urllib, "request"), "agents.urllib.request が無い"
-
-
 # ===== `__file__` 由来値（危険地雷1）: repo root を指すことの pin =====
 
 def test_kb_read_roots_fallback_points_at_repo_data_kb(monkeypatch):
@@ -144,7 +120,7 @@ def test_kb_read_roots_fallback_points_at_repo_data_kb(monkeypatch):
     """
     monkeypatch.setattr(W, "_fixtures", lambda: False)
     monkeypatch.setattr(W, "world_dir", lambda world_id: None)
-    roots = A._kb_read_roots("no-such-world-s1-pin")
+    roots = SB._kb_read_roots("no-such-world-s1-pin")
     repo_root = pathlib.Path(A.__file__).resolve().parents[1]
     assert roots == [str((repo_root / "data" / "kb").resolve())]
 
@@ -159,7 +135,7 @@ def test_marp_bin_search_root_matches_repo_root(monkeypatch):
     monkeypatch.delenv("SHERPA_MARP_BIN", raising=False)
     monkeypatch.setattr(pathlib.Path, "is_file", lambda self: True)
     monkeypatch.setattr(os, "access", lambda *a, **k: True)
-    result = A._marp_bin()
+    result = SB._marp_bin()
     repo_root = pathlib.Path(A.__file__).resolve().parents[1]
     expected = repo_root / "tools" / "marp" / "node_modules" / ".bin" / "marp"
     assert result == str(expected)
@@ -170,7 +146,7 @@ def test_kb_hint_abs_contains_repo_root_path(monkeypatch):
     （`Path(__file__).resolve().parents[1]` 由来）。fixtures 経路は worlds registry（DB）に依存しない。
     """
     monkeypatch.setenv("SHERPA_USE_FIXTURES", "1")
-    text = A._kb_hint_abs("v1")
+    text = PROMPTS._kb_hint_abs("v1")
     repo_root = pathlib.Path(A.__file__).resolve().parents[1]
     expected_base = repo_root / "fixtures" / "corpus" / "v1"
     assert str(expected_base) in text
@@ -189,7 +165,7 @@ def test_write_codex_authoring_config_pythonpath_points_at_repo_root(tmp_path, m
     except ModuleNotFoundError:
         pytest.skip("py<3.11 は tomllib 無し")
     ch = tmp_path / "ch"
-    A._write_codex_authoring_config(ch, ["/kb"], "low", True, "test", None)
+    SB._write_codex_authoring_config(ch, ["/kb"], "low", True, "test", None)
     cfg_text = (ch / "config.toml").read_text(encoding="utf-8")
     parsed = tomllib.loads(cfg_text)
     pythonpath = parsed["mcp_servers"]["sherpa"]["env"]["PYTHONPATH"]
@@ -206,4 +182,4 @@ def test_skills_base_points_at_repo_sherpa_dir():
     （黙って `sherpa/providers/codex` を指してしまう地雷だった・module docstring 参照）。
     """
     expected = pathlib.Path(A.__file__).resolve().parent / "skills_base"
-    assert A._SKILLS_BASE == expected
+    assert TURN_CONSTS._SKILLS_BASE == expected

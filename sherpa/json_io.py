@@ -1,8 +1,4 @@
-"""JSON 入出力の小ユーティリティ（**アトミック書き込み**の単一の真実源・RV DRY）。
-
-派生領域の concepts/キャッシュ/抽出結果は、書き込み途中で同時読み（build_world 等）が**部分 JSON** を
-掴まないよう **tmp→os.replace** で原子置換すべき。各所で個別実装されていたのを集約する。
-"""
+"""JSON 入出力の小ユーティリティ。書き込みは tmp→os.replace のアトミック置換。"""
 from __future__ import annotations
 
 import json
@@ -21,17 +17,17 @@ def read_json(path, default=None):
 
 
 def write_json_atomic(path, data, *, indent=None, ensure_ascii=False) -> Path:
-    """JSON を**アトミックに**書く（tmp→os.replace）。親 dir は自動作成。`indent` 省略時はコンパクト（キャッシュ向け）。"""
+    """JSON をアトミックに書く（親 dir は自動作成。`indent` 省略時はコンパクト）。"""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    # tmp 名は**一意**にする＝同一ファイルへの同時書き込みが tmp を奪い合わない（lock 外の経路あり・RV③ High）。
+    # tmp 名は一意にする（同一ファイルへの同時書き込みで tmp を奪い合わない）
     tmp = p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         tmp.write_text(json.dumps(data, ensure_ascii=ensure_ascii, indent=indent), encoding="utf-8")
-        os.replace(tmp, p)                                 # 同一 dir/FS なら原子置換（最後の writer 勝ち・破損なし）
+        os.replace(tmp, p)
     except OSError:
         try:
-            tmp.unlink()                                   # 失敗時は自分の tmp を後始末（取りこぼさない）
+            tmp.unlink()
         except OSError:
             pass
         raise
@@ -39,9 +35,7 @@ def write_json_atomic(path, data, *, indent=None, ensure_ascii=False) -> Path:
 
 
 def write_text_atomic(path, text: str) -> Path:
-    """任意のテキストを**アトミックに**書く（tmp→os.replace）。`write_json_atomic` と同じ流儀（親 dir 自動作成・
-    tmp 名は一意・失敗時は自分の tmp を後始末）だが、呼び出し側で既に直列化済みの文字列（例:
-    `document_ir.to_json_str` の決定的 JSON 文字列）をそのまま書きたい場合に使う（DOC-IR-001.5・修正4）。"""
+    """任意のテキストをアトミックに書く（`write_json_atomic` と同じ流儀。直列化済みの文字列用）。"""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")

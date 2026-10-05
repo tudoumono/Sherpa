@@ -1,12 +1,7 @@
-"""Codex authoring 実行前に authoring ディレクトリへ書き出す AGENTS.md（docs/archive/2026-07-02-Codex強化計画.md §2）。
+"""Codex 実行前に authoring ディレクトリへ書き出す AGENTS.md（共通ルール：KB 以外を読まない・根拠ベースで答える・成果物は authoring 直下 等）。
+設計: docs/design/codex.md「実行の構成」
 
-`agents.py` の `CodexProvider._prompt`/`_prompt_mcp` に埋め込んでいた**共通ルール**（KB 以外を読まない・
-根拠ベースで答える・成果物は authoring 直下 等）をここへ切り出し、プロンプト側は
-質問固有の部分だけに痩せさせる（docs/archive/2026-07-02-Codex強化計画.md §5-1 決定）。
-
-Codex CLI は cwd 直下（＝ authoring/）の AGENTS.md を実行時に自動的に読み込む（公式仕様）。per-request で
-毎回上書きするため内容は決定的固定文字列（冪等）。実行後も authoring に残ってよい
-（ユーザー本人が見えるだけの無害なファイル・機密は含まない）。
+Codex CLI は cwd 直下の AGENTS.md を自動で読む。リクエストごとに上書きし、内容は決定的な固定文字列（冪等）。機密は含まない。
 """
 from __future__ import annotations
 
@@ -16,8 +11,7 @@ from pathlib import Path
 from .investigation_state import COVERAGE_KEYWORDS
 from .providers.codex.sandbox import _CODEX_MAX_CONCURRENT_SUBAGENTS
 
-# AGENTS.md の網羅要求の検知語（キーワードの定義そのものは `investigation_state.COVERAGE_KEYWORDS`
-# が唯一の真実源——ここでは文言生成のためその集合をそのまま読み下すだけ）。
+# AGENTS.md の網羅要求の検知語。定義は `investigation_state.COVERAGE_KEYWORDS`（唯一の真実源）。
 _COVERAGE_KEYWORD_LIST = "「" + "」「".join(COVERAGE_KEYWORDS) + "」"
 
 AGENTS_MD = f"""\
@@ -95,8 +89,7 @@ AGENTS_MD = f"""\
   （同じことを再度聞かない）。
 """
 
-# 原本直読が許可されたターンだけ足す段落（調査スキルは原本を Python で開く前提＝直読不許可のターンでは
-# 達成不能な手順書へ誘導しない）。
+# 原本直読が許可されたターンだけ足す段落（直読不許可のターンで達成不能な手順へ誘導しない）。
 _INVESTIGATE_SKILLS_PARAGRAPH = """\
 - 質問の型（資料一覧／仕様の問い合わせ／影響範囲／原因調査／比較）に合う `.agents/skills` の
   investigate-* スキルを読んで、その手順（ツールで当たり→原本の中身を確かめる→答える）どおりに進める。
@@ -106,21 +99,11 @@ _INVESTIGATE_SKILLS_PARAGRAPH = """\
   `iconv -f CP932 -t UTF-8` を通す。UTF-8 のファイルには適用しない。
 """
 
-# 本体自身のソース確認要件（深さに関わらず常時）: worker の主張を鵜呑みにせず、根拠に示された
-# ファイル:行を自分で開いて突き合わせる（全文の読み直しは要求しない・根拠が無い主張は『未確認』に
-# 分類して残す＝base AGENTS_MD 冒頭の分類原則に従う。捨てない）。
-# `direct_read`（`_direct_read_ok`・provider.py が秘匿列挙／範囲の解決に失敗したときは偽）で
-# 文言を切り替える——直読不可ターンで「直接読む」と指示すると、同じターンの他の指示
-# （`_prompt`/`_prompt_mcp` の「今回は原本の直接読み取りは使えない」）と矛盾し、Codex に実行不能な
-# 手順を指示することになる。要件そのもの（本体自身の確認・グラフ不調でも止めない）は両分岐で同じ。
-#
-# `layer`（探す対象＝`docs`／`code`／`both`／`None`）も見る: 直読不可（MCP 読取のみ）かつ
-# `layer == "docs"` の組合せでは、MCP の `ripgrep_search`/`read_around` 自体が層制限でソース
-# （code 種別）を拒否する（`agentic_search.py::in_layer_code`）——この組合せで「必ずソースを読む」を
-# 要求すると実行不能な指示になる。提案書 §3 S1「必須種別は許可範囲内で解釈」・裁定⑥（部分回答＋
-# 「ソース未確認のため確定不可」）どおり、この組合せだけは読取要求ではなく確定不可の告知を指示する。
-# direct_read=True のときは層に関係なく直読でソース確認する（`sandbox.py:633-638` の裁定＝
-# Codex は層の指定を強制しない・直読は層に関係なく許可）。
+# 本体自身のソース確認要件（深さに関わらず常時）。worker の主張を鵜呑みにせず、根拠のファイル:行を自分で開いて突き合わせる。
+# 根拠が無い主張は「未確認」に分類して残す。
+# `direct_read` で文言を切り替える（直読不可のターンで「直接読む」と指示しない）。
+# `layer`（`docs`／`code`／`both`／`None`）も見る: 直読不可かつ `layer == "docs"` では MCP の読取がソースを拒否するため、
+# 読取要求ではなく「ソース未確認のため確定不可」の告知を指示する。`direct_read=True` は層に関係なく直読で確認する。
 def _source_verification_paragraph(direct_read: bool, layer: str | None = None) -> str:
     if not direct_read and layer == "docs":
         return """\
@@ -147,15 +130,8 @@ def _source_verification_paragraph(direct_read: bool, layer: str | None = None) 
   または再調査では調べる量を一段引き上げる（読む範囲・確認するファイルを広げる）。
 """
 
-# `--output-schema`（docs/archive/2026-09-08-Codex出力スキーマ.md §2-3）有効時だけ付け足す段落。
-# スキーマ無効時にこの構造化応答の要求を出すと、Codex が実際には守れない形式を約束させられるだけで
-# 実害がある（`--output-schema` が無ければ CLI 側の強制も無い）ため、`write_agents_md` の
-# `output_schema` 引数が真のときだけ本文に足す。
-# `status`／`in_progress`／`next_step`／中断時の記述の意味（v1・v2 共通）。v2 段落は元々「3項目版と
-# 同じ意味」と v1 段落を参照する形だったが、`output_schema_v2=True` のときは v1 段落自体が出力され
-# ず参照先が無い（下の `structured_paragraph` 選択が排他のため）——`providers/codex/provider.py` の
-# 自動継続（`_STRUCTURED_STATUSES`・全件確認前は `in_progress` にする・`final` を受けると継続を
-# 終了する）の前提となるこの記述を1か所に括り出し、両段落から使う。
+# `--output-schema` 有効時だけ付け足す構造化応答の段落で共通に使う、`status`／`in_progress`／`next_step`／中断時の記述の意味。
+# `providers/codex/provider.py` の自動継続（`_STRUCTURED_STATUSES`）の前提。
 _STATUS_FIELD_MEANING = (
     "`status` が `final` になるのは、依頼の調査が完了した（全件要求なら対象範囲の確認を終え、"
     "該当項目が answer にそろった）ときだけ。調べる作業がまだ残っているなら、同じ応答内で続けて"
@@ -169,17 +145,8 @@ _STRUCTURED_RESPONSE_PARAGRAPH = f"""\
 - 最終応答は `status`／`answer`／`next_step` の3項目で返す。{_STATUS_FIELD_MEANING}
 """
 
-# `SHERPA_CODEX_OUTPUT_SCHEMA=2` のときだけ足す段落。
-# `_STRUCTURED_RESPONSE_PARAGRAPH`（3項目）の代わりに使う——v2 は `claims` を4件目のキーとして
-# 追加するため、Codex 自身に「4項目で返す・claims の意味と閉じた語彙」を伝えないと、CLI 側の
-# スキーマ強制があっても Codex は3項目のつもりのまま埋めた形式的な claims しか返さず（または
-# 常に空のまま）、`data.claims` が無言で空になる（`provider.py::_parse_claim` が空の confirmed を
-# 拒否するため、実際には「claims 無し」より「主張構造の恩恵が一切効かない」形で顕在化する）。
-# S1b: `claims` 各要素に `evidence_kinds`（7キー目）を足した——Codex 自身の MCP/直読の履歴は
-# `investigation_state.Evidence` のような機械的に検証できる調査内台帳を持たないため、API 経路
-# （根拠から種別を導く）と違い Codex は主張ごとに「実際に確認した根拠種別」を自己申告する必要が
-# ある。申告が閉じた語彙に合わないと主張構造ごと空になる（`_parse_claim`）ため、語彙・判定基準を
-# 具体的に書く。
+# `SHERPA_CODEX_OUTPUT_SCHEMA=2` のときだけ、3 項目版の代わりに使う段落。`claims`（各要素に `evidence_kinds`）の意味と閉じた語彙を伝える。
+# Codex は根拠種別を自己申告する必要があり、語彙に合わないと主張構造ごと空になる（`_parse_claim`）。
 _STRUCTURED_RESPONSE_PARAGRAPH_V2 = f"""\
 - 最終応答は `status`／`answer`／`next_step`／`claims` の4項目で返す。{_STATUS_FIELD_MEANING}
   `claims` は回答の主張を1件ずつ構造化した配列（`id`／`status`／`text`／
@@ -199,41 +166,27 @@ _STRUCTURED_RESPONSE_PARAGRAPH_V2 = f"""\
   `evidence_kinds` は、この主張の根拠として**実際に開いて確認した**資料の種別を列挙する配列
   （`source`／`spec_doc`／`definition`／`log_config`／`callgraph` の閉集合・複数可・無ければ
   空配列）。`source` は `src/` のコード本文を実際に読んだときだけ入れる（一覧・件数だけの取得は
-  含めない）。`callgraph` はグラフ照会（graph_neighbors 等）で確認したとき、グラフが使えなければ
+  含めない）。`callgraph` はグラフ照会（graph_neighbors・graph_impact 等）で確認したとき、グラフが使えなければ
   ripgrep 等の呼出し検索で代替確認したときに入れる。`confirmed` にするのは、この質問の型が必要と
   する根拠種別（仕様問い合わせ＝ソース＋設計書／影響調査＝ソース＋呼出関係／トラブルシュート＝
   ソース＋ログ・設定／作成系＝ソース＋設計書。登録範囲に無い種別は対象外）が `evidence_kinds` に
   揃っているときだけ——揃わない場合は `inferred` にし、`reason` に確認できていない種別を書く。
 """
 
-# 調査台帳（`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §3・§6「AGENTS.md で済む箇所」・
-# 台帳ファイル自体の読み書き契約は `sherpa/investigation_ledger.py` が正典）の作り方・使い方を
-# 伝える段落。機械的な完了判定（provider.py 側・別契約）は `.tmp/investigation/` 配下の台帳の
-# 非終端有無を見て `status=final` を拒否する——この段落が無いまま機械判定だけ効くと、Codex が
-# 台帳を一切作らないのに機械判定は「未完了」を返し続ける食い違いが起きる。`_schema_v2`（構造化
-# 応答が4項目版で有効）と同じ条件（`output_schema` と `output_schema_v2` が両方真）のときだけ
-# 足す——`output_schema`/`output_schema_v2` の既存2引数の組合せで判定する（有効化そのものは
-# 増やさない）。docs_only（direct_read=False かつ layer=="docs"）はソースが対象外のため、母集団の
-# 確定元・item の初期状態・列挙元を設計書側に書き分ける（`pending` 経由の作成や「ソースから発見」を
-# 出すと、同じ段落内で「ソースは対象外」と矛盾する）。キー名・状態語彙・完了条件は両分岐で共通。
-# `source_required`（呼び出し元が渡す・provider.py の required_extra と同じ判定＝MCP へ実際に
-# 渡す実効の層で決める）は、item に source を required_checks へ含めさせる文を出すかどうかだけを
-# 切り替える——docs_only とは別の軸（docs_only=False でも、範囲に実在しない・層が docs の場合は
-# source_required=False になりうる。両者を混同すると、この段落だけが「source を宣言しろ」と言い、
-# Sherpa 側の完了判定（required_extra）は求めていない食い違いが起き、モデル自身の宣言のせいで
-# spec_only が未充足のまま終わらなくなる）。
+# 調査台帳の作り方・使い方を伝える段落（台帳の読み書き契約は `investigation_ledger.py`）。
+# `output_schema` と `output_schema_v2` が両方真のときだけ足す。
+# docs_only（`direct_read=False` かつ `layer=="docs"`）は母集団の確定元・item の初期状態・列挙元を設計書側に書き分ける。
+# `source_required`（provider.py の `required_extra` と同じ判定）は、item の `required_checks` に source を含めさせる文を出すかだけを切り替える。
 def _investigation_ledger_paragraph(direct_read: bool = True, layer: str | None = None,
                                     source_required: bool = False) -> str:
     _docs_only = not direct_read and layer == "docs"
-    # 母集団がゼロ件だと items=[] のまま manifest が無効になり完了できない——走査した範囲そのものを
-    # 1 item として登録し、理由付き終端（not_found_in_scope）にする逃げ道を明示する
-    # （どちらの分岐でも起こりうるため共通文言）。
+    # 母集団がゼロ件のときは、走査した範囲そのものを 1 item として登録し、理由付き終端（not_found_in_scope）にする。
     _zero_population = (
         "母集団がゼロ件のときは、走査した範囲そのものを1 item（例: `id: \"scope-check\"`・"
         "`kind: \"scope\"`・`subject`: 走査した範囲）として登録し、走査結果を `reason` に書いた "
         "`not_found_in_scope` で終端にする（`items` が空のままでは manifest が無効になり完了できない）。"
     )
-    # 明示継続で復元された台帳を初期化しないよう、作成前にMCPで状態を確認する。
+    # 明示継続で復元された台帳を初期化しないよう、作成前に MCP で状態を確認する。
     _resume_check = (
         "まず親が `ledger_status` で台帳の状態を確認する"
         "（作成系の依頼・1つの事実を答えるだけの単純な質問では台帳自体を作らなくてよい。"
@@ -255,9 +208,7 @@ def _investigation_ledger_paragraph(direct_read: bool = True, layer: str | None 
             "呼出辺（見つかった辺は都度 manifest に追加する）／トラブルシュート＝仮説・観測・検証結果。"
         )
     else:
-        # `source_required` が偽（層が docs・または範囲にソースが無いと判定済み）のときは足さない
-        # ——item 自身にも source を宣言させると、Sherpa 側は求めていない未充足をモデル自身の
-        # 宣言だけで作ってしまう。
+        # `source_required` が偽のときは足さない（item 側にも source を宣言させない）。
         _source_required_block = (
             "登録範囲にソースがあるなら、各 item の `required_checks` に `source` を必ず含める"
             "（Sherpa 側も完了判定で source を必須として確かめるため、宣言を省いても完了しない）。"
@@ -288,7 +239,7 @@ def _investigation_ledger_paragraph(direct_read: bool = True, layer: str | None 
   worker を使わない場合は親が全 item を登録・更新する（`owner: "parent"`）。同じ id を2つの
   プロセスが同時に更新しない。`error` が返ったら `problems` を読み、入力を直して再呼び出しする。
 - 台帳の項目のために探す・読むとき（ripgrep_search／es_search／read_doc／read_around／file_head／
-  graph_neighbors）は、その項目の item id を `item` 引数に付ける。
+  graph_neighbors／graph_resolve／graph_impact）は、その項目の item id を `item` 引数に付ける。
 - item の欄は `id`／`kind`／`subject`／`required_checks`／`evidence`／`status`／`reason`／`owner`
   の8キーちょうど（余分なキーは書かない）。`id` は英数字・ハイフン・アンダースコアのみ。`subject`・
   `reason` は2,000文字まで。`evidence` は `kind`（`source`／`spec_doc`／`definition`／
@@ -325,15 +276,9 @@ def _investigation_ledger_paragraph(direct_read: bool = True, layer: str | None 
   （evaluator）の巡数と反証確認の厚みだけ。
 """
 
-# 中間の見直し（COD-18 ⑤・利用者2026-10-01指示・`docs/proposals/課題管理簿.md` COD-18）:
-# 「最初に目録を決め、項目を順に確かめ、最後に1回だけ見直す」標準モードの流れに、調査の途中で
-# 目的・観点を確かめ直す場面を1つ挟む。`_investigation_ledger_paragraph` と同じ条件
-# （`_ledger_enabled`）のときだけ足す——台帳が無いターンに `ledger_review_put` を使わせる指示は
-# 実行不能（台帳自体を作れない）。既存の「見直しの一巡」（COD-15・`provider.py` の
-# `_LEDGER_REVIEW_PROMPT`）とは別の仕組み——COD-15 は台帳が complete になった**後**に1〜2回だけ
-# 頼む最終点検、こちらは complete になる**前**（最初の item が1つでも終端になった時点）に最低
-# 1回必須の中間点検——両方を求められたターンでは、まずこの段落の中間の見直しを満たしてから
-# complete になり、その後に COD-15 の最終点検が走る。
+# 中間の見直し。調査の途中（最初の item が 1 つでも終端になった時点）から complete になる前に、目的・観点を最低 1 回確かめ直させる。
+# `_investigation_ledger_paragraph` と同じ条件（`_ledger_enabled`）のときだけ足す。
+# complete 後に走る最終点検（provider.py の `_LEDGER_REVIEW_PROMPT`）とは別の仕組み。
 _INVESTIGATION_REVIEW_PARAGRAPH = """\
 - 台帳を作った依頼では、最初の item が1つでも終端になった後、最終回答（`status: final`）を
   返す前に `ledger_review_put` で中間の見直しを最低1回書く（本体だけが呼ぶ。worker は呼ばない）。
@@ -356,10 +301,7 @@ _INVESTIGATION_REVIEW_PARAGRAPH = """\
 """
 
 
-# worker を使う条件・並列数・依頼の形（網羅性の強化と、クイックを本当に速くする §変更A）。
-# 「使うかどうか」は委ねない（観点が2つ以上に分かれる依頼では必ず使う）——「観点の分け方・
-# worker の数」だけが Codex の判断（下の rounds_note 手前の一文）。並列数は sandbox.py の
-# `[agents].max_concurrent_threads_per_session` と同じ値（ハードコードせず定数を import）。
+# worker を使う条件・並列数・依頼の形。観点が 2 つ以上に分かれる依頼では必ず使い、観点の分け方・数だけ Codex が決める。並列数は `sandbox.py` の `[agents].max_concurrent_threads_per_session` と同じ値。
 _WORKER_USAGE_CONDITION = (
     "調べる観点が2つ以上に分かれる依頼（『〜ごと』『すべての』『各』『それぞれ』『一覧』『比較』"
     "など）では、観点ごとに spawn_agent(worker) を必ず使う。1つの観点で完結する単純な質問だけ"
@@ -367,16 +309,10 @@ _WORKER_USAGE_CONDITION = (
     "よい（逐次に待たない）。worker には観点を1つだけ渡し、主張とその根拠（ファイル:行）を"
     "返させる。")
 
-# S6（§2.6）: multi_agent 有効時に本体（orchestrator）へ役割の使い方を伝える段落。`review_rounds`
-# は選ばれた深さが許す evaluator の巡数（`depth_profile.review_rounds_for` の戻り値＝クイック 0／
-# 標準 2／深く 4／最大は管理画面の設定値）——0 のときは evaluator を使わないことを明示する
-# （クイックは確認 1 回だけで答える・巡を増やさない）。
-# `direct_read`／`layer` は `_source_verification_paragraph` と同じ理由・同じ組合せで文言を
-# 切り替える（multi_agent は常時有効のため、直読不可・資料のみターンでもこの段落は出る＝矛盾を
-# 避けるにはどちらも渡す必要がある）。`ledger_enabled`（`write_agents_md` が
-# `_investigation_ledger_paragraph` と同じ条件で渡す）が真のときだけ、worker への指示に
-# 割り当てられた item id とその item だけを書く旨を足す——台帳が無いターンに item id の話をしても
-# 実行不能な指示になる。
+# multi_agent 有効時に本体（orchestrator）へ役割の使い方を伝える段落。
+# `review_rounds` は深さが許す evaluator の巡数（0 なら evaluator を使わない旨を明示）。
+# `direct_read`／`layer` は `_source_verification_paragraph` と同じ組合せで文言を切り替える。
+# `ledger_enabled` が真のときだけ、worker に割り当てられた item id とその item だけを書く旨を足す。
 def _multi_agent_role_paragraph(review_rounds: int, direct_read: bool = True,
                                 layer: str | None = None, escalate: bool = False,
                                 ledger_enabled: bool = False) -> str:
@@ -387,10 +323,7 @@ def _multi_agent_role_paragraph(review_rounds: int, direct_read: bool = True,
         "`ledger_item_put` だけ（`ledger_manifest_set` は親だけが呼ぶ）。ファイルを直接書かない。"
     ) if ledger_enabled else ""
     if review_rounds <= 0:
-        # `_docs_only` はこの段落自体が「ソース裏取りはしない」を既に指示しているため、
-        # rounds_note に全主張の直読要求を続けると同一段落内で矛盾する——巡数の告知だけにする。
-        # 非 docs_only 側は worker の主張を鵜呑みにしない要件を残しつつ、確認は根拠のファイル:行
-        # の突き合わせで足りる（全主張の直読までは要求しない・§変更A③）。
+        # `_docs_only` では全主張の直読を要求せず、巡数の告知だけにする。それ以外は worker の主張を鵜呑みにせず、根拠のファイル:行の突き合わせで確認する。
         rounds_note = ("今回の見直しの回数は 0 回＝evaluator は使わない。" if _docs_only else
                        "今回の見直しの回数は 0 回＝evaluator は使わない。worker の一次判断を鵜呑み"
                        "にせず、根拠として示された箇所（ファイル:行）を自分で開いて突き合わせる"
@@ -400,10 +333,7 @@ def _multi_agent_role_paragraph(review_rounds: int, direct_read: bool = True,
         rounds_note = (f"今回の見直しの回数は {review_rounds} 回まで。spawn_agent(evaluator) は"
                        f"最大 {review_rounds} 回までとし、十分と判定できたらそれ以上は呼ばない。")
         if escalate:
-            # S1b（実装ベース探索の回復・深さの1段引き上げ）: 共通上限（管理画面の設定値）に
-            # 余地があるターンだけ、本体の自己判断で見直しをもう1回だけ足してよい——強制ではなく
-            # 「必須の根拠種別が揃わないと判断したとき」に限る許可（Sherpa 側は spawn_agent の
-            # 呼出数を数えて止める仕組みを持たないため、指示のみ）。
+            # 共通上限に余地があるターンだけ、必須の根拠種別が揃わないと判断したときに限り、見直しをもう 1 回足してよい（指示のみ・強制しない）。
             rounds_note += (f"ただし、必須の根拠種別が揃わないと判断したときに限り、見直しを"
                            f"もう 1 回だけ追加してよい（合計 {review_rounds + 1} 回まで）。")
     if _docs_only:
@@ -418,7 +348,8 @@ def _multi_agent_role_paragraph(review_rounds: int, direct_read: bool = True,
   できる範囲で答える。{rounds_note}
   evaluator の指摘は send_input で worker へ戻し、次の一次判断を待つ。観点の分け方はあなた自身の
   判断でよい。最後に全体を統合し、指定された出力形式で最終回答を返す（成果物は各巡では作らず、
-  最後に一度だけ作る）。
+  最後に一度だけ作る）。最終回答は利用者の元の質問への回答だけを書き、worker・evaluator・点検・
+  答え直しの経緯は本文に書かない。
 """
     if direct_read:
         how = "`src/` の原本を開いて"
@@ -438,13 +369,12 @@ def _multi_agent_role_paragraph(review_rounds: int, direct_read: bool = True,
   グラフ・ES が空・不調・未構築のときも、それを理由に止めず{graph_fallback}{rounds_note}
   evaluator の指摘は send_input で worker へ戻し、次の一次判断を待つ。観点の分け方はあなた自身の
   判断でよい。最後に全体を統合し、指定された出力形式で最終回答を返す（成果物は各巡では作らず、
-  最後に一度だけ作る）。
+  最後に一度だけ作る）。最終回答は利用者の元の質問への回答だけを書き、worker・evaluator・点検・
+  答え直しの経緯は本文に書かない。
 """
 
 
-# resume 直後は名前付きロール（worker/evaluator）での spawn_agent が
-# "Full-history forked agents inherit the parent agent type" エラーで失敗しうる。`multi_agent`
-# 有効時だけ足す段落（`write_agents_md` の `multi_agent` 引数は既定 False で本文に現れない）。
+# resume 直後は名前付きロールの spawn が失敗しうる。`multi_agent` 有効時だけ足す段落。
 _MULTI_AGENT_RESUME_FALLBACK_PARAGRAPH = """\
 - サブエージェント（worker／evaluator）を spawn するとき、このセッションを resume した直後に
   指定したロールでの spawn が失敗したら、ロールを指定しない spawn に切り替えて続ける
@@ -452,10 +382,7 @@ _MULTI_AGENT_RESUME_FALLBACK_PARAGRAPH = """\
 """
 
 
-# 素の Codex モード（`plain`・docs/archive/2026-09-24-素のCodexモード.md §1.2）専用の最小形。
-# 台帳・分類原則の長文・出力スキーマ・worker/evaluator・investigate スキル誘導・グラフ不調時の
-# 段落は出さない——残すのは containment（読取専用・範囲・秘匿は読まない・書き込みは authoring
-# だけ）・出典の書き方・成果物の置き場所・ソースを正とする一文だけ。
+# 素の Codex モード（`plain`）専用の最小形。containment（読取専用・範囲・秘匿は読まない・書き込みは authoring だけ）・出典の書き方・成果物の置き場所・ソースを正とする一文だけを出す。
 AGENTS_MD_PLAIN = """\
 # Sherpa 共通ルール（Codex 実行時・素のモード）
 
@@ -477,65 +404,17 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
                     review_rounds: int = 0, layer: str | None = None,
                     review_rounds_escalation: bool = False, mcp: bool = True,
                     source_required: bool = False, plain: bool = False) -> None:
-    """authoring 直下へ AGENTS.md を書く（per-request・冪等・上書き）。
-
-    `plain`（既定 False）が真なら、他の引数を一切見ず `AGENTS_MD_PLAIN`（最小形）だけを書く
-    （素の Codex モード・§1.2）。
-
-    `mcp`: MCP 接続（台帳ツールを含む）があるか。台帳はツールでしか書けないため、無ければ
-    台帳の段落を出さない（本体の完了ゲートも同じ条件で無効になる）。
-
-    呼び出し側で try/except すること（AGENTS.md はあくまで補助・書込に失敗しても Codex 実行自体は
-    継続してよい＝fail-open。プロンプト側には containment/grounding の短縮形を常置してあるので、
-    失敗時もプロンプトの質問固有部分＋短縮ルールだけで動くことを前提にする）。
-
-    `direct_read`（既定 True）と `layer`（既定 None＝both・`docs`／`code`／`both`）は、常時付く
-    本体自身のソース確認要件（`_source_verification_paragraph`・`multi_agent` 有効時は
-    `_multi_agent_role_paragraph` にも）の文言を一緒に切り替える——`direct_read=True` なら層に
-    関係なく「原本を直接開いて確認する」（`sandbox.py:633-638` の裁定＝Codex は層の指定を強制
-    しない）、`direct_read=False and layer != "docs"` なら「MCP の読取ツールで確認する」に言い換え
-    る（実行不能な手順を指示しない）。`direct_read=False and layer == "docs"` だけは読取要求ではなく
-    「ソースは対象外・確定不可を告知して部分回答」を指示する——この組合せは MCP の `ripgrep_search`/
-    `read_around` 自体が層制限でソース（code 種別）を拒否するため、ソース裏取りが原理的に不可能
-    （提案書 §3 S1「必須種別は許可範囲内で解釈」・裁定⑥）。要件自体（本体自身の確認・グラフ不調でも
-    止めない）はどの分岐でも維持する。`direct_read` が偽のときは調査スキル（原本を Python で開く
-    前提）への誘導段落も落とす。
-    `output_schema`（既定 False）が真のときだけ、構造化最終応答
-    （`status`／`answer`／`next_step`）を求める段落を付け足す（§2-3・呼び出し側は `--output-schema` を付ける判定＝`_schema_on` と同じ値を渡す）。
-    `output_schema_v2`（既定 False）が真のときは3項目版の代わりに4項目版
-    （`_STRUCTURED_RESPONSE_PARAGRAPH_V2`・`claims` の意味と閉じた語彙を含む）を使う——
-    `output_schema` が偽なら `output_schema_v2` が真でも段落を足さない（`--output-schema`
-    自体が無効なターンへ、CLI が強制しない構造化応答を約束させない・既存の `output_schema` 契約と
-    同じ理由）。呼び出し側は `_schema_v2`（`_schema_on and _schema_level == 2`）をそのまま渡す。
-    `multi_agent`（既定 False）が真のときだけ、役割の使い方（worker／evaluator・`review_rounds`
-    が埋め込む見直しの回数）と resume 直後の名前付きロール spawn 失敗へのフォールバック指示を
-    付け足す（`features.multi_agent` を明示有効化する側で使う・既定では本文に現れない）。
-    `review_rounds`（既定 0）は `multi_agent=True` のときだけ意味を持つ（`depth_profile.
-    review_rounds_for` の戻り値をそのまま渡す契約・`multi_agent=False` なら無視される）。
-    `review_rounds_escalation`（既定 False）は `multi_agent=True` かつ `review_rounds > 0`
-    のときだけ意味を持つ——共通上限（`depth_profile.effective_max_review_rounds`）に余地が
-    あるターンに限り、本体が必要な根拠種別の不足を自己判断したときだけ見直しをもう1回だけ
-    足してよい旨を段落へ足す（呼び出し側は `_review_rounds < 共通上限` を渡す契約）。
-
-    `output_schema` と `output_schema_v2` が両方真（呼び出し側の `_schema_v2` と同じ判定）のときだけ、
-    調査台帳（`.tmp/investigation/`）の作り方・使い方の段落（`_investigation_ledger_paragraph`）を
-    足す——機械的な完了判定（provider.py 側）が台帳の非終端有無で `status=final` を拒否するため、
-    Codex が台帳を作らないまま構造化応答だけ有効という食い違いを避ける。`multi_agent=True` のとき
-    は `_multi_agent_role_paragraph` にも同じ判定（`ledger_enabled`）を渡し、worker への指示に
-    割り当てられた item id の扱いを足す。
-
-    `source_required`（既定 False）: 呼び出し側（provider.py）がそのターンの `required_extra` と
-    同じ判定で決めた「今回 source を必須にするか」をそのまま渡す——`_investigation_ledger_paragraph`
-    の docs_only（`direct_read`/`layer` の組合せ）とは別の軸（例: 層が code／both でも、範囲に
-    ソースが実在しないと判定されれば False になりうる）。この値で「item の `required_checks` に
-    source を必ず含める」文を出すかどうかを切り替える——渡さない（または実際とずれた）ターンでは、
-    Sherpa 側は求めていない source をモデル自身の宣言だけで要求し、spec_only が完了できなくなる。
-
-    単純な `Path.write_text()` は既存の `AGENTS.md` が symlink だった場合にその**指す先へ**書き込んで
-    しまう（authoring 配下の想定外の場所を書き換え得る）ため、一時ファイルを
-    `O_CREAT|O_EXCL|O_NOFOLLOW` で新規作成し、`os.replace()` で置換する
-    （`rename`/`replace` はディレクトリエントリの張替えでシンボリックリンクを一切追従しない＝
-    既存 AGENTS.md が symlink でも安全に「通常ファイルの AGENTS.md」へ置き換わる）。
+    """authoring 直下へ AGENTS.md を書く（リクエストごと・冪等・上書き）。呼び出し側で try/except すること（書込失敗でも Codex 実行は継続できる＝fail-open）。
+    - `plain`: 真なら他の引数を見ず `AGENTS_MD_PLAIN` だけを書く。
+    - `mcp`: MCP 接続（台帳ツール）があるか。無ければ台帳の段落を出さない。
+    - `direct_read`／`layer`: ソース確認要件（`_source_verification_paragraph`・multi_agent 時は `_multi_agent_role_paragraph` も）の文言を切り替える。
+      `direct_read` が偽のときは調査スキルへの誘導段落も落とす。
+    - `output_schema`: 真のときだけ構造化最終応答の段落を足す。`output_schema_v2` が真ならその 4 項目版を使う（`output_schema` が偽なら足さない）。
+    - `multi_agent`: 真のときだけ役割の使い方と resume 後の spawn 失敗フォールバックを足す。`review_rounds` は `multi_agent=True` のときだけ意味を持つ。
+      `review_rounds_escalation` は `review_rounds > 0` かつ共通上限に余地があるときだけ、見直しをもう 1 回足してよい旨を足す。
+    - 調査台帳の段落は `output_schema` と `output_schema_v2` が両方真のときだけ足す（multi_agent では `ledger_enabled` も渡す）。
+    - `source_required`: provider.py の `required_extra` と同じ判定の値を渡す（ずれると完了できなくなる）。
+    書込は一時ファイルを `O_CREAT|O_EXCL|O_NOFOLLOW` で作り `os.replace()` で置換する（既存 AGENTS.md が symlink でも指す先へ書かない）。
     """
     if plain:
         content = AGENTS_MD_PLAIN
@@ -568,7 +447,7 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
         os.replace(str(tmp), str(target))
     except Exception:
         try:
-            tmp.unlink(missing_ok=True)   # 置換に失敗したら一時ファイルを残さない（台帳スキャン汚染防止）
+            tmp.unlink(missing_ok=True)  # 置換に失敗したら一時ファイルを残さない（台帳スキャンを汚さない）
         except Exception:
             pass
         raise

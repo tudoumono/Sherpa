@@ -13,7 +13,9 @@ from sherpa import scope
 from sherpa.grep_tool import grep_search
 from sherpa.lens_service import run_qa
 
-V = TEST_WORLD_ID   # 旧固定 'v1' から移行（2026-07-03 インシデント対応 HIGH#2・_world_setup.py 参照）
+V = TEST_WORLD_ID
+
+ENDPOINTS = ["/chat/turns"]
 
 
 @pytest.fixture(autouse=True)
@@ -30,6 +32,20 @@ def _skip(reason):
     pytest.skip(reason)
 
 
+def _client(**kw):
+    from fastapi.testclient import TestClient
+    from sherpa.api import app
+    return TestClient(app, **kw)
+
+
+def _call(c, endpoint, *, knowledge=False, message="x", tools=None, **fields):
+    """受付口（POST /chat/turns）を同じ入力で叩く。"""
+    body = {"message": message, "world": V, "knowledge": knowledge, **fields}
+    if tools is not None:
+        body["tools"] = tools
+    return c.post(endpoint, json=body)
+
+
 # ---- scope ルール（純粋・prefix 前方一致） --------------------------------
 
 def test_in_scope_prefix_rules():
@@ -44,25 +60,18 @@ def test_in_scope_prefix_rules():
 
 # ---- grep を範囲で絞る（純粋） -------------------------------------------
 
-def test_grep_unscoped_is_superset():
-    assert {SPEC, TAXCALC, OPS, TAXCPY} <= _docs("TAX-RATE")
+@pytest.mark.parametrize("kw", [{}, {"scope_paths": ["4期"]}])
+def test_grep_unscoped_and_generation_top_include_all(kw):
+    assert {SPEC, TAXCALC, OPS, TAXCPY} <= _docs("TAX-RATE", **kw)
 
 
-def test_grep_scope_source_only():
-    """ソース scope に絞るとソースだけ（鏡: 00_共通 の TAX-CPY は別フォルダ＝合流しない）。"""
-    assert _docs("TAX-RATE", scope_paths=[S_SRC]) == {TAXCALC}
-
-
-def test_grep_scope_design_only():
-    assert _docs("TAX-RATE", scope_paths=[S_DESIGN]) == {SPEC}
-
-
-def test_grep_scope_prefix_match():
-    assert _docs("TAX-RATE", scope_paths=[S_OPS]) == {OPS}       # 02_保守 は 02_保守/03_運用手順 を含む
-
-
-def test_grep_generation_top_includes_all():
-    assert {SPEC, TAXCALC, OPS, TAXCPY} <= _docs("TAX-RATE", scope_paths=["4期"])
+@pytest.mark.parametrize("scope_path,expected", [
+    (S_SRC, {TAXCALC}),    # 鏡: 00_共通 の TAX-CPY は別フォルダ＝合流しない
+    (S_DESIGN, {SPEC}),
+    (S_OPS, {OPS}),        # 02_保守 は 02_保守/03_運用手順 を含む
+])
+def test_grep_scope_filters_by_folder_prefix(scope_path, expected):
+    assert _docs("TAX-RATE", scope_paths=[scope_path]) == expected
 
 
 # ---- filter_items（根拠 doc 単位・純粋） ---------------------------------
@@ -122,17 +131,9 @@ def test_qa_scoped_citations_within_scope():
     assert scoped == {SPEC} and scoped < full
 
 
-def test_chatreq_accepts_scope_paths():
-    from sherpa.api import ChatReq
-    assert ChatReq(message="x").scope_paths == []
-    assert ChatReq(message="x", scope_paths=["a/b", "c"]).scope_paths == ["a/b", "c"]
-
-
 def test_scopes_endpoint():
     try:
-        from fastapi.testclient import TestClient
-        from sherpa.api import app
-        r = TestClient(app).get("/scopes", params={"world": V})
+        r = _client().get("/scopes", params={"world": V})
     except Exception as e:
         return _skip(f"app import failed: {e}")
     assert r.status_code == 200
@@ -141,267 +142,93 @@ def test_scopes_endpoint():
 
 def test_api_rejects_unknown_scope():
     try:
-        from fastapi.testclient import TestClient
-        from sherpa.api import app
-        c = TestClient(app)
-        r = c.post("/chat", json={"message": "x", "world": V,
-                                  "knowledge": True, "scope_paths": ["存在しない/フォルダ"], "stream_id": "mc-01420"})
+        r = _call(_client(), "/chat/turns", knowledge=True, scope_paths=["存在しない/フォルダ"])
     except Exception as e:
         return _skip(f"infra down: {e}")
     assert r.status_code == 422
 
 
-# ---- 探す対象（層フィルタ・調べ方ブロック §3.4） --------------------------------
+# ---- リクエスト項目（層・調べ方・深さ・検索経路トグル） ----------------------
 
-def test_chatreq_accepts_layer():
-    """既定 both・docs/code も受理・scope_paths と同じ並びのフィールド。"""
+def test_chatreq_accepts_scope_layer_lens_depth_profile_and_tools():
     from sherpa.api import ChatReq
-    assert ChatReq(message="x").layer == "both"
-    assert ChatReq(message="x", layer="docs").layer == "docs"
-    assert ChatReq(message="x", layer="code").layer == "code"
-
-
-def test_chatreq_rejects_invalid_layer_422():
-    """不正な layer 値は pydantic Literal により 422（ExtSearchReq と同じ契約）。
-
-    pydantic のモデル検証は FastAPI がハンドラ本体（DB/Neo4j 接続）へ入る**前**に行い、失敗は
-    ASGI レベルで 422 レスポンスへ変換される——DB/インフラの状態に左右されない契約のため、
-    広い `except Exception: skip` は使わない（検証そのものが壊れていても skip で隠さない）。
-    """
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False, "layer": "bogus", "stream_id": "mc-01740"})
-    assert r.status_code == 422
-
-
-def test_chat_post_requires_stream_id():
-    """stream_id が必須フィールドのため、無いと 422（本文に "stream_id" を含む）。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False})
-    assert r.status_code == 422
-    assert "stream_id" in r.text
-
-
-def test_chat_stream_rejects_invalid_layer_422():
-    """GET /chat/stream（Query パラメータ版）も同じ Literal 制約で 422（DB 非依存・上記と同じ理由で
-    infra-down スキップは使わない）。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V, "layer": "bogus", "stream_id": "mc-01780"})
-    assert r.status_code == 422
-
-
-# ---- 調べ方の明示指定（調べ方ブロック §3.1） ------------------------------------
-
-def test_chatreq_accepts_lens():
-    """既定 None（省略）＝自動・4レンズを受理する。"""
-    from sherpa.api import ChatReq
-    assert ChatReq(message="x").lens is None
+    d = ChatReq(message="x")
+    assert (d.scope_paths, d.layer, d.lens, d.depth_profile, d.tools) == ([], "both", None, "standard", None)
+    assert ChatReq(message="x", scope_paths=["a/b", "c"]).scope_paths == ["a/b", "c"]
+    for layer in ("docs", "code"):
+        assert ChatReq(message="x", layer=layer).layer == layer
     for lens in ("impact", "troubleshoot", "qa", "author"):
         assert ChatReq(message="x", lens=lens).lens == lens
-
-
-def test_chatreq_rejects_invalid_lens_422():
-    """不正な lens 値は pydantic Literal により 422（layer と同じ契約・DB 非依存）。
-    正典は4値＋省略のみ——非正典の "auto" 互換値も受理しない（RV1 #12）。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    for bad in ("bogus", "auto"):
-        r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False, "lens": bad, "stream_id": "mc-02050"})
-        assert r.status_code == 422
-
-
-def test_chat_stream_rejects_invalid_lens_422():
-    """GET /chat/stream（Query パラメータ版）も同じ Literal 制約で 422。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V, "lens": "bogus", "stream_id": "mc-02090"})
-    assert r.status_code == 422
-
-
-# ---- 調べる深さ（調べ方ブロック §3.2・SC-6c） ------------------------------------
-
-def test_chatreq_accepts_depth_profile():
-    """既定 standard・deep/max も受理（layer/lens と同じ並びのフィールド）。"""
-    from sherpa.api import ChatReq
-    assert ChatReq(message="x").depth_profile == "standard"
-    assert ChatReq(message="x", depth_profile="deep").depth_profile == "deep"
-    assert ChatReq(message="x", depth_profile="max").depth_profile == "max"
-
-
-def test_chatreq_rejects_invalid_depth_profile_422():
-    """不正な depth_profile 値は pydantic Literal により 422（layer/lens と同じ契約・DB 非依存）。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False, "depth_profile": "bogus", "stream_id": "mc-02330"})
-    assert r.status_code == 422
-
-
-def test_chat_stream_rejects_invalid_depth_profile_422():
-    """GET /chat/stream（Query パラメータ版）も同じ Literal 制約で 422。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V, "depth_profile": "bogus", "stream_id": "mc-02370"})
-    assert r.status_code == 422
-
-
-# ---- 検索経路トグル（調べ方ブロック §3.6・SC-6e） ------------------------------------
-
-def test_chatreq_tools_omitted_or_null_is_none():
-    """省略/null は None（`_resolve_scope` 側で全ONに正規化・depth_profile と同型の欠落契約）。"""
-    from sherpa.api import ChatReq
-    assert ChatReq(message="x").tools is None
+    for depth in ("deep", "max"):
+        assert ChatReq(message="x", depth_profile=depth).depth_profile == depth
     assert ChatReq(message="x", tools=None).tools is None
-
-
-def test_chatreq_tools_partial_dict_keeps_only_explicit_keys():
-    """SC-6e: 欠落キーは埋めない（生の dict のまま保持）——埋めてしまうと「明示的に true と
-    指定したか」が失われ、可用性 422 判定（`unavailable_explicit_tools`）が省略キーまで誤検知する。
-    実効値（欠落=全ON）への正規化は `_resolve_scope`（保存時）が別途行う。"""
-    from sherpa.api import ChatReq
+    # 欠落キーは埋めない（明示 true の可用性 422 判定が省略キーまで誤検知しないため）
     assert ChatReq(message="x", tools={"grep": False}).tools == {"grep": False}
 
 
-@pytest.mark.parametrize("endpoint", ["/chat", "/chat/turns"])
-def test_chatreq_rejects_all_tools_off_422(endpoint):
-    """grep/fulltext/graph の3つとも false は 422（検索経路が0個になるのを許さない）。
-    共通 `ChatReq` の pydantic field_validator（リクエスト本文の型検証時点）で弾くため、
-    /chat・/chat/turns のどちらでも同じ 422 になる（SC-6e）。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    r = c.post(endpoint, json={"message": "x", "world": V, "knowledge": False,
-                               "tools": {"grep": False, "fulltext": False, "graph": False}})
+@pytest.mark.parametrize("endpoint", ENDPOINTS)
+@pytest.mark.parametrize("field,bad", [
+    ("layer", "bogus"), ("lens", "bogus"), ("lens", "auto"), ("depth_profile", "bogus"),
+])
+def test_invalid_layer_lens_depth_profile_is_422(endpoint, field, bad):
+    """pydantic の Literal 検証は DB/インフラの状態に左右されない（skip で隠さない）。"""
+    r = _call(_client(), endpoint, **{field: bad})
     assert r.status_code == 422
 
 
-def test_chatreq_rejects_unknown_tools_key_422():
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False,
-                              "tools": {"bogus": True}, "stream_id": "mc-02800"})
+@pytest.mark.parametrize("endpoint", ENDPOINTS)
+def test_all_tools_off_is_422(endpoint):
+    """grep/fulltext/graph の3つとも false は 422（検索経路が0個になるのを許さない）。"""
+    r = _call(_client(), endpoint, tools={"grep": False, "fulltext": False, "graph": False})
     assert r.status_code == 422
 
 
-@pytest.mark.parametrize("bad_value", ["false", "true", 0, 1, "yes", None, [], {}])
-def test_chatreq_rejects_non_boolean_tools_value_422(bad_value):
-    """SC-6e: `StrictBool` は非 bool 値（文字列/数値/null/配列/オブジェクト）を静かに
-    coerce せず 422 で拒否する（素の `dict[str, bool]` は `"false"`/`0`/`"yes"` を黙って
-    bool 化してしまい、`tools_pref.normalize_tools_pref` の契約と食い違っていた）。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False,
-                              "tools": {"grep": bad_value}, "stream_id": "mc-02930"})
-    assert r.status_code == 422
+@pytest.mark.parametrize("tools", [
+    {"bogus": True},
+    *[{"grep": v} for v in ("false", "true", 0, 1, "yes", None, [], {})],   # StrictBool: 非 bool は coerce せず拒否
+])
+def test_unknown_tools_key_or_non_boolean_value_is_422(tools):
+    assert _call(_client(), "/chat/turns", tools=tools).status_code == 422
 
 
-def test_chat_stream_rejects_all_tools_off_422():
-    """GET /chat/stream は grep/fulltext/graph 個別 query param から組み立てて同じ検証を通る。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V,
-                                      "tools_grep": False, "tools_fulltext": False, "tools_graph": False, "stream_id": "mc-02980"})
-    assert r.status_code == 422
-
-
-def test_chat_stream_tools_query_params_default_true():
-    """個別 query param の既定は True（省略=全ON・422 にならない）。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V, "knowledge": False, "stream_id": "mc-03130"})
-    assert r.status_code == 200
-
-
-# ---- 検索経路トグルの可用性（実接続・SC-6e） ------------------------------------
+# ---- 検索経路トグルの可用性（実接続） ------------------------------------
 
 def _unavailable(graph=False, fulltext=True):
     return {"grep": True, "fulltext": fulltext, "graph": graph}
 
 
 def test_chat_tools_availability_endpoint_shape(monkeypatch):
-    """GET /chat/tools-availability は `agentic_search.tool_availability()` をそのまま返す
-    （UIチップの表示可否・実行側デフォルトツール構築と同じ単一の真実源）。"""
-    from fastapi.testclient import TestClient
     from sherpa import agentic_search
-    from sherpa.api import app
     monkeypatch.setattr(agentic_search, "tool_availability", lambda: _unavailable(graph=False))
-    c = TestClient(app)
-    r = c.get("/chat/tools-availability")
+    r = _client().get("/chat/tools-availability")
     assert r.status_code == 200
     assert r.json() == {"grep": True, "fulltext": True, "graph": False}
 
 
-def test_chatreq_rejects_explicit_on_unavailable_tool_422(monkeypatch):
-    """明示的に true 指定した検索経路が実接続で到達不可なら 422（ツール名つき・fail-loud）。"""
-    from fastapi.testclient import TestClient
+@pytest.mark.parametrize("endpoint", ENDPOINTS)
+def test_explicit_on_unavailable_tool_is_422_with_tool_name(monkeypatch, endpoint):
     from sherpa import agentic_search
-    from sherpa.api import app
     ensure_v1()
     monkeypatch.setattr(agentic_search, "tool_availability", lambda: _unavailable(graph=False))
-    c = TestClient(app)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": True,
-                              "tools": {"graph": True}, "stream_id": "mc-03440"})
+    r = _call(_client(), endpoint, knowledge=True, tools={"graph": True})
     assert r.status_code == 422
     assert "graph" in r.json()["detail"]
 
 
-def test_chatreq_omitted_or_off_tool_silently_uses_available_only(monkeypatch):
-    """省略/False のキーは可用性チェックの対象外——不達でも 422 にせず可用分だけを使う
-    （既存の「利用可能時のみ登録」契約はそのまま維持する）。"""
-    from fastapi.testclient import TestClient
+def test_omitted_or_off_tool_silently_uses_available_only(monkeypatch):
+    """省略/False のキーは可用性チェックの対象外（不達でも 422 にせず可用分だけを使う）。"""
     from sherpa import agentic_search
-    from sherpa.api import app
     ensure_v1()
     monkeypatch.setattr(agentic_search, "tool_availability", lambda: _unavailable(graph=False))
-    c = TestClient(app)
-    r = c.post("/chat", json={"message": "消費税率とは？", "world": V, "knowledge": True,
-                              "tools": {"graph": False}, "stream_id": "mc-03590"})
+    r = _call(_client(), "/chat/turns", knowledge=True, message="消費税率とは？", tools={"graph": False})
     assert r.status_code != 422
 
 
-def test_chat_stream_rejects_explicit_on_unavailable_tool_422(monkeypatch):
-    """GET /chat/stream も同じ可用性判定を経由する。"""
-    from fastapi.testclient import TestClient
+@pytest.mark.parametrize("endpoint", ENDPOINTS)
+def test_tool_availability_snapshot_computed_exactly_once_per_request(monkeypatch, endpoint):
+    """受付時 422 判定と実行本体は同じ snapshot を使う（別取得だと TTL 境界で食い違い得る）。"""
     from sherpa import agentic_search
-    from sherpa.api import app
     ensure_v1()
-    monkeypatch.setattr(agentic_search, "tool_availability", lambda: _unavailable(graph=False))
-    c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V, "knowledge": True,
-                                      "tools_graph": True, "stream_id": "mc-03720"})
-    assert r.status_code == 422
-    assert "graph" in r.json()["detail"]
-
-
-def test_chat_turns_rejects_explicit_on_unavailable_tool_422(monkeypatch):
-    """POST /chat/turns も同じ可用性判定を経由する。"""
-    from fastapi.testclient import TestClient
-    from sherpa import agentic_search
-    from sherpa.api import app
-    ensure_v1()
-    monkeypatch.setattr(agentic_search, "tool_availability", lambda: _unavailable(graph=False))
-    c = TestClient(app)
-    r = c.post("/chat/turns", json={"message": "x", "world": V, "knowledge": True,
-                                    "tools": {"graph": True}})
-    assert r.status_code == 422
-    assert "graph" in r.json()["detail"]
-
-
-def _counting_tool_availability(monkeypatch):
-    """`agentic_search.tool_availability()` の呼出回数を数える偽物に差し替える。"""
-    from sherpa import agentic_search
     calls: list = []
 
     def _fake():
@@ -409,55 +236,14 @@ def _counting_tool_availability(monkeypatch):
         return {"grep": True, "fulltext": True, "graph": True}
 
     monkeypatch.setattr(agentic_search, "tool_availability", _fake)
-    return calls
-
-
-def test_chat_computes_tool_availability_snapshot_exactly_once(monkeypatch):
-    """`POST /chat` は受付時422判定（`_validate_tools_availability`）と実行本体
-    （`handle_message`）へ同じ snapshot を渡す——別々に取得すると TTL キャッシュの境界を挟んで
-    受付時と実行時の可用性が食い違い得るため、1リクエストにつき `tool_availability()` の呼出は
-    1回だけであるべき。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    ensure_v1()
-    calls = _counting_tool_availability(monkeypatch)
-    c = TestClient(app)
-    r = c.post("/chat", json={"message": "消費税率とは？", "world": V, "knowledge": True, "stream_id": "mc-04150"})
-    assert r.status_code != 422
-    assert len(calls) == 1
-
-
-def test_chat_stream_computes_tool_availability_snapshot_exactly_once(monkeypatch):
-    """`GET /chat/stream` も同様——SSE closure（`gen()`）は受付時と同じ snapshot を使う。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    ensure_v1()
-    calls = _counting_tool_availability(monkeypatch)
-    c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "消費税率とは？", "world": V, "knowledge": True, "stream_id": "mc-04270"})
-    assert r.status_code != 422
-    assert len(calls) == 1
-
-
-def test_chat_turns_computes_tool_availability_snapshot_exactly_once(monkeypatch):
-    """`POST /chat/turns` も同様——背景実行ファクトリ（`_turn_run_fn`）は受付時と同じ snapshot を
-    そのまま転送し、背景スレッド側では再取得しない。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    ensure_v1()
-    calls = _counting_tool_availability(monkeypatch)
-    c = TestClient(app)
-    r = c.post("/chat/turns", json={"message": "消費税率とは？", "world": V, "knowledge": True})
+    r = _call(_client(), endpoint, knowledge=True, message="消費税率とは？")
     assert r.status_code != 422
     assert len(calls) == 1
 
 
 def _spy_target_check_then_availability(monkeypatch):
-    """`routers/chat.py::_prepare_agentic_snapshot` が組み立てる Provider（`get_provider`）と
-    `agentic_search.tool_availability()` の両方を差し替え、(1) `get_provider` の呼出回数、
-    (2) `_agentic_target_check`→`tool_availability` の呼出順序、を記録する。返り値の
-    provider インスタンスは実行本体（`handle_message`/`stream_message`/`_turn_run_fn`）が
-    受け取った `provider` kwarg との同一性（`is`）比較に使う。"""
+    """`get_provider` と `tool_availability` を差し替え、get_provider の呼出回数・
+    `_agentic_target_check`→`tool_availability` の順序を記録する。"""
     from sherpa import agentic_search
     from sherpa.routers import chat as chat_router_mod
     order: list = []
@@ -482,67 +268,12 @@ def _spy_target_check_then_availability(monkeypatch):
     return provider_obj, order, calls
 
 
-def test_chat_shares_single_provider_snapshot_with_execution(monkeypatch):
-    """`POST /chat` は Provider を一度だけ組み立て、`_agentic_target_check`→`tool_availability`
-    の順で呼び、実行本体（`handle_message`）へ同一の Provider インスタンスをそのまま渡す
-    ——受付（422判定）と実行本体が別々に Provider/settings を組み立てると、その間に admin 保存が
-    挟まった場合に新旧混在の接続先/鍵で動きうる。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    from sherpa.routers import chat as chat_router_mod
-    ensure_v1()
-    provider_obj, order, calls = _spy_target_check_then_availability(monkeypatch)
-    captured: dict = {}
-
-    def _fake_handle_message(*args, **kwargs):
-        captured["provider"] = kwargs.get("provider")
-        return {"ok": True}
-
-    monkeypatch.setattr(chat_router_mod, "handle_message", _fake_handle_message)
-    c = TestClient(app)
-    r = c.post("/chat", json={"message": "消費税率とは？", "world": V, "knowledge": True, "stream_id": "mc-04930"})
-    assert r.status_code == 200
-    assert calls["get_provider"] == 1
-    assert order == ["target_check", "tool_availability"]
-    assert captured["provider"] is provider_obj
-
-
-def test_chat_stream_shares_single_provider_snapshot_with_execution(monkeypatch):
-    """GET /chat/stream も同様——SSE closure（`gen()`）は受付時に組み立てた同一の Provider
-    インスタンスをそのまま `stream_message` へ渡す。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    from sherpa.routers import chat as chat_router_mod
-    ensure_v1()
-    provider_obj, order, calls = _spy_target_check_then_availability(monkeypatch)
-    captured: dict = {}
-
-    def _fake_stream_message(*args, **kwargs):
-        captured["provider"] = kwargs.get("provider")
-        return iter(())
-
-    monkeypatch.setattr(chat_router_mod, "stream_message", _fake_stream_message)
-    c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "消費税率とは？", "world": V, "knowledge": True, "stream_id": "mc-05160"})
-    assert r.status_code == 200
-    assert calls["get_provider"] == 1
-    assert order == ["target_check", "tool_availability"]
-    assert captured["provider"] is provider_obj
-
-
-def test_chat_turns_shares_single_provider_snapshot_with_execution(monkeypatch):
-    """POST /chat/turns も同様——背景実行ファクトリ（`_turn_run_fn`）は受付時に組み立てた
-    同一の Provider インスタンスをそのまま受け取る（背景スレッド側では再構築しない）。
-    `chat_turns.start_turn` 自体は差し替え、実際の背景スレッド起動はしない（このテストが
-    検証したいのは `chat_turns_start` から `_turn_run_fn` への同一性のみ）。"""
-    from fastapi.testclient import TestClient
+def _capture_execution_provider(monkeypatch, endpoint, captured):
+    """実行本体（_turn_run_fn）が受け取る provider を捕まえる。"""
     from sherpa import chat_turns as chat_turns_mod
-    from sherpa.api import app
     from sherpa.routers import chat as chat_router_mod
-    ensure_v1()
-    provider_obj, order, calls = _spy_target_check_then_availability(monkeypatch)
-    captured: dict = {}
 
+    # start_turn も差し替え、背景スレッドは起動しない（受付→_turn_run_fn の同一性だけを見る）
     def _fake_turn_run_fn(*args, **kwargs):
         captured["provider"] = kwargs.get("provider")
         return lambda conversation_id: (lambda stop_event, emit: None)
@@ -557,8 +288,17 @@ def test_chat_turns_shares_single_provider_snapshot_with_execution(monkeypatch):
 
     monkeypatch.setattr(chat_router_mod, "_turn_run_fn", _fake_turn_run_fn)
     monkeypatch.setattr(chat_turns_mod, "start_turn", _fake_start_turn)
-    c = TestClient(app)
-    r = c.post("/chat/turns", json={"message": "消費税率とは？", "world": V, "knowledge": True})
+
+
+@pytest.mark.parametrize("endpoint", ENDPOINTS)
+def test_single_provider_snapshot_is_shared_with_execution(monkeypatch, endpoint):
+    """Provider は受付で一度だけ組み立て、`_agentic_target_check`→`tool_availability` の順で呼び、
+    実行本体へ同一インスタンスを渡す（受付と実行で別々に組むと admin 保存を挟んで新旧混在し得る）。"""
+    ensure_v1()
+    provider_obj, order, calls = _spy_target_check_then_availability(monkeypatch)
+    captured: dict = {}
+    _capture_execution_provider(monkeypatch, endpoint, captured)
+    r = _call(_client(), endpoint, knowledge=True, message="消費税率とは？")
     assert r.status_code == 200
     assert calls["get_provider"] == 1
     assert order == ["target_check", "tool_availability"]
@@ -573,52 +313,15 @@ class _TargetCheckRejectingProvider:
         raise llm.SsrfBlocked("許可されていない接続先です: evil.example.com:80")
 
 
-def test_chat_target_check_rejection_is_422_json_not_500(monkeypatch):
-    """`POST /chat`: `_agentic_target_check` が `llm.SsrfBlocked`（`PreflightRejected` 継承）を
-    送出しても、未捕捉の 500 text/plain ではなく、安全な固定文言つきの 422 application/json に
-    なる——生の例外文言（接続先ホスト名等）は応答へ含めない。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
+@pytest.mark.parametrize("endpoint", ENDPOINTS)
+def test_target_check_rejection_is_422_json_not_500(monkeypatch, endpoint):
+    """接続先ポリシー違反は未捕捉の 500 でなく固定文言の 422 application/json（生の例外文言＝
+    接続先ホスト名は応答へ含めない）。"""
     from sherpa.routers import chat as chat_router_mod
     ensure_v1()
     monkeypatch.setattr(chat_router_mod, "get_provider",
                         lambda settings, **kw: _TargetCheckRejectingProvider())
-    c = TestClient(app)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": True, "stream_id": "mc-05770"})
-    assert r.status_code == 422
-    assert r.headers["content-type"].startswith("application/json")
-    detail = r.json()["detail"]
-    assert detail
-    assert "evil.example.com" not in detail
-
-
-def test_chat_stream_target_check_rejection_is_422_json_not_500(monkeypatch):
-    """`GET /chat/stream` も同様。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    from sherpa.routers import chat as chat_router_mod
-    ensure_v1()
-    monkeypatch.setattr(chat_router_mod, "get_provider",
-                        lambda settings, **kw: _TargetCheckRejectingProvider())
-    c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V, "knowledge": True, "stream_id": "mc-05940"})
-    assert r.status_code == 422
-    assert r.headers["content-type"].startswith("application/json")
-    detail = r.json()["detail"]
-    assert detail
-    assert "evil.example.com" not in detail
-
-
-def test_chat_turns_target_check_rejection_is_422_json_not_500(monkeypatch):
-    """`POST /chat/turns` も同様（背景実行を起動する前・受付段階で弾かれる）。"""
-    from fastapi.testclient import TestClient
-    from sherpa.api import app
-    from sherpa.routers import chat as chat_router_mod
-    ensure_v1()
-    monkeypatch.setattr(chat_router_mod, "get_provider",
-                        lambda settings, **kw: _TargetCheckRejectingProvider())
-    c = TestClient(app)
-    r = c.post("/chat/turns", json={"message": "x", "world": V, "knowledge": True})
+    r = _call(_client(), endpoint, knowledge=True)
     assert r.status_code == 422
     assert r.headers["content-type"].startswith("application/json")
     detail = r.json()["detail"]
@@ -627,20 +330,11 @@ def test_chat_turns_target_check_rejection_is_422_json_not_500(monkeypatch):
 
 
 def test_chat_settings_read_failure_propagates_as_500_not_swallowed(monkeypatch):
-    """`POST /chat`: `_prepare_agentic_snapshot` 内の `store.get_settings` が失敗したら、
-    フォールバックして受付を継続させず、そのまま伝播させて 500 で止める（読み取りは1回だけで
-    終わる）。
-
-    ここで例外を握りつぶして楽観的な値（例: 要求どおりの knowledge）へ倒すと、`knowledge=True`
-    の受付が読み取り失敗後も継続し、実行本体（`handle_message`）が `settings=None` を受け取って
-    **自分で settings を再読取**することになる。この2回目の読み取りは受付から時間が経った後
-    （会話・user行の保存後）に起こるため、単一スナップショット契約（本関数が1回だけ読んだ値を
-    実行本体までそのまま渡す契約）と `_agentic_target_check → tool_availability` の順序保証の
-    両方を迂回してしまう——1回目だけ失敗し2回目以降は成功する偽物にすると、フォールバック実装
-    では2回目の再読取が拾われて 200 で完了してしまう（読み取り回数を1回に固定して検出する）。"""
-    from fastapi.testclient import TestClient
+    """`_prepare_agentic_snapshot` 内の `store.get_settings` 失敗はフォールバックせず 500 で止める。
+    握りつぶすと実行本体が settings を再読取し、単一スナップショット契約と
+    `_agentic_target_check → tool_availability` の順序保証を迂回する（1 回目だけ失敗する偽物で、
+    読み取り回数が 1 回であることも固定する）。"""
     from sherpa import store
-    from sherpa.api import app
     ensure_v1()
 
     orig_get_settings = store.get_settings
@@ -653,30 +347,36 @@ def test_chat_settings_read_failure_propagates_as_500_not_swallowed(monkeypatch)
         return orig_get_settings(uid)
 
     monkeypatch.setattr(store, "get_settings", _fails_once_then_recovers)
-    c = TestClient(app, raise_server_exceptions=False)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": True, "stream_id": "mc-06470"})
+    r = _call(_client(raise_server_exceptions=False), "/chat/turns", knowledge=True)
     assert r.status_code == 500
     assert calls["n"] == 1
 
 
 def test_impact_scoped_narrows():
     """範囲を絞ると影響件数は増えない（要 Neo4j+PG）。"""
+    from sherpa import chat_service
+    from sherpa.deps import neo4j_session
+
+    def _answer(s, **kw):
+        for ev in chat_service.stream_message(s, "TAX-RATE を変えたい。影響は？", V, knowledge=True,
+                                              user_id="admin", **kw):
+            if ev.get("type") == "answer":
+                return ev["message"]["answer"]
+        return None
+
     try:
         ensure_v1()
-        from fastapi.testclient import TestClient
-        from sherpa.api import app
-        c = TestClient(app)
-        q = {"message": "TAX-RATE を変えたい。影響は？", "world": V, "knowledge": True, "stream_id": "mc-06600"}
-        full = c.post("/chat", json=q)
-        if full.status_code != 200:
-            return _skip("infra down (Neo4j/PG 未起動)")
-        scoped = c.post("/chat", json={**q, "scope_paths": [S_DESIGN], "stream_id": "mc-06630"})
+        with neo4j_session() as s:
+            f = _answer(s)
+            if f is None:
+                return _skip("infra down (Neo4j/PG 未起動)")
+            ans = _answer(s, scope_paths=[S_DESIGN])
     except Exception as e:
         return _skip(f"infra down: {e}")
-    ans = scoped.json()["message"]["answer"]
-    f = full.json()["message"]["answer"]["summary"]["total"]
-    s = ans["summary"]["total"]
-    assert f >= 1 and s <= f
+    assert ans is not None
+    ft = f["summary"]["total"]
+    s_total = ans["summary"]["total"]
+    assert ft >= 1 and s_total <= ft
     assert ans.get("scope", {}).get("scope_paths") == [S_DESIGN]
     assert ans["scope"]["source"] == "explicit"
     assert all(scope.in_scope(src["doc_id"], [S_DESIGN]) for src in ans["sources"])

@@ -125,3 +125,28 @@ def test_missing_rg_bwrap_is_warning_only(monkeypatch, tmp_path):
     assert required_tools.codex_cli_missing_message() is None
     ids = {c["id"] for c in agent_constructs.available_constructs({})}
     assert {"codex_openai", "codex_ollama"} <= ids
+
+
+def test_doctor_required_tools_never_reaches_ddl(monkeypatch):
+    """doctor は読み取り専用: 表が無い DB でも init_schema(DDL) を呼ばず、OCR ワーカーは「不明」(skip) になる。"""
+    import psycopg
+    import scripts.doctor_checks as doctor_checks
+    from sherpa.store import db, ocr_jobs
+
+    ddl: list[str] = []
+    monkeypatch.setattr(db, "_inited", False, raising=False)
+    monkeypatch.setattr(db, "init_schema", lambda *a, **k: ddl.append("init_schema"))
+
+    class _NoTable:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, *a):
+            ddl.extend(["DDL"] if sql.lstrip().upper().startswith(("CREATE", "ALTER")) else [])
+            raise psycopg.errors.UndefinedTable("ocr_worker_heartbeats")
+
+    monkeypatch.setattr(ocr_jobs, "_connect", lambda: _NoTable())
+    row = ocr_jobs.worker_availability_summary("sha256:" + "a" * 64)
+    assert row["available"] is False and row["unavailable_reason"] == "schema_not_ready"
+    checks = {c.id: c for c in doctor_checks.check_required_tools()}
+    assert checks["tool_ocr_worker"].status == "skip" and "確認できません" in checks["tool_ocr_worker"].detail
+    assert ddl == []

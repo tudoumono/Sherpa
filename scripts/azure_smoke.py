@@ -11,9 +11,8 @@ docs/archive/2026-08-18-AzureOpenAI対応.md）を実装したが、実 Azure �
   - `sherpa.llm`: `openai_base_url` / `openai_url` / `openai_headers` /
     `openai_endpoint_kind` / `assert_openai_base_url_allowed` / `openai_post_json` /
     `_redact_url_for_error`（URL 表示の伏せ字化）
-  - `sherpa.providers.openai.OpenAIProvider`: `_messages`（本文の組み立て）・
-    `_stream`（ストリーミング本体・usage 捕捉を含めてそのまま呼ぶ）
-  - `sherpa.agentic_search`: `openai_tools`（tool calling 検査に渡す本番のツール定義）
+  - `sherpa.agentic_search._post`: 簡易チャット（`sherpa.simple_chat`）が使う HTTP 送信の共通層
+  - `sherpa.simple_chat`: `_build_tools`（tool calling 検査に渡す本番のツール定義）
   - `sherpa.embeddings`: `cfg` / `_embed_batch`（embeddings 検査。`embed()` でなく
     `_embed_batch` を直接呼ぶ理由は該当関数のコメント参照＝次元不一致を隠さず表示するため）
   - `sherpa.providers.codex.sandbox`: `_write_codex_authoring_config` / `_codex_clean_env`
@@ -53,9 +52,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # 本番コードをそのまま使う（再実装しない・モジュール docstring 参照）。
-from sherpa import agent_constructs, agentic_search, embeddings, llm  # noqa: E402
+from sherpa import agent_constructs, agentic_search, embeddings, llm, simple_chat  # noqa: E402
 from sherpa.providers.codex import sandbox as codex_sandbox  # noqa: E402
-from sherpa.providers.openai import OpenAIProvider  # noqa: E402
 
 _TIMEOUT = 30            # 通常の HTTP 検査（②③④⑥⑦）のタイムアウト秒
 _CODEX_TIMEOUT = 90      # ⑧ codex exec の待ち上限秒（reasoning="low"・短いプロンプトなら通常もっと短い）
@@ -67,7 +65,7 @@ _GATED_BY_FLAG = {"vision": "--vision", "codex": "--codex"}     # 既定OFF・�
 _LABELS = {
     "config": "① 設定の解決（通信なし）",
     "chat": "② chat/completions（非ストリーム）",
-    "stream": "③ chat/completions（ストリーム＋usage）",
+    "stream": "③ chat/completions（usage の取得）",
     "tools": "④ tool calling（本番のツール定義）",
     "embeddings": "⑤ embeddings（次元1536を確認）",
     "responses": "⑥ Responses API（Codex(OpenAI) 構成の生死判定）",
@@ -82,9 +80,8 @@ _NEXT_STEPS = {
     "config": "OPENAI_BASE_URL（https:// 必須・ホスト名必須・userinfo/クエリ禁止）を確認してください。",
     "chat": "401/403 なら OPENAI_API_KEY、404 ならモデル欄のデプロイ名の誤り、"
             "400 で api-key 関連のエラーなら SHERPA_OPENAI_AUTH_HEADER=api-key を試してください。",
-    "stream": "400 で stream_options 関連のエラーなら、Azure 側がこれを拒否している可能性があります"
-              "＝実装側の対応が必要です（sherpa/providers/openai.py::OpenAIProvider._stream の"
-              "stream_options 送出を分岐させる改修を検討してください）。それ以外は②と同じ対処です。",
+    "stream": "usage が返らない場合は、対象デプロイが usage を返す設定か確認してください。"
+              "それ以外は②と同じ対処です。",
     "tools": "対象デプロイが function calling に対応しているか確認するか、対応デプロイに切り替えてください。",
     "embeddings": "OPENAI_EMBED_MODEL に埋め込み用デプロイ名を設定し、"
                  "そのデプロイが 1536 次元（text-embedding-3-small 相当）であることを確認してください。",
@@ -118,7 +115,7 @@ Azure 側の準備:
   ① config      設定の解決（通信なし）
   ② chat        chat/completions（非ストリーム）                          [必須]
   ③ stream      chat/completions（ストリーム＋usage・stream_options 込み） [必須]
-  ④ tools       tool calling（agentic_search.openai_tools の本番定義）
+  ④ tools       tool calling（simple_chat._build_tools の本番定義）
   ⑤ embeddings  embeddings（次元 1536 を確認）                            [必須]
   ⑥ responses   Responses API（Codex(OpenAI) 構成が使えるかの生死判定）
   ⑦ vision      画像入力（既定OFF・--vision で有効化）
@@ -427,11 +424,10 @@ def _check_config(cfg: dict, model: str, api_key: str) -> tuple[bool, str]:
 # ---- 検査② chat/completions（非ストリーム） ----
 
 def _check_chat(cfg: dict, model: str, api_key: str) -> tuple[bool, str]:
-    # OpenAIProvider が使うのと同じ本文の形（`_messages()` は system(あれば)+履歴+user を組む
-    # 本番メソッド・そのまま呼ぶ＝再実装しない）。gpt-5.5 系は temperature 拒否＝送らない。
-    provider = OpenAIProvider(api_key, model)
+    # gpt-5.5 系は temperature 拒否＝送らない。
     body = {"model": model, "max_completion_tokens": 16,
-            "messages": provider._messages("Azure OpenAI 疎通確認: 「OK」とだけ日本語で答えてください。")}
+            "messages": [{"role": "user",
+                          "content": "Azure OpenAI 疎通確認: 「OK」とだけ日本語で答えてください。"}]}
     ok, resp = _do_post("chat/completions", body, api_key)
     if not ok:
         return False, resp
@@ -450,43 +446,44 @@ def _check_chat(cfg: dict, model: str, api_key: str) -> tuple[bool, str]:
 # ---- 検査③ chat/completions（ストリーム＋usage） ----
 
 def _check_stream(cfg: dict, model: str, api_key: str) -> tuple[bool, str]:
-    # `OpenAIProvider._stream` を直接呼ぶ（本番のストリーミング実装そのもの・Ctx を組む必要が
-    # ないよう `_GenProvider` 自身が「`run()` を経由せず `_messages`/`_stream` を直接叩くテスト向けの
-    # 安全なフォールバック」を明記している＝sherpa/providers/base.py のクラス docstring 参照）。
-    # 本番と同じく stream_options.include_usage を送る＝Azure がこれを拒否するなら実装側の対応が要る。
-    provider = OpenAIProvider(api_key, model)
+    # 簡易チャット（`sherpa.simple_chat`）と同じ送信層（`llm.openai_url` ＋ `agentic_search._post`）で
+    # 1回だけ呼び、応答の usage（トークン記録の元）が返ることを確かめる。
     try:
-        chunks = list(provider._stream("次の1語だけを日本語で答えてください: OK"))
+        url = llm.openai_url("chat/completions")
+        llm.assert_openai_io_allowed()
+        resp = agentic_search._post(
+            url, llm.openai_headers(api_key),
+            {"model": model, "max_completion_tokens": 16,
+             "messages": [{"role": "user", "content": "次の1語だけを日本語で答えてください: OK"}]},
+            timeout=_TIMEOUT)
     except urllib.error.HTTPError as e:
-        detail = _http_error_detail(e, api_key)
-        if e.code == 400:
-            detail += "（実装側の対応が必要な可能性: Azure が stream_options.include_usage を拒否している場合）"
-        return False, detail
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as e:
+        return False, _http_error_detail(e, api_key)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError, RuntimeError) as e:
         return False, f"{type(e).__name__}: {_scrub(str(e), api_key)}"
-    text = "".join(chunks).strip()
-    usage = provider._last_usage
+    choice = (resp.get("choices") or [{}])[0]
+    text = ((choice.get("message") or {}).get("content") or "").strip()
+    usage = resp.get("usage") or {}
     note = _content_filter_note(text)
-    detail = f"応答={_short(text, 60)!r} usage_chunk={'あり' if usage else 'なし'}"
+    detail = f"応答={_short(text, 60)!r} usage={'あり' if usage else 'なし'}"
     if usage:
-        detail += f"（input={usage['input_tokens']} output={usage['output_tokens']}）"
+        detail += f"（input={usage.get('prompt_tokens')} output={usage.get('completion_tokens')}）"
     if note:
         return False, f"{detail} {note}"
     if not text and not usage:
-        return False, f"{detail}（本文もusageチャンクも空＝応答なし）"
+        return False, f"{detail}（本文もusageも空＝応答なし）"
     return True, detail
 
 
 # ---- 検査④ tool calling ----
 
 def _check_tools(cfg: dict, model: str, api_key: str) -> tuple[bool, str]:
-    # 本番のツール定義（agentic_search.openai_tools）をそのまま渡す。ツールは実行しない
+    # 本番のツール定義（simple_chat._build_tools）をそのまま渡す。ツールは実行しない
     # （1往復で tool_calls が返るかだけを見る）。
-    tools = agentic_search.openai_tools(with_es=False, with_graph=False, can_ask=False)
+    tools = simple_chat._build_tools({})
     body = {"model": model, "max_completion_tokens": 300, "tool_choice": "auto", "tools": tools,
             "messages": [
                 {"role": "system", "content": "あなたは社内資料を検索するアシスタントです。"},
-                {"role": "user", "content": "list_docs ツールを使って、資料の一覧を確認してください。"},
+                {"role": "user", "content": "ripgrep_search ツールを使って、「請求」という語を検索してください。"},
             ]}
     ok, resp = _do_post("chat/completions", body, api_key)
     if not ok:
@@ -616,7 +613,7 @@ def _check_codex(cfg: dict, model: str, api_key: str) -> tuple[bool, str]:
             else:
                 os.environ["CODEX_HOME"] = saved_codex_home
 
-        popen_env = codex_sandbox._codex_clean_env(codex_home, authoring, tmpdir, openai_api_key=api_key)
+        popen_env = codex_sandbox._codex_clean_env(codex_home, tmpdir, openai_api_key=api_key)
         argv = ["codex", "exec", "--json", "--strict-config", "--skip-git-repo-check", "--ephemeral",
                 "-o", str(last_message_path), "-C", str(authoring), "-m", model,
                 "-c", "model_reasoning_effort=low",
@@ -792,7 +789,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         prog="azure_smoke.py",
         description=(
             "Azure OpenAI（または他の OpenAI 互換エンドポイント）への実疎通を、Sherpa 本番コード"
-            "（sherpa.llm / sherpa.embeddings / sherpa.providers.openai.OpenAIProvider / "
+            "（sherpa.llm / sherpa.embeddings / "
             "sherpa.agentic_search / sherpa.providers.codex.sandbox）をそのまま呼んで確認します。"),
         epilog=_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,

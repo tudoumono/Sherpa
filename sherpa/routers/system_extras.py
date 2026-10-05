@@ -1,26 +1,12 @@
-"""システム系追加エンドポイント＋運営掲示板＋全体設定＋外部APIキー（フェーズ3スライス8・純移動）。
-
-`GET /health/summary`・`GET /admin/health`・`GET /announcements`・`POST /admin/announcements`・
-`PATCH /admin/announcements/{id}`・`DELETE /admin/announcements/{id}`・`GET /admin/settings`・
-`PUT /admin/settings`・`POST/GET/DELETE /ext/v1/admin/keys`・`POST /ext/v1/admin/keys/recover`
-（12ルート）を api.py から抽出する。ロジックは変更しない（コード移動のみ）。ルート表 golden の
-定義順を保つため、api.py 側は `sherpa.routers.system` の `healthz_router` を include_router
-した直後（`root_router` より前）に `app.include_router(system_extras.extras_router)` を1回
-だけ置く。これらのルートは golden 上で連続しており、この1箇所の include で定義順は不変。
-
-利用者本人の API キー自己発行/一覧/失効/回復 `POST/GET/DELETE /ext/v1/keys`・
-`POST /ext/v1/keys/recover`（4ルート）を同じ include に追加（Cookie 認証＝`_current_user`
-のみ・admin 不要）。
-
-`_sweep_expired_announcements`（名前に反して maintenance 側・背景ポーラ/起動処理が使う）と
-`_auth_bootstrap_on_startup` は api.py に残る（lifespan 起動処理のため）。
-
-このモジュールは `sherpa.api` を import しない（循環回避）。
+"""システム系の追加エンドポイント（ヘルス・運営掲示板・全体設定・外部APIキー）。
+`GET /health/summary`・`GET /admin/health`・`GET /announcements`・`POST /admin/announcements`・`PATCH /admin/announcements/{id}`・`DELETE /admin/announcements/{id}`・`GET /admin/settings`・`PUT /admin/settings`・`POST/GET/DELETE /ext/v1/admin/keys`・`POST /ext/v1/admin/keys/recover` の 12 ルートと、利用者本人の API キー自己発行/一覧/失効/回復 `POST/GET/DELETE /ext/v1/keys`・`POST /ext/v1/keys/recover`（Cookie 認証・admin 不要）の 4 ルート。
+api.py は `sherpa.routers.system` の `healthz_router` の直後・`root_router` の前に `app.include_router(system_extras.extras_router)` を 1 回だけ置く（ルート表 golden の定義順を保つため）。`_sweep_expired_announcements` と `_auth_bootstrap_on_startup` は lifespan 起動処理のため api.py に残る。
+`sherpa.api` を import しない。
+設計: docs/design/settings.md「管理画面（システム管理）の設定」
 """
 from __future__ import annotations
 
 import logging
-import os
 import secrets
 import uuid
 from datetime import datetime, timezone
@@ -36,10 +22,10 @@ from sherpa import (
     model_catalog,
     notifications,
     required_tools,
-    research_service,
+    simple_chat,
     store,
-    usage_chat,
     webhooks,
+    workspace_limits,
     worlds,
 )
 from sherpa.agents import _web_search_admin_allowed
@@ -58,27 +44,17 @@ from sherpa.schemas import (
 
 _log = logging.getLogger("sherpa")
 
-# router に tags を持たせない: 各エンドポイントの `tags=[...]` と結合されて二重化してしまう
-# （ルート表 golden 不一致の原因）ため、tags 指定は各デコレータ側のみに残す（system.py と同じパターン）。
+# router に tags を持たせない（各デコレータの tags と二重になりルート表 golden が一致しなくなる）。
 extras_router = APIRouter()
 
 _ANNOUNCEMENT_CATEGORIES = ("maintenance", "case", "notice")
 
-# R1b（Codex ネイティブ resume・決定5）→ 初期構成の既定（決定2026-09-19）: 会話ごとの Codex
-# resume セッション保持日数。未設定（None）はこの既定日数へフォールバックする——利用者が
-# 気づかないまま無制限に溜め続けない（初期構成の既定＝気づかなくても効く安全な値）。`0` は
-# 引き続き「無制限」として明示設定できる（未設定と 0 を区別する・`effective_codex_session_retention_days`）。
+# 会話ごとの Codex resume セッションの保持日数の既定。未設定（None）はこの既定日数にフォールバックし、`0` は明示的な「無制限」（未設定と 0 を区別する・`effective_codex_session_retention_days`）。
 CODEX_SESSION_RETENTION_DAYS_DEFAULT = 30
 
 
 def effective_codex_session_retention_days(system_settings: dict | None) -> int:
-    """`codex_session_retention_days` の実効値（`api._sweep_expired_codex_sessions` と
-    管理画面表示 `GET /admin/settings` の両方が呼ぶ唯一の判定）。
-
-    未設定（`None`・キー欠落）は `CODEX_SESSION_RETENTION_DAYS_DEFAULT` へ倒す。明示的に `0` を
-    保存した場合だけ「無制限」（0 を返す）——保存側の pydantic Field でも 0 以上の整数だけを
-    許すが、読み取り側でも壊れた保存値（負値・非 int）を安全側（既定日数）へ倒す。
-    """
+    """`codex_session_retention_days` の実効値（`api._sweep_expired_codex_sessions` と `GET /admin/settings` の表示が呼ぶ唯一の判定）。未設定（None・キー欠落）は `CODEX_SESSION_RETENTION_DAYS_DEFAULT`、明示的な `0` だけが無制限。壊れた保存値（負値・非 int）は既定日数に倒す。"""
     if not isinstance(system_settings, dict):
         return CODEX_SESSION_RETENTION_DAYS_DEFAULT
     raw = system_settings.get("codex_session_retention_days")
@@ -94,19 +70,9 @@ def effective_codex_session_retention_days(system_settings: dict | None) -> int:
 
 
 def _effective_codex_worker_model(sysset: dict) -> str:
-    """`GET /admin/settings` の `codex_worker_model.effective`（S6a RV是正）。
-
-    `codex_sandbox._codex_worker_model(sysset, main_model=...)` の `main_model` は
-    `model_catalog.resolve_model("codex","codex",...)` で解決するが、この経路は内部で
-    `llm.openai_endpoint_kind()`（`_codex_worker_model` 自身が Azure 判定に呼ぶ）を通り、
-    保存済み `openai_base_url` が壊れた値（falsy な非文字列＝`{}`/`[]`/`0`/`False`）だと
-    `ValueError` を送出する——表示専用のこの経路がそれで丸ごと落ちて `GET /admin/settings`
-    自体が 500 になってはいけない（他の壊れた保存値と同じ「表示はベストエフォート・実送信時の
-    fail-closed 判定は別の責務」契約・`usage_chat._effective_provider_for_display` と同じ理由）。
-    解決できない場合は固定フォールバック（`_CODEX_WORKER_MODEL_FALLBACK`）へ倒す。
-    Codex(Ollama) 構成は利用者ごとの設定（`codex_model_provider`）でシステム側からは判定できない
-    ため、この値は Codex(OpenAI 系) の実効値。Ollama 構成の利用者は本体と同じモデルタグになる
-    （画面の注記で補う）。
+    """`GET /admin/settings` の `codex_worker_model.effective`。
+    `model_catalog.resolve_model("codex","codex",...)` は内部で `llm.openai_endpoint_kind()` を通り、保存済み `openai_base_url` が壊れた値だと `ValueError` を送出する。表示専用のこの経路で `GET /admin/settings` を 500 にしないため、解決できなければ固定フォールバック（`_CODEX_WORKER_MODEL_FALLBACK`）に倒す。
+    Codex(Ollama) 構成は利用者ごとの設定でシステム側から判定できないため、この値は Codex(OpenAI 系) の実効値（Ollama 構成の利用者は本体と同じモデルタグになる）。
     """
     try:
         main_model = model_catalog.resolve_model("codex", "codex", None, system_settings=sysset)
@@ -121,8 +87,8 @@ class AnnouncementCreateReq(BaseModel):
     category: str = "notice"
     pinned: bool = False
     published: bool = True
-    publish_at: str | None = None   # S4: ISO 8601 文字列。省略/空文字＝今すぐ公開扱い（NULL）
-    expire_at: str | None = None    # S4: ISO 8601 文字列。省略/空文字＝無期限掲載（NULL）
+    publish_at: str | None = None  # ISO 8601 文字列。省略/空文字＝今すぐ公開扱い（NULL）。
+    expire_at: str | None = None  # ISO 8601 文字列。省略/空文字＝無期限掲載（NULL）。
 
 
 class AnnouncementPatchReq(BaseModel):
@@ -131,167 +97,93 @@ class AnnouncementPatchReq(BaseModel):
     category: str | None = None
     pinned: bool | None = None
     published: bool | None = None
-    # S4: 書込専用キー（openai_api_key 等）と同じ流儀＝未指定(None)は変更しない・""は NULL へクリア・
-    # それ以外は ISO 8601 文字列として新しい値に更新する。
+    # 書込専用キーと同じ扱い: 未指定(None)は変更しない・""は NULL へクリア・それ以外は ISO 8601 文字列として更新する。
     publish_at: str | None = None
     expire_at: str | None = None
 
 
 class _ModelCatalogCellReq(BaseModel):
-    """`SystemSettingsReq.model_catalog[provider][usage]` の1セル（OpenAPI スキーマに形を反映させる
-    ための型のみ・意味検証は `sherpa.model_catalog.validate_catalog` が行う）。"""
+    """`SystemSettingsReq.model_catalog[provider][usage]` の 1 セル（allowed/default）。"""
     allowed: list[str] = []
     default: str = ""
 
 
 class SystemSettingsReq(BaseModel):
-    """全体設定（system_settings）の部分更新（S1・admin のみ）。
-
-    未指定のキーは変更しない・明示的に `null` を送るとそのキーを未設定へ戻す（env/既定へフォールバック）。
-    「指定された」判定は `model_dump(exclude_unset=True)` で行うため、全フィールドの既定は `None`。
-    W0（旧形式変換バックエンド）等で今後キーが増えても system_settings 自体は汎用 KV なので器は不変。
-    """
-    arms_enabled: list[str] | None = None      # 有効アーム名（既知名のみ）・空/未指定は env/既定へ
-    legacy_backend: str | None = None          # 旧形式変換バックエンド（W0）: none|libreoffice・null は env/既定へ
-    # rag.md の LLM 成形トグル（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1）。
-    # on|off・null は既定 off へフォールバック（`legacy_backend` と同型）。
+    """全体設定（system_settings）の部分更新リクエスト（管理者のみ）。未指定のキーは変更せず、明示的に `null` を送るとそのキーを未設定へ戻す（コードの既定へ戻る）。"""
+    arms_enabled: list[str] | None = None  # 有効アーム名（既知名のみ）。空/未指定は既定へ。
+    legacy_backend: str | None = None  # 旧形式変換バックエンド: none|libreoffice|office_com。null は既定へ。
+    # rag.md の LLM 成形トグル。on|off。null は既定 off へフォールバックする（`legacy_backend` と同型）。
     rag_llm_render: str | None = None
-    vlm: dict | None = None                    # 視覚読み取り（⑤ vision）の VLM 設定: {provider,model,cloud_allowed}・null は既定へ
-    # Ollama 接続先の SSRF allowlist（host:port の配列）。
-    # 既定（未設定=None）は loopback のみ許可（`llm.assert_ollama_url_allowed`）・null は未設定へ戻す。
+    vlm: dict | None = None  # 視覚読み取りの VLM 設定 {provider,model,cloud_allowed}。null は既定へ。
+    # Ollama 接続先の SSRF allowlist（host:port の配列）。未設定(None)は loopback のみ許可（`llm.assert_ollama_url_allowed`）。null は未設定へ戻す。
     ollama_allowlist: list[str] | None = None
-    # Webhook 宛先の SSRF allowlist（host:port の
-    # 配列・`ollama_allowlist` と同じ形だが loopback を例外にしない点が異なる）。既定（未設定=None）は
-    # 全拒否——loopback（このサーバー自身）も明示登録が必須（`webhooks.assert_webhook_url_allowed`）・
-    # null は未設定へ戻す。
+    # Webhook 宛先の SSRF allowlist（host:port の配列）。`ollama_allowlist` と違い loopback も例外にせず、未設定(None)は全拒否（`webhooks.assert_webhook_url_allowed`）。null は未設定へ戻す。
     webhook_allowlist: list[str] | None = None
-    # 会話ごとの Codex resume
-    # セッション（workspace/.codex-sessions/{cid}）の保持日数。既定（未設定=None）は
-    # `CODEX_SESSION_RETENTION_DAYS_DEFAULT`（30日・決定2026-09-19）。明示的な 0 は「無制限」
-    # （`effective_codex_session_retention_days`／`api._sweep_expired_codex_sessions` 参照）。
-    # null は未設定へ戻す（＝既定30日に戻る）。
-    # 素の `int` は pydantic の緩い型強制で `true`→1・`"14"`→14 のように暗黙変換
-    # されてしまう（bool は int のサブクラス）。`StrictInt` で bool/文字列からの暗黙変換を拒否する
-    # （`codex_web_search` に `StrictBool` を使っているのと同じ理由）。
+    # 会話ごとの Codex resume セッション（workspace/.codex-sessions/{cid}）の保持日数。未設定(None)は `CODEX_SESSION_RETENTION_DAYS_DEFAULT`（30日）、明示的な 0 は「無制限」。null は未設定へ戻す。
+    # `StrictInt` で bool/文字列からの暗黙変換を拒否する（`codex_web_search` に `StrictBool` を使うのと同じ理由）。
     codex_session_retention_days: StrictInt | None = None
-    # クラウド AI プロバイダの中央設定。
-    # `cloud_provider` は openai/gemini/bedrock の排他選択（A7・既定 openai）。3つのキーは
-    # 中央で保管する資格情報（`sherpa.keys.resolve_api_key` の唯一の真実源）。個人設定
-    # （`user_settings`）とは別物＝非選択プロバイダの個人保存キーも中央キーも消さずに温存するが、
-    # `sherpa.keys` は選択中のプロバイダ以外は常に None を返す。`ollama_url` はここでは
-    # 中央の既定値（A7 排他対象外・個人設定の ollama_url が優先）。`personal_api_keys_allowed`
-    # は A6（個人には発行しない原則）の唯一のスイッチ（既定 false）。
+    # クラウド AI プロバイダの中央設定。`cloud_provider` は openai だけ選べる（既定 openai・gemini/bedrock は 422）。`openai_api_key` は中央で保管する資格情報（`sherpa.keys.resolve_api_key` が唯一の真実源）で、個人設定（`user_settings`）とは別物。`ollama_url` は中央の既定値（個人設定の ollama_url が優先）。`personal_api_keys_allowed` は個人キーを許すかの唯一のスイッチ（既定 false）。
     cloud_provider: str | None = None
     personal_api_keys_allowed: StrictBool | None = None
-    # WEB-1: Codex の Web 検索を許可するか（既定 false）。ON の間だけ、調べ方
-    # ブロックの「Web 検索」行を表示し、チャットごとの希望（`ChatReq.web_search`）を尊重する
-    # （`sherpa/providers/codex/sandbox.py::_web_search_admin_allowed` が唯一の読み手）。
+    # Codex の Web 検索を許可するか（既定 false）。ON の間だけ調べ方ブロックの「Web 検索」行を表示し、チャットごとの希望（`ChatReq.web_search`）を尊重する（`sherpa/providers/codex/sandbox.py::_web_search_admin_allowed` が唯一の読み手）。
     web_search_allowed: StrictBool | None = None
-    # OpenAI 直結（`openai_only`・`agent="openai"`）を利用者の実行構成一覧に出すか（既定 false）。
-    # OFF（既定）のとき OpenAI 系は Codex(OpenAI) に一本化し、`available_constructs()` の一覧から
-    # `openai_only` を外す（決定 2026-09-20）。実行経路・保存値・API・利用統計は変えない＝既に
-    # `agent="openai"` を選んでいる利用者の設定はそのまま有効に動く（一覧外として表示される・
-    # `sherpa/agent_constructs.py::available_constructs` 参照）。
-    openai_direct_visible: StrictBool | None = None
-    # 利用者本人による外部連携 API キーの自己発行を許可するか（既定 false）。
-    # `personal_api_keys_allowed` と同型のスイッチ・OFF に戻すたび（冪等）に利用者発行キーを
-    # 一括失効する（設定変更と同一トランザクション・`store.apply_system_settings_and_revoke_if_disabled`）。
+    # 利用者本人による外部連携 API キーの自己発行を許可するか（既定 false）。OFF に戻すたび（冪等）に利用者発行キーを一括失効する（設定変更と同一トランザクション・`store.apply_system_settings_and_revoke_if_disabled`）。
     user_api_keys_allowed: StrictBool | None = None
-    # 自己発行キーの1日あたりの呼び出し上限（既定/上限を兼ねる）。未指定は組み込みの既定値
-    # （`store.SELF_ISSUED_DAILY_QUOTA_DEFAULT_FALLBACK`）を使う。利用者は発行時にこれ以下の
-    # 値だけ指定できる（超える指定・空欄での無制限化は許さない）。admin 発行キーは対象外。
+    # 自己発行キーの 1 日あたりの呼び出し上限（既定/上限を兼ねる）。未指定は組み込みの既定値（`store.SELF_ISSUED_DAILY_QUOTA_DEFAULT_FALLBACK`）。利用者は発行時にこれ以下の値だけ指定できる。admin 発行キーは対象外。
     user_api_keys_daily_quota_default: StrictInt | None = Field(default=None, ge=1, le=1_000_000)
-    # PART-4a: AI 下調べ検索（POST /ext/v1/research）が model/provider 両方省略時に使う既定
-    # プロバイダ（"ollama"/"openai"）。既定（未設定=None）は "ollama"（コスパ踏襲）。リクエストの
-    # `provider` で明示指定すればここより優先される（`research_service.resolve_model_and_provider`
-    # 参照）。
+    # 簡易回答に使う AI のプロバイダ（"ollama"/"openai"）。チャットの簡易と外部 API（POST /ext/v1/answer）が共通で読む（管理画面の表示名は「簡易回答に使う AI」）。未設定(None)は "ollama"。`sherpa.simple_chat.resolve_model_and_provider` が読む。
     research_default_provider: str | None = None
     openai_api_key: str | None = None
-    gemini_api_key: str | None = None
-    bedrock_api_key: str | None = None
     ollama_url: str | None = None
-    # SET-2c（接続先の UI 移管）: OpenAI 互換 API の接続先。「接続先」欄（ラジオ・本家以外選択時のみ
-    # 表示する base URL・認証ヘッダ形式・API バージョン）。null は未設定へ戻す（既定へフォールバック）。
-    # 意味検証・実効値の解決は `sherpa/llm.py`（唯一の真実源）。
-    openai_endpoint_kind: str | None = None       # openai(既定)/azure/custom
+    # OpenAI 互換 API の接続先（ラジオ・本家以外のときの base URL・認証ヘッダ形式・API バージョン）。null は未設定へ戻す。意味検証・実効値の解決は `sherpa/llm.py` が唯一の真実源。
+    openai_endpoint_kind: str | None = None  # openai(既定)/azure/custom。
     openai_base_url: str | None = None
-    openai_auth_header: str | None = None         # bearer(既定)/api-key
+    openai_auth_header: str | None = None  # bearer(既定)/api-key。
     openai_api_version: str | None = None
-    # モデルカタログ（プロバイダ×用途ごとの「選べるモデル一覧＋既定」）。null は未設定へ戻す
-    # （＝組み込み既定のみへ）。セル形状（allowed/default）は pydantic 型で表現し OpenAPI スキーマに
-    # 反映させる。provider/usage 名の妥当性（既知集合・bedrock 除外）や default∈allowed の補正は
-    # `sherpa.model_catalog.validate_catalog` が行う（dict[str, dict[str, ...]] のキー自体は
-    # 任意文字列を許すため、キー側の意味検証はそちらに残す）。
+    # モデルカタログ（プロバイダ×用途ごとの「選べるモデル一覧＋既定」）。null は未設定へ戻す（組み込み既定のみ）。セル形状（allowed/default）は pydantic 型で表現し、provider/usage 名の妥当性と default∈allowed の補正は `sherpa.model_catalog.validate_catalog` が行う。
     model_catalog: dict[str, dict[str, _ModelCatalogCellReq]] | None = None
-    # Ollama の許可ホスト一覧は既存の `ollama_allowlist` をそのまま使う（新規フィールドは増やさない）。
-    # STAT-2: 利用統計チャット（`POST /admin/usage/chat`）専用の AI 選択。利用者の実行構成
-    # （`agent`）には依存せず、管理者全体で1つに統一する（"openai"|"ollama"）。null は未設定へ
-    # 戻す（既定は固定値ではなく A7・`cloud_provider` 連動＝`usage_chat._default_provider` 参照）。
-    # 空文字は明示的に 422（未設定へ戻すのは null のみ）。
-    usage_chat_provider: str | None = None
-    # SC-6c（調べる深さ・調べ方ブロック §3.2）: 調べる深さ（標準/深く/最大）が掛ける倍率の
-    # 基準値（標準時の値）。既定（未指定=None）は各モジュールの env 既定値
-    # （`sherpa/depth_profile.py::BASE_SETTINGS_KEYS` が対応する定数を列挙）。null は
-    # 未設定へ戻す（env/既定へフォールバック）。倍率表自体（標準/深く/最大）は固定でここでは
-    # 編集しない。
-    depth_base_max_turns: StrictInt | None = Field(default=None, ge=1, le=200)
+    # Ollama の許可ホスト一覧は既存の `ollama_allowlist` を使う。
+    # 調べる深さ（標準/深く/最大）が掛ける倍率の基準値（標準時の値）。未指定(None)は各モジュールのコード既定値（`sherpa/depth_profile.py::BASE_SETTINGS_KEYS` が対応する定数を列挙）。null は未設定へ戻す。倍率表自体は固定でここでは編集しない。
     depth_base_grep_max_hits: StrictInt | None = Field(default=None, ge=1, le=1000)
     depth_base_qa_max_hits: StrictInt | None = Field(default=None, ge=1, le=1000)
     depth_base_read_window: StrictInt | None = Field(default=None, ge=10, le=400)
     depth_base_impact_depth: StrictInt | None = Field(default=None, ge=1, le=64)
     depth_base_troubleshoot_depth: StrictInt | None = Field(default=None, ge=1, le=16)
     depth_base_codex_reasoning: str | None = None
-    # API の1応答内のツール実行数の絶対上限。調べる深さに依らず一定で、全 API 方言に適用する。
-    agentic_max_tools_per_turn: StrictInt | None = Field(default=None, ge=1, le=256)
-    # 埋め込み HTTP の同時送信数（`sherpa.embeddings.embed()` の有界スレッドプール）。
-    # 既定（未指定=None）は `embeddings.EMBED_PARALLEL_DEFAULT`（4）。null は未設定へ戻す。
+    # 埋め込み HTTP の同時送信数（`sherpa.embeddings.embed()` の有界スレッドプール）。未指定(None)は `embeddings.EMBED_PARALLEL_DEFAULT`（4）。null は未設定へ戻す。
     embed_parallel: StrictInt | None = Field(default=None, ge=1, le=16)
-    # 埋め込みの接続先。"auto"（回答用に選んだクラウドに従う・既定）／"ollama"（常に中央 Ollama）。
-    # null は未設定（既定 auto）へ戻す。回答側のプロバイダ選択（cloud_provider）とは独立。
+    # 埋め込みの接続先。"auto"（回答用に選んだクラウドに従う・既定）／"ollama"（常に中央 Ollama）。null は未設定（既定 auto）へ戻す。回答側の cloud_provider とは独立。
     embed_provider: str | None = None
-    # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・
-    # 深く 4 は固定（この上限で頭打ち）で、設定はこの 1 項目だけ。既定（未指定=None）は `depth_profile.MAX_REVIEW_ROUNDS_DEFAULT`（7）。
-    # null は未設定へ戻す。
+    # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・深く 4 は固定で、設定はこの 1 項目だけ。未指定(None)は `depth_profile.MAX_REVIEW_ROUNDS_DEFAULT`（7）。null は未設定へ戻す。
     max_review_rounds: StrictInt | None = Field(
         default=None, ge=depth_profile.MAX_REVIEW_ROUNDS_MIN, le=depth_profile.MAX_REVIEW_ROUNDS_MAX)
-    # multi_agent（S6）の worker モデル（`sherpa.providers.codex.sandbox._codex_worker_model`）。
-    # 既定（未指定=None）は `_CODEX_WORKER_MODEL_FALLBACK`（実機確認済みの安価枠）。空文字・null は
-    # 未設定へ戻す（実装ベース探索の回復 S1・案 B）。
+    # multi_agent の worker モデル（`sherpa.providers.codex.sandbox._codex_worker_model`）。未指定(None)は `_CODEX_WORKER_MODEL_FALLBACK`。空文字・null は未設定へ戻す。
     codex_worker_model: str | None = None
-    # 素の Codex モード（docs/archive/2026-09-24-素のCodexモード.md §1.1）。"standard"（既定・
-    # Sherpa の検索ツールと調査台帳を使う）／"plain"（Codex が自分で資料を読む・試験用）。
-    # 未指定=None は既定 "standard" へ戻す。
+    # 素の Codex モード。"standard"（既定・Sherpa の検索ツールと調査台帳を使う）／"plain"（Codex が自分で資料を読む・試験用）。未指定(None)は既定 "standard"。
+    # 設計: docs/design/codex.md「素の Codex モード」
     codex_mode: str | None = None
-    # チャット同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
-    # 既定（未指定=None）は env 既定値（`chat_turns.MAX_TURNS_PER_USER`／`MAX_TURNS_GLOBAL`）。
-    # null は未設定へ戻す（env/既定へフォールバック）。
+    # チャット同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。未指定(None)はコード既定値（`chat_turns.MAX_TURNS_PER_USER`/`MAX_TURNS_GLOBAL`）。null は未設定へ戻す。
     chat_max_turns_per_user: StrictInt | None = Field(default=None, ge=1, le=16)
     chat_max_turns_global: StrictInt | None = Field(default=None, ge=1, le=64)
-    # agentic search の
-    # tool-result バイト予算を管理者設定へ昇格（「運用ポリシーは UI が唯一の持ち主」・
-    # env フォールバックは撤去済み）。既定（未指定=None）はコード既定（精度優先・
-    # §3.4 憲法1条＝262144/4194304）への フォールバック（`agentic_search.resolve_tool_result_
-    # budgets()` が唯一の解決点）。範囲は元の env 側検証と同一（1件あたり=1024〜8MiB・
-    # 1 run 累計=4096〜64MiB）。null は未設定へ戻す。
+    # Codex の MCP ツール結果 1 件あたりのバイト予算。未指定(None)はコード既定（262144・`agentic_search.effective_tool_result_max_bytes()` が唯一の解決点）。null は未設定へ戻す。撤去済みの旧キー（`agentic_max_tools_per_turn`/`agentic_budget_total`/`depth_base_max_turns`）は送られても無視する。
     agentic_budget_per_result: StrictInt | None = Field(default=None, ge=1024, le=8 * 1024 * 1024)
-    agentic_budget_total: StrictInt | None = Field(default=None, ge=4096, le=64 * 1024 * 1024)
-    # チャット画面のクイック入力例（ウェルカム画面のチップ）のカスタマイズ。`{enabled, items}`
-    # （意味検証は `sherpa.chat_examples.validate`・`_validate_chat_examples` が 422 へ変換）。
-    # null は未設定へ戻す（既定＝表示・組み込み4例）。
+    # 個人ファイル（workspace）の 1 件あたりの上限（バイト）と保持日数（0 は無期限）。未指定(None)は `workspace_limits` の既定（10 MiB・90 日）。null は未設定へ戻す。
+    workspace_max_bytes: StrictInt | None = Field(
+        default=None, ge=workspace_limits.MAX_BYTES_MIN, le=workspace_limits.MAX_BYTES_MAX)
+    workspace_ttl_days: StrictInt | None = Field(
+        default=None, ge=workspace_limits.TTL_DAYS_MIN, le=workspace_limits.TTL_DAYS_MAX)
+    # チャット画面のクイック入力例（ウェルカム画面のチップ）のカスタマイズ `{enabled, items}`。意味検証は `sherpa.chat_examples.validate`（`_validate_chat_examples` が 422 へ変換）。null は未設定へ戻す（既定＝表示・組み込み 4 例）。
     chat_examples: dict | None = None
 
 
 def _normalize_world_list_field(v: list[str] | None) -> list[str] | None:
-    """`allowed_worlds` の形式検証（識別子として妥当か・重複除去）。`ExtKeyCreateReq`・
-    `ExtSelfKeyCreateReq` の双方の field_validator から呼ぶ共通本体（実在検証は各ハンドラ側・
-    DB/走査を要するため）。None（未指定）はそのまま返す＝全 world 許可（既存キーと同じ後方互換）。
-    """
+    """`allowed_worlds` の形式検証（識別子として妥当か・重複除去）。`ExtKeyCreateReq`・`ExtSelfKeyCreateReq` の field_validator が共用する（実在検証は各ハンドラ側）。None（未指定）はそのまま返す＝全 world 許可。"""
     if v is None:
         return v
     for w in v:
         if not worlds.valid_world(w):
             raise ValueError(f"world 識別子が不正です: {w}")
-    seen, out = set(), []                 # 重複除去（順序維持）
+    seen, out = set(), []  # 重複除去（順序維持）。
     for w in v:
         if w not in seen:
             seen.add(w)
@@ -299,18 +191,11 @@ def _normalize_world_list_field(v: list[str] | None) -> list[str] | None:
     return out
 
 
-# daily_quota の上限（DB は INTEGER 列＝この範囲を超える値は CHECK 制約で拒否されるが、
-# ここで先に 422 にすることで整数オーバーフロー起因の 500 を防ぐ）。
+# daily_quota の上限。DB の CHECK 制約より先に 422 にして、整数オーバーフロー起因の 500 を防ぐ。
 _DAILY_QUOTA_MAX = 1_000_000
 
 def _validate_client_op_id_format(v: str) -> str:
-    """`client_op_id` を UUID として解析し、標準の小文字正準形（8-4-4-4-12・ハイフン区切り）へ
-    正規化する。DB 側の非NULL部分一意制約（`api_keys_client_op_id_unique`）と組み合わせて
-    「この1回の発行操作」を一意に指す前提のため、固定値の使い回し等で衝突しやすい任意の
-    自由文字列は受け付けない。大小文字表記の違い（例: 'ABCD...' と 'abcd...'）は同じ UUID を
-    指すため、正規化せずに保存すると一意制約・回復時の照合を大小文字の書き分けで迂回できて
-    しまう——ここで常に正準小文字形へ揃えて以後の全経路（DB・回復API）に渡すことで、
-    表記の違いが別の値として扱われる余地を無くす。"""
+    """`client_op_id` を UUID として解析し、標準の小文字正準形（8-4-4-4-12・ハイフン区切り）へ正規化する。DB の非NULL部分一意制約（`api_keys_client_op_id_unique`）と組み合わせて「この 1 回の発行操作」を一意に指すため、任意の自由文字列は受け付けず、大小文字違いも正準形に揃えて一意制約と回復時の照合を迂回できないようにする。"""
     try:
         return str(uuid.UUID(v))
     except (ValueError, AttributeError, TypeError) as e:
@@ -319,22 +204,16 @@ def _validate_client_op_id_format(v: str) -> str:
 
 
 class ExtKeyCreateReq(BaseModel):
-    """外部連携 API キー発行（/ext/v1・admin のみ）。"""
+    """外部連携 API キーの発行リクエスト（/ext/v1・admin のみ）。"""
     label: str = Field(min_length=1, max_length=100)
-    # world スコープ（オプトイン）。未指定/null＝全 world 許可（既存キーと同じ後方互換）。
-    # 空リストは「どの world にもアクセスできない」キー（意図的な選択・拒否はしない）。
-    # 形式検証はここ（識別子として妥当か）・実在検証は `ext_key_create` 側（DB/走査を要するため）。
+    # world スコープ（オプトイン）。未指定/null＝全 world 許可、空リスト＝どの world にもアクセスできないキー。形式検証はここ、実在検証は `ext_key_create` 側。
     allowed_worlds: list[str] | None = None
-    # 有効期限（ISO 8601 文字列・announcements の publish_at/expire_at と同じ流儀）・
-    # 日次クォータ（任意・1〜_DAILY_QUOTA_MAX の整数）。いずれも省略/null＝後方互換（無期限・無制限）。
+    # 有効期限（ISO 8601 文字列）と日次クォータ（任意・1〜_DAILY_QUOTA_MAX の整数）。いずれも省略/null＝無期限・無制限。
     expires_at: str | None = None
     daily_quota: StrictInt | None = Field(default=None, ge=1, le=_DAILY_QUOTA_MAX)
-    # 発行 UI が生成する相関トークン（任意・秘密ではない・UUID 形式のみ）。POST 応答が失われた
-    # 場合に、UI が回復専用エンドポイント（`ext_key_recover`）でこの値を照合して自動失効する。
+    # 発行 UI が生成する相関トークン（任意・秘密ではない・UUID 形式のみ）。POST 応答が失われた場合に、UI が回復エンドポイント（`ext_key_recover`）でこの値を照合して自動失効する。
     client_op_id: str | None = Field(default=None, max_length=100)
-    # PART-6（Webhook 通知・オプトイン）: 取り込み run の terminal 化を受け取る宛先 URL。
-    # 未指定/null＝Webhook 無効。意味検証（http/https・宛先ポリシー）は `ext_key_create` 側
-    # （`webhooks.assert_webhook_url_allowed`・DB の allowlist を読むため）。
+    # Webhook 通知の宛先 URL（取り込み run の terminal 化を受け取る）。未指定/null＝Webhook 無効。意味検証（http/https・宛先ポリシー）は `ext_key_create` 側（`webhooks.assert_webhook_url_allowed`）。
     webhook_url: str | None = Field(default=None, max_length=2048)
 
     @field_validator("allowed_worlds")
@@ -354,18 +233,15 @@ class ExtKeyCreateReq(BaseModel):
 
 
 class ExtSelfKeyCreateReq(BaseModel):
-    """利用者本人による外部連携 API キー発行。`system_settings.user_api_keys_allowed` が
-    true のときのみ受理される。"""
+    """利用者本人による外部連携 API キー発行のリクエスト。`system_settings.user_api_keys_allowed` が true のときのみ受理される。"""
     label: str = Field(min_length=1, max_length=100)
-    # 本人がアクセスできる範囲 ⊆ に強制する（`_enforce_self_world_scope` 側で検証・
-    # `worlds.accessible_world_ids` 経由）。ここでは形式検証のみ（`ExtKeyCreateReq` と同型）。
+    # 本人がアクセスできる範囲の部分集合に強制する（`_enforce_self_world_scope` が `worlds.accessible_world_ids` で検証）。ここでは形式検証のみ（`ExtKeyCreateReq` と同型）。
     allowed_worlds: list[str] | None = None
     expires_at: str | None = None
-    # 未指定/null は管理者の現在の既定を適用・指定値が現在の上限を超える場合は422（`store.
-    # insert_api_key` がロック内で DB から再読して確定する＝ここでの上限は入力の型検証のみ）。
+    # 未指定/null は管理者の現在の既定を適用し、指定値が現在の上限を超える場合は 422 にする（確定は `store.insert_api_key` がロック内で DB から再読して行う・ここでは型検証のみ）。
     daily_quota: StrictInt | None = Field(default=None, ge=1, le=_DAILY_QUOTA_MAX)
     client_op_id: str | None = Field(default=None, max_length=100)
-    # PART-6: `ExtKeyCreateReq.webhook_url` と同型（利用者自己発行キーにも同じく使える）。
+    # `ExtKeyCreateReq.webhook_url` と同型（自己発行キーにも使える）。
     webhook_url: str | None = Field(default=None, max_length=2048)
 
     @field_validator("allowed_worlds")
@@ -385,8 +261,7 @@ class ExtSelfKeyCreateReq(BaseModel):
 
 
 class ExtKeyRecoverReq(BaseModel):
-    """曖昧な発行結果（POST 応答が届かなかった等）の回復専用リクエスト
-    （`ext_key_recover`/`ext_self_key_recover` 共通）。"""
+    """曖昧な発行結果（POST 応答が届かなかった等）の回復リクエスト。"""
     client_op_id: str = Field(min_length=1, max_length=100)
 
     @field_validator("client_op_id")
@@ -397,12 +272,7 @@ class ExtKeyRecoverReq(BaseModel):
 
 @extras_router.get("/health/summary", tags=["システム"], response_model=HealthSummaryResponse)
 def health_summary(request: Request):
-    """バックエンド健全性のサマリ（全画面の状態ドット用・ログイン必須）。
-
-    `_current_user` 自体が Postgres（session_user）に依存するため、Postgres 停止時
-    （＝一番この結果を必要とする時）にここで例外化しないよう try で包む。未ログイン
-    （HTTPException）はそのまま re-raise、それ以外（認証DB到達不可）は down を返す。
-    """
+    """バックエンド健全性のサマリを返す（全画面の状態ドット用・ログイン必須）。Postgres 停止時にも例外にならず down を返す（未ログインは 401）。"""
     try:
         _current_user(request)
     except HTTPException:
@@ -415,19 +285,8 @@ def health_summary(request: Request):
 
 @extras_router.get("/admin/health", tags=["システム"])
 def admin_health(request: Request, refresh: bool = False):
-    """コンポーネント別の健全性詳細（システム状態画面用・admin 専用）。
-
-    admin 確認自体が Postgres に依存するため、認証DB到達不可時は admin かどうか
-    判定できない＝詳細（DSN 等が漏れうる情報）は返さず 503 のみ返す。
-
-    UI フィードバック4: AI（openai/gemini/bedrock/ollama/codex）は状態ドット用の
-    軽量チェック（env の有無/バイナリ有無だけ・per-user キーは見ない）ではなく、**この管理者本人が
-    設定画面で入れた API キーも含めて実際に1回だけ接続確認**した結果に差し替える
-    （`health.ai_snapshot`・per-uid キャッシュ＝自動ポーリングで実 API 呼び出しを連発しない）。
-
-    AI との切り分け用に、登録 world への ES/グラフ実クエリ検索テスト（`health.search_snapshot`）を
-    2行追加する（同じ per-uid TTL キャッシュ＝自動ポーリングでは TTL 内で最大1回/60秒に抑え、
-    「再チェック」は `force=True` で必ず最新化する）。
+    """コンポーネント別の健全性詳細を返す（システム状態画面用・admin 専用）。
+    認証 DB に到達できないときは詳細（DSN 等）を返さず 503 のみ返す。AI（openai/ollama/codex）は、この管理者本人が設定画面で入れた API キーも含めて実際に 1 回だけ接続確認した結果を返し、登録 world への ES/グラフ検索テストも含む（結果は利用者ごとに 60 秒キャッシュされ、「再チェック」は `force=True` で最新化する）。
     """
     try:
         u = _require_admin(_current_user(request))
@@ -440,7 +299,7 @@ def admin_health(request: Request, refresh: bool = False):
             "make up でストアの復旧を確認してください。",
         )
     data = health.snapshot(force=refresh)
-    ai_ids = {"openai", "gemini", "bedrock", "ollama", "codex"}
+    ai_ids = {"openai", "ollama", "codex"}
     ai_rows = health.ai_snapshot(u["uid"], store.get_settings(u["uid"]), force=refresh)
     search_rows = health.search_snapshot(u["uid"], force=refresh)
     components = [c for c in data["components"] if c["id"] not in ai_ids] + ai_rows + search_rows
@@ -449,25 +308,17 @@ def admin_health(request: Request, refresh: bool = False):
 
 @extras_router.get("/notifications", tags=["システム"])
 def notifications_list(request: Request):
-    """非同期処理の完了/要対応の通知（NOTIFY-1・ホーム画面「通知」区画用・ログイン必須）。
-
-    誰でも取り込み run の完了/失敗が見える。admin はさらにグラフ drift・LLM 成形完了・OCR
-    反映待ちも見える（`notifications.list_notifications` が role で絞る）。自分が所有する共有の期限が
-    7 日以内に来る場合は本人にだけ見える。既読管理はしない
-    （毎回現在の状態から組み立てて返す）。
+    """非同期処理の完了/要対応の通知を返す（ホーム画面「通知」区画用・ログイン必須）。
+    誰でも取り込み run の完了/失敗が見える。admin はさらにグラフ drift・LLM 成形完了・OCR 反映待ちも見える。自分が所有する共有の期限が 7 日以内に来る場合は本人にだけ見える。既読管理はせず、毎回現在の状態から組み立てる。
     """
     u = _current_user(request)
     return {"notifications": notifications.list_notifications(is_admin=u.get("role") == "admin", uid=u["uid"])}
 
 
-# ===== 運営掲示板（2026-07-02-利用統計とホーム掲示板.md Feature 2・公開/削除タイマー） =====
+# 運営掲示板（公開/削除タイマー）。
 
 def _parse_announcement_dt(value: str | None, field_label: str) -> datetime | None:
-    """publish_at/expire_at の入力（ISO 8601 文字列）をパースする。空/未指定は None。
-
-    naive（tzinfo 無し）は UTC 扱いに統一する（`ShareCreateReq.expires_at` と同じ流儀）。
-    不正な形式は 422（フロントは datetime-local→`Date#toISOString()` で常にオフセット付きを送る想定）。
-    """
+    """publish_at/expire_at の入力（ISO 8601 文字列）をパースする。空/未指定は None。naive（tzinfo 無し）は UTC 扱いに統一し（`ShareCreateReq.expires_at` と同じ）、不正な形式は 422。"""
     if not value:
         return None
     try:
@@ -480,11 +331,7 @@ def _parse_announcement_dt(value: str | None, field_label: str) -> datetime | No
 
 
 def _announcement_status(row: dict, now: datetime) -> str:
-    """admin 向けの状態バッジ用（S4）: unpublished / scheduled（予約公開待ち）/ expired（掲載終了）/ active（公開中）。
-
-    `now` は呼び出し側で1回だけ計算して渡す（行ごとに `datetime.now()` を呼ぶと、
-    応答生成の途中で時刻が進んで境界付近の行だけ判定がドリフトし得るため・一覧は必ず同一 now で揃える）。
-    """
+    """admin 向けの状態バッジ用: unpublished / scheduled（予約公開待ち）/ expired（掲載終了）/ active（公開中）。`now` は呼び出し側が 1 回だけ計算して渡す（一覧は同一 now で揃える）。"""
     if not row["published"]:
         return "unpublished"
     pub_at, exp_at = row.get("publish_at"), row.get("expire_at")
@@ -508,23 +355,18 @@ def _announcement_out(row: dict, now: datetime) -> dict:
 @extras_router.get("/announcements", tags=["運営掲示板"], response_model=AnnouncementsListResponse)
 def announcements_list(request: Request, limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0),
                        include_unpublished: bool = Query(False)):
-    """お知らせ一覧（ログイン必須・既定は公開済みのみ・ピン留め優先→新着順）。
-
-    `include_unpublished=true` は admin 専用（非公開記事を再発見して再公開できるようにするため。
-    指定時のみ admin ゲートを課す・非 admin が指定しても 403）。
-    """
-    u = _current_user(request)   # ログイン必須（auth 有効時）
+    """お知らせ一覧を返す（ログイン必須・既定は公開済みのみ・ピン留め優先→新着順）。`include_unpublished=true` は admin 専用（非 admin が指定すると 403）。"""
+    u = _current_user(request)  # ログイン必須（auth 有効時）。
     if include_unpublished:
         _require_admin(u)
     rows = store.list_announcements(limit=limit, offset=offset, published_only=not include_unpublished)
-    now = datetime.now(timezone.utc)   # 全行で同一の now を使う（行ごとのドリフト防止）
+    now = datetime.now(timezone.utc)  # 全行で同一の now を使う。
     return {"announcements": [_announcement_out(r, now) for r in rows]}
 
 
 @extras_router.post("/admin/announcements", tags=["運営掲示板"], response_model=AnnouncementMutateResponse)
 def announcement_create(req: AnnouncementCreateReq, request: Request):
-    """お知らせを新規作成（管理者のみ）。監査は fail-closed（share.created と同じ compensate パターン:
-    書けなければ作成を取り消し 500 を返す＝「監査できない変更が成功したまま残る」状態を作らない）。"""
+    """お知らせを新規作成する（管理者のみ）。監査は fail-closed: 書けなければ作成を取り消して 500 を返す。"""
     u = _current_user(request)
     _require_admin(u)
     title = (req.title or "").strip()
@@ -562,8 +404,7 @@ def announcement_create(req: AnnouncementCreateReq, request: Request):
 
 @extras_router.patch("/admin/announcements/{id}", tags=["運営掲示板"], response_model=AnnouncementMutateResponse)
 def announcement_patch(id: int, req: AnnouncementPatchReq, request: Request):
-    """お知らせを部分更新（管理者のみ）。`published=false` で非公開化。
-    監査は fail-closed（書けなければ更新前の状態へ復元し 500 を返す）。"""
+    """お知らせを部分更新する（管理者のみ）。`published=false` で非公開化。監査は fail-closed: 書けなければ更新前の状態へ復元して 500 を返す。"""
     u = _current_user(request)
     _require_admin(u)
     before = store.get_announcement(id)
@@ -577,17 +418,13 @@ def announcement_patch(id: int, req: AnnouncementPatchReq, request: Request):
         raise HTTPException(422, "本文は空にできません")
     if req.category is not None and req.category not in _ANNOUNCEMENT_CATEGORIES:
         raise HTTPException(422, "category は maintenance / case / notice のみ")
-    # S4: publish_at/expire_at は書込専用キーと同じ流儀＝未指定(None)は kwarg 自体を渡さない
-    # （store 側の _UNSET 既定＝変更しない）。""は明示的に None（NULLへクリア）として渡す。
+    # publish_at/expire_at は書込専用キーと同じ扱い: 未指定(None)は kwarg 自体を渡さず（store 側の `_UNSET`＝変更しない）、""は明示的に None（NULL へクリア）として渡す。
     dt_kwargs = {}
     if req.publish_at is not None:
         dt_kwargs["publish_at"] = _parse_announcement_dt(req.publish_at, "公開日時")
     if req.expire_at is not None:
         dt_kwargs["expire_at"] = _parse_announcement_dt(req.expire_at, "掲載終了日時")
-    # publish_at/expire_at の順序検証は `before`（この時点で既に古いかも
-    # しれないスナップショット）ではなく、update_announcement 内の SELECT...FOR UPDATE で取得した
-    # ロック済みの現在値に対して行う（2並行 PATCH が別々のフィールドを更新して単体検証をすり抜け、
-    # 矛盾した状態が永続化される競合を防ぐ）。ここでは呼ばずに store 層へ委譲する。
+    # publish_at/expire_at の順序検証は、`update_announcement` 内の `SELECT...FOR UPDATE` で取得したロック済みの現在値に対して行う（並行 PATCH の競合を防ぐ）。ここでは呼ばず store 層へ委譲する。
     try:
         row = store.update_announcement(id, title=title, body=body, category=req.category,
                                         pinned=req.pinned, published=req.published, **dt_kwargs)
@@ -609,8 +446,7 @@ def announcement_patch(id: int, req: AnnouncementPatchReq, request: Request):
     except Exception:
         _log.critical("audit write failed for announcement.updated – restoring announcement %s (fail-closed)", id)
         try:
-            # RV ラウンド2: updated_at まで含めて完全に before へ戻す
-            # （update_announcement は updated_at=now() を必ず打つため使わない）。
+            # updated_at まで含めて完全に before へ戻す（`update_announcement` は updated_at=now() を打つため使わない）。
             store.restore_announcement_state(id, before)
         except Exception:
             _log.critical("compensating restore also failed for announcement %s – manual cleanup required", id)
@@ -620,9 +456,7 @@ def announcement_patch(id: int, req: AnnouncementPatchReq, request: Request):
 
 @extras_router.delete("/admin/announcements/{id}", tags=["運営掲示板"])
 def announcement_delete(id: int, request: Request):
-    """お知らせを削除（管理者のみ）。監査は fail-closed（書けなければ id/created_at/updated_at を
-    含めて完全に復元し 500 を返す。RV ラウンド2: 単純な再作成だと id/created_at が変わってしまうため
-    store.restore_announcement で before スナップショットどおりに復元する）。"""
+    """お知らせを削除する（管理者のみ）。監査は fail-closed: 書けなければ id/created_at/updated_at を含めて削除前の状態へ復元し、500 を返す。"""
     u = _current_user(request)
     _require_admin(u)
     before = store.get_announcement(id)
@@ -645,31 +479,19 @@ def announcement_delete(id: int, request: Request):
     return {"ok": True}
 
 
-# ===== 全体設定（system_settings・admin のみ・2026-07-08-設定分離とUI整備.md）=====
+# 全体設定（system_settings・admin のみ）。
 
-_ENDPOINT_TEST_TIMEOUT_S = 10   # 接続テスト専用の短いタイムアウト（秒）。到達不能を素早く申告する
+_ENDPOINT_TEST_TIMEOUT_S = 10  # 接続テスト専用の短いタイムアウト（秒）。到達不能を素早く申告する。
 
 
 def _admin_settings_view() -> dict:
-    """GET/PUT 共通の応答＝現行値（system_settings の生値）＋実効値（env/既定込みの解決結果）。
-
-    UI は実効値でチェック/表を描画し、`configured`（生値・未設定なら null）で「既定に従っているか」を判別し、
-    `env_default`/`default` で「未設定に戻したら何になるか」を示す（プレースホルダ表示）。
-    """
+    """GET/PUT 共通の応答。現行値（system_settings の生値）と実効値（既定込みの解決結果）を返す。`configured` は生値（未設定なら null）、`env_default`/`default` は未設定に戻したときの値で、UI の既定表示に使う。"""
     from sherpa import agentic_search, chat_service, chat_turns, embeddings, impact_service, keys, lens_service, llm
     from sherpa.ingest import arms as ingest_arms
     from sherpa.ingest import llm_render
     from sherpa.ingest.arms import legacy_convert, vision_arm
     sysset = store.get_system_settings()
-    # `sysset["openai_base_url"]`/`sysset["openai_endpoint_kind"]` は JSONB のため型を
-    # 強制されず、非文字列の破損値もあり得る。`llm.openai_endpoint_kind()`/`llm.openai_base_url()`
-    # はどちらの分岐（kind=openai／未設定を含む）でも型検査を判定より先に行い、不正なら
-    # `ValueError` を送出する契約のため、両方を同じ try で解決する（`openai_endpoint_
-    # kind()` を個別に呼び直すと、型検査の結果（成功/失敗）が呼び出しごとに揃わなくなる）。
-    # 管理画面が生値を確認・修正できるよう表示は落とさず固定文字列へ倒す
-    # （`system.py::_INVALID_SAVED_BASE_URL_LABEL` と同じ流儀）。
-    # `openai_auth_header_style()`/`openai_api_version()` も内部で `openai_endpoint_kind()` を
-    # 呼ぶため、同じ try に含める（呼び出しごとに型検査の成否が食い違わないようにする）。
+    # `sysset["openai_base_url"]`/`sysset["openai_endpoint_kind"]` は JSONB のため非文字列の破損値がありうる。`llm.openai_endpoint_kind()`/`llm.openai_base_url()` は判定より先に型検査して不正なら `ValueError` を送出するため、両方を同じ try で解決する。管理画面が生値を確認・修正できるよう、表示は落とさず固定文字列へ倒す（`system.py::_INVALID_SAVED_BASE_URL_LABEL` と同じ）。`openai_auth_header_style()`/`openai_api_version()` も内部で `openai_endpoint_kind()` を呼ぶため同じ try に含める。
     try:
         eff_openai_kind = llm.openai_endpoint_kind(sysset)
         eff_openai_base_url = llm.openai_base_url(sysset)
@@ -680,46 +502,28 @@ def _admin_settings_view() -> dict:
         eff_openai_base_url = "(不正な保存値)"
         eff_openai_auth_header = "(不正な保存値)"
         eff_openai_api_version = "(不正な保存値)"
-    # `research_default_provider` も同じ流儀（型検査を判定より先に行い ValueError を送出する
-    # 契約）——PUT 側で不正値は 422 で弾いているため通常は起きないが、保存後に何らかの経路で
-    # 壊れた値があっても管理画面全体を 500 にしない。
+    # `research_default_provider` も型検査を判定より先に行い ValueError を送出する。保存後に壊れた値があっても管理画面全体を 500 にしない。
     try:
-        eff_research_default_provider = research_service.default_research_provider(sysset)
+        eff_research_default_provider = simple_chat.default_research_provider(sysset)
     except ValueError:
         eff_research_default_provider = "(不正な保存値)"
     return {
-        # クラウド AI プロバイダの中央設定。key_set はキーの値そのもの
-        # を返さず有無のみ（他の *_key_set と同じ流儀）。`provider` は A7 の現在選択・`providers` は
-        # 選べる値の一覧（画面はこれで <select> を描画する）。
+        # クラウド AI プロバイダの中央設定。key_set はキー値そのものではなく有無のみ。`provider` は現在の選択、`providers` は選べる値の一覧（画面の `<select>` 用）。
         "cloud": {
             "provider": keys.selected_cloud_provider(sysset),
-            # 生の保存値（未選択＝一度も PUT されていなければ None）。UI はこれで
-            # 「admin が実際にラジオを操作したか」を判別する（`provider` は既定込みの実効値のため、
-            # 初期表示の既定 openai と明示選択した openai を区別できない）。
+            # 生の保存値（一度も PUT されていなければ None）。UI が「admin が実際に操作したか」を判別する（`provider` は既定込みの実効値のため区別できない）。
             "provider_raw": keys.cloud_provider_raw(sysset),
             "providers": list(keys.CLOUD_PROVIDERS),
             "personal_api_keys_allowed": keys.personal_keys_allowed(sysset),
             "openai_key_set": bool(sysset.get("openai_api_key")),
-            "gemini_key_set": bool(sysset.get("gemini_api_key")),
-            "bedrock_key_set": bool(sysset.get("bedrock_api_key")),
+            "retired_provider": keys.retired_cloud_provider(sysset),
             "ollama_url": sysset.get("ollama_url") or keys.DEFAULT_OLLAMA_URL,
-            # 個人秘密キーを保存中のユーザー数（A6 を OFF で保存すると一括削除される・画面が
-            # 保存前の確認ダイアログに件数を出すためのプレビュー）。
+            # 個人秘密キーを保存中のユーザー数（`personal_api_keys_allowed` を OFF で保存すると一括削除される・保存前の確認ダイアログ用）。
             "personal_keys_in_use_count": store.count_users_with_personal_keys(),
-            # WEB-1: Codex の Web 検索を管理者が許可しているか（既定 false）。
-            # チャットの調べ方ブロック（web/chat/menus.js）はこれと現在の頭脳（Codex＋OpenAI直結）
-            # の両方が揃った時だけ Web 検索行を表示する（個人設定 `GET /settings` の
-            # `web_search_available` と同じ実効値）。
+            # Codex の Web 検索を管理者が許可しているか（既定 false）。チャットの調べ方ブロック（web/chat/menus.js）は、これと現在の頭脳（Codex＋OpenAI直結）が揃ったときだけ Web 検索行を表示する。
             "web_search_allowed": _web_search_admin_allowed(sysset),
-            # OpenAI 直結を利用者の実行構成一覧に出すか（既定 false・`available_constructs` 参照）。
-            "openai_direct_visible": bool(sysset.get("openai_direct_visible") or False),
         },
-        # 利用者本人による外部連携 API キー自己発行の許可トグル（既定 false・
-        # personal_api_keys_allowed と同型）。`self_issued_active_count` は OFF で保存する前の
-        # 確認ダイアログ用プレビュー（`personal_keys_in_use_count` と同型・失効/期限切れは除く）。
-        # `daily_quota_default` は自己発行キーの1日あたり呼び出し上限の既定/上限（`configured` は
-        # 管理者の生値・`effective` は未設定時のフォールバック込みの実際に適用される値・`default`
-        # は組み込みのフォールバック値そのもの＝管理画面の差分強調の基準）。
+        # 利用者本人による外部連携 API キー自己発行の許可トグル（既定 false）。`self_issued_active_count` は OFF で保存する前の確認ダイアログ用（失効/期限切れは除く）。`daily_quota_default` は自己発行キーの 1 日あたり呼び出し上限の既定/上限（`configured`＝管理者の生値・`effective`＝未設定時のフォールバック込みの適用値・`default`＝組み込みのフォールバック値）。
         "ext_keys": {
             "user_api_keys_allowed": bool(sysset.get("user_api_keys_allowed") or False),
             "self_issued_active_count": store.count_self_issued_active_api_keys(),
@@ -728,19 +532,14 @@ def _admin_settings_view() -> dict:
                 "effective": store.resolve_self_issued_daily_quota_cap(sysset),
                 "default": store.SELF_ISSUED_DAILY_QUOTA_DEFAULT_FALLBACK,
             },
-            # PART-4a: AI 下調べ検索（POST /ext/v1/research）の既定 AI（`configured`=管理者の生値・
-            # `effective`=未設定時のフォールバック込みの実際に適用される値・`default`=組み込みの
-            # フォールバック値そのもの＝差分強調の基準）。
+            # 外部からの簡易回答（POST /ext/v1/answer）の既定 AI（`configured`＝管理者の生値・`effective`＝未設定時のフォールバック込みの適用値・`default`＝組み込みのフォールバック値）。
             "research_default_provider": {
                 "configured": sysset.get("research_default_provider"),
                 "effective": eff_research_default_provider,
                 "default": "ollama",
             },
         },
-        # SET-2c: OpenAI 互換 API の接続先（本家／Azure OpenAI／その他 OpenAI 互換）。`configured` は
-        # admin が実際に保存した生値（未設定なら None）、`effective` は `sherpa/llm.py`（唯一の真実源）
-        # による解決結果。base URL はここでは伏せない（管理画面の入力欄そのものであり、個人設定の
-        # 読み取り専用表示（ホスト名のみ）とは別の面）。
+        # OpenAI 互換 API の接続先（本家／Azure OpenAI／その他 OpenAI 互換）。`configured` は admin が保存した生値（未設定なら None）、`effective` は `sherpa/llm.py` による解決結果。base URL は管理画面の入力欄そのものなので伏せない（個人設定の読み取り専用表示はホスト名のみ）。
         "openai_endpoint": {
             "configured": {
                 "kind": sysset.get("openai_endpoint_kind"),
@@ -757,40 +556,32 @@ def _admin_settings_view() -> dict:
             "kinds": ["openai", "azure", "custom"],
             "auth_headers": ["bearer", "api-key"],
         },
-        # 使えるモデル一覧＋用途別既定。管理画面は「選択中のクラウドプロバイダ＋Ollama＋Codex」の
-        # 列だけを描く（冗長化対策）。`effective` は組み込み既定に管理者設定を重ねた解決結果
-        # （セル単位）、`configured` は管理者が実際に保存した生値（未設定なら null）。
+        # 使えるモデル一覧＋用途別既定。管理画面は「選択中のクラウドプロバイダ＋Ollama＋Codex」の列だけを描く。`effective` は組み込み既定に管理者設定を重ねた解決結果（セル単位）、`configured` は管理者が保存した生値（未設定なら null）。
         "model_catalog": {
             "configured": sysset.get("model_catalog"),
             "effective": model_catalog.get_catalog(sysset),
-            # 組み込み既定のみ（管理者設定を一切重ねない）。管理画面が「セルの値が既定と異なるか」を
-            # 判定する基準（`configured` にセルが存在するだけでは、既定と同じ値を明示保存した場合を
-            # 区別できない）。
+            # 組み込み既定のみ（管理者設定を重ねない）。管理画面がセルの値が既定と異なるかを判定する基準。
             "builtin": model_catalog.get_catalog({}),
             "providers": list(model_catalog.PROVIDERS),
             "usages": list(model_catalog.USAGES),
         },
         "arms": {
             "known": ingest_arms.known_arm_names(),
-            "enabled": ingest_arms.enabled_arm_names(),         # 実効（system_settings 反映済）
-            "configured": sysset.get("arms_enabled"),           # 全体設定の生値（未設定=None＝env/既定）
-            "env_default": ingest_arms.env_default_arm_names(),  # 未設定に戻したときの実効（env/既定）
-            "available": ingest_arms.arm_availability(),         # 各アームがこの端末で実際に使えるか（未導入案内用）
+            "enabled": ingest_arms.enabled_arm_names(),  # 実効（system_settings 反映済）。
+            "configured": sysset.get("arms_enabled"),  # 全体設定の生値（未設定=None＝既定）。
+            "env_default": ingest_arms.env_default_arm_names(),  # 未設定に戻したときの実効（既定）。
+            "available": ingest_arms.arm_availability(),  # 各アームがこの端末で実際に使えるか（未導入案内用）。
         },
         "legacy_backend": {
-            "configured": sysset.get("legacy_backend"),          # 生値（未設定=None＝env/既定に従う）
-            "effective": legacy_convert.legacy_backend_name(),   # system>env>既定（none|libreoffice|office_com）
-            "default": legacy_convert.env_default_backend(),     # 未設定に戻したときの実効（env/既定）
-            "options": list(legacy_convert.BACKEND_OPTIONS),     # 選択肢（none|libreoffice|office_com）
+            "configured": sysset.get("legacy_backend"),  # 生値（未設定=None＝既定に従う）。
+            "effective": legacy_convert.legacy_backend_name(),  # system>既定（none|libreoffice|office_com）。
+            "default": legacy_convert.env_default_backend(),  # 未設定に戻したときの実効（既定）。
+            "options": list(legacy_convert.BACKEND_OPTIONS),  # 選択肢（none|libreoffice|office_com）。
             "libreoffice": {
-                "available": legacy_convert.soffice_available(),  # soffice 検出の有無
-                "version": legacy_convert.soffice_version(),      # 検出時のバージョン（未検出は None）
+                "available": legacy_convert.soffice_available(),  # soffice 検出の有無。
+                "version": legacy_convert.soffice_version(),  # 検出時のバージョン（未検出は None）。
             },
-            # office_com の到達性と動作形態（2026-07-08-旧Office変換2系統.md）。
-            #   mode="direct"（同一マシン・URL 未設定かつ powershell 検出＝既定）｜"http"（別ホストのワーカー・
-            #   URL 設定済み）｜"unavailable"（どちらも無し）。powershell は direct の検出状態（同一マシンで
-            #   すぐ使えるか）。configured_url で「URL 未設定」と「設定済みだが不達」を UI が区別できる。
-            #   versions は healthz の各 Office バージョン（不達/未検出なら None）。
+            # office_com の到達性と動作形態。mode="direct"（同一マシン・URL 未設定かつ powershell 検出＝既定）｜"http"（別ホストのワーカー・URL 設定済み）｜"unavailable"（どちらも無し）。configured_url で「URL 未設定」と「設定済みだが不達」を UI が区別できる。versions は healthz の各 Office バージョン（不達/未検出なら None）。
             "office_com": {
                 "configured_url": legacy_convert.office_com_configured(),
                 "mode": legacy_convert.office_com_mode(),
@@ -801,83 +592,49 @@ def _admin_settings_view() -> dict:
         },
         # 外部の道具の導入状況（sherpa/required_tools.py・短時間キャッシュ）。
         "required_tools": required_tools.snapshot(),
-        # rag.md の LLM 成形トグル（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1）。
-        # 既定 off（実測で文体整形のみ・コスト不釣合）。ON でも規則版と両立・既存の成形版は残る。
+        # rag.md の LLM 成形トグル。既定 off。ON でも規則版と両立し、既存の成形版は残る。
         "rag_llm_render": {
-            "configured": sysset.get("rag_llm_render"),           # 生値（未設定=None＝既定に従う）
-            "effective": llm_render.rag_llm_render_enabled(),     # system>既定（bool）
-            "default": llm_render.env_default_enabled(),          # 未設定に戻したときの実効（コード既定）
+            "configured": sysset.get("rag_llm_render"),  # 生値（未設定=None＝既定に従う）。
+            "effective": llm_render.rag_llm_render_enabled(),  # system>既定（bool）。
+            "default": llm_render.env_default_enabled(),  # 未設定に戻したときの実効（コード既定）。
             "options": ["on", "off"],
         },
-        # 視覚読み取り（vision）の VLM 設定。既定＝ローカル（Ollama）・
-        # クラウド（OpenAI）は cloud_allowed=true（管理者が明示許可）のときだけ有効（INGEST-MD 決定3）。
+        # 視覚読み取り（vision）の VLM 設定。既定＝ローカル（Ollama）。クラウド（OpenAI）は cloud_allowed=true（管理者が明示許可）のときだけ有効。
         "vlm": {
-            "configured": sysset.get("vlm"),                     # 生値（未設定=None＝既定へ）
-            # 解決結果（provider/model/cloud_allowed/ollama_url）。provider/model は system>既定
-            # （env フォールバックは ENV-CLEAN で撤去済み）・ollama_url は env のまま（UI 項目なし）。
+            "configured": sysset.get("vlm"),  # 生値（未設定=None＝既定へ）。
+            # 解決結果（provider/model/cloud_allowed/ollama_url）。provider/model/ollama_url は system>既定（ollama_url は中央の Ollama 接続先）。
             "effective": vision_arm.vlm_config(),
-            "default": vision_arm.env_default_vlm(),     # 未設定に戻したときの実効（cloud は常に false）
-            "available": vision_arm.vlm_usable(),        # 実効的に使えるか（ネットワーク I/O なし）
-            "providers": list(vision_arm._KNOWN_PROVIDERS),   # ローカル(ollama)/クラウド(openai)
-            "openai_key_present": bool(vision_arm._openai_key()),   # クラウド選択時のキー未設定案内用
+            "default": vision_arm.env_default_vlm(),  # 未設定に戻したときの実効（cloud は常に false）。
+            "available": vision_arm.vlm_usable(),  # 実効的に使えるか（ネットワーク I/O なし）。
+            "providers": list(vision_arm._KNOWN_PROVIDERS),  # ローカル(ollama)/クラウド(openai)。
+            "openai_key_present": bool(vision_arm._openai_key()),  # クラウド選択時のキー未設定案内用。
         },
-        # Ollama 接続先の SSRF allowlist。loopback（localhost・
-        # 127.0.0.0/8・::1）は allowlist の有無に関わらず常に暗黙許可されるため、ここに出るのは
-        # それ以外（RFC1918 含む非 loopback）の許可先のみ（`llm.assert_ollama_url_allowed` 参照）。
+        # Ollama 接続先の SSRF allowlist。loopback（localhost・127.0.0.0/8・::1）は常に暗黙許可されるため、ここに出るのはそれ以外（RFC1918 含む）の許可先のみ（`llm.assert_ollama_url_allowed`）。
         "ollama_allowlist": {
-            "configured": sysset.get("ollama_allowlist"),   # 生値（未設定=None＝loopback のみ許可）
-            # 実際に許可される非 loopback 接続先（DB の admin allowlist のみ・env はここへ加算しない＝
-            # 初回シード時の一度きりの追加を除き、env は起動後この一覧に影響しない・
-            # `llm._allowlisted_hosts()` 参照）。値そのものに秘密情報は含まない（host:port のみ）。
+            "configured": sysset.get("ollama_allowlist"),  # 生値（未設定=None＝loopback のみ許可）。
+            # 実際に許可される非 loopback 接続先（DB の admin allowlist のみ・env は初回シード時の一度きりの追加を除き影響しない・`llm._allowlisted_hosts()`）。host:port のみで秘密情報は含まない。
             "effective": sorted(f"{h}:{p}" for h, p in llm._allowlisted_hosts(sysset)),
         },
-        # PART-6（W3・RV是正#1）: Webhook 宛先の SSRF allowlist。`ollama_allowlist` と型は同じだが
-        # loopback を暗黙許可しない点が異なる——ここに出る host:port が許可先の全てで、それ以外
-        # （loopback 含む）は拒否される（`webhooks.assert_webhook_url_allowed` 参照）。
+        # Webhook 宛先の SSRF allowlist。`ollama_allowlist` と型は同じだが loopback を暗黙許可せず、ここに出る host:port が許可先の全て（`webhooks.assert_webhook_url_allowed`）。
         "webhook_allowlist": {
             "configured": sysset.get("webhook_allowlist"),
             "effective": sorted(f"{h}:{p}" for h, p in webhooks._allowlisted_hosts(sysset)),
         },
-        # R1b（Codex ネイティブ resume・決定5）→ 初期構成の既定（決定2026-09-19）: 会話ごとの
-        # Codex resume セッションの保持日数。未設定は既定 30 日、明示的な 0 だけが「無制限」
-        # （`effective_codex_session_retention_days`・`api._sweep_expired_codex_sessions` が同じ
-        # 判定を呼ぶ）。
+        # 会話ごとの Codex resume セッションの保持日数。未設定は既定 30 日、明示的な 0 だけが「無制限」（`effective_codex_session_retention_days`・`api._sweep_expired_codex_sessions`）。
         "codex_session_retention_days": {
-            "configured": sysset.get("codex_session_retention_days"),   # 生値（未設定=None）
+            "configured": sysset.get("codex_session_retention_days"),  # 生値（未設定=None）。
             "effective": effective_codex_session_retention_days(sysset),
             "default": CODEX_SESSION_RETENTION_DAYS_DEFAULT,
         },
-        # STAT-2: 利用統計チャット専用の AI 選択（利用者の実行構成には依存しない・管理者全体で統一）。
-        # `effective`/`default` は A7（`cloud_provider`）連動（`usage_chat._default_provider`/
-        # `_effective_provider_for_display` 参照）。保存済み `usage_chat_provider` が不正でも
-        # 表示自体は落とさない（実送信時の fail-closed 判定は `_resolve_cfg` の責務・ここでは
-        # 表示用のベストエフォート値を返す）。
-        "usage_chat": {
-            "configured": sysset.get("usage_chat_provider"),
-            "effective": usage_chat._effective_provider_for_display(sysset),
-            "default": usage_chat._default_provider(sysset),
-            "providers": list(usage_chat._USAGE_CHAT_PROVIDERS),
-        },
-        # 素の Codex モード（docs/archive/2026-09-24-素のCodexモード.md §1.1）。`effective` は
-        # `codex_sandbox.codex_mode()`（唯一の解決関数・実行時に provider.py が見るのと同じ値）。
-        # plain では下の depth_profile（見直しの回数等）は Codex に渡らない——設定自体は残す。
+        # 素の Codex モード。`effective` は `codex_sandbox.codex_mode()`（実行時に provider.py が見るのと同じ値）。plain では下の depth_profile（見直しの回数等）は Codex に渡らない（設定自体は残す）。
         "codex_mode": {
             "configured": sysset.get("codex_mode"),
             "effective": codex_sandbox.codex_mode(sysset),
             "default": "standard",
             "options": list(codex_sandbox.CODEX_MODES),
         },
-        # SC-6c（調べる深さ・調べ方ブロック §3.2）: 調べる深さ（標準/深く/最大）が掛ける倍率の
-        # 基準値（標準時の値）。`effective` は
-        # `depth_profile.effective_base()`（system_settings→env→コード既定）の解決結果、
-        # `default` は env/コード既定（未設定に戻したときの実効値）。倍率表自体（標準/深く/最大）は
-        # 固定でここでは編集しない。
+        # 調べる深さの基準値（標準時の値）。`effective` は `depth_profile.effective_base()`（system_settings→コード既定）の解決結果、`default` はコード既定（未設定に戻したときの実効値）。倍率表自体は固定でここでは編集しない。
         "depth_profile": {
-            "max_turns": {
-                "configured": sysset.get("depth_base_max_turns"),
-                "effective": depth_profile.effective_base(sysset, "max_turns", agentic_search.MAX_TURNS),
-                "default": agentic_search.MAX_TURNS,
-            },
             "grep_max_hits": {
                 "configured": sysset.get("depth_base_grep_max_hits"),
                 "effective": depth_profile.effective_base(sysset, "grep_max_hits", agentic_search.MAX_HITS),
@@ -909,18 +666,12 @@ def _admin_settings_view() -> dict:
             "codex_reasoning": {
                 "configured": sysset.get("depth_base_codex_reasoning"),
                 "effective": depth_profile.effective_base(
-                    sysset, "codex_reasoning", os.environ.get("SHERPA_CODEX_REASONING", "low")),
-                "default": os.environ.get("SHERPA_CODEX_REASONING", "low"),
+                    sysset, "codex_reasoning", depth_profile.CODEX_REASONING_DEFAULT),
+                "default": depth_profile.CODEX_REASONING_DEFAULT,
                 "options": list(depth_profile.CODEX_REASONING_LEVELS),
             },
         },
-        "agentic_tool_limit": {
-            "configured": sysset.get("agentic_max_tools_per_turn"),
-            "effective": agentic_search.effective_max_tools_per_turn(sysset),
-            "default": agentic_search.MAX_TOOLS_PER_TURN,
-        },
-        # 埋め込み HTTP の同時送信数（`embeddings.embed()` が `_provider_batches` を
-        # 束ねて並列送信する本数）。env フォールバックは持たない（設定は UI(DB) が唯一の持ち主）。
+        # 埋め込み HTTP の同時送信数（`embeddings.embed()` が `_window_batches` を並列送信する本数）。
         "embed_provider": {
             "configured": sysset.get("embed_provider"),
             "effective": embeddings.effective_embed_provider(sysset),
@@ -934,29 +685,19 @@ def _admin_settings_view() -> dict:
             "effective": embeddings.effective_embed_parallel(sysset),
             "default": embeddings.EMBED_PARALLEL_DEFAULT,
         },
-        # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・
-        # 深く 4 はコード固定のため、設定はこの 1 項目だけ（env フォールバックは持たない）。
+        # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・深く 4 はコード固定で、設定はこの 1 項目だけ。
         "max_review_rounds": {
             "configured": sysset.get("max_review_rounds"),
             "effective": depth_profile.effective_max_review_rounds(sysset),
             "default": depth_profile.MAX_REVIEW_ROUNDS_DEFAULT,
         },
-        # multi_agent（S6）の worker モデル（実装ベース探索の回復 S1・案 B）。env フォールバックは
-        # 持たない（設定は UI(DB) が唯一の持ち主）。`effective` は本体 Codex が実際に使うモデル名
-        # （カタログの codex/codex 既定値）を Azure 判定に使う——渡さないと Azure かつ未設定のとき
-        # `effective` が実在しないフォールバック固定値（`_CODEX_WORKER_MODEL_FALLBACK`）を表示
-        # してしまい、実際に使われる値（本体デプロイ名）と食い違う（RV是正・2026-09-19）。
-        # 解決自体が壊れた保存値（`_effective_codex_worker_model` docstring 参照）で失敗しても
-        # 表示専用のこの経路は 500 にしない（別の RV是正）。
+        # multi_agent の worker モデル。`effective` は本体 Codex が実際に使うモデル名（カタログの codex/codex 既定値）を Azure 判定に使って解決する（渡さないと Azure かつ未設定のとき実在しないフォールバック固定値を表示してしまう）。解決自体が壊れた保存値で失敗しても、表示専用のこの経路は 500 にしない（`_effective_codex_worker_model`）。
         "codex_worker_model": {
             "configured": sysset.get("codex_worker_model"),
             "effective": _effective_codex_worker_model(sysset),
             "default": codex_sandbox._CODEX_WORKER_MODEL_FALLBACK,
         },
-        # 同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
-        # `effective` は実際にターン受付が使う値そのもの（`effective_limits()` を直接呼ぶ・
-        # 表示とターン受付の解決ロジックを二重化しない）。`default` は env 既定（未設定に戻した
-        # ときの実効値）。
+        # 同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。`effective` はターン受付が実際に使う値（`effective_limits()` を直接呼ぶ）、`default` はコード既定。
         "chat_max_turns": {
             "per_user": {
                 "configured": sysset.get("chat_max_turns_per_user"),
@@ -969,30 +710,28 @@ def _admin_settings_view() -> dict:
                 "default": chat_turns.MAX_TURNS_GLOBAL,
             },
         },
-        # agentic search の
-        # tool-result バイト予算を管理者設定へ昇格（env フォールバックは撤去済み）。
-        # `effective` は `agentic_search.resolve_tool_result_budgets()`（settings > コード既定）の
-        # 解決結果、`default` はコード既定（未設定に戻したときの実効値）。既定は精度優先
-        # （憲法1条・2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）。モデルの窓由来の上限との
-        # min()（旧 BUDGET-2）は撤去済み（利用者裁定「AI が持つ文脈窓を Sherpa が制限しない」・
-        # `docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`）。
+        # Codex の MCP ツール結果 1 件あたりのバイト予算（管理者設定）。`effective` は `agentic_search.effective_tool_result_max_bytes()`（settings > コード既定）の解決結果、`default` はコード既定（精度優先）。
         "agentic_budget": {
             "per_result": {
                 "configured": sysset.get("agentic_budget_per_result"),
                 "effective": agentic_search.effective_tool_result_max_bytes(sysset),
                 "default": agentic_search.TOOL_RESULT_MAX_BYTES,
             },
-            "total": {
-                "configured": sysset.get("agentic_budget_total"),
-                "effective": agentic_search.effective_tool_result_max_total_bytes(sysset),
-                "default": agentic_search.TOOL_RESULT_MAX_TOTAL_BYTES,
+        },
+        # 個人ファイル（workspace）の 1 件あたりの上限と保持日数。`effective` は `workspace_limits` が実際に使う値、`default` はコード既定。
+        "workspace": {
+            "max_bytes": {
+                "configured": sysset.get("workspace_max_bytes"),
+                "effective": workspace_limits.max_bytes(),
+                "default": workspace_limits.MAX_BYTES_DEFAULT,
+            },
+            "ttl_days": {
+                "configured": sysset.get("workspace_ttl_days"),
+                "effective": workspace_limits.ttl_days(),
+                "default": workspace_limits.TTL_DAYS_DEFAULT,
             },
         },
-        # チャット画面のクイック入力例（ウェルカム画面のチップ）。`configured` は生値（未設定なら
-        # null）、`effective` は実際に表示される内容（非表示なら空リスト）、`default` は組み込み既定
-        # （未設定に戻したときに使われる4例・`GET /settings` の非 admin 向け応答はこの既定文言自体は
-        # 返さない＝フロントの組み込み既定 `web/chat/state.js::DEFAULT_EXAMPLES` と一致させる必要が
-        # あるため、値がずれていないか確認する参考表示として返す）。
+        # チャット画面のクイック入力例（ウェルカム画面のチップ）。`configured` は生値（未設定なら null）、`effective` は実際に表示される内容（非表示なら空リスト）、`default` は組み込み既定の 4 例（フロントの `web/chat/state.js::DEFAULT_EXAMPLES` と一致させる必要があり、ずれの確認用に返す）。
         "chat_examples": {
             "configured": sysset.get("chat_examples"),
             "effective": chat_examples.effective_examples(sysset),
@@ -1004,8 +743,7 @@ def _admin_settings_view() -> dict:
 
 
 def _validate_arms_enabled(value):
-    """`arms_enabled` の検証。None/空リストは None（未設定＝env/既定へフォールバック・S1）。
-    list は既知アーム名のみ許可し、重複を畳んで返す。未知名・型不正は 422。"""
+    """`arms_enabled` の検証。None/空リストは None（未設定＝既定へ）。list は既知アーム名のみ許可し、重複を畳んで返す。未知名・型不正は 422。"""
     if value is None:
         return None
     if not isinstance(value, list):
@@ -1022,17 +760,11 @@ def _validate_arms_enabled(value):
         if name not in known:
             raise HTTPException(422, f"未知のアーム名です: {name}（既知: {', '.join(sorted(known))}）")
         names.append(name)
-    return list(dict.fromkeys(names)) or None   # 重複除去・空は未設定扱い（env/既定へ）
+    return list(dict.fromkeys(names)) or None  # 重複除去・空は未設定扱い（既定へ）。
 
 
 def _validate_legacy_backend(value):
-    """`legacy_backend`（W0/W1）の検証。None は未設定（env/既定へフォールバック）。
-
-    許可は none|libreoffice|office_com（`legacy_convert.KNOWN_BACKENDS`・W1 で office_com 追加）。未知値は 422。
-    `none` は「明示的に変換しない」という有効な選択（未設定へは畳まず生値のまま保存する＝env が libreoffice の
-    ときでも明示的な none を尊重する）。office_com を選んでもワーカー不達なら実効は変換不可へ倒れる（fail-safe・
-    保存自体は許可＝ワーカー起動待ちの間も設定を保持できる）。
-    """
+    """`legacy_backend` の検証。None は未設定（既定へ）。許可は none|libreoffice|office_com（`legacy_convert.KNOWN_BACKENDS`）で、未知値は 422。`none` は明示的な選択として生値のまま保存する。office_com はワーカー不達でも保存でき、実効は変換不可へ倒れる。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1051,8 +783,7 @@ def _validate_legacy_backend(value):
 
 
 def _validate_rag_llm_render(value):
-    """`rag_llm_render`（L5）の検証。None は未設定（既定 off へフォールバック）。許可は on|off のみ
-    （`_validate_legacy_backend` と同型・大文字小文字は無視）。"""
+    """`rag_llm_render` の検証。None は未設定（既定 off）。許可は on|off のみ（大文字小文字は無視）。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1066,11 +797,8 @@ def _validate_rag_llm_render(value):
 
 
 def _validate_vlm(value):
-    """`vlm`（⑤ vision の視覚モデル設定）の検証。None/空 dict は None（未設定＝既定へ）。
-
-    受理キーは `provider`（"ollama"|"openai"）・`model`（非空文字列）・`cloud_allowed`（bool）のみ。型不正・
-    未知 provider・未知キーは 422。**cloud_allowed の既定は false**（未指定なら保存しない＝resolve 側で false へ）。
-    provider=openai の保存自体は許可する（cloud_allowed=false のままなら実効は無効＝画像を送らない・fail-safe）。
+    """`vlm` の検証。None/空 dict は None（未設定＝既定へ）。
+    受理キーは `provider`（"ollama"|"openai"）・`model`（非空文字列）・`cloud_allowed`（bool）のみで、型不正・未知 provider・未知キーは 422。`cloud_allowed` の既定は false（未指定なら保存しない）。provider=openai の保存自体は許可するが、cloud_allowed=false のままなら実効は無効（画像を送らない）。
     """
     if value is None:
         return None
@@ -1098,17 +826,12 @@ def _validate_vlm(value):
         if not isinstance(value["cloud_allowed"], bool):
             raise HTTPException(422, "vlm.cloud_allowed は true/false で指定してください")
         out["cloud_allowed"] = value["cloud_allowed"]
-    return out or None                                       # 空 dict は未設定扱い（既定へ）
+    return out or None  # 空 dict は未設定扱い（既定へ）。
 
 
 def _validate_ollama_allowlist(value):
-    """`ollama_allowlist`（R2a-S2・Ollama 接続先 SSRF allowlist）の検証。None/空リストは None
-    （未設定＝loopback のみ許可へフォールバック・`llm.assert_ollama_url_allowed` 参照）。
-
-    各エントリは scheme・空白を含まない `host[:port]` 形式の文字列のみ許可し、
-    `llm._canonical_host_port` で正規化した `host:port` 文字列に整えて保存する（書込時に正規化して
-    おくことで、読取側 `llm._allowlisted_hosts()` の比較が単純な文字列一致で済む＝ポート省略等の
-    表記ゆれで allowlist を迂回できないようにする）。不正な形式・解釈不能なホストは 422。
+    """`ollama_allowlist` の検証。None/空リストは None（未設定＝loopback のみ許可・`llm.assert_ollama_url_allowed`）。
+    各エントリは scheme・空白を含まない `host[:port]` の文字列のみ許可し、`llm._canonical_host_port` で `host:port` に正規化して保存する（読取側の比較を文字列一致で済ませ、表記ゆれで迂回できないようにする）。不正な形式・解釈不能なホストは 422。
     """
     if value is None:
         return None
@@ -1120,26 +843,18 @@ def _validate_ollama_allowlist(value):
         if not isinstance(entry, str):
             raise HTTPException(422, "ollama_allowlist の各要素は host:port（文字列）で指定してください")
         e = entry.strip()
-        # userinfo（@）・path（/）・query（?）・fragment（#）を拒否する。
-        # `_canonical_host_port` は hostname だけ取り出すため `127.0.0.1@evil:11434` を `evil:11434` に
-        # 黙って丸めてしまい、admin の誤登録（別ホストを allowlist に入れる）を誘発する。SSRF 迂回では
-        # ないが、host:port 形式を厳密化して入力ミスを 422 で弾く。
+        # userinfo（@）・path（/）・query（?）・fragment（#）を拒否する（`_canonical_host_port` は hostname だけ取り出すため `127.0.0.1@evil:11434` が `evil:11434` に丸まる誤登録を防ぐ）。
         if not e or "://" in e or any(c.isspace() for c in e) or any(c in e for c in "@/?#"):
             raise HTTPException(422, f"不正な接続先です: {entry!r}（scheme/userinfo/path/空白を含まない host:port 形式で指定してください）")
         hp = llm._canonical_host_port(f"http://{e}")
         if hp is None:
             raise HTTPException(422, f"不正な接続先です: {entry!r}（host:port 形式で指定してください）")
-        out.append(llm.format_host_port(hp[0], hp[1]))   # IPv6 は角括弧付き＝読取側の再パースと round-trip
-    return list(dict.fromkeys(out)) or None                  # 重複除去・空は未設定扱い（loopback のみ許可へ）
+        out.append(llm.format_host_port(hp[0], hp[1]))  # IPv6 は角括弧付き（読取側の再パースと round-trip する）。
+    return list(dict.fromkeys(out)) or None  # 重複除去・空は未設定扱い（loopback のみ許可へ）。
 
 
 def _validate_webhook_allowlist(value):
-    """`webhook_allowlist`（PART-6・W3・Webhook 宛先 SSRF allowlist）の検証。
-    `_validate_ollama_allowlist` と同形式（各エントリは host:port のみ・scheme/userinfo/path/
-    空白は拒否）——allowlist のエントリ自体は Webhook URL 本体と違い path/query を持たない
-    （宛先の起点だけを登録する）ため、`llm._canonical_host_port` の path 拒否契約と衝突しない。
-    None/空リストは None（未設定＝**全拒否**へフォールバック・RV是正#1——loopback も例外にしない）。
-    """
+    """`webhook_allowlist` の検証。`_validate_ollama_allowlist` と同形式（各エントリは host:port のみ・scheme/userinfo/path/空白は拒否）。None/空リストは None（未設定＝全拒否。loopback も例外にしない）。"""
     if value is None:
         return None
     if not isinstance(value, list):
@@ -1160,7 +875,7 @@ def _validate_webhook_allowlist(value):
 
 
 def _validate_cloud_provider(value):
-    """`cloud_provider`（A7・クラウド AI 排他選択）の検証。None は未設定（既定 openai へ）。"""
+    """`cloud_provider` の検証。None は未設定（既定 openai へ）。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1169,49 +884,17 @@ def _validate_cloud_provider(value):
     if not v:
         return None
     from sherpa import keys
+    if v in keys.RETIRED_CLOUD_PROVIDERS:
+        raise HTTPException(422, f"cloud_provider の {v} は利用できなくなりました"
+                                 f"（{'/'.join(keys.CLOUD_PROVIDERS)} を指定してください）")
     if v not in keys.CLOUD_PROVIDERS:
         raise HTTPException(422, f"cloud_provider は {'/'.join(keys.CLOUD_PROVIDERS)} のいずれかで指定してください")
     return v
 
 
-def _validate_usage_chat_provider(value):
-    """`usage_chat_provider`（STAT-2・利用統計チャット専用の AI 選択）の検証。
-    None（JSON `null`）だけが「未設定へ戻す」（既定は A7 連動・`usage_chat._default_provider`
-    参照）。`cloud_provider`（A7）とは別物＝gemini/bedrock は選べない（`usage_chat.
-    _USAGE_CHAT_PROVIDERS` が唯一の真実源）。**空文字は 422**（未設定へ戻す操作は null のみに
-    一本化し、空文字を「未設定」として黙って受理しない）。"""
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise HTTPException(422, "usage_chat_provider は文字列で指定してください")
-    v = value.strip().lower()
-    if not v:
-        raise HTTPException(
-            422, "usage_chat_provider は空文字で指定できません"
-                "（未設定へ戻す場合は null を指定してください）")
-    if v not in usage_chat._USAGE_CHAT_PROVIDERS:
-        raise HTTPException(
-            422, f"usage_chat_provider は {'/'.join(usage_chat._USAGE_CHAT_PROVIDERS)} の"
-                "いずれかで指定してください")
-    return v
-
-
 def _validate_secret_key(value, field_label: str):
-    """openai/gemini/bedrock の中央 API キーの検証。None は未設定のまま・空文字は明示クリア（未設定へ戻す）。
-
-    改行・制御文字を含む値は保存させない（422）。コピー＆ペースト事故等でキー値に `\\r`/`\\n`
-    等が混入したまま保存されると、以後の全リクエストで送信時に urllib/http.client が「ヘッダ値に
-    不正な文字が含まれる」例外を投げ、その例外メッセージにキー値自体がエコーされて漏洩しうる
-    （実際に再現・`research_service.py` のマスク処理はあくまで最終防衛線で、根本対策は保存時点で
-    弾くこと）。
-
-    制御文字の検査は **strip() 前の生値**に対して行う（`strip()` は `\\r`/`\\n` も空白として
-    削るため、先に strip してから検査すると `"\\r\\nsk-ok\\r\\n"` のように前後だけに制御文字が
-    ある値が検査をすり抜けて（strip 後の中身には制御文字が残らない）そのまま保存されてしまう。
-    生値の時点で弾けば、ユーザー入力に制御文字が混入していたこと自体を 422 で知らせ、黙って
-    trim して保存しない）。制御文字だけの値（strip すると空文字になる非空文字列）も同じ理由で
-    422 にする——「クリア（未設定へ戻す）」は利用者が明示的に空文字を送った場合だけの契約とし、
-    ゴミ入力（改行だけ等）を誤ってクリア操作として受理しない。
+    """openai の中央 API キーの検証。None は未設定のまま・空文字は明示クリア（未設定へ戻す）。
+    改行・制御文字を含む値は 422（保存されると送信時にヘッダ値エラーの例外メッセージへキー値が混入して漏洩しうる）。検査は `strip()` 前の生値に対して行い、前後だけに制御文字がある値や制御文字だけの値も 422 にする（クリアは利用者が明示的に空文字を送ったときだけ）。
     """
     if value is None:
         return None
@@ -1225,24 +908,10 @@ def _validate_secret_key(value, field_label: str):
 
 def _validate_central_ollama_url(value, pending_allowlist: list[str] | None = None, *,
                                  strict_pending: bool = False):
-    """中央既定の Ollama 接続先の検証。空文字/None は未設定（既定 localhost へ）。宛先ポリシーは
-    個人設定の `ollama_url` と同じ `llm.assert_ollama_url_allowed`（loopback／admin allowlist）。
-
-    `pending_allowlist`（省略可）: 同一 PUT リクエストで `ollama_allowlist` も一緒に更新される場合、
-    検証済みの新しい候補値（`_validate_ollama_allowlist` の戻り値）を渡す。DB はまだ更新前のため
-    `llm._allowlisted_hosts()`（DB を読む）は古い allowlist しか見えない。
-
-    `strict_pending=True`（呼び出し側判定: この PUT で `ollama_url` が**実際に新しい値へ変わる**
-    場合のみ渡す・`admin_settings_put` 参照）: `pending_allowlist` を**置換後の正本**として
-    `llm.assert_ollama_url_allowed_in`（DB の現行 allowlist は一切見ない）で検証する。これにより
-    「新しいホストへ変更しつつ、旧 allowlist にだけ残っている別ホストの権限で通ってしまう」
-    （新一覧には無いのに保存できてしまい、保存直後の実行時には拒否される）不整合を防ぐ（RV 是正）。
-
-    `strict_pending=False`（既定・URL 自体は変わらない再送、または allowlist を同時に変更しない
-    通常の保存）: 従来どおり `extra_allowed` として DB の現行 allowlist に**加えて**この検証にだけ
-    重ねる（DB には影響しない）。中央 URL が実際には変わらない再送を、同時に行う allowlist の
-    縮小操作（中央ホストの削除を含む・既に認めている狭い例外）で巻き添えに 422 化しないための
-    意図的な緩さ。
+    """中央既定の Ollama 接続先の検証。空文字/None は未設定（既定 localhost へ）。宛先ポリシーは個人設定の `ollama_url` と同じ `llm.assert_ollama_url_allowed`（loopback／admin allowlist）。
+    `pending_allowlist`（省略可）: 同じ PUT で `ollama_allowlist` も更新されるとき、検証済みの新しい候補値（`_validate_ollama_allowlist` の戻り値）を渡す（DB はまだ更新前のため）。
+    `strict_pending=True`（この PUT で `ollama_url` が実際に新しい値へ変わる場合だけ渡す・`admin_settings_put` 参照）: `pending_allowlist` を置換後の正本として `llm.assert_ollama_url_allowed_in` で検証し、DB の現行 allowlist は見ない。
+    `strict_pending=False`（既定）: DB の現行 allowlist に `extra_allowed` としてこの検証だけ重ねる（URL が変わらない再送を、同時の allowlist 縮小で 422 にしないための緩さ）。
     """
     if value is None:
         return None
@@ -1276,8 +945,7 @@ def _validate_central_ollama_url(value, pending_allowlist: list[str] | None = No
 
 
 def _validate_research_default_provider(value):
-    """`research_default_provider`（PART-4a・外部連携タブ「AI 下調べ検索の既定 AI」）の検証。
-    None は未設定（`research_service.default_research_provider()` の既定 "ollama" へフォールバック）。"""
+    """`research_default_provider` の検証。None は未設定（`simple_chat.default_research_provider()` の既定 "ollama"）。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1285,17 +953,14 @@ def _validate_research_default_provider(value):
     v = value.strip().lower()
     if not v:
         return None
-    if v not in research_service.RESEARCH_PROVIDERS:
-        options = "/".join(sorted(research_service.RESEARCH_PROVIDERS))
+    if v not in simple_chat.RESEARCH_PROVIDERS:
+        options = "/".join(sorted(simple_chat.RESEARCH_PROVIDERS))
         raise HTTPException(422, f"research_default_provider は {options} のいずれかで指定してください")
     return v
 
 
 def _validate_depth_base_codex_reasoning(value):
-    """`depth_base_codex_reasoning`（SC-6c・調べる深さの基準値「Codex の推論レベル」）の検証。
-    None は未設定（env `SHERPA_CODEX_REASONING` へフォールバック）。既知の語彙
-    （`sherpa.depth_profile.CODEX_REASONING_LEVELS`）以外は 422（Codex CLI へ渡す
-    `model_reasoning_effort` の誤字を保存時点で弾く）。"""
+    """`depth_base_codex_reasoning` の検証。None は未設定（コードの既定）。既知の語彙（`sherpa.depth_profile.CODEX_REASONING_LEVELS`）以外は 422。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1308,11 +973,7 @@ def _validate_depth_base_codex_reasoning(value):
 
 
 def _validate_codex_worker_model(value):
-    """`codex_worker_model`（multi_agent の worker モデル・実装ベース探索の回復 S1）の検証。
-    None は未設定（`_CODEX_WORKER_MODEL_FALLBACK` へフォールバック）。Codex 自身のモデルカタログは
-    Sherpa 側で把握しないため語彙検証はしない（空文字は None と同じ扱い＝未設定へ戻す）。
-    制御文字（CR/LF 等・DEL）を含む値は 422——`_write_codex_agent_role_configs` が TOML の
-    1行文字列としてそのまま書くため、混入すると生成 TOML が構文エラーになる。"""
+    """`codex_worker_model` の検証。None は未設定（`_CODEX_WORKER_MODEL_FALLBACK`）。語彙検証はしない（空文字は None と同じ）。制御文字（CR/LF 等・DEL）を含む値は 422（`_write_codex_agent_role_configs` が TOML の 1 行文字列として書くため）。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1326,7 +987,7 @@ def _validate_codex_worker_model(value):
 
 
 def _validate_embed_provider(value):
-    """`embed_provider`（埋め込みの接続先）の検証。None は未設定（既定 "auto"）。閉じた語彙以外は 422。"""
+    """`embed_provider` の検証。None は未設定（既定 "auto"）。閉じた語彙以外は 422。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1339,9 +1000,7 @@ def _validate_embed_provider(value):
 
 
 def _validate_codex_mode(value):
-    """`codex_mode`（素の Codex モード・docs/archive/2026-09-24-素のCodexモード.md §1.1）の検証。
-    None は未設定（既定 "standard" へフォールバック）。閉じた語彙（`codex_sandbox.CODEX_MODES`）
-    以外は 422——`depth_base_codex_reasoning` と同じ流儀（空文字も未設定扱いにはしない）。"""
+    """`codex_mode` の検証。None は未設定（既定 "standard"）。閉じた語彙（`codex_sandbox.CODEX_MODES`）以外は 422（空文字も未設定扱いにしない）。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1354,34 +1013,22 @@ def _validate_codex_mode(value):
 
 
 def _assert_research_default_provider_sendable(effective_settings: dict) -> None:
-    """`research_default_provider` を "openai" にする PUT は、保存時点で実際に送信できる状態か
-    preflight する（`research_service._connect_openai` が実行時に行う判定と全く同じ関数・同じ
-    用途で判定する——`sherpa.providers.openai_direct_block_reason` に `usage="subsearch"` を
-    渡す。本モジュールが実際に送信するのは下調べ検索用のモデルであり、既定の "chat" のままだと
-    chat セルにだけデプロイ名を設定した環境で subsearch セルの未設定を見逃す）。プレースホルダ/
-    未設定キー・Azure 等の接続先で用途別デプロイ名が無い、のいずれかなら保存自体を 422 で拒否する
-    （`openai_endpoint_kind` のクロス検証と同じ「保存時点で壊れた組み合わせを作らせない」流儀・
-    実際の下調べ検索が動くまで気付けない事後発覚を防ぐ）。
-
-    `effective_settings`: この PUT 適用後に有効になる（と見なせる）設定のスナップショット
-    （現在値へ `updates` を重ねたもの・呼び出し元が組み立てる）。DB の advisory lock は取らない
-    （openai_endpoint_kind/base_url のペア検証と異なり、他の同時 PUT との際どい TOCTOU よりも
-    「保存直後に使うと壊れている」を防ぐ実用上のガードという位置づけ・不一致が起きても実行時に
-    改めて `_connect_openai` が honest に 503 で拒否する）。
+    """`research_default_provider` を "openai" にする PUT は、保存時点で実際に送信できる状態かを preflight する（`simple_chat._connect_openai` と同じ `sherpa.providers.openai_direct_block_reason` を `usage="subsearch"` で呼ぶ）。プレースホルダ/未設定キー・Azure 等で用途別デプロイ名が無いなら 422 で拒否する。
+    `effective_settings`: この PUT 適用後に有効になる設定のスナップショット（現在値へ `updates` を重ねたもの・呼び出し元が組み立てる）。DB の advisory lock は取らない（不一致が起きても実行時に `_connect_openai` が 503 で拒否する）。
     """
     from sherpa import keys as _keys, providers as _providers
     try:
         key = _keys.resolve_api_key("openai", None, system_settings=effective_settings, strict=True)
     except _keys.InvalidCloudProviderConfigError as e:
-        raise HTTPException(422, f"AI 下調べ検索の既定 AI を OpenAI にできません（{e}）") from None
+        raise HTTPException(
+            422, f"簡易回答に使う AI を OpenAI にできません（{e}）") from None
     reason = _providers.openai_direct_block_reason(key, effective_settings, usage="subsearch")
     if reason is not None:
-        raise HTTPException(422, f"AI 下調べ検索の既定 AI を OpenAI にできません（{reason}）")
+        raise HTTPException(422, f"簡易回答に使う AI を OpenAI にできません（{reason}）")
 
 
 def _validate_openai_endpoint_kind(value):
-    """`openai_endpoint_kind`（SET-2c・接続先の種別）の検証。None は未設定（推定へフォールバック・
-    `llm.openai_endpoint_kind()` 参照）。"""
+    """`openai_endpoint_kind`（接続先の種別）の検証。None は未設定（推定へフォールバック・`llm.openai_endpoint_kind()`）。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1395,8 +1042,7 @@ def _validate_openai_endpoint_kind(value):
 
 
 def _validate_openai_base_url(value):
-    """`openai_base_url`（SET-2c・接続先 URL）の検証。None/空文字は未設定（既定 OpenAI 本家へ）。
-    妥当性は個人設定の `ollama_url` と同じ流儀で `llm.assert_openai_base_url_allowed` に委ねる。"""
+    """`openai_base_url`（接続先 URL）の検証。None/空文字は未設定（既定 OpenAI 本家へ）。妥当性は `llm.assert_openai_base_url_allowed` に委ねる。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1413,7 +1059,7 @@ def _validate_openai_base_url(value):
 
 
 def _validate_openai_auth_header(value):
-    """`openai_auth_header`（SET-2c）の検証。None/空文字は未設定（既定 bearer へ）。"""
+    """`openai_auth_header` の検証。None/空文字は未設定（既定 bearer へ）。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1427,7 +1073,7 @@ def _validate_openai_auth_header(value):
 
 
 def _validate_openai_api_version(value):
-    """`openai_api_version`（SET-2c）の検証。None/空文字は未設定（未使用へ）。"""
+    """`openai_api_version` の検証。None/空文字は未設定（未使用へ）。"""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1436,8 +1082,7 @@ def _validate_openai_api_version(value):
 
 
 def _validate_model_catalog(value):
-    """`model_catalog` の検証。形・意味の検証本体は `sherpa.model_catalog.validate_catalog`
-    （`ValueError` を送出）で行い、ここでは 422 へ変換するだけ（他の `_validate_*` と同じ流儀）。"""
+    """`model_catalog` の検証。形・意味の検証本体は `sherpa.model_catalog.validate_catalog`（`ValueError`）で、ここでは 422 へ変換する。"""
     try:
         return model_catalog.validate_catalog(value)
     except ValueError as e:
@@ -1445,46 +1090,15 @@ def _validate_model_catalog(value):
 
 
 def _validate_chat_examples(value):
-    """`chat_examples`（チャット画面のクイック入力例）の検証。形・意味の検証本体は
-    `sherpa.chat_examples.validate`（`ValueError` を送出）で行い、ここでは 422 へ変換するだけ
-    （`_validate_model_catalog` と同じ流儀）。"""
+    """`chat_examples`（チャット画面のクイック入力例）の検証。検証本体は `sherpa.chat_examples.validate`（`ValueError`）で、ここでは 422 へ変換する。"""
     try:
         return chat_examples.validate(value)
     except ValueError as e:
         raise HTTPException(422, str(e))
 
 
-def _validate_agentic_budgets(provided: dict, updates: dict) -> None:
-    """BUDGET-1 の2キー（`agentic_budget_per_result`/`agentic_budget_total`）は範囲検証
-    （StrictInt+Field）だけでは逆転（累計 < 1件あたり）を防げない——実機で per_result=8MiB／
-    total=4KiB という入れ替え保存が成立し、最初のツール呼び出しで即座に打ち切りになった。
-
-    累計は1件あたり以上でなければならない（422・逆転は保存させない）。判定は「両方同時指定」
-    だけでなく「片方だけの指定」でも成立させる必要があるため、指定していない側は
-    `store.get_system_settings()`（この PUT 適用前の保存済み現在値）で補う——`updates` に
-    含まれない側の値は変わらないまま保存されるため、変わらない側との整合も確認しないと
-    入れ替え保存を防げない。値の欠落（未設定/明示 null）はコード既定
-    （`agentic_search.TOOL_RESULT_MAX_BYTES`/`TOOL_RESULT_MAX_TOTAL_BYTES`・
-    `effective_tool_result_max_bytes`/`_max_total_bytes` が system_settings 未設定時に使う値と
-    同じ）へ倒す。"""
-    if "agentic_budget_per_result" not in provided and "agentic_budget_total" not in provided:
-        return
-    from sherpa import agentic_search
-    current = store.get_system_settings()
-    eff_per_result = (updates.get("agentic_budget_per_result")
-                      if "agentic_budget_per_result" in updates
-                      else current.get("agentic_budget_per_result")) or agentic_search.TOOL_RESULT_MAX_BYTES
-    eff_total = (updates.get("agentic_budget_total")
-                if "agentic_budget_total" in updates
-                else current.get("agentic_budget_total")) or agentic_search.TOOL_RESULT_MAX_TOTAL_BYTES
-    if eff_total < eff_per_result:
-        raise HTTPException(422, "合計は1件あたり以上にしてください")
-
-
 def _validate_codex_session_retention_days(value):
-    """`codex_session_retention_days`（R1b・決定5→初期構成の既定・決定2026-09-19）の検証。
-    None は未設定（＝既定30日へフォールバック・`effective_codex_session_retention_days`）。
-    0 以上の整数のみ許可（0＝無制限・明示的に保存できる）。負値・非整数は 422。"""
+    """`codex_session_retention_days` の検証。None は未設定（既定 30 日・`effective_codex_session_retention_days`）。0 以上の整数のみ許可（0＝無制限）。負値・非整数は 422。"""
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int):
@@ -1494,53 +1108,28 @@ def _validate_codex_session_retention_days(value):
     return value
 
 
-# GET・PUT /admin/settings には response_model を付与しない: `legacy_backend.libreoffice.version`
-# （soffice 検出バージョン文字列）を含むため、response_model を付与すると OpenAPI スキーマに
-# `version` プロパティが露出する。`test_world_param_compat.py::test_openapi_surface_has_no_version_parameter`
-# が「退役した version 概念を API surface に再宣言しない」契約を pin しているため、この2ルートは
-# `sherpa.schemas.AdminSettingsView` を TypeAdapter 契約のみで固定する（response_model 非付与）。
+# GET・PUT /admin/settings には response_model を付けない。`legacy_backend.libreoffice.version` を含むため、response_model を付けると OpenAPI に `version` が露出して `test_openapi_surface_has_no_version_parameter` に反する。この 2 ルートは `sherpa.schemas.AdminSettingsView` を TypeAdapter 契約のみで固定する。
 @extras_router.get("/admin/settings", tags=["管理者:全体設定"])
 def admin_settings_get(request: Request):
-    """全体設定（取り込みアーム・旧形式変換バックエンド）の現行値＋実効値を返す（admin のみ）。
-
-    `legacy_backend.libreoffice` に soffice の検出状態（有無＋バージョン）を含める（UI の案内表示用）。
-    """
+    """全体設定（取り込みアーム・旧形式変換バックエンド）の現行値＋実効値を返す（admin のみ）。`legacy_backend.libreoffice` に soffice の検出状態（有無＋バージョン）を含める。"""
     _require_admin(_current_user(request))
     return _admin_settings_view()
 
 
 @extras_router.put("/admin/settings", tags=["管理者:全体設定"])
 def admin_settings_put(req: SystemSettingsReq, request: Request):
-    """全体設定を部分更新（admin のみ・検証・監査・fail-closed）。
-
-    未指定キーは変更しない・`null` は未設定へ戻す（env/既定へフォールバック）。arms_enabled は既知アーム名
-    のみ・legacy_backend は none|libreoffice|office_com・rag_llm_render（L5）は on|off のみ・
-    vlm は provider/model/cloud_allowed の型を検証する
-    （不正は 422）。ollama_allowlist（R2a-S2）は各エントリを host:port に正規化して保存する（junk は 422）。
-    codex_session_retention_days（R1b）は0以上の整数のみ（0=無制限・負値は422）。openai_endpoint_kind/base_url/auth_header/
-    webhook_allowlist（PART-6・W3）は ollama_allowlist と同形式で host:port に正規化して保存する
-    （junk は 422）。api_version（SET-2c・接続先）は種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら
-    実効 base_url が空でないことも確認する（422）。usage_chat_provider（STAT-2）は openai|ollama
-    のみ（不正は422・`cloud_provider` とは独立）。research_default_provider（PART-4a）は
-    ollama/openai のいずれかのみ（422・`research_service.RESEARCH_PROVIDERS`）。"openai" への
-    変更はこの PUT 適用後の実効設定で実送信可能性も preflight する
-    （`_assert_research_default_provider_sendable`・NG は422）。depth_base_*（SC-6c・調べる深さの
-    基準値）は整数6項目が範囲検証済み（StrictInt+Field）、depth_base_codex_reasoning は
-    `sherpa.depth_profile.CODEX_REASONING_LEVELS` のいずれかのみ（422）。chat_max_turns_per_user/
-    chat_max_turns_global（同時実行の上限・`sherpa.chat_turns.effective_limits`）も StrictInt+Field
-    で範囲検証済み（1〜16／1〜64・範囲外は422）。agentic_budget_per_result/
-    agentic_budget_total（§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・
-    累計=4096〜64MiB・範囲外は422）に加え、両者の相対関係も検証する（`_validate_agentic_budgets`・
-    累計は1件あたり以上・逆転は422）——片方だけの指定でも保存済みのもう片方（DB の現在値）と
-    突き合わせて判定する。
-    chat_examples（チャット画面のクイック入力例）は `{enabled, items}`（items は最大8件・各1〜200文字・
-    `sherpa.chat_examples.validate` が意味検証・不正は422）。codex_worker_model（multi_agent の
-    worker モデル・実装ベース探索の回復 S1）は文字列のみ（Codex 自身のモデルカタログは検証しない・
-    空文字/nullは未設定へ戻す）。codex_mode（素の Codex モード）は standard/plain のみ（422）。
-    監査 INSERT の失敗は
-    `store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（
-    commit 後の別接続 audit＋失敗時 compensate 方式では穴が残るため、原子性で置き換えた・
-    announcement CRUD の compensate 方式とは異なる）。ここではその例外を 500 に変換するだけ。応答は GET と同形。
+    """全体設定を部分更新する（admin のみ・検証・監査・fail-closed）。応答は GET と同形。
+    未指定キーは変更せず、`null` は未設定へ戻す（コードの既定へ戻る）。検証:
+    - arms_enabled: 既知アーム名のみ。legacy_backend: none|libreoffice|office_com。rag_llm_render: on|off。vlm: provider/model/cloud_allowed の型。
+    - ollama_allowlist/webhook_allowlist: 各エントリを host:port に正規化して保存（不正は 422）。
+    - codex_session_retention_days: 0 以上の整数（0=無制限）。
+    - openai_endpoint_kind/base_url/auth_header/api_version: 種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら実効 base_url が空でないことも確認する。
+    - research_default_provider: ollama/openai のみ。"openai" への変更は適用後の実効設定で実送信可能性も確認する。
+    - depth_base_*: 整数 5 項目は範囲検証済み。depth_base_codex_reasoning は定義済みの推論レベルのみ。
+    - chat_max_turns_per_user/chat_max_turns_global: 1〜16／1〜64。agentic_budget_per_result: 1024〜8MiB。
+    - workspace_max_bytes: 1MiB〜1GiB。workspace_ttl_days: 0〜3650（0=無期限）。
+    - chat_examples: `{enabled, items}`（items は最大 8 件・各 1〜200 文字）。codex_worker_model: 文字列のみ（空文字/null は未設定へ戻す）。codex_mode: standard/plain のみ。
+    設定変更と監査は同一トランザクションで行い、監査に失敗すれば設定変更も取り消されて 500 を返す。
     """
     u = _current_user(request)
     _require_admin(u)
@@ -1564,19 +1153,14 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     # クラウド AI プロバイダの中央設定。
     if "cloud_provider" in provided:
         updates["cloud_provider"] = _validate_cloud_provider(provided["cloud_provider"])
-    if "usage_chat_provider" in provided:
-        updates["usage_chat_provider"] = _validate_usage_chat_provider(provided["usage_chat_provider"])
     if "personal_api_keys_allowed" in provided:
-        # StrictBool が型検証済み（非 bool は pydantic 自身が 422 にする）。
+        # StrictBool が型検証済み（非 bool は pydantic が 422 にする）。
         updates["personal_api_keys_allowed"] = provided["personal_api_keys_allowed"]
     if "web_search_allowed" in provided:
-        # StrictBool が型検証済み（非 bool は pydantic 自身が 422 にする）。
+        # StrictBool が型検証済み（非 bool は pydantic が 422 にする）。
         updates["web_search_allowed"] = provided["web_search_allowed"]
-    if "openai_direct_visible" in provided:
-        # StrictBool が型検証済み（非 bool は pydantic 自身が 422 にする）。
-        updates["openai_direct_visible"] = provided["openai_direct_visible"]
     if "user_api_keys_allowed" in provided:
-        # StrictBool が型検証済み（非 bool は pydantic 自身が 422 にする）。
+        # StrictBool が型検証済み（非 bool は pydantic が 422 にする）。
         updates["user_api_keys_allowed"] = provided["user_api_keys_allowed"]
     if "user_api_keys_daily_quota_default" in provided:
         # StrictInt・範囲（1〜1,000,000）は pydantic Field が型検証済み。
@@ -1584,16 +1168,14 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     if "research_default_provider" in provided:
         updates["research_default_provider"] = _validate_research_default_provider(
             provided["research_default_provider"])
-    # SC-6c: 調べる深さの基準値（整数6項目は StrictInt+Field(ge,le) で pydantic が範囲検証済み）。
-    for _k in ("depth_base_max_turns", "depth_base_grep_max_hits", "depth_base_qa_max_hits",
+    # 調べる深さの基準値（整数 5 項目は StrictInt+Field(ge,le) で範囲検証済み）。
+    for _k in ("depth_base_grep_max_hits", "depth_base_qa_max_hits",
               "depth_base_read_window", "depth_base_impact_depth", "depth_base_troubleshoot_depth"):
         if _k in provided:
             updates[_k] = provided[_k]
     if "depth_base_codex_reasoning" in provided:
         updates["depth_base_codex_reasoning"] = _validate_depth_base_codex_reasoning(
             provided["depth_base_codex_reasoning"])
-    if "agentic_max_tools_per_turn" in provided:
-        updates["agentic_max_tools_per_turn"] = provided["agentic_max_tools_per_turn"]
     if "embed_provider" in provided:
         updates["embed_provider"] = _validate_embed_provider(provided["embed_provider"])
     if "embed_parallel" in provided:
@@ -1606,36 +1188,34 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
         updates["codex_worker_model"] = _validate_codex_worker_model(provided["codex_worker_model"])
     if "codex_mode" in provided:
         updates["codex_mode"] = _validate_codex_mode(provided["codex_mode"])
-    # チャット同時実行の上限（2項目とも StrictInt+Field(ge,le) で pydantic が範囲検証済み）。
+    # チャット同時実行の上限（2 項目とも StrictInt+Field(ge,le) で範囲検証済み）。
     for _k in ("chat_max_turns_per_user", "chat_max_turns_global"):
         if _k in provided:
             updates[_k] = provided[_k]
-    # BUDGET-1（§3.4）: agentic search の tool-result バイト予算（2項目とも StrictInt+Field(ge,le)
-    # で pydantic が範囲検証済み・カスタムバリデータ不要）。
-    for _k in ("agentic_budget_per_result", "agentic_budget_total"):
+    # Codex の MCP ツール結果 1 件あたりのバイト予算（StrictInt+Field(ge,le) で範囲検証済み）。
+    if "agentic_budget_per_result" in provided:
+        updates["agentic_budget_per_result"] = provided["agentic_budget_per_result"]
+    # 個人ファイルの上限・保持日数（StrictInt+Field(ge,le) で範囲検証済み）。
+    for _k in ("workspace_max_bytes", "workspace_ttl_days"):
         if _k in provided:
             updates[_k] = provided[_k]
-    _validate_agentic_budgets(provided, updates)
     if "chat_examples" in provided:
         updates["chat_examples"] = _validate_chat_examples(provided["chat_examples"])
-    _cloud_secret_keys = frozenset({"openai_api_key", "gemini_api_key", "bedrock_api_key"})
+    _cloud_secret_keys = frozenset({"openai_api_key"})
     for _k in _cloud_secret_keys:
         if _k in provided:
             updates[_k] = _validate_secret_key(provided[_k], _k)
     if "ollama_url" in provided:
-        # 同一 PUT で ollama_allowlist も更新される場合は、その新しい候補（検証済み）で ollama_url を
-        # 検証する（DB がまだ更新されていない古い allowlist で判定して誤って 422 にしない）。
+        # 同じ PUT で ollama_allowlist も更新される場合は、その新しい候補（検証済み）で ollama_url を検証する。
         _pending_allowlist = updates["ollama_allowlist"] if "ollama_allowlist" in updates else None
-        # 「URL 自体が実際に新しい値へ変わる」場合だけ、pending allowlist を置換後の正本として
-        # 厳密検証する（strict_pending）。中央 URL が変わらない再送（フォームの全項目送信等）は、
-        # 同時に allowlist を縮小してそのホストを含まなくなっても拒否しない（狭い例外・RV 是正）。
+        # URL 自体が実際に新しい値へ変わる場合だけ、pending allowlist を置換後の正本として厳密検証する（strict_pending）。URL が変わらない再送は、同時の allowlist 縮小でそのホストが外れても拒否しない。
         _strict_pending = False
         if "ollama_allowlist" in provided and isinstance(provided["ollama_url"], str):
             _cur_central = (store.get_system_settings().get("ollama_url") or "").strip()
             _strict_pending = provided["ollama_url"].strip() != _cur_central
         updates["ollama_url"] = _validate_central_ollama_url(
             provided["ollama_url"], _pending_allowlist, strict_pending=_strict_pending)
-    # SET-2c: OpenAI 互換 API の接続先（4キー）。
+    # OpenAI 互換 API の接続先（4 キー）。
     if "openai_endpoint_kind" in provided:
         updates["openai_endpoint_kind"] = _validate_openai_endpoint_kind(provided["openai_endpoint_kind"])
     if "openai_base_url" in provided:
@@ -1644,23 +1224,15 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
         updates["openai_auth_header"] = _validate_openai_auth_header(provided["openai_auth_header"])
     if "openai_api_version" in provided:
         updates["openai_api_version"] = _validate_openai_api_version(provided["openai_api_version"])
-    # kind/base のクロス検証（kind が openai 以外なら base_url も必要）は、ここ（キャッシュ経由の
-    # 現在値）では行わない。`store.set_system_settings()` が advisory lock 取得後に同一コネクション
-    # から実効値を読んで検証する（並行 PUT・別 worker のキャッシュ陳腐化による TOCTOU を避ける・
-    # 下の `OpenAIEndpointSettingsConflict` except 節参照）。
+    # kind/base のクロス検証（kind が openai 以外なら base_url も必要）はここでは行わない。`store.set_system_settings()` が advisory lock 取得後に同一コネクションから実効値を読んで検証する（`OpenAIEndpointSettingsConflict` の except 節）。
     if "model_catalog" in provided:
         updates["model_catalog"] = _validate_model_catalog(provided["model_catalog"])
-    # research_default_provider を "openai" にする更新は、この PUT 適用後に有効になる設定
-    # （現在値へ updates を重ねたもの・同じ PUT で openai_api_key 等を同時に変える場合も反映する）
-    # で実送信可能性を preflight する。
+    # research_default_provider を "openai" にする更新は、この PUT 適用後に有効になる設定（現在値へ updates を重ねたもの）で実送信可能性を preflight する。
     if updates.get("research_default_provider") == "openai":
         _assert_research_default_provider_sendable({**store.get_system_settings(), **updates})
     if updates:
         try:
-            # `user_api_keys_allowed` を実効 OFF（false または明示 null）にする更新は、設定の
-            # 適用・利用者発行キーの一括失効・監査を同一トランザクションで行う（それ以外の更新は
-            # `store.set_system_settings` と同じ結果）。失効の失敗も設定変更ごと rollback する
-            # （握り潰さない・fail-closed）。
+            # `user_api_keys_allowed` を実効 OFF（false または明示 null）にする更新は、設定の適用・利用者発行キーの一括失効・監査を同一トランザクションで行う（失効の失敗も設定変更ごと rollback する）。それ以外の更新は `store.set_system_settings` と同じ結果。
             store.apply_system_settings_and_revoke_if_disabled(
                 u["uid"], updates, secret_keys=_cloud_secret_keys & set(updates))
         except store.OpenAIEndpointSettingsConflict as e:
@@ -1668,10 +1240,7 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
         except Exception:
             _log.critical("system_settings.updated failed (fail-closed) – keys=%s", list(updates))
             raise HTTPException(500, "全体設定の保存中にエラーが発生しました")
-        # A6: personal_api_keys_allowed を false で保存するたび（true→false の遷移に限らず・
-        # 冪等）、全ユーザーの個人秘密キーを一括削除する（OFF のとき個人キーは保存されない状態を
-        # 保つ）。settings 本体の保存は既に成功しているため、ここが失敗しても 500 にはしない
-        # （起動時の `api._purge_personal_keys_if_disabled_on_startup` が backstop）。
+        # personal_api_keys_allowed を false で保存するたび（冪等）、全ユーザーの個人秘密キーを一括削除する。設定本体の保存は成功済みのため、失敗しても 500 にはしない（起動時の `api._purge_personal_keys_if_disabled_on_startup` が backstop）。
         if updates.get("personal_api_keys_allowed") is False:
             try:
                 store.purge_personal_api_keys(actor=u["uid"])
@@ -1683,50 +1252,23 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
 
 class OpenaiEndpointTestReq(BaseModel):
     """管理画面「接続先」欄の接続テスト（admin 専用・`POST /admin/settings/openai-endpoint-test`）。
-
-    タイムアウトは接続テスト専用に短くする（`_ENDPOINT_TEST_TIMEOUT_S`）: `_probe` の既定（抽出用90秒）の
-    ままだと、パケットが破棄される閉域網で画面のスピナーが数分止まらない（閉域実機で観測）。
-    テストの目的は疎通確認なので、10秒で「到達できません」を返すのが正しい申告。
-
-    保存前の入力中の値でその場だけ試す。DB は書かない・秘密は保存も監査もしない。個人設定用の
-    `POST /settings/test` とは別ルート: 一般ユーザーには接続先 override を一切与えない（任意の
-    HTTPS 宛先へ中央キーを送信できてしまう SSRF／キー漏洩の穴になるため）。
+    タイムアウトは接続テスト専用に短い（10 秒で「到達できません」を返す）。保存前の入力中の値でその場だけ試し、DB は書かず、秘密は保存も監査もしない。個人設定用の `POST /settings/test` とは別ルートで、一般ユーザーには接続先 override を与えない。
     """
-    provider: str = "openai"                    # openai（既定）／codex（Codex(OpenAI) 構成の判定）
+    provider: str = "openai"  # openai（既定）／codex（Codex(OpenAI) 構成の判定）。
     openai_endpoint_kind: str | None = None
     openai_base_url: str | None = None
     openai_auth_header: str | None = None
     openai_api_version: str | None = None
-    openai_api_key: str | None = None            # 入力中の未保存の中央キー。省略時は保存済み中央キー。
-    # `codex_model` は受け取らない。接続テストはカタログ内モデルでの疎通確認のみを目的とする＝
-    # admin が任意のカタログ外モデル名を入力してカタログ検証を素通りできる経路を持たせない。
-    # provider=codex は常に中央カタログ既定（`model_catalog.resolve_model` の field 省略）で解決する。
+    openai_api_key: str | None = None  # 入力中の未保存の中央キー。省略時は保存済み中央キー。
+    # `codex_model` は受け取らない（カタログ外のモデル名で検証を迂回させない）。provider=codex は常に中央カタログ既定（`model_catalog.resolve_model` の field 省略）で解決する。
 
 
 @extras_router.post("/admin/settings/openai-endpoint-test", tags=["管理者:全体設定"],
                     response_model=SettingsTestResponse)
 def admin_openai_endpoint_test(req: OpenaiEndpointTestReq, request: Request):
-    """OpenAI 互換 API の接続先（管理画面「接続先」欄）を、保存前の入力中の値でその場だけ試す
-    （admin 専用・1回だけ最小リクエスト・DB は書かない）。
-
-    `PUT /admin/settings` と同じ検証（種別 enum・URL 妥当性・userinfo 禁止・kind が openai 以外なら
-    base_url 必須）を**通信前に**共有する（`_validate_openai_*`・`llm.assert_openai_endpoint_consistent`）。
-    不正な入力は 422 で `_probe` を一切呼ばない。
-
-    キー・モデルは常に**中央**（`user_settings=None`）で解決する。個人設定用 `/settings/test` を
-    admin 本人のログインで流用すると、A6（個人キー許可）が有効な環境では admin 本人の個人キー・
-    個人モデルで試してしまい、「中央キーが壊れていても緑」「正しい中央デプロイなのに個人設定の
-    古いモデルで赤」という誤診断が起こる。
-
-    provider=codex は Codex(OpenAI) 構成の接続先ブロック判定（`_codex_openai_compat_block_reason`）
-    を同じ pending スナップショットで試す（Codex 分岐だけ入力中の接続先が反映されない食い違いを
-    防ぐ）。モデルは常に中央カタログ既定で解決する（`codex_model` の入力は受け付けない＝カタログ外
-    モデル名を接続テスト経由でカタログ検証を迂回させないため）。
-
-    実行を監査する（`openai_endpoint.tested`）。記録するのは actor・provider・endpoint_kind・host
-    のみ（`llm._redact_url_for_error` の安全な host 表現）＝キー・生 URL（path・クエリ含む）・probe
-    のエラー本文は一切含めない。**監査の書き込みに失敗したら probe を呼ばずに 500 で中断する**
-    （fail-closed＝未監査のまま実 API へ到達させない）。
+    """OpenAI 互換 API の接続先（管理画面「接続先」欄）を、保存前の入力中の値でその場だけ試す（admin 専用・1 回だけ最小リクエスト・DB は書かない）。
+    `PUT /admin/settings` と同じ検証（種別・URL 妥当性・userinfo 禁止・kind が openai 以外なら base_url 必須）を通信前に行い、不正な入力は 422 で接続しない。キー・モデルは常に中央設定で解決し、provider=codex は Codex(OpenAI) 構成の接続先ブロック判定を同じ入力で試す。
+    実行を監査する（`openai_endpoint.tested`・記録は actor・provider・endpoint_kind・host のみで、キー・生 URL・エラー本文は含めない）。監査の書き込みに失敗したら接続せず 500 で中断する（fail-closed）。
     """
     from sherpa import agent_constructs, keys, llm, model_catalog
     from sherpa.ingest import graph_extract
@@ -1736,7 +1278,7 @@ def admin_openai_endpoint_test(req: OpenaiEndpointTestReq, request: Request):
     if prov not in ("openai", "codex"):
         raise HTTPException(422, "provider は openai / codex のいずれか")
     sys_s = store.get_system_settings()
-    # PUT と同じ検証を通信前に行う（不正なら 422・ネットワークへは一切出さない）。
+    # PUT と同じ検証を通信前に行う（不正なら 422・ネットワークへは出さない）。
     pending = dict(sys_s)
     if req.openai_endpoint_kind is not None:
         pending["openai_endpoint_kind"] = _validate_openai_endpoint_kind(req.openai_endpoint_kind)
@@ -1746,14 +1288,7 @@ def admin_openai_endpoint_test(req: OpenaiEndpointTestReq, request: Request):
         pending["openai_auth_header"] = _validate_openai_auth_header(req.openai_auth_header)
     if req.openai_api_version is not None:
         pending["openai_api_version"] = _validate_openai_api_version(req.openai_api_version)
-    # `pending["openai_base_url"]` は保存済み値を継承した場合、JSONB は型を強制しないため理論上
-    # 非文字列（list/dict/int 等・`{}`/`[]`/`0`/`False` のような falsy な非文字列も含む）もあり得る。
-    # ここは「kind が base_url を要求するのに何も設定されていない」という**欠落**だけを検出する
-    # 安価な事前チェックであり、非文字列は欠落ではなく不正（型検証は下の再検証ブロックの役割）
-    # として扱う: `None`／空文字列だけを「欠落」とみなし、それ以外（非文字列を含むどんな値でも）は
-    # 「何か設定されている」として通す。`str(value or "")` のような素朴な falsy 潰しは `{}`/`[]`/
-    # `0`/`False` を「欠落」と誤認してここで 422（監査を書く前）に倒してしまい、下の再検証
-    # ブロック（不正値でも deny 監査を残してから 422 にする契約）に到達できなくなる。
+    # `pending["openai_base_url"]` は保存済み値を継承した場合、非文字列（falsy な `{}`/`[]`/`0`/`False` を含む）もありうる。ここは「kind が base_url を要求するのに未設定」という欠落だけを検出する事前チェックで、`None`/空文字列だけを欠落とみなし、それ以外は通して下の再検証ブロック（不正値でも deny 監査を残してから 422 にする）に任せる。
     _raw_pending_base_url = pending.get("openai_base_url")
     _base_url_missing = _raw_pending_base_url is None or _raw_pending_base_url == ""
     try:
@@ -1762,21 +1297,8 @@ def admin_openai_endpoint_test(req: OpenaiEndpointTestReq, request: Request):
             "" if _base_url_missing else "x")
     except ValueError as e:
         raise HTTPException(422, str(e))
-    # 監査は probe（実 API 呼び出し）より前に行う。書き込み失敗はそのまま例外にして 500 へ変換する
-    # （fail-closed・未監査のまま先へ進まない）。キー・生 URL・エラー本文は含めない。
-    #
-    # `pending["openai_base_url"]` はリクエストで明示された値だけでなく、`req.openai_base_url`
-    # 省略時は保存済みの値をそのまま継承する（976行目）。継承側は `_validate_openai_base_url` を
-    # 通っていないため、空白・バックスラッシュ混入・非文字列等を含む値が保存されていると、
-    # 生値のまま扱えば `hostname` に内部パス断片が残ったり（`urlsplit`）、`llm.openai_base_url()`
-    # の型検証で `ValueError` が飛んだりする。実効値（明示・継承いずれの経路でも）を
-    # 使用直前に再検証し、不合格（型不正を含む）なら host 表現を作らず固定文字列へ倒したうえで
-    # probe は実行しない（表示系の `system.py::_INVALID_SAVED_BASE_URL_LABEL` と同じ流儀）。
-    # `eff_kind` の解決（`llm.openai_endpoint_kind()`）も try 内に含める: 同関数は
-    # `openai_base_url` の型も判定分岐より先に検査する契約（`_assert_openai_endpoint_
-    # settings_types_valid`）のため、kind=openai／未設定でも base_url が非文字列なら
-    # ここで `ValueError` を送出しうる（kind の解決だけを外に出すと、この場合に監査へ
-    # 到達する前で 500 になってしまう）。
+    # 監査は probe（実 API 呼び出し）より前に行う。書き込み失敗は 500 に変換する（fail-closed・キー・生 URL・エラー本文は含めない）。
+    # `pending["openai_base_url"]` は、`req.openai_base_url` 省略時に保存済みの値を継承し、その値は `_validate_openai_base_url` を通っていない。実効値（明示・継承いずれも）を使用直前に再検証し、不合格（型不正を含む）なら host 表現を作らず固定文字列へ倒して probe は実行しない（`system.py::_INVALID_SAVED_BASE_URL_LABEL` と同じ）。`eff_kind` の解決（`llm.openai_endpoint_kind()`）も `openai_base_url` の型検査で `ValueError` を出しうるため try 内に含める。
     try:
         eff_kind = llm.openai_endpoint_kind(pending)
         eff_base_url = llm.openai_base_url(pending)
@@ -1799,11 +1321,9 @@ def admin_openai_endpoint_test(req: OpenaiEndpointTestReq, request: Request):
         raise HTTPException(500, "接続テストの監査記録に失敗したため中断しました")
     if not base_url_valid:
         raise HTTPException(422, "保存されている接続先 URL が不正です。管理画面で接続先を設定し直してください")
-    # 中央のみ（個人キー・個人モデルは一切見ない＝`user_settings=None`）。この直後で probe
-    # （実 API 呼び出し）に使うため strict=True で解決する（非 strict のままだと `cloud_provider`
-    # が非空の不正値でも黙って既定 openai 扱いのキーで実送信してしまい、課金を伴う接続テストの
-    # honest failure 契約が崩れるため）。
+    # 中央のみ（個人キー・個人モデルは見ない＝`user_settings=None`）。この直後の probe（実 API 呼び出し）に使うため strict=True で解決する（課金を伴う接続テストを寛容なキー解決で実送信しない）。
     try:
+        keys.selected_cloud_provider(sys_s, strict=True)  # 入力中のキーでも廃止済み保存値では送信しない。
         central_key = req.openai_api_key or keys.resolve_api_key(
             "openai", None, system_settings=sys_s, strict=True)
     except keys.InvalidCloudProviderConfigError as e:
@@ -1830,11 +1350,7 @@ def admin_openai_endpoint_test(req: OpenaiEndpointTestReq, request: Request):
 
 
 def _validate_allowed_worlds_or_error(allowed_worlds: list[str] | None) -> None:
-    """`allowed_worlds` の各 world_id を個別に strict resolve する（全 world を列挙しない・
-    空リスト/None は何もしない＝deny-all/無スコープに検証の必要は無い）。
-
-    未知の world は422、resolver（registry/root）到達不可は503。
-    """
+    """`allowed_worlds` の各 world_id を個別に strict resolve する（全 world は列挙しない・空リスト/None は何もしない）。未知の world は 422、resolver（registry/root）到達不可は 503。"""
     if not allowed_worlds:
         return
     for wid in allowed_worlds:
@@ -1848,16 +1364,13 @@ def _validate_allowed_worlds_or_error(allowed_worlds: list[str] | None) -> None:
 
 
 def _validate_future_expiry(dt: datetime | None, field_label: str) -> None:
-    """API キーの有効期限は未来の日時のみ許可する（過去日を選べてしまうと発行直後から
-    使えないキーができる・422）。無期限（None）はそのまま許可。"""
+    """API キーの有効期限は未来の日時のみ許可する（過去日は 422）。無期限（None）はそのまま許可。"""
     if dt is not None and dt <= datetime.now(timezone.utc):
         raise HTTPException(422, f"{field_label}は未来の日時で指定してください")
 
 
 def _validate_webhook_url_or_error(webhook_url: str | None) -> None:
-    """`webhook_url`（PART-6・キー発行時のオプトイン）が宛先ポリシー（admin allowlist・
-    RV是正#1で loopback も対象）を満たすか検証する。None（未指定）はそのまま許可（Webhook 無効のまま発行）。
-    不許可は 422（`webhooks.assert_webhook_url_allowed` が `WebhookUrlInvalid` を送出）。"""
+    """`webhook_url`（キー発行時のオプトイン）が宛先ポリシー（admin allowlist・loopback も対象）を満たすか検証する。None（未指定）は許可（Webhook 無効のまま発行）。不許可は 422（`webhooks.assert_webhook_url_allowed` が `WebhookUrlInvalid` を送出）。"""
     if webhook_url is None:
         return
     try:
@@ -1878,11 +1391,7 @@ _EXT_ADMIN_RESPONSES = {
 
 
 def _key_created_out(row: dict, plain: str) -> dict:
-    """発行直後のレスポンス（プレーンキーを含む・**このレスポンスでのみ**返す）。
-    admin 発行（`ext_key_create`）・利用者自己発行（`ext_self_key_create`）で共通の形。
-
-    `webhook_secret`（PART-6）もここでのみ平文で返す（`webhook_url` 未指定なら両方 null）。
-    """
+    """発行直後のレスポンス（プレーンキーを含み、このレスポンスでのみ返す）。admin 発行・利用者自己発行で共通の形。`webhook_secret` もここでのみ平文で返す（`webhook_url` 未指定なら両方 null）。"""
     return {"ok": True, "id": row["id"], "key": plain, "key_prefix": row["key_prefix"],
             "label": row["label"], "created_at": str(row["created_at"]),
             "allowed_worlds": row.get("allowed_worlds"),
@@ -1892,15 +1401,8 @@ def _key_created_out(row: dict, plain: str) -> dict:
 
 
 def _key_list_out(rows: list, call_counts: dict) -> dict:
-    """一覧レスポンス（プレーンキーは含めない）。admin 全件一覧・利用者本人一覧で共通の形。
-    `client_op_id` は秘密ではない（発行操作の相関トークン）。曖昧な発行結果の照合・自動失効は
-    一覧をクライアントが走査するのではなく、専用の回復エンドポイント（`ext_key_recover`/
-    `ext_self_key_recover`）がサーバー側で単一の原子的 UPDATE として行う——ここで返す値は
-    参照・デバッグ用途（一覧上で「どの発行操作に対応するか」を確認できる）。
-
-    `webhook`（PART-6）は Webhook 登録の有無のみ・`webhook_host` は宛先の host:port までは出す
-    （path/query・`webhook_secret` は絶対に一覧へ出さない——`rows` の SELECT 自体が
-    `webhook_secret` を含まない・`list_api_keys` 参照）。
+    """キー一覧のレスポンス（プレーンキーは含めない）。admin 全件一覧・利用者本人一覧で共通の形。
+    `client_op_id` は発行操作の相関トークン（秘密ではない・参照用）。`webhook` は Webhook 登録の有無のみ、`webhook_host` は宛先の host:port までで、path/query・`webhook_secret` は返さない。
     """
     return {"keys": [{**{k: r[k] for k in
                           ("id", "key_prefix", "label", "created_by", "revoked_by", "allowed_worlds",
@@ -1930,24 +1432,13 @@ def _key_list_out(rows: list, call_counts: dict) -> dict:
                               **_EXT_ADMIN_RESPONSES})
 def ext_key_create(req: ExtKeyCreateReq, request: Request,
                    x_request_id: str | None = ext_api._XRequestIdIn):
-    """外部 API キーを発行。プレーンキーは**このレスポンスで1度だけ**返す（DB はハッシュのみ）。
-
-    `allowed_worlds` は実在する world_id のみ許可する（形式検証は `ExtKeyCreateReq` 側・
-    実在検証はここ・指定された ID だけを個別に strict resolve する＝全 world 列挙はしない）。
-    未知の world は 422。`expires_at` は announcements と同じ ISO 8601 文字列（省略/null＝
-    無期限）・`daily_quota` は1以上の整数（省略/null＝無制限）。監査は
-    `ext_api.start_audit()` で `request.state.audit_pending` に積み、実際の書き込みは
-    `ExtRequestMiddleware`（`/ext/v1/*` 全体に装着済み）が実応答ステータスで一元的に行う
-    （他の X-API-Key 系ルートと同じ経路・書込先を二重化しない）。このルートも `/ext/v1/*` 配下＝
-    `ExtRequestMiddleware` が X-Request-Id の解決/応答ヘッダ付与・401/403 を含む全応答への付与を
-    行う（`x_request_id` はここでは OpenAPI 契約の宣言のみ・実際の解決は Cookie 認証と無関係に
-    ミドルウェアが行う）。
+    """外部 API キーを発行する（admin のみ）。プレーンキーはこのレスポンスで 1 度だけ返す（DB はハッシュのみ）。
+    `allowed_worlds` は実在する world_id のみ許可する（未知の world は 422）。`expires_at` は ISO 8601 文字列（省略/null＝無期限）・`daily_quota` は 1 以上の整数（省略/null＝無制限）。
     """
     del x_request_id
     u = _require_admin(_current_user(request))
     pending = ext_api.start_audit(request, u["uid"], "ext_api.key_created", "api_key")
-    # 検証前に積む（`req.label`/`req.allowed_worlds` は Pydantic の field_validator を経た
-    # 正規化済みの値）＝422/503 で失敗しても監査に「何を発行しようとしたか」（入力）が残る。
+    # 検証前に積む（`req.label`/`req.allowed_worlds` は正規化済みの値）。422/503 で失敗しても、何を発行しようとしたかが監査に残る。
     pending["detail"].update({"label": req.label, "allowed_worlds": req.allowed_worlds,
                               "expires_at": req.expires_at, "daily_quota": req.daily_quota,
                               "webhook": bool(req.webhook_url)})
@@ -1955,7 +1446,7 @@ def ext_key_create(req: ExtKeyCreateReq, request: Request,
     expires_at = _parse_announcement_dt(req.expires_at, "有効期限")
     _validate_future_expiry(expires_at, "有効期限")
     _validate_webhook_url_or_error(req.webhook_url)
-    # PART-6（W4）: secret は登録時に生成し平文保管する（署名生成に平文が必須）。
+    # secret は登録時に生成し平文保管する（署名生成に平文が必要）。
     webhook_secret = secrets.token_urlsafe(32) if req.webhook_url else None
     plain = ext_api._generate_key()
     try:
@@ -1979,11 +1470,8 @@ def ext_key_create(req: ExtKeyCreateReq, request: Request,
                    responses={200: {"headers": dict(ext_api._REQUEST_ID_OPENAPI_HEADER)},
                              **_EXT_ADMIN_AUTH_RESPONSES})
 def ext_key_list(request: Request, x_request_id: str | None = ext_api._XRequestIdIn):
-    """外部 API キー一覧（プレーンキーは含めない・全件・admin のみ）。
-
-    `call_count` は監査台帳（直近分のみ・`store.count_ext_api_calls_by_key`）からの集計。
-    `owner_uid` が非 null のキーは利用者本人が自己発行したもの——admin はこれも含めて
-    全件を見え、失効もできる。
+    """外部 API キー一覧を返す（プレーンキーは含めない・全件・admin のみ）。
+    `call_count` は直近分の呼び出し回数。`owner_uid` が非 null のキーは利用者本人が自己発行したもので、admin はこれも含めて全件を見え、失効もできる。
     """
     del x_request_id
     u = _require_admin(_current_user(request))
@@ -2003,8 +1491,7 @@ def ext_key_list(request: Request, x_request_id: str | None = ext_api._XRequestI
                                 **_EXT_ADMIN_AUTH_RESPONSES})
 def ext_key_revoke(key_id: int, request: Request,
                    x_request_id: str | None = ext_api._XRequestIdIn):
-    """キー失効（soft・冪等）。未知 id は 404。admin は所有者を問わず任意のキー（利用者自己発行
-    キーを含む）を失効できる。"""
+    """キーを失効する（soft・冪等）。未知 id は 404。admin は所有者を問わず任意のキー（利用者自己発行を含む）を失効できる。"""
     del x_request_id
     u = _require_admin(_current_user(request))
     pending = ext_api.start_audit(request, u["uid"], "ext_api.key_revoked", "api_key",
@@ -2025,17 +1512,9 @@ def ext_key_revoke(key_id: int, request: Request,
                               **_EXT_ADMIN_AUTH_RESPONSES})
 def ext_key_recover(req: ExtKeyRecoverReq, request: Request,
                     x_request_id: str | None = ext_api._XRequestIdIn):
-    """`POST /ext/v1/admin/keys` の応答が届かなかった（タイムアウト・通信断・不正な形の応答等・
-    曖昧な結果）場合の回復専用エンドポイント。
-
-    この admin 自身（`created_by=uid` かつ `owner_uid IS NULL`＝admin 発行の行のみ）が発行操作を
-    試みた `client_op_id` に一致する**未失効**キーだけを、単一の原子的 UPDATE で照合・失効する
-    （一覧取得→別リクエストで DELETE、という2段構成は「一覧に他人の行も混じる」「その間に
-    別の変更が起こる」隙があるため使わない——`client_op_id`・所有条件を同一 SQL の WHERE 句で
-    照合するので、`client_op_id` が他人の値と衝突しても他人のキーには触れない）。
-    `found: false` は「POST がそもそもサーバーに届かなかった」「まだコミットされていない」の
-    いずれか（呼び出し側で有界に再試行すること・区別できない・区別する必要もない——どちらも
-    「今は確定的な有効キーは無い」という意味では同じ）。
+    """`POST /ext/v1/admin/keys` の応答が届かなかった（タイムアウト・通信断・不正な形の応答等）場合の回復専用エンドポイント。
+    この admin 自身が発行操作を試みた `client_op_id` に一致する未失効キーだけを、単一の原子的な操作で照合・失効する（他人のキーには触れない）。
+    `found: false` は「POST がサーバーに届かなかった」か「まだコミットされていない」のいずれか（呼び出し側で有界に再試行する）。
     """
     del x_request_id
     u = _require_admin(_current_user(request))
@@ -2050,15 +1529,10 @@ def ext_key_recover(req: ExtKeyRecoverReq, request: Request,
     return {"found": True, "id": row["id"], "revoked_at": str(row["revoked_at"])}
 
 
-# ===== 利用者本人による API キー自己発行/一覧/失効/回復（4ルート） =====
-# admin ルートと同じ `X-API-Key` 系ではなく、個人設定ページと同じ Cookie 認証（`_current_user`）。
-# admin 権限は不要（`_require_admin` を呼ばない）——本人の分だけ見え、本人の分だけ失効・回復できる。
+# 利用者本人による API キーの自己発行/一覧/失効/回復（4 ルート）。個人設定ページと同じ Cookie 認証（`_current_user`）で、admin 権限は不要（`_require_admin` を呼ばない）。本人の分だけ見え、本人の分だけ失効・回復できる。
 
 def _require_user_api_keys_allowed(u: dict) -> dict:
-    """`system_settings.user_api_keys_allowed` が偽なら403（本人一覧/失効/回復を含む4ルート
-    共通のゲート）。OFF のときは自己発行キーの機能そのものを見せない/触らせない（発行だけでなく
-    一覧・失効・回復も同様に拒否する）。戻り値は以後の処理で使い回す system_settings。
-    """
+    """`system_settings.user_api_keys_allowed` が偽なら 403（本人一覧/失効/回復を含む 4 ルート共通のゲート）。戻り値は以後の処理で使い回す system_settings。"""
     sysset = store.get_system_settings()
     if not bool(sysset.get("user_api_keys_allowed")):
         raise HTTPException(403, "利用者による API キー発行は許可されていません（管理者に確認してください）")
@@ -2066,12 +1540,7 @@ def _require_user_api_keys_allowed(u: dict) -> dict:
 
 
 def _enforce_self_world_scope(uid: str, requested: list[str] | None) -> list[str] | None:
-    """利用者自己発行キーの world スコープを本人のアクセス範囲 ⊆ に強制する。
-
-    `worlds.accessible_world_ids(uid)` が None（現状＝全ユーザーが全 world にアクセス可）なら
-    そのまま返す。非 None（将来の部門/管理者スコープ実装後）になったら、未指定は本人の範囲へ
-    明示的に絞り、指定された world がその範囲外なら 403。
-    """
+    """利用者自己発行キーの world スコープを本人のアクセス範囲の部分集合に強制する。`worlds.accessible_world_ids(uid)` が None（現状＝全ユーザーが全 world にアクセス可）ならそのまま返し、非 None なら未指定は本人の範囲へ絞り、範囲外の world を指定されたら 403。"""
     accessible = worlds.accessible_world_ids(uid)
     if accessible is None:
         return requested
@@ -2103,17 +1572,8 @@ def _enforce_self_world_scope(uid: str, requested: list[str] | None) -> list[str
                                     "headers": dict(ext_api._REQUEST_ID_OPENAPI_HEADER)}})
 def ext_self_key_create(req: ExtSelfKeyCreateReq, request: Request,
                         x_request_id: str | None = ext_api._XRequestIdIn):
-    """利用者本人の API キーを発行する（`system_settings.user_api_keys_allowed` が
-    true のときのみ）。
-
-    world スコープは本人がアクセスできる範囲へ強制する（`_enforce_self_world_scope`）。
-    `daily_quota` の解決・上限チェックは `store.insert_api_key` が `_USER_KEY_LOCK` の下で
-    DB から現在の許可トグル・現在の上限を再読して行う（ここでは生の入力をそのまま渡すだけ・
-    TOCTOU対策として router 側では解決しない——利用者が上限100を読んだ直後に admin が5へ
-    引き下げても、実際に書き込む瞬間の上限で判定する）。プレーンキーは発行直後のこの応答でのみ
-    返す。`system_settings.user_api_keys_allowed` の最終判定も同じロック内で再確認する
-    （ここでの事前チェック `_require_user_api_keys_allowed` は早期リターンのための
-    best-effort・正本は store 側）。
+    """利用者本人の API キーを発行する（`system_settings.user_api_keys_allowed` が true のときのみ）。
+    world スコープは本人のアクセス範囲に絞られる。`daily_quota` の上限チェックと許可トグルの最終判定は、発行の書込み直前にロック内で DB から再読して行う（先に行う事前チェックは早期リターン用）。プレーンキーはこの応答でのみ返す。
     """
     del x_request_id
     u = _current_user(request)
@@ -2160,8 +1620,7 @@ def ext_self_key_create(req: ExtSelfKeyCreateReq, request: Request,
                              401: {"description": "ログインが必要です（セッション Cookie）",
                                    "headers": dict(ext_api._REQUEST_ID_OPENAPI_HEADER)}})
 def ext_self_key_list(request: Request, x_request_id: str | None = ext_api._XRequestIdIn):
-    """本人が発行した API キーの一覧（プレーンキーは含めない・他人のキーは見えない）。
-    機能トグルが OFF のときは一覧そのものを見せない（4ルート共通のゲート）。"""
+    """本人が発行した API キーの一覧を返す（プレーンキーは含めない・他人のキーは見えない）。機能トグルが OFF のときは一覧そのものを見せない。"""
     del x_request_id
     u = _current_user(request)
     _require_user_api_keys_allowed(u)
@@ -2184,9 +1643,7 @@ def ext_self_key_list(request: Request, x_request_id: str | None = ext_api._XReq
                                       "headers": dict(ext_api._REQUEST_ID_OPENAPI_HEADER)}})
 def ext_self_key_revoke(key_id: int, request: Request,
                         x_request_id: str | None = ext_api._XRequestIdIn):
-    """本人が発行したキーの失効（soft・冪等）。他人/admin発行のキー・未知 id は 404
-    （所有権の有無を外に出さない・`store.revoke_api_key(owner_uid=...)` が絞り込む）。
-    機能トグルが OFF のときはこの操作そのものを拒否する（4ルート共通のゲート）。"""
+    """本人が発行したキーを失効する（soft・冪等）。他人/admin 発行のキー・未知 id は 404。機能トグルが OFF のときは拒否する。"""
     del x_request_id
     u = _current_user(request)
     _require_user_api_keys_allowed(u)
@@ -2211,10 +1668,7 @@ def ext_self_key_revoke(key_id: int, request: Request,
                                     "headers": dict(ext_api._REQUEST_ID_OPENAPI_HEADER)}})
 def ext_self_key_recover(req: ExtKeyRecoverReq, request: Request,
                          x_request_id: str | None = ext_api._XRequestIdIn):
-    """自己発行の `POST /ext/v1/keys` の応答が届かなかった場合の回復専用エンドポイント
-    （`ext_key_recover` の自己発行版・`owner_uid=uid` で照合）。機能トグルが OFF のときは
-    この操作そのものを拒否する（他の自己サービス系ルートと同じゲート——OFF になった時点で
-    自己発行キーは一括失効済みのため、実質的には常に `found: false` になる）。"""
+    """自己発行の `POST /ext/v1/keys` の応答が届かなかった場合の回復専用エンドポイント（自己発行版・本人のキーだけを照合）。機能トグルが OFF のときは拒否する（OFF になった時点で自己発行キーは一括失効済みのため、実質は常に `found: false`）。"""
     del x_request_id
     u = _current_user(request)
     _require_user_api_keys_allowed(u)

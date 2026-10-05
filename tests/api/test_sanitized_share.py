@@ -110,7 +110,7 @@ def test_toggle_marks_user_message_at_save_in_source():
     """RV BLOCKER(in-flight): トグルONは保存時点で質問を個人扱いにし、provider 前に会話フラグを立てる。"""
     import inspect
     from sherpa import chat_service
-    for fn in (chat_service.handle_message, chat_service.stream_message):
+    for fn in (chat_service.stream_message,):
         src = inspect.getsource(fn)
         # 保存時点で personal=personal（provider 前）＋会話フラグを provider 前に立てる。
         assert 'add_message(conversation_id, "user", message, personal=personal)' in src, \

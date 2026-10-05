@@ -198,6 +198,8 @@ sequenceDiagram
   共有閲覧はトークン＋招待＋期限（§10）。
 
 ## 11. API（抜粋）
+> 初期 MVP の時点の API の記録。`/impact/*`・`/qa/run`・`/troubleshoot/run`・同期チャットは撤去済み。今の API は `docs/manual/90-リファレンス.md`（画面の API）と外部連携 API `/ext/v1`（影響のつながりは `/ext/v1/search` の graph エンジン）を見る。
+
 **MVP の入口は薄い専用エンドポイント**: `POST /ingest`・`GET /ingest/{id}/preview`・
 `POST /ingest/{id}/publish`・`POST /impact/run`・`GET /impact/{id}`・`GET /impact/{id}/export.xlsx`・
 `GET /documents/{id}/download`。**＋別のやりたいことの薄い probe**（read-only）: `POST /troubleshoot/run`・`POST /qa/run`。

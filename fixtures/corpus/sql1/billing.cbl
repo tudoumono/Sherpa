@@ -34,4 +34,7 @@
                DECLARE CUR1 CURSOR FOR
                SELECT * FROM ORDERS
            END-EXEC.
+           EXEC SQL
+               DECLARE CUR2 CURSOR FOR STMT1
+           END-EXEC.
            GOBACK.

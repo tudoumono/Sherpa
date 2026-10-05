@@ -71,14 +71,14 @@ def _upload(filename: str, content: bytes) -> dict:
     return r
 
 
-def _chat_personal(message: str, personal: bool = True, cid: int | None = None) -> dict:
-    """personal フラグ付きで /chat (POST) を呼ぶ（ナレッジ参照 OFF・personal 指定）。"""
-    import uuid
-    body: dict = {"message": message, "personal": personal, "knowledge": False, "stream_id": uuid.uuid4().hex}
-    if cid is not None:
-        body["conversation_id"] = cid
-    r = client.post("/chat", json=body)
-    return r
+def _chat_personal(uid: str, message: str, personal: bool = True, cid: int | None = None) -> dict:
+    """personal フラグ付きの 1 ターンを `stream_message` で直接実行し、answer イベントを返す（ナレッジ参照 OFF・personal 指定）。"""
+    from sherpa import chat_service
+    from sherpa.deps import _USERS_DIR
+    events = list(chat_service.stream_message(
+        None, message, "v1", conversation_id=cid, knowledge=False, personal=personal,
+        user_id=uid, users_dir=str(_USERS_DIR)))
+    return next(e for e in events if e["type"] == "answer")
 
 
 # ===== テスト =====
@@ -97,9 +97,7 @@ def test_personal_on_returns_personal_sources():
     assert r.status_code == 200, r.text
 
     # personal=True でチャット（ナレッジ参照OFF）。
-    r = _chat_personal("UNIQUE_KEYWORD_XYZ_TESTING", personal=True)
-    assert r.status_code == 200, r.text
-    ans = r.json()
+    ans = _chat_personal(uid, "UNIQUE_KEYWORD_XYZ_TESTING", personal=True)
     answer_env = ans["message"]["answer"]
 
     # personal_sources が含まれている（個人ファイルがヒットした場合）。
@@ -127,9 +125,7 @@ def test_personal_off_no_personal_sources():
     _upload(f"personal_off_{sfx}.txt", content)
 
     # personal=False でチャット。
-    r = _chat_personal("ANOTHER_UNIQUE_KWD_OFF_TEST", personal=False)
-    assert r.status_code == 200, r.text
-    ans = r.json()
+    ans = _chat_personal(uid, "ANOTHER_UNIQUE_KWD_OFF_TEST", personal=False)
     answer_env = ans["message"]["answer"]
 
     # personal_sources は含まれない（OFF 時は personal grep しない）。
@@ -156,9 +152,7 @@ def test_cross_user_personal_isolation():
 
     # B で personal=True チャット（A のキーワードを検索）。
     _login(uid_b, pw_b)
-    r = _chat_personal(secret_kw, personal=True)
-    assert r.status_code == 200, r.text
-    ans = r.json()
+    ans = _chat_personal(uid_b, secret_kw, personal=True)
     answer_env = ans["message"]["answer"]
 
     # B の personal_sources に A のファイルが出てはいけない。
@@ -214,9 +208,7 @@ def test_contains_personal_workspace_set_on_personal_chat():
     _upload(f"flag_test_{sfx}.txt", content)
 
     # personal=True でチャット。
-    r = _chat_personal("UNIQUE_PERSONAL_FLAG_TEST", personal=True)
-    assert r.status_code == 200, r.text
-    cid = r.json()["conversation_id"]
+    cid = _chat_personal(uid, "UNIQUE_PERSONAL_FLAG_TEST", personal=True)["conversation_id"]
 
     # 会話の contains_personal_workspace フラグを確認。
     conv_data = store.get_conversation_for_read(uid, cid)
@@ -242,9 +234,7 @@ def test_share_blocked_when_contains_personal_workspace():
     _upload(f"share_block_{sfx}.txt", content)
 
     # personal=True でチャット → cid を取得。
-    r = _chat_personal("SHARE_BLOCK_TEST", personal=True)
-    assert r.status_code == 200, r.text
-    cid = r.json()["conversation_id"]
+    cid = _chat_personal(uid, "SHARE_BLOCK_TEST", personal=True)["conversation_id"]
 
     # contains_personal_workspace が True になっているか確認。
     conv_data = store.get_conversation_for_read(uid, cid)
@@ -343,9 +333,8 @@ def test_received_share_blocked_when_source_has_personal():
 def test_blocker1_flag_failure_prevents_answer_save():
     """BLOCKER-1 fix: set_contains_personal_workspace が失敗したとき、個人内容を含む回答は保存されない。
 
-    handle_message で set_contains_personal_workspace が例外を raise → 500 またはサーバ例外が上がること、
+    `stream_message` で set_contains_personal_workspace が例外を raise → 例外が上がること、
     かつ add_message(assistant) が呼ばれていないことを store 層で検証する。
-    raise_server_exceptions=True のため TestClient が例外を再 raise する場合も許容。
     """
     if not _try_init():
         pytest.skip("DB down")
@@ -367,26 +356,15 @@ def test_blocker1_flag_failure_prevents_answer_save():
         saved_roles.append(role)
         return _real_add(conversation_id, role, *args, **kwargs)
 
-    server_error_raised = False
-    try:
-        import uuid
-        with patch("sherpa.store.set_contains_personal_workspace",
-                   side_effect=RuntimeError("DB write failure")), \
-             patch("sherpa.store.add_message", side_effect=_tracking_add):
-            r = client.post("/chat", json={
-                "message": "BLOCKER1_FAIL_TEST", "personal": True, "knowledge": False, "stream_id": uuid.uuid4().hex})
-        # raise_server_exceptions=False 相当で 500 を受け取った場合。
-        assert r.status_code >= 400, \
-            f"BLOCKER-1: flag write 失敗でも 200 が返った（{r.status_code}）"
-    except RuntimeError as e:
-        # raise_server_exceptions=True で例外が再 raise された場合も PASS（fail-closed 確認済み）。
-        assert "DB write failure" in str(e), f"予期しない例外: {e}"
-        server_error_raised = True
+    with patch("sherpa.store.set_contains_personal_workspace",
+               side_effect=RuntimeError("DB write failure")), \
+         patch("sherpa.store.add_message", side_effect=_tracking_add):
+        with pytest.raises(RuntimeError, match="DB write failure"):
+            _chat_personal(uid, "BLOCKER1_FAIL_TEST", personal=True)
 
     # アシスタントメッセージが保存されていないこと（fail-closed）。
     assert "assistant" not in saved_roles, \
         f"BLOCKER-1: flag write 失敗後もアシスタントメッセージが保存された: roles={saved_roles}"
-    assert server_error_raised or True  # 例外が上がるか 400+ が返れば PASS。
 
     _logout()
 

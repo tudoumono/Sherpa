@@ -1,10 +1,9 @@
-// 監査ログ閲覧画面（Slice3・admin 専用）。GET /admin/audit でフィルタ検索。
+// 監査ログ閲覧画面（admin 専用）。GET /admin/audit でフィルタ検索。
+// 設計: docs/design/users.md「監査ログ」
 // セキュリティ: server data は全て esc()。detail/before_state/after_state は既にサーバ側で redact 済み。
 'use strict';
 
-// UI-TABS2（2026-09-04）: システム管理のタブから iframe（?embed=1）で開かれた時は、自ページの
-// 共通トップバー/ナビを隠す（CSS 側は .embedded 修飾・audit.html の <style>）。単独 URL 直開き
-// （?embed 無し）では何もしない＝この画面の機能・見た目は完全に不変。
+// システム管理のタブから iframe（?embed=1）で開かれた時は、共通トップバー/ナビを隠す（CSS は .embedded 修飾）。
 if (new URLSearchParams(location.search).has('embed')) {
   document.documentElement.classList.add('embedded');
 }
@@ -70,8 +69,7 @@ function sevClass(s) {
   return '';
 }
 // 表示ラベルのみ日本語化（value・API 送信値・監査ログの生データは英語のまま）。
-// pending: 送信前に確保する監査行（例: admin.usage_chat_asked の外部送信 fail-closed 契約）。
-// 対応する結果行（success/failure）とは request_id で対応付く（行クリックで開く詳細を参照）。
+// pending: 送信前に確保する監査行。対応する結果行（success/failure）とは request_id で対応付く。
 const OUTCOME_LABEL = { success: '成功', deny: '拒否', failure: '失敗', error: 'エラー', pending: '送信前記録' };
 const SEVERITY_LABEL = { info: '情報', warning: '警告', critical: '重大' };
 
@@ -115,9 +113,8 @@ function renderRows(rows) {
   }).join('');
 }
 
-// ===== 表示項目カスタマイズ（UI フィードバック6・2026-07-03）=====
-// 端末ローカル保存。テーマ切替と同じ思想: localStorage は try/catch で包む
-// （プライベートモード等でアクセス不可でも既定表示に落ちるだけにする）。
+// ===== 表示項目カスタマイズ =====
+// 端末ローカル保存。localStorage は try/catch で包む（アクセス不可でも既定表示に落ちるだけ）。
 const AUDIT_COLUMNS = ['ts', 'actor', 'action', 'resource', 'outcome', 'severity', 'reason', 'detail'];
 const AUDIT_COL_KEY = 'sherpa_audit_columns';
 const AUDIT_COL_DEFAULT = { ts: true, actor: true, action: true, resource: true, outcome: true, severity: true, reason: true, detail: false };
@@ -164,8 +161,7 @@ function toggleDetailRow(tr) {
   const full = row && row.detail != null
     ? (typeof row.detail === 'string' ? row.detail : JSON.stringify(row.detail, null, 2))
     : '（詳細なし）';
-  // request_id: pending 行と結果行（success/failure）を対応付ける相関 ID（例: admin.usage_chat_asked
-  // の外部送信 fail-closed 契約・audit.js::OUTCOME_LABEL 参照）。detail の前に独立した行として示す。
+  // request_id: pending 行と結果行を対応付ける相関 ID。detail の前に独立した行として示す。
   const reqLine = row && row.request_id ? `request_id: ${row.request_id}\n\n` : '';
   const detailTr = document.createElement('tr');
   detailTr.className = 'detail-row';
@@ -231,7 +227,7 @@ async function exportAudit(format) {
     const cd = r.headers.get('content-disposition') || '';
     const m = cd.match(/filename="([^"]+)"/);
     const name = m ? m[1] : `sherpa-audit.${format}`;
-    Sherpa.downloadBlob(blob, name);   // UI フィードバック3: revoke タイミング問題を共通ヘルパで回避
+    Sherpa.downloadBlob(blob, name);   // revoke のタイミング問題は共通ヘルパで回避
     if (status) status.textContent = `エクスポートしました: ${name}`;
   } catch (e) {
     if (status) status.textContent = `エクスポート失敗: ${e.message}`;

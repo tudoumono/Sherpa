@@ -16,7 +16,7 @@
   - 上記2条件に該当しない名前（public 関数・定数・例外クラス・facade で re-export された
     非モジュール値）は private 名（`_` 始まり）であっても**すべて対象**にする。tests/ や
     sherpa/ が `store._audit_insert`・`store._redact`・`store._connect`・`store._dsn`・
-    `store._ensure`・`store._compute_retention`・`store._audit_entry_hash`・
+    `store._ensure`・`store._audit_entry_hash`・
     `store._audit_canonical`・`store._safe_share_answer`・
     `store._invalidate_system_settings_cache`・`store._REDACT_KEYS`・`store._REDACTED_TEXT`・
     `store._SETTINGS_FIELDS`・`store.AnnouncementOrderError` 等を直接参照/monkeypatch するため、
@@ -52,7 +52,6 @@ REQUIRED_PRIVATE_NAMES = (
     "_connect",
     "_dsn",
     "_ensure",
-    "_compute_retention",
     "_audit_entry_hash",
     "_audit_canonical",
     "_safe_share_answer",

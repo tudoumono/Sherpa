@@ -6,8 +6,21 @@ set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" 2>/dev/null || exit 0
 
+# 時間制限は GNU の timeout があればそれ、無ければ Python（scripts/lib/portable_tools.py）。どちらも
+# 無ければ制限なしで実行する（フックの目的は表示だけ・失敗は無視する）。
+_limited() {  # SEC CMD...
+  local sec="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$sec" "$@"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 "$ROOT/scripts/lib/portable_tools.py" run-limited "$sec" "$@"
+  else
+    "$@"
+  fi
+}
+
 echo "=== git 状態 ==="
-timeout 15 git fetch origin --quiet 2>/dev/null
+_limited 15 git fetch origin --quiet 2>/dev/null
 
 branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 echo "ブランチ: ${branch:-不明}"
@@ -29,7 +42,7 @@ git worktree list 2>/dev/null
 if [ -x "$ROOT/scripts/check-ports.sh" ]; then
     echo
     echo "=== ポート状況 ==="
-    timeout 20 "$ROOT/scripts/check-ports.sh" 2>&1
+    _limited 20 "$ROOT/scripts/check-ports.sh" 2>&1
 fi
 
 exit 0

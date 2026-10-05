@@ -20,7 +20,7 @@ os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 
 from pathlib import Path  # noqa: E402
 
-from sherpa import grep_tool, worlds  # noqa: E402
+from sherpa import worlds  # noqa: E402
 from sherpa.ingest import observation_render  # noqa: E402
 
 CANONICAL = "a" * 64
@@ -39,28 +39,6 @@ def _publish_observation(base: Path, rel: str, body: str) -> Path:
         "observation_generation_id": OBSERVATION,
     }), encoding="utf-8")
     return doc
-
-
-def test_observation_only_text_is_not_searched_directly(tmp_path, monkeypatch):
-    """観測専用ツリー（`{rel}.rag_observations.md`）にしか無い文字列は grep から見えない
-    （O1・rag.md へ統合していない生成物を検索対象にしない＝観測ツリーの直接走査を撤去済み）。"""
-    world_dir = tmp_path / "world"
-    (world_dir / "5期更改").mkdir(parents=True)
-    (world_dir / "5期更改" / "資料.docx").write_bytes(b"dummy")
-    observations = tmp_path / "obs"
-    _publish_observation(observations, "5期更改/資料.docx",
-                         "# OCR補助観測\n\n画像内文字（補正なし）:\nグラフを生成\n")
-
-    monkeypatch.setattr(worlds, "world_dir", lambda _w: world_dir)
-    monkeypatch.setattr(worlds, "derived_md_dir", lambda _w: tmp_path / "no-derived")
-    monkeypatch.setattr(worlds, "derived_rag_dir", lambda _w: tmp_path / "no-rag")
-    monkeypatch.setattr(worlds, "observation_current_dir",
-                        lambda _w: observations / observation_render.OBSERVATION_GENERATIONS_NAME
-                        / CANONICAL / OBSERVATION)
-
-    hits = grep_tool.grep_search("グラフを生成", world="test")
-
-    assert hits == [], "観測専用ツリーが grep の検索ルートとして走査されている（rag.md 統合済みのはず）"
 
 
 def test_stale_observations_are_not_searched(tmp_path, monkeypatch):

@@ -11,8 +11,7 @@
 <script src="nav.js"></script>
 <style>
   .wrap2{max-width:none;margin:0}
-  /* UI-TABS2（2026-09-04）: システム管理のタブから iframe（?embed=1）で開かれた時だけ、
-     自ページの共通トップバー/ナビを隠す（単独 URL 直開きは従来どおり・audit.js 冒頭が判定）。 */
+  /* システム管理のタブから iframe（?embed=1）で開かれた時だけ、共通トップバー/ナビを隠す（audit.js 冒頭が判定）。 */
   .embedded .topbar,.embedded nav{display:none}
   .embedded .wrap{padding-top:8px}
   /* フィルターバー */
@@ -40,7 +39,7 @@
   .pager .info{font-size:var(--text-small);color:var(--ink-3)}
   #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
   .empty-row td{text-align:center;color:var(--ink-3);padding:24px}
-  /* UI フィードバック6（2026-07-03）: 表示項目カスタマイズ（列の表示/非表示・端末ローカル保存）。 */
+  /* 表示項目カスタマイズ（列の表示/非表示・端末ローカル保存）。 */
   .colcfg{display:flex;flex-wrap:wrap;gap:3px 14px;align-items:center;margin-bottom:10px;font-size:var(--text-small);color:var(--ink-2)}
   .colcfg label{display:inline-flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap}
   .colcfg input{margin:0}

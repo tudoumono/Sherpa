@@ -2,8 +2,8 @@
 
 正典: `docs/archive/2026-09-03-世代間diff比較.md` §3〜§8。ツールは grep と同格の素朴な決定的
 diff——レコード同定・業務キー対応付け・要約はしない（agentic loop の LLM が diff テキストを読んで
-行う）。ここでは決定的な入出力契約（`sherpa/compare_docs.py`）と、`agentic_search.run_tool`/
-`openai_tools`/`gemini_tools`/`mcp_server._tool_defs()` への配線を、実ファイル（`office_md.
+行う）。ここでは決定的な入出力契約（`sherpa/compare_docs.py`）と、`tool_dispatch.run_tool`/
+`mcp_server._tool_defs()` への配線を、実ファイル（`office_md.
 build_derived()` の実往復）で固定する。
 
 **openpyxl 再保存の偽差分に注意**（CONV-CACHE レーンの教訓）: 世代間で「意図的に変えた値」以外の
@@ -25,7 +25,7 @@ os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 import openpyxl
 import pytest
 
-from sherpa import agentic_search, compare_docs, mcp_server, worlds
+from sherpa import compare_docs, mcp_server, tool_dispatch, worlds
 from sherpa.ingest import evidence_render, office_md
 
 _WORLD = "gendiff-test"
@@ -194,7 +194,7 @@ def test_scope_violation_returns_error(_pinned_world):
 
 def test_run_tool_comparable_adds_both_doc_ids_to_sources(_pinned_world):
     world = _pinned_world
-    result, docs, _cites, _cards = agentic_search.run_tool(
+    result, docs, _cites, _cards = tool_dispatch.run_tool(
         "compare_documents",
         {"left_doc_id": f"4期/{_XLSX_NAME}", "right_doc_id": f"5期/{_XLSX_NAME}"},
         world, None)
@@ -204,7 +204,7 @@ def test_run_tool_comparable_adds_both_doc_ids_to_sources(_pinned_world):
 
 def test_run_tool_clips_diff_to_budget_and_reports_truncated(_pinned_world):
     world = _pinned_world
-    result, _docs, _cites, _cards = agentic_search.run_tool(
+    result, _docs, _cites, _cards = tool_dispatch.run_tool(
         "compare_documents",
         {"left_doc_id": f"4期/{_XLSX_NAME}", "right_doc_id": f"5期/{_XLSX_NAME}"},
         world, None, tool_result_max_bytes=64)
@@ -215,24 +215,11 @@ def test_run_tool_clips_diff_to_budget_and_reports_truncated(_pinned_world):
 
 # ---- ツール登録（§5・4+1箇所のうちの3箇所を確認）----
 
-def test_registered_in_openai_tools():
-    names = [t["function"]["name"] for t in agentic_search.openai_tools(with_es=True, with_graph=True)]
-    assert "compare_documents" in names
-
-
-def test_registered_in_gemini_tools():
-    names = [f["name"] for f in agentic_search.gemini_tools(with_es=True, with_graph=True)[0]["functionDeclarations"]]
-    assert "compare_documents" in names
-
 
 def test_registered_in_mcp_tool_defs(monkeypatch):
     monkeypatch.delenv("SHERPA_MCP_ASK_DISABLED", raising=False)
     names = [d["name"] for d in mcp_server._tool_defs()]
     assert "compare_documents" in names
-
-
-def test_system_prompt_mentions_compare_documents():
-    assert "compare_documents" in agentic_search.SYSTEM
 
 
 # ---- 秘匿名は rag.md が物理的に残っていても比較材料にしない（台帳 #85〜#88）----

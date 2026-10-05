@@ -108,3 +108,40 @@ def test_search_knn_only_layer_omitted_matches_current_behavior(monkeypatch):
     _stub_embeddings(monkeypatch)
     es_index.search_knn_only("v1", "q", k=5)
     assert captured["body"]["knn"]["filter"] == []
+
+
+# ===== es_search の方式（hybrid／keyword／vector）=====
+
+def test_search_mode_query_shapes(monkeypatch):
+    """hybrid は match＋knn の should（match 節だけ名前付き・既定）・keyword は BM25 だけ・vector は knn だけ。"""
+    captured = _capture_req(monkeypatch)
+    _stub_embeddings(monkeypatch)
+    es_index.search("v1", "q", k=5)
+    should = captured["body"]["query"]["function_score"]["query"]["bool"]["should"]
+    assert should[0] == {"match": {"text": {"query": "q", "_name": "keyword"}}}
+    assert "knn" in should[1]
+    es_index.search("v1", "q", k=5, vector=False)
+    q = captured["body"]["query"]["function_score"]["query"]["bool"]
+    assert q["must"] == [{"match": {"text": "q"}}] and "should" not in q and "knn" not in captured["body"]
+    es_index.search_knn_only("v1", "q", k=5)
+    assert "knn" in captured["body"] and "query" not in captured["body"]
+
+
+def test_search_hybrid_marks_keyword_match(monkeypatch):
+    """hybrid で kNN だけに当たったヒットは keyword_match:false・BM25 のみの経路は全件 true。"""
+    _stub_embeddings(monkeypatch)
+    monkeypatch.setattr(es_index, "available", lambda: True)
+
+    def hit(i, mq):
+        h = {"_source": {"doc_id": f"{i}.md", "text": "t"}, "_score": 1.0}
+        if mq is not None:
+            h["matched_queries"] = mq
+        return h
+
+    monkeypatch.setattr(es_index, "_req", lambda m, p, body=None, **kw: {"hits": {"hits": [
+        hit(1, ["keyword"]), hit(2, [])]}})
+    hits, _ = es_index.search("v1", "q", k=5)
+    assert [h["keyword_match"] for h in hits] == [True, False]
+    monkeypatch.setattr(es_index, "_req", lambda m, p, body=None, **kw: {"hits": {"hits": [hit(1, None)]}})
+    hits, _ = es_index.search("v1", "q", k=5, vector=False)
+    assert hits[0]["keyword_match"] is True

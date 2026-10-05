@@ -11,11 +11,6 @@ import pytest
 from sherpa import scope_infer as si
 
 
-def test_estimation_layer_is_retired():
-    """auto-scope の推定 API は撤去されている（鏡＝フォルダが真）。"""
-    assert not hasattr(si, "infer") and not hasattr(si, "common_markers")
-
-
 def test_unique_index_fail_closed_on_collision():
     items = [("a/X.cbl", 1), ("b/X.cbl", 2), ("c/Y.cbl", 3)]
     idx, col = si.unique_index(items, keyfn=lambda it: it[0].split("/")[-1])

@@ -9,6 +9,7 @@ import pytest
 from playwright.sync_api import expect
 
 from mock_api import CONVERSATIONS_LIST, install_api_mocks
+from _admin_page import goto_admin_settings
 
 
 def _contrast(foreground, background):
@@ -20,21 +21,26 @@ def _contrast(foreground, background):
     return (b + .05) / (a + .05)
 
 
+def _text_contrast(locator, target='el'):
+    colors = locator.evaluate(f'(el) => [getComputedStyle({target}).color, getComputedStyle(el).backgroundColor]')
+    return _contrast(*colors)
+
+
+def _use_theme(page, theme):
+    page.add_init_script(f"localStorage.setItem('sherpa-theme', '{theme}')")
+
+
 @pytest.mark.parametrize('theme', ['light', 'dark'])
 def test_action_surfaces_keep_readable_text_in_both_themes(page, web_base_url, theme):
     install_api_mocks(page)
-    page.add_init_script(f"localStorage.setItem('sherpa-theme', '{theme}')")
+    _use_theme(page, theme)
     page.goto(f"{web_base_url}/chat.html")
     page.locator('#input').fill('根拠を確認したい')
     page.locator('#send').click()
     expect(page.locator('#messages .sources')).to_be_visible()
-    bubble = page.locator('.bubble-user').last
-    colors = bubble.evaluate('(el) => [getComputedStyle(el).color, getComputedStyle(el).backgroundColor]')
-    assert _contrast(*colors) >= 4.5
-    page.goto(f"{web_base_url}/admin-settings.html")
-    button = page.locator('#save')
-    colors = button.evaluate('(el) => [getComputedStyle(el).color, getComputedStyle(el).backgroundColor]')
-    assert _contrast(*colors) >= 4.5
+    assert _text_contrast(page.locator('.bubble-user').last) >= 4.5
+    goto_admin_settings(page, web_base_url)
+    assert _text_contrast(page.locator('#save')) >= 4.5
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
@@ -42,7 +48,7 @@ def test_action_surfaces_keep_readable_text_in_both_themes(page, web_base_url, t
                                        ("大", "18px"), ("特大", "20px"), ("未知値", "16px")])
 def test_chat_font_choice_survives_reload_and_theme(page, web_base_url, theme, saved, size):
     install_api_mocks(page)
-    page.add_init_script(f"localStorage.setItem('sherpa-theme', {json.dumps(theme)});")
+    _use_theme(page, theme)
     if saved is not None:
         page.add_init_script(f"localStorage.setItem('sherpa-chatfont', {json.dumps(saved)});")
     page.goto(f"{web_base_url}/chat.html")
@@ -105,7 +111,8 @@ def test_history_menu_reserves_title_and_keeps_open_action_separate(page, web_ba
     assert len(opened) == 1
 
 
-def test_history_rename_pin_delete_keep_requests_and_focus(page, web_base_url):
+def test_history_actions_keep_requests_and_focus(page, web_base_url):
+    """会話の補助操作（共有・名前変更・ピン留め・削除）は会話を開かず、リクエストとフォーカスの戻りを保つ。"""
     install_api_mocks(page)
     conversations = [dict(c) for c in CONVERSATIONS_LIST]
     calls = []
@@ -114,9 +121,7 @@ def test_history_rename_pin_delete_keep_requests_and_focus(page, web_base_url):
     def mutate(route):
         req = route.request
         calls.append((req.method, urlparse(req.url).path, req.post_data_json))
-        if req.method == "PATCH":
-            conversations[0].update(req.post_data_json)
-        elif req.method == "POST":
+        if req.method in ("PATCH", "POST"):
             conversations[0].update(req.post_data_json)
         elif req.method == "DELETE":
             conversations.pop(0)
@@ -129,6 +134,21 @@ def test_history_rename_pin_delete_keep_requests_and_focus(page, web_base_url):
     page.on('dialog', lambda d: d.accept('新しい名前') if d.type == 'prompt' else d.accept())
     page.goto(f"{web_base_url}/chat.html")
     trigger = page.locator('[data-conv-menu="101"]')
+    trigger.click()
+    page.locator('[data-sharecid="101"]').focus()
+    page.keyboard.press("Enter")
+    expect(page.locator('#share-overlay')).to_be_visible()
+    expect(page.locator('#share-invitees')).to_be_focused()
+    page.evaluate("async () => { const history = await import('./chat/history.js'); await history.loadConversations(); }")
+    page.keyboard.press("Escape")
+    expect(page.locator('#share-overlay')).to_be_hidden()
+    expect(trigger).to_be_focused()
+    # 受領共有の操作は従来通り pin/delete だけ
+    page.locator('[data-conv-menu="202"]').click()
+    menu = page.locator('#conv-actions-202')
+    expect(menu.locator('button')).to_have_count(2)
+    expect(menu.locator('[data-rename], [data-sharecid]')).to_have_count(0)
+    page.keyboard.press("Escape")
     trigger.click()
     page.locator('[data-rename="101"]').click()
     expect(page.locator('[data-open="101"] .t')).to_have_text('新しい名前')
@@ -146,26 +166,6 @@ def test_history_rename_pin_delete_keep_requests_and_focus(page, web_base_url):
                      ('DELETE', '/conversations/101', None)]
 
 
-def test_history_share_dialog_keyboard_returns_to_trigger(page, web_base_url):
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/chat.html")
-    trigger = page.locator('[data-conv-menu="101"]')
-    trigger.click()
-    page.locator('[data-sharecid="101"]').focus()
-    page.keyboard.press("Enter")
-    expect(page.locator('#share-overlay')).to_be_visible()
-    expect(page.locator('#share-invitees')).to_be_focused()
-    page.evaluate("async () => { const history = await import('./chat/history.js'); await history.loadConversations(); }")
-    page.keyboard.press("Escape")
-    expect(page.locator('#share-overlay')).to_be_hidden()
-    expect(trigger).to_be_focused()
-    # 受領共有の操作は従来通り pin/delete だけ。
-    page.locator('[data-conv-menu="202"]').click()
-    menu = page.locator('#conv-actions-202')
-    expect(menu.locator('button')).to_have_count(2)
-    expect(menu.locator('[data-rename], [data-sharecid]')).to_have_count(0)
-
-
 def test_history_more_is_available_on_touch(browser, web_base_url):
     context = browser.new_context(viewport={"width": 1280, "height": 800}, has_touch=True)
     page = context.new_page()
@@ -180,12 +180,12 @@ def test_history_more_is_available_on_touch(browser, web_base_url):
 
 def test_admin_vertical_tabs_manual_activation_and_hidden_items(page, web_base_url):
     install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html")
+    goto_admin_settings(page, web_base_url)
     tabs = page.locator('#admin-tabs')
     expect(tabs).to_have_attribute('aria-orientation', 'vertical')
     page.locator('[data-tab="provider"]').focus()
     page.keyboard.press('ArrowDown')
-    expect(page.locator('[data-tab="models"]')).to_be_focused()
+    expect(page.locator('[data-tab="research"]')).to_be_focused()
     expect(page.locator('[data-tab="provider"]')).to_have_attribute('aria-selected', 'true')
     expect(page.locator('#embed-frame-users')).not_to_have_attribute('src', re.compile('.+'))
     page.keyboard.press('End')
@@ -203,20 +203,16 @@ def test_admin_vertical_tabs_manual_activation_and_hidden_items(page, web_base_u
     page.keyboard.press('Home')
     page.keyboard.press('Enter')
     expect(page.locator('#tabpanel-provider')).to_be_visible()
-    page.locator('[data-tab="usage"]').click()
-    expect(page.locator('[data-tab="usage"]')).to_contain_text('利用統計の AI')
-    assert page.url.endswith('#usage')
-    expect(page.locator('#tabpanel-usage')).to_have_attribute('aria-labelledby', 'tab-btn-usage')
 
 
 @pytest.mark.parametrize('theme', ['light', 'dark'])
 @pytest.mark.parametrize('height', [300, 400, 450])
 def test_admin_iframe_theme_and_low_viewport_do_not_overlap_save(page, web_base_url, theme, height):
     install_api_mocks(page)
-    page.add_init_script(f"localStorage.setItem('sherpa-theme', '{theme}')")
+    _use_theme(page, theme)
     page.set_viewport_size({'width': 640, 'height': height})
-    page.goto(f"{web_base_url}/admin-settings.html")
-    page.locator('#depth-base-max-turns').fill('21')
+    goto_admin_settings(page, web_base_url)
+    page.locator('#chat-max-turns-per-user').fill('12')
     expect(page.locator('#unsaved-note')).to_be_visible()
     expect(page.locator('#admin-tabs')).to_have_css('position', 'static')
     nav, panel = page.locator('#admin-tabs').bounding_box(), page.locator('.admin-panels').bounding_box()
@@ -245,27 +241,33 @@ def test_admin_iframe_theme_and_low_viewport_do_not_overlap_save(page, web_base_
                                         ('audit', 'audit'), ('status', 'status')])
 def test_admin_embed_keeps_standalone_breadcrumb_and_reaches_end(page, web_base_url, theme, key, filename):
     install_api_mocks(page)
-    page.add_init_script(f"localStorage.setItem('sherpa-theme', '{theme}')")
+    _use_theme(page, theme)
     page.set_viewport_size({'width': 640, 'height': 400})
     page.goto(f'{web_base_url}/{filename}.html')
     expect(page.locator('.crumb')).to_be_visible()
-    page.goto(f'{web_base_url}/admin-settings.html')
+    goto_admin_settings(page, web_base_url)
     page.locator('[data-tab="' + key + '"]').click()
     frame = page.locator('#embed-frame-' + key)
     child = page.frame_locator('#embed-frame-' + key)
     expect(child.locator('h1')).to_be_visible()
     expect(child.locator('.crumb')).to_be_hidden()
+    if key == 'usage-page':
+        child.locator('[data-usage-tab="tokens"]').click()   # 表は既定では隠れたトークンのタブパネルにある
     rows = {'users': '#user-tbody tr', 'usage-page': '#token-user-tbody tr',
             'audit': '#audit-tbody tr', 'status': '#health-tbody tr'}
     expect(child.locator(rows[key]).first).to_be_visible()
     # 実際の末尾の操作をキーボードでフォーカスし、親子のスクロールと重なりを確認する。
-    last = child.locator('.wrap').locator(
-        'button:visible:enabled, a:visible, input:visible:enabled, select:visible:enabled, textarea:visible:enabled').last
-    last.focus()
-    expect(last).to_be_focused()
-    last.click(trial=True)
+    if key == 'usage-page':
+        # トークンのタブパネルは表だけで末尾に操作が無い。タブ列のキー操作と衝突しないよう本文へフォーカスを移す。
+        child.locator('h1').click()
+    else:
+        last = child.locator('.wrap').locator(
+            'button:visible:enabled, a:visible, input:visible:enabled, select:visible:enabled, textarea:visible:enabled').last
+        last.focus()
+        expect(last).to_be_focused()
+        last.click(trial=True)
     page.keyboard.press('Control+End')
-    page.frame(url=f'{web_base_url}/{filename}.html?embed=1').wait_for_function(
+    page.frame(url=re.compile(re.escape(f'{web_base_url}/{filename}.html?embed=1') + '(#.*)?$')).wait_for_function(
         'scrollY + innerHeight >= document.documentElement.scrollHeight - 1')
     box, save = frame.bounding_box(), page.locator('#save-bar').bounding_box()
     assert box['y'] + box['height'] <= save['y']
@@ -276,27 +278,23 @@ def test_admin_embed_keeps_standalone_breadcrumb_and_reaches_end(page, web_base_
 @pytest.mark.parametrize('theme', ['light', 'dark'])
 def test_selected_history_and_login_error_text_contrast(page, web_base_url, theme):
     install_api_mocks(page, login_status=401)
-    page.add_init_script(f"localStorage.setItem('sherpa-theme', '{theme}')")
+    _use_theme(page, theme)
     page.goto(f'{web_base_url}/chat.html')
     page.locator('[data-open="101"] .cmain').click()
     selected = page.locator('.conv.on')
     expect(selected).to_be_visible()
-    colors = selected.evaluate('''(el) => [
-        getComputedStyle(el.querySelector('.d')).color, getComputedStyle(el).backgroundColor
-    ]''')
-    assert _contrast(*colors) >= 4.5
+    assert _text_contrast(selected, "el.querySelector('.d')") >= 4.5
     page.goto(f'{web_base_url}/login.html')
     page.locator('#username').fill('unknown')
     page.locator('#password').fill('bad')
     page.locator('#submit').click()
     expect(page.locator('#err')).to_be_visible()
-    colors = page.locator('#err').evaluate('(el) => [getComputedStyle(el).color, getComputedStyle(el).backgroundColor]')
-    assert _contrast(*colors) >= 4.5
+    assert _text_contrast(page.locator('#err')) >= 4.5
 
 
 def test_admin_first_iframe_after_theme_switch_uses_current_theme(page, web_base_url):
     install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html")
+    goto_admin_settings(page, web_base_url)
     page.locator('#themebtn').click()
     page.locator('[data-tab="users"]').click()
     expect(page.frame_locator('#embed-frame-users').locator('html')).to_have_attribute('data-theme', 'dark')
@@ -304,17 +302,17 @@ def test_admin_first_iframe_after_theme_switch_uses_current_theme(page, web_base
 
 def test_admin_dirty_state_survives_tabs_and_save_failure(page, web_base_url):
     records = install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    page.locator('#depth-base-max-turns').fill('21')
+    goto_admin_settings(page, web_base_url)
+    page.locator('#chat-max-turns-per-user').fill('12')
     expect(page.locator('#tab-dot-provider')).to_be_visible()
     expect(page.locator('#unsaved-note')).to_be_visible()
     page.locator('[data-tab="ingest"]').click()
     page.locator('#arms-list input[data-arm="pdf_text"]').uncheck()
     expect(page.locator('#tab-dot-ingest')).to_be_visible()
     page.locator('[data-tab="provider"]').click()
-    page.locator('#depth-base-max-turns').fill('')
+    page.locator('#chat-max-turns-per-user').fill('')
     expect(page.locator('#tab-dot-provider')).to_be_hidden()
-    page.locator('#depth-base-max-turns').fill('21')
+    page.locator('#chat-max-turns-per-user').fill('12')
 
     def reject_save(route):
         assert route.request.method == 'PUT'
@@ -323,11 +321,11 @@ def test_admin_dirty_state_survives_tabs_and_save_failure(page, web_base_url):
     page.route('**/admin/settings', reject_save)
     page.locator('#save').click()
     expect(page.locator('#msg')).to_contain_text('保存に失敗')
-    expect(page.locator('#depth-base-max-turns')).to_have_value('21')
+    expect(page.locator('#chat-max-turns-per-user')).to_have_value('12')
     expect(page.locator('#tab-dot-provider')).to_be_visible()
     expect(page.locator('#tab-dot-ingest')).to_be_visible()
     page.unroute('**/admin/settings', reject_save)
     page.locator('#save').click()
     expect(page.locator('#msg')).to_contain_text('保存しました')
-    assert records['admin_settings_put'][-1]['depth_base_max_turns'] == 21
+    assert records['admin_settings_put'][-1]['chat_max_turns_per_user'] == 12
     assert records['admin_settings_put'][-1]['arms_enabled'] == ['ooxml']

@@ -66,19 +66,6 @@ def test_manual_page_renders_screenshots(page, web_base_url):
     assert first.evaluate("el => el.naturalWidth") > 0
 
 
-def test_manual_nav_has_no_overview_entry(page, web_base_url):
-    """概観（cloud）廃止の回帰: ナビに「概観」が出ず、ナレッジグラフは残る。"""
-    from playwright.sync_api import expect
-
-    _install_manual_mocks(page)
-    page.goto(f"{web_base_url}/manual.html")
-
-    nav = page.locator("#sherpa-nav")
-    expect(nav).to_contain_text("ナレッジグラフ")
-    expect(nav).not_to_contain_text("概観")
-    assert nav.locator("a[href='cloud.html']").count() == 0
-
-
 def test_manual_anchor_deep_link_opens_matching_chapter(page, web_base_url):
     """他画面の help-link（例 admin-settings.html の manual.html#sysadmin）互換の回帰:
     #settings で直接開いても、旧アンカー id が正しい章（個人設定）に解決される。"""

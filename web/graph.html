@@ -11,9 +11,7 @@
 <script src="common.js"></script>
 <script src="nav.js"></script>
 <style>
-  /* admin ガード（CLEAN-1・2026-09-03・W1 の残・同型是正）: この画面のデータ（`/graph`・
-     `/graph/facets`・`/graph/search`・`POST /graph/ask`）は全て admin 限定 API に依存する。
-     ingest.html（W1）/ admin-settings.html と同じ「非 admin は access-denied だけ見せる」パターン。 */
+  /* admin ガード: この画面のデータ（`/graph`・`/graph/facets`・`/graph/search`）は全て admin 限定 API に依存するため、非 admin は access-denied だけ見せる。 */
   #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
 </style>
 </head>
@@ -83,12 +81,6 @@
       <div id="legtypes"></div>
       <button type="button" class="legrow ftog gdep" data-fdep="1" aria-pressed="false">廃止・未使用の疑いを隠す</button>
       <p class="leg-help">色は種別、矢印は依存の向きです。全体図では、つながりの多い要素を中央に配置します。線の名前は要素を選ぶと表示されます。</p>
-    </section>
-    <section>
-      <h2><label for="gask">ナレッジ状況に質問</label></h2>
-      <textarea class="gask" id="gask" rows="3" placeholder="例: このナレッジベースはどこが弱い？"></textarea>
-      <button class="btn-secondary gaskbtn" id="gaskbtn">質問</button>
-      <div class="ganswer" id="ganswer"></div>
     </section>
     <a class="help-link" href="ingest.html">資料の取り込み状況</a>
   </aside>

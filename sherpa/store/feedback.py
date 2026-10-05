@@ -1,14 +1,11 @@
 """回答ごとの利用者フィードバック（`message_feedback`）。
-
-投稿は会話の所有者のみ（認可判定は `conversations.py::owns_assistant_message` 側）。1利用者×
-1メッセージにつき最新1件のみ保持する（同一ペアの再送は上書き）。質問/回答本文はここに複製しない
-（`message_id` で `messages` を参照するだけ）。
+1利用者×1メッセージにつき最新1件のみ保持する（再送は上書き）。本文は複製せず `message_id` で参照する。投稿の認可は呼び出し側（`conversations.py::owns_assistant_message`）。
 """
 from __future__ import annotations
 
 from .db import _connect, _ensure
 
-# 定型タグの閉じた語彙（画面文言は日本語ラベル・値はこの英語スラッグで保存する）。
+# 定型タグの閉じた語彙（保存値は英語スラッグ）。
 MESSAGE_FEEDBACK_TAGS = ("wrong_evidence", "incomplete", "outdated", "slow")
 
 # 一言コメントの文字数上限。
@@ -32,9 +29,7 @@ def upsert_message_feedback(message_id: int, user_id: str, rating: str,
 
 
 def get_feedback_by_message_ids(ids: list[int]) -> dict[int, dict]:
-    """message_id → フィードバック辞書（改善ログエクスポート/管理者チャット集計の一括 join 専用）。
-    1メッセージにつき最新（created_at 降順）の1件を返す。
-    """
+    """message_id → フィードバック辞書（改善ログ・管理者集計の一括 join 用）。1メッセージにつき最新1件。"""
     if not ids:
         return {}
     _ensure()
@@ -49,10 +44,7 @@ def get_feedback_by_message_ids(ids: list[int]) -> dict[int, dict]:
 
 
 def get_feedback_by_message_ids_for_user(ids: list[int], user_id: str) -> dict[int, dict]:
-    """message_id → `user_id` 自身のフィードバック辞書（会話履歴の復元表示専用）。
-    `message_feedback` は `(message_id, user_id)` に UNIQUE 制約があるため、この絞り込みで
-    1メッセージにつき高々1件になる。他人のフィードバックは返さない。
-    """
+    """message_id → `user_id` 自身のフィードバック辞書（会話履歴の復元表示用・他人のものは返さない）。"""
     if not ids:
         return {}
     _ensure()

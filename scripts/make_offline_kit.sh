@@ -43,6 +43,7 @@
 #       --skip-libreoffice --skip-docker-engine --skip-python-system --skip-ocr
 #                                                      # marp/LibreOffice/Docker Engine 等を除外（サイズ削減）
 set -euo pipefail
+[ "$(uname -s)" = "Linux" ] || { echo "このスクリプトは Linux 専用です（閉域キットの収集は apt・dpkg・docker を使います）。macOS では使えません。" >&2; exit 2; }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -232,7 +233,7 @@ _validate_base_closure_packages "$BASE_CLOSURE_PACKAGES" || exit 1
 # 違うと正しい閉包にならない。docker のある機体での収集を引き続き推奨する・呼び出し側で警告表示する）。
 _apt_collect_base_closure_fallback() {  # $1=dest_dir（$OUT/base/debs）
   local dest_dir="$1" cache_dir
-  cache_dir="$(mktemp -d)"
+  cache_dir="$(mktemp -d "${TMPDIR:-/tmp}/sherpa.XXXXXX")"
   mkdir -p "$cache_dir/archives/partial" "$dest_dir"
   sudo apt-get update
   # shellcheck disable=SC2046
@@ -427,6 +428,33 @@ _check_python_version_match() {  # $1=収集に使う python の major.minor
 # （端末の Python 版に依存しない＝閉域側の python3 と必ず同じ major.minor になる）。SHERPA_WHEELS_IN_CONTAINER=0
 # で端末の $PY を使う旧経路（このときは上の版照合が必須）。
 # $1=requirements ファイル（$ROOT からの相対） $2=constraints（同・空なら無し） $3=出力先ディレクトリ
+# Tree-sitter（本体＋文法 8 種）はビルド不要のホイールだけを集める（sdist だと閉域でコンパイルが要る）。
+# 全体をホイール限定にはせず（他の依存が壊れうる）、対象のパッケージ名だけに掛ける。
+TS_PACKAGES="tree-sitter tree-sitter-java tree-sitter-c-sharp tree-sitter-c tree-sitter-javascript tree-sitter-bash tree-sitter-css tree-sitter-embedded-template"
+_ts_only_binary() { echo "${TS_PACKAGES// /,}"; }
+
+# 収集した wheels に Tree-sitter の 8 パッケージのホイールが対象タグ（収集に使った Python の cpXY・manylinux x86_64）で
+# 揃い（版は constraints.txt の固定版と一致）、sdist が混じっていないことを確かめる。
+# $1=wheels ディレクトリ $2=constraints.txt（省略時は $ROOT/constraints.txt）。
+_check_ts_wheels() {
+  local d="$1" cons="${2:-$ROOT/constraints.txt}" pyv mm tag pkg norm n ver bad=0
+  pyv="$(sed -n 's/^Python \([0-9]*\.[0-9]*\).*/\1/p' "$d/COLLECTED-WITH-PYTHON-VERSION.txt" 2>/dev/null | head -1)"
+  [ -n "$pyv" ] || { fail "$d/COLLECTED-WITH-PYTHON-VERSION.txt から Python の版を読めません（Tree-sitter ホイールの検査不能）。"; return 1; }
+  tag="cp${pyv/./}"
+  for pkg in $TS_PACKAGES; do
+    norm="${pkg//-/_}"
+    ver="$(sed -n "s/^${pkg}==\([^ #]*\).*/\1/p" "$cons" | head -1)"
+    if [ -z "$ver" ]; then fail "$cons に $pkg の固定版（==）がありません"; bad=1; continue; fi
+    n="$(cd "$d" && ls -1 "${norm}-${ver}-"*.whl 2>/dev/null | grep -E 'manylinux.*x86_64' | grep -Ec "(${tag}-${tag}|abi3)" || true)"
+    if [ "$n" -lt 1 ]; then fail "Tree-sitter のホイールが対象タグ（${tag}・manylinux x86_64・版 ${ver}）でありません: $pkg"; bad=1; fi
+    if [ -n "$(cd "$d" && ls -1 "${norm}-"[0-9]*.tar.gz "${norm}-"[0-9]*.zip "${pkg}-"[0-9]*.tar.gz "${pkg}-"[0-9]*.zip 2>/dev/null | head -1)" ]; then
+      fail "Tree-sitter の sdist が混じっています: $pkg"; bad=1
+    fi
+  done
+  [ "$bad" = 0 ] || return 1
+  ok "Tree-sitter 8 パッケージのホイールが揃っています（${tag}・manylinux x86_64・sdist なし）"
+}
+
 _pip_download_wheels() {
   local req="$1" cons="${2:-}" dest="$3" cons_opt=()
   mkdir -p "$dest"
@@ -439,13 +467,13 @@ _pip_download_wheels() {
       apt-get update -qq >/dev/null
       apt-get install -y -qq python3 python3-pip >/dev/null
       python3 --version > /out/COLLECTED-WITH-PYTHON-VERSION.txt 2>&1
-      python3 -m pip download --disable-pip-version-check -r '/src/$req' ${cons_opt[*]} -d /out
+      python3 -m pip download --disable-pip-version-check --only-binary '$(_ts_only_binary)' -r '/src/$req' ${cons_opt[*]} -d /out
       chown -R $(id -u):$(id -g) /out
     " || return $?
   else
     [ -n "$cons" ] && cons_opt=(-c "$ROOT/$cons")
     "$PY" --version > "$dest/COLLECTED-WITH-PYTHON-VERSION.txt" 2>&1 || true
-    "$PY" -m pip download -r "$ROOT/$req" "${cons_opt[@]}" -d "$dest" || return $?
+    "$PY" -m pip download --only-binary "$(_ts_only_binary)" -r "$ROOT/$req" "${cons_opt[@]}" -d "$dest" || return $?
   fi
 }
 
@@ -453,7 +481,7 @@ _pip_download_wheels() {
 # システムの /var/cache/apt/archives を汚さないよう Dir::Cache::Archives を一時ディレクトリへ差し替える。
 _apt_collect_debs_fallback() {
   local packages="$1" dest_dir="$2" cache_dir
-  cache_dir="$(mktemp -d)"
+  cache_dir="$(mktemp -d "${TMPDIR:-/tmp}/sherpa.XXXXXX")"
   mkdir -p "$cache_dir/archives/partial" "$dest_dir"
   if sudo apt-get -o "Dir::Cache::Archives=$cache_dir/archives" install --download-only -y $packages; then
     find "$cache_dir/archives" -maxdepth 1 -name '*.deb' -exec cp -f {} "$dest_dir/" \;
@@ -536,6 +564,7 @@ if [ "$FETCH" = 1 ]; then
     fail "$OUT/wheels/ に *.whl が1つもありません（pip download 成功後にこれは異常です）。"
     exit 1
   fi
+  _check_ts_wheels "$OUT/wheels" || exit 1
   # RV HIGH（2026-07-15 2巡目）: 通常ファイル以外（シンボリックリンク・ディレクトリ等）は manifest に
   # 載せられず install 側の未掲載検出で必ず fail になるため、収集時点で拒否する（pip download は
   # 通常ファイルしか書かない＝これが出たら収集環境の異常）。
@@ -795,7 +824,7 @@ if [ "$FETCH" = 1 ] && [ "$SKIP_CHROMIUM" != 1 ]; then
   reset_dir "$OUT/chromium"
   # M1: Ubuntu 24.04 は PEP 668（externally-managed-environment）でシステム Python に直接
   # pip install できないため、使い捨ての一時 venv に playwright を入れる。
-  PW_VENV="$(mktemp -d)"
+  PW_VENV="$(mktemp -d "${TMPDIR:-/tmp}/sherpa.XXXXXX")"
   note "一時 venv に playwright を導入します: $PW_VENV"
   "$PY" -m venv "$PW_VENV"
   "$PW_VENV/bin/python" -m pip install --quiet --upgrade pip playwright

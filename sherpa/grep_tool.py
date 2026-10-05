@@ -1,15 +1,11 @@
-"""直接 grep ツール（read-only・鏡モデル）。
-
-world（登録ディレクトリ）の**1つのフォルダ木**を行単位で全文検索し、根拠つき（`doc_id`＝**rel_path**＋`span`）
-のヒットを返す。RAG（ES/Neo4j）を経由しない素の grep 経路で、別レンズ（仕様問い合わせ qa／
-トラブルシュート troubleshoot）の材料を集める。`doc_id`＝world root 相対パス（グラフの来歴・DL キーと一致・§2.2）。
-特定テーマの名前はコードに持たない（検索語は入力から）。個人 workspace も対象になり得るが MVP は共有 KB のみ。
+"""直接 grep ツール（read-only）。world の 1 つのフォルダ木を行単位で全文検索し、根拠つき（`doc_id`＝rel_path＋`span`）のヒットを返す。
+RAG（ES/Neo4j）を経由しない素の grep 経路。`doc_id` は world root 相対パス（グラフの来歴・DL キーと一致）。
+設計: docs/design/rag.md「読み取り部品の道具」
 """
 from __future__ import annotations
 
 import heapq
 import logging
-import os
 import re
 import time
 from collections import deque
@@ -18,109 +14,58 @@ from pathlib import Path
 from . import layer as layer_mod
 from . import text_encoding
 from .doc_kinds import CODE_EXT
+from .env_int import env_int
 from .ingest import text_kind
 
 _log = logging.getLogger("sherpa")
 
-# 決定的MD（Office/PDF 由来）とソース原文（cobol/jcl/copybook）。grep は両方を対象にする。
+# 決定的 MD（Office/PDF 由来）とソース原文。grep は両方を対象にする。
 _MD_EXT = {".md", ".markdown"}
-# Evidence IR 由来の検索向け Markdown（`sherpa/ingest/evidence_render.py::render`）。
+# Evidence IR 由来の検索向け Markdown（`ingest/evidence_render.py::render`）。
 _RAG_SUFFIX = ".rag.md"
-# OCR 観測の本文ファイル名（`sherpa/ingest/observation_render.py::artifact_paths`）。
+# OCR 観測の本文ファイル名の接尾辞。
 _OBSERVATION_SUFFIX = ".rag_observations.md"
-# 拡張子だけで確実にテキストと分かる集合（`doc_kinds.CODE_EXT`＝登録拡張子の和集合＋MD/テキスト＋
-# 軽量テキスト枠の第1段拡張子マップ）。この集合の所属だけで「コード」とも「対象外」とも見なさない
-# ——`.txt` はコード判定の対象外（プレーンテキスト＝どちらでもない）だがここでは従来どおり grep
-# 対象。「コードか資料か・読めるか」の最終確定は常に `grep_search` 本体の
-# `corpus_docs.classify_document` 呼び出しに集約する（§7 裁定10）。この集合**に無い**拡張子
-# （未登録拡張子・拡張子なし＝軽量テキスト枠の第2段）も走査候補からは除外しない——`grep_search`
-# は全ファイルへ同じ `classify_document` 呼び出し（1ファイルにつき1回・先頭数KBのみ読む）を行い、
-# 内容が実際にテキストと判定できるかで可否を決める（拡張子の閉じた許可リストでは決めない）。
+# 拡張子だけで確実にテキストと分かる集合。この集合の所属だけで「コード」とも「対象外」とも見なさない。
+# コードか資料か・読めるかの最終確定は `grep_search` 本体の `corpus_docs.classify_document` に集約する。
+# 集合に無い拡張子（未登録・拡張子なし）も走査候補から除外せず、内容がテキストと判定できるかで決める。
 _TEXT_EXT = _MD_EXT | CODE_EXT | {".txt"} | text_kind.CODE_EXT | text_kind.DOCUMENT_EXT
 
-# world 識別子は英数字＋限定記号のみ（`/`・`..` を含めない＝パストラバーサル防止）。
-_WORLD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")   # fullmatch 専用（^/$ アンカー不要）
+# world 識別子は英数字＋限定記号のみ（`/`・`..` 不可）。
+_WORLD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")  # fullmatch 専用
 
 
-def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """security-limit 系 env の整数解析（`agentic_search._env_int` と同型）。
-
-    `agentic_search` は本モジュールを import する側（`from . import ... grep_tool ...`）のため、
-    ここで `agentic_search` を import すると循環 import になる。同じ検証ロジック（範囲外・非整数・
-    負値は既定へ、既定値自体も [lo, hi] にクランプ）を独立実装する。
-    """
-    default = max(lo, min(default, hi))
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return v if lo <= v <= hi else default
-
-
-# `_GREP_FILE_CAP_BYTES`（1ファイルの走査上限）: `grep_search` は1ファイルを bounded chunk
-# （`_SCAN_CHUNK_BYTES`）で`_CappedStreamReader`によりストリーミング走査し、保持するメモリは
-# 「現在の窓」と「ヒット節を復元する最小限の状態」（MD なら直近の見出し行とその行番号・その節の
-# 引用テキストは `_GREP_HIT_TEXT_MAX_BYTES` で頭打ち）だけに限定される——`_GREP_FILE_CAP_BYTES` の
-# 大きさにもファイル実サイズにも比例しない。この定数自体はメモリ安全弁ではなく、1ファイルに
-# かける走査コスト・時間の安全弁として残る。既定値は範囲上限まで引き上げてあり、実運用の
-# 10MB〜100MB 級文書をできるだけ cap 無しで検索できるようにする。
-_GREP_FILE_CAP_BYTES = _env_int("SHERPA_GREP_FILE_CAP_BYTES", 64 * 1024 * 1024, 65536, 64 * 1024 * 1024)
-# MD の見出し節引用は `_section()` が節全体を返すため、見出しのない巨大 MD だと1ヒットが文書全体に
-# なり得る（`max_hits` との掛け算でヒットリスト自体も肥大）。ヒット1件あたりの引用テキストを
-# UTF-8 バイト上限でクリップする（`agentic_search._clip_utf8_bytes` と同じセマンティクス）。
-_GREP_HIT_TEXT_MAX_BYTES = _env_int("SHERPA_GREP_HIT_TEXT_MAX_BYTES", 64 * 1024, 1024, 8 * 1024 * 1024)
+# 1 ファイルの走査上限（バイト）。`_CappedStreamReader` が bounded chunk でストリーミング走査するため、メモリはこの値にもファイル実サイズにも比例しない。
+# 走査コスト・時間の安全弁。
+_GREP_FILE_CAP_BYTES = env_int("SHERPA_GREP_FILE_CAP_BYTES", 64 * 1024 * 1024, 65536, 64 * 1024 * 1024)
+# MD の見出し節引用は節全体になり得るため、ヒット 1 件あたりの引用テキストを UTF-8 バイト上限でクリップする。
+_GREP_HIT_TEXT_MAX_BYTES = 64 * 1024
 
 
 def _clip_utf8_bytes(s: str, max_bytes: int) -> str:
-    """UTF-8 エンコード後のバイト数が `max_bytes` を超えないよう `s` を切り詰める
-    （`agentic_search._clip_utf8_bytes` と同型・マルチバイト文字の境界破壊を避ける）。
-    """
+    """UTF-8 のバイト数が `max_bytes` を超えないよう `s` を切り詰める（マルチバイト文字の境界を壊さない）。"""
     b = s.encode("utf-8")
     if len(b) <= max_bytes:
         return s
     return b[:max_bytes].decode("utf-8", errors="ignore")
 
 
-# ストリーミング走査（本丸・2026-09）: `_GREP_FILE_CAP_BYTES`（最大64MiB）自体を一括ロードすると、
-# 既定を引き上げた意味が薄れる（cap の大きさに比例したメモリを毎ファイル消費する）。以下は
-# bounded chunk（`_SCAN_CHUNK_BYTES`・cap にもファイル実サイズにも依存しない固定値）で読み、
-# 改行区切りの行を順に yield するリーダー。境界セマンティクス（1 byte 余分に読んで「ちょうど cap」
-# と「cap 超過」を区別する・cap で切れた中途行は破棄する）は旧 `f.read(cap + 1)` 一括ロードと同じ。
+# ストリーミング走査の読み取り単位（バイト）。cap にもファイル実サイズにも依存しない。
 _SCAN_CHUNK_BYTES = 64 * 1024
-# 改行が来ないまま伸び続ける単一行（`agentic_search` の単一行対策と同種の懸念）で
-# 保持バイト数が増え続けないための、1行あたりの保持上限。cap 内であっても、この上限を超えた行は
-# 内容の一部を破棄しつつ次の改行まで読み進める（行番号の同期は保つ）。
-#
-# env 化（2026-09・read 側のストリーミング化に合わせて）: `agentic_search`（read_around/read_doc/
-# doc_outline）も本モジュールの `_CappedStreamReader`/`_logical_lines` をそのまま再利用するが、
-# 1行あたりの保持上限は `_GREP_FILE_CAP_BYTES`/`SHERPA_READ_AROUND_FILE_CAP_BYTES` と同じ「経路
-# ごとに別 env」の流儀に揃え、read 側は独立の env（`SHERPA_READ_LINE_MAX_BYTES`・既定値・許容
-# 範囲は揃える）で調整できるようにする——`_CappedStreamReader` 自体は `line_max_bytes` を
-# 呼び出し元から差し込める（省略時だけこの既定を使う）。
-_GREP_LINE_MAX_BYTES = _env_int("SHERPA_GREP_LINE_MAX_BYTES", 2 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024)
+# 1 行あたりの保持上限（バイト）。改行が来ないまま伸びる単一行でメモリが増え続けないための上限で、超えた行は一部を破棄して次の改行まで読み進める（行番号の同期は保つ）。
+# read 側（`agentic_search`）は `_CappedStreamReader` に独立の定数（`_READ_LINE_MAX_BYTES`）を渡す。
+_GREP_LINE_MAX_BYTES = 2 * 1024 * 1024
 
-# 隣接ヒット窓の重複排除（`grep_search` 内 `seen`）に
-# 使う小さな有界窓。衝突が起こり得るのは常に直近の窓どうしだけ（`grep_search` 内コメント参照）
-# のため、ファイル内の全ヒット数に比例させる必要が無い——固定サイズの小さな `deque` で十分。
+# 隣接ヒット窓の重複排除（`grep_search` 内 `seen`）に使う小さな有界窓。重複が起こり得るのは直近の窓どうしだけ。
 _SEEN_RECENT_MAX = 16
 
 
 class _CappedStreamReader:
-    """open 済みバイナリファイル `f` を bounded chunk で読み、`cap` バイトまでの行
-    （改行を含まない生バイト列）を順に yield する。
-
-    メモリは `_SCAN_CHUNK_BYTES`・`_GREP_LINE_MAX_BYTES`・繰り越し中の未確定バイト列だけで
-    頭打ちになり、`cap` の大きさにもファイル実サイズにも比例しない。
-
-    属性は列挙の進行に伴って逐次更新され、呼び出し元は列挙の途中でも参照できる:
+    """open 済みバイナリファイル `f` を bounded chunk で読み、`cap` バイトまでの行（改行を含まない生バイト列）を順に yield する。
+    メモリは `_SCAN_CHUNK_BYTES`・`_GREP_LINE_MAX_BYTES`・繰り越し中の未確定バイト列だけで頭打ち。
+    属性は列挙の進行に伴って更新される:
     - `total_read`: これまでに読んだ総バイト数。
-    - `truncated`: `total_read > cap` になった時点で True（ちょうど cap のファイルを誤って
-      truncated 扱いしないための境界）。
-    - `line_overflowed`: 1行が `line_max_bytes`（既定 `_GREP_LINE_MAX_BYTES`）を超えて改行が
-      来ず、内容の一部を破棄したら True（探せていない範囲がある＝呼び出し元は打切りとして扱う）。
+    - `truncated`: `total_read > cap` になった時点で True（ちょうど cap のファイルは False）。
+    - `line_overflowed`: 1 行が `line_max_bytes` を超えて内容の一部を破棄したら True（探せていない範囲がある）。
     """
 
     def __init__(self, f, line_max_bytes: int | None = None):
@@ -128,10 +73,7 @@ class _CappedStreamReader:
         self.total_read = 0
         self.truncated = False
         self.line_overflowed = False
-        # `None`（省略）は「呼び出し時点の」`_GREP_LINE_MAX_BYTES` を使う（`__init__` 実行時に
-        # 解決＝テストの `monkeypatch.setattr(grep_tool, "_GREP_LINE_MAX_BYTES", ...)` は
-        # インスタンス生成より前に行われる限り効く）。呼び出し元（`agentic_search`）が独自の
-        # env（`SHERPA_READ_LINE_MAX_BYTES`）由来の値を渡せば、grep 側の設定とは独立に効く。
+        # `None` は呼び出し時点の `_GREP_LINE_MAX_BYTES` を使う（`__init__` 実行時に解決）。
         self._line_max_bytes = _GREP_LINE_MAX_BYTES if line_max_bytes is None else line_max_bytes
 
     def lines(self, cap: int):
@@ -155,9 +97,7 @@ class _CappedStreamReader:
                     break
                 line_bytes = data[start:nl]
                 if len(line_bytes) > line_max:
-                    # 改行までの距離が長くても、たまたま同じ chunk 内に収まっていれば `find()` は
-                    # 即座に見つかる——「複数 chunk にまたがる巨大行」だけでなく、この場合も
-                    # 一律に頭打ちにする（1行の保持上限はチャンク境界に依存しない）。
+                    # 同じ chunk 内で改行が見つかった場合も、1 行の保持上限を一律に適用する。
                     line_bytes = line_bytes[:line_max]
                     self.line_overflowed = True
                 yield line_bytes
@@ -167,31 +107,16 @@ class _CappedStreamReader:
                 tail = tail[:line_max]
                 self.line_overflowed = True
             carry = tail
-        # cap で打ち切られた場合、繰り越し中の未完の行（改行未到達）は行の途中で切れているため
-        # 丸ごと破棄する（既存仕様＝中途行を誤ヒットさせない）。cap に達さず自然に EOF に達した
-        # 場合は、繰り越し中の内容は正当な最終行（改行なしで終わるファイル）として残す。
+        # cap で打ち切られた場合、未完の行は丸ごと破棄する（中途行を誤ヒットさせない）。EOF に達した場合は最終行として残す。
         if carry and not self.truncated:
             yield carry
 
 
 def _logical_lines(reader, cap: int, encoding: str = "utf-8"):
-    """ストリーム読みの生バイト行（`\n` 区切り）→ **`str.splitlines()` と同一の論理行**の列。
-
-    行番号の定義は `str.splitlines()`（全体 decode → `splitlines()`）であり、read_around/read_doc も同じ
-    `splitlines()` で行を数える（`agentic_search.run_tool` の read_around/read_doc/doc_outline
-    分岐——`_stream_doc_lines` 経由で本関数を再利用する）。grep 側だけ `\n` 限定で
-    数えると、`\r` 単独・`\f`（改ページ＝COBOL/JCL リストに実在する）・`\x85`（NEL＝EBCDIC 変換由来）・
-    `\u2028` 等を含む文書で**ヒットの行番号と精読の行番号がズレ、引用と read_around が食い違う**。
-
-    `\n`（0x0A）は UTF-8/CP932 いずれのマルチバイト列の続きバイトにもなり得ないため
-    （`text_encoding` docstring 参照）、`\n` 区切りの生バイト行を個別に decode → `splitlines()`
-    した結果を連結すると、全体を decode → `splitlines()` した結果と完全に一致する（各セグメントは
-    `\n` を含まず、他の区切り文字はセグメント内で完結する）。空セグメント（連続改行）は空行1本として
-    数える（`"".splitlines()` は `[]` を返すため明示の補正）。
-
-    `encoding`（`text_encoding.detect_fd`/`detect_bytes` が返す判定結果）: `utf-8-sig` は先頭の BOM を
-    最初のセグメントでだけ落とす——全セグメントへ `utf-8-sig` を適用すると、文書中程に偶然 U+FEFF が
-    現れた場合（コピペ由来の BOM 等）まで誤って削ってしまう。
+    """ストリーム読みの生バイト行（`\n` 区切り）→ `str.splitlines()` と同一の論理行の列。
+    read_around/read_doc も `splitlines()` で行を数えるため、ヒットの行番号と精読の行番号が一致する。
+    `\n` 区切りの生バイト行を個別に decode → `splitlines()` して連結した結果は、全体を decode → `splitlines()` した結果と一致する。空セグメントは空行 1 本として数える。
+    `encoding` は `text_encoding` の判定結果。`utf-8-sig` は先頭セグメントでだけ BOM を落とす。
     """
     rest_encoding = "utf-8" if encoding == "utf-8-sig" else encoding
     first = True
@@ -202,30 +127,12 @@ def _logical_lines(reader, cap: int, encoding: str = "utf-8"):
 
 
 def valid_world(v: str) -> bool:
-    """world 識別子の許容文字。worlds/scope/api が共用する単一の検証。
-
-    `fullmatch()` を使う（`match()`＋`$` アンカーだと `$` が「末尾の改行の直前」にもマッチするため、
-    末尾に LF が付いた値を誤って通してしまう・X-Request-Id の検証で踏んだのと同じ抜け穴）。
-    """
+    """world 識別子の許容文字（worlds/scope/api が共用する単一の検証）。`fullmatch()` を使う（末尾の LF を通さない）。"""
     return bool(_WORLD_RE.fullmatch(v or ""))
 
 
-def rag_grep_enabled() -> bool:
-    """grep の検索対象・read_around の精読対象の双方が rag 表現（`{rel}.rag.md`）を優先するか。
-
-    常時 True（グローバルな系統切替トグル `SHERPA_SEARCH_RAG_GREP` は撤去済み・復活させない）。
-    呼び出し元は本関数の戻り値を経由せず直接 `preferred_derived_name` の
-    ファイル実在チェックへ委ねてよいが、既存の呼び出し形を変えない最小変更として関数自体は残す。
-    rag ファイルがその文書について実在しない場合の per-file legacy フォールバック（`{rel}.md` を
-    使う）はこの関数と無関係の別契約として維持する（`preferred_derived_name` 参照）。
-    """
-    return True
-
-
 def strip_derived_suffix(name: str) -> str:
-    """派生ファイルの物理名（rel）→ 原本 rel。`.rag.md` → `.rag_observations.md` → 一般の `.md` の順に、
-    最初に一致した1つだけを剥がす（`.rag.md`/`.rag_observations.md` はいずれも `.md` でも終わるため、
-    より具体的な拡張を先に判定する必要がある）。どれにも一致しなければ変更せず返す。"""
+    """派生ファイルの物理名（rel）→ 原本 rel。`.rag.md` → `.rag_observations.md` → 一般の `.md` の順に、最初に一致した 1 つだけを剥がす。"""
     if name.endswith(_RAG_SUFFIX):
         return name[: -len(_RAG_SUFFIX)]
     if name.endswith(_OBSERVATION_SUFFIX):
@@ -236,189 +143,99 @@ def strip_derived_suffix(name: str) -> str:
 
 
 def preferred_derived_name(rag_root: Path, rel: str) -> str:
-    """原本 rel（拡張子込み・例 `report.docx`）→ 検索/精読対象の派生ファイル名（rag 優先・legacy フォールバック）。
-
-    rag が有効かつ `{rel}.rag.md` が `rag_root`（`worlds.derived_rag_dir`）に実在すればそちらを、
-    それ以外は従来どおり `{rel}.md` を返す（**legacy 側の**実在確認はしない＝呼び出し元が
-    confinement 検証込みで open/stat する。rag 側は「優先すべきか」の判定に実在確認そのものが
-    必要なのでここで行う）。返す名前が `.rag.md` で終わるかどうかで、呼び出し元は物理ルートが
-    `rag_root`（`.rag.md`）か md 層のルート（`.md`）かを判別する（§8.1 三階層・フォルダ分離＝
-    `.rag.md`/`.md` は別ディレクトリに物理配置される）。
-    `grep_search`（どちらの物理ファイルを検索対象にするか）と `agentic_search._safe_doc_path`
-    （read_around がどちらを開くか）が本関数を共有することで、両者は常に同じ1ファイルを見る
-    （食い違うとヒット位置と精読内容が一致しなくなる）。
+    """原本 rel（拡張子込み）→ 検索/精読対象の派生ファイル名。`{rel}.rag.md` が `rag_root` に実在すればそちら、無ければ `{rel}.md`（legacy 側の実在確認は呼び出し元）。
+    返す名前が `.rag.md` で終わるかで、呼び出し元は物理ルート（`rag_root` か md 層）を判別する。
+    `grep_search` と `parts/read/tools._safe_doc_path` が共有し、常に同じ 1 ファイルを見る。
     """
-    if rag_grep_enabled() and (rag_root / (rel + _RAG_SUFFIX)).is_file():
+    if (rag_root / (rel + _RAG_SUFFIX)).is_file():
         return rel + _RAG_SUFFIX
     return rel + ".md"
 
 
 class GrepDeadlineExceeded(Exception):
-    """`grep_search(deadline=...)` がツリー列挙中にデッドラインを超えたことを示す（呼び出し元が
-    翻訳する・PART-4 経由の呼び出しは既存のデッドライン優先の再分類で `ResearchTimeout`/504 に
-    なる・`scope_infer.ScopeWalkDeadlineExceeded` と同型）。"""
+    """`grep_search(deadline=...)` がツリー列挙中に期限を超えたことを示す（呼び出し元が翻訳する）。"""
 
 
-_DEADLINE_CHECK_ENTRIES = 256   # ツリー列挙中に `deadline` を再確認する間隔（`grep_search`
-# docstring 参照・単一ルートに大量のファイルがあっても列挙完了・ソート開始前に打ち切れるように
-# する）。
-_DEADLINE_CHECK_LINES = 256   # 1ファイルの行走査ループ中に `deadline` を再確認する間隔（`grep_search`
-# docstring 参照・巨大ファイル1件の全文走査自体がデッドラインを食い潰すケースの防御）。
+_DEADLINE_CHECK_ENTRIES = 256  # ツリー列挙中に `deadline` を再確認する間隔
+_DEADLINE_CHECK_LINES = 256  # 1 ファイルの行走査ループ中に `deadline` を再確認する間隔
 
 
 def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 scope_paths=None, deadline: float | None = None, layer=None,
                 truncated_docs: list | None = None, offset: int = 0):
     """`query` を含む行を world のフォルダ木から探し、根拠つきヒットを返す（read-only）。
+    各ヒット: `{doc_id(=rel_path), path(内部用・API 非露出), ext, line, span:[start,end], text, match}`。
+    登録者の重要度（`_重要度.txt`・`ingest.importance`）があれば `importance`/`importance_reason` を追加する（無ければキー自体を作らない）。
+    MD は該当見出し節を `text`/`span`、ソースは該当行＋前後数行。同一 (doc, 節) は 1 件に集約する。
+    `scope_paths`（フォルダ prefix）を渡すと、その範囲の文書だけ読む。
 
-    各ヒット: `{doc_id(=rel_path), path(内部用・API非露出), ext, line, span:[start,end], text, match}`
-    ＋登録者が `_重要度.txt`（`ingest.importance`）で付けた重要度があれば `importance`/
-    `importance_reason` を条件付きで追加（無ければキー自体を持たない）。
-    MD は**該当見出し節**を `text`/`span`（qa の引用）、ソースは該当行＋前後数行。同一 (doc, 節) は1集約。
-    `scope_paths`（フォルダ prefix）を渡すと、**その範囲の文書だけ** grep する（範囲外は読まない・MIRROR §3）。
+    ヒットの選抜: 上限 `max_hits` 件の top-K。優先度は `(重要度 rank 降順, 発見順昇順)`。`offset` 対応のためヒープ容量は `heap_cap`（=`max_hits+offset`）。
+    `_重要度.txt` が無い world（または `roots` 明示指定）は rank が一様で、ヒープが満杯になった時点で以後のヒットは採用され得ないため、ファイル内とファイル境界の 2 点で走査を早期終了する
+    （早期終了した最終節／未確定の pending 行は flush しないが、選抜結果は変わらない）。`imp_map` が非空の world は常に全量走査する。
 
-    **ヒットの選抜**: 返すのは上限 `max_hits` 件の **top-K**——優先度は `(重要度rank降順, 発見順昇順)`（重要度＝
-    `高`>`中`/未設定>`低`・同 rank は先に見つかった方を残す）。ページング（`offset`）対応のため
-    ヒープ自体の容量は `heap_cap`（=`max_hits+offset`）——`offset=0` なら `heap_cap == max_hits`。
-    `_重要度.txt` が無い world（または `roots` 明示指定の呼び出し）は `imp_map` が空＝全ヒットの
-    rank が揃う。この場合、ヒープが `heap_cap` で満杯になった時点で**以後どのヒットも数学的に
-    二度と採用され得ない**
-    （min-heap のキー `(rank, -seq)` は rank 一様なら新エントリの `-seq` が既存最小値より必ず
-    小さくなるため、`entry > heap[0]` が恒に False になる）——この事実を使い、2つの打切り点で
-    走査を早期終了する: **ファイル内**（行走査ループの各行の後・MD 最終節／
-    未確定 pending 行の flush は行わない——早期終了した run だけが最終節／未確定 pending 行を
-    取りこぼすが、この時点でヒープは満杯＝以後どのヒットも採用され得ないため最終出力は変わらない）と
-    **ファイル境界**（1ファイルを終えるたびに判定・満たせば以後のファイル・root を一切開かない）。
-    早期終了しても選抜結果（offset によるページング前）は「発見順で先頭 `heap_cap` 件」のまま
-    変わらず、`deadline` の消費（`_check_deadline` の呼び出し頻度）は全量走査より減る。
-    一方、`_重要度.txt` がある world（`imp_map` が非空）は、後から見つかった `高` 文書が現在の
-    ヒープ最下位を上書きしうるため、この早期終了条件は成立せず**常に全量走査**する（`heap_cap`
-    到達後も走査を続けるぶん `deadline` 消費は増える——既存の周期チェックが引き続き効くことで
-    ハングしないことがテストの固定対象）。
+    打切りの申告（読み込みが `_GREP_FILE_CAP_BYTES` に達し、cap より後ろは検索できていない可能性）:
+    - ヒット元が打ち切られていたら、そのヒットにだけ `file_truncated: True` を付ける（通常のヒットにはキーを作らない）。
+    - `truncated_docs`（省略可）にリストを渡すと、打ち切られた文書の `doc_id` を重複なく追記する（ヒット 0 件の文書も載る）。早期終了したファイル以降の打切りは報告されない。
 
-    **打切りの申告**（`agentic_search.run_tool` の read_doc/doc_outline 分岐が返す `file_truncated`
-    と同じ語彙・同じ意味＝
-    読み込みが `_GREP_FILE_CAP_BYTES` に達し、cap より後ろは検索できていない可能性がある）を2経路で行う:
+    軽量テキスト枠（`ingest.text_kind`＝未登録拡張子のテキスト）は、台帳/ES と同じ基準（`text_kind.MAX_BYTES`＝8MiB）でサイズ超過を丸ごと対象外にし、`truncated_docs` へ載せる。
 
-    - ヒット元が打ち切られていたら、そのヒットにだけ `file_truncated: True` を付ける。打切りが無い
-      通常のヒットにはキー自体を作らない（`degrade_reason` と同じ流儀＝戻り値の形は不変）。
-    - `truncated_docs`（省略可）にリストを渡すと、**打ち切られた文書の `doc_id`** を重複なく追記する。
-      **ヒットを1件も出さなかった打切り文書もここに載る**——ヒット経由の申告だけでは「cap より
-      後ろにしか一致が無い文書」が完全に無音になる（＝『検索したのに出てこない』の正体）。
-      呼び出し元がリストを渡さなければ何もしない（既存呼び出し元は無変更）。ただし上記の早期終了
-      （`imp_map` が空かつヒープ満杯）が発生した場合、早期終了したファイル自身（cap 到達前に
-      読むのをやめる）と、そこから先の文書（一切開かない）の打切りは報告されない——早期終了に
-      固有の限定であり、
-      `_重要度.txt` がある world（常に全量走査）ではこの限定は無い。
+    `layer`（`"docs"|"code"|"both"`・既定 `None`＝`"both"`）: 探す対象。`classify_document` の確定結果（`layer_mod.in_layer_code`）に一致しない文書は読まない。
 
-    軽量テキスト枠（`ingest.text_kind`＝未登録拡張子のテキストファイル）だけは、台帳/ES と同じ基準
-    （`text_kind.MAX_BYTES`＝8MiB）でサイズ超過を丸ごと対象外にし、これも `truncated_docs` へ
-    載せる（TEXT-ALL L-1 是正・2026-09）——台帳側が `size_exceeded` として除外している文書を、
-    grep だけ `_GREP_FILE_CAP_BYTES`（64MiB）内の先頭部分でヒットさせてしまう矛盾を避けるため。
-    登録拡張子コード・Office 派生 MD・`.md`/`.txt` はこの対象外（従来どおり `_GREP_FILE_CAP_BYTES`
-    まで検索する）。
+    `deadline`（`time.monotonic()` 系の絶対期限・既定 None＝無期限）: 関数の開始直後・ルートごとの走査開始時・ツリー列挙中（ソートの前・`_DEADLINE_CHECK_ENTRIES` 件ごと）・
+    各エントリの処理直前・ファイル読込直後・行走査ループ内（`_DEADLINE_CHECK_LINES` 行ごと）・各 `return` の直前で確認し、超過で `GrepDeadlineExceeded` を送出する（部分結果は返さない）。
 
-    `layer`（省略可・`"docs"|"code"|"both"`・既定 `None`＝`"both"`＝フィルタなし＝既存呼び出し元は
-    無変更）: 探す対象（調べ方ブロック §3.4）。`scope_paths` と同じ場所（範囲外はそもそも読まない）で
-    判定する——`classify_document` の確定結果（`layer_mod.in_layer_code`）に一致しない文書は
-    そもそも読まない（拡張子だけの近似（`layer_mod.in_layer`）は使わない・§7 裁定10）。
-
-    `deadline`（省略可・`time.monotonic()` 系の絶対期限。既定 None＝無期限＝既存呼び出し元は
-    無変更）: 指定時、以下の**すべての境界**で確認し、超えていれば `GrepDeadlineExceeded` を
-    送出して打ち切る——一貫して例外にする（部分的なヒット集合を黙って返さない・空 query/不正
-    world による早期 `[]` も含め、いかなる `return` も期限超過を検知した後は行わない）:
-    **関数の開始直後**（query/world の検証より前）・**ルートごとの走査開始時**（複数 root 間の
-    境界）・**ツリー列挙中**（`root.rglob("*")` を `_DEADLINE_CHECK_ENTRIES` 件処理するごと・
-    `sorted(...)` は列挙完了まで戻らないためソートの**前**に確認する）・**各エントリの処理直前**
-    （ソート済み集合を1件処理するごと）・**ファイル読込直後**（ストリーミング走査に入る前）・
-    **行走査ループ内**（`_DEADLINE_CHECK_LINES` 行ごと）・**各 `return` の直前**。
-    超過していない通常経路の最終的な列挙順序（ソート結果）・ヒット内容はこれまでと変わらない
-    （`deadline is None` の分岐は追加の `time.monotonic()` 呼び出しをしない）。PART-4
-    （`agentic_search.run_tool`経由）が残り時間ベースで渡す・通常チャット経路は渡さない。
-
-    `offset`（省略可・既定0＝既存呼び出し元は無変更）: 上位 `offset + max_hits` 件までを選抜対象
-    にし（top-K ヒープの容量を `max_hits` からこの合計へ広げる・早期打切りの閾値も同じ合計を使う）、
-    最終的な優先順位付きリストのうち後ろ `max_hits` 件（`[offset:offset+max_hits]`）を返す。
-    `offset=0` は容量が従来どおり `max_hits` のまま＝結果は完全に不変。
+    `offset`（既定 0）: 上位 `offset + max_hits` 件を選抜し、`[offset:offset+max_hits]` を返す。
     """
     def _check_deadline() -> None:
         if deadline is not None and time.monotonic() > deadline:
             raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")
 
     _check_deadline()
-    from . import corpus_docs, scope, worlds           # 遅延 import（循環回避）
-    from .ingest import importance                     # 同上（importance が worlds を import するため）
+    from . import corpus_docs, scope, worlds  # 遅延 import（循環回避）
+    from .ingest import importance  # 遅延 import（循環回避）
     q = (query or "").strip()
     if not q or not valid_world(world):
         return []
     ql = q.lower()
-    # (root, is_derived) のリスト。derived＝Office→決定的MD の置き場（rel は元 Office に対応＝末尾 .md を剥がす）。
+    # (root, is_derived) のリスト。derived＝Office→決定的 MD の置き場（rel は元 Office に対応＝末尾 .md を剥がす）。
     imp_map: dict = {}
     if roots is not None:
         roots_spec = [(Path(r), False) for r in roots]
-        # `roots` 明示指定（テスト／個別パス指定の呼び出し）は世界の登録 root と一致する保証が
-        # 無いため重要度は解決しない（`imp_map` は空のまま＝全ヒット rank 均一・§I2）。
+        # `roots` 明示指定は重要度を解決しない（`imp_map` は空＝全ヒット rank 均一）。
     else:
         wd = worlds.world_dir(world)
         roots_spec = [(wd, False)] if wd else []
-        # アーカイブ取り込み（zip/tar(.gz)/tgz）: 展開先（`worlds.archives_dir`）も原本ツリーと同じ
-        # 規律（`is_derived=False`＝`classify_document` で分類・層判定も通常どおり）で grep 対象に
-        # 含める——展開木の構成がそのまま doc_id（`<アーカイブ>/<中のパス>`）になるため、
-        # 原本ツリーと同じ rel 組み立てロジックがそのまま成立する（下の `rel = p.resolve().
-        # relative_to(rootr)` を参照）。zip/tar の無い world は `archives_dir` が存在しないため無害。
+        # アーカイブ展開先（`worlds.archives_dir`）も原本ツリーと同じ規律（`is_derived=False`）で grep 対象にする。
         der_archives = worlds.archives_dir(world)
         if der_archives.is_dir():
             roots_spec.append((der_archives, False))
-        # rag（RAG 正本）と md（人間用・legacy 縮退）は§8.1 三階層のフォルダ分離で別ディレクトリ
-        # ——両方を is_derived ルートとして歩く。優先順位判定（下の `preferred_derived_name`）は
-        # `der_rag` を固定で参照するため、どちらのルートを走査中でも同じ判定になる。
+        # rag と md は別ディレクトリのため、両方を is_derived ルートとして歩く。優先判定（`preferred_derived_name`）は `der_rag` を固定で参照する。
         der_rag = worlds.derived_rag_dir(world)
         if der_rag.is_dir():
             roots_spec.append((der_rag, True))
         der_md = worlds.derived_md_dir(world)
         if der_md.is_dir():
             roots_spec.append((der_md, True))
-        # OCR 観測（画像の中の文字）は`rag.md`へ統合済み（O1・§8.1一本化）——VLMと合流した
-        # AI観測レコードとして`.rag.md`自体に含まれるため、ここで観測専用ツリー
-        # （`worlds.observation_current_dir`・`{rel}.rag_observations.md`）を別途歩く必要はない
-        # （二重ヒットを作らない）。観測ツリー自体は generation GC の対象として引き続き存在しうる。
-        # ヒットの優先順位付け（`_offer` 参照）用に world の重要度を1回だけ解決する
-        # （`_重要度.txt` が無い world は空 dict＝以下のヒープ処理が rank 均一のまま完全にno-op化する）。
+        # OCR 観測は `rag.md` に統合済みのため、観測専用ツリーは歩かない（二重ヒットを作らない）。
+        # ヒットの優先順位付け（`_offer`）用に world の重要度を 1 回だけ解決する（`_重要度.txt` が無ければ空 dict）。
         if wd:
-            # `sig` を渡さないと `resolve_for_world` は
-            # `worker.world_signature_of_root(wd)` で world 全体をもう一度全木走査してキャッシュ
-            # キー用の署名を作ってしまう（`_read_all_control_contents` 自身の走査とは別の、もう1回の
-            # 走査）。grep は1回のチャット往復（agentic ループ）で何度も呼ばれうるため、この二重
-            # 走査コストを毎回払うのは無駄——registry の `last_sig`（狭い1行 SELECT・
-            # `store.get_world_status_row` 参照・`last_manifest` を含まないため O(1)）を渡せば1回
-            # 省ける（`doc_ledger.preview_documents`/`preview_service.build_preview` と同じ流儀）。
-            # 取得できなくても（DB 不達・未登録 world 等）fail-closed にはせず `sig=None` のまま
-            # 従来どおり自前計算へフォールバックする（grep 自体は DB 不要で動く契約を壊さない・
-            # 空文字は渡さない＝`resolve_for_world` 側の署名キャッシュ契約を固定してしまわない）。
+            # `sig` を渡すと `resolve_for_world` が world 全体をもう一度全木走査しない（registry の `last_sig` を使う）。
+            # 取得できなくても fail-closed にはせず `sig=None` のまま自前計算へ戻す。
             sig = None
             try:
-                from . import store                     # 遅延 import（循環回避）
+                from . import store  # 遅延 import（循環回避）
                 row = store.get_world_status_row(world)
                 sig = (row or {}).get("last_sig") or None
             except Exception:
                 sig = None
             imp_map = importance.resolve_for_world(world, root=wd, sig=sig)
-    # ---- top-K（優先度つき）ヒット選抜（I2）----
-    # 早期打切り（旧: ファイル内でヒット数到達時に break／ファイル境界でヒット数到達時に return）は
-    # 撤去し、常に対象を全量走査する。ヒットは `_offer` を通じて上限 `heap_cap`（=max_hits+offset・
-    # ページング対応）の有界ヒープへ出し入れし、`(rank, -seq)` の昇順（＝重要度が高いほど・同rankは
-    # 発見順が早いほど）で最下位を追い出す——メモリは常に高々 `heap_cap` 件。`seq` は全ルート・
-    # 全ファイルを通した発見順の単調増加カウンタ（同一 rank 内の tie-break・heapq の比較がタプル
-    # 要素だけで完結する保証にも使う＝dict である hit 本体同士の比較には決して落ちない）。`imp_map`
-    # が空なら全ヒット rank が `importance.RANK_UNSET` で揃うため、選抜結果は「発見順で先頭
-    # heap_cap 件」になり、最終的に `[offset:offset+max_hits]` を返す（受け入れ条件＝`_重要度.txt`
-    # の無い world・offset=0 で出力不変）。
+    # top-K（優先度つき）ヒット選抜。常に対象を全量走査し（早期打切りは `imp_map` が空のときだけ・下記）、ヒットは `_offer` を通じて有界ヒープ（容量 `heap_cap`）へ出し入れする。
+    # `(rank, -seq)` の昇順（重要度が高いほど・同 rank は発見順が早いほど）で最下位を追い出す。`seq` は全ルート・全ファイルを通した発見順の単調増加カウンタ（tie-break）。
+    # `imp_map` が空なら選抜結果は発見順の先頭 `heap_cap` 件になる。
     heap: list[tuple[int, int, dict]] = []
     seq = 0
-    offset = max(0, offset)   # 負値は0扱い（list_docs の offset クランプと同じ流儀）
-    # `heap_cap`: ページング対応（ヒット単位バイト上限とあわせ、網羅性を落とさずに文脈枠を守る）——
-    # offset 分だけ余分に選抜し、末尾で `[offset:offset+max_hits]` を切り出す。`offset=0` なら
-    # `heap_cap == max_hits` で従来と完全に同じ容量・同じ早期打切り閾値になる。
+    offset = max(0, offset)  # 負値は 0 扱い
+    # `heap_cap`: offset 分だけ余分に選抜し、末尾で `[offset:offset+max_hits]` を切り出す。
     heap_cap = max_hits + offset
 
     def _offer(hit: dict) -> None:
@@ -428,14 +245,14 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
             return
         res = imp_map.get(hit["doc_id"])
         rank = importance.rank_of(res)
-        hit.update(importance.public_fields(res))   # importance/importance_reason（条件付き・§I2 実装1）
+        hit.update(importance.public_fields(res))  # importance/importance_reason（条件付き）
         entry = (rank, -seq, hit)
         if len(heap) < heap_cap:
             heapq.heappush(heap, entry)
         elif entry > heap[0]:
             heapq.heapreplace(heap, entry)
 
-    stop_scan = False   # ファイル境界の打切り点
+    stop_scan = False  # ファイル境界の打切り点
     for root, is_derived in roots_spec:
         _check_deadline()
         if not root.is_dir():
@@ -448,15 +265,10 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")
             entries.append(p)
         for p in sorted(entries):
-            # 各エントリの処理（ファイル読込・全文走査を含む）ごとに確認する——列挙段階の
-            # 間引きチェック（`_DEADLINE_CHECK_ENTRIES` 件ごと）だけでは、列挙後のファイル
-            # 読込/走査自体で予算を使い切るケース（列挙件数が間引き間隔未満の小規模ディレクトリ
-            # を含む）を検知できない。
+            # 各エントリの処理（ファイル読込・全文走査を含む）ごとに期限を確認する。
             _check_deadline()
             ext = p.suffix.lower()
-            # 派生ツリー（Office/PDF の決定的MD）は拡張子で絞る（`.md`/`.rag.md` 以外は元々存在しない）。
-            # 原本ツリーは拡張子で絞らない——未登録拡張子・拡張子なしも候補に含め、可否は下の
-            # `classify_document` 呼び出し（1ファイル1回・必要な時だけ内容を読む）に委ねる。
+            # 派生ツリー（Office/PDF の決定的 MD）は拡張子で絞る。原本ツリーは絞らず、可否は下の `classify_document` に委ねる。
             ok_ext = (ext in _MD_EXT) if is_derived else True
             if not (p.is_file() and not p.is_symlink() and ok_ext):
                 continue
@@ -464,22 +276,15 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 rel = p.resolve().relative_to(rootr).as_posix()
             except ValueError:
                 continue
-            if importance.is_importance_control_path(rel):   # 重要度設定ファイル自体は検索対象外（§5）
+            if importance.is_importance_control_path(rel):  # 重要度設定ファイル自体は検索対象外
                 continue
             if is_derived and (rel.endswith(_RAG_SUFFIX) or rel.endswith(".md")):
-                # `.rag.md`（Evidence IR 由来の検索向け Markdown）と legacy `{原本rel}.md` は
-                # 同じ原本 rel に対する2つの物理ファイルになり得る。`preferred_derived_name()`
-                # （grep と read_around の共有ヘルパー）が選ぶ側だけを検索対象にし、選ばれない側は
-                # 除外する（1文書につき検索対象は常に1ファイルのみ＝二重ヒットを作らない）。
+                # `.rag.md` と legacy `{原本rel}.md` は同じ原本の 2 つの物理ファイルになり得る。`preferred_derived_name()` が選ぶ側だけを検索対象にする（二重ヒットを作らない）。
                 origin_rel = strip_derived_suffix(rel)
                 if preferred_derived_name(der_rag, origin_rel) != rel:
                     continue
                 rel = origin_rel
-                # 秘匿名: 派生MDの物理名から復元した**原本名**で判定する
-                # （`ok_ext`／`_MD_EXT` は派生ファイルの拡張子=`.md`/`.rag.md` を見るだけなので、
-                # ここで通さないと `credentials.xlsx`/`.env.png` 等の派生MDが原本の秘匿名を
-                # 素通りして grep 対象になる＝`corpus_docs.classify_document` の秘匿除外は
-                # 派生ツリーの走査（`is_derived`）には掛からない）。
+                # 秘匿名は派生 MD の物理名から復元した原本名で判定する（派生ツリーの走査には `classify_document` の秘匿除外が掛からないため）。
                 if text_kind.is_sensitive_doc_id(origin_rel):
                     _log.warning("grep_search: 秘匿名のため派生MDを対象外にしました（ext=%s）",
                                 Path(origin_rel).suffix.lower())
@@ -487,23 +292,11 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
             if not scope.in_scope(rel, scope_paths):  # 範囲外の文書はそもそも読まない
                 continue
             is_code = False
-            encoding_caution = None   # SRH-05: 対象外にしない「一部が化けている」ヒットへの注意文
+            encoding_caution = None  # 対象外にしない「一部が化けている」ヒットへの注意文
             if not is_derived:
-                # コード解析層と同じ単一の判定（`corpus_docs.classify_document`）を実行ゲートにする
-                # （拡張子の許可リストではなくこれが最終判定・§7 裁定10）——accepts() 内容判定に
-                # 必要なヘッダが読み取れない文書は除外し（この1件だけ skip・検索全体は継続）、
-                # accepts() が全滅した登録拡張子は既存の資料種別（doctype）に該当する場合だけ資料
-                # として扱う（該当しなければ未対応）。`_TEXT_EXT` に属する拡張子（登録済みコード・
-                # 軽量テキスト枠の第1段）はほとんどの場合ここで内容を読まない（既定 accepts の
-                # ままなら候補が無い/内容判定不要）——`_TEXT_EXT` 外（未登録拡張子・拡張子なし＝
-                # 軽量テキスト枠の第2段）だけが、ここで先頭数KBの内容判定（1ファイルにつき1回）を
-                # 要する。`corpus_docs.reachable_as_text` と同じ判定式（`_classify_verdict_reachable`）
-                # を共有する。
-                # SRH-05: `text_quality` を渡すと、文字コードを判別できない（UTF-8/CP932 どちらも
-                # 化ける）原本は `_classify_verdict_reachable` が False になり grep からも除外される
-                # （grep/scan_report/read_around が同じ1つの判定式を共有する契約・§7 裁定10を維持）。
-                # 対象外にしない「一部が化けている」（`encoding_partial`）は検索対象のまま、この
-                # ファイルの各ヒットへ注意文（`encoding_caution`）を付ける。
+                # `corpus_docs.classify_document` の判定を実行ゲートにする（拡張子の許可リストではなくこれが最終判定）。
+                # 内容判定に必要なヘッダが読めない文書はこの 1 件だけ skip する。`_TEXT_EXT` 外の拡張子だけが、ここで先頭数 KB の内容判定（1 ファイル 1 回）を要する。`corpus_docs.reachable_as_text` と同じ判定式（`_classify_verdict_reachable`）を共有する。
+                # `text_quality` を渡すと、文字コードを判別できない原本は grep からも除外される。「一部が化けている」（`encoding_partial`）は対象のまま、各ヒットへ注意文（`encoding_caution`）を付ける。
                 verdict = corpus_docs.classify_document(
                     rel, Path(rel).suffix.lower(),
                     lambda p=p, size=4096: corpus_docs._read_head(p, size),
@@ -512,19 +305,8 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     continue
                 if verdict.get("encoding_partial"):
                     encoding_caution = corpus_docs._ENCODING_CAUTION["partial"]
-                # TEXT-ALL L-1 是正（2026-09）: 軽量テキスト枠（`ingest.text_kind`）だけは、台帳/ES
-                # と同じ基準（`text_kind.MAX_BYTES`＝8MiB・`corpus_docs._text_oversize` と同一の
-                # 判定式）でサイズ超過を grep からも除外する。是正前は台帳側が `size_exceeded` で
-                # `unreadable` にしていても grep 側は `classify_document` の判定だけをゲートに
-                # ファイルサイズを見ておらず、`_GREP_FILE_CAP_BYTES`（64MiB）内の先頭部分で
-                # ヒットを返せてしまっていた（「grep はヒットするのに台帳/引用検証には存在しない」
-                # 矛盾窓・受容記録 TEXT-ALL L-1）。登録拡張子コード・Office 派生 MD・`.md`/`.txt` は
-                # `verdict["doctype"]` がこの2値と一致しないため対象外のまま（従来どおり
-                # `_GREP_FILE_CAP_BYTES` まで検索する）。黙って消さず、`truncated_docs`
-                # （打ち切られた文書 doc_id の既存申告流儀）へ伝える——ヒットが1件も無い打切りも
-                # 無音にしない、という既存契約と同じ扱い。
-                # 登録アナライザ対象（`kind=="code"`）も台帳・グラフと同じ上限で除外する（台帳では
-                # `size_exceeded` で unreadable なのに grep だけヒットする矛盾を作らない）。
+                # 軽量テキスト枠と登録アナライザ対象（`kind=="code"`）は、台帳・グラフと同じ基準（`text_kind.MAX_BYTES`＝8MiB・`corpus_docs._text_oversize` と同じ判定式）でサイズ超過を grep からも除外する。
+                # 黙って消さず `truncated_docs` へ伝える（ヒットが無い文書も含む）。登録拡張子コード・Office 派生 MD・`.md`/`.txt` は対象外。
                 if (verdict["kind"] == "code"
                         or verdict.get("doctype") in (text_kind.CODE_DOCTYPE_LABEL, text_kind.DOCUMENT_DOCTYPE_LABEL)):
                     try:
@@ -536,50 +318,27 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                             truncated_docs.append(rel)
                         continue
                 is_code = verdict["kind"] == "code"
-            # 層判定（§3.4）は上の classify_document 確定結果を使う（`layer_mod.in_layer`＝拡張子
-            # だけの近似は使わない・§7 裁定10 と同じ確定判定に揃える）。派生 MD（Office/画像）は
-            # 常に docs 層（is_code=False のまま）。
+            # 層判定は `classify_document` の確定結果を使う。派生 MD（Office/画像）は常に docs 層。
             if not layer_mod.in_layer_code(is_code, layer):
                 continue
-            # ストリーミング走査（本丸・2026-09）: `_CappedStreamReader` が bounded chunk で読み、
-            # 改行区切りの行を順に yield する（境界セマンティクス＝「1 byte 余分に読んでちょうど
-            # cap のファイルを誤って truncated 扱いしない」「cap で切れた中途行は破棄する」は
-            # 旧 `f.read(cap + 1)` 一括ロードと同じ）。保持するのは現在の窓（MD なら直近の見出し行と
-            # その行番号・節の引用は `_GREP_HIT_TEXT_MAX_BYTES` で頭打ち／ソースは前後2行の小窓）
-            # だけで、`_GREP_FILE_CAP_BYTES` の大きさにもファイル実サイズにも比例しない。
-            #
-            # 持続的な OSError（権限変更・デバイス障害等）で検索全体を失敗させない——この1件だけ
-            # skip して他の文書の検索を続ける（ストリーミング中の途中失敗はここまでに見つかった
-            # ヒットを残したまま次のファイルへ進む＝全量ロード一発読みには無かった部分成功だが、
-            # 打切り申告と同じ「探せていない範囲がある」の一種として許容する）。
+            # ストリーミング走査: `_CappedStreamReader` が bounded chunk で読み、改行区切りの行を順に処理する。保持するのは現在の窓（MD は直近の見出し行とその行番号、ソースは前後 2 行の小窓）だけ。
+            # 持続的な OSError はこの 1 件だけ skip して他の文書の検索を続ける（ここまでのヒットは残す）。
             try:
                 f = p.open("rb")
             except OSError:
                 continue
             try:
-                # 「ファイル読込直後（全文走査に入る前）」の確認——
-                # ストリーミングでは巨大 decode は起きないが、open 直後〜走査開始前の境界として
-                # 引き続き確認する。
+                # ファイル読込直後（全文走査に入る前）の期限確認。
                 _check_deadline()
-                # 派生ツリー（Office/PDF 由来の決定的 MD・`.rag.md`）は Sherpa 自身が UTF-8 で書いた
-                # ものなので判定を省く（原本ツリーだけ実バイト列から符号化を判定する）。
+                # 派生ツリーは Sherpa 自身が UTF-8 で書いたものなので判定を省く。原本ツリーだけ実バイト列から符号化を判定する。
                 try:
                     enc = "utf-8" if is_derived else text_encoding.detect_fd(f.fileno())
                 except OSError:
-                    continue                          # この 1 件だけ飛ばす（検索全体を失敗させない）
+                    continue  # この 1 件だけ飛ばす
                 reader = _CappedStreamReader(f)
                 is_md = is_derived or ext in _MD_EXT
-                out_ext = Path(rel).suffix.lower()      # doc_id（元ファイル）の拡張子で表示
-                # `seen`（隣接ヒット窓の同一 span 重複排除）を
-                # ファイル内の全ヒット数に比例して肥大する `set` のまま持たない——1ファイルに
-                # マッチが大量にある病的ケース（共有フォルダに巨大テキストを置ける主体と
-                # 同種の攻撃面）では、この1ファイル内だけで `seen` が
-                # ヒット総数ぶん際限なく増える。重複が起こり得るのは常に**直近**の窓どうし
-                # （非MD: `pending` は「まだ2行分の確認猶予中」のヒットしか保持しない設計のため
-                # 定常時は高々2〜3件・MD: セクション境界は単調増加するため遠く離れた節どうしが
-                # 衝突することは無い）——`maxlen` 付き `deque` による小さな有界窓で十分に同じ
-                # 重複排除効果が得られる（`key in seen` は O(_SEEN_RECENT_MAX) の線形走査だが
-                # 窓が小さいため無視できるコスト）。
+                out_ext = Path(rel).suffix.lower()  # doc_id（元ファイル）の拡張子で表示
+                # `seen`（隣接ヒット窓の同一 span 重複排除）は `maxlen` 付き `deque` の小さな有界窓にする（重複は直近の窓どうしでしか起きないため、ヒット総数に比例させない）。
                 seen: deque = deque(maxlen=_SEEN_RECENT_MAX)
                 line_i = 0
                 if is_md:
@@ -590,29 +349,25 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     section_buf_bytes = 0
                     section_capped = False
                 else:
-                    recent: deque = deque(maxlen=5)   # 直近5行（前後2行窓の復元に必要な最小限）
-                    pending: list[int] = []           # まだ確定していないヒット行（1-based）
+                    recent: deque = deque(maxlen=5)  # 直近 5 行（前後 2 行窓の復元に必要な最小限）
+                    pending: list[int] = []  # まだ確定していないヒット行（1-based）
 
                 def _add_hit(hit_line: int, s: int, e: int, text: str) -> None:
                     key = (str(p), s, e)
                     if key in seen:
                         return
                     seen.append(key)
-                    # 見つけ次第すぐ世界全体の top-K ヒープへ供する（`_offer` は既に有界＝高々
-                    # `max_hits` 件しか保持しない）。`file_truncated` の付与（この1ファイルの走査を
-                    # 終えるまで確定しない）は、ヒープに残っている（このファイル由来の）エントリを
-                    # 事後に見つけて付与する形にする（下の該当箇所参照・ヒープは有界なのでこの事後
-                    # 走査も高々 `max_hits` 件で終わる）。
+                    # 見つけ次第 top-K ヒープへ供する。`file_truncated` はファイルの走査を終えてから、ヒープに残っているこのファイル由来のエントリへ事後に付ける。
                     hit = {
-                        "doc_id": rel,                # world root 相対パス（来歴・DL キー・§2.2）
-                        "path": str(p),                # 内部用（物理パス）。API 露出は lens 層で除去。
+                        "doc_id": rel,  # world root 相対パス
+                        "path": str(p),  # 内部用（物理パス）。API 露出は lens 層で除去。
                         "ext": out_ext,
                         "line": hit_line,
                         "span": [s, e],
                         "text": text,
                         "match": q,
                     }
-                    if encoding_caution:      # SRH-05: 対象外にしないが一部が化けているファイルの目印
+                    if encoding_caution:  # 一部が化けているファイルの目印
                         hit["encoding_caution"] = encoding_caution
                     _offer(hit)
 
@@ -627,7 +382,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     _add_hit(section_hit_line, section_start, end_line, text)
                     section_has_hit = False
 
-                hit_limit_reached = False   # ファイル内でヒット数上限に達したか（達したら flush を省く）
+                hit_limit_reached = False  # ファイル内でヒット数上限に達したか（達したら flush を省く）
                 try:
                     for t in _logical_lines(reader, _GREP_FILE_CAP_BYTES, encoding=enc):
                         if (deadline is not None and line_i > 0 and line_i % _DEADLINE_CHECK_LINES == 0
@@ -661,15 +416,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                                 text = "\n".join(txt for (ln, txt) in recent if s <= ln <= e)
                                 _add_hit(h, s, e, _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES))
                         line_i += 1
-                        # `imp_map`
-                        # が空（rank一様）でヒープが `heap_cap`（=max_hits+offset）で満杯なら、以後どの
-                        # ファイル・どの行のヒットも数学的に二度とヒープへ採用されない（min-heap の
-                        # 比較キー `(rank, -seq)` は rank が一様なとき新エントリの `-seq` が既存最小値
-                        # より必ず小さくなるため `entry > heap[0]` が恒に False になる証明・モジュール
-                        # docstring 参照）。offset=0 なら `heap_cap == max_hits` で従来と同じ閾値。
-                        # ファイル内break（この時点で MD 最終節／未確定 pending
-                        # 行の flush は**行わない**——ヒープは満杯＝以後どのヒットも採用され得ないため
-                        # 最終出力は変わらない）。
+                        # `imp_map` が空でヒープが `heap_cap` で満杯なら、以後のヒットは採用され得ない。ファイル内で break する（最終節／未確定 pending 行の flush は行わない）。
                         if not imp_map and len(heap) >= heap_cap:
                             hit_limit_reached = True
                             break
@@ -686,13 +433,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
             finally:
                 f.close()
             # ファイル全体（cap まで）の走査を終えた時点で「探せていない範囲があるか」が確定する。
-            # この1ファイル由来でヒープに**現に残っている**エントリへ一律に適用する
-            # （`agentic_search.run_tool` の read_doc/doc_outline 分岐が返す `file_truncated` と
-            # 同じ語彙・同じ意味）。ヒットは既に `_add_hit`→`_offer` で見つけ次第ヒープへ供給済み
-            # （RV是正 #1・file_hits バッファは撤去）——この時点で他ファイルに追い出されず残って
-            # いるものだけが最終的に出力されうるため、ヒープ（高々 `max_hits` 件・有界）を1回
-            # 走査して `path` が一致するものにだけ付ける。理由が無ければキーを作らない既存の
-            # 流儀に合わせ、打切りが無い通常のヒットは従来どおりキー無し＝戻り値の形が完全に不変。
+            # この 1 ファイル由来でヒープに残っているエントリ（`path` が一致するもの）にだけ `file_truncated` を付ける。打切りが無いヒットはキーを作らない。
             effective_truncated = reader.truncated or reader.line_overflowed
             if effective_truncated:
                 p_str = str(p)
@@ -701,22 +442,15 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                         h["file_truncated"] = True
                 if truncated_docs is not None and rel not in truncated_docs:
                     truncated_docs.append(rel)
-            # ファイル境界の
-            # 打切り点（「ヒット数到達時の return」の意味論）——`imp_map` が空（rank一様）
-            # でヒープが `heap_cap` で満杯なら、以後のファイル・root を一切開かない（`_check_deadline()`
-            # を含む以降の周期チェックも実行されない）。
+            # ファイル境界の打切り点。`imp_map` が空でヒープが満杯なら、以後のファイル・root を開かない。
             if not imp_map and len(heap) >= heap_cap:
                 stop_scan = True
                 break
         if stop_scan:
             break
     _check_deadline()
-    # heap は有界（高々 heap_cap 件）——最終順序だけ `(-rank, seq)` 昇順（重要度が高いほど先・
-    # 同rankは発見順）へ並べ替える。`entry`=(rank, -seq, hit) なので、
-    # 望む並び順のキーは (-rank, seq) == (-entry[0], -entry[1])。
+    # heap は有界。最終順序だけ `(-rank, seq)` 昇順（重要度が高いほど先・同 rank は発見順）へ並べ替える。`entry`=(rank, -seq, hit)。
     heap.sort(key=lambda entry: (-entry[0], -entry[1]))
     ordered = [hit for _rank, _neg_seq, hit in heap]
-    # ページング（`heap_cap`＝offset+max_hits まで選抜済み）: 後ろ `max_hits` 件を返す。
-    # offset=0 は `len(ordered) <= max_hits` が常に成り立つため `ordered[0:max_hits] == ordered`
-    # ＝結果は完全に不変。
+    # ページング: 後ろ `max_hits` 件を返す（offset=0 なら結果は不変）。
     return ordered[offset:offset + max_hits]

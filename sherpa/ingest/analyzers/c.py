@@ -1,306 +1,271 @@
-r"""C アナライザ（docs/archive/2026-09-05-アナライザ拡張.md §4(a)/§9 S6・A1）。
+r"""C アナライザ。`.c`/`.h` を全件受理し、ファイル自体を主体定義（`Module`・拡張子込みのファイル名）、トップレベルの関数定義（`.c`）／プロトタイプ宣言（`.h`）を子定義（`<ファイル名>.<関数名>`・extra `c_kind`）として返す。
 
-`.c`/`.h` を**全件受理**する。ファイル自体を主体定義（`Module`・primary）とし、トップレベルの
-関数定義（`.c`）／プロトタイプ宣言（`.h`）を子定義（`Module`・`CONTAINS`）として返す（RV1 是正・
-§10）——宣言のみの `.h` ファイルも主体を持てるようにするため、関数を primary にはしない。
-
-**primary 名は拡張子込みのファイル名**（`foo.c`/`foo.h`・RV2-1 是正）: ステム名だと同じ
-ディレクトリに同居する `foo.c`/`foo.h` が同一 `Module` に索引され、`#include "foo.h"` が
-同距離2候補で曖昧になる。関数 children の修飾名は Copybook の `GROUP.ITEM` と同型の
-`<ファイル名>.<関数名>`（`cid_key`）とする——`name` は関数名そのもの（表示名）のまま。
-各 children は `extra={"c_kind": "definition"|"declaration"}` を持つ（`{` 終端か `;` 終端かの
-区別・world_graph 側の単純名呼び出し解決が定義を宣言より優先するために使う索引）。
-
-拡張子の大文字小文字は区別しない（`UTIL.H` も `.h` と同じ扱い・`PurePosixPath.suffix.lower()`
-で判定する）——`registry._ext` がすでに小文字化して拡張子ルーティングしているため、本体側の
-ヘッダ判定もそれに合わせる。
-
-関数定義/プロトタイプの判定は**粗い判定**（`戻り値型 名前(引数) {` または `;`・`static`/
-`inline`/`extern` 修飾は許容）で、単一物理行にマッチするものだけを見る（複数行にまたがる
-シグネチャは見逃す＝安全側・Java アナライザと同じ流儀）。波括弧深度0（トップレベル）に限定し、
-制御構文（`if`/`for`/`while`/`switch`/`return`/`sizeof`）を戻り値型として誤認しない。
-マクロ関数定義（`#define F(x) ...`）は対象外（`#` 始まりの行は最初から構文が一致しない）。
-K&R 形式（旧式・`name(params)` の次行に `型 名;` 形のパラメータ宣言が続く）は子定義としては
-認識しない（検出限界のまま）が、ヘッダ行の `name(` を通常呼び出しとして誤検出しないよう
-`Dropped("c_knr_definition", ...)` として申告する。
-
-**参照**: `#include "x.h"`（ローカル・`<...>` は無視）は2段で解決する（world_graph.py 側・
-§12）——本アナライザは `RefCandidate(..., extra={"via": "include", "include_path": <元の文字列>})`
-を返すだけで、パス解決自体は共通層が行う。`include_path` は区切りを `\` → `/` に正規化してから
-渡す（basename もその正規化後の文字列から取る）——Windows 由来のソース（`#include "..\inc\log.h"`
-等）でも `world_graph._resolve_include_relpath` が同じ区切りで距離計算できるようにするため。
-関数呼び出し `name(`（制御構文キーワード除外）は `via=call` で返す——解決先は他ファイルの関数
-children を**単純名**（関数名のみ）で同一 top_scope 内最近傍解決する（共通層 `_register_children`
-側の追加索引・§9 参照。この2段目解決は C アナライザ由来かつ `via=call` の参照だけに限定される
-——他言語からの参照が同名の C 関数へ誤接続しないため）。自ファイル内定義への呼び出しも除外しない
-（primary と children の cid は常に異なるため自己ループにはならない）。
-
-関数ポインタ経由の呼び出し（`(*fp)(...)`）は `Dropped("c_dynamic_call", ...)`。宣言（`int (*fp)(int);`）
-との判別は、該当物理行の前置部（行頭から `(*名)(` の手前まで）が型指定子だけの宣言形かどうかで行う
-——`return (*fp)(x);` や `x = (*fp)(1);` のように前置部が制御構文キーワードや式（代入等）なら
-宣言ではなく呼び出しそのものと判定し、宣言でも呼び出しでもない中途半端な判定で黙って消さない。
-マクロ関数（同一ファイル内 `#define NAME(...)` で定義済みの識別子への呼び出し）は展開後にしか
-実際の呼び出し先が決まらないため `Dropped("c_macro_call", ...)` として申告するだけ（推測接続はしない）。
-
-大文字小文字は区別する（正規化しない・C は大文字小文字を区別する言語のため Java と同じ理由）。
-
-`.h` に `class`/`namespace`/`template` 等 C++ 専用構文を検知したら `Dropped("cxx_header", ...)` を
-1件申告する（primary はそのまま作る——C ヘッダとして誤解析しないことの可視化のみで、解析自体は
-変えない）。
-
-**検出限界（粗い判定の裏返し）**: シグネチャが複数物理行にまたがる関数定義/宣言は見逃す。
-関数ポインタ型のフィールド/変数宣言（`int (*fp)(int);`）は関数宣言として誤認しない設計だが、
-検出自体もしない（構造情報を持たない単なる見逃し）。`typedef` で定義された関数ポインタ型・
-可変引数マクロ・条件コンパイル（`#ifdef`）分岐後にしか存在しない定義は考慮しない。K&R 形式の
-関数定義は誤って呼び出し扱いにはしないが、子定義としても認識しない（検出限界のまま）。
+参照: `#include "x.h"` は `via=include`（`include_path` は `\` を `/` に正規化・始点はファイルの主体・パス区切りを含む相対パスは完全一致でしか解決せず、一致しなければ最近傍へ倒さず未解決＝`path_exact`）、関数呼び出しは `via=call`（他ファイルの関数 children を単純名で最近傍解決）。
+呼び出しの始点（`source_symbol_id`）は、その行を本体に含む関数定義（`<ファイル名>.<関数名>`）。関数の外の呼び出しはファイルの主体。同じ行に複数の定義がかかる行・定義の閉じ `}` の後ろに同じ行のコードが続く行の呼び出しは決められないので主体にし、`Dropped("ambiguous_source_symbol")` で申告する。
+読み取りは Tree-sitter（tree-sitter-c・`_ts`）。関数定義は複数行・K&R 形式・`extern "C" { }` の中・`#if` の枝の中も読む（K&R 形式は通常の定義として子定義・始点になる）。
+申告: 構文エラーの領域は `syntax_error`（`extern "C"` の括弧を `#ifdef __cplusplus` で分ける定型句は除く）、`.h` に C++ 専用の予約語（`class`/`namespace`/`template`）は `cxx_header`、同じファイルで `#define 名(...)` した関数形式マクロの呼び出しは `c_macro_call`（参照にしない）、呼び出し先が名前でない形（`(*fp)(x)`・`p->fn(x)`・`tbl[i](x)`）は `c_dynamic_call`。`#if` の条件式・マクロ本体の中は読まない。大文字小文字は区別する。
+設計: docs/design/rag.md「グラフ」
 """
 from __future__ import annotations
 
-import bisect
 import re
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+from . import _ts
 from ._base import Analyzer, DefItem, DefResult, Dropped, RefCandidate, RefResult
+
 
 C_EXT = frozenset({".c", ".h"})
 
-# 制御構文キーワード（戻り値型として誤認しない・関数呼び出しとしても除外する）。
+# 制御構文キーワード（呼び出しから除外する）。
 _CONTROL_KEYWORDS = frozenset({"if", "for", "while", "switch", "return", "sizeof"})
 
-# 関数定義／プロトタイプ宣言（単一物理行のみ・粗い判定）: [modifiers] rtype name(args) {|;
-# 定義（`{`）は本文が同じ行に続いてもよい（`int f(void) { return 0; }` 形の短い定義も検出する）——
-# `.match()` は先頭一致のみを要求し、末尾までの一致は要求しない。
-_FUNC_SIG = re.compile(
-    r'^(?:(?:static|inline|extern)\s+)*'
-    r'(?P<rtype>[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*)'
-    r'[\s*]+'
-    r'(?P<name>[A-Za-z_]\w*)\s*'
-    r'\((?P<args>[^;{}()]*)\)\s*'
-    r'(?P<term>[{;])'
-)
+# `.h` に現れたら C++ 専用構文とみなす予約語。
+_CXX_ONLY_WORDS = frozenset({"class", "namespace", "template"})
 
-# `#include "x.h"`／`#include <x.h>`（後者は無視）。
-_INCLUDE = re.compile(r'^\s*#\s*include\s*(?:"(?P<local>[^"]+)"|<[^>]+>)', re.M)
+# 宣言の並びをそのまま包むノード（`#if` の枝・`extern "C" { }`・構文エラーの領域）。中の宣言を読み続ける。
+_CONTAINERS = frozenset({
+    "preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "preproc_elifdef",
+    "linkage_specification", "declaration_list", "ERROR",
+})
 
-# `#define NAME(...)`（関数マクロ・名前と `(` の間に空白を許さない＝オブジェクトマクロと区別）。
-_MACRO_DEFINE = re.compile(r'^\s*#\s*define\s+(?P<name>[A-Za-z_]\w*)\(', re.M)
-
-# 関数ポインタ経由の呼び出し（`(*fp)(...)`）。
-_DYNAMIC_CALL = re.compile(r'\(\s*\*\s*[A-Za-z_]\w*\s*\)\s*\(')
-
-# 通常の呼び出し（`identifier(`）。直後が `(*`（例: `int (*fp)(int);` の型名部分）は関数ポインタ型
-# 宣言の戻り値型/変数型であり呼び出しではないため除外する。
-_CALL = re.compile(r'\b(?P<name>[A-Za-z_]\w*)\s*\((?!\s*\*)')
-
-# K&R 形式（旧式）の関数定義ヘッダ: `name(params)` で行末（`{`/`;` を伴わない）。
-_KNR_HEADER = re.compile(
-    r'^(?:(?:static|inline|extern)\s+)*'
-    r'(?P<rtype>[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*)'
-    r'[\s*]+'
-    r'(?P<name>[A-Za-z_]\w*)\s*'
-    r'\((?P<args>[^;{}()]*)\)\s*$'
-)
-# K&R パラメータ宣言（`型 名;` 形・ヘッダ直後の行に現れることを確認する材料）。
-_KNR_PARAM_DECL = re.compile(r'^[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*[\s*]+[A-Za-z_]\w*\s*;\s*$')
-
-# `(*名)(` の前置部（該当物理行の行頭からその手前まで）が「型指定子だけの宣言形」かどうかの判定。
-# `static`/`extern`/`const` 修飾＋識別子の連なりのみを許し、代入/制御構文等の式は含まない。
-_POINTER_DECL_PREFIX = re.compile(
-    r'^\s*(?:(?:static|extern|const)\s+)*[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*[\s*]*$'
-)
-
-# `.h` に現れたら C++ 専用構文とみなす予約語（C にはこれらのキーワードは無い）。
-_CXX_ONLY_HEADER = re.compile(r'\b(?:class|namespace|template)\b')
+_SNIPPET_MAX = 120
 
 
-def _sanitize(text: str) -> str:
-    """コメント（`//`・`/* */`）と文字列/char リテラルの中身を空白化した、同じ行数の文字列を返す
-    （偽マッチ除外専用・改行は保持し行番号が原本と1対1のまま）。"""
-    out: list = []
+def _captured(parsed: _ts.Parsed, pattern: str, name: str) -> list:
+    """クエリの捕捉を出現順（開始位置の昇順）に並べる（`_ts.captures` の列は出現順とは限らない）。"""
+    return sorted(_ts.captures(parsed, pattern).get(name, []), key=lambda n: n.start_byte)
+
+
+_EMPTY_DEFINE = re.compile(r'^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]*(?:/\*.*?\*/[ \t]*|//.*)?$', re.M)
+_BUILTIN_TYPE_WORDS = frozenset({"int", "void", "char", "short", "long", "float", "double", "unsigned", "signed", "struct", "union", "enum"})
+_LINE_HEAD = re.compile(r'^([ \t]*)([A-Za-z_]\w*)([ \t]+)(?=([A-Za-z_]\w*))', re.M)
+_TYPEDEF_NAMES = re.compile(r'\btypedef\b[^;{}]*?\b([A-Za-z_]\w*)[ \t]*(?:\[[^\]\n]*\])?[ \t]*;|\}[ \t]*([A-Za-z_]\w*)[ \t]*;')
+_MACRO_NAME = re.compile(r'[A-Z][A-Z0-9_]*\Z')
+
+
+def _preprocessor_line_starts(text: str) -> set:
+    """プリプロセッサ指令（継続行を含む）に属する行の先頭位置の集合。"""
+    out: set = set()
+    pos, cont = 0, False
+    for line in text.split("\n"):
+        if cont or line.lstrip().startswith("#"):
+            out.add(pos)
+            cont = line.rstrip("\r").endswith("\\")
+        pos += len(line) + 1
+    return out
+
+
+_EXTERN_C_BRACE = re.compile(r'extern[ \t\n]*"[ ]*"[ \t\n]*\Z')
+_BARE_CALL = re.compile(r'^[ \t]*([A-Z][A-Z0-9_]*)[ \t]*\(', re.M)
+
+
+def _mask(text: str, pp: set) -> str:
+    """コメント・文字列・文字リテラル・プリプロセッサ指令の中身を空白にした同じ長さの文字列（改行は残す）。"""
+    out = list(text)
     i, n = 0, len(text)
+    line_pp = False
+    line_start = True
     while i < n:
         ch = text[i]
-        if ch == "/" and text[i:i + 2] == "/*":
-            out.append("  ")
-            i += 2
-            while i < n and text[i:i + 2] != "*/":
-                out.append("\n" if text[i] == "\n" else " ")
-                i += 1
-            if i < n:
-                out.append("  ")
-                i += 2
-            continue
-        if ch == "/" and text[i:i + 2] == "//":
-            out.append("  ")
-            i += 2
-            while i < n and text[i] != "\n":
-                out.append(" ")
-                i += 1
-            continue
-        if ch == '"' or ch == "'":
-            quote = ch
-            out.append(" ")
+        if line_start:
+            line_pp = i in pp
+            line_start = False
+        if ch == "\n":
+            line_start = True
             i += 1
-            while i < n and text[i] != quote:
-                if text[i] == "\\" and i + 1 < n:
-                    out.append("  ")
-                    i += 2
-                    continue
-                out.append("\n" if text[i] == "\n" else " ")
-                i += 1
-            if i < n:
-                out.append(" ")
-                i += 1
             continue
-        out.append(ch)
+        if line_pp:
+            out[i] = " "
+            i += 1
+            continue
+        two = text[i:i + 2]
+        if two == "/*" or two == "//":
+            end = text.find("*/", i + 2) + 2 if two == "/*" else text.find("\n", i)
+            if end < (2 if two == "/*" else 0):
+                end = n
+            for k in range(i, end):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = end
+            continue
+        if ch in "\"'":
+            j = i + 1
+            while j < n and text[j] != ch and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            for k in range(i + 1, min(j, n)):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j + 1
+            continue
         i += 1
     return "".join(out)
 
 
-def _sanitize_comments_only(text: str) -> str:
-    """コメントだけを空白化し、文字列リテラルの中身は残す（`#include "path"` のパス文字列を
-    読む必要があるため・Java アナライザの同名ヘルパと同じ役割）。"""
-    out: list = []
-    i, n = 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch == "/" and text[i:i + 2] == "/*":
-            out.append("  ")
-            i += 2
-            while i < n and text[i:i + 2] != "*/":
-                out.append("\n" if text[i] == "\n" else " ")
-                i += 1
-            if i < n:
-                out.append("  ")
-                i += 2
+def _blank_bare_macro_calls(text: str, pp: set) -> str:
+    """(c) ファイルの最上位（関数の本体の外）で、大文字・数字・`_` だけの名前 ＋ 閉じる括弧 だけで終わる行（セミコロン無しのマクロの呼び出し
+    `DECLARE_X(Foo)`）を空白にする。後ろに `{`・`=` が続くものは触らない。"""
+    masked = _mask(text, pp)
+    out = list(text)
+    depth, stack, line_depth = 0, [], {}
+    pos = 0
+    for line in masked.split("\n"):
+        line_depth[pos] = depth
+        for k, ch in enumerate(line):
+            if ch == "{":
+                skip = bool(_EXTERN_C_BRACE.search(masked[max(0, pos + k - 40):pos + k]))
+                stack.append(skip)
+                depth += 0 if skip else 1
+            elif ch == "}" and stack:
+                depth -= 0 if stack.pop() else 1
+        pos += len(line) + 1
+    for m in _BARE_CALL.finditer(masked):
+        start = m.start()
+        if line_depth.get(start, 1) != 0 or start in pp:
             continue
-        if ch == "/" and text[i:i + 2] == "//":
-            out.append("  ")
-            i += 2
-            while i < n and text[i] != "\n":
-                out.append(" ")
-                i += 1
-            continue
-        if ch == '"' or ch == "'":
-            quote = ch
-            out.append(ch)
+        i, d = m.end(), 1
+        while i < len(masked) and d:
+            d += (masked[i] == "(") - (masked[i] == ")")
             i += 1
-            while i < n and text[i] != quote:
-                if text[i] == "\\" and i + 1 < n:
-                    out.append(text[i:i + 2])
-                    i += 2
-                    continue
-                out.append(text[i])
-                i += 1
-            if i < n:
-                out.append(quote)
-                i += 1
+        if d:
             continue
-        out.append(ch)
-        i += 1
+        eol = masked.find("\n", i)
+        rest = masked[i:eol if eol != -1 else len(masked)]
+        if rest.strip():
+            continue
+        nxt = masked[i:].lstrip()
+        if nxt[:1] in ("{", "=", ";", ","):
+            continue
+        for k in range(m.start(1), i):
+            if out[k] != "\n":
+                out[k] = " "
     return "".join(out)
 
 
-def _newline_offsets(text: str) -> list:
-    """`text` 内の全改行位置（昇順）。`extract_refs` 1回につき1回だけ作り、`_line_at` は
-    これを `bisect` で引く（大規模ファイルでも対数時間・sql.py と同じ流儀）。"""
-    return [i for i, ch in enumerate(text) if ch == "\n"]
+def _blank_macro_noise(text: str) -> str:
+    """文法が読めない 2 つの定型を、行と位置を変えずに空白へ置き換える（申告は出さない・エラーではない）。対象は宣言の先頭の 1 語だけ。
+    (a) その行より前に、同じファイルで中身の無いマクロとして `#define` された名前（`#define API`）。
+    (c) 最上位のセミコロン無しのマクロの呼び出し行（`DECLARE_X(Foo)`）全体。
+    (b) 組み込みの型の語か同じファイルの typedef 名の直前に置かれた大文字・数字・`_` だけの名前（`API int f(void);`）。
+    プリプロセッサ指令（継続行を含む）の中は触らない。"""
+    text = _blank_bare_macro_calls(text, _preprocessor_line_starts(text))
+    empties = {}
+    for m in _EMPTY_DEFINE.finditer(text):
+        empties.setdefault(m.group(1), m.end())
+    pp = _preprocessor_line_starts(text)
+    typedefs = None
+
+    def head(m):
+        nonlocal typedefs
+        if m.start() in pp:
+            return m.group(0)
+        word, nxt = m.group(2), m.group(4)
+        if word in empties and m.start(2) > empties[word]:
+            pass
+        elif _MACRO_NAME.match(word) and word not in _BUILTIN_TYPE_WORDS:
+            if nxt not in _BUILTIN_TYPE_WORDS:
+                if typedefs is None:
+                    typedefs = {g for t in _TYPEDEF_NAMES.finditer(text) for g in t.groups() if g}
+                if nxt not in typedefs:
+                    return m.group(0)
+        else:
+            return m.group(0)
+        return m.group(1) + " " * len(word) + m.group(3)
+
+    return _LINE_HEAD.sub(head, text)
 
 
-def _line_at(newline_offsets: list, pos: int) -> int:
-    return bisect.bisect_left(newline_offsets, pos) + 1
+def _parse(text: str) -> _ts.Parsed:
+    return _ts.parse("c", _blank_macro_noise(text))
 
 
-def _preprocessor_line_numbers(text: str) -> set:
-    """`#` で始まる（プリプロセッサ指令の）物理行番号の集合。関数定義/呼び出し検出の対象外にする
-    （`#define`/`#include`/`#if defined(...)` 等を誤って関数の宣言/呼び出しと解釈しないため）。"""
-    return {i for i, line in enumerate(text.splitlines(), 1) if line.lstrip().startswith("#")}
+def _members(node):
+    for ch in node.children:
+        if ch.type in _CONTAINERS:
+            yield from _members(ch)
+        else:
+            yield ch
 
 
-def _scan_func_decls(sanitized: str, pp_lines: set) -> list:
-    """波括弧深度0の関数定義/プロトタイプ宣言を `(name, line, name_start, term)` のリストで返す
-    （`term` は `"{"`＝定義／`";"`＝宣言（プロトタイプ）そのもの）。
+def _func_name(declarator):
+    """関数宣言子（`*` の付いた戻り値も可）から関数名のノードを返す。`(*fp)(…)` など名前が直接でないものは `None`。"""
+    n = declarator
+    while n is not None and n.type == "pointer_declarator":
+        n = n.child_by_field_name("declarator")
+    if n is None or n.type != "function_declarator":
+        return None
+    inner = n.child_by_field_name("declarator")
+    return inner if inner is not None and inner.type == "identifier" else None
 
-    `name_start` は `extract_refs` 側が同じ出現位置を「呼び出しではなく定義/宣言」として
-    通常の呼び出し走査から除外するために使う（`_CALL` は `identifier(` という定義/宣言のヘッダとも
-    重なる形のため、二重検出を避ける）。`term` は `collect_defs` 側が children 化を `.c`（定義＝`{`
-    のみ）／`.h`（宣言＝`;` も含む）で使い分けるために使う。
-    """
+
+@dataclass
+class _Func:
+    name: str
+    line: int          # 関数名の行
+    start: int         # 定義の開始行（宣言のみは `line`）
+    end: int           # 定義の終了行
+    definition: bool
+    clean: bool        # 定義の閉じ `}` の後ろに同じ行のコードが続かない
+    qualified: bool = False   # `Widget::run` のような C++ の修飾つきの名前
+
+
+def _trailing_code(parsed: _ts.Parsed, node) -> bool:
+    row = node.end_point[0]
+    sib = node.next_sibling
+    while sib is not None and sib.start_point[0] == row:
+        if sib.type != "comment" and parsed.text(sib).strip() != ";":
+            return True
+        sib = sib.next_sibling
+    return False
+
+
+def _is_qualified(parsed: _ts.Parsed, name) -> bool:
+    return parsed.src[:name.start_byte].rstrip().endswith(b"::")
+
+
+def _scan_funcs(parsed: _ts.Parsed) -> list:
+    """トップレベル（`#if` の枝・`extern "C"` の中を含む）の関数定義とプロトタイプ宣言を出現順に返す。"""
     out: list = []
-    depth = 0
-    pos = 0
-    for i, raw_line in enumerate(sanitized.split("\n"), 1):
-        line_depth = depth
-        depth += raw_line.count("{") - raw_line.count("}")
-        line_start = pos
-        pos += len(raw_line) + 1                          # +1＝改行分（次行の開始位置へ進める）
-        if i in pp_lines or line_depth != 0:
-            continue
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
-        m = _FUNC_SIG.match(stripped)
-        if not m:
-            continue
-        if m.group("rtype").strip() in _CONTROL_KEYWORDS:
-            continue                                      # `return X(...);` 等の誤爆防止
-        # `stripped` は行内の先頭空白を除去済み——元の `raw_line` 内でのオフセットへ補正する。
-        offset_in_line = len(raw_line) - len(raw_line.lstrip())
-        name_start = line_start + offset_in_line + m.start("name")
-        out.append((m.group("name"), i, name_start, m.group("term")))
+    for ch in _members(parsed.root):
+        if ch.type == "function_definition":
+            name = _func_name(ch.child_by_field_name("declarator"))
+            if name is not None:
+                out.append(_Func(parsed.text(name), _ts.start_line(name), _ts.start_line(ch), _ts.end_line(ch), True,
+                                 not _trailing_code(parsed, ch), _is_qualified(parsed, name)))
+        elif ch.type == "declaration":
+            for decl in ch.children_by_field_name("declarator"):
+                name = _func_name(decl)
+                if name is not None:
+                    line = _ts.start_line(name)
+                    out.append(_Func(parsed.text(name), line, line, line, False, True, _is_qualified(parsed, name)))
     return out
 
 
-def _scan_knr_definitions(sanitized: str, pp_lines: set) -> list:
-    """波括弧深度0の K&R 形式（旧式）関数定義ヘッダを `(name, line, name_start)` のリストで返す。
-
-    `name(params)` 単独行（`{`/`;` を伴わない）の直後の非空行が `型 名;` 形のパラメータ宣言で
-    あることまで確認してから採用する——単なる複数行にまたがる呼び出し式まで拾わないため。
-    採用した出現位置は `extract_refs` が通常呼び出し（`_CALL`）走査から除外し、代わりに
-    `Dropped("c_knr_definition", ...)` として申告する（子定義としては認識しない＝検出限界のまま）。
-    """
-    out: list = []
-    depth = 0
-    pos = 0
-    lines = sanitized.split("\n")
-    for i, raw_line in enumerate(lines, 1):
-        line_depth = depth
-        depth += raw_line.count("{") - raw_line.count("}")
-        line_start = pos
-        pos += len(raw_line) + 1
-        if i in pp_lines or line_depth != 0:
-            continue
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
-        m = _KNR_HEADER.match(stripped)
-        if not m:
-            continue
-        if m.group("rtype").strip() in _CONTROL_KEYWORDS:
-            continue
-        nxt = None
-        for j in range(i, len(lines)):
-            candidate = lines[j].strip()
-            if candidate:
-                nxt = candidate
-                break
-        if nxt is None or not _KNR_PARAM_DECL.match(nxt):
-            continue                                      # 次行がパラメータ宣言形でなければ K&R と断定しない
-        offset_in_line = len(raw_line) - len(raw_line.lstrip())
-        name_start = line_start + offset_in_line + m.start("name")
-        out.append((m.group("name"), i, name_start))
-    return out
+def _cxx_header_line(parsed: _ts.Parsed) -> int | None:
+    hits = [n for n in _ts.captures(parsed, "[(identifier) (type_identifier)] @t").get("t", [])
+            if parsed.text(n) in _CXX_ONLY_WORDS]
+    return _ts.start_line(min(hits, key=lambda n: n.start_byte)) if hits else None
 
 
-def _looks_like_pointer_decl_prefix(line_prefix: str) -> bool:
-    """`(*名)(` の前置部（同一物理行内・行頭からその手前まで）が関数ポインタの宣言形
-    （型指定子だけ）かどうかを判定する。`return`/`if` 等の制御構文キーワードは字面上
-    「識別子1語」と区別が付かないため、先頭トークンが制御構文キーワードなら宣言とはみなさない
-    （`return (*fp)(x);` を宣言と誤認しない）。"""
-    if not _POINTER_DECL_PREFIX.match(line_prefix):
-        return False
-    tokens = line_prefix.split()
-    return bool(tokens) and tokens[0] not in _CONTROL_KEYWORDS
+_EXTERN_C_OPEN = re.compile(r'^[ \t]*#[ \t]*if[^\n]*__cplusplus[^\n]*\n[ \t]*extern[ \t]+"C"[ \t]*\{', re.M)
+_EXTERN_C_CLOSE = re.compile(r'^[ \t]*#[ \t]*if[^\n]*__cplusplus[^\n]*\n[ \t]*\}', re.M)
+
+
+def _syntax_errors(parsed: _ts.Parsed, text: str) -> list:
+    """構文エラーの申告。`#ifdef __cplusplus extern "C" { #endif … #ifdef __cplusplus } #endif` の括弧の対応が `#if` の枝に分かれる形は
+    文法が `#endif` の欠落を 1 つ報告するが、中身は正しく読めているので申告しない。この定型が開閉とも見つかったときだけ最初の 1 件を除き、他の未閉鎖の `#if` は申告する。"""
+    errors = _ts.syntax_errors(parsed)
+    if _EXTERN_C_OPEN.search(text) and _EXTERN_C_CLOSE.search(text):
+        for i, d in enumerate(errors):
+            if d.snippet == "missing #endif":
+                return errors[:i] + errors[i + 1:]
+    return errors
+
+
+def _line_text(text: str, line: int) -> str:
+    lines = text.split("\n")
+    return lines[line - 1].strip()[:_SNIPPET_MAX] if 0 < line <= len(lines) else ""
 
 
 class CAnalyzer(Analyzer):
@@ -311,86 +276,81 @@ class CAnalyzer(Analyzer):
     extensions = C_EXT
     resolves_calls_by_simple_name = True
     doctype = "c"
+    version = 4
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         filename = PurePosixPath(rel_path).name
-        is_header = PurePosixPath(rel_path).suffix.lower() == ".h"   # 拡張子は大文字小文字を区別しない
-        sanitized = _sanitize(text)
-        lines_raw = text.splitlines()
-        pp_lines = _preprocessor_line_numbers(text)
-        # `.c` は定義（`{` 終端）だけを children 化する——`;` 終端は外部宣言（プロトタイプ）であり、
-        # 別ファイルの実体を指すだけの宣言を自ファイルの偽 child にしない。`.h` は従来どおり
-        # 宣言（`;`）も children 化する。
-        decls = _scan_func_decls(sanitized, pp_lines)
-        if is_header:
-            child_decls = decls
-        else:
-            child_decls = [d for d in decls if d[3] == "{"]
-        # `c_kind`（定義/宣言）を children の索引に持たせる（world_graph._register_children が
-        # `simple_name_defs` へそのまま転記し、単純名の呼び出し解決が定義側を宣言側より優先できる
-        # ようにするため・§9）。
+        is_header = PurePosixPath(rel_path).suffix.lower() == ".h"
+        parsed = _parse(text)
+        # `.c` は定義だけを children 化する（`;` 終端の外部宣言を偽 child にしない）。`.h` は宣言（`;`）も children 化する。
+        # `c_kind` を children の索引へ持たせる（単純名の呼び出し解決が定義を宣言より優先するため）。
         children = [
-            DefItem(label="Module", name=name, cid_key=f"{filename}.{name}", line=line,
-                    extra={"c_kind": "definition" if term == "{" else "declaration"})
-            for name, line, _start, term in child_decls
+            DefItem(label="Module", name=f.name, cid_key=f"{filename}.{f.name}", line=f.line,
+                    extra={"c_kind": "definition" if f.definition else "declaration"})
+            for f in _scan_funcs(parsed) if not f.qualified and (is_header or f.definition)
         ]
         dropped: list = []
         if is_header:
-            cxx_m = _CXX_ONLY_HEADER.search(sanitized)
-            if cxx_m:
-                line = sanitized.count("\n", 0, cxx_m.start()) + 1
-                snippet = lines_raw[line - 1].strip()[:120] if line - 1 < len(lines_raw) else ""
-                dropped.append(Dropped("cxx_header", line, snippet))
+            lines = [f.line for f in _scan_funcs(parsed) if f.qualified]
+            keyword = _cxx_header_line(parsed)
+            line = min(lines + ([keyword] if keyword is not None else []), default=None)
+            if line is not None:
+                dropped.append(Dropped("cxx_header", line, _line_text(text, line)))
+        dropped += _syntax_errors(parsed, text)
         return DefResult(primary=DefItem(label="Module", name=filename), children=children, dropped=dropped)
 
     def extract_refs(self, text: str, rel_path: str) -> RefResult:
-        sanitized = _sanitize(text)
-        comments_only = _sanitize_comments_only(text)
-        pp_lines = _preprocessor_line_numbers(text)
-        newline_offsets = _newline_offsets(text)
+        parsed = _parse(text)
         refs: list = []
         dropped: list = []
 
-        for m in _INCLUDE.finditer(comments_only):
-            line = _line_at(newline_offsets, m.start())
-            local = m.group("local")
-            if not local:
-                continue                                  # `<...>` システムヘッダは対象外
-            local = local.replace("\\", "/")               # Windows 区切り正規化（analyzer 入口・§4(a)）
+        for p in _captured(parsed, "(preproc_include path: (string_literal) @p)", "p"):
+            local = parsed.text(p)[1:-1].replace("\\", "/")  # Windows 区切り正規化
             basename = PurePosixPath(local).name
             if basename:
-                refs.append(RefCandidate("INVOKES", "Module", basename, line,
-                                         extra={"via": "include", "include_path": local}))
+                refs.append(RefCandidate("INVOKES", "Module", basename, _ts.start_line(p),
+                                         extra={"via": "include", "include_path": local, "path_exact": True}))
 
-        for m in _DYNAMIC_CALL.finditer(sanitized):
-            line = _line_at(newline_offsets, m.start())
-            if line in pp_lines:
+        filename = PurePosixPath(rel_path).name
+        spans = [(f.name, f.start, f.end, f.clean) for f in _scan_funcs(parsed) if f.definition and not f.qualified]
+        ambiguous_lines: set = set()
+
+        def owner_of(line: int):
+            """行を本体に含む関数定義の `source_symbol_id`（関数の外＝ファイル直下は `None`）。
+
+            同じ行に 2 つ以上の定義がかかる行・定義の閉じ `}` の後ろに同じ行のコードが続く行は決められないので主体（`None`）にし、`Dropped("ambiguous_source_symbol")` を 1 行 1 件残す。
+            """
+            hits = [name for name, start, end, _clean in spans if start <= line <= end]
+            shared = len(hits) > 1 or any(end == line and not clean for _n, _s, end, clean in spans)
+            if shared:
+                if line not in ambiguous_lines:
+                    ambiguous_lines.add(line)
+                    dropped.append(Dropped("ambiguous_source_symbol", line, ", ".join(f"{filename}.{n}" for n in hits)))
+                return None
+            return (rel_path, f"{filename}.{hits[0]}") if hits else None
+
+        macro_names = {parsed.text(n) for n in
+                       _ts.captures(parsed, "(preproc_function_def name: (identifier) @m)").get("m", [])}
+        conditions = [(n.start_byte, n.end_byte) for n in _ts.captures(
+            parsed, "[(preproc_if condition: (_) @c) (preproc_elif condition: (_) @c)]").get("c", [])]
+
+        for call in _captured(parsed, "(call_expression) @call", "call"):
+            if any(lo <= call.start_byte and call.end_byte <= hi for lo, hi in conditions):
+                continue                                  # `#if FOO(1)` の条件式は呼び出しではない
+            callee = call.child_by_field_name("function")
+            if callee is None:
                 continue
-            line_start = sanitized.rfind("\n", 0, m.start()) + 1
-            line_prefix = sanitized[line_start:m.start()]
-            if _looks_like_pointer_decl_prefix(line_prefix):
-                continue                                  # 前置部が型指定子だけの宣言形＝関数ポインタ型の
-                                                            # 変数宣言（`int (*fp)(int);`）——呼び出しではなく
-                                                            # 検出限界として黙って見逃す（docstring 参照）
-            dropped.append(Dropped("c_dynamic_call", line, sanitized.splitlines()[line - 1].strip()[:120]))
-
-        decl_positions = {start for _name, _line, start, _term in _scan_func_decls(sanitized, pp_lines)}
-        knr_defs = _scan_knr_definitions(sanitized, pp_lines)
-        knr_positions = {start for _name, _line, start in knr_defs}
-        for name, line, _start in knr_defs:
-            dropped.append(Dropped("c_knr_definition", line, sanitized.splitlines()[line - 1].strip()[:120]))
-        macro_names = {m.group("name") for m in _MACRO_DEFINE.finditer(sanitized)}
-
-        for m in _CALL.finditer(sanitized):
-            line = _line_at(newline_offsets, m.start())
-            if line in pp_lines or m.start("name") in decl_positions or m.start("name") in knr_positions:
+            line = _ts.start_line(callee)
+            if callee.type != "identifier":
+                dropped.append(Dropped("c_dynamic_call", line, _line_text(text, line)))
                 continue
-            name = m.group("name")
+            name = parsed.text(callee)
             if name in _CONTROL_KEYWORDS:
                 continue
             if name in macro_names:
                 dropped.append(Dropped("c_macro_call", line, name))
                 continue
-            refs.append(RefCandidate("INVOKES", "Module", name, line, extra={"via": "call"}))
+            refs.append(RefCandidate("INVOKES", "Module", name, line, extra={"via": "call"},
+                                     source_symbol_id=owner_of(line)))
 
         return RefResult(refs=refs, dropped=dropped)

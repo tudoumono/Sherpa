@@ -7,26 +7,13 @@
     document.head.appendChild(l);
   }
 })();
-// 全ページ共通ユーティリティ（window.Sherpa）。フェーズ6 S2（リファクタリング計画）で nav.js から
-// 分離した。全 HTML で nav.js の直前に読み込む classic script（module 化しない — nav.js と同じ
-// 理由＝読み込み順が全ページに波及するため単純さを優先）。
+// 全ページ共通ユーティリティ（window.Sherpa）。全 HTML で nav.js の直前に読み込む classic script（module 化しない）。
 'use strict';
 
-// 全ページ共通ユーティリティ（各 *.js で重複していた esc/$/api/getJSON の単一の真実源・RV DRY）。
-// nav.js は全 HTML で page script より前に読まれるので、ここに置けば HTML 追加なしで共有できる。
-// `opts.timeoutMs`（省略可）: 指定すると応答本文の読了までを含めた締切を設ける（`fetch()` が
-// すぐ解決しても `r.json()` の本文読み取りが詰まるケースも締切の対象にするため、`fetch()`＋
-// `json()` 全体を `Promise.race` で締切と競わせる——`fetch()` 単体に `AbortController` を
-// 付けるだけだと、ヘッダ受信後に本文ストリームが詰まる場合を締切から取りこぼす）。締切超過・
-// 通信断（ネットワーク断・DNS失敗等）・本文が不正な JSON（ステータスに関わらず）のいずれも
-// 「サーバーに書込みが実際に届いたかどうか分からない曖昧な失敗」として `err.ambiguous = true`
-// を立てて投げる（呼び出し側は発行系 API のように「送信済みかもしれないが結果が確認できない」
-// 失敗を回復する用途に使う）。締切超過は追加で `err.timeout = true` も立てる（従来からの区別・
-// 呼び出し側で締切固有の文言を出したい場合用）。**本文の JSON 解析可否を先に判定する**——
-// 妥当な JSON を持つ非2xx応答（自分のアプリが明示的に拒否を返した）だけが曖昧ではない確定的な
-// 失敗になる。本文が JSON として解析できない非2xx（例: リバースプロキシ/ゲートウェイが返す
-// HTML の 502/504）は、自分のアプリの整形されたエラー応答ではない＝アプリ側の処理が実際には
-// 完了していた可能性を排除できないため、ambiguous 扱いにする（ステータス判定より先に行う）。
+// 全ページ共通ユーティリティ（esc/$/api/getJSON）。nav.js は全 HTML で page script より前に読まれるため、ここに置けば HTML 追加なしで共有できる。
+// opts.timeoutMs（省略可）: 指定すると本文の読了までを含めた締切を設け、fetch()＋json() 全体を Promise.race で締切と競わせる。
+// 締切超過・通信断・本文が不正な JSON のいずれも「書込みが届いたか分からない曖昧な失敗」として err.ambiguous = true を立てて投げる（締切超過は追加で err.timeout = true）。
+// 本文の JSON 解析可否を先に判定する: 妥当な JSON を持つ非2xx応答だけが確定的な失敗で、解析できない非2xx（プロキシの HTML 502/504 等）は ambiguous 扱い。
 const _sherpaApi = async (method, url, body, opts) => {
   const o = opts || {};
   const opt = { method, headers: { 'Content-Type': 'application/json' } };
@@ -53,19 +40,13 @@ const _sherpaApi = async (method, url, body, opts) => {
     let parseFailed = false;
     try { data = await r.json(); } catch (_) { parseFailed = true; }
     if (parseFailed) {
-      // ステータス判定より先に評価する: 妥当な JSON を返せていない応答は、ステータスが非2xx
-      // でも自分のアプリからの整形されたエラーとは限らない（中間のプロキシ障害等）ため、
-      // 常に曖昧（結果不明）として扱う。
+      // ステータス判定より先に評価する: 妥当な JSON を返せていない応答は、非2xx でも自アプリの整形エラーとは限らないため常に曖昧（結果不明）として扱う。
       const err = new Error(`応答の形式が不正です（HTTP ${r.status}・サーバーの処理結果が確認できません）`);
       err.ambiguous = true;
       throw err;
     }
     if (!r.ok) {
-      // ここに来るのは妥当な JSON を持つ非2xx＝自分のアプリが明示的に拒否した確定的な失敗。
-      // `status`/`body`（応答 JSON 全体）を Error へ載せる——`message` だけでは、応答本文に
-      // 追加フィールド（例: usage_chat の 502/503 応答の `provider_used`/`endpoint_kind`）を
-      // 持つ場合に呼び出し側がそれを読めない（既存の呼び出し元は `message` のみ参照するため
-      // 影響なし＝追加のみ）。
+      // ここに来るのは妥当な JSON を持つ非2xx＝自アプリが明示的に拒否した確定的な失敗。status/body（応答 JSON 全体）を Error へ載せる（既存の呼び出し元は message のみ参照するため追加のみ）。
       const err = new Error((data && (data.detail || data.message)) || `エラー (${r.status})`);
       err.status = r.status;
       err.body = data;
@@ -90,11 +71,8 @@ const _sherpaApi = async (method, url, body, opts) => {
     clearTimeout(timer);
   }
 };
-// 日時表示の共通ヘルパー（RV DRY・S3 2026-07 修正）。サーバは常に timezone 付き ISO 8601（`+00:00` 等）
-// を返す（psycopg の timestamptz はタイムゾーン付き datetime→FastAPI がオフセット込みで直列化）。
-// `String(iso).slice(0,16).replace('T',' ')` のような素朴な文字列切り出しは UTC の時刻をそのまま
-// ローカル表示してしまう不具合の元（例: 16:12 表示なのに実際は 9 時間ズレた JST 1:13）。
-// 必ず `new Date(iso)` を経由し、**端末ロケール（実質 JST）**へ変換してから表示する。
+// 日時表示の共通ヘルパー。サーバは常に timezone 付き ISO 8601 を返すため、文字列切り出しでは UTC の時刻がそのまま表示される。
+// 必ず new Date(iso) を経由し、端末ロケール（実質 JST）へ変換してから表示する。
 const _fmtDateTime = (iso, opts) => {
   if (!iso) return '';
   const d = new Date(iso);
@@ -105,12 +83,8 @@ const _fmtDateTime = (iso, opts) => {
   const time = `${p(d.getHours())}:${p(d.getMinutes())}` + (opts && opts.seconds ? `:${p(d.getSeconds())}` : '');
   return `${date} ${time}`;
 };
-// UI フィードバック3（2026-07-03・原本DLの「フリーズ」修正）: blob ダウンロードは `a.click()` の
-// 直後に `URL.revokeObjectURL()` すると、ブラウザの保存ダイアログ（「名前を付けて保存」設定時）が
-// まだ blob を読み切る前に無効化してしまい、保存・キャンセルいずれの結果でもダウンロードが完了せず
-// 固まって見える不具合の原因になる（chat.js/ingest.js の原本DLハンドラで実際に踏んでいたパターン）。
-// 保存ダイアログが閉じたことを検知できる汎用イベントは無い（特にキャンセル時）ため、そのイベント待ち
-// に依存せず、十分な猶予（数秒）を置いてから revoke するタイムアウト方式にする。
+// blob ダウンロードは a.click() の直後に URL.revokeObjectURL() すると、保存ダイアログが blob を読み切る前に無効化されダウンロードが固まる。
+// 保存ダイアログの終了は検知できないため、数秒の猶予を置いてから revoke する。
 const _sherpaDownloadBlob = (blob, filename) => {
   const a = document.createElement('a');
   const url = URL.createObjectURL(blob);
@@ -123,21 +97,16 @@ const _sherpaDownloadBlob = (blob, filename) => {
 const _sherpaEsc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-// 非表示タブでの定期ポーリング停止（Page Visibility API・RV DRY＝各所の setInterval が個別に
-// 同じ判定を書かない単一の真実源）。document.hidden の間はタイマーを止め、可視化に戻った瞬間に
-// fn を1回即時実行してから再開する（間隔いっぱい待たせない）。ストリーミング中の SSE ティックや
-// 取り込み run 進捗の自己ポーリング（run_id 追跡中）はこの対象外——それぞれ独自の停止条件を
-// 既に持つため個別のまま（既存の即時初回呼び出しは呼び出し側の責務のまま・ここでは繰り返しのみ扱う）。
-// 戻り値の stop() は setInterval のクリアと visibilitychange リスナーの解除を両方行う
-// （connectedCallback の再実行等で作り直す前に必ず呼ぶこと＝多重登録防止）。
+// 非表示タブでの定期ポーリング停止（Page Visibility API）。document.hidden の間はタイマーを止め、可視化に戻った瞬間に fn を1回即時実行してから再開する。
+// SSE ティックや取り込み run 進捗の自己ポーリングは独自の停止条件を持つため対象外。
+// 戻り値の stop() は setInterval のクリアと visibilitychange リスナーの解除を両方行う（作り直す前に必ず呼ぶ＝多重登録防止）。
 const _sherpaVisibilityInterval = (fn, ms) => {
   let timer = null;
   const start = () => { if (timer === null) timer = setInterval(fn, ms); };
   const stop = () => { if (timer !== null) { clearInterval(timer); timer = null; } };
   const onVisibility = () => {
     if (document.hidden) { stop(); return; }
-    // fn() が同期例外を投げても再開（start）は必ず行う——再開が死んで以後ずっと
-    // ポーリングされなくなる事故を避ける。
+    // fn() が同期例外を投げても再開（start）は必ず行う。
     try { fn(); } finally { start(); }
   };
   document.addEventListener('visibilitychange', onVisibility);
@@ -146,52 +115,34 @@ const _sherpaVisibilityInterval = (fn, ms) => {
 };
 
 // AI回答の Markdown 表示: 外部ライブラリ非依存の安全サブセット・レンダラ。
-// **必ず esc() で全文エスケープしてからパターン変換する**＝変換元に <script> 等の実タグは
-// 一切存在しない状態でのみ正規表現を当てるため、構造的に XSS が起こり得ない（`<img onerror=...>` は
-// エスケープ済みの見えるだけの文字列にしかならない）。リンクは `[text](http(s)://…)` だけを
-// `<a>` にする（`javascript:`・`data:` 等の他スキームと裸の URL は文字のまま＝自動リンク化しない）。
-// 対応: **太字**・*斜体*・`インラインコード`・```コードブロック```・[text](http(s)://…)・
-// 箇条書き（-／*／+）・番号付き（1.）・入れ子リスト（行頭の字下げ 2 桁以上／タブ）・
-// 見出し（# 〜 ###### は太字段落程度の控えめな表現）・表（| a | b | ＋ 区切り行）・引用（>）・
-// 水平線（---／***／___）・改行。それ以外は素の段落として通す。CommonMark/GFM 全体の再実装では
-// なく実害の出やすい形だけを狙う安全サブセットのため、意図的に非対応のままの箇所がある
-// （バックスラッシュエスケープ全般・パイプで囲んだ1行の直後に来る水平線との衝突）。
+// 必ず esc() で全文エスケープしてからパターン変換する（変換元に実タグが存在しないため XSS が起こり得ない）。リンクは [text](http(s)://…) だけを <a> にする（javascript:・data: 等の他スキームと裸の URL は文字のまま）。
+// 対応: 太字・斜体・インラインコード・コードブロック・リンク・箇条書き（-／*／+）・番号付き・入れ子リスト・見出し（太字段落程度）・表・引用・水平線・改行。それ以外は素の段落。
+// CommonMark/GFM の再実装ではなく、バックスラッシュエスケープ全般などは意図的に非対応。
 function _mdInlineSafe(escaped) {
-  // escaped は esc() 済み文字列。コードスパンをまたぐ強調やコードスパンを含むリンクにも対応する
-  // ため、バッククォート区間で断片に分割してから個別に処理するのではなく、コードスパンを
-  // 制御文字のプレースホルダへ退避 → 結合済み文字列に太字/斜体/リンクを適用 → 最後にコードスパンを
-  // 復元する（プレースホルダは esc() 済みテキストに現れない制御文字を使うため元テキストと衝突しない）。
+  // escaped は esc() 済み文字列。コードスパンを制御文字のプレースホルダへ退避 → 結合済み文字列に太字/斜体/リンクを適用 → 最後にコードスパンを復元する。
   const codeSpans = [];
   const withPlaceholders = escaped.replace(/`([^`]+?)`/g, (_, code) => {
     codeSpans.push(code);
     return `\x00${codeSpans.length - 1}\x00`;
   });
   const inline = withPlaceholders
-    // 太字（*斜体*より先に処理）。中身は「連続する **」を含まないことだけを要求し、単独の `*`
-    // （`**COUNT(*)**` 等）は許す。
+    // 太字（*斜体*より先に処理）。単独の `*`（`**COUNT(*)**` 等）は許す。
     .replace(/\*\*((?:(?!\*\*)[\s\S])+?)\*\*/g, '<strong>$1</strong>')
-    // 斜体: 開き `*` の直後・閉じ `*` の直前の空白を禁止する（CommonMark のフランキング規則の実用形）。
-    // SQL のワイルドカード・COBOL の乗算演算子・glob の `*` のような単発の記号を誤って強調にしない。
-    // 中身に `<`/`>` を許さない＝太字処理済みの `<strong>`/`</strong>` タグ境界を跨いで
-    // 別々の太字内にある単発 `*` 同士（`**COUNT(*)** と **COUNT(*)**` 等）を対応付けない。
+    // 斜体: 開き `*` の直後・閉じ `*` の直前の空白を禁止する（SQL のワイルドカード・COBOL の乗算・glob の `*` を誤って強調にしない）。
+    // 中身に `<`/`>` を許さない（太字済みタグ境界を跨いだ対応付けを防ぐ）。
     .replace(/(^|[^*])\*(?!\s)([^*<>]+?)(?<!\s)\*(?!\*)/g, '$1<em>$2</em>')
-    // リンク: URL は http(s) のみ・空白を含まない範囲＋1段の対応括弧を許す（esc 済みなので
-    // " ' < > は入り得ない）。太字/斜体の後に処理するため、リンク文字列側に <strong> 等が
-    // 入っていてもそのまま包める。
+    // リンク: URL は http(s) のみ・空白を含まない範囲＋1段の対応括弧を許す。太字/斜体の後に処理するため、リンク文字列側の <strong> 等はそのまま包める。
     .replace(/\[([^\]]+?)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)/g,
       '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   return inline.replace(/\x00(\d+)\x00/g, (_, idx) => `<code>${codeSpans[Number(idx)]}</code>`);
 }
 // 表・リスト項目・コードフェンスで共通に使う行パターン。
 const _MD_ITEM_RE = /^(\s*)([-*+]|\d+\.)\s+(.*)$/;
-// 開き fence: 3連バッククォートの前後（インデント最大4桁＝リスト内の字下げも兼ねる・info string
-// との間・info string の後）に空白を許す。info string 自体の内容は使わない（言語名クラスを
-// 付けない）ため中身は問わない。
+// 開き fence: 3連バッククォートの前後（インデント最大4桁・info string との間・後）に空白を許す。info string の内容は使わない。
 const _MD_FENCE_OPEN = /^(\s{0,4})(`{3,})[ \t]*[^`\s]*[ \t]*$/;
-// 閉じ fence: 開きと同数以上のバッククォートのみの行（info string 不可）。開きの本数を捕捉して
-// 判定する＝4 連で開いたフェンスは内側の 3 連では閉じない（フェンス自体を見せる書き方）。
+// 閉じ fence: 開きと同数以上のバッククォートのみの行。開きの本数を捕捉して判定する（4連で開いたフェンスは内側の3連では閉じない）。
 function _mdFenceClose(n) { return new RegExp('^\\s{0,4}`{' + n + ',}\\s*$'); }
-// 引用: `>` の直後が空白または行末のときだけ（`>=` のような比較演算子を引用と誤認識しない）。
+// 引用: `>` の直後が空白または行末のときだけ（`>=` などの比較演算子を誤認しない）。
 const _MD_QUOTE_RE = /^\s*&gt;(?:\s|$)/;
 function _mdStripIndent(line, n) {
   if (n <= 0) return line;
@@ -199,14 +150,11 @@ function _mdStripIndent(line, n) {
   return line.slice(Math.min(lead.length, n));
 }
 function _mdTableCells(line) {
-  // バッククォート区間の外・かつ直前が `\` でない `|` だけで分割する（コードスパン内の `|` や
-  // GFM エスケープ `\|` をセルの継ぎ目にしない）。外側の `|` は任意＝境界の空セルは捨てる。
-  // 残った `\|` は表示直前に `|` へ戻す。
+  // バッククォート区間の外・かつ直前が `\` でない `|` だけで分割する。外側の `|` は任意（境界の空セルは捨てる）。残った `\|` は表示直前に `|` へ戻す。
   const src = line.trim();
   const cells = [];
   let buf = '';
-  // 行内で閉じないバッククォート（奇数個）はコードスパンではなく通常文字として扱う＝
-  // 区切りの `|` を取りこぼして本体行の取り込みが途切れないようにする。
+  // 行内で閉じないバッククォート（奇数個）はコードスパンではなく通常文字として扱う（区切りの `|` を取りこぼさないため）。
   const codeAware = (src.match(/`/g) || []).length % 2 === 0;
   let inCode = false;
   for (let idx = 0; idx < src.length; idx++) {
@@ -220,8 +168,7 @@ function _mdTableCells(line) {
   if (cells.length > 1 && cells[cells.length - 1].trim() === '') cells.pop();
   return cells.map((c) => c.trim().replace(/\\\|/g, '|'));
 }
-// 表行の構造判定: 外側の `|` は任意・2セル以上（ヘッダ・区切り・本体で共通の1つの判定）。
-// 1セルしか無い行（パイプで囲んだだけの1行文など）は表として扱わない＝偽の1列表も防ぐ。
+// 表行の構造判定: 外側の `|` は任意・2セル以上。1セルしか無い行は表として扱わない。
 function _mdIsTableRow(line) {
   return _mdTableCells(line).length >= 2;
 }
@@ -235,10 +182,7 @@ function _mdTableAlign(sepLine) {
   });
 }
 function _mdRenderList(list) {
-  // list = {type, items:[{text, children:[list…], extraHtml:[...]}], start}。
-  // extraHtml はリスト項目内の字下げコードフェンスなど、テキストと同列に描画するがインライン
-  // 処理には通さない（既に組み立て済みの）ブロック HTML。start は先頭項目の番号（<ol> のみ・
-  // 1 のときは省略）。
+  // list = {type, items:[{text, children:[list…], extraHtml:[...]}], start}。extraHtml はリスト項目内の字下げコードフェンスなど、インライン処理に通さない組み立て済みブロック HTML。start は先頭項目の番号（<ol> のみ・1 のときは省略）。
   const startAttr = list.type === 'ol' && list.start && list.start !== 1 ? ` start="${list.start}"` : '';
   const items = list.items.map((it) => (
     `<li>${_mdInlineSafe(it.text)}${(it.extraHtml || []).join('')}${it.children.map(_mdRenderList).join('')}</li>`
@@ -303,8 +247,7 @@ function _mdBlocks(lines) {
       const thead = `<thead><tr>${header.map((c, k) => td(c, k, 'th')).join('')}</tr></thead>`;
       const rows = [];
       i += 2;
-      // ヘッダの列数を超えるセルは最後のセルへ `|` で連結して 1 行として描画する（余剰セルを
-      // 消さず、後続の正常な本体行も表に残す）。
+      // ヘッダの列数を超えるセルは最後のセルへ `|` で連結して 1 行として描画する。
       while (i < lines.length && _mdIsTableRow(lines[i])) {
         let cells = _mdTableCells(lines[i]);
         if (cells.length > header.length) {
@@ -316,9 +259,7 @@ function _mdBlocks(lines) {
       out.push(`<table class="md-table">${thead}<tbody>${rows.join('')}</tbody></table>`);
       continue;
     }
-    // リスト（- * + ／ 1.）: 連続する項目行を集め、字下げ幅で入れ子にする。項目間の空行1行・
-    // 項目の内容列以上の字下げが付いた継続行（コードフェンスならブロックとして、それ以外は
-    // 現在の項目のテキストへ連結）はリストを打ち切らない。
+    // リスト（- * + ／ 1.）: 連続する項目行を集め、字下げ幅で入れ子にする。項目間の空行1行・項目の内容列以上の字下げの継続行はリストを打ち切らない。
     const item = line.match(_MD_ITEM_RE);
     if (item) {
       flushPara();
@@ -338,8 +279,7 @@ function _mdBlocks(lines) {
       while (i < lines.length) {
         const raw = lines[i];
         if (raw.trim() === '') {
-          // 空行1行はリスト継続。次行が項目、または現在の項目への継続行なら打ち切らない
-          // （2連続の空行・無関係な内容が続く場合はここで終了し、外側ループに処理を戻す）。
+          // 空行1行はリスト継続。次行が項目、または現在の項目への継続行なら打ち切らない。
           const next = lines[i + 1] ?? '';   // 末尾の空行（次行なし）は空行扱い＝ここでリスト終了
           const nextBlank = next.trim() === '';
           const nextIsItem = _MD_ITEM_RE.test(next);
@@ -353,8 +293,7 @@ function _mdBlocks(lines) {
         if (!m) {
           const indent = raw.match(/^(\s*)/)[1].replace(/\t/g, '  ').length;
           if (lastItem !== null && indent >= lastItemCol) {
-            // 字下げされた表の開始行・引用行は項目テキストへ連結せず、リストを閉じて外側の
-            // ブロック処理に返す（表・引用として描画される＝行はそのまま残す）。
+            // 字下げされた表の開始行・引用行は項目テキストへ連結せず、リストを閉じて外側のブロック処理に返す。
             if (_MD_QUOTE_RE.test(raw) ||
                 (_mdIsTableRow(raw) && i + 1 < lines.length && _mdIsTableSep(lines[i + 1]))) break;
             // fence は項目の内容列を基準に判定する（2 段目以降の入れ子でも字下げ 4 桁超で認識する）。
@@ -415,12 +354,8 @@ function _mdLite(raw) {
   return _mdBlocks(escaped.split('\n'));
 }
 
-// 担当アナライザの来歴表示（§7 裁定2の受入条件＝取り込み画面と影響分析の根拠表示で参照できる
-// ようにする）。内部名（`Analyzer.name`・現行は cobol/copybook/jcl）を平文の表示ラベルへ写像する
-// ——ingest.js（文書一覧・プレビュー）と chat/render.js（影響結果）が共有する単一の真実源（DRY）。
-// own-property のみを見る（`hasOwnProperty` 経由・`constructor`/`__proto__`/`toString` 等の
-// プロトタイプ継承プロパティを誤って返さない）。未知の名前（新規言語追加時）は加工せず
-// `String(name)` をそのまま返す（大文字化しない・黙って空にもしない）。
+// 担当アナライザの来歴表示: 内部名（Analyzer.name・現行は cobol/copybook/jcl）を平文の表示ラベルへ写像する。ingest.js と chat/render.js が共有する。
+// own-property のみを見る（プロトタイプ継承プロパティを返さない）。未知の名前は加工せず String(name) をそのまま返す。
 const _ANALYZER_LABEL = { cobol: 'COBOL', copybook: 'コピーブック', jcl: 'JCL' };
 const _analyzerLabel = (name) => {
   if (!name) return null;

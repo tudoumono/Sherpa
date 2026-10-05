@@ -11,6 +11,12 @@
 # 対になる——このスクリプトは OS 側の前提条件、doctor は Codex 自身が実際にコマンドを実行できるかを見る。
 set -euo pipefail
 
+# この診断は Linux の仕組み（bubblewrap・AppArmor）の確認。macOS の Codex は Seatbelt を使うため対象外。
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "Codex は macOS では Seatbelt を使うため、この確認（bubblewrap・AppArmor）は Linux 用です。何もせず終了します。"
+  exit 0
+fi
+
 _SYSCTL_KEY="kernel.apparmor_restrict_unprivileged_userns"
 _SYSCTL_KEY_RE='kernel\.apparmor_restrict_unprivileged_userns'
 _CONF_PATH="/etc/sysctl.d/99-sherpa-codex-userns.conf"
@@ -45,16 +51,15 @@ _sysctl_value() {
 # 勝つ（systemd-sysctl の規則）。生き残ったファイルのうちこのキーを持つものを basename 順に見て、
 # 最後（＝再起動後に実際に効く値を書く）ファイルのパスを出す。見つからなければ何も出さない。
 _winning_conf_file() {
-  local dir f bn last=""
-  local -A seen=()
+  local dir f bn last="" seen=" "
   local -a survivors=()
   for dir in /etc/sysctl.d /run/sysctl.d /usr/lib/sysctl.d; do
     [ -d "$dir" ] || continue
     for f in "$dir"/*.conf; do
       [ -f "$f" ] || continue
       bn="$(basename "$f")"
-      [ -n "${seen[$bn]:-}" ] && continue
-      seen[$bn]=1
+      case "$seen" in *" $bn "*) continue ;; esac
+      seen="$seen$bn "
       if grep -Eq "^[[:space:]]*${_SYSCTL_KEY_RE}[[:space:]]*=" "$f" 2>/dev/null; then
         survivors+=("$bn|$f")
       fi

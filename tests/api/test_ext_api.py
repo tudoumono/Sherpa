@@ -1,29 +1,49 @@
-"""外部連携 API（/ext/v1・E1: APIキー基盤＋POST /ext/v1/convert・E2c: POST /ext/v1/search＋openapi）のテスト。
+"""外部連携 API（/ext/v1）のテスト。要 Postgres（DB 不可は skip）。
 
-要 Postgres。DB 不可は SKIP（tests/api の既存流儀）。admin キー発行/失効はセッション Cookie 認証
-（`/admin/users` 系と同じ）・convert/search/openapi は X-API-Key ヘッダ認証（Cookie ではない）。
-search 本体のエンジン分離/RRF融合ロジックは `sherpa/search_service.py` の
-`tests/unit/test_search_service.py` で検証済み。ここでは認証・世界/scope検証・監査・
-degrade 応答・openapi サブセットの配線を検証する（`sherpa.search_service.search` は monkeypatch で
-スタブ化し ES/Neo4j 到達性に依存しない）。
+admin 操作はセッション Cookie 認証、convert/search/answer/capabilities/doc/openapi は X-API-Key 認証。
+融合ロジックは tests/unit/test_fused_search.py、fd 所有権は tests/unit/test_fd_response.py、
+CFB/ZIP の検証部品は tests/unit/test_ext_api_cfb.py。ここでは認証・world/scope・監査・配線を検証する。
 """
 from __future__ import annotations
 
+import asyncio
+import errno
 import io
 import json
 import os
+import shutil
+import threading
 import time
 import uuid
 import zipfile
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
 
 from _test_users import register_test_uid
-from sherpa import auth, keys, store
+from sherpa import agentic_search, auth, documents, es_index, ext_api, store, worlds
 from sherpa.api import app
+from sherpa.parts.read import fused_search
 
 client = TestClient(app, raise_server_exceptions=True)
+
+_TAX_DOC = "4期/01_標準/消費税法.md"
+_ANSWER_REAL_DOC = "4期/04_運用/障害記録.md"   # fixtures/corpus/v1 実在ファイル
+_ADMIN_KEYS = "/ext/v1/admin/keys"
+_SELF_KEYS = "/ext/v1/keys"
+
+
+@pytest.fixture(autouse=True)
+def _db():
+    try:
+        store.init_schema()
+    except Exception as e:
+        pytest.skip(f"DB down: {e}")   # 不可なら可視の skip
 
 
 # ---- ヘルパ ----
@@ -32,30 +52,21 @@ def _sfx() -> str:
     return str(int(time.time() * 1000))[-8:]
 
 
-def _try_init() -> bool:
-    try:
-        store.init_schema()
-        return True
-    except Exception as e:
-        pytest.skip(f"DB down: {e}")   # 不可なら可視の skip（silent-green 根絶）
+def _mk_account(prefix: str, role: str, sfx: str) -> tuple[str, str]:
+    uid = f"{prefix}{sfx}"
+    pw = f"pw-{uid}"
+    store.upsert_user(uid, email=f"{uid}@ex.local", display_name=uid.upper(),
+                      password_hash=auth.hash_password(pw), role=role, status="active")
+    register_test_uid(uid)
+    return uid, pw
 
 
 def _mk_admin(sfx: str) -> tuple[str, str]:
-    uid = f"exta{sfx}"
-    pw = f"pw-{uid}"
-    store.upsert_user(uid, email=f"{uid}@ex.local", display_name=uid.upper(),
-                      password_hash=auth.hash_password(pw), role="admin", status="active")
-    register_test_uid(uid)
-    return uid, pw
+    return _mk_account("exta", "admin", sfx)
 
 
 def _mk_user(sfx: str) -> tuple[str, str]:
-    uid = f"extu{sfx}"
-    pw = f"pw-{uid}"
-    store.upsert_user(uid, email=f"{uid}@ex.local", display_name=uid.upper(),
-                      password_hash=auth.hash_password(pw), role="user", status="active")
-    register_test_uid(uid)
-    return uid, pw
+    return _mk_account("extu", "user", sfx)
 
 
 def _login(uid: str, pw: str) -> None:
@@ -67,11 +78,66 @@ def _logout() -> None:
     client.post("/auth/logout")
 
 
-def _issue_key(label: str) -> dict:
-    """admin としてログイン済みの前提で発行し、プレーンキーを含む dict を返す。"""
-    r = client.post("/ext/v1/admin/keys", json={"label": label})
-    assert r.status_code == 200, r.text
-    return r.json()
+@contextmanager
+def _as_admin():
+    """admin としてログインした状態で with 本体を実行し、終了時にログアウトする。"""
+    uid, pw = _mk_admin(_sfx())
+    _login(uid, pw)
+    try:
+        yield uid
+    finally:
+        _logout()
+
+
+def _key(label: str, **body) -> dict:
+    """admin 発行（world スコープ等は body で指定）。プレーンキーを含む応答 dict を返す。"""
+    with _as_admin():
+        r = client.post(_ADMIN_KEYS, json={"label": f"{label}-{_sfx()}", **body})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+
+@contextmanager
+def _self_issue_enabled(**settings):
+    """利用者の自己発行を許可し、終了時に未設定へ戻す。admin 資格と設定 PUT 応答を渡す。"""
+    uid, pw = _mk_admin(_sfx())
+    _login(uid, pw)
+    put = client.put("/admin/settings", json={"user_api_keys_allowed": True, **settings})
+    assert put.status_code == 200, put.text
+    _logout()
+    try:
+        yield SimpleNamespace(uid=uid, pw=pw, put=put)
+    finally:
+        _logout()
+        _login(uid, pw)
+        client.put("/admin/settings", json={"user_api_keys_allowed": None,
+                                            **{k: None for k in settings}})
+        _logout()
+
+
+@contextmanager
+def _issuer(who: str, **settings):
+    """who="admin": admin ログイン済みで発行ルートを返す。who="self": 自己発行を許可し、利用者
+    ログイン済みで自己発行ルートを返す。"""
+    if who == "admin":
+        with _as_admin():
+            yield _ADMIN_KEYS
+        return
+    with _self_issue_enabled(**settings):
+        _login(*_mk_user(_sfx()))
+        try:
+            yield _SELF_KEYS
+        finally:
+            _logout()
+
+
+def _h(key: str | None = None, rid: str | None = None) -> dict:
+    h = {}
+    if key:
+        h["X-API-Key"] = key
+    if rid:
+        h["X-Request-Id"] = rid
+    return h
 
 
 _DOCX_XML = """<?xml version="1.0"?>
@@ -83,158 +149,122 @@ _DOCX_XML = """<?xml version="1.0"?>
 </w:document>"""
 
 
-def _make_docx_bytes() -> bytes:
+def _zip_bytes(members) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("word/document.xml", _DOCX_XML)
+        for name, content in members:
+            z.writestr(name, content)
     return buf.getvalue()
 
 
-def _convert(filename: str, content: bytes, api_key: str | None = None):
-    headers = {"X-API-Key": api_key} if api_key else {}
-    return client.post(
-        "/ext/v1/convert",
-        files={"file": (filename, io.BytesIO(content), "application/octet-stream")},
-        headers=headers,
-    )
+def _make_docx_bytes() -> bytes:
+    return _zip_bytes([("word/document.xml", _DOCX_XML)])
 
 
-def _search(payload: dict, api_key: str | None = None):
-    headers = {"X-API-Key": api_key} if api_key else {}
-    return client.post("/ext/v1/search", json=payload, headers=headers)
+def _convert(filename, content, key=None, rid=None):
+    return client.post("/ext/v1/convert",
+                       files={"file": (filename, io.BytesIO(content), "application/octet-stream")},
+                       headers=_h(key, rid))
 
 
-def _capabilities(api_key: str | None = None):
-    headers = {"X-API-Key": api_key} if api_key else {}
-    return client.get("/ext/v1/capabilities", headers=headers)
+def _search(payload, key=None, rid=None):
+    return client.post("/ext/v1/search", json=payload, headers=_h(key, rid))
 
 
-def _doc(world: str, path: str, api_key: str | None = None):
-    headers = {"X-API-Key": api_key} if api_key else {}
-    return client.get("/ext/v1/doc", params={"world": world, "path": path}, headers=headers)
+def _answer(payload, key=None):
+    return client.post("/ext/v1/answer", json=payload, headers=_h(key))
 
 
-def _issue_key_scoped(label: str, allowed_worlds) -> dict:
-    """admin としてログイン済みの前提で、world スコープ付きで発行する。"""
-    r = client.post("/ext/v1/admin/keys", json={"label": label, "allowed_worlds": allowed_worlds})
-    assert r.status_code == 200, r.text
-    return r.json()
+def _capabilities(key=None, rid=None):
+    return client.get("/ext/v1/capabilities", headers=_h(key, rid))
+
+
+def _doc(world, path, key=None):
+    return client.get("/ext/v1/doc", params={"world": world, "path": path}, headers=_h(key))
+
+
+def _audit_rows(rid, cols="outcome, reason, detail"):
+    with store._connect() as c:
+        return c.execute(f"SELECT {cols} FROM audit_log WHERE request_id=%s ORDER BY id",
+                         (rid,)).fetchall()
+
+
+def _audit_one(rid, cols="outcome, reason, detail"):
+    rows = _audit_rows(rid, cols)
+    assert len(rows) == 1, f"監査行はちょうど1件のはず（実際 {len(rows)} 件）"
+    return rows[0]
+
+
+def _raise(exc):
+    def _f(*a, **kw):
+        raise exc
+    return _f
 
 
 # ===== APIキー基盤 =====
 
-def test_ext_convert_requires_api_key():
-    if not _try_init():
-        pytest.skip("DB down")
-    r = _convert("a.docx", _make_docx_bytes())
-    assert r.status_code == 401, r.text
+@pytest.mark.parametrize("call", [
+    lambda: _convert("a.docx", _make_docx_bytes()),
+    lambda: _search({"world": "v1", "query": "税"}),
+    lambda: _capabilities(),
+    lambda: _doc("v1", _TAX_DOC),
+    lambda: client.get("/ext/v1/openapi.json"),
+], ids=["convert", "search", "capabilities", "doc", "openapi"])
+def test_ext_endpoints_require_api_key(call):
+    assert call().status_code == 401
 
 
 def test_admin_key_create_requires_admin():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    uid, pw = _mk_user(sfx)
-    _login(uid, pw)
-    r = client.post("/ext/v1/admin/keys", json={"label": "x"})
-    assert r.status_code == 403, r.text
-    _logout()
+    _login(*_mk_user(_sfx()))
+    try:
+        assert client.post(_ADMIN_KEYS, json={"label": "x"}).status_code == 403
+    finally:
+        _logout()
 
 
 def test_admin_key_lifecycle():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-
-    # 発行: プレーンキーが sk-ext- で始まる。
-    issued = _issue_key(f"lifecycle-{sfx}")
-    plain = issued["key"]
-    key_id = issued["id"]
+    adm = _mk_admin(_sfx())
+    _login(*adm)
+    issued = client.post(_ADMIN_KEYS, json={"label": f"lifecycle-{_sfx()}"}).json()
+    plain, key_id = issued["key"], issued["id"]
     assert plain.startswith("sk-ext-"), issued
 
-    # 一覧: key_prefix のみ（plain キーは出ない）。
-    r = client.get("/ext/v1/admin/keys")
+    # 一覧は key_prefix のみ（プレーンキーは出ない）。
+    r = client.get(_ADMIN_KEYS)
     assert r.status_code == 200, r.text
-    rows = r.json()["keys"]
-    row = next(x for x in rows if x["id"] == key_id)
+    row = next(x for x in r.json()["keys"] if x["id"] == key_id)
     assert row["key_prefix"] == issued["key_prefix"]
-    for v in row.values():
-        if isinstance(v, str):
-            assert plain not in v
-
+    assert all(plain not in v for v in row.values() if isinstance(v, str))
     _logout()
 
-    # このキーで convert が通る。
-    r = _convert("a.docx", _make_docx_bytes(), api_key=plain)
-    assert r.status_code == 200, r.text
+    assert _convert("a.docx", _make_docx_bytes(), plain).status_code == 200
 
-    # DELETE で失効。
-    _login(adm_uid, adm_pw)
-    r = client.delete(f"/ext/v1/admin/keys/{key_id}")
+    _login(*adm)
+    r = client.delete(f"{_ADMIN_KEYS}/{key_id}")
     assert r.status_code == 200, r.text
     assert r.json()["revoked_at"]
     _logout()
 
-    # 失効後は convert が 401。
-    r = _convert("a.docx", _make_docx_bytes(), api_key=plain)
-    assert r.status_code == 401, r.text
+    assert _convert("a.docx", _make_docx_bytes(), plain).status_code == 401   # 失効後
 
-    # 再 DELETE は冪等に 200。
-    _login(adm_uid, adm_pw)
-    r = client.delete(f"/ext/v1/admin/keys/{key_id}")
-    assert r.status_code == 200, r.text
-
-    # 未知 id は 404。
-    r = client.delete("/ext/v1/admin/keys/999999999")
-    assert r.status_code == 404, r.text
+    _login(*adm)
+    assert client.delete(f"{_ADMIN_KEYS}/{key_id}").status_code == 200   # 再 DELETE は冪等
+    assert client.delete(f"{_ADMIN_KEYS}/999999999").status_code == 404
     _logout()
 
 
 def test_key_hash_only_in_db():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"hashonly-{sfx}")
-    _logout()
-
-    from sherpa import ext_api
+    issued = _key("hashonly")
     row = store.api_key_by_hash(ext_api._hash_key(issued["key"]))
     assert row is not None
     assert row["key_hash"] != issued["key"]
     assert issued["key"] not in row["key_hash"]
 
 
-def test_revoked_key_rejected():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"revoke-{sfx}")
-    r = client.delete(f"/ext/v1/admin/keys/{issued['id']}")
-    assert r.status_code == 200, r.text
-    _logout()
-
-    r = _convert("a.docx", _make_docx_bytes(), api_key=issued["key"])
-    assert r.status_code == 401, r.text
-
-
 # ===== POST /ext/v1/convert =====
 
 def test_convert_docx_roundtrip():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"convert-{sfx}")
-    _logout()
-
-    r = _convert("doc.docx", _make_docx_bytes(), api_key=issued["key"])
+    r = _convert("doc.docx", _make_docx_bytes(), _key("convert")["key"])
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["unsupported"] is False
@@ -244,81 +274,36 @@ def test_convert_docx_roundtrip():
     assert body["size_bytes"] == len(_make_docx_bytes())
 
 
-def test_convert_rejects_extension():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"ext-{sfx}")
-    _logout()
-
-    r = _convert("a.txt", b"hello", api_key=issued["key"])
-    assert r.status_code == 422, r.text
-
-
-def test_convert_size_limit(monkeypatch):
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api
-    monkeypatch.setattr(ext_api, "_CONVERT_MAX_BYTES", 1000)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"size-{sfx}")
-    _logout()
-
-    r = _convert("big.docx", b"x" * 2000, api_key=issued["key"])
-    assert r.status_code == 413, r.text
+@pytest.mark.parametrize("name, content, patch, status", [
+    ("a.txt", b"hello", {}, 422),
+    ("big.docx", b"x" * 2000, {"_CONVERT_MAX_BYTES": 1000}, 413),
+    ("bomb.docx", _zip_bytes([("word/document.xml", _DOCX_XML + "A" * 1000)]),
+     {"_ZIP_MAX_UNCOMPRESSED": 100}, 422),
+], ids=["extension", "size_limit", "zip_bomb"])
+def test_convert_rejects(monkeypatch, name, content, patch, status):
+    for k, v in patch.items():
+        monkeypatch.setattr(ext_api, k, v)
+    r = _convert(name, content, _key("convrej")["key"])
+    assert r.status_code == status, r.text
 
 
-def test_convert_zip_bomb_rejected(monkeypatch):
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api
-    monkeypatch.setattr(ext_api, "_ZIP_MAX_UNCOMPRESSED", 100)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"zipbomb-{sfx}")
-    _logout()
-
-    # 展開サイズが上限（monkeypatch で 100 バイト）を超える docx。
-    big_xml = _DOCX_XML + ("A" * 1000)
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("word/document.xml", big_xml)
-    r = _convert("bomb.docx", buf.getvalue(), api_key=issued["key"])
-    assert r.status_code == 422, r.text
-
-
-def test_convert_broken_file_unsupported():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"broken-{sfx}")
-    _logout()
-
-    # docx 拡張子だが中身は壊れた zip（BadZipFile）→ 変換は None＝未対応 200。
-    r = _convert("broken.docx", b"not a real zip file", api_key=issued["key"])
+def test_convert_broken_file_is_unsupported_200_and_audited_as_failed_business_outcome():
+    """壊れた zip は変換 None＝HTTP 200・`unsupported: true`。監査は outcome=success のまま
+    business_outcome=failed を別列で記録する。"""
+    rid = f"probe-convfail-{_sfx()}"
+    r = _convert("broken.docx", b"not a real zip file", _key("broken")["key"], rid)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["unsupported"] is True
     assert body["md"] is None
     assert body["reason"] == "conversion_failed"
 
+    row = _audit_one(rid)
+    assert row["outcome"] == "success"
+    assert row["detail"]["business_outcome"] == "failed"
+
 
 def test_convert_tmpfile_cleaned(monkeypatch):
-    if not _try_init():
-        pytest.skip("DB down")
-    from pathlib import Path
-
-    from sherpa import ext_api
-
     created: list[Path] = []
     orig_to_markdown = ext_api.office_md.to_markdown
 
@@ -327,203 +312,87 @@ def test_convert_tmpfile_cleaned(monkeypatch):
         return orig_to_markdown(path)
 
     monkeypatch.setattr(ext_api.office_md, "to_markdown", _spy)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"tmpclean-{sfx}")
-    _logout()
-
-    r = _convert("clean.docx", _make_docx_bytes(), api_key=issued["key"])
+    r = _convert("clean.docx", _make_docx_bytes(), _key("tmpclean")["key"])
     assert r.status_code == 200, r.text
     assert created, "to_markdown が呼ばれていない（スパイ未到達）"
     for p in created:
         assert not p.exists(), f"一時ファイルが残っている: {p}"
 
 
-# ===== POST /ext/v1/search（E2c）=====
-#
-# エンジン分離/RRF融合ロジック自体は tests/unit/test_search_service.py で検証済み。
-# ここでは ext_api 層の配線（認証・world/scope 検証・監査・degraded 応答・openapi サブセット）を検証する。
-
-def test_ext_search_requires_api_key():
-    if not _try_init():
-        pytest.skip("DB down")
-    r = _search({"world": "v1", "query": "税"})
-    assert r.status_code == 401, r.text
-
-
-def test_ext_openapi_requires_api_key():
-    if not _try_init():
-        pytest.skip("DB down")
-    r = client.get("/ext/v1/openapi.json")
-    assert r.status_code == 401, r.text
-
-
-def test_search_unknown_world_404():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"noworld-{sfx}")
-    _logout()
-
-    r = _search({"world": "no-such-world-xyz", "query": "税"}, api_key=issued["key"])
-    assert r.status_code == 404, r.text
-
+# ===== POST /ext/v1/search =====
 
 def test_search_unknown_scope_422():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"badscope-{sfx}")
-    _logout()
-
     r = _search({"world": "v1", "query": "税", "scope_paths": ["no-such-scope-xyz"]},
-                api_key=issued["key"])
+                _key("badscope")["key"])
     assert r.status_code == 422, r.text
 
 
-def test_search_scope_validation_oserror_returns_503_and_audits_requested_prefix(monkeypatch):
-    """`scope_mod.valid_scope_paths(strict=True)` は OSError を re-raise しうる契約
-    （`scope.py` docstring）——search() 本体と同じ try/except に含める（未処理例外として漏らさ
-    ない）。あわせて、失敗時の監査行にも要求された scope_paths（`detail["prefix"]`）・
-    http_status・outcome・reason が残ることを固定する（検証前に正規化して積む）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api
+@pytest.mark.parametrize("patch, allowed, world, scope_in, scope_audited, status, outcome, reason", [
+    # scope 検証の OSError は未処理例外にせず 503。要求された scope は検証前に正規化して監査に積む。
+    ("scope_oserror", None, "v1", ["01_受付"], ["01_受付"], 503, "error", "unavailable"),
+    # prefix は `_enforce_world_scope()`／`_resolve_world_or_error()`／registry 解決より前に積まれ、
+    # 失敗リクエストの監査にも残る（未正規化入力は正規化後の値で残る）。
+    ("none", ["v1"], "other-world-xyz", ["4期//サブ/"], ["4期//サブ"], 403, "deny", "world_not_allowed"),
+    ("none", None, "no-such-world-xyz", ["4期//サブ/"], ["4期//サブ"], 404, "error", "not_found"),
+    ("registry_down", None, "v1", ["4期//サブ/"], ["4期//サブ"], 503, "error", "unavailable"),
+], ids=["scope_oserror_503", "scope_exclusion_403", "unknown_world_404", "registry_unreachable_503"])
+def test_search_failure_audits_normalized_prefix(monkeypatch, patch, allowed, world, scope_in,
+                                                 scope_audited, status, outcome, reason):
+    if patch == "scope_oserror":
+        monkeypatch.setattr(ext_api.scope_mod, "valid_scope_paths", _raise(
+            OSError("simulated permission error during scope validation")))
+    elif patch == "registry_down":
+        monkeypatch.setattr(worlds, "resolve_external_world", _raise(
+            worlds.ExternalResolverError("simulated registry outage")))
+    extra = {} if allowed is None else {"allowed_worlds": allowed}
+    key = _key("auditprefix", **extra)["key"]
+    rid = f"probe-search-fail-{_sfx()}"
 
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"scopeoserror-{sfx}")
-    _logout()
-    rid = f"probe-scope-oserror-{sfx}"
+    r = _search({"world": world, "query": "x", "scope_paths": scope_in}, key, rid)
+    assert r.status_code == status, r.text
 
-    def _boom(world, scope_paths, root=None, strict=False):
-        raise OSError("simulated permission error during scope validation")
-
-    monkeypatch.setattr(ext_api.scope_mod, "valid_scope_paths", _boom)
-    r = client.post(
-        "/ext/v1/search", json={"world": "v1", "query": "税", "scope_paths": ["01_受付"]},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
-    assert r.status_code == 503, r.text
-
-    with store._connect() as c:
-        rows = c.execute(
-            "SELECT outcome, reason, detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchall()
-    assert len(rows) == 1, f"監査行はちょうど1件のはず（実際 {len(rows)} 件）"
-    row = rows[0]
-    assert row["detail"]["prefix"] == ["01_受付"]
-    assert row["detail"]["http_status"] == 503
-    assert row["outcome"] == "error"
-    assert row["reason"] == "unavailable"   # `_HTTP_OUTCOME_REASON[503]`
+    row = _audit_one(rid)
+    assert row["detail"]["world"] == world
+    assert row["detail"]["prefix"] == scope_audited
+    assert row["detail"]["http_status"] == status
+    assert row["outcome"] == outcome
+    assert row["reason"] == reason
 
 
-def _assert_single_audit_row_has_world_and_prefix(rid, expected_world, expected_prefix, status_code,
-                                                  expected_outcome, expected_reason):
-    with store._connect() as c:
-        rows = c.execute(
-            "SELECT outcome, reason, detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchall()
-    assert len(rows) == 1, f"監査行はちょうど1件のはず（実際 {len(rows)} 件）"
-    row = rows[0]
-    detail = row["detail"]
-    assert detail["world"] == expected_world
-    assert detail["prefix"] == expected_prefix
-    assert detail["http_status"] == status_code
-    assert row["outcome"] == expected_outcome
-    assert row["reason"] == expected_reason
+@pytest.mark.parametrize("target, attr, exc, call", [
+    (worlds, "resolve_external_world", worlds.ExternalResolverError("simulated registry outage"),
+     lambda k: _search({"world": "v1", "query": "x"}, k)),
+    (worlds, "resolve_external_world", worlds.ExternalResolverError("simulated registry outage"),
+     lambda k: _doc("v1", "a.md", k)),
+    # fixtures/dev KB の FS 列挙の失敗と registry スナップショット取得の失敗は別経路・同じ 503。
+    (worlds, "discover_fs_world_ids_strict", worlds.ExternalResolverError("simulated fs outage"),
+     lambda k: _capabilities(k)),
+    (store, "list_worlds_db", RuntimeError("simulated db outage"),
+     lambda k: _capabilities(k)),
+], ids=["search", "doc", "capabilities_fs", "capabilities_snapshot"])
+def test_registry_unreachable_returns_503(monkeypatch, target, attr, exc, call):
+    monkeypatch.setattr(target, attr, _raise(exc))
+    assert call(_key("reg503")["key"]).status_code == 503
 
 
-def test_search_scope_exclusion_403_audits_prefix_before_enforcement():
-    """scope 外 world（403）でも、prefix は `_enforce_world_scope()` より前に積まれているため
-    監査行に残る（後で積むと、403 で失敗したリクエストの監査に prefix が残らない）。未正規化の
-    入力（連続スラッシュ・末尾スラッシュ）を与え、監査に残る値が正規化後（`normalize_scope_paths`
-    通過後）であることも併せて固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key_scoped(f"scoped403prefix-{sfx}", ["v1"])
-    _logout()
-    rid = f"probe-search403-prefix-{sfx}"
-
-    r = client.post(
-        "/ext/v1/search",
-        json={"world": "other-world-xyz", "query": "x", "scope_paths": ["4期//サブ/"]},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
-    assert r.status_code == 403, r.text
-
-    _assert_single_audit_row_has_world_and_prefix(
-        rid, "other-world-xyz", ["4期//サブ"], 403, "deny", "world_not_allowed")
-
-
-def test_search_unknown_world_404_audits_prefix_before_resolution():
-    """未知の world（404）でも、prefix は `_resolve_world_or_error()` より前に積まれているため
-    監査行に残る。未正規化の入力（連続スラッシュ・末尾スラッシュ）を与え、監査に残る値が
-    正規化後であることも併せて固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"search404prefix-{sfx}")
-    _logout()
-    rid = f"probe-search404-prefix-{sfx}"
-
-    r = client.post(
-        "/ext/v1/search",
-        json={"world": "no-such-world-xyz", "query": "x", "scope_paths": ["4期//サブ/"]},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
-    assert r.status_code == 404, r.text
-
-    _assert_single_audit_row_has_world_and_prefix(
-        rid, "no-such-world-xyz", ["4期//サブ"], 404, "error", "not_found")
-
-
-def test_search_registry_unreachable_503_audits_prefix_before_resolution(monkeypatch):
-    """registry 到達不可（503）でも、prefix は `_resolve_world_or_error()` より前に積まれている
-    ため監査行に残る。未正規化の入力（連続スラッシュ・末尾スラッシュ）を与え、監査に残る値が
-    正規化後であることも併せて固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import worlds
-
-    def _boom(world_id, **kw):
-        raise worlds.ExternalResolverError("simulated registry outage")
-
-    monkeypatch.setattr(worlds, "resolve_external_world", _boom)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"search503prefix-{sfx}")
-    _logout()
-    rid = f"probe-search503-prefix-{sfx}"
-
-    r = client.post(
-        "/ext/v1/search",
-        json={"world": "v1", "query": "x", "scope_paths": ["4期//サブ/"]},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
-    assert r.status_code == 503, r.text
-
-    _assert_single_audit_row_has_world_and_prefix(
-        rid, "v1", ["4期//サブ"], 503, "error", "unavailable")
+def test_search_registered_root_unreachable_returns_503(tmp_path):
+    """登録済みだが参照先ディレクトリが無い（マウント外れ等）＝503（未登録の 404 とは区別）。"""
+    wid = f"realbroken{_sfx()}"
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "note.md").write_text("x", encoding="utf-8")
+    store.upsert_world(wid, str(root))
+    try:
+        shutil.rmtree(root)
+        r = _search({"world": wid, "query": "x"}, _key("rootunreach")["key"])
+        assert r.status_code == 503, r.text
+    finally:
+        store.delete_world_row(wid)
 
 
 def test_search_degraded_all_engines_down(monkeypatch):
-    """ES/Neo4j 不可はエンジン単位の degraded（200）で返る（黙ってすり替えない・D3）。"""
-    if not _try_init():
-        pytest.skip("DB down")
+    """ES/Neo4j 不可はエンジン単位の degraded（200）で返る（黙ってすり替えない）。"""
     from neo4j.exceptions import ServiceUnavailable
-
-    from sherpa import es_index, search_service
 
     monkeypatch.setattr(es_index, "available", lambda: False)
 
@@ -534,78 +403,44 @@ def test_search_degraded_all_engines_down(monkeypatch):
         def __exit__(self, *a):
             return False
 
-    monkeypatch.setattr(search_service, "_neo4j_session", lambda: _RaiseCtx())
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"degrade-{sfx}")
-    _logout()
+    monkeypatch.setattr(fused_search, "_neo4j_session", lambda: _RaiseCtx())
 
     r = _search({"world": "v1", "query": "税", "engines": ["keyword", "vector", "graph"]},
-                api_key=issued["key"])
+                _key("degrade")["key"])
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["hits"] == []
     assert body["engines_used"] == []
-    reasons = {d["engine"]: d["reason"] for d in body["degraded"]}
-    assert reasons == {"keyword": "es_unavailable", "vector": "es_unavailable",
-                       "graph": "neo4j_unavailable"}
+    assert {d["engine"]: d["reason"] for d in body["degraded"]} == {
+        "keyword": "es_unavailable", "vector": "es_unavailable", "graph": "neo4j_unavailable"}
 
 
 def test_search_filters_nonexistent_docs(monkeypatch):
-    """R3-S2: 削除直後の窓で ES 索引に古いまま残る doc_id は返さない
-    （`documents.world_rel_set` の実在フィルタ・`chat_service._es_hits` と同型・search_service 側に集約）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import documents, search_service
+    """削除直後の窓で ES 索引に古いまま残る doc_id は返さない（`documents.world_rel_set` の実在フィルタ）。"""
+    def _hit(rel):
+        return {"key": rel, "doc_id": rel, "path": rel, "line": 1, "snippet": "s",
+                "engine_score": 1.0, "judgement": None, "paths": None}
 
-    def _fake_keyword(world, query, sp, k, settings, layer=None):
-        return ([{"key": "real.md", "doc_id": "real.md", "path": "real.md", "line": 1,
-                  "snippet": "s", "engine_score": 1.0, "judgement": None, "paths": None},
-                 {"key": "deleted.md", "doc_id": "deleted.md", "path": "deleted.md", "line": 1,
-                  "snippet": "s", "engine_score": 1.0, "judgement": None, "paths": None}], None)
-
-    monkeypatch.setattr(search_service, "_search_keyword", _fake_keyword)
+    monkeypatch.setattr(fused_search, "_search_keyword",
+                        lambda world, query, sp, k, settings, layer=None: (
+                            [_hit("real.md"), _hit("deleted.md")], None))
     monkeypatch.setattr(documents, "world_rel_set",
                         lambda world=None, root=None, strict=False, **kw: {"real.md"})
 
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"realfilter-{sfx}")
-    _logout()
-
-    r = _search({"world": "v1", "query": "x", "engines": ["keyword"]}, api_key=issued["key"])
+    r = _search({"world": "v1", "query": "x", "engines": ["keyword"]}, _key("realfilter")["key"])
     assert r.status_code == 200, r.text
     body = r.json()
-    ids = {h["doc_id"] for h in body["hits"]}
-    assert ids == {"real.md"}
-    assert "deleted.md" not in ids
-    assert body["engines_used"] == ["keyword"]   # フィルタで件数が減っても degrade 扱いにはしない
+    assert {h["doc_id"] for h in body["hits"]} == {"real.md"}
+    assert body["engines_used"] == ["keyword"]   # フィルタで減っても degrade 扱いにしない
 
 
 def test_search_audit_written():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"audit-{sfx}")
-    _logout()
-    rid = f"probe-search-audit-{sfx}"
-
-    r = client.post(
-        "/ext/v1/search", json={"world": "v1", "query": "税計算", "engines": ["keyword"]},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
+    issued = _key("audit")
+    rid = f"probe-search-audit-{_sfx()}"
+    r = _search({"world": "v1", "query": "税計算", "engines": ["keyword"]}, issued["key"], rid)
     assert r.status_code == 200, r.text
 
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT actor_user_id, action, resource_type, resource_id, detail FROM audit_log "
-            "WHERE request_id=%s", (rid,)
-        ).fetchone()
-    assert row is not None
+    row = _audit_one(rid, "actor_user_id, action, resource_type, resource_id, detail")
     assert row["actor_user_id"] == f"ext:{issued['id']}"
     assert row["resource_type"] == "ext_search"
     assert row["resource_id"] == "v1"
@@ -613,22 +448,148 @@ def test_search_audit_written():
     assert row["detail"]["engines"] == ["keyword"]
 
 
-def test_ext_openapi_subset():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"openapi-{sfx}")
-    _logout()
+# ===== search: coverage（未完了・打ち切りの申告）・graph_origin・degraded.detail・include_presumed =====
 
-    r = client.get("/ext/v1/openapi.json", headers={"X-API-Key": issued["key"]})
+def _stub_engines(monkeypatch, graph_result, keyword_docs=()):
+    """keyword は固定ヒット、graph は `run_impact` 相当の結果を実の `_graph_hits` で変換する（ES/Neo4j は使わない）。"""
+    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, root=None, strict=False, **kw: _AllDocs())
+    monkeypatch.setattr(fused_search, "_search_keyword",
+                        lambda world, query, sp, k, settings, layer=None: ([
+                            {"key": d, "doc_id": d, "path": d, "line": 1, "snippet": "s",
+                             "engine_score": 1.0, "judgement": None, "paths": None} for d in keyword_docs], None))
+    seen = []
+
+    def _graph(world, query, sp, k, depth=10, **kw):
+        seen.append(kw)
+        return fused_search._graph_hits(graph_result, k), None
+
+    monkeypatch.setattr(fused_search, "_search_graph", _graph)
+    return seen
+
+
+class _AllDocs:
+    def __contains__(self, item):
+        return True
+
+
+_GRAPH_RESULT = {
+    "items": [{"name": f"S{i}", "label": "Module", "category": "ソース", "path": f"s{i}.cbl",
+               "trace": [], "evidence": []} for i in range(3)],
+    "presumed": [],
+    "coverage": {"complete": False, "limits": [{"kind": "depth", "stage": "impact"}], "omitted": None,
+                 "depth": {"requested": 4, "truncated": True}},
+}
+
+
+def test_search_coverage_shape_and_graph_origin(monkeypatch):
+    _stub_engines(monkeypatch, _GRAPH_RESULT, keyword_docs=["s0.cbl", "k.md"])
+    r = _search({"world": "v1", "query": "x", "engines": ["keyword", "graph"], "k": 2}, _key("cov")["key"])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["coverage"] == {
+        "keyword": {"complete": True, "requested_k": 2, "returned": 2, "omitted": None, "limits": []},
+        "graph": {"complete": False, "requested_k": 2, "returned": 2, "omitted": 1,
+                  "limits": [{"kind": "depth"}, {"kind": "result_cap"}],
+                  "depth": {"requested": 4, "truncated": True}, "structural_count": 3, "presumed_count": 0},
+        "fused": {"requested_k": 2, "returned": 2, "omitted_by_cut": 1},
+    }
+    by = {h["doc_id"]: h for h in body["hits"]}
+    assert by["s0.cbl"]["graph_origin"] == ["structure"] and set(by["s0.cbl"]["sources"]) == {"keyword", "graph"}
+    assert "graph_origin" not in by["k.md"]
+    assert all("detail" not in d for d in body["degraded"])
+
+
+def test_search_overload_is_degraded_detail_without_coverage(monkeypatch):
+    from sherpa.ingest.world_neo4j import GraphQueryOverloadError
+
+    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, root=None, strict=False, **kw: _AllDocs())
+
+    @contextmanager
+    def _session():
+        yield object()
+
+    monkeypatch.setattr(fused_search, "_neo4j_session", _session)
+    monkeypatch.setattr(fused_search, "run_impact", _raise(GraphQueryOverloadError("timeout", world="v1")))
+    r = _search({"world": "v1", "query": "x", "engines": ["graph"]}, _key("ovl")["key"])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["degraded"] == [{"engine": "graph", "reason": "graph_query_failed", "detail": "timeout"}]
+    assert "graph" not in body["coverage"] and body["engines_used"] == []
+
+
+def test_search_include_presumed_default_unchanged_and_false_audited(monkeypatch):
+    seen = _stub_engines(monkeypatch, {"items": [], "presumed": []})
+    key = _key("presumed")["key"]
+    rid = f"probe-presumed-default-{_sfx()}"
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"]}, key, rid).status_code == 200
+    assert seen == [{}]  # 既定は今までの呼び方のまま
+    detail = _audit_one(rid, "detail")["detail"]
+    assert {"world", "query", "engines", "k", "depth", "layer", "prefix", "result_count", "degraded"} <= set(detail)
+    assert "include_presumed" not in detail and "coverage_complete" not in detail  # 既定の要求の詳細は今と同じ
+
+    rid = f"probe-presumed-false-{_sfx()}"
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"], "include_presumed": False},
+                   key, rid).status_code == 200
+    assert seen[-1] == {"include_presumed": False}
+    assert _audit_one(rid, "detail")["detail"]["include_presumed"] is False
+
+
+def test_search_audit_keeps_coverage_complete_only_when_incomplete(monkeypatch):
+    _stub_engines(monkeypatch, _GRAPH_RESULT)
+    rid = f"probe-cov-audit-{_sfx()}"
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"]}, _key("covaudit")["key"], rid).status_code == 200
+    assert _audit_one(rid, "detail")["detail"]["coverage_complete"] == {"graph": False}
+
+
+_SRC = {"doc_id": "s0.cbl", "file": "s0.cbl", "via": "call", "from_def": {"file": "s0.cbl", "key": None}}
+
+
+def test_search_graph_edges_carry_via_rule_sources_and_paths_omitted(monkeypatch):
+    """経路の辺に `via`・`rule`・`sources`・`sources_omitted`、5 本で切った経路に `paths_omitted`（根拠のない辺は今の形のまま）。"""
+    edge = {"type": "INVOKES", "doc": "s0.cbl", "line": 3, "via": "call", "rule": "single_import",
+            "sources": [{**_SRC, "line": 3, "rule": "single_import"}, {**_SRC, "line": 8, "rule": "single_import"}],
+            "sources_overflow_count": 5}
+    plain = {"type": "COPIES", "doc": "s0.cbl", "line": 1}
+    result = {"items": [{"name": "S", "label": "Module", "category": "ソース", "path": "s0.cbl",
+                         "trace": ["A", "B", "C"], "evidence": [edge, plain]} for _ in range(7)]
+              + [{"name": "T", "label": "Module", "category": "ソース", "path": "t.cbl", "trace": [], "evidence": []}],
+              "presumed": []}
+    _stub_engines(monkeypatch, result)
+    r = _search({"world": "v1", "query": "x", "engines": ["graph"], "k": 10}, _key("edges")["key"])
+    assert r.status_code == 200, r.text
+    by = {h["doc_id"]: h for h in r.json()["hits"]}
+    assert len(by["s0.cbl"]["paths"]) == 5 and by["s0.cbl"]["paths_omitted"] == 2
+    e0, e1 = by["s0.cbl"]["paths"][0]["edges"]
+    assert e0 == {"type": "INVOKES", "doc": "s0.cbl", "line": 3, "via": "call", "rule": "single_import",
+                  "sources": [{**_SRC, "line": 3, "rule": "single_import"}, {**_SRC, "line": 8, "rule": "single_import"}],
+                  "sources_omitted": 5}
+    assert e1 == plain
+    assert "paths_omitted" not in by["t.cbl"]
+
+
+def test_search_evidence_limit_range_passthrough_and_audit(monkeypatch):
+    seen = _stub_engines(monkeypatch, {"items": [], "presumed": []})
+    key = _key("evlimit")["key"]
+    for bad in (-1, 11):
+        assert _search({"world": "v1", "query": "x", "engines": ["graph"], "evidence_limit": bad}, key).status_code == 422
+    rid = f"probe-evlimit-default-{_sfx()}"
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"]}, key, rid).status_code == 200
+    assert seen == [{}] and "evidence_limit" not in _audit_one(rid, "detail")["detail"]  # 既定の要求は今と同じ
+    rid = f"probe-evlimit-7-{_sfx()}"
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"], "evidence_limit": 7}, key, rid).status_code == 200
+    assert seen[-1] == {"evidence_limit": 7} and _audit_one(rid, "detail")["detail"]["evidence_limit"] == 7
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"], "evidence_limit": 0}, key).status_code == 200
+
+
+def test_ext_openapi_subset():
+    r = client.get("/ext/v1/openapi.json", headers=_h(_key("openapi")["key"]))
     assert r.status_code == 200, r.text
     doc = r.json()
 
     assert set(doc["paths"].keys()) == {
         "/ext/v1/convert", "/ext/v1/search", "/ext/v1/capabilities", "/ext/v1/doc",
-        "/ext/v1/research"}
+        "/ext/v1/answer", "/ext/v1/codex/jobs", "/ext/v1/codex/jobs/{job_id}",
+        "/ext/v1/codex/jobs/{job_id}/result", "/ext/v1/codex/jobs/{job_id}/cancel"}
     assert not any(p.startswith("/ext/v1/admin") for p in doc["paths"])
 
     def _collect_refs(obj, out: set) -> None:
@@ -653,73 +614,44 @@ def test_ext_openapi_subset():
         "type": "apiKey", "in": "header", "name": "X-API-Key"}
 
 
-# ===== search: depth パラメータ =====
+# ===== search: depth・layer =====
 
-def test_search_depth_passthrough(monkeypatch):
-    """`ExtSearchReq.depth` が `search_service.search(depth=...)` まで素通しされる。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import search_service
-
+def test_search_depth_and_layer_passthrough(monkeypatch):
+    """`depth`/`layer` が `fused_search.search` まで素通しされ、省略時は既定（depth=10・layer=both）。"""
     captured = {}
 
     def _fake_search(world, query, engines=None, k=10, scope_paths=None, weights=None,
                      settings=None, depth=8, root=None, strict=False, layer=None):
-        captured["depth"] = depth
+        captured.update(depth=depth, layer=layer)
         return {"hits": [], "engines_used": [], "degraded": []}
 
-    monkeypatch.setattr(search_service, "search", _fake_search)
+    monkeypatch.setattr(fused_search, "search", _fake_search)
+    key = _key("passthru")["key"]
 
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"depth-{sfx}")
-    _logout()
+    assert _search({"world": "v1", "query": "x", "depth": 3, "layer": "code"}, key).status_code == 200
+    assert captured == {"depth": 3, "layer": "code"}
 
-    r = _search({"world": "v1", "query": "x", "depth": 3}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    assert captured["depth"] == 3
-
-    r = _search({"world": "v1", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    assert captured["depth"] == 8   # 既定（従来の固定値と同じ）
+    assert _search({"world": "v1", "query": "x"}, key).status_code == 200
+    assert captured["depth"] == fused_search.IMPACT_MAX_DEPTH == 10
+    assert captured["layer"] == "both"
 
 
-def test_search_depth_out_of_range_422(monkeypatch):
-    """`depth` の上限（le）は元の外部 API 契約 12 を後退させない（`SHERPA_IMPACT_MAX_DEPTH`
-    未設定/12未満でも `max(12, IMPACT_MAX_DEPTH)`＝env 未設定時は従来どおり 12 のまま）。
-    0/13 は従来どおり範囲外、9〜12 は従来どおり受理されることの両方を固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import search_service
-
-    monkeypatch.setattr(search_service, "search",
+def test_search_depth_range_and_invalid_layer_422(monkeypatch):
+    """`depth` の上限は外部 API 契約 12 を後退させない（0/13 は範囲外・9〜12 は受理）。不正 layer は 422。"""
+    monkeypatch.setattr(fused_search, "search",
                         lambda *a, **kw: {"hits": [], "engines_used": [], "degraded": []})
+    key = _key("depthrange")["key"]
 
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"depthrange-{sfx}")
-    _logout()
-
-    for bad in (0, 13):
-        r = _search({"world": "v1", "query": "x", "depth": bad}, api_key=issued["key"])
-        assert r.status_code == 422, r.text
-
+    for extra in ({"depth": 0}, {"depth": 13}, {"layer": "bogus"}):
+        r = _search({"world": "v1", "query": "x", **extra}, key)
+        assert r.status_code == 422, (extra, r.text)
     for ok in (9, 10, 11, 12):
-        r = _search({"world": "v1", "query": "x", "depth": ok}, api_key=issued["key"])
-        assert r.status_code == 200, r.text
+        r = _search({"world": "v1", "query": "x", "depth": ok}, key)
+        assert r.status_code == 200, (ok, r.text)
 
 
 def test_search_depth_reaches_run_impact(monkeypatch):
-    """`search_service.search` 自体は monkeypatch せず、`_search_graph`→`run_impact` の実配線を
-    通して depth の最終到達値を確認する（`test_search_depth_passthrough` は search() 止まり）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from contextlib import contextmanager
-
-    from sherpa import search_service
-
+    """`fused_search.search` は差し替えず、`_search_graph`→`run_impact` の実配線で depth の最終到達値を見る。"""
     captured = {}
 
     def _fake_run_impact(session, term, world, aliasmap=None, scope_prefixes=None, depth=8, **kw):
@@ -730,134 +662,68 @@ def test_search_depth_reaches_run_impact(monkeypatch):
     def _fake_session():
         yield object()
 
-    monkeypatch.setattr(search_service, "_neo4j_session", _fake_session)
-    monkeypatch.setattr(search_service, "run_impact", _fake_run_impact)
+    monkeypatch.setattr(fused_search, "_neo4j_session", _fake_session)
+    monkeypatch.setattr(fused_search, "run_impact", _fake_run_impact)
 
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"depthreach-{sfx}")
-    _logout()
-
-    r = _search({"world": "v1", "query": "x", "engines": ["graph"], "depth": 5}, api_key=issued["key"])
+    r = _search({"world": "v1", "query": "x", "engines": ["graph"], "depth": 5}, _key("depthreach")["key"])
     assert r.status_code == 200, r.text
     assert captured["depth"] == 5
 
 
-# ===== 探す対象（層フィルタ・調べ方ブロック §3.4）=====
+# ===== GET /ext/v1/capabilities =====
 
-def test_search_layer_passthrough(monkeypatch):
-    """`ExtSearchReq.layer` が `search_service.search(layer=...)` まで素通しされる（既定 both）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import search_service
-
-    captured = {}
-
-    def _fake_search(world, query, engines=None, k=10, scope_paths=None, weights=None,
-                     settings=None, depth=8, root=None, strict=False, layer=None):
-        captured["layer"] = layer
-        return {"hits": [], "engines_used": [], "degraded": []}
-
-    monkeypatch.setattr(search_service, "search", _fake_search)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"layer-{sfx}")
-    _logout()
-
-    r = _search({"world": "v1", "query": "x", "layer": "code"}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    assert captured["layer"] == "code"
-
-    r = _search({"world": "v1", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    assert captured["layer"] == "both"   # 既定
-
-
-def test_search_layer_invalid_value_422():
-    """不正な layer 値は 422（Literal 制約）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"layerbad-{sfx}")
-    _logout()
-
-    r = _search({"world": "v1", "query": "x", "layer": "bogus"}, api_key=issued["key"])
-    assert r.status_code == 422, r.text
-
-
-# ===== GET /ext/v1/capabilities（discovery）=====
-
-def test_capabilities_requires_api_key():
-    if not _try_init():
-        pytest.skip("DB down")
-    r = _capabilities()
-    assert r.status_code == 401, r.text
-
-
-def test_capabilities_lists_worlds_and_features():
-    """`v1`（fixtures 直下・DB 未登録）は一覧に載る。fixtures はテスト経路で worker の成功同期を
-    通っていないため `document_count`/`last_updated` は未確定＝null（正しい「不明」表示——
-    確定値の取得は `test_capabilities_document_count_reflects_confirmed_sync` 側で検証）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"caps-{sfx}")
-    _logout()
-
-    r = _capabilities(api_key=issued["key"])
+def test_capabilities_lists_worlds_and_capabilities():
+    """`v1`（fixtures 直下・DB 未登録）は載るが、成功同期を通っていないため document_count/last_updated は null。"""
+    r = _capabilities(_key("caps")["key"])
     assert r.status_code == 200, r.text
     body = r.json()
-    ids = {w["id"] for w in body["worlds"]}
-    assert "v1" in ids
-    assert set(body["features"]) == {
-        "convert", "search:keyword", "search:vector", "search:graph", "doc", "research"}
+    assert set(body) == {"worlds"}
+    w = next(w for w in body["worlds"] if w["world"] == "v1")
+    assert set(w) == {"world", "document_count", "last_updated", "capabilities"}
+    assert set(w["capabilities"]) == {"search", "answer", "codex_jobs", "embed", "convert"}
+    for cap in w["capabilities"].values():
+        assert isinstance(cap["configured"], bool) and isinstance(cap["available"], bool)
+        # reason は configured/available のどちらかが偽のときだけ付く
+        assert ("reason" in cap) == (not (cap["configured"] and cap["available"]))
 
 
-def test_capabilities_document_count_reflects_confirmed_sync(monkeypatch):
-    """取り込みが成功確定済み（`last_sig` が非空）の world は `document_count`/`last_updated` が
-    実値で返る（`worlds.last_doc_count`・`worker._run_locked` の成功パスで書き込まれる事前集計値・
-    ここではホットパス走査をしない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from datetime import datetime, timezone
-    from pathlib import Path
-
-    from sherpa import store as store_mod
-
-    fake_row = {"world_id": "confirmed-world", "root_path": str(Path("fixtures/corpus/v1").resolve()),
-               "last_synced_at": datetime.now(timezone.utc), "last_sig": "abc123",
-               "last_doc_count": 42}
-    monkeypatch.setattr(store_mod, "list_worlds_db", lambda: [fake_row])
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"capsconfirmed-{sfx}")
-    _logout()
-
-    r = _capabilities(api_key=issued["key"])
+def test_capabilities_distinguishes_configured_from_runnable(monkeypatch):
+    """Codex は構成済みでも CLI が無ければ「設定済み・今は実行不可」（閉じた語彙の理由付き）。"""
+    from sherpa import codex_jobs_worker
+    monkeypatch.setattr(codex_jobs_worker, "capability", lambda: (True, False, "codex_cli_missing"))
+    r = _capabilities(_key("capsrun")["key"])
     assert r.status_code == 200, r.text
-    world = next(w for w in r.json()["worlds"] if w["id"] == "confirmed-world")
-    assert world["document_count"] == 42
-    assert world["last_updated"] is not None
+    w = next(w for w in r.json()["worlds"] if w["world"] == "v1")
+    assert w["capabilities"]["codex_jobs"] == {
+        "configured": True, "available": False, "reason": "codex_cli_missing"}
+    assert w["capabilities"]["convert"] == {"configured": True, "available": True}
+
+
+@pytest.mark.parametrize("wid, sig, count, confirmed", [
+    ("confirmed-world", "abc123", 42, True),
+    ("pending-world", "", 7, False),   # 取り込み開始時の pre-invalidate（last_sig=""）＝未確定
+], ids=["confirmed", "unconfirmed"])
+def test_capabilities_document_count_only_when_sync_confirmed(monkeypatch, tmp_path, wid, sig, count,
+                                                              confirmed):
+    root = Path("fixtures/corpus/v1").resolve() if confirmed else tmp_path
+    fake_row = {"world_id": wid, "root_path": str(root), "last_synced_at": datetime.now(timezone.utc),
+                "last_sig": sig, "last_doc_count": count}
+    monkeypatch.setattr(store, "list_worlds_db", lambda: [fake_row])
+
+    r = _capabilities(_key("capsconfirm")["key"])
+    assert r.status_code == 200, r.text
+    world = next(w for w in r.json()["worlds"] if w["world"] == wid)
+    if confirmed:
+        assert world["document_count"] == count
+        assert world["last_updated"] is not None
+    else:
+        assert world["document_count"] is None
+        assert world["last_updated"] is None
 
 
 def test_capabilities_does_not_fabricate_v1_when_nothing_exists(monkeypatch):
-    """world が1件も無い場合、`list_worlds()` の UI 向け `["v1"] フォールバックは使わない
-    （`store.list_worlds_db()`＋`discover_fs_world_ids_strict()` を使う＝実在しない world を
-    実在するように返さない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import store as store_mod, worlds
-
-    monkeypatch.setattr(store_mod, "list_worlds_db", lambda: [])
+    """world が 1 件も無いとき、UI 向けの ["v1"] フォールバック（`list_worlds`）は使わず空を返す。"""
+    monkeypatch.setattr(store, "list_worlds_db", lambda: [])
     monkeypatch.setattr(worlds, "discover_fs_world_ids_strict", lambda: [])
 
     def _must_not_be_called():
@@ -866,397 +732,194 @@ def test_capabilities_does_not_fabricate_v1_when_nothing_exists(monkeypatch):
     monkeypatch.setattr(worlds, "list_worlds", _must_not_be_called)
     monkeypatch.setattr(worlds, "discover_world_ids", _must_not_be_called)
 
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"nofakev1-{sfx}")
-    _logout()
-
-    r = _capabilities(api_key=issued["key"])
+    r = _capabilities(_key("nofakev1")["key"])
     assert r.status_code == 200, r.text
     assert r.json()["worlds"] == []
 
 
-def test_capabilities_last_updated_null_when_not_confirmed(tmp_path, monkeypatch):
-    """取り込み開始時の pre-invalidate 書き込み（`last_sig=""`）のままの world は、
-    `last_synced_at` があっても `last_updated=null`・`document_count=null`
-    （進行中/未確定を成功確定と誤表示しない・`worlds.last_doc_count` も同じゲートで隠す）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from datetime import datetime, timezone
-
-    from sherpa import store as store_mod
-
-    fake_row = {"world_id": "pending-world", "root_path": str(tmp_path),
-               "last_synced_at": datetime.now(timezone.utc), "last_sig": "", "last_doc_count": 7}
-    monkeypatch.setattr(store_mod, "list_worlds_db", lambda: [fake_row])
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"unconfirmed-{sfx}")
-    _logout()
-
-    r = _capabilities(api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    world = next(w for w in r.json()["worlds"] if w["id"] == "pending-world")
-    assert world["last_updated"] is None
-    assert world["document_count"] is None
-
-
-def test_capabilities_registry_snapshot_error_returns_503(monkeypatch):
-    """`store.list_worlds_db()`（唯一の registry スナップショット取得点）が例外を送出した場合は
-    503（未捕捉例外による 500 にしない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import store as store_mod
-
-    def _boom():
-        raise RuntimeError("simulated db outage")
-
-    monkeypatch.setattr(store_mod, "list_worlds_db", _boom)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"caps503-{sfx}")
-    _logout()
-
-    r = _capabilities(api_key=issued["key"])
-    assert r.status_code == 503, r.text
-
-
-# ===== GET /ext/v1/doc（原本取得）=====
-
-def test_doc_requires_api_key():
-    if not _try_init():
-        pytest.skip("DB down")
-    r = _doc("v1", "4期/01_標準/消費税法.md")
-    assert r.status_code == 401, r.text
-
+# ===== GET /ext/v1/doc =====
 
 def test_doc_download_roundtrip():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"doc-{sfx}")
-    _logout()
-
-    r = _doc("v1", "4期/01_標準/消費税法.md", api_key=issued["key"])
+    r = _doc("v1", _TAX_DOC, _key("doc")["key"])
     assert r.status_code == 200, r.text
+    original = Path("fixtures/corpus/v1", _TAX_DOC).read_bytes()
     assert r.content
-    from pathlib import Path
-    original = Path("fixtures/corpus/v1/4期/01_標準/消費税法.md").read_bytes()
     assert r.content == original
     assert r.headers["content-type"] == "text/markdown; charset=utf-8"
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["cache-control"] == "private, no-store"
-    # 非ASCIIファイル名は RFC 5987 形式（filename*=utf-8''<percent-encoded>）で返る。
-    from urllib.parse import quote
+    # 非 ASCII ファイル名は RFC 5987 形式で返る。
     assert r.headers["content-disposition"] == f"attachment; filename*=utf-8''{quote('消費税法.md')}"
     assert r.headers["content-length"] == str(len(original))
 
 
-def test_doc_unknown_path_404():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"docnf-{sfx}")
-    _logout()
-
-    r = _doc("v1", "no/such/file.md", api_key=issued["key"])
-    assert r.status_code == 404, r.text
-
-
-def test_doc_rejects_unsupported_doctype():
-    """`semantic/l_extract.json` は doctype 対応種別外＝404（原本DLの対象外）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"docext-{sfx}")
-    _logout()
-
-    r = _doc("v1", "semantic/l_extract.json", api_key=issued["key"])
-    assert r.status_code == 404, r.text
-
-
-def test_doc_traversal_rejected():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"doctrav-{sfx}")
-    _logout()
-
-    r = _doc("v1", "../../../../etc/passwd.md", api_key=issued["key"])
-    assert r.status_code == 404, r.text
-
-
-def test_doc_unknown_world_404():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"docworld-{sfx}")
-    _logout()
-
-    r = _doc("no-such-world-xyz", "a.md", api_key=issued["key"])
-    assert r.status_code == 404, r.text
+@pytest.mark.parametrize("world, path", [
+    ("v1", "no/such/file.md"),
+    ("v1", "semantic/l_extract.json"),          # doctype 対応種別外
+    ("v1", "../../../../etc/passwd.md"),        # traversal
+    ("no-such-world-xyz", "a.md"),
+], ids=["unknown_path", "unsupported_doctype", "traversal", "unknown_world"])
+def test_doc_not_found_404(world, path):
+    assert _doc(world, path, _key("docnf")["key"]).status_code == 404
 
 
 def test_doc_size_limit(monkeypatch):
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api
     monkeypatch.setattr(ext_api, "_DOC_MAX_BYTES", 10)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"docsize-{sfx}")
-    _logout()
-
-    r = _doc("v1", "4期/01_標準/消費税法.md", api_key=issued["key"])
-    assert r.status_code == 413, r.text
+    assert _doc("v1", _TAX_DOC, _key("docsize")["key"]).status_code == 413
 
 
 # ===== GET /ext/v1/doc: symlink 差し替え耐性・マジック検証（低レベル安全性） =====
 #
-# `worlds.world_dir` を任意の一時ディレクトリへ monkeypatch し、`safe_open` の実 O_NOFOLLOW walk を
-# 実ファイルシステム上で検証する（tests/unit/test_ext2_evidence.py と同じ monkeypatch 流儀）。
+# `worlds.resolve_external_world` を任意の一時ディレクトリへ差し替え、`safe_open` の実 O_NOFOLLOW walk を
+# 実ファイルシステム上で検証する。
 
-def _mk_doc_key(sfx: str) -> str:
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"docfd-{sfx}")
-    _logout()
-    return issued["key"]
-
-
-def _mock_external_world(monkeypatch, root):
-    """`worlds.resolve_external_world`（ext_doc/ext_search が使う strict resolver）を任意の
-    一時ディレクトリへ差し替える（低レベル安全性テスト用・registry/fixtures 解決を経由しない）。
-    """
-    from sherpa import worlds
+def _mock_external_world(monkeypatch, root, *, world_dir=False):
+    """外部 API 専用の strict resolver を一時ディレクトリへ向ける。`world_dir=True` は内容判定
+    （`status_document_doctype`→`worlds.world_dir`）も同じ root へ向ける（未登録拡張子の内容判定用）。"""
     monkeypatch.setattr(worlds, "resolve_external_world",
                         lambda w, **kw: worlds.ExternalWorldResolution("ok", root))
+    if world_dir:
+        monkeypatch.setattr(worlds, "world_dir", lambda w: root)
 
 
-def _mock_external_world_and_world_dir(monkeypatch, root):
-    """`_mock_external_world` に加え `worlds.world_dir` も同じ root へ差し替える。
-
-    `ext_doc` はファイル配信を `resolve_external_world`（外部API専用の world 解決）経由で行うが、
-    doctype 判定（`corpus_docs.status_document_doctype`）内部の内容読み取り
-    （`documents.resolve`→`worlds.world_dir`）は別経路——登録済みの実 world では両者が同じ
-    registry 行に解決されるため一致するが、`_mock_external_world` 単独では `world_dir` 側が
-    未登録のまま（内容判定が必要な拡張子だと read 失敗＝`unreadable` に丸められ、内容に関わらず
-    doctype が付いてしまう）。内容判定を伴うテスト（未登録拡張子の到達可能性）はこちらを使う。
-    """
-    from sherpa import worlds
-    _mock_external_world(monkeypatch, root)
-    monkeypatch.setattr(worlds, "world_dir", lambda w: root)
+def _file(name, data):
+    def setup(root, outside):
+        (root / name).write_bytes(data)
+        return data
+    return setup
 
 
-def test_doc_rejects_symlink_in_path(tmp_path, monkeypatch):
-    """world root 配下の中間要素が symlink だと、実ファイルが world 外にあっても 404
-    （`safe_open.open_file_nofollow_walk` は中間ディレクトリも O_NOFOLLOW で辿る）。"""
-    if not _try_init():
-        pytest.skip("DB down")
+def _zip_file(name, members):
+    def setup(root, outside):
+        (root / name).write_bytes(_zip_bytes(members))
+    return setup
 
-    outside = tmp_path / "outside"
-    outside.mkdir()
+
+def _symlinked_dir(root, outside):
     (outside / "secret.md").write_text("外部の内容", encoding="utf-8")
-    root = tmp_path / "root"
-    root.mkdir()
     (root / "evil_link").symlink_to(outside, target_is_directory=True)
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "evil_link/secret.md", api_key=key)
-    assert r.status_code == 404, r.text
 
 
-def test_doc_rejects_symlink_file_itself(tmp_path, monkeypatch):
-    """対象ファイル自体が symlink（world 外の実ファイルを指す）でも 404。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    outside = tmp_path / "outside"
-    outside.mkdir()
+def _symlinked_file(root, outside):
     target = outside / "secret.md"
     target.write_text("外部の内容", encoding="utf-8")
-    root = tmp_path / "root"
-    root.mkdir()
     (root / "link.md").symlink_to(target)
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "link.md", api_key=key)
-    assert r.status_code == 404, r.text
 
 
-def test_doc_rejects_magic_mismatch(tmp_path, monkeypatch):
-    """拡張子は `.pdf` だが実バイト列が PDF マジック（`%PDF-`）でない＝拡張子偽装は 415。"""
-    if not _try_init():
-        pytest.skip("DB down")
+def _cfb_header_bytes(*, major: int = 3, sector_shift: int = 9) -> bytes:
+    import struct
+    header = bytearray(512)
+    header[0:8] = ext_api._OLE2_MAGIC
+    struct.pack_into("<HH", header, 24, 0, major)
+    struct.pack_into("<H", header, 28, 0xFFFE)
+    struct.pack_into("<H", header, 30, sector_shift)
+    return bytes(header)
 
+
+_PDF = b"%PDF-1.4\n%dummy pdf content\n"
+_UTF8_TEXT = "こんにちは"
+
+# (setup, 要求パス, 期待ステータス, 期待 content-type（None は見ない）, world_dir も差し替え, ext_api 定数の上書き)
+_DOC_CASES = {
+    # symlink: 中間ディレクトリでも対象ファイル自体でも、world 外へ出る経路は 404
+    "symlink_in_path": (_symlinked_dir, "evil_link/secret.md", 404, None, False, {}),
+    "symlink_file_itself": (_symlinked_file, "link.md", 404, None, False, {}),
+    # マジック検証（拡張子偽装は 415・一致は配信）
+    "magic_mismatch_pdf": (_file("fake.pdf", b"this is not a pdf file at all"), "fake.pdf", 415, None,
+                           False, {}),
+    "real_pdf": (_file("real.pdf", _PDF), "real.pdf", 200, "application/pdf", False, {}),
+    "cross_format_image": (_file("fake.jpg", b"\x89PNG\r\n\x1a\n" + b"\x00" * 32), "fake.jpg", 415,
+                           None, False, {}),
+    "bigtiff": (_file("big.tif", b"II+\x00" + b"\x08\x00\x00\x00" + b"\x00" * 32), "big.tif", 200,
+                None, False, {}),
+    "ooxml_empty_zip": (_zip_file("empty.docx", []), "empty.docx", 415, None, False, {}),
+    "ooxml_cross_format": (_zip_file("mislabeled.docx", [("[Content_Types].xml", "<Types/>"),
+                                                         ("xl/workbook.xml", "<workbook/>")]),
+                           "mislabeled.docx", 415, None, False, {}),
+    "ooxml_valid": (_zip_file("real.docx", [("[Content_Types].xml", "<Types/>"),
+                                            ("word/document.xml", "<document/>")]),
+                    "real.docx", 200, None, False, {}),
+    "ooxml_too_many_members": (_zip_file("many.docx", [("[Content_Types].xml", "<Types/>"),
+                                                       ("word/document.xml", "<document/>")]
+                                         + [(f"extra/{i}.txt", "x") for i in range(10)]),
+                               "many.docx", 415, None, False, {"_ZIP_MAX_MEMBERS": 3}),
+    # legacy Office: OLE2 でない旧形式は拒否せず、壊れた CFB ヘッダは 415
+    "pre_ole2_xls": (_file("legacy.xls", b"\x09\x00\x04\x00not really biff but not ole2 either"),
+                     "legacy.xls", 200, None, False, {}),
+    "valid_cfb_doc": (_file("real.doc", _cfb_header_bytes() + b"\x00" * 512), "real.doc", 200,
+                      "application/octet-stream", False, {}),
+    "malformed_cfb_xls": (_file("fake.xls", _cfb_header_bytes(major=3, sector_shift=12) + b"\x00" * 512),
+                          "fake.xls", 415, None, False, {}),
+    # テキストの charset: UTF-8 でなければ宣言を外し、検証上限超過も「未検証」として宣言しない
+    "charset_invalid_utf8": (_file("sjis.txt", _UTF8_TEXT.encode("shift_jis")), "sjis.txt", 200,
+                             "text/plain", False, {}),
+    "charset_valid_utf8": (_file("utf8.txt", _UTF8_TEXT.encode("utf-8")), "utf8.txt", 200,
+                           "text/plain; charset=utf-8", False, {}),
+    "charset_over_validation_cap": (_file("big.txt", ("あ" * 200).encode("utf-8")), "big.txt", 200,
+                                    "text/plain", False, {"_UTF8_VALIDATE_CAP": 100}),
+    # 対象外: 重要度設定ファイル・内容判定で対象外のバイナリ・秘匿名は 404、読めるテキストは未登録拡張子でも配信
+    "importance_control_file": (_file("_重要度.txt", "*.md: 高\n".encode("utf-8")), "_重要度.txt", 404,
+                                None, False, {}),
+    "unregistered_ext_text": (_file("app.zzz", b"readable plain text content\n"), "app.zzz", 200,
+                              None, True, {}),
+    "unregistered_ext_binary": (_file("blob.bin", b"\x00\x01\x02binary\xff\xfe" * 10), "blob.bin", 404,
+                                None, True, {}),
+    "sensitive_name": (_file(".env", b"API_KEY=secret\n"), ".env", 404, None, True, {}),
+}
+
+
+@pytest.mark.parametrize("case", list(_DOC_CASES))
+def test_doc_serving_safety(tmp_path, monkeypatch, case):
+    setup, rel, status, ctype, world_dir, patch = _DOC_CASES[case]
     root = tmp_path / "root"
     root.mkdir()
-    (root / "fake.pdf").write_bytes(b"this is not a pdf file at all")
-    _mock_external_world(monkeypatch, root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for k, v in patch.items():
+        monkeypatch.setattr(ext_api, k, v)
+    content = setup(root, outside)
+    _mock_external_world(monkeypatch, root, world_dir=world_dir)
 
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "fake.pdf", api_key=key)
-    assert r.status_code == 415, r.text
-
-
-def test_doc_accepts_real_magic(tmp_path, monkeypatch):
-    """マジックが一致する場合は正常に配信される（誤検知していないことの対照）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    root = tmp_path / "root"
-    root.mkdir()
-    content = b"%PDF-1.4\n%dummy pdf content\n"
-    (root / "real.pdf").write_bytes(content)
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "real.pdf", api_key=key)
-    assert r.status_code == 200, r.text
-    assert r.content == content
-    assert r.headers["content-type"] == "application/pdf"
-
-
-def test_doc_rejects_importance_control_file(tmp_path, monkeypatch):
-    """`_重要度.txt`（文書の重要度設定ファイル自体）は原本DLの対象外＝404。
-
-    `corpus_docs.status_document_doctype()` が `_重要度.txt` を None 扱いにする（§5 の除外契約）
-    ため、`documents.resolve()` を経由しないこの経路（`ext_doc` は直接 `safe_open` で配信する）
-    でも一貫して弾かれることを固定する。
-    """
-    if not _try_init():
-        pytest.skip("DB down")
-
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "_重要度.txt").write_text("*.md: 高\n", encoding="utf-8")
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "_重要度.txt", api_key=key)
-    assert r.status_code == 404, r.text
-
-
-def test_doc_downloads_unregistered_ext_readable_text(tmp_path, monkeypatch):
-    """未登録拡張子でも内容がテキストと判定できれば原本DLできる（軽量テキスト枠の第2段・
-    `status_document_doctype(..., allow_content_sniff=True)`）——grep/read_around で読める文書が
-    ダウンロードだけ 404 になる非対称を解消する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    root = tmp_path / "root"
-    root.mkdir()
-    content = b"readable plain text content\n"
-    (root / "app.zzz").write_bytes(content)
-    _mock_external_world_and_world_dir(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "app.zzz", api_key=key)
-    assert r.status_code == 200, r.text
-    assert r.content == content
-
-
-def test_doc_rejects_unregistered_ext_binary(tmp_path, monkeypatch):
-    """未登録拡張子で内容が実質バイナリ（NUL バイト支配的）なら、内容判定を有効にしても
-    doctype が付かない＝原本DLの対象外のまま 404（grep/精読/ES 索引からも対象外の文書と同じ扱い
-    ——`corpus_docs.scan_report` の `unreachable_as_text` に数えられる集合）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "blob.bin").write_bytes(b"\x00\x01\x02binary\xff\xfe" * 10)
-    _mock_external_world_and_world_dir(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "blob.bin", api_key=key)
-    assert r.status_code == 404, r.text
-
-
-def test_doc_rejects_sensitive_unregistered_name(tmp_path, monkeypatch):
-    """秘匿名（`.env`）は内容判定を有効にしても対象外のまま 404（存在を漏らさない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
-    _mock_external_world_and_world_dir(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", ".env", api_key=key)
-    assert r.status_code == 404, r.text
+    r = _doc("docsafety", rel, _key("docfd")["key"])
+    assert r.status_code == status, r.text
+    if status == 200 and content is not None:
+        assert r.content == content
+    if ctype is not None:
+        assert r.headers["content-type"] == ctype
 
 
 def test_doc_rejects_dot_segment_path_tricks_matching_content_check(tmp_path, monkeypatch):
-    """`./`・`.//`・`a/./b`・末尾 `/.`（生の `.` セグメント表現・URL エンコード `%2e` を含む）は、
-    配信側（`_doc_path_segments`）・内容判定側（`status_document_doctype`→`resolve_path`）の
-    どちらも同じ正規化（`world_graph.valid_rel_parts`）で拒否する——正規化規則が2箇所で
-    食い違うと、内容判定側は「読み取り不可」で通してしまうのに配信側だけが実ファイルを開いて
-    返してしまう（秘密鍵等の漏洩経路）。実ファイル（`.` トリックが無ければ普通に読める内容）で
-    再現する——モックで経路を差し替えると穴を再現できないため。秘密鍵の中身はアサーションに
-    出さない（ステータスコードだけを見る）。
-    """
-    if not _try_init():
-        pytest.skip("DB down")
-
+    """`./`・`.//`・`a/./b`・末尾 `/.`（`%2e` 含む）は、配信側（`_doc_path_segments`）と内容判定側
+    （`status_document_doctype`→`resolve_path`）のどちらも同じ正規化（`valid_rel_parts`）で拒否する
+    ——食い違うと内容判定は「読み取り不可」で通り、配信側だけが実ファイルを返す（秘密鍵の漏洩経路）。
+    実ファイルで再現する（モックでは穴が再現できない）。秘密鍵の中身は出さずステータスだけ見る。"""
     root = tmp_path / "root"
     root.mkdir()
-    # PEM 秘密鍵ヘッダを持つファイル（拡張子トリック無しの直指定でも内容判定で対象外になる対照）。
     (root / "blob.zzz").write_text(
         "-----BEGIN RSA PRIVATE KEY-----\n" + "A" * 64 + "\n-----END RSA PRIVATE KEY-----\n",
         encoding="utf-8")
     (root / "sub").mkdir()
-    # トリック無しなら普通に読める（秘密鍵ではない）ファイル——`.` トリックがコンテンツではなく
-    # パス正規化自体で拒否されることを、こちらで独立に固定する。
-    (root / "sub" / "note.zzz").write_text("readable plain text\n", encoding="utf-8")
-    _mock_external_world_and_world_dir(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    headers = {"X-API-Key": key}
+    (root / "sub" / "note.zzz").write_text("readable plain text\n", encoding="utf-8")   # トリック無しなら読める
+    _mock_external_world(monkeypatch, root, world_dir=True)
+    key = _key("docdot")["key"]
 
     for tricky in ("./blob.zzz", ".//blob.zzz", "sub/./note.zzz", "note.zzz/.", "sub/note.zzz/."):
-        r = client.get("/ext/v1/doc", params={"world": "docsafety", "path": tricky}, headers=headers)
+        r = client.get("/ext/v1/doc", params={"world": "docsafety", "path": tricky}, headers=_h(key))
         assert r.status_code == 404, tricky
+    # URL エンコード表現が HTTP 層でデコードされた後も拒否される。
+    for qs in ("path=%2eblob.zzz", "path=sub%2f%2enote.zzz"):
+        r = client.get(f"/ext/v1/doc?world=docsafety&{qs}", headers=_h(key))
+        assert r.status_code == 404, r.text
 
-    # URL エンコード表現（`%2e`→`.`・`%2f`→`/`）が実際に HTTP 層でデコードされた後も拒否されること。
-    r = client.get("/ext/v1/doc?world=docsafety&path=%2eblob.zzz", headers=headers)
-    assert r.status_code == 404, r.text
-    r = client.get("/ext/v1/doc?world=docsafety&path=sub%2f%2enote.zzz", headers=headers)
-    assert r.status_code == 404, r.text
-
-    # トリック無しの正常なパスは従来どおり取得できる（回帰）。
-    r = _doc("docsafety", "sub/note.zzz", api_key=key)
+    r = _doc("docsafety", "sub/note.zzz", key)   # トリック無しは取得できる（回帰）
     assert r.status_code == 200, r.text
     assert r.content == b"readable plain text\n"
 
 
 def _build_deep_tree_with_leaves(root, num_segments: int, seg_len: int, leaves: dict) -> dict:
     """PATH_MAX を超える深いディレクトリ木を dir_fd 相対の syscall だけで構築し（累積パス文字列は
-    一度も作らない——配信側 `safe_open.open_file_nofollow_walk` が辿るのと同じ経路）、`leaves`
-    （{ファイル名: バイト列}）を最深ディレクトリへ書き込む。通常の `Path.mkdir(parents=True)`
-    （内部で累積パスを使う）ではこの深さを作れない（`os.lstat`/累積パスでの `os.mkdir` は
-    ENAMETOOLONG で失敗する）。戻り値は {ファイル名: world root からの相対 rel}。
-    """
+    作らない＝配信側 `safe_open.open_file_nofollow_walk` と同じ経路）、`leaves`（{名前: バイト列}）を
+    最深ディレクトリへ書く。戻り値は {名前: world root からの相対 rel}。"""
     segs = ["あ" * seg_len] * num_segments
     dir_fd = os.open(str(root), os.O_DIRECTORY)
     try:
@@ -1282,800 +945,312 @@ def _build_deep_tree_with_leaves(root, num_segments: int, seg_len: int, leaves: 
 
 def test_doc_rejects_path_too_long_for_content_check_even_though_serving_would_succeed(
         tmp_path, monkeypatch):
-    """内容判定（`status_document_reachable`→`world_graph.resolve_path`）は累積パス文字列を
-    `os.lstat` するため、パス全体が長すぎると（ENAMETOOLONG）判定不能（`None`）になる。一方
-    配信側（`safe_open.open_file_nofollow_walk`）は dir_fd 相対で1段ずつ open するため同じ
-    ファイルを問題なく開ける——判定不能を「対象外ではない」に丸めると、判定できなかった
-    ファイルがそのまま配信されてしまう（fail-open）。実ファイル（PEM 秘密鍵ヘッダを持つものと、
-    トリック無しなら普通に読めるテキストの両方・同じ長さ）で固定する——「判定できない以上、
-    内容に関わらず拒否する」ことを見るため。秘密鍵の中身はアサーションに出さない
-    （ステータスコードだけを見る）。
-    """
-    if not _try_init():
-        pytest.skip("DB down")
-
+    """内容判定は累積パスを `os.lstat` するためパスが長すぎると判定不能（ENAMETOOLONG）になるが、
+    配信側は dir_fd 相対で同じファイルを開ける。判定不能を「対象外ではない」に丸めると判定できなかった
+    ファイルが配信される（fail-open）。PEM 秘密鍵ヘッダ入りと読めるテキストの両方（同じ長さ）で、
+    判定できない以上は内容に関わらず拒否することを固定する（`verify_doc_exists` にも同じ fail-closed）。"""
     root = tmp_path / "root"
     root.mkdir()
     leaves = _build_deep_tree_with_leaves(root, 18, 80, {
         "secret.zzz": b"-----BEGIN RSA PRIVATE KEY-----\n" + b"A" * 64
-                     + b"\n-----END RSA PRIVATE KEY-----\n",
+                      + b"\n-----END RSA PRIVATE KEY-----\n",
         "plain.zzz": b"readable plain text\n",
     })
-    full_path = root.joinpath(*(["あ" * 80] * 18), "secret.zzz")
-    try:
-        full_path.stat()
-        pytest.fail("累積パスの stat が成功した＝この環境では ENAMETOOLONG を再現できない")
-    except OSError as e:
-        import errno
-        assert e.errno == errno.ENAMETOOLONG, f"想定外の errno（この環境の PATH_MAX 設定を確認）: {e}"
+    with pytest.raises(OSError) as ei:
+        root.joinpath(*(["あ" * 80] * 18), "secret.zzz").stat()
+    assert ei.value.errno == errno.ENAMETOOLONG, f"想定外の errno（この環境の PATH_MAX 設定を確認）: {ei.value}"
 
-    _mock_external_world_and_world_dir(monkeypatch, root)
-    key = _mk_doc_key(_sfx())
-    headers = {"X-API-Key": key}
-
+    _mock_external_world(monkeypatch, root, world_dir=True)
+    key = _key("docdeep")["key"]
     for rel in leaves.values():
-        r = client.get("/ext/v1/doc", params={"world": "docsafety", "path": rel}, headers=headers)
+        r = client.get("/ext/v1/doc", params={"world": "docsafety", "path": rel}, headers=_h(key))
         assert r.status_code == 404, rel
 
-    # 通常の長さの正常ファイルは従来どおり取得できる（回帰）。
-    (root / "normal.zzz").write_bytes(b"ok\n")
-    r = client.get("/ext/v1/doc", params={"world": "docsafety", "path": "normal.zzz"}, headers=headers)
+    (root / "normal.zzz").write_bytes(b"ok\n")   # 通常の長さの正常ファイルは取得できる（回帰）
+    r = client.get("/ext/v1/doc", params={"world": "docsafety", "path": "normal.zzz"}, headers=_h(key))
     assert r.status_code == 200, r.text
     assert r.content == b"ok\n"
 
-    # `verify_doc_exists` 側にも同じ fail-closed 原則が効くこと（`worlds.world_dir` は
-    # `_mock_external_world_and_world_dir` が既に同じ root へ向けている）。
-    from sherpa import agentic_search
     for rel in leaves.values():
         assert agentic_search.verify_doc_exists(rel, "docsafety") is False, rel
     assert agentic_search.verify_doc_exists("normal.zzz", "docsafety") is True
 
 
-def test_doc_rejects_ooxml_content_types_missing(tmp_path, monkeypatch):
-    """docx を騙る空/不正な zip（`[Content_Types].xml` も main part も無い）は 415
-    （cross-format 検証・空 ZIP のケースを兼ねる）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    import zipfile as zf
-
-    root = tmp_path / "root"
-    root.mkdir()
-    buf_path = root / "empty.docx"
-    with zf.ZipFile(buf_path, "w"):
-        pass   # 空の zip（PK\x05\x06 の EOCD のみ）＝有効な zip だが中身が無い
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "empty.docx", api_key=key)
-    assert r.status_code == 415, r.text
-
-
-def test_doc_rejects_cross_format_ooxml(tmp_path, monkeypatch):
-    """実体は xlsx（`xl/workbook.xml` を持つ）だが `.docx` として要求＝main part 不一致で 415。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    import zipfile as zf
-
-    root = tmp_path / "root"
-    root.mkdir()
-    p = root / "mislabeled.docx"
-    with zf.ZipFile(p, "w") as z:
-        z.writestr("[Content_Types].xml", "<Types/>")
-        z.writestr("xl/workbook.xml", "<workbook/>")   # xlsx の main part（docx のではない）
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "mislabeled.docx", api_key=key)
-    assert r.status_code == 415, r.text
-
-
-def test_doc_accepts_valid_ooxml(tmp_path, monkeypatch):
-    """`[Content_Types].xml` と形式固有 main part を持つ正しい docx は 200（誤検知していない対照）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    import zipfile as zf
-
-    root = tmp_path / "root"
-    root.mkdir()
-    p = root / "real.docx"
-    with zf.ZipFile(p, "w") as z:
-        z.writestr("[Content_Types].xml", "<Types/>")
-        z.writestr("word/document.xml", "<document/>")
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "real.docx", api_key=key)
-    assert r.status_code == 200, r.text
-
-
-def test_doc_rejects_cross_format_image(tmp_path, monkeypatch):
-    """PNG の実バイト列を `.jpg` として要求＝拡張子別 signature 不一致で 415
-    （旧実装は「画像系ならどれかの signature が一致すればOK」だったため素通りしていた）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    root = tmp_path / "root"
-    root.mkdir()
-    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
-    (root / "fake.jpg").write_bytes(png_bytes)
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "fake.jpg", api_key=key)
-    assert r.status_code == 415, r.text
-
-
-def test_doc_accepts_pre_ole2_legacy_xls(tmp_path, monkeypatch):
-    """OLE2/CFB ではない .xls（pre-OLE2 の旧形式を模した任意バイト列）は拒否しない
-    （doctype ゲート済みのため。CFB ヘッダ健全性チェックは OLE2 マジックがある場合のみ働く）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "legacy.xls").write_bytes(b"\x09\x00\x04\x00not really biff but not ole2 either")
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "legacy.xls", api_key=key)
-    assert r.status_code == 200, r.text
-
-
-def _cfb_header_bytes(*, major: int = 3, sector_shift: int = 9) -> bytes:
-    """妥当な [MS-CFB] ヘッダ（512バイト）を組み立てる。legacy Office（.doc/.xls/.ppt）の検証は
-    ヘッダの署名・version・byte order・sector shift の健全性のみを見る（stream 列挙・形式判別は
-    しない——配信元は登録済み world＝信頼済みコーパスであり、深い形式判別は脅威モデル過剰という
-    裁定。パーサ単体の網羅的なテストは tests/unit/test_ext_api_cfb.py 側）。
-    """
-    import struct
-
-    from sherpa import ext_api
-
-    header = bytearray(512)
-    header[0:8] = ext_api._OLE2_MAGIC
-    struct.pack_into("<HH", header, 24, 0, major)
-    struct.pack_into("<H", header, 28, 0xFFFE)
-    struct.pack_into("<H", header, 30, sector_shift)
-    return bytes(header)
-
-
-def test_doc_accepts_valid_cfb_doc(tmp_path, monkeypatch):
-    """妥当な CFB ヘッダを持つ実体は `.doc` として 200・Content-Type は application/octet-stream 固定
-    （legacy Office は形式判別しない裁定・nosniff 済みのため MIME 混同の実害は無い）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    data = _cfb_header_bytes() + b"\x00" * 512
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "real.doc").write_bytes(data)
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "real.doc", api_key=key)
-    assert r.status_code == 200, r.text
-    assert r.content == data
-    assert r.headers["content-type"] == "application/octet-stream"
-
-
-def test_doc_rejects_malformed_cfb_header(tmp_path, monkeypatch):
-    """OLE2 マジックはあるが sector_shift が major version と不整合な壊れヘッダは 415。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    data = _cfb_header_bytes(major=3, sector_shift=12) + b"\x00" * 512   # v3 なのに v4 の shift
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "fake.xls").write_bytes(data)
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "fake.xls", api_key=key)
-    assert r.status_code == 415, r.text
-
-
-def test_doc_charset_dropped_for_invalid_utf8(tmp_path, monkeypatch):
-    """`.txt` の内容が有効な UTF-8 でなければ、Content-Type から charset=utf-8 を外す
-    （実際のエンコーディングを確認せず utf-8 と偽らない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "sjis.txt").write_bytes("こんにちは".encode("shift_jis"))
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "sjis.txt", api_key=key)
-    assert r.status_code == 200, r.text
-    assert r.headers["content-type"] == "text/plain"   # charset 宣言なし
-
-
-def test_doc_charset_kept_for_valid_utf8(tmp_path, monkeypatch):
-    """`.txt` が実際に UTF-8 なら charset=utf-8 のまま（誤検知していないことの対照）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "utf8.txt").write_text("こんにちは", encoding="utf-8")
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "utf8.txt", api_key=key)
-    assert r.status_code == 200, r.text
-    assert r.headers["content-type"] == "text/plain; charset=utf-8"
-
-
 # ===== API キーの world スコープ =====
 
-def test_scoped_key_allows_in_scope_world():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key_scoped(f"scoped-ok-{sfx}", ["v1"])
-    _logout()
+def test_scoped_key_enforces_world_scope_across_endpoints():
+    issued = _key("scoped", allowed_worlds=["v1"])
+    key = issued["key"]
+    with _as_admin():   # 一覧にも allowed_worlds が出る
+        row = next(x for x in client.get(_ADMIN_KEYS).json()["keys"] if x["id"] == issued["id"])
+        assert row["allowed_worlds"] == ["v1"]
 
-    r = _search({"world": "v1", "query": "税", "engines": ["keyword"]}, api_key=issued["key"])
+    assert _search({"world": "v1", "query": "税", "engines": ["keyword"]}, key).status_code == 200
+    assert _doc("v1", _TAX_DOC, key).status_code == 200
+    for r in (_search({"world": "other-world-xyz", "query": "x"}, key),
+              _doc("other-world-xyz", "a.md", key),
+              _answer({"world": "other-world-xyz", "query": "x"}, key)):
+        assert r.status_code == 403, r.text
+    r = _capabilities(key)
     assert r.status_code == 200, r.text
-    r = _doc("v1", "4期/01_標準/消費税法.md", api_key=issued["key"])
-    assert r.status_code == 200, r.text
-
-
-def test_scoped_key_rejects_out_of_scope_world():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key_scoped(f"scoped-403-{sfx}", ["v1"])
-    _logout()
-
-    r = _search({"world": "other-world-xyz", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 403, r.text
-    r = _doc("other-world-xyz", "a.md", api_key=issued["key"])
-    assert r.status_code == 403, r.text
-
-
-def test_scoped_key_capabilities_filters_worlds():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key_scoped(f"scoped-caps-{sfx}", ["v1"])
-    _logout()
-
-    r = _capabilities(api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    ids = {w["id"] for w in r.json()["worlds"]}
-    assert ids == {"v1"}
+    assert {w["world"] for w in r.json()["worlds"]} == {"v1"}
 
 
 def test_unscoped_key_allows_any_world():
-    """既存キー（allowed_worlds 未指定=null）は従来どおり全 world にアクセスできる（後方互換）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"unscoped-{sfx}")
-    _logout()
+    """既存キー（allowed_worlds=null）は従来どおり全 world にアクセスできる（後方互換）。"""
+    issued = _key("unscoped")
     assert issued["allowed_worlds"] is None
+    assert _search({"world": "v1", "query": "税", "engines": ["keyword"]}, issued["key"]).status_code == 200
+    r = _search({"world": "some-other-world-abc", "query": "x"}, issued["key"])
+    assert r.status_code == 404, r.text   # スコープではなく世界不在の 404
 
-    r = _search({"world": "v1", "query": "税", "engines": ["keyword"]}, api_key=issued["key"])
+
+def test_key_create_empty_allowed_worlds_denies_all():
+    issued = _key("denyall", allowed_worlds=[])
+    assert issued["allowed_worlds"] == []
+    assert _search({"world": "v1", "query": "x"}, issued["key"]).status_code == 403
+    assert _doc("v1", _TAX_DOC, issued["key"]).status_code == 403
+    r = _capabilities(issued["key"])
     assert r.status_code == 200, r.text
-    r = _search({"world": "some-other-world-abc", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 404, r.text   # スコープではなく世界不在の 404（後方互換）
+    assert r.json()["worlds"] == []
 
 
-def test_key_create_rejects_invalid_world_identifier():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    r = client.post("/ext/v1/admin/keys",
-                    json={"label": f"badworld-{sfx}", "allowed_worlds": ["not a valid id!"]})
-    assert r.status_code == 422, r.text
-    _logout()
+@pytest.mark.parametrize("worlds_in", [["not a valid id!"], ["nonexistent-world-zzz"]],
+                         ids=["invalid_identifier", "unknown_world"])
+def test_key_create_rejects_invalid_or_unknown_world(worlds_in):
+    with _as_admin():
+        r = client.post(_ADMIN_KEYS, json={"label": f"badworld-{_sfx()}", "allowed_worlds": worlds_in})
+        assert r.status_code == 422, r.text
 
 
-def test_key_list_includes_allowed_worlds():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key_scoped(f"listscope-{sfx}", ["v1"])
-    r = client.get("/ext/v1/admin/keys")
-    assert r.status_code == 200, r.text
-    row = next(x for x in r.json()["keys"] if x["id"] == issued["id"])
-    assert row["allowed_worlds"] == ["v1"]
-    _logout()
+def test_key_create_two_world_scope(tmp_path):
+    """2 つの実在 world をスコープに持てる（本物の registry 行・resolver はモックしない）。
+    スコープに未知の world を含めると発行時点で 422。"""
+    second_world = f"v2real{_sfx()}"
+    root2 = tmp_path / "root2"
+    root2.mkdir()
+    (root2 / "note.md").write_text("第二世界の資料です", encoding="utf-8")
+    store.upsert_world(second_world, str(root2))
+    try:
+        issued = _key("twoworld", allowed_worlds=["v1", second_world])
+        assert issued["allowed_worlds"] == ["v1", second_world]
+        with _as_admin():
+            r = client.post(_ADMIN_KEYS, json={"label": f"badscope-{_sfx()}",
+                                               "allowed_worlds": [second_world, "nonexistent-world-zzz"]})
+            assert r.status_code == 422, r.text
+
+        key = issued["key"]
+        assert _search({"world": "v1", "query": "税", "engines": ["keyword"]}, key).status_code == 200
+        assert _search({"world": second_world, "query": "資料", "engines": ["keyword"]},
+                       key).status_code == 200
+        r = _doc(second_world, "note.md", key)
+        assert r.status_code == 200, r.text
+        assert "第二世界" in r.text
+    finally:
+        # 本物の registry 行は共有テスト DB に残ると `worlds.register()`（全体で 1 本だけ）を使う他テストを壊す。
+        store.delete_world_row(second_world)
 
 
-def test_key_create_rejects_unknown_world():
-    """形式は正しいが実在しない world は 422（`_known_world_ids_or_503` の実在検証）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    r = client.post("/ext/v1/admin/keys",
-                    json={"label": f"unknownworld-{sfx}", "allowed_worlds": ["nonexistent-world-zzz"]})
-    assert r.status_code == 422, r.text
-    _logout()
-
-
-# ===== expires_at・daily_quota・利用者自己発行 =====
+# ===== expires_at・daily_quota・client_op_id・利用者自己発行 =====
 
 def test_key_create_with_expires_at_and_daily_quota_round_trip():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    r = client.post("/ext/v1/admin/keys",
-                    json={"label": f"exq-{sfx}", "expires_at": "2099-01-01T00:00:00+00:00",
-                          "daily_quota": 5})
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["expires_at"] is not None
-    assert body["daily_quota"] == 5
-
-    listed = client.get("/ext/v1/admin/keys").json()["keys"]
-    row = next(x for x in listed if x["id"] == body["id"])
-    assert row["expires_at"] is not None
-    assert row["daily_quota"] == 5
-    assert row["call_count"] == 0
-    _logout()
+    with _as_admin():
+        r = client.post(_ADMIN_KEYS, json={"label": f"exq-{_sfx()}",
+                                           "expires_at": "2099-01-01T00:00:00+00:00", "daily_quota": 5})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["expires_at"] is not None
+        assert body["daily_quota"] == 5
+        row = next(x for x in client.get(_ADMIN_KEYS).json()["keys"] if x["id"] == body["id"])
+        assert row["expires_at"] is not None
+        assert row["daily_quota"] == 5
+        assert row["call_count"] == 0
 
 
-def test_key_create_rejects_invalid_daily_quota():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    r = client.post("/ext/v1/admin/keys", json={"label": f"badq-{sfx}", "daily_quota": 0})
-    assert r.status_code == 422, r.text
-    _logout()
-
-
-def test_key_create_daily_quota_rejects_bool_string_and_over_limit():
-    """`daily_quota` は StrictInt: bool・数字文字列は型検証で 422（暗黙変換しない）。
-    1,000,000 を超える値も 422（DB の CHECK 制約と同じ上限）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    try:
-        r = client.post("/ext/v1/admin/keys", json={"label": f"boolq-{sfx}", "daily_quota": True})
-        assert r.status_code == 422, r.text
-        r = client.post("/ext/v1/admin/keys", json={"label": f"strq-{sfx}", "daily_quota": "10"})
-        assert r.status_code == 422, r.text
-        r = client.post("/ext/v1/admin/keys", json={"label": f"overq-{sfx}", "daily_quota": 1_000_001})
-        assert r.status_code == 422, r.text
-        # 上限ちょうどは許可される。
-        r = client.post("/ext/v1/admin/keys", json={"label": f"maxq-{sfx}", "daily_quota": 1_000_000})
+@pytest.mark.parametrize("who", ["admin", "self"])
+def test_key_create_daily_quota_is_strict_int_with_max(who):
+    """`daily_quota` は StrictInt: bool・数字文字列・1,000,000 超は 422（DB の CHECK と同じ上限）で、
+    上限ちょうどは許可される。自己発行は管理者の許可上限を 1,000,000 へ上げた上で確認する。"""
+    bad = ([0] if who == "admin" else []) + [True, "10", 1_000_001]
+    with _issuer(who, user_api_keys_daily_quota_default=1_000_000) as route:
+        for v in bad:
+            r = client.post(route, json={"label": f"badq-{_sfx()}", "daily_quota": v})
+            assert r.status_code == 422, (v, r.text)
+        r = client.post(route, json={"label": f"maxq-{_sfx()}", "daily_quota": 1_000_000})
         assert r.status_code == 200, r.text
         assert r.json()["daily_quota"] == 1_000_000
-    finally:
-        _logout()
 
 
-def test_self_key_create_daily_quota_rejects_bool_string_and_over_limit():
-    """自己発行側でも `daily_quota` は StrictInt（管理者発行側と同じ境界カバレッジ）。
-    管理者の許可上限自体を1,000,000へ引き上げた上で、型検証（bool/文字列）と
-    _DAILY_QUOTA_MAX 超過がいずれも422になることを確認する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    assert client.put("/admin/settings", json={"user_api_keys_allowed": True,
-                                                "user_api_keys_daily_quota_default": 1_000_000}
-                     ).status_code == 200
-    _logout()
-    try:
-        uid, pw = _mk_user(sfx)
-        _login(uid, pw)
-        r = client.post("/ext/v1/keys", json={"label": f"selfboolq-{sfx}", "daily_quota": True})
-        assert r.status_code == 422, r.text
-        r = client.post("/ext/v1/keys", json={"label": f"selfstrq-{sfx}", "daily_quota": "10"})
-        assert r.status_code == 422, r.text
-        r = client.post("/ext/v1/keys", json={"label": f"selfoverq-{sfx}", "daily_quota": 1_000_001})
-        assert r.status_code == 422, r.text
-        # 上限ちょうど（かつ管理者の許可上限内）は許可される。
-        r = client.post("/ext/v1/keys", json={"label": f"selfmaxq-{sfx}", "daily_quota": 1_000_000})
-        assert r.status_code == 200, r.text
-        assert r.json()["daily_quota"] == 1_000_000
-        _logout()
-    finally:
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None,
-                                            "user_api_keys_daily_quota_default": None})
-        _logout()
-
-
-def test_key_create_rejects_past_expiry():
-    """管理者発行・利用者自己発行のいずれも、過去日時の有効期限は422（発行直後から使えない
-    キーを作らせない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    try:
-        r = client.post("/ext/v1/admin/keys",
-                        json={"label": f"pastexp-{sfx}", "expires_at": "2000-01-01T00:00:00+00:00"})
+@pytest.mark.parametrize("who", ["admin", "self"])
+def test_key_create_rejects_past_expiry(who):
+    with _issuer(who) as route:
+        r = client.post(route, json={"label": f"pastexp-{_sfx()}", "expires_at": "2000-01-01T00:00:00+00:00"})
         assert r.status_code == 422, r.text
 
-        assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
-    finally:
-        _logout()
-    try:
-        uid, pw = _mk_user(sfx)
-        _login(uid, pw)
-        r = client.post("/ext/v1/keys",
-                        json={"label": f"pastexpself-{sfx}", "expires_at": "2000-01-01T00:00:00+00:00"})
-        assert r.status_code == 422, r.text
-        _logout()
-    finally:
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None})
-        _logout()
 
-
-def test_key_create_client_op_id_round_trips_to_list_and_create_response():
-    """`client_op_id`（発行 UI の相関トークン・UUID 形式）は発行応答・一覧の両方に反映される
-    （POST 応答が失われた場合の照合用・秘密ではない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    op_id = str(uuid.uuid4())
-    r = client.post("/ext/v1/admin/keys", json={"label": f"opid-{sfx}", "client_op_id": op_id})
-    assert r.status_code == 200, r.text
-    assert r.json()["client_op_id"] == op_id
-    listed = client.get("/ext/v1/admin/keys").json()["keys"]
-    row = next(x for x in listed if x["id"] == r.json()["id"])
-    assert row["client_op_id"] == op_id
-    _logout()
-
-
-def test_self_key_create_client_op_id_round_trips_to_list_and_create_response():
-    """自己発行側でも `client_op_id` が発行応答・本人一覧の両方に反映される
-    （管理者発行側と同じ境界カバレッジ）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
-    _logout()
-    try:
-        uid, pw = _mk_user(sfx)
-        _login(uid, pw)
+@pytest.mark.parametrize("who", ["admin", "self"])
+def test_key_create_client_op_id_round_trips_to_list_and_create_response(who):
+    with _issuer(who) as route:
         op_id = str(uuid.uuid4())
-        r = client.post("/ext/v1/keys", json={"label": f"selfopid-{sfx}", "client_op_id": op_id})
+        r = client.post(route, json={"label": f"opid-{_sfx()}", "client_op_id": op_id})
         assert r.status_code == 200, r.text
         assert r.json()["client_op_id"] == op_id
-        listed = client.get("/ext/v1/keys").json()["keys"]
-        row = next(x for x in listed if x["id"] == r.json()["id"])
+        row = next(x for x in client.get(route).json()["keys"] if x["id"] == r.json()["id"])
         assert row["client_op_id"] == op_id
-        _logout()
-    finally:
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None})
-        _logout()
 
 
-def test_key_create_client_op_id_rejects_non_uuid_format():
-    """`client_op_id` は UUID 形式（8-4-4-4-12）以外は422（管理者発行・自己発行の両方）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    try:
-        for bad in ("not-a-uuid", f"op-{sfx}-abc123", "12345678-1234-1234-1234", ""):
-            r = client.post("/ext/v1/admin/keys",
-                            json={"label": f"badcop-{sfx}", "client_op_id": bad})
+@pytest.mark.parametrize("who, bad_values", [
+    ("admin", ["not-a-uuid", "op-abc123", "12345678-1234-1234-1234", ""]),
+    ("self", ["xyz"]),
+])
+def test_key_create_client_op_id_rejects_non_uuid_format(who, bad_values):
+    with _issuer(who) as route:
+        for bad in bad_values:
+            r = client.post(route, json={"label": f"badcop-{_sfx()}", "client_op_id": bad})
             assert r.status_code == 422, (bad, r.text)
 
-        assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
-    finally:
-        _logout()
-    try:
-        uid, pw = _mk_user(sfx)
-        _login(uid, pw)
-        r = client.post("/ext/v1/keys", json={"label": f"selfbadcop-{sfx}", "client_op_id": "xyz"})
-        assert r.status_code == 422, r.text
-        _logout()
-    finally:
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None})
-        _logout()
+
+@pytest.mark.parametrize("who", ["admin", "self"])
+def test_key_create_client_op_id_conflict_returns_409(who):
+    with _issuer(who) as route:
+        op_id = str(uuid.uuid4())
+        assert client.post(route, json={"label": f"dup1-{_sfx()}", "client_op_id": op_id}).status_code == 200
+        r = client.post(route, json={"label": f"dup2-{_sfx()}", "client_op_id": op_id})
+        assert r.status_code == 409, r.text
 
 
-def test_key_create_client_op_id_conflict_returns_409():
-    """同じ `client_op_id` で2回発行しようとすると2回目は409（一意制約違反の変換）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    op_id = str(uuid.uuid4())
-    r1 = client.post("/ext/v1/admin/keys", json={"label": f"dup1-{sfx}", "client_op_id": op_id})
-    assert r1.status_code == 200, r1.text
-    r2 = client.post("/ext/v1/admin/keys", json={"label": f"dup2-{sfx}", "client_op_id": op_id})
-    assert r2.status_code == 409, r2.text
-    _logout()
+def test_key_create_client_op_id_normalizes_case_and_conflicts_even_after_revoke():
+    """大文字で送っても応答は正準小文字形。別の大小文字表記の同じ UUID は 409（大小文字迂回を防ぐ）で、
+    失効済みキーの client_op_id でも一意制約は有効。"""
+    with _as_admin():
+        op_lower = str(uuid.uuid4())
+        r1 = client.post(_ADMIN_KEYS, json={"label": f"upnorm-{_sfx()}", "client_op_id": op_lower.upper()})
+        assert r1.status_code == 200, r1.text
+        assert r1.json()["client_op_id"] == op_lower
 
+        r2 = client.post(_ADMIN_KEYS, json={"label": f"upnorm2-{_sfx()}", "client_op_id": op_lower})
+        assert r2.status_code == 409, r2.text
 
-def test_key_create_client_op_id_uppercase_input_normalizes_and_second_attempt_conflicts():
-    """`client_op_id` を大文字で送っても、発行応答は正準小文字形に正規化される。同じ UUID を
-    別の大小文字表記で2回目に送っても409（UUID互換の回帰契約・大小文字迂回を防ぐ）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    op_id_lower = str(uuid.uuid4())
-    r1 = client.post("/ext/v1/admin/keys",
-                     json={"label": f"upnorm-{sfx}", "client_op_id": op_id_lower.upper()})
-    assert r1.status_code == 200, r1.text
-    assert r1.json()["client_op_id"] == op_id_lower   # 応答は常に正準小文字形。
-
-    r2 = client.post("/ext/v1/admin/keys",
-                     json={"label": f"upnorm2-{sfx}", "client_op_id": op_id_lower})
-    assert r2.status_code == 409, r2.text
-    _logout()
+        assert client.delete(f"{_ADMIN_KEYS}/{r1.json()['id']}").status_code == 200
+        r3 = client.post(_ADMIN_KEYS, json={"label": f"revdup-{_sfx()}", "client_op_id": op_lower})
+        assert r3.status_code == 409, r3.text
 
 
 def test_key_recover_matches_directly_seeded_uppercase_legacy_row_via_lowercase_query():
-    """アプリの正規化を経由しない直接 SQL で大文字のまま保存された旧行（移行前のデータを
-    模す）でも、回復 API へ小文字で照会すれば一致する（`lower()` 照合の回帰契約）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    op_id_upper = str(uuid.uuid4()).upper()
-    with store._connect() as c:
-        key_id = c.execute(
-            "INSERT INTO api_keys (key_hash, key_prefix, label, created_by, client_op_id) "
-            "VALUES (%s,%s,%s,%s,%s) RETURNING id",
-            (f"hash-legacyup-{sfx}", f"pfxlgu{sfx}"[:12], "legacy", adm_uid, op_id_upper),
-        ).fetchone()["id"]
+    """正規化を経由せず大文字のまま保存された旧行でも、回復 API へ小文字で照会すれば一致する。"""
+    with _as_admin() as adm_uid:
+        op_id_upper = str(uuid.uuid4()).upper()
+        sfx = _sfx()
+        with store._connect() as c:
+            key_id = c.execute(
+                "INSERT INTO api_keys (key_hash, key_prefix, label, created_by, client_op_id) "
+                "VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                (f"hash-legacyup-{sfx}", f"pfxlgu{sfx}"[:12], "legacy", adm_uid, op_id_upper),
+            ).fetchone()["id"]
+        rec = client.post(f"{_ADMIN_KEYS}/recover", json={"client_op_id": op_id_upper.lower()})
+        assert rec.status_code == 200, rec.text
+        assert rec.json()["found"] is True
+        assert rec.json()["id"] == key_id
 
-    rec = client.post("/ext/v1/admin/keys/recover", json={"client_op_id": op_id_upper.lower()})
-    assert rec.status_code == 200, rec.text
-    assert rec.json()["found"] is True
-    assert rec.json()["id"] == key_id
-    _logout()
+
+def _recover(route, op_id):
+    r = client.post(f"{route}/recover", json={"client_op_id": op_id})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _list_row(route, key_id):
+    return next(x for x in client.get(route).json()["keys"] if x["id"] == key_id)
 
 
 def test_key_recover_scoped_to_self_actor_does_not_reach_other_owners_key():
-    """回復専用エンドポイントは認証主体自身が発行操作した行にしか一致しない。B が A の
-    `client_op_id` で回復を試みても A のキーは無傷（別所有者衝突の反転テスト・API 経由）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
-    _logout()
+    """回復は認証主体自身が発行操作した行にしか一致しない。B が A の client_op_id で試みても
+    A のキーは無傷（別所有者衝突の反転テスト）。"""
     op_id = str(uuid.uuid4())
-    try:
+    sfx = _sfx()
+    with _self_issue_enabled():
         uid_a, pw_a = _mk_user(f"{sfx}a")
         _login(uid_a, pw_a)
-        created = client.post("/ext/v1/keys", json={"label": f"recA-{sfx}", "client_op_id": op_id})
+        created = client.post(_SELF_KEYS, json={"label": f"recA-{sfx}", "client_op_id": op_id})
         assert created.status_code == 200, created.text
         key_id = created.json()["id"]
         _logout()
 
-        uid_b, pw_b = _mk_user(f"{sfx}b")
-        _login(uid_b, pw_b)
-        # B が A の client_op_id で回復を試みても、見つからない（found: false）。
-        rec_b = client.post("/ext/v1/keys/recover", json={"client_op_id": op_id})
-        assert rec_b.status_code == 200, rec_b.text
-        assert rec_b.json()["found"] is False
+        _login(*_mk_user(f"{sfx}b"))
+        assert _recover(_SELF_KEYS, op_id)["found"] is False
         _logout()
 
         _login(uid_a, pw_a)
-        listed = client.get("/ext/v1/keys").json()["keys"]
-        row = next(x for x in listed if x["id"] == key_id)
-        assert row["revoked_at"] is None   # A のキーは無傷のまま
-        # A 自身の回復は正しく効く。
-        rec_a = client.post("/ext/v1/keys/recover", json={"client_op_id": op_id})
-        assert rec_a.status_code == 200, rec_a.text
-        assert rec_a.json()["found"] is True
-        assert rec_a.json()["id"] == key_id
-        _logout()
-    finally:
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None})
+        assert _list_row(_SELF_KEYS, key_id)["revoked_at"] is None   # A のキーは無傷
+        rec_a = _recover(_SELF_KEYS, op_id)
+        assert rec_a["found"] is True
+        assert rec_a["id"] == key_id
         _logout()
 
 
 def test_key_recover_admin_self_success_and_different_admin_denied():
-    """admin 自身の回復は成功し、別の admin が同じ `client_op_id` で回復を試みても見つからない
-    （admin 側の反転テスト・`created_by` で厳密に絞り込む）。"""
-    if not _try_init():
-        pytest.skip("DB down")
+    """admin 自身の回復は成功し、別の admin が同じ client_op_id で試みても見つからない（`created_by` で厳密に絞る）。"""
     sfx = _sfx()
-    adm1_uid, adm1_pw = _mk_admin(f"{sfx}1")
-    adm2_uid, adm2_pw = _mk_admin(f"{sfx}2")
+    adm1 = _mk_admin(f"{sfx}1")
+    adm2 = _mk_admin(f"{sfx}2")
     op_id = str(uuid.uuid4())
 
-    _login(adm1_uid, adm1_pw)
-    created = client.post("/ext/v1/admin/keys", json={"label": f"rec1-{sfx}", "client_op_id": op_id})
+    _login(*adm1)
+    created = client.post(_ADMIN_KEYS, json={"label": f"rec1-{sfx}", "client_op_id": op_id})
     assert created.status_code == 200, created.text
     key_id = created.json()["id"]
     _logout()
 
-    _login(adm2_uid, adm2_pw)
-    rec_other = client.post("/ext/v1/admin/keys/recover", json={"client_op_id": op_id})
-    assert rec_other.status_code == 200, rec_other.text
-    assert rec_other.json()["found"] is False
+    _login(*adm2)
+    assert _recover(_ADMIN_KEYS, op_id)["found"] is False
     _logout()
 
-    _login(adm1_uid, adm1_pw)
-    listed = client.get("/ext/v1/admin/keys").json()["keys"]
-    row = next(x for x in listed if x["id"] == key_id)
-    assert row["revoked_at"] is None   # 別 admin の回復では無傷のまま
-
-    rec_self = client.post("/ext/v1/admin/keys/recover", json={"client_op_id": op_id})
-    assert rec_self.status_code == 200, rec_self.text
-    assert rec_self.json()["found"] is True
-    assert rec_self.json()["id"] == key_id
+    _login(*adm1)
+    assert _list_row(_ADMIN_KEYS, key_id)["revoked_at"] is None   # 別 admin の回復では無傷
+    rec_self = _recover(_ADMIN_KEYS, op_id)
+    assert rec_self["found"] is True
+    assert rec_self["id"] == key_id
     _logout()
 
 
 def test_key_recover_admin_and_self_rows_do_not_cross_match():
-    """admin 発行の回復エンドポイントは自己発行キー（`owner_uid` 非NULL）に一致せず、
-    自己発行の回復エンドポイントも admin 発行キー（`owner_uid IS NULL`）に一致しない
-    （`client_op_id` はグローバルに一意のため同じ値は使えない——別々の値で、行の種別
-    そのものが交差しないことを確認する）。"""
-    if not _try_init():
-        pytest.skip("DB down")
+    """admin 回復は自己発行キー（owner_uid 非 NULL）に、自己発行の回復は admin 発行キーに一致しない
+    （client_op_id はグローバル一意のため別々の値で、行の種別が交差しないことを見る）。"""
+    admin_op_id, self_op_id = str(uuid.uuid4()), str(uuid.uuid4())
     sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
-    admin_op_id = str(uuid.uuid4())
-    created_admin = client.post("/ext/v1/admin/keys",
-                                json={"label": f"crossA-{sfx}", "client_op_id": admin_op_id})
-    assert created_admin.status_code == 200, created_admin.text
-    _logout()
-    try:
-        uid, pw = _mk_user(sfx)
-        _login(uid, pw)
-        self_op_id = str(uuid.uuid4())
-        created_self = client.post("/ext/v1/keys",
-                                   json={"label": f"crossB-{sfx}", "client_op_id": self_op_id})
+    with _self_issue_enabled() as adm:
+        _login(adm.uid, adm.pw)
+        created_admin = client.post(_ADMIN_KEYS, json={"label": f"crossA-{sfx}", "client_op_id": admin_op_id})
+        assert created_admin.status_code == 200, created_admin.text
+        _logout()
+
+        _login(*_mk_user(sfx))
+        created_self = client.post(_SELF_KEYS, json={"label": f"crossB-{sfx}", "client_op_id": self_op_id})
         assert created_self.status_code == 200, created_self.text
-
-        # 自己発行の回復エンドポイントで admin 発行キーの client_op_id を渡しても一致しない。
-        rec_self_for_admin_row = client.post("/ext/v1/keys/recover",
-                                             json={"client_op_id": admin_op_id})
-        assert rec_self_for_admin_row.status_code == 200, rec_self_for_admin_row.text
-        assert rec_self_for_admin_row.json()["found"] is False
+        assert _recover(_SELF_KEYS, admin_op_id)["found"] is False
         _logout()
 
-        _login(adm_uid, adm_pw)
-        # admin 発行の回復エンドポイントで自己発行キーの client_op_id を渡しても一致しない。
-        rec_admin_for_self_row = client.post("/ext/v1/admin/keys/recover",
-                                             json={"client_op_id": self_op_id})
-        assert rec_admin_for_self_row.status_code == 200, rec_admin_for_self_row.text
-        assert rec_admin_for_self_row.json()["found"] is False
-
-        # どちらの行も無傷のまま。
-        admin_listed = client.get("/ext/v1/admin/keys").json()["keys"]
-        admin_row = next(x for x in admin_listed if x["id"] == created_admin.json()["id"])
-        assert admin_row["revoked_at"] is None
-        self_row = next(x for x in admin_listed if x["id"] == created_self.json()["id"])
-        assert self_row["revoked_at"] is None
+        _login(adm.uid, adm.pw)
+        assert _recover(_ADMIN_KEYS, self_op_id)["found"] is False
+        assert _list_row(_ADMIN_KEYS, created_admin.json()["id"])["revoked_at"] is None
+        assert _list_row(_ADMIN_KEYS, created_self.json()["id"])["revoked_at"] is None
         _logout()
-    finally:
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None})
-        _logout()
-
-
-def test_self_key_create_client_op_id_conflict_returns_409():
-    """自己発行側でも、同じ `client_op_id` で2回目の発行を試みると409（管理者発行側と同型）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
-    _logout()
-    try:
-        uid, pw = _mk_user(sfx)
-        _login(uid, pw)
-        op_id = str(uuid.uuid4())
-        r1 = client.post("/ext/v1/keys", json={"label": f"selfdup1-{sfx}", "client_op_id": op_id})
-        assert r1.status_code == 200, r1.text
-        r2 = client.post("/ext/v1/keys", json={"label": f"selfdup2-{sfx}", "client_op_id": op_id})
-        assert r2.status_code == 409, r2.text
-        _logout()
-    finally:
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None})
-        _logout()
-
-
-def test_self_key_recover_forbidden_when_disabled():
-    """`user_api_keys_allowed` が OFF のときは自己発行の回復エンドポイントも403
-    （create/list/revoke と同じ4ルート共通のゲートに、回復も揃っている）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    uid, pw = _mk_user(sfx)
-    _login(uid, pw)
-    r = client.post("/ext/v1/keys/recover", json={"client_op_id": str(uuid.uuid4())})
-    assert r.status_code == 403, r.text
-    _logout()
 
 
 def test_key_recover_creates_audit_row():
-    """回復の試行は監査ログに残る（`ext_api.key_recover_attempted`・成功時は resource_id が
-    失効したキーの id）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    op_id = str(uuid.uuid4())
-    created = client.post("/ext/v1/admin/keys", json={"label": f"audrec-{sfx}", "client_op_id": op_id})
-    assert created.status_code == 200, created.text
-    key_id = created.json()["id"]
-
-    rec = client.post("/ext/v1/admin/keys/recover", json={"client_op_id": op_id})
-    assert rec.status_code == 200, rec.text
-    assert rec.json()["found"] is True
-    _logout()
+    """回復の試行は監査ログに残る（`ext_api.key_recover_attempted`・resource_id は失効したキーの id）。"""
+    with _as_admin() as adm_uid:
+        op_id = str(uuid.uuid4())
+        created = client.post(_ADMIN_KEYS, json={"label": f"audrec-{_sfx()}", "client_op_id": op_id})
+        assert created.status_code == 200, created.text
+        assert _recover(_ADMIN_KEYS, op_id)["found"] is True
 
     rows = store.list_audit(actor=adm_uid, action="ext_api.key_recover_attempted", limit=10)
-    matching = [r for r in rows if r["resource_id"] == str(key_id)]
-    assert matching, f"回復の監査行が見つからない: {rows}"
-
-
-def test_key_create_client_op_id_conflict_after_revoke_still_409():
-    """失効済みキーの `client_op_id` でも一意制約は有効（`revoked_at` の有無に関わらず一意・
-    失効済みキーの操作トークンを使い回して2重発行できてしまわないようにする）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    op_id = str(uuid.uuid4())
-    r1 = client.post("/ext/v1/admin/keys", json={"label": f"revdup1-{sfx}", "client_op_id": op_id})
-    assert r1.status_code == 200, r1.text
-    key_id = r1.json()["id"]
-
-    revoked = client.delete(f"/ext/v1/admin/keys/{key_id}")
-    assert revoked.status_code == 200, revoked.text
-
-    r2 = client.post("/ext/v1/admin/keys", json={"label": f"revdup2-{sfx}", "client_op_id": op_id})
-    assert r2.status_code == 409, r2.text
-    _logout()
+    assert [r for r in rows if r["resource_id"] == str(created.json()["id"])], f"回復の監査行が無い: {rows}"
 
 
 def test_check_constraint_rejects_out_of_range_daily_quota_at_db_level():
-    """DB の CHECK 制約（`api_keys_daily_quota_range`）は、アプリ層のバリデーションを迂回した
-    直接 SQL でも範囲外の `daily_quota` を拒否する（最後の砦）。"""
-    if not _try_init():
-        pytest.skip("DB down")
+    """アプリ層のバリデーションを迂回した直接 SQL でも、DB の CHECK 制約が範囲外の daily_quota を拒否する。"""
     sfx = _sfx()
     with store._connect() as c:
         with pytest.raises(Exception) as exc_info:
@@ -2083,999 +1258,414 @@ def test_check_constraint_rejects_out_of_range_daily_quota_at_db_level():
                 "INSERT INTO api_keys (key_hash, key_prefix, label, created_by, daily_quota) "
                 "VALUES (%s,%s,%s,%s,%s)",
                 (f"hash-chk-{sfx}", f"pfxchk{sfx}"[:12], f"chk-{sfx}", "admin", 2_000_000))
-    assert "api_keys_daily_quota_range" in str(exc_info.value) or "check constraint" in str(exc_info.value).lower()
+    assert ("api_keys_daily_quota_range" in str(exc_info.value)
+            or "check constraint" in str(exc_info.value).lower())
 
 
-def test_self_key_create_forbidden_when_disabled():
-    """既定 OFF（user_api_keys_allowed 未設定）では利用者は自己発行できない。
-    一覧・失効・回復も同様に拒否する（4ルート共通のゲート）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    uid, pw = _mk_user(sfx)
-    _login(uid, pw)
+def test_self_key_forbidden_when_disabled():
+    """既定 OFF では利用者は自己発行できず、一覧・失効・回復も同じゲートで 403。"""
+    _login(*_mk_user(_sfx()))
     try:
-        r = client.post("/ext/v1/keys", json={"label": f"self-{sfx}"})
-        assert r.status_code == 403, r.text
-        r = client.get("/ext/v1/keys")
-        assert r.status_code == 403, r.text
-        r = client.delete("/ext/v1/keys/999999999")
-        assert r.status_code == 403, r.text
-        r = client.post("/ext/v1/keys/recover", json={"client_op_id": str(uuid.uuid4())})
-        assert r.status_code == 403, r.text
+        assert client.post(_SELF_KEYS, json={"label": f"self-{_sfx()}"}).status_code == 403
+        assert client.get(_SELF_KEYS).status_code == 403
+        assert client.delete(f"{_SELF_KEYS}/999999999").status_code == 403
+        assert client.post(f"{_SELF_KEYS}/recover", json={"client_op_id": str(uuid.uuid4())}).status_code == 403
     finally:
         _logout()
 
 
 def test_self_key_create_list_revoke_when_enabled():
-    """許可時は自己発行→一覧→本人失効ができ、他人からは見えない（IDOR無し）。"""
-    if not _try_init():
-        pytest.skip("DB down")
+    """許可時は自己発行→一覧→本人失効ができ、他人からは見えない・失効もできない（IDOR 無し）。"""
     sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    r = client.put("/admin/settings", json={"user_api_keys_allowed": True})
-    assert r.status_code == 200, r.text
-    _logout()
-    try:
+    with _self_issue_enabled() as adm:
         uid, pw = _mk_user(sfx)
         other_uid, other_pw = _mk_user(f"o{sfx}")
 
         _login(uid, pw)
-        r = client.post("/ext/v1/keys", json={"label": f"self-{sfx}"})
+        r = client.post(_SELF_KEYS, json={"label": f"self-{sfx}"})
         assert r.status_code == 200, r.text
         created = r.json()
         assert created["key"].startswith("sk-ext-")
-
-        listed = client.get("/ext/v1/keys").json()["keys"]
+        listed = client.get(_SELF_KEYS).json()["keys"]
         assert {row["id"] for row in listed} == {created["id"]}
-        assert listed[0]["allowed_worlds"] is None   # 現状「全員全 world」＝⊆ の結果は全許可のまま
+        assert listed[0]["allowed_worlds"] is None   # 現状「全員全 world」
         _logout()
 
-        # 他人には見えない・失効もできない（404＝所有権の有無を外に出さない）。
         _login(other_uid, other_pw)
-        assert client.get("/ext/v1/keys").json()["keys"] == []
-        r = client.delete(f"/ext/v1/keys/{created['id']}")
-        assert r.status_code == 404, r.text
+        assert client.get(_SELF_KEYS).json()["keys"] == []
+        assert client.delete(f"{_SELF_KEYS}/{created['id']}").status_code == 404   # 所有権の有無を外に出さない
         _logout()
 
-        # 本人は失効できる。
         _login(uid, pw)
-        r = client.delete(f"/ext/v1/keys/{created['id']}")
+        r = client.delete(f"{_SELF_KEYS}/{created['id']}")
         assert r.status_code == 200, r.text
         assert r.json()["revoked_at"] is not None
         _logout()
 
-        # admin は全キー（利用者発行分も含む）を見え、失効もできる。
-        _login(adm_uid, adm_pw)
-        admin_listed = client.get("/ext/v1/admin/keys").json()["keys"]
-        admin_row = next(x for x in admin_listed if x["id"] == created["id"])
-        assert admin_row["owner_uid"] == uid
-        _logout()
-    finally:
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None})
+        _login(adm.uid, adm.pw)   # admin は利用者発行分も見える
+        assert _list_row(_ADMIN_KEYS, created["id"])["owner_uid"] == uid
         _logout()
 
 
 def test_self_key_create_daily_quota_is_admin_controlled():
-    """自己発行キーの daily_quota は管理者統制: 未指定は既定を適用し（空欄=無制限を許さない）、
-    上限を超える指定は422。管理者が既定/上限を明示設定していれば、その値が適用される。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    r = client.put("/admin/settings", json={"user_api_keys_allowed": True,
-                                            "user_api_keys_daily_quota_default": 5})
-    assert r.status_code == 200, r.text
-    assert r.json()["ext_keys"]["daily_quota_default"]["effective"] == 5
-    _logout()
-    try:
-        uid, pw = _mk_user(sfx)
-        _login(uid, pw)
-        # 未指定＝管理者の既定（5）が適用される（空欄で無制限にはならない）。
-        r = client.post("/ext/v1/keys", json={"label": f"quotadef-{sfx}"})
+    """自己発行キーの daily_quota は管理者統制: 未指定は既定を適用（空欄で無制限にならない）・上限超過は 422。"""
+    with _self_issue_enabled(user_api_keys_daily_quota_default=5) as adm:
+        assert adm.put.json()["ext_keys"]["daily_quota_default"]["effective"] == 5
+        _login(*_mk_user(_sfx()))
+        r = client.post(_SELF_KEYS, json={"label": f"quotadef-{_sfx()}"})
         assert r.status_code == 200, r.text
         assert r.json()["daily_quota"] == 5
 
-        # 上限（5）以下の指定は許可される。
-        r = client.post("/ext/v1/keys", json={"label": f"quotaok-{sfx}", "daily_quota": 3})
+        r = client.post(_SELF_KEYS, json={"label": f"quotaok-{_sfx()}", "daily_quota": 3})
         assert r.status_code == 200, r.text
         assert r.json()["daily_quota"] == 3
 
-        # 上限超過は422（管理者の許可なく無制限/大容量キーを作れない）。
-        r = client.post("/ext/v1/keys", json={"label": f"quotaover-{sfx}", "daily_quota": 6})
+        r = client.post(_SELF_KEYS, json={"label": f"quotaover-{_sfx()}", "daily_quota": 6})
         assert r.status_code == 422, r.text
-        _logout()
-    finally:
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None,
-                                            "user_api_keys_daily_quota_default": None})
         _logout()
 
 
 def test_self_key_create_daily_quota_fallback_default_when_admin_unset():
-    """管理者が既定/上限を一度も設定していなくても、組み込みのフォールバック既定が適用される
-    （self-issued キーが常にクォータを持つことの保証）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
-    _logout()
-    try:
-        uid, pw = _mk_user(sfx)
-        _login(uid, pw)
-        r = client.post("/ext/v1/keys", json={"label": f"quotafallback-{sfx}"})
+    """管理者が既定/上限を設定していなくても組み込みのフォールバック既定が適用される。"""
+    with _self_issue_enabled():
+        _login(*_mk_user(_sfx()))
+        r = client.post(_SELF_KEYS, json={"label": f"quotafallback-{_sfx()}"})
         assert r.status_code == 200, r.text
         assert r.json()["daily_quota"] == store.SELF_ISSUED_DAILY_QUOTA_DEFAULT_FALLBACK
-        _logout()
-    finally:
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None})
         _logout()
 
 
 def test_self_issued_key_audit_detail_has_owner_uid_on_success_401_429_and_fallback():
-    """自己発行キーの `detail.owner_uid` が、行を特定できる全ての監査経路
-    （成功・401・429・フォールバック）で付与される（actor は `ext:{key_id}` のまま）。"""
-    if not _try_init():
-        pytest.skip("DB down")
+    """自己発行キーの `detail.owner_uid` が、行を特定できる全ての監査経路（成功・429・所有者無効の 401・
+    フォールバック）で付与される（actor は `ext:{key_id}` のまま）。"""
     sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
-    _logout()
     uid, pw = _mk_user(sfx)
-    try:
-        _login(uid, pw)
-        r = client.post("/ext/v1/keys", json={"label": f"ownaudit-{sfx}", "daily_quota": 1})
-        assert r.status_code == 200, r.text
-        key, key_id = r.json()["key"], r.json()["id"]
-        _logout()
+    with _self_issue_enabled():
+        try:
+            _login(uid, pw)
+            r = client.post(_SELF_KEYS, json={"label": f"ownaudit-{sfx}", "daily_quota": 1})
+            assert r.status_code == 200, r.text
+            key, key_id = r.json()["key"], r.json()["id"]
+            _logout()
 
-        # 成功（200）。
-        r = _convert("a.docx", _make_docx_bytes(), api_key=key)
-        assert r.status_code == 200, r.text
+            assert _convert("a.docx", _make_docx_bytes(), key).status_code == 200
+            assert _convert("a.docx", _make_docx_bytes(), key).status_code == 429   # daily_quota=1 を使い切り
+            store.upsert_user(uid, role="user", status="disabled")
+            assert _convert("a.docx", _make_docx_bytes(), key).status_code == 401   # 所有者無効
+            store.upsert_user(uid, role="user", status="active")
+            # require_api_key 自体が実行されない終了経路（malformed body）。
+            r = client.post("/ext/v1/search", content=b"{not valid json",
+                            headers={**_h(key, f"probe-ownaudit-fallback-{sfx}"),
+                                     "Content-Type": "application/json"})
+            assert r.status_code == 422, r.text
 
-        # 429（daily_quota=1 を使い切っているので2回目は拒否）。
-        r = _convert("a.docx", _make_docx_bytes(), api_key=key)
-        assert r.status_code == 429, r.text
-
-        # 401（所有者を無効化）。
-        store.upsert_user(uid, role="user", status="disabled")
-        r = _convert("a.docx", _make_docx_bytes(), api_key=key)
-        assert r.status_code == 401, r.text
-        store.upsert_user(uid, role="user", status="active")
-
-        # フォールバック（malformed body・require_api_key 自体が実行されない終了経路）。
-        rid_fb = f"probe-ownaudit-fallback-{sfx}"
-        r = client.post("/ext/v1/search", content=b"{not valid json",
-                        headers={"X-API-Key": key, "Content-Type": "application/json",
-                                "X-Request-Id": rid_fb})
-        assert r.status_code == 422, r.text
-
-        with store._connect() as c:
-            rows = c.execute(
-                "SELECT outcome, reason, detail FROM audit_log WHERE actor_user_id=%s "
-                "ORDER BY id ASC", (f"ext:{key_id}",)
-            ).fetchall()
-
-        success_row = next((r for r in rows if r["outcome"] == "success"), None)
-        assert success_row is not None, f"成功行が見つからない: {rows}"
-        assert success_row["detail"].get("owner_uid") == uid
-
-        quota_row = next((r for r in rows if r["reason"] == "daily_quota_exceeded"), None)
-        assert quota_row is not None, f"429（daily_quota_exceeded）行が見つからない: {rows}"
-        assert quota_row["detail"].get("owner_uid") == uid
-
-        inactive_row = next((r for r in rows if r["reason"] == "owner_inactive"), None)
-        assert inactive_row is not None, f"401（owner_inactive）行が見つからない: {rows}"
-        assert inactive_row["detail"].get("owner_uid") == uid
-
-        fallback_row = next((r for r in rows if r["reason"] == "request_incomplete"), None)
-        assert fallback_row is not None, f"フォールバック行（request_incomplete）が見つからない: {rows}"
-        assert fallback_row["detail"].get("owner_uid") == uid
-    finally:
-        store.upsert_user(uid, role="user", status="active")
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None})
-        _logout()
-
-
-def test_self_issued_key_owner_disabled_returns_401():
-    """自己発行キーの所有者が無効化（disabled）されたら、キー自体は失効していなくても
-    以後の呼び出しは401になる（Cookie セッションのアカウント停止確認と同じ扱い・IDOR/権限
-    迂回の防止）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
-    _logout()
-    try:
-        uid, pw = _mk_user(sfx)
-        _login(uid, pw)
-        r = client.post("/ext/v1/keys", json={"label": f"ownerdis-{sfx}"})
-        assert r.status_code == 200, r.text
-        key = r.json()["key"]
-        _logout()
-
-        r = _convert("a.docx", _make_docx_bytes(), api_key=key)
-        assert r.status_code == 200, r.text
-
-        store.upsert_user(uid, role="user", status="disabled")
-        r = _convert("a.docx", _make_docx_bytes(), api_key=key)
-        assert r.status_code == 401, r.text
-    finally:
-        store.upsert_user(uid, role="user", status="active")
-        _login(adm_uid, adm_pw)
-        client.put("/admin/settings", json={"user_api_keys_allowed": None})
-        _logout()
+            with store._connect() as c:
+                rows = c.execute(
+                    "SELECT outcome, reason, detail FROM audit_log WHERE actor_user_id=%s ORDER BY id ASC",
+                    (f"ext:{key_id}",)).fetchall()
+            for label, match in (("success", lambda r: r["outcome"] == "success"),
+                                 ("daily_quota_exceeded", lambda r: r["reason"] == "daily_quota_exceeded"),
+                                 ("owner_inactive", lambda r: r["reason"] == "owner_inactive"),
+                                 ("request_incomplete", lambda r: r["reason"] == "request_incomplete")):
+                row = next((r for r in rows if match(r)), None)
+                assert row is not None, f"{label} の監査行が見つからない: {rows}"
+                assert row["detail"].get("owner_uid") == uid, label
+        finally:
+            store.upsert_user(uid, role="user", status="active")
 
 
 def test_self_key_create_disallowed_after_toggle_off_revokes_existing():
-    """OFF に戻すと利用者発行キーは一括失効し、以後は認証時にも fail-safe で締め出される
-    （A6 と同型・PUT /admin/settings の一括失効＋`_verify_key_sync` の二重チェック）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
-    _logout()
+    """OFF に戻すと利用者発行キーは一括失効し、以後の認証でも締め出される（PUT /admin/settings の一括失効＋
+    `_verify_key_sync` の二重チェック）。"""
+    with _self_issue_enabled() as adm:
+        _login(*_mk_user(_sfx()))
+        r = client.post(_SELF_KEYS, json={"label": f"toggle-{_sfx()}"})
+        assert r.status_code == 200, r.text
+        key = r.json()["key"]
+        _logout()
+        assert _convert("a.docx", _make_docx_bytes(), key).status_code == 200
 
-    uid, pw = _mk_user(sfx)
-    _login(uid, pw)
-    r = client.post("/ext/v1/keys", json={"label": f"toggle-{sfx}"})
-    assert r.status_code == 200, r.text
-    key = r.json()["key"]
-    _logout()
+        _login(adm.uid, adm.pw)
+        r = client.put("/admin/settings", json={"user_api_keys_allowed": False})
+        assert r.status_code == 200, r.text
+        assert r.json()["ext_keys"]["user_api_keys_allowed"] is False
+        _logout()
+        assert _convert("a.docx", _make_docx_bytes(), key).status_code == 401
 
-    r = _convert("a.docx", _make_docx_bytes(), api_key=key)
-    assert r.status_code == 200, r.text
 
-    _login(adm_uid, adm_pw)
-    r = client.put("/admin/settings", json={"user_api_keys_allowed": False})
-    assert r.status_code == 200, r.text
-    assert r.json()["ext_keys"]["user_api_keys_allowed"] is False
-    _logout()
-
-    # 一括失効された鍵は以後 401（revoked と同じ扱い）。
-    r = _convert("a.docx", _make_docx_bytes(), api_key=key)
-    assert r.status_code == 401, r.text
-
+# ===== キー発行の監査（失敗・未処理例外・malformed body） =====
 
 def test_key_create_failure_audits_requested_label_and_allowed_worlds():
-    """キー発行が 422（未知の world）で失敗しても、監査行には要求された `label`/`allowed_worlds`
-    （検証前の入力）が残る——検証成功後にしか `pending["detail"]` へ積まないと、失敗した
-    発行の監査行は入力が空のままになる。status/outcome/reason の三項目も併せて固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    rid = f"probe-keycreate-fail-{sfx}"
-    label = f"failaudit-{sfx}"
-    r = client.post(
-        "/ext/v1/admin/keys",
-        json={"label": label, "allowed_worlds": ["nonexistent-world-zzz"]},
-        headers={"X-Request-Id": rid})
-    assert r.status_code == 422, r.text
-    _logout()
+    """発行が 422（未知の world）で失敗しても、監査行には検証前の入力（label/allowed_worlds）が残る。"""
+    rid = f"probe-keycreate-fail-{_sfx()}"
+    label = f"failaudit-{_sfx()}"
+    with _as_admin():
+        r = client.post(_ADMIN_KEYS, json={"label": label, "allowed_worlds": ["nonexistent-world-zzz"]},
+                        headers=_h(rid=rid))
+        assert r.status_code == 422, r.text
 
-    with store._connect() as c:
-        rows = c.execute(
-            "SELECT outcome, reason, detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchall()
-    assert len(rows) == 1, f"監査行はちょうど1件のはず（実際 {len(rows)} 件）"
-    row = rows[0]
-    detail = row["detail"]
-    assert detail["label"] == label
-    assert detail["allowed_worlds"] == ["nonexistent-world-zzz"]
-    assert detail["http_status"] == 422
+    row = _audit_one(rid)
+    assert row["detail"]["label"] == label
+    assert row["detail"]["allowed_worlds"] == ["nonexistent-world-zzz"]
+    assert row["detail"]["http_status"] == 422
     assert row["outcome"] == "error"
-    assert row["reason"] == "validation_error"   # `_HTTP_OUTCOME_REASON[422]`
+    assert row["reason"] == "validation_error"
 
 
 def test_key_create_unhandled_exception_audits_status_outcome_reason(monkeypatch):
-    """キー発行が（実在する world で検証を通過した後の）未処理例外で 500 になっても、
-    `ExtRequestMiddleware` が自前で 500 応答を組み立てて監査する（`test_unhandled_exception_
-    gets_request_id_and_is_audited` の search 版と対になる key-issuance 版）。500 は
-    `_HTTP_OUTCOME_REASON` に無いため reason は既定の "error" になることを固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
+    """検証通過後の未処理例外で 500 になっても `ExtRequestMiddleware` が 500 を組み立てて監査する。
+    500 は `_HTTP_OUTCOME_REASON` に無いため reason は既定の "error"。"""
+    monkeypatch.setattr(store, "insert_api_key", _raise(RuntimeError("simulated db outage during key insert")))
+    rid = f"probe-keycreate-500-{_sfx()}"
+    with _as_admin():
+        r = client.post(_ADMIN_KEYS, json={"label": f"boom500-{_sfx()}", "allowed_worlds": ["v1"]},
+                        headers=_h(rid=rid))
+        assert r.status_code == 500, r.text
+        assert r.headers["X-Request-Id"] == rid
 
-    def _boom(*a, **kw):
-        raise RuntimeError("simulated db outage during key insert")
-
-    monkeypatch.setattr(store, "insert_api_key", _boom)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    rid = f"probe-keycreate-500-{sfx}"
-    r = client.post(
-        "/ext/v1/admin/keys",
-        json={"label": f"boom500-{sfx}", "allowed_worlds": ["v1"]},
-        headers={"X-Request-Id": rid})
-    assert r.status_code == 500, r.text
-    assert r.headers["X-Request-Id"] == rid
-    _logout()
-
-    with store._connect() as c:
-        rows = c.execute(
-            "SELECT outcome, reason, detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchall()
-    assert len(rows) == 1, f"監査行はちょうど1件のはず（実際 {len(rows)} 件）"
-    row = rows[0]
+    row = _audit_one(rid)
     assert row["detail"]["http_status"] == 500
     assert row["outcome"] == "error"
-    assert row["reason"] == "error"   # `_HTTP_OUTCOME_REASON` に 500 は無い＝既定値
+    assert row["reason"] == "error"
 
 
 def test_key_create_malformed_json_body_returns_clean_422_without_stray_audit_row():
-    """`/ext/v1/admin/keys`（Cookie 認証の admin ルート）へ malformed JSON を送ると、body parse
-    自体が `start_audit()` 実行前に失敗するため `request.state.audit_pending` は一度も作られない。
-    `_fallback_audit_pending()` は5つの X-API-Key ルート限定（`_ACTION_BY_PATH`）で admin 系は
-    意図的にスコープ外（docstring 明記）——クライアントへは綺麗な 422（X-Request-Id 付き）を
-    返しつつ、迷子の監査行を残さないことを固定する（三項目 assert が成立しないのはこの経路が
-    そもそも監査行を持たないため、という前提を明示する）。"""
-    if not _try_init():
-        pytest.skip("DB down")
+    """admin ルート（Cookie 認証）の malformed JSON は `start_audit()` 前に失敗し、フォールバック監査
+    （X-API-Key の 5 ルート限定）の対象外＝X-Request-Id 付きの綺麗な 422 で、迷子の監査行を残さない。"""
+    rid = f"probe-keycreate-malformed-{_sfx()}"
+    with _as_admin():
+        r = client.post(_ADMIN_KEYS, content=b"{not valid json at all",
+                        headers={"Content-Type": "application/json", "X-Request-Id": rid})
+        assert r.status_code == 422, r.text
+        assert r.headers["X-Request-Id"] == rid
+    assert _audit_rows(rid, "id") == []
+
+
+def test_admin_key_routes_are_audited():
+    """管理系 3 ルート（発行/一覧/失効）も同じ request-level 監査へ統合され、プレーンキーは detail に出ない。"""
     sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    rid = f"probe-keycreate-malformed-{sfx}"
-    r = client.post(
-        "/ext/v1/admin/keys", content=b"{not valid json at all",
-        headers={"Content-Type": "application/json", "X-Request-Id": rid})
-    assert r.status_code == 422, r.text
-    assert r.headers["X-Request-Id"] == rid
-    _logout()
+    rid_create, rid_list, rid_revoke = (f"probe-admin-create-{sfx}", f"probe-admin-list-{sfx}",
+                                        f"probe-admin-revoke-{sfx}")
+    with _as_admin() as adm_uid:
+        r = client.post(_ADMIN_KEYS, json={"label": f"adminaudit-{sfx}"}, headers=_h(rid=rid_create))
+        assert r.status_code == 200, r.text
+        key_id, plain_key = r.json()["id"], r.json()["key"]
+        assert client.get(_ADMIN_KEYS, headers=_h(rid=rid_list)).status_code == 200
+        r = client.delete(f"{_ADMIN_KEYS}/{key_id}", headers=_h(rid=rid_revoke))
+        assert r.status_code == 200, r.text
 
     with store._connect() as c:
-        rows = c.execute(
-            "SELECT id FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchall()
-    assert rows == [], (
-        "admin 系ルートの malformed JSON はフォールバック監査の対象外＝監査行は書かれないはず"
-        f"（実際 {len(rows)} 件）")
-
-
-def test_key_create_two_world_scope(tmp_path):
-    """2つの**実在** world をスコープに持てる（`store.upsert_world` で本物の registry 行を作る・
-    `worlds.resolve_external_world` はモックしない＝実際の scope/存在検証経路をそのまま通す）。
-    スコープに含めた未知（実在しない）world は key 発行時点で 422（`_validate_allowed_worlds_or_error`
-    が個別に strict resolve するため）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    sfx = _sfx()
-    second_world = f"v2real{sfx}"
-    root2 = tmp_path / "root2"
-    root2.mkdir()
-    (root2 / "note.md").write_text("第二世界の資料です", encoding="utf-8")
-    store.upsert_world(second_world, str(root2))
-    try:
-        adm_uid, adm_pw = _mk_admin(sfx)
-        _login(adm_uid, adm_pw)
-        issued = _issue_key_scoped(f"twoworld-{sfx}", ["v1", second_world])
-        assert issued["allowed_worlds"] == ["v1", second_world]
-
-        r = client.post("/ext/v1/admin/keys",
-                        json={"label": f"badscope-{sfx}",
-                              "allowed_worlds": [second_world, "nonexistent-world-zzz"]})
-        assert r.status_code == 422, r.text
-        _logout()
-
-        r = _search({"world": "v1", "query": "税", "engines": ["keyword"]}, api_key=issued["key"])
-        assert r.status_code == 200, r.text
-        r = _search({"world": second_world, "query": "資料", "engines": ["keyword"]},
-                   api_key=issued["key"])
-        assert r.status_code == 200, r.text
-        r = _doc(second_world, "note.md", api_key=issued["key"])
-        assert r.status_code == 200, r.text
-        assert "第二世界" in r.text
-    finally:
-        # `store.upsert_world` は共有テスト DB に本物の registry 行を作る（実 scope 検証経路を
-        # 通すため・モックしない裁定）。片付けないと `worlds.register()`（「全体で1本だけ」制約）を
-        # 使う他テスト（例: tests/integration/test_worlds_sig_lock_discipline.py）を毎回壊す
-        # （実際に踏んだ回帰 周辺の確認で発覚）。
-        store.delete_world_row(second_world)
-
-
-def test_key_create_empty_allowed_worlds_denies_all():
-    """`allowed_worlds: []`（意図的な空配列）はどの world にもアクセスできない（deny-all）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key_scoped(f"denyall-{sfx}", [])
-    assert issued["allowed_worlds"] == []
-    _logout()
-
-    r = _search({"world": "v1", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 403, r.text
-    r = _doc("v1", "4期/01_標準/消費税法.md", api_key=issued["key"])
-    assert r.status_code == 403, r.text
-    r = _capabilities(api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    assert r.json()["worlds"] == []
+        rows = {row["request_id"]: row for row in c.execute(
+            "SELECT request_id, action, actor_user_id, detail FROM audit_log WHERE request_id = ANY(%s)",
+            ([rid_create, rid_list, rid_revoke],)).fetchall()}
+    assert set(rows) == {rid_create, rid_list, rid_revoke}
+    assert rows[rid_create]["action"] == "ext_api.key_created"
+    assert rows[rid_create]["actor_user_id"] == adm_uid
+    assert rows[rid_list]["action"] == "ext_api.key_listed"
+    assert rows[rid_revoke]["action"] == "ext_api.key_revoked"
+    for rid, row in rows.items():
+        assert plain_key not in json.dumps(row["detail"]), (
+            f"監査行 {rid}（{row['action']}）の detail にプレーンキー本体が含まれている: {row['detail']}")
 
 
 # ===== X-Request-Id =====
 
-def test_request_id_echoed_and_generated():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"reqid-{sfx}")
-    _logout()
-
-    # クライアント指定値はそのまま応答ヘッダへ返る。
-    r = client.get("/ext/v1/capabilities",
-                   headers={"X-API-Key": issued["key"], "X-Request-Id": "probe-req-1"})
+def test_request_id_echoed_generated_and_recorded_in_audit():
+    key = _key("reqid")["key"]
+    r = _capabilities(key, "probe-req-1")
     assert r.status_code == 200, r.text
     assert r.headers["X-Request-Id"] == "probe-req-1"
 
-    # 未指定なら採番され、応答ヘッダに載る。
-    r2 = client.get("/ext/v1/capabilities", headers={"X-API-Key": issued["key"]})
+    r2 = _capabilities(key)   # 未指定なら採番される
     assert r2.status_code == 200, r2.text
     assert r2.headers.get("X-Request-Id")
 
-    # 401 応答にもヘッダが付く（キー不正でも request_id は解決される）。
-    r3 = client.get("/ext/v1/capabilities", headers={"X-Request-Id": "probe-req-401"})
+    r3 = _capabilities(rid="probe-req-401")   # 401 にも付く（キー不正でも request_id は解決される）
     assert r3.status_code == 401, r3.text
     assert r3.headers["X-Request-Id"] == "probe-req-401"
 
-
-def test_request_id_recorded_in_audit():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"reqidaudit-{sfx}")
-    _logout()
-    # request_id は sfx で一意化する（固定リテラルだと、共有 sherpa_test DB に残る過去実行や
-    # 並行実行中の他テストの同名行と衝突しうる）。
-    rid = f"probe-audit-req-{sfx}"
-
-    r = client.get("/ext/v1/capabilities",
-                   headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
-    assert r.status_code == 200, r.text
-
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT request_id FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchone()
-    assert row is not None
-    assert row["request_id"] == rid
+    rid = f"probe-audit-req-{_sfx()}"   # 固定リテラルだと共有 DB の過去実行行と衝突しうる
+    assert _capabilities(key, rid).status_code == 200
+    assert _audit_one(rid, "request_id")["request_id"] == rid
 
 
 def test_request_id_present_on_representative_error_statuses(monkeypatch):
-    """403/404/413/422/429 の代表的な失敗応答にも X-Request-Id が付く
-    （`ExtRequestMiddleware` が routing/validation の外側で一元的に付与するため、
-    自動バリデーション由来・ドメインエラー由来のどちらの応答でも漏れない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api
+    """403/404/422/413/429 の代表的な失敗応答にも X-Request-Id が付く（`ExtRequestMiddleware` が一元付与）。"""
+    scoped = _key("reqid403", allowed_worlds=["v1"])["key"]
+    plain = _key("reqidplain")["key"]
 
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    scoped = _issue_key_scoped(f"reqid403-{sfx}", ["v1"])
-    plain = _issue_key(f"reqidplain-{sfx}")
-    _logout()
-
-    # 403: world スコープ外
-    r = client.post("/ext/v1/search", json={"world": "other-world-xyz", "query": "x"},
-                    headers={"X-API-Key": scoped["key"], "X-Request-Id": "probe-403"})
-    assert r.status_code == 403, r.text
-    assert r.headers["X-Request-Id"] == "probe-403"
-
-    # 404: 世界不在
-    r = client.post("/ext/v1/search", json={"world": "no-such-world-xyz", "query": "x"},
-                    headers={"X-API-Key": plain["key"], "X-Request-Id": "probe-404"})
-    assert r.status_code == 404, r.text
-    assert r.headers["X-Request-Id"] == "probe-404"
-
-    # 422: 不明な scope_paths（FastAPI/pydantic の自動検証ではなくハンドラ内の 422）
-    r = client.post("/ext/v1/search",
-                    json={"world": "v1", "query": "x", "scope_paths": ["no-such-scope-xyz"]},
-                    headers={"X-API-Key": plain["key"], "X-Request-Id": "probe-422"})
-    assert r.status_code == 422, r.text
-    assert r.headers["X-Request-Id"] == "probe-422"
-
-    # 413: 変換サイズ上限
+    cases = [
+        (403, _search({"world": "other-world-xyz", "query": "x"}, scoped, "probe-403")),
+        (404, _search({"world": "no-such-world-xyz", "query": "x"}, plain, "probe-404")),
+        (422, _search({"world": "v1", "query": "x", "scope_paths": ["no-such-scope-xyz"]}, plain,
+                           "probe-422")),
+    ]
     monkeypatch.setattr(ext_api, "_CONVERT_MAX_BYTES", 10)
-    r = client.post(
-        "/ext/v1/convert",
-        files={"file": ("big.docx", io.BytesIO(b"x" * 100), "application/octet-stream")},
-        headers={"X-API-Key": plain["key"], "X-Request-Id": "probe-413"})
-    assert r.status_code == 413, r.text
-    assert r.headers["X-Request-Id"] == "probe-413"
-
-    # 429: レート制限
+    cases.append((413, _convert("big.docx", b"x" * 100, plain, "probe-413")))
     monkeypatch.setattr(ext_api.ratelimit, "check_ext_api_rate_limit", lambda key_id: 3)
-    r = client.get("/ext/v1/capabilities",
-                   headers={"X-API-Key": plain["key"], "X-Request-Id": "probe-429"})
-    assert r.status_code == 429, r.text
-    assert r.headers["X-Request-Id"] == "probe-429"
+    cases.append((429, _capabilities(plain, "probe-429")))
+    for status, r in cases:
+        assert r.status_code == status, r.text
+        assert r.headers["X-Request-Id"] == f"probe-{status}"
+
+
+def test_request_id_appears_on_application_log_records(caplog):
+    """束縛された request_id が共通ロガー（"sherpa"）のアプリログの `record.request_id` にも乗る。"""
+    import logging
+    key = _key("logreqid")["key"]
+    with caplog.at_level(logging.INFO, logger="sherpa"):
+        assert _capabilities(key, "probe-log-reqid").status_code == 200
+    assert [rec for rec in caplog.records if getattr(rec, "request_id", None) == "probe-log-reqid"], (
+        f"request_id='probe-log-reqid' を持つログレコードが無い: "
+        f"{[(rec.name, rec.getMessage()) for rec in caplog.records]}")
 
 
 # ===== request-level 監査（ExtRequestMiddleware・自動422/未処理例外を含む全終了経路）=====
 
 def test_auto_validation_422_is_audited():
-    """自動バリデーション422（handler 本体が一度も実行されない終了経路）も監査される
-    （`require_api_key` が action/actor を仮置きし、`ExtRequestMiddleware` が実ステータスで書く）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"auto422-{sfx}")
-    _logout()
-    rid = f"probe-auto422-{sfx}"
-
-    r = client.post("/ext/v1/search", json={"world": "v1", "query": "x", "k": 999},
-                    headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
+    """handler 本体が実行されない自動バリデーション 422 も、仮置きの action/actor と実ステータスで監査される。"""
+    rid = f"probe-auto422-{_sfx()}"
+    r = _search({"world": "v1", "query": "x", "k": 999}, _key("auto422")["key"], rid)
     assert r.status_code == 422, r.text
-
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT outcome, reason, detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchone()
-    assert row is not None
+    row = _audit_rows(rid)[0]
     assert row["outcome"] == "error"
     assert row["reason"] == "validation_error"
     assert row["detail"]["http_status"] == 422
 
 
 def test_unhandled_exception_gets_request_id_and_is_audited(monkeypatch):
-    """handler 内の未処理例外でも X-Request-Id が付き、500 として監査される
-    （`ExtRequestMiddleware` が自前で 500 応答を組み立てる・再送出はしない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import search_service
-
-    def _boom(*a, **kw):
-        raise RuntimeError("simulated bug")
-
-    monkeypatch.setattr(search_service, "search", _boom)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"unhandled500-{sfx}")
-    _logout()
-    rid = f"probe-500-{sfx}"
-
-    r = client.post("/ext/v1/search", json={"world": "v1", "query": "x"},
-                    headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
+    monkeypatch.setattr(fused_search, "search", _raise(RuntimeError("simulated bug")))
+    rid = f"probe-500-{_sfx()}"
+    r = _search({"world": "v1", "query": "x"}, _key("unhandled500")["key"], rid)
     assert r.status_code == 500, r.text
     assert r.headers["X-Request-Id"] == rid
-
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchone()
-    assert row is not None
-    assert row["detail"]["http_status"] == 500
+    assert _audit_rows(rid, "detail")[0]["detail"]["http_status"] == 500
 
 
 def test_audit_row_has_all_fields_exactly_once():
-    """成功応答は監査行がちょうど1件だけ・全項目（http_status/duration_ms/result_count/
-    method/path/world/prefix/business_outcome）を含む。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"auditfields-{sfx}")
-    _logout()
-
-    r = _search({"world": "v1", "query": "税", "engines": ["keyword"]}, api_key=issued["key"])
+    r = _search({"world": "v1", "query": "税", "engines": ["keyword"]}, _key("auditfields")["key"])
     assert r.status_code == 200, r.text
-    req_id = r.headers["X-Request-Id"]
-
     with store._connect() as c:
-        rows = c.execute(
-            "SELECT outcome, detail FROM audit_log WHERE action='ext_api.search' AND request_id=%s",
-            (req_id,)
-        ).fetchall()
+        rows = c.execute("SELECT outcome, detail FROM audit_log WHERE action='ext_api.search' "
+                         "AND request_id=%s", (r.headers["X-Request-Id"],)).fetchall()
     assert len(rows) == 1, f"監査行はちょうど1件のはず（実際 {len(rows)} 件）"
     detail = rows[0]["detail"]
-    for key in ("http_status", "duration_ms", "result_count", "method", "path", "world", "prefix",
-               "business_outcome"):
-        assert key in detail, f"detail に {key} が無い: {detail}"
+    for field in ("http_status", "duration_ms", "result_count", "method", "path", "world", "prefix",
+                  "business_outcome"):
+        assert field in detail, f"detail に {field} が無い: {detail}"
     assert detail["http_status"] == 200
     assert detail["method"] == "POST"
     assert detail["path"] == "/ext/v1/search"
     assert rows[0]["outcome"] == "success"
 
 
-def test_convert_business_outcome_failed_on_conversion_failure():
-    """変換失敗（HTTP レベルは200・`unsupported: true`）は `business_outcome=failed` で記録する
-    （HTTP の outcome=success とは別列の業務結果）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"convfail-{sfx}")
-    _logout()
-    rid = f"probe-convfail-{sfx}"
-
-    r = client.post(
-        "/ext/v1/convert",
-        files={"file": ("broken.docx", io.BytesIO(b"not a real zip file"), "application/octet-stream")},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
-    assert r.status_code == 200, r.text
-    assert r.json()["unsupported"] is True
-
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT outcome, detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchone()
-    assert row is not None
-    assert row["outcome"] == "success"
-    assert row["detail"]["business_outcome"] == "failed"
-
-
-# ===== 外部 API 専用 strict world resolver（registry/root 不達は 503）=====
-
-def test_search_registry_unreachable_returns_503(monkeypatch):
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import worlds
-
-    def _boom(world_id, **kw):
-        raise worlds.ExternalResolverError("simulated registry outage")
-
-    monkeypatch.setattr(worlds, "resolve_external_world", _boom)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"search503-{sfx}")
-    _logout()
-
-    r = _search({"world": "v1", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 503, r.text
-
-
-def test_doc_registry_unreachable_returns_503(monkeypatch):
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import worlds
-
-    def _boom(world_id, **kw):
-        raise worlds.ExternalResolverError("simulated registry outage")
-
-    monkeypatch.setattr(worlds, "resolve_external_world", _boom)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"doc503-{sfx}")
-    _logout()
-
-    r = _doc("v1", "a.md", api_key=issued["key"])
-    assert r.status_code == 503, r.text
-
-
-def test_capabilities_registry_unreachable_returns_503(monkeypatch):
-    """fixtures/dev KB のファイルシステム列挙（`discover_fs_world_ids_strict`）自体が失敗した
-    場合も 503（registry スナップショット取得の失敗とは別経路・どちらも同じ 503 契約）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import worlds
-
-    def _boom():
-        raise worlds.ExternalResolverError("simulated fs enumeration outage")
-
-    monkeypatch.setattr(worlds, "discover_fs_world_ids_strict", _boom)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"capsregistry503-{sfx}")
-    _logout()
-
-    r = _capabilities(api_key=issued["key"])
-    assert r.status_code == 503, r.text
-
-
-def test_search_registered_root_unreachable_returns_503(tmp_path):
-    """レジストリには登録されているが参照先ディレクトリが無い（マウント外れ等）＝503
-    （未登録＝404 とは区別する）。`store.get_world`/`resolve_external_world` はモックせず、
-    実際に登録した world の root を削除して実装経由で確認する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    wid = f"realbroken{sfx}"
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "note.md").write_text("x", encoding="utf-8")
-    store.upsert_world(wid, str(root))
-    try:
-        import shutil
-        shutil.rmtree(root)   # 登録後にマウント外れ/削除を模擬（resolve_external_world は実処理で辿る）
-
-        adm_uid, adm_pw = _mk_admin(sfx)
-        _login(adm_uid, adm_pw)
-        issued = _issue_key(f"rootunreach-{sfx}")
-        _logout()
-
-        r = _search({"world": wid, "query": "x"}, api_key=issued["key"])
-        assert r.status_code == 503, r.text
-    finally:
-        store.delete_world_row(wid)
-
-
-# fd 所有権（`sherpa.fd_response.FdOwner`/`FdFileResponse` の ASGI __call__ 全体を try/finally）
-# ＝documents/ext_api 両ルータの共有部品。単体テストは tests/unit/test_fd_response.py（DB 不要）
-# へ集約済み（本ファイルからは重複するため撤去）。
-
-# ===== malformed body・キャンセル・並行監査・admin監査統合・UTF8/ZIP境界・request_id⇔ログ =====
-
-def test_malformed_json_body_is_still_audited():
-    """本文が JSON としてすら解析できない（`RequestValidationError` が `require_api_key` 実行前に
-    発生する）場合でも、`ExtRequestMiddleware` のフォールバック（`_fallback_audit_pending`）が
-    ヘッダの X-API-Key から identity を解決し、監査行を1件書く（audit_pending が最後まで
-    None のまま=無記録、という抜け穴を塞ぐ）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"malformed-{sfx}")
-    _logout()
-    # request_id は sfx で一意化する（固定リテラルだと、共有 sherpa_test DB に残る過去実行の
-    # 同名行と衝突しうる）。
-    rid = f"probe-malformed-{sfx}"
-
+@pytest.mark.parametrize("api_key, expected_actor", [("issued", "issued"), ("sk-ext-totally-bogus-key-xyz", "ext:unknown")],
+                         ids=["valid_key", "unknown_key"])
+def test_malformed_json_body_is_still_audited(api_key, expected_actor):
+    """本文が JSON として解析できず `require_api_key` 前に失敗しても、フォールバックが X-API-Key から
+    identity を解決して監査行を 1 件書く（無効なキーなら actor は "ext:unknown"）。"""
+    issued = _key("malformed")
+    if api_key == "issued":
+        api_key, expected_actor = issued["key"], f"ext:{issued['id']}"
+    rid = f"probe-malformed-{_sfx()}"
     r = client.post("/ext/v1/search", content=b"{not valid json at all",
-                    headers={"X-API-Key": issued["key"], "Content-Type": "application/json",
-                            "X-Request-Id": rid})
+                    headers={**_h(api_key, rid), "Content-Type": "application/json"})
     assert r.status_code == 422, r.text
     assert r.headers["X-Request-Id"] == rid
 
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT actor_user_id, outcome, reason, detail FROM audit_log "
-            "WHERE request_id=%s ORDER BY id DESC LIMIT 1", (rid,)
-        ).fetchone()
-    assert row is not None, "malformed body でも監査行が書かれているはず"
-    assert row["actor_user_id"] == f"ext:{issued['id']}"
-    assert row["detail"]["business_outcome"] == "failed"
-
-
-def test_malformed_json_body_unknown_key_records_unknown_actor():
-    """malformed body＋無効な X-API-Key でも監査は書かれる（actor は特定できないため
-    "ext:unknown"）——フォールバック経路自体が例外で落ちない対照。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    # request_id は sfx で一意化する（固定リテラルだと、共有 sherpa_test DB に残る過去実行の
-    # 同名行と衝突しうる）。
-    rid = f"probe-malformed-unknown-{_sfx()}"
-    r = client.post("/ext/v1/search", content=b"{not valid json",
-                    headers={"X-API-Key": "sk-ext-totally-bogus-key-xyz",
-                            "Content-Type": "application/json",
-                            "X-Request-Id": rid})
-    assert r.status_code == 422, r.text
-
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT actor_user_id, detail FROM audit_log WHERE request_id=%s "
-            "ORDER BY id DESC LIMIT 1", (rid,)
-        ).fetchone()
-    assert row is not None
-    assert row["actor_user_id"] == "ext:unknown"
+    row = _audit_rows(rid, "actor_user_id, outcome, reason, detail")[-1]
+    assert row["actor_user_id"] == expected_actor
+    if expected_actor != "ext:unknown":
+        assert row["detail"]["business_outcome"] == "failed"
 
 
 def _minimal_asgi_http_scope(path: str, headers: list) -> dict:
-    """手組みの ASGI HTTP scope（middleware 単体テスト用）。`query_string`/`scheme`/`server`/
-    `client`/`root_path` を省くと、応答開始前に例外が起きた経路で Starlette 自身の
-    `ServerErrorMiddleware` が内部的に `Request(scope).query_params` 等へアクセスして
-    `KeyError` を起こすことがある（実測）——最小限だが完全な scope を1箇所にまとめる。"""
+    """手組みの ASGI HTTP scope。`query_string`/`scheme`/`server`/`client`/`root_path` を省くと、応答開始前に
+    例外が起きた経路で Starlette の `ServerErrorMiddleware` が KeyError を起こすことがある。"""
     return {"type": "http", "method": "GET", "path": path, "raw_path": path.encode(),
             "query_string": b"", "scheme": "http", "root_path": "",
-            "server": ("testserver", 80), "client": ("testclient", 12345),
-            "headers": headers}
+            "server": ("testserver", 80), "client": ("testclient", 12345), "headers": headers}
 
 
 def _bare_ext_app():
-    """`ExtRequestMiddleware` を装着していない裸の FastAPI app（`ext_api.router` だけを含む・
-    `request.app` 経由の依存解決は効く）。`sherpa.api.app` は `app.add_middleware()` で
-    このミドルウェアを**既に装着済み**のため、`ExtRequestMiddleware(app)` のように直接包むと
-    二重に呼ばれてしまう（監査行が複数書かれる・実際に踏んだ回帰）。middleware 単体テスト専用。
-    """
+    """`ExtRequestMiddleware` 未装着の裸の FastAPI app（`sherpa.api.app` は装着済みで、直接包むと二重に呼ばれ
+    監査行が複数書かれる）。middleware 単体テスト専用。"""
     from fastapi import FastAPI
-
-    from sherpa import ext_api
     bare = FastAPI()
     bare.include_router(ext_api.router)
     return bare
 
 
+def _run_through_middleware(api_key: str, rid: str, send, expect_exc):
+    """`/ext/v1/capabilities` を `ExtRequestMiddleware` へ直接流し、`send` が投げた例外を返す。"""
+    async def _run():
+        scope = _minimal_asgi_http_scope(
+            "/ext/v1/capabilities", [(b"x-api-key", api_key.encode()), (b"x-request-id", rid.encode())])
+
+        async def _receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        with pytest.raises(expect_exc) as ei:
+            await ext_api.ExtRequestMiddleware(_bare_ext_app())(scope, _receive, send)
+        return ei.value
+
+    return asyncio.run(_run())
+
+
+def _assert_failed_delivery_audit(rid, reason, http_status):
+    row = _audit_one(rid)
+    assert row["outcome"] == "error", row
+    assert row["reason"] == reason
+    assert row["detail"]["business_outcome"] == "failed"
+    assert row["detail"]["http_status"] == http_status
+
+
 def test_cancelled_request_still_writes_audit_and_resets_contextvar():
-    """`asyncio.CancelledError` が応答完了前に起きても、監査書込と ContextVar reset は
-    `asyncio.shield()` で保護されて完了する（キャンセルシールド）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    import asyncio
+    """応答完了前の `CancelledError` でも、監査書込と ContextVar reset は `asyncio.shield()` で完了する。
+    status は 0 のまま success 扱いにならない。"""
+    rid = f"probe-cancel-{_sfx()}"
 
-    from sherpa import ext_api
+    async def _send(message):
+        if message["type"] == "http.response.start":
+            raise asyncio.CancelledError()
 
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"cancel-{sfx}")
-    _logout()
-    rid = f"probe-cancel-{sfx}"   # sfx で一意化（固定リテラルだと共有 sherpa_test DB の過去実行行と衝突する）
-
-    async def _run():
-        scope = _minimal_asgi_http_scope(
-            "/ext/v1/capabilities",
-            [(b"x-api-key", issued["key"].encode()), (b"x-request-id", rid.encode())])
-
-        async def _receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        sent = []
-
-        async def _send(message):
-            sent.append(message)
-            if message["type"] == "http.response.start":
-                raise asyncio.CancelledError()
-
-        mw = ext_api.ExtRequestMiddleware(_bare_ext_app())   # 二重装着を避ける（helper docstring 参照）
-        with pytest.raises(asyncio.CancelledError):
-            await mw(scope, _receive, _send)
-
-    asyncio.run(_run())
-
+    _run_through_middleware(_key("cancel")["key"], rid, _send, asyncio.CancelledError)
     assert ext_api._request_id_ctx.get() is None, "ContextVar がリクエスト後にリセットされていない"
-    with store._connect() as c:
-        rows = c.execute(
-            "SELECT outcome, reason, detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchall()
-    assert len(rows) == 1, f"監査行はちょうど1件のはず（実際 {len(rows)} 件）"
-    row = rows[0]
-    # status_holder["code"] は None のまま（http.response.start の送信自体が CancelledError で
-    # 失敗している）＝ status=0 のまま success 扱いになっていないことを固定する。
-    assert row["outcome"] == "error", row
-    assert row["reason"] == "cancelled"
-    assert row["detail"]["business_outcome"] == "failed"
-    assert row["detail"]["http_status"] == 0
+    _assert_failed_delivery_audit(rid, "cancelled", 0)
 
 
-def test_send_start_failure_with_self_generated_500_also_failing_is_audited(monkeypatch):
-    """`http.response.start` の送信自体が失敗し（早期切断相当）、その後の自己生成500の再送も
-    同じ理由で失敗するケースでも、例外を握り潰さず・status=0のままsuccess扱いにもならず、
-    outcome=error・reason=delivery_failedで監査され、最初の送信例外が再送出される
-    （自己生成500を含む全 send を同一追跡関数に通す）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    import asyncio
+def test_send_start_failure_with_self_generated_500_also_failing_is_audited():
+    """`http.response.start` の送信が失敗し、自己生成 500 の再送も失敗しても、例外を握り潰さず
+    outcome=error・reason=delivery_failed で監査し、最初の送信例外を再送出する。"""
+    rid = f"probe-sendfail-{_sfx()}"
+    raised: list[Exception] = []
 
-    from sherpa import ext_api
+    async def _send(message):
+        exc = ConnectionResetError("simulated early disconnect (every send fails)")
+        raised.append(exc)
+        raise exc
 
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"sendfail-{sfx}")
-    _logout()
-    rid = f"probe-sendfail-{sfx}"
-
-    async def _run():
-        scope = _minimal_asgi_http_scope(
-            "/ext/v1/capabilities",
-            [(b"x-api-key", issued["key"].encode()), (b"x-request-id", rid.encode())])
-
-        async def _receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        raised: list[Exception] = []   # send() が実際に投げた例外オブジェクトを呼び出し順に記録する
-
-        async def _send(message):
-            exc = ConnectionResetError("simulated early disconnect (every send fails)")
-            raised.append(exc)
-            raise exc
-
-        mw = ext_api.ExtRequestMiddleware(_bare_ext_app())   # 二重装着を避ける（helper docstring 参照）
-        with pytest.raises(ConnectionResetError) as exc_info:
-            await mw(scope, _receive, _send)
-        assert len(raised) >= 2, (
-            f"send が2回以上（start 失敗＋自己生成500の再送失敗）呼ばれているはず（実際 {len(raised)} 回）")
-        assert exc_info.value is raised[0], (
-            "再送出された例外が最初の送信失敗そのものではない（同一性不一致）——自己生成500の"
-            "再送で発生した後続の例外にすり替わっている可能性がある")
-
-    asyncio.run(_run())
-
-    with store._connect() as c:
-        rows = c.execute(
-            "SELECT outcome, reason, detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchall()
-    assert len(rows) == 1, f"監査行はちょうど1件のはず（実際 {len(rows)} 件）"
-    row = rows[0]
-    assert row["outcome"] == "error", row
-    assert row["reason"] == "delivery_failed"
-    assert row["detail"]["business_outcome"] == "failed"
-    assert row["detail"]["http_status"] == 0
+    err = _run_through_middleware(_key("sendfail")["key"], rid, _send, ConnectionResetError)
+    assert len(raised) >= 2, f"send が 2 回以上（start 失敗＋自己生成500の再送失敗）呼ばれるはず（実際 {len(raised)} 回）"
+    assert err is raised[0], "再送出された例外が最初の送信失敗そのものではない（後続の例外にすり替わっている）"
+    _assert_failed_delivery_audit(rid, "delivery_failed", 0)
 
 
 def test_send_body_failure_after_start_succeeds_is_audited_as_delivery_failed():
-    """`http.response.start` は成功したが、その後の `http.response.body` 送信で失敗する
-    （早期切断の典型パターン）場合も、実際に観測できた status（200 等）を "success" に
-    誤記録せず、outcome=error・reason=delivery_failedで監査される。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    import asyncio
+    """`http.response.start` 成功後の body 送信失敗（早期切断）は、観測できた status（200）を残したまま
+    "success" に誤記録せず delivery_failed で監査する。"""
+    rid = f"probe-bodyfail-{_sfx()}"
 
-    from sherpa import ext_api
+    async def _send(message):
+        if message["type"] == "http.response.body":
+            raise ConnectionResetError("simulated disconnect mid-body")
 
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"bodyfail-{sfx}")
-    _logout()
-    rid = f"probe-bodyfail-{sfx}"
-
-    async def _run():
-        scope = _minimal_asgi_http_scope(
-            "/ext/v1/capabilities",
-            [(b"x-api-key", issued["key"].encode()), (b"x-request-id", rid.encode())])
-
-        async def _receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        async def _send(message):
-            if message["type"] == "http.response.body":
-                raise ConnectionResetError("simulated disconnect mid-body")
-
-        mw = ext_api.ExtRequestMiddleware(_bare_ext_app())   # 二重装着を避ける（helper docstring 参照）
-        with pytest.raises(ConnectionResetError):
-            await mw(scope, _receive, _send)
-
-    asyncio.run(_run())
-
-    with store._connect() as c:
-        rows = c.execute(
-            "SELECT outcome, reason, detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchall()
-    assert len(rows) == 1, f"監査行はちょうど1件のはず（実際 {len(rows)} 件）"
-    row = rows[0]
-    assert row["outcome"] == "error", row
-    assert row["reason"] == "delivery_failed"
-    assert row["detail"]["business_outcome"] == "failed"
-    assert row["detail"]["http_status"] == 200, "start は成功済みなので観測できた実ステータスは残る"
+    _run_through_middleware(_key("bodyfail")["key"], rid, _send, ConnectionResetError)
+    _assert_failed_delivery_audit(rid, "delivery_failed", 200)
 
 
 def test_audit_write_does_not_block_event_loop(monkeypatch):
-    """監査 DB 書込を専用 writer スレッドへ逃がしているため、1件の書込みが人為的に遅延しても
-    同じ event loop 上の**他のコルーチン**は並行して進む（単一 writer スレッドである
-    以上、監査書込み**同士**は queue で直列化される——書込み中の別リクエストの応答完了まで
-    同じだけ待たされうる——が、それは「event loop がブロックされる」こととは別物。ここでは
-    event loop レベルで直接検証する（`_write_pending_audit_async` を await している間、
-    同じ event loop の他のコルーチンが進めることを確認する）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    import asyncio
-    import threading
-
-    from sherpa import ext_api
-
+    """監査 DB 書込は専用 writer スレッドへ逃がされ、書込みが遅延しても同じ event loop の他コルーチンは進む。"""
     orig_write = ext_api._write_pending_audit
     release = threading.Event()
 
@@ -3084,8 +1674,6 @@ def test_audit_write_does_not_block_event_loop(monkeypatch):
         return orig_write(pending, *a, **kw)
 
     monkeypatch.setattr(ext_api, "_write_pending_audit", _slow_write)
-    # request_id は sfx で一意化する（固定リテラルだと共有 sherpa_test DB に残る過去実行の
-    # 同名行を拾ってしまう）。
     rid = f"probe-evloop-{_sfx()}"
 
     async def _run():
@@ -3100,866 +1688,83 @@ def test_audit_write_does_not_block_event_loop(monkeypatch):
             await asyncio.sleep(0.05)
             progressed["v"] = True
 
-        await asyncio.wait_for(_other_coro(), timeout=2)   # …同じ event loop の別コルーチンが進む
+        await asyncio.wait_for(_other_coro(), timeout=2)   # …別コルーチンが進む
         assert progressed["v"] is True
-        assert not write_task.done(), "監査書込みがまだ release 待ちのはず（早期完了は想定外）"
-
+        assert not write_task.done(), "監査書込みがまだ release 待ちのはず"
         release.set()
         await asyncio.wait_for(write_task, timeout=5)
 
     asyncio.run(_run())
-
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT actor_user_id FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchone()
-    assert row is not None and row["actor_user_id"] == "ext:evloop-test"
+    assert _audit_one(rid, "actor_user_id")["actor_user_id"] == "ext:evloop-test"
 
 
-def test_admin_key_routes_are_audited():
-    """管理系3ルート（発行/一覧/失効）も `ext_api.start_audit()` 経由で同じ request-level 監査へ
-    統合されている。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    # request_id は sfx で一意化する（固定リテラルだと、共有 sherpa_test DB に残る過去実行の
-    # 同名行を拾って actor が食い違う偽陽性/陰性が起きうる・実際に踏んだ回帰）。
-    rid_create, rid_list, rid_revoke = (f"probe-admin-create-{sfx}", f"probe-admin-list-{sfx}",
-                                        f"probe-admin-revoke-{sfx}")
-
-    r = client.post("/ext/v1/admin/keys", json={"label": f"adminaudit-{sfx}"},
-                    headers={"X-Request-Id": rid_create})
-    assert r.status_code == 200, r.text
-    key_id = r.json()["id"]
-    plain_key = r.json()["key"]   # プレーンキーはこの応答で1度だけ返る
-
-    r = client.get("/ext/v1/admin/keys", headers={"X-Request-Id": rid_list})
-    assert r.status_code == 200, r.text
-
-    r = client.delete(f"/ext/v1/admin/keys/{key_id}", headers={"X-Request-Id": rid_revoke})
-    assert r.status_code == 200, r.text
-    _logout()
-
-    with store._connect() as c:
-        rows = {row["request_id"]: row for row in c.execute(
-            "SELECT request_id, action, actor_user_id, detail FROM audit_log "
-            "WHERE request_id = ANY(%s)",
-            ([rid_create, rid_list, rid_revoke],)
-        ).fetchall()}
-    assert set(rows) == {rid_create, rid_list, rid_revoke}
-    assert rows[rid_create]["action"] == "ext_api.key_created"
-    assert rows[rid_create]["actor_user_id"] == adm_uid
-    assert rows[rid_list]["action"] == "ext_api.key_listed"
-    assert rows[rid_revoke]["action"] == "ext_api.key_revoked"
-    # プレーンキー本体は3ルートいずれの監査 detail にも一切現れない（key_prefix のみ記録する契約）。
-    for rid, row in rows.items():
-        assert plain_key not in json.dumps(row["detail"]), (
-            f"監査行 {rid}（{row['action']}）の detail にプレーンキー本体が含まれている: {row['detail']}")
-
-
-def test_doc_charset_skipped_when_file_exceeds_validation_cap(tmp_path, monkeypatch):
-    """`.txt` が有効な UTF-8 でも、ファイル全体が検証上限（64KiB）を超える場合は打ち切って
-    charset を宣言しない（「未検証」を utf-8 と偽らない方針）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api
-    monkeypatch.setattr(ext_api, "_UTF8_VALIDATE_CAP", 100)
-
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "big.txt").write_text("あ" * 200, encoding="utf-8")   # 全体は有効な UTF-8・上限だけ超える
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "big.txt", api_key=key)
-    assert r.status_code == 200, r.text
-    assert r.headers["content-type"] == "text/plain"   # charset 宣言なし（検証していないため）
-
-
-def test_doc_accepts_bigtiff_magic(tmp_path, monkeypatch):
-    """BigTIFF（version 43）のシグネチャも受理する（classic TIFF の version 42 だけでなく）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-
-    root = tmp_path / "root"
-    root.mkdir()
-    content = b"II+\x00" + b"\x08\x00\x00\x00" + b"\x00" * 32   # BigTIFF header（little-endian）
-    (root / "big.tif").write_bytes(content)
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "big.tif", api_key=key)
-    assert r.status_code == 200, r.text
-    assert r.content == content
-
-
-def test_doc_rejects_ooxml_with_too_many_zip_members(tmp_path, monkeypatch):
-    """EOCD のメンバ数が上限を超える OOXML は `_zip_bounded_check` で拒否する（`zipfile.ZipFile`
-    への解析委譲は無い＝メンバー名も検証済みの central directory 走査から直接得る・
-    legacy-Office/OOXML 検証方針: bounded EOCD 検査）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    import zipfile as zf
-
-    from sherpa import ext_api
-    monkeypatch.setattr(ext_api, "_ZIP_MAX_MEMBERS", 3)
-
-    root = tmp_path / "root"
-    root.mkdir()
-    p = root / "many.docx"
-    with zf.ZipFile(p, "w") as z:
-        z.writestr("[Content_Types].xml", "<Types/>")
-        z.writestr("word/document.xml", "<document/>")
-        for i in range(10):
-            z.writestr(f"extra/{i}.txt", "x")
-    _mock_external_world(monkeypatch, root)
-
-    key = _mk_doc_key(_sfx())
-    r = _doc("docsafety", "many.docx", api_key=key)
-    assert r.status_code == 415, r.text
-
-
-def test_request_id_appears_on_application_log_records(caplog):
-    """`ExtRequestMiddleware` が束縛した request_id が、共通ロガー（"sherpa"）経由で出す
-    アプリログの `record.request_id` にも乗る（`_RequestIdLogFilter`）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    import logging as logging_mod
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"logreqid-{sfx}")
-    _logout()
-
-    with caplog.at_level(logging_mod.INFO, logger="sherpa"):
-        r = client.get("/ext/v1/capabilities",
-                       headers={"X-API-Key": issued["key"], "X-Request-Id": "probe-log-reqid"})
-    assert r.status_code == 200, r.text
-    matching = [rec for rec in caplog.records
-               if getattr(rec, "request_id", None) == "probe-log-reqid"]
-    assert matching, ("request_id='probe-log-reqid' を持つログレコードが見つからない: "
-                      f"{[(rec.name, rec.getMessage()) for rec in caplog.records]}")
-
-
-# ===== POST /ext/v1/research（PART-4: AI 下調べ検索）=====
+# ===== POST /ext/v1/answer（簡易チャットの同期応答・C-EXT-ANSWER-01）=====
 #
-# agentic search 本体（ツール実行・Evidence Packet 組み立て）は tests/unit/test_ext2_evidence.py で
-# 既に検証済み（`_dedupe_citations_and_evidence`/`_evidence_packet_evidence` 等）。ここでは ext_api 層
-# の配線（認証・world/scope 検証・監査・model 許容値検証・プロバイダ未接続の honest failure・利用統計
-# 記録）を検証する。LLM は `agentic_search._post` を差し替えて呼ぶ（実 Ollama/OpenAI 到達不要・
-# `test_ext2_evidence.py` と同じ手法）。
+# LLM は外部境界のため HTTP 層（`agentic_search._post`）で偽装し、ES/グラフを不可にして提示ツールを
+# ripgrep_search/read_around に絞る。
 
-_RESEARCH_REAL_DOC = "4期/04_運用/障害記録.md"   # fixtures/corpus/v1 実在ファイル（test_ext2_evidence.py と同一）
-
-
-def test_normalize_evidence_spans_folds_none_element_to_none():
-    """RV12 是正の固定: `source_span` の要素に `None` が1つでも含まれていれば全体を `None` へ畳む
-    （`ExtEvidenceItem.source_span: list[int] | None` は要素として `None` を許さないため）。
-    有効な整数 span・既に `None` の span は変更しない。"""
-    from sherpa import ext_api
-
-    evidence = [
-        {"evidence_id": "ev-1", "source_span": [None, None]},
-        {"evidence_id": "ev-2", "source_span": [5, None]},
-        {"evidence_id": "ev-3", "source_span": [3, 6]},
-        {"evidence_id": "ev-4", "source_span": None},
-        {"evidence_id": "ev-5"},   # キー自体が無いケースも壊さない
-    ]
-    ext_api._normalize_evidence_spans(evidence)
-    assert evidence[0]["source_span"] is None
-    assert evidence[1]["source_span"] is None
-    assert evidence[2]["source_span"] == [3, 6]
-    assert evidence[3]["source_span"] is None
-    assert evidence[4].get("source_span") is None
+def _install_answer_post(monkeypatch, seq):
+    monkeypatch.setattr(agentic_search.es_index, "available", lambda: False)
+    monkeypatch.setattr(agentic_search, "_graph_available", lambda: False)
+    monkeypatch.setattr(agentic_search, "_tools_availability_cache", {"at": 0.0, "data": None})
+    monkeypatch.setattr(agentic_search, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
 
 
-def _research(payload: dict, api_key: str | None = None):
-    headers = {"X-API-Key": api_key} if api_key else {}
-    return client.post("/ext/v1/research", json=payload, headers=headers)
+def _tool_call_round(call_id, name, arguments):
+    return {"choices": [{"message": {"content": "", "tool_calls": [
+        {"id": call_id, "function": {"name": name, "arguments": arguments}}]}}]}
 
 
-def _install_agentic_post(monkeypatch, seq):
-    """`sherpa.agentic_search._post` を固定応答列に差し替える（tests/unit/test_ext2_evidence.py と同じ手法）。"""
-    from sherpa import agentic_search as A
-    monkeypatch.setattr(A, "es_index", A.es_index)
-    monkeypatch.setattr(A.es_index, "available", lambda: False)
-    monkeypatch.setattr(A, "_graph_available", lambda: False)
-    # ツール可用性は短 TTL でプロセス内にキャッシュされる。前のテストが差し替えた可用性が
-    # 残ると、このテストの差し替え（ES あり/なし）が効かず提示ツールが食い違う＝毎回リセットする。
-    monkeypatch.setattr(A, "_tools_availability_cache", {"at": 0.0, "data": None})
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
-
-
-_RESEARCH_SUCCESS_SEQ = [
-    {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "c1", "function": {"name": "ripgrep_search",
-         "arguments": '{"query":"税率改定に伴う障害の記録"}'}}]}}]},
-    {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "c2", "function": {"name": "read_around",
-         "arguments": f'{{"doc_id":"{_RESEARCH_REAL_DOC}","line":1}}'}}]}}]},
-    # finish_reason=stop（自然完了 allowlist）が無いと帰属呼び出し（次項）自体が省略される
-    # （`agentic_search._is_natural_completion` 参照）。
-    {"choices": [{"message": {"content": "税率改定に伴う障害です。"}, "finish_reason": "stop"}]},
-    # attribution 呼び出し（EV-0）: `submit_attribution` の tool 強制呼び出しへの応答形
-    # （`agentic_search.attribute_openai_style` 参照・プレーンな JSON content ではない）。
-    # 1回目は `openai_style` 自身が内部で行う帰属（重複排除**前**の添字・research_service は
-    # この結果を使わない）。2回目は `research_service.run_research` が最終重複排除の**後**に
-    # やり直す帰属（Evidence Packet の `used` へ実際に反映されるのはこちら）。
-    {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "c3", "function": {"name": "submit_attribution", "arguments": '{"used":["ev-1"]}'}}]}}]},
-    {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "c4", "function": {"name": "submit_attribution", "arguments": '{"used":["ev-1"]}'}}]}}]},
-]
-
-
-def test_ext_research_requires_api_key():
-    if not _try_init():
-        pytest.skip("DB down")
-    r = _research({"world": "v1", "query": "税率改定の障害は？"})
-    assert r.status_code == 401, r.text
-
-
-def test_ext_research_unknown_world_404():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"research404-{sfx}")
-    _logout()
-
-    r = _research({"world": "no-such-world-xyz", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 404, r.text
-
-
-def test_ext_research_unknown_scope_422():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"research422-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x", "scope_paths": ["no-such-scope-xyz"]},
-                  api_key=issued["key"])
-    assert r.status_code == 422, r.text
-
-
-def test_ext_research_param_limits_rejected_with_422():
-    """反復上限/件数上限/タイムアウトは Pydantic Field 制約（`/ext/v1/search` の k/depth/weights と
-    同じ自動バリデーション経路）——範囲外は 422（LLM を一切呼ばない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchlimits-{sfx}")
-    _logout()
-
-    for bad in ({"max_iterations": 13}, {"max_iterations": 0}, {"max_results": 0},
-               {"max_results": 51}, {"timeout_s": 4}, {"timeout_s": 181}):
-        r = _research({"world": "v1", "query": "x", **bad}, api_key=issued["key"])
-        assert r.status_code == 422, f"{bad}: {r.text}"
-
-
-def test_ext_research_world_scope_403():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key_scoped(f"research403-{sfx}", ["v1"])
-    _logout()
-
-    r = _research({"world": "other-world-xyz", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 403, r.text
-
-
-def test_ext_research_model_not_allowed_400():
-    """許可リスト外の model は 400（LLM を一切呼ばない・ネットワーク到達不要）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchbadmodel-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x", "model": "not-a-real-model"}, api_key=issued["key"])
-    assert r.status_code == 400, r.text
-
-
-def test_ext_research_openai_unavailable_returns_503_no_fallback(monkeypatch):
-    """model が openai 側カタログに一致する値でも、openai_api_key 未設定なら 503（黙って ollama へ
-    フォールバックしない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})   # cloud_provider 未選択＝鍵解決は常に None
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchnokey-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x", "model": "gpt-5.4-mini"}, api_key=issued["key"])
-    assert r.status_code == 503, r.text
-
-
-def test_ext_research_unknown_provider_422():
-    """PART-4a: `provider` は ollama/openai の2択のみ（pydantic Literal・LLM を一切呼ばない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchbadprovider-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x", "provider": "gemini"}, api_key=issued["key"])
-    assert r.status_code == 422, r.text
-
-
-def test_ext_research_provider_openai_without_key_returns_503_fixed_message(monkeypatch):
-    """PART-4a: `provider=openai` を明示指定し、中央キー未設定なら 503＋固定文言
-    （`keys.NO_CENTRAL_KEY_MESSAGE`・黙って ollama へフォールバックしない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})   # openai_api_key 未設定
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchprovidernokey-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x", "provider": "openai"}, api_key=issued["key"])
-    assert r.status_code == 503, r.text
-    assert r.json()["detail"] == keys.NO_CENTRAL_KEY_MESSAGE
-
-
-def test_ext_research_provider_openai_routes_to_openai_when_model_omitted(monkeypatch):
-    """PART-4a: `model` 省略・`provider=openai` 明示指定時は、管理者設定の既定（ollama）ではなく
-    openai 側カタログの既定モデルを使って openai 経路を呼ぶ（provider_used=="openai" で固定）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    monkeypatch.setattr(store, "get_system_settings",
-                        lambda **kw: {"openai_api_key": "sk-fake-test-key-for-provider-test"})
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchproveropenai-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？", "provider": "openai"},
-                  api_key=issued["key"])
+def test_ext_answer_sources_only_real_touched_verified_docs(monkeypatch):
+    """出典は、この回答中に実際に道具で触れ、かつ実在確認できた doc_id だけ。"""
+    _install_answer_post(monkeypatch, [
+        # 0 件ヒットのダミー語（read_around だけが唯一の「触れた doc_id」になる）。
+        _tool_call_round("c1", "ripgrep_search", '{"query":"該当なしのダミー語xyz99"}'),
+        _tool_call_round("c2", "read_around", f'{{"doc_id":"{_ANSWER_REAL_DOC}","line":1}}'),
+        {"choices": [{"message": {"content": "障害の記録を確認しました。"}, "finish_reason": "stop"}]},
+    ])
+    r = _answer({"world": "v1", "query": "税率改定の障害は？"}, _key("answerok")["key"])
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["provider_used"] == "openai"
-    assert body["model_used"] == "gpt-5.4-mini"
+    assert body["answer"] == "障害の記録を確認しました。"
+    assert body["tool_calls"] == 2
+    assert body["unconfirmed"] is False
+    assert "unconfirmed_reason" not in body   # 確かめられた回答では添えない
+    assert [s["doc_id"] for s in body["sources"]] == [_ANSWER_REAL_DOC]
 
 
-def test_ext_research_provider_omitted_uses_admin_default_provider_setting(monkeypatch):
-    """リクエストの `provider` を省略した場合、管理者設定 `research_default_provider`
-    （既定 ollama）がハードコード既定より優先される——ここでは "openai" に設定した状態を模し、
-    明示指定なしでも openai 経路が呼ばれることを確認する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    monkeypatch.setattr(store, "get_system_settings",
-                        lambda **kw: {"openai_api_key": "sk-fake-test-key-for-provider-test",
-                                     "research_default_provider": "openai"})
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchdefaultopenai-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？"}, api_key=issued["key"])
+def test_ext_answer_unconfirmed_when_no_verified_sources(monkeypatch):
+    """道具を一度も使わず回答した場合、出典 0 件のまま黙って消さず `unconfirmed=True` を明示する。"""
+    _install_answer_post(monkeypatch, [
+        {"choices": [{"message": {"content": "資料からは確認できませんでした。"}, "finish_reason": "stop"}]}])
+    r = _answer({"world": "v1", "query": "存在しない話題"}, _key("answernosrc")["key"])
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["provider_used"] == "openai"
-    assert body["model_used"] == "gpt-5.4-mini"
+    assert body["sources"] == []
+    assert body["tool_calls"] == 0
+    assert body["unconfirmed"] is True
+    assert body["unconfirmed_reason"] is not None
 
 
-def test_ext_research_ollama_default_success_with_evidence(monkeypatch):
-    """model 省略＝既定 Ollama。Evidence Packet（Committed Evidence）付きで 200 を返す。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
+def test_ext_answer_round_trip_and_tool_call_limits_not_exceeded(monkeypatch):
+    """往復は最大 3 回・1 往復あたりの道具呼び出しは内部上限 4 回。毎回 5 件要求し一度も回答を終えなくても
+    実行は 3×4=12 件で頭打ちになり、往復が尽きれば `unconfirmed=True`（黙って打ち切らない）。"""
+    def _round_with_5_calls(n):
+        return {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": f"r{n}-{i}", "function": {"name": "ripgrep_search",
+             "arguments": '{"query":"該当なしのダミー語xyz"}'}} for i in range(5)]}}]}
 
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchok-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？"}, api_key=issued["key"])
+    _install_answer_post(monkeypatch, [_round_with_5_calls(1), _round_with_5_calls(2), _round_with_5_calls(3)])
+    r = _answer({"world": "v1", "query": "限界まで道具を呼ぶ"}, _key("answerlimits")["key"])
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["world"] == "v1"
-    assert body["provider_used"] == "ollama"
-    assert body["model_used"] == "qwen2.5"
-    # iterations（可視ステップ数=ツール呼び出し2回）と llm_calls（課金相当=ツール2回+最終合成+
-    # 帰属呼び出し1回〔内部のみ・単一 citation で ev-N 採番がずれないため研究サービス側の再帰属は
-    # 発行されない・RV12 是正で二重発行を解消〕の計4回）は一致しない値であることを固定する。
-    assert body["iterations"] == 2
-    assert body["llm_calls"] == 4
-    assert body["answer"]
-    packet = body["evidence_packet"]
-    assert packet["investigation_status"] == "sufficient"
-    assert packet["evidence"], "Evidence Packet に evidence が1件も無い"
-    ev = packet["evidence"][0]
-    assert ev["source_path"] == _RESEARCH_REAL_DOC
-    assert ev["evidence_id"] == "ev-1"
-
-
-def test_ext_research_es_search_hit_without_line_number_normalizes_span_to_none(monkeypatch):
-    """RV12 是正の固定: 行番号を持たない ES/RAG ヒット（`span=[None, None]`）が Evidence Packet の
-    `source_span` へそのまま転記されると、応答モデル（`ExtEvidenceItem.source_span: list[int] |
-    None`）の Pydantic 検証で 500 になる——API 境界（`ext_api._normalize_evidence_spans`）で
-    `None` へ正規化し、200 で返すことを固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import agentic_search as A
-
-    monkeypatch.setattr(A, "es_index", A.es_index)
-    monkeypatch.setattr(A.es_index, "available", lambda: True)
-    monkeypatch.setattr(A, "_graph_available", lambda: False)
-    monkeypatch.setattr(A, "_tools_availability_cache", {"at": 0.0, "data": None})   # 前テストの可用性を持ち越さない
-
-    # `es_search`（rag_chunks 由来で行番号を持たない想定）が実在 doc への citation を
-    # `span=[None, None]` で返すケースを再現する（`agentic_search.run_tool` の es_search 分岐が
-    # `[h.get("line"), h.get("line")]` を組む際、`line` 欠落だとこの形になる）。
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, {_RESEARCH_REAL_DOC},
-               [{"doc_id": _RESEARCH_REAL_DOC, "span": [None, None], "quote": "本文", "ext": ".md"}], [])
-
-    monkeypatch.setattr(A, "run_tool", fake_run_tool)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "es_search", "arguments": '{"query":"x"}'}}]}}]},
-        {"choices": [{"message": {"content": "見つかりました。"}, "finish_reason": "stop"}]},
-    ]
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchspan-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    packet = r.json()["evidence_packet"]
-    assert packet["evidence"], "Evidence Packet に evidence が1件も無い"
-    for ev in packet["evidence"]:
-        assert ev["source_span"] is None or all(isinstance(x, int) for x in ev["source_span"])
-
-
-def test_ext_research_max_results_caps_evidence_count(monkeypatch):
-    """`max_results` は Evidence Packet の `evidence` 件数上限として働く。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchcap-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？", "max_results": 1},
-                  api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    assert len(r.json()["evidence_packet"]["evidence"]) <= 1
-
-
-def test_ext_research_audits_model_used_and_ev_ids(monkeypatch):
-    """監査行に model_used/provider_used/iterations と ev-* の一覧が残る（§8.3/§8.4）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchaudit-{sfx}")
-    _logout()
-    rid = f"probe-research-audit-{sfx}"
-
-    r = client.post(
-        "/ext/v1/research", json={"world": "v1", "query": "税率改定の障害は？"},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
-    assert r.status_code == 200, r.text
-
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT actor_user_id, resource_type, detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchone()
-    assert row is not None
-    assert row["actor_user_id"] == f"ext:{issued['id']}"
-    assert row["resource_type"] == "ext_research"
-    assert row["detail"]["model_used"] == "qwen2.5"
-    assert row["detail"]["provider_used"] == "ollama"
-    assert row["detail"]["llm_calls"] == 4
-    assert row["detail"]["ev_ids"] == ["ev-1"]
-
-
-def test_ext_research_usage_metering_records_per_key(monkeypatch):
-    """利用量の記録は常時ON（TOGGLE-RM・2026-09-03）: キー別 usage_events へ記録される
-    （§8.3・kind='research'）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchusage-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？"}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-
-    with store._connect() as c:
-        rows = c.execute(
-            "SELECT provider, model, calls FROM usage_events WHERE kind='research' AND user_id=%s",
-            (f"ext:{issued['id']}",)
-        ).fetchall()
-    assert rows, "usage_events に research kind の行が記録されていない"
-    assert rows[-1]["provider"] == "ollama"
-    assert rows[-1]["model"] == "qwen2.5"
-    assert rows[-1]["calls"] == 4   # llm_calls と一致する実測値（ツール2回+最終合成+帰属呼び出し1回）
-
-
-def test_ext_research_pins_resolved_root(monkeypatch):
-    """`research_service.run_research` は `ext_api._resolve_world_or_error`（preflight・ロック**前**の
-    値）を使わず、共有ロック（`world_lock_shared`）を保持した状態で自前に `worlds.
-    resolve_external_world` を（再）解決してから `worlds.pin_world_root` で固定することを配線レベルで
-    固定する（TOCTOU 対策の実地確認。`tests/unit/test_worlds_pin_root.py` は pin 機構自体の契約、
-    `tests/integration/test_world_lock_shared_semantics.py` はロックの相互排他そのものを検証——
-    こちらは実際にその2つが呼ばれることを確認する）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-    from sherpa import worlds
-
-    seen = {}
-    real_pin = worlds.pin_world_root
-    real_resolve = worlds.resolve_external_world
-
-    def spy_pin(world_id, root):
-        seen["world_id"] = world_id
-        seen["root"] = root
-        return real_pin(world_id, root)
-
-    def spy_resolve(world_id, **kw):
-        seen["resolve_called"] = seen.get("resolve_called", 0) + 1
-        return real_resolve(world_id, **kw)
-
-    monkeypatch.setattr(worlds, "pin_world_root", spy_pin)
-    monkeypatch.setattr(worlds, "resolve_external_world", spy_resolve)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchpin-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？"}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    assert seen["world_id"] == "v1"
-    assert seen["root"] == worlds.world_dir("v1")
-    assert seen["resolve_called"] >= 1, "研究実行経路が自前で world を再解決していない"
-
-
-def test_ext_research_overall_timeout_returns_504(monkeypatch):
-    """`timeout_s`（リクエスト全体のデッドライン）超過は 504（黙った空 200 にしない）。
-
-    実時間を待たない: `research_service.threading.Timer` を即時発火する fake に差し替え、
-    `stop_event` がループ冒頭（初回 `_post` の前）で立った状態を作る——`agentic_search.openai_style`
-    は `stop_event` が立っていれば `final` を yield せず終了する契約（既存挙動・agentic_search.py
-    docstring）ため、LLM 呼び出し自体が一度も発行されない decisive なタイムアウト再現になる。
-    """
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import research_service
-
-    class _ImmediateTimer:
-        def __init__(self, interval, function):
-            self._function = function
-
-        def start(self):
-            self._function()   # デッドライン到達を即座に模擬（実待機なし）
-
-        def cancel(self):
-            pass
-
-    monkeypatch.setattr(research_service.threading, "Timer", _ImmediateTimer)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchtimeout-{sfx}")
-    _logout()
-    rid = f"probe-research-timeout-{sfx}"
-
-    r = client.post(
-        "/ext/v1/research", json={"world": "v1", "query": "税率改定の障害は？", "timeout_s": 5},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
-    assert r.status_code == 504, r.text
-    assert "制限時間" in r.json()["detail"]
-
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT reason FROM audit_log WHERE request_id=%s", (rid,)).fetchone()
-    assert row is not None
-    assert row["reason"] == "timeout"   # `_HTTP_OUTCOME_REASON[504]`
-
-
-def test_ext_research_preflight_exceeding_deadline_returns_504_not_422(monkeypatch):
-    """RV5 是正の固定: scope_paths 走査（preflight）自体がリクエスト全体の共有デッドラインを
-    使い切るほど遅い場合、走査結果が「不明な範囲」であっても 422 ではなく 504 を返す——preflight
-    と `run_research` が同じ絶対期限（ハンドラ入口で確定）を共有する契約
-    （`ext_api.ext_research`/`research_service.run_research` docstring 参照）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchpreflightdl-{sfx}")
-    _logout()
-
-    clock = {"t": 0.0}
-    monkeypatch.setattr(ext_api.time, "monotonic", lambda: clock["t"])
-
-    def _slow_invalid_scope(*a, **kw):
-        clock["t"] = 1000.0   # scope 走査がデッドラインを丸ごと使い切ったことにする
-        return False
-
-    monkeypatch.setattr(ext_api.scope_mod, "valid_scope_paths", _slow_invalid_scope)
-
-    r = _research({"world": "v1", "query": "x", "scope_paths": ["no-such-scope-xyz"],
-                  "timeout_s": 5}, api_key=issued["key"])
-    assert r.status_code == 504, r.text
-
-
-def test_ext_research_preflight_elapsed_time_shares_absolute_deadline_with_run_research(monkeypatch):
-    """RV6 是正の固定: `run_research` へは preflight 消費後の `timeout_s`（残り秒数）を再計算して
-    渡すのではなく、ハンドラ入口で確定した絶対期限（`absolute_deadline`）そのものを渡す——
-    別々に `time.monotonic()` を起点に変換し直すと、整数秒への切り上げ＋変換〜呼び出しに実際に
-    かかる僅かな時間の両方が積み重なり、元の期限を最大約1秒超えてから 200 を返しうる（RV6・
-    旧実装は `timeout_s=max(1, math.ceil(_remaining()))` を渡し直していた＝RV5 時点の教訓）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import citations, ext_api, research_service
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchbudget-{sfx}")
-    _logout()
-
-    clock = {"t": 0.0}
-    monkeypatch.setattr(ext_api.time, "monotonic", lambda: clock["t"])
-
-    real_resolve = ext_api._resolve_world_or_error
-
-    def _slow_resolve(world, **kw):
-        clock["t"] = 12.0   # world 解決（preflight）に12秒かかったことにする
-        return real_resolve(world)
-
-    monkeypatch.setattr(ext_api, "_resolve_world_or_error", _slow_resolve)
-
-    captured: dict = {}
-
-    def _fake_run_research(**kw):
-        captured.update(kw)
-        return {"world": kw["world"], "query": kw["query"], "answer": "",
-                "evidence_packet": citations.build_evidence_packet(
-                    task_id="t", investigation_status="insufficient"),
-                "model_used": "qwen2.5", "provider_used": "ollama",
-                "iterations": 0, "llm_calls": 0, "used_ev_ids": []}
-
-    monkeypatch.setattr(research_service, "run_research", _fake_run_research)
-
-    r = _research({"world": "v1", "query": "x", "timeout_s": 30}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    # 元の timeout_s（30）はそのまま渡る（メッセージ表示用・切り詰めない）。
-    assert captured["timeout_s"] == 30
-    # 絶対期限はハンドラ入口の時刻（0.0）+30 のまま——preflight が12秒使っても「期限」という
-    # 固定点自体は動かない（動くのは run_research 内部が見る「残り」だけ）。
-    assert captured["absolute_deadline"] == 30.0
-
-
-def test_ext_research_slow_world_resolver_404_becomes_504_when_deadline_exceeded(monkeypatch):
-    """RV6 是正の固定: world resolver（`worlds.resolve_external_world`）自体が長引いた末に
-    「未登録」（404 相当）で失敗した場合でも、その時点で既にリクエスト全体のデッドラインを
-    超えていれば 404 ではなく 504 を返す——`_resolve_world_or_error` 自身は期限を見ずに直接
-    404/503 を送出するだけなので、呼び出し元（`ext_research`）が resolver の失敗を捕捉して
-    判定する契約を固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api, worlds
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchslow404-{sfx}")
-    _logout()
-
-    clock = {"t": 0.0}
-    monkeypatch.setattr(ext_api.time, "monotonic", lambda: clock["t"])
-
-    def _slow_not_found(world_id, **kw):
-        clock["t"] = 1000.0   # world 解決自体がデッドラインを丸ごと使い切ったことにする
-        return worlds.ExternalWorldResolution("not_found", None)
-
-    monkeypatch.setattr(ext_api.worlds, "resolve_external_world", _slow_not_found)
-
-    r = _research({"world": "no-such-world-xyz", "query": "x", "timeout_s": 5},
-                  api_key=issued["key"])
-    assert r.status_code == 504, r.text
-
-
-def test_ext_research_slow_world_resolver_503_becomes_504_when_deadline_exceeded(monkeypatch):
-    """RV6 是正の固定: 上と同じ契約だが、resolver が registry 到達不可（`ExternalResolverError`
-    →503相当）で失敗する場合。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api, worlds
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchslow503-{sfx}")
-    _logout()
-
-    clock = {"t": 0.0}
-    monkeypatch.setattr(ext_api.time, "monotonic", lambda: clock["t"])
-
-    def _slow_unreachable(world_id, **kw):
-        clock["t"] = 1000.0
-        raise worlds.ExternalResolverError("simulated registry unreachable")
-
-    monkeypatch.setattr(ext_api.worlds, "resolve_external_world", _slow_unreachable)
-
-    r = _research({"world": "v1", "query": "x", "timeout_s": 5}, api_key=issued["key"])
-    assert r.status_code == 504, r.text
-
-
-def test_ext_research_fast_world_resolver_404_stays_404_when_deadline_not_exceeded():
-    """対照実験: resolver が期限内に速く失敗した場合は、これまでどおり素の 404 のまま
-    （デッドライン優先の再分類は「期限を超えた場合だけ」に限定されることの固定）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchfast404-{sfx}")
-    _logout()
-
-    r = _research({"world": "no-such-world-xyz", "query": "x", "timeout_s": 30},
-                  api_key=issued["key"])
-    assert r.status_code == 404, r.text
-
-
-def test_ext_research_scope_walk_deadline_exceeded_becomes_504(monkeypatch):
-    """RV6 是正の固定: scope_paths の木走査自体（`scope_infer.safe_files` の `deadline` 引数）が
-    デッドラインを超えて中断した場合（`scope_infer.ScopeWalkDeadlineExceeded`）、422/503 ではなく
-    504 を返す。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api, scope_infer
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchscopewalkdl-{sfx}")
-    _logout()
-
-    def _boom_walk(*a, **kw):
-        raise scope_infer.ScopeWalkDeadlineExceeded("simulated deadline mid-walk")
-
-    monkeypatch.setattr(ext_api.scope_mod, "valid_scope_paths", _boom_walk)
-
-    r = _research({"world": "v1", "query": "x", "scope_paths": ["4期"], "timeout_s": 5},
-                  api_key=issued["key"])
-    assert r.status_code == 504, r.text
-
-
-def test_ext_research_records_partial_cost_and_audit_on_mid_failure(monkeypatch):
-    """途中で LLM 呼び出しが失敗しても、それまでの llm_calls 分は metering に記録され、
-    監査 detail にも解決済み model_used/provider_used/llm_calls が残る。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import agentic_search as A
-
-    monkeypatch.setattr(A, "es_index", A.es_index)
-    monkeypatch.setattr(A.es_index, "available", lambda: False)
-    monkeypatch.setattr(A, "_graph_available", lambda: False)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAXCALC"}'}}]}}]},
-    ]
-
-    def failing_post(url, headers, body, timeout=90):
-        if seq:
-            return seq.pop(0)
-        raise ConnectionError("simulated network failure")
-
-    monkeypatch.setattr(A, "_post", failing_post)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchfail-{sfx}")
-    _logout()
-    rid = f"probe-research-fail-{sfx}"
-
-    r = client.post(
-        "/ext/v1/research", json={"world": "v1", "query": "TAXCALCの仕様は？"},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
+    assert body["tool_calls"] == 12
+    assert body["unconfirmed"] is True
+    assert body["unconfirmed_reason"].startswith("round_trip_limit")
+
+
+def test_ext_answer_llm_unavailable_returns_503_no_fallback(monkeypatch):
+    """既定 AI が未接続（中央キー未設定）なら 503——黙って別プロバイダへフォールバックしない。"""
+    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {"research_default_provider": "openai"})
+    r = _answer({"world": "v1", "query": "x"}, _key("answernokey")["key"])
     assert r.status_code == 503, r.text
-
-    with store._connect() as c:
-        audit_row = c.execute(
-            "SELECT detail FROM audit_log WHERE request_id=%s", (rid,)).fetchone()
-        usage_rows = c.execute(
-            "SELECT provider, model, calls FROM usage_events WHERE kind='research' AND user_id=%s",
-            (f"ext:{issued['id']}",)).fetchall()
-    assert audit_row is not None
-    assert audit_row["detail"]["model_used"] == "qwen2.5"
-    assert audit_row["detail"]["provider_used"] == "ollama"
-    # 成功1回（ripgrep_search）+失敗1回分の送信——ただし `ConnectionError` は `OSError` の一種
-    # として `agentic_search._retryable_post_error` の再試行対象に入るため、`_send` が同一
-    # プロバイダ内で最大 `_POST_RETRY_ATTEMPTS`（2）回まで再試行する（初回+再試行2回=3回試行）。
-    # 実際に発行を試みた回数を数える契約（`llm_calls`/usage_events 双方）のため、失敗した
-    # 再試行分もすべて計上される＝1（成功）+3（失敗側の全試行）=4。
-    assert audit_row["detail"]["llm_calls"] == 4
-    assert usage_rows, "失敗時も usage_events へ記録される"
-    assert usage_rows[-1]["calls"] == 4
-
-
-def test_ext_research_openapi_subset_includes_research():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchopenapi-{sfx}")
-    _logout()
-
-    r = client.get("/ext/v1/openapi.json", headers={"X-API-Key": issued["key"]})
-    assert r.status_code == 200, r.text
-    assert "/ext/v1/research" in r.json()["paths"]

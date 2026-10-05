@@ -1,13 +1,10 @@
 """管理者の利用明細エクスポート（ZIP・`GET /admin/usage/export`）。
 
-期間内の回答（`messages.answer`）から、本文（質問・回答・会話タイトル・参照した資料・
-ツールの引数）を一切含めない数字・閉じた語彙の欄だけを取り出し、`turns.csv`/`agents.csv`/
-`tools.csv`/`aux_calls.csv`/`daily.csv`/`activity/<会話番号>.txt`/`summary.json`/`README.txt`
-の1つの ZIP にまとめる。母集団・期間境界は `sherpa.store.usage.usage_stats`/`usage_export_turns`/
-`usage_export_aux_calls` に委ねる（このモジュールは受け取った行を整形するだけ）。
-
-activity 由来の文字列（ツール名・モデル名・設定値・エラーコード・未解析の種類）の安全化規則は
-`sherpa.turn_activity_format` に従う。
+期間内の回答（`messages.answer`）から、本文（質問・回答・会話タイトル・参照した資料・ツールの引数）を含めず、数字・閉じた語彙の欄だけを
+取り出し、`turns.csv`/`agents.csv`/`tools.csv`/`aux_calls.csv`/`daily.csv`/`activity/<会話番号>.txt`/`summary.json`/`README.txt` を
+1つの ZIP にまとめる。母集団・期間境界は `store.usage` に委ね、このモジュールは受け取った行を整形するだけ。
+activity 由来の文字列の安全化は `turn_activity_format` に従う。
+設計: docs/design/usage.md「明細エクスポート」
 """
 from __future__ import annotations
 
@@ -24,9 +21,7 @@ from sherpa.csv_safe import csv_safe
 from sherpa.store.usage import _JST, _USAGE_LIMIT_FIELD_KINDS
 from sherpa.turn_activity_format import _IDENT, _WORD, _safe, _version, format_turn, label_agents, merge_tools
 
-# 打ち切りの内訳（answer.limits）の列見出し。web/usage.js の LIMIT_LABEL と同じ表記に揃える
-# （画面の「打ち切りの内訳」表と同じ語彙で明細を読めるように）。列順は `_USAGE_LIMIT_FIELD_KINDS`
-# の定義順（sherpa/store/usage.py・codex 系→API 系の順）をそのまま使う。
+# 打ち切りの内訳（answer.limits）の列見出し。`web/usage.js` の LIMIT_LABEL と同じ表記、列順は `_USAGE_LIMIT_FIELD_KINDS` の定義順
 _LIMIT_LABELS = {
     "tool_result_clipped": "1件の読取量を制限",
     "total_budget_hit": "累計の読取量に到達",
@@ -42,8 +37,7 @@ _LIMIT_LABELS = {
     "depth_escalated": "自動で深く調べた",
 }
 _LIMIT_FIELDS = list(_USAGE_LIMIT_FIELD_KINDS.items())
-# CSV のモデル名の形（配備名の大文字・Ollama のタグの `:` を許す）。パス区切り・空白・非 ASCII を
-# 含むものは中身を出さず「（その他）」にまとめる（activity の文字列と同じ扱い）。
+# CSV のモデル名の形。パス区切り・空白・非 ASCII を含むものは中身を出さず「（その他）」にまとめる
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,80}$")
 
 _TURNS_HEADER = [
@@ -82,8 +76,7 @@ def _safe_or_none(v, pattern):
 
 
 def _setting_value(v):
-    """activity.settings の1値を出力用に整形する（`sherpa.turn_activity_format.format_turn` の
-    内部 `_setting` と同じ規則: bool/int/None はそのまま、それ以外の文字列だけ安全化する）。"""
+    """activity.settings の1値を出力用に整形する（bool/int/None はそのまま、それ以外の文字列だけ安全化する）。"""
     if isinstance(v, bool) or v is None or isinstance(v, int):
         return v
     return _safe(v, _WORD)
@@ -191,9 +184,7 @@ def _aux_row(r: dict) -> list:
 
 
 def _daily_rows(summary: dict) -> list[list]:
-    """`daily`（日付・ターン数・アクティブ利用者数）と `tokens.daily`（日付・入力/出力トークン）を
-    日付で突き合わせる。どちらか片方にしか無い日付（0件の側が欠けている）も欠側を空欄にして残す。
-    """
+    """`daily` と `tokens.daily` を日付で突き合わせる（片方にしか無い日付も欠側を空欄にして残す）。"""
     daily = {d["date"]: d for d in (summary.get("daily") or []) if isinstance(d, dict) and d.get("date")}
     token_daily = {d["date"]: d for d in ((summary.get("tokens") or {}).get("daily") or [])
                   if isinstance(d, dict) and d.get("date")}
@@ -250,12 +241,10 @@ def _readme_text(period: dict, retrieved_at: datetime, app_ver: str | None) -> s
 
 def build_export_zip(fileobj, *, summary: dict, turn_rows: list[dict], aux_rows: list[dict],
                      retrieved_at: datetime, app_ver: str | None) -> None:
-    """`fileobj`（シーク可能な書き込み先・`tempfile.SpooledTemporaryFile` 等）へ ZIP を書き込む。
+    """`fileobj`（シーク可能な書き込み先）へ ZIP を書き込む。
 
-    `summary`: `store.usage_stats(...)` の結果そのもの（本関数は読み取るだけ・改変しない）。
-    `turn_rows`: `store.usage_export_turns(...)` の行（本文を含む `answer` 全体を持つが、
-    ここで数字・閉じた語彙の欄だけを抜き出す——本文を zip のどのファイルへも書かない）。
-    `aux_rows`: `store.usage_export_aux_calls(...)` の行。
+    `summary`: `store.usage_stats(...)` の結果（読み取るだけ）。`turn_rows`: `store.usage_export_turns(...)` の行
+    （数字・閉じた語彙の欄だけを抜き出し、本文は zip のどのファイルへも書かない）。`aux_rows`: `store.usage_export_aux_calls(...)` の行。
     """
     period = summary.get("period") or {}
     turns_csv_rows: list[list] = []

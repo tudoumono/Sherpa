@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from _test_users import register_test_uid
+from _store_helpers import get_conversation
 from sherpa import auth, store
 from sherpa.api import app
 
@@ -202,7 +203,7 @@ def test_admin_audit_export_chat_content_soft_deleted_conversation_placeholder()
     sid = store.create_share(cid, admin_uid, th, _future(), [recipient_uid])
     store.accept_share(sid, recipient_uid)          # 生きた受領ラッパーを作る
     assert store.delete_conversation(cid, user_id=admin_uid)   # ラッパー有り→soft delete（messages は残る）
-    conv = store.get_conversation(cid)
+    conv = get_conversation(cid)
     assert conv is not None, "soft delete のはずが会話ごと消えている（テスト前提が崩れている）"
 
     admin = _login(admin_uid, admin_pw)

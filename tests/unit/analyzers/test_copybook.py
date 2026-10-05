@@ -124,3 +124,38 @@ def test_extract_refs_is_always_empty():
     text = "       01 SHARED-CPY.\n           05 SHARED-AMT PIC 9(5) VALUE 100.\n"
     res = A.extract_refs(text, "SHARED-CPY.cpy")
     assert res.refs == [] and res.dropped == []
+
+
+def test_filler_group_closes_previous_group_so_following_items_do_not_join_it():
+    text = (
+        "       01 G1.\n"
+        "           05 A1           PIC X.\n"
+        "       01 FILLER.\n"
+        "           05 B1           PIC X.\n"
+    )
+    by_name = {c.name: c for c in A.collect_defs(text, "G.cpy").children}
+    assert set(by_name) == {"G1", "A1", "B1"}
+    assert by_name["A1"].cid_key == "G1.A1"
+    assert by_name["B1"].cid_key == "B1"
+
+
+def test_copy_replacing_pseudo_text_is_not_scanned():
+    text = "       01 R.\n           COPY INNER REPLACING ==COPY FAKE== BY ==COPY FAKE2==.\n"
+    assert [r.name for r in A.extract_refs(text, "R.cpy").refs] == ["INNER"]
+
+
+def test_nested_copy_inside_copybook_is_a_copies_ref():
+    text = (
+        "      * COPY COMMENTED.\n"
+        "       01 OUTER-REC.\n"
+        "           COPY INNER-CPY.\n"
+        "           05 NOTE   PIC X(8) VALUE 'COPY FAKE'.\n"
+    )
+    refs = A.extract_refs(text, "OUTER-CPY.cpy").refs
+    assert [(r.edge_type, r.kind, r.name, r.line) for r in refs] == [("COPIES", "Copybook", "INNER-CPY", 3)]
+
+
+def test_self_copy_is_reported_not_an_edge():
+    res = A.extract_refs("       01 OUTER-REC.\n           COPY OUTER.\n           COPY OTHER.\n", "dir/OUTER.cpy")
+    assert [r.name for r in res.refs] == ["OTHER"]
+    assert [(d.reason, d.line) for d in res.dropped] == [("copy_self_reference", 2)]

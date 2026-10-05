@@ -10,7 +10,17 @@ uvicorn[standard]    # ASGI サーバ
 openpyxl>=3          # Excel 出力（R7）
 python-docx>=1.1     # Feature A: Codex が Word 文書（.docx）を生成するためのライブラリ
 python-pptx>=0.6     # Feature A: Codex が PowerPoint（.pptx）を生成するためのライブラリ
-anthropic[bedrock]>=0.115  # AWS Bedrock（Claude）プロバイダ（Mantle クライアント＋boto3 依存）
 pypdf>=6             # PDF テキスト層抽出（MD化アーム④・同梱既定・2026-07-08 ユーザー指示）
 olefile>=0.47        # OLE2/CFB（暗号化 OOXML・旧 Office バイナリ）の暗号化ストリーム判定（ING-1 閉じた理由語彙）
 markitdown[all]>=0.1  # MD化アーム②の汎用変換（同梱既定・全部入り・2026-07-08 ユーザー指示）
+# コードアナライザの構文解析（Tree-sitter・ANA-19）。本体と文法は言語の版（ABI 15）が合う組み合わせに固定する
+# （本体 0.25 以降が ABI 15 を読む・上限は 0.27 未満で止め、上げるときは全文法の読み込みを確かめる）。
+# 文法はどれもビルド不要の abi3 ホイール（Linux x86_64・macOS arm64）。
+tree-sitter>=0.25,<0.27
+tree-sitter-java>=0.23,<0.24
+tree-sitter-c-sharp>=0.23,<0.24
+tree-sitter-c>=0.24,<0.25
+tree-sitter-javascript>=0.25,<0.26
+tree-sitter-bash>=0.25,<0.26
+tree-sitter-css>=0.25,<0.26
+tree-sitter-embedded-template>=0.25,<0.26

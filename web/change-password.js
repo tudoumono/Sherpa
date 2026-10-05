@@ -93,9 +93,7 @@ form.addEventListener('submit', async (e) => {
       window.location.href = '/ui/login.html?next=' + encodeURIComponent('/ui/change-password.html' + location.search);
       return;
     }
-    // ログイン済みならフラグの有無を問わず表示する——強制変更（must_change_password）専用に
-    // していた頃の「フラグ無しは即リダイレクト」は、メニューからの任意のパスワード変更を
-    // 一瞬で閉じてしまう（実環境指摘 2026-09-02）。
+    // ログイン済みならフラグの有無を問わず表示する（強制変更専用ではなく、メニューからの任意変更にも使うため）。
   } catch (_) {
     show(errEl, 'ログイン状態を確認できません。もう一度ログインしてください。');
   }

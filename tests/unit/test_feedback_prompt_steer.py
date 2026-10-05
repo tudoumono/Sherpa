@@ -1,7 +1,6 @@
 """F1/F2（2026-07-07-フィードバック一括.md）: 影響質問のクエリ計画・ask_user 発動基準のプロンプト文言テスト。
 
-F1: 影響を問う質問では症状語（落ちる/止まる/エラー等）をそのまま検索語にしない指示が `_prompt_mcp`／
-    `_facts` の impact steer に含まれること。
+F1: 影響を問う質問では症状語（落ちる/止まる/エラー等）をそのまま検索語にしない指示が `_prompt_mcp` に含まれること。
 F2: ①lens 別の具体基準（影響分析で候補が割れる/確実0件）②「確認してから進めて」で必ず ask_user から
     始める③S2 の確認ID ガードが上の指示より優先される旨が `_prompt_mcp`／`_DESC_ASK`／AGENTS_MD に
     含まれること。
@@ -26,15 +25,6 @@ def test_prompt_mcp_impact_query_plan_and_no_symptom_words():
         assert "トラブルシュート" in prompt                             # 原因調査明示時のみ症状語可
 
 
-def test_facts_impact_steer_points_to_connection_not_symptoms():
-    # 構造的な影響0件（presumed のみ）で steer が付く＝接続の確認へ誘導・症状語を追わない
-    # （K12・2026-09-04-グラフのソース正典化.md §4＝確実/要確認の2値判定は撤去済み・全件同格）。
-    env = {"data": {"start": "税率", "items": [],
-                    "presumed": [{"name": "夜間バッチ運用", "category": "機能"}]},
-           "summary": {"total": 0, "presumed": 1, "code_silent": True}}
-    facts = A._facts("impact", env)
-    assert "接続" in facts and "経路" in facts
-    assert "症状語をそのまま探さない" in facts
 
 
 # ---- F2-1: lens 別の具体基準 ----

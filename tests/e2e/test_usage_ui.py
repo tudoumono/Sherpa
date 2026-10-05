@@ -5,20 +5,39 @@ import re
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-
 from mock_api import USAGE_STATS_DEFAULT, install_api_mocks
+from playwright.sync_api import expect
+
+INVALID_RANGE = "開始日は終了日以前にしてください"
+
+
+def _stats():
+    return json.loads(json.dumps(USAGE_STATS_DEFAULT))
+
+
+def _tab(page, name):
+    return page.get_by_role("tab", name=name, exact=True)
+
+
+def _open(page, web_base_url, path="usage.html", **mock_kw):
+    records = install_api_mocks(page, **mock_kw)
+    page.goto(f"{web_base_url}/{path}")
+    return records
+
+
+def _limit_cells(page):
+    heads = page.locator("#limits-tbody").locator("xpath=../thead//th")
+    return heads, [dict(zip(heads.all_text_contents(), row.locator("td").all_text_contents()))
+                   for row in page.locator("#limits-tbody tr").all()]
 
 
 def test_usage_trends_section_renders_all_new_metrics(page, web_base_url):
-    """バッチ3（2026-07-03）: 「利用の傾向」セクション（ゼロヒット率・ヒートマップ・world別・
-    頭脳別・週次アクティブ+再訪率・原本DL数）が実データで表示される。"""
-    from playwright.sync_api import expect
-
-    stats = json.loads(json.dumps(USAGE_STATS_DEFAULT))
+    """「利用の傾向」（ゼロヒット率・ヒートマップ・資料フォルダ別・頭脳別・週次アクティブ+再訪率・原本DL数）と
+    トークンが実データで表示される。"""
+    stats = _stats()
     stats["quality_runs"]["by_rounds"][1]["condition"] = "depth2-quick"
     stats["quality_runs"]["by_rounds"][1]["rounds"] = 0
-    install_api_mocks(page, usage_stats=stats)
-    page.goto(f"{web_base_url}/usage.html")
+    _open(page, web_base_url, usage_stats=stats)
 
     review = page.locator("#review-stats")
     expect(review.locator("table")).to_have_count(3)
@@ -34,39 +53,26 @@ def test_usage_trends_section_renders_all_new_metrics(page, web_base_url):
     expect(review).to_contain_text("次の見直しへ: 4")
     expect(review).to_contain_text("0.36")
 
-    # ゼロヒット率タイル（totals.zero_hit.rate=0.2142... → 21%）。
-    expect(page.locator("#t-zerohit")).to_have_text("21%")
-
-    # ランキング表にゼロヒット率列が追加され、seed どおりの値が入る（admin=27%, sato=0%）。
+    expect(page.locator("#t-zerohit")).to_have_text("21%")   # rate=0.2142...
     admin_row = page.locator("#usage-tbody tr.u-row", has_text="admin").first
     expect(admin_row.locator(".zhr-cell")).to_have_text("27%")
 
-    page.get_by_role("tab", name="利用者", exact=True).click()
-    # ヒートマップ: 空状態が消え、SVG が描画される（セルが1つ以上存在する）。
+    _tab(page, "利用者").click()
     expect(page.locator("#heatmap-empty")).to_be_hidden()
     expect(page.locator("#heatmap-svg .cell")).to_have_count(24 * 7)
-
-    # world別横棒: 空状態が消え、"test" ラベルの棒が描画される。
     expect(page.locator("#chart-world-empty")).to_be_hidden()
     expect(page.locator("#chart-world-svg")).to_contain_text("test")
-
-    # 頭脳別横棒＋常設凡例（色だけに頼らない）。
     expect(page.locator("#chart-provider-empty")).to_be_hidden()
-    legend = page.locator("#chart-provider-legend")
+    legend = page.locator("#chart-provider-legend")   # 常設凡例（色だけに頼らない）
     expect(legend).to_contain_text("簡易（AIなし）")
     expect(legend).to_contain_text("OpenAI API")
     expect(legend).to_contain_text("Codex")
-
-    # 週次アクティブユーザー＋再訪率（seed: revisit_rate=0.5 → 50%）。
     expect(page.locator("#chart-weekly-empty")).to_be_hidden()
     expect(page.locator("#revisit-rate-val")).to_have_text("50%")
-
-    # 原本ダウンロード数（日別トレンド）＋見出し脇の期間合計（RV LOW再検証・seed: downloads.total=5）。
     expect(page.locator("#chart-dl-empty")).to_be_hidden()
     expect(page.locator("#dl-total-badge")).to_have_text("期間合計 5件")
 
-    page.get_by_role("tab", name="トークン", exact=True).click()
-    # F3（2026-07-07／2026-07-08 金額表示は撤去）: トークン（tiles・頭脳/モデル別表・日別チャート）。
+    _tab(page, "トークン").click()
     expect(page.locator("#t-tok-input")).to_have_text("12,000")
     expect(page.locator("#t-tok-output")).to_have_text("1,800")
     expect(page.locator("#chart-tokin-empty")).to_be_hidden()
@@ -77,10 +83,8 @@ def test_usage_trends_section_renders_all_new_metrics(page, web_base_url):
 
 
 def test_usage_trends_section_handles_empty_data_without_crashing(page, web_base_url):
-    """空データ（dev DB 掃除済み・少数データでも壊れない描画が必須）: 各セクションが正直に
-    空状態を表示し、JS エラーで画面全体が壊れない。"""
-    from playwright.sync_api import expect
-
+    """空データでも各セクションが正直に空状態を表示し、JS エラーで画面全体が壊れない。
+    対応するキーが応答に全く無くても（旧 API 応答/計測前）壊れない。"""
     empty = {
         "users": [], "totals": {"turns": 0, "active_users": 0, "conversations": 0},
         "daily": [], "period": {"start": "2026-06-04", "end": "2026-07-03", "days": 30},
@@ -89,146 +93,107 @@ def test_usage_trends_section_handles_empty_data_without_crashing(page, web_base
         "retention": {"weekly": [], "revisit_rate": None},
         "downloads": {"total": 0, "daily": []},
     }
-    install_api_mocks(page, usage_stats=empty)
-    page.goto(f"{web_base_url}/usage.html")
+    _open(page, web_base_url, usage_stats=empty)
 
     expect(page.locator("#t-zerohit")).to_have_text("対象なし")
-    page.get_by_role("tab", name="利用者", exact=True).click()
+    _tab(page, "利用者").click()
     expect(page.locator("#usage-tbody .empty-row")).to_be_visible()
     expect(page.locator("#review-stats table")).to_have_count(3)
-    page.get_by_role("tab", name="品質", exact=True).click()
+    _tab(page, "品質").click()
     expect(page.locator("#review-stats .hint", has_text="見直しの機能はこの環境では未導入です。")).to_be_visible()
-    expect(page.locator("#review-stats tbody td")).to_have_text([
-        "この期間の記録はありません。",
-        "この期間の記録はありません。",
-        "この期間の記録はありません。",
-    ])
+    expect(page.locator("#review-stats tbody td")).to_have_text(["この期間の記録はありません。"] * 3)
 
-    page.get_by_role("tab", name="利用者", exact=True).click()
-    expect(page.locator("#heatmap-empty")).to_be_visible()
-    expect(page.locator("#chart-world-empty")).to_be_visible()
-    expect(page.locator("#chart-provider-empty")).to_be_visible()
-    expect(page.locator("#chart-weekly-empty")).to_be_visible()
-    expect(page.locator("#chart-dl-empty")).to_be_visible()
+    _tab(page, "利用者").click()
+    for empty_id in ("heatmap", "chart-world", "chart-provider", "chart-weekly", "chart-dl"):
+        expect(page.locator(f"#{empty_id}-empty")).to_be_visible()
     expect(page.locator("#dl-total-badge")).to_have_text("期間合計 0件")
     expect(page.locator("#revisit-rate-val")).to_have_text("算出できません（データ不足）")
-
-    # 空状態でも「利用の傾向」の各カードタイトル自体は表示され続けている（画面が壊れていない）。
-    expect(page.locator("text=フォルダ別利用量")).to_be_visible()
+    expect(page.locator("text=フォルダ別利用量")).to_be_visible()   # カードタイトル自体は表示され続ける
     expect(page.locator("text=頭脳（AI）別利用比率")).to_be_visible()
 
-    # F3: トークン表示も空状態で壊れない（tokens キーが無い応答＝undefined でも空表示）。
-    page.get_by_role("tab", name="トークン", exact=True).click()
+    _tab(page, "トークン").click()
     expect(page.locator("#t-tok-input")).to_have_text("未取得")
     expect(page.locator("#chart-tokin-empty")).to_be_visible()
     expect(page.locator("#token-model-tbody .empty-row")).to_be_visible()
-
-    # 新6項目も、対応するキーが応答に全く無くても（旧 API 応答/計測前）壊れない。
-    # (1)(4) 用途別・ユーザー別×用途別＝空/不在ならカードごと隠す（token-kind-card と同じ流儀）。
-    expect(page.locator("#token-kind-card")).to_be_hidden()
+    expect(page.locator("#token-kind-card")).to_be_hidden()   # 空/不在ならカードごと隠す
     expect(page.locator("#token-user-kind-card")).to_be_hidden()
-    # (2) 終了理由の分布＝既存の頭脳別/world別バーと同じ空状態表示・停止数バッジは0件表示。
-    page.get_by_role("tab", name="品質", exact=True).click()
+
+    _tab(page, "品質").click()
     expect(page.locator("#chart-stopkind-empty")).to_be_visible()
     expect(page.locator("#stopkind-total-badge")).to_have_text("利用者停止 未取得")
-    # (3) 会話あたりのやり取り回数・resume率＝サマリタイルと同じ「—」表示（カードは隠さない）。
     expect(page.locator("#t-turns-avg")).to_have_text("未取得")
     expect(page.locator("#t-turns-max")).to_have_text("未取得")
     expect(page.locator("#t-resume-rate")).to_have_text("未取得")
-    # (6) 回答時間の分布＝`overall` 行はつねに存在する契約なので「全体」行だけ「—」で描画される。
-    rt_tbody = page.locator("#response-time-tbody")
+    rt_tbody = page.locator("#response-time-tbody")   # `overall` 行はつねに存在する契約
     expect(rt_tbody).to_contain_text("全体")
     expect(rt_tbody).to_contain_text("未取得")
-    # (5) 会話別上位＝空/不在ならカードごと隠す。
     expect(page.locator("#conversations-top-card")).to_be_hidden()
-    # 打ち切りの内訳＝limits キーが応答に無くても表は空のまま（クラッシュしない）。
-    expect(page.locator("#limits-tbody tr")).to_have_count(0)
+    expect(page.locator("#limits-tbody tr")).to_have_count(0)   # limits キーが無くてもクラッシュしない
 
 
 def test_usage_stat4_new_metrics_render_with_default_seed(page, web_base_url):
-    """（docs/archive/2026-09-12-利用統計の拡充2.md §2 (c)）: 見えていなかった6項目が
-    USAGE_STATS_DEFAULT の値どおりに描画される。"""
-    from playwright.sync_api import expect
+    """用途別・終了理由・会話あたりのやり取り・ユーザー別×用途別・会話別上位・回答時間が既定 seed の値どおりに描画される。"""
+    _open(page, web_base_url, "usage.html#tokens?days=30")
 
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html#tokens?days=30")
-
-    # (1) 用途別（kind）表に所要時間の列（合計・平均・件数）。
+    expect(page.locator("#token-kind-card")).to_be_visible()
     kind_tbody = page.locator("#token-kind-tbody")
+    expect(kind_tbody).to_contain_text("会話")
+    expect(kind_tbody).to_contain_text("依頼の仕分け")
     chat_row = kind_tbody.locator("tr", has_text="会話").first
     expect(chat_row).to_contain_text("未計測")        # chat 行は所要時間を持たない（API 契約＝None）
     expect(chat_row).not_to_contain_text("秒")
-    embed_row = kind_tbody.locator("tr", has_text="検索の索引づくり")
-    expect(embed_row).to_contain_text("未計測")       # elapsed_ms_total=None（報告不能マーカー）
+    embed_row = kind_tbody.locator("tr", has_text="検索の索引づくり")   # 報告不能マーカー（null）＝未計測
+    expect(embed_row).to_contain_text("検索の索引づくり")
+    expect(embed_row).to_contain_text("未計測")
 
-    # (2) 終了理由の分布（平文ラベル）と停止数のバッジ。
     stopkind_svg = page.locator("#chart-stopkind-svg")
     expect(page.locator("#chart-stopkind-empty")).to_be_hidden()
-    expect(stopkind_svg).to_contain_text("完了")
-    expect(stopkind_svg).to_contain_text("14")
-    expect(stopkind_svg).to_contain_text("調査の上限")
-    expect(stopkind_svg).to_contain_text("不明")
+    for text in ("完了", "14", "調査の上限", "不明"):
+        expect(stopkind_svg).to_contain_text(text)
     expect(page.locator("#stopkind-total-badge")).to_have_text("利用者停止 1件")
 
-    # (3) 会話あたりのやり取り回数（avg/median/max/p90）と resume 率。
     expect(page.locator("#t-turns-avg")).to_have_text("3.0")
     expect(page.locator("#t-turns-median")).to_have_text("2.0")
     expect(page.locator("#t-turns-p90")).to_have_text("5.0")
     expect(page.locator("#t-turns-max")).to_have_text("6")
     expect(page.locator("#t-resume-rate")).to_have_text("50%")
 
-    # (4) ユーザー別×用途別内訳。
-    page.get_by_role("tab", name="トークン", exact=True).click()
+    _tab(page, "トークン").click()
     expect(page.locator("#token-user-kind-card")).to_be_visible()
-    ukind_tbody = page.locator("#token-user-kind-tbody")
-    admin_intent_row = ukind_tbody.locator("tr", has_text="依頼の仕分け").first
+    admin_intent_row = page.locator("#token-user-kind-tbody").locator("tr", has_text="依頼の仕分け").first
     expect(admin_intent_row).to_contain_text("管理者")
     expect(admin_intent_row).to_contain_text("0.9秒")   # elapsed_ms_total=900
     expect(admin_intent_row).to_contain_text("0.3秒")   # elapsed_ms_avg=300.0
 
-    # (5) 会話別上位（トークン合計降順・1行目は admin の会話501）。会話 id はテキストのみ（リンクではない）。
     expect(page.locator("#conversations-top-card")).to_be_visible()
-    top_rows = page.locator("#conversations-top-tbody tr")
-    first_row = top_rows.first
+    first_row = page.locator("#conversations-top-tbody tr").first   # トークン合計降順・admin の会話501
     expect(first_row).to_contain_text("#501")
     expect(first_row).to_contain_text("管理者")
     expect(first_row).to_contain_text("test")
-    expect(first_row).to_contain_text("4.5秒")   # response_time_avg_ms=4500.0
+    expect(first_row).to_contain_text("4.5秒")
     expect(first_row.locator("a")).to_have_count(0)   # 会話 id はリンクにしない
 
-    # (6) 回答時間の分布（全体＋経路別）。
     rt_tbody = page.locator("#response-time-tbody")
     expect(rt_tbody).to_contain_text("全体")
-    overall_row = rt_tbody.locator("tr", has_text="全体")
-    expect(overall_row).to_contain_text("9.0秒")   # p90=9000.0
-    codex_row = rt_tbody.locator("tr", has_text="Codex")
-    expect(codex_row).to_contain_text("4.5秒")   # avg=4500.0
+    expect(rt_tbody.locator("tr", has_text="全体")).to_contain_text("9.0秒")   # p90
+    expect(rt_tbody.locator("tr", has_text="Codex")).to_contain_text("4.5秒")   # avg
 
 
 def test_usage_limits_table_renders_by_provider(page, web_base_url):
-    """打ち切りの内訳（`InvestigationState.limits`・経路別）が USAGE_STATS_DEFAULT の値どおりに描画される。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html#quality?days=30")
+    """打ち切りの内訳（経路別）が既定 seed の値どおりに描画される。"""
+    _open(page, web_base_url, "usage.html#quality?days=30")
 
     limits_tbody = page.locator("#limits-tbody")
     codex_row = limits_tbody.locator("tr", has_text="Codex")
-    expect(codex_row).to_contain_text("10")     # turns
-    expect(codex_row).to_contain_text("3件（計5回）")     # tool_result_clipped
-    expect(codex_row).to_contain_text("1件")              # total_budget_hit（bool 系・合計は出さない）
-    expect(codex_row).to_contain_text("4件（計9回）")     # search_truncated
-    expect(codex_row).to_contain_text("2件（計3回）")     # auto_continues
-    openai_row = limits_tbody.locator("tr", has_text="OpenAI")
-    expect(openai_row).to_contain_text("0件（計0回）")    # tool_result_clipped=0
-    # S2/S4: 自動引き上げ・バックエンド不調の列も見出しと値が並ぶ（bool 系＝件数のみ）。
-    heads = page.locator("#limits-tbody").locator("xpath=../thead//th")
-    expect(heads).to_contain_text(["自動で深く調べた"])
-    expect(heads).to_contain_text(["全文検索が使えなかった"])
-    expect(heads).to_contain_text(["グラフが使えなかった"])
-    expect(heads).to_contain_text(["グラフは再取り込み待ち"])
-    codex_cells = dict(zip(heads.all_text_contents(), codex_row.locator("td").all_text_contents()))
-    api_cells = dict(zip(heads.all_text_contents(), openai_row.locator("td").all_text_contents()))
+    expect(codex_row).to_contain_text("10")
+    expect(codex_row).to_contain_text("3件（計5回）")
+    expect(codex_row).to_contain_text("1件")              # bool 系・合計は出さない
+    expect(codex_row).to_contain_text("4件（計9回）")
+    expect(codex_row).to_contain_text("2件（計3回）")
+    expect(limits_tbody.locator("tr", has_text="OpenAI")).to_contain_text("0件（計0回）")
+    heads, (codex_cells, api_cells) = _limit_cells(page)
+    for head in ("自動で深く調べた", "全文検索が使えなかった", "グラフが使えなかった", "グラフは再取り込み待ち"):
+        expect(heads).to_contain_text([head])
     assert codex_cells["履歴の整理"] == "未計測"
     assert codex_cells["清書の打ち切り"] == "未計測"
     assert codex_cells["自動で深く調べた"] == "未計測"
@@ -243,127 +208,23 @@ def test_usage_limits_table_renders_by_provider(page, web_base_url):
     expect(tooltip).to_have_attribute("title", re.compile(r"Codexで数える列.*API経路で数える列"))
 
 
-def test_usage_chat_notice_uses_plain_language_not_jargon(page, web_base_url):
-    """統計チャットの案内文は honest_failure 等の専門語を使わず、平文（「見つからないと正直に
-    答えた割合」）で説明する（`docs/04-画面の原則.md`＝専門用語ゼロ）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-
-    notice = page.locator(".uc-send-notice")
-    expect(notice).to_contain_text("見つからないと正直に答えた割合")
-    expect(notice).not_to_contain_text("honest_failure")
-
-
-def test_usage_chat_shows_server_notes_as_hints(page, web_base_url):
-    """サーバ応答の `notes`（例: 改善ログの要約を取得できなかった旨）は黙って捨てず、
-    回答の下にヒントとして表示する。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-
-    def handle_usage_chat(route):
-        route.fulfill(content_type="application/json", body=json.dumps({
-            "answer": "今月は特に目立った変化はありません。",
-            "notes": ["改善ログの要約を取得できませんでした。"],
-        }))
-    page.route("**/admin/usage/chat", handle_usage_chat)
-
-    page.locator("#usage-chat-input").fill("今月はどう？")
-    page.locator("#usage-chat-send").click()
-
-    messages = page.locator("#usage-chat-messages")
-    expect(messages).to_contain_text("今月は特に目立った変化はありません。")
-    expect(messages.locator(".uc-hint")).to_contain_text("改善ログの要約を取得できませんでした。")
-
-
-def test_usage_chat_shows_tool_calls_as_hints(page, web_base_url):
-    """サーバ応答の `tool_calls`（実際に呼んだ調査ツールの名前と引数）は、
-    既存の notes と同じ「調べた内容」ヒント欄に1行ずつ表示する。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-
-    def handle_usage_chat(route):
-        route.fulfill(content_type="application/json", body=json.dumps({
-            "answer": "先週は sato さんが一番多く使っています。",
-            "notes": [],
-            "tool_calls": [{"name": "usage_by_user", "args": {"days": 7, "uid": "sato"}}],
-        }))
-    page.route("**/admin/usage/chat", handle_usage_chat)
-
-    page.locator("#usage-chat-input").fill("先週は誰が一番使った？")
-    page.locator("#usage-chat-send").click()
-
-    messages = page.locator("#usage-chat-messages")
-    expect(messages).to_contain_text("先週は sato さんが一番多く使っています。")
-    expect(messages.locator(".uc-hint")).to_contain_text("調べた内容: usage_by_user(days=7, uid=sato)")
-
-
-def test_token_kind_table_renders(page, web_base_url):
-    """S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: 「用途別」表に日本語 kind ラベルと、
-    usage を報告しないプロバイダ（Gemini の embed）の null トークンに対する「—」表示を確認する。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)   # USAGE_STATS_DEFAULT（tokens.by_kind に chat×2（codex/gemini）/intent/embed の 4 行を含む）
-    page.goto(f"{web_base_url}/usage.html#tokens?days=30")
-
-    kind_tbody = page.locator("#token-kind-tbody")
-    expect(page.locator("#token-kind-card")).to_be_visible()
-    expect(kind_tbody).to_contain_text("会話")          # kind=chat
-    expect(kind_tbody).to_contain_text("依頼の仕分け")     # kind=intent
-    expect(kind_tbody).to_contain_text("検索の索引づくり")  # kind=embed
-
-    # gemini/embed 行はトークン列が全て null（報告不能マーカー）＝「—」で表示される。
-    embed_row = kind_tbody.locator("tr", has_text="検索の索引づくり")
-    expect(embed_row).to_contain_text("未計測")
-
-
 def test_token_kind_table_hidden_when_absent(page, web_base_url):
     """`tokens.by_kind` が無い応答（旧 API 互換）でも pageerror なく「用途別」カードが隠れる。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page, usage_stats={})
-    page.goto(f"{web_base_url}/usage.html#tokens?days=30")
-
+    _open(page, web_base_url, "usage.html#tokens?days=30", usage_stats={})
     expect(page.locator("#token-kind-card")).to_be_hidden()
-
-
-def test_usage_period_switch_refetches_and_rerenders_trends(page, web_base_url):
-    """期間切替（7/30/90日）に「利用の傾向」セクションも追従する。"""
-    from playwright.sync_api import expect
-
-    seven_day = dict(USAGE_STATS_DEFAULT)
-    seven_day["period"] = {"start": "2026-06-27", "end": "2026-07-03", "days": 7}
-    seven_day["zero_hit"] = {"knowledge_turns": 2, "zero_hit_turns": 1, "rate": 0.5}
-
-    records = install_api_mocks(page, usage_stats=seven_day)
-    page.goto(f"{web_base_url}/usage.html")
-    expect(page.locator("#t-zerohit")).to_have_text("50%")   # 初期表示（既定30日）でも同じモックが返る
-
-    page.locator("[data-days='7']").click()
-    expect(page.locator(".period-bar [data-days='7']")).to_have_class(re.compile(r"\bon\b"))
-    assert records["admin_usage_stats"][-1]["days"] == ["7"]
-    expect(page.locator("#t-zerohit")).to_have_text("50%")
 
 
 def test_usage_custom_period_sends_jst_half_open_range(page, web_base_url):
     """開始日・終了日の指定は JST の [開始日 00:00, 終了日の翌日 00:00) で取得し、URL にも残す。
     開始日が終了日より後なら取得せずに理由を出す。"""
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html#tokens?days=30")
+    records = _open(page, web_base_url, "usage.html#tokens?days=30")
     expect(page.locator("#usage-stat-panels")).to_be_visible()
     sent = len(records["admin_usage_stats"])
 
     page.locator("#period-start").fill("2026-02-10")
     page.locator("#period-end").fill("2026-02-01")
     page.locator("#period-range button[type=submit]").click()
-    expect(page.locator("#period-range-error")).to_have_text("開始日は終了日以前にしてください")
+    expect(page.locator("#period-range-error")).to_have_text(INVALID_RANGE)
     assert len(records["admin_usage_stats"]) == sent
 
     page.locator("#period-start").fill("2026-01-01")
@@ -378,793 +239,68 @@ def test_usage_custom_period_sends_jst_half_open_range(page, web_base_url):
     assert query["to"] == ["2026-02-01T00:00:00+09:00"]
     assert "days" not in query
 
-    # URL に直接書いた不正な期間も、取得せずに理由を出す（開いた直後も同じ）。
+    # URL に直接書いた不正な期間も、取得せずに理由を出す（開いた直後も同じ）
     sent = len(records["admin_usage_stats"])
     page.goto(f"{web_base_url}/usage.html#tokens?start=2026-02-10&end=2026-02-01")
-    expect(page.locator("#period-range-error")).to_have_text("開始日は終了日以前にしてください")
+    expect(page.locator("#period-range-error")).to_have_text(INVALID_RANGE)
     page.reload()
-    expect(page.locator("#period-range-error")).to_have_text("開始日は終了日以前にしてください")
+    expect(page.locator("#period-range-error")).to_have_text(INVALID_RANGE)
     expect(page.locator("#usage-stat-panels")).to_be_hidden()
     page.locator("#usage-tab-quality").click()
     expect(page).to_have_url(re.compile(r"#quality\?start=2026-02-10&end=2026-02-01$"))
     assert len(records["admin_usage_stats"]) == sent
 
 
-# ===== STAT-2: 統計チャットの「今回だけ」一時プロバイダ切替（保存しない・リクエスト単位） =====
-# `POST /admin/usage/chat` は install_api_mocks の共通ハンドラに含まれないため、ここで個別に
-# page.route を足す（既存の graph.html/ingest.html の e2e と同じ流儀・Playwright は後から登録した
-# 方を先にマッチさせるため、install_api_mocks より後に登録すれば共通ハンドラを迂回できる）。
-
-def _handle_usage_chat(sent_bodies, answer="テストの回答です", default_provider_used="openai",
-                       endpoint_kind=None, tool_calls=None):
-    """応答は実サーバと同じ形（`answer`/`provider_used`/`endpoint_kind`/`tool_calls`）。
-    `provider_used` はリクエストの `provider`（一時上書き）があればそれを、無ければ
-    `default_provider_used`（既定・実サーバの `usage_chat.effective` に相当）を返す——
-    実サーバの「実際に使った provider を返す」契約を素直に模す。`tool_calls`（
-    省略時は空リスト）は実際に呼んだ調査ツールの名前と引数。"""
-    def _handle(route):
-        body = json.loads(route.request.post_data or "{}")
-        sent_bodies.append(body)
-        provider_used = body.get("provider") or default_provider_used
-        route.fulfill(status=200, content_type="application/json",
-                      body=json.dumps({"answer": answer, "provider_used": provider_used,
-                                       "endpoint_kind": endpoint_kind,
-                                       "tool_calls": tool_calls or []}))
-    return _handle
-
-
-def test_usage_chat_notice_shows_configured_provider_and_default_send_omits_override(page, web_base_url):
-    """通知欄が管理画面の専用設定（GET /admin/settings の usage_chat.effective）を反映し、
-    「今回だけ」トグルを触らずに送信すると provider を送らない（管理画面の設定どおりに任せる）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)   # SYSTEM_SETTINGS_VIEW.usage_chat.effective == "openai"（既定）
-    sent_bodies: list = []
-    page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies))
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-    expect(page.locator('[data-uc-provider=""]')).to_have_attribute("aria-pressed", "true")
-
-    page.locator("#usage-chat-input").fill("今月一番使っているユーザーは？")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages")).to_contain_text("テストの回答です")
-    assert "provider" not in sent_bodies[-1], "既定のまま送信した場合は provider を送らない"
-
-
-def test_usage_chat_temporary_toggle_overrides_one_send_without_persisting(page, web_base_url):
-    """「今回だけ」トグルは画面の一時状態のみ（保存しない）: 選ぶとその回の送信にだけ
-    provider を添える。「既定」へ戻すと以後の送信は再び provider を送らない。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    sent_bodies: list = []
-    page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies, answer="回答"))
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-
-    ollama_btn = page.locator('[data-uc-provider="ollama"]')
-    ollama_btn.click()
-    expect(ollama_btn).to_have_attribute("aria-pressed", "true")
-    expect(page.locator('[data-uc-provider=""]')).to_have_attribute("aria-pressed", "false")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: ローカル（Ollama）")
-
-    page.locator("#usage-chat-input").fill("質問1")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages")).to_contain_text("回答")
-    assert sent_bodies[-1].get("provider") == "ollama"
-
-    page.locator('[data-uc-provider=""]').click()
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-
-    page.locator("#usage-chat-input").fill("質問2")
-    page.locator("#usage-chat-send").click()
-    # 「回答」は1回目の送信で既に画面に出ているため、コンテナ全体への contain_text だと
-    # 2回目の完了を待たずに（レースして）真になる。直近の吹き出し（.msg の最後の要素）だけを
-    # 見て、2回目の応答が実際に反映されるまで待つ。
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("回答")
-    assert "provider" not in sent_bodies[-1], "「既定」へ戻したので一時上書きは尾を引かない"
-
-
-def test_usage_chat_shows_loading_state_before_settings_resolve_and_disables_send(page, web_base_url):
-    """設定取得（GET /admin/settings）が完了するまで、通知欄は「確認中…」を表示し、
-    'OpenAI' 等の未確認の値を先出ししない。送信ボタンも無効のまま
-    （「今回だけ」上書きを選ぶまでは送信させない）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    held: dict = {}
-
-    def hold_settings(route):
-        if route.request.method == "GET":
-            held["route"] = route   # fulfill せず保留＝取得中の状態を作る
-            return
-        route.fallback()
-    page.route("**/admin/settings", hold_settings)
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("確認中…")
-    expect(page.locator("#usage-chat-send")).to_be_disabled()
-
-    held["route"].fallback()   # install_api_mocks の通常応答へ解放
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-    expect(page.locator("#usage-chat-send")).to_be_enabled()
-
-
-def test_usage_chat_settings_fetch_failure_shows_error_and_disables_send(page, web_base_url):
-    """設定取得が失敗したら、通知欄に明示エラーを表示し送信ボタンを
-    無効のままにする（黙って既定 'openai' 扱いで送信させない）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-
-    def fail_settings(route):
-        if route.request.method == "GET":
-            route.fulfill(status=500, content_type="application/json", body=json.dumps({"detail": "boom"}))
-            return
-        route.fallback()
-    page.route("**/admin/settings", fail_settings)
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text(
-        "送信先を取得できませんでした（再読み込みしてください）")
-    expect(page.locator("#usage-chat-send")).to_be_disabled()
-
-    # 「今回だけ」上書きを選べば、その送信先は確定しているため送信できる（設定取得の成否に
-    # 関わらず、明示的な上書きは常に優先する）。
-    page.locator('[data-uc-provider="ollama"]').click()
-    expect(page.locator("#usage-chat-send")).to_be_enabled()
-
-
-def test_usage_chat_notice_shows_cloud_openai_compatible_label_for_azure_endpoint(page, web_base_url):
-    """OpenAI の接続先が実際には Azure/その他 OpenAI 互換エンドポイントの場合、「OpenAI」ではなく
-    実態に即した表示にする（`openai_endpoint.effective.kind` に合わせる・
-    Azure 等へ送っているのに OpenAI 社そのものへ送っていると誤解させない）。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["openai_endpoint"]["effective"]["kind"] = "azure"
-    install_api_mocks(page, system_settings=settings)
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: クラウド（OpenAI 互換）")
-
-
-def test_usage_chat_refetches_settings_before_default_send_and_updates_note(page, web_base_url):
-    """provider を省略する送信は、送信直前に管理設定を再取得し、
-    ページ読み込み後に他セッションが変更した usage_chat_provider を通知欄へ反映する
-    （表示と実際の送信先の食い違いを防ぐ）。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    install_api_mocks(page)
-    calls = {"n": 0}
-
-    def settings_route(route):
-        if route.request.method != "GET":
-            route.fallback()
-            return
-        calls["n"] += 1
-        if calls["n"] == 1:
-            route.fallback()   # 初回（ページ読み込み時）は通常のモック応答（openai）
-            return
-        # 2回目以降（送信直前の再取得）は他セッションが ollama へ変更した状況を模す。
-        changed = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-        changed["usage_chat"] = {"configured": "ollama", "effective": "ollama",
-                                 "default": "openai", "providers": ["openai", "ollama"]}
-        route.fulfill(status=200, content_type="application/json", body=json.dumps(changed))
-    page.route("**/admin/settings", settings_route)
-    sent_bodies: list = []
-    # 送信直前の再取得後は system_settings が ollama を返す想定なので、POST 応答の
-    # `provider_used`（省略送信＝実サーバが専用設定から解決する値）も ollama に揃える
-    # （実サーバなら両者は常に同じ設定を見るため一致する）。
-    page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies, default_provider_used="ollama"))
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-
-    page.locator("#usage-chat-input").fill("質問")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages")).to_contain_text("テストの回答です")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: ローカル（Ollama）")
-    assert "provider" not in sent_bodies[-1], "省略のまま（サーバの現在設定に委ねる）"
-    assert calls["n"] == 2, "初回読み込み＋送信直前の再取得の2回のはず"
-
-
-def test_usage_chat_notice_updates_from_response_provider_used_after_send(page, web_base_url):
-    """送信前の表示（予定）と応答の `provider_used` が食い違う場合、送信後の表示は応答の値を
-    信頼する（GET と POST の間の競合を応答時点の確定値で吸収する）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)   # usage_chat.effective == "openai"（送信前の「予定」表示はこちら）
-    sent_bodies: list = []
-    # 応答は pre-send の予定（openai）と異なる値（ollama）を返す＝実際に食い違いが起きた状況を模す。
-    page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies, default_provider_used="ollama"))
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")   # 送信前は「予定」
-
-    page.locator("#usage-chat-input").fill("質問")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages")).to_contain_text("テストの回答です")
-    # 応答の provider_used（ollama）で表示が確定する。
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: ローカル（Ollama）")
-
-
-def test_usage_chat_blocks_default_send_when_saved_value_invalid(page, web_base_url):
-    """`usage_chat.effective` が選択肢に無い（保存値が不正）場合、
-    既定送信（provider 省略）は送信不可のまま——「今回だけ」で明示指定した場合のみ送信できる。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["usage_chat"] = {"configured": "gemini", "effective": "(不正な保存値)",
-                              "default": "ollama", "providers": ["openai", "ollama"]}
-    install_api_mocks(page, system_settings=settings)
-    sent_bodies: list = []
-    page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies, default_provider_used="ollama"))
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_contain_text("不正です")
-    expect(page.locator("#usage-chat-send")).to_be_disabled()
-
-    # 「今回だけ」で明示指定すれば送信できる（上書き自体が送信先を確定させるため）。
-    page.locator('[data-uc-provider="ollama"]').click()
-    expect(page.locator("#usage-chat-send")).to_be_enabled()
-    page.locator("#usage-chat-input").fill("質問")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages")).to_contain_text("テストの回答です")
-    assert sent_bodies[-1].get("provider") == "ollama"
-
-
-def test_usage_chat_override_send_in_flight_toggle_does_not_change_sent_request(page, web_base_url):
-    """送信中にトグルを操作しても、実際に送るリクエストの provider は送信開始時点の値のまま。
-    「次の送信先」（現在の選択・`#usage-chat-provider-note`）と「前回の送信先」（直前に実際に
-    送った確定値・`#usage-chat-last-sent-note`）は別状態・別表示のため、応答到着後も互いを
-    上書きしない（可変な現在のトグル状態を応答処理の時点で読み直すと、送信中の操作で
-    「実際に送ったのとは違う値」を参照してしまう）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    held: dict = {}
-
-    def hold_chat(route):
-        if route.request.method == "POST":
-            held["route"] = route   # fulfill せず保留＝送信中の状態を作る
-            return
-        route.fallback()
-    page.route("**/admin/usage/chat", hold_chat)
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-
-    page.locator('[data-uc-provider="ollama"]').click()
-    page.locator("#usage-chat-input").fill("質問")
-    page.locator("#usage-chat-send").click()
-    # 上書き送信も送信直前に設定を再取得してから POST するため、POST 到達までの間に
-    # 追加のラウンドトリップが挟まる——固定時間内でポーリングして待つ（`expect_request` は
-    # この追加の非同期区間と相性が悪く、まれに検出できないことがある）。
-    import time
-    deadline = time.time() + 5
-    while "route" not in held and time.time() < deadline:
-        page.wait_for_timeout(20)
-    assert "route" in held, "送信（POST）が捕捉されているはず"
-
-    # 送信が保留されている間に、別のトグル（openai）へ切り替える。「次の送信先」は即座に
-    # 「予定」として変わるが、既に送ってしまったリクエスト自体は送信開始時点（ollama）のまま
-    # 変わらない。
-    page.locator('[data-uc-provider="openai"]').click()
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-
-    body = json.loads(held["route"].request.post_data or "{}")
-    assert body.get("provider") == "ollama", \
-        "送信中にトグルを openai へ変えても、実際に送ったリクエストは送信開始時点の ollama のまま"
-
-    held["route"].fulfill(status=200, content_type="application/json",
-                          body=json.dumps({"answer": "回答", "provider_used": "ollama",
-                                           "endpoint_kind": None}))
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("回答")
-    # 応答の確定値（ollama・送信開始時点の上書き）は「前回の送信先」へ反映する。
-    expect(page.locator("#usage-chat-last-sent-note")).to_have_text("前回の送信先: ローカル（Ollama）")
-    # 「次の送信先」は送信中に切り替えた現在の選択（openai）のまま——確定値の到着で
-    # 上書き/巻き戻しされない。
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-
-
-def test_usage_chat_default_send_toggled_during_settings_refetch_still_uses_captured_default(
-        page, web_base_url):
-    """既定送信（provider 省略）の直前の設定再取得（GET /admin/settings）が保留されている間に
-    「今回だけ」トグルへ切り替えても、この送信は送信開始時点（override なし＝既定）のまま進む:
-    本文に provider を含めず、応答の確定値は既定側（`_ucDefaultProvider`・「前回の送信先」）へ
-    正しく反映する。可変な現在のトグル状態を再取得後に読み直すと、既定送信のはずが途中で
-    「今回だけ」上書き送信に化けてしまう。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    held: dict = {}
-    calls = {"get": 0}
-
-    def hold_settings_refetch(route):
-        if route.request.method != "GET":
-            route.fallback()
-            return
-        calls["get"] += 1
-        if calls["get"] == 1:
-            route.fallback()   # 初回（ページ読み込み時）は通常のモック応答
-            return
-        held["settings_route"] = route   # 2回目（送信直前の再取得）を保留する
-    page.route("**/admin/settings", hold_settings_refetch)
-
-    sent_bodies: list = []
-    page.route("**/admin/usage/chat",
-              _handle_usage_chat(sent_bodies, default_provider_used="openai"))
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-
-    page.locator("#usage-chat-input").fill("質問")
-    with page.expect_request("**/admin/settings"):
-        page.locator("#usage-chat-send").click()   # override なし＝既定送信として開始
-    assert "settings_route" in held, "送信直前の設定再取得（GET）が保留されているはず"
-
-    # 再取得が保留されている間に「今回だけ ollama」へ切り替える。「次の送信先」は即座に反映する。
-    page.locator('[data-uc-provider="ollama"]').click()
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: ローカル（Ollama）")
-
-    held["settings_route"].fallback()   # 再取得を解放（通常のモック応答＝openai のまま）
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("テストの回答です")
-
-    assert "provider" not in sent_bodies[-1], \
-        "送信開始時点は既定（override なし）だったため、途中でトグルを変えても provider を送らない"
-    # 応答の確定値（openai・既定側）は「前回の送信先」へ反映する。
-    expect(page.locator("#usage-chat-last-sent-note")).to_have_text("前回の送信先: OpenAI")
-    # 「次の送信先」は送信中に切り替えた現在の選択（ollama）のまま——応答で汚染されない。
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: ローカル（Ollama）")
-
-
-def test_usage_chat_override_response_azure_kind_shown_in_last_sent_not_next_send(page, web_base_url):
-    """「今回だけ」上書き送信の確定 provider_used/endpoint_kind は「前回の送信先」
-    （`#usage-chat-last-sent-note`）へ反映する（「次の送信先」＝次回の既定送信の表示は
-    汚染しない）。既定 Ollama で成功した直後に「今回だけ OpenAI」を選んで送信し、応答が
-    Azure 経由（endpoint_kind="azure"）だった場合、「前回の送信先」は「OpenAI」ではなく
-    「クラウド（OpenAI 互換）」と表示する。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["usage_chat"] = {"configured": "ollama", "effective": "ollama",
-                              "default": "ollama", "providers": ["openai", "ollama"]}
-    install_api_mocks(page, system_settings=settings)
-    sent_bodies: list = []
-
-    def chat_route(route):
-        body = json.loads(route.request.post_data or "{}")
-        sent_bodies.append(body)
-        if body.get("provider") == "openai":
-            route.fulfill(status=200, content_type="application/json",
-                          body=json.dumps({"answer": "回答2", "provider_used": "openai",
-                                           "endpoint_kind": "azure"}))
-        else:
-            route.fulfill(status=200, content_type="application/json",
-                          body=json.dumps({"answer": "回答1", "provider_used": "ollama",
-                                           "endpoint_kind": None}))
-    page.route("**/admin/usage/chat", chat_route)
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: ローカル（Ollama）")
-
-    page.locator("#usage-chat-input").fill("質問1")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("回答1")
-    expect(page.locator("#usage-chat-last-sent-note")).to_have_text("前回の送信先: ローカル（Ollama）")
-
-    page.locator('[data-uc-provider="openai"]').click()
-    page.locator("#usage-chat-input").fill("質問2")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("回答2")
-    expect(page.locator("#usage-chat-last-sent-note")).to_have_text(
-        "前回の送信先: クラウド（OpenAI 互換）")
-
-    # 「次の送信先」（既定状態）は上書き送信の確定値で汚染されていない:「既定」へ戻すと ollama のまま。
-    page.locator('[data-uc-provider=""]').click()
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: ローカル（Ollama）")
-
-
-def test_usage_chat_default_ollama_success_does_not_corrupt_openai_endpoint_kind(page, web_base_url):
-    """既定 Ollama の送信結果（endpoint_kind=null）は、GET /admin/settings 由来の openai
-    接続先種別（`_ucOpenaiEndpointKind`）を上書きしない。既定 Ollama で1回送信した直後に
-    「今回だけ OpenAI」へ切り替えても、「次の送信先」は実際の接続先設定（Azure）どおり
-    「クラウド（OpenAI 互換）」と表示する（直前の ollama 送信結果の null に化けて
-    「OpenAI」に誤表示しない）。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["usage_chat"] = {"configured": "ollama", "effective": "ollama",
-                              "default": "ollama", "providers": ["openai", "ollama"]}
-    settings["openai_endpoint"]["effective"]["kind"] = "azure"
-    install_api_mocks(page, system_settings=settings)
-    sent_bodies: list = []
-    page.route("**/admin/usage/chat",
-              _handle_usage_chat(sent_bodies, default_provider_used="ollama", endpoint_kind=None))
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: ローカル（Ollama）")
-
-    page.locator("#usage-chat-input").fill("質問1")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("テストの回答です")
-    expect(page.locator("#usage-chat-last-sent-note")).to_have_text("前回の送信先: ローカル（Ollama）")
-
-    page.locator('[data-uc-provider="openai"]').click()
-    # まだ送信していない時点の「次の送信先」——直前の ollama 送信結果に汚染されず、
-    # 設定（azure）どおりに表示する。
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: クラウド（OpenAI 互換）")
-
-
-def test_usage_chat_returning_to_default_after_override_send_still_shows_settings_error(
-        page, web_base_url):
-    """設定取得の失敗/不正状態（`_ucNoticeError`）は、「今回だけ」上書き送信が成功しても消えない
-    ——「前回の送信先」は独立した別要素で確定値を表示し、「次の送信先」欄はエラーのまま。
-    その後「既定」へ戻すと、古い送信先ではなく元のエラー案内へ戻る（送信不可の状態と表示が
-    食い違わない）。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["usage_chat"] = {"configured": "gemini", "effective": "(不正な保存値)",
-                              "default": "ollama", "providers": ["openai", "ollama"]}
-    install_api_mocks(page, system_settings=settings)
-    page.route("**/admin/usage/chat", _handle_usage_chat([], default_provider_used="ollama"))
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_contain_text("不正です")
-    expect(page.locator("#usage-chat-send")).to_be_disabled()
-
-    page.locator('[data-uc-provider="ollama"]').click()
-    page.locator("#usage-chat-input").fill("質問")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("テストの回答です")
-    expect(page.locator("#usage-chat-last-sent-note")).to_have_text("前回の送信先: ローカル（Ollama）")
-
-    page.locator('[data-uc-provider=""]').click()
-    # 送信不可のままで、表示も（古い送信先ではなく）元のエラー案内に戻る。
-    expect(page.locator("#usage-chat-send")).to_be_disabled()
-    expect(page.locator("#usage-chat-provider-note")).to_contain_text("不正です")
-
-
-def test_usage_chat_502_failure_updates_last_sent_note_since_actually_sent(page, web_base_url):
-    """502（実送信を試みたが失敗）は応答の provider_used/endpoint_kind で「前回の送信先」を
-    更新する——実際に使った送信先は確定しているため（`common.js::api` が非2xx応答の JSON
-    本文を `err.status`/`err.body` として渡す契約を利用する）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-
-    def chat_route(route):
-        route.fulfill(status=502, content_type="application/json",
-                      body=json.dumps({"detail": "送信に失敗しました", "provider_used": "openai",
-                                       "endpoint_kind": "azure"}))
-    page.route("**/admin/usage/chat", chat_route)
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-last-sent-note")).to_have_text(
-        "前回の送信先: （まだ送信していません）")
-
-    page.locator("#usage-chat-input").fill("質問")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("送信に失敗しました")
-    expect(page.locator("#usage-chat-last-sent-note")).to_have_text(
-        "前回の送信先: クラウド（OpenAI 互換）")
-
-
-def test_usage_chat_503_failure_does_not_update_last_sent_note_since_unsent(page, web_base_url):
-    """503（未送信）は応答に provider_used が入っていても「前回の送信先」を更新しない
-    ——実際には送っていないため（502 とは対称的な扱い）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-
-    def chat_route(route):
-        route.fulfill(status=503, content_type="application/json",
-                      body=json.dumps({"detail": "未接続です", "provider_used": "openai",
-                                       "endpoint_kind": "openai"}))
-    page.route("**/admin/usage/chat", chat_route)
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    page.locator("#usage-chat-input").fill("質問")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("未接続です")
-    expect(page.locator("#usage-chat-last-sent-note")).to_have_text(
-        "前回の送信先: （まだ送信していません）")
-
-
-def test_usage_chat_override_send_refetches_settings_for_fresh_endpoint_kind(page, web_base_url):
-    """「今回だけ openai」の送信も、送信直前に設定を再取得して openai 接続先種別
-    （`_ucOpenaiEndpointKind`）を確定させてから送る——既定送信と同じ経路で再取得する
-    （初回読み込み時点の古い/未確認だった接続先種別のまま送らない）。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    install_api_mocks(page)
-    calls = {"n": 0}
-
-    def settings_route(route):
-        if route.request.method != "GET":
-            route.fallback()
-            return
-        calls["n"] += 1
-        if calls["n"] == 1:
-            route.fallback()   # 初回（ページ読み込み時）: openai_endpoint.kind = "openai"（既定）
-            return
-        # 2回目以降（送信直前の再取得）: 他セッションが Azure へ切り替えた状況を模す。
-        changed = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-        changed["openai_endpoint"]["effective"]["kind"] = "azure"
-        route.fulfill(status=200, content_type="application/json", body=json.dumps(changed))
-    page.route("**/admin/settings", settings_route)
-
-    sent_bodies: list = []
-    page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies, endpoint_kind="azure"))
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    page.locator('[data-uc-provider="openai"]').click()
-    page.locator("#usage-chat-input").fill("質問")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("テストの回答です")
-    assert calls["n"] == 2, "上書き送信でも送信直前に設定を再取得するはず"
-    assert sent_bodies[-1].get("provider") == "openai"
-    # 再取得後の openai 接続先種別（azure）が「次の送信先」表示にも反映される。
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: クラウド（OpenAI 互換）")
-
-
-def test_usage_chat_override_send_blocked_when_settings_refetch_fails(page, web_base_url):
-    """「今回だけ」上書き送信も、送信直前の設定再取得（GET /admin/settings）自体が失敗したら
-    送信を中断し、明示エラーを表示する——接続先種別を確定できないまま送らない。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    calls = {"n": 0}
-
-    def fail_second_get(route):
-        if route.request.method != "GET":
-            route.fallback()
-            return
-        calls["n"] += 1
-        if calls["n"] == 1:
-            route.fallback()
-            return
-        route.fulfill(status=500, content_type="application/json", body=json.dumps({"detail": "boom"}))
-    page.route("**/admin/settings", fail_second_get)
-
-    chat_calls: list = []
-
-    def _record_and_fulfill(route):
-        chat_calls.append(route.request.post_data)
-        route.fulfill(status=200, content_type="application/json",
-                      body=json.dumps({"answer": "x", "provider_used": "ollama", "endpoint_kind": None}))
-    page.route("**/admin/usage/chat", _record_and_fulfill)
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    page.locator('[data-uc-provider="ollama"]').click()
-    page.locator("#usage-chat-input").fill("質問")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("接続先の設定を確認できなかった")
-    assert calls["n"] == 2, "上書き送信でも送信直前に再取得を試みるはず"
-    assert chat_calls == [], "設定再取得に失敗したのに実送信してはいけない"
-
-
-def test_usage_chat_override_shows_selection_while_settings_error_shown_separately(
-        page, web_base_url):
-    """設定取得失敗/保存値不正の状態でも、「今回だけ」上書きを選ぶと「次の送信先」欄
-    （`#usage-chat-provider-note`）は上書きの選択（現在の選択）を優先して表示し、設定エラーの
-    案内は別行（`#usage-chat-settings-error-note`）へ併記する——上書き中もエラーが見えなく
-    ならない。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["usage_chat"] = {"configured": "gemini", "effective": "(不正な保存値)",
-                              "default": "ollama", "providers": ["openai", "ollama"]}
-    install_api_mocks(page, system_settings=settings)
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_contain_text("不正です")
-    expect(page.locator("#usage-chat-settings-error-note")).to_be_hidden()
-
-    page.locator('[data-uc-provider="ollama"]').click()
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: ローカル（Ollama）")
-    expect(page.locator("#usage-chat-settings-error-note")).to_be_visible()
-    expect(page.locator("#usage-chat-settings-error-note")).to_contain_text("不正です")
-
-    page.locator('[data-uc-provider=""]').click()
-    expect(page.locator("#usage-chat-provider-note")).to_contain_text("不正です")
-    expect(page.locator("#usage-chat-settings-error-note")).to_be_hidden()
-
-
-def test_usage_chat_default_send_refetch_failure_clears_stale_default_and_shows_error(
-        page, web_base_url):
-    """初回の設定取得（GET /admin/settings）が成功して「送信先: OpenAI」等の表示になった後、
-    既定送信直前の再取得が失敗した場合、古い `_ucDefaultProvider` を残さず「次の送信先」を
-    エラー表示に切り替える（POST は行わない）——最初の成功で残った既定値のせいで、実際には
-    未確認なのに送信できるように見えてはいけない。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    calls = {"n": 0}
-
-    def settings_route(route):
-        if route.request.method != "GET":
-            route.fallback()
-            return
-        calls["n"] += 1
-        if calls["n"] == 1:
-            route.fallback()   # 初回（ページ読み込み時）は成功
-            return
-        route.fulfill(status=500, content_type="application/json", body=json.dumps({"detail": "boom"}))
-    page.route("**/admin/settings", settings_route)
-
-    chat_calls: list = []
-
-    def _record_and_fulfill(route):
-        chat_calls.append(route.request.post_data)
-        route.fulfill(status=200, content_type="application/json",
-                      body=json.dumps({"answer": "x", "provider_used": "openai", "endpoint_kind": None}))
-    page.route("**/admin/usage/chat", _record_and_fulfill)
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-
-    page.locator("#usage-chat-input").fill("質問")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text(
-        "送信先の設定を確認できなかった")
-    # 古い既定値（OpenAI）に化けて「送信できそう」に見えてはいけない——明示エラーへ切り替わる。
-    expect(page.locator("#usage-chat-provider-note")).to_have_text(
-        "送信先を取得できませんでした（再読み込みしてください）")
-    assert chat_calls == [], "設定再取得に失敗したのに実送信してはいけない"
-    assert calls["n"] == 2, "初回読み込み＋送信直前の再取得の2回のはず"
-
-
-def test_usage_chat_stale_settings_response_does_not_overwrite_newer_one(page, web_base_url):
-    """初期読み込みの設定取得（GET /admin/settings）が保留されている間に「今回だけ」上書き
-    送信を行うと、送信直前の再取得（2回目の GET）が別に走る。この2回目が先に解決した後、
-    保留していた1回目（古い世代）が遅れて到着しても、既に確定した状態を巻き戻してはいけない
-    （世代番号で古い応答を捨てる）。"""
-    from playwright.sync_api import expect
-    import time
-
-    install_api_mocks(page)
-    held: dict = {}
-    calls = {"n": 0}
-
-    def settings_route(route):
-        if route.request.method != "GET":
-            route.fallback()
-            return
-        calls["n"] += 1
-        if calls["n"] == 1:
-            held["first"] = route   # 初回（ページ読み込み時）を保留する
-            return
-        route.fallback()   # 2回目（送信直前の再取得）はすぐ解決する（通常のモック応答）
-    page.route("**/admin/settings", settings_route)
-    page.route("**/admin/usage/chat", _handle_usage_chat([], default_provider_used="openai"))
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    deadline = time.time() + 5
-    while "first" not in held and time.time() < deadline:
-        page.wait_for_timeout(20)
-    assert "first" in held, "初回の設定取得（GET）が保留されているはず"
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("確認中…")
-
-    # 初回取得が保留されている間に「今回だけ openai」を選んで送信する——上書き送信は
-    # `_ucSettingsFetchOk`（2回目の再取得の成否）だけを見るため、初回取得の未完了に
-    # 関わらず送信できる。
-    page.locator('[data-uc-provider="openai"]').click()
-    page.locator("#usage-chat-input").fill("質問")
-    page.locator("#usage-chat-send").click()
-    expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("テストの回答です")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-
-    # 保留していた初回（古い世代）の応答が今ごろ遅れて到着しても（今回はエラーを模す）、
-    # 既に確定した表示・送信可否を巻き戻してはいけない。
-    expect(page.locator("#usage-chat-settings-error-note")).to_be_hidden()
-    held["first"].fulfill(status=500, content_type="application/json", body=json.dumps({"detail": "boom"}))
-    page.wait_for_timeout(100)
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-    expect(page.locator("#usage-chat-send")).to_be_enabled()
-    # 「次の送信先」欄は上書き中のため常に override を優先して表示する（世代ガードを外しても
-    # ここは変わらず「送信先: OpenAI」のまま＝false green の原因）。世代ガードが実際に効いて
-    # いることは、上書きに隠れないこの別行（`_ucNoticeError` 用）が非表示のままであることで
-    # 確認する——世代ガードが無ければ、遅れて届いた 500 が `_ucNoticeError` を設定し、
-    # override 中でも見えるこの別行が表示されてしまう。
-    expect(page.locator("#usage-chat-settings-error-note")).to_be_hidden()
-
-
-def test_usage_chat_openai_key_hint_shown_when_a7_not_openai(page, web_base_url):
-    """A7（`cloud_provider`）が openai 以外（例: gemini）の間、「今回だけ OpenAI」ボタンの
-    近くに、中央 OpenAI キーが実行構成が OpenAI の時しか使えない旨の注記を出す——A7 の
-    排他選択契約により、この状態で「今回だけ OpenAI」を選んでも実際には 503（未接続）に
-    なるため、選ぶ前に理由が分かるようにする。A7 が openai なら注記は出ない。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["cloud"]["provider"] = "gemini"
-    install_api_mocks(page, system_settings=settings)
-
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-openai-key-hint")).to_be_visible()
-    expect(page.locator("#usage-chat-openai-key-hint")).to_contain_text(
-        "OpenAI のキーは頭脳の選択が OpenAI のときだけ使えます")
-    expect(page.locator("#usage-chat-openai-key-hint")).to_contain_text("現在: Gemini")
-
-
-def test_usage_chat_openai_key_hint_hidden_when_a7_is_openai(page, web_base_url):
-    """A7 が openai の間は、OpenAI キーが使えない旨の注記は出ない。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)   # cloud.provider == "openai"（既定）
-    page.goto(f"{web_base_url}/usage.html#ask?days=30")
-    expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
-    expect(page.locator("#usage-chat-openai-key-hint")).to_be_hidden()
-
-
 @pytest.mark.parametrize("embedding", ["", "?embed=1"])
 def test_usage_overview_and_tabs_preserve_period_through_history(page, web_base_url, embedding):
     """概要から詳細へ進み、戻る・再読込でも同じ期間で調べられる。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html{embedding}")
-    expect(page.locator("#usage-standalone")).to_be_visible() if embedding else expect(page.locator("#usage-standalone")).to_be_hidden()
+    _open(page, web_base_url, f"usage.html{embedding}")
+    if embedding:
+        expect(page.locator("#usage-standalone")).to_be_visible()
+    else:
+        expect(page.locator("#usage-standalone")).to_be_hidden()
     expect(page.locator("#summary-tiles")).to_be_visible()
-    expect(page.locator("#usage-chat-card")).to_be_hidden()
     expect(page.locator("#review-stats-card")).to_be_hidden()
     assert page.locator(".period-bar").bounding_box()["y"] < page.locator("#summary-tiles").bounding_box()["y"]
     page.locator('[data-days="7"]').click()
     expect(page).to_have_url(re.compile(r"#overview\?days=7$"))
-    page.get_by_role("tab", name="品質", exact=True).click()
+    _tab(page, "品質").click()
     expect(page.locator("#review-stats-card")).to_be_visible()
     expect(page.locator("#session-details")).not_to_have_attribute("open", "")
-    page.get_by_role("tab", name="品質", exact=True).press("ArrowRight")
-    expect(page.get_by_role("tab", name="トークン", exact=True)).to_be_focused()
+    _tab(page, "品質").press("ArrowRight")
+    expect(_tab(page, "トークン")).to_be_focused()
     expect(page.locator("#token-tiles")).to_be_visible()
     page.go_back()
-    expect(page.get_by_role("tab", name="品質", exact=True)).to_have_attribute("aria-selected", "true")
+    expect(_tab(page, "品質")).to_have_attribute("aria-selected", "true")
     page.reload()
     expect(page.locator("#review-stats-card")).to_be_visible()
     expect(page.locator('[data-days="7"]')).to_have_attribute("aria-pressed", "true")
-    page.get_by_role("tab", name="AIに聞く", exact=True).click()
-    expect(page.locator("#usage-chat-card")).to_be_visible()
-    expect(page.locator("#usage-chat-provider-note")).to_be_visible()
-    expect(page.locator("#summary-tiles")).to_be_hidden()
+    _tab(page, "概要").click()
+    expect(page.locator("#summary-tiles")).to_be_visible()
+    expect(page.locator("#review-stats-card")).to_be_hidden()
 
 
 @pytest.mark.parametrize("user_count", [10, 12])
 def test_usage_metric_definitions_missing_values_and_export(page, web_base_url, user_count):
-    """集計と母数の意味を確認し、0・未計測を区別した状態で保存できる。"""
-    from playwright.sync_api import expect
-
-    stats = json.loads(json.dumps(USAGE_STATS_DEFAULT))
+    """集計と母数の意味を確認し、0・未計測を区別した状態で JSON に書き出せる。"""
+    stats = _stats()
     stats["tokens"]["totals"].update(input=0, output=None)
     stats["tokens"]["by_user"] = [
         {"uid": f"sample-user-{i}", "display_name": f"サンプル利用者{i}",
          "turns": 1, "input": 1000 - i, "output": 10}
         for i in range(user_count)
     ]
-    install_api_mocks(page, usage_stats=stats)
-    page.goto(f"{web_base_url}/usage.html")
+    _open(page, web_base_url, usage_stats=stats)
     expect(page.locator("#zero-hit-counts")).to_contain_text("3件 / 社内資料参照の回答 14件")
     page.locator("#usage-definitions summary").click()
     expect(page.locator("#usage-definitions")).to_contain_text("回答のない質問は対象外")
     expect(page.locator("#usage-period-label")).to_contain_text("JST")
-    page.get_by_role("tab", name="品質", exact=True).click()
+    _tab(page, "品質").click()
     page.locator("#session-details summary").click()
     expect(page.locator("#t-resume-rate")).to_have_text("50%")
     expect(page.locator("#session-counts")).to_have_text("IDあり 2件 / 対象会話 4件")
     expect(page.locator("#session-details")).to_contain_text("成功率ではありません")
-    page.get_by_role("tab", name="トークン", exact=True).click()
+    _tab(page, "トークン").click()
     expect(page.locator("#t-tok-input")).to_have_text("0")
     expect(page.locator("#t-tok-output")).to_have_text("未計測")
     expect(page.locator("#token-user-tbody tr")).to_have_count(10)
@@ -1183,31 +319,36 @@ def test_usage_metric_definitions_missing_values_and_export(page, web_base_url, 
 
 
 def test_usage_export_zip_button_requests_current_period(page, web_base_url):
-    """「明細を保存（ZIP）」は画面が表示している期間（load() が /admin/usage/stats へ渡すのと
-    同じクエリの組み立て）で /admin/usage/export を取得し、応答のファイル名で保存する。"""
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html")
-    expect(page.locator("#usage-export-detail")).to_be_enabled()
+    """期間切替（7/30/90日）に統計が追従し、「明細を保存（ZIP）」は画面が表示している期間で /admin/usage/export を
+    取得して応答のファイル名で保存する。"""
+    seven_day = dict(USAGE_STATS_DEFAULT)
+    seven_day["period"] = {"start": "2026-06-27", "end": "2026-07-03", "days": 7}
+    seven_day["zero_hit"] = {"knowledge_turns": 2, "zero_hit_turns": 1, "rate": 0.5}
+    records = _open(page, web_base_url, usage_stats=seven_day)
+    expect(page.locator("#t-zerohit")).to_have_text("50%")
+    export = page.locator("#usage-export-detail")
+    expect(export).to_be_enabled()
 
     with page.expect_download() as download:
-        page.locator("#usage-export-detail").click()
+        export.click()
     assert download.value.suggested_filename == "usage-detail-20260601-20260630.zip"
     assert records["admin_usage_export"][-1]["days"] == ["30"]
 
-    page.locator('[data-days="7"]').click()
-    expect(page.locator("#usage-export-detail")).to_be_enabled()
+    page.locator("[data-days='7']").click()
+    expect(page.locator(".period-bar [data-days='7']")).to_have_class(re.compile(r"\bon\b"))
+    assert records["admin_usage_stats"][-1]["days"] == ["7"]
+    expect(page.locator("#t-zerohit")).to_have_text("50%")
+    expect(export).to_be_enabled()
     with page.expect_download():
-        page.locator("#usage-export-detail").click()
+        export.click()
     assert records["admin_usage_export"][-1]["days"] == ["7"]
 
     page.locator("#period-start").fill("2026-01-01")
     page.locator("#period-end").fill("2026-01-31")
     page.locator("#period-range button[type=submit]").click()
-    expect(page.locator("#usage-export-detail")).to_be_enabled()
+    expect(export).to_be_enabled()
     with page.expect_download():
-        page.locator("#usage-export-detail").click()
+        export.click()
     query = records["admin_usage_export"][-1]
     assert query["from"] == ["2026-01-01T00:00:00+09:00"]
     assert query["to"] == ["2026-02-01T00:00:00+09:00"]
@@ -1216,10 +357,7 @@ def test_usage_export_zip_button_requests_current_period(page, web_base_url):
 
 def test_usage_failed_period_does_not_display_or_export_previous_data(page, web_base_url):
     """期間変更の取得失敗を、前期間の成功した値で隠さない。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html")
+    _open(page, web_base_url)
     expect(page.locator("#summary-tiles")).to_be_visible()
     page.route("**/admin/usage/stats?days=7", lambda route: route.fulfill(
         status=500, content_type="application/json", body='{"detail":"集計失敗"}'))
@@ -1229,7 +367,7 @@ def test_usage_failed_period_does_not_display_or_export_previous_data(page, web_
     expect(page.locator("#summary-tiles")).to_be_hidden()
     expect(page.locator("#usage-export")).to_be_disabled()
     expect(page.locator("#usage-export-detail")).to_be_disabled()
-    page.get_by_role("tab", name="トークン", exact=True).click()
+    _tab(page, "トークン").click()
     expect(page.locator("#token-tiles")).to_be_hidden()
     page.locator('[data-days="90"]').click()
     expect(page.locator("#token-tiles")).to_be_visible()
@@ -1238,11 +376,8 @@ def test_usage_failed_period_does_not_display_or_export_previous_data(page, web_
 
 
 def test_usage_embedded_condition_can_open_as_standalone(page, web_base_url):
-    """管理画面のiframeから、条件をURLで再現できる単独表示へ移れる。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html#usage-page")
+    """管理画面の iframe から、条件を URL で再現できる単独表示へ移れる。"""
+    _open(page, web_base_url, "admin-settings.html#usage-page")
     frame = page.frame_locator("#embed-frame-usage-page")
     expect(frame.locator("#summary-tiles")).to_be_visible()
     frame.locator('[data-days="7"]').click()
@@ -1251,15 +386,13 @@ def test_usage_embedded_condition_can_open_as_standalone(page, web_base_url):
     expect(page).to_have_url(f"{web_base_url}/usage.html#quality?days=7")
     expect(page.locator("#review-stats-card")).to_be_visible()
     page.reload()
-    expect(page.get_by_role("tab", name="品質", exact=True)).to_have_attribute("aria-selected", "true")
+    expect(_tab(page, "品質")).to_have_attribute("aria-selected", "true")
     expect(page.locator('[data-days="7"]')).to_have_attribute("aria-pressed", "true")
 
 
 def test_usage_limits_preserve_recorded_values_and_mark_unmeasured(page, web_base_url):
     """経路によって記録値を隠さず、未計測を0件や対象外と混同しない。"""
-    from playwright.sync_api import expect
-
-    stats = json.loads(json.dumps(USAGE_STATS_DEFAULT))
+    stats = _stats()
     api = stats["limits"]["by_provider"][1]
     api.update(context_compactions_turns=0, context_compactions_total=0,
                duplicate_tool_call_turns=None, duplicate_tool_call_total=None,
@@ -1271,22 +404,15 @@ def test_usage_limits_preserve_recorded_values_and_mark_unmeasured(page, web_bas
         if key not in ("provider", "turns"):
             unknown[key] = None
     stats["limits"]["by_provider"].append(unknown)
-    install_api_mocks(page, usage_stats=stats)
-    page.goto(f"{web_base_url}/usage.html#quality?days=30")
-    heads = page.locator("#limits-tbody").locator("xpath=../thead//th")
+    _open(page, web_base_url, "usage.html#quality?days=30", usage_stats=stats)
     expect(page.locator("#limits-tbody tr")).to_have_count(3)
-    codex_cells, api_cells, unknown_cells = [
-        dict(zip(heads.all_text_contents(), row.locator("td").all_text_contents()))
-        for row in page.locator("#limits-tbody tr").all()
-    ]
+    _, (codex_cells, api_cells, unknown_cells) = _limit_cells(page)
     assert codex_cells["履歴の整理"] == "未計測"
     assert codex_cells["清書の打ち切り"] == "未計測"
     assert codex_cells["自動で深く調べた"] == "未計測"
     assert api_cells["履歴の整理"] == "0件（計0回）"
-    assert api_cells["同じ条件の再検索を省略"] == "未計測"
-    assert api_cells["調査の回数上限に到達"] == "未計測"
-    assert api_cells["自動継続"] == "未計測"
-    assert api_cells["累計上限到達"] == "未計測"
+    for head in ("同じ条件の再検索を省略", "調査の回数上限に到達", "自動継続", "累計上限到達"):
+        assert api_cells[head] == "未計測"
     assert unknown_cells["経路"] == "不明"
     assert all(value == "未計測" for key, value in unknown_cells.items()
                if key not in ("経路", "対象ターン数"))
@@ -1295,15 +421,12 @@ def test_usage_limits_preserve_recorded_values_and_mark_unmeasured(page, web_bas
 @pytest.mark.parametrize("missing", ["omitted", "null", "empty"])
 def test_usage_zero_hit_missing_does_not_break_rendering(page, web_base_url, missing):
     """出典なし集計の欠落でも、描画関数が例外を出さず他の統計を読める。"""
-    from playwright.sync_api import expect
-
-    stats = json.loads(json.dumps(USAGE_STATS_DEFAULT))
+    stats = _stats()
     if missing == "omitted":
         del stats["zero_hit"]
     else:
         stats["zero_hit"] = None if missing == "null" else {}
-    install_api_mocks(page, usage_stats=stats)
-    page.goto(f"{web_base_url}/usage.html")
+    _open(page, web_base_url, usage_stats=stats)
     expect(page.locator("#summary-tiles")).to_be_visible()
     if missing == "omitted":
         page.evaluate("renderZeroHitTile()")

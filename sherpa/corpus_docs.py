@@ -1,9 +1,6 @@
-"""world（登録ディレクトリ）の文書走査（鏡モデル・doc_ledger の seed 元）。
-
-旧モデル（version 別 src/md・structure.json・auto-scope の layer/ambiguous）は**撤去**。
-鏡では world の**フォルダ木そのもの**を走査し、各文書に `top_scope/phase/category`（rel_path の
-第1-3セグメント）と `path`(=rel_path) を持たせる（範囲＝フォルダ・MIRROR §3）。グラフは作らない（read-only）。
-特定テーマの名前は持たない（語彙はフォルダ/ファイル名＝データ由来）。
+"""資料フォルダの文書走査（doc_ledger の元）。フォルダ木そのものを走査し、各文書に `top_scope/phase/category`（rel_path の第 1〜3 セグメント）と
+`path`(=rel_path) を持たせる。グラフは作らない（読み取り専用）。
+設計: docs/design/scope.md「範囲（scope）＝フォルダ部分木のフィルタ」
 """
 from __future__ import annotations
 
@@ -22,35 +19,23 @@ from .ingest.analyzers import registry as _analyzer_registry
 
 _log = logging.getLogger("sherpa")
 
-# 拡張子 → doctype（表示用・非コード分＝固定表）。コード分はアナライザ登録簿から毎回導出する
-# （`_doctype_map()`）ので、新規言語をレジストリに足すだけで台帳・scan_report・原本 API に反映される。
+# 拡張子 → doctype（表示用・非コード分の固定表）。コード分はアナライザ登録簿（`registry.candidates`／`resolve_lazy`）で決まる
 _NONCODE_DOCTYPE = {".md": "設計書", ".markdown": "設計書", ".txt": "テキスト"}
 _MD_EXT = {".md", ".markdown", ".txt"}
-# Office/PDF（決定的MD化の対象・INGEST-MD §D5）。OOXML は常時変換、PDF はバックエンド導入時のみ、旧バイナリは未対応。
+# Office／PDF（決定的 MD 化の対象）
 _OFFICE_DOCTYPE = {".docx": "Word", ".doc": "Word(旧)", ".xlsx": "Excel", ".xls": "Excel(旧)",
                    ".pptx": "PowerPoint", ".ppt": "PowerPoint(旧)", ".pdf": "PDF"}
-# ラスタ画像（視覚読み取りアーム `vision`＝VLM の対象・tesseract の `ocr` アームは撤去済 2026-07-08）。
-# doctype は Office と混同しない平文「画像」。**vision 有効 かつ VLM 実効可（＝office_md.convertible_exts
-# に画像 ext が含まれる）ときだけ**文書として一覧に載せる（既定は vision 無効では convertible に画像が
-# 入らない＝下の image_exts が空＝走査は従来どおり「その他」に落ちる＝scan_report 不変）。
-# ⚠ 許容される過渡状態（RV Med #4・コード変更不要）: vision 無効化〜次回 sync（`office_md.arms_sig_drift`
-# が検知して派生MD を作り直す）までの間は、既存の画像派生MD がディスクに残ったままなので grep/read_around
-# からは引き続き見える（アーム構成変更全般に共通する性質・鏡の即時性は「次回 sync 完了時点」が基準）。
+# ラスタ画像（視覚読み取りアーム `vision` の対象）。vision 有効かつ VLM 実効可（`office_md.convertible_exts` に画像 ext がある）ときだけ文書として一覧に載せる
 _IMAGE_DOCTYPE_LABEL = "画像"
-# 内容判定（accepts）が必要だったが読み取れなかった時の明示 doctype。
+# 内容判定（accepts）が必要だったが読み取れなかった時の明示 doctype
 _UNREADABLE_DOCTYPE_LABEL = "読み取り不可"
-# アーカイブ取り込み（zip/tar(.gz)/tgz）: アーカイブ自身の台帳1行用 doctype（中のファイルは通常の
-# doctype・branch で別行になる＝`ingest.archive_extract.sync_world_archives` が展開した木を
-# `also=` で合流させる・下の `_archive_row` 参照）。
+# アーカイブ（zip/tar(.gz)/tgz）自身の台帳 1 行用 doctype（中のファイルは `archive_extract.sync_world_archives` が展開した木が `also=` で合流し、通常の行になる）
 _ARCHIVE_DOCTYPE_LABEL = "アーカイブ(zip/tar)"
 
 
 def _archive_row(rel: str, world: str) -> dict:
-    """アーカイブ自身（zip/tar(.gz)/tgz）の台帳1行——`archive_extract.sync_world_archives` が
-    `worlds.archive_manifest_path(world)` へ書いたサマリから組み立てる（展開結果の件数・失敗理由）。
-
-    マニフェストに該当行が無い（取り込みが一度も展開段を通っていない・古い台帳の再走査等）場合は
-    `state="unreadable"`／`reason="archive_pending"`——黙って一覧から消さない。
+    """アーカイブ自身の台帳 1 行。`archive_extract.sync_world_archives` が `worlds.archive_manifest_path(world)` へ書いたサマリから組み立てる。
+    マニフェストに行が無ければ `state="unreadable"`／`reason="archive_pending"`（一覧から消さない）。
     """
     manifest = json_io.read_json(worlds.archive_manifest_path(world), default={})
     summary = manifest.get(rel) if isinstance(manifest, dict) else None
@@ -76,76 +61,18 @@ def _archive_row(rel: str, world: str) -> dict:
 
 
 class _HeadUnreadable(Exception):
-    """`_read_head` が実ファイルを読めなかった（OSError）ことを示す内部シグナル。
-
-    `accepts()` を「空文字＝内容なし」と誤解させて次点アナライザへ誤配属しないよう、
-    `classify_document()` がこれを捕まえて明示の失敗（`kind="unreadable"`）に倒し、そこで
-    判定を打ち切る。
-    """
-
-
-def _code_doctype() -> dict:
-    """コード分の拡張子→doctype（優先順で先勝ち＝拡張子衝突時はレジストリの優先順に従う）。
-
-    毎回アナライザ登録簿から導出する（新規言語の追加やテストでの差し替えに追随する単一の真実源・
-    §2.4）——値を固定 dict にキャッシュしない。
-    """
-    out: dict = {}
-    for a in _analyzer_registry.known_analyzers():
-        for ext in a.extensions:
-            out.setdefault(ext, a.doctype)
-    return out
-
-
-def _doctype_map() -> dict:
-    """表示用 doctype の合成表（非コード分の固定表＋コード分のレジストリ導出）。呼び出しごとに計算する。
-
-    `scan_report`/`status_document_doctype`/`iter_world_documents` は `accepts()` まで見る
-    `classify_document()` を共有するため、本関数はもう使わない——後方互換の `_DOCTYPE`
-    属性アクセス（`tests/_corpus_expect.py` 等の拡張子メンバーシップ判定）専用に残す。
-    衝突時は非コード分（`_NONCODE_DOCTYPE`）を優先する（レジストリ側の不備で `.md`/`.txt` 等の
-    確立済み表示名を巻き込んで壊さない安全側の順序）。
-    """
-    return {**_code_doctype(), **_NONCODE_DOCTYPE}
-
-
-def __getattr__(name: str):
-    """後方互換: `_DOCTYPE`（旧・固定 dict）への属性アクセスを `_doctype_map()` へ委譲する。
-
-    `tests/_corpus_expect.py` 等の外部参照が `from sherpa.corpus_docs import _DOCTYPE` の形で
-    使えるよう維持しつつ、値そのものはレジストリ変更に追随させる（モジュール読み込み時には
-    レジストリを引かない＝`doc_kinds.__getattr__` と同型）。
-    """
-    if name == "_DOCTYPE":
-        return _doctype_map()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    """`_read_head` が実ファイルを読めなかった（OSError）ことを示す内部シグナル。`classify_document()` が捕まえて `kind="unreadable"` で判定を打ち切る。"""
 
 
 def classify_document(rel_path: str, ext: str, read_head, *, allow_content_sniff: bool = True,
                       text_quality=None) -> dict:
-    """`_classify_document_core()` の判定を返す（判定そのものの説明はそちらの docstring 参照）。
-
-    `text_quality`（SRH-05・省略可・キーワード専用・zero-arg callable）: テキストとして読める
-    （`_classify_verdict_reachable()` が True）と core が判定した場合だけ呼ぶ——Office/PDF/画像・
-    秘匿名・未対応は対象外のまま core の結果をそのまま返す（本文を原本ツリーから直接読むのは
-    `kind=="code"` またはテキスト資料の doctype 確定時だけ・`grep_tool.grep_search` が派生MDを
-    UTF-8 固定で読み符号化判定を省くのと同じ理由）。`text_quality()` は `(encoding, ratio,
-    majority_garbled)`（`text_encoding.detect_fd_quality` と同型・`ratio`＝化け比率・
-    `majority_garbled`＝空でない行の過半に化けがあるか）または `None`（読み取り不能）を返す
-    callable——呼び出し元は `_text_quality_for(rp)` を渡す。
-
-    `text_encoding.quality_of(ratio, majority_garbled)` が:
-    - `"ok"`（置換なし）: core の結果をそのまま返す（追加のキーも付けない）。
-    - `"partial"`（一部が化けている・対象外にしない）: `result["encoding_partial"] = True` を足す
-      （`kind`/`doctype` は変えない＝検索・精読は従来どおり可能・利用者/Codex への注意喚起のみ）。
-    - `"undetermined"`（UTF-8 でも CP932 でも化ける）: `kind`/`doctype` を未対応
-      （`document`/`None`）へ**書き換え**、`result["unreadable_reason"] = "encoding_undetermined"`
-      を足す——`_classify_verdict_reachable()` が False になり、grep/scan_report/read_around 等の
-      既存の到達可否ゲートが自動的に対象外にする（拡張子の許可リストではなくこの1つの判定式が
-      可否を決める契約・§7 裁定10 を維持）。
-
-    `text_quality is None`（既定）: 補正を一切行わない——既存呼び出し元（quality を渡さない全ての
-    呼び出し・`status_document_doctype` 系のホットパス含む）は完全に無変更のまま。
+    """`_classify_document_core()` の判定を返す。
+    `text_quality`（省略可・zero-arg callable）: テキストとして読める（`_classify_verdict_reachable()` が True）場合だけ呼ぶ。
+    `(encoding, ratio, majority_garbled)`（`text_encoding.detect_fd_quality` と同型）または None を返す。`text_encoding.quality_of` が:
+    - `"ok"`: core の結果をそのまま返す。
+    - `"partial"`: `result["encoding_partial"] = True` を足す（`kind`／`doctype` は変えない）。
+    - `"undetermined"`: `kind`／`doctype` を未対応（`document`／`None`）へ書き換え、`unreadable_reason = "encoding_undetermined"` を足す。
+    `text_quality is None`（既定）は補正しない。
     """
     result = _classify_document_core(rel_path, ext, read_head, allow_content_sniff=allow_content_sniff)
     if text_quality is None or not _classify_verdict_reachable(result):
@@ -168,65 +95,19 @@ def classify_document(rel_path: str, ext: str, read_head, *, allow_content_sniff
 
 
 def _classify_document_core(rel_path: str, ext: str, read_head, *, allow_content_sniff: bool = True) -> dict:
-    """1ファイルの分類（列挙・集計・状態APIが共有する単一の判定）。`classify_document()`
-    （符号化の読み取り品質を補正する薄いラッパー・SRH-05）が本関数へ委譲する——直接は呼ばない。
-
-    `read_head`（`size` キーワードを受け取れる callable）は `registry.resolve_lazy` の内容判定に
-    そのまま渡す——実際に必要な時（拡張子を要求する候補の誰かが `accepts()` を上書きしている時）
-    だけ呼ばれる（既定 accepts のみなら内容を読まない・§7 裁定10）。`resolve_lazy` が実際に読んだ
-    head はここでキャッシュし、`accepts()` 全滅で `_classify_generic_text` の内容推定へ回った
-    場合に**追加 I/O なしで**再利用する（`allow_content_sniff=False` でも同様——`accepts()` 用に
-    既に読んだ内容を使うだけで新たな読み取り/world root 再解決は発生しない）。
-
+    """1 ファイルの分類（列挙・集計・状態 API が共有する単一の判定）。`classify_document()` が委譲する（直接は呼ばない）。
+    `read_head`（`size` キーワードを受ける callable）は `registry.resolve_lazy` の内容判定にそのまま渡す。既定の accepts だけなら内容を読まない。
+    `resolve_lazy` が読んだ head はキャッシュし、`_classify_generic_text` の内容推定で追加 I/O なしに再利用する。
     戻り値:
-    - `{"kind": "code", "doctype": ..., "analyzer": ...}` — `resolve_lazy` が担当を確定。
-    - `{"kind": "document", "doctype": str | None, "had_code_candidates": bool}` — 担当なし
-      （未登録拡張子、または登録済みだが `accepts()` 全滅）＝**資料の枠へ倒す**。実際に資料として
-      扱われる（索引・一覧に出る）のは既存の資料種別（`doctype` が `_NONCODE_DOCTYPE` にある、
-      または呼び出し側が Office/画像と判定する拡張子）に該当する場合のみ——該当しなければ
-      未対応（§7 裁定10「既存の資料種別に該当するものは資料・それ以外は未対応」）。
-      `doctype` は `_NONCODE_DOCTYPE` にあればその値、無ければ `None`（呼び出し側が
-      Office/画像/未対応へ倒す）。`had_code_candidates`＝この拡張子を要求する登録済み
-      アナライザが1つ以上あったか（`accepts()` 全滅で資料の枠へ落ちたことを可視化するのに使う・
-      裁定10「その旨を内訳へ」）。**秘匿名（`text_kind.is_sensitive`）で早期returnした場合だけ
-      `"sensitive": True` を追加で持つ**——`doctype=None`／`had_code_candidates=False` という
-      形は「真に未分類（Office/画像として再採用してよい）」の場合とも一致してしまうため、
-      呼び出し側（`_doctype_for_count`/`iter_world_documents`/`scan_report`）が Office/画像の
-      拡張子分類へ**再度**倒して秘匿ファイルを本文付きで台帳・変換・精読へ通してしまわないよう、
-      この旗で明示的に区別する。
-    - `{"kind": "unreadable", "had_code_candidates": True}` — 内容判定が必要だったが
-      読み取れなかった。次点アナライザへは進まず（誤配属しない）ここで判定を打ち切る。
-
-    `accepts()` が全滅（`analyzer is None`）した場合、候補のいずれかが `fallback_to_text_kind_
-    when_declined=True`（`Analyzer` 既定 False・`HtmlTemplateAnalyzer` 専用）を宣言していれば、
-    `_classify_generic_text` の「登録済み候補が拒否した拡張子は資料枠へ即倒す」早期returnを
-    行わず、通常の内容推定経路へ進める（コーディネータ裁定・HTML の分類——アプリ画面の目印が
-    無い HTML は日本語本文主体の資料として扱う）。
-
-    「担当なし」（登録簿にもアナライザにも拾われなかった）拡張子は、`.md`/`.txt` 等の既存の
-    資料表にも無ければ `_classify_generic_text()`（軽量テキスト枠・`ingest.text_kind`）へ回す。
-    Office/画像（`_OFFICE_DOCTYPE`／`office_md.IMAGE_EXT`）はそちらで既存の資料種別として
-    確定するため、ここでは対象外のまま返す（`doctype=None`・呼び出し側の既存分岐に委ねる）。
-    軽量テキスト枠が `"code"` と判定した場合は `kind="code"`（`analyzer=None`）で返す——
-    `branch=source`／層フィルタが登録アナライザと同じ経路で自然に効く（§ ING-TEXT-1）。
-
-    `allow_content_sniff`（既定 True）: 軽量テキスト枠の第2段（未知拡張子・拡張子なしの
-    `read_head()` 内容推定）を許すか。`False` にすると第1段（拡張子マップ）で判定できない
-    拡張子は `read_head()` を一切呼ばず即座に `doctype=None` へ倒す——`status_document_doctype`/
-    `status_document_requires_coverage`（`manifest_doctype_count` 経由で `_run_locked` の
-    ホットパスから毎 sync 呼ばれる・元々「ファイルツリー走査を避ける」ために `manifest` 経由の
-    軽量呼び出しとして設計された関数）が使う。ここで `read_head()` を呼ぶと、`status_document_
-    doctype` が内部で使う `_read_head_for_status` が `documents.resolve`→`worlds.world_dir` を
-    経由して world root を**再解決**（DB 往復もありうる）してしまい、`manifest_doctype_count` の
-    「追加の走査/解決をしない」という設計契約を破る（実測: `_run_locked` の world root 解決を
-    モックした単体テストで `store.get_world()` の返り値不足により落ちた・2026-09-02）。
-    `scan_report`/`iter_world_documents`（どのみち全木を歩く経路）は既定 True のまま。
+    - `{"kind": "code", "doctype", "analyzer"}` — `resolve_lazy` が担当を確定。
+    - `{"kind": "document", "doctype": str | None, "had_code_candidates": bool}` — 担当なし＝資料の枠へ倒す。`doctype` は `_NONCODE_DOCTYPE` にあればその値、無ければ None（呼び出し側が Office／画像／未対応へ倒す）。
+      秘匿名（`text_kind.is_sensitive`）で早期 return した場合だけ `"sensitive": True` を持つ（呼び出し側が Office／画像の拡張子分類へ再度倒して秘匿ファイルを採用しないため）。
+    - `{"kind": "unreadable", "had_code_candidates": True}` — 内容判定が必要だったが読めなかった（次点アナライザへ進まず打ち切る）。
+    `accepts()` が全滅した場合、候補のいずれかが `fallback_to_text_kind_when_declined=True` なら、早期 return せず通常の内容推定へ進める。
+    担当なしの拡張子は、`.md`／`.txt` 等の資料表にも無ければ `_classify_generic_text()`（軽量テキスト枠）へ回す（Office／画像は対象外のまま返す）。軽量テキスト枠が `"code"` と判定したら `kind="code"`（`analyzer=None`）。
+    `allow_content_sniff`（既定 True）: False なら第 1 段（拡張子マップ）で判定できない拡張子は `read_head()` を呼ばず `doctype=None` へ倒す（status 経路が資料フォルダ root を再解決しないため）。
     """
-    # 秘匿ファイル（.env 系・id_rsa 系・credentials 等＝名前規約を含む）は担当アナライザの有無に
-    # よらず分類経路から外す。拡張アナライザが `.old`/`.local` のような拡張子を担当宣言しても、
-    # 秘匿除外が無効化されて本文が台帳・grep・精読（外部送信）へ流れないための不変条件。
-    # `sensitive: True`＝呼び出し側が Office/画像の拡張子分類へ再度倒して秘匿ファイルを
-    # 台帳・変換対象へ再採用しないための明示的な旗（上のdocstring参照）。
+    # 秘匿ファイルは担当アナライザの有無によらず分類経路から外す。`sensitive: True` は呼び出し側が Office／画像分類へ再採用しないための旗
     if text_kind.is_sensitive(Path(rel_path).name, ext):
         return {"kind": "document", "doctype": None, "had_code_candidates": False, "sensitive": True}
     candidates = _analyzer_registry.candidates(rel_path)
@@ -236,9 +117,7 @@ def _classify_document_core(rel_path: str, ext: str, read_head, *, allow_content
             return {"kind": "document", "doctype": doctype, "had_code_candidates": False}
         return _classify_generic_text(rel_path, ext, read_head, had_code_candidates=False,
                                       allow_content_sniff=allow_content_sniff)
-    # `resolve_lazy` が accepts() 判定用に実際に読んだ head をここで捕らえておく——`accepts()`
-    # 全滅で内容推定（`_classify_generic_text`）へ回った場合に、追加の read_head() 呼び出し
-    # （＝status 経路では world root 再解決）を経ずそのまま再利用する。
+    # `resolve_lazy` が accepts() 判定用に読んだ head を捕らえ、内容推定へ回った場合に再利用する
     cached_head: list = []
 
     def _capturing_read_head(size: int = 4096) -> str:
@@ -267,44 +146,12 @@ def _classify_generic_text(rel_path: str, ext: str, read_head, had_code_candidat
                            allow_content_sniff: bool = True,
                            declined_allows_text_kind: bool = False,
                            cached_head: str | None = None) -> dict:
-    """軽量テキスト枠（`ingest.text_kind`）＝**登録簿に候補が一つも無い**（＝真に未登録の）拡張子の
-    テキストファイル判定。
-
-    `classify_document()` の「担当なし」経路から呼ばれるが、`had_code_candidates=True`
-    （登録アナライザの候補は居たが `accepts()` が全滅した＝§7 裁定10 の対象）は軽量テキスト枠の
-    対象**外**——既存の資料種別（`.md`/`.txt`/Office/画像）に該当しなければ従来どおり「未対応」の
-    まま `doctype=None` を返す（`test_declined_extension_...`/`test_grep_search_excludes_declined_
-    registered_code_extension_...` 系が固定する既存契約。軽量テキスト枠は「未登録拡張子」だけが
-    対象で、「登録されているが拒否された」ケースの扱いを緩めない）。
-
-    `declined_allows_text_kind=True`（拒否した候補のいずれかが `fallback_to_text_kind_when_
-    declined=True` を宣言＝`HtmlTemplateAnalyzer` 専用）のときだけ、この「拒否は資料枠へ即倒す」
-    早期returnを行わず、通常の内容推定（第1段の拡張子マップ→第2段の内容 sniff）へ進める
-    （コーディネータ裁定・HTML の分類）。
-
-    `cached_head`（`classify_document` が `resolve_lazy` の accepts() 判定用の読み取りを捕らえた
-    もの）が渡されていれば、第2段の内容推定はこれをそのまま使う——
-    `allow_content_sniff=False`（status 経路）でも読み取り自体は既に済んでいる（追加の
-    `read_head()` 呼び出し＝status 経路では world root 再解決を伴う I/O を発生させない）ため、
-    通常の `allow_content_sniff` ゲートを迂回してよい。
-
-    Office/画像は既存の資料種別として呼び出し側（`scan_report`/`iter_world_documents`/
-    `status_document_doctype`）が別途扱うため、ここで対象外のまま `doctype=None` を返し、内容も
-    読まない（二重の読み取りをしない）。ノイズ/一時ファイル、秘匿ファイル慣習拡張子
-    （`text_kind.SENSITIVE_EXT`＝`.env`/`.key`。`agentic_search.verify_doc_exists()` が
-    「doctype 分類に無い付帯物は文書として実在しない」を秘匿ファイル非対応の安全側の性質として
-    使っている・`tests/unit/test_ext2_evidence.py::test_verify_doc_exists_false_for_dotenv_and_key_files`
-    参照）、`worlds.is_semantic_control_path()`（`semantic/concepts.json`／`semantic/l_extract.json`
-    ＝旧・意味層機構〔GRAPH-SRC 2026-09-04 で撤去済み〕の world配下フォールバック位置に置かれた
-    内部制御ファイル。`.json` を汎用コード扱いにしたことで偶然「ただの文書」に露出しないように
-    する残置ガード）も同様（`doctype=None`＝呼び出し側の既存「未対応」集計へ自然に合流）。
-
-    第1段（拡張子マップ）で判定できなければ、第2段（`read_head()` の先頭数KBの内容推定）へ——
-    ただし `allow_content_sniff=False` なら第2段自体を行わず（`read_head()` を呼ばず）
-    即座に `doctype=None` へ倒す（`classify_document` の同名引数 docstring 参照）。
-    `read_head()` が失敗（`_HeadUnreadable`）したら `kind="unreadable"`（既存の read_failed
-    経路と同じ形）。サイズ上限（8MiB）はここでは判定しない——実ファイルの stat を持つ
-    呼び出し側（`iter_world_documents`/`scan_report`）の責務。
+    """軽量テキスト枠（`ingest.text_kind`）＝登録簿に候補が一つも無い拡張子のテキストファイル判定。
+    登録アナライザの候補が居たが `accepts()` が全滅した場合（`had_code_candidates=True`）は対象外（既存の資料種別に該当しなければ未対応のまま `doctype=None`）。
+    `declined_allows_text_kind=True`（拒否した候補が `fallback_to_text_kind_when_declined=True` を宣言）のときだけ、通常の内容推定（第 1 段の拡張子マップ→第 2 段の内容 sniff）へ進める。
+    `cached_head` があれば第 2 段の内容推定はそれを使い、`allow_content_sniff` のゲートを迂回してよい（追加読み取りが無いため）。
+    Office／画像、ノイズ・一時ファイル、秘匿ファイル、`worlds.is_semantic_control_path()` は対象外のまま `doctype=None`（内容も読まない）。
+    `allow_content_sniff=False` なら第 2 段は行わず `doctype=None`。`read_head()` が失敗（`_HeadUnreadable`）したら `kind="unreadable"`。サイズ上限（8MiB）は呼び出し側の責務。
     """
     if ext in _OFFICE_DOCTYPE:
         return {"kind": "document", "doctype": None, "had_code_candidates": had_code_candidates}
@@ -321,7 +168,7 @@ def _classify_generic_text(rel_path: str, ext: str, read_head, had_code_candidat
     kind = text_kind.classify_ext(ext)
     if kind is None:
         if cached_head is not None:
-            head = cached_head                # accepts() 用に既に読んだ head を再利用（追加I/Oなし）
+            head = cached_head  # accepts() 用に既に読んだ head を再利用（追加 I/O なし）
         elif not allow_content_sniff:
             return {"kind": "document", "doctype": None, "had_code_candidates": False}
         else:
@@ -331,10 +178,7 @@ def _classify_generic_text(rel_path: str, ext: str, read_head, had_code_candidat
                 return {"kind": "unreadable", "had_code_candidates": had_code_candidates}
         sniff = text_kind.sniff_content(head)
         if sniff == "binary":
-            # SRH-05: 理由を明示するが、一覧への出し方（バイナリは載せない）は従来どおり——
-            # `unreadable_reason` は `scan_report()` の理由別内訳（`unreachable_by_reason`）専用で、
-            # `iter_world_documents()` は既存契約のとおりこの旗を見ない（`test_stage2_binary_
-            # unknown_extension_is_not_listed` が固定する既存挙動＝バイナリは一覧に出ない）。
+            # 理由を明示する。`unreadable_reason` は `scan_report()` の理由別内訳専用で、`iter_world_documents()` は見ない（バイナリは一覧に出ない）
             return {"kind": "document", "doctype": None, "had_code_candidates": had_code_candidates,
                     "unreadable_reason": "binary"}
         kind = sniff
@@ -346,45 +190,27 @@ def _classify_generic_text(rel_path: str, ext: str, read_head, had_code_candidat
 
 
 def _classify_verdict_reachable(result: dict) -> bool:
-    """`classify_document()` の戻り値から「本文をテキストとして読める（grep/精読/ES 索引の対象に
-    してよい）」かを導く単一の式。`kind=="code"`、または `kind=="document"` で `doctype` が付く
-    （登録済み資料種別／軽量テキスト枠の第1段・第2段いずれか）なら True。`kind=="unreadable"`
-    （読み取り不可）、または `doctype` が付かない `kind=="document"`（秘匿名・Office/画像・
-    declined 登録拡張子・内容が実質バイナリ）は False。
-
-    `_safe_doc_path`・`grep_search`・`_safe_original_path`（file_head）・`reachable_as_text` が
-    この1つの式を共有する（拡張子の許可リストではなく、常にこの確定判定が可否を決める）。
+    """`classify_document()` の戻り値から「本文をテキストとして読める（grep／精読／ES 索引の対象にしてよい）」かを導く単一の式。
+    `kind=="code"`、または `kind=="document"` で `doctype` が付けば True。`unreadable`、`doctype` の付かない `document`（秘匿名・Office／画像・declined 拡張子・内容が実質バイナリ）は False。
+    `_safe_doc_path`・`grep_search`・`_safe_original_path`（file_head）・`reachable_as_text` がこの式を共有する（拡張子の許可リストでなく確定判定が可否を決める）。
     """
     return result["kind"] == "code" or (result["kind"] == "document" and result.get("doctype") is not None)
 
 
 def reachable_as_text(rel_path: str, ext: str, read_head) -> bool:
-    """本文を検索・精読・索引の対象として読めるか（grep/`_safe_doc_path`/ES 索引が共有する判定）。
-
-    Office/PDF/画像は対象外——本文は派生MD経由でしか読めないため、呼び出し側がここへ来る前に
-    別解決（派生MD の実在確認）へ分岐する（本関数はその分岐を持たない）。秘匿ファイルは
-    `classify_document()` が内部で先に弾くため False になる。拡張子が登録済みかどうかは問わない
-    ——未登録拡張子（軽量テキスト枠の第2段・拡張子なし含む）でも内容が実際にテキストと判定できれば
-    True。
+    """本文を検索・精読・索引の対象として読めるか（grep／`_safe_doc_path`／ES 索引が共有する判定）。
+    Office／PDF／画像は対象外（呼び出し側が派生 MD の実在確認へ分岐する）。秘匿ファイルは False。拡張子が登録済みかは問わず、内容がテキストと判定できれば True。
     """
     return _classify_verdict_reachable(classify_document(rel_path, ext, read_head))
 
 
 def _read_head(rp: Path, size: int = 4096) -> str:
-    """先頭 `size` **バイト**を読み UTF-8/CP932（不正/途中で切れたバイト列は置換）でデコードする
-    （`registry.resolve_lazy` の内容判定専用・head だけで足りる経路が使う軽量版）。
-    読めなければ `_HeadUnreadable`。
-
-    バイナリで `size` バイトちょうど読んでからデコードする——テキストモードで `size` **文字**
-    読むと、マルチバイト文字（日本語等）を含む文書では実際に読む範囲が `Analyzer.head_bytes`
-    の宣言（例: `HtmlTemplateAnalyzer` の64KiB）よりずっと広くなり、境界の直後にある目印
-    （`<form>` 等）まで誤って拾ってしまう（バイト境界と文字境界の食い違い）。
-    全文も必要な経路（`ingest.world_graph` Pass1）はこの関数を呼ばず `read_full_text_and_raw()`
-    を使う（同じファイルを2回開かない・下記参照）。
+    """先頭 `size` バイトを読み UTF-8／CP932（不正バイトは置換）でデコードする（`registry.resolve_lazy` の内容判定用）。読めなければ `_HeadUnreadable`。
+    バイナリで `size` バイトちょうど読んでからデコードする（`Analyzer.head_bytes` の宣言どおりのバイト境界を守るため）。
     """
     try:
         with rp.open("rb") as f:
-            # 分類は先頭だけで足りる＝読み込み量を先頭 size バイトに保つ（全体判定の detect_fd は使わない）。
+            # 分類は先頭だけで足りる＝読み込み量を先頭 size バイトに保つ
             raw = f.read(size)
             encoding = text_encoding.detect_bytes(raw, complete=len(raw) < size or os.fstat(f.fileno()).st_size <= size)
             return text_encoding.decode(raw, encoding)
@@ -392,12 +218,8 @@ def _read_head(rp: Path, size: int = 4096) -> str:
         raise _HeadUnreadable(str(e)) from e
 
 
-# SRH-05: 符号化の読み取り品質（`text_encoding.detect_fd_quality` の薄いラッパー）。原本ツリーの
-# 実パスを持つ呼び出し元（`scan_report`/`iter_world_documents`/`grep_tool.grep_search`/
-# `agentic_search._safe_doc_path` 等）が `classify_document(..., text_quality=...)` へ渡す
-# closure、およびツール結果への注意喚起（`encoding_caution_for*`）の両方の入口。
-# `text_encoding` 側のキャッシュ（ファイル state キー）を共有するため、同じファイルに対して
-# `_read_head`/`read_full_text_and_raw` 等が既に符号化判定を済ませていれば再スキャンしない。
+# 符号化の読み取り品質（`text_encoding.detect_fd_quality` の薄いラッパー）。`classify_document(..., text_quality=...)` へ渡す closure と
+# ツール結果への注意喚起（`encoding_caution_for*`）の入口。`text_encoding` のキャッシュを共有する
 def _text_quality_for(rp: Path) -> tuple[str, float, bool] | None:
     """`rp` の `(encoding, replacement_ratio, majority_garbled)`。開けなければ `None`。"""
     try:
@@ -407,9 +229,7 @@ def _text_quality_for(rp: Path) -> tuple[str, float, bool] | None:
         return None
 
 
-# ツール結果（read_doc/read_around/ripgrep_search 等）へ添える短い注意文——判定結果（"partial"/
-# "undetermined"）だけで決まる閉じた語彙（利用者向け平文ではなく Codex 向けの機械的な印だが、
-# 文言そのものは `failure_reasons` の平文と同じ趣旨で揃える）。
+# ツール結果（read_doc／read_around／ripgrep_search 等）へ添える短い注意文（判定結果 "partial"／"undetermined" だけで決まる）
 _ENCODING_CAUTION = {
     "partial": "この資料は文字コードの判別が不確実で、一部の文字が正しく読み取れていない可能性があります（要確認）。",
     "undetermined": "この資料は文字コードを判別できず、内容が正しく読み取れていません。",
@@ -422,7 +242,7 @@ def encoding_caution_for_ratio(ratio: float, majority_garbled: bool = False) -> 
 
 
 def encoding_caution_for(rp: Path) -> str | None:
-    """`rp` の符号化品質に応じた注意文（読み取り不能/"ok" なら None）。"""
+    """`rp` の符号化品質に応じた注意文（読み取り不能／"ok" なら None）。"""
     tq = _text_quality_for(rp)
     if tq is None:
         return None
@@ -430,22 +250,11 @@ def encoding_caution_for(rp: Path) -> str | None:
 
 
 def read_full_text_and_raw(rp: Path) -> tuple[str, bytes]:
-    """ファイルをバイナリで**1回だけ**読み、全文（UTF-8/CP932・不正バイト列は置換でデコード）
-    と生バイト列の両方を返す。読めなければ `OSError`（呼び出し元の既存の読取失敗処理に委ねる）。
-
-    `ingest.world_graph` の Pass1（構文解析用の全文と、アナライザごとに異なる `accepts()` 判定用の
-    head の両方を同一ファイルから必要とする唯一の経路）専用。生バイト列を返すのは、呼び出し元が
-    アナライザごとに異なる `head_bytes`（既定4KiB・`HtmlTemplateAnalyzer` は64KiB）でスライスして
-    デコードするため——全文読取後に `head_bytes` 分だけ**再度ファイルを開いて**読み直す旧実装は、
-    全文読取と head 読取の間でファイルが消える/権限が変わるなどの TOCTOU が起きると、既に読めた
-    全文を捨てて head だけ「読み取り失敗」を空文字（＝目印なし＝不採用）へ静かに丸めてしまい、
-    本来なら明示の `unreadable_code_file` blocked flag にすべき失敗を見えなくしていた。1回の読み取り
-    から両方を切り出すことでこの再オープン自体を無くす。
+    """ファイルをバイナリで 1 回だけ読み、全文（UTF-8／CP932・不正バイトは置換）と生バイト列の両方を返す。読めなければ `OSError`。
+    `ingest.world_graph` の Pass1 専用（構文解析用の全文と、アナライザごとの `head_bytes` でスライスする生バイト列を同一の読み取りから得る）。
     """
     raw = rp.read_bytes()
-    # 全文はテキストモード読取（`Path.read_text`）と同じユニバーサル改行（CRLF/単独 CR → LF）に
-    # 揃える——行単位で構文を見るアナライザが単独 CR のファイルで1行に潰れないため。head 用の
-    # 生バイト列は無加工（バイト境界の契約を保つ）。
+    # 全文はユニバーサル改行（CRLF／単独 CR → LF）に揃える。head 用の生バイト列は無加工
     encoding = text_encoding.detect_bytes(raw[:text_encoding.DETECT_CAP_BYTES],
                                           complete=len(raw) <= text_encoding.DETECT_CAP_BYTES)
     text = text_encoding.decode(raw, encoding).replace("\r\n", "\n").replace("\r", "\n")
@@ -454,20 +263,7 @@ def read_full_text_and_raw(rp: Path) -> tuple[str, bytes]:
 
 def _read_head_for_status(world: str, rel_path: str, size: int = 4096) -> str:
     """`status_document_doctype` 系の遅延読み取り（`world` から実体を解決して先頭を読む）。
-
-    `resolve_lazy` は既定 accepts のみの拡張子では呼ばない（§7 裁定10）ため、登録アナライザ側の
-    大半（cobol/copybook/jcl 等・既定 accepts のまま）では実際には呼ばれない——ただし
-    `HtmlTemplateAnalyzer` は `accepts()` を上書きしているため、`.html`/`.htm`/`.xhtml` では
-    実際に呼ばれる（`size` はその head_bytes 宣言＝64KiB に従う）。**軽量テキスト
-    枠**（`ingest.text_kind`）の第2段（未知拡張子・拡張子なしの内容推定）も、
-    `status_document_doctype`/`status_document_requires_coverage` は
-    `classify_document(..., allow_content_sniff=False)` で呼ぶため、`accepts()` 判定用に既に
-    読んだ head が無い場合はここでも呼ばれない（`classify_document` が `resolve_lazy` の読み取り
-    結果をキャッシュして再利用する）——`manifest_doctype_count`（`ingest/worker.py`
-    がホットパス（毎 sync）で「追加の走査/world root 再解決をしない」前提で使う）がこの関数を
-    経由して `documents.resolve`→`worlds.world_dir` の再解決（DB 往復を伴いうる）へ**追加で**
-    踏み込まないための安全策（2026-09-02・実測: `_run_locked` 系単体テストで world root 解決の
-    モック不足により落ちた）。第1段（拡張子マップ）で判定できる拡張子は元々内容を読まない。
+    `accepts()` を上書きするアナライザの拡張子（`.html` 等）でだけ実際に呼ばれる。status 経路が資料フォルダ root の再解決（DB 往復）へ踏み込まないようにするための入口。
     """
     from . import documents
     rp = documents.resolve(rel_path, world)
@@ -477,26 +273,10 @@ def _read_head_for_status(world: str, rel_path: str, size: int = 4096) -> str:
 
 
 def status_document_doctype(rel_path: str, world: str, *, allow_content_sniff: bool = False) -> str | None:
-    """文書状態APIが列挙する原本のdoctype。対象外の付帯物・重要度設定ファイル自体は ``None``。
-
-    通常の文書台帳は検索可能になった文書だけを返すため、変換に失敗して派生物を持たない
-    Office/画像を列挙できない。状態APIは原本側の対象集合を先に作る必要があるので、既存の
-    文書種別とOffice/PDF/画像の拡張子分類だけをここで共有する。変換可否は判定しない。
-
-    コード判定は `iter_world_documents`/`scan_report` と同じ `classify_document()` を使い、
-    `accepts()` まで見て確定する。読み取れなかった場合は `_UNREADABLE_DOCTYPE_LABEL`
-    （明示の失敗状態・原本自体は存在するので `None` にはしない）。
-    `_重要度.txt`（`importance.is_importance_control_path`）は文書として扱わない（§5の除外契約・
-    `/ext/v1/doc` の配信可否・`document_count` の両方がこの1関数を経由する）——classify_document
-    より前に判定する（除外対象の内容は読まない）。
-
-    `allow_content_sniff`（既定 False）: 軽量テキスト枠（`ingest.text_kind`）の第2段
-    （未知拡張子・拡張子なしの内容推定）を行うか。既定 False は `manifest_doctype_count`
-    （`ingest/worker.py` がホットパスで使う）が想定する「追加の走査/world root 再解決をしない」
-    契約を守るため（`_read_head_for_status` docstring 参照）——manifest 件数分の呼び出しになる
-    経路はこの既定のまま使う。単発の doc_id 解決（`agentic_search.verify_doc_exists`・
-    `ext_api.ext_doc` の配信可否）は `True` を渡す——第2段の文書（未登録拡張子でも内容がテキストと
-    判定できるもの）を「存在しない」と誤判定しないため（1回の追加解決/読み取りのコストは許容する）。
+    """文書状態 API が列挙する原本の doctype。対象外の付帯物・重要度設定ファイル自体は `None`。
+    Office／PDF／画像は拡張子分類だけで数え、変換可否は判定しない。コード判定は `iter_world_documents`／`scan_report` と同じ `classify_document()` を使う。
+    読み取れなかった場合は `_UNREADABLE_DOCTYPE_LABEL`（原本自体は存在するので `None` にしない）。`_重要度.txt` は classify の前に除外する。
+    `allow_content_sniff`（既定 False）: 既定はホットパス（`manifest_doctype_count`）が資料フォルダ root を再解決しないため。単発の doc_id 解決（`verify_doc_exists`・`ext_doc` の配信可否）は True を渡す。
     """
     if importance.is_importance_control_path(rel_path):
         return None
@@ -508,15 +288,8 @@ def status_document_doctype(rel_path: str, world: str, *, allow_content_sniff: b
 
 
 def _doctype_for_count(result: dict, ext: str) -> str | None:
-    """`classify_document()` の戻り値 `result` から集計用 doctype を導く（`status_document_doctype`
-    の判定そのもの・`manifest_doctype_count`/`manifest_doctype_count_from_root`/`scan_report` の
-    `document_count` が全て共有する単一の判定——`result` を再計算せず呼び出し元がキャッシュを渡せる
-    ようにして重複 I/O を避ける）。
-
-    `result["sensitive"]`（秘匿名で早期returnした印・`classify_document` docstring参照）は
-    Office/画像の拡張子分類へ**再度**倒さず無条件で `None`（対象外・件数に入れない）——
-    そうしないと `.env.png`/`credentials.xlsx` 等が「担当なし＝資料として Office/画像 doctype」に
-    再採用されてしまう。
+    """`classify_document()` の戻り値から集計用 doctype を導く単一の判定（`status_document_doctype`／`manifest_doctype_count*`／`scan_report` が共有）。
+    `result["sensitive"]` は Office／画像の拡張子分類へ倒さず無条件で `None`（件数に入れない）。
     """
     if result.get("sensitive"):
         return None
@@ -533,23 +306,11 @@ def _doctype_for_count(result: dict, ext: str) -> str | None:
 
 
 def status_document_reachable(rel_path: str, world: str, *, allow_content_sniff: bool = False) -> bool | None:
-    """文書として実在し、原本DL・実在確認で配信/確認してよいかを3値で返す——曖昧な状態を
-    True/False へ丸めない。
-
-    - `True`：`classify_document()` が「読める」と積極的に確定した（`kind=="code"`／
-      `kind=="document"` で doctype 確定、または Office/PDF/画像＝拡張子分類のみで内容は読まない）。
-    - `False`：積極的に「対象外」と確定した（秘匿名・重要度制御ファイル・内容が実質バイナリ・
-      declined 拡張子等）。
-    - `None`：**判定できなかった**（`kind=="unreadable"`＝内容判定に必要な読み取り自体が失敗。
-      パスが長すぎて `lstat` が失敗する等）。
-
-    呼び出し元は **`is True` のときだけ**配信/実在扱いにする（fail-closed）。`status_document_
-    doctype()` は `kind=="unreadable"` を `_UNREADABLE_DOCTYPE_LABEL`（非 None）として返すため、
-    「配信してよいか」の判定にそのまま使うと判定不能を「読める」と取り違える——`resolve_path`
-    （`os.lstat` で完全パスを都度渡す）と配信側の `open_file_nofollow_walk`（dir_fd 相対で1段ずつ
-    open する・単一コンポーネント長の制約しか受けない）は実効的なパス長上限が異なるため、
-    内容判定だけが失敗し配信は成功する実害があった。`status_document_doctype()` 自体は
-    台帳・件数表示（「読み取れません」の明示バッジ）用に非 None のまま維持する——用途が違う。
+    """文書として実在し、原本 DL・実在確認で配信／確認してよいかを 3 値で返す（曖昧な状態を True／False に丸めない）。
+    - True: 「読める」と確定（コード、doctype 確定の資料、または Office／PDF／画像）。
+    - False: 「対象外」と確定（秘匿名・重要度制御ファイル・実質バイナリ・declined 拡張子等）。
+    - None: 判定できなかった（内容判定の読み取りが失敗）。
+    呼び出し元は `is True` のときだけ配信／実在扱いにする（fail-closed）。`status_document_doctype()` は unreadable を非 None で返すため、配信可否には使わない。
     """
     if importance.is_importance_control_path(rel_path):
         return False
@@ -572,36 +333,18 @@ def status_document_reachable(rel_path: str, world: str, *, allow_content_sniff:
 
 
 def manifest_doctype_count(manifest: dict, world: str) -> int:
-    """`manifest`（`ingest/worker.py` の `world_state()`/`_manifest()` が返す `rel -> [...]` 辞書）から
-    doctype 対応**原本**件数を数える。
-
-    原本が存在するが変換に失敗/未対応な Office/PDF/画像も対象原本として数える——
-    `status_document_doctype()` が None を返す付帯物（semantic/*.json 等）だけを除外する。
-    軽量テキスト枠（`ingest.text_kind`）第1段（拡張子マップ）は内容を読まないため無コスト。
-    ただし `accepts()` を上書きする登録アナライザ（`HtmlTemplateAnalyzer` 等）の拡張子は
-    `status_document_doctype()`→`_read_head_for_status()` が rel ごとに `documents.resolve`→
-    `worlds.world_dir` を再解決（DB 往復もありうる）し、その head（64KiB）を読む——**manifest
-    件数に比例したコスト**になる。呼び出し元がこのコストを避けたい場合は、既に world root を
-    握っている経路から呼ぶ: 直前に `scan_report()` を呼んだ成功確定経路はその戻り値の
-    `document_count`（同一の判定を走査ループ内で算出済み）をそのまま使い、バックフィル
-    （`ingest/worker.py` の unchanged 経路）は `manifest_doctype_count_from_root()`
-    （world root を1回だけ解決）を使う——本関数を直接は呼ばない。
+    """`manifest`（`ingest/worker.py` の `world_state()`／`_manifest()` が返す `rel -> [...]`）から doctype 対応の原本件数を数える。
+    変換に失敗／未対応の Office／PDF／画像も数え、`status_document_doctype()` が None の付帯物だけ除く。
+    `accepts()` を上書きする拡張子は rel ごとに資料フォルダ root を再解決して head を読むため、manifest 件数に比例したコストになる。
+    root を握っている経路からは、`scan_report()` の `document_count` か `manifest_doctype_count_from_root()` を使い、本関数は直接呼ばない。
     """
     return sum(1 for rel in manifest if status_document_doctype(rel, world) is not None)
 
 
 def manifest_doctype_count_from_root(manifest: dict, root) -> int:
-    """`manifest_doctype_count()` と同じ判定（`_doctype_for_count`）を、**解決済みの world root**
-    （呼び出し側が `worlds.world_dir(world)` を一度だけ呼んだ結果）から数える——バックフィル用
-    集計（`ingest/worker.py` の unchanged 経路・`last_doc_count`/`last_manifest` 列の初期補完）専用。
-
-    `manifest_doctype_count()`（`status_document_doctype`→`_read_head_for_status`経由）は accepts()
-    上書きのある拡張子（`.html`等）ごとに `documents.resolve`→`worlds.world_dir` を**個別に**再解決
-    （DB 往復もありうる）する——バックフィルは `world_lock` 保持中に呼ばれるため、manifest 件数分の
-    再解決を1回の解決に潰す。`root` から `ingest.world_graph.resolve_path`（lstat のみ・階層数に
-    比例するコストで実ファイルへ直接降りる）で個々の rel を辿るため、DB 往復は発生しない。
-    `root` が `None`（world 不在）なら全件を読み取り不能として扱う（`manifest_doctype_count` が
-    `documents.resolve` の `None` を経て `_HeadUnreadable` へ倒すのと同じ挙動）。
+    """`manifest_doctype_count()` と同じ判定（`_doctype_for_count`）を、解決済みの資料フォルダ root から数える（バックフィル用集計専用）。
+    root から `ingest.world_graph.resolve_path`（lstat のみ）で辿るため DB 往復が無く、`world_lock` 保持中の呼び出しに向く。
+    `root` が None なら全件を読み取り不能として扱う。
     """
     from .ingest import world_graph
 
@@ -626,42 +369,10 @@ def manifest_doctype_count_from_root(manifest: dict, root) -> int:
     return count
 
 
-def status_document_requires_coverage(rel_path: str, world: str) -> bool:
-    """文書状態の根拠として Canonical coverage を要求する形式か（Office/PDF/画像のみ True）。
-
-    `allow_content_sniff=False`（`status_document_doctype` と同じ理由・docstring参照）。
-    """
-    ext = Path(rel_path).suffix.lower()
-    result = classify_document(
-        rel_path, ext, lambda size=4096: _read_head_for_status(world, rel_path, size),
-        allow_content_sniff=False)
-    if result.get("sensitive"):          # 秘匿名は Office/画像へ再採用しない（`_doctype_for_count` と同じ理由）
-        return False
-    if result["kind"] in ("code", "unreadable") or result["doctype"] is not None:
-        return False
-    if ext in _OFFICE_DOCTYPE:
-        return True
-    from .ingest import office_md
-    return ext in office_md.IMAGE_EXT
-
-
 def last_run_flags(world: str, *, deadline: float | None = None) -> list | None:
     """直近の ingest run（`store.get_latest_run_summary`）の `extraction_snapshot.flags`。
-
-    `deadline`（省略可・`time.monotonic()` 系の絶対期限・既定 None＝無期限＝既存呼び出し元は
-    無変更）: `agentic_search.run_tool` の list_docs ツール打切り契約（`doc_ledger.documents_for`
-    経由）に合わせ、残り時間を接続/SQL の statement timeout として `store.get_latest_run_summary`
-    （RV2是正#a3・以前は `store.list_ingest_runs`）へ渡す。超過時・DB 例外時は呼ばず（または
-    結果を待たず）打ち切り、warning ログを残して **`None`** を返す——「blocked 無し」と混同しない
-    よう、呼び出し元（`last_run_blocked_docs`）に「確認できなかった」ことを明示的に伝える
-    （黙って空へ丸めない）。run 自体が無い/flags が無ければ空リスト（＝正常に「blocked 無し」と
-    確認できた）。
-
-    `list_ingest_runs(world, limit=1)` は `source_doc_ids`（world の全文書名を持つ JSONB 配列・
-    大規模 world では際限なく大きい）まで毎回読む——本関数は `doc_ledger.public_documents_page`
-    が `world_lock_shared`（共有ロック）保持中に呼ぶ経路を持つため、この重い列を読むと O(N)
-    （文書総数比例）の転送・deserialize を共有ロック区間へ持ち込んでしまう。`get_latest_run_summary`
-    （`source_doc_ids` を持たない狭い SELECT・`GET /worlds/{wid}/status` と共用）に置き換える。
+    `deadline`（省略可・`time.monotonic()` 系の絶対期限）: 残り時間を接続／SQL の statement timeout として渡す。超過時・DB 例外時は warning を残して `None`（＝確認できなかった。「blocked 無し」と混同させない）。
+    run 自体が無い／flags が無ければ空リスト。`source_doc_ids` を持たない狭い SELECT を使う（`public_documents_page` が共有ロック中に呼ぶため、重い列を読まない）。
     """
     from . import store
     kwargs = {}
@@ -683,14 +394,8 @@ def last_run_flags(world: str, *, deadline: float | None = None) -> list | None:
 
 
 def last_run_blocked_docs(world: str, *, deadline: float | None = None) -> dict | None:
-    """直近 run の blocked flag（doc 付きのみ）を `{doc: reason}` で返す。**`None`＝確認できなかった**
-    （DB 例外・打切り期限超過）——呼び出し元は「blocked 無し」（空 dict）と区別し、対象文書を
-    黙って「使えます」のままにしない（`doc_ledger.documents_for` 参照）。
-
-    既定 accepts の言語（cobol/copybook/jcl）は `resolve_lazy` が内容を読まない短絡（§7 裁定10）
-    のため、`classify_document`（列挙・`scan_report`・文書一覧が共有する判定）だけでは実際の
-    読み取り失敗（`world_graph.build_world` Pass1 の実読込＋OSError 検知）を検知できない——
-    実際にファイルを開く直近 ingest run の結果を突き合わせて上書きするための材料。
+    """直近 run の blocked flag（doc 付きのみ）を `{doc: reason}` で返す。`None`＝確認できなかった（呼び出し元は空 dict と区別し、黙って「使えます」にしない）。
+    既定 accepts の言語（cobol/copybook/jcl）は `resolve_lazy` が内容を読まないため、`classify_document` だけでは実読込の失敗を検知できない。実際にファイルを開いた直近 run の結果を突き合わせる材料。
     """
     flags = last_run_flags(world, deadline=deadline)
     if flags is None:
@@ -701,23 +406,19 @@ def last_run_blocked_docs(world: str, *, deadline: float | None = None) -> dict 
 
 
 def _office_convertible() -> set:
-    """今 MD化できる Office/PDF 拡張子（OOXML＋PDFバックエンド有無で動的）。office_md が唯一の真実源。"""
+    """今 MD 化できる Office／PDF 拡張子（`office_md` が唯一の真実源）。"""
     from .ingest import office_md
     return office_md.convertible_exts()
 
 
 def _image_convertible(conv: set) -> set:
-    """今MD化できる画像拡張子。PNG/JPEGは決定的metadata経路、その他は任意vision経路。
-
-    真実源は `office_md.convertible_exts()`（既に受け取った `conv`）と `office_md.IMAGE_EXT` の積＝
-    ``convertible_exts``との積を真実源にし、OCR/VLMが無くてもPNG/JPEGは対象になる。
-    """
+    """今 MD 化できる画像拡張子（`office_md.convertible_exts()` と `office_md.IMAGE_EXT` の積）。PNG／JPEG は決定的 metadata 経路、その他は任意の vision 経路。"""
     from .ingest import office_md
     return conv & office_md.IMAGE_EXT
 
 
 def _scope_meta(rel: str) -> dict:
-    """rel_path → {top_scope, phase, category}。導出は scope_infer に集約（rv-full B3）。"""
+    """rel_path → {top_scope, phase, category}（導出は scope_infer）。"""
     return si.rel_scope_meta(rel)
 
 
@@ -733,11 +434,7 @@ def _note_value(notes, key: str) -> str | None:
 
 
 def _coverage_notice_status(md_path: Path) -> str | None:
-    """検索可能なpartial noticeならcoverage statusを返す。
-
-    MDの存在と内容抽出成功を同一視しないための表示用判定。Canonicalな判定は
-    Evidence/coverage台帳にあり、ここでは既存status APIの互換カウンタだけを補う。
-    """
+    """検索可能な partial notice なら coverage status を返す（表示用判定。既存 status API の互換カウンタだけを補う）。"""
     raw = json_io.read_json(Path(str(md_path) + ".meta.json"))
     if not isinstance(raw, dict):
         return None
@@ -746,28 +443,20 @@ def _coverage_notice_status(md_path: Path) -> str | None:
 
 
 def provenance_summary(md_path) -> dict | None:
-    """派生MD の来歴サイドカー（`office_md` が書く `{md_path}.meta.json`）から**画面表示用**の要約を作る。
-
-    「どう読み取ったか」バッジ（ingest.html・S2）のデータ源。**追加の記録は一切せず**、既にある来歴
-    （A1 のサイドカー）を読むだけ（表示のみ）。返値（あれば）:
-
-    - `method`（`ooxml`／`pdf_text`／`vision`）＝主たる読み取り方法（アンカー）。
+    """派生 MD の来歴サイドカー（`{md_path}.meta.json`）から画面表示用の要約を作る（「どう読み取ったか」バッジ用・読むだけ）。返値（あれば）:
+    - `method`（`ooxml`／`pdf_text`／`vision`）＝主たる読み取り方法。
     - `confidence`（0.0〜1.0）＝アームの確信度。
-    - `legacy_backend`（`libreoffice`／`office_com` 等）＝旧形式（.doc/.xls/.ppt）を前段変換した時のバックエンド名
-      （notes の `legacy_backend=…` 由来・あれば）。
-    - `has_conflicts`（True のみ）＝決定的マージ（A4）で「別の読み方で追加内容」が見つかった文書。
-
-    ソース文書（`md_path` 無し）・サイドカー欠落/型不正・method 欠落は **None**（＝バッジを出さない・後方互換）。
-    best-effort（読取失敗は None）。**per-doc の小さな JSON 読み**（`es_index._provenance_meta` と同型）で、
-    md_path を持つ Office/画像枝の文書だけが読む（ソース文書は md_path 無し＝この関数を呼ぶ前に None で弾かれる）。
+    - `legacy_backend`（`libreoffice`／`office_com` 等）＝旧形式を前段変換したバックエンド名（notes の `legacy_backend=…`）。
+    - `has_conflicts`（True のみ）＝決定的マージで「別の読み方で追加内容」が見つかった文書。
+    `md_path` 無し・サイドカー欠落／型不正・method 欠落・読取失敗は None（バッジを出さない）。
     """
     if not md_path:
         return None
-    raw = json_io.read_json(Path(str(md_path) + ".meta.json"))    # 無い/壊れは None
+    raw = json_io.read_json(Path(str(md_path) + ".meta.json"))  # 無い／壊れは None
     if not isinstance(raw, dict):
         return None
     method = raw.get("method")
-    if not (isinstance(method, str) and method):                  # method がアンカー（無ければ表示すべきものが無い）
+    if not (isinstance(method, str) and method):  # method がアンカー（無ければ表示すべきものが無い）
         return None
     out: dict = {"method": method}
     conf = raw.get("confidence")
@@ -776,23 +465,15 @@ def provenance_summary(md_path) -> dict | None:
     lb = _note_value(raw.get("notes"), "legacy_backend")
     if lb:
         out["legacy_backend"] = lb
-    if raw.get("conflicts"):                                       # A4 マージが差分を出した文書だけ（空/無しは付けない）
+    if raw.get("conflicts"):  # マージが差分を出した文書だけ
         out["has_conflicts"] = True
     return out
 
 
 def _text_oversize(rp: Path) -> bool:
-    """`kind=="code"` の文書全般（登録アナライザ＝cobol/copybook/jcl/java/xml_config/properties/
-    yaml_config・軽量テキスト枠の汎用コードの両方）に適用するサイズ超過判定（grep 上限と同じ 8MiB・
-    単一の真実源＝`text_kind.MAX_BYTES`）。`.md`/`.txt`・Office/画像には適用しない——呼び出し側が
-    `result["kind"] == "code"` のときだけ呼ぶ（`_NONCODE_DOCTYPE` 由来の資料判定はここを通らない）。
-
-    登録アナライザは `corpus_docs.classify_document()` の accepts() 判定だけでは実ファイルサイズを
-    見ないため、この上限が無いと `world_graph.build_world()` の Pass1 が `read_full_text_and_raw()` で
-    巨大ファイルを全量メモリに読み込んでしまう（単一 worker を1ファイルで OOM させ得る）。8MiB 超のソース
-    （COBOL/Java/設定ファイル問わず）は実務上あり得ない前提で、コード種別は言語を問わず一律に
-    この上限を適用する。stat 失敗（消失・権限）はサイズ超過として扱わない（実読込の失敗は別経路
-    （`unreadable`）が拾う対象で、本関数の責務ではない）。
+    """`kind=="code"` の文書全般（登録アナライザ・軽量テキスト枠の汎用コード）に適用するサイズ超過判定（`text_kind.MAX_BYTES`＝8MiB・grep 上限と同じ）。
+    `.md`／`.txt`・Office／画像には適用しない（呼び出し側が `kind == "code"` のときだけ呼ぶ）。巨大ファイルの全量読み込みによる OOM を防ぐ。
+    stat 失敗はサイズ超過として扱わない。
     """
     try:
         return rp.stat().st_size > text_kind.MAX_BYTES
@@ -801,12 +482,8 @@ def _text_oversize(rp: Path) -> bool:
 
 
 def _size_exceeded_row(rel: str, doctype: str, branch: str) -> dict:
-    """軽量テキスト枠のサイズ超過を台帳行へ（`failure_reasons` の既存語彙 `size_exceeded` を再利用）。
-
-    `state="unreadable"` にする（`es_index.index_world`/`ingest.worker._ledger_rows` の唯一の
-    索引スキップ・ステータス判定ゲートと同じ値＝新しい state 値を増やさない）。`doctype`/`branch`
-    は判定済みの値をそのまま残す（「何のファイルか」は分かる状態を保つ・`doc_ledger` の
-    blocked flag 反映と同じ流儀）。
+    """軽量テキスト枠のサイズ超過を台帳行へ（`failure_reasons` の `size_exceeded` を再利用）。
+    `state="unreadable"` にし（`es_index.index_world`／`ingest.worker._ledger_rows` の索引スキップ判定と同じ値）、`doctype`／`branch` は判定済みの値を残す。
     """
     from .ingest.failure_reasons import REASON_CATALOG
     return {"name": rel, "path": rel, "doctype": doctype, "branch": branch, "analyzer": None,
@@ -814,27 +491,19 @@ def _size_exceeded_row(rel: str, doctype: str, branch: str) -> dict:
             "reason": "size_exceeded", "md_path": None, **_scope_meta(rel)}
 
 
-# `scan_report()` へフィールドを追加したとき、追加前に保存された `worlds.last_scan_report`
-# はこのキーを持たない——`routers.worlds._ingest_summary`（response_model 必須フィールド）・
-# `ingest.worker._sync_impl`（無変更同期のバックフィル判定）が `scan_report_missing_fields()`
-# 経由で共有する単一のキー集合。
+# `scan_report()` のフィールド追加前に保存された `worlds.last_scan_report` が持たないキーの集合。
+# `routers.worlds._ingest_summary`・`ingest.worker._sync_impl` が `scan_report_missing_fields()` 経由で共有する
 SCAN_REPORT_REQUIRED_KEYS = ("sensitive_excluded", "unreachable_as_text", "unreachable_as_text_by_ext",
                             "unreachable_by_reason", "encoding_partial_count")
 
 
 def scan_report_missing_fields(rep) -> bool:
-    """`rep`（`last_scan_report` 列の値）が dict だが `SCAN_REPORT_REQUIRED_KEYS` のいずれかを
-    持たない（フィールド追加前に保存された旧形式）なら True。dict でない（None 等）場合は False
-    （呼び出し元の `is None` 判定と別に扱う——完全欠落と旧形式は別の枝）。"""
+    """`rep`（`last_scan_report` 列の値）が dict だが `SCAN_REPORT_REQUIRED_KEYS` のいずれかを持たない（旧形式）なら True。dict でない（None 等）は False。"""
     return isinstance(rep, dict) and any(k not in rep for k in SCAN_REPORT_REQUIRED_KEYS)
 
 
 def empty_scan_report() -> dict:
-    """`scan_report()` の全ゼロ形（world 未解決の返値と同形）。
-
-    `GET /worlds/{wid}/status` が事前集計（`worlds.last_scan_report`）を持たない world に対して
-    「未集計」を示すためのプレースホルダとしても使う（呼び出し元はフォルダを歩かない）。
-    """
+    """`scan_report()` の全ゼロ形（資料フォルダ未解決の返値と同形）。事前集計を持たない資料フォルダの「未集計」プレースホルダにも使う。"""
     return {"scanned": 0, "indexed": 0, "by_doctype": {}, "office_md": 0,
             "skipped_office": 0, "office_failed": 0, "skipped_other": 0, "skipped_ext": {},
             "analyzer_declined": 0, "analyzer_declined_as_document": 0, "unreadable": 0,
@@ -844,83 +513,43 @@ def empty_scan_report() -> dict:
 
 
 def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> dict:
-    """world 走査の内訳（**取り込み状況の正直化**）。インデックス済み・未対応形式・拡張子別の件数を返す。
+    """資料フォルダ走査の内訳（インデックス済み・未対応形式・拡張子別の件数）。
 
-    `expected_rels`（省略可）: 呼び出し元が既に持つ rel 集合（取り込み冒頭の manifest 等）。本走査
-    （`si.safe_files(wd)`）が実際に見た rel 集合と一致した場合だけ `document_count` を実値で返す
-    ——不一致（本走査より前の集合を渡した後、その間にファイルが追加/削除された＝世代混在）なら
-    `document_count` を `None` にして更新を保留する（呼び出し元が古い/新しい世代の値を取り違えて
-    確定しないための安全弁）。省略時（`None`）は従来どおり比較せず実値をそのまま返す。
+    `expected_rels`（省略可）: 呼び出し元が持つ rel 集合。本走査の rel 集合と一致した場合だけ `document_count` を実値で返し、不一致（走査中に増減＝世代混在）なら `None` にして更新を保留する。省略時は比較しない。
 
-    `indexed`＝検索対象になる本文（ソース/設計書/テキスト＋**MD化できた Office**＋（OCR 有効時のみ）**OCR できた画像**）。
-    `office_md`＝そのうち検索可能なOffice MD（明示partial noticeを含む。画像は別集計）。
-    `office_failed`/`skipped_office`はnoticeが検索可能でも内容抽出に失敗/未対応なら併記するため、
-    `indexed`と排他的な件数ではない。`skipped_other`＝その他（json 等）。
-    Office/画像の MD化済みは派生領域（`worlds.derived_dir`）に `{rel}.md` があるかで判定（＝実態に一致）。
-    **既定（OCR 無効）では画像は従来どおり `skipped_other` に落ちる**（`_image_convertible` が空集合＝この分類は不変）。
-
-    `analyzer_declined`＝担当アナライザは居たが `accepts()` が全滅し、かつ既存の資料種別
-    （md/office/txt/画像等）にも該当しない＝**未対応**として残った件数（`skipped_other` と重複してよい
-    内訳・§7 裁定10「既存の資料種別に該当するものは資料・それ以外は未対応」）。
-    `analyzer_declined_as_document`＝`accepts()` が全滅したが既存の資料種別（md/office/txt/画像）に
-    該当し**資料として扱われた**件数（`indexed`／`office_md`／`office_failed`／`skipped_office` の
-    いずれかと重複してよい内訳・Office/画像判定を確定してから加算する＝資料扱いを未対応に誤集計
-    しない）。現行の登録拡張子構成（cobol/copybook/jcl のみ）では常に0＝コード拡張子と資料拡張子が
-    排他のため。将来アナライザが既存の資料拡張子を要求した場合に非0になる。
-    `unreadable`＝内容判定が必要だったが読み取れず明示の失敗にした件数（`iter_world_documents`/
-    `status_document_doctype` と同じ `classify_document()` を共有）。`kind=="code"` 全般
-    （登録アナライザ＝cobol/copybook/jcl/java/xml_config/properties/yaml_config・軽量テキスト枠の
-    汎用コードの両方）のサイズ超過（8MiB・grep 上限と同じ・`_text_oversize` 参照）もここへ合流する
-    （`skipped_ext` にも計上・`failure_reasons.REASON_CATALOG["size_exceeded"]` と同じ理由）——
-    新しいカウンタは増やさない。
-    `document_count`＝`manifest_doctype_count()`/`status_document_doctype()` と同一の判定（doctype
-    対応原本件数・`/ext/v1/capabilities` の `document_count` の材料）をこのループ内で算出したもの。
-    `_doctype_for_count()` を共有し、本ループが既に読んだ head を再利用する（追加 I/O・world root
-    再解決なし）——`ingest/worker.py` の成功確定経路はこの値をそのまま `confirm_doc_count` に使い、
-    `manifest_doctype_count()` を別途呼ばない（HTML 等の accepts() 上書きアナライザに対する per-file
-    `documents.resolve`→`worlds.world_dir` 再解決の重複を無くす）。
-
-    `sensitive_excluded`＝秘匿名（`text_kind.is_sensitive`）で分類自体をスキップした件数——拡張子
-    内訳は持たない（存在を推測させない）。`unreachable_as_text`＝`reachable_as_text` が False になる
-    （＝grep/read_around/ES 索引のどれからも本文を読めない）ファイルの総数（`unreadable` の読み取り
-    失敗・サイズ超過分＋`skipped_other` のうち Office/画像でも無い未分類分＋`sensitive_excluded` の
-    合算）。`unreachable_as_text_by_ext`＝そのうち秘匿を除いた拡張子別内訳（`skipped_ext` とは別の
-    Counter——`skipped_ext` は Office/画像の変換失敗・未対応も混ざるため、本文readabilityだけの
-    内訳を別に持つ）。
-
-    SRH-05（原本の符号化・読み取りの正直化）: `classify_document(..., text_quality=...)` を通して
-    原本ツリーの符号化品質を判定する（Office/PDF/画像・秘匿名・未対応拡張子は対象外のまま・
-    `classify_document` docstring 参照）。`unreachable_by_reason`＝`unreachable_as_text` の内訳の
-    うち理由コードが判明しているものだけの Counter（キーは `failure_reasons.REASON_CATALOG` の
-    語彙——現状 `"encoding_undetermined"`／`"binary"`。バイナリ（`ingest.text_kind.sniff_content`
-    が判定・未知拡張子のみ）と符号化判別不能（登録拡張子も含む全テキストが対象）はどちらも
-    `other`/`unreachable_as_text_by_ext` へ既に合流済みの内訳を、理由別にも見せるだけ——二重計上
-    ではない）。`encoding_partial_count`＝対象外にはしないが置換文字が残る（`quality_of`＝
-    `"partial"`）ファイルの件数——`unreachable_as_text` には**含めない**（読める・検索/精読の対象の
-    まま・要確認の別枠）。
+    - `indexed`＝検索対象になる本文（ソース／設計書／テキスト＋MD 化できた Office＋OCR できた画像）。
+    - `office_md`＝そのうち検索可能な Office MD（明示 partial notice を含む）。`office_failed`／`skipped_office` は notice があっても内容抽出に失敗／未対応なら併記するので `indexed` と排他ではない。
+    - `skipped_other`＝その他（json 等）。Office／画像の MD 化済みは派生領域に `{rel}.md` があるかで判定。既定（画像変換が無効）では画像は `skipped_other` に落ちる。
+    - `analyzer_declined`＝担当アナライザは居たが `accepts()` が全滅し、既存の資料種別にも該当しない＝未対応として残った件数（`skipped_other` と重複してよい）。
+    - `analyzer_declined_as_document`＝`accepts()` が全滅したが既存の資料種別に該当し資料として扱われた件数。
+    - `unreadable`＝内容判定が必要だったが読めず明示の失敗にした件数。`kind=="code"` のサイズ超過（8MiB・`_text_oversize`）もここへ合流する（`skipped_ext` にも計上）。
+    - `document_count`＝`manifest_doctype_count()`／`status_document_doctype()` と同一の判定（`/ext/v1/capabilities` の `document_count` の材料）を、本ループが読んだ head を再利用して算出したもの。
+    - `sensitive_excluded`＝秘匿名で分類自体をスキップした件数（拡張子内訳は持たない）。
+    - `unreachable_as_text`＝grep／read_around／ES 索引のどれからも本文を読めないファイルの総数（`unreadable`＋`skipped_other` の未分類分＋`sensitive_excluded`）。`unreachable_as_text_by_ext`＝そのうち秘匿を除いた拡張子別内訳。
+    - `unreachable_by_reason`＝`unreachable_as_text` のうち理由コードが判明しているものの内訳（`"encoding_undetermined"`／`"binary"`）。
+    - `encoding_partial_count`＝対象外にはしないが置換文字が残る（`quality_of` が `"partial"`）ファイルの件数（`unreachable_as_text` には含めない）。
     """
     wd = worlds.world_dir(world)
     if not wd:
         return empty_scan_report()
     derived = worlds.derived_md_dir(world)
-    conv = _office_convertible()                       # OOXML＋（バックエンド有なら）PDF
-    image_exts = _image_convertible(conv)              # 画像（OCR 有効時のみ非空・既定は空＝画像は下の else へ）
+    conv = _office_convertible()  # OOXML＋（バックエンド有なら）PDF
+    image_exts = _image_convertible(conv)  # 画像（変換が有効なときのみ非空）
     (indexed, by, office_md_n, office_skip, office_fail, other, skipped_ext,
      analyzer_declined, analyzer_declined_as_document, unreadable, doc_count) = (
         0, Counter(), 0, 0, 0, 0, Counter(), 0, 0, 0, 0)
     sensitive_excluded = 0
-    unreachable_ext: Counter = Counter()   # `unreadable`＋`other`（本文readability起因のみ）の拡張子別内訳
-    unreachable_by_reason: Counter = Counter()   # SRH-05: 理由コードが判明している分だけの内訳
-    encoding_partial_count = 0                    # SRH-05: 対象外にしない「一部が化けている」件数
+    unreachable_ext: Counter = Counter()  # `unreadable`＋`other`（本文 readability 起因のみ）の拡張子別内訳
+    unreachable_by_reason: Counter = Counter()  # 理由コードが判明している分だけの内訳
+    encoding_partial_count = 0  # 対象外にしない「一部が化けている」件数
     scanned = 0
-    # `expected_rels` 比較用（省略時は集めない＝無駄なメモリ確保を避ける）。manifest と同じ母集合
-    # （重要度設定ファイルも含む全 rel）にするため、下の `continue` より前で追加する。
+    # `expected_rels` 比較用（省略時は集めない）。manifest と同じ母集合にするため、下の `continue` より前で追加する
     actual_rels: set | None = set() if expected_rels is not None else None
     for rp, rel in si.safe_files(wd):
         scanned += 1
         if actual_rels is not None:
             actual_rels.add(rel)
-        if importance.is_importance_control_path(rel):  # 重要度設定ファイル自体は検索可能数・by_doctype に数えない（§5）
+        if importance.is_importance_control_path(rel):  # 重要度設定ファイル自体は検索可能数・by_doctype に数えない
             continue
         ext = rp.suffix.lower()
         head_cache: dict = {}
@@ -932,27 +561,15 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
 
         result = classify_document(rel, ext, _cached_read_head,
                                    text_quality=lambda rp=rp: _text_quality_for(rp))
-        if result.get("sensitive"):          # 秘匿名: 台帳にも by_doctype/skipped_ext にも入れない
+        if result.get("sensitive"):  # 秘匿名: 台帳にも by_doctype／skipped_ext にも入れない
             _log.warning("scan_report: 秘匿名のため対象外にしました（doctype=対象外 ext=%s）", ext)
-            sensitive_excluded += 1          # 拡張子内訳は持たない（存在を推測させない）
+            sensitive_excluded += 1  # 拡張子内訳は持たない（存在を推測させない）
             continue
-        # SRH-05: 理由が判明している「対象外」の内訳（`unreachable_as_text` には含めない——
-        # このあとの分岐で `result` は "code"/doctype 付きのまま扱われ、`indexed` 等の既存の
-        # 集計を通常どおり増やす）。「一部が化けている」件数（`encoding_partial_count`）は
-        # `indexed` を実際に加算する分岐（下の "code"/doctype 分岐）でだけ数える——ここで
-        # 数えると、サイズ超過で対象外（`unreadable`）になる資料まで二重に数えてしまう。
+        # 理由が判明している「対象外」の内訳（`unreachable_as_text` には含めない）。`encoding_partial_count` は `indexed` を加算する分岐でだけ数える（サイズ超過との二重計上を避ける）
         ur_reason = result.get("unreadable_reason")
         if ur_reason:
             unreachable_by_reason[ur_reason] += 1
-        # `document_count`（`/ext/v1/capabilities` の doc_count が使う値）: `manifest_doctype_count`/
-        # `status_document_doctype` と同一の判定（`allow_content_sniff=False`）を、本ループが既に
-        # 読んだ head を `_cached_read_head` 経由で再利用して求める——`registry` の登録済みアナライザ
-        # （`accepts()` 上書き含む＝HTML等）は `allow_content_sniff` の影響を受けない経路のため
-        # キャッシュヒットで追加 I/O ゼロ、軽量テキスト枠の2段目（内容推定）だけが `allow_content_
-        # sniff=False` で短絡し従来どおり対象外のまま——`ingest/worker.py` の成功確定経路
-        # （`confirm_doc_count`）はこの値をそのまま使い、`manifest_doctype_count()`（`status_
-        # document_doctype`→`documents.resolve`→`worlds.world_dir` の per-file 再解決を伴う）を
-        # 別途呼ばずに済む。
+        # `document_count`: `manifest_doctype_count`／`status_document_doctype` と同一の判定を、本ループが読んだ head を `_cached_read_head` で再利用して求める
         if _doctype_for_count(classify_document(rel, ext, _cached_read_head, allow_content_sniff=False),
                               ext) is not None:
             doc_count += 1
@@ -962,31 +579,29 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
             continue
         if result["kind"] == "code":
             if _text_oversize(rp):
-                unreadable += 1                         # 登録アナライザ/軽量テキスト枠のコード全般・サイズ超過は対象外（failure_reasons.size_exceeded）
+                unreadable += 1  # コード全般のサイズ超過は対象外（failure_reasons.size_exceeded）
                 skipped_ext[ext] += 1
                 unreachable_ext[ext or "(拡張子なし)"] += 1
                 continue
             indexed += 1
             by[result["doctype"]] += 1
-            if result.get("encoding_partial"):          # SRH-05: 対象外にしない「一部が化けている」件数
+            if result.get("encoding_partial"):
                 encoding_partial_count += 1
             continue
-        if result["doctype"] is not None:              # 資料表（.md/.txt 等）にある拡張子
+        if result["doctype"] is not None:
             if result["doctype"] == text_kind.DOCUMENT_DOCTYPE_LABEL and _text_oversize(rp):
-                unreadable += 1                         # 軽量テキスト枠のみ・サイズ超過は対象外
+                unreadable += 1  # 軽量テキスト枠のみ・サイズ超過は対象外
                 skipped_ext[ext] += 1
                 unreachable_ext[ext or "(拡張子なし)"] += 1
                 continue
             indexed += 1
             by[result["doctype"]] += 1
-            if result.get("encoding_partial"):          # SRH-05: 対象外にしない「一部が化けている」件数
+            if result.get("encoding_partial"):
                 encoding_partial_count += 1
-            if result["had_code_candidates"]:           # 担当アナライザは居たが accepts() 全滅＝資料として扱う
+            if result["had_code_candidates"]:  # 担当アナライザは居たが accepts() 全滅＝資料として扱う
                 analyzer_declined_as_document += 1
             continue
-        # 「担当なし」の内訳（未対応 vs 資料扱い）は、Office/画像という**既存の資料種別**に
-        # 該当するかを確定してから振り分ける（先に analyzer_declined へ倒すと、資料として使える
-        # Office/画像まで「未対応」に誤集計する・§7 裁定10）。
+        # 「担当なし」の内訳（未対応 vs 資料扱い）は、Office／画像という既存の資料種別に該当するかを確定してから振り分ける
         if ext in _OFFICE_DOCTYPE:
             if result["had_code_candidates"]:
                 analyzer_declined_as_document += 1
@@ -1000,32 +615,30 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
                     office_fail += 1
                 elif notice_status == "unsupported":
                     office_skip += 1
-            elif ext in conv:                          # 変換可能形式だが派生MD無し＝変換失敗（壊れ/暗号化/スキャン=OCR要）
+            elif ext in conv:  # 変換可能形式だが派生 MD 無し＝変換失敗
                 office_fail += 1
                 skipped_ext[ext] += 1
-            else:                                      # PDF/旧バイナリ（MVP 未対応）
+            else:  # PDF／旧バイナリ（未対応）
                 office_skip += 1
                 skipped_ext[ext] += 1
-        elif ext in image_exts:                        # PNG/JPEGはmetadata、その他は任意vision経路
+        elif ext in image_exts:
             if result["had_code_candidates"]:
                 analyzer_declined_as_document += 1
-            if (derived / (rel + ".md")).is_file():    # image_exts ⊆ conv なので変換可否は判定済み
+            if (derived / (rel + ".md")).is_file():  # image_exts ⊆ conv なので変換可否は判定済み
                 indexed += 1
-                by[_IMAGE_DOCTYPE_LABEL] += 1          # 「画像」を doctype に（office_md_n＝Office/PDF 用なので触らない）
-            else:                                      # OCR で文字が取れなかった＝変換失敗
+                by[_IMAGE_DOCTYPE_LABEL] += 1
+            else:  # 文字が取れなかった＝変換失敗
                 office_fail += 1
                 skipped_ext[ext] += 1
-        else:                                          # 既存の資料種別に該当しない＝未対応（§7 裁定10）
-            # SRH-05: `classify_document` は undetermined を document/None へ書き換えても
-            # `had_code_candidates` はそのまま残す——理由が符号化（`ur_reason` あり）なら
-            # アナライザは何も拒否していないので「未対応」には数えない（二重の理由を出さない）。
+        else:  # 既存の資料種別に該当しない＝未対応
+            # 符号化が理由（`ur_reason` あり）ならアナライザは何も拒否していないので「未対応」には数えない
             if result["had_code_candidates"] and not ur_reason:
                 analyzer_declined += 1
             other += 1
             skipped_ext[ext or "(拡張子なし)"] += 1
             unreachable_ext[ext or "(拡張子なし)"] += 1
     if expected_rels is not None and actual_rels != expected_rels:
-        doc_count = None            # 世代混在（走査中の増減）＝実値を確定できないので更新保留
+        doc_count = None  # 世代混在（走査中の増減）＝実値を確定できないので更新保留
     return {"scanned": scanned, "indexed": indexed, "by_doctype": dict(by), "office_md": office_md_n,
             "skipped_office": office_skip, "office_failed": office_fail,
             "skipped_other": other, "skipped_ext": dict(skipped_ext),
@@ -1041,73 +654,35 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
 
 def iter_world_documents(world: str, include_rag: bool = False, *, root=None, deadline: float | None = None,
                          files=None):
-    """world の文書一覧（rel_path＝doc_id・フォルダ由来の範囲メタ付き）。**存在しない world は空**。
-
-    本文（ソース/設計書/テキスト）＋ **MD化できた Office**（派生 `{rel}.md` あり）＋（OCR 有効時のみ）
-    **OCR できた画像**を載せる。PDF/旧形式など未変換の Office は台帳に載せない（`scan_report.skipped_office`
-    で可視化）。**既定（OCR 無効）では画像は載らない**（`_image_convertible` が空集合＝ES/検索対象にも入らない）。
-
-    `include_rag=True`は**rag 表現を正本とする消費者向け**（ES索引＝`es_index.index_world`、
-    グラフの言及エッジ＝辞書突合＝`world_graph.build_world`）。`{rel}.rag.md`があればそれを`md_path`に採り、
-    無ければ legacy `{rel}.md`へ落ちる（`grep_tool.preferred_derived_name`と同じ優先順位＝
-    grep/ES/グラフが同じ物理ファイルを見る）。通常MDを作れないimage-only PDFもこれで検索対象に入る。
-    既定Falseなので台帳・preview・legacy索引の従来挙動は変えない。
-
-    `root`（省略可）: 呼び出し側が既に world root を解決済みなら渡す（`worlds.world_dir()` を
-    再度呼ばない）——文書列挙と重要度解決を同一 root から行いたい呼び出し元向け
-    （`doc_ledger.public_documents`/`preview_documents` 参照）。
-    `files`（省略可・キーワード専用）: 呼び出し側が既に `scope_infer.safe_files(wd)` を1回
-    materialize（`list(...)`）済みなら渡す——与えられれば `si.safe_files` を呼ばない（`deadline`
-    もこのとき無視される＝列挙自体は呼び出し側の責務。§③ 2026-09-01・`preview_service.build_preview`
-    が文書列挙／重要度解決／診断の3消費者へ同じ list を配って二重の全木走査を避けるのに使う）。
-    `deadline`（省略可・キーワード専用・既定 None＝無期限＝既存呼び出し元は無変更）:
-    `scope_infer.safe_files` へそのまま転送する（PART-4 の `agentic_search.run_tool` が残り時間
-    ベースで渡す・超過時は `scope_infer.ScopeWalkDeadlineExceeded` を送出）。
-
-    コード拡張子で `accepts()` 内容判定が必要なのに読み取れなかった文書は `state="unreadable"`
-    （`doctype`/`branch`/`analyzer` は `None`・`reason="read_failed"`）で載せる——資料としても除外しない。
-
-    `analyzer`＝担当アナライザの内部名（`Analyzer.name`）。`kind=="code"` の文書だけ非 `None`
-    （§7 裁定2の受入条件＝取り込み画面・影響分析の根拠表示で担当アナライザを参照できるようにする）。
-    軽量テキスト枠（`ingest.text_kind`＝未登録拡張子のテキストファイル）は登録アナライザを持たない
-    ため `analyzer=None`（`doctype` は `text_kind.CODE_DOCTYPE_LABEL`/`DOCUMENT_DOCTYPE_LABEL`）。
-    サイズ超過（8MiB・grep 上限と同じ）は `state="unreadable"`／`reason="size_exceeded"`
-    （`failure_reasons.REASON_CATALOG` の既存語彙を再利用・派生MD もベクトル/グラフも作らない
-    ＝原文をそのまま grep/ES 全文の対象にする）。
-
-    SRH-05: 文字コードを判別できない原本（登録拡張子・軽量テキスト枠の両方が対象）は
-    `state="unreadable"`／`reason="encoding_undetermined"` で載せる（`read_failed`/`size_exceeded`
-    と同じ既存の出し方）。ただしバイナリ（`text_kind.sniff_content` 判定）は**この行に含めない**
-    ——バイナリの未知拡張子は従来どおり一覧に出ない契約（`test_stage2_binary_unknown_extension_
-    is_not_listed` が固定）を保つ。対象外にしない「一部が化けている」（`encoding_partial`）は
-    通常どおり `state="ready"` のまま、行へ `encoding_partial: True` を追加で持つ（コード/テキスト
-    資料の行のみ・Office/画像/サイズ超過には付けない）。
+    """資料フォルダの文書一覧（rel_path＝doc_id・フォルダ由来の範囲メタ付き）。存在しない資料フォルダは空。
+    本文（ソース／設計書／テキスト）＋MD 化できた Office（派生 `{rel}.md` あり）＋（画像変換が有効なときのみ）変換できた画像を載せる。
+    未変換の Office は載せない（`scan_report.skipped_office` で可視化）。
+    `include_rag=True` は rag 表現を正本とする消費者向け（ES 索引・グラフの言及エッジ）。`{rel}.rag.md` があればそれを `md_path` に採り、無ければ `{rel}.md`（`grep_tool.preferred_derived_name` と同じ優先順位）。
+    `root`: 解決済みの資料フォルダ root を渡すと `worlds.world_dir()` を再度呼ばない。
+    `files`: materialize 済みの `safe_files` の list を渡すと走査しない（`deadline` は無視される）。
+    `deadline`: `scope_infer.safe_files` へそのまま渡す（超過時は `scope_infer.ScopeWalkDeadlineExceeded`）。
+    `accepts()` の内容判定が必要なのに読めなかったコード拡張子の文書は `state="unreadable"`（`reason="read_failed"`）で載せる。
+    `analyzer`＝担当アナライザの内部名（`kind=="code"` の登録アナライザのみ非 None）。軽量テキスト枠は `analyzer=None`。
+    サイズ超過（8MiB）は `state="unreadable"`／`reason="size_exceeded"`（派生 MD もベクトル／グラフも作らず原文を grep／ES 全文の対象にする）。
+    文字コードを判別できない原本は `state="unreadable"`／`reason="encoding_undetermined"`。バイナリは載せない。
+    「一部が化けている」（`encoding_partial`）は `state="ready"` のまま行へ `encoding_partial: True` を足す（コード／テキスト資料の行のみ）。
     """
     wd = root if root is not None else worlds.world_dir(world)
     if not wd:
         return
     derived = worlds.derived_md_dir(world)
-    derived_rag = worlds.derived_rag_dir(world)          # RAG 正本層（§8.1 三階層）
-    conv = _office_convertible()                       # OOXML＋（バックエンド有なら）PDF
-    image_exts = _image_convertible(conv)              # 画像（OCR 有効時のみ非空・既定は空＝画像は台帳に載らない）
-    # アーカイブ取り込み: `worlds.archives_dir(world)` は zip/tar(.gz)/tgz の展開先（存在しなければ
-    # `safe_files` が無害に空を返す＝zip/tar の無い world は従来どおり）。展開木の構成がそのまま
-    # doc_id（`<アーカイブの相対パス>/<中のパス>`）になるため、合流後は通常の文書と同じ分類・
-    # MD参照（`derived/(rel+".md")`）がそのまま成立する。
+    derived_rag = worlds.derived_rag_dir(world)  # RAG 正本層
+    conv = _office_convertible()  # OOXML＋（バックエンド有なら）PDF
+    image_exts = _image_convertible(conv)  # 画像（変換が有効なときのみ非空）
+    # アーカイブ取り込み: `worlds.archives_dir(world)` は zip/tar(.gz)/tgz の展開先。展開木の構成がそのまま doc_id になり、通常の文書と同じ分類・MD 参照が成立する
     entries = files if files is not None else si.safe_files(
         wd, deadline=deadline, also=worlds.archives_dir(world))
     for rp, rel in entries:
-        if importance.is_importance_control_path(rel):  # 重要度設定ファイル自体は文書として扱わない（§5）
+        if importance.is_importance_control_path(rel):  # 重要度設定ファイル自体は文書として扱わない
             continue
         if archive_extract.archive_kind(rel) is not None:
-            # アーカイブ自身（原本ツリー側の zip/tar(.gz)/tgz・展開先 `archives_dir` には同名の
-            # エントリは現れない＝展開先の rel は常に `<アーカイブ>/<中のパス>` で長くなる）は、
-            # 通常の分類（`classify_document`）を経由させない——バイナリとして「黙って見えなくなる」
-            # 既存の2段判定（`text_kind`）に流すと展開結果が一覧から消えるため、専用の1行にする。
-            # 秘匿判定は**この専用1行を作る前**に行う（他の秘匿ファイルと同じ「台帳に一切出さない」
-            # 扱い——`archive_extract.sync_world_archives` が秘匿名のアーカイブを展開しない
-            # ようになっても、原本ツリー側にはそのアーカイブ自身が実在し続けるため、ここで塞がないと
-            # 「展開待ち」等の行として存在だけが漏れる）。
+            # アーカイブ自身は `classify_document` を経由させず専用の 1 行にする（バイナリ扱いで一覧から消えるのを避ける）。
+            # 秘匿判定はこの専用行を作る前に行う（秘匿名のアーカイブは存在も出さない）
             if text_kind.is_sensitive_doc_id(rel):
                 _log.warning(
                     "iter_world_documents: 秘匿名のため対象外にしました（アーカイブ・doctype=対象外）")
@@ -1115,33 +690,26 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
             yield _archive_row(rel, world)
             continue
         ext = rp.suffix.lower()
-        # コード判定は拡張子だけでなく accepts() まで見て確定する（`resolve_lazy` は既定 accepts
-        # （常に真）のアナライザしか候補に無ければ内容を読まない＝列挙コストは増やさない・§7 裁定10）。
-        # scan_report/status_document_doctype と同じ classify_document() を共有する。
+        # コード判定は拡張子だけでなく accepts() まで見て確定する（`scan_report`／`status_document_doctype` と同じ `classify_document()` を共有）
         result = classify_document(rel, ext, lambda rp=rp, size=4096: _read_head(rp, size),
                                    text_quality=lambda rp=rp: _text_quality_for(rp))
-        if result.get("sensitive"):          # 秘匿名: 台帳に載せない・Office/画像へ再採用しない
+        if result.get("sensitive"):  # 秘匿名: 台帳に載せない・Office／画像へ再採用しない
             _log.warning("iter_world_documents: 秘匿名のため対象外にしました（doctype=対象外 ext=%s）", ext)
             continue
         encoding_partial_kw = {"encoding_partial": True} if result.get("encoding_partial") else {}
         if result["kind"] == "unreadable":
-            # 内容判定が必要だったが読み取れない＝次点アナライザへ誤配属せず判定を打ち切り、
-            # 明示の失敗状態として出す。
+            # 内容判定が必要だったが読み取れない＝判定を打ち切り、明示の失敗状態として出す
             yield {"name": rel, "path": rel, "doctype": None, "branch": None, "analyzer": None,
                    "state": "unreadable", "label": "読み取れません", "reason": "read_failed",
                    "md_path": None, **_scope_meta(rel)}
         elif result.get("unreadable_reason") == "encoding_undetermined":
-            # SRH-05: `read_failed`/`size_exceeded` と同じ既存の出し方（バイナリはこの行に含めない
-            # ——`unreadable_reason` docstring 参照・一覧非表示の既存契約を保つ）。
+            # `read_failed`／`size_exceeded` と同じ出し方（バイナリはこの行に含めない）
             from .ingest.failure_reasons import REASON_CATALOG as _RC
             yield {"name": rel, "path": rel, "doctype": None, "branch": None, "analyzer": None,
                    "state": "unreadable", "label": _RC["encoding_undetermined"]["label"],
                    "reason": "encoding_undetermined", "md_path": None, **_scope_meta(rel)}
         elif result["kind"] == "code":
-            # `analyzer`＝担当アナライザの内部名（`Analyzer.name`）。`doctype` は種別表示用の
-            # 平文ラベル素材で、両者は現行構成では同値だが独立した概念（§7 裁定2の受入条件＝
-            # 担当アナライザの来歴を一覧応答で参照できるようにする）——画面は `analyzer` を表示する。
-            # 軽量テキスト枠の汎用コード（`text_kind`）には登録アナライザが無い＝`analyzer=None`。
+            # `analyzer`＝担当アナライザの内部名（画面は `analyzer` を表示する）。軽量テキスト枠の汎用コードは `analyzer=None`
             analyzer_obj = result.get("analyzer")
             if _text_oversize(rp):
                 yield _size_exceeded_row(rel, result["doctype"], "source")
@@ -1150,7 +718,7 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
                        "analyzer": analyzer_obj.name if analyzer_obj is not None else None,
                        "state": "ready", "label": "使えます", "reason": None,
                        "md_path": None, **_scope_meta(rel), **encoding_partial_kw}
-        elif result["doctype"] is not None:              # 設計書/テキスト（コード拡張子が accepts() 全滅時もここへ資料落ち）
+        elif result["doctype"] is not None:  # 設計書／テキスト（accepts() 全滅のコード拡張子もここへ資料落ち）
             if result["doctype"] == text_kind.DOCUMENT_DOCTYPE_LABEL and _text_oversize(rp):
                 yield _size_exceeded_row(rel, result["doctype"], "office")
             else:
@@ -1158,10 +726,7 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
                        "state": "ready", "label": "使えます", "reason": None,
                        "md_path": None, **_scope_meta(rel), **encoding_partial_kw}
         elif ext in _OFFICE_DOCTYPE:
-            # rag 表現が正本（`grep_tool.preferred_derived_name` と同じ優先順位）: include_rag 有効時は
-            # legacy `.md` より `.rag.md` を優先する（grep/ES/グラフが同じ物理ファイルを見る・
-            # 2026-09-02-RAG表現の全形式展開と文脈保持.md §8 D1）。image-only PDF 等 legacy を作れない
-            # 文書は rag.md だけが存在する。include_rag 無効時は従来どおり legacy のみを見る。
+            # include_rag 有効時は legacy `.md` より `.rag.md` を優先する（grep／ES／グラフが同じ物理ファイルを見る）。無効時は legacy のみ
             rag_md = derived_rag / (rel + ".rag.md") if (ext in conv and include_rag) else None
             if rag_md is not None and rag_md.is_file():
                 yield {"name": rel, "path": rel, "doctype": _OFFICE_DOCTYPE[ext], "branch": "office",
@@ -1170,7 +735,7 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
                        "md_path": str(rag_md), **_scope_meta(rel)}
             else:
                 md = derived / (rel + ".md")
-                if md.is_file():                       # 通常MDまたは明示partial noticeを検索対象にする。
+                if md.is_file():  # 通常 MD または明示 partial notice を検索対象にする
                     notice_status = _coverage_notice_status(md)
                     label = "使えます（MD化）" if notice_status is None else "未抽出箇所を検索できます"
                     yield {"name": rel, "path": rel, "doctype": _OFFICE_DOCTYPE[ext], "branch": "office", "analyzer": None,
@@ -1192,10 +757,6 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
 
 def world_documents(world: str, include_rag: bool = False, *, root=None, deadline: float | None = None,
                     files=None) -> list:
-    """後方互換のmaterialized一覧。大規模索引は``iter_world_documents``を使う。
-
-    `root`/`deadline`/`files`（省略可・キーワード専用・既定 None＝既存呼び出し元は無変更）:
-    `iter_world_documents` へそのまま転送する。
-    """
+    """後方互換の materialized 一覧。大規模索引は `iter_world_documents` を使う。引数は `iter_world_documents` へそのまま渡す。"""
     return sorted(iter_world_documents(world, include_rag=include_rag, root=root, deadline=deadline, files=files),
                  key=lambda d: d["name"])

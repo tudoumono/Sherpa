@@ -117,7 +117,7 @@ def _figure_emf() -> bytes:
 
 
 def _build(monkeypatch, tmp_path: Path, emf: bytes | None = None):
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     wd = _docx_world(tmp_path, emf if emf is not None else _figure_emf())
     dmd = tmp_path / "derived" / "md"
     rep = office_md.build_derived(wd, dmd, world="metafile-world")
@@ -194,7 +194,7 @@ def _legacy_world(monkeypatch, tmp_path):
     converted.write_bytes(mb.docx_with_media("image1.emf", _figure_emf()))
     monkeypatch.setattr(legacy_convert, "legacy_exts", lambda: {".doc"})
     monkeypatch.setattr(legacy_convert, "ensure_ooxml", lambda src, rel, cache_root: (converted, []))
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     rep = office_md.build_derived(wd, dmd)
     assert not rep.get("error") and rep["rag_failed"] == 0, rep
     key = Path(str(converted) + ".key")
@@ -283,7 +283,7 @@ def test_already_ingested_legacy_ppt_gets_the_figure_text_from_the_cached_conver
     converted.write_bytes(mb.pptx_with_media("image1.emf", _figure_emf()))
     monkeypatch.setattr(legacy_convert, "legacy_exts", lambda: {".ppt"})
     monkeypatch.setattr(legacy_convert, "ensure_ooxml", lambda src, rel, cache_root: (converted, []))
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     office_md.build_derived(wd, dmd)
     Path(str(converted) + ".key").write_text(legacy_convert._source_key(wd / "old.ppt"), encoding="utf-8")
     md_path = dmd / "old.ppt.md"
@@ -395,3 +395,16 @@ def test_ocr_result_of_a_child_png_renders_at_the_parent_figure(monkeypatch, tmp
 
     rag = evidence_render.render(ir, source_name="a.docx", observation_set=observation_set).markdown
     assert rag.index("画像内容は未解釈") < rag.index("埋込画像の文字") < rag.index("後の段落")
+
+
+def test_image_pixel_size_png_shares_metafile_reader_and_gif_jpeg_unchanged():
+    from sherpa.ingest import evidence_spike
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (640).to_bytes(4, "big") + (480).to_bytes(4, "big")
+    gif = b"GIF89a" + (30).to_bytes(2, "little") + (20).to_bytes(2, "little") + b"\x00" * 4
+    jpeg = (b"\xff\xd8" + b"\xff\xc0" + (17).to_bytes(2, "big") + b"\x08" + (50).to_bytes(2, "big")
+            + (70).to_bytes(2, "big") + b"\x00" * 10)
+    assert evidence_spike._image_pixel_size(png) == metafile_text.child_png_size(png) == [640, 480]
+    assert evidence_spike._image_pixel_size(png[:20]) is None and metafile_text.child_png_size(png[:20]) is None
+    assert evidence_spike._image_pixel_size(gif) == [30, 20]
+    assert evidence_spike._image_pixel_size(jpeg) == [70, 50]
+    assert evidence_spike._image_pixel_size(b"not an image") is None

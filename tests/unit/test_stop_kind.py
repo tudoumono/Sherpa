@@ -164,7 +164,7 @@ def test_resolve_agentic_failure_typed_transport_values_pass_through():
     assert stop_kind.resolve({"agentic_failure": "transport_error"}) == "transport_error"
 
 
-# ===== `_plain_run`（素の会話）が定型文へ落ちたターンに印を付ける =====
+# ===== `_plain_run`（素の会話）が定型文を返したターンに印を付ける =====
 
 def _plain_ctx():
     from sherpa.providers.base import Ctx
@@ -176,21 +176,8 @@ class _EmptyPlain:
     label = "test"
     _last_usage = None
 
-    def _plain_stream(self, message):
-        return iter(())
-
     def _plain_text(self, message=""):
         return "まだ接続されていません"
-
-
-class _RaisingPlain(_EmptyPlain):
-    def _plain_stream(self, message):
-        raise TimeoutError("timed out")
-
-
-class _OkPlain(_EmptyPlain):
-    def _plain_stream(self, message):
-        yield "本文"
 
 
 def _plain_env(provider):
@@ -199,22 +186,10 @@ def _plain_env(provider):
     return res[0]["env"]
 
 
-def test_plain_run_marks_empty_stream_as_failure():
+def test_plain_run_marks_fixed_text_turn_as_failure():
     env = _plain_env(_EmptyPlain())
     assert env["agentic_failure"] == "error"
     assert stop_kind.resolve(env) is None
-
-
-def test_plain_run_marks_timeout_stream_exception_as_timeout():
-    env = _plain_env(_RaisingPlain())
-    assert env["agentic_failure"] == "timeout"
-    assert stop_kind.resolve(env) == "timeout"
-
-
-def test_plain_run_leaves_successful_turn_unmarked():
-    env = _plain_env(_OkPlain())
-    assert "agentic_failure" not in env
-    assert stop_kind.resolve(env) == "completed"
 
 
 def test_from_exception_http_error_response_is_not_transport_error():
@@ -235,62 +210,6 @@ def test_resolve_raises_for_value_outside_stop_kinds(monkeypatch):
 
 def test_resolve_none_still_passes_through_the_check():
     assert stop_kind.resolve({"busy": True}) is None
-
-
-# ===== 下調べ役 catch-all は例外の型（timeout/transport_error）を優先して立てる =====
-# 従来は `agentic_failure` を "insufficient"/"error" に固定し `from_exception` を一度も呼ばず、
-# 下調べ役（Ollama 等）の read timeout が固定値 "error" に丸められていた。
-
-def test_agentic_run_catchall_marks_timeout_from_sub_loop_exception():
-    from sherpa.providers.base import Ctx, _GenProvider
-
-    class _P(_GenProvider):
-        label, model, provider_id = "T", "m", "openai"
-
-        def _sub_agentic_loop(self, ctx, request_claims=True):
-            raise TimeoutError("下調べ役が応答しない")
-            yield {}   # pragma: no cover - ジェネレータにするためのダミー yield（到達しない）
-
-    p = _P()
-    p._sub = {"provider": "openai", "key": "sk-x", "url": None, "model": "gpt-5.4-mini",
-              "tools": frozenset({"ripgrep_search"}), "guard": {"min_citations": 1, "max_turns": 6,
-                                                                "llm_timeout": 60},
-              "profile_id": "search-helper-openai", "description": "", "name": "下調べ役"}
-    ctx = Ctx(message="バッチ停止の記録は？", world="v1", knowledge=True,
-              route=lambda m: {"lens": "qa", "reason": "t", "input": m},
-              dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}, "sources": []},
-              make_sources=lambda docs: [{"doc_id": d} for d in docs])
-    events = list(p.run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["agentic_failure"] == "timeout", (
-        f"下調べ役のタイムアウトが固定値 'error' に丸められている: {env!r}")
-    assert stop_kind.resolve(env) == "timeout"
-
-
-# ===== 単発清書フォールバックは型が特定できない例外でも completed 扱いにしない =====
-# 従来は `stop_kind.from_exception` が None を返す例外（HTTPError の 401/429/5xx・JSON デコード
-# エラー等）は無印のまま `resolve()` に渡り "completed" として数えられていた。
-
-def test_single_shot_fallback_marks_unclassified_stream_exception_as_error():
-    from sherpa.providers.base import Ctx, _GenProvider
-
-    class _P(_GenProvider):
-        label, model, provider_id = "T", "m", "openai"
-
-        def _stream(self, prompt, completion=None):
-            raise ValueError("型を特定できないストリーム例外")
-            yield ""   # pragma: no cover - ジェネレータにするためのダミー yield（到達しない）
-
-    p = _P()
-    ctx = Ctx(message="こんにちは", world="v1", knowledge=True,
-              route=lambda m: {"lens": "author", "reason": "t", "input": m},
-              dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}, "sources": []},
-              make_sources=lambda docs: [{"doc_id": d} for d in docs])
-    events = list(p.run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["agentic_failure"] == "error", (
-        f"型を特定できない例外が無印のまま completed に落ちている: {env!r}")
-    assert stop_kind.resolve(env) is None
 
 
 def test_from_exception_follows_one_level_of_cause():

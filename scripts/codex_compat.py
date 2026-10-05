@@ -379,8 +379,7 @@ def check_role_files_live() -> CheckResult:
             return CheckResult("role_files", "役割ファイル（worker/evaluator）", False,
                                "developer_instructions が role config に書かれていません")
 
-        env = codex_sandbox._codex_clean_env(codex_home, run_dir, tool_tmp,
-                                             openai_api_key=_EXPECT_KEY)
+        env = codex_sandbox._codex_clean_env(codex_home, tool_tmp, openai_api_key=_EXPECT_KEY)
         last_message = tool_tmp / "last-message.txt"
         argv = ["codex", "exec", "--json", "--strict-config", "--skip-git-repo-check",
                "-o", str(last_message), "-C", str(run_dir), "-m", _FAKE_MODEL,

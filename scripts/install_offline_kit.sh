@@ -42,6 +42,7 @@
 # root で実行すると Chromium/Ollama 等が /root 配下に展開され、sherpa/agents.py の自動検出
 # （実行ユーザーの $HOME を見る）から見えなくなるため。
 set -Eeuo pipefail   # -E: 下の ERR trap（失敗箇所の表示）を関数内にも継承する
+[ "$(uname -s)" = "Linux" ] || { echo "このスクリプトは Linux 専用です（閉域キットの導入は apt・dpkg を使います）。macOS では使えません。" >&2; exit 2; }
 
 if [ "$(id -u)" = 0 ]; then
   echo "✗ このスクリプトを root 直接では実行しないでください（sudo 経由の操作のみ内部で使います）。" >&2
@@ -597,7 +598,7 @@ _step "2. Python 実行系＋基本ツール"
 # 実際に venv を作れるかで判定する（一時ディレクトリに作って即削除）。
 # 同梱 .deb には xz-utils/unzip/fontconfig（Node 展開・HackGen 展開・fc-cache）も含むため、
 # それらの有無も併せて判定する。
-_PROBE_VENV="$(mktemp -d)/venv-probe"
+_PROBE_VENV="$(mktemp -d "${TMPDIR:-/tmp}/sherpa.XXXXXX")/venv-probe"
 if command -v python3 >/dev/null 2>&1 && python3 -m venv "$_PROBE_VENV" >/dev/null 2>&1 \
     && command -v xz >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 && command -v fc-cache >/dev/null 2>&1; then
   rm -rf "$(dirname "$_PROBE_VENV")"
@@ -712,16 +713,24 @@ if [ -f "$OUT/wheels/SHA256SUMS" ] || { [ -d "$OUT/wheels" ] && [ -n "$(find "$O
   else
     note "既存の venv を再利用します: $VENV"
   fi
+  # Tree-sitter（本体＋文法）はホイールだけを入れる（sdist が混じっていたら閉域でビルドへ進まず止める）。
   if "$VENV/bin/python" -m pip install --no-index --find-links "$OUT/wheels" \
+      --only-binary tree-sitter,tree-sitter-java,tree-sitter-c-sharp,tree-sitter-c,tree-sitter-javascript,tree-sitter-bash,tree-sitter-css,tree-sitter-embedded-template \
       -r "$INSTALL_DIR/requirements.txt" -c "$INSTALL_DIR/constraints.txt"; then
     ok "Python 依存を --no-index でインストールしました: $VENV"
+    # start.sh が「依存は最新」と判断できるよう、同じ式でハッシュを記録する（無いと閉域で PyPI へ出て止まる）。
+    # shellcheck source=scripts/lib/req_hash.sh
+    . "$ROOT/scripts/lib/req_hash.sh"
+    (cd "$INSTALL_DIR" && req_hash "$VENV/bin/python") > "$VENV/.requirements.sha256"
   else
     fail "pip install --no-index に失敗しました。wheel 一式（$OUT/wheels/）とこの機体の Python バージョンが"
     fail "一致しているか確認してください（$OUT/wheels/COLLECTED-WITH-PYTHON-VERSION.txt を参照）。"
     exit 1
   fi
 else
-  warn "wheel 一式が見つかりません（$OUT/wheels/）。オンライン側で収集していないためスキップします。"
+  fail "wheel 一式が見つかりません（$OUT/wheels/）。Python 依存を導入できないため中止します。"
+  fail "  対処: オンライン側で make_offline_kit.sh --fetch を実行して wheels を収集したキットを搬入してください。"
+  exit 1
 fi
 echo ""
 
@@ -865,7 +874,7 @@ if [ -n "$HACKGEN_ZIP" ]; then
   if command -v unzip >/dev/null 2>&1; then
     FONT_DEST="$HOME/.local/share/fonts"
     mkdir -p "$FONT_DEST"
-    TMP_UNZIP="$(mktemp -d)"
+    TMP_UNZIP="$(mktemp -d "${TMPDIR:-/tmp}/sherpa.XXXXXX")"
     unzip -oq "$HACKGEN_ZIP" -d "$TMP_UNZIP"
     find "$TMP_UNZIP" -type f \( -name '*.ttf' -o -name '*.otf' \) -exec cp -f {} "$FONT_DEST/" \;
     rm -rf "$TMP_UNZIP"
@@ -1115,30 +1124,24 @@ echo "次にやること:"
 # RV MEDIUM（2026-07-16 6巡目RV）: --target-dir（releases/<版> は完成後 immutable）では
 # release 自体への書込みを案内しない。設定ファイルは常に /etc/sherpa/sherpa.env のみを案内し、
 # 起動例にも SHERPA_ENV_FILE を明示する（既定モードの表示はこれまでどおり変えない）。
-# 閉域実機報告⑥（2026-08-18）: 従来の案内（SHERPA_AGENT=heuristic か ollama。OPENAI_API_KEY 等は
-# 空のままにする）は sherpa/agent_constructs.py の契約と食い違っていた。heuristic は
-# SHERPA_EXTRA_AGENTS でも有効化しない限り選択肢に無い値として無視され、常に codex へ倒れる
-# （案内どおりに設定した閉域ホストで「AI が答えない」の根本原因になっていた）。さらに本キットは
-# Codex CLI を同梱し（7b）、OPENAI_API_KEY があれば導入時点で認証まで自動で済ませるため、
-# 「OPENAI_API_KEY 等は空のままにする」も実態と合わない。実際に動く3通りに書き直す
-# （実装＝sherpa/agent_constructs.py・sherpa/providers/__init__.py は変更していない）。
+# 本キットは Codex CLI を同梱し（7b）、OPENAI_API_KEY があれば導入時点で認証まで自動で済ませる
+# ため、「OPENAI_API_KEY 等は空のままにする」とは案内しない。AI なしの定型応答（heuristic）は
+# チャットで閉じており案内しない（実装＝sherpa/agent_constructs.py・sherpa/providers/__init__.py）。
 if [ "$TARGET_DIR" != "$ROOT" ]; then
-  echo "  1) /etc/sherpa/sherpa.env を設定する（閉域での構成は実際には3通り）:"
+  echo "  1) /etc/sherpa/sherpa.env を設定する（閉域での構成は実際には2通り）:"
 else
-  echo "  1) $TARGET_DIR/.env（または /etc/sherpa/sherpa.env）を設定する（閉域での構成は実際には3通り）:"
+  echo "  1) $TARGET_DIR/.env（または /etc/sherpa/sherpa.env）を設定する（閉域での構成は実際には2通り）:"
 fi
 # S3（2026-08-18-AzureOpenAI対応）: 実行環境が Azure OpenAI 経由のこともあるため、a) に Azure の
 # 設定（OPENAI_BASE_URL＋モデル欄=デプロイ名）を追記した（sherpa/llm.py::openai_base_url。Azure 分岐は
 # 作らず「OpenAI 互換の接続先」を設定化しただけ＝OPENAI_API_KEY を設定する導線自体は変えていない）。
 echo "     a) OpenAI または Azure OpenAI へ穴あけがある: OPENAI_API_KEY を設定する（Azure ならその"
-echo "        キー。同梱の Codex CLI は 7b でキーがあれば認証まで自動で済んでいる。SHERPA_AGENT は"
-echo "        書かなくてよい＝未指定なら自動選択される）。Azure なら加えて"
+echo "        キー。同梱の Codex CLI は 7b でキーがあれば認証まで自動で済んでいる。頭脳は"
+echo "        自動選択され、チャットで選び直せる）。Azure なら加えて"
 echo "        OPENAI_BASE_URL=https://<リソース名>.openai.azure.com/openai/v1/ を設定する"
 echo "        （モデル欄には Azure の「デプロイ名」を入れる）。"
-echo "     b) 外へ出られない・ローカル LLM（Ollama）がある: SHERPA_AGENT=ollama（＋ OLLAMA_URL）。"
-echo "     c) AI を一切使わない（定型文の簡易応答）: SHERPA_EXTRA_AGENTS=heuristic と"
-echo "        SHERPA_AGENT=heuristic の両方を設定する（片方だけだと選べない値として無視され"
-echo "        codex へ倒れる）。"
+echo "     b) 外へ出られない・ローカル LLM（Ollama）がある: OLLAMA_URL を設定する（頭脳は簡易が選ばれる）。"
+echo "     （AI を使わない定型文の応答はチャットでは廃止しました。a) か b) のどちらかが必要です。）"
 # 閉域実機報告⑧（2026-08-18）: 「不足していれば恒久設定」だけの案内だと、(a) 既に十分な値をさらに
 # 下げてしまう・(b) 同居する別製品が別ファイルで設定したより大きい値を後勝ちで踏む、の事故になる
 # （実機は /etc/sysctl.d/10-map-count.conf=1048576 を同居製品が置いており、素直に 262144 を書くと

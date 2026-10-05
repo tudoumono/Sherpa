@@ -1,4 +1,6 @@
-"""OCR補助観測worker用のPostgreSQL lease queueとWorld内結果cache。"""
+"""OCR補助観測worker用のPostgreSQL lease queueとWorld内結果cache。
+設計: docs/design/data.md「OCR（非同期・隔離ワーカー）」
+"""
 from __future__ import annotations
 
 import hashlib
@@ -10,6 +12,7 @@ from pathlib import PurePosixPath
 from collections.abc import Callable, Iterator
 from typing import Any
 
+import psycopg
 from psycopg.types.json import Json
 
 from .db import _connect, _ensure
@@ -79,31 +82,6 @@ def _job_values(
         world.strip(), _relative_path(source_rel_path), generation, _tagged_hash(source_content_hash),
         _tagged_hash(route_manifest_hash), route_input_id, route_input, _tagged_hash(engine_profile_hash),
     )
-
-
-def enqueue_job(
-    *,
-    world: str,
-    source_rel_path: str,
-    canonical_generation_id: str,
-    source_content_hash: str,
-    route_manifest_hash: str,
-    route_input: dict[str, Any],
-    engine_profile_hash: str,
-    priority: int = 0,
-    max_attempts: int = 3,
-) -> dict[str, Any]:
-    """同じgeneration/input/profileを1回だけenqueueする。成功済み行を再queueしない。"""
-    if max_attempts <= 0 or priority < 0:
-        raise ValueError("invalid OCR job limits")
-    values = _job_values(
-        world=world, source_rel_path=source_rel_path, canonical_generation_id=canonical_generation_id,
-        source_content_hash=source_content_hash, route_manifest_hash=route_manifest_hash,
-        route_input=route_input, engine_profile_hash=engine_profile_hash,
-    )
-    _ensure()
-    with _connect() as connection:
-        return _insert_job(connection, values, priority, max_attempts)
 
 
 def _insert_job(connection, values, priority: int, max_attempts: int) -> dict[str, Any]:
@@ -488,83 +466,6 @@ def mark_stale(job_id: int, lease_token: str, *, reason: str = "canonical_genera
         ).fetchone()
 
 
-def cancel_generation(world: str, canonical_generation_id: str) -> int:
-    generation = _generation_id(canonical_generation_id)
-    _ensure()
-    with _connect() as connection:
-        cursor = connection.execute(
-            "UPDATE ocr_jobs SET status='cancelled', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, "
-            "updated_at=now(), finished_at=now() WHERE world=%s AND canonical_generation_id=%s "
-            "AND status IN ('queued','leased')",
-            (world, generation),
-        )
-        affected = int(cursor.rowcount)
-    return affected
-
-
-def cancel_superseded_generations(world: str, active_generation_id: str) -> dict[str, int]:
-    """Canonical publish後に旧generationの実行中job/runを原子的にcancelする。"""
-    selected_world = _world_id(world)
-    active = _generation_id(active_generation_id)
-    _ensure()
-    with _connect() as connection:
-        jobs = connection.execute(
-            "UPDATE ocr_jobs SET status='cancelled', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, "
-            "error_code='superseded_generation', error_detail='new Canonical generation became active', "
-            "updated_at=now(), finished_at=now() WHERE world=%s AND canonical_generation_id<>%s "
-            "AND status IN ('queued','leased')",
-            (selected_world, active),
-        )
-        runs = connection.execute(
-            "UPDATE ocr_refresh_runs SET status='cancelled', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, "
-            "error_code='superseded_generation', error_detail='new Canonical generation became active', "
-            "updated_at=now(), finished_at=now() WHERE world=%s AND canonical_generation_id<>%s "
-            "AND status IN ('queued','leased')",
-            (selected_world, active),
-        )
-        jobs_cancelled = int(jobs.rowcount)
-        runs_cancelled = int(runs.rowcount)
-    return {"jobs_cancelled": jobs_cancelled, "refresh_runs_cancelled": runs_cancelled}
-
-
-def purge_generation(world: str, canonical_generation_id: str) -> dict[str, int]:
-    """指定generationのjob本文とrefresh進捗をtransactionで削除する。World cacheは共有のため残す。"""
-    selected_world = _world_id(world)
-    generation = _generation_id(canonical_generation_id)
-    _ensure()
-    with _connect() as connection:
-        runs = connection.execute(
-            "DELETE FROM ocr_refresh_runs WHERE world=%s AND canonical_generation_id=%s",
-            (selected_world, generation),
-        )
-        jobs = connection.execute(
-            "DELETE FROM ocr_jobs WHERE world=%s AND canonical_generation_id=%s",
-            (selected_world, generation),
-        )
-        jobs_deleted = int(jobs.rowcount)
-        runs_deleted = int(runs.rowcount)
-    return {"jobs": jobs_deleted, "refresh_runs": runs_deleted}
-
-
-def purge_superseded_generations(world: str, active_generation_id: str) -> dict[str, int]:
-    """現Canonical以外のOCR job本文・runをtransactionで削除する。"""
-    selected_world = _world_id(world)
-    active = _generation_id(active_generation_id)
-    _ensure()
-    with _connect() as connection:
-        runs = connection.execute(
-            "DELETE FROM ocr_refresh_runs WHERE world=%s AND canonical_generation_id<>%s",
-            (selected_world, active),
-        )
-        jobs = connection.execute(
-            "DELETE FROM ocr_jobs WHERE world=%s AND canonical_generation_id<>%s",
-            (selected_world, active),
-        )
-        jobs_deleted = int(jobs.rowcount)
-        runs_deleted = int(runs.rowcount)
-    return {"jobs": jobs_deleted, "refresh_runs": runs_deleted}
-
-
 def purge_world(world: str) -> dict[str, int]:
     """World削除/rebind用。OCR本文を含むjob/cache/runを1 transactionで消去する。"""
     selected_world = _world_id(world)
@@ -656,51 +557,6 @@ def status_summary(world: str, canonical_generation_id: str | None = None) -> di
     return {**summary, "counts": counts, "total": sum(counts.values()), "updated_at": last["updated_at"] if last else None}
 
 
-def refresh_run_summary(world: str, canonical_generation_id: str | None = None) -> dict[str, Any]:
-    """API/運用表示用の永続refresh run集計。"""
-    selected_world = _world_id(world)
-    where = "world=%s"
-    params: list[Any] = [selected_world]
-    if canonical_generation_id is not None:
-        where += " AND canonical_generation_id=%s"
-        params.append(_generation_id(canonical_generation_id))
-    _ensure()
-    with _connect() as connection:
-        rows = connection.execute(
-            f"SELECT status, count(*) AS count FROM ocr_refresh_runs WHERE {where} GROUP BY status", params,
-        ).fetchall()
-        totals = connection.execute(
-            f"SELECT COALESCE(sum(manifests_processed),0) AS manifests, "
-            "COALESCE(sum(selected_count),0) AS selected, COALESCE(sum(excluded_count),0) AS excluded, "
-            "COALESCE(sum(failed_binding_count),0) AS failed_binding, "
-            "COALESCE(sum(jobs_enqueued),0) AS jobs, max(updated_at) AS updated_at "
-            f"FROM ocr_refresh_runs WHERE {where}", params,
-        ).fetchone()
-    counts = {name: 0 for name in ("queued", "leased", "completed", "failed", "cancelled")}
-    counts.update({str(row["status"]): int(row["count"]) for row in rows})
-    return {
-        "counts": counts,
-        "total": sum(counts.values()),
-        "pending": counts["queued"] + counts["leased"],
-        **{name: int(totals[name]) for name in ("manifests", "selected", "excluded", "failed_binding", "jobs")},
-        "updated_at": totals["updated_at"],
-    }
-
-
-def list_succeeded_results(world: str, canonical_generation_id: str) -> list[dict[str, Any]]:
-    """別観測generation再構築用に、現Canonicalへbindした完了Setを決定順で返す。"""
-    generation = canonical_generation_id.strip().lower()
-    if _GENERATION_RE.fullmatch(generation) is None:
-        raise ValueError("invalid canonical generation id")
-    _ensure()
-    with _connect() as connection:
-        return connection.execute(
-            "SELECT * FROM ocr_jobs WHERE world=%s AND canonical_generation_id=%s AND status='succeeded' "
-            "AND result_payload IS NOT NULL ORDER BY source_rel_path, route_input_id, id",
-            (world, generation),
-        ).fetchall()
-
-
 def iter_succeeded_results(
     world: str,
     canonical_generation_id: str,
@@ -709,21 +565,10 @@ def iter_succeeded_results(
     batch_size: int = 100,
 ) -> Iterator[dict[str, Any]]:
     """完了Setを、呼出側が渡す``sort_key``が決める順で有界に読む。
-
-    並び順はDBの照合順序やSQL側の正規化には頼らず、``sort_key``（呼出側は
-    ``observation_render._relative_source_path``——Observation renderer自身の検査と
-    同じ関数）だけで決める。検査側の正規化（区切り文字の置換に加え、連続する``/``の畳み込みや
-    ``.``除去等の``PurePosixPath``正規化）をSQLで再現すると、正規化が増えるたびに追随が
-    壊れるため、同じ関数を1回だけ両方に使う。
-
-    まず``id, source_rel_path, result_observation_set_hash``だけを全件読み（本体
-    ``result_payload``を含まないため、メモリは行数×短い文字列に収まる——World全体は保持
-    しないが、1世代の全succeeded行の軽量部分は保持する）。次に
-    ``(sort_key(source_rel_path), result_observation_set_hash, id)``順にPython側で並べ、
-    その順に``batch_size``件ずつ``id = ANY(%s)``で本体を取り出し、並べた順に戻してyieldする。
-    ``sort_key``が不正な``source_rel_path``（絶対パス・``..``等）でValueErrorを出す場合は
-    そのまま呼出側へ伝播する（検査と同じ失敗）。本体取得時点で条件を満たさなくなった
-    （状態が変わった・消えた）idは黙って飛ばす。
+    ① ``id, source_rel_path, result_observation_set_hash``だけを全件読む（本体``result_payload``は含まない）。
+    ② ``(sort_key(source_rel_path), result_observation_set_hash, id)``順にPython側で並べる。
+    ③ その順に``batch_size``件ずつ``id = ANY(%s)``で本体を取り出し、並べた順にyieldする。
+    並び順はDBの照合順序に頼らず``sort_key``だけで決める。``sort_key``のValueError（不正な``source_rel_path``）は呼出側へ伝播し、本体取得時点で条件を満たさなくなったidは飛ばす。
     """
     selected_world = _world_id(world)
     generation = _generation_id(canonical_generation_id)
@@ -810,9 +655,7 @@ def mark_snapshot_artifacts_published(
     snapshot: dict[str, int | None],
 ) -> int:
     """同じ完了Set集合のままなら、集合全体をID listなしで公開済みにする。
-
-    集合照合とUPDATEは1 SQL statementのsnapshotで行う。並行して新しい成功jobが見えた場合は
-    何もmarkせず、workerのself-repairに再公開を委ねる。
+    集合照合とUPDATEは1 SQL statementのsnapshotで行い、並行して新しい成功jobが見えた場合は何もmarkしない（workerのself-repairに任せる）。
     """
     selected_world = _world_id(world)
     generation = _generation_id(canonical_generation_id)
@@ -850,23 +693,6 @@ def mark_snapshot_artifacts_published(
     return int(row["marked"])
 
 
-def requeue_failed(world: str, canonical_generation_id: str) -> int:
-    """明示refresh用。同じactive Canonicalのterminal failureだけを再試行可能に戻す。"""
-    generation = canonical_generation_id.strip().lower()
-    if _GENERATION_RE.fullmatch(generation) is None:
-        raise ValueError("invalid canonical generation id")
-    _ensure()
-    with _connect() as connection:
-        cursor = connection.execute(
-            "UPDATE ocr_jobs SET status='queued', attempts=0, available_at=now(), error_code=NULL, error_detail=NULL, "
-            "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, finished_at=NULL, updated_at=now() "
-            "WHERE world=%s AND canonical_generation_id=%s AND status='failed'",
-            (world, generation),
-        )
-        affected = int(cursor.rowcount)
-    return affected
-
-
 def record_worker_heartbeat(
     worker_id: str,
     *,
@@ -901,14 +727,18 @@ def worker_availability_summary(engine_profile_hash: str, *, stale_seconds: int 
     if stale_seconds <= 0:
         raise ValueError("stale_seconds must be positive")
     profile = _tagged_hash(engine_profile_hash)
-    _ensure()
-    with _connect() as connection:
-        rows = connection.execute(
-            "SELECT worker_id, available, unavailable_reason, model_hashes_valid, status, metadata, last_seen_at "
-            "FROM ocr_worker_heartbeats WHERE engine_profile_hash=%s "
-            "AND last_seen_at >= now() - (%s * interval '1 second') ORDER BY last_seen_at DESC",
-            (profile, stale_seconds),
-        ).fetchall()
+    # 読み取り専用（doctor／status からも呼ばれる）＝スキーマ初期化(DDL)は走らせない。表が無ければ不明で返す。
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                "SELECT worker_id, available, unavailable_reason, model_hashes_valid, status, metadata, last_seen_at "
+                "FROM ocr_worker_heartbeats WHERE engine_profile_hash=%s "
+                "AND last_seen_at >= now() - (%s * interval '1 second') ORDER BY last_seen_at DESC",
+                (profile, stale_seconds),
+            ).fetchall()
+    except psycopg.errors.UndefinedTable:
+        return {"available": False, "unavailable_reason": "schema_not_ready", "model_hashes_valid": False,
+                "engine_profile_hash": profile, "worker_count": 0, "last_seen_at": None, "workers": []}
     usable = [row for row in rows if row["available"] and row["model_hashes_valid"]]
     latest = rows[0] if rows else None
     return {
@@ -933,12 +763,11 @@ def get_cached_result(world: str, input_fingerprint: str, engine_profile_hash: s
     fingerprint, profile = _tagged_hash(input_fingerprint), _tagged_hash(engine_profile_hash)
     _ensure()
     with _connect() as connection:
-        row = connection.execute(
+        return connection.execute(
             "UPDATE ocr_result_cache SET last_used_at=now() WHERE world=%s AND input_fingerprint=%s "
             "AND engine_profile_hash=%s RETURNING *",
             (world, fingerprint, profile),
         ).fetchone()
-    return row
 
 
 def put_cached_result_for_lease(
@@ -974,29 +803,3 @@ def put_cached_result_for_lease(
             "AND engine_profile_hash=%s RETURNING *",
             (selected_world, fingerprint, profile),
         ).fetchone()
-
-
-def put_cached_result(
-    world: str,
-    input_fingerprint: str,
-    engine_profile_hash: str,
-    result_payload: dict[str, Any],
-) -> dict:
-    """並行推論時は先に保存された結果を権威とし、同一cache keyを上書きしない。"""
-    fingerprint, profile = _tagged_hash(input_fingerprint), _tagged_hash(engine_profile_hash)
-    result_hash = _result_hash(result_payload)
-    _ensure()
-    with _connect() as connection:
-        connection.execute(
-            "INSERT INTO ocr_result_cache (world, input_fingerprint, engine_profile_hash, result_hash, result_payload) "
-            "VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-            (world, fingerprint, profile, result_hash, Json(result_payload)),
-        )
-        row = connection.execute(
-            "UPDATE ocr_result_cache SET last_used_at=now() WHERE world=%s AND input_fingerprint=%s "
-            "AND engine_profile_hash=%s RETURNING *",
-            (world, fingerprint, profile),
-        ).fetchone()
-    if row is None:  # pragma: no cover - INSERT直後のDB異常だけ
-        raise RuntimeError("OCR cache row disappeared")
-    return row

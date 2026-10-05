@@ -56,7 +56,7 @@ NAV_GENERATED_IDS = {
 # ホワイトリスト。実装を読んで洗い出し済みの唯一の1件（新規に増えたら追記・下の
 # test_dynamic_id_lookups_whitelist_targets_exist が実在チェックする＝形骸化を防ぐ）。
 DYNAMIC_ID_LOOKUPS = {
-    "settings.js": ["t-openai", "t-gemini", "t-bedrock", "t-ollama", "t-codex"],   # $('t-' + provider)
+    "settings.js": ["t-openai", "t-ollama", "t-codex"],   # $('t-' + provider)
 }
 
 _ID_CALL_RE = re.compile(r"""\$\(\s*['"]([\w.\-]+)['"]\s*\)|getElementById\(\s*['"]([\w.\-]+)['"]\s*\)""")

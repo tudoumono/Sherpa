@@ -66,10 +66,7 @@ def _first_row_for_sheet(world: str, sheet: str) -> dict:
 def test_resolve_human_excerpt_via_chunk_id_returns_pipe_table(_xlsx_world):
     row = _first_row_for_sheet(_xlsx_world, "対象")
     chunk_id = row["chunk_id"]
-    locator = row["citations"][0]["locator"]
-    section_path = row["section_path"]
-    result = excerpts.resolve_human_excerpt(
-        _xlsx_world, _DOC_ID, chunk_id=chunk_id, locator=locator, section_path=section_path)
+    result = excerpts.resolve_human_excerpt(_xlsx_world, _DOC_ID, chunk_id=chunk_id)
     assert result is not None
     assert "| 項目ID | 状態 | 内部コード |" in result["text"]
     assert "ITEM01" in result["text"]
@@ -79,9 +76,7 @@ def test_resolve_human_excerpt_via_chunk_id_returns_pipe_table(_xlsx_world):
 def test_resolve_human_excerpt_kv_line_never_appears(_xlsx_world):
     """rag の KV 文（「項目ID: 「ITEM01」」）が利用者向けの解決結果に出ないことを固定する。"""
     row = _first_row_for_sheet(_xlsx_world, "対象")
-    result = excerpts.resolve_human_excerpt(
-        _xlsx_world, _DOC_ID, chunk_id=row["chunk_id"],
-        locator=row["citations"][0]["locator"], section_path=row["section_path"])
+    result = excerpts.resolve_human_excerpt(_xlsx_world, _DOC_ID, chunk_id=row["chunk_id"])
     assert result is not None
     assert "項目ID: 「ITEM01」" not in result["text"]
     assert "状態: 「廃止予定」" not in result["text"]
@@ -121,8 +116,7 @@ def test_display_quote_without_any_locator_or_span_is_pure_fallback():
 
 
 def test_resolve_human_excerpt_rejects_traversal_doc_id():
-    assert excerpts.resolve_human_excerpt("w", "../evil.xlsx", chunk_id="x",
-                                          locator={"sheet": "s", "cell_range": "A1"}) is None
+    assert excerpts.resolve_human_excerpt("w", "../evil.xlsx", chunk_id="x") is None
 
 
 # ---- citations.py 加算的フィールド ----
@@ -211,34 +205,9 @@ def test_resolve_parent_return_reports_tier_for_every_doc_never_drops():
     assert out == [{"doc_id": "missing.xlsx", "tier": "chunk", "text": "X", "chunk_ids": ["c1"]}]
 
 
-def test_parent_return_enabled_always_true_no_env_toggle():
-    """TOGGLE-RM（2026-09-03）: グローバルな系統切替トグルは撤去済み・常時 True（env に一切
-    左右されない）。"""
-    assert rag_parent_return.parent_return_enabled() is True
-
-
-def test_apply_to_hits_disabled_returns_input_unchanged(monkeypatch):
-    """`parent_return_enabled` は今も内部シームとして残るため、直接差し替えて False 分岐を
-    引き続き検証する（env では OFF にできない）。"""
-    monkeypatch.setattr(rag_parent_return, "parent_return_enabled", lambda: False)
-    hits = [{"doc_id": "d.xlsx", "chunk_id": "c1", "text": "x", "score": 1.0}]
-    assert rag_parent_return.apply_to_hits("w", hits) is hits
-
-
 def test_apply_to_hits_passes_through_non_rag_hits():
     hits = [{"doc_id": "legacy.txt", "line": 3, "text": "no chunk_id here", "score": 1.0}]
     assert rag_parent_return.apply_to_hits("w", hits) == hits
-
-
-def test_excerpt_budget_bytes_default_and_env_bounds(monkeypatch):
-    monkeypatch.delenv("SHERPA_CHAT_ES_EXCERPT_BUDGET_BYTES", raising=False)
-    assert rag_parent_return.excerpt_budget_bytes() == rag_parent_return.DEFAULT_BUDGET_BYTES
-    monkeypatch.setenv("SHERPA_CHAT_ES_EXCERPT_BUDGET_BYTES", "not-a-number")
-    assert rag_parent_return.excerpt_budget_bytes() == rag_parent_return.DEFAULT_BUDGET_BYTES
-    monkeypatch.setenv("SHERPA_CHAT_ES_EXCERPT_BUDGET_BYTES", "999999999999")   # out of range
-    assert rag_parent_return.excerpt_budget_bytes() == rag_parent_return.DEFAULT_BUDGET_BYTES
-    monkeypatch.setenv("SHERPA_CHAT_ES_EXCERPT_BUDGET_BYTES", "65536")
-    assert rag_parent_return.excerpt_budget_bytes() == 65536
 
 
 # ---- 実配線: lens_service.run_qa / chat_service._es_citations ----
@@ -287,8 +256,8 @@ def test_excerpts_module_does_not_import_agentic_search():
 
 
 def test_rag_parent_return_module_has_no_forbidden_imports():
-    """`search_service.py` の分離境界（api/agents/chat_service/chat_router/grep_tool を import しない）
-    を共有部品側も満たすことを確認する——`search_service.py` から import できる前提。"""
+    """`parts/read/fused_search.py` の分離境界（api/agents/chat_service/chat_router/grep_tool を import しない）
+    を共有部品側も満たすことを確認する——`parts/read/fused_search.py` から import できる前提。"""
     import sherpa.rag_parent_return as m
     src_globals = set(m.__dict__.keys())
     for forbidden in ("api", "agents", "chat_service", "chat_router", "grep_tool", "agentic_search"):

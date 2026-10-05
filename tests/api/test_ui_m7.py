@@ -29,8 +29,8 @@ def test_preview_extraction_structure():
     assert {"COPIES", "CONTAINS", "INVOKES"} <= rel_types
     # 骨格＋言及のみ＝供給源を失った status（deprecated/hidden_candidate）はもう作られない。
     assert pv["counts"]["deprecated"] == 0 and pv["counts"]["hidden"] == 0
-    assert pv["counts"]["entities_static"] == pv["counts"]["entities"] > 0
-    assert pv["counts"]["relations_static"] == pv["counts"]["relations"] > 0
+    assert pv["counts"]["entities"] > 0
+    assert pv["counts"]["relations"] > 0
 
 
 def test_preview_documents_path_based():

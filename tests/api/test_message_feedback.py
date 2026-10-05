@@ -10,7 +10,7 @@
 - 本文は解析前にチャンク読みでサイズ上限を適用する（413）。
 - rating 等の不正値は固定文言の 422（送信値は応答に反射しない）。
 
-未ログインは 401（test_auth_snapshot.py で snapshot 済み）。要 Postgres。DB 不可は SKIP。
+未ログインは 401（test_authz_matrix.py で固定済み）。要 Postgres。DB 不可は SKIP。
 """
 from __future__ import annotations
 

@@ -1,0 +1,3 @@
+CREATE TABLE X (
+    ID INT
+);

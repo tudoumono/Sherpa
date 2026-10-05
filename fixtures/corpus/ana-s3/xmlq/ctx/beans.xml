@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans>
+  <bean id="svc" class="com.acme.Svc"/>
+  <bean id="ghost" class="com.missing.Ghost"/>
+</beans>

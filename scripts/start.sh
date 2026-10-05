@@ -167,15 +167,15 @@ fi
 # requirements.txt と constraints.txt の両方を連結してハッシュする（由来: 2026-07-13-横断レビュー対応.md
 # R6a・constraints のピン更新だけでは requirements.txt が無変更のため再インストールが走らない穴を塞ぐ）。
 REQ_HASH_FILE="$VENV/.requirements.sha256"
-req_hash() {
-  "$VENV/bin/python" -c \
-    'import hashlib,sys; print(hashlib.sha256(b"".join(open(f,"rb").read() for f in sys.argv[1:])).hexdigest())' \
-    requirements.txt constraints.txt
-}
-CUR_HASH="$(req_hash)"
+# shellcheck source=scripts/lib/req_hash.sh
+. "$ROOT/scripts/lib/req_hash.sh"
+CUR_HASH="$(req_hash "$VENV/bin/python")"
 if [ ! -f "$REQ_HASH_FILE" ] || [ "$(cat "$REQ_HASH_FILE" 2>/dev/null || true)" != "$CUR_HASH" ]; then
   echo "依存関係をインストールします（requirements.txt / constraints.txt の変更を検出）..."
-  "$VENV/bin/python" -m pip install -r requirements.txt -c constraints.txt
+  # Tree-sitter（本体＋文法 8 種）はビルドへ進ませずホイールだけを入れる（パッケージ名だけに限る）。
+  "$VENV/bin/python" -m pip install \
+    --only-binary tree-sitter,tree-sitter-java,tree-sitter-c-sharp,tree-sitter-c,tree-sitter-javascript,tree-sitter-bash,tree-sitter-css,tree-sitter-embedded-template \
+    -r requirements.txt -c constraints.txt
   echo "$CUR_HASH" > "$REQ_HASH_FILE"
 else
   echo "依存関係は最新です（requirements.txt / constraints.txt 変更なし・インストールを省略）。"

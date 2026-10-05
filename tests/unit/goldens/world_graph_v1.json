@@ -7,7 +7,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/MONTHLY.jcl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -22,7 +21,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/NIGHTLY.jcl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -37,7 +35,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -51,7 +48,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -65,7 +61,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -79,7 +74,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -93,7 +87,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -107,7 +100,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -123,7 +115,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -139,7 +130,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "value": "0.030",
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -155,7 +145,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -171,7 +160,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -187,7 +175,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "value": "0.100",
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -203,7 +190,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -219,7 +205,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -235,7 +220,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -251,7 +235,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -267,7 +250,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -283,7 +265,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -299,7 +280,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -315,7 +295,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -331,7 +310,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -351,7 +329,6 @@
       "path": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "scope_path": "4期/02_保守/03_運用手順",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -365,7 +342,6 @@
       "path": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "scope_path": "4期/02_保守/03_運用手順",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -379,7 +355,6 @@
       "path": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -393,7 +368,6 @@
       "path": "4期/02_設計/01_基本設計/売上計上機能設計書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -407,7 +381,6 @@
       "path": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -421,7 +394,6 @@
       "path": "4期/02_設計/01_基本設計/税計算仕様書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -435,7 +407,6 @@
       "path": "4期/02_設計/01_基本設計/請求機能設計書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -449,7 +420,6 @@
       "path": "4期/02_設計/01_基本設計/顧客マスタ機能設計書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -463,7 +433,6 @@
       "path": "4期/04_運用/手数料改定障害記録.md",
       "scope_path": "4期/04_運用",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -477,7 +446,6 @@
       "path": "4期/04_運用/障害記録.md",
       "scope_path": "4期/04_運用",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -487,7 +455,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/AGENTPAY.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -501,7 +468,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/BILLGEN.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -515,7 +481,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/COMMISUP.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -529,7 +494,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/CUSTMNT.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -543,7 +507,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/FEECALC.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -557,7 +520,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/SALESUP.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -571,7 +533,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/TAXCALC.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -586,7 +547,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA",
       "doc": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -595,7 +555,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-AMOUNT",
       "doc": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "line": 4,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -604,7 +563,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE",
       "doc": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -613,7 +571,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA",
       "doc": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -622,7 +579,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-AMOUNT",
       "doc": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "line": 4,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -631,7 +587,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE",
       "doc": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -640,7 +595,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC",
       "doc": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -649,7 +603,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-CODE",
       "doc": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -658,7 +611,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-NAME",
       "doc": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "line": 4,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -667,7 +619,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC",
       "doc": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -676,7 +627,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC.CUST-CODE",
       "doc": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -685,7 +635,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC.CUST-NAME",
       "doc": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "line": 4,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -694,7 +643,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC",
       "doc": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -703,7 +651,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-AMOUNT",
       "doc": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "line": 4,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -712,7 +659,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-NO",
       "doc": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -721,8 +667,19 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
       "doc": "4期/03_開発/01_ソース/BILLGEN.cbl",
       "line": 6,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/BILLGEN.cbl",
+          "file": "4期/03_開発/01_ソース/BILLGEN.cbl",
+          "line": 6,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/BILLGEN.cbl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "COPIES",
@@ -730,8 +687,19 @@
       "dst": "copybook:v1_s3a_regress_test:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
       "doc": "4期/03_開発/01_ソース/BILLGEN.cbl",
       "line": 5,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/BILLGEN.cbl",
+          "file": "4期/03_開発/01_ソース/BILLGEN.cbl",
+          "line": 5,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/BILLGEN.cbl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "COPIES",
@@ -739,8 +707,19 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
       "doc": "4期/03_開発/01_ソース/COMMISUP.cbl",
       "line": 5,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/COMMISUP.cbl",
+          "file": "4期/03_開発/01_ソース/COMMISUP.cbl",
+          "line": 5,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/COMMISUP.cbl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "COPIES",
@@ -748,8 +727,19 @@
       "dst": "copybook:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
       "doc": "4期/03_開発/01_ソース/COMMISUP.cbl",
       "line": 6,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/COMMISUP.cbl",
+          "file": "4期/03_開発/01_ソース/COMMISUP.cbl",
+          "line": 6,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/COMMISUP.cbl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "COPIES",
@@ -757,8 +747,19 @@
       "dst": "copybook:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY",
       "doc": "4期/03_開発/01_ソース/CUSTMNT.cbl",
       "line": 5,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/CUSTMNT.cbl",
+          "file": "4期/03_開発/01_ソース/CUSTMNT.cbl",
+          "line": 5,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/CUSTMNT.cbl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "COPIES",
@@ -766,8 +767,19 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
       "doc": "4期/03_開発/01_ソース/FEECALC.cbl",
       "line": 5,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/FEECALC.cbl",
+          "file": "4期/03_開発/01_ソース/FEECALC.cbl",
+          "line": 5,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/FEECALC.cbl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "COPIES",
@@ -775,8 +787,19 @@
       "dst": "copybook:v1_s3a_regress_test:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
       "doc": "4期/03_開発/01_ソース/SALESUP.cbl",
       "line": 5,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/SALESUP.cbl",
+          "file": "4期/03_開発/01_ソース/SALESUP.cbl",
+          "line": 5,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/SALESUP.cbl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "COPIES",
@@ -784,8 +807,19 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
       "doc": "4期/03_開発/01_ソース/TAXCALC.cbl",
       "line": 5,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl",
+          "file": "4期/03_開発/01_ソース/TAXCALC.cbl",
+          "line": 5,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/TAXCALC.cbl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -793,9 +827,42 @@
       "dst": "batch:v1_s3a_regress_test:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 7 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 実行手順・本文 14 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 障害一次対応（ABEND）・本文 19 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "月次手数料バッチ運用手順・本文 3 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -803,9 +870,26 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 8 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 障害一次対応（ABEND）・本文 19 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -813,9 +897,18 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 障害一次対応（ABEND）・本文 19 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -823,9 +916,34 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 7 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 8 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 実行手順・本文 15 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -833,9 +951,34 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 7 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 8 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 実行手順・本文 15 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -843,9 +986,26 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 8 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 障害一次対応（ABEND）・本文 21 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -853,9 +1013,42 @@
       "dst": "batch:v1_s3a_regress_test:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 7 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 実行手順・本文 13 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 障害一次対応（ABEND）・本文 18 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "締めバッチ運用手順・本文 3 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -863,9 +1056,26 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 8 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 障害一次対応（ABEND）・本文 18 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -873,9 +1083,18 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 障害一次対応（ABEND）・本文 18 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -883,9 +1102,26 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 7 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 実行手順・本文 14 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -893,9 +1129,26 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 7 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 実行手順・本文 14 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -903,9 +1156,26 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 対象ジョブ・本文 8 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "file": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 障害一次対応（ABEND）・本文 20 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -913,9 +1183,18 @@
       "dst": "batch:v1_s3a_regress_test:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
       "doc": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
+          "file": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "代理店手数料機能 設計書・本文 4 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -923,9 +1202,18 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
       "doc": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
+          "file": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "代理店手数料機能 設計書・本文 4 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -933,9 +1221,18 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
       "doc": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
+          "file": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "代理店手数料機能 設計書・本文 3 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -943,9 +1240,18 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
       "doc": "4期/02_設計/01_基本設計/売上計上機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/売上計上機能設計書.md",
+          "file": "4期/02_設計/01_基本設計/売上計上機能設計書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "売上計上機能 設計書・本文 3 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -953,9 +1259,18 @@
       "dst": "batch:v1_s3a_regress_test:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 計算経路・本文 17 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -963,9 +1278,42 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 手数料率・本文 12 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 手数料率・本文 13 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 計算経路・本文 20 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "4. 関連・本文 25 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -973,9 +1321,18 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 手数料率・本文 12 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -983,9 +1340,26 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 計算経路・本文 17 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 計算経路・本文 19 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -993,9 +1367,42 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 計算経路・本文 17 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 計算経路・本文 18 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 計算経路・本文 19 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 計算経路・本文 20 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -1003,9 +1410,50 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 適用範囲・本文 8 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 計算経路・本文 18 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 計算経路・本文 19 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "3. 計算経路・本文 20 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "4. 関連・本文 25 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -1013,9 +1461,34 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
       "doc": "4期/02_設計/01_基本設計/税計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 消費税率・本文 13 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 消費税率・本文 14 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "4. 関連・本文 29 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -1023,9 +1496,18 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE",
       "doc": "4期/02_設計/01_基本設計/税計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "2. 消費税率・本文 13 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -1033,9 +1515,26 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
       "doc": "4期/02_設計/01_基本設計/税計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "1. 適用範囲・本文 8 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "file": "4期/02_設計/01_基本設計/税計算仕様書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "4. 関連・本文 29 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -1043,9 +1542,18 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
       "doc": "4期/02_設計/01_基本設計/請求機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/請求機能設計書.md",
+          "file": "4期/02_設計/01_基本設計/請求機能設計書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "請求機能 設計書・本文 3 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -1053,9 +1561,18 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT",
       "doc": "4期/02_設計/01_基本設計/顧客マスタ機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/02_設計/01_基本設計/顧客マスタ機能設計書.md",
+          "file": "4期/02_設計/01_基本設計/顧客マスタ機能設計書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "顧客マスタ機能 設計書・本文 3 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -1063,9 +1580,18 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
       "doc": "4期/04_運用/手数料改定障害記録.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/04_運用/手数料改定障害記録.md",
+          "file": "4期/04_運用/手数料改定障害記録.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "手数料改定障害記録・本文 3 行目"
+        }
+      ]
     },
     {
       "type": "DOCUMENTS",
@@ -1073,9 +1599,18 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
       "doc": "4期/04_運用/障害記録.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
-      "via": "mention"
+      "via": "mention",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "4期/04_運用/障害記録.md",
+          "file": "4期/04_運用/障害記録.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "障害記録・本文 3 行目"
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -1083,8 +1618,19 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
       "doc": "4期/03_開発/01_ソース/MONTHLY.jcl",
       "line": 3,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/MONTHLY.jcl",
+          "file": "4期/03_開発/01_ソース/MONTHLY.jcl",
+          "line": 3,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/MONTHLY.jcl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -1092,8 +1638,19 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
       "doc": "4期/03_開発/01_ソース/MONTHLY.jcl",
       "line": 2,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/MONTHLY.jcl",
+          "file": "4期/03_開発/01_ソース/MONTHLY.jcl",
+          "line": 2,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/MONTHLY.jcl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -1101,8 +1658,19 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
       "doc": "4期/03_開発/01_ソース/NIGHTLY.jcl",
       "line": 2,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/NIGHTLY.jcl",
+          "file": "4期/03_開発/01_ソース/NIGHTLY.jcl",
+          "line": 2,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/NIGHTLY.jcl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -1110,8 +1678,19 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
       "doc": "4期/03_開発/01_ソース/NIGHTLY.jcl",
       "line": 3,
-      "extraction_method": "static",
-      "status": "active"
+      "status": "active",
+      "sources": [
+        {
+          "doc_id": "4期/03_開発/01_ソース/NIGHTLY.jcl",
+          "file": "4期/03_開発/01_ソース/NIGHTLY.jcl",
+          "line": 3,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/NIGHTLY.jcl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -1119,9 +1698,21 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
       "doc": "4期/03_開発/01_ソース/AGENTPAY.cbl",
       "line": 6,
-      "extraction_method": "static",
       "status": "active",
-      "via": "call"
+      "via": "call",
+      "sources": [
+        {
+          "via": "call",
+          "doc_id": "4期/03_開発/01_ソース/AGENTPAY.cbl",
+          "file": "4期/03_開発/01_ソース/AGENTPAY.cbl",
+          "line": 6,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/AGENTPAY.cbl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -1129,9 +1720,21 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
       "doc": "4期/03_開発/01_ソース/BILLGEN.cbl",
       "line": 8,
-      "extraction_method": "static",
       "status": "active",
-      "via": "call"
+      "via": "call",
+      "sources": [
+        {
+          "via": "call",
+          "doc_id": "4期/03_開発/01_ソース/BILLGEN.cbl",
+          "file": "4期/03_開発/01_ソース/BILLGEN.cbl",
+          "line": 8,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/BILLGEN.cbl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -1139,9 +1742,21 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
       "doc": "4期/03_開発/01_ソース/COMMISUP.cbl",
       "line": 8,
-      "extraction_method": "static",
       "status": "active",
-      "via": "call"
+      "via": "call",
+      "sources": [
+        {
+          "via": "call",
+          "doc_id": "4期/03_開発/01_ソース/COMMISUP.cbl",
+          "file": "4期/03_開発/01_ソース/COMMISUP.cbl",
+          "line": 8,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/COMMISUP.cbl",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -1149,9 +1764,21 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
       "doc": "4期/03_開発/01_ソース/SALESUP.cbl",
       "line": 7,
-      "extraction_method": "static",
       "status": "active",
-      "via": "call"
+      "via": "call",
+      "sources": [
+        {
+          "via": "call",
+          "doc_id": "4期/03_開発/01_ソース/SALESUP.cbl",
+          "file": "4期/03_開発/01_ソース/SALESUP.cbl",
+          "line": 7,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/SALESUP.cbl",
+            "key": null
+          }
+        }
+      ]
     }
   ],
   "flags": []

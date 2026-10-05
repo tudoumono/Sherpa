@@ -1,11 +1,6 @@
-"""会話管理エンドポイント（フェーズ3スライス4・純移動）。
-
-`GET /conversations`・`GET /conversations/{cid}`・`DELETE /conversations/{cid}`・
-`POST /conversations/{cid}/pin`・`PATCH /conversations/{cid}`＋専用モデル（`PinReq`/`RenameReq`）
-を api.py から抽出する。ロジックは変更しない（コード移動のみ）。ルート表 golden の定義順を保つため、
-api.py 側は削除したブロックの元位置に `app.include_router(conversations.router)` を1回だけ置く。
-
-このモジュールは `sherpa.api` を import しない（循環回避）。
+"""会話管理エンドポイント（`GET /conversations`・`GET /conversations/{cid}`・`DELETE /conversations/{cid}`・`POST /conversations/{cid}/pin`・`PATCH /conversations/{cid}`）と専用モデル（`PinReq`/`RenameReq`）。
+`sherpa.api` を import しない。
+設計: docs/design/chat.md「会話の保存と継続」
 """
 from __future__ import annotations
 
@@ -16,26 +11,17 @@ from pydantic import BaseModel
 
 from sherpa import investigation_record_render, store
 from sherpa.deps import _current_user, _delete_codex_sessions_for_conversation
-from sherpa.providers.codex.provider import _conversation_lock
+from sherpa.providers.codex.turn_prepare import _conversation_lock
 from sherpa.store import investigation_records as store_investigation
 
-# router に tags を持たせない: 各エンドポイントの `tags=["会話管理"]` と結合されて
-# 二重化してしまう（ルート表 golden 不一致の原因）ため、tags 指定は各デコレータ側のみに残す
-# （system.py:42-44 と同じパターン）。
+# router に tags を持たせない（各デコレータの tags と二重になりルート表 golden が一致しなくなる）。
 router = APIRouter()
 
 
-# GET /conversations には response_model を付与しない: 応答行（store.list_conversations）は DB 列
-# `version`（歴史的名称・世代/世界 ID の実体・語彙統一のスコープ外＝DB 不変）をそのまま含み、
-# response_model を付与すると OpenAPI スキーマに `version` プロパティが露出する。
-# `tests/api/test_world_param_compat.py::test_openapi_surface_has_no_version_parameter` が
-# 「退役した version 概念を API surface に再宣言しない」契約を pin しているため、このルートは
-# `sherpa.schemas.ConversationSummary` を TypeAdapter 契約のみで固定する
-# （`tests/api/test_response_schemas.py` 参照・response_model 非付与）。
+# GET /conversations には response_model を付けない。応答行は DB 列 `version` を含み、response_model を付けると OpenAPI に `version` が露出して `test_openapi_surface_has_no_version_parameter` に反する。応答形は `sherpa.schemas.ConversationSummary` の TypeAdapter 契約（`tests/api/test_mock_api_contract.py`）で固定する。
 @router.get("/conversations", tags=["会話管理"])
 def conversations_list(request: Request, q: str | None = None):
-    """現在ユーザーの会話一覧（所有＋受領共有）を返す。`q` 指定時はタイトル・本文検索に絞る（H1・
-    trim 後 1〜100 字。省略時は従来どおり全件・応答形も不変）。"""
+    """現在ユーザーの会話一覧（所有＋受領共有）を返す。`q`（trim 後 1〜100 字）を指定するとタイトル・本文検索に絞る（省略時は全件）。"""
     u = _current_user(request)
     if q is None:
         return store.list_conversations(u["uid"])
@@ -57,18 +43,9 @@ def conversation_get(cid: int, request: Request):
 
 @router.delete("/conversations/{cid}", tags=["会話管理"])
 def conversation_delete(cid: int, request: Request):
-    """会話を削除（所有会話・受領ラッパーいずれも削除可）。
-
-    生きた受領ラッパーがこの会話を参照している場合は soft-delete（自分の一覧からは消えるが
-    受領側は引き続き読める）、参照が無ければ物理削除（store.delete_conversation 参照）。
-    どちらの場合も Codex resume セッション実体（`.codex-sessions/{cid}`）は即時削除する
-    （_delete_codex_sessions_for_conversation 参照・soft delete でも削除する理由はそちら側に記載）。
-
-    Codex 実行と同じ会話単位ロック（`CodexProvider._conversation_lock`）を DB 変更の前に
-    非ブロッキングで取る。実行中（取れない）なら DB には一切触れず 409 を返す——取らずに削除すると、
-    実行側がロック取得前に `.codex-sessions/{cid}` を作り直す窓ができ、削除済み会話の孤児
-    ディレクトリが TTL 掃除まで残る（実行側も同じロックを取ってから作成・生存確認する。
-    provider.py::CodexProvider._run_authoring 参照）。
+    """会話を削除する（所有会話・受領ラッパーいずれも可）。
+    生きた受領ラッパーがこの会話を参照している場合は論理削除（自分の一覧からは消えるが受領側は引き続き読める）、無ければ物理削除する。どちらも Codex の継続セッションは即時に削除する。
+    Codex が実行中の会話は DB に触れず 409 を返す（Codex の実行と同じ会話単位のロックを、DB を変える前に待たずに取る）。
     """
     u = _current_user(request)
     lock = _conversation_lock(cid)
@@ -89,7 +66,7 @@ class PinReq(BaseModel):
 
 @router.post("/conversations/{cid}/pin", tags=["会話管理"])
 def conversation_pin(cid: int, req: PinReq, request: Request):
-    """会話のピン留め状態を変更（所有会話・受領ラッパーどちらも可）。"""
+    """会話のピン留め状態を変更する（所有会話・受領ラッパーどちらも可）。"""
     u = _current_user(request)
     # pin は所有会話も受領ラッパーも可（どちらも user_id = current.uid）。
     if not store.set_pinned(cid, req.pinned, u["uid"]):
@@ -103,9 +80,9 @@ class RenameReq(BaseModel):
 
 @router.patch("/conversations/{cid}", tags=["会話管理"])
 def conversation_rename(cid: int, req: RenameReq, request: Request):
-    """会話タイトルを変更（所有会話のみ・受領共有は403）。"""
+    """会話タイトルを変更する（所有会話のみ・受領共有は403）。"""
     u = _current_user(request)
-    # rename は所有会話（origin='own'）のみ。受領共有は拒否。
+    # rename は所有会話（origin='own'）のみ。受領共有は拒否する。
     if not store.owns_conversation(u["uid"], cid):
         # 受領共有かどうか確認して 403/404 を区別する。
         conv = store.get_conversation_for_read(u["uid"], cid)
@@ -123,16 +100,9 @@ def conversation_rename(cid: int, req: RenameReq, request: Request):
 @router.get("/conversations/{cid}/messages/{message_id}/investigation", tags=["会話管理"])
 def conversation_investigation_download(cid: int, message_id: int, request: Request,
                                          format: str = Query("md", pattern="^(md|json)$")):
-    """調査の記録（`investigation_records`・COD-18「調査台帳を回答ごとに残す」提案書）のダウンロード。
-
-    会話の所有者のみ（`owns_assistant_message` と同じ判定＝他人の会話・論理削除済み・共有の
-    閲覧者（受領共有ラッパーは `origin != 'own'`）はすべて 404・`conversation_rename` と同じ
-    「所有会話のみ」の流儀だが、こちらは403との区別をしない＝常に404）。記録が無い
-    （台帳を使わない構成・台帳ゲートが走らなかったターン）メッセージも404。
-
-    `format=md`（既定）は人が読む Markdown・`format=json` は保存した4つ（manifest/items/
-    coverage/reviews＝COD-18 ⑤「中間の見直し」）をそのまま返す。ファイル名は固定の一般名
-    （質問文・資料名を含めない・CLAUDE.md「実環境の固有名」節と同じ理由）。
+    """調査の記録（回答ごとの調査台帳）をダウンロードする。
+    会話の所有者のみ（他人の会話・論理削除済み・共有の閲覧者はすべて 404）。記録が無いメッセージも 404。
+    `format=md`（既定）は人が読む Markdown、`format=json` は保存した manifest/items/coverage/reviews をそのまま返す。ファイル名は固定の一般名（質問文・資料名を含めない）。
     """
     u = _current_user(request)
     if not store.owns_assistant_message(u["uid"], cid, message_id):

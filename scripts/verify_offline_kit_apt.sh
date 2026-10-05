@@ -42,6 +42,7 @@
 #   SHERPA_WFTEST_REBUILD_HOST=1  来歴が一致していても既存のホスト像を確認せず常に作り直す
 #   SHERPA_WFTEST_SNAPSHOT        ホスト像構築に使う snapshot.ubuntu.com の時刻（既定: 20240501T000000Z）
 set -Eeuo pipefail
+[ "$(uname -s)" = "Linux" ] || { echo "このスクリプトは Linux 専用です（閉域キットの検証は apt を使います）。macOS では使えません。" >&2; exit 2; }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -227,7 +228,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # 2. --network none でキットを実導入する（apt_offline_install をそのまま使う・別経路を作らない）
 # ---------------------------------------------------------------------------
-DRIVER="$(mktemp)"
+DRIVER="$(mktemp "${TMPDIR:-/tmp}/sherpa.XXXXXX")"
 trap 'rm -f "$DRIVER"' EXIT
 cat > "$DRIVER" <<'DRV'
 set -Eeuo pipefail

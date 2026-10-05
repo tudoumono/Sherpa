@@ -1,0 +1,2 @@
+<!DOCTYPE Project [<!ENTITY x "y">]>
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><RootNamespace>&x;</RootNamespace></PropertyGroup></Project>

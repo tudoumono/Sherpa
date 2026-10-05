@@ -87,7 +87,6 @@ def test_plain_mode_turn_skips_schema_and_multi_agent_and_uses_minimal_prompt(tm
 
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users"))
-    monkeypatch.setenv("SHERPA_CODEX_REASONING", "medium")   # 基準値（クイックの standard なら low へ下がる）
 
     ctx = A.Ctx(
         message="消費税率の仕様を教えて",
@@ -99,7 +98,8 @@ def test_plain_mode_turn_skips_schema_and_multi_agent_and_uses_minimal_prompt(tm
         knowledge=True, uid="plain-mode-u1", make_sources=lambda docs: [],
         scope_meta={"depth_profile": "quick"},   # plain では調べる深さが効かない（推論は基準値のまま）
     )
-    prov = A.CodexProvider(system_settings={"codex_mode": "plain"})
+    # 基準値は管理画面の設定（クイックの standard なら low へ下がる値）
+    prov = A.CodexProvider(system_settings={"codex_mode": "plain", "depth_base_codex_reasoning": "medium"})
     env = _result_env(list(prov.run(ctx)))
 
     # (e) 平文の回答がそのまま headline になる（非スキーマ経路 _pick_codex_headline）。
@@ -138,13 +138,17 @@ def test_plain_mode_turn_skips_schema_and_multi_agent_and_uses_minimal_prompt(tm
     assert "investigate-" not in agents_md
 
     # 直読の準備（秘匿ファイル列挙）に失敗したら、素の Codex は資料を読む手段が無い＝Codex を起動せず正直に失敗する。
-    from sherpa.providers.codex import provider as provider_mod
+    from sherpa.providers.codex import sandbox as sandbox_mod
+
+    enum_calls: list = []
 
     def _enum_fails(*a, **k):
+        enum_calls.append(a)
         raise RuntimeError("sensitive_enum_failed:test")
 
-    monkeypatch.setattr(provider_mod, "_enumerate_sensitive", _enum_fails)
+    monkeypatch.setattr(sandbox_mod, "_enumerate_sensitive", _enum_fails)
     env2 = _result_env(list(A.CodexProvider(system_settings={"codex_mode": "plain"}).run(ctx)))
+    assert len(enum_calls) == 1
     assert env2["agentic_failure"] == "error"
     assert "読み取りの準備ができませんでした" in env2["headline"]
     assert len([ln for ln in argv_log.read_text().splitlines() if ln.strip()]) == 1   # 2 回目は起動していない
@@ -153,14 +157,14 @@ def test_plain_mode_turn_skips_schema_and_multi_agent_and_uses_minimal_prompt(tm
 def test_plain_headline_skips_follow_up_reply_and_tool_home_is_outside_deliverables(tmp_path):
     """実環境の 0.14.5 で起きた 2 つ: 回答の後に届いた通知への短い返事を回答として拾った／LibreOffice の
     プロファイル（HOME 配下）が成果物として登録された。"""
-    from sherpa.providers.codex import provider as provider_mod
+    from sherpa.providers.codex import continuation as continuation_mod
     from sherpa.providers.codex import sandbox as sandbox_mod
     answer = "区分は 1〜7 です。\n\n参照した資料:\n- a/b.doc"
     follow_up = "追加通知の内容は結論と整合していました。先ほどの回答内容は変更ありません。"
-    assert provider_mod._pick_codex_headline([answer, follow_up], prefer_marker="参照した資料") == answer
-    assert provider_mod._pick_codex_headline([answer, follow_up]) == follow_up   # standard は従来どおり
+    assert continuation_mod._pick_codex_headline([answer, follow_up], prefer_marker="参照した資料") == answer
+    assert continuation_mod._pick_codex_headline([answer, follow_up]) == follow_up   # standard は従来どおり
 
     run, tmp = tmp_path / "run", tmp_path / "run" / ".tmp"
     tmp.mkdir(parents=True)
-    env = sandbox_mod._codex_clean_env(tmp_path / "home", run, tmp)
+    env = sandbox_mod._codex_clean_env(tmp_path / "home", tmp)
     assert Path(env["HOME"]).is_relative_to(tmp)   # 成果物の走査から外れる .tmp/ の下

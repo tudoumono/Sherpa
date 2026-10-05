@@ -14,6 +14,7 @@
 #   sudo scripts/setup-runtime-users.sh --dry-run  # 何をするか表示のみ
 #   sudo scripts/setup-runtime-users.sh --verify    # 所有権/mode/グループを点検
 set -euo pipefail
+[ "$(uname -s)" = "Linux" ] || { echo "このスクリプトは Linux 専用です（useradd・groupadd で OS ユーザを作ります）。macOS では使えません。" >&2; exit 2; }
 
 ROOT="${SHERPA_SRV_ROOT:-/srv/sherpa}"
 GROUP="sherpa"

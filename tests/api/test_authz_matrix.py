@@ -1,6 +1,6 @@
 """認可マトリクス完全版（役割 × 全ルート・refactoring-plan フェーズ7 S4）。
 
-`tests/api/test_auth_snapshot.py`（未ログイン×全ルートのステータス snapshot）を土台に、
+未ログイン×全ルートのステータス表を土台に、
 役割（admin / user / 未ログイン / 互換モード）× 全 APIRoute（`_authz_probe._api_route_keys()`）
 へ拡張する。プローブ機構（プレースホルダ・最小 body・request ヘルパ）は
 `tests/api/_authz_probe.py` を共有する。
@@ -8,8 +8,7 @@
 POLICY: 各ルートの認可区分を機械的に列挙した表（`(METHOD, PATH) -> 区分`）。
 区分は 'admin'（`_require_admin` 必須）／'login'（ログインのみ必須）／
 'ext_key'（`X-API-Key` ヘッダ必須・cookie 無関係）／'special:<期待値>'（個別の固定期待値を持つ
-公開系・test_auth_snapshot.EXPECTED 側で既に snapshot 済み＝ここでは POLICY の完全性チェック用に
-存在を認識するだけで、追加のループ検証はしない）。
+公開系・`test_special_routes_anon_status` が未ログインの実測ステータスを固定する）。
 `test_policy_covers_all_routes` が「新規ルート追加時に POLICY 更新を強制する」ガード。
 
 区分の初期値は handler ソースの `_require_admin` 呼び出し（38 出現・うち `GET /announcements` は
@@ -29,13 +28,9 @@ POLICY: 各ルートの認可区分を機械的に列挙した表（`(METHOD, PA
 ルートは `DENY_ONLY` に列挙し、許可側 probe をスキップする（拒否側＝未ログイン401 の検証は
 `_current_user`/`_require_admin`/`require_api_key` が handler の先頭で必ず先に評価されるため、
 DENY_ONLY 対象でも安全に実行できる）。DENY_ONLY の内訳（実 TestClient で確認済み・2026-07-14）:
-  - LLM/Codex を実起動しうる重い実行系: `/chat`・`/chat/stream`（GET・SSE 生成器を最後まで
-    消費すると同じ経路を通る）・`/chat/turns`（バックグラウンドスレッドで実行が続く）・
-    `/qa/run`・`/troubleshoot/run`・`/impact/run`・`/graph/ask`・`/admin/usage/chat`。
+  - LLM/Codex を実起動しうる重い実行系: `/chat/turns`（バックグラウンドスレッドで実行が続く）。
   - 外部 API へ実接続する系（コスト/レイテンシ・キーが env にあれば実課金systemもあり得る）:
-    `/settings/test`・`/settings/bedrock-models/verify`・`GET /settings/bedrock-models`
-    （保存済みキー無しでも env フォールバックで control-plane を叩く実装・キャッシュ無しの初回は必ず
-    外向き通信が発生する）。
+    `/settings/test`。
   - 共有 fixtures world を実際に再構築してしまう: `POST /ingest/rerun`（world 未指定時は既定 "v1"＝
     他テストが使う共有 world をフルリビルドする・404 での保護が無い）。
   - プレースホルダで守れない実書き込み: `POST /admin/announcements`（実在チェックが無く必ず行を
@@ -50,11 +45,11 @@ DENY_ONLY 対象でも安全に実行できる）。DENY_ONLY の内訳（実 Te
   `PUT /admin/settings`・`PATCH`/`DELETE /admin/announcements/{id}`・
   `DELETE /ext/v1/admin/keys/{key_id}`・`DELETE /worlds/{wid}`・`POST /worlds`・`POST /worlds/diff`・
   `POST /worlds/{wid}/*`・`DELETE`/`PATCH`/`POST /conversations/{cid}(/pin)`・
-  `DELETE /workspace/files/{file_id}`・`POST /workspace/files`・`POST /chat/stream/stop`・
+  `DELETE /workspace/files/{file_id}`・`POST /workspace/files`・
   `POST /chat/turns/{turn_id}/stop`・`PUT /settings`）は実 TestClient で「許可側 probe をしても
   実データを作らず/壊さず、401/403 も返さない」ことを確認済み（2026-07-14・本ファイル作成時）。
 
-**IDOR / 所有権系は対象外**（既存の個別テスト tests/api/test_impact_idor.py 等へ委譲）。
+**IDOR / 所有権系は対象外**（個別テストへ委譲）。
 `POST /conversations/{cid}/shares` 等の所有権 403 も同じ理由で DENY_ONLY（このマトリクスは
 「認証ゲートの有無」を見るものであり、ビジネスロジック上の所有権判定は別の関心事）。
 
@@ -118,7 +113,6 @@ POLICY: dict[tuple[str, str], str] = {
     ("GET", "/admin/audit/export"): "admin",
     ("GET", "/admin/usage/stats"): "admin",
     ("GET", "/admin/usage/export"): "admin",
-    ("POST", "/admin/usage/chat"): "admin",
     ("POST", "/admin/usage/quality-runs"): "admin",
     ("GET", "/admin/improvement-log/export"): "admin",
     ("GET", "/admin/settings"): "admin",
@@ -126,6 +120,7 @@ POLICY: dict[tuple[str, str], str] = {
     ("POST", "/admin/settings/openai-endpoint-test"): "admin",
     ("GET", "/admin/users"): "admin",
     ("POST", "/admin/users"): "admin",
+    ("POST", "/admin/users/import"): "admin",
     ("PATCH", "/admin/users/{uid}"): "admin",
     ("POST", "/admin/announcements"): "admin",
     ("PATCH", "/admin/announcements/{id}"): "admin",
@@ -136,7 +131,6 @@ POLICY: dict[tuple[str, str], str] = {
     ("GET", "/graph"): "admin",
     ("GET", "/graph/facets"): "admin",
     ("GET", "/graph/search"): "admin",
-    ("POST", "/graph/ask"): "admin",
     ("GET", "/ingest/preview"): "admin",
     ("GET", "/ingest/runs"): "admin",
     ("POST", "/ingest/rerun"): "admin",
@@ -145,11 +139,12 @@ POLICY: dict[tuple[str, str], str] = {
     ("POST", "/worlds/diff"): "admin",
     ("GET", "/worlds/{wid}/status"): "admin",
     ("POST", "/worlds/{wid}/recount"): "admin",
-    ("GET", "/worlds/{wid}/diff"): "admin",
     ("POST", "/worlds/{wid}/rebind"): "admin",
     ("POST", "/worlds/{wid}/refresh"): "admin",
     ("POST", "/worlds/{wid}/reconvert"): "admin",
     ("POST", "/worlds/{wid}/rag_regenerate_rules"): "admin",
+    ("GET", "/worlds/{wid}/resolve-settings"): "admin",
+    ("PUT", "/worlds/{wid}/resolve-settings"): "admin",
     ("DELETE", "/worlds/{wid}"): "admin",
     ("POST", "/ext/v1/admin/keys"): "admin",
     ("GET", "/ext/v1/admin/keys"): "admin",
@@ -160,9 +155,13 @@ POLICY: dict[tuple[str, str], str] = {
     ("POST", "/ext/v1/search"): "ext_key",
     ("GET", "/ext/v1/capabilities"): "ext_key",
     ("GET", "/ext/v1/doc"): "ext_key",
-    ("POST", "/ext/v1/research"): "ext_key",
+    ("POST", "/ext/v1/answer"): "ext_key",
+    ("POST", "/ext/v1/codex/jobs"): "ext_key",
+    ("GET", "/ext/v1/codex/jobs/{job_id}"): "ext_key",
+    ("GET", "/ext/v1/codex/jobs/{job_id}/result"): "ext_key",
+    ("POST", "/ext/v1/codex/jobs/{job_id}/cancel"): "ext_key",
     ("GET", "/ext/v1/openapi.json"): "ext_key",
-    # ---- special（個別固定期待値・test_auth_snapshot.EXPECTED で snapshot 済み・7）----
+    # ---- special（個別固定期待値・7）----
     ("POST", "/auth/login"): "special:422",
     ("POST", "/auth/logout"): "special:200",
     ("GET", "/healthz"): "special:200",
@@ -190,14 +189,8 @@ POLICY: dict[tuple[str, str], str] = {
     ("DELETE", "/workspace/files/{file_id}"): "login",
     ("GET", "/workspace/files/{file_id}/download"): "login",
     ("GET", "/workspace/search"): "login",
-    ("POST", "/impact/run"): "login",
-    ("GET", "/impact/{aid}"): "login",
-    ("GET", "/impact/{aid}/export.xlsx"): "login",
     ("GET", "/scopes"): "login",
     ("GET", "/chat/tools-availability"): "login",   # SC-6e: 検索経路の実接続可用性
-    ("POST", "/chat"): "login",
-    ("GET", "/chat/stream"): "login",
-    ("POST", "/chat/stream/stop"): "login",
     ("POST", "/chat/turns"): "login",
     ("GET", "/chat/turns/{turn_id}/stream"): "login",
     ("GET", "/chat/turns/running"): "login",   # 条件付き admin（all=true）は別テストで検証
@@ -205,8 +198,6 @@ POLICY: dict[tuple[str, str], str] = {
     ("POST", "/chat/{conversation_id}/messages/{message_id}/feedback"): "login",
     ("GET", "/config"): "login",
     ("GET", "/settings"): "login",
-    ("GET", "/settings/bedrock-models"): "login",
-    ("POST", "/settings/bedrock-models/verify"): "login",
     ("PUT", "/settings"): "login",
     ("POST", "/settings/test"): "login",
     ("GET", "/conversations"): "login",
@@ -217,8 +208,6 @@ POLICY: dict[tuple[str, str], str] = {
     # cid=1・message_id=999999999 は実在しない（_PLACEHOLDERS）＝owns_assistant_message が必ず偽と
     # なり処理に届く前に404で止まる（DENY_ONLY 不要・/conversations/{wid}/fork と同じ理由）。
     ("GET", "/conversations/{cid}/messages/{message_id}/investigation"): "login",
-    ("POST", "/troubleshoot/run"): "login",
-    ("POST", "/qa/run"): "login",
     ("GET", "/documents/download"): "login",
     ("GET", "/documents"): "login",
     ("GET", "/world-options"): "login",
@@ -232,18 +221,11 @@ POLICY: dict[tuple[str, str], str] = {
 
 # 「許可側」probe をスキップするルート（理由はモジュール docstring 参照）。
 DENY_ONLY: set[tuple[str, str]] = {
-    ("GET", "/chat/stream"),
     # SC-6e: ES/Neo4j への実接続を試みる（`agentic_search.tool_availability()`）ため、
     # 許可側 probe の所要時間・結果がテスト環境の外部到達性に左右される（本テストは認可判定の
     # 固定が目的で、可用性判定の実測は tests/api/test_scope_mc.py 側が担う）。
     ("GET", "/chat/tools-availability"),
-    ("GET", "/settings/bedrock-models"),
     ("POST", "/auth/change-password"),
-    ("POST", "/qa/run"),
-    ("POST", "/troubleshoot/run"),
-    ("POST", "/impact/run"),
-    ("POST", "/graph/ask"),
-    ("POST", "/admin/usage/chat"),
     # DB へ1行 INSERT する（`admin/announcements` と同じ「安全な no-op body が無い create」
     # パターン・許可側 probe を通すと実データが残る）。
     ("POST", "/admin/usage/quality-runs"),
@@ -270,13 +252,10 @@ DENY_ONLY: set[tuple[str, str]] = {
 # RV MED（2026-07-14 フェーズ7 1巡目）: DENY_ONLY を4本減らし、専用 body で「外部接続・実行・
 # DB 変異の**前に**決定的に返る分岐」を突いて許可側 probe を成立させる（実装読解＋実 TestClient で
 # 確認済み・2026-07-14）:
-#   - verify: model_id 形式不正 → BEDROCK_MODEL_ID_RE 不一致で 200 {"ok": False}（外部呼び出し前。
-#     レート制限は uid 単位＝probe の uid は毎回一意なので非干渉・仮に 429 でも not in(401,403)）
 #   - settings/test: 未知 provider → graph_extract._probe 到達前に 422
 #   - chat / chat/turns: 存在しない conversation_id → handler 先頭の _check_chat_write が 404
 #     （provider 実行・会話作成の前）
 ALLOW_PROBE_BODY: dict[tuple[str, str], dict] = {
-    ("POST", "/settings/bedrock-models/verify"): {"model_id": "x"},
     ("POST", "/settings/test"): {"provider": "__authz_probe__"},
     # 未指定なら OpenaiEndpointTestReq.provider の既定値 "openai" になり、
     # DB に中央 OpenAI キーが残っていれば（他テストの副作用等）実 API へ到達しうる（このルートは
@@ -284,7 +263,6 @@ ALLOW_PROBE_BODY: dict[tuple[str, str], dict] = {
     # 通信前 422」の安全な body を明示する（admin 認可の ALLOW 確認自体は 200/404/422 いずれでも
     # 401/403 でなければ成立するため、実通信を避けつつ認可判定だけを固定できる）。
     ("POST", "/admin/settings/openai-endpoint-test"): {"provider": "__authz_probe__"},
-    ("POST", "/chat"): {"message": "authz-probe", "conversation_id": 999999999, "stream_id": "authzprobe0001"},
     ("POST", "/chat/turns"): {"message": "authz-probe", "conversation_id": 999999999},
 }
 
@@ -352,7 +330,8 @@ def test_policy_covers_all_routes():
         f"表にあるが消えたルート: {sorted(expected - actual)}"
     )
     # 区分の内訳が事前分析の実測（admin=旧38＋SET-2cの接続テスト1＋STAT-1の利用統計チャット1・
-    # ext_key=旧5＋PART-4の POST /ext/v1/research・special 7（旧5＋Swagger UI 自前ルート化分の
+    # ext_key=旧5＋簡易チャットの POST /ext/v1/answer（旧 PART-4 の POST /ext/v1/research を置き換え）・
+    # special 7（旧5＋Swagger UI 自前ルート化分の
     # 2件・ReDoc は提供しないため対象外）・login=旧39＋PART-5の利用者自己発行3ルート＋回復1ルート）
     # と一致することも併せて固定する（区分の取り違えに気づけるように）。
     # admin=改善ログエクスポート1件追加（41）・login=回答フィードバック投稿1件追加（44）。
@@ -365,11 +344,19 @@ def test_policy_covers_all_routes():
     # login=SH-1/SH-2（2026-09-05・共有フォーク＋再共有）で3ルート追加（fork・refresh・共有一覧）し49。
     # admin=品質採点の入口（POST /admin/usage/quality-runs）1件追加で41。
     # admin=明細の ZIP 保存（GET /admin/usage/export）1件追加で42。
+    # admin=利用統計の AI チャット（/admin/usage/chat）とグラフの AI 質問の撤去で40。
+    # admin=ユーザーの CSV 一括追加（POST /admin/users/import）1件追加で41。
+    # admin=GET /worlds/{wid}/diff の撤去で40。
+    # admin=資料フォルダの解決範囲の設定（GET/PUT /worlds/{wid}/resolve-settings）2件追加で42。
     assert len(ADMIN_ROUTES) == 42
-    assert len(EXT_KEY_ROUTES) == 6
+    # ext_key=旧6＋Codex ジョブ API 4本（受付・状態・結果・取消・`C-EXT-CODEXJOB-*`）で10。
+    assert len(EXT_KEY_ROUTES) == 10
     assert len(SPECIAL_ROUTES) == 7
     # login=調査の記録のダウンロード（COD-18・`C-CONV-INVESTIGATION-01`）1件追加で50。
-    assert len(LOGIN_ROUTES) == 51
+    # login=Gemini・Bedrock のモデル取得・検証の撤去で48。
+    # login=共有の期限延長（POST /conversation-shares/{id}/extend）1件追加で49。
+    # login=画面が使わない直 API（/chat・/chat/stream・/chat/stream/stop・/qa/run・/troubleshoot/run・/impact/run・/impact/{aid}・/impact/{aid}/export.xlsx）8 ルートの撤去で41。
+    assert len(LOGIN_ROUTES) == 41
 
 
 def test_admin_routes_deny_for_anon_and_nonadmin_user():
@@ -414,6 +401,20 @@ def test_login_routes_deny_for_anon():
         if got != 401:
             mismatches.append(f"anon {method} {path}: 期待 401 実測 {got}")
     assert not mismatches, "login ゲートの拒否側が変化:\n" + "\n".join(mismatches)
+
+
+def test_special_routes_anon_status():
+    """special 区分（公開系）: 未ログインの実測ステータスが POLICY の期待値のまま（リダイレクトは追わない）。"""
+    if not _try_init():
+        pytest.skip("infra down")
+    anon = TestClient(app, follow_redirects=False, raise_server_exceptions=False)
+    mismatches = []
+    for method, path in sorted(SPECIAL_ROUTES):
+        want = int(POLICY[(method, path)].split(":", 1)[1])
+        got = _request(anon, method, path).status_code
+        if got != want:
+            mismatches.append(f"anon {method} {path}: 期待 {want} 実測 {got}")
+    assert not mismatches, "公開系ルートのステータスが変化:\n" + "\n".join(mismatches)
 
 
 def test_login_routes_allow_for_user_and_admin():

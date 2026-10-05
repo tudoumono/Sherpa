@@ -1,18 +1,16 @@
 // システム状態画面（admin 専用）。GET /admin/health でコンポーネント別の健全性を取得。
+// 設計: docs/design/operations.md「構成（運用の仕組み）」
 // セキュリティ: server data（label/detail/hint）は全て esc()。
 'use strict';
 
-// UI-TABS2（2026-09-04）: システム管理のタブから iframe（?embed=1）で開かれた時は、自ページの
-// 共通トップバー/ナビを隠す（CSS 側は .embedded 修飾・status.html の <style>）。単独 URL 直開き
-// （?embed 無し）では何もしない＝この画面の機能・見た目は完全に不変。
+// システム管理のタブから iframe（?embed=1）で開かれた時は、共通トップバー/ナビを隠す（CSS は .embedded 修飾）。
 if (new URLSearchParams(location.search).has('embed')) {
   document.documentElement.classList.add('embedded');
 }
 
 const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;
 
-// 非表示タブは Sherpa.visibilityInterval が自動で止める（性能台帳 QW4）ので、可視タブの
-// 定常負荷を下げるためここは長めにしてよい。
+// 非表示タブは Sherpa.visibilityInterval が自動で止めるため、ここは長めでよい。
 const POLL_MS = 45000;
 
 function toast(msg) {
@@ -22,13 +20,8 @@ function toast(msg) {
 }
 
 // ===== admin ガード =====
-// 戻り値は3値: 'admin'（アクセス可）／'denied'（非admin・未ログイン等）／
-// 'unreachable'（5xx・ネットワーク失敗＝認証DB停止等でアクセス可否が判定できない）。
-// getJSON（`common.js::api`）は非2xxでも妥当な JSON 本文を持つ場合に限り例外へ
-// `err.status`/`err.body` を載せるが、本文が JSON として解析できない応答（ネットワーク
-// 障害・不正な JSON 等）は status を持たない曖昧な失敗として扱う——401/403（denied）と
-// それ以外の失敗（unreachable）を確実にステータスコードだけで判別したいここでは、
-// 例外経由ではなく素の fetch で `r.status` を直接見る。
+// 戻り値は3値: 'admin'（アクセス可）／'denied'（非admin・未ログイン等）／'unreachable'（5xx・ネットワーク失敗＝認証DB停止等でアクセス可否が判定できない）。
+// 401/403（denied）とそれ以外の失敗（unreachable）をステータスコードだけで判別するため、getJSON ではなく素の fetch で r.status を直接見る。
 async function checkAdmin() {
   let r;
   try {
@@ -140,9 +133,7 @@ async function loadHealth(refresh) {
   }
 }
 
-// UI フィードバック4（2026-07-03）: 「再チェック」クリックで実際に何が起きているか分かるよう、
-// ボタンをスピナー付きの「確認中...」表示にし、各行の状態セルにも「確認中…」を反映する
-// （AI の実接続確認は数秒かかることがあるため、何も反応が無いように見えないようにする）。
+// 「再チェック」クリックで、ボタンをスピナー付きの「確認中...」表示にし、各行の状態セルにも「確認中…」を反映する（AI の実接続確認は数秒かかることがあるため）。
 function showChecking() {
   document.querySelectorAll('#health-tbody .state-cell').forEach((td) => {
     td.textContent = '確認中…'; td.style.color = 'var(--ink-3)';

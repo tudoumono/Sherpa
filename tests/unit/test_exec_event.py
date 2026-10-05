@@ -45,7 +45,7 @@ def test_kind_for_event_type_none_or_unknown_defaults_to_think():
 
 def test_build_event_fills_v1_minimal_contract():
     ev = EE.build_event("id1", "tool", "ラベル", "詳細", "done")
-    for f in EE.V1_FIELDS:
+    for f in ("id", "kind", "label", "detail", "status"):
         assert f in ev
     assert ev["type"] == "node"
     assert ev["id"] == "id1" and ev["kind"] == "tool" and ev["label"] == "ラベル"

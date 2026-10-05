@@ -58,7 +58,7 @@ def test_provider_switch_changes_cache_key_and_triggers_reindex(monkeypatch):
     ol = embeddings.cfg(None, system_settings={**_CLOUD, "embed_provider": "ollama"})
     assert es_index._chunk_key(oa, "本文") != es_index._chunk_key(ol, "本文")
     meta = {"content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-            "search_chunk_mode": es_index._search_chunk_mode(), "arms_sig": "a", "analyzer_config_sig": "z",
+            "arms_sig": "a", "analyzer_config_sig": "z",
             "chunk_lines": es_index._CHUNK_LINES, "human_md_sig": None,
             "embed_provider": "openai", "embed_model": oa["model"], "dim": oa["dim"],
             "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID}

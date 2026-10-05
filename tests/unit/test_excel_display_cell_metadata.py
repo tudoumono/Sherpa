@@ -4,12 +4,13 @@
 **同時に**フルロードしていた（ピークメモリ2倍）。逐次化（`wb_formula` を読み終えてから閉じ、
 その後 `wb_values` を開く）に是正するにあたり、出力が byte-identical であることをこのテストで
 固定する。期待値（`_EXPECTED_JSON`）は**是正前のコード**を実際に実行して得た実測値
-（`metadata_json()` の決定的直列化）であり、推測値ではない。
+（`json.dumps(sort_keys=True)` の決定的直列化）であり、推測値ではない。
 
 対象セル: formula（cache 有/無）・日付書式・素の整数・文字列・空セル（対象だが未使用の座標）。
 """
 from __future__ import annotations
 
+import json
 import weakref
 import zipfile
 from datetime import datetime
@@ -89,7 +90,7 @@ def test_extract_cell_metadata_matches_pre_refactor_golden(tmp_path):
     targets = {"Sheet1": {"A1", "A2", "A3", "A4", "A5", "A6"}}
     metadata = excel_display.extract_cell_metadata(fixture, targets)
     keyed = {f"{sheet}!{coord}": v for (sheet, coord), v in metadata.items()}
-    assert excel_display.metadata_json(keyed) == _EXPECTED_JSON
+    assert json.dumps(keyed, ensure_ascii=False, sort_keys=True, separators=(",", ":")) == _EXPECTED_JSON
 
 
 def test_extract_cell_metadata_skips_sheet_missing_from_either_workbook(tmp_path):

@@ -8,19 +8,16 @@ cd "$ROOT"
 # .env を用意（無ければ雛形から）
 [ -f .env ] || { cp .env.example .env; echo "created .env from .env.example (set the AI key in the admin UI)"; }
 
-# .env の非 secret 設定（SHERPA_VERSION など）を反映（読み方は scripts/run-common.sh に一本化:
+# .env の非 secret 設定を反映（読み方は scripts/run-common.sh に一本化:
 # 呼び出し側の明示指定 ＞ .env ＞ 既定・SHERPA_ENV_FILE 対応）。
 # shellcheck source=scripts/run-common.sh
 . "$ROOT/scripts/run-common.sh"
 sherpa_source_dotenv
 
 # ローカルデータディレクトリ（本番は /srv/sherpa）。kb は読み取り専用運用、workspace は書込可。
-VER="${SHERPA_VERSION:-v1}"
-UID_="${SHERPA_UID:-admin}"
-mkdir -p "data/kb/uploads/$VER" "data/kb/md/$VER" "data/kb/src/$VER"
+UID_="admin"
 mkdir -p "data/users/$UID_/workspace/outputs" "data/users/$UID_/workspace/tmp"
 echo "dirs ready:"
-echo "  data/kb/{uploads,md,src}/$VER   (read-only KB)"
 echo "  data/users/$UID_/workspace       (writable)"
 
 # curl の存在確認（下のストア待ちで使う）

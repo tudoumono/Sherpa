@@ -1,97 +1,34 @@
-"""`compare_documents`（GEN-DIFF）本体: 2文書の RAG 正本（`.rag.md`）を突き合わせる素朴な決定的 diff。
+"""`compare_documents` ツール本体: 2文書の RAG 正本（`.rag.md`）を突き合わせる素朴な決定的 diff。
 
-正典: `docs/archive/2026-09-03-世代間diff比較.md` §3〜§8。**方針（裁定）**: ツールは grep と同格の
-素朴な決定的ツール——レコード同定・業務キー対応付け・要約・ask_user 連携は行わない。曖昧な対応文書
-（§4）は候補一覧を返すだけで会話側（agentic loop の LLM）が確認する。
-
-**独立モジュールにする理由**: 登録元（`agentic_search.py`・`mcp_server.py`）はこのモジュールを import
-する側（逆は循環 import になるため不可）。パス封じ込め（doc_id 検証→resolve+is_relative_to→字面パスと
-resolve() の一致で symlink 検知）は `agentic_search._safe_doc_path` と同じ流儀をここで独立に実装する
-（`rag_parent_return.py` が `search_service.py` の境界のために同じ判断をしたのと同型——重複は既知の
-設計判断・BUDGET-2 系の共有実装化は将来のフォローアップ）。
+レコード同定・業務キー対応付け・要約は行わない。対応文書が曖昧なときは候補一覧を返すだけで、確認は会話側が行う。
+パス封じ込め（doc_id 検証→resolve+is_relative_to→字面パスと resolve() の一致で symlink 検知）は `worlds.rag_md_path` が行う。
 """
 from __future__ import annotations
 
 import difflib
-import os
 import re
 from pathlib import Path
 
 from . import corpus_docs, doc_ledger, documents, scope as scope_mod, worlds
-from .ingest import evidence_render, text_kind
+from .env_int import env_int
+from .ingest import evidence_render
 
 
-def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """`grep_tool._env_int`/`agentic_search._env_int` と同型（循環 import 回避のため独立実装）。"""
-    default = max(lo, min(default, hi))
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return v if lo <= v <= hi else default
+# rag.md 1件あたりの読み取り上限（バイト）。`agentic_search._READ_AROUND_FILE_CAP_BYTES` と同じ env 名・既定値
+_RAG_MD_READ_CAP_BYTES = env_int("SHERPA_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024, 65536, 64 * 1024 * 1024)
 
-
-# rag.md 1件あたりの読み取り上限（バイト・非有界にしない安全弁）。`agentic_search.
-# _READ_AROUND_FILE_CAP_BYTES` と同じ env 名・既定値を共有する（§5「新しい env を増やさない」方針・
-# `agentic_search` を import できない＝循環回避のため値だけ独立に読む）。
-_RAG_MD_READ_CAP_BYTES = _env_int("SHERPA_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024, 65536, 64 * 1024 * 1024)
-
-# 対応文書候補列挙（§4 step3・basename 類似度）の上限件数。順位付け・確度の言語化はしない
-# （`difflib.get_close_matches` の並びをそのまま返すだけ）——上限は tool result 予算を圧迫しない安全弁。
+# 対応文書候補列挙（basename 類似度）の上限件数
 _CANDIDATES_MAX = 10
 
-# `evidence_render._markdown` の固定ヘッダ書式（機械的な行一致だけで読み取る・追加解析はしない）。
+# `evidence_render._markdown` の固定ヘッダ書式（機械的な行一致だけで読み取る）
 _HEADER_SHA_RE = re.compile(r"^原本SHA-256:\s*(\S+)")
 _HEADER_PROFILE_RE = re.compile(r"^変換プロファイル:\s*(\S+)\s*/\s*(\S+)\s*$")
-_HEADER_SCAN_LINES = 20   # ヘッダは冒頭7行程度・余裕を持たせた走査上限
-
-
-def _rag_md_path(world: str, doc_id: str) -> Path | None:
-    """doc_id（rel_path）→ `{rel}.rag.md` の実パス（無効/範囲外/不在/symlink は None）。
-
-    `agentic_search._safe_doc_path` と同じ封じ込め流儀（トラバーサル拒否→resolve+is_relative_to→
-    字面パスと resolve() の一致で経路上の symlink を検知）を rag.md 専用に独立実装する。
-    `rag_parent_return._rag_md_path` は ES ヒット由来の既検証 doc_id を前提にした軽量版だが、
-    ここは LLM が直接生成したツール引数を受けるためより厳格な版を使う。
-    """
-    if not isinstance(doc_id, str) or not doc_id or doc_id.startswith("/") or "\\" in doc_id or "\x00" in doc_id:
-        return None
-    parts = doc_id.split("/")
-    if ".." in parts or "" in parts:
-        return None
-    if text_kind.is_sensitive_doc_id(doc_id):
-        # 秘匿名は rag.md を一切持たない契約（`office_md._is_sensitive_original` 参照）——
-        # 更新前に生成済みの `.rag.md` が残っていても diff 材料として使わない（台帳 #85〜#88）。
-        return None
-    root = worlds.derived_rag_dir(world)
-    if not root:
-        return None
-    root = Path(root)
-    lexical_rel = doc_id + ".rag.md"
-    cand = root / lexical_rel
-    try:
-        rr = root.resolve()
-        rp = cand.resolve()
-        if not (rp == rr or rp.is_relative_to(rr)):
-            return None
-        if rp != rr / lexical_rel:          # 字面パスと不一致＝経路上のどこかに symlink があった
-            return None
-        if not rp.is_file():
-            return None
-    except OSError:
-        return None
-    return rp
+_HEADER_SCAN_LINES = 20  # ヘッダの走査上限
 
 
 def _doc_exists(doc_id: str, world: str) -> bool:
-    """doc_id が world 内に文書として実在するか（`agentic_search.verify_doc_exists` と同じ2判定・
-    scope は呼び出し元＝`compare`/`_discover` が別途見る）。`status_document_reachable` の `True`
-    確定だけを「実在する」に丸める（fail-closed）——判定不能（`None`）を実在扱いにしない。
-    `allow_content_sniff=True`：本関数は1 doc_id につき1回だけ呼ばれる（manifest 件数分の
-    ホットループではない）ため、軽量テキスト枠の第2段も内容を読んで判定する。"""
+    """doc_id が world 内に文書として実在するか（`status_document_reachable` の `True` 確定だけを実在とする＝fail-closed）。
+    軽量テキスト枠の第2段も内容を読んで判定する（`allow_content_sniff=True`）。"""
     try:
         if corpus_docs.status_document_reachable(doc_id, world, allow_content_sniff=True) is not True:
             return False
@@ -103,9 +40,7 @@ def _doc_exists(doc_id: str, world: str) -> bool:
 def _read_capped(path: Path, cap_bytes: int) -> tuple[str | None, bool]:
     """`path` を `cap_bytes` まで読む。戻り `(text, truncated)`。読み取り失敗時は `(None, False)`。
 
-    `difflib.unified_diff` はシーケンス全体の比較が要る（真のストリーミング diff は成立しない）ため、
-    「非有界にしない」は読み取りサイズの安全弁として実装する——cap を超えた側は冒頭 cap 分だけで比較し、
-    その旨を呼び出し元が `notices[]` に積む（黙って打ち切らない）。
+    cap を超えた側は冒頭 cap 分だけで比較し、呼び出し元が `notices[]` に積む。
     """
     try:
         with path.open("rb") as f:
@@ -141,7 +76,7 @@ def _parse_header(text: str) -> dict:
 
 
 def _generation_and_suffix(doc_id: str) -> tuple[str, str]:
-    """rel_path の第1セグメント（世代＝`docs/03-鏡モデル.md` §2 用語の `generation`）とそれ以降。"""
+    """rel_path の第1セグメント（世代＝トップフォルダ）とそれ以降。"""
     if "/" not in doc_id:
         return doc_id, ""
     gen, suffix = doc_id.split("/", 1)
@@ -154,11 +89,7 @@ def _in_scope(doc_id: str, scope_paths) -> bool:
 
 def _basename_candidates(world: str, source_doc_id: str, target_generation: str, scope_paths,
                          deadline: float | None) -> list:
-    """§4 step3: 厳密一致（§4 step2）が0件のときの候補列挙（basename 類似度）。
-
-    機構は作らない——`difflib.get_close_matches`（標準ライブラリ・追加依存なし）で拾えるだけ拾って
-    そのまま返す。順位付け・確度スコアの言語化はしない（会話側の LLM が確認に使うヒントに留める）。
-    """
+    """厳密一致が0件のときの対応文書候補の列挙（`difflib.get_close_matches` による basename 類似度・順位付けはしない）。"""
     try:
         rows = doc_ledger.documents_for(world, deadline=deadline)
     except Exception:
@@ -193,11 +124,10 @@ def _basename_candidates(world: str, source_doc_id: str, target_generation: str,
 
 def _discover(world: str, source_doc_id: str, target_generation: str, scope_paths,
              deadline: float | None) -> tuple[str | None, list]:
-    """§4: 明示ペア以外の対応文書の同定。戻り `(right_doc_id|None, candidates)`。
+    """明示ペア以外の対応文書の同定。戻り `(right_doc_id|None, candidates)`。
 
-    **同一性＝パス**（`docs/03-鏡モデル.md` §2.1）のため、世代を除いた相対 suffix の完全一致は
-    「0件か1件」の二択——構築した候補パスが実在するかを直接確認するだけで済む（全文書を舐めて
-    ファジー一致を探す必要はない）。実在しなければ basename 類似度の候補列挙へフォールバックする。
+    世代を除いた相対 suffix の完全一致（0件か1件）を、構築した候補パスの実在確認で判定し、無ければ basename 類似度の候補列挙へ倒す。
+    設計: docs/design/scope.md「同一性＝パス」
     """
     _gen, suffix = _generation_and_suffix(source_doc_id)
     candidate_id = f"{target_generation}/{suffix}" if suffix else target_generation
@@ -207,17 +137,13 @@ def _discover(world: str, source_doc_id: str, target_generation: str, scope_path
 
 
 def compare(world: str, args: dict, *, scope_paths=None, deadline: float | None = None) -> dict:
-    """`compare_documents` ツール本体（§3・決定的・LLM 呼び出しゼロ）。
+    """`compare_documents` ツール本体（決定的・LLM 呼び出しなし）。
 
-    引数は明示ペア（`left_doc_id`+`right_doc_id`・最優先）か世代発見（`source_doc_id`+
-    `target_generation`）のどちらか。`scope_paths`（会話ターン全体にかかる硬いフィルタ・他ツールと
-    同型）で範囲外の doc_id は拒否する。`deadline` は `doc_ledger.documents_for` の走査（候補列挙時
-    のみ発生しうる）へそのまま転送する。
+    引数は明示ペア（`left_doc_id`+`right_doc_id`・最優先）か世代発見（`source_doc_id`+`target_generation`）のどちらか。
+    `scope_paths` で範囲外の doc_id は拒否する。`deadline` は `doc_ledger.documents_for` の走査へ転送する。
 
-    戻り値の `status`: `"comparable"`（`diff`/`notices`/`compare_conditions` を返す）／
-    `"needs_disambiguation"`（対応文書候補が0件/複数件・`candidates[]` を返す）／
-    `"unsupported"`（片側以上に `.rag.md` が無い・比較材料が無い）。引数不備・範囲外は他の
-    run_tool 系ツールと同型の `{"error": ...}`。
+    戻り値の `status`: `"comparable"`（`diff`/`notices`/`compare_conditions`）／`"needs_disambiguation"`（`candidates[]`）／
+    `"unsupported"`（片側以上に `.rag.md` が無い）。引数不備・範囲外は `{"error": ...}`。
     """
     args = args or {}
     left_doc_id = str(args.get("left_doc_id") or "").strip()
@@ -226,7 +152,7 @@ def compare(world: str, args: dict, *, scope_paths=None, deadline: float | None 
     target_generation = str(args.get("target_generation") or "").strip()
 
     if left_doc_id and right_doc_id:
-        pass                                    # 明示ペア最優先（§4 step1）＝発見処理を経由しない
+        pass  # 明示ペア最優先（発見処理を経由しない）
     elif source_doc_id and target_generation:
         if not _in_scope(source_doc_id, scope_paths):
             return {"error": "指定 doc_id は対象範囲外です"}
@@ -241,8 +167,8 @@ def compare(world: str, args: dict, *, scope_paths=None, deadline: float | None 
     if not _in_scope(left_doc_id, scope_paths) or not _in_scope(right_doc_id, scope_paths):
         return {"error": "指定 doc_id は対象範囲外です"}
 
-    left_path = _rag_md_path(world, left_doc_id)
-    right_path = _rag_md_path(world, right_doc_id)
+    left_path = worlds.rag_md_path(world, left_doc_id)
+    right_path = worlds.rag_md_path(world, right_doc_id)
     if left_path is None or right_path is None:
         return {"status": "unsupported", "left_doc_id": left_doc_id, "right_doc_id": right_doc_id,
                 "reason": "片方以上に RAG 正本（.rag.md）が無い文書です（コード原文等・比較材料が無い）"}
@@ -250,9 +176,7 @@ def compare(world: str, args: dict, *, scope_paths=None, deadline: float | None 
     left_text, left_trunc = _read_capped(left_path, _RAG_MD_READ_CAP_BYTES)
     right_text, right_trunc = _read_capped(right_path, _RAG_MD_READ_CAP_BYTES)
     if left_text is None or right_text is None:
-        # `_open_doc_stream`/`_open_verified_original` と同じ固定理由コード——呼び出し元
-        # （`agentic_search._record_tool_result_error_code`）が名前非依存で拾い
-        # `InvestigationState.backend_failures["read_io"]` へ反映する。
+        # 固定理由コード（`agentic_search._record_tool_result_error_code` が拾って `backend_failures["read_io"]` へ反映する）
         return {"status": "unsupported", "left_doc_id": left_doc_id, "right_doc_id": right_doc_id,
                 "reason": "RAG 正本の読み取りに失敗しました", "error_code": "read_io_failed"}
 
@@ -266,7 +190,7 @@ def compare(world: str, args: dict, *, scope_paths=None, deadline: float | None 
         notices.append(f"{right_doc_id} の RAG 正本が大きすぎるため冒頭のみで比較した")
     for doc_id, meta in ((left_doc_id, left_meta), (right_doc_id, right_meta)):
         rv = meta.get("renderer_version")
-        # §3 step4: 停止せず注記だけ添えて実施する（機械的に検出できた事実のみ・解釈はしない）。
+        # 停止せず注記だけ添えて実施する（機械的に検出できた事実のみ）
         if rv and rv != evidence_render.RAG_RENDERER_VERSION:
             gen, _suffix = _generation_and_suffix(doc_id)
             notices.append(f"片側({gen})の表現バージョンが古い({rv})")

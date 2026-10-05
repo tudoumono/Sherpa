@@ -1,6 +1,7 @@
-"""`JsAnalyzer` の単体テスト（アナライザ拡張 波3 レーン A・docs/archive/2026-09-05-アナライザ拡張.md
-§13）。"""
+"""`JsAnalyzer` の単体テスト（アナライザ拡張 波3 レーン A・入力ソース片 → 参照・Dropped の表）。"""
 from __future__ import annotations
+
+import pytest
 
 from sherpa.ingest.analyzers._base import Analyzer
 from sherpa.ingest.analyzers.js import JsAnalyzer
@@ -12,9 +13,6 @@ def test_extensions_and_name():
     assert A.extensions == frozenset({".js", ".mjs"})
     assert A.name == "js"
     assert A.doctype == "js"
-
-
-def test_ts_extension_is_not_claimed():
     assert ".ts" not in A.extensions
 
 
@@ -24,170 +22,110 @@ def test_accepts_all_js_files_without_content_inspection():
 
 def test_collect_defs_primary_is_extension_included_filename_no_children():
     res = A.collect_defs("console.log('hi');", "static/app.js")
-    assert res.primary is not None
-    assert res.primary.label == "Module" and res.primary.name == "app.js"
+    assert res.primary is not None and res.primary.label == "Module" and res.primary.name == "app.js"
     assert res.children == []
 
 
-# --- import/require/importScripts（INVOKES via=include） ---
-
-def test_import_from_relative_path_with_extension():
-    res = A.extract_refs('import { x } from "./util.js";\n', "app.js")
-    assert [(r.name, r.extra) for r in res.refs] == [
-        ("util.js", {"via": "include", "include_path": "./util.js"})]
+def Inc(name, path):
+    return ("INVOKES", "Module", name, {"via": "include", "include_path": path})
 
 
-def test_import_without_extension_gets_js_appended():
-    res = A.extract_refs('import x from "./util";\n', "app.js")
-    assert res.refs[0].name == "util.js"
-    assert res.refs[0].extra["include_path"] == "./util.js"
+def Key(name, key_kind="url"):
+    return ("ACCESSES", "Config", name, {"via": "config_key", "key_kind": key_kind})
 
 
-def test_bare_package_import_is_not_a_local_include():
-    res = A.extract_refs('import React from "react";\n', "app.js")
-    assert res.refs == []
+EXT = "web_external_ref"
+DYN = "js_dynamic_url"
+# (入力, path, 参照[(edge, kind, name, extra 部分|None)], Dropped[(reason, line|None)]|None)
+CASES = {
+    # import/require/importScripts（INVOKES via=include）
+    "import_from_relative_with_extension": ('import { x } from "./util.js";\n', "app.js", [Inc("util.js", "./util.js")], None),
+    "import_without_extension_gets_js": ('import x from "./util";\n', "app.js", [Inc("util.js", "./util.js")], None),
+    "bare_package_import_not_local": ('import React from "react";\n', "app.js", [], None),
+    "require_relative": ('const x = require("./util");\n', "app.js", [("INVOKES", "Module", "util.js", None)], None),
+    "import_scripts_relative": ('importScripts("helpers.js");\n', "app.js", [("INVOKES", "Module", "helpers.js", None)], None),
+    "import_scripts_absolute_url_excluded": ('importScripts("https://cdn.example.com/lib.js");\n', "app.js", [], [(EXT, None)]),
+    "import_scripts_data_uri_dropped": ('importScripts("data:text/javascript,void(0)");\n', "app.js", [], [(EXT, None)]),
+    "absolute_import_scripts_relative_to_referrer": ('importScripts("/static/helpers.js");\n', "gen1/static/worker.js",
+                                                     [Inc("helpers.js", "helpers.js")], None),
+    # URL 文字列リテラル（ACCESSES via=config_key）
+    "fetch_static_path": ('fetch("/api/orders");\n', "app.js", [Key("/api/orders")], None),
+    "axios_get_static_path": ('axios.get("/api/orders");\n', "app.js", [Key("/api/orders")], None),
+    "ajax_url_key": ('$.ajax({ url: "/api/orders", method: "GET" });\n', "app.js", [Key("/api/orders")], None),
+    "xhr_open_static_path": ('xhr.open("GET", "/api/orders");\n', "app.js", [Key("/api/orders")], None),
+    "location_href_static_path": ('location.href = "/orders/list";\n', "app.js", [Key("/orders/list")], None),
+    "form_action_dot_action_is_struts_key": ('form.action = "login.action";\n', "app.js", [Key("login", "action")], None),
+    "fetch_url_strips_query_and_fragment": ('fetch("/api/orders?q=1#x");\n', "app.js", [Key("/api/orders")], None),
+    "form_action_with_query_strips": ('form.action = "login.action?next=/";\n', "app.js", [Key("login", "action")], None),
+    "protocol_relative_url_not_a_key": ('fetch("//cdn.example.com/x");\n', "app.js", [], None),
+    # 動的連結は参照にせず Dropped（match span 単位で除外・同一行の静的呼び出しは残る）
+    "dynamic_concatenation_dropped": ('fetch("/api/" + id);\n', "app.js", [], [(DYN, 1)]),
+    "static_on_same_line_as_dynamic_still_ref": ('fetch("/ok"); fetch("/api/" + id);\n', "app.js", [Key("/ok")], [(DYN, 1)]),
+    "interleaved_static_dynamic_static_dynamic": (
+        'fetch("/a");\nfetch("/b/" + x);\nfetch("/c");\nfetch("/d/" + y);\n', "app.js", [Key("/a"), Key("/c")],
+        [(DYN, 2), (DYN, 4)]),
+    # コメント
+    "line_comment_not_scanned": ('// fetch("/api/orders");\n', "app.js", [], None),
+    "block_comment_not_scanned": ('/* fetch("/api/orders"); */\n', "app.js", [], None),
+    "url_in_string_survives_comment_removal": ('// note\nfetch("/api/orders");\n', "app.js", [Key("/api/orders")], None),
+    # 文字列の中のコードの断片は読まない（Dropped で申告）。API の引数の位置の文字列は読む
+    "code_in_description_string_not_scanned": (
+        'var msg = "import x from \'./b.js\'; fetch(\'/api/z\')";\n', "app.js", [], [("js_string_code", 1)]),
+    "code_in_template_string_not_scanned": ('var t = `require("./b.js")`;\n', "app.js", [], [("js_string_code", 1)]),
+    "api_arguments_kept_beside_description_string": (
+        'var msg = "import x from \'./b.js\'; fetch(\'/api/z\')";\nconst b = require("./b.js");\n'
+        'import("./c.js");\nfetch("/api/z");\n', "app.js",
+        [Inc("c.js", "./c.js"), Inc("b.js", "./b.js"), Key("/api/z")], [("js_string_code", 1)]),
+    "dynamic_import_with_comment_before_arg": ('import(/* chunk */ "./c.js");\n', "app.js", [Inc("c.js", "./c.js")], None),
+    "template_expression_code_is_scanned": (
+        'var t = `x ${require("./b.js")} ${`n ${fetch("/api/q")}`} import z from "./no.js"`;\n', "app.js",
+        [Inc("b.js", "./b.js"), Key("/api/q")], [("js_string_code", 1)]),
+    "api_argument_static_template_is_read": ('fetch(`/api/orders`);\n', "app.js", [Key("/api/orders")], None),
+    "api_argument_static_template_import": ('import(`./b.js`);\n', "app.js", [Inc("b.js", "./b.js")], None),
+    "api_argument_dynamic_template_reported": ('fetch(`/api/${id}`);\n', "app.js", [], [(DYN, 1)]),
+    "xhr_open_variable_method_second_arg_is_url": ('xhr.open(method, "/api/orders");\n', "app.js", [Key("/api/orders")], None),
+    # 関数名と括弧の間の空白・改行、複数行の import/export … from
+    "require_space_before_paren": ('const x = require ("./util");\n', "app.js", [("INVOKES", "Module", "util.js", None)], None),
+    "import_scripts_space_before_paren": ('importScripts ("helpers.js");\n', "app.js", [("INVOKES", "Module", "helpers.js", None)], None),
+    "fetch_newline_before_paren": ('fetch\n("/api/orders");\n', "app.js", [Key("/api/orders")], None),
+    "axios_spaced_call": ('axios . get ("/api/orders");\n', "app.js", [Key("/api/orders")], None),
+    "multiline_named_import": ('import {x,\n  y} from "./b.js";\n', "app.js", [Inc("b.js", "./b.js")], None),
+    "multiline_export_from": ('export {\n  a,\n  b\n} from "./b.js";\n', "app.js", [Inc("b.js", "./b.js")], None),
+    "multiline_import_does_not_swallow_next_statement": (
+        'import {x,\n  y} from "react";\nconst s = "./not-a-dep.js";\n', "app.js", [], None),
+    # 木で読むことで直った読み違い
+    "directory_import_is_not_a_file": ('import x from "../";\nrequire("./");\n', "app.js", [], None),
+    "regex_literal_quote_does_not_hide_next_call": ('var re = /"/g; fetch("/after-regex");\n', "app.js", [Key("/after-regex")], None),
+    "export_from_after_long_specifier_list": (
+        "export { " + ", ".join(f"a{i} as b{i}" for i in range(80)) + ' } from "./b.js";\n', "app.js", [Inc("b.js", "./b.js")], None),
+    "dynamic_import_and_require_are_reported": ('import(p);\nrequire(q);\nimport("./ok.js");\n', "app.js", [Inc("ok.js", "./ok.js")],
+                                                [("js_dynamic_import", 1), ("js_dynamic_import", 2)]),
+    "dynamic_template_import_is_dynamic_import": ("import(`./${p}`);\nrequire(`./${q}`);\n", "app.js", [], [("js_dynamic_import", 1), ("js_dynamic_import", 2)]),
+    # minified
+    "min_js_filename_dropped": ('fetch("/api/orders");', "app.min.js", [], [("js_minified", 1)]),
+    "long_single_line_dropped": ("var x=1;" * 1000, "bundle.js", [], [("js_minified", 1)]),
+}
 
 
-def test_require_relative_path():
-    res = A.extract_refs('const x = require("./util");\n', "app.js")
-    assert res.refs[0].name == "util.js"
+@pytest.mark.parametrize("text,path,refs,dropped", CASES.values(), ids=CASES)
+def test_extract_refs(text, path, refs, dropped):
+    res = A.extract_refs(text, path)
+    assert [(r.edge_type, r.kind, r.name) for r in res.refs] == [e[:3] for e in refs]
+    for r, e in zip(res.refs, refs):
+        assert e[3] is None or all(r.extra.get(k) == v for k, v in e[3].items())
+    expected = dropped or []  # None は「申告なし」の期待
+    assert [(d.reason, d.line if line is not None else None) for d, (_r, line) in zip(res.dropped, expected)] == expected
+    assert len(res.dropped) == len(expected)
 
 
-def test_import_scripts_relative_path():
-    res = A.extract_refs('importScripts("helpers.js");\n', "app.js")
-    assert res.refs[0].name == "helpers.js"
+def test_syntax_error_is_reported_and_the_rest_is_still_read():
+    res = A.extract_refs('var broken = {;\nfetch("/after-error");\nimport z from "./z.js";\n', "app.js")
+    assert [r.name for r in res.refs] == ["z.js", "/after-error"]
+    assert [d.reason for d in res.dropped] == ["syntax_error"]
 
 
-def test_import_scripts_absolute_url_is_excluded():
-    res = A.extract_refs('importScripts("https://cdn.example.com/lib.js");\n', "app.js")
-    assert res.refs == []
-
-
-# --- URL 文字列リテラル（ACCESSES via=config_key） ---
-
-def test_fetch_static_path_is_config_key():
-    res = A.extract_refs('fetch("/api/orders");\n', "app.js")
-    assert [(r.edge_type, r.kind, r.name, r.extra["via"]) for r in res.refs] == [
-        ("ACCESSES", "Config", "/api/orders", "config_key")]
-    assert res.refs[0].extra["key_kind"] == "url"
-
-
-def test_axios_get_static_path_is_config_key():
-    res = A.extract_refs('axios.get("/api/orders");\n', "app.js")
-    assert res.refs[0].name == "/api/orders"
-
-
-def test_ajax_url_key_is_config_key():
-    res = A.extract_refs('$.ajax({ url: "/api/orders", method: "GET" });\n', "app.js")
-    assert res.refs[0].name == "/api/orders"
-
-
-def test_xhr_open_static_path_is_config_key():
-    res = A.extract_refs('xhr.open("GET", "/api/orders");\n', "app.js")
-    assert res.refs[0].name == "/api/orders"
-
-
-def test_location_href_static_path_is_config_key():
-    res = A.extract_refs('location.href = "/orders/list";\n', "app.js")
-    assert res.refs[0].name == "/orders/list"
-
-
-def test_form_action_dot_action_extension_is_struts_key():
-    res = A.extract_refs('form.action = "login.action";\n', "app.js")
-    assert res.refs[0].name == "login"
-    assert res.refs[0].extra["key_kind"] == "action"
-
-
-def test_dynamic_url_concatenation_is_dropped_not_a_ref():
-    res = A.extract_refs('fetch("/api/" + id);\n', "app.js")
-    assert res.refs == []
-    assert [(d.reason, d.line) for d in res.dropped] == [("js_dynamic_url", 1)]
-
-
-def test_static_call_on_same_line_as_dynamic_concatenation_still_becomes_a_ref():
-    """動的連結の除外は match span 単位——同じ行の他の静的呼び出しまで巻き込まない
-    （行単位の除外だと `/ok` のような同一行の静的参照まで一緒に消えてしまう）。"""
-    res = A.extract_refs('fetch("/ok"); fetch("/api/" + id);\n', "app.js")
-    assert [r.name for r in res.refs] == ["/ok"]
-    assert [(d.reason, d.line) for d in res.dropped] == [("js_dynamic_url", 1)]
-
-
-def test_multiple_dynamic_and_static_calls_interleaved_are_matched_correctly():
-    """動的連結／静的呼び出しの単調ポインタ突合は、複数件が入り交じる順序
-    （静的→動的→静的→動的）でも取りこぼし・誤除外なく判定する（二次時間対策の副作用で
-    判定順序に依存するバグを作っていないことの固定）。"""
-    text = (
-        'fetch("/a");\n'
-        'fetch("/b/" + x);\n'
-        'fetch("/c");\n'
-        'fetch("/d/" + y);\n'
-    )
-    res = A.extract_refs(text, "app.js")
-    assert [r.name for r in res.refs] == ["/a", "/c"]
-    assert [(d.reason, d.line) for d in res.dropped] == [
-        ("js_dynamic_url", 2), ("js_dynamic_url", 4)]
-
-
-# --- 外部参照スキーム（include 対象外・URL キーにもしない） ---
-
-def test_import_scripts_data_uri_is_dropped():
-    res = A.extract_refs('importScripts("data:text/javascript,void(0)");\n', "app.js")
-    assert res.refs == []
-    assert any(d.reason == "web_external_ref" for d in res.dropped)
-
-
-def test_protocol_relative_url_in_fetch_is_not_a_config_key():
-    """`//cdn.example.com/x` は `/` で始まるが外部参照（protocol-relative URL）——URL キーにしない。"""
-    res = A.extract_refs('fetch("//cdn.example.com/x");\n', "app.js")
-    assert res.refs == []
-
-
-def test_absolute_import_scripts_path_is_converted_to_referrer_relative_path():
-    res = A.extract_refs('importScripts("/static/helpers.js");\n', "gen1/static/worker.js")
-    assert res.refs[0].name == "helpers.js"
-    assert res.refs[0].extra["include_path"] == "helpers.js"
-
-
-# --- URL 正規化（`?`/`#` 以降を判定/basename取得の前に除去） ---
-
-def test_fetch_url_strips_query_and_fragment():
-    res = A.extract_refs('fetch("/api/orders?q=1#x");\n', "app.js")
-    assert res.refs[0].name == "/api/orders"
-
-
-def test_form_action_with_query_string_still_strips_correctly():
-    res = A.extract_refs('form.action = "login.action?next=/";\n', "app.js")
-    assert res.refs[0].name == "login"
-
-
-# --- コメント（内容は読み飛ばす・文字列内容は保持） ---
-
-def test_line_comment_contents_are_not_scanned():
-    res = A.extract_refs('// fetch("/api/orders");\n', "app.js")
-    assert res.refs == []
-
-
-def test_block_comment_contents_are_not_scanned():
-    res = A.extract_refs('/* fetch("/api/orders"); */\n', "app.js")
-    assert res.refs == []
-
-
-def test_url_inside_string_survives_comment_sanitization():
-    """コメント除去は文字列の中身を壊さない（`_sanitize_comments_only` は文字列を温存する）。"""
-    res = A.extract_refs('// note\nfetch("/api/orders");\n', "app.js")
-    assert res.refs[0].name == "/api/orders"
-
-
-# --- minified（Dropped・参照抽出なし） ---
-
-def test_min_js_filename_is_dropped_as_minified():
-    res = A.extract_refs('fetch("/api/orders");', "app.min.js")
-    assert res.refs == []
-    assert [(d.reason, d.line) for d in res.dropped] == [("js_minified", 1)]
-
-
-def test_long_single_line_is_dropped_as_minified():
-    long_line = "var x=1;" * 1000
-    res = A.extract_refs(long_line, "bundle.js")
-    assert res.refs == []
-    assert [(d.reason, d.line) for d in res.dropped] == [("js_minified", 1)]
+def test_inner_literal_parse_is_bounded_but_api_refs_are_still_read():
+    prose = "".join(f'var m{i} = "see url {i}";\n' for i in range(500))
+    res = A.extract_refs(prose + 'fetch("/api/z");\nimport x from "./b.js";\n', "bundle.js")
+    assert [r.name for r in res.refs] == ["b.js", "/api/z"]
+    assert [(d.reason, d.snippet) for d in res.dropped] == [("js_string_code_limit", "300 件")]

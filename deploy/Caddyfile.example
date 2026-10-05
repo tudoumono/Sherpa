@@ -33,13 +33,13 @@
 	# （443/80 自体が既存サービスと衝突する場合は、この Caddyfile の待受アドレス行を
 	#   例えば `:8443` のように変更する）
 	reverse_proxy 127.0.0.1:8000 {
-		# SSE（GET /chat/stream の text/event-stream）はそのまま流れる。
+		# SSE（GET /chat/turns/{turn_id}/stream の text/event-stream）はそのまま流れる。
 		# Caddy は既定でレスポンスをバッファせずストリーミングするため、通常この設定は不要。
 		# もし環境依存でチャットのストリーミングが詰まる場合だけ、次のフラッシュ即時化を有効にする:
 		# flush_interval -1
 	}
 
-	# 個人ファイルのアップロード上限。アプリ側の既定は 10MB（SHERPA_WORKSPACE_MAX_BYTES）。
+	# 個人ファイルのアップロード上限。アプリ側の既定は 10MB（管理画面「個人ファイル（作業領域）」で変更できる）。
 	# 大きいファイルを許可したい場合は、こことアプリ側の上限の両方を上げること。
 	request_body {
 		max_size 100MB

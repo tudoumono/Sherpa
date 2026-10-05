@@ -3,9 +3,9 @@ from __future__ import annotations
 from mock_api import install_api_mocks
 
 
-def test_status_page_shows_ai_components_including_gemini(page, web_base_url):
-    """UI フィードバック4（2026-07-03）: システム状態ページに AI 各プロバイダ（gemini 含む・
-    旧実装は含んでいなかった）が表示される。"""
+def test_status_page_shows_ai_components(page, web_base_url):
+    """UI フィードバック4（2026-07-03）: システム状態ページに AI 各プロバイダ（OpenAI/Ollama/Codex）が
+    表示される。閉じたプロバイダ（Gemini/Bedrock）の行は出ない。"""
     from playwright.sync_api import expect
 
     install_api_mocks(page)
@@ -13,12 +13,12 @@ def test_status_page_shows_ai_components_including_gemini(page, web_base_url):
 
     tbody = page.locator("#health-tbody")
     expect(tbody).to_contain_text("OpenAI API")
-    expect(tbody).to_contain_text("Gemini（Google）")
-    expect(tbody).to_contain_text("AWS Bedrock（Claude）")
     expect(tbody).to_contain_text("ローカルLLM（Ollama）")
     expect(tbody).to_contain_text("Codex CLI（AIエージェント）")
-    # 失敗した項目には対処ヒントが出る（bedrock は既定モックで認証失敗にしてある）。
-    expect(tbody).to_contain_text("認証失敗")
+    expect(tbody).not_to_contain_text("Gemini")
+    expect(tbody).not_to_contain_text("Bedrock")
+    # 失敗した項目には対処ヒントが出る（ollama は既定モックで接続拒否にしてある）。
+    expect(tbody).to_contain_text("接続拒否")
 
 
 def test_status_recheck_button_shows_checking_state_then_result(page, web_base_url):
@@ -63,14 +63,14 @@ def test_status_recheck_button_shows_checking_state_then_result(page, web_base_u
                        "components": [
                            {"id": "postgres", "label": "PostgreSQL", "impact": "down",
                             "ok": True, "detail": None, "latency_ms": 3},
-                           {"id": "gemini", "label": "Gemini（Google）", "impact": "none",
+                           {"id": "openai", "label": "OpenAI API", "impact": "none",
                             "ok": True, "detail": None, "latency_ms": 150},
                        ]})
     pending["route"].fulfill(status=200, content_type="application/json", body=body)
 
     expect(btn).not_to_be_disabled()
     expect(btn).to_have_text("再チェック")
-    expect(page.locator("#health-tbody")).to_contain_text("Gemini（Google）")
+    expect(page.locator("#health-tbody")).to_contain_text("OpenAI API")
 
 
 def test_status_polling_pauses_when_hidden_and_resumes_once_visible(page, web_base_url):

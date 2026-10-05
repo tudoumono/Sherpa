@@ -2,6 +2,7 @@
 # Docker Engine を Ubuntu 24.04 / WSL2(systemd) に入れる。
 # ※ sudo パスワードを1回聞かれます（非対話の自動実行はできないため手動）。
 set -euo pipefail
+[ "$(uname -s)" = "Linux" ] || { echo "このスクリプトは Linux 専用です（apt と systemd で Docker Engine を入れます）。macOS では使えません。" >&2; exit 2; }
 
 echo "== Docker Engine install (Ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") / WSL2) =="
 sudo apt-get update
@@ -23,4 +24,4 @@ sudo usermod -aG docker "$USER"
 echo
 echo "OK. 反映するには新しいシェルを開く（または: newgrp docker）。"
 echo "確認: docker run --rm hello-world"
-echo "次:   make up && make graph   （Sherpa のストア起動＋統合グラフ投入＋検証）"
+echo "次:   make up   （Sherpa のストア起動）"

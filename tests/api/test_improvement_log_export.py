@@ -1,6 +1,6 @@
 """改善ログエクスポート API（`GET /admin/improvement-log/export`）。
 
-- admin のみ（未ログイン401は test_auth_snapshot.py で snapshot 済み・非admin403はここで確認）。
+- admin のみ（未ログイン401は test_authz_matrix.py で固定済み・非admin403はここで確認）。
 - CSV/JSONL 両対応・1行=1ターン（assistant メッセージ）。質問の対応付けは `chat.turn` 監査
   （message_id_user/message_id_assistant）で厳密に行う——対応付けられない（監査行が無い/
   欠けている）ターンは fail-closed で丸ごと除外する（個人情報の有無が確認できないため）。
@@ -33,6 +33,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from _test_users import register_test_uid
+from _store_helpers import get_conversation
 from sherpa import auth, store
 from sherpa.api import app
 from sherpa.routers import chat as chat_router_mod
@@ -258,7 +259,7 @@ def test_improvement_log_export_excludes_personal_turn_via_real_crash_recovery_p
     chat_router_mod._persist_turn_crash(conv["id"], message_text, user_uid, "v1", True,
                                         RuntimeError("boom"))
 
-    msgs = store.get_conversation(conv["id"])["messages"]
+    msgs = get_conversation(conv["id"])["messages"]
     user_msg = next(m for m in msgs if m["role"] == "user")
     assistant_msg = next(m for m in msgs if m["role"] == "assistant")
     assert _message_personal_flag(assistant_msg["id"]) is True, \
@@ -308,7 +309,7 @@ def test_improvement_log_export_crash_recovery_does_not_misattribute_to_stale_sa
     chat_router_mod._persist_turn_crash(conv["id"], same_text, user_uid, "v1", True,
                                         RuntimeError("boom"))
 
-    msgs = store.get_conversation(conv["id"])["messages"]
+    msgs = get_conversation(conv["id"])["messages"]
     new_user = next(m for m in msgs if m["role"] == "user" and m["id"] > before_id)
     new_assistant = next(m for m in msgs if m["role"] == "assistant" and m["id"] > before_id)
     assert new_user["id"] != old_user["id"], "新しいターンが古い user 行を使い回してしまった"

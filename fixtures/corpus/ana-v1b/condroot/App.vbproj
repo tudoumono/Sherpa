@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Acme</RootNamespace>
+    <RootNamespace Condition="'$(Flag)' == '1'">Other</RootNamespace>
+  </PropertyGroup>
+</Project>

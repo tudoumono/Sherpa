@@ -14,6 +14,14 @@ def test_node_row_carries_jcl_kind_when_present():
     assert row["jcl_kind"] == "job"
 
 
+def test_node_row_carries_table_schema_and_qualified_name():
+    n = {"cid": "table:w:g/a.sql#CUSTOMER", "name": "CUSTOMER", "schema": "A", "qualified_name": "A.CUSTOMER"}
+    row = wn._node_row(n)
+    assert (row["schema"], row["qualified_name"]) == ("A", "A.CUSTOMER")
+    plain = wn._node_row({"cid": "table:w:g/b.sql#X", "name": "X"})
+    assert (plain["schema"], plain["qualified_name"]) == (None, None)
+
+
 def test_node_row_jcl_kind_is_none_when_absent():
     """JCL 以外のノード（例: Module）は `jcl_kind` を持たない——UNWIND 行では null（既存キーの
     追加のみ・無いノードを埋めない）。"""

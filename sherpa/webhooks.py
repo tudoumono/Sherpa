@@ -1,32 +1,13 @@
-"""Webhook 通知（PART-6・docs/archive/2026-09-05-Webhook通知.md）。
+"""Webhook 通知。取り込み run の完了・失敗（sync/refresh/rebind/rerun/delete）を、`api_keys.webhook_url` を登録したキー宛てに署名付き POST で通知する。
 
-取り込み run の terminal 化（sync/refresh/rebind/rerun/delete の完了・失敗）を、
-`api_keys.webhook_url` を登録したキー宛てに署名付き POST で通知する（ポーリング排除）。
-
-配送保証は軽量型（W1・裁定 2026-09-05）: 即時送信＋失敗時リトライ3回（2/8/30秒バックオフ）＋
-監査記録。実送信は**単一の daemon worker スレッド＋有界キュー**（RV是正#4・`_QUEUE_MAXSIZE`）
-が直列に行う——`notify_run_terminal` はキューへ積むだけで即座に返る（`ext_api._AuditWriter` と
-同じ「単一 writer＋bounded queue」型だが、lifespan 連携までは持たない軽量版＝プロセス終了で
-未処理分は消えてよい契約はそのまま）。キューが溢れたらその1件だけ捨てて `webhook.dropped` を
-監査記録する（他の配送・取り込み自体は継続＝fail-loud だが個別行の犠牲で全体を守る）。
-永続キューは持たない——プロセス終了で未送信の通知は消える（受信側は既存の
-`GET /worlds/{wid}/status` ポーリングで補完できる＝劣化しても現状に戻るだけ）。
-
-署名（W4）: `X-Sherpa-Signature: sha256=<hex(HMAC-SHA256(body_bytes, webhook_secret))>`。
-`webhook_secret` は登録時に生成し平文保管する（署名生成に平文が必須＝API キーのハッシュ保管
-方式は構造的に使えない。閉域 LAN・DB は管理境界内として受容）。
-
-宛先ポリシー（W3・RV是正#1）: `llm._canonical_host_port` は「`base + path` 単純連結」契約
-（`ollama_url()`）を守るため path（空/"/" 以外）・query・fragment 付き URL を解釈不能として
-拒否する——Webhook の宛先は利用者の受信エンドポイントそのもので path/query を伴うのが通常
-のため、この関数は流用せず `_webhook_host_port()` を別途新設する（host:port 抽出のみを行い
-path/query はそのまま許す）。userinfo 拒否・scheme 既定ポート補完・末尾ドット除去は
-`_canonical_host_port` と同じ規律。**loopback を含め既定は全拒否**——
-`system_settings.webhook_allowlist`（host:port の配列・`ollama_allowlist` と同じ形）に明示
-登録された host:port のみを許可する（Ollama の loopback 常時許可とは意図的に違える: Webhook は
-自己発行キー利用者〔一般ユーザー〕が宛先を選べるため、loopback を暗黙許可すると認証なしの
-内蔵サービス〔例: ES:9200〕を SSRF 経由で叩けてしまう）。DB 不達は fail-closed（allowlist
-空扱い＝何も許可しない・`llm._allowlisted_hosts` と同じ規律）。
+配送は軽量型: 即時送信＋失敗時リトライ3回（2/8/30秒バックオフ）＋監査記録。実送信は単一の daemon worker スレッドが有界キュー
+（`_QUEUE_MAXSIZE`）を直列に消費し、`notify_run_terminal` はキューへ積むだけで返る。キューが溢れたらその1件だけ捨てて
+`webhook.dropped` を監査記録する。永続キューは持たない（プロセス終了で未送信分は消える）。
+署名: `X-Sherpa-Signature: sha256=<hex(HMAC-SHA256(body_bytes, webhook_secret))>`。`webhook_secret` は登録時に生成し平文保管する。
+宛先ポリシー: path/query を許す宛先のため `_webhook_host_port()` で host:port を抽出する（userinfo 拒否・scheme 既定ポート補完・
+末尾ドット除去は `llm._canonical_host_port` と同じ）。loopback を含め既定は全拒否で、`system_settings.webhook_allowlist` に
+明示登録された host:port のみ許可する（DB 不達は allowlist 空扱い＝fail-closed）。
+設計: docs/design/external-api.md「終了通知（Webhook）」
 """
 from __future__ import annotations
 
@@ -47,32 +28,27 @@ from . import llm
 _log = logging.getLogger(__name__)
 
 _TIMEOUT_SEC = 5
-# 即時送信の後に続くリトライ間隔（秒）。要素数=3＝W1「失敗時リトライ3回」（合計4回試行）。
+# 即時送信の後に続くリトライ間隔（秒）。要素数3＝失敗時リトライ3回（合計4回試行）
 _RETRY_DELAYS_SEC = (2, 8, 30)
 
 
 class WebhookUrlInvalid(ValueError):
-    """Webhook 宛先 URL が不正・または宛先ポリシー（admin allowlist・RV是正#1で loopback も対象）
-    を満たさない。"""
+    """Webhook 宛先 URL が不正、または宛先ポリシー（admin allowlist）を満たさない。"""
 
 
 def _webhook_host_port(url: str) -> tuple[str, int] | None:
     """`url` を `(host, port)` に正規化する（解釈不能・不正なら None）。
 
-    `llm._canonical_host_port` の Webhook 版——path/query/fragment を**許す**点だけが異なる
-    （モジュール docstring 参照）。scheme は http/https のみ許可・userinfo（`user:pass@`）は
-    禁止・ポート省略時は scheme の既定ポート（http=80・https=443）を補う・末尾ドットは除去する
-    ——ここまでは `_canonical_host_port` と同じ規則（allowlist との突合が単純な文字列一致で
-    済むよう揃える）。
+    `llm._canonical_host_port` の Webhook 版で、path/query/fragment を許す点だけが異なる。http/https のみ・userinfo 禁止・
+    ポート省略時は scheme の既定ポートを補う・末尾ドットは除去する。
     """
     try:
         p = urlparse(url or "")
-    except ValueError:                       # 例: 不正な IPv6 リテラル
+    except ValueError:
         return None
     if p.scheme not in ("http", "https"):
         return None
-    # RV是正#8: 空文字の userinfo（`http://@host/`）は `p.username == ""`（falsy）で `or` 判定を
-    # すり抜ける——`is not None` で判定し、`user:` のような片方だけの空文字も含めて確実に拒否する。
+    # 空文字の userinfo（`http://@host/`）も拒否するため `is not None` で判定する
     if p.username is not None or p.password is not None:
         return None
     host = (p.hostname or "").rstrip(".")
@@ -80,7 +56,7 @@ def _webhook_host_port(url: str) -> tuple[str, int] | None:
         return None
     try:
         port = p.port
-    except ValueError:                       # 例: ポートが数値でない/範囲外
+    except ValueError:
         return None
     if port is not None:
         return host, port
@@ -88,32 +64,27 @@ def _webhook_host_port(url: str) -> tuple[str, int] | None:
 
 
 def _allowlisted_hosts(system_settings: dict | None = None) -> set[tuple[str, int]]:
-    """許可された接続先（`system_settings.webhook_allowlist`）。RV是正#1: loopback もこの集合に
-    含まれていなければ許可されない（`llm._allowlisted_hosts()` は非 loopback 専用だが、こちらは
-    唯一の許可判定源）。DB 不達は空集合＝fail-closed。
-    """
+    """許可された接続先（`system_settings.webhook_allowlist`）。loopback もこの集合に含まれていなければ許可されない。DB 不達は空集合＝fail-closed。"""
     allowed: set[tuple[str, int]] = set()
     try:
         if system_settings is not None:
             entries = system_settings.get("webhook_allowlist") or []
         else:
-            from . import store              # 遅延 import（循環回避）
+            from . import store  # 遅延 import（循環回避）
             entries = store.get_system_settings().get("webhook_allowlist") or []
     except Exception:
         entries = []
     for entry in entries:
-        hp = llm._canonical_host_port(f"http://{entry}")   # allowlist の各エントリ自体は host:port のみ（path 無し）
+        hp = llm._canonical_host_port(f"http://{entry}")  # allowlist の各エントリは host:port のみ
         if hp is not None:
             allowed.add(hp)
     return allowed
 
 
 def assert_webhook_url_allowed(url: str, *, system_settings: dict | None = None) -> None:
-    """`url`（Webhook 宛先）が接続許可ポリシーを満たすか検証する（I/O なし・登録時／送信直前
-    〔リトライ毎の再評価含む・RV是正#6〕の両方で呼ぶ）。RV是正#1: 既定許可なし——loopback も
-    例外にせず、`_allowlisted_hosts()` に host:port が正規化一致するものだけ許可する（自己発行
-    キー利用者が認証なしの内蔵サービスを宛先登録できてしまう穴を塞ぐ・モジュール docstring
-    参照）。不正 URL／不許可の宛先は `WebhookUrlInvalid` を送出する。
+    """`url` が接続許可ポリシーを満たすか検証する（I/O なし。登録時と送信直前の両方で呼ぶ）。
+
+    既定許可なし。`_allowlisted_hosts()` に host:port が一致するものだけ許可する。不正 URL／不許可の宛先は `WebhookUrlInvalid`。
     """
     hp = _webhook_host_port(url)
     if hp is None:
@@ -130,12 +101,9 @@ def _sign(secret: str, body: bytes) -> str:
 
 
 def _send_once(url: str, secret: str, body: bytes, request_id: str, event: str) -> None:
-    """1回分の送信（2xx 以外・接続エラー等は例外として呼び出し元へ伝播＝リトライ対象）。
-    `llm.urlopen_no_redirect` を流用（redirect 非追跡・共有 opener・R2a と同じ安全側の既定）。
+    """1回分の送信（2xx 以外・接続エラー等は例外として伝播＝リトライ対象）。
 
-    RV是正#3: 応答本体は読まない（`urlopen` は 2xx 以外を `HTTPError` として送出する契約＝
-    `with` を抜けた時点で 2xx 確定・本文を読む必要がない）。相手が無制限に本文を返すエンドポイント
-    でも、ここでメモリを消費しない——`with` を抜ける際のクローズだけで済ませる。
+    `llm.urlopen_no_redirect` を使う（redirect 非追跡）。応答本体は読まない。
     """
     headers = {
         "Content-Type": "application/json",
@@ -155,28 +123,35 @@ def _host_port_for_audit(url: str) -> str:
 
 
 def _deliver(key_id: int, url: str, secret: str, payload: dict) -> None:
-    """1キー分の配送（即時送信＋失敗時リトライ3回・W1）。単一 daemon worker（`_worker_loop`）の
-    中で他キーの配送と直列に実行される想定（RV是正#4・呼び出し元は `notify_run_terminal` が
-    積んだキューを worker が消費する）。監査は最終結果（成功／全滅）のみ1行記録する
-    （試行ごとには記録しない・detail に secret／フル URL は含めない）。
+    """1キー分の配送（即時送信＋失敗時リトライ3回）。単一 daemon worker の中で他キーの配送と直列に実行される。
 
-    RV是正#6: 宛先ポリシー（`assert_webhook_url_allowed`）は**試行ごと**に再評価する（登録時
-    チェックとは別に、リトライ待機の間に admin が allowlist を変更した場合を即座に反映する）。
-    不許可は恒久的な失敗＝そこで打ち切る（残りの待機・試行はしない）。
+    監査は最終結果（成功／全滅）のみ1行記録する（detail に secret／フル URL は含めない）。
+    宛先ポリシー（`assert_webhook_url_allowed`）は試行ごとに再評価し、不許可は恒久的な失敗として打ち切る。
     """
-    from . import store              # 遅延 import（循環回避）
+    from . import store  # 遅延 import（循環回避）
 
-    host_port = _host_port_for_audit(url)
+    # Codex ジョブの終了通知は各試行の直前に鍵の現在の宛先を引き直す（引けなければ配送を打ち切る）
+    resolve_each_attempt = str(payload.get("event", "")).startswith("codex_job.")
+    host_port = _host_port_for_audit(url) if url else "（未解決）"
     detail_base = {"host_port": host_port, "world": payload.get("world"),
                    "run_id": payload.get("run_id"), "event": payload.get("event")}
+    if "job_id" in payload:
+        detail_base["job_id"] = payload["job_id"]
     body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
     request_id = uuid.uuid4().hex
     attempts = 0
     last_error: Exception | None = None
-    delays = (0,) + _RETRY_DELAYS_SEC   # 先頭 0 ＝即時（sleep しない）
+    delays = (0,) + _RETRY_DELAYS_SEC  # 先頭 0 ＝即時
     for delay in delays:
         if delay:
             time.sleep(delay)
+        if resolve_each_attempt:
+            dest = store.get_api_key_webhook(key_id)
+            if not dest:
+                _log.info("Codex ジョブの終了通知を打ち切ります（通知先が無効になりました）: job_id=%s",
+                          payload.get("job_id"))
+                return
+            url, secret = dest["webhook_url"], dest["webhook_secret"]
         try:
             assert_webhook_url_allowed(url)
         except WebhookUrlInvalid as e:
@@ -203,11 +178,7 @@ def _deliver(key_id: int, url: str, secret: str, payload: dict) -> None:
         _log.warning("Webhook 送信失敗の監査記録に失敗しました（best-effort）", exc_info=True)
 
 
-# RV是正#4: 「イベント×キーごとに Thread を無制限生成」をやめ、単一 daemon worker が有界キューを
-# 直列消費する型へ（`ext_api._AuditWriter` と同じ「単一 writer＋bounded queue」だが、lifespan
-# start/stop 連携までは持たない軽量版——プロセス終了で未処理分が消えてよい契約は変わらないため）。
-# 上限256＝1 world の同時 terminal 化がこれを超えて詰まることは通常考えにくい規模（監査での
-# 可視化と同時に、無制限生成による OOM/FD 枯渇を防ぐことを優先する）。
+# 単一 daemon worker が有界キューを直列消費する。上限は 256（無制限の Thread 生成による OOM/FD 枯渇を防ぐ）
 _QUEUE_MAXSIZE = 256
 _queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAXSIZE)
 _worker_thread: threading.Thread | None = None
@@ -215,9 +186,7 @@ _worker_lock = threading.Lock()
 
 
 def _process_queue_item(item: tuple) -> None:
-    """キューから取り出した1件を処理する（`_worker_loop` の本体・単体テストが実スレッド/実
-    キューなしで直接呼べるよう分離）。`_deliver` 自身は例外を握るが、想定外の例外で worker
-    自体が落ちて以後の配送が止まらないよう、ここでも最外周として捕捉する。"""
+    """キューから取り出した1件を処理する（`_worker_loop` の本体）。想定外の例外で worker が落ちないよう最外周で捕捉する。"""
     try:
         _deliver(*item)
     except Exception:
@@ -226,9 +195,7 @@ def _process_queue_item(item: tuple) -> None:
 
 
 def _worker_loop() -> None:
-    """単一 daemon worker 本体。キューから1件ずつ取り出し `_process_queue_item` を直列実行し
-    続ける（プロセス生存中は戻らない想定・daemon thread なのでプロセス終了時に強制終了して
-    問題ない）。"""
+    """単一 daemon worker 本体。キューから1件ずつ取り出し `_process_queue_item` を直列実行し続ける。"""
     while True:
         item = _queue.get()
         try:
@@ -238,7 +205,7 @@ def _worker_loop() -> None:
 
 
 def _ensure_worker_started() -> None:
-    """worker が未起動なら起こす（lazy start・複数回呼んでも1本しか起動しない）。"""
+    """worker が未起動なら起こす（lazy start・1本しか起動しない）。"""
     global _worker_thread
     if _worker_thread is not None and _worker_thread.is_alive():
         return
@@ -251,10 +218,7 @@ def _ensure_worker_started() -> None:
 
 
 def _enqueue(key_id: int, url: str, secret: str, payload: dict) -> None:
-    """1キー分の配送をキューへ積む（`notify_run_terminal` から呼ぶ）。キューが飽和していれば
-    このキュー投入だけを待たず即座に諦め、`webhook.dropped` を監査記録する（RV是正#4・
-    他キーの配送・取り込み自体は継続する＝1件の犠牲で全体を守る）。
-    """
+    """1キー分の配送をキューへ積む。キューが飽和していれば即座に諦め、`webhook.dropped` を監査記録する。"""
     _ensure_worker_started()
     try:
         _queue.put_nowait((key_id, url, secret, payload))
@@ -264,10 +228,11 @@ def _enqueue(key_id: int, url: str, secret: str, payload: dict) -> None:
     _log.warning("Webhook 配送キューが飽和したため1件破棄しました: key_id=%s world=%s",
                 key_id, payload.get("world"))
     try:
-        from . import store          # 遅延 import（循環回避）
+        from . import store  # 遅延 import（循環回避）
         store.audit("system", "webhook.dropped", "webhook", str(key_id),
                     detail={"host_port": _host_port_for_audit(url), "world": payload.get("world"),
-                           "run_id": payload.get("run_id"), "event": payload.get("event")},
+                           "run_id": payload.get("run_id"), "event": payload.get("event"),
+                           **({"job_id": payload["job_id"]} if "job_id" in payload else {})},
                     outcome="failure", severity="warning", reason="queue_full")
     except Exception:
         _log.warning("Webhook 破棄の監査記録に失敗しました（best-effort）", exc_info=True)
@@ -275,18 +240,11 @@ def _enqueue(key_id: int, url: str, secret: str, payload: dict) -> None:
 
 def notify_run_terminal(world: str, run_id: int | None, op: str, status: str, *,
                         doc_count: int | None = None) -> None:
-    """取り込み run の terminal 化を、`world` を許可する Webhook 登録済みキー全部へ通知する
-    （イベント仕様は `docs/archive/2026-09-05-Webhook通知.md` 参照）。
+    """取り込み run の terminal 化を、`world` を許可する Webhook 登録済みキー全部へ通知する。
 
-    best-effort・呼び出し元（`ingest.worker._record`／`worlds._finalize_pending_run`／
-    `routers/worlds._run_delete_background`／`background.py` の最外周セーフティネット）は
-    例外を気にせず呼べる（内部で全て捕捉し、取り込み自体の成否へは一切昇格させない）。実送信は
-    単一 daemon worker が有界キューを直列消費する（RV是正#4）——ここでは対象キーの列挙と
-    キューへの投入だけを行う。
-
-    `status` は `ingest_runs.status`（'extracting' はここへ渡らない前提＝terminal 化のみが
-    呼ぶ）: auto_published/auto_published_with_flags→`ingest.completed`・failed→`ingest.failed`。
-    `op` は sync/refresh/rebind/rerun/delete のいずれか（呼び出し元が決める・情報用途のみ）。
+    best-effort（内部で全て捕捉し、取り込み自体の成否へ影響させない）。対象キーの列挙とキューへの投入だけを行う。
+    `status` は `ingest_runs.status`（terminal のみ）: auto_published/auto_published_with_flags→`ingest.completed`・failed→`ingest.failed`。
+    `op` は sync/refresh/rebind/rerun/delete（情報用途のみ）。
     """
     try:
         from . import store
@@ -305,3 +263,22 @@ def notify_run_terminal(world: str, run_id: int | None, op: str, status: str, *,
     for key in keys:
         payload = dict(payload_base)
         _enqueue(key["id"], key["webhook_url"], key["webhook_secret"], payload)
+
+
+def notify_codex_job_terminal(job_id: str, key_id: int, status: str, finished_at) -> None:
+    """Codex ジョブの終了（completed/failed/cancelled）を、受付時に `webhook: true` を指定した鍵の通知先へ1回積む。
+
+    署名・再送・監査は取り込み通知と同じ仕組み（`_enqueue`→`_deliver`）。本文は専用の4項目のみ（回答本文は載せない）。
+    宛先は送信時に鍵から読み、外されていれば送らずログだけ残す。例外は呼び出し元へ伝播させない。
+    """
+    try:
+        from . import store
+        dest = store.get_api_key_webhook(key_id)
+        if not dest or not dest.get("webhook_url") or not dest.get("webhook_secret"):
+            _log.info("Codex ジョブの終了通知を送りません（通知先が未登録）: job_id=%s", job_id)
+            return
+        payload = {"event": f"codex_job.{status}", "job_id": job_id, "status": status,
+                   "finished_at": str(finished_at) if finished_at is not None else None}
+        _enqueue(key_id, dest["webhook_url"], "", payload)  # 宛先・secret は送信直前に引き直す
+    except Exception:
+        _log.warning("Codex ジョブの終了通知の準備に失敗しました（job_id=%s）", job_id, exc_info=True)

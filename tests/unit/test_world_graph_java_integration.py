@@ -16,6 +16,11 @@ WORLD_DIR = ROOT / "fixtures" / "corpus" / "java1"
 WORLD_ID = "java1_test"
 
 
+def _core(flags):
+    """未解決系の申告から、新しく足した欄（`from_def`・`candidates`）を除いた形（既存の欄の契約だけを確かめる）。"""
+    return [{k: v for k, v in f.items() if k not in ("from_def", "candidates")} for f in flags]
+
+
 def _build():
     return world_graph.build_world(WORLD_DIR, WORLD_ID)
 
@@ -67,10 +72,9 @@ def test_cross_package_new_and_static_call_resolve_via_nearest_neighbor():
     assert ("INVOKES", src, dst) in ek
 
 
-def test_same_named_helper_in_two_packages_is_flagged_ambiguous_not_arbitrarily_resolved():
-    """`com/acme/Main.java` は `com/acme/tax/util/Helper.java` と `com/acme/billing/util/Helper.java`
-    の両方から等距離——共通層は任意解決せず `ambiguous_reference`(`ambiguous`) flag を立てる
-    （docs/03-鏡モデル.md §2.2・§4.2 (c) の否定的テスト）。"""
+def test_same_named_helper_in_two_other_packages_is_not_connected_and_is_reported_unresolved():
+    """`com/acme/Main.java` は `Helper` を import せず、同じ package（`com.acme`）にも無い。別 package の 2 つの
+    `Helper` は近さに依らず選ばない——辺を張らず `unresolved` を申告する（docs/03-鏡モデル.md §2.2・否定的テスト）。"""
     nodes, edges, flags = _build()
     ek = _edge_keys(nodes, edges)
     src = ("Module", "Main", "com/acme/Main.java")
@@ -78,8 +82,8 @@ def test_same_named_helper_in_two_packages_is_flagged_ambiguous_not_arbitrarily_
     billing_helper = ("Module", "Helper", "com/acme/billing/util/Helper.java")
     assert ("INVOKES", src, tax_helper) not in ek           # 任意解決していない
     assert ("INVOKES", src, billing_helper) not in ek
-    assert {"reason": "ambiguous", "from": "com/acme/Main.java", "kind": "Module", "name": "Helper",
-            "line": 9, "via": "call"} in flags
+    assert {"reason": "unresolved", "from": "com/acme/Main.java", "kind": "Module", "name": "Helper",
+            "line": 9, "via": "call"} in _core(flags)
 
 
 def test_reference_to_non_public_sibling_type_now_resolves_via_children_index():
@@ -100,7 +104,7 @@ def test_static_call_heuristic_flags_unresolved_jdk_reference_rather_than_guessi
     コーパスに `Math` の定義は無いため `unresolved` になる（誤って解決しない）。"""
     _nodes, _edges, flags = _build()
     assert {"reason": "unresolved", "from": "com/acme/tax/TaxCalculator.java",
-            "kind": "Module", "name": "Math", "line": 29, "via": "call"} in flags
+            "kind": "Module", "name": "Math", "line": 29, "via": "call"} in _core(flags)
 
 
 def test_analyzer_provenance_is_recorded_on_java_nodes():

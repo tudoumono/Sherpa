@@ -1,0 +1,7 @@
+CREATE TABLE DB1.S3.TT (
+    ID INT
+);
+
+CREATE TABLE W.X.Y.Z (
+    ID INT
+);

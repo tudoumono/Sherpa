@@ -25,7 +25,7 @@ import time
 # 同じファミリーのテスト（test_codex_kill_timeout.py 等）と同じ流儀（setdefault のみ）。
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 
-from sherpa.providers.codex import provider as PV  # noqa: E402
+from sherpa.providers.codex import process as process_mod  # noqa: E402
 
 
 def _alive(pid: int) -> bool:
@@ -71,7 +71,7 @@ _PIPE_LEADER_SCRIPT = (
 
 def test_kill_session_reaps_orphan_but_spares_unrelated_session(monkeypatch):
     """session leader（start_new_session=True）が、別プロセスグループへ移った子を残して
-    先に終了した状態を作り、`PV._kill_session(sid)` を呼ぶとその子だけが消えることを確かめる。
+    先に終了した状態を作り、`process_mod._kill_session(sid)` を呼ぶとその子だけが消えることを確かめる。
     同じセッションに属さない別プロセス（このテストが別に起動したもの）は消えないことも確かめる。
     `_attempt` の finally と同じ順序（リーダーを `wait()` で回収する**前**に `_kill_session` を
     呼ぶ）を踏襲し、その時点でリーダーがまだ回収されていない（＝sid の pid がまだこのテストに
@@ -134,7 +134,7 @@ def test_kill_session_reaps_orphan_but_spares_unrelated_session(monkeypatch):
 
         # `_kill_session` はリーダーがまだ未回収（zombie 化はしていても reap 前）の状態で呼ぶ
         # ——このテストはまだ `leader.wait()` を呼んでいない。
-        PV._kill_session(sid)
+        process_mod._kill_session(sid)
 
         assert _wait_until(lambda: not _alive(orphan_pid)), (
             f"_kill_session が同一セッションの孤児(pid={orphan_pid})を回収できていない")
@@ -158,7 +158,16 @@ def test_kill_session_reaps_orphan_but_spares_unrelated_session(monkeypatch):
         assert _wait_until(lambda: _alive(pipe_child_pid)), (
             "pipe を継承する子が起動した形跡が無い（テスト前提が崩れている）")
 
-        PV._spawn_stop_watcher(pipe_leader, None, threading.Lock(), {"done": False})
+        _kill_session_calls = []
+        _real_kill_session = process_mod._kill_session
+
+        def _recording_kill_session(sid):
+            _kill_session_calls.append(sid)
+            return _real_kill_session(sid)
+
+        monkeypatch.setattr(process_mod, "_kill_session", _recording_kill_session)   # 監視スレッドは process の名前で呼ぶ
+
+        process_mod._spawn_stop_watcher(pipe_leader, None, threading.Lock(), {"done": False})
 
         readable, _, _ = select.select([pipe_leader.stdout], [], [], 5.0)
         assert readable, (
@@ -169,25 +178,18 @@ def test_kill_session_reaps_orphan_but_spares_unrelated_session(monkeypatch):
         assert _wait_until(lambda: not _alive(pipe_child_pid)), (
             f"監視スレッドが pipe を握っていた子(pid={pipe_child_pid})を回収できていない")
         pipe_leader.wait(timeout=5)
+        assert _kill_session_calls, "差し替えた _kill_session が監視スレッドから呼ばれていない（差し替えが効いていない）"
+        _kill_session_calls.clear()
 
         # finally が既に reap した後（waitid が ECHILD になる状態）で監視の判定が走っても
         # `_kill_session` を呼ばないことを確かめる: sid は reap 後に再利用され得るため、
-        # ECHILD の経路では触れてはいけない（`_kill_session` 自体を、振る舞いを変えずに
-        # 記録するだけのラッパで包んで観測する）。
-        _kill_session_calls = []
-        _real_kill_session = PV._kill_session
-
-        def _recording_kill_session(sid):
-            _kill_session_calls.append(sid)
-            return _real_kill_session(sid)
-
-        monkeypatch.setattr(PV, "_kill_session", _recording_kill_session)
+        # ECHILD の経路では触れてはいけない（上で組んだ記録用のラッパで観測する）。
         echild_leader = subprocess.Popen(
             [sys.executable, "-c", "pass"], start_new_session=True,
         )
         echild_leader.wait(timeout=5)   # 完全に reap 済み（以後 waitid はこの pid に ECHILD を返す）
 
-        PV._spawn_stop_watcher(echild_leader, None, threading.Lock(), {"done": False})
+        process_mod._spawn_stop_watcher(echild_leader, None, threading.Lock(), {"done": False})
         time.sleep(0.2)   # 監視スレッドが最低1回はループを回るのに十分な猶予
         assert _kill_session_calls == [], (
             f"reap 済み（ECHILD）のリーダーに対して _kill_session が呼ばれてしまった: "
@@ -249,7 +251,7 @@ def test_kill_session_falls_back_to_killpg_without_pidfd(monkeypatch):
     monkeypatch.setattr(os, "getpgid", _zombie_getpgid)
     monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
 
-    PV._kill_session(4242)
+    process_mod._kill_session(4242)
 
     assert calls == [(4242, signal.SIGKILL)]
 
@@ -286,9 +288,9 @@ def test_startup_stderr_logged_only_when_no_events_and_failed(caplog):
         return f
 
     with caplog.at_level(logging.WARNING, logger="sherpa"):
-        PV._log_startup_stderr(_f("Error: config rejected\n"), 1, False, 7, "u")
-        PV._log_startup_stderr(_f("streamed body\n"), 1, True, 7, "u")
-        PV._log_startup_stderr(_f("normal\n"), 0, False, 7, "u")
+        process_mod._log_startup_stderr(_f("Error: config rejected\n"), 1, False, 7, "u")
+        process_mod._log_startup_stderr(_f("streamed body\n"), 1, True, 7, "u")
+        process_mod._log_startup_stderr(_f("normal\n"), 0, False, 7, "u")
     text = caplog.text
     assert "config rejected" in text
     assert "streamed body" not in text and "normal" not in text

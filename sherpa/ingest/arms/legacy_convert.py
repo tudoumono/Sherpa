@@ -1,43 +1,13 @@
-"""旧形式 Office（.doc/.xls/.ppt）→ 新形式 OOXML の変換バックエンド抽象（docs/archive/2026-07-08-旧Office変換2系統.md W0）。
+"""旧形式 Office（.doc/.xls/.ppt）→ 新形式 OOXML の変換バックエンド。旧バイナリ（CFB）は XML 直パースで読めないため、前段で OOXML へ変換し、MD 化自体は OOXML アーム（値の権威）へ委譲する。変換器（LibreOffice 等）は構造抽出の権威にしない。
 
-旧バイナリ（CFB）は OOXML ではないため `office_md` の XML 直パースでは読めない（INGEST-MD §5.6・D2）。本モジュールは
-「旧→新（OOXML）の**前段変換器**」を提供し、MD 化自体は既存①OOXML アーム（値の権威・決定的）へ委譲する
-（**LibreOffice を構造抽出の権威にしない**＝INGEST-MD の決定を維持。LO は「Office を持たない環境での旧→新変換
-の選択肢」に留める）。
-
-バックエンドの解決順は **system_settings `legacy_backend` > env `SHERPA_LEGACY_BACKEND` > 既定 "none"**
-（2026-07-08-設定分離とUI整備.md S1 の汎用 KV に相乗り）。値は `none` | `libreoffice` | `office_com`。
-env 段は ENV-CLEAN でも**撤去しない**——`providers/codex/mcp.py::_mcp_env` が親プロセス
-（DB 接続あり）で解決した実効値を `SHERPA_LEGACY_BACKEND` としてスナップショットし、MCP サブプロセス
-（PG creds 無し）はこの env フォールバックだけで親と同じ実効値に一致する（`SHERPA_LEGACY_EXTS`／
-`SHERPA_VLM_USABLE` と同じ内部 IPC 契約）。管理画面からは system_settings 段が常に優先するため、
-「UI が唯一の真実源」の原則自体は保たれる。
-`office_com`（Windows の本物 Office・忠実変換）は **W1 で追加**。COM interop は Windows 側の
-`deploy/office-com-worker.ps1` だけが持ち、ここ（WSL コア）は **HTTP か WSL interop の one-shot で呼ぶ**。
-office_com には2つの動作形態がある（**W2'**）:
-  - **direct（既定・同一マシン）**: `SHERPA_OFFICE_COM_URL` 未設定時、WSL interop（`/mnt/c/.../powershell.exe`）で
-    ps1 を one-shot 実行する（常駐ワーカー・URL・トークン不要＝Windows 側の事前準備ゼロ）。powershell.exe が
-    検出できなければ到達不可（fail-safe）。healthz は ps1 `-Healthz` の JSON を長め TTL でキャッシュする。
-  - **http（別ホスト）**: `SHERPA_OFFICE_COM_URL` 設定時、その常駐 HTTP ワーカー（別マシンの Office）を呼ぶ
-    （W1 実装・`SHERPA_OFFICE_COM_TOKEN`・healthz を短 TTL でキャッシュ）。
-`SHERPA_OFFICE_COM_URL`（未設定＝direct へ倒す）・`SHERPA_OFFICE_COM_TOKEN`・`SHERPA_POWERSHELL_BIN`（direct の
-powershell.exe 明示パス・未設定は既定パスを探す）。
-`SHERPA_LEGACY_EXTS`（設定時は最優先＝MCP サブプロセス用のスナップショット・office_com の URL/TOKEN を
-持たないサブプロセスに healthz probe をさせず、親の実効値をそのまま信じさせる。W1）。
-
-**OFFICE-WIN-001（2026-07-20-調査型RAG詳細修正計画.html §6.5・http モード限定）**: 別ホストのワーカーへ
-原本をどう渡すかは `transfer_mode`（`system_settings` `office_transfer_mode` > env
-`SHERPA_OFFICE_TRANSFER_MODE` > 既定 `"path"`）で切り替える。`path`（既定・現行完全不変＝Windows から見える
-絶対パス/UNC を JSON で渡す・共有ストレージ前提）｜`upload`（毎回ファイル本体を multipart 送信・共有ストレージ
-無しの独立 Linux サーバー向け・原本 sha256 を `source_hash` として添え、ワーカー側で検証させる）｜`auto`（まず
-path を試し、path 方式そのものが使えないと判別できた場合（パス変換不能／ネットワーク到達不能／worker が
-404「file not found」を返した）だけ upload へ縮退。500 等の COM 変換失敗はそのまま失敗として伝播し upload
-へは縮退しない＝真の失敗を隠さない・Med-2）。direct モード（同一マシン・WSL interop）には適用しない
-（ファイルシステムへ既に直接アクセスできるため転送方式という概念が無い＝常に path 相当）。
-
-fail-safe: バックエンド none／soffice 未検出／ワーカー未到達／変換失敗はすべて「変換できない（None）」に倒し、
-呼び出し側は従来どおり「未対応」として表示する（既定 none＝挙動不変）。決定性は「キャッシュ後の①MD化」で担保する
-（同じ OOXML → 同じ MD。SaveAs のバイト厳密性には依存しない）。soffice/Office のバージョンは provenance に残す。
+バックエンドの解決順: system_settings `legacy_backend` > MCP スナップショット env `SHERPA_MCP_LEGACY_BACKEND` > 既定 `"none"`。値は `none` | `libreoffice` | `office_com`。スナップショット段は、MCP サブプロセス（PG creds 無し）が親プロセスの実効値を `SHERPA_MCP_LEGACY_BACKEND` で受け取る（`providers/codex/mcp.py::_mcp_env`）ために残す（`SHERPA_LEGACY_EXTS`／`SHERPA_VLM_USABLE` も同じ）。
+`office_com`（Windows の本物の Office・忠実変換）の COM interop は `deploy/office-com-worker.ps1` だけが持ち、ここ（WSL コア）は HTTP か WSL interop の one-shot で呼ぶ。動作形態は2つ:
+- direct（既定・同一マシン）: `SHERPA_OFFICE_COM_URL` 未設定時、WSL interop（`powershell.exe`）で ps1 を one-shot 実行する。powershell.exe が検出できなければ到達不可。healthz は ps1 `-Healthz` の JSON を長め TTL でキャッシュする。
+- http（別ホスト）: `SHERPA_OFFICE_COM_URL` 設定時、その常駐ワーカーを呼ぶ（`SHERPA_OFFICE_COM_TOKEN`・healthz は短 TTL でキャッシュ）。
+`SHERPA_POWERSHELL_BIN` は direct の powershell.exe の明示パス。`SHERPA_LEGACY_EXTS` が設定されていれば最優先（office_com の URL/TOKEN を持たないサブプロセスに healthz probe をさせず、親の実効値を信じさせる）。
+http モードの原本の渡し方 `transfer_mode`（system_settings `office_transfer_mode` > env `SHERPA_OFFICE_TRANSFER_MODE` > 既定 `"path"`）: `path`（Windows から見える絶対パス/UNC を JSON で渡す）｜`upload`（ファイル本体を multipart 送信し、原本 sha256 を `source_hash` として添えてワーカー側で検証させる）｜`auto`（path を試し、path 方式が使えないと判別できた場合＝パス変換不能／ネットワーク到達不能／worker が 404「file not found」の場合だけ upload へ縮退する。500 等の COM 変換失敗は縮退せずそのまま失敗とする）。direct モードには適用しない。
+バックエンド none／soffice 未検出／ワーカー未到達／変換失敗はすべて「変換できない（None）」に倒し、呼び出し側は「未対応」として表示する（既定 none）。soffice/Office のバージョンは provenance に残す。
+設計: docs/design/rag.md「アーム一覧」
 """
 from __future__ import annotations
 
@@ -58,37 +28,30 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-# 専用ログ（sherpa.convert.libreoffice）へルーティングする（`sherpa/log_setup.py`
-# の登録表参照）。office_com backend（http/direct）のログも本モジュール内にあるため同じ系統に乗る。
+# 専用ログ（sherpa.convert.libreoffice）へルーティングする（`sherpa/log_setup.py` の登録表参照）。office_com（http/direct）のログも同じ系統に乗る。
 _log = logging.getLogger("sherpa.convert.libreoffice")
 
-# W0 の対象＝旧バイナリ → 新形式（OOXML）拡張子の対応。これ以外は W0 対象外。
+# 旧バイナリ → 新形式（OOXML）拡張子の対応。
 LEGACY_EXT_MAP: dict[str, str] = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}
 
-# 拡張子 → office_com ワーカーが使うアプリ名（healthz の versions dict のキーと一致・deploy/office-com-worker.ps1
-# の $script:ExtMap と対応）。healthz `ok` だけで3拡張子すべてを候補化すると、Word のみ
-# 導入環境で .xls が毎回投入されては失敗する（failed に寄る）。アプリ単位でゲートするために使う。
+# 拡張子 → office_com ワーカーが使うアプリ名（healthz の versions dict のキーと一致・`deploy/office-com-worker.ps1` の `$script:ExtMap` と対応）。アプリ単位でゲートするために使う（Word のみ導入の環境へ .xls を投入しないため）。
 _EXT_APP: dict[str, str] = {".doc": "word", ".xls": "excel", ".ppt": "powerpoint"}
 
-# 選択可能なバックエンド（既知値・検証と UI 選択肢に使う）。"none"＝現状どおり未対応表示（既定）。
-# "libreoffice"＝WSL 内で soffice が旧→新変換。"office_com"＝Windows 側の独立ワーカー（本物の Office・忠実変換）を
-# HTTP で呼ぶ（W1・deploy/office-com-worker.ps1・INGEST-MD §5.6「実装境界」）。
+# 選択可能なバックエンド（検証と UI 選択肢に使う）。"none"＝未対応表示（既定）、"libreoffice"＝WSL 内の soffice で変換、"office_com"＝Windows 側の本物の Office（忠実変換）。
 KNOWN_BACKENDS: frozenset[str] = frozenset({"none", "libreoffice", "office_com"})
 # UI の選択肢表示順（既定の「使わない」を先頭に・KNOWN_BACKENDS と集合として一致）。
 BACKEND_OPTIONS: tuple[str, ...] = ("none", "libreoffice", "office_com")
 _DEFAULT_BACKEND = "none"
 
-_DEFAULT_TIMEOUT_SEC = 60.0            # 1 件あたりの変換タイムアウト（env SHERPA_LEGACY_TIMEOUT で調整可）
-_VERSION_TIMEOUT_SEC = 15.0           # `soffice --version` のタイムアウト（検出・provenance 用）
-_OFFICE_COM_HEALTH_TIMEOUT = 2.0      # office_com(http) /healthz の短タイムアウト（到達判定・毎回叩かないよう TTL キャッシュ）
-_OFFICE_COM_HEALTH_TTL = 30.0         # http /healthz の結果をプロセス内でキャッシュする秒数（到達可否・versions）
+_DEFAULT_TIMEOUT_SEC = 60.0  # 1 件あたりの変換タイムアウト（env SHERPA_LEGACY_TIMEOUT で調整可）
+_VERSION_TIMEOUT_SEC = 15.0  # `soffice --version` のタイムアウト（検出・provenance 用）
+_OFFICE_COM_HEALTH_TIMEOUT = 2.0  # office_com(http) /healthz の短タイムアウト（到達判定）
+_OFFICE_COM_HEALTH_TTL = 30.0  # http /healthz の結果をプロセス内でキャッシュする秒数（到達可否・versions）
 
-# W2'（direct モード）: ps1 の one-shot は起動コスト（~1-3s）があるため長め TTL でキャッシュする。
+# direct モード: ps1 の one-shot は起動コスト（~1-3s）があるため長め TTL でキャッシュする。
 _OFFICE_COM_DIRECT_HEALTH_TTL = 300.0  # direct `-Healthz` one-shot の結果をキャッシュする秒数
-_DIRECT_HEALTH_TIMEOUT = 15.0          # direct `-Healthz` one-shot 自体のタイムアウト（powershell 起動＋レジストリ参照）
-# WSL 側の変換/レンダ backstop タイムアウト。ps1 内部（-JobTimeoutSec）が先に発火して Office 残骸を Windows 側で
-# 掃除する（Stop-CandidateProcesses）ため、WSL は「内部タイムアウト＋余裕」だけ待つ二重の保険（interop の
-# wedge 等の異常時のみ WSL 側 killpg が効く）。unit テストは本定数を monkeypatch で短縮する。
+_DIRECT_HEALTH_TIMEOUT = 15.0  # direct `-Healthz` one-shot 自体のタイムアウト（powershell 起動＋レジストリ参照）
+# WSL 側の変換/レンダ backstop タイムアウト。ps1 内部（-JobTimeoutSec）が先に発火して Windows 側の Office 残骸を掃除し、WSL は「内部タイムアウト＋余裕」だけ待つ二重の保険（異常時のみ WSL 側 killpg が効く）。unit テストは本定数を monkeypatch で短縮する。
 _DIRECT_GRACE_SEC = 30.0
 
 # direct モードの powershell.exe 既定パス（WSL interop・env SHERPA_POWERSHELL_BIN で上書き可）。
@@ -97,11 +60,7 @@ _DEFAULT_POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell
 # 直列実行（LibreOffice は同一プロファイルでの並列が不安定・Office COM も並列不可）＝プロセス内で1件ずつ変換する。
 _convert_lock = threading.Lock()
 
-# ING-1（閉じた理由語彙）: `convert_to_ooxml()` の戻り値契約（`bytes | None`）は変えない（既存呼び出し元・
-# tests への影響を避ける・最小修正）。詳しい失敗理由（タイムアウト／バックエンド未設定）は
-# スレッドローカルな片方向シグナルで伝える——`ensure_ooxml()` が冒頭で必ずクリアしてから
-# `convert_to_ooxml()` を呼ぶため、直前の無関係な呼び出しの残留が混ざらない
-# （`ensure_ooxml`/`take_conversion_failure_reason` docstring 参照）。
+# `convert_to_ooxml()` の戻り値契約（`bytes | None`）は変えず、詳しい失敗理由（タイムアウト等）はスレッドローカルな片方向シグナルで伝える。`ensure_ooxml()` が冒頭でクリアしてから `convert_to_ooxml()` を呼ぶので、直前の無関係な呼び出しの残留は混ざらない。
 _conversion_failure_ctx = threading.local()
 
 
@@ -112,12 +71,7 @@ def _note_conversion_failure_reason(reason: str) -> None:
 def take_conversion_failure_reason() -> str | None:
     """直前の `ensure_ooxml()` 呼び出し（同一スレッド）が失敗した詳しい理由（読んだら消費・無ければ None）。
 
-    現状セットされ得るのは `"timeout"`——`_run_soffice`（libreoffice subprocess）だけでなく
-    office_com の HTTP（path/upload 転送）・direct（WSL interop ps1）の各タイムアウト経路も含む。
-    `office_md` が `ensure_ooxml()` の失敗直後に読み取り、
-    汎用の `legacy_conversion_failed` より詳しい理由コード（`legacy_conversion_timeout`）を
-    rel 単位の失敗一覧へ残すために使う（バックエンド未設定/未到達は `legacy_exts()` で判別可能な
-    ため、この経由は使わない）。
+    現状セットされ得るのは `"timeout"`（libreoffice subprocess・office_com の HTTP/direct の各タイムアウト経路）。`office_md` が失敗直後に読み、`legacy_conversion_timeout` の理由コードを rel 単位の失敗一覧へ残す。バックエンド未設定/未到達は `legacy_exts()` で判別できるのでこの経由は使わない。
     """
     reason = getattr(_conversion_failure_ctx, "reason", None)
     _conversion_failure_ctx.reason = None
@@ -125,10 +79,7 @@ def take_conversion_failure_reason() -> str | None:
 
 
 def _is_timeout_error(e: Exception) -> bool:
-    """`urllib`/`socket` 由来の例外が実質タイムアウトかを判定する。判定の実装は
-    `stop_kind.is_timeout_exc` を唯一の真実源として使う（遅延 import はこのモジュールの
-    既存の流儀＝`from sherpa import store` と同じ）。
-    """
+    """`urllib`/`socket` 由来の例外が実質タイムアウトかを判定する（`stop_kind.is_timeout_exc` を使う）。"""
     from sherpa import stop_kind
     return stop_kind.is_timeout_exc(e)
 
@@ -136,25 +87,20 @@ def _is_timeout_error(e: Exception) -> bool:
 _version_cache: dict[str, str | None] = {}
 _warned_unknown_backend: set[str] = set()
 
-# office_com(http) ワーカー /healthz の結果を URL 毎に短TTLキャッシュ（毎ファイル/毎リクエストで叩かない）。
-# 値は (monotonic 取得時刻, healthz dict | None)。失敗（None）も同じ TTL でキャッシュする（fail-safe・叩き過ぎ防止）。
+# office_com(http) ワーカー /healthz の結果を URL 毎に短TTLキャッシュする。値は (monotonic 取得時刻, healthz dict | None)。失敗（None）も同じ TTL でキャッシュする（叩き過ぎ防止）。
 _healthz_cache: dict[str, tuple[float, dict | None]] = {}
 
-# office_com(direct) `-Healthz` one-shot の結果を powershell.exe パス毎に長め TTL でキャッシュする（同上）。
+# office_com(direct) `-Healthz` one-shot の結果を powershell.exe パス毎に長め TTL でキャッシュする。
 _direct_healthz_cache: dict[str, tuple[float, dict | None]] = {}
 
 # /mnt/<drive>/rest → <DRIVE>:\rest 変換用（単一ドライブ文字＋任意の残り。/mnt/c と /mnt/c/ も許容）。
 _MNT_DRIVE = re.compile(r"^/mnt/([a-zA-Z])(?:/(.*))?$")
 
 
-# ---- バックエンド解決（system_settings > env > 既定・S1・env 段の存置理由はモジュール docstring 参照）----
+# バックエンド解決（system_settings > env > 既定）
 
 def _system_legacy_backend() -> str | None:
-    """全体設定 system_settings の `legacy_backend`（非空 str のみ）。読めない/未設定は None（env へ倒す）。
-
-    **fail-safe**: store を読めない文脈（MCP サブプロセスは PG creds 無し・DB 停止中）は例外を握って None
-    （`arms._system_arms_enabled` と同じ流儀）。
-    """
+    """全体設定 system_settings の `legacy_backend`（非空 str のみ）。読めない/未設定は None（env へ倒す）。store を読めない文脈（MCP サブプロセス・DB 停止中）は例外を握って None。"""
     try:
         from sherpa import store
         val = store.get_system_settings().get("legacy_backend")
@@ -166,16 +112,12 @@ def _system_legacy_backend() -> str | None:
 
 
 def _env_backend() -> str:
-    """env `SHERPA_LEGACY_BACKEND`（未設定は既定 "none"）。正規化のみ（既知/未知の判定は `_normalize`）。
-
-    MCP サブプロセスは `providers/codex/mcp.py::_mcp_env` が親の実効値をここへスナップショットする
-    （モジュール docstring 参照）ため、この env 読みは ENV-CLEAN でも維持する。
-    """
-    return (os.environ.get("SHERPA_LEGACY_BACKEND") or _DEFAULT_BACKEND).strip() or _DEFAULT_BACKEND
+    """MCP スナップショット env `SHERPA_MCP_LEGACY_BACKEND`（未設定は既定 "none"）。正規化のみ（既知/未知の判定は `_normalize`）。MCP サブプロセスには `_mcp_env` が親の実効値をここへスナップショットする。"""
+    return (os.environ.get("SHERPA_MCP_LEGACY_BACKEND") or _DEFAULT_BACKEND).strip() or _DEFAULT_BACKEND
 
 
 def _normalize(name: str) -> str:
-    """未知のバックエンド名は "none" に倒す（fail-safe・プロセス内で1回だけ警告）。"""
+    """未知のバックエンド名は "none" に倒す（プロセス内で1回だけ警告）。"""
     if name in KNOWN_BACKENDS:
         return name
     if name not in _warned_unknown_backend:
@@ -186,20 +128,19 @@ def _normalize(name: str) -> str:
 
 
 def legacy_backend_name() -> str:
-    """実効バックエンド名（system_settings > env > 既定）。既知の none|libreoffice のみ（未知は none・fail-safe）。"""
+    """実効バックエンド名（system_settings > MCP スナップショット > 既定）。既知の none|libreoffice|office_com のみ（未知は none）。"""
     sysv = _system_legacy_backend()
     return _normalize(sysv if sysv is not None else _env_backend())
 
 
 def env_default_backend() -> str:
-    """system_settings を無視した env/既定の実効バックエンド（設定画面の「未設定に戻すと何になるか」表示用）。"""
+    """system_settings を無視した既定の実効バックエンド（設定画面の「未設定に戻すと何になるか」表示用）。"""
     return _normalize(_env_backend())
 
 
-# ---- transfer_mode 解決（office_com の http モード限定・system_settings > env > 既定・OFFICE-WIN-001）----
+# transfer_mode 解決（office_com の http モード限定・system_settings > env > 既定）
 
-# 別ホストのワーカーへ原本をどう渡すか。"path"（既定・現行完全不変）｜"upload"（ファイル本体を毎回送る）｜
-# "auto"（path→失敗時 upload へ縮退）。direct モードには適用しない（呼び出し側が mode を見て使い分ける）。
+# 別ホストのワーカーへ原本をどう渡すか。"path"（既定）｜"upload"（ファイル本体を毎回送る）｜"auto"（path→失敗時 upload へ縮退）。direct モードには適用しない。
 KNOWN_TRANSFER_MODES: frozenset[str] = frozenset({"path", "upload", "auto"})
 TRANSFER_MODE_OPTIONS: tuple[str, ...] = ("path", "upload", "auto")
 _DEFAULT_TRANSFER_MODE = "path"
@@ -224,7 +165,7 @@ def _env_transfer_mode() -> str:
 
 
 def _normalize_transfer_mode(name: str) -> str:
-    """未知の transfer_mode は "path"（現状どおり）に倒す（fail-safe・プロセス内で1回だけ警告）。"""
+    """未知の transfer_mode は "path" に倒す（プロセス内で1回だけ警告）。"""
     if name in KNOWN_TRANSFER_MODES:
         return name
     if name not in _warned_unknown_transfer_mode:
@@ -245,13 +186,10 @@ def env_default_transfer_mode() -> str:
     return _normalize_transfer_mode(_env_transfer_mode())
 
 
-# ---- soffice 検出（env 明示 ＞ PATH）----
+# soffice 検出（env 明示 ＞ PATH）
 
 def _soffice_bin() -> str | None:
-    """soffice 実行ファイルの絶対パス。env `SHERPA_SOFFICE_BIN`（絶対パス化＋実行可検査）＞ PATH の soffice。
-
-    未検出は None（＝libreoffice バックエンドは実質無効＝fail-safe で変換せず未対応表示）。
-    """
+    """soffice 実行ファイルの絶対パス。env `SHERPA_SOFFICE_BIN`（絶対パス化＋実行可検査）＞ PATH の soffice。未検出は None（libreoffice バックエンドは実質無効＝変換せず未対応表示）。"""
     override = os.environ.get("SHERPA_SOFFICE_BIN")
     if override:
         try:
@@ -300,14 +238,12 @@ def _timeout_sec() -> float:
     return v if v > 0 else _DEFAULT_TIMEOUT_SEC
 
 
-# ---- direct モード検出（WSL interop の powershell.exe・W2'）----
+# direct モード検出（WSL interop の powershell.exe）
 
 def _powershell_bin() -> str | None:
-    """direct モードで使う powershell.exe の絶対パス。env `SHERPA_POWERSHELL_BIN`（絶対パス化＋実行可検査）＞
-    既定 `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`。未検出は None（＝direct 無効＝fail-safe）。
+    """direct モードで使う powershell.exe の絶対パス。env `SHERPA_POWERSHELL_BIN`（絶対パス化＋実行可検査）＞ 既定 `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`。未検出は None（direct 無効）。
 
-    env を**明示設定したら override のみを見る**（未検出なら既定パスへフォールバックしない）＝テストで direct を
-    確実に無効化できる（`SHERPA_POWERSHELL_BIN=/nonexistent` で unavailable に固定）。
+    env を明示設定したら override のみを見る（既定パスへフォールバックしない）。テストで direct を無効化できる。
     """
     override = os.environ.get("SHERPA_POWERSHELL_BIN")
     if override is not None:
@@ -335,8 +271,7 @@ def _ps1_path() -> Path:
 
 
 def _ps1_win_path() -> str | None:
-    """`_ps1_path()` を powershell.exe が -File で読める Windows パスへ変換（repo は WSL ネイティブ＝
-    `\\\\wsl.localhost\\{distro}\\...`）。ファイル欠落／distro 不明で変換不能は None（fail-safe）。"""
+    """`_ps1_path()` を powershell.exe が -File で読める Windows パス（`\\\\wsl.localhost\\{distro}\\...`）へ変換する。ファイル欠落／distro 不明で変換不能は None。"""
     p = _ps1_path()
     if not p.is_file():
         return None
@@ -344,8 +279,7 @@ def _ps1_win_path() -> str | None:
 
 
 def office_com_mode() -> str:
-    """office_com の動作形態を返す（W2'）: "http"（URL 設定済み＝別ホストのワーカー）｜"direct"（URL 未設定かつ
-    powershell.exe 検出＝同一マシンの interop one-shot・既定）｜"unavailable"（どちらも無し＝現状どおり未対応表示）。"""
+    """office_com の動作形態を返す: "http"（URL 設定済み＝別ホストのワーカー）｜"direct"（URL 未設定かつ powershell.exe 検出＝同一マシンの interop one-shot・既定）｜"unavailable"（どちらも無し＝未対応表示）。"""
     if _office_com_url() is not None:
         return "http"
     if _powershell_bin() is not None:
@@ -353,7 +287,7 @@ def office_com_mode() -> str:
     return "unavailable"
 
 
-# ---- office_com（http: Windows 側ワーカーへの HTTP・W1）----
+# office_com（http: Windows 側ワーカーへの HTTP）
 
 def _office_com_url() -> str | None:
     """office_com ワーカーの base URL（env `SHERPA_OFFICE_COM_URL`・末尾 `/` は落とす）。未設定は None（到達不可扱い）。"""
@@ -384,9 +318,7 @@ def office_com_configured() -> bool:
 
 
 def office_com_configured_url() -> str | None:
-    """設定画面の接続テスト（`POST /system/office-worker/probe`・OFFICE-WIN-001 ④）が body 省略時に使う
-    「保存済み」URL。現状は env `SHERPA_OFFICE_COM_URL` のみ（system_settings には url/token を持たない・
-    転送方式（`office_transfer_mode`）だけが system_settings 対応・今回のスコープ外）。未設定は None。"""
+    """設定画面の接続テスト（`POST /system/office-worker/probe`）が body 省略時に使う「保存済み」URL。現状は env `SHERPA_OFFICE_COM_URL` のみ（system_settings には url/token を持たない）。未設定は None。"""
     return _office_com_url()
 
 
@@ -407,8 +339,7 @@ def _fetch_healthz(url: str) -> dict | None:
 def _healthz_http() -> dict | None:
     """http モードの healthz（到達可なら {ok,versions,worker} dict・不達/未設定は None）。
 
-    URL 毎に短TTL（`_OFFICE_COM_HEALTH_TTL` 秒）でプロセス内キャッシュする（毎ファイル/毎リクエストで叩かない）。
-    失敗（None）も同じ TTL でキャッシュ＝落ちているワーカーを叩き続けない。
+    URL 毎に短TTL（`_OFFICE_COM_HEALTH_TTL` 秒）でプロセス内キャッシュする。失敗（None）も同じ TTL でキャッシュする。
     """
     url = _office_com_url()
     if not url:
@@ -423,8 +354,7 @@ def _healthz_http() -> dict | None:
 
 
 def _run_healthz_direct(ps_bin: str) -> dict | None:
-    """direct モードの healthz＝ps1 を `-Healthz` で one-shot 実行し stdout の JSON を読む（COM は起動しない・
-    レジストリ参照の軽量判定）。非0終了/タイムアウト/JSON 不正/ok でない は None（fail-safe）。"""
+    """direct モードの healthz＝ps1 を `-Healthz` で one-shot 実行し stdout の JSON を読む（COM は起動せず、レジストリ参照の軽量判定）。非0終了/タイムアウト/JSON 不正/ok でないは None。"""
     ps1_win = _ps1_win_path()
     if ps1_win is None:
         return None
@@ -448,10 +378,7 @@ def _run_healthz_direct(ps_bin: str) -> dict | None:
 
 
 def _healthz_direct() -> dict | None:
-    """direct モードの healthz（powershell.exe パス毎に長め TTL `_OFFICE_COM_DIRECT_HEALTH_TTL` でキャッシュ）。
-
-    one-shot は起動コスト（~1-3s）があるため http より長い TTL で叩き過ぎを防ぐ。失敗（None）も同じ TTL でキャッシュ。
-    """
+    """direct モードの healthz（powershell.exe パス毎に長め TTL `_OFFICE_COM_DIRECT_HEALTH_TTL` でキャッシュ）。失敗（None）も同じ TTL でキャッシュする。"""
     ps_bin = _powershell_bin()
     if not ps_bin:
         return None
@@ -465,11 +392,7 @@ def _healthz_direct() -> dict | None:
 
 
 def office_com_healthz() -> dict | None:
-    """office_com の healthz 応答（モードに応じ http/direct を使い分け・到達可なら {ok,versions,worker} dict）。
-
-    未設定・powershell 未検出（unavailable）は None（fail-safe）。versions/到達可否の実体はモード別のキャッシュ済み
-    プローブ（`_healthz_http`/`_healthz_direct`）が返す。
-    """
+    """office_com の healthz 応答（モードに応じて http/direct を使い分け・到達可なら {ok,versions,worker} dict）。未設定・powershell 未検出（unavailable）は None。"""
     mode = office_com_mode()
     if mode == "http":
         return _healthz_http()
@@ -484,13 +407,9 @@ def office_com_available() -> bool:
 
 
 def probe_office_com(url: str, token: str | None = None, timeout: float | None = None) -> dict:
-    """任意の url/token で office_com ワーカーの到達性を検査する（設定画面の接続テスト用の関数。OFFICE-WIN-001）。
+    """任意の url/token で office_com ワーカーの到達性を検査する（設定画面の接続テスト用）。
 
-    `_office_com_url()`/`_office_com_token()`（env 由来・保存済み設定）は使わず、呼び出し元が明示的に渡した
-    値だけで `/healthz` を1回叩く（`POST /settings/test` の他プロバイダ probe と同じ流儀＝保存前に確認できる・
-    保存はしない）。router への配線・UI は次スライス（本関数は API/関数レベルまで）。
-
-    戻り値 `{ok, detail, versions}`。到達不可/認証失敗/応答不正はすべて `ok=False`（fail-safe）。
+    保存済み設定（env 由来）は使わず、呼び出し元が渡した値だけで `/healthz` を1回叩く（保存前に確認できる・保存はしない）。戻り値 `{ok, detail, versions}`。到達不可/認証失敗/応答不正はすべて `ok=False`。
     """
     u = (url or "").strip().rstrip("/")
     if not u:
@@ -515,7 +434,7 @@ def probe_office_com(url: str, token: str | None = None, timeout: float | None =
 
 
 def _office_com_versions_summary() -> str | None:
-    """provenance 用に healthz の versions を短い文字列へ要約（例 `word=16.0,excel=16.0`）。取得不可は None。"""
+    """provenance 用に healthz の versions を短い文字列へ要約する（例 `word=16.0,excel=16.0`）。取得不可は None。"""
     hz = office_com_healthz()
     if not hz:
         return None
@@ -525,7 +444,7 @@ def _office_com_versions_summary() -> str | None:
     parts = []
     for app in ("word", "excel", "powerpoint"):
         v = versions.get(app)
-        if v and not isinstance(v, bool):        # False（未導入）は載せない
+        if v and not isinstance(v, bool):  # False（未導入）は載せない
             parts.append(f"{app}={v}")
     return ",".join(parts) if parts else None
 
@@ -545,11 +464,7 @@ def _office_com_available_apps() -> set[str]:
 
 
 def office_com_available_exts() -> set[str]:
-    """office_com で今変換できる拡張子集合（healthz の versions で検出できたアプリ対応分のみ）。
-
-    healthz `ok` だけで .doc/.xls/.ppt を丸ごと候補化すると、Word のみ導入環境で
-    .xls が投入されては毎回失敗する（failed に寄る＝ユーザーに誤った期待を持たせる）。アプリ単位でゲートする。
-    """
+    """office_com で今変換できる拡張子集合（healthz の versions で検出できたアプリ対応分のみ）。アプリ単位でゲートする（Word のみ導入の環境で .xls を毎回失敗させない）。"""
     apps = _office_com_available_apps()
     return {ext for ext, app in _EXT_APP.items() if app in apps}
 
@@ -557,11 +472,9 @@ def office_com_available_exts() -> set[str]:
 def wsl_to_windows_path(p: str) -> str | None:
     """WSL パス → Windows パス（office_com ワーカーへ渡す・純関数）。
 
-    - `/mnt/<drive>/rest` → `<DRIVE>:\\rest`（大文字ドライブ・バックスラッシュ）。world は元々 Windows
-      ドライブ（例 C:\\test）なので通常こちら。
-    - `/mnt` 配下でない WSL ネイティブパスは `\\\\wsl.localhost\\{distro}\\...`（distro は env `WSL_DISTRO_NAME`）へ
-      フォールバック。distro 不明なら None。
-    - 絶対パスでない/変換不能は None（fail-safe＝呼び出し側は変換せず未対応表示）。
+    - `/mnt/<drive>/rest` → `<DRIVE>:\\rest`（大文字ドライブ・バックスラッシュ）。
+    - `/mnt` 配下でない WSL ネイティブパスは `\\\\wsl.localhost\\{distro}\\...`（distro は env `WSL_DISTRO_NAME`）。distro 不明なら None。
+    - 絶対パスでない/変換不能は None（呼び出し側は未対応表示）。
     """
     if not p or not isinstance(p, str) or not p.startswith("/"):
         return None
@@ -578,16 +491,9 @@ def wsl_to_windows_path(p: str) -> str | None:
 
 
 def _convert_office_com_ex(src: Path, target_ext: str) -> tuple[bytes | None, bool]:
-    """`_convert_office_com` の内部実装。戻り値 `(data, fallback_worthy)`（Med-2）。
+    """`_convert_office_com` の内部実装。戻り値 `(data, fallback_worthy)`。
 
-    `fallback_worthy=True` は「path 方式そのものが使えない」と判別できた場合のみ:
-      (i) Windows パスへのマッピング自体が不能（HTTP を送る前に判明）。
-      (ii) ネットワーク到達不能（接続不可・DNS 失敗・タイムアウト等＝`URLError`/`OSError`）。
-      (iii) worker が「file not found」（HTTP 404・Handle-Convert が `Test-Path` 失敗時にのみ返す・判別可能）
-            を返した場合。
-    それ以外（500 等の COM 変換失敗・400 の拡張子/target 不一致・401 の認証失敗・想定外の例外）は
-    `fallback_worthy=False`＝呼び出し元（auto モード）は upload へ縮退せず、この失敗をそのまま最終結果として
-    伝播する（COM の真の失敗を upload 再試行の成功で覆い隠さない）。
+    `fallback_worthy=True` は「path 方式そのものが使えない」と判別できた場合のみ: (i) Windows パスへのマッピング不能（HTTP を送る前に判明）、(ii) ネットワーク到達不能（`URLError`/`OSError`）、(iii) worker が「file not found」（HTTP 404）を返した。それ以外（500 等の COM 変換失敗・400・401・想定外の例外）は `False`＝auto モードでも upload へ縮退せず失敗をそのまま伝播する（COM の真の失敗を upload の成功で覆い隠さない）。
     """
     url = _office_com_url()
     if not url:
@@ -595,7 +501,7 @@ def _convert_office_com_ex(src: Path, target_ext: str) -> tuple[bytes | None, bo
     win_path = wsl_to_windows_path(str(Path(src)))
     if win_path is None:
         _log.warning("office_com: Windows パスに変換できません: %s", src)
-        return None, True         # (i) パスへのマッピング自体が不能＝fallback 対象
+        return None, True  # (i) パスへのマッピング自体が不能＝fallback 対象
     body = json.dumps({"path": win_path, "target": target_ext.lstrip(".")}).encode("utf-8")
     headers = _office_com_headers({"Content-Type": "application/json"})
     req = urllib.request.Request(url + "/convert", data=body, method="POST", headers=headers)
@@ -606,15 +512,15 @@ def _convert_office_com_ex(src: Path, target_ext: str) -> tuple[bytes | None, bo
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 _log.warning("office_com: path 方式で対象が見つかりません（HTTP 404・upload へ縮退可）: %s", src)
-                return None, True    # (iii) worker が「パスが見つからない」と判別可能に返した
+                return None, True  # (iii) worker が「パスが見つからない」と判別可能に返した
             _log.warning("office_com 変換が失敗しました（HTTP %s・fallback しません）: %s", e.code, src)
-            return None, False       # 500 等の真の失敗は fallback しない
+            return None, False  # 500 等の真の失敗は fallback しない
         except (urllib.error.URLError, OSError) as e:
             _log.warning("office_com 変換を実行できませんでした（%s・upload へ縮退可）: %s",
                          e.__class__.__name__, src)
             if _is_timeout_error(e):
                 _note_conversion_failure_reason("timeout")
-            return None, True        # (ii) ネットワーク到達不能
+            return None, True  # (ii) ネットワーク到達不能
         except Exception as e:
             _log.warning("office_com 変換で想定外エラー（%s・fallback しません）: %s", e.__class__.__name__, src)
             return None, False
@@ -622,27 +528,22 @@ def _convert_office_com_ex(src: Path, target_ext: str) -> tuple[bytes | None, bo
 
 
 def _convert_office_com(src: Path, target_ext: str) -> bytes | None:
-    """旧形式 `src` を Windows 側ワーカーへ HTTP で送って変換したバイト列。到達不可/失敗/タイムアウトは None（fail-safe）。
+    """旧形式 `src` を Windows 側ワーカーへ HTTP で送って変換したバイト列。到達不可/失敗/タイムアウトは None。
 
-    直列実行（COM は並列不可・ワーカー側も直列だが WSL 側でも `_convert_lock` で二重に直列化する）。
-    タイムアウトは libreoffice と同じ `SHERPA_LEGACY_TIMEOUT`（既定60s）を流用する。"path" 単独呼び出しでは
-    fallback という概念が無いため `_convert_office_com_ex` の `fallback_worthy` 信号は無視して data だけ返す。
+    直列実行（`_convert_lock` で二重に直列化する）。タイムアウトは libreoffice と同じ `SHERPA_LEGACY_TIMEOUT`（既定60s）。`fallback_worthy` は無視して data だけ返す。
     """
     return _convert_office_com_ex(src, target_ext)[0]
 
 
-# ---- office_com（http: upload 転送・OFFICE-WIN-001・共有ストレージ無しの独立 Linux サーバー向け）----
+# office_com（http: upload 転送・共有ストレージ無しの独立 Linux サーバー向け）
 
-_MAX_UPLOAD_RETRIES = 1   # 失敗時の再送回数（初回＋1回・source_hash が同じ＝冪等なリトライ）
+_MAX_UPLOAD_RETRIES = 1  # 失敗時の再送回数（初回＋1回・source_hash が同じ＝冪等なリトライ）
 
 
 def _build_multipart(fields: dict[str, str], file_field: str, filename: str, file_bytes: bytes) -> tuple[bytes, str]:
-    """multipart/form-data のボディを標準ライブラリのみで組み立てる（新規 pip 依存を増やさない）。
+    """multipart/form-data のボディを標準ライブラリのみで組み立てる。
 
-    フィールドは全てUTF-8テキスト（target/source_hashに加え、Excel表示補完の日本語sheet名を含む
-    ``cells_json``）＋1個のファイルパート。ファイル名は
-    ワーカー側で拡張子判定にしか使わない（非 ASCII を含んでも実害無し・往復での文字化けは許容）。
-    戻り値は `(body, content_type)`（`content_type` に boundary を含む・そのまま HTTP ヘッダへ渡せる）。
+    フィールドは全て UTF-8 テキスト（target/source_hash に加え、Excel 表示補完の日本語 sheet 名を含む `cells_json`）＋1個のファイルパート。ファイル名はワーカー側で拡張子判定にしか使わない。戻り値は `(body, content_type)`（`content_type` に boundary を含む）。
     """
     boundary = "----SherpaBoundary" + uuid.uuid4().hex
     parts: list[bytes] = []
@@ -660,8 +561,7 @@ def _build_multipart(fields: dict[str, str], file_field: str, filename: str, fil
 def _post_multipart(url: str, body: bytes, content_type: str, timeout: float) -> bytes | None:
     """multipart POST を最大 `_MAX_UPLOAD_RETRIES + 1` 回（初回＋冪等リトライ）実行し応答バイトを返す。
 
-    リトライは同じ body（同じ source_hash）を再送するだけ（ワーカー側は毎回ゼロから変換するため二重実行の
-    副作用が無い＝冪等）。失敗（HTTPError／接続不可／タイムアウト等）はすべて None（fail-safe）。
+    リトライは同じ body（同じ source_hash）を再送するだけ（ワーカーは毎回ゼロから変換するので二重実行の副作用が無い）。失敗（HTTPError／接続不可／タイムアウト等）はすべて None。
     """
     headers = _office_com_headers({"Content-Type": content_type})
     for attempt in range(_MAX_UPLOAD_RETRIES + 1):
@@ -683,8 +583,7 @@ def _post_multipart(url: str, body: bytes, content_type: str, timeout: float) ->
 def _convert_office_com_upload(src: Path, target_ext: str) -> bytes | None:
     """旧形式 `src` をファイル本体ごと multipart 送信して変換する（共有ストレージ無しの別ホスト向け）。
 
-    原本 sha256 を `source_hash` として添付する（ワーカー側で検証・不一致は 400）。直列実行は path 方式と
-    同じ `_convert_lock`（COM は並列不可）。
+    原本 sha256 を `source_hash` として添付する（ワーカー側で検証・不一致は 400）。直列実行は path 方式と同じ `_convert_lock`。
     """
     url = _office_com_url()
     if not url:
@@ -704,10 +603,7 @@ def _convert_office_com_upload(src: Path, target_ext: str) -> bytes | None:
 def _convert_office_com_via_transfer_mode(src: Path, target_ext: str) -> bytes | None:
     """http モードの転送方式（`transfer_mode_name()`）を解決して変換する。
 
-    既定 "path" は `_convert_office_com` とまったく同じ（現行完全不変）。"auto" は path を試し、
-    `_convert_office_com_ex` が `fallback_worthy=True`（パス変換不能／ネットワーク到達不能／worker が
-    404「file not found」）と判別した場合のみ upload へ縮退する。500 等の真の COM 失敗は fallback せず
-    そのまま None を返す（Med-2・upload 再試行の成功で COM の真の失敗を覆い隠さない）。
+    "path"（既定）は `_convert_office_com` と同じ。"auto" は path を試し、`_convert_office_com_ex` が `fallback_worthy=True` と判別した場合のみ upload へ縮退する。500 等の真の COM 失敗はそのまま None を返す。
     """
     mode = transfer_mode_name()
     if mode == "upload":
@@ -717,24 +613,22 @@ def _convert_office_com_via_transfer_mode(src: Path, target_ext: str) -> bytes |
         if data is not None:
             return data
         if not fallback_worthy:
-            return None            # 真の失敗（500 等）はそのまま伝播・upload へ縮退しない
+            return None  # 真の失敗（500 等）はそのまま伝播・upload へ縮退しない
         data = _convert_office_com_upload(src, target_ext)
         if data is not None:
-            # path 試行で残った失敗理由（timeout 等）は upload 縮退が成功したなら
-            # 消す——最終的に変換できているのに前段の失敗理由が誤って報告されないようにする。
+            # path 試行で残った失敗理由（timeout 等）は、upload 縮退が成功したなら消す（変換できているのに前段の失敗理由を報告しない）。
             take_conversion_failure_reason()
         return data
-    return _convert_office_com(src, target_ext)          # "path"（既定）
+    return _convert_office_com(src, target_ext)  # "path"（既定）
 
 
-# ---- office_com（direct: WSL interop で ps1 を one-shot・W2'）----
+# office_com（direct: WSL interop で ps1 を one-shot）
 
 # render_pdf が受け付ける Office 原本の拡張子（旧/新両方・ps1 の $script:RenderExtMap と対応）。
 _RENDER_EXTS: frozenset[str] = frozenset(
     {".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"})
 
-# Microsoft Excel Range.Text / DisplayFormat.NumberFormat 抽出対象。変換backendの選択とは独立した
-# optional補完で、旧XLSも原本のままExcelへ渡す。
+# Microsoft Excel Range.Text / DisplayFormat.NumberFormat 抽出の対象。変換 backend の選択とは独立した補完で、旧 XLS も原本のまま Excel へ渡す。
 _EXCEL_DISPLAY_EXTS: frozenset[str] = frozenset({".xls", ".xlsx"})
 _EXCEL_CELL_REF_RE = re.compile(r"^[A-Z]{1,3}[1-9][0-9]{0,6}$")
 _MAX_EXCEL_DISPLAY_CELLS = 50_000
@@ -742,11 +636,9 @@ _EXCEL_DISPLAY_SCHEMA = "sherpa-excel-display-v1"
 
 
 def _run_direct_process(cmd: list[str], src: Path, timeout: float) -> bool:
-    """direct モードの ps1（-DirectJob）を実行し成否を返す。非0終了/タイムアウト/起動失敗は False（fail-safe）。
+    """direct モードの ps1（-DirectJob）を実行し成否を返す。非0終了/タイムアウト/起動失敗は False。
 
-    ps1 内部（-JobTimeoutSec）が先に発火して Office 残骸を Windows 側で掃除するため、ここ（WSL）の `timeout` は
-    「内部タイムアウト＋余裕」の backstop。異常時（interop の wedge 等）に `start_new_session=True` の
-    プロセスグループを丸ごと SIGKILL する（`_kill_process_group` 流用・soffice と同じ手法）。
+    ps1 内部（-JobTimeoutSec）が先に発火して Office 残骸を Windows 側で掃除するので、ここ（WSL）の `timeout` は「内部タイムアウト＋余裕」の backstop。異常時（interop の wedge 等）は `start_new_session=True` のプロセスグループを丸ごと SIGKILL する（`_kill_process_group` と同じ手法）。
     """
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -778,20 +670,9 @@ def _run_direct_job(
     """direct モードで ps1 を `-DirectJob` one-shot 実行し、結果バイト列を返す（変換/レンダ共通）。到達不可/失敗は None。
 
     - `job`＝"convert"（旧→新 OOXML）｜"render"（PDF）。`out_ext`＝出力拡張子（.docx/.xlsx/.pptx/.pdf）。
-    - 入出力は env でなく **ps1 引数**で渡す（WSL→Windows interop の env 透過に依存しない）。入力/スクリプト/出力
-      パスは `wsl_to_windows_path` で Windows 形式へ変換する（出力は WSL の一時ファイルを `\\\\wsl.localhost` の
-      UNC で渡し、ps1 が WriteAllBytes で書き、こちらが読み返す＝Office は常に Windows ローカルに書く）。
-    - 直列実行（`_convert_lock`）・backstop タイムアウト（**ps1 へ渡した整数秒** ＋ `_DIRECT_GRACE_SEC`）。
-
-    `-JobTimeoutSec` は ps1 側で `$tsec -le 0` のとき既定120秒へフォールバックする
-    （`Invoke-DirectJob`）。`SHERPA_LEGACY_TIMEOUT` に1秒未満の値（例 0.3）を設定していると、素朴に
-    `str(int(inner))` すると "0" になりこのフォールバックを誤って踏む＝ps1 内部は120秒待つのに、WSL 側の
-    backstop は元の小さい値（0.3+grace）で先に外側 powershell.exe を kill してしまい、ps1 内部の
-    `Stop-CandidateProcesses`（この変換が作った Office だけを識別して停止する処理）が一度も走らないまま
-    Office プロセスが孤児化しうる。**0 を作らない最低1秒への切り上げ**（`_timeout_sec()` 自体は他経路
-    （soffice のタイムアウト検証・http モードの urllib timeout）でも使われており、小さい閾値でのタイムアウト
-    挙動を検証する既存テストがあるため、そちらは変更せず direct 専用にここで丸める）。backstop の起点も
-    **実際に ps1 へ渡した整数秒**（丸め後の値）に揃える＝渡した値と backstop の間に矛盾が生まれない。
+    - 入出力は env でなく ps1 引数で渡す。入力/スクリプト/出力パスは `wsl_to_windows_path` で Windows 形式へ変換する（出力は WSL の一時ファイルを `\\\\wsl.localhost` の UNC で渡し、ps1 が書いてこちらが読み返す）。
+    - 直列実行（`_convert_lock`）・backstop タイムアウト（ps1 へ渡した整数秒 ＋ `_DIRECT_GRACE_SEC`）。
+    `-JobTimeoutSec` は ps1 側で `$tsec -le 0` のとき既定120秒へフォールバックするため、`SHERPA_LEGACY_TIMEOUT` が1秒未満でも 0 を渡さないよう、direct 専用に最低1秒へ切り上げる（0 を渡すと ps1 内部は120秒待つのに WSL 側 backstop が先に kill し、Office プロセスが孤児化しうる）。backstop の起点も、実際に渡した整数秒に揃える。
     """
     ps_bin = _powershell_bin()
     if not ps_bin:
@@ -814,7 +695,7 @@ def _run_direct_job(
         if win_out is None or win_err is None:
             _log.warning("office_com(direct): 一時出力を Windows パスに変換できません（WSL_DISTRO_NAME 未設定?）")
             return None
-        inner_arg = max(1, math.ceil(_timeout_sec()))    # 0 を作らない（ps1 の 120s フォールバック誤爆を防ぐ）
+        inner_arg = max(1, math.ceil(_timeout_sec()))  # 0 を作らない（ps1 の 120s フォールバック誤爆を防ぐ）
         cmd = [ps_bin, "-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass",
                "-File", ps1_win, "-DirectJob",
                "-InPath", win_in, "-OutPath", win_out, "-ErrPath", win_err,
@@ -848,17 +729,14 @@ def _run_direct_job(
 
 
 def _convert_office_com_direct(src: Path, target_ext: str) -> bytes | None:
-    """旧形式 `src` を direct モード（WSL interop の ps1 one-shot）で新形式へ変換したバイト列。失敗は None（fail-safe）。"""
+    """旧形式 `src` を direct モード（WSL interop の ps1 one-shot）で新形式へ変換したバイト列。失敗は None。"""
     return _run_direct_job(Path(src), "convert", target_ext, target_ext)
 
 
-# ---- 忠実 PDF レンダ（Office外観確認や将来の視覚処理に利用可能・W2'）----
+# 忠実 PDF レンダ
 
 def _render_office_com_http_ex(src: Path) -> tuple[bytes | None, bool]:
-    """`_render_office_com_http` の内部実装。戻り値 `(data, fallback_worthy)`（`_convert_office_com_ex` の
-    render 対称・Med-2）。判別条件は `_convert_office_com_ex` と同じ（(i) パス変換不能／(ii) ネットワーク
-    到達不能／(iii) worker の 404「file not found」のみ fallback 対象・500 等は fallback しない）。
-    """
+    """`_render_office_com_http` の内部実装。戻り値 `(data, fallback_worthy)`。判別条件は `_convert_office_com_ex` と同じ（パス変換不能／ネットワーク到達不能／worker の 404 のみ fallback 対象）。"""
     url = _office_com_url()
     if not url:
         return None, False
@@ -890,11 +768,7 @@ def _render_office_com_http_ex(src: Path) -> tuple[bytes | None, bool]:
 
 
 def _render_office_com_http(src: Path) -> bytes | None:
-    """http モードのワーカー `POST /render` で Office 原本を PDF（as-displayed）へレンダしたバイト列。失敗は None。
-
-    "path" 単独呼び出しでは fallback という概念が無いため `_render_office_com_http_ex` の `fallback_worthy`
-    信号は無視して data だけ返す。
-    """
+    """http モードのワーカー `POST /render` で Office 原本を PDF（as-displayed）へレンダしたバイト列。失敗は None。`fallback_worthy` は無視して data だけ返す。"""
     return _render_office_com_http_ex(src)[0]
 
 
@@ -915,7 +789,7 @@ def _render_office_com_upload(src: Path) -> bytes | None:
 
 
 def _render_office_com_via_transfer_mode(src: Path) -> bytes | None:
-    """render 版の transfer_mode 解決（`_convert_office_com_via_transfer_mode` と対称・Med-2）。"""
+    """render 版の transfer_mode 解決（`_convert_office_com_via_transfer_mode` と対称）。"""
     mode = transfer_mode_name()
     if mode == "upload":
         return _render_office_com_upload(src)
@@ -924,18 +798,15 @@ def _render_office_com_via_transfer_mode(src: Path) -> bytes | None:
         if data is not None:
             return data
         if not fallback_worthy:
-            return None            # 真の失敗（500 等）はそのまま伝播・upload へ縮退しない
+            return None  # 真の失敗（500 等）はそのまま伝播・upload へ縮退しない
         return _render_office_com_upload(src)
-    return _render_office_com_http(src)                  # "path"（既定）
+    return _render_office_com_http(src)  # "path"（既定）
 
 
 def render_pdf(src) -> bytes | None:
     """Office 原本（.doc/.docx/.xls/.xlsx/.ppt/.pptx）を PDF（見た目どおりの忠実レンダ）へ変換したバイト列。到達不可/失敗は None。
 
-    Office外観確認や将来の視覚処理で使うレンダリング経路。office_com の動作形態に応じて direct（ps1
-    `-RenderPdf` one-shot・既定）／http（ワーカー・`transfer_mode` で path/upload/auto を使い分け・
-    OFFICE-WIN-001）を使い分ける。legacy_backend の選択とは独立（PDF レンダは旧形式変換バックエンドの設定に
-    関わらず office_com 到達性だけで決まる）。対象外拡張子は None。
+    office_com の動作形態に応じて direct（ps1 `-RenderPdf` one-shot・既定）／http（ワーカー・`transfer_mode` で path/upload/auto）を使い分ける。legacy_backend の選択とは独立（office_com の到達性だけで決まる）。対象外拡張子は None。
     """
     src = Path(src)
     if src.suffix.lower() not in _RENDER_EXTS:
@@ -948,22 +819,16 @@ def render_pdf(src) -> bytes | None:
     return None
 
 
-# ---- office_com（http: PowerPoint 補助構造抽出・upload 限定・OFFICE-WIN-001 ⑤・試作・未配線）----
+# office_com（http: PowerPoint 補助構造抽出・upload 限定・試作・未配線）
 
 # `deploy/office-com-worker.ps1` の `$script:ExtractStructureExtMap` と対応（PowerPoint 限定）。
 _EXTRACT_STRUCTURE_EXTS: frozenset[str] = frozenset({".ppt", ".pptx"})
 
 
 def extract_structure_office_com_upload(src) -> dict | None:
-    """PowerPoint（.ppt/.pptx）をファイル本体ごと multipart 送信し、Windows 側ワーカーの
-    `/extract-structure-upload`（OFFICE-WIN-001 ⑤・PowerPoint COM による補助構造抽出の試作）から
-    JSON（スライド番号・タイトル・本文テキスト・発表者ノート・非表示フラグ・図形一覧）を取得する。
+    """PowerPoint（.ppt/.pptx）をファイル本体ごと multipart 送信し、Windows 側ワーカーの `/extract-structure-upload`（PowerPoint COM による補助構造抽出の試作）から JSON（スライド番号・タイトル・本文テキスト・発表者ノート・非表示フラグ・図形一覧）を取得する。
 
-    `_render_office_com_upload` と同型（http モード・upload 転送限定・原本 sha256 を `source_hash` として
-    添付・直列実行は同じ `_convert_lock`）。**試作段階**＝取り込みパイプライン（office_md.py 等）へは
-    未配線（呼び出し側の配線は将来スライス・`probe_office_com` と同じくここでは関数のみ提供する）。
-    direct モード（同一マシン・WSL interop）には未対応（http 限定・upload 系はすべて同じ制約）。
-    対象外拡張子・URL 未設定・到達不可・失敗・応答 JSON 不正はすべて None（fail-safe）。
+    `_render_office_com_upload` と同型（http モード・upload 転送限定・原本 sha256 を `source_hash` として添付・直列実行は同じ `_convert_lock`）。取り込みパイプラインへは未配線で、direct モードには未対応。対象外拡張子・URL 未設定・到達不可・失敗・応答 JSON 不正はすべて None。
     """
     src = Path(src)
     if src.suffix.lower() not in _EXTRACT_STRUCTURE_EXTS:
@@ -990,10 +855,10 @@ def extract_structure_office_com_upload(src) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-# ---- office_com: Microsoft Excel 表示値補完（XLS/XLSX・upload/direct）----
+# office_com: Microsoft Excel 表示値補完（XLS/XLSX・upload/direct）
 
 def _excel_display_options(targets: dict[str, set[str]]) -> dict | None:
-    """sheet/cell集合をworkerへ渡す決定的契約へ正規化する。不正座標や上限超過はfail-safeでNone。"""
+    """sheet/cell 集合を worker へ渡す決定的契約へ正規化する。不正座標や上限超過は None。"""
     cells: list[dict[str, str]] = []
     for sheet in sorted(targets):
         if not isinstance(sheet, str) or not sheet or len(sheet) > 31:
@@ -1031,7 +896,7 @@ def _validated_excel_display_response(
     source_hash: str,
     requested: set[tuple[str, str]],
 ) -> dict | None:
-    """worker応答をsource hash・target集合・安全profileまで検証し、不完全な契約をEvidenceへ混ぜない。"""
+    """worker 応答を source hash・target 集合・安全 profile まで検証し、不完全な契約を Evidence へ混ぜない。"""
     if raw is None:
         return None
     try:
@@ -1141,10 +1006,9 @@ def _extract_excel_display_upload(src: Path, options: dict, source_hash: str) ->
 
 
 def extract_excel_display(src, targets: dict[str, set[str]]) -> dict | None:
-    """XLS/XLSXの対象セルについてMicrosoft Excel ``Range.Text`` と実効書式を得る。
+    """XLS/XLSX の対象セルについて Microsoft Excel `Range.Text` と実効書式を得る。
 
-    HTTPモードは原本bytesをuploadし、directモードは同じps1をone-shot起動する。worker不在・失敗・
-    応答改ざん/欠落はすべてNoneで、呼び出し側はLinux基本表示を維持する。
+    HTTP モードは原本 bytes を upload し、direct モードは同じ ps1 を one-shot 起動する。worker 不在・失敗・応答改ざん/欠落はすべて None で、呼び出し側は Linux 基本表示を維持する。
     """
     source = Path(src)
     if source.suffix.lower() not in _EXCEL_DISPLAY_EXTS or not source.is_file():
@@ -1170,20 +1034,13 @@ def extract_excel_display(src, targets: dict[str, set[str]]) -> dict | None:
     return response
 
 
-# ---- 変換可否・構成署名 ----
+# 変換可否・構成署名
 
 def legacy_exts() -> set[str]:
     """今この環境で旧→新変換できる拡張子集合（.doc/.xls/.ppt）。バックエンド none／バックエンド不達は空集合。
 
-    office_com token 漏洩対策: env `SHERPA_LEGACY_EXTS` が設定されていれば**最優先で
-    それを信じ、以降のロジック（soffice 検出／office_com healthz 到達）は一切実行しない**。これは MCP サブ
-    プロセス（`agents._mcp_env`）が親プロセスの実効値スナップショットをこの env に積んで渡すための入口で、
-    MCP は office_com の URL/TOKEN を持たない（Codex sandbox 無効時の fallback 実行環境にシークレットを
-    露出させないため渡さない設計＝W1）。カンマ区切り（例 ".doc,.xls,.ppt"）・空文字列は「対象なし」。
-    通常の API プロセス（MCP サブプロセスでない）ではこの env は設定されないため、下の通常ロジックのまま。
-
-    ⚠ MD 化は①OOXML アーム経由なので、呼び出し側（`office_md.convertible_exts`）は **ooxml アーム有効時のみ**
-    この集合を採用する（ここではアーム有効性は見ない＝バックエンド到達性のみ判定する）。
+    env `SHERPA_LEGACY_EXTS` が設定されていれば最優先でそれを信じ、soffice 検出／office_com healthz は一切実行しない。MCP サブプロセス（`agents._mcp_env`）が親の実効値スナップショットをこの env に積んで渡す入口で、MCP には office_com の URL/TOKEN を渡さない（シークレットを露出させない）。カンマ区切り（例 ".doc,.xls,.ppt"）・空文字列は「対象なし」。
+    呼び出し側（`office_md.convertible_exts`）は ooxml アーム有効時のみこの集合を採用する（ここではバックエンド到達性のみ判定する）。
     """
     if "SHERPA_LEGACY_EXTS" in os.environ:
         raw = os.environ["SHERPA_LEGACY_EXTS"]
@@ -1194,18 +1051,14 @@ def legacy_exts() -> set[str]:
     if backend == "libreoffice" and not soffice_available():
         return set()
     if backend == "office_com":
-        return office_com_available_exts()          # アプリ単位でゲート（healthz probe はここでのみ実行）
+        return office_com_available_exts()  # アプリ単位でゲート（healthz probe はここでのみ実行）
     return set(LEGACY_EXT_MAP)
 
 
 def legacy_sig_value() -> str:
-    """アーム構成署名（`office_md._arms_sig`）に載せる**実効**バックエンド値。変換が実際に可能な時だけ backend 名。
+    """アーム構成署名（`office_md._arms_sig`）に載せる実効バックエンド値。変換が実際に可能な時だけ backend 名。
 
-    バックエンドを選んでも変換手段が無ければ "none"（libreoffice なら soffice 未検出・office_com ならワーカー
-    不達／対応アプリ無し）＝変換不可・現状どおり。soffice/ワーカーの後付け導入やバックエンド切替、**office_com の
-    利用可能アプリ集合の変化**（例 Word だけ→Word+Excel）で署名が変わり drift 再ビルドが誘発される（arms/pdf と
-    同じ扱い）。soffice/Office の**バージョン**は署名に含めない（版更新での不要な全リビルドを避ける・provenance
-    には残す）。office_com は `"office_com:<ソート済みアプリ名カンマ区切り>"`（例 `office_com:excel,word`）。
+    バックエンドを選んでも変換手段が無ければ "none"（soffice 未検出・ワーカー不達・対応アプリ無し）。soffice/ワーカーの後付け導入、バックエンド切替、office_com の利用可能アプリ集合の変化で署名が変わる。soffice/Office のバージョンは署名に含めない（provenance には残す）。office_com は `"office_com:<ソート済みアプリ名カンマ区切り>"`（例 `office_com:excel,word`）。
     """
     backend = legacy_backend_name()
     if backend == "libreoffice" and soffice_available():
@@ -1218,15 +1071,12 @@ def legacy_sig_value() -> str:
     return "none"
 
 
-# ---- 変換本体 ----
+# 変換本体
 
 def convert_to_ooxml(src: Path, target_ext: str) -> bytes | None:
     """旧形式 `src` を新形式（`target_ext`＝.docx/.xlsx/.pptx）へ変換したバイト列。変換不可/失敗は None。
 
-    バックエンド＝libreoffice（WSL 内 soffice）｜office_com（direct＝WSL interop の ps1 one-shot・既定／
-    http＝Windows 側ワーカーへ HTTP・`transfer_mode` で path/upload/auto を使い分け・OFFICE-WIN-001）。
-    office_com のモードは `office_com_mode()`（URL 設定時 http・未設定かつ powershell 検出時 direct・
-    どちらも無ければ unavailable＝None）。例外は握って None（fail-safe）。
+    バックエンド＝libreoffice（WSL 内 soffice）｜office_com（direct＝ps1 one-shot・既定／http＝Windows 側ワーカー・`transfer_mode` で path/upload/auto）。office_com のモードは `office_com_mode()`（unavailable なら None）。例外は握って None。
     """
     backend = legacy_backend_name()
     if backend == "libreoffice":
@@ -1237,16 +1087,14 @@ def convert_to_ooxml(src: Path, target_ext: str) -> bytes | None:
             return _convert_office_com_via_transfer_mode(Path(src), target_ext)
         if mode == "direct":
             return _convert_office_com_direct(Path(src), target_ext)
-        return None                   # unavailable（URL 未設定かつ powershell 未検出）
-    return None                       # none は変換しない
+        return None  # unavailable（URL 未設定かつ powershell 未検出）
+    return None  # none は変換しない
 
 
 def _build_convert_cmd(bin_path: str, fmt: str, outdir, profile, src: Path) -> list[str]:
-    """soffice の変換コマンド列を組み立てる（実行しない・単体でテスト可能に切り出し）。
+    """soffice の変換コマンド列を組み立てる（実行しない）。
 
-    soffice は `-env:UserInstallation` を URL としてパースするため、パスを
-    そのまま `file://` に埋め込むと空白等を含む場合に誤解釈されうる。`Path.as_uri()` で正規に
-    percent-encode する（`tempfile.mkdtemp` は常に絶対パスを返すので `as_uri()` の前提を満たす）。
+    soffice は `-env:UserInstallation` を URL としてパースするため、パスは `Path.as_uri()` で percent-encode して渡す（空白等を含む場合の誤解釈を防ぐ）。
     """
     return [bin_path, "--headless", "--convert-to", fmt, "--outdir", str(outdir),
             f"-env:UserInstallation={Path(profile).as_uri()}", str(Path(src).resolve())]
@@ -1256,12 +1104,12 @@ def _convert_libreoffice(src: Path, target_ext: str) -> bytes | None:
     bin_path = _soffice_bin()
     if not bin_path:
         return None
-    fmt = target_ext.lstrip(".")      # "docx"/"xlsx"/"pptx"
-    profile = tempfile.mkdtemp(prefix="sherpa-lo-profile-")   # プロファイル分離（一時 dir・毎回破棄）
+    fmt = target_ext.lstrip(".")  # "docx"/"xlsx"/"pptx"
+    profile = tempfile.mkdtemp(prefix="sherpa-lo-profile-")  # プロファイル分離（一時 dir・毎回破棄）
     outdir = tempfile.mkdtemp(prefix="sherpa-lo-out-")
     try:
         cmd = _build_convert_cmd(bin_path, fmt, outdir, profile, src)
-        with _convert_lock:           # 直列実行（LibreOffice の並列不安定を避ける）
+        with _convert_lock:  # 直列実行（LibreOffice の並列不安定を避ける）
             if not _run_soffice(cmd, src):
                 return None
         # soffice は <outdir>/<stem>.<fmt> に出力する。名前ゆらぎに備え target_ext のファイルも拾う。
@@ -1280,9 +1128,7 @@ def _convert_libreoffice(src: Path, target_ext: str) -> bytes | None:
 def render_metafile_png(data: bytes, kind: str) -> tuple[bytes | None, str | None]:
     """WMF/EMF の bytes を LibreOffice で PNG に描画する（原本は触らず一時 dir のコピーだけを渡す）。
 
-    戻りは ``(png, None)`` か ``(None, 理由)``。理由は ``unavailable``（soffice 未検出）／``timeout``／
-    ``convert_failed``。直列実行・プロファイル分離・タイムアウト時のプロセスグループ停止は
-    ``_convert_libreoffice`` と同じ。
+    戻りは `(png, None)` か `(None, 理由)`。理由は `unavailable`（soffice 未検出）／`timeout`／`convert_failed`。直列実行・プロファイル分離・タイムアウト時のプロセスグループ停止は `_convert_libreoffice` と同じ。
     """
     if not soffice_available():
         return None, "unavailable"
@@ -1302,13 +1148,9 @@ def render_metafile_png(data: bytes, kind: str) -> tuple[bytes | None, str | Non
 
 
 def _run_soffice(cmd: list[str], src: Path) -> bool:
-    """soffice を実行し成功/失敗を返す。タイムアウト/非0終了/起動失敗はすべて False（fail-safe）。
+    """soffice を実行し成功/失敗を返す。タイムアウト/非0終了/起動失敗はすべて False。
 
-    `subprocess.run(timeout=)` は直接の子プロセスしか kill しない。soffice は
-    wrapper スクリプト→`soffice.bin` の多段起動のため、タイムアウト時に孫プロセスが生き残り、その後
-    `finally` で profile/outdir を rmtree すると、残った soffice が消えたディレクトリを掴んだまま
-    残骸プロセスになる。`start_new_session=True`（独立プロセスグループ）＋タイムアウト時
-    `os.killpg(...,SIGKILL)` でグループ全体を確実に停止する。
+    `subprocess.run(timeout=)` は直接の子しか kill せず、soffice は wrapper→`soffice.bin` の多段起動のため孫が残る。`start_new_session=True`（独立プロセスグループ）＋タイムアウト時 `os.killpg(...,SIGKILL)` でグループ全体を停止する。
     """
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1332,9 +1174,7 @@ def _run_soffice(cmd: list[str], src: Path) -> bool:
 def _kill_process_group(proc: subprocess.Popen) -> None:
     """タイムアウトした soffice のプロセスグループを丸ごと停止する（wrapper→soffice.bin の子孫を含む）。
 
-    `start_new_session=True` で作った独立グループを `os.killpg` で一括 SIGKILL する。既に終了済み
-    （`ProcessLookupError`）は握る（fail-safe）。kill 後にパイプを読み切ってから wait（zombie 化防止・
-    子孫が pipe fd を握っていても、グループ全体が死ぬことで fd が閉じ communicate は速やかに戻る）。
+    `os.killpg` で一括 SIGKILL し、既に終了済み（`ProcessLookupError`）は握る。kill 後にパイプを読み切ってから wait する（zombie 化防止）。
     """
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -1346,7 +1186,7 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         proc.wait()
 
 
-# ---- キャッシュ（原本 mtime/size キーで再変換を省く・derived/{world}/_legacy_cache）----
+# キャッシュ（原本 mtime/size キーで再変換を省く・derived/{world}/_legacy_cache）
 
 _CACHE_DIRNAME = "_legacy_cache"
 
@@ -1354,27 +1194,19 @@ _CACHE_DIRNAME = "_legacy_cache"
 def cache_root_for(derived_md_dir) -> Path:
     """派生MD dir（derived/{world}/md）と同階層の legacy 変換キャッシュ dir（derived/{world}/_legacy_cache）。
 
-    build_derived は md/ を全消去して作り直すが、キャッシュはその**兄弟**（semantic 等と同様）に置くため
-    再ビルドをまたいで残る（soffice 再実行を省く）。world 削除時は derived/{world} 木ごと消える＝鏡と整合。
+    `build_derived` は md/ を全消去して作り直すが、キャッシュはその兄弟に置くので再ビルドをまたいで残る。world 削除時は derived/{world} 木ごと消える。
     """
     parent = Path(derived_md_dir).parent
-    # generation layoutでは `derived/{world}/md-generations/<id-or-stage>` が派生MD dir。
-    # cacheをgenerationの外へ出し、公開切替・古いgeneration掃除をまたいで再利用する。
+    # generation layout では `derived/{world}/md-generations/<id-or-stage>` が派生MD dir。キャッシュは generation の外へ出し、公開切替・古い generation の掃除をまたいで再利用する。
     if parent.name == "md-generations":
         parent = parent.parent
     return parent / _CACHE_DIRNAME
 
 
 def _source_key(src: Path) -> str:
-    """キャッシュの変更検知キー（backend:mode:size:mtime_ns）。原本が変わるか**バックエンドを切り替えたら**再変換する
-    （backend を含めないと、W1 で office_com へ切替後も LibreOffice 産キャッシュがヒットし続け、provenance の
-    backend 名と実際の変換元が食い違う）。
+    """キャッシュの変更検知キー（backend:mode:size:mtime_ns）。
 
-    office_com（W2'）は backend 名が同じ "office_com" のままでも、動作形態
-    （`office_com_mode()`＝http／direct）が切り替わると実際の変換元（別ホストの Office／同一マシンの Office）が
-    変わり、provenance（`office_com_versions=...`）も変わりうる。backend 名だけをキーにすると http→direct
-    （またはその逆）の切替後も旧モード産キャッシュがヒットし続けてしまうため、backend が office_com のときだけ
-    実効モードもキーへ混ぜる（他バックエンドはモード概念が無いため空欄のまま）。
+    原本が変わるか、バックエンドを切り替えたら再変換する（backend を含めないと、切替後も旧バックエンド産のキャッシュがヒットし続け、provenance と実際の変換元が食い違う）。office_com は動作形態（`office_com_mode()`＝http／direct）でも変換元が変わるため、backend が office_com のときだけ実効モードもキーへ混ぜる。
     """
     st = src.stat()
     backend = legacy_backend_name()
@@ -1385,26 +1217,21 @@ def _source_key(src: Path) -> str:
 def ensure_ooxml(src, rel: str, cache_root):
     """旧形式 `src` の変換済み OOXML を用意し `(ooxml_path, notes)` を返す。変換不可/失敗は None。
 
-    キャッシュ（`cache_root/{rel}{target_ext}`）が原本の mtime/size と一致すれば再変換せず再利用し、
-    さもなくばバックエンドで変換して保存する。`notes` は provenance（meta.json）へ足す来歴
-    （`legacy_backend=<name>`・soffice バージョン）。
-
-    冒頭で `take_conversion_failure_reason()` を読み捨てる（直前の無関係な呼び出しの残留理由を
-    混ぜない）——このあと実際に `convert_to_ooxml()` を呼んだ場合だけ、その呼び出し中の失敗理由が
-    改めてセットされる（呼ばない/キャッシュ命中で戻る経路は理由 None のまま）。
+    キャッシュ（`cache_root/{rel}{target_ext}`）が原本の mtime/size と一致すれば再利用し、さもなくばバックエンドで変換して保存する。`notes` は provenance（meta.json）へ足す来歴（`legacy_backend=<name>`・soffice バージョン）。
+    冒頭で `take_conversion_failure_reason()` を読み捨てる（直前の無関係な呼び出しの残留理由を混ぜない）。`convert_to_ooxml()` を呼んだ場合だけ、その失敗理由が改めてセットされる。
     """
     take_conversion_failure_reason()
     src = Path(src)
     target_ext = LEGACY_EXT_MAP.get(src.suffix.lower())
     if target_ext is None:
-        return None                   # W0 対象外の拡張子
+        return None  # 対象外の拡張子
     cache_path = Path(cache_root) / (rel + target_ext)
     key_path = Path(str(cache_path) + ".key")
     try:
         want = _source_key(src)
     except OSError:
         return None
-    # キャッシュヒット（原本 unchanged）＝再変換しない（soffice を再実行しない）。
+    # キャッシュヒット（原本 unchanged）＝再変換しない。
     if cache_path.is_file() and key_path.is_file():
         try:
             if key_path.read_text(encoding="utf-8").strip() == want:
@@ -1424,12 +1251,9 @@ def ensure_ooxml(src, rel: str, cache_root):
 
 
 def drop_cache_entry(cache_root, rel: str) -> bool:
-    """`rel` の旧→新変換キャッシュ（`ensure_ooxml` が書く OOXML/`.key`）を落とす（**明示的な再変換**用）。
+    """`rel` の旧→新変換キャッシュ（`ensure_ooxml` が書く OOXML/`.key`）を落とす（明示的な再変換用）。
 
-    次回の `ensure_ooxml` 呼び出しで原本 mtime/size が不変でもキャッシュヒットさせず、必ず
-    `convert_to_ooxml` を再実行させる（安定して壊れた OOXML キャッシュ——原本自体は変わっていない
-    のに一度キャッシュした変換結果が壊れている場合——を再利用し続けない）。対象拡張子
-    （`LEGACY_EXT_MAP`）でなければ no-op（False）。キャッシュが元々無い場合も成功扱い（True）。
+    次回の `ensure_ooxml` で、原本 mtime/size が不変でもキャッシュヒットさせず `convert_to_ooxml` を再実行させる（壊れた変換結果を再利用し続けない）。対象拡張子（`LEGACY_EXT_MAP`）でなければ no-op（False）。キャッシュが元々無い場合も成功扱い（True）。
     """
     target_ext = LEGACY_EXT_MAP.get(Path(rel).suffix.lower())
     if target_ext is None:
@@ -1445,12 +1269,7 @@ def drop_cache_entry(cache_root, rel: str) -> bool:
 
 
 def _notes() -> list[str]:
-    """provenance（meta.json）へ足す来歴。backend 名＋変換元エンジンのバージョン要約。
-
-    libreoffice なら `soffice=<version>`、office_com なら healthz の各 Office バージョン要約
-    （`office_com_versions=word=16.0,excel=16.0`）を残す（同じ OOXML → 同じ MD なので決定性はキャッシュ後の
-    ①MD化で担保・バージョンは追跡目的のみ）。
-    """
+    """provenance（meta.json）へ足す来歴。backend 名＋変換元エンジンのバージョン要約。libreoffice なら `soffice=<version>`、office_com なら healthz の各 Office バージョン要約（`office_com_versions=word=16.0,excel=16.0`）。"""
     backend = legacy_backend_name()
     notes = [f"legacy_backend={backend}"]
     if backend == "libreoffice":

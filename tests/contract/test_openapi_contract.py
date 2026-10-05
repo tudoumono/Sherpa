@@ -1,7 +1,6 @@
 """OpenAPI 契約の固定（フェーズ7-1・docs/proposals/2026-07-02-リファクタリング計画.md フェーズ7 作業項目1）。
 
-`sherpa.api.app.openapi()`（`GET /openapi.json` と同じ生成物）を golden 化する。`tests/api/test_route_snapshot.py`
-（ルート表の定義順固定）と同じ思想で、こちらは**各ルートの入出力スキーマ**（response_model 付与状況・
+`sherpa.api.app.openapi()`（`GET /openapi.json` と同じ生成物）を golden 化する。**各ルートの入出力スキーマ**（response_model 付与状況・
 リクエストボディの型・必須/任意）まで含めて固定する。response_model 付与（フェーズ7-1）や
 リクエスト/応答モデルの変更が golden 差分として必ず可視化される。
 

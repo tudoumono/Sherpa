@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from sherpa import agentic_search as A
+from sherpa import tool_dispatch
 from sherpa import corpus_docs, worlds
 from sherpa.ingest.failure_reasons import REASON_CATALOG
 
@@ -58,7 +58,7 @@ def test_euc_jp_registered_extension_is_unreadable_with_encoding_undetermined_re
 
     # read_around の到達可否も同じ判定（`classify_document(..., text_quality=...)`）を
     # 共有する（§7 裁定10）——`_safe_doc_path` が `corpus_docs._text_quality_for` を渡す。
-    res = A.run_tool("read_around", {"doc_id": "guide.txt", "line": 1, "window": 1}, "w", None)[0]
+    res = tool_dispatch.run_tool("read_around", {"doc_id": "guide.txt", "line": 1, "window": 1}, "w", None)[0]
     assert "error" in res
 
 
@@ -96,7 +96,7 @@ def test_cp932_file_with_a_few_invalid_bytes_stays_ready_with_partial_caution(mo
     assert rep["unreachable_as_text"] == 0
     assert rep["unreachable_by_reason"] == {}
 
-    res = A.run_tool("read_doc", {"doc_id": "note.txt", "start_line": 1}, "w", None)[0]
+    res = tool_dispatch.run_tool("read_doc", {"doc_id": "note.txt", "start_line": 1}, "w", None)[0]
     assert "error" not in res
     assert res["encoding_caution"] == corpus_docs._ENCODING_CAUTION["partial"]
 
@@ -148,9 +148,9 @@ def test_plain_utf8_file_has_no_encoding_marks(monkeypatch, tmp_path):
     assert rep["unreachable_by_reason"] == {}
     assert rep["encoding_partial_count"] == 0
 
-    res_doc = A.run_tool("read_doc", {"doc_id": "app.py", "start_line": 1}, "w", None)[0]
+    res_doc = tool_dispatch.run_tool("read_doc", {"doc_id": "app.py", "start_line": 1}, "w", None)[0]
     assert "encoding_caution" not in res_doc
-    res_around = A.run_tool("read_around", {"doc_id": "app.py", "line": 1, "window": 1}, "w", None)[0]
+    res_around = tool_dispatch.run_tool("read_around", {"doc_id": "app.py", "line": 1, "window": 1}, "w", None)[0]
     assert "encoding_caution" not in res_around
 
     from sherpa import grep_tool, store
@@ -183,7 +183,7 @@ def test_ripgrep_search_attaches_encoding_caution_for_partial_cp932_hit(monkeypa
     assert hits and hits[0]["doc_id"] == "memo.txt"
     assert hits[0]["encoding_caution"] == corpus_docs._ENCODING_CAUTION["partial"]
 
-    res = A.run_tool("ripgrep_search", {"query": "TARGETWORD"}, "w", None)[0]
+    res = tool_dispatch.run_tool("ripgrep_search", {"query": "TARGETWORD"}, "w", None)[0]
     assert res["hits"] and res["hits"][0]["doc_id"] == "memo.txt"
     assert res["hits"][0]["encoding_caution"] == corpus_docs._ENCODING_CAUTION["partial"]
 
@@ -196,7 +196,7 @@ def test_file_head_attaches_encoding_caution_for_partial_cp932_file(monkeypatch,
     raw[10], raw[11] = 0x81, 0xFF
     (wd / "note.txt").write_bytes(bytes(raw))
 
-    res = A.run_tool("file_head", {"doc_id": "note.txt"}, "w", None)[0]
+    res = tool_dispatch.run_tool("file_head", {"doc_id": "note.txt"}, "w", None)[0]
     assert "error" not in res
     assert res["encoding_caution"] == corpus_docs._ENCODING_CAUTION["partial"]
 

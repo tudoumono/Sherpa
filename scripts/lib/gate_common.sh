@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gate-lane.sh / gate-integration.sh / gate-quiet.sh 共通ヘルパ（TEST-3・レーン別 world 分離）。
+# gate-lane.sh / gate-integration.sh 共通ヘルパ（TEST-3・レーン別 world 分離）。
 # source 専用。
 #
 # 使い方（source）:
@@ -8,7 +8,7 @@
 #   PY="$(gate_resolve_venv_python "$WORKTREE")"
 #   LANE_DSN="$(gate_compute_lane_dsn "$PY" "$WORKTREE" "sherpa_test_$LANE")"
 #   gate_acquire_named_lock "/tmp/sherpa-gate-$LANE.lock" || exit 1   # 同名 cross-entry 排他
-#   gate_acquire_lane_slot                                            # 上限2・空くまで待つ
+#   gate_acquire_lane_slot || exit 1                                  # 上限2・空くまで待つ
 #   GATE_HELD_FDS=("$GATE_NAMED_LOCK_FD" "$GATE_SLOT_FD")
 #   GATE_LOG_FILE="$log"
 #   run(){ gate_run_group "$@"; }
@@ -32,18 +32,69 @@ GATE_INTEGRATION_LOCKFILE="/tmp/sherpa-gate-integration.lock"
 GATE_ADMISSION_LOCKFILE="/tmp/sherpa-gate-admission.lock"
 GATE_LANE_POLL_SECONDS=5   # 固定値（環境変数による上書きなし・全スロット使用中の再試行間隔）
 
+# flock・setsid・timeout（GNU）が無い環境（macOS の標準構成）では scripts/lib/portable_tools.py が
+# 同じ契約の代わりを務める（ロック＝保持プロセス・グループ起動と時間制限＝run-group）。
+# bash 3.2 でも動くよう fd は固定番号で扱う（ロック名ごとに 200 番台を呼び出し側が割り当てる）。
+GATE_PORTABLE_TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/portable_tools.py"
+GATE_NAMED_LOCK_FD_NUM=200   # gate_acquire_named_lock
+GATE_SLOT_FD_NUM=202         # gate_acquire_lane_slot（スロット）
+GATE_ADMISSION_FD_NUM=203    # gate_acquire_lane_slot（admission）
+GATE_LOCK_FD=""
+GATE_LOCK_PID=""
+
+_gate_python() {
+  if [ -n "${PY:-}" ] && [ -x "$PY" ]; then echo "$PY"
+  elif command -v python3 >/dev/null 2>&1; then echo python3
+  else echo python; fi
+}
+
+# 1つのロックを確保する。$1=ロックファイル $2=wait|nowait $3=使う fd 番号。確保できたら 0 を返し、
+# 保持の手がかりを GATE_LOCK_FD（flock の fd）か GATE_LOCK_PID（保持プロセス）に残す。
+# プロセス終了で自動解放される（fd は終了で閉じ、保持プロセスは親 PID が消えると手放す）。
+_gate_lock_take() {
+  local lockfile="$1" mode="$2" fd="$3"
+  GATE_LOCK_FD=""
+  GATE_LOCK_PID=""
+  if command -v flock >/dev/null 2>&1; then
+    eval "exec ${fd}>\"\$lockfile\""
+    if [ "$mode" = wait ]; then
+      flock "$fd" || { eval "exec ${fd}>&-"; return 1; }
+    else
+      flock -n "$fd" || { eval "exec ${fd}>&-"; return 1; }
+    fi
+    GATE_LOCK_FD=$fd
+    return 0
+  fi
+  local status pid line
+  status="$(mktemp "${TMPDIR:-/tmp}/sherpa.XXXXXX")"
+  "$(_gate_python)" "$GATE_PORTABLE_TOOLS" hold-lock "$lockfile" "$mode" "$$" > "$status" 2>/dev/null &
+  pid=$!
+  while true; do
+    line="$(head -n 1 "$status" 2>/dev/null)"
+    case "$line" in
+      LOCKED) rm -f "$status"; GATE_LOCK_PID=$pid; return 0 ;;
+      BUSY) rm -f "$status"; wait "$pid" 2>/dev/null; return 1 ;;
+    esac
+    if ! kill -0 "$pid" 2>/dev/null; then rm -f "$status"; return 1; fi
+    sleep 0.1
+  done
+}
+
+# _gate_lock_take で確保したロックを手放す（$1=fd 番号か空・$2=保持プロセスの PID か空）。
+_gate_lock_drop() {
+  if [ -n "${1:-}" ]; then eval "exec ${1}>&-"; fi
+  if [ -n "${2:-}" ]; then kill "$2" 2>/dev/null; wait "$2" 2>/dev/null; fi
+  return 0
+}
+
 # gate-lane.sh／gate-integration.sh 共通: 指定パスのロックをブロッキングで確保する（同名レーンの
 # cross-entry 排他に使う——`/tmp/sherpa-gate-<lane>.lock` を lane 経由・integration 経由の両方が
 # 取り合うことで、同じレーン名を2つの入口から同時に起動できないようにする）。確保できた fd を
-# GATE_NAMED_LOCK_FD に残す（プロセス終了で自動解放）。
+# GATE_NAMED_LOCK_FD に残す（プロセス終了で自動解放。保持プロセス方式のときは空）。
 gate_acquire_named_lock() {
-  local lockfile="$1"
-  local fd
-  exec {fd}>"$lockfile"
-  if ! flock "$fd"; then
-    return 1
-  fi
-  GATE_NAMED_LOCK_FD=$fd
+  GATE_NAMED_LOCK_FD=""
+  _gate_lock_take "$1" wait "$GATE_NAMED_LOCK_FD_NUM" || return 1
+  GATE_NAMED_LOCK_FD=$GATE_LOCK_FD
   return 0
 }
 
@@ -55,47 +106,31 @@ gate_acquire_named_lock() {
 # 確保できたスロット番号（1始まり）を GATE_SLOT_INDEX に、fd 番号を GATE_SLOT_FD に残す
 # （呼び出し元は GATE_HELD_FDS に積んで gate_run_group の子への非継承に使う）。
 gate_acquire_lane_slot() {
+  GATE_SLOT_FD=""
   while true; do
-    local admission_fd
-    exec {admission_fd}>"$GATE_ADMISSION_LOCKFILE"
-    flock "$admission_fd"
-    local i=1 slot fd
+    local adm_fd adm_pid
+    _gate_lock_take "$GATE_ADMISSION_LOCKFILE" wait "$GATE_ADMISSION_FD_NUM" || {
+      echo "スロット待ちの admission ロックを取得できません（${GATE_ADMISSION_LOCKFILE}）" >&2
+      return 1
+    }
+    adm_fd=$GATE_LOCK_FD
+    adm_pid=$GATE_LOCK_PID
+    local i=1 slot
     for slot in "${GATE_LANE_SLOT_LOCKS[@]}"; do
-      exec {fd}>"$slot"
-      if flock -n "$fd"; then
+      if _gate_lock_take "$slot" nowait "$GATE_SLOT_FD_NUM"; then
         GATE_SLOT_INDEX=$i
-        GATE_SLOT_FD=$fd
-        exec {admission_fd}>&-
+        GATE_SLOT_FD=$GATE_LOCK_FD
+        _gate_lock_drop "$adm_fd" "$adm_pid"
         return 0
       fi
-      exec {fd}>&-
       i=$((i + 1))
     done
-    exec {admission_fd}>&-
+    _gate_lock_drop "$adm_fd" "$adm_pid"
     sleep "$GATE_LANE_POLL_SECONDS"
   done
 }
 
-# gate-quiet.sh 専用: 全レーンスロット＋integration 専用ロックを非ブロッキングで全部確保する
-# （「他のゲートが1つも動いていない」の保証に必要な全ロック）。1つでも取れなければ、それまでに
-# 確保した分を解放して 1 を返す（部分確保のまま居座らない）。確保できた fd は GATE_QUIET_FDS に
-# 残る（プロセス終了で自動解放・明示 unlock は不要）。
-gate_acquire_all_or_none() {
-  GATE_QUIET_FDS=()
-  local lockfile fd f2
-  for lockfile in "${GATE_LANE_SLOT_LOCKS[@]}" "$GATE_INTEGRATION_LOCKFILE"; do
-    exec {fd}>"$lockfile"
-    if ! flock -n "$fd"; then
-      for f2 in "${GATE_QUIET_FDS[@]}"; do exec {f2}>&-; done
-      GATE_QUIET_FDS=()
-      return 1
-    fi
-    GATE_QUIET_FDS+=("$fd")
-  done
-  return 0
-}
-
-# gate-lane.sh／gate-integration.sh／gate-quiet.sh 共通: 1群を実行する。**呼び出し元はこの関数を
+# gate-lane.sh／gate-integration.sh 共通: 1群を実行する。**呼び出し元はこの関数を
 # パイプ（`| tee`）やサブシェル（`{ ... } &`）で包まず、launcher 本体のトップレベルから直接
 # 呼ばなければならない**——bash の `wait PID` は「呼び出し元シェルの直接の子」にしか使えず、
 # 間にもう1段シェル層（パイプはそれ自体が1段フォークする）を挟むと、gate_run_group が起動した
@@ -111,7 +146,7 @@ gate_acquire_all_or_none() {
 # 唯一のブロッキング点が素の `wait` 組み込み呼び出しになるため、trap は signal 到着後ただちに
 # 実行される（実測で確認済み）。
 #
-# テストプロセスは setsid で専用の新しいプロセスグループとして起動する（gate_handle_signal が
+# テストプロセスは setsid（無ければ portable_tools.py run-group）で専用の新しいプロセスグループとして起動する（gate_handle_signal が
 # このグループへ丸ごとシグナルを転送できるようにするため）。呼び出し元が保持しているロック fd
 # （GATE_HELD_FDS に fd 番号を積んでおく）は、子（テストプロセス）へ継承させない——fd を明示
 # close してから exec する（`flock -o` 相当）。
@@ -123,7 +158,7 @@ gate_acquire_all_or_none() {
 # 要約出力も無傷でログに残る。
 #
 # 使い方: 呼び出し元が PY・GROUP_TIMEOUT・GATE_LOG_FILE を変数で用意する。RC_FILE が設定されて
-# いれば終了コードを追記する（未設定でもよい＝gate-quiet.sh はこの追記を使わない）。
+# いれば終了コードを追記する（未設定でもよい）。
 #
 # GATE_EXTRACT_PATTERN はテスト子の生出力から残す行を選ぶ grep パターン（pytest の合否サマリ等）
 # ＋ gate_handle_signal が書く `SCRIPT_EXIT` マーカー行——両方を同じ語彙として扱う（ログを後から
@@ -138,14 +173,18 @@ GATE_LOG_FILE=""
 gate_run_group() {
   local name="$1"; shift
   echo "=== $name ($(date +%H:%M:%S))" | tee -a "${GATE_LOG_FILE:-/dev/null}"
-  local out; out=$(mktemp)
+  local out; out=$(mktemp "${TMPDIR:-/tmp}/sherpa.XXXXXX")
   GATE_RUN_OUT="$out"
   (
     local _held
-    for _held in "${GATE_HELD_FDS[@]}"; do
+    for _held in ${GATE_HELD_FDS[@]+"${GATE_HELD_FDS[@]}"}; do
       [ -n "$_held" ] && eval "exec ${_held}>&-"
     done
-    exec setsid timeout -s INT "$GROUP_TIMEOUT" "$PY" -m pytest "$@" -q -p no:cacheprovider -rf > "$out" 2>&1
+    if command -v setsid >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+      exec setsid timeout -s INT "$GROUP_TIMEOUT" "$PY" -m pytest "$@" -q -p no:cacheprovider -rf > "$out" 2>&1
+    fi
+    exec "$(_gate_python)" "$GATE_PORTABLE_TOOLS" run-group "$GROUP_TIMEOUT" \
+      "$PY" -m pytest "$@" -q -p no:cacheprovider -rf > "$out" 2>&1
   ) &
   GATE_RUN_PID=$!
   wait "$GATE_RUN_PID"
@@ -160,7 +199,7 @@ gate_run_group() {
   return "$rc"
 }
 
-# gate-lane.sh／gate-integration.sh／gate-quiet.sh 共通: INT/TERM を受けたら、今動いている
+# gate-lane.sh／gate-integration.sh 共通: INT/TERM を受けたら、今動いている
 # テストプロセスグループ（GATE_RUN_PID・gate_run_group が setsid で確保済み・launcher 本体の
 # 直接の子——上の gate_run_group の契約参照）へ同じシグナルを転送し、確実に `wait` してから
 # 要約（pytest 出力の末尾＋exit 理由＋SCRIPT_EXIT マーカー）を GATE_LOG_FILE へ書き、

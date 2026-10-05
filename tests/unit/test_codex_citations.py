@@ -8,12 +8,26 @@ import pytest
 
 from sherpa.providers.codex import citations as C
 
-# ===== parse_referenced_docs =====
+# ===== 「参照した資料:」ブロックの解析 =====
+
+
+def _parse_flat(answer: str):
+    """`parse_referenced_doc_lines` の結果を、本文と重複を除いた候補の平坦な列に畳む（検査しやすい形）。"""
+    body, line_groups = C.parse_referenced_doc_lines(answer)
+    refs: list[str] = []
+    seen: set[str] = set()
+    for groups in line_groups:
+        for group in groups:
+            for c in group:
+                if c not in seen:
+                    seen.add(c)
+                    refs.append(c)
+    return body, refs
 
 
 def test_parse_no_block_returns_answer_unchanged():
     answer = "消費税率は10%です。根拠は税計算仕様書に記載されています。"
-    body, refs = C.parse_referenced_docs(answer)
+    body, refs = _parse_flat(answer)
     assert body == answer
     assert refs == []
 
@@ -25,7 +39,7 @@ def test_parse_basic_bullet_block():
         "- 4期/02_設計/01_基本設計/税計算仕様書.md\n"
         "- 4期/01_標準/消費税法.md\n"
     )
-    body, refs = C.parse_referenced_docs(answer)
+    body, refs = _parse_flat(answer)
     assert body == "消費税率は10%です。"
     assert refs == [
         "4期/02_設計/01_基本設計/税計算仕様書.md",
@@ -42,7 +56,7 @@ def test_parse_basic_bullet_block():
 ])
 def test_parse_heading_variants(heading):
     answer = f"本文です。\n\n{heading}\n- 4期/01_標準/消費税法.md\n"
-    body, refs = C.parse_referenced_docs(answer)
+    body, refs = _parse_flat(answer)
     assert body == "本文です。"
     assert refs == ["4期/01_標準/消費税法.md"]
 
@@ -54,7 +68,7 @@ def test_parse_numbered_and_backtick_and_multi_split_and_paren_annotation():
         "1. `4期/02_設計/01_基本設計/税計算仕様書.md`（Sheet1!B3:D10）\n"
         "2. 4期/01_標準/消費税法.md、4期/01_標準/経理コーディング規約.md\n"
     )
-    body, refs = C.parse_referenced_docs(answer)
+    body, refs = _parse_flat(answer)
     assert body == "本文。"
     # 区切り文字を含む行は「行全体」も候補に残す（パス自体に区切り文字を含む場合の取りこぼし防止・
     # 実在確認で落ちる）。
@@ -74,7 +88,7 @@ def test_parse_dedupes_preserving_first_occurrence_order():
         "- 4期/02_設計/01_基本設計/税計算仕様書.md\n"
         "- 4期/01_標準/消費税法.md\n"
     )
-    _, refs = C.parse_referenced_docs(answer)
+    _, refs = _parse_flat(answer)
     assert refs == [
         "4期/01_標準/消費税法.md",
         "4期/02_設計/01_基本設計/税計算仕様書.md",
@@ -83,7 +97,7 @@ def test_parse_dedupes_preserving_first_occurrence_order():
 
 def test_parse_trims_trailing_blank_lines_before_block():
     answer = "本文です。\n\n\n\n参照した資料:\n- 4期/01_標準/消費税法.md\n"
-    body, _ = C.parse_referenced_docs(answer)
+    body, _ = _parse_flat(answer)
     assert body == "本文です。"
 
 
@@ -95,7 +109,7 @@ def test_parse_keeps_paragraph_after_blank_line():
         "\n"
         "この後の文は本文として残る。\n"
     )
-    body, refs = C.parse_referenced_docs(answer)
+    body, refs = _parse_flat(answer)
     assert refs == ["4期/01_標準/消費税法.md"]
     assert body == "本文。\n\nこの後の文は本文として残る。"   # ブロック後の本文は残す（落とさない）
 
@@ -107,7 +121,7 @@ def test_parse_last_heading_wins_when_multiple():
         "参照した資料:\n"
         "- 4期/01_標準/消費税法.md\n"
     )
-    body, refs = C.parse_referenced_docs(answer)
+    body, refs = _parse_flat(answer)
     assert refs == ["4期/01_標準/消費税法.md"]
     assert "実際の本文はここです。" in body
     assert "参照した資料:" not in body
@@ -241,42 +255,36 @@ def test_verified_includes_reachable_unregistered_ext_excludes_binary_and_sensit
 
 def test_parse_keeps_text_after_the_reference_block():
     """参照ブロックの後ろに本文（注意事項）が続くとき、それを落とさない。"""
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    body, refs = parse_referenced_docs("結論。\n\n参照した資料:\n- a/b.md\n\n本番への反映は承認後に実施する。")
+    body, refs = _parse_flat("結論。\n\n参照した資料:\n- a/b.md\n\n本番への反映は承認後に実施する。")
     assert refs == ["a/b.md"]
     assert body == "結論。\n\n本番への反映は承認後に実施する。"
 
 
 def test_parse_keeps_parentheses_inside_file_names():
     """ファイル名の括弧は削らない（削ると別文書に化ける）。空白の後ろの注記だけ落とす。"""
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    _, refs = parse_referenced_docs("x\n参照した資料:\n- 4期/消費税法（架空）.md\n- `a/b.xlsx` （Sheet1!B3）\n- c/d.xlsx （3 ページ）")
+    _, refs = _parse_flat("x\n参照した資料:\n- 4期/消費税法（架空）.md\n- `a/b.xlsx` （Sheet1!B3）\n- c/d.xlsx （3 ページ）")
     assert refs == ["4期/消費税法（架空）.md", "a/b.xlsx", "c/d.xlsx"]
 
 
 def test_parse_skips_blank_lines_right_after_heading():
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    body, refs = parse_referenced_docs("x\n参照した資料:\n\n- a/b.md\n- c/d.md")
+    body, refs = _parse_flat("x\n参照した資料:\n\n- a/b.md\n- c/d.md")
     assert refs == ["a/b.md", "c/d.md"] and body == "x"
 
 
 def test_parse_line_with_separators_keeps_whole_line_and_parts():
     """区切り文字を含む 1 行は、行全体と各片の両方を候補にする（実在確認で正しい方だけ残る）。"""
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    _, refs = parse_referenced_docs("x\n参照した資料: a/b.md, c/d.md")
+    _, refs = _parse_flat("x\n参照した資料: a/b.md, c/d.md")
     assert refs == ["a/b.md, c/d.md", "a/b.md", "c/d.md"]
 
 
 def test_parse_keeps_raw_names_that_formatting_would_alter():
     """整形（箇条書き除去・括弧除去・分割）で別名に化ける名前は整形前の候補も残る。"""
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    _, refs = parse_referenced_docs("x\n参照した資料:\n1.要件定義/a.md\n- 4期/売上,原価.xlsx\n- 4期/仕様書(旧).xlsx")
+    _, refs = _parse_flat("x\n参照した資料:\n1.要件定義/a.md\n- 4期/売上,原価.xlsx\n- 4期/仕様書(旧).xlsx")
     assert "1.要件定義/a.md" in refs and "4期/売上,原価.xlsx" in refs and "4期/仕様書(旧).xlsx" in refs
 
 
 def test_parse_block_at_start_keeps_following_body():
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    body, refs = parse_referenced_docs("参照した資料:\n- 4期/a.md\n\n消費税率は10%です。")
+    body, refs = _parse_flat("参照した資料:\n- 4期/a.md\n\n消費税率は10%です。")
     assert refs == ["4期/a.md"] and body == "消費税率は10%です。"
 
 
@@ -292,8 +300,7 @@ def test_verified_takes_whole_line_only_when_it_exists(monkeypatch):
 
 def test_parse_heading_with_inline_item_keeps_following_paragraph():
     """見出し行に項目があるときは直後の空行で終端＝後続の段落を参照として飲み込まない。"""
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    body, refs = parse_referenced_docs("結論。\n\n参照した資料: 4期/a.md\n\n本番への反映は承認後に実施する。")
+    body, refs = _parse_flat("結論。\n\n参照した資料: 4期/a.md\n\n本番への反映は承認後に実施する。")
     assert refs == ["4期/a.md"] and body == "結論。\n\n本番への反映は承認後に実施する。"
 
 
@@ -307,8 +314,7 @@ def test_parse_bullet_without_space_yields_both_raw_and_stripped():
 
 def test_parse_block_ends_at_prose_line_without_blank_separator():
     """空行で区切られていない後続本文（箇条書きでもパスらしくもない行）は参照に飲み込まない。"""
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    body, refs = parse_referenced_docs("本文。\n\n参照した資料:\n- a/b.md\n注意: 本番反映は承認後に行う。")
+    body, refs = _parse_flat("本文。\n\n参照した資料:\n- a/b.md\n注意: 本番反映は承認後に行う。")
     assert refs == ["a/b.md"] and body == "本文。\n\n注意: 本番反映は承認後に行う。"
 
 
@@ -323,19 +329,17 @@ def test_parse_annotations_without_space_yield_bare_path_candidates():
 
 def test_parse_block_ends_at_prose_line_containing_date_or_path():
     """箇条書きでない行に日付やパスの言及があっても、空白を含む文なら本文として残す。"""
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    body, refs = parse_referenced_docs("本文。\n\n参照した資料:\n- a/b.md\n注意: 反映は 2026/09/10 以降に行う。")
+    body, refs = _parse_flat("本文。\n\n参照した資料:\n- a/b.md\n注意: 反映は 2026/09/10 以降に行う。")
     assert refs == ["a/b.md"] and body == "本文。\n\n注意: 反映は 2026/09/10 以降に行う。"
-    body, refs = parse_referenced_docs("本文。\n\n参照した資料:\n- a/b.md\n注意: 設定は config/app.yml を参照。")
+    body, refs = _parse_flat("本文。\n\n参照した資料:\n- a/b.md\n注意: 設定は config/app.yml を参照。")
     assert refs == ["a/b.md"] and "config/app.yml" in body
 
 
 def test_parse_long_extension_and_prose_with_doc_mention():
     """`.properties` のような長い拡張子も参照として拾う。資料名を含む注意文（空白あり）は本文に残す。"""
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    body, refs = parse_referenced_docs("結論。\n参照した資料:\na.md\napplication.properties\nb.md")
+    body, refs = _parse_flat("結論。\n参照した資料:\na.md\napplication.properties\nb.md")
     assert refs == ["a.md", "application.properties", "b.md"]
-    body, refs = parse_referenced_docs("結論。\n参照した資料:\n- a/b.md\n注意: 手順.md を参照してから本番反映する。")
+    body, refs = _parse_flat("結論。\n参照した資料:\n- a/b.md\n注意: 手順.md を参照してから本番反映する。")
     assert refs == ["a/b.md"] and body == "結論。\n\n注意: 手順.md を参照してから本番反映する。"
 
 
@@ -352,8 +356,7 @@ def test_parse_does_not_truncate_space_names_or_multi_items_at_first_space(monke
 
 def test_parse_quoted_path_with_space_is_a_reference_line():
     """行全体が引用符で囲まれたパスは内部に空白があっても参照（ブロックが途中で終わらない）。"""
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    _, refs = parse_referenced_docs("x\n参照した資料:\na.md\n`設計資料/基本 設計.xlsx`\nb.md")
+    _, refs = _parse_flat("x\n参照した資料:\na.md\n`設計資料/基本 設計.xlsx`\nb.md")
     assert refs == ["a.md", "設計資料/基本 設計.xlsx", "b.md"]
 
 
@@ -364,27 +367,24 @@ def test_parse_keeps_names_with_apostrophes():
 
 
 def test_parse_prose_with_multiple_code_spans_stays_in_body():
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    body, refs = parse_referenced_docs("本文。\n参照した資料:\na.md\n`config/app.yml` の変更後は `systemctl restart app`")
+    body, refs = _parse_flat("本文。\n参照した資料:\na.md\n`config/app.yml` の変更後は `systemctl restart app`")
     assert refs == ["a.md"] and "systemctl restart app" in body
 
 
 def test_parse_quoted_sentence_stays_in_body_and_apostrophe_name_with_note_yields_bare_path():
     from sherpa.providers.codex import citations as C
-    body, refs = C.parse_referenced_docs("本文。\n\n参照した資料:\n- a/b.md\n“注意: 反映は 2026/09/10 以降”\n最後の一文。")
+    body, refs = _parse_flat("本文。\n\n参照した資料:\n- a/b.md\n“注意: 反映は 2026/09/10 以降”\n最後の一文。")
     assert refs == ["a/b.md"] and "注意: 反映は 2026/09/10 以降" in body and "最後の一文。" in body
     assert "a/John's.md" in C._line_alternatives("- a/John's.md（要約）")[0]
 
 
 def test_parse_backtick_quoted_name_with_apostrophe_is_a_reference_line():
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    _, refs = parse_referenced_docs("x\n参照した資料:\na.md\n`a/John's.md`\nb.md")
+    _, refs = _parse_flat("x\n参照した資料:\na.md\n`a/John's.md`\nb.md")
     assert refs == ["a.md", "a/John's.md", "b.md"]
 
 
 def test_parse_quoted_multi_item_line_is_a_reference_line():
-    from sherpa.providers.codex.citations import parse_referenced_docs
-    body, refs = parse_referenced_docs("本文\n\n参照した資料:\n`a/b.xlsx`、`c/d.xlsx`\n`e/f.xlsx`\n")
+    body, refs = _parse_flat("本文\n\n参照した資料:\n`a/b.xlsx`、`c/d.xlsx`\n`e/f.xlsx`\n")
     assert "a/b.xlsx" in refs and "c/d.xlsx" in refs and "e/f.xlsx" in refs and body == "本文"
-    body, refs = parse_referenced_docs("本文\n参照した資料:\na.md\n`config/app.yml` の変更後は `systemctl restart app`")
+    body, refs = _parse_flat("本文\n参照した資料:\na.md\n`config/app.yml` の変更後は `systemctl restart app`")
     assert refs == ["a.md"] and "systemctl" in body

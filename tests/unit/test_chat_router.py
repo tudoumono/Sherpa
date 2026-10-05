@@ -96,10 +96,10 @@ def test_ascii_cue_requires_word_boundary():
     「password」「keyword」に誤ヒットし、通常の QA が author 扱いになる実害があった。"""
     assert R.route("passwordの規定を教えて")["lens"] == "qa"
     assert R.route("keywordの定義は？")["lens"] == "qa"
-    assert not R.looks_like_author("passwordの規定を教えて")
+    assert not R._has("passwordの規定を教えて", R._AUTHOR)
     # 境界があれば従来どおり一致する（日本語文字は境界扱い＝「wordで」「excelで」は拾う）。
-    assert R.looks_like_author("この内容をwordで清書して")
-    assert R.looks_like_author("excelでください")
+    assert R._has("この内容をwordで清書して", R._AUTHOR)
+    assert R._has("excelでください", R._AUTHOR)
     # 境界化は trouble 側の ASCII cue にも及ぶ＝「abendした」は引き続き troubleshoot。
     assert R.route("バッチがabendした。原因は？")["lens"] == "troubleshoot"
 

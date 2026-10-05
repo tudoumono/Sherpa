@@ -74,7 +74,7 @@ def test_bean_class_resolves_to_qualified_package_and_does_not_connect_to_same_n
     foo_b = ("Module", "Foo", "spring/com/acme/b/Foo.java")
     assert ("INVOKES", config, foo_a, "bean_class") in ek
     assert ("INVOKES", config, foo_b, "bean_class") not in ek
-    assert not [f for f in flags if f.get("reason") in ("ambiguous", "qualified_fallback")
+    assert not [f for f in flags if f.get("reason") in ("ambiguous", "unresolved_qualifier")
                 and f.get("from") == "spring/applicationContext.xml"]
 
 
@@ -113,7 +113,7 @@ def test_mapper_include_refid_is_recorded_as_dropped_not_silently_lost():
     （旧 `Dropped("mapper_sql", ...)`＝文数だけの申告は S4' の `Table` 抽出に置き換わり撤去済み）。"""
     _nodes, _edges, flags = _build()
     mapper_include = [f for f in flags if f.get("reason") == "dropped_syntax"
-                       and f.get("why") == "mapper_include" and f.get("from") == "mybatis/OrderMapper.xml"]
+                       and f.get("why") == "xml:mybatis: mapper_include" and f.get("from") == "mybatis/OrderMapper.xml"]
     assert len(mapper_include) == 1
     assert mapper_include[0]["snippet"] == "cols"
 

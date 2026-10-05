@@ -4,6 +4,7 @@ AI も外部の道具も使わない（標準ライブラリ＋Pillow）。文�
 EXTTEXTOUTW/A・POLYTEXTOUTW/A、EMF+ の DrawString）に載っている文字列そのもの（原本の値）で、ANSI の文字列は
 選択中フォントの文字セットから符号化を決める。ビットマップ（DIB）は PNG へ変換し、既存の OCR 経路へ渡す。
 どんな入力でも例外を外へ出さない（失敗は ``reason`` に残す）。走査は記録数・バイト数・出力量で有界。
+設計: docs/design/rag.md「OCR（非同期・隔離ワーカー）」
 """
 from __future__ import annotations
 
@@ -17,6 +18,8 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
+
+from .ooxml.rels import load_relationships
 
 # 抽出規則の版。抽出結果（rag.md の「図の中の文字」・子 PNG）が変わる変更をしたら上げる。
 METAFILE_EXTRACT_VERSION = "metafile-extract-v1"
@@ -630,24 +633,17 @@ def materialize_children(assets_dir: str | Path, *, keep_state: bool = False) ->
 
 # ---- Office パッケージ内の図の位置（人間向け MD 用）-----------------------------------------------
 
-_REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 _R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 _SML_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 
 
 def _rels(archive: zipfile.ZipFile, part: str) -> dict[str, str]:
     base = PurePosixPath(part)
-    rels_name = (base.parent / "_rels" / (base.name + ".rels")).as_posix()
-    try:
-        root = ET.fromstring(archive.read(rels_name))
-    except (KeyError, ET.ParseError):
-        return {}
     out: dict[str, str] = {}
-    for rel in root.iter(f"{_REL_NS}Relationship"):
-        rel_id, target = rel.get("Id"), rel.get("Target")
-        if not rel_id or not target or rel.get("TargetMode") == "External":
+    for rel in load_relationships(archive.read, part):
+        if not rel.id or not rel.target or rel.mode == "External":
             continue
-        resolved = PurePosixPath(target.lstrip("/")) if target.startswith("/") else base.parent / target
+        resolved = PurePosixPath(rel.target.lstrip("/")) if rel.target.startswith("/") else base.parent / rel.target
         parts: list[str] = []
         for piece in resolved.parts:
             if piece == "..":
@@ -655,7 +651,7 @@ def _rels(archive: zipfile.ZipFile, part: str) -> dict[str, str]:
                     parts.pop()
             elif piece != ".":
                 parts.append(piece)
-        out[rel_id] = "/".join(parts)
+        out[rel.id] = "/".join(parts)
     return out
 
 

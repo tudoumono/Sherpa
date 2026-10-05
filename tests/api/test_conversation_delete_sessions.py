@@ -19,7 +19,7 @@ import pytest
 from _common import _login, _try_init
 from _test_users import register_test_uid
 from sherpa import auth, deps, store
-from sherpa.providers.codex.provider import _conversation_lock
+from sherpa.providers.codex.turn_prepare import _conversation_lock
 
 
 def _sfx() -> str:

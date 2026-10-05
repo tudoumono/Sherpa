@@ -1,46 +1,25 @@
-"""システム系エンドポイント。
-
-`/healthz`・`/`（ルート）・`/config`・`/settings*`（ユーザー設定系）を api.py から抽出する。
-ロジックは変更しない（コード移動のみ）。ルート表 golden の定義順を保つため、api.py 側は
-この3つの router（`healthz_router` / `settings_router` / `root_router`）を、元のエンドポイント
-位置にそれぞれ `app.include_router(...)` する（`sherpa.ext_api` と同じ分離パターン）。
-
-このモジュールは `sherpa.api` を import しない（循環回避）。
+"""システム系エンドポイント: `/healthz`・`/`（ルート）・`/config`・`/settings*`（ユーザー設定系）。
+`healthz_router`/`settings_router`/`root_router` の 3 router を、api.py が元のエンドポイント位置にそれぞれ `app.include_router(...)` する（ルート表 golden の定義順を保つため）。
+`sherpa.api` を import しない。
+設計: docs/design/settings.md「個人設定に残るもの」
 """
 from __future__ import annotations
 
 import logging
 import threading
-import time
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, StrictBool
+from pydantic import BaseModel
 
-from sherpa import agent_constructs, chat_examples, keys, llm, model_catalog, required_tools, search_helper, store
-# `_bedrock_key_fingerprint` は `sherpa/store/settings.py`
-# へ移設した（`add_bedrock_verified_models` が同一トランザクション内で使う必要があるため）。ここでは
-# store facade から re-export する（`sherpa.routers.system._bedrock_key_fingerprint`／
-# `sherpa.api._bedrock_key_fingerprint` の既存参照・テスト互換を保つ・ロジックは無い純粋関数なので
-# 他の「危険な継ぎ目」のような実行時解決は不要）。
-from sherpa.store import _bedrock_key_fingerprint  # noqa: F401
+from sherpa import agent_constructs, chat_examples, keys, llm, model_catalog, required_tools, store
 from sherpa.agents import (
     AGENT_PROVIDERS,
-    BEDROCK_MODEL_CHOICES,
-    BEDROCK_MODEL_ID_RE,
-    BedrockProvider,
-    _bedrock_auth_available,
-    _bedrock_profile_label,
-    _BEDROCK_MODEL,
-    _redact_bedrock_secret,
     _web_search_admin_allowed,
-    list_bedrock_inference_profiles,
     provider_info,
 )
 from sherpa.deps import _current_user
 from sherpa.schemas import (
-    BedrockModelsResponse,
-    BedrockVerifyResponse,
     ConfigResponse,
     SettingsResponse,
     SettingsTestResponse,
@@ -49,80 +28,34 @@ from sherpa.schemas import (
 _log = logging.getLogger("sherpa")
 
 
-# ===== /config・/settings*（設定） =====
-# router に tags を持たせない: 各エンドポイントの `tags=["設定"]` と結合されて "設定,設定" に
-# 二重化してしまう（ルート表 golden 不一致の原因）ため、tags 指定は各デコレータ側のみに残す。
+# /config・/settings*（設定）。router に tags を持たせない（各デコレータの tags と二重になりルート表 golden が一致しなくなる）。
 settings_router = APIRouter()
 
 
+# チャットで閉じた頭脳（保存させない。保存済みの値はチャット時に選び直しを案内する）。
+_CLOSED_CHAT_AGENTS = frozenset({"heuristic", "gemini", "bedrock", "openai", "ollama"})
+
+
 class SettingsReq(BaseModel):
-    """個人設定の PUT ボディ。プロバイダ/モデルの選択（`extract_provider`／`graph_provider`／
-    `intent_provider`／`embed_provider`／`search_helper_model`／`intent_model`／`openai_model`／
-    `gemini_model`／`ollama_model`／`codex_model`）は個人設定に無い＝管理者の使えるモデル一覧
-    （`model_catalog`）・選択中のクラウドプロバイダだけで決まる。`codex_reasoning`（Codex の
-    推論深さ）も個人設定に無いが、こちらは使えるモデル一覧の対象外＝環境変数
-    `SHERPA_CODEX_REASONING`（既定 `low`）だけで決まる。これらの旧フィールド名は未知フィールド
-    として黙って無視される（pydantic 既定の extra="ignore"）＝送っても 422 にはならず、
-    保存もされない。`bedrock_model` は例外（実在確認済みモデルの専用機構のため個人設定に残す）。"""
+    """個人設定の PUT ボディ。未指定のフィールドは変更しない。
+    プロバイダ/モデルの選択・`codex_reasoning`・`codex_web_search`・`search_helper`・`system_prompt`・閉じたプロバイダ（gemini/bedrock）のキー・モデル欄は個人設定に無い。これらを送っても未知フィールドとして無視される（422 にならず保存もされない）。
+    """
     agent: str | None = None
-    # 4構成: Codex CLI が接続するモデル提供元（openai / ollama）。Codex 構成のみ有効。
+    # Codex CLI が接続するモデル提供元（openai / ollama）。Codex 構成のみ有効。
     codex_model_provider: str | None = None
-    # web_search はネット到達可否を左右するフラグ＝"1"/"true" 等の緩い型強制を
-    # 受理せず、JSON の真偽値のみ許可する（StrictBool）。既存 SettingsReq の他フィールドは文字列/
-    # 未使用の bool のみで security-relevant な on/off フラグはこれが唯一＝他フィールドとの整合が
-    # 問題になる箇所は無い（ChatReq.knowledge 等の UI トグルは非セキュリティ的で対象外・変更なし）。
-    codex_web_search: StrictBool | None = None   # 管理者が許可した時だけ実際に効く（agents._web_search_disabled_value）
     openai_api_key: str | None = None
     ollama_url: str | None = None
-    gemini_api_key: str | None = None
-    bedrock_model: str | None = None
-    bedrock_api_key: str | None = None
-    # 検索アシスタント（`sherpa/search_helper.py`）: 下調べだけを安いモデルへ任せる
-    # 利用者ごとの設定。''＝使わない／'ollama'／'openai'。モデルは管理者のカタログ既定を使う。
-    search_helper: str | None = None
-    system_prompt: str | None = None
 
 
-# Bedrock モデル選択の allowlist（単一の真実源は sherpa/agents.py の BEDROCK_MODEL_CHOICES）。
-# 誤設定によるモデル指定ミスを防ぐため PUT /settings で検証する。
-# 静的選択肢 ∪ `BEDROCK_MODEL_ID_RE` の**形式一致のみ**で許可すると、
-# `jp.anthropic.not-a-real-model-v999:999` のような形だけ正しい架空 ID が verify を経ずに
-# 保存でき、チャット/グラフQA/グラフ抽出が Bedrock 4xx で全滅する実害が起きる。
-# 「保存できるのは実在確認済みIDだけ」に締める＝静的 choices ∪ そのユーザーが verify/列挙で実在
-# 確認済みの ID（`store.add_bedrock_verified_models`）∪ 現在保存中の値（grandfather・no-op 再保存を
-# 422 にしない）の membership 判定のみとし、正規表現単独では許可しない（形式チェックは
-# `POST /settings/bedrock-models/verify` が probe 前のガードとして引き続き使う）。
-_BEDROCK_MODEL_IDS = frozenset(model_id for model_id, _label in BEDROCK_MODEL_CHOICES)
-
-
-def _bedrock_model_id_valid(model_id: str, verified: list, current: str | None) -> bool:
-    """`model_id` が「静的 choices」「このユーザーが実在確認済み（verified）」「現在保存中の値
-    （grandfather）」のいずれかに含まれるか（membership 判定のみ・形式一致だけでは真にならない）。"""
-    return (model_id in _BEDROCK_MODEL_IDS
-            or model_id in (verified or [])
-            or (current is not None and model_id == current))
-
-
-# 接続先（OpenAI／Azure OpenAI／その他 OpenAI 互換）を個人設定画面へ読み取り専用で表示するための
-# 補助。接続先そのものの設定（管理画面）・判定は `sherpa/llm.py::openai_base_url`／
-# `openai_endpoint_kind` が唯一の真実源（DB `system_settings`）。実行時例外（DB 不達等）は握って
-# 安全側（openai・ホスト名なし＝画面には何も出ない）へ倒す。
+# 接続先（OpenAI／Azure OpenAI／その他 OpenAI 互換）を個人設定画面へ読み取り専用で表示するための補助。判定は `sherpa/llm.py::openai_base_url`/`openai_endpoint_kind` が唯一の真実源。実行時例外（DB 不達等）は安全側（openai・ホスト名なし）に倒す。
 _INVALID_SAVED_BASE_URL_LABEL = "(不正な保存値)"
 
 
 def _openai_base_url_host(system_settings: dict | None = None) -> str:
-    """`llm.openai_base_url()` からホスト名だけを取り出す。パス・クエリ・認証情報は含めない
-    （設定画面に出すのはホスト名だけ・CLAUDE.md の「キーやパスは出さない」契約）。
-
-    `system_settings`（省略可）は `llm.openai_base_url()` へそのまま渡す。`_public_settings` は
-    1応答内で読んだ単一スナップショットを渡す（省略時に自分で読み直すと、`_openai_endpoint_kind`
-    と別々の DB 読みになり、応答の途中で admin 更新が挟まった場合に kind と host が別世代の値の
-    まま混在しうる）。
-
-    表示前に `llm.assert_openai_base_url_allowed()` で再検証する: 空白・バックスラッシュ混入等を
-    含む値は `urlsplit` がこれらを構造区切りとして扱わずそのまま `hostname` に含めてしまうため、
-    再検証なしでは内部パスの断片が生のまま画面へ出る。不合格なら `hostname` を取り出さず
-    固定文字列（`_INVALID_SAVED_BASE_URL_LABEL`）を返す。"""
+    """`llm.openai_base_url()` からホスト名だけを取り出す（パス・クエリ・認証情報は含めない）。
+    `system_settings`（省略可）は `llm.openai_base_url()` へそのまま渡す（`_public_settings` が 1 応答内の単一スナップショットを渡し、kind と host が別世代にならないようにする）。
+    表示前に `llm.assert_openai_base_url_allowed()` で再検証する（空白・バックスラッシュ混入の値は `urlsplit` が `hostname` にそのまま含めるため）。不合格なら固定文字列（`_INVALID_SAVED_BASE_URL_LABEL`）を返す。
+    """
     try:
         url = llm.openai_base_url(system_settings)
     except Exception:
@@ -143,9 +76,7 @@ def _openai_base_url_host(system_settings: dict | None = None) -> str:
 
 
 def _openai_endpoint_kind(system_settings: dict | None = None) -> str:
-    """`llm.openai_endpoint_kind()` の値。例外時は "openai"（既定・画面に注記を出さない）へ倒す。
-
-    `system_settings`（省略可）は `_openai_base_url_host` と同じ理由でそのまま渡す。"""
+    """`llm.openai_endpoint_kind()` の値。例外時は "openai"（既定）に倒す。`system_settings`（省略可）は `_openai_base_url_host` と同じ理由でそのまま渡す。"""
     try:
         return llm.openai_endpoint_kind(system_settings) or "openai"
     except Exception:
@@ -153,38 +84,16 @@ def _openai_endpoint_kind(system_settings: dict | None = None) -> str:
 
 
 def _ollama_url_choice(s: dict, system_settings: dict | None = None) -> dict:
-    """個人設定の Ollama 接続先 `<select>` の選択肢（`model_catalog[field]` と同じ
-    `{"allowed": [...], "default": "..."}` 形 ＋ `legacy`）。許可ホスト一覧から選ぶ・空文字は
-    「管理者の既定を使う」（モデル名欄と同じ規約）。
-
-    `allowed` には**許可ポリシー（loopback／admin allowlist）を実際に満たす完全 URL だけ**を返す
-    （選んでも保存時に 422 になる選択肢を UI に出さない）。利用者の現在の保存値が許可されていない
-    （旧 admin allowlist の削除等で失効した）場合は `allowed` へ混ぜず、`legacy` に別枠で返す
-    （画面側はこれを「一覧外（失効）」として警告表示できる）。
-
-    `allowed` は **完全 URL（scheme 込み）を保持する**（host:port へ正規化して返すと、選択・保存・
-    接続テストの往復で https が http に化ける・IPv6 の角括弧が失われる等の劣化が起きるため）。
-    scheme が分かっている実際の URL（中央既定・利用者の現在の保存値）を admin allowlist からの
-    合成エントリより**先に**追加する（host:port が既に他のエントリで解決済みなら重複追加しない＝
-    scheme 不明な allowlist から `http://` を補って合成したエントリが、既に分かっている https を
-    上書きしない）。
-
-    同一 host:port の実 URL 同士（例: 中央既定が `http://host:443`・
-    利用者の現在値が `https://host:443`）が衝突する場合、単純な「先勝ち」だと中央（http）が個人の
-    https を隠してしまい、policy-valid な https 現在値が `allowed` にも `legacy` にも現れず
-    UI で「一覧外」と誤表示する。ここでは同一 host:port が既にある場合、後から来た URL が
-    `https://` かつ既存が `https://` でなければ**置換**する（scheme 不明な allowlist からの
-    `http://` 合成エントリが正しい https を上書きすることはない＝合成分は必ず最後に追加される
-    ため、常に「他の実 URL が既に埋めた枠」を尊重する）。
-
-    `system_settings`（省略可）: `ollama_url`（中央既定）・`llm._allowlisted_hosts()` の両方の
-    解決をそれで行う（省略時は自分で読む）。
+    """個人設定の Ollama 接続先 `<select>` の選択肢（`{"allowed": [...], "default": "..."}` 形＋`legacy`）。空文字は「管理者の既定を使う」。
+    `allowed` には許可ポリシー（loopback／admin allowlist）を満たす完全 URL（scheme 込み）だけを返す。利用者の現在の保存値が許可されていない場合は `allowed` に混ぜず `legacy` に別枠で返す。
+    scheme が分かっている実際の URL（中央既定・利用者の現在の保存値）を、admin allowlist からの合成エントリより先に追加する。同一 host:port が既にある場合は、後から来た URL が `https://` で既存が `https://` でないときだけ置換する（合成の `http://` が https を上書きしない）。
+    `system_settings`（省略可）: `ollama_url`（中央既定）と `llm._allowlisted_hosts()` の解決に使う（省略時は自分で読む）。
     """
     sysset = system_settings if system_settings is not None else store.get_system_settings()
     central_url = (sysset.get("ollama_url") or "").strip() or keys.DEFAULT_OLLAMA_URL
     allowlisted = llm._allowlisted_hosts(sysset)
     allowed: list[str] = []
-    seen: dict[tuple[str, int], int] = {}   # host:port -> allowed 内の index
+    seen: dict[tuple[str, int], int] = {}  # host:port -> allowed 内の index。
 
     def _policy_valid(hp: tuple[str, int]) -> bool:
         return llm.is_loopback_host(hp[0]) or hp in allowlisted
@@ -202,10 +111,9 @@ def _ollama_url_choice(s: dict, system_settings: dict | None = None) -> dict:
             allowed.append(full)
             return
         if full.startswith("https://") and not allowed[idx].startswith("https://"):
-            allowed[idx] = full   # https が同一 host:port の http を置換する
+            allowed[idx] = full  # https が同一 host:port の http を置換する。
 
-    # scheme が分かっている実URL（中央既定・利用者の現在値）を先に確定させ、admin allowlist からの
-    # http:// 合成エントリは最後に（未確定分だけ）補う。
+    # scheme が分かっている実URL（中央既定・利用者の現在値）を先に確定させ、admin allowlist からの `http://` 合成エントリは最後に未確定分だけ補う。
     _add(central_url)
     current = (s.get("ollama_url") or "").strip()
     _add(current)
@@ -221,112 +129,40 @@ def _ollama_url_choice(s: dict, system_settings: dict | None = None) -> dict:
     return {"allowed": allowed, "default": central_url, "legacy": legacy}
 
 
-def _model_choice_table_by_provider(system_settings: dict | None = None) -> dict:
-    """`intent_model`／`search_helper_model` のように実効プロバイダが実行時まで決まらない欄
-    （`FIELD_CELLS` の中で複数プロバイダを跨ぐもの）について、プロバイダごとの選択肢を全パターン
-    事前に返す（`{field: {provider: {"allowed": [...], "default": "..."}}}`）。個人設定画面
-    （`web/settings.js`）が intent_provider／search_helper のセレクタを変更した瞬間に、サーバへ
-    再往復せずモデル欄の選択肢を再描画できるようにするため。保存済みの実効プロバイダに
-    基づく `model_catalog[field]`（`_public_settings` 参照）とは別に、**選べる全プロバイダ**を返す
-    （未保存の「見込み」選択に追従するため）。
-
-    `system_settings`（省略可）は `field_choice_info()` へそのまま渡す。
-    """
-    out: dict = {}
-    for field, cells in model_catalog.FIELD_CELLS.items():
-        providers = sorted({p for p, _u in cells})
-        if len(providers) < 2:
-            continue
-        out[field] = {p: model_catalog.field_choice_info(field, provider=p, system_settings=system_settings)
-                      for p in providers}
-    return out
-
-
 def _public_settings(s: dict) -> dict:
-    bedrock_model = s.get("bedrock_model") or _BEDROCK_MODEL
-    bedrock_known = bedrock_model in _BEDROCK_MODEL_IDS or bedrock_model in (s.get("bedrock_verified_models") or [])
-    # key_set は「今この設定で実際に使えるキーがあるか」＝`keys.resolve_api_key`（中央/個人・
-    # A6/A7 込み）の結果で判定する。個人キー許可 OFF・または A7 非選択プロバイダなら、保存済みの
-    # 個人キーがあっても false になる（＝画面に「未設定」と映る＝実態と一致させる）。
-    # この関数内の system_settings 依存の解決（3キー・agent 既定選択・cloud_provider・
-    # construct_id の A7 判定・モデルカタログ・Ollama allowlist）は同じスナップショットで行う
-    # （個別に読み直すと、応答の途中で admin 更新が挟まった場合に「新旧が混ざった1レスポンス」に
-    # なりうる窓を塞ぐ）。
+    # key_set は「今この設定で実際に使えるキーがあるか」を `keys.resolve_api_key`（中央/個人・A6/A7 込み）の結果で判定する。この関数内の system_settings 依存の解決（キー・agent 既定選択・cloud_provider・construct_id の A7 判定・モデルカタログ・Ollama allowlist）は同じスナップショットで行う。
     sys_s = store.get_system_settings()
     openai_key = keys.resolve_api_key("openai", s, system_settings=sys_s)
-    gemini_key = keys.resolve_api_key("gemini", s, system_settings=sys_s)
-    bedrock_key = keys.resolve_api_key("bedrock", s, system_settings=sys_s)
-    return {"agent": s["agent"] or agent_constructs.default_agent(sys_s),
-            # WEB-1: web_search の管理者許可は system_settings.web_search_allowed（管理画面
-            # 「プロバイダ＋接続先」タブ）が唯一の真実源。ここでは調べ方ブロックの Web 検索行の
-            # 表示条件（web/chat/menus.js 参照）としてのみ使う——実行に使うかどうかはチャット
-            # ごとの `ChatReq.web_search` のみを見る（旧: 個人設定 `codex_web_search` は列を
-            # 残すが実行経路では読まない）。
+    saved_agent = s["agent"]
+    return {"agent": saved_agent or agent_constructs.default_agent(sys_s),
+            # web_search の管理者許可は `system_settings.web_search_allowed`（管理画面「プロバイダ＋接続先」タブ）が唯一の真実源で、ここでは調べ方ブロックの Web 検索行の表示条件（web/chat/menus.js）にだけ使う。実行に使うかどうかは `ChatReq.web_search` だけで決まる。
             "web_search_available": _web_search_admin_allowed(sys_s),
-            "codex_web_search": bool(s.get("codex_web_search")),
-            # 真偽値のみだとプレースホルダでも「設定済み」と
-            # 表示しうる。判定を provider 選択・health と同じ `agent_constructs.is_real_api_key` に揃える
-            # （利用者が設定画面で入れた実キーの扱いは変えない＝プレースホルダ文字列と一致しない限り真）。
+            # 判定を provider 選択・health と同じ `agent_constructs.is_real_api_key` に揃える（プレースホルダ文字列でなければ真）。
             "openai_key_set": agent_constructs.is_real_api_key(openai_key),
-            # 接続先の種類（openai/azure/custom）とホスト名のみ（キー・パスは出さない）。
-            # 管理画面「AIプロバイダ（クラウド）」カードの設定であり、ユーザーごとには変わらない。
+            # 接続先の種類（openai/azure/custom）とホスト名のみ（キー・パスは出さない）。ユーザーごとには変わらない。
             "openai_endpoint_kind": _openai_endpoint_kind(sys_s),
             "openai_base_url_host": _openai_base_url_host(sys_s),
             "ollama_url": s["ollama_url"],
-            "gemini_key_set": bool(gemini_key),
-            "bedrock_model": bedrock_model,
-            "bedrock_key_set": bool(bedrock_key),
-            # フロント（web/settings.js）が「旧設定（legacy）」表示と検証済み
-            # 表示を区別するための情報。known=true なら静的 choices か verified 済み＝正当な値。
-            "bedrock_model_known": bedrock_known,
-            "bedrock_model_label": _bedrock_profile_label(bedrock_model, ""),
-            # 4構成（agent_constructs）: 現在の構成と、この環境で選べる構成の一覧。
-            # 画面はこの一覧だけを描画する＝env で無効な AI は選択肢にも入力欄にも出さない。
+            # 4 構成（agent_constructs）: 現在の構成と、この環境で選べる構成の一覧。画面はこの一覧だけを描画する。
             "codex_model_provider": s.get("codex_model_provider") or "",
-            # 検索アシスタント: 下調べを安いモデルへ任せる利用者ごとの設定。
-            "search_helper": s.get("search_helper") or "",
-            # 旧・個人上書き時代のモデル指定（個人設定に入力欄は無い・保存もされない）。実行時には
-            # もう使われないが、以前この画面で選んだ値が DB に残っている利用者へ「もう使われて
-            # いない」と伝えるためだけに読み取り専用で返す（web/settings.js の注記表示）。
-            "search_helper_model": s.get("search_helper_model") or "",
             "construct_id": agent_constructs.construct_id(s, system_settings=sys_s),
             "constructs_available": agent_constructs.available_constructs(system_settings=sys_s),
-            "system_prompt": s.get("system_prompt", ""),
             "cloud_provider": keys.selected_cloud_provider(sys_s),
             "personal_api_keys_allowed": keys.personal_keys_allowed(sys_s),
-            # 個人設定の「外部連携」欄を出し分けるためのフラグ（既定 false・
-            # personal_api_keys_allowed と同型）。
+            # 個人設定の「外部連携」欄を出し分けるフラグ（既定 false・personal_api_keys_allowed と同型）。
             "user_api_keys_allowed": bool(sys_s.get("user_api_keys_allowed") or False),
-            # 自己発行キーの1日あたり呼び出し上限（既定/上限・管理者統制）。発行フォームの
-            # プレースホルダ表示用（未指定時に何件が適用されるかを事前に見せる）。
+            # 自己発行キーの 1 日あたり呼び出し上限（既定/上限・管理者統制）。発行フォームのプレースホルダ表示用。
             "user_api_keys_daily_quota_default": store.resolve_self_issued_daily_quota_cap(sys_s),
-            # 各モデル名欄の選択肢。プロバイダが固定の欄（openai_model 等）は積集合、実効プロバイダが
-            # 解決できる欄（intent_model/search_helper_model・`_effective_provider_for_field` 参照）は
-            # そのプロバイダのセルだけに絞り込む（保存時検証と一致させる＝画面に出るのに PUT すると
-            # 422 になる選択肢を無くす・RV 是正）。保存済みの値がカタログ外（旧・自由入力時代の値等）
-            # でも拒否しない（移行期の寛容）＝ここでは選択肢だけを返し、警告表示は画面側。
-            "model_catalog": {
-                field: model_catalog.field_choice_info(
-                    field, provider=_effective_provider_for_field(field, s, system_settings=sys_s)[0],
-                    system_settings=sys_s)
-                for field in model_catalog.FIELD_CELLS
-            },
-            # intent_model／search_helper_model のプロバイダ別選択肢（未保存のセレクタ変更に画面が
-            # 再往復無しで追従するため・`web/settings.js::_resyncModelChoicesForProvider` 参照）。
-            "model_catalog_by_provider": _model_choice_table_by_provider(sys_s),
-            # 個人の Ollama 接続先は許可ホスト一覧から選ぶ（許可ホスト一覧＋中央既定・full URL 保持）。
+            # 個人の Ollama 接続先は許可ホスト一覧から選ぶ（許可ホスト一覧＋中央既定・完全 URL 保持）。
             "ollama_url_choice": _ollama_url_choice(s, system_settings=sys_s),
-            # チャット画面のクイック入力例（管理者設定・`sherpa/chat_examples.py`）。
-            # None＝未設定（フロントの組み込み既定を使う）。配列（空含む）＝管理者が明示設定済み
-            # （空配列＝非表示）。
+            # チャット画面のクイック入力例（管理者設定・`sherpa/chat_examples.py`）。None＝未設定（フロントの既定を使う）。配列（空含む）＝管理者が明示設定済み（空配列＝非表示）。
             "chat_examples": chat_examples.public_examples(sys_s)}
 
 
 
 
 def _codex_ollama_probe(s: dict, sys_s: dict, model: str | None) -> dict:
-    """Codex(Ollama) の接続テスト。実行時（`providers._select_provider`）と同じ接続先の解決と許可の
-    確認をしてから、Ollama の `/api/tags` でモデルが取得済みかを見る（タグ無しは `:latest` とみなす）。"""
+    """Codex(Ollama) の接続テスト。実行時（`providers._select_provider`）と同じ接続先の解決と許可の確認をしてから、Ollama の `/api/tags` でモデルが取得済みかを見る（タグ無しは `:latest` とみなす）。"""
     import json as _json
     base = keys.resolve_ollama_url(s, system_settings=sys_s)
     try:
@@ -361,373 +197,31 @@ def settings_get(request: Request):
     return _public_settings(store.get_settings(u["uid"]))
 
 
-# `GET /settings/bedrock-models` の per-user 結果キャッシュ（プロセス内 dict・TTL 付き）。
-# 設定画面を開くたびに control-plane を叩かないため。過剰設計しない＝これで十分（複数ワーカー構成では
-# ワーカーごとに独立したキャッシュになるが、TTL が短いため実害は小さい）。
-# entry は「どのキーで取得したか」の fingerprint（値そのものは持たない・
-# sha256 先頭16桁）を持ち、read/write のどちらでも**その時点の現在キー**と不一致なら破棄する。
-# 素朴な dict[uid]=(...) だけだと、GET が古いキーで control-plane 呼び出し中に PUT でキーが変わった
-# 場合、GET 完了時に古い結果を書き戻してしまい、以後 TTL（5分）はそのユーザーに新キーの結果が
-# 一切反映されない read-modify-write 競合になる。dict の複合操作（読取判定・書込）は
-# `threading.Lock` で保護する（ネットワーク呼び出し自体はロック外＝他ユーザーの読み書きを塞がない）。
-_BEDROCK_MODELS_CACHE: dict[str, tuple[float, str, list, str | None]] = {}
-_BEDROCK_MODELS_CACHE_TTL = 300.0   # 5分
-_BEDROCK_MODELS_CACHE_LOCK = threading.Lock()
-
-# per-uid キャッシュ世代カウンタ。fp の再確認
-# （ロック外・低速な記録処理を挟む）から実際のキャッシュ書込（ロック内）までの間に、別リクエストが
-# キーを変更（`settings_put` がキャッシュを pop する箇所）すると、その"別リクエスト"自身の新しい
-# fetch＋書込が先に完了していた場合、この"古いリクエスト"の遅延書込がそれを上書きしてしまう
-# （stale なキーの fingerprint で書くだけなので次回読取で即座にキャッシュミスになり、誤った内容が
-# 提供されるわけではないが、有効なキャッシュが無駄に潰れ、無用な control-plane 再呼び出しを招く）。
-# 対処: `settings_put` のキー変更時 pop と同じ箇所でこの世代を increment し、`settings_bedrock_models`
-# は最初のキャッシュ参照時点の世代を記憶しておき、実際に書き込む直前（ロック内）に世代が変わって
-# いないか確認する（変わっていれば書込をスキップ＝新しい entry を残す）。
-_BEDROCK_MODELS_CACHE_GEN: dict[str, int] = {}
-
-
-def _bedrock_record_and_filter(uid: str, models: list, fp: str) -> list | None:
-    """`models`（列挙/キャッシュヒット結果・`[{"id","label"}]`）のうち動的な ID だけを実在確認済み
-    テーブルへ記録し、応答を「記録に成功した動的 ID ∪ 静的 choices」へ絞り込む。`None` は
-    fingerprint 不一致（キー変更中）で何も記録していない場合（呼び出し側はエラー応答を返す）。
-
-    静的 choices（`_BEDROCK_MODEL_IDS`）は
-    `_bedrock_model_id_valid` が無条件で受理するため、実在確認済みテーブルへ記録する必要が無い。
-    記録すると動的分の容量（`_BEDROCK_VERIFIED_MODELS_MAX`）を無駄に消費し、満杯時に「静的なのに
-    保存枠不足」という誤ったエラーを招く。渡す ids からあらかじめ
-    静的分を除外する（store 層は「静的」という概念を知らない汎用のまま・フィルタはこのルータ層だけで
-    行う）。応答フィルタの `keep` は既存どおり `∪ _BEDROCK_MODEL_IDS` で静的を無条件に含める。
-
-    動的分が無い（全て静的＝`dynamic_ids` が空）場合、
-    記録処理自体を丸ごとスキップするだけだと fingerprint 再確認も素通りしてしまう。静的 choices は
-    `PUT /settings` が無条件で受理するため保存契約自体は破れないが、非静的経路（キー変更中は
-    「設定が変更されました」で正直に失敗を伝える）と意味論を揃えるため、この場合も現在の
-    fingerprint を再確認する。
-    """
-    dynamic_ids = [m["id"] for m in models if m["id"] not in _BEDROCK_MODEL_IDS]
-    if dynamic_ids:
-        retained = store.add_bedrock_verified_models(uid, dynamic_ids, expected_key_fp=fp)
-        if retained is None:
-            return None
-    else:
-        if _bedrock_key_fingerprint(store.get_settings(uid).get("bedrock_api_key")) != fp:
-            return None
-        retained = []
-    keep = set(retained) | _BEDROCK_MODEL_IDS
-    return [m for m in models if m["id"] in keep]
-
-
-@settings_router.get("/settings/bedrock-models", tags=["設定"], response_model=BedrockModelsResponse)
-def settings_bedrock_models(request: Request):
-    """現在ユーザーの Bedrock 設定でアカウントが実際に使える推論プロファイルを取得する。
-
-    admin 限定にしない（自分の頭脳選択のための情報・他人の設定は見えない）。ログイン中ユーザーの
-    保存済み `bedrock_api_key`（未設定ならサーバ側 env）で control-plane を叩き、ACTIVE な anthropic
-    系のみを返す。キー自体は応答に含めない。失敗（キー無し/403/ネットワーク）でも 200 のまま
-    `{"models": [], "error": "<短い理由>"}` を返す（設定画面の UX を壊さない）。per-user 5分キャッシュ
-    （key の fingerprint が変わっていれば期限内でも破棄・上のキャッシュ entry 構造の説明参照）。
-
-    中核契約:「この応答に含まれる ID は必ず `PUT /settings` で保存できる」。
-      - 取得できた ID 群の記録は `store.add_bedrock_verified_models`
-        の `expected_key_fp` に開始時点の fingerprint を渡し、**行ロック取得後・DB 書込直前に
-        同一トランザクション内で**現在の `bedrock_api_key` と再照合させる（呼び出し側でスナップ
-        ショットを取って別途比較する方式だと、比較〜記録の間に別リクエストのキー変更がコミット
-        される TOCTOU を埋め切れない）。不一致（`None` が返る）なら記録していない。
-      - 不一致時は verify と同じ意味論に統一し、その場の応答も
-        `{"models": [], "error": "設定が変更されました。もう一度お試しください"}` にする
-        （models をそのまま返すと「表示はされたが保存すると 422」という握りつぶしの変種になるため）。
-      - `add_bedrock_verified_models` の返り値（cap 適用後も実際に
-        残った ID のサブセット）で応答を「保持セット ∪ 静的 choices」にフィルタする（`_bedrock_
-        record_and_filter` 参照）。cap（`_BEDROCK_VERIFIED_MODELS_MAX`）値に依らず、返す ID は必ず
-        保存可能というのが構造的に保証される（AWS `ListInferenceProfiles` は1回の応答が cap を
-        超えうる・同定数のコメント参照）。
-      - 記録対象（`add_bedrock_verified_models` へ
-        渡す ids）からは静的 choices を除外する（`_bedrock_record_and_filter` 参照）。静的は無条件で
-        受理されるため記録不要＝動的分の容量を無駄に消費しない（満杯時に静的まで「保存枠不足」に
-        なる誤りを防ぐ）。
-      - キャッシュヒット早期 return 側でも記録は毎回行う（記録は冪等・ボタン押下時のみの経路
-        なので DB 1往復は許容・cap 溢れで store 側から evict された ID がキャッシュには残っているのに
-        保存不能になる、という穴を塞ぐ）。models が空（失敗結果）の場合は記録は不要（何も無いため）
-        だが、キャッシュ書込自体は取得完了後に世代（`_BEDROCK_MODELS_CACHE_GEN`）が変わっていない
-        時だけ行う（キー変更中の stale write 対策）。
-      - 記録成功後・実際のキャッシュ書込までの間に
-        別リクエストがキーを変更し、かつその別リクエストの新しい fetch＋書込が先に完了していると、
-        この（古い）リクエストの遅延書込がその有効な entry を潰しうる（stale 提供にはならないが
-        無用な control-plane 再呼び出しを招く）。`_BEDROCK_MODELS_CACHE_GEN`（per-uid 世代カウンタ・
-        `settings_put` のキー変更時 pop と同時に increment）をこのリクエスト開始時点で記憶しておき、
-        書込直前（ロック内）に世代が変わっていないか確認してから書く。
-      - 上の世代の捕捉は**関数の最初**（`key` の
-        読取より前）で行う。捕捉がキー読取の後だと、「このリクエストがキーを読んだ直後・まだ世代を
-        捕捉する前」に別リクエストが世代を進めた場合、このリクエストは既に進んだ後の世代を自分の
-        基準として捕捉してしまい、古いキーの結果を書込直前チェックが「変化無し」と誤認する。
-
-    `_BEDROCK_MODELS_CACHE_LOCK` は「低速 I/O はロック外」が既存設計
-    原則（列挙の外向き通信をロック外にしているのと同じ理由）。キャッシュヒット側の記録
-    （`store.add_bedrock_verified_models` の DB 書込・FOR UPDATE 待ちを含みうる）をロックを握ったまま
-    呼ぶと、同一ユーザーの並行 verify が行ロックを握っている間、その待ちで**全ユーザー**の列挙
-    キャッシュ読取がブロックされてしまう（DB 障害時はさらに長く握る）。ロック内では
-    ヒット判定とスナップショット取得（`cached` タプルは不変）だけを行い、記録・return はロックを
-    抜けてから行う。
-    """
-    u = _current_user(request)
-    uid = u["uid"]
-    # 世代の捕捉は**このリクエストの最初**（キー読取
-    # より前）で行う——キー読取の後に捕捉すると、「このリクエストがキーを読んだ直後・
-    # まだ世代を捕捉する前」に別リクエストが PUT でキーを変更（世代 increment）した場合、この
-    # リクエストは（古いキーで処理を続けているにもかかわらず）既に進んだ後の世代を自分の基準として
-    # 捕捉してしまい、その後の書込直前チェックが「何も変わっていない」と誤認してしまう（結果、
-    # 別の正当なリクエストが書いた新しい有効なキャッシュ entry を、この（古いキーの）リクエストが
-    # 上書きしうる）。世代捕捉をキー読取より前に置くことで、キー読取以降に起きた変化は必ず
-    # 検知できるようにする。
-    gen = _BEDROCK_MODELS_CACHE_GEN.get(uid, 0)
-    key = store.get_settings(uid).get("bedrock_api_key")
-    fp = _bedrock_key_fingerprint(key)
-    now = time.monotonic()
-    with _BEDROCK_MODELS_CACHE_LOCK:
-        cached = _BEDROCK_MODELS_CACHE.get(uid)
-        hit = cached if cached and cached[1] == fp and now - cached[0] < _BEDROCK_MODELS_CACHE_TTL else None
-    if hit is not None:
-        hit_models, hit_error = hit[2], hit[3]
-        if hit_models:
-            hit_models = _bedrock_record_and_filter(uid, hit_models, fp)
-            if hit_models is None:
-                return {"models": [], "error": "設定が変更されました。もう一度お試しください"}
-        return {"models": hit_models, "error": hit_error}
-    models, error = list_bedrock_inference_profiles(key)   # ロック外（低速な外向き通信を他ユーザーへ波及させない）
-    if models:
-        models = _bedrock_record_and_filter(uid, models, fp)
-        if models is None:
-            return {"models": [], "error": "設定が変更されました。もう一度お試しください"}
-        # 記録が終わった今この瞬間でも、世代が変わっていなければ書く（変わっていれば、別
-        # リクエストの新しい有効な entry を古い fp で潰さないようスキップする）。応答自体は
-        # models/error をそのまま返す（stale 提供の心配は無い＝この応答は「このリクエスト自身が
-        # 今取得した」内容そのもの）。
-        with _BEDROCK_MODELS_CACHE_LOCK:
-            if _BEDROCK_MODELS_CACHE_GEN.get(uid, 0) == gen:
-                _BEDROCK_MODELS_CACHE[uid] = (now, fp, models, error)
-        return {"models": models, "error": error}
-    # models が空（失敗）: 記録するものが無いが、取得中にキーが変わっていた場合の stale なキャッシュ
-    # 書込は models の有無に関係なく起こりうるため、
-    # ここでも世代が変わっていないか確認してから書く。
-    with _BEDROCK_MODELS_CACHE_LOCK:
-        if _BEDROCK_MODELS_CACHE_GEN.get(uid, 0) == gen:
-            _BEDROCK_MODELS_CACHE[uid] = (now, fp, models, error)
-    return {"models": models, "error": error}
-
-
-# 実環境では「接続テストOK・モデル取得は失敗（既定選択肢のまま）」ということが起こりうる。
-# 容疑は Bedrock API キー（Bearer）が runtime（InvokeModel）専用で control-plane（ListInferenceProfiles）
-# 権限が無いケース＝`GET /settings/bedrock-models` の動的列挙が使えない。列挙に頼らず、ユーザーが
-# 分かっているモデルID（推論プロファイルID）を**実際に1回叩いて検証**してから追加できる経路を用意する。
-# ID の推測ハードコードはしない（BEDROCK_MODEL_CHOICES のコメント参照）＝あくまで検証つき手動入力。
-_BEDROCK_VERIFY_TIMEOUT = 8.0     # 設定画面のボタン押下待ち＝短め（GET 側の _BEDROCK_LIST_TIMEOUT と同程度）
-_BEDROCK_VERIFY_MIN_INTERVAL = 5.0   # per-user 連打抑制（悪用防止・実 API 課金/レート制限を消費するため）
-_bedrock_verify_lock = threading.Lock()
-_bedrock_verify_last_call: dict[str, float] = {}   # uid -> monotonic 秒
-
-
-class BedrockVerifyReq(BaseModel):
-    model_id: str
-
-
-@settings_router.post("/settings/bedrock-models/verify", tags=["設定"], response_model=BedrockVerifyResponse)
-def settings_bedrock_models_verify(req: BedrockVerifyReq, request: Request):
-    """モデルID（推論プロファイルID）を実際に1回（max_tokens=1）叩いて検証する（S6 の動的列挙が
-    使えない構成向け・バッチ2 1番）。成功のみ `{"ok": true, "id", "label"}`。失敗（形式不正/連打/
-    401403/ネットワーク/検証中のキー変更）は `{"ok": false, "error": "<短い理由>"}`（連打抑制のみ 429）。
-    キー自体は応答に含めない（既存の redact/固定文言流儀を踏襲）。
-    """
-    u = _current_user(request)
-    uid = u["uid"]
-    now = time.monotonic()
-    with _bedrock_verify_lock:
-        last = _bedrock_verify_last_call.get(uid)
-        if last is not None and now - last < _BEDROCK_VERIFY_MIN_INTERVAL:
-            raise HTTPException(429, "検証の間隔が短すぎます。しばらく待って再試行してください。")
-        _bedrock_verify_last_call[uid] = now   # 形式不正でも「試行」自体はレート制限の対象にする
-
-    model_id = (req.model_id or "").strip()
-    if not BEDROCK_MODEL_ID_RE.fullmatch(model_id):
-        return {"ok": False, "error": "モデルIDの形式が正しくありません（例: jp.anthropic.claude-xxx-v1:0）"}
-
-    settings = store.get_settings(uid)
-    api_key = settings.get("bedrock_api_key")
-    if not _bedrock_auth_available(api_key):
-        return {"ok": False, "error": "Bedrock の API キー/AWS 認証情報が未設定です"}
-    # probe（実 I/O・時間がかかりうる）の**前**に
-    # このユーザーのキーの fingerprint を取っておく。記録は `store.add_bedrock_verified_models` の
-    # `expected_key_fp` に渡し、行ロック取得後・DB 書込直前に**同一トランザクション内で**再照合させる
-    # （probe 後にここで別途 SELECT して比較する方式だと、比較〜記録の間に別リクエストのキー変更が
-    # コミットされる TOCTOU を埋め切れない）。不一致（`None` が返る）なら記録しない＝ok:true の
-    # まま未記録だと、選択肢には追加されたのに保存が 422 になる、握りつぶしの変種を作ってしまうため、
-    # ここは ok:false で理由を返す。
-    fp_before = _bedrock_key_fingerprint(api_key)
-
-    ok, detail = BedrockProvider(None, model_id, api_key).probe(
-        timeout=_BEDROCK_VERIFY_TIMEOUT, max_tokens=1)
-    if not ok:
-        _log.warning("bedrock model verify failed: uid=%s model=%s", uid, model_id)
-        # BedrockProvider.probe() は内部で安全境界（_safe_bedrock_detail）を通すが、ここでも
-        # _redact_bedrock_secret を重ねる（probe() 自体が差し替えられても抜けない最終防衛線・
-        # 二重適用は無害）。
-        return {"ok": False, "error": _redact_bedrock_secret(detail, api_key) or "接続に失敗しました"}
-
-    # 静的 choices（`_BEDROCK_MODEL_IDS`）は
-    # `_bedrock_model_id_valid` が無条件で受理するため、実在確認済みテーブルへの記録は不要。
-    # probe には意味がある（このユーザーの実際の AWS 権限で本当に呼べるかを確認できる）ので probe
-    # 自体は通常どおり行うが、記録はスキップして直接 ok:true を返す（動的分の容量が満杯でも、静的
-    # ID の verify が「保存枠不足」という誤ったエラーになる実害を防ぐ）。
-    if model_id in _BEDROCK_MODEL_IDS:
-        # 記録処理自体をスキップするこのファストパス
-        # でも、probe 完了後に現在キーの fingerprint を再確認する。静的 choices は PUT /settings が
-        # 無条件で受理するため保存契約自体は破れないが、非静的経路（キー変更中は「設定が変更され
-        # ました」で正直に失敗を伝える）と体験を揃える。
-        if _bedrock_key_fingerprint(store.get_settings(uid).get("bedrock_api_key")) != fp_before:
-            return {"ok": False, "error": "設定が変更されました。もう一度お試しください"}
-        return {"ok": True, "id": model_id, "label": _bedrock_profile_label(model_id, "")}
-
-    # 実際に1回叩いて成功した ID を「実在確認済み」として記録する（`_bedrock_model_id_valid` の
-    # 正本・以後 PUT /settings で保存できるようになる）。
-    retained = store.add_bedrock_verified_models(uid, [model_id], expected_key_fp=fp_before)
-    if retained is None:
-        return {"ok": False, "error": "設定が変更されました。もう一度お試しください"}
-    # 単調保持（monotonic）とする——cap
-    # （`_BEDROCK_VERIFIED_MODELS_MAX`）が満杯だと新規 ID は記録されない（evict して押し込むことは
-    # しない＝既存 ID を後から取り消さないため）。probe 自体は成功していても ok:true で「選択肢には
-    # 追加されたのに保存できない」握りつぶしを作らないよう、専用のエラーで正直に失敗を返す。
-    if model_id not in retained:
-        return {"ok": False, "error": "検証済みモデルIDの保存枠（200件）に達しています"}
-    return {"ok": True, "id": model_id, "label": _bedrock_profile_label(model_id, "")}
-
-
-def _effective_provider_for_field(field: str, settings: dict,
-                                  system_settings: dict | None = None) -> tuple[str | None, bool]:
-    """モデル名フィールドが実際に使われるプロバイダを `settings`（1つの設定値の集合＝保存済みの
-    現在値、またはリクエストを重ねた保存後の見込み値のいずれでもよい）から求める。
-
-    戻り値 `(provider, consumed)` の3状態（RV 是正）:
-      - `(具体的なプロバイダ名, True)`: そのプロバイダのセルだけで判定する（`field_valid`/
-        `field_choice_info` に `provider=` を渡す）。
-      - `(None, True)`: **未確定**（auto の解決がキー等の実行時状態に依存し、この呼び出し時点では
-        判断しない）。呼び出し側は複数プロバイダの和集合で寛容に判定する。
-      - `(None, False)`: **非消費**（このフィールドの値は現在の選択では実行時に一切使われない・
-        例: `intent_provider` が実質的に bedrock へ解決される場合は intent 分類に bedrock 経路が
-        無いため `intent_model` を消費しない、`search_helper=""` は検索アシスタント自体が無効で
-        `search_helper_model` を消費しない）。呼び出し側はモデル名検証を省略する（対象外として
-        常に許可）＝正当な切替・無効化が、消費されない古い保存値によって誤って 422 にならない
-        ようにする。
-
-    `openai_model`/`gemini_model`/`ollama_model`/`codex_model` はプロバイダが固定（欄名そのものが
-    プロバイダを表す）なので対象外＝ `(None, True)` を返す（`field_valid` 側が単一プロバイダの
-    積集合で判定する）。
-
-    `intent_provider`（または `extract_provider` フォールバック）の決定は `llm.resolve_provider_selection`
-    （`pick_provider_selector` で明示 `auto` と空文字継承を区別し、auto に落ちた場合は実行時の
-    `select_provider()` と同じ関数（`llm.resolve_auto_provider`）で解決する共有ラッパー・RV 是正）を
-    使う。ここで解決を諦めて `(None, True)`（和集合フォールバック）に倒すと、保存時検証が「実行時は
-    特定の1プロバイダに決まるのに、保存時は何でも許してしまう」という食い違いを起こす。
-
-    `system_settings`（省略可）: auto 解決へそのまま渡す（省略時は自分で読む）。
-    """
-    if field == "intent_model":
-        selector = llm.pick_provider_selector(settings.get("intent_provider"), settings.get("extract_provider"))
-        if selector == "bedrock":
-            return None, False   # intent 分類に bedrock 経路は無い（現状の runtime 実装・非消費）
-        return llm.resolve_provider_selection(
-            settings.get("intent_provider"), settings.get("extract_provider"), settings=settings,
-            system_settings=system_settings), True
-    if field == "search_helper_model":
-        choice = str(settings.get("search_helper") or "").strip().lower()
-        if not choice:
-            return None, False   # 検索アシスタント無効化＝非消費
-        return (choice if choice in (search_helper.OLLAMA, search_helper.OPENAI) else None), True
-    return None, True
-
-
 @settings_router.put("/settings", tags=["設定"], response_model=SettingsResponse)
 def settings_put(req: SettingsReq, request: Request):
-    """現在ユーザーの設定を更新（未指定フィールドは変更しない）。
-
-    `bedrock_model` は allowlist 検証する（空文字/未指定＝既定を許可・静的選択肢／このユーザーが
-    verify・列挙で実在確認済みの ID／現在保存中の値（grandfather）のいずれかでなければ 422）。
-    `BEDROCK_MODEL_ID_RE` の**形式一致だけ**で許可すると、
-    形だけ正しい架空 ID が verify を経ずに保存できてしまう。
-    正規表現単独では通さない＝`store.add_bedrock_verified_models` に記録済みの ID だけを許可する
-    （BEDROCK_MODEL_CHOICES 参照）。`agent` も同様に allowlist 検証する
-    （監査ログに任意文字列が入るのを防ぐため。単一の真実源は
-    `sherpa.agents.AGENT_PROVIDERS`）。
-
-    `ollama_url` は保存前に `llm.assert_ollama_url_allowed`
-    で宛先ポリシー（loopback／admin allowlist）を検証する。ブロック時は汎用メッセージの 422 のみ返す
-    （到達可否の詳細は返さない＝到達オラクル対策・詳細は POST /settings/test 側で丸める）。
-
-    A6（個人 API キー原則）: `personal_api_keys_allowed`（既定 false・管理画面で設定）が偽のときは
-    クラウド AI のキー3種（openai/gemini/bedrock）を一切書かせない（422）。個人には発行しない、という
-    原則をコードで強制する＝キー入力欄自体は UI 側で非表示にするが、直接 API を叩かれても拒否する。
+    """現在ユーザーの設定を更新する（未指定フィールドは変更しない）。
+    `agent` は許可された頭脳のみ（閉じた頭脳は 422）。`ollama_url` は宛先ポリシー（loopback／admin allowlist）に合わないと 422（到達可否の詳細は返さない）。管理画面で個人キーが許可されていない（`personal_api_keys_allowed` が偽）ときは、クラウド AI のキーを保存できず 422。
     """
     u = _current_user(request)
     uid = u["uid"]
-    # この関数内の system_settings 依存の判定・解決（A6・A7・Ollama URL/allowlist・モデル
-    # カタログ）はすべて同じスナップショットで行う（個別に読み直すと、検証の途中で admin 設定が
-    # 変わった場合に判定が矛盾しうる）。
-    # 個人キーの実書込みだけは、このスナップショットが古くなる余地（admin が事後に無効化＋一括
-    # 削除する競合）が残るため、`store.update_settings()` が書込み直前に advisory lock 付きで
-    # 別途再確認する（`store.PersonalKeysDisallowedError` 参照・下の except 節）。
+    # この関数内の system_settings 依存の判定・解決（A6・A7・Ollama URL/allowlist・モデルカタログ）は同じスナップショットで行う。個人キーの実書込みだけは、`store.update_settings()` が書込み直前に advisory lock 付きで再確認する（`store.PersonalKeysDisallowedError`）。
     sys_s = store.get_system_settings()
     if not keys.personal_keys_allowed(sys_s):
-        for _k in ("openai_api_key", "gemini_api_key", "bedrock_api_key"):
+        for _k in ("openai_api_key",):
             if getattr(req, _k) is not None:
                 raise HTTPException(422, "個人 API キーは無効化されています（管理者が中央設定でキーを管理します）")
-    # grandfather 判定（現在保存中の値）用に一度だけ取得する（bedrock verified 一覧・各モデル名欄の
-    # 現在値の両方に使う）。
-    cur = store.get_settings(uid)
-    # このリクエストを重ねた「保存後に成立する設定」。モデル名/接続先の検証・実効プロバイダ解決
-    # ・接続先 probe など、複数箇所で同じ「保存後の姿」を見る必要があるため一度だけ作る
-    # （`is not None`＝送られてきたフィールドだけ重ねる・明示的な "" も正しく重なる）。
-    pending = {**cur, **{k: v for k, v in req.model_dump().items() if v is not None}}
-    if req.bedrock_model:
-        if not _bedrock_model_id_valid(req.bedrock_model, cur.get("bedrock_verified_models"),
-                                       cur.get("bedrock_model")):
-            raise HTTPException(422, "bedrock_model は選択肢から選ぶか、モデル取得/検証済みのIDを指定してください")
-    if req.agent and req.agent not in AGENT_PROVIDERS:
-        raise HTTPException(422, "agent は heuristic / codex / openai / ollama / gemini / bedrock のいずれか")
-    # 標準MVPは4構成だけを見せる。env で有効化していない外部AIは保存させない
-    # ＝画面から消えているのに設定だけ残る状態を作らない（`agent_constructs` 参照）。
+    if req.agent and (req.agent not in AGENT_PROVIDERS or req.agent in _CLOSED_CHAT_AGENTS):
+        raise HTTPException(422, "agent は codex / simple のいずれか"
+                                 "（Gemini・AWS Bedrock・AI なしの定型応答はチャットでは廃止しました）")
+    # 標準 MVP は 4 構成だけを見せる。env で有効化していない外部 AI は保存させない。
     if req.agent and agent_constructs.runtime_blocked(req.agent):
         raise HTTPException(422, "この AI はこの環境では利用できません（管理者が有効化していません）")
     if req.agent == "codex":
         _codex_msg = required_tools.codex_cli_missing_message()
         if _codex_msg:
             raise HTTPException(422, _codex_msg)
-    # A7（クラウドプロバイダ排他選択）: 選択中でないクラウド系 agent（openai/gemini/bedrock）は
-    # 保存させない（保存できても実行時に ollama へフォールバックするだけの構成を作らせない）。
-    if req.agent and agent_constructs.agent_requires_unselected_cloud(req.agent, sys_s):
-        raise HTTPException(422, "この AI は現在選択されているクラウドプロバイダではありません"
-                                 "（管理画面でプロバイダを切り替えるか、別の AI を選んでください）")
     if req.codex_model_provider and req.codex_model_provider not in agent_constructs.CODEX_MODEL_PROVIDERS:
         raise HTTPException(422, "codex_model_provider は openai / ollama のいずれか")
-    if req.search_helper is not None and req.search_helper not in search_helper.CHOICES:
-        raise HTTPException(422, "search_helper は空（使わない）/ ollama / openai のいずれか")
-    if req.search_helper == search_helper.OLLAMA:
-        # 保存時に実際へ届くか確かめる＝「選んだのに黙って効かない」を避ける。
-        # 宛先ポリシー（loopback/allowlist）→ 実 probe の順（settings_test と同じ流儀）。
-        # `keys.resolve_ollama_url(pending)` を使う（`req.ollama_url or ...` という truthy 判定は、
-        # UI が送る明示的な ""（個人 override をクリア＝中央既定を使う指示）を「未指定」として扱い、
-        # 個人未設定＋中央が共有 Ollama という正当な構成を localhost で probe して 422 にしてしまう
-        # 実害を避けるため）。モデルは常に管理者のカタログ既定で probe する（個人設定のモデル名
-        # 上書きは無い）。
-        _url = keys.resolve_ollama_url(pending, system_settings=sys_s)
-        try:
-            llm.assert_ollama_url_allowed(_url, system_settings=sys_s)
-        except llm.SsrfBlocked:
-            raise HTTPException(422, "指定された Ollama 接続先は許可されていません"
-                                     "（admin が allowlist に登録した host:port のみ使えます）")
-        from sherpa.ingest import graph_extract
-        _model = model_catalog.resolve_model("ollama", "subsearch", None, system_settings=sys_s)
-        _ok, _ = graph_extract._probe({"provider": "ollama", "url": _url, "model": _model})
-        if not _ok:
-            raise HTTPException(422, "ローカル（Ollama）に接続できませんでした。"
-                                     "Ollama が起動しているか、モデル名を確認してください")
     if req.ollama_url:
         try:
             llm.assert_ollama_url_allowed(req.ollama_url, system_settings=sys_s)
@@ -738,21 +232,10 @@ def settings_put(req: SettingsReq, request: Request):
     try:
         store.update_settings(uid, **fields)
     except store.PersonalKeysDisallowedError:
-        # A6 の事前チェック（上の sys_s）通過後、この保存の書込み直前に admin が無効化した
-        # （store.update_settings が同一トランザクションで再確認し fail-closed した）。
+        # 事前チェック通過後、書込み直前に admin が無効化した（`store.update_settings` が同一トランザクションで再確認して fail-closed した）。
         raise HTTPException(422, "個人 API キーは無効化されています（管理者が中央設定でキーを管理します）")
-    if "bedrock_api_key" in fields:
-        # キーを変えたら古いキーでの列挙結果を次回取得まで持ち越さない（過度な TTL 待ちを避ける）。
-        # GET 側と同じロックで保護する（dict 操作自体は GIL で原子的だが、GET の
-        # read-check→write の複合操作と時系列を揃えるため同じロックを使う）。
-        # 世代カウンタも同時に increment する（GET 側が「記録直後・キャッシュ書込直前」に
-        # 世代の変化を検知し、この pop の後に別の GET が新しい有効な entry を書いても、それより
-        # 前に開始していた古い GET の遅延書込がそれを潰さないようにするため）。
-        with _BEDROCK_MODELS_CACHE_LOCK:
-            _BEDROCK_MODELS_CACHE.pop(uid, None)
-            _BEDROCK_MODELS_CACHE_GEN[uid] = _BEDROCK_MODELS_CACHE_GEN.get(uid, 0) + 1
     try:
-        # API key の before/after は <set>/<unset>/<cleared> のみ記録（値は保存しない）。
+        # API key の before/after は <set>/<unset>/<cleared> のみ記録する（値は保存しない）。
         _audit_settings_update(uid, fields)
     except Exception:
         _log.warning("audit write failed for settings.updated (best-effort)")
@@ -761,17 +244,13 @@ def settings_put(req: SettingsReq, request: Request):
 
 def _audit_settings_update(uid: str, fields: dict) -> None:
     """settings 更新の監査（API key は状態のみ・値は保存しない）。"""
-    secret_keys = {"openai_api_key", "gemini_api_key", "bedrock_api_key"}
+    secret_keys = {"openai_api_key"}
     changed: dict = {}
     for k, v in fields.items():
         if k in secret_keys:
             changed[k] = "<set>" if v else "<cleared>"
-        elif k == "system_prompt":
-            changed[k] = {"changed": True, "len": len(v) if v else 0}
         elif k == "ollama_url" and v:
-            # 多層防御: 通常は保存前に `assert_ollama_url_allowed`（`_canonical_host_port` が
-            # userinfo 付き URL を拒否する）を通るため userinfo が残った値はここへ届かないはずだが、
-            # 監査ログ側でも念のため除去する（`llm._redact_url_for_error` と同じロジックを再利用）。
+            # 多層防御: userinfo 付き URL は保存前に拒否されるが、監査ログ側でも念のため除去する（`llm._redact_url_for_error` と同じロジック）。
             changed[k] = llm._redact_url_for_error(v) or "<不正なURL>"
         else:
             changed[k] = v
@@ -781,118 +260,65 @@ def _audit_settings_update(uid: str, fields: dict) -> None:
 
 
 def _round_ollama_probe_detail(detail: str) -> str:
-    """`POST /settings/test`（provider=ollama）の失敗理由を丸める（R2a-S2: 到達オラクル低減）。
-
-    Connection refused/timeout/reset/DNS 失敗の区別を出さない（内部ホスト/ポートの生死判別に使える
-    ポートスキャンオラクルになるため・到達可否そのものは allowlist で塞ぐ＝ここは detail の粒度だけ）。
-    認証失敗（401 相当）だけは区別を残す（`graph_extract._http_detail` は HTTPError を
-    `f"{e.code} ...: ..."` 形式に整形するため、401 はここで先頭一致する）。
-    """
+    """`POST /settings/test`（provider=ollama）の失敗理由を丸める。Connection refused/timeout/reset/DNS 失敗の区別を出さない（内部ホスト/ポートの生死判別に使われないため）。認証失敗（401 相当）だけは区別を残す（`graph_extract._http_detail` の `f"{e.code} ...: ..."` 形式に先頭一致する）。"""
     if detail.startswith("401"):
         return detail
     return "Ollama への接続に失敗しました（詳細は表示しません）"
 
 
 class TestReq(BaseModel):
-    provider: str                              # openai / gemini / ollama / codex / bedrock
-    openai_api_key: str | None = None          # 未入力なら保存済みキーで試す（入力時はそれで試す）
-    gemini_api_key: str | None = None
+    provider: str  # openai / ollama / codex。
+    openai_api_key: str | None = None  # 未入力なら保存済みキーで試す（入力時はそれで試す）。
     ollama_url: str | None = None
-    bedrock_model: str | None = None           # Bedrock だけ例外＝下記参照
-    bedrock_api_key: str | None = None
-    # `bedrock_region` はここに置かない（region は常に東京固定＝`BedrockProvider`/`_bedrock_region`
-    # 参照。入力を受け取っても無視されるだけの死んだフィールドを API 面に残さない）。
-    # モデル名（openai/gemini/ollama/codex）はここに置かない。`/settings/test` はログイン済みなら
-    # 誰でも呼べる（管理者確認なし・レート制限もない）ため、任意のモデル名を受け取ると一般ユーザーが
-    # 実 probe（外部 API への実リクエスト）へ任意の値を到達させられてしまう。モデルは常に管理者の
-    # 使えるモデル一覧の解決値で probe する（Bedrock だけ例外＝実在確認済みモデルの専用機構
-    # （`store.add_bedrock_verified_models`）が別にあり、確認前の入力中の ID を試す用途がある）。
-    # 接続先（kind/base_url/auth_header/api_version）の override もここに**置かない**。
-    # `/settings/test` はログイン済みなら誰でも呼べる（管理者確認なし）ため、一般ユーザーが任意の
-    # HTTPS 宛先を指定して中央キーを送信できてしまう SSRF／キー漏洩の穴になる。保存前の入力中の
-    # 接続先で試す機能は admin 専用（`POST /admin/settings/openai-endpoint-test`・system_extras.py）
-    # に分離した。この `/settings/test` は常に**保存済みの** system_settings をそのまま使う。
+    # モデル名と接続先（kind/base_url/auth_header/api_version）の override はここに置かない。`/settings/test` はログイン済みなら誰でも呼べるため、任意の値を受けると実 probe への到達や中央キーの送信先指定に使われる。モデルは常に管理者の使えるモデル一覧の解決値で、接続先は保存済みの system_settings で probe する（入力中の接続先で試す機能は admin 専用の `POST /admin/settings/openai-endpoint-test`）。
 
 
 @settings_router.post("/settings/test", tags=["設定"], response_model=SettingsTestResponse)
 def settings_test(req: TestReq, request: Request):
-    """API キー/モデルの**接続テスト**（1回だけ最小リクエスト）。保存はしない。入力中のキーで試せる。
-
+    """API キー/モデルの接続テスト（1 回だけ最小リクエスト）。保存はしない。入力中のキーで試せる。
     返値 `{ok, provider, model, detail}`。ok=False の detail に実エラー（401=認証/429=クォータ/モデル不明 等）を載せる。
-
-    provider=ollama は宛先ポリシー（loopback／admin
-    allowlist）を probe 前に検証し、ブロック時は probe せず汎用メッセージの 422 を返す。probe した
-    上での失敗は Connection refused/timeout/reset/DNS の区別を出さず丸める（`_round_ollama_probe_detail`
-    参照・到達可否の詳細を返す到達オラクルを避ける。401 相当の認証失敗だけは区別を残す）。
+    provider=ollama は宛先ポリシー（loopback／admin allowlist）に合わないと接続せず 422 を返す。接続後の失敗は、到達可否の区別を出さず丸める（401 相当の認証失敗だけ区別を残す）。
     """
     from sherpa.ingest import graph_extract
     u = _current_user(request)
     s = store.get_settings(u["uid"])
-    # system_settings 依存の解決（キー・モデル・URL・宛先許可）はこの1回のスナップショットで行う
-    # （個別に読み直すと、接続テスト中に admin 更新が挟まった場合に判定が新旧混在しうる）。
+    # system_settings 依存の解決（キー・モデル・URL・宛先許可）はこの 1 回のスナップショットで行う。
     sys_s = store.get_system_settings()
-    # 正規化不一致の是正: 前後の空白を除去してから比較する（実行時の共通判定＝A7/agent/
-    # search_helper 等と同じ流儀・" OLLAMA " のような値を誤って「不明な provider」扱いしない）。
+    # 前後の空白を除去してから比較する（実行時の判定と同じ）。
     prov = str(req.provider or "").strip().lower()
     pending = dict(s)
-    # `ollama_url` は個人設定として残る欄＝送られてこなければ保存済みの値をそのまま使う
-    # （`req.model or s.get(...)` という truthy 判定は、UI が送る明示的な `""`（クリア＝中央既定に
-    # 従う）を「未指定」として扱ってしまい、保存済みの古い値のまま接続テストしてしまうため、
-    # 値をそのまま重ねる＝`keys.resolve_ollama_url()` が空文字を正しく「既定へフォールバック」と
-    # して扱う）。
+    # `ollama_url` は個人設定として残る欄で、送られてこなければ保存済みの値を使う。明示的な `""`（クリア＝中央既定に従う）はそのまま重ねる（`keys.resolve_ollama_url()` が空文字を既定へフォールバックする）。
     if req.ollama_url is not None:
         pending["ollama_url"] = req.ollama_url
-    # モデル名は個人設定に無く TestReq にも無い（管理者の使えるモデル一覧の解決値のみで probe
-    # する・一般ユーザーが任意のモデル名を実 probe へ到達させられないようにするため）。
-    if prov == "codex":                       # Codex は CLI＝キー不要。CLI の有無とログイン状態を確認（フル exec はしない）
+    # モデル名は個人設定にも TestReq にも無く、管理者の使えるモデル一覧の解決値だけで probe する。
+    if prov == "codex":  # Codex は CLI＝キー不要。CLI の有無とログイン状態を確認する（フル exec はしない）。
         import shutil
         import subprocess
         model = model_catalog.resolve_model("codex", "codex", None, system_settings=sys_s)
-        # `codex login status`（下記）はモデル名を一切見ない（ログイン状態だけを見る）ため、
-        # 文法として不正なモデル名（`CodexProvider` が実行時に拒否する値）でも subprocess 経路は
-        # ok=True を返してしまう。ここで共通文法（`CodexProvider` と同じ判定）を先に確認する。
+        # `codex login status` はモデル名を見ないため、文法として不正なモデル名（`CodexProvider` が実行時に拒否する値）を先に共通文法で確認する。
         if model and not model_catalog.CODEX_MODEL_NAME_RE.fullmatch(model):
             return {"ok": False, "provider": "codex", "model": model,
                     "detail": "モデル名の形式が不正です（使える文字: 英数字 . _ : / - ・64文字以内）"}
         if not shutil.which("codex"):
             return {"ok": False, "provider": "codex", "model": model, "detail": "codex CLI が見つかりません（インストール/PATH を確認）"}
-        # 接続先が Azure 等（`openai_endpoint_kind() != "openai"`）の
-        # Codex(OpenAI) 構成は `codex login status`（auth.json のログイン状態）が実際に動くかと無関係
-        # （env のキーで接続する設計・`sandbox.py::_codex_clean_env` 参照）。この分岐が無いと
-        # 「CLI あり＋ログイン済み」であれば ok=True を返してしまい、実際には `_select_provider` が
-        # `_UnwiredProvider` を返す（実キー/デプロイ名/サンドボックス/base URL のいずれか不足）
-        # 構成でも接続テストだけ緑になる不整合が起きる。`_select_provider` と判定ロジックを共有する
-        # （重複実装しない）ため `providers._codex_openai_compat_block_reason` を呼ぶ。入力中の未保存の
-        # キー（`req.openai_api_key`）も試せるよう明示 override として渡す（モデル名は個人上書きが
-        # 無いため明示指定しない）。
-        # Codex(Ollama) 構成: サンドボックス無効時は `_select_provider` と同じ理由で fail-closed
-        # （実行時と接続テストで判定が食い違うと、保存前は緑なのに実行時だけ honest failure になる
-        # 不整合が起きる）。それ以外（従来どおり login status を見る＝Azure 判定と無関係）。
+        # 接続先が Azure 等（`openai_endpoint_kind() != "openai"`）の Codex(OpenAI) 構成は、`codex login status` ではなく env のキーで接続する（`sandbox.py::_codex_clean_env`）。`_select_provider` と判定を共有するため `providers._codex_openai_compat_block_reason` を呼び、入力中の未保存キー（`req.openai_api_key`）も明示 override として渡す。
+        # Codex(Ollama) 構成: サンドボックス無効時は `_select_provider` と同じく fail-closed にする。それ以外は `login status` を見る。
         from sherpa import llm as _llm
-        # 正規化不一致の是正: 生値の raw string 比較でなく、実行時（_select_provider）と同じ
-        # 共通resolver（`agent_constructs.codex_model_provider`）を通す＝「anthropic」等の不正値・
-        # 前後空白は同じ判定/エラーになる（保存前は緑なのに実行時だけ食い違う事故を防ぐ）。
+        # 実行時（`_select_provider`）と同じ共通 resolver（`agent_constructs.codex_model_provider`）を通す。
         try:
             codex_provider_choice = agent_constructs.codex_model_provider(s)
         except agent_constructs.InvalidCodexModelProviderError as e:
             return {"ok": False, "provider": "codex", "model": model, "detail": str(e)}
-        # Ollama 分岐を先に見る（_select_provider と同じ順序＝providers/__init__.py 参照）。
-        # 先に openai_endpoint_kind を評価すると、Codex(Ollama) 利用時でも無関係な OpenAI 系
-        # 設定の型破損（JSONB の非文字列値）で ValueError になり、接続テストが false negative
-        # になってしまう。
+        # Ollama 分岐を先に見る（`_select_provider` と同じ順序）。先に `openai_endpoint_kind` を評価すると、OpenAI 系設定の型破損で ValueError になり接続テストが偽陰性になる。
         if codex_provider_choice == "ollama":
             from sherpa.providers import _codex_ollama_sandbox_disabled_reason
             sandbox_reason = _codex_ollama_sandbox_disabled_reason()
             if sandbox_reason is not None:
                 return {"ok": False, "provider": "codex", "model": model, "detail": sandbox_reason}
-            # Codex(Ollama) は codex login を使わない（独自プロバイダで Ollama へ直接つなぐ）ので、
-            # 実行時と同じ接続先へ届くか・モデルがあるかを確かめる。
+            # Codex(Ollama) は codex login を使わないため、実行時と同じ接続先へ届くか・モデルがあるかを確かめる。
             return _codex_ollama_probe(s, sys_s, model)
         else:
-            # `sys_s`（保存済み中央設定）の openai_endpoint_kind/openai_base_url は JSONB のため
-            # 非文字列の破損値もあり得る。`openai_endpoint_kind()` は判定分岐より先に型検査する契約
-            # のため、破損時は ValueError を送出しうる＝ここで捕捉して正直な失敗にする
-            # （未捕捉のまま 500 にしない）。
+            # `sys_s` の openai_endpoint_kind/openai_base_url は JSONB で非文字列の破損値がありうる。`openai_endpoint_kind()` は型検査で ValueError を出しうるため、ここで捕捉して正直な失敗にする。
             try:
                 _codex_kind = _llm.openai_endpoint_kind(sys_s)
             except ValueError:
@@ -901,21 +327,18 @@ def settings_test(req: TestReq, request: Request):
         if _codex_kind != "openai":
             from sherpa.providers import _codex_openai_compat_block_reason
             probe_settings = {**s, "openai_api_key": req.openai_api_key or s.get("openai_api_key")}
-            # 入力中の未保存キー（req.openai_api_key）は A6（personal_api_keys_allowed）の対象外で
-            # 試せるよう、明示 override として渡す（保存・ログ出力はしない）。モデル名は個人上書きが
-            # 無い＝`model`（管理者のカタログ解決値）と常に一致するため明示指定しない。
+            # 入力中の未保存キー（req.openai_api_key）は A6（personal_api_keys_allowed）の対象外で試せるよう、明示 override として渡す（保存・ログ出力はしない）。
             reason = _codex_openai_compat_block_reason(probe_settings, explicit_openai_api_key=req.openai_api_key,
                                                         system_settings=sys_s)
             if reason is not None:
                 return {"ok": False, "provider": "codex", "model": model, "detail": reason}
-            # 形式確認（サンドボックス有効・base URL 妥当・実キー・非既定デプロイ名）だけでは、
-            # キー無効／デプロイ名不在／権限不足／DNS 不到達等の実失敗を「接続OK」と誤表示して
-            # しまう。ここで実際に1回だけ最小リクエストする（Codex CLI 自体は起動しない＝
-            # Codex が使うのと同じ base_url/キー/デプロイ名への直接プローブ。`graph_extract._probe`
-            # は他プロバイダの接続テストと共有する唯一の実 HTTP 経路＝テストはここを差し替える）。
-            # Codex CLI 経由（Responses API・実際の config.toml 生成物）の生死判定は
-            # `make azure-smoke ARGS="--codex"` が別途担う。
-            resolved_key = probe_settings["openai_api_key"] or keys.resolve_api_key("openai", s, system_settings=sys_s)
+            # 形式確認だけでは実失敗（キー無効・デプロイ名不在・権限不足・DNS 不到達）を「接続OK」と誤表示するため、実際に 1 回だけ最小リクエストする（Codex CLI は起動せず、Codex が使うのと同じ base_url/キー/デプロイ名への直接プローブ。`graph_extract._probe` が他プロバイダと共有する唯一の実 HTTP 経路）。Codex CLI 経由の生死判定は `make azure-smoke ARGS="--codex"`。
+            try:
+                keys.selected_cloud_provider(sys_s, strict=True)  # 入力中のキーでも廃止済み保存値では送信しない。
+                resolved_key = probe_settings["openai_api_key"] or keys.resolve_api_key(
+                    "openai", s, system_settings=sys_s, strict=True)
+            except keys.InvalidCloudProviderConfigError as e:
+                return {"ok": False, "provider": "codex", "model": model, "detail": str(e)}
             ok, detail = graph_extract._probe({"provider": "openai", "key": resolved_key, "model": model,
                                               "openai_endpoint_override": sys_s})
             return {"ok": ok, "provider": "codex", "model": model,
@@ -928,108 +351,54 @@ def settings_test(req: TestReq, request: Request):
         except Exception as e:
             ok, detail = False, f"{type(e).__name__}"[:200]
         return {"ok": ok, "provider": "codex", "model": model, "detail": detail}
-    if prov == "bedrock":                     # Bedrock は Anthropic SDK 直呼び（messages.create を max_tokens=16 で1回）
-        from sherpa.agents import BedrockProvider
-        model = req.bedrock_model or s.get("bedrock_model") or _BEDROCK_MODEL
-        # 入力キー優先（未保存でも試せる）→中央/個人（A6/A7）解決。SDK の env(Bearer) チェーンには
-        # もう委ねない（env はシード専用という所有原則に合わせる）。この直後で probe（実 API
-        # 呼び出し）に使うため strict=True で解決する（課金を伴う接続テストは非 strict の
-        # 寛容キー解決で実送信してはならないため）。
-        try:
-            api_key = req.bedrock_api_key or keys.resolve_api_key("bedrock", s, system_settings=sys_s, strict=True)
-        except keys.InvalidCloudProviderConfigError as e:
-            return {"ok": False, "provider": "bedrock", "model": model, "detail": str(e)}
-        # region は常に東京固定（`BedrockProvider`/`_bedrock_region` 参照・入力面を持たない）。
-        ok, detail = BedrockProvider(None, model, api_key).probe()
-        # BedrockProvider.probe() は内部で安全境界（_safe_bedrock_detail）を通すが、ここでも
-        # _redact_bedrock_secret を重ねる（probe() 自体が差し替えられても抜けない最終防衛線・
-        # req.bedrock_api_key は未保存の入力中キーのこともあり、なおさら厳重に・二重適用は無害）。
-        safe_detail = _redact_bedrock_secret(detail, api_key) if not ok else "接続OK"
-        return {"ok": ok, "provider": "bedrock", "model": model, "detail": safe_detail}
-    if prov == "gemini":
-        model = model_catalog.resolve_model("gemini", "chat", None, system_settings=sys_s)
-        # この直後で probe（実 API 呼び出し）に使うため strict=True で解決する（課金を伴う
-        # 接続テストは非 strict の寛容キー解決で実送信してはならないため）。
-        try:
-            gemini_key = req.gemini_api_key or keys.resolve_api_key("gemini", s, system_settings=sys_s, strict=True)
-        except keys.InvalidCloudProviderConfigError as e:
-            return {"ok": False, "provider": "gemini", "model": model, "detail": str(e)}
-        cfg = {"provider": "gemini", "key": gemini_key, "model": model}
-    elif prov == "openai":
+    if prov == "openai":
         model = model_catalog.resolve_model("openai", "chat", None, system_settings=sys_s)
-        # この直後で probe（実 API 呼び出し）に使うため strict=True で解決する（課金を伴う
-        # 接続テストは非 strict の寛容キー解決で実送信してはならないため）。
+        # この直後の probe（実 API 呼び出し）に使うため strict=True で解決する（課金を伴う接続テストを寛容なキー解決で実送信しない）。
         try:
+            keys.selected_cloud_provider(sys_s, strict=True)  # 入力中のキーでも廃止済み保存値では送信しない。
             openai_key = req.openai_api_key or keys.resolve_api_key("openai", s, system_settings=sys_s, strict=True)
         except keys.InvalidCloudProviderConfigError as e:
             return {"ok": False, "provider": "openai", "model": model, "detail": str(e)}
-        # env の OPENAI_API_KEY がプレースホルダのままだと、
-        # 真偽値だけの判定は「キーあり」と誤認して実 API へ probe しに行き、分かりにくい 401 になる。
-        # 他の消費箇所（provider 選択・health・設定済み表示）と同じ `is_real_api_key` で早期に弾く
-        # （下の `not cfg.get("key")` 判定が `keys.NO_CENTRAL_KEY_MESSAGE` を返す・利用者が入力した
-        # 実キーの扱いは変えない）。
+        # env の OPENAI_API_KEY がプレースホルダのままだと分かりにくい 401 になるため、他の消費箇所と同じ `is_real_api_key` で早期に弾く（利用者が入力した実キーの扱いは変えない）。
         cfg = {"provider": "openai",
                "key": openai_key if agent_constructs.is_real_api_key(openai_key) else None,
                "model": model,
-               # 接続先も含め、この probe 全体を入口で読んだ1つの `sys_s` だけで完結させる
-               # （`complete_json` が送信時に別途 system_settings を読み直すと、この probe の
-               # 判定中に admin 保存が挟まった場合、旧キーを新接続先へ送る等の混在が起こり得る）。
-               # 一般ユーザーの接続先 override は受け付けない（admin 専用の
-               # `POST /admin/settings/openai-endpoint-test` へ分離済み）。
+               # 接続先も含め、この probe 全体を入口で読んだ 1 つの `sys_s` だけで完結させる（`complete_json` が別途読み直すと旧キーを新接続先へ送る混在が起こりうる）。一般ユーザーの接続先 override は受け付けない。
                "openai_endpoint_override": sys_s}
     elif prov == "ollama":
         cfg = {"provider": "ollama", "url": keys.resolve_ollama_url(pending, system_settings=sys_s),
                "model": model_catalog.resolve_model("ollama", "chat", None, system_settings=sys_s)}
-        # R2a-S2: probe（実 I/O）の**前**に宛先ポリシーを検証する。ブロック時は probe せず汎用
-        # メッセージの 422 のみ返す（到達可否の詳細を返さない＝到達オラクル対策）。
+        # probe（実 I/O）の前に宛先ポリシーを検証する。ブロック時は probe せず汎用メッセージの 422 のみ返す。
         try:
             llm.assert_ollama_url_allowed(cfg["url"], system_settings=sys_s)
         except llm.SsrfBlocked:
             raise HTTPException(422, "指定された Ollama 接続先は許可されていません"
                                      "（admin が allowlist に登録した host:port のみ確認できます）")
     else:
-        raise HTTPException(422, "provider は openai / gemini / ollama / codex / bedrock のいずれか")
-    if prov in ("openai", "gemini") and not cfg.get("key"):
+        raise HTTPException(422, "provider は openai / ollama / codex のいずれか")
+    if prov == "openai" and not cfg.get("key"):
         return {"ok": False, "provider": prov, "model": cfg["model"], "detail": keys.NO_CENTRAL_KEY_MESSAGE}
     ok, detail = graph_extract._probe(cfg)
     if prov == "ollama" and not ok:
-        # R2a-S2: Connection refused/timeout/reset/DNS の区別を出さない（ポートスキャンオラクル低減・
-        # 401 相当の認証失敗だけは区別を残す）。
+        # Connection refused/timeout/reset/DNS の区別を出さない（401 相当の認証失敗だけ区別を残す）。
         detail = _round_ollama_probe_detail(detail)
     return {"ok": ok, "provider": prov, "model": cfg["model"],
             "detail": "接続OK" if ok else detail}
 
 
-# ===== /healthz =====
-# router に tags を持たせない（settings_router と同じ理由・タグ二重化を避ける）。
+# /healthz。router に tags を持たせない（settings_router と同じ）。
 healthz_router = APIRouter()
 
-# 未 ready 中に未認証 /healthz が重なると、全リクエストが advisory lock に
-# 並んで各自 DDL 全文を実行し、接続/スレッドが滞留し得る。再初期化はプロセス内 single-flight
-# （非ブロッキング）にし、進行中なら試行せず即 503 を返す（sync エンドポイントは threadpool で
-# 並行実行されるため lock が要る）。
+# 未 ready 中に未認証 /healthz が重なると、全リクエストが advisory lock に並んで各自 DDL 全文を実行し滞留しうる。再初期化はプロセス内 single-flight（非ブロッキング）にし、進行中なら試行せず即 503 を返す（sync endpoint は threadpool で並行実行されるため lock が要る）。
 _schema_init_inflight = threading.Lock()
 
-# env→system_settings シード再試行の single-flight（schema 初期化とは独立＝schema 自体は ready の
-# まま「シードだけ」が一時的に失敗した場合（DB の瞬断等）も、次の healthz 呼び出しで再試行できる
-# ようにする（schema-ready への「遷移」の瞬間だけに絞ると、その回だけ DB が落ちていた場合に
-# 永久に再試行されなくなる）。
+# env→system_settings シード再試行の single-flight。schema が ready のままシードだけ一時失敗した場合も、次の healthz で再試行できるようにする。
 _seed_retry_inflight = threading.Lock()
 
 
 @healthz_router.get("/healthz", tags=["システム"])
 def healthz():
-    """死活監視用エンドポイント（R5: schema readiness 連動＝liveness→readiness 化）。
-
-    `store.schema_ready()` が False（未適用・lifespan 起動時に DB 不達だった等）なら
-    `store.init_schema()` を一度だけ試み（プロセス内 single-flight・進行中なら試行しない）、
-    それでも ready でなければ 503 を返す（2026-07-13-横断レビュー対応.md R5）。ready なら従来どおり 200。
-
-    schema が ready（今回の呼び出しで初めて ready になった場合も、すでに ready だった場合も両方）
-    のたびに `api._seed_settings_from_env()` を試みる（起動時の env→system_settings シードが
-    DB 不達で完了マーカーを付けられなかった場合の再試行経路）。シード自体は冪等
-    （`store.seed_system_settings_once` が ON CONFLICT DO NOTHING で保護）なため、
-    ready 確認のたびに呼んでも安全＝完了マーカーがあれば内部で即座に何もしない。
+    """死活監視用エンドポイント（schema readiness 連動）。DB のスキーマが未適用なら一度だけ初期化を試み、それでも ready でなければ 503、ready なら 200 を返す。
     """
     if not store.schema_ready() and _schema_init_inflight.acquire(blocking=False):
         try:
@@ -1038,16 +407,19 @@ def healthz():
             pass
         finally:
             _schema_init_inflight.release()
+    # schema が ready のたびに env→system_settings のシードを再試行する（冪等・single-flight）
     if store.schema_ready() and _seed_retry_inflight.acquire(blocking=False):
         try:
-            from sherpa import api as _api   # 循環回避のため関数内 import（api.py は本モジュールを import 済み）
+            from sherpa import api as _api  # 循環回避のため関数内 import
             _api._seed_settings_from_env()
-            _api._seed_ollama_url_from_env()   # 同じ single-flight／再試行の枠に相乗り（独立したマーカー）
-            _api._confirm_legacy_env_seed_marker()   # 同じ single-flight／再試行の枠に相乗り（旧マーカー互換）
-            _api._catchup_ollama_allowlist_for_central_url()   # 同じ single-flight／再試行の枠に相乗り
-            _api._seed_openai_endpoint_from_env()   # 同じ single-flight／再試行の枠に相乗り（独立したマーカー）
-            _api._seed_depth_profile_from_env()   # 同じ single-flight／再試行の枠に相乗り（独立したマーカー）
-            model_catalog.seed_catalog_once()   # 同じ single-flight／再試行の枠に相乗り（独立したマーカー）
+            _api._seed_ollama_url_from_env()
+            _api._warn_central_ollama_not_allowed()
+            _api._seed_openai_endpoint_from_env()
+            _api._seed_depth_profile_from_env()
+            _api._seed_screen_settings_from_env()
+            _api._seed_user_agent_from_env()
+            _api._seed_vlm_ollama_url_from_env()
+            model_catalog.seed_catalog_once()
         except Exception:
             pass
         finally:
@@ -1057,12 +429,12 @@ def healthz():
     return {"ok": True}
 
 
-# ===== / (ルート) =====
+# /（ルート）。
 
 root_router = APIRouter()
 
 
 @root_router.get("/", tags=["システム"])
 def _root():
-    """ルートアクセスをトップ画面（/ui/home.html・運営掲示板）へ redirect。チャット直リンクは不変。"""
+    """ルートアクセスをトップ画面（/ui/home.html・運営掲示板）へ redirect する。"""
     return RedirectResponse("/ui/home.html")

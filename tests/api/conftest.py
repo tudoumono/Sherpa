@@ -4,11 +4,11 @@ tests/api 配下は FastAPI TestClient 経由で `sherpa.api.app` を叩く。�
 `python3 file.py` の別プロセス直実行（Makefile の for ループ）を前提に、import 直後で
 `os.environ` を書き換えていた。pytest で一括収集すると同一プロセスに複数ファイルが同居するため、
 **import 時にしか読まれない env**（module 定数）は最初に import したファイルの値で固定されてしまい、
-後続ファイルが書き換えても手遅れになる（実測で確認済み: `sherpa.api._USERS_DIR` /
-`_WORKSPACE_TTL_DAYS` は import 時の1度きりの評価）。
+後続ファイルが書き換えても手遅れになる（実測で確認済み: `sherpa.api._USERS_DIR` は
+import 時の1度きりの評価）。
 
 このファイルが解決する対象:
-  - `SHERPA_USERS_DIR` / `SHERPA_WORKSPACE_TTL_DAYS`（api.py が import 時に1度だけ読む定数）
+  - `SHERPA_USERS_DIR`（api.py が import 時に1度だけ読む定数）
     → tests/api のどの test_*.py よりも**先に**（conftest はテストファイル収集前に import される）
       ここで確定する。個人 workspace を一時ディレクトリへ逃がしたい各ファイルは
       `os.environ["SHERPA_USERS_DIR"]` を**読むだけ**にし、自前の `tempfile.mkdtemp` は行わない
@@ -29,7 +29,6 @@ os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 os.environ.setdefault("SHERPA_DISABLE_EMBED", "1")   # 実埋め込み API を叩かない（ES は BM25 のみ）
 os.environ.pop("SHERPA_AUTH_DISABLED", None)
 os.environ.setdefault("SHERPA_USERS_DIR", tempfile.mkdtemp(prefix="sherpa_api_users_"))
-os.environ.setdefault("SHERPA_WORKSPACE_TTL_DAYS", "90")
 # W2'（2026-07-08）: office_com direct モードは実 powershell.exe を検出すると one-shot を起動しうる。
 # _admin_settings_view は office_com の到達性を毎回プローブする＝開発機（実 Windows ホスト付き WSL）で
 # api を走らせても実プロセスを起こさないよう、既定で direct 検出を無効化する（direct を検証するテストは
@@ -37,6 +36,13 @@ os.environ.setdefault("SHERPA_WORKSPACE_TTL_DAYS", "90")
 # export 済みの実 SHERPA_POWERSHELL_BIN（例: 実機検証セッションの残り）に迂回されうる＝
 # tests/unit/conftest.py の autouse fixture（`monkeypatch.setenv`＝常に上書き）と同じ「強制上書き」に統一する。
 os.environ["SHERPA_POWERSHELL_BIN"] = "/nonexistent/sherpa-no-powershell"
+
+
+@pytest.fixture(autouse=True)
+def _no_stream_pace(monkeypatch):
+    """SSE の思考ステップ表示の間隔を 0 にする（テスト高速化・pace が要るテストは個別に `emit_pace` を monkeypatch する）。"""
+    from sherpa import chat_service
+    monkeypatch.setattr(chat_service, "_STREAM_PACE", 0.0)
 
 
 @pytest.fixture

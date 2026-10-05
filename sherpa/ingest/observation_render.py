@@ -1,10 +1,7 @@
-"""隔離OCR workerが書くOCR補助観測Setを、Canonical RAG成果物とは別のgenerationへ永続化する。
+"""OCR 補助観測 Set（`{rel}.ai_observations.jsonl`）を、Canonical RAG 成果物とは別の generation へ永続化する。
 
-O1（§8.1一本化）で検索用途の描画（Markdown/chunkJSONL）は撤去した——OCR観測は
-VLMと合流してrag.md（正本）へ「AI観測」レコードとして統合される経路（`office_md._build_observation_set`）
-に一本化されており、grepもこの別木を直接走査しない（`grep_tool.grep_search`参照）。
-このmoduleが今も持つのは、`office_md._load_ocr_observation_sets`がその合流のために読む
-`{rel}.ai_observations.jsonl`（Observation Set本体）の永続化・世代管理・pointer切替だけである。
+OCR 観測は `office_md._build_observation_set` で rag.md の「AI観測」レコードへ統合される。
+ここは `office_md._load_ocr_observation_sets` が読む Observation Set 本体の永続化・世代管理・pointer 切替だけを持つ。
 """
 from __future__ import annotations
 
@@ -30,8 +27,7 @@ OBSERVATION_POINTER_SCHEMA = "sherpa-observation-pointer-v1"
 OBSERVATION_GENERATION_MANIFEST = ".observation-generation.json"
 OBSERVATION_GENERATION_SCHEMA = "sherpa-observation-generation-v1"
 
-# immutable generationを毎文書のES row生成で全bytes再hashしないための検証cache。
-# keyのgenerationに対し、全artifactのpath/size/mtime/ctime/inode台帳が同一な間だけ再利用する。
+# 検証済み generation の artifact 台帳（path/size/mtime/ctime/inode）が同一な間だけ、bytes の再 hash を省く
 _VERIFIED_ARTIFACT_LEDGERS: dict[tuple[str, str], str] = {}
 _VERIFICATION_CACHE_LIMIT = 64
 _ARTIFACT_SORT_CHUNK_SIZE = 2048
@@ -46,7 +42,7 @@ class ObservationArtifactPaths:
 
 @dataclass(frozen=True)
 class ObservationRecord:
-    """DBから1行ずつ渡せる、1資料・1 OCR routeの有界な公開単位。"""
+    """DB から1行ずつ渡せる、1資料・1 OCR route の公開単位。"""
 
     source_rel_path: str
     ir: evidence_ir.EvidenceIR
@@ -55,42 +51,6 @@ class ObservationRecord:
 
 def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def observation_generation_id(observation_sets: list[ai_observation.AIObservationSet]) -> str:
-    """文書単位の別観測generation ID。Set追加時は別directoryとなり既存成果物を不変に保つ。"""
-    if not observation_sets:
-        raise ValueError("at least one AI Observation Set is required")
-    payload = {
-        "renderer": OBSERVATION_RENDERER_VERSION,
-        "canonical_generation_id": observation_sets[0].canonical_generation_id,
-        "observation_set_hashes": sorted(item.observation_set_hash for item in observation_sets),
-    }
-    if any(item.canonical_generation_id != payload["canonical_generation_id"] for item in observation_sets):
-        raise ValueError("mixed Canonical generations")
-    return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
-
-
-def artifact_paths(
-    derived_root: str | Path,
-    *,
-    canonical_generation_id: str,
-    observation_generation_id: str,
-    source_rel_path: str,
-) -> ObservationArtifactPaths:
-    """Canonical外の不変な別観測generationに置く、Observation Set本体のpath契約。"""
-    for value in (canonical_generation_id, observation_generation_id):
-        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-            raise ValueError("invalid generation id")
-    rel = PurePosixPath(source_rel_path.replace("\\", "/"))
-    if rel.is_absolute() or not rel.parts or any(part in {"", ".", ".."} for part in rel.parts):
-        raise ValueError("source_rel_path must be relative")
-    generation_root = Path(derived_root) / OBSERVATION_GENERATIONS_NAME / canonical_generation_id / observation_generation_id
-    base = generation_root.joinpath(*rel.parts)
-    return ObservationArtifactPaths(
-        generation_root=generation_root,
-        observation_sets_jsonl=Path(str(base) + ".ai_observations.jsonl"),
-    )
 
 
 def _write_atomic(path: Path, text: str) -> Path:
@@ -109,7 +69,7 @@ def _write_atomic(path: Path, text: str) -> Path:
 
 
 def _walk_tree_files(root: Path):
-    """Walk files without retaining a directory or World-wide entry list."""
+    """ディレクトリや全体一覧を保持せずにファイルを歩く。"""
     if root.is_symlink() or not root.is_dir():
         raise ValueError("observation generation root must be a non-symlink directory")
     stack = [os.scandir(root)]
@@ -146,7 +106,7 @@ def _iter_path_run(stream: TextIO):
 
 
 def _merge_path_runs(inputs: list[Path], output: Path) -> None:
-    """Merge a fixed-size group; fan-in bounds open files and heap memory."""
+    """固定数の run を併合する（fan-in で開くファイル数とヒープを有界にする）。"""
     with ExitStack() as stack:
         streams = [stack.enter_context(path.open("r", encoding="utf-8")) for path in inputs]
         with output.open("w", encoding="utf-8", newline="") as target:
@@ -155,17 +115,11 @@ def _merge_path_runs(inputs: list[Path], output: Path) -> None:
 
 
 def _iter_tree_files_sorted(root: Path):
-    """Yield files in stable relative-path order with bounded RAM.
+    """相対パス順にファイルを返す（メモリは有界）。
 
-    Small generations sort one fixed-size chunk in memory.  Larger generations
-    spill sorted path runs to a private temporary directory and merge them with
-    fixed fan-in.  This preserves the former global relative-path ordering (and
-    therefore artifact digests) without ``sorted(root.rglob('*'))``.  Temporary
-    data contains relative paths only and is removed when iteration ends.
+    小さい generation はメモリ内で整列し、大きい場合は整列済みの run を一時ディレクトリへ退避して併合する。
     """
-    # Spill beside the generation rather than into the OCR container's bounded
-    # /tmp tmpfs.  The ``.staging-`` prefix makes concurrent observation GC
-    # ignore the private merge workspace; cleanup remains automatic.
+    # 一時領域は generation の隣に置く（`.staging-` 接頭辞で観測 GC の対象外になる）
     with tempfile.TemporaryDirectory(
         prefix=".staging-artifact-sort-", dir=root.parent,
     ) as temporary_value:
@@ -232,7 +186,7 @@ def _artifact_digest(root: Path) -> tuple[str, int, int]:
 
 
 def _artifact_stat_ledger(root: Path) -> tuple[str, int, int]:
-    """再hash省略の可否だけを判定する軽量台帳。metadata変化時は必ず実bytes検証へ戻す。"""
+    """再 hash を省けるかだけを判定する軽量台帳。metadata が変われば bytes 検証に戻す。"""
     digest = hashlib.sha256()
     count = total_bytes = 0
     for path in _iter_tree_files_sorted(root):
@@ -252,7 +206,7 @@ def _artifact_stat_ledger(root: Path) -> tuple[str, int, int]:
 
 
 def _artifacts_match_manifest(root: Path, manifest: dict[str, Any]) -> bool:
-    """artifact実体をmanifestへ照合する。安定台帳の検証済みcacheだけbytes再読を省略する。"""
+    """artifact 実体を manifest と照合する。検証済み台帳と一致するときだけ bytes の再読を省く。"""
     expected_digest = manifest.get("artifact_sha256")
     expected_count = manifest.get("artifact_count")
     expected_bytes = manifest.get("artifact_bytes")
@@ -274,7 +228,7 @@ def _artifacts_match_manifest(root: Path, manifest: dict[str, Any]) -> bool:
         ledger_after, stable_count, stable_bytes = _artifact_stat_ledger(root)
     except (OSError, ValueError):
         return False
-    if ledger_before != ledger_after:  # 検証中に書き換わったgenerationは公開扱いにしない
+    if ledger_before != ledger_after:  # 検証中に書き換わった generation は公開扱いにしない
         return False
     if ((actual_digest, actual_count, actual_bytes) != (expected_digest, expected_count, expected_bytes)
             or (stable_count, stable_bytes) != (expected_count, expected_bytes)):
@@ -304,7 +258,7 @@ def active_observation_dir(
     *,
     canonical_generation_id: str | None = None,
 ) -> Path | None:
-    """pointerが指定Canonicalと一致する場合だけ、ESが読む唯一の別観測directoryを返す。"""
+    """pointer が指定 Canonical と一致するときだけ、ES が読む観測 directory を返す。"""
     root = Path(derived_root)
     pointer = _pointer_payload(root / OBSERVATION_POINTER_NAME)
     if pointer is None:
@@ -346,7 +300,7 @@ def _flush_file(stream: TextIO) -> None:
 
 
 class _StreamingObservationBundle:
-    """1資料のSetを1件ずつstageの`.ai_observations.jsonl`へ書き、資料全体のlistを保持しない。"""
+    """1資料の Set を1件ずつ stage の `.ai_observations.jsonl` へ書く（資料全体の list を保持しない）。"""
 
     def __init__(self, stage: Path, record: ObservationRecord, *, canonical_generation_id: str):
         self.source_rel_path = _relative_source_path(record.source_rel_path)
@@ -407,10 +361,9 @@ def publish_snapshot_stream(
     snapshot_is_current: Callable[[], bool] | None = None,
     publish_guard: Callable[[], ContextManager[Any]] | None = None,
 ) -> dict[str, Any]:
-    """順序済みSetを逐次書込みし、最後に小さいpointerだけを切り替える。
+    """順序済みの Set を逐次書き込み、最後に pointer だけを切り替える。
 
-    呼出し側は``(source_rel_path, observation_set_hash)``順で渡す。保持するのは1 OCR job分の
-    Setだけで、World全体や1資料全体の観測をlist化しない。
+    呼出し側は `(source_rel_path, observation_set_hash)` 順で渡す。
     """
     if len(canonical_generation_id) != 64 or any(ch not in "0123456789abcdef" for ch in canonical_generation_id):
         raise ValueError("invalid canonical generation id")

@@ -77,25 +77,6 @@ def _clean_system_settings(monkeypatch):
     _clear_system_settings()
 
 
-def test_settings_test_ignores_stale_personal_model_column_uses_catalog_default():
-    """個人設定に保存済みの（カタログ導入以前の自由入力時代の）モデル名が残っていても、
-    `/settings/test` は一切読まずカタログ既定のみで解決する（個人上書きは撤去済み）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    uid, pw = f"strslclr{sfx}", f"pw-{sfx}"
-    _mk_user(uid, pw)
-    c = _login(uid, pw)
-    # 保存済みの（カタログ外）旧値を直接仕込む（PUT /settings 経由だとカタログ検証で弾かれるため
-    # store を直接使う＝旧・自由入力時代に保存された値を模す）。
-    store.update_settings(uid, openai_model="stale-legacy-model")
-
-    resp = c.post("/settings/test", json={"provider": "openai"})
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["model"] == "gpt-5.5"   # カタログ既定（組み込み既定）へ解決される
-    assert resp.json()["model"] != "stale-legacy-model"
-
-
 def test_settings_test_rejects_unknown_body_fields_silently_openai_model():
     """`TestReq` に openai_model 欄は無い。リクエスト本文に含めても pydantic の `extra="ignore"`
     で黙って無視され、任意のモデル名が実 probe へ到達しない（バリデーションエラーにもならない＝
@@ -237,47 +218,6 @@ def test_settings_test_openai_injected_model_ignored_uses_catalog_default():
     assert body["model"] != "attacker-chosen-model"
 
 
-def test_settings_test_gemini_empty_model_uses_catalog_default_not_hardcoded():
-    if not _try_init():
-        pytest.skip("DB down")
-    admin = _admin_client()
-    r = admin.put("/admin/settings", json={
-        "model_catalog": {"gemini": {"chat": {"allowed": ["custom-gemini-deploy"],
-                                              "default": "custom-gemini-deploy"}}}})
-    assert r.status_code == 200, r.text
-
-    sfx = _sfx()
-    uid, pw = f"strslg{sfx}", f"pw-{sfx}"
-    _mk_user(uid, pw)
-    c = _login(uid, pw)
-    resp = c.post("/settings/test", json={"provider": "gemini"})
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["ok"] is False
-    assert body["model"] == "custom-gemini-deploy"
-
-
-def test_settings_test_gemini_injected_model_ignored_uses_catalog_default():
-    """`gemini_model` はリクエスト本文に含めても `TestReq` に欄が無く無視される。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    admin = _admin_client()
-    r = admin.put("/admin/settings", json={
-        "model_catalog": {"gemini": {"chat": {"allowed": ["custom-gemini-deploy"],
-                                              "default": "custom-gemini-deploy"}}}})
-    assert r.status_code == 200, r.text
-
-    sfx = _sfx()
-    uid, pw = f"strslginj{sfx}", f"pw-{sfx}"
-    _mk_user(uid, pw)
-    c = _login(uid, pw)
-    resp = c.post("/settings/test", json={"provider": "gemini", "gemini_model": "attacker-chosen-model"})
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["model"] == "custom-gemini-deploy"
-    assert body["model"] != "attacker-chosen-model"
-
-
 def test_settings_test_ollama_injected_model_ignored_uses_catalog_default():
     """`ollama_model` はリクエスト本文に含めても `TestReq` に欄が無く無視される
     （`ollama_url` は個人設定として残る欄のため引き続き受け付ける＝モデル名だけが対象）。"""
@@ -301,11 +241,11 @@ def test_settings_test_ollama_injected_model_ignored_uses_catalog_default():
     assert body["model"] != "attacker-chosen-model"
 
 
-@pytest.mark.parametrize("provider", ["openai", "gemini", "bedrock"])
+@pytest.mark.parametrize("provider", ["openai"])
 def test_settings_test_rejects_invalid_cloud_provider_without_probing(monkeypatch, provider):
     """`cloud_provider`（A7）が非空の不正値のとき、非 strict の寛容キー解決で黙って既定
     openai 扱いのキーで実送信しない（課金を伴う接続テストは送信前に strict 検証する）。
-    openai/gemini/bedrock いずれも `keys.resolve_api_key(..., strict=True)` を経由し、
+    openai は `keys.resolve_api_key(..., strict=True)` を経由し、
     `InvalidCloudProviderConfigError` を honest failure（`ok: False`）へ変換する。"""
     if not _try_init():
         pytest.skip("DB down")
@@ -315,7 +255,6 @@ def test_settings_test_rejects_invalid_cloud_provider_without_probing(monkeypatc
         raise AssertionError(f"不正な cloud_provider なのに {provider} へ実送信してしまった")
 
     monkeypatch.setattr(graph_extract, "_probe", _boom)
-    monkeypatch.setattr("sherpa.agents.BedrockProvider.probe", lambda self: _boom())
     monkeypatch.setattr("sherpa.store.get_system_settings",
                         lambda: {"cloud_provider": "not-a-real-provider"})
     sfx = _sfx()

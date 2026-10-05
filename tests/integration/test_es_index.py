@@ -57,8 +57,8 @@ def test_es_roundtrip_if_available():
     assert reason is None
     assert all(h["doc_id"].startswith("4期/02_設計") for h in scoped)
     # agentic の es_search ツール経由
-    from sherpa import agentic_search as A
-    res, docs, cites, _cards = A.run_tool("es_search", {"query": "消費税率"}, V, None)
+    from sherpa import tool_dispatch
+    res, docs, cites, _cards = tool_dispatch.run_tool("es_search", {"query": "消費税率"}, V, None)
     assert res["hits"] and docs and all("span" in c for c in cites)
     assert "degrade_reason" not in res
     # 範囲外検索は 0 件（5期 に消費税率の設計は無い想定）でも doc は 5期 配下に限定される

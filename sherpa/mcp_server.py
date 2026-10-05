@@ -1,34 +1,14 @@
-"""Sherpa MCP サーバ（stdio・自前実装・SDK 非依存）。
+"""Sherpa MCP サーバ（stdio・自前実装・SDK 非依存）。Codex に Sherpa の read-only ツール（grep / 精読 / グラフ近傍 / ES）を MCP で渡す。
+設計: docs/design/codex.md「MCP の道具」／docs/design/interfaces.md「MCP の道具」
+ツールの実装は `tool_dispatch.run_tool`（読み取り部品 `parts/read/tools.py` への振り分け）を API 経路と共用する。
 
-Codex（自律エージェント）に Sherpa の read-only ツール一家（grep / 精読 / グラフ近傍 / ES）を渡すための
-**MCP(stdio) サーバ**。ツールの実装は `agentic_search.run_tool` を**そのまま再利用**（cloud LLM と実装共通＝
-ツールの中身は1本・rv 方針）。Codex は別プロセスの自律エージェントなので API の function-calling では渡せず、
-MCP がツールを渡す唯一の素直な口（network 不要＝本サーバ＝Sherpa 側プロセスが Neo4j/ES に接続する）。
-
-- **world / scope / layer は起動時の環境変数で固定**（`SHERPA_MCP_WORLD` / `SHERPA_MCP_SCOPE` /
-  `SHERPA_MCP_LAYER`）＝Codex/LLM には選ばせない（範囲外探索を防ぐ・read-only は run_tool 側で担保）。
-- トランスポート＝**改行区切り JSON-RPC 2.0**（MCP stdio）。stdin から1行1メッセージ、stdout に応答、ログは stderr。
-- `ask_user` は Codex にも公開する（S2・ask_user-improvements.md）。codex exec は非対話だが、質問は
-  ラッパー（`agents._run_authoring` の mcp_tool_call 監視）が question イベントとしてフロントへ届ける
-  ＝ここはツール結果（「届いた・調査をやめて要約せよ」）を返すだけ。乱用ガードの1つ＝**1実行1回**は
-  本サーバのプロセス寿命で数える——**エージェント（MCP 接続）ごとに別プロセスが立つ**ため
-  （下の DEPTH-2 S3b 参照）、この上限は multi_agent の子エージェントごとに独立に働く（親と子は
-  別カウント）。
-- `SHERPA_MCP_ASK_DISABLED=1`（確認ID 付き再送＝ラッパーが ask_user を無視する実行）が立っていたら
-  **ask_user を tools/list から外す**（呼べる道具を最初から見せない＝最強のガード・RV HIGH 2026-07-07）。
-  それでも呼ばれたら（Codex がプロンプト指示に反した場合の防御）初回でも `_ASK_RESULT_AGAIN` を返す
-  ＝質問カードを出さないまま調査を打ち切らせない（ラッパー側 `_ask_disabled` と同じフラグを共有）。
-- DEPTH-2 S3b（`docs/archive/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1）: Codex の
-  multi_agent（`spawn_agent`）で起動された子エージェントの MCP 呼出は、親プロセスの `--json`
-  イベントには構造化イベントとして現れない（実機確認済み）。子・親のどちらから呼ばれたかを
-  本サーバは区別できないため、`SHERPA_MCP_SIDECAR`（JSONL パス・model-shell の書込許可領域の外＝
-  通常は codex_home 配下）が設定されていれば読取系ツールの doc_id と ask_user の質問だけを
-  **本文なしで**そのファイルへ追記する——本サーバ自身は permission profile の外の別プロセスなので
-  書けるが、Codex の shell ツールはそこへ書けない（サイドカーが読取専用の観測経路であり続ける
-  前提はこの書込不可に依る）。呼び出し元
-  （`providers/codex/provider.py`）が codex exec 終了後にこのファイルを読み、子だけが読んだ資料を
-  出典へ・子の ask_user を確認カードへ合流させる。未設定（`SHERPA_MCP_SIDECAR` なし）なら何もしない
-  （既存の単一エージェント実行は無変更）。
+- world / scope / layer は起動時の環境変数（`SHERPA_MCP_WORLD` / `SHERPA_MCP_SCOPE` / `SHERPA_MCP_LAYER`）で固定する（Codex には選ばせない）。
+- トランスポートは改行区切り JSON-RPC 2.0（MCP stdio）。stdin から 1 行 1 メッセージ、stdout に応答、ログは stderr。
+- `ask_user` は Codex にも公開する。質問カードはラッパー（`agents._run_authoring`）が届け、ここは「届いた・調査をやめて要約せよ」のツール結果を返すだけ。
+  1 実行 1 回の上限は本サーバのプロセス寿命で数える（エージェント＝MCP 接続ごとに別プロセスなので、multi_agent の子は親と別カウント）。
+- `SHERPA_MCP_ASK_DISABLED=1`（確認ID 付き再送）では `ask_user` を tools/list から外す。それでも呼ばれたら初回でも `_ASK_RESULT_AGAIN` を返す（質問カードを出さないまま調査を打ち切らせない）。
+- `SHERPA_MCP_SIDECAR`（JSONL パス・codex_home 配下など model-shell の書込許可領域の外）が設定されていれば、読取系ツールの doc_id と ask_user の質問だけを本文なしで追記する。
+  multi_agent の子の MCP 呼出は親の `--json` に現れないため、`providers/codex/provider.py` が codex exec 終了後にこのファイルを読み、子が読んだ資料を出典へ・子の ask_user を確認カードへ合流させる。未設定なら何もしない。
 """
 from __future__ import annotations
 
@@ -40,32 +20,26 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import agentic_search, es_index, investigation_ledger
+from . import agentic_search, es_index, graph_coverage, graph_tools, investigation_ledger, tool_dispatch
 from .ingest.world_neo4j import GraphSchemaEraError
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "sherpa", "version": "0.1.0"}
 
-# DEPTH-2 S3b: 読取系ツールの分類（provider.py 側の出典収集と同じ区分＝二重管理を避けるため
-# `sherpa/providers/codex/provider.py` がこのタプルを import して使う）。`LISTED_DOC_TOOLS`
-# （シート一覧のみ）は sources_verified には数えない扱いを provider 側が踏襲する。
+# 読取系ツールの分類。`providers/codex/provider.py` の出典収集がこのタプルを import して使う。`LISTED_DOC_TOOLS`（シート一覧のみ）は sources_verified に数えない。
 READ_DOC_TOOLS = ("read_doc", "read_around", "doc_outline",
                   "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head")
 LISTED_DOC_TOOLS = ("xlsx_sheets",)
 COMPARE_DOC_ID_ARGS = ("left_doc_id", "right_doc_id", "source_doc_id")
 
-# S2: ask_user は検索ツールではない（run_tool に実装は無い）＝ここでは Codex に返す**ツール結果**だけを持つ。
-# 1実行1回まで（本サーバはエージェント＝MCP 接続ごとに別プロセスで起動する＝プロセス寿命＝
-# そのエージェント1体ぶんの実行＝モジュール変数で数える。multi_agent の子エージェントは親とは
-# 別プロセス＝別カウント＝モジュール docstring の DEPTH-2 S3b 参照）。
+# ask_user は検索ツールではなく、ここでは Codex に返すツール結果だけを持つ。1 実行 1 回まで（プロセス寿命＝エージェント 1 体ぶんをモジュール変数で数える）。
 _ASK_STATE = {"count": 0}
 _ASK_RESULT_FIRST = "質問はユーザーに届きました。追加調査はせず、ここまでに確認できたことを省略せずまとめて終了してください。"
 _ASK_RESULT_AGAIN = "既に質問済みです。調査を続けて回答をまとめてください。"
 
 _LEDGER_TOOLS = frozenset({"ledger_manifest_set", "ledger_item_put", "ledger_status", "ledger_review_put"})
 
-# 素の Codex モード（`plain`・docs/archive/2026-09-24-素のCodexモード.md §1.2/§3）で公開する
-# ツールの全体。`_tool_defs()`・`handle()` のどちらもこの集合だけを見る（値のぶれを作らない）。
+# 素の Codex モード（`plain`）で公開するツールの全体。`_tool_defs()`・`handle()` のどちらもこの集合だけを見る。
 _PLAIN_TOOLSET = frozenset({"graph_neighbors", "ask_user"})
 
 
@@ -141,7 +115,7 @@ def _ledger_tool_defs() -> list:
 def _run_ledger_tool(name: str, args: dict) -> dict:
     ledger_dir = os.environ.get("SHERPA_MCP_LEDGER_DIR")
     if not ledger_dir:
-        # 書込先が未設定ならfail-closed。別の場所へ台帳を作らない。
+        # 書込先が未設定なら fail-closed（別の場所へ台帳を作らない）。
         return {"error": "ledger_unavailable"}
     directory = Path(ledger_dir)
     try:
@@ -171,16 +145,9 @@ def _run_ledger_tool(name: str, args: dict) -> dict:
                 return {"error": "ledger_item_invalid", "problems": [str(exc)]}
             return {"ok": True, "id": args["id"]}
         if name == "ledger_review_put":
-            # RV是正（順番）: 見直しは終端の item が1件以上できてから書く——受付時に現在の台帳を
-            # 数え、終端が0件なら書き込まず拒否する（「最初の item が1つでも終端になった後」の
-            # 指示を機械的に強制する）。`ts`/`terminal_count` はサーバが付ける（モデルには渡させ
-            # ない・manifest の `created_at` と同じ分担）。`terminal_count` はこの見直しを書いた
-            # **時点**の終端件数として台帳へそのまま記録する——後で item の状態が変わっても
-            # この見直しの有効性（`validate_review_entry` の1以上要件）は変わらない。
-            # RV是正（2巡目）: **manifest に登録済みの id だけ**を数える——未登録の item（親の
-            # manifest にまだ無い・子が勝手に作った shard 等）を終端にしても、中間の見直しの前提
-            # （「台帳としてこの依頼を調べ進めている」）にはならない（`ledger_complete()` の
-            # `unregistered_ids` の扱いと同じ「登録集合だけを見る」契約に揃える）。
+            # 見直しは終端の item が 1 件以上できてから書く。受付時に現在の台帳の終端件数を数え、0 件なら拒否する。
+            # `ts`/`terminal_count` はサーバが付ける（`terminal_count` は書いた時点の件数としてそのまま記録する）。
+            # 数えるのは manifest に登録済みの id だけ（未登録の item を終端にしても前提にならない・`ledger_complete()` の `unregistered_ids` と同じ）。
             snapshot = investigation_ledger.load_ledger(directory)
             manifest_ids = (set(snapshot.manifest["items"])
                             if snapshot.manifest is not None else set())
@@ -207,9 +174,7 @@ def _run_ledger_tool(name: str, args: dict) -> dict:
             return {"error": "ledger_manifest_invalid", "problems": ["既存の manifest が symlink です"]}
         created_at = None
         if manifest_path.exists():
-            # 内容が規約に合わない通常ファイルは、検証済みの入力で修復できる（本体の継続ゲートは
-            # 「修復してから続けて」と催促する——ここで拒否すると修復手段が無くなる）。`created_at` は
-            # 既存が文字列ならそれを保持し、無ければ作り直す。読取不能（OSError）は外側で拒否。
+            # 内容が規約に合わない通常ファイルは、検証済みの入力で修復できる（拒否すると修復手段が無くなるため）。`created_at` は既存が文字列なら保持し、無ければ作り直す。読取不能（OSError）は外側で拒否する。
             try:
                 existing = json.loads(manifest_path.read_text(encoding="utf-8"))
             except ValueError:
@@ -225,21 +190,17 @@ def _run_ledger_tool(name: str, args: dict) -> dict:
         investigation_ledger.write_manifest_atomic(directory, manifest)
         return {"ok": True}
     except OSError as exc:
-        # ファイル操作の失敗はfail-closed。MCPのエラーとして返し、自動再試行しない。
+        # ファイル操作の失敗は fail-closed。MCP のエラーとして返し、自動再試行しない。
         print(f"[sherpa-mcp] {name} failed: {type(exc).__name__} errno={exc.errno}", file=sys.stderr)
         return {"error": "ledger_write_failed", "problems": [f"{type(exc).__name__}: errno={exc.errno}"]}
 
 
 def _toolset() -> str:
-    """MCP が公開するツールの絞り込み（`SHERPA_MCP_TOOLSET`・素の Codex モード＝`plain` 専用）。
-    `"plain"` だけを特別扱いし、それ以外（未設定・`"full"`・想定外の値）は全て従来どおりのフル
-    公開に倒す（fail-safe・provider.py が明示的に plain を立てた実行だけを絞る）。"""
+    """MCP が公開するツールの絞り込み（`SHERPA_MCP_TOOLSET`）。`"plain"` だけを特別扱いし、それ以外（未設定・`"full"`・想定外の値）はフル公開に倒す。"""
     return "plain" if os.environ.get("SHERPA_MCP_TOOLSET", "").strip().lower() == "plain" else "full"
 
 
-# plain で公開するグラフの説明。standard 用の説明（`agentic_search._DESC_GRAPH`）は plain で公開しない
-# ツール（ripgrep_search・read_doc・read_around・list_docs）の使用を指示するため使わない。
-# es_search は plain では出さない（1 回ごとにクエリの埋め込みを呼び、Azure が不安定だと再送で数分止まる）。
+# plain で公開するグラフの説明。standard 用の説明は plain で公開しないツールの使用を指示するため使わない。es_search は plain では出さない。
 _DESC_GRAPH_PLAIN = (
     "関係グラフから、ある名前（プログラム/コピーブック/ジョブ/データ項目/テーブルなど）の関連部品"
     "（コピー・呼び出し・参照・関連文書（言及）の近傍）を、辺ごとの種類と向き（from→to）付きの経路で返す。"
@@ -247,28 +208,22 @@ _DESC_GRAPH_PLAIN = (
     "A →COPIES→ B は B を変えると A が影響を受ける）。DOCUMENTS（言及）・CORRESPONDS_TO（同名の対応）や "
     "`unverified` の辺を含む経路は候補＝原本で確認する。名前は完全一致で引く（シェルで正確な名前を見つけてから"
     "渡す）。近傍が上限で切られたときは truncated:true と count（総数）が付く＝その範囲は未確認として扱う。"
+    "coverage.complete が false のとき（時間切れ・件数の上限・文書探索の打ち切り・カード数の上限）は、近傍が空でも"
+    "「近傍なし」とは言えない＝未確認（理由は coverage.limits[].kind）。"
 )
-# plain（台帳を持たない・「何も変えない」契約）は `item`（COD-16・§2）を出さない——
-# `agentic_search._PARAMS_GRAPH` は6ツール共通スキーマのため item を含むが、`name` の schema/
-# 説明は共有したまま `item` だけを除いたコピーを使う（`name` の二重管理はしない）。
+# plain は台帳を持たないため `item` を除いたコピーを使う（`name` の schema/説明は共有する）。
 _PARAMS_GRAPH_PLAIN = {**agentic_search._PARAMS_GRAPH,
                       "properties": {k: v for k, v in agentic_search._PARAMS_GRAPH["properties"].items()
                                      if k != "item"}}
 
 
 def _tool_defs() -> list:
-    """公開ツール定義（schema は agentic_search と共通＝二重管理しない）。ES はインデックスがある時だけ。
-    `read_doc`/`doc_outline`/`glob_search` は `read_around` 等と同じ土台系ツール（ES/graph の可用性に
-    依存しない）＝常に公開する。並びは `agentic_search.openai_tools` と同じ「構造を掴む→通読→精読」
-    （ripgrep_search の直後に glob_search、read_around の直前に doc_outline・read_doc）。
-    S2 RV HIGH: `SHERPA_MCP_ASK_DISABLED=1`（確認ID 付き再送）の実行では ask_user 自体を外す
-    （呼べる道具を最初から見せない＝プロンプト指示だけに頼らない最強のガード）。
-    探す対象（層）が限定されている間は `graph_neighbors` 自体を外す（呼べる道具を最初から見せない・
-    `run_tool` 側の拒否と多層防御・迂回路を tools/list の時点で塞ぐ）。
-
-    `_toolset()` が `"plain"` のときは `_PLAIN_TOOLSET`（graph_neighbors・ask_user）だけを
-    返す——それぞれの既存の出す条件（層・ask 無効）はそのまま守る。台帳・grep/読取・
-    list_docs 系は出さない（`handle()` 側も同じ集合だけを許可し、直接呼ばれても拒否する）。"""
+    """公開ツール定義（schema は agentic_search と共通）。ES はインデックスがある時だけ公開し、`read_doc`/`doc_outline`/`glob_search` は常に公開する。
+    並びは「構造を掴む→通読→精読」（ripgrep_search の直後に glob_search、read_around の直前に doc_outline・read_doc）。
+    `SHERPA_MCP_ASK_DISABLED=1` の実行では ask_user を外す。探す対象（層）が限定されている間は `graph_neighbors` を外す（`run_tool` の拒否と多層防御）。
+    `graph_resolve`・`graph_impact` は層が資料のみ（docs）のときだけ外す（ソース限定の層では出す）。plain には出さない。
+    `_toolset()` が `"plain"` のときは `_PLAIN_TOOLSET`（graph_neighbors・ask_user）だけを返す（出す条件は同じ）。`handle()` 側も同じ集合だけを許可する。
+    """
     if _toolset() == "plain":
         defs = []
         if _layer() in (None, "both"):
@@ -281,8 +236,7 @@ def _tool_defs() -> list:
     defs = [
         {"name": "list_docs", "description": agentic_search._DESC_LIST_DOCS,
          "inputSchema": agentic_search._PARAMS_LIST_DOCS},
-        # K6（`docs/archive/2026-09-04-グラフのソース正典化.md` §3・§4b S1）: list_docs と同じ
-        # 台帳ベースの土台系ツール（ES/graph 可用性に依存しない）＝常に公開する。
+        # 台帳ベースの土台系ツール（ES/graph の可用性に依存しない）。常に公開する。
         {"name": "folder_tree", "description": agentic_search._DESC_FOLDER_TREE,
          "inputSchema": agentic_search._PARAMS_FOLDER_TREE},
         {"name": "ripgrep_search", "description": agentic_search._DESC_SEARCH,
@@ -295,14 +249,10 @@ def _tool_defs() -> list:
          "inputSchema": agentic_search._PARAMS_READ_DOC},
         {"name": "read_around", "description": agentic_search._DESC_READ,
          "inputSchema": agentic_search._PARAMS_READ},
-        # GEN-DIFF（`docs/archive/2026-09-03-世代間diff比較.md` §5）: ES/graph の可用性に依存しない
-        # 土台系ツール（read_around 等と同じ扱い）＝常に公開する。
+        # ES/graph の可用性に依存しない土台系ツール。常に公開する。
         {"name": "compare_documents", "description": agentic_search._DESC_COMPARE,
          "inputSchema": agentic_search._PARAMS_COMPARE},
-        # S3b（原本読取ツール・`docs/archive/2026-09-10-Codex原本直読と調査スキル.md` §2-9）:
-        # `file_head`（テキスト・コード）は層に関係なく常に公開する（`run_tool` 側が層で個別に
-        # 絞る）。Office/PDF の5本（下）は探す対象がソースに限定されている間は外す（Office/PDF は
-        # 常に docs 側扱いのため・`run_tool` 側の拒否と多層防御）。
+        # `file_head`（テキスト・コード）は層に関係なく常に公開する。Office/PDF の 5 本（下）は探す対象がソースに限定されている間は外す（`run_tool` の拒否と多層防御）。
         {"name": "file_head", "description": agentic_search._DESC_FILE_HEAD,
          "inputSchema": agentic_search._PARAMS_FILE_HEAD},
     ]
@@ -320,13 +270,18 @@ def _tool_defs() -> list:
     if _layer() in (None, "both"):
         defs.append({"name": "graph_neighbors", "description": agentic_search._DESC_GRAPH,
                      "inputSchema": agentic_search._PARAMS_GRAPH})
+    if _layer() != "docs":
+        # 影響の調査（起点の候補 → 識別子から構造の辺だけを逆向きにたどる）。言及の辺を使わないので、ソース限定の層でも出す（資料のみの層では外す）。
+        defs.append({"name": "graph_resolve", "description": agentic_search._DESC_GRAPH_RESOLVE,
+                     "inputSchema": agentic_search._PARAMS_GRAPH_RESOLVE})
+        defs.append({"name": "graph_impact", "description": agentic_search._DESC_GRAPH_IMPACT,
+                     "inputSchema": agentic_search._PARAMS_GRAPH_IMPACT})
     if not _ask_disabled():
-        # S2: ask_user を Codex にも公開（description は agentic と同じ制約文言＝_DESC_ASK・schema も共通）。
+        # ask_user を Codex にも公開する（description・schema は agentic と共通）。
         defs.append({"name": "ask_user", "description": agentic_search._DESC_ASK,
                      "inputSchema": agentic_search._PARAMS_ASK})
     if es_index.available():
-        # ripgrep_search の直後に挿む。手前のツール構成が変わっても崩れないよう、index 決め打ちでは
-        # なく名前で位置を探す。
+        # ripgrep_search の直後に挿む。名前で位置を探す（index 決め打ちにしない）。
         _idx = next(i for i, d in enumerate(defs) if d["name"] == "ripgrep_search") + 1
         defs.insert(_idx, {"name": "es_search", "description": agentic_search._DESC_ES,
                            "inputSchema": agentic_search._PARAMS_ES_SEARCH})
@@ -344,18 +299,16 @@ def _scope():
 
 
 def _layer():
-    """探す対象（層フィルタ）。未設定は `None`（`agentic_search.run_tool` 側で both 扱い）。
-    親プロセス（`codex/mcp.py::_mcp_env`）が qa レンズのときだけ渡す＝impact/troubleshoot・author は
-    未設定のまま（グラフ traversal 非適用・Codex 自身の追加探索の既知の非対称性）。"""
+    """探す対象（層フィルタ）。未設定は `None`（`agentic_search.run_tool` が both 扱い）。
+    親プロセス（`codex/mcp.py::_mcp_env`）が qa レンズのときだけ渡す。
+    """
     return os.environ.get("SHERPA_MCP_LAYER") or None
 
 
 def _ledger_required_extra() -> tuple[str, ...]:
-    """`ledger_status` の完了判定へ追加で足す必須根拠種別（`SHERPA_MCP_LEDGER_REQUIRED_EXTRA`・
-    親プロセス（provider.py）がそのターンの台帳ゲートへ渡すものと同じ値をカンマ区切りで渡す）。
-    未設定・空文字は空タプル（今までどおり）。1つでも `EVIDENCE_KINDS` の閉集合に無い値が
-    混ざっていたら、部分的に受け入れず空タプルとして扱う（語彙外を黙って無視しない・
-    fail-closed・壊れた値から推測で埋めない）。"""
+    """`ledger_status` の完了判定へ追加で足す必須根拠種別（`SHERPA_MCP_LEDGER_REQUIRED_EXTRA`・親プロセスが台帳ゲートへ渡すものと同じ値のカンマ区切り）。
+    未設定・空文字は空タプル。`EVIDENCE_KINDS` に無い値が 1 つでもあれば部分的に受け入れず空タプルにする（fail-closed）。
+    """
     raw = os.environ.get("SHERPA_MCP_LEDGER_REQUIRED_EXTRA", "").strip()
     if not raw:
         return ()
@@ -366,41 +319,35 @@ def _ledger_required_extra() -> tuple[str, ...]:
 
 
 def _ledger_require_review() -> bool:
-    """`ledger_status` の自己確認（COD-18 ⑤・中間の見直し）が `ledger_complete()` へ
-    `require_review=True` を渡すか（`SHERPA_MCP_LEDGER_REQUIRE_REVIEW`・親プロセスが
-    そのターンの実際のゲート判定と同じ値を `"1"`/未設定で渡す）。未設定・`"1"` 以外は要求しない
-    （fail-safe・この env はあくまで自己確認の利便性のためで、実際の完了判定
-    （provider.py の台帳ゲート）はこの env に関わらず独立に `require_review` を決める）。"""
+    """`ledger_status` の自己確認が `ledger_complete()` へ `require_review=True` を渡すか（`SHERPA_MCP_LEDGER_REQUIRE_REVIEW`・`"1"` のとき）。未設定・`"1"` 以外は要求しない。
+    この env は自己確認用で、実際の完了判定（provider.py の台帳ゲート）とは独立。
+    """
     return os.environ.get("SHERPA_MCP_LEDGER_REQUIRE_REVIEW", "").strip() == "1"
 
 
 def _ledger_require_continuation_resolved() -> bool:
-    """`ledger_status` の自己確認へ渡す `ledger_complete()` の `require_continuation_resolved`
-    （`SHERPA_MCP_LEDGER_REQUIRE_CONTINUATION_RESOLVED`・RV是正3巡目「続き」——前ターンの
-    `mostly_answered`＋`extra_perspectives` を注入して復元したターンだけ `1` を渡す）。
-    未設定・`"1"` 以外は要求しない（fail-safe・現行と同じ「義務の有無を見ない」の意味）。"""
+    """`ledger_status` の自己確認へ渡す `require_continuation_resolved`（`SHERPA_MCP_LEDGER_REQUIRE_CONTINUATION_RESOLVED`・「続き」ターンだけ `1`）。未設定・`"1"` 以外は要求しない。"""
     return os.environ.get("SHERPA_MCP_LEDGER_REQUIRE_CONTINUATION_RESOLVED", "").strip() == "1"
 
 
 def _ask_disabled() -> bool:
-    """S2 RV HIGH: この実行（確認ID 付き再送）ではラッパーが ask_user を無視する＝サーバ側でも隠す。"""
+    """確認ID 付き再送の実行ではラッパーが ask_user を無視するため、サーバ側でも隠す。"""
     return os.environ.get("SHERPA_MCP_ASK_DISABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _sidecar_path() -> str | None:
-    """DEPTH-2 S3b: run ごとのサイドカーファイルパス（`SHERPA_MCP_SIDECAR`・未設定は None＝無効）。"""
+    """run ごとのサイドカーファイルパス（`SHERPA_MCP_SIDECAR`・未設定は None＝無効）。"""
     p = os.environ.get("SHERPA_MCP_SIDECAR", "").strip()
     return p or None
 
 
-_sidecar_write_failed_once = False   # 書込失敗の warning はプロセス寿命（エージェントごと）に1回だけ出す（過剰ログ防止）
+_sidecar_write_failed_once = False  # 書込失敗の warning はプロセス寿命に 1 回だけ出す
 
 
 def _sidecar_append(entry: dict) -> None:
-    """サイドカーへ1行（JSON）追記する。**fail-open**（書けなくてもツール呼出自体は失敗させない・
-    ディスク不調やパス消失を検索結果へ波及させない）。呼び出し元は doc_id／ツール名／種別／時刻
-    （と ask_user の質問）だけを渡すこと——資料本文・回答本文は一切書かない契約。書込失敗は
-    完全に無言にはせず、型と errno だけ（本文・パスは出さない）を stderr へ1回だけ知らせる。"""
+    """サイドカーへ 1 行（JSON）追記する。fail-open（書けなくてもツール呼出は失敗させない）。
+    渡すのは doc_id／ツール名／種別／時刻（と ask_user の質問）だけで、資料本文・回答本文は書かない。書込失敗は型と errno だけを stderr へ 1 回知らせる。
+    """
     global _sidecar_write_failed_once
     path = _sidecar_path()
     if not path:
@@ -415,20 +362,15 @@ def _sidecar_append(entry: dict) -> None:
                   file=sys.stderr)
 
 
-# 子エージェント（`spawn_agent` された worker/evaluator）の障害を親が観測するための閉じたコード。
-# 親の `--json` には子の MCP 呼出が現れないため、サイドカーが唯一の観測経路
-# （`providers/codex/provider.py::_read_mcp_sidecar`）。本文・資料名は書かない。
+# 子エージェントの障害を親が観測するための閉じたコード。親の `--json` に子の MCP 呼出が現れないため、サイドカーが唯一の観測経路（`providers/codex/provider.py::_read_mcp_sidecar`）。本文・資料名は書かない。
 _SIDECAR_ERROR_CODES = frozenset({
     agentic_search.GRAPH_REINGEST_ERROR_CODE, "graph_unavailable",
     "es_unavailable", "es_query_failed", "es_query_rejected", "read_io_failed"})
 
 
 def _sidecar_error_code(name, result) -> None:
-    """ツール結果が既知の障害コードを持つときだけ `{"kind": "error", ...}` を1行書く。
-
-    コードは `error`（結果そのものが障害＝`isError`）・`error_code`（結果は返るが内部で障害を
-    捕捉した）・`degrade_reason`（`es_search` の縮退）のいずれかに載る——いずれも閉集合に
-    含まれる値のときだけ書き、自由文（`error` の日本語メッセージ等）は書かない。
+    """ツール結果が既知の障害コードを持つときだけ `{"kind": "error", ...}` を 1 行書く。
+    コードは `error`（`isError`）・`error_code`（内部で障害を捕捉）・`degrade_reason`（`es_search` の縮退）のいずれかで、閉集合に含まれる値のときだけ書く（自由文は書かない）。
     """
     if not isinstance(result, dict):
         return
@@ -439,48 +381,35 @@ def _sidecar_error_code(name, result) -> None:
             return
 
 
-# ---- COD-16（`docs/proposals/2026-09-29-調査の網羅と未確認の明示.md` §2）: 項目ごとの未確認 ----
-# 検索・読取ツール6本（任意引数 `item`＝台帳の項目 id・`agentic_search._ITEM_PARAM_SCHEMA` 参照）の
-# 呼出結果を `investigation_ledger.append_coverage_atomic` で台帳の置き場（coverage.jsonl）へ記録
-# する。親・子（`spawn_agent` の worker）は同じ `SHERPA_MCP_LEDGER_DIR` を渡されるため、この
-# 記録も台帳の items/ と同じく親子で共有される（サイドカーを介さない・台帳と同じ書込手段）。
+# 項目ごとの未確認の記録。検索・読取ツール 6 本（任意引数 `item`＝台帳の項目 id・`agentic_search._ITEM_PARAM_SCHEMA`）の呼出結果を
+# `investigation_ledger.append_coverage_atomic` で台帳の置き場（coverage.jsonl）へ記録する。親と子は同じ `SHERPA_MCP_LEDGER_DIR` を共有する。
 _ITEM_PARAM_TOOLS = frozenset({
-    "ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors"})
-_ITEM_HITS_TOOLS = frozenset({"ripgrep_search", "es_search"})   # `hits` 配列を持つ形
-_ITEM_READ_TOOLS = frozenset({"read_doc", "read_around", "file_head"})   # 単一文書読取の形
-# 単一文書読取の error はほぼ全て「その doc_id を読めなかった」ことを意味する（scope 外・秘匿・
-# IO 失敗のいずれも呼び出し元からは同じ「読めない」に見える）——read 系だけはこの単純化を採る。
-# 検索・グラフ系の error はこの単純化をせず、`error_code` が既知の「読めない」系コードのときだけ
-# unreadable にする（それ以外は一般 error）。
+    "ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors",
+    "graph_resolve", "graph_impact"})
+_ITEM_HITS_TOOLS = frozenset({"ripgrep_search", "es_search"})  # `hits` 配列を持つ形
+_ITEM_READ_TOOLS = frozenset({"read_doc", "read_around", "file_head"})  # 単一文書読取の形
+# 単一文書読取の error は「その doc_id を読めなかった」とみなす。検索・グラフ系の error は、`error_code` が既知の「読めない」系コードのときだけ unreadable にする。
 _ITEM_UNREADABLE_ERROR_CODES = frozenset({"read_io_failed"})
 
 
 def _coverage_outcome(name: str, result, is_error: bool) -> str | None:
-    """`item` 付き呼出しの結果を、`investigation_ledger.COVERAGE_OUTCOMES` の7区分へ落とす。
-    戻り値が `None` のときは記録しない対象（呼び出し側の引数誤り＝範囲外/型不正——道具や
-    対象が読み取れないわけではなく、どちらの区分にも当てはまらない）。
-
-    母集団側の打切り（`truncated`＝件数上限）・1件あたりのバイト予算の打切り
-    （`text_truncated`／`file_truncated`／`byte_clipped`／`partial_hit`／`partial_line`）は、
-    利用統計「打ち切りの内訳」（`agentic_search._SEARCH_TRUNCATED_TOOLS`/`_BYTE_CLIP_TOOLS`）と
-    同じ判定キーを使う（車輪の再発明をしない・語彙だけ7区分へ翻訳する）。`timeout` はこの経路
-    （MCP は `run_tool()` へ `deadline` を渡さない）では実際には発生しないが、
-    `investigation_ledger.UNVERIFIED_REASON_CODES` の閉じた語彙に対応する区分として温存する。
+    """`item` 付き呼出しの結果を `investigation_ledger.COVERAGE_OUTCOMES` の 7 区分へ落とす。`None` は記録しない対象（呼び出し側の引数誤り）。
+    母集団側の打切り（`truncated`）・1 件あたりのバイト予算の打切り（`text_truncated`／`file_truncated`／`byte_clipped`／`partial_hit`／`partial_line`）は、
+    利用統計「打ち切りの内訳」（`agentic_search._SEARCH_TRUNCATED_TOOLS`/`_BYTE_CLIP_TOOLS`）と同じ判定キーを使う。
+    `timeout` はこの経路では発生しないが、`UNVERIFIED_REASON_CODES` の語彙に対応する区分として残す。
     """
     if not isinstance(result, dict):
         return "error"
     if is_error:
         if name in _ITEM_READ_TOOLS:
             if result.get("error_code") == agentic_search._READ_INVALID_ARGS_ERROR_CODE:
-                return None   # 呼び出し側の引数誤り（範囲外・型不正）——読めない扱いにしない
+                return None  # 呼び出し側の引数誤り（範囲外・型不正）は読めない扱いにしない
             return "unreadable"
         if result.get("error_code") in _ITEM_UNREADABLE_ERROR_CODES:
             return "unreadable"
         return "error"
     if name in _ITEM_HITS_TOOLS:
-        # 0件の判定より前に、道具そのものの失敗（error）・母集団側の打切り（limit）・
-        # バイト予算での打切り（truncated_docs）を判定する——ヒットが有っても
-        # `truncated_docs` があれば truncated（探せていない文書がある事実は隠さない）。
+        # 0 件の判定より前に、道具の失敗・母集団側の打切り・バイト予算での打切りを判定する（ヒットがあっても `truncated_docs` があれば truncated）。
         if name == "es_search" and result.get("degrade_reason") in (
                 "es_unavailable", "es_query_failed", "es_query_rejected"):
             return "error"
@@ -496,9 +425,24 @@ def _coverage_outcome(name: str, result, is_error: bool) -> str | None:
                 for h in hits):
             return "truncated"
         return "hit"
-    if name == "graph_neighbors":
-        if result.get("error_code"):   # `graph_unavailable`/`graph_internal_error`（isError ではない縮退）
+    if name in ("graph_resolve", "graph_impact"):
+        if result.get("error_code"):  # `graph_unavailable`/`graph_internal_error`（isError ではない縮退）
             return "error"
+        coverage = result.get("coverage")
+        if isinstance(coverage, dict) and coverage.get("complete") is False:
+            return "limit"  # 時間切れ・天井・深さの先・件数の上限は、空でも「該当なし・影響なし」（確認済みの 0 件）にしない
+        if result.get("truncated"):
+            return "limit"
+        items = result.get("candidates" if name == "graph_resolve" else "impact")
+        if isinstance(items, list) and len(items) == 0:
+            return "no_hits"
+        return "hit"
+    if name == "graph_neighbors":
+        if result.get("error_code"):  # `graph_unavailable`/`graph_internal_error`（isError ではない縮退）
+            return "error"
+        coverage = result.get("coverage")
+        if isinstance(coverage, dict) and coverage.get("complete") is False:
+            return "limit"  # 時間切れの空・天井の部分結果を「近傍なし」（確認済みの 0 件）にしない
         neighbors = result.get("neighbors")
         if isinstance(neighbors, list) and len(neighbors) == 0:
             return "no_hits"
@@ -513,19 +457,15 @@ def _coverage_outcome(name: str, result, is_error: bool) -> str | None:
 
 
 def _record_item_coverage(name: str, args: dict, result, is_error: bool) -> None:
-    """`item` 引数つきの検索・読取ツール呼出しの結果区分を台帳の置き場（coverage.jsonl）へ追記
-    する。**fail-open**——`item` が無い/不正・対象外ツール・`_coverage_outcome` が `None`
-    （呼び出し側の引数誤り）・`SHERPA_MCP_LEDGER_DIR` 未設定（台帳を使わないターン・素の Codex
-    モード）はいずれも何もしない。書込に失敗しても（`OSError`/`ValueError`＝`item` が安全でない
-    id）ツール呼出自体は失敗させない——観測用の副記録であって、ツール結果本体の契約ではない。"""
+    """`item` 付きの検索・読取ツール呼出しの結果区分を coverage.jsonl へ追記する。fail-open:
+    `item` が無い/不正・対象外ツール・`_coverage_outcome` が `None`・`SHERPA_MCP_LEDGER_DIR` 未設定（台帳を使わないターン・plain）は何もしない。書込失敗（`OSError`/`ValueError`）でもツール呼出は失敗させない。
+    """
     if name not in _ITEM_PARAM_TOOLS:
         return
     outcome = _coverage_outcome(name, result, is_error)
     if outcome is None:
         return
-    # `item` を除いた正規化キー（`_dedup_key`）へこの結果区分を控える（`item` の無い呼出しも）
-    # ——後で同じ条件が item 付きで重複呼出しされたとき（`_is_duplicate_tool_call`）、run_tool を
-    # 再実行せずにこの結果区分をその item へ転記できる（`_record_duplicate_item_coverage` 参照）。
+    # `item` を除いた正規化キー（`_dedup_key`）にこの結果区分を控える。同じ条件が別の item で重複呼出しされたとき、run_tool を再実行せず転記できる（`_record_duplicate_item_coverage`）。
     _dkey = _dedup_key(name, args)
     if _dkey is not None and _dkey in _seen_tool_calls:
         _seen_tool_calls[_dkey] = outcome
@@ -541,31 +481,16 @@ def _record_item_coverage(name: str, args: dict, result, is_error: bool) -> None
         pass
 
 
-# ---- ツール結果1件あたりのバイト予算・調べる深さ連動の実効上限（Azure 実機の
-#      context_window_exceeded 是正）----
-# API 経路（`agentic_search.py` の3 dialect ループ／`providers/openai.py` 等の `_agentic_loop`）と
-# 同じ実効値解決（バイト予算＝`effective_tool_result_max_bytes`・grep ヒット上限/読み取り窓＝
-# `depth_profile.scaled_ratio`＋`effective_base`・system_settings 未解決時のコード既定フォール
-# バックも同関数内で完結）をそのまま使う——車輪の再発明をしない。
-#
-# 累計（1 run 全体）のツール結果バイト予算・ツール呼び出し回数の上限は Codex 経路では持たない
-# （撤去済み）: MCP プロセス単位の累計値は Codex CLI の自動圧縮で文脈が空いてもリセットされず、
-# 到達後は本文系ツールが永続的に拒否される——「調査の途中で閉じる」を作る側だった
-# （`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §1/§2）。1件あたりの上限は
-# CLI の remote compact 失敗（`_CONTEXT_WINDOW_EXCEEDED_CODE`）という実障害の根拠があるため残す。
-#
-# `list_docs`/`folder_tree`（一覧のみ・本文を返さない土台系ツール）と `ask_user`（制御系・専用分岐で
-# 既に処理済み）は1件あたりのバイト予算の対象外。
+# ツール結果 1 件あたりのバイト予算・調べる深さ連動の実効上限。
+# API 経路と同じ実効値解決（バイト予算＝`effective_tool_result_max_bytes`・grep ヒット上限/読み取り窓＝`depth_profile.scaled_ratio`＋`effective_base`）を使う。
+# 1 run 全体の累計バイト予算・呼び出し回数の上限は Codex 経路では持たない（到達後に本文系ツールが永続的に拒否されるため）。1 件あたりの上限は CLI の remote compact 失敗（`_CONTEXT_WINDOW_EXCEEDED_CODE`）対策として残す。
+# `list_docs`/`folder_tree`（一覧のみ）と `ask_user`（制御系）はバイト予算の対象外。
 _BUDGET_EXEMPT_TOOLS = frozenset({"list_docs", "folder_tree"}) | _LEDGER_TOOLS
 
 
 def _env_int_override(var_name: str) -> int | None:
-    """`SHERPA_MCP_TOOL_BUDGET_BYTES`/`_MAX_HITS`/`_WINDOW_CAP`（親プロセス＝`CodexProvider` が
-    調べる深さ連動込みで解決した実効値を渡す・`provider.py::_resolve_mcp_budget_env` 参照）を
-    優先して読む共通ヘルパ。未設定/不正値（0以下・数値でない）は None を返し、呼び出し元は従来の
-    モジュール既定（`effective_tool_result_max_bytes`・`agentic_search.run_tool()` の
-    `max_hits`/`window_cap` 省略時のモジュール既定）へフォールバックする——親から渡らない実行
-    （単体テスト・手動起動）で退行しないため。
+    """`SHERPA_MCP_TOOL_BUDGET_BYTES`/`_MAX_HITS`/`_WINDOW_CAP`（親の `CodexProvider` が調べる深さ連動込みで解決した実効値・`providers/codex/usage.py::_resolve_mcp_budget`）を優先して読む。
+    未設定/不正値（0 以下・数値でない）は None を返し、呼び出し元はモジュール既定へ戻る。
     """
     raw = os.environ.get(var_name, "").strip()
     if not raw:
@@ -578,17 +503,12 @@ def _env_int_override(var_name: str) -> int | None:
 
 
 def _json_bytes(obj) -> int:
-    """`handle()` の最終再シリアライズと同じ関数・同じ引数（`ensure_ascii=False`）で実バイト数を
-    測る——ここでの保証がそのまま `content[].text` の最終出力の保証になる（引用符・バックスラッシュ
-    の多い本文は素朴な文字数見積りだと再エスケープ分だけ実バイト数が膨らむため、常に直列化して測る）。
-    """
+    """`handle()` の最終再シリアライズと同じ関数・同じ引数（`ensure_ascii=False`）で実バイト数を測る（`content[].text` の最終出力の保証になる）。"""
     return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
 
 def _offset_arg(args: dict | None) -> int:
-    """呼び出し引数の `offset`（`ripgrep_search` の `run_tool` 呼出に渡ったのと同じ生の値）を安全に
-    int 化する——省略/不正値（負・数値でない）は 0（`agentic_search.run_tool` の grep 経路と同じ
-    既定値・失敗時の扱い）。"""
+    """呼び出し引数の `offset` を int 化する。省略/不正値（負・数値でない）は 0。"""
     if not isinstance(args, dict):
         return 0
     try:
@@ -605,15 +525,9 @@ _TOOL_RESULT_BUDGET_TOO_SMALL_HINT = "1件も返せません。範囲を絞る�
 
 
 def _clip_hits_partial_first_hit(result: dict, max_bytes: int, *, offset: int, allow_next_offset: bool):
-    """`_clip_hits_field` で先頭ヒット1件すら丸ごとは残せない（0件のページなら収まるが `hits` は
-    非空）ときの最終手段。先頭ヒットの本文（`text`）だけを UTF-8 バイト単位で縮めてでも、位置情報
-    （`doc_id`/`line`/`span` 等・`text` 以外の全キー）付きの1件を残す——`hits=[]`・`next_offset`
-    を進めないページを返すと、続きの呼び出しが前回と同一引数になり `_is_duplicate_tool_call` の
-    重複拒否でその検索を先へ進められなくなる（`read_doc` の1行が長すぎる場合と同じ型の穴）。
-
-    位置情報だけ（`text` を空にしても）`max_bytes` に収まらない場合は、成功ページを装わず
-    `tool_result_budget_too_small` エラーを返す。エラー自体も収まらない極端な予算では `None`
-    （呼び出し元の更なるフォールバックに委ねる）。
+    """`_clip_hits_field` で先頭ヒット 1 件すら丸ごとは残せないときの最終手段。先頭ヒットの `text` だけを UTF-8 バイト単位で縮め、位置情報（`text` 以外の全キー）付きの 1 件を残す。
+    `hits=[]`・`next_offset` を進めないページを返すと、続きの呼び出しが前回と同一引数になり重複拒否で進めなくなるため。
+    位置情報だけでも `max_bytes` に収まらなければ `tool_result_budget_too_small` エラーを返す。エラー自体も収まらなければ `None`。
     """
     first = result["hits"][0]
     has_text_field = isinstance(first, dict) and isinstance(first.get("text"), str)
@@ -628,7 +542,7 @@ def _clip_hits_partial_first_hit(result: dict, max_bytes: int, *, offset: int, a
         elif isinstance(first, str):
             item = agentic_search._clip_utf8_bytes(body, byte_len)
         else:
-            item = first   # 文字列でも text 付き dict でもない＝縮められる本文が無い
+            item = first  # 文字列でも text 付き dict でもない＝縮められる本文が無い
         r["hits"] = [item]
         r["truncated"] = True
         r["partial_hit"] = True
@@ -659,24 +573,9 @@ def _clip_hits_partial_first_hit(result: dict, max_bytes: int, *, offset: int, a
 
 
 def _clip_hits_field(result: dict, max_bytes: int, *, offset: int, allow_next_offset: bool):
-    """`hits`（配列）を持つ結果（`ripgrep_search`/`es_search`）を、末尾のヒットから落として構造を
-    保ったまま `max_bytes` に収める。`truncated=true` は常に付ける（呼び出し元はここに来た時点で
-    元の直列化が `max_bytes` を超えている）。
-
-    `next_offset` は `allow_next_offset`（＝ツール名が `ripgrep_search`）のときだけ付ける——
-    `es_search` はページングを持たない（kNN の候補集合はページ間で固定できず offset を進める
-    意味が無い・`_DESC_ES` に「候補の発見用・全件列挙は ripgrep_search/list_docs/原本読取」と
-    案内済み）ため、`hits` を切っても `next_offset` は一切付けない。`ripgrep_search` では
-    「呼び出し引数の `offset`」＋「今回残した件数」で必ず計算する——`hits` の最終ページ（ヒット数が
-    ページ幅未満）は `agentic_search.py` 側が `next_offset` を付けないため、ここでの外側クリップが
-    既存の `result["next_offset"]` から逆算すると基準を持てず巻き戻る（offset=20 の最終5件を2件に
-    切ったときに正しい22ではなく2を返す）——`offset` は呼び出し元から明示的に渡してもらう。
-
-    ヒット0件（envelope だけ）なら収まるが `hits` が非空（＝先頭1件すら丸ごとは残せない）場合は
-    `_clip_hits_partial_first_hit` に委譲する——`hits=[]`・`next_offset` 据え置きのページは
-    続きの呼び出しが同一引数になり重複拒否で進められなくなるため、成功ページとして返さない。
-
-    envelope（`hits=[]`）自体も収まらなければ `None`（呼び出し元が他の手段にフォールバックする）。
+    """`hits` を持つ結果（`ripgrep_search`/`es_search`）を、末尾のヒットから落として `max_bytes` に収める。`truncated=true` は常に付ける。
+    `next_offset` は `allow_next_offset`（ツールが `ripgrep_search`）のときだけ、「呼び出し引数の `offset`」＋「今回残した件数」で計算して付ける（`es_search` はページングを持たない）。
+    先頭 1 件すら丸ごとは残せない場合は `_clip_hits_partial_first_hit` に委譲する。envelope（`hits=[]`）自体も収まらなければ `None`。
     """
     hits = result.get("hits")
     if not isinstance(hits, list):
@@ -691,8 +590,7 @@ def _clip_hits_field(result: dict, max_bytes: int, *, offset: int, allow_next_of
             r.pop("next_offset", None)
         elif k < n:
             r["next_offset"] = offset + k
-        # allow_next_offset かつ k == n（hits 自体は削っていない）: 元の next_offset（無ければ無し）
-        # をそのまま残す（`dict(result)` で既にコピー済み）。
+        # allow_next_offset かつ hits を削っていない場合は、元の next_offset（無ければ無し）をそのまま残す。
         return r
 
     lo, hi, best_k = 0, n, -1
@@ -706,9 +604,9 @@ def _clip_hits_field(result: dict, max_bytes: int, *, offset: int, allow_next_of
     if best_k > 0:
         return _build(best_k), True
     if best_k < 0:
-        return None                      # envelope（0件ページ）すら収まらない
+        return None  # envelope（0 件ページ）すら収まらない
     if n == 0:
-        return _build(0), True           # 元々0件＝縮める本文が無い正当な0件ページ
+        return _build(0), True  # 元々 0 件＝縮める本文が無い正当な 0 件ページ
     return _clip_hits_partial_first_hit(result, max_bytes, offset=offset, allow_next_offset=allow_next_offset)
 
 
@@ -716,14 +614,8 @@ _PARTIAL_LINE_NOTE_TMPL = "先頭行が長すぎるため行の途中まで。�
 
 
 def _clip_read_doc_partial_first_line(result: dict, max_bytes: int, first_line: str, start_line: int):
-    """`_clip_read_doc_field` で1行も丸ごとは残せない（最初の1行だけでも `max_bytes` を超える）
-    ときの最終手段。先頭行の本文をバイト単位で縮めてでも空文字を返さない——`text=""`・
-    `end_line=start_line-1`（進捗ゼロ）のまま返すと、続きの呼び出しが前回と同じ引数になり
-    `_is_duplicate_tool_call` の重複拒否でその文書を二度と読めなくなる。
-
-    `end_line=start_line`（その行を消費済み扱いにする）にして進捗を保証する——行の途中からの
-    再開位置（文字オフセット）は `read_doc` の引数に無いため、この行の残りは読めない
-    （`partial_line=true`・`note` で明示。受容: 1行が極端に長い場合の残りは未読のまま扱う）。
+    """`_clip_read_doc_field` で 1 行も丸ごとは残せないときの最終手段。先頭行の本文をバイト単位で縮めて、空文字を返さない。
+    `end_line=start_line`（その行を消費済み扱い）にして進捗を保証する（進捗ゼロだと続きが重複拒否で進まない）。行の残りは読めない（`partial_line=true`・`note` で明示）。
     """
     first_bytes = first_line.encode("utf-8")
 
@@ -750,12 +642,8 @@ def _clip_read_doc_partial_first_line(result: dict, max_bytes: int, first_line: 
 
 
 def _clip_read_doc_field(result: dict, max_bytes: int):
-    """`text`＋`end_line`（`read_doc` の形）を持つ結果を、行境界を保ったまま `max_bytes` に収める。
-    `end_line`/`total_lines` を残し、`truncated=true` を付ける——続きは呼び出し元が
-    `start_line=end_line+1` で読み直せる（`total_lines` は変えない＝「全何行中どこまで読めたか」の
-    申告のまま）。1行も丸ごとは残せない場合は `_clip_read_doc_partial_first_line` に委譲する。
-
-    `text`/`end_line` の両方を持たない結果には適用できない（`None`）。
+    """`text`＋`end_line`（`read_doc` の形）を持つ結果を、行境界を保ったまま `max_bytes` に収める。`end_line`/`total_lines` を残し、`truncated=true` を付ける（続きは `start_line=end_line+1`）。
+    1 行も残せない場合は `_clip_read_doc_partial_first_line` に委譲する。`text`/`end_line` の両方を持たない結果には適用できない（`None`）。
     """
     text = result.get("text")
     end_line = result.get("end_line")
@@ -765,7 +653,7 @@ def _clip_read_doc_field(result: dict, max_bytes: int):
     n = len(lines)
     start_line = result.get("start_line")
     if not isinstance(start_line, int):
-        start_line = end_line - n + 1   # 行数から逆算（start_line を持たない読取系向けの近似）
+        start_line = end_line - n + 1  # 行数から逆算（start_line を持たない読取系向けの近似）
 
     def _build(k: int) -> dict:
         r = dict(result)
@@ -789,44 +677,77 @@ def _clip_read_doc_field(result: dict, max_bytes: int):
     return _clip_read_doc_partial_first_line(result, max_bytes, lines[0], start_line)
 
 
-# 構造が分からない結果（`hits`/`end_line` のどちらの形にも合わない、または0件/0行まで削っても
-# 収まらない極端なケース）向けの最終防衛線。続きの位置を保証できないことを明示する。
+# 構造が分からない結果、または 0 件/0 行まで削っても収まらない極端なケース向けの最終防衛線。続きの位置を保証できないことを明示する。
 _CLIP_FALLBACK_NOTE = "結果が大きすぎるため先頭のみ。範囲を絞って再実行してください"
 
 
+def _clip_graph_neighbors(result: dict, max_bytes: int):
+    """`graph_neighbors` の結果を、`coverage`・`error_code` などの固定欄を残したまま `neighbors` の末尾から削って収める。
+    削った件数は `coverage` に `card_cap`（`omitted` へ加算）として足す。0 件まで削っても収まらなければ `None`。
+    """
+    neighbors = result.get("neighbors")
+    if not isinstance(neighbors, list):
+        return None
+    kept = list(neighbors)
+    up = result.get("coverage") or {}
+    unknown = not up.get("complete", True) and up.get("omitted") is None  # 上流が部分結果で総数が不明
+
+    def _cov(dropped: int) -> dict:
+        cov = {"complete": False, "limits": [dict(x) for x in up.get("limits", [])],
+               "omitted": None if unknown else (0 if up.get("complete", True) else up["omitted"]) + dropped}
+        if "depth" in up:
+            cov["depth"] = dict(up["depth"])
+        if {"kind": graph_coverage.KIND_CARD_CAP, "stage": graph_coverage.STAGE_CARDS} not in cov["limits"]:
+            cov["limits"].append({"kind": graph_coverage.KIND_CARD_CAP, "stage": graph_coverage.STAGE_CARDS})
+        return cov
+
+    count = None if unknown else result.get("count", len(neighbors))
+    while True:
+        dropped = len(neighbors) - len(kept)
+        r = dict(result)
+        r["neighbors"] = kept
+        if dropped:
+            r["coverage"] = _cov(dropped)
+            r["truncated"] = True
+            r["count"] = count
+        if _json_bytes(r) <= max_bytes:
+            return r, True
+        if not kept:
+            break
+        kept.pop()
+    # 近傍を 0 件にしても収まらない: 固定欄だけの最小形、それも入らなければ明示のエラー（`hit` に分類させない）
+    minimal = {"neighbors": [], "truncated": True, "count": count, "coverage": _cov(len(neighbors))}
+    if result.get("error_code"):
+        minimal["error_code"] = result["error_code"]
+    if _json_bytes(minimal) <= max_bytes:
+        return minimal, True
+    err = {"error": "tool_result_budget_too_small"}
+    return (err, True) if _json_bytes(err) <= max_bytes else None
+
+
 def _clip_tool_result(result, name: str | None = None, args: dict | None = None):
-    """1件あたりのバイト予算を超えた結果を切り詰める（`SHERPA_MCP_TOOL_BUDGET_BYTES` があれば
-    優先・無ければ `effective_tool_result_max_bytes` へフォールバック）。`agentic_search.run_tool`
-    自身が直列化後の実バイト数で収まりを保証する仕組み（ripgrep_search/es_search の per-hit
-    シュリンク・`_finish_reader_result` の二分探索）を持つため、ここに来るのは通常その保証が
-    効かない極端なケースだけ——「構造を保ったまま続きを取れる」ことを保証する最終防衛線として、
-    結果の形ごとに分岐する（`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §2「1件あたりの
-    ツール結果バイト予算」）。
-
-    `name`（呼び出したツール名）・`args`（そのツール呼出の生の引数）は `handle()` が渡す——
-    `hits` 分岐の `next_offset` 付与可否（`ripgrep_search` だけ）と基準位置（呼び出し引数の
-    `offset`）の判定に使う。省略時（単体テストでの直接呼出等）は `name=None`（`next_offset` を
-    付けない）・`args=None`（`offset=0`）に倒す。
-
-    1. `hits`（配列）を持つ結果（ripgrep_search/es_search）→ `_clip_hits_field`（末尾ヒットを落とし、
-       ripgrep_search だけ `next_offset` を保つ）。
-    2. `text`＋`end_line` を持つ結果（read_doc）→ `_clip_read_doc_field`（行境界で落とし `end_line`/
-       `total_lines` を保つ・1行も残せない極端なケースは先頭行を部分的に残す）。
-    3. どちらの形でもない、または0件/0行まで削っても収まらない → 直列化済み JSON 文字列を先頭から
-       切った断片を `text` に残す（fail-open）。続きの位置は保証できないため `note` で明示する。
-
+    """1 件あたりのバイト予算を超えた結果を切り詰める（`SHERPA_MCP_TOOL_BUDGET_BYTES` 優先・無ければ `effective_tool_result_max_bytes`）。
+    `run_tool` 自身が収まりを保証するため、ここに来るのは通常その保証が効かない極端なケースだけの最終防衛線。
+    `name`・`args` は `handle()` が渡す（`next_offset` の付与可否と基準位置の判定に使う）。省略時は `next_offset` を付けず `offset=0`。
+    ① `hits` を持つ結果 → `_clip_hits_field`。
+    ② `text`＋`end_line` を持つ結果 → `_clip_read_doc_field`。
+    ③ どちらでもない、または削っても収まらない → 直列化済み JSON の先頭の断片を `text` に残す（fail-open・`note` で続きの位置を保証できないと明示）。
     戻り値は `(result_or_clipped, clipped: bool)`。
     """
     if not isinstance(result, dict):
         return result, False
     max_bytes = _env_int_override("SHERPA_MCP_TOOL_BUDGET_BYTES") \
-        or agentic_search.effective_tool_result_max_bytes(provider="codex")
+        or agentic_search.effective_tool_result_max_bytes()
     size = _json_bytes(result)
     if size <= max_bytes:
         return result, False
 
     structured = _clip_hits_field(result, max_bytes, offset=_offset_arg(args),
                                   allow_next_offset=(name == "ripgrep_search"))
+    if structured is None and name in graph_tools.TOOL_NAMES:
+        structured = graph_tools.fit_to_bytes(result, max_bytes)
+    if structured is None and name == "graph_neighbors":
+        structured = _clip_graph_neighbors(result, max_bytes)
     if structured is None:
         structured = _clip_read_doc_field(result, max_bytes)
     if structured is not None:
@@ -840,10 +761,7 @@ def _clip_tool_result(result, name: str | None = None, args: dict | None = None)
                                "note": _CLIP_FALLBACK_NOTE}, ensure_ascii=False)
         return len(envelope.encode("utf-8"))
 
-    # 二分探索: `raw` の UTF-8 バイト接頭辞長 `mid` を増減させ、包んだ最終形が `max_bytes` 以下に
-    # なる最大の `mid` を探す（`mid` を増やすほど候補文字列は単調に長くなり、包んだバイト数も
-    # 単調非減少＝二分探索が成立する）。`max_bytes` が極端に小さく空 text でも収まらない場合は
-    # 空文字のまま返す（設定側の下限＝1KiB がこの状況を実運用では起こさない）。
+    # 二分探索: `raw` の UTF-8 バイト接頭辞長 `mid` を調整し、包んだ最終形が `max_bytes` 以下になる最大の `mid` を探す。空 text でも収まらない極端な予算では空文字のまま返す。
     lo, hi, best = 0, size, ""
     while lo <= hi:
         mid = (lo + hi) // 2
@@ -858,26 +776,17 @@ def _clip_tool_result(result, name: str | None = None, args: dict | None = None)
             "note": _CLIP_FALLBACK_NOTE}, True
 
 
-# ---- 同一クエリの重複実行の抑止 ----
-# 実機で同じ ripgrep_search が2回ずつ走り、同一結果を二重に文脈へ積んでいた（Codex が前回の結果を
-# 見落として同条件で再実行する）ことへの対処。プロセス寿命（エージェント＝MCP 接続ごとに別プロセス・
-# モジュール docstring の DEPTH-2 S3b 参照）で (ツール名, 引数の正規化 JSON) だけを覚え、結果本文は
-# 一切保持しない（メモリ・漏洩の両面）。multi_agent の子エージェントは親とは別に覚える。
+# 同一クエリの重複実行の抑止。同じ ripgrep_search が同条件で二重に実行され、同一結果が文脈に積まれるのを防ぐ。
+# プロセス寿命（エージェントごと）で (ツール名, 引数の正規化 JSON) だけを覚え、結果本文は保持しない。
 _DUPLICATE_CALL_CACHE_MAX = 64
-# 値は COD-16 の結果区分（`_coverage_outcome` の戻り値）——初回呼出しの結果が確定するまでは
-# `None`（`_is_duplicate_tool_call` が挿入した直後の値・`_record_item_coverage` が後から埋める）。
+# 値は結果区分（`_coverage_outcome` の戻り値）。初回呼出しの結果が確定するまでは `None`（`_record_item_coverage` が後から埋める）。
 _seen_tool_calls: "OrderedDict[tuple, str | None]" = OrderedDict()
-# ask_user は専用分岐で既に処理済み（重複可＝毎回同じ確認文言を返す契約）。`_BUDGET_EXEMPT_TOOLS`
-# （一覧のみの土台系）も対象外——list_docs/folder_tree を繰り返し呼ぶこと自体は実害が無い。
+# ask_user は専用分岐で処理済みのため対象外。`_BUDGET_EXEMPT_TOOLS`（一覧のみの土台系）も対象外。
 _DUPLICATE_CHECK_EXEMPT_TOOLS = frozenset({"ask_user"}) | _BUDGET_EXEMPT_TOOLS
 
 
 def _dedup_key(name: str, args) -> tuple | None:
-    """重複判定・COD-16 の結果区分キャッシュが共有する正規化キー。`item`（台帳の項目 id）は
-    除いて正規化する——同じ検索条件を別の item タグで呼び直しても、道具として見た呼出しの
-    同一性は変わらない（`item` は Sherpa 側の付け札であって Codex から見た引数ではない）。
-    直列化できない引数は `None`（同一性を判定できない・呼び出し側は fail-open にする）。
-    """
+    """重複判定と結果区分キャッシュが共有する正規化キー。`item`（台帳の項目 id）は除く。直列化できない引数は `None`（同一性を判定できない・fail-open）。"""
     try:
         _key_args = ({k: v for k, v in args.items() if k != "item"}
                     if isinstance(args, dict) else args)
@@ -887,15 +796,12 @@ def _dedup_key(name: str, args) -> tuple | None:
 
 
 def _is_duplicate_tool_call(name: str, args: dict) -> bool:
-    """同一 `(name, 正規化した args)` の2回目以降の呼出なら True（初回はここで記録するだけ）。
-
-    `_dedup_key` でキー順の違い・`item` の違いを同一視する。件数上限
-    （`_DUPLICATE_CALL_CACHE_MAX`）に達したら最も古いキーから捨てる（LRU）——無限に覚え続けて
-    プロセスのメモリを圧迫しないため。
+    """同一 `(name, 正規化した args)` の 2 回目以降の呼出なら True（初回は記録するだけ）。`_dedup_key` でキー順・`item` の違いを同一視する。
+    件数上限（`_DUPLICATE_CALL_CACHE_MAX`）に達したら最も古いキーから捨てる（LRU）。
     """
     key = _dedup_key(name, args)
     if key is None:
-        return False   # 直列化できない引数は同一性を判定できない＝重複扱いしない（fail-open）
+        return False  # 直列化できない引数は重複扱いしない（fail-open）
     if key in _seen_tool_calls:
         _seen_tool_calls.move_to_end(key)
         return True
@@ -906,14 +812,8 @@ def _is_duplicate_tool_call(name: str, args: dict) -> bool:
 
 
 def _record_duplicate_item_coverage(name: str, args: dict) -> None:
-    """重複拒否した呼出し（`_is_duplicate_tool_call` が `True`）でも、`item` が付いていれば
-    初回呼出しの結果区分（`_seen_tool_calls` に控えた値）をこの item にも記録する（COD-16）。
-    重複拒否は run_tool を呼ばず結果を再送しないため、これをしないとこの item だけ
-    coverage.jsonl に記録が残らず「調べた記録が無い」（`not_searched`）に誤判定される。
-
-    初回の結果区分がまだ確定していない（同一キーの呼出しが並行している等）・`item` 無し・
-    対象外ツール・`_coverage_outcome` が記録しない対象（`None`）だった場合はいずれも何もしない
-    （fail-open・観測用の副記録）。
+    """重複拒否した呼出しでも、`item` が付いていれば初回の結果区分（`_seen_tool_calls`）をこの item にも記録する（しないと「調べた記録が無い」と誤判定される）。
+    結果区分が未確定・`item` 無し・対象外ツール・記録しない対象のときは何もしない（fail-open）。
     """
     if name not in _ITEM_PARAM_TOOLS:
         return
@@ -942,12 +842,12 @@ def _err(rid, code: int, msg: str) -> dict:
 
 
 def handle(req: dict) -> dict | None:
-    """JSON-RPC 1件を処理して応答 dict を返す。**通知（id 無し）は None＝応答しない**（MCP 準拠）。"""
+    """JSON-RPC 1 件を処理して応答 dict を返す。通知（id 無し）は None＝応答しない。"""
     method = req.get("method")
     rid = req.get("id")
     is_notification = "id" not in req
     if method == "initialize":
-        # protocolVersion はクライアント要求をそのまま返す（緩い交渉・未指定なら既定）。
+        # protocolVersion はクライアント要求をそのまま返す（未指定なら既定）。
         pv = (req.get("params") or {}).get("protocolVersion") or PROTOCOL_VERSION
         return _ok(rid, {"protocolVersion": pv, "capabilities": {"tools": {}},
                          "serverInfo": SERVER_INFO})
@@ -958,8 +858,7 @@ def handle(req: dict) -> dict | None:
         name = params.get("name")
         args = params.get("arguments") or {}
         if _toolset() == "plain" and name not in _PLAIN_TOOLSET:
-            # plain は es_search・graph_neighbors・ask_user だけ——tools/list に出していなくても
-            # 直接呼ばれたら存在しないツールと同じエラーで拒否する（fail-closed・多層防御）。
+            # plain は es_search・graph_neighbors・ask_user だけ。tools/list に出していなくても、直接呼ばれたら存在しないツールと同じエラーで拒否する（fail-closed）。
             err_body = {"error": f"unknown tool: {name}"}
             return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                              "isError": True})
@@ -969,21 +868,14 @@ def handle(req: dict) -> dict | None:
             return _ok(rid, {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
                              "isError": bool(result.get("error"))})
         if name == "ask_user":
-            # S2: ask_user はユーザーへ届ける「質問」＝検索ツールではない。実際の質問カード表示は
-            # ラッパー（agents._run_authoring）が question イベントで行う。ここは Codex に「届いた・
-            # 追加調査せず要約して終了せよ」を返すだけ（乱用ガード③: 2回目以降は別文言で調査続行を促す）。
-            # RV HIGH: 確認ID 付き再送（tools/list で隠しても、プロンプト指示に反して呼ばれる場合の防御）は
-            # 初回でも _ASK_RESULT_AGAIN＝質問カードを出さずに調査を打ち切らせない（ラッパーも無視するため）。
+            # ask_user は質問であって検索ツールではない。質問カードの表示はラッパー（`agents._run_authoring`）が行い、ここは「届いた・追加調査せず要約して終了せよ」を返すだけ（2 回目以降は別文言で調査続行を促す）。
+            # 確認ID 付き再送では初回でも `_ASK_RESULT_AGAIN` を返す（質問カードを出さないまま調査を打ち切らせない）。
             if _ask_disabled():
                 return _ok(rid, {"content": [{"type": "text", "text": _ASK_RESULT_AGAIN}], "isError": False})
             _ASK_STATE["count"] += 1
             if _ASK_STATE["count"] == 1:
                 text = _ASK_RESULT_FIRST
-                # DEPTH-2 S3b: 子（spawn_agent された worker/evaluator）の ask_user は親の `--json` に
-                # 現れない（実機確認済み）——本サーバは呼び出し元が親か子か区別できないため、初回の
-                # 質問は常にサイドカーへも書く（親が直接呼んだ通常実行では、親は同じ質問を自分の
-                # `--json` item から既に見えている＝二重には効かない・provider.py 側が
-                # `codex_question is None` の時だけサイドカー分を使う）。
+                # 子（worker/evaluator）の ask_user は親の `--json` に現れず、呼び出し元が親か子か区別できないため、初回の質問は常にサイドカーへも書く（provider.py が `codex_question is None` のときだけサイドカー分を使う）。
                 _q = agentic_search._question_from_args(args)
                 if isinstance(_q, dict):
                     _sidecar_append({"kind": "ask_user", "ts": time.time(), "question": _q})
@@ -991,49 +883,32 @@ def handle(req: dict) -> dict | None:
                 text = _ASK_RESULT_AGAIN
             return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": False})
         if name not in _DUPLICATE_CHECK_EXEMPT_TOOLS and _is_duplicate_tool_call(name, args):
-            # 同一条件の再実行は run_tool を呼ばず本文も再送しない（実機で同じ ripgrep_search が
-            # 2回ずつ走り同一結果を二重に文脈へ積んでいた事象への対処・module docstring 参照）。
+            # 同一条件の再実行は run_tool を呼ばず本文も再送しない。
             _sidecar_append({"kind": "limit", "field": "duplicate_tool_call", "ts": time.time()})
-            _record_duplicate_item_coverage(name, args)   # COD-16: 初回の結果区分をこの item にも転記
+            _record_duplicate_item_coverage(name, args)  # 初回の結果区分をこの item にも転記
             err_body = {"error": "duplicate_tool_call",
                        "hint": "同じ条件の検索は既に実行済みです。条件を変えてください。"}
             return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                              "isError": True})
         try:
-            # 調べる深さ連動込みの実効 hits/window（`SHERPA_MCP_TOOL_MAX_HITS`/`_WINDOW_CAP`・
-            # 親＝`CodexProvider` が API 経路と同じ関数で解決した値）とバイト予算（既存）を
-            # `run_tool()` 自身のクリップ処理へも渡す——`_clip_tool_result`（この後段）は最終形を
-            # 保証する多層防御で、こちらは実行中の内部クリップ（read_doc の逐次クリップ等）を
-            # 同じ実効値に揃えるためのもの。env 未設定/不正値は `None`＝`run_tool()` のモジュール
-            # 既定へフォールバックする。
-            result, _docs, _cites, _cards = agentic_search.run_tool(
+            # 調べる深さ連動込みの実効 hits/window（`SHERPA_MCP_TOOL_MAX_HITS`/`_WINDOW_CAP`）とバイト予算を `run_tool()` の内部クリップにも渡す。env 未設定/不正値は `None`＝`run_tool()` の既定。後段の `_clip_tool_result` は最終形を保証する多層防御。
+            result, _docs, _cites, _cards = tool_dispatch.run_tool(
                 name, args, _world(), _scope(), layer=_layer(),
                 max_hits=_env_int_override("SHERPA_MCP_TOOL_MAX_HITS"),
                 window_cap=_env_int_override("SHERPA_MCP_TOOL_WINDOW_CAP"),
                 tool_result_max_bytes=_env_int_override("SHERPA_MCP_TOOL_BUDGET_BYTES"),
                 graph_only=(_toolset() == "plain"))
         except GraphSchemaEraError as e:
-            # RV是正（rv-periphery #11）: `graph_neighbors`（`lens_service.neighbor_cards` 経由）が
-            # 検知した旧世代グラフは、汎用の JSON-RPC プロトコルエラー（-32603・`serve()` の
-            # broad except）に丸めず、通常のツール結果と同じ経路（`isError` あり・
-            # `content[].text` に安定した機械可読コード）で返す——Codex 側の `item["result"]` に
-            # そのまま載るため（JSON-RPC のプロトコルエラーは Codex 自身の item 表現が保証されて
-            # いない）、`providers/codex/mcp.py::_graph_schema_era_from_item` が読み取って
-            # `GraphSchemaEraError` を再構成できる。
+            # `graph_neighbors` が検知した旧世代グラフは、JSON-RPC のプロトコルエラーにせず通常のツール結果（`isError` あり・`content[].text` に機械可読コード）で返す。`providers/codex/mcp.py::_graph_schema_era_from_item` が `GraphSchemaEraError` を再構成する。
             err_body = {"error": agentic_search.GRAPH_REINGEST_ERROR_CODE,
                         "world": e.world, "stored_era": e.stored_era}
-            _sidecar_error_code(name, err_body)   # 子が受け取った障害も親が観測できるようにする
+            _sidecar_error_code(name, err_body)  # 子が受け取った障害も親が観測できるようにする
             _record_item_coverage(name, args, err_body, True)
             return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                              "isError": True})
         is_error = bool(isinstance(result, dict) and result.get("error"))
         _sidecar_error_code(name, result)
-        # `run_tool()` 自身が内部で行った打ち切り（1件あたりバイト予算の外側クリップとは別）を
-        # サイドカーへ記録する——API 経路（`agentic_search._record_run_tool_limits`）と同じ判定キー・
-        # 同じ語彙（`agentic_search._SEARCH_TRUNCATED_TOOLS`/`_BYTE_CLIP_TOOLS` をそのまま使う・
-        # 車輪の再発明をしない）。`_tool_result_clipped_recorded` はこの呼び出し1回の中で
-        # `tool_result_clipped` を二重に書かないためのフラグ（下の `_clip_tool_result` による
-        # 外側クリップも同じ呼び出しで起き得るため、1回の呼び出しにつき最大1回だけ書く）。
+        # `run_tool()` 自身が内部で行った打ち切りをサイドカーへ記録する（API 経路の `agentic_search._SEARCH_TRUNCATED_TOOLS`/`_BYTE_CLIP_TOOLS` と同じ判定キー・語彙）。`_tool_result_clipped_recorded` は 1 回の呼び出しで `tool_result_clipped` を二重に書かないためのフラグ。
         _tool_result_clipped_recorded = False
         if isinstance(result, dict):
             if name in agentic_search._SEARCH_TRUNCATED_TOOLS and result.get("truncated"):
@@ -1042,9 +917,7 @@ def handle(req: dict) -> dict | None:
                 _sidecar_append({"kind": "limit", "field": "tool_result_clipped", "ts": time.time()})
                 _tool_result_clipped_recorded = True
         if not is_error:
-            # DEPTH-2 S3b: 子が読んだ doc_id をサイドカーへ（本文は書かない・失敗した呼出は数えない）。
-            # `_sidecar_append` は `SHERPA_MCP_SIDECAR` 未設定なら no-op（既存の単一エージェント実行に
-            # は影響しない）。
+            # 子が読んだ doc_id をサイドカーへ（本文は書かない・失敗した呼出は数えない）。
             if name in READ_DOC_TOOLS:
                 d = args.get("doc_id")
                 if isinstance(d, str) and d:
@@ -1062,18 +935,14 @@ def handle(req: dict) -> dict | None:
             result, _clipped = _clip_tool_result(result, name=name, args=args)
             if _clipped and not _tool_result_clipped_recorded:
                 _sidecar_append({"kind": "limit", "field": "tool_result_clipped", "ts": time.time()})
-            # `_clip_tool_result`（`_clip_hits_partial_first_hit`）は位置情報だけでも予算に
-            # 収まらない極端なケースで `result` を `{"error": ...}` へ置き換えることがある
-            # （成功ページを装わない契約）——`is_error` はクリップ前の結果で確定済みのため、
-            # クリップ後に error 形へ変わった分もここで同じ基準（`result.get("error")`）で拾い直す。
+            # `_clip_tool_result` が結果を `{"error": ...}` へ置き換えることがあるため、クリップ後に error 形へ変わった分もここで拾い直す。
             is_error = is_error or bool(isinstance(result, dict) and result.get("error"))
-        # COD-16: `item` 付き呼出しの結果区分を台帳へ記録する（Codex へ返す最終形＝クリップ後の
-        # `result`/`is_error` を使う——外側クリップ自体が「切り詰め」の事実そのものであるため）。
+        # `item` 付き呼出しの結果区分を台帳へ記録する（Codex へ返す最終形＝クリップ後の `result`/`is_error` を使う）。
         _record_item_coverage(name, args, result, is_error)
-        # MCP 標準＝content[].text。Codex が読む本文＝run_tool の結果（graph_neighbors は compact neighbors）。
+        # MCP 標準＝content[].text。Codex が読む本文は run_tool の結果。
         text = json.dumps(result, ensure_ascii=False)
         return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": is_error})
-    if is_notification:                       # notifications/initialized 等＝応答しない
+    if is_notification:  # notifications/initialized 等は応答しない
         return None
     return _err(rid, -32601, f"method not found: {method}")
 
@@ -1089,10 +958,10 @@ def serve(stdin=None, stdout=None) -> None:
         try:
             req = json.loads(line)
         except ValueError:
-            continue                          # 壊れた行は黙って捨てる（プロトコルを落とさない）
+            continue  # 壊れた行は黙って捨てる（プロトコルを落とさない）
         try:
             resp = handle(req)
-        except Exception as e:                # ツール例外でもサーバは落とさない（その応答だけ error）
+        except Exception as e:  # ツール例外でもサーバは落とさない（その応答だけ error）
             resp = _err(req.get("id"), -32603, f"{type(e).__name__}: {e}")
         if resp is not None:
             stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")

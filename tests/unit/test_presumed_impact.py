@@ -233,45 +233,16 @@ def test_run_impact_no_truncation_output_unchanged(monkeypatch):
     assert result["presumed"] == []
 
 
-# ---- SHERPA_IMPACT_MAX_DEPTH ----
-# import 時に一度だけ確定する定数は実プロセスを新規に起こして検証する（`_fresh_import`）。
-# （`ingest.world_neo4j.IMPACT_MAX_DEPTH` と同じ env を共用・循環 import のため定数は複製）。
+# ---- IMPACT_MAX_DEPTH（コード既定・管理画面の基準値が未設定のときに使う） ----
 
-def _impact_max_depth_env_script() -> str:
-    return (
+def test_impact_max_depth_default_is_shared_by_run_impact_and_ignores_env():
+    """既定は 10。`run_impact` の `depth` 既定が揃っていて、環境変数 `SHERPA_IMPACT_MAX_DEPTH` は
+    実行時の値に影響しない（画面だけが正）。"""
+    script = (
         "import inspect, json\n"
         "import sherpa.impact_service as m\n"
-        "print(json.dumps({\n"
-        "    'impact_max_depth': m.IMPACT_MAX_DEPTH,\n"
-        "    'run_impact_depth': inspect.signature(m.run_impact).parameters['depth'].default,\n"
-        "}))\n"
+        "print(json.dumps([m.IMPACT_MAX_DEPTH,\n"
+        "                  inspect.signature(m.run_impact).parameters['depth'].default]))\n"
     )
-
-
-def test_impact_max_depth_fresh_import_env_unset_is_default():
-    out = json.loads(FI.run_script(_impact_max_depth_env_script(),
-                                   env={"SHERPA_IMPACT_MAX_DEPTH": None}))
-    assert out["impact_max_depth"] == 8
-
-
-def test_impact_max_depth_fresh_import_env_valid_value():
-    """正しい値が反映されることに加え、`run_impact` の `depth` 既定値が `IMPACT_MAX_DEPTH` に
-    揃っていること（既定値どうしが偶然一致するだけの「旧リテラル `depth=8` への退行」を検出
-    できない自己言及を避けるため、既定と異なる値で確認）も同じ fresh import でまとめて確認する。"""
-    out = json.loads(FI.run_script(_impact_max_depth_env_script(),
-                                   env={"SHERPA_IMPACT_MAX_DEPTH": "20"}))
-    assert out["impact_max_depth"] == 20
-    assert out["run_impact_depth"] == 20
-
-
-def test_impact_max_depth_fresh_import_env_invalid_falls_back_to_default():
-    for bad in ("0", "65", "abc"):
-        out = json.loads(FI.run_script(_impact_max_depth_env_script(),
-                                       env={"SHERPA_IMPACT_MAX_DEPTH": bad}))
-        assert out["impact_max_depth"] == 8, bad
-
-
-def test_impact_max_depth_env_change_after_import_has_no_effect(monkeypatch):
-    before = I.IMPACT_MAX_DEPTH
-    monkeypatch.setenv("SHERPA_IMPACT_MAX_DEPTH", "40")
-    assert I.IMPACT_MAX_DEPTH == before == 8
+    out = json.loads(FI.run_script(script, env={"SHERPA_IMPACT_MAX_DEPTH": "20"}))
+    assert out == [10, 10]

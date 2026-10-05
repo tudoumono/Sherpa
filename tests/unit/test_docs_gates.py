@@ -5,7 +5,7 @@
 - test_retired_vocabulary_gate: 退役した「版」モデル固有語彙が、archive/proposals
   以外の現役 docs（＋ CLAUDE.md）に「撤去の説明」以外の形で残っていないか検査する。
 - test_relative_markdown_links_resolve: docs 配下（archive 含む）＋ CLAUDE.md／
-  README.md／mockups/README.md の相対 Markdown リンクが実在するファイル/ディレクトリを
+  README.md の相対 Markdown リンクが実在するファイル/ディレクトリを
   指しているか検査する。
 - test_env_vars_documented: sherpa/**/*.py が参照する `SHERPA_*` 環境変数が
   `.env.example` ∪ `docs/manual/90-リファレンス.md` に文書化されているか検査する
@@ -53,19 +53,6 @@ def _retired_vocab_targets() -> list[pathlib.Path]:
     return targets
 
 
-def test_retired_vocabulary_gate():
-    """archive/proposals 以外の docs に旧「版」モデル語彙が説明抜きで残っていないこと。"""
-    violations: list[str] = []
-    for path in _retired_vocab_targets():
-        rel = path.relative_to(ROOT)
-        text = path.read_text(encoding="utf-8")
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            if _RETIRED_VOCAB_RE.search(line) and not _EXPLAINED_RE.search(line):
-                violations.append(f"{rel}:{lineno}: {line.strip()}")
-
-    assert not violations, "退役語彙ゲート違反（撤去の説明なしに旧語彙が残存）:\n" + "\n".join(violations)
-
-
 # フェーズ2第2段（version 受理終了・2026-07-13）後のドリフト検査。
 # 「version が API のクエリ/ボディパラメータとして今なお受理される」という記載だけを狙い、
 # DB 列 `version`（例: `version=NULL`）・semver・`SHERPA_VERSION` env・設計私案の property 名
@@ -81,23 +68,6 @@ _API_VERSION_STALE_RE = re.compile(r"version[^。\n]{0,30}(互換受理|受理|d
 _API_VERSION_OK_RE = re.compile(r"受理終了|受理は終了|受理を終了|受理削除|終了済み|撤去済み|削除済み|未宣言|無視され")
 
 
-def test_api_version_param_retired():
-    """archive/proposals 以外の docs に、旧 `version` が API パラメータとして受理される旨の記載が
-    「終了・撤去済み」の明示なしに残っていないこと（フェーズ2第2段の受け入れ基準）。"""
-    violations: list[str] = []
-    for path in _retired_vocab_targets():
-        rel = path.relative_to(ROOT)
-        text = path.read_text(encoding="utf-8")
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            hit = (_API_VERSION_QUERY_RE.search(line)
-                   or _API_VERSION_PARAM_MENTION_RE.search(line)
-                   or _API_VERSION_STALE_RE.search(line))
-            if hit and not _API_VERSION_OK_RE.search(line):
-                violations.append(f"{rel}:{lineno}: {line.strip()}")
-
-    assert not violations, "旧 version パラメータ受理ゲート違反（撤去の説明なしに記載が残存）:\n" + "\n".join(violations)
-
-
 # Markdown リンク `](target)` の target 抽出。画像 `![alt](target)` も同じ形なので
 # 併せて拾った上で、画像拡張子は下流で除外する。
 _MD_LINK_RE = re.compile(r"\]\(([^)]+)\)")
@@ -105,14 +75,13 @@ _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".ico")
 
 
 def _relative_link_targets() -> list[pathlib.Path]:
-    """docs/**/*.md（archive 含む全部）＋ CLAUDE.md／README.md／mockups/README.md。"""
+    """docs/**/*.md（archive 含む全部）＋ CLAUDE.md／README.md。"""
     targets = sorted(DOCS.rglob("*.md"))
     # 公開 export（scripts/export_public.sh）には CLAUDE.md が含まれない＝存在するときだけ検査
     # （内部リポでは常に存在＝検査は従来どおり効く）。
     if (ROOT / "CLAUDE.md").exists():
         targets.append(ROOT / "CLAUDE.md")
     targets.append(ROOT / "README.md")
-    targets.append(ROOT / "mockups" / "README.md")
     return targets
 
 

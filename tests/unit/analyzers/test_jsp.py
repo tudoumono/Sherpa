@@ -1,8 +1,9 @@
-"""`JspAnalyzer` の単体テスト（アナライザ拡張 波3 レーン A・docs/archive/2026-09-05-アナライザ拡張.md
-§13）。"""
+"""`JspAnalyzer` の単体テスト（アナライザ拡張 波3 レーン A・入力ソース片 → 参照・Dropped の表）。"""
 from __future__ import annotations
 
 import time
+
+import pytest
 
 from sherpa.ingest.analyzers._base import Analyzer
 from sherpa.ingest.analyzers.jsp import JspAnalyzer
@@ -22,251 +23,119 @@ def test_accepts_all_jsp_files_without_content_inspection():
 
 def test_collect_defs_primary_is_extension_included_filename():
     res = A.collect_defs("<html></html>", "WEB-INF/jsp/login.jsp")
-    assert res.primary is not None
-    assert res.primary.label == "Module" and res.primary.name == "login.jsp"
+    assert res.primary is not None and res.primary.label == "Module" and res.primary.name == "login.jsp"
     assert res.children == []
 
 
-# --- include 系（INVOKES via=include） ---
-
-def test_include_directive_file_attr():
-    res = A.extract_refs('<%@ include file="common/header.jspf" %>\n', "x.jsp")
-    assert [(r.edge_type, r.kind, r.name, r.extra) for r in res.refs] == [
-        ("INVOKES", "Module", "header.jspf",
-         {"via": "include", "include_path": "common/header.jspf"})]
+# 参照の期待値: (edge, kind, name, extra 部分)。Dropped は (reason, line|None)。
+def Inc(name, path, kind="Module"):
+    return ("INVOKES", kind, name, {"via": "include", "include_path": path})
 
 
-def test_jsp_include_page_attr():
-    res = A.extract_refs('<jsp:include page="../frag.jspf" />\n', "x.jsp")
-    assert res.refs[0].name == "frag.jspf"
-    assert res.refs[0].extra == {"via": "include", "include_path": "../frag.jspf"}
+def Key(name, key_kind):
+    return ("ACCESSES", "Config", name, {"via": "config_key", "key_kind": key_kind})
 
 
-def test_c_import_url_attr():
-    res = A.extract_refs('<c:import url="/WEB-INF/frag.jspf" />\n', "x.jsp")
-    assert res.refs[0].name == "frag.jspf"
-    assert res.refs[0].extra["via"] == "include"
+EXT = "web_external_ref"
+CASES = {
+    # include 系（INVOKES via=include）
+    "include_directive_file": ('<%@ include file="common/header.jspf" %>\n', "x.jsp",
+                               [Inc("header.jspf", "common/header.jspf")], []),
+    "jsp_include_page": ('<jsp:include page="../frag.jspf" />\n', "x.jsp", [Inc("frag.jspf", "../frag.jspf")], []),
+    "c_import_url": ('<c:import url="/WEB-INF/frag.jspf" />\n', "x.jsp", [("INVOKES", "Module", "frag.jspf", {"via": "include"})], None),
+    "script_src_and_link_href": ('<script src="../static/app.js"></script>\n<link href="../static/style.css">\n', "x.jsp",
+                                 [("INVOKES", "Module", "app.js", {"via": "include"}),
+                                  ("INVOKES", "Module", "style.css", {"via": "include"})], None),
+    "windows_separator_normalized": (r'<%@ include file="common\header.jspf" %>' + "\n", "x.jsp",
+                                     [Inc("header.jspf", "common/header.jspf")], None),
+    "jspx_directive_include": ('<jsp:directive.include file="frag.jspf"/>\n', "x.jspx",
+                               [("INVOKES", "Module", "frag.jspf", {"via": "include"})], None),
+    "absolute_include_relative_to_referrer": ('<jsp:include page="/WEB-INF/shared/header.jspf" />\n',
+                                              "gen1/WEB-INF/jsp/page.jsp", [Inc("header.jspf", "../shared/header.jspf")], None),
+    "include_basename_strips_query": ('<script src="app.js?v=1"></script>\n', "x.jsp", [Inc("app.js", "app.js")], None),
+    "uppercase_tag_unquoted_attribute": ('<SCRIPT SRC=app.js></SCRIPT>\n', "x.jsp", [("INVOKES", "Module", "app.js", None)], None),
+    "attribute_order_independent_jsp_include": ('<jsp:include flush="true" page="frag.jspf"/>\n', "x.jsp",
+                                                [("INVOKES", "Module", "frag.jspf", None)], None),
+    "attribute_order_independent_c_import": ('<c:import var="x" url="frag.jspf"/>\n', "x.jsp",
+                                             [("INVOKES", "Module", "frag.jspf", None)], None),
+    # エッジ化しないもの
+    "taglib_tagdir_no_reference": ('<%@ taglib tagdir="/WEB-INF/tags" %>\n<html></html>\n', "x.jsp", [], []),
+    "page_import_is_hint_only": ('<%@ page import="java.util.List" %>\n', "x.jsp", [], None),
+    "el_expression_not_processed": ("${loginBean.name}\n", "x.jsp", [], []),
+    "jsp_comment_not_scanned": ('<%-- <%@ include file="commented.jspf" %> --%>\n', "x.jsp", [], None),
+    "html_comment_not_scanned": ('<!-- <s:form action="commented"> -->\n', "x.jsp", [], None),
+    "script_body_href_not_scanned": ("<script>var x = '<a href=\"/admin/delete\">';</script>\n", "x.jsp", [], None),
+    # Struts action キー／URL キー（ACCESSES via=config_key）
+    "struts_form_action_bare_name": ('<s:form action="login">\n</s:form>\n', "x.jsp", [Key("login", "action")], None),
+    "href_dot_action_strips_suffix_and_slash": ('<a href="/login.action">Login</a>\n', "x.jsp", [Key("login", "action")], None),
+    "action_extension_with_query": ('<a href="/login.action?next=/">Login</a>\n', "x.jsp", [Key("login", "action")], None),
+    "unquoted_form_action": ("<form action=login></form>\n", "x.jsp", [("ACCESSES", "Config", "login", None)], None),
+    "url_key_absolute_path": ('<a href="/orders/list">Orders</a>\n', "x.jsp", [Key("/orders/list", "url")], None),
+    "url_key_strips_query": ('<a href="/orders/list?page=2">Orders</a>\n', "x.jsp", [Key("/orders/list", "url")], None),
+    "url_key_strips_fragment": ('<a href="/orders/list#tab">Orders</a>\n', "x.jsp", [Key("/orders/list", "url")], None),
+    "static_asset_href_not_config_key": ('<a href="/static/logo.png">logo</a>\n', "x.jsp", [], None),
+    "hash_and_javascript_scheme_not_keys": ('<a href="#">top</a>\n<a href="javascript:void(0)">x</a>\n', "x.jsp", [], None),
+    # jsp:useBean
+    "use_bean_class_qualified": ('<jsp:useBean id="loginBean" class="com.acme.LoginAction" />\n', "x.jsp",
+                                 [("INVOKES", "Module", "com.acme.LoginAction", {"via": "bean_class", "qualified": True})], None),
+    # 外部参照スキーム（include 対象外・URL キーにもしない）
+    "external_script_src_dropped": ('<script src="https://cdn.example.com/lib.js"></script>\n', "x.jsp", [], [(EXT, 1)]),
+    "protocol_relative_link_dropped": ('<link href="//cdn.example.com/style.css">\n', "x.jsp", [], [(EXT, None)]),
+    "data_uri_script_src_dropped": ('<script src="data:text/javascript,void(0)"></script>\n', "x.jsp", [], [(EXT, None)]),
+    # <base href>: 対応せず Dropped・相対 include は basename 最近傍に落とさない
+    "base_href_suppresses_relative_include": ('<base href="/app/">\n<script src="app.js"></script>\n', "x.jsp", [],
+                                              [("web_base_href", None), ("web_relative_under_base", None)]),
+    "absolute_include_unaffected_by_base_href": (
+        '<base href="/app/">\n<jsp:include page="/WEB-INF/shared/header.jspf" />\n', "gen1/WEB-INF/jsp/page.jsp",
+        [("INVOKES", "Module", "header.jspf", None)], None),
+    # 埋め込みの中の文字列は読まない・属性値の中の式は空白に置き換える
+    "tag_text_inside_scriptlet_string_not_scanned": ('<% String s = "<a href=\'/in-java\'>"; %>\n<a href="/real">x</a>\n', "x.jsp",
+                                                    [Key("/real", "url")], None),
+    "jsp_comment_may_contain_close_marker": ('<%-- a %> <a href="/in-comment"> --%>\n<a href="/real">x</a>\n', "x.jsp",
+                                             [Key("/real", "url")], None),
+    "expression_in_href_is_blanked": ('<a href="<%= ctx %>/x.action">x</a>\n', "x.jsp", [Key("x", "action")], None),
+    # スクリプトレット
+    "directive_and_expression_not_scriptlets": ('<%@ page import="a.b.C" %>\n<%= 1 + 1 %>\n', "x.jsp", [], []),
+    "multiple_script_bodies_interleaved_with_real_tags": (
+        '<a href="/real-1">one</a>\n<script>var x = \'<a href="/fake-1">\';</script>\n<a href="/real-2">two</a>\n'
+        '<script>var y = \'<a href="/fake-2">\';</script>\n<a href="/real-3">three</a>\n', "x.jsp",
+        [Key("/real-1", "url"), Key("/real-2", "url"), Key("/real-3", "url")], None),
+}
 
 
-def test_script_src_and_link_href_are_include():
-    res = A.extract_refs('<script src="../static/app.js"></script>\n<link href="../static/style.css">\n', "x.jsp")
-    names = {(r.name, r.extra["via"]) for r in res.refs}
-    assert ("app.js", "include") in names
-    assert ("style.css", "include") in names
+@pytest.mark.parametrize("text,path,refs,dropped", CASES.values(), ids=CASES)
+def test_extract_refs(text, path, refs, dropped):
+    res = A.extract_refs(text, path)
+    got = res.refs
+    exp = refs
+    assert [(r.edge_type, r.kind, r.name) for r in got] == [e[:3] for e in exp]
+    for r, e in zip(got, exp):
+        assert e[3] is None or all(r.extra.get(k) == v for k, v in e[3].items())
+    if dropped is not None:
+        assert len(res.dropped) == len(dropped)
+        for d, (reason, line) in zip(res.dropped, dropped):
+            assert d.reason == reason and (line is None or d.line == line)
 
 
-def test_windows_style_separator_is_normalized():
-    res = A.extract_refs(r'<%@ include file="common\header.jspf" %>' + "\n", "x.jsp")
-    assert res.refs[0].name == "header.jspf"
-    assert res.refs[0].extra["include_path"] == "common/header.jspf"
-
-
-# --- taglib tagdir（ディレクトリ指定・エッジ化しない） ---
-
-def test_taglib_tagdir_produces_no_reference():
-    res = A.extract_refs('<%@ taglib tagdir="/WEB-INF/tags" %>\n<html></html>\n', "x.jsp")
-    assert res.refs == [] and res.dropped == []
-
-
-def test_page_import_is_hint_only_no_edge():
-    res = A.extract_refs('<%@ page import="java.util.List" %>\n', "x.jsp")
-    assert res.refs == []
-
-
-# --- Struts action キー／URL キー（ACCESSES via=config_key） ---
-
-def test_struts_form_action_bare_name_is_action_key():
-    res = A.extract_refs('<s:form action="login">\n</s:form>\n', "x.jsp")
-    assert [(r.edge_type, r.kind, r.name, r.extra["via"]) for r in res.refs] == [
-        ("ACCESSES", "Config", "login", "config_key")]
-    assert res.refs[0].extra["key_kind"] == "action"
-
-
-def test_href_with_dot_action_extension_strips_suffix_and_leading_slash():
-    res = A.extract_refs('<a href="/login.action">Login</a>\n', "x.jsp")
-    assert res.refs[0].name == "login"
-    assert res.refs[0].extra["key_kind"] == "action"
-
-
-def test_url_key_absolute_path_without_extension():
-    res = A.extract_refs('<a href="/orders/list">Orders</a>\n', "x.jsp")
-    assert res.refs[0].name == "/orders/list"
-    assert res.refs[0].extra["key_kind"] == "url"
-
-
-def test_url_key_strips_query_string():
-    res = A.extract_refs('<a href="/orders/list?page=2">Orders</a>\n', "x.jsp")
-    assert res.refs[0].name == "/orders/list"
-
-
-def test_href_to_static_asset_with_extension_is_not_a_config_key():
-    res = A.extract_refs('<a href="/static/logo.png">logo</a>\n', "x.jsp")
-    assert res.refs == []
-
-
-def test_href_hash_and_javascript_scheme_are_not_config_keys():
-    res = A.extract_refs('<a href="#">top</a>\n<a href="javascript:void(0)">x</a>\n', "x.jsp")
-    assert res.refs == []
-
-
-# --- jsp:useBean（INVOKES via=bean_class qualified） ---
-
-def test_use_bean_class_is_qualified_invokes():
-    res = A.extract_refs('<jsp:useBean id="loginBean" class="com.acme.LoginAction" />\n', "x.jsp")
-    assert [(r.edge_type, r.kind, r.name, r.extra) for r in res.refs] == [
-        ("INVOKES", "Module", "com.acme.LoginAction", {"via": "bean_class", "qualified": True})]
-
-
-def test_use_bean_id_alone_is_not_processed():
-    """`id` 属性・EL式 `${bean.prop}` はどちらも対象外（値スタックが曖昧なため・限界明記）。"""
-    res = A.extract_refs('${loginBean.name}\n', "x.jsp")
-    assert res.refs == [] and res.dropped == []
-
-
-# --- コメント除去（JSP コメント／HTML コメント） ---
-
-def test_jsp_comment_contents_are_not_scanned():
-    res = A.extract_refs('<%-- <%@ include file="commented.jspf" %> --%>\n', "x.jsp")
-    assert res.refs == []
-
-
-def test_html_comment_contents_are_not_scanned():
-    res = A.extract_refs('<!-- <s:form action="commented"> -->\n', "x.jsp")
-    assert res.refs == []
-
-
-# --- スクリプトレット（Dropped） ---
-
-def test_scriptlet_is_dropped_once():
-    text = "<%\n  int x = 1;\n%>\n<%\n  int y = 2;\n%>\n"
-    res = A.extract_refs(text, "x.jsp")
+def test_scriptlet_is_dropped_once_at_first_line():
+    res = A.extract_refs("<%\n  int x = 1;\n%>\n<%\n  int y = 2;\n%>\n", "x.jsp")
     scriptlets = [d for d in res.dropped if d.reason == "jsp_scriptlet"]
-    assert len(scriptlets) == 1
-    assert scriptlets[0].line == 1
+    assert len(scriptlets) == 1 and scriptlets[0].line == 1
 
-
-def test_directive_and_expression_tags_are_not_scriptlets():
-    text = '<%@ page import="a.b.C" %>\n<%= 1 + 1 %>\n'
-    res = A.extract_refs(text, "x.jsp")
-    assert not any(d.reason == "jsp_scriptlet" for d in res.dropped)
-
-
-# --- 外部参照スキーム（include 対象外・URL キーにもしない） ---
-
-def test_external_script_src_is_dropped_not_included():
-    res = A.extract_refs('<script src="https://cdn.example.com/lib.js"></script>\n', "x.jsp")
-    assert res.refs == []
-    assert [(d.reason, d.line) for d in res.dropped] == [("web_external_ref", 1)]
-
-
-def test_protocol_relative_link_href_is_dropped_not_included():
-    res = A.extract_refs('<link href="//cdn.example.com/style.css">\n', "x.jsp")
-    assert res.refs == []
-    assert any(d.reason == "web_external_ref" for d in res.dropped)
-
-
-def test_data_uri_script_src_is_dropped():
-    res = A.extract_refs('<script src="data:text/javascript,void(0)"></script>\n', "x.jsp")
-    assert res.refs == []
-    assert any(d.reason == "web_external_ref" for d in res.dropped)
-
-
-# --- `/` 始まりの include の scope 相対化 ---
-
-def test_absolute_include_is_converted_to_referrer_relative_path():
-    res = A.extract_refs('<jsp:include page="/WEB-INF/shared/header.jspf" />\n',
-                         "gen1/WEB-INF/jsp/page.jsp")
-    assert res.refs[0].name == "header.jspf"
-    assert res.refs[0].extra["include_path"] == "../shared/header.jspf"
-
-
-# --- `<base href>`（対応せず Dropped・相対 include は basename 最近傍に落とさない） ---
-
-def test_base_href_is_dropped_and_relative_include_after_it_is_suppressed():
-    text = '<base href="/app/">\n<script src="app.js"></script>\n'
-    res = A.extract_refs(text, "x.jsp")
-    assert any(d.reason == "web_base_href" for d in res.dropped)
-    assert any(d.reason == "web_relative_under_base" for d in res.dropped)
-    assert res.refs == []
-
-
-def test_absolute_include_is_unaffected_by_base_href():
-    text = '<base href="/app/">\n<jsp:include page="/WEB-INF/shared/header.jspf" />\n'
-    res = A.extract_refs(text, "gen1/WEB-INF/jsp/page.jsp")
-    assert res.refs[0].name == "header.jspf"
-
-
-# --- URL 正規化（`?`/`#` 以降を判定/basename取得の前に除去） ---
-
-def test_action_extension_with_query_string_still_strips_correctly():
-    res = A.extract_refs('<a href="/login.action?next=/">Login</a>\n', "x.jsp")
-    assert res.refs[0].name == "login"
-
-
-def test_url_key_strips_fragment():
-    res = A.extract_refs('<a href="/orders/list#tab">Orders</a>\n', "x.jsp")
-    assert res.refs[0].name == "/orders/list"
-
-
-def test_include_basename_strips_query_string():
-    res = A.extract_refs('<script src="app.js?v=1"></script>\n', "x.jsp")
-    assert res.refs[0].name == "app.js"
-    assert res.refs[0].extra["include_path"] == "app.js"
-
-
-# --- 開始タグの字句解析（属性順不同・引用符省略・大文字タグ名・script本文除外） ---
-
-def test_uppercase_tag_and_unquoted_attribute_value():
-    res = A.extract_refs('<SCRIPT SRC=app.js></SCRIPT>\n', "x.jsp")
-    assert res.refs[0].name == "app.js"
-
-
-def test_unquoted_form_action_attribute():
-    res = A.extract_refs('<form action=login></form>\n', "x.jsp")
-    assert res.refs[0].name == "login"
-
-
-def test_attribute_order_independence_for_jsp_include():
-    res = A.extract_refs('<jsp:include flush="true" page="frag.jspf"/>\n', "x.jsp")
-    assert res.refs[0].name == "frag.jspf"
-
-
-def test_attribute_order_independence_for_c_import():
-    res = A.extract_refs('<c:import var="x" url="frag.jspf"/>\n', "x.jsp")
-    assert res.refs[0].name == "frag.jspf"
-
-
-def test_script_body_href_is_not_scanned():
-    text = '<script>var x = \'<a href="/admin/delete">\';</script>\n'
-    res = A.extract_refs(text, "x.jsp")
-    assert res.refs == []
-
-
-def test_multiple_script_bodies_interleaved_with_real_tags_are_excluded_correctly():
-    """タグ／除外 span の単調ポインタ突合は、複数の `<script>` ブロックが
-    実タグと交互に現れても取りこぼし・誤除外なく判定する（二次時間対策の副作用で判定順序に
-    依存するバグを作っていないことの固定）。"""
-    text = (
-        '<a href="/real-1">one</a>\n'
-        '<script>var x = \'<a href="/fake-1">\';</script>\n'
-        '<a href="/real-2">two</a>\n'
-        '<script>var y = \'<a href="/fake-2">\';</script>\n'
-        '<a href="/real-3">three</a>\n'
-    )
-    res = A.extract_refs(text, "x.jsp")
-    assert {r.name for r in res.refs} == {"/real-1", "/real-2", "/real-3"}
-
-
-def test_jspx_directive_include_is_processed():
-    res = A.extract_refs('<jsp:directive.include file="frag.jspf"/>\n', "x.jspx")
-    assert res.refs[0].name == "frag.jspf"
-    assert res.refs[0].extra["via"] == "include"
-
-
-# --- コメント除去の二次時間対策（線形スキャナ） ---
 
 def test_unclosed_html_comment_sanitization_is_linear_time():
-    text = "<!--" * 20000
     start = time.perf_counter()
-    A.extract_refs(text, "x.jsp")
+    A.extract_refs("<!--" * 20000, "x.jsp")
     assert time.perf_counter() - start < 1.0
+
+
+def test_broken_scriptlet_java_and_broken_template_are_reported_and_the_rest_is_read():
+    res = A.extract_refs('<% int x = ; %>\n<a href="/ok">z</a>\n<% if (a) { %>\n<a href="/in-if">y</a>\n<%\n', "x.jsp")
+    errors = [d.line for d in res.dropped if d.reason == "syntax_error"]
+    assert 1 in errors and len(errors) >= 2
+    assert [r.name for r in res.refs] == ["/ok", "/in-if"]
+
+
+def test_valid_scriptlets_split_across_html_are_not_syntax_errors():
+    text = '<% if (a) { %>\n<p>x</p>\n<% } else { %>\n<p>y</p>\n<% } %>\n<%! int n; %>\n<%= n %>\n'
+    assert [d for d in A.extract_refs(text, "x.jsp").dropped if d.reason == "syntax_error"] == []

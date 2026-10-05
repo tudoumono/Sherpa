@@ -157,7 +157,7 @@ def test_stop_event_triggers_watcher_kill(tmp_path, monkeypatch):
     pid = _read_pid(pid_file)
     child_pid = _read_pid(child_pid_file)
 
-    stop_event.set()   # UI 側の /chat/stream/stop 相当（_spawn_stop_watcher が 0.3秒間隔で検知）
+    stop_event.set()   # UI 側の /chat/turns/{turn_id}/stop 相当（_spawn_stop_watcher が 0.3秒間隔で検知）
 
     th.join(timeout=20)
     assert not th.is_alive(), "stop_event 経路が想定時間内に完走しない（watcher→_killpg が効いていない疑い）"
@@ -229,7 +229,7 @@ def test_generator_close_releases_conversation_lock(tmp_path, monkeypatch):
     `_conversation_lock` が確実に解放される（漏れると同一会話が恒久的に拒否され続ける）。
     会話生存確認（`store.owns_conversation`）は `tests/unit/conftest.py::_hermetic_conversation_alive`
     が既定 True に固定する（conversation_id=424242 は実 DB 行を持たない）。"""
-    from sherpa.providers.codex import provider as PV
+    from sherpa.providers.codex import turn_prepare as TP
 
     _bin_dir, sentinel_dir = _setup(tmp_path, monkeypatch, users_dirname="users_close_conv")
 
@@ -253,7 +253,7 @@ def test_generator_close_releases_conversation_lock(tmp_path, monkeypatch):
     pid = _read_pid(pid_file)
     assert _pid_alive(pid), "close() 前提: 偽 codex 本体がまだ生きていること"
 
-    lk = PV._conversation_lock(conversation_id)
+    lk = TP._conversation_lock(conversation_id)
     assert not lk.acquire(blocking=False), "実行中に会話ロックが解放されている（テスト前提が崩れている）"
 
     users_dir = Path(os.environ["SHERPA_USERS_DIR"]).resolve()

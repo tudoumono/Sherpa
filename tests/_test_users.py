@@ -49,10 +49,6 @@ def cleanup_users(uids: list[str]) -> dict:
          conversation_shares → conversation_share_invites も一緒に消える）。
       3. auth_sessions（users への FK が無いため明示削除が必要）。
       4. user_settings（同上）。
-      4.5. bedrock_verified_models（2026-07-16・RV MED F1/F4/F6 是正で新設した専用テーブル。
-           `user_settings` と同じく users への FK が無いため明示削除が必要。verify/列挙を直接叩く
-           store 単体テスト（tests/api/test_bedrock_settings.py）が users 行を作らずにこのテーブルへ
-           書き込むことがあるため、users 削除の成否とは独立して uids ベースで消す）。
       5. conversation_share_invites の招待先として残る分（FK 無し・念のため明示削除）。
       6. users 本体を削除する（personal_workspace_files は `ON DELETE CASCADE` で自動的に消える）。
       7. `SHERPA_USERS_DIR`（既定 `data/users`）配下の `{uid}` 実ディレクトリを削除する。
@@ -81,7 +77,6 @@ def cleanup_users(uids: list[str]) -> dict:
         c.execute("DELETE FROM conversation_share_invites WHERE invitee_user_id = ANY(%s)", (uids,))
         c.execute("DELETE FROM auth_sessions WHERE user_id = ANY(%s)", (uids,))
         c.execute("DELETE FROM user_settings WHERE user_id = ANY(%s)", (uids,))
-        c.execute("DELETE FROM bedrock_verified_models WHERE user_id = ANY(%s)", (uids,))
         n = c.execute("DELETE FROM users WHERE uid = ANY(%s)", (uids,)).rowcount
 
     users_dir = Path(os.environ.get("SHERPA_USERS_DIR", "data/users"))

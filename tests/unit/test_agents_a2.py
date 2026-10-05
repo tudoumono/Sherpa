@@ -1,7 +1,7 @@
 """Phase2 A2 の単体テスト: Codex の mcp_tool_call(graph_neighbors) → UI カード(candidates) 復元。
 
-`agents._mcp_neighbors_from`（result JSON のパース堅牢性）と
-`agents._apply_codex_neighbors`（troubleshoot 限定の上書き＋name 重複排除＋summary 整合）を
+`mcp._mcp_neighbors_from`（result JSON のパース堅牢性）と
+`mcp._apply_codex_neighbors`（troubleshoot 限定の上書き＋name 重複排除＋summary 整合）を
 Codex サブプロセス無しで直接検証する（A2 の回帰固定）。
 """
 from __future__ import annotations
@@ -11,7 +11,7 @@ import json
 import os
 
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
-from sherpa import agents as A  # noqa: E402
+from sherpa.providers.codex import mcp as MCP  # noqa: E402
 
 
 def _item(neighbors):
@@ -21,31 +21,31 @@ def _item(neighbors):
 
 def test_neighbors_from_valid():
     ns = [{"name": "BILLINGJOB", "label": "Module", "role": "実装", "path": ["請求", "BILLINGJOB"]}]
-    assert A._mcp_neighbors_from(_item(ns)) == ns
+    assert MCP._mcp_neighbors_from(_item(ns)) == ns
 
 
 def test_neighbors_from_broken_or_empty():
-    assert A._mcp_neighbors_from({}) == []                                       # result 無し
-    assert A._mcp_neighbors_from({"result": {"content": []}}) == []              # content 空
-    assert A._mcp_neighbors_from({"result": {"content": [{"text": "{bad"}]}}) == []   # 壊れ JSON
+    assert MCP._mcp_neighbors_from({}) == []                                       # result 無し
+    assert MCP._mcp_neighbors_from({"result": {"content": []}}) == []              # content 空
+    assert MCP._mcp_neighbors_from({"result": {"content": [{"text": "{bad"}]}}) == []   # 壊れ JSON
     # neighbors が list でない / payload が dict でない → []（.get で落とさない・RV LOW）
-    assert A._mcp_neighbors_from({"result": {"content": [{"text": json.dumps({"neighbors": "x"})}]}}) == []
-    assert A._mcp_neighbors_from({"result": {"content": [{"text": json.dumps([1, 2])}]}}) == []
+    assert MCP._mcp_neighbors_from({"result": {"content": [{"text": json.dumps({"neighbors": "x"})}]}}) == []
+    assert MCP._mcp_neighbors_from({"result": {"content": [{"text": json.dumps([1, 2])}]}}) == []
 
 
 def test_apply_overrides_troubleshoot_and_dedups():
     env = {"data": {"candidates": [{"name": "OLD"}]}, "summary": {"total": 1}}
     mcp = [{"name": "A"}, {"name": "A"}, {"name": "B"}, {"name": None}, "x"]    # 重複/None/非dict 混在
-    A._apply_codex_neighbors(env, mcp, "troubleshoot")
+    MCP._apply_codex_neighbors(env, mcp, "troubleshoot")
     assert [c["name"] for c in env["data"]["candidates"]] == ["A", "B"]         # _gather 由来 OLD を上書き＋重複排除
     assert env["summary"]["total"] == 2                                          # summary も Codex 由来に整合
 
 
 def test_apply_noop_for_non_troubleshoot_or_empty():
     env = {"data": {"candidates": [{"name": "OLD"}]}, "summary": {"total": 1}}
-    A._apply_codex_neighbors(env, [{"name": "A"}], "qa")                         # qa は上書きしない
+    MCP._apply_codex_neighbors(env, [{"name": "A"}], "qa")                         # qa は上書きしない
     assert env["data"]["candidates"] == [{"name": "OLD"}]
-    A._apply_codex_neighbors(env, [], "troubleshoot")                           # 近傍無しは無変更
+    MCP._apply_codex_neighbors(env, [], "troubleshoot")                           # 近傍無しは無変更
     assert env["data"]["candidates"] == [{"name": "OLD"}] and env["summary"]["total"] == 1
 
 
@@ -59,7 +59,7 @@ def _era_item(**kw):
 
 
 def test_graph_schema_era_from_item_reconstructs_error_from_structured_result():
-    err = A._graph_schema_era_from_item(_era_item(), "v1", "troubleshoot")
+    err = MCP._graph_schema_era_from_item(_era_item(), "v1", "troubleshoot")
     from sherpa.ingest.world_neo4j import GraphSchemaEraError
     assert isinstance(err, GraphSchemaEraError)
     assert err.world == "v1" and err.stored_era == "old-era" and err.lens == "troubleshoot"
@@ -67,74 +67,20 @@ def test_graph_schema_era_from_item_reconstructs_error_from_structured_result():
 
 def test_graph_schema_era_from_item_none_for_normal_result():
     """通常の（isError の無い）graph_neighbors 結果は None——`_mcp_neighbors_from` の対象のまま。"""
-    assert A._graph_schema_era_from_item(_item([]), "v1", None) is None
+    assert MCP._graph_schema_era_from_item(_item([]), "v1", None) is None
 
 
 def test_graph_schema_era_from_item_none_when_isError_but_different_code():
     """`isError: true` でも既知の `graph_reingest_required` 以外のコードは None
     （他のツールレベルエラー・例えば run_tool 自体のエラー dict を誤検知しない）。"""
     body = {"result": {"content": [{"text": json.dumps({"error": "unknown tool: x"})}], "isError": True}}
-    assert A._graph_schema_era_from_item(body, "v1", None) is None
+    assert MCP._graph_schema_era_from_item(body, "v1", None) is None
 
 
 def test_graph_schema_era_from_item_none_for_broken_shapes():
-    assert A._graph_schema_era_from_item({}, "v1", None) is None                       # result 無し
-    assert A._graph_schema_era_from_item({"result": {}}, "v1", None) is None            # isError 無し
-    assert A._graph_schema_era_from_item(
+    assert MCP._graph_schema_era_from_item({}, "v1", None) is None                       # result 無し
+    assert MCP._graph_schema_era_from_item({"result": {}}, "v1", None) is None            # isError 無し
+    assert MCP._graph_schema_era_from_item(
         {"result": {"content": [{"text": "{bad"}], "isError": True}}, "v1", None) is None   # 壊れ JSON
 
 
-# ==== rv-periphery #7/#11: `_run_authoring` の配線（Popen 必須・ソース検査・
-# test_agents_ask_user.py と同じ既存慣行）====
-
-def _src():
-    return inspect.getsource(A.CodexProvider._run_authoring)
-
-
-def test_tlabel_dict_includes_folder_tree_and_compare_documents():
-    """RV是正（rv-periphery #7）: folder_tree/compare_documents は MCP 経由で Codex にも
-    公開済みだが、mcp_tool_call の表示用ラベル辞書（`tlabel`）に対応が無く「その他の処理」の
-    汎用ラベルに丸まっていた（`improvement_log._TOOL_CALL_LABELS` の集計対象からも漏れる）。"""
-    src = _src()
-    assert '"folder_tree": "フォルダ構成を確認"' in src
-    assert '"compare_documents": "世代間の差分を比較"' in src
-
-
-def test_tlabel_dict_includes_ledger_tools_and_detail_has_no_model_text():
-    """調査台帳の MCP ツール 3 つは「その他の処理」に丸めず専用ラベルで出す。補足は件数と状態語彙
-    （閉集合）だけで、id・subject・reason 等のモデル生成文字列は出さない。"""
-    from sherpa.providers.codex import provider as PV
-    src = _src()
-    for name in ("ledger_manifest_set", "ledger_item_put", "ledger_status"):
-        assert f'"{name}": "調査台帳' in src
-    assert PV._LEDGER_TOOL_DETAILS["ledger_manifest_set"]({"question_kind": "list", "items": ["a", "b"]}) == "2件"
-    assert PV._LEDGER_TOOL_DETAILS["ledger_item_put"](
-        {"id": "sel1", "subject": "秘密の本文", "status": "source_confirmed"}) == "状態: source_confirmed"
-    assert PV._LEDGER_TOOL_DETAILS["ledger_item_put"]({"status": "<script>"}) == ""
-    for bad in ([], {}, ["source_confirmed"], {"k": "v"}, 1, None):
-        assert PV._LEDGER_TOOL_DETAILS["ledger_item_put"]({"status": bad}) == ""
-    assert PV._LEDGER_TOOL_DETAILS["ledger_status"]({}) == ""
-    from sherpa import improvement_log
-    assert {"調査台帳に項目を登録", "調査台帳の項目を更新", "調査台帳の状態を確認"} <= improvement_log._TOOL_CALL_LABELS
-
-
-def test_graph_schema_era_detection_wired_before_neighbors_extraction():
-    """RV是正（rv-periphery #11）: graph_neighbors の mcp_tool_call item を処理する際、
-    `_graph_schema_era_from_item` を先に見て、検知しなければ従来どおり `_mcp_neighbors_from`
-    を呼ぶ（era エラーを近傍データとして誤って読まない）。"""
-    src = _src()
-    i_check = src.index("_graph_schema_era_from_item(")
-    i_neighbors = src.index("_mcp_neighbors_from(item)")
-    assert i_check < i_neighbors, "era 検知が近傍抽出より後に配線されている"
-
-
-def test_graph_schema_era_does_not_terminate_run_and_marks_degraded():
-    """S4（縮退の可視化と計数）: 検知した世代不一致で run を終端しない——`raise
-    _graph_schema_era_error` と、検知後にアイテム処理を打ち切る `break` は撤去し、Codex は同じ
-    MCP の grep/原本読取ツールで調査を続ける。縮退は env の印（`graph_degraded`）として残り、
-    `chat_service._finalize` が冒頭告知と統計へ変換する。"""
-    src = _src()
-    assert "raise _graph_schema_era_error" not in src, "世代不一致で run を終端してはいけない"
-    i_flag_set = src.index("_graph_schema_era_error = _era_err")
-    i_env = src.index('env["graph_degraded"]')
-    assert i_flag_set < i_env, "検知した事実が env の縮退の印へ渡っていない"

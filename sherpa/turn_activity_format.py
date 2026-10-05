@@ -1,18 +1,14 @@
 """1ターンの活動記録（`answer["activity"]`）を安全な文字列表現へ変換する共通ロジック。
 
-管理者の利用明細エクスポート（`sherpa/usage_export.py`）と会話トレース（`scripts/conversation_trace.py`・
-`make trace`）が使う。表示規則は識別子の形の文字列だけを出し、それ以外は「（その他）」に畳み込む。
-
-activity は Codex 経路で 0.13.1 以降に保存したターンにだけあり、`source` が `"codex_rollout"` の
-ときだけ agents/tools/settings を持つ（それ以外は phases_ms.total と app_version のみ）。
+利用明細エクスポート（`usage_export.py`）と会話トレース（`scripts/conversation_trace.py`）が共有する。識別子の形の文字列だけを出し、
+それ以外は「（その他）」に畳み込む。`source` が `"codex_rollout"` のときだけ agents/tools/settings を持つ。
 """
 from __future__ import annotations
 
 import re
 
 _TOP_TOOLS = 8
-# 表示してよい文字列の形。activity の文字列（ツール名・未解析の種類・モデル名・設定値・エラーコード）は
-# Codex CLI 側の語彙だが閉集合ではないので、この形に合わないものは中身を出さず「その他」にまとめる。
+# 表示してよい文字列の形。合わないものは中身を出さず「その他」にまとめる
 _IDENT = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _UNPARSED_KEY = re.compile(r"^[a-z_]{1,40}(:[a-z_?]{1,40})?$")
 _WORD = re.compile(r"^[a-z0-9][a-z0-9._-]{0,40}$")
@@ -41,13 +37,7 @@ def _sec(ms) -> str:
 
 
 def merge_tools(tools) -> dict:
-    """1エージェント分の `tools`（ツール名→統計 dict）を、名前の安全化（`_safe(name, _IDENT)`）で
-    畳み込みながら合算する。`max_bytes` は最大値、それ以外の整数フィールドは合算する
-    （非 dict/非整数の値は無視する想定外データ防御）。
-
-    表示用の上位N件抽出（`_agent_lines`）と生データ全件（`sherpa/usage_export.py` の
-    tools.csv）が同じ合算結果を共有する——別々に畳み込むと集計が食い違いかねない。
-    """
+    """1エージェント分の `tools` を、名前の安全化で畳み込みながら合算する（`max_bytes` は最大値、他の整数は合算）。"""
     merged: dict = {}
     if not isinstance(tools, dict):
         return merged
@@ -67,8 +57,7 @@ def merge_tools(tools) -> dict:
 
 
 def label_agents(agents) -> list[tuple[str, dict]]:
-    """`activity.agents`（本体1件＋下調べ役0件以上）へ表示用ラベル（本体／下調べ役N）を振る。
-    非 dict の要素は読み飛ばす（想定外データ防御）。"""
+    """`activity.agents` へ表示用ラベル（本体／下調べ役N）を振る。非 dict は読み飛ばす。"""
     labeled: list[tuple[str, dict]] = []
     if not isinstance(agents, list):
         return labeled
@@ -124,8 +113,7 @@ def _agent_lines(agent: dict, label: str) -> list[str]:
 
 
 def format_turn(row: dict) -> list[str]:
-    """assistant メッセージ 1 件分の表示行。`row` は id・created_at と、answer から選んだ欄だけを持つ
-    （`activity`・`stop_kind`・`codex_error_code`・`duration_ms`・`investigation`）。"""
+    """assistant メッセージ 1 件分の表示行。`row` は id・created_at と answer から選んだ欄だけを持つ。"""
     act = row.get("activity") if isinstance(row.get("activity"), dict) else None
     head = (f"── #{row.get('id')} {row.get('created_at')} 終了: {_safe(row.get('stop_kind'), _IDENT) if row.get('stop_kind') else '-'}"
             + (f" エラー: {_safe(row['codex_error_code'], _IDENT)}" if row.get("codex_error_code") else "")
@@ -133,7 +121,7 @@ def format_turn(row: dict) -> list[str]:
     if act is None:
         return [head, "  活動記録なし（0.13.1 より前の版で保存）"]
     if act.get("source") != "codex_rollout":
-        # Codex 以外の経路（API／Ollama）や Codex を起動しなかったターンは、版と合計の所要だけを持つ。
+        # Codex 以外の経路や Codex を起動しなかったターンは、版と合計の所要だけを持つ
         return [head, "  Codex の詳しい記録なし（Codex 以外の経路・または Codex を起動しなかったターン）"
                       f" 版={_version(act.get('app_version'))}"]
     ph = act.get("phases_ms") if isinstance(act.get("phases_ms"), dict) else {}

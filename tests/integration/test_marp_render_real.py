@@ -15,7 +15,7 @@ import tempfile
 
 import pytest
 
-from sherpa import agents as A
+from sherpa.providers.codex import sandbox as SB
 from sherpa import marp_render as R
 
 _MD = """\
@@ -39,9 +39,9 @@ M3 実機統合テスト用の最小 Marp Markdown。
 
 
 def _skip_reason() -> str | None:
-    if A._marp_bin() is None:
+    if SB._marp_bin() is None:
         return "この環境には marp CLI（tools/marp）が導入されていない"
-    if A._detect_chrome_path() is None:
+    if SB._detect_chrome_path() is None:
         return "この環境には Chromium（CHROME_PATH/Playwright）が無い"
     if not R._unshare_available():
         # RV round2: バイナリ有無でなく実プローブ（lo UP まで）で判定＝unshare はあるが
@@ -61,7 +61,7 @@ def test_render_outputs_real_marp_all_three_formats():
         md.write_text(_MD, encoding="utf-8")
 
         got = R.render_outputs(
-            [md], marp_bin=A._marp_bin(), chrome_path=A._detect_chrome_path(),
+            [md], marp_bin=SB._marp_bin(), chrome_path=SB._detect_chrome_path(),
             theme_dirs=[pathlib.Path(__file__).resolve().parents[2]
                         / "sherpa" / "skills_base" / "marp" / "themes"],
             containment_root=tdp,

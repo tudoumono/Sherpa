@@ -1,16 +1,14 @@
-// フェーズ6 S4（リファクタリング計画）: 共有ダイアログドメイン（招待チップ・入力補完・送信）。chat.js から純移動。
-// 入口は openShareDialog(cid, title)（呼び出し元の状態チェック＝「会話が開かれているか」「個人ファイルを
-// 参照済みでないか」は呼び出し側 chat.js の責務のまま・cid/title は引数で渡される＝実依存を grep で
-// 確認した結果このモジュール自体は S（共有状態）に依存しない）。
+// 会話の共有ダイアログ。招待者の入力補完・チップ、共有リンクの発行、既存共有の取消・延長・更新を扱う。
+// 設計: docs/design/chat.md「共有」
+// 入口は openShareDialog(cid, title)。共有できる会話かの判定は呼び出し側（chat.js）の責務。
 'use strict';
 
 import { copyText, toast } from '../chat.js';
 
-const esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime;   // 共通ユーティリティ（common.js・グローバル参照のまま）
+const esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime;
 
-// 所有者のみ: POST /conversations/{cid}/shares → 一度だけ表示する URL。
-// バッチ2・5番（2026-07-03）: GET /users/suggest による入力補完（デバウンス200ms）→
-// クリック/Enter で確定しチップ化。既存のカンマ/スペース区切り手入力も引き続き動く（後方互換）。
+// 所有者のみ: POST /conversations/{cid}/shares で共有リンクを発行する（URL は一度だけ表示）。
+// 招待者は GET /users/suggest の入力補完（デバウンス200ms）からチップとして確定する。カンマ/スペース区切りの手入力も使える。
 
 let _inviteeChips = [];          // [{uid, display_name}] クリック/Enter で確定した候補
 let _inviteeSuggestTimer = null;
@@ -57,8 +55,7 @@ async function fetchInviteeSuggest(q) {
   } catch (_) { hideInviteeSuggest(); }
 }
 
-// SH-2（再共有）: 発行ダイアログ上部に「この会話の共有」一覧を出す（招待者・期限・状態・
-// サニタイズ有無）。各行に「取消」、サニタイズ済かつ未取消の行だけ「最新の内容に更新」を出す。
+// 「この会話の共有」一覧（招待者・期限・状態・サニタイズ有無）。各行に取消・延長、サニタイズ済かつ未取消の行に「最新の内容に更新」を出す。
 function _shareStatusLabel(s) {
   if (s.revoked_at) return '取消済み';
   if (s.expires_at && new Date(s.expires_at).getTime() <= Date.now()) return '期限切れ';
@@ -84,7 +81,7 @@ function _shareExistingRowHTML(s) {
   </div>`;
 }
 
-let _shareListGen = 0;   // loadShareExistingList の世代カウンタ（下の関数参照）
+let _shareListGen = 0;   // loadShareExistingList の世代カウンタ（古い応答の破棄用）
 
 async function loadShareExistingList(cid) {
   const box = document.getElementById('share-existing-list');
@@ -99,10 +96,7 @@ async function loadShareExistingList(cid) {
   } catch (_) {
     html = '<div class="muted" style="font-size:var(--text-small)">共有一覧を読み込めませんでした</div>';
   }
-  // 世代チェック（history.js の resumeRunningTurn と同型）: この fetch の await 中に、別の
-  // 呼び出し（取消/更新/発行直後の再取得・ダイアログの開き直し）がさらに新しい世代を進めていたら、
-  // この応答はもう古い。世代が最新でも、ダイアログが既に別会話向けに開き直されていれば
-  // （overlay.dataset.cid が呼び出し時の cid と一致しなければ）同様に捨てる。
+  // 古い応答（新しい世代が進んだ・別会話向けに開き直された）は捨てる
   const overlay = document.getElementById('share-overlay');
   if (gen !== _shareListGen || !overlay || overlay.dataset.cid !== String(cid)) return;
   box.innerHTML = html;
@@ -114,6 +108,7 @@ function closeShareDialog() {
   document.querySelector(shareReturnSelector).focus();
 }
 
+// 共有ダイアログを開く（フォームを初期化し、既存の共有一覧を読み込む）。
 export function openShareDialog(cid, title) {
   const overlay = document.getElementById('share-overlay');
   const tidEl = document.getElementById('share-dialog-title');
@@ -121,7 +116,7 @@ export function openShareDialog(cid, title) {
   const form = document.getElementById('share-form');
   if (!overlay) return;
 
-  // フォームをリセット
+  // ① フォームをリセットする
   tidEl.textContent = esc(title);
   result.hidden = true;
   form.hidden = false;
@@ -132,7 +127,7 @@ export function openShareDialog(cid, title) {
   renderInviteeChips();
   hideInviteeSuggest();
   overlay.dataset.cid = String(cid);
-  // 背景ターン完了で履歴DOMが再描画されても、現在のトリガーへ戻す。
+  // ② 閉じたときに戻すフォーカス先を決める（履歴の再描画後も現在のトリガーへ戻す）
   shareReturnSelector = document.activeElement.matches('[data-conv-menu]')
     ? `[data-conv-menu="${document.activeElement.dataset.convMenu}"]` : '#sharebtn';
   overlay.hidden = false;
@@ -140,15 +135,12 @@ export function openShareDialog(cid, title) {
   loadShareExistingList(cid);
 }
 
-// フェーズ6 S3（地雷7対応）: DOMContentLoaded 依存を即時実行へ（S4 module 化後は動的 import 等で
-// DCL 待ちのままだと初期化されない死ダイアログになるため）。classic script の本体末尾での実行なら
-// DOM は既にパース済み＝挙動は同値。module（static import）でも同じ理由で安全
-// （module の評価は常に DOMContentLoaded より後）。
+// ダイアログのイベント配線（モジュール評価時に即時実行する）
 (() => {
   const overlay = document.getElementById('share-overlay');
   if (!overlay) return;
 
-  // overlay 外クリックで閉じる
+  // 閉じる操作と Tab のフォーカス循環
   overlay.addEventListener('click', (e) => { if (e.target === overlay) closeShareDialog(); });
   const closeBtn = document.getElementById('share-close');
   if (closeBtn) closeBtn.addEventListener('click', closeShareDialog);
@@ -175,7 +167,7 @@ export function openShareDialog(cid, title) {
     copyText(url);
   });
 
-  // SH-2: 既存共有一覧の「取消」「最新の内容に更新」（イベント委譲）。
+  // 既存共有一覧の取消・延長・更新（イベント委譲）
   document.getElementById('share-existing-list')?.addEventListener('click', async (e) => {
     const cid = overlay.dataset.cid;
     const revokeBtn = e.target.closest('[data-share-revoke]');
@@ -214,7 +206,7 @@ export function openShareDialog(cid, title) {
     }
   });
 
-  // チップの削除（× クリック・イベント委譲）
+  // チップの削除（イベント委譲）
   document.getElementById('share-invitee-chips')?.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-rm-invitee]');
     if (!btn) return;
@@ -224,7 +216,7 @@ export function openShareDialog(cid, title) {
 
   const inviteesInput = document.getElementById('share-invitees');
 
-  // 最後のトークン（検索クエリとして送った部分）だけを入力欄から取り除く（残りの自由入力は温存）。
+  // 検索クエリにした最後のトークンだけを入力欄から取り除く
   function removeLastInviteeToken() {
     const parts = inviteesInput.value.split(/([\s,]+)/);
     parts.pop();
@@ -239,7 +231,7 @@ export function openShareDialog(cid, title) {
     inviteesInput.focus();
   }
 
-  // 入力補完（デバウンス200ms）: カンマ/スペース区切りの手入力時は、最後のトークンだけを検索クエリにする。
+  // 入力補完（デバウンス200ms）。最後のトークンだけを検索クエリにする
   inviteesInput?.addEventListener('input', () => {
     clearTimeout(_inviteeSuggestTimer);
     const tail = inviteesInput.value.split(/[\s,]+/).pop().trim();
@@ -254,7 +246,7 @@ export function openShareDialog(cid, title) {
     confirmInviteeSuggestion(_inviteeSuggestItems[Number(btn.dataset.pickInvitee)]);
   });
 
-  // キーボード操作（↑↓で候補移動・Enterでハイライト確定・Escで閉じる）
+  // キーボード操作（↑↓で候補移動・Enterで確定・Escで閉じる）
   inviteesInput?.addEventListener('keydown', (e) => {
     if (!_inviteeSuggestItems.length) return;
     const box = document.getElementById('share-invitee-suggest');
@@ -274,14 +266,14 @@ export function openShareDialog(cid, title) {
     }
   });
 
-  // 送信
+  // 送信（共有リンクの発行）
   document.getElementById('share-submit')?.addEventListener('click', async () => {
     const cid = Number(overlay.dataset.cid);
     const rawInvitees = document.getElementById('share-invitees').value;
     const days = Number(document.getElementById('share-days').value) || 30;
     const errEl = document.getElementById('share-err');
 
-    // チップ確定分 ＋ 自由入力（カンマ/スペース区切り）の両方を合わせる（既存の手入力との後方互換）。
+    // チップ確定分と自由入力を合わせる
     const freeText = rawInvitees.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
     const invitees = Array.from(new Set([..._inviteeChips.map((c) => c.uid), ...freeText]));
     if (!invitees.length) { errEl.textContent = '招待するユーザー名を入力してください'; return; }
@@ -289,7 +281,7 @@ export function openShareDialog(cid, title) {
     errEl.textContent = '';
     const expires = new Date(Date.now() + days * 86400 * 1000).toISOString();
     const submitBtn = document.getElementById('share-submit');
-    if (submitBtn.disabled) return;   // 多重クリック防止（連打で共有リンクを二重作成しない）
+    if (submitBtn.disabled) return;   // 二重発行の防止
     submitBtn.disabled = true;
     try {
       const d = await (await fetch(`/conversations/${cid}/shares`, {
@@ -298,19 +290,19 @@ export function openShareDialog(cid, title) {
         body: JSON.stringify({ invitee_user_ids: invitees, expires_at: expires }),
       })).json();
       if (d.ok) {
-        // 共有 URL は一度だけ表示（絶対 URL に補完）。
+        // 共有 URL は一度だけ表示する
         const absUrl = location.origin + d.url;
         document.getElementById('share-url-val').textContent = absUrl;
         document.getElementById('share-form').hidden = true;
         document.getElementById('share-result').hidden = false;
-        loadShareExistingList(cid);   // SH-2: 発行直後に一覧へ反映
+        loadShareExistingList(cid);
       } else {
         errEl.textContent = d.detail || '共有に失敗しました';
       }
     } catch (err) {
       errEl.textContent = '通信エラーが発生しました';
     } finally {
-      submitBtn.disabled = false;   // 失敗時に再試行できるよう戻す（成功時はフォーム自体が隠れる）
+      submitBtn.disabled = false;
     }
   });
 })();

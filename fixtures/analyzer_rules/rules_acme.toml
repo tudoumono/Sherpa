@@ -1,0 +1,37 @@
+# 宣言的なルールファイルの例（架空の社内基盤 acme・上流には登録しない）。
+# 実際に使うときは sherpa/ingest/analyzers/ へ rules_<名前>.toml として置く（docs/21-拡張の契約.md §3c）。
+name = "acme"
+version = 1
+order = 200
+languages = ["java", "xml_config"]
+
+# Java: @AcmeApi("/x") の付いたメソッドを API の入口（URL キー）にする。
+[[rule]]
+id = "acme-api-entry"
+version = 1
+language = "java"
+query = '''
+(method_declaration
+  (modifiers
+    (annotation
+      name: (identifier) @n
+      arguments: (annotation_argument_list (string_literal) @value)))
+  (#eq? @n "AcmeApi"))
+'''
+emit = "def"
+key_kind = "url"
+
+# XML: <acme:service class="..."/> の class 属性をクラス名の参照にする（beans 設定の中だけ）。
+[[rule]]
+id = "acme-service-class"
+version = 1
+language = "xml_config"
+root = "beans"
+namespace = "http://example.invalid/acme"
+element = "service"
+attribute = "class"
+emit = "ref"
+edge_type = "INVOKES"
+kind = "Module"
+via = "bean_class"
+name_form = "qualified"

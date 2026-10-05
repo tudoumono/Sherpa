@@ -1,7 +1,7 @@
 Namespace Acme.Order
 
     Public Class OrderService
-        Inherits BaseService
+        Inherits Acme.Core.BaseService
 
         Private ReadOnly Name As String
 

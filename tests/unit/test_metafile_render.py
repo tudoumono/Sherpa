@@ -57,7 +57,7 @@ def _vector_emf() -> bytes:
 
 
 def _build(monkeypatch, tmp_path: Path, emf: bytes, names: tuple[str, ...] = ("a.docx",)):
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     wd = tmp_path / "world"
     wd.mkdir()
     for name in names:

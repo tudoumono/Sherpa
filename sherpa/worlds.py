@@ -1,9 +1,7 @@
-"""登録ディレクトリ（world）のレジストリ・解決・ライフサイクル（鏡モデル・MIRROR-MODEL §3/§4/§8）。
-
-旧 `versions.py`（版ライフサイクル）を置換。鏡では **world＝登録した1ディレクトリ**＝1グラフ＋1 ES。
-world は**参照元 root_path に 1:1 バインド**（`store.worlds`）。参照先変更（rebind）＝**旧 world の派生物を
-全削除して新パスから再ミラー**（即反映ライブ鏡の思想を「バインド変更」にも適用）。
-別案件は**別 world として追加**（world_id で同居・検索は分離）。`world_id` は内部識別子（UI では version の語を出さない）。
+"""資料フォルダ（登録ディレクトリ）のレジストリ・解決・ライフサイクル。
+資料フォルダは参照元 `root_path` に 1:1 でバインドする（`store.worlds`）。参照先変更（rebind）は旧資料フォルダの派生物を全削除して新パスから再ミラーする。
+別案件は別の資料フォルダとして追加する（`world_id` は内部識別子）。
+設計: docs/design/scope.md「資料フォルダの登録・解決・付け替え（registry）」
 """
 from __future__ import annotations
 
@@ -15,13 +13,12 @@ import stat as stat_mod
 from pathlib import Path
 from typing import NamedTuple
 
-from .grep_tool import valid_world   # 識別子の許容文字（パストラバーサル防止）
+from .grep_tool import valid_world  # 識別子の許容文字（パストラバーサル防止）
+from .ingest import text_kind
 
 
 def semantic_dir(world_id: str) -> Path:
-    """派生 `semantic/` ディレクトリ（`es_index.py` の埋め込みキャッシュ〔SQLite・`embed_cache.sqlite3`〕の
-    置き場）。旧・意味層フル抽出/対応橋（`concepts.json`/`l_extract.json` 等）一式は
-    撤去済み（`SemanticFiles`/`semantic_files()` も同時撤去・復活させない）。"""
+    """派生 `semantic/` ディレクトリ（ES の埋め込みキャッシュ〔SQLite・`embed_cache.sqlite3`〕の置き場）。"""
     return derived_dir(world_id) / "semantic"
 
 
@@ -29,11 +26,8 @@ def _fixtures() -> bool:
     return os.environ.get("SHERPA_USE_FIXTURES", "").lower() in ("1", "true", "yes")
 
 
-# SHERPA_KB_DIR/SHERPA_DERIVED_DIR の
-# **相対既定値**は cwd 基準だと呼び出し元プロセスの cwd（例: MCP サブプロセスの cwd=authoring）に
-# 引きずられて誤解決する。既定はリポジトリ基準（Path(__file__) 経由）で解決する（恒久対策・
-# クラスごと潰す）。env で**明示的に**指定された値（絶対/相対いずれも）はそのまま尊重する
-# （既存の cwd 相対オーバーライドの挙動は変えない＝挙動変更は「未設定時の既定」に限定）。
+# `SHERPA_KB_DIR`／`SHERPA_DERIVED_DIR` の未設定時の既定はリポジトリ基準で解決する（呼び出し元の cwd に依存させない）。
+# env で明示された値はそのまま尊重する
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -44,80 +38,84 @@ def _kb() -> Path:
 
 
 def derived_dir(world_id: str) -> Path:
-    """world の派生領域ルート（**READ-ONLY のソースには書かず** WSL 側に持つ）。配下: `md/`（人間用）／
-    `rag/`（RAG 正本＋証跡）／`ir/`（中間表現）／`semantic/`（ES 埋め込みキャッシュ＝`embed_cache.sqlite3`。
-    旧・意味層フル抽出 l_extract は撤去済み）。delete 時はこの木ごと消す。"""
+    """資料フォルダの派生領域ルート（READ-ONLY のソースには書かない）。配下: `md/`（人間用）／`rag/`（RAG 正本＋証跡）／`ir/`（中間表現）／`semantic/`（ES 埋め込みキャッシュ）。削除時はこの木ごと消す。"""
     v = os.environ.get("SHERPA_DERIVED_DIR")
     base = Path(v) if v else _repo_root() / "data" / "derived"
     return base / world_id
 
 
 def derived_md_dir(world_id: str) -> Path:
-    """人間用 MD のミラー置き場（派生領域の `md/` 配下・§8.1 三階層）。画面表示・原本DL の根拠。
-    取り込みのたび作り直す部分（semantic は残す）。"""
+    """人間用 MD のミラー置き場（派生領域の `md/`）。画面表示・原本 DL の根拠。取り込みのたび作り直す（semantic は残す）。"""
     return derived_dir(world_id) / "md"
 
 
 def derived_rag_dir(world_id: str) -> Path:
-    """RAG 正本＋証跡の置き場（`{rel}.rag.md`／`{rel}.rag_chunks.jsonl`／`{rel}.assets/`・
-    `derived_md_dir` と同じ derived root の兄弟・§8.1 三階層）。grep（rag優先）・ES・グラフ（L層）が読む。"""
+    """RAG 正本＋証跡の置き場（`{rel}.rag.md`／`{rel}.rag_chunks.jsonl`／`{rel}.assets/`）。grep・ES・グラフが読む。"""
     return derived_dir(world_id) / "rag"
 
 
+def rag_md_path(world_id: str, doc_id: str) -> Path | None:
+    """`doc_id` の `{rel}.rag.md`（RAG 正本）の実パス。無効な doc_id・秘匿名・範囲外・不在・経路上の symlink は None。
+    ツール引数を直接受けるため、字面パスと `resolve()` の一致で symlink を検知する（厳格側に統一）。
+    """
+    if not isinstance(doc_id, str) or not doc_id or doc_id.startswith("/") or "\\" in doc_id or "\x00" in doc_id:
+        return None
+    parts = doc_id.split("/")
+    if ".." in parts or "" in parts:
+        return None
+    if text_kind.is_sensitive_doc_id(doc_id):
+        return None  # 秘匿名は rag.md を持たない契約。残っていても読ませない
+    root = derived_rag_dir(world_id)
+    if not root:
+        return None
+    root = Path(root)
+    lexical_rel = doc_id + ".rag.md"
+    try:
+        rr = root.resolve()
+        rp = (root / lexical_rel).resolve()
+        if not (rp == rr or rp.is_relative_to(rr)):
+            return None
+        if rp != rr / lexical_rel:  # 字面パスと不一致＝経路上に symlink がある
+            return None
+        if not rp.is_file():
+            return None
+    except OSError:
+        return None
+    return rp
+
+
 def derived_ir_dir(world_id: str) -> Path:
-    """中間表現の置き場（`{rel}.document.json`／`{rel}.evidence.json`／`{rel}.derived.json`／
-    `{rel}.ocr_route.json`・§8.1 三階層）。再生成可能・検索には出さない・drift 判定専用。"""
+    """中間表現の置き場（`{rel}.document.json`／`{rel}.evidence.json`／`{rel}.derived.json`／`{rel}.ocr_route.json`）。再生成可能・検索には出さない・drift 判定専用。"""
     return derived_dir(world_id) / "ir"
 
 
 def archives_dir(world_id: str) -> Path:
-    """zip/tar(.gz)/tgz の展開先（アーカイブ取り込み）。`derived_dir` の兄弟（`archives/`）——
-    原本（登録ディレクトリ）には一切書かない。木の構成がそのまま doc_id になる＝
-    `archives_dir(world_id) / "<アーカイブの相対パス>" / "<中のパス>"`
-    （`scope_infer.safe_files(..., also=archives_dir(world_id))` で世界本体の列挙へ合流する際、
-    `also` root からの相対パスがそのまま `<アーカイブの相対パス>/<中のパス>` になるよう
-    `ingest.archive_extract` 側が展開先をこの形に合わせている）。delete/世代入替時はこの木ごと消す
-    （`derived_dir` 全体の削除に含まれる）。"""
+    """zip/tar(.gz)/tgz の展開先（`derived_dir` の兄弟 `archives/`）。原本（登録ディレクトリ）には書かない。
+    木の構成がそのまま doc_id（`<アーカイブの相対パス>/<中のパス>`）になる（`scope_infer.safe_files(..., also=archives_dir(world_id))` で列挙に合流する）。
+    """
     return derived_dir(world_id) / "archives"
 
 
 def archives_work_dir(world_id: str) -> Path:
-    """アーカイブ展開の作業領域（ステージング・退避・異常終了時の掃除専用・`archives_dir` の
-    **外**＝`derived_dir` の兄弟）。
-
-    `archives_dir` は文書列挙（`scope_infer.safe_files(..., also=archives_dir(...))`）・grep・
-    Codex 原本直読の読み取り範囲に含まれる公開領域——展開の途中経過（ステージング）や旧内容の
-    退避をここに置くと、途中の書きかけの中身が列挙/検索に漏れたり、異常終了時の掃除（名前の
-    パターンで探して消す）が展開物の中の似た名前のフォルダを誤って消しうる（RV是正・実害）。
-    本領域は `ingest.archive_extract` だけが使い、他のどの読み取り経路（`also=`／grep の
-    roots_spec／Codex の `_direct_read_roots`）にも**一切登場させない**——登場させたら契約違反。
-    異常終了時の掃除は中身を単純に全消去するだけでよい（公開済みの中身と混在しないため、
-    名前のパターンで選別する必要が無い）。
+    """アーカイブ展開の作業領域（ステージング・退避・異常終了時の掃除専用。`archives_dir` の外）。
+    `ingest.archive_extract` だけが使い、他のどの読み取り経路（`also=`／grep の roots_spec／Codex の `_direct_read_roots`）にも登場させない（書きかけの中身が列挙・検索に漏れないため）。
     """
     return derived_dir(world_id) / "archives_work"
 
 
 def archive_manifest_path(world_id: str) -> Path:
     """アーカイブごとの展開結果サマリ（`ingest.archive_extract.sync_world_archives` が書く）。
-
-    `archives_dir` の**外**に置く——中に置くと `scope_infer.safe_files(archives_dir(...))` が
-    このサマリ自身を展開済み文書の1件として拾ってしまう（展開木は中身だけを持つ、という契約を守る）。
+    `archives_dir` の外に置く（中に置くとサマリ自身が展開済み文書として列挙される）。
     """
     return derived_dir(world_id) / "archive_manifest.json"
 
 
-# ---- OCR 観測領域（任意機能・既定 OFF）----------------------------------------
-# OCR は隔離 worker が動かす。worker には **登録ディレクトリと Canonical 派生を read-only** で渡し、
-# **書けるのは観測領域だけ** に限定する。以下はその境界を fail-closed で守るための検証群で、
-# 「別の bind mount 経由で同じ inode が書けてしまう」ことを防ぐため、文字列比較ではなく resolve 済み
-# パスの包含関係で判定する（CLAUDE.md「登録ディレクトリ配下は読み取り専用」の実装上の担保）。
+# ---- OCR 観測領域（任意機能・既定 OFF）----
+# OCR は隔離 worker が動かす。worker には登録ディレクトリと Canonical 派生を read-only で渡し、書けるのは観測領域だけにする。
+# 以下はその境界を fail-closed で守る検証群で、別の bind mount 経由で同じ inode に書けてしまわないよう、resolve 済みパスの包含関係で判定する
 
 def _paths_overlap(first: Path, second: Path) -> bool:
-    """2つの root が同一、または祖先/子孫の関係かを返す。
-
-    観測領域は書き込み可、World 参照元は読み取り専用でマウントする。別 path から同じ inode へ
-    書けてしまう経路を塞ぐため、文字列として違うだけでは不十分＝解決後の包含関係で見る。
-    """
+    """2 つの root が同一、または祖先／子孫の関係かを返す（解決後の包含関係で見る）。"""
     try:
         left = first.resolve()
         right = second.resolve()
@@ -127,24 +125,20 @@ def _paths_overlap(first: Path, second: Path) -> bool:
 
 
 def observation_base_dir() -> Path:
-    """観測領域のベース（`SHERPA_OBSERVATION_DIR`＞`data/observations`）。相対 path は
-    `derived_dir` と同じく cwd 基準という既存規約に従う。"""
+    """観測領域のベース（`SHERPA_OBSERVATION_DIR`＞`data/observations`）。"""
     value = os.environ.get("SHERPA_OBSERVATION_DIR")
     return Path(value) if value else _repo_root() / "data" / "observations"
 
 
 def validate_observation_source_separation(source_root: str | Path) -> None:
-    """書き込み可の観測領域が World 参照元と重なっていたら止める。"""
+    """書き込み可の観測領域が資料フォルダの参照元と重なっていたら止める。"""
     if _paths_overlap(observation_base_dir(), Path(source_root)):
         raise ValueError("SHERPA_OBSERVATION_DIRはWorld参照元と物理分離してください")
 
 
 def validate_observation_registered_sources(*extra_source_roots: str | Path) -> None:
-    """登録済みの全 World 参照元と観測領域が分離していることを確認する。
-
-    ここはセキュリティ境界なので、registry の失敗や壊れた行は**握りつぶさず送出する**
-    （「registry が空」と解釈して素通しさせない）。register/rebind は行が出来る前の候補 root を
-    渡してくるため、候補と既存行の両方を検査する。
+    """登録済みの全資料フォルダの参照元と観測領域が分離していることを確認する。
+    セキュリティ境界なので registry の失敗・壊れた行は握りつぶさず送出する。候補 root（register／rebind）と既存行の両方を検査する。
     """
     from . import store
 
@@ -232,16 +226,13 @@ def observation_removal_target(world_id: str) -> Path | None:
 
 def observation_current_dir(world_id: str) -> Path | None:
     """いま公開されている OCR 観測のディレクトリ（無ければ None）。
-
-    観測は Canonical（決定的に変換した MD/Evidence）とは別の木に置く。検索はここも読むため、
-    「画像の中の文字」で資料に辿り着ける。どの世代が公開中かは観測領域の pointer が正で、
-    Canonical と食い違う（取り込みが先に進んだ）場合は None＝古い観測を読ませない。
+    観測は Canonical（決定的に変換した MD／Evidence）とは別の木に置く。どの世代が公開中かは観測領域の pointer が正で、Canonical と食い違う場合は None（古い観測を読ませない）。
     """
     from .ingest import derived_generation, observation_render
 
     try:
         base = observation_dir(world_id)
-    except ValueError:                       # 保存先の設定不備は検索を止めずに「観測なし」とする
+    except ValueError:  # 保存先の設定不備は検索を止めずに「観測なし」とする
         return None
     canonical = derived_generation.active_generation_id(derived_dir(world_id))
     if not canonical:
@@ -250,11 +241,7 @@ def observation_current_dir(world_id: str) -> Path | None:
 
 
 def _configured_ocr_world_root() -> Path:
-    """OCR worker へ read-only で渡す、明示された参照元 root。
-
-    OCR は任意機能なので、呼ぶのは有効化された取り込み/worker の境界だけ。`/mnt` のような広い
-    既定値は**意図的に持たない**＝未設定・相対・symlink・到達不可はすべて設定エラーとして落とす。
-    """
+    """OCR worker へ read-only で渡す、明示された参照元 root。広い既定値は持たない（未設定・相対・symlink・到達不可は設定エラー）。"""
     raw = os.environ.get("SHERPA_OCR_WORLD_ROOT", "").strip()
     if not raw:
         raise ValueError("OCR有効時はSHERPA_OCR_WORLD_ROOTの明示が必要です")
@@ -273,7 +260,7 @@ def _configured_ocr_world_root() -> Path:
 
 
 def validate_ocr_source_root(source_root: str | Path, *, allowed_root: Path | None = None) -> Path:
-    """登録 World が、明示した OCR 読み取り専用 root 経由でしか辿れないことを確認する。"""
+    """登録済みの資料フォルダが、明示した OCR 読み取り専用 root 経由でしか辿れないことを確認する。"""
     allowed = allowed_root if allowed_root is not None else _configured_ocr_world_root()
     source = Path(source_root)
     if not source.is_absolute():
@@ -292,7 +279,7 @@ def validate_ocr_source_root(source_root: str | Path, *, allowed_root: Path | No
 
 
 def validate_ocr_registered_sources(*extra_source_roots: str | Path) -> Path:
-    """登録済み/候補の全 World が明示 root 配下に無ければ止める（fail-closed）。"""
+    """登録済み／候補の全資料フォルダが明示 root 配下に無ければ止める（fail-closed）。"""
     from . import store
 
     allowed = _configured_ocr_world_root()
@@ -313,11 +300,7 @@ def observation_dir(
     source_root: str | Path | None = None,
     validate_registered: bool = False,
 ) -> Path:
-    """OCR 補助観測だけを置く world 別領域。
-
-    Canonical Evidence/MD の `derived_dir` とは**物理 root を分ける**。これにより隔離 OCR worker へ
-    Canonical 派生を read-only で渡しつつ、検索用の別観測にだけ書き込みを許せる。
-    """
+    """OCR 補助観測だけを置く資料フォルダ別領域。Canonical の `derived_dir` とは物理 root を分ける（OCR worker へ Canonical を read-only で渡しつつ、観測にだけ書き込みを許す）。"""
     base = observation_base_dir()
     derived_value = os.environ.get("SHERPA_DERIVED_DIR")
     derived_base = Path(derived_value) if derived_value else _repo_root() / "data" / "derived"
@@ -331,38 +314,18 @@ def observation_dir(
     return base / world_id
 
 
-# ---- 解決済み root の request-scope pin（PART-4・TOCTOU 対策）----------------------------------
-# `/ext/v1/research`（`sherpa/research_service.py`）は呼び出し元（`ext_api.py`）の preflight 解決
-# とは別に、共有 advisory lock を保持した状態で `resolve_external_world()` を改めて strict に呼び、
-# その解決結果**だけ**を使う。以降 agentic search の複数ターン（数十秒〜規定の反復上限ぶん）に
-# わたって `agentic_search.run_tool` 経由で `world_dir()` を何度も間接的に再解決する
-# （`grep_tool.grep_search`／`corpus_docs.iter_world_documents`／`agentic_search._safe_doc_path`／
-# `verify_citation`／`verify_doc_exists` など、いずれもこの関数が唯一の真実源）。pin が無ければ、
-# この authoritative な解決と実際のツール実行の間に registry の rebind（同じ world_id が別
-# root_path に差し替わる）が起きたとき、確認した world と実際に検索する world が食い違いうる。
-#
-# `ContextVar` にする理由: `world_dir()` を直接呼ぶ全箇所（上記4モジュール以上）に `root=` 引数を
-# 追加して呼び出し元まで貫通させると、`providers/base.py`（PART-4 では変更しない契約——
-# `sherpa/research_service.py` docstring 冒頭「読み取り専用で再利用する」参照）が呼ぶ
-# `agentic_search.verify_citation`/`_dedupe_citations_and_evidence` の経路にも改修が要る。
-# ここで唯一の真実源（`world_dir()`）自体に「このリクエストの間だけ、この world_id は
-# この root で答える」という pin を持たせれば、呼び出し階層のどこにも手を入れずに TOCTOU を
-# 閉じられる（下流の関数シグネチャは1つも変えない）。`contextvars.ContextVar` は
-# `sherpa/ext_api.py::_request_id_ctx` と同じ機構——FastAPI の同期 def ハンドラ（`run_in_threadpool`
-# 経由）でもリクエストのコンテキストがそのままコピーされてワーカースレッドへ渡るため、
-# 並行リクエスト間で混線しない（`os.environ` ベースの `SHERPA_MCP_WORLD_ROOT` と違いプロセス全体を
-# 汚染しない）。`world_id` が完全一致した時だけ使う（他 world の解決には影響しない＝MCP override と
-# 同じスコープ限定の設計）。
+# ---- 解決済み root の request-scope pin（TOCTOU 対策）----
+# 外部 API・簡易チャットは入口で共有 advisory lock を保持して `resolve_external_world()` を strict に解決し、その結果だけを使う。
+# 以降のツール実行（`world_dir()` を何度も間接的に再解決する）の間に rebind が起きても、確認した資料フォルダと検索する資料フォルダが食い違わないよう、
+# `world_dir()` 自体に「このリクエストの間だけ、この world_id はこの root で答える」pin を `ContextVar` で持たせる（下流のシグネチャは変えない）。
+# `world_id` が完全一致したときだけ使う。リクエスト間で混線しない
 _pinned_root: "contextvars.ContextVar[tuple[str, Path] | None]" = contextvars.ContextVar(
     "sherpa_pinned_world_root", default=None)
 
 
 @contextlib.contextmanager
 def pin_world_root(world_id: str, root):
-    """このスコープ内（同一コンテキスト＝同一リクエスト/スレッド）の `world_dir(world_id)` 呼び出しを
-    すべて `root` に固定する（registry への再解決を行わない）。ネスト時は内側の pin が優先され、
-    スコープを抜けると外側の状態（pin 無し、または外側の pin）へ自動的に戻る。
-    """
+    """このスコープ内（同一コンテキスト）の `world_dir(world_id)` をすべて `root` に固定する（registry へ再解決しない）。ネスト時は内側の pin が優先される。"""
     token = _pinned_root.set((world_id, Path(root)))
     try:
         yield
@@ -371,20 +334,11 @@ def pin_world_root(world_id: str, root):
 
 
 def world_dir(world_id: str):
-    """world（登録ディレクトリ）の実パス。**pin（同一リクエスト内固定）＞ MCP override ＞ レジストリ binding ＞ fixtures ＞ KB**。無ければ None。
-
-    レジストリに**行があれば root_path だけが正**＝参照元が消失/マウント不可なら **None（fail-closed）**で
-    fixtures/旧KB へは落とさない（別内容を同 world として誤読しない・MIRROR §4）。
-    DB 不可、または行が無い（未登録の dev world）ときのみ fixtures（`fixtures/corpus/{id}`）／`data/kb/{id}` へ。
-
-    MCP サブプロセスは PG creds を持たない
-    （`agents._MCP_PASSTHROUGH` に含めない設計）ため、サンドボックス下では registry 解決
-    （Postgres 接続）に頼れない/信頼できない可能性がある。`SHERPA_MCP_WORLD`（対象 world_id）と
-    `SHERPA_MCP_WORLD_ROOT`（サーバプロセスが registry 込みで解決した絶対パス・`agents._mcp_env()`
-    が設定）が**要求された world_id に一致する時だけ**それを使い、registry への再解決を避ける
-    （他 world には効かないスコープ限定 override）。絶対パス・存在・ディレクトリ・非symlink を
-    検証し、壊れていれば override 自体を無視して通常の解決（registry→fixtures→KB）へフォールバックする
-    （override が信頼できないという理由だけで fail-closed にはしない＝既存の多段フォールバック方針を維持）。
+    """資料フォルダ（登録ディレクトリ）の実パス。優先順は pin（同一リクエスト内固定）＞ MCP override ＞ レジストリ binding ＞ fixtures ＞ KB。無ければ None。
+    レジストリに行があれば `root_path` だけが正で、参照元が消失・マウント不可なら None（fixtures／旧 KB へは落とさない）。
+    DB 不可または行が無い（未登録の dev 資料フォルダ）ときだけ fixtures（`fixtures/corpus/{id}`）／`data/kb/{id}` を見る。
+    MCP サブプロセスは PG creds を持たないため、`SHERPA_MCP_WORLD_ROOT`（`agents._mcp_env()` が設定した絶対パス）を `SHERPA_MCP_WORLD` と一致する資料フォルダにだけ使う。
+    絶対パス・存在・ディレクトリ・非 symlink を検証し、壊れていれば override を無視して通常の解決へ進む。
     """
     if not valid_world(world_id):
         return None
@@ -402,15 +356,12 @@ def world_dir(world_id: str):
         row = store.get_world(world_id)
     except Exception:
         db_ok = False
-    if db_ok and row:                                # 登録済み world → 参照元 root のみ（無効なら unavailable）
+    if db_ok and row:  # 登録済み → 参照元 root のみ（無効なら None）
         p = Path(row["root_path"])
         return p if (p.is_dir() and not p.is_symlink()) else None
-    cands = []                                       # 未登録 or DB 不可 → dev fixtures / 後方互換 KB
+    cands = []  # 未登録 or DB 不可 → dev fixtures／後方互換 KB
     if _fixtures():
-        # テスト専用 world_id エイリアス: 固定 world_id 'v1' を
-        # 共有 Neo4j/ES のラベルに使うと実登録 world と衝突しうるため、テストは専用 id（例
-        # 'pytest-v1'・`SHERPA_TEST_WORLD_ID` で指定）をラベルに使う一方、fixture データ源は
-        # 従来どおり `fixtures/corpus/v1` を再利用する（最小の写像・データを複製しない）。
+        # テスト専用 world_id エイリアス（`SHERPA_TEST_WORLD_ID`）は fixtures の `v1` を再利用する
         src = "v1" if world_id == os.environ.get("SHERPA_TEST_WORLD_ID") else world_id
         cands.append(Path("fixtures/corpus") / src)
     cands.append(_kb() / world_id)
@@ -418,43 +369,26 @@ def world_dir(world_id: str):
 
 
 class ExternalResolverError(Exception):
-    """外部 API（/ext/v1）専用 resolver が registry/KB へ到達できなかった（呼び出し側は 503 にする）。"""
+    """外部 API（/ext/v1）専用 resolver が registry／KB へ到達できなかった（呼び出し側は 503 にする）。"""
 
 
 class ExternalWorldResolution(NamedTuple):
-    """`resolve_external_world` の結果。`status`: "ok"（`path` が有効）／"not_found"（world が実在しない）。
-    到達不可（registry 不達・登録済み root 不達）は `status` ではなく `ExternalResolverError` で表す
-    （呼び出し側が「存在しない」と取り違えないよう、正常系の戻り値と区別する）。
-    """
+    """`resolve_external_world` の結果。`status`: "ok"（`path` が有効）／"not_found"（資料フォルダが実在しない）。到達不可は `ExternalResolverError` で表す（「存在しない」と区別する）。"""
     status: str
     path: Path | None
 
 
-_UNSET = object()   # registry_row 省略の判別用（None＝「未登録と確認済み」と区別する）
+_UNSET = object()  # registry_row 省略の判別用（None＝「未登録と確認済み」と区別する）
 
 
 def resolve_external_world(world_id: str, *, registry_row=_UNSET,
                            connect_timeout: float | None = None,
                            statement_timeout_ms: int | None = None) -> ExternalWorldResolution:
-    """外部 API（`/ext/v1`）専用の world 解決。`world_dir()`（UI/取込向け・DB 不達を fixtures/KB へ
-    フォールバックする多段解決）とは異なり、**registry 到達不可・登録済み root 到達不可は
-    `ExternalResolverError` で明示する**（この2つを「存在しない」に潰すと、外部呼び出し元が
-    一時的な不達を「未登録/削除済み」と取り違え、同名の別内容（dev fixtures 等）を実体だと
-    誤解しかねない）。fixtures/dev KB へのフォールバックは **registry に到達できて、かつ
-    その world_id の行が無い**ときだけ行う（registry 到達不可時に同名 dev root を誤って配信しない）。
-
-    パス確認は `_is_dir_strict()` を使う（`Path.is_dir()`/`Path.is_symlink()` は内部で任意の
-    `OSError` を握って False を返すため使わない）——登録済み root・未登録候補（fixtures/KB）の
-    どちらも、ENOENT（存在しない）は「無い」として扱うが、それ以外の `OSError`（権限エラー等）は
-    `ExternalResolverError` として伝播させる。権限エラー等を「存在しない」に取り違えて 404 相当
-    （`not_found`）に潰すと、一時的な確認不能を「削除済み」と誤解しかねないため。
-
-    `registry_row`: 呼び出し側が `store.list_worlds_db()` を一括取得済みなら渡す（world ごとに
-    `store.get_world()` を引き直さない・discovery の N+1 回避）。省略時はここで1回引く。
-
-    `connect_timeout`/`statement_timeout_ms`（`registry_row` 省略時のみ意味を持つ・両方省略可・
-    既定 None＝無期限＝既存呼び出し元は無変更）: `store.get_world()` へそのまま転送する
-    （PART-4 が残り時間ベースで渡す・同関数 docstring 参照）。
+    """外部 API（`/ext/v1`）専用の資料フォルダ解決。`world_dir()`（DB 不達を fixtures／KB へ落とす）と違い、registry 到達不可・登録済み root 到達不可は `ExternalResolverError` で明示する（「存在しない」に潰さない）。
+    fixtures／dev KB へのフォールバックは、registry に到達できて、その world_id の行が無いときだけ行う。
+    パス確認は `_is_dir_strict()` を使い、ENOENT は「無い」、それ以外の `OSError` は `ExternalResolverError` として伝播させる。
+    `registry_row`: 呼び出し側が `store.list_worlds_db()` を取得済みなら渡す（N+1 回避）。
+    `connect_timeout`／`statement_timeout_ms`（`registry_row` 省略時のみ有効）は `store.get_world()` へそのまま渡す。
     """
     if not valid_world(world_id):
         return ExternalWorldResolution("not_found", None)
@@ -487,11 +421,9 @@ def resolve_external_world(world_id: str, *, registry_row=_UNSET,
         try:
             ok = _is_dir_strict(d)
         except FileNotFoundError:
-            continue   # この候補は単に存在しない＝次の候補（または not_found）へ
+            continue  # この候補は存在しない＝次の候補へ
         except OSError as e:
-            # `Path.is_dir()`/`Path.is_symlink()` は内部で任意の OSError を握って False を
-            # 返す仕様のため、ここでは使わず `_is_dir_strict()` に統一している——ENOENT 以外
-            # （権限エラー等）を「存在しない」（404相当）に取り違えず 503 にする。
+            # ENOENT 以外（権限エラー等）は「存在しない」にせず 503 にする
             raise ExternalResolverError(f"cannot stat {d}") from e
         if ok:
             return ExternalWorldResolution("ok", d)
@@ -499,30 +431,15 @@ def resolve_external_world(world_id: str, *, registry_row=_UNSET,
 
 
 def _is_dir_strict(p: Path) -> bool:
-    """`os.lstat()`（symlink は辿らない＝`Path.is_symlink()` 相当も一度に判定できる）で
-    ディレクトリかどうかを判定する。この関数自体は何も握り潰さない——`FileNotFoundError`
-    （ENOENT）も他の `OSError`（権限エラー等）も区別せずそのまま呼び出し元へ伝播させる。
-    「ENOENT だけは無視して次の候補へ・それ以外は 503 にする」という判断は呼び出し元の
-    責務（各呼び出し元が個別に `except FileNotFoundError: continue`／
-    `except OSError: raise ExternalResolverError` のように分けて処理する）。
-
-    `Path.is_dir()`／`Path.is_symlink()` は内部で任意の `OSError` を握って False を返す
-    （ドキュメント上の仕様）ため、strict 経路では使えない——「見えなかった」（権限エラー等）を
-    「無かった」に取り違えて候補から静かに落としてしまう。
-    """
-    st = os.lstat(p)   # FileNotFoundError/OSError は呼び出し元が処理する
+    """`os.lstat()` でディレクトリかどうかを判定する（symlink は辿らない）。何も握りつぶさず、`FileNotFoundError` も他の `OSError` も呼び出し元へ伝播させる（扱いの分岐は呼び出し元の責務）。"""
+    st = os.lstat(p)
     return stat_mod.S_ISDIR(st.st_mode)
 
 
 def discover_fs_world_ids_strict() -> list:
-    """fixtures/dev KB 直下の world_id 一覧（**ファイルシステム列挙のみ・DB を触らない**）。
-
-    登録済みかどうかは問わない（呼び出し側が registry の集合と突き合わせて重複排除する）。
-    列挙時の予期しない例外（権限エラー等）は握り潰さず `ExternalResolverError` で通知する
-    （`_is_dir_strict()` により ENOENT だけを skip・それ以外の OSError は伝播させる）。
-    `discover_world_ids_strict()` から分離しているのは、呼び出し側（`/ext/v1/capabilities`）が
-    registry 行を自前で1回だけ取得し使い回すため（同じスナップショットから ID・root・
-    最終同期時刻を導出し、2回目の DB 往復・DB 例外の取りこぼしを避ける）。
+    """fixtures／dev KB 直下の資料フォルダ ID 一覧（ファイルシステム列挙のみ・DB を触らない）。登録済みかは問わない。
+    予期しない例外（権限エラー等）は `ExternalResolverError` で通知する（ENOENT だけ skip）。
+    `/ext/v1/capabilities` が registry 行を自前で 1 回だけ取得して使い回すため、`discover_world_ids_strict()` から分離してある。
     """
     out = set()
     bases = []
@@ -546,7 +463,7 @@ def discover_fs_world_ids_strict() -> list:
                 if not _is_dir_strict(d):
                     continue
             except FileNotFoundError:
-                continue   # iterdir()〜stat() の間に消えた（レース・実在しないので単純に skip）
+                continue  # 列挙〜stat の間に消えた
             except OSError as e:
                 raise ExternalResolverError(f"cannot stat {d}") from e
             try:
@@ -561,11 +478,8 @@ def discover_fs_world_ids_strict() -> list:
 
 
 def discover_world_ids_strict() -> list:
-    """外部 API 専用の world 実在一覧（registry ∪ fixtures/dev KB）。`discover_world_ids()`
-    （レジストリ不達を空扱いで黙って続行する・UI 隣接用途向け）とは異なり、registry 不達・
-    KB/fixtures 列挙時の予期しない例外（権限エラー等）を握り潰さず `ExternalResolverError` で
-    通知する。単発呼び出し用（registry 行を使い回したい呼び出し元は `discover_fs_world_ids_strict()`
-    と `store.list_worlds_db()` を自前で1回ずつ呼ぶこと）。
+    """外部 API 専用の資料フォルダ実在一覧（registry ∪ fixtures／dev KB）。registry 不達・列挙時の予期しない例外は `ExternalResolverError` で通知する。
+    単発呼び出し用（registry 行を使い回すなら `discover_fs_world_ids_strict()` と `store.list_worlds_db()` を自前で呼ぶ）。
     """
     try:
         from . import store
@@ -576,38 +490,19 @@ def discover_world_ids_strict() -> list:
     return sorted(registered | set(fs_ids))
 
 
-# 旧・意味層フル抽出/対応橋の world配下フォールバック位置（`concepts.json`／`l_extract.json`）。
-# 実体の解決機構（旧 `semantic_paths()`）自体は撤去済み（単一の真実源・
-# `is_semantic_control_path` 用に相対パスの定数だけ残す）。
+# 旧・意味層のフォールバック位置（`concepts.json`／`l_extract.json`）。`is_semantic_control_path` 用に相対パスの定数だけ残す
 _SEMANTIC_CONTROL_RELPATHS = frozenset({"semantic/concepts.json", "semantic/l_extract.json"})
 
 
 def is_semantic_control_path(rel_path: str) -> bool:
-    """`rel_path`（world root 相対 POSIX）が旧・意味層機構（手動意味層 concepts／L抽出 l_extract）の
-    world配下フォールバック位置か。**撤去済み機構の残置ガード**:
-    生成側（旧 `semantic_paths()`／`graph_extract.extract_world` 等）は撤去済みだが、既存 world の
-    ディスク上に過去の取り込みで置かれたこれらのファイルが残っていることがある。
-
-    `importance.is_importance_control_path`（`_重要度.txt`）と同じ性質の内部制御ファイル——
-    軽量テキスト枠（`ingest.text_kind`）が `.json` を汎用コード扱いにしたことで、`semantic/`
-    配下に置かれたこれらのファイルが偶然「ただの文書」として grep/ES/台帳に露出しないよう
-    `corpus_docs._classify_generic_text()` が呼ぶ（実 fixture `fixtures/corpus/v1/
-    semantic/concepts.json` で発覚）。ここは**厳密な相対パス一致**（`importance` 側の「ファイル名
-    一致ならどの階層でも」とは違う）——`semantic/` 配下の別名ファイルや、無関係フォルダの同名
-    ファイルまで巻き込まない。
+    """`rel_path`（資料フォルダ root 相対 POSIX）が旧・意味層のフォールバック位置か。既存の資料フォルダに残っているこれらのファイルが、文書として grep／ES／台帳に露出しないための残置ガード
+    （`corpus_docs._classify_generic_text()` が呼ぶ）。厳密な相対パス一致で判定する。
     """
     return rel_path in _SEMANTIC_CONTROL_RELPATHS
 
 
 def _lstat_kind(p) -> str | None:
-    """`os.lstat()` ベースで種別を返す（`"dir"`/`"file"`/`"symlink"`/`None`）。パスが存在しない
-    （`FileNotFoundError`／ENOENT）だけは `None`（skip 対象）とし、それ以外の `OSError`
-    （権限エラー等）は呼び出し元へ伝播させる（`scope_infer._lstat_kind` と同じ設計）。
-
-    `Path.is_dir()`/`is_file()`/`is_symlink()`、`os.DirEntry.is_dir()`/`is_file()`/`is_symlink()`
-    は内部で任意の `OSError` を握って False を返すため strict 経路では使えない——「見えなかった」
-    （権限エラー等）を「無かった」に取り違えて候補から静かに落としてしまう。
-    """
+    """`os.lstat()` ベースで種別（`"dir"`／`"file"`／`"symlink"`／`None`）を返す。ENOENT だけは `None`、それ以外の `OSError` は呼び出し元へ伝播させる。"""
     try:
         st = os.lstat(p)
     except FileNotFoundError:
@@ -622,19 +517,9 @@ def _lstat_kind(p) -> str | None:
 
 
 def _has_any_file(root: Path, *, strict: bool = False) -> bool:
-    """root 配下に実ファイルが1つでもあるか（sort なし・最初の1件で即 return）。
-
-    `scope_infer.safe_files` は grep/DL 用の**完全な**安全列挙（各階層 sorted・rel_path 生成込み）だが、
-    ここでは「候補として出す価値があるか」の存在確認だけで十分＝順序も rel_path も要らない。
-    `/world-options` はチャット初期化のたび（画面を開くたび）呼ばれる hot path なので、未登録候補ごとに
-    `safe_files` の完全列挙を回すのは無駄が大きい。symlink は辿らない（safe_files と同じ脱出防止の方針）。
-
-    `strict=False`（既定・`list_worlds()`/`discover_world_ids()` 等の UI 隣接用途）: 列挙中の
-    `OSError` は黙って False 扱いにする（従来どおり）。`strict=True`（`discover_fs_world_ids_strict()`
-    専用）: 同じ `OSError` を re-raise する——「見えなかった」を「実ファイル無し」に取り違えて
-    候補から静かに落としてはいけない（呼び出し側が `ExternalResolverError`／503 にする）。
-    `_lstat_kind()`（`os.lstat`＋`stat.S_ISDIR` 等）を使う——`Path`/`os.DirEntry` の便利メソッドは
-    内部で OSError を握るため strict 経路には使えない。
+    """root 配下に実ファイルが 1 つでもあるか（sort なし・最初の 1 件で即 return）。symlink は辿らない。
+    `/world-options` が呼ぶ hot path のため、完全列挙（`safe_files`）は使わない。
+    `strict=False`（既定）は列挙中の `OSError` を False 扱いにし、`strict=True`（`discover_fs_world_ids_strict()` 用）は re-raise する（「見えなかった」を「無かった」にしない）。
     """
     try:
         kind = _lstat_kind(root)
@@ -653,12 +538,7 @@ def _has_any_file(root: Path, *, strict: bool = False) -> bool:
             if strict:
                 raise
             continue
-        # `list(os.scandir(cur))` で一括材料化すると、最初の1件で return できるはずの最適化が
-        # 死ぬ（巨大ディレクトリで全件を先に読み切ってしまう）。`with` で確実にクローズしつつ、
-        # 1件ずつ逐次 `next()` する——`for entry in it:` だと反復自体が投げる OSError（列挙途中の
-        # 消失等）を個々の entry の `_lstat_kind` 失敗と区別できず、1エントリの権限エラーで
-        # ディレクトリ全体を放棄してしまう（strict=False 時の挙動）か直接 raise（strict=True 時）に
-        # なるかの分岐を this 関数レベルで保てない——`next()` を手動で呼び分離する。
+        # `os.scandir` は一括材料化せず `next()` で 1 件ずつ取る（最初の 1 件で return する最適化を保ち、反復自体の `OSError` と各 entry の失敗を分けて扱うため）
         with it:
             while True:
                 try:
@@ -668,7 +548,7 @@ def _has_any_file(root: Path, *, strict: bool = False) -> bool:
                 except OSError:
                     if strict:
                         raise
-                    break   # このディレクトリの残りは諦める（list() が丸ごと失敗するのと同じ挙動）
+                    break  # このディレクトリの残りは諦める
                 p = Path(entry.path)
                 try:
                     kind = _lstat_kind(p)
@@ -679,18 +559,13 @@ def _has_any_file(root: Path, *, strict: bool = False) -> bool:
                 if kind == "dir":
                     stack.append(p)
                 elif kind == "file":
-                    return True                 # 最初の1件で即終了（TTL キャッシュ等は過剰設計＝不要）
+                    return True
     return False
 
 
 def discover_world_ids() -> list:
-    """登録 world の実在一覧（レジストリ ∪ fixtures/corpus ∪ data/kb 直下・**フォールバック無し**）。
-
-    `list_worlds()` が UI 向けに付ける「1件も無ければ `["v1"]` を返す」という空でない保証は
-    含まない＝呼び出し元が「本当に何が存在するか」を必要とする場合（外部公開 discovery・
-    キーの world スコープ検証等）はこちらを使う。レジストリ登録済みは無条件に含め、
-    fixtures/data/kb 直下の未登録候補は実ファイルが1つも無いものを除外する（`list_worlds()` と
-    同じ選別ロジック・単一の真実源）。
+    """登録資料フォルダの実在一覧（レジストリ ∪ fixtures/corpus ∪ data/kb 直下・フォールバック無し）。
+    `list_worlds()` の「1 件も無ければ `["v1"]`」という保証は含まない。レジストリ登録済みは無条件に含め、未登録候補は実ファイルが 1 つも無いものを除く。
     """
     out = set()
     registered = set()
@@ -710,49 +585,34 @@ def discover_world_ids() -> list:
         for d in base.iterdir():
             if not (d.is_dir() and valid_world(d.name)) or d.name in registered:
                 continue
-            if not _has_any_file(d):                    # 実ファイル無し＝選ぶ意味の無い候補は出さない
+            if not _has_any_file(d):  # 実ファイル無し＝選ぶ意味の無い候補は出さない
                 continue
             out.add(d.name)
     return sorted(out)
 
 
 def list_worlds() -> list:
-    """登録 world の一覧（レジストリ ∪ fixtures/corpus ∪ data/kb 直下）。UI の取込ディレクトリ選択用。
-
-    1件も無ければ `["v1"]` を返す: 旧レイアウト（`data/kb/{layer}/
-    {version}/…`）の空ディレクトリが残っていると世界として混入し、アルファベット順で先頭に来て
-    世界セレクタの既定選択を奪いうる＝実質そのディレクトリの空の範囲ツリーが出て「範囲セレクタが
-    消えた」ように見えることを防ぐ（scope_tree 自体は無傷）。この保証が不要（＝実在しない
-    world を実在するかのように返してはいけない）呼び出し元は `discover_world_ids()` を使うこと。
+    """登録資料フォルダの一覧（レジストリ ∪ fixtures/corpus ∪ data/kb 直下）。UI の取込ディレクトリ選択用。
+    1 件も無ければ `["v1"]` を返す（空の旧レイアウトの残骸が既定選択を奪わないため）。実在しないものを実在するかのように返してはいけない呼び出し元は `discover_world_ids()` を使う。
     """
     return discover_world_ids() or ["v1"]
 
 
 def accessible_world_ids(uid: str) -> list[str] | None:
-    """uid がアクセス可能な world_id の一覧。None＝全 world（現状の方針）。
-
-    利用者による API キー自己発行の world スコープは「本人がアクセスできる範囲 ⊆」に強制する
-    契約になっている。現状は KB が全社1つ＝全ユーザーが全 world にアクセスできるため
-    None（無制限）を返すが、将来
-    部門/管理者スコープ（CLAUDE.md「KB は全社1つ＋利用者登録可（将来：管理者/部門スコープ）」）
-    を実装する際は、呼び出し側（`sherpa/routers/system_extras.py::_enforce_self_world_scope`）
-    が「全員全 world」をハードコードしなくて済むよう、この関数だけを差し替えればよい。
+    """uid がアクセス可能な資料フォルダ ID の一覧。None＝全資料フォルダ（現状は全員が全資料フォルダにアクセスできる）。
+    API キー自己発行の範囲をこの一覧の部分集合に制限するため（`sherpa/routers/system_extras.py::_enforce_self_world_scope`）、将来の部門／管理者スコープはこの関数だけを差し替える。
     """
-    del uid   # 現状は uid によらず None（全 world）
+    del uid  # 現状は uid によらず None
     return None
 
 
 def default_world() -> str:
-    """既定 world（API クエリ既定値・env 未指定時の解決）。リテラル `"v1"` の散在を1箇所に集約する単一の真実源。
-
-    現状は後方互換の `"v1"` 固定（`list_worlds()` の最終 fallback と一致）＝**挙動不変**。
-    レジストリ先頭を動的に返す案は、既定 world を `"v1"` に固定する現行挙動（テストで担保）を変えるため採らない。
-    """
+    """既定の資料フォルダ（API クエリ既定値・env 未指定時の解決）。リテラル `"v1"` を 1 箇所に集約する単一の真実源（`list_worlds()` の最終 fallback と一致）。"""
     return "v1"
 
 
 def world_label(world_id: str) -> str:
-    """world の表示名（レジストリ label ＞ 識別子）。鏡では UI に version の語を出さない（§8）。"""
+    """資料フォルダの表示名（レジストリ label ＞ 識別子）。"""
     row = None
     try:
         from . import store
@@ -762,35 +622,19 @@ def world_label(world_id: str) -> str:
     return (row or {}).get("label") or world_id
 
 
-# ---- ライフサイクル（register / rebind / delete）。worker は遅延 import（循環回避）----
+# ---- ライフサイクル（register / rebind / delete）。worker は循環回避のため遅延 import ----
 
 class WorldConflict(ValueError):
-    """既存 world と衝突（同名 / 同一参照元の二重登録）。API は 409 にマップ。"""
+    """既存の資料フォルダと衝突（同名／同一参照元の二重登録）。API は 409 にマップする。"""
 
 
 def register(world_id: str, root_path: str, label=None, storage_mode="external_reference",
              reflect=True, run_id=None, on_run_id=None) -> dict:
-    """空のレジストリへ1本の参照元 root_path を登録して取り込む。
-
-    `run_id` ＝呼び出し元が受付時に O(1) で確保済みの `ingest_runs` 行を
-    `_run_locked` へそのまま転送する。`on_run_id`＝旧経路（後方互換）のコールバック
-    （`_run_locked` が確保した run_id が判明した瞬間に呼ばれる）。
-
-    標準MVPは登録元フォルダを全体で1本に固定する。既存行が1件でもあれば、同じ root/world_id を含めて
-    **更新せず失敗**する（内容更新は refresh、参照先変更は rebind）。既存データの自動選択・削除はしない。
-
-    行作成（`upsert_world`）〜失敗時 cleanup（行削除＋派生 rmtree）
-    までを**単一の world_lock 区間**に収める——行作成〜cleanup を lock の外に置くと、register が
-    失敗して lock を持たないまま cleanup する前に、並行 sync/rebind が同じ world_id で run を開始でき、
-    その run 完了後（＝行がまだ存在する間に確定した last_sig）に register 側の cleanup が行を削除すると
-    「registry 無し・グラフ/台帳あり」の孤児状態が残りうる（並行 sync 側は自分の `set_world_sig` を
-    UPDATE 0行のまま成功扱いする）。事前チェック（既存 world_id 拒否・同一 root 1:1 拒否）も lock 取得
-    **後**に行う（lock 待ちの間に他プロセスが同じ world_id/root を登録し得るため）。異なる world_id 同士の
-    同時登録も直列化するため、固定 `world_registry_lock` → `world_lock(world_id)` の順で取得し、登録件数の
-    確認から失敗時 cleanup まで両方を保持する。
-    取り込みは `worker.run`（自前 lock）ではなく lock-free の `worker._run_locked` を直接呼ぶ
-    （rebind/delete と同じ確立済みパターン・session-level advisory lock は別コネクション再入不可のため
-    `run` を呼ぶと自己デッドロックする）。署名の確定/無効化は `_run_locked` 内部（lock 保持中）に一任する。
+    """空のレジストリへ 1 本の参照元 `root_path` を登録して取り込む。
+    登録元フォルダは全体で 1 本に固定する。既存行が 1 件でもあれば更新せず失敗する（内容更新は refresh、参照先変更は rebind）。
+    `run_id`: 呼び出し元が受付時に確保済みの `ingest_runs` 行を `_run_locked` へ渡す。`on_run_id`: 確保された run_id が判明した時点で呼ばれるコールバック。
+    ロック: 固定 `world_registry_lock` → `world_lock(world_id)` の順で取り、行作成から失敗時 cleanup までを単一の区間に収める。事前チェック（既存 world_id・同一 root の拒否）はロック取得後に行う。
+    取り込みは `worker.run`（自前 lock）ではなく `worker._run_locked` を直接呼ぶ（`run` を呼ぶと自己デッドロックする）。署名の確定／無効化は `_run_locked` 内部に任せる。
     """
     import psycopg
     from . import es_index, store
@@ -806,7 +650,7 @@ def register(world_id: str, root_path: str, label=None, storage_mode="external_r
                 "資料フォルダは1本だけ登録できます。"
                 "別のフォルダに変更する場合は、先に登録済みのフォルダを削除してください。"
             )
-        # registry 全体 lock 内の防御的再確認。将来もこの関数を経由しない行作成を許可しない。
+        # registry 全体 lock 内の防御的再確認（この関数を経由しない行作成を許さない）
         if store.get_world(world_id):
             raise WorldConflict(f"world '{world_id}' は既に存在します（参照先変更は rebind）")
         other = store.world_by_root(root_path)
@@ -814,15 +658,12 @@ def register(world_id: str, root_path: str, label=None, storage_mode="external_r
             raise WorldConflict(f"その参照元は既に world '{other['world_id']}' に登録済みです")
         try:
             store.upsert_world(world_id, root_path, label=label, storage_mode=storage_mode)
-        except psycopg.errors.UniqueViolation:                 # 同一 root を同時に別 world_id で新規登録した競合
+        except psycopg.errors.UniqueViolation:  # 同一 root を同時に別 world_id で新規登録した競合
             raise WorldConflict(f"その参照元は既に別 world に登録済みです（同時登録の競合）")
         import shutil
         registered_ok = False
         try:
-            # `_run_locked` が「failed」を返す場合だけでなく、途中で例外を bare raise する場合
-            # （PG/Neo4j 接続断等）も同じ扱いにする——try/finally で両方の失敗経路を一本化し、
-            # registry 行だけが残って取り込みは一度も成功していない孤児状態を作らない
-            # （bare raise は except で個別に握り潰さず、finally の cleanup 後にそのまま伝播させる）。
+            # `_run_locked` の失敗（`failed` の返却・途中の例外）はどちらも `finally` の cleanup 後に伝播させる（registry 行だけが残る孤児状態を作らない）
             res = worker._run_locked(world_id, reflect=reflect, created_by="admin", scan_root=None,
                                      run_id=run_id, on_run_id=on_run_id)
             if res["status"] == "failed":
@@ -830,18 +671,9 @@ def register(world_id: str, root_path: str, label=None, storage_mode="external_r
             registered_ok = True
             return res
         finally:
-            if not registered_ok:                              # 取り込み失敗＝行も派生残骸も残さない（fail-closed）
-                # `_run_locked` は Neo4j load を先に commit してから台帳・ES・実行記録・署名を
-                # 個別に進めるため、Neo4j 成功後に台帳書込（`replace_documents`）等が失敗すると
-                # 「registry 行は無いのに Neo4j/台帳/ES に部分的な残骸が残る」状態になりうる。
-                # `DELETE /worlds`（`worlds.delete`/`worker._wipe_locked`）が使うのと同じ削除
-                # 伝播（Neo4j 削除・台帳クリア・ES 削除）を、cleanup 専用に best-effort で
-                # 補償的に実行する。各段を独立した try で包み、どれか1つが失敗しても他は必ず
-                # 試みる。finally 内で例外を飛ばすと（Python の仕様で）呼び出し元へ伝播中の
-                # 元例外（取り込み失敗の詳細）を丸ごと置き換えてしまうため、cleanup 自身の
-                # 失敗はログのみに留め re-raise しない。派生ディレクトリ・registry 行の削除は
-                # 最後に行う（DB 行削除が PG 障害等で失敗して止まっても、逆順だと到達できない
-                # 手前の補償削除を先に済ませておく）。
+            if not registered_ok:  # 取り込み失敗＝行も派生残骸も残さない（fail-closed）
+                # 補償削除（Neo4j・台帳・ES）は `worlds.delete` と同じ伝播を best-effort で行う。各段を独立した try で包み、cleanup 自身の失敗はログのみで re-raise しない
+                # （元の取り込み失敗の例外を置き換えない）。派生ディレクトリ・registry 行の削除は最後に行う
                 try:
                     env = world_neo4j._env()
                     world_neo4j.delete_world(world_id, env["uri"], env["user"], env["pw"])
@@ -863,11 +695,7 @@ def register(world_id: str, root_path: str, label=None, storage_mode="external_r
                         world_id, exc_info=True)
 
                 def _log_rmtree_error(function, path, exc):
-                    # `ignore_errors=True` は削除失敗を無音で握り潰すため、契約どおり
-                    # warning ログに残しつつ（re-raise しない＝他ファイルの削除は継続する）。
-                    # ただし `FileNotFoundError`（派生ディレクトリがそもそも作られていない
-                    # 早期失敗）は「削除すべきものが無かっただけ」の正常系なので警告しない
-                    # ——実際の削除失敗（権限等）だけを警告に残す。
+                    # 削除失敗は warning に残す（re-raise しない）。`FileNotFoundError` は正常系なので警告しない
                     if isinstance(exc, FileNotFoundError):
                         return
                     logging.getLogger(__name__).warning(
@@ -889,12 +717,9 @@ def register(world_id: str, root_path: str, label=None, storage_mode="external_r
 
 def _finalize_pending_run(run_id, world_id: str, pending: dict, *, status: str | None = None,
                           extraction_snapshot: dict | None = None) -> dict:
-    """`worker._run_locked(..., finalize=False)` の保留分（`_pending_finalize`）を使って、
-    受付 run の確定を一度だけ行う（`rebind` の新root試行/旧root復旧いずれの内部段でも書かず、
-    最終結末が判明してからここでまとめて書く）。`status`/`extraction_snapshot` を渡すと保留分の
-    その値だけ上書きする（内部段は成功していても利用者向けの結末は失敗、という場合に使う）。
-    他フィールド（published_snapshot/source_doc_ids・world 確定用の sig 等）は保留分のまま
-    温存し、NULL 上書きで Graph 件数等を消さない。"""
+    """`worker._run_locked(..., finalize=False)` の保留分（`_pending_finalize`）を使って、受付 run の確定を一度だけ行う（`rebind` の最終結末が判明してからまとめて書く）。
+    `status`／`extraction_snapshot` を渡すと保留分のその値だけ上書きする。他フィールドは保留分のまま温存する（Graph 件数等を NULL で消さない）。
+    """
     from . import store, webhooks
     st = status if status is not None else pending.get("status", "failed")
     snap = extraction_snapshot if extraction_snapshot is not None else pending.get("extraction_snapshot")
@@ -904,19 +729,16 @@ def _finalize_pending_run(run_id, world_id: str, pending: dict, *, status: str |
             published_snapshot=pending.get("published_snapshot"),
             source_doc_ids=pending.get("source_doc_ids"),
             sig=pending["confirm_sig"], manifest=pending.get("confirm_manifest"),
-            doc_count=pending.get("confirm_doc_count"), scan_report=pending.get("confirm_scan_report"))
+            doc_count=pending.get("confirm_doc_count"), scan_report=pending.get("confirm_scan_report"),
+            resolve_sig=pending.get("confirm_resolve_sig"))
     else:
         rec = store.finish_ingest_run(
             run_id, status=st, extraction_snapshot=snap,
             published_snapshot=pending.get("published_snapshot"),
             source_doc_ids=pending.get("source_doc_ids"))
-    # rebind の内部多段（`finalize=False`）は terminal 化がここ1回だけ（モジュール
-    # docstring 参照）なので、通知もここ1点に集約する（`worker._record` の hook は
-    # `finalize=False` の間 `store.finish_ingest_run*` を呼ばないため到達しない＝自然に重複しない）。
+    # rebind の内部多段は terminal 化がここ 1 回だけなので、通知もここ 1 点に集約する
     try:
-        # `source_doc_ids` が空リスト（実際に0件・既知）と None（未算出・不明）を
-        # 区別する——`len([]) or None` で両者をまとめると、
-        # 「0件で成功した rebind」と「件数不明」が見分けられなくなる。
+        # `source_doc_ids` の空リスト（0 件・既知）と None（未算出）を区別する
         ids = pending.get("source_doc_ids")
         doc_count = len(ids) if ids is not None else None
         webhooks.notify_run_terminal(world_id, run_id, "rebind", st, doc_count=doc_count)
@@ -933,17 +755,8 @@ _REBIND_PENDING_FALLBACK = {
 
 
 def _select_rebind_pending(recovery_pending: dict | None, attempt_pending: dict | None) -> dict:
-    """rebind 失敗確定に使う保留分（`_pending_finalize`）を選ぶ——新root試行・旧root復旧の
-    どちらが実際に Graph へ反映済みだったか（`published_snapshot is not None`）を最優先する。
-
-    複合失敗ケース（新root試行が Neo4j load まで成功→PG replace で失敗、続く旧root復旧が
-    それより早い段階〔office_md 等〕で力尽きる）では、復旧側の `published_snapshot` は
-    `None`（反映未到達）のまま、Neo4j には**新root分が実際に反映済み**という食い違いが起きる。
-    復旧を無条件優先すると、実在する Graph の件数を `None` で消してしまう（`get_latest_
-    published_run_summary` が古い run の件数を返し続ける・status の graph_nodes/edges が
-    実態と乖離する）。優先順位: ①復旧が反映済みならそれ ②復旧が反映未到達なら新root試行の方が
-    反映済みならそちら ③どちらも反映済みでなければ詳細情報として復旧側（旧rootへ戻そうとした
-    直接の顛末）④復旧の情報が無ければ新root試行側 ⑤どちらも無ければ最小限のフォールバック。
+    """rebind 失敗確定に使う保留分（`_pending_finalize`）を選ぶ。新 root 試行・旧 root 復旧のどちらが Graph へ反映済みか（`published_snapshot is not None`）を最優先する。
+    優先順位: ① 復旧が反映済みなら復旧 ② 復旧が未反映で新 root 試行が反映済みなら新 root 試行 ③ どちらも未反映なら復旧 ④ 復旧の情報が無ければ新 root 試行 ⑤ どちらも無ければ最小限のフォールバック。
     """
     if recovery_pending is not None and recovery_pending.get("published_snapshot") is not None:
         return recovery_pending
@@ -957,45 +770,19 @@ def _select_rebind_pending(recovery_pending: dict | None, attempt_pending: dict 
 
 
 def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, on_run_id=None) -> dict:
-    """参照先パス変更＝**その world を全削除 → 新パスから再作成**（差分でなく破棄→再作成・他 world は無傷）。
-
-    手順: バインドを新 root へ更新 → `worker._run_locked`（`load_world` が world_id 単位の delete+load を**1 tx**で置換）。
-    取り込み失敗時は旧状態へ一貫復元（fail-closed）: バインド・派生は旧へ戻し、
-    **Neo4j は失敗段階に依存**する — Neo4j load 段階で失敗なら tx ロールバックで旧グラフが残る（台帳も未変更）が、
-    **Neo4j load 成功後に PG replace 段階で失敗しうる**（Neo4j＝新・台帳＝旧のまま tx ロールバック）ため、
-    except 節で旧 root から即時再構築して Neo4j を旧へ戻す（失敗時は `last_sig` 無効化で次回 sync に self-heal を強制）。
-    `label=None` は既存 label を保持。
-
-    **world_lock は外側で1回だけ取得**: `worker.run`（lock を自前で取る）を呼ぶと、session-level
-    advisory lock は別コネクション再入不可のため自己デッドロックする。lock-free の `_run_locked` を直接呼ぶ。
-
-    署名（last_sig/manifest）の**確定**は**`_run_locked` 内部**
-    （lock 保持中・かつ `_run_locked` 自身が呼び出し直前に取り直す新しいスキャン）に一任する。ただし
-    **無効化**は例外が1つ: 復旧経路の `restore_bind_invalidate_sig` は bind 復元と同一 tx で last_sig を
-    直接無効化する（確定はしない＝古い署名を有効化する方向の書き込みではないので ABA の穴にならない）。
-    外側（このフレーム）で取り込み**前**にスキャンし、成功時・復旧時ともにその外側の署名で
-    改めて `set_world_sig` を上書きすることはしない。world_lock は**このプロセス内の rebind/run/delete 同士**しか直列化
-    せず、参照元フォルダ自体への外部変更（例: 別プロセス・利用者による書き換え）は防がないため、
-    「外側スキャン(A) → 内側スキャン・確定(B) → 外側が(A)の古い署名で上書き」という順序が起き得て、
-    その後にソースが(A)へ戻ると「グラフ=B・署名=A・ソース=A」で `sync` が unchanged と誤判定する
-    **恒久的な不整合**になる（ABA 問題）。よって外側の事前/事後スキャンと `set_world_sig` 呼び出しは
-    行わない（成功パス・復旧パスとも）。
-
-    `run_id`（ING-3）＝呼び出し元が受付時に確保済みの `ingest_runs` 行。新root試行・
-    （失敗時の）旧root復旧のどちらも `_run_locked` を `finalize=False` で呼ぶ——受付run自身の
-    terminal 化はこの関数の最後で一度だけ行う（複数回 terminal 化すると、後段の書込が前段の
-    `published_snapshot`/`source_doc_ids` を NULL/空で上書きし、Graph 件数 0 表示等の不整合に
-    なる）。最終結末が rebind 失敗の場合、実際に採用した内部段（旧root復旧が成功していれば
-    その結果・失敗/未実施なら新root試行の結果）の snapshot を温存したまま、status だけ
-    `failed` へ・reason を `rebind_failed_rolled_back`（bind 復元＋旧root再構築の成功を
-    確認できた時だけ）または `rebind_rollback_failed`（それ以外＝復旧自体が不完全）で
-    上書きする。省略時（直接呼び出し・テスト用）は各 `_run_locked` 呼び出しがそれぞれ独立に
-    新しい行を確保・terminal 化する旧来の動作のまま。`on_run_id`＝旧経路（後方互換）の
-    コールバック。
+    """参照先パス変更＝その資料フォルダを全削除し、新パスから再作成する（差分でなく破棄→再作成・他の資料フォルダは無傷）。
+    設計: docs/design/scope.md「資料フォルダの登録・解決・付け替え（registry）」
+    手順: ① バインドを新 root へ更新 ② `worker._run_locked`（`load_world` が world_id 単位の delete＋load を 1 tx で置換）で再構築 ③ 失敗時は旧状態への復元を試みる（fail-closed）。復元にも失敗した場合は旧状態を保証しない（`rebind_rollback_failed`）。
+    復元: バインド・派生を旧へ戻す。Neo4j は失敗段階に依存し、load 段階の失敗なら tx ロールバックで旧グラフが残る。load 成功後に PG replace で失敗した場合は、旧 root から即時再構築して Neo4j を旧へ戻す（失敗時は `last_sig` を無効化して次回 sync の self-heal に委ねる）。
+    `label=None` は既存 label を保持する。
+    ロック: `world_lock` は外側で 1 回だけ取り、lock-free の `_run_locked` を直接呼ぶ（`worker.run` を呼ぶと自己デッドロックする）。
+    署名（last_sig／manifest）の確定は `_run_locked` 内部に任せる。外側で取り込み前にスキャンして `set_world_sig` で上書きしない（`world_lock` は参照元の外部変更を防がないため、古い署名で上書きすると `sync` が unchanged と誤判定する ABA 不整合になる）。例外は復旧経路の `restore_bind_invalidate_sig`（bind 復元と同一 tx で `last_sig` を無効化するだけ）。
+    `run_id`: 呼び出し元が受付時に確保済みの `ingest_runs` 行。新 root 試行・旧 root 復旧はどちらも `_run_locked` を `finalize=False` で呼び、受付 run の terminal 化はこの関数の最後で 1 回だけ行う。
+    rebind 失敗時は採用した内部段の snapshot を残し、status を `failed`、reason を `rebind_failed_rolled_back`（bind 復元＋旧 root 再構築が成功）または `rebind_rollback_failed`（それ以外）にする。`on_run_id` は確保された run_id が判明した時点で呼ばれるコールバック。
     """
     from . import store
     from .ingest import worker
-    from .store.worlds import rebind_bind_invalidate_sig   # 内部専用・facade に re-export しない
+    from .store.worlds import rebind_bind_invalidate_sig  # 内部専用・facade に re-export しない
     with store.world_lock(world_id):
         old = store.get_world(world_id)
         if not old:
@@ -1003,47 +790,35 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
         other = store.world_by_root(new_root)
         if other and other["world_id"] != world_id:
             raise WorldConflict(f"その参照元は既に world '{other['world_id']}' に登録済みです")
-        # 新 root へのバインドと last_sig/last_doc_count 無効化を同一 tx で確定する（label None は
-        # 既存保持）——`upsert_world()` 単体だと `_run_locked` 冒頭の全木スキャンが終わるまで
-        # pre-invalidate されず、旧世代の件数・時刻が新 root に結び付いて見える窓ができる。
-        # `storage_mode` も既存値を明示的に引き継ぐ（渡さないと既定 "external_reference" に
-        # 化けてしまう）。
+        # 新 root へのバインドと `last_sig`／`last_doc_count` の無効化を同一 tx で確定する（label None は既存保持）。`storage_mode` は既存値を引き継ぐ
         rebind_bind_invalidate_sig(world_id, new_root, label=label,
                                    storage_mode=old.get("storage_mode"))
         import os as _os
         import shutil
         der = derived_dir(world_id)
-        # 退避先は **`.` 始まり**＝`valid_world` が False＝自動リコンサイル(reconcile)の対象外（rebind 中に旧派生バックアップを孤児削除させない）
+        # 退避先は `.` 始まり（`valid_world` が False＝自動リコンサイルの対象外。rebind 中に旧派生バックアップを孤児削除させない）
         backup = der.with_name("." + der.name + ".rebind-bak") if der.exists() else None
-        # run_id 指定時（受付run）は新root試行・旧root復旧のどちらも非terminalな内部段として扱う。
+        # `run_id` 指定時は新 root 試行・旧 root 復旧のどちらも非 terminal な内部段として扱う
         defer_finalize = run_id is not None
         attempt_pending = None
         res = None
         try:
-            if backup is not None:                                   # 旧 root の派生は**消さず退避**（失敗時に復元）
-                # 退避（os.replace）自体も try 内＝bind 更新後にここで失敗しても
-                # rollback されず bind=新/derived=旧のまま放置されることはない（except の
-                # restore_bind_invalidate_sig で必ず旧へ戻す・sig 無効化で次回 sync に self-heal を委ねる）。
-                shutil.rmtree(backup, ignore_errors=True)           # 前回失敗の残骸を掃除してから
-                _os.replace(der, backup)                            # 脇へ移す＝新 root の build はまっさらから（混入防止は維持）
-            res = worker._run_locked(world_id, reflect=reflect,     # 新 root から build＋atomic 置換（lock-free 版）。
-                                      created_by="admin", scan_root=None,  # 署名の確定は内部が行う（HIGH-A・ABA 対策）
+            if backup is not None:  # 旧 root の派生は消さず退避する（失敗時に復元）
+                # 退避自体も try 内に置く（bind 更新後に失敗しても except の `restore_bind_invalidate_sig` で旧へ戻す）
+                shutil.rmtree(backup, ignore_errors=True)  # 前回失敗の残骸を掃除
+                _os.replace(der, backup)  # 脇へ移す＝新 root の build はまっさらから
+            res = worker._run_locked(world_id, reflect=reflect,  # 新 root から build＋atomic 置換（lock-free 版）
+                                      created_by="admin", scan_root=None,  # 署名の確定は内部が行う
                                       run_id=run_id, on_run_id=on_run_id, finalize=not defer_finalize,
                                       op="rebind")
             if defer_finalize:
                 attempt_pending = res.get("_pending_finalize")
             if res["status"] == "failed":
                 raise RuntimeError(f"rebind 失敗（取り込みエラー）: {res.get('flags')}")
-        except Exception as e:                                      # 失敗＝旧状態へ復元。**復元経路は全て guard**し
-            # 末尾の bare raise で**元例外を必ず伝播**する（復元側の二次例外で元例外を握り潰さない）。
-            # 「Neo4j load 成功後に PG replace 段階で失敗して例外化」する経路があるため、失敗が
-            # Neo4j commit 後だと Neo4j＝新 root のまま残る。PG replace は単一 tx なので失敗時ロールバックで
-            # 台帳は旧のまま無傷＝直すべきは Neo4j のみ。復元の順序と原子性が肝:
-            #  ① **bind を旧へ＋last_sig 無効化を同一 tx で先に確定**（`restore_bind_invalidate_sig`）。
-            #     これで「bind=旧なら sig は必ず無効化済み」＝次回 sync が必ず self-heal する不変条件を保証。
-            #     tx 失敗（PG 断）時はどちらも未適用＝bind=新のまま＝PG 復旧後の sync が新へ収束（整合）。
-            #  ② 旧派生を復元（best-effort）。 ③ 旧 root から即時再構築で Neo4j を旧へ戻し sig を正しい値へ
-            #     （best-effort・冪等）。失敗しても ① で sig は無効化済み＝次回 sync が self-heal。
+        except Exception as e:  # 失敗＝旧状態へ復元（元例外は末尾の bare raise で必ず伝播する）
+            # 復元の順序: ① bind を旧へ戻すのと `last_sig` 無効化を同一 tx で先に確定する（`restore_bind_invalidate_sig`・bind=旧なら sig は必ず無効化済み）。
+            # tx が失敗（PG 断）したらどちらも未適用で bind=新のまま、PG 復旧後の sync が新へ収束する。② 旧派生を復元（best-effort）。③ 旧 root から即時再構築して Neo4j を旧へ戻す（best-effort・冪等）。
+            # 復元側の二次例外で元例外を握りつぶさない
             if attempt_pending is None:
                 attempt_pending = getattr(e, "_sherpa_ingest_run_pending", None)
             bind_restored = False
@@ -1054,24 +829,18 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
                 bind_restored = True
             except Exception:
                 pass
-            # 旧派生の復元と旧 root 再構築は **bind が旧へ戻った時だけ**行う。
-            # bind 復元（＝sig 無効化と同一 tx）が失敗（PG 断）した場合は bind＝新 root のままで、その世界の
-            # 正しい終状態は「新 root で整合」＝旧派生 A を戻すと新 root B に A の semantic 等が混入して逆に
-            # 不整合になる。よって bind 未復元時は**何も足さず**、bind＝新・派生＝新のまま次回
-            # sync が新 root へ収束するのに委ねる。
+            # ② ③ は bind が旧へ戻った時だけ行う（bind 未復元で旧派生を戻すと新 root に旧派生が混入する）
             recovery_pending = None
             recovery_ok = False
             if bind_restored:
                 if backup is not None:
                     try:
-                        shutil.rmtree(der, ignore_errors=True)     # 途中まで作った新派生を捨て
-                        _os.replace(backup, der)                   # 旧派生を完全復元
+                        shutil.rmtree(der, ignore_errors=True)  # 途中まで作った新派生を捨てる
+                        _os.replace(backup, der)  # 旧派生を完全復元
                     except Exception:
                         pass
                 try:
-                    # 旧 root から即時再構築（Neo4j を旧へ戻す・best-effort）。署名の確定/無効化は
-                    # `_run_locked` 内部が行う（HIGH-A: ここで外側スキャンを再確定に使うと ABA 恒久
-                    # 不整合の穴になる＝呼び出しの副作用だけを使い、戻り値の sig 系は参照しない）。
+                    # 旧 root から即時再構築（Neo4j を旧へ戻す）。署名の確定／無効化は `_run_locked` 内部が行う（戻り値の sig 系は参照しない）
                     res2 = worker._run_locked(world_id, reflect=reflect,
                                               created_by="admin", scan_root=None,
                                               run_id=run_id, on_run_id=on_run_id, finalize=not defer_finalize,
@@ -1082,11 +851,7 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
                 except Exception as e2:
                     if defer_finalize:
                         recovery_pending = getattr(e2, "_sherpa_ingest_run_pending", None)
-            # 受付run自身の終端確定は復旧結果が判明した後にここで一度だけ行う。復旧（旧root再構築）が
-            # 成功していればその snapshot を、そうでなければ新root試行の snapshot を温存し、
-            # status だけ failed へ・reason で bind 復元＋旧root再構築の成否を区別する（利用者向けの
-            # 意味は常に「rebind は失敗し旧状態へ戻した／戻せなかった」であり、`_run_locked` が
-            # 内部的に書いた「成功」をそのまま見せると rebind が成功したかのように誤解させる）。
+            # 受付 run の終端確定は復旧結果が判明した後に 1 回だけ行う。採用した内部段の snapshot を残して status だけ `failed` にし、reason で復元の成否を区別する
             if defer_finalize:
                 reason = ("rebind_failed_rolled_back" if (bind_restored and recovery_ok)
                          else "rebind_rollback_failed")
@@ -1103,46 +868,25 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
                         "rebind 失敗の run 記録に失敗しました（best-effort）: world_id=%s",
                         world_id, exc_info=True)
             raise
-        if backup is not None:                                      # 成功＝退避した旧派生を破棄（新 root に混入させない）
+        if backup is not None:  # 成功＝退避した旧派生を破棄
             shutil.rmtree(backup, ignore_errors=True)
-        # 署名（last_sig/manifest）の確定は `_run_locked` 内部が既に行っている（HIGH-A）＝ここで改めて
-        # 確定/上書きしない（外側の古い署名で上書きすると ABA 恒久不整合の穴になる）。
+        # 署名の確定は `_run_locked` 内部が済ませている（ここで上書きしない）
         if defer_finalize:
             res["run"] = _finalize_pending_run(run_id, world_id, res["_pending_finalize"])
         return res
 
 
 def delete(world_id: str, reflect=True, run_id=None) -> bool:
-    """world を完全削除（派生物 wipe ＋ レジストリ行削除）。参照元（外部フォルダ）は消さない。
-
-    `_wipe_locked` は Neo4j 削除失敗時に例外を投げる（fail-closed）ので、**グラフ削除に成功した時だけ**行を削除する。
-
-    **world_lock は外側で1回だけ取得**（R3-S3）: wipe とレジストリ行削除を同じロック区間に収め、
-    同時実行の run/rebind と直列化する（`worker.wipe_world` を経由すると自己デッドロックするため
-    lock-free の `_wipe_locked` を直接呼ぶ）。
-
-    `run_id`（ING-3）＝呼び出し元が受付時に O(1) で確保済みの `ingest_runs` 行。指定時は
-    world レジストリ行の DELETE と run 完了 UPDATE を**同一トランザクション**（
-    `store.finish_ingest_run_and_confirm_world` ...ではなく専用の
-    `store.finish_ingest_run_and_delete_world`）で確定する——「world 行は消えたが run はまだ
-    'extracting' のまま」という中間状態を作らない。省略時（直接呼び出し・テスト用）は従来どおり
-    `store.delete_world_row` を単独で呼ぶ。
-
-    行削除に成功したら `preview_service` のグラフ view キャッシュも即座に破棄する——
-    `last_sig` が空になる次回読み取りでも自然に無効化されるが、同じ world_id を直後に再登録して
-    たまたま同じ内容（同じ sig）に確定した場合の取り違えを待たずに断つ（防御的二重化）。
-    この破棄は `preview_service._GRAPH_VIEW_LOCK` を取ってから行う——素の pop だと、並行中の
-    `graph_view()` 側が削除**前**に読んだ世代で構築を終えて `_GRAPH_VIEW_CACHE` へ書き込む瞬間と
-    競合し、pop の**後**にその古い view が再挿入されて残ってしまう窓ができる（DB 行削除自体は
-    この時点で既に確定済みなので、同じロックの下でどちらが先でも最終的に正しい状態になる——
-    後から入る構築側は世代不一致で公開しない、後から入る pop 側は単に消す）。
-    `build_preview` はこの**同じ** `_GRAPH_VIEW_CACHE` を共有する（
-    `preview_service._get_graph_bundle` 参照）ため、この破棄1本で両方に効く。
+    """資料フォルダを完全削除する（派生物 wipe ＋ レジストリ行削除）。参照元（外部フォルダ）は消さない。
+    `_wipe_locked` は Neo4j 削除失敗時に例外を投げる（fail-closed）ので、グラフ削除に成功した時だけ行を削除する。
+    `world_lock` は外側で 1 回だけ取り、wipe と行削除を同じ区間に収める（lock-free の `_wipe_locked` を直接呼ぶ）。
+    `run_id`: 受付時に確保済みの `ingest_runs` 行。指定時は行の DELETE と run 完了 UPDATE を `store.finish_ingest_run_and_delete_world` で同一トランザクションにする。省略時は `store.delete_world_row`。
+    行削除に成功したら、`preview_service._GRAPH_VIEW_LOCK` を取ってグラフ view キャッシュ（`build_preview` と共有）を破棄する（並行中の構築が古い view を再挿入するのを防ぐ）。
     """
     from . import store
     from .ingest import worker
     with store.world_lock(world_id):
-        worker._wipe_locked(world_id, reflect=reflect)          # 失敗なら例外＝行も run の terminal 化もしない
+        worker._wipe_locked(world_id, reflect=reflect)  # 失敗なら例外＝行も run の terminal 化もしない
         if run_id is not None:
             _rec, ok = store.finish_ingest_run_and_delete_world(
                 run_id, world_id, status="auto_published",
@@ -1154,7 +898,7 @@ def delete(world_id: str, reflect=True, run_id=None) -> bool:
         with preview_service._GRAPH_VIEW_LOCK:
             preview_service._GRAPH_VIEW_CACHE.pop(world_id, None)
     try:
-        from . import reconcile                                 # 削除後に孤児派生物を自動掃除（ES delete が落ちていた等の取りこぼしを回収・不可視）
+        from . import reconcile  # 削除後に孤児派生物を自動掃除する
         reconcile.reconcile_derivatives(reflect=reflect)
     except Exception:
         pass

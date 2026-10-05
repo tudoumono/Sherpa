@@ -1,14 +1,7 @@
-"""回答 JSON（`messages.answer`）から `turn_metrics`/`turn_tool_stats`（集計専用の細い写像表・
-`docs/archive/2026-09-23-利用統計の刷新.md` §3.1/§4 が正典）への書込。
-
-正本は引き続き `messages.answer`（JSONB・全文）。本モジュールが書く2表はそこから**再生成できる
-派生物**——集計クエリを索引付きで速くするためのコピーであり、単一真実源ではない。
-`metrics_from_answer()` が唯一の写像元（answer dict → 列値 dict の純関数・DB を触らない）。
-
-読み方（トークンの取り方・limits/claims の語彙）は `store/usage.py` の既存の集計定義に合わせる
-——数え方がずれると新旧の集計値が食い違う。`_USAGE_LIMIT_INT_FIELDS`/`_USAGE_LIMIT_BOOL_FIELDS`/
-`_CLAIM_STATUS_KEYS` は usage.py から import する（同じ store パッケージ内なので `store は他の
-sherpa.* を import しない` 原則には抵触しない・値のドリフトを防ぐ単一の真実源）。
+"""回答 JSON（`messages.answer`）から `turn_metrics`/`turn_tool_stats`（集計専用の細い写像表）への書込。
+正本は `messages.answer` で、2表はそこから再生成できる派生物。`metrics_from_answer()` が唯一の写像元（answer dict → 列値 dict の純関数）。
+トークンの取り方・limits/claims の語彙は `store/usage.py` の集計定義に合わせ、`_USAGE_LIMIT_INT_FIELDS`/`_USAGE_LIMIT_BOOL_FIELDS`/`_CLAIM_STATUS_KEYS` は usage.py から import する。
+設計: docs/design/usage.md「`turn_metrics`（1 assistant 回答＝1行）」
 """
 from __future__ import annotations
 
@@ -21,25 +14,16 @@ from .usage import _CLAIM_STATUS_KEYS, _USAGE_LIMIT_BOOL_FIELDS, _USAGE_LIMIT_IN
 
 _log = logging.getLogger("sherpa")
 
-# metrics_from_answer() 自体の写像規則の版。規則を変えたら上げる——`turn_metrics.mapping_version`
-# 列に残るため、規則変更前後の行を区別できる（過去行の再解釈可否の判断材料）。
+# `metrics_from_answer()` の写像規則の版。規則を変えたら上げる（`turn_metrics.mapping_version` 列に残る）。
 MAPPING_VERSION = 1
 
-# `answer["activity"]`（§3.1）の契約版。これ以外（欠落・不一致）は「activity 無し」として
-# 全面的に旧フィールドへフォールバックする（部分的に信用しない＝壊れた envelope を都合よく
-# 読み替えない）。
+# `answer["activity"]` の契約版。これ以外は「activity 無し」として全面的に旧フィールドへフォールバックする。
 _ACTIVITY_SCHEMA_VERSION = 1
 
-# `codex_usage_children`/`codex_usage_breakdown.children`（既存フィールド）のトークン4種のキー
-# （`providers/codex/provider.py::_CHILD_USAGE_KEYS` と同じ語彙）。store は provider 層を
-# import しない（leaf 原則・循環 import 回避）ため値を直接持つ——4値は `_usage_meta` の標準形
-# として複数箇所に既に複製されている定数で、ここでの複製も同じ扱い。
+# `codex_usage_children`/`codex_usage_breakdown.children` のトークン4種のキー（`providers/codex/provider.py::_CHILD_USAGE_KEYS` と同じ語彙・store は provider 層を import しない）。
 _TOKEN_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
 
-# metrics_from_answer() が返す列名のうち、identity 列（message_id/conversation_id/
-# user_message_id/user_id/world/created_at/lens/personal・upsert() が呼び出し元コンテキストや
-# 補助 SELECT から直接埋める）を除いた全列。INSERT/UPDATE 文を1箇所（このタプル）から機械的に
-# 組み立てる（列の手書き重複を避ける）。
+# `metrics_from_answer()` が返す列名から identity 列（message_id/conversation_id/user_message_id/user_id/world/created_at/lens/personal）を除いた全列（INSERT/UPDATE 文の組み立て用）。
 _METRIC_COLUMNS = (
     "provider", "model", "depth_profile", "reasoning", "app_version",
     "stop_kind", "codex_error_code", "duration_ms",
@@ -60,16 +44,15 @@ _METRIC_COLUMNS = (
     "mapping_source", "mapping_version",
 )
 
-# JSONB 列（psycopg へ渡す際 Json(...) で包む必要がある列。他は int/str/bool/None のスカラー）。
+# JSONB 列（`Json(...)` で包んで渡す列）。
 _JSONB_COLUMNS = frozenset({"investigation_counts", "claims_unknown_reasons",
                             "gate_missing_codes", "activity_json"})
 
 
-# ---- 小さな防御的読み取りヘルパ（answer は外部由来の JSON なので型を信用しない） ----
+# answer は外部由来の JSON なので型を信用しない防御的読み取りヘルパ。
 
 def _clamp_int(v, default: int = 0) -> int:
-    """非負整数として解釈できる値だけを通す（bool は int のサブクラスなので明示的に除外——
-    既存の `_usage_tok`/`_usage_limit_int` と同じ防御思想）。それ以外は `default`。"""
+    """非負整数として解釈できる値だけを通す（bool は除外）。それ以外は `default`。"""
     if isinstance(v, bool):
         return default
     if isinstance(v, int) and v >= 0:
@@ -95,8 +78,7 @@ def _bool_or_none(v) -> bool | None:
 
 
 def _activity_dict(answer: dict) -> dict | None:
-    """`answer["activity"]` が §3.1 契約どおりの形（`v==1` かつ `agents` が配列）なら返す。
-    そうでなければ None（呼び出し側は全面的に旧フィールドへフォールバックする）。"""
+    """`answer["activity"]` が契約どおりの形（`v==1` かつ `agents` が配列）なら返し、そうでなければ None（呼び出し側は旧フィールドへフォールバックする）。"""
     a = answer.get("activity")
     if not isinstance(a, dict) or a.get("v") != _ACTIVITY_SCHEMA_VERSION:
         return None
@@ -112,8 +94,7 @@ def _agent_tokens(agent: dict) -> dict:
 
 
 def _sum_tokens(agents: list, *, role: str | None) -> dict:
-    """`agents`（activity の配列）のうち role 一致分（role=None なら全件）のトークンを合算する。
-    非 dict の要素は無視する。"""
+    """`agents`（activity の配列）のうち role 一致分（role=None なら全件）のトークンを合算する。非 dict の要素は無視する。"""
     out = {k: 0 for k in _TOKEN_KEYS}
     for agent in agents:
         if not isinstance(agent, dict):
@@ -135,10 +116,8 @@ def _find_parent_agent(agents: list) -> dict | None:
 
 def _activity_aggregates(agents: list) -> tuple[int, int, int, int]:
     """`(tool_calls_total, tool_result_bytes_total, api_rounds_total, compactions_total)`。
-    ツール呼出数・結果バイトは全エージェント×全ツールの合算、往復数・圧縮回数は全エージェントの
-    `rounds`/`compactions` 配列長の合算。`bytes` キーの無いツール（`_tool_stat_rows` 参照）は
-    合算では 0 扱い（`_clamp_int`）——欠落ツールの分だけ合計が過小になるが、値自体を欠くわけ
-    ではない（1ツールごとの実際の欠落は `turn_tool_stats.bytes_total` の NULL で見分けられる）。"""
+    ツール呼出数・結果バイトは全エージェント×全ツールの合算（`bytes` キーの無いツールは 0 扱い）、往復数・圧縮回数は全エージェントの `rounds`/`compactions` 配列長の合算。
+    """
     tool_calls = 0
     tool_bytes = 0
     rounds_total = 0
@@ -162,14 +141,9 @@ def _activity_aggregates(agents: list) -> tuple[int, int, int, int]:
 
 
 def _tool_stat_rows(agents: list) -> list[tuple]:
-    """`(agent_index, role, tool, calls, bytes_total, max_bytes, clipped, truncated, errors, ms)`
-    のタプル列。`agent_index` は `agents` 配列の添字（0始まり・parent が通常先頭）。
-
-    `calls` だけは常に測定される（0 既定）。`bytes_total`/`max_bytes`/`clipped`/`truncated`/
-    `errors`/`ms` はキーが無ければ NULL——Codex 組み込みツール（function_call/custom_tool_call/
-    tool_search/web_search）は測っていないこれらのキーを activity に置かない契約（§3.1）のため、
-    欠落を 0 で埋めない（`web_search` は結果の大きさを取れず calls のみのエントリになる）。
-    MCP ツールは全キーが揃って来るのでこれまでどおり実測値が入る。"""
+    """`(agent_index, role, tool, calls, bytes_total, max_bytes, clipped, truncated, errors, ms)` のタプル列。`agent_index` は `agents` 配列の添字（0始まり）。
+    `calls` は常に測定される（0 既定）。それ以外はキーが無ければ NULL（Codex 組み込みツールは測っていないキーを置かない契約のため、0 で埋めない）。
+    """
     rows: list[tuple] = []
     for idx, agent in enumerate(agents):
         if not isinstance(agent, dict):
@@ -192,11 +166,7 @@ def _tool_stat_rows(agents: list) -> list[tuple]:
 
 
 def _limit_fields(limits) -> dict:
-    """`_USAGE_LIMIT_INT_FIELDS`/`_USAGE_LIMIT_BOOL_FIELDS` の12項目を answer["limits"] から読む。
-    `limits` 自体が dict でなければ全項目 None（「この打ち切り計測が無い」＝取れない）。dict が
-    存在すれば項目ごとに数値/真偽へクランプ（欠落・非数値は 0/false——`limits` という区画自体は
-    観測されている以上、その中の未設定項目は「起きなかった」の確定値として扱う。usage.py の
-    `_usage_limit_int`/`_usage_limit_bool` と同じ既定＝集計側とずれない）。"""
+    """`_USAGE_LIMIT_INT_FIELDS`/`_USAGE_LIMIT_BOOL_FIELDS` の12項目を answer["limits"] から読む。`limits` が dict でなければ全項目 None（計測なし）。dict があれば項目ごとに数値/真偽へクランプし、欠落・非数値は 0/false（usage.py と同じ既定）。"""
     if not isinstance(limits, dict):
         return {f: None for f in (_USAGE_LIMIT_INT_FIELDS + _USAGE_LIMIT_BOOL_FIELDS)}
     out = {f: _clamp_int(limits.get(f)) for f in _USAGE_LIMIT_INT_FIELDS}
@@ -205,8 +175,7 @@ def _limit_fields(limits) -> dict:
 
 
 def _claim_counts(data) -> dict:
-    """`answer["data"]["claims"]`（配列）から `_CLAIM_STATUS_KEYS` 別件数。配列でなければ全 None
-    （claims 自体を持たないターン＝旧回答・巡を持たない経路等）。"""
+    """`answer["data"]["claims"]`（配列）から `_CLAIM_STATUS_KEYS` 別件数。配列でなければ全 None。"""
     claims = data.get("claims") if isinstance(data, dict) else None
     if not isinstance(claims, list):
         return {f"claims_{k}": None for k in _CLAIM_STATUS_KEYS}
@@ -218,10 +187,7 @@ def _claim_counts(data) -> dict:
 
 
 def _claims_unknown_reasons(data) -> dict | None:
-    """status='unknown' の主張を reason_code 別に数える（`usage.py::_compute_final_reason_codes`
-    と同じ規則: reason_code が空なら 'unknown'、文字列でなければ飛ばす）。data.claims が配列で
-    なければ None。閉じた語彙は上流で保証済み（`investigation_state._CLAIM_UNKNOWN_REASON_CODES`）
-    ——ここでは検証しない。"""
+    """status='unknown' の主張を reason_code 別に数える（`tests/_usage_reference.py` の参照実装と同じ規則: 空なら 'unknown'、文字列でなければ飛ばす）。data.claims が配列でなければ None。"""
     claims = data.get("claims") if isinstance(data, dict) else None
     if not isinstance(claims, list):
         return None
@@ -237,10 +203,7 @@ def _claims_unknown_reasons(data) -> dict | None:
 
 
 def _gate_missing_codes(data) -> dict | None:
-    """`answer["data"]["evidence_gate"]["missing_codes"]` を件数化する
-    （`usage.py::_compute_final_missing_codes` と同じ規則: 空でない文字列だけを数える）。配列で
-    なければ None。閉じた語彙は上流で保証済み（`providers/base.py::_MISSING_CODES`）——ここでは
-    検証しない。"""
+    """`answer["data"]["evidence_gate"]["missing_codes"]` を件数化する（`tests/_usage_reference.py` の参照実装と同じ規則: 空でない文字列だけを数える）。配列でなければ None。"""
     gate = data.get("evidence_gate") if isinstance(data, dict) else None
     codes = gate.get("missing_codes") if isinstance(gate, dict) else None
     if not isinstance(codes, list):
@@ -253,11 +216,7 @@ def _gate_missing_codes(data) -> dict | None:
 
 
 def _investigation_fields(investigation) -> dict:
-    """`answer["investigation"]`（provider.py が組み立てる辞書）から complete／継続回数／
-    `investigation_counts`（**終端状態の件数のみ**・`counts`＝terminal_counts をそのまま）を読む。
-    非終端・不正・欠落の id 一覧（`non_terminal`/`invalid`/`missing`）は先頭50件に切り詰められて
-    おり全体の項目数を確定できない（未完了の台帳では過小な値になる）ため、項目数の列は持たない。
-    """
+    """`answer["investigation"]` から complete／継続回数／`investigation_counts`（終端状態の件数のみ）を読む。非終端・不正・欠落の id 一覧は先頭50件に切り詰められているため、項目数の列は持たない。"""
     if not isinstance(investigation, dict):
         return {"investigation_complete": None, "investigation_continuations": None,
                 "investigation_counts": None}
@@ -275,57 +234,18 @@ def _investigation_fields(investigation) -> dict:
 
 
 def _sources_count(answer: dict) -> int:
-    """出典件数（`answer["sources"]` の配列長）。非配列/欠落は 0。
-
-    「根拠なし」（usage.py の zero_hit）はここでは判定しない——その定義は assistant メッセージの
-    `lens` 列（`messages.lens`・行の識別情報であり `answer` の中身ではない）と本列の組で決まるため、
-    turn_metrics には出典件数だけを置き、判定は読み出し側（lens 列と sources_count 列を持つ集計）に委ねる。
-    """
+    """出典件数（`answer["sources"]` の配列長・非配列/欠落は 0）。「根拠なし」の判定は読み出し側（lens 列と sources_count 列）が行う。"""
     sources = answer.get("sources")
     return len(sources) if isinstance(sources, list) else 0
 
 
 def metrics_from_answer(answer: dict) -> dict:
-    """回答1件（`messages.answer` の中身）→ `turn_metrics`/写像列の辞書への純粋な写像。
-
-    DB を一切触らない（identity 列＝message_id/conversation_id/user_message_id/user_id/world/
-    created_at/lens/personal は呼び出し元コンテキストや補助 SELECT 由来であり、本関数の対象外
-    ——`upsert()` 側が付与する）。
-
-    **優先順位と NULL の規則**（本関数全体の唯一の規則）:
-      `answer["activity"]`（§3.1・`v==1` かつ `agents` が配列の場合のみ「有効」とみなす）が
-      有効なら、そこから求まる値（トークン4種の合計・本体/下調べ役の内訳・下調べ役の数・
-      ツール呼出数/結果バイト・API往復数・圧縮回数・所要の内訳・アプリの版）を使い、
-      `activity_json` に検証済みの activity をそのまま保持する。無効/欠落なら、対応する
-      **旧フィールド**（`answer["usage"]`・`answer["usage"]["codex_usage_breakdown"]`・
-      `answer["codex_usage_children"]`）へ全面的にフォールバックし、`activity_json` は NULL。
-      （部分的な混在はしない＝どちらの世代の値かが列ごとに変わると突合が壊れるため）。
-      トークン合計を activity 優先にする理由: 失敗したターン（`context_window_exceeded` 等）は
-      `answer["usage"]` が 0 のまま保存されるが、activity はセッション記録から実消費を拾える。
-
-      「取れない値」（該当する区画（`usage`/`limits`/`activity`/`investigation`/`data.claims`）
-      自体が丸ごと欠けている）は **NULL**、「区画はあるが個々の項目が無い/不正」は既存
-      集計（usage.py）と同じ既定（int=0・bool=false）に倒す——0 と「不明」を区別する
-      （区画の有無＝計測されたかどうかの証拠、項目値の有無＝その計測の中身）。
-      `turn_tool_stats` の `bytes_total`/`max_bytes`/`clipped`/`truncated`/`errors`/`ms` は
-      この既定の例外で、ツール1件ごとにキーが無ければ NULL（Codex 組み込みツールは測っていない
-      キーを置かない契約のため・`web_search` は結果の大きさを取れず calls だけのエントリになる）。
-      `calls` だけは常に測定されるので 0 既定のまま（`_tool_stat_rows` 参照）。`turn_metrics.
-      tool_result_bytes_total`（全ツールの合算）はキーの無いツールを 0 として合算するため
-      （`_activity_aggregates` 参照）、合計値自体には影響しない。
-
-      `provider`/`model`/`depth_profile`/`reasoning` は常に `answer["usage"]` から読む
-      （新旧どちらの回答でも同じ場所にあり、activity 優先の対象外）。
-      `_USAGE_LIMIT_INT_FIELDS`/`_USAGE_LIMIT_BOOL_FIELDS`（打ち切りの内訳12項目）は常に
-      `answer["limits"]` から読む（activity のスキーマに含まれないため）。
-      `sources_count`/`claims_*`/`claims_unknown_reasons`/`gate_missing_codes`/
-      `investigation_*`/`stop_kind`/`codex_error_code`/`duration_ms` も同様に activity を
-      経由しない既存の場所（`answer` 直下・`answer["data"]["claims"]`・
-      `answer["data"]["evidence_gate"]["missing_codes"]`）から読む。
-
-    本文・タイトル・資料名・ツール引数は列として個別には読まない。`activity_json` だけは
-    例外的に activity（§3.1）を丸ごと保持するが、その契約自体に引数・本文・資料名を
-    含めないことが上流（S1）の取り決めであり、本関数はそれを信頼して検証しない。
+    """回答1件（`messages.answer` の中身）→ `turn_metrics`/写像列の辞書への純粋な写像（DB を触らない）。identity 列は `upsert()` が付与する。
+    優先順位と NULL の規則:
+    - `answer["activity"]`（`v==1` かつ `agents` が配列のときだけ有効）が有効なら、トークン4種の合計・本体/下調べ役の内訳・下調べ役の数・ツール呼出数/結果バイト・API往復数・圧縮回数・所要の内訳・アプリの版をそこから求め、`activity_json` に保持する。無効/欠落なら旧フィールド（`answer["usage"]`・`codex_usage_breakdown`・`codex_usage_children`）へ全面的にフォールバックし、`activity_json` は NULL（部分的な混在はしない）。
+    - 該当する区画（`usage`/`limits`/`activity`/`investigation`/`data.claims`）が丸ごと欠けていれば NULL、区画はあるが項目が無い/不正なら int=0・bool=false（usage.py と同じ既定）。例外として `turn_tool_stats` の `bytes_total` 等は、ツール1件ごとにキーが無ければ NULL。
+    - `provider`/`model`/`depth_profile`/`reasoning` は常に `answer["usage"]` から、打ち切り12項目は常に `answer["limits"]` から、`sources_count`/`claims_*`/`gate_missing_codes`/`investigation_*`/`stop_kind`/`codex_error_code`/`duration_ms` は activity を経由しない既存の場所から読む。
+    本文・タイトル・資料名・ツール引数は列として読まない（`activity_json` はそれらを含まない契約を信頼して保持する）。
     """
     if not isinstance(answer, dict):
         raise TypeError("metrics_from_answer: answer は dict である必要があります")
@@ -337,16 +257,16 @@ def metrics_from_answer(answer: dict) -> dict:
 
     out: dict = {}
 
-    # ---- 経路・モデル・深さ・推論（常に usage 由来・新旧共通） ----
+    # 経路・モデル・深さ・推論（常に usage 由来）。
     out["provider"] = _str_or_none(usage.get("provider")) if usage else None
     out["model"] = _str_or_none(usage.get("model")) if usage else None
     out["depth_profile"] = _str_or_none(usage.get("depth_profile")) if usage else None
     out["reasoning"] = _str_or_none(usage.get("reasoning")) if usage else None
 
-    # ---- アプリの版（activity にしか無い） ----
+    # アプリの版（activity にしか無い）。
     out["app_version"] = _str_or_none(activity.get("app_version")) if activity else None
 
-    # ---- 終了理由・エラー・所要 ----
+    # 終了理由・エラー・所要。
     out["stop_kind"] = _str_or_none(answer.get("stop_kind"))
     out["codex_error_code"] = _str_or_none(answer.get("codex_error_code"))
     out["duration_ms"] = _pos_int_or_none(answer.get("duration_ms"))
@@ -356,7 +276,7 @@ def metrics_from_answer(answer: dict) -> dict:
     out["phase_agent_ms"] = _pos_int_or_none(phases.get("agent")) if activity else None
     out["phase_post_ms"] = _pos_int_or_none(phases.get("post")) if activity else None
 
-    # ---- トークン4種: 合計・本体（parent）内訳・下調べ役（child）内訳 ----
+    # トークン4種: 合計・本体（parent）内訳・下調べ役（child）内訳。
     breakdown = usage.get("codex_usage_breakdown") if usage else None
     breakdown = breakdown if isinstance(breakdown, dict) else None
     children = answer.get("codex_usage_children")
@@ -384,7 +304,7 @@ def metrics_from_answer(answer: dict) -> dict:
             for k in _TOKEN_KEYS:
                 out[f"parent_{k}"] = _clamp_int(breakdown["parent"].get(k))
         else:
-            # breakdown が無い＝下調べ役の内訳自体が計測されていない＝usage 全体が本体分。
+            # breakdown が無ければ下調べ役の内訳は未計測で、usage 全体が本体分。
             for k in _TOKEN_KEYS:
                 out[f"parent_{k}"] = out[k]
         if breakdown is not None and isinstance(breakdown.get("children"), dict):
@@ -402,10 +322,7 @@ def metrics_from_answer(answer: dict) -> dict:
             out[f"parent_{k}"] = None
             out[f"child_{k}"] = None
 
-    # ---- 下調べ役の数（検出・usage 取得・欠落） ----
-    # `codex_usage_children`（found/missing の明示的な区別を持つ唯一の場所）を優先する。
-    # 無ければ activity の agents 配列から role=='child' の件数を数える——この場合、配列に
-    # 載っている＝usage を取得できた分のみなので「欠落」件数は分からず None のまま。
+    # 下調べ役の数（検出・usage 取得・欠落）。`codex_usage_children`（found/missing を区別する唯一の場所）を優先し、無ければ activity の role=='child' の件数（欠落は不明のまま None）。
     if children is not None:
         found = _clamp_int(children.get("found"))
         missing = _clamp_int(children.get("missing"))
@@ -422,7 +339,7 @@ def metrics_from_answer(answer: dict) -> dict:
         out["children_usage_found"] = None
         out["children_usage_missing"] = None
 
-    # ---- ツール呼出数・結果バイト・API往復数・圧縮回数（activity にしか無い） ----
+    # ツール呼出数・結果バイト・API往復数・圧縮回数（activity にしか無い）。
     if agents is not None:
         tool_calls, tool_bytes, rounds_total, compactions_total = _activity_aggregates(agents)
         out["tool_calls_total"] = tool_calls
@@ -435,28 +352,25 @@ def metrics_from_answer(answer: dict) -> dict:
         out["api_rounds_total"] = None
         out["compactions_total"] = None
 
-    # ---- 打ち切りの内訳（常に answer["limits"] 由来） ----
+    # 打ち切りの内訳（常に answer["limits"] 由来）。
     out.update(_limit_fields(answer.get("limits")))
 
-    # ---- 出典件数 ----
+    # 出典件数。
     out["sources_count"] = _sources_count(answer)
 
-    # ---- 調査台帳 ----
+    # 調査台帳。
     out.update(_investigation_fields(answer.get("investigation")))
 
-    # ---- 主張の区分件数・不明の理由コード・最終ゲートの不足コード ----
+    # 主張の区分件数・不明の理由コード・最終ゲートの不足コード。
     data = answer.get("data")
     out.update(_claim_counts(data))
     out["claims_unknown_reasons"] = _claims_unknown_reasons(data)
     out["gate_missing_codes"] = _gate_missing_codes(data)
 
-    # ---- activity 全体（検証済みなら丸ごと保持） ----
-    # 詳細画面は本体の往復系列だけでなく下調べ役の系列・エージェント別モデル・圧縮位置・
-    # 実際に効いた設定（§2.2）も要るため、個別の列に分解せず activity をそのまま JSONB で持つ
-    # （§3.1 の契約により activity 自体に本文・資料名・ツール引数は入らない）。
+    # activity 全体（検証済みなら丸ごと保持）。
     out["activity_json"] = activity
 
-    # ---- 写像の由来・版 ----
+    # 写像の由来・版。
     out["mapping_source"] = "activity" if activity is not None else "answer_only"
     out["mapping_version"] = MAPPING_VERSION
 
@@ -469,21 +383,9 @@ def _tool_stats_values_sql(n: int) -> str:
 
 def upsert(c, *, message_id: int, conversation_id: int, created_at, lens: str | None,
           personal: bool, answer: dict) -> None:
-    """`turn_metrics`/`turn_tool_stats` を1メッセージ分、渡された接続 `c` で書く（呼び出し元の
-    トランザクションに乗る・commit/rollback は呼び出し元の責務）。
-
-    `user_message_id`（同じ会話でこの assistant より id が小さい直近の role='user' の id・
-    無ければ NULL）はここで1本の SELECT により求める——`store/usage.py::_USAGE_TURN_CTE` と同じ
-    「ターン＝user 発言」の対応付けに揃える（1ターンに assistant 行が複数あっても全員が同じ
-    user_message_id を指す）。`personal` はこのアシスタント回答自体が個人の資料を使ったか
-    （`chat_service._used_personal`）——usage.py の personal_turns（user 発言の personal 列）とは
-    別物で、対応する user 発言は user_message_id で引く。
-
-    冪等: `turn_metrics` は `message_id` 主キーの `ON CONFLICT DO UPDATE`。`turn_tool_stats` は
-    自然キーが無い（1メッセージに複数行）ため、まず該当 `message_id` を全削除してから
-    activity 由来の行を入れ直す（洗い替え＝再実行しても最終状態は同じ）。
-
-    例外はそのまま送出する（呼び出し元が savepoint 等で隔離する契約・`upsert_best_effort` 参照）。
+    """`turn_metrics`/`turn_tool_stats` を1メッセージ分、渡された接続 `c` で書く（commit/rollback は呼び出し元の責務）。
+    `user_message_id` は同じ会話で id が小さい直近の role='user' の id（無ければ NULL）で、`store/usage.py::_USAGE_TURN_CTE` と同じ「ターン＝user 発言」の対応付け。`personal` はこの回答自体が個人の資料を使ったか。
+    冪等: `turn_metrics` は `message_id` 主キーの `ON CONFLICT DO UPDATE`、`turn_tool_stats` は該当 `message_id` を全削除してから入れ直す。例外はそのまま送出する（呼び出し元が savepoint で隔離する）。
     """
     if not isinstance(answer, dict):
         raise TypeError("turn_metrics.upsert: answer は dict である必要があります")
@@ -541,14 +443,7 @@ def upsert(c, *, message_id: int, conversation_id: int, created_at, lens: str | 
 
 def upsert_best_effort(c, *, message_id: int, conversation_id: int, created_at, lens: str | None,
                        personal: bool, answer: dict) -> bool:
-    """`upsert()` を Postgres SAVEPOINT（`c.transaction()`）で保護して呼ぶ。
-
-    `turn_metrics`/`turn_tool_stats` は回答 JSON から再生成できる派生物であり、書込失敗を
-    呼び出し元のトランザクション（本体メッセージの保存等）へ伝播させない——欠けた行は
-    `ensure_rows()` が後で埋める。savepoint を使うのは、素の例外握りつぶしだと Postgres 側で
-    トランザクションが abort 状態のまま残り、呼び出し元の後続 commit まで失敗するため
-    （savepoint への rollback だけがこの汚染を防げる）。
-
+    """`upsert()` を Postgres SAVEPOINT（`c.transaction()`）で保護して呼ぶ。書込失敗を呼び出し元のトランザクションへ伝播させない（欠けた行は `ensure_rows()` が後で埋める）。
     戻り値: 成功なら True。失敗時は型名・errno のみ warning ログして False（本文・値は出さない）。
     """
     try:
@@ -563,18 +458,12 @@ def upsert_best_effort(c, *, message_id: int, conversation_id: int, created_at, 
         return False
 
 
-_BACKFILL_BATCH_SIZE = 500   # keyset ページングの1バッチ件数（fetchall で全件を一度に載せない）
+_BACKFILL_BATCH_SIZE = 500  # keyset ページングの1バッチ件数。
 
 
 def backfill_all() -> int:
-    """既存の全 assistant メッセージ（`answer` 有り）を `turn_metrics`/`turn_tool_stats` へ
-    一度だけ移す。`id` 昇順の keyset で `_BACKFILL_BATCH_SIZE` 件ずつ処理しバッチごとに commit する
-    （大きな messages 表を一括 fetchall/単一トランザクションにしない）。
-
-    冪等: `upsert` が `message_id` 主キーの `ON CONFLICT DO UPDATE`（`turn_tool_stats` は洗い替え）
-    のため、複数回実行しても行数・値は変わらない。
-
-    戻り値: 書込に成功した件数（失敗はスキップして次へ進む・`upsert_best_effort` が warning ログ）。
+    """既存の全 assistant メッセージ（`answer` 有り）を `turn_metrics`/`turn_tool_stats` へ一度だけ移す。`id` 昇順の keyset で `_BACKFILL_BATCH_SIZE` 件ずつ処理し、バッチごとに commit する。
+    冪等（`upsert` が `ON CONFLICT DO UPDATE`・`turn_tool_stats` は洗い替え）。戻り値は書込に成功した件数（失敗はスキップ）。
     """
     _ensure()
     processed = 0
@@ -600,19 +489,8 @@ def backfill_all() -> int:
 
 
 def ensure_rows(start_ts, end_ts) -> int:
-    """`turn_metrics` 行が無い assistant メッセージのうち、`[start_ts, end_ts)` の期間に属する
-    ターンを埋める——旧版のアプリで保存された・ライブ書込が失敗した等で欠けたターンを、
-    利用統計を開いたときに補う想定（`add_message` は同期で毎回呼ぶ・こちらは補完専用）。
-
-    「期間に属する」は `store/usage.py::_USAGE_TURN_CTE` と同じ基準（**質問＝user 発言の
-    created_at**）に揃える契約——回答は必ず質問より後なので、下限（`assistant.created_at >= start`）
-    のままで質問が期間内のターンを取りこぼさない。上限は `assistant.created_at < end` **または**
-    その assistant の直近の先行 user 発言（`user_message_id` と同じ決め方）の `created_at < end`
-    のどちらかが成り立てば対象にする——23:59 の質問に翌日00:01保存された回答のように、質問と
-    回答が期間の境をまたぐターンを取りこぼさないため（先行 user が無ければ assistant 自身の
-    created_at だけで判定する）。質問が期間よりわずかに前のターンの回答を余分に埋めることは
-    あるが、`turn_metrics` は answer から再生成できる派生物なので害はない。
-
+    """`turn_metrics` 行が無い assistant メッセージのうち、`[start_ts, end_ts)` の期間に属するターンを埋める（利用統計を開いたときの補完用）。
+    「期間に属する」は `store/usage.py::_USAGE_TURN_CTE` と同じ基準（質問＝user 発言の created_at）。上限は assistant 自身の created_at か直近の先行 user 発言の created_at のどちらかが `end` 未満なら対象にする（期間の境をまたぐターンを取りこぼさない）。
     `backfill_all()` と同じ keyset バッチ方式。戻り値は書込に成功した件数。
     """
     _ensure()
@@ -647,13 +525,8 @@ def ensure_rows(start_ts, end_ts) -> int:
 
 
 def backfill_missing() -> dict:
-    """`turn_metrics` 行が無い assistant メッセージ（`answer` 有り）だけを埋める（起動時の
-    自動補完用・全期間）。`backfill_all()` と違い、既に行があるメッセージは読まない・書き直さない。
-
-    冪等・再開可能: 行を持つメッセージは次回の対象から外れるため、中断（プロセス終了）後に
-    もう一度走らせると残りだけを処理する。`id` 昇順 keyset・バッチごとに commit。
-    書込失敗の行は `upsert_best_effort` が warning を残してスキップし、次回起動で再試行される。
-
+    """`turn_metrics` 行が無い assistant メッセージ（`answer` 有り）だけを埋める（起動時の自動補完用・全期間）。既に行があるメッセージは読まない。
+    冪等・再開可能（`id` 昇順 keyset・バッチごとに commit・失敗行は次回起動で再試行）。
     戻り値: `{"written": 書込に成功した件数, "failed": 失敗した件数}`。
     """
     _ensure()

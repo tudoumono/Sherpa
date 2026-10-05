@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# 運用の入口コマンド。`./sherpactl <道具> [オプション]` で scripts/ の運用スクリプトを呼ぶ
+# （make 経由だと -h などのオプションが make に取られるため）。道具の中身は作り直さず、
+# 引数を受けて渡すだけ。リポジトリ直下に sherpa/ パッケージがあるため名前は sherpactl。
+# macOS（bash 3.2）でも動く書き方に限る。
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+
+usage() {
+  cat <<'USAGE'
+使い方: ./sherpactl <道具> [オプション]
+
+道具:
+  logs    全ログ（アプリ＋ストア）を1画面で追う
+          ./sherpactl logs [名前…] [-n 行数] [-m] [-r] [-h]
+  trace   会話の流れを時刻順に書き出す（読み取りだけ）
+          ./sherpactl trace <会話ID[,ID…]> [--mask] [--mask-models] [-o 出力] [-h]
+  diag    解析用のログ回収バンドルを作る（dist/diag/・機密は含めない）
+          ./sherpactl diag [--days N] [--out ファイル] [--dry-run] [-h]
+  doctor  導入先の統合セットアップ検査（読み取り専用）
+          ./sherpactl doctor [--probe-cloud] [-h]
+
+例:
+  ./sherpactl logs convert embed -n 100   取り込みの2つのログを末尾100行から追う
+  ./sherpactl logs -h                     指定できる名前の一覧
+  ./sherpactl trace 136,137 --mask -o trace.txt
+  ./sherpactl diag --dry-run
+  ./sherpactl doctor --probe-cloud        課金プロバイダの実接続も確かめる
+
+make の書き方（make logs / make l / make trace CONV=… / make diag / make doctor）も使えます。
+USAGE
+}
+
+tool="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$tool" in
+  ""|-h|--help|help)
+    usage
+    ;;
+  logs)
+    for a in "$@"; do
+      if [ "$a" = "-f" ]; then
+        echo "-f には対応していません（logs は既定で追い続けます。止めるときは Ctrl-C）" >&2
+        exit 2
+      fi
+    done
+    exec "$ROOT/scripts/logs.sh" "$@"
+    ;;
+  trace)
+    conv="" out="" args=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --conv) [ $# -ge 2 ] || { echo "--conv には会話番号を指定してください" >&2; exit 2; }
+                conv="$2"; shift 2 ;;
+        -o|--out) [ $# -ge 2 ] || { echo "$1 には出力ファイルを指定してください" >&2; exit 2; }
+                  out="$2"; shift 2 ;;
+        --mask|--mask-models) args+=("$1"); shift ;;
+        -*) echo "知らないオプションです: $1（./sherpactl trace -h で使い方）" >&2; exit 2 ;;
+        *) if [ -z "$conv" ]; then conv="$1"; shift
+           else echo "会話番号は 1 つ（カンマ区切りで複数）で指定してください" >&2; exit 2; fi ;;
+      esac
+    done
+    case "$conv" in
+      ""|*[!0-9,]*)
+        echo "使い方: ./sherpactl trace <会話ID[,ID…]> [--mask] [--mask-models] [-o 出力]（会話番号は数字とカンマだけ）" >&2
+        exit 2 ;;
+    esac
+    set -- --conv "$conv" ${args[@]+"${args[@]}"}
+    if [ -n "$out" ]; then set -- "$@" --out "$out"; fi
+    exec "$ROOT/scripts/conversation-trace.sh" "$@"
+    ;;
+  diag)
+    exec "$ROOT/scripts/diag.sh" "$@"
+    ;;
+  doctor)
+    for a in "$@"; do
+      case "$a" in
+        -h|--help) usage; exit 0 ;;
+        --probe-cloud) export PROBE_CLOUD=1 ;;
+        *) echo "知らないオプションです: $a（./sherpactl doctor -h で使い方）" >&2; exit 2 ;;
+      esac
+    done
+    exec "$ROOT/scripts/doctor.sh"
+    ;;
+  *)
+    echo "知らない道具です: $tool" >&2
+    echo >&2
+    usage >&2
+    exit 2
+    ;;
+esac

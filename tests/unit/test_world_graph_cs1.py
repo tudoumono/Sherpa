@@ -113,3 +113,18 @@ def test_partial_class_split_across_two_files_is_dropped_in_both():
     partial_flags = {(f["from"]) for f in flags
                      if f.get("reason") == "dropped_syntax" and f.get("why") == "cs_partial"}
     assert partial_flags == {"Acme/Order/BatchJob.Part1.cs", "Acme/Order/BatchJob.Part2.cs"}
+
+
+def test_global_using_is_not_hidden_by_a_namespace_scoped_using_of_the_same_name(tmp_path):
+    """別ファイルの `global using Lib;` は、参照ファイルの namespace ブロックの中だけの `using Lib;` と同一視しない。"""
+    top = tmp_path / "w"
+    (top / "Lib").mkdir(parents=True)
+    (top / "G.cs").write_text("global using Lib;\n", encoding="utf-8")
+    (top / "Lib" / "T.cs").write_text("namespace Lib;\npublic class Target { }\n", encoding="utf-8")
+    (top / "Use.cs").write_text(
+        "namespace App\n{\n    using Lib;\n    public class A { private Target t; }\n}\n"
+        "namespace Other\n{\n    public class B { private Target t; }\n}\n", encoding="utf-8")
+    nodes, edges, _flags = world_graph.build_world(tmp_path, "gl")
+    by_cid = {n["cid"]: n["path"] for n in nodes}
+    got = {(by_cid[e["src"]], by_cid[e["dst"]], e.get("line")) for e in edges if e["type"] == "INVOKES"}
+    assert ("w/Use.cs", "w/Lib/T.cs", 4) in got and ("w/Use.cs", "w/Lib/T.cs", 8) in got

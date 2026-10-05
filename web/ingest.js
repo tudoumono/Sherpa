@@ -1,25 +1,22 @@
-// 資料（統合画面・S3-A）＝「資料フォルダの登録・取り込み」と「取り込み状況の確認」を1画面に統合。
-//   上＝資料フォルダ（登録フォーム＋登録済み一覧・差分/更新/削除。旧 ingest-new.js）
-//   下＝取り込み状況（文書一覧・状態・フォルダツリー・全文検索・原本DL。旧 M10・04-画面の原則.md §3.3）
-// 旧 ingest-new.html はこの画面へのリダイレクトに縮退（挙動は不変）。専門用語は出さず状態3つに集約。
-// XSS: 全データ esc()・インラインハンドラ無し（委譲）。API は相対パス。
+// 資料画面: 「資料フォルダの登録・取り込み」と「取り込み状況の確認」の統合画面。
+//   上＝資料フォルダ（登録フォーム＋登録済み一覧・差分/更新/削除）
+//   下＝取り込み状況（文書一覧・状態・フォルダツリー・全文検索・原本DL）
+// 設計: docs/design/rag.md「更新と削除」
+// 専門用語は出さず状態3つに集約。XSS: 全データ esc()・インラインハンドラ無し（委譲）。API は相対パス。
 'use strict';
 
-const $ = Sherpa.$, esc = Sherpa.esc, api = Sherpa.api, getJSON = Sherpa.getJSON, analyzerLabel = Sherpa.analyzerLabel;     // 共通ユーティリティ（nav.js・RV DRY）
+const $ = Sherpa.$, esc = Sherpa.esc, api = Sherpa.api, getJSON = Sherpa.getJSON, analyzerLabel = Sherpa.analyzerLabel;   // 共通ユーティリティ（nav.js）
 
-// UI フィードバック5（2026-07-03）: 読み込み中表示を統一（既存の .loading-inline/spinner 流儀）。
+// 読み込み中表示（既存の .loading-inline/spinner 流儀）。
 const _LOADING_INLINE = '<div class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>読み込み中...</span></div>';
 
 // =====================================================================
-// 上: 資料フォルダ（登録・一覧）＝旧 ingest-new.js。鏡モデル・専門用語ゼロ。
+// 上: 資料フォルダ（登録・一覧）。専門用語ゼロ。
 // フォルダを「選んで」追加／今すぐ更新（全削除して作り直し）／削除。パスは手入力させず picker で選ぶ。
 // =====================================================================
 
-// ---- /worlds 取得の共有（RV Med3・2026-07-08: 初期ロード時の loadList と下段セレクタ初期化の
-// 同時多発フェッチを1本化）。同じ tick 内の複数呼び出しは同一 Promise を返す（結果はキャッシュしない
-// ＝完了すれば次回呼び出しは必ず新規フェッチ＝mutation 後も古いデータを掴まない）。
-// 行ごとの /worlds/{id}/status（loadStat）は件数に比例するファンアウトの性質を持つが、これは旧
-// ingest-new 画面から不変のもの＝今回は対象外（据え置き・RV Med3）。
+// /worlds 取得の共有: 初期ロード時の loadList と下段セレクタ初期化の同時多発フェッチを1本化する。
+// 同じ tick 内の複数呼び出しは同一 Promise を返す（結果はキャッシュしない＝完了後の呼び出しは必ず新規フェッチ＝mutation 後も古いデータを掴まない）。
 let _worldsInFlight = null;
 function fetchWorldsShared() {
   if (!_worldsInFlight) {
@@ -31,8 +28,7 @@ function fetchWorldsShared() {
 }
 
 // ---- 登録中のフォルダ（単一World・登録済みなら1件だけ表示） ----
-// 資料フォルダは全体で1本（決定 2026-08-15）。未登録なら登録カード、登録済みなら現在のフォルダと
-// 操作（更新／削除）だけを出す＝更新の入口を1つにする。
+// 資料フォルダは全体で1本。未登録なら登録カード、登録済みなら現在のフォルダと操作（更新／削除）だけを出す（更新の入口を1つにする）。
 async function loadList() {
   $('list').setAttribute('aria-busy', 'true');
   $('list').innerHTML = '<div class="loading" role="status" style="padding:14px 0"><span class="spinner spinner-sm"></span><span>資料フォルダを読み込んでいます...</span></div>';
@@ -41,10 +37,12 @@ async function loadList() {
     const w = ws[0] || null;
     $('regcard').hidden = !!w;                          // 登録済みなら登録フォームは出さない
     $('currentcard').hidden = !w;
+    $('resolvecard').hidden = !w;
     if (!w) {
       $('list').innerHTML = '';
       return;
     }
+    loadResolveSettings(w.world_id);
     $('list').innerHTML = `<div class="row" data-wid="${esc(w.world_id)}" data-path="${esc(w.root_path)}">`
       + `<div class="rowmain"><span class="nm">${esc(w.label || w.world_id)}</span>`
       + `<span class="pth" title="${esc(w.root_path)}">${esc(w.root_path)}</span>`
@@ -60,6 +58,48 @@ async function loadList() {
     $('list').setAttribute('aria-busy', 'false');
   }
 }
+
+// ---- 資料の探し方の設定（COPY の取り込み元の場所・パスの別名）----
+let _resolveWid = null;
+function resolveMsg(html) { $('rs-msg').innerHTML = html; }
+async function loadResolveSettings(wid) {
+  _resolveWid = wid;
+  try {
+    const d = await api('GET', `/worlds/${encodeURIComponent(wid)}/resolve-settings`);
+    $('rs-copy').value = (d.copy_paths || []).join('\n');
+    $('rs-alias').value = Object.entries(d.path_aliases || {}).map(([k, v]) => `${k} = ${v}`).join('\n');
+    resolveMsg(resolveWarnings(d));
+  } catch (e) {
+    resolveMsg(`<span class="danger">設定を取得できません: ${esc(e.message)}</span>`);
+  }
+}
+function resolveWarnings(d) {
+  return (d.warnings || []).map((w) => `<div class="danger">※ ${esc(w)}</div>`).join('');
+}
+async function saveResolveSettings() {
+  if (!_resolveWid) return;
+  const copy_paths = $('rs-copy').value.split('\n').map((l) => l.trim()).filter(Boolean);
+  const path_aliases = {};
+  for (const line of $('rs-alias').value.split('\n').map((l) => l.trim()).filter(Boolean)) {
+    const i = line.indexOf('=');
+    if (i < 0) { resolveMsg(`<span class="danger">別名は「別名 = 場所」の形で書いてください: ${esc(line)}</span>`); return; }
+    path_aliases[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  if (!confirm('保存すると資料フォルダ全体を取り込み直します（時間がかかります）。保存しますか？')) return;
+  $('rs-save').disabled = true;
+  try {
+    const d = await api('PUT', `/worlds/${encodeURIComponent(_resolveWid)}/resolve-settings`, { copy_paths, path_aliases });
+    $('rs-copy').value = d.copy_paths.join('\n');
+    $('rs-alias').value = Object.entries(d.path_aliases).map(([k, v]) => `${k} = ${v}`).join('\n');
+    resolveMsg(`${d.changed && !d.refresh_started ? '⏳' : '✓'} ${esc(d.note)}${resolveWarnings(d)}`);
+    if (d.refresh_started) loadStat(_resolveWid);
+  } catch (e) {
+    resolveMsg(`<span class="danger">保存できません: ${esc(e.message)}</span>`);
+  } finally {
+    $('rs-save').disabled = false;
+  }
+}
+$('rs-save').addEventListener('click', saveResolveSettings);
 
 // ---- 追加 ----
 let _chosen = null;            // 追加フォーム用に選んだフォルダ path
@@ -77,15 +117,11 @@ async function register() {
   const path = _chosen, label = $('label').value.trim();
   $('regmsg').textContent = ''; $('regbtn').disabled = true; $('diffout').innerHTML = '';
   try {
-    // ING-3: 登録は即受付・取り込みは背景で継続する（`run_id`/`joined` のみ返る）。完了状況は
-    // 下段（取り込み状況）の行が数秒間隔でポーリングして表示する（`loadStat` 参照）。
+    // 登録は即受付・取り込みは背景で継続する（`run_id`/`joined` のみ返る）。完了状況は下段（取り込み状況）の行が数秒間隔でポーリングして表示する（`loadStat` 参照）。
     const res = await api('POST', '/worlds', { path, label: label || null });
     $('regmsg').innerHTML = `✓ ${esc(res.note)}`;
-    // ②是正（利用者報告 2026-09-03）: 受付直後は資料フォルダ行がまだ `GET /worlds` に現れない（背景で
-    // 作成中）——`trackNewRegistration` がそれを検出するまで待たせず、受付応答自身が返す
-    // `world_id` で楽観的なプレースホルダ行を即時表示する。実際の行（操作ボタン付き）は
-    // 行が現れ次第 `reloadAll` の `loadList()` が上書きする（既存の run 追跡機構の範囲内・
-    // 新しいポーリングは増やさない）。
+    // 受付直後は資料フォルダ行がまだ `GET /worlds` に現れない（背景で作成中）ため、受付応答の `world_id` で楽観的なプレースホルダ行を即時表示する。
+    // 実際の行（操作ボタン付き）は、行が現れ次第 `reloadAll` の `loadList()` が上書きする。
     showOptimisticRegisteredRow(res.world_id, label || path.split('/').filter(Boolean).pop() || res.world_id, path);
     setChosen(null); $('label').value = '';
     trackNewRegistration(res.world_id, res.run_id);
@@ -105,11 +141,9 @@ function showOptimisticRegisteredRow(worldId, label, path) {
     + `<span class="spinner spinner-sm"></span><span>取り込み中…（登録処理を開始しています）</span></span></div></div>`;
 }
 
-// 未登録フォルダの新規登録は資料フォルダ行自体が背景（`worlds.register`）で作られるため、受付直後は
-// 通常の /worlds 一覧・status にまだ現れない——行が現れるまでは受付 run（run_id）自身を
-// /ingest/runs で追跡する（既存の run_id は資料フォルダ行と無関係に検索できる）。行が現れたら通常の
-// reloadAll/loadStat のポーリングへ切り替える。行が現れないまま run が terminal（failed）に
-// 達した場合は登録失敗として表示する（例: 極小窓の同時登録競合）。
+// 未登録フォルダの新規登録は資料フォルダ行自体が背景で作られるため、受付直後は通常の /worlds 一覧・status に現れない。
+// 行が現れるまでは受付 run（run_id）を /ingest/runs で追跡し、現れたら通常の reloadAll/loadStat のポーリングへ切り替える。
+// 行が現れないまま run が terminal（failed）に達した場合は登録失敗として表示する。
 async function trackNewRegistration(worldId, runId) {
   try {
     const ws = await fetchWorldsShared();
@@ -165,16 +199,14 @@ async function checkDiff() {                          // 追加カード: 選ん
   }
 }
 
-// ---- 取り込み状況の要約（正直化: 入った/未対応/グラフ）----
+// ---- 取り込み状況の要約（入った/未対応/グラフ） ----
 function summaryText(s) {
   if (!s) return '';
   const p = [`文書 ${esc(s.indexed)} 件を検索可能に`];
   if (s.office_md) p.push(`うち Office ${esc(s.office_md)} 件をテキスト化`);
   if (s.skipped_office) p.push(`未対応 ${esc(s.skipped_office)} 件（PDF/旧形式）`);
   if (s.office_failed) p.push(`変換失敗 ${esc(s.office_failed)} 件`);
-  // accepts() 全滅（担当アナライザは居たが内容判定で不採用）の内訳: 既存の資料種別に該当すれば
-  // 「資料扱い」（indexed に含まれる）、該当しなければ「未対応」（skipped_other に含まれる）
-  // ——§7 裁定10「既存の資料種別に該当するものは資料・それ以外は未対応」を可視化する。
+  // accepts() 全滅（担当アナライザは居たが内容判定で不採用）の内訳: 既存の資料種別に該当すれば「資料扱い」（indexed に含まれる）、該当しなければ「未対応」（skipped_other に含まれる）。
   if (s.analyzer_declined_as_document || s.analyzer_declined) {
     const declined = [];
     if (s.analyzer_declined_as_document) declined.push(`担当なし（資料扱い）${esc(s.analyzer_declined_as_document)} 件`);
@@ -182,15 +214,10 @@ function summaryText(s) {
     p.push(declined.join('／'));
   }
   if (s.skipped_other) p.push(`除外 ${esc(s.skipped_other)} 件`);
-  // 本文が読めない（バイナリ・読み取り失敗・秘匿）ため grep/全文検索/精読のどれからも対象外に
-  // したファイル数。`stage_summary.counts`（最新 run の extraction_snapshot 由来）ではなく
-  // `scanned`/`skipped_other` と同じ資料フォルダ単位のキャッシュ値を使う——無変更の再同期は
-  // extraction_snapshot を書き換えるだけで scan_report を再実行しないため、run 由来の値だと
-  // 無変更後に表示が消えてしまう。`counts_as_of` が無い（未集計・旧形式集計の欠落補完中を含む）
-  // ときは件数を出さない——実測でない 0 を「対象外 0 件」と誤解させない（`countsAsOfNote` の
-  // 「未集計」表示だけで足りる）。
-  // SRH-05: 理由が判明している分（文字コード判別不能／バイナリ）だけ内訳をカッコ書きで添える
-  // （残りは秘匿/その他の未対応＝従来どおり理由を出さない）。
+  // 本文が読めない（バイナリ・読み取り失敗・秘匿）ため grep/全文検索/精読のどれからも対象外にしたファイル数。
+  // `scanned`/`skipped_other` と同じ資料フォルダ単位のキャッシュ値を使う（run 由来の値だと無変更の再同期後に表示が消える）。
+  // `counts_as_of` が無い（未集計）ときは件数を出さない（実測でない 0 を「対象外 0 件」と誤解させない）。
+  // 理由が判明している分（文字コード判別不能／バイナリ）だけ内訳をカッコ書きで添える（残りは秘匿/その他の未対応で、理由を出さない）。
   if (s.counts_as_of && s.unreachable_as_text) {
     const byReason = s.unreachable_by_reason || {};
     const parts = [];
@@ -213,16 +240,14 @@ function summaryText(s) {
   return p.join(' ／ ');
 }
 
-// ING-2: 件数の集計時刻＋再集計ボタン（`GET /worlds/{id}/status` はキャッシュを読むだけでフォルダを
-// 歩かない・保存済み集計が無い資料フォルダは counts_as_of=null＝「未集計」を促す）。
+// 件数の集計時刻＋再集計ボタン（`GET /worlds/{id}/status` はキャッシュを読むだけでフォルダを歩かない）。保存済み集計が無い資料フォルダは counts_as_of=null＝「未集計」を促す。
 function countsAsOfNote(s, wid) {
   const at = s.counts_as_of ? `（${esc(Sherpa.fmtDateTime(s.counts_as_of))} 時点）` : '（未集計）';
   return ` <span class="muted" data-countsof="${esc(wid)}">${at}</span>`
     + ` <button class="mini" data-recount="${esc(wid)}">再集計</button>`;
 }
 
-// ING-1: 理由コード → 平文（`failure_reason_catalog` はサーバ側の単一の真実源・docs/04 平文原則。
-// 未知コードは raw のまま出す＝fail-open）。
+// 理由コード → 平文（`failure_reason_catalog` はサーバ側の単一の真実源）。未知コードは raw のまま出す。
 function reasonInfo(catalog, code) {
   return (catalog && catalog[code]) || { label: code, advice: '' };
 }
@@ -238,7 +263,7 @@ function stageSummaryHtml(stage) {
     lines.push(`全文検索: ${stage.es.chunks != null ? esc(stage.es.chunks) + ' 片' : '-'}`
       + (stage.es.error ? `（エラー: ${esc(stage.es.error)}）` : ''));
     // 資料が不変の更新はキャッシュ再利用のみで新規0件になる（費用が掛からないことの可視化）。
-    // reused を記録していない古い取り込み結果は「取れない値」であって0件ではない＝0で埋めない。
+    // reused を記録していない古い取り込み結果は「取れない値」であって0件ではないため、0で埋めない。
     if (stage.es.embedded != null) {
       lines.push(stage.es.reused != null
         ? `埋め込み: 再利用 ${esc(stage.es.reused)} 件・新規 ${esc(stage.es.embedded)} 件`
@@ -273,8 +298,7 @@ function partialSuspectedHtml(ps, advice) {
     + `<ul>${rows}</ul>${more}</div>`;
 }
 
-// 失敗一覧／各段の要約／抽出不完全の疑いを1つの折りたたみへまとめる（新しい詳細画面は作らない・
-// 資料画面の各行の下に出す）。何も無ければ折りたたみ自体を出さない。
+// 失敗一覧／各段の要約／抽出不完全の疑いを1つの折りたたみにまとめ、資料画面の各行の下に出す。何も無ければ折りたたみ自体を出さない。
 function ingestDetailHtml(wid, s) {
   const body = stageSummaryHtml(s.stage_summary)
     + failedFilesHtml(wid, s.failed_files, s.failure_reason_catalog)
@@ -282,11 +306,9 @@ function ingestDetailHtml(wid, s) {
   if (!body) return '';
   return `<details class="adv"><summary>詳細を表示</summary>${body}</details>`;
 }
-// ING-3: 実行中 run の逐次進捗（`running_progress`）。段の平文はサーバ側で確定済み（`stage_label`）。
-// ステッパー表示（2026-09-04 実環境フィードバック）: 数時間級の取り込みで「あと何段あるのか」が
-// 見えるよう、済んだ段✓・いまの段▶（件数付き）・残りの段を1行に並べる。段の並びはサーバの
-// `worker.STAGE_LABELS` の取り込み系5段のミラー（キーが未知の段＝削除等は従来の1行表示へ
-// フォールバック＝ズレても壊れない）。ラベルはステッパー用の短縮形（正式な平文は stage_label）。
+// 実行中 run の逐次進捗（`running_progress`）。段の平文はサーバ側で確定済み（`stage_label`）。
+// ステッパー表示: 済んだ段✓・いまの段▶（件数付き）・残りの段を1行に並べる。
+// 段の並びはサーバの `worker.STAGE_LABELS` の取り込み系5段のミラー（未知の段は1行表示へフォールバック）。ラベルはステッパー用の短縮形（正式な平文は stage_label）。
 const INGEST_STAGE_STEPS = [
   ['scanning', 'フォルダ確認'],
   ['office_md', '読める写し(MD)作成'],
@@ -297,11 +319,11 @@ const INGEST_STAGE_STEPS = [
 function progressNote(s) {
   const p = s && s.running_progress;
   if (!p) return '';
-  // total 不明の段（走査中）は件数のみ「N件確認済み」表示（実環境フィードバック 2026-09-04）。
+  // total 不明の段（走査中）は件数のみ「N件確認済み」表示。
   const counts = (p.done != null && p.total != null) ? `（${esc(p.done)}/${esc(p.total)}）`
     : (p.done != null ? `（${esc(p.done)}件確認済み）` : '');
   const idx = INGEST_STAGE_STEPS.findIndex(([k]) => k === p.stage);
-  if (idx < 0) {                                   // 未知の段（accepted/deleting 等）＝従来の1行表示
+  if (idx < 0) {                                   // 未知の段（accepted/deleting 等）＝1行表示
     return `<div class="muted" style="margin-top:3px"><span class="loading-inline" role="status">`
       + `<span class="spinner spinner-sm"></span><span>${esc(p.stage_label)}${counts}</span></span></div>`;
   }
@@ -327,9 +349,11 @@ function summaryNote(s, wid) {
   }
   const warns = s.last_run_warnings || [];
   const dangers = [];
+  if (s.resolve_settings_pending) {
+    dangers.push('資料の探し方の設定がまだ反映されていません（更新が必要です。「更新」を押すと資料を取り込み直します）');
+  }
   if (s.last_run_status === 'failed') {
-    // `failed` は派生物の公開後（グラフ反映・台帳更新等）の失敗も含みうるため、「検索は前回成功
-    // 時点のまま」とは断定しない（派生物自体は今回分に更新済みのことがある）。
+    // `failed` は派生物の公開後（グラフ反映・台帳更新等）の失敗も含みうるため、「検索は前回成功時点のまま」とは断定しない。
     dangers.push('前回の取り込みは失敗しました（次回の取り込みで自動的に再試行されます）');
   }
   if (warns.some(w => typeof w === 'string' && w.startsWith('es_index_failed'))) {
@@ -340,6 +364,10 @@ function summaryNote(s, wid) {
   }
   if (warns.some(w => typeof w === 'string' && w.startsWith('office_md:'))) {
     dangers.push('前回の取り込みでOffice文書のテキスト化処理自体に問題がありました（次回の取り込みで再試行されます）');
+  }
+  if (warns.some(w => w === 'plugin_failed')) {
+    dangers.push('前回の取り込みで、フレームワーク固有の解析に失敗した部分があります。関係グラフの結果が一部欠けているため、'
+      + '関連が無いとは言えません（原因を直して取り込み直すまで残ります）');
   }
   // `office_md_blocked:{doc}\t{reason}`（区切りはタブ・doc/reasonとも`:`を含みうるため`:`では分割しない）。
   const blockedDocs = warns
@@ -354,8 +382,7 @@ function summaryNote(s, wid) {
     dangers.push(`前回の取り込みで一部の文書（${blockedDocs.map(esc).join('・')}）を想定外のエラーで`
       + '変換できませんでした（次回の取り込みで再試行されます）');
   }
-  // 不可読コードによる全体停止（`unreadable_code_file`）: 対象ファイルを名指しする
-  // （`last_run_warnings` は reason のみ＝doc が届かないため `last_run_blocked` を使う）。
+  // 不可読コードによる全体停止（`unreadable_code_file`）: 対象ファイルを名指しする（`last_run_warnings` は reason のみのため `last_run_blocked` を使う）。
   const unreadableDocs = (s.last_run_blocked || [])
     .filter((b) => b && b.reason === 'unreadable_code_file' && b.doc)
     .map((b) => b.doc);
@@ -368,20 +395,15 @@ function summaryNote(s, wid) {
   const detail = wid ? ingestDetailHtml(wid, s) : '';
   return `<span>${summaryText(s)}</span>${countsNote}${progressNote(s)}${note}${dangerNote}${detail}`;
 }
-// ING-3: 実行中（`running_progress` あり）は行の操作ボタンを無効化する（多重クリックはサーバ側の
-// 資料フォルダ単位の単一実行〔既存 run への合流〕で安全だが、UI 側でも明示的に抑止する）。
+// 実行中（`running_progress` あり）は行の操作ボタンを無効化する（サーバ側も資料フォルダ単位の単一実行で多重クリックに安全だが、UI でも抑止する）。
 function setIngestBusy(world_id, busy) {
   document.querySelectorAll(`[data-refresh="${world_id}"],`
     + `[data-rag-rules="${world_id}"],[data-del="${world_id}"]`)
     .forEach((b) => { b.disabled = busy; });
 }
 
-// ING-3b（利用者報告 2026-09-04）: 登録ボタン（`pickbtn`）は上の行ボタンと違い world_id に
-// 紐付かない（登録前は資料フォルダがまだ無い）ため、`loadStat` が集計した「実行中の world_id 集合」で
-// 管理する——`worlds.register` は登録処理全体（多くの場合 es_index 段を含み数時間かかりうる）を
-// グローバル advisory lock の下で行うため、実行中に別の登録を投げると新規リクエストが完了まで
-// ブロックされてしまう（サーバ側で弾かれず「固まって見える」）。Set のまま（資料フォルダ単位で複数を
-// 素朴に集計するだけ）にしておき、現行の単一資料フォルダ運用が将来複数に広がっても書き直し不要にする。
+// 登録ボタン（`pickbtn`）は行ボタンと違い world_id に紐付かない（登録前は資料フォルダがまだ無い）ため、`loadStat` が集計した「実行中の world_id 集合」で管理する。
+// 登録処理は長時間かかりうる（グローバル advisory lock の下で実行される）ため、実行中に別の登録を投げると完了までブロックされる。
 const _runningWorldIds = new Set();
 function _updatePickbtnState() {
   const b = $('pickbtn');
@@ -410,11 +432,8 @@ async function loadStat(world_id) {                   // 各行の状況を非�
       return;
     }
     el.innerHTML = '<span class="muted">状況を取得できませんでした</span>';
-    // ING-3b是正（rv-periphery #5）: 404 以外の一時的な失敗（ネットワーク瞬断等）でポーリングを
-    // 止めると、既に「実行中」と分かっている world_id が `_runningWorldIds` に残ったまま二度と
-    // 更新されず、pickbtn が「取り込み実行中」表示のまま固まる。既知の実行中 world だけ、同じ
-    // 3秒間隔でポーリングを継続する（world 未登録等の恒久的な失敗まで無限リトライしないよう、
-    // 既に実行中と分かっている world_id に限る）。
+    // 404 以外の一時的な失敗（ネットワーク瞬断等）でポーリングを止めると、実行中と分かっている world_id が `_runningWorldIds` に残ったまま更新されず、pickbtn が「取り込み実行中」で固まる。
+    // 既知の実行中 world だけ同じ3秒間隔で継続する（恒久的な失敗を無限リトライしない）。
     if (_runningWorldIds.has(world_id)) setTimeout(() => loadStat(world_id), 3000);
   }
 }
@@ -429,8 +448,7 @@ async function removeWorld(world_id) {
     + `削除すると、別のフォルダを登録できるようになります。よろしいですか？`)) return;
   $('listmsg').innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>削除を受け付けています...</span></span>';
   try {
-    // ING-3: 削除も即受付・派生物wipeは背景で継続する。行の「削除中」表示は loadStat のポーリングが
-    // 示し、完了（world 行が消えて status が 404 になる）を検知すると一覧を自動で再同期する。
+    // 削除も即受付・派生物wipeは背景で継続する。行の「削除中」表示は loadStat のポーリングが示し、完了（world 行が消えて status が 404 になる）を検知すると一覧を自動で再同期する。
     const res = await api('DELETE', `/worlds/${encodeURIComponent(world_id)}`);
     $('listmsg').innerHTML = `✓ ${esc(res.note)}`;
     reloadAll();
@@ -443,7 +461,7 @@ async function removeWorld(world_id) {
 async function refresh(world_id) {
   $('listmsg').innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>更新を受け付けています...</span></span>';
   try {
-    // ING-3: 更新は即受付・再取り込みは背景で継続する。進捗・完了は行のポーリング（loadStat）が示す。
+    // 更新は即受付・再取り込みは背景で継続する。進捗・完了は行のポーリング（loadStat）が示す。
     const res = await api('POST', `/worlds/${encodeURIComponent(world_id)}/refresh`);
     $('listmsg').innerHTML = `✓ ${esc(res.note)}`;
     // 更新受付後は下段も再同期し、対象の資料フォルダの状況を表示する。
@@ -453,7 +471,7 @@ async function refresh(world_id) {
   }
 }
 
-// ---- 再集計（ING-2・`corpus_docs.scan_report` を明示的にやり直す唯一の実走査）----
+// ---- 再集計（`corpus_docs.scan_report` を明示的にやり直す唯一の実走査）----
 async function recount(world_id) {
   const el = document.querySelector(`[data-stat="${world_id}"]`);
   if (el) el.innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>集計しています...</span></span>';
@@ -466,7 +484,7 @@ async function recount(world_id) {
   loadStat(world_id);
 }
 
-// ---- 再変換（ING-1・失敗一覧の1件をやり直す＝更新と同じ資料フォルダ全体 sync が走る）----
+// ---- 再変換（失敗一覧の1件をやり直す＝更新と同じ資料フォルダ全体 sync が走る）----
 async function reconvertFile(world_id, rel) {
   if (!confirm(`「${rel}」を再変換します。\n\n更新（今すぐ取り込み直す）と同じ処理が資料フォルダ全体に対して走ります。続けますか？`)) return;
   const el = document.querySelector(`[data-stat="${world_id}"]`);
@@ -480,14 +498,14 @@ async function reconvertFile(world_id, rel) {
   loadStat(world_id);
 }
 
-// ---- 規則版で再生成（L5・§8.6-2「規則版で再生成」管理操作・AI 成形の一掃）----
+// ---- 規則版で再生成（管理操作・AI 成形の一掃）----
 async function regenerateRagRules(world_id) {
   const w = (await fetchWorldsShared()).find((x) => x.world_id === world_id) || {};
   if (!confirm(`「${w.label || world_id}」の検索用データを、AI を使わない元の形（規則版）へ作り直します。\n`
     + `AI が読みやすく整えた版は消えます（AI 成形は無効化していない限り、後で改めて作られることがあります）。続けますか？`)) return;
   $('listmsg').innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>規則版への再生成を受け付けています...</span></span>';
   try {
-    // ING-3: 即受付・作り直しは背景で継続する。進捗・完了は行のポーリング（loadStat）が示す。
+    // 即受付・作り直しは背景で継続する。進捗・完了は行のポーリング（loadStat）が示す。
     const res = await api('POST', `/worlds/${encodeURIComponent(world_id)}/rag_regenerate_rules`, {});
     $('listmsg').innerHTML = `✓ ${esc(res.note)}`;
     reloadAll(world_id);
@@ -496,12 +514,9 @@ async function regenerateRagRules(world_id) {
   }
 }
 
-// 業務語↔コードの対応づけは GRAPH-SRC（2026-09-04・K9-K11）で辞書突合による言及エッジ（S2）へ
-// 置き換え済み。旧・LLM 提案の承認フロー（手動「業務語↔コード対応」ボタン・自動橋渡し・
-// /worlds/{id}/concepts/* API）は概念ごと撤去し、復活させない。
 
 // ---- フォルダ選択モーダル（追加フォーム用）----
-let _mode = null;              // {kind:'register'}（rebind UI は撤去）
+let _mode = null;   // {kind:'register'}
 let _cur = '';                // 現在表示中のパス（''=トップ＝ドライブ一覧）
 
 async function openPicker(mode) { _mode = mode; await showDir(mode.start || ''); $('ovl').classList.add('open'); }
@@ -520,7 +535,7 @@ async function showDir(path) {
       : '<div class="muted" style="padding:10px">サブフォルダはありません。「このフォルダにする」で確定できます。</div>';
     $('pbody').dataset.parent = d.parent || '';
   } catch (e) {
-    // 失敗時は選択状態をリセット（古いパスで誤登録させない・RV Med#5）。
+    // 失敗時は選択状態をリセット（古いパスで誤登録させない）。
     _cur = ''; $('pchoose').disabled = true; $('upbtn').disabled = true; $('pbody').dataset.parent = '';
     $('pickcur').textContent = '読み込めませんでした';
     $('pbody').innerHTML = `<div class="danger" style="padding:10px">${esc(e.message)}</div>`;
@@ -553,8 +568,7 @@ $('pcancel').addEventListener('click', closePicker);
 $('ovl').addEventListener('click', (e) => { if (e.target === $('ovl')) closePicker(); });
 
 // =====================================================================
-// 下: 取り込み状況（文書一覧・全文検索・原本DL）＝旧 ingest.js。
-// 「どの資料が使えるか確認・失敗をやり直す」。専門用語は出さず状態3つに集約。
+// 下: 取り込み状況（文書一覧・全文検索・原本DL）。「どの資料が使えるか確認・失敗をやり直す」。専門用語は出さず状態3つに集約。
 // =====================================================================
 
 const STATE = {  // state → 表示（記号・クラス）。enum のみ。
@@ -568,22 +582,19 @@ const ABBR = { Module: 'Mod', Copybook: 'Cpy', DataItem: '項目', Document: '�
 
 let _pv = null, _q = '', _type = '', _state = 'all', _folder = '';
 
-// unreadable/unknown は「⚠ 失敗」フィルタ・理由・やり直すの対象にも含める（バッジ表示は個別）
-// ——不可読/確認不能の行が失敗フィルタで消えたり、理由/再実行の導線を失ったりしないようにする。
+// unreadable/unknown は「⚠ 失敗」フィルタ・理由・やり直すの対象にも含める（バッジ表示は個別）。失敗フィルタで消えたり、理由/再実行の導線を失ったりしないようにする。
 function isFailureState(state) {
   return state === 'failed' || state === 'unreadable' || state === 'unknown';
 }
 
-// 内部コード（`reason`）を平文に写像する（専門用語ゼロ・docs/04-画面の原則.md）。未知の値は
-// raw のまま表示する（fail-open＝想定外の新規コードでも黙って消さない・原因追跡の手がかりを残す）。
+// 内部コード（`reason`）を平文に写像する（専門用語ゼロ）。未知の値は raw のまま表示する（黙って消さない）。
 const REASON_JA = {
   read_failed: 'ファイルを読み取れませんでした',
   unreadable_code_file: 'コードを読み取れなかったため取り込みを止めました',
   encoding_undetermined: '文字コードを判別できないため読み取れません（UTF-8/CP932どちらも文字化けします）',
+  plugin_failed: 'フレームワーク固有の解析に失敗しました（関係グラフの結果が一部欠けています）',
 };
-// Office 変換失敗の内側の理由（`office_md_blocked:{doc}\t{innerReason}` の innerReason 部）→ 平文。
-// 例外クラス名（`unhandled_exception:RuntimeError` 等の `:` 以降）はそのまま出さない
-// （内部実装の詳細・専門用語ゼロの原則）。
+// Office 変換失敗の内側の理由（`office_md_blocked:{doc}\t{innerReason}` の innerReason 部）→ 平文。例外クラス名（`:` 以降）はそのまま出さない。
 const OFFICE_INNER_REASON_JA = { manifest_write_failed: '記録の書き込みに失敗しました' };
 function officeBlockedReasonText(reason) {
   const rest = reason.slice('office_md_blocked:'.length);
@@ -600,15 +611,13 @@ function reasonText(reason) {
   return REASON_JA[reason] || reason;
 }
 
-// 「どう読み取ったか」の平文バッジ（S2・専門用語ゼロ・04-画面の原則.md）。データ源は取り込み時の来歴（provenance）＝
-// 追加の記録はしない・表示のみ。method 1個＋（該当時のみ）旧形式変換／照合差分の最大2〜3個に抑える。
+// 「どう読み取ったか」の平文バッジ。データ源は取り込み時の来歴（provenance）で、表示のみ。method 1個＋（該当時のみ）旧形式変換／照合差分の最大2〜3個に抑える。
 const PROV_METHOD = {                       // 主たる読み取り方法 → 平文
   ooxml: 'Office から直接読み取り',
   pdf_text: 'PDF の文字を抽出',
   markitdown: '文書を広く読み取り（MarkitDown）',
-  markitdown_ocr: 'AI が画像を見て読み取り（数値は要確認）',   // 視覚読み取り（VLM）・tesseract 撤去後の唯一の OCR
-  // 後方互換のみ（RV Med 2026-07-08 R1）: tesseract 直の `ocr` アームは撤去済み。次回の派生 md 全再ビルドで
-  // method="ocr" の来歴は出なくなるが、それまでは既存の派生 meta.json にこの値が残る＝表示だけ維持する。
+  markitdown_ocr: 'AI が画像を見て読み取り（数値は要確認）',   // 視覚読み取り（VLM）
+  // 後方互換のみ: 既存の派生 meta.json に method="ocr" の来歴が残っている間は表示だけ維持する。
   ocr: '画像から文字を読み取り（旧方式）',
 };
 const PROV_LEGACY = {                       // 旧形式（.doc/.xls/.ppt）の前段変換バックエンド → 平文
@@ -628,16 +637,13 @@ function provBadges(p) {                     // 文書一覧の来歴バッジ�
   return out.length ? `<div class="provrow">${out.join('')}</div>` : '';
 }
 
-// 文書一覧: 担当アナライザの来歴（コード文書のみ・§7 裁定2の受入条件＝取り込み画面と影響分析の
-// 根拠表示で参照できるようにする）。`d.analyzer`（`Analyzer.name`）を表示ラベルへ写像する
-// （`d.doctype` は種別表示用の別項目——現行構成では同値だが独立した概念のため取り違えない）。
+// 文書一覧: 担当アナライザの来歴（コード文書のみ）。`d.analyzer`（`Analyzer.name`）を表示ラベルへ写像する（`d.doctype` は種別表示用の別項目で、取り違えない）。
 function analyzerBadgeRow(d) {
   if (d.branch !== 'source' || !d.analyzer) return '';
   return `<div class="provrow"><span class="provbadge">解析: ${esc(analyzerLabel(d.analyzer))}</span></div>`;
 }
 
-// SRH-05: 対象外にしないが符号化の読み取りが不確実な資料への注意バッジ（`state` は変えない＝
-// 検索/精読は可能・要確認のみ）。
+// 対象外にしないが符号化の読み取りが不確実な資料への注意バッジ（`state` は変えない＝検索/精読は可能・要確認のみ）。
 const ENCODING_PARTIAL_TIP = '文字コードの判別が不確実で、一部の文字が正しく読み取れていない可能性があります（要確認）';
 function encodingPartialBadge(d) {
   if (!d.encoding_partial) return '';
@@ -667,12 +673,8 @@ function renderImportanceDiagnostics() {      // 重要度設定の構文エラ�
     + `</ul>`;
 }
 
-// UI-ING是正1（利用者報告 2026-09-03）: `/ingest/preview` は world 未指定/空文字を 422 で拒否する
-// （バックエンドの入口検証としては妥当・変更しない）ため、worlds 0件（未登録）のまま素通しで
-// fetch すると `_pv.documents` を欠いた応答（`{"detail": [...]}`）が返り、後続の `.map` が
-// 例外を投げてスピナー（`_LOADING_INLINE`）が永久に残っていた。worlds 0件は fetch 自体を
-// 行わず平文の空状態へ倒し、それ以外の失敗（503・ネットワーク断等）も try/catch で拾って
-// 平文のエラー表示に倒す（スピナー放置を構造的に無くす）。
+// `/ingest/preview` は world 未指定/空文字を 422 で拒否するため、worlds 0件（未登録）のときは fetch 自体を行わず平文の空状態へ倒す。
+// それ以外の失敗（503・ネットワーク断等）も try/catch で拾って平文のエラー表示に倒す（スピナー放置を無くす）。
 const _NO_WORLD_MSG = 'まだ資料フォルダが登録されていません。上の「登録」から追加してください。';
 
 async function load() {
@@ -722,7 +724,7 @@ function renderTree() {                       // 文書の folder からフォ�
   let html = `<div class="tnode ${_folder === '' ? 'on' : ''}" data-folder="">📂 すべて<span class="tc">${docs.length}</span></div>`;
   for (const path of Object.keys(counts).sort()) {
     const depth = path.split('/').length - 1, name = path.split('/').pop();
-    // 鏡モデルでは common layer 概念は撤去済（フォルダは全て同列）＝旧 layer-common 強調は廃止（rv-full2 C3）
+    // フォルダは全て同列（common layer 概念は無い）。
     html += `<div class="tnode ${_folder === path ? 'on' : ''}" data-folder="${esc(path)}" style="padding-left:${8 + depth * 15}px">📁 ${esc(name)}<span class="tc">${counts[path]}</span></div>`;
   }
   $('tree').innerHTML = html;
@@ -736,9 +738,7 @@ function render() {
     && (_state === 'all' || (_state === 'failed' ? isFailureState(d.state) : d.state === _state)));
   const scoped = (_pv ? _pv.documents : []).filter(inFolder);
   const n = { ready: 0, processing: 0, failed: 0 };
-  // 集計は3状態（専門用語ゼロ・ファイル冒頭のコメント参照）に寄せる——unreadable/unknown は行の
-  // 表示は個別（`STATE.unreadable`/`STATE.unknown`）だが集計上は failed の一種として数える
-  // （黙って数から漏らさない）。
+  // 集計は3状態に寄せる: unreadable/unknown は行の表示は個別（`STATE.unreadable`/`STATE.unknown`）だが、集計上は failed の一種として数える。
   scoped.forEach((d) => { const b = isFailureState(d.state) ? 'failed' : d.state; n[b] = (n[b] || 0) + 1; });
   $('count').textContent = (_folder ? `範囲: ${_folder} ・ ` : '') + `使えます ${n.ready | 0} ・ 処理中 ${n.processing | 0} ・ 失敗 ${n.failed | 0}`;
   $('rows').innerHTML = docs.map(row).join('')
@@ -769,13 +769,11 @@ function updateEsScope() {
   $('es-scope').textContent = (_folder ? `範囲: ${_folder}` : `${world || '資料フォルダ'} 全体`);
 }
 
-// ヒットの由来（小さく・専門用語ゼロ＝略語を出さない・RV Low 2026-07-08）。
-// ヒットカードはスペースが狭いので一覧側（PROV_METHOD）より短い平文にする。
-// ocr は後方互換のみ（tesseract 撤去済み・次回全再ビルドで消える・RV Med 2026-07-08 R1）。
+// ヒットの由来（小さく・専門用語ゼロ）。ヒットカードはスペースが狭いため一覧側（PROV_METHOD）より短い平文にする。ocr は後方互換のみ。
 const ES_METHOD = { ooxml: 'Office から抽出', pdf_text: 'PDF から抽出',
                     markitdown: '広く読み取り', markitdown_ocr: 'AI が画像から読み取り',
                     ocr: '画像から読み取り（旧）' };
-function esProvBadges(h) {                   // ヒットカードの由来バッジ（無ければ空文字＝従来どおり）
+function esProvBadges(h) {                   // ヒットカードの由来バッジ（無ければ空文字）
   const out = [];
   const m = ES_METHOD[h.extraction_method];
   if (m) out.push(`<span class="provbadge">${esc(m)}</span>`);
@@ -817,10 +815,9 @@ async function searchEs() {
   }
 }
 
-// ===== admin ガード（W1・2026-09-03）: 資料フォルダ登録/更新/削除・取り込み状況
-// （/ingest/preview）・全文検索（/admin/es/search）は全て admin 限定 API。この画面は丸ごと admin 専用
-// ＝admin-settings.js / audit.js と同じ自前 checkAdmin() パターン（nav.js の _isAdminUser はカスタム
-// エレメント内部の非公開状態のため外部から参照できない）。判定失敗時は fail-safe で非表示のまま。 =====
+// ===== admin ガード =====
+// 資料フォルダ登録/更新/削除・取り込み状況（/ingest/preview）・全文検索（/admin/es/search）は全て admin 限定 API。
+// この画面は丸ごと admin 専用＝admin-settings.js / audit.js と同じ自前 checkAdmin() パターン。判定失敗時は非表示のまま。
 async function checkAdmin() {
   try {
     const u = await getJSON('/auth/me');
@@ -837,7 +834,7 @@ function openPrev() {
   const c = _pv.counts;
   $('pv-bar').innerHTML = `抽出された要素 <b>${c.entities}</b>`
     + ` ・ 関係 <b>${c.relations}</b> ・ 廃止/隠し <b>${c.deprecated + c.hidden}</b>`;
-  // 担当アナライザの来歴（コード以外は analyzer=null＝出さない・§7 裁定2）。
+  // 担当アナライザの来歴（コード以外は analyzer=null＝出さない）。
   $('pv-ents').innerHTML = _pv.entities.map((e) => `<div class="ent"><span class="ico">${esc(ABBR[e.label] || e.label)}</span>`
     + `<span class="nm">${esc(e.name)}${statusTag(e.status)}<small>${esc(e.label)}${e.parent ? ' ・ ' + esc(e.parent) : ''}${e.value != null ? ' ・ 値 ' + esc(e.value) : ''}${e.analyzer ? ' ・ 解析: ' + esc(analyzerLabel(e.analyzer)) : ''}</small></span></div>`).join('');
   $('pv-rels').innerHTML = _pv.relations.map((r) => `<div class="rel"><div class="chain">${esc(r.src)} ─${esc(r.type)}→ ${esc(r.dst)}</div>`
@@ -852,13 +849,12 @@ async function download(name) {
   const r = await fetch(`/documents/download?world=${encodeURIComponent(world)}&rel=${encodeURIComponent(name)}`);
   if (!r.ok) { alert((await r.json().catch(() => ({}))).detail || '原本が見つかりません'); return; }
   const blob = await r.blob();
-  Sherpa.downloadBlob(blob, name.split('/').pop());   // UI フィードバック3: revoke タイミング問題を共通ヘルパで回避
+  Sherpa.downloadBlob(blob, name.split('/').pop());   // revoke のタイミング問題は共通ヘルパで回避
 }
 
 async function rerun() {
-  // 鏡＝即反映ライブ鏡: 資料フォルダ全体のクリーン rebuild（doc 単位の差分やり直しは無い）。ING-3:
-  // 即受付・背景実行のため、他のボタン（更新/削除）と同じ共通 api()＋エラー確認＋reloadAll()へ
-  // 統一する（進捗・完了は上段の行ポーリング loadStat が示す）。
+  // 鏡＝即反映ライブ鏡: 資料フォルダ全体のクリーン rebuild（doc 単位の差分やり直しは無い）。
+  // 即受付・背景実行のため、他のボタン（更新/削除）と同じ共通 api()＋エラー確認＋reloadAll() を使う（進捗・完了は上段の行ポーリング loadStat が示す）。
   try {
     const res = await api('POST', '/ingest/rerun', { world: $('version').value });
     alert(res.note || '再取り込みを受け付けました');
@@ -874,7 +870,7 @@ $('type').addEventListener('change', (e) => { _type = e.target.value; render(); 
 $('tree').addEventListener('click', (e) => {                 // 範囲で絞る
   const t = e.target.closest('[data-folder]'); if (!t) return;
   _folder = t.dataset.folder; renderTree(); render();
-  // 全文検索結果は範囲依存＝範囲変更で古い結果を残さない（検索語があれば新範囲で再検索・RV Med）
+  // 全文検索結果は範囲依存＝範囲変更で古い結果を残さない（検索語があれば新範囲で再検索）。
   if ($('esq').value.trim()) searchEs();
   else $('eshits').innerHTML = '<div class="muted">検索語を入力してください</div>';
 });
@@ -896,8 +892,7 @@ function showCurPath() {
 $('version').addEventListener('change', () => { showCurPath(); $('eshits').innerHTML = '<div class="muted">検索語を入力してください</div>'; load(); });
 
 // ---- 下段（取り込み状況）の再同期（登録/削除/更新後に呼び直す） ----
-// 資料フォルダは全体で1本のため選択の余地が無い。`#version` は下段の各処理が参照する値として
-// 残し（load()/searchEs()/scope ツリーが読む）、UI としては常に隠す。
+// 資料フォルダは全体で1本のため選択の余地が無い。`#version` は下段の各処理（load()/searchEs()/scope ツリー）が読む値として残し、UI としては常に隠す。
 async function reloadStatusSection(_preferredWorldId) {
   let ws = [];
   try {
@@ -916,7 +911,7 @@ async function reloadStatusSection(_preferredWorldId) {
   await load();
 }
 
-// ---- 上段一覧＋下段セレクタの同時再同期（fetchWorldsShared() を共有＝/worlds 取得は1回・RV Med3） ----
+// ---- 上段一覧＋下段セレクタの同時再同期（fetchWorldsShared() を共有＝/worlds 取得は1回） ----
 function reloadAll(preferredWorldId) {
   loadList();
   reloadStatusSection(preferredWorldId);
@@ -933,11 +928,8 @@ $('themebtn').addEventListener('click', () => {
 applyThemeIcon();
 
 // =====================================================================
-// 初期化（admin ガード・W1）: この画面のデータは全て admin 限定 API のため、非 admin には
-// access-denied だけを見せ、資料フォルダ一覧・取り込み状況・全文検索のいずれも取得しない
-// （admin-settings.js と同じ「本体を読まずに弾く」パターン）。
-// admin 判明後に上＝一覧／下＝セレクタを読む（取込ディレクトリ確定後に状況を読む。
-// /worlds 取得は1回に共有・RV Med3）。
+// 初期化（admin ガード）: 非 admin には access-denied だけを見せ、資料フォルダ一覧・取り込み状況・全文検索のいずれも取得しない（admin-settings.js と同じ「本体を読まずに弾く」パターン）。
+// admin 判明後に上＝一覧／下＝セレクタを読む（取込ディレクトリ確定後に状況を読む。/worlds 取得は1回に共有）。
 (async () => {
   const isAdmin = await checkAdmin();
   if (!isAdmin) {

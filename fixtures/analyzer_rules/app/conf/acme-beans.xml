@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:acme="http://example.invalid/acme">
+  <acme:service class="com.example.acme.OrderService"/>
+  <acme:service/>
+</beans>

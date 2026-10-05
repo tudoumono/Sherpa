@@ -69,9 +69,8 @@ GRAPH = {
         {"source": "batch:w1:billing", "target": "module:w1:TAXCALC", "type": "INVOKES",
          "status": "active"},
     ],
-    # GraphCounts と IngestPreviewCounts は同一の `preview_service.py::_counts()` が作る同一形
-    # （K12・entities_static/relations_static は残置＝全件 static なので値は entities/relations と一致）。
-    "counts": {"entities": 4, "entities_static": 4, "relations": 3, "relations_static": 3,
+    # GraphCounts と IngestPreviewCounts は同一の `preview_service.py::_counts()` が作る同一形。
+    "counts": {"entities": 4, "relations": 3,
               "deprecated": 0, "hidden": 0, "documents": 3},
     # ②graph 軽量化（段階読み込み）: 4 ノードは既定 limit に収まる＝非truncated（実 API と同じ応答形）。
     "total_nodes": 4, "total_edges": 3, "truncated": False,
@@ -85,10 +84,7 @@ PREVIEW = {
     # 実 API（doc_ledger.control_diagnostics 経由）は importance_diagnostics も常に持つ
     # （`_重要度.txt` の構文診断・無ければ空リスト）。
     "world": "w1", "label": "4期更改", "issues": [], "importance_diagnostics": [],
-    # ソース正典化（K12・実 schemas.py::IngestPreviewCounts で確認済み）: entities_llm/entities_both/
-    # relations_llm/relations_both は撤去済み（全件 static のため無意味）。entities_static/
-    # relations_static 自体は残る（値は entities/relations と常に一致）。
-    "counts": {"entities": 4, "entities_static": 4, "relations": 3, "relations_static": 3,
+    "counts": {"entities": 4, "relations": 3,
                "deprecated": 0, "hidden": 0, "documents": 3},
     # フェーズ7-1: 実 doc（doc_ledger.py::preview_documents）は phase/category/label/reason も常に持つ
     # （旧モックは欠落＝実ドリフト是正。reason は失敗時のみ非 None・他は None）。
@@ -159,7 +155,13 @@ IMPACT_ANSWER = {
             {"category": "ソース", "name": "TAXCALC", "status": "active",
              "analyzer": "cobol",
              "trace": ["TAXCALC", "TAX-RATE"],
-             "evidence": [{"doc": "4期/03_開発/01_ソース/TAXCALC.cbl"}]},
+             # 代表経路の辺ごとの根拠（実 API の `evidence`）: 関係の種類・解決の規則・参照元の文書と行を複数・切った分の件数
+             "evidence": [{"type": "COPIES", "doc": "4期/03_開発/01_ソース/TAXCALC.cbl", "line": 12, "via": "copy",
+                           "rule": "nearest_name", "sources_overflow_count": 2,
+                           "sources": [{"via": "copy", "doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl",
+                                        "file": "4期/03_開発/01_ソース/TAXCALC.cbl", "line": 12, "rule": "nearest_name"},
+                                       {"via": "copy", "doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl",
+                                        "file": "4期/03_開発/01_ソース/TAXCALC.cbl", "line": 40, "rule": "nearest_name"}]}]},
             {"category": "バッチ", "name": "請求機能", "status": "active",
              "trace": ["請求機能", "TAXCALC", "TAX-RATE"],
              "evidence": [{"doc": "4期/02_設計/01_基本設計/税計算仕様書.md"}]},
@@ -172,7 +174,7 @@ IMPACT_ANSWER = {
     ],
 }
 
-# 送信の既定 SSE 応答（GET /chat/turns/{turn_id}/stream・後方互換の GET /chat/stream 共通）。
+# 送信の既定 SSE 応答（GET /chat/turns/{turn_id}/stream）。
 # 個別テストは `install_api_mocks(page, stream_events=[...])` で丸ごと上書きできる。
 _DEFAULT_STREAM_EVENTS = [
     {"type": "node", "id": "understand", "kind": "thought", "status": "done",
@@ -356,7 +358,7 @@ V2_BUCKET_SURVIVES_SUBAGENT_LANE_INTERLEAVED_TRACE = [
 # is_local・name/event_type/evidence_ids は sherpa/exec_event.py・
 # sherpa/providers/base.py（ハイブリッド下調べ役の `_sub_agent_metrics`/`_sub_agent_completed_node`）
 # が実際に組む shape と同じ。`is_local`/`name` はサーバの権威ある判定（`agent_constructs.is_local`）・
-# 表示名（`search_helper.resolve()` の "name"）をそのまま模す＝フロントは推測しない契約。
+# 表示名（下調べ役の "name"）をそのまま模す＝フロントは推測しない契約。
 # 「資料を検索（語句そのまま）」を3件並べて集約表示（GREP×N 相当）の閾値（AGG_MIN_RUN=3）に届かせる。
 V2_LANE_TRACE = [
     # 計画ノードの detail は表示名（「下調べ役」）のみを載せる（内部 slug "researcher" を
@@ -571,25 +573,6 @@ def workspace_search_response(q: str) -> dict:
     }
 
 
-def graph_ask_response(question: str | None) -> dict:
-    """POST /graph/ask の mock 応答（実形状＝graph_admin.py::ask_graph と同キー・cited_nodes[] は
-    type_ja/category/distance/edges も持ち、summary は isolated_nodes/weak_documents/
-    recent_ingest_errors の中身の list も持つ）。"""
-    return {"status": "ok", "world": "w1", "question": question,
-            "answer": "TAX-RATE は消費税率と TAXCALC に関係します。",
-            "cited_nodes": [{"name": "TAXCALC", "label": "Module", "type_ja": "プログラム",
-                             "role": "実装", "category": None, "distance": 2,
-                             "path": ["消費税率", "TAX-RATE", "TAXCALC"], "edges": []}],
-            "docs": [],
-            "summary": {"world": "w1", "scope_paths": [], "documents": 3,
-                       "graph_nodes": 4, "graph_edges": 3,
-                       "isolated_node_count": 1,
-                       "isolated_nodes": [{"name": "経理コーディング規約.md",
-                                          "type": "Document", "path": None}],
-                       "weak_document_count": 0, "weak_documents": [],
-                       "recent_ingest_errors": []}}
-
-
 def graph_search_response(nodes: list, edges: list, counts: dict) -> dict:
     """GET /graph/search の mock 応答（実形状＝graph_admin.py::_rows_to_graph と同キー。nodes[] は
     GET /graph（preview_service.py::graph_view）と別形＝ phase/category に加え em も持つ
@@ -602,10 +585,9 @@ def world_diff_response(path: str | None, world_id: str | None = None, label: st
                         registered: bool = False, added: list | None = None,
                         changed: list | None = None, removed: list | None = None,
                         total: int = 2, indexed: int = 0) -> dict:
-    """POST /worlds/diff・GET /worlds/{wid}/diff の mock 応答（実形状＝worlds.py::_diff_payload と
-    同キー＝ "world_id" も常に持つ）。既定値は未登録フォルダ（POST /worlds/diff の代表例＝
-    追加2件・未取込）を表す。登録済みで変更なしの例（GET /worlds/{wid}/diff）は呼び出し側で
-    `added=[]`・`total=indexed` を渡す。"""
+    """POST /worlds/diff の mock 応答（実形状＝worlds.py::_diff_payload と同キー＝ "world_id" も
+    常に持つ）。既定値は未登録フォルダ（追加2件・未取込）を表す。登録済みで変更なしの例は
+    呼び出し側で `added=[]`・`total=indexed` を渡す。"""
     return {"ok": True, "registered": registered, "world_id": world_id, "label": label,
             "root_path": path,
             "added": added if added is not None else ["4期/税計算仕様書.md", "4期/TAXCALC.cbl"],
@@ -676,10 +658,10 @@ AUDIT_ROWS = [
      "outcome": "success", "severity": "info", "reason": None, "detail": {"rel_path": "onboarding.md"},
      "request_id": None, "session_id": None, "ip_hash": None, "user_agent": None,
      "before_state": None, "after_state": None},
-    # RV9 #7: 利用統計チャット（POST /admin/usage/chat）の pending→結果 2行契約を e2e で固定する。
-    # 同じ request_id で対応付く pending 行＋failure 行の対（audit.js::OUTCOME_LABEL の
-    # 「送信前記録」/「失敗」表示・oc-pending/oc-error の色分け・行の title 属性・行クリック展開の
-    # 詳細先頭に request_id が出ることを e2e から確認できるようにする）。
+    # 撤去済みの機能（利用統計チャット）が過去に残した pending→結果 2行の監査行。同じ request_id で
+    # 対応付く pending 行＋failure 行の対（audit.js::OUTCOME_LABEL の「送信前記録」/「失敗」表示・
+    # oc-pending/oc-error の色分け・行の title 属性・行クリック展開の詳細先頭に request_id が出る
+    # ことを e2e から確認できるようにする）。
     {"id": 5, "created_at": "2026-07-01T09:50:00+00:00", "actor_user_id": "admin",
      "action": "admin.usage_chat_asked", "resource_type": "usage", "resource_id": None,
      "outcome": "pending", "severity": "info", "reason": None,
@@ -756,10 +738,6 @@ _HEALTH_COMPONENTS_DEFAULT = [
     {"id": "elasticsearch", "label": "Elasticsearch（全文検索）", "impact": "degraded",
      "ok": True, "detail": None, "latency_ms": 5},
     {"id": "openai", "label": "OpenAI API", "impact": "none", "ok": True, "detail": None, "latency_ms": 320},
-    {"id": "gemini", "label": "Gemini（Google）", "impact": "none", "ok": True, "detail": None, "latency_ms": 210},
-    {"id": "bedrock", "label": "AWS Bedrock（Claude）", "impact": "none", "ok": False,
-     "detail": "認証失敗（RuntimeError）", "latency_ms": 180,
-     "hint": "設定画面で Bedrock の API キーを入れるか、サーバ側 env を設定してください"},
     {"id": "ollama", "label": "ローカルLLM（Ollama）", "impact": "none", "ok": False,
      "detail": "接続拒否（サービス停止の可能性）（URLError）", "latency_ms": 50,
      "hint": "ollama serve の起動を確認してください（使わない構成なら対応不要）"},
@@ -1014,14 +992,6 @@ def _default_model_catalog() -> dict:
                       "default": "text-embedding-3-small"},
             "subsearch": {"allowed": ["gpt-5.4-mini", "gpt-4o-mini"], "default": "gpt-5.4-mini"},
         },
-        "gemini": {
-            "chat": {"allowed": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"],
-                     "default": "gemini-2.5-flash"},
-            "extract": {"allowed": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"],
-                        "default": "gemini-2.5-flash"},
-            "intent": {"allowed": ["gemini-2.5-flash"], "default": "gemini-2.5-flash"},
-            "embed": {"allowed": ["gemini-embedding-001"], "default": "gemini-embedding-001"},
-        },
         "ollama": {
             "chat": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
             "extract": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
@@ -1045,23 +1015,21 @@ _CHAT_EXAMPLES_DEFAULT = (
 # S1（2026-07-08-設定分離とUI整備.md）: GET /admin/settings の既定応答（全体設定の現行値＋実効値）。
 # admin-settings.html の描画・保存 e2e 用。configured=None＝未設定（既定/env に従う）状態。
 SYSTEM_SETTINGS_VIEW = {
-    # クラウド AI プロバイダの中央設定。既定は openai・個人キー許可 OFF（既定 false）・3種のキーとも未設定。
+    # クラウド AI プロバイダの中央設定。既定は openai・個人キー許可 OFF（既定 false）・キーは未設定。
     "cloud": {
         "provider": "openai",
         # FBK-1 RV1（2026-09-01）: 生の保存値（未選択＝一度も PUT されていなければ None）。
         # 既定モックは「クラウドを一度も選んでいない」状態＝None（`provider` は既定込みの実効値）。
         "provider_raw": None,
-        "providers": ["openai", "gemini", "bedrock"],
+        "providers": ["openai"],
+        # 保存済みの cloud_provider が閉じたプロバイダのときだけその名前（未選択扱い・画面が警告する）。
+        "retired_provider": None,
         "personal_api_keys_allowed": False,
         "openai_key_set": False,
-        "gemini_key_set": False,
-        "bedrock_key_set": False,
         "ollama_url": "http://localhost:11434",
         "personal_keys_in_use_count": 0,
         # WEB-1: Codex の Web 検索を管理者が許可しているか（既定 false）。
         "web_search_allowed": False,
-        # OpenAI 直結を利用者の構成一覧に出すか（既定 false・実行経路は変えない）。
-        "openai_direct_visible": False,
     },
     # 利用者による API キー自己発行の許可トグル（既定 false・個別テストが `system_settings=`
     # 上書きで true に切り替える）。
@@ -1084,8 +1052,8 @@ SYSTEM_SETTINGS_VIEW = {
         "configured": None,
         "effective": _default_model_catalog(),
         "builtin": _default_model_catalog(),
-        "providers": ["openai", "gemini", "bedrock", "ollama", "codex"],
-        "usages": ["chat", "intent", "embed", "route", "subsearch", "codex", "render"],
+        "providers": ["openai", "ollama", "codex"],
+        "usages": ["chat", "intent", "embed", "subsearch", "codex", "render"],
     },
     "arms": {
         # known_arm_names() はソート済み（markitdown 系は 2026-08 撤去＝現行3本: ooxml/pdf_text/vision）。
@@ -1140,19 +1108,10 @@ SYSTEM_SETTINGS_VIEW = {
     # （明示的な 0 だけ無制限）。フェーズ7-1（response_model 実測）で発見した実ドリフト
     # 是正＝旧モックはこのキーを欠いていた（実 GET /admin/settings は常に持つ）。
     "codex_session_retention_days": {"configured": None, "effective": 30, "default": 30},
-    # STAT-2（2026-08-28-利用統計AIチャット.md 追記）: 利用統計チャット専用の AI 選択。利用者の
-    # 実行構成（agent）には依存せず、管理者全体で1つに統一する。未設定時の既定は A7
-    # （`cloud`.`provider`・下記）連動——この環境は A7=openai（既定）なので "openai"
-    # （実サーバは `usage_chat._default_provider` が同じ規則で計算する・PUT ハンドラでの
-    # 再計算は下記 "usage_chat_provider" reflection 参照）。実 GET /admin/settings は常に持つ
-    # （real drift 対策・codex_session_retention_days と同じ理由でここに含める）。
-    "usage_chat": {"configured": None, "effective": "openai", "default": "openai",
-                   "providers": ["openai", "ollama"]},
     # SC-6c（調べる深さの基準値・調べ方ブロック §3.2）: 既定（未設定）は各モジュールの env 既定値
     # （`sherpa/agentic_search.py`/`sherpa/impact_service.py`/`sherpa/lens_service.py`/
     # `sherpa/chat_service.py::QA_MAX_HITS_DEFAULT`・Codex は `SHERPA_CODEX_REASONING` 既定 "low"）。
     "depth_profile": {
-        "max_turns": {"configured": None, "effective": 12, "default": 12},
         "grep_max_hits": {"configured": None, "effective": 30, "default": 30},
         "qa_max_hits": {"configured": None, "effective": 20, "default": 20},
         "read_window": {"configured": None, "effective": 40, "default": 40},
@@ -1163,7 +1122,6 @@ SYSTEM_SETTINGS_VIEW = {
     },
     # チャット同時実行の上限（`sherpa/chat_turns.py::effective_limits`）。既定（未設定）は env 既定値
     # （`MAX_TURNS_PER_USER`=2／`MAX_TURNS_GLOBAL`=8）。depth_profile の各項目と同型。
-    "agentic_tool_limit": {"configured": None, "effective": 16, "default": 16},
     # 埋め込み HTTP の同時送信数。既定（未設定）は
     # `sherpa/embeddings.py::EMBED_PARALLEL_DEFAULT`（4）。env フォールバックは持たない。
     "embed_parallel": {"configured": None, "effective": 4, "default": 4},
@@ -1180,15 +1138,18 @@ SYSTEM_SETTINGS_VIEW = {
         "per_user": {"configured": None, "effective": 2, "default": 2},
         "global": {"configured": None, "effective": 8, "default": 8},
     },
+    # 個人ファイル（workspace）の 1 件あたりの上限（バイト）と保持日数（`sherpa/workspace_limits.py`）。
+    "workspace": {
+        "max_bytes": {"configured": None, "effective": 10485760, "default": 10485760},
+        "ttl_days": {"configured": None, "effective": 90, "default": 90},
+    },
     # BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: agentic search の tool-result
-    # バイト予算（1件あたり／1 run 累計）。既定（未設定）は env/コード既定（精度優先・262144/4194304
-    # ＝`sherpa/agentic_search.py::TOOL_RESULT_MAX_BYTES`/`TOOL_RESULT_MAX_TOTAL_BYTES` の
-    # コード既定値と一致）。モデルの窓由来の上限との min()（旧 BUDGET-2・管理画面のモデル窓登録表）
+    # バイト予算（1件あたり）。既定（未設定）はコード既定（精度優先・262144
+    # ＝`sherpa/agentic_search.py::TOOL_RESULT_MAX_BYTES` と一致）。モデルの窓由来の上限との min()（旧 BUDGET-2・管理画面のモデル窓登録表）
     # は撤去済み（`sherpa/schemas.py::AgenticBudgetAdminInfo` と同じ形＝`window`/`model_windows`
     # キーは応答に含まれない）。
     "agentic_budget": {
         "per_result": {"configured": None, "effective": 262144, "default": 262144},
-        "total": {"configured": None, "effective": 4194304, "default": 4194304},
     },
     # チャット画面のクイック入力例（`sherpa/chat_examples.py`）。既定（未設定）は表示・組み込み4例
     # （`GET /settings` の非 admin 向け `chat_examples` は None を返す＝下記 SETTINGS_RESP 参照）。
@@ -1208,30 +1169,21 @@ SYSTEM_SETTINGS_VIEW = {
 
 HEALTH_SUMMARY_RESP = {"status": "ok", "checked_at": "2026-07-01T09:00:00+00:00"}
 
-CONFIG_RESP = {"agent": "heuristic", "label": "簡易（AIなし）", "model": "—"}
+CONFIG_RESP = {"agent": "simple", "label": "簡易（検索して答える）", "model": "—"}
 # GET /config の実応答は agent ごとにラベルが変わる（`sherpa/providers/__init__.py::provider_info`）。
 # ハンドラ側（PUT /settings 後の GET /config）が `settings_resp["agent"]` から動的に組み立てるための
 # 表示名テーブル（`SETTINGS_RESP.constructs_available` のラベルと揃える・実サーバの厳密な文言とは
 # 別物＝あくまでモックの表示整合性のため）。
 _CONFIG_AGENT_LABELS = {
-    "heuristic": "簡易（AIなし）", "openai": "OpenAI", "gemini": "Gemini（Google）",
-    "ollama": "ローカル（Ollama）", "codex": "Codex", "bedrock": "AWS Bedrock (Claude)",
+    "heuristic": "利用できないAI", "simple": "簡易（検索して答える）", "openai": "OpenAI",
+    "ollama": "ローカル（Ollama）", "codex": "Codex",
 }
 
 
-# A7（クラウドプロバイダ排他選択）対象の頭脳（実サーバ `sherpa.keys.CLOUD_PROVIDERS`）。
-_CLOUD_AGENTS = ("openai", "gemini", "bedrock")
-# env で明示的に有効化していない限り使えない頭脳（実サーバ `agent_constructs._RUNTIME_BLOCKABLE`）。
-_RUNTIME_BLOCKABLE = ("gemini", "bedrock")
+# チャットで閉じた頭脳（実サーバ `sherpa/routers/system.py::_CLOSED_CHAT_AGENTS`・保存させない）。
+_CLOSED_CHAT_AGENTS = ("heuristic", "gemini", "bedrock", "openai", "ollama")
 # codex_model_provider の allowlist（実サーバ `agent_constructs.CODEX_MODEL_PROVIDERS`）。
 _CODEX_MODEL_PROVIDERS = ("openai", "ollama")
-
-
-def _enabled_agents(resp: dict) -> set:
-    """このモックでの「有効な頭脳」集合。`constructs_available` に列挙されている agent 名がそれ
-    （このモックは実サーバと違い、一覧を A7 で動的に絞り込まない＝一覧に載っている＝
-    `SHERPA_EXTRA_AGENTS` 等で有効化済み、とみなせる）。"""
-    return {c.get("agent") for c in (resp.get("constructs_available") or [])}
 
 
 def _recompute_construct_id(resp: dict) -> str:
@@ -1242,11 +1194,8 @@ def _recompute_construct_id(resp: dict) -> str:
     壊れた既存データ相当）は実サーバと同じく一覧に無い "codex_invalid" を返す（一覧外の値を
     codex_openai へ丸めない＝画面に実際と異なる構成が動いているという食い違いを見せない・
     `str(x or "")` 単独の truthiness 判定は falsy な非文字列を「未設定」に化けさせるため使わない）。
-    クラウド系（openai/gemini/bedrock）は、**有効化されている場合に限り**選択中の cloud_provider
-    と一致しなければ ollama へ正規化する（A7）。有効化されていない agent（例: env で許可していない
-    bedrock）は実サーバ同様、正規化せず生値のまま保つ（`effective_agent()` は非有効な raw_agent を
-    素通りさせ、A7 判定にも進まない）。それ以外は `constructs_available`（標準4＋有効化した
-    追加頭脳）から agent が一致する id を探し、見つからなければ agent 名そのものを返す。"""
+    それ以外は `constructs_available`（標準3）から agent が一致する id を探し、見つからなければ
+    agent 名そのものを返す（選べない保存値は生値のまま保つ）。"""
     agent = resp.get("agent") or ""
     if agent == "codex":
         raw = resp.get("codex_model_provider")
@@ -1261,42 +1210,24 @@ def _recompute_construct_id(resp: dict) -> str:
         if provider == "ollama":
             return "codex_ollama"
         return "codex_invalid"
-    enabled = _enabled_agents(resp)
-    if agent in _CLOUD_AGENTS and agent in enabled and (resp.get("cloud_provider") or "openai") != agent:
-        agent = "ollama"
     for c in resp.get("constructs_available") or []:
         if c.get("agent") == agent:
             return c["id"]
     return agent
 
 
-# GET /settings の実形状（sherpa/routers/system.py::_public_settings）: web_search_available・
-# codex_web_search・bedrock_model・bedrock_key_set が旧モックには無かった
-# （S3 実ドリフト是正）。web/settings.js は全キーを読む（S3 事前分析どおり load() で全て使用）。
-# RV MED（2026-07-15）: bedrock_model_known・bedrock_model_label は「保存できるのは実在確認済みID
-# だけ」の締め（Codex RV 指摘）に伴い `_public_settings` へ追加された新フィールド。既定値は静的
-# choices の1つ＝known:true（tests/e2e/test_settings_ui.py が settings= 上書きで unknown/legacy
-# シナリオを個別に検証する）。
-SETTINGS_RESP = {"agent": "openai",   # construct_id="openai_only" と一致させる（実サーバは両方同じ raw agent から導出）
-                 "web_search_available": False, "codex_web_search": False,
+# GET /settings の実形状（sherpa/routers/system.py::_public_settings）。web/settings.js は全キーを
+# 読む（load() で全て使用）。
+SETTINGS_RESP = {"agent": "simple",   # construct_id="simple" と一致させる（実サーバは両方同じ raw agent から導出）
+                 "web_search_available": False,
                  "openai_key_set": True,
                  # S3（2026-08-18-AzureOpenAI対応）: 既定（env 未設定）は openai・ホスト名なし
                  # （画面は注記を出さない）。Azure 表示は tests/e2e 側で settings= 上書きにより検証する。
                  "openai_endpoint_kind": "openai", "openai_base_url_host": "",
-                 "gemini_key_set": False,
                  "ollama_url": "http://localhost:11434",
-                 "bedrock_model": "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
-                 "bedrock_key_set": False,
-                 "bedrock_model_known": True,
-                 "bedrock_model_label": "Claude Haiku 4.5（JP 推論プロファイル・既定）",
-                 # 4構成（2026-08-15・sherpa/agent_constructs.py）: 画面はこの一覧だけを描画する。
-                 # 既定（env 未設定）の実サーバと同じく標準4件のみ＝gemini/bedrock は出さない。
+                 # 実行構成（sherpa/agent_constructs.py）: 画面はこの一覧だけを描画する（標準3件）。
                  "codex_model_provider": "",
-                 # 検索アシスタント（2026-08-15）: 既定は未設定＝メインのAIが自分で検索する。
-                 "search_helper": "",
-                 # 旧・個人上書き時代のモデル指定（読み取り専用・注記表示のみ・保存経路は無い）。
-                 "search_helper_model": "",
-                 "construct_id": "openai_only",
+                 "construct_id": "simple",
                  # 既定モックは「個人キー許可＝true・選択中プロバイダ＝openai」にそろえる
                  # （A6/A7 導入前から存在する大多数の e2e がキー入力欄の可視を前提にしているため）。
                  # A6 が false のときの挙動（キー欄が隠れる）は個別テストが `settings=` 上書きで検証する。
@@ -1305,65 +1236,23 @@ SETTINGS_RESP = {"agent": "openai",   # construct_id="openai_only" と一致さ�
                  # `settings={**SETTINGS_RESP, "user_api_keys_allowed": True}` で上書き）。
                  "user_api_keys_allowed": False,
                  "user_api_keys_daily_quota_default": 100,
-                 # モデル名欄ごとの選択肢（system.py::_public_settings が model_catalog.FIELD_CELLS の
-                 # 全フィールドを常に含める）。
-                 "model_catalog": {
-                     "openai_model": {"allowed": ["gpt-5.5", "gpt-5.4-mini"], "default": "gpt-5.5"},
-                     "gemini_model": {"allowed": ["gemini-2.5-flash", "gemini-2.5-flash-lite",
-                                                  "gemini-flash-latest"], "default": "gemini-2.5-flash"},
-                     "ollama_model": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
-                     "codex_model": {"allowed": ["gpt-5.5"], "default": "gpt-5.5"},
-                     "intent_model": {"allowed": ["gpt-4o-mini", "gpt-5.4-mini", "gemini-2.5-flash", "qwen2.5"],
-                                      "default": "gpt-4o-mini"},
-                     "search_helper_model": {"allowed": ["gpt-5.4-mini", "gpt-4o-mini", "qwen2.5"],
-                                              "default": "gpt-5.4-mini"},
-                 },
                  # 個人の Ollama 接続先 <select> の選択肢（allowed は完全 URL）。legacy は
                  # 「保存値が許可されなくなった旧接続先」用の別枠（実サーバは常にキーを持つ・
                  # 該当なしは None・mock drift 是正）。
                  "ollama_url_choice": {"allowed": ["http://localhost:11434"],
                                       "default": "http://localhost:11434", "legacy": None},
                  "constructs_available": [
-                     {"id": "openai_only", "agent": "openai", "codex_model_provider": None,
-                      "label": "OpenAI", "hint": "OpenAI API に直結（速い）"},
-                     {"id": "ollama_only", "agent": "ollama", "codex_model_provider": None,
-                      "label": "ローカル（Ollama）", "hint": "このパソコン/社内のローカルLLM"},
+                     {"id": "simple", "agent": "simple", "codex_model_provider": None,
+                      "label": "簡易（検索して答える）",
+                      "hint": "資料を数回検索して手早く答える・網羅性が要る質問は Codex 調査へ"},
                      {"id": "codex_openai", "agent": "codex", "codex_model_provider": "openai",
-                      "label": "Codex（OpenAI）", "hint": "Codex が自分で資料を探して調べる・モデルは OpenAI"},
+                      "label": "Codex 調査（OpenAI）", "hint": "Codex が自分で資料を探して調べる・モデルは OpenAI"},
                      {"id": "codex_ollama", "agent": "codex", "codex_model_provider": "ollama",
-                      "label": "Codex（Ollama）", "hint": "Codex が自分で資料を探して調べる・モデルは Ollama"},
+                      "label": "Codex 調査（Ollama）", "hint": "Codex が自分で資料を探して調べる・モデルは Ollama"},
                  ],
-                 # intent_model／search_helper_model のプロバイダ別選択肢（実サーバの
-                 # `_model_choice_table_by_provider`。セレクタ変更時の再描画を検証する e2e が使う）。
-                 "model_catalog_by_provider": {
-                     "intent_model": {
-                         "openai": {"allowed": ["gpt-4o-mini", "gpt-5.4-mini"], "default": "gpt-4o-mini"},
-                         "gemini": {"allowed": ["gemini-2.5-flash"], "default": "gemini-2.5-flash"},
-                         "ollama": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
-                     },
-                     "search_helper_model": {
-                         "openai": {"allowed": ["gpt-5.4-mini", "gpt-4o-mini"], "default": "gpt-5.4-mini"},
-                         "ollama": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
-                     },
-                 },
-                 "system_prompt": "既定の方針",
                  # チャット画面のクイック入力例（`sherpa/chat_examples.py::public_examples`）。
                  # None＝未設定（フロントは組み込み既定 `web/chat/state.js::DEFAULT_EXAMPLES` を使う）。
                  "chat_examples": None}
-
-# 追加AI（gemini/bedrock）を `SHERPA_EXTRA_AGENTS` で有効化した環境の応答。これらの AI を扱う
-# テスト（Bedrock のモデル検証・機能ごとの AI に gemini を選ぶ等）はこちらを使う。
-SETTINGS_RESP_WITH_EXTRA_AGENTS = {
-    **SETTINGS_RESP,
-    "constructs_available": [
-        *SETTINGS_RESP["constructs_available"],
-        {"id": "bedrock", "agent": "bedrock", "codex_model_provider": None,
-         "label": "AWS Bedrock (Claude)", "hint": "AWS 経由の Claude"},
-        {"id": "gemini", "agent": "gemini", "codex_model_provider": None,
-         "label": "Gemini（Google）", "hint": "Google の Gemini API"},
-    ],
-}
-
 
 WORLD_OPTIONS_RESP = {"worlds": ["w1"], "labels": {"w1": "4期更改"}}
 
@@ -1386,7 +1275,7 @@ _FAILURE_REASON_CATALOG_MOCK = {
 _PARTIAL_EXTRACTION_ADVICE_MOCK = "本文の一部しか読み取れていない可能性があります。開いて確認し、必要なら保存し直すか再変換してください。"
 
 WORLD_STATUS_RESP = {"ok": True, "world_id": "w1", "label": "4期更改", "root_path": "/mnt/c/ProjectA",
-                     "last_synced_at": "2026-07-03T09:00:00+00:00",
+                     "last_synced_at": "2026-07-03T09:00:00+00:00", "resolve_settings_pending": False,
                      "scanned": 3, "indexed": 3, "by_doctype": {"設計書": 1, "ソース": 2},
                      "office_md": 1, "skipped_office": 0, "office_failed": 0,
                      "skipped_other": 0, "skipped_ext": {}, "analyzer_declined": 0,
@@ -1538,10 +1427,8 @@ def _mock_validate_openai_endpoint_cross(kind: str, base_url: str) -> str | None
 # 調べる深さの基準値（`sherpa/routers/system_extras.py::SystemSettingsReq` の StrictInt+Field(ge,le)
 # と同じ範囲）。整数以外・bool・範囲外はすべて 422（実 API の pydantic 検証を模す）。
 _DEPTH_BASE_INT_BOUNDS = {
-    "agentic_max_tools_per_turn": (1, 256),
     "embed_parallel": (1, 16),
     "max_review_rounds": (1, 32),
-    "depth_base_max_turns": (1, 200),
     "depth_base_grep_max_hits": (1, 1000),
     "depth_base_qa_max_hits": (1, 1000),
     "depth_base_read_window": (10, 400),
@@ -1577,7 +1464,6 @@ def _mock_validate_chat_max_turns(body: dict):
 # 同じ範囲）。`_mock_validate_depth_base_int` を共用する（型/範囲の判定形は depth_base_* と同じ）。
 _AGENTIC_BUDGET_INT_BOUNDS = {
     "agentic_budget_per_result": (1024, 8 * 1024 * 1024),
-    "agentic_budget_total": (4096, 64 * 1024 * 1024),
 }
 
 
@@ -1644,8 +1530,7 @@ def _mock_validate_depth_base(body: dict):
 
 
 def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
-                      login_status: int = 200, bedrock_models: dict | None = None,
-                      bedrock_verify: dict | None = None,
+                      login_status: int = 200,
                       health_components: list | None = None, usage_stats: dict | None = None,
                       system_settings: dict | None = None, settings: dict | None = None,
                       stream_events: list | None = None, extra_users: list | None = None,
@@ -1670,8 +1555,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
     # 深いコピーで切り離す。
     system_settings_resp = json.loads(json.dumps(
         system_settings if system_settings is not None else SYSTEM_SETTINGS_VIEW))
-    # RV MED（2026-07-15）: GET /settings の既定応答（呼び出し元が `settings=` で丸ごと上書き可・
-    # bedrock_model_known/legacy 表示の分岐シナリオを試すテスト用・bedrock_models 等と同じ流儀）。
+    # GET /settings の既定応答（呼び出し元が `settings=` で丸ごと上書き可）。
     # PUT /settings がこの dict をその場で更新する（保存→再読込の往復を検証するため・RV 是正）ため、
     # 呼び出し元が渡した dict／モジュール定数 `SETTINGS_RESP` をそのまま参照すると、この install_api_mocks
     # 呼び出し（1テスト）の変更が他テスト・モジュール定数まで汚染してしまう。深いコピーで切り離す。
@@ -1680,15 +1564,6 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
     # `world_options={"worlds": [], "labels": {}}` で資料フォルダ未登録を模せる）。
     world_options_resp = json.loads(json.dumps(
         world_options if world_options is not None else WORLD_OPTIONS_RESP))
-    # S6: GET /settings/bedrock-models の既定応答（呼び出し元が `bedrock_models=` で上書き可・
-    # 失敗系フローを試すテストのため）。ユーザー指名の Sonnet 4.6 を含めて動的取得の見た目を再現。
-    bedrock_models_resp = bedrock_models if bedrock_models is not None else {"models": [
-        {"id": "jp.anthropic.claude-haiku-4-5-20251001-v1:0", "label": "Claude Haiku 4.5（JP 推論プロファイル）"},
-        {"id": "us.anthropic.claude-sonnet-4-6-20260115-v1:0", "label": "Claude Sonnet 4.6（US 推論プロファイル）"},
-    ], "error": None}
-    # バッチ2・1番: POST /settings/bedrock-models/verify の既定応答（呼び出し元が `bedrock_verify=` で
-    # 上書き可・成功/失敗いずれのフローも試せるように）。既定は成功（{ok, id, label}）を模す。
-    bedrock_verify_resp = bedrock_verify
     # UI フィードバック4: GET /admin/health の既定応答（呼び出し元が `health_components=` で上書き可）。
     health_components_resp = health_components if health_components is not None else _HEALTH_COMPONENTS_DEFAULT
     # バッチ3: GET /admin/usage/stats の既定応答（呼び出し元が `usage_stats=` で丸ごと上書き可・
@@ -1699,20 +1574,18 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
     tools_availability_resp = tools_availability if tools_availability is not None else {
         "grep": True, "fulltext": True, "graph": True}
     records = {
-        "stream_urls": [],
         "turn_starts": [],
         "turn_stream_urls": [],
         "turn_stops": [],
         "settings_put": [],
         "settings_test": [],
-        "bedrock_models_fetch": [],
-        "bedrock_models_verify": [],
         "admin_health": [],
         "admin_usage_stats": [],
         "admin_usage_export": [],
         "world_diff": [],
         "world_register": [],
         "world_refresh": [],
+        "resolve_settings_put": [],
         "auth_login": [],
         "auth_logout": [],
         "share_create": [],
@@ -1728,7 +1601,6 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         "workspace_downloads": [],
         "doc_downloads": [],
         "es_search": [],
-        "graph_ask": [],
         "announcement_create": [],
         "announcement_patch": [],
         "admin_settings_put": [],
@@ -1838,12 +1710,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                 if "web_search_allowed" in body:
                     # WEB-1: 破壊的副作用は無い（チャットの Web 検索行の表示条件のみ）。
                     view["cloud"]["web_search_allowed"] = bool(body["web_search_allowed"])
-                if "openai_direct_visible" in body:
-                    # OpenAI 直結を利用者の構成一覧に出すか（既定 false・実行経路は変えない）。
-                    view["cloud"]["openai_direct_visible"] = bool(body["openai_direct_visible"])
-                for field, flag in (("openai_api_key", "openai_key_set"),
-                                    ("gemini_api_key", "gemini_key_set"),
-                                    ("bedrock_api_key", "bedrock_key_set")):
+                for field, flag in (("openai_api_key", "openai_key_set"),):
                     if field in body:
                         view["cloud"][flag] = bool(body[field])
                 if "ollama_url" in body:
@@ -1853,7 +1720,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                 # キー未設定警告が古いままにならないことを e2e で固定するため）。
                 if "openai_api_key" in body and "vlm" in view:
                     view["vlm"]["openai_key_present"] = bool(body["openai_api_key"])
-            # AI 下調べ検索の既定 AI（簡易反映・null は "ollama" へ戻す）。"openai" への変更は
+            # 簡易回答に使う AI（簡易反映・null は "ollama" へ戻す）。"openai" への変更は
             # 実サーバの保存時 preflight（`_assert_research_default_provider_sendable`）と同じく、
             # この PUT 適用後の実効状態で中央 OpenAI キーが無ければ 422 で拒否する（キー設定と
             # 同一 PUT で送られた場合も反映済みの `view["cloud"]["openai_key_set"]` を見る）。
@@ -1865,7 +1732,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             if "ext_keys" in view and "research_default_provider" in body:
                 val = body["research_default_provider"]
                 if val == "openai" and not (view.get("cloud") or {}).get("openai_key_set"):
-                    return _json(route, {"detail": "AI 下調べ検索の既定 AI を OpenAI にできません"
+                    return _json(route, {"detail": "簡易回答に使う AI を OpenAI にできません"
                                                    "（管理者が AI プロバイダのキーを設定してください）"},
                                 status=422)
                 view["ext_keys"]["research_default_provider"]["configured"] = val
@@ -1945,22 +1812,9 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                 val = body["webhook_allowlist"]
                 view["webhook_allowlist"]["configured"] = val
                 view["webhook_allowlist"]["effective"] = sorted(val) if val else []
-            # STAT-2: 利用統計チャット専用の AI 選択。実サーバ（`usage_chat._default_provider`）
-            # と同じ A7 連動の既定（`cloud_provider` が openai のときだけ openai・それ以外は
-            # ollama）を簡易再現する。
-            if "usage_chat" in view:
-                default_provider = "openai" if (view.get("cloud", {}).get("provider") == "openai") else "ollama"
-                view["usage_chat"]["default"] = default_provider
-                if "usage_chat_provider" in body:
-                    val = body["usage_chat_provider"]
-                    view["usage_chat"]["configured"] = val
-                    view["usage_chat"]["effective"] = val if val else default_provider
-                elif view["usage_chat"].get("configured") is None:
-                    view["usage_chat"]["effective"] = default_provider
             # SC-6c: 調べる深さの基準値（簡易反映・null は default へ戻す）。
             if "depth_profile" in view:
-                for _key, _put in (("max_turns", "depth_base_max_turns"),
-                                   ("grep_max_hits", "depth_base_grep_max_hits"),
+                for _key, _put in (("grep_max_hits", "depth_base_grep_max_hits"),
                                    ("qa_max_hits", "depth_base_qa_max_hits"),
                                    ("read_window", "depth_base_read_window"),
                                    ("impact_depth", "depth_base_impact_depth"),
@@ -1978,11 +1832,6 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                     view["depth_profile"]["codex_reasoning"]["configured"] = _val
                     view["depth_profile"]["codex_reasoning"]["effective"] = (
                         _val if _val is not None else view["depth_profile"]["codex_reasoning"]["default"])
-            if "agentic_max_tools_per_turn" in body:
-                value = body["agentic_max_tools_per_turn"]
-                limit = view["agentic_tool_limit"]
-                limit["configured"] = value
-                limit["effective"] = value if value is not None else limit["default"]
             if "embed_parallel" in body:
                 value = body["embed_parallel"]
                 parallel = view["embed_parallel"]
@@ -2028,11 +1877,18 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                         view["chat_max_turns"][_key]["configured"] = _val
                         view["chat_max_turns"][_key]["effective"] = (
                             _val if _val is not None else view["chat_max_turns"][_key]["default"])
+            # 個人ファイルの上限・保持日数（簡易反映・null は default へ戻す）。
+            if "workspace" in view:
+                for _key, _put in (("max_bytes", "workspace_max_bytes"), ("ttl_days", "workspace_ttl_days")):
+                    if _put in body:
+                        _val = body[_put]
+                        view["workspace"][_key]["configured"] = _val
+                        view["workspace"][_key]["effective"] = (
+                            _val if _val is not None else view["workspace"][_key]["default"])
             # BUDGET-1（§3.4）: agentic search の tool-result バイト予算（簡易反映・null は default
             # へ戻す・depth_profile と同型）。
             if "agentic_budget" in view:
-                for _key, _put in (("per_result", "agentic_budget_per_result"),
-                                   ("total", "agentic_budget_total")):
+                for _key, _put in (("per_result", "agentic_budget_per_result"),):
                     if _put in body:
                         _val = body[_put]
                         view["agentic_budget"][_key]["configured"] = _val
@@ -2268,38 +2124,22 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             # `settings_resp`（PUT /settings で更新される・上記参照）の agent/モデルを反映する
             # （静的な CONFIG_RESP をそのまま返すと、頭脳メニューでの切替直後に `loadConfig()`
             # がバッジを古い agent へ戻してしまい、直後の保存操作が誤った agent 宛てに飛ぶ）。
-            # モデル名は個人設定に無い＝bedrock は個人設定の bedrock_model、それ以外は管理者の
-            # 使えるモデル一覧（model_catalog）の既定から解決する（実サーバの provider_info() が
-            # 実際に解決したプロバイダの .model を返すのと同じ形）。
-            _agent_now = settings_resp.get("agent") or "heuristic"
+            # モデル名は個人設定に無い＝管理者の使えるモデル一覧（model_catalog）の既定から解決する
+            # （実サーバの provider_info() が実際に解決したプロバイダの .model を返すのと同じ形）。
+            _agent_now = settings_resp.get("agent") or "simple"
             _label = _CONFIG_AGENT_LABELS.get(_agent_now, _agent_now)
-            if _agent_now == "bedrock":
-                _model = settings_resp.get("bedrock_model") or "—"
-            else:
-                _cell = (settings_resp.get("model_catalog") or {}).get(f"{_agent_now}_model") or {}
-                _model = _cell.get("default") or "—"
+            _model = {"codex": "gpt-5.5"}.get(_agent_now) or "—"
             return _json(route, {"agent": _agent_now, "label": _label, "model": _model})
         if method == "GET" and path == "/settings":
             return _json(route, settings_resp)
         if method == "PUT" and path == "/settings":
             body = _post_json(request)
             records["settings_put"].append(body)
-            # 有効化していない頭脳（gemini/bedrock）の保存は実サーバ同様 422 で拒否する
-            # （`sherpa/routers/system.py::settings_put` の `agent_constructs.runtime_blocked` 相当）。
-            # A7（次段の cloud_provider 一致チェック）より先に見る＝実サーバと同じ順序
-            # （そもそも使えない頭脳を、たまたま cloud_provider が一致するからと通さない）。
-            _new_agent = body.get("agent")
-            _enabled = _enabled_agents(settings_resp)
-            if _new_agent in _RUNTIME_BLOCKABLE and _new_agent not in _enabled:
-                return _json(route, {"detail": "この AI はこの環境では利用できません"
-                                               "（管理者が有効化していません）"}, status=422)
-            # A7（クラウドプロバイダ排他選択）: 有効化されている前提で、選択中でないクラウド系
-            # agent の保存は 422 で拒否する（`agent_constructs.agent_requires_unselected_cloud`
-            # 相当・保存済み値は変更しない）。
-            if (_new_agent in _CLOUD_AGENTS and _new_agent in _enabled
-                    and _new_agent != (settings_resp.get("cloud_provider") or "openai")):
-                return _json(route, {"detail": "この AI は現在選択されているクラウドプロバイダではありません"
-                                               "（管理画面でプロバイダを切り替えるか、別の AI を選んでください）"},
+            # チャットで閉じた頭脳（AI なし・Gemini・Bedrock）の保存は実サーバ同様 422 で拒否する
+            # （`sherpa/routers/system.py::settings_put`）。
+            if body.get("agent") in _CLOSED_CHAT_AGENTS:
+                return _json(route, {"detail": "agent は codex / simple のいずれか"
+                                               "（Gemini・AWS Bedrock・AI なしの定型応答はチャットでは廃止しました）"},
                             status=422)
             # codex_model_provider は openai/ollama の allowlist（実サーバ
             # `sherpa/routers/system.py::settings_put` の同名チェック相当）。空文字/未指定は
@@ -2324,8 +2164,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             # 保存後の GET /settings が反映済みの値を返すよう簡易マージする（実サーバは
             # `_public_settings(store.get_settings(uid))` を返す＝保存前後で同じキー集合。ここでは
             # `settings_resp`（このクロージャが保持する現在値）をその場で更新する）。
-            _secret_key_fields = {"openai_api_key": "openai_key_set", "gemini_api_key": "gemini_key_set",
-                                  "bedrock_api_key": "bedrock_key_set"}
+            _secret_key_fields = {"openai_api_key": "openai_key_set"}
             for k, v in body.items():
                 if v is None:
                     continue
@@ -2344,26 +2183,11 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             body = _post_json(request)
             records["settings_test"].append(body)
             provider = body.get("provider")
-            # モデル名は個人上書きが無い＝Bedrock だけ例外（実在確認済みモデルの専用機構）。
-            # 他は本文に何が入っていても無視し、カタログ既定（モック側の GET /settings 応答が
-            # 持つ既定値）のみで解決する（実サーバの `model_catalog.resolve_model` に対応）。
-            if provider == "bedrock":
-                model = body.get("bedrock_model") or settings_resp.get("bedrock_model") or "—"
-            else:
-                model = (settings_resp.get("model_catalog", {}).get(f"{provider}_model", {})
-                        .get("default") or "gpt-5.5")
+            # モデル名は個人上書きが無い＝本文に何が入っていても無視し、カタログ既定のみで解決する
+            # （実サーバの `model_catalog.resolve_model` に対応）。
+            model = {"openai": "gpt-5.5", "ollama": "qwen2.5", "codex": "gpt-5.5"}.get(provider) or "gpt-5.5"
             return _json(route, {"ok": True, "provider": provider, "model": model,
                                  "detail": "接続OK"})
-        if method == "GET" and path == "/settings/bedrock-models":
-            records["bedrock_models_fetch"].append(True)
-            return _json(route, bedrock_models_resp)
-        if method == "POST" and path == "/settings/bedrock-models/verify":
-            body = _post_json(request)
-            records["bedrock_models_verify"].append(body)
-            model_id = body.get("model_id") or ""
-            resp = bedrock_verify_resp if bedrock_verify_resp is not None else {
-                "ok": True, "id": model_id, "label": f"{model_id}（検証済み）"}
-            return _json(route, resp)
         if method == "GET" and path == "/conversations":
             q = (query.get("q") or [None])[0]
             if q is not None:
@@ -2747,21 +2571,15 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         if method == "GET" and path == "/graph/facets":
             return _json(route, GRAPH_FACETS_RESP)
         if method == "GET" and path == "/graph/search":
-            # GET /graph/search の nodes[] は GET /graph（graph_view）と別形＝ phase/category に加え
-            # em も持つ（graph_admin.py::_node は em を返し続ける・GraphNode と違い GraphSearchNode は
-            # S3 でも em を撤去していない＝graph_admin の管理検索専用ビューは対象外）。
+            # GET /graph/search の nodes[] は GET /graph（graph_view）と別形＝ phase/category を持つ。
             # GRAPH["nodes"] を直接使い回さず個別に足してから graph_search_response へ渡す。
             rel = (query.get("relationship") or [""])[0]
-            search_nodes = [{**n, "em": "static", "phase": None, "category": None} for n in GRAPH["nodes"]]
+            search_nodes = [{**n, "phase": None, "category": None} for n in GRAPH["nodes"]]
             if rel:
                 return _json(route, graph_search_response(
                     search_nodes[:2], GRAPH["edges"][:1], {"nodes": 2, "edges": 1}))
             return _json(route, graph_search_response(
                 search_nodes[:1], [], {"nodes": 1, "edges": 0}))
-        if method == "POST" and path == "/graph/ask":
-            body = _post_json(request)
-            records["graph_ask"].append(body)
-            return _json(route, graph_ask_response(body.get("question")))
         if method == "GET" and path == "/ingest/preview":
             return _json(route, PREVIEW)
         if method == "GET" and path == "/admin/es/search":
@@ -2794,18 +2612,21 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             body = _post_json(request)
             records["world_register"].append(body)
             return _json(route, world_ingest_accepted_response(WORLD["world_id"]))
-        if method == "GET" and path == "/worlds/w1/diff":
-            return _json(route, world_diff_response(
-                "/mnt/c/ProjectA", world_id="w1", label="4期更改", registered=True,
-                added=[], total=3, indexed=3))
+        if method == "GET" and path == "/worlds/w1/resolve-settings":
+            return _json(route, {"ok": True, "world_id": "w1", "copy_paths": [], "path_aliases": {},
+                                 "warnings": [], "changed": False, "refresh_started": False, "note": ""})
+        if method == "PUT" and path == "/worlds/w1/resolve-settings":
+            body = _post_json(request)
+            records["resolve_settings_put"].append(body)
+            return _json(route, {"ok": True, "world_id": "w1", "copy_paths": body.get("copy_paths", []),
+                                 "path_aliases": body.get("path_aliases", {}),
+                                 "warnings": [f"COPY の取り込み元の場所「{p}」は資料フォルダの中に見つかりません"
+                                              for p in body.get("copy_paths", [])],
+                                 "changed": True, "refresh_started": True,
+                                 "note": "保存しました。資料を取り込み直しています（時間がかかります）。"})
         if method == "POST" and path == "/worlds/w1/refresh":
             records["world_refresh"].append(True)
             return _json(route, world_ingest_accepted_response("w1"))
-        if method == "GET" and path == "/chat/stream":
-            # 旧エンドポイント（後方互換のため実サーバ側は残置・chat.js はもう呼ばない）。
-            # デフォルトモックとしては維持するが、既定の送信フローは /chat/turns 系を使う。
-            records["stream_urls"].append(request.url)
-            return _sse(route, stream_events if stream_events is not None else _DEFAULT_STREAM_EVENTS)
         if method == "POST" and path == "/chat/turns":
             # 背景実行（覗き窓方式・docs/proposals/2026-07-03-チャット背景実行.md）: 送信の既定フロー。
             # turn_id は固定値（"turn-101"）＝個別テストが `**/chat/turns/*/stream**` のような
@@ -2999,11 +2820,9 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
 
 
 # S3（mock 契約ドリフト対策）: 機械可読レジストリ。`handler()` が明示的に応答する (method, path) の
-# 一覧（path は FastAPI ルート表記＝`tests/api/goldens/routes.txt` と同じ `{param}` テンプレート）。
-# `tests/api/test_mock_api_contract.py` がこれを golden ルート表と突合し、実 API に無いルートを
+# 一覧（path は FastAPI ルート表記＝OpenAPI と同じ `{param}` テンプレート）。
+# `tests/api/test_mock_api_contract.py` がこれを実ルート表と突合し、実 API に無いルートを
 # 偽装したままにしていないかを検査する（旧ルート撤去・改名の検知）。
-# `GET /chat/stream` は chat.js からはもう呼ばれないが、実サーバ側は後方互換のため意図的に残置
-# （sherpa/routers/chat.py 参照）＝routes.txt にも存在する現役ルートであり除外不要。
 MOCKED: list[tuple[str, str]] = [
     ("GET", "/auth/me"),
     ("GET", "/health/summary"),
@@ -3036,8 +2855,6 @@ MOCKED: list[tuple[str, str]] = [
     ("GET", "/settings"),
     ("PUT", "/settings"),
     ("POST", "/settings/test"),
-    ("GET", "/settings/bedrock-models"),
-    ("POST", "/settings/bedrock-models/verify"),
     ("GET", "/conversations"),
     ("GET", "/conversations/{cid}"),
     ("GET", "/users/suggest"),
@@ -3048,16 +2865,15 @@ MOCKED: list[tuple[str, str]] = [
     ("GET", "/graph"),
     ("GET", "/graph/facets"),
     ("GET", "/graph/search"),
-    ("POST", "/graph/ask"),
     ("GET", "/ingest/preview"),
     ("GET", "/admin/es/search"),
     ("GET", "/fs/list"),
     ("GET", "/worlds/{wid}/status"),
     ("POST", "/worlds/diff"),
     ("POST", "/worlds"),
-    ("GET", "/worlds/{wid}/diff"),
     ("POST", "/worlds/{wid}/refresh"),
-    ("GET", "/chat/stream"),                   # 後方互換の意図的残置（上のコメント参照）
+    ("GET", "/worlds/{wid}/resolve-settings"),
+    ("PUT", "/worlds/{wid}/resolve-settings"),
     ("POST", "/chat/turns"),
     ("GET", "/chat/turns/{turn_id}/stream"),
     ("POST", "/chat/turns/{turn_id}/stop"),

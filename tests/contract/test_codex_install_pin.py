@@ -1,20 +1,4 @@
-"""固定版 Codex CLI 導入（scripts/codex_install.sh・scripts/lib/codex_pin.sh）の契約テスト。
-
-固定版・配布物名・sha256 は
-scripts/codex-version.env に集約する。ここでは実ネットワークを一切使わず、取得元を
-`CODEX_PIN_BASE_URL`（file:// スキーム）で差し替えて次の2つの安全性だけを固定する:
-
-  - sha256 が固定値と一致しない配布物は導入しない（fail-closed・tools/codex/bin/codex を作らない）。
-  - 配布物は本体＋付属物の package 一式（bin/codex・codex-path/rg・Linux は codex-resources/bwrap）。
-    リンク・脱出パスを含む package は入れず、本体だけの既存配置は入れ直す（tools/codex 全体を入れ替える）。
-  - 配布物を取得できない（ネットワーク不可・閉域網を模す）場合は日本語で警告するだけで、
-    `make start` の文脈（`./scripts/codex_install.sh || true`）では非0にならない
-    （＝起動そのものは止めない設計）。
-
-スクリプトは自分の場所（$0）から ROOT（tools/codex/ の置き場所）を解決するため、tmp_path に
-codex_install.sh が動くのに要る最小限のファイルだけをコピーした「リポジトリもどき」を作って
-実行する。実ワークツリーの tools/codex/（この worktree で導入済みの固定版）には一切触れない。
-"""
+"""固定版 Codex CLI 導入（scripts/codex_install.sh・scripts/lib/codex_pin.sh）の契約テスト。"""
 from __future__ import annotations
 
 import os
@@ -46,8 +30,7 @@ def _make_repo_skeleton(tmp_path: Path) -> Path:
 
 
 def _fake_path_codex(tmp_path: Path, version: str, npm_like: bool = False) -> Path:
-    """PATH 上の既存 codex を模す。開発機の本物の codex を試験に混ぜない。
-    npm_like=True は npm 版（実体が .js のランチャー＝付属物つき）、False は付属物の無い単体ファイル。"""
+    """PATH 上の既存 codex を模す。"""
     d = tmp_path / "pathbin"
     d.mkdir(exist_ok=True)
     if not npm_like:
@@ -84,46 +67,24 @@ def _run(repo: Path, extra_env: dict[str, str], *, wrap_or_true: bool = False,
     return subprocess.run(cmd, cwd=str(repo), env=env, capture_output=True, text=True, timeout=60)
 
 
-def test_sha256_mismatch_refuses_to_install(tmp_path):
-    """偽の配布物（sha256 が固定値と一致しない）は fail-closed で導入しない。"""
+def test_sha256_mismatch_and_unreachable_source_refuse_to_install(tmp_path):
+    """偽の配布物（sha256 不一致）や取得元に届かない場合は fail-closed で導入しない。"""
     repo = _make_repo_skeleton(tmp_path)
     fixture_dir = tmp_path / "fixture" / "rust-v0.153.4"
     fixture_dir.mkdir(parents=True)
-    # 内容は何でもよい（scripts/codex-version.env の固定 sha256 と一致しないことを試すだけ）。
     (fixture_dir / "codex-package-x86_64-unknown-linux-musl.tar.gz").write_bytes(b"not the real codex binary")
-
     result = _run(repo, {"CODEX_PIN_BASE_URL": f"file://{tmp_path / 'fixture'}"})
-
     out = result.stdout + result.stderr
-    assert result.returncode != 0, out
-    assert "sha256" in out
+    assert result.returncode != 0 and "sha256" in out, out
     assert not (repo / "tools" / "codex" / "bin" / "codex").exists()
 
-
-def test_unreachable_source_warns_in_japanese_without_installing(tmp_path):
-    """取得元に届かない（file:// が存在しない＝閉域網を模す）場合は日本語で警告し、導入しない。"""
-    repo = _make_repo_skeleton(tmp_path)
-
-    result = _run(repo, {"CODEX_PIN_BASE_URL": f"file://{tmp_path / 'does-not-exist'}"})
-
+    gone = {"CODEX_PIN_BASE_URL": f"file://{tmp_path / 'does-not-exist'}"}
+    result = _run(repo, gone)
     out = result.stdout + result.stderr
-    assert result.returncode != 0, out
-    assert "ネットワーク不可" in out or "取得できませんでした" in out
+    assert result.returncode != 0 and ("ネットワーク不可" in out or "取得できませんでした" in out), out
     assert not (repo / "tools" / "codex" / "bin" / "codex").exists()
-
-
-def test_start_context_does_not_block_when_fetch_fails(tmp_path):
-    """make start の文脈（`./scripts/codex_install.sh || true`）では、取得できなくても非0にならない
-    （起動は止めない設計）。"""
-    repo = _make_repo_skeleton(tmp_path)
-
-    result = _run(
-        repo,
-        {"CODEX_PIN_BASE_URL": f"file://{tmp_path / 'does-not-exist'}"},
-        wrap_or_true=True,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
+    # make start の文脈（`./scripts/codex_install.sh || true`）では取得できなくても起動を止めない
+    assert _run(repo, gone, wrap_or_true=True).returncode == 0
 
 
 def test_pinned_version_already_on_path_skips_fetch(tmp_path):
@@ -137,7 +98,6 @@ def test_pinned_version_already_on_path_skips_fetch(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "取得しません" in result.stdout
     assert not (repo / "tools" / "codex").exists()
-
 
 
 def _pin_version() -> str:

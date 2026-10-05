@@ -86,3 +86,33 @@ def test_edge_without_via_has_null_property():
     finally:
         _cleanup(drv)
         drv.close()
+
+
+def test_sql_table_schema_and_qualified_name_survive_the_neo4j_round_trip():
+    """SQL の Table ノードの `schema`・`qualified_name`（ANA-14 S5）が保存後に残る。schema を書かない表は null。"""
+    from sherpa.ingest import world_graph, world_neo4j
+    from _world_registry import register_test_world
+
+    fixture = ROOT / "fixtures" / "corpus" / "ana-s5"
+    nodes, edges, _flags = world_graph.build_world(fixture, WORLD)
+    env = world_neo4j._env()
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])
+    register_test_world(WORLD)
+
+    drv = _driver()
+    try:
+        with drv.session() as s:
+            rows = s.run(
+                "MATCH (t:Table {world_id:$w}) WHERE t.path IN ['g/sql/schemas.sql', 'g/sql/plain.sql'] "
+                "RETURN t.canonical_id AS cid, t.name AS name, t.schema AS schema, "
+                "t.qualified_name AS qn", w=WORLD,
+            ).data()
+        got = {r["cid"].split("#", 1)[1]: (r["name"], r["schema"], r["qn"]) for r in rows}
+        assert got == {
+            "CUSTOMER": ("CUSTOMER", "A", "A.CUSTOMER"),
+            "B.CUSTOMER": ("CUSTOMER", "B", "B.CUSTOMER"),
+            "X": ("X", None, None),
+        }
+    finally:
+        _cleanup(drv)
+        drv.close()

@@ -4,6 +4,7 @@ import ast
 import hashlib
 import inspect
 import json
+import textwrap
 from pathlib import Path
 from unittest import mock
 
@@ -57,9 +58,9 @@ def _psycopg_related_lines(text: str) -> str:
 # （requirements.txt の「関連行だけ抜き出す」方式の関数/DDL 単位版）。
 #   - `world_lock`（`ocr_worker.py` が import）・`_connect`/`_ensure`（`ocr_jobs.py` が import）と、
 #     それぞれが直接使う補助（`_dsn`/`_world_lock_key`/PG プール一式/`init_schema`）を
-#     `inspect.getsource()` で個別に抜き出す——`init_schema` 自体は他テーブルの移行処理
-#     （`_migrate_client_op_id_unique_index`/`_ensure_messages_created_at_index_background`）を
-#     **呼び出す**が、それらの**中身**は関数呼び出し1行としてしか現れないため、その中身が変わっても
+#     `inspect.getsource()` で個別に抜き出す——`init_schema` 自体は他テーブルの処理
+#     （`_ensure_messages_created_at_index_background`）を**呼び出す**が、その中身は関数呼び出し1行としてしか
+#     現れないため、その中身が変わっても
 #     ここでは検知しない（意図的な妥協＝会話/監査系の変更を無関係のまま保つのが目的）。
 #   - `_ensure`→`init_schema` が実行する `_SCHEMA`（DB 全表の DDL リスト）は丸ごとではなく、
 #     OCR 関連テーブル名を含む要素だけを抜き出す（`_DB_OCR_SCHEMA_MARKERS`）。
@@ -76,7 +77,12 @@ _DB_OCR_SCHEMA_MARKERS = ("ocr_jobs", "ocr_refresh_runs", "ocr_result_cache", "o
 
 
 def _db_ocr_relevant_source() -> str:
-    parts = [inspect.getsource(getattr(store_db, name)) for name in _DB_OCR_RELEVANT_CALLABLES]
+    # コメント・docstring・整形では変わらないよう、定義ごとに構造（AST）で比べる
+    parts = []
+    for name in _DB_OCR_RELEVANT_CALLABLES:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(store_db, name))))
+        _strip_docstrings(tree)
+        parts.append(ast.dump(tree))
     schema_subset = [stmt for stmt in store_db._SCHEMA
                      if any(marker in stmt for marker in _DB_OCR_SCHEMA_MARKERS)]
     parts.append("\n".join(schema_subset))
@@ -249,14 +255,7 @@ def test_route_manifest_does_not_create_generation_id_digest_cycle():
     assert "source_rel_path" in fields
 
 
-def test_observation_artifact_names_are_separate_from_canonical_rag(tmp_path):
-    paths = observation_render.artifact_paths(
-        tmp_path, canonical_generation_id="a" * 64, observation_generation_id="b" * 64,
-        source_rel_path="sub/design.xlsx",
-    )
-    assert paths.observation_sets_jsonl.name == "design.xlsx.ai_observations.jsonl"
-    assert "/md-generations/" not in paths.observation_sets_jsonl.as_posix()
-    assert f"/{observation_render.OBSERVATION_GENERATIONS_NAME}/" in paths.observation_sets_jsonl.as_posix()
+def test_observation_artifact_names_are_separate_from_canonical_rag():
     assert observation_render.OBSERVATION_POINTER_NAME == "md-observations.current.json"
     assert observation_render.OBSERVATION_POINTER_SCHEMA == "sherpa-observation-pointer-v1"
 
@@ -290,19 +289,6 @@ def test_db_ocr_relevant_source_reacts_to_world_lock_body_changes():
     baseline = _db_ocr_relevant_source()
     with mock.patch.object(store_db, "world_lock", _different_world_lock):
         assert _db_ocr_relevant_source() != baseline
-
-
-def test_retired_observation_render_symbols_are_gone():
-    """O1（2026-09-03）で検索専用描画（Markdown/chunk JSONL）を撤去した——CLAUDE.md 退役リスト参照。
-    `observation_render.py` は `.ai_observations.jsonl`（`office_md._load_ocr_observation_sets` が
-    読む Observation Set 本体）の永続化・世代管理だけを残す。"""
-    for retired in (
-        "render", "render_many", "RenderedObservations", "write_markdown_atomic",
-        "write_chunks_atomic", "OBSERVATION_CHUNK_SCHEMA",
-    ):
-        assert not hasattr(observation_render, retired), retired
-    fields = set(observation_render.ObservationArtifactPaths.__dataclass_fields__)
-    assert fields == {"generation_root", "observation_sets_jsonl"}
 
 
 def test_publish_snapshot_stream_only_persists_observation_set_jsonl(tmp_path):

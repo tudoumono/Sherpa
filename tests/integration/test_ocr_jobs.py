@@ -30,6 +30,12 @@ def _route(route_input_id: str) -> dict:
     }
 
 
+def _enqueue(**fields):
+    ocr_jobs._ensure()
+    with ocr_jobs._connect() as connection:
+        return ocr_jobs._insert_job(connection, ocr_jobs._job_values(**fields), 0, 3)
+
+
 def test_ocr_job_lease_token_idempotence_retry_and_world_cache():
     _init_or_skip()
     world = "test-ocr-" + uuid.uuid4().hex
@@ -44,8 +50,8 @@ def test_ocr_job_lease_token_idempotence_retry_and_world_cache():
         "engine_profile_hash": "sha256:" + "e" * 64,
     }
     try:
-        first = ocr_jobs.enqueue_job(**common)
-        duplicate = ocr_jobs.enqueue_job(**common)
+        first = _enqueue(**common)
+        duplicate = _enqueue(**common)
         assert duplicate["id"] == first["id"]
 
         leased = ocr_jobs.lease_next("worker-a", lease_seconds=60, world=world)
@@ -60,22 +66,21 @@ def test_ocr_job_lease_token_idempotence_retry_and_world_cache():
         assert retried["status"] == "queued"
         leased_again = ocr_jobs.lease_next("worker-b", lease_seconds=60, world=world)
         assert leased_again["attempts"] == 2 and leased_again["lease_token"] != leased["lease_token"]
+        cache_first = ocr_jobs.put_cached_result_for_lease(
+            leased_again["id"], leased_again["lease_token"], world, "sha256:" + "1" * 64, "sha256:" + "e" * 64,
+            {"schema": "ocr-engine-lines-v1", "observations": [{"text": "first"}]},
+        )
+        cache_second = ocr_jobs.put_cached_result_for_lease(
+            leased_again["id"], leased_again["lease_token"], world, "sha256:" + "1" * 64, "sha256:" + "e" * 64,
+            {"schema": "ocr-engine-lines-v1", "observations": [{"text": "second"}]},
+        )
+        assert cache_first["result_hash"] == cache_second["result_hash"]
+        assert cache_second["result_payload"]["observations"][0]["text"] == "first"
         completed = ocr_jobs.complete_job(
             leased_again["id"], leased_again["lease_token"], observation_set_hash="sha256:" + "f" * 64,
             result_payload={"schema_version": "ai-observation-set-v1alpha2"},
         )
         assert completed["status"] == "succeeded"
-
-        cache_first = ocr_jobs.put_cached_result(
-            world, "sha256:" + "1" * 64, "sha256:" + "e" * 64,
-            {"schema": "ocr-engine-lines-v1", "observations": [{"text": "first"}]},
-        )
-        cache_second = ocr_jobs.put_cached_result(
-            world, "sha256:" + "1" * 64, "sha256:" + "e" * 64,
-            {"schema": "ocr-engine-lines-v1", "observations": [{"text": "second"}]},
-        )
-        assert cache_first["result_hash"] == cache_second["result_hash"]
-        assert cache_second["result_payload"]["observations"][0]["text"] == "first"
 
         summary = ocr_jobs.status_summary(world, generation)
         assert summary["counts"]["succeeded"] == 1
@@ -101,8 +106,7 @@ def test_ocr_refresh_run_lease_progress_and_world_purge():
         ) is True
         completed = ocr_jobs.complete_refresh_run(leased["id"], leased["lease_token"])
         assert completed["status"] == "completed"
-        summary = ocr_jobs.refresh_run_summary(world, generation)
-        assert summary["manifests"] == 1 and summary["selected"] == 2 and summary["jobs"] == 2
+        assert (completed["manifests_processed"], completed["selected_count"], completed["jobs_enqueued"]) == (1, 2, 2)
     finally:
         removed = ocr_jobs.purge_world(world)
         assert removed["refresh_runs"] == 1
@@ -114,7 +118,7 @@ def test_succeeded_results_stream_and_snapshot_mark_use_real_postgres():
     generation = "a" * 64
     try:
         for index, source_rel_path in enumerate(("a/large.pdf", "b/image.png"), start=1):
-            ocr_jobs.enqueue_job(
+            _enqueue(
                 world=world,
                 source_rel_path=source_rel_path,
                 canonical_generation_id=generation,
@@ -139,7 +143,8 @@ def test_succeeded_results_stream_and_snapshot_mark_use_real_postgres():
         snapshot = ocr_jobs.succeeded_results_snapshot(world, generation)
         assert snapshot["row_count"] == 2
         assert ocr_jobs.mark_snapshot_artifacts_published(world, generation, snapshot) == 2
-        assert all(row["artifact_published"] for row in ocr_jobs.list_succeeded_results(world, generation))
+        assert all(row["artifact_published"] for row in ocr_jobs.iter_succeeded_results(
+            world, generation, observation_render._relative_source_path))
     finally:
         ocr_jobs.purge_world(world)
 
@@ -151,13 +156,14 @@ def _world_rows(world: str) -> int:
 
 
 def _enqueue_one(world: str) -> None:
-    ocr_jobs.enqueue_job(
+    _enqueue(
         world=world, source_rel_path="sub/design.xlsx", canonical_generation_id="a" * 64,
         source_content_hash="sha256:" + "b" * 64, route_manifest_hash="sha256:" + "c" * 64,
         route_input=_route("route-1"), engine_profile_hash="sha256:" + "e" * 64,
     )
-    ocr_jobs.put_cached_result(
-        world, "sha256:" + "1" * 64, "sha256:" + "e" * 64,
+    leased = ocr_jobs.lease_next("worker", lease_seconds=60, world=world)
+    ocr_jobs.put_cached_result_for_lease(
+        leased["id"], leased["lease_token"], world, "sha256:" + "1" * 64, "sha256:" + "e" * 64,
         {"schema": "ocr-engine-lines-v1", "observations": [{"text": "secret"}]},
     )
 

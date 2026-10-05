@@ -2,8 +2,8 @@
 クイック/標準/深く/最大）。
 
 - `review_rounds_for`: 見直しの巡数（クイック 0／標準 2／深く 4／最大＝管理画面の共通上限）。
-- `scaled_turns`/`scaled_ratio`/`scaled_depth`: 深さに応じて探索量を拡大する（ターン数
-  ×0.5/×1/×2/×3・ヒット上限と読取窓 ×0.5/×1/×1.5/×2・たどる深さ +0/+0/+2/+4）。クイックだけ
+- `scaled_ratio`/`scaled_depth`: 深さに応じて探索量を拡大する（
+  ヒット上限と読取窓 ×0.5/×1/×1.5/×2・たどる深さ +0/+0/+2/+4）。クイックだけ
   ×0.5（網羅性の強化と、クイックを本当に速くする・変更D①）で最低1を保証する。
   `abs_max` の絶対上限は倍率適用後に一度だけ効く。不正な depth_profile は fail-loud のまま。
 - `codex_reasoning_for`: 推論レベルはクイックだけ `CODEX_REASONING_LEVELS` を1段下げる
@@ -40,25 +40,23 @@ def test_normalize_depth_profile_invalid_raises():
 # ヒット上限（基準 30）・読取窓（基準 40）・影響の段数（基準 8）・推論（基準 medium）・
 # 1段上の深さ。クイックだけ探索量が×0.5・推論が1段下（`low`）——他は基準値のまま。
 _DEPTH_MATRIX = [
-    # profile,    rounds, turns, hits, window, depth, reasoning, escalated
-    ("quick",     0,      6,     15,   20,     8,     "low",     "standard"),
-    ("standard",  2,      12,    30,   40,     8,     "medium",  "deep"),
-    ("deep",      4,      24,    45,   60,     10,    "medium",  "max"),
-    ("max",       7,      36,    60,   80,     12,    "medium",  None),
+    # profile,    rounds, hits, window, depth, reasoning, escalated
+    ("quick",     0,      15,   20,     8,     "low",     "standard"),
+    ("standard",  2,      30,   40,     8,     "medium",  "deep"),
+    ("deep",      4,      45,   60,     10,    "medium",  "max"),
+    ("max",       7,      60,   80,     12,    "medium",  None),
 ]
 
 
-@pytest.mark.parametrize("profile,rounds,turns,hits,window,depth,reasoning,escalated", _DEPTH_MATRIX)
-def test_depth_matrix(profile, rounds, turns, hits, window, depth, reasoning, escalated):
+@pytest.mark.parametrize("profile,rounds,hits,window,depth,reasoning,escalated", _DEPTH_MATRIX)
+def test_depth_matrix(profile, rounds, hits, window, depth, reasoning, escalated):
     """4段（クイック/標準/深く/最大）の期待値表を1本で固定する。"""
     assert D.review_rounds_for(profile) == rounds
-    assert D.scaled_turns(12, profile) == turns
     assert D.scaled_ratio(30, profile) == hits
     assert D.scaled_ratio(40, profile) == window
     assert D.scaled_depth(8, profile) == depth
     assert D.codex_reasoning_for("medium", profile) == reasoning
     assert D.escalated_profile(profile) == escalated
-    assert D.usage_extras(profile)["depth_profile"] == profile
 
 
 @pytest.mark.parametrize("profile,expected", [("quick", 3), ("standard", 3), ("deep", 5), ("max", 7)])
@@ -121,25 +119,25 @@ def test_scaled_ratio_invalid_profile_still_raises():
 # ===== effective_base: system_settings（管理画面の基準値編集）→ env 既定 =====
 
 def test_effective_base_none_settings_uses_env_default():
-    assert D.effective_base(None, "max_turns", 12) == 12
+    assert D.effective_base(None, "grep_max_hits", 12) == 12
 
 
 def test_effective_base_empty_settings_uses_env_default():
-    assert D.effective_base({}, "max_turns", 12) == 12
+    assert D.effective_base({}, "grep_max_hits", 12) == 12
 
 
 def test_effective_base_configured_overrides_env_default():
-    assert D.effective_base({"depth_base_max_turns": 20}, "max_turns", 12) == 20
+    assert D.effective_base({"depth_base_grep_max_hits": 20}, "grep_max_hits", 12) == 20
 
 
 def test_effective_base_zero_or_negative_falls_back_to_env_default():
     """0以下は無効値として env_default へ fail-open（管理画面のクリア操作の安全網）。"""
-    assert D.effective_base({"depth_base_max_turns": 0}, "max_turns", 12) == 12
-    assert D.effective_base({"depth_base_max_turns": -5}, "max_turns", 12) == 12
+    assert D.effective_base({"depth_base_grep_max_hits": 0}, "grep_max_hits", 12) == 12
+    assert D.effective_base({"depth_base_grep_max_hits": -5}, "grep_max_hits", 12) == 12
 
 
 def test_effective_base_non_numeric_falls_back_to_env_default():
-    assert D.effective_base({"depth_base_max_turns": "not-a-number"}, "max_turns", 12) == 12
+    assert D.effective_base({"depth_base_grep_max_hits": "not-a-number"}, "grep_max_hits", 12) == 12
 
 
 def test_effective_base_codex_reasoning_string_passthrough():
@@ -154,10 +152,10 @@ def test_effective_base_codex_reasoning_non_string_falls_back_to_env_default():
     assert D.effective_base({"depth_base_codex_reasoning": 123}, "codex_reasoning", "low") == "low"
 
 
-def test_base_settings_keys_cover_all_seven_knobs():
-    """admin-settings.html の基準値編集セクション（§3.2・§6 SC-6c）が扱う7項目。"""
+def test_base_settings_keys_cover_all_six_knobs():
+    """admin-settings.html の基準値編集セクション（§3.2・§6 SC-6c）が扱う6項目。"""
     assert set(D.BASE_SETTINGS_KEYS) == {
-        "max_turns", "grep_max_hits", "qa_max_hits", "read_window",
+        "grep_max_hits", "qa_max_hits", "read_window",
         "impact_depth", "troubleshoot_depth", "codex_reasoning",
     }
 
@@ -201,26 +199,6 @@ def test_scaled_depth_abs_max_omitted_keeps_existing_behavior():
 
 
 # ===== STAT-3 S1（利用統計の拡充）: usage メタへ足す depth 由来のキー =====
-
-@pytest.mark.parametrize("profile,mult", [("quick", 0.5), ("standard", 1), ("deep", 2), ("max", 3)])
-def test_effective_max_turns_composes_effective_base_and_scaled_turns(profile, mult):
-    """`effective_base(...,"max_turns",12)` → `scaled_turns(...)` と同じ結果（単一の真実源）＝
-    管理画面の基準値編集と深さの倍率の両方が効く。"""
-    assert D.effective_max_turns(None, 12, profile) == 12 * mult
-    assert D.effective_max_turns({"depth_base_max_turns": 20}, 1, profile) == 20 * mult
-
-
-def test_usage_extras_always_includes_depth_profile_defaulting_to_standard():
-    assert D.usage_extras(None) == {"depth_profile": "standard"}
-    assert D.usage_extras("deep") == {"depth_profile": "deep"}
-
-
-def test_usage_extras_omits_limits_unless_both_given():
-    """max_turns/max_tools_per_turn は両方揃ったときだけ足す（欠落は欄ごと省略）。"""
-    assert D.usage_extras("standard", max_turns=12) == {"depth_profile": "standard"}
-    assert D.usage_extras("standard", max_tools_per_turn=16) == {"depth_profile": "standard"}
-    assert D.usage_extras("deep", max_turns=24, max_tools_per_turn=16) == {
-        "depth_profile": "deep", "max_turns": 24, "max_tools_per_turn": 16}
 
 
 def test_usage_reasoning_extras_omits_base_when_unchanged():

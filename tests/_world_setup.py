@@ -47,7 +47,7 @@ try:
         f = {}
         for k in _store._SETTINGS_FIELDS:
             v = _ORIG_SETTINGS.get(k)
-            if k in ("openai_api_key", "gemini_api_key"):
+            if k == "openai_api_key":
                 f[k] = v if v else ""                    # None→""（クリア）で元の状態に一致
             elif v is not None:
                 f[k] = v

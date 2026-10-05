@@ -1,10 +1,13 @@
 """`SqlDdlAnalyzer` の単体テスト（アナライザ拡張 §4(a)/(g)＝A1・A10）。"""
 from __future__ import annotations
 
+import pytest
+
 from sherpa.ingest.analyzers._base import Analyzer
 from sherpa.ingest.analyzers.sql import SqlDdlAnalyzer
 
 A = SqlDdlAnalyzer()
+UNS = "ddl_unsupported"
 
 
 def test_extensions_and_name():
@@ -14,234 +17,109 @@ def test_extensions_and_name():
 
 
 def test_accepts_all_sql_files_without_content_inspection():
-    """§6: `.sql` は拡張子内を全件受理する——`accepts()` は既定のままオーバーライドしていない。"""
     assert SqlDdlAnalyzer.accepts is Analyzer.accepts
 
 
-# --- 単一 CREATE TABLE（primary のみ）---
-
-def test_single_create_table_becomes_table_primary_with_column_children():
-    text = (
-        "CREATE TABLE orders (\n"
-        "    id INT PRIMARY KEY,\n"
-        "    customer_id INT NOT NULL,\n"
-        "    CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers(id)\n"
-        ");\n"
-    )
-    res = A.collect_defs(text, "orders.sql")
-    assert res.primary is not None
-    assert res.primary.label == "Table" and res.primary.name == "ORDERS"     # 非引用＝大文字正規化
-    names = [(c.label, c.name, c.cid_key) for c in res.children]
-    assert names == [("DataItem", "ID", "ORDERS.ID"), ("DataItem", "CUSTOMER_ID", "ORDERS.CUSTOMER_ID")]
-    assert res.extras == [] and res.dropped == []
+def DI(name, key):
+    return ("DataItem", name, key)
 
 
-def test_quoted_identifier_table_and_columns_preserve_case():
-    text = 'CREATE TABLE "OrderLines" (\n    "LineNo" INT,\n    qty INT\n);\n'
-    res = A.collect_defs(text, "order_lines.sql")
-    assert res.primary.name == "OrderLines"                       # 引用識別子はそのまま（大文字小文字区別）
-    names = [(c.name, c.cid_key) for c in res.children]
-    assert names == [("LineNo", "OrderLines.LineNo"), ("QTY", "OrderLines.QTY")]
+# (入力, primary 名（None=primary なし）, primary.extra（None は検査しない）, 列 children（None は検査しない）,
+#  extras の primary 名列（None は検査しない）, Dropped の reason 列（None は検査しない）)
+CASES = {
+    "single_create_table_with_columns": (
+        "CREATE TABLE orders (\n    id INT PRIMARY KEY,\n    customer_id INT NOT NULL,\n"
+        "    CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers(id)\n);\n",
+        "ORDERS", None, [DI("ID", "ORDERS.ID"), DI("CUSTOMER_ID", "ORDERS.CUSTOMER_ID")], [], []),
+    "quoted_identifiers_preserve_case": (
+        'CREATE TABLE "OrderLines" (\n    "LineNo" INT,\n    qty INT\n);\n', "OrderLines", None,
+        [DI("LineNo", "OrderLines.LineNo"), DI("QTY", "OrderLines.QTY")], None, None),
+    "schema_dropped_into_extra": ("CREATE TABLE billing.orders (id INT);\n", "ORDERS", {"schema": "BILLING", "qualified_name": "BILLING.ORDERS"}, None, None, None),
+    "if_not_exists": ("CREATE TABLE IF NOT EXISTS orders (id INT);\n", "ORDERS", None, None, None, None),
+    "multiple_create_table_rest_are_extras": (
+        "CREATE TABLE orders (id INT);\nCREATE TABLE order_lines (order_id INT);\nCREATE TABLE customers (id INT);\n",
+        "ORDERS", None, None, ["ORDER_LINES", "CUSTOMERS"], None),
+    "constraint_lines_not_columns": (
+        "CREATE TABLE t (\n    id INT,\n    name VARCHAR(50),\n    PRIMARY KEY (id),\n"
+        "    FOREIGN KEY (id) REFERENCES other(id),\n    CONSTRAINT uq UNIQUE (name),\n    UNIQUE (name),\n"
+        "    INDEX idx_name (name),\n    KEY idx_name2 (name),\n    CHECK (id > 0)\n);\n",
+        "T", None, [DI("ID", "T.ID"), DI("NAME", "T.NAME")], None, None),
+    # 未対応 DDL/DML → Dropped（定義・参照は作らない）
+    "create_view": ("CREATE VIEW active_orders AS SELECT * FROM orders WHERE status = 'NEW';\n", None, None, None, None, [UNS]),
+    "procedure_function_trigger": (
+        "CREATE OR REPLACE PROCEDURE p1() BEGIN END;\nCREATE FUNCTION f1() RETURNS INT BEGIN END;\n"
+        "CREATE TRIGGER tr1 BEFORE INSERT ON t FOR EACH ROW BEGIN END;\n", None, None, None, None, [UNS] * 3),
+    "alter_table": ("ALTER TABLE orders ADD COLUMN notes VARCHAR(255);\n", None, None, None, None, [UNS]),
+    "dml_only": ("INSERT INTO orders (id) VALUES (1);\nSELECT * FROM orders;\n", None, None, None, None, ["dml_only"]),
+    "empty_or_irrelevant": ("-- just a comment\n", None, None, None, None, []),
+    "unrecognized_create_dialect_reported": (
+        "CREATE INDEX idx_orders_id ON orders (id);\nCREATE SEQUENCE seq1;\n", None, None, None, None, [UNS, UNS]),
+    # コメント・文字列リテラル内は無視
+    "create_table_in_line_comment": (
+        "-- CREATE TABLE FAKE (x INT);\nCREATE TABLE real_table (id INT);\n", "REAL_TABLE", None, None, [], None),
+    "create_table_in_block_comment": (
+        "/* CREATE TABLE FAKE (x INT); */\nCREATE TABLE real_table (id INT);\n", "REAL_TABLE", None, None, [], None),
+    "create_table_in_string_literal": (
+        "CREATE TABLE orders (\n    id INT,\n    memo VARCHAR(255) DEFAULT 'trap: CREATE TABLE FAKE (y INT)'\n);\n",
+        "ORDERS", None, [DI("ID", "ORDERS.ID"), DI("MEMO", "ORDERS.MEMO")], [], None),
+    "escaped_quote_does_not_end_string_early": (
+        "CREATE TABLE orders (\n    id INT,\n    memo VARCHAR(255) DEFAULT 'it''s a trap: CREATE TABLE FAKE (y INT)'\n);\n",
+        "ORDERS", None, [DI("ID", "ORDERS.ID"), DI("MEMO", "ORDERS.MEMO")], None, None),
+    # 引用識別子の内側の `--` はコメントと誤解釈しない
+    "double_quoted_identifier_with_comment_marker": ('CREATE TABLE "a--b" (id INT);\n', "a--b", None, None, None, []),
+    "bracket_quoted_identifier_with_comment_marker": ("CREATE TABLE [a--b] (id INT);\n", "a--b", None, None, None, []),
+    # 同じ schema＋名前の重複は 2件目を Dropped
+    "same_schema_name_collision": (
+        "CREATE TABLE a.orders (id INT);\nCREATE TABLE a.orders (id INT, extra INT);\n",
+        "ORDERS", {"schema": "A", "qualified_name": "A.ORDERS"}, [DI("ID", "ORDERS.ID")], [], ["table_name_collision"]),
+    # 方言
+    "global_temporary_table": ("CREATE GLOBAL TEMPORARY TABLE staging (id INT);\n", "STAGING", None, [DI("ID", "STAGING.ID")], None, []),
+    "local_temporary_table": ("CREATE LOCAL TEMPORARY TABLE staging (id INT);\n", "STAGING", None, None, None, None),
+    "unlogged_and_temp_tables": (
+        "CREATE UNLOGGED TABLE a (id INT);\nCREATE TEMP TABLE b (id INT);\nCREATE TEMPORARY TABLE IF NOT EXISTS c (id INT);\n",
+        "A", None, [DI("ID", "A.ID")], ["B", "C"], []),
+    "ctas_parenthesized_and_with": (
+        "CREATE TABLE a AS (SELECT 1 AS x FROM dual);\nCREATE TABLE b AS WITH c AS (SELECT 1) SELECT * FROM c;\n",
+        "A", None, [], ["B"], []),
+    "create_table_as_select_has_no_columns": (
+        "CREATE TABLE recent_orders AS SELECT * FROM orders WHERE status = 'NEW';\n", "RECENT_ORDERS", None, [], None, []),
+}
 
 
-def test_schema_qualified_name_drops_schema_into_extra():
-    text = "CREATE TABLE billing.orders (id INT);\n"
-    res = A.collect_defs(text, "orders.sql")
-    assert res.primary.name == "ORDERS"
-    assert res.primary.extra == {"schema": "BILLING"}
-
-
-def test_if_not_exists_is_accepted():
-    text = "CREATE TABLE IF NOT EXISTS orders (id INT);\n"
-    res = A.collect_defs(text, "orders.sql")
-    assert res.primary is not None and res.primary.name == "ORDERS"
-
-
-# --- 複数 CREATE TABLE（A10・extras）---
-
-def test_multiple_create_table_first_is_primary_rest_are_extras():
-    text = (
-        "CREATE TABLE orders (id INT);\n"
-        "CREATE TABLE order_lines (order_id INT);\n"
-        "CREATE TABLE customers (id INT);\n"
-    )
-    res = A.collect_defs(text, "schema.sql")
-    assert res.primary.name == "ORDERS"
-    assert [g.primary.name for g in res.extras] == ["ORDER_LINES", "CUSTOMERS"]
-    assert [c.name for c in res.extras[0].children] == ["ORDER_ID"]
-    assert [c.name for c in res.extras[1].children] == ["ID"]
-
-
-# --- 制約行は列にしない ---
-
-def test_constraint_lines_are_not_columns():
-    text = (
-        "CREATE TABLE t (\n"
-        "    id INT,\n"
-        "    name VARCHAR(50),\n"
-        "    PRIMARY KEY (id),\n"
-        "    FOREIGN KEY (id) REFERENCES other(id),\n"
-        "    CONSTRAINT uq UNIQUE (name),\n"
-        "    UNIQUE (name),\n"
-        "    INDEX idx_name (name),\n"
-        "    KEY idx_name2 (name),\n"
-        "    CHECK (id > 0)\n"
-        ");\n"
-    )
+@pytest.mark.parametrize("text,name,extra,children,extras,dropped", CASES.values(), ids=CASES)
+def test_collect_defs(text, name, extra, children, extras, dropped):
     res = A.collect_defs(text, "t.sql")
-    assert [c.name for c in res.children] == ["ID", "NAME"]
+    if name is None:
+        assert res.primary is None
+    else:
+        assert res.primary is not None and res.primary.label == "Table" and res.primary.name == name
+    assert extra is None or res.primary.extra == extra
+    if children is not None:
+        assert [(c.label, c.name, c.cid_key) for c in res.children] == children
+    if extras is not None:
+        assert [g.primary.name for g in res.extras] == extras
+    if dropped is not None:
+        assert [d.reason for d in res.dropped] == dropped
 
 
-# --- 未対応 DDL/DML → Dropped（定義・参照は作らない）---
-
-def test_create_view_yields_no_primary_and_ddl_unsupported_dropped():
-    text = "CREATE VIEW active_orders AS SELECT * FROM orders WHERE status = 'NEW';\n"
-    res = A.collect_defs(text, "view.sql")
-    assert res.primary is None
-    assert [d.reason for d in res.dropped] == ["ddl_unsupported"]
+def test_extras_carry_their_own_columns():
+    res = A.collect_defs("CREATE TABLE orders (id INT);\nCREATE TABLE order_lines (order_id INT);\n"
+                         "CREATE TABLE customers (id INT);\n", "schema.sql")
+    assert [[c.name for c in g.children] for g in res.extras] == [["ORDER_ID"], ["ID"]]
 
 
-def test_create_or_replace_procedure_function_trigger_yield_ddl_unsupported():
-    text = (
-        "CREATE OR REPLACE PROCEDURE p1() BEGIN END;\n"
-        "CREATE FUNCTION f1() RETURNS INT BEGIN END;\n"
-        "CREATE TRIGGER tr1 BEFORE INSERT ON t FOR EACH ROW BEGIN END;\n"
-    )
-    res = A.collect_defs(text, "proc.sql")
-    assert res.primary is None
-    assert [d.reason for d in res.dropped] == ["ddl_unsupported"] * 3
-
-
-def test_alter_table_yields_ddl_unsupported_dropped():
-    text = "ALTER TABLE orders ADD COLUMN notes VARCHAR(255);\n"
-    res = A.collect_defs(text, "alter.sql")
-    assert res.primary is None
-    assert [d.reason for d in res.dropped] == ["ddl_unsupported"]
-
-
-def test_dml_only_file_yields_dml_only_dropped():
-    text = "INSERT INTO orders (id) VALUES (1);\nSELECT * FROM orders;\n"
-    res = A.collect_defs(text, "dml.sql")
-    assert res.primary is None
-    assert [d.reason for d in res.dropped] == ["dml_only"]
-
-
-def test_empty_or_irrelevant_file_yields_no_defs_and_no_dropped():
-    res = A.collect_defs("-- just a comment\n", "empty.sql")
-    assert res.primary is None and res.dropped == []
-
-
-# --- コメント/文字列リテラル内は無視する ---
-
-def test_create_table_inside_line_comment_is_ignored():
-    text = "-- CREATE TABLE FAKE (x INT);\nCREATE TABLE real_table (id INT);\n"
-    res = A.collect_defs(text, "t.sql")
-    assert res.primary.name == "REAL_TABLE"
-    assert res.extras == []
-
-
-def test_create_table_inside_block_comment_is_ignored():
-    text = "/* CREATE TABLE FAKE (x INT); */\nCREATE TABLE real_table (id INT);\n"
-    res = A.collect_defs(text, "t.sql")
-    assert res.primary.name == "REAL_TABLE"
-    assert res.extras == []
-
-
-def test_create_table_inside_string_literal_is_ignored():
-    text = (
-        "CREATE TABLE orders (\n"
-        "    id INT,\n"
-        "    memo VARCHAR(255) DEFAULT 'trap: CREATE TABLE FAKE (y INT)'\n"
-        ");\n"
-    )
-    res = A.collect_defs(text, "t.sql")
-    assert res.primary.name == "ORDERS"
-    assert [c.name for c in res.children] == ["ID", "MEMO"]
-    assert res.extras == []
-
-
-def test_string_literal_escaped_quote_does_not_end_string_early():
-    text = (
-        "CREATE TABLE orders (\n"
-        "    id INT,\n"
-        "    memo VARCHAR(255) DEFAULT 'it''s a trap: CREATE TABLE FAKE (y INT)'\n"
-        ");\n"
-    )
-    res = A.collect_defs(text, "t.sql")
-    assert res.primary.name == "ORDERS"
-    assert [c.name for c in res.children] == ["ID", "MEMO"]
-
-
-# --- 引用識別子の内側の `--`/`/* */` はコメントと誤解釈しない ---
-
-def test_double_quoted_identifier_containing_comment_marker_is_not_truncated():
-    """`"a--b"` の `--` は行コメントの開始と誤認しない——`)` まで読み切って Table にする。"""
-    text = 'CREATE TABLE "a--b" (id INT);\n'
-    res = A.collect_defs(text, "t.sql")
-    assert res.primary is not None
-    assert res.primary.name == "a--b"
+def test_same_name_in_another_schema_is_a_separate_table_with_its_own_key():
+    res = A.collect_defs("CREATE TABLE a.orders (id INT);\nCREATE TABLE b.orders (id INT);\n", "schema.sql")
     assert res.dropped == []
+    assert (res.primary.key, res.extras[0].primary.key) == ("ORDERS", "B.ORDERS")
+    assert res.extras[0].children[0].cid_key == "B.ORDERS.ID"
 
 
-def test_bracket_quoted_identifier_containing_comment_marker_is_not_truncated():
-    """`[a--b]` も同様——角括弧識別子の中身はコメントと誤解釈しない。"""
-    text = "CREATE TABLE [a--b] (id INT);\n"
-    res = A.collect_defs(text, "t.sql")
-    assert res.primary is not None
-    assert res.primary.name == "a--b"
-    assert res.dropped == []
+def test_collision_snippet_names_the_second_table():
+    res = A.collect_defs("CREATE TABLE a.orders (id INT);\nCREATE TABLE a.orders (id INT);\n", "schema.sql")
+    assert res.dropped[0].snippet == "a.orders"
 
-
-# --- extract_refs は常に空（DDL は他ファイルを参照しない）---
 
 def test_extract_refs_is_always_empty():
-    text = "CREATE TABLE orders (id INT);\nALTER TABLE orders ADD COLUMN x INT;\n"
-    res = A.extract_refs(text, "t.sql")
+    res = A.extract_refs("CREATE TABLE orders (id INT);\nALTER TABLE orders ADD COLUMN x INT;\n", "t.sql")
     assert res.refs == [] and res.dropped == []
-
-
-# --- schema 除去後の同名 Table は cid が衝突するため2件目以降を Dropped にする ---
-
-def test_schema_qualified_same_table_name_collision_only_first_is_defined():
-    text = (
-        "CREATE TABLE a.orders (id INT);\n"
-        "CREATE TABLE b.orders (id INT, extra INT);\n"
-    )
-    res = A.collect_defs(text, "schema.sql")
-    assert res.primary.name == "ORDERS" and res.primary.extra == {"schema": "A"}
-    assert res.extras == []
-    assert [d.reason for d in res.dropped] == ["table_name_collision"]
-    assert res.dropped[0].snippet == "b.orders"
-
-
-# --- CREATE TABLE 方言（GLOBAL/LOCAL TEMPORARY・CTAS）---
-
-def test_global_temporary_table_is_accepted():
-    text = "CREATE GLOBAL TEMPORARY TABLE staging (id INT);\n"
-    res = A.collect_defs(text, "t.sql")
-    assert res.primary is not None and res.primary.name == "STAGING"
-    assert [c.name for c in res.children] == ["ID"]
-    assert res.dropped == []
-
-
-def test_local_temporary_table_is_accepted():
-    text = "CREATE LOCAL TEMPORARY TABLE staging (id INT);\n"
-    res = A.collect_defs(text, "t.sql")
-    assert res.primary is not None and res.primary.name == "STAGING"
-
-
-def test_create_table_as_select_yields_table_with_no_columns():
-    text = "CREATE TABLE recent_orders AS SELECT * FROM orders WHERE status = 'NEW';\n"
-    res = A.collect_defs(text, "t.sql")
-    assert res.primary is not None
-    assert res.primary.name == "RECENT_ORDERS" and res.children == []
-    assert res.dropped == []
-
-
-# --- CREATE TABLE/ALTER TABLE 以外の CREATE 方言は必ず ddl_unsupported にする ---
-
-def test_unrecognized_create_dialect_is_reported_as_ddl_unsupported_not_silently_dropped():
-    text = "CREATE INDEX idx_orders_id ON orders (id);\nCREATE SEQUENCE seq1;\n"
-    res = A.collect_defs(text, "t.sql")
-    assert res.primary is None
-    assert [d.reason for d in res.dropped] == ["ddl_unsupported", "ddl_unsupported"]

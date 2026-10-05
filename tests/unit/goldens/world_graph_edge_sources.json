@@ -1,0 +1,96 @@
+{
+  "called_twice": [
+    {
+      "type": "INVOKES",
+      "src": "module:s7_test:g/main.c#main.c.main",
+      "dst": "module:s7_test:g/helper.c#helper.c.helper",
+      "sources": [
+        {
+          "via": "call",
+          "doc_id": "g/main.c",
+          "file": "g/main.c",
+          "line": 2,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "g/main.c",
+            "key": "main.c.main"
+          }
+        },
+        {
+          "via": "call",
+          "doc_id": "g/main.c",
+          "file": "g/main.c",
+          "line": 3,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "g/main.c",
+            "key": "main.c.main"
+          }
+        }
+      ]
+    },
+    {
+      "type": "INVOKES",
+      "src": "module:s7_test:g/main.c#main.c.other",
+      "dst": "module:s7_test:g/helper.c#helper.c.helper",
+      "sources": [
+        {
+          "via": "call",
+          "doc_id": "g/main.c",
+          "file": "g/main.c",
+          "line": 7,
+          "rule": "nearest_name",
+          "from_def": {
+            "file": "g/main.c",
+            "key": "main.c.other"
+          }
+        }
+      ]
+    }
+  ],
+  "single_import": [
+    {
+      "type": "INVOKES",
+      "src": "module:s7_test:g/app/Main.java#Main",
+      "dst": "module:s7_test:g/lib/Target.java#Target",
+      "sources": [
+        {
+          "via": "call",
+          "doc_id": "g/app/Main.java",
+          "file": "g/app/Main.java",
+          "line": 4,
+          "rule": "single_import",
+          "from_def": {
+            "file": "g/app/Main.java",
+            "key": null
+          }
+        }
+      ]
+    }
+  ],
+  "mentioned_twice": [
+    {
+      "type": "DOCUMENTS",
+      "src": "document:s7_test:g/設計書.md",
+      "dst": "module:s7_test:g/helper.c#helper.c.helper",
+      "sources": [
+        {
+          "via": "mention",
+          "doc_id": "g/設計書.md",
+          "file": "g/設計書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "概要・本文 2 行目"
+        },
+        {
+          "via": "mention",
+          "doc_id": "g/設計書.md",
+          "file": "g/設計書.md",
+          "line": 0,
+          "rule": "dictionary_match",
+          "locator": "詳細・本文 5 行目"
+        }
+      ]
+    }
+  ]
+}

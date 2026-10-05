@@ -1,0 +1,8 @@
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <RootNamespace>Beta</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\Inner\Shop\Basket.vb;Use.vb" />
+  </ItemGroup>
+</Project>

@@ -11,8 +11,6 @@ __pycache__
 fixtures
 # テストコード
 tests
-# 画面モック
-mockups
 # 設計ドキュメント（配布物には不要）
 docs
 # World原本・派生物・観測cache・model cache。OCR imageのbuild contextへも絶対に送らない。

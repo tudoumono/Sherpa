@@ -1,6 +1,7 @@
-"""`CssAnalyzer` の単体テスト（アナライザ拡張 波3 レーン A・docs/archive/2026-09-05-アナライザ拡張.md
-§13）。"""
+"""`CssAnalyzer` の単体テスト（アナライザ拡張 波3 レーン A）。"""
 from __future__ import annotations
+
+import pytest
 
 from sherpa.ingest.analyzers._base import Analyzer
 from sherpa.ingest.analyzers.css import CssAnalyzer
@@ -20,79 +21,45 @@ def test_accepts_all_css_files_without_content_inspection():
 
 def test_collect_defs_primary_is_extension_included_filename_no_children():
     res = A.collect_defs("body { color: red; }", "static/style.css")
-    assert res.primary is not None
-    assert res.primary.label == "Module" and res.primary.name == "style.css"
+    assert res.primary is not None and res.primary.label == "Module" and res.primary.name == "style.css"
     assert res.children == []
 
 
-def test_import_url_function_with_double_quotes():
-    res = A.extract_refs('@import url("base.css");\n', "style.css")
+# (入力, path, [(name, include_path)], Dropped[(reason, line|None)])
+CASES = {
+    "import_url_double_quotes": ('@import url("base.css");\n', "style.css", [("base.css", "base.css")], []),
+    "import_url_without_quotes": ("@import url(base.css);\n", "style.css", [("base.css", "base.css")], []),
+    "import_bare_string": ('@import "base.css";\n', "style.css", [("base.css", "base.css")], []),
+    "import_single_quotes": ("@import url('base.css');\n", "style.css", [("base.css", "base.css")], []),
+    "relative_path_preserved": ('@import url("../common/base.css");\n', "sub/style.css",
+                                [("base.css", "../common/base.css")], []),
+    "windows_separator_normalized": (r'@import url("common\base.css");' + "\n", "style.css",
+                                     [("base.css", "common/base.css")], []),
+    "absolute_import_relative_to_referrer": ('@import url("/static/base.css");\n', "gen1/static/style.css",
+                                             [("base.css", "base.css")], []),
+    "query_string_stripped": ('@import url("base.css?v=1");\n', "style.css", [("base.css", "base.css")], []),
+    "selectors_and_property_values_not_extracted": ('.icon { background: url("icon.png"); }\n', "style.css", [], []),
+    "block_comment_not_scanned": ('/* @import url("commented.css"); */\n', "style.css", [], []),
+    "import_inside_string_not_read": ('.a { content: "@import \'str.css\';" }\n@import "real.css";\n', "style.css",
+                                      [("real.css", "real.css")], []),
+    "external_import_dropped": ('@import url("https://cdn.example.com/base.css");\n', "style.css", [],
+                                [("web_external_ref", 1)]),
+    "protocol_relative_import_dropped": ('@import url("//cdn.example.com/base.css");\n', "style.css", [],
+                                         [("web_external_ref", None)]),
+}
+
+
+@pytest.mark.parametrize("text,path,refs,dropped", CASES.values(), ids=CASES)
+def test_extract_refs(text, path, refs, dropped):
+    res = A.extract_refs(text, path)
     assert [(r.edge_type, r.kind, r.name, r.extra) for r in res.refs] == [
-        ("INVOKES", "Module", "base.css", {"via": "include", "include_path": "base.css"})]
+        ("INVOKES", "Module", n, {"via": "include", "include_path": p}) for n, p in refs]
+    assert len(res.dropped) == len(dropped)
+    for d, (reason, line) in zip(res.dropped, dropped):
+        assert d.reason == reason and (line is None or d.line == line)
 
 
-def test_import_url_function_without_quotes():
-    res = A.extract_refs('@import url(base.css);\n', "style.css")
-    assert res.refs[0].name == "base.css"
-
-
-def test_import_bare_string_without_url_function():
-    res = A.extract_refs('@import "base.css";\n', "style.css")
-    assert res.refs[0].name == "base.css"
-
-
-def test_import_single_quotes():
-    res = A.extract_refs("@import url('base.css');\n", "style.css")
-    assert res.refs[0].name == "base.css"
-
-
-def test_relative_path_include_path_is_preserved():
-    res = A.extract_refs('@import url("../common/base.css");\n', "sub/style.css")
-    assert res.refs[0].name == "base.css"
-    assert res.refs[0].extra["include_path"] == "../common/base.css"
-
-
-def test_windows_style_separator_is_normalized():
-    res = A.extract_refs(r'@import url("common\base.css");' + "\n", "style.css")
-    assert res.refs[0].extra["include_path"] == "common/base.css"
-
-
-def test_selectors_and_property_values_are_not_extracted():
-    """`@import` 以外（セレクタ・`background: url(...)` 等）は対象外。"""
-    res = A.extract_refs('.icon { background: url("icon.png"); }\n', "style.css")
-    assert res.refs == []
-
-
-def test_block_comment_contents_are_not_scanned():
-    res = A.extract_refs('/* @import url("commented.css"); */\n', "style.css")
-    assert res.refs == []
-
-
-# --- 外部参照スキーム（include 対象外） ---
-
-def test_external_import_is_dropped_not_included():
-    res = A.extract_refs('@import url("https://cdn.example.com/base.css");\n', "style.css")
-    assert res.refs == []
-    assert [(d.reason, d.line) for d in res.dropped] == [("web_external_ref", 1)]
-
-
-def test_protocol_relative_import_is_dropped_not_included():
-    res = A.extract_refs('@import url("//cdn.example.com/base.css");\n', "style.css")
-    assert res.refs == []
-    assert any(d.reason == "web_external_ref" for d in res.dropped)
-
-
-# --- `/` 始まりの include の scope 相対化 ---
-
-def test_absolute_import_is_converted_to_referrer_relative_path():
-    res = A.extract_refs('@import url("/static/base.css");\n', "gen1/static/style.css")
-    assert res.refs[0].name == "base.css"
-    assert res.refs[0].extra["include_path"] == "base.css"
-
-
-# --- URL 正規化（`?` 以降を basename取得の前に除去） ---
-
-def test_import_basename_strips_query_string():
-    res = A.extract_refs('@import url("base.css?v=1");\n', "style.css")
-    assert res.refs[0].name == "base.css"
-    assert res.refs[0].extra["include_path"] == "base.css"
+def test_syntax_error_is_reported_and_the_rest_is_still_read():
+    res = A.extract_refs('@import "a.css";\n.x { color: ; \n@import "b.css";\n', "style.css")
+    assert "syntax_error" in [d.reason for d in res.dropped]
+    assert [r.name for r in res.refs][0] == "a.css"

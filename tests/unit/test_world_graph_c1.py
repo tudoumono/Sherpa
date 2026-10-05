@@ -98,10 +98,10 @@ def test_duplicate_basename_header_resolves_to_nearer_directory_not_farther_one(
 def test_function_call_resolves_to_definition_child_not_prototype_child():
     """`via=call`＝`util_add(1, 2)` は util.c の定義（children）に解決する——同一 top_scope 内で
     util.c（main.c と同ディレクトリ＝距離0）が util.h（別ディレクトリ＝距離2）より近いため
-    プロトタイプ側へ誤接続しない（S9 S6 の受け入れ条件）。"""
+    プロトタイプ側へ誤接続しない（S9 S6 の受け入れ条件）。始点は呼び出しを含む関数 `main`。"""
     nodes, edges, _flags = _build()
     tuples = _edge_tuples(nodes, edges)
-    main_c = ("Module", "main.c", "gen1/src/main.c")
+    main_c = ("Module", "main", "gen1/src/main.c")
     util_add_def = ("Module", "util_add", "gen1/src/util.c")
     util_add_proto = ("Module", "util_add", "gen1/include/util.h")
     assert ("INVOKES", main_c, util_add_def, "call") in tuples
@@ -136,7 +136,7 @@ def test_c_source_external_prototype_is_not_a_fake_child_that_swallows_call_reso
     by_key = _node_keys(nodes)
     tuples = _edge_tuples(nodes, edges)
     assert ("Module", "target", "gen1/ext/caller_ext.c") not in by_key
-    caller_ext_c = ("Module", "caller_ext.c", "gen1/ext/caller_ext.c")
+    caller_ext_c = ("Module", "use_target", "gen1/ext/caller_ext.c")
     target_def = ("Module", "target", "gen1/ext/target.c")
     assert ("INVOKES", caller_ext_c, target_def, "call") in tuples
 
@@ -146,7 +146,7 @@ def test_equidistant_declaration_and_definition_resolves_to_the_definition():
     定義側を優先する——等距離だからといって `ambiguous` に落とさない（§9・定義優先の中核ケース）。"""
     nodes, edges, flags = _build()
     tuples = _edge_tuples(nodes, edges)
-    main2_c = ("Module", "main2.c", "gen1/eqdist/main2.c")
+    main2_c = ("Module", "use_pref", "gen1/eqdist/main2.c")
     pref_def = ("Module", "pref_add", "gen1/eqdist/pref.c")
     pref_decl = ("Module", "pref_add", "gen1/eqdist/pref.h")
     assert ("INVOKES", main2_c, pref_def, "call") in tuples
@@ -172,7 +172,7 @@ def test_declaration_only_call_resolves_to_the_header_child_when_no_definition_e
     フォールバック側）。"""
     nodes, edges, _flags = _build()
     tuples = _edge_tuples(nodes, edges)
-    caller_only = ("Module", "caller_only.c", "gen1/decl_only/caller_only.c")
+    caller_only = ("Module", "use_only", "gen1/decl_only/caller_only.c")
     only_decl = ("Module", "only_decl", "gen1/decl_only/only.h")
     assert ("INVOKES", caller_only, only_decl, "call") in tuples
 
