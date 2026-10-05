@@ -423,13 +423,17 @@ Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に�
 ./sherpactl logs c e m                          # 同じことの短縮
 ./sherpactl logs -n 500 convert                 # 最初に末尾 500 行から
 ./sherpactl logs err                            # エラー・警告だけ拾う
+./sherpactl logs -g 'ERROR'                     # エラーだけ（警告は出さない）
+./sherpactl logs -g 'WARN'                      # 警告だけ
+./sherpactl logs app err                        # アプリ本体のエラー・警告だけ
+./sherpactl logs err -x elasticsearch           # エラー・警告から Elasticsearch の起動時の警告を除く
 ./sherpactl logs -h                             # 指定できる名前の一覧
 ./sherpactl logs -r                             # 取り込み後の振り返りレポート
 ./sherpactl logs -x api                         # アプリ全般から api のノイズを抜く
 ./sherpactl logs -l                             # いまの状況を一覧で（追わない）
 ```
 
-make の書き方（`make logs convert embed`・`make l c e m`・`NAME=convert,embed`・`MEM=1`・`REPORT=1`・`N=500`）も使えます。
+make の書き方（`make logs convert embed`・`make logs err`・`make l c e m`・`NAME=convert,embed`・`MEM=1`・`REPORT=1`・`N=500`）も使えます。`make l` の `l` は `logs` の短縮で、**小文字のエル**です（`|`＝パイプではありません。`make | err` と打つと「err というコマンドは無い」と言われます）。迷ったら `make logs …` と書いてください。`-g`・`-x` のような `-` で始まる指定は make に取られるため、`./sherpactl logs …` で使います。
 
 ### 起動時の退避（ローテーション）
 
