@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ... import agentic_search
+from ... import agentic_search, metering
 from ... import depth_profile as depth_profile_mod
 from ...env_int import env_int
 from ..base import _usage_meta
@@ -61,6 +61,7 @@ def _usage_from_turn_completed(event: dict, model: str | None, *, codex_model_pr
                        cached_input_tokens=u.get("cached_input_tokens"),
                        output_tokens=u.get("output_tokens"),
                        reasoning_output_tokens=u.get("reasoning_output_tokens"),
+                       cache_write_tokens=metering.cache_write_from_usage(u, u.get("input_tokens_details")),
                        is_local=agent_constructs.is_local("codex", codex_model_provider=codex_model_provider,
                                                           system_settings=system_settings))
 
@@ -82,7 +83,7 @@ def _read_mcp_sidecar(path: Path) -> tuple[list, list, dict | None, list, dict]:
     ask: dict | None = None
     error_codes: list = []
     limits = {"tool_result_clipped": 0, "total_budget_hit": False, "duplicate_tool_call": 0,
-             "search_truncated": 0, "tool_calls_exhausted": False}
+             "search_truncated": 0, "tool_calls_exhausted": False, "coverage_write_failed": 0}
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -124,6 +125,8 @@ def _read_mcp_sidecar(path: Path) -> tuple[list, list, dict | None, list, dict]:
                         limits["search_truncated"] += 1
                     elif field == "tool_calls_exhausted":
                         limits["tool_calls_exhausted"] = True
+                    elif field == "coverage_write_failed":
+                        limits["coverage_write_failed"] += 1
     except (OSError, UnicodeDecodeError):
         # UnicodeDecodeError は行の読取自体で起きうる。ここまでに集めた分は返す（部分的な fail-open）。
         pass
@@ -131,6 +134,8 @@ def _read_mcp_sidecar(path: Path) -> tuple[list, list, dict | None, list, dict]:
 
 
 _CHILD_USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+# 4 種とは別に持つキャッシュ書き込み量の欄（返されなければ None＝不明）。
+CACHE_WRITE_KEY = "cache_write_tokens"
 
 
 def _collect_child_token_usage(codex_home: Path, child_thread_ids: set,
@@ -143,10 +148,12 @@ def _collect_child_token_usage(codex_home: Path, child_thread_ids: set,
     (b) 旧形式: `session_meta.payload.id` が `spawn_agent` の `collab_tool_call` から捕捉した `child_thread_ids` に含まれる。
     検出した子のうち最後の `token_count`（`payload.info.total_token_usage`）があるものだけ `found_ids` に入れ、usage を1子につき1回だけ合算する。検出できたのに usage が取れなかった id（rollout が見つからない旧形式 id を含む）は `missing` に残す（推定で埋めない）。壊れた JSONL・欠損・存在しない codex_home は fail-open。
     戻り値: `(totals, found, missing, detected)`（`detected` は `found + missing` と一致）。
+    `totals[CACHE_WRITE_KEY]` は usage を読めた子がすべてキャッシュ書き込み量を返したときだけ入れ、1 体でも返さない（または読めた子が 0 体）なら項目ごと載せない（不明）。
     """
     totals = dict.fromkeys(_CHILD_USAGE_KEYS, 0)
     if not child_thread_ids and not parent_thread_id:
         return totals, 0, 0, 0
+    cache_write: int | None = 0
     detected_ids: set = set()
     found_ids: set = set()
     remaining_old = set(child_thread_ids)
@@ -192,7 +199,12 @@ def _collect_child_token_usage(codex_home: Path, child_thread_ids: set,
                     found_ids.add(tid)
                     for k in _CHILD_USAGE_KEYS:
                         totals[k] += int(last_usage.get(k) or 0)
+                    cache_write = metering.sum_cache_write(
+                        cache_write, metering.cache_write_from_usage(
+                            last_usage, last_usage.get("input_tokens_details")))
         except (OSError, ValueError, TypeError, AttributeError):
             continue
+    if found_ids and cache_write is not None:
+        totals[CACHE_WRITE_KEY] = cache_write
     all_detected = detected_ids | child_thread_ids  # rollout 自体が見つからなかった旧形式 id も含める
     return totals, len(found_ids), len(all_detected - found_ids), len(all_detected)

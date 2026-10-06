@@ -12,9 +12,13 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from ... import metering
+
 _log = logging.getLogger("sherpa")
 
 _CHILD_USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+# 各 agent の `tokens` に 4 種とは別に載せるキャッシュ書き込み量（返されなければ項目ごと載せない＝不明）。
+_CACHE_WRITE_KEY = "cache_write_tokens"
 _MAX_ROUNDS = 1000  # `rounds` 配列をこの件数で打ち切る（tokens/tools/compactions の集計は最後まで続ける）。
 
 # 集計に寄与しない既知のペイロード種別。ここに無い種別は `unparsed` へ計上する。
@@ -248,6 +252,7 @@ def _summarize_session_file(path: Path, *, min_epoch: float | None) -> dict | No
     `min_epoch`（省略時=フィルタしない）より前の `timestamp` の行は数えない。timestamp が読めない行は `unparsed["timestamp"]` に計上して飛ばす。
     """
     tokens = dict.fromkeys(_CHILD_USAGE_KEYS, 0)
+    cache_write: int | None = 0  # 1 往復でも返されなければ None のまま（不明）
     rounds: list = []
     compactions: list = []
     tools: dict = {}
@@ -314,6 +319,8 @@ def _summarize_session_file(path: Path, *, min_epoch: float | None) -> dict | No
                         else:
                             for k, v in zip(_CHILD_USAGE_KEYS, row):
                                 tokens[k] += v
+                            cache_write = metering.sum_cache_write(
+                                cache_write, metering.cache_write_from_usage(last, last.get("input_tokens_details")))
                             round_count += 1
                             # 往復1000件の打切りは rounds 配列だけを抑える（tokens／tools／compactions の集計は続ける）。
                             if len(rounds) < _MAX_ROUNDS:
@@ -373,6 +380,8 @@ def _summarize_session_file(path: Path, *, min_epoch: float | None) -> dict | No
         f.close()
     _commit_tool_calls(tools, tool_calls, tool_outputs, mcp_call_ids, exec_signals)
 
+    if round_count and cache_write is not None:
+        tokens[_CACHE_WRITE_KEY] = cache_write
     return {
         "model": model,
         "tokens": tokens,
@@ -393,6 +402,7 @@ def _merge_parent_pieces(pieces: list) -> dict:
         pieces[0].pop("_round_count", None)
         return pieces[0]
     merged_tokens = dict.fromkeys(_CHILD_USAGE_KEYS, 0)
+    merged_cache_write: int | None = 0
     merged_rounds: list = []
     merged_compactions: list = []
     merged_tools: dict = {}
@@ -401,6 +411,7 @@ def _merge_parent_pieces(pieces: list) -> dict:
     for piece in pieces:
         for k in _CHILD_USAGE_KEYS:
             merged_tokens[k] += piece["tokens"][k]
+        merged_cache_write = metering.sum_cache_write(merged_cache_write, piece["tokens"].get(_CACHE_WRITE_KEY))
         merged_compactions.extend(c + round_offset for c in piece["compactions"])
         merged_rounds.extend(piece["rounds"])
         round_offset += piece["_round_count"]
@@ -418,7 +429,8 @@ def _merge_parent_pieces(pieces: list) -> dict:
             merged_unparsed[kind] = merged_unparsed.get(kind, 0) + count
     return {
         "model": pieces[-1]["model"],
-        "tokens": merged_tokens,
+        "tokens": (merged_tokens if merged_cache_write is None
+                   else {**merged_tokens, _CACHE_WRITE_KEY: merged_cache_write}),
         # 連結後に再度先頭 _MAX_ROUNDS 件へ切り詰める（rounds[i] が実往復 i+1 番目からずれないように）。
         "rounds": merged_rounds[:_MAX_ROUNDS],
         "compactions": merged_compactions,

@@ -26,7 +26,7 @@ from .sandbox import (
     _safe_workspace_authoring,
     codex_mode,
 )
-from .turn_finish import assemble_result, close_session, register_created_files
+from .turn_finish import assemble_result, close_session, recovered_result, register_created_files
 from .turn_loop import run_session
 from .turn_prepare import enter_conversation, prepare_run
 from .turn_state import CodexTurnState
@@ -87,17 +87,21 @@ class CodexProvider(Provider):
         self._system_settings = system_settings
         # 既定は空（`run()` を経由せず `_prompt_mcp` を直接呼ぶ場合用）。`run()` 冒頭で `ctx.history` から設定し直される。
         self._history: list = []
+        self._history_note = ""  # 履歴を減らした・読めなかったことの一言（`ctx.history.note`）
 
-    def _history_block(self) -> str:
-        """直前ターンの履歴を Codex プロンプトへ前置するテキスト（会話継続）。`self._history` が空なら空文字列。"""
-        if not self._history:
+    def _history_block(self, with_history: bool = True) -> str:
+        """直前ターンの履歴を Codex プロンプトへ前置するテキスト（会話継続）。`self._history` が空、または `with_history` が偽（resume 先の Codex セッションが履歴を持つ）なら空文字列。"""
+        if not with_history or not (self._history or self._history_note):
             return ""
         lines = [f"{'ユーザー' if h.get('role') == 'user' else 'アシスタント'}: {h.get('content', '')}"
                 for h in self._history]
+        if self._history_note:
+            lines.insert(0, self._history_note)
         return ("【直前の会話（参考・新しいものが下）】\n" + "\n".join(lines) + "\n"
                 + _HISTORY_VOICE_NOTE + "\n\n")
 
-    def _prompt_mcp(self, message, lens, world, direct_read: bool = True, layer=None):
+    def _prompt_mcp(self, message, lens, world, direct_read: bool = True, layer=None,
+                    with_history: bool = True):
         """MCP 版プロンプト。事実を前渡しせず、Codex に MCP ツールで自律調査させる。MCP ツール固有の使い分けと、containment/grounding の短縮形を置く（共通ルールは AGENTS.md）。
         `direct_read`（既定 True）: 原本直読（permission profile で KB／派生ルートを read し、コードインタープリターで直接開く）の可否。`_run_authoring` が秘匿列挙と範囲（`_scope_deny_entries`）の成否から計算して渡し、失敗した（fail-closed）ターンだけ False（MCP のみへ縮退）。
         """
@@ -146,8 +150,10 @@ class CodexProvider(Provider):
             "確定した事実と推定は分けて書く（詳細ルールは AGENTS.md）。"
             "検索ヒットや精読結果に text_truncated が付いていたら、その本文は途中で切れている。"
             "結論を出す前に read_around か read_doc で続きを読む。続きを取得する手段が無い打ち切り"
-            "（file_truncated・pdf_pages の text_truncated・compare_documents／graph_neighbors／glob_search／doc_outline の truncated・graph_resolve／graph_impact の truncated と coverage.complete:false（理由は coverage.limits）・folder_tree の folders_truncated・xlsx_sheets／ripgrep_search／es_search の truncated＝ヒット数上限）は"
+            "（file_truncated・pdf_pages の text_truncated・compare_documents／graph_neighbors／glob_search／doc_outline の truncated・graph_resolve／graph_impact の truncated と coverage.complete:false（理由は coverage.limits）・folder_tree の folders_truncated・xlsx_sheets／es_search の truncated＝ヒット数上限）は"
             "その範囲を未確認として明示し、全件性を主張しない。"
+            "ripgrep_search の truncated（ヒット数上限）は続きを取れる——next_offset をそのまま offset に渡す（next_offset が無い・limit_reached は絶対上限＝続きは取れない）。"
+            "結果の欠落の印（section_truncated・fragment・unreadable_files・excluded_hits・unverified・excluded・no_text_layer・unread_shapes・unread_objects・formula_no_value・pages_remaining・pages_ignored・file_truncated・line_beyond_eof・window_clamped・candidates_total・title_truncated など）が付いた範囲も、確かめるまで未確認として扱う。"
             "**ドキュメント数・一覧・どんな資料があるか・フォルダ構成といった台帳質問は、まず list_docs を使う**"
             "（grep は本文中の一致しか探せず件数/一覧には答えられない）。フォルダ名・ファイル名はパスに含まれる"
             "ので、名前の部分一致は list_docs の name_pattern で当てる（grep で本文からは探さない）。"
@@ -204,11 +210,11 @@ class CodexProvider(Provider):
                 "最後に**作成したファイル名**と**内容の要約**を"
                 "日本語で報告してください。\n\n"
                 # 履歴があれば【依頼】の前に前置する。
-                f"{self._history_block()}【依頼】{message}")
+                f"{self._history_block(with_history)}【依頼】{message}")
         # 履歴があれば【質問】の前に前置する。
-        return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block()}【質問】{message}"
+        return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block(with_history)}【質問】{message}"
 
-    def _prompt_plain(self, message, lens, world):
+    def _prompt_plain(self, message, lens, world, with_history: bool = True):
         """素の Codex（`plain`）向けプロンプト。Sherpa の調べ方の上乗せ（MCP ツール一覧・list_docs 誘導・investigate スキル誘導・台帳・影響調査の手順・原因調査の症状語の指示）は持たず、Codex 本来の調べ方（シェルで直接読む）に任せる。
         containment（範囲・秘匿は読まない）・出典書式・ask_user の使い方は AGENTS.md（`codex_agents_md.AGENTS_MD_PLAIN`）と重複しても多層防御として置く。
         """
@@ -268,8 +274,8 @@ class CodexProvider(Provider):
                 "marp を使わず pptx スキル（python-pptx）で作る。"
                 "最後に**作成したファイル名**と**内容の要約**を"
                 "日本語で報告してください。\n\n"
-                f"{self._history_block()}【依頼】{message}")
-        return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block()}【質問】{message}"
+                f"{self._history_block(with_history)}【依頼】{message}")
+        return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block(with_history)}【質問】{message}"
 
     def _plain_text(self, message: str = "") -> str:
         # ナレッジ参照オフでは Codex CLI を起動しない（read-only でも KB を覗けてしまうため）。通常この経路には来ない（`routers/chat.py::_knowledge_for` が資料参照 ON を強制する）。内部経路や古いクライアントが knowledge=False で呼んだ場合の安全網。
@@ -279,6 +285,7 @@ class CodexProvider(Provider):
     def run(self, ctx: Ctx) -> Iterator[dict]:
         # 分岐前に確定させる（`_prompt_mcp` が `_run_authoring` から参照する）。
         self._history = list(ctx.history or [])
+        self._history_note = str(getattr(ctx.history, "note", "") or "")
         if not ctx.knowledge:  # ナレッジ参照オフ＝素の会話（Codex を grep なしで・authoring 不使用）
             yield from _plain_run(self, ctx); return
         yield from self._run_authoring(ctx)
@@ -331,6 +338,12 @@ class CodexProvider(Provider):
             if codex_created_files:
                 register_created_files(st)
             yield from assemble_result(self, ctx, st, decision, env)
+        except Exception as exc:
+            _log.warning("codex result processing failed: type=%s errno=%s", type(exc).__name__, getattr(exc, "errno", None))
+            result = recovered_result(ctx, st, decision, env, exc)
+            if result is None:
+                raise
+            yield result
         finally:
             # 台帳の退避・削除が終わるまで会話ロックを保持する（先に解放すると、同じ会話の「続き」ターンが未作成またはコピー途中の退避先を復元処理で参照しうる）。内側 `try/finally` で、退避／run_dir 削除の途中で例外が起きても最後に必ずロックを解放する。
             try:

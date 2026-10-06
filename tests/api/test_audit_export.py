@@ -233,3 +233,26 @@ def test_admin_audit_export_chat_content_deleted_resilience():
     row = next(json.loads(line) for line in r.text.splitlines() if json.loads(line)["action"] == "chat.turn")
     assert row["detail"]["user_prompt"] == "（削除済み）"
     assert row["detail"]["assistant_answer"] == "（削除済み）"
+
+
+def test_admin_audit_export_marks_truncation_when_rows_remain(monkeypatch):
+    if not _try_init():
+        pytest.skip("DB down")
+    from sherpa.routers import audit_usage
+    sfx = _sfx()
+    admin_uid, admin_pw = f"audtrunc{sfx}", f"AdminTrunc{sfx}"
+    _mk_user(admin_uid, admin_pw, "admin")
+    action = f"test.trunc_{sfx}"
+    for i in range(3):
+        store.audit(admin_uid, action, "user", f"user:{admin_uid}", detail={"i": i})
+    admin = _login(admin_uid, admin_pw)
+    monkeypatch.setattr(audit_usage, "_AUDIT_EXPORT_MAX_ROWS", 2)
+    cut = admin.get(f"/admin/audit/export?format=jsonl&action={action}")
+    assert cut.status_code == 200, cut.text
+    assert cut.headers["x-audit-export-truncated"] == "true"
+    assert "-truncated.jsonl" in cut.headers["content-disposition"]
+    assert len(cut.text.strip().splitlines()) == 2
+    monkeypatch.setattr(audit_usage, "_AUDIT_EXPORT_MAX_ROWS", 3)   # ちょうど上限＝残りなし
+    full = admin.get(f"/admin/audit/export?format=jsonl&action={action}")
+    assert "x-audit-export-truncated" not in full.headers
+    assert len(full.text.strip().splitlines()) == 3

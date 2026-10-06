@@ -7,18 +7,57 @@ import hashlib
 from pathlib import Path
 
 from ... import agentic_search, investigation_ledger, workspace_limits
+from ...investigation_record_render import describe_dropped
+from ...store.investigation_records import trim_record
 from ... import layer as layer_mod
+from ...answer_shape import STOPPED_EARLY_NOTICE, STOPPED_NOTICE, add_notice, seal, set_body
 from ..base import _evidence_gate_note, _log, _node, _verified_sources
-from .citations import parse_referenced_doc_lines, verified_referenced_docs
+from .citations import parse_referenced_doc_lines, resolve_referenced_docs
 from .codex_cli import apply_codex_usage, log_turn_end
 from .ledger_gate import _format_unconfirmed_items_section, _retire_investigation_ledger, _unconfirmed_items_list
 from .mcp import _apply_codex_neighbors
 from .continuation import _pick_codex_headline
 from .process import _CONTEXT_WINDOW_EXCEEDED_CODE, _masked_run_dir_path, _read_last_message_fallback
 from .sandbox import _detect_chrome_path, _marp_bin
-from .structured import _DEMOTED_CLAIMS_NOTE, strip_review_preamble, _apply_codex_evidence_gate, _claims_vs_ledger
-from .turn_candidates import _continuation_pending, _pick_structured_claims, _pick_structured_headline
-from .turn_consts import _CREATED_FILES_FAILURE_NOTE, _MCP_SIDECAR_NAME, _SKILLS_BASE, _WALL_CLOCK_LIMIT_NOTE
+from .structured import _DEMOTED_CLAIMS_NOTE, _INVALID_CLAIMS_NOTE, split_review_preamble, _apply_codex_evidence_gate, _claims_vs_ledger
+from .turn_candidates import _continuation_pending, _pick_structured_claims, _pick_structured_claims_invalid, _pick_structured_headline
+from .turn_consts import (_CREATED_FILES_FAILURE_NOTE, _MARP_FAILURE_NOTE, _MCP_SIDECAR_NAME, _SKILLS_BASE,
+                          _WALL_CLOCK_LIMIT_NOTE)
+
+
+# 「確認できなかった資料」に載せる件数の上限（超えた分は件数だけ）。
+_SOURCES_UNVERIFIED_MAX = 20
+
+
+# 「使った検索」に数える道具（原本の読み取りと一覧は数えない）。
+_SEARCH_TOOL_NAMES = frozenset({"ripgrep_search", "es_search", "glob_search", "graph_neighbors",
+                                "graph_resolve", "graph_impact"})
+
+
+def _count_searches(activity) -> int:
+    """利用統計の活動記録（親と子の全エージェント）から、検索の道具の呼出し回数を数える。取れなければ 0。"""
+    total = 0
+    for agent in (activity or {}).get("agents") or [] if isinstance(activity, dict) else []:
+        tools = agent.get("tools") if isinstance(agent, dict) else None
+        for name, stats in (tools.items() if isinstance(tools, dict) else []):
+            calls = stats.get("calls") if isinstance(stats, dict) else None
+            if (isinstance(name, str) and name.split("__")[-1] in _SEARCH_TOOL_NAMES
+                    and isinstance(calls, int) and not isinstance(calls, bool)):
+                total += calls
+    return total
+
+
+def _new_run_files(run_dir, before) -> list:
+    """作業領域（Codex の cwd）に、実行前の一覧 `before` に無い新規ファイルがあれば昇順で返す。`.tmp`・`.agents`・AGENTS.md・サイドカーは対象外（`before` を作る側と対）。"""
+    if not run_dir.is_dir():
+        return []
+    after = {
+        p for p in run_dir.rglob("*")
+        if p.is_file() and not p.is_symlink()
+        and p.relative_to(run_dir) not in (Path("AGENTS.md"), Path(_MCP_SIDECAR_NAME))
+        and not ({".tmp", ".agents"} & set(p.relative_to(run_dir).parts))
+    }
+    return sorted(after - before)
 
 
 def close_session(self, ctx, st, decision, env):
@@ -34,7 +73,7 @@ def close_session(self, ctx, st, decision, env):
     log_turn_end(ctx, st, env)
     # ask_user が出たターンは question 優先＝env/_result・成果物台帳登録を出さずここで終了する（回答は chat.js の整形再送＝新 codex exec で拾う）。proc は直上の finally で後始末済み。chat_service はこの question を answer.question として保存する。
     codex_question = st.codex_question
-    if codex_question is not None:
+    if codex_question is not None and not (ctx.stop_event is not None and ctx.stop_event.is_set()):
         # 親ノード（"Codex が調べる"）も "active" のまま止まっているため、通常経路の完了 yield と同様にここで "done" に確定させる。
         yield _node("codex", "think", "Codex が調べる", "ユーザに確認するため終了しました", "done")
         # `-o` 一時ファイル（last-message-*.txt）の削除を通常経路と同じ best-effort で先に消す（早期 return で .tmp/ に蓄積しないように）。
@@ -45,6 +84,13 @@ def close_session(self, ctx, st, decision, env):
         # 利用統計 activity: この経路は env/_result を出さないため、finally で確定済みの `env["activity"]` は question イベント経由で運ぶ（運ばないと chat_service の確認カード保存側が source:"none" で作り直す）。
         if env.get("activity") is not None:
             codex_question["activity"] = env["activity"]
+        # 確認で終えるターンに作られたファイルは保存しない（作らせない方針）。捨てた件数は確認カードに添える。
+        try:
+            _discarded_for_question = len(_new_run_files(run_dir, _before_ws_files))
+        except OSError:
+            _discarded_for_question = 0
+        if _discarded_for_question:
+            codex_question["discarded_files"] = _discarded_for_question
         yield codex_question
         return True
     # 調査台帳（回答 envelope への記録）: 本文・path は含めず、id 一覧は先頭50件に打ち切る。ゲートが1度も走らなかった（`_investigation_dir` が未確定＝早期 return 済み）ターンには載せない。
@@ -64,6 +110,7 @@ def close_session(self, ctx, st, decision, env):
             "counts": dict(st._investigation_verdict.terminal_counts),
             "non_terminal": list(st._investigation_verdict.non_terminal_ids[:_ledger_id_report_limit]),
             "invalid": list(st._investigation_verdict.invalid_ids[:_ledger_id_report_limit]),
+            "invalid_total": len(st._investigation_verdict.invalid_ids),
             "missing": list(st._investigation_verdict.missing_ids[:_ledger_id_report_limit]),
             "continuations": st._ledger_continuations,
             "stopped_reason": st._investigation_stopped_reason,
@@ -85,13 +132,29 @@ def close_session(self, ctx, st, decision, env):
         env["limits"] = {**(env.get("limits") or {}),
                          "ledger_incomplete": not st._investigation_verdict.complete}
         # この時点の台帳の正規形を env とは別項目に積む。本文・path は `_investigation_snapshot` 側の検証（`validate_item`）で除外済み。`load_coverage` は item ごとの outcome タプルのみ（本文を持たない）。`reviews`（本文を持つ・`validate_review_entry()` 済みの正規形のみ）も調査の記録の一部として積む（`investigation_record_render.py` の素材）。
+        # 保存の大きさの上限で落とすものがあれば、ここで先に切り詰めて内訳を記録に残し、回答の注記にも出す。
+        _reviews_report = investigation_ledger.load_reviews_report(st._investigation_dir)[1]
+        (_rec_manifest, _rec_items, _rec_coverage, _rec_reviews, _rec_cov_detail,
+         _rec_dropped) = trim_record(
+            st._investigation_snapshot.manifest, dict(st._investigation_snapshot.items),
+            {k: list(v) for k, v in investigation_ledger.load_coverage(st._investigation_dir).items()},
+            list(st._investigation_reviews),
+            investigation_ledger.load_coverage_detail(st._investigation_dir))
+        _extras: dict = {}
+        if _rec_dropped:
+            _extras["dropped"] = _rec_dropped
+            st._record_notes.append(describe_dropped(_rec_dropped))
+        if _reviews_report["invalid"] or _reviews_report["over_count"] or _reviews_report["over_bytes"]:
+            _extras["reviews_report"] = _reviews_report
+            env["investigation"]["reviews_report"] = _reviews_report
         st._investigation_record_payload = {
             "complete": st._investigation_verdict.complete,
-            "manifest": st._investigation_snapshot.manifest,
-            "items": dict(st._investigation_snapshot.items),
-            "coverage": {k: list(v) for k, v in
-                        investigation_ledger.load_coverage(st._investigation_dir).items()},
-            "reviews": list(st._investigation_reviews),
+            "manifest": _rec_manifest,
+            "items": _rec_items,
+            "coverage": _rec_coverage,
+            "reviews": _rec_reviews,
+            "coverage_detail": _rec_cov_detail,
+            "extras": _extras,
         }
     # `_schema_on` は構造化 message から見出しを選ぶ（生 JSON をそのまま出さない・平文ヒューリスティックへは戻さない）。無効時は現行どおりの選び方（下記）。
     if _schema_on:
@@ -99,27 +162,25 @@ def close_session(self, ctx, st, decision, env):
     else:
         # 集めた agent_message から結論を優先して headline を選ぶ（進行中の作業宣言を見出しにしない・最後の1件を鵜呑みにしない）。
         _picked = _pick_codex_headline(_agent_msgs, st._agent_partial,
-                                       prefer_marker="参照した資料") or None
+                                       prefer_marker="参照した資料", dropped=st._trimmed) or None
         # `-o` は保険。--json の agent_message から拾えなかった時だけ最終メッセージファイルを読む。使い終わったら必ず削除する（.tmp/ に溜め続けないため）。途中例外時は完全版が入り得る `-o` を先に試し、空/無いときだけ pick に委ねる。正常終了時は pick が主・`-o` は従。
         _stream_error = st._stream_error
         if _stream_error:
-            st.answer = _read_last_message_fallback(_last_message_path) or _picked
+            st.answer = _read_last_message_fallback(_last_message_path, st._answer_notices, st._attempt_no) or _picked
         else:
-            st.answer = _picked or _read_last_message_fallback(_last_message_path)
+            st.answer = _picked or _read_last_message_fallback(_last_message_path, st._answer_notices, st._attempt_no)
     if st.answer:
-        st.answer = strip_review_preamble(st.answer)
+        st.answer, _preamble = split_review_preamble(st.answer)
+        if _preamble:
+            st._trimmed.append({"kind": "review_preamble", "text": _preamble})
     try:
         _last_message_path.unlink(missing_ok=True)
     except Exception:
         pass
     # codex exec を実際に起動した（attempt_returncode is not None）のに stdout に JSON を1行も出さず（got_any_line=False）、answer も得られない場合だけ「正直に伝える」文言に切り替える。ユーザーの stop_event・壁時計上限（`_wall_clock_state`）による打ち切りは失敗ではないため対象外。
     _stopped_final = (ctx.stop_event is not None and ctx.stop_event.is_set()) or _wall_clock_state["hit"]
-    # 最新 attempt（継続 attempt を含む）が `turn.failed`／`error` で閉じ、その attempt 自身は agent_message を1つも出さなかった（`_agent_msgs[_attempt_msgs_start:]` も `_agent_partial` も空）場合は、過去 attempt の古い回答が `answer` に残っていても明示失敗として扱う（古い途中経過を見出しにしないため）。利用者の明示停止は対象外。
-    _turn_failed_no_new_message = (
-        st._turn_failed and not _agent_msgs[st._attempt_msgs_start:] and not st._agent_partial
-        and not _stopped_final)
-    if _turn_failed_no_new_message:
-        st.answer = None
+    if st.answer and (st._turn_failed or st.attempt_returncode not in (None, 0)) and not _stopped_final:
+        st._answer_notices.append("後続の調査または回答の処理が失敗しました。回収済みの回答を残しています。")
     # `turn.failed`／`error` で閉じた attempt は、JSON が読めていても（got_any_line=True）agent_message が無いままの失敗のため、`_turn_failed` を OR で加える。
     if (not st.answer and (not st.got_any_line or st._turn_failed) and st.attempt_returncode is not None
             and not _stopped_final):
@@ -127,21 +188,16 @@ def close_session(self, ctx, st, decision, env):
     # 自動継続を尽くしてもなお（上限0・セッション非永続・継続 attempt が無出力/異常終了を含む）作業宣言だけなら、本文（headline）は書き換えず印だけ立てる（「途中までの結果」と伝えて続きを促す）。利用者の明示停止は途中結果として扱わない。
     st._codex_stopped_early = (
         _continuation_pending(st)
-        and not _stopped_final and not _turn_failed_no_new_message)
+        and not _stopped_final and not st._turn_failed)
     # run_dir の新規ファイルを検出して台帳登録する（personal_workspace_files に登録・ES/Neo4j には一切書かない）。Codex の cwd = run_dir のため、個人アップロード（files/）は読み取り・書き込み不可。
     if run_dir.is_dir():
         # `.tmp`（TMPDIR）配下・`.agents`（配備したスキル）配下・ルート直下の AGENTS.md・`.mcp_sidecar.jsonl` は台帳登録しない（before 側と対）。
-        _after_ws_files = {
-            p for p in run_dir.rglob("*")
-            if p.is_file() and not p.is_symlink()
-            and p.relative_to(run_dir) not in (Path("AGENTS.md"), Path(_MCP_SIDECAR_NAME))
-            and not ({".tmp", ".agents"} & set(p.relative_to(run_dir).parts))
-        }
-        new_authoring = sorted(_after_ws_files - _before_ws_files)
+        new_authoring = _new_run_files(run_dir, _before_ws_files)
         if decision["lens"] != "author" and new_authoring:
             # 作成の依頼（画面の「資料を作成」／依頼文が作成と判定）以外では成果物にしない。登録せず、run_dir の削除で一緒に消す。
             _log.info("codex created %d file(s) in a non-authoring turn; discarded",
                       len(new_authoring))
+            st._discarded_files = len(new_authoring)
             new_authoring = []
         for fp in new_authoring:
             codex_created_files.append(str(fp))
@@ -149,14 +205,20 @@ def close_session(self, ctx, st, decision, env):
         try:
             from ... import marp_render
             _mds = [p for p in new_authoring if p.suffix == ".md"]
+            _marp_failed_formats: list = []
             _rendered = marp_render.render_outputs(
                 [p for p in _mds if marp_render.is_marp_markdown(p)],
                 marp_bin=_marp_bin(), chrome_path=_detect_chrome_path(),
                 theme_dirs=[run_dir / ".agents" / "skills" / "marp" / "themes",
                             _SKILLS_BASE / "marp" / "themes"],
-                containment_root=run_dir)  # 入出力を run_dir 内実体に強制
+                containment_root=run_dir, failures=_marp_failed_formats)  # 入出力を run_dir 内実体に強制
             codex_created_files.extend(str(p) for p in _rendered)
+            st._marp_failed_formats = sorted(set(_marp_failed_formats))
+            # marp の原稿があるのに 1 つも書き出せなかった（marp 未導入・全形式の失敗）ときは注記する。
+            if any(marp_render.is_marp_markdown(p) for p in _mds) and not _rendered:
+                st._marp_failed = True
         except Exception as e:
+            st._marp_failed = True
             _log.warning("marp_render: レンダ処理が例外で終了（fail-open）: %s", e)
     return False
 
@@ -221,6 +283,11 @@ def register_created_files(st):
                                         getattr(_move_back_err, "errno", None))
                                 raise
                         break
+                    else:
+                        # 同名回避の候補（`_i` が 10001 通り）をすべて使い切った＝この成果物は保存できていない。
+                        st._created_files_failed = True
+                        _log.warning("codex created file: no free file name after %d candidates: %s",
+                                    _i, _masked_run_dir_path(_fp, run_dir))
                 except Exception as e:
                     # 通常の move 失敗も、差し戻し失敗と同じく型と errno だけ記録する（フルパスは出さない）。
                     st._created_files_failed = True
@@ -288,6 +355,12 @@ def assemble_result(self, ctx, st, decision, env):
     # troubleshoot は Codex が実際に引いた近傍を UI カードにする（`_gather` 由来を Codex の実調査由来で上書きする）。
     _apply_codex_neighbors(env, mcp_neighbors, decision.get("lens") if decision else None)
     apply_codex_usage(ctx, st, env)
+    # 使った検索と読んだ資料の数（取れる範囲）と、調査記録を縮めた旨を調査台帳の欄に添える（「調べた範囲」の素材）。
+    if isinstance(env.get("investigation"), dict):
+        env["investigation"]["effort"] = {"searches": _count_searches(env.get("activity")),
+                                          "docs_read": len(set(st._mcp_read_docs))}
+        if st._record_notes:
+            env["investigation"]["record_notes"] = list(st._record_notes)
     # 捕捉した session/thread id を env に載せる（chat_service が `store.set_session_id` で永続化し次ターンの resume 判定に使う）。ゲートは `_session_persistence_enabled`（conversation_id あり かつ サンドボックス有効）を使う（`SHERPA_CODEX_SANDBOX=0` は使い捨て thread_id のため DB に保存すると次回の resume が必ず失敗する）。
     if st._session_persistence_enabled and st.thread_id:
         env["codex_session_id"] = st.thread_id
@@ -301,6 +374,7 @@ def assemble_result(self, ctx, st, decision, env):
             for r in _created_file_rows
         ]
     if st.answer:
+        env["headline"] = st.answer
         # 直読した資料は MCP の結果に載らず env["sources"] に反映されない。回答末尾の「参照した資料:」ブロックを解析し、read 系 MCP ツール引数から拾った doc_id（記載漏れの補完・出現順で後ろに合流）と合わせて機械検証（実在・文書種別・scope・秘匿名除外）を通ったものだけを sources の先頭へ足す（`_gather` 由来の既存 sources は後ろに残す・doc_id 重複は除外）。verified が0件なら参照ブロックの記載を消さず本文をそのまま残す。
         _body, _listed_lines = parse_referenced_doc_lines(st.answer)
         _ref_candidates: list = list(_listed_lines)
@@ -310,12 +384,14 @@ def assemble_result(self, ctx, st, decision, env):
                 _ref_seen.add(_r)
                 _ref_candidates.append(_r)
         # `xlsx_sheets`（シート一覧のみ）の doc_id も参照候補（sources）には合流させる。ただし「参照した資料:」にも書かれておらず本文精読ツール（`_mcp_read_docs`）でも読まれていない doc_id は、根拠ゲート（sources_verified）に数えない。参照ブロック＋本文精読ツールだけで確定する「精読済み」集合を先に確定させ、`xlsx_sheets` を足した後の verified との差分（`_listed_only_ids`）として区別する。
-        _verified_before_listed = set(verified_referenced_docs(_ref_candidates, ctx.world, sp))
+        _verified_listed, _unverified_refs, _sensitive_refs = resolve_referenced_docs(
+            _ref_candidates, ctx.world, sp)
+        _verified_before_listed = set(_verified_listed)
         for _r in _mcp_listed_docs:
             if _r and _r not in _ref_seen:
                 _ref_seen.add(_r)
                 _ref_candidates.append(_r)
-        _verified_refs = verified_referenced_docs(_ref_candidates, ctx.world, sp)
+        _verified_refs = resolve_referenced_docs(_ref_candidates, ctx.world, sp)[0]
         _listed_only_ids = set(_verified_refs) - _verified_before_listed
         if _verified_refs and ctx.make_sources:
             _ref_sources, _ = _verified_sources(ctx.make_sources, set(_verified_refs), ctx.world, sp)
@@ -328,11 +404,25 @@ def assemble_result(self, ctx, st, decision, env):
             # 実際に開いて根拠にした資料＝API 経路の「精読済み」と同じ意味＝出典の 2 区分（根拠／参考）に載せる。`xlsx_sheets` だけで到達した doc_id（`_listed_only_ids`）は除く。
             env["sources_verified"] = sorted(_ref_ids - _listed_only_ids)
         env["codex_referenced_docs"] = {"listed": len(_ref_candidates), "verified": len(_verified_refs)}
+        # 「参照した資料」の行のうち検証を通らなかったもの（理由つき・秘匿名は名前を出さず件数だけ）。
+        _unverified_total = len(_unverified_refs) + _sensitive_refs
+        if _unverified_total:
+            env["sources_unverified"] = _unverified_refs[:_SOURCES_UNVERIFIED_MAX]
+            if _sensitive_refs:
+                env["sources_unverified_hidden"] = _sensitive_refs
+            if len(_unverified_refs) > _SOURCES_UNVERIFIED_MAX:
+                env["sources_unverified_more"] = len(_unverified_refs) - _SOURCES_UNVERIFIED_MAX
+            add_notice(env, "sources_unverified",
+                       f"回答が出典として挙げた資料のうち {_unverified_total} 件は、確認できなかったため出典に載せていません"
+                       "（出典の欄の下の「確認できなかった資料」を参照）"
+                       + ("。名前を表示できない資料があります。" if _sensitive_refs else "。"))
         env["headline"] = _body if (_verified_refs and _body.strip()) else st.answer  # 空本文には差し替えない
         if _schema_on:
             # v2 のときだけ主張配列を持つ（v1 は常に空リスト）。区分と理由コードを envelope にも載せる（共有・監査で消えないよう `sherpa/store/shares.py::_safe_claim` が既知フィールドのみで再構築する）。
             _claims = _pick_structured_claims(st)
-            if _claims:
+            _claims_invalid = _pick_structured_claims_invalid(st)
+            # 正当な 0 件（挨拶など）は何も付けない。不正で除かれた主張があったターンは、残りの主張を通常どおり検証し、件数を残して注記する。
+            if _claims or _claims_invalid:
                 # API 経路と同じ最終ゲートを Codex にも掛ける。確定主張のうち必須の根拠種別を欠くものを推定へ格下げし、ターン単位の不足を headline 冒頭に前置する（本文は書き換えない・作成系は成果物の中身に混ざるため注記を出さない）。
                 _claims, _gate_meta, _gate_missing, _gate_unavailable = _apply_codex_evidence_gate(
                     _claims, lens=decision["lens"], world=ctx.world, scope_paths=sp,
@@ -349,6 +439,8 @@ def assemble_result(self, ctx, st, decision, env):
                         if st._investigation_dir is not None else False))
                 env.setdefault("data", {})["claims"] = _claims
                 env["data"]["evidence_gate"] = _gate_meta
+                if _claims_invalid:
+                    env["data"]["claims_invalid"] = _claims_invalid
                 if st._investigation_verdict is not None:
                     env["investigation"]["claims_check"] = _claims_ledger_check
                 env["limits"] = {**(env.get("limits") or {}),
@@ -361,20 +453,15 @@ def assemble_result(self, ctx, st, decision, env):
                         or _claims_ledger_check.get("downgraded", 0) > 0)
                     if not _gate_missing and _any_claims_demoted:
                         _gate_note = _DEMOTED_CLAIMS_NOTE + _gate_note
+                    if _claims_invalid:
+                        _gate_note = _INVALID_CLAIMS_NOTE + _gate_note
                     if _gate_note:
-                        env["headline"] = f"{_gate_note}\n\n{env['headline']}"
+                        add_notice(env, "evidence_gate", _gate_note)
         # 実際に回答を生成できたターンは、`_dispatch` がツール遮断時に立てた `agentic_failure`（`agentic_search.tools_blocked_env`）を消す（Codex は遮断状態を見ずに調査を続行し得るため）。
         env.pop("agentic_failure", None)
-        # 台帳の確認できなかった項目を、回答の末尾へ機械的に付ける（AI は使わない・無ければ付けない）。`_investigation_snapshot` は降格適用後の状態で `env["investigation"]["counts"]` と一致する。同じリストを `env["investigation"]["unconfirmed_items"]` にも構造化形で載せる（Codex ジョブ API の `unconfirmed_items` の正本・チャット画面には出さない内部キー）。
-        if st._investigation_snapshot is not None:
-            _unconfirmed_items = _unconfirmed_items_list(st._investigation_snapshot)
-            env.setdefault("investigation", {})["unconfirmed_items"] = _unconfirmed_items
-            _unconfirmed_section = _format_unconfirmed_items_section(_unconfirmed_items)
-            if _unconfirmed_section:
-                env["headline"] = f"{env['headline']}\n\n{_unconfirmed_section}"
         # 「追加で調べますか？」: 最後の中間の見直しが mostly_answered かつ extra_perspectives を挙げていたら定型文を付ける（AI の自由記述はそのまま流さない・`_review_continuation_note_text` は観点を短く切って並べた決定的な文字列）。台帳は既に退避済みで、「続き」で復元されれば `_investigation_dir`／`reviews.jsonl` がそのまま戻る。
         if st._review_continuation_note_text:
-            env["headline"] = f"{env['headline']}\n\n{st._review_continuation_note_text}"
+            add_notice(env, "review_continuation", st._review_continuation_note_text)
         # 自動継続を尽くしてもなお進行中の宣言文が headline に残ったターンは、本文を書き換えず `_codex_stopped_early` を根拠に envelope へ印を付ける。chat_service._finalize が予算到達時の途中結果・出典0件時の案内と同形式（headline 直下の独立注記＋案内ボタン）で UI に出す（`stop_reason` の閉じた語彙とは別のマーカー）。
         if st._codex_stopped_early:
             env["codex_stopped_early"] = True
@@ -423,13 +510,84 @@ def assemble_result(self, ctx, st, decision, env):
         _no_answer_detail = ("（未応答のため回答を出せませんでした）" if _skip_presearch
                              else "（未応答のため決定的回答に切替）")
         yield _node("codex", "think", "Codex が調べる", _no_answer_detail, "done")
+    # 台帳の確認できなかった項目を、回答の末尾へ機械的に付ける（AI は使わない・無ければ付けない）。本文を選べなかったターン（無出力・未応答）でも台帳から作って返す。`_investigation_snapshot` は降格適用後の状態で `env["investigation"]["counts"]` と一致する。同じリストを `env["investigation"]["unconfirmed_items"]` にも構造化形で載せる（Codex ジョブ API の `unconfirmed_items` の正本）。
+    if st._investigation_snapshot is not None:
+        _unconfirmed_items = _unconfirmed_items_list(st._investigation_snapshot)
+        env.setdefault("investigation", {})["unconfirmed_items"] = _unconfirmed_items
+        _unconfirmed_section = _format_unconfirmed_items_section(_unconfirmed_items)
+        if _unconfirmed_section:
+            add_notice(env, "unconfirmed_items", _unconfirmed_section)
+    if st._discarded_files:
+        add_notice(env, "files_discarded",
+                   f"資料の作成を求められていない依頼のため、AI が作ったファイル {st._discarded_files} 件は保存していません。"
+                   "ファイルが必要なときは「資料を作成」から依頼してください。")
+    if st._marp_failed or st._marp_failed_formats:
+        _fmts = "・".join(f.upper() for f in st._marp_failed_formats)
+        add_notice(env, "marp_failed", _MARP_FAILURE_NOTE
+                   if st._marp_failed and not _fmts else
+                   f"スライドの書き出しのうち {_fmts} への変換に失敗しました。できた形式と Markdown の原稿は保存しています。")
+    if st._mcp_coverage_write_failed:
+        add_notice(env, "coverage_write_failed",
+                   f"調査の確認記録を {st._mcp_coverage_write_failed} 回書き込めませんでした。"
+                   "「確認できなかった項目」が実際より多く（または少なく）見えている可能性があります。")
+    for _note in st._record_notes:
+        add_notice(env, "investigation_record_trimmed", _note)
     if st._created_files_failed:
         # headline がどの分岐で組み立てられていても、保存できなかった成果物がある事実は一律に伝える。
-        env["headline"] = f"{env['headline']}\n\n{_CREATED_FILES_FAILURE_NOTE}"
+        add_notice(env, "created_files_failed", _CREATED_FILES_FAILURE_NOTE)
     if _wall_clock_state["hit"]:
         # headline がどの分岐で組み立てられていても、時間の上限で打ち切った事実は一律に伝える。「打ち切りの内訳」（利用統計）へも記録する。
-        env["headline"] = f"{env['headline']}\n\n{_WALL_CLOCK_LIMIT_NOTE}"
+        add_notice(env, "wall_clock", _WALL_CLOCK_LIMIT_NOTE)
         env["limits"] = {**(env.get("limits") or {}), "wall_clock_hit": True}
+    _finish_partial_status(ctx, st, env)
     yield {"type": "answer_delta", "text": env["headline"]}  # Codex は一括→フロントで段階表示
     yield {"type": "_result", "env": env, "decision": decision,
           "investigation_record": st._investigation_record_payload}
+
+
+def _finish_partial_status(ctx, st, env):
+    """回収済みの本文は書き換えず、注記を `answer.notices` へ足し、停止・部分回答の終端を記録して回答の形を確定する。"""
+    if st._invalid_output_events:
+        st._answer_notices.append(("invalid_output",
+            f"壊れた出力イベント {st._invalid_output_events} 件を解釈できず除外しました（失われた本文の文字数不明）。"))
+    for _n in st._answer_notices:
+        _kind, _text = _n if isinstance(_n, tuple) else ("answer_recovery", _n)
+        add_notice(env, _kind, _text)
+    if st._codex_stopped_early:
+        add_notice(env, "stopped_early", STOPPED_EARLY_NOTICE)
+    if st._trimmed:
+        env["trimmed"] = [dict(t) for t in st._trimmed]
+    if ctx.stop_event is not None and ctx.stop_event.is_set():
+        env["_terminal"] = "stopped"
+        env["stopped_by_user"] = True
+        env["completion"] = "stopped"
+        add_notice(env, "stopped", STOPPED_NOTICE)
+    elif (st._answer_notices or st._stream_error or st._turn_failed or st._codex_stopped_early
+          or st._wall_clock_state["hit"] or st._created_files_failed
+          or (env.get("limits") or {}).get("ledger_incomplete")):
+        env["completion"] = "partial" if st.answer else "failed"
+    else:
+        env["completion"] = "failed" if st._codex_silent_failure else "complete"
+    seal(env)
+
+
+def recovered_result(ctx, st, decision, env, exc):
+    """回答の仕上げの例外でも回収済みの本文・検証済み出典・台帳を返す。"""
+    body = st.answer
+    if not body:
+        if st._schema_on:
+            body = _pick_structured_headline(st)
+        else:
+            body = _pick_codex_headline(st._agent_msgs, st._agent_partial, prefer_marker="参照した資料")
+    if not body:
+        return None
+    st.answer = body
+    if not env.get("codex_referenced_docs"):
+        set_body(env, body)
+    st._stream_error = True
+    st._answer_notices.append(f"回答の仕上げでエラーが発生しました（{type(exc).__name__}）。回収済みの回答を返します。")
+    env["codex_multi_agent"] = st._multi_agent_enabled
+    env.pop("agentic_failure", None)
+    _finish_partial_status(ctx, st, env)
+    return {"type": "_result", "env": env, "decision": decision,
+            "investigation_record": st._investigation_record_payload}

@@ -249,6 +249,13 @@ def test_web_search_disabled_value_forces_off_for_non_openai_endpoint():
     assert sandbox._web_search_disabled_value(False, "azure", allowed) == "disabled"
 
 
+def test_config_model_verbosity_high_for_openai_and_azure_but_not_ollama(tmp_path, sysset):
+    assert 'model_verbosity = "high"' in _config_text(tmp_path / "a")
+    _azure(sysset)
+    assert 'model_verbosity = "high"' in _config_text(tmp_path / "b")
+    assert "model_verbosity" not in _config_text(tmp_path / "c", ollama_base_url=OLLAMA_URL)
+
+
 def test_config_web_search_forced_off_when_azure_even_if_admin_and_user_allow(tmp_path, sysset):
     _azure(sysset)
     sysset["web_search_allowed"] = True

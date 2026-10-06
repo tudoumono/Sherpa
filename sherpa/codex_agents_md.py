@@ -56,6 +56,7 @@ AGENTS_MD = f"""\
   の確認を終え、該当項目が回答にそろってから完了とする。`truncated`／`text_truncated`／`file_truncated`／
   `total > start+count` は続きを取得する。続きを取得する手段が無い打ち切り（`file_truncated`・
   pdf_pages の `text_truncated`・compare_documents／graph_neighbors／glob_search／doc_outline の `truncated`・folder_tree の `folders_truncated`・xlsx_sheets／es_search の `truncated`＝ヒット数上限）は、その範囲を未確認として明示し全件性を主張しない。
+  結果に付く欠落の印（`section_truncated`・`fragment`・`unreadable_files`・`excluded_hits`・`unverified`・`excluded`・`no_text_layer`・`unread_shapes`・`unread_objects`・`formula_no_value`・`pages_remaining`・`pages_ignored`・`line_beyond_eof`・`window_clamped`・`candidates_total`・`title_truncated` など）が付いた範囲も、確かめるまで未確認として扱う。
   ripgrep_search の `truncated`（ヒット数上限）は続きを取得できる——`next_offset` を
   そのまま次回呼び出しの `offset` に渡す。
   利用者停止・通信エラー・既存の反復／情報量予算への到達で
@@ -143,12 +144,17 @@ _STATUS_FIELD_MEANING = (
 
 _STRUCTURED_RESPONSE_PARAGRAPH = f"""\
 - 最終応答は `status`／`answer`／`next_step` の3項目で返す。{_STATUS_FIELD_MEANING}
+  利用者に届くのは `answer` だけ。説明のすべてを `answer` に書き、見直しや続きで書き直すときも
+  前の内容を削らず、直した点を反映した完全な回答にする（短くまとめ直さない）。
 """
 
 # `SHERPA_CODEX_OUTPUT_SCHEMA=2` のときだけ、3 項目版の代わりに使う段落。`claims`（各要素に `evidence_kinds`）の意味と閉じた語彙を伝える。
 # Codex は根拠種別を自己申告する必要があり、語彙に合わないと主張構造ごと空になる（`_parse_claim`）。
 _STRUCTURED_RESPONSE_PARAGRAPH_V2 = f"""\
 - 最終応答は `status`／`answer`／`next_step`／`claims` の4項目で返す。{_STATUS_FIELD_MEANING}
+  利用者に届くのは `answer` だけ。`claims` は機械用の索引で画面に出ないため、`claims` にだけ
+  書いた説明は利用者に届かない——説明のすべてを `answer` に書く。見直しや続きで書き直すときも
+  前の内容を削らず、直した点を反映した完全な回答にする（短くまとめ直さない）。
   `claims` は回答の主張を1件ずつ構造化した配列（`id`／`status`／`text`／
   `evidence_refs`／`reason`／`reason_code`／`evidence_kinds` の7キーちょうど）で、`status` は
   次の3種のどれか: `confirmed`（確定・裏付けとなる資料の根拠を最低1件 `evidence_refs` に書く。
@@ -260,7 +266,8 @@ def _investigation_ledger_paragraph(direct_read: bool = True, layer: str | None 
   `unknown` にし、その item の `reason` を claim の `reason` へそのまま写し、`reason_code` を item
   の状態に対応させる（`not_found_in_scope`→`not_found_in_scope`、`unreadable`→`unreadable`、
   `unavailable`→`insufficient`）——根拠の無い主張を事実と断定せず『未確認』として残す（冒頭の分類
-  原則）ことと矛盾しない。台帳に無い新しい主張を最終回答で作らない。親が `ledger_status` を呼び、
+  原則）ことと矛盾しない。台帳に無い新しい主張を最終回答で作らない（この規則は正しさのためで、その範囲内で台帳の各
+  項目の内容・条件・例外・根拠は `answer` に詳しく書く）。親が `ledger_status` を呼び、
   全 item が終端となり、根拠が必要な状態での未充足も解消して `complete` が true になるまで
   `status=final` は返さない——未完了の item があるのに `final` を返すと、Sherpa から「未完了:
   {{id...}}」と差し戻され、続きを求められる。差し戻されたら最初からやり直さず、指定された id の
@@ -307,7 +314,7 @@ _WORKER_USAGE_CONDITION = (
     "など）では、観点ごとに spawn_agent(worker) を必ず使う。1つの観点で完結する単純な質問だけ"
     f"自分で調べてよい。観点ごとの worker は同時に {_CODEX_MAX_CONCURRENT_SUBAGENTS} 体まで起動して"
     "よい（逐次に待たない）。worker には観点を1つだけ渡し、主張とその根拠（ファイル:行）を"
-    "返させる。")
+    "返させる。worker・evaluator が見つけた事実と根拠は、統合のときに落とさず最終回答に含める。")
 
 # multi_agent 有効時に本体（orchestrator）へ役割の使い方を伝える段落。
 # `review_rounds` は深さが許す evaluator の巡数（0 なら evaluator を使わない旨を明示）。

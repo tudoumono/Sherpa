@@ -517,8 +517,7 @@ export class TraceTreeV2 {
     this._placeLeaf(lane, e);
   }
 }
-// 終了理由は answer.data.evidence_packet.stop_reason だけを根拠にする。stopInfo は {text, interrupted}。
-// evidence_packet 経由は常に interrupted:false、SSE の終端イベント（stopped/timeout/error）だけが true。
+// 保存された回答の完了状態と終了理由を、思考の流れの表示に使う。
 const STOP_REASON_UNKNOWN_TEXT = '終了理由を確認できませんでした';
 // SSE 終端イベント種別（stream.js が判定・常に中断扱い）
 const SSE_STOP_REASON_LABEL = { stopped: '停止操作', timeout: '期限', error: 'エラー' };
@@ -551,6 +550,9 @@ const BUDGET_NOTE_TEXT = '調査の上限に達したため、途中までの結
 export function deriveTraceStopReason(answer) {
   // clarify（確認カード）は終了理由の対象外
   if (!answer || answer.lens === 'clarify') return null;
+  if (answer.completion === 'stopped') return stopReasonInfo('stopped');
+  if (answer.completion === 'partial') return { text: '途中までの回答', interrupted: true };
+  if (answer.completion === 'failed' || answer.agentic_failure === 'error') return stopReasonInfo('error');
   const raw = answer.data && answer.data.evidence_packet && answer.data.evidence_packet.stop_reason;
   // evidence_packet 経由は回答の合成まで到達しているため中断ではない
   return { text: _stopReasonText(raw), interrupted: false };
@@ -659,7 +661,9 @@ export function questionHTML(q) {
       + `<input id="${esc(id)}" type="${mode}" name="${name}" value="${esc(o.id || o.label || i)}" data-qopt data-label="${esc(o.label || '')}">`
       + `<span><b>${esc(o.label || '')}</b>${o.description ? `<small>${esc(o.description)}</small>` : ''}</span></label>`;
   }).join('');
-  return `<div class="askcard"><div class="askeyebrow">確認が必要です</div><div class="askprompt">${esc(q.prompt || '確認したいことがあります。')}</div>`
+  const discarded = Number.isInteger(q.discarded_files) && q.discarded_files > 0
+    ? `<div class="muted" style="font-size:var(--text-small)">確認の前に AI が作ったファイル ${q.discarded_files} 件は、資料の作成の依頼ではないため保存していません。</div>` : '';
+  return `<div class="askcard"><div class="askeyebrow">確認が必要です</div><div class="askprompt">${esc(q.prompt || '確認したいことがあります。')}</div>${discarded}`
     + `<div class="askopts">${opts}</div>`
     + (q.allow_free_text ? '<textarea class="askfree" data-qfree rows="2" placeholder="補足があれば入力"></textarea>' : '')
     + '<div class="askactions"><button class="btn-primary asksend" data-ask-submit>この内容で続ける</button></div></div>';
@@ -678,25 +682,30 @@ export function appendAssistantRaw(innerHtml) {
   d.innerHTML = `<div class="a-row"><div class="a-avatar">S</div><div class="a-body">${innerHtml}</div></div>`;
   $('messages').appendChild(d); scroll(); return d;
 }
+// 個人ファイルの引用は 200 文字で切り、切ったときは末尾に「…」を付ける。
+export const PERSONAL_QUOTE_MAX = 200;
+export function clipPersonalQuote(q) { return q.length > PERSONAL_QUOTE_MAX ? q.slice(0, PERSONAL_QUOTE_MAX) + '…' : q; }
 function renderPersonalSources(personal_sources) {
   // 個人ファイル内ヒットを別枠で表示する（DL リンクなし）
   const srcs = (personal_sources || []).filter((s) => s && s.doc_id);
   if (!srcs.length) return '';
   const items = srcs.map((s) =>
     `<li><span class="src-name">${esc(s.doc_id)}</span>`
-    + (s.quote ? `<pre class="src-snippet">${esc(String(s.quote).slice(0, 200))}</pre>` : '')
+    + (s.quote ? `<pre class="src-snippet">${esc(clipPersonalQuote(String(s.quote)))}</pre>` : '')
     + '</li>').join('');
   return `<div class="personal-sources"><div class="personal-sources-h">🗂 個人ファイル内ヒット（本人のみ・共有不可）</div><ul>${items}</ul></div>`;
 }
 function renderCreatedFiles(created_files) {
-  // Codex が作成したファイルの DL カード。data-dl は chat.js の委譲ハンドラが処理する（リンクテキストはそのままファイル名に使われる）
-  const files = (created_files || []).filter((f) => f && f.name && f.download_url);
+  // Codex が作成したファイルの DL カード。data-dl は chat.js の委譲ハンドラが処理する（リンクテキストはそのままファイル名に使われる）。共有ではリンクを持たない（名前だけ）。
+  const files = (created_files || []).filter((f) => f && f.name);
   if (!files.length) return '';
-  const items = files.map((f) =>
-    `<li><a href="${esc(f.download_url)}" data-dl>${esc(f.name)}</a></li>`
+  const items = files.map((f) => f.download_url
+    ? `<li><a href="${esc(f.download_url)}" data-dl>${esc(f.name)}</a></li>`
+    : `<li>${esc(f.name)}</li>`
   ).join('');
   return `<div class="created-files"><div class="created-files-h">📎 作成したファイル</div><ul>${items}</ul>`
-    + `<a href="workspace.html" class="created-files-link">マイワークスペースで開く</a></div>`;
+    + (files.some((f) => f.download_url) ? `<a href="workspace.html" class="created-files-link">マイワークスペースで開く</a>` : '')
+    + '</div>';
 }
 // トークン使用量のターン末尾表示（入力/出力トークン数のみ）。usage が無いターンは何も出さない。クリックで内訳を展開する。
 function _fmtTokensCompact(n) {
@@ -799,8 +808,8 @@ function answerHTML(answer, trace, feedback) {
     ? _providerSummaryHTML(_computeProviderSummary(trace, answer)) : '';
   if (answer.lens === 'chat') {   // 資料参照オフの通常チャット（出典枠なし）
     return `<div class="chips"><span class="chip ghost">💬 通常チャット（社内資料参照オフ）</span></div>`
-      + `<div class="headline">${mdLite(answer.headline)}</div>`
-      + personalHTML + summaryHTML + usageHTML + usageSubHTML
+      + answerNoticesHTML(answer) + `<div class="headline">${mdLite(answerBody(answer))}</div>`
+      + investigationSummaryHTML(answer) + personalHTML + summaryHTML + usageHTML + usageSubHTML
       + '<button class="copybtn" data-copy>⧉ コピー</button><button class="copybtn" data-export>⬇ 書き出し</button>'
       + feedbackHtml;
   }
@@ -818,12 +827,13 @@ function answerHTML(answer, trace, feedback) {
     : (answer.lens === 'troubleshoot' && troubleHasCandidates) ? renderTrouble(answer) : renderQa(answer);
   // 検証バッジは trace_version=2 の回答だけに付ける
   const evidencePacketForBadges = answer.trace_version === 2 ? (answer.data && answer.data.evidence_packet) : null;
-  return chip + `<div class="headline">${mdLite(answer.headline)}</div>`
-    + budgetNoteHTML(answer.data && answer.data.evidence_packet) + codexTimeoutNoteHTML(answer)
-    + codexStoppedEarlyNoteHTML(answer)
+  return chip + answerNoticesHTML(answer) + `<div class="headline">${mdLite(answerBody(answer))}</div>`
+    + budgetNoteHTML(answer.data && answer.data.evidence_packet)
+    + investigationSummaryHTML(answer)
     + retryHintsHTML(answer.retry_hints) + body
     + refGraphHTML(answer) + renderCreatedFiles(answer.created_files)
     + renderSources(answer.sources, answer.sources_verified, evidencePacketForBadges)
+    + renderSourcesUnverified(answer)
     + renderInvestigationRecord(answer.investigation) + personalHTML
     + summaryHTML + usageHTML + usageSubHTML
     + '<button class="copybtn" data-copy>⧉ コピー</button><button class="copybtn" data-export>⬇ 書き出し</button>'
@@ -870,26 +880,38 @@ function retryHintsHTML(hints) {
 }
 
 // 調査予算の到達で打ち切られたターンに、本文とは別要素で注記を出す（evidence_packet.stop_reason だけが根拠）。
-function budgetNoteHTML(evidencePacket) {
+// 予算で止まった旨の文言（該当しなければ空）。画面と書き出しが同じ文言を使う。
+export function budgetNoteText(evidencePacket) {
   const raw = evidencePacket && evidencePacket.stop_reason;
-  if (!BUDGET_EXHAUSTED_STOP_REASONS.has(raw)) return '';
-  return `<div class="budget-note">${esc(BUDGET_NOTE_TEXT)}</div>`;
+  return BUDGET_EXHAUSTED_STOP_REASONS.has(raw) ? BUDGET_NOTE_TEXT : '';
+}
+function budgetNoteHTML(evidencePacket) {
+  const text = budgetNoteText(evidencePacket);
+  return text ? `<div class="budget-note">${esc(text)}</div>` : '';
 }
 
-// Codex の実行が時間切れで打ち切られたターン（answer.codex_timed_out）の注記。stop_reason とは別マーカー。
-const CODEX_TIMEOUT_NOTE_TEXT = '調査の時間上限に達したため途中までの結果です。'
-  + '「続きを調べる」を押すと続きから調べられます。';
-function codexTimeoutNoteHTML(answer) {
-  if (!answer || !answer.codex_timed_out) return '';
-  return `<div class="budget-note">${esc(CODEX_TIMEOUT_NOTE_TEXT)}</div>`;
+// 回答の本文。旧形式の行（body が無い）は headline を本文として読む。
+export function answerBody(answer) {
+  return typeof answer.body === 'string' ? answer.body : (answer.headline || '');
 }
-
-// Codex が自動継続を尽くしても結論に届かず終了したターン（answer.codex_stopped_early）の注記。timeout とは別マーカーで、同じ resume ボタンで案内する。
-const CODEX_STOPPED_EARLY_NOTE_TEXT = 'AI が途中経過を伝えたまま調査を終えたため、途中までの結果です。'
-  + '「続きを調べる」を押すと続きから調べられます。';
-function codexStoppedEarlyNoteHTML(answer) {
-  if (!answer || !answer.codex_stopped_early) return '';
-  return `<div class="budget-note">${esc(CODEX_STOPPED_EARLY_NOTE_TEXT)}</div>`;
+// 回答の注記（answer.notices: [{kind, text}]）。本文の上に控えめな帯で出す。旧形式の行・壊れた要素は出さない。
+export function answerNotices(answer) {
+  const list = answer && Array.isArray(answer.notices) ? answer.notices : [];
+  return list.filter((n) => n && typeof n.text === 'string' && n.text.trim());
+}
+function answerNoticesHTML(answer) {
+  const list = answerNotices(answer);
+  if (!list.length) return '';
+  return '<div class="answer-notices">' + list.map((n) =>
+    `<div class="answer-notice" data-notice-kind="${esc(String(n.kind || ''))}">${mdLite(n.text)}</div>`).join('') + '</div>';
+}
+// 調べた範囲（answer.investigation_summary.items: [{label, text}]）。items が空なら何も出さない。
+function investigationSummaryHTML(answer) {
+  const s = answer && answer.investigation_summary;
+  const items = s && Array.isArray(s.items) ? s.items.filter((i) => i && typeof i.text === 'string' && i.text.trim()) : [];
+  if (!items.length) return '';
+  return '<div class="investigation-summary">' + items.map((i) =>
+    `<div class="investigation-summary-item"><span class="investigation-summary-label">${esc(String(i.label || ''))}</span> ${esc(i.text)}</div>`).join('') + '</div>';
 }
 
 // 回答が参照したノード/関係から小さな部分グラフを組む（impact=経路、troubleshoot=近傍チェーン）
@@ -1070,10 +1092,22 @@ function renderImpact(a) {
   }
   return ilist + pres;
 }
+// 原因候補の表示件数。超えた分は「ほか N 件」の折りたたみで全件を見られる（総数は summary.total と候補の長い方）。
+const TROUBLE_SHOWN_MAX = 8;
+function _candidateHTML(c) {
+  return `<div class="cand"><span class="nm">${esc(c.name)}</span><span class="role">${esc(c.role)}</span>`
+    + (c.path && c.path.length ? `<div class="chain">${esc(c.path.join(' → '))}</div>` : '') + '</div>';
+}
 function renderTrouble(a) {
-  return ((a.data && a.data.candidates) || []).slice(0, 8).map((c) =>
-    `<div class="cand"><span class="nm">${esc(c.name)}</span><span class="role">${esc(c.role)}</span>`
-    + (c.path && c.path.length ? `<div class="chain">${esc(c.path.join(' → '))}</div>` : '') + '</div>').join('');
+  const cands = (a.data && a.data.candidates) || [];
+  const head = cands.slice(0, TROUBLE_SHOWN_MAX).map(_candidateHTML).join('');
+  const total = Math.max(cands.length, Number.isInteger(a.summary && a.summary.total) ? a.summary.total : 0);
+  if (total <= TROUBLE_SHOWN_MAX) return head;
+  const rest = cands.slice(TROUBLE_SHOWN_MAX);
+  const label = `ほか ${total - TROUBLE_SHOWN_MAX} 件${rest.length ? 'を見る' : '（一覧には保存されていません）'}`;
+  return head + (rest.length
+    ? `<details class="cand-more"><summary>${esc(label)}</summary>${rest.map(_candidateHTML).join('')}</details>`
+    : `<div class="muted cand-more">${esc(label)}</div>`);
 }
 // 引用（該当箇所）カード。既定は折りたたみで、件数だけ見える見出しボタン＋hidden な本体にする。
 function renderQa(a) {
@@ -1094,7 +1128,11 @@ function renderSources(sources, verifiedDocIds, evidencePacket) {
   }
   // Evidence Packet の verification_method があれば doc_id ごとに検証バッジを添える
   const vmap = _verificationMethodByDoc(evidencePacket);
-  const link = (s) => `<a href="${esc(s.download_url)}" data-dl>📄 ${esc(s.doc_id)}</a>${verificationBadgeHTML(vmap.get(s.doc_id))}${importanceBadgeHTML(s)}`;
+  // リンクが無い出典（保存されていない・安全に通せない）は href を空にせず、ダウンロードできないと分かる表示にする。
+  const link = (s) => (s.download_url
+    ? `<a href="${esc(s.download_url)}" data-dl>📄 ${esc(s.doc_id)}</a>`
+    : `<span class="muted" title="この画面ではダウンロードできません">📄 ${esc(s.doc_id)}（ダウンロードできません）</span>`)
+    + `${verificationBadgeHTML(vmap.get(s.doc_id))}${importanceBadgeHTML(s)}`;
   // sources_verified（精読済み doc_id）があれば、出典を「根拠（精読済み）」と「参考（ヒットのみ）」に分ける（除外はしない）
   if (Array.isArray(verifiedDocIds)) {
     const verified = new Set(verifiedDocIds);
@@ -1107,6 +1145,23 @@ function renderSources(sources, verifiedDocIds, evidencePacket) {
       + group('根拠（精読済み）', grounded) + group('参考（ヒットのみ）', reference) + '</div>';
   }
   return `<div class="sources"><div class="h">出典（原本をダウンロード）</div>${sources.map(link).join('')}</div>`;
+}
+// 出典の下の「確認できなかった資料」（answer.sources_unverified: [{path, reason}]）。秘匿の資料は名前を出さず件数だけ。
+export function unverifiedSourceRows(answer) {
+  const list = answer && Array.isArray(answer.sources_unverified) ? answer.sources_unverified : [];
+  const rows = list.filter((u) => u && typeof u.path === 'string' && u.path.trim())
+    .map((u) => ({ path: u.path, reason: typeof u.reason === 'string' ? u.reason : '' }));
+  const num = (v) => (Number.isInteger(v) && v > 0 ? v : 0);
+  return { rows, hidden: num(answer && answer.sources_unverified_hidden), more: num(answer && answer.sources_unverified_more) };
+}
+function renderSourcesUnverified(answer) {
+  const { rows, hidden, more } = unverifiedSourceRows(answer);
+  if (!rows.length && !hidden) return '';
+  return '<div class="sources sources-unverified"><div class="h">確認できなかった資料</div>'
+    + rows.map((u) => `<div class="sources-unverified-row">${esc(u.path)}${u.reason ? `<span class="muted">（${esc(u.reason)}）</span>` : ''}</div>`).join('')
+    + (more ? `<div class="sources-unverified-row muted">ほか ${more} 件</div>` : '')
+    + (hidden ? `<div class="sources-unverified-row muted">名前を表示できない資料 ${hidden} 件</div>` : '')
+    + '</div>';
 }
 // 調査台帳が保存された回答にだけ、Markdown のダウンロード導線を出す。href は chat.js の data-investigation-dl 委譲ハンドラがクリック時に組み立てる。
 function renderInvestigationRecord(investigation) {

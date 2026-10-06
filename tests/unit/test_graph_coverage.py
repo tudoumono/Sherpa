@@ -145,7 +145,8 @@ def _neighbors(monkeypatch, session):
 def test_graph_neighbors_timeout_is_not_reported_as_no_neighbors(monkeypatch, session, stage):
     res = _neighbors(monkeypatch, session)
     assert res["neighbors"] == []
-    assert res["coverage"] == {"complete": False, "limits": [{"kind": "timeout", "stage": stage}], "omitted": None}
+    assert res["coverage"] == {"complete": False, "limits": [{"kind": "timeout", "stage": stage}], "omitted": None,
+                               "depth": {"requested": 4, "truncated": None}}
     assert res["truncated"] is True
     assert M._coverage_outcome("graph_neighbors", res, False) == "limit"  # 台帳に「確認済みの 0 件」と記録しない
 
@@ -161,7 +162,8 @@ def test_graph_neighbors_partial_fetch_has_no_unresolved_field(monkeypatch, sess
     session.run = lambda query, **kw: asked.append(str(query)) or orig(query, **kw)
     res = _neighbors(monkeypatch, session)
     assert res == {"neighbors": [], "truncated": True,
-                   "coverage": {"complete": False, "limits": [{"kind": "timeout", "stage": stage}], "omitted": None}}
+                   "coverage": {"complete": False, "limits": [{"kind": "timeout", "stage": stage}], "omitted": None,
+                                "depth": {"requested": 4, "truncated": None}}}
     assert not any("unresolved_names" in q for q in asked)
 
 
@@ -212,7 +214,7 @@ def test_graph_neighbors_unavailable_and_reingest_are_named_by_the_same_kinds(mo
 
 def test_complete_empty_neighbors_is_still_a_confirmed_zero(monkeypatch):
     res = _neighbors(monkeypatch, _StageSession([], []))
-    assert res["coverage"] == {"complete": True, "limits": [], "omitted": 0}
+    assert res["coverage"] == {"complete": True, "limits": [], "omitted": 0, "depth": {"requested": 4, "truncated": None}}
     assert M._coverage_outcome("graph_neighbors", res, False) == "no_hits"
 
 

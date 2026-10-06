@@ -379,8 +379,10 @@ def _stream_doc_lines(f):
     caution = corpus_docs.encoding_caution_for_ratio(ratio, majority_garbled)
     return reader, grep_tool._logical_lines(reader, _READ_AROUND_FILE_CAP_BYTES, encoding=enc), caution
 
-def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, byte_cap: int) -> str | None:
+def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, byte_cap: int,
+                        info: dict | None = None) -> str | None:
     """親返し P2: rag.md をアンカー（`<!-- chunk:{chunk_id} -->`）単位でストリーミング走査し、`target_chunk_ids` に属するチャンクの本文だけを集める。
+    `info`（省略可）には、集められなかった対象チャンクの数を `info["missing_chunks"]` として返す（rag.md に無い・走査が cap で終わった等）。
     対象外のチャンク本文は保持せず、全件そろうか `byte_cap` 超過で打ち切る。`byte_cap` を超えたら None を返し、集めた部分的な本文は使わない（途中で打ち切ったものを完全なものとして返さない）。
     """
     if not target_chunk_ids:
@@ -429,6 +431,8 @@ def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, by
         f.close()
     if over or not collected:
         return None
+    if info is not None:
+        info["missing_chunks"] = len(remaining)
     return "\n\n".join(collected[cid] for cid in order)
 
 def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_rag: int) -> list:
@@ -453,21 +457,31 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
         tier = "chunk"
         text = "\n\n".join(it["text"] for it in items)  # 最低保証（redaction／クリップ済み）
         text_truncated = False
+        region_capped = False
+        parent_unfetched = False
+        region_info = {}
         parent_ids = sorted({it["parent_id"] for it in items if it.get("parent_id")})
         if parent_ids:
-            target_ids = set(es_index.chunk_ids_for_parent(
-                world, doc_id, parent_ids, limit=_PARENT_RETURN_REGION_CHUNKS_MAX))
+            es_ids = es_index.chunk_ids_for_parent(
+                world, doc_id, parent_ids, limit=_PARENT_RETURN_REGION_CHUNKS_MAX)
+            # ES の取得が上限ちょうどまで返ったら、領域のチャンクが上限で打ち切られている可能性がある
+            region_capped = len(es_ids) >= _PARENT_RETURN_REGION_CHUNKS_MAX
+            parent_unfetched = not es_ids  # 親の領域のチャンク一覧を取れなかった（ES 不達・失敗）＝ヒット自身だけでは領域とは言えない
+            target_ids = set(es_ids)
             target_ids |= set(chunk_ids)  # ヒット自身のチャンクは必ず含める（ES 反映漏れの安全弁）
             shared_cap = baseline + remaining
             per_doc_ceiling = max(per_doc_cap, baseline)  # baseline（最低保証）自体は削らない
             region_cap = min(shared_cap, per_doc_ceiling)
-            region_text = _rag_md_region_text(world, doc_id, sp, layer, target_ids, region_cap)
+            region_info = {}
+            region_text = _rag_md_region_text(world, doc_id, sp, layer, target_ids, region_cap, region_info)
             if region_text is not None:
                 delta_region = len(region_text.encode("utf-8")) - baseline
                 if delta_region <= remaining:
                     text = _redact(region_text)
                     tier = "region"
                     remaining -= delta_region
+                    if region_info.get("missing_chunks"):
+                        text_truncated = True
             if tier != "region" and per_doc_ceiling < shared_cap:
                 # 1 文書あたりの上限が共有予算より先に効いた＝この文書は上限で頭打ちにされた
                 text_truncated = True
@@ -477,6 +491,16 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
                             for it in items]}
         if text_truncated:
             entry["text_truncated"] = True
+        if tier == "chunk":
+            entry["fragment"] = True  # 子チャンクだけ＝文書の一部（全文は read_doc／read_around）
+        if parent_unfetched:
+            entry["fragment"] = True
+            entry["text_truncated"] = True
+            entry["parent_chunks_unfetched"] = True  # 親の領域のチャンクを取得できなかった（本文はヒットのチャンクだけ）
+        if region_capped:
+            entry["region_chunks_capped"] = True  # 領域のチャンク取得が ES の取得上限（5000）に当たった
+        if tier == "region" and region_info.get("missing_chunks"):
+            entry["region_missing_chunks"] = region_info["missing_chunks"]  # 領域の一部のチャンクが集まらなかった
         if any(it.get("keyword_match") is not None for it in items):
             entry["keyword_match"] = any(it.get("keyword_match") for it in items)  # 束ねた子チャンクのどれかに語が一致していれば True
         out.append(entry)
@@ -537,6 +561,11 @@ def _doc_reader_text_locator(name: str, result: dict) -> tuple[str | None, str |
             for ri, row in enumerate(t.get("rows") or []):
                 cells = row if isinstance(row, list) else []
                 lines.append(f"表{ti}行{row_start + ri}: " + "\t".join(str(c) for c in cells))
+        for h in result.get("headers_footers") or []:
+            lines.append(f"{'ヘッダー' if 'header' in str(h.get('kind')) else 'フッター'}: {h.get('text', '')}")
+        lines += [f"テキストボックス: {t}" for t in result.get("textboxes") or []]
+        lines += [f"脚注{n.get('id')}: {n.get('text', '')}" for n in result.get("footnotes") or []]
+        lines += [f"文末脚注{n.get('id')}: {n.get('text', '')}" for n in result.get("endnotes") or []]
         text = "\n".join(lines)
         # locator は表の行範囲も含めて「実際に返した範囲」を表す（`paragraphs[s-e];tables[ts-te]rows[rs-re]`）。`InvestigationState._find` が locator 文字列で同一性を判定するため
         ids = [p.get("i") for p in paras]
@@ -580,7 +609,7 @@ def _doc_reader_text_locator(name: str, result: dict) -> tuple[str | None, str |
         pages = [p for p in (result.get("pages") or []) if isinstance(p, dict)]
         if not pages:
             return None, None
-        text = "\n".join(f"ページ{p.get('no')}: {p.get('text', '')}" for p in pages)
+        text = "\n".join(f"ページ{p.get('no')}: {p.get('text') or p.get('note') or ''}" for p in pages)
         nos = [p.get("no") for p in pages]
         locator = f"pages[{','.join(str(n) for n in nos)}]" if nos else "pages"
         return text, locator
@@ -638,11 +667,32 @@ def _shrink_single_item_result(name: str, result: dict, doc_id: str, field: str,
 # バイト予算で切ったことを申告する印 `"byte_clipped": true` の JSON 上の増分。切り詰め側は先にこの分を差し引く
 _BYTE_CLIP_MARK_BYTES = len(', "byte_clipped": true')
 
+_DOCX_EXTRA_LIST_KEYS = ("headers_footers", "textboxes", "footnotes", "endnotes")
+
+def _fit_docx_extras(result: dict, budget: int) -> dict:
+    """`docx_paragraphs` の追加欄（ヘッダー・フッター・テキストボックス・脚注）を `budget` バイトに収める。末尾の項目から落とし、落とした件数を `extras_clipped` に足して `truncated` を立てる。"""
+    keys = [k for k in _DOCX_EXTRA_LIST_KEYS if result.get(k)]
+    if not keys or _result_byte_size({k: result[k] for k in keys}) <= budget:
+        return result
+    r = dict(result)
+    cut = 0
+    while keys and _result_byte_size({k: r[k] for k in keys}) > budget:
+        k = max(keys, key=lambda x: len(r[x]))
+        r[k] = r[k][:-1]
+        cut += 1
+        if not r[k]:
+            del r[k]
+            keys.remove(k)
+    r["extras_clipped"] = int(r.get("extras_clipped") or 0) + cut
+    r["truncated"] = True
+    return r
+
 def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int) -> dict:
     """`docx_paragraphs` 専用の仕上げ。段落だけでなく表（表→行）もバイト予算の削減対象にする。
     予算超過時は段落を先に確保（表 0 行で段落数を二分探索）し、余った予算で表の行を先頭の表から順に埋める（途中で打ち切ると `row_truncated`）。
     段落が 1 件も入らない場合は、まず表を `best_n_rows` に固定したまま先頭 1 段落を切り詰めて試す。それでも段落が空文字になる・予算を超える場合だけ、表を 0 行にして段落を切り詰め直し、残り予算で表の行数を改めて決める。
     """
+    result = _fit_docx_extras(result, tr_max_bytes // 2)
     paras = [p for p in (result.get("paragraphs") or []) if isinstance(p, dict)]
     tables_orig = [t for t in (result.get("tables") or []) if isinstance(t, dict)]
     flat_rows: list[tuple[int, object]] = []
@@ -895,6 +945,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         q = str(args.get("query") or "")
         degrade_reason = None
         truncated_docs: list = []  # ripgrep_search のみ（es_search は空のまま）
+        grep_stats: dict = {}  # ripgrep_search のみ（読めずに飛ばしたファイルの件数）
+        excluded = {"not_current": 0, "withheld": 0}  # es_search のみ（結果から除いたヒットの件数）
         cap_reached = False  # ヒット上限に達した（母集団の一部しか見ていない）
         offset = 0  # ripgrep_search のみ意味を持つ（es_search は常に 0＝ページングしない）
         if name == "es_search":
@@ -936,9 +988,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             for h in es_hits:
                 did = h.get("doc_id")
                 if not did or did not in valid:
+                    excluded["not_current"] += 1
                     continue
                 if text_kind.is_sensitive_doc_id(did):
                     _log.warning("es_search: 秘匿名のため対象外にしました（ext=%s）", Path(did).suffix.lower())
+                    excluded["withheld"] += 1
                     continue
                 valid_es_hits.append(h)
             hits = [{"doc_id": h["doc_id"], "line": h.get("line"), "text": h.get("text", ""),
@@ -958,11 +1012,13 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             # `offset` は LLM が渡す未検証値。絶対上限 `MAX_HITS_ABS_MAX` を「offset＋このページの件数」の合計に適用し、`offset` 自体は巻き戻さない。ページの件数 `used_max_hits` を縮めて天井を守り、`offset` が天井以上なら空を返す
             used_max_hits = min((max_hits or MAX_HITS), max(0, MAX_HITS_ABS_MAX - offset))
             if used_max_hits <= 0:
-                return ({"hits": []}, docs, cites, cards)
+                # 絶対上限（`MAX_HITS_ABS_MAX`）に達していてこれ以上は取れない＝空は「該当なし」ではなく上限到達
+                return ({"hits": [], "truncated": True, "limit_reached": True,
+                        "max_hits_abs": MAX_HITS_ABS_MAX}, docs, cites, cards)
             # `truncated_docs`: `_GREP_FILE_CAP_BYTES` で打ち切られた文書の doc_id（ヒット 0 件の打切り文書も載る）
             hits = grep_tool.grep_search(q, world, max_hits=used_max_hits, scope_paths=sp,
                                          deadline=deadline, layer=layer, truncated_docs=truncated_docs,
-                                         offset=offset)
+                                         offset=offset, stats=grep_stats)
         # 親返し（es_search 限定）: rag チャンク由来のヒット（`chunk_id` あり）は doc_id ごとに束ねて `_resolve_parent_return` へ渡し、legacy ヒット（40 行チャンク由来）は素通しする。
         # ① 引用（cites）・doc 収集・rag_groups の組み立て（1 回だけ）
         # ヒットはスコア降順のまま渡ってくる。`template`（出力順のプレースホルダ列）で各 doc の最初に出現したヒットの位置を予約し、legacy ヒットはその場で確定させる（検索結果全体のスコア降順を保つ）。
@@ -1007,6 +1063,10 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             if h.get("encoding_caution"):
                 # 一部が化けているヒットの注意文（`encoding_caution`）も転送する
                 hit_view["encoding_caution"] = h["encoding_caution"]
+            if h.get("section_truncated"):
+                hit_view["section_truncated"] = True  # 節・窓の本文が 64KiB の上限で切れている（全文は read_doc／read_around）
+            if name == "es_search":
+                hit_view["fragment"] = True  # ES のヒット本文は文書の断片
             template.append(("legacy", hit_view))
 
         # ② per_hit を割り当てて `view` を組み立て、直列化後の実バイト数で収まりを保証する
@@ -1050,6 +1110,14 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 view["degrade_reason"] = degrade_reason
             if truncated_docs:  # ripgrep_search のみ・打切りで探せていない文書
                 view["truncated_docs"] = truncated_docs[:_TRUNCATED_DOCS_MAX]
+                if len(truncated_docs) > _TRUNCATED_DOCS_MAX:
+                    view["truncated_docs_total"] = len(truncated_docs)  # 一覧は先頭だけ・総数
+            if grep_stats.get("unreadable_files"):  # ripgrep_search のみ・開けず／読めずに探せていないファイルの件数（名前は出さない）
+                view["unreadable_files"] = grep_stats["unreadable_files"]
+            if excluded["not_current"] or excluded["withheld"]:  # es_search のみ・結果から除いたヒット
+                view["excluded_hits"] = {k: v for k, v in excluded.items() if v}
+            if any(isinstance(v, dict) and v.get("section_truncated") for v in out):
+                view["section_truncated"] = True
             if any_clipped:
                 # ヒット単位のクリップを最上位にも申告する（`tool_result_clipped` 計測は最上位キーしか見ない）
                 view["text_truncated"] = True
@@ -1108,6 +1176,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         clipped = _clip_cards(raw_cards, max_bytes=tr_max_bytes)
         # カード単位で裏付け doc の実在（資料フォルダ・範囲内）を検証し、裏付け doc を主張したのに 1 件も実在しないカードは cards と LLM への view の両方から除外する。doc を主張しないカード（グラフ位相情報等）はそのまま通す
         cards = []
+        unverified_cards = 0  # 裏付け資料を確認できず一覧から除いたカードの数
         for c in clipped:
             claimed_ids = _card_claimed_doc_ids(c)
             if not claimed_ids:
@@ -1115,6 +1184,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 continue
             verified_ids = _card_verified_doc_ids(c, world, sp)
             if not verified_ids:
+                unverified_cards += 1
                 continue
             docs |= verified_ids  # 出典付与は検証済み doc のみ（決定的 troubleshoot と同じく edge doc も含める）
             # 検証済み doc_id をカード自身へ同梱する（呼び出し元が Evidence digest を組むときに再検証しない）
@@ -1124,6 +1194,13 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                  "path": c.get("path", []), "distance": c.get("distance"),
                  "edges": _card_edges_view(c, world, sp)} for c in cards]
         result = {"neighbors": view}
+        unverified_edges = sum(1 for v in view for e in v["edges"] if e.get("unverified"))
+        if unverified_cards or unverified_edges:
+            # 裏付け資料を確認できなかったカード（一覧から除外）・辺（資料名を伏せて `unverified`）の数。名前は出さない
+            result["unverified"] = {k: n for k, n in (("cards", unverified_cards), ("edges", unverified_edges)) if n}
+        dataitems_excluded = int(getattr(raw_cards, "dataitems_excluded", 0) or 0)
+        if dataitems_excluded:
+            result["excluded"] = {"data_items": dataitems_excluded}  # 粒度が細かすぎるため一覧に含めない DataItem（影響の調査で見る）
         # 打ち切りの申告（`coverage`）: 取得時の時間切れ・行数の天井・文書探索の打ち切り（`raw_cards.coverage`）に、カード数の上限を足す。
         # 空・部分結果を「近傍なし」「近傍の全部」と区別させる（`complete:false` のとき `limits[].kind` が理由）。
         coverage = getattr(raw_cards, "coverage", None)
@@ -1142,7 +1219,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         if _graph_error_code == graph_coverage.KIND_GRAPH_UNAVAILABLE:
             coverage.add(graph_coverage.KIND_GRAPH_UNAVAILABLE)
         if _graph_error_code in (None, graph_coverage.KIND_GRAPH_UNAVAILABLE):
-            result["coverage"] = coverage.as_dict(omitted=omitted)  # `graph_internal_error` は `error_code` だけ（`kind` に対応する語が無い）
+            # `graph_internal_error` は `error_code` だけ（`kind` に対応する語が無い）。`depth`＝近傍たどりの深さの上限（その先に辺が残るかは判定しない＝truncated null）
+            result["coverage"] = coverage.as_dict(omitted=omitted, depth=getattr(raw_cards, "depth", None))
             unresolved = getattr(raw_cards, "unresolved", None)
             if unresolved is not None:
                 result["unresolved"] = unresolved             # 起点の名前に一致する未解決の参照（保存が無い旧グラフは available:false）
@@ -1156,6 +1234,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             line = int(args.get("line") or 1)
             # LLM が window を省略した既定値にも `window_cap` を使う
             window = int(args.get("window") or (window_cap or READ_WINDOW))
+            window_requested = window
         except (TypeError, ValueError):
             return ({"error": "line/window は整数で",
                     "error_code": _READ_INVALID_ARGS_ERROR_CODE}, docs, cites, cards)
@@ -1169,11 +1248,15 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         s = max(0, line - 1 - window)  # 0-based 窓の開始
         e_target = line - 1 + window + 1  # 0-based 窓の終端（排他）
         collected: list[tuple[int, str]] = []
+        reached_eof = True
+        total_seen = 0
         try:
-            _reader, it, encoding_caution = _stream_doc_lines(f)
+            reader, it, encoding_caution = _stream_doc_lines(f)
             for idx, t in enumerate(it):
                 if idx >= e_target:
+                    reached_eof = False
                     break
+                total_seen = idx + 1
                 if idx >= s:
                     collected.append((idx + 1, t))
         finally:
@@ -1190,6 +1273,15 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         result["text"] = text
         if read_around_truncated:
             result["text_truncated"] = True
+        if reader.truncated or reader.line_overflowed:
+            result["file_truncated"] = True  # 読み取りの上限（ファイル 64MiB・単一行 2MiB）で一部を読めていない
+            if reader.line_overflowed:
+                result["line_overflowed"] = True
+        if window_requested > window:
+            result["window_clamped"] = {"requested": window_requested, "used": window}
+        if reached_eof and not reader.truncated and line > total_seen:
+            result["line_beyond_eof"] = True  # 指定した行はファイルの末尾より後ろ
+            result["total_lines"] = total_seen
         return (result, docs, cites, cards)
     if name == "read_doc":
         doc_id = str(args.get("doc_id") or "")
@@ -1262,8 +1354,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             for idx, t in enumerate(it):
                 m = _HEADING_RE.match(t.lstrip())
                 if m:
-                    title = _redact(m.group(2).strip())[:_OUTLINE_TITLE_MAX_CHARS]
-                    all_headings.append({"line": idx + 1, "level": len(m.group(1)), "title": title})
+                    full_title = _redact(m.group(2).strip())
+                    heading = {"line": idx + 1, "level": len(m.group(1)), "title": full_title[:_OUTLINE_TITLE_MAX_CHARS]}
+                    if len(full_title) > _OUTLINE_TITLE_MAX_CHARS:
+                        heading["title_truncated"] = True  # 見出しが長く、途中で切って返している
+                    all_headings.append(heading)
                 total += 1
         finally:
             f.close()
@@ -1282,6 +1377,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         docs.add(doc_id)
         result = {"doc_id": doc_id, "total_lines": total, "count": len(all_headings),
                  "headings": headings, "truncated": truncated}
+        if any(h.get("title_truncated") for h in headings):
+            result["titles_truncated"] = True
         if file_truncated:
             result["file_truncated"] = True
         return (result, docs, cites, cards)

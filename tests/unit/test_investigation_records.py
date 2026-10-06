@@ -138,8 +138,10 @@ def test_save_and_get_investigation_record_round_trip_and_cascades_on_conversati
     reviews = [_review()]
     saved = store_investigation.save_investigation_record(
         msg["id"], conv["id"], complete=True, manifest=manifest, items=items, coverage=coverage,
-        reviews=reviews)
-    assert saved["complete"] is True and saved["truncated"] is False
+        reviews=reviews, coverage_detail={"i1": [{"tool": "read_doc", "outcome": "hit", "doc": "a.md"}]},
+        extras={"dropped": {"items": 2}})
+    assert saved["complete"] is True and saved["truncated"] is True     # 先に縮めた分も `truncated` に出る
+    assert saved["detail"]["dropped"] == {"items": 2} and saved["detail"]["coverage"]["i1"][0]["doc"] == "a.md"
     assert saved["manifest"] == manifest
     assert saved["items"] == items
     assert saved["reviews"] == reviews
@@ -148,6 +150,17 @@ def test_save_and_get_investigation_record_round_trip_and_cascades_on_conversati
     assert fetched["conversation_id"] == conv["id"]
     assert fetched["items"]["i1"]["status"] == "source_confirmed"
     assert fetched["reviews"] == reviews
+
+    # 保存より後に分かった欠落は、回答に注記を足して残す（本文は変えない・調査の記録の導線は外れる）。
+    store.append_answer_notice(msg["id"], "investigation_record_failed", "調査の記録を保存できませんでした。",
+                               unrecorded=True)
+    with store._connect() as c:
+        row = c.execute("SELECT content, answer FROM messages WHERE id=%s", (msg["id"],)).fetchone()
+    assert row["answer"]["notices"] == [{"kind": "investigation_record_failed", "text": "調査の記録を保存できませんでした。"}]
+    assert row["answer"]["body"] == "headline" and row["content"].endswith("headline")
+    with store._connect() as c:   # 後から足した注記は集計表の注記の種類にも反映される
+        tm = c.execute("SELECT notice_kinds FROM turn_metrics WHERE message_id=%s", (msg["id"],)).fetchone()
+    assert tm["notice_kinds"] == ["investigation_record_failed"]
 
     assert store.delete_conversation(conv["id"], "admin") is True
     assert store_investigation.get_investigation_record(msg["id"]) is None
@@ -165,3 +178,25 @@ def test_save_investigation_record_defaults_reviews_to_empty_list_when_omitted()
         items={"i1": _item("i1")}, coverage={"i1": ["hit"]})
     assert saved["reviews"] == []
     assert store.delete_conversation(conv["id"], "admin") is True
+
+
+def test_record_trim_reports_what_was_dropped_and_reviews_load_reports_omissions(tmp_path):
+    """調査記録の 1MiB の削減は、何を何件落としたかを返す。見直しの読み取りの上限・不正行も内訳で分かる。"""
+    ids = [f"i{i:02d}" for i in range(50)]
+    items = {i: _item(i, subject="x" * 25000) for i in ids}
+    detail = {i: [{"tool": "read_doc", "outcome": "hit", "doc": "a.md"}] for i in ids}
+    *_rest, dropped = store_investigation.trim_record(
+        {"question_kind": "qa", "created_at": "t", "items": ids}, items, {i: ["hit"] for i in ids}, [_review()], detail)
+    assert dropped["items"] > 0 and "reviews" not in dropped
+    text = investigation_record_render.describe_dropped(dropped)
+    assert f"調べた項目 {dropped['items']} 件" in text and "保存していません" in text
+    assert investigation_record_render.describe_dropped({}) == ""
+    # 見直しは件数の上限・不正行を数えて返す。
+    from sherpa import investigation_ledger as L
+    for _ in range(L.REVIEWS_MAX_COUNT):
+        L.append_review_atomic(tmp_path, {**_review(), "ts": 1.0})
+    with (tmp_path / "reviews.jsonl").open("a", encoding="utf-8") as f:
+        f.write('{"broken": true}\n' + __import__("json").dumps(_review()) + "\n")
+    reviews, report = L.load_reviews_report(tmp_path)
+    assert len(reviews) == L.REVIEWS_MAX_COUNT
+    assert report == {"invalid": 1, "over_count": 1, "over_bytes": False}

@@ -38,7 +38,7 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(worker, "_ledger_rows", lambda world, *, sig: [])
     monkeypatch.setattr(worker, "world_signature", lambda world: "sig")
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None: (0, 0))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None: (0, 0))
     monkeypatch.setattr(es_index, "index_world",
                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 0, "chunks": 0})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
@@ -149,7 +149,7 @@ def test_pg_replace_failure_marks_exception_as_already_recorded(monkeypatch, _st
     `get_latest_published_run_summary` が返す「今実際に Neo4j にある内容」を、この run が新世代の
     まま止めてしまわないようにする。
     """
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None: (4, 6))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None: (4, 6))
 
     def _boom_replace(world, rows):
         raise RuntimeError("pg_replace fault")

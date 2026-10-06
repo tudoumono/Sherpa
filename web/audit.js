@@ -228,7 +228,8 @@ async function exportAudit(format) {
     const m = cd.match(/filename="([^"]+)"/);
     const name = m ? m[1] : `sherpa-audit.${format}`;
     Sherpa.downloadBlob(blob, name);   // revoke のタイミング問題は共通ヘルパで回避
-    if (status) status.textContent = `エクスポートしました: ${name}`;
+    const truncated = r.headers.get('x-audit-export-truncated') === 'true';
+    if (status) status.textContent = `エクスポートしました: ${name}` + (truncated ? '（上限の 5 万行で切れています。期間や条件を絞って取り直してください）' : '');
   } catch (e) {
     if (status) status.textContent = `エクスポート失敗: ${e.message}`;
     toast('エクスポートに失敗しました');

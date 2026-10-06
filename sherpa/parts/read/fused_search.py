@@ -119,11 +119,12 @@ def _engine_coverage(engine: str, k: int, returned: int, graph_info: "GraphHits 
     if engine != "graph" or graph_info is None:
         return out
     run = graph_info.run_coverage or {}
-    limits = [{"kind": lim["kind"]} for lim in run.get("limits", [])
+    limits = [{"kind": lim["kind"], **({"count": lim["count"]} if isinstance(lim.get("count"), int) else {})}
+              for lim in run.get("limits", [])
               if lim["kind"] in (graph_coverage.KIND_DEPTH, graph_coverage.KIND_DOC_SEARCH_TRUNCATED,
                                    graph_coverage.KIND_TIMEOUT, graph_coverage.KIND_ROW_CAP,
                                    graph_coverage.KIND_GRAPH_UNAVAILABLE, graph_coverage.KIND_RESULT_CAP,
-                                   graph_coverage.KIND_PLUGIN_FAILED)]
+                                   graph_coverage.KIND_PLUGIN_FAILED, graph_coverage.KIND_SOURCE_UNPARSED)]
     cut = max(0, graph_info.total - k)
     if cut and {"kind": graph_coverage.KIND_RESULT_CAP} not in limits:
         limits.append({"kind": graph_coverage.KIND_RESULT_CAP})

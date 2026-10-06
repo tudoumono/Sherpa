@@ -381,13 +381,17 @@ def _sidecar_error_code(name, result) -> None:
             return
 
 
-# 項目ごとの未確認の記録。検索・読取ツール 6 本（任意引数 `item`＝台帳の項目 id・`agentic_search._ITEM_PARAM_SCHEMA`）の呼出結果を
-# `investigation_ledger.append_coverage_atomic` で台帳の置き場（coverage.jsonl）へ記録する。親と子は同じ `SHERPA_MCP_LEDGER_DIR` を共有する。
+# 項目ごとの未確認の記録。読み取り・検索・一覧・比較の道具すべて（任意引数 `item`＝台帳の項目 id・`agentic_search._ITEM_PARAM_SCHEMA`）の呼出結果と、
+# 検索語・資料・読んだ範囲を `investigation_ledger.append_coverage_atomic` で台帳の置き場（coverage.jsonl）へ記録する。親と子は同じ `SHERPA_MCP_LEDGER_DIR` を共有する。
 _ITEM_PARAM_TOOLS = frozenset({
     "ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors",
-    "graph_resolve", "graph_impact"})
+    "graph_resolve", "graph_impact", "doc_outline", "compare_documents", "xlsx_sheets", "xlsx_range",
+    "docx_paragraphs", "pptx_slides", "pdf_pages", "list_docs", "glob_search", "folder_tree"})
 _ITEM_HITS_TOOLS = frozenset({"ripgrep_search", "es_search"})  # `hits` 配列を持つ形
-_ITEM_READ_TOOLS = frozenset({"read_doc", "read_around", "file_head"})  # 単一文書読取の形
+# 単一文書読取の形（原本の Office／PDF の読み取り・見出し・比較を含む）。
+_ITEM_READ_TOOLS = frozenset({"read_doc", "read_around", "file_head", "doc_outline", "compare_documents",
+                              "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"})
+_ITEM_LIST_TOOLS = frozenset({"list_docs", "glob_search", "folder_tree"})  # 一覧の形（打ち切りだけを区分にする）
 # 単一文書読取の error は「その doc_id を読めなかった」とみなす。検索・グラフ系の error は、`error_code` が既知の「読めない」系コードのときだけ unreadable にする。
 _ITEM_UNREADABLE_ERROR_CODES = frozenset({"read_io_failed"})
 
@@ -425,6 +429,8 @@ def _coverage_outcome(name: str, result, is_error: bool) -> str | None:
                 for h in hits):
             return "truncated"
         return "hit"
+    if name in _ITEM_LIST_TOOLS:
+        return "truncated" if result.get("truncated") else "hit"
     if name in ("graph_resolve", "graph_impact"):
         if result.get("error_code"):  # `graph_unavailable`/`graph_internal_error`（isError ではない縮退）
             return "error"
@@ -456,9 +462,77 @@ def _coverage_outcome(name: str, result, is_error: bool) -> str | None:
     return "hit"
 
 
+def _coverage_detail(name: str, args) -> dict:
+    """呼出しの内容（検索語 `query`・資料 `doc`・読んだ範囲 `range`）を引数から写す。本文は含めない（文字列の引数だけ）。"""
+    if not isinstance(args, dict):
+        return {}
+
+    def _s(key):
+        v = args.get(key)
+        return v.strip() if isinstance(v, str) and v.strip() else None
+
+    def _n(key):
+        v = args.get(key)
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    detail: dict = {}
+    if name in ("ripgrep_search", "es_search"):
+        detail["query"] = _s("query")
+    elif name == "graph_neighbors":
+        detail["query"] = _s("name")
+    elif name == "graph_resolve":
+        detail["query"] = _s("name") or _s("path")
+    elif name == "graph_impact":
+        detail["query"] = _s("canonical_id")
+    elif name == "glob_search":
+        detail["query"] = _s("pattern")
+    elif name in ("list_docs", "folder_tree"):
+        detail["query"] = _s("name_pattern") or _s("path_prefix")
+    elif name == "compare_documents":
+        pair = [x for x in (_s("left_doc_id") or _s("source_doc_id"), _s("right_doc_id")) if x]
+        detail["doc"] = " ⇔ ".join(pair) if pair else None
+    elif name in READ_DOC_TOOLS or name in LISTED_DOC_TOOLS:
+        detail["doc"] = _s("doc_id")
+        if name == "read_doc":
+            detail["range"] = f"{_n('start_line') or 1} 行目から"
+        elif name == "read_around":
+            line, window = _n("line"), _n("window")
+            if line is not None:
+                detail["range"] = f"{line} 行目の前後" + (f" {window} 行" if window is not None else "")
+        elif name == "xlsx_range":
+            detail["range"] = "!".join(x for x in (_s("sheet"), _s("range")) if x) or None
+        elif name == "docx_paragraphs":
+            start, count = _n("start"), _n("count")
+            detail["range"] = f"段落 {start or 0} 番から" + (f" {count} 件" if count is not None else "")
+        elif name == "pptx_slides":
+            detail["range"] = f"スライド {_s('pages') or '1-10'}"
+        elif name == "pdf_pages":
+            detail["range"] = f"ページ {_s('pages') or '1-5'}"
+        elif name == "file_head":
+            mb = _n("max_bytes")
+            detail["range"] = f"先頭 {mb if mb is not None else 65536} バイト"
+    # 資料名は秘匿名なら記録しない。検索語・グラフの名前は、個人ファイルを使ったターン（`SHERPA_MCP_COVERAGE_NO_QUERY`）では記録しない。
+    from .ingest import text_kind
+    if detail.get("doc"):
+        names = [d for d in detail["doc"].split(" ⇔ ") if not text_kind.is_sensitive_doc_id(d)]
+        detail["doc"] = " ⇔ ".join(names)
+    if os.environ.get("SHERPA_MCP_COVERAGE_NO_QUERY") == "1":
+        detail.pop("query", None)
+    return {k: v for k, v in detail.items() if v}
+
+
+def _append_coverage(ledger_dir: str, item_id: str, name: str, outcome: str, args) -> None:
+    """coverage.jsonl へ 1 行追記する。書けなかったら黙らず、親が注記できるようサイドカーへ `coverage_write_failed` を残す（ツール呼出しは失敗させない）。"""
+    try:
+        investigation_ledger.append_coverage_atomic(Path(ledger_dir), item_id, name, outcome,
+                                                    _coverage_detail(name, args))
+    except (OSError, ValueError):
+        _sidecar_append({"kind": "limit", "field": "coverage_write_failed", "ts": time.time()})
+
+
 def _record_item_coverage(name: str, args: dict, result, is_error: bool) -> None:
-    """`item` 付きの検索・読取ツール呼出しの結果区分を coverage.jsonl へ追記する。fail-open:
-    `item` が無い/不正・対象外ツール・`_coverage_outcome` が `None`・`SHERPA_MCP_LEDGER_DIR` 未設定（台帳を使わないターン・plain）は何もしない。書込失敗（`OSError`/`ValueError`）でもツール呼出は失敗させない。
+    """`item` 付きの検索・読取ツール呼出しの結果区分と内容を coverage.jsonl へ追記する。書込失敗はツール呼出しを失敗させず、サイドカーで親へ知らせる（fail-open）:
+    `item` が無い/不正・対象外ツール・`_coverage_outcome` が `None`・`SHERPA_MCP_LEDGER_DIR` 未設定（台帳を使わないターン・plain）は何もしない。
     """
     if name not in _ITEM_PARAM_TOOLS:
         return
@@ -475,10 +549,7 @@ def _record_item_coverage(name: str, args: dict, result, is_error: bool) -> None
     ledger_dir = os.environ.get("SHERPA_MCP_LEDGER_DIR")
     if not ledger_dir:
         return
-    try:
-        investigation_ledger.append_coverage_atomic(Path(ledger_dir), item_id, name, outcome)
-    except (OSError, ValueError):
-        pass
+    _append_coverage(ledger_dir, item_id, name, outcome, args)
 
 
 # ツール結果 1 件あたりのバイト予算・調べる深さ連動の実効上限。
@@ -827,10 +898,7 @@ def _record_duplicate_item_coverage(name: str, args: dict) -> None:
     ledger_dir = os.environ.get("SHERPA_MCP_LEDGER_DIR")
     if not ledger_dir:
         return
-    try:
-        investigation_ledger.append_coverage_atomic(Path(ledger_dir), item_id, name, outcome)
-    except (OSError, ValueError):
-        pass
+    _append_coverage(ledger_dir, item_id, name, outcome, args)
 
 
 def _ok(rid, result: dict) -> dict:

@@ -829,8 +829,10 @@ def _extract_evidence_assets(
     return written
 
 
-def _build_figure_texts(extracted_evidence, assets_dir: Path) -> dict[str, list[list[str]]]:
+def _build_figure_texts(extracted_evidence, assets_dir: Path,
+                        drops: dict | None = None) -> dict[str, list[list[str]]]:
     """WMF/EMF の図の描画命令に載っている文字を、図（Evidence 要素）ごとに取り出す。
+    `drops`（省略可）を渡すと、行数・文字数の上限で落とした分と上限に達した図・除いたビットマップの数を足す（本文は変えない・図 1 つにつき 1 回数える）。
 
     OCR の有効/無効や完了に依存せず、抽出済み assets だけから決定的に作る。失敗は「この文書の図の
     文字なし」へ縮退し、rag.md の生成は止めない。
@@ -859,6 +861,14 @@ def _build_figure_texts(extracted_evidence, assets_dir: Path) -> dict[str, list[
                 if digest not in cache:
                     content = metafile_text.read_asset_content(assets_dir.joinpath(*relative.split("/")))
                     cache[digest] = content.lines if content is not None else []
+                    if drops is not None and content is not None:
+                        for key, n in (("lines_dropped", content.lines_dropped),
+                                       ("chars_dropped", content.chars_dropped),
+                                       ("figures_text_capped", int(content.text_items_capped)),
+                                       ("figures_bitmaps_capped", int(content.bitmaps_capped)),
+                                       ("bitmaps_excluded", content.bitmaps_excluded)):
+                            if n:
+                                drops[key] = drops.get(key, 0) + n
                 if cache[digest]:
                     result.setdefault(element.element_id, []).append(cache[digest])
         return result
@@ -1539,6 +1549,12 @@ def _build_derived_into_staging(
     conv_cache_pipeline_sig = _current_conv_cache_pipeline_sig(ocr_observation_marker=ocr_observation_marker)
     conv_cache_seen_rels: set[str] = set()               # 剪定用「今回の原本一覧」（成否問わず候補に入った rel）
 
+    # いまの 1 ファイルの変換だけが持つ、サイドカーを書くときに足す来歴（ファイルの先頭で空にする＝書かれなければ捨てる）
+    pending_meta: dict = {}
+
+    def _write_prov(md_path, arm_name, result, **kw):
+        _write_provenance(md_path, arm_name, result, extra_meta=pending_meta, **kw)
+
     def _generate_evidence(
         rp: Path,
         rel: str,
@@ -1599,7 +1615,14 @@ def _build_derived_into_staging(
             if prebuilt_evidence is None or actual.suffix.lower() not in LEGACY_OFFICE_EXT:
                 _extract_evidence_assets(rp, actual, extracted_evidence, assets_dir)
                 observation_set = _build_observation_set(extracted_evidence, rel, assets_dir, obs_dir=obs_dir)
-                figure_texts = _build_figure_texts(extracted_evidence, assets_dir)
+                figure_drops: dict = {}
+                figure_texts = _build_figure_texts(extracted_evidence, assets_dir, figure_drops)
+                pending_meta.clear()
+                if figure_drops:   # 文字・画像を上限で落とした図の件数を来歴へ残す（rag.md の本文は変えない）
+                    if (dr / (rel + ".md.meta.json")).is_file():
+                        _merge_provenance_metadata(dr / (rel + ".md"), {"metafile_truncated": figure_drops})
+                    else:                                    # サイドカーはこの後の `_write_prov` が書くときに載せる
+                        pending_meta["metafile_truncated"] = figure_drops
             rendered = evidence_render.render(
                 extracted_evidence, source_name=rel, observation_set=observation_set,
                 figure_texts=figure_texts)
@@ -1756,7 +1779,7 @@ def _build_derived_into_staging(
                 confidence=1.0,
                 notes=["coverage_status=failed", f"reason_code={reason_code}"],
             )
-            _write_provenance(dst, "evidence_notice", notice_result)
+            _write_prov(dst, "evidence_notice", notice_result)
             published_notice_count += 1
         failed += 1
         conversion_failures.append({"doc": rel, "reason": reason_code})
@@ -1768,6 +1791,7 @@ def _build_derived_into_staging(
         progress(0, candidate_total)
 
     for rp, rel in si.safe_files(wd, also=_also):
+        pending_meta.clear()
         ext = rp.suffix.lower()
         if ext not in candidate:
             continue
@@ -1811,7 +1835,7 @@ def _build_derived_into_staging(
                             confidence=1.0,
                             notes=["coverage_status=unsupported", "reason_code=legacy_backend_unavailable"],
                         )
-                        _write_provenance(dst, "legacy", notice_result)
+                        _write_prov(dst, "legacy", notice_result)
                         published_notice_count += 1
                 unsupported += 1
                 continue
@@ -1870,7 +1894,7 @@ def _build_derived_into_staging(
                 dst = dr / (rel + ".md")
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_text(raster_md, encoding="utf-8")
-                _write_provenance(dst, "raster", result)
+                _write_prov(dst, "raster", result)
                 converted += 1
                 _conv_cache_store_if_eligible()
                 continue
@@ -1902,7 +1926,7 @@ def _build_derived_into_staging(
                             confidence=1.0,
                             notes=[f"coverage_status={status}", f"reason_code={reason}"],
                         )
-                        _write_provenance(dst, "legacy", notice_result)
+                        _write_prov(dst, "legacy", notice_result)
                         published_notice_count += 1
                     if backend_ready:
                         failed += 1
@@ -1960,7 +1984,7 @@ def _build_derived_into_staging(
                             )
                             # 変換 arm 名を付けると quality Gate が通常の Document IR chain まで要求するため付けない
                             # （変換成功物ではなく、source-level failed coverage を検索可能にする notice）
-                            _write_provenance(dst, "evidence_notice", notice_result)
+                            _write_prov(dst, "evidence_notice", notice_result)
                             published_notice_count += 1
                     failed += 1
                     continue
@@ -1984,14 +2008,19 @@ def _build_derived_into_staging(
                         )
                         # 変換 arm 名を付けると quality Gate が通常の Document IR chain まで要求するため付けない
                         # （変換成功物ではなく、source-level failed coverage を検索可能にする notice）
-                        _write_provenance(dst, "evidence_notice", notice_result)
+                        _write_prov(dst, "evidence_notice", notice_result)
                         published_notice_count += 1
                 failed += 1
                 # IR を持たない拡張子（PDF/PPTX 等）の一般失敗も rel・理由を残す。PDF は暗号化を判別可能な範囲で明示する。
-                conversion_failures.append({
+                failure = {
                     "doc": rel,
                     "reason": "password_protected" if (ext == ".pdf" and _pdf_is_encrypted(rp)) else "conversion_failed",
-                })
+                }
+                from .. import corpus_docs   # 遅延 import（循環回避）
+                pages = corpus_docs._pdf_pages_summary(result.notes) if result is not None else None
+                if pages:                                    # 画像で読んだ PDF が全ページ空・失敗だったときの読めなかったページ数
+                    failure["pdf_pages"] = pages
+                conversion_failures.append(failure)
                 continue
             if extra_notes:                                  # 来歴に legacy_backend/soffice バージョンを追記
                 result.notes = list(result.notes) + extra_notes
@@ -2001,7 +2030,7 @@ def _build_derived_into_staging(
             _check_partial_extraction(rp, result.md, rel, result.document, partial_extraction_suspected)
             if ext in (".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt") and arm_name == "ooxml":
                 human_md_sig_for_rel = _current_human_md_sig()
-            _write_provenance(
+            _write_prov(
                 dst, arm_name, result, legacy_conversion=legacy_conversion)  # 来歴サイドカーをESチャンクメタへ搬送
             # IR は原本が素の .docx/.pptx/.xlsx のときだけ書く。旧 .doc/.ppt/.xls は前段変換後の一時 OOXML から IR を作れてしまうが、
             # doc_id/source.path は原本 rel なのに file_type・content_hash が変換後ファイルの値になる（来歴汚染）ため、
@@ -2053,7 +2082,7 @@ def _build_derived_into_staging(
                         confidence=1.0,
                         notes=["coverage_status=failed", "reason_code=source_parse_failed"],
                     )
-                    _write_provenance(dst, "evidence_notice", notice_result)
+                    _write_prov(dst, "evidence_notice", notice_result)
                     published_notice_count += 1
                     failed += 1
                     continue
@@ -2638,6 +2667,7 @@ def _write_provenance(
     result,
     *,
     legacy_conversion: dict | None = None,
+    extra_meta: dict | None = None,
 ) -> None:
     """変換来歴サイドカー `{md_path}.meta.json`（`{arm, method, confidence, notes}`）を書く（best-effort）。
 
@@ -2645,6 +2675,8 @@ def _write_provenance(
     """
     meta = {"arm": arm_name, "method": result.method,
             "confidence": result.confidence, "notes": list(result.notes)}
+    if extra_meta:
+        meta.update(extra_meta)
     if legacy_conversion is not None:
         meta["legacy_conversion"] = legacy_conversion
     try:

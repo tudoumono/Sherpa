@@ -103,11 +103,12 @@ def _run_render(argv: list[str], *, needs_network_isolation: bool, env: dict, cw
 def render_outputs(
     md_paths: list[Path], *, marp_bin: str | None, chrome_path: str | None,
     theme_dirs: list[Path], containment_root: Path, timeout: int = 180,
+    failures: list | None = None,
 ) -> list[Path]:
     """marp な .md それぞれについて html/pdf/pptx を同ディレクトリ・同 stem で生成する。
 
     marp 未導入なら即 `[]`（.md のみが成果物）。同名の出力が既にある形式はスキップ（上書き禁止）。pdf/pptx はネットワーク隔離が
-    使えない環境ではスキップ。個々の失敗は他に波及させない。
+    使えない環境ではスキップ。個々の失敗は他に波及させない（`failures` を渡すと、試みて失敗した形式名を追記する）。
     入出力とも `containment_root`（authoring）内の実体であることを強制する（src は symlink・root 外解決を拒否、出力先は
     symlink（dangling 含む）が居座っていれば拒否）。
     """
@@ -162,5 +163,7 @@ def render_outputs(
                 cwd=src.parent, timeout=timeout)
             if ok and out.is_file():
                 rendered.append(out)
+            elif failures is not None:
+                failures.append(fmt)  # 実際に書き出しを試みて失敗した形式（呼び出し側が利用者へ知らせる）
 
     return rendered

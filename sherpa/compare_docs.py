@@ -88,12 +88,13 @@ def _in_scope(doc_id: str, scope_paths) -> bool:
 
 
 def _basename_candidates(world: str, source_doc_id: str, target_generation: str, scope_paths,
-                         deadline: float | None) -> list:
-    """厳密一致が0件のときの対応文書候補の列挙（`difflib.get_close_matches` による basename 類似度・順位付けはしない）。"""
+                         deadline: float | None) -> tuple[list, int]:
+    """厳密一致が0件のときの対応文書候補の列挙（`difflib.get_close_matches` による basename 類似度・順位付けはしない）。
+    戻り `(候補（先頭 `_CANDIDATES_MAX` 件）, 類似の閾値を超えた候補の総数)`。"""
     try:
         rows = doc_ledger.documents_for(world, deadline=deadline)
     except Exception:
-        return []
+        return [], 0
     names = []
     for r in rows:
         rel = r.get("name")
@@ -105,10 +106,12 @@ def _basename_candidates(world: str, source_doc_id: str, target_generation: str,
             continue
         names.append(rel)
     if not names:
-        return []
+        return [], 0
     source_base = Path(source_doc_id).name
     basenames = [Path(n).name for n in names]
-    close = difflib.get_close_matches(source_base, basenames, n=_CANDIDATES_MAX, cutoff=0.4)
+    close_all = difflib.get_close_matches(source_base, basenames, n=len(basenames), cutoff=0.4)
+    total = len({rel for cb in close_all for rel in names if Path(rel).name == cb})
+    close = close_all[:_CANDIDATES_MAX]
     out: list = []
     seen: set = set()
     for cb in close:
@@ -119,12 +122,12 @@ def _basename_candidates(world: str, source_doc_id: str, target_generation: str,
                 break
         if len(out) >= _CANDIDATES_MAX:
             break
-    return out
+    return out, max(total, len(out))
 
 
 def _discover(world: str, source_doc_id: str, target_generation: str, scope_paths,
-             deadline: float | None) -> tuple[str | None, list]:
-    """明示ペア以外の対応文書の同定。戻り `(right_doc_id|None, candidates)`。
+             deadline: float | None) -> tuple[str | None, list, int]:
+    """明示ペア以外の対応文書の同定。戻り `(right_doc_id|None, candidates, candidates_total)`。
 
     世代を除いた相対 suffix の完全一致（0件か1件）を、構築した候補パスの実在確認で判定し、無ければ basename 類似度の候補列挙へ倒す。
     設計: docs/design/scope.md「同一性＝パス」
@@ -132,8 +135,9 @@ def _discover(world: str, source_doc_id: str, target_generation: str, scope_path
     _gen, suffix = _generation_and_suffix(source_doc_id)
     candidate_id = f"{target_generation}/{suffix}" if suffix else target_generation
     if _in_scope(candidate_id, scope_paths) and _doc_exists(candidate_id, world):
-        return candidate_id, []
-    return None, _basename_candidates(world, source_doc_id, target_generation, scope_paths, deadline)
+        return candidate_id, [], 0
+    candidates, total = _basename_candidates(world, source_doc_id, target_generation, scope_paths, deadline)
+    return None, candidates, total
 
 
 def compare(world: str, args: dict, *, scope_paths=None, deadline: float | None = None) -> dict:
@@ -156,10 +160,15 @@ def compare(world: str, args: dict, *, scope_paths=None, deadline: float | None 
     elif source_doc_id and target_generation:
         if not _in_scope(source_doc_id, scope_paths):
             return {"error": "指定 doc_id は対象範囲外です"}
-        resolved, candidates = _discover(world, source_doc_id, target_generation, scope_paths, deadline)
+        resolved, candidates, candidates_total = _discover(
+            world, source_doc_id, target_generation, scope_paths, deadline)
         if resolved is None:
-            return {"status": "needs_disambiguation", "source_doc_id": source_doc_id,
-                    "target_generation": target_generation, "candidates": candidates}
+            out = {"status": "needs_disambiguation", "source_doc_id": source_doc_id,
+                   "target_generation": target_generation, "candidates": candidates}
+            if candidates_total > len(candidates):
+                out["candidates_total"] = candidates_total  # 候補は先頭だけ・類似の候補はほかにもある
+                out["truncated"] = True
+            return out
         left_doc_id, right_doc_id = source_doc_id, resolved
     else:
         return {"error": "left_doc_id+right_doc_id か source_doc_id+target_generation のどちらかを指定してください"}

@@ -586,6 +586,14 @@ _SCHEMA = [
         mapping_source TEXT NOT NULL,
         mapping_version INTEGER NOT NULL
     )""",
+    # キャッシュへの書き込み量（プロンプトキャッシュの書き込み課金）。NULL＝プロバイダが返さなかった「不明」で、0（書き込みなしと報告）とは別。古い行は NULL のまま。
+    "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_write_tokens BIGINT",
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS cache_write_tokens BIGINT",
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS parent_cache_write_tokens BIGINT",
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS child_cache_write_tokens BIGINT",
+    # 回答の完了状態（complete/partial/stopped/failed）と注記の種類（閉じた語彙の配列）。古い行は NULL。
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS completion TEXT",
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS notice_kinds JSONB",
     "CREATE INDEX IF NOT EXISTS turn_metrics_created_at ON turn_metrics(created_at)",
     "CREATE INDEX IF NOT EXISTS turn_metrics_user_created ON turn_metrics(user_id, created_at)",
     "CREATE INDEX IF NOT EXISTS turn_metrics_conversation ON turn_metrics(conversation_id)",
@@ -648,6 +656,8 @@ _SCHEMA = [
     )""",
     "CREATE INDEX IF NOT EXISTS investigation_records_conversation "
     "ON investigation_records(conversation_id)",
+    # 調査記録の補足（落とした内訳 `dropped`・検索語と読んだ範囲 `coverage`・見直しの読み取りの省略 `reviews_report`）。
+    "ALTER TABLE investigation_records ADD COLUMN IF NOT EXISTS detail JSONB NOT NULL DEFAULT '{}'",
 ]
 # usage_stats の期間絞り（`_usage_period_bounds`）が messages.created_at の索引を使えるようにする索引。`_USAGE_TURN_CTE` の `touched`（期間の候補メッセージを絞るサブクエリ）が使う。
 # `_SCHEMA` には含めない（既存の大規模 messages では素の CREATE INDEX が起動の単一トランザクション内で長時間かかり、readiness 未達のまま強制終了→再起動を繰り返しうるため）。`ensure_messages_created_at_index()` が別 autocommit 接続で `CREATE INDEX CONCURRENTLY` を実行し、`init_schema()` はその完了を待たない（background daemon thread）。

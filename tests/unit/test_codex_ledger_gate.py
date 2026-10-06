@@ -117,6 +117,9 @@ for i, text in enumerate(step.get("agent_messages", [])):
                        "item": {"id": f"m{i}", "type": "agent_message", "text": text}}))
     sys.stdout.flush()
 
+for event in step.get("extra_events", []):
+    print(json.dumps(event), flush=True)
+
 usage = step.get("usage")
 if usage:
     print(json.dumps({"type": "turn.completed", "usage": usage}))
@@ -538,13 +541,18 @@ def test_retire_directory_is_either_absent_or_complete_and_lock_released_after_r
 
 
 def test_unevaluated_final_in_same_attempt_is_not_adopted_when_ledger_incomplete(tmp_path, monkeypatch):
-    """final の直後に in_progress を出した attempt の final はゲートを通っておらず、後続が in_progress のままなら採用しない。"""
+    """台帳未完了の final は完了回答にせず、後続の途中本文とともに部分回答として残す。"""
     steps = [_st("TH-UNEVAL", _final("第一final・まだ未完了です。"), _inprog("これから確認します。")),
              _st("TH-UNEVAL", _inprog("台帳の催促後も作業中です。")),
              _st("TH-UNEVAL", _inprog("自動継続後も作業中です。"))]
     _, env, calls = _t(tmp_path, monkeypatch, steps, "ledger-unevaluated-final", 30017)
     assert len(calls) == 3
-    assert env["headline"] == "自動継続後も作業中です。"
+    assert "第一final・まだ未完了です。" in env["headline"]
+    assert "台帳の確認が終わる前" in env["headline"]
+    assert "続きの調査で得た途中の内容" in env["headline"]
+    for text in ("これから確認します。", "台帳の催促後も作業中です。", "自動継続後も作業中です。"):
+        assert env["headline"].count(text) == 1
+    assert env["completion"] == "partial"
     assert env.get("codex_stopped_early") is True
     inv = env["investigation"]
     assert inv["complete"] is False and inv["manifest_invalid"] is True and inv["stopped_reason"] == "ledger_missing"
@@ -1022,7 +1030,8 @@ def test_review_round_reverts_to_pre_review_candidate_when_answer_gets_worse(tmp
     steps = [_st("TH-REV4", _final("対象は Y です。"), ledger=_complete()), _st("TH-REV4", _final(""))]
     _, env, calls = _t(tmp_path, monkeypatch, steps, "review-revert", 32004)
     assert len(calls) == 2
-    assert env["headline"] == "対象は Y です。"
+    assert "対象は Y です。" in env["headline"]
+    assert "見直し前の回答に戻しました" in env["headline"]
     assert env["investigation"]["review"] == {"attempted": True, "rounds": 0, "items_added": 0}
 
 
@@ -1042,7 +1051,8 @@ def test_review_round_broken_json_does_not_mark_stopped_early(tmp_path, monkeypa
               "usage": helper._usage()}]
     _, env, calls = _t(tmp_path, monkeypatch, steps, "review-broken-json", 32006)
     assert len(calls) == 2
-    assert env["headline"] == "初回の結論です。"
+    assert "初回の結論です。" in env["headline"]
+    assert "見直し前の回答に戻しました" in env["headline"]
     assert not env.get("codex_stopped_early") and not env.get("codex_silent_failure")
 
 
@@ -1069,7 +1079,8 @@ def test_review_round_growth_reverts_to_pre_review_candidate_when_followup_stall
     assert len(calls) == 4
     assert env["investigation"]["stopped_reason"] == "no_progress"
     assert env["investigation"]["review"] == {"attempted": True, "rounds": 1, "items_added": 1}
-    assert env["headline"].startswith("初回の結論です。")
+    assert "初回の結論です。" in env["headline"]
+    assert "見直し前の回答に戻しました" in env["headline"]
     assert "対象（調べ終わっていません）" in env["headline"]
 
 
@@ -1092,7 +1103,8 @@ def test_review_round_growth_reverts_when_followup_ends_in_progress(tmp_path, mo
                  ledger={"manifest": _manifest(["a", "b"]), "items": {"b": _pend("b")}}),
              _st("TH-REV9", _inprog("b を調べています。")), _st("TH-REV9", _inprog("b を調べています。"))]
     _, env, _ = _t(tmp_path, monkeypatch, steps, "review-growth-inprog", 32010)
-    assert env["headline"].startswith("初回の結論です。")
+    assert "初回の結論です。" in env["headline"]
+    assert "見直し前の回答に戻しました" in env["headline"]
     assert not env.get("codex_stopped_early")
 
 
@@ -1111,7 +1123,10 @@ def test_review_round_growth_then_worse_followup_reverts_before_second_review(tm
     _, env, calls = _t(tmp_path, monkeypatch, steps, "review-growth-worse", 32011)
     assert len(calls) == 3
     assert "初回の結論です（X・Y・Z）。" in env["headline"]
-    assert "b だけの回答です。" not in env["headline"]
+    assert "b だけの回答です。" in env["headline"]
+    assert "見直し前の回答に戻しました" in env["headline"]
+    assert "b が必要でした（X・Y・Z）。" in env["headline"]
+    assert env["completion"] == "partial"
 
 
 def test_review_round_growth_ending_in_progress_does_not_ask_second_review(tmp_path, monkeypatch):
@@ -1235,3 +1250,80 @@ def test_continue_obligation_survives_an_intervening_insufficient_review(tmp_pat
     _, env2, calls2 = _t(tmp_path, monkeypatch, steps2, uid, cid, message="続きをお願いします", log="argv2.log")
     assert "前回の見直しで追加に調べられるとした観点: 帳票" in calls2[0][-1]
     assert env2["investigation"]["complete"] is True
+
+
+@pytest.mark.parametrize("followup", [
+    {"exit_code": 1, "extra_events": [{"type": "turn.failed", "error": {"code": "test_failure"}}]},
+    {"exit_code": 1},
+    {"agent_messages": [_final("")], "exit_code": 1},
+])
+def test_rejected_final_survives_followup_failure(tmp_path, monkeypatch, followup):
+    steps = [_st("TH-PARTIAL", _final("回収済みの結論です。"), ledger=_open()),
+             followup]
+    _, env, calls = _t(tmp_path, monkeypatch, steps, "partial-ledger", 33001)
+    assert "resume" in calls[1]
+    assert "回収済みの結論です。" in env["headline"]
+    assert "台帳の確認が終わる前" in env["headline"]
+    assert "失敗" in env["headline"]
+    assert env["completion"] == "partial"
+    assert not env["investigation"]["complete"]
+
+
+def test_rejected_final_keeps_progress_and_broken_followup_as_notices(tmp_path, monkeypatch):
+    original = "回収済みの結論です。対象はサンプル処理です。"
+    progress = "続きで確認した補足です。詳細は未確認です。"
+    broken = "続きで見つけた候補です。確認は終わっていません。"
+    steps = [_st("TH-PARTIAL-CONTENT", _final(original), ledger=_open()),
+             _st("TH-PARTIAL-CONTENT", _inprog(progress),
+                 '{"answer": ' + json.dumps(broken, ensure_ascii=False) + ', "claims": [',
+                 exit_code=1, extra_events=[{"type": "turn.failed", "error": {"code": "test_failure"}}])]
+    _, env, calls = _t(tmp_path, monkeypatch, steps, "partial-content", 33002)
+    assert len(calls) == 2
+    headline = env["headline"]
+    # 本文は差し戻された回答のまま・注記は別の欄（headline は注記＋本文の投影）。
+    assert env["body"] == original and env["answer_schema"] == 2
+    kinds = {n["kind"] for n in env["notices"]}
+    assert {"ledger_unfinished", "partial_followup", "answer_recovery"} <= kinds
+    assert "続きの調査で得た途中の内容" in headline and "失敗" in headline
+    assert progress in headline and broken in headline
+    assert headline.count(progress) == headline.count(broken) == 1
+    assert headline.endswith(original)
+    assert env["completion"] == "partial" and not env["investigation"]["complete"]
+
+
+def test_review_rollback_keeps_answer_read_only_from_last_message_file(tmp_path):
+    from sherpa.providers.codex.turn_candidates import _pick_structured_headline, _update_structured_state
+    from sherpa.providers.codex.turn_loop import _revert_review_if_worse
+    from sherpa.providers.codex.turn_state import CodexTurnState
+
+    st = CodexTurnState(helper._ctx("review-file", 33003), turn_t0=0, plain=False, skip_presearch=True)
+    st._schema_on = st._schema_v2 = True
+    st._last_message_path = tmp_path / "last-message.txt"
+    original, review = "回収済みの結論です。", "見直しで別の確認点を見つけました。"
+    st._last_message_path.write_text(_final(original), encoding="utf-8")
+    _update_structured_state(st)
+    st._ledger_review_pre_candidate = st._latest_structured
+    st._ledger_review_pre_latest_structured = st._latest_structured
+    st._ledger_review_pre_len = len(st._structured_answers)
+    st._last_message_path.write_text(_final(review), encoding="utf-8")
+    _update_structured_state(st)
+    assert not st._agent_msgs and not st._agent_partial
+    st._turn_failed = True
+    _revert_review_if_worse(st)
+    assert _pick_structured_headline(st) == original
+    assert [k for k, _ in st._answer_notices] == ["review_reverted"]
+    note = "\n\n".join(t for _, t in st._answer_notices)
+    assert "見直し前の回答に戻しました" in note
+    assert "採用しなかった見直しの内容（未確定）" in note
+    assert note.count(review) == 1 and "回収できませんでした" not in note
+
+
+def test_unconfirmed_items_are_returned_from_the_ledger_even_when_no_body_was_picked(tmp_path, monkeypatch):
+    """回答の本文を選べなかったターンでも、台帳から作った未確認の一覧と「調べた範囲」を返す。"""
+    ledger = {"manifest": _manifest(["a"]),
+              "items": {"a": _item("a", "not_found_in_scope", reason="探したが無かった")}}
+    events, env, _ = _t(tmp_path, monkeypatch, [_st("TH-COD25-NOBODY", ledger=ledger)], "cod25-nobody", 31125)
+    assert env["investigation"]["unconfirmed_items"] == [
+        {"item": "対象", "reason": "この項目を調べた記録がありません"}]
+    assert any(n["kind"] == "unconfirmed_items" for n in env["notices"])
+    assert any(i["label"] == "確認できなかった項目" for i in env["investigation_summary"]["items"])

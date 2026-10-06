@@ -76,7 +76,7 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
     try:
         _last_message_path.unlink(missing_ok=True)
     except OSError as exc:
-        st._stale_last_message = _read_last_message_fallback(_last_message_path)
+        st._stale_last_message = _read_last_message_fallback(_last_message_path, st._answer_notices, st._attempt_no)
         _log.warning("codex last-message cleanup failed: %s errno=%s conv=%s uid=%s",
                      type(exc).__name__, getattr(exc, "errno", None), ctx.conversation_id, uid)
     # このプロセス内だけで完結する id 集合（run-level `_mcp_calls` への合算は finally で行う）。
@@ -132,9 +132,18 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
             try:
                 e = json.loads(line)
             except ValueError:
+                st._invalid_output_events += 1
                 continue
-            st.got_any_line = True
+            if not isinstance(e, dict) or not isinstance(e.get("item", {}), dict):
+                st._invalid_output_events += 1
+                continue
             _et = e.get("type")
+            if isinstance(_et, str) and _et.startswith("item."):
+                _item_type = (e.get("item") or {}).get("type")
+                if not isinstance(_item_type, str) or not _item_type.strip():
+                    st._invalid_output_events += 1
+                    continue
+            st.got_any_line = True
             if isinstance(_et, str):
                 _event_type_counts[_et] = _event_type_counts.get(_et, 0) + 1
             if e.get("type") == "thread.started":  # session/thread id 捕捉（resume 先の id）
@@ -295,6 +304,9 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                     yield _node(f"cx-{iid}", "think", "考える", txt[-1][:80], "done")
             elif it == "agent_message" and e.get("type") in ("item.completed", "item.updated"):
                 # 最後の1件で上書きせず集める（完了分はリストへ・未完分は partial に保持）。結論の選択は loop 後に `_pick_codex_headline` で決定的に行う。
+                if not isinstance(item.get("text"), str):
+                    st._invalid_output_events += 1
+                    continue
                 _txt = (item.get("text") or "").strip()
                 if e.get("type") == "item.completed":
                     if _txt:
@@ -302,8 +314,10 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                     st._agent_partial = ""
                 else:  # item.updated＝成長中の未完 message（打ち切り保険）
                     st._agent_partial = _txt
-    except Exception:
+    except Exception as exc:
         st._stream_error = True
+        st._answer_notices.append(f"回答の回収中にエラーが発生しました（{type(exc).__name__}）。")
+        _log.warning("codex output collection failed: type=%s errno=%s", type(exc).__name__, getattr(exc, "errno", None))
     finally:
         # このプロセスで観測した分だけ run-level へ合算する（例外で打ち切られても、見えていた分は計測に残す）。
         _mcp_calls["total"] += len(_attempt_mcp_seen)
@@ -333,7 +347,7 @@ def _absorb_last_message_fallback(st) -> None:
     """attempt が `--json` に agent_message を出さず `-o` 最終メッセージファイルにだけ結論を書いたケースを拾う（毎 attempt 終了直後に呼ぶ）。`_last_message_path` は attempt をまたいで使い回すため、最新 attempt の分（`_agent_msgs[_attempt_msgs_start:]`）と同一（strip 比較）なら追加しない（過去の attempt と同文だからと落とすと、この attempt の結論が判定対象から消える）。"""
     _last_message_path = st._last_message_path
     _agent_msgs = st._agent_msgs
-    _fb = _read_last_message_fallback(_last_message_path)
+    _fb = _read_last_message_fallback(_last_message_path, st._answer_notices, st._attempt_no)
     if _fb and _fb == st._stale_last_message:
         return
     if _fb and _fb.strip() not in {m.strip() for m in _agent_msgs[st._attempt_msgs_start:]}:

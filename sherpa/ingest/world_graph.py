@@ -887,6 +887,22 @@ def plugin_failures_from_flags(flags) -> list:
                   key=lambda x: x["plugin"])
 
 
+def unparsed_sources_from_flags(flags) -> dict:
+    """`build_world` の `flags` から、グラフに入れなかったソースのファイル数 `{syntax, size_exceeded}` を取り出す（`world_neo4j.load_world` が同じ世代で保存する）。
+    `syntax`＝落とした構文があり主体のノードも作れず、ファイルごとグラフに入らなかったもの（`build_world` が出す `source_not_registered`）、
+    `size_exceeded`＝大きすぎて読まなかったファイル（`dropped_syntax` の `why`）。いずれも `from` で重複を除く。
+    主体のノードを作った上で一部の構文だけ落とした申告（動的 URL・構文エラーの一部など）は数えない。取り込みの状態の通知も同じ関数を使う。
+    """
+    syntax: set = set()
+    oversize: set = set()
+    for f in flags:
+        if f.get("reason") == "source_not_registered":
+            syntax.add(f.get("from"))
+        elif f.get("reason") == "dropped_syntax" and f.get("why") == "size_exceeded":
+            oversize.add(f.get("from"))
+    return {"syntax": len(syntax), "size_exceeded": len(oversize)}
+
+
 def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
     """資料フォルダ（登録ディレクトリ）を `(nodes, edges, flags)` にする。パス同一性＋同 top_scope 内の最近傍解決。
 
@@ -1111,6 +1127,8 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
             global_imports.setdefault((analyzer.name, _top(rel)), []).append(imp)
         _flag_dropped(analyzer.name, rel, defres.dropped)
         if defres.primary is None:                        # 構文にマッチせず主体を持たない
+            if defres.dropped:                            # 落とした構文があるのに主体も無い＝ファイルごとグラフに入らない
+                flags.append({"reason": "source_not_registered", "analyzer": analyzer.name, "from": rel})
             continue
         if defres.primary.label not in analyzer_registry.NODE_LABELS:
             flags.append({"reason": "unknown_label", "analyzer": analyzer.name,

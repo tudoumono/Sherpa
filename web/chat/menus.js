@@ -6,7 +6,7 @@
 import { S, setChatExamples } from './state.js';
 import { setKbLocked } from './scope.js';
 import { setSimpleMode, setWebSearchEligible } from './inquiry.js';
-import { refreshWelcomeExamples } from './render.js';
+import { refreshWelcomeExamples, answerBody, answerNotices, unverifiedSourceRows, budgetNoteText, clipPersonalQuote } from './render.js';
 import { toast } from '../chat.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;
@@ -198,15 +198,31 @@ function _exportName(title, ext) {
   return `${safe}_${_stamp().file}.${ext}`;
 }
 const LENS_FULL = { impact: '影響範囲分析', troubleshoot: 'トラブルシュート', qa: '仕様問い合わせ', chat: '通常チャット', author: '資料を作成' };
+const COMPLETION_TEXT = { partial: '途中までの回答', stopped: '停止した時点までの回答', failed: '回答できませんでした' };
 function _scopeText(ans) {   // 参照範囲を1行にする
   const sc = ans.scope || {};
   if (sc.source === 'off') return '社内資料参照オフ';
   const r = (sc.scope_paths && sc.scope_paths.length) ? sc.scope_paths.join('、') : '全体';
   return (sc.world ? (S.verLabels[sc.world] || '名称未設定の資料フォルダ') + ' / ' : '') + r;
 }
-function _answerLines(ans, md) {
+// shared=true は共有された会話の書き出し（個人の出典は出さない）。
+function _answerLines(ans, md, shared) {
   const L = [(md ? '**回答（' : '回答（') + (LENS_FULL[ans.lens] || ans.lens || '未判定') + (md ? '）**' : '）'),
-    (md ? '_範囲: ' : '範囲: ') + _scopeText(ans) + (md ? '_' : ''), ans.headline || ''];
+    (md ? '_範囲: ' : '範囲: ') + _scopeText(ans) + (md ? '_' : '')];
+  // 注記・完了状態は本文の前に書き出す（画面と同じ並び）。旧形式の行は headline が本文になり、注記は無い。
+  const state = COMPLETION_TEXT[ans.completion];
+  if (state) L.push((md ? '**状態:** ' : '状態: ') + state);
+  const notices = answerNotices(ans);
+  notices.forEach((n) => L.push((md ? '> ' : '※ ') + n.text.trim().replace(/\n+/g, md ? '\n> ' : ' ')));
+  // 予算で止まった旨（簡易の古い形の evidence_packet.stop_reason）。画面の注記と同じ文言。
+  const budget = budgetNoteText(ans.data && ans.data.evidence_packet);
+  if (budget) L.push((md ? '> ' : '※ ') + budget);
+  if (md && (notices.length || budget)) L.push('');
+  L.push(answerBody(ans));
+  const sum = ans.investigation_summary;
+  ((sum && Array.isArray(sum.items)) ? sum.items : []).forEach((i) => {
+    if (i && typeof i.text === 'string' && i.text.trim()) L.push(`${md ? '- ' : '・'}${i.label ? i.label + ': ' : ''}${i.text}`);
+  });
   const d = ans.data || {};
   // 画面（render.js）と同じ条件で並べる。グラフ由来の結果が無い impact／troubleshoot は引用を書き出す
   const impactHasGraph = !!((d.items || []).length || (d.presumed || []).length);
@@ -216,7 +232,7 @@ function _answerLines(ans, md) {
     || (ans.lens === 'troubleshoot' && !troubleHasCandidates));
   if (ans.lens === 'impact') (d.items || []).forEach((it) => L.push(`${md ? '- ' : '・'}${it.category}｜${it.name}`));
   if (ans.lens === 'impact') (d.presumed || []).forEach((p) => L.push(`${md ? '- ' : '・'}資料から見つけた関連｜${p.category}｜${p.name}`));
-  if (ans.lens === 'troubleshoot') (d.candidates || []).slice(0, 8).forEach((c) => L.push(`${md ? '- ' : '・'}${c.name}（${c.role || ''}）`));
+  if (ans.lens === 'troubleshoot') (d.candidates || []).forEach((c) => L.push(`${md ? '- ' : '・'}${c.name}（${c.role || ''}）`));
   if (showCitations) (d.citations || []).forEach((c) => L.push(`${md ? '> ' : ''}${c.doc_id}（行${(c.span || [])[0]}-${(c.span || [])[1]}）: ${c.quote || ''}`));
   if ((ans.sources || []).length) {
     // sources_verified があれば根拠/参考の2区分で書き出す（render.js と同じ）
@@ -230,14 +246,26 @@ function _answerLines(ans, md) {
       L.push((md ? '**出典:** ' : '出典: ') + ans.sources.map((s) => s.doc_id).join(', '));
     }
   }
+  const unv = unverifiedSourceRows(ans);
+  if (unv.rows.length || unv.hidden) {
+    L.push((md ? '**確認できなかった資料:** ' : '確認できなかった資料: ')
+      + [...unv.rows.map((u) => u.path + (u.reason ? `（${u.reason}）` : '')),
+        ...(unv.more ? [`ほか ${unv.more} 件`] : []), ...(unv.hidden ? [`名前を表示できない資料 ${unv.hidden} 件`] : [])].join(', '));
+  }
+  // 個人の出典は本人の書き出しだけに入れる（共有された会話では出さない）。
+  const personal = shared ? [] : (ans.personal_sources || []).filter((p) => p && p.doc_id);
+  if (personal.length) {
+    L.push((md ? '**個人ファイル内ヒット（本人のみ）:** ' : '個人ファイル内ヒット（本人のみ）: '));
+    personal.forEach((p) => L.push(`${md ? '- ' : '・'}${p.doc_id}${p.quote ? ': ' + clipPersonalQuote(String(p.quote)).replace(/\s+/g, ' ') : ''}`));
+  }
   if ((ans.created_files || []).length) L.push((md ? '**作成したファイル:** ' : '作成したファイル: ') + ans.created_files.map((f) => f.name).join(', '));
   return L;
 }
-function _buildText(title, messages, md) {
+function _buildText(title, messages, md, shared) {
   const L = [md ? `# ${title}` : title, (md ? '> ' : '') + `エクスポート: ${_stamp().human}`, ''];
   for (const m of messages) {
     if (m.role === 'user') L.push(md ? '## 質問' : '■ 質問', m.content || '', '');
-    else if (m.answer) L.push(..._answerLines(m.answer, md), '');
+    else if (m.answer) L.push(..._answerLines(m.answer, md, shared), '');
   }
   return L.join('\n');
 }
@@ -245,19 +273,25 @@ function _download(name, content, mime) {
   Sherpa.downloadBlob(new Blob([content], { type: mime }), name);
 }
 // 回答単位の書き出し（chat.js の data-export 委譲リスナーが呼ぶ）。
-export function exportMessages(title, messages, format) {
+export function exportMessages(title, messages, format, shared = false) {
   if (format === 'pdf') { window.print(); return; }   // 印刷ダイアログから PDF 保存
   if (format === 'json') _download(_exportName(title, 'json'), JSON.stringify({ title, exported_at: _stamp().human, messages }, null, 2), 'application/json');
-  else if (format === 'txt') _download(_exportName(title, 'txt'), _buildText(title, messages, false), 'text/plain;charset=utf-8');
-  else _download(_exportName(title, 'md'), _buildText(title, messages, true), 'text/markdown;charset=utf-8');
+  else if (format === 'txt') _download(_exportName(title, 'txt'), _buildText(title, messages, false, shared), 'text/plain;charset=utf-8');
+  else _download(_exportName(title, 'md'), _buildText(title, messages, true, shared), 'text/markdown;charset=utf-8');
   toast('エクスポートしました');
 }
 async function exportChat(format) {
   const title = $('conv-title').textContent || 'chat';
-  let messages = [];
-  if (S.cid) { try { messages = (await getJSON('/conversations/' + S.cid)).messages; } catch (e) { } }
+  let messages = [], shared = false;
+  if (S.cid) {
+    try {
+      const data = await getJSON('/conversations/' + S.cid);
+      messages = data.messages;
+      shared = !!(data.conversation && data.conversation.origin === 'received_share');
+    } catch (e) { }
+  }
   if (!messages.length) { toast('書き出す内容がありません'); return; }
-  exportMessages(title, messages, format);
+  exportMessages(title, messages, format, shared);
 }
 function renderExportMenu() {
   $('exportmenu').innerHTML = '<div class="bm-h">この会話を書き出し</div>'

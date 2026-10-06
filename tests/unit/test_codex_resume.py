@@ -144,6 +144,8 @@ with argv_log.open("a", encoding="utf-8") as f:
     f.flush()
 
 _prompt_text = sys.stdin.read() if args and args[-1] == "-" else (args[-1] if args else "")
+with pathlib.Path(r"{argv_log}" + ".history").open("a", encoding="utf-8") as f:
+    f.write(("with" if "【直前の会話" in _prompt_text else "without") + "\n")
 if "TRIGGER_ASK_USER_BREAK" in _prompt_text:
     # ask_user で早期 break するターン: mcp_tool_call を 1 件返して即終了する。
     print(json.dumps({{"type": "item.completed", "item": {{
@@ -229,6 +231,14 @@ def _read_argv_log(argv_log: Path) -> list[list[str]]:
     return [ast.literal_eval(line) for line in argv_log.read_text().splitlines() if line.strip()]
 
 
+def _history_flags(argv_log: Path) -> list[str]:
+    """各 codex 起動のプロンプトに履歴ブロックが入っていたか（"with"／"without"・起動順）。"""
+    return (argv_log.parent / "argv.log.history").read_text().split()
+
+
+_HISTORY = [{"role": "user", "content": "前の質問"}, {"role": "assistant", "content": "前の回答"}]
+
+
 def _ws(uid: str) -> Path:
     return Path(os.environ["SHERPA_USERS_DIR"]).resolve() / uid / "workspace"
 
@@ -258,8 +268,9 @@ def test_fresh_conversation_captures_session_id_and_skips_ephemeral(tmp_path, mo
 
 def test_resume_success_uses_existing_session_without_retry(tmp_path, monkeypatch):
     argv_log = _setup(tmp_path, monkeypatch, "users_resume_ok")
-    env = _result_env(_run(A.CodexProvider(), _ctx("r1b-resume-ok", 202, "SID-GOOD")))
+    env = _result_env(_run(A.CodexProvider(), _ctx("r1b-resume-ok", 202, "SID-GOOD", history=_HISTORY)))
     assert env["headline"] == "resumed-ok"
+    assert _history_flags(argv_log) == ["without"]  # resume 先のセッションが履歴を持つ
     assert env.get("codex_session_id") == "SID-GOOD"
     calls = _read_argv_log(argv_log)
     assert len(calls) == 1, calls
@@ -273,8 +284,9 @@ def test_resume_failure_falls_back_to_fresh_session_once(tmp_path, monkeypatch, 
     # 消失（空 stdout・exit 1）／部分失敗（thread.started のみ・非ゼロ終了）のどちらでも、
     # そのターン内で 1 回だけ resume 無しの新規セッションへフォールバックする。
     argv_log = _setup(tmp_path, monkeypatch, "users_resume_fail")
-    env = _result_env(_run(A.CodexProvider(), _ctx("r1b-resume-fail", 303, sid)))
+    env = _result_env(_run(A.CodexProvider(), _ctx("r1b-resume-fail", 303, sid, history=_HISTORY)))
     assert env["headline"] == "fresh-ok", env
+    assert _history_flags(argv_log) == ["without", "with"]  # 作り直した新規セッションには履歴を入れる
     assert env.get("codex_session_id") == "TH-FRESH"
     calls = _read_argv_log(argv_log)
     assert len(calls) == 2, calls
@@ -308,8 +320,9 @@ def test_exception_after_config_write_still_cleans_up(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox_mod, "_write_codex_authoring_config", _write_then_boom)
     env = _result_env(_run(A.CodexProvider(), _ctx("r1b-config-boom", 1010)))
     assert boom_calls == [1]
-    # MCP 有効の Codex 経路は presearch を省くため、固定文言のまま利用者へ出る。
-    assert env["headline"] == _NO_PRESEARCH_HEADLINE, env
+    assert _NO_PRESEARCH_HEADLINE in env["headline"], env
+    assert "RuntimeError" in env["headline"]
+    assert env["completion"] == "failed"
     assert _read_argv_log(argv_log) == []
     _assert_creds_removed(_conv_home("r1b-config-boom", 1010))
 

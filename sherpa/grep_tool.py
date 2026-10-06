@@ -162,7 +162,7 @@ _DEADLINE_CHECK_LINES = 256  # 1 ファイルの行走査ループ中に `deadli
 
 def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 scope_paths=None, deadline: float | None = None, layer=None,
-                truncated_docs: list | None = None, offset: int = 0):
+                truncated_docs: list | None = None, offset: int = 0, stats: dict | None = None):
     """`query` を含む行を world のフォルダ木から探し、根拠つきヒットを返す（read-only）。
     各ヒット: `{doc_id(=rel_path), path(内部用・API 非露出), ext, line, span:[start,end], text, match}`。
     登録者の重要度（`_重要度.txt`・`ingest.importance`）があれば `importance`/`importance_reason` を追加する（無ければキー自体を作らない）。
@@ -177,6 +177,9 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
     - ヒット元が打ち切られていたら、そのヒットにだけ `file_truncated: True` を付ける（通常のヒットにはキーを作らない）。
     - `truncated_docs`（省略可）にリストを渡すと、打ち切られた文書の `doc_id` を重複なく追記する（ヒット 0 件の文書も載る）。早期終了したファイル以降の打切りは報告されない。
 
+    `stats`（省略可）に dict を渡すと、開けない・読み取り中にエラーになって飛ばしたファイルの件数を `stats["unreadable_files"]` へ加える（名前は残さない）。
+    節・窓の本文を `_GREP_HIT_TEXT_MAX_BYTES` で切ったヒットには `section_truncated: True` を付ける（通常のヒットにはキーを作らない）。
+
     軽量テキスト枠（`ingest.text_kind`＝未登録拡張子のテキスト）は、台帳/ES と同じ基準（`text_kind.MAX_BYTES`＝8MiB）でサイズ超過を丸ごと対象外にし、`truncated_docs` へ載せる。
 
     `layer`（`"docs"|"code"|"both"`・既定 `None`＝`"both"`）: 探す対象。`classify_document` の確定結果（`layer_mod.in_layer_code`）に一致しない文書は読まない。
@@ -189,6 +192,10 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
     def _check_deadline() -> None:
         if deadline is not None and time.monotonic() > deadline:
             raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")
+
+    def _count_unreadable() -> None:
+        if stats is not None:
+            stats["unreadable_files"] = stats.get("unreadable_files", 0) + 1
 
     _check_deadline()
     from . import corpus_docs, scope, worlds  # 遅延 import（循環回避）
@@ -302,6 +309,8 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     lambda p=p, size=4096: corpus_docs._read_head(p, size),
                     text_quality=lambda p=p: corpus_docs._text_quality_for(p))
                 if not corpus_docs._classify_verdict_reachable(verdict):
+                    if verdict.get("kind") == "unreadable":  # 内容判定に必要なヘッダを読めなかった＝探せていないファイル
+                        _count_unreadable()
                     continue
                 if verdict.get("encoding_partial"):
                     encoding_caution = corpus_docs._ENCODING_CAUTION["partial"]
@@ -326,6 +335,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
             try:
                 f = p.open("rb")
             except OSError:
+                _count_unreadable()
                 continue
             try:
                 # ファイル読込直後（全文走査に入る前）の期限確認。
@@ -334,6 +344,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 try:
                     enc = "utf-8" if is_derived else text_encoding.detect_fd(f.fileno())
                 except OSError:
+                    _count_unreadable()
                     continue  # この 1 件だけ飛ばす
                 reader = _CappedStreamReader(f)
                 is_md = is_derived or ext in _MD_EXT
@@ -352,7 +363,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     recent: deque = deque(maxlen=5)  # 直近 5 行（前後 2 行窓の復元に必要な最小限）
                     pending: list[int] = []  # まだ確定していないヒット行（1-based）
 
-                def _add_hit(hit_line: int, s: int, e: int, text: str) -> None:
+                def _add_hit(hit_line: int, s: int, e: int, text: str, clipped: bool = False) -> None:
                     key = (str(p), s, e)
                     if key in seen:
                         return
@@ -369,6 +380,8 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     }
                     if encoding_caution:  # 一部が化けているファイルの目印
                         hit["encoding_caution"] = encoding_caution
+                    if clipped:
+                        hit["section_truncated"] = True
                     _offer(hit)
 
                 def _emit_md_section(end_line: int) -> None:
@@ -378,8 +391,9 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     text = "\n".join(section_buf)
                     if not section_capped:
                         text = text.strip()
-                    text = _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES)
-                    _add_hit(section_hit_line, section_start, end_line, text)
+                    clipped_text = _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES)
+                    _add_hit(section_hit_line, section_start, end_line, clipped_text,
+                             clipped=section_capped or clipped_text != text)
                     section_has_hit = False
 
                 hit_limit_reached = False  # ファイル内でヒット数上限に達したか（達したら flush を省く）
@@ -414,7 +428,8 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                                 h = pending.pop(0)
                                 s, e = max(1, h - 2), h + 2
                                 text = "\n".join(txt for (ln, txt) in recent if s <= ln <= e)
-                                _add_hit(h, s, e, _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES))
+                                clipped_text = _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES)
+                                _add_hit(h, s, e, clipped_text, clipped=clipped_text != text)
                         line_i += 1
                         # `imp_map` が空でヒープが `heap_cap` で満杯なら、以後のヒットは採用され得ない。ファイル内で break する（最終節／未確定 pending 行の flush は行わない）。
                         if not imp_map and len(heap) >= heap_cap:
@@ -427,9 +442,10 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                             for h in pending:
                                 s, e = max(1, h - 2), min(line_i, h + 2)
                                 text = "\n".join(txt for (ln, txt) in recent if s <= ln <= e)
-                                _add_hit(h, s, e, _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES))
+                                clipped_text = _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES)
+                                _add_hit(h, s, e, clipped_text, clipped=clipped_text != text)
                 except OSError:
-                    pass
+                    _count_unreadable()
             finally:
                 f.close()
             # ファイル全体（cap まで）の走査を終えた時点で「探せていない範囲があるか」が確定する。

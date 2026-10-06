@@ -238,25 +238,48 @@ def _spawn_wall_clock_watcher(proc, deadline_mono: float, reap_lock, reaped, hit
 _LAST_MESSAGE_MAX_BYTES = 16 * 1024 * 1024  # 最終メッセージの保険読取のメモリ保護（回答の長さを切る目的ではない）
 
 
-def _read_last_message_fallback(path: Path) -> str | None:
-    """`-o <path>` で Codex が書く最終メッセージファイルを読む（`--json` の `agent_message` 抽出が空だった時の保険）。無い/空/読取失敗は None。ファイルの削除は呼び出し側の責務。
-    `.tmp/` は Codex の書込対象のため、`O_NOFOLLOW` で symlink を拒否し、通常ファイルのみ・サイズ上限つきで読む。
-    """
+def _read_last_message_fallback(path: Path, notices: list[str] | None = None,
+                                attempt_no: int | None = None) -> str | None:
+    """最終メッセージを通常ファイル・16 MiB の上限で読み、欠落を注記に残す。"""
+    def note(text):
+        if attempt_no is not None:
+            text = f"試行 {attempt_no}: {text}"
+        if notices is not None and text not in notices:
+            notices.append(text)
+
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(str(path), flags)
-    except OSError:
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        note(f"最終メッセージ 1 件を読み取り失敗のため採用できませんでした"
+             f"（{type(exc).__name__}、大きさ不明）。")
         return None
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > _LAST_MESSAGE_MAX_BYTES:
+        if not stat.S_ISREG(st.st_mode):
+            note("最終メッセージ 1 件を読み取りできませんでした（通常ファイルではありません、大きさ不明）。")
+            return None
+        if st.st_size > _LAST_MESSAGE_MAX_BYTES:
+            note(f"最終メッセージ 1 件（{st.st_size} バイト）を 16 MiB の上限超過のため採用できませんでした。")
+            return None
+        if st.st_size <= 0:
             return None
         data = os.read(fd, st.st_size)
-    except Exception:
+        if len(data) < st.st_size:
+            note(f"最終メッセージ 1 件の読み取りが途中で終わりました（未取得 {st.st_size - len(data)} バイト）。")
+    except OSError as exc:
+        note(f"最終メッセージ 1 件を読み取り失敗のため採用できませんでした"
+             f"（{type(exc).__name__}、大きさ不明）。")
         return None
     finally:
         os.close(fd)
-    txt = data.decode("utf-8", errors="replace").strip()
+    try:
+        txt = data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        note("最終メッセージ 1 件を UTF-8 の読み取り失敗のため採用できませんでした（失われた文字数不明）。")
+        return None
     return txt or None
 
 

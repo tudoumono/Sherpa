@@ -9,30 +9,34 @@ import logging
 
 from psycopg.types.json import Json
 
+from .. import answer_shape
 from .db import _connect, _ensure
 from .usage import _CLAIM_STATUS_KEYS, _USAGE_LIMIT_BOOL_FIELDS, _USAGE_LIMIT_INT_FIELDS
 
 _log = logging.getLogger("sherpa")
 
 # `metrics_from_answer()` の写像規則の版。規則を変えたら上げる（`turn_metrics.mapping_version` 列に残る）。
-MAPPING_VERSION = 1
+MAPPING_VERSION = 2
 
 # `answer["activity"]` の契約版。これ以外は「activity 無し」として全面的に旧フィールドへフォールバックする。
 _ACTIVITY_SCHEMA_VERSION = 1
 
 # `codex_usage_children`/`codex_usage_breakdown.children` のトークン4種のキー（`providers/codex/provider.py::_CHILD_USAGE_KEYS` と同じ語彙・store は provider 層を import しない）。
 _TOKEN_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+# キャッシュ書き込み量。4 種と違い、返されなかった（欠落・不正）ときは 0 でなく None（不明）で持ち、合算も 1 件でも不明なら不明にする。
+_CACHE_WRITE_KEY = "cache_write_tokens"
 
 # `metrics_from_answer()` が返す列名から identity 列（message_id/conversation_id/user_message_id/user_id/world/created_at/lens/personal）を除いた全列（INSERT/UPDATE 文の組み立て用）。
 _METRIC_COLUMNS = (
     "provider", "model", "depth_profile", "reasoning", "app_version",
-    "stop_kind", "codex_error_code", "duration_ms",
+    "stop_kind", "codex_error_code", "duration_ms", "completion", "notice_kinds",
     "phase_prepare_ms", "phase_agent_ms", "phase_post_ms",
     "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
     "parent_input_tokens", "parent_cached_input_tokens",
     "parent_output_tokens", "parent_reasoning_output_tokens",
     "child_input_tokens", "child_cached_input_tokens",
     "child_output_tokens", "child_reasoning_output_tokens",
+    "cache_write_tokens", "parent_cache_write_tokens", "child_cache_write_tokens",
     "children_detected", "children_usage_found", "children_usage_missing",
     "tool_calls_total", "tool_result_bytes_total", "api_rounds_total", "compactions_total",
 ) + _USAGE_LIMIT_INT_FIELDS + _USAGE_LIMIT_BOOL_FIELDS + (
@@ -46,7 +50,7 @@ _METRIC_COLUMNS = (
 
 # JSONB 列（`Json(...)` で包んで渡す列）。
 _JSONB_COLUMNS = frozenset({"investigation_counts", "claims_unknown_reasons",
-                            "gate_missing_codes", "activity_json"})
+                            "gate_missing_codes", "activity_json", "notice_kinds"})
 
 
 # answer は外部由来の JSON なので型を信用しない防御的読み取りヘルパ。
@@ -77,6 +81,15 @@ def _bool_or_none(v) -> bool | None:
     return v if isinstance(v, bool) else None
 
 
+def _notice_kinds(answer: dict) -> list | None:
+    """`answer.notices[].kind` を閉じた語彙（`answer_shape.NOTICE_KINDS`）へ写す。語彙外は `other`。注記を持たない旧形式の行（`notices` が配列でない）は NULL、注記 0 件は空配列。"""
+    if not isinstance(answer.get("notices"), list):
+        return None
+    kinds = {n["kind"] if n["kind"] in answer_shape.NOTICE_KINDS else "other"
+             for n in answer_shape.notices_of(answer)}
+    return sorted(kinds)
+
+
 def _activity_dict(answer: dict) -> dict | None:
     """`answer["activity"]` が契約どおりの形（`v==1` かつ `agents` が配列）なら返し、そうでなければ None（呼び出し側は旧フィールドへフォールバックする）。"""
     a = answer.get("activity")
@@ -90,12 +103,16 @@ def _activity_dict(answer: dict) -> dict | None:
 def _agent_tokens(agent: dict) -> dict:
     tokens = agent.get("tokens")
     tokens = tokens if isinstance(tokens, dict) else {}
-    return {k: _clamp_int(tokens.get(k)) for k in _TOKEN_KEYS}
+    out = {k: _clamp_int(tokens.get(k)) for k in _TOKEN_KEYS}
+    out[_CACHE_WRITE_KEY] = _pos_int_or_none(tokens.get(_CACHE_WRITE_KEY))
+    return out
 
 
 def _sum_tokens(agents: list, *, role: str | None) -> dict:
     """`agents`（activity の配列）のうち role 一致分（role=None なら全件）のトークンを合算する。非 dict の要素は無視する。"""
     out = {k: 0 for k in _TOKEN_KEYS}
+    cache_write: int | None = 0
+    matched = 0
     for agent in agents:
         if not isinstance(agent, dict):
             continue
@@ -104,6 +121,9 @@ def _sum_tokens(agents: list, *, role: str | None) -> dict:
         t = _agent_tokens(agent)
         for k in _TOKEN_KEYS:
             out[k] += t[k]
+        cache_write = None if cache_write is None or t[_CACHE_WRITE_KEY] is None else cache_write + t[_CACHE_WRITE_KEY]
+        matched += 1
+    out[_CACHE_WRITE_KEY] = cache_write if matched else None
     return out
 
 
@@ -269,6 +289,9 @@ def metrics_from_answer(answer: dict) -> dict:
     # 終了理由・エラー・所要。
     out["stop_kind"] = _str_or_none(answer.get("stop_kind"))
     out["codex_error_code"] = _str_or_none(answer.get("codex_error_code"))
+    # 完了状態と注記の種類（閉じた語彙。注記の文は持たない）。旧形式の行は NULL。
+    out["completion"] = answer.get("completion") if answer.get("completion") in answer_shape.COMPLETIONS else None
+    out["notice_kinds"] = _notice_kinds(answer)
     out["duration_ms"] = _pos_int_or_none(answer.get("duration_ms"))
     phases = activity.get("phases_ms") if activity else None
     phases = phases if isinstance(phases, dict) else {}
@@ -284,43 +307,51 @@ def metrics_from_answer(answer: dict) -> dict:
 
     if agents is not None:
         totals = _sum_tokens(agents, role=None)
-        for k in _TOKEN_KEYS:
+        for k in _TOKEN_KEYS + (_CACHE_WRITE_KEY,):
             out[k] = totals[k]
         parent_agent = _find_parent_agent(agents)
         if parent_agent is not None:
             pt = _agent_tokens(parent_agent)
-            for k in _TOKEN_KEYS:
+            for k in _TOKEN_KEYS + (_CACHE_WRITE_KEY,):
                 out[f"parent_{k}"] = pt[k]
         else:
-            for k in _TOKEN_KEYS:
+            for k in _TOKEN_KEYS + (_CACHE_WRITE_KEY,):
                 out[f"parent_{k}"] = None
         ct = _sum_tokens(agents, role="child")
-        for k in _TOKEN_KEYS:
+        for k in _TOKEN_KEYS + (_CACHE_WRITE_KEY,):
             out[f"child_{k}"] = ct[k]
     elif usage is not None:
         for k in _TOKEN_KEYS:
             out[k] = _clamp_int(usage.get(k))
+        out[_CACHE_WRITE_KEY] = _pos_int_or_none(usage.get(_CACHE_WRITE_KEY))
         if breakdown is not None and isinstance(breakdown.get("parent"), dict):
             for k in _TOKEN_KEYS:
                 out[f"parent_{k}"] = _clamp_int(breakdown["parent"].get(k))
+            out[f"parent_{_CACHE_WRITE_KEY}"] = _pos_int_or_none(breakdown["parent"].get(_CACHE_WRITE_KEY))
         else:
             # breakdown が無ければ下調べ役の内訳は未計測で、usage 全体が本体分。
-            for k in _TOKEN_KEYS:
+            for k in _TOKEN_KEYS + (_CACHE_WRITE_KEY,):
                 out[f"parent_{k}"] = out[k]
         if breakdown is not None and isinstance(breakdown.get("children"), dict):
             for k in _TOKEN_KEYS:
                 out[f"child_{k}"] = _clamp_int(breakdown["children"].get(k))
+            out[f"child_{_CACHE_WRITE_KEY}"] = _pos_int_or_none(breakdown["children"].get(_CACHE_WRITE_KEY))
         elif children is not None:
             for k in _TOKEN_KEYS:
                 out[f"child_{k}"] = _clamp_int(children.get(k))
+            out[f"child_{_CACHE_WRITE_KEY}"] = _pos_int_or_none(children.get(_CACHE_WRITE_KEY))
         else:
-            for k in _TOKEN_KEYS:
+            for k in _TOKEN_KEYS + (_CACHE_WRITE_KEY,):
                 out[f"child_{k}"] = None
     else:
-        for k in _TOKEN_KEYS:
+        for k in _TOKEN_KEYS + (_CACHE_WRITE_KEY,):
             out[k] = None
             out[f"parent_{k}"] = None
             out[f"child_{k}"] = None
+    # 下調べ役の usage が 1 件でも取れていなければ、書き込み量の合計と下調べ役分は不明にする（既知分だけを合計として残さない）。
+    if children is not None and _clamp_int(children.get("missing")) > 0:
+        out[_CACHE_WRITE_KEY] = None
+        out[f"child_{_CACHE_WRITE_KEY}"] = None
 
     # 下調べ役の数（検出・usage 取得・欠落）。`codex_usage_children`（found/missing を区別する唯一の場所）を優先し、無ければ activity の role=='child' の件数（欠落は不明のまま None）。
     if children is not None:

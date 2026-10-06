@@ -31,7 +31,7 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(worker, "_ledger_rows", lambda world, *, sig: [])
     monkeypatch.setattr(worker, "world_signature", lambda world: "sig")
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None: (0, 0))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None: (0, 0))
 
     @contextlib.contextmanager
     def _noop_lock(world_id):

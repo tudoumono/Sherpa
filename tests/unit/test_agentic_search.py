@@ -169,7 +169,9 @@ def test_run_tool_offset_past_abs_ceiling_short_circuits_without_calling_search(
     monkeypatch.setattr(grep_tool_mod, "grep_search", lambda *a, **kw: captured.update(called=True) or [])
     res, _docs, _cites, _cards = TD.run_tool(
         "ripgrep_search", {"query": "x", "offset": 10_000_000}, "v1", None, max_hits=30)
-    assert res == {"hits": []} and captured["called"] is False
+    # 空は「該当なし」ではなく上限到達（limit_reached）として返す
+    assert res["hits"] == [] and res["limit_reached"] is True and res["truncated"] is True
+    assert captured["called"] is False
 
 
 def test_run_tool_ripgrep_search_offset_pages_through_real_corpus(monkeypatch, tmp_path):
@@ -210,7 +212,7 @@ def test_run_tool_ripgrep_search_offset_near_ceiling_shrinks_page_without_rollin
     p1 = _page(3)
     assert [h["doc_id"] for h in p1["hits"]] == ["d.md", "e.md"]
     assert p1.get("truncated") is True and "next_offset" not in p1
-    assert _page(5) == {"hits": []}
+    assert _page(5)["hits"] == [] and _page(5)["limit_reached"] is True
 
 
 def _run_rg_with_hits(monkeypatch, hits, **kw):
@@ -467,6 +469,7 @@ def test_es_search_filters_stale_and_sensitive_named_hits(monkeypatch):
     res, docs, cites, _ = TD.run_tool("es_search", {"query": "q"}, "v1", None)
     assert {h["doc_id"] for h in res["hits"]} == {"real.md"} and len(res["hits"]) == 1
     assert docs == {"real.md"} and all(c["doc_id"] == "real.md" for c in cites)
+    assert res["excluded_hits"] == {"not_current": 1, "withheld": 1}  # 除いた件数は返す（名前は出さない）
 
 
 def test_es_search_tolerates_hit_without_line(monkeypatch):
@@ -474,7 +477,8 @@ def test_es_search_tolerates_hit_without_line(monkeypatch):
     （rag.md が無いので tier は chunk）。"""
     _stub_es(monkeypatch, [{"doc_id": "a.docx", "text": "rag_chunks 由来", "ext": ".docx", "chunk_id": "rc1"}], {"a.docx"})
     res, docs, cites, _ = TD.run_tool("es_search", {"query": "q"}, "v1", None)
-    assert res["hits"] == [{"doc_id": "a.docx", "tier": "chunk", "text": "rag_chunks 由来", "chunks": [{"chunk_id": "rc1"}]}]
+    assert res["hits"] == [{"doc_id": "a.docx", "tier": "chunk", "text": "rag_chunks 由来", "chunks": [{"chunk_id": "rc1"}],
+                              "fragment": True}]
     assert docs == {"a.docx"} and cites[0]["span"] == [None, None]
 
 
@@ -486,8 +490,9 @@ def test_es_search_locator_hint_goes_to_llm_text_only_and_absent_locator_is_unch
         {"doc_id": "a.md", "line": 3, "text": "本文", "ext": ".md"}], {"b.xlsx", "a.md"})
     res, docs, cites, _ = TD.run_tool("es_search", {"query": "q"}, "v1", None)
     by_doc = {h["doc_id"]: h for h in res["hits"]}
-    assert by_doc["b.xlsx"] == {"doc_id": "b.xlsx", "line": None, "text": "単価100円（位置: シート「明細」A2）"}
-    assert by_doc["a.md"] == {"doc_id": "a.md", "line": 3, "text": "本文"}
+    assert by_doc["b.xlsx"] == {"doc_id": "b.xlsx", "line": None, "text": "単価100円（位置: シート「明細」A2）",
+                                  "fragment": True}
+    assert by_doc["a.md"] == {"doc_id": "a.md", "line": 3, "text": "本文", "fragment": True}
     quotes = {c["doc_id"]: c for c in cites}
     assert quotes["b.xlsx"]["quote"] == "単価100円" and "locator" not in quotes["a.md"]
 
@@ -1662,7 +1667,7 @@ def test_parent_return_minimum_guarantee_lower_score_doc_survives(monkeypatch, t
     baseline_total = len("top-baseline".encode("utf-8")) + len("second-baseline".encode("utf-8"))
     delta_doc1 = len(doc1_md.encode("utf-8")) - len("top-baseline".encode("utf-8"))
     res, _ = _run_parent_return(monkeypatch, tmp_path, hits, {"top.docx": doc1_md, "second.docx": doc2_md},
-                                baseline_total + delta_doc1, chunk_ids=[])
+                                baseline_total + delta_doc1, chunk_ids=["c1", "c2"])
     by_doc = {h["doc_id"]: h for h in res["hits"]}
     assert by_doc["top.docx"]["tier"] == "region" and by_doc["top.docx"]["text"] == "A" * 400
     assert by_doc["second.docx"]["tier"] == "chunk" and by_doc["second.docx"]["text"] == "second-baseline"
@@ -1671,8 +1676,9 @@ def test_parent_return_minimum_guarantee_lower_score_doc_survives(monkeypatch, t
 
 def test_parent_return_declares_tier_for_every_doc(monkeypatch, tmp_path):
     """アップグレードできなかった doc（rag.md 不在）も tier を申告する（限界に当たったら黙らない）。"""
-    res, _ = _run_parent_return(monkeypatch, tmp_path, [_chunk_hit("a.docx", "c1", "p1", 1.0, "本文A")], {}, 262144, chunk_ids=[])
-    assert res["hits"] == [{"doc_id": "a.docx", "tier": "chunk", "text": "本文A", "chunks": [{"chunk_id": "c1"}]}]
+    res, _ = _run_parent_return(monkeypatch, tmp_path, [_chunk_hit("a.docx", "c1", "p1", 1.0, "本文A")], {}, 262144, chunk_ids=["c1"])
+    assert res["hits"] == [{"doc_id": "a.docx", "tier": "chunk", "text": "本文A", "chunks": [{"chunk_id": "c1"}],
+                              "fragment": True}]
 
 
 def test_parent_return_deterministic(monkeypatch, tmp_path):
@@ -1702,7 +1708,7 @@ def test_parent_return_legacy_hits_pass_through_untouched(monkeypatch, tmp_path)
             {"doc_id": "legacy.md", "line": 7, "text": "legacy本文", "ext": ".md", "score": 1.0}]
     res, _ = _run_parent_return(monkeypatch, tmp_path, hits, {"rag.docx": "<!-- chunk:c1 -->\nrag本文\n"}, 5000, chunk_ids=[])
     legacy_entries = [h for h in res["hits"] if h["doc_id"] == "legacy.md"]
-    assert legacy_entries == [{"doc_id": "legacy.md", "line": 7, "text": "legacy本文"}]
+    assert legacy_entries == [{"doc_id": "legacy.md", "line": 7, "text": "legacy本文", "fragment": True}]
 
 
 def test_parent_return_redacts_region_text(monkeypatch, tmp_path):
@@ -2119,7 +2125,8 @@ def test_run_tool_graph_neighbors_three_graph_states(monkeypatch):
     assert res["neighbors"] == [] and res["error_code"] == "graph_unavailable" and "error" not in res
     _patch_neo4j_driver(monkeypatch, _FakeSession(None, count=0))
     res, *_ = TD.run_tool("graph_neighbors", {"name": "請求"}, "v1", None)
-    assert res == {"neighbors": [], "coverage": {"complete": True, "limits": [], "omitted": 0},
+    assert res == {"neighbors": [], "coverage": {"complete": True, "limits": [], "omitted": 0,
+                                                 "depth": {"requested": 4, "truncated": None}},
                    "unresolved": {"available": False, "items": [], "omitted": 0}}
 
 
@@ -2168,3 +2175,65 @@ def test_run_tool_es_search_mode_routing(monkeypatch):
     v = run("vector")
     assert calls == [("knn", None)] and v["hits"] == []
     assert v["degrade_reason"] == "es_query_failed" and v["mode_used"] == "vector"
+
+
+# ===== 黙って落とさない（COD-25 B）=====
+
+def test_read_around_reports_beyond_eof_window_clamp_and_read_cap(monkeypatch, tmp_path):
+    world = "read-around-marks"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"doc.md": "\n".join(f"line {i}" for i in range(1, 6))})
+    r, *_ = TD.run_tool("read_around", {"doc_id": "doc.md", "line": 99, "window": 5000}, world, None)
+    assert r["line_beyond_eof"] is True and r["total_lines"] == 5
+    assert r["window_clamped"] == {"requested": 5000, "used": 200}
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 20)
+    r, *_ = TD.run_tool("read_around", {"doc_id": "doc.md", "line": 2}, world, None)
+    assert r["file_truncated"] is True and "line_beyond_eof" not in r
+
+
+def test_ripgrep_marks_clipped_section_unreadable_files_and_truncated_docs_total(monkeypatch, tmp_path):
+    world = "rg-drop-marks"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {
+        "big.md": "# 節\nNEEDLE " + "あ" * 400 + "\n", "locked.md": "NEEDLE\n",
+        "c1.txt": "NEEDLE\n" + "x" * 200, "c2.txt": "NEEDLE\n" + "x" * 200})
+    kb_file = tmp_path / "kb" / world / "locked.md"
+    kb_file.chmod(0)
+    monkeypatch.setattr(grep_tool_mod, "_GREP_HIT_TEXT_MAX_BYTES", 100)
+    try:
+        res, *_ = TD.run_tool("ripgrep_search", {"query": "NEEDLE"}, world, None)
+        big = next(h for h in res["hits"] if h["doc_id"] == "big.md")
+        assert big["section_truncated"] is True and res["section_truncated"] is True
+        if os.geteuid() != 0:  # root は権限 0 のファイルも開けてしまう
+            assert res["unreadable_files"] == 1
+        monkeypatch.setattr(grep_tool_mod, "_GREP_FILE_CAP_BYTES", 64)
+        monkeypatch.setattr(RT, "_TRUNCATED_DOCS_MAX", 1)
+        res, *_ = TD.run_tool("ripgrep_search", {"query": "NEEDLE"}, world, None)
+    finally:
+        kb_file.chmod(0o644)
+    assert res["truncated_docs_total"] >= 2 and len(res["truncated_docs"]) == 1
+
+
+def test_parent_return_reports_region_chunk_fetch_cap(monkeypatch, tmp_path):
+    rag_md = "<!-- chunk:c1 -->\nAAA\n\n<!-- chunk:c2 -->\nBBB\n"
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "c1", "p1", 1.0, "AAA")], {"a.docx": rag_md}, 262144,
+        chunk_ids=lambda w, doc_id, parent_ids, limit=5000: [f"x{i}" for i in range(limit)] + ["c1", "c2"][:0])
+    entry = res["hits"][0]
+    assert entry["region_chunks_capped"] is True  # ES の取得が上限（5000）に当たった
+    assert entry["tier"] == "region" and entry["region_missing_chunks"] >= 1  # 領域の一部のチャンクが集まらなかった
+
+
+def test_docx_extras_are_trimmed_to_byte_budget():
+    r = {"total": 1, "paragraphs": [{"i": 0, "style": None, "text": "a"}], "tables": [], "truncated": False,
+         "footnotes": [{"id": str(i), "text": "あ" * 500} for i in range(50)]}
+    out = RT._finish_docx_paragraphs_result(r, "a.docx", 2048)
+    assert len(json.dumps(out, ensure_ascii=False).encode()) < 6000
+    assert out["extras_clipped"] > 0 and out["truncated"] is True
+
+
+def test_parent_return_marks_unfetched_parent_chunks_as_partial(monkeypatch, tmp_path):
+    rag_md = "<!-- chunk:c1 -->\nAAA\n"
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "c1", "p1", 1.0, "AAA")], {"a.docx": rag_md}, 262144,
+        chunk_ids=lambda w, doc_id, parent_ids, limit=5000: [])
+    entry = res["hits"][0]
+    assert entry["parent_chunks_unfetched"] is True and entry["fragment"] is True and entry["text_truncated"] is True

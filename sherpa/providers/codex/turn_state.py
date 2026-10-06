@@ -18,11 +18,12 @@ class CodexTurnState:
         "codex_question", "codex_usage", "_agent_start_mono", "_agent_end_mono",
         "_wall_clock_limit_s", "_wall_clock_state", "_resume_fallback_happened", "_sidecar_init_ok",
         "_graph_schema_era_error", "_mcp_error_codes", "_mcp_tool_result_clipped", "_mcp_total_budget_hit",
-        "_mcp_duplicate_tool_call", "_mcp_search_truncated", "_mcp_tool_calls_exhausted", "_ask_disabled",
+        "_mcp_duplicate_tool_call", "_mcp_search_truncated", "_mcp_tool_calls_exhausted", "_mcp_coverage_write_failed",
+        "_ask_disabled",
         "mcp_neighbors", "mcp_graph_results", "_mcp_read_docs", "_mcp_listed_docs", "_mcp_calls", "_event_type_counts",
         "_child_thread_ids", "_all_parent_thread_ids", "_child_usage_totals", "_child_usage_found",
         "_child_usage_missing", "_child_usage_detected", "codex_created_files",
-        "_created_file_rows", "_created_files_failed",
+        "_created_file_rows", "_created_files_failed", "_discarded_files", "_marp_failed", "_marp_failed_formats", "_record_notes",
         # 会話ロック・調査台帳
         "_conv_lock", "_conv_lock_acquired", "_investigation_dir", "_ledger_home", "_ledger_required_extra",
         "_ledger_require_review", "_ledger_require_continuation_resolved", "_investigation_restored",
@@ -33,6 +34,7 @@ class CodexTurnState:
         "_ledger_review_pre_candidate", "_ledger_review_pre_len", "_ledger_review_pre_valid_from",
         "_ledger_review_pre_turn_failed", "_ledger_review_pre_turn_failed_code",
         "_ledger_review_pre_attempt_msgs_start", "_ledger_review_pre_latest_structured",
+        "_ledger_review_pre_msgs_len",
         "_ledger_review_pre_codex_question", "_ledger_review_reverted", "_investigation_stopped_reason",
         "_investigation_retire_done",
         # 会話の継続と起動前の準備
@@ -41,13 +43,14 @@ class CodexTurnState:
         "_agent_msgs", "_agent_partial", "_latest_structured", "_structured_answers",
         "_structured_answers_valid_from", "sp", "_layer", "ws_files", "_before_ws_files",
         "_reason", "_usage_depth_extra", "_review_rounds", "_review_rounds_escalation",
-        "_direct_roots", "_deny_roots", "_sensitive_deny", "_direct_read_ok", "_tmp", "prompt",
+        "_direct_roots", "_deny_roots", "_sensitive_deny", "_direct_read_ok", "_tmp", "prompt", "prompt_with_history",
         "_last_message_path", "_mcp_budget_env", "codex_home", "_sidecar_path", "argv_base", "popen_env",
         "_schema_on", "_schema_v2", "_schema_level_effective", "_codex_run_started_at", "_turn_started_wall",
         "_activity_settings",
         # `_attempt` ごとの状態
         "got_any_line", "attempt_returncode", "_attempt_ran_tools", "_attempt_no", "_attempt_msgs_start",
         "_stale_last_message", "_turn_failed", "_turn_failed_code",
+        "_answer_notices", "_invalid_output_events", "_trimmed",
     )
 
     def __init__(self, ctx, *, turn_t0: float, plain: bool, skip_presearch: bool):
@@ -58,6 +61,11 @@ class CodexTurnState:
         self.uid = None
         self.run_dir = None
         self.answer, self.ran = None, False
+        # 回答の注記（文字列、または (kind, 文) の組）。仕上げで `answer.notices` へ移す。
+        self._answer_notices: list = []
+        # 本文から外した前置き・末尾の作業宣言（内部記録・`answer.trimmed`）。
+        self._trimmed: list[dict] = []
+        self._invalid_output_events = 0
         # 「CLI はあるが認証が無い」と codex exec は即座に非ゼロ終了し JSON を1行も出さない。起動前ガードで一度も起動していないケースと区別するため、if ブロック内でだけ True にする（スキップされた経路は False のまま＝既存の決定的回答フォールバック）。
         self._codex_silent_failure = False
         # 自動継続の `env["codex_stopped_early"]` 判定用フラグも既定 False（`_agent_msgs` 等は if ブロック内にしか無い）。
@@ -89,6 +97,8 @@ class CodexTurnState:
         self._mcp_search_truncated = 0
         # ツール呼び出し回数の上限到達（`field: "tool_calls_exhausted"`）。bool・一度立てば真のまま。`env["limits"]` へ載せる。
         self._mcp_tool_calls_exhausted = False
+        # 台帳の coverage.jsonl へ書けなかった回数（子がサイドカーで報告・回答の注記に出す）。
+        self._mcp_coverage_write_failed = 0
         # 確認ID 付き再送（前の質問への回答）では ask_user を無視する（再質問ループ防止）。
         self._ask_disabled = bool(re.search(r"確認ID[:：]", ctx.message or ""))
         self.mcp_neighbors: list = []  # Codex が graph_neighbors で引いた近傍（UI カードに反映）
@@ -114,6 +124,11 @@ class CodexTurnState:
         self._created_file_rows: list[dict] = []  # 台帳登録に成功した行（env["created_files"] 用）
         # move／台帳登録が1件でも失敗したら True（run_dir を消さず回収用に残し、回答本文へ注記を足す判定に使う）。
         self._created_files_failed = False
+        # 資料作成の依頼でないターンに作られて保存しなかったファイルの件数／Marp の書き出しに失敗したか／調査記録を縮めた旨などの注記（回答の注記に出す）。
+        self._discarded_files = 0
+        self._marp_failed = False
+        self._marp_failed_formats: list[str] = []  # 書き出しを試みて失敗した形式（html／pdf／pptx）
+        self._record_notes: list[str] = []
         # 会話単位ロック（`_session_persistence_enabled` のときだけ後段で実値になる）。finally が参照できるよう既定値を確定する（`_conv_lock_acquired` は自分が取得できた時だけ True）。
         self._conv_lock = None
         self._conv_lock_acquired = False
@@ -147,6 +162,7 @@ class CodexTurnState:
         # `_ledger_review_reverted` は、その後にサイドカーの確認（ask_user）を採らない印（`_read_mcp_sidecar` は毎回先頭から読み直すため）。
         self._ledger_review_pre_candidate: dict | None = None
         self._ledger_review_pre_len = 0
+        self._ledger_review_pre_msgs_len = 0
         self._ledger_review_pre_valid_from = 0
         self._ledger_review_pre_turn_failed = False
         self._ledger_review_pre_turn_failed_code = None
@@ -172,7 +188,7 @@ class CodexTurnState:
         # 出力スキーマ有効時（`_schema_on`）だけ使う状態: `_latest_structured` は最新 attempt の最終出力の検証結果（合格した dict・不合格/欠落は None）。`_structured_answers` は attempt をまたいで合格した dict を積む。
         self._latest_structured: dict | None = None
         self._structured_answers: list[dict] = []
-        # 台帳ゲートが「未完了のため受理しない」と判断した final は、見出し/主張候補として拾わない。`_structured_answers[:_structured_answers_valid_from]` は拒否済み扱いで、`_pick_structured_headline`/`_pick_structured_claims` はこの境界より後だけを走査する（台帳ゲートが継続を発行する直前に境界を更新する）。
+        # 台帳ゲートの回答候補・主張の対象範囲。境界より前の本文も部分回答として保持する。
         self._structured_answers_valid_from = 0
         # 起動前の準備（`_run_authoring` が起動条件を満たしたあとに確定する値）。
         self.sp = None
@@ -189,6 +205,7 @@ class CodexTurnState:
         self._direct_read_ok = False
         self._tmp = None
         self.prompt = None
+        self.prompt_with_history = None
         self._last_message_path = None
         self._mcp_budget_env: dict[str, str] = {}
         self.codex_home = None

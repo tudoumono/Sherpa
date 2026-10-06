@@ -468,6 +468,7 @@ def test_persist_turn_crash_sets_stop_kind_by_exception_type(exc, expected):
     cid = _crash_conv("crash-stop-kind")
     api._persist_turn_crash(cid, "stop-kind-q", "admin", V, False, exc)
     answer = _assistant(cid)["answer"]
+    assert answer["completion"] == "failed"   # 再読み込みで「完了」に見せない
     if expected is None:
         assert "stop_kind" not in answer
     else:

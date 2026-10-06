@@ -148,7 +148,9 @@ def _attach_plugin_failures(session, world: str, result: dict, stage: str) -> No
     from .ingest import world_neo4j
     cov = result.get("coverage")
     if isinstance(cov, dict):
-        graph_coverage.attach_plugin_failures(cov, lambda: world_neo4j.read_plugin_failures(session, world), stage)
+        graph_coverage.attach_plugin_failures(
+            cov, lambda: world_neo4j.read_plugin_failures(session, world), stage,
+            read_unparsed=lambda: world_neo4j.read_unparsed_sources(session, world))
 
 
 # ---- graph_resolve ----

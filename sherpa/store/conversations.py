@@ -50,6 +50,33 @@ def add_message(conversation_id, role, content="", lens=None,
         return row
 
 
+def append_answer_notice(message_id, kind: str, text: str, *, unrecorded: bool = False) -> dict | None:
+    """保存済みの assistant 回答に注記を 1 件足す（本文は書き換えない）。回答の保存より後に分かった欠落（調査記録を保存できなかった等）を回答に残すために使う。
+    `unrecorded=True` なら `answer.investigation.recorded` を偽に戻す（調査の記録のダウンロード導線を出さない）。更新後の行を返す（回答が無い・辞書でなければ `None`）。
+    """
+    from .. import answer_shape
+    _ensure()
+    with _connect() as c:
+        row = c.execute("SELECT id, answer FROM messages WHERE id=%s FOR UPDATE", (message_id,)).fetchone()
+        answer = row["answer"] if row else None
+        if not isinstance(answer, dict):
+            return None
+        answer_shape.add_notice(answer, kind, text)
+        if unrecorded and isinstance(answer.get("investigation"), dict):
+            answer["investigation"]["recorded"] = False
+        answer_shape.seal(answer)
+        updated = c.execute(
+            "UPDATE messages SET answer=%s, content=%s WHERE id=%s "
+            "RETURNING id, conversation_id, role, content, lens, route, trace, answer, personal, created_at",
+            (Json(answer), answer.get("headline") or "", message_id)).fetchone()
+        # 集計表（notice_kinds・completion ほか）も同じトランザクションで写し直す（冪等・失敗は回答の保存を止めない）。
+        _turn_metrics_upsert_best_effort(
+            c, message_id=updated["id"], conversation_id=updated["conversation_id"],
+            created_at=updated["created_at"], lens=updated["lens"], personal=bool(updated["personal"]),
+            answer=updated["answer"])
+        return updated
+
+
 def recent_messages(conversation_id, limit) -> list:
     """直近 `limit` 件のメッセージを軽量に返す（id/role/content のみ・時系列昇順・履歴の読み込み用）。"""
     _ensure()

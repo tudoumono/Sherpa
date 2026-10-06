@@ -94,12 +94,14 @@ _PARAMS_LIST_DOCS = {"type": "object", "properties": {
                             "'unknown'=直近確認が未実施）。省略可"},
     "limit": {"type": "integer", "description": "一覧に含める最大件数（既定200・上限500）。件数(count)は limit/offset と無関係に全件を返す"},
     "offset": {"type": "integer",
-              "description": "一覧の開始位置（既定0）。truncated:true のときは next_offset をそのまま渡すと続きが取れる"}},
+              "description": "一覧の開始位置（既定0）。truncated:true のときは next_offset をそのまま渡すと続きが取れる"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": []}
 _PARAMS_FOLDER_TREE = {"type": "object", "properties": {
     "path_prefix": {"type": "string",
                     "description": "この配下のフォルダ階層だけを見る（rel_path の先頭一致・例: '4期保守'）。省略可＝範囲全体"},
-    "depth": {"type": "integer", "description": "列挙するフォルダの深さ上限（既定3・1〜10にクランプ）"}},
+    "depth": {"type": "integer", "description": "列挙するフォルダの深さ上限（既定3・1〜10にクランプ）"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": []}
 _PARAMS_READ = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "ripgrep_search が返した doc_id（資料の相対パス）"},
@@ -115,7 +117,8 @@ _PARAMS_READ_DOC = {"type": "object", "properties": {
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _PARAMS_OUTLINE = {"type": "object", "properties": {
-    "doc_id": {"type": "string", "description": "list_docs/ripgrep_search 等が返した doc_id（資料の相対パス）"}},
+    "doc_id": {"type": "string", "description": "list_docs/ripgrep_search 等が返した doc_id（資料の相対パス）"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _PARAMS_ASK = {"type": "object", "properties": {
     "prompt": {"type": "string", "description": "ユーザに確認したい短い質問文"},
@@ -134,9 +137,15 @@ _DESC_SEARCH = ("社内資料を全文 grep して当たりを付ける（doc_id
                 "read_around（周辺）か read_doc（続き）で読む。"
                 "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない——"
                 "next_offset をそのまま offset に渡せば続きが取れる（範囲を絞る・別の語で探すのも有効）。"
+                "limit_reached:true は offset が絶対上限に達した＝続きは取れない（空は該当なしではない）。"
+                "section_truncated が付くヒットは節の本文が 64KiB の上限で切れている——read_doc で続きを読む。"
+                "truncated_docs は先頭 20 件だけで、超えたら truncated_docs_total が総数。"
+                "unreadable_files は開けず・読めずに検索できなかったファイルの件数（名前は出さない・その分は未確認）。"
                 f"{_ITEM_PARAM_NOTE}")
 _DESC_READ = ("ヒット箇所の周辺行だけを精読する（全文は読まない）。doc_id と line を渡す。"
              "text_truncated が付いたら本文が上限で切れている——read_doc で続き（次の開始行）を読む。"
+             "file_truncated は読み取りの上限（ファイル 64MiB・1 行 2MiB。line_overflowed は 1 行が長すぎた）で一部を読めていない・"
+             "window_clamped は窓を上限（200 行）に丸めた・line_beyond_eof は指定した行がファイルの末尾より後ろ（total_lines が総行数）。"
              f"{_ITEM_PARAM_NOTE}")
 _DESC_READ_DOC = ("文書を開始行から連続して読む（通読向け・全文を一度には読まない）。"
                   "doc_id と start_line（省略時1）を渡す。1回の返却行数には上限があり、"
@@ -149,7 +158,8 @@ _DESC_OUTLINE = ("文書の見出し構造（Markdown の #/##/### 見出し・�
                  "行番号つきで返す。read_doc/read_around で読む箇所の当たりを付けるのに使う。"
                  "見出しが無い文書は総行数だけを返す。file_truncated が付くときは文書自体が"
                  "大きすぎて total_lines/見出し一覧が過小申告の可能性がある。"
-                 "見出しが上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。")
+                 "見出しが上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。"
+                 "title_truncated が付く見出しは 300 文字で切っている（titles_truncated は一覧にそれがあること）。")
 _DESC_LIST_DOCS = ("文書台帳の一覧・件数を返す（本文は読まない・grep しない）。"
                    "「ドキュメント数」「どんな資料があるか」「フォルダ構成」等の台帳質問はこれで答える。"
                    "path_prefix でフォルダ配下に絞り、name_pattern でパス（フォルダ名/ファイル名）の部分一致に絞れる。"
@@ -171,7 +181,9 @@ _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素�
             "返す本文は該当箇所の周辺まで（文書全体は返さない）——文書全体を確認したいときは "
             "doc_id を渡して read_doc で読む。"
             "text_truncated が付くヒットは本文が途中で切れている——read_around（周辺）か "
-            "read_doc（続き）で読む。"
+            "read_doc（続き）で読む。fragment:true は本文が文書の断片（子チャンクだけ）。"
+            "excluded_hits は結果から除いたヒットの件数（not_current＝現在の資料に無い・withheld＝秘匿のため。名前は出さない）。"
+            "region_chunks_capped は領域のチャンク取得が上限（5000）に当たった・region_missing_chunks は領域の一部のチャンクが集まらなかった＝領域の本文は一部欠けている。"
             "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。"
             "es_search は候補の発見用——全件が必要な列挙は ripgrep_search"
             "（truncated:true なら next_offset を offset に渡して続きを取る）・list_docs・原本の読取で行う。"
@@ -197,6 +209,9 @@ _DESC_GRAPH = ("関係グラフから、ある名前（プログラム/コピー
                "接続が確認できていない参照として原本で確かめる（available が false なら申告を保存していない旧グラフ。candidates が null は 0 ではなく候補数を数えられなかった）。"
                "これは関連の近傍用（無向・言及を含む）。**変更の影響先を調べるときは graph_resolve で起点を選び graph_impact を使う**"
                "（構造の依存だけを矢印の逆向きにたどり、同名の別ノードを混ぜない）。"
+               "unverified は裏付け資料を確認できず一覧から除いたカード数（cards）・資料名を伏せた辺の数（edges）、"
+               "excluded.data_items は粒度が細かすぎるため一覧に含めない DataItem の数、"
+               "coverage.depth はたどる深さの上限（truncated が null は先に辺が残るか未判定）。"
                f"{_ITEM_PARAM_NOTE}")
 _PARAMS_GRAPH = {"type": "object", "properties": {
     "name": {"type": "string", "description": "関連をたどる起点の名前（プログラム名/データ項目名など・具体名）"},
@@ -243,7 +258,8 @@ _PARAMS_GLOB = {"type": "object", "properties": {
     "pattern": {"type": "string",
                "description": ("ファイル名/パスのワイルドカードパターン。`*`/`?`/`[seq]` は1階層内のみ・"
                                "`**` は複数階層をまたぐ。スラッシュを含まなければファイル名として"
-                               "どの階層でも探す（例: '*.jcl'・'*請求書*.xlsx'・'**/障害対応/*.md'）")}},
+                               "どの階層でも探す（例: '*.jcl'・'*請求書*.xlsx'・'**/障害対応/*.md'）")},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["pattern"]}
 _DESC_GLOB = ("ファイル名・フォルダ名のパターンで対象範囲内のファイルを列挙する（中身は読まない・パスのみ）。"
              "大文字小文字は区別しない。該当パス一覧と総件数を返す（上限200件・超過分は打ち切り＝truncated:true。"
@@ -256,7 +272,7 @@ _DESC_COMPARE = ("2つの文書のRAG正本（.rag.md）を突き合わせ、追
                  "left_doc_id/right_doc_id で比較したい2文書を明示するか、"
                  "source_doc_id（片方の doc_id）と target_generation（比べたい世代＝トップフォルダ名）で"
                  "対応する文書を自動発見する。世代を除いた相対パスが完全一致すれば1件に決まる。"
-                 "決まらないときは status: needs_disambiguation と candidates（doc_id 一覧）を返すので、"
+                 "決まらないときは status: needs_disambiguation と candidates（doc_id 一覧・先頭 10 件。candidates_total が総数）を返すので、"
                  "会話で利用者にどちらか確認してから left_doc_id/right_doc_id で呼び直す。"
                  "片方以上が rag.md を持たない文書（コード原文等）のときは status: unsupported を返す。"
                  "diff が上限で切られたときは truncated:true が付く＝続きは取れないので、その範囲は未確認として扱う。")
@@ -265,7 +281,8 @@ _PARAMS_COMPARE = {"type": "object", "properties": {
     "right_doc_id": {"type": "string", "description": "比較するもう片方の doc_id（left_doc_id とセットで指定）"},
     "source_doc_id": {"type": "string", "description": "対応文書を自動発見する起点の doc_id（left_doc_id/right_doc_id 省略時）"},
     "target_generation": {"type": "string",
-                          "description": "比べたい世代（トップフォルダ名・例 '5期'）。source_doc_id とセットで指定"}},
+                          "description": "比べたい世代（トップフォルダ名・例 '5期'）。source_doc_id とセットで指定"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": []}
 
 # 原本読取ツール。Codex（MCP 経由）と API 経路の頭脳が同じ関数（`doc_readers.py`）で原本の中身を読む。毎回 Python を書かせず、トークンと実行時間を削り、再現性を上げる（突合・集計など定型外の作業だけ Python に任せる）。
@@ -274,45 +291,60 @@ _DESC_XLSX_SHEETS = ("Excel（.xlsx）原本のシート一覧と大きさを返
                     "大きすぎて時間内に数えられないシートは dims_estimated=true で、大きさは記録値（推定）か不明。"
                     "シート一覧が上限で切られたときは truncated:true＝続きは取れないので、その範囲（残りのシート）は未確認として扱う。")
 _PARAMS_XLSX_SHEETS = {"type": "object", "properties": {
-    "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .xlsx）"}},
+    "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .xlsx）"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _DESC_XLSX_RANGE = ("Excel（.xlsx）原本のセル範囲を表で返す（原本を直接読む・派生ではない）。"
                     "range 省略時は先頭から max_rows×max_cols（既定200行×50列）。"
                     "範囲が上限を超えたら切り詰めて truncated:true（range は実際に返した範囲）。"
+                    "セル値は切らない（cells_clipped は Excel の 1 セル上限を超えて切った件数・size_clipped は返却量の上限で行を打ち切った）。"
+                    "数式で保存値が無いセルは「値なし（数式）」と返す（formula_no_value が件数・formula_check:unavailable は数式かどうかを確かめられなかった）。"
                     "引用するときはシート名とセル範囲（例 'Sheet1!B3:D10'）で示す。")
 _PARAMS_XLSX_RANGE = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .xlsx）"},
     "sheet": {"type": "string", "description": "シート名（xlsx_sheets が返す name）"},
     "range": {"type": "string", "description": "セル範囲（A1形式・例 'B3:D10'）。省略可＝先頭から既定サイズ"},
     "max_rows": {"type": "integer", "description": "返す最大行数（既定200）"},
-    "max_cols": {"type": "integer", "description": "返す最大列数（既定50）"}},
+    "max_cols": {"type": "integer", "description": "返す最大列数（既定50）"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id", "sheet"]}
 _DESC_DOCX_PARAGRAPHS = ("Word（.docx）原本の段落と表を返す（原本を直接読む・派生ではない）。"
                         "start（既定0）・count（既定200）で段落をページングする。表は先頭20表・各50行まで。"
                         "表が大きく結果が予算を超える場合は表の行も削られる（row_truncated:true）。"
+                        "表の中の表はセルの文字列に含める（nested_tables_clipped は深さ・行数の上限で読まなかった件数）。"
+                        "最初の窓（start=0）だけ、ヘッダー・フッター（headers_footers）・テキストボックス（textboxes）・脚注（footnotes／endnotes）と、"
+                        "読めない画像・図形・グラフの件数（unread_objects）を付ける（*_unread:true はその種別を読めなかった・extras_clipped は件数・文字数の上限で切った）。"
                         "引用するときは段落番号（i）・見出し（style）、表なら表番号・行で示す。")
 _PARAMS_DOCX_PARAGRAPHS = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .docx）"},
     "start": {"type": "integer", "description": "読み始める段落インデックス（既定0）"},
     "count": {"type": "integer", "description": "読む段落数（既定200）"},
     "table_start": {"type": "integer", "description": "表の開始インデックス（既定0・1回20表）。tables が total_tables に足りなければ進めて呼び直す"},
-    "table_row_start": {"type": "integer", "description": "各表の開始行（既定0・1回50行）。rows が total_rows に足りなければ進めて呼び直す"}},
+    "table_row_start": {"type": "integer", "description": "各表の開始行（既定0・1回50行）。rows が total_rows に足りなければ進めて呼び直す"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _DESC_PPTX_SLIDES = ("PowerPoint（.pptx）原本のスライドのテキスト・表・ノートを返す"
                     "（原本を直接読む・派生ではない）。pages（例 '3'・'2-5'・'1,3,5'・既定 '1-10'）で"
-                    "スライドを指定する（1回20枚まで）。引用するときはスライド番号（no）で示す。")
+                    "スライドを指定する（1回20枚まで）。指定が無い・既定のままで残りがあれば truncated:true と pages_remaining（残り枚数）が付く。"
+                    "範囲外・不正な指定は pages_ignored に返す（有効が無ければエラー）。"
+                    "グループ・SmartArt・グラフ（タイトルと系列名）の文字も texts に含め、読めない画像・埋め込みオブジェクトはスライドごとに unread_shapes（件数）で返す。"
+                    "引用するときはスライド番号（no）で示す。")
 _PARAMS_PPTX_SLIDES = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .pptx）"},
-    "pages": {"type": "string", "description": "スライド指定（例 '3'・'2-5'・'1,3,5'）。省略時 '1-10'"}},
+    "pages": {"type": "string", "description": "スライド指定（例 '3'・'2-5'・'1,3,5'）。省略時 '1-10'"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _DESC_PDF_PAGES = ("PDF 原本のページのテキストを返す（原本を直接読む・派生ではない）。"
                   "pages（例 '3'・'2-5'・'1,3,5'・既定 '1-5'）でページを指定する（1回10ページまで）。"
                   "1ページの文字量だけで結果が予算を超える場合でもページ自体は残し、本文を"
                   "切り詰めて text_truncated:true にする（ページ番号は保つ）。"
+                  "文字層の無いページは no_text_layer:true と「文字なし（スキャンの可能性）」を返す＝本文は読めていない（画像として確認する）。"
+                  "指定が無い・既定のままで残りがあれば truncated:true と pages_remaining が付く。範囲外・不正な指定は pages_ignored に返す（有効が無ければエラー）。"
                   "引用するときはページ番号（no）で示す。")
 _PARAMS_PDF_PAGES = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .pdf）"},
-    "pages": {"type": "string", "description": "ページ指定（例 '3'・'2-5'・'1,3,5'）。省略時 '1-5'"}},
+    "pages": {"type": "string", "description": "ページ指定（例 '3'・'2-5'・'1,3,5'）。省略時 '1-5'"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _DESC_FILE_HEAD = ("テキスト・コード原本の先頭バイトをそのまま返す（原本を直接読む・派生ではない・"
                   "Office/PDF は対象外＝xlsx_sheets/docx_paragraphs/pptx_slides/pdf_pages を使う）。"
@@ -402,8 +434,10 @@ def _post(url: str, headers: dict, body: dict, timeout: int = 90) -> dict:
 
 
 # トークン使用量の合算（ツールループの全ターン分）。生トークンだけを合算し、provider/model の付与は呼び元が行う。`final` イベントに `usage` を載せる（無ければ None）。
+# `cache_write_tokens` は 0 から足し始め、1 回でもプロバイダが返さなければ None（不明）に倒して以後 None のまま（0 に丸めない）。
 def _new_usage_acc() -> dict:
-    return {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0}
+    return {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0,
+            "cache_write_tokens": 0}
 
 
 def _usage_or_none(acc: dict):
@@ -422,8 +456,12 @@ def _acc_openai_usage(acc: dict, resp: dict, ollama: bool) -> None:
     if ollama and not u:  # Ollama /api/chat（stream=false）はトップレベルの eval_count 系
         acc["input_tokens"] += _n(resp.get("prompt_eval_count"))
         acc["output_tokens"] += _n(resp.get("eval_count"))
+        acc["cache_write_tokens"] = None
         return
     pd = u.get("prompt_tokens_details") or {}
+    from . import metering
+    acc["cache_write_tokens"] = metering.sum_cache_write(
+        acc["cache_write_tokens"], metering.cache_write_from_usage(u, pd, u.get("input_tokens_details")))
     cd = u.get("completion_tokens_details") or {}
     acc["input_tokens"] += _n(u.get("prompt_tokens"))
     acc["cached_input_tokens"] += _n(pd.get("cached_tokens"))

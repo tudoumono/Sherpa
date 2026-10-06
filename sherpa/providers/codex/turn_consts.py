@@ -18,6 +18,8 @@ _REASONING_AUTHOR = "medium"
 
 # 成果物の move／台帳登録に1件でも失敗したとき、回答本文の末尾に付ける固定文。
 _CREATED_FILES_FAILURE_NOTE = "（作成したファイルの一部を保存できませんでした。管理者に確認してください）"
+# Marp の書き出し（HTML・PDF・PPTX）が失敗したとき。Markdown の原稿は保存されている。
+_MARP_FAILURE_NOTE = "スライドの書き出し（HTML・PDF・PPTX への変換）に失敗しました。Markdown の原稿だけを保存しています。"
 # 壁時計上限（`SHERPA_CODEX_WALL_CLOCK_LIMIT_S`）で打ち切った時に headline へ付ける注記。
 _WALL_CLOCK_LIMIT_NOTE = "（時間の上限に達したため、ここまでの結果で打ち切りました）"
 

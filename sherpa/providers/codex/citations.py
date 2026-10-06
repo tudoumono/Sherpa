@@ -215,12 +215,44 @@ def _verify_one(ref: str, world: str, scope_paths) -> str | None:
     return doc if agentic_search.verify_doc_exists(doc, world, scope_paths) else None
 
 
-def verified_referenced_docs(refs: list, world: str, scope_paths=None) -> list[str]:
-    """参照の候補 → 秘匿名を落とし実在確認を通った doc_id の一覧（出現順・重複除去）。
-    `refs` の要素は文字列か行の候補群。候補群は行全体の候補のうち最初に実在したもの、無ければ各片の最初に実在したものを採る（1 行 1 件）。
+# 検証を通らなかった参照の理由（利用者向けの文）。
+REASON_OUT_OF_SCOPE = "今回の範囲の外です"
+REASON_UNREADABLE = "見つからないか、読めない形式です"
+UNVERIFIED_PATH_MAX_LEN = 200
+
+
+def _classify_failure(candidates: list, world: str, scope_paths) -> tuple[dict | None, bool]:
+    """検証を通らなかった 1 件（候補の列）の理由。`(行, 名前を出せないか)`。
+    名前を出すのは、資料フォルダ内の資料パスとして正規化でき（拡張子で終わる）、秘匿名でないものだけ。
+    秘匿名・自由な文・解釈できない行は名前を返さず（行は None）、件数だけに使う。"""
+    from ...ingest import text_kind
+    from ... import scope as scope_mod
+
+    first_doc = None
+    for c in candidates:
+        doc = normalize_doc_ref(c, world)
+        if not doc:
+            continue
+        if text_kind.is_sensitive_doc_id(doc):
+            return None, True
+        if first_doc is None and _EXT_END_RE.search(doc) and not any(ord(ch) < 32 for ch in doc):
+            first_doc = doc
+    if first_doc is not None:
+        reason = (REASON_OUT_OF_SCOPE if scope_paths is not None and not scope_mod.in_scope(first_doc, scope_paths)
+                  else REASON_UNREADABLE)
+        return {"path": first_doc[:UNVERIFIED_PATH_MAX_LEN], "reason": reason}, False
+    return None, True
+
+
+def resolve_referenced_docs(refs: list, world: str, scope_paths=None) -> tuple[list[str], list[dict], int]:
+    """参照の候補 → `(検証を通った doc_id の一覧, 通らなかった行の {path, reason} の一覧, 名前を出さず件数だけにした数)`。
+    `refs` の要素は文字列か行の候補群（`verified_referenced_docs` と同じ採り方）。通らなかったものを数えるのは行の候補群（回答の「参照した資料」の行）だけで、
+    文字列（道具の引数から拾った資料）は検証を通らなくても数えない。名前を出せない参照（秘匿名・自由な文・解釈できない行）は名前を出さず件数だけ返す。
     """
     out: list[str] = []
     seen: set[str] = set()
+    failures: list[dict] = []
+    sensitive = 0
 
     def _add(doc: str | None) -> None:
         if doc and doc not in seen:
@@ -234,6 +266,14 @@ def verified_referenced_docs(refs: list, world: str, scope_paths=None) -> list[s
                 return d
         return None
 
+    def _fail(group: list) -> None:
+        nonlocal sensitive
+        row, is_sensitive = _classify_failure(group, world, scope_paths)
+        if is_sensitive:
+            sensitive += 1  # 名前を出せない参照（秘匿名・自由な文・解釈できない行）は件数だけ
+        elif row is not None and row not in failures:
+            failures.append(row)
+
     for r in refs:
         if isinstance(r, str):
             _add(_verify_one(r, world, scope_paths))
@@ -245,6 +285,20 @@ def verified_referenced_docs(refs: list, world: str, scope_paths=None) -> list[s
         if whole:
             _add(whole)
             continue
+        if len(groups) == 1:
+            _fail(groups[0])
+            continue
         for part in groups[1:]:
-            _add(_first(part))
-    return out
+            doc = _first(part)
+            if doc:
+                _add(doc)
+            else:
+                _fail(part)
+    return out, failures, sensitive
+
+
+def verified_referenced_docs(refs: list, world: str, scope_paths=None) -> list[str]:
+    """参照の候補 → 秘匿名を落とし実在確認を通った doc_id の一覧（出現順・重複除去）。
+    `refs` の要素は文字列か行の候補群。候補群は行全体の候補のうち最初に実在したもの、無ければ各片の最初に実在したものを採る（1 行 1 件）。
+    """
+    return resolve_referenced_docs(refs, world, scope_paths)[0]

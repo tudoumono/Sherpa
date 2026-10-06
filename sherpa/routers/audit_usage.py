@@ -98,12 +98,16 @@ _AUDIT_EXPORT_FIELDS = [
 ]
 
 
-def _audit_export_rows(**filters) -> list[dict]:
-    """監査ログをエクスポート用にページング取得する。"""
+_AUDIT_EXPORT_MAX_ROWS = 50000
+
+
+def _audit_export_rows(**filters) -> tuple[list[dict], bool]:
+    """監査ログをエクスポート用にページング取得する。`(行, 残りあり)`。上限（`_AUDIT_EXPORT_MAX_ROWS`）に達したあとにまだ行が残るときだけ「残りあり」が真になる。"""
     rows: list[dict] = []
     offset = 0
     page = 500
-    max_rows = min(int(filters.pop("max_rows", 50000) or 50000), 50000)
+    max_rows = min(int(filters.pop("max_rows", _AUDIT_EXPORT_MAX_ROWS) or _AUDIT_EXPORT_MAX_ROWS),
+                   _AUDIT_EXPORT_MAX_ROWS)
     while len(rows) < max_rows:
         batch = store.list_audit(limit=min(page, max_rows - len(rows)), offset=offset, **filters)
         if not batch:
@@ -112,7 +116,8 @@ def _audit_export_rows(**filters) -> list[dict]:
         if len(batch) < page:
             break
         offset += page
-    return rows
+    more = len(rows) >= max_rows and bool(store.list_audit(limit=1, offset=len(rows), **filters))
+    return rows, more
 
 
 def _audit_export_clean(row: dict) -> dict:
@@ -127,8 +132,8 @@ def _audit_export_clean(row: dict) -> dict:
     return clean
 
 
-def _audit_export_filename(fmt: str) -> str:
-    return f"sherpa-audit-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.{fmt}"
+def _audit_export_filename(fmt: str, truncated: bool = False) -> str:
+    return f"sherpa-audit-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}{'-truncated' if truncated else ''}.{fmt}"
 
 
 # `include_chat_content=1` のときだけ本文を結合する。保存済みの `audit_log.detail`（append-only・hash-chain 対象）は変更せず、エクスポート出力にだけ足す。
@@ -192,6 +197,7 @@ def admin_audit_export(
 ):
     """監査ログを CSV / JSONL でエクスポートする（管理者のみ）。
     `include_chat_content=1` を指定したときだけ、`chat.turn` 行にユーザーのプロンプトと AI の回答（headline）を結合する（未指定なら本文を含まない）。個人参照ターンはプレースホルダになる。
+    出力は最大 5 万行。条件に合う行がまだ残るときは、ヘッダー `X-Audit-Export-Truncated: true` とファイル名の `-truncated` で示す。
     """
     u = _current_user(request)
     _require_admin(u)
@@ -201,21 +207,25 @@ def admin_audit_export(
         "time_from": time_from, "time_to": time_to, "request_id": request_id,
     }
     filters = {k: v for k, v in filters.items() if v is not None}
-    rows = [_audit_export_clean(r) for r in _audit_export_rows(**filters)]
+    raw_rows, truncated = _audit_export_rows(**filters)
+    rows = [_audit_export_clean(r) for r in raw_rows]
     if include_chat_content:
         _join_chat_content(rows)
 
     try:
         store.audit(u["uid"], "admin.audit_exported", "audit_log", None,
                     detail={"format": format, "filters": filters, "result_count": len(rows),
-                            "include_chat_content": include_chat_content},
+                            "include_chat_content": include_chat_content, "truncated": truncated},
                     outcome="success", severity="critical")
     except Exception:
         _log.critical("audit write failed for admin.audit_exported – fail-closed")
         raise HTTPException(500, "監査ログの記録に失敗しました（fail-closed）")
 
-    filename = _audit_export_filename(format)
+    filename = _audit_export_filename(format, truncated)
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if truncated:
+        # 本文の形式は変えず、上限で切ったことをヘッダーとファイル名で伝える（期間・条件を絞って取り直す）。
+        headers["X-Audit-Export-Truncated"] = "true"
     if format == "jsonl":
         body = "\n".join(json.dumps(r, ensure_ascii=False, default=str) for r in rows)
         if body:

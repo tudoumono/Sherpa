@@ -10,7 +10,7 @@
 // scope.js/menus.js は toast/updateShareButtonState をこのファイルから相対 import する（関数宣言＝hoisted のため、循環 import でも実行時に呼ぶ限り安全）。
 import { S, EXAMPLES } from './chat/state.js';
 import { openShareDialog } from './chat/share-dialog.js';
-import { welcome, initRefGraph } from './chat/render.js';
+import { welcome, initRefGraph, deriveTraceStopReason } from './chat/render.js';
 import {
   loadConversations, deleteConversation, togglePin, renameConversation,
   newConversation, openConversation, resumeRunningTurn, forkConversation, syncConvParam,
@@ -269,12 +269,15 @@ $('messages').addEventListener('click', (e) => {
   if (msg.classList.contains('user')) { copyText(msg.querySelector('.bubble-user').textContent); return; }
   const clone = cp.closest('.a-body').cloneNode(true);
   clone.querySelectorAll('.copybtn,.chips').forEach((el) => el.remove());
-  // .headline は mdLite() で HTML 整形して描画しているため、コピーは生テキストのまま（変換しない）にする: 見出し部分だけ元データ（_answer.headline）に差し替えてから抽出する。
-  if (msg._answer && typeof msg._answer.headline === 'string') {
+  // .headline は mdLite() で HTML 整形して描画しているため、コピーは生テキストのまま（変換しない）にする: 本文部分だけ元データ（_answer.body・旧形式は headline）に差し替えてから抽出する。注記の帯（.answer-notices）はそのまま本文の前に残る。
+  if (msg._answer && typeof (msg._answer.body ?? msg._answer.headline) === 'string') {
     const h = clone.querySelector('.headline');
-    if (h) h.textContent = msg._answer.headline;
+    if (h) h.textContent = typeof msg._answer.body === 'string' ? msg._answer.body : msg._answer.headline;
   }
-  copyText(clone.textContent.trim());
+  // 完了状態（途中・停止・失敗）は画面の終了表示と同じ文言で先頭に付ける。
+  const a = msg._answer;
+  const state = a && ['partial', 'stopped', 'failed'].includes(a.completion) ? deriveTraceStopReason(a) : null;
+  copyText((state ? `${state.text}\n` : '') + clone.textContent.trim());
 });
 
 // 個人ファイルのアップロード（送信欄の一部）。参照トグルの setPersonal/setKb は web/chat/scope.js の担当。

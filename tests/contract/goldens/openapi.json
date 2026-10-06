@@ -146,6 +146,13 @@
       "AdminUsageStatsResponse": {
         "description": "利用統計（GET /admin/usage/stats）。",
         "properties": {
+          "completions": {
+            "items": {
+              "$ref": "#/components/schemas/UsageCompletionRow"
+            },
+            "title": "Completions",
+            "type": "array"
+          },
           "conversation_turns": {
             "$ref": "#/components/schemas/UsageConversationTurns"
           },
@@ -260,6 +267,7 @@
           "resume_rate",
           "stop_kinds",
           "stopped_turns",
+          "completions",
           "response_time",
           "conversations_top",
           "limits",
@@ -2617,6 +2625,17 @@
       },
       "ExtLimit": {
         "properties": {
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Count"
+          },
           "kind": {
             "enum": [
               "timeout",
@@ -2627,7 +2646,8 @@
               "card_cap",
               "graph_unavailable",
               "graph_reingest_required",
-              "plugin_failed"
+              "plugin_failed",
+              "source_unparsed"
             ],
             "title": "Kind",
             "type": "string"
@@ -3437,8 +3457,27 @@
         "title": "IngestBlockedDoc",
         "type": "object"
       },
+      "IngestNotice": {
+        "description": "`ingest_notices` の要素。取り込みで黙って落とした・粗くしたものの種類（`code`）と件数（`count`）。`count` は数えられない種類では 1。",
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "code",
+          "count"
+        ],
+        "title": "IngestNotice",
+        "type": "object"
+      },
       "IngestSummaryFields": {
-        "description": "資料フォルダの取り込み状況（スキャン結果のキャッシュ＋グラフ/ES 件数・最終実行状態）。\n\n`scanned`〜`unreadable` は sync 完走時と `POST /worlds/{wid}/recount` のときだけ更新されるキャッシュで、このエンドポイント自身はフォルダを歩かない。\n`counts_as_of` はそのキャッシュの記録時刻（`None`＝未集計）。`sensitive_excluded`/`unreachable_as_text`/`unreachable_as_text_by_ext`/\n`unreachable_by_reason`（`\"encoding_undetermined\"`/`\"binary\"`）/`encoding_partial_count`（一部が化けている件数）も同じキャッシュ由来。\n`failed_files`/`partial_extraction_suspected`/`stage_summary` は最新 run の由来（無ければ `None`）。\n`failure_reason_catalog`/`partial_extraction_advice` は閉じた理由語彙の平文辞書。\n`last_run_warnings`/`last_run_blocked` は flags を打ち切って導出したもの（`last_run_flags_total`=打切り前の総数・`last_run_flags_truncated`=打切りの有無）。\n`last_run_id`/`running_progress` は最新 run の id と実行中進捗（実行中でなければ `running_progress` は `None`）。",
+        "description": "資料フォルダの取り込み状況（スキャン結果のキャッシュ＋グラフ/ES 件数・最終実行状態）。\n\n`scanned`〜`unreadable` は sync 完走時と `POST /worlds/{wid}/recount` のときだけ更新されるキャッシュで、このエンドポイント自身はフォルダを歩かない。\n`counts_as_of` はそのキャッシュの記録時刻（`None`＝未集計）。`sensitive_excluded`/`unreachable_as_text`/`unreachable_as_text_by_ext`/\n`unreachable_by_reason`（`\"encoding_undetermined\"`/`\"binary\"`）/`encoding_partial_count`（一部が化けている件数）も同じキャッシュ由来。\n`failed_files`/`partial_extraction_suspected`/`stage_summary` は最新 run の由来（無ければ `None`）。\n`failure_reason_catalog`/`partial_extraction_advice` は閉じた理由語彙の平文辞書。\n`walk_skipped`＝木の走査で辿らなかったものの件数（`symlink`/`unreadable_dir`/`unreadable_file`/`outside_root`・集計キャッシュ由来）。\n`ingest_notices`＝黙って落とした・粗くしたものの `{code, count}`（走査・関係グラフ・全文索引の各段から導出・名前は持たない。無ければ空）。\n`last_run_warnings`/`last_run_blocked` は flags を打ち切って導出したもの（`last_run_flags_total`=打切り前の総数・`last_run_flags_truncated`=打切りの有無）。\n`last_run_id`/`running_progress` は最新 run の id と実行中進捗（実行中でなければ `running_progress` は `None`）。",
         "properties": {
           "analyzer_declined": {
             "title": "Analyzer Declined",
@@ -3547,6 +3586,14 @@
           "indexed": {
             "title": "Indexed",
             "type": "integer"
+          },
+          "ingest_notices": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/IngestNotice"
+            },
+            "title": "Ingest Notices",
+            "type": "array"
           },
           "last_run_blocked": {
             "items": {
@@ -3682,6 +3729,14 @@
           "unreadable": {
             "title": "Unreadable",
             "type": "integer"
+          },
+          "walk_skipped": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "default": {},
+            "title": "Walk Skipped",
+            "type": "object"
           }
         },
         "required": [
@@ -5016,9 +5071,43 @@
         "title": "TestReq",
         "type": "object"
       },
+      "UsageCompletionRow": {
+        "description": "回答の完了状態。`complete`/`partial`/`stopped`/`failed`、または旧形式の行の `unknown`。",
+        "properties": {
+          "completion": {
+            "title": "Completion",
+            "type": "string"
+          },
+          "turns": {
+            "title": "Turns",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "completion",
+          "turns"
+        ],
+        "title": "UsageCompletionRow",
+        "type": "object"
+      },
       "UsageConversationKindRow": {
         "description": "会話ごとの用途別（kind）内訳（`conversations_top[].kinds` の1行）。null の意味は `UsageTokenByKind` と同じ。",
         "properties": {
+          "cache_write": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Write"
+          },
+          "cache_write_unknown": {
+            "title": "Cache Write Unknown",
+            "type": "integer"
+          },
           "cached_input": {
             "anyOf": [
               {
@@ -5103,6 +5192,8 @@
           "calls",
           "input",
           "cached_input",
+          "cache_write",
+          "cache_write_unknown",
           "output",
           "reasoning_output",
           "elapsed_ms_total",
@@ -6294,8 +6385,23 @@
         "type": "object"
       },
       "UsageTokenByKind": {
-        "description": "用途別（kind）内訳。\n\nchat 行は `messages.answer->'usage'` 由来（トークン列は常に int）。それ以外の kind は `usage_events` 由来で、プロバイダが usage を報告しなかった行はトークン列が None（0 に丸めない）。\n`elapsed_ms_total`/`elapsed_ms_avg`/`elapsed_n` は計測ありの行の合計・平均・行数（chat 行は対象外＝total/avg=None・n=0）。",
+        "description": "用途別（kind）内訳。\n\n`cache_write`（キャッシュへの書き込み）は報告のあった行だけの合計で、全行が不明なら None・`cache_write_unknown` は不明だった行（ターン／呼び出し）の数（0 より大きければ「不明を含む」）。\n\nchat 行は `messages.answer->'usage'` 由来（トークン列は常に int）。それ以外の kind は `usage_events` 由来で、プロバイダが usage を報告しなかった行はトークン列が None（0 に丸めない）。\n`elapsed_ms_total`/`elapsed_ms_avg`/`elapsed_n` は計測ありの行の合計・平均・行数（chat 行は対象外＝total/avg=None・n=0）。",
         "properties": {
+          "cache_write": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Write"
+          },
+          "cache_write_unknown": {
+            "title": "Cache Write Unknown",
+            "type": "integer"
+          },
           "cached_input": {
             "anyOf": [
               {
@@ -6390,6 +6496,8 @@
           "calls",
           "input",
           "cached_input",
+          "cache_write",
+          "cache_write_unknown",
           "output",
           "reasoning_output",
           "elapsed_ms_total",
@@ -6401,6 +6509,21 @@
       },
       "UsageTokenByModel": {
         "properties": {
+          "cache_write": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Write"
+          },
+          "cache_write_unknown": {
+            "title": "Cache Write Unknown",
+            "type": "integer"
+          },
           "cached_input": {
             "title": "Cached Input",
             "type": "integer"
@@ -6436,6 +6559,8 @@
           "turns",
           "input",
           "cached_input",
+          "cache_write",
+          "cache_write_unknown",
           "output",
           "reasoning_output"
         ],
@@ -6444,6 +6569,21 @@
       },
       "UsageTokenByUser": {
         "properties": {
+          "cache_write": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Write"
+          },
+          "cache_write_unknown": {
+            "title": "Cache Write Unknown",
+            "type": "integer"
+          },
           "cached_input": {
             "title": "Cached Input",
             "type": "integer"
@@ -6479,6 +6619,8 @@
           "turns",
           "input",
           "cached_input",
+          "cache_write",
+          "cache_write_unknown",
           "output",
           "reasoning_output"
         ],
@@ -6488,6 +6630,21 @@
       "UsageTokenByUserKind": {
         "description": "ユーザー別 × 用途別（kind）内訳（`UsageTokenByKind` をユーザーごとに分けたもの）。利用者に紐付かない呼び出しは含まれない。",
         "properties": {
+          "cache_write": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Write"
+          },
+          "cache_write_unknown": {
+            "title": "Cache Write Unknown",
+            "type": "integer"
+          },
           "cached_input": {
             "anyOf": [
               {
@@ -6582,6 +6739,8 @@
           "calls",
           "input",
           "cached_input",
+          "cache_write",
+          "cache_write_unknown",
           "output",
           "reasoning_output",
           "elapsed_ms_total",
@@ -6616,6 +6775,21 @@
       },
       "UsageTokenTotals": {
         "properties": {
+          "cache_write": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Write"
+          },
+          "cache_write_unknown": {
+            "title": "Cache Write Unknown",
+            "type": "integer"
+          },
           "cached_input": {
             "title": "Cached Input",
             "type": "integer"
@@ -6641,6 +6815,8 @@
           "turns",
           "input",
           "cached_input",
+          "cache_write",
+          "cache_write_unknown",
           "output",
           "reasoning_output"
         ],
@@ -7649,6 +7825,14 @@
             "title": "Indexed",
             "type": "integer"
           },
+          "ingest_notices": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/IngestNotice"
+            },
+            "title": "Ingest Notices",
+            "type": "array"
+          },
           "last_run_blocked": {
             "items": {
               "$ref": "#/components/schemas/IngestBlockedDoc"
@@ -7787,6 +7971,14 @@
           "unreadable": {
             "title": "Unreadable",
             "type": "integer"
+          },
+          "walk_skipped": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "default": {},
+            "title": "Walk Skipped",
+            "type": "object"
           },
           "world_id": {
             "title": "World Id",
@@ -8039,6 +8231,14 @@
             "title": "Indexed",
             "type": "integer"
           },
+          "ingest_notices": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/IngestNotice"
+            },
+            "title": "Ingest Notices",
+            "type": "array"
+          },
           "label": {
             "anyOf": [
               {
@@ -8214,6 +8414,14 @@
           "unreadable": {
             "title": "Unreadable",
             "type": "integer"
+          },
+          "walk_skipped": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "default": {},
+            "title": "Walk Skipped",
+            "type": "object"
           },
           "world_id": {
             "title": "World Id",
@@ -8676,7 +8884,7 @@
     },
     "/admin/audit/export": {
       "get": {
-        "description": "監査ログを CSV / JSONL でエクスポートする（管理者のみ）。\n`include_chat_content=1` を指定したときだけ、`chat.turn` 行にユーザーのプロンプトと AI の回答（headline）を結合する（未指定なら本文を含まない）。個人参照ターンはプレースホルダになる。",
+        "description": "監査ログを CSV / JSONL でエクスポートする（管理者のみ）。\n`include_chat_content=1` を指定したときだけ、`chat.turn` 行にユーザーのプロンプトと AI の回答（headline）を結合する（未指定なら本文を含まない）。個人参照ターンはプレースホルダになる。\n出力は最大 5 万行。条件に合う行がまだ残るときは、ヘッダー `X-Audit-Export-Truncated: true` とファイル名の `-truncated` で示す。",
         "operationId": "admin_audit_export_admin_audit_export_get",
         "parameters": [
           {

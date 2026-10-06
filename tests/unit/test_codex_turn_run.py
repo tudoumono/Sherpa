@@ -249,7 +249,9 @@ def test_stream_read_error_prefers_last_message_file_over_picked_message(tmp_pat
     broken = (_STREAM_BODY + "import sys, time\nsys.stdout.flush()\ntime.sleep(0.5)\n"
               "sys.stdout.buffer.write(b'\\xff\\xfe\\n')\nsys.stdout.buffer.flush()\n")
     _, env, _ = _run(tmp_path, monkeypatch, broken, "stream-err-u1")
-    assert env["headline"] == _FILE_MESSAGE
+    assert _FILE_MESSAGE in env["headline"]
+    assert "UnicodeDecodeError" in env["headline"]
+    assert env["completion"] == "partial"
     ok_dir = tmp_path / "ok"
     ok_dir.mkdir()
     _, env_ok, _ = _run(ok_dir, monkeypatch, _STREAM_BODY, "stream-ok-u1")
@@ -502,3 +504,107 @@ def _alive(pid: int) -> bool:
     except OSError:
         return False
     return state != "Z"
+
+
+@pytest.mark.parametrize("fault,notice", [
+    ("oversize", "16 MiB"), ("unreadable", "読み取り"), ("invalid_utf8", "UTF-8"),
+])
+def test_last_message_loss_is_noticed(tmp_path, monkeypatch, fault, notice):
+    actions = {
+        "oversize": "with p.open('wb') as f: f.truncate(16 * 1024 * 1024 + 1)",
+        "unreadable": "p.mkdir()",
+        "invalid_utf8": "p.write_bytes(b'\\xff')",
+    }
+    body = H._msg("回収済みの結論です。") + f"p = pathlib.Path({_o_path()})\n" + actions[fault] + "\n"
+    _, env, _ = _run(tmp_path, monkeypatch, body, "message-loss")
+    assert "回収済みの結論です。" in env["headline"]
+    assert notice in env["headline"]
+    assert env["headline"].count("試行 1:") == 1
+    assert "1 件" in env["headline"]
+    assert env["completion"] == "partial"
+
+
+@pytest.mark.parametrize("broken", ["not-json", "[]", '{"type":"item.completed","item":42}'])
+def test_broken_output_event_keeps_body_and_notice(tmp_path, monkeypatch, broken):
+    body = H._msg("回収済みの結論です。") + f"print({broken!r})\n" + H._msg("後続の結論です。", "2")
+    _, env, _ = _run(tmp_path, monkeypatch, body, "broken-output")
+    assert "後続の結論です。" in env["headline"]
+    assert "出力イベント" in env["headline"] and "1 件" in env["headline"]
+    assert env["completion"] == "partial"
+
+
+def test_malformed_item_events_are_counted_without_losing_answer(tmp_path, monkeypatch):
+    broken = [
+        {"type": "item.completed"},
+        {"type": "item.started", "item": {}},
+        {"type": "item.updated", "item": {"type": 42}},
+        {"type": "item.completed", "item": {"type": "agent_message", "id": "missing-text"}},
+    ]
+    body = "".join(H._emit(e) for e in broken) + H._msg("回収済みの結論です。")
+    _, env, _ = _run(tmp_path, monkeypatch, body, "malformed-items")
+    assert "回収済みの結論です。" in env["headline"]
+    assert "壊れた出力イベント 4 件" in env["headline"]
+    assert "文字数不明" in env["headline"] and env["completion"] == "partial"
+
+
+@pytest.mark.parametrize("ollama", [False, True])
+def test_provider_processing_error_keeps_collected_body(tmp_path, monkeypatch, ollama):
+    def unavailable_sources(docs):
+        raise OSError("private diagnostic must not be shown")
+    _, env, _ = _run(tmp_path, monkeypatch,
+                     H._msg("回収済みの結論です。\n参照した資料:\n- " + H._DOC),
+                     "provider-partial", make_sources=unavailable_sources,
+                     prov=A.CodexProvider(ollama_base_url="http://127.0.0.1:11434" if ollama else None))
+    assert "回収済みの結論です。" in env["headline"]
+    assert "OSError" in env["headline"]
+    assert "private diagnostic" not in env["headline"]
+    assert env["completion"] == "partial"
+
+
+# ===== 出典とファイルの欠落を伝える（COD-25 A3） =====
+
+def test_referenced_docs_that_failed_verification_are_listed_with_reason_and_secret_names_only_counted(
+        tmp_path, monkeypatch):
+    """検証を通らなかった「参照した資料」の行は、理由つきで返し注記する。秘匿名は名前を出さず件数だけ。"""
+    answer = (f"消費税率は10%です。\n\n参照した資料:\n- {H._DOC}\n- 存在しない.md\n- ../外へ出る.md\n- .env\n")
+    _, env, _ = _run(tmp_path, monkeypatch, H._PY + H._msg(answer), "unverified-u1",
+                     make_sources=H._make_sources)
+    assert env["sources_verified"] == [H._DOC]
+    from sherpa.providers.codex import citations as C
+    assert env["sources_unverified"] == [{"path": "存在しない.md", "reason": C.REASON_UNREADABLE}]
+    assert env["sources_unverified_hidden"] == 2      # 秘匿名と解釈できない行は件数だけ
+    assert ".env" not in str(env["sources_unverified"]) and ".env" not in env["headline"]
+    notice = next(n for n in env["notices"] if n["kind"] == "sources_unverified")
+    assert "3 件" in notice["text"] and notice["text"] in env["headline"]
+    assert env["completion"] == "complete"      # 出典の欠落は完了状態を変えない
+
+
+def test_files_made_outside_authoring_are_discarded_and_say_so(tmp_path, monkeypatch, registry):
+    """資料作成でないターンに作られたファイルは保存せず、捨てた件数を注記する。"""
+    _, env, _ = _run(tmp_path, monkeypatch, _WRITE_REPORT + H._msg("説明します。"), "discard-u1", lens="qa")
+    assert registry == [] and "created_files" not in env
+    notice = next(n for n in env["notices"] if n["kind"] == "files_discarded")
+    assert "1 件" in notice["text"]
+
+
+def test_exhausted_file_names_and_failed_marp_export_are_noticed(tmp_path, monkeypatch, registry):
+    """同名回避の候補を使い切って保存できない成果物は失敗として扱い、Marp の書き出しの失敗も注記する。"""
+    from sherpa import store
+    from sherpa.providers.codex import turn_finish
+    monkeypatch.setattr(store, "no_live_upload_for_path", lambda *a, **k: False)
+    monkeypatch.setattr(turn_finish, "_marp_bin", lambda: None)
+    body = ("import pathlib\n"
+            "pathlib.Path('deck.md').write_text('---\\nmarp: true\\n---\\n# 表紙\\n')\n")
+    _, env, _ = _run(tmp_path, monkeypatch, body + H._msg("作成しました。"), "exhausted-u1", lens="author")
+    kinds = [n["kind"] for n in env["notices"]]
+    assert "created_files_failed" in kinds and "marp_failed" in kinds
+    assert registry == [] and env["completion"] == "partial"
+
+
+def test_personal_toggle_without_hits_still_keeps_search_words_out_of_the_coverage(tmp_path, monkeypatch):
+    """個人ファイル参照トグル ON のターンは、ヒットが 0 件でも MCP へ「検索語を記録しない」を渡す。OFF なら渡さない。"""
+    _, _, off = _run(tmp_path, monkeypatch, H._msg("回答です。"), "personal-off-u1")
+    assert "SHERPA_MCP_COVERAGE_NO_QUERY" not in off[0]["config"]
+    (tmp_path / "on").mkdir()
+    _, _, on = _run(tmp_path / "on", monkeypatch, H._msg("回答です。"), "personal-on-u1", personal=True)
+    assert 'SHERPA_MCP_COVERAGE_NO_QUERY = "1"' in on[0]["config"]

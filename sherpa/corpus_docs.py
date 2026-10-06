@@ -448,6 +448,8 @@ def provenance_summary(md_path) -> dict | None:
     - `confidence`（0.0〜1.0）＝アームの確信度。
     - `legacy_backend`（`libreoffice`／`office_com` 等）＝旧形式を前段変換したバックエンド名（notes の `legacy_backend=…`）。
     - `has_conflicts`（True のみ）＝決定的マージで「別の読み方で追加内容」が見つかった文書。
+    - `metafile_truncated`（該当時のみ）＝図（WMF/EMF）の文字・画像を上限で落とした記録（`lines_dropped`／`chars_dropped`／`figures_text_capped`／`figures_bitmaps_capped`／`bitmaps_excluded`）。
+    - `pdf_pages`（画像で読んだ PDF のみ）＝`{total, over_limit, budget_cut, unread}`（元の総ページ数／上限で読まなかった数／時間予算で読まなかった数／読み取りに失敗・空だったページ数）。0 の項目は載せない。
     `md_path` 無し・サイドカー欠落／型不正・method 欠落・読取失敗は None（バッジを出さない）。
     """
     if not md_path:
@@ -467,6 +469,30 @@ def provenance_summary(md_path) -> dict | None:
         out["legacy_backend"] = lb
     if raw.get("conflicts"):  # マージが差分を出した文書だけ
         out["has_conflicts"] = True
+    pages = _pdf_pages_summary(raw.get("notes"))
+    if pages:
+        out["pdf_pages"] = pages
+    mt = raw.get("metafile_truncated")
+    if isinstance(mt, dict) and mt:  # 図（WMF/EMF）の文字・画像を上限で落とした記録（件数のみ）
+        out["metafile_truncated"] = {k: v for k, v in mt.items() if isinstance(v, int) and not isinstance(v, bool)}
+    return out
+
+
+def _pdf_pages_summary(notes) -> dict | None:
+    """画像で読んだ PDF の notes（`vision_arm._read_pdf` の `pdf_pages_*`）から読めなかったページの要約を作る。総ページ数の記録が無ければ None。"""
+    def _int(key: str) -> int:
+        v = _note_value(notes, key)
+        return int(v) if v and v.isdigit() else 0
+
+    total = _int("pdf_pages_total")
+    if not total:
+        return None
+    out = {"total": total}
+    for key, name in (("pdf_pages_over_limit", "over_limit"), ("pdf_pages_budget_cut", "budget_cut"),
+                      ("pdf_pages_unread_count", "unread")):
+        n = _int(key)
+        if n:
+            out[name] = n
     return out
 
 
@@ -494,7 +520,7 @@ def _size_exceeded_row(rel: str, doctype: str, branch: str) -> dict:
 # `scan_report()` のフィールド追加前に保存された `worlds.last_scan_report` が持たないキーの集合。
 # `routers.worlds._ingest_summary`・`ingest.worker._sync_impl` が `scan_report_missing_fields()` 経由で共有する
 SCAN_REPORT_REQUIRED_KEYS = ("sensitive_excluded", "unreachable_as_text", "unreachable_as_text_by_ext",
-                            "unreachable_by_reason", "encoding_partial_count")
+                            "unreachable_by_reason", "encoding_partial_count", "walk_skipped")
 
 
 def scan_report_missing_fields(rep) -> bool:
@@ -509,7 +535,7 @@ def empty_scan_report() -> dict:
             "analyzer_declined": 0, "analyzer_declined_as_document": 0, "unreadable": 0,
             "sensitive_excluded": 0, "unreachable_as_text": 0, "unreachable_as_text_by_ext": {},
             "unreachable_by_reason": {}, "encoding_partial_count": 0,
-            "document_count": 0}
+            "walk_skipped": {}, "document_count": 0}
 
 
 def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> dict:
@@ -528,6 +554,7 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
     - `unreachable_as_text`＝grep／read_around／ES 索引のどれからも本文を読めないファイルの総数（`unreadable`＋`skipped_other` の未分類分＋`sensitive_excluded`）。`unreachable_as_text_by_ext`＝そのうち秘匿を除いた拡張子別内訳。
     - `unreachable_by_reason`＝`unreachable_as_text` のうち理由コードが判明しているものの内訳（`"encoding_undetermined"`／`"binary"`）。
     - `encoding_partial_count`＝対象外にはしないが置換文字が残る（`quality_of` が `"partial"`）ファイルの件数（`unreachable_as_text` には含めない）。
+    - `walk_skipped`＝木の走査で数えなかったものの件数（`scope_infer.WALK_SKIPPED_KEYS`・0 の項目は載せない）。`scanned` に含まれないので、無いのではなく「見ていない」ことを区別して伝える。
     """
     wd = worlds.world_dir(world)
     if not wd:
@@ -543,9 +570,10 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
     unreachable_by_reason: Counter = Counter()  # 理由コードが判明している分だけの内訳
     encoding_partial_count = 0  # 対象外にしない「一部が化けている」件数
     scanned = 0
+    walk_skipped: dict = {}
     # `expected_rels` 比較用（省略時は集めない）。manifest と同じ母集合にするため、下の `continue` より前で追加する
     actual_rels: set | None = set() if expected_rels is not None else None
-    for rp, rel in si.safe_files(wd):
+    for rp, rel in si.safe_files(wd, skipped=walk_skipped):
         scanned += 1
         if actual_rels is not None:
             actual_rels.add(rel)
@@ -649,6 +677,7 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
             "unreachable_as_text_by_ext": dict(unreachable_ext),
             "unreachable_by_reason": dict(unreachable_by_reason),
             "encoding_partial_count": encoding_partial_count,
+            "walk_skipped": {k: v for k, v in walk_skipped.items() if v},
             "document_count": doc_count}
 
 

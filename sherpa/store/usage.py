@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta, timezone
 
-from .. import stop_kind
+from .. import answer_shape, stop_kind
 from .db import _connect, _ensure
 
 _USAGE_AUDIT_ACTIONS = ("auth.login", "document.downloaded", "workspace.file_uploaded", "share.created")
@@ -212,7 +212,14 @@ _USAGE_TOKEN_WHERE = " AND jsonb_typeof(answer->'usage')='object' "
 # 1 ターン＝期間内の user 発言 1 件＋その最初の assistant 返答の `turn_metrics` 行。ターンはリクエストごとに 1 回だけ一時表 `usage_turns` へ組み立て、各集計はこの表だけを読む（回答 JSON には触れない）。
 # 対応付けは `turn_metrics.user_message_id` で引き、1 ターンに複数返答があれば `message_id` が最小のもの。`personal_turns` は user 発言の `messages.personal`（`turn_metrics.personal` は回答側の別物）。トークンは `turn_metrics` の値（activity 優先）で、失敗ターンの実消費も数える。
 _TURN_LIMIT_FIELDS = _USAGE_LIMIT_INT_FIELDS + _USAGE_LIMIT_BOOL_FIELDS
-_TURN_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+_TURN_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
+                      "cache_write_tokens")
+
+
+# キャッシュ書き込み量の集計は、報告のあった行だけの合計（`cache_write`・全行が不明なら None）と、不明だった行（ターン／呼び出し）の数（`cache_write_unknown`）を並べて返す。0 に丸めず、不明が混ざる集計は `cache_write_unknown > 0` で分かる。
+def _cache_write_fields(r) -> dict:
+    return {"cache_write": int(r["cache_write"]) if r["cache_write"] is not None else None,
+            "cache_write_unknown": int(r["cache_write_unknown"] or 0)}
 
 
 # `usage_turns` から終了理由（`stop_kind.STOP_KINDS` の閉じた語彙）の分布を引く SQL。返答が存在するターン（`message_id IS NOT NULL`）のうち、確認カード（`lens='clarify'`）と利用者停止（`stopped_turns` 側で数える）を除き、語彙外・NULL は 'unknown' へ畳み込む。
@@ -222,6 +229,16 @@ _STOP_KINDS_SQL = (
     "WHERE message_id IS NOT NULL "
     "  AND lens IS DISTINCT FROM 'clarify' "
     "  AND stop_kind IS DISTINCT FROM 'stopped_by_user' "
+    "GROUP BY 1 ORDER BY n DESC"
+)
+
+
+# `usage_turns` から回答の完了状態（`answer_shape.COMPLETIONS`）の分布を引く SQL。母集団は `_STOP_KINDS_SQL` と同じ（返答があり確認カードでないターン）だが、利用者停止も `stopped` として数える。語彙外・NULL（旧形式の行）は 'unknown'。
+_COMPLETIONS_SQL = (
+    "SELECT CASE WHEN completion = ANY(%s) THEN completion ELSE 'unknown' END AS completion, COUNT(*) AS n "
+    "FROM usage_turns "
+    "WHERE message_id IS NOT NULL "
+    "  AND lens IS DISTINCT FROM 'clarify' "
     "GROUP BY 1 ORDER BY n DESC"
 )
 
@@ -238,7 +255,7 @@ def _build_usage_turns(c, start_ts, end_exclusive_ts, *, uid: str | None = None,
     """
     c.execute("DROP TABLE IF EXISTS pg_temp.usage_turns")
     cols = ", ".join(
-        f"tm.{f}" for f in ("message_id", "lens", "provider", "model", "depth_profile", "stop_kind",
+        f"tm.{f}" for f in ("message_id", "lens", "provider", "model", "depth_profile", "stop_kind", "completion",
                             "duration_ms", "sources_count", "claims_unknown_reasons",
                             "gate_missing_codes") + _TURN_TOKEN_FIELDS + _TURN_LIMIT_FIELDS)
     if with_next:
@@ -275,6 +292,8 @@ def _build_usage_turns(c, start_ts, end_exclusive_ts, *, uid: str | None = None,
 def _turn_token_sum_cols() -> str:
     return ("COUNT(*) AS turns, "
             "SUM(input_tokens) AS input, SUM(cached_input_tokens) AS cached_input, "
+            "SUM(cache_write_tokens) AS cache_write, "
+            "COUNT(*) FILTER (WHERE cache_write_tokens IS NULL) AS cache_write_unknown, "
             "SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output")
 
 
@@ -570,6 +589,7 @@ def _round_reason_codes(rounds_stats: dict, final_reasons: list[dict]) -> dict:
 # `usage_ev` を（用途 kind・経路・モデル・利用者・会話）で束ねた行から、`keys` 単位の合計を取る列。全 NULL の合計（報告不能のみのグループ）は None のまま保つ（0 に丸めない）。平均所要時間は計測のあった呼び出し（`elapsed_n`）あたり。
 _EV_KIND_COLS = (
     "{keys}, SUM(calls) AS calls, SUM(input) AS input, SUM(cached_input) AS cached_input, "
+    "SUM(cache_write) AS cache_write, SUM(cache_write_unknown) AS cache_write_unknown, "
     "SUM(output) AS output, SUM(reasoning_output) AS reasoning_output, "
     "SUM(elapsed_ms_total) AS elapsed_ms_total, "
     "SUM(elapsed_ms_total) / NULLIF(SUM(elapsed_n), 0) AS elapsed_ms_avg, "
@@ -585,6 +605,8 @@ def _build_usage_events(c, start_ts, end_exclusive_ts, *, conv_only: bool = Fals
         "CREATE TEMP TABLE usage_ev ON COMMIT DROP AS "
         "SELECT user_id, conversation_id, kind, provider, model, SUM(calls) AS calls, "
         "  SUM(input_tokens) AS input, SUM(cached_input_tokens) AS cached_input, "
+        "  SUM(cache_write_tokens) AS cache_write, "
+        "  COALESCE(SUM(calls) FILTER (WHERE cache_write_tokens IS NULL), 0) AS cache_write_unknown, "
         "  SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output, "
         "  SUM(elapsed_ms) AS elapsed_ms_total, COUNT(elapsed_ms) AS elapsed_n "
         "FROM usage_events WHERE ts >= %s AND ts < %s AND kind <> 'chat-round'" + conv_filter + " "
@@ -649,6 +671,9 @@ def _build_usage_conversations(c) -> None:
         "  COUNT(*) AS user_turns, "
         "  COUNT(*) FILTER (WHERE input_tokens IS NOT NULL) AS chat_calls, "
         "  SUM(input_tokens) AS chat_input, SUM(cached_input_tokens) AS chat_cached_input, "
+        "  SUM(cache_write_tokens) AS chat_cache_write, "
+        "  COUNT(*) FILTER (WHERE input_tokens IS NOT NULL AND cache_write_tokens IS NULL) "
+        "    AS chat_cache_write_unknown, "
         "  SUM(output_tokens) AS chat_output, SUM(reasoning_output_tokens) AS chat_reasoning_output, "
         "  AVG(duration_ms) FILTER (WHERE lens IS DISTINCT FROM 'clarify') AS avg_response_time_ms "
         "FROM usage_turns GROUP BY conversation_id, user_id, version, codex_session_id"
@@ -685,6 +710,7 @@ def _kind_row(r) -> dict:
         "kind": r["kind"], "calls": int(r["calls"] or 0),
         "input": int(r["input"]) if r["input"] is not None else None,
         "cached_input": int(r["cached_input"]) if r["cached_input"] is not None else None,
+        **_cache_write_fields(r),
         "output": int(r["output"]) if r["output"] is not None else None,
         "reasoning_output": int(r["reasoning_output"]) if r["reasoning_output"] is not None else None,
         "elapsed_ms_total": int(r["elapsed_ms_total"]) if r["elapsed_ms_total"] is not None else None,
@@ -722,6 +748,8 @@ def _conversations_top_from_sql(c, *, sort: str = "tokens", limit: int = 20) -> 
             kinds.append({
                 "kind": "chat", "calls": int(r["chat_calls"]),
                 "input": int(r["chat_input"] or 0), "cached_input": int(r["chat_cached_input"] or 0),
+                **_cache_write_fields({"cache_write": r["chat_cache_write"],
+                                       "cache_write_unknown": r["chat_cache_write_unknown"]}),
                 "output": int(r["chat_output"] or 0), "reasoning_output": int(r["chat_reasoning_output"] or 0),
                 "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0,
             })
@@ -754,6 +782,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     - response_time: 全体（`overall`）と経路別（`by_provider`）の `turn_metrics.duration_ms` の avg/median/p90/max/件数（0件なら None・n=0）。確認カードと所要時間が無い行（実行中のターン・停止の終端が無いまま終わったターン）は除く。停止の終端を保存したターンは含む。
     - conversations_top: 期間内に user ターンがある会話について、会話 id・uid・world・user ターン数・用途別内訳（`kinds`）・回答時間の平均を、トークン合計の降順で上位20件（選択は SQL の `_conversations_top_from_sql`・タイトル・本文は含まない）。
     - stop_kinds: `turn_metrics.stop_kind`（`sherpa/stop_kind.py` の閉じた8値）の分布。返答が存在するターン（`message_id IS NOT NULL`）のみで、利用者の明示停止と確認カードは除き、語彙外・NULL は 'unknown' に畳む。
+    - completions: `turn_metrics.completion`（complete/partial/stopped/failed）の分布。母集団は stop_kinds と同じ（返答があり確認カードでないターン）で、利用者停止も `stopped` に入る。旧形式の行・語彙外は 'unknown'。
     - stopped_turns: 利用者の明示停止（`chat.turn` 監査の `detail.stopped=true`）の件数。境界は `turns`/`stop_kinds` と同じ `turn_created_at`（`_stopped_turns_sql`）。
     期間の基準時刻は指標ごとに違う:
     - ターン由来の集計: user 発言の `turn_created_at`。
@@ -812,6 +841,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         ).fetchall()
         # 終了理由（`usage_turns.stop_kind`・`stop_kind.py` の8値）の分布。`usage_turns` 経由にして `turns`/`stopped_turns` と同じ `turn_created_at` 境界を使う。`answer IS NOT NULL` で assistant 返答が存在するターンだけに絞り（停止・実行中のターンが 'unknown' に混入して `stopped_turns` と二重計上になるのを避ける）、`stopped_by_user` は除く。allowlist（`stop_kind.STOP_KINDS`）外の値は 'unknown' へ畳み込み、確認カード（lens='clarify'）は母数から外す。
         stop_kind_rows = c.execute(_STOP_KINDS_SQL, (list(stop_kind.STOP_KINDS),)).fetchall()
+        completion_rows = c.execute(_COMPLETIONS_SQL, (list(answer_shape.COMPLETIONS),)).fetchall()
         # limits（「打ち切りの内訳」・経路別）: `stop_kind_rows` から `stopped_by_user` の除外だけを外した母集団（停止ターンで当たった制限も残す）に、`answer->'usage'->>'provider'` 別の集計を足す。
         limits_rows = c.execute(
             "SELECT COALESCE(provider, 'unknown') AS provider, "
@@ -949,6 +979,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     # 終了理由の分布＋利用者停止の件数。
     stop_kinds = [{"stop_kind": r["stop_kind"], "turns": r["n"] or 0} for r in stop_kind_rows]
     stopped_turns = (stopped_turns_row["n"] or 0) if stopped_turns_row else 0
+    completions = [{"completion": r["completion"], "turns": r["n"] or 0} for r in completion_rows]
 
     # limits（「打ち切りの内訳」・経路別・行=provider の list）。`*_turns`＝回数系は1回以上・bool系は真だったターン数、`*_total`＝回数系の合計回数。
     by_provider_limits = [_usage_limits_provider_row(r) for r in limits_rows]
@@ -967,26 +998,30 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     # トークン使用量（provider/model 別・上位ユーザー別・日別）。金額換算はしない。
     token_by_model = [{"provider": r["provider"] or "unknown", "model": r["model"] or "",
                        "turns": r["turns"] or 0, "input": int(r["input"] or 0),
-                       "cached_input": int(r["cached_input"] or 0), "output": int(r["output"] or 0),
+                       "cached_input": int(r["cached_input"] or 0), **_cache_write_fields(r),
+                       "output": int(r["output"] or 0),
                        "reasoning_output": int(r["reasoning_output"] or 0)}
                       for r in token_model_rows]
     token_by_user = [{"uid": r["uid"], "display_name": display_names.get(r["uid"]) or r["uid"],
                       "turns": r["turns"] or 0, "input": int(r["input"] or 0),
-                      "cached_input": int(r["cached_input"] or 0), "output": int(r["output"] or 0),
+                      "cached_input": int(r["cached_input"] or 0), **_cache_write_fields(r),
+                      "output": int(r["output"] or 0),
                       "reasoning_output": int(r["reasoning_output"] or 0)}
                      for r in token_user_rows]
     token_daily = [{"date": str(r["date"]), "input": int(r["input"] or 0), "output": int(r["output"] or 0)}
                    for r in token_daily_rows]
     # 用途別（kind）内訳。chat 行は token_by_model から合成し、usage_events 由来の行と結合する。usage_events 側の全 NULL 合計はそのまま None（0 に丸めない）。chat 行は elapsed_ms を持たないため elapsed_n=0・total/avg は None。
     token_by_kind = [{"kind": "chat", "provider": m["provider"], "model": m["model"], "calls": m["turns"],
-                      "input": m["input"], "cached_input": m["cached_input"], "output": m["output"],
-                      "reasoning_output": m["reasoning_output"],
+                      "input": m["input"], "cached_input": m["cached_input"],
+                      "cache_write": m["cache_write"], "cache_write_unknown": m["cache_write_unknown"],
+                      "output": m["output"], "reasoning_output": m["reasoning_output"],
                       "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0}
                      for m in token_by_model]
     token_by_kind += [{"kind": r["kind"], "provider": r["provider"] or "unknown", "model": r["model"] or "",
                        "calls": int(r["calls"] or 0),
                        "input": int(r["input"]) if r["input"] is not None else None,
                        "cached_input": int(r["cached_input"]) if r["cached_input"] is not None else None,
+                       **_cache_write_fields(r),
                        "output": int(r["output"]) if r["output"] is not None else None,
                        "reasoning_output": (int(r["reasoning_output"]) if r["reasoning_output"] is not None
                                             else None),
@@ -999,7 +1034,8 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     # ユーザー別×用途別（kind）内訳。chat 行は token_by_user と同じ材料から kind='chat' として合流し、それ以外は usage_event_user_kind_rows 由来（user_id が NULL の行は含まない）。
     token_by_user_kind = [{"uid": r["uid"], "display_name": display_names.get(r["uid"]) or r["uid"],
                           "kind": "chat", "calls": r["turns"] or 0, "input": int(r["input"] or 0),
-                          "cached_input": int(r["cached_input"] or 0), "output": int(r["output"] or 0),
+                          "cached_input": int(r["cached_input"] or 0), **_cache_write_fields(r),
+                          "output": int(r["output"] or 0),
                           "reasoning_output": int(r["reasoning_output"] or 0),
                           "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0}
                          for r in token_user_rows]
@@ -1007,6 +1043,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
                            "kind": r["kind"], "calls": int(r["calls"] or 0),
                            "input": int(r["input"]) if r["input"] is not None else None,
                            "cached_input": int(r["cached_input"]) if r["cached_input"] is not None else None,
+                           **_cache_write_fields(r),
                            "output": int(r["output"]) if r["output"] is not None else None,
                            "reasoning_output": (int(r["reasoning_output"]) if r["reasoning_output"] is not None
                                                 else None),
@@ -1022,6 +1059,9 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
             "turns": sum(r["turns"] for r in token_by_model),
             "input": sum(r["input"] for r in token_by_model),
             "cached_input": sum(r["cached_input"] for r in token_by_model),
+            "cache_write": (sum(r["cache_write"] or 0 for r in token_by_model)
+                            if any(r["cache_write"] is not None for r in token_by_model) else None),
+            "cache_write_unknown": sum(r["cache_write_unknown"] for r in token_by_model),
             "output": sum(r["output"] for r in token_by_model),
             "reasoning_output": sum(r["reasoning_output"] for r in token_by_model),
         },
@@ -1041,7 +1081,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         "zero_hit": zero_hit, "worlds": worlds_usage, "providers": providers_usage,
         "heatmap": heatmap, "retention": retention, "downloads": downloads, "tokens": tokens,
         "conversation_turns": conversation_turns, "resume_rate": resume_rate,
-        "stop_kinds": stop_kinds, "stopped_turns": stopped_turns,
+        "stop_kinds": stop_kinds, "stopped_turns": stopped_turns, "completions": completions,
         "response_time": response_time, "limits": limits_stats,
         "conversations_top": conversations_top,
         "rounds": rounds_stats,
@@ -1087,8 +1127,8 @@ def usage_export_aux_calls(days: int = 30, *, time_from: str | None = None,
     start_ts, end_exclusive_ts, _period = _usage_period(days, time_from=time_from, time_to=time_to)
     with _connect() as c:
         rows = c.execute(
-            "SELECT ts, kind, provider, model, input_tokens, cached_input_tokens, output_tokens, "
-            "  reasoning_output_tokens, calls, elapsed_ms, user_id AS uid, conversation_id "
+            "SELECT ts, kind, provider, model, input_tokens, cached_input_tokens, cache_write_tokens, "
+            "  output_tokens, reasoning_output_tokens, calls, elapsed_ms, user_id AS uid, conversation_id "
             "FROM usage_events WHERE ts >= %s AND ts < %s ORDER BY ts",
             (start_ts, end_exclusive_ts),
         ).fetchall()

@@ -59,7 +59,11 @@ def _pick_project_a(page):
     ({"last_run_status": "failed", "last_run_warnings": ["unreadable_code_file"],
       "last_run_blocked": [{"doc": "PROG.cbl", "reason": "unreadable_code_file"}]},
      ["取り込みを止めました", "PROG.cbl", "読み取れませんでした"]),
-], ids=["failed_and_generic_office_md", "analyzer_declined", "unreachable_breakdown", "unreadable_code_blocked"])
+    ({"ingest_notices": [{"code": "walk_unreadable_dir", "count": 2}, {"code": "graph_source_oversize", "count": 1},
+                         {"code": "es_analyzer_fallback", "count": 1}]},
+     ["2 件のフォルダを開けず", "1 件のソースは大きすぎて関係グラフに載せていません", "標準の解析器で全文検索を作りました"]),
+], ids=["failed_and_generic_office_md", "analyzer_declined", "unreachable_breakdown", "unreadable_code_blocked",
+        "silent_drops_noticed"])
 def test_status_summary_shows_run_failures_and_breakdowns(page, web_base_url, status, texts):
     """状況欄: 前回の失敗・汎用 office_md warning・アナライザ不採用の内訳・読めず対象外の理由別内訳・
     不可読コードによる停止（対象ファイル名付き）を平文で出す。"""
@@ -94,6 +98,13 @@ def test_document_list_shows_unreadable_and_unknown_as_distinct_from_ready(page,
     expect(row).to_be_visible()
     if doc["state"] == "unreadable":
         expect(row.locator('button[data-rerun="PROG.cbl"]')).to_be_visible()
+
+
+def test_scanned_pdf_with_unread_pages_shows_warning_badge(page, web_base_url):
+    """画像で読んだ PDF のうち読めていないページがある文書にだけ、未読の注意バッジを出す。"""
+    doc = _doc(SCAN_PDF, provenance={"method": "vision", "pdf_pages": {"total": 25, "over_limit": 5, "unread": 1}})
+    _open(page, web_base_url, preview={**PREVIEW, "documents": [doc]})
+    expect(page.locator("#rows tr", has_text="スキャン図面.pdf")).to_contain_text("全 25 ページのうち一部は未読")
 
 
 def test_ingest_new_redirects_to_merged_page(page, web_base_url):

@@ -31,6 +31,58 @@ def test_usage_from_openai_chat_full_and_broken():
     assert metering.usage_from_openai_chat({"usage": "not-a-dict"}) is None
 
 
+def test_usage_from_openai_chat_cache_write_only_when_reported():
+    reported = {"usage": {"prompt_tokens": 100, "completion_tokens": 20,
+                          "prompt_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 40}}}
+    assert metering.usage_from_openai_chat(reported)["cache_write_tokens"] == 40
+    zero = {"usage": {"prompt_tokens": 1, "prompt_tokens_details": {"cache_write_tokens": 0}}}
+    assert metering.usage_from_openai_chat(zero)["cache_write_tokens"] == 0   # 0 と報告された値は 0
+    unreported = {"usage": {"prompt_tokens": 1, "prompt_tokens_details": {"cached_tokens": 1}}}
+    assert "cache_write_tokens" not in metering.usage_from_openai_chat(unreported)   # 不明（推定で埋めない）
+
+
+def test_acc_cache_write_unknown_is_sticky_and_record_passes_null(monkeypatch):
+    """1 回でも書き込み量が不明な呼び出しを含む合算は不明のまま・record は NULL で渡す。"""
+    from sherpa.store import usage_events as ue
+
+    monkeypatch.setattr(metering, "record", _real_record)
+    got = []
+    monkeypatch.setattr(ue, "add_usage_event", lambda **kw: got.append(kw))
+    metering.acc_begin()
+    metering.acc_add({"input_tokens": 5, "cache_write_tokens": 7})
+    metering.acc_add({"input_tokens": 5})
+    mixed, _ = metering.acc_end()
+    assert "cache_write_tokens" not in mixed
+    metering.acc_begin()
+    metering.acc_add({"input_tokens": 5, "cache_write_tokens": 7})
+    metering.acc_add({"input_tokens": 5, "cache_write_tokens": 3})
+    known, _ = metering.acc_end()
+    assert known["cache_write_tokens"] == 10
+    metering.record("intent", "openai", "m", mixed)
+    metering.record("intent", "openai", "m", known)
+    assert [c["cache_write_tokens"] for c in got] == [None, 10]
+
+
+def test_usage_from_openai_chat_reads_input_tokens_details_cache_write():
+    resp = {"usage": {"prompt_tokens": 100, "completion_tokens": 20,
+                      "input_tokens_details": {"cache_write_tokens": 7}}}
+    assert metering.usage_from_openai_chat(resp)["cache_write_tokens"] == 7
+    acc = {"cache_write_tokens": 0, "input_tokens": 0, "cached_input_tokens": 0,
+           "output_tokens": 0, "reasoning_output_tokens": 0}
+    from sherpa import agentic_search
+    agentic_search._acc_openai_usage(acc, resp, False)
+    assert acc["cache_write_tokens"] == 7
+
+
+def test_acc_known_then_unknown_call_makes_cache_write_unknown():
+    for unknown_step in (lambda: metering.acc_add(None), lambda: metering.acc_merge({"input_tokens": 1}, 1)):
+        metering.acc_begin()
+        metering.acc_add({"input_tokens": 5, "cache_write_tokens": 7})
+        unknown_step()
+        tokens, _ = metering.acc_end()
+        assert "cache_write_tokens" not in tokens
+
+
 def test_usage_from_ollama_chat_full_and_broken():
     resp = {"message": {"content": "答え"}, "prompt_eval_count": 80, "eval_count": 12}
     assert metering.usage_from_ollama_chat(resp) == {

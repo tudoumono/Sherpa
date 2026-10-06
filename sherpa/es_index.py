@@ -350,12 +350,19 @@ def reconcile(valid_worlds) -> list:
     return deleted
 
 
+# 直近の `ensure_index()` が実際に作った索引のアナライザ（資料フォルダ ID → "kuromoji"／"standard"）。`index_world()` が取り出して
+# 標準への退避を結果へ載せる（`ensure_index()` の戻り値は bool のまま）。既存索引だった場合は入れない。
+_created_analyzer: dict[str, str] = {}
+
+
 def ensure_index(world: str, dim=None, emeta=None) -> bool:
-    """index を作成する（既存なら True）。アナライザ不明（400）は standard で再試行する。`dim`／`emeta` で kNN 用。"""
+    """index を作成する（既存なら True）。アナライザ不明（400）は standard で再試行する（作ったアナライザは `_created_analyzer`）。`dim`／`emeta` で kNN 用。"""
     idx = "/" + _index(world)
+    _created_analyzer.pop(world, None)
     for analyzer in ("kuromoji", "standard"):
         try:
             _req("PUT", idx, _mapping(dim, analyzer, emeta))
+            _created_analyzer[world] = analyzer
             return True
         except urllib.error.HTTPError as e:
             try:
@@ -843,7 +850,7 @@ def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts:
     rag_chunks 経路は yield を始める前に `_rag_chunks_validate()` で jsonl 全体を検証し終える。失敗なら 1 件も yield せず legacy 40 行チャンクへ縮退する（doc 単位の原子性）。検証成功後にファイルを開き直して `_iter_rag_chunk_entries` で yield する。
     `res_map`（省略可）: `importance.resolve_for_world()` の結果。あれば `importance`／`importance_reason` を全チャンクの body へ条件付きで焼き込む。
     返値 `(chunk_iter, degraded_entry)`。
-    - `chunk_iter`＝None: この文書はスキップ（unreadable／テキスト抽出失敗／本文が空白のみ）。
+    - `chunk_iter`＝None: この文書はスキップ（unreadable／本文の読み取り失敗＝reason="text_read_failed"／本文が空白のみ＝reason="empty_text"）。
     - `chunk_iter`＝`(id, body, text, no_embed)` を yield するジェネレータ（0 件もありうる）。
     - `degraded_entry`＝None または {"doc": rel, "reason": ...}（rag_chunks はあるが使えなかった場合のみ。yield を始める前に確定する）。
     """
@@ -887,7 +894,8 @@ def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts:
                 # 検証成功で 0 件チャンク（正しく空）の場合は degraded にせず legacy 縮退へ続ける
     text = doc_text.read_world_doc_text(world, d)  # ソース／テキスト、または rag_chunks の無い／無効な Office／PDF
     if text is None:
-        return None, degraded_entry
+        # 本文を読めず索引から外す文書（rag_chunks が使えなかった理由があっても、外れたことを優先して報告する）
+        return None, {"doc": rel, "reason": "text_read_failed"}
     if text.strip() == "":
         # 本文が空白のみ（空ファイル／空派生 MD）は「処理対象外」に分類する（空文書だけの資料フォルダが `index_world()` の no_chunks ガードに恒常的に該当しないように）
         return None, {"doc": rel, "reason": "empty_text"}
@@ -981,7 +989,8 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     """資料フォルダをクリーン再索引する（delete→create→bulk）。埋め込み設定があればベクトルも付与する（kNN 用）。
     - 失敗は古い索引を残さず error を返す。埋め込みを一度も選んでいない構成は BM25 のみで索引する。明示選択したクラウドの埋め込みが解決できない・実際の embed が失敗した場合は、delete の前に打ち切る（既存のベクトル付き索引を BM25 のみで黙って上書きしない）。
     - `content_sig`＝索引時のフォルダ署名（`_meta` に保存・古い索引の検知に使う）。埋め込みは内容ハッシュキャッシュ（`_embed_cached`）経由で未変更チャンクの再 embed を省く。
-    - Office／PDF（`{rel}.rag_chunks.jsonl` を持つ）はレコード単位チャンク、それ以外（ソース／テキスト、rag_chunks が無い／検証に失敗した Office／PDF）は 40 行チャンク。rag_chunks があるのに使えなかった文書と本文が空白のみの文書（reason="empty_text"）は、戻り値の `rag_degraded`（件数）・`rag_degraded_docs`（内訳）で報告する。
+    - Office／PDF（`{rel}.rag_chunks.jsonl` を持つ）はレコード単位チャンク、それ以外（ソース／テキスト、rag_chunks が無い／検証に失敗した Office／PDF）は 40 行チャンク。rag_chunks があるのに使えなかった文書と本文が空白のみの文書（reason="empty_text"）は、戻り値の `rag_degraded`（件数）・`rag_degraded_docs`（内訳）・`rag_degraded_by_reason`（理由別の件数）で報告する。本文を読めず索引から外した文書は reason="text_read_failed"。
+      埋め込みに失敗して BM25 のみで索引したときは `embed_degraded=True`、日本語アナライザを作れず標準で作り直したときは `analyzer_fallback=True`（どちらも取り込みの状態へ出す）。
     - `branch=="source"`（登録コード＋軽量テキスト枠の汎用コード）のチャンクは埋め込み対象から除く（BM25 は全チャンクに効く）。
     - bulk 送信は `_bulk_batches()` で件数・バイト数ともに有界なバッチへ分割し、`refresh=true` は最後のバッチだけに付ける。途中のバッチが失敗したら `delete_world()` して空へ戻し、error を返す（全部か無しか）。
     - 2 パス構成（メモリを資料フォルダの規模に比例させない）:
@@ -1103,6 +1112,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
                       "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID})  # 前処理アルゴリズム版（`_chunk_key` と同じ材料）
     if not ensure_index(world, dim=dim, emeta=(emeta or None)):
         return {"available": True, "indexed": 0, "chunks": 0, "error": "create_failed"}
+    analyzer_fallback = _created_analyzer.pop(world, None) == "standard"  # 日本語アナライザを作れず標準で作り直した
 
     # ---- Pass2: チャンクを 1 件ずつ受け取り、`_EMBED_FLUSH_CHUNKS` 件ごとにグループ化して bulk 送信する ----
     n_docs = 0
@@ -1154,6 +1164,14 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     rag_report = {"rag_degraded": rag_degraded}
     if rag_degraded_docs:
         rag_report["rag_degraded_docs"] = rag_degraded_docs
+        by_reason: dict = {}
+        for entry in rag_degraded_docs:
+            by_reason[entry["reason"]] = by_reason.get(entry["reason"], 0) + 1
+        rag_report["rag_degraded_by_reason"] = by_reason
+    if ec is not None and had_embed_eligible and not embed_ok:
+        rag_report["embed_degraded"] = True    # 埋め込みに失敗し、BM25 のみで索引した（クラウド未選択の構成）
+    if analyzer_fallback:
+        rag_report["analyzer_fallback"] = True
 
     if sender.failed or not sender.finish():
         # 途中バッチの失敗は資料フォルダを空へ戻す（全部か無しか）

@@ -30,6 +30,15 @@ def test_usage_from_turn_completed_parses_real_shape():
         "is_local": "cloud"}
 
 
+def test_usage_from_turn_completed_cache_write_only_when_reported():
+    base = {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 2, "reasoning_output_tokens": 0}
+    got = CUSAGE._usage_from_turn_completed(
+        {"type": "turn.completed", "usage": {**base, "cache_write_tokens": 7}}, "gpt-5.5", system_settings={})
+    assert got["cache_write_tokens"] == 7
+    none = CUSAGE._usage_from_turn_completed({"type": "turn.completed", "usage": base}, "gpt-5.5", system_settings={})
+    assert "cache_write_tokens" not in none   # 返されなければ不明（0 を書かない）
+
+
 def test_usage_from_turn_completed_codex_model_provider_drives_is_local():
     """Codex は常に provider_id="codex" を名乗るため、実際の接続先は呼び出し元が明示した
     `codex_model_provider`（"ollama"/"openai"）でしか分からない（`agent_constructs.is_local`

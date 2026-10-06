@@ -1315,7 +1315,8 @@ def test_referenced_docs_block_keeps_body_when_zero_verified(tmp_path, monkeypat
     answer = "消費税率は10%です。\n\n参照した資料:\n- 存在しない1.md\n- 存在しない2.md\n"
     _, env = _run_fake(tmp_path, monkeypatch, _PY + _msg(answer), "citation-zero-u1", make_sources=_make_sources)
     assert env["codex_referenced_docs"] == {"listed": 2, "verified": 0}
-    assert env["headline"].strip() == answer.strip()
+    assert env["body"].strip() == answer.strip()         # 本文は書き換えず、確認できなかった旨は注記に出る
+    assert [n["kind"] for n in env["notices"]] == ["sources_unverified"] and "2 件" in env["notices"][0]["text"]
     assert not env.get("sources") and "sources_verified" not in env
 
 
@@ -1482,7 +1483,7 @@ def test_read_mcp_sidecar_invalid_utf8_bytes_is_fail_open(tmp_path):
     reads, listed, ask, error_codes, limits = US._read_mcp_sidecar(path)
     assert reads == [] and listed == [] and ask is None and error_codes == []
     assert limits == {"tool_result_clipped": 0, "total_budget_hit": False, "duplicate_tool_call": 0,
-                      "search_truncated": 0, "tool_calls_exhausted": False}
+                      "search_truncated": 0, "tool_calls_exhausted": False, "coverage_write_failed": 0}
 
 
 # ===== 書込・失敗・分類 =====

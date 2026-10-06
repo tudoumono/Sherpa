@@ -67,8 +67,8 @@ def resolve(env: dict) -> str | None:
     `None` は「完了として数えない・型も特定できない」場合（`busy`・`agentic_failure="error"`）で、集計側の `unknown` になる。
     `agentic_failure="insufficient"` は `no_evidence`、`"timeout"`/`"transport_error"` はその値。
 
-    優先順位: busy → Codex 経路の印（silent のうち `limits.total_budget_hit` は budget へ格上げ→それ以外の silent→partial）
-    → honest failure の印 → `evidence_packet.stop_reason`（`is_main_task` が真のときのみ）→ 既定 `completed`。
+    優先順位: busy → 停止 → Codex 経路の印（silent のうち `limits.total_budget_hit` は budget へ格上げ→それ以外の silent→partial）
+    → honest failure の印 → `evidence_packet.stop_reason`（`is_main_task` が真のときのみ）→ 時間切れ・台帳未完了・`completion` が partial/failed → それ以外は `completed`。
     戻り値が `None` でなければ必ず `STOP_KINDS` の要素。
     """
     kind = _resolve_kind(env)
@@ -77,10 +77,33 @@ def resolve(env: dict) -> str | None:
     return kind
 
 
+def derive_completion(env: dict) -> str:
+    """回答の完了状態（`complete`/`partial`/`stopped`/`failed`）を env の事実から導く。`completion` が既にあればそれを優先する（`chat_service._finalize` が `resolve` より前に埋める）。
+
+    停止・失敗・時間切れ・台帳未完了・予算到達・根拠不足は `complete` にしない。
+    """
+    done = env.get("completion")
+    if done in ("complete", "partial", "stopped", "failed"):
+        return done
+    if env.get("stopped_by_user"):
+        return "stopped"
+    if env.get("busy") or env.get("codex_silent_failure") or env.get("agentic_failure") in (
+            "error", "timeout", "transport_error"):
+        return "failed"
+    limits = env.get("limits") or {}
+    packet = (env.get("data") or {}).get("evidence_packet") or {}
+    stop_reason = packet.get("stop_reason") if is_main_task(packet) else None
+    if (env.get("agentic_failure") == "insufficient" or env.get("codex_stopped_early")
+            or limits.get("wall_clock_hit") or limits.get("ledger_incomplete")
+            or stop_reason in _BUDGET_STOP_REASONS or stop_reason in _NO_EVIDENCE_STOP_REASONS):
+        return "partial"
+    return "complete"
+
+
 def _resolve_kind(env: dict) -> str | None:
     if env.get("busy"):
         return None
-    if env.get("stopped_by_user"):
+    if env.get("stopped_by_user") or env.get("completion") == "stopped":
         # 利用者の停止で打ち切った未完了回答は完了として数えない
         return "stopped_by_user"
     if env.get("codex_silent_failure"):
@@ -88,6 +111,12 @@ def _resolve_kind(env: dict) -> str | None:
         if (env.get("limits") or {}).get("total_budget_hit"):
             return "budget"
         return "codex_silent"
+    if "codex_multi_agent" in env:
+        limits = env.get("limits") or {}
+        if limits.get("wall_clock_hit"):
+            return "timeout"
+        if env.get("completion") in ("partial", "failed") or limits.get("ledger_incomplete"):
+            return "codex_partial"
     if env.get("codex_stopped_early"):
         return "codex_partial"
     failure = env.get("agentic_failure")
@@ -104,4 +133,10 @@ def _resolve_kind(env: dict) -> str | None:
             return "budget"
         if stop_reason in _NO_EVIDENCE_STOP_REASONS:
             return "no_evidence"
+    # 時間切れ・台帳未完了・部分回答は provider を問わず完了に数えない。
+    limits = env.get("limits") or {}
+    if limits.get("wall_clock_hit"):
+        return "timeout"
+    if env.get("completion") in ("partial", "failed") or limits.get("ledger_incomplete"):
+        return "codex_partial"
     return "completed"

@@ -1467,35 +1467,74 @@ def test_retry_hint_button_raises_depth_profile_and_resends(page, web_base_url):
     assert body.get("message") == "消費税率とは？"
 
 
+_TIMEOUT_NOTICE = "（時間の上限に達したため、ここまでの結果で打ち切りました）"
+
+
 def _resume_answer(flag):
-    return {
+    answer = {
         "lens": "qa", "headline": "次に資料を確認します。",
         "route": {"path": ["文書を検索"]}, "summary": {"total": 0},
         "scope": {"world": "w1", "scope_paths": [], "source": "explicit", "layer": "both", "layer_applied": True},
         "data": {"citations": ["doc1"]}, "sources": ["doc1"],
-        flag: True,
         "retry_hints": [{"kind": "resume", "label": "続きを調べる", "action": {"message": "続きを調べて"}}],
     }
+    text = _TIMEOUT_NOTICE if flag == "notices" else (
+        "AI が途中経過を伝えたまま調査を終えたため、途中までの結果です。「続きを調べる」を押すと続きから調べられます。")
+    answer.update(body="次に資料を確認します。", completion="partial", answer_schema=2,
+                  notices=[{"kind": "wall_clock" if flag == "notices" else flag, "text": text}],
+                  headline=text + "\n\n次に資料を確認します。")
+    if flag == "stopped_early":
+        answer["codex_stopped_early"] = True
+    return answer
 
 
-@pytest.mark.parametrize("flag, note_text", [
-    ("codex_timed_out", "調査の時間上限に達したため途中までの結果です"),
-    ("codex_stopped_early", "AI が途中経過を伝えたまま調査を終えたため、途中までの結果です"),
+@pytest.mark.parametrize("flag, note_selector, note_text", [
+    ("notices", ".answer-notice", "時間の上限に達したため"),
+    ("stopped_early", ".answer-notice", "AI が途中経過を伝えたまま調査を終えたため、途中までの結果です"),
 ])
-def test_codex_incomplete_note_and_continue_button_resends_fixed_message(page, web_base_url, flag, note_text):
+def test_codex_incomplete_note_and_continue_button_resends_fixed_message(
+        page, web_base_url, flag, note_selector, note_text):
     records = _open(page, web_base_url, stream_events=_answer_events(_resume_answer(flag)))
     _send(page, "消費税率とは？")
     expect(page.locator("#messages")).to_contain_text("次に資料を確認します。")
-    note = page.locator(".budget-note").last
+    note = page.locator(note_selector).last
     expect(note).to_be_visible()
     expect(note).to_contain_text(note_text)
+    if True:
+        # 注記は本文の上の別要素で、本文の欄には混ざらない。
+        expect(page.locator(".a-body > .answer-notices + .headline")).to_have_count(1)
+        expect(page.locator(".headline").last).not_to_contain_text("時間の上限")
 
     page.locator(".retry-hint-btn", has_text="続きを調べる").click()
-    expect(page.locator("#rt")).to_contain_text("完了")
+    expect(page.locator("#rt")).to_contain_text("途中までの回答")
     body = records["turn_starts"][-1]
     assert body.get("message") == "続きを調べて"
     assert not body.get("scope_paths")
     assert body.get("layer") is None
+
+
+@pytest.mark.parametrize("answer, expect_notice", [
+    ({"lens": "qa", "headline": "旧形式の回答です。", "sources": [], "summary": {"total": 0}}, False),
+    ({"lens": "qa", "headline": "注記の文。\n\n新形式の回答です。", "body": "新形式の回答です。", "answer_schema": 2,
+      "completion": "partial", "notices": [{"kind": "stopped", "text": "注記の文。"}],
+      "sources": [], "summary": {"total": 0}}, True),
+])
+def test_old_and_new_rows_render_and_export_with_notices(page, web_base_url, tmp_path, answer, expect_notice):
+    _open(page, web_base_url, stream_events=_answer_events(answer, conv=120))
+    _send(page, "質問です")
+    expect(page.locator("#messages")).to_contain_text("回答です。")
+    assert page.locator(".answer-notice").count() == (1 if expect_notice else 0)
+    # 書き出し（メニューの実装 exportMessages）へ保存行と同じ形を渡す。
+    with page.expect_download() as dl_info:
+        page.evaluate(
+            "async (msgs) => { const m = await import('/chat/menus.js'); m.exportMessages('t', msgs, 'txt'); }",
+            [{"role": "user", "content": "質問です"}, {"role": "assistant", "answer": answer}])
+    txt_path = tmp_path / "export.txt"
+    dl_info.value.save_as(txt_path)
+    txt = txt_path.read_text(encoding="utf-8")
+    assert answer.get("body", answer["headline"]) in txt
+    assert ("※ 注記の文。" in txt and "途中までの回答" in txt) == expect_notice
+    assert txt.count("旧形式の回答です。" if not expect_notice else "注記の文。") == 1
 
 
 def _confirm_first_resend(page, base, question, text, settings=_CODEX_SETTINGS):
@@ -1858,3 +1897,46 @@ def test_chat_ime_composition_enter_does_not_send(page, web_base_url):
     page.locator("#input").press("Enter")
     expect(page.locator("#messages")).to_contain_text("へんかんちゅう")
     assert records["turn_starts"]
+
+
+_MANY_CANDIDATES_ANSWER = {
+    "lens": "troubleshoot", "headline": "原因候補です。", "body": "原因候補です。", "answer_schema": 2,
+    "summary": {"total": 10},
+    "data": {"candidates": [{"name": f"候補{i}", "role": "原因"} for i in range(10)]},
+    "sources": [{"doc_id": "a/b.md", "download_url": "/documents/download?world=w&rel=a%2Fb.md"},
+                {"doc_id": "c/d.md"}],
+    "personal_sources": [{"doc_id": "個人メモ.txt", "quote": "あ" * 250}],
+}
+
+
+def test_trouble_candidates_show_more_count_unlinked_source_and_clipped_personal_quote(page, web_base_url):
+    _open(page, web_base_url, stream_events=_answer_events(_MANY_CANDIDATES_ANSWER))
+    _send(page, "夜間バッチが止まる")
+    expect(page.locator(".cand")).to_have_count(10)   # 折りたたみの中も含めて全件ある
+    more = page.locator("details.cand-more")
+    expect(more.locator("summary")).to_contain_text("ほか 2 件")
+    expect(more.locator(".cand")).to_have_count(2)
+    # リンクの無い出典は href を空にせず、ダウンロードできないと分かる。
+    expect(page.locator(".sources a[data-dl]")).to_have_count(1)
+    expect(page.locator(".sources")).to_contain_text("c/d.md（ダウンロードできません）")
+    snippet = page.locator(".personal-sources .src-snippet").inner_text()
+    assert snippet == "あ" * 200 + "…"
+
+
+def test_export_includes_budget_stop_and_personal_sources_but_not_when_shared(page, web_base_url, tmp_path):
+    _open(page, web_base_url, stream_events=_answer_events(_MANY_CANDIDATES_ANSWER))
+    answer = {**_MANY_CANDIDATES_ANSWER, "lens": "qa",
+              "data": {"evidence_packet": {"stop_reason": "turns_exhausted"}}}
+    msgs = [{"role": "user", "content": "質問"}, {"role": "assistant", "answer": answer}]
+    texts = []
+    for shared in (False, True):
+        with page.expect_download() as dl_info:
+            page.evaluate(
+                "async ([msgs, shared]) => { const m = await import('/chat/menus.js'); m.exportMessages('t', msgs, 'txt', shared); }",
+                [msgs, shared])
+        path = tmp_path / f"export{int(shared)}.txt"
+        dl_info.value.save_as(path)
+        texts.append(path.read_text(encoding="utf-8"))
+    own, shared_txt = texts
+    assert "調査の上限に達したため、途中までの結果で答えています" in own and "調査の上限に達したため" in shared_txt
+    assert "個人メモ.txt" in own and "個人メモ.txt" not in shared_txt

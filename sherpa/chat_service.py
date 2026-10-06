@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from . import agent_constructs, agentic_search, app_version, exec_event, intent_llm, scope, store, text_encoding, worlds
+from . import agent_constructs, agentic_search, answer_shape, app_version, exec_event, intent_llm, scope, store, text_encoding, worlds
 from . import depth_profile as depth_profile_mod
 from . import investigation_state as investigation_state_mod
 from . import layer as layer_mod
@@ -312,7 +312,7 @@ def _audit_chat_turn(uid, conversation_id, settings, *, lens, user_msg_id,
 
 
 def _is_stopped_terminal(ev) -> bool:
-    """利用者の停止で打ち切った未完了回答の `_result` か（`providers/base.py::TERMINALS`）。巡ループの停止終端だけは、追加の LLM 呼び出しをせずコードで組んだ未完了回答を保存する（監査も `stopped=True` で assistant を保存した形）。それ以外のイベントは停止後は捨てる。"""
+    """利用者の停止で打ち切った部分回答の終端を判定する。"""
     return (isinstance(ev, dict) and ev.get("type") == "_result"
             and (ev.get("env") or {}).get("_terminal") == "stopped")
 
@@ -759,6 +759,8 @@ def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=No
 
 # 出典 0 件時の案内: 「絞られている軸だけ」を範囲→探す対象の順で 1 つの案内にまとめる（既に最も緩い設定の軸は含めない）。
 _NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE = "範囲・種類を変えても見つかりませんでした（確証なし）。"
+# Codex 構成では本文を捨てず、出典が無いことだけを冒頭に前置する。
+_CODEX_NO_SOURCES_NOTICE = "確認できた出典はありません（内容は未確認です）。"
 
 
 def _no_genuine_results(env: dict) -> bool:
@@ -846,8 +848,7 @@ def _apply_graph_degraded(env: dict) -> None:
     notice = agentic_search.graph_degraded_notice(code)
     if not notice:
         return
-    head = (env.get("headline") or "").strip()
-    env["headline"] = f"{notice}\n\n{head}" if head else notice
+    answer_shape.add_notice(env, "graph_degraded", notice)
     field = _GRAPH_DEGRADED_LIMIT_FIELD.get(code)
     if field:
         env["limits"] = {**(env.get("limits") or {}), field: True}
@@ -859,6 +860,7 @@ def _finalize(env, decision, message: str = ""):
     env["route"] = {"lens": decision["lens"], "reason": decision["reason"],
                     "path": _ROUTE_PATH.get(decision["lens"], [])}
     # 終了理由を閉じた語彙（8 値）へ正規化して `messages.answer.stop_kind` に残す（`stop_kind_mod.resolve`）。`resolve` が None（busy／型を特定できない honest failure）のときは立てず、集計側の `unknown` に落とす。
+    env["completion"] = stop_kind_mod.derive_completion(env)
     _stop_kind = stop_kind_mod.resolve(env)
     if _stop_kind is not None:
         env["stop_kind"] = _stop_kind
@@ -877,14 +879,19 @@ def _finalize(env, decision, message: str = ""):
         elif (decision["lens"] in ("qa", "author") and not _is_budget_exhausted(env)
               and not _codex_stopped_early):
             # 全軸が既に最も緩い設定（全体・資料＋コード・最大）でなお 0 件のとき、これ以上緩める軸が無いため案内を出す。予算到達・Codex の作業宣言止まりの途中結果、および impact/troubleshoot（headline が十分具体的）は上書きしない。
-            env["headline"] = _NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
+            _head = answer_shape.body_of(env).strip()
+            if _head:
+                # 本文があるときは provider を問わず置き換えず、出典なしの注記だけを足す。
+                answer_shape.add_notice(env, "no_sources", _CODEX_NO_SOURCES_NOTICE)
+            else:
+                answer_shape.set_body(env, _NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE)
     # 縮退の告知は 0 件案内（headline の全置換）より後で前置する（先に付けると置換で消える）。
     _apply_graph_degraded(env)
     if _codex_stopped_early:
         # 「続きから調べ直せる」案内は、出典 0 件時の案内と同じボタン機構（retry_hints・data-retry-kind）に載せ、0 件案内とは独立に常に追加する。クリック時は kind="resume" 専用分岐（`web/chat.js`）が固定文言を送り、`codex_session_id` の継続に委ねる。
         env.setdefault("retry_hints", []).append(
             {"kind": "resume", "label": "続きを調べる", "action": {"message": "続きを調べて"}})
-    return env
+    return answer_shape.seal(env)
 
 
 def _finalize_activity_phases(answer: dict, duration_ms: int) -> None:
@@ -934,12 +941,17 @@ def _mark_investigation_recorded(env: dict, investigation_record: dict | None) -
         env["investigation"]["recorded"] = True
 
 
-def _save_investigation_record(investigation_record: dict | None, message_id, conversation_id) -> None:
+_INVESTIGATION_RECORD_SAVE_FAILED_NOTICE = ("調査の記録を保存できませんでした（回答は保存しています）。"
+                                            "調査の記録のダウンロードは使えません。")
+
+
+def _save_investigation_record(investigation_record: dict | None, message_id, conversation_id) -> dict | None:
     """`investigation_record` を `investigation_records` 表へ保存する。assistant message を保存した直後（`message_id` が実在する状態）に呼ぶこと（`message_id` は `messages(id)` への FK）。
-    保存に失敗しても fail-open（警告ログのみ）で、先に立てた `recorded` 印は訂正しない（回答の保存を失敗させない契約を優先）。`None` は何もしない。
+    保存に失敗しても回答の保存は失敗させない（警告ログ）。失敗は回答の注記に残し、調査の記録のダウンロード導線を外す（`store.append_answer_notice`）。
+    戻り値は、注記を足して更新した assistant 行（失敗しなかった・`None` のときは `None`）。呼び出し側は配信する行をこれで差し替える。
     """
     if investigation_record is None:
-        return
+        return None
     try:
         store_investigation.save_investigation_record(
             message_id, conversation_id,
@@ -947,9 +959,18 @@ def _save_investigation_record(investigation_record: dict | None, message_id, co
             manifest=investigation_record.get("manifest"),
             items=investigation_record.get("items") or {},
             coverage=investigation_record.get("coverage") or {},
-            reviews=investigation_record.get("reviews") or [])
+            reviews=investigation_record.get("reviews") or [],
+            coverage_detail=investigation_record.get("coverage_detail") or {},
+            extras=investigation_record.get("extras") or {})
+        return None
     except Exception as e:
-        _log.warning("investigation record save failed (fail-open): %s", e)
+        _log.warning("investigation record save failed: %s", e)
+    try:
+        return store.append_answer_notice(message_id, "investigation_record_failed",
+                                          _INVESTIGATION_RECORD_SAVE_FAILED_NOTICE, unrecorded=True)
+    except Exception as e:
+        _log.warning("investigation record failure notice save failed: %s", e)
+        return None
 
 
 # 影響分析の Neo4j 安全弁（timeout＋緊急天井）に当たったときは fail-loud（偽陰性防止）: `_dispatch` の impact 分岐が `GraphQueryOverloadError` を送出したら、LLM 合成を経由させず固定文言の `_result` に差し替える。この例外は impact 以外では発生しない。
@@ -1001,11 +1022,18 @@ def _clip_history_msg(text: str) -> str:
     return t[:_HISTORY_MSG_CHARS] + "…（省略）"
 
 
+class _HistoryList(list):
+    """`_history_pairs` の戻り値。`note`＝履歴を減らした・読めなかったことの一言（Codex への文脈に添える・空なら無し）。"""
+
+    note: str = ""
+
+
 def _history_pairs(conversation_id) -> list[dict]:
     """直近ターンの (user, assistant) 完全対を `Ctx.history` 形式で返す。
     会話は交互とは限らない（途中停止・clarify・crash 補填）ため、user 行の直後（id 順）が assistant 行のときだけ対として採用し、不対行は捨てる。
     二重キャップ: 直近 `_HISTORY_TURNS` 対＋`_HISTORY_CHAR_BUDGET`（新しい対から積み、超える対は捨てる）。メッセージ単体も `_HISTORY_MSG_CHARS` で切る。
     呼び出しは `store.add_message(現在の user)` より前（in-flight の質問を履歴に含めない）。conversation_id が None・`_HISTORY_TURNS <= 0`・読み取り失敗は `[]`（fail-open）。
+    対数・文字予算で古い対を落としたとき、読み取りに失敗したときは、戻り値の `note` にその一言を持たせる。
     """
     if conversation_id is None or _HISTORY_TURNS <= 0:
         return []
@@ -1025,6 +1053,8 @@ def _history_pairs(conversation_id) -> list[dict]:
             if len(pairs) >= _HISTORY_TURNS or len(rows) < limit or limit >= 512:
                 break
             limit = min(512, limit * 4)
+        found_pairs = len(pairs)
+        window_full = len(rows) >= limit  # 取得窓が満杯＝窓より古いやり取りが残っている
         pairs = pairs[-_HISTORY_TURNS:]  # 直近 N 対（対数キャップ）
         kept = []
         budget = _HISTORY_CHAR_BUDGET
@@ -1035,14 +1065,23 @@ def _history_pairs(conversation_id) -> list[dict]:
                 break
             budget -= cost
             kept.append((u_txt, a_txt))
-        out: list[dict] = []
+        out = _HistoryList()
         for u_txt, a_txt in reversed(kept):  # 時系列順（古→新）に戻す
             out.append({"role": "user", "content": u_txt})
             out.append({"role": "assistant", "content": a_txt})
+        dropped = found_pairs - len(kept)
+        note = ""
+        if dropped > 0:
+            note = f"（これより前のやり取り{dropped}対は、長さの上限のため以下に含めていません）"
+        if window_full:
+            note += "（さらに古いやり取りが残っている可能性がありますが、読み取りの上限のため読んでいません）"
+        out.note = note
         return out
     except Exception as e:
         _log.warning("history priming failed (degrade to no-history, turn continues): %s", e)
-        return []
+        failed = _HistoryList()
+        failed.note = "（会話履歴を読み取れなかったため、前のやり取りは含めていません）"
+        return failed
 
 
 def _ensure_conversation(conversation_id, message, world, user_id):
@@ -1207,7 +1246,7 @@ def stream_message(session, message, world="v1",
                    knowledge=False, personal=False, users_dir="data/users", stop_event=None,
                    on_user_saved=None, web_search=False, depth_profile=None, tools=None,
                    tools_explicit=None, tools_availability=None, provider=None, settings=None,
-                   sys_settings=None):
+                   sys_settings=None, recovered_result=None):
     """思考イベントを逐次 yield する（SSE）。頭脳は provider（差し替え可能）で、UI/プロトコルは不変。
     provider が `node`（動的に何個でも）を流し、最後に内部 `_result` を返す。本関数は会話の用意・永続だけを担い、`_result` を `answer` イベントに変換して返す。
     - `knowledge=False`（既定）: 検索せず素の会話（資料参照オフ）。`True` で社内資料を参照する（レンズ＋出典）。
@@ -1275,6 +1314,7 @@ def stream_message(session, message, world="v1",
         uid=user_id,
         # agentic/plain 経路にも個人ヒットを伝搬する。
         personal_facts=_personal_facts(personal_hits, message) if personal_hits else "",
+        personal=bool(personal),
         stop_event=stop_event,
         # 直前ターンの (user, assistant) 対（message には混ぜない・別チャネル）。conversation_id/codex_session_id は CodexProvider の resume 判定に使う。
         history=history, conversation_id=conversation_id, codex_session_id=codex_session_id,
@@ -1292,11 +1332,21 @@ def stream_message(session, message, world="v1",
     _provider = provider if provider is not None else get_provider(settings, system_settings=sys_settings)
     for ev in _degrade_overload(_provider.run(ctx), message, world, scope_meta):
         if stop_event is not None and stop_event.is_set() and not _is_stopped_terminal(ev):
-            # provider が停止要求を受けて何らかのイベント（`_result` 含む）を返してきても保存しない（assistant は永続しない）。例外は巡ループの停止終端（`_is_stopped_terminal`）で、未完了回答を保存する。停止終端は途中のイベントの後に続くため、捨てながら受け取り続け、終端が来なければループを抜けた後に停止監査・停止応答を 1 回だけ返す。
-            _stopped_pending = True
-            continue
+            if ev.get("type") == "_result" and "codex_multi_agent" in ev["env"]:
+                ev["env"].update(_terminal="stopped", stopped_by_user=True, completion="stopped")
+                answer_shape.add_notice(ev["env"], "stopped", answer_shape.STOPPED_NOTICE)
+            else:
+                # 停止後は停止の終端までイベントを受け取り続ける。
+                _stopped_pending = True
+                continue
         if ev["type"] == "_result":
             _stopped_pending = False
+            if recovered_result is not None and "codex_multi_agent" in ev["env"]:
+                recovered_result.update(
+                    result=ev, trace=trace_nodes,
+                    personal=bool(personal or personal_hits or ev["env"].get("_personal_rounds")
+                                  or ev["env"].get("wrote_files") or ev["env"].get("codex_wrote_files")),
+                    stopped=ev["env"].get("_terminal") == "stopped")
             env = _finalize(ev["env"], ev["decision"], message)
             # `_result` のサイドカーを trace へ折り込む（孤児イベント防止・永続化後にライブ配信もする）。
             _ev_committed_node = _pop_evidence_committed(env, trace_nodes)
@@ -1347,7 +1397,13 @@ def stream_message(session, message, world="v1",
                                     lens=ev["decision"]["lens"], route=env["route"], answer=env,
                                     trace=_cap_trace_v2(trace_nodes),
                                     personal=_used_personal)
-            _save_investigation_record(_investigation_record, msg["id"], conversation_id)
+            if recovered_result is not None and recovered_result.get("result") is ev:
+                recovered_result["saved_message"] = msg
+            _noted = _save_investigation_record(_investigation_record, msg["id"], conversation_id)
+            if _noted is not None:
+                msg = _noted
+                if recovered_result is not None and recovered_result.get("result") is ev:
+                    recovered_result["saved_message"] = msg
             # 停止終端は監査も停止として残す（assistant は保存済み）。
             _audit_chat_turn(user_id, conversation_id, settings,
                              lens=("stopped" if _terminal == "stopped" else ev["decision"]["lens"]),

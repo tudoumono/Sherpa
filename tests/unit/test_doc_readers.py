@@ -206,10 +206,10 @@ def test_xlsx_range_rejects_row_numbers_beyond_excel_limit(tmp):
     assert "error" in r
 
 
-def test_xlsx_range_without_clean_keeps_raw_cell_truncated_at_200(tmp):
+def test_xlsx_range_keeps_long_cell_whole(tmp):
     p = tmp / "a.xlsx"
     _xlsx_with_cells(p, {"A1": "x" * 300})
-    assert DR.xlsx_range(_open(p), "Sheet1", "A1:A1")["rows"][0][0] == "x" * 200
+    assert DR.xlsx_range(_open(p), "Sheet1", "A1:A1")["rows"][0][0] == "x" * 300
 
 
 @pytest.mark.parametrize("name, reader, error", [
@@ -523,7 +523,7 @@ def test_pdf_pages_default_and_range(tmp):
     _make_pdf(p, n=7)
     r = DR.pdf_pages(_open(p))
     assert r["total"] == 7 and [pg["no"] for pg in r["pages"]] == [1, 2, 3, 4, 5]
-    assert r["truncated"] is False and all(pg["text"] == "" for pg in r["pages"])
+    assert r["truncated"] is True and r["pages_remaining"] == 2 and all(pg["text"] == "" and pg["no_text_layer"] for pg in r["pages"])
     assert [pg["no"] for pg in DR.pdf_pages(_open(p), pages="2-4")["pages"]] == [2, 3, 4]
 
 
@@ -761,3 +761,115 @@ def test_cache_skips_large_inputs(tmp, monkeypatch):
     docx.Document().save(p)
     DR.docx_paragraphs(_open(p))
     assert not DR._cache
+
+
+# ===== 黙って落とさない（COD-25 B）=====
+
+def test_xlsx_range_marks_formula_without_saved_value(tmp):
+    p = tmp / "f.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S"
+    ws["A1"] = "=1+1"  # 保存値（キャッシュ）の無い数式
+    ws["C1"] = "x"
+    wb.save(p)
+    DR._cache.clear()
+    for _ in range(2):  # 2 回目はキャッシュ命中で入力が閉じられる
+        r = DR.xlsx_range(_open(p), "S", "A1:C1")
+        assert r["rows"] == [[DR._FORMULA_NO_VALUE, "", "x"]] and r["formula_no_value"] == 1
+
+
+def test_pptx_reads_group_shapes_and_counts_unread_pictures(tmp):
+    p = tmp / "g.pptx"
+    prs = pptx.Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    grp = slide.shapes.add_group_shape()
+    grp.shapes.add_textbox(0, 0, Inches(2), Inches(1)).text_frame.text = "group-inner-text"
+    png = tmp / "i.png"
+    from PIL import Image
+    Image.new("RGB", (4, 4)).save(png)
+    slide.shapes.add_picture(str(png), 0, 0)
+    prs.save(p)
+    s = DR.pptx_slides(_open(p))["slides"][0]
+    assert "group-inner-text" in s["texts"] and s["unread_shapes"] == 1
+
+
+def _docx_add_footnotes(path: Path) -> None:
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    fn = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:footnotes xmlns:w="{ns}">'
+          f'<w:footnote w:type="separator" w:id="0"><w:p><w:r><w:t>sep</w:t></w:r></w:p></w:footnote>'
+          f'<w:footnote w:id="1"><w:p><w:r><w:t>footnote-body</w:t></w:r></w:p></w:footnote></w:footnotes>')
+    with zipfile.ZipFile(path) as zin:
+        items = {n: zin.read(n) for n in zin.namelist()}
+    items["word/footnotes.xml"] = fn.encode()
+    items["[Content_Types].xml"] = items["[Content_Types].xml"].replace(
+        b"</Types>", b'<Override PartName="/word/footnotes.xml" ContentType='
+        b'"application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>')
+    items["word/_rels/document.xml.rels"] = items["word/_rels/document.xml.rels"].replace(
+        b"</Relationships>", b'<Relationship Id="rIdFn" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+        b'relationships/footnotes" Target="footnotes.xml"/></Relationships>')
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for n, b in items.items():
+            zout.writestr(n, b)
+
+
+def test_docx_reads_header_footnote_textbox_and_nested_table(tmp):
+    from docx.oxml import parse_xml
+    p = tmp / "x.docx"
+    d = docx.Document()
+    d.sections[0].header.paragraphs[0].text = "header-text"
+    d.sections[0].header._element.append(parse_xml(
+        '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:r><w:pict><w:txbxContent>'
+        '<w:p><w:r><w:t>hdr-box</w:t></w:r></w:p></w:txbxContent></w:pict></w:r></w:p>'))
+    d.add_paragraph("body")
+    outer = d.add_table(rows=1, cols=1)
+    inner = outer.cell(0, 0).add_table(rows=1, cols=2)
+    inner.cell(0, 0).text = "nested-a"
+    inner.cell(0, 1).text = "nested-b"
+    d.paragraphs[0]._p.append(parse_xml(
+        '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pict><w:txbxContent>'
+        '<w:p><w:r><w:t>box-text</w:t></w:r></w:p></w:txbxContent></w:pict></w:r>'))
+    d.save(p)
+    _docx_add_footnotes(p)
+    r = DR.docx_paragraphs(_open(p))
+    assert r["headers_footers"][0]["text"].strip() == "header-text"
+    assert sorted(r["textboxes"]) == ["box-text", "hdr-box"]
+    assert [n["text"] for n in r["footnotes"]] == ["footnote-body"]
+    assert "nested-a | nested-b" in r["tables"][0]["rows"][0][0]
+
+
+def test_pdf_pages_reports_invalid_and_out_of_range_page_spec(tmp):
+    p = tmp / "a.pdf"
+    _make_pdf(p, n=3)
+    e = DR.pdf_pages(_open(p), pages="9")
+    assert "error" in e and e["pages_ignored"] == ["9"]
+    r = DR.pdf_pages(_open(p), pages="2,9,abc")
+    assert [pg["no"] for pg in r["pages"]] == [2] and r["pages_ignored"] == ["9", "abc"]
+
+
+def test_pptx_smartart_is_counted_unread_when_not_readable(tmp):
+    from pptx.oxml import parse_xml
+    p = tmp / "s.pptx"
+    prs = pptx.Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes._spTree.append(parse_xml(
+        '<p:graphicFrame xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:nvGraphicFramePr>'
+        '<p:cNvPr id="9" name="d"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>'
+        '<p:xfrm><a:off x="0" y="0"/><a:ext cx="10" cy="10"/></p:xfrm><a:graphic>'
+        '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"/></a:graphic></p:graphicFrame>'))
+    prs.save(p)
+    assert DR.pptx_slides(_open(p))["slides"][0]["unread_shapes"] == 1
+
+
+def test_page_spec_reports_invalid_parts_after_the_cap():
+    _nos, trunc, err, notes = DR._resolve_pages("1-20,abc,500", 100, "1-5", 5, 10)
+    assert trunc and err is None and notes["pages_ignored"] == ["abc", "500"] and notes["pages_capped"] == 10
+
+
+def test_xlsx_range_clips_when_last_row_overflows_char_cap(tmp, monkeypatch):
+    monkeypatch.setattr(DR, "_XLSX_TOTAL_CHARS_MAX", 150)
+    p = tmp / "big.xlsx"
+    _xlsx_with_cells(p, {"A1": "x" * 100, "A2": "y" * 100})
+    r = DR.xlsx_range(_open(p), "Sheet1", "A1:A2")
+    assert r["size_clipped"] is True and r["truncated"] is True and len(r["rows"]) == 1 and r["range"] == "A1:A1"

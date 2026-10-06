@@ -16,10 +16,11 @@ from . import citations, graph_coverage, scope
 from .env_int import env_int
 from .graph_coverage import Coverage
 from .grep_tool import grep_search
-from .impact_service import CATEGORY, plugin_failed_note
+from .impact_service import CATEGORY, plugin_failed_note, source_unparsed_note
 from .ingest.world_neo4j import (
     EDGE_SOURCE_FIELDS, EDGE_SOURCES_RETURN_DEFAULT, EDGE_SOURCES_RETURN_MAX, GraphQueryOverloadError, GraphSchemaEraError, _scope_pred,
-    check_schema_era, edge_view, limit_edge_sources, read_plugin_failures, read_unresolved)
+    check_schema_era, edge_view, limit_edge_sources, read_plugin_failures, read_unparsed_sources,
+    read_unresolved)
 
 _log = logging.getLogger("sherpa")
 
@@ -35,6 +36,8 @@ _ROLE_RANK = {"Document": 1, "Batch": 2, "Module": 3}
 _NEO4J_QUERY_TIMEOUT_S = env_int("SHERPA_NEO4J_QUERY_TIMEOUT_S", 30, 1, 600)
 # ストリーム反復の緊急天井（行数）。
 _NEO4J_MAX_ROWS = 10000
+# 近傍カードの文書側の根拠として、起点名ごとに grep で取るヒットの上限（`grep_search` の既定 `max_hits`）
+_CARD_GREP_MAX_HITS = 50
 # トラブルシュート/近傍探索（neo4j_related）の既定深さ（管理画面の基準値が未設定のときに使う）。
 TROUBLESHOOT_GRAPH_DEPTH = 4
 # 調べる深さ（`depth_profile.scaled_depth`）が加算後に一度だけ適用する絶対上限。
@@ -153,7 +156,8 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
     def _plugin_failures():
         if coverage is not None:
             graph_coverage.attach_plugin_failures(
-                coverage, lambda: read_plugin_failures(session, world), graph_coverage.STAGE_NEIGHBORS)
+                coverage, lambda: read_plugin_failures(session, world), graph_coverage.STAGE_NEIGHBORS,
+                read_unparsed=lambda: read_unparsed_sources(session, world))
 
     if not anchors:
         check_schema_era(session, world, lens="troubleshoot")
@@ -193,10 +197,15 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
 
 
 class _Cards(list):
-    """`_troubleshoot_cards` が返すカードの `list`。`coverage`（`Coverage`）に、この読み取りで見つかった打ち切りを持つ。"""
+    """`_troubleshoot_cards` が返すカードの `list`。`coverage`（`Coverage`）に、この読み取りで見つかった打ち切りを持つ。
+    `depth`＝近傍たどりの深さの上限（`{"requested", "truncated": None}`・上限の先に辺が残るかは判定しない＝None）、
+    `dataitems_excluded`＝粒度が細かすぎるため一覧から除いた DataItem の数（`neighbor_cards*` が申告する）。
+    """
 
     coverage: Coverage
     unresolved: dict | None = None   # 起点の名前に一致する未解決の参照（`neighbor_cards*` だけが付ける・`world_neo4j.read_unresolved` の形）
+    depth: dict | None = None
+    dataitems_excluded: int = 0
 
     def __init__(self, items, coverage: Coverage):
         super().__init__(items)
@@ -221,13 +230,18 @@ def _troubleshoot_cards(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH,
     grep_by_doc: dict[str, list] = {}
     truncated_docs: list = []
     for nm in anchor_names:
-        for h in grep_search(nm, world, scope_paths=sp, truncated_docs=truncated_docs):
+        found = grep_search(nm, world, scope_paths=sp, truncated_docs=truncated_docs)
+        if len(found) >= _CARD_GREP_MAX_HITS:  # 起点名 1 つあたりのヒット上限に達した＝文書側の根拠が一部だけ
+            coverage.add(graph_coverage.KIND_RESULT_CAP, graph_coverage.STAGE_DOCS)
+        for h in found:
             grep_by_doc.setdefault(h["doc_id"], []).append(h)
 
     cards: list[dict] = []
     covered_docs: set[str] = set()
+    dataitems_excluded = 0
     for nb in related:
         if nb["label"] == "DataItem":  # 末端の項目は粒度が細かすぎる（影響レンズで見る）
+            dataitems_excluded += 1
             continue
         card_docs = {e.get("doc") for e in nb["edges"] if e.get("doc")}  # この候補の来歴 rel_path
         gh = [h for d in card_docs for h in grep_by_doc.get(d, [])]  # grep 根拠は rel_path で結合
@@ -254,7 +268,10 @@ def _troubleshoot_cards(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH,
     cards = scope.filter_items(cards, sp)
     if truncated_docs:
         coverage.add(graph_coverage.KIND_DOC_SEARCH_TRUNCATED, graph_coverage.STAGE_DOCS)
-    return anchor_names, _Cards(cards, coverage), truncated_docs
+    out_cards = _Cards(cards, coverage)
+    out_cards.depth = {"requested": int(depth), "truncated": None}
+    out_cards.dataitems_excluded = dataitems_excluded
+    return anchor_names, out_cards, truncated_docs
 
 
 _GRAPH_LIMIT_NOTES = {
@@ -277,8 +294,9 @@ def graph_limit_notes(coverage: Coverage) -> list[str]:
     """`coverage` の `timeout`／`row_cap`／`plugin_failed` → 利用者向け平文の注記（段階ごとに 1 件・`plugin_failed` は全プラグインで 1 件）。文書探索の打ち切りは `_truncated_search_note` が別に出す。"""
     notes = [_GRAPH_LIMIT_NOTES[(lim["kind"], lim.get("stage"))] for lim in coverage.limits
              if (lim["kind"], lim.get("stage")) in _GRAPH_LIMIT_NOTES]
-    plugin_note = plugin_failed_note({"limits": coverage.limits})
-    return notes + [plugin_note] if plugin_note else notes
+    extra = [n for n in (plugin_failed_note({"limits": coverage.limits}),
+                         source_unparsed_note({"limits": coverage.limits})) if n]
+    return notes + extra
 
 
 def run_troubleshoot(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH, include_deprecated=False, scope_paths=None):
@@ -313,6 +331,13 @@ def _attach_unresolved(session, cards, world, anchor_names, scope_prefixes) -> N
         cards.coverage.add(graph_coverage.kind_of_overload(e.reason), graph_coverage.STAGE_NEIGHBORS)
 
 
+def _overload_cards(e: GraphQueryOverloadError) -> "_Cards":
+    """読み取りが時間切れ・件数の天井で失敗したとき、内部障害にせず「空・調べきれていない」として理由つきの coverage で返す。"""
+    coverage = Coverage()
+    coverage.add(graph_coverage.kind_of_overload(e.reason), graph_coverage.STAGE_NEIGHBORS)
+    return _Cards([], coverage)
+
+
 class NeighborCardsFailure(list):
     """`neighbor_cards` が障害を捕捉したときだけ返す空 `list` のサブクラス。`error_code` 属性で通常の空リストと区別する。"""
 
@@ -345,6 +370,8 @@ def neighbor_cards(world, term, scope_paths=None) -> list:
         return cards
     except GraphSchemaEraError:
         raise
+    except GraphQueryOverloadError as e:
+        return _overload_cards(e)
     except Exception as exc:
         from neo4j.exceptions import ConfigurationError, DriverError, TransientError
         # `ConfigurationError` は `DriverError` のサブクラスだが回復不可として扱う。
@@ -404,8 +431,10 @@ def neighbor_cards_graph_only(world, term, scope_paths=None) -> list:
             _attach_unresolved(s, probe, world, [n for _c, n in pairs], sp)
             unresolved = probe.unresolved
         cards: list[dict] = []
+        dataitems_excluded = 0
         for nb in related:
             if nb["label"] == "DataItem":  # 末端の項目は粒度が細かすぎる（影響レンズで見る）
+                dataitems_excluded += 1
                 continue
             cards.append({
                 "name": nb["name"], "label": nb["label"], "category": nb["category"],
@@ -418,9 +447,13 @@ def neighbor_cards_graph_only(world, term, scope_paths=None) -> list:
                                   c["distance"] if c["distance"] is not None else 99, c["name"]))
         result = _Cards(scope.filter_items(cards, sp), coverage)
         result.unresolved = unresolved
+        result.depth = {"requested": TROUBLESHOOT_GRAPH_DEPTH, "truncated": None}
+        result.dataitems_excluded = dataitems_excluded
         return result
     except GraphSchemaEraError:
         raise
+    except GraphQueryOverloadError as e:
+        return _overload_cards(e)
     except Exception as exc:
         from neo4j.exceptions import ConfigurationError, DriverError, TransientError
         recoverable = not isinstance(exc, ConfigurationError) and isinstance(exc, (DriverError, TransientError))

@@ -47,34 +47,51 @@ def _is_progress_only(text: str) -> bool:
     return any(s.startswith(_PROGRESS_MARKERS) for s in sents) or len(sents) >= 2
 
 
-def _trim_trailing_progress(text: str) -> str:
-    """単一段落（改行なし）の平文に限り、末尾の連続する作業宣言文を落として結論で締める。
-    改行や箇条書きを含む場合、または全部が作業宣言で空になる場合は元文を返す。
+def _split_trailing_progress(text: str) -> tuple[str, str]:
+    """単一段落（改行なし）の平文に限り、末尾の連続する作業宣言文を (結論, 落とした文) に分ける。
+    改行や箇条書きを含む場合、または全部が作業宣言で空になる場合は (元文, 空文字)。
     """
     if "\n" in text:
-        return text
+        return text, ""
     parts = [p for p in re.findall(r"[^。]*。|[^。]+$", text) if p.strip()]
+    dropped: list[str] = []
     while len(parts) > 1 and _PROGRESS_END_RE.search(parts[-1].strip()):
-        parts.pop()
-    return "".join(parts).strip() or text
+        dropped.insert(0, parts.pop())
+    kept = "".join(parts).strip()
+    if not kept:
+        return text, ""
+    return kept, "".join(dropped).strip()
 
 
-def _pick_codex_headline(completed: list[str], partial: str = "", prefer_marker: str | None = None) -> str:
+def _trim_trailing_progress(text: str) -> str:
+    """末尾の作業宣言文を落として結論で締める（落とした文は `_split_trailing_progress` が返す）。"""
+    return _split_trailing_progress(text)[0]
+
+
+def _pick_codex_headline(completed: list[str], partial: str = "", prefer_marker: str | None = None,
+                         dropped: list | None = None) -> str:
     """集めた複数の agent_message から headline を決定的に選ぶ（LLM 不使用）。
     `prefer_marker`（素の Codex 用）: この文字列を含む message があれば、その最後のものを優先する。
     ① 結論を含む最後の message を優先する。② その末尾に連なる作業宣言文は落とす（`_trim_trailing_progress`）。③ どれも作業宣言だけなら最後の message をそのまま返す。
     `partial`＝item.updated だけ来て item.completed が来なかった未完 message（打ち切り時の保険）。
+    `dropped`（省略可）: 末尾から落とした作業宣言文を `{"kind": "trailing_progress", "text": ...}` で足す（内部記録用）。
     """
+    def _pick(m: str) -> str:
+        kept, cut = _split_trailing_progress(m)
+        if cut and dropped is not None:
+            dropped.append({"kind": "trailing_progress", "text": cut})
+        return kept
+
     msgs = [m.strip() for m in [*completed, partial] if m and m.strip()]
     if not msgs:
         return ""
     if prefer_marker:
         for m in reversed(msgs):
             if prefer_marker in m and not _is_progress_only(m):
-                return _trim_trailing_progress(m)
+                return _pick(m)
     for m in reversed(msgs):
         if not _is_progress_only(m):
-            return _trim_trailing_progress(m)
+            return _pick(m)
     return msgs[-1]
 
 
@@ -121,9 +138,22 @@ def _needs_continuation(completed: list[str], partial: str = "") -> bool:
     return _is_progress_only(joined) or _is_report_with_next_action(joined)
 
 
+# 続き・見直しで最終回答を書き直すときの規則（回答の情報量を削らない）。台帳継続・見直しのプロンプト（`ledger_gate.py`）も共有する。
+_KEEP_FULL_ANSWER_RULE = (
+    "書き直すときは前の回答の内容を削らず、直した点を反映した完全な回答を書き、短くまとめ直さないでください。"
+    "worker・evaluator が見つけた事実と根拠は統合のときに落とさず含め、"
+    "台帳の各項目の内容・条件・例外・根拠は詳しく書いてください（台帳に無い新しい主張は作らない）。"
+)
+_FULL_ANSWER_RULE = (
+    "回答の説明はすべて answer に書いてください（claims は機械用の索引で画面に出ないため、"
+    "claims にだけ書いた説明は利用者に届きません）。"
+    + _KEEP_FULL_ANSWER_RULE
+)
+
 _CONTINUE_PROMPT = (
     "続けてください。途中経過の報告ではなく、調査を最後まで進めて最終回答（結論と根拠）を書いてください。"
     "最終回答はそのまま利用者に見せるので、利用者の元の質問への回答として書き、この指示や途中の経緯には触れないでください。"
+    + _KEEP_FULL_ANSWER_RULE
 )
 # 出力スキーマ有効時（`_schema_on`）だけ使う継続プロンプト（AGENTS.md が構造化応答 `status`／`answer`／`next_step` を求めるのはスキーマ有効時だけのため）。
 _CONTINUE_PROMPT_SCHEMA = (
@@ -131,4 +161,5 @@ _CONTINUE_PROMPT_SCHEMA = (
     "最終回答（結論と根拠）を書いてください。ただし全件・一覧・すべての依頼で対象範囲の確認が"
     "終わっていなければ `final` にせず、`in_progress` のまま `next_step` に残りを書いてください。"
     "`final` の `answer` はそのまま利用者に見せるので、利用者の元の質問への回答として書き、この指示や途中の経緯には触れないでください。"
+    + _FULL_ANSWER_RULE
 )

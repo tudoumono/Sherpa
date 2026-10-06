@@ -10,13 +10,18 @@ import math
 
 from psycopg.types.json import Json
 
+from urllib.parse import parse_qs, urlsplit
+
+from .. import answer_shape
 from .. import citations as citations_mod
+from .. import stop_kind as stop_kind_mod
 from ..ingest import importance
 from .conversations import (
     SHARE_DEFAULT_EXPIRY_DAYS, SHARE_EFFECTIVE_EXPIRES_SQL, is_personal_tainted, _resolve_received_share_msg_src,
 )
 from .db import _connect, _ensure
 from .feedback import get_feedback_by_message_ids_for_user
+from .usage import _USAGE_LIMIT_BOOL_FIELDS, _USAGE_LIMIT_INT_FIELDS
 
 
 def _share_lock_key(share_id) -> int:
@@ -117,7 +122,8 @@ def _strip_shared_message(m: dict) -> dict:
     out = {**m, "route": None, "trace": None}
     a = out.get("answer")
     # usage・usage_sub・usage_subs・codex_usage_total も内部情報として受領共有では伏せる。
-    _drop = ("question", "route", "trace", "usage", "usage_sub", "usage_subs", "codex_usage_total")
+    _drop = ("question", "route", "trace", "usage", "usage_sub", "usage_subs", "codex_usage_total",
+             "trimmed")
     if isinstance(a, dict):
         needs_copy = any(k in a for k in _drop)
         # 通常の受領共有は元会話の answer をそのまま読むため、`sources[]`・`data.citations[]`・Evidence Packet の `source_path`/`matched_doc_ids` から重要度設定ファイルへの参照をここでも落とす。
@@ -190,8 +196,11 @@ def get_conversation_for_read(uid, cid) -> dict | None:
 
 # sanitized share snapshot（個人部分を除いた共有）: allowlist 再構築＋ターンごとの個人フラグで作る。個人ターン（messages.personal）は Q/A とも伏字。
 _REDACTED_TEXT = "（個人ファイルを参照した回答のため、共有では非表示にしています）"
+# ファイルを作成したターンは作成物（個人の作業領域）を含み得るため伏せる。理由が個人ファイルの参照とは別なので文言を分ける。
+_REDACTED_FILES_TEXT = "（ファイルを作成した回答のため、共有では非表示にしています）"
+_REDACTED_TEXTS = (_REDACTED_TEXT, _REDACTED_FILES_TEXT)
 _SANITIZED_TITLE = "共有用（サニタイズ済み会話）"
-_SHARE_SAFE_LENS = ("qa", "impact", "troubleshoot", "chat", "clarify")
+_SHARE_SAFE_LENS = ("qa", "impact", "troubleshoot", "chat", "clarify", "author")
 
 
 _EVIDENCE_PACKET_STR_FIELDS = ("task_id", "investigation_status", "summary", "stop_reason", "next_action")
@@ -363,6 +372,129 @@ def _safe_evidence_packet(packet):
     return out
 
 
+# 項目名（AI が書いた自由な文を含む）は共有の複製に載せず、件数だけにする。
+_SHARE_COUNT_ONLY_LABELS = ("確認できなかった項目", "壊れていた項目")
+
+
+def _share_summary(summary: dict) -> dict:
+    """調べた範囲を共有向けにする。確認できなかった項目・壊れた項目は名前を出さず件数だけ。"""
+    import re
+    items, counts = [], {}
+    for it in summary["items"]:
+        label, text = it["label"], it["text"]
+        if label not in _SHARE_COUNT_ONLY_LABELS:
+            items.append(it)
+            continue
+        m = re.match(r"^(?:ほか |名前を表示できない項目 )?(\d+) 件", text)
+        if label == "壊れていた項目":
+            n = int(m.group(1)) if m else 1
+        elif m and text.startswith(("ほか ", "名前を表示できない項目 ")):
+            n = int(m.group(1))
+        else:
+            n = 1
+        counts[label] = counts.get(label, 0) + n
+    for label, n in counts.items():
+        items.append({"label": label, "text": f"{n} 件（項目名は共有では表示しません）"})
+    return {"v": summary["v"], "items": items}
+
+
+def _share_sources_unverified(answer: dict) -> dict:
+    """確認できなかった資料を共有向けに写す。資料パスは秘匿名でないものだけ、それ以外は件数に回す。"""
+    from ..ingest import text_kind
+    rows = answer.get("sources_unverified")
+    if not isinstance(rows, list):
+        return {}
+    kept, hidden = [], 0
+    for r in rows:
+        if (isinstance(r, dict) and isinstance(r.get("path"), str) and isinstance(r.get("reason"), str)
+                and not text_kind.is_sensitive_doc_id(r["path"])):
+            kept.append({"path": r["path"], "reason": r["reason"]})
+        else:
+            hidden += 1
+    for key in ("sources_unverified_hidden",):
+        v = answer.get(key)
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            hidden += v
+    out: dict = {"sources_unverified": kept}
+    if hidden:
+        out["sources_unverified_hidden"] = hidden
+    more = answer.get("sources_unverified_more")
+    if isinstance(more, int) and not isinstance(more, bool) and more > 0:
+        out["sources_unverified_more"] = more
+    return out
+
+
+def _safe_download_url(url, doc_id, world) -> str | None:
+    """出典の原本ダウンロードリンクを、`/documents/download?world=…&rel=<doc_id>` の形に限って通す（それ以外の URL・別資料を指すリンクは落とす）。取得側のエンドポイントが利用者ごとに権限・秘匿を再判定する。リンクの world は回答の `scope.world` と一致するものだけ（別の資料フォルダの文書を指すリンク・world 不明は落とす）。"""
+    if not isinstance(url, str) or not isinstance(doc_id, str) or not isinstance(world, str) or not world:
+        return None
+        return None
+    parts = urlsplit(url)
+    if parts.scheme or parts.netloc or parts.path != "/documents/download":
+        return None
+    q = parse_qs(parts.query, keep_blank_values=True)
+    if set(q) - {"world", "rel"} or q.get("rel") != [doc_id] or q.get("world") != [world]:
+        return None
+    return url
+
+
+_RETRY_LABEL_MAX = 200
+_RETRY_DEPTHS = ("quick", "standard", "deep", "max")
+
+
+def _safe_retry_hint(h) -> dict | None:
+    """続きのボタン 1 件（`chat_service._retry_hints`／resume が作る既知の 5 種）を、種類ごとの既知の形だけで再構築する。形が合わなければ None。"""
+    if not isinstance(h, dict) or not isinstance(h.get("label"), str) or not h["label"].strip():
+        return None
+    kind, act = h.get("kind"), h.get("action")
+    if not isinstance(act, dict):
+        return None
+    if kind == "scope" and act == {"scope_paths": []}:
+        action = {"scope_paths": []}
+    elif kind == "layer" and set(act) == {"layer"} and act["layer"] in ("both", "docs", "code"):
+        action = {"layer": act["layer"]}
+    elif kind == "depth" and set(act) == {"depth_profile"} and act["depth_profile"] in _RETRY_DEPTHS:
+        action = {"depth_profile": act["depth_profile"]}
+    elif (kind == "tools" and set(act) == {"tools"} and isinstance(act["tools"], dict)
+          and all(isinstance(k, str) and isinstance(v, bool) for k, v in act["tools"].items())):
+        action = {"tools": dict(act["tools"])}
+    elif kind == "resume" and act == {"message": "続きを調べて"}:
+        action = {"message": "続きを調べて"}
+    else:
+        return None
+    return {"kind": kind, "label": h["label"][:_RETRY_LABEL_MAX], "action": action}
+
+
+# 打ち切りの旗（利用統計の 12 項目＋調べた範囲の組み立てが読む 3 項目）。値は非負整数か真偽だけ通す。
+_SHARE_LIMIT_KEYS = frozenset(_USAGE_LIMIT_INT_FIELDS + _USAGE_LIMIT_BOOL_FIELDS
+                              + ("wall_clock_hit", "ledger_incomplete", "claims_unmatched"))
+
+
+def _safe_share_limits(limits) -> dict | None:
+    if not isinstance(limits, dict):
+        return None
+    out = {k: v for k, v in limits.items()
+           if k in _SHARE_LIMIT_KEYS and (isinstance(v, bool) or (isinstance(v, int) and v >= 0))}
+    return out or None
+
+
+def _safe_created_files(files) -> list[dict] | None:
+    """作成したファイルは名前だけ残す（中身・ダウンロードリンクは出さない）。"""
+    if not isinstance(files, list):
+        return None
+    out = [{"name": f["name"]} for f in files
+           if isinstance(f, dict) and isinstance(f.get("name"), str) and f["name"]]
+    return out or None
+
+
+def _redaction_text(answer) -> str:
+    """個人由来のターンを伏せるときの文言。個人ファイルの参照が無く、ファイルの作成だけが理由のターンは専用の文言にする。"""
+    if (isinstance(answer, dict) and answer.get("codex_wrote_files")
+            and not (answer.get("personal_sources") or answer.get("_personal_facts"))):
+        return _REDACTED_FILES_TEXT
+    return _REDACTED_TEXT
+
+
 def _safe_share_answer(answer):
     """非個人ターンの answer を allowlist で再構築する（未知キー・個人由来・route/trace を持ち込まない）。共有できるのは KB 由来の headline/data/summary/scope と、個人ヒットを除いた sources のみ。
     確認カード（lens=clarify）は `{"lens":"clarify"}` の最小形だけを返す。`_SHARE_SAFE_LENS` に clarify を含めるのは、複製する `messages.lens` を NULL に落とさないため。
@@ -374,6 +506,19 @@ def _safe_share_answer(answer):
     out = {}
     if isinstance(answer.get("headline"), str):
         out["headline"] = answer["headline"]
+    # 本文・注記・完了状態・調べた範囲は型を確かめて写す（旧形式の行は headline だけが残る）。
+    if isinstance(answer.get("body"), str):
+        out["body"] = answer["body"]
+        out["notices"] = answer_shape.notices_of(answer)
+    if answer.get("completion") in answer_shape.COMPLETIONS:
+        out["completion"] = answer["completion"]
+    if isinstance(answer.get("answer_schema"), int) and not isinstance(answer["answer_schema"], bool):
+        out["answer_schema"] = answer["answer_schema"]
+    summary = answer_shape.investigation_summary_of(answer)
+    if summary is not None:
+        out["investigation_summary"] = _share_summary(summary)
+    unverified = _share_sources_unverified(answer)
+    out.update(unverified)
     if answer.get("lens") in _SHARE_SAFE_LENS:
         out["lens"] = answer["lens"]
     srcs = answer.get("sources")
@@ -385,10 +530,30 @@ def _safe_share_answer(answer):
         out["sources"] = [{k: s[k] for k in ("doc_id", "quote", "source", "title", "path",
                                               "importance", "importance_reason") if k in s}
                           for s in importance_filtered]
+        for row, src in zip(out["sources"], importance_filtered):
+            url = _safe_download_url(src.get("download_url"), src.get("doc_id"),
+                                      (answer.get("scope") or {}).get("world") if isinstance(answer.get("scope"), dict) else None)
+            if url:
+                row["download_url"] = url
     # 出典の2区分表示（根拠/参考）に使う doc_id 集合。実際に残った `out["sources"]` の doc_id 集合と必ず交差させる。
     sv = answer.get("sources_verified")
     if isinstance(sv, list):
         out["sources_verified"] = _intersect_sources_verified(sv, out.get("sources", []))
+    # 停止／途中・続きのボタン・打ち切り・作成したファイル（名前のみ）は既知の安全な形だけ写す。
+    if answer.get("codex_stopped_early") is True:
+        out["codex_stopped_early"] = True
+    if answer.get("stop_kind") in stop_kind_mod.STOP_KINDS:
+        out["stop_kind"] = answer["stop_kind"]
+    if isinstance(answer.get("retry_hints"), list):
+        hints = [h for h in (_safe_retry_hint(x) for x in answer["retry_hints"]) if h is not None]
+        if hints:
+            out["retry_hints"] = hints
+    limits = _safe_share_limits(answer.get("limits"))
+    if limits is not None:
+        out["limits"] = limits
+    created = _safe_created_files(answer.get("created_files"))
+    if created is not None:
+        out["created_files"] = created
     if isinstance(answer.get("summary"), dict):
         out["summary"] = answer["summary"]
     if answer.get("data") is not None:  # 非個人ターンの影響カード等（KB 由来）。
@@ -419,19 +584,20 @@ def _create_sanitized_snapshot_tx(c, owner_uid: str, source_cid: int) -> int | N
     # taint 判定は `conversations.py::is_personal_tainted` に集約する。
     def _tainted(m):
         return is_personal_tainted(m)
-    prepped = [{"m": m, "tainted": _tainted(m)} for m in msgs]
+    prepped = [{"m": m, "tainted": _tainted(m), "redaction": _redaction_text(m["answer"])} for m in msgs]
     # 2nd pass: user 質問も、直後の assistant が taint なら伏字化する。
     for i, pm in enumerate(prepped):
-        if pm["m"]["role"] == "user" and not pm["tainted"]:
+        if pm["m"]["role"] == "user":
             nxt = next((prepped[j] for j in range(i + 1, len(prepped))
                         if prepped[j]["m"]["role"] == "assistant"), None)
             if nxt and nxt["tainted"]:
                 pm["tainted"] = True
+                pm["redaction"] = nxt["redaction"]
     for pm in prepped:
         m = pm["m"]
         if pm["tainted"]:  # 個人ターン: Q/A とも伏字・answer は最小化。
-            content = _REDACTED_TEXT
-            answer = {"headline": _REDACTED_TEXT} if m["role"] == "assistant" else None
+            content = pm["redaction"]
+            answer = {"headline": content} if m["role"] == "assistant" else None
             lens = None
         else:  # 非個人ターン: content 保持・answer は allowlist 再構築。
             content = m["content"]
@@ -618,7 +784,7 @@ def _fork_title(conv: dict, messages: list) -> str:
     if conv["title"] != _SANITIZED_TITLE:
         return conv["title"]
     for m in messages:
-        if m["role"] == "user" and m["content"] != _REDACTED_TEXT:
+        if m["role"] == "user" and m["content"] not in _REDACTED_TEXTS:
             t = (m["content"] or "").strip()[:40]
             if t:
                 return t

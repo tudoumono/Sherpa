@@ -190,6 +190,7 @@ from .workspace_files import (
 # conversations・shares の全名（私的名含む）を re-export する。
 from .conversations import (
     add_message,
+    append_answer_notice,
     conversation_has_personal_message,
     create_conversation,
     delete_conversation,

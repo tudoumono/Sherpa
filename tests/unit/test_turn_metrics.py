@@ -69,6 +69,18 @@ def _activity(*, parent_tokens=None, child_tokens_list=None, app_version="v-test
 
 # ===================== metrics_from_answer（純粋関数） =====================
 
+def test_completion_and_notice_kinds_map_to_closed_vocabulary_with_null_for_legacy_rows():
+    m = turn_metrics.metrics_from_answer({
+        "completion": "partial",
+        "notices": [{"kind": "wall_clock", "text": "時間切れ"}, {"kind": "wall_clock", "text": "別文"},
+                    {"kind": "未知の種類", "text": "x"}]})
+    assert m["completion"] == "partial" and m["notice_kinds"] == ["other", "wall_clock"]
+    assert "時間切れ" not in str(m["notice_kinds"])
+    legacy = turn_metrics.metrics_from_answer({"headline": "旧形式"})
+    assert legacy["completion"] is None and legacy["notice_kinds"] is None
+    assert turn_metrics.metrics_from_answer({"completion": "weird", "notices": []})["notice_kinds"] == []
+
+
 def test_activity_priority_over_legacy_including_failed_turn():
     """activity（§3.1）が有効ならそこから求まる値を使う——失敗ターン（usage が 0 のまま保存）
     でも activity の実消費を拾う。壊れた activity（版不一致・agents 非配列）は全面的に
@@ -383,3 +395,16 @@ def test_usage_backfill_wrapper_reads_env_file(tmp_path):
     )
     assert proc.returncode != 0
     assert marker_host in (proc.stdout + proc.stderr)
+
+
+def test_cache_write_unknown_when_child_usage_missing():
+    """下調べ役の usage が 1 件でも取れていなければ、書き込み量の合計と下調べ役分は既知分だけで埋めず不明にする。"""
+    answer = {
+        "usage": {"provider": "codex", "model": "m", "input_tokens": 130, "cached_input_tokens": 12,
+                  "output_tokens": 24, "reasoning_output_tokens": 6, "cache_write_tokens": 7},
+        "codex_usage_children": {"found": 1, "missing": 1, "input_tokens": 30, "cached_input_tokens": 2,
+                                 "output_tokens": 4, "reasoning_output_tokens": 1, "cache_write_tokens": 3},
+    }
+    m = turn_metrics.metrics_from_answer(answer)
+    assert m["cache_write_tokens"] is None and m["child_cache_write_tokens"] is None
+    assert m["children_usage_missing"] == 1

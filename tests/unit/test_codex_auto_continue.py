@@ -249,7 +249,9 @@ def test_continuation_stops_at_limit_and_sets_stopped_early_flag(tmp_path, monke
                            env={"SHERPA_CODEX_AUTO_CONTINUE": "2"})
     assert len(calls) == 3
     assert env.get("codex_stopped_early") is True
-    assert env["headline"] == "続いて関連ファイルを確認します。"   # 本文は書き換えない
+    assert env["body"] == "続いて関連ファイルを確認します。"   # 本文は書き換えない
+    assert [n["kind"] for n in env["notices"]] == ["stopped_early"]   # 途中までの説明は注記として残る
+    assert env["headline"].endswith(env["body"]) and "途中までの結果" in env["headline"]
     finalized = CS._finalize(dict(env), {"lens": "qa", "reason": "既定（検索）"})
     assert len([h for h in finalized.get("retry_hints", []) if h["kind"] == "resume"]) == 1
 
@@ -388,7 +390,8 @@ def test_config_write_failure_leaves_sidecar_absorb_disabled(tmp_path, monkeypat
     monkeypatch.setattr(usage_mod, "_read_mcp_sidecar", _spy_read_sidecar)
 
     env = _result_env(_run(A.CodexProvider(), _ctx(uid="config-boom-sidecar-u1", conversation_id=952)))
-    assert env["headline"] == _NO_PRESEARCH_HEADLINE
+    assert _NO_PRESEARCH_HEADLINE in env["headline"]
+    assert "エラー" in env["headline"]
     assert boom_calls == [1]
     assert _read_argv_log(argv_log) == []
     assert read_calls == []
@@ -436,7 +439,8 @@ def test_continuation_attempt_without_output_marks_stopped_early(tmp_path, monke
     _, env, calls = _drive(tmp_path, monkeypatch, steps, "auto-continue-crash", 907)
     assert len(calls) == 2
     assert "resume" in calls[1] and calls[1][-1] == CONT._CONTINUE_PROMPT
-    assert env["headline"] == "まず資料を確認します。"
+    assert "まず資料を確認します。" in env["headline"]
+    assert "失敗" in env["headline"]
     assert env.get("codex_stopped_early") is True
     finalized = CS._finalize(dict(env), {"lens": "qa", "reason": "既定（検索）"})
     assert len([h for h in finalized.get("retry_hints", []) if h["kind"] == "resume"]) == 1

@@ -28,7 +28,7 @@ _STOP = {"DATA", "CODE", "RATE", "TOTAL", "INPUT", "OUTPUT", "FILE", "DATE", "TI
 
 
 from .graph_coverage import (KIND_DOC_SEARCH_TRUNCATED, KIND_GRAPH_UNAVAILABLE, KIND_PLUGIN_FAILED, KIND_RESULT_CAP,
-                             STAGE_PRESUMED, add_limit)
+                             KIND_SOURCE_UNPARSED, STAGE_PRESUMED, add_limit)
 from .ingest.identifiers import normalize_code_name as _norm
 
 
@@ -131,6 +131,16 @@ def plugin_failed_note(coverage: dict | None) -> str | None:
             "（関連が無いとは言えません）。原因を直して取り込み直すまで残ります。")
 
 
+def source_unparsed_note(coverage: dict | None) -> str | None:
+    """`coverage.limits` の `source_unparsed`（構文を読み切れない・大きすぎてグラフに入れなかったソース）→ 利用者向け平文の注記。無ければ `None`。"""
+    counts = [lim["count"] for lim in (coverage or {}).get("limits", [])
+              if lim.get("kind") == KIND_SOURCE_UNPARSED and isinstance(lim.get("count"), int)]
+    if not counts:
+        return None
+    return (f"取り込み時に {max(counts)} 件のソースを構文の読み切れなさ・大きさのためグラフに入れていません。"
+            "そのソースの関連はここに出ていないため、関連が無いとは言えません（ソースを直接読んで確かめてください）。")
+
+
 def _depth_note(depth: int) -> str:
     return (f"影響をたどる深さの上限（{depth}段）で止めたため、さらに先に影響が残っている可能性があります。"
             "調べる深さを増やして再実行してください。")
@@ -163,6 +173,9 @@ def run_impact(session, term, world, scope_prefixes=None,
     plugin_note = plugin_failed_note(coverage)
     if plugin_note:
         result.setdefault("notes", []).append(plugin_note)
+    unparsed_note = source_unparsed_note(coverage)
+    if unparsed_note:
+        result.setdefault("notes", []).append(unparsed_note)
     if include_presumed and not result.get("items"):
         truncated_docs: list = []
         try:

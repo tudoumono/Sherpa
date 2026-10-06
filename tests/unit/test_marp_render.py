@@ -255,3 +255,18 @@ def test_render_outputs_marp_bin_nonexistent_path_is_empty():
             [md], marp_bin="/nonexistent/marp", chrome_path=None, theme_dirs=[],
             containment_root=tdp)
         assert got == []
+
+
+def test_render_outputs_reports_the_formats_that_failed_while_others_succeed(monkeypatch):
+    """HTML だけ書き出せて PDF／PPTX が失敗したとき、失敗した形式名を返す（利用者への注記の素材）。"""
+    with tempfile.TemporaryDirectory() as td:
+        tdp = pathlib.Path(td)
+        md = _write_md(tdp / "a.md")
+        marp = _fake_marp_bin(tdp, record=tdp / "record.txt")
+        monkeypatch.setattr(R, "_unshare_available", lambda: True)
+        monkeypatch.setattr(R, "_run_render", lambda argv, **kw: (
+            "--pdf" not in argv and "--pptx" not in argv) and (subprocess.run(argv).returncode == 0))
+        failed: list = []
+        got = R.render_outputs([md], marp_bin=str(marp), chrome_path="/x", theme_dirs=[],
+                               containment_root=tdp, failures=failed)
+        assert [p.name for p in got] == ["a.html"] and failed == ["pdf", "pptx"]

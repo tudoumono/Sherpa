@@ -624,9 +624,11 @@ def test_sanitize_review_text_strips_control_chars_escapes_markdown_and_truncate
     cleaned = L.sanitize_review_text("観点*です\n\t`コード`[リンク](x)|パイプ")
     assert "\n" not in cleaned and "\t" not in cleaned
     assert cleaned == r"観点\*です\`コード\`\[リンク\](x)\|パイプ"
-    assert L.sanitize_review_text("x" * (L.REVIEW_TEXT_PER_ITEM_MAX + 50)) == "x" * L.REVIEW_TEXT_PER_ITEM_MAX
+    # 上限で切ったら末尾に省略の印を付ける。
+    assert L.sanitize_review_text("x" * (L.REVIEW_TEXT_PER_ITEM_MAX + 50)) == "x" * L.REVIEW_TEXT_PER_ITEM_MAX + L.TRUNCATION_MARK
+    assert L.sanitize_review_text("x" * L.REVIEW_TEXT_PER_ITEM_MAX) == "x" * L.REVIEW_TEXT_PER_ITEM_MAX
     assert L.sanitize_review_text(None) == ""
     joined = L.sanitize_review_text_list(["x" * L.REVIEW_TEXT_PER_ITEM_MAX for _ in range(20)])
-    assert len(joined) == L.REVIEW_TEXT_TOTAL_MAX
+    assert len(joined) == L.REVIEW_TEXT_TOTAL_MAX + len(L.TRUNCATION_MARK) and joined.endswith(L.TRUNCATION_MARK)
     assert L.sanitize_review_text_list([]) == ""
     assert L.sanitize_review_text_list(["帳票", None, "  ", "画面"]) == "帳票、画面"

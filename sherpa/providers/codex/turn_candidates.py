@@ -3,6 +3,9 @@
 """
 from __future__ import annotations
 
+import json
+import re
+
 from . import usage
 from .continuation import _needs_continuation
 from .process import _read_last_message_fallback
@@ -27,7 +30,7 @@ def _update_structured_state(st) -> None:
         _parsed = _parse_fn(_m)
         if _parsed is not None:
             st._structured_answers.append(_parsed)
-    _fb = _read_last_message_fallback(st._last_message_path)
+    _fb = _read_last_message_fallback(st._last_message_path, st._answer_notices, st._attempt_no)
     if _fb and _fb == st._stale_last_message:
         _fb = None  # `_absorb_last_message_fallback` と同じ staleness 規則
     _last_msg = _latest_msgs[-1] if _latest_msgs else None
@@ -57,17 +60,98 @@ def _candidate_final(st) -> dict | None:
     return _finals[-1] if _finals else None
 
 
+_TRUNCATED_NOTICE = "回答が途中で切れた可能性があります。\n\n"
+_LEDGER_UNFINISHED_NOTICE = "調査台帳の確認が終わる前の回答です（未確認の項目があります）。\n\n"
+
+
+def _top_level_answer(text: str) -> str:
+    """途中で切れていてもよい JSON オブジェクトから、最上位キー `answer` の文字列値だけを取り出す（入れ子の値・配列・文字列以外は対象外）。取れなければ空文字。"""
+    n, i, depth = len(text), 0, 0
+    while i < n:
+        c = text[i]
+        if c in "{[":
+            depth += 1
+        elif c in "}]":
+            depth -= 1
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            if depth == 1 and text[i + 1:j] == "answer":
+                k = j + 1
+                while k < n and text[k] in " \t\r\n":
+                    k += 1
+                if k < n and text[k] == ":":
+                    k += 1
+                    while k < n and text[k] in " \t\r\n":
+                        k += 1
+                    if k < n and text[k] == '"':
+                        m = k + 1
+                        while m < n and text[m] != '"':
+                            m += 2 if text[m] == "\\" else 1
+                        frag = text[k + 1:m]
+                        for cut in (frag, frag[:-1]):  # 末尾が `\` で切れた断片は 1 文字落として復号する
+                            try:
+                                return json.loads(f'"{cut}"').strip()
+                            except ValueError:
+                                continue
+                    return ""
+            i = j
+        i += 1
+    return ""
+
+
+def _salvage_body(text: str) -> str:
+    """構造化として解釈できなかった出力から、利用者へ見せられる本文を取り出す。JSON らしい出力は最上位の `answer` 文字列だけ、JSON でない平文はそのまま使う。取れなければ空文字。"""
+    _t = (text or "").strip()
+    if not _t:
+        return ""
+    if _t.startswith(("{", "[")):
+        return _top_level_answer(_t) if _t.startswith("{") else ""
+    return _t
+
+
 def _pick_structured_headline(st) -> str | None:
-    """`_schema_on` の見出し。構造化 message に `final` があれば最後の `final` の `answer`、無ければ最後の構造化 message の `answer`。構造化 message が一度も無くても何か出力はあった（`_agent_msgs`/`_agent_partial` が非空）ときだけ固定文言（`_codex_stopped_early` が立つ）。出力そのものが無ければ None（無出力失敗の判定へ委ねる）。"""
-    # `answer` が空の構造化 message は「本文なし」＝固定文言に落とす（空文字を返すと dispatch の決定的見出しが正常回答として出てしまう）。`_structured_answers_valid_from` より前（台帳ゲートが拒否した final を含む）は候補にせず、台帳ゲートを通った final（`_candidate_final`）を優先する。
+    """新しい final、差し戻した final、途中本文の順に回答本文を選ぶ。
+    差し戻した final を返すときは、後続の途中本文を注記に残す。
+    """
     _empty = "回答を取り出せませんでした。もう一度お試しください。"
     _cand = _candidate_final(st)
-    if _cand is not None:
-        return _cand["answer"].strip() or _empty
+    if _cand is not None and _cand["answer"].strip():
+        return _cand["answer"].strip()
     _valid = st._structured_answers[st._structured_answers_valid_from:]
+    _rejected = [x for x in st._structured_answers[:st._structured_answers_valid_from]
+                 if x.get("status") == "final" and (x.get("answer") or "").strip()]
+    if _rejected and not any(s.get("status") == "final" and s["answer"].strip() for s in _valid):
+        _answer = _rejected[-1]["answer"].strip()
+        _followup_msgs = st._agent_msgs[st._attempt_msgs_start:]
+        for _i, _m in enumerate(st._agent_msgs):
+            if _salvage_body(_m) == _answer:
+                _followup_msgs = st._agent_msgs[_i + 1:]
+        _partial_bodies = [s["answer"].strip() for s in _valid]
+        _partial_bodies.extend(_salvage_body(m) for m in [*_followup_msgs, st._agent_partial])
+        _partial_bodies = list(dict.fromkeys(b for b in _partial_bodies if b and b != _answer))
+        st._answer_notices.append(("ledger_unfinished", _LEDGER_UNFINISHED_NOTICE))
+        if _partial_bodies:
+            st._answer_notices.append(
+                ("partial_followup", "続きの調査で得た途中の内容（未確定）:\n\n" + "\n\n".join(_partial_bodies)))
+        return _answer
     if _valid:
-        return _valid[-1]["answer"].strip() or _empty
+        for _s in reversed(_valid):
+            if _s["answer"].strip():
+                return _s["answer"].strip()
     if st._agent_msgs or st._agent_partial:
+        # 構造化として読めた出力が無い（壁時計の打ち切り等で JSON が途中で切れた）。最新 attempt の出力から取れる本文があれば固定文言より優先して返す。
+        for _m in reversed([*st._agent_msgs[st._attempt_msgs_start:], st._agent_partial]):
+            _body = _salvage_body(_m)
+            if _body:
+                st._answer_notices.append(("truncated", _TRUNCATED_NOTICE))
+                return _body
+        for _m in reversed(st._agent_msgs[:st._attempt_msgs_start]):
+            _body = _salvage_body(_m)
+            if _body:
+                st._answer_notices.append(("truncated", _TRUNCATED_NOTICE))
+                return _body
         return _empty
     return None
 
@@ -102,6 +186,7 @@ def _absorb_mcp_sidecar(st) -> None:
     st._mcp_search_truncated = _sc_limits.get("search_truncated", 0)
     if _sc_limits.get("tool_calls_exhausted"):
         st._mcp_tool_calls_exhausted = True
+    st._mcp_coverage_write_failed = _sc_limits.get("coverage_write_failed", 0)
 
 
 def _pick_structured_claims(st) -> list[dict]:
@@ -115,3 +200,14 @@ def _pick_structured_claims(st) -> list[dict]:
     if _valid:
         return _valid[-1].get("claims") or []
     return []
+
+
+def _pick_structured_claims_invalid(st) -> int:
+    """`_pick_structured_claims` と同じ message の `claims_invalid`（形式不正で除かれた主張の件数）。v1 形・`_schema_v2` 無効時は 0。"""
+    if not st._schema_v2:
+        return 0
+    _cand = _candidate_final(st)
+    if _cand is None:
+        _valid = st._structured_answers[st._structured_answers_valid_from:]
+        _cand = _valid[-1] if _valid else None
+    return int((_cand or {}).get("claims_invalid") or 0)

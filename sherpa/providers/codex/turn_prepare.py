@@ -233,16 +233,18 @@ def prepare_run(self, ctx, st, decision):
                       f"【個人ファイル内ヒット（本人のみ・共有不可）】\n{ctx.personal_facts}")
     if _continuation_review_note:
         _codex_msg = f"{_codex_msg}\n\n【前回の続き】\n{_continuation_review_note}"
-    if _plain:
-        prompt = self._prompt_plain(_codex_msg, decision["lens"], ctx.world)
-    else:
-        prompt = self._prompt_mcp(_codex_msg, decision["lens"], ctx.world,
-                                  direct_read=_direct_read_ok, layer=_layer)
+    def _build_prompt(with_history: bool) -> str:
+        if _plain:
+            return self._prompt_plain(_codex_msg, decision["lens"], ctx.world, with_history=with_history)
+        return self._prompt_mcp(_codex_msg, decision["lens"], ctx.world,
+                                direct_read=_direct_read_ok, layer=_layer, with_history=with_history)
     build_launch(self, ctx, st)
     log_turn_start(self, ctx, st)
     # 起動前の準備で決まった値を `st` へ渡す（以後の段と `_attempt` は `st` から読む）。
     st.ws_files, st._before_ws_files = ws_files, _before_ws_files
     st._direct_roots, st._deny_roots, st._sensitive_deny, st._direct_read_ok = (
         _direct_roots, _deny_roots, _sensitive_deny, _direct_read_ok)
-    st.prompt = prompt
+    # resume が成立する初回の試行（`build_launch` がセッション非永続で `resume_sid` を落とした場合を除く）は、Codex 側のセッションが履歴を持つため前置しない。新規セッションで始めるとき・resume 失敗後の作り直し（`_resume_fallback`）は履歴つきのプロンプトを使う。
+    st.prompt_with_history = _build_prompt(True)
+    st.prompt = _build_prompt(False) if st.resume_sid else st.prompt_with_history
     return False

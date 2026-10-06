@@ -79,7 +79,8 @@ def _reflect_graph_after_rag_rewrite(world: str) -> None:
         raise RuntimeError(f"graph reflect blocked: {','.join(reasons)}")
     env = world_neo4j._env()
     world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"],
-                           plugin_failures=world_graph.plugin_failures_from_flags(flags))
+                           plugin_failures=world_graph.plugin_failures_from_flags(flags),
+                           unparsed_sources=world_graph.unparsed_sources_from_flags(flags))
 
 
 # `office_md.build_derived()` の per-file 失敗リスト（`[{"doc": rel, "reason": str}]`）のキー。末尾の `_failures` を落とした残りを stage 名にする
@@ -95,6 +96,21 @@ def _office_md_stage_summary(drep: dict) -> dict:
     """`office_md.build_derived()` の要約3値（`_record` と PG replace 失敗パスの共通片）。"""
     return {"converted": drep.get("converted", 0), "failed": drep.get("failed", 0),
             "unsupported": drep.get("unsupported", 0)}
+
+
+def _es_summary(esr) -> dict:
+    """`es_index.index_world()` の結果から `extraction_snapshot.es` に残す要約を作る（counts の元データ＋取り込みの状態へ出す落とし・粗くした記録）。
+    `rag_degraded`（粗い区切りへ退避・本文の読み取り失敗・空文書の件数）と `rag_degraded_by_reason`（理由別）、`embed_degraded`（埋め込み失敗で BM25 のみ）、`analyzer_fallback`（日本語アナライザを作れず標準）は、あるときだけ載せる。
+    """
+    r = esr if isinstance(esr, dict) else {}
+    out = {"available": r.get("available") if r else None, "error": r.get("error") if r else None,
+           "chunks": r.get("chunks") if r else None, "indexed": r.get("indexed") if r else None,
+           "embedded": r.get("embedded") if r else None, "reused": r.get("reused") if r else None,
+           "embed_elapsed_ms": r.get("embed_elapsed_ms") if r else None}
+    for key in ("rag_degraded", "rag_degraded_by_reason", "embed_degraded", "analyzer_fallback"):
+        if r.get(key):
+            out[key] = r[key]
+    return out
 
 
 def _counts_summary(drep: dict | None, es_summary: dict | None, manifest: dict | None,
@@ -157,7 +173,10 @@ def _failed_files_summary(drep: dict) -> dict:
                 continue
             desc = failure_reasons.describe(raw_reason)
             by_reason[desc["code"]] = by_reason.get(desc["code"], 0) + 1
-            items.append({"doc": doc, "stage": stage, "reason": desc["code"], "detail": desc["detail"]})
+            item = {"doc": doc, "stage": stage, "reason": desc["code"], "detail": desc["detail"]}
+            if isinstance(entry.get("pdf_pages"), dict):
+                item["pdf_pages"] = entry["pdf_pages"]       # 画像で読んだ PDF の読めなかったページ数
+            items.append(item)
     return {"items": items[:_FAILED_FILES_LIMIT], "total": len(items),
             "truncated": len(items) > _FAILED_FILES_LIMIT, "by_reason": by_reason}
 
@@ -385,7 +404,8 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
     try:
         env = world_neo4j._env()
         n, m = world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"],
-                                      plugin_failures=world_graph.plugin_failures_from_flags(flags))
+                                      plugin_failures=world_graph.plugin_failures_from_flags(flags),
+                                      unparsed_sources=world_graph.unparsed_sources_from_flags(flags))
     except Exception as e:
         # 失敗理由に接続先（ホスト:ポート）を含める（認証情報は含めない）。失敗した段も stage summary に所要時間とエラーを残す
         return _record("failed", extra_flags=[{"doc": None, "action": "blocked",
@@ -486,14 +506,7 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
         extra.append({"doc": None, "action": "warn", "reason": f"reconcile_failed:{e.__class__.__name__}"})
     status = "auto_published_with_flags" if (flags or extra) else "auto_published"
     # `esr` は `chunks`（bulk 対象件数）を既に持つので、`es_index.count()` は叩き直さない
-    es_summary = {"available": esr.get("available") if isinstance(esr, dict) else None,
-                 "error": esr.get("error") if isinstance(esr, dict) else None,
-                 "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
-                 # counts の元データ（`esr` に無ければ None のまま）
-                 "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
-                 "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
-                 "reused": esr.get("reused") if isinstance(esr, dict) else None,
-                 "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None}
+    es_summary = _es_summary(esr)                           # counts の元データ（`esr` に無ければ None のまま）
     neo4j_summary = {"nodes": n, "edges": m, "duration_sec": round(neo4j_duration_sec, 3)}
     # 既知の残余: 確定する署名は冒頭スキャン時点のもので、各段が実際に読んだ内容と原子的には一致しない（取り込み中の ABA で次回 sync が unchanged と誤判定しうる）。
     # 恒久変化なら次回 sync の署名不一致で自己修復する。
@@ -843,15 +856,7 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
     es_ok = esr.get("available") is True and not esr.get("error")
     # 呼び出し元の明示 ES 自己修復と同形（呼び出し元が `counts`/`stage_timings` へ畳み込む）
     es_refresh_info = {
-        "summary": {
-            "available": esr.get("available") if isinstance(esr, dict) else None,
-            "error": esr.get("error") if isinstance(esr, dict) else None,
-            "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
-            "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
-            "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
-            "reused": esr.get("reused") if isinstance(esr, dict) else None,
-            "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None,
-        },
+        "summary": _es_summary(esr),
         "stage_timing": {
             "started_at": _es_started_at,
             "finished_at": _es_finished_at,
@@ -1085,13 +1090,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                     if not (esr.get("available") is True and not esr.get("error")):
                         es_repair_failure = esr.get("error") or "unavailable"
                     # `_record` の es_summary と同形（counts の元データ）
-                    _outer_summary = {"available": esr.get("available") if isinstance(esr, dict) else None,
-                                      "error": esr.get("error") if isinstance(esr, dict) else None,
-                                      "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
-                                      "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
-                                      "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
-                                      "reused": esr.get("reused") if isinstance(esr, dict) else None,
-                                      "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None}
+                    _outer_summary = _es_summary(esr)
                     # 内部再索引の後に外側の再索引も走った場合は置換せず合成する（`_merge_es_runs`）
                     es_summary, _stage_timings["es_index"] = _merge_es_runs(
                         es_summary, _stage_timings.get("es_index"), _outer_summary, _outer_timing)

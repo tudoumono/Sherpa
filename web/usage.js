@@ -572,6 +572,14 @@ function renderStopKinds(stopKinds, stoppedTurns) {
   $('stopkind-total-badge').textContent = `利用者停止 ${fmtTokOrDash(stoppedTurns)}${stoppedTurns == null ? '' : '件'}`;
 }
 
+// 回答の完了状態（`answer.completion` の4値＋旧形式の 'unknown'）の内訳を終了理由の下に1行で出す。
+const COMPLETION_LABEL = { complete: '最後まで回答', partial: '途中までの回答', stopped: '停止', failed: '回答できず', unknown: '不明（旧形式）' };
+function renderCompletions(completions) {
+  const rows = (completions || []).filter((r) => r && (r.turns || 0) > 0);
+  $('completion-note').textContent = rows.length
+    ? '回答の状態: ' + rows.map((r) => `${COMPLETION_LABEL[r.completion] || r.completion} ${r.turns}件`).join('・') : '';
+}
+
 // ミリ秒を秒表記へ（null は未計測・欠落は未取得）。回答時間・所要時間の各テーブル/カードで共用。
 function fmtSecOrDash(ms) {
   if (ms === undefined) return '未取得';
@@ -754,6 +762,13 @@ const KIND_LABEL = {
 function kindLabel(k) { return KIND_LABEL[k] || k; }
 // トークン列は null（プロバイダが usage を報告しなかった「報告不能」マーカー）なら「未計測」、項目欠落なら「未取得」で表示する。
 function fmtTokOrDash(v) { return v === undefined ? '未取得' : v === null ? '未計測' : Number(v).toLocaleString('ja-JP'); }
+// キャッシュへの書き込み量。全件が不明（null）なら「不明」（0とは区別）、不明の行が混ざる合計は「（不明を含む）」を添える。項目欠落（古いサーバー）は「未取得」。
+function fmtCacheWrite(r) {
+  if (r.cache_write === undefined) return '未取得';
+  if (r.cache_write === null) return '不明';
+  const v = Number(r.cache_write).toLocaleString('ja-JP');
+  return r.cache_write_unknown > 0 ? `${v}（不明を含む）` : v;
+}
 function renderTokenKindTable(rows) {
   const card = $('token-kind-card');
   const tb = $('token-kind-tbody');
@@ -772,6 +787,7 @@ function renderTokenKindTable(rows) {
       <td class="num">${(r.calls || 0).toLocaleString('ja-JP')}</td>
       <td class="num">${fmtTokOrDash(r.input)}</td>
       <td class="num">${fmtTokOrDash(r.cached_input)}</td>
+      <td class="num">${fmtCacheWrite(r)}</td>
       <td class="num">${fmtTokOrDash(r.output)}</td>
       <td class="num">${fmtTokOrDash(r.reasoning_output)}</td>
       <td class="num">${fmtSecOrDash(r.elapsed_ms_total)}</td>
@@ -798,6 +814,7 @@ function renderTokenUserKindTable(rows) {
     <td class="num">${(r.calls || 0).toLocaleString('ja-JP')}</td>
     <td class="num">${fmtTokOrDash(r.input)}</td>
     <td class="num">${fmtTokOrDash(r.cached_input)}</td>
+    <td class="num">${fmtCacheWrite(r)}</td>
     <td class="num">${fmtTokOrDash(r.output)}</td>
     <td class="num">${fmtTokOrDash(r.reasoning_output)}</td>
     <td class="num">${fmtSecOrDash(r.elapsed_ms_total)}</td>
@@ -807,7 +824,7 @@ function renderTokenUserKindTable(rows) {
 function renderTokenModelTable(rows) {
   const tb = $('token-model-tbody');
   if (!rows.length) {
-    tb.innerHTML = '<tr class="empty-row"><td colspan="6">この期間のトークン記録はまだありません</td></tr>';
+    tb.innerHTML = '<tr class="empty-row"><td colspan="7">この期間のトークン記録はまだありません</td></tr>';
     return;
   }
   tb.innerHTML = rows.map((r) => {
@@ -818,6 +835,7 @@ function renderTokenModelTable(rows) {
       <td class="num">${(r.turns || 0).toLocaleString('ja-JP')}</td>
       <td class="num">${fmtTokOrDash(r.input)}</td>
       <td class="num">${fmtTokOrDash(r.cached_input)}</td>
+      <td class="num">${fmtCacheWrite(r)}</td>
       <td class="num">${fmtTokOrDash(r.output)}</td>
       <td class="num">${fmtTokOrDash(r.reasoning_output)}</td>
     </tr>`;
@@ -1009,6 +1027,7 @@ async function load(period) {
     renderWeeklyAndRetention(d.retention || {});
     renderDownloadsChart(d.downloads || {}, d.period);
     renderStopKinds(d.stop_kinds || [], d.stopped_turns);
+    renderCompletions(d.completions || []);
     renderConversationTurns(d.conversation_turns || {}, d.resume_rate);
     renderResponseTime(d.response_time || {});
     renderLimits(d.limits || {});

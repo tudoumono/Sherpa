@@ -95,14 +95,24 @@ def test_confirmed_no_ref_matches_downgrades_to_inferred():
                        "manifest_state": "valid"}
 
 
-def test_confirmed_partial_ref_match_stays_confirmed():
+def test_confirmed_partial_ref_match_downgrades():
     claims = [_claim(evidence_refs=["src/a.py:12", "src/other.py:5"])]
     snap = _snapshot({"i1": _ledger_item("i1", _EVIDENCE_A)})
     out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
-    assert out[0]["status"] == "confirmed"
-    # 一致しなかった側の参照は unmatched_refs に数える（維持されても集計はする）。
-    assert summary == {"ledger": True, "checked": 1, "downgraded": 0, "unmatched_refs": 1,
+    assert out[0]["status"] == "inferred"
+    assert "根拠が調査台帳に無い" in out[0]["reason"]
+    assert summary == {"ledger": True, "checked": 1, "downgraded": 1, "unmatched_refs": 1,
                        "manifest_state": "valid"}
+
+
+def test_confirmed_backed_only_by_unverified_item_downgrades():
+    """確認済みでない状態（unverified 等）の item の evidence は『確定』の裏付けにならない。"""
+    item = {**_ledger_item("i1", _EVIDENCE_A), "status": "unverified", "reason": "timeout"}
+    snap = _snapshot({"i1": item})
+    out, summary = STRUCT._claims_vs_ledger([_claim(evidence_refs=["src/a.py:12"])], snap,
+                                            manifest_file_exists=True)
+    assert out[0]["status"] == "inferred"
+    assert summary["downgraded"] == 1
 
 
 def test_confirmed_ref_to_unregistered_item_evidence_is_not_trusted():

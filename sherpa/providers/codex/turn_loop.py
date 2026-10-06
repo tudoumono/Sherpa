@@ -24,6 +24,7 @@ from .turn_candidates import (
     _candidate_final,
     _continuation_pending,
     _update_structured_state,
+    _salvage_body,
 )
 from ...env_int import env_int
 
@@ -56,6 +57,8 @@ def _resume_fallback(self, ctx, st, decision):
         st._structured_answers_valid_from = 0
         st._latest_structured = None
         st._resume_fallback_happened = True
+        st.prompt = st.prompt_with_history  # 新規セッションは履歴を持たないため前置する
+        st.resume_sid = None  # 以後の継続は新しい thread_id だけを使い、失敗した旧セッションへは戻らない
         yield from _attempt(self, ctx, st, decision, False)
         _absorb_last_message_fallback(st)
         _update_structured_state(st)
@@ -123,6 +126,7 @@ def _continue_until_done(self, ctx, st, decision):
                 st._ledger_review_attempted = True
                 st._ledger_review_pre_candidate = _candidate_final(st)
                 st._ledger_review_pre_len = len(_structured_answers)
+                st._ledger_review_pre_msgs_len = len(st._agent_msgs)
                 st._ledger_review_pre_valid_from = st._structured_answers_valid_from
                 st._ledger_review_pre_turn_failed = st._turn_failed
                 st._ledger_review_pre_turn_failed_code = st._turn_failed_code
@@ -185,7 +189,7 @@ def _continue_until_done(self, ctx, st, decision):
                 _ledger_prompt_text = _ledger_continue_prompt(_ledger_verdict)
                 # この継続を「進捗なし」の1回として仮計上する（次周の先頭の進捗比較で何か終端化していれば 0 へ戻る）。
                 _ledger_no_progress_streak += 1
-            # この final は拒否済み＝以後の見出し/主張候補から除外する（`_pick_structured_headline`/`_pick_structured_claims` はこの境界より後だけを見る）。
+            # この final は受理候補から除外する。本文は後続の final が無いときの部分回答として残す。
             st._structured_answers_valid_from = len(_structured_answers)
             st._ledger_continuations += 1
             yield _node(
@@ -228,6 +232,22 @@ def _revert_review_if_worse(st):
         if (_ledger_review_post is None or st._turn_failed or st.codex_question is not None
                 or _continuation_pending(st)
                 or _ledger_review_is_worse(st._ledger_review_pre_candidate, _ledger_review_post)):
+            _review_bodies = []
+            _review_contents = [_salvage_body(text) for text in
+                                [*st._agent_msgs[st._ledger_review_pre_msgs_len:], st._agent_partial]]
+            _review_contents.extend(s["answer"].strip() for s in _structured_answers[st._ledger_review_pre_len:])
+            for _body in _review_contents:
+                if (_body and _body != st._ledger_review_pre_candidate["answer"].strip()
+                        and _body not in _review_bodies):
+                    _review_bodies.append(_body)
+            _note = "見直し前の回答に戻しました。見直し後の回答は未完了・失敗または根拠の減少により採用していません。"
+            if _review_bodies:
+                _note += "\n\n採用しなかった見直しの内容（未確定）:\n\n" + "\n\n".join(_review_bodies)
+            else:
+                _note += "見直しの回答本文は回収できませんでした。"
+            if st._turn_failed or st._stream_error:
+                _note += "\n\n見直し後の処理が失敗しました。"
+            st._answer_notices.append(("review_reverted", _note))
             del _structured_answers[st._ledger_review_pre_len:]
             st._structured_answers_valid_from = min(
                 st._structured_answers_valid_from, st._ledger_review_pre_valid_from)
@@ -268,7 +288,7 @@ def _final_ledger_verdict(st):
 
 def run_session(self, ctx, st, decision, env):
     """Codex の実行を 1 ターン分行う: ファイルの書き込み → 初回実行 → 作り直し → 継続ループ → 安全弁 → 台帳の最終判定。
-    例外は握って `st.answer = None`・`st._stream_error = True` にし、サイドカーの取り込みと CODEX_HOME の後始末は必ず行う。"""
+    例外は回収済みの本文を残して注記し、サイドカーの取り込みと CODEX_HOME の後始末を行う。"""
     _all_parent_thread_ids = st._all_parent_thread_ids
     codex_home = st.codex_home
     # prepare/agent（`ctx.turn_started_mono`/`_agent_start_mono`/`_agent_end_mono` から）は最初の Popen・最後の wait が確定してから finally ブロックでまとめて計算する。
@@ -285,9 +305,10 @@ def run_session(self, ctx, st, decision, env):
         yield from _continue_until_done(self, ctx, st, decision)
         _revert_review_if_worse(st)
         _final_ledger_verdict(st)
-    except Exception:
-        st.answer = None
+    except Exception as exc:
         st._stream_error = True
+        st._answer_notices.append(f"調査の共通処理でエラーが発生しました（{type(exc).__name__}）。")
+        _log.warning("codex session failed: type=%s errno=%s", type(exc).__name__, getattr(exc, "errno", None))
     finally:
         # サイドカーは codex_home の削除・後始末より前に必ず一度吸収する（`_attempt()` の途中で例外が起きた経路の取りこぼし防止・fail-open）。
         _absorb_mcp_sidecar(st)

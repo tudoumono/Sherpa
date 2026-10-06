@@ -29,7 +29,7 @@ from sherpa.deps import (
     _under_roots,
 )
 from sherpa.grep_tool import valid_world
-from sherpa.ingest import background, failure_reasons, resolve_settings
+from sherpa.ingest import background, failure_reasons, resolve_settings, world_graph
 from sherpa.ingest import worker as ingest_worker
 from sherpa.preview_service import build_preview
 from sherpa.routers.graph import _GRAPH_UNAVAILABLE_MESSAGE  # /ingest/preview も同じ固定文言で 503 にする。
@@ -232,6 +232,41 @@ def worlds_list(request: Request):
     return {"worlds": [_public_world(r) for r in store.list_worlds_db()]}
 
 
+# `rag_degraded_by_reason` のうち「粗い区切りで索引した」ではなく別の通知になる理由。
+_ES_NOT_COARSE_REASONS = ("empty_text", "text_read_failed")
+
+
+def _ingest_notices(rep: dict, flags_all: list, es_stage) -> list[dict]:
+    """取り込みで黙って落とした・粗くしたものを `[{code, count}]` にまとめる（件数のみ・名前は出さない）。
+    走査（`rep["walk_skipped"]`）・関係グラフ（action の無い `dropped_syntax`/`unreadable_mention_doc` flag を打切り前の全件から）・全文索引（`es_stage`）の順。
+    """
+    out: list[dict] = []
+
+    def _add(code: str, count) -> None:
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            out.append({"code": code, "count": count})
+
+    walk = rep.get("walk_skipped")
+    for key in ("symlink", "unreadable_dir", "unreadable_file", "outside_root"):
+        _add("walk_" + key, walk.get(key) if isinstance(walk, dict) else None)
+    dict_flags = [f for f in flags_all if isinstance(f, dict)]
+    dropped = world_graph.unparsed_sources_from_flags(dict_flags)   # 関係グラフの coverage と同じ判定
+    mention_unreadable = sum(1 for f in dict_flags if f.get("reason") == "unreadable_mention_doc")
+    _add("graph_source_unparsed", dropped["syntax"])
+    _add("graph_source_oversize", dropped["size_exceeded"])
+    _add("graph_mention_doc_unreadable", mention_unreadable)
+    if isinstance(es_stage, dict):
+        by_reason = es_stage.get("rag_degraded_by_reason")
+        by_reason = by_reason if isinstance(by_reason, dict) else {}
+        _add("es_rag_degraded", sum(v for k, v in by_reason.items()
+                                   if k not in _ES_NOT_COARSE_REASONS and isinstance(v, int)))
+        _add("es_text_read_failed", by_reason.get("text_read_failed"))
+        _add("es_empty_text", by_reason.get("empty_text"))
+        _add("es_embed_failed_bm25_only", 1 if es_stage.get("embed_degraded") is True else 0)
+        _add("es_analyzer_fallback", 1 if es_stage.get("analyzer_fallback") is True else 0)
+    return out
+
+
 def _ingest_summary(wid: str, row: dict) -> dict:
     """取り込み状況の要約: インデックス件数・未対応(Office/PDF)件数・関係グラフ・ES 全文索引のチャンク数。
     `row`＝呼び出し元が取得済みの world 登録行（`store.get_world(wid)`・ここでは読み直さない）。
@@ -287,6 +322,7 @@ def _ingest_summary(wid: str, row: dict) -> dict:
         graph_nodes = pub_snap.get("nodes") or 0
         graph_edges = pub_snap.get("edges") or 0
     es_chunks = None
+    es_notice_stage = None
     # graph（Neo4j）と ES は反映の完了境界が異なる（台帳 replace 失敗の run は Neo4j へは反映済みでも ES へは未到達）。`get_latest_published_run_summary` を ES にも使うと、実際に ES へ触れた直近の run を隠すため、ES 専用の別クエリ（`extraction_snapshot ? 'es'` で絞り込み済み）を使う。
     es_run = store.get_latest_es_run_summary(wid)
     if es_run:
@@ -296,6 +332,7 @@ def _ingest_summary(wid: str, row: dict) -> dict:
         # bulk 投入が実際に成功した（`available is True` かつ `error` 無し）ときだけ chunks を件数として見せる（不明なときは None＝UI「不明」表示）。
         if isinstance(pub_es, dict) and pub_es.get("available") is True and not pub_es.get("error"):
             es_chunks = pub_es.get("chunks")
+            es_notice_stage = pub_es
     # 実行中（`status='extracting'`）の run だけ進捗を載せる。`extracting` は `reflect=False`（staging・テスト専用経路）の成功時終端状態でもあるため、`progress` 自体の有無で最終判定する。
     last_status = (last or {}).get("status")
     running_progress = (last or {}).get("progress") if last_status == "extracting" else None
@@ -306,6 +343,7 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     return {**rep, "counts_as_of": str(counts_as_of) if counts_as_of else None,
             "graph_nodes": graph_nodes, "graph_edges": graph_edges, "es_chunks": es_chunks,
             "es_state": es_state, "es_error": es_error, "es_index_kept": es_index_kept,
+            "ingest_notices": _ingest_notices(rep, flags_all, es_notice_stage),
             "last_run_id": (last or {}).get("id"),
             "last_run_status": last_status, "last_run_warnings": warns,
             "last_run_blocked": blocked,

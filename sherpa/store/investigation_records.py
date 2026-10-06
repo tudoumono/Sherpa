@@ -9,65 +9,95 @@ import json
 
 from psycopg.types.json import Json
 
+from ..investigation_record_render import describe_dropped  # noqa: F401  (呼び出し側が一緒に使う)
 from .db import _connect, _ensure
 
-# 1 件（manifest+items+coverage 合算）の大きさの上限。超過時は items を id 降順に後ろから、次に coverage、reviews、最後に manifest を縮めて収め、何か落としたら `truncated` を立てる。
+# 1 件（manifest+items+coverage+reviews+検索語の記録 合算）の大きさの上限。超過時は `trim_record` の順に落として収め、何か落としたら `truncated` を立て、内訳を `detail.dropped` に残す。
 MAX_RECORD_BYTES = 1024 * 1024
 
 
-def _record_size(manifest, items, coverage, reviews) -> int:
+def _record_size(manifest, items, coverage, reviews, coverage_detail=None) -> int:
     """保存前のバイト見積り（UTF-8 JSON 直列化）。"""
     return len(json.dumps({"manifest": manifest, "items": items, "coverage": coverage,
-                          "reviews": reviews}, ensure_ascii=False).encode("utf-8"))
+                          "reviews": reviews, "coverage_detail": coverage_detail or {}},
+                         ensure_ascii=False).encode("utf-8"))
+
+
+def trim_record(manifest: dict | None, items: dict, coverage: dict, reviews: list | None = None,
+                coverage_detail: dict | None = None) -> tuple[dict | None, dict, dict, list, dict, dict]:
+    """`MAX_RECORD_BYTES` を超える場合、coverage_detail（検索語・資料・範囲）、items（id 降順に 1 件ずつ）、coverage、reviews（1 件ずつ後ろから）、manifest（質問の種類だけに縮める）の順に落とす（純関数）。
+    戻り値は `(manifest, items, coverage, reviews, coverage_detail, dropped)`。`dropped` は落としたものの内訳 `{"coverage_detail": 落とした項目数, "items": 落とした件数, "coverage": 落とした項目数, "reviews": 落とした件数, "manifest": 縮めたか}`（落とさなかった欄は無い・何も落とさなければ空）。
+    """
+    items = dict(items or {})
+    reviews = list(reviews or [])
+    coverage = dict(coverage or {})
+    coverage_detail = dict(coverage_detail or {})
+    dropped: dict = {}
+
+    def _over() -> bool:
+        return _record_size(manifest, items, coverage, reviews, coverage_detail) > MAX_RECORD_BYTES
+
+    if not _over():
+        return manifest, items, coverage, reviews, coverage_detail, dropped
+    for item_id in sorted(coverage_detail, reverse=True):
+        if not _over():
+            break
+        del coverage_detail[item_id]
+        dropped["coverage_detail"] = dropped.get("coverage_detail", 0) + 1
+    for item_id in sorted(items, reverse=True):
+        if not _over():
+            break
+        del items[item_id]
+        dropped["items"] = dropped.get("items", 0) + 1
+    if _over() and coverage:
+        dropped["coverage"] = len(coverage)
+        coverage = {}
+    while _over() and reviews:
+        reviews.pop()
+        dropped["reviews"] = dropped.get("reviews", 0) + 1
+    if _over():
+        kind = (manifest or {}).get("question_kind") if isinstance(manifest, dict) else None
+        manifest = {"question_kind": kind} if isinstance(kind, str) and len(kind) <= 64 else None
+        dropped["manifest"] = True
+    return manifest, items, coverage, reviews, coverage_detail, dropped
 
 
 def trim_to_budget(manifest: dict | None, items: dict, coverage: dict,
                    reviews: list | None = None) -> tuple[dict | None, dict, dict, list, bool]:
-    """`MAX_RECORD_BYTES` を超える場合、items を id 降順に1件ずつ落とし、足りなければ coverage、reviews、manifest（質問の種類だけに縮める）の順に縮める（純関数）。
-    何か落としたら `truncated=True`。戻り値は `(manifest, items, coverage, reviews, truncated)`。
-    """
-    items = dict(items or {})
-    reviews = list(reviews or [])
-    if _record_size(manifest, items, coverage, reviews) <= MAX_RECORD_BYTES:
-        return manifest, items, coverage, reviews, False
-    truncated = False
-    for item_id in sorted(items, reverse=True):
-        if _record_size(manifest, items, coverage, reviews) <= MAX_RECORD_BYTES:
-            break
-        del items[item_id]
-        truncated = True
-    if _record_size(manifest, items, coverage, reviews) > MAX_RECORD_BYTES:
-        coverage = {}
-        truncated = True
-    if _record_size(manifest, items, coverage, reviews) > MAX_RECORD_BYTES:
-        reviews = []
-        truncated = True
-    if _record_size(manifest, items, coverage, reviews) > MAX_RECORD_BYTES:
-        kind = (manifest or {}).get("question_kind") if isinstance(manifest, dict) else None
-        manifest = {"question_kind": kind} if isinstance(kind, str) and len(kind) <= 64 else None
-        truncated = True
-    return manifest, items, coverage, reviews, truncated
+    """`trim_record` の旧形式の戻り値（何か落としたら `truncated=True`）。戻り値は `(manifest, items, coverage, reviews, truncated)`。"""
+    manifest, items, coverage, reviews, _detail, dropped = trim_record(manifest, items, coverage, reviews)
+    return manifest, items, coverage, reviews, bool(dropped)
 
 
 def save_investigation_record(message_id: int, conversation_id: int, *,
                               complete: bool, manifest: dict | None,
-                              items: dict, coverage: dict, reviews: list | None = None) -> dict:
+                              items: dict, coverage: dict, reviews: list | None = None,
+                              coverage_detail: dict | None = None, extras: dict | None = None) -> dict:
     """投稿時点の調査台帳を1行保存する。assistant message の保存直後に呼ぶ（`message_id` は `messages` に実在すること＝FK）。
-    `trim_to_budget` で切り詰めてから書く。`reviews` は中間の見直し（省略時は []）。
-    戻り値は保存した行（`complete`/`truncated`/`manifest`/`items`/`coverage`/`reviews` を含む）。
+    `trim_record` で切り詰めてから書き、落としたものの内訳と検索語・読んだ範囲を `detail`（`{"dropped", "coverage", ...}`）に残す。`extras` は呼び出し側が先に切り詰めた分の内訳などを `detail` へ足す（`dropped` は合算）。
+    戻り値は保存した行（`complete`/`truncated`/`manifest`/`items`/`coverage`/`reviews`/`detail` を含む）。
     """
-    manifest, items, coverage, reviews, truncated = trim_to_budget(manifest, items, coverage, reviews)
+    manifest, items, coverage, reviews, coverage_detail, dropped = trim_record(
+        manifest, items, coverage, reviews, coverage_detail)
+    detail: dict = dict(extras or {})
+    prior = detail.get("dropped") if isinstance(detail.get("dropped"), dict) else {}
+    merged = {**prior, **dropped}
+    if merged:
+        detail["dropped"] = merged
+    if coverage_detail:
+        detail["coverage"] = coverage_detail
+    truncated = bool(merged)
     _ensure()
     with _connect() as c:
         return c.execute(
             "INSERT INTO investigation_records "
-            "  (message_id, conversation_id, complete, truncated, manifest, items, coverage, reviews) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+            "  (message_id, conversation_id, complete, truncated, manifest, items, coverage, reviews, detail) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
             "RETURNING message_id, conversation_id, created_at, complete, truncated, "
-            "  manifest, items, coverage, reviews",
+            "  manifest, items, coverage, reviews, detail",
             (message_id, conversation_id, bool(complete), truncated,
              Json(manifest) if manifest is not None else None,
-             Json(items), Json(coverage), Json(reviews)),
+             Json(items), Json(coverage), Json(reviews), Json(detail)),
         ).fetchone()
 
 
@@ -77,6 +107,6 @@ def get_investigation_record(message_id: int) -> dict | None:
     with _connect() as c:
         return c.execute(
             "SELECT message_id, conversation_id, created_at, complete, truncated, "
-            "  manifest, items, coverage, reviews FROM investigation_records WHERE message_id=%s",
+            "  manifest, items, coverage, reviews, detail FROM investigation_records WHERE message_id=%s",
             (message_id,),
         ).fetchone()

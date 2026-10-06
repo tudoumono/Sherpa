@@ -93,10 +93,23 @@ class Bitmap:
 
 @dataclass
 class MetafileContent:
+    """抽出結果。`lines_dropped`／`chars_dropped`＝行数・文字数の上限で落とした分、`text_items_capped`／`bitmaps_capped`＝文字要素数・ビットマップ数の上限に達した（落とした数は数えない）、
+    `bitmaps_excluded`＝大きさ・形式の条件で除いたビットマップの数（重複は数えない）。いずれも本文を変えず、変換の記録（`.md.meta.json`）へ残すだけ。
+    """
     kind: str | None = None
     lines: list[str] = field(default_factory=list)
     bitmaps: list[Bitmap] = field(default_factory=list)
     reason: str | None = None
+    lines_dropped: int = 0
+    chars_dropped: int = 0
+    text_items_capped: bool = False
+    bitmaps_capped: bool = False
+    bitmaps_excluded: int = 0
+
+
+class _BitmapList(list):
+    """`_bitmap_from_dib` が条件（大きさ・形式）で除いたビットマップの数を持つ入れ物。"""
+    excluded = 0
 
 
 @dataclass
@@ -185,6 +198,10 @@ def dib_to_bmp(dib: bytes) -> bytes | None:
 
 
 def _bitmap_from_dib(dib: bytes, out: list[Bitmap], seen: set[str]) -> None:
+    def _excluded() -> None:
+        if isinstance(out, _BitmapList):
+            out.excluded += 1
+
     if len(out) >= MAX_BITMAPS or len(dib) < 16:
         return
     header_size = _u32(dib, 0)
@@ -193,8 +210,10 @@ def _bitmap_from_dib(dib: bytes, out: list[Bitmap], seen: set[str]) -> None:
     elif header_size >= 40 and len(dib) >= 12:
         width, height = _i32(dib, 4), abs(_i32(dib, 8))
     else:
+        _excluded()
         return
     if width < MIN_BITMAP_SIDE or height < MIN_BITMAP_SIDE or width * height > MAX_BITMAP_PIXELS:
+        _excluded()
         return
     digest = hashlib.sha256(dib).hexdigest()
     if digest in seen:
@@ -202,6 +221,7 @@ def _bitmap_from_dib(dib: bytes, out: list[Bitmap], seen: set[str]) -> None:
     seen.add(digest)
     bmp = dib_to_bmp(dib)
     if bmp is None:
+        _excluded()
         return
     try:
         from PIL import Image
@@ -211,6 +231,7 @@ def _bitmap_from_dib(dib: bytes, out: list[Bitmap], seen: set[str]) -> None:
             buffer = io.BytesIO()
             rgb.save(buffer, format="PNG")
     except Exception:
+        _excluded()
         return
     out.append(Bitmap(png=buffer.getvalue(), width=width, height=height, source_sha256=digest))
 
@@ -435,6 +456,11 @@ def _cap_lines(lines: list[str]) -> list[str]:
     return result
 
 
+def _dropped_by_cap(lines: list[str], kept: list[str]) -> tuple[int, int]:
+    """`_cap_lines` が落とした `(行数, 文字数)`。途中で切った行は残った行に数え、切った分の文字数だけ文字数に足す。"""
+    return len(lines) - len(kept), sum(len(x) for x in lines) - sum(len(x) for x in kept)
+
+
 def extract(data: bytes) -> MetafileContent:
     """WMF/EMF の bytes から文字行と埋込ビットマップ（PNG）を取り出す。例外は外へ出さない。"""
     kind = sniff(data[:SNIFF_BYTES])
@@ -446,13 +472,18 @@ def extract(data: bytes) -> MetafileContent:
         result.reason = "too_large"
         return result
     items: list[_Item] = []
-    bitmaps: list[Bitmap] = []
+    bitmaps = _BitmapList()
     try:
         reason = (_parse_wmf if kind == "wmf" else _parse_emf)(data, items, bitmaps, set())
     except Exception as exc:                      # 壊れた入力で取り込みを止めない
         reason = f"parse_error:{exc.__class__.__name__}"
-    result.lines = _cap_lines(_order_lines(items))
-    result.bitmaps = bitmaps
+    ordered = _order_lines(items)
+    result.lines = _cap_lines(ordered)
+    result.lines_dropped, result.chars_dropped = _dropped_by_cap(ordered, result.lines)
+    result.text_items_capped = len(items) >= MAX_TEXT_ITEMS
+    result.bitmaps_capped = len(bitmaps) >= MAX_BITMAPS
+    result.bitmaps_excluded = bitmaps.excluded
+    result.bitmaps = list(bitmaps)
     result.reason = reason
     return result
 

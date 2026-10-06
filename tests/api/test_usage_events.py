@@ -116,6 +116,40 @@ def test_by_kind_aggregation_roundtrip():
         _delete_usage_events_by_model(models)
 
 
+def test_by_kind_cache_write_keeps_unknown_distinct_from_zero():
+    """キャッシュ書き込み量: 全件が不明なら None・既知と不明が混ざる合計は既知分の和＋不明件数（0 に丸めない）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin, admin_uid = _admin_client()
+    world = f"usgevcw{sfx}"
+    m_known, m_mixed, m_unknown = (f"test-model-cw-{k}-{sfx}" for k in ("known", "mixed", "unknown"))
+    models = [m_known, m_mixed, m_unknown]
+    try:
+        common = dict(provider="openai", input_tokens=10, cached_input_tokens=0, output_tokens=1,
+                      reasoning_output_tokens=0, calls=1, user_id=admin_uid, world=world)
+        store.add_usage_event(kind="intent", model=m_known, cache_write_tokens=0, **common)
+        store.add_usage_event(kind="intent", model=m_mixed, cache_write_tokens=8, **common)
+        store.add_usage_event(kind="intent", model=m_mixed, cache_write_tokens=None, **common)
+        store.add_usage_event(kind="intent", model=m_unknown, cache_write_tokens=None, **common)
+        conv = store.create_conversation(user_id=admin_uid, world=world, title="cw")
+        _turn_with_usage(conv["id"], "qa", {"provider": "openai", "model": f"chat-cw-{sfx}", "input_tokens": 5,
+                                            "cached_input_tokens": 0, "output_tokens": 1,
+                                            "reasoning_output_tokens": 0})   # 書き込み量の項目なし＝不明
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        tokens = r.json()["tokens"]
+        by_kind = {(row["kind"], row["model"]): row for row in tokens["by_kind"]}
+        assert (by_kind[("intent", m_known)]["cache_write"], by_kind[("intent", m_known)]["cache_write_unknown"]) == (0, 0)
+        assert (by_kind[("intent", m_mixed)]["cache_write"], by_kind[("intent", m_mixed)]["cache_write_unknown"]) == (8, 1)
+        assert (by_kind[("intent", m_unknown)]["cache_write"], by_kind[("intent", m_unknown)]["cache_write_unknown"]) == (None, 1)
+        chat_row = by_kind[("chat", f"chat-cw-{sfx}")]
+        assert chat_row["cache_write"] is None and chat_row["cache_write_unknown"] == 1
+        assert tokens["totals"]["cache_write_unknown"] >= 1
+    finally:
+        _delete_usage_events_by_model(models)
+
+
 def test_meta_column_roundtrip():
     """`meta`（JSONB・省略可）: 渡さない既存経路は NULL のまま書ける・渡すと読み返せる。"""
     if not _try_init():

@@ -30,6 +30,36 @@ KINDS = ("intent", "embed", "graph_ask", "vlm", "chat-sub", "chat-plan",
         "usage_chat", "research", "answer", "chat-review", "chat-round", "rag_render")
 
 _TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+# キャッシュへの書き込み量。プロバイダが返さない場合は 0 ではなく不明（辞書では項目ごと欠落・DB では NULL）で持つため `_TOKEN_FIELDS` とは別に扱う。
+_CACHE_WRITE_FIELD = "cache_write_tokens"
+# 応答の usage 内でキャッシュ書き込み量を指す項目名（OpenAI の `input_tokens_details.cache_write_tokens` と同名だけを読む）。
+_CACHE_WRITE_SOURCE_KEYS = ("cache_write_tokens",)
+
+
+def _opt_int(v) -> int | None:
+    """数値として読める値だけ非負整数にし、無い・数値でない値は None（不明）のまま返す。0 に丸めない。"""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return max(int(v), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def cache_write_from_usage(usage: dict | None, *details: dict | None) -> int | None:
+    """応答の usage（`details`＝`prompt_tokens_details`/`input_tokens_details` など）からキャッシュ書き込み量を取り出す。details を先に、次に usage 直下を見る。どこにも無ければ None（不明）。"""
+    for src in (*details, usage):
+        if isinstance(src, dict):
+            for key in _CACHE_WRITE_SOURCE_KEYS:
+                v = _opt_int(src.get(key))
+                if v is not None:
+                    return v
+    return None
+
+
+def sum_cache_write(a: int | None, b: int | None) -> int | None:
+    """キャッシュ書き込み量の合算。どちらかが不明（None）なら合計も不明（既知分だけの下限値を実測として見せない）。"""
+    return None if a is None or b is None else a + b
 
 
 def _clamp_int(v) -> int:
@@ -69,14 +99,16 @@ def record(kind, provider, model, usage, *, user_id=None, world=None, calls=1,
     try:
         if isinstance(usage, dict):
             tokens = {f: _clamp_int(usage.get(f)) for f in _TOKEN_FIELDS}
+            tokens[_CACHE_WRITE_FIELD] = _opt_int(usage.get(_CACHE_WRITE_FIELD))
         else:
-            tokens = dict.fromkeys(_TOKEN_FIELDS)  # usage が None（または辞書でない）＝報告不能マーカー
+            tokens = dict.fromkeys(_TOKEN_FIELDS + (_CACHE_WRITE_FIELD,))  # usage が None（または辞書でない）＝報告不能マーカー
         prov_c, model_c, world_c = _clamp_str(provider), _clamp_str(model), _clamp_str(world)
         elapsed_ms_val = (round(elapsed_ms) if elapsed_ms is not None
                          else (round(elapsed * 1000) if elapsed is not None else None))
         _ue.add_usage_event(kind=kind, provider=prov_c, model=model_c,
                             input_tokens=tokens["input_tokens"],
                             cached_input_tokens=tokens["cached_input_tokens"],
+                            cache_write_tokens=tokens[_CACHE_WRITE_FIELD],
                             output_tokens=tokens["output_tokens"],
                             reasoning_output_tokens=tokens["reasoning_output_tokens"],
                             calls=calls, user_id=_clamp_str(user_id), world=world_c,
@@ -166,8 +198,11 @@ def acc_add(usage) -> None:
         if isinstance(usage, dict):
             if frame["tokens"] is None:
                 frame["tokens"] = dict.fromkeys(_TOKEN_FIELDS, 0)
+            frame["cw"] = sum_cache_write(frame.get("cw", 0), _opt_int(usage.get(_CACHE_WRITE_FIELD)))
             for f in _TOKEN_FIELDS:
                 frame["tokens"][f] += _clamp_int(usage.get(f))
+        else:
+            frame["cw"] = None  # usage が取れなかった呼び出しを含む合算は書き込み量も不明
     except Exception:
         pass
 
@@ -183,7 +218,10 @@ def acc_end() -> tuple:
         if t0 is not None:
             _local.last_elapsed = time.monotonic() - t0
             _local.last_elapsed_ts = time.monotonic()
-        return frame["tokens"], frame["calls"]
+        tokens = frame["tokens"]
+        if tokens is not None and frame.get("cw") is not None:
+            tokens = {**tokens, _CACHE_WRITE_FIELD: frame["cw"]}  # 1 回でも不明な呼び出しを含めば項目ごと載せない
+        return tokens, frame["calls"]
     except Exception:
         return None, 0
 
@@ -203,8 +241,11 @@ def acc_merge(tokens: dict | None, calls: int) -> None:
         if isinstance(tokens, dict):
             if frame["tokens"] is None:
                 frame["tokens"] = dict.fromkeys(_TOKEN_FIELDS, 0)
+            frame["cw"] = sum_cache_write(frame.get("cw", 0), _opt_int(tokens.get(_CACHE_WRITE_FIELD)))
             for f in _TOKEN_FIELDS:
                 frame["tokens"][f] += _clamp_int(tokens.get(f))
+        else:
+            frame["cw"] = None
     except Exception:
         pass
 
@@ -229,7 +270,7 @@ def acc_elapsed() -> float | None:
 
 
 # ---- プロバイダ別・例外安全な usage パーサ群 ----
-# 各々 `{input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens}` の辞書、または usage が無ければ None を返す（例外は出さない）。
+# 各々 `{input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens}`（キャッシュ書き込み量 `cache_write_tokens` は返された場合だけ・無ければ欠落＝不明）の辞書、または usage が無ければ None を返す（例外は出さない）。
 # `agentic_search.py`（es_index を引き込む）を ingest 経路に持ち込まないため意図的に重複させている
 
 def usage_from_openai_chat(resp) -> dict | None:
@@ -240,8 +281,10 @@ def usage_from_openai_chat(resp) -> dict | None:
             return None
         pd = u.get("prompt_tokens_details") or {}
         cd = u.get("completion_tokens_details") or {}
+        cw = cache_write_from_usage(u, pd, u.get("input_tokens_details"))
         return {"input_tokens": u.get("prompt_tokens"),
                 "cached_input_tokens": pd.get("cached_tokens"),
+                **({} if cw is None else {"cache_write_tokens": cw}),
                 "output_tokens": u.get("completion_tokens"),
                 "reasoning_output_tokens": cd.get("reasoning_tokens")}
     except Exception:

@@ -44,7 +44,7 @@ _TURNS_HEADER = [
     "会話番号", "回答番号", "日時(JST)", "利用者ID", "用途", "経路", "モデル",
     "終了理由", "エラーコード", "所要ms",
     "準備ms", "Codex実行ms", "後処理ms",
-    "入力トークン", "キャッシュ入力トークン", "出力トークン", "推論トークン",
+    "入力トークン", "キャッシュ入力トークン", "キャッシュ書込トークン", "出力トークン", "推論トークン",
     "下調べ役の数", "下調べ役トークン合計",
     "本体往復数", "本体最大入力", "圧縮回数",
     "台帳完了", "台帳継続回数",
@@ -52,13 +52,13 @@ _TURNS_HEADER = [
 ] + [_LIMIT_LABELS[f] for f, _ in _LIMIT_FIELDS]
 
 _AGENTS_HEADER = ["会話番号", "回答番号", "役割", "モデル", "入力トークン", "キャッシュ入力トークン",
-                 "出力トークン", "推論トークン", "往復数", "最大入力", "圧縮回数"]
+                 "キャッシュ書込トークン", "出力トークン", "推論トークン", "往復数", "最大入力", "圧縮回数"]
 
 _TOOLS_HEADER = ["会話番号", "回答番号", "役割", "ツール名", "回数", "バイト", "最大バイト",
                 "合計ms", "切詰", "打切", "失敗", "サンド失敗"]
 
 _AUX_HEADER = ["日時(JST)", "用途", "経路", "モデル", "入力トークン", "キャッシュ入力トークン",
-              "出力トークン", "推論トークン", "呼び出し回数", "経過ms", "利用者ID", "会話番号"]
+              "キャッシュ書込トークン", "出力トークン", "推論トークン", "呼び出し回数", "経過ms", "利用者ID", "会話番号"]
 
 _DAILY_HEADER = ["日付", "利用者数", "ターン数", "入力トークン", "出力トークン"]
 
@@ -135,6 +135,7 @@ def _turns_row(row: dict, answer: dict) -> list:
         _num(answer.get("duration_ms")),
         _num(phases.get("prepare")), _num(phases.get("agent")), _num(phases.get("post")),
         _num(usage.get("input_tokens")), _num(usage.get("cached_input_tokens")),
+        _num(usage.get("cache_write_tokens")),
         _num(usage.get("output_tokens")), _num(usage.get("reasoning_output_tokens")),
         len(children) if has_agents else None, sub_agent_tokens_total,
         len(parent_rounds) if parent is not None else None,
@@ -159,6 +160,7 @@ def _agent_row(conv_id, msg_id, label: str, agent: dict) -> list:
     return [
         conv_id, msg_id, label, _safe(agent.get("model"), _MODEL),
         _num(tok.get("input_tokens")), _num(tok.get("cached_input_tokens")),
+        _num(tok.get("cache_write_tokens")),
         _num(tok.get("output_tokens")), _num(tok.get("reasoning_output_tokens")),
         len(rounds), max(inputs) if inputs else None, len(comps),
     ]
@@ -177,6 +179,7 @@ def _aux_row(r: dict) -> list:
         _jst_str(r.get("ts")), _safe_or_none(r.get("kind"), _IDENT), _safe_or_none(r.get("provider"), _IDENT),
         _safe_or_none(r.get("model"), _MODEL),
         _num(r.get("input_tokens")), _num(r.get("cached_input_tokens")),
+        _num(r.get("cache_write_tokens")),
         _num(r.get("output_tokens")), _num(r.get("reasoning_output_tokens")),
         _num(r.get("calls")), _num(r.get("elapsed_ms")),
         _str_or_none(r.get("uid")), r.get("conversation_id") if isinstance(r.get("conversation_id"), int) else None,
@@ -220,15 +223,15 @@ def _readme_text(period: dict, retrieved_at: datetime, app_ver: str | None) -> s
         "（上位10件などの絞り込みも画面と同じ）。",
         "  turns.csv       回答（assistant 返答）1件=1行。会話番号・回答番号・日時・利用者ID・"
         "用途・経路・モデル・終了理由・エラーコード・所要時間・準備/Codex/後処理の所要時間・"
-        "トークン4種・下調べ役の数とトークン合計・本体の往復数と最大入力・圧縮回数・調査台帳"
+        "トークン4種・キャッシュ書込・下調べ役の数とトークン合計・本体の往復数と最大入力・圧縮回数・調査台帳"
         "（完了・継続回数）・主な設定・版・打ち切りの内訳。Codex 経路の詳しい記録が無い回答は"
         "該当欄が空欄です。",
-        "  agents.csv      回答×エージェント（本体/下調べ役N）=1行。モデル・トークン4種・"
+        "  agents.csv      回答×エージェント（本体/下調べ役N）=1行。モデル・トークン4種・キャッシュ書込・"
         "往復数・最大入力・圧縮回数。",
         "  tools.csv       回答×エージェント×ツール=1行。回数・バイト・最大バイト・合計所要"
         "時間・切詰/打切/失敗/サンドボックス失敗の件数。",
         "  aux_calls.csv   期間内のチャット以外のAI呼び出し（usage_events）1件=1行。日時・"
-        "用途・経路・モデル・トークン4種・呼び出し回数・経過時間・利用者ID・会話番号。",
+        "用途・経路・モデル・トークン4種・キャッシュ書込・呼び出し回数・経過時間・利用者ID・会話番号。",
         "  daily.csv       日別。日付・利用者数・ターン数・入力/出力トークン。",
         "  activity/<会話番号>.txt   その会話の期間内の回答ごとの活動記録（本体と下調べ役の"
         "トークン・往復・圧縮・ツール別の回数とバイト）を数字だけで表示。",

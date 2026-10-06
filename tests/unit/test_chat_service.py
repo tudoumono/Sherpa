@@ -1255,11 +1255,24 @@ def test_finalize_no_retry_hints_for_explicit_error_envelope():
     assert "retry_hints" not in out and out["headline"] != CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
 
 
-def test_finalize_replaces_headline_when_loosest_and_no_hints_qa():
+def test_finalize_keeps_body_with_notice_when_loosest_and_no_hints_qa():
     env = _env([], _scope())
     env["headline"] = "該当する記述は見つかりませんでした（確証なし）。検索語を変えて試してください。"
     out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
-    assert "retry_hints" not in out and out["headline"] == CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
+    assert "retry_hints" not in out and out["body"].startswith("該当する記述は見つかりませんでした")
+    assert [n["kind"] for n in out["notices"]] == ["no_sources"]
+    # 本文が空のときだけ固定文が本文になる。
+    empty = _env([], _scope())
+    empty["headline"] = ""
+    assert CS._finalize(empty, {"lens": "qa", "reason": "既定（検索）"})["body"] == CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
+
+
+def test_finalize_keeps_codex_body_with_notice_when_no_sources():
+    env = _env([], _scope(), data={"citations": []})
+    env["headline"] = "本文です。"
+    env["codex_multi_agent"] = True
+    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
+    assert out["headline"] == f"{CS._CODEX_NO_SOURCES_NOTICE}\n\n本文です。"
 
 
 @pytest.mark.parametrize("task_id,replaced", [("main", False), ("sub:worker", True)])
@@ -1269,7 +1282,7 @@ def test_finalize_budget_headline_kept_only_for_main_task_id(task_id, replaced):
     env["headline"] = "調査が上限に達したため、ここまでに確認できた内容のみをお伝えします。"
     out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
     assert "retry_hints" not in out
-    assert (out["headline"] == CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE) is replaced
+    assert out["body"] == env["body"] and bool(out["notices"]) is replaced   # 本文は置換せず、予算到達以外は注記を足す
 
 
 def test_finalize_keeps_partial_headline_when_codex_stopped_early_even_with_zero_sources():
@@ -1427,8 +1440,9 @@ def test_finalize_graph_degraded_notice_survives_no_results_headline():
            "scope": {"world": "w1", "scope_paths": [], "source": "all", "layer": "both", "depth_profile": "max"},
            "graph_degraded": "graph_unavailable"}
     out = CS._finalize(env, {"lens": "qa", "reason": "テスト"})
-    assert out["headline"].startswith("関係のつながりをたどる検索に接続できなかったため")
-    assert out["headline"].endswith(CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE)
+    assert "関係のつながりをたどる検索に接続できなかったため" in out["headline"]
+    assert out["headline"].endswith("該当する記述は見つかりませんでした。")
+    assert {n["kind"] for n in out["notices"]} == {"graph_degraded", "no_sources"}
     assert out["limits"]["backend_unavailable_graph"] is True
 
 
@@ -1555,3 +1569,12 @@ def test_coverage_hint_for_quick_even_when_results_exist(message, shown):
 def test_impact_headline_without_structural_items_has_no_grading_words():
     h = CS._answer_impact({"items": [], "start": "税率", "presumed": [{"name": "TAXCALC", "evidence": []}]}, "w")["headline"]
     assert "見つけた関連" in h and not any(w in h for w in ("確実", "推定", "要確認"))
+
+
+def test_history_note_does_not_claim_drop_when_window_only_filled_by_unpaired_rows():
+    cid = _new_conv()
+    n = CS._HISTORY_TURNS
+    _add_pairs(cid, *[(f"質問{i}", f"回答{i}") for i in range(n)])
+    _add_pairs(cid, *[(f"止められた質問{i}", None) for i in range(8)])
+    note = CS._history_pairs(cid).note
+    assert "対は" not in note

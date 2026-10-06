@@ -878,7 +878,8 @@ def test_item_coverage_recorded_for_hit_and_no_hits_outcomes_in_shared_ledger_di
     assert not _call("ripgrep_search", {"query": "TAX-RATE", "item": "a"})["result"]["isError"]
     assert IL.load_coverage(directory)["a"] == ("hit",)
     first = json.loads((directory / "coverage.jsonl").read_text(encoding="utf-8").splitlines()[0])
-    assert first["tool"] == "ripgrep_search" and set(first) == {"item", "tool", "outcome", "ts"}
+    assert first["tool"] == "ripgrep_search" and set(first) == {"item", "tool", "outcome", "ts", "query"}
+    assert first["query"] == "TAX-RATE"  # 検索語も記録する（本文は記録しない）
     assert not _call("ripgrep_search", {"query": "ZZZ_NO_SUCH_TOKEN_XYZ", "item": "a"})["result"]["isError"]
     assert IL.load_coverage(directory) == {"a": ("hit", "no_hits")}
 
@@ -945,3 +946,49 @@ def test_item_coverage_read_doc_outcomes(tmp_path, monkeypatch):
 ])
 def test_coverage_outcome_classification(name, result, is_error, expected):
     assert M._coverage_outcome(name, result, is_error) == expected
+
+
+def test_office_and_pdf_reads_are_recorded_in_coverage_with_range_and_write_failure_is_reported(
+        tmp_path, monkeypatch):
+    """原本の Office／PDF の読み取り・比較・一覧も、検索語・資料・読んだ範囲つきで台帳に記録する。
+    記録を書けなかったら黙らず、サイドカーで親へ知らせる（ツール呼出しは失敗させない）。"""
+    directory = tmp_path / "investigation"
+    sidecar = tmp_path / "sidecar.jsonl"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
+    _stub_run_tool(monkeypatch, {"pages": [{"no": 3, "text": "x"}], "truncated": True})
+    assert not _call("pdf_pages", {"doc_id": "仕様/a.pdf", "pages": "3-4", "item": "p"})["result"]["isError"]
+    _stub_run_tool(monkeypatch, {"sheet": "S1", "cells": []})
+    assert not _call("xlsx_range", {"doc_id": "仕様/b.xlsx", "sheet": "S1", "range": "B3:D10", "item": "p"})["result"]["isError"]
+    _stub_run_tool(monkeypatch, {"status": "ok", "diff": ""})
+    assert not _call("compare_documents", {"left_doc_id": "5期/a.md", "right_doc_id": "6期/a.md", "item": "p"})["result"]["isError"]
+    _stub_run_tool(monkeypatch, {"count": 2, "docs": []})
+    assert not _call("glob_search", {"pattern": "*.jcl", "item": "p"})["result"]["isError"]
+    detail = IL.load_coverage_detail(directory)["p"]
+    assert detail[0] == {"tool": "pdf_pages", "outcome": "truncated", "doc": "仕様/a.pdf", "range": "ページ 3-4"}
+    assert detail[1]["range"] == "S1!B3:D10" and detail[1]["doc"] == "仕様/b.xlsx"
+    assert detail[2]["doc"] == "5期/a.md ⇔ 6期/a.md" and detail[3]["query"] == "*.jcl"
+    assert IL.load_coverage(directory) == {"p": ("truncated", "hit", "hit", "hit")}
+    assert not [e for e in _entries(sidecar) if e["kind"] == "limit"]
+    # 台帳の置き場が書けない（通常ファイル）ときは、結果はそのまま返し、書けなかったことをサイドカーで報告する。
+    blocked = tmp_path / "blocked"
+    blocked.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(blocked))
+    _stub_run_tool(monkeypatch, {"pages": []})
+    assert not _call("pdf_pages", {"doc_id": "仕様/c.pdf", "item": "p"})["result"]["isError"]
+    assert {"kind": "limit", "field": "coverage_write_failed"}.items() <= _entries(sidecar)[-1].items()
+
+
+def test_coverage_detail_never_stores_sensitive_doc_names_and_drops_queries_for_personal_turns(tmp_path, monkeypatch):
+    """秘匿名の資料は coverage に記録しない。個人ファイルを使うターンでは検索語も記録しない。"""
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    _stub_run_tool(monkeypatch, {"text": "x"})
+    assert not _call("read_doc", {"doc_id": "鍵/server.pem", "item": "s"})["result"]["isError"]
+    _stub_run_tool(monkeypatch, {"hits": [{"doc_id": "a.md", "text": "x"}]})
+    assert not _call("ripgrep_search", {"query": "COVNOQ-1", "item": "s"})["result"]["isError"]
+    monkeypatch.setenv("SHERPA_MCP_COVERAGE_NO_QUERY", "1")
+    assert not _call("ripgrep_search", {"query": "COVNOQ-2", "item": "s"})["result"]["isError"]
+    text = (directory / "coverage.jsonl").read_text(encoding="utf-8")
+    assert "server.pem" not in text and "COVNOQ-1" in text and "COVNOQ-2" not in text
+

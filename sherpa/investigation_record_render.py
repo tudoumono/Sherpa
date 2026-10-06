@@ -65,6 +65,22 @@ def _review_list_text(values: list) -> str:
     return "、".join(_esc_cell(v) for v in values if isinstance(v, str))
 
 
+def describe_dropped(dropped: dict | None) -> str:
+    """保存時に落としたものの内訳（`store.investigation_records.trim_record` の `dropped`）を利用者向けの 1 文にする（落としたものが無ければ空文字）。"""
+    parts = []
+    for key, label, unit in (("items", "調べた項目", "件"), ("reviews", "途中の見直し", "件"),
+                             ("coverage", "検索の結果の記録", "項目分"),
+                             ("coverage_detail", "検索語・読んだ範囲の記録", "項目分")):
+        n = (dropped or {}).get(key)
+        if isinstance(n, int) and n > 0:
+            parts.append(f"{label} {n} {unit}")
+    if (dropped or {}).get("manifest"):
+        parts.append("調査の目録の詳細")
+    if not parts:
+        return ""
+    return "調査の記録が大きすぎたため、" + "・".join(parts) + "を保存していません。"
+
+
 def render_markdown(record: dict) -> str:
     """調査台帳の記録1件を Markdown へ整形する。`record` は `complete`/`truncated`/`manifest`/`items`/`coverage`/`reviews`（省略可）を持つ dict。"""
     manifest = record.get("manifest") or {}
@@ -73,8 +89,15 @@ def render_markdown(record: dict) -> str:
     lines = [_HEADER, "",
              f"- 質問の種類: {question_kind}",
              f"- 完了: {'はい' if record.get('complete') else 'いいえ'}"]
+    detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
     if record.get("truncated"):
-        lines.append("- 注記: 件数が多いため、一部を切り詰めて保存しています。")
+        lines.append("- 注記: " + (describe_dropped(detail.get("dropped"))
+                                  or "件数が多いため、一部を切り詰めて保存しています。"))
+    reviews_report = detail.get("reviews_report") if isinstance(detail.get("reviews_report"), dict) else {}
+    if reviews_report.get("over_count") or reviews_report.get("over_bytes") or reviews_report.get("invalid"):
+        lines.append("- 注記: 途中の見直しは上限（件数・容量）または形式の不正のため、一部を読み込めていません"
+                     f"（上限超過 {reviews_report.get('over_count') or 0} 件・不正 {reviews_report.get('invalid') or 0} 件"
+                     + ("・容量超過あり" if reviews_report.get("over_bytes") else "") + "）。")
     lines += ["", "## 項目", "",
              "| id | 対象 | 状態 | 必要な根拠の種類 | 根拠（資料のパス・行） | 理由 | 担当 |",
              "|---|---|---|---|---|---|---|"]
@@ -127,5 +150,14 @@ def render_markdown(record: dict) -> str:
             outcomes = coverage[item_id] or []
             subject = _esc_cell((items.get(item_id) or {}).get("subject")) or _esc_cell(item_id)
             lines.append(f"- {subject}: " + "、".join(_label(_COVERAGE_LABELS, o) for o in outcomes))
+            for call in (detail.get("coverage") or {}).get(item_id) or []:
+                if not isinstance(call, dict):
+                    continue
+                if isinstance(call.get("omitted"), int):
+                    lines.append(f"  - ほか {call['omitted']} 件（省略）")
+                    continue
+                what = "・".join(_esc_cell(call[k]) for k in ("query", "doc", "range") if call.get(k))
+                lines.append(f"  - {_esc_cell(call.get('tool'))}（{_label(_COVERAGE_LABELS, call.get('outcome'))}）"
+                             + (f": {what}" if what else ""))
     lines.append("")
     return "\n".join(lines)

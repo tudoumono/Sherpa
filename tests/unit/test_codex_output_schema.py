@@ -144,7 +144,12 @@ def test_invalid_final_output_is_not_treated_as_complete(tmp_path, monkeypatch, 
                      env={"SHERPA_CODEX_AUTO_CONTINUE": "0"})
     assert env.get("codex_stopped_early") is True
     assert '"status"' not in env["headline"] and "{" not in env["headline"]
-    assert env["headline"] == _FIXED_NO_ANSWER
+    if label == "wrong_type_answer":
+        assert env["body"] == _FIXED_NO_ANSWER
+    else:
+        # 読み取れた answer の本文は固定文言に置き換えず、途中で切れた可能性の注記つきで返す。
+        _body = "これから資料を確認します。" if label == "truncated" else "終わりました。"
+        assert env["body"] == _body and "回答が途中で切れた可能性があります。" in env["headline"]
     assert len(calls) == 1
 
 
@@ -162,7 +167,7 @@ def test_valid_final_earlier_in_same_attempt_is_not_lost_by_later_broken_message
               "agent_messages": [_sj("final", "先に得た結論です。"), _TRUNCATED], "usage": helper._usage()}]
     env, calls = _go(tmp_path, monkeypatch, steps, "schema-keep-final", 20600,
                      env={"SHERPA_CODEX_AUTO_CONTINUE": "0"})
-    assert env["headline"] == "先に得た結論です。"
+    assert env["body"] == "先に得た結論です。"
     assert env.get("codex_stopped_early") is True
     assert len(calls) == 2   # 確定候補にも台帳催促が 1 回入る
 
@@ -245,7 +250,7 @@ def test_turn_failed_without_agent_message_is_explicit_failure(tmp_path, monkeyp
 
 
 def test_continuation_turn_failed_without_new_message_is_explicit_failure(tmp_path, monkeypatch, caplog):
-    """継続 attempt が agent_message 無しの turn.failed で終わったら、古い in_progress の answer に戻らず明示失敗。"""
+    """継続が無回答で失敗しても、前の回答と失敗の注記を返す。"""
     steps = [
         {"thread_id": "TH-SCHEMA-CONT-TURNFAILED",
          "agent_messages": [_sj("in_progress", "まず資料を確認します。", "続きを見る")],
@@ -254,10 +259,10 @@ def test_continuation_turn_failed_without_new_message_is_explicit_failure(tmp_pa
     ]
     with caplog.at_level(logging.WARNING, logger="sherpa"):
         env, calls = _go(tmp_path, monkeypatch, steps, "schema-cont-turnfailed", 20800)
-    assert env["headline"] != "まず資料を確認します。"
-    assert "接続できません" in env["headline"] and "回答を返せずに終了しました" in env["headline"]
-    assert not env.get("codex_stopped_early")
-    assert any("turn_failed=True" in r.message for r in caplog.records)
+    assert "まず資料を確認します。" in env["headline"]
+    assert "失敗" in env["headline"]
+    assert env["completion"] == "partial"
+    assert not env.get("codex_silent_failure")
     assert len(calls) == 2
 
 
@@ -287,7 +292,7 @@ def test_resume_fallback_resets_structured_state(tmp_path, monkeypatch):
     ctx = helper._ctx(uid="schema-resume-reset", conversation_id=20700, codex_session_id="SID-SCHEMA-STALE")
     env, calls = _go(tmp_path, monkeypatch, steps, "schema-resume-reset", 20700, ctx=ctx,
                      env={"SHERPA_CODEX_AUTO_CONTINUE": "0"})
-    assert env["headline"] == "フレッシュ側の途中経過です。"
+    assert env["body"] == "フレッシュ側の途中経過です。"
     assert env.get("codex_stopped_early") is True
     assert len(calls) == 2
     assert "resume" in calls[0] and "SID-SCHEMA-STALE" in calls[0]
@@ -321,7 +326,7 @@ def test_parse_structured_rejects_invalid(raw):
 
 # ===== v2（主張配列） =====
 
-_V2_EMPTY_CLAIMS = {"status": "final", "answer": "回答", "next_step": None, "claims": []}
+_V2_EMPTY_CLAIMS = {"status": "final", "answer": "回答", "next_step": None, "claims": [], "claims_invalid": 0}
 
 
 def test_parse_structured_v2_reads_claims_array():
@@ -348,9 +353,13 @@ def test_parse_structured_v2_rejects_truncated_json():
     {"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": [], "reason": "", "reason_code": "", "extra": 1},
     {"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": [], "reason": "", "reason_code": ""},
 ])
-def test_parse_structured_v2_falls_back_to_empty_claims_on_invalid_claim(bad_claim):
-    """不正な主張要素は主張構造だけを不採用にし、status/answer は保持する（応答全体を捨てない）。"""
-    assert STRUCT._parse_structured_v2(_sj2("final", "回答", [bad_claim])) == _V2_EMPTY_CLAIMS
+def test_parse_structured_v2_drops_only_invalid_claims(bad_claim):
+    """不正な主張要素だけを除き、正しい要素と status/answer は保持する。除いた件数を `claims_invalid` に残す。"""
+    good = {"id": "c2", "status": "unknown", "text": "t2", "evidence_refs": [], "reason": "", "reason_code": "budget"}
+    parsed = STRUCT._parse_structured_v2(_sj2("final", "回答", [bad_claim, good]))
+    assert parsed["answer"] == "回答"
+    assert [c["id"] for c in parsed["claims"]] == ["c2"]
+    assert parsed["claims_invalid"] == 1
 
 
 def test_env_2_selects_v2_schema_file_and_surfaces_claims(tmp_path, monkeypatch):
@@ -378,8 +387,10 @@ def test_env_2_invalid_claim_keeps_final_answer_without_extra_continuation(tmp_p
                    "evidence_refs": [], "reason_code": "not_a_real_code"}])],
               "usage": helper._usage()}]
     env, calls = _go(tmp_path, monkeypatch, steps, "schema-v2-badclaim", 20701, schema_env="2")
-    assert env["headline"] == "確認した結果、標準税率は10%です。"
+    assert env["headline"].startswith(STRUCT._INVALID_CLAIMS_NOTE)
+    assert env["headline"].endswith("確認した結果、標準税率は10%です。")
     assert not env.get("data", {}).get("claims")
+    assert env["data"]["claims_invalid"] == 1
     assert len(calls) == 2   # 台帳催促の 1 回だけ
 
 
@@ -583,3 +594,78 @@ def test_evidence_gate_author_lens_skips_headline_note(tmp_path, monkeypatch):
                     files=_SRC_AND_SPEC, lens="author")
     assert env["headline"] == "資料を作成しました。"
     assert env["data"]["claims"][0]["status"] == "inferred"
+
+
+_BAD_CLAIM = {"id": "cx", "status": "confirmed", "text": "t", "evidence_refs": [], "reason": "", "reason_code": "", "extra": 1}
+
+
+def test_invalid_claim_does_not_skip_gate_for_valid_claims(tmp_path, monkeypatch):
+    """不正な主張が混じっても、正しい主張は根拠種別ゲートにかかり、不正があった旨が前置される。"""
+    env = _gate_run(tmp_path, monkeypatch, claims=[_claim("c1", "confirmed", ["source"]), _BAD_CLAIM],
+                    answer="標準税率は10%です。", uid="schema-v2-mixed", cid=20708, files=_SRC_AND_SPEC)
+    assert [c["status"] for c in env["data"]["claims"]] == ["inferred"]
+    assert env["data"]["claims_invalid"] == 1
+    assert env["headline"].startswith(STRUCT._INVALID_CLAIMS_NOTE)
+    assert env["headline"].endswith("標準税率は10%です。")
+
+
+def test_all_invalid_claims_leave_no_confirmed_and_note(tmp_path, monkeypatch):
+    env = _gate_run(tmp_path, monkeypatch, claims=[_BAD_CLAIM, {**_BAD_CLAIM, "id": "cy"}],
+                    answer="標準税率は10%です。", uid="schema-v2-allbad", cid=20709, files=_SRC_AND_SPEC)
+    assert env["data"]["claims"] == []
+    assert env["data"]["claims_invalid"] == 2
+    assert env["headline"].startswith(STRUCT._INVALID_CLAIMS_NOTE)
+
+
+def test_legitimately_empty_claims_get_no_note(tmp_path, monkeypatch):
+    env = _gate_run(tmp_path, monkeypatch, claims=[], answer="こんにちは。",
+                    uid="schema-v2-empty", cid=20710, files=_SRC_AND_SPEC)
+    assert env["headline"] == "こんにちは。"
+    assert "claims_invalid" not in env.get("data", {})
+
+
+def _headline_state(**kw):
+    from types import SimpleNamespace
+    base = dict(_structured_answers=[], _structured_answers_valid_from=0, _schema_v2=False,
+                _agent_msgs=[], _agent_partial="", _attempt_msgs_start=0, _answer_notices=[])
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_salvage_uses_only_top_level_answer_of_latest_attempt():
+    from sherpa.providers.codex.turn_candidates import _pick_structured_headline as pick
+    for msg in ('{"meta":{"answer":"入れ子の値"},"status":"in_pro', "[]"):
+        assert pick(_headline_state(_agent_msgs=[msg])) == _FIXED_NO_ANSWER
+    # 最新の試行に本文がないときは、前の試行から回収した本文を残す。
+    assert "前の試行の本文です。" in pick(
+        _headline_state(_agent_msgs=["前の試行の本文です。"], _attempt_msgs_start=1))
+
+
+def test_ledger_rejected_final_is_shown_with_its_own_note_not_the_cut_off_note():
+    from sherpa.providers.codex.turn_candidates import _pick_structured_headline as pick
+    rejected = {"status": "final", "answer": "台帳確認前の回答です。", "next_step": None}
+    st = _headline_state(_structured_answers=[rejected], _structured_answers_valid_from=1,
+                         _agent_msgs=["x"], _attempt_msgs_start=1)
+    out = pick(st)
+    # 本文は差し戻された回答だけ。台帳の注記は本文に混ぜず notices に足す。
+    assert out == "台帳確認前の回答です。"
+    assert [k for k, _ in st._answer_notices] == ["ledger_unfinished"]
+    assert "調査台帳の確認が終わる前の回答です" in st._answer_notices[0][1]
+    assert "途中で切れた" not in out
+
+
+def test_resume_fallback_drops_old_resume_sid(monkeypatch):
+    from types import SimpleNamespace
+    from sherpa.providers.codex import turn_loop
+    st = _headline_state(
+        uid="u", mcp_neighbors=[], mcp_graph_results=[], _wall_clock_state={"hit": False},
+        _all_parent_thread_ids=[], got_any_line=False, attempt_returncode=1, resume_sid="OLD",
+        codex_question=None, _stream_error=False, codex_usage=None, ran=False, thread_id=None,
+        _latest_structured=None, _resume_fallback_happened=False, prompt="p", prompt_with_history="ph")
+    monkeypatch.setattr(turn_loop, "_attempt", lambda *a, **k: iter(()))
+    monkeypatch.setattr(turn_loop, "_absorb_last_message_fallback", lambda st: None)
+    monkeypatch.setattr(turn_loop, "_update_structured_state", lambda st: None)
+    monkeypatch.setattr(turn_loop, "_absorb_mcp_sidecar", lambda st: None)
+    ctx = SimpleNamespace(stop_event=None, conversation_id=1)
+    list(turn_loop._resume_fallback(None, ctx, st, {}))
+    assert st.resume_sid is None and st.prompt == "ph"

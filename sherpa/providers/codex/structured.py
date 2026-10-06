@@ -96,8 +96,8 @@ def _parse_claim(item) -> dict | None:
 
 
 def _parse_structured_v2(text: str | None) -> dict | None:
-    """v2 出力スキーマ（`claims` を持つ4キー）を検証する。v1 の3キー形（`claims` 無し）も `_parse_structured` と同じ検証で読み、返す dict に `claims: []` を補う。
-    v2 の4キー形は主張配列の各要素も `_parse_claim` で検証し、1件でも不正なら主張構造だけ `claims: []` に落とす（`status`/`answer`/`next_step` はそのまま返す＝回答本文を巻き添えにしない）。
+    """v2 出力スキーマ（`claims` を持つ4キー）を検証する。v1 の3キー形（`claims` 無し）も `_parse_structured` と同じ検証で読み、返す dict に `claims: []`・`claims_invalid: 0` を補う。
+    v2 の4キー形は主張配列の各要素も `_parse_claim` で検証し、不正な要素だけを除いて正しい要素を残す。除いた件数を `claims_invalid` に載せる（`status`/`answer`/`next_step` はそのまま返す＝回答本文を巻き添えにしない）。
     """
     if not text:
         return None
@@ -111,7 +111,7 @@ def _parse_structured_v2(text: str | None) -> dict | None:
         v1 = _parse_structured(text)
         if v1 is None:
             return None
-        return {**v1, "claims": []}
+        return {**v1, "claims": [], "claims_invalid": 0}
     if set(obj.keys()) != _STRUCTURED_KEYS_V2:
         return None
     _status = obj.get("status")
@@ -126,14 +126,16 @@ def _parse_structured_v2(text: str | None) -> dict | None:
     if not isinstance(claims, list):
         return None
     parsed_claims = []
+    invalid = 0
     for item in claims:
         parsed = _parse_claim(item)
         if parsed is None:
-            # 不正な主張構造は本文を巻き添えにせず主張だけを捨てる。
-            _log.warning("codex v2: invalid claim dropped (claims emptied, answer kept)")
-            return {**obj, "claims": []}
+            invalid += 1
+            continue
         parsed_claims.append(parsed)
-    return {**obj, "claims": parsed_claims}
+    if invalid:
+        _log.warning("codex v2: invalid claims dropped=%d kept=%d (answer kept)", invalid, len(parsed_claims))
+    return {**obj, "claims": parsed_claims, "claims_invalid": invalid}
 
 
 # Codex は自分の MCP/直読の履歴を残さないため、主張自身が申告する `evidence_kinds`（`_parse_claim` が検証）を根拠種別の唯一の入力にする。
@@ -204,11 +206,11 @@ def _parse_evidence_ref(ref) -> tuple[str, int] | None:
 
 
 def _ledger_evidence_locations(snapshot: investigation_ledger.LedgerSnapshot) -> set:
-    """台帳の manifest に登録された item（`snapshot.manifest["items"]`）だけの `evidence` を `(正規化 path, line)` の集合にまとめる。未登録 item の evidence は裏付けとして採用しない。manifest が無い／`items` が空なら集合は空（全 confirmed が格下げされる）。"""
+    """台帳の manifest に登録され、確認済みの状態（`EVIDENCE_REQUIRED_STATUSES`）の item だけの `evidence` を `(正規化 path, line)` の集合にまとめる。未登録 item・`unverified`／`unreadable`／`unavailable`／未完了の item の evidence は裏付けとして採用しない。manifest が無い／`items` が空なら集合は空（全 confirmed が格下げされる）。"""
     manifest_ids = set(snapshot.manifest["items"]) if snapshot.manifest is not None else set()
     locations = set()
     for item_id, item in snapshot.items.items():
-        if item_id not in manifest_ids:
+        if item_id not in manifest_ids or item.get("status") not in investigation_ledger.EVIDENCE_REQUIRED_STATUSES:
             continue
         for ev in item.get("evidence") or []:
             locations.add((_normalize_evidence_path(ev["path"]), ev["line"]))
@@ -222,7 +224,7 @@ _LEDGER_UNMATCHED_REASON = "根拠が調査台帳に無いため確定できま�
 def _claims_vs_ledger(claims: list[dict], snapshot: investigation_ledger.LedgerSnapshot, *,
                       manifest_file_exists: bool) -> tuple[list[dict], dict]:
     """最終回答の `claims` を調査台帳と突き合わせる（claims は台帳からの投影）。
-    `evidence_refs` が1件も台帳の `evidence`（`path`/`line`）に一致しない confirmed 主張は、推定（inferred）へ格下げする（`status`/`reason`/`reason_code` を書き換える）。一部だけ一致する confirmed は維持する。`inferred`／`unknown` は対象外。
+    `evidence_refs` が空、または1件でも台帳の確認済み item の `evidence`（`path`/`line`）に一致しない confirmed 主張は、推定（inferred）へ格下げする（`status`/`reason`/`reason_code` を書き換える）。一部だけ一致する confirmed も格下げする（全 refs が一致したときだけ維持）。`inferred`／`unknown` は対象外。
     `manifest_file_exists`（`(investigation_dir / "manifest.json").is_file()`）で `snapshot.manifest is None` の原因を区別する:
     - ファイルが無い＝台帳を作らなかった依頼: 対応関係を適用せず `claims` を無変更で返す。
     - ファイルはあるが内容不正／symlink＝壊れた台帳: 登録集合を空として扱い、confirmed を全て格下げする。
@@ -239,13 +241,10 @@ def _claims_vs_ledger(claims: list[dict], snapshot: investigation_ledger.LedgerS
             out.append(c)
             continue
         checked += 1
-        matched = False
-        for ref in (c.get("evidence_refs") or []):
-            if _parse_evidence_ref(ref) in locations:
-                matched = True
-            else:
-                unmatched_refs += 1
-        if not matched:
+        refs = c.get("evidence_refs") or []
+        unmatched = sum(1 for ref in refs if _parse_evidence_ref(ref) not in locations)
+        unmatched_refs += unmatched
+        if not refs or unmatched:
             reason = (c.get("reason") or "").strip()
             new_reason = (f"{_LEDGER_UNMATCHED_REASON}（{reason}）" if reason
                          else _LEDGER_UNMATCHED_REASON)
@@ -258,6 +257,9 @@ def _claims_vs_ledger(claims: list[dict], snapshot: investigation_ledger.LedgerS
 
 # 格下げは起きたがターン全体では種別が揃っている（不足の注記が出ない）ときの前置文（本文は書き換えない）。
 _DEMOTED_CLAIMS_NOTE = "一部の内容は必要な根拠の種別が揃っていないため、確定ではなく推定として扱っています。"
+
+# 主張の一部が形式不正で除かれたターンの前置文（残った主張は通常どおり検証される）。
+_INVALID_CLAIMS_NOTE = "根拠の一部を確認できませんでした。"
 
 
 # 最終回答の先頭段落が「点検・答え直しの経緯」だけの前置きのとき、その段落を取り除く（指示文での抑止が破れたときの決定的な守り）。
@@ -277,15 +279,20 @@ def _is_review_preamble(paragraph: str) -> bool:
     return any(m in text for m in _PREAMBLE_MARKERS)
 
 
-def strip_review_preamble(answer: str) -> str:
-    """回答の先頭 1 段落（最初の空行まで）が点検の前置きで、取り除いても本文が残るときだけ除く。それ以外・判断できないときは原文のまま。"""
+def split_review_preamble(answer: str) -> tuple[str, str]:
+    """回答の先頭 1 段落（最初の空行まで）が点検の前置きで、取り除いても本文が残るときだけ (残りの本文, 前置き) に分ける。それ以外・判断できないときは (原文, 空文字)。"""
     if not isinstance(answer, str):
-        return answer
+        return answer, ""
     head, sep, rest = answer.lstrip().partition("\n\n")
     if not sep or not _is_review_preamble(head):
-        return answer
+        return answer, ""
     # 残りが「参照した資料」のブロックだけ（実際の本文が空）なら除かない。
     if not rest.split("参照した資料", 1)[0].strip():
-        return answer
+        return answer, ""
     _log.info("codex answer: leading review preamble removed chars=%d", len(answer) - len(rest.lstrip()))
-    return rest.lstrip("\n")
+    return rest.lstrip("\n"), head
+
+
+def strip_review_preamble(answer: str) -> str:
+    """点検の前置きを除いた本文（除いた段落は `split_review_preamble` が返す）。"""
+    return split_review_preamble(answer)[0]

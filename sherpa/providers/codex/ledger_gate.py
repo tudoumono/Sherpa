@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ... import investigation_ledger
 from ..base import _log, _scope_evidence_kinds
+from .continuation import _FULL_ANSWER_RULE
 from .sandbox import _remove_dir_best_effort
 
 
@@ -17,6 +18,7 @@ _FINAL_ANSWER_VOICE = (
     "最終回答はそのまま利用者に見せます。利用者の元の質問への回答として最初から書き、"
     "点検・台帳・目録・前回の回答・答え直したこと・追加で調べたことの経緯には触れないでください"
     "（「点検の結果」「答え直します」のような前置きを書かない）。"
+    + _FULL_ANSWER_RULE
 )
 
 

@@ -802,19 +802,19 @@ USAGE_STATS_DEFAULT = {
     },
     # F3（2026-07-07／2026-07-08 金額表示は撤去）: トークン（入力/出力トークン数のみ）。
     "tokens": {
-        "totals": {"turns": 6, "input": 12000, "cached_input": 3000, "output": 1800,
+        "totals": {"turns": 6, "input": 12000, "cached_input": 3000, "cache_write": None, "cache_write_unknown": 0, "output": 1800,
                    "reasoning_output": 900},
         "by_model": [
             {"provider": "codex", "model": "gpt-5.5", "turns": 4, "input": 10000,
-             "cached_input": 3000, "output": 1500, "reasoning_output": 900},
+             "cached_input": 3000, "cache_write": None, "cache_write_unknown": 0, "output": 1500, "reasoning_output": 900},
             {"provider": "gemini", "model": "gemini-2.5-flash", "turns": 2, "input": 2000,
-             "cached_input": 0, "output": 300, "reasoning_output": 0},
+             "cached_input": 0, "cache_write": None, "cache_write_unknown": 0, "output": 300, "reasoning_output": 0},
         ],
         "by_user": [
             {"uid": "admin", "display_name": "管理者", "turns": 5, "input": 11000,
-             "cached_input": 3000, "output": 1600, "reasoning_output": 900},
+             "cached_input": 3000, "cache_write": None, "cache_write_unknown": 0, "output": 1600, "reasoning_output": 900},
             {"uid": "sato", "display_name": "佐藤 太郎", "turns": 1, "input": 1000,
-             "cached_input": 0, "output": 200, "reasoning_output": 0},
+             "cached_input": 0, "cache_write": None, "cache_write_unknown": 0, "output": 200, "reasoning_output": 0},
         ],
         "daily": [
             {"date": "2026-07-01", "input": 4000, "output": 600},
@@ -828,29 +828,29 @@ USAGE_STATS_DEFAULT = {
         "by_kind": [
             # chat 行は messages.answer->'usage' 由来で所要時間を持たない（API 契約＝常に None/None/0）
             {"kind": "chat", "provider": "codex", "model": "gpt-5.5", "calls": 4, "input": 10000,
-             "cached_input": 3000, "output": 1500, "reasoning_output": 900,
+             "cached_input": 3000, "cache_write": None, "cache_write_unknown": 0, "output": 1500, "reasoning_output": 900,
              "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
             {"kind": "chat", "provider": "gemini", "model": "gemini-2.5-flash", "calls": 2, "input": 2000,
-             "cached_input": 0, "output": 300, "reasoning_output": 0,
+             "cached_input": 0, "cache_write": None, "cache_write_unknown": 0, "output": 300, "reasoning_output": 0,
              "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
             {"kind": "intent", "provider": "openai", "model": "gpt-4o-mini", "calls": 3,
-             "input": 450, "cached_input": 0, "output": 60, "reasoning_output": 0,
+             "input": 450, "cached_input": 0, "cache_write": None, "cache_write_unknown": 0, "output": 60, "reasoning_output": 0,
              "elapsed_ms_total": 900, "elapsed_ms_avg": 300.0, "elapsed_n": 3},
             {"kind": "embed", "provider": "gemini", "model": "gemini-embedding-001", "calls": 2,
-             "input": None, "cached_input": None, "output": None, "reasoning_output": None,
+             "input": None, "cached_input": None, "cache_write": None, "cache_write_unknown": 0, "output": None, "reasoning_output": None,
              "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
         ],
         # ユーザー別 × 用途別内訳。chat 行は by_user と同じ材料（admin は by_user と一致させる）。
         # user_id の無い呼び出しは含まれないため、同一 kind の合計は by_kind 以下になりうる。
         "by_user_kind": [
             {"uid": "admin", "display_name": "管理者", "kind": "chat", "calls": 5, "input": 11000,
-             "cached_input": 3000, "output": 1600, "reasoning_output": 900,
+             "cached_input": 3000, "cache_write": None, "cache_write_unknown": 0, "output": 1600, "reasoning_output": 900,
              "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
             {"uid": "admin", "display_name": "管理者", "kind": "intent", "calls": 3, "input": 450,
-             "cached_input": 0, "output": 60, "reasoning_output": 0,
+             "cached_input": 0, "cache_write": None, "cache_write_unknown": 0, "output": 60, "reasoning_output": 0,
              "elapsed_ms_total": 900, "elapsed_ms_avg": 300.0, "elapsed_n": 3},
             {"uid": "sato", "display_name": "佐藤 太郎", "kind": "chat", "calls": 1, "input": 1000,
-             "cached_input": 0, "output": 200, "reasoning_output": 0,
+             "cached_input": 0, "cache_write": None, "cache_write_unknown": 0, "output": 200, "reasoning_output": 0,
              "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
         ],
     },
@@ -865,6 +865,12 @@ USAGE_STATS_DEFAULT = {
         {"stop_kind": "unknown", "turns": 1},
     ],
     "stopped_turns": 1,
+    # 回答の完了状態（complete/partial/stopped/failed＋旧形式の unknown）の分布
+    "completions": [
+        {"completion": "complete", "turns": 12},
+        {"completion": "partial", "turns": 3},
+        {"completion": "unknown", "turns": 1},
+    ],
     # STAT-4 U1: 回答時間（duration_ms）の分布。全体＋経路（provider）別。
     "response_time": {
         "overall": {"provider": None, "avg": 4200.0, "median": 3800.0, "max": 9000, "p90": 9000.0, "n": 6},
@@ -879,15 +885,15 @@ USAGE_STATS_DEFAULT = {
         {"conversation_id": 501, "uid": "admin", "display_name": "管理者", "world": "test",
          "user_turns": 3, "response_time_avg_ms": 4500.0,
          "kinds": [
-             {"kind": "chat", "calls": 3, "input": 8000, "cached_input": 2000, "output": 1200,
+             {"kind": "chat", "calls": 3, "input": 8000, "cached_input": 2000, "cache_write": None, "cache_write_unknown": 0, "output": 1200,
               "reasoning_output": 900, "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
-             {"kind": "intent", "calls": 3, "input": 450, "cached_input": 0, "output": 60,
+             {"kind": "intent", "calls": 3, "input": 450, "cached_input": 0, "cache_write": None, "cache_write_unknown": 0, "output": 60,
               "reasoning_output": 0, "elapsed_ms_total": 900, "elapsed_ms_avg": 300.0, "elapsed_n": 3},
          ]},
         {"conversation_id": 502, "uid": "sato", "display_name": "佐藤 太郎", "world": "test",
          "user_turns": 1, "response_time_avg_ms": 3500.0,
          "kinds": [
-             {"kind": "chat", "calls": 1, "input": 1000, "cached_input": 0, "output": 200,
+             {"kind": "chat", "calls": 1, "input": 1000, "cached_input": 0, "cache_write": None, "cache_write_unknown": 0, "output": 200,
               "reasoning_output": 0, "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
          ]},
     ],
@@ -1282,6 +1288,7 @@ WORLD_STATUS_RESP = {"ok": True, "world_id": "w1", "label": "4期更改", "root_
                      "analyzer_declined_as_document": 0, "unreadable": 0,
                      "sensitive_excluded": 0, "unreachable_as_text": 0, "unreachable_as_text_by_ext": {},
                      "unreachable_by_reason": {}, "encoding_partial_count": 0,
+                     "walk_skipped": {}, "ingest_notices": [],
                      "counts_as_of": "2026-07-03T09:00:00+00:00",
                      "graph_nodes": 4, "graph_edges": 3, "es_chunks": 6,
                      "es_state": "ok", "es_error": None, "es_index_kept": None,

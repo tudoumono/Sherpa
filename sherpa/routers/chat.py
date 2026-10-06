@@ -15,12 +15,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StrictBool, field_validator
 from starlette.concurrency import run_in_threadpool
 
-from sherpa import agent_constructs, agentic_search, chat_turns, llm, store
+from sherpa import agent_constructs, agentic_search, answer_shape, chat_turns, llm, store
 from sherpa import stop_kind as stop_kind_mod
 from sherpa import tools_pref as tools_pref_mod
 from sherpa.agents import get_provider
 from sherpa.chat_router import extract_slash_lens as _extract_slash_lens
-from sherpa.chat_service import _ensure_conversation, stream_message
+from sherpa.chat_service import _ensure_conversation, _save_investigation_record, stream_message
 from sherpa.deps import _USERS_DIR, _WorldField, _current_user, _resolve_world, neo4j_session, validated_scope
 from sherpa.schemas import ChatTurnsRunningResponse, ChatTurnStartResponse, ChatTurnStopResponse
 
@@ -148,12 +148,13 @@ def chat_tools_availability(request: Request):
 def _persist_turn_crash(conversation_id: int, message: str, uid: str, world: str,
                         personal: bool, exc: Exception, *,
                         knowledge: bool = False, lens: str | None = None,
-                        saved_user_id: int | None = None, saved_user_personal: bool | None = None) -> None:
-    """background thread が `stream_message` に辿り着く前/途中で例外を投げた場合に、best-effort で次の (a)(b)(c) を行う。ここでの失敗は握り潰す（`_turn_run_fn.run()` が元の例外を re-raise し、chat_turns 側の error イベントと枠解放は動く）。
-    assistant 側のエラー応答は user 行の実際の personal 値を継承する。chat.turn 監査にも message_id_user/message_id_assistant を残す。
-    `saved_user_id`/`saved_user_personal` は `stream_message(..., on_user_saved=...)` のコールバックで受け取った、このターン専用の値で、あれば最優先で使う。None なら user 行は未保存なので、本文一致の探索はせず新規に保存する（同一利用者の同文の並走ターンの行を取り違えないため）。
-    `knowledge`/`lens`: assistant 行の lens は、`knowledge` が False なら "chat"、True なら `lens`（明示指定のみ）をそのまま使う。明示指定が無い（`None`）ときは "chat" で偽装せず `None` のまま保存する。
+                        saved_user_id: int | None = None, saved_user_personal: bool | None = None,
+                        recovered_result: dict | None = None) -> dict | None:
+    """例外時に、回収済みの部分回答または本文なしのエラーを保存して返す。
+    設計: docs/design/chat.md「仕上げと保存」
     """
+    if recovered_result and recovered_result.get("saved_message"):
+        return recovered_result["saved_message"]
     user_msg_id = None
     user_msg_personal = personal
     assistant_msg_id = None
@@ -179,23 +180,52 @@ def _persist_turn_crash(conversation_id: int, message: str, uid: str, world: str
                     "original error still re-raised): %s", persist_exc)
         return
 
-    # (b) assistant 側にエラーの最小 envelope を保存する（busy 応答と同じ最小形）。
+    # ② 回収済みの回答またはエラーを保存する。
     try:
         headline = f"エラーが発生しました（{type(exc).__name__}）。もう一度お試しください。"
         crash_lens = lens if knowledge else "chat"
-        env = {"lens": crash_lens, "headline": headline, "summary": {"total": 0}, "data": {}, "sources": []}
+        env = {"lens": crash_lens, "headline": headline, "summary": {"total": 0}, "data": {}, "sources": [],
+               "completion": "failed", "agentic_failure": "error"}
+        answer_shape.seal(env)
         # provider.run() が通信例外で落ちた honest failure の経路。例外の型だけで timeout／transport_error を判別する（`_finalize` を経由しないため `stop_kind_mod.from_exception` を直接使う）。それ以外の例外型は `stop_kind` を立てず NULL のままにする。
         _crash_stop_kind = stop_kind_mod.from_exception(exc)
         if _crash_stop_kind:
             env["stop_kind"] = _crash_stop_kind
+        trace = None
+        record = None
+        if recovered_result and recovered_result.get("result"):
+            result = recovered_result["result"]
+            env = dict(result["env"])
+            notice = f"回答の処理または保存でエラーが発生しました（{type(exc).__name__}）。回収済みの回答を残しています。"
+            answer_shape.add_notice(env, "recovered_error", notice)
+            stopped = recovered_result.get("stopped")
+            env["completion"] = "stopped" if stopped else "partial"
+            env["stop_kind"] = "stopped_by_user" if stopped else (_crash_stop_kind or "codex_partial")
+            for key in ("_terminal", "_personal_rounds", "_evidence_committed"):
+                env.pop(key, None)
+            crash_lens = result["decision"]["lens"]
+            env["lens"] = crash_lens
+            record = result.get("investigation_record")
+            from sherpa.chat_service import _cap_trace_v2, _mark_investigation_recorded
+            _mark_investigation_recorded(env, record)
+            trace = _cap_trace_v2(recovered_result.get("trace") or {})
+            user_msg_personal = bool(user_msg_personal or recovered_result.get("personal")
+                                     or store.conversation_is_personal_tainted(conversation_id))
+            if user_msg_personal:
+                store.set_contains_personal_workspace(conversation_id)
+                store.set_message_personal(user_msg_id)
+            answer_shape.seal(env)
+            headline = env["headline"]
         saved_assistant = store.add_message(conversation_id, "assistant", headline, lens=crash_lens,
+                                            route=env.get("route"), trace=trace,
                                             answer=env, personal=user_msg_personal)
+        saved_assistant = _save_investigation_record(record, saved_assistant["id"], conversation_id) or saved_assistant
         assistant_msg_id = saved_assistant["id"]
     except Exception as persist_exc:
         _log.warning("turn crash assistant message persistence failed (best-effort, "
                     "original error still re-raised): %s", persist_exc)
 
-    # (c) 監査（可能なら）。失敗しても元の例外の re-raise は妨げない。
+    # ③ 監査を保存する。
     try:
         store.audit(uid, "chat.turn", "conversation", f"conv:{conversation_id}",
                    detail={"lens": "error", "world": world, "error": type(exc).__name__,
@@ -204,6 +234,8 @@ def _persist_turn_crash(conversation_id: int, message: str, uid: str, world: str
                    outcome="error", severity="warning")
     except Exception as audit_exc:
         _log.warning("turn crash audit failed (best-effort): %s", audit_exc)
+
+    return saved_assistant if assistant_msg_id is not None else None
 
 
 def _turn_run_fn(message: str, world: str, uid: str,
@@ -221,6 +253,7 @@ def _turn_run_fn(message: str, world: str, uid: str,
         def run(stop_event: threading.Event, emit) -> None:
             # このターン自身が保存した user 行の id/personal を `stream_message` から直接受け取る（本文一致で推測しない）。
             saved_user: dict = {}
+            recovered: dict = {}
 
             def _on_user_saved(message_id, is_personal):
                 saved_user["id"] = message_id
@@ -234,8 +267,11 @@ def _turn_run_fn(message: str, world: str, uid: str,
                                               users_dir=str(_USERS_DIR), stop_event=stop_event,
                                               on_user_saved=_on_user_saved, web_search=web_search,
                                               tools_availability=tools_availability,
-                                              provider=provider, settings=settings, sys_settings=sys_settings):
+                                              provider=provider, settings=settings, sys_settings=sys_settings,
+                                              recovered_result=recovered):
                         emit(evt)
+                        if evt.get("type") == "answer" and recovered:
+                            recovered["delivered"] = True
                     return
                 with neo4j_session() as s:
                     for evt in stream_message(s, message, world,
@@ -247,14 +283,20 @@ def _turn_run_fn(message: str, world: str, uid: str,
                                               depth_profile=depth_profile, tools=tools,
                                               tools_explicit=tools_explicit,
                                               tools_availability=tools_availability,
-                                              provider=provider, settings=settings, sys_settings=sys_settings):
+                                              provider=provider, settings=settings, sys_settings=sys_settings,
+                                              recovered_result=recovered):
                         emit(evt)
+                        if evt.get("type") == "answer" and recovered:
+                            recovered["delivered"] = True
             except Exception as e:
                 # `neo4j_session()`/`stream_message` 自体が例外を投げて DB に何も残らないことがあるため、`on_user_saved` が発火済みなら `_persist_turn_crash` にその id を再利用させ、未発火なら新規に保存する（best-effort で永続してから re-raise する）。
-                _persist_turn_crash(conversation_id, message, uid, world, personal, e,
+                partial = _persist_turn_crash(conversation_id, message, uid, world, personal, e,
                                     knowledge=knowledge, lens=lens,
                                     saved_user_id=saved_user.get("id"),
-                                    saved_user_personal=saved_user.get("personal"))
+                                    saved_user_personal=saved_user.get("personal"),
+                                    recovered_result=recovered)
+                if partial is not None and recovered and not recovered.get("delivered"):
+                    emit({"type": "answer", "conversation_id": conversation_id, "message": partial})
                 raise
         return run
     return make_run

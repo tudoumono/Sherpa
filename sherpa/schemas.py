@@ -605,6 +605,12 @@ class UsageStopKindRow(BaseModel):
     turns: int
 
 
+class UsageCompletionRow(BaseModel):
+    """回答の完了状態。`complete`/`partial`/`stopped`/`failed`、または旧形式の行の `unknown`。"""
+    completion: str
+    turns: int
+
+
 class UsageHeatmapCell(BaseModel):
     weekday: int
     hour: int
@@ -637,6 +643,8 @@ class UsageTokenByModel(BaseModel):
     turns: int
     input: int
     cached_input: int
+    cache_write: int | None
+    cache_write_unknown: int
     output: int
     reasoning_output: int
 
@@ -647,6 +655,8 @@ class UsageTokenByUser(BaseModel):
     turns: int
     input: int
     cached_input: int
+    cache_write: int | None
+    cache_write_unknown: int
     output: int
     reasoning_output: int
 
@@ -661,12 +671,16 @@ class UsageTokenTotals(BaseModel):
     turns: int
     input: int
     cached_input: int
+    cache_write: int | None
+    cache_write_unknown: int
     output: int
     reasoning_output: int
 
 
 class UsageTokenByKind(BaseModel):
     """用途別（kind）内訳。
+
+    `cache_write`（キャッシュへの書き込み）は報告のあった行だけの合計で、全行が不明なら None・`cache_write_unknown` は不明だった行（ターン／呼び出し）の数（0 より大きければ「不明を含む」）。
 
     chat 行は `messages.answer->'usage'` 由来（トークン列は常に int）。それ以外の kind は `usage_events` 由来で、プロバイダが usage を報告しなかった行はトークン列が None（0 に丸めない）。
     `elapsed_ms_total`/`elapsed_ms_avg`/`elapsed_n` は計測ありの行の合計・平均・行数（chat 行は対象外＝total/avg=None・n=0）。
@@ -677,6 +691,8 @@ class UsageTokenByKind(BaseModel):
     calls: int
     input: int | None
     cached_input: int | None
+    cache_write: int | None
+    cache_write_unknown: int
     output: int | None
     reasoning_output: int | None
     elapsed_ms_total: int | None
@@ -692,6 +708,8 @@ class UsageTokenByUserKind(BaseModel):
     calls: int
     input: int | None
     cached_input: int | None
+    cache_write: int | None
+    cache_write_unknown: int
     output: int | None
     reasoning_output: int | None
     elapsed_ms_total: int | None
@@ -745,6 +763,8 @@ class UsageConversationKindRow(BaseModel):
     calls: int
     input: int | None
     cached_input: int | None
+    cache_write: int | None
+    cache_write_unknown: int
     output: int | None
     reasoning_output: int | None
     elapsed_ms_total: int | None
@@ -938,6 +958,7 @@ class AdminUsageStatsResponse(BaseModel):
     resume_rate: float | None
     stop_kinds: list[UsageStopKindRow]
     stopped_turns: int
+    completions: list[UsageCompletionRow]
     response_time: UsageResponseTime
     conversations_top: list[UsageConversationRow]
     limits: UsageLimits
@@ -1097,6 +1118,12 @@ class IngestBlockedDoc(BaseModel):
     reason: str
 
 
+class IngestNotice(BaseModel):
+    """`ingest_notices` の要素。取り込みで黙って落とした・粗くしたものの種類（`code`）と件数（`count`）。`count` は数えられない種類では 1。"""
+    code: str
+    count: int
+
+
 class RunProgress(BaseModel):
     """実行中 run の逐次進捗。`stage_label` は内部段キー（`stage`）に対応する利用者向けの平文。`done`/`total` はファイル単位の進捗（件数を持たない段では両方 `None`）。"""
     stage: str
@@ -1114,6 +1141,8 @@ class IngestSummaryFields(BaseModel):
     `unreachable_by_reason`（`"encoding_undetermined"`/`"binary"`）/`encoding_partial_count`（一部が化けている件数）も同じキャッシュ由来。
     `failed_files`/`partial_extraction_suspected`/`stage_summary` は最新 run の由来（無ければ `None`）。
     `failure_reason_catalog`/`partial_extraction_advice` は閉じた理由語彙の平文辞書。
+    `walk_skipped`＝木の走査で辿らなかったものの件数（`symlink`/`unreadable_dir`/`unreadable_file`/`outside_root`・集計キャッシュ由来）。
+    `ingest_notices`＝黙って落とした・粗くしたものの `{code, count}`（走査・関係グラフ・全文索引の各段から導出・名前は持たない。無ければ空）。
     `last_run_warnings`/`last_run_blocked` は flags を打ち切って導出したもの（`last_run_flags_total`=打切り前の総数・`last_run_flags_truncated`=打切りの有無）。
     `last_run_id`/`running_progress` は最新 run の id と実行中進捗（実行中でなければ `running_progress` は `None`）。
     """
@@ -1133,6 +1162,8 @@ class IngestSummaryFields(BaseModel):
     unreachable_as_text_by_ext: dict[str, int]
     unreachable_by_reason: dict[str, int]
     encoding_partial_count: int
+    walk_skipped: dict[str, int] = {}
+    ingest_notices: list[IngestNotice] = []
     counts_as_of: str | None
     graph_nodes: int
     graph_edges: int

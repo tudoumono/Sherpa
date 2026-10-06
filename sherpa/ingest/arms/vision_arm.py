@@ -221,6 +221,9 @@ def _vlm_timeout_sec() -> float:
     return v if v > 0 else _DEFAULT_VLM_TIMEOUT_SEC
 
 
+_UNREAD_PAGES_LISTED = 50   # 読めなかったページ番号を notes に残す最大件数（超過分は件数だけ）
+
+
 class VisionArm:
     """画像・スキャン PDF を VLM で読み取るアーム（既定ローカル Ollama・クラウドは管理者オプトイン）。"""
     name = "vision"
@@ -260,6 +263,9 @@ class VisionArm:
                 _log.warning("VLM 視覚読み取りに失敗しました（%s）", p, exc_info=False)
                 return None
             if not text or not text.strip():
+                if ext == ".pdf" and extra_notes:
+                    # 文字が取れない＝変換失敗（md=None）。読めなかったページの記録は失敗の記録へ載せるため notes を持たせる
+                    return ArmResult(md=None, method="vision", confidence=0.0, notes=extra_notes)
                 return None  # 文字が取れない＝未対応（失敗計上）
             md = _LABEL + "\n\n" + text.strip()
             notes = [f"vlm_provider={cfg['provider']}", f"vlm_model={cfg['model']}", "numeric_verified=false"]
@@ -280,6 +286,8 @@ class VisionArm:
         """テキスト層ゼロ PDF を PDFium でページ画像化し、各ページを VLM で読み取る（ラスタ化は `raster` を共用）。
 
         返値 `(結合テキスト|None, 処理ページ数, 追加notes)`。1 ファイル総予算（`SHERPA_VLM_TIMEOUT`）の残り時間で各ページを実行し、予算切れは残ページを打ち切って `truncated=pages N/M` を notes に残す。ページ上限（`SHERPA_OCR_MAX_PAGES`）・ピクセル上限は `raster` を共用する。
+        読まなかったページは本文を変えず notes にだけ残す（`pdf_pages_total`＝元の総ページ数／`pdf_pages_over_limit`＝上限で読まなかった数／`pdf_pages_budget_cut`＝時間予算で読まなかった数／
+        `pdf_pages_unread_count`・`pdf_pages_unread`＝読み取りに失敗・空だったページの数と先頭 `_UNREAD_PAGES_LISTED` 件のページ番号）。`corpus_docs.provenance_summary` が読む。
         """
         import pypdfium2 as pdfium
 
@@ -288,15 +296,21 @@ class VisionArm:
         parts: list[str] = []
         pages_done = 0
         extra_notes: list[str] = []
+        unread_pages: list[int] = []
         deadline = time.monotonic() + _vlm_timeout_sec()
         try:
             doc = pdfium.PdfDocument(str(pdf_path))
             try:
-                total = min(len(doc), raster._max_pages())
+                doc_pages = len(doc)
+                total = min(doc_pages, raster._max_pages())
+                extra_notes.append(f"pdf_pages_total={doc_pages}")
+                if doc_pages > total:
+                    extra_notes.append(f"pdf_pages_over_limit={doc_pages - total}")
                 for i in range(total):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         extra_notes.append(f"truncated=pages {pages_done}/{total}（タイムアウト予算超過）")
+                        extra_notes.append(f"pdf_pages_budget_cut={total - pages_done}")
                         break
                     img = tmp / f"page_{i + 1}.png"
                     page = doc[i]
@@ -312,10 +326,15 @@ class VisionArm:
                     pages_done += 1
                     if page_text and page_text.strip():
                         parts.append(f"## ページ {i + 1}\n\n{page_text.strip()}")
+                    else:
+                        unread_pages.append(i + 1)
             finally:
                 doc.close()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+        if unread_pages:
+            extra_notes.append(f"pdf_pages_unread_count={len(unread_pages)}")
+            extra_notes.append("pdf_pages_unread=" + ",".join(str(n) for n in unread_pages[:_UNREAD_PAGES_LISTED]))
         return ("\n\n".join(parts) if parts else None), pages_done, extra_notes
 
 

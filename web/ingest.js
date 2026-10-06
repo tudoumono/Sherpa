@@ -281,7 +281,12 @@ function failedFilesHtml(wid, ff, catalog) {
   if (!ff || !ff.items || !ff.items.length) return '';
   const rows = ff.items.map((it) => {
     const info = reasonInfo(catalog, it.reason);
-    return `<li><span class="fname">${esc(it.doc)}</span> — ${esc(info.label)}`
+    const pp = it.pdf_pages;
+    const pages = pp ? `<div class="muted" style="font-size:var(--text-caption)">画像で読んだ PDF（全 ${esc(pp.total)} ページ）: `
+      + [pp.over_limit ? `上限のため ${esc(pp.over_limit)} ページは読まず` : '',
+        pp.budget_cut ? `時間切れで ${esc(pp.budget_cut)} ページは読まず` : '',
+        pp.unread ? `${esc(pp.unread)} ページは読み取れませんでした` : ''].filter(Boolean).join('・') + '</div>' : '';
+    return `<li><span class="fname">${esc(it.doc)}</span> — ${esc(info.label)}${pages}`
       + (info.advice ? `<div class="muted" style="font-size:var(--text-caption)">${esc(info.advice)}</div>` : '')
       + `<button class="mini" data-reconvert-wid="${esc(wid)}" data-rel="${esc(it.doc)}">再変換</button></li>`;
   }).join('');
@@ -344,6 +349,11 @@ function summaryNote(s, wid) {
     hints.push(`PDF・旧形式（${exts}）はまだ未対応です（今後対応）`);
   }
   if (s.office_failed) hints.push(`${esc(s.office_failed)} 件は変換に失敗しました（ファイル破損などの可能性）`);
+  // 黙って落とした・粗くしたもの（走査・関係グラフ・全文索引）。件数だけで名前は出さない。
+  for (const n of (s.ingest_notices || [])) {
+    const t = INGEST_NOTICE_JA[n.code];
+    if (t) hints.push(t(esc(n.count)));
+  }
   if (s.graph_nodes === 0 && s.indexed > 0) {
     hints.push('関係グラフはソースコード（COBOL/JCL等）から作られます。文書のみのフォルダでは空です（文書は検索で使えます）');
   }
@@ -611,6 +621,22 @@ function reasonText(reason) {
   return REASON_JA[reason] || reason;
 }
 
+// 取り込みで黙って落とした・粗くしたものの平文（`ingest_notices[].code` → 件数を受ける文）。
+const INGEST_NOTICE_JA = {
+  walk_symlink: (n) => `${n} 件のシンボリックリンクは辿らず、取り込んでいません`,
+  walk_unreadable_dir: (n) => `${n} 件のフォルダを開けず、中のファイルを取り込めていません（権限などを確認してください）`,
+  walk_unreadable_file: (n) => `${n} 件のファイルは情報を取得できず、取り込めていません`,
+  walk_outside_root: (n) => `${n} 件は登録したフォルダの外を指しているため、取り込んでいません`,
+  graph_source_unparsed: (n) => `${n} 件のソースは構文を読み切れず、関係グラフに載っていない部分があります（関連が無いとは言えません）`,
+  graph_source_oversize: (n) => `${n} 件のソースは大きすぎて関係グラフに載せていません（検索はできます）`,
+  graph_mention_doc_unreadable: (n) => `${n} 件の文書は読めず、文書からコードへの言及を拾えていません`,
+  es_rag_degraded: (n) => `${n} 件の資料は検索用の細かな区切りを使えず、粗い区切りで全文検索に入れています`,
+  es_empty_text: (n) => `${n} 件の資料は本文が空のため、全文検索に入っていません`,
+  es_text_read_failed: (n) => `${n} 件の資料は本文を読めず、全文検索に入っていません`,
+  es_embed_failed_bm25_only: () => '意味検索用の変換に失敗したため、全文検索はキーワード検索だけで作りました',
+  es_analyzer_fallback: () => '日本語用の解析器を使えず標準の解析器で全文検索を作りました（日本語の検索精度が下がります）',
+};
+
 // 「どう読み取ったか」の平文バッジ。データ源は取り込み時の来歴（provenance）で、表示のみ。method 1個＋（該当時のみ）旧形式変換／照合差分の最大2〜3個に抑える。
 const PROV_METHOD = {                       // 主たる読み取り方法 → 平文
   ooxml: 'Office から直接読み取り',
@@ -626,6 +652,16 @@ const PROV_LEGACY = {                       // 旧形式（.doc/.xls/.ppt）の�
 };
 const CONFLICT_TIP = '別の方法で読むと追加の内容が見つかりました。原本を確認してください';
 
+// 画像で読んだ PDF のうち読めていないページがあるときだけ出す注意（全部読めていれば出さない）。
+function pdfPagesBadge(pp) {
+  if (!pp || !(pp.over_limit || pp.budget_cut || pp.unread)) return '';
+  const parts = [];
+  if (pp.over_limit) parts.push(`上限のため ${pp.over_limit} ページは読んでいません`);
+  if (pp.budget_cut) parts.push(`時間切れで ${pp.budget_cut} ページは読んでいません`);
+  if (pp.unread) parts.push(`${pp.unread} ページは読み取れませんでした`);
+  return `<span class="provbadge warn" title="${esc(parts.join('。'))}">全 ${esc(pp.total)} ページのうち一部は未読</span>`;
+}
+
 function provBadges(p) {                     // 文書一覧の来歴バッジ（無ければ空文字＝後方互換）
   if (!p) return '';
   const out = [];
@@ -634,6 +670,11 @@ function provBadges(p) {                     // 文書一覧の来歴バッジ�
   const lb = PROV_LEGACY[p.legacy_backend];
   if (lb) out.push(`<span class="provbadge">${esc(lb)}</span>`);
   if (p.has_conflicts) out.push(`<span class="provbadge warn" title="${esc(CONFLICT_TIP)}">照合で差分あり</span>`);
+  const pg = pdfPagesBadge(p.pdf_pages);
+  if (pg) out.push(pg);
+  if (p.metafile_truncated && Object.keys(p.metafile_truncated).length) {
+    out.push('<span class="provbadge warn" title="図の中の文字や画像のうち、上限を超えた分は検索の対象に入れていません">図の中の文字・画像を一部省略</span>');
+  }
   return out.length ? `<div class="provrow">${out.join('')}</div>` : '';
 }
 

@@ -367,8 +367,25 @@ def test_v2_stop_pending_then_post_failure_corrects_trace_stop_reason(page, web_
     expect(page.locator("#rt")).to_contain_text("接続エラー。もう一度お試しください。")
 
 
-def test_v2_history_replay_has_same_hierarchy_as_live(page, web_base_url):
+@pytest.mark.parametrize("completion, stop_reason", [
+    (None, "自然終了"), ("stopped", "停止操作"),
+    ("partial", "途中までの回答"), ("failed", "エラー"),
+])
+def test_v2_history_replay_has_same_hierarchy_as_live(page, web_base_url, completion, stop_reason):
     install_api_mocks(page)
+    if completion is not None:
+        page.route("**/conversations/111", lambda route: route.fulfill(
+            content_type="application/json", body=json.dumps({
+                "conversation": {"id": 111, "title": "階層表示の履歴", "origin": "own",
+                                 "version": "v1", "read_only": False,
+                                 "contains_personal_workspace": False},
+                "messages": [
+                    {"role": "user", "content": "資料を確認したい"},
+                    {"role": "assistant", "answer": {**V2_LANE_ANSWER, "completion": completion},
+                     "trace": V2_LANE_TRACE},
+                ],
+            }),
+        ))
     page.goto(f"{web_base_url}/chat.html")
     page.evaluate("window.__sherpaChatTest.openConversation(111)")
 
@@ -382,8 +399,37 @@ def test_v2_history_replay_has_same_hierarchy_as_live(page, web_base_url):
     agg = lane.locator(".fagg")
     expect(agg).to_have_count(1)
     expect(agg.locator(".fagg-head")).to_contain_text("資料を検索（語句そのまま）×3")
-    expect(turn.locator(".ftrace-stopreason")).to_contain_text("自然終了")
+    expect(turn.locator(".ftrace-stopreason")).to_contain_text(stop_reason)
     _no_slug_leak(turn.inner_text())
+
+
+def test_common_error_without_completion_is_error_in_live_and_history(page, web_base_url):
+    from sherpa.chat_service import _finalize, _fixed_lens_result
+
+    result = _fixed_lens_result("impact", "資料の確認でエラーが発生しました。", "処理エラー",
+                                "資料を確認して", "w1", None)
+    answer = _finalize(result["env"], result["decision"])
+    answer["trace_version"] = 2
+    assert answer["agentic_failure"] == "error" and answer["completion"] == "failed"
+    del answer["completion"]  # completion を持たない旧形式の行でもエラーと表示する
+    assert "stop_kind" not in answer
+    trace = [{"type": "node", "id": "understand", "kind": "think", "status": "done",
+              "label": "質問を理解", "detail": "内容を把握しました"}]
+    _run(page, web_base_url, [V2_META, *trace, _answer_event(answer, trace)], "資料を確認して")
+    expect(page.locator("#messages")).to_contain_text(answer["headline"])
+    expect(page.locator("#rt")).to_contain_text("エラー")
+    expect(page.locator(".ftrace-stopreason").first).to_contain_text("エラー")
+    page.route("**/conversations/111", lambda route: route.fulfill(
+        content_type="application/json", body=json.dumps({
+            "conversation": {"id": 111, "title": "処理エラー", "origin": "own", "version": "v1",
+                             "read_only": False, "contains_personal_workspace": False},
+            "messages": [{"role": "assistant", "answer": answer, "trace": trace}],
+        }),
+    ))
+    page.reload()
+    page.evaluate("window.__sherpaChatTest.openConversation(111)")
+    expect(page.locator("#messages")).to_contain_text(answer["headline"])
+    expect(page.locator(".ftrace-stopreason").first).to_contain_text("エラー")
 
 
 _V1_FLAT_NODES = [

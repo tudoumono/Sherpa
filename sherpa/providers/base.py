@@ -45,6 +45,7 @@ class Ctx:
     make_sources: Callable[[list], list] | None = None  # doc_id[] -> sources[]（agentic 結果に出典を付与）
     uid: str = "admin"  # 現在ユーザー uid（互換モードは 'admin'）
     personal_facts: str = ""  # 個人ファイルのヒット（ナレッジオフ/agentic 経路にも注入）
+    personal: bool = False  # 個人ファイル参照トグルが ON のターン（ヒットの有無に関わらず）
     stop_event: "threading.Event | None" = None  # 途中停止（/chat/turns/{turn_id}/stop が set する）
     # 直前ターンの (user, assistant) 完全対（時系列順・件数と文字予算は chat_service で制限済み）。
     # 例: [{"role":"user","content":"…"},{"role":"assistant","content":"…"}, ...]。
@@ -141,9 +142,10 @@ def _plain_run(provider: "Provider", ctx: Ctx) -> Iterator[dict]:
 
 # ---- トークン使用量メタ ----
 def _usage_meta(provider_id: str, model: str | None, *, input_tokens=0, cached_input_tokens=0,
-                output_tokens=0, reasoning_output_tokens=0, is_local: str | None = None,
-                system_settings: dict | None = None) -> dict:
+                output_tokens=0, reasoning_output_tokens=0, cache_write_tokens=None,
+                is_local: str | None = None, system_settings: dict | None = None) -> dict:
     """answer メタに載せる usage の標準形（無い項目は 0・cached ⊆ input・reasoning ⊆ output）。
+    `cache_write_tokens`（キャッシュへの書き込み量）だけは、プロバイダが返さなかった場合を 0 と区別するため、不明（None）なら項目ごと載せない。
     `is_local` は担当バッジ用の判定（`agent_constructs.is_local`：local/on_prem/cloud/cloud_compat、判定不能は None）。`provider_id="codex"` は呼び出し元が明示的に渡す。
     `system_settings`（省略可）は `provider_id="openai"` の判定に使う。
     """
@@ -155,10 +157,13 @@ def _usage_meta(provider_id: str, model: str | None, *, input_tokens=0, cached_i
     if is_local is None:
         from .. import agent_constructs
         is_local = agent_constructs.is_local(provider_id, system_settings=system_settings)
-    return {"provider": provider_id, "model": model or "",
+    meta = {"provider": provider_id, "model": model or "",
             "input_tokens": _i(input_tokens), "cached_input_tokens": _i(cached_input_tokens),
             "output_tokens": _i(output_tokens), "reasoning_output_tokens": _i(reasoning_output_tokens),
             "is_local": is_local}
+    if cache_write_tokens is not None:
+        meta["cache_write_tokens"] = _i(cache_write_tokens)
+    return meta
 
 
 def _log_chat_usage(usage: dict, elapsed: float | None = None, world: str | None = None) -> None:
@@ -170,6 +175,7 @@ def _log_chat_usage(usage: dict, elapsed: float | None = None, world: str | None
         from .. import metering
         tokens = {"input_tokens": usage.get("input_tokens"),
                   "cached_input_tokens": usage.get("cached_input_tokens"),
+                  "cache_write_tokens": usage.get("cache_write_tokens"),
                   "output_tokens": usage.get("output_tokens")}
         reasoning = usage.get("reasoning")
         if reasoning is None and usage.get("max_turns") is not None \

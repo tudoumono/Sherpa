@@ -17,10 +17,11 @@ KIND_CARD_CAP = "card_cap"                        # 近傍カードの件数・�
 KIND_GRAPH_UNAVAILABLE = "graph_unavailable"
 KIND_GRAPH_REINGEST_REQUIRED = "graph_reingest_required"
 KIND_PLUGIN_FAILED = "plugin_failed"              # FW プラグインの失敗（`limits[].plugin` にプラグイン名。欠けはそのプラグインを直して取り込み直すまで残る）
+KIND_SOURCE_UNPARSED = "source_unparsed"          # 構文を読み切れない／大きすぎるソースをグラフに入れていない（`limits[].count` にそのファイル数。「関係が無い」とは言えない）
 
 LIMIT_KINDS = (
     KIND_TIMEOUT, KIND_ROW_CAP, KIND_DEPTH, KIND_RESULT_CAP, KIND_DOC_SEARCH_TRUNCATED, KIND_CARD_CAP,
-    KIND_GRAPH_UNAVAILABLE, KIND_GRAPH_REINGEST_REQUIRED, KIND_PLUGIN_FAILED,
+    KIND_GRAPH_UNAVAILABLE, KIND_GRAPH_REINGEST_REQUIRED, KIND_PLUGIN_FAILED, KIND_SOURCE_UNPARSED,
 )
 
 # 処理の段階（`limits[].stage`・Codex の道具と各レンズだけが付ける。外部 API の `limits` には出さない）。
@@ -48,13 +49,27 @@ def add_plugin_failures(coverage, failures, stage: str | None) -> None:
             add_limit(coverage, KIND_PLUGIN_FAILED, stage, plugin=f["plugin"])
 
 
+def add_source_unparsed(coverage, info, stage: str | None) -> None:
+    """`world_neo4j.read_unparsed_sources` の結果（`{syntax, size_exceeded}`＝グラフに入れなかったソースのファイル数・保存が無い旧グラフは None）を `source_unparsed`（件数つき）として足す。0 件なら足さない。"""
+    if not isinstance(info, dict):
+        return
+    n = sum(v for v in (info.get("syntax"), info.get("size_exceeded")) if isinstance(v, int))
+    if n <= 0:
+        return
+    if isinstance(coverage, Coverage):
+        coverage.add(KIND_SOURCE_UNPARSED, stage, count=n)
+    else:
+        add_limit(coverage, KIND_SOURCE_UNPARSED, stage, count=n)
+
+
 def _has_overload(coverage) -> bool:
     limits = coverage.limits if isinstance(coverage, Coverage) else coverage["limits"]
     return any(lim["kind"] in (KIND_TIMEOUT, KIND_ROW_CAP) for lim in limits)
 
 
-def attach_plugin_failures(coverage, read, stage: str | None) -> None:
+def attach_plugin_failures(coverage, read, stage: str | None, read_unparsed=None) -> None:
     """取り込み時に失敗した FW プラグイン（`read()`＝`world_neo4j.read_plugin_failures` の結果）を `coverage` へ足す。
+    `read_unparsed`（省略可・`world_neo4j.read_unparsed_sources`）があれば、グラフに入れなかったソースの件数も `source_unparsed` として同じ規律で足す。
 
     すでに時間切れ・件数の天井で不完全なときは読まない。この読み取り自体の時間切れ・天井は、その理由で申告する（失敗にしない）。
     """
@@ -63,6 +78,8 @@ def attach_plugin_failures(coverage, read, stage: str | None) -> None:
         return
     try:
         add_plugin_failures(coverage, read(), stage)
+        if read_unparsed is not None:
+            add_source_unparsed(coverage, read_unparsed(), stage)
     except GraphQueryOverloadError as e:
         if isinstance(coverage, Coverage):
             coverage.add(kind_of_overload(e.reason), stage)
@@ -76,12 +93,14 @@ class Coverage:
     def __init__(self) -> None:
         self.limits: list[dict] = []
 
-    def add(self, kind: str, stage: str | None = None, plugin: str | None = None) -> None:
+    def add(self, kind: str, stage: str | None = None, plugin: str | None = None, count: int | None = None) -> None:
         if kind not in LIMIT_KINDS:
             raise ValueError(f"unknown coverage kind: {kind}")
         item = {"kind": kind} if stage is None else {"kind": kind, "stage": stage}
         if plugin is not None:
             item["plugin"] = plugin
+        if count is not None:
+            item["count"] = count
         if item not in self.limits:
             self.limits.append(item)
 
@@ -103,13 +122,16 @@ class Coverage:
         return out
 
 
-def add_limit(coverage: dict, kind: str, stage: str | None = None, plugin: str | None = None) -> None:
-    """`Coverage.as_dict` 済みの辞書へ打ち切りを 1 件足し、`complete` を落とす（`omitted` は分からないので null にする）。`plugin`＝`plugin_failed` の FW プラグイン名。"""
+def add_limit(coverage: dict, kind: str, stage: str | None = None, plugin: str | None = None,
+              count: int | None = None) -> None:
+    """`Coverage.as_dict` 済みの辞書へ打ち切りを 1 件足し、`complete` を落とす（`omitted` は分からないので null にする）。`plugin`＝`plugin_failed` の FW プラグイン名・`count`＝`source_unparsed` のファイル数。"""
     if kind not in LIMIT_KINDS:
         raise ValueError(f"unknown coverage kind: {kind}")
     item = {"kind": kind} if stage is None else {"kind": kind, "stage": stage}
     if plugin is not None:
         item["plugin"] = plugin
+    if count is not None:
+        item["count"] = count
     if item not in coverage["limits"]:
         coverage["limits"].append(item)
     coverage["complete"] = False

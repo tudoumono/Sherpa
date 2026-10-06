@@ -388,3 +388,14 @@ def test_parse_quoted_multi_item_line_is_a_reference_line():
     assert "a/b.xlsx" in refs and "c/d.xlsx" in refs and "e/f.xlsx" in refs and body == "本文"
     body, refs = _parse_flat("本文\n参照した資料:\na.md\n`config/app.yml` の変更後は `systemctl restart app`")
     assert refs == ["a.md"] and "systemctl" in body
+
+
+def test_unverified_references_list_only_plain_document_paths_others_are_counted(monkeypatch):
+    """検証を通らなかった参照のうち、名前を出すのは秘匿名でない資料パスだけ。自由な文・解釈できない行・秘匿名は件数だけ。"""
+    from sherpa import agentic_search as A
+    monkeypatch.setattr(A, "verify_doc_exists", lambda d, w, sp=None: False)
+    sentence = "田中太郎さんの住所は東京都千代田区1-1です"
+    refs = [[["存在しない.md"]], [[sentence]], [[".env"]], [["../外.md"]]]
+    verified, rows, hidden = C.resolve_referenced_docs(refs, "v1")
+    assert verified == [] and rows == [{"path": "存在しない.md", "reason": C.REASON_UNREADABLE}]
+    assert hidden == 3

@@ -44,7 +44,11 @@ def _lstat_kind(p: Path) -> str | None:
     return None
 
 
-def safe_files(root, *, strict: bool = False, deadline: float | None = None, also=None):
+WALK_SKIPPED_KEYS = ("symlink", "unreadable_dir", "unreadable_file", "outside_root")
+
+
+def safe_files(root, *, strict: bool = False, deadline: float | None = None, also=None,
+               skipped: dict | None = None):
     """`root` 配下の実ファイルを列挙する（symlink の file/dir は辿らない・root 外へ出ない）。要素は `(resolved_path, rel_posix)`。
 
     - `also`: 第2の root（アーカイブ展開先）も同じ規律で列挙して連結する（1 段のみ）。存在しなければ何も足さない。
@@ -53,12 +57,19 @@ def safe_files(root, *, strict: bool = False, deadline: float | None = None, als
     - `deadline`: `time.monotonic()` 系の絶対期限。開始時・ディレクトリごと・エントリ列挙中・後処理完了時に確認し、
       超過で `ScopeWalkDeadlineExceeded` を送出する（部分結果は返さない）。
       1 回のシステムコール自体がブロックする場合は打ち切れない。
+    - `skipped`: 渡すと、走査で数えられなかったものの件数を `WALK_SKIPPED_KEYS` ごとに足す（`symlink`＝辿らなかったシンボリックリンク／
+      `unreadable_dir`＝列挙できなかったフォルダ／`unreadable_file`＝種別・実体を取れなかったエントリ／`outside_root`＝root の外へ出る実体）。
+      列挙の結果は変えない。名前は持たない（件数のみ）。
     """
     # `also` が実在するときだけ連結する（無ければ単一 root の走査のまま）。
     if also is not None and Path(also).is_dir():
-        yield from safe_files(root, strict=strict, deadline=deadline)
-        yield from safe_files(also, strict=strict, deadline=deadline)
+        yield from safe_files(root, strict=strict, deadline=deadline, skipped=skipped)
+        yield from safe_files(also, strict=strict, deadline=deadline, skipped=skipped)
         return
+    def _skip(key: str) -> None:
+        if skipped is not None:
+            skipped[key] = skipped.get(key, 0) + 1
+
     root = Path(root)
     if deadline is not None and time.monotonic() > deadline:
         raise ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
@@ -67,6 +78,7 @@ def safe_files(root, *, strict: bool = False, deadline: float | None = None, als
     except OSError:
         if strict:
             raise
+        _skip("unreadable_dir")
         return
     if root_kind != "dir":  # root 自体が symlink/非ディレクトリなら走査しない
         return
@@ -93,6 +105,7 @@ def safe_files(root, *, strict: bool = False, deadline: float | None = None, als
         except OSError:
             if strict:
                 raise
+            _skip("unreadable_dir")
             continue
         for i, p in enumerate(entries):
             if (deadline is not None and i > 0
@@ -104,8 +117,10 @@ def safe_files(root, *, strict: bool = False, deadline: float | None = None, als
             except OSError:
                 if strict:
                     raise
+                _skip("unreadable_file")
                 continue
             if kind == "symlink":  # symlink は file/dir とも辿らない
+                _skip("symlink")
                 continue
             if kind == "dir":
                 stack.append(p)
@@ -115,9 +130,12 @@ def safe_files(root, *, strict: bool = False, deadline: float | None = None, als
                 except OSError:
                     if strict:
                         raise
+                    _skip("unreadable_file")
                     continue
                 if rp.is_relative_to(rootr):  # root 外への脱出を拒否
                     yield rp, p.relative_to(root).as_posix()
+                else:
+                    _skip("outside_root")
         # 後処理完了時にも期限を確認する。
         if deadline is not None and time.monotonic() > deadline:
             raise ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")

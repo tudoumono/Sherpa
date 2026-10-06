@@ -113,7 +113,8 @@ def conversation_investigation_download(cid: int, message_id: int, request: Requ
     if format == "json":
         body = {"complete": record["complete"], "truncated": record["truncated"],
                 "manifest": record["manifest"], "items": record["items"],
-                "coverage": record["coverage"], "reviews": record.get("reviews") or []}
+                "coverage": record["coverage"], "reviews": record.get("reviews") or [],
+                "detail": record.get("detail") or {}}
         return Response(content=json.dumps(body, ensure_ascii=False, indent=2),
                         media_type="application/json; charset=utf-8",
                         headers={"Content-Disposition": 'attachment; filename="investigation.json"'})

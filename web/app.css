@@ -723,6 +723,13 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 /* 調査予算の到達（途中までの結果）の注記。本文と分離した独立要素で、.impdiag と同じ配色・寸法。 */
 .budget-note{font-size:var(--text-caption);color:var(--warn);background:var(--warn-bg);border-radius:8px;
   padding:8px 10px;margin:4px 0 10px;line-height:1.5}
+/* 回答の注記（answer.notices）。本文の上に出す控えめな帯。 */
+.answer-notices{margin:0 0 8px}
+.answer-notice{font-size:var(--text-caption);color:var(--warn);background:var(--warn-bg);border-radius:8px;
+  padding:6px 10px;margin:0 0 4px;line-height:1.5;white-space:pre-wrap}
+.investigation-summary{font-size:var(--text-caption);color:var(--muted,inherit);margin:6px 0}
+.investigation-summary-label{font-weight:600}
+.sources-unverified-row{font-size:var(--text-small);overflow-wrap:anywhere}
 /* AI・実行環境のクイック切替メニュー */
 .brainwrap{position:relative;display:inline-flex}
 .brainmenu{position:absolute;right:0;bottom:38px;z-index:30;width:264px;

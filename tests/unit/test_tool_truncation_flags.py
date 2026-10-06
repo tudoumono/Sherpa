@@ -100,7 +100,7 @@ def test_es_search_parent_return_chunk_tier_keeps_full_chunk_text(monkeypatch, t
     hits = [{"doc_id": "b.docx", "text": long_text, "ext": ".docx",
             "chunk_id": "c1", "parent_id": "p1", "score": 1.0}]
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {})   # rag.md 無し＝展開不能
-    monkeypatch.setattr(es_index, "chunk_ids_for_parent", lambda w, doc_id, parent_ids, limit=5000: [])
+    monkeypatch.setattr(es_index, "chunk_ids_for_parent", lambda w, doc_id, parent_ids, limit=5000: ["c1"])
     res, _, _, _ = tool_dispatch.run_tool("es_search", {"query": "q"}, world, None)
     h = res["hits"][0]
     assert h["tier"] == "chunk"
@@ -117,6 +117,7 @@ def test_es_search_parent_return_region_tier_omits_text_truncated(monkeypatch, t
     hits = [{"doc_id": "full.docx", "text": long_text, "ext": ".docx",
             "chunk_id": "cf1", "parent_id": "pf", "score": 1.0}]
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {"full.docx": full_md})
+    monkeypatch.setattr(es_index, "chunk_ids_for_parent", lambda w, doc_id, parent_ids, limit=5000: ["cf1"])
     res, _, _, _ = tool_dispatch.run_tool("es_search", {"query": "q"}, world, None)
     h = res["hits"][0]
     assert h["tier"] == "region"

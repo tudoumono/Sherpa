@@ -359,7 +359,10 @@ export function subscribeTurn(thinking) {
       if (e.message.answer && (e.message.answer.personal_sources || e.message.answer.codex_wrote_files)) {
         S.convHasPersonal = true; updateShareButtonState();
       }
-      setRt('完了', false); S.es.close(); S.es = null; S.turnId = null;
+      const completion = e.message.answer.completion;
+      setRt(completion === 'stopped' ? '停止しました' : completion === 'partial' ? '途中までの回答'
+        : completion === 'failed' || e.message.answer.agentic_failure === 'error' ? 'エラー' : '完了', false);
+      S.es.close(); S.es = null; S.turnId = null;
       setSendButtonStopping(false); $('messages').setAttribute('aria-busy', 'false'); loadConversations();
     }
   };

@@ -47,6 +47,7 @@ add_message
 add_usage_event
 annotations
 api_key_by_hash
+append_answer_notice
 apply_system_settings_and_revoke_if_disabled
 audit
 backfill_all

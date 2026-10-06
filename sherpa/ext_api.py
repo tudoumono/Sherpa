@@ -1033,7 +1033,8 @@ class ExtDegraded(BaseModel):
 
 class ExtLimit(BaseModel):
     kind: Literal["timeout", "row_cap", "depth", "result_cap", "doc_search_truncated", "card_cap",
-                  "graph_unavailable", "graph_reingest_required", "plugin_failed"]
+                  "graph_unavailable", "graph_reingest_required", "plugin_failed", "source_unparsed"]
+    count: int | None = None  # `source_unparsed` のときだけ、グラフに入れなかったソースのファイル数
 
 
 class ExtDepth(BaseModel):

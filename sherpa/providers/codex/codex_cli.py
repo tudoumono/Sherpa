@@ -8,7 +8,7 @@ import os
 import shutil
 import time
 
-from ... import codex_agents_md, codex_skills, investigation_ledger
+from ... import codex_agents_md, codex_skills, investigation_ledger, metering
 from ... import depth_profile as depth_profile_mod
 from ..base import _log, _log_chat_usage, _log_codex, _node, _usage_meta
 from . import sandbox
@@ -28,7 +28,7 @@ from .structured import _claims_vs_ledger
 from .turn_candidates import _pick_structured_claims
 from .turn_consts import _MCP_SIDECAR_NAME, _OUTPUT_SCHEMA_PATH, _OUTPUT_SCHEMA_PATH_V2, _REASONING_AUTHOR, _int_or_none
 from ...env_int import env_int
-from .usage import _CHILD_USAGE_KEYS, _collect_child_token_usage, _resolve_mcp_budget
+from .usage import CACHE_WRITE_KEY, _CHILD_USAGE_KEYS, _collect_child_token_usage, _resolve_mcp_budget
 
 
 def log_turn_end(ctx, st, env):
@@ -122,6 +122,8 @@ def apply_codex_usage(ctx, st, env):
             "output_tokens": codex_usage.get("output_tokens"),
             "reasoning_output_tokens": codex_usage.get("reasoning_output_tokens"),
         }
+        if codex_usage.get(CACHE_WRITE_KEY) is not None:
+            env["codex_usage_total"][CACHE_WRITE_KEY] = codex_usage[CACHE_WRITE_KEY]
         _prev_total = ctx.codex_usage_prev_total
         if (st.resume_sid and not st._resume_fallback_happened and _prev_total
                 and _prev_total.get("session_id") == st.resume_sid):
@@ -135,6 +137,10 @@ def apply_codex_usage(ctx, st, env):
                                   - (_prev_total.get("output_tokens") or 0)),
                 reasoning_output_tokens=max(0, (codex_usage.get("reasoning_output_tokens") or 0)
                                            - (_prev_total.get("reasoning_output_tokens") or 0)),
+                # 今回・前ターンのどちらかの累計が不明（None・欠落）なら差分も不明のまま（0 にしない）。
+                cache_write_tokens=(
+                    None if codex_usage.get(CACHE_WRITE_KEY) is None or _prev_total.get(CACHE_WRITE_KEY) is None
+                    else max(0, codex_usage[CACHE_WRITE_KEY] - _prev_total[CACHE_WRITE_KEY])),
                 is_local=codex_usage.get("is_local"))
         else:
             env["usage"] = codex_usage
@@ -145,6 +151,8 @@ def apply_codex_usage(ctx, st, env):
         if st._child_usage_found or st._child_usage_missing:
             # 親分の内訳は `codex_usage`（セッション累計）ではなく `env["usage"]`（このターンの計上値）から作る（resume ターンでは `codex_usage` に前ターン分が混入するため）。
             _parent_only = {k: env["usage"].get(k) or 0 for k in _CHILD_USAGE_KEYS}
+            if env["usage"].get(CACHE_WRITE_KEY) is not None:
+                _parent_only[CACHE_WRITE_KEY] = env["usage"][CACHE_WRITE_KEY]
             env["codex_usage_children"] = {
                 "found": st._child_usage_found, "missing": st._child_usage_missing,
                 **st._child_usage_totals,
@@ -155,6 +163,13 @@ def apply_codex_usage(ctx, st, env):
             }
             for _k in _CHILD_USAGE_KEYS:
                 env["usage"][_k] = (env["usage"].get(_k) or 0) + st._child_usage_totals.get(_k, 0)
+            # 親子どちらかが不明なら合算も不明（子が取れなかった分を 0 として足さない）。
+            _cw = metering.sum_cache_write(env["usage"].get(CACHE_WRITE_KEY),
+                                           st._child_usage_totals.get(CACHE_WRITE_KEY))
+            if _cw is None:
+                env["usage"].pop(CACHE_WRITE_KEY, None)
+            else:
+                env["usage"][CACHE_WRITE_KEY] = _cw
         # Codex 経路も `sherpa.usage` ログ 1 行（kind=chat・深さ・推論レベル付き）を出す。
         _log_chat_usage(env["usage"], time.monotonic() - _turn_t0, ctx.world)
 
@@ -354,6 +369,9 @@ def build_launch(self, ctx, st):
         _mcp_budget_env["SHERPA_MCP_LEDGER_DIR"] = os.path.realpath(st._investigation_dir)
         # `ledger_status`（mcp_server.py）の自己確認も provider 側のゲートと同じ required_extra を見られるようにする（ターンの最初に決めた値・カンマ区切り・空なら空文字列）。
         _mcp_budget_env["SHERPA_MCP_LEDGER_REQUIRED_EXTRA"] = ",".join(st._ledger_required_extra)
+        # 個人ファイル参照トグルが ON のターンは、ヒットの有無に関わらず台帳の coverage に検索語を記録しない（個人の内容が混ざり得るため）。
+        if ctx.personal or ctx.personal_facts:
+            _mcp_budget_env["SHERPA_MCP_COVERAGE_NO_QUERY"] = "1"
     codex_home = None
     # サイドカーの置き場（`_sidecar_path`）は、本サーバ側は書けるが model-shell からは書込許可外の場所に決める。両分岐の中で確定し、`_absorb_mcp_sidecar` のガードはこの変数と `_sidecar_init_ok` を見る。既定は非サンドボックス経路の置き場（サンドボックス有効時のみ codex_home 配下へ差し替える）。
     _sidecar_path = _tmp / _MCP_SIDECAR_NAME

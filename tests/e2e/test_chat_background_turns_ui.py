@@ -8,25 +8,35 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from mock_api import IMPACT_ANSWER, install_api_mocks
 
 
-def test_chat_background_turn_survives_navigation_and_resumes_on_return(page, web_base_url):
+@pytest.mark.parametrize("completion,label", [
+    (None, "完了"), ("stopped", "停止しました"), ("partial", "途中までの回答"), ("failed", "エラー"),
+])
+def test_chat_background_turn_survives_navigation_and_resumes_on_return(page, web_base_url, completion, label):
     """送信直後に別ページへ移動してもターンは止まらず（GET /chat/turns/{turn_id}/stream への
     最初の購読を保留＝切断を模す）、トップバーに「実行中」バッジが出る。会話に戻ると
     実行中ターンを自動検知して再購読し（2回目の GET）、続きから回答が表示される。"""
     from playwright.sync_api import expect
 
     stream_calls = {"n": 0}
+    answer = dict(IMPACT_ANSWER)
+    trace = [{"type": "node", "id": "understand", "kind": "think", "status": "done",
+              "label": "質問を理解", "detail": "内容を把握しました"}]
+    if completion is not None:
+        answer.update(completion=completion, trace_version=2)
 
     def handle_turn_stream(route):
         stream_calls["n"] += 1
         if stream_calls["n"] == 1:
             return   # fulfill しない＝保留（送信直後の「実行中」を作る・別ページへの遷移で自然に破棄される）
         body = "".join(f"data: {json.dumps(e, ensure_ascii=False)}\n\n" for e in [
-            {"type": "node", "id": "understand", "kind": "think", "status": "done",
-             "label": "質問を理解", "detail": "内容を把握しました"},
-            {"type": "answer", "conversation_id": 101, "message": {"answer": IMPACT_ANSWER}},
+            {"type": "trace_meta", "trace_version": 2} if completion else {"type": "trace_meta", "trace_version": 1},
+            *trace,
+            {"type": "answer", "conversation_id": 101, "message": {"id": 2, "answer": answer, "trace": trace}},
         ])
         route.fulfill(status=200, headers={"Content-Type": "text/event-stream"}, body=body)
 
@@ -69,7 +79,10 @@ def test_chat_background_turn_survives_navigation_and_resumes_on_return(page, we
     # resumeRunningTurn が自動で再購読（2回目の GET）→ 続きから回答が表示される。
     expect(page.locator("#messages")).to_contain_text("影響範囲分析")
     expect(page.locator("#messages")).to_contain_text("TAXCALC")
-    expect(page.locator("#rt")).to_contain_text("完了")
+    expect(page.locator("#rt")).to_contain_text(label)
+    if completion is not None:
+        expected_reason = "停止操作" if completion == "stopped" else label
+        expect(page.locator(".ftrace-stopreason").first).to_contain_text(expected_reason)
     assert stream_calls["n"] == 2, f"再購読が期待どおりに行われていない: {stream_calls['n']}"
 
 

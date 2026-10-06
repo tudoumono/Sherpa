@@ -307,6 +307,28 @@ def test_child_thread_usage_breakdown_on_resume_uses_delta_not_cumulative(tmp_pa
     assert usage["codex_usage_breakdown"]["children"] == _tok(40, 0, 8, 1)
 
 
+def test_cache_write_delta_adds_children_once_and_stays_unknown_without_prev(tmp_path, monkeypatch):
+    """キャッシュ書き込み量も他のトークンと同じ規則（累計→ターン差分・親子合算）に通す。次ターンの差分の元（codex_usage_total）は親の累計のままで子を混ぜない。
+    前ターンの累計に書き込み量が無い（不明）なら差分は不明のまま（0 にしない・項目ごと載せない）。"""
+    cw = lambda n: {"cache_write_tokens": n}   # noqa: E731
+    step = _step("SID-CW", usage={**_usage(130, 2, 13, 3), **cw(30)},
+                 collab_spawns=[{"id": "c1", "receiver_thread_ids": ["CHILD-1"]}],
+                 child_sessions=[{"thread_id": "CHILD-1", "usage": {**_usage(40, 0, 8, 1), **cw(5)}}])
+    env, _ = _exec(tmp_path, monkeypatch, [step], "cw-delta-u1", 805, codex_session_id="SID-CW",
+                   codex_usage_prev_total={**_prev_total("SID-CW", input_tokens=100), **cw(10)})
+    assert env["codex_usage_total"]["cache_write_tokens"] == 30
+    assert env["usage"]["cache_write_tokens"] == 25                       # 親差分(30-10) + 子(5)
+    assert env["usage"]["codex_usage_breakdown"]["parent"]["cache_write_tokens"] == 20
+    assert env["usage"]["codex_usage_breakdown"]["children"]["cache_write_tokens"] == 5
+
+    (tmp_path / "second").mkdir()
+    env2, _ = _exec(tmp_path / "second", monkeypatch, [_step("SID-CW2", usage={**_usage(130, 2, 13, 3), **cw(30)})],
+                    "cw-delta-u2", 806, codex_session_id="SID-CW2",
+                    codex_usage_prev_total=_prev_total("SID-CW2", input_tokens=100))   # 前ターンは書き込み量が不明
+    assert "cache_write_tokens" not in env2["usage"]
+    assert env2["codex_usage_total"]["cache_write_tokens"] == 30
+
+
 # ===== 新形式: spawn_agent item が出ない CLI でも rollout の parent_thread_id 突合で子を数える =====
 
 def _codex_log_lines(caplog, prefix: str) -> list:

@@ -136,11 +136,10 @@ def test_stopped_before_any_output_keeps_deterministic_fallback(tmp_path, monkey
     env = _result_env(events)
     assert "接続できません" not in env["headline"], (
         f"ユーザー停止なのに未接続失敗の文言になっている（stop は失敗ではない）: {env!r}")
-    # MCP 有効の Codex 経路は presearch を省くため、`_gather` が最初に持つ headline は
-    # dispatch 由来の目印文字列ではなく `_NO_PRESEARCH_HEADLINE`——stop 経路はそれを上書きしない
-    # （dispatch が呼ばれていれば別の文字列になるため、presearch が復活する回帰もここで検知する）。
-    assert env["headline"] == _NO_PRESEARCH_HEADLINE, (
-        f"stop 経路は presearch を省いた `_gather` の headline のままのはず: {env!r}")
+    assert _NO_PRESEARCH_HEADLINE in env["headline"], env
+    assert "停止" in env["headline"]
+    assert env["completion"] == "stopped"
+    assert env["_terminal"] == "stopped"
 
 
 # ===== (3) 一部出力はあるが agent_message が無いまま失敗 → 既存の決定的回答フォールバックのまま =====
@@ -161,9 +160,10 @@ def test_partial_tool_output_then_failure_keeps_deterministic_fallback(tmp_path,
 
     env = _result_env(_run(prov, ctx))
 
-    # presearch を省いたターンの `_gather` headline（`_NO_PRESEARCH_HEADLINE`）のままのはず。
-    assert env["headline"] == _NO_PRESEARCH_HEADLINE, (
-        f"部分出力ケースは presearch を省いた `_gather` の headline のままのはず: {env!r}")
+    # 本文は presearch を省いたターンの `_gather` headline（`_NO_PRESEARCH_HEADLINE`）のまま。headline は注記＋本文の投影。
+    assert env["body"] == _NO_PRESEARCH_HEADLINE, (
+        f"部分出力ケースは presearch を省いた `_gather` の本文のままのはず: {env!r}")
+    assert env["headline"].endswith(_NO_PRESEARCH_HEADLINE)
 
 
 # ===== (4) 不採用の付帯条件（2026-08-18・Codex RV 2巡目）: HTTPS_PROXY の userinfo が漏れないこと =====
@@ -304,15 +304,9 @@ def test_popen_exec_failure_marks_codex_silent(tmp_path, monkeypatch):
 
     assert env.get("codex_silent_failure") is True, (
         f"Popen 自体の起動失敗が codex_silent として印を付けられていない: {env!r}")
-    # 第3分岐（Popen 未完走＝`attempt_returncode is None` のまま）だけを狙い撃つ区別:
-    # 本物の codex が実際に起動して無出力のまま終了する「silent-codex」分岐
-    # （provider.py `elif _codex_silent_failure:` ＝ attempt_returncode is not None）は
-    # env["headline"] を「Codex に接続できませんでした」等へ書き換える。第3分岐はその節を
-    # 通らない（同 `else:` 節）ため `_gather` の headline（presearch を省いたターンは
-    # `_NO_PRESEARCH_HEADLINE`）が残ったまま——本物の codex 経由で「見かけ上」緑になって
-    # いないかをこの一致で区別する。
-    assert env["headline"] == _NO_PRESEARCH_HEADLINE, (
-        f"headline が書き換わっている＝本物の codex 経由の silent-codex 分岐を通った疑い: {env!r}")
+    assert _NO_PRESEARCH_HEADLINE in env["headline"], env
+    assert "FileNotFoundError" in env["headline"]
+    assert env["completion"] == "failed"
     from sherpa import stop_kind
     assert stop_kind.resolve(env) == "codex_silent"
 

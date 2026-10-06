@@ -596,6 +596,8 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     _ws_value = _web_search_disabled_value(web_search_enabled, _web_search_endpoint_kind, system_settings)
     if _ws_value is not None:  # 既定は必ず disabled を明示的に書く
         lines.append(f'web_search = {_toml_str(_ws_value)}')
+    if not ollama_base_url:  # Codex(OpenAI)（Azure 含む）構成だけ回答を省略させない。ローカルモデルは verbosity を持たない
+        lines.append('model_verbosity = "high"')
     # role config（worker/evaluator）にも同じ provider 行を書けるよう控える（`None`＝既定 OpenAI）。
     _role_provider_lines: list | None = None
     if ollama_base_url:  # Codex(Ollama) 構成のときだけ接続先を差し替える

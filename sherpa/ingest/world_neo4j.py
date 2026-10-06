@@ -305,7 +305,7 @@ def limit_edge_sources(edges: list, limit: int) -> list:
     return out
 
 
-def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None):
+def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None, unparsed_sources=None):
     """資料フォルダのグラフ（dict）を Neo4j へクリーン rebuild する（削除→全ロードを1つの write tx で行う）。
 
     ① schema コマンドはデータ tx と混ぜられないので先に流す。
@@ -317,6 +317,7 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
     未解決の申告は主体のノードの `unresolved`（JSON 文字列）・`unresolved_names`・`unresolved_overflow_count` に載せ、
     メタの `unresolved_stored` を立てる（`read_unresolved` が「申告の保存が無い」と「0 件」を区別する）。
     FW プラグインの失敗（`world_graph.plugin_failures_from_flags`）はメタの `plugin_failures`（JSON 文字列・失敗なしは `[]`）に同じ tx で保存する（`read_plugin_failures`）。
+    グラフに入れなかったソースのファイル数（`world_graph.unparsed_sources_from_flags`）はメタの `unparsed_sources`（JSON 文字列）に同じ tx で保存する（`read_unparsed_sources`）。
     """
     from neo4j import GraphDatabase  # 遅延 import（解析だけなら不要）
 
@@ -381,9 +382,10 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
                 tx.run(
                     "MERGE (m:SherpaMeta {world_id:$w}) "
                     "SET m.schema_era=$era, m.node_count=$nc, m.edge_count=$ec, m.unresolved_stored=true, "
-                    "m.plugin_failures=$pf",
+                    "m.plugin_failures=$pf, m.unparsed_sources=$us",
                     w=world_id, era=GRAPH_SCHEMA_ERA, nc=node_count, ec=edge_count,
-                    pf=json.dumps(list(plugin_failures or []), ensure_ascii=False))
+                    pf=json.dumps(list(plugin_failures or []), ensure_ascii=False),
+                    us=json.dumps(dict(unparsed_sources or {}), ensure_ascii=False))
                 return len(nodes), len(edges)
             return s.execute_write(_apply)
     finally:
@@ -605,6 +607,17 @@ def read_plugin_failures(session, world_id) -> list:
     return json.loads(rows[0]["pf"])
 
 
+def read_unparsed_sources(session, world_id) -> dict | None:
+    """そのグラフを作ったときにグラフへ入れなかったソースのファイル数 `{syntax, size_exceeded}`。保存が無い旧グラフは None（不明・申告しない）。範囲（フォルダ）では絞らない。"""
+    rows = _run_read_capped(
+        session, "MATCH (m:SherpaMeta {world_id:$w}) RETURN m.unparsed_sources AS us",
+        world=world_id, w=world_id)
+    if not rows or not rows[0].get("us"):
+        return None
+    info = json.loads(rows[0]["us"])
+    return info if isinstance(info, dict) else None
+
+
 def read_unresolved(session, world_id, names, scope_prefixes=None, *, fold_case=False) -> dict:
     """起点の名前に一致する未解決の参照（保存済みの申告）を `{available, items[], omitted}` で返す。
 
@@ -796,7 +809,8 @@ def run_world_impact(session, term, world_id, scope_prefixes=None,
     elif truncated:
         coverage.add(graph_coverage.KIND_DEPTH, graph_coverage.STAGE_IMPACT)
     graph_coverage.attach_plugin_failures(
-        coverage, lambda: read_plugin_failures(session, world_id), graph_coverage.STAGE_IMPACT)
+        coverage, lambda: read_plugin_failures(session, world_id), graph_coverage.STAGE_IMPACT,
+        read_unparsed=lambda: read_unparsed_sources(session, world_id))
     # 第1ソートキーは重要度（`高`>`中`/未設定>`低`）。`_重要度.txt` の無い資料フォルダは全 item の rank が揃い、category・name だけの順になる
     items.sort(key=lambda x: (-importance.RANK.get(x.get("importance"), importance.RANK_UNSET),
                               x["category"], x["name"]))

@@ -14,11 +14,12 @@ from .db import _connect, _ensure
 
 def add_usage_event(*, kind, provider, model=None, input_tokens=None, cached_input_tokens=None,
                     output_tokens=None, reasoning_output_tokens=None, calls=1,
+                    cache_write_tokens=None,
                     user_id=None, world=None, ts=None, elapsed_ms: int | None = None,
                     conversation_id: int | None = None, meta=None,
                     connect_timeout: float | None = None,
                     statement_timeout_ms: int | None = None) -> None:
-    """1行 INSERT。トークン列の NULL はプロバイダが usage を返さなかったことを表す。
+    """1行 INSERT。トークン列の NULL はプロバイダが usage を返さなかったことを表す（`cache_write_tokens` の NULL は書き込み量が不明）。
     `ts` はテスト用（None なら DB 既定の now()）。`elapsed_ms` は呼び出しの所要時間（None＝未計測）。
     `conversation_id` は会話別集計キー（None＝未確定）。`meta` は表示・分析用の付帯内訳（JSONB・課金集計は読まない）。
     `connect_timeout`/`statement_timeout_ms`（None＝無期限）は接続確立と SET statement_timeout の予算。
@@ -43,20 +44,20 @@ def add_usage_event(*, kind, provider, model=None, input_tokens=None, cached_inp
             c.execute(
                 "INSERT INTO usage_events (ts, kind, provider, model, input_tokens, cached_input_tokens, "
                 "  output_tokens, reasoning_output_tokens, calls, user_id, world, elapsed_ms, "
-                "  conversation_id, meta) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "  conversation_id, meta, cache_write_tokens) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (ts, kind, provider, model, input_tokens, cached_input_tokens,
                  output_tokens, reasoning_output_tokens, calls, user_id, world, elapsed_ms,
-                 conversation_id, meta_json))
+                 conversation_id, meta_json, cache_write_tokens))
         else:
             c.execute(
                 "INSERT INTO usage_events (kind, provider, model, input_tokens, cached_input_tokens, "
                 "  output_tokens, reasoning_output_tokens, calls, user_id, world, elapsed_ms, "
-                "  conversation_id, meta) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "  conversation_id, meta, cache_write_tokens) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (kind, provider, model, input_tokens, cached_input_tokens,
                  output_tokens, reasoning_output_tokens, calls, user_id, world, elapsed_ms,
-                 conversation_id, meta_json))
+                 conversation_id, meta_json, cache_write_tokens))
 
 
 def list_recent_events(kind: str, *, limit: int = 200) -> list:
