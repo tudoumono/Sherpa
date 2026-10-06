@@ -17,7 +17,6 @@ export const S = {
   verLabels: {},   // 取込ディレクトリ識別子→表示名（/world-options 由来）
   pendingConvWorld: null,   // 会話復元が選択肢の読込より先に走った時の後追い適用
   kb: true,                // ナレッジ参照（既定ON）
-  kbLocked: false,         // Codex 構成は資料参照ON固定（サーバ側でも強制）
   // 資料フォルダが1つも登録されていないと確定した（`GET /world-options` が空）ときだけ true。false は「未確認」を含む。
   kbForcedOff: false,
   personal: false,         // 個人ファイル参照トグル（既定オフ）

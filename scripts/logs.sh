@@ -10,7 +10,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 # shellcheck source=scripts/run-common.sh
 . "$ROOT/scripts/run-common.sh" 2>/dev/null || true
-LOG_DIR="${SHERPA_LOG_DIR:-data/run}"
+LOG_DIR="${RUN_DIR:-$ROOT/data/run}"
+sherpa_warn_legacy_log_dir 2>/dev/null || true
 
 LINES=20 GREP="" LIST=0 MEM_INTERVAL=0 REPORT=0 REPORT_ALL=0 PRINT_HELP=0
 NAMES=()

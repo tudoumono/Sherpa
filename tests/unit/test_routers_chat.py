@@ -111,10 +111,10 @@ def test_prepare_agentic_snapshot_reads_settings_exactly_once_for_knowledge_and_
                         lambda: {"grep": True, "fulltext": True, "graph": True})
 
     knowledge, provider, settings, sys_settings, tools_availability = RC._prepare_agentic_snapshot(
-        "u1", False, False)   # 要求は knowledge=False だが Codex 構成なので実効値は True になるはず
+        "u1", True, False)
 
     assert calls["n"] == 1        # settings は一度しか読まない
-    assert knowledge is True      # Codex 構成は常にON（多層防御）が正しく効く
+    assert knowledge is True      # 要求どおり
     assert provider is not None   # knowledge の実効値どおり Provider が準備される
 
 
@@ -133,10 +133,17 @@ def test_prepare_agentic_snapshot_reads_settings_exactly_once_when_knowledge_sta
         raise AssertionError("knowledge=False では Provider を準備してはいけない")
 
     monkeypatch.setattr(RC, "get_provider", _must_not_be_called)
+    snap = {"research_default_provider": "ollama"}
+    monkeypatch.setattr(RC.store, "_read_system_settings_fresh", lambda: snap)
+    seen = []
+    plain = object()
+    monkeypatch.setattr(RC, "plain_provider_for", lambda s, sys_s: (seen.append((s, sys_s)), plain)[1])
 
     knowledge, provider, settings, sys_settings, tools_availability = RC._prepare_agentic_snapshot(
         "u1", False, False)
 
     assert calls["n"] == 1
     assert knowledge is False
-    assert provider is None
+    # 受付時の設定の写しから頭脳を作り、実行本体へ渡す（実行時に読み直さない）。
+    assert provider is plain and sys_settings is snap and settings == {"agent": "heuristic"}
+    assert seen == [(settings, snap)]

@@ -11,8 +11,29 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 # shellcheck source=scripts/run-common.sh
 . "$ROOT/scripts/run-common.sh"
+# shellcheck source=scripts/lib/install_state.sh
+. "$ROOT/scripts/lib/install_state.sh"
 
 KEEP_STORES="${KEEP_STORES:-0}"
+
+# systemd で常駐しているユニット（このフォルダを WorkingDirectory にしているもの）を止める。
+# 止められなければ、止め方を案内してここで終わる（動いたままストアだけ止めない）。
+stop_systemd_units() {
+  local units unit failed=0
+  units="$(pkg_systemd_active_units)"
+  [ -n "$units" ] || return 0
+  for unit in $units; do
+    echo "systemd のユニット ${unit} を停止します..."
+    if systemctl stop "$unit" 2>/dev/null || sudo -n systemctl stop "$unit" 2>/dev/null; then
+      echo "  ${unit} を停止しました。"
+    else
+      echo "✗ ${unit} を止められませんでした（権限が足りない可能性があります）。次を実行してから、もう一度 make stop を実行してください:" >&2
+      echo "    sudo systemctl stop ${unit}" >&2
+      failed=1
+    fi
+  done
+  [ "$failed" = 0 ] || exit 1
+}
 
 # pid ファイルのプロセスを穏当に停止する（SIGTERM→数秒待って SIGKILL）。
 # setsid 起動＝PID がプロセスグループ長のため、まずグループ全体に送る（子も巻き取る）。
@@ -57,6 +78,7 @@ stop_pid() {  # $1=表示名  $2=pidファイル  $3=コマンドライン照合
   esac
 }
 
+stop_systemd_units
 stop_pid "Sherpa アプリ" "$APP_PID_FILE" "$APP_PROC_NEEDLE"
 stop_pid "Caddy" "$CADDY_PID_FILE" "$CADDY_PROC_NEEDLE"
 

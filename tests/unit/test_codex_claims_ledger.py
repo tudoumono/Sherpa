@@ -229,3 +229,65 @@ def test_normalize_evidence_path_strips_leading_dot_slash_and_backslashes():
     assert STRUCT._normalize_evidence_path("./src/a.py") == "src/a.py"
     assert STRUCT._normalize_evidence_path("src/a.py") == "src/a.py"
     assert STRUCT._normalize_evidence_path(".\\src\\a.py") == "src/a.py"
+
+
+# ===== item_ids（主張と台帳項目の対応） =====
+
+_EVIDENCE_B = [{"kind": "source", "path": "src/b.py", "line": 7}]
+
+
+def _two_items() -> IL.LedgerSnapshot:
+    return _snapshot({"a": _ledger_item("a", _EVIDENCE_A), "b": _ledger_item("b", _EVIDENCE_B)})
+
+
+def test_confirmed_with_item_ids_keeps_only_when_refs_match_that_item():
+    ok = {**_claim(evidence_refs=["src/a.py:12"]), "item_ids": ["a"]}
+    swapped = {**_claim("c2", evidence_refs=["src/b.py:7"]), "item_ids": ["a"]}
+    out, stats = STRUCT._claims_vs_ledger([ok, swapped], _two_items(), manifest_file_exists=True)
+    assert out[0]["status"] == "confirmed"
+    assert out[1]["status"] == "inferred"
+    assert "別の項目の根拠" in out[1]["reason"]
+    assert stats["downgraded"] == 1
+
+
+def test_confirmed_with_empty_or_unregistered_item_ids_is_downgraded():
+    empty = {**_claim(evidence_refs=["src/a.py:12"]), "item_ids": []}
+    ghost = {**_claim("c2", evidence_refs=["src/a.py:12"]), "item_ids": ["zzz"]}
+    out, stats = STRUCT._claims_vs_ledger([empty, ghost], _two_items(), manifest_file_exists=True)
+    assert [c["status"] for c in out] == ["inferred", "inferred"]
+    assert "項目が示されていない" in out[0]["reason"] and "確認済みの項目に無い" in out[1]["reason"]
+    assert stats["downgraded"] == 2
+
+
+def test_items_without_any_claim_are_reported_as_omitted_and_summarized():
+    from sherpa import investigation_summary
+    claims = [{**_claim(evidence_refs=["src/a.py:12"]), "item_ids": ["a"]}]
+    _, stats = STRUCT._claims_vs_ledger(claims, _two_items(), manifest_file_exists=True)
+    assert stats["omitted_items"] == ["対象"]
+    texts = investigation_summary.build_items({"investigation": {"omitted_items": stats["omitted_items"]}})
+    assert any(i["label"] == "回答に入っていない項目" and i["text"].startswith("1 件") for i in texts)
+
+
+def test_claims_without_item_ids_keep_legacy_check_and_report_no_omission():
+    out, stats = STRUCT._claims_vs_ledger([_claim(evidence_refs=["src/b.py:7"])], _two_items(),
+                                          manifest_file_exists=True)
+    assert out[0]["status"] == "confirmed"
+    assert "omitted_items" not in stats
+
+
+def test_omission_not_counted_when_some_claims_lack_item_ids():
+    legacy = _claim(evidence_refs=["src/b.py:7"])
+    with_ids = {**_claim("c2", evidence_refs=["src/a.py:12"]), "item_ids": ["a"]}
+    _, stats = STRUCT._claims_vs_ledger([legacy, with_ids], _two_items(), manifest_file_exists=True)
+    assert "omitted_items" not in stats
+
+
+def test_sensitive_omitted_item_name_is_kept_only_as_count():
+    from sherpa import investigation_summary
+    items = {"a": _ledger_item("a", _EVIDENCE_A), "b": {**_ledger_item("b", _EVIDENCE_B), "subject": ".env"}}
+    claims = [{**_claim(evidence_refs=["src/a.py:12"]), "item_ids": ["a"]}]
+    _, stats = STRUCT._claims_vs_ledger(claims, _snapshot(items), manifest_file_exists=True)
+    assert stats["omitted_items"] == [] and stats["omitted_hidden"] == 1
+    texts = investigation_summary.build_items(
+        {"investigation": {"omitted_items": [], "omitted_hidden": 1}})
+    assert any(i["text"].startswith("1 件") and ".env" not in i["text"] for i in texts)

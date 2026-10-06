@@ -15,10 +15,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StrictBool, field_validator
 from starlette.concurrency import run_in_threadpool
 
-from sherpa import agent_constructs, agentic_search, answer_shape, chat_turns, llm, store
+from sherpa import agentic_search, answer_shape, chat_turns, llm, store
 from sherpa import stop_kind as stop_kind_mod
 from sherpa import tools_pref as tools_pref_mod
 from sherpa.agents import get_provider
+from sherpa.providers import plain_provider_for
 from sherpa.chat_router import extract_slash_lens as _extract_slash_lens
 from sherpa.chat_service import _ensure_conversation, _save_investigation_record, stream_message
 from sherpa.deps import _USERS_DIR, _WorldField, _current_user, _resolve_world, neo4j_session, validated_scope
@@ -63,11 +64,9 @@ class ChatReq(BaseModel):
 
 def _knowledge_for_settings(settings: dict, requested: bool) -> bool:
     """`_knowledge_for`/`_prepare_agentic_snapshot` が共有する判定本体（settings は呼び出し側が読んだものを渡す）。
-    Codex 構成は常に資料参照ON（Codex CLI は read-only 実行でも自分で grep/ファイル参照ができるため）。簡易（検索して答える）も常に ON。画面もトグルを ON 固定にするが、ここでも強制する。
+    資料参照は利用者の要求どおり（構成による強制はしない）。オフのターンは `chat_service.stream_message` が簡易と同じ AI を道具なしで呼ぶ。
+    設計: docs/design/chat.md「1ターンの流れ」
     """
-    cid = agent_constructs.construct_id(settings)
-    if cid.startswith("codex") or cid == "simple":
-        return True
     return bool(requested)
 
 
@@ -115,13 +114,15 @@ def _prepare_agentic_snapshot(uid: str, requested_knowledge: bool, web_search: b
     ② 同一のスナップショットから Provider を一度だけ組み立てる。
     ③ `_agentic_target_check`（接続先の I/O-free allowlist 検証）→ `tool_availability`（ES/Neo4j への実接続チェック）の順で呼ぶ（不許可の接続先へ通信する前に拒否するため）。
     返り値 `(knowledge, provider, settings, sys_settings, tools_availability)`。`knowledge` は各エンドポイントの分岐へ、残り 3 つは実行本体（`_turn_run_fn`）へそのまま渡す。
-    `store.get_settings` の失敗は捕捉せず伝播させる（500 で停止）。knowledge の実効値が False のときは Provider を準備せず `(False, None, None, None, None)` を返す。
+    `store.get_settings` の失敗は捕捉せず伝播させる（500 で停止）。knowledge の実効値が False のときは接続先検証・可用性確認を行わず、`(False, plain_provider_for の結果, settings, sys_settings, None)` を返す。
     `_agentic_target_check` が `llm.PreflightRejected`（`SsrfBlocked` を含む）を送出した場合は捕捉し、固定文言の `HTTPException(422)` に変換する（例外の生文言は応答に含めない）。それ以外の例外は伝播して 500 のままにする。
     """
     settings = store.get_settings(uid)
     knowledge = _knowledge_for_settings(settings, requested_knowledge)
     if not knowledge:
-        return False, None, None, None, None
+        # 資料参照オフも受付時の設定の写しから頭脳（`PlainChatProvider`）を作り、実行本体へ渡す（実行時に設定を読み直さない）。
+        sys_settings = store._read_system_settings_fresh()
+        return False, plain_provider_for(settings, sys_settings), settings, sys_settings, None
     # `stream_message` と同じ上書き（実行時にも同じ値で冪等に上書きされる）。
     settings = {**settings, "codex_web_search": bool(web_search)}
     sys_settings = store._read_system_settings_fresh()

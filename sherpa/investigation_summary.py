@@ -12,6 +12,7 @@ UNCONFIRMED_LIST_MAX = 50
 _LABEL_LIMIT = "打ち切り"
 _LABEL_CONFIRMED = "確認できた項目"
 _LABEL_UNCONFIRMED = "確認できなかった項目"
+_LABEL_OMITTED = "回答に入っていない項目"
 _LABEL_BROKEN = "壊れていた項目"
 _LABEL_EFFORT = "調べた量"
 _LABEL_REVIEW = "途中の見直し"
@@ -74,6 +75,16 @@ def build_items(env: dict) -> list[dict]:
         items.append({"label": _LABEL_UNCONFIRMED, "text": f"ほか {len(unconfirmed) - UNCONFIRMED_LIST_MAX} 件"})
     if hidden:
         items.append({"label": _LABEL_UNCONFIRMED, "text": f"名前を表示できない項目 {hidden} 件"})
+    omitted = [n for n in (inv.get("omitted_items") or []) if isinstance(n, str)]
+    omitted_hidden = _count(inv.get("omitted_hidden"))
+    if omitted or omitted_hidden:
+        shown, masked = _split_names(omitted[:UNCONFIRMED_LIST_MAX])
+        more = len(omitted) - len(shown) - masked
+        masked += omitted_hidden
+        tail = ("、".join(shown) + (f" ほか {more} 件" if more > 0 else "")
+                + (f"（名前を表示できない項目 {masked} 件）" if masked else ""))
+        items.append({"label": _LABEL_OMITTED,
+                      "text": f"{len(omitted) + omitted_hidden} 件（調べて確認できましたが、回答の主張に対応づけられていません: {tail}）"})
     invalid = [i for i in (inv.get("invalid") or []) if isinstance(i, str)]
     invalid_total = max(_count(inv.get("invalid_total")), len(invalid))
     if invalid_total:

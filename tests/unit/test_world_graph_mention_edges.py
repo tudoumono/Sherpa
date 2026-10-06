@@ -233,25 +233,23 @@ def test_same_generation_duplicate_name_is_ambiguous_and_not_linked(tmp_path, mo
     assert not [f for f in flags if f.get("reason") == "mention_overflow"]
 
 
-# ---- 別世代の同名＝全世代へ張る（K5） ----------------------------------------------------------
+# ---- 言及は同じトップフォルダの中だけ ----------------------------------------------------------
 
-def test_different_generation_same_name_links_to_all_generations(tmp_path, monkeypatch):
+def test_mention_links_only_within_the_same_top_folder(tmp_path, monkeypatch):
     wd = _world(tmp_path, {
-        "g1/a.fk": "x", "g2/a.fk": "x",
-        "g1/note.md": "この文書は SOMENAME に言及する。",
+        "g1/a.fk": "x", "g2/a.fk": "x", "g2/only.fk": "x",
+        "g1/note.md": "この文書は SOMENAME と OTHERNAME に言及する。",
     })
-    defs = {"g1/a.fk": _def("Module", "SOMENAME"), "g2/a.fk": _def("Module", "SOMENAME")}
+    defs = {"g1/a.fk": _def("Module", "SOMENAME"), "g2/a.fk": _def("Module", "SOMENAME"),
+            "g2/only.fk": _def("Module", "OTHERNAME")}
     monkeypatch.setattr(registry, "_ANALYZERS", (_FakeAnalyzer(defs),))
 
     _, edges, flags = world_graph.build_world(wd, "w")
     doc_edges = _mention_edges(edges)
     assert flags == []
-    dsts = {e["dst"] for e in doc_edges}
-    assert dsts == {world_graph._cid("Module", "w", "g1/a.fk", "SOMENAME"),
-                    world_graph._cid("Module", "w", "g2/a.fk", "SOMENAME")}
-    src_cid = world_graph._document_cid("w", "g1/note.md")
+    assert {e["dst"] for e in doc_edges} == {world_graph._cid("Module", "w", "g1/a.fk", "SOMENAME")}
     for e in doc_edges:
-        assert e["src"] == src_cid
+        assert e["src"] == world_graph._document_cid("w", "g1/note.md")
         assert e["via"] == "mention"
         assert "extraction_method" not in e
         assert e["status"] == "active"

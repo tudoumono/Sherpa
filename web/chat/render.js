@@ -832,6 +832,7 @@ function answerHTML(answer, trace, feedback) {
     + investigationSummaryHTML(answer)
     + retryHintsHTML(answer.retry_hints) + body
     + refGraphHTML(answer) + renderCreatedFiles(answer.created_files)
+    + renderReconciliation(answer)
     + renderSources(answer.sources, answer.sources_verified, evidencePacketForBadges)
     + renderSourcesUnverified(answer)
     + renderInvestigationRecord(answer.investigation) + personalHTML
@@ -1145,6 +1146,39 @@ function renderSources(sources, verifiedDocIds, evidencePacket) {
       + group('根拠（精読済み）', grounded) + group('参考（ヒットのみ）', reference) + '</div>';
   }
   return `<div class="sources"><div class="h">出典（原本をダウンロード）</div>${sources.map(link).join('')}</div>`;
+}
+// 設計書とソースの照らし合わせ（answer.data.reconciliation）。Codex が両方を確かめた項目だけ。旧形式・壊れた行は出さない。
+const RECON_VERDICT_LABEL = { match: '一致', mismatch: '食い違い（ソースが正）', spec_missing: '設計書に記述なし',
+  source_missing: 'ソースに見当たらない', unverified: '未確認' };
+export function reconciliationRows(answer) {
+  const list = answer && answer.data && Array.isArray(answer.data.reconciliation) ? answer.data.reconciliation : [];
+  const side = (v) => ({ text: v && typeof v.text === 'string' ? v.text : '',
+    doc_id: v && typeof v.doc_id === 'string' && v.doc_id ? v.doc_id : '',
+    line: v && Number.isInteger(v.line) && v.line > 0 ? v.line : 0,
+    lineEnd: v && Number.isInteger(v.line) && v.line > 0 && Number.isInteger(v.line_end) && v.line_end > v.line ? v.line_end : 0 });
+  return list.filter((r) => r && typeof r.item === 'string' && r.item.trim() && RECON_VERDICT_LABEL[r.verdict])
+    .map((r) => ({ item: r.item, verdict: r.verdict, label: RECON_VERDICT_LABEL[r.verdict], spec: side(r.spec), source: side(r.source) }));
+}
+function _reconRefHTML(sd, world) {
+  if (!sd.doc_id) return '';
+  const name = sd.doc_id + (sd.line ? `:${sd.line}${sd.lineEnd ? `-${sd.lineEnd}` : ''}` : '');
+  return world
+    ? `<a href="/documents/download?world=${encodeURIComponent(world)}&rel=${encodeURIComponent(sd.doc_id)}" data-dl>📄 ${esc(name)}</a>`
+    : `<span class="muted">📄 ${esc(name)}</span>`;
+}
+function renderReconciliation(answer) {
+  const rows = reconciliationRows(answer);
+  if (!rows.length) return '';
+  const world = answer.scope && typeof answer.scope.world === 'string' ? answer.scope.world : '';
+  const cell = (sd, empty) => `${sd.text ? `<div>${esc(sd.text)}</div>` : (empty ? `<div class="muted">${empty}</div>` : '')}${_reconRefHTML(sd, world)}`;
+  const body = rows.map((r) => `<tr class="recon-${r.verdict}">`
+    + `<td data-label="項目">${esc(r.item)}</td>`
+    + `<td data-label="設計書の記述">${cell(r.spec, r.verdict === 'spec_missing' ? '記述なし' : '')}</td>`
+    + `<td data-label="ソースの実装">${cell(r.source, r.verdict === 'source_missing' ? '見当たらない' : '')}</td>`
+    + `<td data-label="判定"><span class="recon-verdict">${esc(r.label)}</span></td></tr>`).join('');
+  return '<div class="sources reconcile"><div class="h">設計書とソースの照らし合わせ</div>'
+    + '<table class="recon-table"><thead><tr><th>項目</th><th>設計書の記述</th><th>ソースの実装</th><th>判定</th></tr></thead>'
+    + `<tbody>${body}</tbody></table></div>`;
 }
 // 出典の下の「確認できなかった資料」（answer.sources_unverified: [{path, reason}]）。秘匿の資料は名前を出さず件数だけ。
 export function unverifiedSourceRows(answer) {

@@ -845,12 +845,16 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
                                               created_by="admin", scan_root=None,
                                               run_id=run_id, on_run_id=on_run_id, finalize=not defer_finalize,
                                               op="rebind")
-                    recovery_ok = res2["status"] != "failed"
+                    # 全文検索の索引を作り直せなかった復旧は「戻せた」と扱わない。
+                    recovery_ok = res2["status"] != "failed" and not any(
+                        str(f.get("reason") or "").startswith("es_index_failed")
+                        for f in res2.get("flags") or [] if isinstance(f, dict))
                     if defer_finalize:
                         recovery_pending = res2.get("_pending_finalize")
                 except Exception as e2:
                     if defer_finalize:
                         recovery_pending = getattr(e2, "_sherpa_ingest_run_pending", None)
+            e._sherpa_rebind_restored = bool(bind_restored and recovery_ok)  # 呼び出し側が失敗文を復元の成否で分ける
             # 受付 run の終端確定は復旧結果が判明した後に 1 回だけ行う。採用した内部段の snapshot を残して status だけ `failed` にし、reason で復元の成否を区別する
             if defer_finalize:
                 reason = ("rebind_failed_rolled_back" if (bind_restored and recovery_ok)

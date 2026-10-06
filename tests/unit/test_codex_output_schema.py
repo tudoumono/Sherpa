@@ -217,11 +217,20 @@ def test_output_schema_file_matches_contract():
     assert schema["properties"]["next_step"]["type"] == ["string", "null"]
 
 
-def test_output_schema_v2_claim_requires_seven_keys_including_evidence_kinds():
+def test_output_schema_v2_claim_requires_eight_keys_including_item_ids():
     schema = json.loads(TC._OUTPUT_SCHEMA_PATH_V2.read_text(encoding="utf-8"))
     claim_schema = schema["properties"]["claims"]["items"]
     assert set(claim_schema["required"]) == STRUCT._CLAIM_KEYS
     assert claim_schema["properties"]["evidence_kinds"]["items"]["enum"] == list(INV.EVIDENCE_KINDS)
+    assert "item_ids" in claim_schema["required"]
+
+
+def test_parse_claim_accepts_item_ids_and_keeps_seven_key_form_without_them():
+    base = {"id": "c1", "status": "inferred", "text": "t", "evidence_refs": [], "reason": "r",
+            "reason_code": "", "evidence_kinds": ["source"]}
+    assert STRUCT._parse_claim({**base, "item_ids": ["i1"]})["item_ids"] == ["i1"]
+    assert "item_ids" not in STRUCT._parse_claim(base)
+    assert STRUCT._parse_claim({**base, "item_ids": "i1"}) is None
 
 
 def test_env_default_still_resolves_to_2_matching_provider_default(monkeypatch):

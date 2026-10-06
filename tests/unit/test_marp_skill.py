@@ -226,3 +226,16 @@ def test_chrome_path_none_when_nothing(monkeypatch):
         monkeypatch.setenv("HOME", str(td))              # 空 HOME＝Playwright chromium 無し
         assert SB._detect_chrome_path() is None
 
+
+
+def test_chrome_path_autodetect_follows_playwright_browsers_path(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        pw = pathlib.Path(td) / "pw"
+        monkeypatch.delenv("CHROME_PATH", raising=False)
+        monkeypatch.delenv("CHROMIUM_PATH", raising=False)
+        monkeypatch.setenv("HOME", str(pathlib.Path(td) / "empty-home"))
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(pw))
+        d = _mk(pw / "chromium-1300" / "chrome-mac-arm64" / "Chromium.app" / "Contents" / "MacOS")
+        _make_exec(d / "Chromium")
+        got = SB._detect_chrome_path()
+        assert got is not None and got.endswith("Chromium.app/Contents/MacOS/Chromium")

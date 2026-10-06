@@ -148,6 +148,14 @@ _SYSTEM_PROMPT = (
     "呼び出せる回数に上限があるため、早めに絞り込み、確認が済み次第すぐに回答してください。"
 )
 
+# 資料参照オフのチャット（道具なし）の system。社内資料は読めない前提で一般知識だけで答える。
+_PLAIN_SYSTEM_PROMPT = (
+    "あなたは業務を手伝うアシスタントです。社内資料は参照していません。"
+    "一般的な知識の範囲で日本語で簡潔に答えてください。"
+    "社内の固有の仕様や運用など、資料を読まないと分からないことは推測で埋めず、"
+    "資料参照をオンにして調べ直す必要がある旨を伝えてください。"
+)
+
 # `agentic_search` の既存ツール定義（説明・JSON スキーマ）を再利用する。
 _TOOL_DEFS = {
     "es_search": (agentic_search._DESC_ES, agentic_search._PARAMS_ES_SEARCH),
@@ -239,11 +247,12 @@ def iter_tool_loop(state: LoopState, *, provider: str, model: str, endpoint: str
                    system_prompt: str, query: str, world: str, scope_paths: list | None,
                    history: list | None = None, stop_event=None, extra_context: str = "",
                    availability: dict | None = None, layer=None,
-                   absolute_deadline: float | None = None) -> Iterator[dict]:
+                   absolute_deadline: float | None = None, offer_tools: bool = True) -> Iterator[dict]:
     """道具ループの本体（`answer()` とチャットの簡易 provider が共有する）。
     道具を 1 件実行するたびに `{"phase": "start"|"done", "name", "args", ("result", "docs")}` を yield し、結果は `state` に積む。
     `stop_event` が立ったら次の LLM 呼び出し・道具実行の前で `state.stopped=True` にして終える。
     期限超過は `AnswerTimeout`、送信失敗は `LLMUnavailable`。`history`（直前までの user/assistant 完全対）は system と今回の質問の間に置く。
+    `offer_tools=False` は道具を渡さず 1 往復で答えさせる（資料参照オフのチャット用）。
     """
     def _per_call_timeout() -> float:
         return min(_check_deadline(absolute_deadline), _MAX_PER_CALL_TIMEOUT_S)
@@ -251,7 +260,8 @@ def iter_tool_loop(state: LoopState, *, provider: str, model: str, endpoint: str
     def _stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
 
-    tools = _build_tools(availability if availability is not None else agentic_search.tool_availability())
+    tools = (_build_tools(availability if availability is not None else agentic_search.tool_availability())
+             if offer_tools else [])
     offered_names = frozenset(_TOOL_DEFS.keys()) & {t["function"]["name"] for t in tools}
     system = system_prompt + (("\n\n" + extra_context) if extra_context else "")
     msgs = [{"role": "system", "content": system}, *(history or []),
@@ -262,7 +272,9 @@ def iter_tool_loop(state: LoopState, *, provider: str, model: str, endpoint: str
         if _stopped():
             state.stopped = True
             return
-        body = {"model": model, "messages": msgs, "tools": tools}
+        body = {"model": model, "messages": msgs}
+        if tools:
+            body["tools"] = tools
         if provider == "ollama":
             body["stream"] = False
             body["options"] = {"temperature": 0.2}
@@ -281,7 +293,7 @@ def iter_tool_loop(state: LoopState, *, provider: str, model: str, endpoint: str
         msg = ((resp.get("choices") or [{}])[0].get("message") if "choices" in resp
               else resp.get("message")) or {}
         calls = msg.get("tool_calls") or []
-        if not calls:
+        if not calls or not offer_tools:   # 道具なしは 1 回で終える（tool call が返っても呼び直さない）
             state.final_text = agentic_search._openai_style_text(msg)
             return
         msgs.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})

@@ -124,15 +124,18 @@ def test_only_boundary(entry, only, expect_boundary_reject, needle):
 
 # ===== 同名レーンの cross-entry 排他（gate-lane.sh と gate-integration.sh が共有） ================
 
-def test_cross_entry_same_lane_lock_blocks_integration_while_held():
+def test_cross_entry_same_lane_lock_blocks_integration_while_held(tmp_path):
     """`/tmp/sherpa-gate-<lane>.lock` を外部で保持したまま gate-integration.sh --lane <同名> を 起動すると、レーン別ロック待ちでブロックし続ける（worktree/venv は本物・実サービスには 到達しない——ロック取得は DB reset より前で止まるため）。"""
     lane = f"rvtest{os.getpid()}"
     lockfile = pathlib.Path(f"/tmp/sherpa-gate-{lane}.lock")
+    worktree = tmp_path / "wt"   # .venv を持つ最小の worktree（CI のように ROOT に .venv が無くても venv 解決を通す）
+    (worktree / ".venv" / "bin").mkdir(parents=True)
+    (worktree / ".venv" / "bin" / "python").symlink_to(PY)
     fd = _hold_flock(lockfile)
     try:
         r = subprocess.run(
             ["timeout", "3", "bash", str(ROOT / "scripts" / "gate-integration.sh"),
-             str(ROOT), "--lane", lane, "--only", "tests/integration/test_nonexistent_rv.py"],
+             str(worktree), "--lane", lane, "--only", "tests/integration/test_nonexistent_rv.py"],
             cwd=ROOT, capture_output=True, text=True, timeout=15,
         )
         assert r.returncode == 124, f"ブロックされず進行してしまった: {r.stdout}{r.stderr}"

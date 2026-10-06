@@ -31,7 +31,7 @@ BASH4_PATTERNS = (
 
 
 def _targets() -> list[Path]:
-    return sorted(p for p in SCRIPTS.rglob("*.sh") if p.name not in LINUX_ONLY)
+    return sorted([p for p in SCRIPTS.rglob("*.sh") if p.name not in LINUX_ONLY] + [ROOT / "install.sh"])
 
 
 def _code_lines(path: Path):
@@ -64,7 +64,7 @@ _VAR_BEFORE_NON_ASCII = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]")
 
 def test_scripts_brace_variables_before_non_ascii():
     found = [f"{path.relative_to(ROOT)}:{no}: {line.strip()}"
-             for path in sorted(SCRIPTS.rglob("*.sh"))
+             for path in sorted(SCRIPTS.rglob("*.sh")) + [ROOT / "install.sh"]
              for no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
              if _VAR_BEFORE_NON_ASCII.search(line)]
     assert not found, "変数の直後に非 ASCII の文字があります（${VAR} と囲んでください）:\n" + "\n".join(found)

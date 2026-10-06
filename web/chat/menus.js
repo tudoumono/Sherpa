@@ -4,9 +4,8 @@
 'use strict';
 
 import { S, setChatExamples } from './state.js';
-import { setKbLocked } from './scope.js';
 import { setSimpleMode, setWebSearchEligible } from './inquiry.js';
-import { refreshWelcomeExamples, answerBody, answerNotices, unverifiedSourceRows, budgetNoteText, clipPersonalQuote } from './render.js';
+import { refreshWelcomeExamples, answerBody, answerNotices, unverifiedSourceRows, reconciliationRows, budgetNoteText, clipPersonalQuote } from './render.js';
 import { toast } from '../chat.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;
@@ -37,7 +36,6 @@ applyThemeIcon();
 function setBrainBadge(c) {
   if (!c) return;
   _agent = c.agent || _agent;
-  setKbLocked(_agent === 'codex' || _agent === 'simple');   // Codex・簡易は常に資料を参照する（トグルON固定）
   setSimpleMode(_agent === 'simple');    // 簡易は調べ方・深さ・検索経路の行を隠す
   _syncWebSearchEligibility();
   $('brain-label').textContent = c.label || '…';
@@ -234,6 +232,18 @@ function _answerLines(ans, md, shared) {
   if (ans.lens === 'impact') (d.presumed || []).forEach((p) => L.push(`${md ? '- ' : '・'}資料から見つけた関連｜${p.category}｜${p.name}`));
   if (ans.lens === 'troubleshoot') (d.candidates || []).forEach((c) => L.push(`${md ? '- ' : '・'}${c.name}（${c.role || ''}）`));
   if (showCitations) (d.citations || []).forEach((c) => L.push(`${md ? '> ' : ''}${c.doc_id}（行${(c.span || [])[0]}-${(c.span || [])[1]}）: ${c.quote || ''}`));
+  const recon = reconciliationRows(ans);
+  if (recon.length) {
+    const ref = (sd) => sd.doc_id + (sd.line ? `:${sd.line}${sd.lineEnd ? `-${sd.lineEnd}` : ''}` : '');
+    const cellText = (sd) => [sd.text, ref(sd) ? `（${ref(sd)}）` : ''].join('').replace(/\s+/g, ' ').replace(/\|/g, '/').trim();
+    if (md) {
+      L.push('**設計書とソースの照らし合わせ**', '', '| 項目 | 設計書の記述 | ソースの実装 | 判定 |', '| --- | --- | --- | --- |');
+      recon.forEach((r) => L.push(`| ${r.item.replace(/\s+/g, ' ').replace(/\|/g, '/').trim()} | ${cellText(r.spec)} | ${cellText(r.source)} | ${r.label} |`));
+    } else {
+      L.push('設計書とソースの照らし合わせ');
+      recon.forEach((r) => L.push(`・${r.item.replace(/\s+/g, ' ').trim()}｜設計書: ${cellText(r.spec) || '-'}｜ソース: ${cellText(r.source) || '-'}｜${r.label}`));
+    }
+  }
   if ((ans.sources || []).length) {
     // sources_verified があれば根拠/参考の2区分で書き出す（render.js と同じ）
     const verified = Array.isArray(ans.sources_verified) ? new Set(ans.sources_verified) : null;

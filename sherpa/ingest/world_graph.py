@@ -6,7 +6,7 @@
 ① Pass1: 言語アナライザ（`sherpa.ingest.analyzers`）で定義を集める。
 ② Pass2: 参照を同 top_scope 内の最近傍で解決して構造エッジを張る。
 ③ Pass3: 定義索引を辞書として資料文書の本文と決定的に突合し、`Document -DOCUMENTS(via="mention")-> コード` を張る
-   （世代をまたいでよい例外・影響 traversal の対象外）。
+   （言及元と同じ top_scope の定義にだけ張る・影響 traversal の対象外）。
 LLM は使わない。言語ごとの抽出はアナライザ側、本モジュールは名前解決・cid 組み立てなど言語非依存の共通層。
 設計: docs/design/scope.md「リンクの解決：構造エッジ・対応エッジ・言及エッジ」
 """
@@ -591,7 +591,7 @@ def _document_cid(world_id: str, rel: str) -> str:
 # 決定的（LLM なし）に突合し、`Document -DOCUMENTS(via="mention")-> コードノード` を張る。
 # `DOCUMENTS` は影響 traversal（`_IMPACT_REL`）に含まれない。
 
-MENTION_SCHEMA_VERSION = 3   # 突合仕様の版（worker._sig の材料。仕様変更時に既存の資料フォルダを素通りさせない）
+MENTION_SCHEMA_VERSION = 4   # 突合仕様の版（worker._sig の材料。仕様変更時に既存の資料フォルダを素通りさせない）
 
 _MENTION_TOKEN_RE = re.compile(r"[A-Za-z0-9_#@$-]+")
 
@@ -639,8 +639,8 @@ def _mention_dictionary(defs: dict, aliases: dict | None = None, *, min_len: int
     """`defs`（Pass1 の定義索引 `(label,key)->[rel,...]`）→ 言及突合の辞書 `name->[(label,rel,key),...]`。
 
     - `min_len` 未満の名前と、1 トークンとして生成されない修飾名は、辞書構築の時点で除外する。
-    - 同一 top_scope（世代）内に同名の定義が複数ある場合は曖昧として、その世代は除外する（ラベルは問わない）。
-      世代が違う同名は曖昧ではなく、全世代の定義をそれぞれ辞書に残す。
+    - 同一トップフォルダ内に同名の定義が複数ある場合は曖昧として、そのトップフォルダは除外する（ラベルは問わない）。
+      トップフォルダが違う同名は曖昧ではなく、それぞれ辞書に残す（張る先の絞り込みは `_mention_edges_for_doc`）。
     - `key` は `defs` のキーそのもの（修飾名を含み得る）。dst の cid 組み立てに使うため、辞書引きの文字列とは別に保持する。
     - `aliases`（`(label,simple_name)->[(rel,key),...]`）は、`cid_key` と表示名が異なる定義（コピーブックの
       `GROUP.ITEM` 等）を表示名でも登録する。`build_world` は `key != name` のときだけ渡す。
@@ -725,14 +725,15 @@ def _mention_edges_for_doc(rel: str, text: str, mdict: dict, min_len: int, max_p
                            world_id: str, nodes: dict, edges: list, flags: list) -> None:
     """1 文書分の言及突合: トークン化→辞書突合→`Document -DOCUMENTS(via=mention)-> コード` を張る。
 
+    言及元の文書と同じトップフォルダ（`_top`）の定義にだけ張る（設計: docs/03-鏡モデル.md §2.4）。
     1 文書あたりの上限（`max_per_doc`）を超えた分は張らず、件数を `flags`（`mention_overflow`）へ申告する。
-    上限は 1 トークンが複数世代へ展開される場合もエッジ単位で数える。
     dst の cid は `targets` の `key`（修飾名を含み得る）で組み立てる。同一 `(doc, dst)` は 1 本にまとめ、文書内の言及の位置を
     根拠 `sources[].locator` に並べる（`doc` は言及元の文書・`line` は 0）。
     """
     added = 0
     overflow = 0
     doc_cid = None
+    doc_top = _top(rel)
     seen_dst: set = set()
     pending: list = []                               # (tok, edge)
     for tok in _mention_tokenize(text):
@@ -742,6 +743,8 @@ def _mention_edges_for_doc(rel: str, text: str, mdict: dict, min_len: int, max_p
         if not targets:
             continue
         for label, trel, key in targets:
+            if _top(trel) != doc_top:                 # 言及も同じトップフォルダの中だけ
+                continue
             dst_cid = _cid(label, world_id, trel, key)
             if dst_cid in seen_dst:                   # 同一 (doc,dst) の重複エッジは作らない
                 continue

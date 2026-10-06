@@ -402,10 +402,10 @@ export async function send(override) {
   const thinking = appendAssistantRaw('<div class="thinking loading-inline" role="status"><span class="spinner spinner-sm"></span><span>回答を準備しています...</span></div>');
   startThinkingTicker(thinking);
   startFlow(message);
-  const body = { message, world: $('version').value, knowledge: !!S.kb, personal: !!S.personal };
+  const body = { message, world: $('version').value, knowledge: !!S.kb, personal: !!S.personal && !!S.kb };   // 社内資料オフでは個人ファイルも読まない
   if (S.cid) body.conversation_id = S.cid;
   // Web 検索は true のときだけ載せる
-  if (S.webSearch && !isSimpleMode()) body.web_search = true;
+  if (S.kb && S.webSearch && !isSimpleMode()) body.web_search = true;
   // 範囲・調べ方・探す対象・深さ・検索経路はナレッジ参照オンのときだけ送り、既定値は省略する。override のキーはこの1回だけ優先する
   if (S.kb) {
     const ov = override || {};

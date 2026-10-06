@@ -106,11 +106,9 @@ def test_original_download_is_path_based_not_basename():
     assert world_graph.resolve_path(MIRROR, "4期更改/03_開発/01_ソース/NOPE.cbl") is None
 
 
-def test_mention_edges_link_to_all_generations_with_same_name():
-    """言及エッジ（Pass3・S2）は骨格の「同世代内最近傍」規律とは別の**制度化された例外**（K5）:
-    名前一致する**全世代**のコードノードへ張る。両世代の受注設計書.md はそれぞれ ORDER-MAIN に
-    言及しており、各 Document は自世代/他世代を問わず両方の ORDER-MAIN ノードへ DOCUMENTS
-    （via=mention）を持つ（世代跨ぎが許される唯一の構造エッジ族＝影響 traversal には乗らない）。
+def test_mention_edges_stay_within_the_same_top_folder():
+    """言及エッジ（Pass3）も同じトップフォルダの中だけ。両世代の受注設計書.md は、それぞれ自分の
+    トップフォルダの ORDER-MAIN にだけ DOCUMENTS（via=mention）を持つ。
     """
     nodes, edges, flags = _build()
     assert flags == []
@@ -118,10 +116,7 @@ def test_mention_edges_link_to_all_generations_with_same_name():
         doc_cid = f"document:mirror:{top}/02_設計/01_基本設計/受注設計書.md"
         mentions = {e["dst"] for e in edges
                    if e["type"] == "DOCUMENTS" and e.get("via") == "mention" and e["src"] == doc_cid}
-        assert mentions == {
-            f"module:mirror:4期更改/03_開発/01_ソース/ORDER-MAIN.cbl#ORDER-MAIN",
-            f"module:mirror:5期更改/03_開発/01_ソース/ORDER-MAIN.cbl#ORDER-MAIN",
-        }, mentions
+        assert mentions == {f"module:mirror:{top}/03_開発/01_ソース/ORDER-MAIN.cbl#ORDER-MAIN"}, mentions
 
 
 CORPUS_V1 = ROOT / "fixtures/corpus/v1"

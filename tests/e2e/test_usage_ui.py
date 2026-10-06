@@ -334,18 +334,22 @@ def test_usage_export_zip_button_requests_current_period(page, web_base_url):
     assert download.value.suggested_filename == "usage-detail-20260601-20260630.zip"
     assert records["admin_usage_export"][-1]["days"] == ["30"]
 
-    page.locator("[data-days='7']").click()
+    # 期間切替は画面遷移を挟んで取得を始めるため、取得要求が出るまでは旧期間のボタンが有効なまま残る。
+    # 要求の発出（＝ボタンが取得中の無効状態に入った後）を待ってから有効化を待つ。
+    with page.expect_request(lambda r: "/admin/usage/stats" in r.url and "days=7" in r.url):
+        page.locator("[data-days='7']").click()
     expect(page.locator(".period-bar [data-days='7']")).to_have_class(re.compile(r"\bon\b"))
+    expect(export).to_be_enabled()
     assert records["admin_usage_stats"][-1]["days"] == ["7"]
     expect(page.locator("#t-zerohit")).to_have_text("50%")
-    expect(export).to_be_enabled()
     with page.expect_download():
         export.click()
     assert records["admin_usage_export"][-1]["days"] == ["7"]
 
     page.locator("#period-start").fill("2026-01-01")
     page.locator("#period-end").fill("2026-01-31")
-    page.locator("#period-range button[type=submit]").click()
+    with page.expect_request(lambda r: "/admin/usage/stats" in r.url and "from=" in r.url):
+        page.locator("#period-range button[type=submit]").click()
     expect(export).to_be_enabled()
     with page.expect_download():
         export.click()

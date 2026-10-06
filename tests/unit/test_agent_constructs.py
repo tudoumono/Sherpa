@@ -135,35 +135,18 @@ def test_effective_agent_strict_rejects_falsy_non_string_saved_agent(monkeypatch
         assert AC.effective_agent({"agent": bad}) in AC.enabled_agents()
 
 
-def test_codex_construct_forces_knowledge_on(monkeypatch):
-    """Codex 構成は資料参照ON固定（決定 2026-08-15）。
-
-    Codex CLI は read-only 実行でも自分で grep/ファイル参照ができるため、「参照オフのつもりなのに
-    KB を覗く」状態を作らない。画面はトグルをON固定にするが、UI を信頼せずサーバでも強制する。
-    """
+def test_knowledge_follows_the_request_in_every_construct(monkeypatch):
+    """資料参照は構成によらず利用者の要求どおり（Codex 構成・簡易でもオフにできる）。"""
     from sherpa import store
     from sherpa.routers.chat import _knowledge_for
 
     saved = {}
     monkeypatch.setattr(store, "get_settings", lambda uid: saved)
-
-    saved.clear(); saved.update({"agent": "codex"})
-    assert _knowledge_for("u", False) is True          # OFF 要求でも ON にする
-    assert _knowledge_for("u", True) is True
-
-    saved.clear(); saved.update({"agent": "codex", "codex_model_provider": "ollama"})
-    assert _knowledge_for("u", False) is True          # Codex(Ollama) も同じ
-
-    saved.clear(); saved.update({"agent": "simple"})
-    assert _knowledge_for("u", False) is True          # 簡易も資料参照ON固定（検索・出典確認が本体）
-
-
-    # 設定が読めない時は要求どおり（可用性優先＝チャット自体を止めない）
-    def _boom(uid):
-        raise RuntimeError("db down")
-
-    monkeypatch.setattr(store, "get_settings", _boom)
-    assert _knowledge_for("u", False) is False
+    for cfg in ({"agent": "codex"}, {"agent": "codex", "codex_model_provider": "ollama"},
+                {"agent": "simple"}):
+        saved.clear(); saved.update(cfg)
+        assert _knowledge_for("u", False) is False
+        assert _knowledge_for("u", True) is True
 
 
 def test_default_construct_is_selectable_from_the_screen(monkeypatch):

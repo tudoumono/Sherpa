@@ -38,8 +38,19 @@ _HANDLER_MARK = "_sherpa_log_setup"
 _configured = False
 
 
-def _log_dir() -> Path:
-    return Path(os.environ.get("SHERPA_LOG_DIR", "data/run"))
+def run_dir() -> Path:
+    """ログ・pid の置き場（環境変数 RUN_DIR・既定 `<Sherpa のフォルダ>/data/run`）。相対パスは Sherpa のフォルダ基準（scripts/run-common.sh と同じ）。"""
+    root = Path(__file__).resolve().parents[1]
+    raw = os.environ.get("RUN_DIR", "").strip()
+    if not raw:
+        return root / "data" / "run"
+    p = Path(raw)
+    return p if p.is_absolute() else root / p
+
+
+def _warn_legacy_log_dir(base: Path) -> None:
+    if os.environ.get("SHERPA_LOG_DIR"):
+        print(f"SHERPA_LOG_DIR はもう使いません。ログは {base} に書きます", file=sys.stderr)
 
 
 # <stem>-YYYYmmdd-HHMMSS[-N]<suffix>（scripts/run-common.sh の sherpa_rotate_log と同じ命名規約）
@@ -127,7 +138,8 @@ def configure_logging(*, log_dir: Path | str | None = None, force: bool = False)
         _configured = True
         return
 
-    base = Path(log_dir) if log_dir is not None else _log_dir()
+    base = Path(log_dir) if log_dir is not None else run_dir()
+    _warn_legacy_log_dir(base)
     keep = _LOG_KEEP
 
     run_logger = logging.getLogger("sherpa")

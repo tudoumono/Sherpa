@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from typing import Iterator
 
-from .. import agentic_search, layer as layer_mod
+from .. import agentic_search, answer_shape, layer as layer_mod
 from .. import simple_chat
 from .base import Ctx, Provider, _log_chat_usage, _node, _usage_meta
 
@@ -121,3 +121,65 @@ class SimpleProvider(Provider):
             env["_personal_facts"] = ctx.personal_facts
         yield {"type": "_result", "env": env,
                "decision": {"lens": "qa", "input": ctx.message, "reason": "簡易（検索して答える）"}}
+
+
+KNOWLEDGE_OFF_NOTICE = "社内資料は参照していません（資料参照がオフのため、一般的な知識での回答です）。"
+
+
+class PlainChatProvider(Provider):
+    """資料参照オフのチャットの頭脳。簡易と同じ AI（`simple_chat._resolve_llm`）を道具なしで 1 回呼んで答える。
+    資料・個人ファイルは読まず、出典は付けない。履歴は簡易と同じ別チャネルで渡す。
+    設計: docs/design/simple.md「資料参照オフのチャット（`PlainChatProvider`）」
+    """
+    label = "通常チャット（資料参照オフ）"
+
+    def __init__(self, provider: str, model: str, endpoint: str, headers: dict,
+                 system_settings: dict | None = None):
+        self.provider_id = provider
+        self.model = model
+        self._endpoint, self._headers = endpoint, headers
+        self._system_settings = system_settings
+
+    def run(self, ctx: Ctx) -> Iterator[dict]:
+        yield _node("understand", "think", "質問を理解", "内容を把握しました", "done")
+        yield _node("brain", "think", f"考える（{self.label}）", "資料を参照せずに回答中", "active")
+        state = simple_chat.LoopState()
+        t0 = time.monotonic()
+        failure: str | None = None
+        try:
+            for _ev in simple_chat.iter_tool_loop(
+                    state, provider=self.provider_id, model=self.model, endpoint=self._endpoint,
+                    headers=self._headers, system_prompt=simple_chat._PLAIN_SYSTEM_PROMPT,
+                    query=ctx.message, world=ctx.world, scope_paths=None,
+                    history=list(ctx.history or []), stop_event=ctx.stop_event, offer_tools=False):
+                pass
+        except (simple_chat.LLMUnavailable, simple_chat.AnswerTimeout) as e:
+            from .. import stop_kind as stop_kind_mod
+            failure = stop_kind_mod.from_exception(e) or "error"
+        finally:
+            usage = (_usage_meta(self.provider_id, self.model,
+                                 **(agentic_search._usage_or_none(state.usage_acc) or {}),
+                                 system_settings=self._system_settings)
+                     if state.llm_calls > 0 else None)
+
+        if state.stopped or (ctx.stop_event is not None and ctx.stop_event.is_set()):
+            return  # 停止時は `_result` を出さない
+        text = (state.final_text or "").strip()
+        if failure is None and not text:
+            failure = "error"
+        if failure is not None:
+            text = f"{LABEL} の AI に接続できませんでした。管理者に設定を確認してください。"
+        yield _node("brain", "think", f"考える（{self.label}）",
+                    "回答しました" if failure is None else "AI に接続できません", "done")
+        yield {"type": "answer_delta", "text": text}
+        env = {"lens": "chat", "headline": text, "summary": {"total": 0}, "data": {}, "sources": [],
+               "scope": {"world": ctx.world, "scope_paths": [], "source": "off"}}
+        if failure is None:
+            answer_shape.add_notice(env, "knowledge_off", KNOWLEDGE_OFF_NOTICE)
+        else:
+            env["agentic_failure"] = failure
+        if usage:
+            env["usage"] = usage
+            _log_chat_usage(usage, time.monotonic() - t0, ctx.world)
+        yield {"type": "_result", "env": env,
+               "decision": {"lens": "chat", "input": ctx.message, "reason": "ナレッジ参照オフ"}}

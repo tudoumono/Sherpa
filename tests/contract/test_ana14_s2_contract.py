@@ -137,7 +137,9 @@ def test_edges_differ_from_baseline_only_by_start_node_within_the_same_file(buil
     """旧辺 `(src,type,dst,via,line)` ごとに、始点だけが同じファイルの定義ノードへ移った辺が新側にある。
     辺は件数込みで比べる（二重の辺を作らない・新側にだけある辺は ana-s2 の表にある 1 本だけ）。影響たどりの `affected.path` 集合は新旧で減らず、増えるのは `S2_AFFECTED_GAINS` の分だけ。"""
     name, _nodes, edges, _flags = built
-    old = Counter(tuple(e) for e in BASELINE[name]["edges"])
+    # 言及はトップフォルダの中だけに張る（docs/03-鏡モデル.md §2.4）。基準に残るトップフォルダをまたぐ言及は比べない。
+    old = Counter(tuple(e) for e in BASELINE[name]["edges"]
+                  if not (e[3] == "mention" and _path(e[0]).split("/")[0] != _path(e[2]).split("/")[0]))
     new_list = [(e["src"], e["type"], e["dst"], e.get("via"), e.get("line")) for e in edges]
     new_list = [e for e in new_list if (_short(e[0]), e[1], _short(e[2]), e[3], e[4]) not in S3_NEW_EDGES]
     new = Counter(new_list)

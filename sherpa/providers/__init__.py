@@ -133,6 +133,25 @@ def _select_simple(sys_s: dict) -> Provider:
     return _facade.SimpleProvider(llm_provider, llm_model, endpoint, headers, system_settings=sys_s)
 
 
+def plain_provider_for(settings: dict | None, system_settings: dict) -> Provider | None:
+    """資料参照オフのターンの頭脳。Codex 構成・簡易のとき、簡易と同じ AI を道具なしで呼ぶ `PlainChatProvider`（未接続なら `_UnwiredProvider`）を返す。それ以外の構成は `None`（呼び出し側が通常の `get_provider` を使う）。"""
+    from sherpa import agent_constructs
+    from sherpa import agents as _facade
+    from sherpa import simple_chat
+    try:
+        agent = agent_constructs.effective_agent(settings or {}, system_settings=system_settings)
+    except Exception:
+        return None
+    if agent not in ("codex", "simple"):
+        return None
+    try:
+        llm_provider, llm_model, endpoint, headers = simple_chat._resolve_llm(system_settings)
+    except simple_chat.LLMUnavailable as e:
+        return _facade._UnwiredProvider("通常チャット（資料参照オフ）", str(e))
+    from .simple import PlainChatProvider
+    return PlainChatProvider(llm_provider, llm_model, endpoint, headers, system_settings=system_settings)
+
+
 def _select_provider(s: dict, system_settings: dict | None = None) -> Provider:
     from sherpa import agent_constructs
     from sherpa import agents as _facade  # 実行時解決

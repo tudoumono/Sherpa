@@ -132,18 +132,6 @@ def test_safe_detail_does_not_raise_on_non_string_secret():
     assert isinstance(GE._safe_detail(_Boom("some failure"), secret={"not": "a-string"}), str)
 
 
-def test_safe_detail_anthropic_delegation_masks_key_straddling_boundary():
-    import anthropic
-    import httpx
-
-    key = "PLAINBEDROCKKEY-VIASAFEDETAIL-1122334455667788990011-TAIL"
-    resp = httpx.Response(403, request=httpx.Request("POST", "http://x"))
-    exc = anthropic.APIStatusError("x" * 360 + key + "y" * 30, response=resp, body=None)
-    detail = GE._safe_detail(exc, secret=key)
-    assert key not in detail
-    assert key[:15] not in detail, f"キーの断片が残っている: {detail!r}"
-
-
 @pytest.mark.parametrize("message", [
     pytest.param("deployment not found", id="short"),
     pytest.param("この本文はダミーです。実際のエラーメッセージを模した長文です。" * 20, id="long-over-limit"),

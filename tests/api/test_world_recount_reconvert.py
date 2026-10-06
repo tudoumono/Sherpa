@@ -439,8 +439,10 @@ def test_status_es_state_distinguishes_failed_unavailable_reflecting(client, mon
     assert es(emb, *([emb] * 50), ok)["es_index_kept"] is True    # 窓の奥の成功も拾う（limit は store 側）
     assert es({"available": False, "error": None})["es_state"] == "unavailable"
     assert es(ok)["es_state"] == "ok"
-    prog = lambda stage: {"status": "extracting", "extraction_snapshot": None, "progress": {
-        "stage": stage, "stage_label": "x", "done": None, "total": None, "updated_at": "2026-01-01T00:00:00+00:00"}}
+    def prog(stage):
+        return {"status": "extracting", "extraction_snapshot": None, "progress": {
+            "stage": stage, "stage_label": "x", "done": None, "total": None,
+            "updated_at": "2026-01-01T00:00:00+00:00"}}
     run["v"] = prog("graph_build")
     assert es(emb, ok)["es_state"] == "failed"                    # ES 以外の段の実行中は直前の記録
     run["v"] = prog("es_index")

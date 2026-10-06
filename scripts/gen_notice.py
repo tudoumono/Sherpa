@@ -148,7 +148,7 @@ def _ollama_models(kit: pathlib.Path) -> list[str]:
 
 
 def _render_notice(groups: dict[str, list[dict]]) -> str:
-    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip() if (ROOT / "VERSION").exists() else "0.0.0"
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip().split("+", 1)[0] if (ROOT / "VERSION").exists() else "0.0.0"
     lines = [
         f"# Sherpa {version} — 第三者ソフトウェアの帰属表示（NOTICE）",
         "",
@@ -209,7 +209,7 @@ def _render_license_texts(groups: dict[str, list[dict]]) -> str:
 
 
 def _render_sbom(groups: dict[str, list[dict]]) -> str:
-    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip() if (ROOT / "VERSION").exists() else "0.0.0"
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip().split("+", 1)[0] if (ROOT / "VERSION").exists() else "0.0.0"
     components = []
     for label, rows in groups.items():
         for r in rows:

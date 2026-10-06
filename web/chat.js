@@ -449,7 +449,7 @@ fetch('/world-options').then((r) => r.json()).then((d) => {
   const names = d.worlds || [];
   const lbls = d.labels || {};
   S.verLabels = {}; names.forEach((n) => { S.verLabels[n] = lbls[n] || n; });
-  // 資料フォルダが1つも登録されていない環境では、資料参照を送ると 404 になるため、未登録なら明示OFFへ倒す（Codex構成の kbLocked は setKb 自身が常にONへ上書きするため分岐しない）。
+  // 資料フォルダが1つも登録されていない環境では、資料参照を送ると 404 になるため、未登録なら明示OFFへ倒す。
   // S.kbForcedOff も立てる: newConversation() が「未確認（読込前/失敗）」と「空で確定」を区別して、後者のときだけ新規会話も OFF のままにするため。
   if (names.length === 0) { S.kbForcedOff = true; setKb(false); }
   const sel = $('version');

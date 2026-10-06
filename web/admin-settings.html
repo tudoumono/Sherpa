@@ -407,7 +407,7 @@
           <div class="card sec" id="codex-investigation-card">
             <div class="card-head"><span class="title">Codex に考えさせる量</span></div>
             <div class="body">
-              <p class="hint">Codex 本体の考えさせる量に適用します。深さを変えてもこの値は変わりません。「作成」は専用の環境設定を使います。</p>
+              <p class="hint">Codex 本体の考えさせる量の基準値です。調べる深さが「クイック」のときだけ、この値より 1 段下がります（それ以外の深さ・素の Codex では変わりません。low 以下はそれ以上下がりません）。「作成」は専用の環境設定を使います。</p>
               <label class="vlm-field"><span class="vlm-l">Codex の考えさせる量（作成以外）</span>
                 <select id="depth-base-codex-reasoning" style="max-width:200px">
                   <option value="">既定に従う</option>
@@ -475,7 +475,7 @@
           <div class="card sec" id="search-investigation-card">
             <div class="card-head"><span class="title">共通の資料検索・関係探索</span></div>
             <div class="body">
-              <p class="hint">資料を探す件数・読む行数・関係をたどる段数の基準値です。調べる深さを変えても、この値は変わりません。</p>
+              <p class="hint">資料を探す件数・読む行数・関係をたどる段数の基準値です。ここで保存した値は深さを変えても変わりませんが、実際に使う値は深さに応じて変わります（件数・行数はクイック×0.5・深く×1.5・最大×2、段数は深く+2・最大+4）。</p>
               <label class="vlm-field"><span class="vlm-l">資料検索のヒット件数上限（基準値）</span>
                 <input type="number" id="depth-base-grep-max-hits" min="1" max="1000" step="1" style="max-width:160px">
               </label>

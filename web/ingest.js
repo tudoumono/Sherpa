@@ -379,6 +379,12 @@ function summaryNote(s, wid) {
     dangers.push('前回の取り込みで、フレームワーク固有の解析に失敗した部分があります。関係グラフの結果が一部欠けているため、'
       + '関連が無いとは言えません（原因を直して取り込み直すまで残ります）');
   }
+  if (warns.includes('rebind_failed_rolled_back')) {
+    dangers.push('前回の参照先の変更は失敗しました。変更前の状態を保持しています');
+  }
+  if (warns.includes('rebind_rollback_failed')) {
+    dangers.push('前回の参照先の変更は失敗し、変更前の状態に戻せませんでした。「今すぐ更新」で作り直してください');
+  }
   // `office_md_blocked:{doc}\t{reason}`（区切りはタブ・doc/reasonとも`:`を含みうるため`:`では分割しない）。
   const blockedDocs = warns
     .filter(w => typeof w === 'string' && w.startsWith('office_md_blocked:'))

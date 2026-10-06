@@ -124,152 +124,26 @@ make restart                         # stop(ストア維持)→start。依存の
 make status                          # 全緑＋スモークで確認
 ```
 
-tarball＋systemd で本番展開している場合（[40-運用](40-運用.md)「本番展開の標準手順」の、版ごとのフォルダに
-展開して `current` リンクを切り替える形）: **旧版フォルダは `/opt/sherpa/releases/` に残っている**ため、
-再展開は不要でリンクを戻すだけです。
-
-**同時に複数の導入作業をしない**でください（この手順自体には多重実行の排他機構がありません。
-導入スクリプト実行中はロールバックしない／導入とロールバックを同時に行わないでください。
-メンテナンス時間帯を確保し、単一のオペレータが1つずつ実行してください）。
+パッケージ（圧縮ファイル）で本番展開している場合（[40-運用](40-運用.md)「本番展開の標準手順」）: **前の版の圧縮ファイルを
+入れ直す**だけです（版ごとのフォルダと `current` のリンクの切り替えは廃止しました）。前の版の圧縮ファイルは、更新が
+確認できるまで作業用のフォルダに残しておく約束です。
 
 ```bash
-ls /opt/sherpa/releases/                       # 旧版フォルダ名を確認（例 sherpa-v0.1.0）
-
-# 切替（symlink 張り替え）だけでなく、切替後のプリフライト（check-production.sh）・再起動・
-# 状態確認までを**同じ** set -euo pipefail サブシェルに含める。切替後に分離したコマンド列で
-# 書くと、途中（例えば check-production.sh）が失敗しても後続の systemctl restart がそのまま
-# 実行されてしまい、失敗に気づかないまま先に進んでしまう。
-( set -euo pipefail   # 対話シェルでも1コマンドの失敗で確実に中断する（続行して事故らないため）
-
-  OLD_RELEASE="/opt/sherpa/releases/<旧版フォルダ名>"   # 上の一覧から実在する版名に置き換える
-
-  # 戻す先が「実ディレクトリ」として存在することを確認してから進める（symlink ではないこと
-  # も確認する＝ releases/<版> は本来 immutable な実ディレクトリのみのはずで、symlink なら
-  # 想定外の場所を指している可能性がある。version 名の入力ミス・削除済みの版を指すミスも
-  # ここで止める）。
-  if [ ! -d "$OLD_RELEASE" ] || [ -L "$OLD_RELEASE" ]; then
-    echo "エラー: $OLD_RELEASE が実ディレクトリとして見つかりません（symlink である場合も含む）" >&2
-    exit 1
-  fi
-
-  # 未完成マーカー（.sherpa-incomplete）付きの版は、依存導入・検証を完了できなかった
-  # 残骸なので戻し先として選べない（--list-releases で表示される完成済みの版名を使う）。
-  if [ -e "$OLD_RELEASE/.sherpa-incomplete" ]; then
-    echo "エラー: $OLD_RELEASE は未完成マーカー付きです（依存導入・検証が完了していません）" >&2
-    exit 1
-  fi
-
-  # current が旧方式（リンクでない実フォルダ）のままだとこの手順は使えない＝先に通常導入を1回行う
-  if [ -e /opt/sherpa/current ] && [ ! -L /opt/sherpa/current ]; then
-    echo "エラー: /opt/sherpa/current がリンクではありません（旧方式のまま）" >&2
-    exit 1
-  fi
-
-  # 切替に失敗した/切替後の確認に失敗した場合に戻せるよう、切替前に current の指す先を
-  # 控えておく。
-  PREV_TARGET=""
-  if [ -L /opt/sherpa/current ]; then
-    PREV_TARGET="$(readlink -f /opt/sherpa/current)"
-  fi
-
-  # current の切替は一発の rename で行う（ln -sfn は「削除→作成」の2手順で途中状態が生じうるため
-  # 使わない。固定名ではなく一意な一時フォルダにリンクを作ってから mv -T で置き換える）。
-  # mktemp の戻り値・生成結果を明示的に確認してから使う。
-  TMP_LINK_DIR="$(sudo mktemp -d /opt/sherpa/.sherpa-current-tmp.XXXXXX)"
-  if [ -z "$TMP_LINK_DIR" ] || [ ! -d "$TMP_LINK_DIR" ]; then
-    echo "エラー: 一時ディレクトリの作成に失敗しました" >&2
-    exit 1
-  fi
-  sudo ln -s "$OLD_RELEASE" "$TMP_LINK_DIR/current"
-  sudo mv -T "$TMP_LINK_DIR/current" /opt/sherpa/current
-  sudo rmdir "$TMP_LINK_DIR" 2>/dev/null || true
-
-  # 切替後、current 経由で check-production.sh を実行する（$ROOT が current の symlink パスの
-  # まま解決されるため、SHERPA_DERIVED_DIR 等の current 相対の誤配置検出が正しく効く）。
-  # sudo は既定で環境変数をリセットするため `sudo env VAR=val ... cmd` の形で明示的に渡す
-  # （PYTHON_BIN 無しだと system python3 を検査してしまい、健全な venv でも依存不足と誤判定する）。
-  #
-  # ここから先（プリフライト・再起動・状態確認）のどれかが失敗したら、切替前の版
-  # （$PREV_TARGET）へ戻してから中止する（ロールバックのつもりが別の問題を持ち込んで
-  # 終わらないようにするため）。
-  POSTFLIGHT_OK=1
-  sudo env SHERPA_ENV_FILE=/etc/sherpa/sherpa.env PYTHON_BIN=/opt/sherpa/current/.venv/bin/python \
-    /opt/sherpa/current/scripts/check-production.sh || POSTFLIGHT_OK=0
-  if [ "$POSTFLIGHT_OK" = 1 ]; then
-    sudo systemctl restart sherpa-api.service || POSTFLIGHT_OK=0
-  fi
-  if [ "$POSTFLIGHT_OK" = 1 ]; then
-    sudo systemctl status sherpa-api.service || POSTFLIGHT_OK=0
-  fi
-  # 起動直後は数秒〜数十秒応答しないことがあるため、healthz は即断せず一定時間リトライしてから
-  # 判定する（最大30回・1秒間隔。起動に時間がかかっているだけで実際は正常起動する
-  # ケースを誤って失敗扱いにしないため）。curl 自体にも --connect-timeout 2 --max-time 5 を
-  # 付け、TCP 接続はできるのに応答が返らない状態で無期限に止まらないようにする（実効の最大
-  # 待ち時間は、接続が即座に拒否される通常の失敗時で約30秒、毎回タイムアウトいっぱいまで
-  # 粘る最悪ケースで最大 約180秒＝30回 x (5秒+1秒)）。
-  if [ "$POSTFLIGHT_OK" = 1 ]; then
-    HEALTHZ_OK=0
-    for i in $(seq 1 30); do
-      curl -fsS --connect-timeout 2 --max-time 5 http://127.0.0.1:8000/healthz >/dev/null 2>&1 && { HEALTHZ_OK=1; break; }
-      sleep 1
-    done
-    [ "$HEALTHZ_OK" = 1 ] || POSTFLIGHT_OK=0
-  fi
-
-  if [ "$POSTFLIGHT_OK" != 1 ]; then
-    echo "エラー: 切替後の確認（プリフライト/再起動/状態確認/healthz）に失敗しました。" >&2
-    if [ -n "$PREV_TARGET" ]; then
-      TMP_LINK_DIR2="$(sudo mktemp -d /opt/sherpa/.sherpa-current-tmp.XXXXXX)"
-      sudo ln -s "$PREV_TARGET" "$TMP_LINK_DIR2/current"
-      sudo mv -T "$TMP_LINK_DIR2/current" /opt/sherpa/current
-      sudo rmdir "$TMP_LINK_DIR2" 2>/dev/null || true
-      echo "切替前の版（$PREV_TARGET）へ戻しました。" >&2
-
-      # リンクを戻しただけではサービスは復旧しない（restart の途中（stop 済み・start 失敗等）で
-      # 止まっている可能性がある）。戻した版で改めて再起動・状態確認・healthz まで行う。
-      RECOVERY_OK=1
-      sudo systemctl restart sherpa-api.service || RECOVERY_OK=0
-      if [ "$RECOVERY_OK" = 1 ]; then
-        sudo systemctl status sherpa-api.service || RECOVERY_OK=0
-      fi
-      if [ "$RECOVERY_OK" = 1 ]; then
-        # こちらも切替成功側と同じ基準（最大30回・1秒間隔＋curl 自体に --connect-timeout 2
-        # --max-time 5、実効の最大待ち時間は約30秒〜最悪 約180秒）で healthz をリトライしてから
-        # 判定する。
-        HEALTHZ_OK=0
-        for i in $(seq 1 30); do
-          curl -fsS --connect-timeout 2 --max-time 5 http://127.0.0.1:8000/healthz >/dev/null 2>&1 && { HEALTHZ_OK=1; break; }
-          sleep 1
-        done
-        [ "$HEALTHZ_OK" = 1 ] || RECOVERY_OK=0
-      fi
-
-      if [ "$RECOVERY_OK" = 1 ]; then
-        echo "切替前の版（$PREV_TARGET）でサービスが復旧しました。ロールバック先（$OLD_RELEASE）への" >&2
-        echo "切替はできていません。原因を確認してから、あらためて実行してください。" >&2
-      else
-        echo "エラー: 切替前の版へ戻しても復旧できませんでした。**サービスは停止中の可能性があります**。" >&2
-        echo "  ここからは自動処理できません。人手で対応してください" >&2
-        echo "  （journalctl -u sherpa-api.service / systemctl status sherpa-api.service で原因確認）。" >&2
-      fi
-    else
-      echo "エラー: 戻し先の版が分かりませんでした（切替前は current が未設定でした）。" >&2
-      echo "  **サービスは停止中の可能性があります**。人手で対応してください。" >&2
-    fi
-    exit 1
-  fi
-)
+cd <作業フォルダ>
+make -C Sherpa stop                                   # systemd 常駐なら有効なユニットも止まる（止められなければ案内が出る）
+sha256sum -c <前の版の圧縮ファイル名>.sha256 && tar xzf <前の版の圧縮ファイル名>   # 照合に失敗したら展開しない
+cd Sherpa && ./install.sh 2>&1 | tee ~/install-sherpa-rollback.log
+make check-ports && make start                        # systemd 常駐なら sudo systemctl restart sherpa-api.service
+make status                                           # 全緑＋スモークで確認
 ```
 
-（オフラインキット導入＝`scripts/install_offline_kit.sh --target-dir` を使った環境では、上のリンク切替の
-代わりに `scripts/install_offline_kit.sh --target-dir /opt/sherpa/current --rollback-to <旧版フォルダ名>`
-の1コマンドで同じ切替ができます。`--list-releases` で版名一覧を確認できます。）
-
-旧版の `releases/<版>/.venv` はそのまま残っているため、依存関係を入れ直す必要はありません
-（`releases/<版>` ごと venv を持つ設計・別 Python 版に切替済みなら作り直してください）。
+インストールは、残してある前の `.venv`／`tools/`（`.prev`）か、そのパッケージの資材から、合う組を戻します。
+`./install.sh` が失敗して「インストール中」の印（`data/.installing`）が残っている間は、`make start` も
+`systemctl start` も断られます（原因を直して `./install.sh` をやり直してください）。**同時に複数の導入作業をしない**
+でください（メンテナンス時間帯を確保し、単一のオペレータが1つずつ実行してください）。
 
 - DB スキーマは起動時の自動適用で、**基本は「不足分の追加」型**（旧版に戻しても新しい列は無視されるだけ）ですが、
-  版によっては**制約変更やデータ更新を含む**ことがあり、`git checkout` では DB は戻りません。だからこそ
+  版によっては**制約変更やデータ更新を含む**ことがあり、`git checkout` や圧縮ファイルの入れ直しでは DB は戻りません。だからこそ
   **デプロイ前の `make backup` は保険ではなく前提**です。戻した後の動作が怪しければバックアップ復元まで行います。
 
 ### S8. OpenAI 系の応答が「接続先が未確定」で止まる（fail-closed）
@@ -357,23 +231,25 @@ Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定して
 
 ### 置き場所
 
+以下の `RUN_DIR` は、ログと pid の置き場（`.env` の `RUN_DIR`・既定 `data/run`・相対パスは Sherpa のフォルダ基準）です。`RUN_DIR` を変えたときは、この手順書の `data/run/` もその場所に読み替えてください。
+
 | ログ | 場所 | 中身 |
 |------|------|------|
-| アプリ（run ログ） | `data/run/api.log` | アプリ全体の標準出力/標準エラー（起動処理・各リクエストの警告以上・uvicorn のアクセスログ等） |
-| Caddy（LAN 公開時のみ） | `data/run/caddy.log` | リバースプロキシ/HTTPS のログ |
-| LibreOffice 変換 | `data/run/libreoffice.log` | 旧形式 Office（.doc/.xls/.ppt）変換の詳細（`legacy_backend`＝libreoffice／office_com 両方。`SHERPA_LOG_DIR` で変更可） |
-| MD 変換（取り込み） | `data/run/convert.log` | 取り込み（資料フォルダスキャン→MD化→索引）の進行ログの詳細 |
-| LLM 埋め込み | `data/run/embed.log` | ベクトル埋め込み生成（OpenAI/Ollama）の詳細 |
-| AI 利用量 | `data/run/usage.log` | LLM 呼び出し1回ごとの kind/provider/model/トークン数/経過秒（`sherpa/metering.py::record`・チャット本回答含む・LOG-UX・2026-09-04） |
-| Codex 実行ログ | `./sherpactl logs codex`（`data/run/codex.log`） | Codex CLI 実行1回ごとの開始（構成種別/multi_agent/深さ/見直し回数/出力スキーマ段/モデル）・終了（returncode/イベント種類別件数/MCP呼出数/spawn_agent 子数/usage合計/エラーcode・message/経過秒/stderr末尾）サマリ。文脈枠超過（`context_window_exceeded`）等の原因切り分けに使う |
-| Codex 実行 | `data/run/codex.log` | Codex CLI 実行1回ごとの開始/終了サマリ（構成・深さ・イベント種別件数・MCP 呼出数・子スレッド数・使用トークン・エラーコード・所要時間。**stderr と失敗本文は保存しない**＝資料名・本文・環境変数値が残るため・2026-09-20） |
+| アプリ（run ログ） | `RUN_DIR/api.log` | アプリ全体の標準出力/標準エラー（起動処理・各リクエストの警告以上・uvicorn のアクセスログ等） |
+| Caddy（LAN 公開時のみ） | `RUN_DIR/caddy.log` | リバースプロキシ/HTTPS のログ |
+| LibreOffice 変換 | `RUN_DIR/libreoffice.log` | 旧形式 Office（.doc/.xls/.ppt）変換の詳細（`legacy_backend`＝libreoffice／office_com 両方。置き場は `RUN_DIR` で変更可） |
+| MD 変換（取り込み） | `RUN_DIR/convert.log` | 取り込み（資料フォルダスキャン→MD化→索引）の進行ログの詳細 |
+| LLM 埋め込み | `RUN_DIR/embed.log` | ベクトル埋め込み生成（OpenAI/Ollama）の詳細 |
+| AI 利用量 | `RUN_DIR/usage.log` | LLM 呼び出し1回ごとの kind/provider/model/トークン数/経過秒（`sherpa/metering.py::record`・チャット本回答含む・LOG-UX・2026-09-04） |
+| Codex 実行ログ | `./sherpactl logs codex`（`RUN_DIR/codex.log`） | Codex CLI 実行1回ごとの開始（構成種別/multi_agent/深さ/見直し回数/出力スキーマ段/モデル）・終了（returncode/イベント種類別件数/MCP呼出数/spawn_agent 子数/usage合計/エラーcode・message/経過秒/stderr末尾）サマリ。文脈枠超過（`context_window_exceeded`）等の原因切り分けに使う |
+| Codex 実行 | `RUN_DIR/codex.log` | Codex CLI 実行1回ごとの開始/終了サマリ（構成・深さ・イベント種別件数・MCP 呼出数・子スレッド数・使用トークン・エラーコード・所要時間。**stderr と失敗本文は保存しない**＝資料名・本文・環境変数値が残るため・2026-09-20） |
 
-**WARNING 以上（障害の疑いがある事象）はサブシステム別ログだけでなく `data/run/api.log`（run ログ）にも残ります**——
+**WARNING 以上（障害の疑いがある事象）はサブシステム別ログだけでなく `RUN_DIR/api.log`（run ログ）にも残ります**——
 上記の専用ログ（usage.log を除く）は INFO 以下の詳細を追うためのもので、見なくても障害には run ログだけで気づける設計です
 （LOG-2・裁定 2026-09-03）。障害調査でまず見るのは run ログ、原因が変換/埋め込み系だと分かった後に該当の専用ログを
 掘り下げる、という順で使います。
 
-**まとめて見る/集計する**: 上記は個別に `tail`/`cat` してもよいですが、`./sherpactl logs` は data/run/*.log と
+**まとめて見る/集計する**: 上記は個別に `tail`/`cat` してもよいですが、`./sherpactl logs` は RUN_DIR/*.log と
 Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に合流して追えます
 （`./sherpactl logs convert embed` で絞り込み・`./sherpactl logs -r` で追わずに集計レポート・
 `./sherpactl logs -h` でヘルプ。本書冒頭「最初の5分（トリアージ）」表の6行目も参照）。
@@ -548,5 +424,10 @@ RTO の絶対値は環境依存のため、**初回のリストア演習で実�
 2. `scripts/export_public.sh <公開 checkout のパス>` を実行する（allowlist に基づいて公開 checkout の
    中身を入れ替え、内部専用パスの混入を検査する。検査に失敗したら公開しない）。
 3. 公開 checkout 側で `git status`/`git diff` を確認し、意図した差分だけになっていることを見る。
-4. 公開 checkout で commit/push し、`vX.Y.Z` のタグを打って `git push origin vX.Y.Z` で push する
+4. 内部リポで `scripts/publish_public_commit.sh <公開 checkout のパス> "<メッセージ>" <内部の元コミット>` を実行する
+   （内部の元コミットは手順 2 の最後に表示される値）。中身のコミットと、`VERSION` に中身のコミットの 9 桁を書く
+   2 つ目のコミットの 2 段になる（push はしない）。
+5. 公開 checkout で push し、**2 つ目のコミットに** `vX.Y.Z` のタグを打って `git push origin vX.Y.Z` で push する
    （release.yml はタグ push で起動する。手順の正典は [20-開発ハーネス.md](../20-開発ハーネス.md) §9）。
+6. パッケージは公開 checkout で作る（`make package-full` / `make package-app`）。中の `VERSION` と PACKAGE-INFO の
+   commit が公開リポの中身のコミットになる。

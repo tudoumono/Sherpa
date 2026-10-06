@@ -14,6 +14,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 # shellcheck source=scripts/run-common.sh
 . "$ROOT/scripts/run-common.sh"
+# shellcheck source=scripts/lib/install_state.sh
+. "$ROOT/scripts/lib/install_state.sh"
+
+# インストールの途中・展開しただけ・依存の記録との不一致なら、何かを作る前に起動を断る。
+if ! pkg_install_guard; then
+  exit 1
+fi
 
 PY="${PYTHON_BIN:-python3}"
 VENV="${SHERPA_VENV:-$ROOT/.venv}"
@@ -21,6 +28,12 @@ PORT="${SHERPA_PORT:-8000}"
 # LAN 公開が既定（SHERPA_LAN 既定=1・ユーザー裁定 2026-09-04＝チームで使うサーバ製品のため）。
 # このホストだけに閉じるときは LAN=0 make start（その場限り）か .env の SHERPA_LAN=0。
 # 明示の LAN= が .env より優先（読み方の契約どおり）。
+sherpa_warn_legacy_log_dir
+# .env（SHERPA_ENV_FILE）にだけ SHERPA_LOG_DIR が残っている場合も端末に知らせる（値は表示しない）。
+if [ -z "${SHERPA_LOG_DIR:-}" ] && [ -f "$(sherpa_dotenv_file)" ] \
+   && grep -qE '^[[:space:]]*(export[[:space:]]+)?SHERPA_LOG_DIR=' "$(sherpa_dotenv_file)"; then
+  echo "SHERPA_LOG_DIR はもう使いません。ログは ${RUN_DIR} に書きます" >&2
+fi
 sherpa_env_default SHERPA_LAN
 LAN="${LAN:-${SHERPA_LAN:-1}}"
 
@@ -159,6 +172,10 @@ fi
 
 # --- Python 環境（依存は requirements.txt / constraints.txt のハッシュが変わった時だけ再インストール）---
 if [ ! -x "$VENV/bin/python" ]; then
+  if pkg_install_recorded; then
+    echo "✗ インストール済みの環境ですが、Python 環境（${VENV}）がありません。./install.sh を実行してください。" >&2
+    exit 1
+  fi
   echo "Python 環境を作成します: $VENV"
   "$PY" -m venv "$VENV"
 fi
@@ -170,7 +187,10 @@ REQ_HASH_FILE="$VENV/.requirements.sha256"
 # shellcheck source=scripts/lib/req_hash.sh
 . "$ROOT/scripts/lib/req_hash.sh"
 CUR_HASH="$(req_hash "$VENV/bin/python")"
-if [ ! -f "$REQ_HASH_FILE" ] || [ "$(cat "$REQ_HASH_FILE" 2>/dev/null || true)" != "$CUR_HASH" ]; then
+if pkg_install_recorded; then
+  # インストール済みの環境では、依存は ./install.sh が管理する（起動では入れない・上げない）。
+  echo "依存関係は ./install.sh が管理しています（起動では入れません）。"
+elif [ ! -f "$REQ_HASH_FILE" ] || [ "$(cat "$REQ_HASH_FILE" 2>/dev/null || true)" != "$CUR_HASH" ]; then
   echo "依存関係をインストールします（requirements.txt / constraints.txt の変更を検出）..."
   # Tree-sitter（本体＋文法 8 種）はビルドへ進ませずホイールだけを入れる（パッケージ名だけに限る）。
   "$VENV/bin/python" -m pip install \
@@ -184,6 +204,19 @@ fi
 # 以降の起動で使う Python は venv 側。
 export PYTHON_BIN="$VENV/bin/python"
 export SHERPA_PORT="$PORT"
+
+# --- 本番（SHERPA_ENV=production）は、起動の前に本番の検査（make prod-check と同じ）を自動で行う ---
+sherpa_env_default SHERPA_ENV
+case "$(printf '%s' "${SHERPA_ENV:-}" | tr '[:upper:]' '[:lower:]')" in
+  prod|production)
+    echo "本番の検査（check-production）を行います..."
+    if ! SHERPA_ENV_FILE="$(sherpa_dotenv_file)" ./scripts/check-production.sh; then
+      echo "" >&2
+      echo "本番の検査で問題が見つかったため起動を中止しました。上の NG を直してから、もう一度 make start を実行してください。" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 # --- ポートの整合・占有検査（compose up の**前**）。不一致（compose 5433・アプリ 5432＝他人の DB へ繋ぐ）や
 #     他プロセスの占有は起動後に気づくと分かりづらいので、ここで表を出して止める（原因と直し方は検査側が出す）。

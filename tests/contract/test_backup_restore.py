@@ -255,19 +255,17 @@ def test_restore_redacts_env_values_when_showing_difference(tmp_path: Path):
     assert len(before) == 1 and (before[0] / "u1.txt").exists()
 
 
-def test_installer_backs_up_before_switch_and_docs_describe_it():
-    s = (ROOT / "scripts" / "install_offline_kit.sh").read_text(encoding="utf-8")
-    hook = s.index("# 13a. 更新時のバックアップ")
-    finalize = s.index('rm -f "$PENDING_MARKER_PATH"')
-    swap = s.index('if _atomic_symlink_swap "$TARGET_DIR" "$PENDING_SWAP_TO"')
-    assert hook < finalize < swap, "バックアップは版の確定・current 切替より前でなければ意味がない"
-    body = s[hook:swap]
+def test_installer_backs_up_before_touching_dependencies_and_docs_describe_it():
+    s = (ROOT / "install.sh").read_text(encoding="utf-8")
+    fn = s.index("backup_before_install() {")
+    body = s[fn:s.index("\n}\n", fn)]
     assert "scripts/backup.sh" in body and "SHERPA_BACKUP_BEFORE_SWITCH" in body
-    assert "バックアップ未取得（ストア/アプリ稼働中）" in body and "make stop && make backup" in body
-    assert "3)" in body and "SHERPA_DOCKER" in body   # 稼働中=exit 3 を区別
-    assert "版の確定と current の切替を中止" in body and "VERIFY_FAILED=1" in body
+    assert "バックアップを取れませんでした（ストアが動いています）" in body and "make stop のあと make backup" in body
+    assert "3)" in body and "exit 1" in body   # 稼働中=exit 3 は警告して続行・それ以外の失敗は中止
     assert "docker ps" not in body   # project 名の解決は backup.sh に委ねる
-    assert "env ${_BK_ENV:+" not in body and 'SHERPA_ENV_FILE="$_BK_ENV"' in body   # 空白入り path を分割しない
+    assert 'SHERPA_ENV_FILE="$bk_env"' in body   # 空白入り path を分割しない
+    # 依存の入れ替え（退避・準備）より前に呼ぶ
+    assert s.index("\nbackup_before_install\n") < s.index("park_sets\n  prep_rc=0")
     d18 = (ROOT / "docs" / "18-オフライン構築.md").read_text(encoding="utf-8")
     assert "未整備（既知の穴）" not in d18 and "make backup" in d18 and "make restore" in d18
     m40 = (ROOT / "docs" / "manual" / "40-運用.md").read_text(encoding="utf-8")

@@ -20,6 +20,12 @@ from sherpa import store
 
 
 @pytest.fixture(autouse=True)
+def _no_plain_provider(monkeypatch):
+    """資料参照オフの頭脳選択（`plain_provider_for`）は別テストで検証する。ここでは差し替えた `get_provider` を使う。"""
+    monkeypatch.setattr(CS, "plain_provider_for", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
 def _default_world_graph_not_empty(monkeypatch):
     """`_dispatch` の impact/troubleshoot 分岐は 0 件時に `world_graph_is_empty` を呼ぶ。既定は
     「実データがある」側に倒す（未構築の挙動を検証するテストが個別に上書きする）。"""

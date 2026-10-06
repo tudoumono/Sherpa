@@ -41,20 +41,20 @@ Marp（スライド PDF/PPTX 出力）と LibreOffice（旧形式 Office 変換�
 
 ```
 [オンライン環境]                                    [搬入]                [閉域環境]
- このリポジトリを clone                                                    このチェックアウトの
-   └ make_offline_kit.sh --fetch を実行                                    ルートで
-        ├ make dist（アプリ本体）                                          install_offline_kit.sh
-        ├ pip download（wheel一式）           リポジトリ全体を              を実行
-        ├ python3 系 .deb（素の対象OSコンテナ）                            （Python実行系→
-        ├ docker build+save                    USB / 許可された              Docker Engine→
-        │  （postgres/neo4j/es+kuromoji）   ──→ ファイル転送手段で ──→        docker load→
-        ├ Docker Engine 本体 .deb（同上）      丸ごと移送                    pip install --no-index→
-        ├ フォント（Noto CJK・HackGen）        （dist/offline-kit/ を         Node/marp/Chromium(+deps)/
-        ├ Node.js + marp-cli                   含めること）                  LibreOffice/フォント/
-        ├ Playwright Chromium（本体+deps）                                  Ollama を順に導入→
-        ├ LibreOffice（同上）                                               最終検証）
-        └ ollama pull（任意・大きい）
-             dist/offline-kit/
+ このリポジトリを clone                                                    作業フォルダに
+   ├ make_offline_kit.sh --fetch で資材を集める                            圧縮ファイルを置き
+   │    ├ pip download（wheel一式）                                         照合（sha256）→展開
+   │    ├ python3 系 .deb（素の対象OSコンテナ）       圧縮ファイル          → Sherpa/ ができる
+   │    ├ docker build+save                           （.tar.gz）と         → ./install.sh
+   │    │  （postgres/neo4j/es+kuromoji）           ──→ .sha256 を ──→      （Python実行系→
+   │    ├ Docker Engine 本体 .deb（同上）             許可された経路で        Docker Engine→
+   │    ├ フォント（Noto CJK・HackGen）               搬入                    docker load→
+   │    ├ Node.js + marp-cli                                                  pip install --no-index→
+   │    ├ Playwright Chromium（本体+deps）                                    Node/marp/Chromium(+deps)/
+   │    ├ LibreOffice（同上）                                                 LibreOffice/フォント/
+   │    └ ollama pull（任意・大きい）                                         Ollama を順に導入→
+   │         dist/offline-kit/                                                最終検証→指紋の照合）
+   └ make package-full（アプリ＋資材を 1 つの圧縮ファイルに）
 ```
 
 apt 系の資材（python3 系・Docker Engine・フォント・Chromium のシステム依存・LibreOffice）は、収集マシンに
@@ -62,14 +62,15 @@ apt 系の資材（python3 系・Docker Engine・フォント・Chromium のシ�
 **素の対象OSコンテナ内**（既定 `ubuntu:24.04`・`APT_BASE_IMAGE` で変更可）で収集します。これにより、まっさらな
 閉域ホストでも依存パッケージ込みで完全に導入できます（収集には収集マシン自身の Docker が必要・sudo 不要）。
 
-1. **オンライン側**でこのリポジトリを clone し、`./scripts/make_offline_kit.sh --fetch` を実行して
-   資材一式（`dist/offline-kit/`）を作る。
-2. 組織の規定に従って、**このチェックアウト全体（`dist/offline-kit/` を含む）を丸ごと**閉域環境へ**搬入**する
-   （USB 等の可搬媒体、または承認されたファイル転送経路。搬入手段自体は組織のセキュリティ規程に従ってください。
-   本書は資材の作り方・使い方のみを扱います）。
-3. **閉域側**で、移送したチェックアウトのルートで `./scripts/install_offline_kit.sh` を1回実行する
+1. **オンライン側**でこのリポジトリを clone し、`./scripts/make_offline_kit.sh --fetch` で資材一式
+   （`dist/offline-kit/`）を作り、`make package-full` でアプリと資材を **1 つの圧縮ファイル**
+   （`dist/sherpa-<版>-full-<コミット>.tar.gz`＋`.sha256`）にする。
+2. 組織の規定に従って、**圧縮ファイルと `.sha256`** を閉域環境へ**搬入**する（USB 等の可搬媒体、または承認された
+   ファイル転送経路。搬入手段自体は組織のセキュリティ規程に従ってください。本書は資材の作り方・使い方のみを
+   扱います）。
+3. **閉域側**で、作業用のフォルダに置いて照合→展開し、できた `Sherpa/` で `./install.sh` を1回実行する
    （`docker load`・`pip install --no-index`・Node/marp/Chromium/LibreOffice/フォント/Ollama の展開を一括で行う）。
-   `.env` を設定して起動する。
+   `.env` を設定して `make start` で起動する。
 4. **検証チェックリスト**で、機能が動くこと・外部到達が無いことを確認する。
 
 ## 資材一覧
@@ -78,7 +79,7 @@ apt 系の資材（python3 系・Docker Engine・フォント・Chromium のシ�
 
 | 資材 | 集め方 | 出力先 |
 |------|--------|--------|
-| アプリ本体 | `make dist`（`git archive`・ネットワーク不要） | `dist/offline-kit/app/sherpa-vX.Y.Z.tar.gz` (+`.sha256`) |
+| アプリ本体（古い方式の tar.gz。パッケージには入らず `./install.sh` も使わない） | `make dist`（`git archive`・ネットワーク不要） | `dist/offline-kit/app/sherpa-vX.Y.Z.tar.gz` (+`.sha256`) |
 | Python 依存（wheel一式） | `pip download -r requirements.txt -c constraints.txt` | `dist/offline-kit/wheels/`（+`SHA256SUMS`） |
 | Python 実行系＋基本ツール（python3/venv/pip・xz-utils/unzip/fontconfig・**curl/make**） | 素の対象OSコンテナで `apt-get install --download-only`（curl=起動時のストア健康確認・make=`make start` の入口。素の Linux に無い） | `dist/offline-kit/python/debs/` |
 | Docker イメージ：PostgreSQL | `docker pull postgres:16` → `docker save` | `dist/offline-kit/docker-images/postgres-16.tar` |
@@ -194,6 +195,10 @@ git clone <このリポジトリ> Sherpa && cd Sherpa
 
 # 4) 搬入前の出荷ゲート（docker 必須・必ず通す。2026-08-18・閉域実機報告③）
 make verify-kit
+
+# 5) パッケージを作る（資材を先に集めてあることが条件。dist/ に圧縮ファイルと .sha256 ができる）
+make package-full   # 初回導入・依存が変わる更新用（アプリ＋資材）
+make package-app    # 依存が変わらない更新用（アプリだけ）
 ```
 
 Docker が使えない収集マシンの場合は `--skip-docker` を付けて Docker イメージの収集を省略できます
@@ -203,9 +208,12 @@ Docker が使えない収集マシンの場合は `--skip-docker` を付けて D
 `--skip-base`（土台の閉包。閉域ホストの土台がキットより古いと導入が unmet で止まるため、通常は省略しない）。
 
 収集結果は `dist/offline-kit/`（`dist/` は Git 管理外）にまとまり、`MANIFEST.txt` に内容一覧が記録されます。
-**このリポジトリのチェックアウト全体（`dist/offline-kit/` を含む）を丸ごと**搬入用媒体にコピーしてください
-（`dist/offline-kit/` だけを抜き出すのではなく、`scripts/install_offline_kit.sh` 等を含むリポジトリ本体ごと
-移送する一体型フローです）。
+`make package-full` はこの資材を `Sherpa/dist/offline-kit/` に入れた圧縮ファイルを作ります（最上位フォルダは常に
+`Sherpa/`・ファイル名は `sherpa-<版>-<full|app>-<短いコミットハッシュ>.tar.gz`・隣に `.sha256`）。圧縮ファイルの
+先頭の項目は `PACKAGE-INFO`（種類・版・コミット・プラットフォームごとの依存の指紋）、次が
+`PACKAGE-MANIFEST.sha256`（アプリのファイル一覧）です。`.env`・`data/`・`.venv`・`tools/` の実行物は入りません。
+`make package-app` はアプリだけの圧縮ファイルを作りますが、指紋を資材から求めるため `dist/offline-kit/` が必要です。
+**搬入するのは圧縮ファイルと `.sha256` だけ**です（チェックアウト全体を移送する必要はありません）。
 
 **搬入前に `make verify-kit` を必ず通してください**（`scripts/verify_offline_kit_apt.sh`）。docker で
 「搬入先に近いホスト」（インストール直後の Ubuntu Server 24.04 GA 相当）を用意し、`--network none` で
@@ -215,172 +223,171 @@ Docker が使えない収集マシンの場合は `--skip-docker` を付けて D
 
 ## 閉域側: セットアップ手順
 
-搬入したチェックアウトのルートで、**一般ユーザーとして**（root 直接ではなく）導入スクリプトを1回実行します。
+導入も更新も**同じ手順**です（照合 → 展開 → `./install.sh` → 確認 → `make start`）。同じ手順書がパッケージの
+`INSTALL.md` にも入っています。以下の `<作業フォルダ>`・`<圧縮ファイル名>`・`<サーバー>`・`<SHERPA_PORT>` は、
+ご利用の環境の値に読み替えてください。
 
-```bash
-cd Sherpa   # 移送してきたチェックアウトのルート（dist/offline-kit/ を含む）
-./scripts/install_offline_kit.sh
-```
+パッケージは 2 種類です。**初回導入はフルだけ**です（アプリだけのパッケージには資材が無く、閉域の Linux は
+オンラインで取れないため、初回には使えません。`./install.sh` が依存に触れずに止まり、フルが必要と案内します）。
 
-`root` で直接実行するとエラーで止まります。Chromium/Ollama 等が `/root` 配下に展開されてしまい、
-`sherpa/providers/codex/sandbox.py` の自動検出（実行ユーザーの `$HOME` を見る）から見えなくなるためです。必要な操作
-（パッケージ導入・`systemctl`・`usermod` 等）はスクリプト内部が個別に `sudo` を使います。スクリプト冒頭で
-`sudo -v` によりパスワードを一度だけ聞かれ、以降は長時間の手順（.deb 導入・`docker load` 等）の途中で
-sudo 認証が失効しないよう、バックグラウンドで自動延命されます。
+| 種類 | 中身 | 使いどき |
+|---|---|---|
+| フル | アプリ＋オフラインの資材（`Sherpa/dist/offline-kit/`） | 初回導入、および依存が変わった更新 |
+| アプリだけ | アプリのみ（小さい） | 依存がすでに入っている環境の、依存が変わらない更新 |
 
-これで sha256 検証 → Python 実行系（python3/venv/pip）→ Docker Engine 本体（未導入の場合のみ・
-`systemctl enable --now docker` と `usermod -aG docker` を含む）→ Docker イメージの `docker load` →
-`pip install --no-index`（`.venv` 作成込み）→ Node.js/marp-cli の展開 → Playwright Chromium
-（本体＋システム依存 .deb）の展開 → LibreOffice/フォントの導入 → Ollama モデルデータのコピー →
-**最終検証**（各資材の動作確認一覧）が、収集済みの資材があるものだけ順に実行されます（未収集の資材は
-「スキップしました」と表示して次へ進みます）。
+`Sherpa/` の中のパッケージのファイルは**アプリのファイルで、更新のたびに置き換わります。編集しないでください**。
+設定は `.env`（または `/etc/sherpa/sherpa.env`）に、データと利用者のファイルは `data/` に置きます（どちらも
+パッケージに入っていないので、上書き展開で消えません）。
 
-.deb の導入は `dpkg -i` ではなく `scripts/lib/apt_offline.sh`（`apt_offline_install`）で行います: 導入の最初に
-`BASELINE` と機体の OS/arch を照合し、各グループは **`apt-get -s`（シミュレーション）を先行 → 削除提案（Remv）が
-あれば中止 → `--no-remove`・非対話で本導入 → 稼働カーネル（linux-image-*）の残存確認**。索引（`Packages`）付き
-キットは `deb [trusted=yes] file:<kit_root> ./` のローカル repo として読み、`debs/PACKAGES` の名前だけを apt に
-解かせます（`./*.deb` 全列挙より安全＝降格にならず、土台の閉包も候補に載る）。失敗時は「不足しているパッケージ名」
-を表示するので、オンライン側の収集に足して作り直してください。復旧は `sudo dpkg --configure -a` のあと
-`sudo apt-get -f -s install` で計画に削除が無いことを確かめてから `sudo apt-get -f --no-remove install`
-（`-f` 単独は削除を提案し得るので使わない）。土台の閉包を入れると libc6 等が更新されるため、導入後の再起動は運用判断。
+### 導入（初回・フルのパッケージ）
 
-展開先を別ディレクトリ（例 `/opt/sherpa/current`）にしたい場合は `--target-dir` を指定してください。
-**版ごとのフォルダに展開し、`--target-dir` のリンクを一度に切り替える方式**（設計経緯:
-開発時のレビュー決定）で導入します:
-tar 展開だけは `<target-dir の親>/releases/` 配下の staging（一時名）で行い、展開直後に
-未完成マーカーを付けたまま `releases/<版>`（例 `/opt/sherpa/releases/sherpa-v0.1.0`）という
-**最終パス**へ据え付けます。依存（Python/Node/marp 等）の導入・最終検証は**その最終パスに
-対して**行います（venv は shebang・`pyvenv.cfg` に絶対パスを埋め込むため、作成後に場所を移すと
-壊れるため）。全部成功したら未完成マーカーを消して初めて `releases/<版>` を「完成版」として
-確定（以後 immutable）し、最後の一歩として `--target-dir`（例 `/opt/sherpa/current`）をその版
-フォルダへの symlink に切り替えます（途中で失敗したら `--target-dir` は元の版のまま無傷。
-`releases/<版>` がマーカー無しで既にある場合（完成済み）は置換せず、その場でエラーにします。
-マーカー付きで残っている場合は前回の失敗導入の残骸なので、同じ版名で安全に作り直せます）。
-旧版フォルダは `releases/` に残るため、アップグレードで tar 上書きの残存ファイルが出ません。
+1. 作業用のフォルダに圧縮ファイルと `.sha256` を置き、**展開の前に**照合します。失敗したら展開しません
+   （既存の `Sherpa/` には触れません）。
 
-このスクリプト自身は展開・依存導入・切替までを一括で自動実行するため、途中で人手による
-プリフライトを挟めません。実行する前に、**現行の環境が健全であることを確認**しておいてください。
-切替後に問題を見つけても手遅れです（「データ系パスが release 配下」誤配置の検出は、切替前で
-なければ意味がありません）。
+   ```bash
+   cd <作業フォルダ>
+   sha256sum -c <圧縮ファイル名>.sha256         # Linux
+   shasum -a 256 -c <圧縮ファイル名>.sha256     # macOS（同じ照合）
+   tar xzf <圧縮ファイル名>                      # Sherpa/ ができる
+   ```
 
-**Ubuntu 23.10 以降なら、あわせて Codex のサンドボックスを確認してください**: AppArmor の
-ユーザー名前空間制限で Codex のサンドボックス（bubblewrap）が起動できず、資料フォルダを直接
-読めないまま別の経路で応答してしまうことがあります（詳しくは [40-運用.md](40-運用.md) の
-「Codex のサンドボックス」節）。閉域網はこの障害が特に気付きにくいため（外部から様子を確認
-できない）、導入時に必ず確認してください。
+2. インストールします（ログを残します）。**一般ユーザーとして**実行してください（root 直接ではなく）。
 
-```bash
-sudo bash scripts/setup-codex-sandbox.sh          # 確認のみ（既定 check・何も変更しません）
-sudo bash scripts/setup-codex-sandbox.sh apply    # 制限が原因なら緩和します（OS の設定を変更）
-```
+   ```bash
+   cd <作業フォルダ>/Sherpa
+   ./install.sh 2>&1 | tee ~/install-sherpa.log
+   ```
 
-`apply` のあと、`make doctor` の「Codex のサンドボックス」項目が OK になることを確かめてください。
+   `./install.sh` は共通の入口で、`make` が無くても動きます。最初にパッケージのメタデータ（`PACKAGE-INFO`）で
+   フル／アプリだけを読み、Linux のフルのときだけ `scripts/install_offline_kit.sh`（同梱の資材でオフライン導入）を
+   呼びます（macOS はオフラインの資材を使わず、`./install.sh` がオンラインで準備します）。最後の「最終検証」が
+   OK（Ollama は対象外）なら完了です。終わったら一度ログインし直してください（docker グループの権限は、
+   ログインし直すまで効きません）。
 
-まず展開先を決めます（以下の手順はこの2行の変数を**この端末セッションを通して**参照します。
-このスクリプト経路は別パスでの運用も可能で、その場合はここだけ書き換えてください。ただし
-**systemd で常駐化する場合、同梱のユニットファイルは `/opt/sherpa/current` 固定**です——別パスを
-選んだときは常駐化にユニットファイルの自前調整が必要になります（[40-運用.md](40-運用.md) 参照）。
-セッションを分けて作業する場合は、その都度この2行を先に実行し直してください。
+   `root` で直接実行するとエラーで止まります。Chromium/Ollama 等が `/root` 配下に展開されてしまい、
+   `sherpa/providers/codex/sandbox.py` の自動検出（実行ユーザーの `$HOME` を見る）から見えなくなるためです。必要な操作
+   （パッケージ導入・`systemctl`・`usermod` 等）はスクリプト内部が個別に `sudo` を使います。スクリプト冒頭で
+   `sudo -v` によりパスワードを一度だけ聞かれ、以降は長時間の手順（.deb 導入・`docker load` 等）の途中で
+   sudo 認証が失効しないよう、バックグラウンドで自動延命されます。
 
-```bash
-TARGET_DIR=/opt/sherpa/current   # 別パス運用時はここだけ書き換える（systemd 常駐は上の注意を参照）
-RELEASES_DIR="$(dirname "$TARGET_DIR")/releases"
-```
+   導入の流れは次のとおりです。展開したファイルの照合（`PACKAGE-MANIFEST.sha256`）→ このプラットフォームの指紋の
+   項目の確認 → Python 実行系（python3/venv/pip）→ Docker Engine 本体（未導入の場合のみ・
+   `systemctl enable --now docker` と `usermod -aG docker` を含む）→ Docker イメージの `docker load` →
+   `pip install --no-index`（`.venv` 作成込み）→ Node.js/marp-cli の展開 → Playwright Chromium
+   （本体＋システム依存 .deb）の展開 → LibreOffice/フォントの導入 → Ollama モデルデータのコピー →
+   **最終検証**（各資材の動作確認一覧）→ 導入後の環境の指紋とパッケージの指紋の照合 → 記録の更新。
+   収集済みの資材があるものだけ順に実行されます（未収集の資材は「スキップしました」と表示して次へ進みます）。
+   今の `.venv` と `tools/` の実行物は `.prev` に退避してから最終の場所で作り直し、失敗したら元へ戻します。
 
-設定ファイルを用意します（**初回のみ**）。`.env.example`（開発・本番共通の唯一の例）はこの
-チェックアウトのルートに含まれています。既に `/etc/sherpa/sherpa.env` がある場合（＝更新、または
-旧方式からの移行で以前から使っていた設定がある場合）は**上書きしません**。
+   .deb の導入は `dpkg -i` ではなく `scripts/lib/apt_offline.sh`（`apt_offline_install`）で行います: 導入の最初に
+   `BASELINE` と機体の OS/arch を照合し、各グループは **`apt-get -s`（シミュレーション）を先行 → 削除提案（Remv）が
+   あれば中止 → `--no-remove`・非対話で本導入 → 稼働カーネル（linux-image-*）の残存確認**。索引（`Packages`）付き
+   キットは `deb [trusted=yes] file:<kit_root> ./` のローカル repo として読み、`debs/PACKAGES` の名前だけを apt に
+   解かせます（`./*.deb` 全列挙より安全＝降格にならず、土台の閉包も候補に載る）。失敗時は「不足しているパッケージ名」
+   を表示するので、オンライン側の収集に足して作り直してください。復旧は `sudo dpkg --configure -a` のあと
+   `sudo apt-get -f -s install` で計画に削除が無いことを確かめてから `sudo apt-get -f --no-remove install`
+   （`-f` 単独は削除を提案し得るので使わない）。土台の閉包を入れると libc6 等が更新されるため、導入後の再起動は運用判断。
 
-```bash
-sudo install -d /etc/sherpa
-if [ ! -e /etc/sherpa/sherpa.env ]; then
-  sudo cp .env.example /etc/sherpa/sherpa.env
-  sudo editor /etc/sherpa/sherpa.env   # まず冒頭「0. 本番チェックリスト」節を設定する
-else
-  echo "/etc/sherpa/sherpa.env は既に存在するため上書きしません（前回の設定をそのまま使います）"
-fi
-```
+3. 設定ファイルを用意します（**初回のみ**）。`./install.sh`（Linux のフル）は、`.env` が無ければ `.env.example`
+   から作ります（既存の `.env` には触れません）。本番で `/etc/sherpa/sherpa.env` を使うときは、既にあれば**上書きせず**、
+   無ければ `.env.example` から作って、冒頭「0. 本番チェックリスト」節を設定します。
 
-**データ系パスのその場検査**（初回導入・更新・旧方式からの初回移行のいずれでも、切替の前に
-必ず実行します。`$TARGET_DIR`/`$RELEASES_DIR` の実体がまだ無くても `realpath -m` は文字面の
-正規化だけで判定できるため、`$TARGET_DIR` に置かれている（かもしれない古い版の）
-`check-production.sh` の有無や中身に依存しません）:
+   ```bash
+   sudo install -d /etc/sherpa
+   if [ ! -e /etc/sherpa/sherpa.env ]; then
+     sudo cp .env.example /etc/sherpa/sherpa.env
+     sudo editor /etc/sherpa/sherpa.env
+   else
+     echo "/etc/sherpa/sherpa.env は既に存在するため上書きしません（前回の設定をそのまま使います）"
+   fi
+   ```
 
-```bash
-( set -euo pipefail
-  set -a
-  . /etc/sherpa/sherpa.env
-  set +a
-  CURRENT_REAL="$(realpath -m "$TARGET_DIR")"
-  RELEASES_REAL="$(realpath -m "$RELEASES_DIR")"
-  for name in SHERPA_USERS_DIR SHERPA_DERIVED_DIR; do
-    v="${!name:-}"
-    if [ -z "$v" ]; then
-      echo "エラー: $name が未設定です" >&2
-      echo "  （未設定時の既定は data/users・data/derived のような相対パスで、systemd の" >&2
-      echo "   WorkingDirectory=$TARGET_DIR を基準に解決されるため release の中を" >&2
-      echo "   指してしまいます。/srv/sherpa/... のような固定の絶対パスを明示してください）" >&2
-      exit 1
-    fi
-    case "$v" in
-      /*) : ;;
-      *)
-        echo "エラー: $name が相対パスです（$v）" >&2
-        echo "  （プロセスの作業ディレクトリ＝systemd の WorkingDirectory=$TARGET_DIR" >&2
-        echo "   を基準に解決されるため release の中を指してしまいます。絶対パスにしてください）" >&2
-        exit 1
-        ;;
-    esac
-    v_real="$(realpath -m "$v")"
-    case "$v_real" in
-      "$CURRENT_REAL"|"$CURRENT_REAL"/*|"$RELEASES_REAL"|"$RELEASES_REAL"/*)
-        echo "エラー: $name（$v）が $TARGET_DIR または $RELEASES_DIR の配下を" >&2
-        echo "  指しています（release 切替のたびに新しい版フォルダへ入れ替わるため、データが" >&2
-        echo "  見えなくなります）。/srv/sherpa/... のような current/releases の外の固定パスに" >&2
-        echo "  変更してください。" >&2
-        exit 1
-        ;;
-    esac
-  done
-  echo "OK: データ系パスの配置を確認しました（$TARGET_DIR / $RELEASES_DIR の配下ではありません）"
-)
-```
+   データ系パス（`SHERPA_USERS_DIR`・`SHERPA_DERIVED_DIR`）は、`Sherpa/data/` の下か、アプリのフォルダの外の
+   固定パス（例 `/srv/sherpa/...`）にします。`Sherpa/data/` 以外のアプリのフォルダの中は、更新で置き換わるため
+   `check-production` が断ります。
 
-`$TARGET_DIR` が既にある場合（更新）は、加えて `$TARGET_DIR/scripts/check-production.sh`
-（=今動いている版のスクリプト）も補助的に実行しておくと安心です（DB 疎通・admin 初期パスワード
-残存等、上のその場検査ではカバーしない項目を確認できます）。必ず `$TARGET_DIR` 経由で実行します
-（新しい版自身のパスから実行すると、判定基準が新しい版の実体パスにすり替わります）。
-`sudo` は既定で環境変数をリセットするため、`sudo env VAR=val ... cmd` の形で明示的に渡します
-（`PYTHON_BIN` を渡さないと system python3 を検査してしまい、健全な venv があっても「依存
-不足」と誤判定します）。
+4. 確認して起動します。
 
-```bash
-sudo env SHERPA_ENV_FILE=/etc/sherpa/sherpa.env PYTHON_BIN="$TARGET_DIR/.venv/bin/python" \
-  "$TARGET_DIR/scripts/check-production.sh"
-```
+   ```bash
+   cd <作業フォルダ>/Sherpa
+   docker ps                                  # エラーにならないこと
+   sysctl vm.max_map_count                    # 262144 以上なら何もしない（Linux のみ）
+   sudo bash scripts/setup-codex-sandbox.sh   # 「このままでは…起動できない」と出たら apply で直す（Linux のみ）
+   make check-ports && make start
+   ```
 
-```bash
-./scripts/install_offline_kit.sh --target-dir "$TARGET_DIR"
-```
+   `SHERPA_ENV=production` のときは、`make start` が起動の前に `check-production` の検査を自動で行います。
 
-事前に `$TARGET_DIR` の親ディレクトリ（`current`/`releases` の親。上の例では `/opt/sherpa`）を
-実行ユーザーが書ける状態にしておいてください
-（`sudo install -d -o "$USER" -g "$(id -gn)" "$(dirname "$TARGET_DIR")"`）。個々の
-`$TARGET_DIR`/`releases/<版>` はスクリプトが自分で作ります。
+   **Ubuntu 23.10 以降なら、Codex のサンドボックスを必ず確認してください**: AppArmor の
+   ユーザー名前空間制限で Codex のサンドボックス（bubblewrap）が起動できず、資料フォルダを直接
+   読めないまま別の経路で応答してしまうことがあります（詳しくは [40-運用.md](40-運用.md) の
+   「Codex のサンドボックス」節）。閉域網はこの障害が特に気付きにくいため（外部から様子を確認
+   できない）、導入時に確認してください。
 
-版の一覧確認・ロールバック（再展開なし・symlink 切替のみ）は次のとおりです。
+   ```bash
+   sudo bash scripts/setup-codex-sandbox.sh          # 確認のみ（既定 check・何も変更しません）
+   sudo bash scripts/setup-codex-sandbox.sh apply    # 制限が原因なら緩和します（OS の設定を変更）
+   ```
 
-```bash
-./scripts/install_offline_kit.sh --target-dir "$TARGET_DIR" --list-releases
-./scripts/install_offline_kit.sh --target-dir "$TARGET_DIR" --rollback-to sherpa-v0.1.0
-```
+   `apply` のあと、`make doctor` の「Codex のサンドボックス」項目が OK になることを確かめてください。
+
+5. 起動後に確かめます。
+   1. ブラウザで `http://<サーバー>:<SHERPA_PORT>/` を開き、admin でログインできる。
+   2. 管理画面で頭脳が Codex になっている。
+   3. 管理「資料フォルダ」で資料を登録し、取り込みが終わる。
+   4. 新しい会話で 1 つ依頼し、回答と出典が返る。
+
+systemd で常駐化する場合は、同梱の `deploy/systemd/sherpa-api.service`（Sherpa フォルダを直接指す）を、置き場に
+合わせてパスを直して使います（[40-運用.md](40-運用.md) の「本番展開の標準手順」）。
+
+### 更新
+
+1. `make stop`（systemd で常駐させているときは有効なユニットも止めます。止められないときは
+   `sudo systemctl stop <ユニット名>` を促すメッセージが出ます）。
+2. 同じ作業用のフォルダに新しい圧縮ファイルを置き、導入の 1 と同じく**照合してから展開**します
+   （`Sherpa/` が上書きされます）。
+3. そのあとは導入の 2〜5 と同じです。更新のインストールは、作業の前にデータのバックアップを自動で取ります
+   （`SHERPA_BACKUP_BEFORE_SWITCH=0` で抑止。**ストアが動いていると取らずに警告して続行**するので、更新前に
+   `make stop` してから実行するのが安全です。停止中なのにバックアップに失敗したときはインストールを中止します）。
+   バックアップが守るのはデータ（DB・個人領域・設定）で、アプリ・`.venv`・`tools/` は含みません。
+4. **前の版の圧縮ファイルは、更新が確認できるまで作業用のフォルダに残してください**（元に戻すため）。
+
+`./install.sh` は、前回の一覧にあって今回の一覧に無いファイルを、**今のハッシュが記録したハッシュと同じときだけ**
+削除します（手を入れたファイルは残し、最後に一覧で表示します。`.env`・`data/`・`.venv`・`tools/` は決して
+消しません）。アプリだけで更新すると、古い `dist/offline-kit` もこの規則で片付きます。
+
+**アプリだけのパッケージで「フルが必要」と止まったとき**: 依存（Python パッケージ・Docker イメージ・Codex CLI・
+Node／marp・Chromium・LibreOffice・OCR・フォントなど）の版が変わっている、または部品が欠けていると、
+`./install.sh` は `.venv`・`tools/`・依存・データに触れず、「インストール中」の印（`data/.installing`）を残したまま
+止まります。印があるので `make start` も systemd からの起動も断られます。出口は 2 つです（どちらもデータには
+触れません）。(a) 同じ版の**フルのパッケージ**を置き、通常の手順で入れ直す。(b) **前の版の圧縮ファイル**を
+展開し直し、`./install.sh` して前の版へ戻る。
+
+### 元に戻す
+
+1. `make stop`。
+2. 前の版の圧縮ファイルを、同じ手順（照合 → 展開 → `./install.sh`）で入れ直します。インストールは、残してある
+   前の `.venv`／`tools/` か、そのパッケージの資材から、合う組を戻します。
+3. データの形が変わる版のときは、更新前のバックアップから `make restore FROM=<バックアップの dir>` でデータを戻します
+   （DB は前進のみのため、アプリだけ戻しても多くは動きますが、保証はされません）。
+
+### 途中で失敗したとき
+
+- 圧縮ファイルの展開は `./install.sh` より前に起きます。展開しただけで `./install.sh` が成功していない間は、
+  `data/` の記録の版・コミットとパッケージのメタデータが食い違うため、`make start`・`systemctl start`・再起動は
+  断られます（展開が途中で止まっても、先頭のメタデータは書かれているので同じです）。
+- インストールが途中で失敗した場合は、`data/.installing`（インストール中の印）が残る間、起動できません。原因を
+  直して `./install.sh` をやり直してください。成功すると印が消えます。
+- 起動は依存を自分では入れません。依存の記録（requirements／constraints）と違うときは起動を断り、`./install.sh` を
+  案内します。
+- 同じ版を入れ直す展開が途中で止まった場合（ディスク不足など）は、版・コミットが同じなので起動の拒否では
+  見つかりません。展開のあとは必ず `./install.sh` を実行してください（展開したファイルを一覧のハッシュで確かめます）。
 
 ### 手動で行う場合の内訳（`install_offline_kit.sh` が内部で行っていること）
 
 ```bash
-# 1) 搬入物の整合性を確認（展開前・sha256 ファイルはベース名のみを記録しているため
-#    tarball と同じディレクトリに cd してから検証する）
-(cd dist/offline-kit/app && sha256sum -c sherpa-vX.Y.Z.tar.gz.sha256)
+# 1) 展開したファイルの整合性を確認（Sherpa/ の直下で・PACKAGE-MANIFEST.sha256 の一覧と照合）
+sha256sum -c PACKAGE-MANIFEST.sha256
 
 # 2) Python 実行系（venv 作成が最初に転ばないよう Docker Engine より先に導入）
 bash scripts/lib/apt_offline.sh install "python/debs" "$PWD/dist/offline-kit" "$PWD/dist/offline-kit/python/debs"   # -s 先行・--no-remove・カーネル残存確認（生の apt-get install -y ./*.deb は使わない）
@@ -492,7 +499,7 @@ sudo sysctl --system
 ファイルは置かないでください（どうしても両方置くなら、Sherpa 側を同居製品より小さい番号にします）。
 
 ```bash
-# 以下は Sherpa チェックアウトのルートで実行（--target-dir を使った場合はその展開先で実行）
+# 以下は Sherpa/（パッケージを展開したフォルダ）の直下で実行
 # ※ Docker Engine をこの手順で入れた直後は docker グループが未反映＝再ログイン（または
 #   newgrp docker）してから実行する。再ログイン前に進める場合は sudo docker compose ... を使う。
 sudo ./scripts/setup-runtime-users.sh

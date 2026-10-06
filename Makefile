@@ -2,11 +2,11 @@
 #
 # `make` だけを打つと、下の一覧（help）が出ます。
 .PHONY: help hooks dev-setup start stop restart status check-ports up down ps logs l bootstrap install-docker ocr-models \
-        api serve prod-check verify-kit verify-extension dist nuke notice notice-check \
+        api serve prod-check verify-kit verify-extension dist package-full package-app nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e \
         test-db-reset screenshots backup restore usage-backfill trace azure-smoke codex-compat doctor sandbox-check \
         codex-install codex-version \
-        gate-slice gate-merge gate-release gate-ci test-inventory test-durations doc-lint
+        gate-slice gate-merge gate-release gate-ci test-inventory test-durations doc-lint package-build
 
 # 引数なしの `make` は一覧表示にする（いきなりサーバが起動すると事故になるため）。
 .DEFAULT_GOAL := help
@@ -32,7 +32,7 @@ endif
 endif
 
 # 配布物のバージョン: タグ上なら git tag（例 v0.1.0）、そうでなければ VERSION ファイル（v プレフィックス付与）。
-SHERPA_VERSION := $(shell git describe --tags --exact-match 2>/dev/null || printf 'v%s' "$$(cat VERSION 2>/dev/null || echo 0.0.0)")
+SHERPA_VERSION := $(shell git describe --tags --exact-match 2>/dev/null || printf 'v%s' "$$(cat VERSION 2>/dev/null | cut -d+ -f1 | grep . || echo 0.0.0)")
 
 # テスト系ターゲットの Python。開発は .venv を正とする（無ければ python3 にフォールバック）。
 PY ?= $(shell test -x .venv/bin/python && echo .venv/bin/python || echo python3)
@@ -232,13 +232,15 @@ dist: notice       ## 配布物 tarball を生成（版名＋sha256＋NOTICE/SBO
 	# あればそれを使い、無い環境（macOS の標準構成）だけ Python（tarfile／hashlib）で同じ中身にする。
 	git archive --format=tar --prefix=sherpa-$(SHERPA_VERSION)/ \
 		-o dist/sherpa-$(SHERPA_VERSION).tar HEAD
+	# 中の VERSION は `<版>+<コミット>`（同名の後勝ちで元の VERSION を置き換える）。
+	printf '%s+%s\n' "$(PACKAGE_VERSION)" "$(PACKAGE_COMMIT)" > dist/notice/VERSION
 	if tar --version 2>/dev/null | grep -q 'GNU tar'; then \
 		tar --append --file=dist/sherpa-$(SHERPA_VERSION).tar \
 			--transform 's,^dist/notice,sherpa-$(SHERPA_VERSION),' \
-			dist/notice/NOTICE.md dist/notice/THIRD-PARTY-LICENSES.txt dist/notice/sbom.cdx.json; \
+			dist/notice/NOTICE.md dist/notice/THIRD-PARTY-LICENSES.txt dist/notice/sbom.cdx.json dist/notice/VERSION; \
 	else \
 		$(PY) scripts/lib/portable_tools.py tar-append dist/sherpa-$(SHERPA_VERSION).tar sherpa-$(SHERPA_VERSION) \
-			dist/notice/NOTICE.md dist/notice/THIRD-PARTY-LICENSES.txt dist/notice/sbom.cdx.json; \
+			dist/notice/NOTICE.md dist/notice/THIRD-PARTY-LICENSES.txt dist/notice/sbom.cdx.json dist/notice/VERSION; \
 	fi
 	gzip -f dist/sherpa-$(SHERPA_VERSION).tar
 	if command -v sha256sum >/dev/null 2>&1; then \
@@ -247,6 +249,30 @@ dist: notice       ## 配布物 tarball を生成（版名＋sha256＋NOTICE/SBO
 		$(PY) scripts/lib/portable_tools.py sha256 --basename dist/sherpa-$(SHERPA_VERSION).tar.gz > dist/sherpa-$(SHERPA_VERSION).tar.gz.sha256; \
 	fi
 	@echo "created: dist/sherpa-$(SHERPA_VERSION).tar.gz (+ .sha256)  展開すると sherpa-$(SHERPA_VERSION)/ フォルダ"
+
+# 配布パッケージ（フル＝アプリ＋オフラインの資材／アプリだけ）。最上位フォルダは Sherpa/。
+# 先に scripts/make_offline_kit.sh --fetch で dist/offline-kit/ を集めておく（指紋を資材から求めるため両方とも必要）。
+PACKAGE_KIT ?= dist/offline-kit
+PACKAGE_STAGE := dist/package-stage
+PACKAGE_VERSION := $(patsubst v%,%,$(SHERPA_VERSION))
+# VERSION が `<版>+<公開リポの中身のコミット>` ならその `+` の後ろ、無ければ HEAD の 9 桁。
+PACKAGE_COMMIT := $(shell v="$$(cat VERSION 2>/dev/null)"; if printf '%s' "$$v" | grep -q +; then printf '%s' "$$v" | cut -d+ -f2; else git rev-parse --short=9 HEAD 2>/dev/null || echo unknown; fi)
+
+package-full:      ## フルのパッケージを生成（dist/sherpa-<版>-full-<コミット>.tar.gz＋.sha256）。初回導入・依存が変わる更新用
+	$(MAKE) package-build PACKAGE_KIND=full
+
+package-app:       ## アプリだけのパッケージを生成（dist/sherpa-<版>-app-<コミット>.tar.gz＋.sha256）。依存が変わらない更新用
+	$(MAKE) package-build PACKAGE_KIND=app
+
+package-build: notice
+	@test -d "$(PACKAGE_KIT)" || { echo "オフラインの資材 $(PACKAGE_KIT) がありません。先に scripts/make_offline_kit.sh --fetch を実行してください。"; exit 1; }
+	rm -rf $(PACKAGE_STAGE)
+	mkdir -p $(PACKAGE_STAGE)/Sherpa
+	git archive --format=tar HEAD | tar -x -C $(PACKAGE_STAGE)/Sherpa
+	cp dist/notice/NOTICE.md dist/notice/THIRD-PARTY-LICENSES.txt dist/notice/sbom.cdx.json $(PACKAGE_STAGE)/Sherpa/
+	$(PY) scripts/lib/pkg_tool.py build --kind $(PACKAGE_KIND) --source $(PACKAGE_STAGE)/Sherpa --kit "$(PACKAGE_KIT)" \
+		--out-dir dist --version "$(PACKAGE_VERSION)" --commit "$(PACKAGE_COMMIT)"
+	rm -rf $(PACKAGE_STAGE)
 
 backup:            ## データを退避（停止中のストア＋個人領域＋.env → data/backups/<日時>/。ARGS=--stop/--with-derived/--dry-run）
 	./scripts/backup.sh $(ARGS)

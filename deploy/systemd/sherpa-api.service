@@ -1,6 +1,9 @@
+# Sherpa フォルダ（パッケージを展開した Sherpa/）を直接指すユニット。/opt/sherpa/Sherpa は例＝実際の置き場に読み替える。
+# 更新は「make stop → 上書き展開 → ./install.sh」。インストール中の印・展開しただけの状態では
+# scripts/run-api.sh が終了コード 78 で起動を断る（RestartPreventExitStatus で再起動の繰り返しを止める）。
 [Unit]
 Description=Sherpa FastAPI
-Documentation=file:/opt/sherpa/current/README.md
+Documentation=file:/opt/sherpa/Sherpa/README.md
 Wants=network-online.target
 After=network-online.target docker.service
 
@@ -8,22 +11,25 @@ After=network-online.target docker.service
 Type=simple
 User=sherpa-api
 Group=sherpa-workspace
-WorkingDirectory=/opt/sherpa/current
+WorkingDirectory=/opt/sherpa/Sherpa
 Environment=SHERPA_ENV_FILE=/etc/sherpa/sherpa.env
-Environment=PYTHON_BIN=/opt/sherpa/current/.venv/bin/python
+Environment=PYTHON_BIN=/opt/sherpa/Sherpa/.venv/bin/python
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 UMask=0007
-ExecStart=/opt/sherpa/current/scripts/run-api.sh serve
+ExecStart=/opt/sherpa/Sherpa/scripts/run-api.sh serve
 Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=78
 
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 ReadOnlyPaths=/srv/sherpa/kb
-ReadWritePaths=/srv/sherpa/users /srv/sherpa/derived
+# アプリが書く場所: Sherpa/data（データ・実行状態・ログ）。データを外の固定パスへ置く構成なら、その場所と
+# ログの置き場（RUN_DIR）も加える（先頭の - はその場所が無くても起動を止めない）。
+ReadWritePaths=/opt/sherpa/Sherpa/data -/srv/sherpa/users -/srv/sherpa/derived -/var/log/sherpa
 
 [Install]
 WantedBy=multi-user.target

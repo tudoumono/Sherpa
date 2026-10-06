@@ -614,6 +614,7 @@ def test_chat_service_fills_app_version_and_phases_ms_for_both_paths(monkeypatch
     from sherpa import app_version as AV
 
     saved_none = _mock_store_no_db(monkeypatch)
+    monkeypatch.setattr(CS, "plain_provider_for", lambda *a, **k: None)
     monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeChatProvider(
         [_fixed_chat_result("provider に activity 無し")]))
     list(CS.stream_message(None, "activity 無し経路のテスト", world="v1", conversation_id=999,
@@ -627,6 +628,7 @@ def test_chat_service_fills_app_version_and_phases_ms_for_both_paths(monkeypatch
     saved = _mock_store_no_db(monkeypatch)
     provider_activity = {"v": 1, "source": "codex_rollout", "settings": {"model": "gpt-5.5-test"},
                          "phases_ms": {"prepare": 120, "agent": 340}, "agents": []}
+    monkeypatch.setattr(CS, "plain_provider_for", lambda *a, **k: None)
     monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeChatProvider(
         [_fixed_chat_result("provider に activity 有り", activity=provider_activity)]))
     list(CS.stream_message(None, "activity 有り経路のテスト", world="v1", conversation_id=999,
@@ -658,6 +660,7 @@ def test_confirm_question_turn_carries_provider_activity_into_saved_card(monkeyp
                       "allow_free_text": False, "activity": provider_activity}
 
     saved = _mock_store_no_db(monkeypatch)
+    monkeypatch.setattr(CS, "plain_provider_for", lambda *a, **k: None)
     monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeChatProvider([question_event]))
     events = list(CS.stream_message(None, "確認質問経路のテスト", world="v1", conversation_id=999,
                                     user_id="admin", knowledge=False))

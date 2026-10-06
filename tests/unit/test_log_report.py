@@ -105,7 +105,7 @@ def test_logs_words_aliases_help_and_unknown_names(tmp_path):
     root = pathlib.Path(__file__).resolve().parents[2]
     for name in ("api", "convert", "embed"):
         (tmp_path / f"{name}.log").write_text(f"{name} line\n", encoding="utf-8")
-    env = {**os.environ, "SHERPA_LOG_DIR": str(tmp_path)}
+    env = {**os.environ, "RUN_DIR": str(tmp_path)}
 
     def logs(*args: str, **extra: str) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", str(root / "scripts" / "logs.sh"), *args], cwd=root,

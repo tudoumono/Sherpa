@@ -9,6 +9,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# インストールの途中・展開しただけ・依存の記録との不一致なら起動を断る（systemd もこのスクリプトを実行する）。
+# shellcheck source=scripts/lib/install_state.sh
+. "$ROOT/scripts/lib/install_state.sh"
+if ! pkg_install_guard; then
+  exit 78
+fi
+
 # 閉域キット導入環境向け（install_offline_kit.sh が tools/node/ へ Node.js を展開する）:
 # marp CLI は node スクリプトのため uvicorn プロセスの PATH に node が必要。start.sh 経由なら
 # run-common.sh が同じ配線をするが、本スクリプトは直接起動も案内されている（offline-kit.md）ため

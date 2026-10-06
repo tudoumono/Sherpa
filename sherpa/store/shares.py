@@ -112,6 +112,8 @@ def _redact_importance_from_answer_data(data):
     if isinstance(out.get("claims"), list):
         # 区分（確定/推定/不明）と理由コードを allowlist で再構築する。
         out["claims"] = [x for x in (_safe_claim(c) for c in out["claims"]) if x is not None]
+    if isinstance(out.get("reconciliation"), list):
+        out["reconciliation"] = [x for x in (_safe_reconciliation_row(r) for r in out["reconciliation"]) if x is not None]
     return out
 
 
@@ -348,6 +350,32 @@ def _safe_claim(c) -> dict | None:
     if isinstance(kinds, list) and all(isinstance(k, str) for k in kinds):
         out["evidence_kinds"] = kinds
     return out
+
+
+_RECON_VERDICTS = ("match", "mismatch", "spec_missing", "source_missing", "unverified")
+
+
+def _safe_reconciliation_side(side) -> dict:
+    """照らし合わせの片側（`{text, doc_id?, line?}`）を既知の形だけで再構築する。重要度設定ファイルを指す参照は落とす。"""
+    out = {"text": side["text"] if isinstance(side, dict) and isinstance(side.get("text"), str) else ""}
+    if isinstance(side, dict) and isinstance(side.get("doc_id"), str) and side["doc_id"] \
+            and not importance.is_importance_control_path(side["doc_id"]):
+        out["doc_id"] = side["doc_id"]
+        line = side.get("line")
+        if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+            out["line"] = line
+            end = side.get("line_end")
+            if isinstance(end, int) and not isinstance(end, bool) and end > line:
+                out["line_end"] = end
+    return out
+
+
+def _safe_reconciliation_row(r) -> dict | None:
+    """設計書とソースの照らし合わせ1行（`data.reconciliation[]`）を既知フィールドだけで再構築する。`item`／`verdict` が合わなければ None（行ごと落とす）。"""
+    if not isinstance(r, dict) or not isinstance(r.get("item"), str) or r.get("verdict") not in _RECON_VERDICTS:
+        return None
+    return {"item": r["item"], "verdict": r["verdict"],
+            "spec": _safe_reconciliation_side(r.get("spec")), "source": _safe_reconciliation_side(r.get("source"))}
 
 
 def _safe_evidence_packet(packet):

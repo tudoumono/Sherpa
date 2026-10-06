@@ -404,6 +404,39 @@ def test_rebind_run_id_recovery_failure_uses_rollback_failed_reason(sb, monkeypa
     assert "rebind_failed_rolled_back" not in reasons
 
 
+@pytest.mark.parametrize("restore, expect, forbid", [
+    ("ok", "旧状態を保持しました", "戻せませんでした"),
+    ("fail", "旧状態に戻せませんでした", "旧状態を保持しました"),
+    ("es_failed", "旧状態に戻せませんでした", "旧状態を保持しました"),
+])
+def test_rebind_admin_error_message_follows_restore_outcome(sb, monkeypatch, restore, expect, forbid):
+    # 付け替え失敗の文は旧状態への復元の成否で分ける（復元に失敗したのに「保持した」と言わない）。
+    from sherpa import world_admin_service
+    a = sb.folder("案件X", "FOOPROG")
+    b = sb.folder("案件Y", "BARPROG")
+    wid = sb.world("test_world_admin_rebind_msg_%s" % restore)
+    worlds.register(wid, str(_resolved(a)))
+    orig_run = worker._run_locked
+    calls = {"n": 0}
+
+    def _run(*aa, **kk):
+        calls["n"] += 1
+        if calls["n"] == 1 or restore == "fail":
+            raise RuntimeError(f"boom-{calls['n']}")
+        res = orig_run(*aa, **kk)
+        if restore == "es_failed":                                 # 復旧で全文検索の索引を作り直せなかった
+            res = {**res, "status": "auto_published_with_flags",
+                   "flags": list(res.get("flags") or []) + [
+                       {"doc": None, "action": "warn", "reason": "es_index_failed:ConnectionError@es"}]}
+        return res
+
+    monkeypatch.setattr(worker, "_run_locked", _run)
+    monkeypatch.setattr(world_admin_service, "resolve_root", lambda p: str(_resolved(p)))
+    with pytest.raises(world_admin_service.WorldAdminUnavailableError) as ei:
+        world_admin_service.rebind(wid, str(_resolved(b)))
+    assert expect in str(ei.value) and forbid not in str(ei.value)
+
+
 def test_rebind_backup_move_failure_rolls_back_bind_and_self_heals(sb, monkeypatch):
     # 退避（旧派生を `.rebind-bak` へ `os.replace`）の失敗も他の rebind 失敗と同じロールバック経路
     # （bind を旧へ戻し last_sig を無効化 → 旧 root から即時再構築）に入る。

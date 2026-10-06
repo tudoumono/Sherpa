@@ -128,7 +128,7 @@ def test_stop_ends_without_result(posts, monkeypatch):
 
 
 def test_knowledge_flag_never_turns_simple_into_a_plain_chat(posts):
-    """ナレッジ参照オフの要求が来ても（入口は常時 ON に強制するが多層防御として）検索して答え、
+    """SimpleProvider 自体は knowledge フラグで素の会話に変わらない（オフは `PlainChatProvider` が答える）。検索して答え、
     出典の注記と Codex 調査への案内を付ける。"""
     seq, bodies = posts
     seq += [_final("こんにちは。")]
@@ -179,3 +179,41 @@ def test_select_provider_builds_simple_with_resolved_llm():
     assert (p.provider_id, p.model) == ("ollama", "qwen2.5")
 
 
+
+
+def test_plain_chat_calls_the_ai_without_tools_and_marks_knowledge_off(posts):
+    """資料参照オフ: 道具を渡さず 1 回で答え、出典なし・資料を参照していない注記つき（履歴は通常どおり渡す）。"""
+    seq, bodies = posts
+    seq += [_final("こんにちは。")]
+    p = simple_mod.PlainChatProvider("ollama", "qwen2.5", "http://localhost:11434/api/chat", {})
+    ctx = _ctx("こんにちは", knowledge=False,
+               history=[{"role": "user", "content": "前の質問"}, {"role": "assistant", "content": "前の答え"}])
+    result = _result(list(p.run(ctx)))
+    env = result["env"]
+    assert len(bodies) == 1 and "tools" not in bodies[0]
+    assert [m["role"] for m in bodies[0]["messages"]] == ["system", "user", "assistant", "user"]
+    assert env["lens"] == "chat" and env["sources"] == [] and env["scope"]["source"] == "off"
+    assert [n["kind"] for n in env["notices"]] == ["knowledge_off"]
+    assert env["headline"] == "こんにちは。" and "agentic_failure" not in env
+    from sherpa import answer_shape
+    sealed = answer_shape.seal(env)
+    assert sealed["body"] == "こんにちは。"
+    assert sealed["headline"].startswith(simple_mod.KNOWLEDGE_OFF_NOTICE)
+
+
+def test_plain_provider_is_chosen_for_codex_and_simple_but_not_other_agents():
+    for agent in ("codex", "simple"):
+        p = providers_pkg.plain_provider_for({"agent": agent}, {})
+        assert isinstance(p, simple_mod.PlainChatProvider)
+        assert (p.provider_id, p.model) == ("ollama", "qwen2.5")
+    assert providers_pkg.plain_provider_for({"agent": "heuristic"}, {}) is None
+
+
+def test_plain_chat_does_not_retry_when_the_ai_returns_a_tool_call(posts):
+    """道具なしで tool call が返っても呼び直さない（本文が無ければ失敗として返す）。"""
+    seq, bodies = posts
+    seq += [_tool_msg(("read_around", '{"doc_id":"x","line":1}')), _final("使われないはず")]
+    p = simple_mod.PlainChatProvider("ollama", "qwen2.5", "http://localhost:11434/api/chat", {})
+    env = _result(list(p.run(_ctx("こんにちは", knowledge=False))))["env"]
+    assert len(bodies) == 1
+    assert env["agentic_failure"] == "error" and "knowledge_off" not in str(env.get("notices"))

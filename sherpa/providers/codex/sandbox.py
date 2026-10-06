@@ -383,7 +383,10 @@ def _detect_chrome_path() -> str | None:
             if p.is_file() and os.access(str(p), os.X_OK):
                 return str(p)
     home = Path(os.environ.get("HOME") or os.path.expanduser("~"))
-    cands = list(home.glob(".cache/ms-playwright/chromium-*/chrome-linux64/chrome"))
+    pw_env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    pw_home = Path(os.path.expanduser(pw_env)) if pw_env else home / ".cache" / "ms-playwright"
+    cands = list(pw_home.glob("chromium-*/chrome-linux64/chrome"))
+    cands += pw_home.glob("chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium")
     if not cands:
         return None
 

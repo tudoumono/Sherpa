@@ -56,7 +56,8 @@ cd "$ROOT"
 . "$ROOT/scripts/lib/codex_pin.sh"
 
 OUT="$ROOT/dist/offline-kit"
-NODE_VERSION="22.22.3"   # 08-実行権限と隔離.md / 2026-07-07-Marpスライド作成.md の実績ピン留め版
+# shellcheck source=scripts/node-version.env
+. "$ROOT/scripts/node-version.env"
 # apt 収集に使う素のコンテナのベースイメージ。閉域側ホストの OS と合わせること
 # （パッケージ名・依存関係が Ubuntu バージョンで変わりうる。既定は現行の収集/検証実績に合わせて 24.04）。
 APT_BASE_IMAGE="${APT_BASE_IMAGE:-ubuntu:24.04}"
@@ -510,7 +511,7 @@ if ! command -v git >/dev/null 2>&1; then
 fi
 make dist
 # バージョン名は Makefile と同じ規則（タグがあれば git describe、無ければ VERSION ファイル）。
-SHERPA_VERSION="$(git describe --tags --exact-match 2>/dev/null || printf 'v%s' "$(cat VERSION 2>/dev/null || echo 0.0.0)")"
+SHERPA_VERSION="$(git describe --tags --exact-match 2>/dev/null || printf 'v%s' "$(cat VERSION 2>/dev/null | cut -d+ -f1 | grep . || echo 0.0.0)")"
 TARBALL="dist/sherpa-$SHERPA_VERSION.tar.gz"
 if [ -f "$TARBALL" ]; then
   reset_dir "$OUT/app"

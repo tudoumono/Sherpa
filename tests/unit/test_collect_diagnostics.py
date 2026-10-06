@@ -54,7 +54,7 @@ def _patch_common(monkeypatch, tmp_path, *, doc_rows=None, worlds_rows=None, set
     monkeypatch.setattr(cd.doctor_checks, "run_all", lambda probe_cloud: [])
     monkeypatch.setattr(cd, "_collect_es_counts", lambda world_ids: {"status": "unavailable", "error": "OSError"})
     monkeypatch.setattr(cd, "_collect_neo4j_counts", lambda world_ids: {"status": "unavailable", "error": "OSError"})
-    monkeypatch.setenv("SHERPA_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("RUN_DIR", str(tmp_path / "logs"))
     (tmp_path / "logs").mkdir(exist_ok=True)
 
 

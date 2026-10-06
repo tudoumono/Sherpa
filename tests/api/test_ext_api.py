@@ -46,6 +46,14 @@ def _db():
         pytest.skip(f"DB down: {e}")   # 不可なら可視の skip
 
 
+@pytest.fixture(autouse=True)
+def _audit_writer_running():
+    """このファイルは lifespan 無しの TestClient を使う。先行テストが lifespan を閉じると監査 writer が
+    明示停止のまま残り監査行が書かれないため、各テストの前に起動し直す。"""
+    ext_api._audit_writer.start()
+    yield
+
+
 # ---- ヘルパ ----
 
 def _sfx() -> str:

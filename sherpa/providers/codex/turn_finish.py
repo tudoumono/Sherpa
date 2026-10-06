@@ -19,8 +19,8 @@ from .mcp import _apply_codex_neighbors
 from .continuation import _pick_codex_headline
 from .process import _CONTEXT_WINDOW_EXCEEDED_CODE, _masked_run_dir_path, _read_last_message_fallback
 from .sandbox import _detect_chrome_path, _marp_bin
-from .structured import _DEMOTED_CLAIMS_NOTE, _INVALID_CLAIMS_NOTE, split_review_preamble, _apply_codex_evidence_gate, _claims_vs_ledger
-from .turn_candidates import _continuation_pending, _pick_structured_claims, _pick_structured_claims_invalid, _pick_structured_headline
+from .structured import _DEMOTED_CLAIMS_NOTE, _INVALID_CLAIMS_NOTE, split_review_preamble, _apply_codex_evidence_gate, _claims_vs_ledger, verify_reconciliation
+from .turn_candidates import _continuation_pending, _pick_structured_claims, _pick_structured_claims_invalid, _pick_structured_headline, _pick_structured_reconciliation
 from .turn_consts import (_CREATED_FILES_FAILURE_NOTE, _MARP_FAILURE_NOTE, _MCP_SIDECAR_NAME, _SKILLS_BASE,
                           _WALL_CLOCK_LIMIT_NOTE)
 
@@ -443,6 +443,15 @@ def assemble_result(self, ctx, st, decision, env):
                     env["data"]["claims_invalid"] = _claims_invalid
                 if st._investigation_verdict is not None:
                     env["investigation"]["claims_check"] = _claims_ledger_check
+                _omitted = _claims_ledger_check.get("omitted_items") or []
+                _omitted_hidden = _claims_ledger_check.get("omitted_hidden", 0)
+                # 形式不正で除いた主張が項目を指していた可能性があるターンは数えない。
+                if (_omitted or _omitted_hidden) and not _claims_invalid and "investigation" in env:
+                    env["investigation"]["omitted_items"] = _omitted
+                    if _omitted_hidden:
+                        env["investigation"]["omitted_hidden"] = _omitted_hidden
+                    add_notice(env, "claims_omitted",
+                               f"調べたが回答に入っていない項目が {len(_omitted) + _omitted_hidden} 件あります。")
                 env["limits"] = {**(env.get("limits") or {}),
                                  "claims_unmatched": _claims_ledger_check.get("downgraded", 0) > 0}
                 if decision["lens"] != "author":
@@ -457,6 +466,21 @@ def assemble_result(self, ctx, st, decision, env):
                         _gate_note = _INVALID_CLAIMS_NOTE + _gate_note
                     if _gate_note:
                         add_notice(env, "evidence_gate", _gate_note)
+        if _schema_on:
+            # 設計書とソースの照らし合わせ: 根拠の参照を検証した行だけを表に出す（落とした・未確認に下げた件数は注記で伝える）。
+            _recon_rows, _recon_invalid = _pick_structured_reconciliation(st)
+            if _recon_rows:
+                _recon_rows, _recon_meta = verify_reconciliation(_recon_rows, ctx.world, sp)
+                env.setdefault("data", {})["reconciliation"] = _recon_rows
+                if _recon_meta["unverified"]:
+                    add_notice(env, "reconciliation_unverified",
+                               f"設計書とソースの照らし合わせのうち {_recon_meta['unverified']} 件は、根拠の資料を確認できなかったため「未確認」にしています。")
+                if _recon_meta["more"]:
+                    add_notice(env, "reconciliation_more",
+                               f"設計書とソースの照らし合わせは件数が多いため、{_recon_meta['more']} 件を表に出していません。")
+            if _recon_invalid:
+                add_notice(env, "reconciliation_invalid",
+                           f"設計書とソースの照らし合わせのうち {_recon_invalid} 件は形式が不正で、表に出せませんでした。")
         # 実際に回答を生成できたターンは、`_dispatch` がツール遮断時に立てた `agentic_failure`（`agentic_search.tools_blocked_env`）を消す（Codex は遮断状態を見ずに調査を続行し得るため）。
         env.pop("agentic_failure", None)
         # 「追加で調べますか？」: 最後の中間の見直しが mostly_answered かつ extra_perspectives を挙げていたら定型文を付ける（AI の自由記述はそのまま流さない・`_review_continuation_note_text` は観点を短く切って並べた決定的な文字列）。台帳は既に退避済みで、「続き」で復元されれば `_investigation_dir`／`reviews.jsonl` がそのまま戻る。

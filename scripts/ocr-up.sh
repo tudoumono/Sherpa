@@ -62,7 +62,8 @@ echo "  OCR（画像内文字の読み取り）ワーカーを起動します...
 # ワーカーへ焼くコードの版（VERSION ＋ git のコミット・コミットが取れなければ VERSION のみ）。
 SHERPA_APP_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || echo unknown)"
 _ocr_commit="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)"
-[ -n "$_ocr_commit" ] && SHERPA_APP_VERSION="$SHERPA_APP_VERSION+$_ocr_commit"
+# VERSION に既に `+<コミット>` があればそのまま使う。
+case "$SHERPA_APP_VERSION" in *+*) ;; *) [ -n "$_ocr_commit" ] && SHERPA_APP_VERSION="$SHERPA_APP_VERSION+$_ocr_commit" ;; esac
 export SHERPA_APP_VERSION
 
 # 閉域（オフライン導入）ではベースイメージが無く、フルビルドできない。その場合も**コードは必ず更新する**:

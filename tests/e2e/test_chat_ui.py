@@ -917,7 +917,6 @@ def test_simple_mode_hides_inquiry_rows_and_omits_them_from_send(page, web_base_
         expect(page.locator(sel)).to_be_hidden()
     expect(page.locator("#simple-note")).to_be_visible()
     expect(page.locator("#simple-note")).to_contain_text("Codex 調査へ")
-    expect(page.locator("#kbtoggle")).to_have_attribute("aria-disabled", "true")
     expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "true")
 
     _pick_brain(page, "codex_openai")
@@ -998,23 +997,27 @@ def test_chat_sub_planner_plan_and_usage_subs_render_live_and_from_history(page,
     expect(sub_meta).to_contain_text("reviewer: 入力 89 / 出力 45 トークン")
 
 
-def test_codex_construct_locks_knowledge_toggle_on(page, web_base_url):
+def test_codex_construct_knowledge_toggle_defaults_on_and_can_be_turned_off(page, web_base_url):
     records = install_api_mocks(page)
     page.route("**/config", lambda route: _fulfill_json(route, {"agent": "codex", "label": "Codex", "model": "gpt-5.5"}))
     page.goto(f"{web_base_url}/chat.html")
 
     kb = page.locator("#kbtoggle")
     expect(kb).to_have_attribute("aria-pressed", "true")
-    expect(kb).to_have_attribute("aria-disabled", "true")
-    expect(kb).to_contain_text("オン")
-
-    kb.click(force=True)
-    expect(kb).to_have_attribute("aria-pressed", "true")
     expect(kb).to_contain_text("オン")
 
     _send(page, "税率の影響は？")
     expect(page.locator("#messages")).to_contain_text("影響範囲分析")
     assert records["turn_starts"][-1]["knowledge"] is True
+
+    page.locator("#inquiry-head").click()
+    kb.click()
+    expect(kb).to_have_attribute("aria-pressed", "false")
+    expect(kb).to_contain_text("オフ")
+    expect(page.locator("#websearchtoggle")).to_be_hidden()
+    expect(page.locator("#send")).to_be_enabled()
+    _send(page, "こんにちは")
+    assert records["turn_starts"][-1]["knowledge"] is False
 
 
 def test_chat_welcome_examples_are_concrete_and_load_only_into_input(page, web_base_url):

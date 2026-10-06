@@ -77,6 +77,8 @@ class _FakeSessionProvider:
 def _fake_provider(monkeypatch, new_sid: str | None) -> _FakeSessionProvider:
     fake = _FakeSessionProvider(new_sid=new_sid)
     monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: fake)
+    # 資料参照オフの頭脳選択（`plain_provider_for`）は別テストで検証する。ここでは差し替えた `get_provider` を使う。
+    monkeypatch.setattr(CS, "plain_provider_for", lambda *a, **k: None)
     return fake
 
 

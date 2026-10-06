@@ -263,7 +263,10 @@ def rebind(world_id: str, path: str, *, label: str | None = None, run_id=None, o
     except worlds.WorldConflict as exc:
         raise WorldAdminConflictError(str(exc)) from exc
     except RuntimeError as exc:  # 取り込み失敗（旧状態への復元を試みた後）
-        raise WorldAdminUnavailableError(f"{exc}（旧状態を保持しました）") from exc
+        if getattr(exc, "_sherpa_rebind_restored", False):
+            raise WorldAdminUnavailableError(f"{exc}（旧状態を保持しました）") from exc
+        raise WorldAdminUnavailableError(
+            f"{exc}（旧状態に戻せませんでした。管理者は今すぐ更新で作り直してください）") from exc
     return {
         "ok": True,
         "world": public_world(_row_after(world_id)),

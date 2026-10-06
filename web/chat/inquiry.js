@@ -65,7 +65,7 @@ function _toolsSummary() {
 function _summary() {
   if (_simpleMode) return `簡易 · ${scopeChipLabel()} · ${LAYER_LABEL[S.layer] || '資料＋コード'}`;
   let ws = '';
-  if (S.webSearch) ws = _webSearchEligible ? ' · Web検索' : ' · Web検索（現在の構成では利用不可）';
+  if (S.webSearch && S.kb) ws = _webSearchEligible ? ' · Web検索' : ' · Web検索（現在の構成では利用不可）';
   return `${LENS_LABEL[S.lens] || '自動'} · ${scopeChipLabel()} · ${LAYER_LABEL[S.layer] || '資料＋コード'}`
     + ` · ${DEPTH_LABEL[S.depthProfile] || '標準'}${_toolsSummary()}${ws}`;
 }
@@ -107,7 +107,7 @@ function renderInquiry() {
   $('depth-row').hidden = _simpleMode;
   $('tools-details').hidden = _simpleMode;
   $('simple-note').hidden = !_simpleMode;
-  if (_simpleMode) wsBtn.hidden = true;
+  if (_simpleMode || !S.kb) wsBtn.hidden = true;   // 資料参照オフでは Web 検索も使わない
   const sum = _summary();
   $('inquiry-sum').textContent = sum;
   $('inquiry-chip-label').textContent = sum;

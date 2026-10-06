@@ -1,6 +1,7 @@
 """アプリの版（利用統計 `activity.app_version`）。
 
 リポ直下 `VERSION` の内容＋取れた場合だけ git の短い SHA を `"+<SHA>"` で付ける（例 `"0.11.4+e87a6750"`）。
+`VERSION` に既に `+<コミット>` があれば（書き出し・パッケージ由来）そのまま使う。
 `VERSION` が読めなければ `None`。起動後1回だけ計算してキャッシュする。
 """
 from __future__ import annotations
@@ -42,7 +43,7 @@ def current() -> str | None:
     if not _computed:
         version = _read_version()
         if version is not None:
-            sha = _short_sha()
+            sha = None if "+" in version else _short_sha()
             _cached = f"{version}+{sha}" if sha else version
         else:
             _cached = None

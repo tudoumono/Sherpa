@@ -116,9 +116,12 @@ _app_ver="$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || true)"
 if [ -n "$_ocr_img_ver" ] && [ "$_ocr_img_ver" != "<no value>" ]; then
   _app_commit="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)"
   # ラベルにコミットがあり、こちらも取れるときはコミットまで比べる（どちらかが無ければ VERSION だけ）。
-  _cmp_img="${_ocr_img_ver%%+*}"; _cmp_app="$_app_ver"
-  if [ -n "$_app_commit" ] && [ "$_ocr_img_ver" != "$_cmp_img" ]; then
-    _cmp_img="$_ocr_img_ver"; _cmp_app="$_app_ver+$_app_commit"
+  _cmp_img="${_ocr_img_ver%%+*}"; _cmp_app="${_app_ver%%+*}"
+  if [ "$_ocr_img_ver" != "$_cmp_img" ]; then
+    case "$_app_ver" in
+      *+*) _cmp_img="$_ocr_img_ver"; _cmp_app="$_app_ver" ;;
+      *) if [ -n "$_app_commit" ]; then _cmp_img="$_ocr_img_ver"; _cmp_app="$_app_ver+$_app_commit"; fi ;;
+    esac
   fi
   if [ "$_cmp_img" = "$_cmp_app" ]; then
     printf '  ワーカーのコード : %s\n' "$_ocr_img_ver"

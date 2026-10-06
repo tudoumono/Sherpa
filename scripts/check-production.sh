@@ -355,10 +355,10 @@ PY
   fi
 fi
 
-# 2026-07-13-横断レビュー対応.md R6b（版ごとのフォルダに展開し、current リンクを一度に切り替える
-# 方式）: 本番は $ROOT が /opt/sherpa/current のような symlink で、実体は releases/<版> を指す運用に
-# なり得る。データ系パスがその実体（release 版ディレクトリ）配下を指していると、次のリリース切替で
-# 新しい版ディレクトリに置き換わった瞬間にデータが見えなくなる（消えたように見える）。
+# データ系パス（SHERPA_USERS_DIR・SHERPA_DERIVED_DIR）は、アプリのフォルダの中なら $ROOT/data/ の下か、
+# アプリのフォルダの外の固定パスにする。パッケージの更新（上書き展開）で置き換わるのは、パッケージに
+# 入っているアプリのファイルだけで、data/ は置き換わらない。data/ 以外のアプリのフォルダの中は
+# 更新で置き換わる・消えるため断る。
 #
 # RV MEDIUM（2026-07-15 再RV）: realpath が無い環境で `|| printf '%s' "$val"`（未解決の文字列を
 # そのまま比較）に黙ってフォールバックすると、symlink 越しの一致を見逃して false negative
@@ -387,15 +387,16 @@ for var in SHERPA_USERS_DIR SHERPA_DERIVED_DIR; do
   elif printf '%s\n' "$val" | grep -q '/fixtures\($\|/\)'; then
     fail "$var points under fixtures: $val"
   elif [ -z "$REAL_ROOT" ]; then
-    fail "$var=$val -- cannot verify it is outside the release tree (path resolution unavailable: install realpath or ensure ${PYTHON_BIN:-python3} is on PATH, then re-run)"
+    fail "$var=$val -- cannot verify it is outside the app directory (or under its data/) (path resolution unavailable: install realpath or ensure ${PYTHON_BIN:-python3} is on PATH, then re-run)"
   else
     real_val=""
     if ! real_val="$(_resolve_real_path "$val")"; then
-      fail "$var=$val -- could not resolve a canonical path to verify it is outside the release tree"
+      fail "$var=$val -- could not resolve a canonical path to verify where it points"
     else
       case "$real_val" in
+        "$REAL_ROOT"/data|"$REAL_ROOT"/data/*) ok "$var=$val (under the app's data/ directory)" ;;
         "$REAL_ROOT"|"$REAL_ROOT"/*)
-          fail "$var points inside the app directory ($ROOT, resolves to $REAL_ROOT): $val -- it would be orphaned on a release cutover (versioned dir + symlink swap); point it at a fixed path outside the release tree (e.g. /srv/sherpa/...)" ;;
+          fail "$var points inside the app directory ($ROOT, resolves to $REAL_ROOT) but outside its data/ directory: $val -- files there are replaced by a package update; use $REAL_ROOT/data/... or a fixed path outside the app directory (e.g. /srv/sherpa/...)" ;;
         *)
           ok "$var=$val" ;;
       esac

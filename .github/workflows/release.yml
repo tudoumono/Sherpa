@@ -27,6 +27,15 @@ jobs:
         with:
           fetch-depth: 0   # git describe --tags のためタグ/履歴を取得
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare .venv (NOTICE・SBOM の生成が導入済みの依存を読む)
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -c constraints.txt -r requirements.txt
+
       - name: Build distribution tarball (make dist)
         run: make dist     # dist/sherpa-<tag>.tar.gz と .sha256 を生成（fixtures/tests 非同梱）
 

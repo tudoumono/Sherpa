@@ -96,8 +96,8 @@
 ## 正典・詳細への入口（契約の根拠）
 
 - **取り込み/範囲/同一性の正典＝`docs/03-鏡モデル.md`**（登録ディレクトリ＝1つの資料フォルダ・範囲＝フォルダ prefix・同一性＝パス・即反映・
-  「版」概念は撤去。**言及エッジ（`DOCUMENTS via="mention"`・辞書突合で Document→コードを木を跨いで繋ぐ）は
-  構造リンクの世代内限定規律の制度化された例外**＝`docs/05-グラフ語彙.md` §2/§5 参照）。
+  「版」概念は撤去。登録フォルダの直下のフォルダ（トップフォルダ）＝システムの境界で、**構造リンクも言及エッジ
+  （`DOCUMENTS via="mention"`・辞書突合で Document→コード）も同じトップフォルダの中だけで張る**＝`docs/05-グラフ語彙.md` §2/§5 参照）。
   実装＝`ingest/world_graph.py`／`ingest/world_neo4j.py`／`worlds.py`／`scope.py`。
   **退役した概念・API（版ライフサイクル・旧 canonical_id の版修飾・auto-scope 推定/要確認(scope)・`versions`/`merge`/`neo4j_load`/`semantic`・
   検索接続前の並走chunk系統＝`search_render`/`chunker`/`status_semantics`・`.search_blocks.jsonl`/`.chunks.jsonl`・

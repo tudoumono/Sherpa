@@ -151,12 +151,12 @@ _STRUCTURED_RESPONSE_PARAGRAPH = f"""\
 # `SHERPA_CODEX_OUTPUT_SCHEMA=2` のときだけ、3 項目版の代わりに使う段落。`claims`（各要素に `evidence_kinds`）の意味と閉じた語彙を伝える。
 # Codex は根拠種別を自己申告する必要があり、語彙に合わないと主張構造ごと空になる（`_parse_claim`）。
 _STRUCTURED_RESPONSE_PARAGRAPH_V2 = f"""\
-- 最終応答は `status`／`answer`／`next_step`／`claims` の4項目で返す。{_STATUS_FIELD_MEANING}
-  利用者に届くのは `answer` だけ。`claims` は機械用の索引で画面に出ないため、`claims` にだけ
-  書いた説明は利用者に届かない——説明のすべてを `answer` に書く。見直しや続きで書き直すときも
+- 最終応答は `status`／`answer`／`next_step`／`claims`／`reconciliation` の5項目で返す。{_STATUS_FIELD_MEANING}
+  利用者に届くのは `answer` と `reconciliation`（画面に表で出る）だけ。`claims` は機械用の索引で画面に
+  出ないため、`claims` にだけ書いた説明は利用者に届かない——説明のすべてを `answer` に書く。見直しや続きで書き直すときも
   前の内容を削らず、直した点を反映した完全な回答にする（短くまとめ直さない）。
   `claims` は回答の主張を1件ずつ構造化した配列（`id`／`status`／`text`／
-  `evidence_refs`／`reason`／`reason_code`／`evidence_kinds` の7キーちょうど）で、`status` は
+  `evidence_refs`／`reason`／`reason_code`／`evidence_kinds`／`item_ids` の8キーちょうど）で、`status` は
   次の3種のどれか: `confirmed`（確定・裏付けとなる資料の根拠を最低1件 `evidence_refs` に書く。
   裏付けが無いなら confirmed にしない）／`inferred`（推定・断定できる根拠が無いが妥当と考える
   理由を `reason` に空でなく書く）／`unknown`（不明・`reason_code` を `not_found_in_scope`／
@@ -177,6 +177,24 @@ _STRUCTURED_RESPONSE_PARAGRAPH_V2 = f"""\
   する根拠種別（仕様問い合わせ＝ソース＋設計書／影響調査＝ソース＋呼出関係／トラブルシュート＝
   ソース＋ログ・設定／作成系＝ソース＋設計書。登録範囲に無い種別は対象外）が `evidence_kinds` に
   揃っているときだけ——揃わない場合は `inferred` にし、`reason` に確認できていない種別を書く。
+  `reconciliation` は設計書とソースの照らし合わせの表で、1行ずつ `item`（項目名）／`spec_text`（設計書の
+  記述）／`spec_ref`／`source_text`（ソースの実装）／`source_ref`／`verdict` の6キーちょうどで書く。
+  設計書とソースの両方を**実際に開いて確かめた項目だけ**を書き、確かめていない項目・片方しか見ていない
+  項目は書かない（該当が無ければ空配列）。`spec_ref`・`source_ref` は `資料のパス:行`（根拠の無い側は空文字）。
+  `verdict` は `match`（一致）／`mismatch`（食い違い・ソースを正とする）／`spec_missing`（設計書に記述なし・
+  `source_ref` 必須）／`source_missing`（ソースに見当たらない・`spec_ref` 必須）の4つ。一致も書く。
+  根拠の資料が登録範囲に無い・読めない行は、画面で「未確認」に下げられる。
+"""
+
+# 主張の `item_ids` の書き方。台帳を使えるときは台帳の段落と組で出し、使えないときは空配列にさせる。
+_CLAIM_ITEM_IDS_LEDGER = """\
+  `item_ids` は、この主張が対応する調査台帳の項目の `id` を列挙する配列（調査台帳を作らなかった
+  依頼や、対応する項目が無い主張は空配列）。`confirmed` の主張は、`item_ids` に挙げた項目が確認済みで、
+  `evidence_refs` がその項目の根拠と一致しているときだけ確定として残る（別の項目の根拠を流用しない）。
+  確認した項目は、回答のいずれかの主張の `item_ids` に必ず挙げる。
+"""
+_CLAIM_ITEM_IDS_EMPTY = """\
+  `item_ids` は空配列にする。
 """
 
 # 調査台帳の作り方・使い方を伝える段落（台帳の読み書き契約は `investigation_ledger.py`）。
@@ -431,6 +449,8 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
             structured_paragraph = (_STRUCTURED_RESPONSE_PARAGRAPH_V2 if output_schema_v2
                                     else _STRUCTURED_RESPONSE_PARAGRAPH)
         _ledger_enabled = bool(output_schema and output_schema_v2 and mcp)
+        if output_schema and output_schema_v2:
+            structured_paragraph += _CLAIM_ITEM_IDS_LEDGER if _ledger_enabled else _CLAIM_ITEM_IDS_EMPTY
         content = (AGENTS_MD + _source_verification_paragraph(direct_read, layer)
                    + (_INVESTIGATE_SKILLS_PARAGRAPH if direct_read else "")
                    + structured_paragraph

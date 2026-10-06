@@ -861,7 +861,8 @@ _ITEM_TOOLS = ("ripgrep_search", "es_search", "read_doc", "read_around", "file_h
                "graph_resolve", "graph_impact")
 
 
-def test_item_param_present_optional_on_all_six_tools():
+def test_item_param_present_optional_on_all_six_tools(monkeypatch):
+    monkeypatch.setattr(M.es_index, "available", lambda: True)   # es_search は ES が使えるときだけ一覧に出る
     byname = {t["name"]: t for t in _rpc("tools/list")["result"]["tools"]}
     for name in _ITEM_TOOLS:
         schema = byname[name]["inputSchema"]

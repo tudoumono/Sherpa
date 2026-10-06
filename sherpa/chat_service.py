@@ -20,6 +20,7 @@ from . import stop_kind as stop_kind_mod
 from . import tools_pref as tools_pref_mod
 from .ingest import importance, text_kind
 from .agents import AGENT_PROVIDERS, Ctx, get_provider
+from .providers import plain_provider_for
 from .chat_router import clarify_decision as _clarify_decision
 from .chat_router import confirm_first_decision as _confirm_first_decision
 from .chat_router import decision_for as _decision_for
@@ -1293,9 +1294,9 @@ def stream_message(session, message, world="v1",
     if tools_availability is None:
         tools_availability = agentic_search.tool_availability() if knowledge else None
 
-    # 個人ファイルを grep して事実テキスト/citation を準備する（ON かつファイルが存在する場合）。grep は本人 uid の workspace 配下のみで、ES/Neo4j には書かない。
+    # 個人ファイルを grep して事実テキスト/citation を準備する（資料参照オンかつ個人ファイル参照 ON で、ファイルが存在する場合。資料参照オフでは読まない）。grep は本人 uid の workspace 配下のみで、ES/Neo4j には書かない。
     personal_hits: list[dict] = []
-    if personal:
+    if personal and knowledge:
         personal_hits = _personal_grep_hits(user_id, message, users_dir)
 
     _dispatch_with_personal = _make_dispatch_with_personal(
@@ -1329,7 +1330,12 @@ def stream_message(session, message, world="v1",
     # 停止を検知したが停止終端（未完了回答）をまだ受け取っていない状態。
     _stopped_pending = False
     # 呼び出し元が既に組み立てた Provider があればそれを使う。
-    _provider = provider if provider is not None else get_provider(settings, system_settings=sys_settings)
+    # 資料参照オフは簡易と同じ AI を道具なしで呼ぶ（Codex 構成でも Codex を起動しない）。
+    _provider = provider
+    if _provider is None and not knowledge:
+        _provider = plain_provider_for(settings, sys_settings)
+    if _provider is None:
+        _provider = get_provider(settings, system_settings=sys_settings)
     for ev in _degrade_overload(_provider.run(ctx), message, world, scope_meta):
         if stop_event is not None and stop_event.is_set() and not _is_stopped_terminal(ev):
             if ev.get("type") == "_result" and "codex_multi_agent" in ev["env"]:

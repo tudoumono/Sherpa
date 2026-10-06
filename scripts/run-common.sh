@@ -35,13 +35,6 @@ if sherpa_codex_local_complete; then
   export PATH
 fi
 
-# ランタイム状態（pid/log）。data/ は .gitignore 済み＝配布物にも入らない。
-# テストは APP_PID_FILE / APP_PROC_NEEDLE を環境で差し替えられる（既定は従来どおり）。
-RUN_DIR="${RUN_DIR:-$ROOT/data/run}"
-APP_PID_FILE="${APP_PID_FILE:-$RUN_DIR/api.pid}"
-APP_LOG="$RUN_DIR/api.log"
-CADDY_PID_FILE="$RUN_DIR/caddy.pid"
-CADDY_LOG="$RUN_DIR/caddy.log"
 
 # ---------------------------------------------------------------------------
 # .env の読み方は**ここに一本化**する（2026-08-17）。以前は 6 通り（丸ごと source ×3・source＋2変数だけ
@@ -92,6 +85,27 @@ sherpa_source_dotenv() {  # [file]
     printf -v "${pre_names[$i]}" '%s' "${pre_vals[$i]}"
     export "${pre_names[$i]?}"
   done
+}
+
+# ランタイム状態（pid/log）の置き場は RUN_DIR の 1 か所（既定 <Sherpa のフォルダ>/data/run）。アプリ（Python）の各部分のログも
+# 同じ場所へ書く。相対パスは Sherpa のフォルダ基準（起動したフォルダに依らない・sherpa/log_setup.py::run_dir と同じ解釈）。
+# data/ は .gitignore 済み＝配布物にも入らない。テストは APP_PID_FILE / APP_PROC_NEEDLE を環境で差し替えられる。
+sherpa_env_default RUN_DIR
+RUN_DIR="${RUN_DIR:-$ROOT/data/run}"
+case "$RUN_DIR" in
+  /*) ;;
+  *) RUN_DIR="$ROOT/${RUN_DIR#./}" ;;
+esac
+export RUN_DIR
+APP_PID_FILE="${APP_PID_FILE:-$RUN_DIR/api.pid}"
+APP_LOG="$RUN_DIR/api.log"
+CADDY_PID_FILE="$RUN_DIR/caddy.pid"
+CADDY_LOG="$RUN_DIR/caddy.log"
+
+# 廃止した SHERPA_LOG_DIR が環境にあるときは黙って無視せず知らせる（ログは RUN_DIR に書く）。
+sherpa_warn_legacy_log_dir() {
+  [ -n "${SHERPA_LOG_DIR:-}" ] || return 0
+  echo "SHERPA_LOG_DIR はもう使いません。ログは ${RUN_DIR} に書きます" >&2
 }
 
 # docker compose の呼び出しは**必ずこれ経由**（2026-08-18）。compose 自身は「自分のディレクトリの .env」しか

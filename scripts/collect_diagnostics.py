@@ -59,7 +59,7 @@ for _p in (str(_ROOT), str(_SCRIPTS_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from sherpa import es_index, redact_keys, store, worlds as worlds_mod  # noqa: E402
+from sherpa import es_index, log_setup, redact_keys, store, worlds as worlds_mod  # noqa: E402
 from sherpa.ingest import graph_extract, world_neo4j  # noqa: E402
 from sherpa.store import db as db_mod  # noqa: E402
 from sherpa.store.settings import _URL_SETTINGS_KEYS  # noqa: E402
@@ -1410,7 +1410,7 @@ def main(argv=None) -> int:
         print(_dry_run_report(args))
         return 0
 
-    log_dir = Path(os.environ.get("SHERPA_LOG_DIR", "data/run"))
+    log_dir = log_setup.run_dir()
 
     bundle: dict = {}
     for arcpath, builder in _json_sections(args):

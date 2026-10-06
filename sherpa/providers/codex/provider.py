@@ -278,7 +278,7 @@ class CodexProvider(Provider):
         return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block(with_history)}【質問】{message}"
 
     def _plain_text(self, message: str = "") -> str:
-        # ナレッジ参照オフでは Codex CLI を起動しない（read-only でも KB を覗けてしまうため）。通常この経路には来ない（`routers/chat.py::_knowledge_for` が資料参照 ON を強制する）。内部経路や古いクライアントが knowledge=False で呼んだ場合の安全網。
+        # ナレッジ参照オフでは Codex CLI を起動しない（read-only でも KB を覗けてしまうため）。通常この経路には来ない（資料参照オフは `chat_service.stream_message` が `PlainChatProvider` で答える）。内部経路が knowledge=False で直接呼んだ場合の安全網。
         return ("Codex は常に社内資料を参照して回答します。"
                 "資料を参照しない雑談は OpenAI／ローカルLLM を選んでください。")
 

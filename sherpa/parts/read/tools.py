@@ -47,13 +47,17 @@ _READABLE_EXT = ({".md", ".markdown", ".txt"} | _analyzer_registry.registered_ex
 _SECRET_RE = re.compile(
     r"(sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}"
     r"|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}"
-    r"|-----BEGIN[^-]+PRIVATE KEY-----[\s\S]*?-----END[^-]+PRIVATE KEY-----)")
+    r"|-----BEGIN[^-]+PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END[^-]+PRIVATE KEY(?: BLOCK)?-----)")
 
 _KV_SECRET_RE = re.compile(r"(?i)\b(pass(?:word|wd)?|secret|api[_-]?key|token|authorization)\b(\s*[=:]\s*)(\S+)")
 
-def _redact(text: str) -> str:
+def _redact_plain(text: str) -> str:
     t = _SECRET_RE.sub("[REDACTED]", text or "")
     return _KV_SECRET_RE.sub(r"\1\2[REDACTED]", t)
+
+def _redact(text: str) -> str:
+    """秘密値の伏せ字。BEGIN だけ・END だけ・本文の base64 連続行だけの断片（窓や切り詰めで片側が無い鍵）も伏せる。"""
+    return redact_keys.mask_orphan_key_body(redact_keys.KeyBlockRedactor(_redact_plain)(text or ""))
 
 def _walk_redact(obj, redactor):
     if isinstance(obj, str):
@@ -1250,6 +1254,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         collected: list[tuple[int, str]] = []
         reached_eof = True
         total_seen = 0
+        key_tracker = redact_keys.KeyBlockRedactor(_redact_plain)  # 窓より前の行を辿って鍵ブロックの内側かを確定する
         try:
             reader, it, encoding_caution = _stream_doc_lines(f)
             for idx, t in enumerate(it):
@@ -1259,9 +1264,12 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 total_seen = idx + 1
                 if idx >= s:
                     collected.append((idx + 1, t))
+                else:
+                    key_tracker.track(t)
         finally:
             f.close()
-        text = _redact("\n".join(f"{i}: {t}" for i, t in collected))
+        red_lines = redact_keys.redact_window_lines([t for _, t in collected], _redact_plain, key_tracker.in_key_block)
+        text = "\n".join(f"{i}: {r}" for (i, _), r in zip(collected, red_lines))
         # 返却テキストを UTF-8 バイト上限で切り詰め、実際に短くなった時だけ `text_truncated` を明示する（read_doc／doc_outline と同じ語彙）
         read_around_truncated = len(text.encode("utf-8")) > tr_max_bytes
         text = _clip_utf8_bytes(text, tr_max_bytes)
@@ -1301,14 +1309,18 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         target_end = start - 1 + page
         window_lines: list[str] = []
         total = 0
+        key_tracker = redact_keys.KeyBlockRedactor(_redact_plain)  # 窓より前の行を辿って鍵ブロックの内側かを確定する
         try:
             reader, it, encoding_caution = _stream_doc_lines(f)
             for idx, t in enumerate(it):
                 if start - 1 <= idx < target_end:
                     window_lines.append(t)
+                elif idx < start - 1:
+                    key_tracker.track(t)
                 total += 1
         finally:
             f.close()
+        window_lines = redact_keys.redact_window_lines(window_lines, _redact_plain, key_tracker.in_key_block)
         file_truncated = reader.truncated or reader.line_overflowed
         if total and start > total:
             return ({"error": f"range 外です（start_line={start}・全{total}行）",
@@ -1320,7 +1332,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         text_truncated = False
         for offset, wline in enumerate(window_lines):
             i = start - 1 + offset
-            ln = _redact(f"{i + 1}: {wline}")
+            ln = f"{i + 1}: {wline}"
             ln_bytes = len(ln.encode("utf-8"))
             sep_bytes = 1 if out_lines else 0  # 結合する "\n" の分
             if cum_bytes + sep_bytes + ln_bytes > tr_max_bytes:

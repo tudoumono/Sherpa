@@ -296,6 +296,9 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     if "plugin_failed" not in warns and any(isinstance(f, dict) and f.get("reason") == "plugin_failed"
                                             for f in flags_all):
         warns.append("plugin_failed")   # 切り詰めの外にあっても取り込み画面の注意に必ず出す
+    for _r in ("rebind_failed_rolled_back", "rebind_rollback_failed"):
+        if _r not in warns and any(isinstance(f, dict) and f.get("reason") == _r for f in flags_all):
+            warns.append(_r)   # 参照先の変更の結果も切り詰めの外にあっても必ず出す
     blocked = [{"doc": f.get("doc"), "reason": f.get("reason")} for f in flags
                if isinstance(f, dict) and f.get("action") == "blocked"
                and isinstance(f.get("doc"), str) and f.get("reason")]

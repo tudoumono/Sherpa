@@ -248,3 +248,22 @@ def test_configure_logging_adds_timestamps_to_uvicorn_handlers(tmp_path):
     finally:
         lg.removeHandler(h)
         log_setup._reset_state_for_tests()
+
+
+def test_run_dir_shell_and_python_agree_on_relative_path(tmp_path):
+    import os
+    import pathlib
+    import subprocess
+
+    root = pathlib.Path(log_setup.__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if k != "SHERPA_ENV_FILE"}
+    env.update({"RUN_DIR": "data/run-x", "SHERPA_ENV_FILE": str(tmp_path / "none.env"),
+                "SHERPA_LOG_DIR": "/elsewhere"})
+    sh = subprocess.run(
+        ["bash", "-c", f'cd "{tmp_path}"; . "{root}/scripts/run-common.sh"; printf "%s" "$APP_LOG"; sherpa_warn_legacy_log_dir'],
+        env=env, capture_output=True, text=True, timeout=60)
+    py = subprocess.run(["python3", "-c", "from sherpa import log_setup; print(log_setup.run_dir())"],
+                        cwd=root, env=env, capture_output=True, text=True, timeout=60)
+    assert sh.stdout == str(root / "data" / "run-x" / "api.log")
+    assert py.stdout.strip() == str(root / "data" / "run-x")
+    assert "SHERPA_LOG_DIR はもう使いません" in sh.stderr

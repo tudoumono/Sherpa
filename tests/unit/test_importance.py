@@ -11,7 +11,7 @@ import pytest
 
 from sherpa import corpus_docs, doc_ledger, documents, es_index, preview_service, scope, store, worlds
 from sherpa.ingest import importance as imp
-from sherpa.ingest import worker
+from sherpa.ingest import worker, world_neo4j
 
 # `.md`＝「設計書」の doctype を前提にするため、登録簿を上流限定に固定する。
 pytestmark = pytest.mark.usefixtures("upstream_only_registry")
@@ -676,6 +676,8 @@ def test_sync_stays_on_unchanged_path_when_signature_matches(monkeypatch, tmp_pa
                         lambda w: {"last_sig": sig, "last_manifest": {"a.md": [1, 2, 3]}, "last_doc_count": 1})
     monkeypatch.setattr(worker, "_derived_stale", lambda w: False)
     monkeypatch.setattr(es_index, "needs_reindex", lambda w, s: False)
+    monkeypatch.setattr(world_neo4j, "load_world", lambda *a, **kw: None)   # 実 Neo4j との境界だけを外す
+    monkeypatch.setattr(world_neo4j, "check_graph_counts", lambda *a, **kw: None)
     run_calls = []
     monkeypatch.setattr(worker, "run", lambda w, reflect=True: run_calls.append(w) or {})
     res = worker.sync("wtest")

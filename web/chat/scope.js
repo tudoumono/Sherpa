@@ -136,27 +136,13 @@ function updateScopeVisibility() {   // 範囲セレクタは「ナレッジ参�
   refreshInquirySummary();
 }
 export function setKb(on) {           // ナレッジ参照トグル（既定ON）。オンで範囲指定が選べる
-  S.kb = S.kbLocked ? true : on;      // Codex構成はON固定
+  S.kb = !!on;
   const b = $('kbtoggle'); b.setAttribute('aria-pressed', S.kb ? 'true' : 'false');
   b.classList.toggle('on', S.kb); b.querySelector('b').textContent = S.kb ? 'オン' : 'オフ';
   if (!S.kb) $('scopepanel').hidden = true;
   updateScopeVisibility();
 }
-// Codex 構成・簡易は資料参照ON固定。トグルは aria-disabled と注記で固定を示す（サーバ側でも強制）。
-export function setKbLocked(locked) {
-  S.kbLocked = !!locked;
-  const b = $('kbtoggle');
-  if (!b) return;
-  b.setAttribute('aria-disabled', S.kbLocked ? 'true' : 'false');
-  b.classList.toggle('locked', S.kbLocked);
-  b.title = S.kbLocked ? 'この頭脳では社内資料を常に参照します（切り替えできません）'
-    : '社内ナレッジ（資料）を参照する';
-  if (S.kbLocked) setKb(true);
-}
-$('kbtoggle').addEventListener('click', () => {
-  if (S.kbLocked) { toast('この頭脳では社内資料を常に参照します'); return; }
-  setKb(!S.kb);
-});
+$('kbtoggle').addEventListener('click', () => setKb(!S.kb));
 
 // 個人ファイル参照トグル
 function setPersonal(on) {

@@ -19,7 +19,8 @@ NOTICE_KINDS = (
     "investigation_record_trimmed", "marp_failed", "no_sources", "recovered_error", "review_continuation",
     "sources_unverified", "stopped", "stopped_early", "unconfirmed_items", "wall_clock",
     "ledger_unfinished", "partial_followup", "truncated", "invalid_output", "answer_recovery", "review_reverted",
-    "investigation_record_failed",
+    "investigation_record_failed", "claims_omitted", "knowledge_off",
+    "reconciliation_unverified", "reconciliation_more", "reconciliation_invalid",
 )
 
 STOPPED_NOTICE = "利用者の操作で停止しました。停止までに回収した部分回答です。"

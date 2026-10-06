@@ -258,6 +258,22 @@ def test_delete_source_after_sanitized_share_keeps_recipient_readable():
 # 別コネクションで対象行を FOR UPDATE ロックしたまま、本物の delete/accept がブロックされること
 # （＝ロックが効いていること）と、解放後の最終状態が先に commit された側を反映することを確認する。
 
+def _wait_until_blocked_by(holder, thread, timeout=30.0):
+    """`thread` の処理が `holder` 接続のロック待ちに入るまで待つ（pg_blocking_pids で確認する）。固定時間の待ちで
+    「ブロックされている」と見なさないための待ち合わせ。スレッドが先に終わった・期限内に待ちに入らなければ失敗させる。"""
+    pid = holder.info.backend_pid
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        assert thread.is_alive(), "処理が対象行のロック待ちに入る前に終了した"
+        with psycopg.connect(store._dsn(), autocommit=True) as c:
+            n = c.execute("SELECT count(*) FROM pg_stat_activity WHERE %s = ANY(pg_blocking_pids(pid))",
+                          (pid,)).fetchone()[0]
+        if n:
+            return
+        time.sleep(0.05)
+    raise AssertionError("処理が対象行のロックでブロックされていない")
+
+
 def test_concurrent_accept_before_delete_forces_soft_delete_not_physical():
     """delete が行ロック待ちの間に別トランザクションが先に wrapper を commit したら、delete は
     必ず soft-delete を選ぶ（物理削除しない）。"""
@@ -269,23 +285,29 @@ def test_concurrent_accept_before_delete_forces_soft_delete_not_physical():
     holder = psycopg.connect(store._dsn())
     holder.execute("SELECT id FROM conversations WHERE id=%s FOR UPDATE", (cid,))
     result: dict = {}
-    t = threading.Thread(target=lambda: result.update(deleted=store.delete_conversation(cid, owner)))
+
+    def _run_delete():
+        try:
+            result["deleted"] = store.delete_conversation(cid, owner)
+        except Exception as e:
+            result["error"] = repr(e)
+
+    t = threading.Thread(target=_run_delete)
     t.start()
-    t.join(timeout=0.5)
-    assert t.is_alive(), "delete_conversation が対象行のロック中にブロックされていない"
-
-    holder.execute(
-        "INSERT INTO conversations (user_id, version, title, origin, source_conversation_id, "
-        "  share_id, shared_by_user_id, received_at, read_only) "
-        "SELECT %s, c.version, c.title, 'received_share', c.id, s.id, s.owner_user_id, now(), true "
-        "FROM conversation_shares s JOIN conversations c ON c.id=s.conversation_id WHERE s.id=%s",
-        (invitee, sid))
-    holder.commit()
-    holder.close()
-
-    t.join(timeout=5)
+    try:
+        _wait_until_blocked_by(holder, t)
+        holder.execute(
+            "INSERT INTO conversations (user_id, version, title, origin, source_conversation_id, "
+            "  share_id, shared_by_user_id, received_at, read_only) "
+            "SELECT %s, c.version, c.title, 'received_share', c.id, s.id, s.owner_user_id, now(), true "
+            "FROM conversation_shares s JOIN conversations c ON c.id=s.conversation_id WHERE s.id=%s",
+            (invitee, sid))
+        holder.commit()
+    finally:
+        holder.close()   # 未 commit ならロールバックされ、待機中のスレッドも解放される
+        t.join(timeout=30)
     assert not t.is_alive(), "delete_conversation がロック解放後も完了しない"
-    assert result.get("deleted") is True
+    assert result.get("deleted") is True, result
     row = _sql_one("SELECT deleted_at FROM conversations WHERE id=%s", cid)
     assert row is not None, "行そのものが消えた（物理削除された）"
     assert row[0] is not None, "先に commit された wrapper があるのに物理削除した（TOCTOU 再発）"
@@ -310,14 +332,13 @@ def test_concurrent_delete_before_accept_share_raises_cleanly_when_source_gone()
 
     t = threading.Thread(target=_run_accept)
     t.start()
-    t.join(timeout=0.5)
-    assert t.is_alive(), "accept_share が対象行のロック中にブロックされていない"
-
-    holder.execute("DELETE FROM conversations WHERE id=%s", (cid,))   # conversation_shares も CASCADE で消える
-    holder.commit()
-    holder.close()
-
-    t.join(timeout=5)
+    try:
+        _wait_until_blocked_by(holder, t)
+        holder.execute("DELETE FROM conversations WHERE id=%s", (cid,))   # conversation_shares も CASCADE で消える
+        holder.commit()
+    finally:
+        holder.close()   # 未 commit ならロールバックされ、待機中のスレッドも解放される
+        t.join(timeout=30)
     assert not t.is_alive(), "accept_share がロック解放後も完了しない"
     assert "error" in result, f"共有元が消えているのに accept_share が例外を出さず完了した: {result}"
     assert "wid" not in result

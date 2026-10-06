@@ -23,6 +23,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 import time
 
 import psycopg
@@ -206,25 +207,34 @@ def test_created_at_index_lock_does_not_collide_with_world_lock(monkeypatch):
     )
 
 
-def test_init_schema_does_not_wait_for_created_at_index_build():
+def test_init_schema_does_not_wait_for_created_at_index_build(monkeypatch):
     """`idx_messages_created_at` が `_SCHEMA`（起動の単一トランザクション）から外れていること、
     及びバックグラウンドで有効に構築されることを確認する（正常系）。"""
     if not _try_init():
         return
+    # 構築スレッドはプロセス生存期間で 1 回しか起動しない。先行して動いているスレッドを終わらせ、索引を
+    # 落としてからフラグを下げ、今回の init_schema() が起動した構築スレッドだけで判定する。
+    def _index_threads():
+        return [t for t in threading.enumerate() if t.name == "sherpa-idx-messages-created-at"]
+
+    for t in _index_threads():
+        t.join(timeout=30)
+    assert not _index_threads(), "先行の索引構築スレッドが終わらない"
+    with store._connect() as c:
+        c.execute("DROP INDEX IF EXISTS idx_messages_created_at")
+    monkeypatch.setattr(store_db, "_created_at_index_thread_started", False)
     assert not any("idx_messages_created_at" in stmt for stmt in store_db._SCHEMA), (
         "idx_messages_created_at が _SCHEMA（起動の単一トランザクション）に含まれている"
         "（CONCURRENTLY 構築へ移行したはず）"
     )
     store.init_schema()
     assert store.schema_ready() is True, "init_schema() 呼び出し直後に readiness が確定していない"
-    # バックグラウンドスレッドが構築を終えるまで短時間だけポーリングする（テストDB規模なら数百ms〜数秒）。
-    deadline = time.time() + 15
-    row = None
-    while time.time() < deadline:
-        row = _index_row("idx_messages_created_at")
-        if row is not None and row["indisvalid"]:
-            break
+    # 構築は速く終わることがあるので、スレッドの列挙ではなく索引が有効になるのを期限まで待って判定する。
+    deadline = time.monotonic() + 60
+    row = _index_row("idx_messages_created_at")
+    while not (row is not None and row["indisvalid"]) and time.monotonic() < deadline:
         time.sleep(0.2)
+        row = _index_row("idx_messages_created_at")
     assert row is not None and row["indisvalid"], (
         f"idx_messages_created_at がバックグラウンドで有効に構築されなかった: {row}"
     )

@@ -711,9 +711,6 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .kbtoggle b{color:var(--ink-3);font-weight:600}
 .kbtoggle.on{background:var(--accent-weak);border-color:var(--accent);color:var(--accent-ink)}
 .kbtoggle.on b{color:var(--accent-ink)}
-/* 資料参照ON固定の構成: 押せないことを見た目でも示す（title/aria-disabled と併用） */
-.kbtoggle.locked{cursor:not-allowed}
-.kbtoggle.locked:hover{background:var(--accent-weak)}
 .chip.ghost{background:var(--surface-2);color:var(--ink-3)}
 /* 出典0件時の再検索案内 */
 .retry-hints{display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 10px}
@@ -730,6 +727,22 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .investigation-summary{font-size:var(--text-caption);color:var(--muted,inherit);margin:6px 0}
 .investigation-summary-label{font-weight:600}
 .sources-unverified-row{font-size:var(--text-small);overflow-wrap:anywhere}
+/* 設計書とソースの照らし合わせの表。食い違い・記述なしは柔らかい警告色、狭い画面は項目ごとに縦に積む。 */
+.recon-table{width:100%;border-collapse:collapse;font-size:var(--text-small)}
+.recon-table th{text-align:left;font-size:var(--text-caption);color:var(--ink-3);font-weight:600;padding:4px 8px;border-bottom:1px solid var(--border)}
+.recon-table td{padding:6px 8px;vertical-align:top;border-bottom:1px solid var(--border);overflow-wrap:anywhere}
+.recon-table td a{margin:0}
+.recon-verdict{display:inline-block;font-size:var(--text-caption);border-radius:999px;padding:2px 9px;background:var(--surface-2);color:var(--ink-3)}
+.recon-match .recon-verdict{background:var(--ok-bg);color:var(--ok)}
+.recon-mismatch{background:var(--warn-bg)}
+.recon-mismatch .recon-verdict,.recon-spec_missing .recon-verdict,.recon-source_missing .recon-verdict{background:var(--warn-bg);color:var(--warn);font-weight:600}
+@media (max-width:640px){
+  .recon-table,.recon-table tbody,.recon-table tr,.recon-table td{display:block}
+  .recon-table thead{display:none}
+  .recon-table tr{border:1px solid var(--border);border-radius:8px;margin-bottom:8px;padding:4px 0}
+  .recon-table td{border-bottom:none;padding:3px 10px}
+  .recon-table td::before{content:attr(data-label) "：";font-size:var(--text-caption);color:var(--ink-3)}
+}
 /* AI・実行環境のクイック切替メニュー */
 .brainwrap{position:relative;display:inline-flex}
 .brainmenu{position:absolute;right:0;bottom:38px;z-index:30;width:264px;

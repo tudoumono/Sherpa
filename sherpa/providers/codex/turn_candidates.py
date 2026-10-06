@@ -211,3 +211,14 @@ def _pick_structured_claims_invalid(st) -> int:
         _valid = st._structured_answers[st._structured_answers_valid_from:]
         _cand = _valid[-1] if _valid else None
     return int((_cand or {}).get("claims_invalid") or 0)
+
+
+def _pick_structured_reconciliation(st) -> tuple[list[dict], int]:
+    """`_pick_structured_claims` と同じ message の照らし合わせ `(行, 形式不正で除かれた件数)`。v1 形・`_schema_v2` 無効時は `([], 0)`。"""
+    if not st._schema_v2:
+        return [], 0
+    _cand = _candidate_final(st)
+    if _cand is None:
+        _valid = st._structured_answers[st._structured_answers_valid_from:]
+        _cand = _valid[-1] if _valid else None
+    return (_cand or {}).get("reconciliation") or [], int((_cand or {}).get("reconciliation_invalid") or 0)
