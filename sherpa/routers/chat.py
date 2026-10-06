@@ -40,8 +40,11 @@ class ChatReq(BaseModel):
     scope_paths: list[str] = Field(default_factory=list)
     # 探す対象。既定 both＝フィルタなし。
     layer: Literal["docs", "code", "both"] = "both"
-    # 調べ方の明示指定。既定 None（省略）＝自動。受理する値は 4 値＋省略のみで、"auto" は受理しない。
-    lens: Literal["impact", "troubleshoot", "qa", "author"] | None = None
+    # 調べ方の明示指定。既定 None（省略）＝自動。画面は investigate（調べる）と author（作る）だけを送る。
+    # impact・troubleshoot・qa は外部や古い画面の互換で受理する。"auto" は受理しない。
+    lens: Literal["investigate", "impact", "troubleshoot", "qa", "author"] | None = None
+    # 資料を中心に調べる指定（investigate のときだけ効く）。範囲（scope_paths）とは別。
+    doc_focus: bool = False
     # 調べる深さ。既定 "standard"（見直し 2 回・`depth_profile.review_rounds_for`）。
     depth_profile: Literal["quick", "standard", "deep", "max"] = "standard"
     personal: bool = False  # 個人ファイル参照トグル（既定OFF）。
@@ -241,7 +244,7 @@ def _persist_turn_crash(conversation_id: int, message: str, uid: str, world: str
 
 def _turn_run_fn(message: str, world: str, uid: str,
                  scope_paths: list, knowledge: bool, personal: bool, layer: str = "both",
-                 lens: str | None = None, web_search: bool = False,
+                 lens: str | None = None, web_search: bool = False, doc_focus: bool = False,
                  depth_profile: str = "standard", tools: dict | None = None,
                  tools_explicit: list | None = None,
                  tools_availability: dict | None = None,
@@ -281,6 +284,7 @@ def _turn_run_fn(message: str, world: str, uid: str,
                                               user_id=uid, personal=personal,
                                               users_dir=str(_USERS_DIR), stop_event=stop_event,
                                               on_user_saved=_on_user_saved, web_search=web_search,
+                                              doc_focus=doc_focus,
                                               depth_profile=depth_profile, tools=tools,
                                               tools_explicit=tools_explicit,
                                               tools_availability=tools_availability,
@@ -326,6 +330,7 @@ def chat_turns_start(req: ChatReq, request: Request):
 
     run_fn_factory = _turn_run_fn(req.message, w, uid, req.scope_paths, knowledge, req.personal,
                                   layer=req.layer, lens=req.lens, web_search=req.web_search,
+                                  doc_focus=req.doc_focus,
                                   depth_profile=req.depth_profile, tools=req.tools,
                                   tools_explicit=req.tools_explicit,
                                   tools_availability=tools_availability,

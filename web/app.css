@@ -736,6 +736,13 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .recon-match .recon-verdict{background:var(--ok-bg);color:var(--ok)}
 .recon-mismatch{background:var(--warn-bg)}
 .recon-mismatch .recon-verdict,.recon-spec_missing .recon-verdict,.recon-source_missing .recon-verdict{background:var(--warn-bg);color:var(--warn);font-weight:600}
+/* 影響一覧の行の状態: 候補・確かめた・根拠に使った・対応不明（対応不明は柔らかい警告色）、起点は小さな札。 */
+.impact-state{display:inline-block;font-size:var(--text-caption);border-radius:999px;padding:2px 9px;background:var(--surface-2);color:var(--ink-3)}
+.impact-inspected .impact-state{background:var(--surface-2);color:var(--ink-2,var(--ink-3));font-weight:600}
+.impact-used .impact-state{background:var(--ok-bg);color:var(--ok);font-weight:600}
+.impact-unmapped{background:var(--warn-bg)}
+.impact-unmapped .impact-state{background:var(--warn-bg);color:var(--warn);font-weight:600}
+.impact-origin{margin-left:6px;font-size:var(--text-caption);border-radius:6px;padding:1px 6px;background:var(--surface-2);color:var(--ink-3)}
 @media (max-width:640px){
   .recon-table,.recon-table tbody,.recon-table tr,.recon-table td{display:block}
   .recon-table thead{display:none}

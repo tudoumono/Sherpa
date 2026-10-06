@@ -293,8 +293,8 @@ def test_continue_prompt_uses_schema_wording_when_schema_on(tmp_path, monkeypatc
 def test_resume_fallback_resets_structured_state(tmp_path, monkeypatch):
     """resume 失敗（-o にだけ古い final）→新規セッションにフォールバックしたとき、古い final を見出しに戻さない。"""
     steps = [
-        {"last_message": _sj("final", "古いセッションの結論です。"), "exit_code": 1},
-        {"thread_id": "TH-SCHEMA-RESET-FRESH",
+        {"last_message": _sj("final", "古いセッションの結論です。"), "exit_code": 1, "no_tools": True},
+        {"thread_id": "TH-SCHEMA-RESET-FRESH", "tool_ids": ["item_0"],
          "agent_messages": [_sj("in_progress", "フレッシュ側の途中経過です。", "続きを見る")],
          "usage": helper._usage()},
     ]
@@ -521,12 +521,20 @@ def _gate(monkeypatch, tmp_path, world, files, claims, lens="qa", personal_facts
 
 def test_evidence_gate_demotes_confirmed_claim_missing_required_kind(monkeypatch, tmp_path):
     out, meta, missing, unavailable = _gate(monkeypatch, tmp_path, "gw1", _SRC_AND_SPEC,
-                                            [_claim("c1", "confirmed", ["source"])])
+                                            [_claim("c1", "confirmed", ["spec_doc"])])
     assert out[0]["status"] == "inferred"
-    assert "設計書" in out[0]["reason"]
+    assert "ソース" in out[0]["reason"]
     assert out[0]["reason_code"] == ""
     assert unavailable == ()
     assert meta["demoted"] == 1
+
+
+def test_evidence_gate_source_only_claim_stays_confirmed_without_spec_doc_or_log_config(monkeypatch, tmp_path):
+    for i, lens in enumerate(("qa", "impact", "troubleshoot", "author")):
+        out, meta, missing, _ = _gate(monkeypatch, tmp_path, f"gws{i}", _SRC_AND_SPEC,
+                                      [_claim("c1", "confirmed", ["source"])], lens=lens)
+        assert out[0]["status"] == "confirmed" and missing == ()
+        assert meta["missing_codes"] == [] and meta["demoted"] == 0
 
 
 def test_evidence_gate_leaves_undeclared_legacy_claim_untouched(monkeypatch, tmp_path):
@@ -537,12 +545,12 @@ def test_evidence_gate_leaves_undeclared_legacy_claim_untouched(monkeypatch, tmp
 
 
 def test_evidence_gate_scope_absent_kind_is_not_counted_as_missing(monkeypatch, tmp_path):
-    out, meta, missing, unavailable = _gate(monkeypatch, tmp_path, "gw3", _SRC_ONLY,
-                                            [_claim("c1", "confirmed", ["source"])])
+    out, meta, missing, unavailable = _gate(monkeypatch, tmp_path, "gw3", {"設計/仕様書.xlsx": b"dummy xlsx bytes"},
+                                            [_claim("c1", "confirmed", ["spec_doc"])])
     assert out[0]["status"] == "confirmed"
     assert missing == ()
-    assert unavailable == ("spec_doc",)
-    assert meta["unavailable"] == ["spec_doc"]
+    assert unavailable == ("source",)
+    assert meta["unavailable"] == ["source"]
     assert meta["missing_codes"] == []
 
 
@@ -556,12 +564,11 @@ def test_evidence_gate_personal_hits_satisfy_log_config(monkeypatch, tmp_path):
     assert out[0]["status"] == "confirmed"
 
 
-def test_evidence_gate_log_config_missing_without_personal_hits(monkeypatch, tmp_path):
+def test_evidence_gate_log_config_in_scope_but_not_declared_does_not_demote(monkeypatch, tmp_path):
     out, meta, missing, _ = _gate(monkeypatch, tmp_path, "gw5", {**_SRC_ONLY, "logs/batch.log": "ERROR x\n"},
                                   [_claim("c1", "confirmed", ["source"])], lens="troubleshoot")
-    assert "log_config" in missing
-    assert "log_missing" in meta["missing_codes"]
-    assert out[0]["status"] == "inferred"
+    assert missing == () and meta["missing_codes"] == []
+    assert out[0]["status"] == "confirmed"
 
 
 def _gate_run(tmp_path, monkeypatch, *, claims, answer, uid, cid, files, lens=None):
@@ -577,11 +584,11 @@ def _gate_run(tmp_path, monkeypatch, *, claims, answer, uid, cid, files, lens=No
 
 
 def test_evidence_gate_headline_gets_note_prefix_for_qa_lens(tmp_path, monkeypatch):
-    env = _gate_run(tmp_path, monkeypatch, claims=[_claim("c1", "confirmed", ["source"])],
+    env = _gate_run(tmp_path, monkeypatch, claims=[_claim("c1", "confirmed", ["spec_doc"])],
                     answer="標準税率は10%です。", uid="schema-v2-gate", cid=20705, files=_SRC_AND_SPEC)
-    assert env["headline"].startswith("設計書を確認できていないため、この点は確定できません。")
+    assert env["headline"].startswith("ソースを確認できていないため、この点は確定できません。")
     assert env["headline"].endswith("標準税率は10%です。")
-    assert env["data"]["evidence_gate"]["missing_codes"] == ["spec_missing"]
+    assert env["data"]["evidence_gate"]["missing_codes"] == ["source_missing"]
     assert env["data"]["claims"][0]["status"] == "inferred"
 
 
@@ -592,13 +599,13 @@ def test_evidence_gate_headline_notes_demotion_when_turn_kinds_are_complete(tmp_
                     answer="標準税率は10%です。", uid="schema-v2-demoted", cid=20707, files=_SRC_AND_SPEC)
     assert env["headline"].startswith(STRUCT._DEMOTED_CLAIMS_NOTE)
     assert env["data"]["evidence_gate"]["missing_codes"] == []
-    assert env["data"]["evidence_gate"]["demoted"] == 2
-    assert all(c["status"] == "inferred" for c in env["data"]["claims"])
+    assert env["data"]["evidence_gate"]["demoted"] == 1
+    assert [c["status"] for c in env["data"]["claims"]] == ["confirmed", "inferred"]
 
 
 def test_evidence_gate_author_lens_skips_headline_note(tmp_path, monkeypatch):
     """作成系は本文が成果物の中身になるため注記を混ぜない（格下げ自体は効く）。"""
-    env = _gate_run(tmp_path, monkeypatch, claims=[_claim("c1", "confirmed", ["source"])],
+    env = _gate_run(tmp_path, monkeypatch, claims=[_claim("c1", "confirmed", ["spec_doc"])],
                     answer="資料を作成しました。", uid="schema-v2-author", cid=20706,
                     files=_SRC_AND_SPEC, lens="author")
     assert env["headline"] == "資料を作成しました。"
@@ -610,12 +617,21 @@ _BAD_CLAIM = {"id": "cx", "status": "confirmed", "text": "t", "evidence_refs": [
 
 def test_invalid_claim_does_not_skip_gate_for_valid_claims(tmp_path, monkeypatch):
     """不正な主張が混じっても、正しい主張は根拠種別ゲートにかかり、不正があった旨が前置される。"""
-    env = _gate_run(tmp_path, monkeypatch, claims=[_claim("c1", "confirmed", ["source"]), _BAD_CLAIM],
+    env = _gate_run(tmp_path, monkeypatch, claims=[_claim("c1", "confirmed", ["spec_doc"]), _BAD_CLAIM],
                     answer="標準税率は10%です。", uid="schema-v2-mixed", cid=20708, files=_SRC_AND_SPEC)
     assert [c["status"] for c in env["data"]["claims"]] == ["inferred"]
     assert env["data"]["claims_invalid"] == 1
     assert env["headline"].startswith(STRUCT._INVALID_CLAIMS_NOTE)
     assert env["headline"].endswith("標準税率は10%です。")
+
+
+def test_scope_without_source_always_gets_notice_and_no_demotion(tmp_path, monkeypatch):
+    env = _gate_run(tmp_path, monkeypatch, claims=[_claim("c1", "confirmed", ["spec_doc"])],
+                    answer="標準税率は10%です。", uid="schema-v2-nosrc", cid=20711,
+                    files={"設計/仕様書.xlsx": b"dummy xlsx bytes"})
+    assert env["data"]["claims"][0]["status"] == "confirmed"
+    assert {"kind": "scope_no_source", "text": "選んだ範囲にソースがありませんでした。"} in env["notices"]
+    assert not any(n["kind"] == "evidence_gate" for n in env["notices"])
 
 
 def test_all_invalid_claims_leave_no_confirmed_and_note(tmp_path, monkeypatch):

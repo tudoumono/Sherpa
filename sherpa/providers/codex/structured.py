@@ -268,7 +268,7 @@ def verify_reconciliation(rows: list[dict], world: str, scope_paths) -> tuple[li
 
 
 # Codex は自分の MCP/直読の履歴を残さないため、主張自身が申告する `evidence_kinds`（`_parse_claim` が検証）を根拠種別の唯一の入力にする。
-# レンズ別必須種別・「範囲に無い」の除外・確定の格下げ文言は API 側と同じ語彙・文言（`investigation_state.demote_reason_for_missing_kinds`）を使う。
+# 確定に要る種別（ソースだけ）・「範囲に無い」の除外・確定の格下げ文言は API 側と同じ語彙・文言（`investigation_state.demote_reason_for_missing_kinds`）を使う。
 def _apply_codex_evidence_gate(claims: list[dict], *, lens: str, world: str, scope_paths,
                                layer, personal_facts: str) -> tuple[list[dict], dict, tuple, tuple]:
     """確定主張のうち必須の根拠種別を欠くものを推定へ格下げし、ターン単位の不足も併せて返す。

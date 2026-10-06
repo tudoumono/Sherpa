@@ -1033,9 +1033,9 @@ def test_resolve_scope_invalid_value_raises(kwargs):
     ("auto", "消費税率を変えたい", (None, "auto", None, "消費税率を変えたい")),
     ("impact", "消費税率を変えたい", ("impact", "explicit", "impact", "消費税率を変えたい")),
     # スラッシュ接頭辞は ChatReq.lens より優先し本文から除く・ブロックの継続設定は lens_block に残す
-    ("qa", "/影響 消費税率を変えたい", ("impact", "slash", "qa", "消費税率を変えたい")),
-    (None, "/原因 x", ("troubleshoot", "slash", None, "x")),
-    (None, "/内容 x", ("qa", "slash", None, "x")),
+    ("qa", "/影響 消費税率を変えたい", ("investigate", "slash", "qa", "消費税率を変えたい")),
+    (None, "/原因 x", ("investigate", "slash", None, "x")),
+    (None, "/内容 x", ("investigate", "slash", None, "x")),
     (None, "/作成 x", ("author", "slash", None, "x")),
     (None, "これは /影響 ではない", (None, "auto", None, "これは /影響 ではない")),
 ])
@@ -1343,7 +1343,7 @@ class _FakeCtxCaptureProvider:
 
 @pytest.mark.parametrize("message,lens,source,route_lens,saved_content", [
     ("消費税率を変えたい", "impact", "explicit", "impact", "消費税率を変えたい"),
-    ("/影響 消費税率を変えたい", "qa", "slash", "impact", "消費税率を変えたい"),     # スラッシュが勝つ
+    ("/影響 消費税率を変えたい", "qa", "slash", "investigate", "消費税率を変えたい"),     # スラッシュが勝つ
     ("消費税率を変えたい", None, "auto", None, None),
     ("夜間バッチが心配", "troubleshoot", "explicit", "troubleshoot", None),
 ])

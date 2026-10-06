@@ -180,7 +180,7 @@ export function newConversation() {
   S.scope = []; if (S.scopeTree) renderScopePanel(S.scopeTree); setScopeLabel('全体');   // 範囲を全体に戻す
   // 資料参照は既定ONに戻す（資料フォルダが未登録と確定している S.kbForcedOff のときだけOFF）
   setKb(!S.kbForcedOff);
-  resetInquiryForNewConversation();   // 調べ方/探す対象を自動・両方に戻す
+  resetInquiryForNewConversation();   // 調べ方/資料中心を調べる・オフに戻す
   S.convHasPersonal = false; updateShareButtonState();
   updateForkButtonState(null);
   welcome(); resetFlow(); loadConversations();
@@ -252,7 +252,7 @@ export async function openConversation(cid) {
     turn.answer = m.answer;
     if (el && turn.trace) attachTraceButton(el, `fturn-${turns.length - 1}`);
   });
-  applyConversationScope(data.messages);   // 最後の回答の範囲/調べ方/探す対象をヘッダ/選択に反映
+  applyConversationScope(data.messages);   // 最後の回答の範囲/調べ方/資料中心をヘッダ/選択に反映
   applyInquiryOpenDefault(data.messages.length === 0);
   $('messages').scrollTop = 0;
   resetFlow();

@@ -1,4 +1,4 @@
-// 右ペイン下部「次の質問の調べ方」ブロック。調べ方・調べる深さ・探す対象・検索経路・Web 検索の選択と、要約チップ・開閉を扱う。
+// 右ペイン下部「次の質問の調べ方」ブロック。調べ方（調べる／作る）・資料を中心に見る・調べる深さ・検索経路・Web 検索の選択と、要約チップ・開閉を扱う。
 // 設計: docs/design/chat.md「文脈と構成」
 // 範囲・ナレッジ参照・個人ファイル参照トグルは scope.js が担当する。
 'use strict';
@@ -9,15 +9,17 @@ import { setRight } from '../chat.js';
 
 const $ = Sherpa.$;
 
-// 画面に出す表示名（確認カードの選択肢ラベルと一致させる）
-const LENS_LABEL = { auto: '自動', impact: '影響', troubleshoot: '原因', qa: '内容', author: '作成' };
-const LAYER_LABEL = { both: '資料＋コード', docs: '資料のみ', code: 'コードのみ' };
+// 画面に出す表示名
+const LENS_LABEL = { investigate: '調べる', author: '作る' };
 const DEPTH_LABEL = { quick: 'クイック', standard: '標準', deep: '深く', max: '最大' };
 // 検索経路トグル。キー順は要約ラベルの表示順にもなる。
 const TOOL_KEYS = ['grep', 'fulltext', 'graph'];
 const TOOL_LABEL = { grep: '語句そのまま検索', fulltext: '意味・表記ゆれも探す', graph: 'グラフ' };
-// 探す対象（層）が効かない調べ方（サーバ側 sherpa/layer.py の _LENS_NOT_APPLIED と同じ）。セグメントを無効化して注記を出す。
-const _LAYER_NOT_APPLIED = new Set(['impact', 'troubleshoot']);
+
+// 保存済みの調べ方（auto・qa・impact・troubleshoot）は「調べる」、author は「作る」に読み替える。
+export function normalizeLens(lens) {
+  return lens === 'author' ? 'author' : 'investigate';
+}
 
 // Web 検索トグルの表示条件（管理者許可 かつ 現在の頭脳が Codex＝OpenAI直結）。menus.js が setWebSearchEligible() で通知する。
 let _webSearchEligible = false;
@@ -52,7 +54,7 @@ function _setSeg(sel, dataAttr, value) {
   $(sel).querySelectorAll('.segbtn').forEach((b) => b.classList.toggle('on', b.dataset[dataAttr] === value));
 }
 
-// チップ/折りたたみ見出しの要約文（調べ方・範囲・探す対象・深さ）。
+// チップ/折りたたみ見出しの要約文（調べ方・範囲・資料中心・深さ）。
 // 検索経路は全ONのとき付けず、非既定のときだけ「使う検索: グラフのみ」のように付記する。
 // Web 検索は S.webSearch が ON の間は常に付記し、非 eligible のときは「現在の構成では利用不可」と明示する。
 function _toolsSummary() {
@@ -63,10 +65,11 @@ function _toolsSummary() {
 }
 
 function _summary() {
-  if (_simpleMode) return `簡易 · ${scopeChipLabel()} · ${LAYER_LABEL[S.layer] || '資料＋コード'}`;
+  if (_simpleMode) return `簡易 · ${scopeChipLabel()}`;
   let ws = '';
   if (S.webSearch && S.kb) ws = _webSearchEligible ? ' · Web検索' : ' · Web検索（現在の構成では利用不可）';
-  return `${LENS_LABEL[S.lens] || '自動'} · ${scopeChipLabel()} · ${LAYER_LABEL[S.layer] || '資料＋コード'}`
+  const focus = (S.lens !== 'author' && S.docFocus) ? ' · 資料中心' : '';
+  return `${LENS_LABEL[S.lens] || '調べる'} · ${scopeChipLabel()}${focus}`
     + ` · ${DEPTH_LABEL[S.depthProfile] || '標準'}${_toolsSummary()}${ws}`;
 }
 
@@ -89,13 +92,15 @@ function _renderToolsSeg() {
 function renderInquiry() {
   // Sherpa.$ は getElementById なので id は # 無しで渡す
   _setSeg('lens-seg', 'lens', S.lens);
-  _setSeg('layer-seg', 'layer', S.layer);
   _setSeg('depth-seg', 'depth', S.depthProfile);
   _renderToolsSeg();
-  // 探す対象の行が非表示（ナレッジ参照オフ）のときは注記も出さない
-  const notApplied = _LAYER_NOT_APPLIED.has(S.lens) && !$('layer-row').hidden;
-  $('layer-seg').querySelectorAll('.segbtn').forEach((b) => { b.disabled = notApplied; });
-  $('layer-note').hidden = !notApplied;
+  // 資料を中心に見る: 調べるのときだけ有効（作るでは無効）
+  const dfBtn = $('docfocustoggle');
+  const dfOn = !!S.docFocus && S.lens !== 'author';
+  dfBtn.disabled = S.lens === 'author';
+  dfBtn.setAttribute('aria-pressed', dfOn ? 'true' : 'false');
+  dfBtn.classList.toggle('on', dfOn);
+  dfBtn.querySelector('b').textContent = dfOn ? 'オン' : 'オフ';
   // 表示条件を満たさないときは行ごと非表示
   const wsBtn = $('websearchtoggle');
   wsBtn.hidden = !_webSearchEligible;
@@ -104,6 +109,7 @@ function renderInquiry() {
   wsBtn.querySelector('b').textContent = S.webSearch ? 'オン' : 'オフ';
   // 簡易: 効かない行を隠し注記を出す
   $('lens-row').hidden = _simpleMode;
+  $('docfocus-row').hidden = _simpleMode || !S.kb;
   $('depth-row').hidden = _simpleMode;
   $('tools-details').hidden = _simpleMode;
   $('simple-note').hidden = !_simpleMode;
@@ -119,12 +125,12 @@ export function setSimpleMode(on) {
 }
 
 export function setLens(lens) {
-  S.lens = lens;
+  S.lens = normalizeLens(lens);
   renderInquiry();
 }
 
-export function setLayer(layer) {
-  S.layer = layer;
+export function setDocFocus(on) {
+  S.docFocus = !!on;
   renderInquiry();
 }
 
@@ -186,9 +192,9 @@ $('lens-seg').addEventListener('click', (e) => {
   const b = e.target.closest('[data-lens]'); if (!b) return;
   setLens(b.dataset.lens);
 });
-$('layer-seg').addEventListener('click', (e) => {
-  const b = e.target.closest('[data-layer]'); if (!b || b.disabled) return;
-  setLayer(b.dataset.layer);
+$('docfocustoggle').addEventListener('click', () => {
+  if ($('docfocustoggle').disabled) return;
+  setDocFocus(!S.docFocus);
 });
 $('depth-seg').addEventListener('click', (e) => {
   const b = e.target.closest('[data-depth]'); if (!b) return;
@@ -234,10 +240,10 @@ $('inquiry-chip').addEventListener('click', () => {
   $('inquiry').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 });
 
-// ===== 新規会話（history.js から呼ぶ。会話復元時の調べ方・探す対象は scope.js の applyConversationScope が担う）=====
+// ===== 新規会話（history.js から呼ぶ。会話復元時の調べ方・資料中心は scope.js の applyConversationScope が担う）=====
 export function resetInquiryForNewConversation() {
-  // 新規会話は自動・両方・標準・Web検索オフ・検索経路は全ON・詳細は閉じる
-  S.lens = 'auto'; S.layer = 'both'; S.depthProfile = 'standard'; S.webSearch = false;
+  // 新規会話は調べる・資料中心オフ・標準・Web検索オフ・検索経路は全ON・詳細は閉じる
+  S.lens = 'investigate'; S.docFocus = false; S.depthProfile = 'standard'; S.webSearch = false;
   S.tools = { grep: true, fulltext: true, graph: true };
   S.toolsExplicit = { grep: false, fulltext: false, graph: false };
   setToolsDetailsOpen(false);

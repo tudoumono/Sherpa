@@ -13,12 +13,12 @@ EVIDENCE_KIND_LABELS = {
     "source": "ソース", "spec_doc": "設計書", "definition": "定義",
     "log_config": "ログ・設定", "callgraph": "呼出関係"}
 
-# レンズ別の必須種別（ソースは常に必須）。影響調査の「定義」は任意。
+# 「確定」に要る根拠種別（どの調べ方でもソースだけ）。設計書・呼び出し関係・ログや設定は無いことを理由に推定へ落とさない。
 LENS_REQUIRED_EVIDENCE_KINDS = {
-    "qa": ("source", "spec_doc"),
-    "impact": ("source", "callgraph"),
-    "troubleshoot": ("source", "log_config"),
-    "author": ("source", "spec_doc"),
+    "qa": ("source",),
+    "impact": ("source",),
+    "troubleshoot": ("source",),
+    "author": ("source",),
 }
 
 # 定義（DDL・copybook・データ構造の宣言）。コード層の拡張子だが実装そのものではないため `source` と分ける。設定ファイルは `log_config`。
@@ -61,7 +61,7 @@ def evidence_kind_of_doc(doc_id) -> str | None:
 
 
 def required_evidence_kinds(lens: str) -> tuple:
-    """レンズ別の必須種別（未知のレンズは仕様問い合わせと同じ扱い）。"""
+    """確定に要る種別（どの調べ方でもソースだけ・未知のレンズも同じ）。"""
     return LENS_REQUIRED_EVIDENCE_KINDS.get(lens, LENS_REQUIRED_EVIDENCE_KINDS["qa"])
 
 

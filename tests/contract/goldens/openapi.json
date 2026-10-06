@@ -180,6 +180,9 @@
             "title": "Heatmap",
             "type": "array"
           },
+          "impact": {
+            "$ref": "#/components/schemas/UsageImpact"
+          },
           "limits": {
             "$ref": "#/components/schemas/UsageLimits"
           },
@@ -229,6 +232,9 @@
           },
           "tokens": {
             "$ref": "#/components/schemas/UsageTokens"
+          },
+          "tool_calls": {
+            "$ref": "#/components/schemas/UsageToolCalls"
           },
           "totals": {
             "$ref": "#/components/schemas/UsageTotals"
@@ -915,6 +921,11 @@
             "title": "Depth Profile",
             "type": "string"
           },
+          "doc_focus": {
+            "default": false,
+            "title": "Doc Focus",
+            "type": "boolean"
+          },
           "knowledge": {
             "default": true,
             "title": "Knowledge",
@@ -934,6 +945,7 @@
             "anyOf": [
               {
                 "enum": [
+                  "investigate",
                   "impact",
                   "troubleshoot",
                   "qa",
@@ -5416,14 +5428,71 @@
         "title": "UsageHeatmapCell",
         "type": "object"
       },
+      "UsageImpact": {
+        "description": "影響一覧のあるターンだけの件数（行の名前・パスは持たない）。",
+        "properties": {
+          "candidate": {
+            "default": 0,
+            "title": "Candidate",
+            "type": "integer"
+          },
+          "hidden": {
+            "default": 0,
+            "title": "Hidden",
+            "type": "integer"
+          },
+          "inspected": {
+            "default": 0,
+            "title": "Inspected",
+            "type": "integer"
+          },
+          "more": {
+            "default": 0,
+            "title": "More",
+            "type": "integer"
+          },
+          "traced_turns": {
+            "default": 0,
+            "title": "Traced Turns",
+            "type": "integer"
+          },
+          "unmapped": {
+            "default": 0,
+            "title": "Unmapped",
+            "type": "integer"
+          },
+          "untraced_turns": {
+            "default": 0,
+            "title": "Untraced Turns",
+            "type": "integer"
+          },
+          "used": {
+            "default": 0,
+            "title": "Used",
+            "type": "integer"
+          }
+        },
+        "title": "UsageImpact",
+        "type": "object"
+      },
       "UsageLens": {
         "properties": {
+          "author": {
+            "default": 0,
+            "title": "Author",
+            "type": "integer"
+          },
           "chat": {
             "title": "Chat",
             "type": "integer"
           },
           "impact": {
             "title": "Impact",
+            "type": "integer"
+          },
+          "investigate": {
+            "default": 0,
+            "title": "Investigate",
             "type": "integer"
           },
           "qa": {
@@ -6873,6 +6942,138 @@
           "by_user_kind"
         ],
         "title": "UsageTokens",
+        "type": "object"
+      },
+      "UsageToolCallRole": {
+        "properties": {
+          "calls": {
+            "title": "Calls",
+            "type": "integer"
+          },
+          "errors": {
+            "title": "Errors",
+            "type": "integer"
+          },
+          "found": {
+            "title": "Found",
+            "type": "integer"
+          },
+          "ms": {
+            "title": "Ms",
+            "type": "integer"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "calls",
+          "found",
+          "ms",
+          "errors",
+          "truncated"
+        ],
+        "title": "UsageToolCallRole",
+        "type": "object"
+      },
+      "UsageToolCallRow": {
+        "description": "道具ごとの累計（`by_role` は parent/child/undetermined の内訳）。",
+        "properties": {
+          "by_role": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/UsageToolCallRole"
+            },
+            "title": "By Role",
+            "type": "object"
+          },
+          "calls": {
+            "title": "Calls",
+            "type": "integer"
+          },
+          "errors": {
+            "title": "Errors",
+            "type": "integer"
+          },
+          "found": {
+            "title": "Found",
+            "type": "integer"
+          },
+          "ms": {
+            "title": "Ms",
+            "type": "integer"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "calls",
+          "found",
+          "ms",
+          "errors",
+          "truncated",
+          "tool",
+          "by_role"
+        ],
+        "title": "UsageToolCallRow",
+        "type": "object"
+      },
+      "UsageToolCalls": {
+        "description": "道具の呼び出しの累計（記録のあるターンだけ・過去のターンは含まない）。",
+        "properties": {
+          "missing": {
+            "title": "Missing",
+            "type": "integer"
+          },
+          "no_tool_use_turns": {
+            "default": 0,
+            "title": "No Tool Use Turns",
+            "type": "integer"
+          },
+          "nudged_then_used": {
+            "default": 0,
+            "title": "Nudged Then Used",
+            "type": "integer"
+          },
+          "nudged_turns": {
+            "default": 0,
+            "title": "Nudged Turns",
+            "type": "integer"
+          },
+          "opened_docs": {
+            "default": 0,
+            "title": "Opened Docs",
+            "type": "integer"
+          },
+          "opened_unknown_turns": {
+            "default": 0,
+            "title": "Opened Unknown Turns",
+            "type": "integer"
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/UsageToolCallRow"
+            },
+            "title": "Tools",
+            "type": "array"
+          },
+          "turns": {
+            "title": "Turns",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "turns",
+          "missing",
+          "tools"
+        ],
+        "title": "UsageToolCalls",
         "type": "object"
       },
       "UsageTotals": {

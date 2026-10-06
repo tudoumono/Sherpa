@@ -160,6 +160,8 @@ if "resume" in args:
     sid = args[i + 1] if i + 1 < len(args) else None
     if sid == "SID-GOOD":
         print(json.dumps({{"type": "thread.started", "thread_id": sid}}))
+        print(json.dumps({{"type": "item.completed", "item": {{
+            "id": "c0", "type": "command_execution", "command": "ls", "status": "completed", "exit_code": 0}}}}))
         print(json.dumps({{"type": "item.completed",
                            "item": {{"id": "1", "type": "agent_message", "text": "resumed-ok"}}}}))
         sys.exit(0)
@@ -175,6 +177,8 @@ if "resume" in args:
     sys.exit(1)
 
 print(json.dumps({{"type": "thread.started", "thread_id": "TH-FRESH"}}))
+print(json.dumps({{"type": "item.completed", "item": {{
+    "id": "c0", "type": "command_execution", "command": "ls", "status": "completed", "exit_code": 0}}}}))
 print(json.dumps({{"type": "item.completed",
                    "item": {{"id": "1", "type": "agent_message", "text": "fresh-ok"}}}}))
 sys.exit(0)

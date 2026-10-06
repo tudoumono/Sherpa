@@ -117,6 +117,12 @@ for i, text in enumerate(step.get("agent_messages", [])):
                        "item": {"id": f"m{i}", "type": "agent_message", "text": text}}))
     sys.stdout.flush()
 
+# 道具ゼロの促しを出さないよう、1 回目の実行は既定で道具を 1 回使う。
+if call_index == 1 and not step.get("no_tools"):
+    print(json.dumps({"type": "item.completed",
+                       "item": {"id": "t0-default", "type": "command_execution",
+                                "command": "ls", "status": "completed", "exit_code": 0}}), flush=True)
+
 for event in step.get("extra_events", []):
     print(json.dumps(event), flush=True)
 
@@ -343,8 +349,8 @@ def test_ledger_source_required_by_scope_even_when_item_omits_it(tmp_path, monke
     assert env["investigation"]["complete"] is True
 
 
-def test_ledger_spec_only_completes_when_layer_excludes_source(tmp_path, monkeypatch):
-    """層を docs に絞ったターンは source を必須に足さず、spec_only のまま受理する。"""
+def test_ledger_spec_only_does_not_complete_when_layer_excludes_source_but_scope_has_source(tmp_path, monkeypatch):
+    """層を docs に絞っても範囲にソースがあるなら source は必須のまま（spec_only だけでは完了しない）。"""
     item = _item("a", "spec_only", evidence=[{"kind": "spec_doc", "path": "docs/x.md", "line": 1}],
                  required_checks=["spec_doc"])
     steps = [_st("TH-DOCS-ONLY", _final("資料で確認しました。"),
@@ -353,15 +359,16 @@ def test_ledger_spec_only_completes_when_layer_excludes_source(tmp_path, monkeyp
     ctx = helper._ctx("docs-only-layer", 31102)
     ctx.scope_meta = {"layer": "docs"}
     env = helper._result_env(helper._run(A.CodexProvider(), ctx))
-    assert len(helper._read_argv_log(argv_log)) == 2
-    assert env["investigation"]["complete"] is True
+    assert len(helper._read_argv_log(argv_log)) > 2
+    assert env["investigation"]["complete"] is False
 
 
-def test_ledger_source_required_extra_follows_effective_layer_not_scope_meta_layer(monkeypatch):
-    """実効の層（qa 以外は層なし）を見る。層=docs なら走査が判定不能でも安全側（必須）へ倒さない。"""
+def test_ledger_source_required_extra_ignores_layer(monkeypatch):
+    """ソースの必須は探す対象（層）に依存しない。走査が判定不能なら安全側（必須）へ倒す。"""
     assert ledger_gate_mod._ledger_source_required_extra("v1", [], None) == ("source",)
+    assert ledger_gate_mod._ledger_source_required_extra("v1", [], "docs") == ("source",)
     monkeypatch.setattr(ledger_gate_mod, "_scope_evidence_kinds", lambda *a, **k: None)
-    assert ledger_gate_mod._ledger_source_required_extra("v1", [], "docs") == ()
+    assert ledger_gate_mod._ledger_source_required_extra("v1", [], "docs") == ("source",)
 
 
 # ===== 受理・継続・打ち切り =====

@@ -347,7 +347,8 @@ def test_agents_md_source_confirmation_required_at_every_depth(tmp_path, rounds)
     assert "自分（本体）が" in txt
     assert "グラフ" in txt and "ripgrep" in txt and "直接読" in txt
     assert "根拠の**件数**では判定しない" in txt
-    assert "設計書と実装（ソース）の" in txt and "『食い違い』と書く" in txt
+    flat = txt.replace("\n  ", "")
+    assert "設計書と実装（ソース）の" in flat and "『食い違い』と書く" in flat
     assert "実装に関する主張は必ず自分でソース" not in txt
     if rounds <= 0:
         assert "根拠として示された箇所（ファイル:行）を自分で開いて突き合わせる" in txt

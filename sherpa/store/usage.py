@@ -243,6 +243,58 @@ _COMPLETIONS_SQL = (
 )
 
 
+_CALL_STATS_SQL = (
+    "SELECT s.tool, s.role, SUM(s.calls) AS calls, SUM(s.found) AS found, SUM(s.ms) AS ms, "
+    "  SUM(s.errors) AS errors, SUM(s.truncated) AS truncated "
+    "FROM turn_call_stats s JOIN usage_turns t ON t.message_id = s.message_id "
+    "GROUP BY s.tool, s.role ORDER BY s.tool, s.role"
+)
+_CALL_META_SQL = (
+    "SELECT COUNT(*) AS turns, COALESCE(SUM(tm.call_log_missing), 0) AS missing "
+    "FROM usage_turns t JOIN turn_metrics tm ON tm.message_id = t.message_id "
+    "WHERE tm.call_log_missing IS NOT NULL"
+)
+_TOOL_USE_SQL = (
+    "SELECT "
+    "  COUNT(*) FILTER (WHERE tm.tool_zero_nudged) AS nudged_turns, "
+    "  COUNT(*) FILTER (WHERE tm.tool_zero_nudged AND tm.tool_use_verdict = 'used') AS nudged_then_used, "
+    "  COUNT(*) FILTER (WHERE tm.notice_kinds ? 'no_tool_use') AS no_tool_use_turns, "
+    "  COALESCE(SUM(tm.opened_docs_count), 0) AS opened_docs, "
+    "  COUNT(*) FILTER (WHERE tm.opened_docs_count IS NOT NULL AND tm.opened_unknown) AS opened_unknown_turns "
+    "FROM usage_turns t JOIN turn_metrics tm ON tm.message_id = t.message_id"
+)
+_IMPACT_SQL = (
+    "SELECT "
+    "  COUNT(*) FILTER (WHERE tm.impact_traced) AS traced_turns, "
+    "  COUNT(*) FILTER (WHERE tm.impact_traced IS NOT NULL AND NOT tm.impact_traced) AS untraced_turns, "
+    "  COALESCE(SUM((tm.impact_counts->>'candidate')::int), 0) AS candidate, "
+    "  COALESCE(SUM((tm.impact_counts->>'inspected')::int), 0) AS inspected, "
+    "  COALESCE(SUM((tm.impact_counts->>'used')::int), 0) AS used, "
+    "  COALESCE(SUM((tm.impact_counts->>'unmapped')::int), 0) AS unmapped, "
+    "  COALESCE(SUM((tm.impact_counts->>'more')::int), 0) AS more, "
+    "  COALESCE(SUM((tm.impact_counts->>'hidden')::int), 0) AS hidden "
+    "FROM usage_turns t JOIN turn_metrics tm ON tm.message_id = t.message_id "
+    "WHERE tm.impact_traced IS NOT NULL"
+)
+_TOOL_USE_FIELDS = ("nudged_turns", "nudged_then_used", "no_tool_use_turns", "opened_docs", "opened_unknown_turns")
+_IMPACT_FIELDS = ("traced_turns", "untraced_turns", "candidate", "inspected", "used", "unmapped", "more", "hidden")
+_CALL_STAT_FIELDS = ("calls", "found", "ms", "errors", "truncated")
+
+
+def _tool_calls_stats(rows, meta, tool_use=None) -> dict:
+    """道具ごとの累計（`tools`・呼び出しの多い順）と、記録のあるターン数・記録の欠けの行数。各道具に親/下調べ役/判定不能の内訳（`by_role`）を持つ。検索語・資料名は持たない。"""
+    tools: dict[str, dict] = {}
+    for r in rows:
+        t = tools.setdefault(r["tool"], {"tool": r["tool"], **{f: 0 for f in _CALL_STAT_FIELDS}, "by_role": {}})
+        vals = {f: int(r[f] or 0) for f in _CALL_STAT_FIELDS}
+        for f, v in vals.items():
+            t[f] += v
+        t["by_role"][r["role"]] = vals
+    ordered = sorted(tools.values(), key=lambda t: (-t["calls"], t["tool"]))
+    return {"turns": int((meta or {}).get("turns") or 0), "missing": int((meta or {}).get("missing") or 0),
+            "tools": ordered, **{f: int((tool_use or {}).get(f) or 0) for f in _TOOL_USE_FIELDS}}
+
+
 def _usage_read_tuning(c) -> None:
     """この集計トランザクションの間だけ（`SET LOCAL`）ソート・ハッシュ集計の作業メモリを広げる（管理者の集計画面専用の短い読み取り）。"""
     c.execute("SET LOCAL work_mem = '64MB'")
@@ -783,6 +835,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     - conversations_top: 期間内に user ターンがある会話について、会話 id・uid・world・user ターン数・用途別内訳（`kinds`）・回答時間の平均を、トークン合計の降順で上位20件（選択は SQL の `_conversations_top_from_sql`・タイトル・本文は含まない）。
     - stop_kinds: `turn_metrics.stop_kind`（`sherpa/stop_kind.py` の閉じた8値）の分布。返答が存在するターン（`message_id IS NOT NULL`）のみで、利用者の明示停止と確認カードは除き、語彙外・NULL は 'unknown' に畳む。
     - completions: `turn_metrics.completion`（complete/partial/stopped/failed）の分布。母集団は stop_kinds と同じ（返答があり確認カードでないターン）で、利用者停止も `stopped` に入る。旧形式の行・語彙外は 'unknown'。
+    - tool_calls: 道具の呼び出しの累計（`turn_call_stats`）。道具ごとの回数・見つかった件数の合計・かかった時間の合計・失敗と打ち切りの数（`by_role` に本体・下調べ役・判定不能の内訳）と、記録のあるターン数・記録の欠けの行数。中身（検索語・資料名）は持たない。
     - stopped_turns: 利用者の明示停止（`chat.turn` 監査の `detail.stopped=true`）の件数。境界は `turns`/`stop_kinds` と同じ `turn_created_at`（`_stopped_turns_sql`）。
     期間の基準時刻は指標ごとに違う:
     - ターン由来の集計: user 発言の `turn_created_at`。
@@ -805,6 +858,8 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
             "  COUNT(*) FILTER (WHERE lens='qa') AS lens_qa, "
             "  COUNT(*) FILTER (WHERE lens='troubleshoot') AS lens_troubleshoot, "
             "  COUNT(*) FILTER (WHERE lens='chat') AS lens_chat, "
+            "  COUNT(*) FILTER (WHERE lens='investigate') AS lens_investigate, "
+            "  COUNT(*) FILTER (WHERE lens='author') AS lens_author, "
             "  COUNT(*) FILTER (WHERE user_personal) AS personal_turns, "
             "  ARRAY_REMOVE(ARRAY_AGG(DISTINCT version COLLATE \"C\"), NULL) AS worlds, "
             "  COUNT(*) FILTER (WHERE lens IS NOT NULL AND lens != 'chat') AS knowledge_turns, "
@@ -842,6 +897,11 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         # 終了理由（`usage_turns.stop_kind`・`stop_kind.py` の8値）の分布。`usage_turns` 経由にして `turns`/`stopped_turns` と同じ `turn_created_at` 境界を使う。`answer IS NOT NULL` で assistant 返答が存在するターンだけに絞り（停止・実行中のターンが 'unknown' に混入して `stopped_turns` と二重計上になるのを避ける）、`stopped_by_user` は除く。allowlist（`stop_kind.STOP_KINDS`）外の値は 'unknown' へ畳み込み、確認カード（lens='clarify'）は母数から外す。
         stop_kind_rows = c.execute(_STOP_KINDS_SQL, (list(stop_kind.STOP_KINDS),)).fetchall()
         completion_rows = c.execute(_COMPLETIONS_SQL, (list(answer_shape.COMPLETIONS),)).fetchall()
+        # 道具の呼び出しの累計（`turn_call_stats`・`call_stats` の無い過去のターンは行が無く、数字は変わらない）。
+        call_stat_rows = c.execute(_CALL_STATS_SQL).fetchall()
+        call_meta_row = c.execute(_CALL_META_SQL).fetchone()
+        tool_use_row = c.execute(_TOOL_USE_SQL).fetchone()
+        impact_row = c.execute(_IMPACT_SQL).fetchone()
         # limits（「打ち切りの内訳」・経路別）: `stop_kind_rows` から `stopped_by_user` の除外だけを外した母集団（停止ターンで当たった制限も残す）に、`answer->'usage'->>'provider'` 別の集計を足す。
         limits_rows = c.execute(
             "SELECT COALESCE(provider, 'unknown') AS provider, "
@@ -951,6 +1011,8 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
                 "qa": r["lens_qa"] or 0,
                 "troubleshoot": r["lens_troubleshoot"] or 0,
                 "chat": r["lens_chat"] or 0,
+                "investigate": r["lens_investigate"] or 0,
+                "author": r["lens_author"] or 0,
             },
             "personal_turns": r["personal_turns"] or 0,
             "worlds": sorted(r["worlds"] or []),
@@ -984,6 +1046,8 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     # limits（「打ち切りの内訳」・経路別・行=provider の list）。`*_turns`＝回数系は1回以上・bool系は真だったターン数、`*_total`＝回数系の合計回数。
     by_provider_limits = [_usage_limits_provider_row(r) for r in limits_rows]
     limits_stats = {"by_provider": by_provider_limits}
+    tool_calls = _tool_calls_stats(call_stat_rows, call_meta_row, tool_use_row)
+    impact_stats = {f: int((impact_row or {}).get(f) or 0) for f in _IMPACT_FIELDS}
 
     # 定着指標: JST 週（月曜始まり）ごとのアクティブユーザー集合→週次人数の推移＋連続週ペアの再訪率。
     den = sum(r["active_users"] for r in retention_rows if r["has_next"])
@@ -1082,7 +1146,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         "heatmap": heatmap, "retention": retention, "downloads": downloads, "tokens": tokens,
         "conversation_turns": conversation_turns, "resume_rate": resume_rate,
         "stop_kinds": stop_kinds, "stopped_turns": stopped_turns, "completions": completions,
-        "response_time": response_time, "limits": limits_stats,
+        "response_time": response_time, "limits": limits_stats, "tool_calls": tool_calls, "impact": impact_stats,
         "conversations_top": conversations_top,
         "rounds": rounds_stats,
         "quality_runs": depth_quality_stats(days, time_from=time_from, time_to=time_to),

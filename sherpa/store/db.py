@@ -614,6 +614,26 @@ _SCHEMA = [
         ms BIGINT,
         UNIQUE (message_id, agent_index, tool)
     )""",
+    # 道具の呼び出しの累計（1 ターン×親/子/判定不能×道具＝1 行・`answer.call_stats` から作る派生物・中身（検索語・資料名）は持たない）。`call_log_missing` は記録の欠けの行数（`call_stats` の無いターンは NULL）。
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS call_log_missing INTEGER",
+    # 道具ゼロの促し（`answer.tool_use`）・開いた資料の件数（`call_stats.opened`）・影響一覧の件数（`answer.impact_list`）。無い回答・過去の行は NULL（件数だけで名前・パスは持たない）。
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS tool_use_verdict TEXT",
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS tool_zero_nudged BOOLEAN",
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS opened_docs_count INTEGER",
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS opened_unknown BOOLEAN",
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS impact_traced BOOLEAN",
+    "ALTER TABLE turn_metrics ADD COLUMN IF NOT EXISTS impact_counts JSONB",
+    """CREATE TABLE IF NOT EXISTS turn_call_stats (
+        message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        calls INTEGER NOT NULL DEFAULT 0,
+        found INTEGER NOT NULL DEFAULT 0,
+        ms BIGINT NOT NULL DEFAULT 0,
+        errors INTEGER NOT NULL DEFAULT 0,
+        truncated INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (message_id, role, tool)
+    )""",
     # Codex ジョブ（外部 API の非同期 Codex 実行）。再起動後も追える永続ジョブ（`sherpa/store/codex_jobs.py` が唯一の読み書き窓口）。`status` は queued/running/completed/failed/cancelled/expired の 6 値（CHECK 制約は持たない）。結果（質問文・回答・出典・未確認項目）は `finished_at` から 7 日（`expires_at`）を過ぎたら `status='expired'` にして NULL へ消す（`codex_jobs.py::expire_due_jobs`/照会時の遅延判定）。
     """CREATE TABLE IF NOT EXISTS codex_jobs (
         id TEXT PRIMARY KEY,

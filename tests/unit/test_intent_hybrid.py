@@ -190,13 +190,13 @@ def test_confirm_first_slash_resend_restores_lens_source_and_block_rv2_1():
     # 1ターン目: ブロックは「qa」を継続選択中に /影響 ... を送る。
     explicit_lens, lens_source, lens_block, message = CS._resolve_lens(
         "qa", "/影響 税率表を確認してから進めて。")
-    assert (explicit_lens, lens_source, lens_block) == ("impact", "slash", "qa")
+    assert (explicit_lens, lens_source, lens_block) == ("investigate", "slash", "qa")
     scope_meta = CS._resolve_scope(message, "w1", [], lens_source=lens_source, lens_block=lens_block)
     d = C._build_router([], "w1", {}, can_ask=True, explicit_lens=explicit_lens,
                         scope_meta=scope_meta)(message)
     assert d["lens"] == "clarify"
     q = d["question"]
-    assert q["lens"] == "impact" and q["lens_source"] == "slash" and q["lens_block"] == "qa"
+    assert q["lens"] == "investigate" and q["lens_source"] == "slash" and q["lens_block"] == "qa"
 
     # web/chat.js の data-ask-submit ハンドラと同じ組み立て: lens_source=="slash" なら
     # 再送本文の先頭へ元の接頭辞を復元し、override の lens には lens_block を渡す。
@@ -204,7 +204,7 @@ def test_confirm_first_slash_resend_restores_lens_source_and_block_rv2_1():
                           f"確認ID: {q['interaction_id']}\n選択: 対象範囲（どの資料/システムか）\n"
                           f"元の依頼: {q['original_message']}")
     explicit2, lens_source2, lens_block2, stripped2 = CS._resolve_lens(q["lens_block"], resend_message_raw)
-    assert explicit2 == "impact" and lens_source2 == "slash" and lens_block2 == "qa"
+    assert explicit2 == "investigate" and lens_source2 == "slash" and lens_block2 == "qa"
     scope_meta2 = CS._resolve_scope(stripped2, "w1", [], lens_source=lens_source2, lens_block=lens_block2)
     assert scope_meta2["lens_source"] == "slash"
     assert scope_meta2["lens_block"] == "qa"   # ブロックの継続設定は変わらない（1回限りの明示のまま）

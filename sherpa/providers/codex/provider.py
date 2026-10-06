@@ -31,9 +31,14 @@ from .turn_loop import run_session
 from .turn_prepare import enter_conversation, prepare_run
 from .turn_state import CodexTurnState
 
-# MCP 付き Codex 経路で決まった手順の下調べ（`_gather` の `ctx.dispatch`）を省くレンズ。impact は省かない（グラフでたどる影響一覧は Codex のツールでは作れず、回答と並べて表示するため）。
-_PRESEARCH_SKIP_LENSES = frozenset({"qa", "troubleshoot", "author"})
+# Codex を起動する前の事前の下調べ（`_gather` の `ctx.dispatch`）を省くレンズ（全部の調べ方）。影響のたどりは Codex が道具で行う。
+_PRESEARCH_SKIP_LENSES = frozenset({"investigate", "qa", "impact", "troubleshoot", "author"})
 # モデルの文脈窓（`model_context_window`）は Codex CLI に渡さず、CLI 自身の判断に任せる（Sherpa 側で窓を判定・登録・上書きしない）。
+
+
+# 資料を中心に調べる指定（investigate かつ doc_focus）のとき【質問】の前に足す一文。
+_DOC_FOCUS_SENTENCE = ("設計書・資料を中心に調べて答えてください。"
+                       "ソースは設計書との食い違いの確認のために読んでください（ソースの確認は省かない）。\n\n")
 
 
 # 原本と変換済みテキストの保護。読み取り専用はサンドボックス（permission profile の read）が強制し、指示は多層防御として全モード・全レンズに常置する。
@@ -101,7 +106,7 @@ class CodexProvider(Provider):
                 + _HISTORY_VOICE_NOTE + "\n\n")
 
     def _prompt_mcp(self, message, lens, world, direct_read: bool = True, layer=None,
-                    with_history: bool = True):
+                    with_history: bool = True, doc_focus: bool = False):
         """MCP 版プロンプト。事実を前渡しせず、Codex に MCP ツールで自律調査させる。MCP ツール固有の使い分けと、containment/grounding の短縮形を置く（共通ルールは AGENTS.md）。
         `direct_read`（既定 True）: 原本直読（permission profile で KB／派生ルートを read し、コードインタープリターで直接開く）の可否。`_run_authoring` が秘匿列挙と範囲（`_scope_deny_entries`）の成否から計算して渡し、失敗した（fail-closed）ターンだけ False（MCP のみへ縮退）。
         """
@@ -212,9 +217,9 @@ class CodexProvider(Provider):
                 # 履歴があれば【依頼】の前に前置する。
                 f"{self._history_block(with_history)}【依頼】{message}")
         # 履歴があれば【質問】の前に前置する。
-        return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block(with_history)}【質問】{message}"
+        return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block(with_history)}{_DOC_FOCUS_SENTENCE if doc_focus else ''}【質問】{message}"
 
-    def _prompt_plain(self, message, lens, world, with_history: bool = True):
+    def _prompt_plain(self, message, lens, world, with_history: bool = True, doc_focus: bool = False):
         """素の Codex（`plain`）向けプロンプト。Sherpa の調べ方の上乗せ（MCP ツール一覧・list_docs 誘導・investigate スキル誘導・台帳・影響調査の手順・原因調査の症状語の指示）は持たず、Codex 本来の調べ方（シェルで直接読む）に任せる。
         containment（範囲・秘匿は読まない）・出典書式・ask_user の使い方は AGENTS.md（`codex_agents_md.AGENTS_MD_PLAIN`）と重複しても多層防御として置く。
         """
@@ -275,7 +280,7 @@ class CodexProvider(Provider):
                 "最後に**作成したファイル名**と**内容の要約**を"
                 "日本語で報告してください。\n\n"
                 f"{self._history_block(with_history)}【依頼】{message}")
-        return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block(with_history)}【質問】{message}"
+        return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block(with_history)}{_DOC_FOCUS_SENTENCE if doc_focus else ''}【質問】{message}"
 
     def _plain_text(self, message: str = "") -> str:
         # ナレッジ参照オフでは Codex CLI を起動しない（read-only でも KB を覗けてしまうため）。通常この経路には来ない（資料参照オフは `chat_service.stream_message` が `PlainChatProvider` で答える）。内部経路が knowledge=False で直接呼んだ場合の安全網。

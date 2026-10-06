@@ -5,7 +5,7 @@
 
 import { S, setChatExamples } from './state.js';
 import { setSimpleMode, setWebSearchEligible } from './inquiry.js';
-import { refreshWelcomeExamples, answerBody, answerNotices, unverifiedSourceRows, reconciliationRows, budgetNoteText, clipPersonalQuote } from './render.js';
+import { refreshWelcomeExamples, answerBody, answerNotices, unverifiedSourceRows, reconciliationRows, referencedDocRows, rangeText, impactListView, foundDocRows, howText, budgetNoteText, clipPersonalQuote } from './render.js';
 import { toast } from '../chat.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;
@@ -195,7 +195,7 @@ function _exportName(title, ext) {
   const safe = (title || 'chat').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40) || 'chat';
   return `${safe}_${_stamp().file}.${ext}`;
 }
-const LENS_FULL = { impact: '影響範囲分析', troubleshoot: 'トラブルシュート', qa: '仕様問い合わせ', chat: '通常チャット', author: '資料を作成' };
+const LENS_FULL = { investigate: '調べる', impact: '影響範囲分析', troubleshoot: 'トラブルシュート', qa: '仕様問い合わせ', chat: '通常チャット', author: '資料を作成' };
 const COMPLETION_TEXT = { partial: '途中までの回答', stopped: '停止した時点までの回答', failed: '回答できませんでした' };
 function _scopeText(ans) {   // 参照範囲を1行にする
   const sc = ans.scope || {};
@@ -208,6 +208,8 @@ function _answerLines(ans, md, shared) {
   const L = [(md ? '**回答（' : '回答（') + (LENS_FULL[ans.lens] || ans.lens || '未判定') + (md ? '）**' : '）'),
     (md ? '_範囲: ' : '範囲: ') + _scopeText(ans) + (md ? '_' : '')];
   // 注記・完了状態は本文の前に書き出す（画面と同じ並び）。旧形式の行は headline が本文になり、注記は無い。
+  const how = howText(ans);
+  if (how) L.push((md ? '**調べ方:** ' : '調べ方: ') + how);
   const state = COMPLETION_TEXT[ans.completion];
   if (state) L.push((md ? '**状態:** ' : '状態: ') + state);
   const notices = answerNotices(ans);
@@ -225,7 +227,8 @@ function _answerLines(ans, md, shared) {
   // 画面（render.js）と同じ条件で並べる。グラフ由来の結果が無い impact／troubleshoot は引用を書き出す
   const impactHasGraph = !!((d.items || []).length || (d.presumed || []).length);
   const troubleHasCandidates = !!(d.candidates || []).length;
-  const showCitations = (ans.lens === 'qa'
+  const newRefs = Array.isArray(ans.referenced_docs);  // 新しい形の回答は該当箇所・根拠／参考を出さず、参照した資料の行だけにする
+  const showCitations = !newRefs && (ans.lens === 'qa' || ans.lens === 'investigate'
     || (ans.lens === 'impact' && !impactHasGraph)
     || (ans.lens === 'troubleshoot' && !troubleHasCandidates));
   if (ans.lens === 'impact') (d.items || []).forEach((it) => L.push(`${md ? '- ' : '・'}${it.category}｜${it.name}`));
@@ -244,7 +247,33 @@ function _answerLines(ans, md, shared) {
       recon.forEach((r) => L.push(`・${r.item.replace(/\s+/g, ' ').trim()}｜設計書: ${cellText(r.spec) || '-'}｜ソース: ${cellText(r.source) || '-'}｜${r.label}`));
     }
   }
-  if ((ans.sources || []).length) {
+  const bullet = md ? '- ' : '・';
+  const il = impactListView(ans);
+  if (il) {
+    L.push(md ? '**影響一覧**' : '影響一覧');
+    if (!il.traced) L.push('影響をたどっていません');
+    il.rows.forEach((r) => L.push(`${bullet}${r.name}${r.origin ? '（起点）' : ''}｜${r.label}${r.reason ? '｜' + r.reason : ''}`));
+    il.reasons.forEach((x) => L.push(`${bullet}${x}`));
+    if (il.more) L.push(`${bullet}ほか ${il.more} 件`);
+    if (il.hidden) L.push(`${bullet}名前を表示できない項目 ${il.hidden} 件`);
+  }
+  const ref = referencedDocRows(ans);
+  if (newRefs) {
+    L.push(md ? '**参照した資料**' : '参照した資料');
+    if (!ref.rows.length && !ref.hidden && !ref.more) L.push('参照した資料はありません');
+    const rangeNote = (r) => (r.ranges.length || r.rangesMore ? '（' + [r.ranges.length ? rangeText(r) : '', r.rangesMore ? `ほか ${r.rangesMore} か所` : ''].filter(Boolean).join('、') + '）' : '');
+    ref.rows.forEach((r) => L.push(`${bullet}${r.path}${rangeNote(r)}${r.unopened ? '（Codex の読み取り記録なし）' : ''}`));
+    if (ref.more) L.push(`${bullet}ほか ${ref.more} 件`);
+    if (ref.hidden) L.push(`${bullet}名前を表示できない資料 ${ref.hidden} 件`);
+  }
+  const fnd = foundDocRows(ans);
+  if (fnd.rows.length || fnd.hidden || fnd.more) {
+    L.push(md ? '**ほかに見つかった資料（Codex の読み取り記録なし）**' : 'ほかに見つかった資料（Codex の読み取り記録なし）');
+    fnd.rows.forEach((p) => L.push(`${bullet}${p}`));
+    if (fnd.more) L.push(`${bullet}ほか ${fnd.more} 件（上限で省略）`);
+    if (fnd.hidden) L.push(`${bullet}名前を表示できない資料 ${fnd.hidden} 件`);
+  }
+  if (!newRefs && (ans.sources || []).length) {
     // sources_verified があれば根拠/参考の2区分で書き出す（render.js と同じ）
     const verified = Array.isArray(ans.sources_verified) ? new Set(ans.sources_verified) : null;
     if (verified) {
@@ -257,7 +286,7 @@ function _answerLines(ans, md, shared) {
     }
   }
   const unv = unverifiedSourceRows(ans);
-  if (unv.rows.length || unv.hidden) {
+  if (unv.rows.length || unv.hidden || unv.more) {
     L.push((md ? '**確認できなかった資料:** ' : '確認できなかった資料: ')
       + [...unv.rows.map((u) => u.path + (u.reason ? `（${u.reason}）` : '')),
         ...(unv.more ? [`ほか ${unv.more} 件`] : []), ...(unv.hidden ? [`名前を表示できない資料 ${unv.hidden} 件`] : [])].join(', '));

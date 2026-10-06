@@ -200,3 +200,31 @@ def test_record_trim_reports_what_was_dropped_and_reviews_load_reports_omissions
     reviews, report = L.load_reviews_report(tmp_path)
     assert len(reviews) == L.REVIEWS_MAX_COUNT
     assert report == {"invalid": 1, "over_count": 1, "over_bytes": False}
+
+
+def test_calls_section_is_dropped_before_the_ledger_and_is_rendered_in_the_download():
+    """調べた経路・見つかった資料は他の欄より先に落とし、落とした件数を残す。ダウンロードにも出る。"""
+    route = [{"call": f"1:{i}", "role": "parent", "tool": "ripgrep_search", "status": "ok", "count": 1, "ms": 2,
+              "query": "税率" + "x" * 3000, "docs": [{"doc": "a.md", "range": "3"}]} for i in range(400)]
+    found = [{"doc": f"d{i}.md", "hits": 1, "lines": [1], "queries": ["税率"], "opened": False} for i in range(50)]
+    calls = {"v": 1, "calls": 400, "missing": 2, "route": route, "found": found}
+    items = {"i01": _item("i01")}
+    kept, dropped = store_investigation.trim_calls({"question_kind": "qa"}, items, {}, [], {}, calls)
+    assert dropped["found_docs"] == 50 and dropped["calls"] > 0 and kept["found"] == []
+    assert kept["route_omitted"] == dropped["calls"] and kept["found_more"] == 50
+    assert len(kept["route"]) + dropped["calls"] == 400
+    assert "見つかった資料の記録 50 件" in investigation_record_render.describe_dropped(dropped)
+    assert store_investigation.trim_calls(None, items, {}, [], {}, None) == (None, {})
+
+    small = {"v": 1, "calls": 2, "missing": 1, "route": [{"call": "1:1", "role": "child", "tool": "es_search",
+             "status": "truncated", "count": 4, "ms": 9, "query": "端数", "docs": [{"doc": "a.md", "range": "3"}]}],
+             "found": [{"doc": "a.md", "hits": 1, "lines": [3], "queries": ["端数"], "opened": False}]}
+    md = investigation_record_render.render_markdown(
+        {"complete": True, "truncated": False, "manifest": {"question_kind": "qa"}, "items": items, "coverage": {},
+         "reviews": [], "detail": {"calls": small}})
+    assert "## 調べた経路" in md and "記録の欠け 1 行" in md and "es_search" in md and "下調べ役" in md
+    assert "## 見つかった資料（検索の結果）" in md and "a.md（行: 3 / 検索語: 端数 / Codex の読み取り記録: なし）" in md
+    # 経路の無い記録のダウンロードは今までどおり（節が増えない）
+    plain = investigation_record_render.render_markdown(
+        {"complete": True, "truncated": False, "manifest": None, "items": items, "coverage": {}, "reviews": [], "detail": {}})
+    assert "調べた経路" not in plain

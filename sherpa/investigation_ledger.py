@@ -12,8 +12,8 @@
 - 終端 item は理由・根拠なしで確定できない。`REASON_REQUIRED_STATUSES` は `reason.strip()` が空なら無効、`EVIDENCE_REQUIRED_STATUSES` は `evidence` が空配列なら無効。
 - `required_checks` は `EVIDENCE_KINDS`（`source`/`spec_doc`/`definition`/`log_config`/`callgraph`）の閉集合で、語彙外・重複・空配列は無効。
   `EVIDENCE_REQUIRED_STATUSES` の 3 状態は、その状態が要求する根拠種別（`source_confirmed`→`source`／`spec_only`→`spec_doc`／`conflict`→両方）が `evidence` に無ければ無効。
-  さらに宣言した全種別の `evidence` が揃っていなければ、item は有効でも未充足として `ledger_complete()` が完了を妨げる（`Verdict.unsatisfied`）。
-- `ledger_complete()`/`no_progress()` は `required_extra`（キーワード専用・既定は空タプル）を受ける。呼び出し側（provider.py）が追加で必須にする根拠種別で、`required_checks` との和集合として効き、対象は `EVIDENCE_REQUIRED_STATUSES` の item だけ。
+  完了を妨げる未充足（`Verdict.unsatisfied`）に数えるのは `source` だけ（設計書・呼出関係・ログ設定が `required_checks` にあっても必須にしない）。
+- `ledger_complete()`/`no_progress()` は `required_extra`（キーワード専用・既定は空タプル）を受ける。呼び出し側（provider.py）が追加で必須にする根拠種別で、`required_checks` との和集合のうち `source` だけが効き、対象は `EVIDENCE_REQUIRED_STATUSES` の item だけ。
 - `load_ledger()` は symlink を一切辿らない（台帳は model-shell が書ける領域にあり、リンク先を親権限で読むと漏れる）。`dir`／`manifest.json`／`items/`／各 `items/*.json` は読む前に symlink 判定し、1 つでも symlink ならその要素は無効にする。
 - 中間の見直し: `dir/reviews.jsonl` に、完了判定の前に最低 1 回必要な「目的・観点の見直し」を 1 行 1 件で追記する（`append_review_atomic`）。
   1 行の正規形は `validate_review_entry()` が検証する。各欄に上限文字数・配列件数の上限がある。
@@ -68,6 +68,12 @@ UNCONFIRMED_STATUSES: frozenset[str] = frozenset({
 EVIDENCE_KINDS: tuple[str, ...] = ("source", "spec_doc", "definition", "log_config", "callgraph")
 _EVIDENCE_KINDS_SET: frozenset[str] = frozenset(EVIDENCE_KINDS)
 
+# 完了の必須として扱う根拠種別。ほかの種別は `required_checks` に挙げても必須にしない。
+_MANDATORY_KINDS: frozenset[str] = frozenset({"source"})
+
+# `required_extra` に入れると、範囲にソースが無いターンとして `required_checks` の `source` も必須から外す印（根拠種別ではない）。
+SOURCE_EXEMPT = "no_source_in_scope"
+
 # `EVIDENCE_REQUIRED_STATUSES` の各状態が要求する根拠種別。`evidence` の `kind` に無ければ item 自体が無効。`conflict` はソースと設計書の両方が要る。
 _STATUS_REQUIRED_EVIDENCE_KINDS: dict[str, frozenset[str]] = {
     "source_confirmed": frozenset({"source"}),
@@ -108,7 +114,7 @@ class Verdict:
     """`ledger_complete()` の戻り値。
     `manifest_invalid`: manifest が無い／壊れている／`items` が空なら `True`。`True` の間は `complete=False`。
     id は原則 `non_terminal_ids`／`invalid_ids`／`missing_ids`／`unregistered_ids` のいずれか 1 つだけに現れる（登録集合に無い id は `unregistered_ids` にだけ現れる）。例外は `unsatisfied` の id で、`non_terminal_ids` にも重ねて現れる。
-    `unsatisfied`: `EVIDENCE_REQUIRED_STATUSES` の登録済み item のうち、`required_checks` と `required_extra` の和集合の一部が `evidence` に無い id → 足りない種別（ソート済み）。内訳の報告専用で、継続判定・無進捗判定は `non_terminal_ids` 経由で効く。
+    `unsatisfied`: `EVIDENCE_REQUIRED_STATUSES` の登録済み item のうち、`required_checks` と `required_extra` の和集合のうち `source` が `evidence` に無い id → 足りない種別（ソート済み）。内訳の報告専用で、継続判定・無進捗判定は `non_terminal_ids` 経由で効く。
     `review_missing`/`review_pending_ids`: `require_review=True` のときだけ意味を持つ。
       `review_missing` は有効な見直しが 1 件も無い、または `require_continuation_resolved=True` で `pending_continuation_review(reviews)` が非 `None`（未解決の「追加の観点」の義務が残る）こと。
       `review_pending_ids` は、見直しが `added_items` に挙げた item id のうち、登録集合に無い・item が無い/無効・終端でないもの（昇順）。どちらか一方でも真/非空なら `complete=False`。
@@ -410,11 +416,13 @@ def ledger_complete(snapshot: LedgerSnapshot, *, required_extra: tuple[str, ...]
 
 
 def _missing_required_kinds(item: dict, required_extra: tuple[str, ...] = ()) -> tuple[str, ...]:
-    """根拠が必要な終端状態の item で、`required_checks` と `required_extra` の和集合のうち `evidence` に無い種別（昇順）。空なら充足。他の状態は常に空。"""
+    """根拠が必要な終端状態の item で、`required_checks` と `required_extra` の和集合のうち必須扱いの種別（`source` だけ）が `evidence` に無いもの（昇順）。空なら充足。他の状態は常に空。"""
     if item.get("status") not in EVIDENCE_REQUIRED_STATUSES:
         return ()
     present_kinds = {ev.get("kind") for ev in (item.get("evidence") or []) if isinstance(ev, dict)}
-    required = set(item.get("required_checks") or []) | set(required_extra)
+    required = (set(item.get("required_checks") or []) | set(required_extra)) & _MANDATORY_KINDS
+    if SOURCE_EXEMPT in required_extra:
+        required -= {"source"}
     return tuple(sorted(required - present_kinds))
 
 

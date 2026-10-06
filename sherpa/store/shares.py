@@ -123,9 +123,9 @@ def _strip_shared_message(m: dict) -> dict:
     """
     out = {**m, "route": None, "trace": None}
     a = out.get("answer")
-    # usage・usage_sub・usage_subs・codex_usage_total も内部情報として受領共有では伏せる。
+    # usage・usage_sub・usage_subs・codex_usage_total・tool_use・call_stats も内部情報として受領共有では伏せる。
     _drop = ("question", "route", "trace", "usage", "usage_sub", "usage_subs", "codex_usage_total",
-             "trimmed")
+             "trimmed", "tool_use", "call_stats")
     if isinstance(a, dict):
         needs_copy = any(k in a for k in _drop)
         # 通常の受領共有は元会話の answer をそのまま読むため、`sources[]`・`data.citations[]`・Evidence Packet の `source_path`/`matched_doc_ids` から重要度設定ファイルへの参照をここでも落とす。
@@ -143,12 +143,16 @@ def _strip_shared_message(m: dict) -> dict:
         filtered_data = _redact_importance_from_answer_data(data) if isinstance(data, dict) else data
         if isinstance(data, dict) and filtered_data != data:
             needs_copy = True
+        new_fields = _share_new_shape_fields(a)
+        if any(k in a for k in answer_shape.NEW_SHAPE_KEYS) and any(a.get(k) != new_fields.get(k) for k in answer_shape.NEW_SHAPE_KEYS):
+            needs_copy = True
         # 調査の記録は会話の持ち主だけが取れるため、受領共有の読者には「記録あり」の旗を見せない。
         inv = a.get("investigation")
         if isinstance(inv, dict) and "recorded" in inv:
             needs_copy = True
         if needs_copy:
-            new_a = {k: v for k, v in a.items() if k not in _drop}
+            new_a = {k: v for k, v in a.items() if k not in _drop and k not in answer_shape.NEW_SHAPE_KEYS}
+            new_a.update(new_fields)
             if isinstance(inv, dict) and "recorded" in inv:
                 new_a["investigation"] = {k: v for k, v in inv.items() if k != "recorded"}
             if isinstance(srcs, list):
@@ -202,7 +206,7 @@ _REDACTED_TEXT = "（個人ファイルを参照した回答のため、共有�
 _REDACTED_FILES_TEXT = "（ファイルを作成した回答のため、共有では非表示にしています）"
 _REDACTED_TEXTS = (_REDACTED_TEXT, _REDACTED_FILES_TEXT)
 _SANITIZED_TITLE = "共有用（サニタイズ済み会話）"
-_SHARE_SAFE_LENS = ("qa", "impact", "troubleshoot", "chat", "clarify", "author")
+_SHARE_SAFE_LENS = ("investigate", "qa", "impact", "troubleshoot", "chat", "clarify", "author")
 
 
 _EVIDENCE_PACKET_STR_FIELDS = ("task_id", "investigation_status", "summary", "stop_reason", "next_action")
@@ -452,6 +456,14 @@ def _share_sources_unverified(answer: dict) -> dict:
     return out
 
 
+def _share_new_shape_fields(answer: dict) -> dict:
+    """新しい欄を共有向けにする（秘匿の資料の名前・パスは出さず件数に回す・`answer_shape.safe_new_fields`）。"""
+    out = answer_shape.safe_new_fields(answer)
+    if isinstance(out.get("referenced_docs"), list):  # 共有の出典から外れる資料（重要度設定ファイル）は参照した資料の行からも外す
+        out["referenced_docs"] = [r for r in out["referenced_docs"] if not importance.is_importance_control_path(r["path"])]
+    return out
+
+
 def _safe_download_url(url, doc_id, world) -> str | None:
     """出典の原本ダウンロードリンクを、`/documents/download?world=…&rel=<doc_id>` の形に限って通す（それ以外の URL・別資料を指すリンクは落とす）。取得側のエンドポイントが利用者ごとに権限・秘匿を再判定する。リンクの world は回答の `scope.world` と一致するものだけ（別の資料フォルダの文書を指すリンク・world 不明は落とす）。"""
     if not isinstance(url, str) or not isinstance(doc_id, str) or not isinstance(world, str) or not world:
@@ -547,6 +559,7 @@ def _safe_share_answer(answer):
         out["investigation_summary"] = _share_summary(summary)
     unverified = _share_sources_unverified(answer)
     out.update(unverified)
+    out.update(_share_new_shape_fields(answer))
     if answer.get("lens") in _SHARE_SAFE_LENS:
         out["lens"] = answer["lens"]
     srcs = answer.get("sources")

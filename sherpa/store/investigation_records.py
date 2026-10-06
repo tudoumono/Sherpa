@@ -62,6 +62,39 @@ def trim_record(manifest: dict | None, items: dict, coverage: dict, reviews: lis
     return manifest, items, coverage, reviews, coverage_detail, dropped
 
 
+def trim_calls(manifest: dict | None, items: dict, coverage: dict, reviews: list | None,
+               coverage_detail: dict | None, calls: dict | None) -> tuple[dict | None, dict]:
+    """調べた経路・見つかった資料（`detail.calls`）を、他の欄と合わせて `MAX_RECORD_BYTES` に収まるよう後ろから落とす（見つかった資料 → 経路の順・他の欄より先に落とす）。
+    戻り値は `(calls, dropped)`。`dropped` は `{"calls": 落とした経路の件数, "found_docs": 落とした資料の件数}`（落とさなければ空）。落とした件数は `calls` の `route_omitted`・`found_more` にも足す（黙って落とさない）。
+    """
+    if not isinstance(calls, dict):
+        return calls, {}
+    rest = _record_size(manifest, items or {}, coverage or {}, reviews or [], coverage_detail)
+    route, found = list(calls.get("route") or []), list(calls.get("found") or [])
+    sizes = {"route": [len(json.dumps(r, ensure_ascii=False).encode("utf-8")) + 1 for r in route],
+             "found": [len(json.dumps(r, ensure_ascii=False).encode("utf-8")) + 1 for r in found]}
+    total = rest + len(json.dumps({**calls, "route": [], "found": []}, ensure_ascii=False).encode("utf-8")) + 64
+    total += sum(sizes["route"]) + sum(sizes["found"])
+    dropped: dict = {}
+    while total > MAX_RECORD_BYTES and (found or route):
+        if found:
+            total -= sizes["found"].pop()
+            found.pop()
+            dropped["found_docs"] = dropped.get("found_docs", 0) + 1
+        else:
+            total -= sizes["route"].pop()
+            route.pop()
+            dropped["calls"] = dropped.get("calls", 0) + 1
+    if not dropped:
+        return calls, {}
+    out = {**calls, "route": route, "found": found}
+    if dropped.get("calls"):
+        out["route_omitted"] = int(calls.get("route_omitted") or 0) + dropped["calls"]
+    if dropped.get("found_docs"):
+        out["found_more"] = int(calls.get("found_more") or 0) + dropped["found_docs"]
+    return out, dropped
+
+
 def trim_to_budget(manifest: dict | None, items: dict, coverage: dict,
                    reviews: list | None = None) -> tuple[dict | None, dict, dict, list, bool]:
     """`trim_record` の旧形式の戻り値（何か落としたら `truncated=True`）。戻り値は `(manifest, items, coverage, reviews, truncated)`。"""

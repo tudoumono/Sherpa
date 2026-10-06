@@ -11,7 +11,7 @@ import {
 } from './render.js';
 import { loadConversations, syncConvParam } from './history.js';
 import { updateScopeHeader } from './scope.js';
-import { isSimpleMode, setInquiryOpen, toolsForSend, toolsExplicitForSend } from './inquiry.js';
+import { isSimpleMode, normalizeLens, setInquiryOpen, toolsForSend, toolsExplicitForSend } from './inquiry.js';
 import { updateShareButtonState } from '../chat.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime;
@@ -384,7 +384,7 @@ export function subscribeTurn(thinking) {
   };
 }
 // 入力欄の質問を送信する（POST /chat/turns → SSE 購読）。
-// override（省略可）: {lens, layer, scope_paths, depth_profile, tools} の指定キーだけ、この1回の送信でブロックの設定の代わりに使う（確認カードの回答再送用）。
+// override（省略可）: {lens, scope_paths, depth_profile, tools, doc_focus} の指定キーだけ、この1回の送信でブロックの設定の代わりに使う（確認カードの回答再送用）。
 export async function send(override) {
   // S.es（ストリーミング中）と S.sending（開始 POST 応答待ち）の両方で二重送信を防ぐ
   if (S.es || S.sending) return;
@@ -406,12 +406,11 @@ export async function send(override) {
   if (S.cid) body.conversation_id = S.cid;
   // Web 検索は true のときだけ載せる
   if (S.kb && S.webSearch && !isSimpleMode()) body.web_search = true;
-  // 範囲・調べ方・探す対象・深さ・検索経路はナレッジ参照オンのときだけ送り、既定値は省略する。override のキーはこの1回だけ優先する
+  // 範囲・調べ方・資料中心・深さ・検索経路はナレッジ参照オンのときだけ送り、既定値は省略する。override のキーはこの1回だけ優先する
   if (S.kb) {
     const ov = override || {};
     const scopePaths = Object.prototype.hasOwnProperty.call(ov, 'scope_paths') ? ov.scope_paths : S.scope;
     const lens = Object.prototype.hasOwnProperty.call(ov, 'lens') ? ov.lens : S.lens;
-    const layer = Object.prototype.hasOwnProperty.call(ov, 'layer') ? ov.layer : S.layer;
     const depthProfile = Object.prototype.hasOwnProperty.call(ov, 'depth_profile') ? ov.depth_profile : S.depthProfile;
     // override の tools は解決済みの値＝全軸明示扱いで省略せず渡す
     const isOverride = Object.prototype.hasOwnProperty.call(ov, 'tools');
@@ -419,8 +418,13 @@ export async function send(override) {
     body.scope_paths = scopePaths || [];
     // 簡易は調べ方・深さ・検索経路が効かない（画面でも隠している）＝送らない。
     const simple = isSimpleMode();
-    if (!simple && lens && lens !== 'auto') body.lens = lens;
-    if (layer && layer !== 'both') body.layer = layer;
+    // 調べ方は investigate／author だけを送る（保存済みの古い値は調べるに読み替える）。簡易は効かないため送らない。
+    if (!simple) {
+      const mode = normalizeLens(lens);
+      body.lens = mode;
+      const docFocus = Object.prototype.hasOwnProperty.call(ov, 'doc_focus') ? ov.doc_focus : S.docFocus;
+      if (mode === 'investigate' && docFocus) body.doc_focus = true;
+    }
     if (!simple && depthProfile && depthProfile !== 'standard') body.depth_profile = depthProfile;
     // 未操作の既定 ON だけを省略する（toolsForSend）。空になれば body.tools 自体を省く
     if (tools && !simple) {

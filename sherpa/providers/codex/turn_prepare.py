@@ -15,7 +15,8 @@ from . import sandbox
 from .ledger_gate import (
     _FINAL_ANSWER_VOICE,
     _investigation_tree_has_symlink,
-    _ledger_source_required_extra,
+    _required_extra_for_state,
+    _scope_source_state,
     _restore_investigation_ledger,
 )
 from .sandbox import (
@@ -109,7 +110,8 @@ def prepare_run(self, ctx, st, decision):
     st.sp, st._layer = sp, _layer
     # 台帳の完了判定へ足す source の必須化は、ターンの最初に1回だけ決め、このターンの台帳ゲート呼び出し全て（required_extra・AGENTS.md の台帳段落・ledger_status への env）へ同じ値を渡す。判定は MCP へ実際に渡す実効の層＝`_layer` を使う。plain も台帳ツールを出さないため計算しない。
     if not _plain:
-        st._ledger_required_extra = _ledger_source_required_extra(ctx.world, sp, _layer)
+        st._scope_source_state = _scope_source_state(ctx.world, sp, _layer)
+        st._ledger_required_extra = _required_extra_for_state(st._scope_source_state)
     _layer_restricted = _layer not in (None, "both")
     # 層のフィルタは MCP ツール側（run_tool）だけが担う。sandbox 無効の構成では層の指定をツールに渡す経路が無いため、黙って無視せず実行前に正直に失敗する。
     _layer_enforcement_ready = _codex_sandbox_enabled()
@@ -235,9 +237,11 @@ def prepare_run(self, ctx, st, decision):
         _codex_msg = f"{_codex_msg}\n\n【前回の続き】\n{_continuation_review_note}"
     def _build_prompt(with_history: bool) -> str:
         if _plain:
-            return self._prompt_plain(_codex_msg, decision["lens"], ctx.world, with_history=with_history)
+            return self._prompt_plain(_codex_msg, decision["lens"], ctx.world, with_history=with_history,
+                                      doc_focus=ctx.doc_focus)
         return self._prompt_mcp(_codex_msg, decision["lens"], ctx.world,
-                                direct_read=_direct_read_ok, layer=_layer, with_history=with_history)
+                                direct_read=_direct_read_ok, layer=_layer, with_history=with_history,
+                                doc_focus=ctx.doc_focus)
     build_launch(self, ctx, st)
     log_turn_start(self, ctx, st)
     # 起動前の準備で決まった値を `st` へ渡す（以後の段と `_attempt` は `st` から読む）。

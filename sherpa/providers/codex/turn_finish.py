@@ -8,15 +8,17 @@ from pathlib import Path
 
 from ... import agentic_search, investigation_ledger, workspace_limits
 from ...investigation_record_render import describe_dropped
-from ...store.investigation_records import trim_record
+from ...store.investigation_records import trim_calls, trim_record
 from ... import layer as layer_mod
-from ...answer_shape import STOPPED_EARLY_NOTICE, STOPPED_NOTICE, add_notice, seal, set_body
+from ...answer_shape import NO_TOOL_USE_NOTICE, STOPPED_EARLY_NOTICE, STOPPED_NOTICE, add_notice, seal, set_body
 from ..base import _evidence_gate_note, _log, _node, _verified_sources
 from .citations import parse_referenced_doc_lines, resolve_referenced_docs
+from .call_log import call_record_sections, call_stats, finalize_call_log, found_docs_for_answer, referenced_docs_for_answer
 from .codex_cli import apply_codex_usage, log_turn_end
-from .ledger_gate import _format_unconfirmed_items_section, _retire_investigation_ledger, _unconfirmed_items_list
+from .ledger_gate import _format_unconfirmed_items_section, _retire_investigation_ledger, _scope_no_source_notice, _unconfirmed_items_list
 from .mcp import _apply_codex_neighbors
 from .continuation import _pick_codex_headline
+from .impact_list import REASON_NO_RECORD, build_impact_list
 from .process import _CONTEXT_WINDOW_EXCEEDED_CODE, _masked_run_dir_path, _read_last_message_fallback
 from .sandbox import _detect_chrome_path, _marp_bin
 from .structured import _DEMOTED_CLAIMS_NOTE, _INVALID_CLAIMS_NOTE, split_review_preamble, _apply_codex_evidence_gate, _claims_vs_ledger, verify_reconciliation
@@ -71,6 +73,7 @@ def close_session(self, ctx, st, decision, env):
     codex_created_files = st.codex_created_files
     _wall_clock_state = st._wall_clock_state
     log_turn_end(ctx, st, env)
+    finalize_call_log(ctx, st)
     # ask_user が出たターンは question 優先＝env/_result・成果物台帳登録を出さずここで終了する（回答は chat.js の整形再送＝新 codex exec で拾う）。proc は直上の finally で後始末済み。chat_service はこの question を answer.question として保存する。
     codex_question = st.codex_question
     if codex_question is not None and not (ctx.stop_event is not None and ctx.stop_event.is_set()):
@@ -134,13 +137,23 @@ def close_session(self, ctx, st, decision, env):
         # この時点の台帳の正規形を env とは別項目に積む。本文・path は `_investigation_snapshot` 側の検証（`validate_item`）で除外済み。`load_coverage` は item ごとの outcome タプルのみ（本文を持たない）。`reviews`（本文を持つ・`validate_review_entry()` 済みの正規形のみ）も調査の記録の一部として積む（`investigation_record_render.py` の素材）。
         # 保存の大きさの上限で落とすものがあれば、ここで先に切り詰めて内訳を記録に残し、回答の注記にも出す。
         _reviews_report = investigation_ledger.load_reviews_report(st._investigation_dir)[1]
+        _snap_items = dict(st._investigation_snapshot.items)
+        _snap_coverage = {k: list(v) for k, v in investigation_ledger.load_coverage(st._investigation_dir).items()}
+        _snap_cov_detail = investigation_ledger.load_coverage_detail(st._investigation_dir)
+        # 調べた経路・見つかった資料は他の欄より先に落とす（落とした件数は記録に残す）。
+        _rec_calls, _calls_dropped = trim_calls(
+            st._investigation_snapshot.manifest, _snap_items, _snap_coverage, list(st._investigation_reviews),
+            _snap_cov_detail, call_record_sections(st))
         (_rec_manifest, _rec_items, _rec_coverage, _rec_reviews, _rec_cov_detail,
          _rec_dropped) = trim_record(
-            st._investigation_snapshot.manifest, dict(st._investigation_snapshot.items),
-            {k: list(v) for k, v in investigation_ledger.load_coverage(st._investigation_dir).items()},
-            list(st._investigation_reviews),
-            investigation_ledger.load_coverage_detail(st._investigation_dir))
+            st._investigation_snapshot.manifest, _snap_items, _snap_coverage, list(st._investigation_reviews),
+            _snap_cov_detail)
+        _rec_dropped = {**_rec_dropped, **_calls_dropped}
         _extras: dict = {}
+        if _rec_calls is not None:
+            _extras["calls"] = _rec_calls
+        if st.call_log is not None and st.call_log.missing:
+            _extras["call_log_missing"] = st.call_log.missing  # 記録の欠け N 行
         if _rec_dropped:
             _extras["dropped"] = _rec_dropped
             st._record_notes.append(describe_dropped(_rec_dropped))
@@ -156,6 +169,11 @@ def close_session(self, ctx, st, decision, env):
             "coverage_detail": _rec_cov_detail,
             "extras": _extras,
         }
+    _call_stats = call_stats(st)
+    if _call_stats is not None:
+        env["call_stats"] = _call_stats  # 道具ごとの累計（利用統計の材料・中身は持たない）
+    if st._call_log_dir is not None and decision["lens"] != "author":
+        env["tool_use"] = {"v": 1, "verdict": st._tool_use.verdict(), "nudged": bool(st._tool_zero_nudged)}  # 道具ゼロの促しの有無（利用統計の材料）
     # `_schema_on` は構造化 message から見出しを選ぶ（生 JSON をそのまま出さない・平文ヒューリスティックへは戻さない）。無効時は現行どおりの選び方（下記）。
     if _schema_on:
         st.answer = _pick_structured_headline(st)
@@ -404,6 +422,20 @@ def assemble_result(self, ctx, st, decision, env):
             # 実際に開いて根拠にした資料＝API 経路の「精読済み」と同じ意味＝出典の 2 区分（根拠／参考）に載せる。`xlsx_sheets` だけで到達した doc_id（`_listed_only_ids`）は除く。
             env["sources_verified"] = sorted(_ref_ids - _listed_only_ids)
         env["codex_referenced_docs"] = {"listed": len(_ref_candidates), "verified": len(_verified_refs)}
+        # 新しい形の「参照した資料」（資料ごとの開いた行の範囲）。資料参照がオンの作成以外のターンだけ・0 件でも欄を入れる。
+        if ctx.make_sources and decision["lens"] != "author":
+            _ref_rows, _ref_more = referenced_docs_for_answer(st, _verified_refs)
+            env["referenced_docs"] = _ref_rows
+            if _ref_more:
+                env["referenced_docs_more"] = _ref_more
+        # 検索で見つかったが Sherpa の読み取り道具で開かれず「参照した資料」にも無い資料（秘匿の資料名は件数）。
+        _found, _found_hidden, _found_more = found_docs_for_answer(st, [_verified_refs, _ref_candidates])
+        if _found:
+            env["found_docs"] = _found
+        if _found_hidden:
+            env["found_docs_hidden"] = _found_hidden
+        if _found_more:
+            env["found_docs_more"] = _found_more
         # 「参照した資料」の行のうち検証を通らなかったもの（理由つき・秘匿名は名前を出さず件数だけ）。
         _unverified_total = len(_unverified_refs) + _sensitive_refs
         if _unverified_total:
@@ -455,7 +487,7 @@ def assemble_result(self, ctx, st, decision, env):
                 env["limits"] = {**(env.get("limits") or {}),
                                  "claims_unmatched": _claims_ledger_check.get("downgraded", 0) > 0}
                 if decision["lens"] != "author":
-                    _gate_note = _evidence_gate_note(_gate_missing, _gate_unavailable)
+                    _gate_note = _evidence_gate_note(_gate_missing, ())  # ソースが範囲に無い旨は `scope_no_source` の注記で出す
                     # 種別ゲート・台帳突合のどちらかで confirmed が1件でも格下げされたら同じ注記を出す（二重には付けない・`_gate_missing` があるターンは既に注記が格下げを示唆しているため重ねない）。
                     _any_claims_demoted = (
                         _gate_meta["demoted"] > 0
@@ -534,6 +566,10 @@ def assemble_result(self, ctx, st, decision, env):
         _no_answer_detail = ("（未応答のため回答を出せませんでした）" if _skip_presearch
                              else "（未応答のため決定的回答に切替）")
         yield _node("codex", "think", "Codex が調べる", _no_answer_detail, "done")
+    # 範囲にソースが無い（または探す対象が資料だけ）ときは、止めず・格下げせず、必ずこの注記を出す。
+    _no_source_text = _scope_no_source_notice(st._scope_source_state, st._layer)
+    if _no_source_text:
+        add_notice(env, "scope_no_source", _no_source_text)
     # 台帳の確認できなかった項目を、回答の末尾へ機械的に付ける（AI は使わない・無ければ付けない）。本文を選べなかったターン（無出力・未応答）でも台帳から作って返す。`_investigation_snapshot` は降格適用後の状態で `env["investigation"]["counts"]` と一致する。同じリストを `env["investigation"]["unconfirmed_items"]` にも構造化形で載せる（Codex ジョブ API の `unconfirmed_items` の正本）。
     if st._investigation_snapshot is not None:
         _unconfirmed_items = _unconfirmed_items_list(st._investigation_snapshot)
@@ -563,6 +599,15 @@ def assemble_result(self, ctx, st, decision, env):
         # headline がどの分岐で組み立てられていても、時間の上限で打ち切った事実は一律に伝える。「打ち切りの内訳」（利用統計）へも記録する。
         add_notice(env, "wall_clock", _WALL_CLOCK_LIMIT_NOTE)
         env["limits"] = {**(env.get("limits") or {}), "wall_clock_hit": True}
+    # 影響一覧: Codex がグラフの道具でたどった結果の記録から作る（要約ではない）。たどっていなければ「影響をたどっていません」。
+    try:
+        _impact_list = build_impact_list(st, env, decision)
+    except Exception as exc:
+        _impact_list = ({"v": 1, "traced": False, "rows": [], "reasons": [REASON_NO_RECORD], "more": 0}
+                        if (decision or {}).get("lens") == "impact" else None)
+        _log.warning("impact list build failed: %s", type(exc).__name__)
+    if _impact_list is not None:
+        env["impact_list"] = _impact_list
     _finish_partial_status(ctx, st, env)
     yield {"type": "answer_delta", "text": env["headline"]}  # Codex は一括→フロントで段階表示
     yield {"type": "_result", "env": env, "decision": decision,
@@ -577,6 +622,8 @@ def _finish_partial_status(ctx, st, env):
     for _n in st._answer_notices:
         _kind, _text = _n if isinstance(_n, tuple) else ("answer_recovery", _n)
         add_notice(env, _kind, _text)
+    if st._tool_zero_notice:
+        add_notice(env, "no_tool_use", NO_TOOL_USE_NOTICE)
     if st._codex_stopped_early:
         add_notice(env, "stopped_early", STOPPED_EARLY_NOTICE)
     if st._trimmed:

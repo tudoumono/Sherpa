@@ -5,7 +5,7 @@
 
 import { S } from './state.js';
 import { toast } from '../chat.js';
-import { refreshInquirySummary, setToolsDetailsOpen, toolsExplicitForRestore } from './inquiry.js';
+import { refreshInquirySummary, setToolsDetailsOpen, toolsExplicitForRestore, normalizeLens } from './inquiry.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;
 
@@ -28,21 +28,23 @@ export function updateScopeHeader(scope) {     // answer.scope → 実際に使�
   const labels = paths.map((p) => S.scopeLabels[p] || p.split('/').pop()).join('・');
   setScopeLabel(labels);
 }
-// lens_source から復元する調べ方を決める。explicit は実効レンズ、slash はブロックの継続設定（lens_block）、それ以外は自動。
+// 復元する調べ方（investigate／author）を決める。how があればそれ、無い古い回答は explicit は実効レンズ・slash はブロックの継続設定（lens_block）を読み替える。
 function _lensToRestore(ans, sc) {
-  if (!ans || !sc) return 'auto';
-  if (sc.lens_source === 'explicit' && ans.lens) return ans.lens;
-  if (sc.lens_source === 'slash') return sc.lens_block || 'auto';
-  return 'auto';
+  if (!ans || !sc) return 'investigate';
+  if (sc.lens_source === 'slash') return normalizeLens(sc.lens_block);   // スラッシュは 1 回限り＝継続設定へ戻す
+  if (ans.how && ans.how.mode) return normalizeLens(ans.how.mode);
+  if (sc.lens_source === 'explicit' && ans.lens) return normalizeLens(ans.lens);
+  return 'investigate';
 }
-// 会話を開いたとき、最後の回答の範囲・調べ方・探す対象・検索経路を復元する。
+// 会話を開いたとき、最後の回答の範囲・調べ方・資料中心・検索経路を復元する。
 export function applyConversationScope(messages) {
   const last = [...messages].reverse().find((m) => m.role !== 'user' && m.answer);
   const ans = last ? last.answer : null;
   if (ans && ans.lens) setKb(ans.lens !== 'chat');   // 直近が資料参照ならナレッジ参照オンに戻す
   const rawSc = ans ? ans.scope : null;
   // 復元する調べ方を sc のコピーへ埋め込む（後追い復元も S.currentScopeMeta 経由で同じ値を使う）
-  const sc = rawSc ? { ...rawSc, lens_restore: _lensToRestore(ans, rawSc) } : null;
+  const sc = rawSc ? { ...rawSc, lens_restore: _lensToRestore(ans, rawSc),
+    doc_focus_restore: !!(ans.how && ans.how.doc_focus) } : null;
   // セレクタを会話の資料フォルダへ合わせる（別フォルダの範囲を送らない）
   const sel = $('version');
   if (sc && sc.world && sel) {
@@ -55,8 +57,8 @@ export function applyConversationScope(messages) {
   }
   const sameDir = !sc || !sc.world || !sel || sc.world === sel.value;
   S.scope = (sameDir && sc && sc.source === 'explicit') ? (sc.scope_paths || []).slice() : [];   // 同じ資料フォルダの明示選択だけ復元
-  S.lens = (sameDir && sc) ? sc.lens_restore : 'auto';
-  S.layer = (sameDir && sc && sc.layer) ? sc.layer : 'both';
+  S.lens = (sameDir && sc) ? sc.lens_restore : 'investigate';
+  S.docFocus = !!(sameDir && sc && sc.doc_focus_restore);
   S.depthProfile = (sameDir && sc && sc.depth_profile) ? sc.depth_profile : 'standard';
   S.webSearch = !!(sameDir && sc && sc.web_search);
   // 検索経路トグルの復元（欠落は全ON）。詳細の折りたたみは開き直すたびに閉じる
@@ -129,9 +131,8 @@ export function renderScopePanel(tree) {
 }
 function updateScopeVisibility() {   // 範囲セレクタは「ナレッジ参照オン」かつ「選べる範囲あり」のときだけ
   $('scopesel').style.display = (S.kb && _scopeAvail) ? '' : 'none';
-  // 調べ方ブロックの行も同じ条件で出し分ける（範囲＝参照ON＋選べる範囲あり・探す対象と深さ＝参照ON）
+  // 調べ方ブロックの行も同じ条件で出し分ける（範囲＝参照ON＋選べる範囲あり・深さ＝参照ON）
   $('scope-row').hidden = !(S.kb && _scopeAvail);
-  $('layer-row').hidden = !S.kb;
   $('depth-row').hidden = !S.kb;
   refreshInquirySummary();
 }

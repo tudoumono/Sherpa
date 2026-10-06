@@ -107,14 +107,14 @@ def test_ascii_cue_requires_word_boundary():
 # ---- 調べ方ブロック（2026-08-29-調べ方ブロック.md §3.1・裁定11）: スラッシュ指定の1回限りの明示 ----
 
 def test_extract_slash_lens_all_four_words():
-    assert R.extract_slash_lens("/影響 消費税率を変えたい") == ("impact", "消費税率を変えたい")
-    assert R.extract_slash_lens("/原因 夜間バッチが止まった") == ("troubleshoot", "夜間バッチが止まった")
-    assert R.extract_slash_lens("/内容 消費税の端数処理は？") == ("qa", "消費税の端数処理は？")
+    assert R.extract_slash_lens("/影響 消費税率を変えたい") == ("investigate", "消費税率を変えたい")
+    assert R.extract_slash_lens("/原因 夜間バッチが止まった") == ("investigate", "夜間バッチが止まった")
+    assert R.extract_slash_lens("/内容 消費税の端数処理は？") == ("investigate", "消費税の端数処理は？")
     assert R.extract_slash_lens("/作成 一覧表にして") == ("author", "一覧表にして")
 
 
 def test_extract_slash_lens_fullwidth_space():
-    assert R.extract_slash_lens("/影響　消費税率") == ("impact", "消費税率")
+    assert R.extract_slash_lens("/影響　消費税率") == ("investigate", "消費税率")
 
 
 def test_extract_slash_lens_no_match_returns_original():
@@ -169,3 +169,4 @@ def test_confirm_first_decision_passes_through_tools_to_question():
     d = R.confirm_first_decision("なにか。確認してから進めて。",
                                  tools={"grep": True, "fulltext": False, "graph": True})
     assert d["question"]["tools"] == {"grep": True, "fulltext": False, "graph": True}
+

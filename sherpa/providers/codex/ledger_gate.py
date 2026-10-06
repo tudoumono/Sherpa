@@ -210,17 +210,33 @@ def _unconfirmed_items_section(snapshot: investigation_ledger.LedgerSnapshot) ->
     return _format_unconfirmed_items_section(_unconfirmed_items_list(snapshot))
 
 
-def _ledger_source_required_extra(world: str, scope_paths, layer) -> tuple[str, ...]:
-    """このターンの台帳ゲートへ渡す `required_extra`。範囲にソースがある調査は、item の `required_checks` に source が無くても完了判定へ source を足す（ソースは常に必須）。
-    `layer` は MCP へ実際に渡す実効の層（qa 以外は `None`）を渡すこと。
-    `layer == "docs"` なら source を必須にしない（MCP のソース読取が層で拒否されるため）。それ以外の層では `_scope_evidence_kinds(world, scope_paths, layer)` の1つ目の要素（登録範囲に実在するか）で判定する。走査が判定不能（`None`）なら source を必須のままにする。
-    """
-    if layer == "docs":
-        return ()
+def _scope_source_state(world: str, scope_paths, layer) -> str:
+    """範囲のソースの有無（探す対象＝層には依存しない）。`present`（ある）／`absent`（走査できてソースが無い）／`unknown`（走査の失敗・判定不能）。"""
     scope_kinds = _scope_evidence_kinds(world, scope_paths, layer)
-    if scope_kinds is None or "source" in scope_kinds[0]:
-        return ("source",)
-    return ()
+    if scope_kinds is None:
+        return "unknown"
+    return "present" if "source" in scope_kinds[0] else "absent"
+
+
+def _ledger_source_required_extra(world: str, scope_paths, layer) -> tuple[str, ...]:
+    """このターンの台帳ゲートへ渡す `required_extra`。範囲にソースがあるか判定不能なら、item の `required_checks` に source が無くても完了判定へ source を足す（ソースは常に必須）。
+    ソースが無い範囲のときは足さず、`required_checks` の source も必須から外す（`SOURCE_EXEMPT`・止めず・格下げせず、回答の注記で必ず知らせる＝`_scope_no_source_notice`）。
+    """
+    return _required_extra_for_state(_scope_source_state(world, scope_paths, layer))
+
+
+def _required_extra_for_state(state: str) -> tuple[str, ...]:
+    """`_scope_source_state` の結果から台帳ゲートへ足す必須種別を決める。"""
+    return (investigation_ledger.SOURCE_EXEMPT,) if state == "absent" else ("source",)
+
+
+def _scope_no_source_notice(state: str, layer=None) -> str:
+    """範囲にソースが無い、または探す対象が資料だけでソースを調べていないときの回答の注記（無ければ空文字）。"""
+    if state == "absent":
+        return "選んだ範囲にソースがありませんでした。"
+    if layer == "docs":
+        return "探す対象を資料だけにしているため、ソースは調べていません。"
+    return ""
 
 
 def _ledger_progressed(

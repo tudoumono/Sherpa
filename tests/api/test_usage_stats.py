@@ -153,7 +153,7 @@ def test_usage_stats_aggregates_seeded_conversations_and_audit():
     heavy, light = _urow(data, heavy_uid), _urow(data, light_uid)
     assert heavy["turns"] == 3
     assert heavy["conversations"] == 2
-    assert heavy["lens"] == {"impact": 1, "qa": 1, "troubleshoot": 1, "chat": 0}
+    assert heavy["lens"] == {"impact": 1, "qa": 1, "troubleshoot": 1, "chat": 0, "investigate": 0, "author": 0}
     assert heavy["personal_turns"] == 1
     assert heavy["worlds"] == [world]
     assert heavy["logins"] == 2
@@ -163,7 +163,7 @@ def test_usage_stats_aggregates_seeded_conversations_and_audit():
     assert heavy["display_name"] == f"表示名-{heavy_uid}"
     assert light["turns"] == 1
     assert light["conversations"] == 1
-    assert light["lens"] == {"impact": 0, "qa": 0, "troubleshoot": 0, "chat": 1}
+    assert light["lens"] == {"impact": 0, "qa": 0, "troubleshoot": 0, "chat": 1, "investigate": 0, "author": 0}
     assert light["personal_turns"] == 0
     assert light["worlds"] == [world_b]
     assert light["logins"] == 0
@@ -229,7 +229,7 @@ def test_usage_stats_assistant_only_rows_do_not_count_as_activity():
 
     row = _urow(data, uid_stray)
     assert row["turns"] == 1
-    assert row["lens"] == {"impact": 1, "qa": 0, "troubleshoot": 0, "chat": 0}, row["lens"]
+    assert row["lens"] == {"impact": 1, "qa": 0, "troubleshoot": 0, "chat": 0, "investigate": 0, "author": 0}, row["lens"]
 
 
 def test_usage_stats_daily_buckets_by_jst_not_utc():
@@ -729,7 +729,7 @@ def test_usage_stats_period_prefilter_does_not_leak_orphan_reply_across_boundary
 
     row = _urow(_stats(admin, 7), uid)
     assert row["turns"] == 1, f"古いターンが期間内に混入した: turns={row['turns']}"
-    assert row["lens"] == {"impact": 1, "qa": 0, "troubleshoot": 0, "chat": 0}, \
+    assert row["lens"] == {"impact": 1, "qa": 0, "troubleshoot": 0, "chat": 0, "investigate": 0, "author": 0}, \
         f"孤立 assistant 返信が期間内ターンの lens に混入した: {row['lens']}"
 
 
@@ -1277,3 +1277,24 @@ def test_admin_usage_quality_run_rejects_non_finite_cost(literal):
                    headers={"content-type": "application/json"})
     assert r.status_code == 422, r.text
     assert admin.get("/admin/usage/stats?days=1").status_code == 200   # 利用統計は壊れない
+
+
+def test_usage_stats_adds_tool_use_impact_and_new_lens_counts():
+    """促し・開いた資料・影響一覧の件数と investigate/author の内訳が、追加前後の差分として足し上がる（過去の種類は変わらない）。"""
+    _try_init()
+    admin = _admin()
+    uid = _mk("usgtu")
+    before = _stats(admin)
+    conv = store.create_conversation(user_id=uid, world=_sfx())
+    _turn_with_answer(conv["id"], "q1", lens="investigate", answer={
+        "tool_use": {"v": 1, "verdict": "used", "nudged": True},
+        "call_stats": {"v": 1, "calls": 0, "missing": 0, "opened": 2, "opened_unknown": False, "tools": []},
+        "impact_list": {"v": 1, "traced": True, "rows": [{"state": "candidate"}, {"state": "used"}]}})
+    _turn_with_answer(conv["id"], "q2", lens="author", answer={})
+    after = _stats(admin)
+    assert _urow(after, uid)["lens"] == {"impact": 0, "qa": 0, "troubleshoot": 0, "chat": 0, "investigate": 1, "author": 1}
+    tb, ta = before["tool_calls"], after["tool_calls"]
+    assert ta["nudged_turns"] - tb["nudged_turns"] == 1 and ta["nudged_then_used"] - tb["nudged_then_used"] == 1
+    assert ta["opened_docs"] - tb["opened_docs"] == 2
+    ib, ia = before["impact"], after["impact"]
+    assert (ia["traced_turns"] - ib["traced_turns"], ia["candidate"] - ib["candidate"], ia["used"] - ib["used"]) == (1, 1, 1)

@@ -14,7 +14,7 @@ _INVESTIGATION_STATUS_COMPLETED = "sufficient"
 # evidence_selected==0 のフォールバック判定（`is_honest_failure`）からも除外する
 INCOMPLETE_STOP_REASONS = ("truncated", "content_filtered", "unknown", "refusal", "tools_per_turn_exceeded")
 # 検索を伴うレンズだけを honest_failure 判定の対象にする
-_KNOWLEDGE_LENSES = ("qa", "impact", "troubleshoot")
+_KNOWLEDGE_LENSES = ("investigate", "qa", "impact", "troubleshoot")
 # 現在コードが生成しうる stop_reason の閉じた語彙。`_resolve_stop_reason` は語彙に無い値・非文字列を `"unknown"` へ正規化する
 _KNOWN_STOP_REASONS = frozenset(HONEST_FAILURE_STOP_REASONS) | frozenset(INCOMPLETE_STOP_REASONS) | {
     "no_tool_calls", "evaluation_sufficient", "turns_exhausted", "budget_exceeded",

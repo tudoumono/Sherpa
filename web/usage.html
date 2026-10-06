@@ -39,6 +39,8 @@
   /* lens ミニバー（app.css の既存トーン＝teal/green/amber/gray。値ラベルは常設＝色のみに頼らない） */
   .lensbar{display:flex;gap:2px;height:10px;border-radius:5px;overflow:hidden;background:var(--border);margin-bottom:8px}
   .lensbar .seg{min-width:2px}
+  .seg-investigate{background:var(--accent)}
+  .seg-author{background:var(--ok)}
   .seg-impact{background:var(--accent)}
   .seg-qa{background:var(--ok)}
   .seg-troubleshoot{background:var(--warn)}
@@ -383,6 +385,30 @@
           <tbody id="limits-tbody"></tbody>
         </table>
         <p class="hint">記録された件数を表示します。値のない項目は「未計測」です。Codexの履歴の整理（文脈の圧縮）は現在未計測のため、集計の0も「未計測」と表示します。正の記録がある場合は、その件数を表示します。</p>
+      </div>
+
+      <div class="card" style="overflow-x:auto;margin-bottom:14px">
+        <div class="chart-title">道具の使われ方</div>
+        <table>
+          <thead>
+            <tr>
+              <th>道具</th>
+              <th class="num">回数</th>
+              <th class="num">見つかった件数</th>
+              <th class="num">平均の時間</th>
+              <th class="num">失敗</th>
+              <th class="num">打ち切り</th>
+              <th class="num">本体の回数</th>
+              <th class="num">下調べ役の回数</th>
+              <th class="num">判定できない回数</th>
+            </tr>
+          </thead>
+          <tbody id="tool-calls-tbody"></tbody>
+        </table>
+        <p class="hint" id="tool-calls-summary"></p>
+        <p class="hint">資料の件数は調べた量の目安で、回答の正しさを示すものではありません。</p>
+        <div class="chart-title" style="margin-top:12px">影響一覧</div>
+        <p class="hint" id="impact-summary"></p>
       </div>
 
       <section class="card" id="review-stats-card" aria-labelledby="review-stats-heading" style="overflow-x:auto;margin-top:28px;margin-bottom:14px">

@@ -40,7 +40,9 @@ _METRIC_COLUMNS = (
     "children_detected", "children_usage_found", "children_usage_missing",
     "tool_calls_total", "tool_result_bytes_total", "api_rounds_total", "compactions_total",
 ) + _USAGE_LIMIT_INT_FIELDS + _USAGE_LIMIT_BOOL_FIELDS + (
-    "sources_count",
+    "sources_count", "call_log_missing",
+    "tool_use_verdict", "tool_zero_nudged", "opened_docs_count", "opened_unknown",
+    "impact_traced", "impact_counts",
     "investigation_complete", "investigation_continuations", "investigation_counts",
     "claims_confirmed", "claims_inferred", "claims_unknown", "claims_unknown_reasons",
     "gate_missing_codes",
@@ -50,7 +52,8 @@ _METRIC_COLUMNS = (
 
 # JSONB 列（`Json(...)` で包んで渡す列）。
 _JSONB_COLUMNS = frozenset({"investigation_counts", "claims_unknown_reasons",
-                            "gate_missing_codes", "activity_json", "notice_kinds"})
+                            "gate_missing_codes", "activity_json", "notice_kinds",
+                            "impact_counts"})
 
 
 # answer は外部由来の JSON なので型を信用しない防御的読み取りヘルパ。
@@ -183,6 +186,61 @@ def _tool_stat_rows(agents: list) -> list[tuple]:
                 _pos_int_or_none(t.get("errors")), _pos_int_or_none(t.get("ms")),
             ))
     return rows
+
+
+_CALL_ROLES = ("parent", "child", "undetermined")
+
+
+def _call_stats_dict(answer: dict) -> dict | None:
+    """`answer["call_stats"]`（道具ごとの累計）が契約どおりの形（`v==1` かつ `tools` が配列）なら返し、そうでなければ None（旧い回答・簡易は None）。"""
+    cs = answer.get("call_stats")
+    if not isinstance(cs, dict) or cs.get("v") != 1 or not isinstance(cs.get("tools"), list):
+        return None
+    return cs
+
+
+def _call_stat_rows(answer: dict) -> list[tuple]:
+    """`(role, tool, calls, found, ms, errors, truncated)` のタプル列（同じ role×tool は合算・中身は持たない）。"""
+    cs = _call_stats_dict(answer)
+    acc: dict[tuple, list] = {}
+    for t in (cs["tools"] if cs else []):
+        if not isinstance(t, dict) or not isinstance(t.get("tool"), str) or not t["tool"]:
+            continue
+        key = (t["role"] if t.get("role") in _CALL_ROLES else "undetermined", t["tool"])
+        row = acc.setdefault(key, [0, 0, 0, 0, 0])
+        for i, f in enumerate(("calls", "found", "ms", "errors", "truncated")):
+            row[i] += _clamp_int(t.get(f))
+    return [(role, tool, *v) for (role, tool), v in sorted(acc.items())]
+
+
+_TOOL_USE_VERDICTS = ("used", "unused", "undetermined")
+_IMPACT_STATES = ("candidate", "inspected", "used", "unmapped")
+
+
+def _tool_use_fields(answer: dict, cs: dict | None) -> dict:
+    """促し（`answer.tool_use`）・開いた資料の件数（`call_stats.opened`）・影響一覧の件数（`answer.impact_list`）。無いものは None（名前・パスは持たない）。"""
+    tu = answer.get("tool_use")
+    tu = tu if isinstance(tu, dict) and tu.get("v") == 1 else None
+    opened = cs.get("opened") if cs else None
+    il = answer.get("impact_list")
+    il = il if isinstance(il, dict) and il.get("v") == 1 else None
+    counts = None
+    if il is not None:
+        counts = {k: 0 for k in _IMPACT_STATES}
+        for row in il.get("rows") if isinstance(il.get("rows"), list) else []:
+            if isinstance(row, dict) and row.get("state") in counts:
+                counts[row["state"]] += 1
+        for key in ("more", "hidden"):
+            v = il.get(key)
+            counts[key] = v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+    return {
+        "tool_use_verdict": tu.get("verdict") if tu and tu.get("verdict") in _TOOL_USE_VERDICTS else None,
+        "tool_zero_nudged": bool(tu.get("nudged")) if tu else None,
+        "opened_docs_count": _clamp_int(opened) if cs and isinstance(opened, int) else None,
+        "opened_unknown": bool(cs.get("opened_unknown")) if cs and isinstance(opened, int) else None,
+        "impact_traced": bool(il.get("traced")) if il is not None else None,
+        "impact_counts": counts,
+    }
 
 
 def _limit_fields(limits) -> dict:
@@ -389,6 +447,11 @@ def metrics_from_answer(answer: dict) -> dict:
     # 出典件数。
     out["sources_count"] = _sources_count(answer)
 
+    # 道具の呼び出しの記録の欠け（行数）。`call_stats` の無い回答は NULL。
+    cs = _call_stats_dict(answer)
+    out["call_log_missing"] = _clamp_int(cs.get("missing")) if cs else None
+    out.update(_tool_use_fields(answer, cs))
+
     # 調査台帳。
     out.update(_investigation_fields(answer.get("investigation")))
 
@@ -470,6 +533,15 @@ def upsert(c, *, message_id: int, conversation_id: int, created_at, lens: str | 
                 f"VALUES {_tool_stats_values_sql(len(rows))}",
                 flat,
             )
+    _write_call_stats(c, message_id, answer)
+
+
+def _write_call_stats(c, message_id: int, answer: dict) -> None:
+    """`turn_call_stats` を 1 メッセージ分洗い替える（`call_stats` の無い回答は行を持たない）。"""
+    c.execute("DELETE FROM turn_call_stats WHERE message_id=%s", (message_id,))
+    for row in _call_stat_rows(answer):
+        c.execute("INSERT INTO turn_call_stats (message_id, role, tool, calls, found, ms, errors, truncated) "
+                  "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (message_id, *row))
 
 
 def upsert_best_effort(c, *, message_id: int, conversation_id: int, created_at, lens: str | None,

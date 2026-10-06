@@ -22,6 +22,8 @@ _STATUS_LABELS = {
 _EVIDENCE_KIND_LABELS = {
     "source": "ソース", "spec_doc": "設計書", "definition": "定義", "log_config": "ログ・設定", "callgraph": "呼び出し関係"}
 _OWNER_LABELS = {"main": "本体", "worker": "下調べ役"}
+_ROLE_LABELS = {"parent": "本体", "child": "下調べ役", "undetermined": "判定不能"}
+_CALL_STATUS_LABELS = {"ok": "成功", "truncated": "上限で途中まで", "error": "失敗"}
 _COVERAGE_LABELS = {
     "hit": "見つかった", "no_hits": "見つからない", "truncated": "上限で途中まで", "limit": "回数の上限",
     "timeout": "時間切れ", "unreadable": "読み取れない", "error": "失敗"}
@@ -70,7 +72,8 @@ def describe_dropped(dropped: dict | None) -> str:
     parts = []
     for key, label, unit in (("items", "調べた項目", "件"), ("reviews", "途中の見直し", "件"),
                              ("coverage", "検索の結果の記録", "項目分"),
-                             ("coverage_detail", "検索語・読んだ範囲の記録", "項目分")):
+                             ("coverage_detail", "検索語・読んだ範囲の記録", "項目分"),
+                             ("found_docs", "見つかった資料の記録", "件"), ("calls", "調べた経路の記録", "件")):
         n = (dropped or {}).get(key)
         if isinstance(n, int) and n > 0:
             parts.append(f"{label} {n} {unit}")
@@ -79,6 +82,54 @@ def describe_dropped(dropped: dict | None) -> str:
     if not parts:
         return ""
     return "調査の記録が大きすぎたため、" + "・".join(parts) + "を保存していません。"
+
+
+def _calls_section(calls) -> list[str]:
+    """調べた経路（全部の道具の呼び出し）と見つかった資料（検索で見つかった資料）の節。記録が無ければ空（今までのダウンロードは変わらない）。"""
+    if not isinstance(calls, dict):
+        return []
+    route = [r for r in (calls.get("route") or []) if isinstance(r, dict)]
+    found = [r for r in (calls.get("found") or []) if isinstance(r, dict)]
+    head = f"道具の呼び出し {calls.get('calls') or 0} 回"
+    if calls.get("missing"):
+        head += f"（記録の欠け {calls['missing']} 行）"
+    lines = ["", "## 調べた経路", "", head, ""]
+    if route:
+        lines += ["| 担当 | 道具 | 検索語 | 件数 | 結果 | 時間(ms) | 項目 | 資料と範囲 |", "|---|---|---|---|---|---|---|---|"]
+    for r in route:
+        docs = "; ".join(_esc_cell(d.get("doc")) + (f" {_esc_cell(d.get('range'))}" if d.get("range") else "")
+                         for d in (r.get("docs") or []) if isinstance(d, dict))
+        if r.get("docs_omitted"):
+            docs += f"（ほか {r['docs_omitted']} 件は上限で省略）"
+        if r.get("docs_hidden"):
+            docs += f"（名前を出せない資料 {r['docs_hidden']} 件）"
+        status = _label(_CALL_STATUS_LABELS, r.get("status")) + (f"・{_esc_cell(r['error'])}" if r.get("error") else "")
+        lines.append(f"| {_esc_cell(_label(_ROLE_LABELS, r.get('role')))} | {_esc_cell(r.get('tool'))} | "
+                     f"{_esc_cell(r.get('query') or r.get('range')) or '-'} | "
+                     f"{r['count'] if isinstance(r.get('count'), int) else '-'} | {status} | "
+                     f"{r['ms'] if isinstance(r.get('ms'), int) else '-'} | {_esc_cell(r.get('item')) or '-'} | {docs or '-'} |")
+    if calls.get("route_omitted"):
+        lines.append(f"\nほか {calls['route_omitted']} 回の呼び出しは、上限のため記録していません。")
+    lines += ["", "## 見つかった資料（検索の結果）", ""]
+    if not found:
+        lines.append("(なし)")
+    for r in found:
+        extra = []
+        if r.get("lines"):
+            extra.append("行: " + "、".join(str(x) for x in r["lines"]))
+        if r.get("queries"):
+            extra.append("検索語: " + "、".join(_esc_cell(q) for q in r["queries"]))
+        extra.append("Codex の読み取り記録: " + ("あり" if r.get("opened")
+                                                 else "確かめられません（記録が欠けています）" if calls.get("opened_unknown")
+                                                 else "なし"))
+        lines.append(f"- {_esc_cell(r.get('doc'))}（{' / '.join(extra)}）")
+    if calls.get("found_more"):
+        lines.append(f"- ほか {calls['found_more']} 件（上限で省略）")
+    if calls.get("found_hidden"):
+        lines.append(f"- 名前を出せない資料 {calls['found_hidden']} 件")
+    if calls.get("found_hits_omitted"):
+        lines.append(f"- 1 回の呼び出しの上限で取り込めなかった検索のヒット {calls['found_hits_omitted']} 件")
+    return lines
 
 
 def render_markdown(record: dict) -> str:
@@ -159,5 +210,6 @@ def render_markdown(record: dict) -> str:
                 what = "・".join(_esc_cell(call[k]) for k in ("query", "doc", "range") if call.get(k))
                 lines.append(f"  - {_esc_cell(call.get('tool'))}（{_label(_COVERAGE_LABELS, call.get('outcome'))}）"
                              + (f": {what}" if what else ""))
+    lines += _calls_section(detail.get("calls"))
     lines.append("")
     return "\n".join(lines)

@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 
-from ...mcp_server import COMPARE_DOC_ID_ARGS, LISTED_DOC_TOOLS, READ_DOC_TOOLS
+from ...mcp_server import _LEDGER_TOOLS, COMPARE_DOC_ID_ARGS, LISTED_DOC_TOOLS, READ_DOC_TOOLS
 from ..base import _log, _node
 from . import process
 from .ledger_gate import _LEDGER_TOOL_DETAILS
@@ -29,11 +29,22 @@ from .process import (
 from .usage import _accumulate_codex_usage, _usage_from_turn_completed
 
 
+def _compare_status(item: dict):
+    """完了した `compare_documents` の mcp_tool_call item の結果の `status`（読めなければ None）。"""
+    try:
+        data = json.loads(item["result"]["content"][0]["text"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return data.get("status") if isinstance(data, dict) else None
+
+
 def _build_argv(st, use_resume: bool) -> list:
     """codex exec を組み立てる。resume 分岐は `codex exec resume [SESSION_ID] [PROMPT]` の位置引数どおり、共通オプションの後・末尾プロンプトの前に `resume <sid>` を挿む。resume 先 id は `thread_id`（`thread.started` で捕捉した最新値）を優先し、未捕捉なら `resume_sid` を使う。
     プロンプト本文は argv に載せず（`ps` で読まれるため）、`-` だけを置いて標準入力から読ませる。本文は `_attempt` が Popen 後に `proc.stdin` へ書く。
     """
     av = list(st.argv_base)
+    # 何回目の実行か（ターン内の通し番号）を MCP サーバーの環境変数へ足す。
+    av += ["-c", f'mcp_servers.sherpa.env.SHERPA_MCP_ATTEMPT_NO="{st._attempt_no}"']
     if use_resume:
         sid = st.thread_id or st.resume_sid
         if sid:
@@ -81,6 +92,7 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                      type(exc).__name__, getattr(exc, "errno", None), ctx.conversation_id, uid)
     # このプロセス内だけで完結する id 集合（run-level `_mcp_calls` への合算は finally で行う）。
     _attempt_mcp_seen: set = set()
+    _mcp_seq_done: set = set()  # 親の道具名の並びに足した item id
     _mcp_read_done: set = set()  # 収集済み item id（同じ item の再送で二重に数えない）
                                      # item id は attempt ごとに振り直される
     _attempt_mcp_open: set = set()
@@ -133,15 +145,18 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                 e = json.loads(line)
             except ValueError:
                 st._invalid_output_events += 1
+                st._tool_use.record_unreliable = True
                 continue
             if not isinstance(e, dict) or not isinstance(e.get("item", {}), dict):
                 st._invalid_output_events += 1
+                st._tool_use.record_unreliable = True
                 continue
             _et = e.get("type")
             if isinstance(_et, str) and _et.startswith("item."):
                 _item_type = (e.get("item") or {}).get("type")
                 if not isinstance(_item_type, str) or not _item_type.strip():
                     st._invalid_output_events += 1
+                    st._tool_use.record_unreliable = True
                     continue
             st.got_any_line = True
             if isinstance(_et, str):
@@ -187,6 +202,7 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
             if it == "command_execution":  # Codex 自身の grep/参照を逐次表示
                 st.ran = True
                 st._attempt_ran_tools = True
+                st._tool_use.parent_shell_events += 1
                 label, detail = _humanize_cmd(item.get("command", ""))
                 if item.get("status") == "completed" or e.get("type") == "item.completed":
                     ec = item.get("exit_code")
@@ -198,6 +214,8 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                 st.ran = True
                 st._attempt_ran_tools = True
                 tool = item.get("tool", "")
+                if tool != "ask_user" and tool not in _LEDGER_TOOLS:  # 質問と台帳の書き込みは資料を調べたことにならない
+                    st._tool_use.parent_sherpa_events += 1
                 a = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}  # 非 dict 引数で落とさない
                 done = e.get("type") == "item.completed" or item.get("status") in ("completed", "failed")
                 # 並走計測（このプロセス内のみ・run 全体への合算は `_attempt` の finally）。id が無い item は対象外。初見かつ未完了のときだけ in-flight に加える（初見でいきなり完了した item は total には数えるが in-flight 幅には寄与しない）。再送は seen 済みなので二重に数えない。
@@ -219,11 +237,16 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                         _d = a.get("doc_id")
                         if isinstance(_d, str) and _d:
                             _mcp_listed_docs.append(_d)
-                    elif tool == "compare_documents":
+                    elif tool == "compare_documents" and _compare_status(item) == "comparable":
                         for _k in COMPARE_DOC_ID_ARGS:
                             _d = a.get(_k)
                             if isinstance(_d, str) and _d:
                                 _mcp_read_docs.append(_d)
+                if (done or tool == "ask_user") and (not _mcp_id or _mcp_id not in _mcp_seq_done):
+                    # 親の道具の呼び出しの並び（道具の名前の順）。プロセスごとの記録と突き合わせて親のプロセスを決める。
+                    if _mcp_id:
+                        _mcp_seq_done.add(_mcp_id)
+                    st._parent_mcp_tools.setdefault(st._attempt_no, []).append(tool)
                 if _mcp_id and _mcp_id not in _attempt_mcp_seen:
                     _attempt_mcp_seen.add(_mcp_id)
                     if not done:
@@ -297,6 +320,7 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                 for _tid in item.get("receiver_thread_ids") or []:
                     if isinstance(_tid, str) and _tid:
                         _child_thread_ids.add(_tid)
+                        st._tool_use.child_spawned = True
             elif it == "reasoning" and e.get("type") == "item.completed":
                 txt = [ln for ln in (_strip_control_markers(ln).strip() for ln in
                                      (item.get("text") or "").splitlines()) if ln]
@@ -306,6 +330,7 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                 # 最後の1件で上書きせず集める（完了分はリストへ・未完分は partial に保持）。結論の選択は loop 後に `_pick_codex_headline` で決定的に行う。
                 if not isinstance(item.get("text"), str):
                     st._invalid_output_events += 1
+                    st._tool_use.record_unreliable = True
                     continue
                 _txt = (item.get("text") or "").strip()
                 if e.get("type") == "item.completed":
@@ -316,6 +341,7 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                     st._agent_partial = _txt
     except Exception as exc:
         st._stream_error = True
+        st._tool_use.record_unreliable = True
         st._answer_notices.append(f"回答の回収中にエラーが発生しました（{type(exc).__name__}）。")
         _log.warning("codex output collection failed: type=%s errno=%s", type(exc).__name__, getattr(exc, "errno", None))
     finally:

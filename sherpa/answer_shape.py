@@ -4,6 +4,7 @@
 `headline` は旧クライアント向けの投影（notices の文 + body）で、会話の `content`・検索・監査の書き出しはこの投影を読む。
 旧形式の行（`body` が無い answer）は `headline` を body として読む（`body_of`）。
 設計: docs/design/chat.md「回答の形」
+新しい欄（`referenced_docs`・`impact_list`・`found_docs`・`how`）は任意で、無い回答（旧形式）は無いまま読む（空の表にしない）。
 `investigation_summary` の中身は `investigation_summary.fill` が回答の事実（limits・investigation）から組み立てる。
 `sherpa` 内の他モジュールは `investigation_summary`（葉）にだけ依存する。
 """
@@ -20,10 +21,13 @@ NOTICE_KINDS = (
     "sources_unverified", "stopped", "stopped_early", "unconfirmed_items", "wall_clock",
     "ledger_unfinished", "partial_followup", "truncated", "invalid_output", "answer_recovery", "review_reverted",
     "investigation_record_failed", "claims_omitted", "knowledge_off",
-    "reconciliation_unverified", "reconciliation_more", "reconciliation_invalid",
+    "reconciliation_unverified", "reconciliation_more", "reconciliation_invalid", "scope_no_source",
+    "no_tool_use",
 )
 
 STOPPED_NOTICE = "利用者の操作で停止しました。停止までに回収した部分回答です。"
+
+NO_TOOL_USE_NOTICE = "資料を調べずに答えています。"
 
 STOPPED_EARLY_NOTICE = ("AI が途中経過を伝えたまま調査を終えたため、途中までの結果です。"
                         "「続きを調べる」を押すと続きから調べられます。")
@@ -63,6 +67,122 @@ def investigation_summary_of(answer) -> dict | None:
             "items": items}
 
 
+HOW_MODES = ("investigate", "author")
+IMPACT_ROLES = ("origin", "affected")
+IMPACT_STATES = ("candidate", "inspected", "used", "unmapped")
+
+
+def _is_count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def count_of(answer, key: str) -> int:
+    """件数の欄（`referenced_docs_more` など）。正の整数以外は 0。"""
+    v = answer.get(key) if isinstance(answer, dict) else None
+    return v if _is_count(v) else 0
+
+
+def _is_line(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def referenced_docs_of(answer) -> list[dict]:
+    """参照した資料 `[{path, ranges:[[開始行, 終了行]], unopened, ranges_more?}]` を型の正しい形だけで返す。`unopened` は読み取り道具でしか読めない資料で開いた記録が無いもの・`ranges_more` は範囲の上限で省いた個数。無い・壊れていれば空リスト。"""
+    rows = answer.get("referenced_docs") if isinstance(answer, dict) else None
+    if not isinstance(rows, list):
+        return []
+    out = []
+    for r in rows:
+        if not (isinstance(r, dict) and isinstance(r.get("path"), str) and r["path"].strip()):
+            continue
+        ranges = [[x[0], x[1]] for x in (r.get("ranges") if isinstance(r.get("ranges"), list) else [])
+                  if isinstance(x, (list, tuple)) and len(x) == 2 and _is_line(x[0]) and _is_line(x[1]) and x[1] >= x[0]]
+        row = {"path": r["path"], "ranges": ranges, "unopened": r.get("unopened") is True}
+        if _is_count(r.get("ranges_more")):
+            row["ranges_more"] = r["ranges_more"]
+        out.append(row)
+    return out
+
+
+def impact_list_of(answer) -> dict | None:
+    """影響一覧 `{v, traced, rows:[{name, path, role, state, reason}], reasons:[文], more}` を型の正しい形だけで返す。無い・壊れていれば None（空の表や「影響なし」に変えない）。`traced` が False は「影響をたどっていません」。"""
+    s = answer.get("impact_list") if isinstance(answer, dict) else None
+    if not isinstance(s, dict) or not isinstance(s.get("traced"), bool):
+        return None
+    rows = []
+    for r in (s.get("rows") if isinstance(s.get("rows"), list) else []):
+        if isinstance(r, dict) and isinstance(r.get("name"), str) and r["name"].strip() and r.get("state") in IMPACT_STATES:
+            rows.append({"name": r["name"], "path": r["path"] if isinstance(r.get("path"), str) else "",
+                         "role": r["role"] if r.get("role") in IMPACT_ROLES else "affected",
+                         "state": r["state"], "reason": r["reason"] if isinstance(r.get("reason"), str) else ""})
+    reasons = [x for x in (s.get("reasons") if isinstance(s.get("reasons"), list) else []) if isinstance(x, str) and x.strip()]
+    return {"v": s["v"] if _is_count(s.get("v")) else 1, "traced": s["traced"], "rows": rows,
+            "reasons": reasons, "more": s["more"] if _is_count(s.get("more")) else 0}
+
+
+def found_docs_of(answer) -> list[dict]:
+    """ほかに見つかった資料（Codex の読み取り記録なし）`[{path}]` を型の正しい形だけで返す。省いた件数は `found_docs_more`。"""
+    rows = answer.get("found_docs") if isinstance(answer, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return [{"path": r["path"]} for r in rows
+            if isinstance(r, dict) and isinstance(r.get("path"), str) and r["path"].strip()]
+
+
+def how_of(answer) -> dict | None:
+    """調べ方の表示 `{mode: investigate|author, doc_focus}`。無い・壊れていれば None（古い回答は `lens` で読む）。"""
+    h = answer.get("how") if isinstance(answer, dict) else None
+    if not isinstance(h, dict) or h.get("mode") not in HOW_MODES:
+        return None
+    return {"mode": h["mode"], "doc_focus": h.get("doc_focus") is True}
+
+
+NEW_SHAPE_KEYS = ("referenced_docs", "referenced_docs_hidden", "referenced_docs_more", "impact_list", "found_docs",
+                   "found_docs_hidden", "found_docs_more", "how")
+
+
+def safe_new_fields(answer) -> dict:
+    """新しい欄を、秘匿の資料（`text_kind.is_sensitive_doc_id`）の名前・パスと、それを含む理由の文を除いた形で返す。除いた分は `*_hidden`（影響一覧は `hidden`）に数える。主の配列が無くても正の件数の欄は写す。"""
+    import re
+    from .ingest import text_kind
+    if not isinstance(answer, dict):
+        return {}
+
+    def visible(path: str) -> bool:
+        return not text_kind.is_sensitive_doc_id(path)
+
+    def clean_text(text: str) -> bool:
+        return all(visible(t) for t in re.findall(r"[A-Za-z0-9_.\-/\\]+", text))
+
+    out: dict = {}
+    for key, rows_of in (("referenced_docs", referenced_docs_of), ("found_docs", found_docs_of)):
+        rows = rows_of(answer)
+        kept = [r for r in rows if visible(r["path"])]
+        if isinstance(answer.get(key), list):
+            out[key] = kept
+        hidden = len(rows) - len(kept) + count_of(answer, key + "_hidden")
+        if hidden:
+            out[key + "_hidden"] = hidden
+        more = count_of(answer, key + "_more")
+        if more:
+            out[key + "_more"] = more
+    il = impact_list_of(answer)
+    if il is not None:
+        kept_src = [r for r in il["rows"] if visible(r["name"]) and (not r["path"] or visible(r["path"]))]
+        rows = [{**r, "reason": r["reason"] if clean_text(r["reason"]) else ""} for r in kept_src]
+        masked = sum(1 for r, k in zip(kept_src, rows) if r["reason"] != k["reason"])
+        reasons = [x for x in il["reasons"] if clean_text(x)]
+        out["impact_list"] = {**il, "rows": rows, "reasons": reasons}
+        hidden = (len(il["rows"]) - len(rows) + masked + len(il["reasons"]) - len(reasons)
+                  + count_of(answer.get("impact_list"), "hidden"))
+        if hidden:
+            out["impact_list"]["hidden"] = hidden
+    how = how_of(answer)
+    if how is not None:
+        out["how"] = how
+    return out
+
+
 def project_headline(notices: list[dict], body: str) -> str:
     """notices の文を本文の前に並べた旧クライアント向けの文字列。"""
     parts = [n["text"].strip() for n in notices]
@@ -99,6 +219,11 @@ def seal(env: dict) -> dict:
     env["body"] = body
     env["notices"] = notices_of(env)
     env["answer_schema"] = ANSWER_SCHEMA
+    if any(k in env for k in NEW_SHAPE_KEYS):
+        safe = safe_new_fields(env)
+        for k in NEW_SHAPE_KEYS:
+            env.pop(k, None)
+        env.update(safe)
     investigation_summary.fill(env)
     env["headline"] = project_headline(env["notices"], body)
     return env

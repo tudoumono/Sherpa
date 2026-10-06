@@ -541,6 +541,8 @@ class UsageLens(BaseModel):
     qa: int
     troubleshoot: int
     chat: int
+    investigate: int = 0
+    author: int = 0
 
 
 class UsageUserRow(BaseModel):
@@ -941,6 +943,44 @@ class AdminUsageQualityRunAck(BaseModel):
     inserted: bool = True
 
 
+class UsageToolCallRole(BaseModel):
+    calls: int
+    found: int
+    ms: int
+    errors: int
+    truncated: int
+
+
+class UsageToolCallRow(UsageToolCallRole):
+    """道具ごとの累計（`by_role` は parent/child/undetermined の内訳）。"""
+    tool: str
+    by_role: dict[str, UsageToolCallRole]
+
+
+class UsageToolCalls(BaseModel):
+    """道具の呼び出しの累計（記録のあるターンだけ・過去のターンは含まない）。"""
+    turns: int
+    missing: int
+    tools: list[UsageToolCallRow]
+    nudged_turns: int = 0
+    nudged_then_used: int = 0
+    no_tool_use_turns: int = 0
+    opened_docs: int = 0
+    opened_unknown_turns: int = 0
+
+
+class UsageImpact(BaseModel):
+    """影響一覧のあるターンだけの件数（行の名前・パスは持たない）。"""
+    traced_turns: int = 0
+    untraced_turns: int = 0
+    candidate: int = 0
+    inspected: int = 0
+    used: int = 0
+    unmapped: int = 0
+    more: int = 0
+    hidden: int = 0
+
+
 class AdminUsageStatsResponse(BaseModel):
     """利用統計（GET /admin/usage/stats）。"""
     users: list[UsageUserRow]
@@ -962,6 +1002,8 @@ class AdminUsageStatsResponse(BaseModel):
     response_time: UsageResponseTime
     conversations_top: list[UsageConversationRow]
     limits: UsageLimits
+    tool_calls: UsageToolCalls = Field(default_factory=lambda: UsageToolCalls(turns=0, missing=0, tools=[]))
+    impact: UsageImpact = Field(default_factory=UsageImpact)
     rounds: UsageRounds
     quality_runs: UsageQualityRuns
 

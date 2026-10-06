@@ -5,14 +5,43 @@
 from __future__ import annotations
 
 import re
+import uuid
 
 from ...env_int import env_int
 from .usage import _CHILD_USAGE_KEYS
+
+TOOL_USE_USED = "used"
+TOOL_USE_UNUSED = "unused"
+TOOL_USE_UNDETERMINED = "undetermined"
+
+
+class TurnToolUse:
+    """1 ターン（初回・同じターンの全 resume／自動の続き・resume 失敗後の新しいセッション）を通した道具の使用の合算。
+    実行ごとの値（`_attempt_ran_tools` など）とは別に持ち、次の利用者のターンで作り直す（`CodexTurnState` と同じ寿命）。
+    設計: docs/proposals/2026-10-07-調べ方と下調べの整理.md 決定 15
+    """
+    __slots__ = ("parent_shell_events", "parent_sherpa_events", "child_spawned", "record_unreliable")
+
+    def __init__(self):
+        self.parent_shell_events = 0  # 親の実行の記録に現れたシェルのコマンドのイベント数
+        self.parent_sherpa_events = 0  # 親の実行の記録に現れた Sherpa の道具（MCP）のイベント数
+        self.child_spawned = False  # 子のエージェントを起動した（子のシェルは親の記録に残らない）
+        self.record_unreliable = False  # 実行の記録を最後まで読めなかった
+
+    def verdict(self) -> str:
+        """親が使っていれば used・使っていなくても子の起動か記録の欠けがあれば undetermined（「使っていない」と断定しない）・それ以外は unused。"""
+        if self.parent_shell_events or self.parent_sherpa_events:
+            return TOOL_USE_USED
+        if self.child_spawned or self.record_unreliable:
+            return TOOL_USE_UNDETERMINED
+        return TOOL_USE_UNUSED
 
 
 class CodexTurnState:
     __slots__ = (
         # ターンの外側（`_run_authoring` の先頭）
+        "turn_uid", "_tool_use", "_call_log_dir", "_parent_mcp_tools", "call_log",
+        "_tool_zero_nudged", "_tool_zero_notice",
         "_turn_t0", "_plain", "_skip_presearch", "users_dir", "uid", "run_dir",
         "answer", "ran", "_codex_silent_failure", "_codex_stopped_early", "_stream_error",
         "codex_question", "codex_usage", "_agent_start_mono", "_agent_end_mono",
@@ -25,7 +54,7 @@ class CodexTurnState:
         "_child_usage_missing", "_child_usage_detected", "codex_created_files",
         "_created_file_rows", "_created_files_failed", "_discarded_files", "_marp_failed", "_marp_failed_formats", "_record_notes",
         # 会話ロック・調査台帳
-        "_conv_lock", "_conv_lock_acquired", "_investigation_dir", "_ledger_home", "_ledger_required_extra",
+        "_conv_lock", "_conv_lock_acquired", "_investigation_dir", "_ledger_home", "_ledger_required_extra", "_scope_source_state",
         "_ledger_require_review", "_ledger_require_continuation_resolved", "_investigation_restored",
         "_investigation_verdict", "_investigation_snapshot", "_investigation_reviews",
         "_review_continuation_note_text", "_investigation_record_payload",
@@ -55,6 +84,15 @@ class CodexTurnState:
 
     def __init__(self, ctx, *, turn_t0: float, plain: bool, skip_presearch: bool):
         self._turn_t0 = turn_t0  # `sherpa.usage` ログ 1 行の elapsed（このターン全体）
+        # 利用者の 1 ターンの ID（MCP へ渡す）と、ターンを通した道具の使用の合算。何回目の実行かは `_attempt_no`（ターン内の通し番号）。
+        self.turn_uid = uuid.uuid4().hex
+        self._tool_use = TurnToolUse()
+        # 道具の呼び出しの記録: プロセスごとのファイルの置き場・親の `--json` の mcp_tool_call の道具名の並び（実行ごと）・ターンの終わりにまとめた結果（`tool_call_log.MergedCallLog`）。
+        self._call_log_dir = None
+        self._parent_mcp_tools: dict[int, list[str]] = {}
+        self.call_log = None
+        self._tool_zero_nudged = False  # 道具ゼロの促しを出したか（1 ターン 1 回まで）
+        self._tool_zero_notice = False  # 促した後も道具ゼロだった（注記「資料を調べずに答えています」を付ける）
         self._plain = plain  # 素の Codex モード（ターンの最初に 1 回だけ決める）
         self._skip_presearch = skip_presearch
         self.users_dir = None
@@ -137,6 +175,7 @@ class CodexTurnState:
         self._ledger_home = None  # workspace/.codex-sessions/{cid}（永続会話のみ）
         # 台帳の完了判定へ足す追加の必須根拠種別。`ledger_complete`/`no_progress`/`_retire_investigation_ledger` の全呼び出しへ同じ値を渡す（ターンの最初に1回だけ決める）。早期 return でも finally が参照できるよう先に空で確定し、`sp`/`decision["lens"]` の確定後に上書きする。
         self._ledger_required_extra: tuple[str, ...] = ()
+        self._scope_source_state = "unknown"  # 範囲のソースの有無（`ledger_gate._scope_source_state`）
         # 中間の見直しを完了判定へ必須にするか（`_schema_v2` の確定後に上書きする）。早期 return 経路向けに先に確定する。
         self._ledger_require_review = False
         # 台帳に残っている「追加の観点」の義務の解決を要求するか（既定False・義務の有無は `investigation_ledger.pending_continuation_review()` が見直しの列だけから決める）。

@@ -20,7 +20,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import agentic_search, es_index, graph_coverage, graph_tools, investigation_ledger, tool_dispatch
+from . import agentic_search, es_index, graph_coverage, graph_tools, investigation_ledger, tool_call_log, tool_dispatch
 from .ingest.world_neo4j import GraphSchemaEraError
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -313,7 +313,7 @@ def _ledger_required_extra() -> tuple[str, ...]:
     if not raw:
         return ()
     kinds = tuple(s.strip() for s in raw.split(",") if s.strip())
-    if not all(k in investigation_ledger.EVIDENCE_KINDS for k in kinds):
+    if not all(k in investigation_ledger.EVIDENCE_KINDS or k == investigation_ledger.SOURCE_EXEMPT for k in kinds):
         return ()
     return kinds
 
@@ -909,6 +909,189 @@ def _err(rid, code: int, msg: str) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
 
 
+def _handle_tool_call(rid, params: dict) -> dict:
+    """`tools/call` 1 件を処理して応答を返す（台帳・ask_user・重複拒否・通常の道具）。"""
+    name = params.get("name")
+    args = params.get("arguments") or {}
+    if _toolset() == "plain" and name not in _PLAIN_TOOLSET:
+        # plain は es_search・graph_neighbors・ask_user だけ。tools/list に出していなくても、直接呼ばれたら存在しないツールと同じエラーで拒否する（fail-closed）。
+        err_body = {"error": f"unknown tool: {name}"}
+        return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
+                         "isError": True})
+    if name in _LEDGER_TOOLS:
+        # 台帳の応答は探索量に計上せず、クリップ・重複拒否・読取サイドカーの対象外にする。
+        result = _run_ledger_tool(name, args)
+        return _ok(rid, {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                         "isError": bool(result.get("error"))})
+    if name == "ask_user":
+        # ask_user は質問であって検索ツールではない。質問カードの表示はラッパー（`agents._run_authoring`）が行い、ここは「届いた・追加調査せず要約して終了せよ」を返すだけ（2 回目以降は別文言で調査続行を促す）。
+        # 確認ID 付き再送では初回でも `_ASK_RESULT_AGAIN` を返す（質問カードを出さないまま調査を打ち切らせない）。
+        if _ask_disabled():
+            return _ok(rid, {"content": [{"type": "text", "text": _ASK_RESULT_AGAIN}], "isError": False})
+        _ASK_STATE["count"] += 1
+        if _ASK_STATE["count"] == 1:
+            text = _ASK_RESULT_FIRST
+            # 子（worker/evaluator）の ask_user は親の `--json` に現れず、呼び出し元が親か子か区別できないため、初回の質問は常にサイドカーへも書く（provider.py が `codex_question is None` のときだけサイドカー分を使う）。
+            _q = agentic_search._question_from_args(args)
+            if isinstance(_q, dict):
+                _sidecar_append({"kind": "ask_user", "ts": time.time(), "question": _q})
+        else:
+            text = _ASK_RESULT_AGAIN
+        return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": False})
+    if name not in _DUPLICATE_CHECK_EXEMPT_TOOLS and _is_duplicate_tool_call(name, args):
+        # 同一条件の再実行は run_tool を呼ばず本文も再送しない。
+        _sidecar_append({"kind": "limit", "field": "duplicate_tool_call", "ts": time.time()})
+        _record_duplicate_item_coverage(name, args)  # 初回の結果区分をこの item にも転記
+        err_body = {"error": "duplicate_tool_call",
+                   "hint": "同じ条件の検索は既に実行済みです。条件を変えてください。"}
+        return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
+                         "isError": True})
+    try:
+        # 調べる深さ連動込みの実効 hits/window（`SHERPA_MCP_TOOL_MAX_HITS`/`_WINDOW_CAP`）とバイト予算を `run_tool()` の内部クリップにも渡す。env 未設定/不正値は `None`＝`run_tool()` の既定。後段の `_clip_tool_result` は最終形を保証する多層防御。
+        result, _docs, _cites, _cards = tool_dispatch.run_tool(
+            name, args, _world(), _scope(), layer=_layer(),
+            max_hits=_env_int_override("SHERPA_MCP_TOOL_MAX_HITS"),
+            window_cap=_env_int_override("SHERPA_MCP_TOOL_WINDOW_CAP"),
+            tool_result_max_bytes=_env_int_override("SHERPA_MCP_TOOL_BUDGET_BYTES"),
+            graph_only=(_toolset() == "plain"))
+    except GraphSchemaEraError as e:
+        # `graph_neighbors` が検知した旧世代グラフは、JSON-RPC のプロトコルエラーにせず通常のツール結果（`isError` あり・`content[].text` に機械可読コード）で返す。`providers/codex/mcp.py::_graph_schema_era_from_item` が `GraphSchemaEraError` を再構成する。
+        err_body = {"error": agentic_search.GRAPH_REINGEST_ERROR_CODE,
+                    "world": e.world, "stored_era": e.stored_era}
+        _sidecar_error_code(name, err_body)  # 子が受け取った障害も親が観測できるようにする
+        _record_item_coverage(name, args, err_body, True)
+        return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
+                         "isError": True})
+    is_error = bool(isinstance(result, dict) and result.get("error"))
+    _sidecar_error_code(name, result)
+    # `run_tool()` 自身が内部で行った打ち切りをサイドカーへ記録する（API 経路の `agentic_search._SEARCH_TRUNCATED_TOOLS`/`_BYTE_CLIP_TOOLS` と同じ判定キー・語彙）。`_tool_result_clipped_recorded` は 1 回の呼び出しで `tool_result_clipped` を二重に書かないためのフラグ。
+    _tool_result_clipped_recorded = False
+    if isinstance(result, dict):
+        if name in agentic_search._SEARCH_TRUNCATED_TOOLS and result.get("truncated"):
+            _sidecar_append({"kind": "limit", "field": "search_truncated", "ts": time.time()})
+        if name in agentic_search._BYTE_CLIP_TOOLS and (result.get("text_truncated") or result.get("byte_clipped")):
+            _sidecar_append({"kind": "limit", "field": "tool_result_clipped", "ts": time.time()})
+            _tool_result_clipped_recorded = True
+    if not is_error:
+        # 子が読んだ doc_id をサイドカーへ（本文は書かない・失敗した呼出は数えない）。
+        if name in READ_DOC_TOOLS:
+            d = args.get("doc_id")
+            if isinstance(d, str) and d:
+                _sidecar_append({"kind": "read", "tool": name, "doc_id": d, "ts": time.time()})
+        elif name in LISTED_DOC_TOOLS:
+            d = args.get("doc_id")
+            if isinstance(d, str) and d:
+                _sidecar_append({"kind": "listed", "tool": name, "doc_id": d, "ts": time.time()})
+        elif name == "compare_documents" and isinstance(result, dict) and result.get("status") == "comparable":
+            for k in COMPARE_DOC_ID_ARGS:
+                d = args.get(k)
+                if isinstance(d, str) and d:
+                    _sidecar_append({"kind": "read", "tool": name, "doc_id": d, "ts": time.time()})
+    if name not in _BUDGET_EXEMPT_TOOLS:
+        result, _clipped = _clip_tool_result(result, name=name, args=args)
+        if _clipped and not _tool_result_clipped_recorded:
+            _sidecar_append({"kind": "limit", "field": "tool_result_clipped", "ts": time.time()})
+        # `_clip_tool_result` が結果を `{"error": ...}` へ置き換えることがあるため、クリップ後に error 形へ変わった分もここで拾い直す。
+        is_error = is_error or bool(isinstance(result, dict) and result.get("error"))
+    # `item` 付き呼出しの結果区分を台帳へ記録する（Codex へ返す最終形＝クリップ後の `result`/`is_error` を使う）。
+    _record_item_coverage(name, args, result, is_error)
+    # MCP 標準＝content[].text。Codex が読む本文は run_tool の結果。
+    text = json.dumps(result, ensure_ascii=False)
+    return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": is_error})
+
+
+_call_log_writer: tool_call_log.CallLogWriter | None = None
+_call_log_write_failed_once = False  # 書込失敗の warning はプロセス寿命に 1 回だけ出す
+
+
+def _call_log_dir() -> str | None:
+    """道具の呼び出しの記録の置き場（`SHERPA_MCP_CALL_LOG_DIR`・ターンの作業フォルダの中・未設定は None＝記録しない）。"""
+    p = os.environ.get(tool_call_log.ENV_DIR, "").strip()
+    return p or None
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def _record_tool_call(rid, params: dict) -> dict:
+    """道具の入口。呼び出しを処理し、終わったら 1 行を自分のプロセス専用のファイルへ追記する（書けなくても道具は失敗させない）。
+    ① 開始時刻を取る ② 道具を処理する ③ 結果・件数・資料と範囲・かかった時間を 1 行にして書く。
+    """
+    global _call_log_writer, _call_log_write_failed_once
+    ts = time.time()
+    t0 = time.monotonic()
+    raised = None
+    try:
+        resp = _handle_tool_call(rid, params)
+    except Exception as exc:  # 例外の呼び出しも 1 行残してから、従来どおり serve に応答させる
+        resp, raised = None, exc
+    directory = _call_log_dir()
+    if directory is None:
+        if raised is not None:
+            raise raised
+        return resp
+    try:
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        result_obj = resp.get("result") if isinstance(resp, dict) else None
+        is_error = raised is not None or bool(isinstance(result_obj, dict) and result_obj.get("isError"))
+        body = None
+        try:
+            text = result_obj["content"][0]["text"]
+            body = json.loads(text) if isinstance(text, str) else None
+        except (KeyError, IndexError, TypeError, ValueError):
+            body = None
+        if _call_log_writer is None or str(_call_log_writer.directory) != directory:
+            _call_log_writer = tool_call_log.CallLogWriter(directory)
+        detail = _coverage_detail(name, args) if isinstance(name, str) else {}
+        seq = _call_log_writer.next_seq()
+        entry = {
+            "v": tool_call_log.SCHEMA_VERSION,
+            "turn": os.environ.get("SHERPA_MCP_TURN_ID", ""),
+            "conv": os.environ.get("SHERPA_MCP_CONVERSATION_ID", ""),
+            "attempt": _env_int("SHERPA_MCP_ATTEMPT_NO"),
+            "proc": _call_log_writer.pid,
+            "seq": seq,
+            "call_id": f"{_call_log_writer.pid}:{seq}",
+            "ts": ts,
+            "tool": name if isinstance(name, str) else "",
+            "ms": max(0, round((time.monotonic() - t0) * 1000)),
+        }
+        entry.update(tool_call_log.summarize_result(entry["tool"], args, body, is_error, detail))
+        if raised is not None:
+            entry["error_kind"] = "tool_exception"
+        arg_summary = {k: tool_call_log.clip(v) for k, v in detail.items() if k in ("query", "doc", "range")}
+        if isinstance(args, dict):
+            for key in ("depth", "limit", "offset"):
+                v = args.get(key)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    arg_summary[key] = v
+            if isinstance(args.get("item"), str) and args["item"]:
+                arg_summary["item"] = tool_call_log.clip(args["item"])
+        if arg_summary:
+            entry["args"] = arg_summary
+        if not _call_log_writer.append(entry) and not _call_log_write_failed_once:
+            _call_log_write_failed_once = True
+            print("[sherpa-mcp] call log write failed", file=sys.stderr)
+        if name in tool_call_log.GRAPH_TOOLS:  # グラフの結果の行は影響一覧の素材として別ファイルへ（ログには出さない）
+            view = tool_call_log.graph_view(name, body)
+            if view is not None:
+                _call_log_writer.append_graph({k: entry[k] for k in ("v", "turn", "proc", "seq", "call_id", "ts", "tool", "attempt")}
+                                              | view)
+    except Exception as e:  # 記録の失敗で道具の応答を落とさない
+        if not _call_log_write_failed_once:
+            _call_log_write_failed_once = True
+            print(f"[sherpa-mcp] call log failed: {type(e).__name__}", file=sys.stderr)
+    if raised is not None:
+        raise raised
+    return resp
+
+
 def handle(req: dict) -> dict | None:
     """JSON-RPC 1 件を処理して応答 dict を返す。通知（id 無し）は None＝応答しない。"""
     method = req.get("method")
@@ -922,94 +1105,7 @@ def handle(req: dict) -> dict | None:
     if method == "tools/list":
         return _ok(rid, {"tools": _tool_defs()})
     if method == "tools/call":
-        params = req.get("params") or {}
-        name = params.get("name")
-        args = params.get("arguments") or {}
-        if _toolset() == "plain" and name not in _PLAIN_TOOLSET:
-            # plain は es_search・graph_neighbors・ask_user だけ。tools/list に出していなくても、直接呼ばれたら存在しないツールと同じエラーで拒否する（fail-closed）。
-            err_body = {"error": f"unknown tool: {name}"}
-            return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
-                             "isError": True})
-        if name in _LEDGER_TOOLS:
-            # 台帳の応答は探索量に計上せず、クリップ・重複拒否・読取サイドカーの対象外にする。
-            result = _run_ledger_tool(name, args)
-            return _ok(rid, {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
-                             "isError": bool(result.get("error"))})
-        if name == "ask_user":
-            # ask_user は質問であって検索ツールではない。質問カードの表示はラッパー（`agents._run_authoring`）が行い、ここは「届いた・追加調査せず要約して終了せよ」を返すだけ（2 回目以降は別文言で調査続行を促す）。
-            # 確認ID 付き再送では初回でも `_ASK_RESULT_AGAIN` を返す（質問カードを出さないまま調査を打ち切らせない）。
-            if _ask_disabled():
-                return _ok(rid, {"content": [{"type": "text", "text": _ASK_RESULT_AGAIN}], "isError": False})
-            _ASK_STATE["count"] += 1
-            if _ASK_STATE["count"] == 1:
-                text = _ASK_RESULT_FIRST
-                # 子（worker/evaluator）の ask_user は親の `--json` に現れず、呼び出し元が親か子か区別できないため、初回の質問は常にサイドカーへも書く（provider.py が `codex_question is None` のときだけサイドカー分を使う）。
-                _q = agentic_search._question_from_args(args)
-                if isinstance(_q, dict):
-                    _sidecar_append({"kind": "ask_user", "ts": time.time(), "question": _q})
-            else:
-                text = _ASK_RESULT_AGAIN
-            return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": False})
-        if name not in _DUPLICATE_CHECK_EXEMPT_TOOLS and _is_duplicate_tool_call(name, args):
-            # 同一条件の再実行は run_tool を呼ばず本文も再送しない。
-            _sidecar_append({"kind": "limit", "field": "duplicate_tool_call", "ts": time.time()})
-            _record_duplicate_item_coverage(name, args)  # 初回の結果区分をこの item にも転記
-            err_body = {"error": "duplicate_tool_call",
-                       "hint": "同じ条件の検索は既に実行済みです。条件を変えてください。"}
-            return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
-                             "isError": True})
-        try:
-            # 調べる深さ連動込みの実効 hits/window（`SHERPA_MCP_TOOL_MAX_HITS`/`_WINDOW_CAP`）とバイト予算を `run_tool()` の内部クリップにも渡す。env 未設定/不正値は `None`＝`run_tool()` の既定。後段の `_clip_tool_result` は最終形を保証する多層防御。
-            result, _docs, _cites, _cards = tool_dispatch.run_tool(
-                name, args, _world(), _scope(), layer=_layer(),
-                max_hits=_env_int_override("SHERPA_MCP_TOOL_MAX_HITS"),
-                window_cap=_env_int_override("SHERPA_MCP_TOOL_WINDOW_CAP"),
-                tool_result_max_bytes=_env_int_override("SHERPA_MCP_TOOL_BUDGET_BYTES"),
-                graph_only=(_toolset() == "plain"))
-        except GraphSchemaEraError as e:
-            # `graph_neighbors` が検知した旧世代グラフは、JSON-RPC のプロトコルエラーにせず通常のツール結果（`isError` あり・`content[].text` に機械可読コード）で返す。`providers/codex/mcp.py::_graph_schema_era_from_item` が `GraphSchemaEraError` を再構成する。
-            err_body = {"error": agentic_search.GRAPH_REINGEST_ERROR_CODE,
-                        "world": e.world, "stored_era": e.stored_era}
-            _sidecar_error_code(name, err_body)  # 子が受け取った障害も親が観測できるようにする
-            _record_item_coverage(name, args, err_body, True)
-            return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
-                             "isError": True})
-        is_error = bool(isinstance(result, dict) and result.get("error"))
-        _sidecar_error_code(name, result)
-        # `run_tool()` 自身が内部で行った打ち切りをサイドカーへ記録する（API 経路の `agentic_search._SEARCH_TRUNCATED_TOOLS`/`_BYTE_CLIP_TOOLS` と同じ判定キー・語彙）。`_tool_result_clipped_recorded` は 1 回の呼び出しで `tool_result_clipped` を二重に書かないためのフラグ。
-        _tool_result_clipped_recorded = False
-        if isinstance(result, dict):
-            if name in agentic_search._SEARCH_TRUNCATED_TOOLS and result.get("truncated"):
-                _sidecar_append({"kind": "limit", "field": "search_truncated", "ts": time.time()})
-            if name in agentic_search._BYTE_CLIP_TOOLS and (result.get("text_truncated") or result.get("byte_clipped")):
-                _sidecar_append({"kind": "limit", "field": "tool_result_clipped", "ts": time.time()})
-                _tool_result_clipped_recorded = True
-        if not is_error:
-            # 子が読んだ doc_id をサイドカーへ（本文は書かない・失敗した呼出は数えない）。
-            if name in READ_DOC_TOOLS:
-                d = args.get("doc_id")
-                if isinstance(d, str) and d:
-                    _sidecar_append({"kind": "read", "tool": name, "doc_id": d, "ts": time.time()})
-            elif name in LISTED_DOC_TOOLS:
-                d = args.get("doc_id")
-                if isinstance(d, str) and d:
-                    _sidecar_append({"kind": "listed", "tool": name, "doc_id": d, "ts": time.time()})
-            elif name == "compare_documents":
-                for k in COMPARE_DOC_ID_ARGS:
-                    d = args.get(k)
-                    if isinstance(d, str) and d:
-                        _sidecar_append({"kind": "read", "tool": name, "doc_id": d, "ts": time.time()})
-        if name not in _BUDGET_EXEMPT_TOOLS:
-            result, _clipped = _clip_tool_result(result, name=name, args=args)
-            if _clipped and not _tool_result_clipped_recorded:
-                _sidecar_append({"kind": "limit", "field": "tool_result_clipped", "ts": time.time()})
-            # `_clip_tool_result` が結果を `{"error": ...}` へ置き換えることがあるため、クリップ後に error 形へ変わった分もここで拾い直す。
-            is_error = is_error or bool(isinstance(result, dict) and result.get("error"))
-        # `item` 付き呼出しの結果区分を台帳へ記録する（Codex へ返す最終形＝クリップ後の `result`/`is_error` を使う）。
-        _record_item_coverage(name, args, result, is_error)
-        # MCP 標準＝content[].text。Codex が読む本文は run_tool の結果。
-        text = json.dumps(result, ensure_ascii=False)
-        return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": is_error})
+        return _record_tool_call(rid, req.get("params") or {})
     if is_notification:  # notifications/initialized 等は応答しない
         return None
     return _err(rid, -32601, f"method not found: {method}")

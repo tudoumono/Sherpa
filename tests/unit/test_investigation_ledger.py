@@ -255,6 +255,14 @@ def test_spec_only_with_required_checks_matching_evidence_is_satisfied_and_termi
     assert verdict.unsatisfied == {} and verdict.non_terminal_ids == () and verdict.complete is True
 
 
+def test_non_source_required_checks_never_block_completion(tmp_path):
+    snap, verdict = _verdict(tmp_path, _item(
+        "id", status="source_confirmed", required_checks=["source", "spec_doc", "callgraph", "log_config"],
+        evidence=[dict(_SRC)]))
+    assert verdict.unsatisfied == {} and verdict.complete is True
+    assert L.ledger_complete(snap, required_extra=("spec_doc",)).complete is True
+
+
 # ===== load_ledger: symlink を辿らない =====
 
 def test_manifest_symlink_is_invalid_and_linked_ids_do_not_leak(tmp_path):

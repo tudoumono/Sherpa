@@ -9,7 +9,7 @@ export const S = {
   // サーバが払い出す turn_id。GET /chat/turns/{turnId}/stream を購読する（切断してもターンは継続・停止は POST .../stop）。
   turnId: null,
   scope: [], scopeLabels: {}, scopeTree: null, currentScopeMeta: null,   // 明示選択/見出し/ツリー/直近の使用範囲
-  lens: 'auto', layer: 'both',   // 調べ方（既定=自動）・探す対象（既定=両方）
+  lens: 'investigate', docFocus: false,   // 調べ方（調べる／作る・既定=調べる）・資料を中心に見る（既定=オフ）
   depthProfile: 'standard',   // 調べる深さ（既定=標準）
   tools: { grep: true, fulltext: true, graph: true },   // 検索経路トグル（既定=全ON）
   // 軸ごとの「利用者が明示操作したか」フラグ。未操作の軸だけ送信 body から省略する（inquiry.js::toolsForSend）。

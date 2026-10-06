@@ -66,7 +66,9 @@ for i, text in enumerate(step.get("agent_messages", [])):
                        "item": {"id": f"m{i}", "type": "agent_message", "text": text}}))
     sys.stdout.flush()
 
-for tool_id in step.get("tool_ids", []):
+# 道具ゼロの促しを出さないよう、1 回目の実行は既定で道具を 1 回使う（`no_tools` で 0 回にする）。
+default_tools = ["t0-default"] if call_index == 1 and "tool_ids" not in step and not step.get("no_tools") else []
+for tool_id in [*step.get("tool_ids", []), *default_tools]:
     print(json.dumps({"type": "item.completed",
                        "item": {"id": tool_id, "type": "command_execution",
                                 "command": "ls", "status": "completed", "exit_code": 0}}))

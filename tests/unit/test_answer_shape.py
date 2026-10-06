@@ -106,3 +106,47 @@ def test_summary_hides_sensitive_names_shows_broken_overflow_and_share_keeps_cou
     assert {"label": "確認できなかった項目", "text": "2 件（項目名は共有では表示しません）"} in s_items
     assert shared["sources_unverified"] == [{"path": "仕様/a.md", "reason": "今回の範囲の外です"}]
     assert shared["sources_unverified_hidden"] == 2
+
+
+_NEW_SHAPE = {
+    "referenced_docs": [{"path": "docs/a.md", "ranges": [[3, 9], [0, 1], "x"], "unopened": True},
+                        {"path": "src/secrets/.env", "ranges": [[1, 2]]}, {"path": 5}],
+    "referenced_docs_more": 2,
+    "impact_list": {"v": 1, "traced": True, "reasons": ["深さの上限で打ち切りました"],
+                    "rows": [{"name": "OrderBatch", "path": "src/OrderBatch.java", "role": "origin", "state": "used"},
+                             {"name": "src/secrets/.env", "state": "candidate"}, {"name": "x", "state": "bogus"}]},
+    "found_docs": [{"path": "docs/b.md"}, {"path": "src/secrets/.env"}], "found_docs_more": 4,
+    "how": {"mode": "investigate", "doc_focus": True},
+}
+
+
+def test_new_shape_fields_are_shared_without_sensitive_names_and_survive_seal():
+    shared = _safe_share_answer(answer_shape.seal({"lens": "qa", "headline": "本文", "sources": [], **_NEW_SHAPE}))
+    assert shared["referenced_docs"] == [{"path": "docs/a.md", "ranges": [[3, 9]], "unopened": True}]
+    assert shared["referenced_docs_hidden"] == 1 and shared["referenced_docs_more"] == 2
+    il = shared["impact_list"]
+    assert [r["name"] for r in il["rows"]] == ["OrderBatch"] and il["hidden"] == 1 and il["traced"] is True
+    assert shared["found_docs"] == [{"path": "docs/b.md"}] and shared["found_docs_hidden"] == 1
+    assert shared["found_docs_more"] == 4 and shared["how"] == {"mode": "investigate", "doc_focus": True}
+    assert ".env" not in str(shared)
+    leaky = {"impact_list": {"traced": True, "reasons": ["src/secrets/.env を解析できません", "深さの上限です"],
+                             "rows": [{"name": "A", "state": "used", "reason": "id_rsa.pem を参照"}]}}
+    il2 = _safe_share_answer({"lens": "qa", "headline": "h", **leaky})["impact_list"]
+    assert il2["reasons"] == ["深さの上限です"] and il2["rows"][0]["reason"] == ""
+    assert ".env" not in str(il2) and "id_rsa" not in str(il2)
+
+
+def test_old_answers_get_no_new_fields_and_stay_unfaked():
+    old = {"lens": "impact", "headline": "旧形式の回答です。", "sources": [], "data": {"items": []}}
+    shared = _safe_share_answer(old)
+    assert not {"referenced_docs", "impact_list", "found_docs", "how"} & set(shared) and shared["lens"] == "impact"
+    assert answer_shape.impact_list_of(old) is None and answer_shape.referenced_docs_of(old) == []
+    assert answer_shape.impact_list_of({"impact_list": {"traced": "yes"}}) is None
+
+
+def test_received_share_read_path_hides_sensitive_names_in_new_fields():
+    from sherpa.store.shares import _strip_shared_message
+    out = _strip_shared_message({"role": "assistant", "answer": {"headline": "本文", **_NEW_SHAPE}})["answer"]
+    assert [r["path"] for r in out["referenced_docs"]] == ["docs/a.md"] and out["referenced_docs_hidden"] == 1
+    assert out["found_docs_hidden"] == 1 and ".env" not in str(out)
+

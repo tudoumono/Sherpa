@@ -219,7 +219,7 @@ def test_new_aggregation_matches_old_except_failed_turn_tokens():
     for r in old_users:
         u = got[r["uid"]]
         assert (u["turns"], u["conversations"], u["lens"], u["personal_turns"], u["knowledge_turns"], u["zero_hit_turns"]) == (
-            r["turns"], r["conversations"], {"impact": r["i"], "qa": r["q"], "troubleshoot": r["t"], "chat": r["ch"]},
+            r["turns"], r["conversations"], {"impact": r["i"], "qa": r["q"], "troubleshoot": r["t"], "chat": r["ch"], "investigate": 0, "author": 0},
             r["p"], r["k"], r["z"]), r["uid"]
     assert {r["uid"] for r in old_users} == set(got) and mine == set(got)
     assert got[s.users[0]]["personal_turns"] == 1   # user 発言の personal（assistant 側の列ではない）

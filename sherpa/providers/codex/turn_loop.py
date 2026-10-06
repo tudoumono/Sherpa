@@ -3,11 +3,14 @@
 """
 from __future__ import annotations
 
+import json
+
 from ... import investigation_ledger
+from .activity import _is_child_session_meta
 from ..base import _log, _node
 from .codex_attempt import _absorb_last_message_fallback, _attempt
 from .codex_cli import release_codex_home, write_run_files
-from .continuation import _CONTINUE_PROMPT, _CONTINUE_PROMPT_SCHEMA
+from .continuation import _CONTINUE_PROMPT, _CONTINUE_PROMPT_SCHEMA, _TOOL_ZERO_PROMPT, _TOOL_ZERO_PROMPT_SCHEMA
 from .ledger_gate import (
     _LEDGER_CONTINUE_CAP,
     _LEDGER_MANIFEST_INVALID_PROMPT,
@@ -19,6 +22,7 @@ from .ledger_gate import (
     _ledger_review_is_worse,
     _review_continuation_note,
 )
+from .turn_state import TOOL_USE_UNUSED
 from .turn_candidates import (
     _absorb_mcp_sidecar,
     _candidate_final,
@@ -68,6 +72,46 @@ def _resume_fallback(self, ctx, st, decision):
             _all_parent_thread_ids.append(st.thread_id)
 
 
+def _mark_child_rollouts(st):
+    """このターンの全部の親の子の rollout（先頭行だけ・軽い走査）が残っていれば child_spawned を立てる（spawn_agent が出ない形式の子を促しの前に見つける）。"""
+    if st.codex_home is None:
+        return
+    parents = list(st._all_parent_thread_ids)
+    if st.thread_id and st.thread_id not in parents:
+        parents.append(st.thread_id)
+    if not parents:
+        return
+    try:
+        for path in st.codex_home.glob("sessions/**/*.jsonl"):
+            with open(path, "r", encoding="utf-8") as f:
+                payload = (json.loads(f.readline()) or {}).get("payload")
+            tid = payload.get("id") if isinstance(payload, dict) else None
+            if any(_is_child_session_meta(payload, tid, child_thread_ids=st._child_thread_ids,
+                                          parent_thread_id=pid, min_mtime=st._turn_started_wall,
+                                          file_mtime=path.stat().st_mtime) for pid in parents):
+                st._tool_use.child_spawned = True
+                return
+    except (OSError, ValueError, TypeError, AttributeError):
+        st._tool_use.record_unreliable = True
+
+
+def _tool_zero_due(ctx, st, decision) -> bool:
+    """道具ゼロの促しを今出すか。資料参照オンの「調べる」で、ターン全部の実行を通して道具が 0 回（子の起動・記録の欠けは対象外）・1 ターン 1 回・正常終了のとき（会話の続きのターンも対象）。"""
+    if decision["lens"] == "author" or st._tool_zero_nudged or st._tool_use.verdict() != TOOL_USE_UNUSED:
+        return False
+    _mark_child_rollouts(st)
+    return (st._tool_use.verdict() == TOOL_USE_UNUSED
+            and st.attempt_returncode == 0 and st.got_any_line and not st._turn_failed)
+
+
+def _note_tool_zero(ctx, st):
+    """促した後も道具ゼロのまま終わったとき、止めずに注記を付ける印を立てる。"""
+    if (st._tool_zero_nudged and st._tool_use.verdict() == TOOL_USE_UNUSED
+            and not st._turn_failed and st.codex_question is None
+            and not (ctx.stop_event is not None and ctx.stop_event.is_set())):
+        st._tool_zero_notice = True
+
+
 def _continue_until_done(self, ctx, st, decision):
     """自動継続（途中経過で止まった）と台帳ゲート（回答が確定でも台帳が未完了）・見直しの一巡を、1 つのループで扱う。"""
     _schema_on = st._schema_on
@@ -91,6 +135,19 @@ def _continue_until_done(self, ctx, st, decision):
             break
         if not (st._session_persistence_enabled and (st.thread_id or st.resume_sid)):
             break
+        # ---- 道具ゼロの促し（1 ターン 1 回）----
+        if (_tool_zero_due(ctx, st, decision) and not _continuation_pending(st)
+                and (_candidate_final(st) is not None or st._agent_msgs)):  # 途中経過は通常の続きに任せる
+            st._tool_zero_nudged = True
+            st._structured_answers_valid_from = len(_structured_answers)
+            yield _node("cx-tool-zero", "think", "資料とソースを調べ直す",
+                        "資料もソースも調べずに答えたため、調べてから答え直します", "done")
+            yield from _attempt(self, ctx, st, decision, True,
+                                prompt_text=_TOOL_ZERO_PROMPT_SCHEMA if _schema_on else _TOOL_ZERO_PROMPT)
+            _absorb_last_message_fallback(st)
+            _update_structured_state(st)
+            _absorb_mcp_sidecar(st)
+            continue
         _ledger_gate_active = _schema_v2 and st._investigation_dir is not None
         _ledger_verdict = None
         if _ledger_gate_active:
@@ -303,6 +360,7 @@ def run_session(self, ctx, st, decision, env):
             _all_parent_thread_ids.append(st.thread_id)
         yield from _resume_fallback(self, ctx, st, decision)
         yield from _continue_until_done(self, ctx, st, decision)
+        _note_tool_zero(ctx, st)
         _revert_review_if_worse(st)
         _final_ledger_verdict(st)
     except Exception as exc:

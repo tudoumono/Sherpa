@@ -23,12 +23,13 @@ _log_codex = logging.getLogger("sherpa.codex")
 
 # レンズ→使うツールのノード（troubleshoot は2つ）。author は qa と同じ「文書を検索」。
 _TOOLS = {
+    "investigate": [("tool-docs", "文書を検索")],
     "impact": [("tool-graph", "関係グラフを照会")],
     "qa": [("tool-docs", "文書を検索")],
     "troubleshoot": [("tool-graph", "関連を確認"), ("tool-docs", "運用手順を検索")],
     "author": [("tool-docs", "文書を検索")],
 }
-_LENS_INTENT = {"impact": "変更の影響をたどります", "troubleshoot": "原因の手がかりを集めます",
+_LENS_INTENT = {"investigate": "資料とソースを調べます", "impact": "変更の影響をたどります", "troubleshoot": "原因の手がかりを集めます",
                 "qa": "仕様の記述を探します", "author": "作成の根拠を集めます"}
 
 
@@ -62,6 +63,8 @@ class Ctx:
     tools_availability: dict | None = None
     # chat_service がターン先頭（provider 呼出しより前）で取った `time.monotonic()`。provider はこれを起点に prepare を測る。None なら測らない。
     turn_started_mono: float | None = None
+    # 資料を中心に調べる指定（investigate のターンだけ真・CodexProvider だけが消費）。
+    doc_focus: bool = False
 
 
 def _node(id, kind, label, detail, status):

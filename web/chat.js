@@ -19,7 +19,7 @@ import {
 import './chat/history-search.js';
 import { send, sendOrStop, _closeOtherTurns, currentTurnGen } from './chat/stream.js';
 import { loadScopes, renderScopePanel, setScopeLabel, scopeChipLabel, setKb } from './chat/scope.js';
-import { setLayer, setDepthProfile, setTools, setToolsAvailability, resetInquiryForNewConversation, refreshInquirySummary, toolsExplicitForRestore } from './chat/inquiry.js';
+import { setDepthProfile, setTools, setToolsAvailability, resetInquiryForNewConversation, refreshInquirySummary, toolsExplicitForRestore } from './chat/inquiry.js';
 import { applyCachedBrain, loadConfig, exportMessages } from './chat/menus.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc;   // 共通ユーティリティ（nav.js）
@@ -65,7 +65,7 @@ $('messages').addEventListener('keydown', (e) => {
 });
 // chat_router._SLASH_LENS の逆写像（実効レンズ→スラッシュ語）。確認カードが lens_source==="slash" のとき、
 // 再送本文の先頭へ元の接頭辞を復元して既存のスラッシュ解決経路（サーバ側 _resolve_lens）に乗せるために使う。
-const _SLASH_WORD_FOR_LENS = { impact: '影響', troubleshoot: '原因', qa: '内容', author: '作成' };
+const _SLASH_WORD_FOR_LENS = { investigate: '内容', impact: '影響', troubleshoot: '原因', qa: '内容', author: '作成' };
 // AI/tool からの確認カード: 選択内容を同じ会話の次メッセージとして送る
 $('messages').addEventListener('click', (e) => {
   const btn = e.target.closest('[data-ask-submit]'); if (!btn) return;
@@ -81,8 +81,8 @@ $('messages').addEventListener('click', (e) => {
   if (free) lines.push(`補足: ${free}`);
   if (q.original_message) lines.push(`元の依頼: ${q.original_message}`);
   msg.querySelectorAll('input,textarea,button').forEach((x) => { x.disabled = true; });
-  // 「確認してから進めて」の確認カード（interaction_id が confirm-*）は、確認が出た時点で解決済みだった調べ方・探す対象・範囲・検索経路トグルを payload に持つ（chat_router.confirm_first_question）。
-  // 回答の再送は1回だけそれへ戻す（ブロックの継続設定 S.lens/S.layer/S.scope/S.tools は変えない）。
+  // 「確認してから進めて」の確認カード（interaction_id が confirm-*）は、確認が出た時点で解決済みだった調べ方・範囲・検索経路トグルを payload に持つ（chat_router.confirm_first_question）。
+  // 回答の再送は1回だけそれへ戻す（ブロックの継続設定 S.lens/S.scope/S.tools は変えない）。
   // lens_source==="slash" は、既存のスラッシュ接頭辞（/影響 等）を再送本文の先頭へ復元し、送信 override の lens にはブロックの継続設定（q.lens_block）を渡す（lens を直接送ると「1回限り」契約が崩れる）。
   // lens 選択の確認カード（interaction_id が ask-*）は本文の「選択:」から chat_router 側で解決するため対象外。
   const isConfirmFirst = typeof q.interaction_id === 'string' && q.interaction_id.startsWith('confirm-');
@@ -93,7 +93,7 @@ $('messages').addEventListener('click', (e) => {
     overrideLens = q.lens_block;
   }
   $('input').value = resendText;
-  send(isConfirmFirst ? { lens: overrideLens, layer: q.layer, scope_paths: q.scope_paths, tools: q.tools } : undefined);
+  send(isConfirmFirst ? { lens: overrideLens, scope_paths: q.scope_paths, tools: q.tools, doc_focus: q.doc_focus === true } : undefined);
 });
 // 過去ターンの「思考の流れ」ボタン → 右ペインの該当ターンを展開してスクロール。
 $('messages').addEventListener('click', (e) => {
@@ -190,8 +190,7 @@ $('messages').addEventListener('click', (e) => {
   const origScope = (msg._answer && msg._answer.scope) || {};
   const scopePaths = Object.prototype.hasOwnProperty.call(action, 'scope_paths')
     ? (action.scope_paths || []) : (origScope.scope_paths || []);
-  const layer = Object.prototype.hasOwnProperty.call(action, 'layer') ? action.layer : (origScope.layer || 'both');
-  // 調べる深さの軸（action.depth_profile）も範囲/探す対象と同型で反映する。
+  // 調べる深さの軸（action.depth_profile）も範囲と同型で反映する。
   const depthProfile = Object.prototype.hasOwnProperty.call(action, 'depth_profile')
     ? action.depth_profile : (origScope.depth_profile || 'standard');
   // 検索経路トグルの軸（action.tools）も同型で反映する（欠落=元回答の値・無ければ全ON）。
@@ -200,7 +199,6 @@ $('messages').addEventListener('click', (e) => {
   S.scope = scopePaths.slice();
   if (S.scopeTree) renderScopePanel(S.scopeTree);
   setScopeLabel(scopeChipLabel());   // 既存 setter（scope.js）を再利用
-  setLayer(layer);                  // 既存 setter（inquiry.js）を再利用
   setDepthProfile(depthProfile);    // 既存 setter（inquiry.js）を再利用
   setTools(tools);                  // 既存 setter（inquiry.js）を再利用
   $('input').value = bubble.textContent;
@@ -467,13 +465,13 @@ fetch('/world-options').then((r) => r.json()).then((d) => {
       if (want) sel.value = want;
       if (saved && !names.includes(saved)) localStorage.removeItem('sherpa-world');   // 削除済みフォルダの残骸掃除
     } catch (_) { /* no-op */ }
-    if (S.pendingConvWorld) {                                // 会話復元が先に走っていた場合の後追い（範囲・調べ方・探す対象の明示選択も復元）
+    if (S.pendingConvWorld) {                                // 会話復元が先に走っていた場合の後追い（範囲・調べ方・資料中心の明示選択も復元）
       const sc = S.currentScopeMeta;
       if (sel.value === S.pendingConvWorld && sc && sc.world === S.pendingConvWorld) {
         S.scope = (sc.source === 'explicit') ? (sc.scope_paths || []).slice() : [];
-        // 調べ方（lens）・探す対象（layer）も同じ後追い経路で復元する（scope.js の applyConversationScope が sc.lens_restore を計算済み）。
-        S.lens = sc.lens_restore || 'auto';
-        S.layer = sc.layer || 'both';
+        // 調べ方（lens）・資料中心も同じ後追い経路で復元する（scope.js の applyConversationScope が sc.lens_restore を計算済み）。
+        S.lens = sc.lens_restore || 'investigate';
+        S.docFocus = !!sc.doc_focus_restore;
         S.depthProfile = sc.depth_profile || 'standard';   // 同じ後追い経路で調べる深さも復元する
         S.webSearch = !!sc.web_search;   // 同じ後追い経路で Web 検索希望も復元する
         S.tools = sc.tools || { grep: true, fulltext: true, graph: true };   // 同じ後追い経路で検索経路トグルも復元する

@@ -155,6 +155,8 @@ _CONTINUE_PROMPT = (
     "最終回答はそのまま利用者に見せるので、利用者の元の質問への回答として書き、この指示や途中の経緯には触れないでください。"
     + _KEEP_FULL_ANSWER_RULE
 )
+# 道具を 1 回も使わずに答えたターンへの促し（1 ターン 1 回）。
+_TOOL_ZERO_PREFIX = "資料とソースを調べてから答えてください。まだ資料もソースも調べていません。"
 # 出力スキーマ有効時（`_schema_on`）だけ使う継続プロンプト（AGENTS.md が構造化応答 `status`／`answer`／`next_step` を求めるのはスキーマ有効時だけのため）。
 _CONTINUE_PROMPT_SCHEMA = (
     "続けてください。途中経過の報告ではなく、調査を最後まで進めて `status` を `final` にした"
@@ -163,3 +165,5 @@ _CONTINUE_PROMPT_SCHEMA = (
     "`final` の `answer` はそのまま利用者に見せるので、利用者の元の質問への回答として書き、この指示や途中の経緯には触れないでください。"
     + _FULL_ANSWER_RULE
 )
+_TOOL_ZERO_PROMPT = _TOOL_ZERO_PREFIX + _CONTINUE_PROMPT
+_TOOL_ZERO_PROMPT_SCHEMA = _TOOL_ZERO_PREFIX + _CONTINUE_PROMPT_SCHEMA

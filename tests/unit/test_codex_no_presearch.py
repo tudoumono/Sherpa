@@ -1,5 +1,5 @@
-"""MCP 付き Codex 経路は qa／troubleshoot／author で事前の下調べ（`providers/base.py::_gather` の
-`ctx.dispatch`＝grep／ES 検索）を省き、impact は省かない契約のテスト。
+"""MCP 付き Codex 経路は全部の調べ方で事前の下調べ（`providers/base.py::_gather` の
+`ctx.dispatch`＝grep／ES 検索・グラフでの影響のたどり）を省く契約のテスト。
 
 実害: MCP 版プロンプトは下調べの結果を Codex に渡さないのに、実環境の大きな資料フォルダでは
 トラブルシュートの下調べ（語ごとに資料フォルダ全体を読み直す grep）が Codex の起動を約 8 分止めていた。
@@ -27,11 +27,8 @@ print(json.dumps({"type": "turn.completed", "usage": {
 '''
 
 
-@pytest.mark.parametrize("lens, expect_dispatch", [
-    ("qa", False),        # 省く（Codex が MCP ツールで自分で調べる）
-    ("impact", True),     # 省かない（影響一覧を回答と並べて表示する）
-])
-def test_codex_presearch_skipped_only_for_non_impact(tmp_path, monkeypatch, lens, expect_dispatch):
+@pytest.mark.parametrize("lens", ["qa", "impact", "troubleshoot", "author"])
+def test_codex_presearch_skipped_for_every_lens(tmp_path, monkeypatch, lens):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake = bin_dir / "codex"
@@ -53,8 +50,8 @@ def test_codex_presearch_skipped_only_for_non_impact(tmp_path, monkeypatch, lens
     results = [e for e in A.CodexProvider().run(ctx) if isinstance(e, dict) and e.get("type") == "_result"]
     env = results[0]["env"]
 
-    assert calls == ([lens] if expect_dispatch else [])
+    assert calls == []
     assert env["headline"] == "Codex の回答"
-    if not expect_dispatch:
-        assert env.get("sources") == []          # 下調べ由来の出典が混ざらない
-        assert "agentic_failure" not in env      # 回答できたターンは失敗の印を外す
+    assert env.get("sources") == []          # 下調べ由来の出典が混ざらない
+    assert "agentic_failure" not in env      # 回答できたターンは失敗の印を外す
+    assert not (env.get("data") or {}).get("items")   # 影響一覧の表は作らない（「影響なし」とも出さない）

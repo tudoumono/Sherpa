@@ -168,12 +168,13 @@
         <div class="inquiry-row" id="lens-row">
           <span class="inquiry-label">やりたいこと</span>
           <div class="seg" id="lens-seg">
-            <button class="segbtn on" data-lens="auto" type="button">自動</button>
-            <button class="segbtn" data-lens="impact" type="button">影響</button>
-            <button class="segbtn" data-lens="troubleshoot" type="button">原因</button>
-            <button class="segbtn" data-lens="qa" type="button">内容</button>
-            <button class="segbtn" data-lens="author" type="button">作成</button>
+            <button class="segbtn on" data-lens="investigate" type="button">調べる</button>
+            <button class="segbtn" data-lens="author" type="button">作る</button>
           </div>
+        </div>
+        <div class="inquiry-row" id="docfocus-row">
+          <span class="inquiry-label">見方</span>
+          <button class="kbtoggle" id="docfocustoggle" aria-pressed="false" title="オンにすると設計書・資料を中心に調べます（ソースは設計書との食い違いの確認のために読みます）">📄 資料を中心に見る <b>オフ</b></button>
         </div>
         <div class="inquiry-row" id="depth-row">
           <span class="inquiry-label" title="見直しの回数です。クイック＝見直しなし（下調べ役の一次判断を確認 1 回だけ）／標準＝見直し 2 回／深く＝見直し 4 回・広く読む／最大＝管理者の設定値まで。どの段も管理者の設定値より多くはなりません。十分に調べられたら途中で終わります。使う AI によっては見直しが行われない構成があります。">調べる深さ</span>
@@ -191,15 +192,6 @@
             <div class="scopepanel" id="scopepanel" hidden></div>
           </span>
         </div>
-        <div class="inquiry-row" id="layer-row">
-          <span class="inquiry-label">探す対象</span>
-          <div class="seg" id="layer-seg">
-            <button class="segbtn on" data-layer="both" type="button">資料＋コード</button>
-            <button class="segbtn" data-layer="docs" type="button">資料のみ</button>
-            <button class="segbtn" data-layer="code" type="button">コードのみ</button>
-          </div>
-        </div>
-        <div class="inquiry-note muted" id="layer-note" hidden>ⓘ 影響検索（原因調べ）は資料とコードをつないで辿るため、探す対象の指定は使われません</div>
         <div class="inquiry-row">
           <span class="inquiry-label">参照する</span>
           <button class="kbtoggle on" id="kbtoggle" aria-pressed="true" title="オフにすると社内資料を調べず、一般的な知識だけで答えます">📚 社内資料 <b>オン</b></button>

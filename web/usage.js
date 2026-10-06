@@ -11,8 +11,8 @@ if (new URLSearchParams(location.search).has('embed')) {
 
 const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON, mdLite = Sherpa.mdLite, api = Sherpa.api;
 
-const LENS_LABEL = { impact: '影響分析', qa: '仕様問い合わせ', troubleshoot: 'トラブルシュート', chat: '素の会話' };
-const LENS_ORDER = ['impact', 'qa', 'troubleshoot', 'chat'];
+const LENS_LABEL = { investigate: '調べる', author: '作る', impact: '影響分析', qa: '仕様問い合わせ', troubleshoot: 'トラブルシュート', chat: '素の会話' };
+const LENS_ORDER = ['investigate', 'author', 'impact', 'qa', 'troubleshoot', 'chat'];
 
 // 頭脳別利用比率の表示名（brainmenu/chat.js の PROVIDERS と同じラベルに揃える）。
 // 専用のカテゴリランプが無いため、既存の semantic token（固定順）をカテゴリ色に転用し、常設の凡例＋直接ラベルで色だけに頼らない。
@@ -658,6 +658,33 @@ function renderLimits(limits) {
   </tr>`).join('');
 }
 
+// 「道具の使われ方」と「影響一覧」（件数だけ・資料名や検索語は出さない）。古い期間（新しい欄が 0・欠け）でも空の表で出す。
+function renderToolUse(tc, impact) {
+  const n = (v) => (v || 0).toLocaleString('ja-JP');
+  const tb = $('tool-calls-tbody');
+  if (tb) {
+    tb.innerHTML = ((tc && tc.tools) || []).map((t) => {
+      const r = t.by_role || {};
+      const avg = t.calls ? `${Math.round((t.ms || 0) / t.calls).toLocaleString('ja-JP')} ms` : '—';
+      return `<tr><td>${esc(t.tool)}</td><td class="num">${n(t.calls)}</td><td class="num">${n(t.found)}</td>`
+        + `<td class="num">${avg}</td><td class="num">${n(t.errors)}</td><td class="num">${n(t.truncated)}</td>`
+        + `<td class="num">${n((r.parent || {}).calls)}</td><td class="num">${n((r.child || {}).calls)}</td><td class="num">${n((r.undetermined || {}).calls)}</td></tr>`;
+    }).join('');
+  }
+  const sum = $('tool-calls-summary');
+  if (sum && tc) {
+    sum.textContent = `記録のあるターン ${n(tc.turns)}件・記録の欠け ${n(tc.missing)}行・開いた資料 ${n(tc.opened_docs)}件`
+      + `（記録が不完全なターン ${n(tc.opened_unknown_turns)}件）。`
+      + `道具を使わずに答えようとして調べ直しを促したターン ${n(tc.nudged_turns)}件・促した後に使った ${n(tc.nudged_then_used)}件・`
+      + `それでも使わなかった ${n(tc.no_tool_use_turns)}件。`;
+  }
+  const im = $('impact-summary');
+  if (im && impact) {
+    im.textContent = `影響をたどったターン ${n(impact.traced_turns)}件（たどらなかった ${n(impact.untraced_turns)}件）・`
+      + `候補 ${n(impact.candidate)}件・確かめた ${n(impact.inspected)}件・根拠に使った ${n(impact.used)}件・対応が分からない ${n(impact.unmapped)}件${impact.more ? `・上限で省いた行 ${n(impact.more)}件（状態は数えていません）` : ''}${impact.hidden ? `・名前を出せない行 ${n(impact.hidden)}件（状態は数えていません）` : ''}。`;
+  }
+}
+
 const REVIEW_LABELS = {
   confirmed: '確定', inferred: '推定', unknown: '不明',
   sufficient: '十分', insufficient: '根拠不足', undecidable: '判定できず',
@@ -1031,6 +1058,7 @@ async function load(period) {
     renderConversationTurns(d.conversation_turns || {}, d.resume_rate);
     renderResponseTime(d.response_time || {});
     renderLimits(d.limits || {});
+    renderToolUse(d.tool_calls || {}, d.impact || {});
     renderReviewStats(d.rounds, d.quality_runs);
     renderTokens(d.tokens || {}, d.period);
     renderConversationsTop(d.conversations_top || []);

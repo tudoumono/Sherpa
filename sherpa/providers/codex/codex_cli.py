@@ -8,7 +8,7 @@ import os
 import shutil
 import time
 
-from ... import codex_agents_md, codex_skills, investigation_ledger, metering
+from ... import codex_agents_md, codex_skills, investigation_ledger, metering, tool_call_log
 from ... import depth_profile as depth_profile_mod
 from ..base import _log, _log_chat_usage, _log_codex, _node, _usage_meta
 from . import sandbox
@@ -207,7 +207,7 @@ def write_run_files(self, ctx, st):
                                             review_rounds=_review_rounds,
                                             layer=_layer,
                                             review_rounds_escalation=_review_rounds_escalation,
-                                            source_required=bool(st._ledger_required_extra))
+                                            source_required="source" in st._ledger_required_extra)
     except Exception as e:
         _log.warning("AGENTS.md write failed (fail-open, prompt still has containment): %s", e)
     # スキル配備もベストエフォート（fail-open）。knowledge=ON の Codex 実行全部で配備する（author に限定しない）。plain は investigate-* スキルを置かない（xlsx/docx/pptx/marp は配備する）。
@@ -270,10 +270,13 @@ def release_codex_home(ctx, st, env):
         try:
             (st._child_usage_totals, st._child_usage_found, st._child_usage_missing,
              st._child_usage_detected) = (
-                _collect_child_token_usage(codex_home, _child_thread_ids, st.thread_id,
+                _collect_child_token_usage(codex_home, _child_thread_ids,
+                                           _activity_parent_ids,
                                            _turn_started_wall))
         except Exception:
             pass
+        if st._child_usage_detected:  # spawn_agent が出ない形式でも子の rollout を見つけたら子ありとする
+            st._tool_use.child_spawned = True
         # 利用統計 activity: codex_home 削除より前に、同じ fail-open 方針で要約する（読めなくても本体ターンは落とさず、型名/errno だけ warning ログに出す）。settings は開始行の直後で確定済みの値を渡す。prepare/agent はここで初めて確定する。prepare は `ctx.turn_started_mono`／`_agent_start_mono` のどちらかが無ければキー自体を置かない（0埋めしない）。
         try:
             _activity_agent_ms = (
@@ -372,6 +375,10 @@ def build_launch(self, ctx, st):
         # 個人ファイル参照トグルが ON のターンは、ヒットの有無に関わらず台帳の coverage に検索語を記録しない（個人の内容が混ざり得るため）。
         if ctx.personal or ctx.personal_facts:
             _mcp_budget_env["SHERPA_MCP_COVERAGE_NO_QUERY"] = "1"
+    # Sherpa 側の ID（会話・ターン）を MCP サーバーへ渡す。何回目の実行かは `_build_argv` が実行ごとに足す。
+    if ctx.conversation_id is not None:
+        _mcp_budget_env["SHERPA_MCP_CONVERSATION_ID"] = str(ctx.conversation_id)
+    _mcp_budget_env["SHERPA_MCP_TURN_ID"] = st.turn_uid
     codex_home = None
     # サイドカーの置き場（`_sidecar_path`）は、本サーバ側は書けるが model-shell からは書込許可外の場所に決める。両分岐の中で確定し、`_absorb_mcp_sidecar` のガードはこの変数と `_sidecar_init_ok` を見る。既定は非サンドボックス経路の置き場（サンドボックス有効時のみ codex_home 配下へ差し替える）。
     _sidecar_path = _tmp / _MCP_SIDECAR_NAME
@@ -386,6 +393,9 @@ def build_launch(self, ctx, st):
             codex_home = users_dir / uid / "workspace" / f".codexhome-{_rand}"
         # codex_home（`:root deny`＝model-shell から不可視・MCP サーバは別プロセスなので書ける）配下に置く。run_dir 直下だと Codex の shell ツールが偽の `{"kind":"read",...}`/`{"kind":"ask_user",...}` 行を追記でき、未読資料を根拠ゲートへ通したり任意の確認カードでターンを潰せてしまう。
         _sidecar_path = codex_home / _MCP_SIDECAR_NAME
+        # 道具の呼び出しの記録の置き場。サンドボックスのシェルから書けない codex_home の中（ターンごとの名前・終わりに消す）。
+        st._call_log_dir = codex_home / f"toolcalls-{st.turn_uid}"
+        _mcp_budget_env[tool_call_log.ENV_DIR] = str(st._call_log_dir)
         argv_base = ["codex", "exec", "--json", "--strict-config", "--skip-git-repo-check",
                     "-o", str(_last_message_path),
                     "-C", str(run_dir), "-m", self.model,
@@ -409,6 +419,9 @@ def build_launch(self, ctx, st):
         argv_base += _web_search_c_args(self._web_search, self._system_settings)
         # `.tmp/`（run_dir 配下）はこの経路では model-shell からも見える（封じ込めが無い前提の経路）。`_sidecar_append` が書く内容は doc_id／ツール名／種別／時刻（と ask_user の質問）だけで本文は書かないが、shell が偽の行を追記できる可能性は残る。
         _sidecar_env = {"SHERPA_MCP_SIDECAR": str(_sidecar_path)}
+        # 封じ込めの無い経路（SHERPA_CODEX_SANDBOX=0）はシェルからも書ける＝ターンの作業フォルダの中に置く。
+        st._call_log_dir = _tmp / "toolcalls"
+        _mcp_budget_env[tool_call_log.ENV_DIR] = os.path.realpath(st._call_log_dir)
         argv_base += _mcp_config_args(ctx.world, sp, _ask_disabled, layer=_layer,
                                       extra_env={**_mcp_budget_env, **_sidecar_env})
         popen_env = {**os.environ, **_mcp_env(ctx.world, sp, _ask_disabled, layer=_layer),

@@ -100,18 +100,18 @@ def route(message: str, known_terms=None) -> dict:
 
 def decision_for(lens: str, message: str, known_terms=None, reason: str = "AI判定") -> dict:
     """LLM 等（Tier2）が選んだ lens を decision に整える。不正な lens は qa。"""
-    if lens not in ("impact", "troubleshoot", "qa", "author"):
+    if lens not in ("investigate", "impact", "troubleshoot", "qa", "author"):
         lens = "qa"
     return _decision(lens, message, known_terms, reason, confident=True)
 
 
 # 上級者向けの 1 回限りのスラッシュ指定。`_CLARIFY_OPTIONS` のラベルに対応する 4 語のみ（半角/全角スペース区切り）。
-_SLASH_LENS = {"影響": "impact", "原因": "troubleshoot", "内容": "qa", "作成": "author"}
+_SLASH_LENS = {"影響": "investigate", "原因": "investigate", "内容": "investigate", "作成": "author"}
 _SLASH_RE = re.compile(r"^/(影響|原因|内容|作成)[ 　]+")
 
 
 def extract_slash_lens(message: str):
-    """メッセージ先頭の `/影響 `・`/原因 `・`/内容 `・`/作成 ` を検出する。
+    """メッセージ先頭の `/影響 `・`/原因 `・`/内容 `（調べる）・`/作成 ` を検出する。
     一致すれば `(lens, 接頭辞を除いた本文)`（次のターンへは引き継がない 1 回限り）、しなければ `(None, message)`。
     """
     m = _SLASH_RE.match(message or "")
@@ -156,9 +156,10 @@ def wants_confirm_first(message: str) -> bool:
 
 def confirm_first_question(message: str, *, lens: str | None = None, layer: str | None = None,
                            scope_paths=None, lens_source: str | None = None,
-                           lens_block: str | None = None, tools: dict | None = None) -> dict:
+                           lens_block: str | None = None, tools: dict | None = None,
+                           doc_focus: bool = False) -> dict:
     """「確認してから進めて」指定時の確認カード（ask_user と同じ question イベント形）。
-    `lens`/`layer`/`scope_paths`/`lens_source`/`lens_block`/`tools` は、確認カードを出した時点で解決済みの指定で、
+    `lens`/`layer`/`scope_paths`/`lens_source`/`lens_block`/`tools`/`doc_focus` は、確認カードを出した時点で解決済みの指定で、
     本文に残らないため payload に載せて運び、回答の再送時に既存の経路へ 1 回だけ戻す。
     """
     return {"type": "question", "interaction_id": "confirm-" + secrets.token_hex(4),
@@ -167,15 +168,18 @@ def confirm_first_question(message: str, *, lens: str | None = None, layer: str 
             "options": list(_CONFIRM_FIRST_OPTIONS), "allow_free_text": True,
             "original_message": (message or "").strip(),
             "lens": lens, "layer": layer, "scope_paths": list(scope_paths or []),
-            "lens_source": lens_source, "lens_block": lens_block, "tools": tools}
+            "lens_source": lens_source, "lens_block": lens_block, "tools": tools,
+            "doc_focus": bool(doc_focus)}
 
 
 def confirm_first_decision(message: str, *, lens: str | None = None, layer: str | None = None,
                           scope_paths=None, lens_source: str | None = None,
-                          lens_block: str | None = None, tools: dict | None = None) -> dict:
+                          lens_block: str | None = None, tools: dict | None = None,
+                           doc_focus: bool = False) -> dict:
     """confirm-first 用 decision（provider が question を emit して停止）。非対話経路は `fallback`（qa）。"""
     return {"lens": "clarify", "input": (message or "").strip(), "reason": "確認してから進める指定",
             "confident": False, "fallback": "qa",
             "question": confirm_first_question(message, lens=lens, layer=layer,
                                                scope_paths=scope_paths, lens_source=lens_source,
-                                               lens_block=lens_block, tools=tools)}
+                                               lens_block=lens_block, tools=tools,
+                                               doc_focus=doc_focus)}

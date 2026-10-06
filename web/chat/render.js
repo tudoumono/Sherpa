@@ -8,7 +8,7 @@ import { setRt } from './stream.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime, mdLite = Sherpa.mdLite, analyzerLabel = Sherpa.analyzerLabel;
 
-const LENS_LABEL = { impact: '影響範囲分析', troubleshoot: 'トラブルシュート', qa: '仕様問い合わせ', author: '資料を作成' };
+const LENS_LABEL = { investigate: '調べる', impact: '影響範囲分析', troubleshoot: 'トラブルシュート', qa: '仕様問い合わせ', author: '資料を作成' };
 const STATUS_CLASS = { deprecated: 'deprecated', hidden_candidate: 'hidden_candidate' };
 const STATUS_LABEL = { deprecated: '廃止', hidden_candidate: '未使用の疑い' };
 
@@ -815,8 +815,8 @@ function answerHTML(answer, trace, feedback) {
   }
   // レンズ未決定（lens が null）のときは空のチップを出さない
   const lensLabel = LENS_LABEL[answer.lens] || answer.lens;
-  const chip = `<div class="chips">${lensLabel ? `<span class="chip">${esc(lensLabel)}</span>` : ''}`
-    + _scopeChipsHTML(answer.scope)
+  const chip = `<div class="chips">${lensLabel && !howText(answer) ? `<span class="chip">${esc(lensLabel)}</span>` : ''}${howChipHTML(answer)}`
+    + _scopeChipsHTML(answer.scope, !!answer.how)
     + ((answer.route && answer.route.path) || []).map((p) => `<span class="chip">${esc(p)}</span>`).join('')
     + _depthHeaderHTML(answer.scope, answer.duration_ms) + '</div>';
   // impact はグラフ由来（items/presumed）と検索由来（citations）の2形がある。グラフ結果が無い回答は QA と同じ引用表示にする
@@ -824,7 +824,8 @@ function answerHTML(answer, trace, feedback) {
   // troubleshoot も、原因候補（candidates）が無ければ QA と同じ引用表示にする
   const troubleHasCandidates = !!(answer.data && (answer.data.candidates || []).length);
   const body = (answer.lens === 'impact' && impactHasGraph) ? renderImpact(answer)
-    : (answer.lens === 'troubleshoot' && troubleHasCandidates) ? renderTrouble(answer) : renderQa(answer);
+    : (answer.lens === 'troubleshoot' && troubleHasCandidates) ? renderTrouble(answer)
+    : hasReferencedDocs(answer) ? '' : renderQa(answer);
   // 検証バッジは trace_version=2 の回答だけに付ける
   const evidencePacketForBadges = answer.trace_version === 2 ? (answer.data && answer.data.evidence_packet) : null;
   return chip + answerNoticesHTML(answer) + `<div class="headline">${mdLite(answerBody(answer))}</div>`
@@ -833,7 +834,10 @@ function answerHTML(answer, trace, feedback) {
     + retryHintsHTML(answer.retry_hints) + body
     + refGraphHTML(answer) + renderCreatedFiles(answer.created_files)
     + renderReconciliation(answer)
-    + renderSources(answer.sources, answer.sources_verified, evidencePacketForBadges)
+    + renderImpactList(answer)
+    + (hasReferencedDocs(answer) ? renderReferencedDocs(answer, evidencePacketForBadges)
+      : renderSources(answer.sources, answer.sources_verified, evidencePacketForBadges))
+    + renderFoundDocs(answer)
     + renderSourcesUnverified(answer)
     + renderInvestigationRecord(answer.investigation) + personalHTML
     + summaryHTML + usageHTML + usageSubHTML
@@ -841,14 +845,14 @@ function answerHTML(answer, trace, feedback) {
     + feedbackHtml;
 }
 
-// 回答ヘッダに、使った範囲・探す対象をチップで示す。層が効かないレンズ（layer_applied:false）は「非適用」と注記する。
+// 回答ヘッダに、使った範囲（古い回答は探す対象も）をチップで示す。層が効かないレンズ（layer_applied:false）は「非適用」と注記する。
 const LAYER_CHIP_LABEL = { both: '資料＋コード', docs: '資料のみ', code: 'コードのみ' };
-function _scopeChipsHTML(scope) {
+function _scopeChipsHTML(scope, hasHow) {
   if (!scope) return '';
   const paths = scope.scope_paths || [];
   const scopeLabel = paths.length ? paths.map((p) => S.scopeLabels[p] || p.split('/').pop()).join('・') : '全体';
   let out = `<span class="chip">${esc(scopeLabel)}</span>`;
-  if (scope.layer) {
+  if (scope.layer && !hasHow) {   // 新しいターン（how あり）は探す対象を出さない
     const layerLabel = esc(LAYER_CHIP_LABEL[scope.layer] || scope.layer);
     out += scope.layer_applied === false
       ? `<span class="chip ghost" title="このやりたいこと（影響・原因）では探す対象の指定は使われません">${layerLabel}（非適用）</span>`
@@ -1147,6 +1151,91 @@ function renderSources(sources, verifiedDocIds, evidencePacket) {
   }
   return `<div class="sources"><div class="h">出典（原本をダウンロード）</div>${sources.map(link).join('')}</div>`;
 }
+// 新しい欄（answer.referenced_docs / impact_list / found_docs / how）。無い・壊れた欄（旧形式）は空として扱い、空の表や「影響なし」を作らない。
+const IMPACT_STATE_LABEL = { candidate: '候補', inspected: '確かめた', used: '根拠に使った', unmapped: '対応不明' };
+const _cnt = (v) => (Number.isInteger(v) && v > 0 ? v : 0);
+const _isLine = (v) => Number.isInteger(v) && v > 0;
+export function referencedDocRows(answer) {
+  const list = answer && Array.isArray(answer.referenced_docs) ? answer.referenced_docs : [];
+  const rows = list.filter((r) => r && typeof r.path === 'string' && r.path.trim()).map((r) => ({
+    path: r.path, unopened: r.unopened === true, rangesMore: _cnt(r.ranges_more),
+    ranges: (Array.isArray(r.ranges) ? r.ranges : []).filter((x) => Array.isArray(x) && x.length === 2 && _isLine(x[0]) && _isLine(x[1]) && x[1] >= x[0]),
+  }));
+  return { rows, hidden: _cnt(answer && answer.referenced_docs_hidden), more: _cnt(answer && answer.referenced_docs_more) };
+}
+export function impactListView(answer) {
+  const s = answer && answer.impact_list;
+  if (!s || typeof s !== 'object' || typeof s.traced !== 'boolean') return null;
+  const rows = (Array.isArray(s.rows) ? s.rows : []).filter((r) => r && typeof r.name === 'string' && r.name.trim() && IMPACT_STATE_LABEL[r.state])
+    .map((r) => ({ name: r.name, path: typeof r.path === 'string' ? r.path : '', origin: r.role === 'origin',
+      state: r.state, label: IMPACT_STATE_LABEL[r.state], reason: typeof r.reason === 'string' ? r.reason : '' }));
+  const reasons = (Array.isArray(s.reasons) ? s.reasons : []).filter((x) => typeof x === 'string' && x.trim());
+  return { traced: s.traced, rows, reasons, more: _cnt(s.more), hidden: _cnt(s.hidden) };
+}
+export function foundDocRows(answer) {
+  const list = answer && Array.isArray(answer.found_docs) ? answer.found_docs : [];
+  return { rows: list.filter((r) => r && typeof r.path === 'string' && r.path.trim()).map((r) => r.path),
+    hidden: _cnt(answer && answer.found_docs_hidden), more: _cnt(answer && answer.found_docs_more) };
+}
+export function howText(answer) {
+  const h = answer && answer.how;
+  if (!h || typeof h !== 'object') return '';
+  const base = h.mode === 'author' ? '作る' : h.mode === 'investigate' ? '調べる' : '';
+  return base ? (h.doc_focus === true && h.mode === 'investigate' ? '資料中心の指定で調べました' : base) : '';
+}
+export const rangeText = (r) => r.ranges.map((x) => (x[0] === x[1] ? `行${x[0]}` : `行${x[0]}-${x[1]}`)).join('、');
+// 新しい形の回答（`referenced_docs` の欄がある）。無い古い回答は出典の 2 群（`renderSources`）と該当箇所（`renderQa`）で出す。
+const hasReferencedDocs = (answer) => !!answer && Array.isArray(answer.referenced_docs);
+// 参照した資料（原本をダウンロード）。資料ごとに原本のリンク・Codex が開いた行の範囲・中身を確かめていない注記を出す。
+// 設計: docs/design/chat.md「1ターンの流れ」
+function renderReferencedDocs(answer, evidencePacket) {
+  const { rows, hidden, more } = referencedDocRows(answer);
+  const head = '<div class="sources referenced-docs"><div class="h">参照した資料（原本をダウンロード）</div>';
+  if (!rows.length && !hidden && !more) return `${head}<span class="muted" style="font-size:var(--text-small)">参照した資料はありません</span></div>`;
+  const vmap = _verificationMethodByDoc(evidencePacket);
+  const byDoc = new Map((Array.isArray(answer.sources) ? answer.sources : []).filter((s) => s && typeof s.doc_id === 'string').map((s) => [s.doc_id, s]));
+  const link = (r) => {
+    const s = byDoc.get(r.path) || { doc_id: r.path };
+    return (s.download_url
+      ? `<a href="${esc(s.download_url)}" data-dl>📄 ${esc(r.path)}</a>`
+      : `<span class="muted" title="この画面ではダウンロードできません">📄 ${esc(r.path)}（ダウンロードできません）</span>`)
+      + `${verificationBadgeHTML(vmap.get(r.path))}${importanceBadgeHTML(s)}`;
+  };
+  return head
+    + rows.map((r) => `<div class="sources-unverified-row">${link(r)}${r.ranges.length ? `<span class="muted">（${esc(rangeText(r))}${r.rangesMore ? `、ほか ${r.rangesMore} か所` : ''}）</span>` : (r.rangesMore ? `<span class="muted">（ほか ${r.rangesMore} か所）</span>` : '')}`
+      + `${r.unopened ? '<span class="muted">（Codex の読み取り記録なし）</span>' : ''}</div>`).join('')
+    + (more ? `<div class="sources-unverified-row muted">ほか ${more} 件</div>` : '')
+    + (hidden ? `<div class="sources-unverified-row muted">名前を表示できない資料 ${hidden} 件</div>` : '') + '</div>';
+}
+function renderImpactList(answer) {
+  const v = impactListView(answer);
+  if (!v) return '';
+  const notes = v.reasons.map((x) => `<div class="sources-unverified-row muted">${esc(x)}</div>`).join('');
+  if (!v.traced) {
+    return '<div class="sources impact-list"><div class="h">影響一覧</div><div class="muted">影響をたどっていません</div>' + notes + '</div>';
+  }
+  const body = v.rows.map((r) => `<tr class="impact-${r.state}"><td data-label="名前">${esc(r.name)}${r.origin ? '<span class="impact-origin">起点</span>' : ''}${r.path ? `<div class="muted">${esc(r.path)}</div>` : ''}</td>`
+    + `<td data-label="状態"><span class="impact-state">${esc(r.label)}</span></td><td data-label="理由">${esc(r.reason)}</td></tr>`).join('');
+  const affected = v.rows.filter((r) => !r.origin).length;
+  const empty = !affected && !v.more ? `<div class="muted">${v.reasons.length ? '影響先は見つかっていません（すべてをたどれたとは言えません）' : 'グラフでたどれる影響先は見つかりませんでした'}</div>` : '';
+  return '<div class="sources impact-list"><div class="h">影響一覧</div>'
+    + (v.rows.length ? `<table class="recon-table"><thead><tr><th>名前</th><th>状態</th><th>理由</th></tr></thead><tbody>${body}</tbody></table>` : '')
+    + empty + notes
+    + (v.more ? `<div class="sources-unverified-row muted">ほか ${v.more} 件</div>` : '')
+    + (v.hidden ? `<div class="sources-unverified-row muted">名前を表示できない項目 ${v.hidden} 件</div>` : '') + '</div>';
+}
+function renderFoundDocs(answer) {
+  const { rows, hidden, more } = foundDocRows(answer);
+  if (!rows.length && !hidden && !more) return '';
+  return '<details class="sources found-docs"><summary class="h">ほかに見つかった資料（Codex の読み取り記録なし）</summary>'
+    + rows.map((p) => `<div class="sources-unverified-row">${esc(p)}</div>`).join('')
+    + (more ? `<div class="sources-unverified-row muted">ほか ${more} 件（上限で省略）</div>` : '')
+    + (hidden ? `<div class="sources-unverified-row muted">名前を表示できない資料 ${hidden} 件</div>` : '') + '</details>';
+}
+function howChipHTML(answer) {
+  const t = howText(answer);
+  return t ? `<span class="chip">${esc(t)}</span>` : '';
+}
 // 設計書とソースの照らし合わせ（answer.data.reconciliation）。Codex が両方を確かめた項目だけ。旧形式・壊れた行は出さない。
 const RECON_VERDICT_LABEL = { match: '一致', mismatch: '食い違い（ソースが正）', spec_missing: '設計書に記述なし',
   source_missing: 'ソースに見当たらない', unverified: '未確認' };
@@ -1190,7 +1279,7 @@ export function unverifiedSourceRows(answer) {
 }
 function renderSourcesUnverified(answer) {
   const { rows, hidden, more } = unverifiedSourceRows(answer);
-  if (!rows.length && !hidden) return '';
+  if (!rows.length && !hidden && !more) return '';
   return '<div class="sources sources-unverified"><div class="h">確認できなかった資料</div>'
     + rows.map((u) => `<div class="sources-unverified-row">${esc(u.path)}${u.reason ? `<span class="muted">（${esc(u.reason)}）</span>` : ''}</div>`).join('')
     + (more ? `<div class="sources-unverified-row muted">ほか ${more} 件</div>` : '')

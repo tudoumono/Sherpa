@@ -338,7 +338,7 @@ def _resolve_lens(lens, message):
 
 
 def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=None, scope_meta=None,
-                  conversation_id=None):
+                  conversation_id=None, doc_focus=False):
     """hybrid intent ルータ。heuristic 確信 →（曖昧）LLM 分類 →（なお曖昧）clarify or qa fallback。
     - per-turn memoize: 同一ターンで route が複数回呼ばれても LLM 分類を二重実行しない。`can_ask` はストリーミングのみ True（非対話は qa fallback）。
     - `user_id`/`conversation_id` は intent 分類の利用量計測（`kind='intent'`）にだけ渡す。
@@ -363,7 +363,7 @@ def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=N
             d = _confirm_first_decision(message, lens=explicit_lens, layer=sm.get("layer"),
                                         scope_paths=sm.get("scope_paths"),
                                         lens_source=sm.get("lens_source"), lens_block=sm.get("lens_block"),
-                                        tools=sm.get("tools"))
+                                        tools=sm.get("tools"), doc_focus=doc_focus)
             cache[message] = d
             return d
         if explicit_lens:  # 調べ方の明示指定＝Tier1〜3 を飛ばす
@@ -389,7 +389,7 @@ def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=N
     return _route
 
 # 経路チップ：レンズ→使った経路（専門用語を出さない）。
-_ROUTE_PATH = {"impact": ["関係を確認"], "troubleshoot": ["関連を確認", "文書を検索"], "qa": ["文書を検索"],
+_ROUTE_PATH = {"investigate": ["文書を検索"], "impact": ["関係を確認"], "troubleshoot": ["関連を確認", "文書を検索"], "qa": ["文書を検索"],
                "author": ["文書を検索", "資料を作成"]}
 # 出典に出さない内部来歴マーカー（DL できる文書ではない）。`scope.NON_DOC` と共有する。
 _NON_DOC = scope.NON_DOC
@@ -681,6 +681,9 @@ def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=No
       qa/author は grep（`run_qa`）と fulltext（ES 補完）のどちらか一方でも実行し、troubleshoot はグラフ必須で fulltext 補完のみを追加で切り替える。
       `tools_availability`（省略可）は呼び出し元がターンにつき 1 回計算した `agentic_search.tool_availability()` の結果で、ここでは計算しない。
     """
+    scope_lens = lens
+    if lens == "investigate":  # 事前検索は qa と同じ下地（grep＋ES）
+        lens = "qa"
     sp = (scope_meta or {}).get("scope_paths") or None
     layer = layer_mod.effective_layer(scope_meta, lens)  # 非適用レンズは常に both（`layer.effective_layer` が判定）
     profile = (scope_meta or {}).get("depth_profile")
@@ -754,7 +757,7 @@ def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=No
     else:  # qa: grep＋ES を統合（Codex/heuristic/非 agentic も ES 参照）
         env = _qa_fallback_env()
     # 参照中の範囲（D/監査）＋このレンズで層フィルタが実効したか（UI が非適用の注記を出すための 1 項目）。
-    env["scope"] = layer_mod.scope_with_layer(scope_meta, world=world, lens=lens)
+    env["scope"] = layer_mod.scope_with_layer(scope_meta, world=world, lens=scope_lens)
     return env
 
 
@@ -877,7 +880,7 @@ def _finalize(env, decision, message: str = ""):
         hints = _retry_hints(env, message)
         if hints:
             env["retry_hints"] = hints
-        elif (decision["lens"] in ("qa", "author") and not _is_budget_exhausted(env)
+        elif (decision["lens"] in ("qa", "investigate", "author") and not _is_budget_exhausted(env)
               and not _codex_stopped_early):
             # 全軸が既に最も緩い設定（全体・資料＋コード・最大）でなお 0 件のとき、これ以上緩める軸が無いため案内を出す。予算到達・Codex の作業宣言止まりの途中結果、および impact/troubleshoot（headline が十分具体的）は上書きしない。
             _head = answer_shape.body_of(env).strip()
@@ -1247,7 +1250,7 @@ def stream_message(session, message, world="v1",
                    knowledge=False, personal=False, users_dir="data/users", stop_event=None,
                    on_user_saved=None, web_search=False, depth_profile=None, tools=None,
                    tools_explicit=None, tools_availability=None, provider=None, settings=None,
-                   sys_settings=None, recovered_result=None):
+                   sys_settings=None, recovered_result=None, doc_focus=False):
     """思考イベントを逐次 yield する（SSE）。頭脳は provider（差し替え可能）で、UI/プロトコルは不変。
     provider が `node`（動的に何個でも）を流し、最後に内部 `_result` を返す。本関数は会話の用意・永続だけを担い、`_result` を `answer` イベントに変換して返す。
     - `knowledge=False`（既定）: 検索せず素の会話（資料参照オフ）。`True` で社内資料を参照する（レンズ＋出典）。
@@ -1255,6 +1258,7 @@ def stream_message(session, message, world="v1",
     - `personal=True`: 共有 KB に加え本人の個人ファイルも grep して事実+引用に含める。個人ファイルは ES/Neo4j に入れず、本人のみ参照可。
     - `web_search=False`（既定）: このチャットで Codex の Web 検索を希望するか。保存済みの個人設定 `codex_web_search` は実行には使わず、この値で上書きしてから provider を選ぶ。
     - `depth_profile`（既定 `None`＝`"standard"`）: 調べる深さ。`_dispatch()`/agentic 探索の反復・ヒット上限・探索深さ・Codex 推論に倍率で効く（evaluator の巡数は `depth_profile.review_rounds_for`）。
+    - `doc_focus`（既定 False）: 資料を中心に調べる指定。`investigate` のターンだけ Codex への指示に効く（`Ctx.doc_focus`）。
     - `tools`（既定 `None`＝全 ON）: 検索経路トグル。agentic 探索が提示する grep/es_search/graph_neighbors を絞る（Codex は対象外）。
     - `tools_availability`（既定 `None`＝自分で計算）: 呼び出し元（`routers/chat.py`）が受付時の 422 判定と同時に計算した可用性 snapshot。渡されたらそれを使う（受付時と実行時で可用性が食い違わないように）。
     - `provider`/`settings`/`sys_settings`（既定 `None`＝自分で用意）: 呼び出し元が受付段階で組み立てた同一の Provider／ユーザ設定／システム設定を実行本体まで渡す。別々に読み直すと、受付時の接続先検証と実行時の provider が別世代の設定を使い得る。
@@ -1306,7 +1310,8 @@ def stream_message(session, message, world="v1",
         message=message, world=world, pace=emit_pace(), knowledge=knowledge,
         route=_build_router(known, world, settings, can_ask=True, user_id=user_id,
                             explicit_lens=explicit_lens, scope_meta=scope_meta,
-                            conversation_id=conversation_id),  # ストリーミング＝曖昧なら clarify で確認
+                            conversation_id=conversation_id,
+                            doc_focus=bool(doc_focus) and explicit_lens == "investigate"),  # ストリーミング＝曖昧なら clarify で確認
         dispatch=_dispatch_with_personal if personal else
                  (lambda lens, inp: _dispatch(session, lens, inp, world, scope_meta, sys_settings,
                                               tools_availability)),
@@ -1324,6 +1329,7 @@ def stream_message(session, message, world="v1",
         tools_availability=tools_availability,
         # activity.phases_ms.prepare の起点。provider 呼出し前の処理も prepare に含める。
         turn_started_mono=_t0,
+        doc_focus=bool(doc_focus) and explicit_lens == "investigate",
     )
     # 「思考の流れ」を `messages.trace` に保存し、会話ロード時に右ペインへ静的復元する。node は id 単位で更新され得るため id で dedup し、最終状態のみ保持する。question は別カードで表示するため含めない。
     trace_nodes: dict = {}
@@ -1353,6 +1359,8 @@ def stream_message(session, message, world="v1",
                     personal=bool(personal or personal_hits or ev["env"].get("_personal_rounds")
                                   or ev["env"].get("wrote_files") or ev["env"].get("codex_wrote_files")),
                     stopped=ev["env"].get("_terminal") == "stopped")
+            if explicit_lens in answer_shape.HOW_MODES:
+                ev["env"]["how"] = {"mode": explicit_lens, "doc_focus": bool(ctx.doc_focus)}
             env = _finalize(ev["env"], ev["decision"], message)
             # `_result` のサイドカーを trace へ折り込む（孤児イベント防止・永続化後にライブ配信もする）。
             _ev_committed_node = _pop_evidence_committed(env, trace_nodes)

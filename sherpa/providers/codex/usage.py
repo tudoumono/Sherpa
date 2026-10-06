@@ -139,7 +139,7 @@ CACHE_WRITE_KEY = "cache_write_tokens"
 
 
 def _collect_child_token_usage(codex_home: Path, child_thread_ids: set,
-                                parent_thread_id: str | None = None,
+                                parent_thread_id: "str | list | tuple | set | None" = None,
                                 min_mtime: float | None = None) -> tuple[dict, int, int, int]:
     """`spawn_agent` した子スレッドの usage を、子ごとの session JSONL（`codex_home/sessions/**/*.jsonl`）から集める。親の `turn.completed.usage` には子の分が含まれない。
     「起動を検出した」ことと「usage を読めた」ことは別に扱う。
@@ -151,7 +151,10 @@ def _collect_child_token_usage(codex_home: Path, child_thread_ids: set,
     `totals[CACHE_WRITE_KEY]` は usage を読めた子がすべてキャッシュ書き込み量を返したときだけ入れ、1 体でも返さない（または読めた子が 0 体）なら項目ごと載せない（不明）。
     """
     totals = dict.fromkeys(_CHILD_USAGE_KEYS, 0)
-    if not child_thread_ids and not parent_thread_id:
+    # 親は 1 つでも複数（resume 失敗で新しいセッションへ切り替えた全部の親）でもよい。子は id ごとに 1 回だけ数える。
+    parent_ids = [parent_thread_id] if isinstance(parent_thread_id, str) else [p for p in (parent_thread_id or []) if p]
+    parent_thread_id = parent_ids[0] if parent_ids else None
+    if not child_thread_ids and not parent_ids:
         return totals, 0, 0, 0
     cache_write: int | None = 0
     detected_ids: set = set()
@@ -163,7 +166,7 @@ def _collect_child_token_usage(codex_home: Path, child_thread_ids: set,
     except OSError:
         cands = []
     for path in cands:
-        if not remaining_old and not parent_thread_id:
+        if not remaining_old and not parent_ids:
             break
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -174,9 +177,11 @@ def _collect_child_token_usage(codex_home: Path, child_thread_ids: set,
                 if tid is None or tid in detected_ids:
                     continue
                 # 子判定は `activity.py::_is_child_session_meta` の1箇所だけに持つ（二重実装しない）。
-                if not _is_child_session_meta(payload, tid, child_thread_ids=child_thread_ids,
-                                              parent_thread_id=parent_thread_id, min_mtime=min_mtime,
-                                              file_mtime=path.stat().st_mtime):
+                _mtime = path.stat().st_mtime
+                if not any(_is_child_session_meta(payload, tid, child_thread_ids=child_thread_ids,
+                                                  parent_thread_id=_pid, min_mtime=min_mtime,
+                                                  file_mtime=_mtime)
+                           for _pid in (parent_ids or [None])):
                     continue
                 detected_ids.add(tid)
                 remaining_old.discard(tid)

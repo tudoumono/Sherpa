@@ -18,7 +18,7 @@
 `sherpa.ingest.graph_extract._mask_secrets`/`_redact_reflected_urls`・複数行にまたがる鍵ブロックは
 `sherpa.redact_keys.KeyBlockRedactor` で伏せる。パス様の区間（絶対パス／区切り 2 つ以上／非 ASCII／
 資料の拡張子／大文字だけの段／英語の前置き for・from・source・dir・-> の直後、のいずれかで始まる語から
-名前の終わりまで）とラベル付きの欄の値は `<path:ハッシュ12桁>` に、検索語（`query=`/`q=`/「検索語」）は
+名前の終わりまで）とラベル付きの欄の値は `<path:ハッシュ12桁>` に、検索語（`query=`/`q=`/「検索語」）と読んだ範囲（`range=`）は
 `<masked>` に置換する（固定文言の 1 個の `/`＝`impact/run` 等は置換しない）。
 
 出力直前に自己検査（fail-closed）を行う: `documents` 台帳の識別子列（name/scope_path/
@@ -126,7 +126,7 @@ def _strip_url_userinfo_query(v):
 # 利用者の入力（検索語・質問文）が入りうる key=value。引用符付きは引用符ごと、引用符なしは
 # 次の `key=` か行末までを丸ごと伏せる（空白入りの検索語の後半を残さない）。
 _QUERY_KV_RE = re.compile(
-    r"(?i)(\b(?:query|q|message|question|text)\b|検索語)(\s*[=:]\s*)"
+    r"(?i)(\b(?:query|q|message|question|text|range)\b|検索語)(\s*[=:]\s*)"
     r"(\"[^\"]*\"|'[^']*'|.+?)(?=\s+\w+=|$)", re.MULTILINE)   # 複数行文字列でも行ごとに効かせる
 # 資料の相対パスが入る欄（`MD化を開始します: <rel>`・`rel=`・`doc=`・`path=` 等）は欄全体を
 # ハッシュにする（空白入りの資料名を語ごとに分けない）。
@@ -1327,7 +1327,7 @@ _APPLIED_RULES = [
     "doctor.json は検査 id・ラベル・判定（ok/ng/skip）だけを載せ、自由文の detail（接続先・例外文言）は載せない。",
     "ログ行のパス様の区間（絶対パス／区切り 2 つ以上／非 ASCII／資料の拡張子／大文字だけの段／英語の前置きの直後"
     "のいずれかで始まる語から名前の終わりまで）とラベル付きの欄の値は <path:ハッシュ12桁> に、"
-    "検索語（query=/q=/「検索語」）は <masked> に置換する。",
+    "検索語（query=/q=/「検索語」）と読んだ範囲（range=）は <masked> に置換する。",
     "相対パス（ingest_runs.flags.doc）・world の id/label/root は常に sha256 先頭12桁へハッシュ化する"
     "（同じ入力は同じハッシュ＝ファイル間の突合は可能）。",
     "usage_stats.json: uid を sha256 先頭12桁へハッシュ化（無効化オプションは無い）・"

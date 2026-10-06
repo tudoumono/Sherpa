@@ -408,3 +408,38 @@ def test_cache_write_unknown_when_child_usage_missing():
     m = turn_metrics.metrics_from_answer(answer)
     assert m["cache_write_tokens"] is None and m["child_cache_write_tokens"] is None
     assert m["children_usage_missing"] == 1
+
+
+def test_call_stats_are_written_per_role_and_tool_and_old_answers_have_no_rows():
+    """回答の call_stats が turn_call_stats（親/子/判定不能×道具）と turn_metrics.call_log_missing に入り、無い回答は行も欠けも持たない。"""
+    _try_init()
+    uid, cid = _new_conversation()
+    answer = {"lens": "qa", "sources": [], "call_stats": {"v": 1, "calls": 3, "missing": 2, "tools": [
+        {"tool": "ripgrep_search", "role": "parent", "calls": 2, "found": 7, "ms": 30, "errors": 1, "truncated": 0},
+        {"tool": "ripgrep_search", "role": "child", "calls": 1, "found": 0, "ms": 5, "errors": 0, "truncated": 1}]}}
+    msg = store.add_message(cid, "assistant", "x", answer=answer)
+    with store._connect() as c:
+        rows = c.execute("SELECT role, tool, calls, found, ms, errors, truncated FROM turn_call_stats "
+                         "WHERE message_id=%s ORDER BY role", (msg["id"],)).fetchall()
+    assert [(r["role"], r["calls"], r["found"], r["errors"], r["truncated"]) for r in rows] == [
+        ("child", 1, 0, 0, 1), ("parent", 2, 7, 1, 0)]
+    assert _fetch_turn_metrics(msg["id"])["call_log_missing"] == 2
+    old = store.add_message(cid, "assistant", "y", answer={"lens": "qa", "sources": []})
+    assert _fetch_turn_metrics(old["id"])["call_log_missing"] is None
+    with store._connect() as c:
+        assert c.execute("SELECT COUNT(*) AS n FROM turn_call_stats WHERE message_id=%s", (old["id"],)).fetchone()["n"] == 0
+
+
+def test_tool_use_opened_and_impact_columns_are_counts_and_old_answers_stay_null():
+    """tool_use・call_stats.opened・impact_list が件数だけの列になり、無い回答は NULL のまま。"""
+    answer = {"tool_use": {"v": 1, "verdict": "used", "nudged": True},
+              "call_stats": {"v": 1, "calls": 0, "missing": 0, "opened": 3, "opened_unknown": True, "tools": []},
+              "impact_list": {"v": 1, "traced": True, "rows": [
+                  {"state": "candidate", "name": "a"}, {"state": "used", "name": "b"}, {"state": "used", "name": "c"}]}}
+    m = turn_metrics.metrics_from_answer(answer)
+    assert (m["tool_use_verdict"], m["tool_zero_nudged"], m["opened_docs_count"], m["opened_unknown"]) == ("used", True, 3, True)
+    assert m["impact_traced"] is True
+    assert m["impact_counts"] == {"candidate": 1, "inspected": 0, "used": 2, "unmapped": 0, "more": 0, "hidden": 0}
+    old = turn_metrics.metrics_from_answer({"lens": "qa", "sources": []})
+    assert all(old[k] is None for k in ("tool_use_verdict", "tool_zero_nudged", "opened_docs_count",
+                                        "opened_unknown", "impact_traced", "impact_counts"))

@@ -76,6 +76,13 @@ for child in step.get("child_sessions", []):
                                                   "info": {"total_token_usage": child["usage"]}}}))
         (sdir / f"rollout-{child['thread_id']}.jsonl").write_text("\n".join(lines) + "\n")
 
+# 道具ゼロの促しを出さないよう、1 回目の実行は既定で道具を 1 回使う（`no_tools` で 0 回にする）。
+if call_index == 1 and not step.get("no_tools"):
+    print(json.dumps({"type": "item.completed", "item": {
+        "id": "t0-default", "type": "command_execution", "command": "ls", "status": "completed",
+        "exit_code": 0}}))
+    sys.stdout.flush()
+
 for i, text in enumerate(step.get("agent_messages", [])):
     print(json.dumps({"type": "item.completed",
                        "item": {"id": f"m{i}", "type": "agent_message", "text": text}}))
@@ -341,11 +348,13 @@ def test_new_format_child_detection_via_rollout_parent_thread_id(tmp_path, monke
     親の thread id と一致すれば子として検出し usage を合算する。codex.log 終了行の spawn_agents は実際に
     見つけた子の数になる。"""
     tid = "SID-NEWFMT-1"
-    step = _step(tid, wait_calls=2, child_sessions=[_child("CHILD-NF-1", 60, 12, parent=tid, reasoning=2),
+    step = _step(tid, wait_calls=2, no_tools=True, child_sessions=[_child("CHILD-NF-1", 60, 12, parent=tid, reasoning=2),
                                                     _child("CHILD-NF-2", 40, 8, parent=tid, reasoning=1)])
     with caplog.at_level(logging.INFO):
-        env, _ = _exec(tmp_path, monkeypatch, [step], "newfmt-child-u1", 1101,
-                       provider=A.CodexProvider(system_settings={}))
+        env, calls = _exec(tmp_path, monkeypatch, [step], "newfmt-child-u1", 1101,
+                           provider=A.CodexProvider(system_settings={}))
+
+    assert len(calls) == 1  # 子だけの実行は「使っていない」と断定せず、道具ゼロの促しを出さない
 
     assert env["codex_usage_children"] == {"found": 2, "missing": 0, **_tok(100, 0, 20, 3)}
     assert env["usage"]["input_tokens"] == 130   # 30(親) + 100(子)
@@ -362,7 +371,7 @@ def test_new_format_child_detected_without_usage_counts_as_spawned_not_missing_e
     だけ0・children_missing（usage 未取得）が1になる（found=0 で spawn_agents まで0にすると「起動していない」と
     区別が付かない）。"""
     tid = "SID-NEWFMT-NOUSAGE"
-    step = _step(tid, wait_calls=1, child_sessions=[_child("CHILD-NOUSAGE-1", 0, 0, parent=tid, with_usage=False)])
+    step = _step(tid, wait_calls=1, no_tools=True, child_sessions=[_child("CHILD-NOUSAGE-1", 0, 0, parent=tid, with_usage=False)])
     with caplog.at_level(logging.INFO):
         env, _ = _exec(tmp_path, monkeypatch, [step], "newfmt-nousage-u1", 1104,
                        provider=A.CodexProvider(system_settings={}))
@@ -394,7 +403,7 @@ def test_new_format_resumed_turn_does_not_recount_prior_turn_children(tmp_path, 
     min_mtime（今ターン開始の壁時計）が防ぐ（今ターンより前に書かれた rollout は対象外）。"""
     tid = "SID-NEWFMT-RESUME"
     steps = [
-        _step(tid, child_sessions=[_child("CHILD-RS-1", 60, 12, parent=tid, reasoning=2),
+        _step(tid, no_tools=True, child_sessions=[_child("CHILD-RS-1", 60, 12, parent=tid, reasoning=2),
                                    _child("CHILD-RS-2", 40, 8, parent=tid, reasoning=1)]),
         {"thread_id": tid, "agent_messages": ["確認した結果、追加の影響はありません。"], "usage": _usage(50, 2, 20, 3)},
     ]
