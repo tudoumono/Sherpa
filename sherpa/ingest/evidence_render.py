@@ -26,8 +26,10 @@ from typing import Any, Mapping
 from . import ai_observation, context_ir, evidence_ir, mermaid_render
 
 
-RAG_RENDERER_VERSION = "evidence-rag-renderer-v1alpha10"
+RAG_RENDERER_VERSION = "evidence-rag-renderer-v1alpha11"
 RAG_CHUNKER_VERSION = "evidence-rag-chunker-v1alpha10"
+# 関係の文に書く対象の名前の上限（字）。超えた分は対象の要素の本文に全文がある旨を明記する。
+_RELATION_TARGET_NAME_MAX = 2000
 MAX_GROUP_CHARS = 1800
 MAX_TEXT_SPAN_CHARS = 1200
 _BREAK_CHARS = frozenset({"\n", "。", "！", "？", ";", "；"})
@@ -1094,9 +1096,16 @@ def _element_piece(
         if target is None:
             continue
         target_text = _value_text(target.value).replace("\n", " ").strip()
-        if len(target_text) > 160:
-            target_text = target_text[:157] + "..."
+        if len(target_text) > _RELATION_TARGET_NAME_MAX:
+            # 関係の文は対象を指すための名前。長い対象は全文がその要素自身の本文にあるので、ここでは省いた字数を明記する（チャンクの上限を守る）
+            omitted = len(target_text) - _RELATION_TARGET_NAME_MAX
+            target_text = (target_text[:_RELATION_TARGET_NAME_MAX]
+                           + f"…（以下 {omitted} 字は対象の要素の本文に全文あり）")
         target_label = target_text or _value_text(target.extension.get("name")) or target.type
+        if not target_text and len(target_label) > _RELATION_TARGET_NAME_MAX:
+            # 本文の無い対象の名前も同じ上限で抑え、省いた字数を明記する（チャンクの上限を守る）
+            omitted = len(target_label) - _RELATION_TARGET_NAME_MAX
+            target_label = target_label[:_RELATION_TARGET_NAME_MAX] + f"…（以下 {omitted} 字を省略）"
         if relation.type == "overlaps":
             if element.extension.get("alpha") == 0:
                 relation_texts.append(f"この要素は対象「{target_label}」の原本領域に重なっている")

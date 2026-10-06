@@ -205,6 +205,27 @@ def test_element_piece_relation_text_on_separate_line():
         "出所: 原本「doc.docx」 / 見出し\n図形: 「元図形」\nこの要素は対象「対象図形」へ接続している。")
 
 
+def test_element_piece_relation_target_name_is_not_cut():
+    long_name = "長い図形名" * 50                          # 250 字（160 字で切っていた長さを超える）
+    target = _element("t1", "shape", long_name)
+    source = _element("e1", "shape", "元図形")
+    relation = IR.EvidenceRelation(relation_id="rel1", type="connects_to", source_id="e1",
+                                   target_id="t1", evidence_ids=[], confidence=1.0)
+    sem = _piece(source, relations=[relation], others=[target])["semantic"]
+    assert f"この要素は対象「{long_name}」へ接続している" in sem
+    huge = "あ" * (R._RELATION_TARGET_NAME_MAX + 500)          # チャンクの上限を壊さない長さに収め、省いた字数を明記する
+    target2 = _element("t2", "shape", huge)
+    relation2 = IR.EvidenceRelation(relation_id="rel2", type="connects_to", source_id="e1",
+                                    target_id="t2", evidence_ids=[], confidence=1.0)
+    sem2 = _piece(source, relations=[relation2], others=[target2])["semantic"]
+    assert "以下 500 字は対象の要素の本文に全文あり" in sem2 and huge not in sem2
+    target3 = _element("t3", "shape", None, name="い" * (R._RELATION_TARGET_NAME_MAX + 7))
+    relation3 = IR.EvidenceRelation(relation_id="rel3", type="connects_to", source_id="e1",
+                                    target_id="t3", evidence_ids=[], confidence=1.0)
+    sem3 = _piece(source, relations=[relation3], others=[target3])["semantic"]
+    assert "以下 7 字を省略" in sem3
+
+
 def test_element_piece_order_relations_before_excel_note_before_state():
     source, target, relation = _connected_pair(
         visibility="hidden", raw_value="1", number_format="General", display_status="unsupported")
@@ -531,9 +552,9 @@ def test_chunk_versions_are_v1alpha10():
     chunks = _read_chunks(_build_wide_xlsx(4), "big.xlsx")
     assert chunks
     for chunk in chunks:
-        assert chunk["renderer_version"] == "evidence-rag-renderer-v1alpha10"
+        assert chunk["renderer_version"] == "evidence-rag-renderer-v1alpha11"
         assert chunk["chunker_version"] == "evidence-rag-chunker-v1alpha10"
-    assert R.RAG_RENDERER_VERSION == "evidence-rag-renderer-v1alpha10"
+    assert R.RAG_RENDERER_VERSION == "evidence-rag-renderer-v1alpha11"
     assert R.RAG_CHUNKER_VERSION == "evidence-rag-chunker-v1alpha10"
 
 

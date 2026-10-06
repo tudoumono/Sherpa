@@ -21,7 +21,7 @@ from . import document_ir
 from .ooxml import excel
 
 # レンダラの版。`office_md._current_human_md_sig()` が抽出器の版と合成し `{rel}.derived.json` に記録する。出力形状を変えたら上げる
-HUMAN_MD_RENDERER_VERSION = "human-md-renderer-v6"
+HUMAN_MD_RENDERER_VERSION = "human-md-renderer-v7"
 
 # 1グループ（画面に1回に出すパイプ表の塊）あたりの目安上限文字数
 _MAX_GROUP_CHARS = 20_000
@@ -370,7 +370,7 @@ def _render_cells_grid(cells: list[document_ir.Cell], budget: "_OutputBudget") -
 
     ① 結合は面積が `_MAX_MERGE_DUPLICATE_CELLS` 以下のときだけ値を継続セルへ複製し、超えるときは起点セルに1回だけ「（結合R×C）」付きで出す。
     ② 行を1行ずつ生成して `_MAX_GROUP_CHARS` のグループへ振り分ける（密な二次元配列は作らず、結合の範囲は `active` で追う）。
-    ③ グループごとに見出し＋本体を1単位として予算判定し、入らなかったグループは `omitted_groups` へ数えて生成を打ち切る。
+    ③ グループごとに見出し＋本体を1単位として予算判定し、入らなかった時点で生成を打ち切る。省略した行数（全行数－表示した行数）を注記に出す。
     起点が持たない座標は空セルで埋める（表示上の穴埋めで値の欠落ではない）。
     """
     if not cells:
@@ -438,8 +438,10 @@ def _render_cells_grid(cells: list[document_ir.Cell], budget: "_OutputBudget") -
         if current:
             if not _flush(current):
                 stopped_early = True
+    omitted_rows = (max_row - min_row + 1) - total_rows_shown if stopped_early else 0
     return _render_groups(budget, shown, any_oversized, stopped_early,
-                          total_rows_shown=total_rows_shown, omitted_groups=omitted_groups)
+                          total_rows_shown=total_rows_shown, omitted_groups=omitted_groups,
+                          omitted_rows=omitted_rows)
 
 
 def _normalize_cell_text(text: str | None) -> str:
@@ -449,7 +451,8 @@ def _normalize_cell_text(text: str | None) -> str:
 
 
 def _render_groups(budget: "_OutputBudget", shown: list[tuple[str, str]], any_oversized: bool,
-                    stopped_early: bool, *, total_rows_shown: int, omitted_groups: int) -> str:
+                    stopped_early: bool, *, total_rows_shown: int, omitted_groups: int,
+                    omitted_rows: int = 0) -> str:
     """`_render_cells_grid` が確定した `(見出し, 本体)` の並びを最終的なパイプ表テキストにする。
 
     `shown` は消費済みなので再消費しない。複数グループのときだけ各グループの見出しと「Nグループに分割して表示します」を添える。
@@ -463,7 +466,9 @@ def _render_groups(budget: "_OutputBudget", shown: list[tuple[str, str]], any_ov
     if not shown:
         if not stopped_early:
             return ""
-        return budget.note("（注記: 出力上限に達したため、この表は表示できませんでした）")
+        return budget.note(f"（注記: 出力上限に達したため、この表（{omitted_rows} 行）は表示できませんでした）"
+                           if omitted_rows > 0 else
+                           "（注記: 出力上限に達したため、この表は表示できませんでした）")
 
     if len(shown) == 1 and not any_oversized and not stopped_early and omitted_groups == 0:
         return shown[0][1]                                  # 唯一・打切りなし＝素の本体
@@ -488,8 +493,8 @@ def _render_groups(budget: "_OutputBudget", shown: list[tuple[str, str]], any_ov
                 parts.append(note)
         parts.append(shown[0][1])                            # 見出し無し（1グループのみ）
     if stopped_early:
-        note = (budget.note(f"（注記: 出力上限に達したため、以降 {omitted_groups} グループを省略しました）")
-                if omitted_groups else
+        note = (budget.note(f"（注記: 出力上限に達したため、以降の {omitted_rows} 行を省略しました）")
+                if omitted_rows > 0 else
                 budget.note("（注記: 出力上限に達したため、この表の続きを省略しました）"))
         if note:
             parts.append(note)

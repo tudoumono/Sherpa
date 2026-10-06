@@ -11,6 +11,7 @@ document-ir（`document_ir.Element`/`Cell`）を直接組み立てて渡し、`o
 """
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
@@ -118,7 +119,10 @@ def test_render_cells_grid_bounded_time_near_five_million_cells():
     # 250,000行は既定予算で必ず出力予算切れ（stopped_early）になる。見出し＋本体を1単位として
     # 予算判定するため、収まった分のグループ見出しは出るが、入らなかったグループ数は
     # 予約枠からの注記で報告される（正典 §10 裁定#1 の実バイト厳密の安全弁）。
-    assert "以降" in out and "グループを省略しました" in out
+    m = re.search(r"以降の (\d+) 行を省略しました", out)
+    assert m, out[-300:]
+    shown_rows = sum(1 for line in out.splitlines() if line.startswith("| "))
+    assert int(m.group(1)) == 250_000 - shown_rows     # 省略した行数は実数（常に 1 と書かない）
 
 
 def test_render_cells_grid_419_rows_near_budget_boundary_no_silent_drop():
