@@ -410,7 +410,9 @@ def test_export_public_version_is_version_only(tmp_path: Path):
 def test_publish_public_commit_records_content_commit_in_version(tmp_path: Path):
     repo = tmp_path / "pub"
     repo.mkdir()
-    git = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    def git(*a):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=repo,
+                              capture_output=True, text=True, check=True).stdout.strip()
     git("init", "-q")
     (repo / "VERSION").write_text("1.2.3\n")
     (repo / "a.txt").write_text("a")
