@@ -84,6 +84,22 @@ def describe_dropped(dropped: dict | None) -> str:
     return "調査の記録が大きすぎたため、" + "・".join(parts) + "を保存していません。"
 
 
+_VIA_LABELS = {"keyword": "言葉の一致", "vector": "ベクトル", "keyword_only_search": "言葉の一致だけで検索"}
+_MODE_LABELS = {"hybrid": "言葉の一致＋ベクトル", "keyword": "言葉の一致だけ", "vector": "ベクトルだけ"}
+
+
+def _hit_rank_note(d: dict) -> str:
+    """検索の当たりの順位・当たり方・点数を「（#3・ベクトル・0.8123）」の形で資料名に添える（無ければ空）。"""
+    parts = []
+    if isinstance(d.get("rank"), int) and not isinstance(d.get("rank"), bool):
+        parts.append(f"#{d['rank']}")
+    if d.get("via") in _VIA_LABELS:
+        parts.append(_VIA_LABELS[d["via"]])
+    if isinstance(d.get("score"), (int, float)) and not isinstance(d.get("score"), bool):
+        parts.append(f"{d['score']:.4f}")
+    return f"（{'・'.join(parts)}）" if parts else ""
+
+
 def _calls_section(calls) -> list[str]:
     """調べた経路（全部の道具の呼び出し）と見つかった資料（検索で見つかった資料）の節。記録が無ければ空（今までのダウンロードは変わらない）。"""
     if not isinstance(calls, dict):
@@ -98,11 +114,13 @@ def _calls_section(calls) -> list[str]:
         lines += ["| 担当 | 道具 | 検索語 | 件数 | 結果 | 時間(ms) | 項目 | 資料と範囲 |", "|---|---|---|---|---|---|---|---|"]
     for r in route:
         docs = "; ".join(_esc_cell(d.get("doc")) + (f" {_esc_cell(d.get('range'))}" if d.get("range") else "")
-                         for d in (r.get("docs") or []) if isinstance(d, dict))
+                         + _hit_rank_note(d) for d in (r.get("docs") or []) if isinstance(d, dict))
         if r.get("docs_omitted"):
             docs += f"（ほか {r['docs_omitted']} 件は上限で省略）"
         if r.get("docs_hidden"):
             docs += f"（名前を出せない資料 {r['docs_hidden']} 件）"
+        if r.get("mode") in _MODE_LABELS:
+            docs = f"検索の形: {_MODE_LABELS[r['mode']]}。 " + docs
         status = _label(_CALL_STATUS_LABELS, r.get("status")) + (f"・{_esc_cell(r['error'])}" if r.get("error") else "")
         lines.append(f"| {_esc_cell(_label(_ROLE_LABELS, r.get('role')))} | {_esc_cell(r.get('tool'))} | "
                      f"{_esc_cell(r.get('query') or r.get('range')) or '-'} | "
@@ -137,10 +155,15 @@ def render_markdown(record: dict) -> str:
     manifest = record.get("manifest") or {}
     items = record.get("items") or {}
     question_kind = _label(_QUESTION_KIND_LABELS, manifest.get("question_kind"))
+    detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+    if detail.get("ledger") == "none":
+        note = describe_dropped(detail.get("dropped")) if record.get("truncated") else ""
+        return "\n".join([_HEADER, "", "調査台帳はありません（このターンは台帳を使っていません）。"]
+                         + ([f"- 注記: {note}"] if note else [])
+                         + _calls_section(detail.get("calls")) + [""])
     lines = [_HEADER, "",
              f"- 質問の種類: {question_kind}",
              f"- 完了: {'はい' if record.get('complete') else 'いいえ'}"]
-    detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
     if record.get("truncated"):
         lines.append("- 注記: " + (describe_dropped(detail.get("dropped"))
                                   or "件数が多いため、一部を切り詰めて保存しています。"))

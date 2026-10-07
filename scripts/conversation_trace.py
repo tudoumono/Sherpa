@@ -1,10 +1,13 @@
 """会話の各ターンを、段・道具の呼び出し・トークン・調査台帳の流れとして 1 本のテキストに書き出す
-（`make trace CONV=<番号>[,<番号>...] [MASK=1] [OUT=<ファイル>]`）。
+（`make trace CONV=<番号>[,<番号>...] | SINCE=<日付> [UNTIL=<日付>] [FORMAT=jsonl] [MASK=1] [OUT=<ファイル>]`）。
+設計: docs/design/usage.md「§8 利用者別・会話別の見え方」
 
 守ること:
 - 読み取りだけ。DB は SELECT だけ・ファイルは Codex のセッション記録を読むだけ。書くのは OUT の 1 ファイルだけ。
 - 個人の資料を参照したターンは出さない。
 - 秘匿ファイル（`text_kind.is_sensitive`）の名前は伏せ字の有無にかかわらず出さない。
+- 期間（SINCE／UNTIL・日本時間の日付）で選ぶときは対象の会話に上限（`CONV_LIMIT`）を設け、超えたら出力の先頭と標準エラーに出す。
+- `--format jsonl` は 1 行 1 ターンの機械で読める形（本文・結果の本文は入れない）。伏せ字と自己検査はテキストと同じ。
 - 伏せ字（MASK=1）は、同じ値に同じ記号（実行ごとの塩で作る短いハッシュ）を振る。書き出す前に、入力から
   集めた伏せるべき値が出力に残っていないかを確かめ、残っていれば書き出さずに失敗する。
 - 道具の結果の本文・シェルの出力・推論・回答の途中文は出さない（件数・大きさ・印だけ）。
@@ -21,24 +24,28 @@ import re
 import shlex
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from sherpa import answer_shape as _as  # noqa: E402
 from sherpa import investigation_ledger as _il  # noqa: E402
 from sherpa import investigation_record_render as _irr  # noqa: E402
 from sherpa.depth_profile import CODEX_REASONING_LEVELS, DEPTH_PROFILES  # noqa: E402
 from sherpa.ingest.text_kind import is_sensitive_doc_id  # noqa: E402
 from sherpa.stop_kind import STOP_KINDS  # noqa: E402
+from sherpa.store.feedback import MESSAGE_FEEDBACK_TAGS  # noqa: E402
 from sherpa.turn_activity_format import _OTHER, _VERSION_UNSAFE, _kib, _n, label_agents  # noqa: E402
 
 _TOKEN_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
 _WINDOW_BEFORE_S = 1.0
 _WINDOW_AFTER_S = 2.0
 _CLIP = 120
+CONV_LIMIT = 500
+_JST = timezone(timedelta(hours=9))
 
 _STAGE_DESC = {
     "main": "質問を受けて調べ、回答を作る最初の実行",
@@ -148,6 +155,18 @@ _VOCAB = {
     "node_status": frozenset({"done", "active", "error", "pending", "skipped"}),
     "doc_state": frozenset({"ready", "unreadable", "unknown"}),
     "ask_mode": frozenset({"choice", "confirm", "free", "single", "multi"}),
+    "route_role": frozenset(_irr._ROLE_LABELS),
+    "call_status": frozenset(_irr._CALL_STATUS_LABELS),
+    "via": frozenset({"keyword", "vector", "keyword_only_search"}),
+    "search_mode": frozenset({"hybrid", "keyword", "vector"}),
+    "completion": frozenset(_as.COMPLETIONS),
+    "lens": frozenset({"impact", "troubleshoot", "qa", "author", "investigate"}),
+    "how_mode": frozenset(_as.HOW_MODES),
+    "config": frozenset({"openai", "azure", "ollama"}),
+    "codex_mode": frozenset({"standard", "plain"}),
+    "tool_use_verdict": frozenset({"used", "unused", "undetermined"}),
+    "feedback_rating": frozenset({"up", "down"}),
+    "feedback_tag": frozenset(MESSAGE_FEEDBACK_TAGS),
     "error": _ERROR_CODES | {"TimeoutError", "ConnectionError", "OSError", "RuntimeError", "ValueError",
                              "KeyError", "TypeError", "PermissionError", "FileNotFoundError"},
 }
@@ -1433,6 +1452,7 @@ def render_turn(no: int, turn: dict, data: dict, threads: list[Thread], masker: 
     lines.extend(_tool_totals_section(act, stages, calls, masker, tok_bad))
     if tok_bad:
         gaps.append(f"数値でないトークンの値（DB・活動記録）を {len(tok_bad)} 件読み飛ばした（合計に入っていない）")
+    lines.extend(_route_section(data.get("investigations", {}).get((a or {}).get("id")), masker, gaps))
     lines.extend(_ledger_section(cid, a, calls, data.get("investigations", {}).get((a or {}).get("id")),
                                  answer, masker, gaps))
     if is_codex and not turn_threads and a is not None:
@@ -1586,9 +1606,277 @@ def _tool_totals_section(act: dict, stages: list[Stage], calls: list[Call], mask
     return lines
 
 
+# ---------------------------------------------------------------------------
+# 調べた経路と見つかった資料（investigation_records の detail.calls）
+# ---------------------------------------------------------------------------
+
+_LINE_RANGE = re.compile(r"^\d{1,9}(-\d{1,9})?$")
+
+
+def _jterm(masker: Masker, value):
+    """検索語など。伏せ字では記号・素では秘匿ファイルの名前だけ伏せた全文。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return masker.term(value) if masker.mask else masker.scrub(value)
+
+
+def _jpath(masker: Masker, value):
+    """資料のパス。伏せ字では記号・秘匿ファイルは伏せ・それ以外の素はそのまま。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return masker.path(value) if (masker.mask or _sensitive(value)) else value
+
+
+def _jrange(masker: Masker, value):
+    """行の範囲は数字のままで出し、シート名などを含みうる範囲は検索語と同じ扱い。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and _LINE_RANGE.match(value.strip()):
+        return value.strip()
+    return _jterm(masker, value)
+
+
+def _num(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def calls_view(calls, masker: Masker) -> dict | None:
+    """detail.calls を、伏せ字と秘匿の規則を通した出力用の形にする。順位・点数・当たり方・行の検索の形は欄があるときだけ。"""
+    if not isinstance(calls, dict):
+        return None
+    route = []
+    for r in calls.get("route") or []:
+        if not isinstance(r, dict):
+            continue
+        out = {"role": masker.word(r.get("role"), "route_role"), "tool": masker.word(r.get("tool"), "tool"),
+               "status": masker.word(r.get("status"), "call_status"), "count": _num(r.get("count")),
+               "ms": _num(r.get("ms"))}
+        if r.get("error"):
+            out["error"] = masker.word(r.get("error"), "error")
+        if r.get("query") not in (None, ""):
+            out["query"] = _jterm(masker, r["query"] if isinstance(r["query"], str) else str(r["query"]))
+        if r.get("range") not in (None, ""):
+            out["range"] = _jrange(masker, r["range"])
+        if r.get("item") not in (None, ""):
+            out["item"] = masker.item(r["item"] if isinstance(r["item"], str) else str(r["item"]))
+        if r.get("mode") not in (None, ""):
+            out["mode"] = masker.word(r["mode"], "search_mode")
+        docs = []
+        for d in r.get("docs") or []:
+            if not (isinstance(d, dict) and isinstance(d.get("doc"), str)):
+                continue
+            row = {"doc": _jpath(masker, d["doc"])}
+            if d.get("range") not in (None, ""):
+                row["range"] = _jrange(masker, d["range"])
+            if _num(d.get("rank")) is not None:
+                row["rank"] = d["rank"]
+            if _num(d.get("score")) is not None:
+                row["score"] = d["score"]
+            if d.get("via") not in (None, ""):
+                row["via"] = masker.word(d["via"], "via")
+            docs.append(row)
+        if docs:
+            out["docs"] = docs
+        for k in ("docs_omitted", "docs_hidden"):
+            if _is_count(r.get(k)) and r[k] > 0:
+                out[k] = r[k]
+        route.append({k: v for k, v in out.items() if v is not None})
+    found = []
+    for r in calls.get("found") or []:
+        if not (isinstance(r, dict) and isinstance(r.get("doc"), str)):
+            continue
+        found.append({"doc": _jpath(masker, r["doc"]), "hits": _num(r.get("hits")),
+                      "lines": [x for x in r.get("lines") or [] if _is_count(x)],
+                      "queries": [t for t in (_jterm(masker, q) for q in r.get("queries") or []) if t],
+                      "opened": r.get("opened") is True})
+    view = {"calls": _num(calls.get("calls")), "missing": _num(calls.get("missing")) or 0,
+            "route": route, "found": found}
+    for k in ("route_omitted", "found_more", "found_hidden", "found_hits_omitted"):
+        if _is_count(calls.get(k)) and calls[k] > 0:
+            view[k] = calls[k]
+    if calls.get("opened_unknown"):
+        view["opened_unknown"] = True
+    return view
+
+
+def _route_section(record, masker: Masker, gaps: list) -> list[str]:
+    """[調べた経路と見つかった資料]（台帳の有無によらず、記録があれば出す）。"""
+    detail = record.get("detail") if isinstance(record, dict) and isinstance(record.get("detail"), dict) else {}
+    view = calls_view(detail.get("calls"), masker)
+    if view is None:
+        return []
+    lines = ["[調べた経路と見つかった資料]（investigation_records から）",
+             f"  道具の呼び出し {view['calls'] if view['calls'] is not None else '-'} 回"
+             + (f"（記録の欠け {view['missing']} 行）" if view["missing"] else "")]
+    for r in view["route"]:
+        docs = []
+        for d in r.get("docs") or []:
+            extra = [f"順位 {d['rank']}" if "rank" in d else "", f"点数 {d['score']}" if "score" in d else "",
+                     d.get("via", "")]
+            docs.append(f"{d['doc']}" + (f":{d['range']}" if "range" in d else "")
+                        + (f"（{' '.join(x for x in extra if x)}）" if any(extra) else ""))
+        lines.append(f"  [{r['role']}]  {r['tool']}"
+                     + (f"  語 {r['query']}" if "query" in r else "") + (f"  範囲 {r['range']}" if "range" in r else "")
+                     + (f"  項目 {r['item']}" if "item" in r else "") + (f"  形 {r['mode']}" if "mode" in r else "")
+                     + f"  件数 {r.get('count', '-')}  {r['status']}" + (f"（{r['error']}）" if "error" in r else "")
+                     + f"  所要 {_dur(r.get('ms'))}"
+                     + (f"  資料 {'; '.join(docs)}" if docs else "")
+                     + (f"（ほか {r['docs_omitted']} 件は上限で省略）" if "docs_omitted" in r else "")
+                     + (f"（名前を出せない資料 {r['docs_hidden']} 件）" if "docs_hidden" in r else ""))
+    if view.get("route_omitted"):
+        lines.append(f"  ほか {view['route_omitted']} 回の呼び出しは上限のため記録されていない")
+    lines.append("  見つかった資料（検索の結果）:")
+    for f in view["found"] or [None]:
+        if f is None:
+            lines.append("    なし")
+            break
+        lines.append(f"    {f['doc']}  ヒット {f['hits'] if f['hits'] is not None else '-'}"
+                     + (f"  行 {','.join(str(x) for x in f['lines'])}" if f["lines"] else "")
+                     + (f"  語 {' '.join(f['queries'])}" if f["queries"] else "")
+                     + f"  Codex の読み取り記録 {'あり' if f['opened'] else '確かめられない' if view.get('opened_unknown') else 'なし'}")
+    for k, word in (("found_more", "上限で省略した見つかった資料"), ("found_hidden", "名前を出せない資料"),
+                    ("found_hits_omitted", "呼び出しの上限で取り込めなかったヒット")):
+        if view.get(k):
+            lines.append(f"    ほか {word} {view[k]} 件")
+    if view["missing"]:
+        gaps.append(f"道具の記録の欠けが {view['missing']} 行ある（経路に出ていない呼び出しがありうる）")
+    if record.get("truncated"):
+        note = _irr.describe_dropped(detail.get("dropped"))
+        if note:
+            gaps.append(note)
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# JSONL（1 行 1 ターン）
+# ---------------------------------------------------------------------------
+
+def _iso(ep: float | None) -> str | None:
+    return datetime.fromtimestamp(ep, _JST).isoformat(timespec="seconds") if ep is not None else None
+
+
+def _note_conversation(data: dict, masker: Masker) -> None:
+    """会話の題・利用者・資料フォルダの値を、伏せ残しの確認の対象に控える。"""
+    conv = data.get("conversation") or {}
+    masker.note(conv.get("title"))
+    for k in ("email", "display_name"):
+        masker.note((data.get("user") or {}).get(k))
+    for k in ("root_path", "label", "world_id"):
+        masker.note((data.get("world") or {}).get(k))
+
+
+def turn_row(no: int, turn: dict, data: dict, masker: Masker) -> dict | None:
+    """assistant の返答 1 件ぶんの行（回答・質問・道具の結果の本文は入れない）。返答が無い・個人の資料を参照したターンは None。"""
+    u, a, audit = turn["user"], turn["assistant"], turn["audit"]
+    if a is None or _personal(u) or _personal(a):
+        return None
+    if isinstance(a.get("answer"), dict) and a["answer"].get("question"):  # 確認カード（回答ではない）は出さない
+        return None
+    conv = data.get("conversation") or {}
+    answer = a.get("answer") if isinstance(a.get("answer"), dict) else {}
+    masker.note_all(_answer_source_names(answer))
+    usage = answer.get("usage") if isinstance(answer.get("usage"), dict) else {}
+    act = answer.get("activity") if isinstance(answer.get("activity"), dict) else {}
+    st = act.get("settings") if isinstance(act.get("settings"), dict) else {}
+    how = _as.how_of(answer)
+    lens = answer.get("lens") or (answer.get("route") or {}).get("lens") or a.get("lens")
+    prov = usage.get("provider") or ((audit or {}).get("detail") or {}).get("provider")
+    inv = answer.get("investigation") if isinstance(answer.get("investigation"), dict) else {}
+    record = (data.get("investigations") or {}).get(a["id"])
+    detail = record.get("detail") if isinstance(record, dict) and isinstance(record.get("detail"), dict) else {}
+    view = calls_view(detail.get("calls"), masker) or {}
+    tokens = _usage_row(usage)
+    row: dict = {
+        "kind": "turn", "conv": data["id"], "turn": no, "answer_id": a["id"],
+        "at": _iso(_epoch(a.get("created_at"))),
+        "user": masker.user(conv.get("user_id")), "scope": masker.scope(conv.get("version")),
+        "how": ({"mode": masker.word(how["mode"], "how_mode"), "doc_focus": how["doc_focus"]} if how else None),
+        "lens": masker.word(lens, "lens") if isinstance(lens, str) and lens else None,
+        "ai": {"provider": masker.word(prov, "provider") if prov else None,
+               "model": masker.model(usage.get("model") or st.get("model")) if (usage.get("model") or st.get("model")) else None,
+               "config": masker.word(st.get("config"), "config") if st.get("config") else None,
+               "mode": masker.word(st.get("mode"), "codex_mode") if st.get("mode") else None,
+               "depth": masker.word(usage.get("depth_profile") or st.get("depth"), "depth")
+               if (usage.get("depth_profile") or st.get("depth")) else None,
+               "reasoning": masker.word(usage.get("reasoning") or st.get("reasoning"), "reasoning")
+               if (usage.get("reasoning") or st.get("reasoning")) else None},
+        "completion": masker.word(answer.get("completion"), "completion") if answer.get("completion") else None,
+        "stop_kind": masker.word(answer.get("stop_kind"), "stop_kind") if answer.get("stop_kind") else None,
+        "duration_ms": answer.get("duration_ms") if _is_count(answer.get("duration_ms")) else None,
+        "tokens": dict(zip(("input", "cached_input", "output", "reasoning"), tokens)) if tokens else None,
+        "ledger": (None if not isinstance(record, dict) else
+                   "none" if detail.get("ledger") == "none" or inv.get("ledger") == "none" else "present"),
+        "calls": {k: v for k, v in view.items() if k not in ("route", "found")} or None,
+        "route": view.get("route"), "found": view.get("found"),
+    }
+    row["ai"] = {k: v for k, v in row["ai"].items() if v is not None} or None
+    safe = _as.safe_new_fields(answer)
+    refs = []
+    for r in safe.get("referenced_docs") or []:
+        e = {"path": _jpath(masker, r["path"]), "ranges": r["ranges"], "unopened": r["unopened"]}
+        if r.get("ranges_more"):
+            e["ranges_more"] = r["ranges_more"]
+        refs.append(e)
+    row["referenced_docs"] = refs if "referenced_docs" in safe else None
+    row["referenced_docs_extra"] = {k: safe[k] for k in ("referenced_docs_hidden", "referenced_docs_more") if k in safe} or None
+    row["found_docs"] = ([_jpath(masker, r["path"]) for r in safe["found_docs"]] if "found_docs" in safe else None)
+    row["found_docs_extra"] = {k: safe[k] for k in ("found_docs_hidden", "found_docs_more") if k in safe} or None
+    il = safe.get("impact_list")
+    if il:
+        states: dict = {}
+        for r in il["rows"]:
+            states[r["state"]] = states.get(r["state"], 0) + 1
+        row["impact_list"] = {"traced": il["traced"], "states": states, "more": il["more"], "hidden": il.get("hidden", 0)}
+    cs = answer.get("call_stats") if isinstance(answer.get("call_stats"), dict) else None
+    if cs:
+        row["call_stats"] = {
+            "calls": _num(cs.get("calls")), "missing": _num(cs.get("missing")), "opened": _num(cs.get("opened")),
+            "opened_unknown": bool(cs.get("opened_unknown")),
+            "tools": [{"tool": masker.word(t.get("tool"), "tool"), "role": masker.word(t.get("role"), "route_role"),
+                       **{k: _num(t.get(k)) for k in ("calls", "found", "ms", "errors", "truncated")}}
+                      for t in cs.get("tools") or [] if isinstance(t, dict)]}
+    tu = answer.get("tool_use") if isinstance(answer.get("tool_use"), dict) else None
+    if tu:
+        row["tool_use"] = {"verdict": masker.word(tu.get("verdict"), "tool_use_verdict") if tu.get("verdict") else None,
+                           "nudged": bool(tu.get("nudged"))}
+    fb = (data.get("feedback") or {}).get(a["id"])
+    if isinstance(fb, dict):
+        row["feedback"] = {"rating": masker.word(fb.get("rating"), "feedback_rating"),
+                           "tags": [masker.word(t, "feedback_tag") for t in fb.get("tags") or []],
+                           "has_comment": bool(isinstance(fb.get("comment"), str) and fb["comment"].strip())}
+    return row
+
+
+def build_jsonl(convs: list[dict], masker: Masker, *, meta: dict, period: tuple[float, float] | None = None) -> str:
+    """1 行目に meta、続けて 1 ターン 1 行。期間があるときは返答がその期間にあるターンだけ。伏せ残しを確かめる（残っていれば LeakError）。"""
+    rows = []
+    for data in convs:
+        if not data.get("conversation"):
+            continue
+        _note_conversation(data, masker)
+        for no, t in enumerate(_turn_pairs(data), 1):
+            ep = _epoch(((t["assistant"] or {}).get("created_at")))
+            if period is not None and (ep is None or not (period[0] <= ep < period[1])):
+                continue
+            row = turn_row(no, t, data, masker)
+            if row is not None:
+                rows.append({k: v for k, v in row.items() if v is not None})
+    head = {"kind": "meta", "exported_at": _iso(datetime.now().timestamp()), "version": _app_version(),
+            "mask": masker.mask, "mask_models": masker.mask_models, "turns": len(rows), **meta}
+    text = "\n".join(json.dumps(r, ensure_ascii=False, separators=(",", ":")) for r in [head] + rows) + "\n"
+    leaks = find_leaks(text, masker)
+    if leaks:
+        raise LeakError(f"伏せるべき値が {leaks} 件残っていたため書き出しを中止しました")
+    return text
+
+
 def _ledger_section(cid, a, calls, record, answer, masker: Masker, gaps) -> list[str]:
     ledger_calls = [c for c in calls if c.name in _LEDGER_TOOLS]
     inv = answer.get("investigation") if isinstance(answer.get("investigation"), dict) else {}
+    if inv.get("ledger") == "none":
+        inv = {}  # 台帳の無いターン（調べた経路だけの記録）は台帳の節に出さない
+    if isinstance(record, dict) and (record.get("detail") or {}).get("ledger") == "none":
+        record = None
     if not ledger_calls and not record and not inv:
         return []
     lines = ["[調査台帳]"]
@@ -1687,13 +1975,7 @@ def render_conversation(data: dict, threads: list[Thread] | None, masker: Masker
     conv = data.get("conversation")
     if not conv:
         return [f"=== 会話 {cid}: 見つかりません"]
-    masker.note(conv.get("title"))
-    user = data.get("user") or {}
-    for k in ("email", "display_name"):
-        masker.note(user.get(k))
-    world = data.get("world") or {}
-    for k in ("root_path", "label", "world_id"):
-        masker.note(world.get(k))
+    _note_conversation(data, masker)
     turns = _turn_pairs(data)
     mask_state = ("あり（モデル名も伏せる）" if masker.mask_models else "あり（モデル名は出す）") if masker.mask else "なし"
     lines = [f"=== 会話 {cid}  ターン {len(turns)} 件  伏せ字: {mask_state}",
@@ -1706,9 +1988,9 @@ def render_conversation(data: dict, threads: list[Thread] | None, masker: Masker
     return lines
 
 
-def build_output(convs: list[dict], masker: Masker, users_dir: Path | None) -> str:
-    """書き出す本文を組み立て、伏せ残りを確かめる（残っていれば LeakError）。"""
-    out = [f"# 会話トレース  書き出し {_ymdhms(datetime.now().timestamp())}  版 {_app_version()}"]
+def build_output(convs: list[dict], masker: Masker, users_dir: Path | None, *, notes: tuple = ()) -> str:
+    """書き出す本文を組み立て、伏せ残りを確かめる（残っていれば LeakError）。notes は先頭に添える注記の行。"""
+    out = [f"# 会話トレース  書き出し {_ymdhms(datetime.now().timestamp())}  版 {_app_version()}", *notes]
     for data in convs:
         threads: list[Thread] = []
         state = "なし"
@@ -1770,6 +2052,10 @@ def load_conversation(cid: int) -> dict:
         "turn_metrics", "SELECT * FROM turn_metrics WHERE conversation_id=%s", (cid,))}
     data["investigations"] = {r["message_id"]: r for r in _try(
         "investigation_records", "SELECT * FROM investigation_records WHERE conversation_id=%s", (cid,))}
+    ids = [m["id"] for m in data["messages"] if m.get("role") == "assistant"]
+    data["feedback"] = {r["message_id"]: r for r in _try(
+        "message_feedback", "SELECT DISTINCT ON (message_id) message_id, rating, tags, comment FROM message_feedback "
+                            "WHERE message_id = ANY(%s) ORDER BY message_id, created_at DESC", (ids,))} if ids else {}
     data["usage_events"] = _try("usage_events", "SELECT * FROM usage_events WHERE conversation_id=%s ORDER BY ts",
                                 (cid,))
     uid = data["conversation"].get("user_id")
@@ -1786,21 +2072,79 @@ def _users_dir() -> Path:
     return p if p.is_absolute() else _ROOT / p
 
 
+def _parse_day(value: str | None) -> date | None:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date() if value else None
+    except ValueError:
+        return None
+
+
+def select_conversation_ids(since: date, until: date) -> tuple[list[int], bool]:
+    """期間（日本時間の日付・until はその日を含む）に assistant の返答がある会話の番号（古い順）と、上限（`CONV_LIMIT`）を超えたか。削除済み・受領共有の複製は除く。"""
+    start = datetime(since.year, since.month, since.day, tzinfo=_JST)
+    end = datetime(until.year, until.month, until.day, tzinfo=_JST) + timedelta(days=1)
+    rows = _query(
+        "SELECT m.conversation_id AS id FROM messages m JOIN conversations c ON c.id = m.conversation_id "
+        "WHERE m.role='assistant' AND m.created_at >= %s AND m.created_at < %s "
+        "AND c.deleted_at IS NULL AND c.origin='own' GROUP BY m.conversation_id ORDER BY MIN(m.created_at), MIN(m.id) LIMIT %s",
+        (start, end, CONV_LIMIT + 1))
+    ids = [r["id"] for r in rows]
+    return ids[:CONV_LIMIT], len(ids) > CONV_LIMIT
+
+
+_USAGE = ("使い方: make trace CONV=<会話番号>[,<会話番号>...] または SINCE=<YYYY-MM-DD> [UNTIL=<YYYY-MM-DD>]"
+          "（どちらか片方）[FORMAT=jsonl] [MASK=1] [OUT=<出力ファイル>]")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="会話トレースの書き出し（読み取りだけ）")
-    ap.add_argument("--conv", required=True, help="会話番号（カンマ区切りで複数）")
+    ap.add_argument("--conv", help="会話番号（カンマ区切りで複数）")
+    ap.add_argument("--since", help="期間の開始日（YYYY-MM-DD・日本時間）")
+    ap.add_argument("--until", help="期間の終了日（YYYY-MM-DD・その日を含む・省略時は今日）")
+    ap.add_argument("--format", choices=("text", "jsonl"), default="text", help="出力の形（既定は text）")
     ap.add_argument("--mask", action="store_true", help="伏せ字にする")
     ap.add_argument("--mask-models", action="store_true", help="伏せ字でモデル名も伏せる（公開のモデル名だけ出す）")
     ap.add_argument("--out", help="出力ファイル（省略時は標準出力）")
     ns = ap.parse_args(argv)
-    ids = [s.strip() for s in ns.conv.split(",") if s.strip()]
-    if not ids or not all(s.isdigit() for s in ids):
-        print("使い方: make trace CONV=<会話番号>[,<会話番号>...] [MASK=1] [OUT=<出力ファイル>]", file=sys.stderr)
+    since, until = _parse_day(ns.since), _parse_day(ns.until)
+    if bool(ns.conv) == bool(ns.since) or (ns.since and since is None) or (ns.until and (not ns.since or until is None)):
+        print(_USAGE, file=sys.stderr)
         return 2
+    ids: list[str] = []
+    if ns.conv:
+        ids = [s.strip() for s in ns.conv.split(",") if s.strip()]
+        if not ids or not all(s.isdigit() for s in ids):
+            print(_USAGE, file=sys.stderr)
+            return 2
+    else:
+        until = until or datetime.now(_JST).date()
+        if until < since:
+            print(_USAGE, file=sys.stderr)
+            return 2
     masker = Masker(mask=ns.mask, mask_models=ns.mask_models)
+    notes: list[str] = []
+    meta: dict = {}
+    period = None
+    if since:
+        found, over = select_conversation_ids(since, until)
+        ids = [str(i) for i in found]
+        meta = {"since": since.isoformat(), "until": until.isoformat(), "conversations": len(ids),
+                "limit": CONV_LIMIT, "truncated": over}
+        notes.append(f"# 期間 {since.isoformat()}〜{until.isoformat()}（日本時間）  会話 {len(ids)} 件")
+        start = datetime(since.year, since.month, since.day, tzinfo=_JST)
+        period = (start.timestamp(), (datetime(until.year, until.month, until.day, tzinfo=_JST)
+                                      + timedelta(days=1)).timestamp())
+        if over:
+            msg = f"対象の会話が上限の {CONV_LIMIT} 件を超えたため、古い順に {CONV_LIMIT} 件までにしています（残りは期間を狭めて取り直してください）"
+            notes.append("# " + msg)
+            meta["note"] = msg
+            print(msg, file=sys.stderr)
     convs = [load_conversation(int(s)) for s in ids]
     try:
-        text = build_output(convs, masker, _users_dir())
+        if ns.format == "jsonl":
+            text = build_jsonl(convs, masker, meta=meta, period=period)
+        else:
+            text = build_output(convs, masker, _users_dir(), notes=tuple(notes))
     except LeakError as e:
         print(str(e), file=sys.stderr)
         return 3

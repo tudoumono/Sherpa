@@ -91,8 +91,11 @@ def test_mcp_entry_records_one_line_per_call_and_keeps_response_and_hides_sensit
     monkeypatch.setattr(M, "_call_log_writer", None)
     M._seen_tool_calls.clear()
     hits = [{"doc_id": "a.md", "line": 3, "text": "x"}, {"doc_id": "server.pem", "line": 1, "text": "y"}]
-    monkeypatch.setattr(M.tool_dispatch, "run_tool",
-                        lambda *a, **kw: ({"hits": hits, "truncated": False}, set(), [], []))
+    def _run(*a, **kw):
+        M.tool_dispatch.read_tools._set_hit_ranks([1, 2])
+        return ({"hits": hits, "truncated": False}, set(), [], [])
+
+    monkeypatch.setattr(M.tool_dispatch, "run_tool", _run)
     resp = M.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                      "params": {"name": "ripgrep_search", "arguments": {"query": "TAX"}}})
     assert json.loads(resp["result"]["content"][0]["text"])["hits"] == hits  # 応答は変わらない
@@ -101,7 +104,7 @@ def test_mcp_entry_records_one_line_per_call_and_keeps_response_and_hides_sensit
     assert (row["tool"], row["attempt"], row["conv"], row["status"], row["count"]) == (
         "ripgrep_search", 2, "7", "ok", 2)
     assert row["call_id"] == f"{os.getpid()}:1" and row["args"] == {"query": "TAX"}
-    assert row["docs"] == [{"doc": "a.md", "range": "3"}] and row["docs_hidden"] == 1
+    assert row["docs"] == [{"doc": "a.md", "range": "3", "rank": 1}] and row["docs_hidden"] == 1
     assert "server.pem" not in (next(tmp_path.glob("calls-*.jsonl"))).read_text(encoding="utf-8")
 
 
@@ -174,3 +177,29 @@ def test_referenced_docs_merge_ranges_and_mark_unopened_office_only():
     # 記録が欠けているときは断定しない
     st2 = SimpleNamespace(call_log=SimpleNamespace(rows=rows, missing=1), _mcp_read_docs=[])
     assert CL.referenced_docs_for_answer(st2, ["d.pdf"])[0][0]["unopened"] is False
+
+
+def test_search_rows_keep_rank_via_and_score_and_show_in_download_table(tmp_path):
+    from sherpa import investigation_record_render as R
+
+    body = {"mode_used": "hybrid", "hits": [
+        {"doc_id": "secret.pem", "line": 1, "keyword_match": True},
+        {"doc_id": "a.md", "line": 3, "keyword_match": False},
+        {"doc_id": "b.md", "line": 5, "keyword_match": True}]}
+    out = T.summarize_result("es_search", {}, body, False, {}, scores=[0.9, 0.81234, 0.5], ranks=[1, 2, 3])
+    assert out["mode"] == "hybrid" and out["docs_hidden"] == 1
+    assert out["docs"] == [{"doc": "a.md", "range": "3", "rank": 2, "score": 0.8123, "via": "vector"},
+                           {"doc": "b.md", "range": "5", "rank": 3, "score": 0.5, "via": "keyword"}]
+    kw = T.summarize_result("es_search", {}, {"mode_used": "keyword", "hits": [{"doc_id": "a.md", "line": 1}]}, False, {})
+    assert kw["docs"][0]["via"] == "keyword_only_search" and "score" not in kw["docs"][0]
+    rg = T.summarize_result("ripgrep_search", {}, {"hits": [{"doc_id": "a.md", "line": 1}]}, False, {},
+                           ranks=[1])
+    assert rg["docs"] == [{"doc": "a.md", "range": "1", "rank": 1}] and "mode" not in rg
+
+    d = tmp_path / "calls"
+    _write(d, "calls-1-1.jsonl", [_row(1, 1, "es_search", 1.0, args={"query": "q"}, **out)])
+    merged = T.merge_call_logs(str(d), TURN)
+    route, _ = T.route_rows(merged)
+    assert route[0]["mode"] == "hybrid" and route[0]["docs"][0]["rank"] == 2
+    text = "\n".join(R._calls_section({"calls": 1, "route": route, "found": []}))
+    assert "a.md 3（#2・ベクトル・0.8123）" in text

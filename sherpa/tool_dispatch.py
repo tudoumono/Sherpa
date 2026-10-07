@@ -18,3 +18,13 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     return read_tools.run_tool(name, args, world, scope_paths, deadline=deadline, layer=layer,
                                max_hits=max_hits, window_cap=window_cap,
                                tool_result_max_bytes=tool_result_max_bytes, graph_only=graph_only)
+
+
+def pop_hit_scores() -> list:
+    """直前の `es_search` のヒットの点数を取り出す（結果とは別に、呼び出しの記録だけが使う）。"""
+    return read_tools.pop_hit_scores()
+
+
+def pop_hit_ranks() -> list:
+    """直前の検索のヒットの元の順位を取り出す（結果とは別に、呼び出しの記録だけが使う）。"""
+    return read_tools.pop_hit_ranks()

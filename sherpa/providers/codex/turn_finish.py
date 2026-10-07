@@ -169,6 +169,22 @@ def close_session(self, ctx, st, decision, env):
             "coverage_detail": _rec_cov_detail,
             "extras": _extras,
         }
+    else:
+        # 台帳が無いターンも、道具の記録があれば調べた経路・見つかった資料だけを調査の記録に残す（台帳の判定・注記・統計には載せない）。
+        _calls_only = call_record_sections(st)
+        if _calls_only is not None:
+            _rec_calls, _rec_dropped = trim_calls(None, {}, {}, [], {}, _calls_only)
+            _extras = {"ledger": "none", "calls": _rec_calls}
+            if st.call_log is not None and st.call_log.missing:
+                _extras["call_log_missing"] = st.call_log.missing
+            if _rec_dropped:
+                _extras["dropped"] = _rec_dropped
+                st._record_notes.append(describe_dropped(_rec_dropped))
+            env["investigation"] = {"ledger": "none"}  # 調査の記録のダウンロード導線の印（`recorded`）の置き場
+            st._investigation_record_payload = {
+                "complete": False, "manifest": None, "items": {}, "coverage": {}, "reviews": [],
+                "coverage_detail": {}, "extras": _extras,
+            }
     _call_stats = call_stats(st)
     if _call_stats is not None:
         env["call_stats"] = _call_stats  # 道具ごとの累計（利用統計の材料・中身は持たない）
@@ -374,7 +390,7 @@ def assemble_result(self, ctx, st, decision, env):
     _apply_codex_neighbors(env, mcp_neighbors, decision.get("lens") if decision else None)
     apply_codex_usage(ctx, st, env)
     # 使った検索と読んだ資料の数（取れる範囲）と、調査記録を縮めた旨を調査台帳の欄に添える（「調べた範囲」の素材）。
-    if isinstance(env.get("investigation"), dict):
+    if isinstance(env.get("investigation"), dict) and env["investigation"].get("ledger") != "none":
         env["investigation"]["effort"] = {"searches": _count_searches(env.get("activity")),
                                           "docs_read": len(set(st._mcp_read_docs))}
         if st._record_notes:
@@ -478,7 +494,7 @@ def assemble_result(self, ctx, st, decision, env):
                 _omitted = _claims_ledger_check.get("omitted_items") or []
                 _omitted_hidden = _claims_ledger_check.get("omitted_hidden", 0)
                 # 形式不正で除いた主張が項目を指していた可能性があるターンは数えない。
-                if (_omitted or _omitted_hidden) and not _claims_invalid and "investigation" in env:
+                if (_omitted or _omitted_hidden) and not _claims_invalid and st._investigation_verdict is not None:
                     env["investigation"]["omitted_items"] = _omitted
                     if _omitted_hidden:
                         env["investigation"]["omitted_hidden"] = _omitted_hidden

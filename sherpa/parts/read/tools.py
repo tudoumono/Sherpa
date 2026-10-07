@@ -439,6 +439,38 @@ def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, by
         info["missing_chunks"] = len(remaining)
     return "\n\n".join(collected[cid] for cid in order)
 
+_hit_scores: list = []
+
+
+def _set_hit_scores(scores: list) -> None:
+    """直前の `es_search` が返したヒットの点数（結果の `hits` と同じ並び）を控える。"""
+    global _hit_scores
+    _hit_scores = list(scores)
+
+
+_hit_ranks: list = []
+
+
+def _set_hit_ranks(ranks: list) -> None:
+    """直前の検索が返したヒットの元の順位（秘匿の除外・資料ごとの束ねの前の並びでの順位・結果の `hits` と同じ並び）を控える。"""
+    global _hit_ranks
+    _hit_ranks = list(ranks)
+
+
+def pop_hit_ranks() -> list:
+    """`_set_hit_ranks` で控えた順位を取り出して空にする（道具の呼び出しの記録が、結果を変えずに順位を読むため）。"""
+    global _hit_ranks
+    out, _hit_ranks = _hit_ranks, []
+    return out
+
+
+def pop_hit_scores() -> list:
+    """`_set_hit_scores` で控えた点数を取り出して空にする（道具の呼び出しの記録が、結果を変えずに点数を読むため）。"""
+    global _hit_scores
+    out, _hit_scores = _hit_scores, []
+    return out
+
+
 def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_rag: int) -> list:
     """親返し本体: doc_id ごとに束ねた rag チャンクのヒットを P2（領域）／chunk（子のみ）へ振り分ける。決定的な貪欲法:
     ① 全 doc の最低保証（子チャンク本文の合計＝`baseline`）を `budget_for_rag` から先に確保する（先頭の巨大文書が予算を食い尽くして子チャンクが消えるのを防ぐ）。
@@ -989,7 +1021,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             cap_reached = len(es_hits) >= used_max_hits
             # 秘匿名文書（秘匿判定の導入前に索引化されたヒット）はここで一律に弾き、件数（`count`／`docs`）にも含めない（`_safe_doc_path` の秘匿ガードは es_search を通らないため）
             valid_es_hits = []
-            for h in es_hits:
+            hit_ranks = []  # valid_es_hits と同じ並びの、除外前の並びでの順位
+            for rank0, h in enumerate(es_hits, 1):
                 did = h.get("doc_id")
                 if not did or did not in valid:
                     excluded["not_current"] += 1
@@ -999,6 +1032,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                     excluded["withheld"] += 1
                     continue
                 valid_es_hits.append(h)
+                hit_ranks.append(rank0)
             hits = [{"doc_id": h["doc_id"], "line": h.get("line"), "text": h.get("text", ""),
                      "span": [h.get("line"), h.get("line")], "ext": h.get("ext"),
                      "score": h.get("score"),  # 親返しの並び順にのみ使う・LLM 出力へは出さない
@@ -1023,6 +1057,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             hits = grep_tool.grep_search(q, world, max_hits=used_max_hits, scope_paths=sp,
                                          deadline=deadline, layer=layer, truncated_docs=truncated_docs,
                                          offset=offset, stats=grep_stats)
+            hit_ranks = list(range(offset + 1, offset + len(hits) + 1))  # 続きのページは元の検索の順位で数える
         # 親返し（es_search 限定）: rag チャンク由来のヒット（`chunk_id` あり）は doc_id ごとに束ねて `_resolve_parent_return` へ渡し、legacy ヒット（40 行チャンク由来）は素通しする。
         # ① 引用（cites）・doc 収集・rag_groups の組み立て（1 回だけ）
         # ヒットはスコア降順のまま渡ってくる。`template`（出力順のプレースホルダ列）で各 doc の最初に出現したヒットの位置を予約し、legacy ヒットはその場で確定させる（検索結果全体のスコア降順を保つ）。
@@ -1031,7 +1066,9 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         template: list = []  # [("legacy", hit_view_dict) | ("rag", doc_id), ...]（出力順）
         rag_groups: dict = {}
         rag_slot_index: dict[str, int] = {}  # doc_id -> template 内の予約位置（代表ヒットの位置）
-        for h in hits:
+        template_scores: list = []  # template と同じ並びの点数（呼び出しの記録だけが使う・結果には出さない）
+        template_ranks: list = []  # template と同じ並びの元の順位（同上）
+        for h, hit_rank in zip(hits, hit_ranks):
             docs.add(h["doc_id"])
             redacted_text = _redact(h["text"])
             quote = redacted_text[:500]  # citation の quote（出典カードの表示用）だけ固定上限・LLM 向け本文は切らない
@@ -1052,6 +1089,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                     # 最初に出現した位置＝その doc の最高スコア。2 件目以降は予約済みの枠へ集約するだけ
                     rag_slot_index[h["doc_id"]] = len(template)
                     template.append(("rag", h["doc_id"]))
+                    template_scores.append(h.get("score"))
+                    template_ranks.append(hit_rank)
                 continue
             hit_view = {"doc_id": h["doc_id"], "line": h["line"], "text": text_for_llm}
             if h.get("keyword_match") is not None:
@@ -1072,6 +1111,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             if name == "es_search":
                 hit_view["fragment"] = True  # ES のヒット本文は文書の断片
             template.append(("legacy", hit_view))
+            template_scores.append(h.get("score"))
+            template_ranks.append(hit_rank)
 
         # ② per_hit を割り当てて `view` を組み立て、直列化後の実バイト数で収まりを保証する
         def _build_view(per_hit: int) -> dict:
@@ -1138,6 +1179,9 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             per_hit = max(_HIT_TEXT_MIN_BYTES, int(per_hit * 0.75))
             view = _build_view(per_hit)
             attempts += 1
+        if name == "es_search":
+            _set_hit_scores(template_scores)
+        _set_hit_ranks(template_ranks)
         return (view, docs, cites, cards)
     if name in ("graph_resolve", "graph_impact"):
         # 起点の候補（graph_resolve）→ 識別子からの影響のたどり（graph_impact）。構造の辺だけをたどり、層 code でも使える（資料は返さない）。層 docs は拒否する

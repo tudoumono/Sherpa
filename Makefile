@@ -284,9 +284,16 @@ restore:           ## バックアップから戻す（make restore FROM=data/ba
 usage-backfill:    ## 既存のassistantメッセージをturn_metrics/turn_tool_statsへ一度だけ移す（冪等・複数回実行可）
 	./scripts/usage-backfill.sh
 
-trace:             ## 会話の各ターンを段・道具の呼び出し（時刻・引数・件数・打ち切り）・トークン・調査台帳の流れで書き出す（make trace CONV=<会話番号>[,<会話番号>...] [MASK=1 [MASK_MODELS=1]] [OUT=<出力ファイル>]・読み取りだけ・MASK=1 で本文や資料名を伏せる・MASK_MODELS=1 でモデル名も伏せる）
-	@case "$${CONV:-}" in ""|*[!0-9,]*) echo "使い方: make trace CONV=<会話番号>[,<会話番号>...] [MASK=1] [OUT=<出力ファイル>]（会話番号は数字とカンマだけ）"; exit 2;; esac; \
-	set -- "$${CONV}"; \
+trace:             ## 会話の各ターンを段・道具の呼び出し（時刻・引数・件数・打ち切り）・調べた経路と見つかった資料・トークン・調査台帳の流れで書き出す（make trace CONV=<会話番号>[,<会話番号>...] か SINCE=<YYYY-MM-DD> [UNTIL=<YYYY-MM-DD>]（日本時間・どちらか片方・会話は 500 件まで）[FORMAT=jsonl（1 行 1 ターンの分析用）] [MASK=1 [MASK_MODELS=1]] [OUT=<出力ファイル>]・読み取りだけ・MASK=1 で本文や資料名を伏せる・MASK_MODELS=1 でモデル名も伏せる）
+	@case "$${CONV:-}" in *[!0-9,]*) echo "使い方: make trace CONV=<会話番号>[,<会話番号>...]（会話番号は数字とカンマだけ）"; exit 2;; esac; \
+	case "$${SINCE:-}$${UNTIL:-}" in *[!0-9-]*) echo "使い方: SINCE・UNTIL は YYYY-MM-DD（日本時間）"; exit 2;; esac; \
+	case "$${FORMAT:-text}" in text|jsonl) ;; *) echo "使い方: FORMAT は text か jsonl"; exit 2;; esac; \
+	if [ -n "$${CONV:-}" ] && [ -n "$${SINCE:-}$${UNTIL:-}" ]; then echo "使い方: CONV と SINCE はどちらか片方"; exit 2; fi; \
+	if [ -z "$${CONV:-}" ] && [ -z "$${SINCE:-}" ]; then echo "使い方: make trace CONV=<会話番号>[,<会話番号>...] または SINCE=<YYYY-MM-DD> [UNTIL=<YYYY-MM-DD>] [FORMAT=jsonl] [MASK=1] [OUT=<出力ファイル>]（CONV か SINCE のどちらか片方）"; exit 2; fi; \
+	set --; \
+	if [ -n "$${CONV:-}" ]; then set -- "$${CONV}"; else set -- --since "$${SINCE}"; fi; \
+	if [ -n "$${UNTIL:-}" ]; then set -- "$$@" --until "$${UNTIL}"; fi; \
+	if [ -n "$${FORMAT:-}" ]; then set -- "$$@" --format "$${FORMAT}"; fi; \
 	if [ "$${MASK:-}" = 1 ]; then set -- "$$@" --mask; fi; \
 	if [ "$${MASK_MODELS:-}" = 1 ]; then set -- "$$@" --mask-models; fi; \
 	if [ -n "$${OUT:-}" ]; then set -- "$$@" --out "$${OUT}"; fi; \

@@ -228,3 +228,16 @@ def test_calls_section_is_dropped_before_the_ledger_and_is_rendered_in_the_downl
     plain = investigation_record_render.render_markdown(
         {"complete": True, "truncated": False, "manifest": None, "items": items, "coverage": {}, "reviews": [], "detail": {}})
     assert "調べた経路" not in plain
+
+
+def test_render_markdown_without_ledger_shows_notice_and_calls_only():
+    """台帳が無いターンの記録は、台帳が無い旨の 1 行と調べた経路・見つかった資料だけを出す（manifest が無くても落ちない）。"""
+    calls = {"v": 1, "calls": 1, "missing": 0,
+             "route": [{"call": "1:1", "role": "parent", "tool": "es_search", "status": "ok", "count": 2, "ms": 5,
+                        "query": "端数", "docs": [{"doc": "a.md", "range": "3"}]}],
+             "found": [{"doc": "a.md", "hits": 1, "lines": [3], "queries": ["端数"], "opened": True}]}
+    md = investigation_record_render.render_markdown(
+        {"complete": False, "truncated": False, "manifest": None, "items": {}, "coverage": {}, "reviews": [],
+         "detail": {"ledger": "none", "calls": calls}})
+    assert "調査台帳はありません（このターンは台帳を使っていません）" in md
+    assert "## 調べた経路" in md and "## 見つかった資料（検索の結果）" in md and "## 項目" not in md

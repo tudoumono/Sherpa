@@ -1026,10 +1026,14 @@ def _record_tool_call(rid, params: dict) -> dict:
     ts = time.time()
     t0 = time.monotonic()
     raised = None
+    tool_dispatch.pop_hit_scores()
+    tool_dispatch.pop_hit_ranks()
     try:
         resp = _handle_tool_call(rid, params)
     except Exception as exc:  # 例外の呼び出しも 1 行残してから、従来どおり serve に応答させる
         resp, raised = None, exc
+    hit_scores = tool_dispatch.pop_hit_scores()
+    hit_ranks = tool_dispatch.pop_hit_ranks()
     directory = _call_log_dir()
     if directory is None:
         if raised is not None:
@@ -1062,7 +1066,8 @@ def _record_tool_call(rid, params: dict) -> dict:
             "tool": name if isinstance(name, str) else "",
             "ms": max(0, round((time.monotonic() - t0) * 1000)),
         }
-        entry.update(tool_call_log.summarize_result(entry["tool"], args, body, is_error, detail))
+        entry.update(tool_call_log.summarize_result(entry["tool"], args, body, is_error, detail,
+                                                         scores=hit_scores, ranks=hit_ranks))
         if raised is not None:
             entry["error_kind"] = "tool_exception"
         arg_summary = {k: tool_call_log.clip(v) for k, v in detail.items() if k in ("query", "doc", "range")}

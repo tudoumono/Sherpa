@@ -197,7 +197,7 @@ def _execute_job(job: dict, stop_event: threading.Event) -> None:
             # ジョブの結果にも調査の記録を載せる（チャット経路と同じ切り詰めルール・ジョブと一緒に期限切れで消える）。
             _investigation_record = result.get("investigation_record")
             investigation = None
-            if _investigation_record is not None:
+            if _investigation_record is not None and (_investigation_record.get("extras") or {}).get("ledger") != "none":
                 _manifest, _items, _coverage, _reviews, _truncated = store_investigation.trim_to_budget(
                     _investigation_record.get("manifest"),
                     _investigation_record.get("items") or {},

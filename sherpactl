@@ -14,7 +14,7 @@ usage() {
   logs    全ログ（アプリ＋ストア）を1画面で追う
           ./sherpactl logs [名前…] [-n 行数] [-m] [-r] [-h]
   trace   会話の流れを時刻順に書き出す（読み取りだけ）
-          ./sherpactl trace <会話ID[,ID…]> [--mask] [--mask-models] [-o 出力] [-h]
+          ./sherpactl trace <会話ID[,ID…]> | --since 日付 [--until 日付] [--format jsonl] [--mask] [--mask-models] [-o 出力] [-h]
   diag    解析用のログ回収バンドルを作る（dist/diag/・機密は含めない）
           ./sherpactl diag [--days N] [--out ファイル] [--dry-run] [-h]
   doctor  導入先の統合セットアップ検査（読み取り専用）
@@ -48,7 +48,7 @@ case "$tool" in
     exec "$ROOT/scripts/logs.sh" "$@"
     ;;
   trace)
-    conv="" out="" args=()
+    conv="" out="" since="" until="" fmt="" args=()
     while [ $# -gt 0 ]; do
       case "$1" in
         -h|--help) usage; exit 0 ;;
@@ -56,18 +56,39 @@ case "$tool" in
                 conv="$2"; shift 2 ;;
         -o|--out) [ $# -ge 2 ] || { echo "$1 には出力ファイルを指定してください" >&2; exit 2; }
                   out="$2"; shift 2 ;;
+        --since) [ $# -ge 2 ] || { echo "--since には日付（YYYY-MM-DD）を指定してください" >&2; exit 2; }
+                 since="$2"; shift 2 ;;
+        --until) [ $# -ge 2 ] || { echo "--until には日付（YYYY-MM-DD）を指定してください" >&2; exit 2; }
+                 until="$2"; shift 2 ;;
+        --format) [ $# -ge 2 ] || { echo "--format には text か jsonl を指定してください" >&2; exit 2; }
+                  fmt="$2"; shift 2 ;;
         --mask|--mask-models) args+=("$1"); shift ;;
         -*) echo "知らないオプションです: $1（./sherpactl trace -h で使い方）" >&2; exit 2 ;;
         *) if [ -z "$conv" ]; then conv="$1"; shift
            else echo "会話番号は 1 つ（カンマ区切りで複数）で指定してください" >&2; exit 2; fi ;;
       esac
     done
-    case "$conv" in
-      ""|*[!0-9,]*)
-        echo "使い方: ./sherpactl trace <会話ID[,ID…]> [--mask] [--mask-models] [-o 出力]（会話番号は数字とカンマだけ）" >&2
-        exit 2 ;;
+    if [ -n "$since" ] && [ -z "$conv" ]; then
+      case "$since$until" in
+        *[!0-9-]*) echo "使い方: --since・--until は YYYY-MM-DD" >&2; exit 2 ;;
+      esac
+      set -- --since "$since"
+      if [ -n "$until" ]; then set -- "$@" --until "$until"; fi
+      set -- "$@" ${args[@]+"${args[@]}"}
+    else
+      case "$conv" in
+        ""|*[!0-9,]*)
+          echo "使い方: ./sherpactl trace <会話ID[,ID…]> | --since 日付 [--until 日付] [--format jsonl] [--mask] [--mask-models] [-o 出力]（会話番号は数字とカンマだけ・会話番号と期間はどちらか片方）" >&2
+          exit 2 ;;
+      esac
+      if [ -n "$since$until" ]; then echo "会話番号と期間はどちらか片方で指定してください" >&2; exit 2; fi
+      set -- --conv "$conv" ${args[@]+"${args[@]}"}
+    fi
+    case "$fmt" in
+      ""|text|jsonl) ;;
+      *) echo "--format は text か jsonl" >&2; exit 2 ;;
     esac
-    set -- --conv "$conv" ${args[@]+"${args[@]}"}
+    if [ -n "$fmt" ]; then set -- "$@" --format "$fmt"; fi
     if [ -n "$out" ]; then set -- "$@" --out "$out"; fi
     exec "$ROOT/scripts/conversation-trace.sh" "$@"
     ;;

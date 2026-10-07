@@ -284,3 +284,71 @@ def test_make_trace_passes_conv_and_out_without_shell_injection(tmp_path):
     bad = subprocess.run(["make", "-s", "trace", f"CONV=1;touch {planted}"],
                          cwd=root, capture_output=True, text=True, timeout=60)
     assert bad.returncode != 0 and "数字とカンマだけ" in bad.stdout and not planted.exists()
+
+
+def _route_detail() -> dict:
+    return {"ledger": "none", "calls": {
+        "v": 1, "calls": 2, "missing": 0,
+        "route": [
+            {"call": "c1", "role": "parent", "tool": "es_search", "status": "ok", "count": 2, "ms": 40,
+             "query": _QUERY, "mode": "mixed",
+             "docs": [{"doc": _DOC, "range": "12", "rank": 1, "score": 0.5, "via": "vector"},
+                      {"doc": "conf/app.key", "range": "3"}]},
+            {"call": "c2", "role": "child", "tool": "read_around", "status": "ok", "count": 1, "ms": 5,
+             "docs": [{"doc": _DOC, "range": "10-20"}]}],
+        "found": [{"doc": _DOC, "hits": 1, "lines": [12], "queries": [_QUERY], "opened": True}]}}
+
+
+def test_jsonl_and_text_route_section_keep_masking_and_secrets_rules(tmp_path):
+    conv = _conv(how={"mode": "investigate", "doc_focus": True}, completion="complete", investigation={"ledger": "none"},
+                 tool_use={"v": 1, "verdict": "used", "nudged": False},
+                 referenced_docs=[{"path": _DOC, "ranges": [[10, 20]], "unopened": False},
+                                  {"path": "keys/id_rsa", "ranges": [], "unopened": True}],
+                 impact_list={"v": 1, "traced": True, "rows": [{"name": "架空部品", "path": _DOC, "role": "origin",
+                                                               "state": "used", "reason": ""}], "reasons": [], "more": 0})
+    conv["investigations"][11] = {"complete": False, "truncated": False, "items": {}, "coverage": {},
+                                  "reviews": [], "detail": _route_detail()}
+    conv["feedback"] = {11: {"rating": "down", "tags": ["incomplete"], "comment": "架空の一言"}}
+    extra = {"id": 12, "role": "assistant", "content": "個人", "personal": True, "answer": {}, "trace": None,
+             "created_at": _A_AT}
+    conv["messages"].append(extra)
+    conv["audits"].append({"id": 2, "detail": {"message_id_assistant": 12}, "outcome": "success", "created_at": _A_AT})
+
+    masker = CT.Masker(mask=True, salt=b"s" * 16)
+    out = CT.build_jsonl([conv], masker, meta={})
+    rows = [json.loads(ln) for ln in out.splitlines()]
+    assert rows[0]["kind"] == "meta" and len(rows) == 2          # 個人の資料を参照したターンは出さない
+    t = rows[1]
+    assert t["conv"] == 7 and t["answer_id"] == 11 and t["ledger"] == "none" and t["completion"] == "complete"
+    assert t["route"][0]["docs"][0]["rank"] == 1 and t["route"][0]["docs"][0]["via"] == "vector"
+    assert "rank" not in t["route"][1]["docs"][0] and t["route"][0]["docs"][1]["doc"] == "（秘匿ファイル）"
+    assert t["feedback"] == {"rating": "down", "tags": ["incomplete"], "has_comment": True}
+    assert t["impact_list"]["states"] == {"used": 1} and t["tool_use"]["verdict"] == "used"
+    for raw in (_QUERY, "架空資料", "app.key", "id_rsa", "架空の一言", "架空の回答の先頭行", "架空の質問", "架空部品"):
+        assert raw not in out, raw
+    assert CT.find_leaks(out, masker) == 0 and CT.find_leaks(out + "\n架空資料.cbl\n", masker) > 0
+
+    plain = CT.build_jsonl([conv], CT.Masker(mask=False), meta={})
+    assert _DOC in plain and _QUERY in plain and "app.key" not in plain and "id_rsa" not in plain
+
+    text = CT.build_output([conv], CT.Masker(mask=False), tmp_path / "nothing")
+    assert "[調べた経路と見つかった資料]" in text and "順位 1 点数 0.5 vector" in text and "app.key" not in text
+    assert "調査台帳]" not in text.split("[調べた経路と見つかった資料]")[1].split("[記録の欠け]")[0]
+
+
+def test_since_selection_is_capped_and_arguments_are_exclusive(monkeypatch, capsys):
+    seen = {}
+
+    def fake_query(sql, params):
+        seen["params"] = params
+        return [{"id": i} for i in range(1, CT.CONV_LIMIT + 2)]
+
+    monkeypatch.setattr(CT, "_query", fake_query)
+    monkeypatch.setattr(CT, "load_conversation", lambda cid: {"id": cid, "conversation": None, "errors": []})
+    assert CT.main(["--since", "2026-10-01", "--until", "2026-10-02", "--format", "jsonl"]) == 0
+    first = json.loads(capsys.readouterr().out.splitlines()[0])
+    assert first["truncated"] is True and first["conversations"] == CT.CONV_LIMIT and "上限" in first["note"]
+    start, end = seen["params"][0], seen["params"][1]
+    assert start.utcoffset().total_seconds() == 9 * 3600 and (end - start).days == 2   # UNTIL はその日を含む
+    for argv in (["--conv", "1", "--since", "2026-10-01"], [], ["--until", "2026-10-01"], ["--since", "10/01"]):
+        assert CT.main(argv) == 2

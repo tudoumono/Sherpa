@@ -55,9 +55,12 @@ def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
-def summarize_result(name: str, args, result, is_error: bool, detail: dict) -> dict:
+def summarize_result(name: str, args, result, is_error: bool, detail: dict, scores: list | None = None,
+                     ranks: list | None = None) -> dict:
     """道具の結果から、記録に残す要点（結果・件数・返した資料と行の範囲・切り詰め・エラーの種類）を取り出す。
     `detail` は `mcp_server._coverage_detail` の戻り値（秘匿の資料名を除いた doc・range）。本文・グラフの行は入れない。
+    検索（`ripgrep_search`・`es_search`）の資料には順位 `rank`、`es_search` にはあれば点数 `score`・当たり方 `via`、行に検索の形 `mode` を足す。
+    `scores` は `es_search` の結果の `hits` と同じ並びの点数、`ranks` は検索の結果の `hits` と同じ並びの元の順位（結果には出さない）。
     """
     from .ingest import text_kind
 
@@ -101,7 +104,14 @@ def summarize_result(name: str, args, result, is_error: bool, detail: dict) -> d
     hidden = 0
     hits = res.get("hits")
     if isinstance(hits, list):
-        for h in hits:
+        is_search = name in ("ripgrep_search", "es_search")
+        is_es = name == "es_search"
+        mode = res.get("mode_used")
+        if is_es and mode in ("hybrid", "keyword", "vector"):
+            out["mode"] = mode
+        use_scores = is_es and isinstance(scores, list) and len(scores) == len(hits)
+        use_ranks = is_search and isinstance(ranks, list) and len(ranks) == len(hits)
+        for i, h in enumerate(hits):
             if not isinstance(h, dict) or not isinstance(h.get("doc_id"), str):
                 continue
             if text_kind.is_sensitive_doc_id(h["doc_id"]):
@@ -110,6 +120,14 @@ def summarize_result(name: str, args, result, is_error: bool, detail: dict) -> d
             row = {"doc": clip(h["doc_id"])}
             if _is_int(h.get("line")):
                 row["range"] = str(h["line"])
+            if use_ranks and _is_int(ranks[i]):
+                row["rank"] = ranks[i]
+            if use_scores and isinstance(scores[i], (int, float)) and not isinstance(scores[i], bool):
+                row["score"] = round(float(scores[i]), 4)
+            if is_es:
+                via = _hit_via(mode, h.get("keyword_match"))
+                if via:
+                    row["via"] = via
             docs.append(row)
     elif detail.get("doc") and not (name == "compare_documents" and res.get("status") != "comparable"):
         names = [d for d in str(detail["doc"]).split(" ⇔ ") if d]
@@ -129,6 +147,17 @@ def summarize_result(name: str, args, result, is_error: bool, detail: dict) -> d
     if hidden:
         out["docs_hidden"] = hidden
     return out
+
+
+def _hit_via(mode, keyword_match) -> str | None:
+    """ES のヒットの当たり方。言葉の一致だけで検索したなら `keyword_only_search`、hybrid なら言葉の一致の節に当たったか（`keyword`／`vector`）。"""
+    if mode == "keyword":
+        return "keyword_only_search"
+    if keyword_match is True:
+        return "keyword"
+    if keyword_match is False or mode == "vector":
+        return "vector"
+    return None
 
 
 def _graph_limits(cov) -> list[dict]:
@@ -477,7 +506,9 @@ def route_rows(merged: MergedCallLog) -> tuple[list[dict], int]:
             if args.get(key) not in (None, ""):
                 out[key] = args[key]
         if docs:
-            out["docs"] = [{k: d[k] for k in ("doc", "range") if k in d} for d in docs]
+            out["docs"] = [{k: d[k] for k in ("doc", "range", "rank", "score", "via") if k in d} for d in docs]
+        if r.get("mode") in ("hybrid", "keyword", "vector"):
+            out["mode"] = r["mode"]
         if _count(r.get("docs_omitted")):
             out["docs_omitted"] = r["docs_omitted"]
         if hidden:
