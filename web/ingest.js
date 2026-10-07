@@ -793,6 +793,10 @@ function render() {
   updateEsScope();
 }
 
+// 一覧の名前は、ツリーで選んだフォルダより下の部分だけを出す（全体のパスは title に残す）。
+function shownName(name) {
+  return _folder && name.startsWith(_folder + '/') ? name.slice(_folder.length + 1) : name;
+}
 function row(d) {
   const st = STATE[d.state] || STATE.ready;
   const icon = d.branch === 'source' ? '📜' : '📄';
@@ -801,7 +805,7 @@ function row(d) {
     ? `<div class="muted" style="font-size:var(--text-caption);margin-top:3px">理由: ${esc(reasonText(d.reason))}</div>` : '';
   const rerun = isFailureState(d.state) ? `<button class="mini" data-rerun="${esc(d.name)}">やり直す</button>` : '';
   return `<tr>
-    <td><span class="fname">${icon} ${esc(d.name)}</span>${reason}${provBadges(d.provenance)}${analyzerBadgeRow(d)}${encodingPartialBadge(d)}</td>
+    <td><span class="fname" title="${esc(d.name)}">${icon} ${esc(shownName(d.name))}</span>${reason}${provBadges(d.provenance)}${analyzerBadgeRow(d)}${encodingPartialBadge(d)}</td>
     <td><span class="dtype">${esc(d.doctype)}</span></td>
     <td><span class="status ${st.cls}"><span class="d"></span>${esc(st.mark)}</span></td>
     <td class="muted">${esc(place)}</td>
