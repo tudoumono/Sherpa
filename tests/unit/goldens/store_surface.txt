@@ -54,6 +54,7 @@ backfill_all
 backfill_doc_count
 backfill_manifest_and_doc_count
 claim_workspace_file_expired
+clear_failed_docs
 conversation_has_personal_message
 conversation_is_personal_tainted
 count_documents
@@ -87,6 +88,7 @@ get_announcement
 get_api_key_webhook
 get_codex_usage_total
 get_conversation_for_read
+get_document
 get_feedback_by_message_ids
 get_feedback_by_message_ids_for_user
 get_latest_es_run_summary
@@ -116,6 +118,7 @@ list_documents
 list_documents_page
 list_expiring_shares_for_owner
 list_export_messages
+list_failed_docs
 list_feedback_turns
 list_ingest_runs
 list_shares_for_conversation
@@ -130,10 +133,14 @@ owns_conversation
 purge_personal_api_keys
 recent_messages
 record_depth_quality_run
+record_failed_doc
 record_workspace_file
 refresh_sanitized_share
+remove_failed_doc
 rename_conversation
+replace_document
 replace_documents
+replace_failed_docs
 resolve_self_issued_daily_quota_cap
 resolve_share_by_token
 restore_announcement

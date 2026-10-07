@@ -175,12 +175,16 @@ def resolve_vlm() -> dict | None:
                             "無効化します（画像はクラウドへ送信しません）。")
             return None
     elif cfg["provider"] == "ollama":
+        from . import enabled_arm_names
+        in_use = "vision" in enabled_arm_names()  # アーム無効＝Ollama を使わない構成（警告しない・戻り値は変えない）
         if not cfg["ollama_url"]:
-            _log.warning("VLM: 中央の Ollama 接続先を読めないため無効化します（画像は送信しません）。")
+            if in_use:
+                _log.warning("VLM: 中央の Ollama 接続先を読めないため無効化します（画像は送信しません）。")
             return None
         if not cfg["cloud_allowed"] and not _ollama_url_permitted(cfg["ollama_url"]):
-            _log.warning("VLM: provider=ollama の接続先（%s）が Ollama の許可先と確認できず、クラウド許可も"
-                         "無いため無効化します（画像は送信しません）。", cfg["ollama_url"])
+            if in_use:
+                _log.warning("VLM: provider=ollama の接続先（%s）が Ollama の許可先と確認できず、クラウド許可も"
+                             "無いため無効化します（画像は送信しません）。", cfg["ollama_url"])
             return None
     return cfg
 

@@ -39,7 +39,6 @@ from sherpa.schemas import (
     WorldIngestAcceptedResponse,
     WorldOptionsResponse,
     WorldRecountResponse,
-    WorldReconvertResponse,
     WorldResolveSettingsResponse,
     WorldsListResponse,
     WorldStatusResponse,
@@ -96,15 +95,16 @@ def _fingerprint(payload: dict) -> str:
 
 
 def _dispatch(wid: str, op: str, fingerprint: str, work_fn, *,
-             extra_registry_keys: tuple[str, ...] = ()) -> tuple[int, bool]:
+             extra_registry_keys: tuple[str, ...] = (), initial_progress: dict | None = None) -> tuple[int, bool]:
     """`background.start_or_join` へ委譲する共通ラッパー（登録/更新/削除/参照先変更/再取り込み等、world に触れる操作全般で共通）。
     受付時に O(1) で `ingest_runs` 行を確保してから背景実行へ渡し、run_id を戻り値で返す。run 行は常に実際の `wid` に紐付ける。`extra_registry_keys` は多重クリック仲裁（`background._REGISTRY`）で `wid` に加えて登録する別名キー（`world_create` の未登録 root 分岐が `_NEW_WORLD_REGISTRY_KEY` を渡す）。
+    `initial_progress` は受付時に run 行へ書く進捗（省略時は `_initial_progress()`）。
     `work_fn(run_id)` は各操作の実処理。想定外の失敗は `background.start_or_join` の CAS セーフティネット（`store.fail_close_if_extracting`）が拾う。
     実行中の run と `op`/`fingerprint` が不一致なら 409、シャットダウン処理中（`background.stop_accepting()` 済み）は 503。
     """
     def _create_run() -> int:
         row = store.start_ingest_run(wid, scan_root=None, created_by="admin",
-                                     progress=_initial_progress())
+                                     progress=initial_progress or _initial_progress())
         return row["id"]
 
     try:
@@ -272,7 +272,7 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     `row`＝呼び出し元が取得済みの world 登録行（`store.get_world(wid)`・ここでは読み直さない）。
     最終 ingest run の status と warn/blocked 理由も含める。`last_run_warnings` は reason 文字列のみの一覧で、対象ファイルが特定できる blocked flag は `last_run_blocked`（`doc`/`reason`）で別途通す。どちらも `extraction_snapshot.flags` を `_STATUS_FLAGS_LIMIT` 件で打ち切ってから導出し、`last_run_flags_total`/`last_run_flags_truncated` で打切りの有無を示す。
     `scanned`〜`unreadable` は `row["last_scan_report"]` を読むだけでフォルダを歩かない。graph/ES 件数も `graph_view()` や ES live `_count` は呼ばず、graph は最新の反映済み run（`store.get_latest_published_run_summary`）の `published_snapshot`、ES は別クエリ（`store.get_latest_es_run_summary`）の `extraction_snapshot.es` から読む（完了境界が異なり別々の run を指しうる）。`store.get_latest_run_summary` は `source_doc_ids` を含まない狭い SELECT（`last_run_status`/`last_run_warnings`/`failed_files`/`stage_summary` の由来）。DB 例外は捕捉せず呼び出し元へ伝播させる（全ゼロへ縮退しない）。キャッシュが無い world は全ゼロ＋`counts_as_of=None`（未集計・利用者が「再集計」を押すまで待つ）。
-    `failed_files`/`partial_extraction_suspected`/`stage_summary`（`stage_timings`/`counts` を含む）は最新 run の `extraction_snapshot` 由来（無ければ None）。`failure_reason_catalog`/`partial_extraction_advice` は静的な辞書（`sherpa.ingest.failure_reasons` が真実源）。
+    `failed_files` は失敗の一覧（`world_failed_docs`）由来、`partial_extraction_suspected`/`stage_summary`（`stage_timings`/`counts` を含む）は最新 run の `extraction_snapshot` 由来（無ければ None）。`failure_reason_catalog`/`partial_extraction_advice` は静的な辞書（`sherpa.ingest.failure_reasons` が真実源）。
     `last_run_id` は背景実行の受付応答の `run_id` と対応付ける。`running_progress` は実行中（`status='extracting'` かつ `progress` がある）時だけ `{stage, stage_label, done, total, updated_at}`（資料画面はこの間だけ数秒間隔でポーリングする）。
     """
     rep = row.get("last_scan_report")
@@ -302,7 +302,8 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     blocked = [{"doc": f.get("doc"), "reason": f.get("reason")} for f in flags
                if isinstance(f, dict) and f.get("action") == "blocked"
                and isinstance(f.get("doc"), str) and f.get("reason")]
-    failed_files = snap.get("failed_files")
+    ingest_worker.seed_failed_docs_once(wid)   # 失敗の一覧の導入前に取り込んだ資料フォルダは、初回だけ派生から集めて入れる
+    failed_files = ingest_worker.failed_files_from_table(wid, snap.get("failed_files"))   # 失敗の一覧は表から読む（変化の無い更新で消えない）
     partial = snap.get("partial_extraction_suspected")
     office_md_stage, es_stage, neo4j_stage = snap.get("office_md"), snap.get("es"), snap.get("neo4j")
     # `stage_timings`（段ごとの開始・終了・所要 ms）と `counts` も最新 run の extraction_snapshot 由来（既存キーは不変・追加のみ）。
@@ -334,7 +335,7 @@ def _ingest_summary(wid: str, row: dict) -> dict:
         pub_es = es_ext.get("es")
         # bulk 投入が実際に成功した（`available is True` かつ `error` 無し）ときだけ chunks を件数として見せる（不明なときは None＝UI「不明」表示）。
         if isinstance(pub_es, dict) and pub_es.get("available") is True and not pub_es.get("error"):
-            es_chunks = pub_es.get("chunks")
+            es_chunks = _es_index_chunks(pub_es)
             es_notice_stage = pub_es
     # 実行中（`status='extracting'`）の run だけ進捗を載せる。`extracting` は `reflect=False`（staging・テスト専用経路）の成功時終端状態でもあるため、`progress` 自体の有無で最終判定する。
     last_status = (last or {}).get("status")
@@ -377,9 +378,14 @@ _ES_ERRORS_OLD_INDEX_KEPT = frozenset({"embedding_cloud_unavailable", "embed_cac
 _ES_PROGRESS_STAGE = "es_index"
 
 
+def _es_index_chunks(es: dict):
+    """索引全体の切れ端の数（1 ファイルの再変換の記録は `index_chunks`・ほかは `chunks`）。"""
+    return es.get("index_chunks", es.get("chunks"))
+
+
 def _es_succeeded(es) -> bool:
     return (isinstance(es, dict) and es.get("available") is True and not es.get("error")
-            and (es.get("chunks") or 0) > 0)
+            and (_es_index_chunks(es) or 0) > 0)
 
 
 def _old_index_kept(earlier) -> bool:
@@ -757,52 +763,53 @@ def _audit_reconvert(u: dict | None, action: str, wid: str, rel: str, *, outcome
                      action, wid, rel, exc_info=True)
 
 
-@worlds_router.post("/worlds/{wid}/reconvert", tags=["資料フォルダ(World)管理"], response_model=WorldReconvertResponse)
+@worlds_router.post("/worlds/{wid}/reconvert", tags=["資料フォルダ(World)管理"],
+                    response_model=WorldIngestAcceptedResponse, status_code=202)
 def world_reconvert(wid: str, req: ReconvertReq, request: Request):
-    """1 ファイルの変換をやり直す（失敗一覧の「再変換」ボタン）。
-    対象の確認・旧形式変換キャッシュの削除・world 全体の作り直しを、同じ world のロックを持ったまま続けて行う。キャッシュを削除できなければ 503、参照元が消えていても 503 を返す。
+    """失敗した資料を 1 ファイルだけ変換し直すことを即受付する（失敗一覧の「再変換」ボタン・背景実行）。
+    受付前に資料フォルダ（404）・参照元（503）・原本（404）・変換の対象か（422）・失敗の一覧にあるか（無ければ 409）を確かめる。同じファイルの多重クリックは既存 run へ合流し、
+    同じ資料フォルダで別の処理（取り込み・更新・別のファイルの再変換など）が実行中なら 409。進み具合は `GET /worlds/{wid}/status` で確認する。
+    設計: docs/design/rag.md「失敗した資料のやり直し」
     """
     u = _current_user(request)
     _require_admin(u)
     if not valid_world(wid):
         raise HTTPException(422, "不正な識別子")
-    from sherpa.ingest.arms import legacy_convert
-    attempted = False
-    outcome = "failure"
-    run = None
     try:
-        with store.world_lock(wid, timeout_ms=_EXTRACT_LOCK_TIMEOUT_MS):
-            if not store.get_world(wid):
-                raise HTTPException(404, "資料フォルダが見つかりません")
-            if not worlds.world_dir(wid):
-                raise HTTPException(503, "参照元フォルダにアクセスできません")
-            if not doc_ledger.original_path(req.rel, wid):
-                raise HTTPException(404, "対象ファイルが見つかりません")
-            attempted = True
-            _audit_reconvert(u, "world.reconvert_requested", wid, req.rel)
-            ext = Path(req.rel).suffix.lower()
-            if ext in legacy_convert.LEGACY_EXT_MAP:
-                # キャッシュ削除の失敗を無視しない（落とせなかった旧形式キャッシュを抱えたまま再構築しない）。sync 前に 503 で止める。
-                cache_root = legacy_convert.cache_root_for(worlds.derived_md_dir(wid))
-                if not legacy_convert.drop_cache_entry(cache_root, req.rel):
-                    raise HTTPException(503, "キャッシュの削除に失敗しました。時間をおいてやり直してください")
-            run = _run_worker_or_503(
-                wid, lambda: ingest_worker._run_locked(wid, reflect=True, created_by="admin", scan_root=None,
-                                                       op="refresh"))
-            if run["status"] == "failed":
-                raise HTTPException(503, f"再変換に失敗しました: {run.get('flags')}")
-            outcome = "success"
-    except HTTPException:
-        raise
-    except psycopg.errors.LockNotAvailable as e:
-        raise HTTPException(409, "他の取り込み処理と競合しています。しばらくしてから再試行してください") from e
-    finally:
-        if attempted:
+        row = store.get_world(wid)
+    except Exception as e:
+        raise HTTPException(503, _INGEST_UNAVAILABLE_MESSAGE) from e
+    if not row:
+        raise HTTPException(404, "資料フォルダが見つかりません")
+    if not worlds.world_dir(wid):
+        raise HTTPException(503, "参照元フォルダにアクセスできません")
+    rp = doc_ledger.original_path(req.rel, wid)
+    if not rp:
+        raise HTTPException(404, "対象ファイルが見つかりません")
+    from sherpa.ingest import office_md
+    if not office_md.is_conversion_target(rp):
+        raise HTTPException(422, "変換の対象ではないファイルです")
+    try:
+        failed = {r["rel"] for r in store.list_failed_docs(wid)}
+    except Exception as e:
+        raise HTTPException(503, _INGEST_UNAVAILABLE_MESSAGE) from e
+    if req.rel not in failed:
+        raise HTTPException(409, "失敗の一覧にない資料です。一覧を読み直してください")
+
+    def _work(run_id):
+        _audit_reconvert(u, "world.reconvert_requested", wid, req.rel)
+        outcome = "failure"
+        try:
+            res = ingest_worker.reconvert(wid, req.rel, run_id=run_id)
+            outcome = "failure" if res["status"] == "failed" else "success"
+        finally:
             _audit_reconvert(u, "world.reconverted", wid, req.rel, outcome=outcome)
-    return {"ok": True, "world_id": wid, "rel": req.rel, "changed": True,
-            "status": run["status"], "ledger": run.get("ledger"), "flags": run.get("flags", []),
-            "summary": _ingest_summary_after_mutation(wid),
-            "note": "更新（今すぐ取り込み直す）と同じ処理が world 全体に対して走りました。"}
+
+    run_id, joined = _dispatch(wid, "reconvert", _fingerprint({"rel": req.rel}), _work,
+                               initial_progress={**_initial_progress(), "rel": req.rel})
+    return {"ok": True, "world_id": wid, "run_id": run_id, "joined": joined,
+            "note": "このファイルの再変換に合流しました。" if joined
+                    else "受け付けました。このファイルだけを変換し直しています。"}
 
 
 def _notify_delete_terminal(wid: str, run_id: int, status: str) -> None:

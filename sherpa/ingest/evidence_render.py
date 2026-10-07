@@ -1952,7 +1952,7 @@ def validation_errors(ir: evidence_ir.EvidenceIR, result: RenderedEvidence) -> l
     }
     expected_cells = {
         element.element_id for element in ir.elements
-        if element.type == "cell" and _value_text(element.value)
+        if element.type == "cell" and _value_text(element.value).strip()
     }
     missing_cells = expected_cells - cited_ids
     if missing_cells:

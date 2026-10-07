@@ -40,6 +40,16 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
         "advice": "ファイルを展開（解凍）した後のサイズが大きすぎて処理できませんでした。"
                   "内容（画像・書式・シート数等）を減らして保存し直してください。",
     },
+    "source_parse_failed": {
+        "label": "読み取りに失敗（失敗の知らせ）",
+        "advice": "中身を読み取れなかったため、検索には失敗の知らせだけが載っています。"
+                  "ファイルを開いて保存し直したあと、「再変換」で変換し直してください。",
+    },
+    "reconvert_reflect_failed": {
+        "label": "再変換の反映が終わっていない",
+        "advice": "変換し直せましたが、関係グラフか全文検索への反映が終わっていません。"
+                  "もう一度「再変換」を押してください。",
+    },
     "write_failed": {
         "label": "書き込み失敗",
         "advice": "派生ファイルの書き込みに失敗しました。ディスクの空き容量や権限を確認し、時間をおいて再試行してください。",
@@ -84,7 +94,7 @@ _DOCUMENT_IR_KNOWN_DETAILS = frozenset({"malformed_structure", "password_protect
 # そのまま理由コードとして通す reason
 _PASSTHROUGH = frozenset({
     "legacy_conversion_timeout", "legacy_conversion_failed", "size_exceeded",
-    "cell_count_exceeded", "uncompressed_size_exceeded",
+    "cell_count_exceeded", "uncompressed_size_exceeded", "source_parse_failed", "reconvert_reflect_failed",
 })
 
 # 書込失敗の別名

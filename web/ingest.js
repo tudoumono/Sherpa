@@ -260,7 +260,11 @@ function stageSummaryHtml(stage) {
       + `未対応 ${esc(stage.office_md.unsupported)} 件`);
   }
   if (stage.es) {
-    lines.push(`全文検索: ${stage.es.chunks != null ? esc(stage.es.chunks) + ' 片' : '-'}`
+    // 1 ファイルの再変換の記録は、その文書の片数（chunks）と索引全体の片数（index_chunks）を分けて持つ
+    const esCount = stage.es.index_chunks != null
+      ? `${esc(stage.es.index_chunks)} 片（再変換したファイル ${esc(stage.es.chunks)} 片）`
+      : (stage.es.chunks != null ? esc(stage.es.chunks) + ' 片' : '-');
+    lines.push(`全文検索: ${esCount}`
       + (stage.es.error ? `（エラー: ${esc(stage.es.error)}）` : ''));
     // 資料が不変の更新はキャッシュ再利用のみで新規0件になる（費用が掛からないことの可視化）。
     // reused を記録していない古い取り込み結果は「取れない値」であって0件ではないため、0で埋めない。
@@ -277,9 +281,13 @@ function stageSummaryHtml(stage) {
   return lines.length ? `<div class="ingest-stage"><b>各段の要約</b><ul>${lines.map((l) => `<li>${l}</li>`).join('')}</ul></div>` : '';
 }
 
-function failedFilesHtml(wid, ff, catalog) {
+function failedFilesHtml(wid, ff, catalog, running) {
   if (!ff || !ff.items || !ff.items.length) return '';
   const rows = ff.items.map((it) => {
+    // 実行中の再変換の対象は「やり直し中…」、ほかの処理の実行中はボタンを押せなくする（終わると一覧を読み直す）。
+    const action = running && running.rel === it.doc
+      ? '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>やり直し中…</span></span>'
+      : `<button class="mini" data-reconvert-wid="${esc(wid)}" data-rel="${esc(it.doc)}"${running ? ' disabled' : ''}>再変換</button>`;
     const info = reasonInfo(catalog, it.reason);
     const pp = it.pdf_pages;
     const pages = pp ? `<div class="muted" style="font-size:var(--text-caption)">画像で読んだ PDF（全 ${esc(pp.total)} ページ）: `
@@ -288,7 +296,7 @@ function failedFilesHtml(wid, ff, catalog) {
         pp.unread ? `${esc(pp.unread)} ページは読み取れませんでした` : ''].filter(Boolean).join('・') + '</div>' : '';
     return `<li><span class="fname">${esc(it.doc)}</span> — ${esc(info.label)}${pages}`
       + (info.advice ? `<div class="muted" style="font-size:var(--text-caption)">${esc(info.advice)}</div>` : '')
-      + `<button class="mini" data-reconvert-wid="${esc(wid)}" data-rel="${esc(it.doc)}">再変換</button></li>`;
+      + `${action}</li>`;
   }).join('');
   const more = ff.truncated ? `<div class="muted">…他 ${esc(ff.total - ff.items.length)} 件</div>` : '';
   return `<div class="ingest-failed"><b>変換失敗 ${esc(ff.total)} 件</b><ul>${rows}</ul>${more}</div>`;
@@ -306,7 +314,7 @@ function partialSuspectedHtml(ps, advice) {
 // 失敗一覧／各段の要約／抽出不完全の疑いを1つの折りたたみにまとめ、資料画面の各行の下に出す。何も無ければ折りたたみ自体を出さない。
 function ingestDetailHtml(wid, s) {
   const body = stageSummaryHtml(s.stage_summary)
-    + failedFilesHtml(wid, s.failed_files, s.failure_reason_catalog)
+    + failedFilesHtml(wid, s.failed_files, s.failure_reason_catalog, s.running_progress)
     + partialSuspectedHtml(s.partial_extraction_suspected, s.partial_extraction_advice);
   if (!body) return '';
   return `<details class="adv"><summary>詳細を表示</summary>${body}</details>`;
@@ -362,7 +370,13 @@ function summaryNote(s, wid) {
   if (s.resolve_settings_pending) {
     dangers.push('資料の探し方の設定がまだ反映されていません（更新が必要です。「更新」を押すと資料を取り込み直します）');
   }
-  if (s.last_run_status === 'failed') {
+  const reconvertFailed = warns.some(w => typeof w === 'string' && w.startsWith('reconvert_'));
+  if (s.last_run_status === 'failed' && reconvertFailed) {
+    // 1 ファイルの再変換は自動ではやり直さない。理由は失敗の一覧の行に出る。
+    dangers.push(warns.includes('reconvert_needs_full_run')
+      ? '前回の再変換はできませんでした。「今すぐ更新」で資料フォルダを取り込み直してから、もう一度お試しください'
+      : '前回の再変換は終わりませんでした。理由は「詳細を表示」の失敗の一覧に出ています（「再変換」でやり直せます）');
+  } else if (s.last_run_status === 'failed') {
     // `failed` は派生物の公開後（グラフ反映・台帳更新等）の失敗も含みうるため、「検索は前回成功時点のまま」とは断定しない。
     dangers.push('前回の取り込みは失敗しました（次回の取り込みで自動的に再試行されます）');
   }
@@ -414,7 +428,7 @@ function summaryNote(s, wid) {
 // 実行中（`running_progress` あり）は行の操作ボタンを無効化する（サーバ側も資料フォルダ単位の単一実行で多重クリックに安全だが、UI でも抑止する）。
 function setIngestBusy(world_id, busy) {
   document.querySelectorAll(`[data-refresh="${world_id}"],`
-    + `[data-rag-rules="${world_id}"],[data-del="${world_id}"]`)
+    + `[data-rag-rules="${world_id}"],[data-del="${world_id}"],[data-reconvert-wid="${world_id}"]`)
     .forEach((b) => { b.disabled = busy; });
 }
 
@@ -434,7 +448,9 @@ async function loadStat(world_id) {                   // 各行の状況を非�
   if (!el) return;
   try {
     const s = await api('GET', `/worlds/${encodeURIComponent(world_id)}/status`);
+    const detailOpen = !!el.querySelector('details.adv[open]');   // 読み直しで詳細（失敗の一覧）を閉じない
     el.innerHTML = summaryNote(s, world_id);
+    if (detailOpen) { const d = el.querySelector('details.adv'); if (d) d.open = true; }
     const running = !!s.running_progress;
     setIngestBusy(world_id, running);
     if (running) _runningWorldIds.add(world_id); else _runningWorldIds.delete(world_id);
@@ -500,15 +516,22 @@ async function recount(world_id) {
   loadStat(world_id);
 }
 
-// ---- 再変換（失敗一覧の1件をやり直す＝更新と同じ資料フォルダ全体 sync が走る）----
-async function reconvertFile(world_id, rel) {
-  if (!confirm(`「${rel}」を再変換します。\n\n更新（今すぐ取り込み直す）と同じ処理が資料フォルダ全体に対して走ります。続けますか？`)) return;
-  const el = document.querySelector(`[data-stat="${world_id}"]`);
-  if (el) el.innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>再変換しています...</span></span>';
+// ---- 再変換（失敗一覧の1件だけを変換し直す・即受付で背景実行）----
+async function reconvertFile(world_id, rel, btn) {
+  if (!confirm(`「${rel}」を再変換します。\n\nこのファイルだけを変換し直し、検索と関係グラフへ反映します（ほかの資料は変換し直しません）。続けますか？`)) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'やり直し中…';
+  }
   try {
+    // 即受付・変換は背景で続く。進み具合と終わったあとの一覧（直ったものは消える）は loadStat のポーリングが示す。
     await api('POST', `/worlds/${encodeURIComponent(world_id)}/reconvert`, { rel });
   } catch (e) {
-    if (el) el.innerHTML = `<span class="danger">再変換できません: ${esc(e.message)}</span>`;
+    $('listmsg').innerHTML = `<span class="danger">再変換できません: ${esc(e.message)}</span>`;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '再変換';
+    }
     return;
   }
   loadStat(world_id);
@@ -573,7 +596,7 @@ $('list').addEventListener('click', (e) => {
   const rf = e.target.closest('[data-refresh]'); if (rf) return refresh(rf.dataset.refresh);
   const dl = e.target.closest('[data-del]'); if (dl) return removeWorld(dl.dataset.del);
   const rc = e.target.closest('[data-recount]'); if (rc) return recount(rc.dataset.recount);
-  const rv = e.target.closest('[data-reconvert-wid]'); if (rv) return reconvertFile(rv.dataset.reconvertWid, rv.dataset.rel);
+  const rv = e.target.closest('[data-reconvert-wid]'); if (rv) return reconvertFile(rv.dataset.reconvertWid, rv.dataset.rel, rv);
 });
 $('pbody').addEventListener('click', (e) => {
   const cd = e.target.closest('[data-cd]'); if (cd) return showDir(cd.dataset.cd);

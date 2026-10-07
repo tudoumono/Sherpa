@@ -623,6 +623,37 @@ def test_ollama_connection_refused(monkeypatch, caplog, settings, ok, warns):
     assert bool([r for r in caplog.records if r.levelno >= logging.WARNING]) is warns
 
 
+_AZURE_ONLY = {"cloud_provider": "openai", "research_default_provider": "openai", "embed_provider": "auto"}
+
+
+def test_ollama_not_in_use_skips_ping_and_logs_nothing(monkeypatch, caplog):
+    monkeypatch.setattr(store, "get_system_settings", lambda: _AZURE_ONLY)
+    monkeypatch.setattr(health, "_active_user_codex_rows", lambda: [])
+    monkeypatch.setattr("sherpa.ingest.arms.enabled_arm_names", lambda: ["ooxml"])
+
+    def _must_not_call(*a, **kw):
+        raise AssertionError("Ollama を問い合わせてはいけない")
+
+    monkeypatch.setattr(llm, "urlopen_no_redirect", _must_not_call)
+    with caplog.at_level(logging.DEBUG, logger="sherpa.health"):
+        out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
+    assert out["ok"] is True and "使っていません" in out["detail"]
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("sys_s, rows", [
+    pytest.param({**_AZURE_ONLY, "embed_provider": "ollama"}, [], id="embed-ollama"),
+    pytest.param(_AZURE_ONLY, [{"agent": "codex", "codex_model_provider": "ollama"}], id="codex-oss-user"),
+    pytest.param({**_AZURE_ONLY, "research_default_provider": "ollama", "ollama_url": "http://h:11434"}, [],
+                 id="simple-ollama"),
+    pytest.param({**_AZURE_ONLY, "research_default_provider": "ollama"}, [], id="simple-ollama-without-url"),
+])
+def test_ollama_in_use_when_any_purpose_uses_it(monkeypatch, sys_s, rows):
+    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
+    monkeypatch.setattr("sherpa.ingest.arms.enabled_arm_names", lambda: ["ooxml"])
+    assert health.ollama_in_use(sys_s, rows) is True
+
+
 # ===== 埋め込みモデル未取得の検出 =====
 
 class _FakeOllamaTagsResponse:

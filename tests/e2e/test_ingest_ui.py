@@ -476,9 +476,8 @@ def test_status_detail_shows_failed_files_and_reconvert_button_calls_endpoint(pa
 
     def handle_reconvert(route):
         reconvert_bodies.append(json.loads(route.request.post_data or "{}"))
-        _fulfill(route, {"ok": True, "world_id": "w1", "rel": "旧料金表.xls", "changed": True,
-                         "status": "auto_published", "ledger": 3, "flags": [], "summary": WORLD_STATUS_RESP,
-                         "note": "更新と同じ処理が走りました。"})
+        _fulfill(route, {"ok": True, "world_id": "w1", "run_id": 7, "joined": False,
+                         "note": "受け付けました。このファイルだけを変換し直しています。"}, status=202)
 
     page.route("**/worlds/w1/reconvert", handle_reconvert)
 
@@ -496,7 +495,7 @@ def test_status_detail_shows_failed_files_and_reconvert_button_calls_endpoint(pa
     page.once("dialog", lambda d: d.accept())
     btn.click()
 
-    expect(page.locator('[data-stat="w1"]')).not_to_contain_text("再変換できません")   # エラーにならず完了する
+    expect(page.locator("#listmsg")).not_to_contain_text("再変換できません")   # 受け付けられ、エラーにならない
     assert reconvert_bodies == [{"rel": "旧料金表.xls"}]
 
 

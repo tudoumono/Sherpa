@@ -1205,6 +1205,182 @@ def count(world: str) -> int | None:
         return None
 
 
+_SCROLL_PAGE = 1000
+
+
+def _scroll_hits(world: str, query: dict, source) -> list:
+    """`query` に当たる切れ端を全部（scroll で）返す。各要素は ES の hit。"""
+    idx = _index(world)
+    res = _req("POST", f"/{idx}/_search?scroll=1m",
+               {"size": _SCROLL_PAGE, "query": query, "_source": source, "sort": ["_doc"]})
+    hits: list = []
+    scroll_id = res.get("_scroll_id")
+    try:
+        while True:
+            page = (res.get("hits") or {}).get("hits") or []
+            if not page:
+                return hits
+            hits.extend(page)
+            res = _req("POST", "/_search/scroll", {"scroll": "1m", "scroll_id": scroll_id})
+            scroll_id = res.get("_scroll_id") or scroll_id
+    finally:
+        if scroll_id:
+            try:
+                _req("DELETE", "/_search/scroll", {"scroll_id": scroll_id})
+            except Exception:
+                pass
+
+
+def _text_used_elsewhere(world: str, rel: str, text: str) -> bool:
+    """`rel` 以外の埋め込み付きの切れ端に、本文がまったく同じものがあるか。確かめられなければ True（キーを残す側）。"""
+    try:
+        res = _req("POST", f"/{_index(world)}/_search", {
+            "size": 100, "_source": ["text"],
+            "query": {"bool": {"filter": [{"exists": {"field": "embedding"}}],
+                               "must_not": [{"term": {"doc_id": rel}}],
+                               "must": [{"match_phrase": {"text": text}}]}}})
+    except Exception:
+        return True
+    return any((h.get("_source") or {}).get("text") == text for h in (res.get("hits") or {}).get("hits") or [])
+
+
+def _embed_cache_delete_keys(world: str, keys: list) -> int:
+    """埋め込みのキャッシュから `keys` を消す（best-effort・消した件数）。"""
+    if not keys:
+        return 0
+    conn = _embed_cache_connect(world, create=False)
+    if conn is None:
+        return 0
+    n = 0
+    try:
+        with conn:
+            for chunk in _sql_chunks(list(keys)):
+                placeholders = ",".join("?" * len(chunk))
+                n += conn.execute(f"DELETE FROM kv WHERE key IN ({placeholders})", chunk).rowcount
+    except sqlite3.Error:
+        _embed_log.warning("es_index: 埋め込みのキャッシュのキーを消せませんでした（world=%s）", world)
+    finally:
+        conn.close()
+    return n
+
+
+def _delete_payloads(ids: list) -> list:
+    """`ids` の切れ端を消す bulk 用の NDJSON（`_ES_BULK_BATCH_MAX_DOCS` 件ずつ）。"""
+    return ["".join(json.dumps({"delete": {"_id": i}}) + "\n" for i in ids[s:s + _ES_BULK_BATCH_MAX_DOCS])
+            for s in range(0, len(ids), _ES_BULK_BATCH_MAX_DOCS)]
+
+
+def _send_bulk(world: str, payloads: list) -> str | None:
+    """bulk 用の NDJSON を順に送り、最後だけ refresh する。失敗なら理由（`bulk_failed`／`bulk_errors`）。"""
+    for i, payload in enumerate(payloads):
+        path = f"/{_index(world)}/_bulk" + ("?refresh=true" if i == len(payloads) - 1 else "")
+        try:
+            res = _req("POST", path, payload, ndjson=True)
+        except Exception:
+            return "bulk_failed"
+        if res.get("errors"):
+            return "bulk_errors"
+    return None
+
+
+def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dict:
+    """1 文書の切れ端だけを入れ替える（索引は消さない・ほかの文書の切れ端には触れない）。
+    設計: docs/design/rag.md「失敗した資料のやり直し」
+    ① 索引があり（切れ端が 0 件でもよい）、今の署名の世代で、埋め込みの素性が今の設定と同じか確かめる（違えば何も書かずに error）
+    ② その文書の新しい切れ端を `index_world` と同じ組み立てで作り、埋め込みはキャッシュから引く（無いものだけ API を呼ぶ）
+    ③ 新しい切れ端を全部書き込んでから、新しい側に無い古い切れ端を消す。途中で失敗したら、新しく入れた切れ端を消し
+       控えた古い切れ端を入れ直して古い切れ端だけの状態へ戻す（戻せなければ error に `_rollback_failed` を付ける）
+    ④ `content_sig` が今の署名と同じ索引なら `_meta.doc_count` を実件数に直す
+    ⑤ 古い切れ端の埋め込みのキャッシュのキーを、ほかの切れ端が同じ本文を使っていなければ消す
+    返値 `{available, error?, chunks, deleted, embedded, reused, doc_count}`（`chunks` はこの文書の切れ端の数・`doc_count` は索引全体）。
+    """
+    if not available():
+        return {"available": False, "error": "unavailable"}
+    meta = _index_meta(world)
+    if meta is None:
+        return {"available": True, "error": "index_missing"}
+    if meta.get("content_sig") != content_sig:  # 索引が今の署名の世代でない＝1 文書だけ混ぜない（全体の更新に任せる）
+        return {"available": True, "error": "index_stale"}
+    if count(world) is None:
+        return {"available": True, "error": "count_failed"}
+    sys_s = _embed_system_settings_snapshot()
+    ec = embeddings.cfg(_settings(None), system_settings=sys_s)
+    want = (ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID) if ec else (None,) * 4
+    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"))
+    if want != have:
+        return {"available": True, "error": "embed_config_changed"}
+    with_vectors = ec is not None
+    # ② 新しい切れ端
+    wd = worlds.world_dir(world)
+    res_map = importance.resolve_for_world(world, root=wd, sig=content_sig) if wd else {}
+    ids: list = []
+    bodies: list = []
+    texts: list = []
+    embed_idx: list = []
+    for d in corpus_docs.iter_world_documents(world, include_rag=True, root=wd, files=[(Path(rp), rel)]):
+        chunk_iter, _degraded = _iter_doc_chunk_records(world, d, worlds.derived_rag_dir(world),
+                                                        _rag_chunk_source_exts(), res_map)
+        if chunk_iter is None:
+            if (_degraded or {}).get("reason") != "empty_text":  # 読めない＝ES を変えずに止める（古い切れ端を消さない）
+                return {"available": True, "error": "chunk_read_failed"}
+            continue
+        for cid, body, text, skip in chunk_iter:
+            if not skip:
+                embed_idx.append(len(ids))
+            ids.append(cid)
+            bodies.append(body)
+            texts.append(text)
+    vec_by_idx: dict = {}
+    reused = embedded = 0
+    if with_vectors and embed_idx:
+        vecs, reused, embedded = _embed_cached(world, [texts[i] for i in embed_idx], ec)
+        if vecs is None:
+            return {"available": True, "error": "embedding_failed"}
+        vec_by_idx = dict(zip(embed_idx, vecs))
+    # ③ 書き込みと古い切れ端の削除（古い切れ端は全部を控え、途中で失敗したら古い切れ端だけの状態へ戻す）
+    try:
+        old_hits = _scroll_hits(world, {"term": {"doc_id": rel}}, True)
+    except Exception:
+        return {"available": True, "error": "search_failed"}
+    old_ids = [h["_id"] for h in old_hits]
+    new_ids = set(ids)
+    stale = [i for i in old_ids if i not in new_ids]
+    err = _send_bulk(world, _bulk_batches(ids, bodies, vec_by_idx)) if ids else None
+    if err is None and stale:
+        err = _send_bulk(world, _delete_payloads(stale))
+    if err is not None:
+        restore = (_delete_payloads(sorted(new_ids - set(old_ids)))
+                   + _bulk_batches(old_ids, [h.get("_source") or {} for h in old_hits], {}))
+        if restore and _send_bulk(world, restore) is not None:
+            return {"available": True, "error": f"{err}_rollback_failed"}
+        return {"available": True, "error": err}
+    old_embedded = [h for h in old_hits if with_vectors and "embedding" in (h.get("_source") or {})]
+    # ④ 件数の印
+    n = count(world)
+    meta = _index_meta(world)
+    if n is None or meta is None:
+        return {"available": True, "error": "meta_update_failed"}
+    if meta.get("content_sig") == content_sig and meta.get("doc_count") != n:  # 件数が無い・ずれていれば実件数を刻む
+        try:
+            _req("PUT", f"/{_index(world)}/_mapping", {"_meta": {**meta, "doc_count": n}})
+        except Exception:
+            return {"available": True, "error": "meta_update_failed"}
+    # ⑤ 使われなくなった埋め込みのキャッシュのキー
+    if with_vectors and old_embedded:
+        new_keys = {_chunk_key(ec, texts[i]) for i in embed_idx}
+        candidates: dict = {}
+        for h in old_embedded:
+            t = (h.get("_source") or {}).get("text")
+            if isinstance(t, str):
+                k = _chunk_key(ec, t)
+                if k not in new_keys:
+                    candidates.setdefault(k, t)
+        _embed_cache_delete_keys(world, [k for k, t in candidates.items()
+                                         if not _text_used_elsewhere(world, rel, t)])
+    return {"available": True, "chunks": len(ids), "deleted": len(stale),
+            "embedded": embedded, "reused": reused, "doc_count": n}
+
+
 def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool:
     """ES 索引の張り直しが要るか（ES 稼働時のみ）。次のいずれかで True:
     空／内容署名ズレ／アーム構成ズレ／マッピング版ズレ／チャンク粒度ズレ／人間向け MD 版ズレ／アナライザ構成ズレ／埋め込み素性（provider／model／dim／前処理アルゴリズム版）ズレ／実件数ズレ。

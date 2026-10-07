@@ -13,13 +13,17 @@ import os
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
+from pathlib import Path
 
-from .. import corpus_docs, es_index, scope_infer, store, webhooks, worlds
+import psycopg
+
+from .. import corpus_docs, es_index, json_io, scope_infer, store, webhooks, worlds
 from . import (
     archive_extract,
     failure_reasons,
     importance,
     office_md,
+    text_kind,
     resolve_settings,
     world_graph,
     world_graph_service,
@@ -63,13 +67,14 @@ def build_world_graph(world: str):
     return world_graph_service.build_effective_world(world)
 
 
-def _reflect_graph_after_rag_rewrite(world: str) -> None:
+def _reflect_graph_after_rag_rewrite(world: str) -> tuple[int, int]:
     """`.rag.md` の軽量書換え後、Neo4j のグラフ（言及エッジ）を追いつかせる。
 
     言及エッジは `{rel}.rag.md` があればそれを本文として読む。`_llm_render_pass`／`regenerate_rag_rule_only`／
     `_refresh_derived_representations` は rag.md を書き換えるが世代（world 署名）を変えないため、`_run_locked` の
     `build_world_graph`→`load_world` を経由しない。ES 反映とは独立に常に呼ぶ。
     呼び出し元が `store.world_lock(world)` を保持している前提（ロックは再入不可）。失敗は例外のまま伝播させる。
+    返値は反映したノード数・関係数。
     """
     nodes, edges, flags = build_world_graph(world)
     blocked = [f for f in flags if f.get("action") == "blocked"]
@@ -78,9 +83,9 @@ def _reflect_graph_after_rag_rewrite(world: str) -> None:
         reasons = sorted({str(f.get("reason")) for f in blocked})
         raise RuntimeError(f"graph reflect blocked: {','.join(reasons)}")
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"],
-                           plugin_failures=world_graph.plugin_failures_from_flags(flags),
-                           unparsed_sources=world_graph.unparsed_sources_from_flags(flags))
+    return world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"],
+                                  plugin_failures=world_graph.plugin_failures_from_flags(flags),
+                                  unparsed_sources=world_graph.unparsed_sources_from_flags(flags))
 
 
 # `office_md.build_derived()` の per-file 失敗リスト（`[{"doc": rel, "reason": str}]`）のキー。末尾の `_failures` を落とした残りを stage 名にする
@@ -169,7 +174,7 @@ def _failed_files_summary(drep: dict) -> dict:
         stage = key[: -len("_failures")]
         for entry in drep.get(key) or []:
             doc, raw_reason = entry.get("doc"), entry.get("reason")
-            if not (isinstance(doc, str) and isinstance(raw_reason, str)):
+            if not (isinstance(doc, str) and isinstance(raw_reason, str)) or _is_noise_rel(doc):
                 continue
             desc = failure_reasons.describe(raw_reason)
             by_reason[desc["code"]] = by_reason.get(desc["code"], 0) + 1
@@ -177,6 +182,130 @@ def _failed_files_summary(drep: dict) -> dict:
             if isinstance(entry.get("pdf_pages"), dict):
                 item["pdf_pages"] = entry["pdf_pages"]       # 画像で読んだ PDF の読めなかったページ数
             items.append(item)
+    return {"items": items[:_FAILED_FILES_LIMIT], "total": len(items),
+            "truncated": len(items) > _FAILED_FILES_LIMIT, "by_reason": by_reason}
+
+
+def _is_noise_rel(rel: str) -> bool:
+    """ロックファイルなどのノイズ（`text_kind.is_noise`）の rel か。失敗の一覧には載せない。"""
+    return text_kind.is_noise(os.path.basename(rel), os.path.splitext(rel)[1].lower())
+
+
+def _failed_doc_reasons(drep: dict) -> dict[str, str]:
+    """`office_md.build_derived()` の各段 `*_failures` から、失敗（縮退）した文書ごとの生の理由 `{rel: reason}` を作る。
+
+    同じ文書が複数の段に載っているときは `_FAILURE_LIST_KEYS` の先に出る段の理由を採る。
+    """
+    out: dict[str, str] = {}
+    for key in _FAILURE_LIST_KEYS:
+        for entry in drep.get(key) or []:
+            doc, raw_reason = entry.get("doc"), entry.get("reason")
+            if isinstance(doc, str) and isinstance(raw_reason, str) and doc not in out and not _is_noise_rel(doc):
+                out[doc] = raw_reason
+    return out
+
+
+_FAILED_DOCS_SEEDED_MARKER = ".failed_docs_seeded"   # 派生領域ルート直下。失敗の一覧を一度でも記録した印（導入前の派生から集める初回の取り込みを一度で止める）
+
+
+def _write_failed_docs_marker(world: str) -> None:
+    try:
+        (worlds.derived_dir(world) / _FAILED_DOCS_SEEDED_MARKER).write_text("1", encoding="utf-8")
+    except OSError:
+        _log.warning("失敗の一覧の記録済みの印を書けませんでした: world=%s", world, exc_info=True)
+
+
+def _failed_docs_from_derived(world: str) -> dict[str, str]:
+    """公開中の派生（`md/{rel}.md.meta.json`）から、失敗の知らせの文書 `{rel: 理由コード}` を集める。読むだけで何も作り直さない。
+
+    失敗の一覧の導入前に取り込んだ資料フォルダの初回用。最新の run の `failed_files` に載る文書（知らせを持たない失敗）も足す。
+    """
+    out: dict[str, str] = {}
+    dmd = worlds.derived_md_dir(world)
+    if dmd.is_dir():
+        suffix = ".md.meta.json"
+        for meta_path in sorted(dmd.rglob("*" + suffix)):
+            reason = office_md.failure_notice_reason(json_io.read_json(meta_path, default=None))
+            rel = meta_path.relative_to(dmd).as_posix()[: -len(suffix)]
+            if reason and not _is_noise_rel(rel):
+                out[meta_path.relative_to(dmd).as_posix()[: -len(suffix)]] = reason
+    snap = ((store.get_latest_run_summary(world) or {}).get("extraction_snapshot") or {})
+    for it in ((snap.get("failed_files") or {}).get("items") or []):
+        doc = it.get("doc") if isinstance(it, dict) else None
+        if isinstance(doc, str) and doc not in out and not _is_noise_rel(doc):
+            out[doc] = it.get("detail") or it.get("reason") or "other"
+    return out
+
+
+def _seed_failed_docs_locked(world: str) -> bool:
+    """失敗の一覧が未記録の資料フォルダへ、公開中の派生から集めた失敗を一度だけ入れる（`store.world_lock` 保持中に呼ぶ）。
+
+    表に行があるとき・印があるときは何もしない。入れたら（0 件でも）印を書き、二度目は走らない。
+    """
+    if not worlds.derived_dir(world).is_dir() or (worlds.derived_dir(world) / _FAILED_DOCS_SEEDED_MARKER).exists():
+        return False
+    if not store.list_failed_docs(world):
+        found = _failed_docs_from_derived(world)
+        if found:
+            store.replace_failed_docs(world, found)
+    _write_failed_docs_marker(world)
+    return True
+
+
+def _settle_notice_markers(world: str, sig: str | None) -> None:
+    """失敗の知らせの文書が版の判定に入っていた旧い派生（`.document_ir_sig`・`.human_md_es_sig` が無いまま残ったもの）の印を確定する。
+
+    ① 知らせ以外の IR が揃っていれば `.document_ir_sig` を確定する。② 失敗の一覧に文書があり、ES の索引が最後まで書き終えた状態
+    （`content_sig`・`doc_count` が揃い `human_md_sig` だけ未確定）なら `.human_md_es_sig` と ES の meta を確定する。
+    どちらも派生・ES を読む・印を書くだけで、変換・索引・グラフの作り直しは起こさない（`store.world_lock` 保持中に呼ぶ）。
+    """
+    wd, dmd = worlds.world_dir(world), worlds.derived_md_dir(world)
+    if not wd or not dmd.exists():
+        return
+    office_md.settle_document_ir_sig_for_notices(wd, dmd, world=world)
+    if (sig and not (dmd / office_md._HUMAN_MD_ES_SIG_MARKER).exists() and store.list_failed_docs(world)
+            and es_index.available() and not office_md.human_md_sig_drift(wd, dmd, world=world)):
+        meta = es_index._index_meta(world) or {}
+        n = es_index.count(world)
+        if (n and meta.get("content_sig") == sig and meta.get("doc_count") == n
+                and meta.get("human_md_sig") is None
+                and office_md.confirm_human_md_es_sig(wd, dmd, world=world)):
+            es_index.confirm_human_md_meta(world)
+
+
+def seed_failed_docs_once(world: str) -> bool:
+    """`_seed_failed_docs_locked` を、取り込みが走っていないときだけ（ロックを待たずに）行う。画面の読み出しから呼ぶ。"""
+    if not worlds.derived_dir(world).is_dir() or (worlds.derived_dir(world) / _FAILED_DOCS_SEEDED_MARKER).exists():
+        return False
+    try:
+        with store.world_lock(world, timeout_ms=200):
+            return _seed_failed_docs_locked(world)
+    except psycopg.errors.LockNotAvailable:
+        return False
+    except Exception:
+        _log.warning("失敗の一覧の初回の記録に失敗しました（次回に再試行）: world=%s", world, exc_info=True)
+        return False
+
+
+def failed_files_from_table(world: str, snapshot_failed_files: dict | None = None) -> dict | None:
+    """失敗の一覧（`world_failed_docs`）を `extraction_snapshot.failed_files` と同じ形で返す。行が無ければ None。
+
+    表が持たない PDF のページ内訳（`pdf_pages`）は、最新 run の `snapshot_failed_files` に同じ文書があれば引き継ぐ。
+    """
+    rows = store.list_failed_docs(world)
+    if not rows:
+        return None
+    pages = {it["doc"]: it["pdf_pages"] for it in ((snapshot_failed_files or {}).get("items") or [])
+             if isinstance(it, dict) and isinstance(it.get("pdf_pages"), dict)}
+    items = []
+    by_reason: dict[str, int] = {}
+    for r in rows:
+        desc = failure_reasons.describe(r["reason"])
+        by_reason[desc["code"]] = by_reason.get(desc["code"], 0) + 1
+        item = {"doc": r["rel"], "stage": "failed", "reason": desc["code"], "detail": desc["detail"]}
+        if r["rel"] in pages:
+            item["pdf_pages"] = pages[r["rel"]]
+        items.append(item)
     return {"items": items[:_FAILED_FILES_LIMIT], "total": len(items),
             "truncated": len(items) > _FAILED_FILES_LIMIT, "by_reason": by_reason}
 
@@ -202,20 +331,21 @@ def _ledger_rows(world: str, *, sig: str | None = None) -> list:
         return []
     files = list(scope_infer.safe_files(root, also=worlds.archives_dir(world)))
     res_map = importance.resolve_for_world(world, root=root, files=files, sig=sig)
-    rows = []
-    for d in corpus_docs.world_documents(world, root=root, files=files):
-        status = "unreadable" if d.get("state") == "unreadable" else "indexed"
-        row = {"name": d["name"], "layer": "version", "scope_path": d.get("top_scope"),
-               "doctype": d.get("doctype"), "branch": d.get("branch"),
-               "original_path": None, "md_path": d.get("md_path"), "status": status}
-        res = res_map.get(d["name"])
-        if res is not None:
-            row["importance"] = res.value
-            row["importance_source"] = f"{res.config_path}:{res.rule_line}行目"
-            if res.reason:
-                row["importance_reason"] = res.reason
-        rows.append(row)
-    return rows
+    return [_ledger_row(d, res_map.get(d["name"])) for d in corpus_docs.world_documents(world, root=root, files=files)]
+
+
+def _ledger_row(d: dict, res) -> dict:
+    """`corpus_docs` の文書 1 件と重要度の解決結果から、台帳の 1 行を作る。"""
+    status = "unreadable" if d.get("state") == "unreadable" else "indexed"
+    row = {"name": d["name"], "layer": "version", "scope_path": d.get("top_scope"),
+           "doctype": d.get("doctype"), "branch": d.get("branch"),
+           "original_path": None, "md_path": d.get("md_path"), "status": status}
+    if res is not None:
+        row["importance"] = res.value
+        row["importance_source"] = f"{res.config_path}:{res.rule_line}行目"
+        if res.reason:
+            row["importance_reason"] = res.reason
+    return row
 
 
 def run(world, *, reflect=True, created_by="admin",
@@ -310,6 +440,9 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
             snap["es"] = es_summary
         if neo4j_summary is not None:
             snap["neo4j"] = neo4j_summary
+        # 失敗の一覧は、グラフ・ES・台帳の反映まで成功した run の確定（署名の確定と同じトランザクション）でだけ置き換える
+        failed_docs = (_failed_doc_reasons(drep)
+                       if confirm_sig is not None and drep is not None and "rag_failures" in drep else None)
         # run 終端で今開いている段を閉じてから記録する
         _close_stage_timing()
         if stage_timings:
@@ -321,7 +454,8 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
         pending = {"status": status, "extraction_snapshot": snap, "published_snapshot": reflected,
                   "source_doc_ids": [r["name"] for r in rows], "confirm_sig": confirm_sig,
                   "confirm_manifest": confirm_manifest, "confirm_doc_count": confirm_doc_count,
-                  "confirm_scan_report": confirm_scan_report, "confirm_resolve_sig": applied_resolve_sig}
+                  "confirm_scan_report": confirm_scan_report, "confirm_resolve_sig": applied_resolve_sig,
+                  "failed_docs": failed_docs}
         if not finalize:
             # `finalize=False`: この行の DB 確定は呼び出し元に委ねる
             return {"world": world, "status": status, "ledger": ledger,
@@ -334,7 +468,10 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
                 run_id, world, status=status, extraction_snapshot=snap,
                 published_snapshot=reflected, source_doc_ids=pending["source_doc_ids"],
                 sig=confirm_sig, manifest=confirm_manifest, doc_count=confirm_doc_count,
-                scan_report=confirm_scan_report, resolve_sig=applied_resolve_sig)
+                scan_report=confirm_scan_report, resolve_sig=applied_resolve_sig,
+                **({"failed_docs": failed_docs} if failed_docs is not None else {}))
+            if failed_docs is not None:
+                _write_failed_docs_marker(world)
         else:
             rec = store.finish_ingest_run(run_id, status=status, extraction_snapshot=snap,
                                           published_snapshot=reflected,
@@ -584,6 +721,182 @@ def rerun(world, **kw) -> dict:
     """失敗/再取り込みのやり直し。資料フォルダ全体のクリーン rebuild を行う。"""
     kw.setdefault("op", "rerun")   # Webhook 通知の op（呼び出し側が明示すればそちらを優先）
     return run(world, **kw)
+
+
+def reconvert(world: str, rel: str, *, run_id: int) -> dict:
+    """失敗した資料を 1 ファイルだけ変換し直し、グラフと ES へ反映する（「再変換」の背景本体）。
+
+    資料フォルダの署名・`last_manifest`・ほかの文書の派生と ES の切れ端には触れない。`run_id` は受付時に確保済みの `ingest_runs` 行。
+    """
+    with store.world_lock(world), resolve_settings.pinned(world):
+        try:
+            return _reconvert_locked(world, rel, run_id=run_id)
+        finally:
+            office_md.discard_staging(worlds.derived_md_dir(world))
+
+
+def _source_matches_manifest(row: dict, wd, rp: Path, rel: str) -> bool:
+    """原本が、署名を確定した更新のときの明細（`last_manifest` の mtime・ctime・大きさ）のままか。
+
+    アーカイブの中の資料は、更新のときに展開した写しを読むので確かめない。
+    """
+    try:
+        rp.resolve().relative_to(Path(wd).resolve())
+    except ValueError:
+        return True
+    want = (row.get("last_manifest") or {}).get(rel)
+    try:
+        st = rp.stat()
+    except OSError:
+        return False
+    return want is not None and list(want) == [st.st_mtime_ns, st.st_ctime_ns, st.st_size]
+
+
+# 変換が終わってから、グラフと ES の反映が終わるまでの失敗の一覧の理由（途中で止まっても一覧に残し、もう一度の再変換で直す）
+RECONVERT_REFLECT_PENDING = "reconvert_reflect_failed"
+
+
+def _reconvert_locked(world: str, rel: str, *, run_id: int) -> dict:
+    """`reconvert` の本体（`store.world_lock` 保持中に呼ぶ）。
+    設計: docs/design/rag.md「失敗した資料のやり直し」
+    ① 公開中の派生がいまの署名の世代か確かめる（違えば全体の更新に任せる）
+    ② 失敗の一覧にある rel か確かめ、その rel の変換のキャッシュを消し、全体の作り直しと同じファイルごとの処理で変換する
+    ③ 変換に失敗した（変換されなかった・未対応を含む）ら公開中・グラフ・ES はそのままで、失敗の一覧の行を更新して終わる
+    ④ 成功したら失敗の一覧の理由を「反映待ち」にしてから、公開中の派生のその rel の分を置き換え、台帳のその行を直す（失敗ならここで止める）
+    ⑤ 資料フォルダ全体のグラフを作り直す ⑥ ES のその文書の切れ端だけを入れ替える ⑦ 失敗の一覧から外す
+    """
+    flags: list = []
+    stage_timings: dict = {}
+    current = [None, 0.0]
+
+    def _progress(stage):
+        now = datetime.now(timezone.utc).isoformat()
+        if current[0] is not None:
+            stage_timings[current[0]].update(finished_at=now,
+                                             elapsed_ms=round((time.monotonic() - current[1]) * 1000))
+        current[0], current[1] = stage, time.monotonic()
+        if stage is None:
+            return
+        stage_timings[stage] = {"started_at": now, "finished_at": None, "elapsed_ms": None}
+        try:
+            store.update_ingest_run_progress(run_id, {
+                "stage": stage, "stage_label": STAGE_LABELS.get(stage, stage), "done": None, "total": None,
+                "updated_at": now, "rel": rel})
+        except Exception:
+            _log.warning("進捗の記録に失敗しました（再変換自体は継続）: world=%s stage=%s", world, stage, exc_info=True)
+
+    def _finish(status, *, published=None, es=None) -> dict:
+        _progress(None)
+        snap = {"op": "reconvert", "rel": rel, "flags": flags, "stage_timings": stage_timings}
+        if es is not None:
+            snap["es"] = es
+        rec = store.finish_ingest_run(run_id, status=status, extraction_snapshot=snap,
+                                      published_snapshot=published, source_doc_ids=[rel])
+        try:
+            webhooks.notify_run_terminal(world, run_id, "reconvert", status)
+        except Exception:
+            _log.warning("Webhook 通知の起動に失敗しました（再変換自体は継続）: world=%s", world, exc_info=True)
+        return {"world": world, "rel": rel, "status": status, "flags": flags, "run": rec}
+
+    def _blocked(reason, *, published=None):
+        flags.append({"doc": rel, "action": "blocked", "reason": reason})
+        return _finish("failed", published=published)
+
+    _progress("office_md")
+    row = store.get_world(world)
+    wd = worlds.world_dir(world)
+    if not row or not wd:
+        return _blocked("world_unresolved")
+    sig = row.get("last_sig")
+    dmd = worlds.derived_md_dir(world)
+    # ① 署名が無効・設定が未反映・公開中の派生が別の世代なら、1 ファイルだけを差し替えない
+    if not sig or resolve_settings.pending(row) or office_md.published_world_sig(dmd) != sig:
+        return _blocked("reconvert_needs_full_run")
+    from .. import documents
+    rp = documents.resolve(rel, world)
+    if rp is None:
+        return _blocked("reconvert_source_missing")
+    if not office_md.is_conversion_target(rp):
+        return _blocked("reconvert_not_target")
+    if not _source_matches_manifest(row, wd, rp, rel):          # 前の更新の後に原本が変わっていれば全体の更新に任せる
+        return _blocked("reconvert_needs_full_run")
+    try:
+        _seed_failed_docs_locked(world)
+        _settle_notice_markers(world, sig)
+    except Exception:
+        _log.warning("失敗の一覧の初回の記録・印の確定に失敗しました（再変換は継続）: world=%s", world, exc_info=True)
+    if rel not in {r["rel"] for r in store.list_failed_docs(world)}:      # 失敗の一覧にある資料だけをやり直す
+        return _blocked("reconvert_not_failed")
+    try:
+        if office_md.restore_reconvert_backups(dmd, rel):  # 前の差し替えが途中で止まっていれば、前の状態へ戻してから始める
+            _log.warning("前の再変換の差し替えの控えから戻しました: world=%s", world)
+    except OSError as e:
+        return _blocked(f"reconvert_restore_failed:{e.__class__.__name__}")
+    # ② 変換
+    if not office_md.drop_conversion_cache(dmd, rel):
+        return _blocked("reconvert_cache_drop_failed")
+    rep = office_md.derive_one(wd, dmd, rp, rel, world=world)
+    reason = (_failed_doc_reasons(rep).get(rel) or rep.get("error")
+              or (None if rep.get("converted") else ("unsupported" if rep.get("unsupported")
+                                                      else "reconvert_not_converted")))
+    if reason:
+        # ③ 変換の失敗
+        office_md.discard_staging(dmd)
+        store.record_failed_doc(world, rel, reason)
+        return _blocked("reconvert_conversion_failed")
+    # ④ 公開中の派生と台帳
+    store.record_failed_doc(world, rel, RECONVERT_REFLECT_PENDING)
+    try:
+        office_md.publish_one(dmd, rel)
+    except OSError as e:
+        return _blocked(f"reconvert_publish_failed:{e.__class__.__name__}")
+    try:
+        _fix_ledger_row(world, wd, rp, rel, sig)
+    except Exception as e:
+        _log.warning("再変換の台帳の行を直せませんでした: world=%s", world, exc_info=True)
+        return _blocked(f"reconvert_ledger_failed:{e.__class__.__name__}")
+    # ⑤ グラフ
+    _progress("graph_build")
+    try:
+        n, m = _reflect_graph_after_rag_rewrite(world)
+    except Exception as e:
+        _log.warning("再変換のグラフの反映に失敗しました: world=%s", world, exc_info=True)
+        return _blocked(f"reconvert_graph_failed:{e.__class__.__name__}")
+    published = {"nodes": n, "edges": m}
+    # ⑥ ES
+    _progress("es_index")
+    try:
+        esr = es_index.replace_document(world, rel, rp, content_sig=sig)
+    except Exception as e:
+        _log.warning("再変換の ES の反映に失敗しました: world=%s", world, exc_info=True)
+        esr = {"available": None, "error": e.__class__.__name__}
+    if esr.get("available") is not True or esr.get("error"):
+        return _blocked(f"reconvert_es_failed:{esr.get('error') or 'unavailable'}", published=published)
+    # ⑦ 直った
+    _progress("finalize")
+    store.remove_failed_doc(world, rel)
+    es = {"available": True, "error": None, "chunks": esr.get("chunks"), "index_chunks": esr.get("doc_count"),
+          "indexed": None,
+          "embedded": esr.get("embedded"), "reused": esr.get("reused"), "embed_elapsed_ms": None}
+    return _finish("auto_published_with_flags" if flags else "auto_published", published=published, es=es)
+
+
+_LEDGER_COLUMNS = ("layer", "scope_path", "doctype", "branch", "original_path", "md_path", "status",
+                   "importance", "importance_reason", "importance_source")
+
+
+def _fix_ledger_row(world: str, wd, rp, rel: str, sig: str) -> None:
+    """台帳のその文書の行だけを、全体の取り込みと同じ作り方で直す（変わらなければ書かない）。"""
+    docs = list(corpus_docs.iter_world_documents(world, root=wd, files=[(rp, rel)]))
+    old = store.get_document(world, rel)
+    if not docs:
+        if old is not None:
+            store.replace_document(world, rel, None)
+        return
+    res = importance.resolve_for_world(world, root=wd, sig=sig).get(rel)
+    new = _ledger_row(docs[0], res)
+    if old is None or any(old.get(k) != new.get(k) for k in _LEDGER_COLUMNS):
+        store.replace_document(world, rel, new)
 
 
 _SCAN_PROGRESS_INTERVAL = 500   # 走査進捗の報告間隔（ファイル数）
@@ -986,6 +1299,15 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
         # （区間を分けると並行の sync/rebind/delete が割り込み、反映が参照した派生物と世代が食い違う）。
         # lock は再入できない（別コネクションの自己デッドロック）ので、区間内で `store.world_lock` を取り直さない
         with store.world_lock(world):                    # derived への書込を同一資料フォルダの並行 run/sync と直列化
+            try:
+                _seed_failed_docs_locked(world)          # 失敗の一覧の導入前に取り込んだ資料フォルダは、初回だけ派生から集めて入れる
+            except Exception:
+                _log.warning("失敗の一覧の初回の記録に失敗しました（次回に再試行）: world=%s", world, exc_info=True)
+            if reflect:
+                try:
+                    _settle_notice_markers(world, sig)
+                except Exception:
+                    _log.warning("失敗の知らせの文書の印の確定に失敗しました: world=%s", world, exc_info=True)
             _t_refresh0 = time.monotonic()
             _refresh_started_at = datetime.now(timezone.utc).isoformat()
             refresh_outcome, refresh_es_info, refresh_failure_reason = _refresh_derived_representations(world, sig)
@@ -1227,4 +1549,5 @@ def _wipe_locked(world, *, reflect) -> dict:
         es_index.delete_world(world)                  # ES インデックスも削除
     except Exception:
         pass
+    store.clear_failed_docs(world)                         # ⑦ 全部成功してから失敗の一覧も消す
     return {"world": world, "ledger_cleared": ledger, "graph_deleted": deleted}

@@ -244,7 +244,7 @@ def notify_run_terminal(world: str, run_id: int | None, op: str, status: str, *,
 
     best-effort（内部で全て捕捉し、取り込み自体の成否へ影響させない）。対象キーの列挙とキューへの投入だけを行う。
     `status` は `ingest_runs.status`（terminal のみ）: auto_published/auto_published_with_flags→`ingest.completed`・failed→`ingest.failed`。
-    `op` は sync/refresh/rebind/rerun/delete（情報用途のみ）。
+    `op` は sync/refresh/rebind/rerun/reconvert/delete（情報用途のみ）。
     """
     try:
         from . import store

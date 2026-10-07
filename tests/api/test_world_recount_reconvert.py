@@ -204,95 +204,64 @@ def test_recount_root_vanished_or_not_a_directory_returns_503_without_scan_or_sa
 # POST /worlds/{wid}/reconvert
 # ===================================================================================
 
-def _reconvert_env(monkeypatch, tmp_path, *, name="旧資料.doc", original=True, drop=lambda cache_root, rel: True,
-                   run_locked=None):
-    """world・原本・旧形式キャッシュ削除・取り込み本体を差し替える。"""
+def _reconvert_env(monkeypatch, tmp_path, *, name="旧資料.xlsx", original=True):
+    """world・原本・失敗の一覧（その原本が載っている）を差し替える。"""
     from sherpa import doc_ledger, store, worlds
-    from sherpa.ingest import worker as ingest_worker
-    from sherpa.ingest.arms import legacy_convert
     monkeypatch.setattr(store, "get_world", lambda wid: {"world_id": wid})
+    monkeypatch.setattr(store, "list_failed_docs", lambda wid: [{"rel": name, "reason": "source_parse_failed"}])
     monkeypatch.setattr(worlds, "world_dir", lambda wid: tmp_path)
-    monkeypatch.setattr(worlds, "derived_md_dir", lambda wid: tmp_path / "derived" / "md")
     src = tmp_path / name
     src.write_bytes(b"x")
     monkeypatch.setattr(doc_ledger, "original_path", lambda rel, wid: src if original and rel == name else None)
-    monkeypatch.setattr(legacy_convert, "drop_cache_entry", drop)
-    if run_locked is not None:
-        monkeypatch.setattr(ingest_worker, "_run_locked", run_locked)
-
-
-def _published(wid, **kw):
-    return {"world": wid, "status": "auto_published", "ledger": 1, "flags": [], "nodes": 0, "edges": 0,
-            "run": {"id": 1}}
 
 
 def test_reconvert_unknown_rel_returns_404(client, monkeypatch, tmp_path):
     _reconvert_env(monkeypatch, tmp_path, original=False)
-    assert client.post("/worlds/w1/reconvert", json={"rel": "missing.doc"}).status_code == 404
+    assert client.post("/worlds/w1/reconvert", json={"rel": "missing.xlsx"}).status_code == 404
 
 
-def test_reconvert_success_drops_cache_and_runs_directly(client, monkeypatch, tmp_path):
-    """`sync(force=True)` ではなく `_run_locked` を直接1回実行する（二重走査を避ける）。"""
-    _stub_ingest_summary(monkeypatch)
-    dropped = {}
-    run_calls = []
+def test_reconvert_non_target_returns_422(client, monkeypatch, tmp_path):
+    """変換のループが扱わない原本（ソースなど）は受け付けない。"""
+    _reconvert_env(monkeypatch, tmp_path, name="a.cbl")
+    assert client.post("/worlds/w1/reconvert", json={"rel": "a.cbl"}).status_code == 422
 
-    def _fake_run_locked(wid, *, reflect, created_by, scan_root, op="sync"):
-        # `op`（Webhook 通知の情報用途のみ）: reconvert は "refresh" を渡す。
-        run_calls.append({"wid": wid, "reflect": reflect, "created_by": created_by,
-                          "scan_root": scan_root, "op": op})
-        return {**_published(wid), "ledger": 3}
 
-    _reconvert_env(monkeypatch, tmp_path, run_locked=_fake_run_locked,
-                   drop=lambda cache_root, rel: dropped.setdefault("rel", rel) or True)
+def test_reconvert_accepts_202_and_runs_one_file_in_background(client, monkeypatch, tmp_path):
+    """受け付けたら 202 ですぐ返し、背景で 1 ファイルの再変換（`worker.reconvert`）を走らせて前後を監査する。"""
+    from sherpa.ingest import worker as ingest_worker
+    from sherpa.routers import worlds as worlds_routes
+    _reconvert_env(monkeypatch, tmp_path)
     audits = _stub_audit(monkeypatch)
+    dispatched = {}
 
-    r = client.post("/worlds/w1/reconvert", json={"rel": "旧資料.doc"})
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["ok"] is True and body["world_id"] == "w1" and body["rel"] == "旧資料.doc"
-    assert body["changed"] is True and body["status"] == "auto_published"
-    assert dropped["rel"] == "旧資料.doc"
-    assert run_calls == [{"wid": "w1", "reflect": True, "created_by": "admin", "scan_root": None,
-                          "op": "refresh"}]
-    # pre/post 監査（actor・world・rel・結果）が両方記録される。
+    def _fake_dispatch(wid, op, fingerprint, work_fn, **kw):
+        dispatched.update(wid=wid, op=op, fingerprint=fingerprint, work_fn=work_fn, **kw)
+        return 7, False
+
+    monkeypatch.setattr(worlds_routes, "_dispatch", _fake_dispatch)
+    calls = []
+    monkeypatch.setattr(ingest_worker, "reconvert",
+                        lambda wid, rel, *, run_id: calls.append((wid, rel, run_id)) or {"status": "auto_published"})
+    r = client.post("/worlds/w1/reconvert", json={"rel": "旧資料.xlsx"})
+    assert r.status_code == 202, r.text
+    assert r.json()["run_id"] == 7 and r.json()["joined"] is False
+    assert dispatched["op"] == "reconvert" and "旧資料.xlsx" in dispatched["fingerprint"]
+    assert dispatched["initial_progress"]["rel"] == "旧資料.xlsx"
+    assert calls == []                                    # 応答の時点ではまだ走らせない
+    dispatched["work_fn"](7)
+    assert calls == [("w1", "旧資料.xlsx", 7)]
     assert audits.pairs() == [("world.reconvert_requested", "success"), ("world.reconverted", "success")]
-    assert audits[1][1]["detail"] == {"world": "w1", "rel": "旧資料.doc"}
 
 
-@pytest.mark.parametrize("case", ["run_failed", "cache_drop_failed"])
-def test_reconvert_failure_returns_503_and_audits_failure(client, monkeypatch, tmp_path, case):
-    """取り込み run が failed／旧形式キャッシュの削除に失敗したら 503 で、失敗を監査する。
-    キャッシュ削除の失敗は sync 前に止める（安定して壊れたファイルを「再変換した」ことにしない・
-    `_run_locked` は一切呼ばれない）。"""
-    run_calls = []
-
-    def _run_failed(wid, **kw):
-        run_calls.append(wid)
-        return {**_published(wid), "status": "failed", "ledger": 0, "flags": [{"reason": "graph_reflect_failed"}]}
-
-    _reconvert_env(monkeypatch, tmp_path, run_locked=_run_failed,
-                   drop=(lambda cache_root, rel: False) if case == "cache_drop_failed"
-                   else (lambda cache_root, rel: True))
-    audits = _stub_audit(monkeypatch)
-
-    r = client.post("/worlds/w1/reconvert", json={"rel": "旧資料.doc"})
-    assert r.status_code == 503, r.text
-    assert run_calls == ([] if case == "cache_drop_failed" else ["w1"])
-    assert audits.pairs() == [("world.reconvert_requested", "success"), ("world.reconverted", "failure")]
-
-
-def test_reconvert_non_legacy_ext_skips_cache_drop(client, monkeypatch, tmp_path):
-    """legacy 拡張子（.doc/.xls/.ppt）でないファイルはキャッシュ削除を試みない。"""
-    _stub_ingest_summary(monkeypatch)
-    drop_calls = []
-    _reconvert_env(monkeypatch, tmp_path, name="新資料.docx", run_locked=lambda wid, **kw: _published(wid),
-                   drop=lambda cache_root, rel: drop_calls.append(rel) or True)
-    _stub_audit(monkeypatch)
-
-    r = client.post("/worlds/w1/reconvert", json={"rel": "新資料.docx"})
-    assert r.status_code == 200, r.text
-    assert drop_calls == []
+def test_reconvert_while_other_op_running_returns_409(client, monkeypatch, tmp_path):
+    """同じ資料フォルダで別の処理（ここでは更新）が実行中なら 409（run を作らない）。"""
+    from sherpa import store
+    from sherpa.ingest import background
+    _reconvert_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(store, "start_ingest_run", lambda *a, **kw: pytest.fail("run を作らない"))
+    monkeypatch.setitem(background._REGISTRY, "w1",
+                        background._BgRun(world_id="w1", op="refresh", fingerprint="{}", run_id=3))
+    assert client.post("/worlds/w1/reconvert", json={"rel": "旧資料.xlsx"}).status_code == 409
 
 
 # ===================================================================================

@@ -225,4 +225,5 @@ def delete_world_row(world_id) -> bool:
     _ensure()
     with _connect() as c:
         n = c.execute("DELETE FROM worlds WHERE kb_id=%s AND world_id=%s", (_KB_ID, world_id)).rowcount
+        c.execute("DELETE FROM world_failed_docs WHERE world_id=%s", (world_id,))
     return n > 0

@@ -678,6 +678,16 @@ _SCHEMA = [
     "ON investigation_records(conversation_id)",
     # 調査記録の補足（落とした内訳 `dropped`・検索語と読んだ範囲 `coverage`・見直しの読み取りの省略 `reviews_report`）。
     "ALTER TABLE investigation_records ADD COLUMN IF NOT EXISTS detail JSONB NOT NULL DEFAULT '{}'",
+    # 取り込みで失敗（縮退）した文書の一覧。資料フォルダを全体で作り直した run が置き換え、変化の無い更新では変えない。
+    """CREATE TABLE IF NOT EXISTS world_failed_docs (
+        world_id TEXT NOT NULL,
+        rel TEXT NOT NULL,
+        reason TEXT,                               -- 失敗の生の理由（`failure_reasons.describe` で利用者向けに分類する）
+        first_failed TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_tried TIMESTAMPTZ NOT NULL DEFAULT now(),
+        tries INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (world_id, rel)
+    )""",
 ]
 # usage_stats の期間絞り（`_usage_period_bounds`）が messages.created_at の索引を使えるようにする索引。`_USAGE_TURN_CTE` の `touched`（期間の候補メッセージを絞るサブクエリ）が使う。
 # `_SCHEMA` には含めない（既存の大規模 messages では素の CREATE INDEX が起動の単一トランザクション内で長時間かかり、readiness 未達のまま強制終了→再起動を繰り返しうるため）。`ensure_messages_created_at_index()` が別 autocommit 接続で `CREATE INDEX CONCURRENTLY` を実行し、`init_schema()` はその完了を待たない（background daemon thread）。

@@ -1173,6 +1173,7 @@ class RunProgress(BaseModel):
     done: int | None
     total: int | None
     updated_at: str
+    rel: str | None = None   # 1 ファイルの再変換の実行中だけ、その資料の rel
 
 
 class IngestSummaryFields(BaseModel):
@@ -1269,7 +1270,7 @@ class WorldResolveSettingsResponse(BaseModel):
 
 
 class WorldIngestAcceptedResponse(BaseModel):
-    """取り込み操作の受付結果（POST /worlds・POST /worlds/{wid}/refresh・DELETE /worlds/{wid}・POST /worlds/{wid}/rebind・POST /ingest/rerun。HTTP 202）。
+    """取り込み操作の受付結果（POST /worlds・POST /worlds/{wid}/refresh・POST /worlds/{wid}/reconvert・DELETE /worlds/{wid}・POST /worlds/{wid}/rebind・POST /ingest/rerun。HTTP 202）。
 
     本体処理は背景で継続し、この応答は「受け付けた」ことだけを示す。`run_id` は受付時点で必ず判明している（非 null）。
     `joined=True` は多重クリック制御（操作種別＋正規化 payload の一致）により新規実行せず既存 run へ合流した場合（不一致なら 409）。
@@ -1286,19 +1287,6 @@ class WorldRecountResponse(IngestSummaryFields):
     """再集計（POST /worlds/{wid}/recount）。スキャンを明示的に再実行してキャッシュし直し、取り込み状況をフラットに展開して返す（同期）。"""
     ok: bool
     world_id: str
-
-
-class WorldReconvertResponse(BaseModel):
-    """1ファイルの再変換（POST /worlds/{wid}/reconvert）。旧形式変換キャッシュを落として world 全体を sync する（同期）。`summary` は取り込み状況をネストする。"""
-    ok: bool
-    world_id: str
-    rel: str
-    changed: bool
-    status: str
-    ledger: int | None
-    flags: list[Any]
-    summary: IngestSummaryFields
-    note: str
 
 
 # ===== ナレッジグラフ（sherpa/routers/graph.py） =====

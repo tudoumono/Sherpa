@@ -32,6 +32,32 @@ def replace_documents(world, rows) -> int:
     return len(rows)
 
 
+def get_document(world, name) -> dict | None:
+    """world の文書台帳の 1 行（`list_documents` と同じ列・無ければ None）。"""
+    _ensure()
+    with _connect() as c:
+        return c.execute(
+            "SELECT name, layer, scope_path, doctype, branch, original_path, md_path, status, "
+            "  importance, importance_reason, importance_source "
+            "FROM documents WHERE kb_id=%s AND version=%s AND name=%s", (_KB_ID, world, name)).fetchone()
+
+
+def replace_document(world, name, row: dict | None) -> None:
+    """world の文書台帳の 1 行だけを入れ替える（`row` が None なら消す）。列は `replace_documents` と同じ。"""
+    _ensure()
+    with _connect() as c:
+        c.execute("DELETE FROM documents WHERE kb_id=%s AND version=%s AND name=%s", (_KB_ID, world, name))
+        if row is not None:
+            c.execute(
+                "INSERT INTO documents (kb_id, version, name, layer, scope_path, doctype, branch, "
+                "  original_path, md_path, status, importance, importance_reason, importance_source) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (_KB_ID, world, name, row.get("layer") or "version", row.get("scope_path"),
+                 row.get("doctype"), row.get("branch"), row.get("original_path"), row.get("md_path"),
+                 row.get("status"), row.get("importance"), row.get("importance_reason"),
+                 row.get("importance_source")))
+
+
 def list_documents(world) -> list:
     """world の文書台帳（name/layer/scope_path/doctype/branch/original_path/md_path/status/importance 系）。"""
     _ensure()

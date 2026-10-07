@@ -76,6 +76,10 @@ class _NotApplicable(RuntimeError):
     """「対象外（未設定/未選択）」の申告用。`_check_one` はこれを ok=True・detail「対象外（…）」・DEBUG ログとして扱う（失敗とは区別する）。"""
 
 
+class _NotInUse(_NotApplicable):
+    """Ollama を使わない構成の申告（`_check_one` は対象外と同じ扱いでログも出さない）。"""
+
+
 class _OllamaEmbedModelMissing(RuntimeError):
     """埋め込みが Ollama 構成に解決されているのに、その埋め込みモデルが Ollama 未取得。`_classify()` が案内文をそのまま使う。"""
 
@@ -84,11 +88,58 @@ class _OllamaEmbedModelMissing(RuntimeError):
         super().__init__(model)
 
 
+def _active_user_codex_rows() -> list[dict]:
+    """有効な利用者の `agent`・`codex_model_provider`（Ollama 利用の判定用・読み取りのみ）。"""
+    from .store.db import _connect
+    # 短い期限つきの直接接続（プールを待たない）。読めない・時間切れは呼び出し側が「使っている」に倒す
+    with _connect(connect_timeout=2, options="-c statement_timeout=2000") as c:
+        rows = c.execute(
+            "SELECT us.agent, us.codex_model_provider FROM user_settings us "
+            "JOIN users u ON u.uid = us.user_id WHERE u.status = 'active'").fetchall()
+    return [dict(r) for r in rows]
+
+
+def ollama_in_use(system_settings: dict, user_rows: list[dict] | None = None) -> bool:
+    """Ollama を使う構成か（定期点検・取り込みの警告を出すかの判定）。判定できないときは使っている側に倒す。
+
+    次のどれかが Ollama なら使っている:
+    ① 回答の AI（クラウド未選択で OpenAI のキーも無く Ollama に解決される構成）・簡易の既定 AI（明示 ollama のときだけ）
+    ② Codex（`--oss`）＝実効の頭脳が codex で `codex_model_provider` が ollama の有効な利用者がいる
+    ③ 埋め込み（`embed_provider` が ollama、または auto で Ollama に解決される構成・`SHERPA_DISABLE_EMBED` のときは除く）
+    ④ 画像を読む AI＝vision アームが有効で VLM の provider が ollama
+    """
+    from . import agent_constructs, llm
+    from .ingest.arms import enabled_arm_names, vision_arm
+    try:
+        if llm.resolve_auto_provider(None, system_settings=system_settings) == "ollama":
+            return True
+        from . import embeddings
+        simple = (system_settings or {}).get("research_default_provider")
+        if simple == "ollama":
+            return True  # 簡易の既定に Ollama を明示している（未設定は使っていない扱い）
+        if not os.environ.get("SHERPA_DISABLE_EMBED") and \
+                embeddings.effective_embed_provider(system_settings) == "ollama":
+            return True
+        if "vision" in enabled_arm_names() and vision_arm.vlm_config()["provider"] == "ollama":
+            return True
+        rows = user_rows if user_rows is not None else _active_user_codex_rows()
+        for row in rows:
+            if row.get("codex_model_provider") != "ollama":
+                continue
+            if agent_constructs.effective_agent(row, system_settings=system_settings) == "codex":
+                return True
+    except Exception:
+        return True
+    return False
+
+
 def _ping_ollama() -> None:
     # 接続先は `llm.ollama_url` 経由で組み立て（SSRF 宛先ポリシーを通す）、送信は `llm.urlopen_no_redirect`。
     # ブロック時の `SsrfBlocked` は `_check_one` の broad except に乗る。env `OLLAMA_URL` は直接読まない
     from . import keys, llm, store
     sys_s = store.get_system_settings()
+    if not ollama_in_use(sys_s):
+        raise _NotInUse("使っていません")
     configured = bool(sys_s.get("ollama_url"))  # 中央設定に接続先があるか（既定 localhost は「未設定」扱い）
     base = keys.resolve_ollama_url(None, system_settings=sys_s)
     try:
@@ -177,7 +228,8 @@ def _check_one(comp_id, label, impact, ping, hint) -> dict:
         ok, detail = True, None
     except _NotApplicable as e:
         ok, detail = True, f"対象外（{e}）"  # 使っていない構成＝正常。WARNING を出さない
-        _logger.debug("health check not applicable: %s: %s", comp_id, e)
+        if not isinstance(e, _NotInUse):
+            _logger.debug("health check not applicable: %s: %s", comp_id, e)
     except Exception as e:
         ok = False
         detail = f"{_classify(e)}（{type(e).__name__}）"
@@ -201,6 +253,8 @@ def _check_one_ai(comp_id, label, impact, ping, hint) -> dict:
     try:
         ping()
         ok, detail = True, None
+    except _NotInUse as e:
+        ok, detail = True, f"対象外（{e}）"  # 使っていない構成はログに出さない
     except Exception as e:
         ok = False
         detail = _mask_secrets(str(e), None)
@@ -277,6 +331,8 @@ def _ai_check_openai(settings: dict, system_settings: dict | None = None) -> Non
 def _ai_check_ollama(settings: dict, system_settings: dict | None = None) -> None:
     # 接続先は `llm.ollama_url` 経由で構築し、送信は `llm.urlopen_no_redirect`。env `OLLAMA_URL` は直接読まない
     from . import keys, llm
+    if not ollama_in_use(system_settings or {}):
+        raise _NotInUse("使っていません")
     base = keys.resolve_ollama_url(settings, system_settings=system_settings)
     with llm.urlopen_no_redirect(llm.ollama_url(base, "/api/tags"), timeout=_AI_TIMEOUT) as r:
         json.loads(r.read())

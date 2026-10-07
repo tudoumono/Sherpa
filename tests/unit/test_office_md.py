@@ -350,15 +350,17 @@ def test_check_partial_extraction_truncated_sheet_does_not_hide_other_sheet_susp
 
 # ---- 変換の失敗・fail-closed ----
 
-def test_build_derived_broken_docx_is_fail_closed_not_sealed_as_success(tmp_path):
-    """document-ir 構築に失敗した docx は `document_ir_failed` へ計上され、`.document_ir_sig` を成功で確定しない。"""
+def test_build_derived_broken_docx_notice_is_listed_and_does_not_block_ir_sig(tmp_path):
+    """document-ir 構築に失敗した docx は `document_ir_failed` へ計上され、失敗の知らせで公開される。
+    知らせの文書の失敗は失敗の一覧で管理し、`.document_ir_sig` は刻む（次の更新が全件の作り直しにならない）。"""
     src, der = _dirs(tmp_path)
     (src / "broken.docx").write_bytes(b"not a zip")
     rep = office_md.build_derived(src, der)
     assert rep["failed"] == 1 and rep["document_ir_failed"] >= 1
     assert any(f["doc"] == "broken.docx" and f["reason"].startswith("document_ir_failed:")
                for f in rep["document_ir_failures"])
-    assert office_md.document_ir_sig_drift(der) is True
+    _notice_meta(der, "broken.docx", "source_parse_failed")
+    assert office_md.document_ir_sig_drift(der) is False
 
 
 def test_build_derived_docx_without_body_element_publishes_failed_notice(tmp_path):

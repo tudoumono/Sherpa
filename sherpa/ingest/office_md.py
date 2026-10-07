@@ -365,6 +365,55 @@ def write_document_ir_sig_marker(derived_md_dir) -> None:
     _write_document_ir_sig_marker(Path(derived_md_dir))
 
 
+def _document_json_is_current(path: Path, rel: str) -> bool:
+    """`{rel}.document.json` が今の版で読めるか（先頭と末尾の一部だけを読む。全体は JSON として解析しない）。
+
+    決定的な出力（キー昇順・末尾が `}`）の先頭に自分の `doc_id`、末尾に現行の `schema_version` があることを確かめる。
+    途中で切れた・壊れた・旧いスキーマの document.json は False。
+    """
+    from . import document_ir
+    rel_json = json.dumps(rel, ensure_ascii=False)
+    n = len(rel_json.encode("utf-8"))  # 先頭の doc_id・末尾の source.path がパスの長さだけ伸びる
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            head = f.read(1024 + n).decode("utf-8", errors="replace")
+            f.seek(max(0, size - 2048 - n))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    return (head.lstrip().startswith("{") and rel_json in head
+            and tail.rstrip().endswith("}")
+            and f'"schema_version": {json.dumps(document_ir.DOCUMENT_IR_SCHEMA_VERSION)}' in tail)
+
+
+def settle_document_ir_sig_for_notices(wd, derived, *, world: str | None = None) -> bool:
+    """`.document_ir_sig` が無く、document.json を持たない OOXML 原本が失敗の知らせの文書だけなら、印を現行値で確定する。
+
+    失敗の知らせの文書の IR 失敗は失敗の一覧で管理する（`build_derived` と同じ扱い）。印が無いまま残った旧い派生が、
+    更新のたびに全 OOXML の再パースと下流の作り直しを呼ぶのを止める。知らせの文書が 1 件も無い・知らせ以外に今の版で読める document.json を持たない文書があるときは何もしない。
+    """
+    from .. import scope_infer as si
+    from .arms import ooxml_arm
+    dr = Path(derived)
+    if (dr / _DOCUMENT_IR_SIG_MARKER).exists():
+        return False
+    dr_ir = _sibling_layer_dir(dr, "ir")
+    notices = 0
+    for rp, rel in si.safe_files(Path(wd).resolve(), also=_archive_also_root(world)):
+        ext = rp.suffix.lower()
+        if ext not in ooxml_arm._IR_EXTS or _is_skipped_original(rp, ext):
+            continue
+        if _md_is_failure_notice(dr, rel):
+            notices += 1
+        elif not _document_json_is_current(dr_ir / (rel + ".document.json"), rel):
+            return False
+    if notices == 0:
+        return False
+    _write_document_ir_sig_marker(dr)
+    return (dr / _DOCUMENT_IR_SIG_MARKER).exists()
+
+
 def document_ir_sig_drift(derived_md_dir) -> bool:
     """派生を作った時と今で document-ir 版が変わったか（マーカー無し/読めない/不一致で True）。
 
@@ -402,6 +451,15 @@ def _md_is_from_ooxml_arm(dr: Path, rel: str) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(meta, dict) and meta.get("arm") == "ooxml"
+
+
+def _md_is_failure_notice(dr: Path, rel: str) -> bool:
+    """既存の `{rel}.md` が失敗の知らせ（`evidence_notice`）か。軽量再生成と版の判定は、知らせの文書を対象から外す。"""
+    try:
+        meta = json.loads((dr / (rel + ".md.meta.json")).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return failure_notice_reason(meta) is not None
 
 
 def _legacy_human_md_source(rp: Path, rel: str, dr: Path) -> Path | None:
@@ -450,8 +508,11 @@ def human_md_sig_drift(wd, derived, *, world: str | None = None) -> bool:
             continue
         if rp.suffix.lower() == ".pptx" and not _md_is_from_ooxml_arm(dr, rel):
             continue
-        if _is_sensitive_original(rp, rp.suffix.lower()):
+        if _is_skipped_original(rp, rp.suffix.lower()):
             # 秘匿名は `{rel}.derived.json` マニフェストを持たない（`_is_sensitive_original` 参照）。除外しないと drift が恒常 True になる
+            continue
+        if _md_is_failure_notice(dr, rel):
+            # 失敗の知らせは `asset_versions.human_md` を持たない。失敗は失敗の一覧で管理し、版の判定には入れない
             continue
         manifest = json_io.read_json(dr_ir / (rel + _DERIVED_MANIFEST_SUFFIX), default=None)
         versions = manifest.get("asset_versions") if isinstance(manifest, dict) else None
@@ -469,6 +530,14 @@ def _is_sensitive_original(rp: Path, ext: str) -> bool:
     秘匿名の原本は派生 MD/IR/Evidence/RAG もマニフェストも持たない。
     """
     return text_kind.is_sensitive(rp.name, ext)
+
+
+def _is_skipped_original(rp: Path, ext: str) -> bool:
+    """原本の木を歩く全ループが変換・判定の対象から外す原本か（秘匿名＋ロックファイル等のノイズ）。
+
+    変換ループ・drift 判定・軽量再生成・欠落検知は、この関数だけで除外を判定する（判定が分散すると一部のループだけ対象に残る）。
+    """
+    return _is_sensitive_original(rp, ext) or text_kind.is_noise(rp.name, ext)
 
 
 def _render_human_md(ir, path: Path, ext: str) -> str | None:
@@ -516,8 +585,11 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
             ext = _LEGACY_HUMAN_MD_EXT[ext]
         elif ext == ".pptx" and not _md_is_from_ooxml_arm(dr, rel):
             continue
-        if _is_sensitive_original(rp, rp.suffix.lower()):
+        if _is_skipped_original(rp, rp.suffix.lower()):
             # 秘匿名は human_md を持たない（`_is_sensitive_original` 参照）。除外しないと秘匿本文が `{rel}.md` へ平文で書き出される
+            continue
+        if _md_is_failure_notice(dr, rel):
+            # 失敗の知らせの `.md` だけを書き換えると、Evidence・RAG が知らせのまま `.md` だけ正しい混在になる
             continue
         manifest = json_io.read_json(dr_ir / (rel + _DERIVED_MANIFEST_SUFFIX), default=None)
         versions = manifest.get("asset_versions") if isinstance(manifest, dict) else None
@@ -978,6 +1050,21 @@ def _is_source_failure_notice(meta: object) -> bool:
     return isinstance(notes, list) and "reason_code=source_parse_failed" in notes
 
 
+def failure_notice_reason(meta: object) -> str | None:
+    """`{rel}.md.meta.json` が失敗の知らせ（変換に失敗して公開した知らせ。未対応の知らせは含まない）なら、その理由コード（無ければ None）。"""
+    if not isinstance(meta, dict) or meta.get("arm") not in ("evidence_notice", "legacy"):
+        return None
+    if meta.get("method") not in ("source_failure_notice", "legacy_source_notice"):
+        return None
+    notes = meta.get("notes")
+    if not isinstance(notes, list) or "coverage_status=failed" not in notes:
+        return None
+    for n in notes:
+        if isinstance(n, str) and n.startswith("reason_code="):
+            return n.split("=", 1)[1] or "source_parse_failed"
+    return "source_parse_failed"
+
+
 def _source_failure_detail(previous_evidence_path: Path) -> dict:
     """旧Evidenceから抽出失敗の診断値だけを引き継ぐ。
 
@@ -1282,6 +1369,183 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
     return rep
 
 
+# ---- 1 ファイルの再変換 ----
+# 設計: docs/design/rag.md「失敗した資料のやり直し」
+# 公開中の md／rag／ir のうち 1 つの rel に属するファイル（`.derived.json` は最後に置き換えるので別に扱う）。
+_REL_FILE_SUFFIXES = {
+    "ir": (".document.json", ".evidence.json", ".ocr_route.json"),
+    "rag": (".rag.md", ".rag_chunks.jsonl"),
+    "md": (".md", ".md.meta.json"),
+}
+
+
+def is_conversion_target(rp: Path) -> bool:
+    """変換のループが扱う原本か（拡張子が候補にあり、秘匿名・ロックファイルでない）。"""
+    ext = Path(rp).suffix.lower()
+    return (ext in (OFFICE_EXT | RASTER_EVIDENCE_EXT | convertible_exts())
+            and not _is_skipped_original(Path(rp), ext))
+
+
+def published_world_sig(derived) -> str | None:
+    """公開中の派生に刻まれた資料フォルダ署名（`.world_sig`）。読めなければ None。"""
+    try:
+        return (Path(derived) / _WORLD_SIG_MARKER).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def drop_conversion_cache(derived, rel: str) -> bool:
+    """`rel` の変換のキャッシュ（ファイルごとの変換結果と旧形式の変換）を消す。消せなければ False。"""
+    from .arms import legacy_convert
+    dr = Path(derived)
+    meta_path, content_dir = _conv_cache_slot(_conv_cache_root_for(dr), rel)
+    try:
+        meta_path.unlink(missing_ok=True)
+        for d in (content_dir, content_dir.with_name(content_dir.name + ".tmp")):
+            if d.exists():
+                shutil.rmtree(d)
+    except OSError:
+        _log.warning("変換のキャッシュを消せませんでした: %s", rel, exc_info=True)
+        return False
+    if Path(rel).suffix.lower() in legacy_convert.LEGACY_EXT_MAP:
+        return legacy_convert.drop_cache_entry(legacy_convert.cache_root_for(dr), rel)
+    return True
+
+
+def _staging_dirs(derived) -> tuple[Path, Path, Path]:
+    """`_build_derived_into_staging` が使う md／rag／ir のステージング。"""
+    try:
+        published = Path(derived).resolve()
+    except OSError:
+        published = Path(derived)
+    return tuple(d.with_name(d.name + _STAGING_SUFFIX) for d in (
+        published, _sibling_layer_dir(published, "rag"), _sibling_layer_dir(published, "ir")))
+
+
+def discard_staging(derived) -> None:
+    """ステージングを捨てる（公開中には触れない）。"""
+    for d in _staging_dirs(derived):
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def derive_one(wd, derived, rp: Path, rel: str, *, world: str | None = None) -> dict:
+    """1 ファイルだけを、全体の作り直しと同じファイルごとの処理でステージングへ変換する（公開中には触れない）。
+
+    続けて呼び出し元が `publish_one`（公開）か `discard_staging`（破棄）を呼ぶ。返値は `build_derived` と同じ形の要約。
+    """
+    try:
+        rep = _build_derived_into_staging(wd, derived, world=world, only=[(Path(rp), rel)])
+    except BaseException:
+        discard_staging(derived)
+        raise
+    if rep.get("error"):
+        discard_staging(derived)
+    return rep
+
+
+_RECONVERT_BACKUP_SUFFIX = ".reconvert-bak"
+
+
+class PublishRollbackError(OSError):
+    """1 ファイルの差し替えの途中で失敗し、前の状態へも戻せなかった。"""
+
+
+def _remove_path(p: Path) -> None:
+    """ファイルかディレクトリを消す（無ければ何もしない）。"""
+    if p.is_dir() and not p.is_symlink():
+        shutil.rmtree(p)
+    else:
+        p.unlink(missing_ok=True)
+
+
+def _move_into(src: Path, dst: Path) -> None:
+    """ステージングの新しい出力を公開中の場所へ移す（同じファイルシステムの中の改名）。"""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src.rename(dst)
+
+
+def _publish_targets(derived, rel: str) -> tuple[dict, list]:
+    """`publish_one` が置き換える公開中の層の場所と、rel の分の名前の並び（ir→rag→md、`.derived.json` は最後）。"""
+    staging_md = _staging_dirs(derived)[0]
+    published = staging_md.with_name(staging_md.name[: -len(_STAGING_SUFFIX)])
+    roots = {"md": published, "rag": _sibling_layer_dir(published, "rag"),
+             "ir": _sibling_layer_dir(published, "ir")}
+    names = [(layer, rel + suffix) for layer in ("ir", "rag", "md") for suffix in _REL_FILE_SUFFIXES[layer]]
+    names.insert(len(_REL_FILE_SUFFIXES["ir"]) + len(_REL_FILE_SUFFIXES["rag"]), ("rag", rel + ".assets"))
+    names.append(("ir", rel + _DERIVED_MANIFEST_SUFFIX))
+    return roots, names
+
+
+def restore_reconvert_backups(derived, rel: str) -> int:
+    """前の差し替えが途中で止まって残った rel の控え（`*.reconvert-bak`）を、公開中の場所へ戻す（戻した数を返す）。
+
+    控えがあれば、その場所の今のものを消して控えを元の名前へ戻す。失敗は OSError のまま伝える。
+    """
+    roots, names = _publish_targets(derived, rel)
+    restored = 0
+    for layer, name in names:
+        dst = roots[layer] / name
+        bak = dst.with_name(dst.name + _RECONVERT_BACKUP_SUFFIX)
+        if bak.exists() or bak.is_symlink():
+            _remove_path(dst)
+            bak.rename(dst)
+            restored += 1
+    return restored
+
+
+def publish_one(derived, rel: str) -> None:
+    """`derive_one` がステージングに作った rel の分で、公開中の md／rag／ir のその rel の分だけを置き換える。
+
+    ① OCR が有効ならステージング上でルートを作る ② 層ごと（ir→rag→md、`.derived.json` は最後）に、公開中のものを
+    同じ場所の控えへ改名してから新しい出力を移す（新しい出力に無いものは控えに退くだけで消える）
+    ③ 途中で失敗したら、移した分を消して控えを全部元へ戻してから OSError を伝える（戻せなければ `PublishRollbackError`）
+    ④ 成功したら控えを消す ⑤ ステージングを捨てる。
+    """
+    staging_md, staging_rag, staging_ir = _staging_dirs(derived)
+    roots, names = _publish_targets(derived, rel)
+    staged = {"md": staging_md, "rag": staging_rag, "ir": staging_ir}
+    moved: list[tuple[Path, Path | None]] = []          # (公開中の場所, 控え〔元が無ければ None〕)
+    try:
+        if ocr_enabled():
+            try:
+                _write_ocr_routes(staging_ir, staging_rag)
+            except Exception:                        # OCR は任意＝変換の公開を巻き添えにしない
+                _log.warning("OCRルート生成に失敗しました（変換の公開は継続）: %s", rel, exc_info=True)
+        try:
+            for layer, name in names:
+                src, dst = staged[layer] / name, roots[layer] / name
+                bak = dst.with_name(dst.name + _RECONVERT_BACKUP_SUFFIX)
+                _remove_path(bak)
+                had = dst.exists() or dst.is_symlink()
+                if had:
+                    dst.rename(bak)
+                moved.append((dst, bak if had else None))
+                if src.exists():
+                    _move_into(src, dst)
+        except OSError:
+            _log.warning("1 ファイルの差し替えに失敗したため前の状態へ戻します: %s", rel, exc_info=True)
+            failed_restore = []
+            for dst, bak in reversed(moved):
+                try:
+                    _remove_path(dst)
+                    if bak is not None:
+                        bak.rename(dst)
+                except OSError:
+                    failed_restore.append(str(dst))
+            if failed_restore:
+                _log.error("1 ファイルの差し替えの途中の状態を前へ戻せませんでした: %s", rel)
+                raise PublishRollbackError(f"rollback failed: {len(failed_restore)}")
+            raise
+        for _dst, bak in moved:
+            if bak is not None:
+                try:
+                    _remove_path(bak)
+                except OSError:
+                    _log.warning("差し替えの控えを消せませんでした: %s", bak, exc_info=True)
+    finally:
+        discard_staging(derived)
+
+
 def _check_partial_extraction(rp: Path, md: str, rel: str, document, out: list[dict]) -> None:
     """静かな部分抽出の疑いを検知する（安価な整合チェックのみ）。
 
@@ -1368,7 +1632,8 @@ def _conv_cache_slot(cache_root: Path, rel: str) -> tuple[Path, Path]:
 def _conv_cache_lookup(cache_root: Path, rel: str, want_key: str) -> tuple[dict, Path] | None:
     """キャッシュヒットなら `(rep_delta, content_dir)` を返す。ミス/壊れ/鍵不一致は None。
 
-    `rep_delta` に失敗カウンタ（`_CONV_CACHE_FAILED_DELTA_KEYS`）が非ゼロで残っている実体はミス扱いにする。
+    `rep_delta` に失敗カウンタ（`_CONV_CACHE_FAILED_DELTA_KEYS`）が非ゼロで残っている実体、および復元する `{rel}.md.meta.json` が
+    失敗の知らせ（`failure_notice_reason` が理由を返すもの）の実体はミス扱いにする。
     """
     meta_path, content_dir = _conv_cache_slot(cache_root, rel)
     meta = json_io.read_json(meta_path, default=None)
@@ -1378,6 +1643,9 @@ def _conv_cache_lookup(cache_root: Path, rel: str, want_key: str) -> tuple[dict,
     if not isinstance(rep_delta, dict) or not content_dir.is_dir():
         return None
     if any(rep_delta.get(k) for k in _CONV_CACHE_FAILED_DELTA_KEYS):
+        return None
+    cached_meta = json_io.read_json(content_dir / "md" / (rel + ".md.meta.json"), default=None)
+    if failure_notice_reason(cached_meta) is not None:
         return None
     return rep_delta, content_dir
 
@@ -1460,6 +1728,7 @@ def _conv_cache_prune(cache_root: Path, seen_rels: set) -> None:
 
 def _build_derived_into_staging(
     wd, derived, *, progress: Callable[[int, int], None] | None = None, world: str | None = None,
+    only: list[tuple[Path, str]] | None = None,
 ) -> dict:
     """`wd` 配下の Office を MD 化して派生物を書き出す（毎回まるごと作り直す）。
 
@@ -1475,7 +1744,9 @@ def _build_derived_into_staging(
     - `legacy_conversion_failures`・`*_failures` は `[{"doc": rel, "reason": ...}]`。
     - 例外は投げない。派生先がソース配下と重なる/セットアップ失敗時は `error` を立てて何も書かずに返す（READ-ONLY source 保護）。
       1 ファイル分の変換は try/except で包み、1 件の失敗で他ファイルを止めない。
-    - `document_ir_failed == 0` のときだけ `.document_ir_sig`、`evidence_ir_failed == 0` のときだけ `.evidence_ir_sig` を書く。
+    - 失敗の知らせで公開した文書を除いて IR の失敗が 0 のときだけ `.document_ir_sig`、`evidence_ir_failed == 0` のときだけ `.evidence_ir_sig` を書く。
+    - `only`（`[(原本 Path, rel)]`）を渡すと、資料フォルダを歩かずその原本だけを同じファイルごとの処理に通す（1 ファイルの再変換用）。
+      このときキャッシュの剪定はしない（ステージングに書いた資料フォルダ単位の版の印は公開しない）。
     """
     from .. import scope_infer as si
     # IRキーは早期 return（overlap/setup 失敗）でも同じ形で返す（レポート契約の一貫性）。
@@ -1753,6 +2024,8 @@ def _build_derived_into_staging(
         """
         if conv_cache_key is None or conv_cache_rep_before is None:
             return
+        if rel in source_failure_notices:        # 失敗の知らせに縮退した結果は保存しない（次回の変換でやり直す）
+            return
         rep_delta = _conv_cache_rep_delta(conv_cache_rep_before)
         if any(rep_delta.get(k) for k in _CONV_CACHE_FAILED_DELTA_KEYS):
             return
@@ -1785,19 +2058,24 @@ def _build_derived_into_staging(
         conversion_failures.append({"doc": rel, "reason": reason_code})
 
     _also = _archive_also_root(world)   # アーカイブ取り込み: この関数内の全 safe_files 呼び出しで共有
-    candidate_total = sum(1 for rp, _rel in si.safe_files(wd, also=_also) if rp.suffix.lower() in candidate)
+
+    def _targets():
+        return iter(only) if only is not None else si.safe_files(wd, also=_also)
+
+    candidate_total = sum(1 for rp, _rel in _targets()
+                          if rp.suffix.lower() in candidate and not _is_skipped_original(rp, rp.suffix.lower()))
     processed_candidates = 0
     if progress is not None:
         progress(0, candidate_total)
 
-    for rp, rel in si.safe_files(wd, also=_also):
+    for rp, rel in _targets():
         pending_meta.clear()
         ext = rp.suffix.lower()
         if ext not in candidate:
             continue
-        if _is_sensitive_original(rp, ext):
-            # 秘匿名は拡張子だけの `candidate` 集合では除けないため、変換ループで別途塞ぐ（派生 MD を一切作らない）
-            _log.warning("MD化をスキップします（秘匿名のため対象外・ext=%s）", ext)
+        if _is_skipped_original(rp, ext):
+            # 秘匿名・ロックファイルは拡張子だけの `candidate` 集合では除けないため、変換ループで別途塞ぐ（派生 MD を一切作らない）
+            _log.warning("MD化をスキップします（秘匿名またはノイズのため対象外・ext=%s）", ext)
             continue
         by[ext] += 1
         conv_cache_seen_rels.add(rel)        # 剪定用「今回の原本一覧」（成否問わず候補に入った rel すべて）
@@ -1896,6 +2174,8 @@ def _build_derived_into_staging(
                 dst.write_text(raster_md, encoding="utf-8")
                 _write_prov(dst, "raster", result)
                 converted += 1
+                if rel in source_failure_notices:            # 失敗の知らせに縮退した結果は一覧に載せる（キャッシュには保存しない）
+                    conversion_failures.append({"doc": rel, "reason": "source_parse_failed"})
                 _conv_cache_store_if_eligible()
                 continue
 
@@ -2085,6 +2365,7 @@ def _build_derived_into_staging(
                     _write_prov(dst, "evidence_notice", notice_result)
                     published_notice_count += 1
                     failed += 1
+                    conversion_failures.append({"doc": rel, "reason": "source_parse_failed"})
                     continue
             converted += 1
             _conv_cache_store_if_eligible()
@@ -2122,9 +2403,12 @@ def _build_derived_into_staging(
                 progress(processed_candidates, candidate_total)
     # per-file ループを完走したときだけ剪定する（`_conv_cache_prune` 参照）。
     # 途中死では呼ばれず、生きている rel のキャッシュは次回 sync で再利用できる。
-    _conv_cache_prune(conv_cache_root, conv_cache_seen_rels)
+    if only is None:
+        _conv_cache_prune(conv_cache_root, conv_cache_seen_rels)
     _write_arms_sig_marker(dr)                           # この派生を作った時のアーム構成を刻む（後の drift 判定用）
-    if document_ir_failed == 0:                          # 全 IR が正常に書けた時だけ IR 版マーカーを刻む
+    # 失敗の知らせで公開した文書の IR 失敗は失敗の一覧で管理し、版の印の判定には入れない
+    document_ir_blocking = sum(1 for f in document_ir_failures if not _md_is_failure_notice(dr, f["doc"]))
+    if document_ir_blocking == 0:                        # 知らせ以外の全 IR が正常に書けた時だけ IR 版マーカーを刻む
         _write_document_ir_sig_marker(dr)
     else:
         _remove_marker(dr, _DOCUMENT_IR_SIG_MARKER)      # 失敗を現行値マーカーで隠さない（次回 sync が必ず drift）
@@ -2190,11 +2474,13 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
         ext = rp.suffix.lower()
         if ext not in ooxml_arm._IR_EXTS:
             continue
-        if _is_sensitive_original(rp, ext):
+        if _is_skipped_original(rp, ext):
             # 秘匿名は document_ir を持たない（`_is_sensitive_original` 参照）。stale な旧 `.md` が残っていた場合の再生成を塞ぐため明示的に除外する。
             continue
         md_path = dr / (rel + ".md")
         if not md_path.is_file():                            # MD 自体が無い（未対応/未変換）は対象外
+            continue
+        if _md_is_failure_notice(dr, rel):                   # 失敗の知らせは IR を持たない（知らせのまま触れない）
             continue
         seen_ir.add(rel)
         try:
@@ -2304,7 +2590,7 @@ def rag_sidecars_missing(wd, derived, *, world: str | None = None) -> bool:
         ext = rp.suffix.lower()
         if ext not in manifest_candidates:
             continue
-        if _is_sensitive_original(rp, ext):
+        if _is_skipped_original(rp, ext):
             # 秘匿名は変換ループが MD/派生/マニフェストを作らない＝「欠落」ではなく「対象外」（`_is_sensitive_original` 参照）。
             # 塞がないと毎 sync で欠落判定→全再構築ループが続く。
             continue
@@ -2389,13 +2675,16 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
         if rp.suffix.lower() not in EVIDENCE_EXT:
             continue
         ext = rp.suffix.lower()
-        if _is_sensitive_original(rp, ext):
+        if _is_skipped_original(rp, ext):
             # 秘匿名は evidence_ir/rag を持たない（`_is_sensitive_original` 参照）。PDF は image-only で `.md` 欠落だけでは対象外にならない経路があるため、
             # 明示的に塞がないと秘匿本文が `.evidence.json`/`.rag.md` へ平文で書き出される。
             continue
         md_path = dr / (rel + ".md")
         meta = json_io.read_json(dr / (rel + ".md.meta.json"), default=None)
         source_failure_notice = _is_source_failure_notice(meta)
+        if failure_notice_reason(meta) is not None and not source_failure_notice:
+            seen.add(rel)                                    # 他の種類の失敗の知らせ（サイズ超過など）は今の知らせを保つ（原本を読み直さない）
+            continue
         if ext == ".pdf":
             # image-only PDF は旧 MD が空でも Evidence/RAG を正本画像と構造から再生成する。
             # full generation で parse failure notice へ縮退済みなら、backend の現在値に左右されず notice chain を現行 schema へ再生成する。
@@ -2572,10 +2861,13 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
             failed += 1
             failures.append({"doc": rel, "reason": "source_missing"})
             continue
-        if _is_sensitive_original(source_path, source_path.suffix.lower()):
+        if _is_skipped_original(source_path, source_path.suffix.lower()):
             # 秘匿名は rag を持たない（`_is_sensitive_original` 参照）。`seen` へ加えず、下の cleanup ループで既存の生成物を削除させる。
             continue
         seen.add(rel)
+        if failure_notice_reason(json_io.read_json(dr / (rel + ".md.meta.json"), default=None)) is not None \
+                and not _is_source_failure_notice(json_io.read_json(dr / (rel + ".md.meta.json"), default=None)):
+            continue                                         # 他の種類の失敗の知らせ（サイズ超過など）は今の知らせを保つ（原本を読み直さない）
         rel_ok = True
         try:
             # 巨大な Evidence JSON の全量 read/json.loads を避け、同じ原本と固定 parser から再構築する

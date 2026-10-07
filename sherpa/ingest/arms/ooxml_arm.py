@@ -726,6 +726,7 @@ def _build_xlsx_ir(p: Path) -> document_ir.DocumentIR | None:
                     owner[coord] = ri
 
             region_tables: list[tuple[object, str]] = []  # [(Region, table_id)]（formula 親解決用）
+            emitted_empty: set[tuple[int, int]] = set()  # どの領域も所有しない空セルを出した座標（先の表にだけ出す）
             for local_order, rg in enumerate(sheet_regions, start=1):
                 table_seq += 1
                 tid = f"table:{table_seq}"
@@ -739,6 +740,10 @@ def _build_xlsx_ir(p: Path) -> document_ir.DocumentIR | None:
                         info = merges.get((r, c))
                         if info is not None and info["anchor"] != (r, c):
                             continue  # 非anchor継続セルは出さない
+                        if own is None:
+                            if (r, c) in emitted_empty:
+                                continue  # 外接矩形が重なる別の表が先に出した空セルは出さない
+                            emitted_empty.add((r, c))
                         row_span = info["row_span"] if info else 1
                         col_span = info["column_span"] if info else 1
                         raw = grid[r - 1][c - 1] if (r - 1 < len(grid) and c - 1 < len(grid[r - 1])) else None

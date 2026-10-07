@@ -3811,309 +3811,6 @@
         "title": "IngestNotice",
         "type": "object"
       },
-      "IngestSummaryFields": {
-        "description": "資料フォルダの取り込み状況（スキャン結果のキャッシュ＋グラフ/ES 件数・最終実行状態）。\n\n`scanned`〜`unreadable` は sync 完走時と `POST /worlds/{wid}/recount` のときだけ更新されるキャッシュで、このエンドポイント自身はフォルダを歩かない。\n`counts_as_of` はそのキャッシュの記録時刻（`None`＝未集計）。`sensitive_excluded`/`unreachable_as_text`/`unreachable_as_text_by_ext`/\n`unreachable_by_reason`（`\"encoding_undetermined\"`/`\"binary\"`）/`encoding_partial_count`（一部が化けている件数）も同じキャッシュ由来。\n`failed_files`/`partial_extraction_suspected`/`stage_summary` は最新 run の由来（無ければ `None`）。\n`failure_reason_catalog`/`partial_extraction_advice` は閉じた理由語彙の平文辞書。\n`walk_skipped`＝木の走査で辿らなかったものの件数（`symlink`/`unreadable_dir`/`unreadable_file`/`outside_root`・集計キャッシュ由来）。\n`ingest_notices`＝黙って落とした・粗くしたものの `{code, count}`（走査・関係グラフ・全文索引の各段から導出・名前は持たない。無ければ空）。\n`last_run_warnings`/`last_run_blocked` は flags を打ち切って導出したもの（`last_run_flags_total`=打切り前の総数・`last_run_flags_truncated`=打切りの有無）。\n`last_run_id`/`running_progress` は最新 run の id と実行中進捗（実行中でなければ `running_progress` は `None`）。",
-        "properties": {
-          "analyzer_declined": {
-            "title": "Analyzer Declined",
-            "type": "integer"
-          },
-          "analyzer_declined_as_document": {
-            "title": "Analyzer Declined As Document",
-            "type": "integer"
-          },
-          "by_doctype": {
-            "additionalProperties": {
-              "type": "integer"
-            },
-            "title": "By Doctype",
-            "type": "object"
-          },
-          "counts_as_of": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Counts As Of"
-          },
-          "encoding_partial_count": {
-            "title": "Encoding Partial Count",
-            "type": "integer"
-          },
-          "es_chunks": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Es Chunks"
-          },
-          "es_error": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Es Error"
-          },
-          "es_index_kept": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Es Index Kept"
-          },
-          "es_state": {
-            "enum": [
-              "ok",
-              "reflecting",
-              "failed",
-              "unavailable",
-              "unknown"
-            ],
-            "title": "Es State",
-            "type": "string"
-          },
-          "failed_files": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Failed Files"
-          },
-          "failure_reason_catalog": {
-            "additionalProperties": {
-              "additionalProperties": {
-                "type": "string"
-              },
-              "type": "object"
-            },
-            "title": "Failure Reason Catalog",
-            "type": "object"
-          },
-          "graph_edges": {
-            "title": "Graph Edges",
-            "type": "integer"
-          },
-          "graph_nodes": {
-            "title": "Graph Nodes",
-            "type": "integer"
-          },
-          "indexed": {
-            "title": "Indexed",
-            "type": "integer"
-          },
-          "ingest_notices": {
-            "default": [],
-            "items": {
-              "$ref": "#/components/schemas/IngestNotice"
-            },
-            "title": "Ingest Notices",
-            "type": "array"
-          },
-          "last_run_blocked": {
-            "items": {
-              "$ref": "#/components/schemas/IngestBlockedDoc"
-            },
-            "title": "Last Run Blocked",
-            "type": "array"
-          },
-          "last_run_flags_total": {
-            "title": "Last Run Flags Total",
-            "type": "integer"
-          },
-          "last_run_flags_truncated": {
-            "title": "Last Run Flags Truncated",
-            "type": "boolean"
-          },
-          "last_run_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Last Run Id"
-          },
-          "last_run_status": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Last Run Status"
-          },
-          "last_run_warnings": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Last Run Warnings",
-            "type": "array"
-          },
-          "office_failed": {
-            "title": "Office Failed",
-            "type": "integer"
-          },
-          "office_md": {
-            "title": "Office Md",
-            "type": "integer"
-          },
-          "partial_extraction_advice": {
-            "title": "Partial Extraction Advice",
-            "type": "string"
-          },
-          "partial_extraction_suspected": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Partial Extraction Suspected"
-          },
-          "running_progress": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/RunProgress"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "scanned": {
-            "title": "Scanned",
-            "type": "integer"
-          },
-          "sensitive_excluded": {
-            "title": "Sensitive Excluded",
-            "type": "integer"
-          },
-          "skipped_ext": {
-            "additionalProperties": {
-              "type": "integer"
-            },
-            "title": "Skipped Ext",
-            "type": "object"
-          },
-          "skipped_office": {
-            "title": "Skipped Office",
-            "type": "integer"
-          },
-          "skipped_other": {
-            "title": "Skipped Other",
-            "type": "integer"
-          },
-          "stage_summary": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Stage Summary"
-          },
-          "unreachable_as_text": {
-            "title": "Unreachable As Text",
-            "type": "integer"
-          },
-          "unreachable_as_text_by_ext": {
-            "additionalProperties": {
-              "type": "integer"
-            },
-            "title": "Unreachable As Text By Ext",
-            "type": "object"
-          },
-          "unreachable_by_reason": {
-            "additionalProperties": {
-              "type": "integer"
-            },
-            "title": "Unreachable By Reason",
-            "type": "object"
-          },
-          "unreadable": {
-            "title": "Unreadable",
-            "type": "integer"
-          },
-          "walk_skipped": {
-            "additionalProperties": {
-              "type": "integer"
-            },
-            "default": {},
-            "title": "Walk Skipped",
-            "type": "object"
-          }
-        },
-        "required": [
-          "scanned",
-          "indexed",
-          "by_doctype",
-          "office_md",
-          "skipped_office",
-          "office_failed",
-          "skipped_other",
-          "skipped_ext",
-          "analyzer_declined",
-          "analyzer_declined_as_document",
-          "unreadable",
-          "sensitive_excluded",
-          "unreachable_as_text",
-          "unreachable_as_text_by_ext",
-          "unreachable_by_reason",
-          "encoding_partial_count",
-          "counts_as_of",
-          "graph_nodes",
-          "graph_edges",
-          "es_chunks",
-          "es_state",
-          "es_error",
-          "es_index_kept",
-          "last_run_id",
-          "last_run_status",
-          "last_run_warnings",
-          "last_run_blocked",
-          "last_run_flags_total",
-          "last_run_flags_truncated",
-          "failed_files",
-          "partial_extraction_suspected",
-          "stage_summary",
-          "running_progress",
-          "failure_reason_catalog",
-          "partial_extraction_advice"
-        ],
-        "title": "IngestSummaryFields",
-        "type": "object"
-      },
       "LoginReq": {
         "properties": {
           "password": {
@@ -4435,6 +4132,17 @@
               }
             ],
             "title": "Done"
+          },
+          "rel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rel"
           },
           "stage": {
             "title": "Stage",
@@ -8119,7 +7827,7 @@
         "type": "object"
       },
       "WorldIngestAcceptedResponse": {
-        "description": "取り込み操作の受付結果（POST /worlds・POST /worlds/{wid}/refresh・DELETE /worlds/{wid}・POST /worlds/{wid}/rebind・POST /ingest/rerun。HTTP 202）。\n\n本体処理は背景で継続し、この応答は「受け付けた」ことだけを示す。`run_id` は受付時点で必ず判明している（非 null）。\n`joined=True` は多重クリック制御（操作種別＋正規化 payload の一致）により新規実行せず既存 run へ合流した場合（不一致なら 409）。\n進捗・結果は `GET /worlds/{wid}/status` で確認する（削除成功後は 404）。",
+        "description": "取り込み操作の受付結果（POST /worlds・POST /worlds/{wid}/refresh・POST /worlds/{wid}/reconvert・DELETE /worlds/{wid}・POST /worlds/{wid}/rebind・POST /ingest/rerun。HTTP 202）。\n\n本体処理は背景で継続し、この応答は「受け付けた」ことだけを示す。`run_id` は受付時点で必ず判明している（非 null）。\n`joined=True` は多重クリック制御（操作種別＋正規化 payload の一致）により新規実行せず既存 run へ合流した場合（不一致なら 409）。\n進捗・結果は `GET /worlds/{wid}/status` で確認する（削除成功後は 404）。",
         "properties": {
           "joined": {
             "title": "Joined",
@@ -8175,67 +7883,6 @@
           "labels"
         ],
         "title": "WorldOptionsResponse",
-        "type": "object"
-      },
-      "WorldReconvertResponse": {
-        "description": "1ファイルの再変換（POST /worlds/{wid}/reconvert）。旧形式変換キャッシュを落として world 全体を sync する（同期）。`summary` は取り込み状況をネストする。",
-        "properties": {
-          "changed": {
-            "title": "Changed",
-            "type": "boolean"
-          },
-          "flags": {
-            "items": {},
-            "title": "Flags",
-            "type": "array"
-          },
-          "ledger": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Ledger"
-          },
-          "note": {
-            "title": "Note",
-            "type": "string"
-          },
-          "ok": {
-            "title": "Ok",
-            "type": "boolean"
-          },
-          "rel": {
-            "title": "Rel",
-            "type": "string"
-          },
-          "status": {
-            "title": "Status",
-            "type": "string"
-          },
-          "summary": {
-            "$ref": "#/components/schemas/IngestSummaryFields"
-          },
-          "world_id": {
-            "title": "World Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "ok",
-          "world_id",
-          "rel",
-          "changed",
-          "status",
-          "ledger",
-          "flags",
-          "summary",
-          "note"
-        ],
-        "title": "WorldReconvertResponse",
         "type": "object"
       },
       "WorldRecountResponse": {
@@ -14848,7 +14495,7 @@
     },
     "/worlds/{wid}/reconvert": {
       "post": {
-        "description": "1 ファイルの変換をやり直す（失敗一覧の「再変換」ボタン）。\n対象の確認・旧形式変換キャッシュの削除・world 全体の作り直しを、同じ world のロックを持ったまま続けて行う。キャッシュを削除できなければ 503、参照元が消えていても 503 を返す。",
+        "description": "失敗した資料を 1 ファイルだけ変換し直すことを即受付する（失敗一覧の「再変換」ボタン・背景実行）。\n受付前に資料フォルダ（404）・参照元（503）・原本（404）・変換の対象か（422）・失敗の一覧にあるか（無ければ 409）を確かめる。同じファイルの多重クリックは既存 run へ合流し、\n同じ資料フォルダで別の処理（取り込み・更新・別のファイルの再変換など）が実行中なら 409。進み具合は `GET /worlds/{wid}/status` で確認する。\n設計: docs/design/rag.md「失敗した資料のやり直し」",
         "operationId": "world_reconvert_worlds__wid__reconvert_post",
         "parameters": [
           {
@@ -14872,11 +14519,11 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/WorldReconvertResponse"
+                  "$ref": "#/components/schemas/WorldIngestAcceptedResponse"
                 }
               }
             },

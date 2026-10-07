@@ -88,10 +88,15 @@ from .usage import (
 # usage_events（チャット以外の LLM 呼び出し計測）を re-export する。`sherpa/metering.py` は `sherpa.store.usage_events` を直接 import する。
 from .usage_events import add_usage_event  # noqa: F401
 
+# failed_docs の re-export。
+from .failed_docs import (  # noqa: F401
+    clear_failed_docs, list_failed_docs, record_failed_doc, remove_failed_doc, replace_failed_docs,
+)
+
 # documents・ingest の re-export。
 from .documents import (  # noqa: F401
-    count_documents, document_exists, list_document_worlds, list_documents,
-    list_documents_page, replace_documents,
+    count_documents, document_exists, get_document, list_document_worlds, list_documents,
+    list_documents_page, replace_document, replace_documents,
 )
 from .ingest import (  # noqa: F401
     add_ingest_run,
