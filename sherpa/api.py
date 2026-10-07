@@ -36,6 +36,7 @@ from sherpa.routers import (
     audit_usage,
     chat,
     conversations,
+    feedback_admin,
     graph,
     impact,
     improvement_log,
@@ -151,6 +152,9 @@ app.include_router(audit_usage.audit_usage_router)
 
 
 app.include_router(improvement_log.improvement_log_router)
+
+
+app.include_router(feedback_admin.feedback_admin_router)
 
 
 app.include_router(shares.router)

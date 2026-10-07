@@ -217,6 +217,7 @@ from .feedback import (
     MESSAGE_FEEDBACK_TAGS,
     get_feedback_by_message_ids,
     get_feedback_by_message_ids_for_user,
+    list_feedback_turns,
     upsert_message_feedback,
 )  # noqa: F401
 # turn_metrics（集計専用の細い写像表）の公開関数を re-export する。

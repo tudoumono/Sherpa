@@ -32,6 +32,101 @@
         "title": "AdminAuditListResponse",
         "type": "object"
       },
+      "AdminFeedbackItemsResponse": {
+        "description": "評価の一覧（GET /admin/feedback/items）。",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/FeedbackItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_before": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Before"
+          }
+        },
+        "required": [
+          "items",
+          "next_before"
+        ],
+        "title": "AdminFeedbackItemsResponse",
+        "type": "object"
+      },
+      "AdminFeedbackSummaryResponse": {
+        "description": "評価の集計（GET /admin/feedback/summary）。",
+        "properties": {
+          "by_mode": {
+            "items": {
+              "$ref": "#/components/schemas/FeedbackModeCount"
+            },
+            "title": "By Mode",
+            "type": "array"
+          },
+          "by_provider": {
+            "items": {
+              "$ref": "#/components/schemas/FeedbackProviderCount"
+            },
+            "title": "By Provider",
+            "type": "array"
+          },
+          "daily": {
+            "items": {
+              "$ref": "#/components/schemas/FeedbackDailyCount"
+            },
+            "title": "Daily",
+            "type": "array"
+          },
+          "down": {
+            "title": "Down",
+            "type": "integer"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          },
+          "rated": {
+            "title": "Rated",
+            "type": "integer"
+          },
+          "tags": {
+            "items": {
+              "$ref": "#/components/schemas/FeedbackTagCount"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "up": {
+            "title": "Up",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rated",
+          "up",
+          "down",
+          "tags",
+          "by_mode",
+          "by_provider",
+          "daily"
+        ],
+        "title": "AdminFeedbackSummaryResponse",
+        "type": "object"
+      },
       "AdminUsageQualityRunAck": {
         "properties": {
           "inserted": {
@@ -2968,6 +3063,234 @@
           "capabilities"
         ],
         "title": "ExtWorldInfo",
+        "type": "object"
+      },
+      "FeedbackDailyCount": {
+        "properties": {
+          "date": {
+            "title": "Date",
+            "type": "string"
+          },
+          "down": {
+            "title": "Down",
+            "type": "integer"
+          },
+          "up": {
+            "title": "Up",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "date",
+          "up",
+          "down"
+        ],
+        "title": "FeedbackDailyCount",
+        "type": "object"
+      },
+      "FeedbackItem": {
+        "properties": {
+          "comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment"
+          },
+          "completion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "question_head": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Question Head"
+          },
+          "rating": {
+            "enum": [
+              "up",
+              "down"
+            ],
+            "title": "Rating",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "user": {
+            "$ref": "#/components/schemas/FeedbackItemUser"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "user",
+          "rating",
+          "tags",
+          "comment",
+          "question_head",
+          "mode",
+          "provider",
+          "completion",
+          "duration_ms"
+        ],
+        "title": "FeedbackItem",
+        "type": "object"
+      },
+      "FeedbackItemUser": {
+        "properties": {
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "uid",
+          "display_name"
+        ],
+        "title": "FeedbackItemUser",
+        "type": "object"
+      },
+      "FeedbackModeCount": {
+        "properties": {
+          "down": {
+            "title": "Down",
+            "type": "integer"
+          },
+          "mode": {
+            "title": "Mode",
+            "type": "string"
+          },
+          "up": {
+            "title": "Up",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mode",
+          "up",
+          "down"
+        ],
+        "title": "FeedbackModeCount",
+        "type": "object"
+      },
+      "FeedbackProviderCount": {
+        "properties": {
+          "down": {
+            "title": "Down",
+            "type": "integer"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "up": {
+            "title": "Up",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "provider",
+          "up",
+          "down"
+        ],
+        "title": "FeedbackProviderCount",
+        "type": "object"
+      },
+      "FeedbackTagCount": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "down": {
+            "title": "Down",
+            "type": "integer"
+          },
+          "tag": {
+            "title": "Tag",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag",
+          "count",
+          "down"
+        ],
+        "title": "FeedbackTagCount",
         "type": "object"
       },
       "FsEntry": {
@@ -9380,6 +9703,154 @@
         "summary": " Admin Es Search Endpoint",
         "tags": [
           "文書"
+        ]
+      }
+    },
+    "/admin/feedback/items": {
+      "get": {
+        "description": "期間内の評価を新しい順に返す（管理者のみ）。閲覧のたびに監査へ残し（件数と絞り込み条件だけ）、記録できなければ返さない（500）。",
+        "operationId": "admin_feedback_items_admin_feedback_items_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "maximum": 365,
+              "minimum": 1,
+              "title": "Days",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "rating",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "pattern": "^(all|up|down)$",
+              "title": "Rating",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tag"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminFeedbackItemsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Feedback Items",
+        "tags": [
+          "管理者:回答への評価"
+        ]
+      }
+    },
+    "/admin/feedback/summary": {
+      "get": {
+        "description": "期間内の評価の集計（管理者のみ）。母集団は改善ログの書き出しと同じ。",
+        "operationId": "admin_feedback_summary_admin_feedback_summary_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "maximum": 365,
+              "minimum": 1,
+              "title": "Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminFeedbackSummaryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Feedback Summary",
+        "tags": [
+          "管理者:回答への評価"
         ]
       }
     },

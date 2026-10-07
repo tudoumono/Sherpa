@@ -175,6 +175,7 @@
         <div class="tab-group-title tab-group-operations" role="presentation">運用・管理</div>
         <button class="tab-btn" type="button" role="tab" data-tab="users" aria-selected="false" id="tab-btn-users" title="利用者の追加・無効化・権限の変更。" aria-controls="tabpanel-users" tabindex="-1">ユーザー管理</button>
         <button class="tab-btn" type="button" role="tab" data-tab="usage-page" aria-selected="false" id="tab-btn-usage-page" title="利用の傾向・トークンの集計。" aria-controls="tabpanel-usage-page" tabindex="-1">利用統計</button>
+        <button class="tab-btn" type="button" role="tab" data-tab="feedback" aria-selected="false" id="tab-btn-feedback" title="利用者が回答に付けた 👍👎・理由・一言。" aria-controls="tabpanel-feedback" tabindex="-1">回答への評価</button>
         <button class="tab-btn" type="button" role="tab" data-tab="audit" aria-selected="false" id="tab-btn-audit" title="誰が・いつ・何をしたかの記録。" aria-controls="tabpanel-audit" tabindex="-1">監査ログ</button>
         <button class="tab-btn" type="button" role="tab" data-tab="status" aria-selected="false" id="tab-btn-status" title="各サービス（DB・検索・AI）の稼働状況。" aria-controls="tabpanel-status" tabindex="-1">システム状態</button>
       </div>
@@ -670,6 +671,9 @@
       </div>
       <div class="tabpanel tabpanel-embed" id="tabpanel-usage-page" data-tabpanel="usage-page" role="tabpanel" aria-labelledby="tab-btn-usage-page" tabindex="0" hidden>
         <iframe class="embed-frame" id="embed-frame-usage-page" title="利用統計" data-src="usage.html?embed=1"></iframe>
+      </div>
+      <div class="tabpanel tabpanel-embed" id="tabpanel-feedback" data-tabpanel="feedback" role="tabpanel" aria-labelledby="tab-btn-feedback" tabindex="0" hidden>
+        <iframe class="embed-frame" id="embed-frame-feedback" title="回答への評価" data-src="feedback.html?embed=1"></iframe>
       </div>
       <div class="tabpanel tabpanel-embed" id="tabpanel-audit" data-tabpanel="audit" role="tabpanel" aria-labelledby="tab-btn-audit" tabindex="0" hidden>
         <iframe class="embed-frame" id="embed-frame-audit" title="監査ログ" data-src="audit.html?embed=1"></iframe>

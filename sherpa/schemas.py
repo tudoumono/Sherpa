@@ -1509,3 +1509,67 @@ class ChatTurnRunning(BaseModel):
 class ChatTurnsRunningResponse(BaseModel):
     turns: list[ChatTurnRunning]
 
+
+
+# ===== 回答への評価（sherpa/routers/feedback_admin.py） =====
+
+class FeedbackTagCount(BaseModel):
+    tag: str
+    count: int
+    down: int
+
+
+class FeedbackModeCount(BaseModel):
+    mode: str
+    up: int
+    down: int
+
+
+class FeedbackProviderCount(BaseModel):
+    provider: str
+    up: int
+    down: int
+
+
+class FeedbackDailyCount(BaseModel):
+    date: str
+    up: int
+    down: int
+
+
+class AdminFeedbackSummaryResponse(BaseModel):
+    """評価の集計（GET /admin/feedback/summary）。"""
+    rated: int
+    up: int
+    down: int
+    truncated: bool = False
+    max_rows: int = 0
+    tags: list[FeedbackTagCount]
+    by_mode: list[FeedbackModeCount]
+    by_provider: list[FeedbackProviderCount]
+    daily: list[FeedbackDailyCount]
+
+
+class FeedbackItemUser(BaseModel):
+    uid: str
+    display_name: str | None
+
+
+class FeedbackItem(BaseModel):
+    id: int
+    created_at: WireDateTime
+    user: FeedbackItemUser
+    rating: Literal["up", "down"]
+    tags: list[str]
+    comment: str | None
+    question_head: str | None
+    mode: str | None
+    provider: str | None
+    completion: str | None
+    duration_ms: int | None
+
+
+class AdminFeedbackItemsResponse(BaseModel):
+    """評価の一覧（GET /admin/feedback/items）。"""
+    items: list[FeedbackItem]
+    next_before: int | None

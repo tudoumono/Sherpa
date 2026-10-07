@@ -55,3 +55,48 @@ def get_feedback_by_message_ids_for_user(ids: list[int], user_id: str) -> dict[i
             (list(ids), user_id),
         ).fetchall()
     return {r["message_id"]: r for r in rows}
+
+
+def list_feedback_turns(*, time_from, before_id: int | None, limit: int,
+                        rating: str | None = None, tag: str | None = None) -> list[dict]:
+    """管理者の評価画面用: `time_from` 以降に付いたフィードバックを、対象の回答・質問と一緒に新しい順（フィードバック id 降順）で返す。
+
+    `before_id` 指定時はそれより小さい id のみ。質問の対応付け・論理削除済み会話と共有の複製の除外は `list_export_messages` と同じ
+    （`chat.turn` 監査で対応付けられないターンは除く）。個人由来の判定は呼び出し側が行う。
+    """
+    _ensure()
+    where = ["f.created_at >= %s", "m.role = 'assistant'",
+             "c.origin <> 'sanitized_snapshot'", "c.deleted_at IS NULL"]
+    params: list = [time_from]
+    if before_id is not None:
+        where.append("f.id < %s")
+        params.append(before_id)
+    if rating is not None:
+        where.append("f.rating = %s")
+        params.append(rating)
+    if tag is not None:
+        where.append("%s = ANY(f.tags)")
+        params.append(tag)
+    params.append(limit)
+    with _connect() as c:
+        return c.execute(
+            "SELECT f.id AS feedback_id, f.user_id AS feedback_user_id, f.rating, f.tags, f.comment, "
+            "  f.created_at AS feedback_created_at, usr.display_name AS feedback_user_name, "
+            "  m.id, m.conversation_id, m.created_at, m.content, m.trace, m.answer, m.personal, m.lens, "
+            "  u.content AS question, u.personal AS question_personal, u.answer AS question_answer "
+            "FROM message_feedback f "
+            "JOIN messages m ON m.id = f.message_id "
+            "JOIN conversations c ON c.id = m.conversation_id "
+            "JOIN LATERAL ( "
+            "  SELECT (a.detail->>'message_id_user')::integer AS uid "
+            "  FROM audit_log a "
+            "  WHERE a.action = 'chat.turn' "
+            "    AND (a.detail->>'message_id_assistant')::integer = m.id "
+            "  ORDER BY a.id DESC LIMIT 1 "
+            ") au ON true "
+            "JOIN messages u ON u.id = au.uid "
+            "LEFT JOIN users usr ON usr.uid = f.user_id "
+            "WHERE " + " AND ".join(where) + " "
+            "ORDER BY f.id DESC LIMIT %s",
+            params,
+        ).fetchall()

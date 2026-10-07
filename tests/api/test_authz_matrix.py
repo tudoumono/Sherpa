@@ -115,6 +115,8 @@ POLICY: dict[tuple[str, str], str] = {
     ("GET", "/admin/usage/export"): "admin",
     ("POST", "/admin/usage/quality-runs"): "admin",
     ("GET", "/admin/improvement-log/export"): "admin",
+    ("GET", "/admin/feedback/summary"): "admin",
+    ("GET", "/admin/feedback/items"): "admin",
     ("GET", "/admin/settings"): "admin",
     ("PUT", "/admin/settings"): "admin",
     ("POST", "/admin/settings/openai-endpoint-test"): "admin",
@@ -348,7 +350,8 @@ def test_policy_covers_all_routes():
     # admin=ユーザーの CSV 一括追加（POST /admin/users/import）1件追加で41。
     # admin=GET /worlds/{wid}/diff の撤去で40。
     # admin=資料フォルダの解決範囲の設定（GET/PUT /worlds/{wid}/resolve-settings）2件追加で42。
-    assert len(ADMIN_ROUTES) == 42
+    # admin=回答への評価（GET /admin/feedback/summary・GET /admin/feedback/items）2件追加で44。
+    assert len(ADMIN_ROUTES) == 44
     # ext_key=旧6＋Codex ジョブ API 4本（受付・状態・結果・取消・`C-EXT-CODEXJOB-*`）で10。
     assert len(EXT_KEY_ROUTES) == 10
     assert len(SPECIAL_ROUTES) == 7

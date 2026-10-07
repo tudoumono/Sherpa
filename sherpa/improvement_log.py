@@ -283,3 +283,104 @@ def fetch_export_rows(*, time_from, output_cap: int) -> tuple[list[dict], bool]:
             return rows, False
 
 
+
+
+# 評価画面（`routers/feedback_admin.py`）が使う。母集団は改善ログの書き出しと同じ除外（個人由来・共有の複製・削除済み会話）。
+# 設計: docs/design/usage.md「回答への評価（管理者の画面）」
+FEEDBACK_SUMMARY_MAX_ROWS = 50_000
+_FEEDBACK_PAGE = 500
+
+
+def turn_mode(answer: dict, lens: str | None = None) -> str | None:
+    """回答の調べ方。`how.mode`（investigate/author）があればそれ、無ければ保存済みの lens。"""
+    from sherpa import answer_shape
+    how = answer_shape.how_of(answer)
+    if how is not None:
+        return how["mode"]
+    return answer.get("lens") or (answer.get("route") or {}).get("lens") or lens
+
+
+def _iter_feedback_turns(*, time_from, before_id, rating, tag):
+    """個人由来を除いたフィードバック行を新しい順に流す（ページ単位で取得）。"""
+    from sherpa import store
+    cursor = before_id
+    while True:
+        batch = store.list_feedback_turns(time_from=time_from, before_id=cursor, limit=_FEEDBACK_PAGE,
+                                          rating=rating, tag=tag)
+        if not batch:
+            return
+        for r in batch:
+            if not is_export_row_personal_tainted(r):
+                yield r
+        cursor = batch[-1]["feedback_id"]
+        if len(batch) < _FEEDBACK_PAGE:
+            return
+
+
+def build_feedback_item(row: dict) -> dict:
+    """フィードバック1行 → 一覧の1件。会話の id・回答の本文・出典は含めない。"""
+    export = build_export_row(row, feedback=None)
+    answer = row.get("answer") or {}
+    return {
+        "id": row["feedback_id"],
+        "created_at": row["feedback_created_at"],
+        "user": {"uid": row["feedback_user_id"], "display_name": row.get("feedback_user_name")},
+        "rating": row["rating"],
+        "tags": list(row.get("tags") or []),
+        "comment": row.get("comment"),
+        "question_head": export["question_head"],
+        "mode": turn_mode(answer, row.get("lens")),
+        "provider": export["provider"],
+        "completion": answer.get("completion") if isinstance(answer.get("completion"), str) else None,
+        "duration_ms": export["duration_ms"],
+    }
+
+
+def fetch_feedback_items(*, time_from, rating, tag, before_id, limit: int) -> tuple[list[dict], int | None]:
+    """一覧用: `(items, next_before)`。続きが無ければ `next_before` は None。"""
+    rows = []
+    for r in _iter_feedback_turns(time_from=time_from, before_id=before_id, rating=rating, tag=tag):
+        rows.append(r)
+        if len(rows) > limit:
+            break
+    more = len(rows) > limit
+    items = [build_feedback_item(r) for r in rows[:limit]]
+    return items, (items[-1]["id"] if more and items else None)
+
+
+def summarize_feedback(*, time_from) -> dict:
+    """集計用: 評価の数・タグ・調べ方・AI・日ごとの 👍👎。"""
+    from datetime import timedelta, timezone
+    jst = timezone(timedelta(hours=9))
+    up = down = 0
+    tags: dict[str, list[int]] = {}
+    by_mode: dict[str, list[int]] = {}
+    by_provider: dict[str, list[int]] = {}
+    daily: dict[str, list[int]] = {}
+    truncated = False
+    for n, r in enumerate(_iter_feedback_turns(time_from=time_from, before_id=None, rating=None, tag=None)):
+        if n >= FEEDBACK_SUMMARY_MAX_ROWS:
+            truncated = True
+            break
+        i = 0 if r["rating"] == "up" else 1
+        if i == 0:
+            up += 1
+        else:
+            down += 1
+        answer = r.get("answer") or {}
+        usage = answer.get("usage") or {}
+        for t in r.get("tags") or []:
+            tags.setdefault(t, [0, 0])[0] += 1
+            tags[t][1] += i
+        by_mode.setdefault(turn_mode(answer, r.get("lens")) or "unknown", [0, 0])[i] += 1
+        by_provider.setdefault(usage.get("provider") or "unknown", [0, 0])[i] += 1
+        day = r["feedback_created_at"].astimezone(jst).strftime("%Y-%m-%d")
+        daily.setdefault(day, [0, 0])[i] += 1
+    return {
+        "rated": up + down, "up": up, "down": down, "truncated": truncated,
+        "max_rows": FEEDBACK_SUMMARY_MAX_ROWS,
+        "tags": [{"tag": t, "count": v[0], "down": v[1]} for t, v in sorted(tags.items())],
+        "by_mode": [{"mode": k, "up": v[0], "down": v[1]} for k, v in sorted(by_mode.items())],
+        "by_provider": [{"provider": k, "up": v[0], "down": v[1]} for k, v in sorted(by_provider.items())],
+        "daily": [{"date": k, "up": v[0], "down": v[1]} for k, v in sorted(daily.items())],
+    }

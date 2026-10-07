@@ -1957,7 +1957,7 @@ if (_chatExamplesReset) _chatExamplesReset.addEventListener('click', async () =>
 // ===== タブ切り替え（URL ハッシュで記憶）・未保存タブの丸印 =====
 const TAB_KEYS = ['provider', 'research', 'models', 'ingest', 'extkeys'];
 // 埋め込みタブ（管理系ページを iframe で表示）。保存対象がないため TAB_DIRTY を持たず、切替に未保存確認は挟まない。
-const EMBED_TAB_KEYS = ['users', 'usage-page', 'audit', 'status'];
+const EMBED_TAB_KEYS = ['users', 'usage-page', 'feedback', 'audit', 'status'];
 const ALL_TAB_KEYS = TAB_KEYS.concat(EMBED_TAB_KEYS);
 function activateTab(tabKey, opts) {
   if (tabKey === 'agentic-budget-card') {

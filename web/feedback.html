@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — 回答への評価</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  .wrap2{max-width:none;margin:0}
+  /* システム管理のタブから iframe（?embed=1）で開かれた時だけ、共通トップバー/ナビを隠す（feedback.js 冒頭が判定）。 */
+  .embedded .topbar,.embedded nav{display:none}
+  .embedded .wrap{padding-top:8px}
+  .period-bar{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+  .period-bar .lbl{font-size:var(--text-small);color:var(--ink-3)}
+  .period-bar .spacer{flex:1}
+  table{width:100%;border-collapse:collapse;font-size:var(--text-label)}
+  th{text-align:left;font-size:var(--text-small);font-weight:600;color:var(--ink-3);padding:8px 10px;
+    border-bottom:2px solid var(--border);white-space:nowrap}
+  td{padding:8px 10px;border-bottom:1px solid var(--border);color:var(--ink);vertical-align:top;overflow-wrap:anywhere}
+  td.nw{white-space:nowrap}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  .empty-row td{text-align:center;color:var(--ink-3);padding:24px}
+  #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0}
+  @media(max-width:720px){.grid2{grid-template-columns:1fr}}
+  .card.pad{padding:14px 16px}
+  .card-title{font-size:var(--text-small);font-weight:700;color:var(--ink-2);margin-bottom:8px}
+  .up{color:var(--ok)} .down{color:var(--danger)}
+  .tagchip{display:inline-block;font-size:var(--text-caption);background:var(--surface-2);border:1px solid var(--border);
+    border-radius:999px;padding:1px 8px;margin:1px 4px 1px 0;color:var(--ink-2);white-space:nowrap}
+  .dailybars{display:flex;align-items:flex-end;gap:2px;height:80px}
+  .dailybars .day{flex:1;min-width:2px;display:flex;flex-direction:column;justify-content:flex-end;height:100%}
+  .dailybars .seg-up{background:var(--ok)} .dailybars .seg-down{background:var(--danger)}
+  .filters{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:20px 0 10px}
+  .filters select{font-size:var(--text-small);padding:4px 8px;border:1px solid var(--control-border);
+    border-radius:var(--radius);background:var(--surface);color:var(--ink)}
+  a.btn-ghost{display:inline-flex;align-items:center;text-decoration:none}
+  .more-row{text-align:center;margin-top:12px}
+  #load-status{font-size:var(--text-small);color:var(--ink-2)}
+</style>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div class="wrap">
+  <div id="access-denied">
+    <div style="font-size:32px;margin-bottom:12px">🚫</div>
+    <div style="font-size:var(--text-body);font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:var(--text-label)">管理者権限が必要です。</div>
+  </div>
+  <div id="main-content">
+    <div class="pagehead">
+      <div>
+        <a class="crumb" href="admin-settings.html">← システム管理</a>
+        <h1>回答への評価</h1>
+        <div class="sub">利用者が回答に付けた 👍👎・理由・一言を集めて見られます。会話そのものは開けません。</div>
+      </div>
+    </div>
+
+    <div class="wrap2">
+      <div class="period-bar" role="group" aria-label="集計期間">
+        <span class="lbl">期間</span>
+        <button type="button" class="filterchip" data-days="7">7日</button>
+        <button type="button" class="filterchip on" data-days="30">30日</button>
+        <button type="button" class="filterchip" data-days="90">90日</button>
+        <span class="spacer"></span>
+        <a class="btn-ghost" id="export-csv" href="#" download>CSVで保存</a>
+        <a class="btn-ghost" id="export-jsonl" href="#" download>JSONLで保存</a>
+      </div>
+      <p id="load-status" role="status" aria-live="polite">読み込んでいます…</p>
+
+      <div class="card">
+        <div class="summary">
+          <div class="sumcell"><div class="n" id="t-rated">—</div><div class="l">評価の数</div></div>
+          <div class="sumcell"><div class="n up" id="t-up">—</div><div class="l">👍 役に立った</div></div>
+          <div class="sumcell"><div class="n down" id="t-down">—</div><div class="l">👎 役に立たなかった</div></div>
+          <div class="sumcell"><div class="n" id="t-rate">—</div><div class="l">👎 の割合</div></div>
+        </div>
+        <div class="hint" id="trunc-note" hidden></div>
+      </div>
+
+      <div class="grid2">
+        <div class="card pad"><div class="card-title">理由のタグ（件数と、そのうち 👎）</div><div id="tags-box"></div></div>
+        <div class="card pad"><div class="card-title">日ごとの 👍👎</div><div id="daily-box"></div></div>
+        <div class="card pad"><div class="card-title">調べ方ごと</div><div id="mode-box"></div></div>
+        <div class="card pad"><div class="card-title">AI ごと</div><div id="provider-box"></div></div>
+      </div>
+
+      <h2 style="font-size:var(--text-body);margin:24px 0 0">一覧</h2>
+      <div class="filters">
+        <label class="hint" for="f-rating">評価</label>
+        <select id="f-rating">
+          <option value="all">すべて</option>
+          <option value="down">👎 だけ</option>
+          <option value="up">👍 だけ</option>
+        </select>
+        <label class="hint" for="f-tag">理由のタグ</label>
+        <select id="f-tag">
+          <option value="">指定なし</option>
+          <option value="wrong_evidence">根拠が違う</option>
+          <option value="incomplete">足りない</option>
+          <option value="outdated">古い版</option>
+          <option value="slow">遅い</option>
+        </select>
+      </div>
+      <div class="card" style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr><th>日時</th><th>利用者</th><th>評価</th><th>理由のタグ</th><th>一言</th><th>質問の先頭</th>
+              <th>調べ方</th><th>AI</th><th>完了状態</th><th class="num">所要時間</th></tr>
+          </thead>
+          <tbody id="items-tbody"></tbody>
+        </table>
+      </div>
+      <div class="more-row"><button type="button" class="btn-ghost" id="more-btn" hidden>さらに読み込む</button></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="feedback.js"></script>
+</body>
+</html>
