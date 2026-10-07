@@ -397,6 +397,8 @@ def test_package_version_file_carries_commit_once(tmp_path: Path):
 
 
 def test_export_public_version_is_version_only(tmp_path: Path):
+    if not (ROOT / "scripts" / "export_public.sh").is_file():
+        pytest.skip("公開の書き出しのスクリプトは内部リポだけにある")
     dest = tmp_path / "public"
     (dest / ".git").mkdir(parents=True)
     r = subprocess.run(["bash", str(ROOT / "scripts" / "export_public.sh"), str(dest)], capture_output=True, text=True, timeout=300)
@@ -408,6 +410,8 @@ def test_export_public_version_is_version_only(tmp_path: Path):
 
 
 def test_publish_public_commit_records_content_commit_in_version(tmp_path: Path):
+    if not (ROOT / "scripts" / "publish_public_commit.sh").is_file():
+        pytest.skip("公開のコミットのスクリプトは内部リポだけにある")
     repo = tmp_path / "pub"
     repo.mkdir()
     def git(*a):
