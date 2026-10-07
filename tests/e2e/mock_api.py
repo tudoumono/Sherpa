@@ -84,6 +84,8 @@ PREVIEW = {
     # 実 API（doc_ledger.control_diagnostics 経由）は importance_diagnostics も常に持つ
     # （`_重要度.txt` の構文診断・無ければ空リスト）。
     "world": "w1", "label": "4期更改", "issues": [], "importance_diagnostics": [],
+    # 資料の画面のツリー用のフォルダの一覧（資料の無いフォルダも含む）。
+    "folders": [], "folders_truncated": False,
     "counts": {"entities": 4, "relations": 3,
                "deprecated": 0, "hidden": 0, "documents": 3},
     # フェーズ7-1: 実 doc（doc_ledger.py::preview_documents）は phase/category/label/reason も常に持つ
@@ -898,6 +900,10 @@ USAGE_STATS_DEFAULT = {
          ]},
     ],
     # 内部制限の打ち切り分布（`InvestigationState.limits`・経路別・制限そのものは変えない計測専用）。
+    "tool_calls": {"turns": 0, "missing": 0, "tools": [], "nudged_turns": 0, "nudged_then_used": 0,
+                   "no_tool_use_turns": 0, "opened_docs": 0, "opened_unknown_turns": 0},
+    "impact": {"traced_turns": 0, "untraced_turns": 0, "candidate": 0, "inspected": 0, "used": 0,
+               "unmapped": 0, "more": 0, "hidden": 0},
     "limits": {
         "by_provider": [
             {"provider": "codex", "turns": 10,

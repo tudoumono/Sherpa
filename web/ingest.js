@@ -761,19 +761,31 @@ function inFolder(d) {                       // 範囲（フォルダ）絞り�
   return !_folder || d.folder === _folder || (d.folder || '').startsWith(_folder + '/');
 }
 
-function renderTree() {                       // 文書の folder からフォルダツリー（範囲）を作る
+// フォルダごとの資料の件数（配下すべて）。資料の無いフォルダ（`_pv.folders`）も 0 件で入れる。
+function folderCounts() {
   const docs = _pv ? _pv.documents : [];
   const counts = {};
+  for (const f of (_pv && Array.isArray(_pv.folders) ? _pv.folders : [])) {
+    let path = '';
+    for (const p of f.split('/').filter(Boolean)) { path = path ? path + '/' + p : p; if (!(path in counts)) counts[path] = 0; }
+  }
   for (const d of docs) {
     let path = '';
     for (const p of (d.folder || '').split('/').filter(Boolean)) { path = path ? path + '/' + p : p; counts[path] = (counts[path] || 0) + 1; }
   }
+  return counts;
+}
+
+function renderTree() {                       // フォルダツリー（範囲）を作る。資料の無いフォルダも出す
+  const docs = _pv ? _pv.documents : [];
+  const counts = folderCounts();
   let html = `<div class="tnode ${_folder === '' ? 'on' : ''}" data-folder="">📂 すべて<span class="tc">${docs.length}</span></div>`;
   for (const path of Object.keys(counts).sort()) {
     const depth = path.split('/').length - 1, name = path.split('/').pop();
     // フォルダは全て同列（common layer 概念は無い）。
     html += `<div class="tnode ${_folder === path ? 'on' : ''}" data-folder="${esc(path)}" style="padding-left:${8 + depth * 15}px">📁 ${esc(name)}<span class="tc">${counts[path]}</span></div>`;
   }
+  if (_pv && _pv.folders_truncated) html += '<div class="muted" style="font-size:var(--text-caption);padding:6px 8px">フォルダが多いため、資料の無いフォルダは一部だけ出しています</div>';
   $('tree').innerHTML = html;
 }
 
@@ -788,11 +800,34 @@ function render() {
   // 集計は3状態に寄せる: unreadable/unknown は行の表示は個別（`STATE.unreadable`/`STATE.unknown`）だが、集計上は failed の一種として数える。
   scoped.forEach((d) => { const b = isFailureState(d.state) ? 'failed' : d.state; n[b] = (n[b] || 0) + 1; });
   $('count').textContent = (_folder ? `範囲: ${_folder} ・ ` : '') + `使えます ${n.ready | 0} ・ 処理中 ${n.processing | 0} ・ 失敗 ${n.failed | 0}`;
-  $('rows').innerHTML = docs.map(row).join('')
-    || `<tr><td colspan="6"><div class="empty">該当する資料がありません</div></td></tr>`;
+  // 絞り込み（名前・種類・状態）が無いときは、エクスプローラーと同じく選んだフォルダの直下（フォルダ→資料）だけを出す。
+  // 絞り込みがあるときは、選んだフォルダより下の全部から探す。
+  const browsing = !_q && !_type && _state === 'all';
+  const shown = browsing ? docs.filter((d) => (d.folder || '') === _folder) : docs;
+  const subRows = browsing ? childFolders().map(folderRow).join('') : '';
+  $('rows').innerHTML = (subRows + shown.map(row).join(''))
+    || `<tr><td colspan="6"><div class="empty">${browsing ? 'このフォルダは空です' : '該当する資料がありません'}</div></td></tr>`;
   updateEsScope();
 }
 
+// 選んだフォルダの直下のフォルダ（`[パス, 配下の資料の件数]`・名前の順）。
+function childFolders() {
+  const counts = folderCounts();
+  const depth = _folder ? _folder.split('/').length : 0;
+  return Object.keys(counts).sort()
+    .filter((p) => p.split('/').length === depth + 1 && (!_folder || p.startsWith(_folder + '/')))
+    .map((p) => [p, counts[p]]);
+}
+function folderRow([path, n]) {
+  return `<tr class="folderrow" data-open-folder="${esc(path)}" style="cursor:pointer">
+    <td><span class="fname" title="${esc(path)}">📁 ${esc(shownName(path))}</span></td>
+    <td><span class="dtype">フォルダ</span></td>
+    <td class="muted">資料 ${n} 件</td>
+    <td class="muted">${esc(_folder)}</td>
+    <td></td>
+    <td><div class="rowact"><button class="mini" data-open-folder="${esc(path)}">開く</button></div></td>
+  </tr>`;
+}
 // 一覧の名前は、ツリーで選んだフォルダより下の部分だけを出す（全体のパスは title に残す）。
 function shownName(name) {
   return _folder && name.startsWith(_folder + '/') ? name.slice(_folder.length + 1) : name;
@@ -929,6 +964,13 @@ $('detailbtn').addEventListener('click', openPrev);
 $('esbtn').addEventListener('click', searchEs);
 $('esq').addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter') searchEs(); });
 $('rows').addEventListener('click', (e) => {
+  const of = e.target.closest('[data-open-folder]');
+  if (of) {                                                  // フォルダの行: そのフォルダを開く（ツリーで選ぶのと同じ）
+    _folder = of.dataset.openFolder; renderTree(); render();
+    if ($('esq').value.trim()) searchEs();
+    else $('eshits').innerHTML = '<div class="muted">検索語を入力してください</div>';
+    return;
+  }
   const dl = e.target.closest('[data-dl]'); if (dl) return download(dl.dataset.dl);
   const rr = e.target.closest('[data-rerun]'); if (rr) return rerun(rr.dataset.rerun);
 });

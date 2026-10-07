@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import threading
 from pathlib import Path
@@ -250,6 +251,37 @@ def graph_view(world=None, limit=None) -> dict:
             "truncated": truncated, "signature": bundle["signature"]}
 
 
+FOLDERS_MAX = 5000  # 資料の画面のツリーに出すフォルダの上限（超えたら `folders_truncated`）
+
+
+def list_folders(root) -> tuple[list[str], bool]:
+    """`root` 配下のフォルダ（中身が空のものも含む）の相対パスを並べて返す。戻り値は `(フォルダ, 上限で打ち切ったか)`。
+    シンボリックリンクは辿らない・名前が `.` で始まるフォルダは出さない・読めないフォルダは飛ばす。
+    """
+    root = Path(root)
+    out: list[str] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                entries = sorted((e for e in it), key=lambda e: e.name)
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink() or not e.is_dir(follow_symlinks=False) or e.name.startswith("."):
+                    continue
+            except OSError:
+                continue
+            if len(out) >= FOLDERS_MAX:
+                return sorted(out), True
+            p = Path(e.path)
+            out.append(p.relative_to(root).as_posix())
+            stack.append(p)
+    return sorted(out), False
+
+
 def build_preview(world: str | None = None) -> dict:
     """抽出プレビュー（読み取り専用）。エンティティ／関係／状態と件数サマリを返す。
     グラフ部分は `graph_view` と同じキャッシュを共有する。文書一覧・重要度解決・重要度診断はキャッシュせず毎回計算する。
@@ -266,12 +298,16 @@ def build_preview(world: str | None = None) -> dict:
         # 世代の `sig`（未登録は空文字）を重要度解決へ渡し、署名のための再走査を避ける
         preview_docs = doc_ledger.preview_documents(world, root=wd, files=files, sig=bundle["sig"] or None)
         diagnostics = doc_ledger.control_diagnostics(world, root=wd, files=files)
+        folders, folders_truncated = list_folders(wd)
     else:
         preview_docs, diagnostics = [], []
+        folders, folders_truncated = [], False
 
     return {"world": world, "label": worlds.world_label(world),
             "counts": _counts(bundle["raw_nodes"], bundle["raw_edges"], world, doc_count=len(preview_docs)),
             "documents": preview_docs,
+            # `folders`: 資料の画面のツリー用のフォルダの一覧（資料の無いフォルダも含む）
+            "folders": folders, "folders_truncated": folders_truncated,
             "issues": bundle["raw_flags"], "entities": entities, "relations": relations,
             # `importance_diagnostics`: 重要度設定ファイルの構文診断（`issues` はグラフ構築の警告で別物）
             "importance_diagnostics": diagnostics}
