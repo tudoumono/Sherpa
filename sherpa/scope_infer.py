@@ -8,6 +8,8 @@ import stat as stat_mod
 import time
 from pathlib import Path
 
+from .ingest import text_kind
+
 
 class ScopeWalkDeadlineExceeded(Exception):
     """`safe_files(deadline=...)` が走査中に期限を超えたことを示す。"""
@@ -136,6 +138,8 @@ def safe_files(root, *, strict: bool = False, deadline: float | None = None, als
                 if not is_vcs_dir_name(p.name):
                     stack.append(p)
             elif kind == "file":
+                if text_kind.is_noise(p.name, p.suffix.lower()):  # ロックファイル・一時ファイルは数えない（開いた・閉じたで署名を変えない）
+                    continue
                 try:
                     rp = p.resolve()
                 except OSError:
