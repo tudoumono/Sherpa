@@ -1447,7 +1447,66 @@ def _prst_geom(node: ET.Element, prefix: str, kind: str) -> str | None:
     return geom.get("prst") if geom is not None else None
 
 
+_GEOMETRY_WIDE_ROWS = 4096  # これより多くの行にまたがるセル範囲は行ごとの索引に入れず、いつも候補にする
+
+
+class _SheetGeometry:
+    """1 シートの cell・table 要素の矩形と、行ごとの索引（図形との幾何交差の候補を絞る）。
+
+    要素の並び（`builder.ir.elements` の順）をそのまま保ち、候補も元の並びの順で返す。
+    守ること: 作った後に同じシートの cell・table 要素が足されたら作り直す（`_xlsx_sheet_geometry`）。
+    """
+
+    def __init__(self, builder: _Builder, sheet_name: str) -> None:
+        self.built_len = len(builder.ir.elements)
+        self.cells: list[tuple[str, list[float]]] = []     # (element_id, rect)
+        self.tables_by_rect: dict[tuple[float, ...], list[tuple[str, list[float]]]] = {}
+        self._rows: dict[int, list[int]] = {}
+        self._wide: list[int] = []
+        for element in builder.ir.elements:
+            if element.locator.sheet != sheet_name or element.type not in ("cell", "table"):
+                continue
+            rect = _cell_rect(element.locator.cell_range)
+            if rect is None:
+                continue
+            if element.type == "table":
+                self.tables_by_rect.setdefault(tuple(rect), []).append((element.element_id, rect))
+                continue
+            pos = len(self.cells)
+            self.cells.append((element.element_id, rect))
+            lo, hi = int(rect[1]), int(rect[3])
+            if hi - lo > _GEOMETRY_WIDE_ROWS:
+                self._wide.append(pos)
+            else:
+                for row in range(lo, hi):
+                    self._rows.setdefault(row, []).append(pos)
+
+    def cells_near(self, rect: list[float]) -> list[tuple[str, list[float]]]:
+        """`rect` と行が重なりうる cell を、元の並びの順で返す（交差の判定は呼び出し側）。"""
+        lo, hi = int(rect[1]), int(rect[3])
+        if hi - lo > _GEOMETRY_WIDE_ROWS:
+            return self.cells
+        hits = set(self._wide)
+        for row in range(lo, hi):
+            hits.update(self._rows.get(row, ()))
+        return [self.cells[pos] for pos in sorted(hits)]
+
+
+def _xlsx_sheet_geometry(builder: _Builder, cache: dict[str, _SheetGeometry], sheet_name: str) -> _SheetGeometry:
+    """`sheet_name` の `_SheetGeometry` を返す。前回作った後に同じシートの cell・table 要素が足されていれば作り直す。"""
+    geometry = cache.get(sheet_name)
+    if geometry is not None:
+        added = builder.ir.elements[geometry.built_len:]
+        if not any(e.locator.sheet == sheet_name and e.type in ("cell", "table") for e in added):
+            geometry.built_len = len(builder.ir.elements)
+            return geometry
+    geometry = _SheetGeometry(builder, sheet_name)
+    cache[sheet_name] = geometry
+    return geometry
+
+
 def _xlsx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
+    geometry_cache: dict[str, _SheetGeometry] = {}
     content_parts = {"xl/workbook.xml"}
     content_parts.update(part for part in ("xl/sharedStrings.xml", "xl/styles.xml") if part in entries)
     sheet_ids = {
@@ -1588,14 +1647,10 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                             # 状態は確定せず、drawing と抽出済み cell region の幾何交差だけを relation にする。
                             # グループ子孫（order_base != 0）は対象外: 子の cell_range は親 anchor の継承（近似）で、
                             # その矩形で overlaps/覆いを主張すると事実でない幾何を relation にしてしまう。
-                            same_sheet = [target for target in builder.ir.elements if target.locator.sheet == sheet_name]
-                            exact_tables = [target for target in same_sheet
-                                            if target.type == "table" and _cell_rect(target.locator.cell_range) == source_rect]
-                            targets = exact_tables or [target for target in same_sheet if target.type == "cell"]
-                            for target in targets:
-                                target_rect = _cell_rect(target.locator.cell_range)
-                                if target_rect is None:
-                                    continue
+                            geometry = _xlsx_sheet_geometry(builder, geometry_cache, sheet_name)
+                            near_cells = geometry.cells_near(source_rect)
+                            targets = geometry.tables_by_rect.get(tuple(source_rect)) or near_cells
+                            for target_id, target_rect in targets:
                                 intersection = _bbox_intersection(source_rect, target_rect)
                                 if intersection is None:
                                     continue
@@ -1604,8 +1659,8 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                                 builder.add_relation(
                                     "overlaps",
                                     element_id,
-                                    target.element_id,
-                                    evidence_ids=[element_id, target.element_id],
+                                    target_id,
+                                    evidence_ids=[element_id, target_id],
                                     extension={
                                         "coordinate_system": "normalized-cell",
                                         "intersection_bbox": intersection,
@@ -1623,12 +1678,7 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                                     occluded_by["text"] = text
                                 elif extension.get("name"):
                                     occluded_by["name"] = extension["name"]
-                                for target in same_sheet:
-                                    if target.type != "cell":
-                                        continue
-                                    target_rect = _cell_rect(target.locator.cell_range)
-                                    if target_rect is None:
-                                        continue
+                                for target_id, target_rect in near_cells:
                                     intersection = _bbox_intersection(source_rect, target_rect)
                                     if intersection is None:
                                         continue
@@ -1636,7 +1686,7 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                                     ratio = _area(intersection) / target_area if target_area else 0.0
                                     if ratio >= _occlusion_ratio():
                                         builder.mark_hidden(
-                                            target.element_id,
+                                            target_id,
                                             reason="occluded_by_picture" if kind == "picture" else "occluded_by_shape",
                                             extra_extension={"occluded_by": occluded_by},
                                         )

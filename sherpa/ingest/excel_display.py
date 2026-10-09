@@ -16,6 +16,8 @@ from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
+
+from .ooxml import excel as _ooxml_excel
 from xml.etree import ElementTree as ET
 
 
@@ -381,7 +383,7 @@ def extract_cell_metadata(path: str | Path, targets: dict[str, set[str]]) -> dic
         Workbook を参照するローカル変数をこの関数の中に閉じ込め、戻った時点で GC が回収できるようにする。
         """
         intermediate: dict[tuple[str, str], dict[str, Any]] = {}
-        wb_formula = openpyxl.load_workbook(source, data_only=False, read_only=False, keep_links=False)
+        wb_formula = _ooxml_excel.load_workbook_fast(source, data_only=False, read_only=False, keep_links=False)
         try:
             for sheet_name in sorted(normalized_targets):
                 if sheet_name not in wb_formula.sheetnames:
@@ -414,7 +416,7 @@ def extract_cell_metadata(path: str | Path, targets: dict[str, set[str]]) -> dic
 
     # 第 2 パス（値ブック）: 数式セルの再計算値を取り、第 1 パスの中間 dict と合流する
     out: dict[tuple[str, str], dict[str, Any]] = {}
-    wb_values = openpyxl.load_workbook(source, data_only=True, read_only=False, keep_links=False)
+    wb_values = _ooxml_excel.load_workbook_fast(source, data_only=True, read_only=False, keep_links=False)
     try:
         for sheet_name in sorted(normalized_targets):
             if sheet_name not in wb_values.sheetnames:

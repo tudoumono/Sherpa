@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import zipfile
 from dataclasses import dataclass
 from xml.etree import ElementTree as ET
@@ -165,13 +166,63 @@ def _split_component(component: set[tuple[int, int]], min_row: int, max_row: int
     return [(frozenset(component), min_row, min_col, max_row, max_col, True)], splits
 
 
+_FAST_MERGE = threading.local()
+
+
+def _format_anchor_only(mcr) -> None:
+    """`MergedCellRange.format` のうち、左上のセル（anchor）への処理だけを元と同じ順で行う（縁のほかのセルへの罫線・保護の書き写しは省く）。"""
+    import copy
+
+    from openpyxl.styles.borders import Border
+    start = mcr.start_cell
+    on_edge = {"top": True, "left": True, "right": mcr.max_col == mcr.min_col, "bottom": mcr.max_row == mcr.min_row}
+    for name in ("top", "left", "right", "bottom"):
+        side = getattr(start.border, name)
+        if side and side.style is None:
+            continue
+        if on_edge[name]:
+            start.border += Border(**{name: side})
+    if start.protection is not None:
+        start.protection = copy.copy(start.protection)
+
+
+def _install_fast_merge_format() -> None:
+    """`MergedCellRange.format` を、このスレッドが `load_workbook_fast` の中にいるときだけ `_format_anchor_only` へ切り替える形に包む（1 回だけ）。"""
+    from openpyxl.worksheet.merge import MergedCellRange
+    orig = MergedCellRange.format
+    if getattr(orig, "_sherpa_fast_merge", False):
+        return
+
+    def format(self):
+        if getattr(_FAST_MERGE, "on", False):
+            return _format_anchor_only(self)
+        return orig(self)
+    format._sherpa_fast_merge = True
+    MergedCellRange.format = format
+
+
+def load_workbook_fast(p, **kw):
+    """`openpyxl.load_workbook` と同じ。読み込みの間だけ、結合範囲の縁の（左上以外の）セルへ罫線・保護を写す処理を省く。
+    抽出は左上以外の結合セルの書式を読まない（値・数式・書式・結合の範囲・左上のセルの style_id は変わらない）。結合の多い表で読み込みの時間の大半を占める。
+    守ること: 省くのはこのスレッドの読み込みの間だけ（ほかのスレッド・書き出し用のブックは元の処理のまま）。
+    """
+    import openpyxl
+    _install_fast_merge_format()
+    prev = getattr(_FAST_MERGE, "on", False)
+    _FAST_MERGE.on = True
+    try:
+        return openpyxl.load_workbook(p, **kw)
+    finally:
+        _FAST_MERGE.on = prev
+
+
 def load_two(p):
     """openpyxl で `p` を2回ロードする（`(wb_values, wb_formula)`）。
 
     `wb_values`＝`data_only=True`（キャッシュ済み計算値）・`read_only=False`（結合セル/非表示行列/ハイパーリンク/コメントの取得に通常ロードが必要）。`wb_formula`＝`data_only=False`（数式文字列）・`read_only=True`（ストリーミング。`formulas()` が `iter_rows()` 等しか使わないため）。呼び出し側は使用後に両方を `close()` すること。
     """
     import openpyxl
-    wb_values = openpyxl.load_workbook(p, data_only=True, read_only=False)
+    wb_values = load_workbook_fast(p, data_only=True, read_only=False)
     wb_formula = openpyxl.load_workbook(p, data_only=False, read_only=True)
     return wb_values, wb_formula
 
