@@ -479,8 +479,8 @@ def test_search_hybrid_failure_with_bm25_success_is_hybrid_query_failed(monkeypa
             return {"idx": {"mappings": {"_meta": {
                 **_HYBRID_META, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID}}}}
         if method == "POST" and path.endswith("/_search"):
-            bool_q = (body or {}).get("query", {}).get("function_score", {}).get("query", {}).get("bool", {})
-            if "should" in bool_q:                      # hybrid（match/knn を bool.should に並べる形）
+            inner = (body or {}).get("query", {}).get("function_score", {}).get("query", {})
+            if "knn" in inner:                          # hybrid の kNN 側のリクエスト
                 raise RuntimeError("hybrid query failed (dimension mismatch etc.)")
             return {"hits": {"hits": [{"_source": {"doc_id": "a.md", "line": 1, "text": "hit"}, "_score": 1.0}]}}
         return {}
@@ -558,8 +558,9 @@ def test_degrade_vocabulary_includes_new_reasons():
     assert "hybrid_query_failed" in fused_search.DEGRADE_REASONS
 
 
-@pytest.mark.parametrize("weight,skewed", [(0.5, False), (0.8, True)])
-def test_search_hybrid_query_boost_follows_weight(monkeypatch, weight, skewed):
+@pytest.mark.parametrize("weight", [0.5, 0.8])
+def test_search_hybrid_rrf_weight_follows_hybrid_weight(monkeypatch, weight):
+    """BM25 だけの文書と kNN だけの文書が同順位のとき、重みの大きい側が上に来る（0.5＝対等）。"""
     monkeypatch.setattr(es_index, "_HYBRID_WEIGHT", weight)
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
@@ -567,23 +568,21 @@ def test_search_hybrid_query_boost_follows_weight(monkeypatch, weight, skewed):
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: dict(
         provider="openai", model="m", dim=3))
     monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None: [[0.1, 0.2, 0.3]])
-    captured = {}
+
+    def hit(i):
+        return {"_id": i, "_source": {"doc_id": f"{i}.md", "text": "t"}, "_score": 1.0}
 
     def fake_req(method, path, body=None, **kw):
-        captured["body"] = body
-        return {"hits": {"hits": []}}
+        inner = body["query"]["function_score"]["query"]
+        return {"hits": {"hits": [hit("v" if "knn" in inner else "k")]}}
 
     monkeypatch.setattr(es_index, "_req", fake_req)
-    es_index.search("w", "query")
-    body = captured["body"]
-    assert "knn" not in body                                      # knn は bool.should の中へ移している
-    should = body["query"]["function_score"]["query"]["bool"]["should"]
-    if not skewed:                                                 # 既定配分は boost キー自体を書かない
-        assert should[0] == {"match": {"text": {"query": "query", "_name": es_index._KEYWORD_QUERY_NAME}}}
-        assert "boost" not in should[1]["knn"]
+    hits, reason = es_index.search("w", "query")
+    assert reason is None
+    if weight == 0.5:
+        assert hits[0]["score"] == hits[1]["score"]
     else:
-        match_boost, knn_boost = should[0]["match"]["text"]["boost"], should[1]["knn"]["boost"]
-        assert match_boost > knn_boost and round(match_boost + knn_boost, 6) == 2.0
+        assert [h["doc_id"] for h in hits] == ["k.md", "v.md"] and hits[0]["score"] > hits[1]["score"]
 
 
 # ---- _meta の記録と再索引判定（needs_reindex） ----

@@ -1107,7 +1107,7 @@ def run_refresh_once(
             evidence_path = root.joinpath(*Path(source_rel_path + ".evidence.json").parts)
             if evidence_path.is_symlink() or not evidence_path.is_file():
                 raise OCRBindingError(f"Evidence missing for route manifest: {source_rel_path}")
-            ir = evidence_ir.from_json_str(evidence_path.read_text(encoding="utf-8"))
+            ir = evidence_ir.read_json_file(evidence_path)
             manifest = ocr_router.from_json_str(route_path.read_text(encoding="utf-8"), ir=ir)
             counts = {"selected": 0, "excluded": 0, "failed_binding": 0}
             for decision in manifest.decisions:
@@ -1375,7 +1375,7 @@ def _runtime_callbacks():
 
     def load_ir(job: dict[str, Any]) -> evidence_ir.EvidenceIR:
         path = active_ir_root(job).joinpath(*Path(job["source_rel_path"] + ".evidence.json").parts)
-        return evidence_ir.from_json_str(path.read_text(encoding="utf-8"))
+        return evidence_ir.read_json_file(path)
 
     def resolve_source(job: dict[str, Any]) -> Path:
         root = worlds.world_dir(job["world"])

@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from xml.etree import ElementTree as ET
 
+from .. import json_io
 from . import document_ir, evidence_ir
 from .metafile_text import child_png_size
 from .ooxml.rels import load_relationships, resolve_target
@@ -3423,7 +3424,7 @@ def extract_assets(path: str | Path, ir: evidence_ir.EvidenceIR, destination: st
             suffix = suffix if isinstance(suffix, str) and suffix.startswith(".") else ".bin"
             target = target_dir / f"{actual_digest}{suffix}"
             if actual_digest not in written:
-                target.write_bytes(raw)
+                json_io.write_bytes_atomic(target, raw)
                 written[actual_digest] = target
         if set(written) != expected:
             raise ValueError("PDF asset inventory mismatch")
@@ -3453,6 +3454,6 @@ def extract_assets(path: str | Path, ir: evidence_ir.EvidenceIR, destination: st
                 raise ValueError(f"asset hash mismatch: {media_part}")
             suffix = Path(media_part).suffix.lower() or ".bin"
             target = target_dir / f"{actual_digest}{suffix}"
-            target.write_bytes(raw)
+            json_io.write_bytes_atomic(target, raw)
             written.append(target)
     return written

@@ -17,6 +17,7 @@ os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 import openpyxl
 import pytest
 
+from sherpa import json_io
 from sherpa.ingest import context_ir as CIR
 from sherpa.ingest import evidence_ir as IR
 from sherpa.ingest import evidence_render as R
@@ -381,8 +382,8 @@ def _rag_md(der: Path, rel: str) -> str:
 
 
 def _read_chunks(der: Path, rel: str) -> list[dict]:
-    return [json.loads(line) for line in (der.parent / "rag" / f"{rel}.rag_chunks.jsonl").read_text(
-        encoding="utf-8").splitlines()]
+    return [json.loads(line) for line in json_io.read_text_maybe_gzip(
+        der.parent / "rag" / f"{rel}.rag_chunks.jsonl").splitlines()]
 
 
 def test_render_shared_path_across_docx_pptx_xlsx_and_pdf_tables():
@@ -496,7 +497,7 @@ def test_group_repack_at_max_group_chars_boundary_no_data_loss(wide_der):
     body = "".join(c["body"] for c in table_chunks)
     assert all(f"値{c:03d}の内容" in body for c in range(1, 61))
 
-    ir = IR.from_json_str((wide_der.parent / "ir" / "big.xlsx.evidence.json").read_text(encoding="utf-8"))
+    ir = IR.read_json_file(wide_der.parent / "ir" / "big.xlsx.evidence.json")
     cell_ids = {el.element_id for el in ir.elements if el.type == "cell" and R._value_text(el.value)}
     cited_ids = {citation["evidence_id"] for chunk in chunks for citation in chunk["citations"]}
     assert cell_ids <= cited_ids

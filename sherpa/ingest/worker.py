@@ -925,9 +925,11 @@ def _sig(parts, resolve_sig: str = "") -> str:
     # 重要度のスキーマ版・アナライザの有効構成・言及エッジの仕様版と実効値（`world_graph._mention_min_len`/`_mention_max_per_doc`）を材料に含める。
     # これらが変わると、ソースが不変でも署名が変わり全再構築される。
     # 資料フォルダの解決範囲の設定（`resolve_settings.signature_material`）があるときはそのハッシュも材料にする（設定が無ければ材料に足さない）
+    # 取り込みから外す版管理の記録のフォルダの名前も材料にする（外す名前が変われば、アーカイブの中だけにあった分も含めて台帳を作り直す）
     material = (importance.IMPORTANCE_SCHEMA_VERSION, analyzer_registry.config_signature(),
                 world_graph.MENTION_SCHEMA_VERSION, world_graph._mention_min_len(),
-                world_graph._mention_max_per_doc(), parts)
+                world_graph._mention_max_per_doc(), parts,
+                ("vcs_excluded", tuple(sorted(scope_infer.VCS_DIR_NAMES))))
     if resolve_sig:
         material += (("resolve_settings", resolve_sig),)
     return hashlib.sha1(repr(material).encode("utf-8")).hexdigest()

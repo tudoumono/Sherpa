@@ -23,7 +23,7 @@ import pytest
 
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 
-from sherpa import citations, excerpts, rag_parent_return, worlds
+from sherpa import citations, excerpts, json_io, rag_parent_return, worlds
 from sherpa.ingest import office_md
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -53,8 +53,8 @@ def _first_row_for_sheet(world: str, sheet: str) -> dict:
     の metadata-only レコードや画像レコードは `region_context=None`（表の範囲を持たない）ため除外する。
     """
     rows = [json.loads(line) for line in
-            (worlds.derived_rag_dir(world) / (_DOC_ID + ".rag_chunks.jsonl")).read_text(
-                encoding="utf-8").splitlines() if line.strip()]
+            json_io.read_text_maybe_gzip(
+                worlds.derived_rag_dir(world) / (_DOC_ID + ".rag_chunks.jsonl")).splitlines() if line.strip()]
     for row in rows:
         if row.get("document_context", {}).get("sheet") == sheet and row.get("region_context"):
             return row

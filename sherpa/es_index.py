@@ -728,13 +728,13 @@ def _rag_chunks_validate(rag_path: Path, anchors: dict, rel: str) -> tuple:
     有効なら `(seen_chunk_ids, None)`（0 件なら空集合）、無効なら `(None, reason)`。`reason` の語彙は `_validate_rag_chunks` 参照（rag.md 側の `rag_md_*` は `_load_rag_md_anchors` が担当）。
     """
     try:
-        if rag_path.stat().st_size > _RAG_CHUNKS_FILE_CAP_BYTES:
+        if json_io.expanded_size_exceeds(rag_path, _RAG_CHUNKS_FILE_CAP_BYTES):
             return None, "file_too_large"
     except OSError:
         return None, "stat_failed"
     seen_chunk_ids: set = set()
     try:
-        with rag_path.open("r", encoding="utf-8", errors="strict") as f:
+        with json_io.open_text_maybe_gzip(rag_path) as f:
             for lineno, raw_line in enumerate(f, start=1):
                 if lineno > _RAG_CHUNKS_MAX_ROWS:
                     return None, "too_many_rows"
@@ -762,7 +762,7 @@ def _rag_chunks_validate(rag_path: Path, anchors: dict, rel: str) -> tuple:
                     return None, "search_text_too_long"
     except UnicodeDecodeError:
         return None, "invalid_utf8"
-    except OSError:
+    except (OSError, *json_io.GZIP_READ_ERRORS):
         return None, "read_failed"
     if set(anchors) - seen_chunk_ids:
         return None, "rag_md_anchor_surplus"
@@ -771,7 +771,7 @@ def _rag_chunks_validate(rag_path: Path, anchors: dict, rel: str) -> tuple:
 
 def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: dict):
     """事前に `_rag_chunks_validate()` が `reason=None` を返した `rag_path` をもう一度走査し、`(id, body, text)` を 1 件ずつ yield する（常に 1 件分だけをメモリに持つ）。検証済みの `rag_path`／`anchors` でのみ呼ぶ。"""
-    with rag_path.open("r", encoding="utf-8", errors="strict") as f:
+    with json_io.open_text_maybe_gzip(rag_path) as f:
         for raw_line in f:
             line = raw_line.strip()
             if not line:
@@ -1415,9 +1415,6 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
     return doc_count is not None and n != doc_count
 
 
-# hybrid の match 節に付ける名前。ヒットの `matched_queries` に載れば語が一致した印（kNN だけで出たヒットは載らない）
-_KEYWORD_QUERY_NAME = "keyword"
-
 
 def _mark_keyword_all(hits: list) -> list:
     for h in hits:
@@ -1439,8 +1436,6 @@ def _parse_hits(res: dict) -> list:
                   "importance", "importance_reason"):
             if src.get(k) is not None:
                 hit[k] = src[k]
-        if "matched_queries" in h:  # 名前付きクエリを持つ hybrid だけ ES が返す
-            hit["keyword_match"] = _KEYWORD_QUERY_NAME in (h["matched_queries"] or [])
         out.append(hit)
     return out
 
@@ -1492,13 +1487,58 @@ def _classify_query_exception(exc: Exception) -> str:
     return "es_query_rejected"
 
 
+def _fuse_hybrid(bm25_res: dict, knn_res: dict, k: int) -> list:
+    """BM25 と kNN の ES 応答を RRF（`fused_search.fuse_rrf`）で融合し、`_parse_hits` の形で上位 k 件を返す。
+    重みは `_HYBRID_WEIGHT`（keyword）と残り（vector）を合計 2.0 に配分（0.5＝対等＝各 1.0）。score は RRF の点数。
+    `keyword_match` はここでは BM25 の上位に出たか（kNN だけのヒットは `_mark_keyword_matches` が語の一致で付け直す）。本文・ハイライトは BM25 側を優先し、kNN だけのヒットは kNN 側の本文（ハイライトなし）。`engine_ranks` に融合前の順位を残す。
+    """
+    from .parts.read.fused_search import fuse_rrf  # fused_search は es_index を import する＝呼び出し時に読む
+
+    raw: dict = {}
+    per_engine: dict = {"keyword": [], "vector": []}
+    for engine, res in (("keyword", bm25_res), ("vector", knn_res)):
+        for h in res.get("hits", {}).get("hits", []):
+            raw.setdefault(h["_id"], h)
+            per_engine[engine].append({"key": h["_id"], "doc_id": h["_id"], "path": "", "snippet": ""})
+    weights = {"keyword": _HYBRID_WEIGHT * 2.0, "vector": (1.0 - _HYBRID_WEIGHT) * 2.0}
+    out = []
+    for m in fuse_rrf(per_engine, weights, k):
+        hit = _parse_hits({"hits": {"hits": [raw[m["doc_id"]]]}})[0]
+        hit["score"] = m["score"]
+        hit["keyword_match"] = "keyword" in m["sources"]
+        hit["engine_ranks"] = dict(m["sources"])
+        hit["_es_id"] = m["doc_id"]          # `_mark_keyword_matches` が使って取り除く
+        out.append(hit)
+    return out
+
+
+def _mark_keyword_matches(world: str, query: str, hits: list) -> list:
+    """融合の結果のうち BM25 の上位に出なかったヒットについて、語が一致するか（`match` に当たるか）を ES に問い合わせて `keyword_match` を付け直す。
+    問い合わせに失敗したら付け直さない（False のまま）。
+    """
+    es_ids = {id(h): h.pop("_es_id", None) for h in hits}
+    ids = [es_ids[id(h)] for h in hits if not h.get("keyword_match") and es_ids[id(h)]]
+    if not ids:
+        return hits
+    body = {"size": len(ids), "_source": False,
+            "query": {"bool": {"filter": [{"ids": {"values": ids}}], "must": [{"match": {"text": query}}]}}}
+    try:
+        matched = {h["_id"] for h in _req("POST", f"/{_index(world)}/_search", body).get("hits", {}).get("hits", [])}
+    except Exception:
+        return hits
+    for h in hits:
+        if not h.get("keyword_match") and es_ids[id(h)] in matched:
+            h["keyword_match"] = True
+    return hits
+
+
 def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict | None = None,
           vector: bool = True, layer=None, k_ceiling: int | None = None) -> tuple[list, str | None]:
     """検索。`vector=True` かつ埋め込み設定があれば kNN＋BM25 のハイブリッド、無ければ BM25。範囲フィルタ・graceful。
     `vector=False` は BM25 のみ（クエリ埋め込みを呼ばない・reason は常に None）。
     `k_ceiling`（省略可）: 呼び出し元が上限まで検証済みの `k` を渡す場合（`agentic_search.run_tool` の `es_search`）、`_ES_SEARCH_K_MAX` による再クランプを迂回してこちらを使う。
     `layer`（省略可・`"docs"|"code"|"both"`・既定 both）: `scopes` と同じ `filter` 節に `branch` の term／must_not フィルタを積む（`layer.es_filter`）。
-    各ヒットに `keyword_match`（語が一致したか）を付ける。hybrid は match 節の名前付きクエリで判定（kNN だけで出たヒットは False）・BM25 のみの経路は全件 True。
+    各ヒットに `keyword_match`（語が一致したか）を付ける。hybrid は BM25 の上位に出たヒットは True、kNN だけで出たヒットは語の一致を問い合わせて付ける（問い合わせの失敗は False）・BM25 のみの経路は全件 True。
     返値 `(hits, degrade_reason|None)`（`search_knn_only()` と同じ形）。degrade 時も BM25 の hits をそのまま返す（reason は「hybrid でなく BM25 だけになった理由」の注記）。`es_unavailable`／クエリ空は `[]`。
     degrade_reason: `es_unavailable`／`embedding_not_configured`（埋め込み未設定）／`embedding_cloud_unavailable`／`vector_feature_mismatch`（索引の埋め込み素性が現在の設定と不一致＝再索引待ち）／`query_embed_failed`／`hybrid_query_failed`（hybrid が失敗し BM25 は成功）／`es_query_failed`（BM25 も失敗・一時的）／`es_query_rejected`（BM25 も失敗・クエリ不備）。`fused_search.DEGRADE_REASONS` と同一集合（増やすときは両方直す）。
     reason は呼び出し元が tool result 経由で思考の流れ（UI）へ表示する。
@@ -1540,24 +1580,22 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     if same:  # 索引のベクトル素性が一致する時だけ kNN
         qv = embeddings.embed([q], ec, world=world)
         if qv:
-            # 既定配分（w=0.5）のときは boost キーを書かない。0.5 以外のときだけ boost を付ける（合計 2.0 に配分）
-            match_clause = {"match": {"text": {"query": q, "_name": _KEYWORD_QUERY_NAME}}}
+            # ① BM25（ハイライト付き）を先に引く。失敗は kNN を打たず BM25 失敗の reason で返す
+            try:
+                bm25_res = _req("POST", f"/{_index(world)}/_search", bm25)
+            except Exception as exc:
+                return [], _classify_query_exception(exc)
+            # ② kNN（同じ filter・k・num_candidates）。重要度ブーストは function_score で kNN 側へ掛ける（重要度なしの資料フォルダでは不変）
             knn_clause = {"knn": {"field": "embedding", "query_vector": qv[0], "k": k,
                                   "num_candidates": max(50, k * 5), "filter": flt}}
-            if _HYBRID_WEIGHT != 0.5:
-                match_clause = {"match": {"text": {"query": q, "boost": _HYBRID_WEIGHT * 2.0,
-                                                   "_name": _KEYWORD_QUERY_NAME}}}
-                knn_clause["knn"]["boost"] = (1.0 - _HYBRID_WEIGHT) * 2.0
-            # 重要度ブーストは合成スコア（BM25＋kNN）全体へ 1 回だけ掛ける。`knn` を top-level で並記すると `query` 側だけを包む function_score が BM25 成分にしか効かないため、
-            # ES 8.9+ の query 節内の `knn` を使い、match／knn を同じ `bool.should` に並べて `_importance_boost_query` で包む。
-            # union（どちらか一方だけに一致した文書も出る）で、重要度なしの資料フォルダではスコア不変
-            combined = {"bool": {"should": [match_clause, knn_clause], "filter": flt}}
-            hybrid = {"size": k, "highlight": hl, "query": _importance_boost_query(combined)}
             try:
-                return _parse_hits(_req("POST", f"/{_index(world)}/_search", hybrid)), None
+                knn_res = _req("POST", f"/{_index(world)}/_search",
+                               {"size": k, "query": _importance_boost_query(knn_clause)})
             except Exception:
-                # hybrid 自体の失敗（次元不一致・未ベクトル索引等）は、BM25 が成功すれば hits が空にならないため、`es_query_failed` とは別の reason にする
-                reason = "hybrid_query_failed"  # 実クエリ失敗 → BM25 へ
+                # kNN だけの失敗は BM25 の結果をそのまま返す（hits は空にならない＝`es_query_failed` とは別の reason）
+                return _mark_keyword_all(_parse_hits(bm25_res)), "hybrid_query_failed"
+            # ③ アプリ側で RRF 融合（設計: docs/design/rag.md「融合検索（RRF）」）④ kNN だけで出たヒットにも語が一致するかを付け直す
+            return _mark_keyword_matches(world, q, _fuse_hybrid(bm25_res, knn_res, k)), None
         else:
             reason = "query_embed_failed"  # クエリ埋め込みの通信失敗 → BM25 へ
     try:

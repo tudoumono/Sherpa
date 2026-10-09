@@ -113,18 +113,27 @@ def test_search_knn_only_layer_omitted_matches_current_behavior(monkeypatch):
 # ===== es_search の方式（hybrid／keyword／vector）=====
 
 def test_search_mode_query_shapes(monkeypatch):
-    """hybrid は match＋knn の should（match 節だけ名前付き・既定）・keyword は BM25 だけ・vector は knn だけ。"""
-    captured = _capture_req(monkeypatch)
+    """hybrid は BM25 と kNN を別々に投げる（kNN は function_score 包みの query-level knn）・keyword は BM25 だけ・vector は knn だけ。"""
+    bodies: list = []
+
+    def fake_req(method, path, body=None, **kw):
+        bodies.append(body)
+        return {"hits": {"hits": []}}
+
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "_req", fake_req)
     _stub_embeddings(monkeypatch)
     es_index.search("v1", "q", k=5)
-    should = captured["body"]["query"]["function_score"]["query"]["bool"]["should"]
-    assert should[0] == {"match": {"text": {"query": "q", "_name": "keyword"}}}
-    assert "knn" in should[1]
+    bm25, knn = bodies[-2], bodies[-1]
+    assert bm25["query"]["function_score"]["query"]["bool"]["must"] == [{"match": {"text": "q"}}]
+    assert "highlight" in bm25
+    assert "knn" in knn["query"]["function_score"]["query"] and "highlight" not in knn
+    bodies.clear()
     es_index.search("v1", "q", k=5, vector=False)
-    q = captured["body"]["query"]["function_score"]["query"]["bool"]
-    assert q["must"] == [{"match": {"text": "q"}}] and "should" not in q and "knn" not in captured["body"]
+    q = bodies[-1]["query"]["function_score"]["query"]["bool"]
+    assert len(bodies) == 1 and q["must"] == [{"match": {"text": "q"}}] and "should" not in q
     es_index.search_knn_only("v1", "q", k=5)
-    assert "knn" in captured["body"] and "query" not in captured["body"]
+    assert "knn" in bodies[-1] and "query" not in bodies[-1]
 
 
 def test_search_hybrid_marks_keyword_match(monkeypatch):
@@ -132,16 +141,15 @@ def test_search_hybrid_marks_keyword_match(monkeypatch):
     _stub_embeddings(monkeypatch)
     monkeypatch.setattr(es_index, "available", lambda: True)
 
-    def hit(i, mq):
-        h = {"_source": {"doc_id": f"{i}.md", "text": "t"}, "_score": 1.0}
-        if mq is not None:
-            h["matched_queries"] = mq
-        return h
+    def hit(i):
+        return {"_id": str(i), "_source": {"doc_id": f"{i}.md", "text": "t"}, "_score": 1.0}
 
-    monkeypatch.setattr(es_index, "_req", lambda m, p, body=None, **kw: {"hits": {"hits": [
-        hit(1, ["keyword"]), hit(2, [])]}})
+    def fake_req(m, p, body=None, **kw):
+        q = body["query"]["function_score"]["query"]
+        return {"hits": {"hits": [hit(1)] if "bool" in q else [hit(2)]}}
+
+    monkeypatch.setattr(es_index, "_req", fake_req)
     hits, _ = es_index.search("v1", "q", k=5)
-    assert [h["keyword_match"] for h in hits] == [True, False]
-    monkeypatch.setattr(es_index, "_req", lambda m, p, body=None, **kw: {"hits": {"hits": [hit(1, None)]}})
+    assert {h["doc_id"]: h["keyword_match"] for h in hits} == {"1.md": True, "2.md": False}
     hits, _ = es_index.search("v1", "q", k=5, vector=False)
-    assert hits[0]["keyword_match"] is True
+    assert all(h["keyword_match"] is True for h in hits)

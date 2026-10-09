@@ -15,6 +15,7 @@ os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 import pytest  # noqa: E402
 
 import _metafile_builders as mb  # noqa: E402
+from sherpa import json_io  # noqa: E402
 from sherpa.ingest import evidence_ir, metafile_text, ocr_router, office_md  # noqa: E402
 
 
@@ -160,7 +161,7 @@ def test_rag_md_and_human_md_carry_the_figure_text_block(monkeypatch, tmp_path):
     # 図（画像）の chunk の直後・次の段落より前に置く。
     assert rag.index("画像内容は未解釈") < rag.index(block) < rag.index("後の段落")
     chunks = [json.loads(line) for line in
-              (dmd.parent / "rag" / "a.docx.rag_chunks.jsonl").read_text(encoding="utf-8").splitlines()]
+              json_io.read_text_maybe_gzip(dmd.parent / "rag" / "a.docx.rag_chunks.jsonl").splitlines()]
     assert any(chunk.get("content_type") == "figure_text" for chunk in chunks)
     human = (dmd / "a.docx.md").read_text(encoding="utf-8")
     block = "図の中の文字（元の値）\n- 帳票の見出し\n- Total 100"
@@ -340,7 +341,7 @@ def test_already_ingested_folder_picks_up_children_and_text_once_without_changin
     current = rag_path.read_text(encoding="utf-8")
 
     # 旧版（v4）で取り込み済みだった状態を作る: 図の文字の chunk も子 PNG も無く、ルートは旧 profile。
-    ir = evidence_ir.from_json_str((dmd.parent / "ir" / "a.docx.evidence.json").read_text(encoding="utf-8"))
+    ir = evidence_ir.read_json_file(dmd.parent / "ir" / "a.docx.evidence.json")
     old = evidence_render.render(ir, source_name="a.docx")
     rag_path.write_text(office_md._stamp_rule_only_rag_markdown(old.markdown), encoding="utf-8")
     shutil.rmtree(dmd.parent / "rag" / "a.docx.assets" / metafile_text.CHILD_DIR)
@@ -376,7 +377,7 @@ def test_ocr_result_of_a_child_png_renders_at_the_parent_figure(monkeypatch, tmp
     from sherpa.ingest import ai_observation, evidence_render, ocr_worker
 
     wd, dmd = _build(monkeypatch, tmp_path)
-    ir = evidence_ir.from_json_str((dmd.parent / "ir" / "a.docx.evidence.json").read_text(encoding="utf-8"))
+    ir = evidence_ir.read_json_file(dmd.parent / "ir" / "a.docx.evidence.json")
     assets = dmd.parent / "rag" / "a.docx.assets"
     manifest = ocr_router.from_json_str(
         (dmd.parent / "ir" / "a.docx.ocr_route.json").read_text(encoding="utf-8"), ir=ir)

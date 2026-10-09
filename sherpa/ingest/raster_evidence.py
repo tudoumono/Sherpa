@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .. import json_io
 from . import evidence_ir
 
 
@@ -114,5 +115,5 @@ def extract_assets(path: str | Path, ir: evidence_ir.EvidenceIR, destination: st
     target_dir = Path(destination)
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{digest}{suffix}"
-    target.write_bytes(data)
+    json_io.write_bytes_atomic(target, data)
     return [target]

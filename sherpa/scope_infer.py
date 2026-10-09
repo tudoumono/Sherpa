@@ -44,6 +44,16 @@ def _lstat_kind(p: Path) -> str | None:
     return None
 
 
+VCS_DIR_NAMES = frozenset({".svn", ".git", ".hg", ".bzr", "CVS"})  # 版管理の記録のフォルダ（取り込みの対象外）
+
+
+def is_vcs_dir_name(name: str) -> bool:
+    """フォルダ名が版管理の記録（`.svn`/`.git`/`.hg`/`.bzr`/`CVS`）そのものか（大文字小文字を区別し、名前の完全一致だけ）。
+    設計: docs/03-鏡モデル.md「取り込みの対象外」。原本の木を歩く入口は、このフォルダに入らない。
+    """
+    return name in VCS_DIR_NAMES
+
+
 WALK_SKIPPED_KEYS = ("symlink", "unreadable_dir", "unreadable_file", "outside_root")
 
 
@@ -123,7 +133,8 @@ def safe_files(root, *, strict: bool = False, deadline: float | None = None, als
                 _skip("symlink")
                 continue
             if kind == "dir":
-                stack.append(p)
+                if not is_vcs_dir_name(p.name):
+                    stack.append(p)
             elif kind == "file":
                 try:
                     rp = p.resolve()

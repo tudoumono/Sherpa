@@ -26,6 +26,7 @@ import zipfile
 
 import pytest
 
+from sherpa import json_io
 from sherpa.ingest import office_md
 from sherpa.ingest.arms import legacy_convert
 
@@ -570,7 +571,7 @@ def test_build_derived_legacy_unsupported_when_backend_none(tmp_path, monkeypatc
     rep = office_md.build_derived(src, derived)
     assert rep["unsupported"] == 1 and rep["converted"] == 0
     assert (derived / "旧資料.doc.md").is_file()              # source-level Evidence/coverage notice は検索可能な成果物
-    evidence = json.loads((derived.parent / "ir" / "旧資料.doc.evidence.json").read_text(encoding="utf-8"))
+    evidence = json_io.read_json(derived.parent / "ir" / "旧資料.doc.evidence.json")
     assert evidence["coverage"][0]["reason_code"] == "legacy_backend_unavailable"
     assert "legacy_backend_unavailable" in (derived.parent / "rag" / "旧資料.doc.rag.md").read_text(encoding="utf-8")
 

@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
 
+from .. import json_io
 from .ooxml.rels import load_relationships
 
 # 抽出規則の版。抽出結果（rag.md の「図の中の文字」・子 PNG）が変わる変更をしたら上げる。
@@ -553,7 +554,7 @@ def _write_state(root: Path, parent_hex: str, state: str | None, file: str | Non
             path.unlink(missing_ok=True)
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"state": state, "file": file}), encoding="utf-8")
+        json_io.write_text_atomic(path, json.dumps({"state": state, "file": file}))
     except OSError:
         pass
 
@@ -601,7 +602,7 @@ def _materialize_render(root: Path, name: str, kind: str, parent_hex: str, *, ke
     if png is not None:
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(png)
+            json_io.write_bytes_atomic(target, png)
         except OSError:
             return 0
         # keep_state: バックグラウンドの反映では、ルート書き直しと OCR job の enqueue が済むまで
@@ -648,7 +649,7 @@ def materialize_children(assets_dir: str | Path, *, keep_state: bool = False) ->
                 name = f"{index:02d}-{hashlib.sha256(bitmap.png).hexdigest()[:16]}.png"
                 target = target_dir / name
                 if not target.is_file():
-                    target.write_bytes(bitmap.png)
+                    json_io.write_bytes_atomic(target, bitmap.png)
                     written += 1
         except OSError:
             continue

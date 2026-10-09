@@ -566,7 +566,7 @@ def test_upgrade_from_v1_signature_regenerates_v2_region_structure(tmp_path):
     doc_path = derived.parent / "ir" / "a.xlsx.document.json"
     evidence_path = derived.parent / "ir" / "a.xlsx.evidence.json"
     original_doc_json = doc_path.read_text(encoding="utf-8")
-    original_evidence_json = evidence_path.read_text(encoding="utf-8")
+    original_evidence_json = evidence_path.read_bytes()
     v2_tables = [e for e in json.loads(original_doc_json)["elements"] if e["type"] == "table"]
     assert len(v2_tables) == 2 and all("score" in t["source_map"] for t in v2_tables)
 
@@ -591,7 +591,7 @@ def test_upgrade_from_v1_signature_regenerates_v2_region_structure(tmp_path):
     assert regenerated == original_doc_json                      # 壊した内容ではなく v2 の中身が復元される
     regen_tables = [e for e in json.loads(regenerated)["elements"] if e["type"] == "table"]
     assert len(regen_tables) == 2 and all("score" in t["source_map"] for t in regen_tables)
-    assert evidence_path.read_text(encoding="utf-8") == original_evidence_json
+    assert evidence_path.read_bytes() == original_evidence_json
 
 
 # ---- 結合セルの異常・巨大宣言 ----

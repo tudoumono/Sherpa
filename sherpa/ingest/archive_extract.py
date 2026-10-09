@@ -90,6 +90,12 @@ def _member_has_sensitive_segment(parts: list[str]) -> bool:
     return any(text_kind.is_sensitive(p, Path(p).suffix.lower()) for p in parts)
 
 
+def _in_vcs_dir(raw_name: str) -> bool:
+    """アーカイブメンバー名が版管理の記録のフォルダ（`scope_infer.is_vcs_dir_name`）の中か。"""
+    parts = [p for p in raw_name.replace("\\", "/").split("/") if p]
+    return any(scope_infer.is_vcs_dir_name(p) for p in parts[:-1])
+
+
 def _decode_zip_name(info: zipfile.ZipInfo) -> str:
     """zip メンバー名を正しい符号化で読み直す（日本語ファイル名対策）。
 
@@ -163,7 +169,7 @@ def _publish_archive_staging(staging: Path, dest: Path, retired: Path) -> None:
 def _extract_zip(archive_path: Path, dest_dir: Path) -> dict:
     base = _empty_summary()
     with zipfile.ZipFile(archive_path) as zf:
-        infos = [i for i in zf.infolist() if not i.is_dir()]
+        infos = [i for i in zf.infolist() if not i.is_dir() and not _in_vcs_dir(_decode_zip_name(i))]  # 版管理のフォルダは件数・大きさにも数えない
         base["entry_count"] = len(infos)
         if len(infos) > MAX_ENTRIES:
             return _empty_summary("too_large", "archive_too_large") | {"entry_count": len(infos)}
@@ -185,6 +191,8 @@ def _extract_zip(archive_path: Path, dest_dir: Path) -> dict:
                 continue
             if archive_kind(parts[-1]) is not None:            # 入れ子のアーカイブは取り込まない
                 base["skipped_nested"] += 1
+                continue
+            if any(scope_infer.is_vcs_dir_name(p) for p in parts[:-1]):  # 版管理の記録のフォルダは展開しない
                 continue
             if _member_has_sensitive_segment(parts):
                 base["skipped_sensitive"] += 1
@@ -217,7 +225,7 @@ def _extract_tar(archive_path: Path, dest_dir: Path) -> dict:
     base = _empty_summary()
     archive_size = archive_path.stat().st_size or 1
     with tarfile.open(archive_path, _tar_open_mode(archive_path)) as tf:
-        members = [m for m in tf.getmembers() if not m.isdir()]
+        members = [m for m in tf.getmembers() if not m.isdir() and not _in_vcs_dir(m.name)]  # 版管理のフォルダは件数・大きさにも数えない
         base["entry_count"] = len(members)
         if len(members) > MAX_ENTRIES:
             return _empty_summary("too_large", "archive_too_large") | {"entry_count": len(members)}
@@ -238,6 +246,8 @@ def _extract_tar(archive_path: Path, dest_dir: Path) -> dict:
                 continue
             if archive_kind(parts[-1]) is not None:
                 base["skipped_nested"] += 1
+                continue
+            if any(scope_infer.is_vcs_dir_name(p) for p in parts[:-1]):  # 版管理の記録のフォルダは展開しない
                 continue
             if _member_has_sensitive_segment(parts):
                 base["skipped_sensitive"] += 1

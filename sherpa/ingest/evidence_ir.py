@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .. import json_io
 
 
 EVIDENCE_IR_SCHEMA_VERSION = "evidence-ir-v1alpha2"
@@ -238,23 +238,19 @@ def _json_parts(ir: EvidenceIR):
 
 
 def write_json_atomic(path: str | Path, ir: EvidenceIR) -> Path:
-    """Evidence IR を同一ディレクトリの tmp へ stream して原子置換する。"""
+    """Evidence IR を gzip で同一ディレクトリの tmp へ stream して原子置換する（設計: docs/design/rag.md「派生物」）。"""
     errors = validation_errors(ir)
     if errors:
         raise ValueError("invalid Evidence IR: " + ",".join(errors))
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8", newline="") as stream:
-            stream.writelines(_json_parts(ir))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    with json_io.atomic_gzip_text_writer(target) as stream:
+        stream.writelines(_json_parts(ir))
     return target
+
+
+def read_json_file(path: str | Path) -> EvidenceIR:
+    """`{rel}.evidence.json`（gzip でも非圧縮でも）を型付き Evidence IR として読む。"""
+    return from_json_str(json_io.read_text_maybe_gzip(path))
 
 
 def from_json_str(raw: str) -> EvidenceIR:

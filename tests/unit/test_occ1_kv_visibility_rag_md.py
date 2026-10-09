@@ -130,9 +130,9 @@ def test_no_raw_visibility_reason_enum_leaks_into_rag_md(_derived_dir, rel):
 def test_rag_md_has_anchors_and_jsonl_chunk_ids_match_1to1(_derived_dir, rel):
     import json as _json
     md = _rag_md(_derived_dir, rel)
+    from sherpa import json_io
     chunks = [_json.loads(line) for line in
-              (_derived_dir.parent / "rag" / f"{rel}.rag_chunks.jsonl")
-              .read_text(encoding="utf-8").splitlines()]
+              json_io.read_text_maybe_gzip(_derived_dir.parent / "rag" / f"{rel}.rag_chunks.jsonl").splitlines()]
     anchor_ids = re.findall(r"^<!-- chunk:(\S+) -->$", md, flags=re.MULTILINE)
     assert set(anchor_ids) == {c["chunk_id"] for c in chunks}
     assert len(anchor_ids) == len(set(anchor_ids))

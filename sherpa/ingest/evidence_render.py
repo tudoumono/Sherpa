@@ -15,14 +15,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import uuid
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .. import json_io
 from . import ai_observation, context_ir, evidence_ir, mermaid_render
 
 
@@ -2076,19 +2075,10 @@ def render(
 
 
 def write_chunks_atomic(path: str | Path, chunks: list[dict]) -> Path:
-    """chunk配列を巨大な中間文字列へ複製せず、1件ずつJSONLへ原子書込する。"""
+    """chunk配列を巨大な中間文字列へ複製せず、1件ずつgzipのJSONLへ原子書込する（設計: docs/design/rag.md「派生物」）。"""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8", newline="") as stream:
-            for chunk in chunks:
-                stream.write(json.dumps(chunk, ensure_ascii=False, sort_keys=True))
-                stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    with json_io.atomic_gzip_text_writer(target) as stream:
+        for chunk in chunks:
+            stream.write(json.dumps(chunk, ensure_ascii=False, sort_keys=True))
+            stream.write("\n")
     return target

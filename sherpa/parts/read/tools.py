@@ -12,7 +12,7 @@ import re
 import stat
 from pathlib import Path
 
-from ... import citations, es_index, graph_coverage, grep_tool, redact_keys, worlds
+from ... import citations, es_index, graph_coverage, grep_tool, redact_keys, scope_infer, worlds
 from ...env_int import env_int
 from ... import layer as layer_mod
 from ... import scope as scope_mod
@@ -181,6 +181,8 @@ def _safe_doc_path(world: str, doc_id: str, *, layer=None):
     parts = doc_id.split("/")
     if ".." in parts or "" in parts:
         return None
+    if any(scope_infer.is_vcs_dir_name(p) for p in parts[:-1]):  # 版管理の記録のフォルダの中は取り込みの対象外
+        return None
     ext = Path(doc_id).suffix.lower()
     if importance.is_importance_control_path(doc_id):  # 重要度設定ファイル自体は精読対象外
         return None
@@ -250,6 +252,8 @@ def _safe_original_path(world: str, doc_id: str, scope_paths, *, kinds: frozense
         return None
     parts = doc_id.split("/")
     if ".." in parts or "" in parts:
+        return None
+    if any(scope_infer.is_vcs_dir_name(p) for p in parts[:-1]):  # 版管理の記録のフォルダの中は取り込みの対象外
         return None
     ext = Path(doc_id).suffix.lower()
     is_file_head = kinds is _FILE_HEAD_KINDS

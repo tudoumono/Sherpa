@@ -15,7 +15,7 @@ import json
 import re
 from pathlib import Path
 
-from . import es_index, worlds
+from . import es_index, json_io, worlds
 
 # rag_chunks.jsonl の読み取り安全弁。`es_index._RAG_CHUNKS_FILE_CAP_BYTES` と同じ値に揃える。
 _RAG_CHUNKS_SCAN_CAP_BYTES = es_index._RAG_CHUNKS_FILE_CAP_BYTES
@@ -51,9 +51,9 @@ def _read_capped(path: Path, cap_bytes: int) -> str | None:
     try:
         if not path.is_file() or path.is_symlink():
             return None
-        if path.stat().st_size > cap_bytes:
+        if json_io.expanded_size_exceeds(path, cap_bytes):
             return None
-        return path.read_text(encoding="utf-8", errors="strict")
+        return json_io.read_text_maybe_gzip(path)
     except (OSError, UnicodeDecodeError):
         return None
 

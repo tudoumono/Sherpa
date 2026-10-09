@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import heapq
 import logging
+import os
 import re
 import time
 from collections import deque
 from pathlib import Path
 
 from . import layer as layer_mod
+from . import scope_infer
 from . import text_encoding
 from .doc_kinds import CODE_EXT
 from .env_int import env_int
@@ -160,6 +162,17 @@ _DEADLINE_CHECK_ENTRIES = 256  # ツリー列挙中に `deadline` を再確認�
 _DEADLINE_CHECK_LINES = 256  # 1 ファイルの行走査ループ中に `deadline` を再確認する間隔
 
 
+def _walk_pruned(root: Path):
+    """`root` 配下の全エントリ（ファイル・フォルダ）を返す。版管理の記録のフォルダ（`scope_infer.VCS_DIR_NAMES`）には入らない。シンボリックリンクは辿らない。"""
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if not scope_infer.is_vcs_dir_name(d)]
+        base = Path(dirpath)
+        for name in dirnames:
+            yield base / name
+        for name in filenames:
+            yield base / name
+
+
 def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 scope_paths=None, deadline: float | None = None, layer=None,
                 truncated_docs: list | None = None, offset: int = 0, stats: dict | None = None):
@@ -266,7 +279,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
             continue
         rootr = root.resolve()
         entries = []
-        for i, p in enumerate(root.rglob("*")):
+        for i, p in enumerate(_walk_pruned(root)):
             if (deadline is not None and i > 0 and i % _DEADLINE_CHECK_ENTRIES == 0
                     and time.monotonic() > deadline):
                 raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")

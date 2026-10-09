@@ -13,6 +13,7 @@ import stat as stat_mod
 from pathlib import Path
 from typing import NamedTuple
 
+from . import scope_infer as _scope_infer
 from .grep_tool import valid_world  # 識別子の許容文字（パストラバーサル防止）
 from .ingest import text_kind
 
@@ -557,7 +558,8 @@ def _has_any_file(root: Path, *, strict: bool = False) -> bool:
                         raise
                     continue
                 if kind == "dir":
-                    stack.append(p)
+                    if not _scope_infer.is_vcs_dir_name(p.name):
+                        stack.append(p)
                 elif kind == "file":
                     return True
     return False

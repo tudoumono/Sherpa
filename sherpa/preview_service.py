@@ -256,7 +256,7 @@ FOLDERS_MAX = 5000  # 資料の画面のツリーに出すフォルダの上限�
 
 def list_folders(root) -> tuple[list[str], bool]:
     """`root` 配下のフォルダ（中身が空のものも含む）の相対パスを並べて返す。戻り値は `(フォルダ, 上限で打ち切ったか)`。
-    シンボリックリンクは辿らない・名前が `.` で始まるフォルダは出さない・読めないフォルダは飛ばす。
+    シンボリックリンクは辿らない・名前が `.` で始まるフォルダと版管理の記録のフォルダ（`CVS` など）は出さない・読めないフォルダは飛ばす。
     """
     root = Path(root)
     out: list[str] = []
@@ -270,7 +270,7 @@ def list_folders(root) -> tuple[list[str], bool]:
             continue
         for e in entries:
             try:
-                if e.is_symlink() or not e.is_dir(follow_symlinks=False) or e.name.startswith("."):
+                if e.is_symlink() or not e.is_dir(follow_symlinks=False) or e.name.startswith(".") or si.is_vcs_dir_name(e.name):
                     continue
             except OSError:
                 continue

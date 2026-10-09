@@ -165,7 +165,7 @@ def test_rag_refresh_regenerates_once_then_noop(_world_with_asset, monkeypatch):
     起きたことを直接固定する）。"""
     dmd = _world_with_asset["dmd"]
     correct_md = (_rag(dmd) / "a.xlsx.rag.md").read_text(encoding="utf-8")
-    correct_chunks = (_rag(dmd) / "a.xlsx.rag_chunks.jsonl").read_text(encoding="utf-8")
+    correct_chunks = (_rag(dmd) / "a.xlsx.rag_chunks.jsonl").read_bytes()
     asset_names_before = sorted(p.name for p in (_rag(dmd) / "scan.png.assets").iterdir())
     assert asset_names_before                            # 前提: PNGのassetが少なくとも1件ある
 
@@ -202,7 +202,7 @@ def test_rag_refresh_regenerates_once_then_noop(_world_with_asset, monkeypatch):
     assert _world_with_asset["req_calls"] == [("GET", mapping_path), ("PUT", mapping_path)]
 
     assert (_rag(dmd) / "a.xlsx.rag.md").read_text(encoding="utf-8") == correct_md              # 置換された
-    assert (_rag(dmd) / "a.xlsx.rag_chunks.jsonl").read_text(encoding="utf-8") == correct_chunks
+    assert (_rag(dmd) / "a.xlsx.rag_chunks.jsonl").read_bytes() == correct_chunks
     asset_names_after = sorted(p.name for p in (_rag(dmd) / "scan.png.assets").iterdir())
     assert asset_names_after == asset_names_before      # 同じ内容から再生成＝ファイル名（内容ハッシュ）も同じ
     for name in asset_names_after:
@@ -313,7 +313,7 @@ def test_document_ir_drift_cascades_to_evidence_and_rag_via_sync(_world):
     assert office_md.evidence_ir_sig_drift(dmd) is False
     assert office_md.rag_sig_drift(dmd) is False
     assert (_ir(dmd) / "a.xlsx.document.json").read_text(encoding="utf-8") != "stale-document-ir"
-    assert (_ir(dmd) / "a.xlsx.evidence.json").read_text(encoding="utf-8") != "stale-evidence-ir"
+    assert (_ir(dmd) / "a.xlsx.evidence.json").read_bytes() != b"stale-evidence-ir"
     assert (_rag(dmd) / "a.xlsx.rag.md").read_text(encoding="utf-8") != "stale-rag-md"
 
     res2 = worker.sync("w")

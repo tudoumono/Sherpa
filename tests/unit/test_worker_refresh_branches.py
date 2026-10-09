@@ -20,7 +20,7 @@ import contextlib
 import openpyxl
 import pytest
 
-from sherpa import es_index, store, worlds
+from sherpa import es_index, json_io, store, worlds
 from sherpa.ingest import office_md, worker, world_neo4j
 
 
@@ -221,9 +221,9 @@ def _old_route_world_with_failed_wmf_job(_stub):
     (asset.parent / (new_hash + asset.suffix)).write_bytes(wmf)
     for name in ("a.xlsx.evidence.json", "a.xlsx.derived.json"):
         doc = dmd.parent / "ir" / name
-        doc.write_text(doc.read_text(encoding="utf-8").replace(old_hash, new_hash), encoding="utf-8")
+        doc.write_text(json_io.read_text_maybe_gzip(doc).replace(old_hash, new_hash), encoding="utf-8")
     evidence = dmd.parent / "ir" / "a.xlsx.evidence.json"
-    ir = evidence_ir.from_json_str(evidence.read_text(encoding="utf-8"))
+    ir = evidence_ir.read_json_file(evidence)
     manifest = ocr_router.build_manifest(
         ir, source_rel_path="a.xlsx", assets=ocr_router.inventory_assets(asset.parent))
     route_input_id = ocr_jobs.unsupported_route_ids(manifest)[0]

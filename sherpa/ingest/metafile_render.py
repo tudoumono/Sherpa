@@ -85,7 +85,7 @@ def _rewrite_route(derived: Path, rel: str):
     from . import evidence_ir, ocr_router
 
     evidence_path = derived / "ir" / f"{rel}.evidence.json"
-    ir = evidence_ir.from_json_str(evidence_path.read_text(encoding="utf-8"))
+    ir = evidence_ir.read_json_file(evidence_path)
     assets_dir = derived / "rag" / f"{rel}.assets"
     manifest = ocr_router.build_manifest(
         ir, source_rel_path=rel, assets=ocr_router.inventory_assets(assets_dir))

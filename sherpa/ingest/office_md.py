@@ -1196,7 +1196,7 @@ def refresh_ocr_routes(derived, *, world: str, generation_id: str) -> dict:
         try:
             raw = route_path.read_text(encoding="utf-8") if route_path.is_file() else None
             if raw is None or json.loads(raw).get("router_profile") != ocr_router.OCR_ROUTER_PROFILE:
-                ir = evidence_ir.from_json_str(evidence_path.read_text(encoding="utf-8"))
+                ir = evidence_ir.read_json_file(evidence_path)
                 metafile_text.materialize_children(dr_rag / f"{rel}.assets")
                 assets = ocr_router.inventory_assets(dr_rag / f"{rel}.assets")
                 manifest = ocr_router.build_manifest(ir, source_rel_path=rel, assets=assets)
@@ -1228,7 +1228,7 @@ def _write_ocr_routes(stage_ir: Path, stage_rag: Path) -> dict:
     for path in sorted(stage_ir.rglob("*.evidence.json")):
         rel = path.relative_to(stage_ir).as_posix()
         source_rel_path = rel[: -len(".evidence.json")]
-        ir = evidence_ir.from_json_str(path.read_text(encoding="utf-8"))
+        ir = evidence_ir.read_json_file(path)
         assets = ocr_router.inventory_assets(stage_rag / f"{source_rel_path}.assets")
         manifest = ocr_router.build_manifest(ir, source_rel_path=source_rel_path, assets=assets)
         ocr_router.write_json_atomic(stage_ir / f"{source_rel_path}.ocr_route.json", manifest)
@@ -1650,8 +1650,25 @@ def _conv_cache_lookup(cache_root: Path, rel: str, want_key: str) -> tuple[dict,
     return rep_delta, content_dir
 
 
+def _link_or_copy(src, dst) -> None:
+    """`src` を `dst` へハードリンクする。リンクできない（別ファイルシステム・権限・未対応の置き場）ときはそのファイルだけコピーする。
+
+    設計: docs/design/rag.md「変換結果の保存と戻し」。
+    リンク先とは中身を共有するので、キャッシュに入るファイルは差し替え方式（`json_io.write_*_atomic`）で書くこと。
+    """
+    src, dst = Path(src), Path(dst)
+    dst.unlink(missing_ok=True)
+    if not src.is_symlink():
+        try:
+            os.link(src, dst)
+            return
+        except OSError:
+            _log.debug("ハードリンクできないためコピーします: %s", src, exc_info=True)
+    shutil.copy2(src, dst)
+
+
 def _conv_cache_restore(content_dir: Path, rel: str, dr: Path, dr_rag: Path, dr_ir: Path) -> bool:
-    """キャッシュ内容一式を 3 層のステージングへコピーする（成功時 True）。失敗（OSError）したら呼び出し元は実変換へフォールバックする。"""
+    """キャッシュ内容一式を 3 層のステージングへ戻す（ハードリンク・作れなければコピー。成功時 True）。失敗（OSError）したら呼び出し元は実変換へフォールバックする。"""
     roots = {"md": dr, "rag": dr_rag, "ir": dr_ir}
     try:
         for suffix in _CONV_CACHE_SIDECAR_SUFFIXES:
@@ -1660,12 +1677,12 @@ def _conv_cache_restore(content_dir: Path, rel: str, dr: Path, dr_rag: Path, dr_
                 continue
             dst = roots[_LAYER_FOR_SIDECAR_SUFFIX[suffix]] / (rel + suffix)
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            _link_or_copy(src, dst)
         assets_src = content_dir / "rag" / (rel + ".assets")
         if assets_src.is_dir():
             assets_dst = dr_rag / (rel + ".assets")
             shutil.rmtree(assets_dst, ignore_errors=True)
-            shutil.copytree(assets_src, assets_dst)
+            shutil.copytree(assets_src, assets_dst, copy_function=_link_or_copy)
         return True
     except OSError:
         _log.warning(
@@ -1677,7 +1694,7 @@ def _conv_cache_store(cache_root: Path, rel: str, key: str, rep_delta: dict,
                       dr: Path, dr_rag: Path, dr_ir: Path) -> None:
     """この rel の変換結果一式（成功時のみ呼ばれる）をキャッシュへ保存する（best-effort）。
 
-    一時 dir へコピーしてから改名する。メタ JSON（鍵・rep_delta）は内容の改名が終わった後に書く（鍵一致だけがヒット判定の根拠のため）。
+    一時 dir へハードリンク（作れなければコピー）してから改名する。メタ JSON（鍵・rep_delta）は内容の改名が終わった後に書く（鍵一致だけがヒット判定の根拠のため）。
     失敗しても取り込みは継続する。
     """
     roots = {"md": dr, "rag": dr_rag, "ir": dr_ir}
@@ -1693,11 +1710,11 @@ def _conv_cache_store(cache_root: Path, rel: str, key: str, rep_delta: dict,
                 continue
             dst = tmp_dir / layer / (rel + suffix)
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            _link_or_copy(src, dst)
             wrote_any = True
         assets_src = dr_rag / (rel + ".assets")
         if assets_src.is_dir():
-            shutil.copytree(assets_src, tmp_dir / "rag" / (rel + ".assets"))
+            shutil.copytree(assets_src, tmp_dir / "rag" / (rel + ".assets"), copy_function=_link_or_copy)
             wrote_any = True
         if not wrote_any:                     # 何も書かれなかった rel はキャッシュする意味が無い
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -2045,7 +2062,7 @@ def _build_derived_into_staging(
         if notice_md is not None:
             dst = dr / (rel + ".md")
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text(notice_md, encoding="utf-8")
+            json_io.write_text_atomic(dst, notice_md)
             notice_result = _arms.ArmResult(
                 md=notice_md,
                 method="source_failure_notice",
@@ -2106,7 +2123,7 @@ def _build_derived_into_staging(
                     if notice_md is not None:
                         dst = dr / (rel + ".md")
                         dst.parent.mkdir(parents=True, exist_ok=True)
-                        dst.write_text(notice_md, encoding="utf-8")
+                        json_io.write_text_atomic(dst, notice_md)
                         notice_result = _arms.ArmResult(
                             md=notice_md,
                             method="legacy_source_notice",
@@ -2171,7 +2188,7 @@ def _build_derived_into_staging(
                 )
                 dst = dr / (rel + ".md")
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.write_text(raster_md, encoding="utf-8")
+                json_io.write_text_atomic(dst, raster_md)
                 _write_prov(dst, "raster", result)
                 converted += 1
                 if rel in source_failure_notices:            # 失敗の知らせに縮退した結果は一覧に載せる（キャッシュには保存しない）
@@ -2199,7 +2216,7 @@ def _build_derived_into_staging(
                     if notice_md is not None:
                         dst = dr / (rel + ".md")
                         dst.parent.mkdir(parents=True, exist_ok=True)
-                        dst.write_text(notice_md, encoding="utf-8")
+                        json_io.write_text_atomic(dst, notice_md)
                         notice_result = _arms.ArmResult(
                             md=notice_md,
                             method="legacy_source_notice",
@@ -2255,7 +2272,7 @@ def _build_derived_into_staging(
                         if notice_md is not None:
                             dst = dr / (rel + ".md")
                             dst.parent.mkdir(parents=True, exist_ok=True)
-                            dst.write_text(notice_md, encoding="utf-8")
+                            json_io.write_text_atomic(dst, notice_md)
                             notice_result = _arms.ArmResult(
                                 md=notice_md,
                                 method="source_failure_notice",
@@ -2279,7 +2296,7 @@ def _build_derived_into_staging(
                     if rel in source_failure_notices and notice_md is not None:
                         dst = dr / (rel + ".md")
                         dst.parent.mkdir(parents=True, exist_ok=True)
-                        dst.write_text(notice_md, encoding="utf-8")
+                        json_io.write_text_atomic(dst, notice_md)
                         notice_result = _arms.ArmResult(
                             md=notice_md,
                             method="source_failure_notice",
@@ -2306,7 +2323,7 @@ def _build_derived_into_staging(
                 result.notes = list(result.notes) + extra_notes
             dst = dr / (rel + ".md")                          # 出力名は必ず**原本 rel**（台帳/grep が一致）
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text(result.md, encoding="utf-8")      # 出力MD は委譲変換のまま＝バイト一致（決定的）
+            json_io.write_text_atomic(dst, result.md)      # 出力MD は委譲変換のまま＝バイト一致（決定的）
             _check_partial_extraction(rp, result.md, rel, result.document, partial_extraction_suspected)
             if ext in (".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt") and arm_name == "ooxml":
                 human_md_sig_for_rel = _current_human_md_sig()
@@ -2355,7 +2372,7 @@ def _build_derived_into_staging(
                         artifact.unlink()
                         document_ir_generated = max(0, document_ir_generated - 1)
                     human_md_sig_for_rel = None       # .md を失敗noticeで上書き＝human_md版の記録は無効
-                    dst.write_text(evidence_md, encoding="utf-8")
+                    json_io.write_text_atomic(dst, evidence_md)
                     notice_result = _arms.ArmResult(
                         md=evidence_md,
                         method="source_failure_notice",
@@ -2878,7 +2895,7 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
             if _is_source_failure_notice(meta):
                 # Evidence sig は一致済みで RAG renderer だけが drift した経路。巨大な通常 Evidence は原本から再構築し、
                 # この source-level notice は小さい既存 IR を正本として読む。
-                ir = evidence_ir.from_json_str(evidence_path.read_text(encoding="utf-8"))
+                ir = evidence_ir.read_json_file(evidence_path)
             elif source_path.suffix.lower() in legacy_convert.LEGACY_EXT_MAP:
                 materialized = legacy_convert.ensure_ooxml(source_path, rel, legacy_cache)
                 if materialized is None:
@@ -2972,8 +2989,9 @@ def _write_provenance(
     if legacy_conversion is not None:
         meta["legacy_conversion"] = legacy_conversion
     try:
-        (md_path.parent / (md_path.name + ".meta.json")).write_text(
-            json.dumps(meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        json_io.write_text_atomic(
+            md_path.parent / (md_path.name + ".meta.json"),
+            json.dumps(meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
     except OSError:
         pass
 
