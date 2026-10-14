@@ -130,12 +130,15 @@ def _chunk_id_from_rag_md_span(world: str, doc_id: str, span) -> str | None:
         if not rag_md_path.is_file() or rag_md_path.is_symlink():
             return None
         with json_io.open_text_maybe_gzip(rag_md_path) as f:
-            for i, line in enumerate(es_index.iter_capped_lines(f), start=1):
-                if i > s:
-                    break
-                cid = es_index.rag_md_anchor_chunk_id(line.rstrip("\r\n"))
-                if cid is not None:
-                    current = cid
+            i = 0
+            for raw in es_index.iter_capped_lines(f):
+                for line in raw.splitlines() or [""]:   # 行番号は grep と同じ論理行（`str.splitlines()`）で数える
+                    i += 1
+                    if i > s:
+                        return current
+                    cid = es_index.rag_md_anchor_chunk_id(line)
+                    if cid is not None:
+                        current = cid
     except (OSError, UnicodeDecodeError, es_index.RagChunkLineTooLarge, *json_io.GZIP_READ_ERRORS):
         return None
     return current

@@ -1072,6 +1072,17 @@ def test_excerpts_region_for_chunk_reads_past_32mib(monkeypatch, big_table_pair)
     assert excerpts._region_for_chunk("w", "a.xlsx", f"r{n}") == {"sheet": "S1", "cell_range": f"A{n}:E{n}"}
 
 
+def test_excerpts_span_counts_logical_lines_like_grep(monkeypatch, tmp_path):
+    """U+2028 などを含む rag.md でも、grep と同じ論理行で span を chunk_id へ逆引きする。"""
+    from sherpa import excerpts, worlds
+    md = tmp_path / "a.xlsx.rag.md"
+    md.write_text("<!-- chunk:r1 -->\n値\u2028続き\n\n<!-- chunk:r2 -->\n行2\n\n<!-- chunk:r3 -->\n行3\n", encoding="utf-8")
+    monkeypatch.setattr(worlds, "rag_md_path", lambda world, doc_id: md)
+    lines = md.read_text(encoding="utf-8").splitlines()
+    span_line = lines.index("<!-- chunk:r3 -->")   # r2 の節の最後の行（次のアンカーの直前・1 始まり）
+    assert excerpts._chunk_id_from_rag_md_span("w", "a.xlsx", (span_line, span_line)) == "r2"
+
+
 def test_validate_rag_chunks_does_not_slurp_jsonl_via_read_text(monkeypatch, tmp_path):
     p, md = _rag_pair(tmp_path)
     original_read_text = Path.read_text
