@@ -3385,7 +3385,7 @@ def _pdf_cell_slot(group: dict[str, Any], grid: tuple[Any, ...]) -> tuple[int, i
     x = float(bbox[0])
     y = float(group.get("baseline_y", (bbox[1] + bbox[3]) / 2))
     column = next((index for index, (left, right) in enumerate(zip(xs, xs[1:], strict=False), start=1)
-                   if left - 0.75 <= x < right + 0.75), None)
+                   if left - 0.75 <= x < right), None)
     row = next((index for index, (top, bottom) in enumerate(zip(ys, ys[1:], strict=False), start=1)
                 if bottom - 0.75 <= y <= top + 0.75), None)
     return (row, column) if row is not None and column is not None else None
