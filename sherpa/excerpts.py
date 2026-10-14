@@ -129,10 +129,11 @@ def _chunk_id_from_rag_md_span(world: str, doc_id: str, span) -> str | None:
     try:
         if not rag_md_path.is_file() or rag_md_path.is_symlink():
             return None
-        with json_io.open_text_maybe_gzip(rag_md_path) as f:
+        with json_io.open_text_maybe_gzip(rag_md_path, newline="\n") as f:
             i = 0
             for raw in es_index.iter_capped_lines(f):
-                for line in raw.splitlines() or [""]:   # 行番号は grep と同じ論理行（`str.splitlines()`）で数える
+                segment = raw[:-1] if raw.endswith("\n") else raw
+                for line in segment.splitlines() or [""]:   # 行番号は grep と同じ論理行（`\n` で区切った区間ごとの `splitlines()`）で数える
                     i += 1
                     if i > s:
                         return current

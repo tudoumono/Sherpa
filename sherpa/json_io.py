@@ -25,15 +25,15 @@ def is_gzip_file(path) -> bool:
         return False
 
 
-def open_text_maybe_gzip(path, *, errors: str = "strict"):
-    """テキストとして開く（gzip でも非圧縮でも同じ使い方・`with` で閉じる・1 行ずつ読める）。
+def open_text_maybe_gzip(path, *, errors: str = "strict", newline: str | None = None):
+    """テキストとして開く（gzip でも非圧縮でも同じ使い方・`with` で閉じる・1 行ずつ読める）。`newline` は `io.TextIOWrapper` と同じ。
     設計: docs/design/rag.md「派生物」。"""
     raw = open(path, "rb")
     try:
         head = raw.read(2)
         raw.seek(0)
         stream = gzip.GzipFile(fileobj=raw, mode="rb") if head == _GZIP_MAGIC else raw
-        return io.TextIOWrapper(stream, encoding="utf-8", errors=errors)
+        return io.TextIOWrapper(stream, encoding="utf-8", errors=errors, newline=newline)
     except BaseException:
         raw.close()
         raise
