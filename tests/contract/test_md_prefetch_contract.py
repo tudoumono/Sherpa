@@ -108,7 +108,7 @@ def test_unused_prefetched_assets_are_removed(tmp_path):
     assets = tmp_path / "rag" / "a.docx.assets"
     job = md_prefetch.Job("a.docx", str(src), "ooxml", ".docx", render=True, assets_dir=str(assets))
     with md_prefetch.Prefetcher([job], 1) as pf:
-        pf._inflight[0][1].result()
+        pf._inflight["a.docx"][1].result()
         assert assets.is_dir()
         src.write_bytes(src.read_bytes() + b"\0")     # 子が読んだ後に原本が変わった
         assert pf.take("a.docx", src) is None
@@ -142,9 +142,36 @@ def test_source_changed_after_child_read_is_not_used(tmp_path):
     src = tmp_path / "a.pdf"
     shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-PDF-EASY.pdf", src)
     with md_prefetch.Prefetcher([md_prefetch.Job("a.pdf", str(src), "pdf_text", ".pdf")], 1) as pf:
-        pf._inflight[0][1].result()                   # 子が読み終えるまで待つ
+        pf._inflight["a.pdf"][1].result()             # 子が読み終えるまで待つ
         shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-PDF-MEDIUM.pdf", src)
         assert pf.take("a.pdf", src) is None
+
+
+def test_submits_largest_first_but_takes_in_name_order_within_window(tmp_path):
+    """提出は大きい順・`take` は名前順で、各 rel に正しい結果が対応し、未取得は 窓（ワーカー数×2）＋1 件を超えない。"""
+    base = (FIXTURES / "eval/office_ja/inputs/OJA-PDF-EASY.pdf").read_bytes()
+    names = ["a.pdf", "b.pdf", "c.pdf", "d.pdf", "e.pdf", "f.pdf"]
+    pads = {"a.pdf": 10, "b.pdf": 50, "c.pdf": 20, "d.pdf": 60, "e.pdf": 30, "f.pdf": 40}   # 大きい順 d b f e c a
+    jobs = []
+    for n in names:
+        (tmp_path / n).write_bytes(base + b"\n%" + b"x" * pads[n] + b"\n")
+        jobs.append(md_prefetch.Job(n, str(tmp_path / n), "pdf_text", ".pdf"))
+    peak = []
+
+    class Watched(md_prefetch.Prefetcher):
+        def _submit(self, job):
+            ok = super()._submit(job)
+            peak.append(len(self._inflight))
+            return ok
+
+    with Watched(jobs, 1) as pf:
+        assert list(pf._inflight) == ["d.pdf", "b.pdf"]          # 先頭の窓は大きい順
+        for n in names:
+            got = pf.take(n, tmp_path / n)
+            assert got is not None and got.source_stat[0] == (tmp_path / n).stat().st_size
+            assert len(pf._inflight) <= 2
+    assert max(peak) <= 2 * 1 + 1
+    assert pf.used == len(names) and pf.max_rss_kb > 0
 
 
 @pytest.mark.parametrize("raw", ["0", "9", "x", ""])

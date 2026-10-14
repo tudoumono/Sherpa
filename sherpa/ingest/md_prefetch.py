@@ -67,6 +67,7 @@ class Prefetched:
 
     `has_document`＝アームが Document IR を作れたか。`partial`＝`_check_partial_extraction` の追記分。
     `evidence`＝Evidence を作る拡張子のときだけ（xlsx は `excel_display` 適用済み）。描画まで済んだとき（`rendered`）は None。
+    `max_rss_kb`＝子プロセスのここまでの最大メモリ（KB）。
     `source_stat`＝子が原本を読む直前の `source_stat()`。`guard_ok`＝子での入口ガードの再判定が通ったか（False なら変換していない）。
     """
     arm_name: str
@@ -78,6 +79,7 @@ class Prefetched:
     source_stat: tuple | None = None
     guard_ok: bool = True
     rendered: Rendered | None = None
+    max_rss_kb: int = 0
 
 
 def source_stat(path) -> tuple | None:
@@ -89,8 +91,25 @@ def source_stat(path) -> tuple | None:
     return (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
+def _max_rss_kb() -> int:
+    """この子プロセスの最大 RSS（KB）。取れなければ 0。"""
+    try:
+        import resource
+        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:
+        return 0
+
+
 def compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = False,
             assets_dir: str | None = None, obs_dir: str | None = None) -> Prefetched:
+    """子プロセスで動く。結果に子の最大メモリを載せる（`_compute`）。"""
+    got = _compute(path_str, arm_name, ext, rel, render, assets_dir, obs_dir)
+    got.max_rss_kb = _max_rss_kb()
+    return got
+
+
+def _compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = False,
+             assets_dir: str | None = None, obs_dir: str | None = None) -> Prefetched:
     """子プロセスで動く。① 原本の stat を取り入口ガードを判定し直す ② アームで変換 ③ 消費前の Document IR から document.json・部分抽出の疑いを作る
     ④ Evidence を抽出する ⑤ `render` のときは素材の書出し・描画まで行い、親が書く中身を返す（失敗したら素材を消して Evidence までで返す）。"""
     from . import document_ir, evidence_spike, excel_display, office_md
@@ -135,19 +154,23 @@ def compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = Fal
 
 
 class Prefetcher:
-    """`jobs` の順に先読みし、`take(rel)` で同じ順に結果を渡す。未取得（提出済み＋完了待ち）は ワーカー数×2 件まで。
+    """`jobs` を原本の大きい順に提出し、`take(rel)` で親のループ順（`jobs` の順）に結果を渡す。
 
+    提出済みで未取得（計算中＋完了待ち）は ワーカー数×2 件まで。`take` した rel が未提出なら窓に関係なく先に提出する（超過は 1 件まで）。
     子の例外・プロセス死・想定外の形は `take` が None を返す＝呼び出し側が直列経路で計算し直す。
     """
 
     def __init__(self, jobs: list[Job], workers: int):
-        self._queue: deque[Job] = deque(jobs)
-        self._inflight: deque[tuple[Job, Future]] = deque()
+        self._order = {j.rel: i for i, j in enumerate(jobs)}
+        sizes = {j.rel: (source_stat(j.path) or (0,))[0] for j in jobs}
+        self._queue: deque[Job] = deque(sorted(jobs, key=lambda j: (-sizes[j.rel], j.rel)))
+        self._inflight: dict[str, tuple[Job, Future]] = {}
         self._known = {j.rel for j in jobs}
         self._window = workers * _WINDOW_PER_WORKER
         self._planned = len(jobs)
         self.used = 0
         self.rendered = 0
+        self.max_rss_kb = 0                                # 子の最大メモリ（全子の最大値）
         self._leftover_dirs: list[str] = []                # 使われなかった子が書いた素材（終了時に消す）
         self._unclaimed: dict[str, str] = {}               # 結果を取り出したが親がまだ描画結果を使っていない rel の素材
         self._pool: ProcessPoolExecutor | None = ProcessPoolExecutor(
@@ -160,39 +183,51 @@ class Prefetcher:
     def __exit__(self, *exc) -> None:
         self.close()
 
+    def _submit(self, job: Job) -> bool:
+        try:
+            fut = self._pool.submit(compute, job.path, job.arm_name, job.ext, job.rel,
+                                    job.render, job.assets_dir, job.obs_dir)
+        except Exception:
+            _log.warning("MD化の先読みを提出できませんでした（直列で処理します）", exc_info=True)
+            self._queue.clear()
+            return False
+        self._inflight[job.rel] = (job, fut)
+        return True
+
     def _pump(self) -> None:
         while self._pool is not None and self._queue and len(self._inflight) < self._window:
-            job = self._queue.popleft()
-            try:
-                fut = self._pool.submit(compute, job.path, job.arm_name, job.ext, job.rel,
-                                        job.render, job.assets_dir, job.obs_dir)
-            except Exception:
-                _log.warning("MD化の先読みを提出できませんでした（直列で処理します）", exc_info=True)
-                self._queue.clear()
+            if not self._submit(self._queue.popleft()):
                 return
-            self._inflight.append((job, fut))
+
+    def _drop_before(self, rel: str) -> None:
+        """ループ順で `rel` より前の未取得分（ループが飛ばしたファイル）を捨てる。"""
+        limit = self._order[rel]
+        for r in [r for r in self._inflight if self._order[r] < limit]:
+            skipped, stale = self._inflight.pop(r)
+            stale.cancel()
+            self._known.discard(r)
+            if skipped.assets_dir:
+                self._leftover_dirs.append(skipped.assets_dir)
+        for job in [j for j in self._queue if self._order[j.rel] < limit]:
+            self._queue.remove(job)
+            self._known.discard(job.rel)
 
     def take(self, rel: str, path) -> Prefetched | None:
         """`rel` の先読み結果。対象外・失敗・子のガード不通過・子が読んだ後に原本が変わったものは None。
 
-        `rel` より前の未取得分（ループが飛ばしたファイル）は捨てる。
+        ループ順で `rel` より前の未取得分（ループが飛ばしたファイル）は捨てる。
         """
         if rel not in self._known:
             return None
-        while self._inflight and self._inflight[0][0].rel != rel:
-            skipped, stale = self._inflight.popleft()
-            stale.cancel()
-            self._known.discard(skipped.rel)
-            if skipped.assets_dir:
-                self._leftover_dirs.append(skipped.assets_dir)
-        if not self._inflight:
-            while self._queue and self._queue[0].rel != rel:
-                self._known.discard(self._queue.popleft().rel)
-            self._pump()
-        if not self._inflight or self._inflight[0][0].rel != rel:
-            self._known.discard(rel)
-            return None
-        job, fut = self._inflight.popleft()
+        self._drop_before(rel)
+        if rel not in self._inflight:
+            queued = next((j for j in self._queue if j.rel == rel), None)
+            if queued is not None:
+                self._queue.remove(queued)
+            if queued is None or self._pool is None or not self._submit(queued):
+                self._known.discard(rel)
+                return None
+        job, fut = self._inflight.pop(rel)
         self._known.discard(rel)
         self._pump()
         try:
@@ -205,6 +240,7 @@ class Prefetcher:
             _log.warning("MD化の先読み結果の形が想定外でした（直列で計算し直します）")
             self._discard_assets(job)
             return None
+        self.max_rss_kb = max(self.max_rss_kb, got.max_rss_kb)
         if not got.guard_ok or got.source_stat is None or got.source_stat != source_stat(path):
             self._discard_assets(job)
             return None                                   # 子が読んだ後に原本が変わった＝古い中身を新しいキャッシュキーで残さない
@@ -227,7 +263,7 @@ class Prefetcher:
     def close(self) -> None:
         pool, self._pool = self._pool, None
         self._queue.clear()
-        self._leftover_dirs.extend(j.assets_dir for j, _f in self._inflight if j.assets_dir)
+        self._leftover_dirs.extend(j.assets_dir for j, _f in self._inflight.values() if j.assets_dir)
         self._inflight.clear()
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
@@ -235,5 +271,5 @@ class Prefetcher:
                 shutil.rmtree(leftover, ignore_errors=True)
             self._leftover_dirs.clear()
             self._unclaimed.clear()
-            _log.info("MD化の先読みを使いました: %d/%d件（うち描画まで子で済んだ件数 %d）",
-                      self.used, self._planned, self.rendered)
+            _log.info("MD化の先読みを使いました: %d/%d件（うち描画まで子で済んだ件数 %d）・子の最大メモリ %dMB",
+                      self.used, self._planned, self.rendered, self.max_rss_kb // 1024)
