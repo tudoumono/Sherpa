@@ -958,6 +958,14 @@ def _build_figure_texts(extracted_evidence, assets_dir: Path,
         return {}
 
 
+def _vlm_observation_possible() -> bool:
+    """`vision` が有効アームにあり VLM が実効利用可か（False なら `_build_vlm_observation_set` は VLM を呼ばない）。"""
+    from . import arms as _arms
+    from .arms import vision_arm
+
+    return "vision" in set(_arms.enabled_arm_names()) and vision_arm.resolve_vlm() is not None
+
+
 def _build_vlm_observation_set(extracted_evidence, rel: str, assets_dir: Path):
     """`vision` が有効かつ VLM 実効可のときだけ、canonical が読めない画像要素を補足観測する。
 
@@ -965,14 +973,10 @@ def _build_vlm_observation_set(extracted_evidence, rel: str, assets_dir: Path):
     候補選定は `ocr_router.build_manifest` を呼び直すだけで、`.ocr_route.json` とは独立。
     `asset_root` は直前に抽出済みの `{rel}.assets/`。
     """
-    from . import arms as _arms
     from . import ocr_router
     from .arms import vision_arm
 
-    names = set(_arms.enabled_arm_names())
-    if "vision" not in names:
-        return None
-    if vision_arm.resolve_vlm() is None:
+    if not _vlm_observation_possible():
         return None
     assets = ocr_router.inventory_assets(assets_dir)
     if not assets:
@@ -1028,12 +1032,14 @@ def _load_ocr_observation_sets(extracted_evidence, rel: str, obs_dir: Path | Non
     return sets
 
 
-def _build_observation_set(extracted_evidence, rel: str, assets_dir: Path, *, obs_dir: Path | None = None):
+def _build_observation_set(extracted_evidence, rel: str, assets_dir: Path, *, obs_dir: Path | None = None,
+                           with_vlm: bool = True):
     """VLM（同期）と OCR（非同期・公開済み分）の観測 Set を合流し、`evidence_render.render` へ渡す 1 つの Set にする。
+    `with_vlm=False` は VLM を呼ばない（先読みの子用。親が VLM の補足観測が起きないと判定済みのとき）。
 
     どちらも無ければ None。片方だけなら合成せずそのまま返す。両方あるときだけ `merge_sets` で畳み、合流が失敗したら VLM 単独へ縮退する。
     """
-    vlm_set = _build_vlm_observation_set(extracted_evidence, rel, assets_dir)
+    vlm_set = _build_vlm_observation_set(extracted_evidence, rel, assets_dir) if with_vlm else None
     ocr_sets = _load_ocr_observation_sets(extracted_evidence, rel, obs_dir)
     candidates = list(ocr_sets)
     if vlm_set is not None:
@@ -1049,6 +1055,25 @@ def _build_observation_set(extracted_evidence, rel: str, assets_dir: Path, *, ob
         _log.warning(
             "VLM/OCR 観測 Set の合流に失敗しました（VLM 単独へ縮退します）: %s", rel, exc_info=True)
         return vlm_set
+
+
+def _render_evidence_for_prefetch(path: Path, rel: str, evidence, assets_dir: Path, obs_dir: Path | None):
+    """先読みの子で動く。① evidence.json の gzip ② 素材の書出し ③ OCR 観測（VLM なし） ④ 図の中の文字 ⑤ 描画と chunks の直列化。
+    ファイルは素材以外書かず、親が書く中身を返す（`_generate_evidence` と同じ順・同じ関数）。
+    設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
+    """
+    from . import evidence_ir, evidence_render
+    from .md_prefetch import Rendered
+
+    evidence_gz = evidence_ir.to_gzip_bytes(evidence)
+    _extract_evidence_assets(path, path, evidence, assets_dir)
+    observation_set = _build_observation_set(evidence, rel, assets_dir, obs_dir=obs_dir, with_vlm=False)
+    figure_drops: dict = {}
+    figure_texts = _build_figure_texts(evidence, assets_dir, figure_drops)
+    rendered = evidence_render.render(
+        evidence, source_name=rel, observation_set=observation_set, figure_texts=figure_texts)
+    return Rendered(evidence_gz, rendered.markdown, evidence_render.chunks_gzip_bytes(rendered.chunks),
+                    figure_drops, str(assets_dir))
 
 
 def _is_source_failure_notice(meta: object) -> bool:
@@ -1776,10 +1801,16 @@ def _precheck_target(rp: Path, ext: str, conv) -> tuple[str, str | None, dict | 
     return "ok", None, None
 
 
-def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit) -> list:
-    """先読みする対象。ループ本体と同じ判定（候補・ガード・変換キャッシュのヒット）を通り、ooxml／pdf_text が受理する前段変換なしのファイルだけ。"""
+def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit, obs_dir=None, assets_root=None) -> list:
+    """先読みする対象。ループ本体と同じ判定（候補・ガード・変換キャッシュのヒット）を通り、ooxml／pdf_text が受理する前段変換なしのファイルだけ。
+
+    `assets_root` を渡すと、VLM の補足観測が起きない（xlsx は Office 表示補完も無効）ファイルは子で描画まで行う（`Job.render`）。判定はここで 1 回だけ。
+    """
+    from . import office_native_display
     from .md_prefetch import PREFETCH_ARMS, Job
     prefetchable = CONVERTIBLE_EXT | PDF_EXT
+    render_ok = assets_root is not None and not _vlm_observation_possible()
+    native_display = office_native_display.config().enabled if render_ok else True
     jobs = []
     for rp, rel in targets:
         ext = rp.suffix.lower()
@@ -1792,7 +1823,11 @@ def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit) -> list:
         except Exception:
             continue                                  # 判定の失敗は本体ループが同じ判定で扱う
         if arm is not None and arm.name in PREFETCH_ARMS:
-            jobs.append(Job(rel=rel, path=str(rp), arm_name=arm.name, ext=ext))
+            render = render_ok and not (ext == ".xlsx" and native_display)
+            jobs.append(Job(
+                rel=rel, path=str(rp), arm_name=arm.name, ext=ext, render=render,
+                assets_dir=str(assets_root / (rel + ".assets")) if render else None,
+                obs_dir=str(obs_dir) if render and obs_dir is not None else None))
     return jobs
 
 
@@ -1917,17 +1952,22 @@ def _build_derived_staging_body(
         legacy_conversion: dict | None = None,
         prebuilt_evidence=None,
         precomputed_evidence=None,
+        prerendered=None,
     ) -> str | None:
         nonlocal evidence_ir_generated, evidence_ir_failed, rag_generated, rag_failed
         nonlocal office_display_requested, office_display_applied, office_display_fallback_docs
         actual = extraction_path or rp
         display_report: dict = {}
         try:
-            extracted_evidence = prebuilt_evidence or _extract_canonical_evidence(
-                rp, extraction_path=actual, legacy_ir=legacy_ir, consume_legacy=consume_legacy,
-                legacy_conversion=legacy_conversion, office_display_report=display_report,
-                precomputed=precomputed_evidence)
-            evidence_ir.write_json_atomic(dr_ir / (rel + ".evidence.json"), extracted_evidence)
+            if prerendered is not None:          # 先読みの子が描画まで済ませた＝中身をそのまま書く
+                extracted_evidence = None
+                json_io.write_bytes_atomic(dr_ir / (rel + ".evidence.json"), prerendered.evidence_gz)
+            else:
+                extracted_evidence = prebuilt_evidence or _extract_canonical_evidence(
+                    rp, extraction_path=actual, legacy_ir=legacy_ir, consume_legacy=consume_legacy,
+                    legacy_conversion=legacy_conversion, office_display_report=display_report,
+                    precomputed=precomputed_evidence)
+                evidence_ir.write_json_atomic(dr_ir / (rel + ".evidence.json"), extracted_evidence)
             evidence_ir_generated += 1
         except OSError:
             evidence_ir_failed += 1
@@ -1966,25 +2006,34 @@ def _build_derived_staging_body(
             assets_dir = dr_rag / (rel + ".assets")
             observation_set = None
             figure_texts = None
-            if prebuilt_evidence is None or actual.suffix.lower() not in LEGACY_OFFICE_EXT:
-                _extract_evidence_assets(rp, actual, extracted_evidence, assets_dir)
-                observation_set = _build_observation_set(extracted_evidence, rel, assets_dir, obs_dir=obs_dir)
-                figure_drops: dict = {}
-                figure_texts = _build_figure_texts(extracted_evidence, assets_dir, figure_drops)
+            figure_drops: dict = {}
+            if prerendered is not None or prebuilt_evidence is None or actual.suffix.lower() not in LEGACY_OFFICE_EXT:
+                if prerendered is not None:
+                    figure_drops = prerendered.figure_drops
+                else:
+                    _extract_evidence_assets(rp, actual, extracted_evidence, assets_dir)
+                    observation_set = _build_observation_set(extracted_evidence, rel, assets_dir, obs_dir=obs_dir)
+                    figure_texts = _build_figure_texts(extracted_evidence, assets_dir, figure_drops)
                 pending_meta.clear()
                 if figure_drops:   # 文字・画像を上限で落とした図の件数を来歴へ残す（rag.md の本文は変えない）
                     if (dr / (rel + ".md.meta.json")).is_file():
                         _merge_provenance_metadata(dr / (rel + ".md"), {"metafile_truncated": figure_drops})
                     else:                                    # サイドカーはこの後の `_write_prov` が書くときに載せる
                         pending_meta["metafile_truncated"] = figure_drops
-            rendered = evidence_render.render(
-                extracted_evidence, source_name=rel, observation_set=observation_set,
-                figure_texts=figure_texts)
-            json_io.write_text_atomic(
-                dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(rendered.markdown))
-            evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
+            if prerendered is not None:
+                markdown = prerendered.markdown
+                json_io.write_text_atomic(dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(markdown))
+                json_io.write_bytes_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), prerendered.chunks_gz)
+            else:
+                rendered = evidence_render.render(
+                    extracted_evidence, source_name=rel, observation_set=observation_set,
+                    figure_texts=figure_texts)
+                markdown = rendered.markdown
+                json_io.write_text_atomic(
+                    dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(markdown))
+                evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
             rag_generated += 1
-            return rendered.markdown
+            return markdown
         except OSError:
             rag_failed += 1
             rag_failures.append({"doc": rel, "reason": "write_failed"})
@@ -2159,7 +2208,8 @@ def _build_derived_staging_body(
     workers = md_prefetch.worker_count()
     if workers > 1 and candidate_total > 1:
         jobs = _prefetch_jobs(targets, candidate=candidate, conv=conv, enabled=enabled,
-                              cache_hit=lambda rp, rel: _conv_cache_hit(rp, rel)[1])
+                              cache_hit=lambda rp, rel: _conv_cache_hit(rp, rel)[1],
+                              obs_dir=obs_dir, assets_root=dr_rag)
         if len(jobs) > 1:
             workers = min(workers, len(jobs))
             _log.info("MD化の重い計算を先読みします: %d件・ワーカー %d", len(jobs), workers)
@@ -2431,6 +2481,9 @@ def _build_derived_staging_body(
             if (ext in EVIDENCE_EXT and _evidence_arm_selected(ext, arm_name)) or legacy_conversion is not None:
                 # 現行 document.json/blocks/chunks を書き終えてから同じ Document IR を Evidence へ移す
                 # （consume_legacy で table cell list を順次空にし、密表で 2 組の cell object を同時保持しない）
+                prerendered = pre.rendered if pre is not None else None
+                if prerendered is not None:
+                    prefetch.claim(rel)
                 evidence_md = _generate_evidence(
                     rp,
                     rel,
@@ -2439,6 +2492,7 @@ def _build_derived_staging_body(
                     consume_legacy=result.document is not None,
                     legacy_conversion=legacy_conversion,
                     precomputed_evidence=pre.evidence if pre is not None else None,
+                    prerendered=prerendered,
                 )
                 result.document = None
                 if rel in source_failure_notices and evidence_md is not None:
@@ -2495,6 +2549,8 @@ def _build_derived_staging_body(
             processed_candidates += 1
             if progress is not None:
                 progress(processed_candidates, candidate_total)
+    if prefetch is not None:
+        prefetch.close()                                 # 子の終了を待ち、使われなかった素材を消す（公開前に済ませる）
     # per-file ループを完走したときだけ剪定する（`_conv_cache_prune` 参照）。
     # 途中死では呼ばれず、生きている rel のキャッシュは次回 sync で再利用できる。
     if only is None:

@@ -2078,7 +2078,16 @@ def write_chunks_atomic(path: str | Path, chunks: list[dict]) -> Path:
     """chunk配列を巨大な中間文字列へ複製せず、1件ずつgzipのJSONLへ原子書込する（設計: docs/design/rag.md「派生物」）。"""
     target = Path(path)
     with json_io.atomic_gzip_text_writer(target) as stream:
-        for chunk in chunks:
-            stream.write(json.dumps(chunk, ensure_ascii=False, sort_keys=True))
-            stream.write("\n")
+        stream.writelines(_chunk_lines(chunks))
     return target
+
+
+def _chunk_lines(chunks: list[dict]):
+    for chunk in chunks:
+        yield json.dumps(chunk, ensure_ascii=False, sort_keys=True)
+        yield "\n"
+
+
+def chunks_gzip_bytes(chunks: list[dict]) -> bytes:
+    """`write_chunks_atomic` が書くのと同じ gzip バイト列（別プロセスで直列化して親が書くとき用）。"""
+    return json_io.gzip_text_bytes(_chunk_lines(chunks))

@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "fixtures"
 CORPUS = (
     "eval/office_ja/inputs/OJA-PPTX-EASY.pptx",
+    "eval/office_ja/inputs/OJA-DOCX-HARD.docx",      # 画像（素材の書出し）を含む
+    "eval/office_ja/inputs/OJA-PPTX-HARD.pptx",
     "eval/office_ja/inputs/OJA-PDF-EASY.pdf",
     "eval/office_ja/inputs/OJA-PDF-MEDIUM.pdf",
     "eval/excel_ja/inputs/JPX-001.xlsx",
@@ -34,6 +36,7 @@ def _build(src: Path, out: Path, workers: int, monkeypatch, caplog) -> tuple[dic
     if workers > 1:   # 先読みの結果が実際に使われた（全件が直列へ戻って一致しているだけではない）
         used = [r.args for r in caplog.records if r.getMessage().startswith("MD化の先読みを使いました")]
         assert used and used[0][0] == used[0][1] > 0
+        assert used[0][2] > 0                  # 描画まで子で済んだ件数（全件が親へ戻って一致しているだけではない）
     files = {
         p.relative_to(out).as_posix(): p.read_bytes()
         for p in sorted(out.rglob("*"))
@@ -57,6 +60,67 @@ def test_workers_do_not_change_derived_bytes(tmp_path, monkeypatch, caplog):
     assert sorted(files3) == sorted(files1)
     assert [k for k in files1 if files1[k] != files3[k]] == []
     assert rep3 == rep1
+
+
+def _jobs_for(src: Path, tmp_path: Path):
+    from sherpa.ingest import arms
+
+    targets = [(p, p.name) for p in sorted(src.iterdir())]
+    return office_md._prefetch_jobs(
+        targets, candidate=office_md.OFFICE_EXT | office_md.convertible_exts(), conv=office_md.convertible_exts(),
+        enabled=arms.enabled_arms(), cache_hit=lambda rp, rel: None, obs_dir=None, assets_root=tmp_path / "rag")
+
+
+def test_child_does_not_render_when_vlm_may_observe(tmp_path, monkeypatch):
+    """VLM が使える構成では子で描画しない（VLM の補足観測は親でしか行わない）。使えないなら描画まで子へ任せる。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-DOCX-HARD.docx", src / "a.docx")
+    shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-PPTX-HARD.pptx", src / "b.pptx")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text,vision")
+    monkeypatch.setenv("SHERPA_VLM_USABLE", "1")
+    assert office_md._vlm_observation_possible()
+    assert [j.render for j in _jobs_for(src, tmp_path)] == [False, False]
+    monkeypatch.setenv("SHERPA_VLM_USABLE", "0")
+    assert not office_md._vlm_observation_possible()
+    jobs = _jobs_for(src, tmp_path)
+    assert [j.render for j in jobs] == [True, True]
+    assert jobs[0].assets_dir == str(tmp_path / "rag" / "a.docx.assets")
+
+
+def test_render_failure_in_child_falls_back_without_leftovers(tmp_path):
+    """子が素材を書けず描画に失敗したら、Evidence までで返し（親が描画し直す）、途中の素材を残さない。"""
+    src = tmp_path / "a.docx"
+    shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-DOCX-HARD.docx", src)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("file")                       # 素材の置き場の親がファイル＝書出しが OSError になる
+    job = md_prefetch.Job("a.docx", str(src), "ooxml", ".docx", render=True,
+                          assets_dir=str(blocker / "a.docx.assets"))
+    with md_prefetch.Prefetcher([job], 1) as pf:
+        got = pf.take("a.docx", src)
+    assert got is not None and got.rendered is None and got.evidence is not None
+
+
+def test_unused_prefetched_assets_are_removed(tmp_path):
+    """結果を使わない（原本が変わった）rel の素材は、親が計算し直す前に消える。使われなかった描画結果も終了時に消える。"""
+    src = tmp_path / "a.docx"
+    shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-DOCX-HARD.docx", src)
+    assets = tmp_path / "rag" / "a.docx.assets"
+    job = md_prefetch.Job("a.docx", str(src), "ooxml", ".docx", render=True, assets_dir=str(assets))
+    with md_prefetch.Prefetcher([job], 1) as pf:
+        pf._inflight[0][1].result()
+        assert assets.is_dir()
+        src.write_bytes(src.read_bytes() + b"\0")     # 子が読んだ後に原本が変わった
+        assert pf.take("a.docx", src) is None
+        assert not assets.exists()
+    src2 = tmp_path / "b.docx"
+    shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-DOCX-HARD.docx", src2)
+    assets2 = tmp_path / "rag" / "b.docx.assets"
+    job2 = md_prefetch.Job("b.docx", str(src2), "ooxml", ".docx", render=True, assets_dir=str(assets2))
+    with md_prefetch.Prefetcher([job2], 1) as pf:
+        got = pf.take("b.docx", src2)
+        assert got is not None and got.rendered is not None and assets2.is_dir()
+    assert not assets2.exists()                      # 親が `claim` しなかった描画結果の素材は残さない
 
 
 def test_failed_job_returns_none_and_next_job_still_runs():

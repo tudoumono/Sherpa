@@ -90,6 +90,19 @@ def atomic_gzip_text_writer(path):
         raise
 
 
+def gzip_text_bytes(parts) -> bytes:
+    """テキスト片の並びを `atomic_gzip_text_writer` と同じ条件で gzip し、バイト列で返す（同じ中身は同じバイト列）。"""
+    buf = io.BytesIO()
+    gz = gzip.GzipFile(filename="", mode="wb", fileobj=buf, compresslevel=_GZIP_LEVEL, mtime=0)
+    text = io.TextIOWrapper(gz, encoding="utf-8", newline="")
+    try:
+        text.writelines(parts)
+        text.flush()
+    finally:
+        text.close()
+    return buf.getvalue()
+
+
 def read_json(path, default=None):
     """JSON を安全に読む（gzip も可）。無い/壊れ/IO エラーは `default` を返す（呼び出し側のフォールバックに使う）。"""
     try:

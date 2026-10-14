@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import os
+import shutil
 from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
@@ -36,11 +37,28 @@ def worker_count() -> int:
 
 @dataclass(frozen=True)
 class Job:
-    """先読み 1 件（原本 rel・原本の絶対パス・担当アーム名・拡張子）。"""
+    """先読み 1 件（原本 rel・原本の絶対パス・担当アーム名・拡張子）。
+
+    `render`＝子で rag.md の描画まで行う（親が判定済み。VLM の補足観測が起きない・xlsx の Office 表示補完が無効のとき）。
+    `assets_dir`＝子が素材を書く `dr_rag/(rel+".assets")`、`obs_dir`＝公開済み OCR 観測の置き場（親が解決済み）。
+    """
     rel: str
     path: str
     arm_name: str
     ext: str
+    render: bool = False
+    assets_dir: str | None = None
+    obs_dir: str | None = None
+
+
+@dataclass
+class Rendered:
+    """子が描画まで済ませた結果。親は中身をそのままファイルへ書く（素材は子が `assets_dir` へ書き済み）。"""
+    evidence_gz: bytes
+    markdown: str
+    chunks_gz: bytes
+    figure_drops: dict
+    assets_dir: str
 
 
 @dataclass
@@ -48,7 +66,7 @@ class Prefetched:
     """子の計算結果。`result.document` は常に None（実体は `document_json`／`evidence` に畳んで返す）。
 
     `has_document`＝アームが Document IR を作れたか。`partial`＝`_check_partial_extraction` の追記分。
-    `evidence`＝Evidence を作る拡張子のときだけ（xlsx は `excel_display` 適用済み）。
+    `evidence`＝Evidence を作る拡張子のときだけ（xlsx は `excel_display` 適用済み）。描画まで済んだとき（`rendered`）は None。
     `source_stat`＝子が原本を読む直前の `source_stat()`。`guard_ok`＝子での入口ガードの再判定が通ったか（False なら変換していない）。
     """
     arm_name: str
@@ -59,6 +77,7 @@ class Prefetched:
     evidence: object | None
     source_stat: tuple | None = None
     guard_ok: bool = True
+    rendered: Rendered | None = None
 
 
 def source_stat(path) -> tuple | None:
@@ -70,8 +89,10 @@ def source_stat(path) -> tuple | None:
     return (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
-def compute(path_str: str, arm_name: str, ext: str, rel: str) -> Prefetched:
-    """子プロセスで動く。① 原本の stat を取り入口ガードを判定し直す ② アームで変換 ③ 消費前の Document IR から document.json・部分抽出の疑いを作る ④ Evidence を抽出する。"""
+def compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = False,
+            assets_dir: str | None = None, obs_dir: str | None = None) -> Prefetched:
+    """子プロセスで動く。① 原本の stat を取り入口ガードを判定し直す ② アームで変換 ③ 消費前の Document IR から document.json・部分抽出の疑いを作る
+    ④ Evidence を抽出する ⑤ `render` のときは素材の書出し・描画まで行い、親が書く中身を返す（失敗したら素材を消して Evidence までで返す）。"""
     from . import document_ir, evidence_spike, excel_display, office_md
     from .arms import ooxml_arm, pdf_text_arm
 
@@ -99,7 +120,18 @@ def compute(path_str: str, arm_name: str, ext: str, rel: str) -> Prefetched:
         evidence = evidence_spike.extract(path, legacy_ir=document, consume_legacy=document is not None)
         if path.suffix.lower() == ".xlsx":
             excel_display.enrich_evidence(evidence, path)
-    return Prefetched(arm_name, result, document is not None, document_json, partial, evidence, stat)
+    rendered = None
+    if render and evidence is not None and assets_dir is not None:
+        try:
+            rendered = office_md._render_evidence_for_prefetch(
+                path, rel, evidence, Path(assets_dir), Path(obs_dir) if obs_dir else None)
+        except Exception:
+            _log.warning("MD化の先読みでの描画に失敗しました（親が計算し直します）: %s", rel, exc_info=True)
+            shutil.rmtree(assets_dir, ignore_errors=True)
+    if rendered is not None:
+        evidence = None
+    return Prefetched(arm_name, result, document is not None, document_json, partial, evidence, stat,
+                      rendered=rendered)
 
 
 class Prefetcher:
@@ -115,6 +147,9 @@ class Prefetcher:
         self._window = workers * _WINDOW_PER_WORKER
         self._planned = len(jobs)
         self.used = 0
+        self.rendered = 0
+        self._leftover_dirs: list[str] = []                # 使われなかった子が書いた素材（終了時に消す）
+        self._unclaimed: dict[str, str] = {}               # 結果を取り出したが親がまだ描画結果を使っていない rel の素材
         self._pool: ProcessPoolExecutor | None = ProcessPoolExecutor(
             max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
         self._pump()
@@ -129,7 +164,8 @@ class Prefetcher:
         while self._pool is not None and self._queue and len(self._inflight) < self._window:
             job = self._queue.popleft()
             try:
-                fut = self._pool.submit(compute, job.path, job.arm_name, job.ext, job.rel)
+                fut = self._pool.submit(compute, job.path, job.arm_name, job.ext, job.rel,
+                                        job.render, job.assets_dir, job.obs_dir)
             except Exception:
                 _log.warning("MD化の先読みを提出できませんでした（直列で処理します）", exc_info=True)
                 self._queue.clear()
@@ -147,6 +183,8 @@ class Prefetcher:
             skipped, stale = self._inflight.popleft()
             stale.cancel()
             self._known.discard(skipped.rel)
+            if skipped.assets_dir:
+                self._leftover_dirs.append(skipped.assets_dir)
         if not self._inflight:
             while self._queue and self._queue[0].rel != rel:
                 self._known.discard(self._queue.popleft().rel)
@@ -161,19 +199,41 @@ class Prefetcher:
             got = fut.result()
         except Exception as exc:
             _log.warning("MD化の先読みに失敗しました（直列で計算し直します）: %s", exc.__class__.__name__)
+            self._discard_assets(job)
             return None
         if not isinstance(got, Prefetched) or got.arm_name != job.arm_name:
             _log.warning("MD化の先読み結果の形が想定外でした（直列で計算し直します）")
+            self._discard_assets(job)
             return None
         if not got.guard_ok or got.source_stat is None or got.source_stat != source_stat(path):
+            self._discard_assets(job)
             return None                                   # 子が読んだ後に原本が変わった＝古い中身を新しいキャッシュキーで残さない
         self.used += 1
+        if got.rendered is not None:
+            self.rendered += 1
+            self._unclaimed[rel] = got.rendered.assets_dir
         return got
+
+    def claim(self, rel: str) -> None:
+        """親が `rel` の描画結果を使う（素材をそのまま残す）。使わなかった分は `close` が消す。"""
+        self._unclaimed.pop(rel, None)
+
+    @staticmethod
+    def _discard_assets(job: Job) -> None:
+        """結果を使わない rel の素材を消す（親が計算し直す前に、子の途中までの書込みを残さない）。"""
+        if job.assets_dir:
+            shutil.rmtree(job.assets_dir, ignore_errors=True)
 
     def close(self) -> None:
         pool, self._pool = self._pool, None
         self._queue.clear()
+        self._leftover_dirs.extend(j.assets_dir for j, _f in self._inflight if j.assets_dir)
         self._inflight.clear()
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
-            _log.info("MD化の先読みを使いました: %d/%d件", self.used, self._planned)
+            for leftover in (*self._leftover_dirs, *self._unclaimed.values()):
+                shutil.rmtree(leftover, ignore_errors=True)
+            self._leftover_dirs.clear()
+            self._unclaimed.clear()
+            _log.info("MD化の先読みを使いました: %d/%d件（うち描画まで子で済んだ件数 %d）",
+                      self.used, self._planned, self.rendered)
