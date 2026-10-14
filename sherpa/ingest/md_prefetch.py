@@ -219,9 +219,8 @@ class Prefetcher:
             self._known.discard(r)
             if skipped.assets_dir:
                 self._leftover_dirs.append(skipped.assets_dir)
-        for job in [j for j in self._queue if self._order[j.rel] < limit]:
-            self._queue.remove(job)
-            self._known.discard(job.rel)
+        while self._queue and self._order[self._queue[0].rel] < limit:   # 未提出の列は名前順（大きいものは最初に提出済み）
+            self._known.discard(self._queue.popleft().rel)
 
     def take(self, rel: str, path) -> Prefetched | None:
         """`rel` の先読み結果。対象外・失敗・子のガード不通過・子が読んだ後に原本が変わったものは None。
@@ -232,9 +231,7 @@ class Prefetcher:
             return None
         self._drop_before(rel)
         if rel not in self._inflight:
-            queued = next((j for j in self._queue if j.rel == rel), None)
-            if queued is not None:
-                self._queue.remove(queued)
+            queued = self._queue.popleft() if self._queue and self._queue[0].rel == rel else None
             if queued is None or self._pool is None or not self._submit(queued):
                 self._known.discard(rel)
                 return None
