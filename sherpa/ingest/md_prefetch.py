@@ -154,16 +154,19 @@ def _compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = Fa
 
 
 class Prefetcher:
-    """`jobs` を原本の大きい順に提出し、`take(rel)` で親のループ順（`jobs` の順）に結果を渡す。
+    """原本の大きい上位 ワーカー数 件を最初に提出し、残りは `jobs` の順に提出する。`take(rel)` は親のループ順（`jobs` の順）に結果を渡す。
 
-    提出済みで未取得（計算中＋完了待ち）は ワーカー数×2 件まで。`take` した rel が未提出なら窓に関係なく先に提出する（超過は 1 件まで）。
+    先に出した大きいものを除く提出済みで未取得（計算中＋完了待ち）は ワーカー数×2 件まで（未取得の合計は ワーカー数×3 件まで）。
+    `take` した rel が未提出なら窓に関係なく先に提出する（超過は 1 件まで）。
     子の例外・プロセス死・想定外の形は `take` が None を返す＝呼び出し側が直列経路で計算し直す。
     """
 
     def __init__(self, jobs: list[Job], workers: int):
         self._order = {j.rel: i for i, j in enumerate(jobs)}
         sizes = {j.rel: (source_stat(j.path) or (0,))[0] for j in jobs}
-        self._queue: deque[Job] = deque(sorted(jobs, key=lambda j: (-sizes[j.rel], j.rel)))
+        largest = sorted(jobs, key=lambda j: (-sizes[j.rel], j.rel))[:workers]
+        self._early = {j.rel for j in largest}               # 最初に提出する大きいもの（窓の外に数える）
+        self._queue: deque[Job] = deque(largest + [j for j in jobs if j.rel not in self._early])
         self._inflight: dict[str, tuple[Job, Future]] = {}
         self._known = {j.rel for j in jobs}
         self._window = workers * _WINDOW_PER_WORKER
@@ -195,9 +198,17 @@ class Prefetcher:
         return True
 
     def _pump(self) -> None:
-        while self._pool is not None and self._queue and len(self._inflight) < self._window:
-            if not self._submit(self._queue.popleft()):
+        while self._pool is not None and self._queue:
+            job = self._queue[0]
+            if job.rel not in self._early and self._windowed_inflight() >= self._window:
                 return
+            self._queue.popleft()
+            if not self._submit(job):
+                return
+
+    def _windowed_inflight(self) -> int:
+        """窓に数える未取得の件数（最初に出した大きいものを除く）。"""
+        return sum(1 for r in self._inflight if r not in self._early)
 
     def _drop_before(self, rel: str) -> None:
         """ループ順で `rel` より前の未取得分（ループが飛ばしたファイル）を捨てる。"""

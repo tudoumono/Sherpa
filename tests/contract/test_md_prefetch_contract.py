@@ -147,30 +147,27 @@ def test_source_changed_after_child_read_is_not_used(tmp_path):
         assert pf.take("a.pdf", src) is None
 
 
-def test_submits_largest_first_but_takes_in_name_order_within_window(tmp_path):
-    """提出は大きい順・`take` は名前順で、各 rel に正しい結果が対応し、未取得は 窓（ワーカー数×2）＋1 件を超えない。"""
+def test_largest_go_first_without_clogging_the_window(tmp_path):
+    """大きい上位 ワーカー数 件を最初に出し、残りは名前順。先に出した分が窓を塞がず、名前順の分は常に ワーカー数×2 件まで出ている。"""
     base = (FIXTURES / "eval/office_ja/inputs/OJA-PDF-EASY.pdf").read_bytes()
-    names = ["a.pdf", "b.pdf", "c.pdf", "d.pdf", "e.pdf", "f.pdf"]
-    pads = {"a.pdf": 10, "b.pdf": 50, "c.pdf": 20, "d.pdf": 60, "e.pdf": 30, "f.pdf": 40}   # 大きい順 d b f e c a
+    names = [f"{c}.pdf" for c in "abcdefghij"]
+    pads = {n: 10 + i for i, n in enumerate(names)}
+    pads["i.pdf"], pads["j.pdf"] = 5000, 6000                    # 名前順で最後の 2 件が最大
     jobs = []
     for n in names:
         (tmp_path / n).write_bytes(base + b"\n%" + b"x" * pads[n] + b"\n")
         jobs.append(md_prefetch.Job(n, str(tmp_path / n), "pdf_text", ".pdf"))
-    peak = []
-
-    class Watched(md_prefetch.Prefetcher):
-        def _submit(self, job):
-            ok = super()._submit(job)
-            peak.append(len(self._inflight))
-            return ok
-
-    with Watched(jobs, 1) as pf:
-        assert list(pf._inflight) == ["d.pdf", "b.pdf"]          # 先頭の窓は大きい順
-        for n in names:
+    workers, window = 2, 4
+    with md_prefetch.Prefetcher(jobs, workers) as pf:
+        assert list(pf._inflight)[:2] == ["j.pdf", "i.pdf"]       # 最初は大きい順
+        assert list(pf._inflight)[2:] == ["a.pdf", "b.pdf", "c.pdf", "d.pdf"]   # 残りは名前順で窓いっぱい
+        for k, n in enumerate(names):
             got = pf.take(n, tmp_path / n)
             assert got is not None and got.source_stat[0] == (tmp_path / n).stat().st_size
-            assert len(pf._inflight) <= 2
-    assert max(peak) <= 2 * 1 + 1
+            remaining_normal = len(names) - 2 - (k + 1)
+            if remaining_normal >= 0:
+                assert pf._windowed_inflight() == min(window, remaining_normal)
+            assert len(pf._inflight) <= window + workers
     assert pf.used == len(names) and pf.max_rss_kb > 0
 
 
