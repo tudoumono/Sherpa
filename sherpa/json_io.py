@@ -147,13 +147,20 @@ def write_text_atomic(path, text: str) -> Path:
     return p
 
 
-def write_bytes_atomic(path, data: bytes) -> Path:
-    """バイト列をアトミックに書く（新しい一時ファイルへ書いて差し替える＝ハードリンクで共有された元ファイルの中身は変わらない）。"""
+def write_bytes_atomic(path, data: bytes, *, durable: bool = False) -> Path:
+    """バイト列をアトミックに書く（新しい一時ファイルへ書いて差し替える＝ハードリンクで共有された元ファイルの中身は変わらない）。
+
+    `durable=True` は差し替えの前に fsync する（`atomic_gzip_text_writer` と同じ耐久性）。
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_bytes(data)
+        with open(tmp, "wb") as raw:
+            raw.write(data)
+            if durable:
+                raw.flush()
+                os.fsync(raw.fileno())
         os.replace(tmp, p)
     except OSError:
         try:

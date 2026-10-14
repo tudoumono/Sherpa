@@ -1961,7 +1961,7 @@ def _build_derived_staging_body(
         try:
             if prerendered is not None:          # 先読みの子が描画まで済ませた＝中身をそのまま書く
                 extracted_evidence = None
-                json_io.write_bytes_atomic(dr_ir / (rel + ".evidence.json"), prerendered.evidence_gz)
+                json_io.write_bytes_atomic(dr_ir / (rel + ".evidence.json"), prerendered.evidence_gz, durable=True)
             else:
                 extracted_evidence = prebuilt_evidence or _extract_canonical_evidence(
                     rp, extraction_path=actual, legacy_ir=legacy_ir, consume_legacy=consume_legacy,
@@ -2023,7 +2023,7 @@ def _build_derived_staging_body(
             if prerendered is not None:
                 markdown = prerendered.markdown
                 json_io.write_text_atomic(dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(markdown))
-                json_io.write_bytes_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), prerendered.chunks_gz)
+                json_io.write_bytes_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), prerendered.chunks_gz, durable=True)
             else:
                 rendered = evidence_render.render(
                     extracted_evidence, source_name=rel, observation_set=observation_set,
