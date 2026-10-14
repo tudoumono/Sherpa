@@ -3,7 +3,7 @@
 OOXML を直接パースする（Office/LibreOffice 非依存）。
 - .docx/.xlsx: document-ir 経由で人間向け MD にする（`human_md.render_docx`/`render_xlsx`）。
 - .pptx: スライド順にテキストを出す。
-- .pdf: テキスト層を抽出する（バックエンド pypdf）。到達不可なら None＝「未対応」。
+- .pdf: テキスト層を抽出する（バックエンド pdfium、無ければ pypdf）。到達不可なら None＝「未対応」。
 - .doc/.xls/.ppt（旧バイナリ）: 直接は扱わず、legacy_backend で OOXML へ前段変換してから OOXML 経路へ委譲する（`arms/legacy_convert.py`）。
 決定的（タイムスタンプ等を出さない・順序安定）。壊れたファイル/非 OOXML は例外を握って None。LLM は使わない。
 設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
@@ -181,12 +181,12 @@ _PARTIAL_SIZE_MAX_MD_BYTES = 512
 
 
 def _pdf_backend() -> str | None:
-    """利用可能な PDF テキスト抽出バックエンド名（優先順 pypdf > pdfminer.six）。無ければ None。
+    """利用可能な PDF テキスト抽出バックエンド名（優先順 pdfium > pypdf > pdfminer.six）。無ければ None。
 
-    pypdf は requirements.txt に同梱既定。いずれも到達不可なら PDF は「未対応」と表示する。
+    pypdfium2・pypdf は requirements.txt に同梱既定。いずれも到達不可なら PDF は「未対応」と表示する。
     テキスト層のみ（スキャン画像の視覚読み取りは vision）。
     """
-    for name, mod in (("pypdf", "pypdf"), ("pdfminer", "pdfminer.high_level")):
+    for name, mod in (("pdfium", "pypdfium2"), ("pypdf", "pypdf"), ("pdfminer", "pdfminer.high_level")):
         try:
             __import__(mod)
             return name
@@ -3298,7 +3298,7 @@ def _xlsx_md(p: Path) -> str | None:
     return _render_human_md(ir, p, ".xlsx") if ir is not None else None
 
 
-# ---- .pdf（テキスト層・バックエンド：pypdf＝同梱既定 / pdfminer.six＝任意）----
+# ---- .pdf（テキスト層・バックエンド：pdfium・pypdf＝同梱既定 / pdfminer.six＝任意）----
 
 def _normalize_pdf_text(txt: str) -> str:
     """PDF 抽出テキストを決定的に整形（改行正規化・行末空白除去・連続空行を1つに）。OCR はしない。"""
@@ -3316,9 +3316,40 @@ def _normalize_pdf_text(txt: str) -> str:
     return "\n".join(out).strip()
 
 
+def _pdfium_pages(p: Path) -> list[str] | None:
+    """pdfium でページ毎テキストを取る。開けない（暗号化・破損）・失敗は None＝pypdf 経路へ任せる。"""
+    from .evidence_spike import _PDFIUM_LOCK
+    try:
+        import pypdfium2 as pdfium
+        with _PDFIUM_LOCK:
+            document = pdfium.PdfDocument(str(p))
+            try:
+                pages = []
+                for index in range(len(document)):
+                    page = document[index]
+                    try:
+                        textpage = page.get_textpage()
+                        try:
+                            pages.append(textpage.get_text_range())
+                        finally:
+                            textpage.close()
+                    finally:
+                        page.close()
+                return pages
+            finally:
+                document.close()
+    except Exception:
+        return None
+
+
 def _pdf_pages(p: Path) -> list[str]:
     """PDF をページ毎テキストのリストに（バックエンド差を吸収）。バックエンド無/失敗は []。"""
     backend = _pdf_backend()
+    if backend == "pdfium":
+        pages = _pdfium_pages(p)
+        if pages is not None:
+            return pages
+        backend = "pypdf" if _pypdf_importable() else None   # pdfium で開けないファイルは pypdf（空パスワード復号つき）へ
     if backend == "pypdf":
         from pypdf import PdfReader
         reader = PdfReader(str(p))
@@ -3335,13 +3366,21 @@ def _pdf_pages(p: Path) -> list[str]:
     return []
 
 
+def _pypdf_importable() -> bool:
+    try:
+        __import__("pypdf")
+        return True
+    except Exception:
+        return False
+
+
 def _pdf_is_encrypted(p: Path) -> bool:
     """PDF が暗号化されているか（空パスワードで復号できるかは問わない・`pypdf` で判定）。
 
     `_pdf_pages` は暗号化 PDF も `[]` に丸めるため、一般失敗分岐が理由を失う。
     ここは判定専用で、バックエンドが `pdfminer` や未導入の場合は判定不能＝False。
     """
-    if _pdf_backend() != "pypdf":
+    if _pdf_backend() not in ("pdfium", "pypdf"):
         return False
     try:
         from pypdf import PdfReader
