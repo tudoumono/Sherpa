@@ -14,7 +14,7 @@ from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-_log = logging.getLogger(__name__)
+_log = logging.getLogger("sherpa.ingest.convert")   # 変換ログ（make logs convert）と同じ名前
 
 PREFETCH_ARMS = ("ooxml", "pdf_text")
 _MAX_WORKERS = 8
@@ -49,6 +49,7 @@ class Prefetched:
 
     `has_document`＝アームが Document IR を作れたか。`partial`＝`_check_partial_extraction` の追記分。
     `evidence`＝Evidence を作る拡張子のときだけ（xlsx は `excel_display` 適用済み）。
+    `source_stat`＝子が原本を読む直前の `source_stat()`。`guard_ok`＝子での入口ガードの再判定が通ったか（False なら変換していない）。
     """
     arm_name: str
     result: object
@@ -56,22 +57,36 @@ class Prefetched:
     document_json: str | None
     partial: list[dict]
     evidence: object | None
+    source_stat: tuple | None = None
+    guard_ok: bool = True
+
+
+def source_stat(path) -> tuple | None:
+    """原本の (st_size, st_mtime_ns, st_ctime_ns)。変換キャッシュのキーと同じ材料。取れなければ None。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def compute(path_str: str, arm_name: str, ext: str, rel: str) -> Prefetched:
-    """子プロセスで動く。① アームで変換 ② 消費前の Document IR から document.json・部分抽出の疑いを作る ③ Evidence を抽出する。"""
+    """子プロセスで動く。① 原本の stat を取り入口ガードを判定し直す ② アームで変換 ③ 消費前の Document IR から document.json・部分抽出の疑いを作る ④ Evidence を抽出する。"""
     from . import document_ir, evidence_spike, excel_display, office_md
     from .arms import ooxml_arm, pdf_text_arm
 
     arm = {"ooxml": ooxml_arm.OoxmlArm, "pdf_text": pdf_text_arm.PdfTextArm}[arm_name]()
     path = Path(path_str)
+    stat = source_stat(path)
+    if office_md._precheck_target(path, ext, {ext})[0] != "ok":      # ガードに掛かる原本は子で開かない
+        return Prefetched(arm_name, None, False, None, [], None, stat, guard_ok=False)
     result = arm.convert(path)
     if result is None:
-        return Prefetched(arm_name, None, False, None, [], None)
+        return Prefetched(arm_name, None, False, None, [], None, stat)
     document = result.document
     result.document = None
     if result.md is None:
-        return Prefetched(arm_name, result, document is not None, None, [], None)
+        return Prefetched(arm_name, result, document is not None, None, [], None, stat)
     partial: list[dict] = []
     office_md._check_partial_extraction(path, result.md, rel, document, partial)
     document_json = None
@@ -84,7 +99,7 @@ def compute(path_str: str, arm_name: str, ext: str, rel: str) -> Prefetched:
         evidence = evidence_spike.extract(path, legacy_ir=document, consume_legacy=document is not None)
         if path.suffix.lower() == ".xlsx":
             excel_display.enrich_evidence(evidence, path)
-    return Prefetched(arm_name, result, document is not None, document_json, partial, evidence)
+    return Prefetched(arm_name, result, document is not None, document_json, partial, evidence, stat)
 
 
 class Prefetcher:
@@ -98,6 +113,8 @@ class Prefetcher:
         self._inflight: deque[tuple[Job, Future]] = deque()
         self._known = {j.rel for j in jobs}
         self._window = workers * _WINDOW_PER_WORKER
+        self._planned = len(jobs)
+        self.used = 0
         self._pool: ProcessPoolExecutor | None = ProcessPoolExecutor(
             max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
         self._pump()
@@ -119,8 +136,11 @@ class Prefetcher:
                 return
             self._inflight.append((job, fut))
 
-    def take(self, rel: str) -> Prefetched | None:
-        """`rel` の先読み結果。対象外・失敗は None。`rel` より前の未取得分（ループが飛ばしたファイル）は捨てる。"""
+    def take(self, rel: str, path) -> Prefetched | None:
+        """`rel` の先読み結果。対象外・失敗・子のガード不通過・子が読んだ後に原本が変わったものは None。
+
+        `rel` より前の未取得分（ループが飛ばしたファイル）は捨てる。
+        """
         if rel not in self._known:
             return None
         while self._inflight and self._inflight[0][0].rel != rel:
@@ -145,6 +165,9 @@ class Prefetcher:
         if not isinstance(got, Prefetched) or got.arm_name != job.arm_name:
             _log.warning("MD化の先読み結果の形が想定外でした（直列で計算し直します）")
             return None
+        if not got.guard_ok or got.source_stat is None or got.source_stat != source_stat(path):
+            return None                                   # 子が読んだ後に原本が変わった＝古い中身を新しいキャッシュキーで残さない
+        self.used += 1
         return got
 
     def close(self) -> None:
@@ -153,3 +176,4 @@ class Prefetcher:
         self._inflight.clear()
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
+            _log.info("MD化の先読みを使いました: %d/%d件", self.used, self._planned)

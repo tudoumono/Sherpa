@@ -2163,7 +2163,11 @@ def _build_derived_staging_body(
         if len(jobs) > 1:
             workers = min(workers, len(jobs))
             _log.info("MD化の重い計算を先読みします: %d件・ワーカー %d", len(jobs), workers)
-            prefetch = stack.enter_context(md_prefetch.Prefetcher(jobs, workers))
+            try:
+                prefetch = stack.enter_context(md_prefetch.Prefetcher(jobs, workers))
+            except Exception:
+                _log.warning("MD化の先読みを始められませんでした（直列で処理します）", exc_info=True)
+                prefetch = None
 
     for rp, rel in targets:
         pending_meta.clear()
@@ -2311,7 +2315,7 @@ def _build_derived_staging_body(
                             rp, rel, "cell_count_exceeded",
                             detail={"measured_cells": materialized_cells, "cap_cells": _XLSX_CELL_CAP})
                         continue
-            pre = prefetch.take(rel) if prefetch is not None else None   # 先読み結果（無ければ None＝この場で計算）
+            pre = prefetch.take(rel, rp) if prefetch is not None else None   # 先読み結果（無ければ None＝この場で計算）
             if pre is not None:
                 arm_name, result = pre.arm_name, pre.result
                 doc_present = pre.has_document

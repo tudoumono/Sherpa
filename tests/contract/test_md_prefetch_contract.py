@@ -31,6 +31,9 @@ def _build(src: Path, out: Path, workers: int, monkeypatch, caplog) -> tuple[dic
     with caplog.at_level("INFO", logger="sherpa.ingest.convert"):
         rep = office_md.build_derived(src, out / "md")
     assert any("先読みします" in r.getMessage() for r in caplog.records) is (workers > 1)
+    if workers > 1:   # 先読みの結果が実際に使われた（全件が直列へ戻って一致しているだけではない）
+        used = [r.args for r in caplog.records if r.getMessage().startswith("MD化の先読みを使いました")]
+        assert used and used[0][0] == used[0][1] > 0
     files = {
         p.relative_to(out).as_posix(): p.read_bytes()
         for p in sorted(out.rglob("*"))
@@ -64,10 +67,20 @@ def test_failed_job_returns_none_and_next_job_still_runs():
         md_prefetch.Job("good.pdf", str(good), "pdf_text", ".pdf"),
     ]
     with md_prefetch.Prefetcher(jobs, 2) as pf:
-        assert pf.take("bad.pdf") is None
-        got = pf.take("good.pdf")
+        assert pf.take("bad.pdf", good) is None
+        got = pf.take("good.pdf", good)
         assert got is not None and got.result.md and got.evidence is not None
-        assert pf.take("good.pdf") is None            # 取り出し済み
+        assert pf.take("good.pdf", good) is None      # 取り出し済み
+
+
+def test_source_changed_after_child_read_is_not_used(tmp_path):
+    """子が読んだ後に原本が変わったら先読み結果を使わない（古い中身を新しいキャッシュキーで残さない）。"""
+    src = tmp_path / "a.pdf"
+    shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-PDF-EASY.pdf", src)
+    with md_prefetch.Prefetcher([md_prefetch.Job("a.pdf", str(src), "pdf_text", ".pdf")], 1) as pf:
+        pf._inflight[0][1].result()                   # 子が読み終えるまで待つ
+        shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-PDF-MEDIUM.pdf", src)
+        assert pf.take("a.pdf", src) is None
 
 
 @pytest.mark.parametrize("raw", ["0", "9", "x", ""])
