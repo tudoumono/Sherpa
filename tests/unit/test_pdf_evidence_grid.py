@@ -99,3 +99,15 @@ def test_falls_back_to_pypdf_when_pdfium_is_unavailable(monkeypatch):
     assert len(cells) == 9
     assert all(e.value for e in cells)
 
+
+
+def test_adjacent_values_across_vertical_rule_stay_in_separate_cells(tmp_path):
+    """右詰めの値と隣の列の左詰めの値が近くても、縦罫線を跨いで 1 つのセルに混ざらない。"""
+    rules = "".join(f"{x} 100 m {x} 200 l S\n" for x in (50, 100, 200))
+    rules += "".join(f"50 {y} m 200 {y} l S\n" for y in (100, 150, 200))
+    path = _pdf_with(tmp_path / "adjacent.pdf", rules + _text(55, 170, "NAME") + _text(105, 170, "VALUE")
+                     + _text(81.3, 120, "123") + _text(101.5, 120, "ABC"))
+    cells = {e.value: e.locator.extension for e in _elements(path, "cell")}
+    assert set(cells) == {"NAME", "VALUE", "123", "ABC"}
+    assert (cells["123"]["row"], cells["123"]["column"]) == (2, 1)
+    assert (cells["ABC"]["row"], cells["ABC"]["column"]) == (2, 2)

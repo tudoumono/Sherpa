@@ -3292,11 +3292,13 @@ def _pdfium_close(document: Any) -> None:
         pass
 
 
-def _pdfium_page_text(document: Any, page_index: int) -> tuple[list[dict[str, Any]], str] | None:
+def _pdfium_page_text(
+    document: Any, page_index: int, vertical_rules: list[tuple[float, float, float]] = (),
+) -> tuple[list[dict[str, Any]], str] | None:
     """pdfiumのtext pageから位置付きtext groupsとページ全文を得る。失敗・文字なしはNone。
 
     矩形は行ごとに取れる。同じ行で間隔が小さい矩形（同じセル内の語の分割）だけ1グループにまとめ、
-    列の跨ぎは作らない。
+    間に縦罫線（`vertical_rules`＝[(x, 下, 上)]）がある矩形はまとめない。
     """
     try:
         import ctypes
@@ -3341,7 +3343,8 @@ def _pdfium_page_text(document: Any, page_index: int) -> tuple[list[dict[str, An
             height = max(last["top"] - last["bottom"], 1.0)
             gap = rect["left"] - last["right"]
             if (abs(rect["bottom"] - last["bottom"]) <= height * _PDF_GROUP_LINE_RATIO
-                    and -height * _PDF_GROUP_LINE_RATIO <= gap <= height * _PDF_GROUP_GAP_RATIO):
+                    and -height * _PDF_GROUP_LINE_RATIO <= gap <= height * _PDF_GROUP_GAP_RATIO
+                    and not _pdf_rule_between(vertical_rules, last, rect)):
                 last["text"] += rect["text"]
                 last["right"] = max(last["right"], rect["right"])
                 last["top"] = max(last["top"], rect["top"])
@@ -3361,6 +3364,19 @@ def _pdfium_page_text(document: Any, page_index: int) -> tuple[list[dict[str, An
     for index, group in enumerate(groups, start=1):
         group["group_index"] = index
     return (groups, full_text) if groups else None
+
+
+def _pdf_vertical_rules(segments: list[tuple[float, float, float, float]]) -> list[tuple[float, float, float]]:
+    """線分のうち縦の罫線を [(x, 下, 上)] で返す（格子検出と同じ長さの下限）。"""
+    return [(segment[0], *sorted((segment[1], segment[3]))) for segment in segments
+            if abs(segment[0] - segment[2]) <= 0.5 and abs(segment[1] - segment[3]) >= 5]
+
+
+def _pdf_rule_between(vertical_rules, left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """2つの矩形の間に、その行の高さに掛かる縦罫線があるか。"""
+    bottom, top = min(left["bottom"], right["bottom"]), max(left["top"], right["top"])
+    return any(left["right"] - 1.0 <= x <= right["left"] + 1.0 and low < top and high > bottom
+               for x, low, high in vertical_rules)
 
 
 def _pdf_cell_slot(group: dict[str, Any], grid: tuple[Any, ...]) -> tuple[int, int] | None:
@@ -3423,10 +3439,12 @@ def _pdf_page_objects(builder: _Builder, path: Path, pdfium_document: Any) -> No
 
         text_indexes = [index for index, (_args, operator) in enumerate(operations)
                         if operator in {b"Tj", b"TJ", b"'", b'"'}]
+        segments = _pdf_axis_segments(operations)
         text_groups: list[dict[str, Any]] = []
         page_text = ""
         if text_indexes:
-            pdfium_text = _pdfium_page_text(pdfium_document, page_number - 1) if pdfium_document is not None else None
+            pdfium_text = (_pdfium_page_text(pdfium_document, page_number - 1, _pdf_vertical_rules(segments))
+                           if pdfium_document is not None else None)
             if pdfium_text is not None:
                 text_groups, page_text = pdfium_text
             else:
@@ -3478,7 +3496,7 @@ def _pdf_page_objects(builder: _Builder, path: Path, pdfium_document: Any) -> No
             )
 
         if not covering_specs and text_groups and all(item.get("position_confidence") == 1.0 for item in text_groups):
-            grids = _pdf_table_grids(_pdf_axis_segments(operations))
+            grids = _pdf_table_grids(segments)
             assigned: set[int] = set()
             for table_index, grid in enumerate(grids, start=1):
                 xs, ys = grid[0], grid[1]

@@ -295,6 +295,7 @@ class VisionArm:
         """
         import pypdfium2 as pdfium
 
+        from ..evidence_spike import _PDFIUM_LOCK   # pdfium の呼び出しはプロセス内でこのロック1つに直列化する（VLM 呼び出しはロックの外）
         from . import raster
         tmp = Path(tempfile.mkdtemp(prefix="sherpa-vlmocr-"))
         parts: list[str] = []
@@ -303,9 +304,11 @@ class VisionArm:
         unread_pages: list[int] = []
         deadline = time.monotonic() + _vlm_timeout_sec()
         try:
-            doc = pdfium.PdfDocument(str(pdf_path))
+            with _PDFIUM_LOCK:
+                doc = pdfium.PdfDocument(str(pdf_path))
             try:
-                doc_pages = len(doc)
+                with _PDFIUM_LOCK:
+                    doc_pages = len(doc)
                 total = min(doc_pages, raster._max_pages())
                 extra_notes.append(f"pdf_pages_total={doc_pages}")
                 if doc_pages > total:
@@ -317,15 +320,16 @@ class VisionArm:
                         extra_notes.append(f"pdf_pages_budget_cut={total - pages_done}")
                         break
                     img = tmp / f"page_{i + 1}.png"
-                    page = doc[i]
-                    try:
-                        rendered = raster._rasterize_page(page)  # ピクセル上限クランプ（raster 共用）
+                    with _PDFIUM_LOCK:
+                        page = doc[i]
                         try:
-                            rendered.save(str(img), format="PNG")
+                            rendered = raster._rasterize_page(page)  # ピクセル上限クランプ（raster 共用）
                         finally:
-                            rendered.close()
+                            page.close()
+                    try:
+                        rendered.save(str(img), format="PNG")
                     finally:
-                        page.close()
+                        rendered.close()
                     page_text = _vlm_read(img, cfg, remaining)
                     pages_done += 1
                     if page_text and page_text.strip():
@@ -333,7 +337,8 @@ class VisionArm:
                     else:
                         unread_pages.append(i + 1)
             finally:
-                doc.close()
+                with _PDFIUM_LOCK:
+                    doc.close()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         if unread_pages:
