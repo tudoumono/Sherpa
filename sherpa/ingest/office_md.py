@@ -10,6 +10,7 @@ OOXML を直接パースする（Office/LibreOffice 非依存）。
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -864,8 +865,12 @@ def _extract_canonical_evidence(
     consume_legacy: bool = False,
     legacy_conversion: dict | None = None,
     office_display_report: dict | None = None,
+    precomputed=None,
 ):
-    """原本identityと実抽出artifactを分離してCanonical Evidenceを構築する。"""
+    """原本identityと実抽出artifactを分離してCanonical Evidenceを構築する。
+
+    `precomputed`＝先読み（`md_prefetch`）が作った抽出済み Evidence（xlsx は `excel_display` 適用済み）。渡されたら抽出と `excel_display` は行わない。
+    """
     from . import excel_display, evidence_spike, legacy_provenance, office_native_display, raster_evidence
 
     source_path = Path(source_path)
@@ -873,10 +878,14 @@ def _extract_canonical_evidence(
     if source_path.suffix.lower() in RASTER_EVIDENCE_EXT:
         extracted = raster_evidence.extract(source_path)
     else:
-        extracted = evidence_spike.extract(
-            actual, legacy_ir=legacy_ir, consume_legacy=consume_legacy)
+        if precomputed is not None:
+            extracted = precomputed
+        else:
+            extracted = evidence_spike.extract(
+                actual, legacy_ir=legacy_ir, consume_legacy=consume_legacy)
+            if actual.suffix.lower() == ".xlsx":
+                excel_display.enrich_evidence(extracted, actual)
         if actual.suffix.lower() == ".xlsx":
-            excel_display.enrich_evidence(extracted, actual)
             native_report = office_native_display.enrich_evidence(extracted, source_path)
             if office_display_report is not None:
                 office_display_report.update(native_report.to_dict())
@@ -1743,6 +1752,50 @@ def _conv_cache_prune(cache_root: Path, seen_rels: set) -> None:
             pass
 
 
+def _precheck_target(rp: Path, ext: str, conv) -> tuple[str, str | None, dict | None]:
+    """候補 1 件の変換前の判定。`("unsupported"|"guard"|"ok", 理由コード, 実測値)` を返す。
+
+    `ext not in conv`＝未対応、サイズ/セル数/非圧縮サイズの入口ガードに掛かれば `guard`。ループ本体と先読みの計画が同じ判定を使う。
+    """
+    if ext not in conv:
+        return "unsupported", None, None
+    if ext in OFFICE_EXT and _office_size_exceeded(rp, ext):
+        return "guard", "size_exceeded", None
+    if ext == ".xlsx":
+        # 圧縮爆弾ガード: st_size は圧縮後サイズのため、zip 内 dimension だけ見てセル数を見積もり、欠落/不正なら `<c ` の実カウントへフォールバックする。
+        estimated_cells = _xlsx_estimated_cell_count(rp)
+        if estimated_cells is None:
+            estimated_cells = _xlsx_actual_cell_count(rp, _XLSX_CELL_CAP)
+        if estimated_cells is not None and estimated_cells > _XLSX_CELL_CAP:
+            return "guard", "cell_count_exceeded", {"measured_cells": estimated_cells, "cap_cells": _XLSX_CELL_CAP}
+    if ext in CONVERTIBLE_EXT:
+        uncompressed = _office_uncompressed_total_bytes(rp)
+        if uncompressed is not None and uncompressed > _OFFICE_UNCOMPRESSED_CAP_BYTES:
+            return ("guard", "uncompressed_size_exceeded",
+                    {"measured_bytes": uncompressed, "cap_bytes": _OFFICE_UNCOMPRESSED_CAP_BYTES})
+    return "ok", None, None
+
+
+def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit) -> list:
+    """先読みする対象。ループ本体と同じ判定（候補・ガード・変換キャッシュのヒット）を通り、ooxml／pdf_text が受理する前段変換なしのファイルだけ。"""
+    from .md_prefetch import PREFETCH_ARMS, Job
+    prefetchable = CONVERTIBLE_EXT | PDF_EXT
+    jobs = []
+    for rp, rel in targets:
+        ext = rp.suffix.lower()
+        try:
+            if ext not in candidate or _is_skipped_original(rp, ext) or ext not in prefetchable:
+                continue
+            if _precheck_target(rp, ext, conv)[0] != "ok" or cache_hit(rp, rel) is not None:
+                continue
+            arm = _select_arm(rp, enabled)
+        except Exception:
+            continue                                  # 判定の失敗は本体ループが同じ判定で扱う
+        if arm is not None and arm.name in PREFETCH_ARMS:
+            jobs.append(Job(rel=rel, path=str(rp), arm_name=arm.name, ext=ext))
+    return jobs
+
+
 def _build_derived_into_staging(
     wd, derived, *, progress: Callable[[int, int], None] | None = None, world: str | None = None,
     only: list[tuple[Path, str]] | None = None,
@@ -1765,6 +1818,16 @@ def _build_derived_into_staging(
     - `only`（`[(原本 Path, rel)]`）を渡すと、資料フォルダを歩かずその原本だけを同じファイルごとの処理に通す（1 ファイルの再変換用）。
       このときキャッシュの剪定はしない（ステージングに書いた資料フォルダ単位の版の印は公開しない）。
     """
+    with contextlib.ExitStack() as stack:
+        return _build_derived_staging_body(
+            wd, derived, progress=progress, world=world, only=only, stack=stack)
+
+
+def _build_derived_staging_body(
+    wd, derived, *, progress: Callable[[int, int], None] | None = None, world: str | None = None,
+    only: list[tuple[Path, str]] | None = None, stack: contextlib.ExitStack,
+) -> dict:
+    """`_build_derived_into_staging` の本体。`stack` には先読みのプールなど関数の終わりに閉じるものを積む。"""
     from .. import scope_infer as si
     # IRキーは早期 return（overlap/setup 失敗）でも同じ形で返す（レポート契約の一貫性）。
     rep = {"converted": 0, "published_notice_count": 0, "failed": 0, "unsupported": 0,
@@ -1808,6 +1871,7 @@ def _build_derived_into_staging(
     from . import evidence_ir
     from . import evidence_render
     from . import legacy_provenance
+    from . import md_prefetch
     from .arms import legacy_convert
     from .arms import ooxml_arm
     converted = published_notice_count = failed = unsupported = unhandled_failed = 0
@@ -1852,6 +1916,7 @@ def _build_derived_into_staging(
         consume_legacy: bool = False,
         legacy_conversion: dict | None = None,
         prebuilt_evidence=None,
+        precomputed_evidence=None,
     ) -> str | None:
         nonlocal evidence_ir_generated, evidence_ir_failed, rag_generated, rag_failed
         nonlocal office_display_requested, office_display_applied, office_display_fallback_docs
@@ -1860,7 +1925,8 @@ def _build_derived_into_staging(
         try:
             extracted_evidence = prebuilt_evidence or _extract_canonical_evidence(
                 rp, extraction_path=actual, legacy_ir=legacy_ir, consume_legacy=consume_legacy,
-                legacy_conversion=legacy_conversion, office_display_report=display_report)
+                legacy_conversion=legacy_conversion, office_display_report=display_report,
+                precomputed=precomputed_evidence)
             evidence_ir.write_json_atomic(dr_ir / (rel + ".evidence.json"), extracted_evidence)
             evidence_ir_generated += 1
         except OSError:
@@ -2076,16 +2142,30 @@ def _build_derived_into_staging(
 
     _also = _archive_also_root(world)   # アーカイブ取り込み: この関数内の全 safe_files 呼び出しで共有
 
-    def _targets():
-        return iter(only) if only is not None else si.safe_files(wd, also=_also)
+    targets = list(only) if only is not None else list(si.safe_files(wd, also=_also))
 
-    candidate_total = sum(1 for rp, _rel in _targets()
+    def _conv_cache_hit(rp: Path, rel: str):
+        """per-file キャッシュ照合。返値 `(キー, ヒット|None)`。キー None＝キャッシュ対象外。ループ本体と先読みの計画が共有する。"""
+        key = _conv_cache_source_key(rp, conv_cache_pipeline_sig)
+        return key, (_conv_cache_lookup(conv_cache_root, rel, key) if key is not None else None)
+
+    candidate_total = sum(1 for rp, _rel in targets
                           if rp.suffix.lower() in candidate and not _is_skipped_original(rp, rp.suffix.lower()))
     processed_candidates = 0
     if progress is not None:
         progress(0, candidate_total)
 
-    for rp, rel in _targets():
+    prefetch = None
+    workers = md_prefetch.worker_count()
+    if workers > 1 and candidate_total > 1:
+        jobs = _prefetch_jobs(targets, candidate=candidate, conv=conv, enabled=enabled,
+                              cache_hit=lambda rp, rel: _conv_cache_hit(rp, rel)[1])
+        if len(jobs) > 1:
+            workers = min(workers, len(jobs))
+            _log.info("MD化の重い計算を先読みします: %d件・ワーカー %d", len(jobs), workers)
+            prefetch = stack.enter_context(md_prefetch.Prefetcher(jobs, workers))
+
+    for rp, rel in targets:
         pending_meta.clear()
         ext = rp.suffix.lower()
         if ext not in candidate:
@@ -2115,7 +2195,8 @@ def _build_derived_into_staging(
         try:
             # 入口ガード群（`size_exceeded`・`cell_count_exceeded`/`uncompressed_size_exceeded`）は per-file キャッシュ照合より先に評価する
             # （逆順だとキャッシュヒットでガードが素通りする）。キャッシュ照合は全ガード通過後にのみ行う。
-            if ext not in conv:                              # PDF(バックエンド無)/旧バイナリ/該当アーム無効は未対応
+            verdict, guard_code, guard_detail = _precheck_target(rp, ext, conv)
+            if verdict == "unsupported":                     # PDF(バックエンド無)/旧バイナリ/該当アーム無効は未対応
                 if ext in LEGACY_OFFICE_EXT:
                     unavailable_evidence = legacy_provenance.build_unavailable_evidence(
                         rp, status="unsupported", reason_code="legacy_backend_unavailable")
@@ -2134,36 +2215,15 @@ def _build_derived_into_staging(
                         published_notice_count += 1
                 unsupported += 1
                 continue
-            if ext in OFFICE_EXT and _office_size_exceeded(rp, ext):
+            if verdict == "guard":
                 # 変換前に諦める＝openpyxl/pypdf 等のフルロードを一切発生させない
-                _publish_failed_size_notice(rp, rel, "size_exceeded")
+                _publish_failed_size_notice(rp, rel, guard_code, guard_detail)
                 continue
-            if ext == ".xlsx":
-                # 圧縮爆弾ガード: st_size は圧縮後サイズのため、小さい xlsx でも展開後に巨大化しうる。
-                # openpyxl を開かず zip 内 dimension だけ見てセル数を見積もり、dimension が欠落/不正なら `<c ` の実カウントへフォールバックする。
-                # 壊れた zip 等で見積不能なら通す。
-                estimated_cells = _xlsx_estimated_cell_count(rp)
-                if estimated_cells is None:
-                    estimated_cells = _xlsx_actual_cell_count(rp, _XLSX_CELL_CAP)
-                if estimated_cells is not None and estimated_cells > _XLSX_CELL_CAP:
-                    _publish_failed_size_notice(
-                        rp, rel, "cell_count_exceeded",
-                        detail={"measured_cells": estimated_cells, "cap_cells": _XLSX_CELL_CAP})
-                    continue
-            if ext in CONVERTIBLE_EXT:
-                # 非圧縮サイズガード: docx/pptx にも同型の圧縮爆弾リスクがあるため、3 形式共通の粗い網として適用する
-                uncompressed = _office_uncompressed_total_bytes(rp)
-                if uncompressed is not None and uncompressed > _OFFICE_UNCOMPRESSED_CAP_BYTES:
-                    _publish_failed_size_notice(
-                        rp, rel, "uncompressed_size_exceeded",
-                        detail={"measured_bytes": uncompressed, "cap_bytes": _OFFICE_UNCOMPRESSED_CAP_BYTES})
-                    continue
             # per-file キャッシュ（`ext in conv` は直前の早期 continue で確定済み）: 原本 mtime/size と変換パイプライン署名が前回成功時と一致すれば、
             # アーム実行・Evidence 生成・LLM/VLM 呼び出しを丸ごとスキップし、キャッシュ済み派生一式をステージングへコピーする。
             # ミスは下の通常経路へ流れる。
-            conv_cache_key = _conv_cache_source_key(rp, conv_cache_pipeline_sig)
+            conv_cache_key, hit = _conv_cache_hit(rp, rel)
             if conv_cache_key is not None:
-                hit = _conv_cache_lookup(conv_cache_root, rel, conv_cache_key)
                 if hit is not None:
                     rep_delta, content_dir = hit
                     if _conv_cache_restore(content_dir, rel, dr, dr_rag, dr_ir):
@@ -2251,11 +2311,17 @@ def _build_derived_into_staging(
                             rp, rel, "cell_count_exceeded",
                             detail={"measured_cells": materialized_cells, "cap_cells": _XLSX_CELL_CAP})
                         continue
-            arm_name, result = _convert_with_arms(conv_path, enabled)  # 最初に受理したアーム 1 本
+            pre = prefetch.take(rel) if prefetch is not None else None   # 先読み結果（無ければ None＝この場で計算）
+            if pre is not None:
+                arm_name, result = pre.arm_name, pre.result
+                doc_present = pre.has_document
+            else:
+                arm_name, result = _convert_with_arms(conv_path, enabled)  # 最初に受理したアーム 1 本
+                doc_present = result is not None and result.document is not None
             if result is None or result.md is None:
                 # fail-closed: docx/xlsx は document-ir 構築失敗が直接 md=None を招く（`OoxmlArm.convert()`）。
                 # 見逃すと `document_ir_failed` が 0 のまま、版マーカーが「全件成功」として確定してしまう。
-                if (result is not None and result.document is None
+                if (result is not None and not doc_present
                         and ext in ooxml_arm._IR_EXTS):
                     document_ir_failed += 1
                     reason = next(
@@ -2285,7 +2351,7 @@ def _build_derived_into_staging(
                             published_notice_count += 1
                     failed += 1
                     continue
-                if (result is not None and result.document is not None
+                if (result is not None and doc_present
                         and ext in (".docx", ".xlsx") and arm_name == "ooxml"):
                     # IR は構築できたが本文が無く human_md が意図的に None を返した（実質 docx のみ）＝失敗ではない。
                     # 今回の版で「空である」と記録し、human_md_sig_drift の無限再評価ループを止める（`.md` は書かない）。
@@ -2324,7 +2390,10 @@ def _build_derived_into_staging(
             dst = dr / (rel + ".md")                          # 出力名は必ず**原本 rel**（台帳/grep が一致）
             dst.parent.mkdir(parents=True, exist_ok=True)
             json_io.write_text_atomic(dst, result.md)      # 出力MD は委譲変換のまま＝バイト一致（決定的）
-            _check_partial_extraction(rp, result.md, rel, result.document, partial_extraction_suspected)
+            if pre is not None:
+                partial_extraction_suspected.extend(pre.partial)
+            else:
+                _check_partial_extraction(rp, result.md, rel, result.document, partial_extraction_suspected)
             if ext in (".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt") and arm_name == "ooxml":
                 human_md_sig_for_rel = _current_human_md_sig()
             _write_prov(
@@ -2333,12 +2402,15 @@ def _build_derived_into_staging(
             # doc_id/source.path は原本 rel なのに file_type・content_hash が変換後ファイルの値になる（来歴汚染）ため、
             # legacy 経路（`ext` が原本の拡張子）では document.json を書かない。
             if ext in ooxml_arm._IR_EXTS:                     # document-ir-v2 の並行生成
-                if result.document is not None:
-                    result.document.doc_id = rel
-                    result.document.source.path = rel        # 絶対パス（環境依存値）を派生物に残さない＝決定的
+                if doc_present:
+                    if pre is not None:
+                        document_json = pre.document_json
+                    else:
+                        result.document.doc_id = rel
+                        result.document.source.path = rel    # 絶対パス（環境依存値）を派生物に残さない＝決定的
+                        document_json = document_ir.to_json_str(result.document)
                     try:                                       # 失敗を握りつぶさず計上する（write_text_atomic）
-                        json_io.write_text_atomic(dr_ir / (rel + ".document.json"),
-                                                  document_ir.to_json_str(result.document))
+                        json_io.write_text_atomic(dr_ir / (rel + ".document.json"), document_json)
                         document_ir_generated += 1
                     except OSError:
                         document_ir_failed += 1
@@ -2362,6 +2434,7 @@ def _build_derived_into_staging(
                     legacy_ir=result.document,
                     consume_legacy=result.document is not None,
                     legacy_conversion=legacy_conversion,
+                    precomputed_evidence=pre.evidence if pre is not None else None,
                 )
                 result.document = None
                 if rel in source_failure_notices and evidence_md is not None:
@@ -2962,12 +3035,20 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
     return {"rag_generated": generated, "rag_failed": failed, "rag_failures": failures}
 
 
-def _convert_with_arms(path, enabled):
-    """有効アームのうち最初に受理したアーム 1 本で変換する。返値 `(arm_name, ArmResult|None)`。受理アームが無ければ `(None, None)`。"""
+def _select_arm(path, enabled):
+    """有効アームのうち最初に受理したアーム。無ければ None。"""
     for arm in enabled:
         if arm.accepts(path):
-            return arm.name, arm.convert(path)
-    return None, None
+            return arm
+    return None
+
+
+def _convert_with_arms(path, enabled):
+    """有効アームのうち最初に受理したアーム 1 本で変換する。返値 `(arm_name, ArmResult|None)`。受理アームが無ければ `(None, None)`。"""
+    arm = _select_arm(path, enabled)
+    if arm is None:
+        return None, None
+    return arm.name, arm.convert(path)
 
 
 def _write_provenance(
