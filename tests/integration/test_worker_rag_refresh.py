@@ -368,7 +368,15 @@ def test_old_schema_manifest_triggers_one_full_rebuild_then_stabilizes(_world, m
     assert res2["status"] == "unchanged" and res2["changed"] is False
 
 
+@pytest.fixture
+def _clean_failed_docs_w():
+    store.clear_failed_docs("w")
+    yield
+    store.clear_failed_docs("w")
+
+
 @pytest.mark.parametrize("build_fixture", ["empty_ooxml", "image_only_pdf", "image_only_pdf_ocr_off"])
+@pytest.mark.usefixtures("_clean_failed_docs_w")
 def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
         tmp_path, monkeypatch, build_fixture):
     """正当に一部 sidecar が無いケース（空 OOXML の legacy `.md`・OCR が無効で変換失敗のままの image-only PDF の `.md`）を
@@ -423,6 +431,9 @@ def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
     for _ in range(2):                                    # 2回連続でフルリビルドが起きないことを固定
         res = worker.sync("w")
         assert res["status"] == "unchanged" and res["changed"] is False
+    # OCR が有効で worker が動いていない構成のスキャン PDF は、失敗の一覧に ocr_unavailable で載る（他は載らない）
+    assert {r["rel"]: r["reason"] for r in store.list_failed_docs("w")} == (
+        {"scan.pdf": "ocr_unavailable"} if build_fixture == "image_only_pdf" else {})
 
 
 def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_path, monkeypatch):
