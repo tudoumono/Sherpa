@@ -25,7 +25,7 @@ from .ooxml import excel
 HUMAN_MD_RENDERER_VERSION = "human-md-renderer-v7"
 
 # PDF の人向け MD（`render_pdf`）の版。`office_md._current_pdf_human_md_sig()` が PDF の変換キャッシュの鍵と再生成の判定に使う。出力形状を変えたら上げる
-PDF_HUMAN_MD_VERSION = "pdf-human-md-v1"
+PDF_HUMAN_MD_VERSION = "pdf-human-md-v2"
 
 # 1グループ（画面に1回に出すパイプ表の塊）あたりの目安上限文字数
 _MAX_GROUP_CHARS = 20_000
@@ -543,6 +543,22 @@ def render_pdf(evidence, page_body: Callable[[int], str]) -> str | None:
         if blocks:
             out.append(f"## ページ {number}\n\n" + "\n\n".join(blocks))
     return "\n\n".join(out) if out else None
+
+
+_PDF_NO_TEXT_NOTICE = ("（文字の層が無いスキャン PDF のため、ここには本文がありません。本文は画像の読み取り（OCR）で検索できます"
+                       "（読み取りが終わるまでは検索に出ません）。内容は原本で確認してください）")
+
+
+def render_pdf_without_text(evidence) -> str:
+    """文字の層が無いスキャン PDF の人向け MD。冒頭に知らせ、続けて `## ページ N` と「（画像だけのページです）」をページ数分出す。
+
+    OCR の進み具合に左右されない決定的な出力（読み取り結果は rag.md 側に入る）。
+    """
+    pages = sorted((e for e in evidence.elements if e.type == "page" and e.visibility == "visible"),
+                   key=lambda p: (p.locator.page or 0, p.order))
+    parts = [_PDF_NO_TEXT_NOTICE]
+    parts.extend(f"## ページ {page.locator.page or 0}\n\n（画像だけのページです）" for page in pages)
+    return "\n\n".join(parts)
 
 
 def _pdf_page_blocks(texts: list, tables: list, cells: dict[str, list]) -> list[str]:

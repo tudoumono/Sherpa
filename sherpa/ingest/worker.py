@@ -25,6 +25,7 @@ from . import (
     office_md,
     text_kind,
     resolve_settings,
+    scan_pdf_ocr_status,
     world_graph,
     world_graph_service,
     world_neo4j,
@@ -365,7 +366,10 @@ def run(world, *, reflect=True, created_by="admin",
 def _run_locked(world, **kwargs) -> dict:
     """取り込み 1 回の本体。解決範囲の設定は始めに 1 回だけ読んで固定する（署名・グラフ・確定の記録が同じ設定を使う）。"""
     with resolve_settings.pinned(world):
-        return _run_locked_body(world, **kwargs)
+        res = _run_locked_body(world, **kwargs)
+    if "_pending_finalize" not in res and str(res.get("status")).startswith("auto_published"):
+        scan_pdf_ocr_status.settle(world)                    # 失敗の一覧の置き換えが済んだ後に、スキャン PDF の OCR の状態を反映する
+    return res
 
 
 def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_run_id=None,
@@ -1438,6 +1442,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             else:
                 _finalize_if_unused("auto_published", stage_timings=_stage_timings, counts=_counts,
                                     es_summary=es_summary)
+            scan_pdf_ocr_status.settle(world, sig)           # スキャン PDF の OCR の状態を失敗の一覧へ反映する（best-effort）
             return {"world": world, "changed": False, "status": "unchanged", "ledger": 0}
     # `op` を渡して Webhook payload の `op` を呼び出し元の種別にそろえる
     res = run(world, reflect=reflect, run_id=run_id, on_run_id=on_run_id, op=op)   # 署名の確定/無効化は run 内部（`_run_locked`）が lock 内で行う

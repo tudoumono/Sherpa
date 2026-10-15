@@ -443,9 +443,12 @@ def _current_human_md_sig() -> str:
 
 
 def _current_pdf_human_md_sig() -> str:
-    """今の PDF 人向け MD（`human_md.render_pdf`）の版。PDF の変換キャッシュの鍵と、`rag_sidecars_missing` の再生成判定に使う。"""
+    """今の PDF 人向け MD（`human_md.render_pdf`／`render_pdf_without_text`）の版。PDF の変換キャッシュの鍵と、`rag_sidecars_missing` の再生成判定に使う。
+
+    OCR の有効/無効で文字の層が無いスキャン PDF の扱い（知らせの MD／失敗）が変わるため、版に含める。
+    """
     from . import human_md
-    return human_md.PDF_HUMAN_MD_VERSION
+    return f"{human_md.PDF_HUMAN_MD_VERSION};ocr={'on' if ocr_enabled() else 'off'}"
 
 
 _LEGACY_HUMAN_MD_EXT = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}
@@ -1288,6 +1291,20 @@ def _write_ocr_routes(stage_ir: Path, stage_rag: Path) -> dict:
             if ocr_router.render_unavailable(decision):
                 summary["metafile_render_unavailable"] += 1     # 「未対応（LibreOffice が入っていません）」の図の数
     return summary
+
+
+def _pdf_ocr_route_inputs(dr_ir: Path, dr_rag: Path, rel: str) -> tuple[int, object | None]:
+    """OCR が有効なとき、生成済みの `{rel}.evidence.json` から OCR の対象（selected）の入力数と Evidence を返す。無効・読めないときは `(0, None)`。"""
+    if not ocr_enabled():
+        return 0, None
+    from . import evidence_ir, ocr_router
+    try:
+        ir = evidence_ir.read_json_file(dr_ir / (rel + ".evidence.json"))
+        assets = ocr_router.inventory_assets(dr_rag / (rel + ".assets"))
+        manifest = ocr_router.build_manifest(ir, source_rel_path=rel, assets=assets)
+    except (OSError, ValueError):
+        return 0, None
+    return sum(1 for d in manifest.decisions if d.status == "selected"), ir
 
 
 def _recover_interrupted_swap(target: Path) -> None:
@@ -2476,6 +2493,30 @@ def _build_derived_staging_body(
                         # （変換成功物ではなく、source-level failed coverage を検索可能にする notice）
                         _write_prov(dst, "evidence_notice", notice_result)
                         published_notice_count += 1
+                    elif (notice_md is not None and ext == ".pdf" and arm_name == "pdf_text"
+                          and pdf_text_quality(rp) == "empty" and not _pdf_is_encrypted(rp)):
+                        # 文字の層が無いスキャン PDF: OCR の対象の入力があれば失敗にせず、本文は OCR で検索できる旨の知らせを人向け MD に出す
+                        ocr_inputs, scan_evidence = _pdf_ocr_route_inputs(dr_ir, dr_rag, rel)
+                        if ocr_inputs > 0 and scan_evidence is not None:
+                            from . import human_md
+                            scan_md = human_md.render_pdf_without_text(scan_evidence)
+                            dst = dr / (rel + ".md")
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            json_io.write_text_atomic(dst, scan_md)
+                            backend = _pdf_backend()
+                            _write_prov(dst, "pdf_text", _arms.ArmResult(
+                                md=scan_md,
+                                method="pdf_scan_ocr",
+                                confidence=1.0,
+                                notes=([f"backend={backend}"] if backend else [])
+                                + ["text_layer=none", f"ocr_inputs={ocr_inputs}"],
+                            ))
+                            human_md_sig_for_rel = _current_pdf_human_md_sig()
+                            converted += 1
+                            _conv_cache_store_if_eligible()
+                            continue
+                if ext == ".pdf":
+                    human_md_sig_for_rel = _current_pdf_human_md_sig()   # 今の版で評価済みの印（失敗のままでも作り直しを繰り返さない）
                 failed += 1
                 # IR を持たない拡張子（PDF/PPTX 等）の一般失敗も rel・理由を残す。PDF は暗号化を判別可能な範囲で明示する。
                 failure = {
@@ -2797,7 +2838,9 @@ def rag_sidecars_missing(wd, derived, *, world: str | None = None) -> bool:
     dr_ir = _sibling_layer_dir(dr, "ir")
     roots = {"md": dr, "rag": dr_rag, "ir": dr_ir}
     # build_derived が候補として処理しうる拡張子とだけ突き合わせる（それ以外の原本はマニフェストを持たない対象外）
-    manifest_candidates = OFFICE_EXT | RASTER_EVIDENCE_EXT | convertible_exts()
+    conv_exts = convertible_exts()
+    manifest_candidates = OFFICE_EXT | RASTER_EVIDENCE_EXT | conv_exts
+    pdf_conv = ".pdf" in conv_exts
     for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         ext = rp.suffix.lower()
         if ext not in manifest_candidates:
@@ -2811,10 +2854,11 @@ def rag_sidecars_missing(wd, derived, *, world: str | None = None) -> bool:
                 or manifest.get("schema") != _DERIVED_MANIFEST_SCHEMA_VERSION
                 or not isinstance(manifest.get("sidecars"), list)):
             return True
-        if ext == ".pdf" and _md_is_from_pdf_text_arm(dr, rel):
+        if ext == ".pdf" and (_md_is_from_pdf_text_arm(dr, rel)
+                              or (pdf_conv and not (dr / (rel + ".md")).is_file())):
             versions = manifest.get("asset_versions")
             recorded = versions.get("human_md") if isinstance(versions, dict) else None
-            if recorded != _current_pdf_human_md_sig():      # 人向け MD が古い形のまま＝全再構築で作り直す
+            if recorded != _current_pdf_human_md_sig():      # 人向け MD が古い形（または今の版で未評価の変換失敗）＝全再構築で作り直す
                 return True
         for suffix in manifest["sidecars"]:
             if not isinstance(suffix, str):

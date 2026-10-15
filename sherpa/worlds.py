@@ -873,6 +873,8 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
                     _finalize_pending_run(run_id, world_id, pending, status="failed",
                                           extraction_snapshot=snap)
                     e._sherpa_ingest_run_recorded = True
+                    from .ingest import scan_pdf_ocr_status
+                    scan_pdf_ocr_status.settle(world_id)
                 except Exception:
                     logging.getLogger(__name__).warning(
                         "rebind 失敗の run 記録に失敗しました（best-effort）: world_id=%s",
@@ -883,6 +885,8 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
         # 署名の確定は `_run_locked` 内部が済ませている（ここで上書きしない）
         if defer_finalize:
             res["run"] = _finalize_pending_run(run_id, world_id, res["_pending_finalize"])
+            from .ingest import scan_pdf_ocr_status
+            scan_pdf_ocr_status.settle(world_id)   # 失敗の一覧の置き換えが済んだ後に、スキャン PDF の OCR の状態を反映する
         return res
 
 

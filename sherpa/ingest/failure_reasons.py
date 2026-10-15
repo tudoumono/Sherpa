@@ -50,6 +50,16 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
         "advice": "変換し直せましたが、関係グラフか全文検索への反映が終わっていません。"
                   "もう一度「再変換」を押してください。",
     },
+    # 文字の層が無いスキャン PDF の画像の読み取り（OCR）の状態（`scan_pdf_ocr_status`）
+    "ocr_unavailable": {
+        "label": "画像の読み取り（OCR）が動いていません",
+        "advice": "管理者に OCR の起動状態を確認してもらってください。"
+                  "文字の層が無いスキャン PDF のため、読み取りが動くまで本文は検索に出ません。",
+    },
+    "ocr_failed": {
+        "label": "画像の読み取り（OCR）で文字を取れませんでした",
+        "advice": "スキャンの画質や向きを確認してください。内容は原本で確認してください。",
+    },
     "write_failed": {
         "label": "書き込み失敗",
         "advice": "派生ファイルの書き込みに失敗しました。ディスクの空き容量や権限を確認し、時間をおいて再試行してください。",
@@ -95,6 +105,7 @@ _DOCUMENT_IR_KNOWN_DETAILS = frozenset({"malformed_structure", "password_protect
 _PASSTHROUGH = frozenset({
     "legacy_conversion_timeout", "legacy_conversion_failed", "size_exceeded",
     "cell_count_exceeded", "uncompressed_size_exceeded", "source_parse_failed", "reconvert_reflect_failed",
+    "ocr_unavailable", "ocr_failed",
 })
 
 # 書込失敗の別名

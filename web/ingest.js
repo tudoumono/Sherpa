@@ -285,8 +285,10 @@ function failedFilesHtml(wid, ff, catalog, running) {
   if (!ff || !ff.items || !ff.items.length) return '';
   const rows = ff.items.map((it) => {
     // 実行中の再変換の対象は「やり直し中…」、ほかの処理の実行中はボタンを押せなくする（終わると一覧を読み直す）。
+    // 画像の読み取り（OCR）の理由は再変換では直らないため、ボタンを出さない。
     const action = running && running.rel === it.doc
       ? '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>やり直し中…</span></span>'
+      : (it.reason === 'ocr_unavailable' || it.reason === 'ocr_failed') ? ''
       : `<button class="mini" data-reconvert-wid="${esc(wid)}" data-rel="${esc(it.doc)}"${running ? ' disabled' : ''}>再変換</button>`;
     const info = reasonInfo(catalog, it.reason);
     const pp = it.pdf_pages;
@@ -670,6 +672,7 @@ const INGEST_NOTICE_JA = {
 const PROV_METHOD = {                       // 主たる読み取り方法 → 平文
   ooxml: 'Office から直接読み取り',
   pdf_text: 'PDF の文字を抽出',
+  pdf_scan_ocr: '画像の文字を読み取って検索（OCR）',
   markitdown: '文書を広く読み取り（MarkitDown）',
   markitdown_ocr: 'AI が画像を見て読み取り（数値は要確認）',   // 視覚読み取り（VLM）
   // 後方互換のみ: 既存の派生 meta.json に method="ocr" の来歴が残っている間は表示だけ維持する。

@@ -45,6 +45,9 @@ _KNOWN_RAW_REASONS = {
     "write_failed": "write_failed",
     "manifest_write_failed": "write_failed",
     "fallback_write_failed": "write_failed",
+    # scan_pdf_ocr_status（文字の層が無いスキャン PDF の OCR の状態）
+    "ocr_unavailable": "ocr_unavailable",
+    "ocr_failed": "ocr_failed",
     # 想定外例外系（render/build/fallback/unhandled）
     "fallback_failed:TypeError": "other",
     "render_failed:RuntimeError": "other",
