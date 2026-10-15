@@ -35,11 +35,14 @@ _CHUNK_LINES_DEFAULT = 40
 # `search()` が ES へ送る size の上限（資料検索のヒット数の既定 `parts.read.tools.MAX_HITS` を下回らない固定値）
 _ES_SEARCH_K_MAX = 50
 _TIMEOUT = 30
-ES_MAPPING_VERSION = "8"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
+ES_MAPPING_VERSION = "9"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
 # reindex のとき埋め込みはキャッシュから再利用される。
-# rag_chunks.jsonl 読み取りの安全弁（1 文書分）: 桁違いに超える入力は破損とみなし、ファイル全体を無効にして legacy チャンクへ縮退する（`_validate_rag_chunks` 参照）。
+# rag_chunks.jsonl 読み取りの安全弁: 1 行（1 チャンク）の大きさで判定する。桁違いに大きい行は破損とみなし、ファイル全体を無効にして legacy チャンクへ縮退する（`_validate_rag_chunks` 参照）。
+# ファイル全体の大きさは見ない（大きな表でも行ごとの切れを保つ）。読むときも上限＋1 文字で打ち切る
 # 資料フォルダ全体の bulk 送信量は `_ES_BULK_BATCH_MAX_DOCS`／`_ES_BULK_BATCH_MAX_BYTES` が別に境界を持つ
-_RAG_CHUNKS_FILE_CAP_BYTES = 32 * 1024 * 1024  # 1 ファイルの読み取り上限バイト（超過は無効）
+_RAG_CHUNKS_LINE_CAP_BYTES = 1024 * 1024  # 1 行の読み取り上限（超過は無効）
+# rag.md はアンカー辞書として本文を全部メモリに持つため、行数上限（下の `_RAG_CHUNKS_MAX_ROWS`）まで通る大きさにメモリとの釣り合いで上限を置く
+_RAG_MD_FILE_CAP_BYTES = 256 * 1024 * 1024  # rag.md 1 ファイルの読み取り上限バイト（超過は無効）
 # レコード単位チャンク（xlsx の行・docx の段落等）の正常なファイル 1 本を拒否しないよう緩めてある
 _RAG_CHUNKS_MAX_ROWS = 200000  # 1 ファイルが持てるチャンク行数の上限（超過は無効）
 _RAG_CHUNK_SEARCH_TEXT_MAX_CHARS = 20000  # 1 チャンクの索引本文の文字数上限（超過は無効）
@@ -707,7 +710,7 @@ def _load_rag_md_anchors(md_path: Path | None) -> tuple:
     if md_path is None:
         return None, "rag_md_missing"
     try:
-        if md_path.stat().st_size > _RAG_CHUNKS_FILE_CAP_BYTES:
+        if md_path.stat().st_size > _RAG_MD_FILE_CAP_BYTES:
             return None, "rag_md_too_large"
     except OSError:
         return None, "rag_md_stat_failed"
@@ -723,19 +726,34 @@ def _load_rag_md_anchors(md_path: Path | None) -> tuple:
     return anchors, None
 
 
+class RagChunkLineTooLarge(Exception):
+    """rag_chunks.jsonl／rag.md の 1 行が `_RAG_CHUNKS_LINE_CAP_BYTES` を超えた。"""
+
+
+def iter_capped_lines(f):
+    """開いたテキストファイルを 1 行ずつ yield する。1 行が `_RAG_CHUNKS_LINE_CAP_BYTES` を超えたら `RagChunkLineTooLarge`（上限＋1 文字までしか読まない）。"""
+    cap = _RAG_CHUNKS_LINE_CAP_BYTES
+    while True:
+        line = f.readline(cap + 1)
+        if not line:
+            return
+        if len(line) > cap and not line.endswith("\n"):
+            raise RagChunkLineTooLarge()
+        yield line
+
+
 def _rag_chunks_validate(rag_path: Path, anchors: dict, rel: str) -> tuple:
     """`{rel}.rag_chunks.jsonl` を検証のみ行う（本文／メタは保持せず、`chunk_id` の集合だけを持つ。1 文書のチャンク数に比例したメモリを使わない）。
     有効なら `(seen_chunk_ids, None)`（0 件なら空集合）、無効なら `(None, reason)`。`reason` の語彙は `_validate_rag_chunks` 参照（rag.md 側の `rag_md_*` は `_load_rag_md_anchors` が担当）。
     """
     try:
-        if json_io.expanded_size_exceeds(rag_path, _RAG_CHUNKS_FILE_CAP_BYTES):
-            return None, "file_too_large"
+        rag_path.stat()
     except OSError:
         return None, "stat_failed"
     seen_chunk_ids: set = set()
     try:
         with json_io.open_text_maybe_gzip(rag_path) as f:
-            for lineno, raw_line in enumerate(f, start=1):
+            for lineno, raw_line in enumerate(iter_capped_lines(f), start=1):
                 if lineno > _RAG_CHUNKS_MAX_ROWS:
                     return None, "too_many_rows"
                 line = raw_line.strip()
@@ -760,6 +778,8 @@ def _rag_chunks_validate(rag_path: Path, anchors: dict, rel: str) -> tuple:
                     return None, "rag_md_anchor_missing"
                 if len(text) > _RAG_CHUNK_SEARCH_TEXT_MAX_CHARS:
                     return None, "search_text_too_long"
+    except RagChunkLineTooLarge:
+        return None, "line_too_large"
     except UnicodeDecodeError:
         return None, "invalid_utf8"
     except (OSError, *json_io.GZIP_READ_ERRORS):
@@ -772,7 +792,7 @@ def _rag_chunks_validate(rag_path: Path, anchors: dict, rel: str) -> tuple:
 def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: dict):
     """事前に `_rag_chunks_validate()` が `reason=None` を返した `rag_path` をもう一度走査し、`(id, body, text)` を 1 件ずつ yield する（常に 1 件分だけをメモリに持つ）。検証済みの `rag_path`／`anchors` でのみ呼ぶ。"""
     with json_io.open_text_maybe_gzip(rag_path) as f:
-        for raw_line in f:
+        for raw_line in iter_capped_lines(f):
             line = raw_line.strip()
             if not line:
                 continue
@@ -799,9 +819,9 @@ def _validate_rag_chunks(rag_path: Path, md_path: Path | None, rel: str, base_me
     - `missing_chunk_id`: 必須フィールドが欠落／空。
     - `source_rel_path_mismatch`: 行の `source_rel_path` が `rel`（原本）と食い違う。
     - `duplicate_chunk_id`: 同一ファイル内で `chunk_id` が重複。
-    - `file_too_large`／`too_many_rows`／`search_text_too_long`: `_RAG_CHUNKS_FILE_CAP_BYTES`／`_RAG_CHUNKS_MAX_ROWS`／`_RAG_CHUNK_SEARCH_TEXT_MAX_CHARS` 超過。
-    - `rag_md_too_large`／`rag_md_stat_failed`／`rag_md_invalid_utf8`／`rag_md_read_failed`: rag.md 側の読み取り失敗。
-    jsonl は逐次読み、rag.md は上限（jsonl と同じ）付きで一括読みする。索引本文・埋め込み対象は rag.md をアンカー分割した本文で、`line` は立てない。
+    - `line_too_large`／`too_many_rows`／`search_text_too_long`: `_RAG_CHUNKS_LINE_CAP_BYTES`（1 行）／`_RAG_CHUNKS_MAX_ROWS`／`_RAG_CHUNK_SEARCH_TEXT_MAX_CHARS` 超過。
+    - `rag_md_too_large`（`_RAG_MD_FILE_CAP_BYTES` 超過）／`rag_md_stat_failed`／`rag_md_invalid_utf8`／`rag_md_read_failed`: rag.md 側の読み取り失敗。
+    jsonl は 1 行ずつ（1 行の上限付き）読み、rag.md は上限付きで一括読みする。索引本文・埋め込み対象は rag.md をアンカー分割した本文で、`line` は立てない。
     """
     anchors, reason = _load_rag_md_anchors(md_path)
     if reason is not None:

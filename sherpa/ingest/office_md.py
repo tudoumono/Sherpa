@@ -3,13 +3,14 @@
 OOXML を直接パースする（Office/LibreOffice 非依存）。
 - .docx/.xlsx: document-ir 経由で人間向け MD にする（`human_md.render_docx`/`render_xlsx`）。
 - .pptx: スライド順にテキストを出す。
-- .pdf: テキスト層を抽出する（バックエンド pypdf）。到達不可なら None＝「未対応」。
+- .pdf: テキスト層を抽出する（バックエンド pdfium、無ければ pypdf）。到達不可なら None＝「未対応」。
 - .doc/.xls/.ppt（旧バイナリ）: 直接は扱わず、legacy_backend で OOXML へ前段変換してから OOXML 経路へ委譲する（`arms/legacy_convert.py`）。
 決定的（タイムスタンプ等を出さない・順序安定）。壊れたファイル/非 OOXML は例外を握って None。LLM は使わない。
 設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -181,12 +182,12 @@ _PARTIAL_SIZE_MAX_MD_BYTES = 512
 
 
 def _pdf_backend() -> str | None:
-    """利用可能な PDF テキスト抽出バックエンド名（優先順 pypdf > pdfminer.six）。無ければ None。
+    """利用可能な PDF テキスト抽出バックエンド名（優先順 pdfium > pypdf > pdfminer.six）。無ければ None。
 
-    pypdf は requirements.txt に同梱既定。いずれも到達不可なら PDF は「未対応」と表示する。
+    pypdfium2・pypdf は requirements.txt に同梱既定。いずれも到達不可なら PDF は「未対応」と表示する。
     テキスト層のみ（スキャン画像の視覚読み取りは vision）。
     """
-    for name, mod in (("pypdf", "pypdf"), ("pdfminer", "pdfminer.high_level")):
+    for name, mod in (("pdfium", "pypdfium2"), ("pypdf", "pypdf"), ("pdfminer", "pdfminer.high_level")):
         try:
             __import__(mod)
             return name
@@ -441,6 +442,12 @@ def _current_human_md_sig() -> str:
             f"docx={ooxml_arm.DOCX_EXTRACTOR_VERSION};xlsx={ooxml_arm.XLSX_EXTRACTOR_VERSION}")
 
 
+def _current_pdf_human_md_sig() -> str:
+    """今の PDF 人向け MD（`human_md.render_pdf`）の版。PDF の変換キャッシュの鍵と、`rag_sidecars_missing` の再生成判定に使う。"""
+    from . import human_md
+    return human_md.PDF_HUMAN_MD_VERSION
+
+
 _LEGACY_HUMAN_MD_EXT = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}
 
 
@@ -451,6 +458,15 @@ def _md_is_from_ooxml_arm(dr: Path, rel: str) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(meta, dict) and meta.get("arm") == "ooxml"
+
+
+def _md_is_from_pdf_text_arm(dr: Path, rel: str) -> bool:
+    """既存の `{rel}.md` が pdf_text アーム由来か（失敗の知らせ・vision 由来は作り直しの対象にしない）。"""
+    try:
+        meta = json.loads((dr / (rel + ".md.meta.json")).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(meta, dict) and meta.get("arm") == "pdf_text"
 
 
 def _md_is_failure_notice(dr: Path, rel: str) -> bool:
@@ -864,8 +880,12 @@ def _extract_canonical_evidence(
     consume_legacy: bool = False,
     legacy_conversion: dict | None = None,
     office_display_report: dict | None = None,
+    precomputed=None,
 ):
-    """原本identityと実抽出artifactを分離してCanonical Evidenceを構築する。"""
+    """原本identityと実抽出artifactを分離してCanonical Evidenceを構築する。
+
+    `precomputed`＝先読み（`md_prefetch`）が作った抽出済み Evidence（xlsx は `excel_display` 適用済み）。渡されたら抽出と `excel_display` は行わない。
+    """
     from . import excel_display, evidence_spike, legacy_provenance, office_native_display, raster_evidence
 
     source_path = Path(source_path)
@@ -873,10 +893,14 @@ def _extract_canonical_evidence(
     if source_path.suffix.lower() in RASTER_EVIDENCE_EXT:
         extracted = raster_evidence.extract(source_path)
     else:
-        extracted = evidence_spike.extract(
-            actual, legacy_ir=legacy_ir, consume_legacy=consume_legacy)
+        if precomputed is not None:
+            extracted = precomputed
+        else:
+            extracted = evidence_spike.extract(
+                actual, legacy_ir=legacy_ir, consume_legacy=consume_legacy)
+            if actual.suffix.lower() == ".xlsx":
+                excel_display.enrich_evidence(extracted, actual)
         if actual.suffix.lower() == ".xlsx":
-            excel_display.enrich_evidence(extracted, actual)
             native_report = office_native_display.enrich_evidence(extracted, source_path)
             if office_display_report is not None:
                 office_display_report.update(native_report.to_dict())
@@ -949,6 +973,14 @@ def _build_figure_texts(extracted_evidence, assets_dir: Path,
         return {}
 
 
+def _vlm_observation_possible() -> bool:
+    """`vision` が有効アームにあり VLM が実効利用可か（False なら `_build_vlm_observation_set` は VLM を呼ばない）。"""
+    from . import arms as _arms
+    from .arms import vision_arm
+
+    return "vision" in set(_arms.enabled_arm_names()) and vision_arm.resolve_vlm() is not None
+
+
 def _build_vlm_observation_set(extracted_evidence, rel: str, assets_dir: Path):
     """`vision` が有効かつ VLM 実効可のときだけ、canonical が読めない画像要素を補足観測する。
 
@@ -956,14 +988,10 @@ def _build_vlm_observation_set(extracted_evidence, rel: str, assets_dir: Path):
     候補選定は `ocr_router.build_manifest` を呼び直すだけで、`.ocr_route.json` とは独立。
     `asset_root` は直前に抽出済みの `{rel}.assets/`。
     """
-    from . import arms as _arms
     from . import ocr_router
     from .arms import vision_arm
 
-    names = set(_arms.enabled_arm_names())
-    if "vision" not in names:
-        return None
-    if vision_arm.resolve_vlm() is None:
+    if not _vlm_observation_possible():
         return None
     assets = ocr_router.inventory_assets(assets_dir)
     if not assets:
@@ -1019,12 +1047,14 @@ def _load_ocr_observation_sets(extracted_evidence, rel: str, obs_dir: Path | Non
     return sets
 
 
-def _build_observation_set(extracted_evidence, rel: str, assets_dir: Path, *, obs_dir: Path | None = None):
+def _build_observation_set(extracted_evidence, rel: str, assets_dir: Path, *, obs_dir: Path | None = None,
+                           with_vlm: bool = True):
     """VLM（同期）と OCR（非同期・公開済み分）の観測 Set を合流し、`evidence_render.render` へ渡す 1 つの Set にする。
+    `with_vlm=False` は VLM を呼ばない（先読みの子用。親が VLM の補足観測が起きないと判定済みのとき）。
 
     どちらも無ければ None。片方だけなら合成せずそのまま返す。両方あるときだけ `merge_sets` で畳み、合流が失敗したら VLM 単独へ縮退する。
     """
-    vlm_set = _build_vlm_observation_set(extracted_evidence, rel, assets_dir)
+    vlm_set = _build_vlm_observation_set(extracted_evidence, rel, assets_dir) if with_vlm else None
     ocr_sets = _load_ocr_observation_sets(extracted_evidence, rel, obs_dir)
     candidates = list(ocr_sets)
     if vlm_set is not None:
@@ -1040,6 +1070,25 @@ def _build_observation_set(extracted_evidence, rel: str, assets_dir: Path, *, ob
         _log.warning(
             "VLM/OCR 観測 Set の合流に失敗しました（VLM 単独へ縮退します）: %s", rel, exc_info=True)
         return vlm_set
+
+
+def _render_evidence_for_prefetch(path: Path, rel: str, evidence, assets_dir: Path, obs_dir: Path | None):
+    """先読みの子で動く。① evidence.json の gzip ② 素材の書出し ③ OCR 観測（VLM なし） ④ 図の中の文字 ⑤ 描画と chunks の直列化。
+    ファイルは素材以外書かず、親が書く中身を返す（`_generate_evidence` と同じ順・同じ関数）。
+    設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
+    """
+    from . import evidence_ir, evidence_render
+    from .md_prefetch import Rendered
+
+    evidence_gz = evidence_ir.to_gzip_bytes(evidence)
+    _extract_evidence_assets(path, path, evidence, assets_dir)
+    observation_set = _build_observation_set(evidence, rel, assets_dir, obs_dir=obs_dir, with_vlm=False)
+    figure_drops: dict = {}
+    figure_texts = _build_figure_texts(evidence, assets_dir, figure_drops)
+    rendered = evidence_render.render(
+        evidence, source_name=rel, observation_set=observation_set, figure_texts=figure_texts)
+    return Rendered(evidence_gz, rendered.markdown, evidence_render.chunks_gzip_bytes(rendered.chunks),
+                    figure_drops, str(assets_dir))
 
 
 def _is_source_failure_notice(meta: object) -> bool:
@@ -1621,6 +1670,8 @@ def _conv_cache_source_key(rp: Path, pipeline_sig: str) -> str | None:
         st = rp.stat()
     except OSError:
         return None
+    if rp.suffix.lower() == ".pdf":
+        pipeline_sig = f"{pipeline_sig};pdf_human_md={_current_pdf_human_md_sig()}"
     return f"{resolved}|{st.st_size}|{st.st_mtime_ns}|{st.st_ctime_ns}|{pipeline_sig}"
 
 
@@ -1743,6 +1794,89 @@ def _conv_cache_prune(cache_root: Path, seen_rels: set) -> None:
             pass
 
 
+def _precheck_target(rp: Path, ext: str, conv) -> tuple[str, str | None, dict | None]:
+    """候補 1 件の変換前の判定。`("unsupported"|"guard"|"ok", 理由コード, 実測値)` を返す。
+
+    `ext not in conv`＝未対応、サイズ/セル数/非圧縮サイズの入口ガードに掛かれば `guard`。ループ本体と先読みの計画が同じ判定を使う。
+    """
+    if ext not in conv:
+        return "unsupported", None, None
+    if ext in OFFICE_EXT and _office_size_exceeded(rp, ext):
+        return "guard", "size_exceeded", None
+    if ext == ".xlsx":
+        # 圧縮爆弾ガード: st_size は圧縮後サイズのため、zip 内 dimension だけ見てセル数を見積もり、欠落/不正なら `<c ` の実カウントへフォールバックする。
+        estimated_cells = _xlsx_estimated_cell_count(rp)
+        if estimated_cells is None:
+            estimated_cells = _xlsx_actual_cell_count(rp, _XLSX_CELL_CAP)
+        if estimated_cells is not None and estimated_cells > _XLSX_CELL_CAP:
+            return "guard", "cell_count_exceeded", {"measured_cells": estimated_cells, "cap_cells": _XLSX_CELL_CAP}
+    if ext in CONVERTIBLE_EXT:
+        uncompressed = _office_uncompressed_total_bytes(rp)
+        if uncompressed is not None and uncompressed > _OFFICE_UNCOMPRESSED_CAP_BYTES:
+            return ("guard", "uncompressed_size_exceeded",
+                    {"measured_bytes": uncompressed, "cap_bytes": _OFFICE_UNCOMPRESSED_CAP_BYTES})
+    return "ok", None, None
+
+
+# 先読みの子へ渡さない重いファイルの目安（どれかを超えたら親が 1 件ずつ直列で処理する）
+_PREFETCH_MAX_FILE_BYTES = 10 * 1024 * 1024
+_PREFETCH_MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+_PREFETCH_MAX_XLSX_CELLS = 50_000
+
+
+def _prefetch_heavy(rp: Path, ext: str) -> bool:
+    """原本・非圧縮の合計・xlsx のセル数のどれかが先読みの目安を超えるか。測れないものは超えない扱い（本体ループが同じ原本を扱う）。"""
+    try:
+        if rp.stat().st_size > _PREFETCH_MAX_FILE_BYTES:
+            return True
+    except OSError:
+        return False
+    if ext in CONVERTIBLE_EXT:
+        uncompressed = _office_uncompressed_total_bytes(rp)
+        if uncompressed is not None and uncompressed > _PREFETCH_MAX_UNCOMPRESSED_BYTES:
+            return True
+    if ext == ".xlsx":
+        cells = _xlsx_estimated_cell_count(rp)
+        if cells is None:
+            cells = _xlsx_actual_cell_count(rp, _PREFETCH_MAX_XLSX_CELLS)
+        if cells is not None and cells > _PREFETCH_MAX_XLSX_CELLS:
+            return True
+    return False
+
+
+def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit, obs_dir=None, assets_root=None) -> list:
+    """先読みする対象。ループ本体と同じ判定（候補・ガード・変換キャッシュのヒット）を通り、ooxml／pdf_text が受理する前段変換なしのファイルだけ。
+    重いファイル（`_prefetch_heavy`）は子へ渡さない。
+
+    `assets_root` を渡すと、VLM の補足観測が起きない（xlsx は Office 表示補完も無効）ファイルは子で描画まで行う（`Job.render`）。判定はここで 1 回だけ。
+    """
+    from . import office_native_display
+    from .md_prefetch import PREFETCH_ARMS, Job
+    prefetchable = CONVERTIBLE_EXT | PDF_EXT
+    render_ok = assets_root is not None and not _vlm_observation_possible()
+    native_display = office_native_display.config().enabled if render_ok else True
+    jobs = []
+    for rp, rel in targets:
+        ext = rp.suffix.lower()
+        try:
+            if ext not in candidate or _is_skipped_original(rp, ext) or ext not in prefetchable:
+                continue
+            if _precheck_target(rp, ext, conv)[0] != "ok" or cache_hit(rp, rel) is not None:
+                continue
+            if _prefetch_heavy(rp, ext):
+                continue
+            arm = _select_arm(rp, enabled)
+        except Exception:
+            continue                                  # 判定の失敗は本体ループが同じ判定で扱う
+        if arm is not None and arm.name in PREFETCH_ARMS:
+            render = render_ok and not (ext == ".xlsx" and native_display)
+            jobs.append(Job(
+                rel=rel, path=str(rp), arm_name=arm.name, ext=ext, render=render,
+                assets_dir=str(assets_root / (rel + ".assets")) if render else None,
+                obs_dir=str(obs_dir) if render and obs_dir is not None else None))
+    return jobs
+
+
 def _build_derived_into_staging(
     wd, derived, *, progress: Callable[[int, int], None] | None = None, world: str | None = None,
     only: list[tuple[Path, str]] | None = None,
@@ -1765,6 +1899,16 @@ def _build_derived_into_staging(
     - `only`（`[(原本 Path, rel)]`）を渡すと、資料フォルダを歩かずその原本だけを同じファイルごとの処理に通す（1 ファイルの再変換用）。
       このときキャッシュの剪定はしない（ステージングに書いた資料フォルダ単位の版の印は公開しない）。
     """
+    with contextlib.ExitStack() as stack:
+        return _build_derived_staging_body(
+            wd, derived, progress=progress, world=world, only=only, stack=stack)
+
+
+def _build_derived_staging_body(
+    wd, derived, *, progress: Callable[[int, int], None] | None = None, world: str | None = None,
+    only: list[tuple[Path, str]] | None = None, stack: contextlib.ExitStack,
+) -> dict:
+    """`_build_derived_into_staging` の本体。`stack` には先読みのプールなど関数の終わりに閉じるものを積む。"""
     from .. import scope_infer as si
     # IRキーは早期 return（overlap/setup 失敗）でも同じ形で返す（レポート契約の一貫性）。
     rep = {"converted": 0, "published_notice_count": 0, "failed": 0, "unsupported": 0,
@@ -1808,6 +1952,7 @@ def _build_derived_into_staging(
     from . import evidence_ir
     from . import evidence_render
     from . import legacy_provenance
+    from . import md_prefetch
     from .arms import legacy_convert
     from .arms import ooxml_arm
     converted = published_notice_count = failed = unsupported = unhandled_failed = 0
@@ -1852,16 +1997,26 @@ def _build_derived_into_staging(
         consume_legacy: bool = False,
         legacy_conversion: dict | None = None,
         prebuilt_evidence=None,
+        precomputed_evidence=None,
+        prerendered=None,
+        precomputed_error: BaseException | None = None,
     ) -> str | None:
         nonlocal evidence_ir_generated, evidence_ir_failed, rag_generated, rag_failed
         nonlocal office_display_requested, office_display_applied, office_display_fallback_docs
         actual = extraction_path or rp
         display_report: dict = {}
         try:
-            extracted_evidence = prebuilt_evidence or _extract_canonical_evidence(
-                rp, extraction_path=actual, legacy_ir=legacy_ir, consume_legacy=consume_legacy,
-                legacy_conversion=legacy_conversion, office_display_report=display_report)
-            evidence_ir.write_json_atomic(dr_ir / (rel + ".evidence.json"), extracted_evidence)
+            if prerendered is not None:          # 先読みの子が描画まで済ませた＝中身をそのまま書く
+                extracted_evidence = None
+                json_io.write_bytes_atomic(dr_ir / (rel + ".evidence.json"), prerendered.evidence_gz, durable=True)
+            else:
+                if precomputed_error is not None:    # 先に行った抽出の失敗＝抽出し直さずに同じ例外として扱う
+                    raise precomputed_error
+                extracted_evidence = prebuilt_evidence or _extract_canonical_evidence(
+                    rp, extraction_path=actual, legacy_ir=legacy_ir, consume_legacy=consume_legacy,
+                    legacy_conversion=legacy_conversion, office_display_report=display_report,
+                    precomputed=precomputed_evidence)
+                evidence_ir.write_json_atomic(dr_ir / (rel + ".evidence.json"), extracted_evidence)
             evidence_ir_generated += 1
         except OSError:
             evidence_ir_failed += 1
@@ -1900,25 +2055,34 @@ def _build_derived_into_staging(
             assets_dir = dr_rag / (rel + ".assets")
             observation_set = None
             figure_texts = None
-            if prebuilt_evidence is None or actual.suffix.lower() not in LEGACY_OFFICE_EXT:
-                _extract_evidence_assets(rp, actual, extracted_evidence, assets_dir)
-                observation_set = _build_observation_set(extracted_evidence, rel, assets_dir, obs_dir=obs_dir)
-                figure_drops: dict = {}
-                figure_texts = _build_figure_texts(extracted_evidence, assets_dir, figure_drops)
+            figure_drops: dict = {}
+            if prerendered is not None or prebuilt_evidence is None or actual.suffix.lower() not in LEGACY_OFFICE_EXT:
+                if prerendered is not None:
+                    figure_drops = prerendered.figure_drops
+                else:
+                    _extract_evidence_assets(rp, actual, extracted_evidence, assets_dir)
+                    observation_set = _build_observation_set(extracted_evidence, rel, assets_dir, obs_dir=obs_dir)
+                    figure_texts = _build_figure_texts(extracted_evidence, assets_dir, figure_drops)
                 pending_meta.clear()
                 if figure_drops:   # 文字・画像を上限で落とした図の件数を来歴へ残す（rag.md の本文は変えない）
                     if (dr / (rel + ".md.meta.json")).is_file():
                         _merge_provenance_metadata(dr / (rel + ".md"), {"metafile_truncated": figure_drops})
                     else:                                    # サイドカーはこの後の `_write_prov` が書くときに載せる
                         pending_meta["metafile_truncated"] = figure_drops
-            rendered = evidence_render.render(
-                extracted_evidence, source_name=rel, observation_set=observation_set,
-                figure_texts=figure_texts)
-            json_io.write_text_atomic(
-                dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(rendered.markdown))
-            evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
+            if prerendered is not None:
+                markdown = prerendered.markdown
+                json_io.write_text_atomic(dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(markdown))
+                json_io.write_bytes_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), prerendered.chunks_gz, durable=True)
+            else:
+                rendered = evidence_render.render(
+                    extracted_evidence, source_name=rel, observation_set=observation_set,
+                    figure_texts=figure_texts)
+                markdown = rendered.markdown
+                json_io.write_text_atomic(
+                    dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(markdown))
+                evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
             rag_generated += 1
-            return rendered.markdown
+            return markdown
         except OSError:
             rag_failed += 1
             rag_failures.append({"doc": rel, "reason": "write_failed"})
@@ -2076,16 +2240,35 @@ def _build_derived_into_staging(
 
     _also = _archive_also_root(world)   # アーカイブ取り込み: この関数内の全 safe_files 呼び出しで共有
 
-    def _targets():
-        return iter(only) if only is not None else si.safe_files(wd, also=_also)
+    targets = list(only) if only is not None else list(si.safe_files(wd, also=_also))
 
-    candidate_total = sum(1 for rp, _rel in _targets()
+    def _conv_cache_hit(rp: Path, rel: str):
+        """per-file キャッシュ照合。返値 `(キー, ヒット|None)`。キー None＝キャッシュ対象外。ループ本体と先読みの計画が共有する。"""
+        key = _conv_cache_source_key(rp, conv_cache_pipeline_sig)
+        return key, (_conv_cache_lookup(conv_cache_root, rel, key) if key is not None else None)
+
+    candidate_total = sum(1 for rp, _rel in targets
                           if rp.suffix.lower() in candidate and not _is_skipped_original(rp, rp.suffix.lower()))
     processed_candidates = 0
     if progress is not None:
         progress(0, candidate_total)
 
-    for rp, rel in _targets():
+    prefetch = None
+    workers = md_prefetch.worker_count()
+    if workers > 1 and candidate_total > 1:
+        jobs = _prefetch_jobs(targets, candidate=candidate, conv=conv, enabled=enabled,
+                              cache_hit=lambda rp, rel: _conv_cache_hit(rp, rel)[1],
+                              obs_dir=obs_dir, assets_root=dr_rag)
+        if len(jobs) > 1:
+            workers = min(workers, len(jobs))
+            _log.info("MD化の重い計算を先読みします: %d件・ワーカー %d", len(jobs), workers)
+            try:
+                prefetch = stack.enter_context(md_prefetch.Prefetcher(jobs, workers))
+            except Exception:
+                _log.warning("MD化の先読みを始められませんでした（直列で処理します）", exc_info=True)
+                prefetch = None
+
+    for rp, rel in targets:
         pending_meta.clear()
         ext = rp.suffix.lower()
         if ext not in candidate:
@@ -2115,7 +2298,8 @@ def _build_derived_into_staging(
         try:
             # 入口ガード群（`size_exceeded`・`cell_count_exceeded`/`uncompressed_size_exceeded`）は per-file キャッシュ照合より先に評価する
             # （逆順だとキャッシュヒットでガードが素通りする）。キャッシュ照合は全ガード通過後にのみ行う。
-            if ext not in conv:                              # PDF(バックエンド無)/旧バイナリ/該当アーム無効は未対応
+            verdict, guard_code, guard_detail = _precheck_target(rp, ext, conv)
+            if verdict == "unsupported":                     # PDF(バックエンド無)/旧バイナリ/該当アーム無効は未対応
                 if ext in LEGACY_OFFICE_EXT:
                     unavailable_evidence = legacy_provenance.build_unavailable_evidence(
                         rp, status="unsupported", reason_code="legacy_backend_unavailable")
@@ -2134,36 +2318,15 @@ def _build_derived_into_staging(
                         published_notice_count += 1
                 unsupported += 1
                 continue
-            if ext in OFFICE_EXT and _office_size_exceeded(rp, ext):
+            if verdict == "guard":
                 # 変換前に諦める＝openpyxl/pypdf 等のフルロードを一切発生させない
-                _publish_failed_size_notice(rp, rel, "size_exceeded")
+                _publish_failed_size_notice(rp, rel, guard_code, guard_detail)
                 continue
-            if ext == ".xlsx":
-                # 圧縮爆弾ガード: st_size は圧縮後サイズのため、小さい xlsx でも展開後に巨大化しうる。
-                # openpyxl を開かず zip 内 dimension だけ見てセル数を見積もり、dimension が欠落/不正なら `<c ` の実カウントへフォールバックする。
-                # 壊れた zip 等で見積不能なら通す。
-                estimated_cells = _xlsx_estimated_cell_count(rp)
-                if estimated_cells is None:
-                    estimated_cells = _xlsx_actual_cell_count(rp, _XLSX_CELL_CAP)
-                if estimated_cells is not None and estimated_cells > _XLSX_CELL_CAP:
-                    _publish_failed_size_notice(
-                        rp, rel, "cell_count_exceeded",
-                        detail={"measured_cells": estimated_cells, "cap_cells": _XLSX_CELL_CAP})
-                    continue
-            if ext in CONVERTIBLE_EXT:
-                # 非圧縮サイズガード: docx/pptx にも同型の圧縮爆弾リスクがあるため、3 形式共通の粗い網として適用する
-                uncompressed = _office_uncompressed_total_bytes(rp)
-                if uncompressed is not None and uncompressed > _OFFICE_UNCOMPRESSED_CAP_BYTES:
-                    _publish_failed_size_notice(
-                        rp, rel, "uncompressed_size_exceeded",
-                        detail={"measured_bytes": uncompressed, "cap_bytes": _OFFICE_UNCOMPRESSED_CAP_BYTES})
-                    continue
             # per-file キャッシュ（`ext in conv` は直前の早期 continue で確定済み）: 原本 mtime/size と変換パイプライン署名が前回成功時と一致すれば、
             # アーム実行・Evidence 生成・LLM/VLM 呼び出しを丸ごとスキップし、キャッシュ済み派生一式をステージングへコピーする。
             # ミスは下の通常経路へ流れる。
-            conv_cache_key = _conv_cache_source_key(rp, conv_cache_pipeline_sig)
+            conv_cache_key, hit = _conv_cache_hit(rp, rel)
             if conv_cache_key is not None:
-                hit = _conv_cache_lookup(conv_cache_root, rel, conv_cache_key)
                 if hit is not None:
                     rep_delta, content_dir = hit
                     if _conv_cache_restore(content_dir, rel, dr, dr_rag, dr_ir):
@@ -2251,11 +2414,17 @@ def _build_derived_into_staging(
                             rp, rel, "cell_count_exceeded",
                             detail={"measured_cells": materialized_cells, "cap_cells": _XLSX_CELL_CAP})
                         continue
-            arm_name, result = _convert_with_arms(conv_path, enabled)  # 最初に受理したアーム 1 本
+            pre = prefetch.take(rel, rp) if prefetch is not None else None   # 先読み結果（無ければ None＝この場で計算）
+            if pre is not None:
+                arm_name, result = pre.arm_name, pre.result
+                doc_present = pre.has_document
+            else:
+                arm_name, result = _convert_with_arms(conv_path, enabled)  # 最初に受理したアーム 1 本
+                doc_present = result is not None and result.document is not None
             if result is None or result.md is None:
                 # fail-closed: docx/xlsx は document-ir 構築失敗が直接 md=None を招く（`OoxmlArm.convert()`）。
                 # 見逃すと `document_ir_failed` が 0 のまま、版マーカーが「全件成功」として確定してしまう。
-                if (result is not None and result.document is None
+                if (result is not None and not doc_present
                         and ext in ooxml_arm._IR_EXTS):
                     document_ir_failed += 1
                     reason = next(
@@ -2285,7 +2454,7 @@ def _build_derived_into_staging(
                             published_notice_count += 1
                     failed += 1
                     continue
-                if (result is not None and result.document is not None
+                if (result is not None and doc_present
                         and ext in (".docx", ".xlsx") and arm_name == "ooxml"):
                     # IR は構築できたが本文が無く human_md が意図的に None を返した（実質 docx のみ）＝失敗ではない。
                     # 今回の版で「空である」と記録し、human_md_sig_drift の無限再評価ループを止める（`.md` は書かない）。
@@ -2319,26 +2488,44 @@ def _build_derived_into_staging(
                     failure["pdf_pages"] = pages
                 conversion_failures.append(failure)
                 continue
+            pdf_evidence = None
+            pdf_extract_error = None
+            if pre is None and ext == ".pdf" and arm_name == "pdf_text":
+                # PDF の人向け MD は Evidence から組む（先読みの子は組み済み）。ここで抽出した Evidence はそのまま _generate_evidence へ渡す
+                try:
+                    pdf_evidence = _extract_canonical_evidence(rp)
+                except Exception as exc:
+                    pdf_extract_error = exc                  # 抽出の失敗は _generate_evidence が同じ例外として扱う（MD は pdfium 本文のまま）
+                if pdf_evidence is not None:
+                    _apply_pdf_human_md(result, pdf_evidence, rp)
             if extra_notes:                                  # 来歴に legacy_backend/soffice バージョンを追記
                 result.notes = list(result.notes) + extra_notes
             dst = dr / (rel + ".md")                          # 出力名は必ず**原本 rel**（台帳/grep が一致）
             dst.parent.mkdir(parents=True, exist_ok=True)
             json_io.write_text_atomic(dst, result.md)      # 出力MD は委譲変換のまま＝バイト一致（決定的）
-            _check_partial_extraction(rp, result.md, rel, result.document, partial_extraction_suspected)
+            if pre is not None:
+                partial_extraction_suspected.extend(pre.partial)
+            else:
+                _check_partial_extraction(rp, result.md, rel, result.document, partial_extraction_suspected)
             if ext in (".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt") and arm_name == "ooxml":
                 human_md_sig_for_rel = _current_human_md_sig()
+            elif ext == ".pdf" and arm_name == "pdf_text":
+                human_md_sig_for_rel = _current_pdf_human_md_sig()
             _write_prov(
                 dst, arm_name, result, legacy_conversion=legacy_conversion)  # 来歴サイドカーをESチャンクメタへ搬送
             # IR は原本が素の .docx/.pptx/.xlsx のときだけ書く。旧 .doc/.ppt/.xls は前段変換後の一時 OOXML から IR を作れてしまうが、
             # doc_id/source.path は原本 rel なのに file_type・content_hash が変換後ファイルの値になる（来歴汚染）ため、
             # legacy 経路（`ext` が原本の拡張子）では document.json を書かない。
             if ext in ooxml_arm._IR_EXTS:                     # document-ir-v2 の並行生成
-                if result.document is not None:
-                    result.document.doc_id = rel
-                    result.document.source.path = rel        # 絶対パス（環境依存値）を派生物に残さない＝決定的
+                if doc_present:
+                    if pre is not None:
+                        document_json = pre.document_json
+                    else:
+                        result.document.doc_id = rel
+                        result.document.source.path = rel    # 絶対パス（環境依存値）を派生物に残さない＝決定的
+                        document_json = document_ir.to_json_str(result.document)
                     try:                                       # 失敗を握りつぶさず計上する（write_text_atomic）
-                        json_io.write_text_atomic(dr_ir / (rel + ".document.json"),
-                                                  document_ir.to_json_str(result.document))
+                        json_io.write_text_atomic(dr_ir / (rel + ".document.json"), document_json)
                         document_ir_generated += 1
                     except OSError:
                         document_ir_failed += 1
@@ -2355,6 +2542,9 @@ def _build_derived_into_staging(
             if (ext in EVIDENCE_EXT and _evidence_arm_selected(ext, arm_name)) or legacy_conversion is not None:
                 # 現行 document.json/blocks/chunks を書き終えてから同じ Document IR を Evidence へ移す
                 # （consume_legacy で table cell list を順次空にし、密表で 2 組の cell object を同時保持しない）
+                prerendered = pre.rendered if pre is not None else None
+                if prerendered is not None:
+                    prefetch.claim(rel)
                 evidence_md = _generate_evidence(
                     rp,
                     rel,
@@ -2362,6 +2552,9 @@ def _build_derived_into_staging(
                     legacy_ir=result.document,
                     consume_legacy=result.document is not None,
                     legacy_conversion=legacy_conversion,
+                    precomputed_evidence=pre.evidence if pre is not None else pdf_evidence,
+                    prerendered=prerendered,
+                    precomputed_error=pdf_extract_error,
                 )
                 result.document = None
                 if rel in source_failure_notices and evidence_md is not None:
@@ -2418,6 +2611,8 @@ def _build_derived_into_staging(
             processed_candidates += 1
             if progress is not None:
                 progress(processed_candidates, candidate_total)
+    if prefetch is not None:
+        prefetch.close()                                 # 子の終了を待ち、使われなかった素材を消す（公開前に済ませる）
     # per-file ループを完走したときだけ剪定する（`_conv_cache_prune` 参照）。
     # 途中死では呼ばれず、生きている rel のキャッシュは次回 sync で再利用できる。
     if only is None:
@@ -2616,6 +2811,11 @@ def rag_sidecars_missing(wd, derived, *, world: str | None = None) -> bool:
                 or manifest.get("schema") != _DERIVED_MANIFEST_SCHEMA_VERSION
                 or not isinstance(manifest.get("sidecars"), list)):
             return True
+        if ext == ".pdf" and _md_is_from_pdf_text_arm(dr, rel):
+            versions = manifest.get("asset_versions")
+            recorded = versions.get("human_md") if isinstance(versions, dict) else None
+            if recorded != _current_pdf_human_md_sig():      # 人向け MD が古い形のまま＝全再構築で作り直す
+                return True
         for suffix in manifest["sidecars"]:
             if not isinstance(suffix, str):
                 return True
@@ -2962,12 +3162,20 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
     return {"rag_generated": generated, "rag_failed": failed, "rag_failures": failures}
 
 
-def _convert_with_arms(path, enabled):
-    """有効アームのうち最初に受理したアーム 1 本で変換する。返値 `(arm_name, ArmResult|None)`。受理アームが無ければ `(None, None)`。"""
+def _select_arm(path, enabled):
+    """有効アームのうち最初に受理したアーム。無ければ None。"""
     for arm in enabled:
         if arm.accepts(path):
-            return arm.name, arm.convert(path)
-    return None, None
+            return arm
+    return None
+
+
+def _convert_with_arms(path, enabled):
+    """有効アームのうち最初に受理したアーム 1 本で変換する。返値 `(arm_name, ArmResult|None)`。受理アームが無ければ `(None, None)`。"""
+    arm = _select_arm(path, enabled)
+    if arm is None:
+        return None, None
+    return arm.name, arm.convert(path)
 
 
 def _write_provenance(
@@ -3298,7 +3506,7 @@ def _xlsx_md(p: Path) -> str | None:
     return _render_human_md(ir, p, ".xlsx") if ir is not None else None
 
 
-# ---- .pdf（テキスト層・バックエンド：pypdf＝同梱既定 / pdfminer.six＝任意）----
+# ---- .pdf（テキスト層・バックエンド：pdfium・pypdf＝同梱既定 / pdfminer.six＝任意）----
 
 def _normalize_pdf_text(txt: str) -> str:
     """PDF 抽出テキストを決定的に整形（改行正規化・行末空白除去・連続空行を1つに）。OCR はしない。"""
@@ -3316,9 +3524,40 @@ def _normalize_pdf_text(txt: str) -> str:
     return "\n".join(out).strip()
 
 
+def _pdfium_pages(p: Path) -> list[str] | None:
+    """pdfium でページ毎テキストを取る。開けない（暗号化・破損）・失敗は None＝pypdf 経路へ任せる。"""
+    from .evidence_spike import _PDFIUM_LOCK
+    try:
+        import pypdfium2 as pdfium
+        with _PDFIUM_LOCK:
+            document = pdfium.PdfDocument(str(p))
+            try:
+                pages = []
+                for index in range(len(document)):
+                    page = document[index]
+                    try:
+                        textpage = page.get_textpage()
+                        try:
+                            pages.append(textpage.get_text_range())
+                        finally:
+                            textpage.close()
+                    finally:
+                        page.close()
+                return pages
+            finally:
+                document.close()
+    except Exception:
+        return None
+
+
 def _pdf_pages(p: Path) -> list[str]:
     """PDF をページ毎テキストのリストに（バックエンド差を吸収）。バックエンド無/失敗は []。"""
     backend = _pdf_backend()
+    if backend == "pdfium":
+        pages = _pdfium_pages(p)
+        if pages is not None:
+            return pages
+        backend = "pypdf" if _pypdf_importable() else None   # pdfium で開けないファイルは pypdf（空パスワード復号つき）へ
     if backend == "pypdf":
         from pypdf import PdfReader
         reader = PdfReader(str(p))
@@ -3335,13 +3574,21 @@ def _pdf_pages(p: Path) -> list[str]:
     return []
 
 
+def _pypdf_importable() -> bool:
+    try:
+        __import__("pypdf")
+        return True
+    except Exception:
+        return False
+
+
 def _pdf_is_encrypted(p: Path) -> bool:
     """PDF が暗号化されているか（空パスワードで復号できるかは問わない・`pypdf` で判定）。
 
     `_pdf_pages` は暗号化 PDF も `[]` に丸めるため、一般失敗分岐が理由を失う。
     ここは判定専用で、バックエンドが `pdfminer` や未導入の場合は判定不能＝False。
     """
-    if _pdf_backend() != "pypdf":
+    if _pdf_backend() not in ("pdfium", "pypdf"):
         return False
     try:
         from pypdf import PdfReader
@@ -3362,6 +3609,30 @@ def _pdf_md(p: Path) -> str | None:
         if body:
             out.append(f"## ページ {i}\n\n{body}")
     return "\n\n".join(out) if out else None
+
+
+def _apply_pdf_human_md(result, evidence, path: Path) -> None:
+    """pdf_text アームの結果 `result.md` を、Evidence から組んだ人向け MD（表は Markdown の表）に差し替える。組めなければ pdfium 本文のまま。
+
+    位置付き文字の無いページは pdfium のページ本文（`_pdf_md` と同じ整形）を使う。
+    設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
+    """
+    from . import human_md
+    pages: list[str] | None = None
+
+    def page_body(number: int) -> str:
+        nonlocal pages
+        if pages is None:
+            pages = _pdf_pages(path)
+        return _normalize_pdf_text(pages[number - 1]) if 0 < number <= len(pages) else ""
+
+    try:
+        md = human_md.render_pdf(evidence, page_body)
+    except Exception:
+        _log.warning("PDF の人向け MD を Evidence から組めませんでした（pdfium の本文で代替します）: %s", path.name, exc_info=True)
+        return
+    if md:
+        result.md = md
 
 
 # ---- PDF ティア制＝テキスト層の品質で担当アームを決定的に選ぶ ----

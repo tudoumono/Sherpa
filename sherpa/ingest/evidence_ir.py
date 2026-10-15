@@ -237,15 +237,26 @@ def _json_parts(ir: EvidenceIR):
     yield "}\n"
 
 
-def write_json_atomic(path: str | Path, ir: EvidenceIR) -> Path:
-    """Evidence IR を gzip で同一ディレクトリの tmp へ stream して原子置換する（設計: docs/design/rag.md「派生物」）。"""
+def _checked_json_parts(ir: EvidenceIR):
+    """検証してから JSON 片を返す（書込と gzip バイト列の直列化はここを共有する）。"""
     errors = validation_errors(ir)
     if errors:
         raise ValueError("invalid Evidence IR: " + ",".join(errors))
+    return _json_parts(ir)
+
+
+def write_json_atomic(path: str | Path, ir: EvidenceIR) -> Path:
+    """Evidence IR を gzip で同一ディレクトリの tmp へ stream して原子置換する（設計: docs/design/rag.md「派生物」）。"""
+    parts = _checked_json_parts(ir)
     target = Path(path)
     with json_io.atomic_gzip_text_writer(target) as stream:
-        stream.writelines(_json_parts(ir))
+        stream.writelines(parts)
     return target
+
+
+def to_gzip_bytes(ir: EvidenceIR) -> bytes:
+    """`write_json_atomic` が書くのと同じ gzip バイト列（別プロセスで直列化して親が書くとき用）。"""
+    return json_io.gzip_text_bytes(_checked_json_parts(ir))
 
 
 def read_json_file(path: str | Path) -> EvidenceIR:

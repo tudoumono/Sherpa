@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import threading
 import zipfile
 from dataclasses import asdict, dataclass, replace as _dataclass_replace
 from pathlib import Path, PurePosixPath
@@ -38,7 +39,7 @@ _CT = "{http://schemas.openxmlformats.org/package/2006/content-types}"
 XLSX_ADAPTER_VERSION = "xlsx-evidence-adapter-v5"
 DOCX_ADAPTER_VERSION = "docx-evidence-adapter-v4"
 PPTX_ADAPTER_VERSION = "pptx-evidence-adapter-v4"
-PDF_ADAPTER_VERSION = "pdf-evidence-adapter-v2"
+PDF_ADAPTER_VERSION = "pdf-evidence-adapter-v3"
 PDF_XOBJECT_MAX_DEPTH = 16
 PDF_XOBJECT_MAX_RESOLUTIONS = 4096
 
@@ -3054,11 +3055,20 @@ def _pdf_xobject_specs(
     return image_specs
 
 
+_PDF_PAINT_OPERATORS = {b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*"}
+_PDF_RULE_MERGE_TOLERANCE = 2.0          # 同じ軸でこの距離以内に並ぶ罫線の境界は1本とみなす（pt）
+_PDF_RULE_COVER_TOLERANCE = 1.5          # セル境界を罫線が覆うかの端の許容（pt）
+_PDF_GROUP_GAP_RATIO = 0.6               # 同じ行の隣り合う矩形を1語群にまとめる間隔の上限（文字高さ比）
+_PDF_GROUP_LINE_RATIO = 0.3              # 同じ行とみなす下端のずれの上限（文字高さ比）
+_PDFIUM_LOCK = threading.Lock()          # pdfiumはスレッド安全でないため、呼び出しをこのロックで直列化する
+
+
 def _pdf_axis_segments(operations: list[tuple[list[Any], bytes]]) -> list[tuple[float, float, float, float]]:
-    """content streamの直交線分をuser spaceへ写す。曲線や斜線を表として扱わない。"""
+    """content streamの直交線分をuser spaceへ写す。描画演算子で確定した経路だけを採り、曲線や斜線は表として扱わない。"""
     stack: list[list[float]] = []
     ctm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
     current: tuple[float, float] | None = None
+    pending: list[tuple[float, float, float, float]] = []
     segments: list[tuple[float, float, float, float]] = []
     for operands, operator in operations:
         if operator == b"q":
@@ -3081,7 +3091,7 @@ def _pdf_axis_segments(operations: list[tuple[list[Any], bytes]]) -> list[tuple[
             except (TypeError, ValueError):
                 continue
             if abs(current[0] - target[0]) <= 0.5 or abs(current[1] - target[1]) <= 0.5:
-                segments.append((*current, *target))
+                pending.append((*current, *target))
             current = target
         elif operator == b"re" and len(operands) >= 4:
             try:
@@ -3092,16 +3102,36 @@ def _pdf_axis_segments(operations: list[tuple[list[Any], bytes]]) -> list[tuple[
                        _pdf_point(ctm, x + width, y + height), _pdf_point(ctm, x, y + height)]
             for left, right in zip(corners, corners[1:] + corners[:1], strict=True):
                 if abs(left[0] - right[0]) <= 0.5 or abs(left[1] - right[1]) <= 0.5:
-                    segments.append((*left, *right))
-        elif operator in {b"n", b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*"}:
+                    pending.append((*left, *right))
+        elif operator in _PDF_PAINT_OPERATORS:
+            segments.extend(pending)
+            pending = []
+            current = None
+        elif operator == b"n":
+            pending = []
             current = None
     return segments
 
 
+def _pdf_merge_close(values: list[float]) -> list[float]:
+    """近接する境界座標を決定的に1本へまとめる（昇順・代表値は平均）。"""
+    ordered = sorted({round(value, 3) for value in values})
+    clusters: list[list[float]] = []
+    for value in ordered:
+        if clusters and value - clusters[-1][-1] <= _PDF_RULE_MERGE_TOLERANCE:
+            clusters[-1].append(value)
+        else:
+            clusters.append([value])
+    return [round(sum(cluster) / len(cluster), 3) for cluster in clusters]
+
+
 def _pdf_table_grids(
     segments: list[tuple[float, float, float, float]],
-) -> list[tuple[list[float], list[float]]]:
-    """交差する縦横線のconnected componentから表gridを得る。独立した上下・左右の表を混ぜない。"""
+) -> list[tuple[list[float], list[float], list[tuple[float, float, float]], list[tuple[float, float, float]]]]:
+    """交差する縦横線のconnected componentから表gridを得る。独立した上下・左右の表を混ぜない。
+
+    返す各gridは (列境界xs昇順, 行境界ys降順, 縦線[(x, 下, 上)], 横線[(y, 左, 右)])。
+    """
     axis = [
         segment for segment in segments
         if (abs(segment[0] - segment[2]) <= 0.5 and abs(segment[1] - segment[3]) >= 5)
@@ -3122,7 +3152,8 @@ def _pdf_table_grids(
                 adjacency[vertical_index].add(horizontal_index)
                 adjacency[horizontal_index].add(vertical_index)
     seen: set[int] = set()
-    grids: list[tuple[list[float], list[float]]] = []
+    grids: list[tuple[list[float], list[float], list[tuple[float, float, float]], list[tuple[float, float, float]]]] = []
+    vertical_set = set(vertical)
     for start in range(len(axis)):
         if start in seen or not adjacency[start]:
             continue
@@ -3135,11 +3166,72 @@ def _pdf_table_grids(
             component.add(index)
             pending.extend(adjacency[index] - component)
         seen.update(component)
-        xs = sorted({round(axis[index][0], 3) for index in component if index in vertical})
-        ys = sorted({round(axis[index][1], 3) for index in component if index in horizontal}, reverse=True)
+        xs = _pdf_merge_close([axis[index][0] for index in component if index in vertical_set])
+        ys = sorted(_pdf_merge_close([axis[index][1] for index in component if index not in vertical_set]), reverse=True)
         if len(xs) >= 2 and len(ys) >= 2:
-            grids.append((xs, ys))
+            vlines = [(axis[index][0], *sorted((axis[index][1], axis[index][3])))
+                      for index in component if index in vertical_set]
+            hlines = [(axis[index][1], *sorted((axis[index][0], axis[index][2])))
+                      for index in component if index not in vertical_set]
+            grids.append((xs, ys, vlines, hlines))
     return sorted(grids, key=lambda grid: (-grid[1][0], grid[0][0]))
+
+
+def _pdf_rule_covers(lines: list[tuple[float, float, float]], position: float, low: float, high: float) -> bool:
+    """position付近の罫線の和が、区間 [low, high] を（許容つきで）覆うか。"""
+    intervals = sorted((lo, hi) for at, lo, hi in lines if abs(at - position) <= _PDF_RULE_MERGE_TOLERANCE)
+    reach = low
+    for lo, hi in intervals:
+        if lo > reach + _PDF_RULE_COVER_TOLERANCE:
+            break
+        reach = max(reach, hi)
+    return reach >= high - _PDF_RULE_COVER_TOLERANCE
+
+
+def _pdf_merged_cells(
+    grid: tuple[list[float], list[float], list[tuple[float, float, float]], list[tuple[float, float, float]]],
+) -> tuple[dict[tuple[int, int], tuple[int, int]], dict[tuple[int, int], tuple[int, int]]]:
+    """罫線が覆っていないセル境界の両側を結合する。長方形になる結合だけ採る。
+
+    返り値は ({各セル: 結合の左上セル}, {左上セル: (row_span, column_span)})。
+    """
+    xs, ys, vlines, hlines = grid
+    rows, columns = len(ys) - 1, len(xs) - 1
+    parent = {(r, c): (r, c) for r in range(1, rows + 1) for c in range(1, columns + 1)}
+
+    def find(cell: tuple[int, int]) -> tuple[int, int]:
+        while parent[cell] != cell:
+            parent[cell] = parent[parent[cell]]
+            cell = parent[cell]
+        return cell
+
+    def union(a: tuple[int, int], b: tuple[int, int]) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[max(root_a, root_b)] = min(root_a, root_b)
+
+    for r in range(1, rows + 1):
+        for c in range(1, columns + 1):
+            if c < columns and not _pdf_rule_covers(vlines, xs[c], ys[r], ys[r - 1]):
+                union((r, c), (r, c + 1))
+            if r < rows and not _pdf_rule_covers(hlines, ys[r], xs[c - 1], xs[c]):
+                union((r, c), (r + 1, c))
+    members: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for cell in parent:
+        members.setdefault(find(cell), []).append(cell)
+    anchor_of = {cell: cell for cell in parent}
+    spans: dict[tuple[int, int], tuple[int, int]] = {cell: (1, 1) for cell in parent}
+    for anchor, cells in members.items():
+        if len(cells) == 1:
+            continue
+        row_lo, row_hi = min(r for r, _ in cells), max(r for r, _ in cells)
+        col_lo, col_hi = min(c for _, c in cells), max(c for _, c in cells)
+        if (row_hi - row_lo + 1) * (col_hi - col_lo + 1) != len(cells):
+            continue
+        for cell in cells:
+            anchor_of[cell] = anchor
+        spans[anchor] = (row_hi - row_lo + 1, col_hi - col_lo + 1)
+    return anchor_of, spans
 
 
 def _pdf_text_groups(page: Any, operations: list[tuple[list[Any], bytes]], page_bbox: list[float]) -> list[dict[str, Any]]:
@@ -3180,19 +3272,135 @@ def _pdf_text_groups(page: Any, operations: list[tuple[list[Any], bytes]], page_
     return result
 
 
-def _pdf_cell_slot(group: dict[str, Any], grid: tuple[list[float], list[float]]) -> tuple[int, int] | None:
-    xs, ys = grid
+def _pdfium_open(path: Path) -> Any:
+    """pdfiumでPDFを開く。使えない・開けない場合はNone（呼び出し側はpypdf経路へ縮退する）。"""
+    try:
+        import pypdfium2 as pdfium
+        with _PDFIUM_LOCK:
+            return pdfium.PdfDocument(str(path))
+    except Exception:
+        return None
+
+
+def _pdfium_close(document: Any) -> None:
+    if document is None:
+        return
+    try:
+        with _PDFIUM_LOCK:
+            document.close()
+    except Exception:
+        pass
+
+
+def _pdfium_page_text(
+    document: Any, page_index: int, vertical_rules: list[tuple[float, float, float]] = (),
+) -> tuple[list[dict[str, Any]], str] | None:
+    """pdfiumのtext pageから位置付きtext groupsとページ全文を得る。失敗・文字なしはNone。
+
+    矩形は行ごとに取れる。同じ行で間隔が小さい矩形（同じセル内の語の分割）だけ1グループにまとめ、
+    間に縦罫線（`vertical_rules`＝[(x, 下, 上)]）がある矩形はまとめない。
+    """
+    try:
+        import ctypes
+
+        import pypdfium2.raw as pdfium_c
+        with _PDFIUM_LOCK:
+            page = document[page_index]
+            try:
+                textpage = page.get_textpage()
+                try:
+                    rects: list[dict[str, Any]] = []
+                    for index in range(textpage.count_rects()):
+                        left, bottom, right, top = textpage.get_rect(index)
+                        text = textpage.get_text_bounded(left, bottom, right, top)
+                        if not text.strip():
+                            continue
+                        height = max(top - bottom, 1.0)
+                        baseline = bottom + height * 0.2
+                        font_size = height
+                        char_index = textpage.get_index(left + 0.5, (bottom + top) / 2, 1.0, 1.0)
+                        if char_index is not None and char_index >= 0:
+                            origin_x, origin_y = ctypes.c_double(), ctypes.c_double()
+                            if pdfium_c.FPDFText_GetCharOrigin(textpage.raw, char_index, origin_x, origin_y) \
+                                    and bottom - 1.0 <= origin_y.value <= top + 1.0:
+                                baseline = origin_y.value
+                            size = pdfium_c.FPDFText_GetFontSize(textpage.raw, char_index)
+                            if size > 0:
+                                font_size = size
+                        rects.append({"text": text, "left": left, "bottom": bottom, "right": right, "top": top,
+                                      "baseline": baseline, "font_size": font_size})
+                    full_text = textpage.get_text_range().replace("\r\n", "\n").replace("\r", "\n")
+                finally:
+                    textpage.close()
+            finally:
+                page.close()
+    except Exception:
+        return None
+    lines: list[dict[str, Any]] = []
+    for rect in rects:
+        last = lines[-1] if lines else None
+        if last is not None:
+            height = max(last["top"] - last["bottom"], 1.0)
+            gap = rect["left"] - last["right"]
+            if (abs(rect["bottom"] - last["bottom"]) <= height * _PDF_GROUP_LINE_RATIO
+                    and -height * _PDF_GROUP_LINE_RATIO <= gap <= height * _PDF_GROUP_GAP_RATIO
+                    and not _pdf_rule_between(vertical_rules, last, rect)):
+                last["text"] += rect["text"]
+                last["right"] = max(last["right"], rect["right"])
+                last["top"] = max(last["top"], rect["top"])
+                last["bottom"] = min(last["bottom"], rect["bottom"])
+                continue
+        lines.append(dict(rect))
+    groups = [
+        {
+            "text": item["text"].strip(),
+            "bbox": [round(item["left"], 3), round(item["bottom"], 3), round(item["right"], 3), round(item["top"], 3)],
+            "baseline_y": round(item["baseline"], 3),
+            "font_size": float(item["font_size"]),
+            "position_confidence": 1.0,
+        }
+        for item in lines if item["text"].strip()
+    ]
+    for index, group in enumerate(groups, start=1):
+        group["group_index"] = index
+    return (groups, full_text) if groups else None
+
+
+def _pdf_vertical_rules(segments: list[tuple[float, float, float, float]]) -> list[tuple[float, float, float]]:
+    """線分のうち縦の罫線を [(x, 下, 上)] で返す（格子検出と同じ長さの下限）。"""
+    return [(segment[0], *sorted((segment[1], segment[3]))) for segment in segments
+            if abs(segment[0] - segment[2]) <= 0.5 and abs(segment[1] - segment[3]) >= 5]
+
+
+def _pdf_rule_between(vertical_rules, left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """2つの矩形の間に、その行の高さに掛かる縦罫線があるか。"""
+    bottom, top = min(left["bottom"], right["bottom"]), max(left["top"], right["top"])
+    return any(left["right"] - 1.0 <= x <= right["left"] + 1.0 and low < top and high > bottom
+               for x, low, high in vertical_rules)
+
+
+def _pdf_cell_slot(group: dict[str, Any], grid: tuple[Any, ...]) -> tuple[int, int] | None:
+    xs, ys = grid[0], grid[1]
     bbox = group["bbox"]
     x = float(bbox[0])
     y = float(group.get("baseline_y", (bbox[1] + bbox[3]) / 2))
     column = next((index for index, (left, right) in enumerate(zip(xs, xs[1:], strict=False), start=1)
-                   if left - 0.75 <= x < right + 0.75), None)
+                   if left - 0.75 <= x < right), None)
     row = next((index for index, (top, bottom) in enumerate(zip(ys, ys[1:], strict=False), start=1)
                 if bottom - 0.75 <= y <= top + 0.75), None)
     return (row, column) if row is not None and column is not None else None
 
 
 def _pdf_objects(builder: _Builder, path: Path) -> None:
+    """PDFをEvidence IRへ。位置付き文字はpdfium、使えないページだけpypdfで取る。"""
+    document = _pdfium_open(path)
+    try:
+        _pdf_page_objects(builder, path, document)
+    finally:
+        _pdfium_close(document)
+
+
+def _pdf_page_objects(builder: _Builder, path: Path, pdfium_document: Any) -> None:
     from pypdf import PdfReader
     from pypdf.generic import ContentStream
 
@@ -3231,7 +3439,17 @@ def _pdf_objects(builder: _Builder, path: Path) -> None:
 
         text_indexes = [index for index, (_args, operator) in enumerate(operations)
                         if operator in {b"Tj", b"TJ", b"'", b'"'}]
-        text_groups = _pdf_text_groups(page, operations, page_bbox) if text_indexes else []
+        segments = _pdf_axis_segments(operations)
+        text_groups: list[dict[str, Any]] = []
+        page_text = ""
+        if text_indexes:
+            pdfium_text = (_pdfium_page_text(pdfium_document, page_number - 1, _pdf_vertical_rules(segments))
+                           if pdfium_document is not None else None)
+            if pdfium_text is not None:
+                text_groups, page_text = pdfium_text
+            else:
+                text_groups = _pdf_text_groups(page, operations, page_bbox)
+                page_text = page.extract_text() or ""
         image_specs = _pdf_xobject_specs(
             builder,
             reader=reader,
@@ -3266,7 +3484,7 @@ def _pdf_objects(builder: _Builder, path: Path) -> None:
                 text_locator,
                 parent_id=page_id,
                 order=1,
-                value=page.extract_text() or "",
+                value=page_text,
                 visibility="hidden" if covering_specs else "visible",
                 extension={
                     "layer": "text",
@@ -3278,14 +3496,15 @@ def _pdf_objects(builder: _Builder, path: Path) -> None:
             )
 
         if not covering_specs and text_groups and all(item.get("position_confidence") == 1.0 for item in text_groups):
-            grids = _pdf_table_grids(_pdf_axis_segments(operations))
+            grids = _pdf_table_grids(segments)
             assigned: set[int] = set()
             for table_index, grid in enumerate(grids, start=1):
-                xs, ys = grid
+                xs, ys = grid[0], grid[1]
+                anchor_of, spans = _pdf_merged_cells(grid)
                 table_groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
                 for group_index, group in enumerate(text_groups):
                     if (slot := _pdf_cell_slot(group, grid)) is not None:
-                        table_groups.setdefault(slot, []).append(group)
+                        table_groups.setdefault(anchor_of[slot], []).append(group)
                         assigned.add(group_index)
                 if not table_groups:
                     continue
@@ -3310,13 +3529,15 @@ def _pdf_objects(builder: _Builder, path: Path) -> None:
                 )
                 table_coverage = builder.coverage_for(table_id)
                 for (row, column), groups_in_cell in sorted(table_groups.items()):
-                    value = " ".join(group["text"] for group in sorted(groups_in_cell, key=lambda item: item["bbox"][0]))
+                    row_span, column_span = spans[(row, column)]
+                    value = " ".join(group["text"] for group in sorted(
+                        groups_in_cell, key=lambda item: (-item.get("baseline_y", item["bbox"][1]), item["bbox"][0])))
                     cell_locator = evidence_ir.Locator(
                         part=f"page:{page_number}/contents",
                         page=page_number,
                         object_id=f"table:{table_index}/cell:{row}:{column}",
-                        bbox=[xs[column - 1], ys[row], xs[column], ys[row - 1]],
-                        extension={"row": row, "column": column, "row_span": 1, "column_span": 1,
+                        bbox=[xs[column - 1], ys[row + row_span - 1], xs[column + column_span - 1], ys[row - 1]],
+                        extension={"row": row, "column": column, "row_span": row_span, "column_span": column_span,
                                    "coordinate_system": "pdf-user-space"},
                     )
                     builder.add_element(

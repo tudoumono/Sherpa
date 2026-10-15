@@ -25,15 +25,15 @@ def is_gzip_file(path) -> bool:
         return False
 
 
-def open_text_maybe_gzip(path, *, errors: str = "strict"):
-    """テキストとして開く（gzip でも非圧縮でも同じ使い方・`with` で閉じる・1 行ずつ読める）。
+def open_text_maybe_gzip(path, *, errors: str = "strict", newline: str | None = None):
+    """テキストとして開く（gzip でも非圧縮でも同じ使い方・`with` で閉じる・1 行ずつ読める）。`newline` は `io.TextIOWrapper` と同じ。
     設計: docs/design/rag.md「派生物」。"""
     raw = open(path, "rb")
     try:
         head = raw.read(2)
         raw.seek(0)
         stream = gzip.GzipFile(fileobj=raw, mode="rb") if head == _GZIP_MAGIC else raw
-        return io.TextIOWrapper(stream, encoding="utf-8", errors=errors)
+        return io.TextIOWrapper(stream, encoding="utf-8", errors=errors, newline=newline)
     except BaseException:
         raw.close()
         raise
@@ -90,6 +90,19 @@ def atomic_gzip_text_writer(path):
         raise
 
 
+def gzip_text_bytes(parts) -> bytes:
+    """テキスト片の並びを `atomic_gzip_text_writer` と同じ条件で gzip し、バイト列で返す（同じ中身は同じバイト列）。"""
+    buf = io.BytesIO()
+    gz = gzip.GzipFile(filename="", mode="wb", fileobj=buf, compresslevel=_GZIP_LEVEL, mtime=0)
+    text = io.TextIOWrapper(gz, encoding="utf-8", newline="")
+    try:
+        text.writelines(parts)
+        text.flush()
+    finally:
+        text.close()
+    return buf.getvalue()
+
+
 def read_json(path, default=None):
     """JSON を安全に読む（gzip も可）。無い/壊れ/IO エラーは `default` を返す（呼び出し側のフォールバックに使う）。"""
     try:
@@ -134,13 +147,20 @@ def write_text_atomic(path, text: str) -> Path:
     return p
 
 
-def write_bytes_atomic(path, data: bytes) -> Path:
-    """バイト列をアトミックに書く（新しい一時ファイルへ書いて差し替える＝ハードリンクで共有された元ファイルの中身は変わらない）。"""
+def write_bytes_atomic(path, data: bytes, *, durable: bool = False) -> Path:
+    """バイト列をアトミックに書く（新しい一時ファイルへ書いて差し替える＝ハードリンクで共有された元ファイルの中身は変わらない）。
+
+    `durable=True` は差し替えの前に fsync する（`atomic_gzip_text_writer` と同じ耐久性）。
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_bytes(data)
+        with open(tmp, "wb") as raw:
+            raw.write(data)
+            if durable:
+                raw.flush()
+                os.fsync(raw.fileno())
         os.replace(tmp, p)
     except OSError:
         try:

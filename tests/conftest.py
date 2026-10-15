@@ -37,6 +37,9 @@ from _ai_env_isolation import strip_ai_env_from_os_environ  # noqa: E402 (sys.pa
 # `_ai_env_isolation.py` 参照）。
 strip_ai_env_from_os_environ()
 
+# MD化の先読み（別プロセス）は、テストが in-process で差し替えた変換・抽出を通らない。並列を見るテストだけ明示で上げる。
+os.environ.setdefault("SHERPA_MD_WORKERS", "1")
+
 
 def _swap_dbname(dsn: str, dbname: str) -> str:
     """DSN（keyword=value 形式・URI 形式のどちらでも）の dbname だけ差し替える。

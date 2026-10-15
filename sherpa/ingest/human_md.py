@@ -2,7 +2,7 @@
 
 `document_ir.py` の標準構造を、`arms/ooxml_arm` の人間向け MD 生成と共有する。表候補・結合セル・ネスト表位置は
 `ooxml/excel.py::regions()` と `arms/ooxml_arm._docx_table_walk` の解決結果をそのまま使う。
-pptx/PDF と `.rag.md`／`evidence_render.py`（RAG 側の表現）は対象外。
+pptx と `.rag.md`／`evidence_render.py`（RAG 側の表現）は対象外。PDF は Evidence IR から `render_pdf` で組む。
 設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
 
 出力は打切りをしないが、次の安全弁を持つ。
@@ -16,12 +16,16 @@ pptx/PDF と `.rag.md`／`evidence_render.py`（RAG 側の表現）は対象外�
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 
 from . import document_ir
 from .ooxml import excel
 
 # レンダラの版。`office_md._current_human_md_sig()` が抽出器の版と合成し `{rel}.derived.json` に記録する。出力形状を変えたら上げる
 HUMAN_MD_RENDERER_VERSION = "human-md-renderer-v7"
+
+# PDF の人向け MD（`render_pdf`）の版。`office_md._current_pdf_human_md_sig()` が PDF の変換キャッシュの鍵と再生成の判定に使う。出力形状を変えたら上げる
+PDF_HUMAN_MD_VERSION = "pdf-human-md-v1"
 
 # 1グループ（画面に1回に出すパイプ表の塊）あたりの目安上限文字数
 _MAX_GROUP_CHARS = 20_000
@@ -499,3 +503,95 @@ def _render_groups(budget: "_OutputBudget", shown: list[tuple[str, str]], any_ov
         if note:
             parts.append(note)
     return "\n\n".join(parts)
+
+
+# 同じ行とみなす縦位置の差（行頭の文字の高さに対する比）と、その下限（PDF のポイント）
+_PDF_ROW_TOLERANCE_RATIO = 0.3
+_PDF_ROW_TOLERANCE_MIN = 1.0
+
+
+def render_pdf(evidence, page_body: Callable[[int], str]) -> str | None:
+    """PDF の Evidence IR → 人向け Markdown（`## ページ N` ごと）。ページが 1 つも出なければ None。
+
+    ① ページ内の表（`table`＋`cell`）と表の外の位置付き文字（`positioned_text`）を、上から下・同じ高さなら左から右に並べる（表は上端の位置）。
+    ② 表は Markdown の表（1 行目が見出し・結合セルは左上だけ値）、同じ高さの文字は 1 行にまとめる。
+    ③ 位置付き文字も表も無いページは `page_body(ページ番号)`（pdfium のページ本文を整形したもの）をそのまま出す。
+    設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
+    """
+    texts: dict[str, list] = {}
+    tables: dict[str, list] = {}
+    cells: dict[str, list] = {}
+    pages = []
+    for e in evidence.elements:
+        if e.visibility != "visible":
+            continue
+        if e.type == "page":
+            pages.append(e)
+        elif e.type == "positioned_text" and e.locator.bbox and isinstance(e.value, str) and e.value.strip():
+            texts.setdefault(e.parent_id, []).append(e)
+        elif e.type == "table" and e.locator.bbox:
+            tables.setdefault(e.parent_id, []).append(e)
+        elif e.type == "cell":
+            cells.setdefault(e.parent_id, []).append(e)
+    out = []
+    for page in sorted(pages, key=lambda p: (p.locator.page or 0, p.order)):
+        number = page.locator.page or 0
+        blocks = _pdf_page_blocks(texts.get(page.element_id, []), tables.get(page.element_id, []), cells)
+        if not blocks:
+            body = page_body(number)
+            blocks = [body] if body else []
+        if blocks:
+            out.append(f"## ページ {number}\n\n" + "\n\n".join(blocks))
+    return "\n\n".join(out) if out else None
+
+
+def _pdf_page_blocks(texts: list, tables: list, cells: dict[str, list]) -> list[str]:
+    """1 ページ分の本文ブロック（表 1 つ・または連続する文字の行の塊が 1 ブロック）を上から下の順で返す。"""
+    items = []     # (縦位置, 左端, 並び順, 種別, 要素, 高さ)
+    for index, e in enumerate(texts):
+        left, bottom, _right, top = e.locator.bbox
+        height = max(top - bottom, 1.0)
+        items.append((bottom + 0.2 * height, left, index, "text", e, height))     # 基線の推定（bbox の下端から文字高の 2 割上）
+    for index, e in enumerate(tables):
+        items.append((e.locator.bbox[3], e.locator.bbox[0], len(texts) + index, "table", e, 0.0))
+    items.sort(key=lambda it: (-it[0], it[1], it[2]))
+    blocks: list[str] = []
+    rows: list[list] = []        # 文字の行（行ごとに [(左端, 並び順, 文字)]）
+    row_top = row_tolerance = 0.0
+
+    def flush_rows() -> None:
+        nonlocal rows
+        if rows:
+            blocks.append("\n".join(
+                " ".join(t for _l, _i, t in sorted(row)) for row in rows))
+            rows = []
+
+    for y, left, index, kind, e, height in items:
+        if kind == "table":
+            flush_rows()
+            blocks.append(_pdf_table_md(cells.get(e.element_id, [])))
+            continue
+        value = " ".join(e.value.replace("\r\n", "\n").replace("\r", "\n").split("\n")).strip()
+        if rows and row_top - y <= row_tolerance:
+            rows[-1].append((left, index, value))
+        else:
+            rows.append([(left, index, value)])
+            row_top = y
+            row_tolerance = max(_PDF_ROW_TOLERANCE_MIN, _PDF_ROW_TOLERANCE_RATIO * height)
+    flush_rows()
+    return [b for b in blocks if b]
+
+
+def _pdf_table_md(cells: list) -> str:
+    """表のセル（`extension.row/column/row_span/column_span`・1 始まり）を Markdown の表にする。1 行目が見出し。"""
+    if not cells:
+        return ""
+    n_rows = max(c.locator.extension["row"] + c.locator.extension.get("row_span", 1) - 1 for c in cells)
+    n_cols = max(c.locator.extension["column"] + c.locator.extension.get("column_span", 1) - 1 for c in cells)
+    grid = [[""] * n_cols for _ in range(n_rows)]
+    for c in cells:
+        grid[c.locator.extension["row"] - 1][c.locator.extension["column"] - 1] = _normalize_cell_text(
+            c.value if isinstance(c.value, str) else None)
+    lines = ["| " + " | ".join(row) + " |" for row in grid]
+    lines.insert(1, "| " + " | ".join("---" for _ in range(n_cols)) + " |")
+    return "\n".join(lines)

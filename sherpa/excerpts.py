@@ -17,9 +17,8 @@ from pathlib import Path
 
 from . import es_index, json_io, worlds
 
-# rag_chunks.jsonl の読み取り安全弁。`es_index._RAG_CHUNKS_FILE_CAP_BYTES` と同じ値に揃える。
-_RAG_CHUNKS_SCAN_CAP_BYTES = es_index._RAG_CHUNKS_FILE_CAP_BYTES
-# rag.md／人間向け MD の読み取り安全弁。`human_md._MAX_HUMAN_MD_BYTES` と揃える。
+# 人間向け MD の読み取り安全弁。`human_md._MAX_HUMAN_MD_BYTES` と揃える。
+# rag_chunks.jsonl／rag.md は 1 行ずつ読み、1 行の上限は `es_index._RAG_CHUNKS_LINE_CAP_BYTES`。
 _MD_SCAN_CAP_BYTES = 8 * 1024 * 1024
 
 _SHEET_HEADING_RE = re.compile(r"^##\s+シート「(.+?)」")
@@ -90,23 +89,26 @@ def _region_for_chunk(world: str, doc_id: str, chunk_id: str) -> dict | None:
     p = _rag_chunks_path(world, doc_id)
     if p is None:
         return None
-    text = _read_capped(p, _RAG_CHUNKS_SCAN_CAP_BYTES)
-    if text is None:
-        return None
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(row, dict) or row.get("chunk_id") != chunk_id:
-            continue
-        region = row.get("region_context")
-        if (isinstance(region, dict) and isinstance(region.get("sheet"), str) and region.get("sheet")
-                and isinstance(region.get("cell_range"), str) and region.get("cell_range")):
-            return region
+    try:
+        if not p.is_file() or p.is_symlink():
+            return None
+        with json_io.open_text_maybe_gzip(p) as f:
+            for line in es_index.iter_capped_lines(f):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict) or row.get("chunk_id") != chunk_id:
+                    continue
+                region = row.get("region_context")
+                if (isinstance(region, dict) and isinstance(region.get("sheet"), str) and region.get("sheet")
+                        and isinstance(region.get("cell_range"), str) and region.get("cell_range")):
+                    return region
+                return None
+    except (OSError, UnicodeDecodeError, es_index.RagChunkLineTooLarge, *json_io.GZIP_READ_ERRORS):
         return None
     return None
 
@@ -123,16 +125,23 @@ def _chunk_id_from_rag_md_span(world: str, doc_id: str, span) -> str | None:
     rag_md_path = worlds.rag_md_path(world, doc_id)
     if rag_md_path is None:
         return None
-    text = _read_capped(rag_md_path, _MD_SCAN_CAP_BYTES)
-    if text is None:
-        return None
     current = None
-    for i, line in enumerate(text.splitlines(), start=1):
-        if i > s:
-            break
-        cid = es_index.rag_md_anchor_chunk_id(line)
-        if cid is not None:
-            current = cid
+    try:
+        if not rag_md_path.is_file() or rag_md_path.is_symlink():
+            return None
+        with json_io.open_text_maybe_gzip(rag_md_path, newline="\n") as f:
+            i = 0
+            for raw in es_index.iter_capped_lines(f):
+                segment = raw[:-1] if raw.endswith("\n") else raw
+                for line in segment.splitlines() or [""]:   # 行番号は grep と同じ論理行（`\n` で区切った区間ごとの `splitlines()`）で数える
+                    i += 1
+                    if i > s:
+                        return current
+                    cid = es_index.rag_md_anchor_chunk_id(line)
+                    if cid is not None:
+                        current = cid
+    except (OSError, UnicodeDecodeError, es_index.RagChunkLineTooLarge, *json_io.GZIP_READ_ERRORS):
+        return None
     return current
 
 

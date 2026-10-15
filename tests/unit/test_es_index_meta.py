@@ -1025,7 +1025,7 @@ def test_validate_rag_chunks_other_invalid_states(tmp_path):
     ("_RAG_CHUNKS_MAX_ROWS", 2, [{"chunk_id": f"rc{i}", "source_rel_path": "a.docx"} for i in range(5)],
      [(f"rc{i}", "x") for i in range(5)], "too_many_rows"),
     ("_RAG_CHUNK_SEARCH_TEXT_MAX_CHARS", 10, [_ROW_A], [("rc1", "x" * 100)], "search_text_too_long"),
-    ("_RAG_CHUNKS_FILE_CAP_BYTES", 4, [_ROW1], [("rc1", "本文")], "rag_md_too_large"),
+    ("_RAG_MD_FILE_CAP_BYTES", 4, [_ROW1], [("rc1", "本文")], "rag_md_too_large"),
 ])
 def test_validate_rag_chunks_limits(monkeypatch, tmp_path, attr, value, rows, chunks, reason):
     p, md = _rag_pair(tmp_path, rows=rows, chunks=chunks)
@@ -1033,12 +1033,62 @@ def test_validate_rag_chunks_limits(monkeypatch, tmp_path, attr, value, rows, ch
     assert es_index._validate_rag_chunks(p, md, "a.docx", {})[3] == reason
 
 
-def test_validate_rag_chunks_jsonl_file_too_large(monkeypatch, tmp_path):
+def test_validate_rag_chunks_jsonl_line_too_large(monkeypatch, tmp_path):
     p, md = _rag_pair(tmp_path)
-    cap = md.stat().st_size + 1            # rag.md はこの上限を超えず jsonl だけ超える
-    assert p.stat().st_size > cap
-    monkeypatch.setattr(es_index, "_RAG_CHUNKS_FILE_CAP_BYTES", cap)
-    assert es_index._validate_rag_chunks(p, md, "a.docx", {})[3] == "file_too_large"
+    monkeypatch.setattr(es_index, "_RAG_CHUNKS_LINE_CAP_BYTES", len(p.read_text(encoding="utf-8").rstrip("\n")) - 1)
+    assert es_index._validate_rag_chunks(p, md, "a.docx", {})[3] == "line_too_large"
+    monkeypatch.setattr(es_index, "_RAG_CHUNKS_LINE_CAP_BYTES", len(p.read_text(encoding="utf-8").rstrip("\n")))
+    assert es_index._validate_rag_chunks(p, md, "a.docx", {})[3] is None   # 境界ちょうどは通る
+
+
+@pytest.fixture(scope="module")
+def big_table_pair(tmp_path_factory):
+    """展開後 32MiB 超（1 行は約 5KB）の正常な rag_chunks.jsonl と対の rag.md（大きな表の再現）。"""
+    d = tmp_path_factory.mktemp("big_table")
+    p, md = d / "a.xlsx.rag_chunks.jsonl", d / "a.xlsx.rag.md"
+    pad = "セル値" * 500
+    n = 0
+    with p.open("w", encoding="utf-8") as jf, md.open("w", encoding="utf-8") as mf:
+        while jf.tell() < 34 * 1024 * 1024:
+            n += 1
+            row = {"chunk_id": f"r{n}", "source_rel_path": "a.xlsx", "pad": pad,
+                   "region_context": {"sheet": "S1", "cell_range": f"A{n}:E{n}"}}
+            jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+            mf.write(f"<!-- chunk:r{n} -->\n行{n}\n\n")
+    assert p.stat().st_size > 32 * 1024 * 1024
+    return p, md, n
+
+
+def test_validate_rag_chunks_accepts_large_table_with_small_lines(big_table_pair):
+    p, md, n = big_table_pair
+    ids, _, _, reason = es_index._validate_rag_chunks(p, md, "a.xlsx", {})
+    assert reason is None and len(ids) == n
+
+
+def test_excerpts_region_for_chunk_reads_past_32mib(monkeypatch, big_table_pair):
+    from sherpa import excerpts
+    p, _md, n = big_table_pair
+    monkeypatch.setattr(excerpts, "_rag_chunks_path", lambda world, doc_id: p)
+    assert excerpts._region_for_chunk("w", "a.xlsx", f"r{n}") == {"sheet": "S1", "cell_range": f"A{n}:E{n}"}
+
+
+def test_excerpts_span_counts_logical_lines_like_grep(monkeypatch, tmp_path):
+    """U+2028 などを含む rag.md でも、grep と同じ論理行で span を chunk_id へ逆引きする。"""
+    from sherpa import excerpts, worlds
+    md = tmp_path / "a.xlsx.rag.md"
+    md.write_text("<!-- chunk:r1 -->\n値\u2028続き\n値A\u2028\n値B\u2029\n\n<!-- chunk:r2 -->\n行2\n\n<!-- chunk:r3 -->\n行3\n",
+                  encoding="utf-8")
+    monkeypatch.setattr(worlds, "rag_md_path", lambda world, doc_id: md)
+    from sherpa import grep_tool
+
+    class _Reader:
+        def lines(self, cap):
+            yield from md.read_bytes().split(b"\n")[:-1]
+
+    lines = list(grep_tool._logical_lines(_Reader(), cap=1 << 20))
+    for anchor, owner in (("<!-- chunk:r3 -->", "r2"), ("行2", "r2")):
+        span_line = lines.index(anchor) if anchor.startswith("<!--") else lines.index(anchor) + 1
+        assert excerpts._chunk_id_from_rag_md_span("w", "a.xlsx", (span_line, span_line)) == owner
 
 
 def test_validate_rag_chunks_does_not_slurp_jsonl_via_read_text(monkeypatch, tmp_path):
@@ -1143,7 +1193,8 @@ def _import_all_constants_script() -> str:
         "    '_HYBRID_WEIGHT': m._HYBRID_WEIGHT,\n"
         "    '_ES_SEARCH_K_MAX': m._ES_SEARCH_K_MAX,\n"
         "    '_RAG_CHUNKS_MAX_ROWS': m._RAG_CHUNKS_MAX_ROWS,\n"
-        "    '_RAG_CHUNKS_FILE_CAP_BYTES': m._RAG_CHUNKS_FILE_CAP_BYTES,\n"
+        "    '_RAG_CHUNKS_LINE_CAP_BYTES': m._RAG_CHUNKS_LINE_CAP_BYTES,\n"
+        "    '_RAG_MD_FILE_CAP_BYTES': m._RAG_MD_FILE_CAP_BYTES,\n"
         "    '_RAG_CHUNK_SEARCH_TEXT_MAX_CHARS': m._RAG_CHUNK_SEARCH_TEXT_MAX_CHARS,\n"
         "    '_ES_BULK_BATCH_MAX_DOCS': m._ES_BULK_BATCH_MAX_DOCS,\n"
         "    '_ES_BULK_BATCH_MAX_BYTES': m._ES_BULK_BATCH_MAX_BYTES,\n"
@@ -1163,7 +1214,8 @@ def test_env_constants_fresh_import_all_unset_is_default():
     assert out["_HYBRID_WEIGHT"] == 0.5
     assert out["_ES_SEARCH_K_MAX"] == 50
     assert out["_RAG_CHUNKS_MAX_ROWS"] == 200000
-    assert out["_RAG_CHUNKS_FILE_CAP_BYTES"] == 32 * 1024 * 1024
+    assert out["_RAG_CHUNKS_LINE_CAP_BYTES"] == 1024 * 1024
+    assert out["_RAG_MD_FILE_CAP_BYTES"] == 256 * 1024 * 1024
     assert out["_RAG_CHUNK_SEARCH_TEXT_MAX_CHARS"] == 20000
     assert out["_ES_BULK_BATCH_MAX_DOCS"] == 2000
     assert out["_ES_BULK_BATCH_MAX_BYTES"] == 8 * 1024 * 1024
