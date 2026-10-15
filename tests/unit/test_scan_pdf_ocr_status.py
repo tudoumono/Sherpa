@@ -25,13 +25,14 @@ def _write_meta(dmd, rel, method):
     path.write_text(json.dumps({"arm": "pdf_text", "method": method, "confidence": 1.0, "notes": []}), encoding="utf-8")
 
 
-def _write_observation(obs_dir, rel, *, texts):
+def _write_observation(obs_dir, rel, *, texts, confidence=0.9):
     """公開中の観測ツリーへ、`texts` を本文とする Observation Set を1行書く（空リストは観測0件の Set）。"""
     inp = ai_observation.ObservationInput(
         input_id="in1", target_evidence_id="e1", asset_sha256="sha256:" + _HEX, media_type="image/png",
         pixel_size=None, input_kind="asset", render_profile=None, parent_asset_sha256=None)
     observations = [ai_observation.AIObservation(
-        observation_id=f"o{i}", input_id="in1", kind="summary", text=t, confidence=0.9)
+        observation_id=f"o{i}", input_id="in1", kind="summary", text=t, confidence=confidence,
+        use_for_answer=confidence >= ai_observation.MIN_ANSWER_CONFIDENCE)
         for i, t in enumerate(texts)]
     obs_set = ai_observation.AIObservationSet(
         schema_version=ai_observation.AI_OBSERVATION_SCHEMA_VERSION, source_content_hash="sha256:" + _HEX,
@@ -88,6 +89,14 @@ def test_terminal_with_empty_observation_is_ocr_failed(env):
     w, _dmd, obs, state = env
     state["terminal"] = True
     _write_observation(obs, SCAN, texts=[])
+    scan_pdf_ocr_status.settle(w, "sig")
+    assert _reasons(w) == {SCAN: "ocr_failed"}
+
+
+def test_terminal_with_only_low_confidence_observation_is_ocr_failed(env):
+    w, _dmd, obs, state = env
+    state["terminal"] = True
+    _write_observation(obs, SCAN, texts=["かすれた文字"], confidence=0.5)    # rag.md に載らない低信頼の観測だけ
     scan_pdf_ocr_status.settle(w, "sig")
     assert _reasons(w) == {SCAN: "ocr_failed"}
 

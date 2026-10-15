@@ -41,7 +41,7 @@ def scan_ocr_rels(world: str) -> list[str]:
 
 
 def has_published_observation(obs_dir: Path | None, rel: str) -> bool:
-    """公開中の OCR 観測（`{rel}.ai_observations.jsonl`）に、検索できる本文の観測が1件でもあるか。読めない・壊れているときは False。"""
+    """公開中の OCR 観測（`{rel}.ai_observations.jsonl`）に、rag.md へ載る本文（`ai_observation.answer_observations`）が1件でもあるか。読めない・壊れているときは False。"""
     if obs_dir is None:
         return False
     path = Path(str(obs_dir.joinpath(*rel.split("/"))) + ".ai_observations.jsonl")
@@ -52,7 +52,7 @@ def has_published_observation(obs_dir: Path | None, rel: str) -> bool:
                 if not line:
                     continue
                 observation_set = ai_observation.from_json_str(line)
-                if any(o.searchable and o.text.strip() for o in observation_set.observations):
+                if any(o.text.strip() for o in ai_observation.answer_observations(observation_set)):
                     return True
     except (OSError, ValueError, json.JSONDecodeError):
         return False
