@@ -1970,6 +1970,7 @@ def _build_derived_staging_body(
         prebuilt_evidence=None,
         precomputed_evidence=None,
         prerendered=None,
+        precomputed_error: BaseException | None = None,
     ) -> str | None:
         nonlocal evidence_ir_generated, evidence_ir_failed, rag_generated, rag_failed
         nonlocal office_display_requested, office_display_applied, office_display_fallback_docs
@@ -1980,6 +1981,8 @@ def _build_derived_staging_body(
                 extracted_evidence = None
                 json_io.write_bytes_atomic(dr_ir / (rel + ".evidence.json"), prerendered.evidence_gz, durable=True)
             else:
+                if precomputed_error is not None:    # 先に行った抽出の失敗＝抽出し直さずに同じ例外として扱う
+                    raise precomputed_error
                 extracted_evidence = prebuilt_evidence or _extract_canonical_evidence(
                     rp, extraction_path=actual, legacy_ir=legacy_ir, consume_legacy=consume_legacy,
                     legacy_conversion=legacy_conversion, office_display_report=display_report,
@@ -2457,12 +2460,13 @@ def _build_derived_staging_body(
                 conversion_failures.append(failure)
                 continue
             pdf_evidence = None
+            pdf_extract_error = None
             if pre is None and ext == ".pdf" and arm_name == "pdf_text":
                 # PDF の人向け MD は Evidence から組む（先読みの子は組み済み）。ここで抽出した Evidence はそのまま _generate_evidence へ渡す
                 try:
                     pdf_evidence = _extract_canonical_evidence(rp)
-                except Exception:
-                    pdf_evidence = None                      # 抽出の失敗は _generate_evidence が従来どおり扱う（MD は pdfium 本文のまま）
+                except Exception as exc:
+                    pdf_extract_error = exc                  # 抽出の失敗は _generate_evidence が同じ例外として扱う（MD は pdfium 本文のまま）
                 if pdf_evidence is not None:
                     _apply_pdf_human_md(result, pdf_evidence, rp)
             if extra_notes:                                  # 来歴に legacy_backend/soffice バージョンを追記
@@ -2521,6 +2525,7 @@ def _build_derived_staging_body(
                     legacy_conversion=legacy_conversion,
                     precomputed_evidence=pre.evidence if pre is not None else pdf_evidence,
                     prerendered=prerendered,
+                    precomputed_error=pdf_extract_error,
                 )
                 result.document = None
                 if rel in source_failure_notices and evidence_md is not None:
