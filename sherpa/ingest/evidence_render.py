@@ -26,7 +26,7 @@ from . import ai_observation, context_ir, evidence_ir, mermaid_render
 
 
 RAG_RENDERER_VERSION = "evidence-rag-renderer-v1alpha11"
-RAG_CHUNKER_VERSION = "evidence-rag-chunker-v1alpha10"
+RAG_CHUNKER_VERSION = "evidence-rag-chunker-v1alpha11"
 # 関係の文に書く対象の名前の上限（字）。超えた分は対象の要素の本文に全文がある旨を明記する。
 _RELATION_TARGET_NAME_MAX = 2000
 MAX_GROUP_CHARS = 1800
@@ -1773,6 +1773,22 @@ def _flow_diagram_records(ir: evidence_ir.EvidenceIR, ctx: context_ir.ContextIR)
     return records
 
 
+def _citations_for_jsonl(citations: list[dict]) -> list[dict]:
+    """jsonl のチャンク行へ載せる citation。セルの値の内訳（`object_metadata.excel_value`）は evidence.json にあるので載せない。"""
+    out: list[dict] = []
+    for citation in citations:
+        metadata = citation.get("object_metadata")
+        if not isinstance(metadata, dict) or "excel_value" not in metadata:
+            out.append(citation)
+            continue
+        slim = {k: v for k, v in citation.items() if k != "object_metadata"}
+        rest = {k: v for k, v in metadata.items() if k != "excel_value"}
+        if rest:
+            slim["object_metadata"] = rest
+        out.append(slim)
+    return out
+
+
 def _chunk_id_for_record(source_hash: str, record: dict) -> str:
     """record の決定的 chunk_id。`_finalize_chunks`（jsonl）と `_markdown`（rag.md アンカー）が同じ式で計算し、1:1 になる。"""
     return _stable_id("rag-chunk", source_hash, record["record_id"], RAG_CHUNKER_VERSION)
@@ -1849,7 +1865,7 @@ def _finalize_chunks(
             "content_type": record["kind"],
             "section_path": record["section_path"],
             "body": record["exact_text"],
-            "citations": record["citations"],
+            "citations": _citations_for_jsonl(record["citations"]),
             "relations": record.get("relations", []),
             "source_rel_path": source_rel_path,
             "coverage_statuses": coverage_statuses,

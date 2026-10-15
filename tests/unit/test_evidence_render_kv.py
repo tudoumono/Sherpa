@@ -549,14 +549,39 @@ def test_identifier_mentions_overflow_caps_at_limit_with_exact_value_set():
     assert kept1.isdisjoint(kept2)
 
 
-def test_chunk_versions_are_v1alpha10():
+def test_xlsx_rag_chunks_omit_excel_value_breakdown_but_evidence_keeps_it():
+    """契約変更: セルの値の内訳は rag_chunks.jsonl に載せない（evidence.json にだけある）。"""
+    import datetime
+    src, der = _dirs()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "明細"
+    ws["A1"], ws["B1"] = "日付", "金額"
+    ws["A2"] = datetime.date(2025, 9, 10)
+    ws["A2"].number_format = "yyyy/mm/dd"
+    ws["B2"] = "=1+2"
+    wb.save(src / "v.xlsx")
+    office_md.build_derived(src, der)
+    chunks = _read_chunks(der, "v.xlsx")
+    assert chunks
+    for chunk in chunks:
+        for citation in chunk["citations"]:
+            assert "excel_value" not in (citation.get("object_metadata") or {})
+    assert "excel_value" not in json_io.read_text_maybe_gzip(
+        der.parent / "rag" / "v.xlsx.rag_chunks.jsonl")
+    ir = IR.read_json_file(der.parent / "ir" / "v.xlsx.evidence.json")
+    cells = [e for e in ir.elements if e.type == "cell" and "raw_value" in e.extension]
+    assert cells and any(e.extension.get("number_format") for e in cells)
+
+
+def test_chunk_versions_are_v1alpha11():
     chunks = _read_chunks(_build_wide_xlsx(4), "big.xlsx")
     assert chunks
     for chunk in chunks:
         assert chunk["renderer_version"] == "evidence-rag-renderer-v1alpha11"
-        assert chunk["chunker_version"] == "evidence-rag-chunker-v1alpha10"
+        assert chunk["chunker_version"] == "evidence-rag-chunker-v1alpha11"
     assert R.RAG_RENDERER_VERSION == "evidence-rag-renderer-v1alpha11"
-    assert R.RAG_CHUNKER_VERSION == "evidence-rag-chunker-v1alpha10"
+    assert R.RAG_CHUNKER_VERSION == "evidence-rag-chunker-v1alpha11"
 
 
 def test_markdown_anchors_precede_each_chunk_and_match_chunk_ids_1to1():
