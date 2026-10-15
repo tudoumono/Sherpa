@@ -4,7 +4,7 @@
 - クラウド（OpenAI）は管理者が `system_settings.vlm.cloud_allowed=true` にした場合のみ。false（既定）なら provider=openai が指定されていても画像を送らない。
 - Ollama の接続先は loopback か管理画面の Ollama 許可一覧にある宛先（IP・DNS 名とも）ならクラウド許可は不要。許可されていない宛先へは送らない（`_ollama_url_permitted`）。
 
-対象（`accepts`）: (a) ラスタ画像（`office_md.IMAGE_EXT`）をそのまま VLM へ。(b) テキスト層ゼロの PDF（`office_md.pdf_escalation_target == "vision"`）を PDFium でページ画像化して VLM へ（`raster` を共用）。Office 文書は担当しない。
+対象（`accepts`）: (a) ラスタ画像（`office_md.IMAGE_EXT`）を VLM へ（PNG・JPEG 以外は PNG にしてから送る・複数ページの TIFF はページごと）。(b) テキスト層ゼロの PDF（`office_md.pdf_escalation_target == "vision"`）を PDFium でページ画像化して VLM へ（`raster` を共用）。Office 文書は担当しない。
 出力: 先頭に `> [OCR抽出（AI視覚読み取り）: 信頼度=低〜中]`・`method="vision"`・confidence 0.4・notes に `vlm_provider`/`vlm_model`/`numeric_verified=false`（VLM は数値を誤りうる）。到達不可/失敗/未対応は None。
 クラウド遮断は二層: ① `resolve_vlm()`（`convert()` 開始時の1回の判定）、② 送信直前（`_read_openai`/`_read_ollama`）に `_cloud_allowed_now()` が system_settings を読み直して再検査する（長い PDF の途中で許可が取り消されても次ページで止まる）。
 設計: docs/design/rag.md「アーム一覧」
@@ -258,7 +258,7 @@ class VisionArm:
         try:
             try:
                 if ext in office_md.IMAGE_EXT:
-                    text, pages = self._read_image(p, cfg), 1
+                    text, pages, extra_notes = self._read_image(p, cfg)
                 elif ext == ".pdf":
                     text, pages, extra_notes = self._read_pdf(p, cfg)
                 else:
@@ -273,7 +273,7 @@ class VisionArm:
                 return None  # 文字が取れない＝未対応（失敗計上）
             md = _LABEL + "\n\n" + text.strip()
             notes = [f"vlm_provider={cfg['provider']}", f"vlm_model={cfg['model']}", "numeric_verified=false"]
-            if ext == ".pdf":
+            if ext == ".pdf" or pages > 1:
                 notes.append(f"pages={pages}")
             notes.extend(extra_notes)  # タイムアウト予算切れの truncated 記録
             return ArmResult(md=md, method="vision", confidence=0.4, notes=notes)
@@ -282,9 +282,44 @@ class VisionArm:
             if n:
                 metering.record("vlm", cfg["provider"], cfg["model"], tokens, calls=n)
 
-    def _read_image(self, image_path: Path, cfg: dict) -> str | None:
-        """1 枚の画像を VLM で読み取る（失敗/空は None）。1 ファイル総予算＝画像1枚分の全時間。"""
-        return _vlm_read(image_path, cfg, _vlm_timeout_sec())
+    def _read_image(self, image_path: Path, cfg: dict) -> tuple[str | None, int, list[str]]:
+        """画像ファイルを VLM で読み取る。返値 `(テキスト|None, 処理ページ数, 追加notes)`。
+
+        1 ページの画像はそのまま 1 回読む。複数ページの TIFF はページごとに PNG にして読み、`## ページ N` で結合する
+        （1 ファイル総予算・ページ上限 `SHERPA_OCR_MAX_PAGES` は PDF と同じ）。
+        """
+        page_total = _tiff_page_count(image_path)
+        if page_total <= 1:
+            return _vlm_read(image_path, cfg, _vlm_timeout_sec()), 1, []
+        from . import raster
+        tmp = Path(tempfile.mkdtemp(prefix="sherpa-vlmtiff-"))
+        parts: list[str] = []
+        pages_done = 0
+        total = min(page_total, raster._max_pages())
+        extra_notes = [f"image_pages_total={page_total}"]
+        if page_total > total:
+            extra_notes.append(f"image_pages_over_limit={page_total - total}")
+        unread_pages: list[int] = []
+        deadline = time.monotonic() + _vlm_timeout_sec()
+        try:
+            for i in range(total):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    extra_notes.append(f"truncated=pages {pages_done}/{total}（タイムアウト予算超過）")
+                    break
+                png = _to_png(image_path, tmp / f"page_{i + 1}.png", frame=i)
+                page_text = _vlm_read(png, cfg, remaining) if png is not None else None
+                pages_done += 1
+                if page_text and page_text.strip():
+                    parts.append(f"## ページ {i + 1}\n\n{page_text.strip()}")
+                else:
+                    unread_pages.append(i + 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if unread_pages:
+            extra_notes.append(f"image_pages_unread_count={len(unread_pages)}")
+            extra_notes.append("image_pages_unread=" + ",".join(str(n) for n in unread_pages[:_UNREAD_PAGES_LISTED]))
+        return ("\n\n".join(parts) if parts else None), pages_done, extra_notes
 
     def _read_pdf(self, pdf_path: Path, cfg: dict) -> tuple[str | None, int, list[str]]:
         """テキスト層ゼロ PDF を PDFium でページ画像化し、各ページを VLM で読み取る（ラスタ化は `raster` を共用）。
@@ -396,8 +431,49 @@ def count_calls():
         _CALLS.reset(token)
 
 
+_VLM_DIRECT_EXTS = frozenset({".png", ".jpg", ".jpeg"})   # VLM へそのまま送る形式（ほかは PNG にしてから送る）
+
+
+def _tiff_page_count(image_path: Path) -> int:
+    """TIFF のページ数。TIFF 以外・開けないものは 1。"""
+    if Path(image_path).suffix.lower() not in (".tif", ".tiff"):
+        return 1
+    try:
+        from PIL import Image
+        with Image.open(image_path) as image:
+            return max(1, int(getattr(image, "n_frames", 1)))
+    except Exception:
+        return 1
+
+
+def _to_png(image_path: Path, dst: Path, *, frame: int = 0) -> Path | None:
+    """画像の `frame` ページ目を PNG に書く（最長辺は `raster._MAX_PIXEL_SIDE` まで縮める）。開けない・書けないときは None。"""
+    from PIL import Image
+
+    from . import raster
+    try:
+        with Image.open(image_path) as image:
+            image.seek(frame)
+            page = image if image.mode in ("1", "L", "LA", "RGB", "RGBA") else image.convert("RGB")
+            if max(page.size) > raster._MAX_PIXEL_SIDE:
+                page = page.copy()
+                page.thumbnail((raster._MAX_PIXEL_SIDE, raster._MAX_PIXEL_SIDE))
+            page.save(dst, format="PNG")
+        return dst
+    except Exception as e:
+        _log.warning("VLM: 画像を PNG にできませんでした（%s）: %s", e.__class__.__name__, image_path)
+        return None
+
+
 def _vlm_read(image_path: Path, cfg: dict, timeout: float) -> str | None:
-    """1 枚の画像を VLM（provider 別）で読み取り、テキストを返す（失敗/到達不可は None）。"""
+    """1 枚の画像を VLM（provider 別）で読み取り、テキストを返す（失敗/到達不可は None）。PNG・JPEG 以外は PNG にしてから送る。"""
+    if Path(image_path).suffix.lower() not in _VLM_DIRECT_EXTS:
+        tmp = Path(tempfile.mkdtemp(prefix="sherpa-vlmimg-"))
+        try:
+            png = _to_png(image_path, tmp / "image.png")
+            return _vlm_read(png, cfg, timeout) if png is not None else None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     if _image_too_large(image_path):
         _log.warning("VLM: 画像サイズが上限（%sMB）を超えるため読み取りをスキップします: %s",
                      _max_image_mb(), image_path)
