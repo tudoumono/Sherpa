@@ -1818,8 +1818,35 @@ def _precheck_target(rp: Path, ext: str, conv) -> tuple[str, str | None, dict | 
     return "ok", None, None
 
 
+# 先読みの子へ渡さない重いファイルの目安（どれかを超えたら親が 1 件ずつ直列で処理する）
+_PREFETCH_MAX_FILE_BYTES = 10 * 1024 * 1024
+_PREFETCH_MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+_PREFETCH_MAX_XLSX_CELLS = 50_000
+
+
+def _prefetch_heavy(rp: Path, ext: str) -> bool:
+    """原本・非圧縮の合計・xlsx のセル数のどれかが先読みの目安を超えるか。測れないものは超えない扱い（本体ループが同じ原本を扱う）。"""
+    try:
+        if rp.stat().st_size > _PREFETCH_MAX_FILE_BYTES:
+            return True
+    except OSError:
+        return False
+    if ext in CONVERTIBLE_EXT:
+        uncompressed = _office_uncompressed_total_bytes(rp)
+        if uncompressed is not None and uncompressed > _PREFETCH_MAX_UNCOMPRESSED_BYTES:
+            return True
+    if ext == ".xlsx":
+        cells = _xlsx_estimated_cell_count(rp)
+        if cells is None:
+            cells = _xlsx_actual_cell_count(rp, _PREFETCH_MAX_XLSX_CELLS)
+        if cells is not None and cells > _PREFETCH_MAX_XLSX_CELLS:
+            return True
+    return False
+
+
 def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit, obs_dir=None, assets_root=None) -> list:
     """先読みする対象。ループ本体と同じ判定（候補・ガード・変換キャッシュのヒット）を通り、ooxml／pdf_text が受理する前段変換なしのファイルだけ。
+    重いファイル（`_prefetch_heavy`）は子へ渡さない。
 
     `assets_root` を渡すと、VLM の補足観測が起きない（xlsx は Office 表示補完も無効）ファイルは子で描画まで行う（`Job.render`）。判定はここで 1 回だけ。
     """
@@ -1835,6 +1862,8 @@ def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit, obs_dir=None
             if ext not in candidate or _is_skipped_original(rp, ext) or ext not in prefetchable:
                 continue
             if _precheck_target(rp, ext, conv)[0] != "ok" or cache_hit(rp, rel) is not None:
+                continue
+            if _prefetch_heavy(rp, ext):
                 continue
             arm = _select_arm(rp, enabled)
         except Exception:

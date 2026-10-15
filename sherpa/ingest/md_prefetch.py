@@ -12,6 +12,7 @@ import os
 import shutil
 from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -179,6 +180,7 @@ class Prefetcher:
         self.max_rss_kb = 0                                # 子の最大メモリ（全子の最大値）
         self._leftover_dirs: list[str] = []                # 使われなかった子が書いた素材（終了時に消す）
         self._unclaimed: dict[str, str] = {}               # 結果を取り出したが親がまだ描画結果を使っていない rel の素材
+        self._closed = False
         self._pool: ProcessPoolExecutor | None = ProcessPoolExecutor(
             max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
         self._pump()
@@ -245,6 +247,8 @@ class Prefetcher:
             got = fut.result()
         except Exception as exc:
             _log.warning("MD化の先読みに失敗しました（直列で計算し直します）: %s", exc.__class__.__name__)
+            if isinstance(exc, BrokenProcessPool):
+                self._stop_broken_pool()
             self._discard_assets(job)
             return None
         if not isinstance(got, Prefetched) or got.arm_name != job.arm_name:
@@ -271,16 +275,29 @@ class Prefetcher:
         if job.assets_dir:
             shutil.rmtree(job.assets_dir, ignore_errors=True)
 
+    def _stop_broken_pool(self) -> None:
+        """壊れたプールの子が全て止まるのを待ってから、未取得分の素材を消す（以降は全件を親が直列で計算する）。"""
+        pool, self._pool = self._pool, None
+        self._queue.clear()
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+        for job, _f in self._inflight.values():
+            self._discard_assets(job)
+        self._inflight.clear()
+
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         pool, self._pool = self._pool, None
         self._queue.clear()
         self._leftover_dirs.extend(j.assets_dir for j, _f in self._inflight.values() if j.assets_dir)
         self._inflight.clear()
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
-            for leftover in (*self._leftover_dirs, *self._unclaimed.values()):
-                shutil.rmtree(leftover, ignore_errors=True)
-            self._leftover_dirs.clear()
-            self._unclaimed.clear()
-            _log.info("MD化の先読みを使いました: %d/%d件（うち描画まで子で済んだ件数 %d）・子の最大メモリ %dMB",
-                      self.used, self._planned, self.rendered, self.max_rss_kb // 1024)
+        for leftover in (*self._leftover_dirs, *self._unclaimed.values()):
+            shutil.rmtree(leftover, ignore_errors=True)
+        self._leftover_dirs.clear()
+        self._unclaimed.clear()
+        _log.info("MD化の先読みを使いました: %d/%d件（うち描画まで子で済んだ件数 %d）・子の最大メモリ %dMB",
+                  self.used, self._planned, self.rendered, self.max_rss_kb // 1024)

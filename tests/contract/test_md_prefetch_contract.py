@@ -88,6 +88,19 @@ def test_child_does_not_render_when_vlm_may_observe(tmp_path, monkeypatch):
     assert jobs[0].assets_dir == str(tmp_path / "rag" / "a.docx.assets")
 
 
+
+def test_heavy_files_are_not_prefetched(tmp_path, monkeypatch):
+    """目安を超える重いファイルは子へ渡さず、親が直列で処理する（子どうしでメモリを食い合わない）。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-DOCX-HARD.docx", src / "a.docx")
+    shutil.copy(FIXTURES / "eval/excel_ja/inputs/JPX-001.xlsx", src / "b.xlsx")
+    assert [j.rel for j in _jobs_for(src, tmp_path)] == ["a.docx", "b.xlsx"]
+    monkeypatch.setattr(office_md, "_PREFETCH_MAX_XLSX_CELLS", 1)
+    assert [j.rel for j in _jobs_for(src, tmp_path)] == ["a.docx"]
+    monkeypatch.setattr(office_md, "_PREFETCH_MAX_FILE_BYTES", 1)
+    assert _jobs_for(src, tmp_path) == []
+
 def test_render_failure_in_child_falls_back_without_leftovers(tmp_path):
     """子が素材を書けず描画に失敗したら、Evidence までで返し（親が描画し直す）、途中の素材を残さない。"""
     src = tmp_path / "a.docx"
@@ -122,6 +135,26 @@ def test_unused_prefetched_assets_are_removed(tmp_path):
         assert got is not None and got.rendered is not None and assets2.is_dir()
     assert not assets2.exists()                      # 親が `claim` しなかった描画結果の素材は残さない
 
+
+
+def test_broken_pool_stops_children_before_removing_assets(tmp_path):
+    """子が強制終了してプールが壊れたら、全ての子が止まってから未取得分の素材を消す（以降は親が直列で計算する）。"""
+    import os
+    import signal
+
+    jobs = []
+    for name in ("a.docx", "b.docx", "c.docx"):
+        shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-DOCX-HARD.docx", tmp_path / name)
+        jobs.append(md_prefetch.Job(name, str(tmp_path / name), "ooxml", ".docx", render=True,
+                                    assets_dir=str(tmp_path / "rag" / (name + ".assets"))))
+    with md_prefetch.Prefetcher(jobs, 2) as pf:
+        procs = list(pf._pool._processes.values())
+        os.kill(procs[0].pid, signal.SIGKILL)
+        assert pf.take("a.docx", tmp_path / "a.docx") is None
+        assert pf._pool is None and not any(p.is_alive() for p in procs)
+        assert not (tmp_path / "rag").exists() or list((tmp_path / "rag").iterdir()) == []
+        assert pf.take("b.docx", tmp_path / "b.docx") is None
+        assert pf.take("c.docx", tmp_path / "c.docx") is None
 
 def test_failed_job_returns_none_and_next_job_still_runs():
     """子が例外を投げたファイルは None（親が直列で計算し直す）。後続は影響を受けない。"""
