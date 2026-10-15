@@ -442,6 +442,12 @@ def _current_human_md_sig() -> str:
             f"docx={ooxml_arm.DOCX_EXTRACTOR_VERSION};xlsx={ooxml_arm.XLSX_EXTRACTOR_VERSION}")
 
 
+def _current_pdf_human_md_sig() -> str:
+    """今の PDF 人向け MD（`human_md.render_pdf`）の版。PDF の変換キャッシュの鍵と、`rag_sidecars_missing` の再生成判定に使う。"""
+    from . import human_md
+    return human_md.PDF_HUMAN_MD_VERSION
+
+
 _LEGACY_HUMAN_MD_EXT = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}
 
 
@@ -452,6 +458,15 @@ def _md_is_from_ooxml_arm(dr: Path, rel: str) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(meta, dict) and meta.get("arm") == "ooxml"
+
+
+def _md_is_from_pdf_text_arm(dr: Path, rel: str) -> bool:
+    """既存の `{rel}.md` が pdf_text アーム由来か（失敗の知らせ・vision 由来は作り直しの対象にしない）。"""
+    try:
+        meta = json.loads((dr / (rel + ".md.meta.json")).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(meta, dict) and meta.get("arm") == "pdf_text"
 
 
 def _md_is_failure_notice(dr: Path, rel: str) -> bool:
@@ -1655,6 +1670,8 @@ def _conv_cache_source_key(rp: Path, pipeline_sig: str) -> str | None:
         st = rp.stat()
     except OSError:
         return None
+    if rp.suffix.lower() == ".pdf":
+        pipeline_sig = f"{pipeline_sig};pdf_human_md={_current_pdf_human_md_sig()}"
     return f"{resolved}|{st.st_size}|{st.st_mtime_ns}|{st.st_ctime_ns}|{pipeline_sig}"
 
 
@@ -2439,6 +2456,15 @@ def _build_derived_staging_body(
                     failure["pdf_pages"] = pages
                 conversion_failures.append(failure)
                 continue
+            pdf_evidence = None
+            if pre is None and ext == ".pdf" and arm_name == "pdf_text":
+                # PDF の人向け MD は Evidence から組む（先読みの子は組み済み）。ここで抽出した Evidence はそのまま _generate_evidence へ渡す
+                try:
+                    pdf_evidence = _extract_canonical_evidence(rp)
+                except Exception:
+                    pdf_evidence = None                      # 抽出の失敗は _generate_evidence が従来どおり扱う（MD は pdfium 本文のまま）
+                if pdf_evidence is not None:
+                    _apply_pdf_human_md(result, pdf_evidence, rp)
             if extra_notes:                                  # 来歴に legacy_backend/soffice バージョンを追記
                 result.notes = list(result.notes) + extra_notes
             dst = dr / (rel + ".md")                          # 出力名は必ず**原本 rel**（台帳/grep が一致）
@@ -2450,6 +2476,8 @@ def _build_derived_staging_body(
                 _check_partial_extraction(rp, result.md, rel, result.document, partial_extraction_suspected)
             if ext in (".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt") and arm_name == "ooxml":
                 human_md_sig_for_rel = _current_human_md_sig()
+            elif ext == ".pdf" and arm_name == "pdf_text":
+                human_md_sig_for_rel = _current_pdf_human_md_sig()
             _write_prov(
                 dst, arm_name, result, legacy_conversion=legacy_conversion)  # 来歴サイドカーをESチャンクメタへ搬送
             # IR は原本が素の .docx/.pptx/.xlsx のときだけ書く。旧 .doc/.ppt/.xls は前段変換後の一時 OOXML から IR を作れてしまうが、
@@ -2491,7 +2519,7 @@ def _build_derived_staging_body(
                     legacy_ir=result.document,
                     consume_legacy=result.document is not None,
                     legacy_conversion=legacy_conversion,
-                    precomputed_evidence=pre.evidence if pre is not None else None,
+                    precomputed_evidence=pre.evidence if pre is not None else pdf_evidence,
                     prerendered=prerendered,
                 )
                 result.document = None
@@ -2749,6 +2777,11 @@ def rag_sidecars_missing(wd, derived, *, world: str | None = None) -> bool:
                 or manifest.get("schema") != _DERIVED_MANIFEST_SCHEMA_VERSION
                 or not isinstance(manifest.get("sidecars"), list)):
             return True
+        if ext == ".pdf" and _md_is_from_pdf_text_arm(dr, rel):
+            versions = manifest.get("asset_versions")
+            recorded = versions.get("human_md") if isinstance(versions, dict) else None
+            if recorded != _current_pdf_human_md_sig():      # 人向け MD が古い形のまま＝全再構築で作り直す
+                return True
         for suffix in manifest["sidecars"]:
             if not isinstance(suffix, str):
                 return True
@@ -3542,6 +3575,30 @@ def _pdf_md(p: Path) -> str | None:
         if body:
             out.append(f"## ページ {i}\n\n{body}")
     return "\n\n".join(out) if out else None
+
+
+def _apply_pdf_human_md(result, evidence, path: Path) -> None:
+    """pdf_text アームの結果 `result.md` を、Evidence から組んだ人向け MD（表は Markdown の表）に差し替える。組めなければ pdfium 本文のまま。
+
+    位置付き文字の無いページは pdfium のページ本文（`_pdf_md` と同じ整形）を使う。
+    設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
+    """
+    from . import human_md
+    pages: list[str] | None = None
+
+    def page_body(number: int) -> str:
+        nonlocal pages
+        if pages is None:
+            pages = _pdf_pages(path)
+        return _normalize_pdf_text(pages[number - 1]) if 0 < number <= len(pages) else ""
+
+    try:
+        md = human_md.render_pdf(evidence, page_body)
+    except Exception:
+        _log.warning("PDF の人向け MD を Evidence から組めませんでした（pdfium の本文で代替します）: %s", path.name, exc_info=True)
+        return
+    if md:
+        result.md = md
 
 
 # ---- PDF ティア制＝テキスト層の品質で担当アームを決定的に選ぶ ----

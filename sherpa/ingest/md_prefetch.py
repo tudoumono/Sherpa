@@ -111,7 +111,7 @@ def compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = Fal
 def _compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = False,
              assets_dir: str | None = None, obs_dir: str | None = None) -> Prefetched:
     """子プロセスで動く。① 原本の stat を取り入口ガードを判定し直す ② アームで変換 ③ 消費前の Document IR から document.json・部分抽出の疑いを作る
-    ④ Evidence を抽出する ⑤ `render` のときは素材の書出し・描画まで行い、親が書く中身を返す（失敗したら素材を消して Evidence までで返す）。"""
+    ④ Evidence を抽出する（pdf_text は人向け MD を組むため②の直後に抽出し `result.md` を差し替える）⑤ `render` のときは素材の書出し・描画まで行い、親が書く中身を返す（失敗したら素材を消して Evidence までで返す）。"""
     from . import document_ir, evidence_spike, excel_display, office_md
     from .arms import ooxml_arm, pdf_text_arm
 
@@ -127,6 +127,10 @@ def _compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = Fa
     result.document = None
     if result.md is None:
         return Prefetched(arm_name, result, document is not None, None, [], None, stat)
+    evidence = None
+    if ext == ".pdf" and arm_name == "pdf_text":                     # 人向け MD は Evidence から組むので、先に抽出して差し替える
+        evidence = evidence_spike.extract(path)
+        office_md._apply_pdf_human_md(result, evidence, path)
     partial: list[dict] = []
     office_md._check_partial_extraction(path, result.md, rel, document, partial)
     document_json = None
@@ -134,8 +138,7 @@ def _compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = Fa
         document.doc_id = rel
         document.source.path = rel
         document_json = document_ir.to_json_str(document)
-    evidence = None
-    if ext in office_md.EVIDENCE_EXT and office_md._evidence_arm_selected(ext, arm_name):
+    if evidence is None and ext in office_md.EVIDENCE_EXT and office_md._evidence_arm_selected(ext, arm_name):
         evidence = evidence_spike.extract(path, legacy_ir=document, consume_legacy=document is not None)
         if path.suffix.lower() == ".xlsx":
             excel_display.enrich_evidence(evidence, path)
