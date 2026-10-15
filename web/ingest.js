@@ -670,6 +670,7 @@ const INGEST_NOTICE_JA = {
 const PROV_METHOD = {                       // 主たる読み取り方法 → 平文
   ooxml: 'Office から直接読み取り',
   pdf_text: 'PDF の文字を抽出',
+  pdf_scan_ocr: '画像の文字を読み取って検索（OCR）',
   markitdown: '文書を広く読み取り（MarkitDown）',
   markitdown_ocr: 'AI が画像を見て読み取り（数値は要確認）',   // 視覚読み取り（VLM）
   // 後方互換のみ: 既存の派生 meta.json に method="ocr" の来歴が残っている間は表示だけ維持する。

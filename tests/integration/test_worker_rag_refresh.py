@@ -368,12 +368,12 @@ def test_old_schema_manifest_triggers_one_full_rebuild_then_stabilizes(_world, m
     assert res2["status"] == "unchanged" and res2["changed"] is False
 
 
-@pytest.mark.parametrize("build_fixture", ["empty_ooxml", "image_only_pdf"])
+@pytest.mark.parametrize("build_fixture", ["empty_ooxml", "image_only_pdf", "image_only_pdf_ocr_off"])
 def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
         tmp_path, monkeypatch, build_fixture):
-    """正当に一部 sidecar が無いケース（空 OOXML の legacy `.md`・image-only PDF の legacy `.md`/
-    `.md.meta.json`）を sidecar 欠落として誤検知しないこと。2回連続 sync してもフルリビルドが
-    起きないことを固定する（過検知は既定 OFF でも毎 sync の全再取り込みという実害を生むため）。
+    """正当に一部 sidecar が無いケース（空 OOXML の legacy `.md`・OCR が無効で変換失敗のままの image-only PDF の `.md`）を
+    sidecar 欠落として誤検知しないこと。OCR が有効な image-only PDF は人向け MD の知らせができる。
+    2回連続 sync してもフルリビルドが起きないことを固定する（過検知は既定 OFF でも毎 sync の全再取り込みという実害を生むため）。
     """
     wd = tmp_path / "world"
     wd.mkdir()
@@ -390,20 +390,17 @@ def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
         assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
         assert not (dmd / "empty.docx.md").is_file()
     else:
-        from pypdf import PdfWriter
-        writer = PdfWriter()
-        writer.add_blank_page(width=200, height=200)
-        with (wd / "scan.pdf").open("wb") as f:
-            writer.write(f)
-        orig_backend, orig_pages = office_md._pdf_backend, office_md._pdf_pages
-        try:
-            office_md._pdf_backend = lambda: "pypdf"
-            office_md._pdf_pages = lambda p: [""]   # legacy MD側はtextless扱い（Evidence抽出は実PDFを読む）
-            rep = office_md.build_derived(wd, dmd)
-        finally:
-            office_md._pdf_backend, office_md._pdf_pages = orig_backend, orig_pages
+        from PIL import Image, ImageDraw
+        monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
+        if build_fixture == "image_only_pdf_ocr_off":
+            monkeypatch.setenv("SHERPA_OCR_ENABLED", "0")
+        image = Image.new("1", (600, 400), 1)
+        ImageDraw.Draw(image).rectangle((40, 40, 300, 200), outline=0, width=4)
+        image.save(wd / "scan.pdf", "PDF")
+        rep = office_md.build_derived(wd, dmd)
         assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
-        assert not (dmd / "scan.pdf.md").is_file()
+        assert (dmd / "scan.pdf.md").is_file() == (build_fixture == "image_only_pdf")
+        assert office_md.rag_sidecars_missing(wd, dmd) is False
 
     monkeypatch.setattr(worlds, "world_dir", lambda world: wd)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
