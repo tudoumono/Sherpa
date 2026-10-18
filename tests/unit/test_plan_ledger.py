@@ -194,11 +194,11 @@ def test_compose_falls_back_to_codex_body_without_conclusion():
 
 def test_style_env(monkeypatch):
     monkeypatch.delenv(PL.STYLE_ENV, raising=False)
-    assert PL.ledger_style() == "json"
+    assert PL.ledger_style() == "plan_main"
     monkeypatch.setenv(PL.STYLE_ENV, "plan_gate")
     assert PL.ledger_style() == "plan_gate"
     monkeypatch.setenv(PL.STYLE_ENV, "bogus")
-    assert PL.ledger_style() == "json"
+    assert PL.ledger_style() == "plan_main"
 
 
 @pytest.mark.parametrize("rows", [

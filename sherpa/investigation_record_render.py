@@ -150,17 +150,31 @@ def _calls_section(calls) -> list[str]:
     return lines
 
 
+def _record_lines_section(detail: dict) -> list[str]:
+    """道具の打ち切りと調べた量（回答には出さず、ここにだけ残す分）。"""
+    rows = [r for r in (detail.get("record_lines") or []) if isinstance(r, dict) and r.get("text")]
+    if not rows:
+        return []
+    return ["", "## 調べた量", ""] + [f"- {_esc_cell(r.get('label'))}: {_esc_cell(r.get('text'))}" for r in rows]
+
+
 def render_markdown(record: dict) -> str:
     """調査台帳の記録1件を Markdown へ整形する。`record` は `complete`/`truncated`/`manifest`/`items`/`coverage`/`reviews`（省略可）を持つ dict。"""
     manifest = record.get("manifest") or {}
     items = record.get("items") or {}
     question_kind = _label(_QUESTION_KIND_LABELS, manifest.get("question_kind"))
     detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+    if detail.get("ledger") == "plan":
+        lines = [_HEADER, "", "このターンは、調査計画書（Markdown）を書きながら調べました。下は、その計画書の全文です。"]
+        if detail.get("plan_truncated"):
+            lines.append("- 注記: 計画書が大きいため、先頭の一部だけを保存しています。")
+        lines += ["", "## 調査計画書", "", "````markdown", str(detail.get("plan") or "（計画書は保存されていません）").rstrip(), "````"]
+        return "\n".join(lines + _record_lines_section(detail) + _calls_section(detail.get("calls")) + [""])
     if detail.get("ledger") == "none":
         note = describe_dropped(detail.get("dropped")) if record.get("truncated") else ""
-        return "\n".join([_HEADER, "", "調査台帳はありません（このターンは台帳を使っていません）。"]
+        return "\n".join([_HEADER, "", "このターンは、調査台帳も調査計画書も使わずに調べました。調べた経路だけを残しています。"]
                          + ([f"- 注記: {note}"] if note else [])
-                         + _calls_section(detail.get("calls")) + [""])
+                         + _record_lines_section(detail) + _calls_section(detail.get("calls")) + [""])
     lines = [_HEADER, "",
              f"- 質問の種類: {question_kind}",
              f"- 完了: {'はい' if record.get('complete') else 'いいえ'}"]
@@ -233,6 +247,7 @@ def render_markdown(record: dict) -> str:
                 what = "・".join(_esc_cell(call[k]) for k in ("query", "doc", "range") if call.get(k))
                 lines.append(f"  - {_esc_cell(call.get('tool'))}（{_label(_COVERAGE_LABELS, call.get('outcome'))}）"
                              + (f": {what}" if what else ""))
+    lines += _record_lines_section(detail)
     lines += _calls_section(detail.get("calls"))
     lines.append("")
     return "\n".join(lines)

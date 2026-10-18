@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from sherpa import answer_shape, chat_service, stop_kind
+from sherpa import answer_shape, investigation_summary, chat_service, stop_kind
 from sherpa.providers.codex.continuation import _pick_codex_headline
 from sherpa.providers.codex.structured import split_review_preamble
 from sherpa.store.shares import _safe_share_answer
@@ -64,7 +64,7 @@ def test_trimmed_preamble_and_trailing_progress_are_recorded_not_lost():
 
 
 def test_investigation_summary_lists_limits_unconfirmed_and_broken_items_in_plain_words():
-    """打ち切り・確認できた／できなかった項目（51 件目以降は「ほか N 件」）・壊れた項目・調べた量が、利用者向けの文で並ぶ。"""
+    """確認できた／できなかった項目（51 件目以降は「ほか N 件」）・壊れた項目が、利用者向けの文で並ぶ。道具の打ち切りと調べた量は回答に出さず、調査の記録に残す。"""
     unconfirmed = [{"item": f"項目{i}", "reason": "検索が失敗し、確認できませんでした"} for i in range(53)]
     env = {"headline": "回答です。", "data": {},
            "limits": {"search_truncated": 2, "total_budget_hit": True, "wall_clock_hit": True, "duplicate_tool_call": 0},
@@ -72,13 +72,15 @@ def test_investigation_summary_lists_limits_unconfirmed_and_broken_items_in_plai
                              "invalid": ["x1", "x2"], "effort": {"searches": 7, "docs_read": 4}}}
     items = answer_shape.seal(env)["investigation_summary"]["items"]
     texts = [(i["label"], i["text"]) for i in items]
-    assert ("打ち切り", "検索の結果が多く、途中で打ち切った検索が 2 回ありました（残りは確認していません）。") in texts
-    assert sum(1 for label, _t in texts if label == "打ち切り") == 3     # 0 回の重複拒否は出さない
+    assert not any(label in ("打ち切り", "調べた量") for label, _t in texts)
+    # 読み取り量の上限は、打てる手を添えて「注意」として出す（時間の上限は回答の注記が受け持つ）。
+    assert any(label == "注意" and "読み取り量の上限" in t and "深く" in t for label, t in texts)
     assert ("確認できた項目", "3 件（ソースで確認 3 件）") in texts
     assert sum(1 for label, _t in texts if label == "確認できなかった項目") == 51   # 50 件 + 「ほか 3 件」
     assert ("確認できなかった項目", "ほか 3 件") in texts
     assert any(label == "壊れていた項目" and "2 件" in t and "x1" in t for label, t in texts)
-    assert ("調べた量", "検索 7 回・読んだ資料 4 件（確認できた範囲の数です）") in texts
+    record = [(i["label"], i["text"]) for i in investigation_summary.record_lines(env["limits"], env["investigation"]["effort"])]
+    assert record == [("調べた量", "検索 7 回・読んだ資料 4 件（確認できた範囲の数です）")]
     # 何度封印しても同じ（事実から作り直す）・自前で詰めた中身は上書きしない。
     assert answer_shape.seal(env)["investigation_summary"]["items"] == items
     own = {"headline": "x", "limits": {"wall_clock_hit": True},
@@ -149,4 +151,24 @@ def test_received_share_read_path_hides_sensitive_names_in_new_fields():
     out = _strip_shared_message({"role": "assistant", "answer": {"headline": "本文", **_NEW_SHAPE}})["answer"]
     assert [r["path"] for r in out["referenced_docs"]] == ["docs/a.md"] and out["referenced_docs_hidden"] == 1
     assert out["found_docs_hidden"] == 1 and ".env" not in str(out)
+
+
+def test_plan_style_summary_leaves_unconfirmed_items_to_the_body_and_keeps_quality_notes():
+    """計画書の方式（C-check）では、確認できなかった項目は本文の補足に出るので要約に重ねない。主張を推定に下げた知らせは残す。"""
+    env = {"headline": "回答", "limits": {"claims_unmatched": 1, "search_truncated": 3},
+           "investigation": {"ledger": "plan", "unconfirmed_items": [{"item": "対象A", "reason": "範囲外"}]}}
+    texts = [(i["label"], i["text"]) for i in answer_shape.seal(env)["investigation_summary"]["items"]]
+    assert not any(label == "確認できなかった項目" for label, _t in texts)
+    assert ("打ち切り", "調べた記録と合わない主張があったため、「推定」に下げています。") in texts
+    assert not any("検索の結果が多く" in t for _l, t in texts)
+
+
+def test_search_cutoff_is_shown_with_what_to_do_only_for_exhaustive_requests():
+    """検索の打ち切りは、全件・一覧・影響範囲の依頼のときだけ、打てる手と一緒に出す。普段の質問・読み取りの切り詰めは出さない。"""
+    base = {"headline": "回答", "limits": {"search_truncated": 2, "tool_result_clipped": 5}}
+    plain = answer_shape.seal({**base, "investigation": {"ledger": "plan"}})["investigation_summary"]["items"]
+    assert plain == []
+    wide = answer_shape.seal({**base, "investigation": {"ledger": "plan", "exhaustive": True}})["investigation_summary"]["items"]
+    assert len(wide) == 1 and wide[0]["label"] == "注意"
+    assert "資料フォルダを絞る" in wide[0]["text"] and "深く" in wide[0]["text"] and "切り詰め" not in wide[0]["text"]
 

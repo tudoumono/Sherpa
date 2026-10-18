@@ -239,5 +239,17 @@ def test_render_markdown_without_ledger_shows_notice_and_calls_only():
     md = investigation_record_render.render_markdown(
         {"complete": False, "truncated": False, "manifest": None, "items": {}, "coverage": {}, "reviews": [],
          "detail": {"ledger": "none", "calls": calls}})
-    assert "調査台帳はありません（このターンは台帳を使っていません）" in md
+    assert "調査台帳も調査計画書も使わずに調べました" in md
     assert "## 調べた経路" in md and "## 見つかった資料（検索の結果）" in md and "## 項目" not in md
+
+
+def test_render_markdown_plan_style_shows_the_plan_and_cutoffs():
+    """C-check（計画書の方式）の記録は、調査計画書の全文と、調べた量を載せる。"""
+    from sherpa import investigation_record_render as R
+    md = R.render_markdown({"complete": False, "manifest": None, "items": {}, "coverage": {}, "reviews": [],
+                            "detail": {"ledger": "plan", "plan": "# 調査計画: 例\n## 母集団\n- [x] a · 種別 · 対象",
+                                       "record_lines": [{"label": "調べた量", "text": "検索 4 回・読んだ資料 3 件（確認できた範囲の数です）"}]}})
+    assert "調査計画書（Markdown）を書きながら調べました" in md and "## 調査計画書" in md and "- [x] a · 種別 · 対象" in md
+    assert "## 調べた量" in md and "検索 4 回" in md
+    assert "台帳を使っていません" not in md and "## 項目" not in md
+

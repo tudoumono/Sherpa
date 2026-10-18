@@ -137,7 +137,13 @@ def format_turn(row: dict) -> list[str]:
             "schema_level", "multi_agent", "budget_per_result", "max_hits", "window_cap") if k in st)
                      + f" 版={_version(act.get('app_version'))}")
     inv = row.get("investigation") if isinstance(row.get("investigation"), dict) else None
-    if inv is not None and any(inv.get(k) is not None for k in ("complete", "continuations", "counts")):
+    if inv is not None and inv.get("ledger") == "plan":
+        marks = inv.get("marks") if isinstance(inv.get("marks"), dict) else {}
+        lines.append(f"  計画書: 方式={_safe(inv.get('style'), _IDENT)} 行={inv.get('rows')} "
+                     + " ".join(f"{_safe(k, _IDENT)}={v}" for k, v in sorted(marks.items())
+                                if isinstance(v, int) and not isinstance(v, bool))
+                     + f" 終了={_safe(inv.get('stopped_reason'), _IDENT)}")
+    elif inv is not None and any(inv.get(k) is not None for k in ("complete", "continuations", "counts")):
         counts = inv.get("counts") if isinstance(inv.get("counts"), dict) else {}
         lines.append(f"  台帳: 完了={inv.get('complete')} 継続={inv.get('continuations')} 終端: "
                      + (" ".join(f"{_safe(k, _IDENT)}={v}" for k, v in sorted(counts.items())

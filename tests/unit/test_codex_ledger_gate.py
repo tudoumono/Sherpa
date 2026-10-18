@@ -1398,6 +1398,19 @@ def test_plan_main_accepts_its_final_without_tool_zero_or_ledger_review(tmp_path
     assert "使うかどうかは自分で決めてよい" in json.loads(capture.read_text())["agents"]
 
 
+
+def test_plan_main_turn_saves_the_plan_in_the_investigation_record(tmp_path, monkeypatch):
+    events, env, _calls = _t(tmp_path, monkeypatch, [
+        _st("PLAN-REC", _final("値は 10 です。"), plan_md=_PLAN_OPEN),
+    ], "plan-rec", 704, env={"SHERPA_LEDGER_STYLE": "plan_main"})
+    result = next(e for e in events if isinstance(e, dict) and e.get("type") == "_result")
+    record = result["investigation_record"]
+    assert record is not None and record["extras"]["ledger"] == "plan"
+    assert record["extras"]["plan"] == _PLAN_OPEN
+    assert env["investigation"]["ledger"] == "plan"
+    labels = [i["label"] for i in env.get("investigation_summary", {}).get("items", [])]
+    assert "打ち切り" not in labels and "調べた量" not in labels
+
 _LIST_ANSWER = ("影響するプログラムは次の2本です。\n- src/demo_one.cbl 受付処理\n- src/demo_two.cbl 集計処理\n\n"
                 "参照した資料:\n- 4期/02_設計/01_基本設計/税計算仕様書.md\n- 存在しない資料.md\n")
 _PLAN_SHORT = ("## 前提\n仮定です\n## 母集団\n- [x] a · program · 架空対象 · 要: source\n"

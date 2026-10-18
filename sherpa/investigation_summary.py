@@ -30,6 +30,21 @@ _LIMIT_TEXTS: tuple[tuple[str, str], ...] = (
     ("ledger_incomplete", "調査の確認項目が一部終わらないまま回答しています。"),
     ("claims_unmatched", "調べた記録と合わない主張があったため、「推定」に下げています。"),
 )
+# 利用者に打てる手が無い打ち切り（仕組みの都合）は回答にも記録にも出さない（`env["limits"]` と活動のログにだけ残る）。
+# 時間の上限は回答の注記（`wall_clock`）が手立てと一緒に出す。
+_HIDDEN_LIMITS = frozenset({"search_truncated", "tool_result_clipped", "duplicate_tool_call",
+                            "backend_unavailable_fulltext", "wall_clock_hit"})
+# 調べ切れなかったときに、利用者に打てる手を添えて出す文。
+_ACTION_TEXTS: tuple[tuple[str, str], ...] = (
+    ("total_budget_hit", "読み取り量の上限に達したため、ここまでの結果で答えています。資料フォルダを絞るか、"
+                         "「調べる深さ」を「深く」にして聞き直すと、さらに調べます。"),
+    ("tool_calls_exhausted", "道具を使える回数の上限に達したため、ここまでの結果で答えています。資料フォルダを絞るか、"
+                             "「調べる深さ」を「深く」にして聞き直すと、さらに調べます。"),
+)
+# 全件・一覧・影響範囲の依頼で検索の結果が多かったときだけ出す文（取りこぼしが起こり得るため）。
+_EXHAUSTIVE_SEARCH_TEXT = ("検索の結果が多く、上位の結果をもとに答えています。漏れが気になるときは、資料フォルダを絞るか、"
+                           "「調べる深さ」を「深く」にして聞き直してください（見る件数が増えます）。")
+_LABEL_NOTE = "注意"
 _CONFIRMED_LABELS = (("source_confirmed", "ソースで確認"), ("spec_only", "設計書だけで確認"),
                      ("conflict", "ソースと設計書が食い違う"))
 
@@ -46,15 +61,24 @@ def _split_names(names) -> tuple[list[str], int]:
 
 
 def build_items(env: dict) -> list[dict]:
-    """`[{label, text}]`。打ち切り・確認できた／できなかった項目・壊れた項目・調べた量・見直しの読み取りの省略・調査記録の欠落の順。"""
+    """回答に付ける `[{label, text}]`。確認の状態・確認できた／できなかった項目・壊れた項目・見直しの読み取りの省略・調査記録の欠落の順。
+    道具の打ち切りと調べた量は入れない（`record_lines` で調査の記録に残す）。計画書の方式では、確認できなかった項目は本文の補足に出るので入れない。"""
     items: list[dict] = []
     limits = env.get("limits") if isinstance(env.get("limits"), dict) else {}
+    inv = env.get("investigation") if isinstance(env.get("investigation"), dict) else {}
+    plan_style = inv.get("ledger") == "plan"
+    for key, text in _ACTION_TEXTS:
+        if limits.get(key) is True or _count(limits.get(key)):
+            items.append({"label": _LABEL_NOTE, "text": text})
+    if inv.get("exhaustive") and (limits.get("search_truncated") is True or _count(limits.get("search_truncated"))):
+        items.append({"label": _LABEL_NOTE, "text": _EXHAUSTIVE_SEARCH_TEXT})
     for key, template in _LIMIT_TEXTS:
+        if key in _HIDDEN_LIMITS or key in dict(_ACTION_TEXTS):
+            continue
         value = limits.get(key)
         n = _count(value)
         if value is True or n:
             items.append({"label": _LABEL_LIMIT, "text": template.format(n=n)})
-    inv = env.get("investigation") if isinstance(env.get("investigation"), dict) else {}
     if inv.get("manifest_invalid"):
         items.append({"label": _LABEL_BROKEN, "text": "調査の目録（確認する項目の一覧）が壊れていて、項目ごとの確認を確かめられません。"})
     counts = inv.get("counts") if isinstance(inv.get("counts"), dict) else {}
@@ -64,7 +88,8 @@ def build_items(env: dict) -> list[dict]:
         parts = "・".join(f"{label} {n} 件" for label, n in confirmed if n)
         items.append({"label": _LABEL_CONFIRMED, "text": f"{total} 件（{parts}）"})
     unconfirmed = [u for u in (inv.get("unconfirmed_items") or [])
-                   if isinstance(u, dict) and isinstance(u.get("item"), str) and isinstance(u.get("reason"), str)]
+                   if not plan_style and isinstance(u, dict) and isinstance(u.get("item"), str)
+                   and isinstance(u.get("reason"), str)]
     hidden = 0
     for u in unconfirmed[:UNCONFIRMED_LIST_MAX]:
         if _split_names([u["item"]])[1]:
@@ -94,10 +119,6 @@ def build_items(env: dict) -> list[dict]:
                 + (f"（名前を表示できない項目 {masked} 件）" if masked else ""))
         items.append({"label": _LABEL_BROKEN,
                       "text": f"{invalid_total} 件（項目の記録が壊れていて確認できませんでした: {tail}）"})
-    effort = inv.get("effort") if isinstance(inv.get("effort"), dict) else {}
-    searches, docs = _count(effort.get("searches")), _count(effort.get("docs_read"))
-    if searches or docs:
-        items.append({"label": _LABEL_EFFORT, "text": f"検索 {searches} 回・読んだ資料 {docs} 件（確認できた範囲の数です）"})
     report = inv.get("reviews_report") if isinstance(inv.get("reviews_report"), dict) else {}
     omitted = _count(report.get("over_count")) + _count(report.get("invalid"))
     if omitted or report.get("over_bytes"):
@@ -106,6 +127,16 @@ def build_items(env: dict) -> list[dict]:
     for note in (inv.get("record_notes") or []):
         if isinstance(note, str) and note.strip():
             items.append({"label": _LABEL_RECORD, "text": note.strip()})
+    return items
+
+
+def record_lines(limits: dict | None, effort: dict | None) -> list[dict]:
+    """調査の記録に残す `[{label, text}]`。調べた量だけ（仕組みの都合の打ち切りは利用者に打てる手が無いので載せない）。"""
+    items: list[dict] = []
+    effort = effort if isinstance(effort, dict) else {}
+    searches, docs = _count(effort.get("searches")), _count(effort.get("docs_read"))
+    if searches or docs:
+        items.append({"label": _LABEL_EFFORT, "text": f"検索 {searches} 回・読んだ資料 {docs} 件（確認できた範囲の数です）"})
     return items
 
 

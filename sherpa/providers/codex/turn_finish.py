@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 from ... import agentic_search, investigation_ledger, workspace_limits
@@ -61,6 +62,57 @@ def _new_run_files(run_dir, before) -> list:
         and not ({".tmp", ".agents"} & set(p.relative_to(run_dir).parts))
     }
     return sorted(after - before)
+
+
+# 全件・一覧・影響範囲を求める依頼の言い回し（検索の取りこぼしが答えに効く依頼）。
+_EXHAUSTIVE_RE = re.compile(r"全件|全て|すべて|一覧|洗い出|網羅|漏れなく|影響範囲|影響先|どこで使")
+
+
+def _is_exhaustive_request(message, lens) -> bool:
+    """全件・一覧・影響範囲を求める依頼か（影響のレンズ、または依頼文の言い回しで判定する）。"""
+    return lens == "impact" or bool(_EXHAUSTIVE_RE.search(message or ""))
+
+
+# 調査の記録に入れる調査計画書の上限（文字数）。超えた分は切って印を付ける。
+_RECORD_PLAN_MAX_CHARS = 400_000
+
+
+def _count_search_calls(st) -> int | None:
+    """Sherpa が取った道具の呼び出しの記録（`st.call_log`）から検索の道具の回数を数える。記録が無ければ None。"""
+    merged = st.call_log
+    if merged is None or not merged.rows:
+        return None
+    return sum(1 for r in merged.rows if str(r.get("tool") or "").split("__")[-1] in _SEARCH_TOOL_NAMES)
+
+
+def _finish_record(st, env) -> None:
+    """調査の記録に、計画書の方式なら調査計画書の全文を、どの方式でも道具の打ち切りと調べた量を足す（回答には出さない分）。"""
+    plan = st._plan_final if st._ledger_style != "json" else None
+    payload = st._investigation_record_payload
+    if payload is None and plan is None:
+        return
+    if payload is None:
+        payload = {"complete": False, "manifest": None, "items": {}, "coverage": {}, "reviews": [],
+                   "coverage_detail": {}, "extras": {"ledger": "none"}}
+        st._investigation_record_payload = payload
+    extras = payload.setdefault("extras", {})
+    if plan is not None:
+        extras["ledger"] = "plan"
+        extras["plan"] = plan.text[:_RECORD_PLAN_MAX_CHARS]
+        if len(plan.text) > _RECORD_PLAN_MAX_CHARS:
+            extras["plan_truncated"] = True
+    limits = {k: v for k, v in (env.get("limits") or {}).items() if v}
+    if limits:
+        extras["limits"] = limits
+    effort = (env.get("investigation") or {}).get("effort")
+    if effort:
+        extras["effort"] = effort
+    from ... import investigation_summary
+    lines = investigation_summary.record_lines(limits, effort)
+    if lines:
+        extras["record_lines"] = lines
+    if not isinstance(env.get("investigation"), dict):
+        env["investigation"] = {"ledger": extras.get("ledger", "none")}
 
 
 def close_session(self, ctx, st, decision, env):
@@ -399,10 +451,14 @@ def assemble_result(self, ctx, st, decision, env):
     apply_codex_usage(ctx, st, env)
     # 使った検索と読んだ資料の数（取れる範囲）と、調査記録を縮めた旨を調査台帳の欄に添える（「調べた範囲」の素材）。
     if isinstance(env.get("investigation"), dict) and env["investigation"].get("ledger") != "none":
-        env["investigation"]["effort"] = {"searches": _count_searches(env.get("activity")),
+        _searches = _count_search_calls(st)
+        env["investigation"]["effort"] = {"searches": _searches if _searches is not None
+                                          else _count_searches(env.get("activity")),
                                           "docs_read": len(set(st._mcp_read_docs))}
         if st._record_notes:
             env["investigation"]["record_notes"] = list(st._record_notes)
+        if _is_exhaustive_request(ctx.message, (decision or {}).get("lens")):
+            env["investigation"]["exhaustive"] = True
     # 捕捉した session/thread id を env に載せる（chat_service が `store.set_session_id` で永続化し次ターンの resume 判定に使う）。ゲートは `_session_persistence_enabled`（conversation_id あり かつ サンドボックス有効）を使う（`SHERPA_CODEX_SANDBOX=0` は使い捨て thread_id のため DB に保存すると次回の resume が必ず失敗する）。
     if st._session_persistence_enabled and st.thread_id:
         env["codex_session_id"] = st.thread_id
@@ -639,6 +695,7 @@ def assemble_result(self, ctx, st, decision, env):
     if _impact_list is not None:
         env["impact_list"] = _impact_list
     plan_ledger.finish_report(st, ctx, env)
+    _finish_record(st, env)
     _finish_partial_status(ctx, st, env)
     yield {"type": "answer_delta", "text": env["headline"]}  # Codex は一括→フロントで段階表示
     yield {"type": "_result", "env": env, "decision": decision,

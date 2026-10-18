@@ -439,3 +439,11 @@ def upstream_only_registry(monkeypatch):
     monkeypatch.setattr(registry, "_ANALYZERS", registry._UPSTREAM_ANALYZERS)
     upstream_ext = frozenset().union(*(a.extensions for a in registry._UPSTREAM_ANALYZERS))
     monkeypatch.setattr(layer_mod, "CODE_EXT", upstream_ext)
+
+
+@pytest.fixture(autouse=True)
+def _ledger_style_default_for_tests(monkeypatch):
+    """既存のテストは JSON 台帳（A）の挙動を確かめるため、方式を指定していないテストは json で動かす（外の環境の値も持ち込まない）。
+    製品の既定（C-check）は tests/unit/test_ledger_style_default.py が確かめる。"""
+    monkeypatch.setenv("SHERPA_LEDGER_STYLE", "json")
+

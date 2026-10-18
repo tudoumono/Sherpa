@@ -51,6 +51,8 @@ def log_turn_end(ctx, st, env):
     # 台帳の終了状態は env["investigation"]["stopped_reason"] の4値より粗い3値（missing/complete/incomplete）。詳細（no_progress/cap 等）は env 側にだけ持つ。
     if not _schema_v2:
         _ledger_log_state = "off"  # 台帳を使わない構成（Codex(Ollama)・素の Codex 等）
+    elif st._ledger_style != "json":
+        _ledger_log_state = "plan"  # 調査計画書の方式（C-check・B）は JSON 台帳を使わない
     elif st._investigation_verdict is None or st._investigation_verdict.manifest_invalid:
         _ledger_log_state = "missing"
     elif st._investigation_verdict.complete:

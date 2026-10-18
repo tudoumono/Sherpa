@@ -1,5 +1,5 @@
 """評価用の調査計画書（`.tmp/investigation/plan.md`）: 目録の節を読むパーサ・Sherpa 判定型（plan_gate）の受理判定・計画書から回答への整形。
-切り替えは環境変数 `SHERPA_LEDGER_STYLE`（json＝既定の JSON 台帳／plan_gate／plan_main）。json のときこのモジュールは何もしない。
+切り替えは環境変数 `SHERPA_LEDGER_STYLE`（plan_main＝既定の C-check／json＝JSON 台帳の A／plan_gate＝B）。json のときこのモジュールは何もしない。
 設計: docs/design/codex.md「1ターンの流れ」
 """
 from __future__ import annotations
@@ -21,6 +21,8 @@ STYLE_ENV = "SHERPA_LEDGER_STYLE"
 REVIEW_CAP_ENV = "SHERPA_LEDGER_REVIEW_CAP"
 GATE_DRYRUN_ENV = "SHERPA_LEDGER_GATE_DRYRUN"
 STYLES = ("json", "plan_gate", "plan_main")
+# 既定の調査の方式（C-check）。
+DEFAULT_STYLE = "plan_main"
 PLAN_FILE_NAME = "plan.md"
 PLAN_REL_PATH = ".tmp/investigation/plan.md"
 
@@ -49,9 +51,9 @@ _PLAN_ONLY_PATHS_MAX = 50
 
 
 def ledger_style() -> str:
-    """`SHERPA_LEDGER_STYLE` の実効値。未設定・想定外は json。"""
+    """`SHERPA_LEDGER_STYLE` の実効値。未設定・想定外は plan_main（C-check）。json（A）・plan_gate（B）は指定したときだけ。"""
     v = os.environ.get(STYLE_ENV, "").strip().lower()
-    return v if v in STYLES else "json"
+    return v if v in STYLES else DEFAULT_STYLE
 
 
 def effective_style(*, plain: bool, ollama: bool, schema_level: int) -> str:
