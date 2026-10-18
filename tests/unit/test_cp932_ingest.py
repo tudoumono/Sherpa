@@ -13,13 +13,19 @@ def test_original_text_and_index_chunks_keep_japanese(tmp_path, encoding):
     doc = {'name': path.name, 'md_path': str(path), 'branch': 'source'}
     expected = source.replace('\r\n', '\n')
     assert doc_text.read_world_doc_text('pytest-encoding', doc) == expected
-    chunks, degraded = es_index._iter_doc_chunk_records('pytest-encoding', doc, None, frozenset())
+    # ソースは全文検索の索引に入れない（grep で探す）。
+    assert es_index._iter_doc_chunk_records('pytest-encoding', doc, None, frozenset()) == (None, None)
+    assert path.read_bytes() == source.encode(encoding)
+    # テキストの資料は索引に入り、日本語が化けない。
+    text_path = tmp_path / 'sample.txt'
+    text_path.write_bytes(source.encode(encoding))
+    text_doc = {'name': text_path.name, 'md_path': str(text_path), 'branch': 'docs'}
+    chunks, degraded = es_index._iter_doc_chunk_records('pytest-encoding', text_doc, None, frozenset())
     records = list(chunks)
     assert degraded is None
     assert records[0][1]['text'] == expected.strip()
     assert records[0][1]['line'] == 1
-    assert records[0][3] is True  # ソースは埋め込み対象外。
-    assert path.read_bytes() == source.encode(encoding)
+    assert text_path.read_bytes() == source.encode(encoding)
 
 
 @pytest.mark.parametrize('name', ['README', 'guide.unknown'])
