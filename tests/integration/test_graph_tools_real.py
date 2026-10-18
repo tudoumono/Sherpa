@@ -132,7 +132,7 @@ def test_unexplored_remainder_is_reported(loaded):
     assert _impact_names(shallow) == ["Link5", "Link4"]
     assert shallow["coverage"]["depth"] == {"requested": 2, "truncated": True}
     assert {"kind": "depth", "stage": "impact"} in shallow["coverage"]["limits"]
-    full = _run("graph_impact", {"canonical_id": link6, "depth": 5})
+    full = _run("graph_impact", {"canonical_id": link6, "depth": 5, "evidence_limit": 0})
     assert _impact_names(full) == ["Link5", "Link4", "Link3", "Link2", "Link1"]
     assert full["coverage"]["complete"] is True and full["coverage"]["depth"]["truncated"] is False
 
@@ -173,10 +173,34 @@ def test_response_shapes_match_golden(loaded):
         "invalid_args": _run("graph_impact", {}),
         "start_not_found": _run("graph_impact", {"canonical_id": "module:nope:x#X"}),
     }
+    for case in cases.values():
+        if "generation" in case:   # 世代は取り込みのたびに変わるので、条件の印だけを固定する
+            case["generation"] = "<世代>." + case["generation"].rpartition(".")[2]
     text = json.dumps(cases, ensure_ascii=False, indent=1, sort_keys=True)
     if os.environ.get("SHERPA_REGEN_GRAPH_TOOLS_GOLDEN") == "1":
         GOLDEN.write_text(text + "\n", encoding="utf-8")
     assert json.loads(GOLDEN.read_text(encoding="utf-8")) == json.loads(text)
+
+
+def test_pages_of_one_cover_the_real_graph_and_a_new_load_is_a_generation_mismatch(loaded):
+    """実 Neo4j の探索結果を 1 件ずつのページで最後まで取ると、全件取得と同じ集合になる。取り込みが作り直されると続きは世代不一致。"""
+    hub = _cid("cap/Hub.java", "Hub")
+    full = _run("graph_impact", {"canonical_id": hub, "limit": 200, "evidence_limit": 0})
+    assert full["transfer"]["complete"] is True and full["transfer"]["next_offset"] is None
+    names, offset, token = [], 0, None
+    while offset is not None:
+        res = _run("graph_impact", {"canonical_id": hub, "limit": 1, "evidence_limit": 0, "offset": offset,
+                                    **({"generation": token} if token else {})})
+        assert "error" not in res and len(res["impact"]) == 1 and res["count"] == 5
+        names += _impact_names(res)
+        offset, token = res["transfer"]["next_offset"], res["generation"]
+    assert sorted(names) == sorted(_impact_names(full)) and len(names) == len(set(names)) == 5
+    first = _run("graph_impact", {"canonical_id": hub, "limit": 1, "evidence_limit": 0})
+    with loaded.session() as s:
+        s.run("MATCH (m:SherpaMeta {world_id:$w}) SET m.generation='reloaded'", w=WORLD)   # 作り直し（`load_world` が世代を刻み直す）
+    res = _run("graph_impact", {"canonical_id": hub, "limit": 1, "evidence_limit": 0, "offset": 1,
+                                "generation": first["generation"]})
+    assert res["error"] == "graph_generation_mismatch"
 
 
 def test_sensitive_nodes_never_appear_in_any_output(loaded):
@@ -218,8 +242,8 @@ def test_impact_evidence_has_edge_sources_without_sensitive_or_out_of_scope_docu
     limited = _run("graph_impact", {"canonical_id": tgt, "evidence_limit": 1})["impact"][0]["evidence"][0]
     assert [s["doc_id"] for s in limited["sources"]] == ["mention/src/Sec2.java"]
     assert limited["sources_overflow_count"] == 4
-    none = _run("graph_impact", {"canonical_id": tgt, "evidence_limit": 0})["impact"][0]["evidence"][0]
-    assert none["sources"] == [] and none["sources_overflow_count"] == 5
+    none = _run("graph_impact", {"canonical_id": tgt, "evidence_limit": 0})["impact"][0]
+    assert "evidence" not in none and none["via"] == ["INVOKES"]                        # 一覧用の軽い形（根拠は付けない）
 
 
 def test_valid_sources_behind_rejected_ones_are_kept_after_verification(loaded, monkeypatch):

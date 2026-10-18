@@ -104,6 +104,7 @@ get_user_by_email
 get_user_by_uid
 get_workspace_file
 get_world
+get_world_root
 get_world_status_row
 init_schema
 insert_api_key

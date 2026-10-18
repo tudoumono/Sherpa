@@ -1,4 +1,4 @@
-"""`worlds.pin_world_root`（PART-4・TOCTOU 対策）の単体テスト。DB 不要（`store.get_world` を
+"""`worlds.pin_world_root`（PART-4・TOCTOU 対策）の単体テスト。DB 不要（`store.get_world_root` を
 差し替えて registry の rebind をシミュレートする）。
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ _WORLD_ID = "pinroottest"   # 実在しない world_id（fixtures/KB どちら�
 
 
 def test_pin_world_root_overrides_registry_reads_for_matching_world(monkeypatch, tmp_path):
-    """pin されている間は `store.get_world` を再度呼ばず、pin した root をそのまま返す
+    """pin されている間は `store.get_world_root` を再度呼ばず、pin した root をそのまま返す
     （preflight と実行の間の registry rebind との TOCTOU 対策）。"""
     root_a = tmp_path / "a"
     root_b = tmp_path / "b"
@@ -28,14 +28,14 @@ def test_pin_world_root_overrides_registry_reads_for_matching_world(monkeypatch,
         # 1回目は root_a（初期登録）・2回目以降は root_b（rebind 後）を返す。
         return {"root_path": str(root_b if len(calls) > 1 else root_a)}
 
-    monkeypatch.setattr(store, "get_world", fake_get_world)
+    monkeypatch.setattr(store, "get_world_root", fake_get_world)
 
     assert worlds.world_dir(_WORLD_ID) == root_a   # pin 無し・初回解決
     with worlds.pin_world_root(_WORLD_ID, root_a):
         # registry が root_b へ rebind された後でも、pin されている間は再解決しない。
         assert worlds.world_dir(_WORLD_ID) == root_a
         assert worlds.world_dir(_WORLD_ID) == root_a
-    assert calls == [_WORLD_ID], "pin 中は store.get_world を一度も呼ばないはず"
+    assert calls == [_WORLD_ID], "pin 中は store.get_world_root を一度も呼ばないはず"
     # pin を抜けたら通常解決に戻る（＝registry の最新値 root_b が見える）。
     assert worlds.world_dir(_WORLD_ID) == root_b
 
@@ -46,7 +46,7 @@ def test_pin_world_root_scope_limited_to_matching_world_id(monkeypatch, tmp_path
     other_root = tmp_path / "other"
     pinned_root.mkdir()
     other_root.mkdir()
-    monkeypatch.setattr(store, "get_world",
+    monkeypatch.setattr(store, "get_world_root",
                         lambda world_id: {"root_path": str(other_root)} if world_id == "otherworld" else None)
 
     with worlds.pin_world_root(_WORLD_ID, pinned_root):
@@ -57,7 +57,7 @@ def test_pin_world_root_scope_limited_to_matching_world_id(monkeypatch, tmp_path
 def test_pin_world_root_resets_after_context_exit_even_on_exception(monkeypatch, tmp_path):
     root_a = tmp_path / "a"
     root_a.mkdir()
-    monkeypatch.setattr(store, "get_world", lambda world_id: None)   # 未登録扱い（fixtures/KB も無し）
+    monkeypatch.setattr(store, "get_world_root", lambda world_id: None)   # 未登録扱い（fixtures/KB も無し）
 
     try:
         with worlds.pin_world_root(_WORLD_ID, root_a):

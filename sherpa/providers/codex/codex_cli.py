@@ -24,6 +24,7 @@ from .sandbox import (
     _web_search_endpoint_note,
     codex_multi_agent_enabled,
 )
+from . import plan_ledger
 from .structured import _claims_vs_ledger
 from .turn_candidates import _pick_structured_claims
 from .turn_consts import _MCP_SIDECAR_NAME, _OUTPUT_SCHEMA_PATH, _OUTPUT_SCHEMA_PATH_V2, _REASONING_AUTHOR, _int_or_none
@@ -207,7 +208,9 @@ def write_run_files(self, ctx, st):
                                             review_rounds=_review_rounds,
                                             layer=_layer,
                                             review_rounds_escalation=_review_rounds_escalation,
-                                            source_required="source" in st._ledger_required_extra)
+                                            source_required="source" in st._ledger_required_extra,
+                                            ledger_style=st._ledger_style,
+                                            plan_review_cap=st._plan_review_cap)
     except Exception as e:
         _log.warning("AGENTS.md write failed (fail-open, prompt still has containment): %s", e)
     # スキル配備もベストエフォート（fail-open）。knowledge=ON の Codex 実行全部で配備する（author に限定しない）。plain は investigate-* スキルを置かない（xlsx/docx/pptx/marp は配備する）。
@@ -364,14 +367,25 @@ def build_launch(self, ctx, st):
     _mcp_budget_env = _resolve_mcp_budget(
         self._system_settings,
         None if _plain else (ctx.scope_meta or {}).get("depth_profile"))
+    # 評価用の計画書方式。標準モードの構造化出力（v2）のときだけ有効（それ以外は常に json＝従来の動作）。
+    _style = st._ledger_style
+    st._plan_review_cap = plan_ledger.review_cap_for((ctx.scope_meta or {}).get("depth_profile"))
+    if _style != "json":
+        st._plan_gate = plan_ledger.PlanGateState() if _style == "plan_gate" else None
     if _plain:
         # 素の Codex モード: MCP サーバへツールの絞り込みを渡す。台帳のディレクトリ・required_extra は渡さない（台帳ツール自体を出さない）。
         _mcp_budget_env["SHERPA_MCP_TOOLSET"] = "plain"
     else:
-        # 解決済み（realpath）のパスを渡す（MCP サーバ側が書込のたびに「書込先の経路に symlink が無い」ことを検査するため）。
-        _mcp_budget_env["SHERPA_MCP_LEDGER_DIR"] = os.path.realpath(st._investigation_dir)
+        # 解決済み（realpath）のパスを渡す（MCP サーバ側が書込のたびに「書込先の経路に symlink が無い」ことを検査するため）。計画書方式では台帳のツールを公開せず、台帳のディレクトリも渡さない。
+        if _style == "json":
+            _mcp_budget_env["SHERPA_MCP_LEDGER_DIR"] = os.path.realpath(st._investigation_dir)
+        else:
+            _mcp_budget_env["SHERPA_MCP_TOOLSET"] = "plan"
+        # 道具が全件の結果を書き出す作業フォルダの `.tmp/`（`graph_impact` の `result_file`）。
+        _mcp_budget_env["SHERPA_MCP_TMP_DIR"] = os.path.realpath(_tmp)
         # `ledger_status`（mcp_server.py）の自己確認も provider 側のゲートと同じ required_extra を見られるようにする（ターンの最初に決めた値・カンマ区切り・空なら空文字列）。
-        _mcp_budget_env["SHERPA_MCP_LEDGER_REQUIRED_EXTRA"] = ",".join(st._ledger_required_extra)
+        if _style == "json":
+            _mcp_budget_env["SHERPA_MCP_LEDGER_REQUIRED_EXTRA"] = ",".join(st._ledger_required_extra)
         # 個人ファイル参照トグルが ON のターンは、ヒットの有無に関わらず台帳の coverage に検索語を記録しない（個人の内容が混ざり得るため）。
         if ctx.personal or ctx.personal_facts:
             _mcp_budget_env["SHERPA_MCP_COVERAGE_NO_QUERY"] = "1"
@@ -417,6 +431,7 @@ def build_launch(self, ctx, st):
         argv_base += ["-c", "features.multi_agent=false"]
         # `--strict-config` が無い経路（config.toml でなく -c）なので同等をここで足す。
         argv_base += _web_search_c_args(self._web_search, self._system_settings)
+        argv_base += sandbox.external_features_c_args()
         # `.tmp/`（run_dir 配下）はこの経路では model-shell からも見える（封じ込めが無い前提の経路）。`_sidecar_append` が書く内容は doc_id／ツール名／種別／時刻（と ask_user の質問）だけで本文は書かないが、shell が偽の行を追記できる可能性は残る。
         _sidecar_env = {"SHERPA_MCP_SIDECAR": str(_sidecar_path)}
         # 封じ込めの無い経路（SHERPA_CODEX_SANDBOX=0）はシェルからも書ける＝ターンの作業フォルダの中に置く。
@@ -439,7 +454,7 @@ def build_launch(self, ctx, st):
         argv_base += ["--output-schema",
                      str(_OUTPUT_SCHEMA_PATH_V2 if _schema_v2 else _OUTPUT_SCHEMA_PATH)]
     # 中間の見直し（`ledger_review_put`）を完了判定へ必須にするのは Codex の標準モード（`_schema_v2`）だけ。素の Codex・Codex(Ollama) は対象外。このターンの台帳ゲート呼び出し全て（while ループ・退避・最終判定）へ同じ値を渡す。`ledger_status`（MCP の自己確認）にも同じ値を env で伝える（`SHERPA_CODEX_SANDBOX=0` の経路だけは env が乗らず自己確認がわずかに楽観的になるが、実際のゲートは `_ledger_require_review` を直接使う）。
-    st._ledger_require_review = _schema_v2
+    st._ledger_require_review = _schema_v2 and _style == "json"
     if not _plain:
         _mcp_budget_env["SHERPA_MCP_LEDGER_REQUIRE_REVIEW"] = "1" if st._ledger_require_review else "0"
         # `ledger_status` の自己確認にも同じ義務フラグを伝える。

@@ -22,11 +22,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .. import json_io
-from . import ai_observation, context_ir, evidence_ir, mermaid_render
+from . import ai_observation, context_ir, evidence_ir, mermaid_render, pdf_chunking
 
 
-RAG_RENDERER_VERSION = "evidence-rag-renderer-v1alpha11"
-RAG_CHUNKER_VERSION = "evidence-rag-chunker-v1alpha11"
+RAG_RENDERER_VERSION = "evidence-rag-renderer-v1alpha13"
+RAG_CHUNKER_VERSION = "evidence-rag-chunker-v1alpha13"
 # 関係の文に書く対象の名前の上限（字）。超えた分は対象の要素の本文に全文がある旨を明記する。
 _RELATION_TARGET_NAME_MAX = 2000
 MAX_GROUP_CHARS = 1800
@@ -44,6 +44,7 @@ class RenderedEvidence:
     markdown: str
     chunks: list[dict]
     coverage_summary: dict[str, int]
+    context: context_ir.ContextIR | None = None
 
 
 def _identifier_metadata_fields(batch: context_ir.IdentifierMentionBatch) -> dict[str, Any]:
@@ -864,10 +865,11 @@ def _context_summary_record(
         label = "領域見出し" if row == region.start_row else (
             "列見出し" if row == region.header_row else "領域情報")
         exact = _value_text(cell.value)
+        shown = context_ir._header_text(cell) if label == "列見出し" else exact
         piece = {
-            "semantic": f"{label}: 「{exact}」",
-            "markdown": f"{label}: 「{exact}」",
-            "exact": f"{label}: {exact}",
+            "semantic": f"{label}: 「{shown}」",
+            "markdown": f"{label}: 「{shown}」",
+            "exact": f"{label}: {shown}",
             "evidence_id": cell.element_id,
             "locator": _compact_cell_locator(cell.locator),
             "header_path": list(region.header_for(column or 0)),
@@ -914,6 +916,14 @@ def _table_records(
         if element.type == "cell" and element.parent_id:
             by_parent[element.parent_id].append(element)
     tables = {element.element_id: element for element in ir.elements if element.type == "table"}
+    has_row_labels = any(region.label_columns for region in ctx.regions)
+    cell_at = {
+        (element.locator.sheet, row, column): element
+        for element in ir.elements
+        if has_row_labels and element.type == "cell"
+        and (position := _cell_row_column(element))[0] is not None and position[1] is not None
+        for row, column in [position]
+    }
     regions_by_table: dict[str, list[context_ir.ContextRegion]] = defaultdict(list)
     for region in ctx.regions:
         regions_by_table[region.table_id].append(region)
@@ -962,6 +972,11 @@ def _table_records(
                     and region.start_column <= column <= region.end_column
                     and _value_text(cell.value)
                 ]
+                row_cells = [
+                    cell for column in region.label_columns
+                    if (cell := cell_at.get((region.sheet, row, column))) is not None
+                    and _value_text(cell.value)
+                ] + row_cells
                 pieces: list[dict] = []
                 for cell in sorted(row_cells, key=lambda item: (_cell_row_column(item)[1] or 0, item.order)):
                     _, column = _cell_row_column(cell)
@@ -1408,6 +1423,95 @@ def _element_aliases(
     return {}, set()
 
 
+def _pdf_group_records(
+    ir: evidence_ir.EvidenceIR,
+    ctx: context_ir.ContextIR,
+    elements: dict[str, evidence_ir.EvidenceElement],
+    aliases: dict[str, list[evidence_ir.EvidenceElement]],
+    suppressed: set[str],
+    cell_ids: set[str],
+) -> tuple[list[dict], set[str]]:
+    """PDF の位置付き文字（1 行＝1 要素）を、同じページの読み順で 300〜400 字ごとの record にまとめる。
+
+    設計: docs/design/rag.md「チャンク化の考え方」。出典は行ごとの citation を読み順のまま残す。
+    戻り値は (record, まとめた要素の ID)。まとめない要素（関係・付随情報を持つもの、1 行が長すぎるもの）は従来どおり 1 要素 1 record。
+    """
+    source_name = ctx.source_name
+    pieces: dict[str, dict] = {}
+    for element in ir.elements:
+        if element.element_id in cell_ids or element.element_id in suppressed or not pdf_chunking.eligible(element):
+            continue
+        piece = _element_piece(
+            element, elements, ir.relations, source_name, _element_section_path(ir, ctx, element),
+            include_native_metadata=True,
+        )
+        if piece is not None and not (piece["metadata_tail"] or piece["markdown_tail"] or piece["relations"]):
+            pieces[element.element_id] = piece
+    page_boxes = {
+        element.locator.page: [float(value) for value in element.locator.bbox]
+        for element in ir.elements
+        if element.type == "page" and element.locator.page is not None and element.locator.bbox
+    }
+    groups = pdf_chunking.plan(
+        [element for element in ir.elements if element.element_id in pieces], page_boxes,
+        max_span_chars=MAX_TEXT_SPAN_CHARS,
+    )
+    records: list[dict] = []
+    merged_ids: set[str] = set()
+    for group in groups:
+        first = group.elements[0]
+        member_pieces = [pieces[member.element_id] for member in group.elements]
+        section_path = _element_section_path(ir, ctx, first)
+        exact = "\n".join(group.texts)
+        header = "出所: " + " / ".join([f"原本「{Path(source_name).name}」", *section_path])
+        if group.heading:
+            header += f"\n見出し: 「{group.heading}」"
+        semantic = f"{header}\n配置文字: 「{exact}」"
+        extra_citations: list[dict] = []
+        for member, piece in zip(group.elements, member_pieces, strict=True):
+            if member is not first:
+                extra_citations.append(_citation(piece))
+            for alias in aliases.get(member.element_id, []):
+                alias_piece = _element_piece(
+                    alias, elements, [], source_name, _element_section_path(ir, ctx, alias),
+                    include_native_metadata=True,
+                )
+                if alias_piece is not None:
+                    extra_citations.append(_citation(alias_piece))
+        merged = {
+            **member_pieces[0],
+            "semantic": semantic,
+            "markdown": semantic,
+            "exact": exact,
+            "extra_citations": extra_citations,
+            "identifier_mentions": [m for piece in member_pieces for m in piece.get("identifier_mentions", [])],
+            "identifier_metadata_complete": all(
+                piece.get("identifier_metadata_complete", True) is True for piece in member_pieces),
+            "identifier_mention_count": sum(piece.get("identifier_mention_count", 0) for piece in member_pieces),
+            "identifier_mention_overflow_count": sum(
+                piece.get("identifier_mention_overflow_count", 0) for piece in member_pieces),
+        }
+        merged_ids.update(member.element_id for member in group.elements)
+        records.append(_base_record(
+            source_hash=ir.source.content_hash,
+            kind=first.type,
+            logical_record_id=_stable_id("logical-element", ir.source.content_hash, first.element_id),
+            group_index=1,
+            group_count=1,
+            section_path=section_path,
+            pieces=[merged],
+            sort_key=_record_sort_key(first.locator, first.order, 0, 1),
+            source_name=Path(source_name).name,
+            document_context={
+                "source_name": Path(source_name).name,
+                "sheet": first.locator.sheet,
+                "slide": first.locator.slide,
+                "page": first.locator.page,
+            },
+        ))
+    return records, merged_ids
+
+
 def _non_table_records(
     ir: evidence_ir.EvidenceIR,
     ctx: context_ir.ContextIR,
@@ -1418,8 +1522,12 @@ def _non_table_records(
     elements = {element.element_id: element for element in ir.elements}
     cell_ids = {element.element_id for element in ir.elements if element.type == "cell"}
     records: list[dict] = []
+    merged_ids: set[str] = set()
+    if ir.source.file_type == "pdf":
+        records, merged_ids = _pdf_group_records(ir, ctx, elements, aliases, suppressed, cell_ids)
     for element in sorted(ir.elements, key=lambda item: item.order):
-        if element.element_id in cell_ids or element.element_id in suppressed or element.type in _CONTAINER_TYPES:
+        if (element.element_id in cell_ids or element.element_id in suppressed
+                or element.element_id in merged_ids or element.type in _CONTAINER_TYPES):
             continue
         section_path = _element_section_path(ir, ctx, element)
         raw_piece = _element_piece(
@@ -1794,6 +1902,42 @@ def _chunk_id_for_record(source_hash: str, record: dict) -> str:
     return _stable_id("rag-chunk", source_hash, record["record_id"], RAG_CHUNKER_VERSION)
 
 
+def _apply_pdf_document_context(records: list[dict], ir: evidence_ir.EvidenceIR) -> None:
+    """PDF の各レコードへ、原本から確かめられた文書の題名・文書番号・版を本文の外（出所の次の行）に添える。
+
+    設計: docs/design/rag.md「チャンク化の考え方」。値の決め方は `pdf_chunking.document_context`。
+    守ること: 本文（exact_text）は変えない。本文に既にある値は添えない。
+    """
+    if ir.source.file_type != "pdf":
+        return
+    info_title = next((element.extension.get("document_info_title") for element in ir.elements
+                       if element.type == "page" and element.locator.page == 1), None)
+    page_boxes = {
+        element.locator.page: [float(value) for value in element.locator.bbox]
+        for element in ir.elements
+        if element.type == "page" and element.locator.page is not None and element.locator.bbox
+    }
+    found = pdf_chunking.document_context(
+        [element for element in ir.elements if pdf_chunking.eligible(element)], page_boxes, info_title)
+    items = [(label, value) for label, value in
+             (("文書", found.title), ("文書番号", found.number), ("版", found.version)) if value]
+    if not items:
+        return
+    for record in records:
+        body = pdf_chunking.comparable_text(record.get("exact_text") or "")
+        lines = [f"{label}: 「{value}」" for label, value in items
+                 if pdf_chunking.comparable_text(value) not in body]
+        if not lines:
+            continue
+        for key in ("semantic_text", "markdown_text"):
+            text = record.get(key)
+            if not isinstance(text, str):
+                continue
+            parts = text.split("\n")
+            at = next((index + 1 for index, line in enumerate(parts) if line.startswith("出所: ")), 0)
+            record[key] = "\n".join(parts[:at] + lines + parts[at:])
+
+
 def _apply_hidden_sheet_visibility(records: list[dict], ir: evidence_ir.EvidenceIR) -> None:
     """非表示シート（`sheet` 要素の `hidden_sheet`/`very_hidden`）を、そのシート由来の全レコードへ KV 行として伝播する。
 
@@ -2045,10 +2189,13 @@ def render(
     source_name: str,
     observation_set: ai_observation.AIObservationSet | None = None,
     figure_texts: Mapping[str, list[list[str]]] | None = None,
+    context: context_ir.ContextIR | None = None,
 ) -> RenderedEvidence:
     """Evidence IRから同一record集合を経由してMarkdownとchunkを決定的に生成する。
 
     ``figure_texts``: メタファイル図の描画命令から取り出した文字（Evidence 要素ID → 図ごとの文字行）。
+    ``context``: 保存済みの Context IR（`context_ir.load_current` が今の Evidence と一致を確認したもの）。無ければ Evidence から作る。
+    使った Context IR は戻り値の ``context`` に載る（呼び出し側が ir 層へ保存する）。
     """
     ir_errors = evidence_ir.validation_errors(ir)
     if ir_errors:
@@ -2063,7 +2210,8 @@ def render(
         observation_errors = ai_observation.validation_errors(observation_set, ir=ir)
         if observation_errors:
             raise ValueError("invalid AI Observation Set: " + ",".join(observation_errors))
-    context = context_ir.build(ir, source_name=source_name)
+    if context is None:
+        context = context_ir.build(ir, source_name=source_name)
     elements = {element.element_id: element for element in ir.elements}
     aliases, suppressed = _element_aliases(ir, elements)
     records = _table_records(ir, context, aliases) + _non_table_records(
@@ -2075,6 +2223,7 @@ def render(
     if observation_set is not None:
         records.extend(_ai_observation_records(ir, context, observation_set))
     records.sort(key=lambda record: record["_sort_key"])
+    _apply_pdf_document_context(records, ir)
     _apply_hidden_sheet_visibility(records, ir)
     _enrich_record_citations(records, ir)
     summary = dict(sorted(Counter(item.status for item in ir.coverage).items()))
@@ -2083,6 +2232,7 @@ def render(
         markdown=_markdown(ir, source_name, records, summary, observation_set),
         chunks=chunks,
         coverage_summary=summary,
+        context=context,
     )
     errors = validation_errors(ir, result)
     if errors:

@@ -60,6 +60,7 @@ class Rendered:
     chunks_gz: bytes
     figure_drops: dict
     assets_dir: str
+    context_gz: bytes
 
 
 @dataclass

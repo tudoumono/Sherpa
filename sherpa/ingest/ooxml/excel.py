@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import re
 import threading
 import zipfile
@@ -166,6 +167,155 @@ def _split_component(component: set[tuple[int, int]], min_row: int, max_row: int
     return [(frozenset(component), min_row, min_col, max_row, max_col, True)], splits
 
 
+_HEADER_TEXT_MAX_CHARS = 40
+# 見出しの空欄を内側に抱えた表を1表へ戻すときに要る、下の行の値の密度（これ未満は別表の寄せ集めとして分割のまま）。
+_REJOIN_MIN_BODY_DENSITY = 0.6
+
+
+def _grid_text(rows: list[list], row: int, col: int) -> str:
+    """1-based 座標のセルの値を前後の空白を除いた文字列で返す（空・範囲外は空文字）。"""
+    if row > len(rows) or col > len(rows[row - 1]):
+        return ""
+    value = rows[row - 1][col - 1]
+    return "" if value is None else str(value).strip()
+
+
+def _header_like_top_row(rows: list[list], top: int, min_col: int, max_col: int,
+                         occupied: set[tuple[int, int]]) -> bool:
+    """成分の最上行が見出し行らしいか（全列が占有・値は2つ以上で全て短い文字列）。"""
+    texts = []
+    for col in range(min_col, max_col + 1):
+        if (top, col) not in occupied:
+            return False
+        text = _grid_text(rows, top, col)
+        if not text:
+            continue
+        raw = rows[top - 1][col - 1]
+        if (not isinstance(raw, str) or len(text) > _HEADER_TEXT_MAX_CHARS or "\n" in text
+                or text.endswith(("。", "！", "？"))):
+            return False
+        texts.append(text)
+    return len(texts) >= 2
+
+
+def _is_ragged_single_table(component: set[tuple[int, int]], rows: list[list],
+                            value_occupied: set[tuple[int, int]],
+                            top: int, bottom: int, min_col: int, max_col: int) -> bool:
+    """成分が「見出し行＋行内の空欄を含む本体」の1表か。
+
+    ① 最上行が見出し行らしい ② 見出し行より下の全ての行で左端と右端の列が占有されている（空欄は行内に挟まれたものだけ）
+    ③ 見出し行より下の値の密度が `_REJOIN_MIN_BODY_DENSITY` 以上。
+    ②で、表の右端や下端が欠ける形（高さの違う隣接表）は分割のままにする。
+    """
+    if bottom == top or not _header_like_top_row(rows, top, min_col, max_col, component):
+        return False
+    body_values = 0
+    for row in range(top + 1, bottom + 1):
+        if (row, min_col) not in component or (row, max_col) not in component:
+            return False
+        body_values += sum((row, col) in value_occupied for col in range(min_col, max_col + 1))
+    area = (bottom - top) * (max_col - min_col + 1)
+    return body_values >= area * _REJOIN_MIN_BODY_DENSITY
+
+
+_NUMBER_TEXT_RE = re.compile(r"^[+-]?[\d,]*\.?\d+%?$")
+_YEAR_TEXT_RE = re.compile(r"^(?:19|20)\d{2}$")
+
+
+def _is_data_number_value(value) -> bool:
+    """見出しになりにくい数値（年度らしい4桁の整数を除く）。"""
+    if value is None or isinstance(value, bool):
+        return False
+    text = str(value).strip()
+    return bool(_NUMBER_TEXT_RE.fullmatch(text)) and not _YEAR_TEXT_RE.fullmatch(text)
+
+
+def _is_header_band_text(rows: list[list], row: int, columns: range) -> bool:
+    values = [rows[row - 1][col - 1] for col in columns if _grid_text(rows, row, col)]
+    if not values or any(_is_data_number_value(v) for v in values):
+        return False
+    return all(len(str(v).strip()) <= _HEADER_TEXT_MAX_CHARS and "\n" not in str(v)
+               and not str(v).strip().endswith(("。", "！", "？")) for v in values)
+
+
+def _is_banded_ragged_table(component: set[tuple[int, int]], rows: list[list],
+                            value_occupied: set[tuple[int, int]],
+                            top: int, bottom: int, min_col: int, max_col: int,
+                            merged: dict[tuple[int, int], dict] | None) -> bool:
+    """表題行の下に複数段の見出しがあり、本体に疎な列（備考など）を含む1表か。
+
+    ① 表題行（全幅の6割以上へ結合した1セル）があれば飛ばす ② 最初の数値行の直前までが文字・年度・日付だけの見出し行（1段以上）
+    ③ 見出し行のどれかで全列が占有されている ④ 本体の全行で左端の列が占有されている
+    ⑤ 本体で空欄を含む列は、空欄の後に値が現れる（上詰めで終わる別表ではない） ⑥ 本体の値の密度が `_REJOIN_MIN_BODY_DENSITY` 以上。
+    """
+    width = max_col - min_col + 1
+    columns = range(min_col, max_col + 1)
+    first = top
+    title_cells = [col for col in columns if _grid_text(rows, first, col)]
+    if len(title_cells) == 1 and merged:
+        info = merged.get((first, title_cells[0]))
+        if info and info["row_span"] == 1 and info["column_span"] >= max(2, int(width * 0.6)):
+            first += 1
+    data_row = next((row for row in range(first, bottom + 1)
+                     if any(_is_data_number_value(rows[row - 1][col - 1])
+                            for col in columns if _grid_text(rows, row, col))), None)
+    if data_row is None or data_row == first:
+        return False
+    band = range(first, data_row)
+    if not all(_is_header_band_text(rows, row, columns) for row in band):
+        return False
+    if not all(any((row, col) in component for row in band) for col in columns):
+        return False
+    body = range(data_row, bottom + 1)
+    if any((row, min_col) not in component for row in body):
+        return False
+    for col in columns:
+        filled = [(row, col) in value_occupied for row in body]
+        if not all(filled) and not any(not a and b for a, b in itertools.pairwise(filled)):
+            return False
+    values = sum((row, col) in value_occupied for row in body for col in columns)
+    return values >= len(body) * width * _REJOIN_MIN_BODY_DENSITY
+
+
+def _attach_orphan_fragments(sub_regions: list[tuple], top: int, rows: list[list],
+                             component: set[tuple[int, int]], min_col: int, max_col: int) -> list[tuple]:
+    """分割で見出し行から切り離された断片を、真上の見出し断片の矩形へ戻す。
+
+    見出し断片＝最上行を含む断片。戻すのは、断片の列が見出し断片の列に収まり、見出しの下にあり、
+    同じ見出し断片へ戻す断片の列の合計が見出し断片の列の過半を占め、戻した外接矩形に他の断片のセルが入らないときだけ。
+    列の過半に満たない断片（横並びの別表・高さの違う隣接表）は戻さない。
+    """
+    if len(sub_regions) < 2 or any(item[5] for item in sub_regions):
+        return sub_regions
+    if not _header_like_top_row(rows, top, min_col, max_col, component):
+        return sub_regions
+    heads = [item for item in sub_regions if item[1] == top]
+    orphans = [item for item in sub_regions if item[1] != top]
+    if not heads or not orphans:
+        return sub_regions
+    attached: dict[int, list[tuple]] = {}
+    for orphan in orphans:
+        for index, head in enumerate(heads):
+            if head[2] <= orphan[2] and orphan[4] <= head[4] and orphan[1] > head[3]:
+                attached.setdefault(index, []).append(orphan)
+                break
+    result = list(sub_regions)
+    for index, group in attached.items():
+        head = heads[index]
+        covered = {col for item in group for col in range(item[2], item[4] + 1)}
+        if len(covered) * 2 <= head[4] - head[2] + 1:
+            continue
+        members = [head, *group]
+        g_bottom = max(item[3] for item in members)
+        others = [item for item in sub_regions if not any(item is member for member in members)]
+        if any(top <= r <= g_bottom and head[2] <= c <= head[4] for item in others for r, c in item[0]):
+            continue
+        rect = frozenset((r, c) for r in range(top, g_bottom + 1) for c in range(head[2], head[4] + 1))
+        result = [item for item in result if not any(item is member for member in members)]
+        result.append((rect, top, head[2], g_bottom, head[4], False))
+    return result
+
+
 _FAST_MERGE = threading.local()
 
 
@@ -285,16 +435,32 @@ def regions(ws_values: list[list], cap_rows: int, cap_cols: int, *,
 
     out: list[Region] = []
     splits_budget = _MAX_RECT_SPLITS_PER_SHEET
-    for component in components:
-        comp_min_r = min(r for r, _ in component)
-        comp_max_r = max(r for r, _ in component)
-        comp_min_c = min(c for _, c in component)
-        comp_max_c = max(c for _, c in component)
+    bboxes = [(min(r for r, _ in comp), max(r for r, _ in comp), min(c for _, c in comp), max(c for _, c in comp))
+              for comp in components]
+    # 見出しを持つ1表と判定した成分の外接矩形。矩形の中にある孤立した成分（疎な列の値）はその表のセルとして取り込む。
+    single_tables = [
+        box for comp, box in zip(components, bboxes)
+        if (box[1] - box[0] + 1) * (box[3] - box[2] + 1) <= _MAX_RECT_DECOMPOSE_CELLS and (
+            _is_ragged_single_table(comp, rows, value_occupied, *box)
+            or _is_banded_ragged_table(comp, rows, value_occupied, *box, merged))]
+    for component, (comp_min_r, comp_max_r, comp_min_c, comp_max_c) in zip(components, bboxes):
+        is_single_table = (comp_min_r, comp_max_r, comp_min_c, comp_max_c) in single_tables
+        if not is_single_table and any(
+                top <= comp_min_r and comp_max_r <= bottom and left <= comp_min_c and comp_max_c <= right
+                for top, bottom, left, right in single_tables):
+            continue
         effective_max_splits = min(_MAX_RECT_SPLITS, splits_budget) if splits_budget > 0 else 0
         effective_max_regions = 1 + extra_region_budget  # 保証1件 + 残りの共有予算
-        sub_regions, used = _split_component(
-            component, comp_min_r, comp_max_r, comp_min_c, comp_max_c,
-            max_splits=effective_max_splits, max_regions=effective_max_regions)
+        if is_single_table:
+            rect = frozenset((r, c) for r in range(comp_min_r, comp_max_r + 1)
+                             for c in range(comp_min_c, comp_max_c + 1))
+            sub_regions, used = [(rect, comp_min_r, comp_min_c, comp_max_r, comp_max_c, False)], 0
+        else:
+            sub_regions, used = _split_component(
+                component, comp_min_r, comp_max_r, comp_min_c, comp_max_c,
+                max_splits=effective_max_splits, max_regions=effective_max_regions)
+            sub_regions = _attach_orphan_fragments(
+                sub_regions, comp_min_r, rows, component, comp_min_c, comp_max_c)
         splits_budget -= used
         extra_region_budget -= max(0, len(sub_regions) - 1)  # この成分が消費した「追加分」だけ減らす
         for cells, top, left, bottom, right, budget_exhausted in sub_regions:

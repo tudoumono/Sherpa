@@ -68,6 +68,7 @@ def test_es_search_legacy_hit_keeps_full_text(monkeypatch):
     monkeypatch.setattr(es_index, "search", lambda world, q, scope_paths=None, k=20, layer=None, **kw: (
         [{"doc_id": "a.md", "line": 3, "text": long_text, "ext": ".md"}], None))
     monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {"a.md"})
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: set(rels) & ({"a.md"}))
     res, _, cites, _ = tool_dispatch.run_tool("es_search", {"query": "q"}, "v1", None)
     h = res["hits"][0]
     assert "text_truncated" not in h
@@ -90,6 +91,7 @@ def _setup_parent_return_world(monkeypatch, tmp_path, world: str, hits: list, ra
     monkeypatch.setattr(es_index, "search",
                         lambda w, q, scope_paths=None, k=20, layer=None, **kw: (list(hits), None))
     monkeypatch.setattr(documents, "world_rel_set", lambda w, **kw: {h["doc_id"] for h in hits})
+    monkeypatch.setattr(documents, "existing_rels", lambda w, rels, **kw: set(rels) & ({h["doc_id"] for h in hits}))
 
 
 def test_es_search_parent_return_chunk_tier_keeps_full_chunk_text(monkeypatch, tmp_path):

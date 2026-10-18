@@ -619,7 +619,7 @@ const STATE = {  // state → 表示（記号・クラス）。enum のみ。
   unreadable: { mark: '⚠ 読み取り不可', cls: 'fail' },   // 内容判定に必要なヘッダが読み取れない（`STATE.ready` へ倒さない）
   unknown: { mark: '❓ 状態を確認できませんでした', cls: 'fail' },  // 直近取り込みの状況が確認できない（`STATE.ready` へ倒さない）
 };
-const ABBR = { Module: 'Mod', Copybook: 'Cpy', DataItem: '項目', Document: '文書', Batch: 'ジョブ', Table: '表', Config: '設定' };
+const ABBR = { Module: 'Mod', Copybook: 'Cpy', DataItem: '項目', Document: '文書', Batch: 'ジョブ', Table: '表', Config: '設定', Dataset: 'データ' };
 
 let _pv = null, _q = '', _type = '', _state = 'all', _folder = '';
 

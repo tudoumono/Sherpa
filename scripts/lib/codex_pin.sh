@@ -28,7 +28,7 @@ codex_pin_platform_key() {
   esac
 }
 
-# $1=platform key -> 配布物ファイル名（例: codex-x86_64-unknown-linux-musl.tar.gz）。未設定なら空。
+# $1=platform key -> 配布物ファイル名（例: codex-package-x86_64-unknown-linux-musl.tar.gz）。未設定なら空。
 # 注意: `local a="$1" b="...${a}..."` は不可（多重代入は全 RHS を先に評価するため、set -u 下で
 # a が未定義のまま b の展開に使われ unbound variable になる）。var は key を使わずに構築する。
 codex_pin_asset_name() {
@@ -156,7 +156,7 @@ codex_pin_inspect_archive() {
 }
 
 # $1=tar.gz（codex-package-<triple>.tar.gz）  $2=導入先ディレクトリ（例 tools/codex）
-# $3=期待する版（例 0.153.4）  $4=platform key
+# $3=期待する版（例 0.162.1）  $4=platform key
 # 導入先と同じファイルシステムの作業領域（導入先の親の隠しフォルダ）へ展開 → 中身の検査（脱出パス・
 # 絶対パス・リンク・デバイスの拒否／bin/codex と付属物の存在）→ 展開した bin/codex の --version を確認 →
 # 導入先全体を rename で入れ替える。途中で失敗しても既存の導入先は壊れない（古い残りは混ざらない＝

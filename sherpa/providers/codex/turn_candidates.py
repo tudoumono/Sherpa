@@ -47,17 +47,22 @@ def _continuation_pending(st) -> bool:
     return _needs_continuation(_continuation_msgs(st), st._agent_partial)
 
 
-def _candidate_final(st) -> dict | None:
-    """`_structured_answers_valid_from` 以降で最後の `final`（見出し/主張として採用しうる候補）。台帳ゲートは `_latest_structured` ではなくこの候補の有無で判定する（final の後に in_progress が出ても、その final は見出し選択の対象になり得るため）。`_pick_structured_headline`/`_pick_structured_claims` もこの関数を使い、ゲートと見出し選択が別々の final を見ないようにする。"""
+def _candidate_choice(st) -> tuple[dict | None, int | None, str]:
+    """`_candidate_final` の選択結果（候補・受理境界以降の final の中の位置・選んだ理由 refs_block／claims／last／none）。"""
     # 回答の後に届いた通知（`<subagent_notification>`）への短い返事も `final` で来る。最後の1件を鵜呑みにせず、出典の行（『参照した資料』）を持つ最後の final、次に主張（`claims`）を持つ最後の final を優先する。
     _finals = [s for s in st._structured_answers[st._structured_answers_valid_from:]
                if s.get("status") == "final"]
-    for _has in (lambda s: "参照した資料" in (s.get("answer") or ""),
-                 lambda s: bool(s.get("claims"))):
-        for s in reversed(_finals):
-            if _has(s):
-                return s
-    return _finals[-1] if _finals else None
+    for _reason, _has in (("refs_block", lambda s: "参照した資料" in (s.get("answer") or "")),
+                          ("claims", lambda s: bool(s.get("claims")))):
+        for i in range(len(_finals) - 1, -1, -1):
+            if _has(_finals[i]):
+                return _finals[i], i, _reason
+    return (_finals[-1], len(_finals) - 1, "last") if _finals else (None, None, "none")
+
+
+def _candidate_final(st) -> dict | None:
+    """`_structured_answers_valid_from` 以降で最後の `final`（見出し/主張として採用しうる候補）。台帳ゲートは `_latest_structured` ではなくこの候補の有無で判定する（final の後に in_progress が出ても、その final は見出し選択の対象になり得るため）。`_pick_structured_headline`/`_pick_structured_claims` もこの関数を使い、ゲートと見出し選択が別々の final を見ないようにする。"""
+    return _candidate_choice(st)[0]
 
 
 _TRUNCATED_NOTICE = "回答が途中で切れた可能性があります。\n\n"
@@ -116,9 +121,11 @@ def _pick_structured_headline(st) -> str | None:
     差し戻した final を返すときは、後続の途中本文を注記に残す。
     """
     _empty = "回答を取り出せませんでした。もう一度お試しください。"
-    _cand = _candidate_final(st)
+    _cand, _idx, _reason = _candidate_choice(st)
     if _cand is not None and _cand["answer"].strip():
+        st._candidate_pick = {"picked_index": _idx, "reason": _reason}
         return _cand["answer"].strip()
+    st._candidate_pick = {"picked_index": None, "reason": "none"}
     _valid = st._structured_answers[st._structured_answers_valid_from:]
     _rejected = [x for x in st._structured_answers[:st._structured_answers_valid_from]
                  if x.get("status") == "final" and (x.get("answer") or "").strip()]

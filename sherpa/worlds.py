@@ -86,7 +86,7 @@ def rag_md_path(world_id: str, doc_id: str) -> Path | None:
 
 
 def derived_ir_dir(world_id: str) -> Path:
-    """中間表現の置き場（`{rel}.document.json`／`{rel}.evidence.json`／`{rel}.derived.json`／`{rel}.ocr_route.json`）。再生成可能・検索には出さない・drift 判定専用。"""
+    """中間表現の置き場（`{rel}.document.json`／`{rel}.evidence.json`／`{rel}.context.json`／`{rel}.derived.json`／`{rel}.ocr_route.json`）。再生成可能・検索には出さない・drift 判定専用。"""
     return derived_dir(world_id) / "ir"
 
 
@@ -354,7 +354,7 @@ def world_dir(world_id: str):
     row, db_ok = None, True
     try:
         from . import store
-        row = store.get_world(world_id)
+        row = store.get_world_root(world_id)
     except Exception:
         db_ok = False
     if db_ok and row:  # 登録済み → 参照元 root のみ（無効なら None）

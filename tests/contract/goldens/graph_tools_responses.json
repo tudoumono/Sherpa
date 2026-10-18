@@ -7,9 +7,20 @@
     "requested": 5,
     "truncated": false
    },
+   "flow": {
+    "requested": 3,
+    "truncated": false
+   },
    "limits": [],
    "omitted": 0
   },
+  "exploration": {
+   "complete": true,
+   "depth_truncated": false,
+   "limits": []
+  },
+  "flow_candidates": [],
+  "generation": "<世代>.fe558c05",
   "impact": [
    {
     "canonical_id": "module:ana_s6_gt_test:mention/src/Invoicer.java#Invoicer",
@@ -74,6 +85,28 @@
    "path": "mention/src/Billing.java",
    "qualified_name": "src.Billing"
   },
+  "summary": {
+   "by_distance": {
+    "1": 1
+   },
+   "by_folder": {
+    "mention": 1
+   },
+   "by_kind": {
+    "Module": 1
+   },
+   "flow_total": 0,
+   "total": 1
+  },
+  "transfer": {
+   "complete": true,
+   "has_more": false,
+   "next_offset": null,
+   "offset": 0,
+   "part": "impact",
+   "returned": 1,
+   "total": 1
+  },
   "unresolved": {
    "available": true,
    "items": [],
@@ -88,6 +121,10 @@
     "requested": 1,
     "truncated": true
    },
+   "flow": {
+    "requested": 3,
+    "truncated": false
+   },
    "limits": [
     {
      "kind": "depth",
@@ -96,6 +133,18 @@
    ],
    "omitted": null
   },
+  "exploration": {
+   "complete": false,
+   "depth_truncated": true,
+   "limits": [
+    {
+     "kind": "depth",
+     "stage": "impact"
+    }
+   ]
+  },
+  "flow_candidates": [],
+  "generation": "<世代>.2c8873fa",
   "impact": [
    {
     "canonical_id": "module:ana_s6_gt_test:chain/Link2.java#Link2",
@@ -161,6 +210,28 @@
    "path": "chain/Link3.java",
    "qualified_name": "chain.Link3"
   },
+  "summary": {
+   "by_distance": {
+    "1": 1
+   },
+   "by_folder": {
+    "chain": 1
+   },
+   "by_kind": {
+    "Module": 1
+   },
+   "flow_total": 0,
+   "total": 1
+  },
+  "transfer": {
+   "complete": true,
+   "has_more": false,
+   "next_offset": null,
+   "offset": 0,
+   "part": "impact",
+   "returned": 1,
+   "total": 1
+  },
   "truncated": true,
   "unresolved": {
    "available": true,
@@ -176,9 +247,20 @@
     "requested": 5,
     "truncated": false
    },
+   "flow": {
+    "requested": 3,
+    "truncated": false
+   },
    "limits": [],
    "omitted": 0
   },
+  "exploration": {
+   "complete": true,
+   "depth_truncated": false,
+   "limits": []
+  },
+  "flow_candidates": [],
+  "generation": "<世代>.2bca279f",
   "impact": [
    {
     "canonical_id": "module:ana_s6_gt_test:mention/src/Sec2.java#Sec2",
@@ -242,6 +324,28 @@
    "name": "Tgt",
    "path": "mention/src/Tgt.java"
   },
+  "summary": {
+   "by_distance": {
+    "1": 1
+   },
+   "by_folder": {
+    "mention": 1
+   },
+   "by_kind": {
+    "Module": 1
+   },
+   "flow_total": 0,
+   "total": 1
+  },
+  "transfer": {
+   "complete": true,
+   "has_more": false,
+   "next_offset": null,
+   "offset": 0,
+   "part": "impact",
+   "returned": 1,
+   "total": 1
+  },
   "unresolved": {
    "available": true,
    "items": [],
@@ -256,6 +360,10 @@
     "requested": 5,
     "truncated": false
    },
+   "flow": {
+    "requested": 3,
+    "truncated": false
+   },
    "limits": [
     {
      "kind": "result_cap",
@@ -264,6 +372,13 @@
    ],
    "omitted": 3
   },
+  "exploration": {
+   "complete": true,
+   "depth_truncated": false,
+   "limits": []
+  },
+  "flow_candidates": [],
+  "generation": "<世代>.39ee5c87",
   "impact": [
    {
     "canonical_id": "module:ana_s6_gt_test:cap/User1.java#User1",
@@ -384,6 +499,28 @@
    "path": "cap/Hub.java",
    "qualified_name": "cap.Hub"
   },
+  "summary": {
+   "by_distance": {
+    "1": 5
+   },
+   "by_folder": {
+    "cap": 5
+   },
+   "by_kind": {
+    "Module": 5
+   },
+   "flow_total": 0,
+   "total": 5
+  },
+  "transfer": {
+   "complete": false,
+   "has_more": true,
+   "next_offset": 2,
+   "offset": 0,
+   "part": "impact",
+   "returned": 2,
+   "total": 5
+  },
   "truncated": true,
   "unresolved": {
    "available": true,
@@ -399,9 +536,20 @@
     "requested": 5,
     "truncated": false
    },
+   "flow": {
+    "requested": 3,
+    "truncated": false
+   },
    "limits": [],
    "omitted": 0
   },
+  "exploration": {
+   "complete": true,
+   "depth_truncated": false,
+   "limits": []
+  },
+  "flow_candidates": [],
+  "generation": "<世代>.2d9cdb85",
   "impact": [],
   "related_documents": [],
   "start": {
@@ -409,6 +557,22 @@
    "kind": "Module",
    "name": "Helper",
    "path": "amb/x/Helper.java"
+  },
+  "summary": {
+   "by_distance": {},
+   "by_folder": {},
+   "by_kind": {},
+   "flow_total": 0,
+   "total": 0
+  },
+  "transfer": {
+   "complete": true,
+   "has_more": false,
+   "next_offset": null,
+   "offset": 0,
+   "part": "impact",
+   "returned": 0,
+   "total": 0
   },
   "unresolved": {
    "available": true,
@@ -438,9 +602,20 @@
     "requested": 5,
     "truncated": false
    },
+   "flow": {
+    "requested": 3,
+    "truncated": false
+   },
    "limits": [],
    "omitted": 0
   },
+  "exploration": {
+   "complete": true,
+   "depth_truncated": false,
+   "limits": []
+  },
+  "flow_candidates": [],
+  "generation": "<世代>.3a356f14",
   "impact": [
    {
     "canonical_id": "module:ana_s6_gt_test:mention/src/Invoicer.java#Invoicer",
@@ -517,6 +692,28 @@
    "name": "Billing",
    "path": "mention/src/Billing.java",
    "qualified_name": "src.Billing"
+  },
+  "summary": {
+   "by_distance": {
+    "1": 1
+   },
+   "by_folder": {
+    "mention": 1
+   },
+   "by_kind": {
+    "Module": 1
+   },
+   "flow_total": 0,
+   "total": 1
+  },
+  "transfer": {
+   "complete": true,
+   "has_more": false,
+   "next_offset": null,
+   "offset": 0,
+   "part": "impact",
+   "returned": 1,
+   "total": 1
   },
   "unresolved": {
    "available": true,

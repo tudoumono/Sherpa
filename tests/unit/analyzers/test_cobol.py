@@ -424,3 +424,139 @@ def test_exec_cics_dropped_lines_and_snippets():
     res = A.extract_refs(_pgm(
         "           EXEC CICS\n               SEND MAP('M1')\n           END-EXEC.\n"), "online1.cbl")
     assert [(d.reason, d.line, d.snippet) for d in res.dropped] == [("cics_other", 4, "SEND")]
+
+
+# ---- 外部ファイルの入出力（file_io）・手続き部の名前（proc_names） ----
+
+def _io_pgm(select: str = "", fd: str = "", proc: str = "", copy: str = "") -> str:
+    """ENVIRONMENT（FILE-CONTROL）・FILE SECTION・PROCEDURE の 3 区画だけを差し替えられる最小のプログラム。"""
+    return (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. IODEMO.\n"
+        "       ENVIRONMENT DIVISION.\n"
+        "       INPUT-OUTPUT SECTION.\n"
+        "       FILE-CONTROL.\n" + select +
+        "       DATA DIVISION.\n"
+        "       FILE SECTION.\n" + fd +
+        "       WORKING-STORAGE SECTION.\n" + copy +
+        "       PROCEDURE DIVISION.\n" + proc + "           STOP RUN.\n")
+
+
+_SEL_IN = "           SELECT IN-FILE ASSIGN TO UT-S-INDD.\n"
+_SEL_OUT = "           SELECT OUT-FILE ASSIGN TO UT-S-OUTDD\n               ORGANIZATION IS SEQUENTIAL.\n"
+_FD_BOTH = ("       FD  IN-FILE.\n       01  IN-REC       PIC X(80).\n"
+            "       FD  OUT-FILE.\n       01  OUT-REC      PIC X(80).\n       01  OUT-REC2     PIC X(10).\n")
+
+
+def _first_use_line(text, names):
+    """手続き部で `names` のどれかが最初に出る行（1 始まり）。`FileIo.line` の期待値。"""
+    lines = text.splitlines()
+    start = next(i for i, ln in enumerate(lines) if "PROCEDURE DIVISION" in ln)
+    return next(i + 1 for i in range(start + 1, len(lines)) if any(n in lines[i] for n in names))
+
+
+def _io(text):
+    """`file_io` を `(ファイル名, DD 名, モード, レコード, 種別)` にし、行は手続き部の最初の使用行と一致することをその場で確かめる。"""
+    res = A.extract_refs(text, "iodemo.cbl")
+    for f in res.file_io:
+        assert f.line == _first_use_line(text, [f.file_name, *f.records]), f
+    return [(f.file_name, f.ddname, f.mode, f.records, f.assign_kind) for f in res.file_io], res
+
+
+IO_CASES = {
+    "open_input_and_output": (
+        _io_pgm(_SEL_IN + _SEL_OUT, _FD_BOTH, "           OPEN INPUT IN-FILE OUTPUT OUT-FILE.\n"),
+        [("IN-FILE", "INDD", "r", ["IN-REC"], "ddname"), ("OUT-FILE", "OUTDD", "w", ["OUT-REC", "OUT-REC2"], "ddname")]),
+    "open_spans_lines": (
+        _io_pgm(_SEL_IN + _SEL_OUT, _FD_BOTH, "           OPEN INPUT IN-FILE\n                 OUTPUT OUT-FILE.\n"),
+        [("IN-FILE", "INDD", "r", ["IN-REC"], "ddname"), ("OUT-FILE", "OUTDD", "w", ["OUT-REC", "OUT-REC2"], "ddname")]),
+    "extend_is_write": (
+        _io_pgm(_SEL_OUT, _FD_BOTH, "           OPEN EXTEND OUT-FILE.\n"),
+        [("OUT-FILE", "OUTDD", "w", ["OUT-REC", "OUT-REC2"], "ddname")]),
+    "io_mode_is_read_write": (
+        _io_pgm(_SEL_IN, _FD_BOTH, "           OPEN I-O IN-FILE.\n"),
+        [("IN-FILE", "INDD", "rw", ["IN-REC"], "ddname")]),
+    "open_wins_over_read_write_statements": (
+        _io_pgm(_SEL_IN, _FD_BOTH, "           OPEN INPUT IN-FILE.\n           WRITE IN-REC.\n"),
+        [("IN-FILE", "INDD", "r", ["IN-REC"], "ddname")]),
+    "read_and_write_decide_when_there_is_no_open": (
+        _io_pgm(_SEL_IN + _SEL_OUT, _FD_BOTH, "           READ IN-FILE.\n           WRITE OUT-REC2 FROM IN-REC.\n"),
+        [("IN-FILE", "INDD", "r", ["IN-REC"], "ddname"), ("OUT-FILE", "OUTDD", "w", ["OUT-REC", "OUT-REC2"], "ddname")]),
+    "rewrite_is_write": (
+        _io_pgm(_SEL_IN, _FD_BOTH, "           REWRITE IN-REC.\n"),
+        [("IN-FILE", "INDD", "w", ["IN-REC"], "ddname")]),
+    "declared_but_never_used_is_not_listed": (
+        _io_pgm(_SEL_IN + _SEL_OUT, _FD_BOTH, "           OPEN INPUT IN-FILE.\n"),
+        [("IN-FILE", "INDD", "r", ["IN-REC"], "ddname")]),
+    "assign_without_class_prefix_uses_the_name": (
+        _io_pgm("           SELECT IN-FILE ASSIGN TO SALESDD.\n", _FD_BOTH, "           OPEN INPUT IN-FILE.\n"),
+        [("IN-FILE", "SALESDD", "r", ["IN-REC"], "ddname")]),
+    "ddname_is_cut_at_eight_chars": (
+        _io_pgm("           SELECT IN-FILE ASSIGN TO UT-S-LONGDDNAME1.\n", _FD_BOTH, "           OPEN INPUT IN-FILE.\n"),
+        [("IN-FILE", "LONGDDNA", "r", ["IN-REC"], "ddname")]),
+    "select_optional_and_assign_to_are_read": (
+        _io_pgm("           SELECT OPTIONAL IN-FILE\n               ASSIGN TO\n               UT-S-INDD.\n", _FD_BOTH,
+                "           OPEN INPUT IN-FILE.\n"),
+        [("IN-FILE", "INDD", "r", ["IN-REC"], "ddname")]),
+    "close_and_other_words_are_not_files": (
+        _io_pgm(_SEL_IN, _FD_BOTH, "           OPEN INPUT IN-FILE.\n           CLOSE IN-FILE.\n           MOVE 'READ IN-FILE' TO X.\n"),
+        [("IN-FILE", "INDD", "r", ["IN-REC"], "ddname")]),
+}
+
+
+@pytest.mark.parametrize("text,expected", IO_CASES.values(), ids=IO_CASES)
+def test_file_io(text, expected):
+    got, _res = _io(text)
+    assert got == expected
+
+
+DROPPED_IO_CASES = {
+    "literal_assign": ("           SELECT LIT-FILE ASSIGN TO 'data.txt'.\n", "assign_literal", "literal"),
+    "using_assign": ("           SELECT LIT-FILE ASSIGN USING WS-NAME.\n", "assign_dynamic", "dynamic"),
+    "dynamic_assign": ("           SELECT LIT-FILE ASSIGN TO DYNAMIC WS-NAME.\n", "assign_dynamic", "dynamic"),
+}
+
+
+@pytest.mark.parametrize("select,reason,kind", DROPPED_IO_CASES.values(), ids=DROPPED_IO_CASES)
+def test_unresolvable_assign_is_dropped_with_a_closed_reason(select, reason, kind):
+    fd = "       FD  LIT-FILE.\n       01  LIT-REC PIC X.\n"
+    got, res = _io(_io_pgm(select, fd, "           OPEN INPUT LIT-FILE.\n"))
+    assert [d.reason for d in res.dropped] == [reason]
+    assert got == [("LIT-FILE", "", "r", ["LIT-REC"], kind)]          # DD 名は決めない
+
+
+def test_sort_file_and_sort_statements_are_reported_not_expanded():
+    select = "           SELECT SORT-WORK ASSIGN TO SORTWK01.\n" + _SEL_IN
+    fd = "       SD  SORT-WORK.\n       01  SORT-REC PIC X(10).\n" + _FD_BOTH.split("       FD  OUT-FILE.")[0]
+    proc = ("           OPEN INPUT IN-FILE.\n           SORT SORT-WORK ON ASCENDING KEY SORT-REC USING IN-FILE\n"
+            "                OUTPUT PROCEDURE IS OUTP.\n           RETURN SORT-WORK AT END MOVE 1 TO X.\n"
+            "           RELEASE SORT-REC.\n")
+    got, res = _io(_io_pgm(select, fd, proc))
+    assert [r[0] for r in got] == ["IN-FILE"]                                         # SD のファイルは出さない
+    assert [d.reason for d in res.dropped] == ["sort_file", "sort_statement", "sort_statement", "sort_statement"]
+
+
+def test_free_format_is_read_the_same_way():
+    text = (">>SOURCE FORMAT IS FREE\nIDENTIFICATION DIVISION.\nPROGRAM-ID. IODEMO.\nENVIRONMENT DIVISION.\n"
+            "INPUT-OUTPUT SECTION.\nFILE-CONTROL.\n    SELECT IN-FILE ASSIGN TO UT-S-INDD.\nDATA DIVISION.\nFILE SECTION.\n"
+            "FD IN-FILE.\n01 IN-REC PIC X.\nPROCEDURE DIVISION.\n    OPEN INPUT IN-FILE. *> 開く\n    STOP RUN.\n")
+    got, _res = _io(text)
+    assert got == [("IN-FILE", "INDD", "r", ["IN-REC"], "ddname")]
+
+
+def test_proc_names_lists_names_of_the_procedure_division_only():
+    text = _io_pgm(_SEL_IN, _FD_BOTH, "           OPEN INPUT IN-FILE.\n           MOVE TAX-RATE TO WS-OUT.\n"
+                   "           DISPLAY 'IGNORED-WORD'.\n           COMPUTE WS-OUT = TAX-RATE * 100.\n",
+                   copy="       01  WS-DECL  PIC 9.\n")
+    names = A.extract_refs(text, "iodemo.cbl").proc_names
+    assert names["TAX-RATE"] == 18 and names["WS-OUT"] == 18 and "WS-DECL" not in names and "IGNORED-WORD" not in names
+    assert "100" not in names and "IN-REC" not in names
+
+
+def test_program_without_file_control_has_no_file_io():
+    res = A.extract_refs(_pgm("           DISPLAY 'X'.\n"), "sqldemo.cbl")
+    assert res.file_io == []
+
+
+def test_version_is_bumped_for_the_new_vocabulary():
+    assert A.version == 4

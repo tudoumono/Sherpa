@@ -13,15 +13,16 @@ import json
 import re
 import unicodedata
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import json_io
 from . import evidence_ir
 
 
 CONTEXT_IR_SCHEMA_VERSION = "context-ir-v1alpha2"
-CONTEXT_ANALYZER_VERSION = "xlsx-context-rules-v4"
+CONTEXT_ANALYZER_VERSION = "xlsx-context-rules-v8"
 DOCX_CONTEXT_ANALYZER_VERSION = "docx-context-rules-v1"
 PPTX_CONTEXT_ANALYZER_VERSION = "pptx-context-rules-v1"
 PDF_CONTEXT_ANALYZER_VERSION = "pdf-context-rules-v1"
@@ -128,6 +129,7 @@ class ContextRegion:
     section_path: tuple[str, ...] = ()
     slide: int | None = None
     page: int | None = None
+    label_columns: tuple[int, ...] = ()
 
     def header_for(self, column: int) -> tuple[str, ...]:
         return dict(self.header_paths).get(column, ())
@@ -456,6 +458,16 @@ def _region_specs(
     return specs or [(min_column, max_column, None, None)]
 
 
+def _anchor_column(cells: list[evidence_ir.EvidenceElement], title_row: int | None, title: str | None) -> int | None:
+    """ブロック見出し（結合セル）の左端の列。"""
+    if title_row is None or title is None:
+        return None
+    columns = [column for cell in cells
+               if (position := _row_column(cell))[0] == title_row and _text(cell.value) == title
+               and _span(cell, "column_span") >= 2 and (column := position[1]) is not None]
+    return min(columns) if columns else None
+
+
 def _cells_in_region(
     cells: list[evidence_ir.EvidenceElement],
     start_column: int,
@@ -465,6 +477,56 @@ def _cells_in_region(
         cell for cell in cells
         if (column := _row_column(cell)[1]) is not None and start_column <= column <= end_column
     ]
+
+
+_DATA_NUMBER_RE = re.compile(r"^[+-]?[\d,]*\.?\d+%?$")
+_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
+
+
+def _is_data_number(value: Any) -> bool:
+    """見出しになりにくい数値（年度らしい 4 桁の整数を除く）。Evidence の値は文字列のこともあるため文字で判定する。"""
+    if isinstance(value, bool):
+        return False
+    text = _text(value)
+    return bool(_DATA_NUMBER_RE.fullmatch(text)) and not _YEAR_RE.fullmatch(text)
+
+
+def _is_header_band_row(row_cells: list[evidence_ir.EvidenceElement]) -> bool:
+    texts = [_text(cell.value) for cell in row_cells]
+    if not texts:
+        return False
+    if any(_is_data_number(cell.value) for cell in row_cells):
+        return False
+    return not any(len(text) > 40 or text.endswith(("。", "！", "？")) or "\n" in text for text in texts)
+
+
+def _header_band_last_row(
+    cells: list[evidence_ir.EvidenceElement],
+    start: int,
+    chosen: int,
+    end_column: int,
+    start_column: int,
+) -> int | None:
+    """選んだ行までに数値を含むデータ行があれば、その直前までの連続した見出し行（文字・年度・日付だけの行）の最終行を返す。
+
+    表題行の次から始まる複数段の見出しで、下段が疎なために本体の行が見出しに選ばれるのを避ける。
+    該当しなければ None（選んだ行のまま）。
+    """
+    first_data = None
+    for row in range(start, chosen + 1):
+        row_cells = [cell for cell in cells if _row_column(cell)[0] == row and _text(cell.value)]
+        if any(_is_data_number(cell.value) for cell in row_cells):
+            first_data = row
+            break
+    if first_data is None or first_data == start:
+        return None
+    for row in range(start, first_data):
+        row_cells = [cell for cell in cells if _row_column(cell)[0] == row and _text(cell.value)]
+        if not _is_header_band_row(row_cells):
+            return None
+    last = first_data - 1
+    last_cells = [cell for cell in cells if _row_column(cell)[0] == last and _text(cell.value)]
+    return last if len(last_cells) >= min(2, end_column - start_column + 1) else None
 
 
 def _header_row(
@@ -505,20 +567,41 @@ def _header_row(
     if not candidates:
         return None, 0.0
     nonempty, score, neg_row = max(candidates)
+    band_last = _header_band_last_row(cells, start, -neg_row, end_column, start_column)
+    if band_last is not None:
+        row_cells = [cell for cell in cells if _row_column(cell)[0] == band_last and _text(cell.value)]
+        width = end_column - start_column + 1
+        nonempty = len(row_cells)
+        string_ratio = sum(isinstance(cell.value, str) for cell in row_cells) / nonempty
+        score = nonempty / width * 0.75 + string_ratio * 0.25
+        neg_row = -band_last
     confidence = min(1.0, score * (1.0 if nonempty >= 2 else 0.7))
     if confidence < 0.55:
         return None, 0.0
     return -neg_row, round(confidence, 3)
 
 
+def _header_text(cell: evidence_ir.EvidenceElement) -> str:
+    """見出しセルの文字。日付・日時は、表示形式に従った文字（Excel の表示）を使う。"""
+    typed = cell.extension.get("typed_value")
+    if (isinstance(typed, dict) and typed.get("type") in {"date", "datetime", "time"}
+            and cell.extension.get("display_status") in {"rendered", "supported"}):
+        display = cell.extension.get("display_value")
+        if isinstance(display, str) and display:
+            return display
+    return _text(cell.value)
+
+
 def _covering_value(cells: list[evidence_ir.EvidenceElement], row: int, column: int) -> str | None:
     candidates = []
     for cell in cells:
         cell_row, cell_column = _row_column(cell)
-        if cell_row != row or cell_column is None or not _text(cell.value):
+        if cell_row is None or cell_column is None or not _text(cell.value):
+            continue
+        if not cell_row <= row < cell_row + _span(cell, "row_span"):
             continue
         if cell_column <= column < cell_column + _span(cell, "column_span"):
-            candidates.append((cell_column, _text(cell.value)))
+            candidates.append((cell_column, _header_text(cell)))
     return min(candidates)[1] if candidates else None
 
 
@@ -541,7 +624,7 @@ def _header_paths(
                                   and _row_column(cell)[1] is not None
                                   and (_row_column(cell)[1] or 0) <= column
                                   < (_row_column(cell)[1] or 0) + _span(cell, "column_span")
-                                  and _text(cell.value) == value), None)
+                                  and _header_text(cell) == value), None)
                     if owner is not None and _span(owner, "column_span") >= 2:
                         values.append(value)
         direct = _covering_value(cells, header_row, column)
@@ -692,6 +775,102 @@ def _continuation_predecessor(
     return predecessor if ordinal_continues and identifier_bridge else None
 
 
+_ROW_LABEL_PREFIX = "行見出し"
+_ROW_LABEL_MAX_GAP = 3
+
+
+def _attach_row_labels(
+    context: ContextIR,
+    cells: list[evidence_ir.EvidenceElement],
+    label_candidates: dict[str, tuple[int, ...]],
+) -> None:
+    """行見出しの列を左端に持つ表の右に横並びするブロック（結合セルの見出し付き）へ、行見出しの値を足す。
+
+    足すのは、ブロックが行見出し側の領域と同じ行範囲・同じ見出し行・同じ先頭行と末尾行を持ち（途中でブロックが空の行は可）、行見出しの列が
+    各データ行でどれか 1 つ埋まり、ブロック間の空き列が `_ROW_LABEL_MAX_GAP` 以内のときだけ。条件を外れたブロックは従来どおり。
+    """
+    if not label_candidates:
+        return
+    cell_at = {
+        (cell.locator.sheet, row, column): cell
+        for cell in cells
+        if (position := _row_column(cell))[0] is not None and position[1] is not None
+        for row, column in [position]
+    }
+    rows_by_region: dict[str, set[int]] = defaultdict(set)
+    for record in context.records:
+        rows_by_region[record.region_id].add(record.row)
+    by_sheet: dict[tuple[str | None, str | None], list[ContextRegion]] = defaultdict(list)
+    for region in context.regions:
+        if region.mode == "header_record" and region.sheet is not None:
+            by_sheet[(region.sheet, region.part)].append(region)
+    replaced: dict[str, ContextRegion] = {}
+    used_bases: list[str] = []
+    for regions in by_sheet.values():
+        regions.sort(key=lambda item: (item.start_column, item.start_row))
+        base: ContextRegion | None = None
+        previous: ContextRegion | None = None
+        for region in regions:
+            if previous is not None and region.start_column - previous.end_column > _ROW_LABEL_MAX_GAP:
+                base = None
+            previous = region
+            columns = label_candidates.get(region.region_id)
+            if columns:
+                base = region
+                continue
+            if base is None or region.title is None or region.region_id in label_candidates:
+                continue
+            labels = label_candidates[base.region_id]
+            rows = rows_by_region[base.region_id]
+            own_rows = rows_by_region[region.region_id]
+            if (not rows or not own_rows or not own_rows <= rows
+                    or (min(own_rows), max(own_rows)) != (min(rows), max(rows))
+                    or region.header_row != base.header_row
+                    or region.start_row != base.start_row or region.end_row != base.end_row
+                    or any(not base.header_for(column) for column in labels)
+                    or any(not any(_text(getattr(cell_at.get((region.sheet, row, column)), "value", None))
+                                   for column in labels)
+                           for row in rows)):
+                continue
+            used_bases.append(base.region_id)
+            replaced[region.region_id] = ContextRegion(**{
+                **{name: getattr(region, name) for name in region.__dataclass_fields__},
+                "header_paths": region.header_paths + tuple(
+                    (column, (_ROW_LABEL_PREFIX, *base.header_for(column))) for column in labels),
+                "label_columns": labels,
+            })
+    if not replaced:
+        return
+    # ブロック側と同じ言い方にそろえるため、行見出し側の領域の見出しにも「行見出し」を付ける
+    for base_id in {base_id for base_id in used_bases}:
+        base = next(region for region in context.regions if region.region_id == base_id)
+        labels = label_candidates[base_id]
+        replaced[base_id] = ContextRegion(**{
+            **{name: getattr(base, name) for name in base.__dataclass_fields__},
+            "header_paths": tuple(
+                (column, (_ROW_LABEL_PREFIX, *path) if column in labels else path)
+                for column, path in base.header_paths),
+        })
+    context.regions = [replaced.get(region.region_id, region) for region in context.regions]
+    kept = [record for record in context.records if record.region_id not in replaced]
+    for region in replaced.values():
+        for row in sorted(rows_by_region[region.region_id]):
+            columns = [*region.label_columns, *range(region.start_column, region.end_column + 1)]
+            row_cells = [cell for column in columns
+                         if (cell := cell_at.get((region.sheet, row, column))) is not None and _text(cell.value)]
+            kept.append(_record_for(context.source_hash, region, row, row_cells))
+    context.records = kept
+
+
+def analyzer_version_for(source_type: str) -> str:
+    """原本形式（旧 Office は OOXML 形式へ寄せた後の名前）に対応する Context の解析規則の版。"""
+    return {
+        "docx": DOCX_CONTEXT_ANALYZER_VERSION,
+        "pptx": PPTX_CONTEXT_ANALYZER_VERSION,
+        "pdf": PDF_CONTEXT_ANALYZER_VERSION,
+    }.get(source_type, CONTEXT_ANALYZER_VERSION)
+
+
 def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
     """XLSX/DOCX/PPTX Evidence IR から Context IR を作る。他形式は文書 context だけを返す。"""
     # 旧 Office は変換後の locator を持つ。原本 identity は保ったまま、context 規則だけ OOXML 形式へ合わせる
@@ -706,14 +885,9 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
         document_titles.update(_pptx_titles(ir))
     if source_type == "pdf":
         document_titles.update(_pdf_titles(ir))
-    analyzer_version = {
-        "docx": DOCX_CONTEXT_ANALYZER_VERSION,
-        "pptx": PPTX_CONTEXT_ANALYZER_VERSION,
-        "pdf": PDF_CONTEXT_ANALYZER_VERSION,
-    }.get(source_type, CONTEXT_ANALYZER_VERSION)
     context = ContextIR(
         schema_version=CONTEXT_IR_SCHEMA_VERSION,
-        analyzer_version=analyzer_version,
+        analyzer_version=analyzer_version_for(source_type),
         source_hash=ir.source.content_hash,
         source_name=Path(source_name).name,
         document_titles=document_titles,
@@ -751,6 +925,7 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
             current = tables.get(current.parent_id or "")
         return ()
 
+    label_candidates: dict[str, tuple[int, ...]] = {}
     for table_id, table_cells in sorted(by_parent.items(), key=lambda item: min(cell.order for cell in item[1])):
         table = tables.get(table_id)
         rows = [row for cell in table_cells if (row := _row_column(cell)[0]) is not None]
@@ -824,6 +999,9 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
                 page=table.locator.page if table is not None else None,
             )
             context.regions.append(region)
+            anchor_column = _anchor_column(table_cells, title_row, title)
+            if mode == "header_record" and anchor_column is not None and anchor_column > start_column:
+                label_candidates[region_id] = tuple(range(start_column, anchor_column))
             data_start = header_row + 1 if header_row is not None else min_row
             by_row: dict[int, list[evidence_ir.EvidenceElement]] = defaultdict(list)
             for cell in region_cells:
@@ -833,6 +1011,8 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
             for row, row_cells in sorted(by_row.items()):
                 context.records.append(_record_for(ir.source.content_hash, region, row, row_cells))
 
+    if source_type == "xlsx":
+        _attach_row_labels(context, cells, label_candidates)
     region_by_id = {region.region_id: region for region in context.regions}
     by_identifier: dict[str, list[ContextRecord]] = defaultdict(list)
     for record in context.records:
@@ -873,3 +1053,92 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
         if items
     }
     return context
+
+
+# ---- ディスクへの保存（`ir/{rel}.context.json`・派生側）----
+# 設計: docs/design/rag.md「派生物」
+def _source_type(ir: evidence_ir.EvidenceIR) -> str:
+    return {"xls": "xlsx", "doc": "docx", "ppt": "pptx"}.get(ir.source.file_type, ir.source.file_type)
+
+
+def _evidence_digest(ir: evidence_ir.EvidenceIR) -> str:
+    """Evidence の要素 ID と値の要約（保存した Context が同じ Evidence から作られたかの照合用）。"""
+    h = hashlib.sha256()
+    for element in ir.elements:
+        h.update(element.element_id.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(_text(element.value).encode("utf-8"))
+        h.update(b"\x01")
+    return "sha256:" + h.hexdigest()
+
+
+def _current_key(ir: evidence_ir.EvidenceIR, source_name: str) -> dict[str, Any]:
+    """保存した Context が今の Evidence・解析規則で作られたものかを決める鍵。1 つでも違えば作り直す。"""
+    return {
+        "schema_version": CONTEXT_IR_SCHEMA_VERSION,
+        "analyzer_version": analyzer_version_for(_source_type(ir)),
+        "identifier_role_analyzer_version": IDENTIFIER_ROLE_ANALYZER_VERSION,
+        "identifier_metadata_schema_version": IDENTIFIER_METADATA_SCHEMA_VERSION,
+        "identifier_max_mentions": IDENTIFIER_MAX_MENTIONS_PER_CHUNK,
+        "source_hash": ir.source.content_hash,
+        "source_name": Path(source_name).name,
+        "evidence_digest": _evidence_digest(ir),
+    }
+
+
+def _context_from_payload(raw: dict[str, Any]) -> ContextIR:
+    def mentions(items) -> tuple[IdentifierMention, ...]:
+        return tuple(IdentifierMention(**item) for item in items)
+
+    return ContextIR(
+        schema_version=raw["schema_version"],
+        analyzer_version=raw["analyzer_version"],
+        source_hash=raw["source_hash"],
+        source_name=raw["source_name"],
+        document_titles=dict(raw["document_titles"]),
+        regions=[ContextRegion(**{
+            **item,
+            "header_paths": tuple((int(column), tuple(path)) for column, path in item["header_paths"]),
+            "section_path": tuple(item.get("section_path", ())),
+            "label_columns": tuple(item.get("label_columns", ())),
+        }) for item in raw["regions"]],
+        records=[ContextRecord(**{
+            **item,
+            "keys": tuple(RecordKey(**key) for key in item["keys"]),
+            "identifiers": tuple(item["identifiers"]),
+            "identifier_mentions": mentions(item["identifier_mentions"]),
+        }) for item in raw["records"]],
+        related_records={key: tuple(value) for key, value in raw["related_records"].items()},
+        element_sections={key: tuple(value) for key, value in raw["element_sections"].items()},
+        element_identifier_mentions={
+            key: mentions(value) for key, value in raw["element_identifier_mentions"].items()},
+    )
+
+
+def to_json_str(context: ContextIR, ir: evidence_ir.EvidenceIR) -> str:
+    """Context IR を、作った元の Evidence を照合する鍵つきの JSON にする。"""
+    return json.dumps({"key": _current_key(ir, context.source_name), "context": asdict(context)},
+                      ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def to_gzip_bytes(context: ContextIR, ir: evidence_ir.EvidenceIR) -> bytes:
+    """`write_json_atomic` が書くのと同じ gzip バイト列（別プロセスで直列化して親が書くとき用）。"""
+    return json_io.gzip_text_bytes([to_json_str(context, ir)])
+
+
+def write_json_atomic(path: str | Path, context: ContextIR, ir: evidence_ir.EvidenceIR) -> Path:
+    """Context IR を gzip で原子置換して書く（`evidence.json` と同じ書き方）。"""
+    target = Path(path)
+    json_io.write_bytes_atomic(target, to_gzip_bytes(context, ir))
+    return target
+
+
+def load_current(path: str | Path, ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR | None:
+    """保存した Context IR を、今の Evidence・解析規則の鍵と一致するときだけ読む。無い・壊れている・鍵が違うときは None（呼び出し側が作り直す）。"""
+    try:
+        payload = json.loads(json_io.read_text_maybe_gzip(path))
+        if payload["key"] != _current_key(ir, source_name):
+            return None
+        return _context_from_payload(payload["context"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None

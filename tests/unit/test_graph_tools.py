@@ -29,6 +29,12 @@ def test_invalid_arguments_are_a_structured_error_without_touching_neo4j(monkeyp
     assert res["error"] == "graph_invalid_args" and res["message"]
 
 
+@pytest.mark.parametrize("depth,expected", [(None, 5), (13, 13), (64, 64), (999, 64), (0, 1)])
+def test_impact_depth_goes_up_to_the_absolute_max_and_keeps_the_default(depth, expected):
+    args = {"canonical_id": "c"} if depth is None else {"canonical_id": "c", "depth": depth}
+    assert graph_tools._parse_impact(args)["depth"] == expected
+
+
 @pytest.mark.parametrize("exc_name,code", [("ServiceUnavailable", "graph_unavailable"),
                                            ("ConfigurationError", "graph_internal_error")])
 def test_neo4j_failure_has_the_same_shape_as_graph_neighbors(monkeypatch, exc_name, code):

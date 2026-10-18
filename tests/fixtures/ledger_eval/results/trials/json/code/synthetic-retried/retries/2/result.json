@@ -1,0 +1,14 @@
+{
+  "style": "json",
+  "system": "code",
+  "id": "synthetic-retried",
+  "hop": 2,
+  "phase": "pilot",
+  "fingerprint": "synthetic-fingerprint",
+  "status": "ok",
+  "conversation_id": 6,
+  "wall_seconds": 120.0,
+  "recall": 1.0,
+  "precision": 0.5,
+  "attempt_no": 2
+}

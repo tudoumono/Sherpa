@@ -5,5 +5,5 @@
 """
 from __future__ import annotations
 
-NODE_LABELS = {"Module", "Copybook", "Batch", "DataItem", "Table", "Document", "Config"}
-EDGE_TYPES = {"COPIES", "CONTAINS", "INVOKES", "ACCESSES", "DOCUMENTS"}
+NODE_LABELS = {"Module", "Copybook", "Batch", "DataItem", "Table", "Document", "Config", "Dataset"}
+EDGE_TYPES = {"COPIES", "CONTAINS", "INVOKES", "ACCESSES", "DOCUMENTS", "FLOWS_TO"}

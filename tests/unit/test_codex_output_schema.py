@@ -501,6 +501,7 @@ def _isolate_world_kb(monkeypatch, tmp_path: Path, world: str, files: dict) -> N
     for env in ("SHERPA_MCP_WORLD", "SHERPA_MCP_WORLD_ROOT"):
         monkeypatch.delenv(env, raising=False)
     monkeypatch.setattr(store, "get_world", lambda world_id: None)
+    monkeypatch.setattr(store, "get_world_root", lambda world_id: None)
     PB._scope_kinds_cache.clear()
 
 

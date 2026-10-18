@@ -70,7 +70,7 @@ def _run(repo: Path, extra_env: dict[str, str], *, wrap_or_true: bool = False,
 def test_sha256_mismatch_and_unreachable_source_refuse_to_install(tmp_path):
     """偽の配布物（sha256 不一致）や取得元に届かない場合は fail-closed で導入しない。"""
     repo = _make_repo_skeleton(tmp_path)
-    fixture_dir = tmp_path / "fixture" / "rust-v0.153.4"
+    fixture_dir = tmp_path / "fixture" / f"rust-v{_pin_version()}"
     fixture_dir.mkdir(parents=True)
     (fixture_dir / "codex-package-x86_64-unknown-linux-musl.tar.gz").write_bytes(b"not the real codex binary")
     result = _run(repo, {"CODEX_PIN_BASE_URL": f"file://{tmp_path / 'fixture'}"})
@@ -90,8 +90,7 @@ def test_sha256_mismatch_and_unreachable_source_refuse_to_install(tmp_path):
 def test_pinned_version_already_on_path_skips_fetch(tmp_path):
     """PATH 上の codex が固定版の npm 版（付属物つき）なら取得しない（閉域で起動のたびに取得を待たない）。"""
     repo = _make_repo_skeleton(tmp_path)
-    from_version = (SCRIPTS / "codex-version.env").read_text(encoding="utf-8")
-    pin = from_version.split('CODEX_PIN_VERSION="', 1)[1].split('"', 1)[0]
+    pin = _pin_version()
     result = _run(repo, {"CODEX_PIN_BASE_URL": f"file://{tmp_path / 'does-not-exist'}"},
                   path_codex_version=pin, path_codex_npm_like=True)
 
@@ -141,7 +140,7 @@ def _setup_fixture(tmp_path: Path, extra=None) -> tuple[Path, dict[str, str]]:
     key = _host_key()
     repo = _make_repo_skeleton(tmp_path)
     asset = "codex-package-test.tar.gz"
-    fixture_dir = tmp_path / "fixture" / "rust-v0.153.4"
+    fixture_dir = tmp_path / "fixture" / f"rust-v{_pin_version()}"
     fixture_dir.mkdir(parents=True)
     sha = _build_package(fixture_dir / asset, key, extra=extra)
     env_file = repo / "scripts" / "codex-version.env"

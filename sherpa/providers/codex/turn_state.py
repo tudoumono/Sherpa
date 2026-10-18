@@ -65,7 +65,8 @@ class CodexTurnState:
         "_ledger_review_pre_attempt_msgs_start", "_ledger_review_pre_latest_structured",
         "_ledger_review_pre_msgs_len",
         "_ledger_review_pre_codex_question", "_ledger_review_reverted", "_investigation_stopped_reason",
-        "_investigation_retire_done",
+        "_investigation_retire_done", "_resume_count", "_ledger_style", "_plan_gate", "_plan_review_cap", "_plan_final",
+        "_candidate_pick", "_compose_stats", "_adopted_answer", "_composed_answer",
         # 会話の継続と起動前の準備
         "_persist_session", "resume_sid", "thread_id", "_session_persistence_enabled",
         "_safe_persistent_codex_home", "_codex_home_ok", "_auto_continue_count", "_multi_agent_enabled",
@@ -192,7 +193,7 @@ class CodexTurnState:
         # このターンの開始時点（前ターンの退避台帳の復元直後）で既に `not_found_in_scope` だった item の id 集合。`apply_unverified_downgrades` はこの id を降格対象から除く。`_investigation_dir` 確定後に一度だけ埋める。
         self._investigation_pre_turn_not_found_ids: frozenset[str] = frozenset()
         self._ledger_continuations = 0
-        # 「見直しの一巡」の状態。`_ledger_review_requests`＝見直しを頼んだ回数（上限 `_LEDGER_REVIEW_CAP`）、`_ledger_review_rounds`＝そのうち目録が増えた回数、`_ledger_review_items_added`＝見直しで足された item の延べ件数、`_ledger_review_attempted`＝1回でも頼んだか。
+        # 「見直しの一巡」の状態。`_ledger_review_requests`＝見直しを頼んだ回数（上限 `_plan_review_cap`）、`_ledger_review_rounds`＝そのうち目録が増えた回数、`_ledger_review_items_added`＝見直しで足された item の延べ件数、`_ledger_review_attempted`＝1回でも頼んだか。
         self._ledger_review_requests = 0
         self._ledger_review_rounds = 0
         self._ledger_review_items_added = 0
@@ -212,6 +213,17 @@ class CodexTurnState:
         self._investigation_stopped_reason = None
         # 通常終了時は `env["investigation"]` を組み立てる前に退避（`_retire_investigation_ledger`）を実行してこの flag を立てる。外側 finally の退避（切断・例外時のフォールバック）は flag が立っていれば実行しない。
         self._investigation_retire_done = False
+        # 評価用の計画書方式（`SHERPA_LEDGER_STYLE`）: json／plan_gate／plan_main、plan_gate の判定状態、深さごとの見直し上限、整形に使った最終の計画書。
+        self._resume_count = 0
+        self._ledger_style = "json"
+        self._plan_gate = None
+        self._plan_review_cap = 0
+        self._plan_final = None
+        # 評価用の記録の材料（採用した候補の選び方・計画書の整形の結果・整形の前後の本文）。
+        self._candidate_pick = None
+        self._compose_stats = None
+        self._adopted_answer = None
+        self._composed_answer = None
         # 会話継続（Codex ネイティブ resume）と、Codex を起動しない経路でも参照する値。
         self._persist_session = False
         self.resume_sid = None

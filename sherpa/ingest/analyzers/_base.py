@@ -82,6 +82,7 @@ KNOWN_VIA = frozenset({
     "mention",
     "bean_class", "mapper_type", "mapper_namespace", "action_class", "config_value", "config_key",
     "exec_sql", "exec_proc", "include_member", "cics_xctl", "cics_link", "mapper_sql", "vba_sql",
+    "use", "write_file", "read_file",
 })
 
 # 同一 `(src, edge_type, dst)` に複数の `via` 候補が来たときの採用順（先頭ほど優先）。FW 固有の via を汎用の via より優先し、同順位・未収載は初出を採用する。
@@ -90,6 +91,7 @@ VIA_PRIORITY = (
     "cics_xctl", "cics_link",
     "call", "extends", "implements", "inject", "field_type", "include", "import", "copy", "exec_sql",
     "vba_sql", "mapper_sql", "exec_proc", "include_member",
+    "write_file", "read_file", "use",
 )
 
 
@@ -170,15 +172,54 @@ class FileContext:
 
 
 @dataclass
+class FileIo:
+    """COBOL の外部ファイル 1 件の入出力（`RefResult.file_io`）。
+
+    `file_name`＝`SELECT` のファイル名・`ddname`＝`ASSIGN TO` から決めた DD 名（`assign_kind` が `ddname` のときだけ。他は空）・
+    `mode`＝`r`／`w`／`rw`（`OPEN` が一次情報・`OPEN` が無いときだけ `READ`／`WRITE` から決める）・`records`＝FD 配下の 01 名・
+    `line`＝最初の `OPEN`（無ければ最初の `READ`／`WRITE`）の行・`assign_kind`＝`ddname`／`literal`／`dynamic`。
+    """
+
+    file_name: str
+    ddname: str
+    mode: str
+    records: list
+    line: int
+    assign_kind: str
+
+
+@dataclass
+class DdBinding:
+    """JCL の `EXEC PGM=` の直後の `DD DSN=` 1 件（`RefResult.dd_bindings`）。
+
+    `exec_line`＝所属ステップの `EXEC` の行（解決済みの `INVOKES` と突き合わせる鍵）・`ddname`＝連結 DD は直前の DD 名・
+    `dsn`＝世代の相対指定を除いた DSN（一時データセットは `&&NAME`）・`disp`＝`DISP=` の記載そのまま（無ければ空）・
+    `gdg_rel`＝`+1`／`0`／`-1` などの相対世代（無ければ空）・`line`＝DD 文の最初の行。
+    """
+
+    exec_line: int
+    ddname: str
+    dsn: str
+    disp: str
+    gdg_rel: str
+    line: int
+
+
+@dataclass
 class RefResult:
     """`Analyzer.extract_refs` の戻り値。`refs`＝参照候補、`dropped`＝解析せず落とした構文。
 
     `file_context`＝ファイル単位の解析の文脈（共通層が Pass 2 の解決器へ渡す）。`requires_file_context` を持つアナライザは常に返す。
+    `file_io`＝COBOL の外部ファイルの入出力（`FileIo`）・`dd_bindings`＝JCL の DD と DSN（`DdBinding`）・`proc_names`＝COBOL の手続き部に出る名前 → 最初の行。
+    いずれも共通層のデータフローの段（`world_graph`）が読む。
     """
 
     refs: list = field(default_factory=list)
     dropped: list = field(default_factory=list)
     file_context: FileContext | None = None
+    file_io: list = field(default_factory=list)
+    dd_bindings: list = field(default_factory=list)
+    proc_names: dict = field(default_factory=dict)
 
 
 def body_end_line(sanitized: str, decl_end: int, scan_limit: int = 4000) -> int:

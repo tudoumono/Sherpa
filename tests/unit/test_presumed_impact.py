@@ -1,7 +1,7 @@
 """推定トレース（presumed_impact）の単体テスト。LLM/Neo4j 不要（grep と session を stub）。
 
 ●確実が0件のとき、業務語を grep → 同文のコード識別子を**実在ノードに裏付け**して「関連の可能性（推定）」に。
-コード成果物（Module/Copybook/DataItem/Batch/Table）だけを拾い、一般語/概念ラベル/実在しない語は出さない。
+コード成果物（Module/Copybook/DataItem/Batch/Table/Dataset）だけを拾い、一般語/概念ラベル/実在しない語は出さない。
 scope/path 同一性を守る（同名が複数世代で曖昧なら任意に繋がない・RV High）。一般語は除外（RV Med）。
 
 secRV 範囲外是正 追補（2026-07-19・RV指摘 MED-1）: `impact_service.run_impact` は presumed_impact
@@ -52,7 +52,7 @@ def _n(name, label, top="src", path=None):
 
 
 _NODES = [_n("TAXCALC", "Module"), _n("TAX-RATE", "DataItem"), _n("TAXRATE", "Copybook"),
-          _n("NIGHTLY", "Batch"), _n("消費税率", "Parameter", top="設計"), _n("FOO-BIZ", "Function", top="設計")]
+          _n("NIGHTLY", "Batch"), _n("MASTER", "Dataset"), _n("消費税率", "Parameter", top="設計"), _n("FOO-BIZ", "Function", top="設計")]
 
 
 def _stub_grep(hits):
@@ -64,12 +64,12 @@ def _stub_grep(hits):
 def test_presumed_grounds_code_only():
     o = _stub_grep([{"doc_id": "設計/消費税.md", "line": 3,
                      "text": "# 消費税\n消費税率について。TAXCALC が担当し、TAXRATE を取り込み TAX-RATE を使用。"
-                             "夜間 NIGHTLY で実行。FOO-BIZ や UNKNOWN-XYZ や DATA も記載。"}])
+                             "夜間 NIGHTLY で実行し MASTER を使う。FOO-BIZ や UNKNOWN-XYZ や DATA も記載。"}])
     try:
         out = I.presumed_impact(_Session(_NODES), "消費税率", "w")
         got = {p["name"] for p in out}
         # コード成果物だけ。Function(FOO-BIZ)/Parameter/実在しない語/一般語(DATA) は除外
-        assert got == {"TAXCALC", "TAX-RATE", "TAXRATE", "NIGHTLY"}, got
+        assert got == {"TAXCALC", "TAX-RATE", "TAXRATE", "NIGHTLY", "MASTER"}, got
         assert all(p["judgement"] == "presumed" and p.get("path") for p in out)   # 同一性(path)を保持
         ev = next(p for p in out if p["name"] == "TAX-RATE")["evidence"][0]
         assert ev["doc"] == "設計/消費税.md" and "TAX-RATE" in ev["quote"]   # 根拠（doc＋引用）つき

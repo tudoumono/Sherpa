@@ -574,14 +574,14 @@ def test_xlsx_rag_chunks_omit_excel_value_breakdown_but_evidence_keeps_it():
     assert cells and any(e.extension.get("number_format") for e in cells)
 
 
-def test_chunk_versions_are_v1alpha11():
+def test_chunk_versions_are_v1alpha13():
     chunks = _read_chunks(_build_wide_xlsx(4), "big.xlsx")
     assert chunks
     for chunk in chunks:
-        assert chunk["renderer_version"] == "evidence-rag-renderer-v1alpha11"
-        assert chunk["chunker_version"] == "evidence-rag-chunker-v1alpha11"
-    assert R.RAG_RENDERER_VERSION == "evidence-rag-renderer-v1alpha11"
-    assert R.RAG_CHUNKER_VERSION == "evidence-rag-chunker-v1alpha11"
+        assert chunk["renderer_version"] == "evidence-rag-renderer-v1alpha13"
+        assert chunk["chunker_version"] == "evidence-rag-chunker-v1alpha13"
+    assert R.RAG_RENDERER_VERSION == "evidence-rag-renderer-v1alpha13"
+    assert R.RAG_CHUNKER_VERSION == "evidence-rag-chunker-v1alpha13"
 
 
 def test_markdown_anchors_precede_each_chunk_and_match_chunk_ids_1to1():

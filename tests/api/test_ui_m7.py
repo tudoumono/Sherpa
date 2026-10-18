@@ -25,7 +25,7 @@ def test_preview_extraction_structure():
     assert ("TAX-RATE", "DataItem") in ents
     assert ("TAXCALC", "Module") in ents
     rel_types = {r["type"] for r in pv["relations"]}
-    assert rel_types <= {"COPIES", "CONTAINS", "INVOKES", "ACCESSES", "DOCUMENTS"}
+    assert rel_types <= {"COPIES", "CONTAINS", "INVOKES", "ACCESSES", "DOCUMENTS", "FLOWS_TO"}
     assert {"COPIES", "CONTAINS", "INVOKES"} <= rel_types
     # 骨格＋言及のみ＝供給源を失った status（deprecated/hidden_candidate）はもう作られない。
     assert pv["counts"]["deprecated"] == 0 and pv["counts"]["hidden"] == 0

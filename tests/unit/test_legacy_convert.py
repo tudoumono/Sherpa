@@ -1195,3 +1195,47 @@ def test_ps1_extract_structure_is_powerpoint_only(ps1):
 def test_ps1_paragraph_chunked_breaks_on_budget_and_on_characters_failure(ps1):
     fn = _scope(ps1, "function Read-ParagraphChunked(", "function Read-ShapeTextClamped(")
     assert fn.count("break") >= 2                      # 予算到達時・Characters() 失敗時（一括取得へフォールバックしない）
+
+
+# ---- .xls の数式の保存値を再計算で置き換えない（実 soffice・無ければスキップ）----
+
+def _stale_xls(tmp_path, monkeypatch):
+    """=A1+1 の保存値を 99 に書き換えた .xls を作る（soffice で xlsx→xls、FORMULA レコードの結果だけ差し替え）。"""
+    import struct
+    import subprocess
+
+    import xlsxwriter
+
+    src = tmp_path / "src.xlsx"
+    wb = xlsxwriter.Workbook(src)
+    sheet = wb.add_worksheet("s")
+    sheet.write_number("A1", 1)
+    sheet.write_formula("A2", "=A1+1", None, 2)
+    wb.close()
+    outdir = tmp_path / "xls"
+    profile = tmp_path / "profile"
+    subprocess.run([legacy_convert._soffice_bin(), "--headless", "--convert-to", "xls", "--outdir", str(outdir),
+                    f"-env:UserInstallation={profile.as_uri()}", str(src)], check=True, capture_output=True, timeout=120)
+    data = bytearray((outdir / "src.xls").read_bytes())
+    pos = data.find(struct.pack("<d", 2.0))
+    while pos >= 0 and data[pos - 10:pos - 8] != b"\x06\x00":
+        pos = data.find(struct.pack("<d", 2.0), pos + 1)
+    assert pos >= 0
+    data[pos:pos + 8] = struct.pack("<d", 99.0)
+    stale = tmp_path / "stale.xls"
+    stale.write_bytes(bytes(data))
+    return stale
+
+
+@pytest.mark.skipif(not legacy_convert.soffice_available(), reason="soffice が無い")
+def test_convert_xls_keeps_saved_formula_value_instead_of_recalculating(tmp_path):
+    import io
+
+    import openpyxl
+
+    stale = _stale_xls(tmp_path, None)
+    converted = legacy_convert._convert_libreoffice(stale, ".xlsx")
+    assert converted is not None
+    sheet = openpyxl.load_workbook(io.BytesIO(converted), data_only=True)["s"]
+    assert sheet["A2"].value == 99
+    assert openpyxl.load_workbook(io.BytesIO(converted))["s"]["A2"].value == "=A1+1"

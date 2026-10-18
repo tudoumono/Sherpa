@@ -1,0 +1,15 @@
+{
+  "style": "json",
+  "system": "multihop",
+  "id": "synthetic-interrupted",
+  "hop": 2,
+  "phase": "pilot",
+  "fingerprint": "synthetic-fingerprint",
+  "status": "interrupted",
+  "conversation_id": 4,
+  "wall_seconds": 150.0,
+  "recall": 1.0,
+  "precision": 0.5,
+  "stop_requested": true,
+  "stop_drained": true
+}

@@ -32,6 +32,7 @@ def _isolate(monkeypatch, tmp_path, world: str = "v1") -> str:
     monkeypatch.setenv("SHERPA_DERIVED_DIR", str(tmp_path / "derived"))
     monkeypatch.delenv("SHERPA_USE_FIXTURES", raising=False)
     monkeypatch.setattr(store, "get_world", lambda world_id: None)
+    monkeypatch.setattr(store, "get_world_root", lambda world_id: None)
     monkeypatch.setattr(store, "get_system_settings", lambda **kw: {"rag_llm_render": "on"})
     # run_world_pass は書込直前に store.world_lock を通す＝DB 非依存の no-op に差し替える。
     monkeypatch.setattr(store, "world_lock", _noop_lock)

@@ -179,6 +179,28 @@ def test_presumed_only_impact_uses_plain_words_without_grades(page, web_base_url
         assert word not in text, word
 
 
+@pytest.mark.parametrize("with_structure", [True, False])
+def test_flow_candidates_are_folded_apart_from_structural_impact(page, web_base_url, with_structure):
+    candidate = {"category": "ソース", "name": "REPORTGEN", "status": "active", "analyzer": "cobol",
+                 "trace": ["REPORTGEN", "PROD.SALES.CALC", "SALESCALC"],
+                 "evidence": [{"type": "FLOWS_TO", "via": "read_file", "doc": "gen1/REPORTGEN.cbl", "line": 10},
+                              {"type": "FLOWS_TO", "via": "write_file", "doc": "gen1/SALESCALC.cbl", "line": 19}]}
+    items = IMPACT_ANSWER["data"]["items"] if with_structure else []
+    answer = {**IMPACT_ANSWER, "data": {"items": items, "candidates": [candidate]}}
+    _open(page, web_base_url, stream_events=_answer_events(answer))
+    _ask(page)
+    section = page.locator("#messages .flow-candidates")
+    expect(section).to_have_count(1)
+    expect(section.locator("summary")).to_contain_text("データの流れの候補")
+    expect(section.locator("li")).not_to_be_visible()
+    expect(page.locator("#messages .ilist li")).to_have_count(len(items) + 1)
+    section.locator("summary").click()
+    expect(section.locator("li")).to_be_visible()
+    expect(section.locator(".nm")).to_contain_text("REPORTGEN")
+    section.locator(".top").click()
+    expect(section.locator(".why")).to_contain_text("読み込んでいます")
+
+
 def test_scope_panel_tree_toggle_and_filter(page, web_base_url):
     _open(page, web_base_url)
     page.locator("#scopebtn").click()

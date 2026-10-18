@@ -1076,11 +1076,11 @@ def _build_observation_set(extracted_evidence, rel: str, assets_dir: Path, *, ob
 
 
 def _render_evidence_for_prefetch(path: Path, rel: str, evidence, assets_dir: Path, obs_dir: Path | None):
-    """先読みの子で動く。① evidence.json の gzip ② 素材の書出し ③ OCR 観測（VLM なし） ④ 図の中の文字 ⑤ 描画と chunks の直列化。
+    """先読みの子で動く。① evidence.json の gzip ② 素材の書出し ③ OCR 観測（VLM なし） ④ 図の中の文字 ⑤ 描画と chunks・context.json の直列化。
     ファイルは素材以外書かず、親が書く中身を返す（`_generate_evidence` と同じ順・同じ関数）。
     設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
     """
-    from . import evidence_ir, evidence_render
+    from . import context_ir, evidence_ir, evidence_render
     from .md_prefetch import Rendered
 
     evidence_gz = evidence_ir.to_gzip_bytes(evidence)
@@ -1091,7 +1091,7 @@ def _render_evidence_for_prefetch(path: Path, rel: str, evidence, assets_dir: Pa
     rendered = evidence_render.render(
         evidence, source_name=rel, observation_set=observation_set, figure_texts=figure_texts)
     return Rendered(evidence_gz, rendered.markdown, evidence_render.chunks_gzip_bytes(rendered.chunks),
-                    figure_drops, str(assets_dir))
+                    figure_drops, str(assets_dir), context_ir.to_gzip_bytes(rendered.context, evidence))
 
 
 def _is_source_failure_notice(meta: object) -> bool:
@@ -1190,6 +1190,7 @@ _LAYER_FOR_SIDECAR_SUFFIX = {
     ".md": "md",
     ".md.meta.json": "md",
     ".evidence.json": "ir",
+    ".context.json": "ir",
     ".document.json": "ir",
     ".derived.json": "ir",
     ".ocr_route.json": "ir",
@@ -1439,7 +1440,7 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
 # 設計: docs/design/rag.md「失敗した資料のやり直し」
 # 公開中の md／rag／ir のうち 1 つの rel に属するファイル（`.derived.json` は最後に置き換えるので別に扱う）。
 _REL_FILE_SUFFIXES = {
-    "ir": (".document.json", ".evidence.json", ".ocr_route.json"),
+    "ir": (".document.json", ".evidence.json", ".context.json", ".ocr_route.json"),
     "rag": (".rag.md", ".rag_chunks.jsonl"),
     "md": (".md", ".md.meta.json"),
 }
@@ -1538,6 +1539,8 @@ def _publish_targets(derived, rel: str) -> tuple[dict, list]:
              "ir": _sibling_layer_dir(published, "ir")}
     names = [(layer, rel + suffix) for layer in ("ir", "rag", "md") for suffix in _REL_FILE_SUFFIXES[layer]]
     names.insert(len(_REL_FILE_SUFFIXES["ir"]) + len(_REL_FILE_SUFFIXES["rag"]), ("rag", rel + ".assets"))
+    # 回答時に描いたページ画像（pdf_page_image の置き場所）も、差し替えで古い原本の分を残さない
+    names.insert(len(_REL_FILE_SUFFIXES["ir"]) + len(_REL_FILE_SUFFIXES["rag"]) + 1, ("rag", rel + ".pages"))
     names.append(("ir", rel + _DERIVED_MANIFEST_SUFFIX))
     return roots, names
 
@@ -1652,7 +1655,7 @@ _CONV_CACHE_DIRNAME = "_conv_cache"
 # per-file キャッシュがミラーする sidecar 種別（`_LAYER_FOR_SIDECAR_SUFFIX` の部分集合）。
 # `.derived.json` は復元後に `_write_derived_sidecar_manifest` が毎回書き直し、`.ocr_route.json` は `build_derived` が資料フォルダ単位で書くため対象外。
 _CONV_CACHE_SIDECAR_SUFFIXES = (
-    ".md", ".md.meta.json", ".evidence.json", ".document.json", ".rag.md", ".rag_chunks.jsonl",
+    ".md", ".md.meta.json", ".evidence.json", ".context.json", ".document.json", ".rag.md", ".rag_chunks.jsonl",
 )
 # rep_delta のうち「MD 自体は成功したが一部書込が失敗した」ことを示すカウンタ。
 # いずれかが非ゼロの結果はキャッシュへ保存せず、既存キャッシュも復元時に拒否する（失敗を焼き付けず、次回 sync で再試行させる）。
@@ -1965,6 +1968,7 @@ def _build_derived_staging_body(
         rep["error"] = f"derived_setup_failed:{e.__class__.__name__}"
         return rep
     from . import arms as _arms
+    from . import context_ir
     from . import document_ir
     from . import evidence_ir
     from . import evidence_render
@@ -2090,6 +2094,7 @@ def _build_derived_staging_body(
                 markdown = prerendered.markdown
                 json_io.write_text_atomic(dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(markdown))
                 json_io.write_bytes_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), prerendered.chunks_gz, durable=True)
+                json_io.write_bytes_atomic(dr_ir / (rel + ".context.json"), prerendered.context_gz)
             else:
                 rendered = evidence_render.render(
                     extracted_evidence, source_name=rel, observation_set=observation_set,
@@ -2098,6 +2103,7 @@ def _build_derived_staging_body(
                 json_io.write_text_atomic(
                     dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(markdown))
                 evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
+                context_ir.write_json_atomic(dr_ir / (rel + ".context.json"), rendered.context, extracted_evidence)
             rag_generated += 1
             return markdown
         except OSError:
@@ -2889,6 +2895,7 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
     `world`: 公開中の OCR 観測を VLM と合流して rag.md へ含め、zip/tar 展開先（`_archive_also_root`）も歩く。
     """
     from .. import scope_infer as si
+    from . import context_ir
     from . import evidence_ir
     from . import evidence_render
     from . import legacy_provenance
@@ -3014,6 +3021,7 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
                 json_io.write_text_atomic(
                     dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(rendered.markdown))
                 evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
+                context_ir.write_json_atomic(dr_ir / (rel + ".context.json"), rendered.context, extracted)
                 rag_generated += 1
             except OSError:
                 rag_failed += 1
@@ -3029,13 +3037,14 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
             rag_failed += 1
             rag_failures.append({"doc": rel, "reason": "manifest_write_failed"})
 
-    for evidence_path in dr_ir.rglob("*.evidence.json"):
-        rel = evidence_path.relative_to(dr_ir).as_posix()[: -len(".evidence.json")]
-        if rel not in seen:
-            try:
-                evidence_path.unlink()
-            except OSError:
-                pass
+    for suffix in (".evidence.json", ".context.json"):
+        for evidence_path in dr_ir.rglob(f"*{suffix}"):
+            rel = evidence_path.relative_to(dr_ir).as_posix()[: -len(suffix)]
+            if rel not in seen:
+                try:
+                    evidence_path.unlink()
+                except OSError:
+                    pass
     for suffix in (".rag.md", ".rag_chunks.jsonl"):
         for rag_path in dr_rag.rglob(f"*{suffix}"):
             rel = rag_path.relative_to(dr_rag).as_posix()[: -len(suffix)]
@@ -3077,6 +3086,7 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
     zip/tar 展開先（`_archive_also_root`）も `sources` に合流する（省くと `source_path is None` 判定が展開先由来の `rel` を `failed` へ誤計上する）。
     """
     from .. import scope_infer as si
+    from . import context_ir
     from . import evidence_ir
     from . import evidence_render
     from . import legacy_provenance
@@ -3165,11 +3175,16 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
                 _extract_evidence_assets(source_path, actual, ir, asset_dir)
                 observation_set = _build_observation_set(ir, rel, asset_dir, obs_dir=obs_dir)
                 figure_texts = _build_figure_texts(ir, asset_dir)
+            context_path = dr_ir / (rel + ".context.json")
+            saved_context = context_ir.load_current(context_path, ir, source_name=rel)   # 同じ Evidence なら作り直さず読む
             rendered = evidence_render.render(
-                ir, source_name=rel, observation_set=observation_set, figure_texts=figure_texts)
+                ir, source_name=rel, observation_set=observation_set, figure_texts=figure_texts,
+                context=saved_context)
             json_io.write_text_atomic(
                 dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(rendered.markdown))
             evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
+            if saved_context is None:
+                context_ir.write_json_atomic(context_path, rendered.context, ir)
             generated += 1
         except OSError:
             failed += 1

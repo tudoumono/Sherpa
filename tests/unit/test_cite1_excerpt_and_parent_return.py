@@ -237,6 +237,7 @@ def test_es_citations_excerpt_swap_and_tier(monkeypatch, _xlsx_world):
 
     monkeypatch.setattr(es_index, "search", fake_search)
     monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {_DOC_ID})
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: set(rels) & ({_DOC_ID}))
     cites = chat_service._es_citations(_xlsx_world, "ITEM01", None)
     assert len(cites) == 1
     c = cites[0]

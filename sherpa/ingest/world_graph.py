@@ -496,6 +496,8 @@ EDGE_RULES = frozenset({
     "copy_path_setting",     # 最近傍で決まらない COPY を、資料フォルダの設定の `copy_paths` の先頭から試して一意に決めた
     "path_alias_setting",    # 資料フォルダの設定の `path_aliases` で別名を prefix に置き換えた実在の相対パスに一致
     "dictionary_match",      # 資料の本文と定義名の辞書突合（言及）
+    "dd_name_match",         # COBOL の `ASSIGN TO` の DD 名と、JCL の `DD` 文の DSN の一致
+    "copy_item_name",        # 手続き部の名前が、COPY で取り込んだコピーブックの項目名に一致
 })
 
 
@@ -508,6 +510,8 @@ def _edge_source(e: dict) -> dict:
         src["rule"] = e["_rule"]
     if e.get("_from_def") is not None:
         src["from_def"] = e["_from_def"]
+    if e.get("_evidence_text"):
+        src["evidence_text"] = e["_evidence_text"]
     return src
 
 
@@ -575,6 +579,8 @@ def _aggregate_pass2_edges(raw_edges: list) -> list:
         sources, overflow = cap_sources([_edge_source(e) for e in cands], first=_edge_source(rep))
         edge = {k: v for k, v in rep.items() if not k.startswith("_")}
         edge["sources"] = sources
+        if any(e.get("_binding_path") for e in cands):
+            edge["binding_paths"] = sorted({e["_binding_path"] for e in cands if e.get("_binding_path")})
         if overflow:
             edge["sources_overflow_count"] = overflow
         out.append(edge)
@@ -904,6 +910,130 @@ def unparsed_sources_from_flags(flags) -> dict:
         elif f.get("reason") == "dropped_syntax" and f.get("why") == "size_exceeded":
             oversize.add(f.get("from"))
     return {"syntax": len(syntax), "size_exceeded": len(oversize)}
+
+USE_AMBIGUOUS_NAMES_MAX = 5   # `use_ambiguous` の申告に載せる名前の上限
+
+def _dataset_value(bindings: list) -> str | None:
+    """`Dataset.value`: 相対世代を使っていれば `gdg=true`、`DISP` の先頭が `NEW`／`MOD` なら `disp=…`（参考値）。"""
+    parts = []
+    if any(b.gdg_rel for _rel, b in bindings):
+        parts.append("gdg=true")
+    disps = sorted({b.disp.split(",")[0] for _rel, b in bindings if b.disp.split(",")[0] in ("NEW", "MOD")})
+    if disps:
+        parts.append("disp=" + ",".join(disps))
+    return " ".join(parts) or None
+
+
+def _dd_evidence(b) -> str:
+    """JCL の DD 文の要約（根拠の `evidence_text`・GDG の相対世代を残す）。"""
+    dsn = f"{b.dsn}({b.gdg_rel})" if b.gdg_rel else b.dsn
+    return f"DD {b.ddname} DSN={dsn}" + (f" DISP={b.disp}" if b.disp else "")
+
+
+def _dataflow_pass(world_id: str, nodes: dict, link_edges: list, io_by_rel: dict, dd_by_rel: dict, names_by_rel: dict):
+    """データの流れの段（Pass 2 の後・集約の前）。`(新しい節点, 流れの辺の候補, flags, 未解決の申告)` を返す。
+
+    ① JCL の `EXEC PGM=` の解決済みの `INVOKES` と `DdBinding` を突き合わせ、Module ごとの DD 名 → DSN の表を作る
+    ② COBOL の `FileIo` の DD 名を引き、`Module -FLOWS_TO(write_file)-> Dataset`／`Dataset -FLOWS_TO(read_file)-> Module` を張る（結べない DD 名は未解決として申告）
+    ③ 手続き部の名前を、その Module が COPY（入れ子を含む）で取り込んだコピーブックの項目名に突き合わせ、`DataItem -FLOWS_TO(use)-> Module` を張る
+    `Dataset` の同一性は（世代, DSN）。一時データセット `&&NAME` は同じ JCL ファイルの中だけ。
+    """
+    new_nodes: dict = {}
+    raw: list = []
+    flags: list = []
+    unresolved: dict = {}
+
+    exec_target: dict = {}     # (JCL の rel, EXEC の行) -> 呼び出し先 Module の rel
+    for e in link_edges:
+        if e["type"] == "INVOKES" and e["doc"] in dd_by_rel:
+            dst = nodes.get(e["dst"])
+            if dst is not None and dst["label"] == "Module":
+                exec_target[(e["doc"], e["line"])] = dst["path"]
+
+    dd_table: dict = defaultdict(lambda: defaultdict(list))    # Module の rel -> DD 名 -> [(JCL の rel, DdBinding)]
+    dsn_bindings: dict = defaultdict(list)                     # Dataset の鍵 -> [(JCL の rel, DdBinding)]（全 DD 文）
+    for jcl_rel in sorted(dd_by_rel):
+        for b in dd_by_rel[jcl_rel]:
+            dsn_bindings[(_top(jcl_rel), f"{jcl_rel}:{b.dsn}" if b.dsn.startswith("&&") else b.dsn)].append((jcl_rel, b))
+            module_rel = exec_target.get((jcl_rel, b.exec_line))
+            if module_rel is not None:
+                dd_table[module_rel][b.ddname].append((jcl_rel, b))
+
+    def _dataset(jcl_rel: str, dsn: str) -> str:
+        key = (_top(jcl_rel), f"{jcl_rel}:{dsn}" if dsn.startswith("&&") else dsn)
+        cid = f"dataset:{world_id}:{key[0] or ''}#{key[1]}"
+        if cid in new_nodes:
+            return cid
+        bindings = sorted(dsn_bindings[key], key=lambda x: (x[0], x[1].line))
+        node = {**_node("Dataset", world_id, bindings[0][0], dsn, value=_dataset_value(bindings)),
+                "cid": cid, "analyzer": "jcl", "membership_paths": sorted({r for r, _b in bindings})}
+        srcs = [{"doc_id": r, "file": r, "line": b.line, "evidence_text": _dd_evidence(b)} for r, b in bindings]
+        node["sources"] = srcs[:EDGE_SOURCES_MAX]
+        if len(srcs) > EDGE_SOURCES_MAX:
+            node["sources_overflow_count"] = len(srcs) - EDGE_SOURCES_MAX
+        new_nodes[cid] = node
+        return cid
+
+    def _flow(src, dst, via, doc, line, binding_path, evidence=None):
+        e = {"type": "FLOWS_TO", "src": src, "dst": dst, "doc": doc, "line": line, "status": "active", "via": via,
+             "_rule": "dd_name_match", "_from_def": {"file": doc, "key": None}, "_binding_path": binding_path}
+        if evidence:
+            e["_evidence_text"] = evidence
+        raw.append(e)
+
+    for rel in sorted(io_by_rel):
+        module_cid, file_io = io_by_rel[rel]
+        for fio in file_io:
+            if fio.assign_kind != "ddname":
+                continue
+            bound = dd_table.get(rel, {}).get(fio.ddname)
+            if not bound:
+                via = "read_file" if fio.mode == "r" else "write_file"
+                flags.append({"reason": "unresolved", "from": rel, "kind": "Dataset", "name": fio.ddname,
+                              "line": fio.line, "via": via})
+                unresolved.setdefault(rel, []).append({
+                    "line": fio.line, "reason": "unresolved", "kind": "Dataset", "name": fio.ddname, "via": via,
+                    "from_def": {"file": rel, "key": None}})
+                continue
+            for jcl_rel, b in bound:
+                ds_cid = _dataset(jcl_rel, b.dsn)
+                if fio.mode in ("w", "rw"):
+                    _flow(module_cid, ds_cid, "write_file", rel, fio.line, jcl_rel)
+                    _flow(module_cid, ds_cid, "write_file", jcl_rel, b.line, jcl_rel, _dd_evidence(b))
+                if fio.mode in ("r", "rw"):
+                    _flow(ds_cid, module_cid, "read_file", rel, fio.line, jcl_rel)
+                    _flow(ds_cid, module_cid, "read_file", jcl_rel, b.line, jcl_rel, _dd_evidence(b))
+
+    if names_by_rel:
+        copies_of: dict = defaultdict(set)
+        for e in link_edges:
+            if e["type"] == "COPIES":
+                copies_of[nodes[e["src"]]["path"]].add(nodes[e["dst"]]["path"])
+        items_by_rel: dict = defaultdict(lambda: defaultdict(list))
+        for n in nodes.values():
+            if n["label"] == "DataItem":
+                items_by_rel[n["path"]][n["name"]].append(n["cid"])
+        for rel in sorted(names_by_rel):
+            module_cid, names = names_by_rel[rel]
+            closure, todo = set(), list(copies_of.get(rel, ()))
+            while todo:
+                cb = todo.pop()
+                if cb not in closure:
+                    closure.add(cb)
+                    todo.extend(copies_of.get(cb, ()))
+            ambiguous: list = []
+            for name, line in sorted(names.items(), key=lambda kv: (kv[1], kv[0])):
+                hits = [c for cb in sorted(closure) for c in items_by_rel.get(cb, {}).get(name, ())]
+                if len(hits) == 1:
+                    raw.append({"type": "FLOWS_TO", "src": hits[0], "dst": module_cid, "doc": rel, "line": line,
+                                "status": "active", "via": "use", "_rule": "copy_item_name",
+                                "_from_def": {"file": rel, "key": None}})
+                elif hits:
+                    ambiguous.append(name)
+            if ambiguous:
+                flags.append({"reason": "use_ambiguous", "from": rel, "count": len(ambiguous),
+                              "names": ambiguous[:USE_AMBIGUOUS_NAMES_MAX]})
+    return new_nodes, raw, flags, unresolved
 
 
 def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
@@ -1379,6 +1509,10 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
 
     unresolved_by_rel: dict = {}   # rel -> 未解決の申告（ファイルの主体ノードへ保存する）
     unresolved_subject: dict = {}  # rel -> 主体ノードの cid
+    io_by_rel: dict = {}           # COBOL の rel -> (Module の cid, [FileIo])（データの流れの段の入力）
+    dd_by_rel: dict = {}           # JCL の rel -> [DdBinding]
+    names_by_rel: dict = {}        # COBOL の rel -> (Module の cid, 手続き部に出るコピーブックの項目名 -> 最初の行)
+    item_names = {n["name"] for n in nodes.values() if n["label"] == "DataItem"}
 
     def _with_global_imports(analyzer, rel, file_context):
         """`file_context` へ、同じ世代・同じ言語の全ファイルへ効く import（`global using` など）と、VB.NET のプロジェクト設定
@@ -1456,7 +1590,9 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
         if rel in fw_ctx and fw_ctx[rel][0]:
             # プラグインへ渡す `file_context` は、世代内の全ファイルへ効く import（`global using` など）を足した後のもの
             ref_result = RefResult(refs=ref_result.refs, dropped=ref_result.dropped,
-                                   file_context=_with_global_imports(analyzer, rel, ref_result.file_context))              # FW プラグイン: 本体の参照へ追加分を足す（失敗は本体の結果を残して申告）
+                                   file_context=_with_global_imports(analyzer, rel, ref_result.file_context),
+                                   file_io=ref_result.file_io, dd_bindings=ref_result.dd_bindings,
+                                   proc_names=ref_result.proc_names)              # FW プラグイン: 本体の参照へ追加分を足す（失敗は本体の結果を残して申告）
             ref_result, pfails, plugin_ambiguities = analyzer_registry.apply_fw_refs(
                 fw_ctx[rel][0], text, rel, fw_ctx[rel][1], ref_result, type_relations, fw_build_ctx)
             _note_plugin_failures(rel, pfails)
@@ -1476,6 +1612,14 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
             continue
         label, name = name_pair
         file_src = _cid(label, world_id, rel, name)
+        if ref_result.file_io:
+            io_by_rel[rel] = (file_src, ref_result.file_io)
+        if ref_result.dd_bindings:
+            dd_by_rel[rel] = ref_result.dd_bindings
+        if ref_result.proc_names and item_names:
+            used = {nm: ln for nm, ln in ref_result.proc_names.items() if nm in item_names}
+            if used:
+                names_by_rel[rel] = (file_src, used)
         for amb in plugin_ambiguities:                    # FW プラグインが 1 つに決められなかった参照（任意に選ばず、辺を張らずに申告する）
             amb_def = {"file": rel, "key": None}
             if amb.source_symbol_id is not None and amb.source_symbol_id[0] == rel and amb.source_symbol_id in symbol_cids:
@@ -1523,6 +1667,16 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
                     item["candidates"] = f["candidates"]
                 unresolved_by_rel.setdefault(rel, []).append(item)
                 unresolved_subject[rel] = file_src
+
+    # データの流れ（ファイル経由の受け渡し・コピーブック項目の使用）を、集約の前に候補として足す
+    flow_nodes, flow_edges, flow_flags, flow_unresolved = _dataflow_pass(
+        world_id, nodes, link_edges, io_by_rel, dd_by_rel, names_by_rel)
+    nodes.update(flow_nodes)
+    link_edges.extend(flow_edges)
+    flags.extend(flow_flags)
+    for rel, items in flow_unresolved.items():
+        unresolved_by_rel.setdefault(rel, []).extend(items)
+        unresolved_subject[rel] = io_by_rel[rel][0]
 
     # 同一 (src,type,dst) の複数候補を 1 本へ集約してから確定する（全 Pass2 エッジに適用・nodes/flags は不変）
     edges.extend(_aggregate_pass2_edges(link_edges))

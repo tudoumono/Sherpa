@@ -208,7 +208,7 @@ def test_kb_explicit_relative_value_still_resolves_against_cwd(monkeypatch, _chd
 
 def test_world_dir_mcp_world_root_override_bypasses_registry_for_matching_world_only(monkeypatch, tmp_path):
     """SHERPA_MCP_WORLD_ROOT は SHERPA_MCP_WORLD と一致する world_id にだけ効き、registry 解決を
-    経由せず絶対パスをそのまま使う。`world_dir()` は `store.get_world()` の例外を自前で握るため、
+    経由せず絶対パスをそのまま使う。`world_dir()` は `store.get_world_root()` の例外を自前で握るため、
     「呼ばれなかった」は例外でなく呼び出し記録で検証する。"""
     real_root = tmp_path / "real-root"
     real_root.mkdir()
@@ -217,7 +217,7 @@ def test_world_dir_mcp_world_root_override_bypasses_registry_for_matching_world_
     def _track(world_id):
         calls.append(world_id)
         return None   # registry には無い体（未登録）
-    monkeypatch.setattr(store, "get_world", _track)
+    monkeypatch.setattr(store, "get_world_root", _track)
 
     monkeypatch.setenv("SHERPA_MCP_WORLD", "target")
     monkeypatch.setenv("SHERPA_MCP_WORLD_ROOT", str(real_root))
@@ -232,7 +232,7 @@ def test_world_dir_mcp_world_root_override_bypasses_registry_for_matching_world_
 
 def test_world_dir_mcp_world_root_override_falls_back_when_invalid(monkeypatch):
     """override が壊れている（相対/不在/symlink）場合は無視して通常解決へフォールバックする。"""
-    monkeypatch.setattr(store, "get_world", lambda world_id: None)
+    monkeypatch.setattr(store, "get_world_root", lambda world_id: None)
     monkeypatch.delenv("SHERPA_USE_FIXTURES", raising=False)
     monkeypatch.setenv("SHERPA_MCP_WORLD", "target")
     monkeypatch.setenv("SHERPA_MCP_WORLD_ROOT", "relative/not/absolute")   # 絶対パスでない＝無効
@@ -257,7 +257,7 @@ def _office_world(monkeypatch, tmp_path, _fake_repo_root):
     world_root.mkdir()
     (world_root / "note.txt").write_text("ソース文書", encoding="utf-8")
     (world_root / "report.xlsx").write_bytes(b"")   # 中身は問わない（変換は別工程・存在と拡張子のみ判定）
-    monkeypatch.setattr(store, "get_world",
+    monkeypatch.setattr(store, "get_world_root",
                         lambda world_id: {"root_path": str(world_root)} if world_id == "testworld" else None)
     monkeypatch.delenv("SHERPA_DERIVED_DIR", raising=False)
     monkeypatch.delenv("SHERPA_KB_DIR", raising=False)
@@ -311,7 +311,7 @@ def test_mcp_env_world_root_survives_registry_outage_for_world_documents(monkeyp
 
     def _unreachable(world_id):
         raise RuntimeError("simulated: Postgres unreachable (sandboxed network)")
-    monkeypatch.setattr(store, "get_world", _unreachable)
+    monkeypatch.setattr(store, "get_world_root", _unreachable)
     for k, v in mcp_env.items():
         monkeypatch.setenv(k, v)
     assert len(corpus_docs.world_documents("testworld")) == baseline_count

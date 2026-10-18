@@ -83,6 +83,16 @@ def get_world(world_id, *, connect_timeout: float | None = None,
             "FROM worlds WHERE kb_id=%s AND world_id=%s", (_KB_ID, world_id)).fetchone()
 
 
+def get_world_root(world_id) -> dict | None:
+    """world 登録行の `world_id`・`root_path` だけを引く（`last_manifest` を読まない＝読取量が world の大きさに比例しない）。
+    資料フォルダの実パスを引くだけの `worlds.world_dir` 専用。
+    """
+    _ensure()
+    with _connect() as c:
+        return c.execute("SELECT world_id, root_path FROM worlds WHERE kb_id=%s AND world_id=%s",
+                         (_KB_ID, world_id)).fetchone()
+
+
 def set_resolve_settings(world_id, settings) -> bool:
     """解決範囲の設定（正規化済みの dict。空は NULL）を保存する。資料フォルダが無ければ False。署名は `worker._sig` が設定のハッシュを材料にするため、次回の更新で全件の取り込みになる。"""
     _ensure()

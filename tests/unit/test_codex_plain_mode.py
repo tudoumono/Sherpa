@@ -78,6 +78,7 @@ def test_plain_mode_turn_skips_schema_and_multi_agent_and_uses_minimal_prompt(tm
     investigate 誘導の段落が無い、(d) プロンプトに変換済みテキストの場所があり ripgrep_search の語が
     無い、(e) 平文の回答がそのまま headline になる。`SHERPA_CODEX_OUTPUT_SCHEMA` は明示的に
     セットしない——env の既定（2＝有効）に勝つことを確かめるため。"""
+    monkeypatch.setenv("SHERPA_LEDGER_STYLE", "plan_main")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     argv_log = tmp_path / "argv.log"

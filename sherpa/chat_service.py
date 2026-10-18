@@ -476,7 +476,8 @@ def _answer_impact(result, world):
     items = result["items"]
     start = result["start"]
     presumed = result.get("presumed") or []  # 構造的な影響が 0 件時の「資料からの関連推定」
-    code_silent = not items  # 構造的な影響が 0＝コードの少ない/無いフォルダのサイン
+    candidates = result.get("candidates") or []  # データの流れ（ファイル受け渡しなど）で届いた候補。構造の影響とは別枠
+    code_silent = not items and not candidates  # 構造的な影響もデータの流れの候補も 0＝コードの少ない/無いフォルダのサイン
     if items:
         headline = f"「{start}」を変えると {len(items)}件に影響。"
     elif presumed:  # 構造的な影響は無いが資料から関連を辿れた＝0 で突き放さない
@@ -489,9 +490,15 @@ def _answer_impact(result, world):
         headline += "　▶ 資料の検索（仕様問い合わせ・トラブルシュート）で仕様/運用の記述を確認できます。"
     docs = [e["doc"] for it in items for e in it.get("evidence", []) if e.get("doc")]
     docs += [e.get("doc") for p in presumed for e in p.get("evidence", []) if e.get("doc")]
+    docs += [e["doc"] for c in candidates for e in c.get("evidence", []) if e.get("doc")]
+    if candidates:
+        headline += f"　データの流れ（ファイルの受け渡しなど）で届く候補が {len(candidates)}件あります。"
     headline += _truncation_headline_suffix(result)
+    summary = {"total": len(items), "presumed": len(presumed), "code_silent": code_silent}
+    if candidates:
+        summary["candidates"] = len(candidates)
     return {"headline": headline,
-            "summary": {"total": len(items), "presumed": len(presumed), "code_silent": code_silent},
+            "summary": summary,
             "data": result, "sources": _sources(docs, world),
             # 検索へ誘導する次の一手（UI がボタン化できる・構造的な影響が無い時のみ）
             "suggest": ({"lens": "qa", "query": start, "reason": "構造的な影響が見つからない"} if code_silent else None)}

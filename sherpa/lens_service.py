@@ -19,13 +19,14 @@ from .grep_tool import grep_search
 from .impact_service import CATEGORY, plugin_failed_note, source_unparsed_note
 from .ingest.world_neo4j import (
     EDGE_SOURCE_FIELDS, EDGE_SOURCES_RETURN_DEFAULT, EDGE_SOURCES_RETURN_MAX, GraphQueryOverloadError, GraphSchemaEraError, _scope_pred,
+    _flow_edge_pred, _flow_node_path, _safe_flow_edge,
     check_schema_era, edge_view, limit_edge_sources, read_plugin_failures, read_unparsed_sources,
     read_unresolved)
 
 _log = logging.getLogger("sherpa")
 
 # 近傍たどりのエッジ（実効語彙）。
-_RELATED_REL = "COPIES|CONTAINS|INVOKES|ACCESSES|DOCUMENTS|CORRESPONDS_TO"
+_RELATED_REL = "COPIES|CONTAINS|INVOKES|ACCESSES|DOCUMENTS|CORRESPONDS_TO|FLOWS_TO"
 
 _ROLE = {"Document": "関連文書", "Module": "実装", "Batch": "ジョブ"}
 _ROLE_RANK = {"Document": 1, "Batch": 2, "Module": 3}
@@ -163,11 +164,16 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
         check_schema_era(session, world, lens="troubleshoot")
         _plugin_failures()
         return []
+    from .ingest import text_kind
     cy = (
         "MATCH (a:Entity) WHERE a.canonical_id IN $anchors "
         f"MATCH p=(a)-[r:{_RELATED_REL}*1..%(d)d]-(nb:Entity) "
         f"WHERE nb.world_id=$world AND nb.canonical_id <> a.canonical_id "
-        f"  AND all(n IN nodes(p) WHERE n.world_id=$world AND {_scope_pred('n')}) "  # 経路全体を範囲内に（scope 外を経由させない）
+        f"  AND all(n IN nodes(p) WHERE n.world_id=$world AND "
+        f"CASE WHEN n:Dataset THEN {_flow_node_path('n')} IS NOT NULL ELSE {_scope_pred('n')} END) "  # 経路全体を範囲内に（scope 外を経由させない）
+        "  AND all(e IN relationships(p) WHERE type(e)<>'FLOWS_TO' OR "
+        f"({_flow_edge_pred()} AND {_flow_node_path('startNode(e)')} IS NOT NULL "
+        f"AND {_flow_node_path('endNode(e)')} IS NOT NULL)) "
         "  AND ($incl OR all(n IN nodes(p) WHERE coalesce(n.status,'active')='active')) "
         "  AND ($incl OR all(e IN relationships(p) WHERE coalesce(e.status,'active')='active')) "
         "WITH nb, p ORDER BY length(p) "
@@ -182,6 +188,8 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
     out = []
     rows = _run_capped(session, cy, log_world=world, anchors=list(anchors), world=world,
                        prefixes=list(scope_prefixes or []), incl=include_deprecated,
+                       s_exact=sorted(text_kind._SENSITIVE_NAME_EXACT), s_pre=list(text_kind._SENSITIVE_NAME_PREFIXES),
+                       s_ext=sorted(text_kind.SENSITIVE_EXT),
                        coverage=coverage, stage=graph_coverage.STAGE_NEIGHBORS)
     check_schema_era(session, world, lens="troubleshoot")
     _plugin_failures()
@@ -191,7 +199,9 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
             "category": CATEGORY.get(r["label"], r["label"]),
             "status": r["status"],
             "path": r["path_names"], "distance": r["dist"],
-            "edges": limit_edge_sources([edge_view(e) for e in r["edges"]], sources_limit),
+            "edges": limit_edge_sources([
+                edge_view(_safe_flow_edge(e, scope_prefixes) if e["type"] == "FLOWS_TO" else e)
+                for e in r["edges"]], sources_limit),
         })
     return out
 

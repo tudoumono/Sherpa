@@ -2,13 +2,13 @@
 """Codex CLI の互換の通し試験（次の取り込みで Codex CLI を新しい版へ上げる前の点検）。
 
 Azure OpenAI 等の Codex(OpenAI) 互換接続先の構成が、新しい Codex CLI（PATH 上の `codex`。
-このホストでは codex-cli 0.153.4）でも壊れないかを、**実 API を一切呼ばず**に確かめる。
+固定版は codex-cli 0.162.1）でも壊れないかを、**実 API を一切呼ばず**に確かめる。
 偽の接続先（127.0.0.1 の http.server・OpenAI Responses API の SSE を最小限だけ模す）を用意し、
 Sherpa の本番コード（`sherpa.providers.codex.sandbox` の config.toml 生成・
 `sherpa.providers.codex.provider.CodexProvider` の実行経路）をそのまま呼んで、実際の Codex CLI
 で 1 ターン走らせる。
 
-**制約（実機で確認済み・回避できない既知の限界）**: Codex CLI 0.153.4 の Responses API
+**過去の実機確認での制約**: Codex CLI 0.153.4 の Responses API
 クライアントは自己署名 CA を信用しない（`SSL_CERT_FILE`/`SSL_CERT_DIR` のどちらを渡しても
 偽サーバーへの接続に一度も到達しない＝TLS ハンドシェイクの時点で失敗する。ローカルの
 `curl --cacert`/`SSL_CERT_FILE` では同じ CA が正しく検証できることを確認済みのため、
@@ -237,8 +237,8 @@ def check_developer_instructions_static() -> CheckResult:
         _write_codex_authoring_config(
             ch, [], "low", False, "", None, web_search_enabled=False,
             multi_agent=True, orchestrator_model=_FAKE_MODEL)
-        worker = (ch / "agents" / "worker.toml").read_text(encoding="utf-8")
-        evaluator = (ch / "agents" / "evaluator.toml").read_text(encoding="utf-8")
+        worker = (ch / "agent-roles" / "worker.toml").read_text(encoding="utf-8")
+        evaluator = (ch / "agent-roles" / "evaluator.toml").read_text(encoding="utf-8")
     ok = "developer_instructions = " in worker and "developer_instructions = " in evaluator
     return CheckResult("dev_instructions_static", "role config の developer_instructions（静的）",
                        ok, "worker/evaluator とも含む" if ok else "欠落しています")
@@ -343,16 +343,22 @@ def check_provider_turn(*, auth_header: str, api_version: str, label_suffix: str
         problems.append(f"モデル名が届いていません: model={req.get('model')!r}")
     if not api_version_ok:
         problems.append(f"api-version がクエリに届いていません: path={req.get('path')!r}")
+    usage = env.get("usage") or {}
+    total = env.get("codex_usage_total") or {}
+    if not isinstance(total.get("session_id"), str) or not total["session_id"]:
+        problems.append("thread.started からセッション ID を捕捉できませんでした")
+    if usage.get("input_tokens") != 12 or usage.get("output_tokens") != 6:
+        problems.append("turn.completed から usage を捕捉できませんでした")
     if not headline or "OK-FROM-FAKE-SERVER" not in str(headline):
         problems.append(f"回答（headline）が想定外です: {headline!r}")
     if problems:
         return CheckResult(key, label, False, " / ".join(problems))
     return CheckResult(key, label, True,
-                       f"stdin 経由・{auth_header}・model={req.get('model')}・headline={headline!r}")
+                       f"stdin 経由・{auth_header}・model={req.get('model')}・headline={headline!r}・session ID/usage 捕捉")
 
 
 def check_role_files_live() -> CheckResult:
-    """multi_agent の role config（worker/evaluator）が実際の Codex CLI 0.153.4 に拒否されない
+    """multi_agent の role config（worker/evaluator）が実際の Codex CLI 0.162.1 に拒否されない
     か（`--strict-config` で config 読込エラーにならない）を、非 ephemeral な codex_home で
     直接 `codex exec` を走らせて確認する（役割ファイルの中身も実行後に検査できるように、
     `CodexProvider` の ephemeral 経路は使わない）。stderr/stdout に
@@ -368,12 +374,17 @@ def check_role_files_live() -> CheckResult:
         run_dir.mkdir(parents=True, exist_ok=True)
         tool_tmp.mkdir(parents=True, exist_ok=True)
         sysset = _system_settings(fake.base_url)
+        legacy = codex_home / "agents"
+        legacy.mkdir(parents=True)
+        for role in ("worker", "evaluator"):
+            (legacy / f"{role}.toml").write_text(
+                f'model = "{_FAKE_MODEL}"\ndeveloper_instructions = "role"\n', encoding="utf-8")
         codex_sandbox._write_codex_authoring_config(
             codex_home, [], "low", False, "", None, web_search_enabled=False,
             system_settings=sysset, multi_agent=True, orchestrator_model=_FAKE_MODEL,
             link_auth=False)
-        worker_toml = (codex_home / "agents" / "worker.toml").read_text(encoding="utf-8")
-        evaluator_toml = (codex_home / "agents" / "evaluator.toml").read_text(encoding="utf-8")
+        worker_toml = (codex_home / "agent-roles" / "worker.toml").read_text(encoding="utf-8")
+        evaluator_toml = (codex_home / "agent-roles" / "evaluator.toml").read_text(encoding="utf-8")
         if "developer_instructions = " not in worker_toml or \
            "developer_instructions = " not in evaluator_toml:
             return CheckResult("role_files", "役割ファイル（worker/evaluator）", False,
@@ -399,8 +410,27 @@ def check_role_files_live() -> CheckResult:
     if proc.returncode != 0:
         return CheckResult("role_files", "役割ファイル（worker/evaluator）", False,
                            f"exit={proc.returncode} 出力末尾: {combined[-400:]!r}")
+    cli_events = []
+    for line in proc.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            cli_events.append(event)
+    thread_ok = any(e.get("type") == "thread.started" and isinstance(e.get("thread_id"), str)
+                    and e["thread_id"] for e in cli_events)
+    message_ok = any(e.get("type") == "item.completed" and isinstance(e.get("item"), dict)
+                     and e["item"].get("type") == "agent_message"
+                     and "OK-FROM-FAKE-SERVER" in str(e["item"].get("text", "")) for e in cli_events)
+    usage_ok = any(e.get("type") == "turn.completed" and isinstance(e.get("usage"), dict)
+                   and e["usage"].get("input_tokens") == 12 and e["usage"].get("output_tokens") == 6
+                   for e in cli_events)
+    if not (thread_ok and message_ok and usage_ok):
+        return CheckResult("role_files", "役割ファイル（worker/evaluator）", False,
+                           f"CLI のイベント形式が想定外です: thread={bool(thread_ok)}・message={message_ok}・usage={usage_ok}")
     return CheckResult("role_files", "役割ファイル（worker/evaluator）", True,
-                       "developer_instructions 付きで config 受理・拒否メッセージなし・"
+                       "developer_instructions 付きで config 受理・拒否メッセージなし・thread/item/usage 形式一致・"
                        f"exit={proc.returncode}")
 
 

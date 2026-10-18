@@ -820,7 +820,7 @@ function answerHTML(answer, trace, feedback) {
     + ((answer.route && answer.route.path) || []).map((p) => `<span class="chip">${esc(p)}</span>`).join('')
     + _depthHeaderHTML(answer.scope, answer.duration_ms) + '</div>';
   // impact はグラフ由来（items/presumed）と検索由来（citations）の2形がある。グラフ結果が無い回答は QA と同じ引用表示にする
-  const impactHasGraph = !!(answer.data && ((answer.data.items || []).length || (answer.data.presumed || []).length));
+  const impactHasGraph = !!(answer.data && ((answer.data.items || []).length || (answer.data.presumed || []).length || (answer.data.candidates || []).length));
   // troubleshoot も、原因候補（candidates）が無ければ QA と同じ引用表示にする
   const troubleHasCandidates = !!(answer.data && (answer.data.candidates || []).length);
   const body = (answer.lens === 'impact' && impactHasGraph) ? renderImpact(answer)
@@ -1028,6 +1028,7 @@ const _WHY_VIA = {
   action_class: 'を設定で指定しています', config_value: 'を設定の値として参照しています', config_key: 'を設定のキーとして参照しています',
   exec_sql: 'の表を SQL で参照しています', exec_proc: 'を呼び出しています', include_member: 'を取り込んでいます',
   cics_xctl: 'を呼び出しています', cics_link: 'を呼び出しています', mapper_sql: 'の表を SQL で参照しています', vba_sql: 'の表を SQL で参照しています',
+  write_file: 'に書き出されています', read_file: 'を読み込んでいます', use: 'を使っています',
 };
 const _WHY_TYPE = { INVOKES: 'を呼び出しています', COPIES: 'を取り込んでいます', ACCESSES: 'を参照しています', CONTAINS: 'を含んでいます' };
 const _WHY_RULE = {
@@ -1037,6 +1038,7 @@ const _WHY_RULE = {
   schema_unqualified: '名前が一致しました（定義側にスキーマ名なし）', table_name: '表の名前で一致しました', nearest_name: '一番近い場所の同じ名前に一致しました',
   di_qualifier: '注入で指定された名前が実装の名前に一致しました', di_primary: '実装のうち優先の指定が付いたものに決まりました',
   di_single_impl: '実装が 1 つだけでした',
+  dd_name_match: 'プログラムのファイル名の指定と、ジョブのデータセットの指定が一致しました', copy_item_name: 'COPY で取り込んだ項目の名前に一致しました',
 };
 // 辺 1 本の「参照元」の平文（文書と行を複数・切った分は「ほか N 件」）。根拠（sources）のある辺だけ出す。
 function _whySourcesText(e) {
@@ -1060,31 +1062,38 @@ function _whyListHTML(trace, evidence) {
   }).join('');
   return `<div class="why"><div class="why-h">なぜつながっているか</div>${lis}</div>`;
 }
-// 影響範囲の回答本文（影響一覧。構造の依存が見つからなかったときは資料から見つけた関連を別枠で出す）。
+// 影響 1 件の行（詳細＝経路チップ＋なぜつながっているか。トグルは行全体・キーボード操作は chat.js の委譲側）。
+function _impactRowHTML(it) {
+  const trace = it.trace || [];                      // 影響の経路（ノード名列）
+  const chain = trace.join(' ← ');
+  // evidence は代表経路の辺ごとの {type, doc, line, via?, rule?, sources?, sources_overflow_count?}（quote は presumed のみが持つ）
+  const why = _whyListHTML(trace, (it.evidence || []).filter((e) => e.doc));
+  const hasDetail = !!(chain || why);
+  const detail = hasDetail
+    ? `<div class="ixdetail">${trace.length ? `<div class="ix-route">${impactRouteChipsHTML(trace)}</div>` : ''}`
+      + `<div class="path"><div class="chain">${esc(chain)}</div>${why}</div></div>`
+    : '';
+  const topAttrs = hasDetail ? ' role="button" tabindex="0" aria-expanded="false" data-toggle' : '';
+  const toggle = hasDetail ? '<span class="pathbtn" aria-hidden="true">経路 <span class="caret">▾</span></span>' : '';
+  // 担当アナライザの来歴（analyzer が null なら出さない）
+  const analyzerNote = it.analyzer ? `<small>（解析: ${esc(analyzerLabel(it.analyzer))}）</small>` : '';
+  return `<li><div class="top"${topAttrs}>`
+    + `<span class="kind">${esc(it.category)}</span><span class="nm">${esc(it.name)}${analyzerNote}</span>${statusTag(it.status)}`
+    + `<span class="spacer"></span>${toggle}</div>${detail}</li>`;
+}
+// データの流れの候補（ファイルの受け渡し・項目の使用）。構造の影響とは別枠で、折りたたみにする。
+function _flowCandidatesHTML(candidates) {
+  if (!candidates.length) return '';
+  return `<details class="flow-candidates"><summary>データの流れの候補（ファイル受け渡し・レコード単位の過大を含む）${esc(candidates.length)} 件</summary>`
+    + `<ul class="ilist">${candidates.map(_impactRowHTML).join('')}</ul></details>`;
+}
+// 影響範囲の回答本文（影響一覧。構造の依存が見つからなかったときは資料から見つけた関連を別枠で出す。データの流れの候補は折りたたみの別枠）。
 function renderImpact(a) {
   const items = (a.data && a.data.items) || [];
   const presumed = (a.data && a.data.presumed) || [];
-  if (!items.length && !presumed.length) return '';
-  const lis = items.map((it) => {
-    const trace = it.trace || [];                      // 影響の経路（ノード名列）
-    const chain = trace.join(' ← ');
-    // evidence は代表経路の辺ごとの {type, doc, line, via?, rule?, sources?, sources_overflow_count?}（quote は presumed のみが持つ）
-    const why = _whyListHTML(trace, (it.evidence || []).filter((e) => e.doc));
-    const hasDetail = !!(chain || why);
-    // 詳細（経路チップ＋なぜつながっているか）は行データにあるものだけで構成する。トグルは行全体（キーボード操作は chat.js の委譲側）
-    const detail = hasDetail
-      ? `<div class="ixdetail">${trace.length ? `<div class="ix-route">${impactRouteChipsHTML(trace)}</div>` : ''}`
-        + `<div class="path"><div class="chain">${esc(chain)}</div>${why}</div></div>`
-      : '';
-    const topAttrs = hasDetail ? ' role="button" tabindex="0" aria-expanded="false" data-toggle' : '';
-    const toggle = hasDetail ? '<span class="pathbtn" aria-hidden="true">経路 <span class="caret">▾</span></span>' : '';
-    // 担当アナライザの来歴（analyzer が null なら出さない）
-    const analyzerNote = it.analyzer ? `<small>（解析: ${esc(analyzerLabel(it.analyzer))}）</small>` : '';
-    return `<li><div class="top"${topAttrs}>`
-      + `<span class="kind">${esc(it.category)}</span><span class="nm">${esc(it.name)}${analyzerNote}</span>${statusTag(it.status)}`
-      + `<span class="spacer"></span>${toggle}</div>${detail}</li>`;
-  }).join('');
-  const ilist = items.length ? `<ul class="ilist">${lis}</ul>` : '';
+  const candidates = (a.data && a.data.candidates) || [];
+  if (!items.length && !presumed.length && !candidates.length) return '';
+  const ilist = items.length ? `<ul class="ilist">${items.map(_impactRowHTML).join('')}</ul>` : '';
   let pres = '';
   if (presumed.length) {                              // 構造の依存が見つからなかったとき、資料から見つけた関連を別枠で出す
     const pl = presumed.map((p) => {
@@ -1095,7 +1104,7 @@ function renderImpact(a) {
     pres = '<div class="muted" style="margin:6px 0 2px">構造の依存は見つかりませんでした。資料から見つけた関連:</div>'
       + `<ul class="ilist">${pl}</ul>`;
   }
-  return ilist + pres;
+  return ilist + pres + _flowCandidatesHTML(candidates);
 }
 // 原因候補の表示件数。超えた分は「ほか N 件」の折りたたみで全件を見られる（総数は summary.total と候補の長い方）。
 const TROUBLE_SHOWN_MAX = 8;

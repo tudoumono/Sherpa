@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import uuid
 
 from neo4j import Query
 from neo4j.exceptions import Neo4jError
@@ -28,8 +29,13 @@ _log = logging.getLogger("sherpa")
 # 許容エッジ＝標準語彙＋対応エッジ `CORRESPONDS_TO`
 WORLD_EDGE_TYPES = EDGE_TYPES | {"CORRESPONDS_TO"}
 
-# 影響たどりで辿るのは構造（コード依存）のエッジだけ。対応エッジ `CORRESPONDS_TO` と添付 `DOCUMENTS`（言及エッジ含む）は辿らない
+# 影響たどりで辿るのは構造（コード依存）のエッジだけ。対応エッジ `CORRESPONDS_TO` と添付 `DOCUMENTS`（言及エッジ含む）は辿らない。
+# データの流れ `FLOWS_TO` は構造の影響に混ぜず、`world_impact` の第 2 段（`flow_depth`）で候補として別に辿る
 _IMPACT_REL = "COPIES|CONTAINS|INVOKES|ACCESSES"
+_FLOW_REL = "FLOWS_TO"
+
+# 流れの候補を辿る段数の既定（道具・画面とも既定で出す）
+FLOW_DEPTH_DEFAULT = 3
 
 WORLD_CONSTRAINTS = [
     "CREATE CONSTRAINT canon IF NOT EXISTS FOR (n:Entity) REQUIRE n.canonical_id IS UNIQUE",
@@ -42,7 +48,7 @@ WORLD_CONSTRAINTS = [
 
 # 保存形式の版（整数）。ノード・辺の保存する属性の形（`unresolved` 等）を変えたら上げる。`GRAPH_SCHEMA_ERA` の材料で、
 # `worker._sig` には含めない（保存形式だけの変更でソースの全件取り込み・ES の再索引を起こさない）。
-GRAPH_STORAGE_VERSION = 2
+GRAPH_STORAGE_VERSION = 3
 
 # 影響・近傍の結果へ返す未解決の申告の上限（件）
 UNRESOLVED_RETURN_MAX = 50
@@ -232,6 +238,7 @@ def _node_row(n: dict) -> dict:
     return {
         "cid": n["cid"], "name": n["name"],
         "top": n.get("top_scope"), "phase": n.get("phase"), "cat": n.get("category"),
+        "membership_paths": n.get("membership_paths"),
         "path": n.get("path"), "sp": n.get("scope_path"), "value": n.get("value"),
         "status": n.get("status", "active"),
         "analyzer": n.get("analyzer"),
@@ -251,6 +258,7 @@ def _edge_row(e: dict) -> dict:
     `sources_overflow_count`。接続の規則（`rule`）・抜粋（`evidence_text`）も `sources` の中で、辺の単独の `source`・`evidence`・`rule` は書かない。
     """
     return {
+        "binding_paths": e.get("binding_paths"),
         "src": e["src"], "dst": e["dst"], "doc": e.get("doc", ""),
         "line": e.get("line", 0),
         "status": e.get("status", "active"),
@@ -348,7 +356,7 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
                         f"MERGE (x:Entity {{canonical_id: row.cid}}) "
                         f"SET x:`{label}`, x.name=row.name, x.world_id=$world, "
                         f"x.top_scope=row.top, x.phase=row.phase, x.category=row.cat, x.path=row.path, "
-                        f"x.scope_path=row.sp, x.value=row.value, "
+                        f"x.scope_path=row.sp, x.value=row.value, x.membership_paths=row.membership_paths, "
                         f"x.status=row.status, x.analyzer=row.analyzer, x.sources=row.sources, "
                         f"x.sources_overflow_count=row.sources_overflow, x.jcl_kind=row.jcl_kind, "
                         f"x.schema=row.schema, x.qualified_name=row.qualified_name, "
@@ -366,7 +374,7 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
                         "SET r.world_id=$world, r.doc=row.doc, r.line=row.line, "
                         "r.status=row.status, "
                         "r.sources=row.sources, r.sources_overflow_count=row.sources_overflow, "
-                        "r.via=row.via"
+                        "r.via=row.via, r.binding_paths=row.binding_paths"
                     )
                     for batch in _batched(items, _NEO4J_BATCH_ROWS):
                         rows = [_edge_row(e) for e in batch]
@@ -382,8 +390,8 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
                 tx.run(
                     "MERGE (m:SherpaMeta {world_id:$w}) "
                     "SET m.schema_era=$era, m.node_count=$nc, m.edge_count=$ec, m.unresolved_stored=true, "
-                    "m.plugin_failures=$pf, m.unparsed_sources=$us",
-                    w=world_id, era=GRAPH_SCHEMA_ERA, nc=node_count, ec=edge_count,
+                    "m.plugin_failures=$pf, m.unparsed_sources=$us, m.generation=$gen",
+                    w=world_id, era=GRAPH_SCHEMA_ERA, nc=node_count, ec=edge_count, gen=uuid.uuid4().hex[:16],
                     pf=json.dumps(list(plugin_failures or []), ensure_ascii=False),
                     us=json.dumps(dict(unparsed_sources or {}), ensure_ascii=False))
                 return len(nodes), len(edges)
@@ -502,73 +510,246 @@ def resolve_world_entity(session, term, world_id, scope_prefixes=None,
            for r in rows]
 
 
-def _impact_path_where(pv: str, sp_n: str) -> str:
-    """影響たどりの経路 `pv` の条件（資料フォルダ・範囲・status）。実際の影響クエリと深さの先の存在確認が同じ断片を使う。"""
+# 1 段ずつ広げる影響たどり（BFS）。Neo4j には「frontier から逆向きに 1 段」だけを問い、訪問済み集合と最初に届いた辺（親）は Sherpa 側で持つ。
+# 1 回の問い合わせに渡す frontier の id 数。行数の天井に当たったら半分に割って投げ直す
+_IMPACT_FRONTIER_CHUNK = 300
+
+
+def _impact_edge_where(mv: str) -> str:
+    """影響たどりの 1 段で、広げた先のノード `mv` と辺 `e` に効かせる条件（資料フォルダ・範囲・status）。"""
     return (
-        "affected.world_id=$world "
-        f"  AND all(n IN nodes({pv}) WHERE n.world_id=$world AND {sp_n}) "
-        "  AND ($incl OR coalesce(affected.status,'active')='active') "
-        f"  AND ($incl OR all(n IN nodes({pv}) WHERE coalesce(n.status,'active')='active')) "
-        f"  AND ($incl OR all(e IN relationships({pv}) WHERE coalesce(e.status,'active')='active')) "
+        f"{mv}.world_id=$world AND {_scope_pred(mv)} "
+        f"  AND ($incl OR coalesce({mv}.status,'active')='active') "
+        "  AND ($incl OR coalesce(e.status,'active')='active') "
     )
 
 
-def _impact_depth_truncated(session, start_cids, world_id, scope_prefixes, depth, include_deprecated) -> bool:
-    """深さ `depth` の先に、実際の影響クエリが `depth+1` なら新しく拾う影響先が残っているか（存在確認だけ・件数は数えない）。
-    長さ `depth+1` の経路で終わる影響先のうち、`depth` 以内の経路では既に届いているものを除く（循環・合流で戻る先は先と数えない）。
-    条件は `_impact_path_where` と `_IMPACT_REL`（向き・辺の型）を実際の影響クエリと共有する。
+def _impact_start_nodes(session, start_cids, world_id, params) -> dict[str, dict]:
+    """起点のうち、資料フォルダ・範囲・status を満たすものの `cid → {name, path}`（満たさない起点からは何も届かない）。"""
+    rows = _run_read_capped(
+        session,
+        "MATCH (s:Entity) WHERE s.canonical_id IN $starts AND s.world_id=$world "
+        f"  AND {_scope_pred('s')} AND ($incl OR coalesce(s.status,'active')='active') "
+        "RETURN s.canonical_id AS cid, s.name AS name, s.path AS path",
+        world=world_id, starts=list(start_cids), **params)
+    return {r["cid"]: {"name": r["name"], "path": r["path"]} for r in rows}
+
+
+def _flow_path_pred(path: str) -> str:
+    """流れの所属・DD 結合元のパスを範囲と秘匿条件で絞る。"""
+    scope = (f"(size($prefixes)=0 OR any(pref IN $prefixes WHERE "
+             f"{path}=pref OR {path} STARTS WITH pref+'/'))")
+    return f"({path} IS NOT NULL AND {scope} AND {_not_sensitive_path('', path=path)})"
+
+
+def _flow_node_path(var: str) -> str:
+    """流れのノードの範囲内の代表パス（Dataset は全 DD 参照元から選ぶ）。"""
+    return (f"head([flow_path IN CASE WHEN 'Dataset' IN labels({var}) THEN coalesce({var}.membership_paths,[]) "
+            f"ELSE [{var}.path] END WHERE {_flow_path_pred('flow_path')}])")
+
+
+def _flow_edge_pred(edge: str = "e") -> str:
+    """ファイル受け渡しの DD 結合元が範囲内・非秘匿である条件。"""
+    return (f"(NOT {edge}.via IN ['read_file','write_file'] OR "
+            f"any(binding_path IN coalesce({edge}.binding_paths,[]) WHERE {_flow_path_pred('binding_path')}))")
+
+
+def _safe_flow_edge(edge: dict, prefixes) -> dict:
+    """流れの候補の経路根拠を範囲・非秘匿条件で絞る。"""
+    from ..graph_tools import _route_doc, _safe_sources
+    edge = dict(edge)
+    try:
+        sources = edge.get("sources") or []
+        if not isinstance(sources, list):
+            sources = json.loads(sources)
+    except (TypeError, ValueError):
+        sources = []
+    sources = _safe_sources(sources, prefixes)
+    edge["sources"] = _sources_json(sources)
+    if prefixes:
+        edge["sources_overflow"] = 0
+    if not _route_doc(edge.get("doc"), prefixes):
+        edge["doc"] = sources[0]["doc_id"] if sources else None
+        edge["line"] = sources[0].get("line") if sources else None
+    return edge
+
+
+def _impact_expand_rows(session, frontier, world_id, params, sink: list, *, seen=None, exists_only=False,
+                        rel: str = _IMPACT_REL, direction: str = "in") -> None:
+    """`frontier` の各ノードから辺 `rel` でつながる 1 段先のノードを `sink` に集める（frontier は `_IMPACT_FRONTIER_CHUNK` 件ずつ分けて問う）。
+    `direction` が `in` なら frontier へ辺を向ける側（依存元）、`out` なら frontier から辺が出る先。
+    行数の天井に当たった塊は半分に割って投げ直し、1 件でも天井なら送出する。送出の時点までに `sink` へ入った行は残る。
+    `exists_only` は、`seen` に無いノードが 1 つでも見つかれば打ち切る（深さの先の存在確認）。
     """
-    d = int(depth)
-    params = {"starts": list(start_cids), "incl": include_deprecated, "prefixes": list(scope_prefixes or [])}
-    sp_n = _scope_pred("n")
+    flow = rel == _FLOW_REL
+    path = _flow_node_path('m') if flow else "m.path"
+    if exists_only:
+        tail = "RETURN 1 AS x LIMIT 1"
+        guard = "AND NOT m.canonical_id IN $seen "
+    else:
+        tail = (
+            "RETURN m.canonical_id AS cid, m.name AS name, [l IN labels(m) WHERE l<>'Entity'][0] AS label, "
+            f"  coalesce(m.status,'active') AS status, {path} AS dpath, m.top_scope AS top, m.analyzer AS analyzer, "
+            f"  n.canonical_id AS to_cid, {{type:type(e), doc:e.doc, line:e.line, {EDGE_SOURCE_FIELDS}}} AS edge")
+        guard = ""
+    pattern = f"(m:Entity)-[e:{rel}]->(n:Entity)" if direction == "in" else f"(n:Entity)-[e:{rel}]->(m:Entity)"
+    where = _impact_edge_where('m')
+    if flow:
+        where = (
+            f"m.world_id=$world AND {path} IS NOT NULL AND {_flow_node_path('n')} IS NOT NULL "
+            "AND ($incl OR coalesce(m.status,'active')='active') "
+            "AND ($incl OR coalesce(e.status,'active')='active') "
+            f"AND {_flow_edge_pred()} ")
     cypher = (
-        "MATCH (start:Entity) WHERE start.canonical_id IN $starts "
-        f"MATCH p=(affected:Entity)-[r:{_IMPACT_REL}*%(d1)d]->(start) "
-        f"WHERE {_impact_path_where('p', sp_n)} "
-        "  AND NOT EXISTS { "
-        "    MATCH q=(affected)-[:" + _IMPACT_REL + "*1..%(d)d]->(s2:Entity) WHERE s2.canonical_id IN $starts "
-        f"      AND {_impact_path_where('q', sp_n)} "
-        "  } "
-        "RETURN 1 AS x LIMIT 1"
-    ) % {"d": d, "d1": d + 1}
-    return bool(_run_read_capped(session, cypher, world=world_id, **params))
+        f"MATCH {pattern} WHERE n.canonical_id IN $frontier {guard}"
+        f"  AND {where} " + tail)
+    extra = {"seen": list(seen)} if exists_only else {}
+    if flow:
+        from . import text_kind
+        extra.update(s_exact=sorted(text_kind._SENSITIVE_NAME_EXACT), s_pre=list(text_kind._SENSITIVE_NAME_PREFIXES),
+                     s_ext=sorted(text_kind.SENSITIVE_EXT))
+    todo = list(_batched(list(frontier), _IMPACT_FRONTIER_CHUNK))
+    while todo:
+        ids = todo.pop(0)
+        try:
+            rows = _run_read_capped(session, cypher, world=world_id, frontier=ids, **params, **extra)
+        except GraphQueryOverloadError as e:
+            if e.reason == "too_many_rows" and len(ids) > 1:
+                todo[:0] = [ids[:len(ids) // 2], ids[len(ids) // 2:]]
+                continue
+            raise
+        sink.extend(rows)
+        if exists_only and rows:
+            return
+
+
+def _impact_row_key(r: dict):
+    e = r["edge"]
+    return (r["cid"], r["to_cid"], str(e.get("type")), str(e.get("doc")), e.get("line") or 0)
+
+
+def _flow_stage(session, seeds, visited: set, world_id, params, flow_depth: int, *, parent: dict, meta: dict,
+                order: list, flow_cids: set) -> tuple:
+    """第 2 段のたどり（データの流れの候補）。構造の到達集合 `seeds` を種に、`flow_depth` 段だけ広げる。
+
+    1 段目は種からの `FLOWS_TO` の出辺。2 段目以降は、前の段で流れによって届いたノードからの `FLOWS_TO` の出辺と `_IMPACT_REL` の入辺
+    （流れで届いた読み手を実行するジョブなど）。`visited` は構造の段から引き継ぎ、初めて届いたノードだけを `parent`／`meta`／`order`／`flow_cids` へ足す。
+    戻りは `(最後に届いたノード, 過負荷)`。過負荷のときは、それまでに届いた分を残して打ち切る。
+    """
+    frontier = sorted(seeds)
+    overload: GraphQueryOverloadError | None = None
+    for level in range(flow_depth):
+        if not frontier:
+            break
+        rows: list[dict] = []
+        try:
+            _impact_expand_rows(session, frontier, world_id, params, rows, rel=_FLOW_REL, direction="out")
+            if level > 0:
+                _impact_expand_rows(session, frontier, world_id, params, rows)
+        except GraphQueryOverloadError as e:
+            overload = e
+        reached: list[str] = []
+        for r in sorted(rows, key=_impact_row_key):
+            cid = r["cid"]
+            if cid in visited:
+                continue
+            visited.add(cid)
+            parent[cid] = (r["to_cid"], r["edge"])
+            meta[cid] = r
+            order.append(cid)
+            flow_cids.add(cid)
+            reached.append(cid)
+        frontier = reached
+        if overload is not None:
+            break
+    return frontier, overload
 
 
 def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPACT_MAX_DEPTH,
-                 include_deprecated=False, info: dict | None = None, detail: bool = False):
-    """範囲フィルタ付きの Cypher で影響ノードを引き、構造化 item を返す（`impact_service.neo4j_impact` の資料フォルダ版）。
+                 include_deprecated=False, info: dict | None = None, detail: bool = False, flow_depth: int = 0):
+    """範囲フィルタ付きで影響ノードを 1 段ずつ広げて引き、構造化 item を返す（`impact_service.neo4j_impact` の資料フォルダ版）。
 
     start・affected・経路の全ノードが `world_id` と `scope_prefixes` 内。骨格エッジ（`_IMPACT_REL`＝COPIES/CONTAINS/INVOKES/ACCESSES）
     だけを辿る決定的な構造たどりで、全件を同格に扱う。
-    主クエリの後に `check_schema_era` を呼ぶ（旧世代の実データがあれば `GraphSchemaEraError`）。主クエリ自体の安全弁を先に効かせるため。
-    `info`（省略可）を渡すと、深さの上限の先に影響先が残るかを `info["depth_truncated"]`（真偽）へ入れる。
+    ① 起点を確かめる ② 段 k ごとに frontier から逆向きに 1 段だけ問い、初めて届いたノードに最初の辺（親）を記録する
+    ③ `check_schema_era`（旧世代の実データがあれば `GraphSchemaEraError`） ④ 深さの先に未到達のノードが残るかを 1 回だけ問う。
+    代表経路は親をたどって復元する（段ごとに広げるので最初の到達が最短）。起点どうしが互いに届くときと、起点へ戻る循環は、起点も影響先に数える。
+    `info`（省略可）を渡すと、深さの先に影響先が残るかを `info["depth_truncated"]`（真偽・判定できなければ None と `depth_check_limit`）へ入れる。
+    段の問い合わせが timeout・行数の天井に当たったときは、届いた分を返し `info["overload"]`（`GraphQueryOverloadError`）を立てる
+    （`info` が無いときは `GraphQueryOverloadError` をそのまま送出する）。
     `detail`（既定 False）が真のとき、各 item に影響先の `canonical_id`・代表経路のノード識別子 `trace_cids`・
     代表経路の全辺 `edges`（`type/doc/line`・`trace` と同じ並び＝影響先から起点へ）を足す（`graph_impact` 用）。
+    `flow_depth`（既定 0）が正のとき、構造の後に第 2 段（`_flow_stage`）でデータの流れの候補を `flow_depth` 段まで広げる。各 item に
+    `origin`（`structure`／`flow`）を足し、`info["flow_depth_truncated"]`（真偽・判定できなければ None と `flow_depth_check_limit`）と
+    第 2 段の過負荷 `info["flow_overload"]` を立てる。構造の段が過負荷なら第 2 段は走らせない。0 のときは戻りも `info` も変わらない。
     """
-    # "world" キーは params に含めず、`_run_read_capped` の専用キーワード引数（world=world_id）から `session.run` へ渡す
-    params = {"starts": list(start_cids),
-              "incl": include_deprecated, "prefixes": list(scope_prefixes or [])}
+    params = {"incl": include_deprecated, "prefixes": list(scope_prefixes or [])}
     d = int(depth)
-    sp_n = _scope_pred("n")
+    starts = _impact_start_nodes(session, start_cids, world_id, params)
+    visited = set(starts)                       # 展開済み（起点を含む）
+    frontier = sorted(starts)
+    parent: dict[str, tuple[str, dict]] = {}    # 起点以外の影響先 → (広げた元ノード, その辺)
+    start_hit: dict[str, tuple[str, dict]] = {}  # 起点に戻って届いた起点 → (広げた元ノード, その辺)
+    meta: dict[str, dict] = {}
+    meta_hit: dict[str, dict] = {}
+    order: list[str] = []
+    overload: GraphQueryOverloadError | None = None
+    for _level in range(d):
+        if not frontier:
+            break
+        rows: list[dict] = []
+        try:
+            _impact_expand_rows(session, frontier, world_id, params, rows)
+        except GraphQueryOverloadError as e:
+            overload = e
+        reached: list[str] = []
+        for r in sorted(rows, key=_impact_row_key):
+            cid = r["cid"]
+            if cid in starts:
+                if cid not in start_hit:
+                    start_hit[cid] = (r["to_cid"], r["edge"])
+                    meta_hit[cid] = r
+                    order.append(cid)
+            elif cid not in visited:
+                visited.add(cid)
+                parent[cid] = (r["to_cid"], r["edge"])
+                meta[cid] = r
+                order.append(cid)
+                reached.append(cid)
+        frontier = reached
+        if overload is not None:
+            break
+    if overload is not None and info is None:
+        raise overload
+    struct_order, struct_frontier = list(order), frontier
+    flow_cids: set[str] = set()
+    flow_overload: GraphQueryOverloadError | None = None
+    flow_frontier: list[str] = []
+    if flow_depth > 0 and overload is None:
+        flow_frontier, flow_overload = _flow_stage(
+            session, list(visited), visited, world_id, params, int(flow_depth),
+            parent=parent, meta=meta, order=order, flow_cids=flow_cids)
+        if flow_overload is not None and info is None:
+            raise flow_overload
 
-    impact_cypher = (
-        "MATCH (start:Entity) WHERE start.canonical_id IN $starts "
-        f"MATCH p=(affected:Entity)-[r:{_IMPACT_REL}*1..%(d)d]->(start) "
-        f"WHERE {_impact_path_where('p', sp_n)}"
-        "WITH affected, p ORDER BY length(p) "        # 代表経路＝最短（trace/evidence 用）
-        "WITH affected, head(collect(p)) AS path "
-        "RETURN affected.canonical_id AS cid, affected.name AS name, "
-        "  [l IN labels(affected) WHERE l<>'Entity'][0] AS label, "
-        "  coalesce(affected.status,'active') AS status, "
-        "  affected.path AS dpath, affected.top_scope AS top, affected.analyzer AS analyzer, "
-        "  [n IN nodes(path) | n.name] AS path_names, "
-        + ("  [n IN nodes(path) | n.canonical_id] AS path_cids, [n IN nodes(path) | n.path] AS path_paths, "
-           if detail else "") +
-        f"  [e IN relationships(path) | {{type:type(e), doc:e.doc, line:e.line, {EDGE_SOURCE_FIELDS}}}] AS edges"
-    ) % {"d": d}
+    def chain(cid):
+        names, cids, paths, edges = [], [], [], []
+        step = parent.get(cid) or start_hit.get(cid)
+        while True:
+            node = meta.get(cid)
+            names.append(node["name"] if node else starts[cid]["name"])
+            cids.append(cid)
+            paths.append(node["dpath"] if node else starts[cid]["path"])
+            if step is None:
+                return names, cids, paths, edges
+            edges.append(step[1])
+            cid = step[0]
+            step = parent.get(cid)
 
     items = []
-    for r in _run_read_capped(session, impact_cypher, world=world_id, **params):
+    for cid in order:
+        names, cids, paths, edges = chain(cid)
+        r = meta.get(cid) or meta_hit[cid]
         items.append({
             "name": r["name"],
             "label": r["label"],
@@ -576,25 +757,66 @@ def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPAC
             "status": r["status"],
             "analyzer": r["analyzer"],                                # 担当アナライザの来歴（コード以外は None）
             "top_scope": r["top"], "path": r["dpath"],                # 所属（範囲）
-            "trace": r["path_names"],                                 # なぜ影響するか（ノード名列）
-            "evidence": [e for e in map(edge_view, r["edges"]) if e.get("doc")],   # 根拠（辺ごとの doc・line・via・rule・sources）
+            "trace": names,                                           # なぜ影響するか（ノード名列）
+            "evidence": [e for e in map(edge_view, edges) if e.get("doc")],   # 根拠（辺ごとの doc・line・via・rule・sources）
         })
+        if cid in flow_cids:
+            edges = [_safe_flow_edge(e, scope_prefixes) for e in edges]
+            items[-1]["evidence"] = [e for e in map(edge_view, edges) if e.get("doc")]
+        if flow_depth > 0:
+            items[-1]["origin"] = "flow" if cid in flow_cids else "structure"
         if detail:
-            items[-1].update({"canonical_id": r["cid"], "trace_cids": r["path_cids"],
-                                 "trace_paths": r["path_paths"], "edges": r["edges"]})
+            items[-1].update({"canonical_id": cid, "trace_cids": cids, "trace_paths": paths, "edges": edges})
     check_schema_era(session, world_id, lens="impact")
     if info is not None:
-        # 影響先が 0 件なら、その先も無い（長さ d+1 の経路の接頭辞が長さ d の影響先になる）ので問い合わせない
-        # 判定の問い合わせの過負荷は本体の結果と分ける（本体の結果は返し、判定だけ不明＝None と過負荷の理由を渡す）
-        try:
-            info["depth_truncated"] = bool(items) and _impact_depth_truncated(
-                session, start_cids, world_id, scope_prefixes, d, include_deprecated)
-        except GraphQueryOverloadError as e:
-            _log.warning("深さの先の判定が過負荷のため不明として返す（world=%s・%s）", world_id, e.reason)
+        if overload is not None:
+            _log.warning("影響たどりが途中で過負荷のため届いた分だけ返す（world=%s・%s）", world_id, overload.reason)
+            info["overload"] = overload
             info["depth_truncated"] = None
-            info["depth_check_limit"] = graph_coverage.kind_of_overload(e.reason)
+            info["depth_check_limit"] = graph_coverage.kind_of_overload(overload.reason)
+        else:
+            # frontier が空なら、その先も無い。判定の問い合わせの過負荷は本体の結果と分ける（判定だけ不明＝None と過負荷の理由を渡す）
+            try:
+                info["depth_truncated"] = False
+                if d >= 1 and struct_frontier:
+                    probe: list[dict] = []
+                    _impact_expand_rows(session, struct_frontier, world_id, params, probe,
+                                        seen=set(struct_order), exists_only=True)
+                    info["depth_truncated"] = bool(probe)
+            except GraphQueryOverloadError as e:
+                _log.warning("深さの先の判定が過負荷のため不明として返す（world=%s・%s）", world_id, e.reason)
+                info["depth_truncated"] = None
+                info["depth_check_limit"] = graph_coverage.kind_of_overload(e.reason)
+        if flow_depth > 0:
+            _flow_truncation(session, info, world_id, params, visited, flow_frontier, overload, flow_overload)
     _attach_importance(items, world_id)
     return items
+
+
+def _flow_truncation(session, info: dict, world_id, params, visited: set, flow_frontier: list,
+                     struct_overload, flow_overload) -> None:
+    """第 2 段の打ち切りを `info` に入れる。構造の段か第 2 段が過負荷なら不明（None）、そうでなければ先に未到達のノードが残るかを 1 回だけ問う。"""
+    over = struct_overload or flow_overload
+    if over is not None:
+        info["flow_depth_truncated"] = None
+        info["flow_depth_check_limit"] = graph_coverage.kind_of_overload(over.reason)
+        if flow_overload is not None:
+            info["flow_overload"] = flow_overload
+        return
+    info["flow_depth_truncated"] = False
+    if not flow_frontier:
+        return
+    try:
+        probe: list[dict] = []
+        _impact_expand_rows(session, flow_frontier, world_id, params, probe, seen=visited, exists_only=True,
+                            rel=_FLOW_REL, direction="out")
+        if not probe:
+            _impact_expand_rows(session, flow_frontier, world_id, params, probe, seen=visited, exists_only=True)
+        info["flow_depth_truncated"] = bool(probe)
+    except GraphQueryOverloadError as e:
+        _log.warning("流れの先の判定が過負荷のため不明として返す（world=%s・%s）", world_id, e.reason)
+        info["flow_depth_truncated"] = None
+        info["flow_depth_check_limit"] = graph_coverage.kind_of_overload(e.reason)
 
 
 def read_plugin_failures(session, world_id) -> list:
@@ -605,6 +827,18 @@ def read_plugin_failures(session, world_id) -> list:
     if not rows or not rows[0].get("pf"):
         return []
     return json.loads(rows[0]["pf"])
+
+
+def read_generation(session, world_id) -> str | None:
+    """そのグラフの取り込みの世代（`load_world` が刻む `generation`）。作り直すたびに変わる。印のない旧グラフは件数から作った印、グラフが無ければ None。"""
+    rows = _run_read_capped(
+        session, "MATCH (m:SherpaMeta {world_id:$w}) "
+                 "RETURN m.generation AS g, m.node_count AS nc, m.edge_count AS ec, m.schema_era AS era",
+        world=world_id, w=world_id)
+    if not rows:
+        return None
+    r = rows[0]
+    return str(r["g"]) if r.get("g") else f"legacy-{r.get('era')}-{r.get('nc')}-{r.get('ec')}"
 
 
 def read_unparsed_sources(session, world_id) -> dict | None:
@@ -664,9 +898,9 @@ def read_unresolved(session, world_id, names, scope_prefixes=None, *, fold_case=
     return {"available": True, "items": items[:UNRESOLVED_RETURN_MAX], "omitted": omitted}
 
 
-def _not_sensitive_path(var: str) -> str:
+def _not_sensitive_path(var: str, *, path: str | None = None) -> str:
     """ノード `var` の所属パスの末尾のファイル名が秘匿名（`text_kind.is_sensitive` と同じ規則）でない、の Cypher 述語（`$s_exact`・`$s_pre`・`$s_ext` を使う）。"""
-    fl = f"toLower(last(split(coalesce({var}.path,''),'/')))"
+    fl = f"toLower(last(split(coalesce({path or var + '.path'},''),'/')))"
     return (f"NOT ({fl} IN $s_exact OR any(p IN $s_pre WHERE {fl} STARTS WITH p) "
             f"OR any(e IN $s_ext WHERE {fl} ENDS WITH e))")
 
@@ -796,28 +1030,53 @@ def _attach_importance(items: list, world_id: str) -> None:
 
 
 def run_world_impact(session, term, world_id, scope_prefixes=None,
-                     depth=IMPACT_MAX_DEPTH, include_deprecated=False):
-    """`resolve_world_entity` → `world_impact` → 構造化結果（emit_result 形・範囲つき）を返す。"""
+                     depth=IMPACT_MAX_DEPTH, include_deprecated=False, flow_depth=0):
+    """`resolve_world_entity` → `world_impact` → 構造化結果（emit_result 形・範囲つき）を返す。
+
+    `flow_depth` が正のとき、構造の影響 `items` とは別に、データの流れで届いた候補を `candidates` に返す（`coverage.flow` に段数と打ち切り）。
+    第 2 段の過負荷は構造の結果を捨てずに `coverage.limits`（stage `flow`）で申告する。
+    """
     starts = resolve_world_entity(session, term, world_id, scope_prefixes, include_deprecated)
     info: dict = {}
     items = world_impact(session, [s["canonical_id"] for s in starts], world_id,
-                         scope_prefixes, depth, include_deprecated, info=info)
+                         scope_prefixes, depth, include_deprecated, info=info,
+                         **({"flow_depth": flow_depth} if flow_depth > 0 else {}))
+    if info.get("overload") is not None:
+        raise info["overload"]   # 画面側は届いた分だけを「影響なし」と読ませない（範囲を絞って再実行を促す）
+    candidates = [i for i in items if i.get("origin") == "flow"]
+    if flow_depth > 0:
+        items = [i for i in items if i.get("origin") != "flow"]
+        for i in items + candidates:
+            i.pop("origin", None)
     truncated = info.get("depth_truncated", False)  # None＝判定できなかった（不明）
     coverage = graph_coverage.Coverage()
     if truncated is None:
         coverage.add(info["depth_check_limit"], graph_coverage.STAGE_IMPACT)
     elif truncated:
         coverage.add(graph_coverage.KIND_DEPTH, graph_coverage.STAGE_IMPACT)
+    flow_cov = None
+    if flow_depth > 0:
+        flow_truncated = info.get("flow_depth_truncated", False)
+        if flow_truncated is None:
+            coverage.add(info["flow_depth_check_limit"], graph_coverage.STAGE_FLOW)
+        elif flow_truncated:
+            coverage.add(graph_coverage.KIND_DEPTH, graph_coverage.STAGE_FLOW)
+        flow_cov = {"requested": int(flow_depth), "truncated": flow_truncated}
     graph_coverage.attach_plugin_failures(
         coverage, lambda: read_plugin_failures(session, world_id), graph_coverage.STAGE_IMPACT,
         read_unparsed=lambda: read_unparsed_sources(session, world_id))
     # 第1ソートキーは重要度（`高`>`中`/未設定>`低`）。`_重要度.txt` の無い資料フォルダは全 item の rank が揃い、category・name だけの順になる
-    items.sort(key=lambda x: (-importance.RANK.get(x.get("importance"), importance.RANK_UNSET),
-                              x["category"], x["name"]))
-    return {"type": "impact", "world_id": world_id, "scope_prefixes": list(scope_prefixes or []),
-            "start": term, "include_deprecated": include_deprecated, "starts": starts, "items": items,
-            "unresolved": read_unresolved(session, world_id, [term], scope_prefixes),
-            "coverage": coverage.as_dict(depth={"requested": int(depth), "truncated": truncated})}
+    def _order(x):
+        return (-importance.RANK.get(x.get("importance"), importance.RANK_UNSET), x["category"], x["name"])
+    items.sort(key=_order)
+    out = {"type": "impact", "world_id": world_id, "scope_prefixes": list(scope_prefixes or []),
+           "start": term, "include_deprecated": include_deprecated, "starts": starts, "items": items,
+           "unresolved": read_unresolved(session, world_id, [term], scope_prefixes),
+           "coverage": coverage.as_dict(depth={"requested": int(depth), "truncated": truncated}, flow=flow_cov)}
+    if flow_depth > 0:
+        candidates.sort(key=_order)
+        out["candidates"] = candidates
+    return out
 
 
 def default_neo4j_uri() -> str:

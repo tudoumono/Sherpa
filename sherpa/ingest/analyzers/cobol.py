@@ -4,6 +4,9 @@
 - `EXEC SQL ... END-EXEC`（複数物理行にまたがる）は、`FROM`/`JOIN`/`INSERT INTO`/`MERGE INTO`/`UPDATE`/`DELETE FROM` 直後のテーブル名を `ACCESSES`→`Table`（`via=exec_sql`）で返す。サニタイズ・テーブル名抽出は `_sql_scan` と共通。`DECLARE ... CURSOR FOR SELECT ...`（静的カーソル）は表への参照にし、準備済みの文の名前を指すカーソル（`CURSOR FOR STMT1`）と `EXECUTE IMMEDIATE` は `Dropped("exec_sql_dynamic")`。
 - `EXEC CICS` は `XCTL`/`LINK` の `PROGRAM('X')` を `INVOKES`（`via=cics_xctl`/`cics_link`）で返す。識別子（動的）は `Dropped("cics_dynamic")`、他コマンドはブロックごとに `Dropped("cics_other")` 1件。
 - 文字列リテラル中の語を拾わないため、開始検索は引用文字列を空白化した文字列で行う。`END-EXEC` は `_find_end_exec` が文字列・コメントの外だけで認識する。継続行結合した論理行でも `--` コメントは物理行境界を越えない。
+- 外部ファイル: `SELECT … ASSIGN TO x`（ddname は最後の `-` 区切り・8 字）・`FD`（配下の 01 名）・`OPEN`（一次情報）・`READ`/`WRITE`/`REWRITE`（`OPEN` が無いときだけ使う）から `RefResult.file_io`（`FileIo`）を返す。
+  引用リテラルの `ASSIGN`・`USING`/`DYNAMIC` は `Dropped("assign_literal"/"assign_dynamic")`、`SD` は `Dropped("sort_file")`、`SORT`/`MERGE`/`RELEASE`/`RETURN` は `Dropped("sort_statement")`。
+- 手続き部に出る名前は `RefResult.proc_names`（名前 → 最初の行）に返す。コピーブックの項目との突き合わせ（`use`）は共通層が行う。
 設計: docs/design/rag.md「グラフ」
 """
 from __future__ import annotations
@@ -17,7 +20,7 @@ from ..static_analysis import (COBOL_EXT, _CALL, _COPY, _DYNAMIC_CALL,
                                _normalize_logical_lines, _split_statements,
                                _strip_inline_comment, _strip_quoted)
 from . import _sql_scan
-from ._base import Analyzer, DefItem, DefResult, Dropped, RefCandidate, RefResult
+from ._base import Analyzer, DefItem, DefResult, Dropped, FileIo, RefCandidate, RefResult
 
 # EXEC SQL/EXEC CICS: ブロック境界・動的 SQL 検知の正規表現。`EXEC SQL`/`EXEC CICS` を1つの正規表現で拾い、種別で分岐する。
 _EXEC_BLOCK_START = re.compile(r"\bEXEC\s+(SQL|CICS)\b", re.IGNORECASE)
@@ -226,6 +229,190 @@ def _exec_cics_block_refs(block_frags: list, start_line: int) -> tuple:
         return [RefCandidate("INVOKES", "Module", _norm(literal), line, extra={"via": via})], []
     return [], [Dropped("cics_dynamic", line, stripped[:120])]
 
+# ---- 外部ファイルの入出力と手続き部の名前（`extract_refs` の論理行ループに相乗りして拾う） ----
+
+_WORD_CHARS = "A-Za-z0-9#@$_-"
+_NAME_RE = re.compile(rf"[{_WORD_CHARS}]+")
+_TOKEN_RE = re.compile(rf"[A-Za-z0-9][{_WORD_CHARS}]*")
+_ZONE_RE = re.compile(
+    rf"(?<![{_WORD_CHARS}])(?:(ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION|(FILE-CONTROL|I-O-CONTROL)"
+    rf"|(FILE|WORKING-STORAGE|LOCAL-STORAGE|LINKAGE|SCREEN|REPORT|COMMUNICATION)\s+SECTION)", re.IGNORECASE)
+_SENTENCE_END = re.compile(r"\.(?=\s|$)")
+_SELECT_RE = re.compile(rf"^\s*SELECT\s+(?:OPTIONAL\s+)?([{_WORD_CHARS}]+)\s+ASSIGN\b(.*)$", re.IGNORECASE | re.DOTALL)
+_ASSIGN_TO_RE = re.compile(r"^\s*TO\b\s*", re.IGNORECASE)
+_FD_RE = re.compile(rf"^\s*(FD|SD)\s+([{_WORD_CHARS}]+)", re.IGNORECASE)
+_RECORD_RE = re.compile(rf"^\s*01\s+([{_WORD_CHARS}]+)", re.IGNORECASE)
+_OPEN_MODES = {"INPUT": "r", "OUTPUT": "w", "EXTEND": "w", "I-O": "rw"}
+_OPEN_NOISE = frozenset({"WITH", "NO", "REWIND", "SHARING", "REVERSED"})
+_READ_VERBS = {"READ": "r", "START": "r", "WRITE": "w", "REWRITE": "w", "DELETE": "w"}
+_SORT_VERBS = frozenset({"SORT", "MERGE", "RELEASE", "RETURN"})
+_ASSIGN_DYNAMIC_HEADS = frozenset({"USING", "DYNAMIC"})
+_ZONE_AFTER = {"ENVIRONMENT": "env", "DATA": "other", "PROCEDURE": "proc", "FILE-CONTROL": "fc", "I-O-CONTROL": "env"}
+
+
+class _FileIoScanner:
+    """`extract_refs` が論理行ごとに `feed` する、外部ファイルの入出力と手続き部の名前の収集器。
+
+    ① ENVIRONMENT の `FILE-CONTROL` の `SELECT … ASSIGN`（文の終わりのピリオドまで束ねる）② FILE SECTION の `FD`/`SD` と配下の 01
+    ③ 手続き部の語（`OPEN`/`READ`/`WRITE`… の直後のファイル名・レコード名と、手続き部に出る全ての名前）を順に拾い、`finish()` で `FileIo` を組む。
+    """
+
+    def __init__(self) -> None:
+        self.zone = "env"
+        self.selects: dict = {}        # ファイル名 -> (assign_kind, ddname, 行)
+        self.sort_files: set = set()
+        self.records: dict = {}        # ファイル名 -> [01 名]
+        self.rec_to_file: dict = {}
+        self.cur_fd: str | None = None
+        self.opens: dict = {}          # ファイル名 -> [モード集合, 最初の行]
+        self.confirms: dict = {}       # ファイル名 -> [モード集合, 最初の行]
+        self.dropped: list = []
+        self.proc_names: dict = {}
+        self._buf = ""
+        self._buf_line = 0
+        self._state: str | None = None   # None／"open"／"r"／"w"（直後の名前を待つ）／"sort"
+        self._open_mode = ""
+
+    def feed(self, line: int, code: str) -> None:
+        """1 つの論理行（EXEC ブロックの外の断片）を読む。見出し語を見つけたら区画を切り替えながら進む。"""
+        while code:
+            if self.zone == "proc":
+                self._proc(line, code)
+                return
+            blanked = _blank_cobol_strings(code) if ("'" in code or '"' in code) else code
+            m = _ZONE_RE.search(blanked)
+            if m is None:
+                self._text(line, code)
+                return
+            self._text(line, code[:m.start()])
+            self._leave_zone()
+            word = (m.group(1) or m.group(2) or m.group(3)).upper()
+            self.zone = _ZONE_AFTER.get(word) or ("file" if word == "FILE" else "other")
+            code = code[m.end():]
+
+    def _leave_zone(self) -> None:
+        if self.zone == "fc":
+            self._flush_sentence()
+        self.cur_fd = None
+
+    def _text(self, line: int, text: str) -> None:
+        if not text.strip():
+            return
+        if self.zone == "fc":
+            self._fc_text(line, text)
+        elif self.zone == "file":
+            fm = _FD_RE.match(text)
+            if fm:
+                name = _norm(fm.group(2))
+                if fm.group(1).upper() == "SD":
+                    self.sort_files.add(name)
+                    self.dropped.append(Dropped("sort_file", line, text.strip()[:120]))
+                self.cur_fd = name
+                self.records.setdefault(name, [])
+                return
+            rm = _RECORD_RE.match(text)
+            if rm and self.cur_fd is not None:
+                rec = _norm(rm.group(1))
+                if rec != "FILLER":
+                    self.records[self.cur_fd].append(rec)
+                    self.rec_to_file.setdefault(rec, self.cur_fd)
+
+    def _fc_text(self, line: int, text: str) -> None:
+        blanked = _blank_cobol_strings(text) if ("'" in text or '"' in text) else text
+        start = 0
+        for m in _SENTENCE_END.finditer(blanked):
+            self._buf_add(line, text[start:m.start()])
+            self._flush_sentence()
+            start = m.end()
+        self._buf_add(line, text[start:])
+
+    def _buf_add(self, line: int, piece: str) -> None:
+        if piece.strip():
+            if not self._buf:
+                self._buf_line = line
+            self._buf += " " + piece.strip()
+
+    def _flush_sentence(self) -> None:
+        sentence, line, self._buf = self._buf.strip(), self._buf_line, ""
+        m = _SELECT_RE.match(sentence)
+        if m is None:
+            return
+        name = _norm(m.group(1))
+        rest = _ASSIGN_TO_RE.sub("", m.group(2).strip(), count=1)
+        head = _NAME_RE.match(rest)
+        if rest[:1] in ("'", '"'):
+            kind, ddname, reason = "literal", "", "assign_literal"
+        elif head is None or head.group(0).upper() in _ASSIGN_DYNAMIC_HEADS:
+            kind, ddname, reason = "dynamic", "", "assign_dynamic"
+        else:
+            word = _norm(head.group(0))
+            kind, ddname, reason = "ddname", (word.split("-")[-1] or word)[:8], None
+        if reason is not None:
+            self.dropped.append(Dropped(reason, line, sentence[:120]))
+        self.selects[name] = (kind, ddname, line)
+
+    def _proc(self, line: int, code: str) -> None:
+        blanked = _blank_cobol_strings(code) if ("'" in code or '"' in code) else code
+        names = self.proc_names
+        track = bool(self.selects)
+        for tok in _TOKEN_RE.findall(blanked):
+            tok = tok.upper()
+            if not tok.isdigit() and tok not in names:
+                names[tok] = line
+            if not track:
+                continue
+            st = self._state
+            if st is not None:
+                self._state = None
+                if st == "open":
+                    if tok in _OPEN_MODES:
+                        self._open_mode = _OPEN_MODES[tok]
+                        self._state = "open"
+                        continue
+                    if tok in self.selects:
+                        self._note(self.opens, tok, self._open_mode, line)
+                        self._state = "open"
+                        continue
+                    if tok in _OPEN_NOISE:
+                        self._state = "open"
+                        continue
+                elif st == "sort":
+                    if tok in self.selects or tok in self.rec_to_file:
+                        self.dropped.append(Dropped("sort_statement", line, tok))
+                    continue
+                else:
+                    target = tok if tok in self.selects else self.rec_to_file.get(tok)
+                    if target is not None:
+                        self._note(self.confirms, target, st, line)
+                    continue
+            if tok == "OPEN":
+                self._state, self._open_mode = "open", ""
+            elif tok in _READ_VERBS:
+                self._state = _READ_VERBS[tok]
+            elif tok in _SORT_VERBS:
+                self._state = "sort"
+
+    @staticmethod
+    def _note(table: dict, file_name: str, mode: str, line: int) -> None:
+        entry = table.setdefault(file_name, [set(), line])
+        entry[0].update(mode)
+
+    def finish(self) -> list:
+        """`SELECT` の宣言順に `FileIo` を作る。`OPEN` があればそのモード、無ければ `READ`/`WRITE` から決める。どちらも無いファイルと `SD` は出さない。"""
+        self._flush_sentence()
+        out = []
+        for name, (kind, ddname, _line) in self.selects.items():
+            if name in self.sort_files:
+                continue
+            modes, line = self.opens.get(name) or self.confirms.get(name) or (None, 0)
+            if not modes:
+                continue
+            mode = "rw" if modes >= {"r", "w"} else ("r" if "r" in modes else "w")
+            out.append(FileIo(file_name=name, ddname=ddname, mode=mode, records=list(self.records.get(name, [])),
+                              line=line, assign_kind=kind))
+        return out
+
+
 # 抽出は `_normalize_logical_lines` が返す論理行（固定形式は連番・識別領域を落とし継続行を結合済み／自由形式は物理行そのまま）に対して行う。
 
 
@@ -235,7 +422,7 @@ class CobolAnalyzer(Analyzer):
     name = "cobol"
     extensions = frozenset(COBOL_EXT)
     doctype = "cobol"
-    version = 3
+    version = 4
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         free_format = _is_free_format(text)
@@ -282,6 +469,7 @@ class CobolAnalyzer(Analyzer):
         exec_kind: str | None = None  # "SQL"／"CICS"（収集中のブロック種別）
         sql_state: str | None = None  # 境界スキャナの持ち越し状態
                                            # None／"block_comment"／"string"／"string_double"
+        io_scan = _FileIoScanner()
         for logical, i, segs in entries:
             if _is_comment(logical):
                 continue
@@ -318,10 +506,12 @@ class CobolAnalyzer(Analyzer):
                 sm = _EXEC_BLOCK_START.search(_blank_cobol_strings(code[pos:]))
                 if sm is None:  # 残り全部が通常コード（EXEC なし）
                     self._process_normal_segment(code[pos:], logical[pos:], i, refs, dropped)
+                    io_scan.feed(i, code[pos:])
                     break
 
                 self._process_normal_segment(code[pos:pos + sm.start()], logical[pos:pos + sm.start()],
                                               i, refs, dropped)
+                io_scan.feed(i, code[pos:pos + sm.start()])
                 kind = sm.group(1).upper()
                 after_start_pos = pos + sm.end()
                 em, sql_state = _find_end_exec(code[after_start_pos:], None,
@@ -347,4 +537,5 @@ class CobolAnalyzer(Analyzer):
             reason = "exec_sql_dynamic" if exec_kind == "SQL" else "cics_dynamic"
             dropped.append(Dropped(reason, exec_start_line, combined[:120]))
 
-        return RefResult(refs=refs, dropped=dropped)
+        file_io = io_scan.finish()
+        return RefResult(refs=refs, dropped=dropped + io_scan.dropped, file_io=file_io, proc_names=io_scan.proc_names)

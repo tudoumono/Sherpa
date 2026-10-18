@@ -341,7 +341,8 @@ def test_grep_search_deadline_checkpoints(monkeypatch, tmp_path, n_files, n_line
         _write(tmp_path, f"f{i:04d}.md", body)
     calls = _clock_exceeding_after(monkeypatch, ok_calls)
     with pytest.raises(G.GrepDeadlineExceeded):
-        list(G.grep_search("NEEDLE", world="v1", roots=[tmp_path], max_hits=max_hits, deadline=50.0))
+        list(G.grep_search("NEEDLE", world="v1", roots=[tmp_path], max_hits=max_hits, deadline=50.0,
+                           engine="python"))
     assert (calls["n"] == expected_calls) if exact else (calls["n"] >= expected_calls)
 
 
@@ -369,7 +370,7 @@ def test_grep_search_continues_scanning_past_max_hits_when_imp_map_nonempty(monk
         "a.md": "NEEDLE\n", "b.md": "NEEDLE\n", "_重要度.txt": "a.md: 中\n"})
     calls = _clock_exceeding_after(monkeypatch, 6)
     with pytest.raises(G.GrepDeadlineExceeded):
-        list(G.grep_search("NEEDLE", world="anyworld", max_hits=1, deadline=50.0))
+        list(G.grep_search("NEEDLE", world="anyworld", max_hits=1, deadline=50.0, engine="python"))
     assert calls["n"] >= 7
 
 

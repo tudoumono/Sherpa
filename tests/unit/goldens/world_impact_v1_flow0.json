@@ -1,0 +1,2016 @@
+{
+ "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ]
+    ],
+    "label": "Module",
+    "name": "COMMISUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/FEECALC.cbl",
+      5
+     ]
+    ],
+    "label": "Module",
+    "name": "FEECALC",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/MONTHLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ]
+    ],
+    "label": "Batch",
+    "name": "MONTHLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/AGENTPAY.cbl",
+      6
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ]
+    ],
+    "label": "Module",
+    "name": "AGENTPAY",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY"
+    ]
+   }
+  ]
+ },
+ "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      6
+     ]
+    ],
+    "label": "Module",
+    "name": "BILLGEN",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/TAXCALC.cbl",
+      5
+     ]
+    ],
+    "label": "Module",
+    "name": "TAXCALC",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/NIGHTLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      6
+     ]
+    ],
+    "label": "Batch",
+    "name": "NIGHTLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/SALESUP.cbl",
+      7
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/TAXCALC.cbl",
+      5
+     ]
+    ],
+    "label": "Module",
+    "name": "SALESUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY"
+    ]
+   }
+  ]
+ },
+ "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ]
+    ],
+    "label": "Module",
+    "name": "COMMISUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/MONTHLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ]
+    ],
+    "label": "Batch",
+    "name": "MONTHLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/AGENTPAY.cbl",
+      6
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ]
+    ],
+    "label": "Module",
+    "name": "AGENTPAY",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY"
+    ]
+   }
+  ]
+ },
+ "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/CUSTMNT.cbl",
+      5
+     ]
+    ],
+    "label": "Module",
+    "name": "CUSTMNT",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY"
+    ]
+   }
+  ]
+ },
+ "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      5
+     ]
+    ],
+    "label": "Module",
+    "name": "BILLGEN",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/SALESUP.cbl",
+      5
+     ]
+    ],
+    "label": "Module",
+    "name": "SALESUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/NIGHTLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      5
+     ]
+    ],
+    "label": "Batch",
+    "name": "NIGHTLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Copybook",
+    "name": "FEE-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Module",
+    "name": "COMMISUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/FEECALC.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Module",
+    "name": "FEECALC",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/MONTHLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Batch",
+    "name": "MONTHLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/AGENTPAY.cbl",
+      6
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Module",
+    "name": "AGENTPAY",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-AMOUNT": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Copybook",
+    "name": "FEE-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-AMOUNT"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Module",
+    "name": "COMMISUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-AMOUNT"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/FEECALC.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Module",
+    "name": "FEECALC",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-AMOUNT"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/MONTHLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Batch",
+    "name": "MONTHLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-AMOUNT"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/AGENTPAY.cbl",
+      6
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Module",
+    "name": "AGENTPAY",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-AMOUNT"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Copybook",
+    "name": "FEE-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Module",
+    "name": "COMMISUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/FEECALC.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Module",
+    "name": "FEECALC",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/MONTHLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Batch",
+    "name": "MONTHLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/AGENTPAY.cbl",
+      6
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Module",
+    "name": "AGENTPAY",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Copybook",
+    "name": "TAX-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Module",
+    "name": "BILLGEN",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/TAXCALC.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Module",
+    "name": "TAXCALC",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/NIGHTLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Batch",
+    "name": "NIGHTLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/SALESUP.cbl",
+      7
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/TAXCALC.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Module",
+    "name": "SALESUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-AMOUNT": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Copybook",
+    "name": "TAX-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-AMOUNT"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Module",
+    "name": "BILLGEN",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-AMOUNT"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/TAXCALC.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Module",
+    "name": "TAXCALC",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-AMOUNT"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/NIGHTLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Batch",
+    "name": "NIGHTLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-AMOUNT"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/SALESUP.cbl",
+      7
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/TAXCALC.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Module",
+    "name": "SALESUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-AMOUNT"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Copybook",
+    "name": "TAX-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Module",
+    "name": "BILLGEN",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/TAXCALC.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Module",
+    "name": "TAXCALC",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/NIGHTLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Batch",
+    "name": "NIGHTLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/SALESUP.cbl",
+      7
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/TAXCALC.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Module",
+    "name": "SALESUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+     "copybook:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
+     "dataitem:v1_flow0_snapshot:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Copybook",
+    "name": "AGENT-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Module",
+    "name": "COMMISUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/MONTHLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Batch",
+    "name": "MONTHLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/AGENTPAY.cbl",
+      6
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Module",
+    "name": "AGENTPAY",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-CODE": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Copybook",
+    "name": "AGENT-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-CODE"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Module",
+    "name": "COMMISUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-CODE"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/MONTHLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Batch",
+    "name": "MONTHLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-CODE"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/AGENTPAY.cbl",
+      6
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Module",
+    "name": "AGENTPAY",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-CODE"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-NAME": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Copybook",
+    "name": "AGENT-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-NAME"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Module",
+    "name": "COMMISUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-NAME"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/MONTHLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Batch",
+    "name": "MONTHLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-NAME"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/AGENTPAY.cbl",
+      6
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      6
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/AGENT-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Module",
+    "name": "AGENTPAY",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-NAME"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Copybook",
+    "name": "CUSTOMER-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/CUSTMNT.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Module",
+    "name": "CUSTMNT",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC.CUST-CODE": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Copybook",
+    "name": "CUSTOMER-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC.CUST-CODE"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/CUSTMNT.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Module",
+    "name": "CUSTMNT",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC.CUST-CODE"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC.CUST-NAME": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Copybook",
+    "name": "CUSTOMER-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC.CUST-NAME"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/CUSTMNT.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Module",
+    "name": "CUSTMNT",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC.CUST-NAME"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Copybook",
+    "name": "INVOICE-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Module",
+    "name": "BILLGEN",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/SALESUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Module",
+    "name": "SALESUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/NIGHTLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      2
+     ]
+    ],
+    "label": "Batch",
+    "name": "NIGHTLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-AMOUNT": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Copybook",
+    "name": "INVOICE-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-AMOUNT"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Module",
+    "name": "BILLGEN",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-AMOUNT"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/SALESUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Module",
+    "name": "SALESUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-AMOUNT"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/NIGHTLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      4
+     ]
+    ],
+    "label": "Batch",
+    "name": "NIGHTLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-AMOUNT"
+    ]
+   }
+  ]
+ },
+ "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-NO": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+    "edges": [
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Copybook",
+    "name": "INVOICE-CPY",
+    "trace_cids": [
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-NO"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Module",
+    "name": "BILLGEN",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-NO"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+    "edges": [
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/SALESUP.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Module",
+    "name": "SALESUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-NO"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/NIGHTLY.jcl",
+      2
+     ],
+     [
+      "COPIES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      5
+     ],
+     [
+      "CONTAINS",
+      "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
+      3
+     ]
+    ],
+    "label": "Batch",
+    "name": "NIGHTLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "copybook:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
+     "dataitem:v1_flow0_snapshot:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-NO"
+    ]
+   }
+  ]
+ },
+ "document:v1_flow0_snapshot:4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "document:v1_flow0_snapshot:4期/02_保守/03_運用手順/締めバッチ運用手順.md": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "document:v1_flow0_snapshot:4期/02_設計/01_基本設計/代理店手数料機能設計書.md": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "document:v1_flow0_snapshot:4期/02_設計/01_基本設計/売上計上機能設計書.md": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "document:v1_flow0_snapshot:4期/02_設計/01_基本設計/手数料計算仕様書.md": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "document:v1_flow0_snapshot:4期/02_設計/01_基本設計/税計算仕様書.md": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "document:v1_flow0_snapshot:4期/02_設計/01_基本設計/請求機能設計書.md": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "document:v1_flow0_snapshot:4期/02_設計/01_基本設計/顧客マスタ機能設計書.md": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "document:v1_flow0_snapshot:4期/04_運用/手数料改定障害記録.md": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "document:v1_flow0_snapshot:4期/04_運用/障害記録.md": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/MONTHLY.jcl",
+      3
+     ]
+    ],
+    "label": "Batch",
+    "name": "MONTHLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY"
+    ]
+   }
+  ]
+ },
+ "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/NIGHTLY.jcl",
+      2
+     ]
+    ],
+    "label": "Batch",
+    "name": "NIGHTLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN"
+    ]
+   }
+  ]
+ },
+ "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/MONTHLY.jcl",
+      2
+     ]
+    ],
+    "label": "Batch",
+    "name": "MONTHLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/AGENTPAY.cbl",
+      6
+     ]
+    ],
+    "label": "Module",
+    "name": "AGENTPAY",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP"
+    ]
+   }
+  ]
+ },
+ "module:v1_flow0_snapshot:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT": {
+  "depth_truncated": false,
+  "items": []
+ },
+ "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      8
+     ]
+    ],
+    "label": "Module",
+    "name": "COMMISUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/MONTHLY.jcl",
+      2
+     ],
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      8
+     ]
+    ],
+    "label": "Batch",
+    "name": "MONTHLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/AGENTPAY.cbl",
+      6
+     ],
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/COMMISUP.cbl",
+      8
+     ]
+    ],
+    "label": "Module",
+    "name": "AGENTPAY",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC"
+    ]
+   }
+  ]
+ },
+ "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/NIGHTLY.jcl",
+      3
+     ]
+    ],
+    "label": "Batch",
+    "name": "NIGHTLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP"
+    ]
+   }
+  ]
+ },
+ "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC": {
+  "depth_truncated": false,
+  "items": [
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      8
+     ]
+    ],
+    "label": "Module",
+    "name": "BILLGEN",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC"
+    ]
+   },
+   {
+    "cid": "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/SALESUP.cbl",
+      7
+     ]
+    ],
+    "label": "Module",
+    "name": "SALESUP",
+    "trace_cids": [
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC"
+    ]
+   },
+   {
+    "cid": "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+    "edges": [
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/NIGHTLY.jcl",
+      2
+     ],
+     [
+      "INVOKES",
+      "4期/03_開発/01_ソース/BILLGEN.cbl",
+      8
+     ]
+    ],
+    "label": "Batch",
+    "name": "NIGHTLY",
+    "trace_cids": [
+     "batch:v1_flow0_snapshot:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
+     "module:v1_flow0_snapshot:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC"
+    ]
+   }
+  ]
+ }
+}

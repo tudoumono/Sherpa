@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 
 from ... import investigation_ledger
+from . import plan_ledger
 from .activity import _is_child_session_meta
 from ..base import _log, _node
 from .codex_attempt import _absorb_last_message_fallback, _attempt
@@ -15,7 +16,6 @@ from .ledger_gate import (
     _LEDGER_CONTINUE_CAP,
     _LEDGER_MANIFEST_INVALID_PROMPT,
     _LEDGER_MANIFEST_MISSING_PROMPT,
-    _LEDGER_REVIEW_CAP,
     _LEDGER_REVIEW_PROMPT,
     _ledger_continue_prompt,
     _ledger_progressed,
@@ -97,7 +97,7 @@ def _mark_child_rollouts(st):
 
 def _tool_zero_due(ctx, st, decision) -> bool:
     """道具ゼロの促しを今出すか。資料参照オンの「調べる」で、ターン全部の実行を通して道具が 0 回（子の起動・記録の欠けは対象外）・1 ターン 1 回・正常終了のとき（会話の続きのターンも対象）。"""
-    if decision["lens"] == "author" or st._tool_zero_nudged or st._tool_use.verdict() != TOOL_USE_UNUSED:
+    if st._ledger_style == "plan_main" or decision["lens"] == "author" or st._tool_zero_nudged or st._tool_use.verdict() != TOOL_USE_UNUSED:
         return False
     _mark_child_rollouts(st)
     return (st._tool_use.verdict() == TOOL_USE_UNUSED
@@ -118,7 +118,7 @@ def _continue_until_done(self, ctx, st, decision):
     _schema_v2 = st._schema_v2
     _structured_answers = st._structured_answers
     _wall_clock_state = st._wall_clock_state
-    # 自動継続（「途中経過で止まった」を検出）と台帳ゲート（「`final` だが台帳が未完了」を検出）は1つの while ループで扱う。毎周「今の状態がどちらの継続を必要とするか」を判定し直す。上限は別枠（`_continue_limit`＝自動継続／`_LEDGER_CONTINUE_CAP`＝台帳／`_LEDGER_REVIEW_CAP`＝見直しの一巡）。優先順位: 台帳未完了（`final` かつ未完了）＞ 見直しの一巡（台帳完了直後・上限内の1回）＞ 途中経過（`final` でない）。
+    # 自動継続（「途中経過で止まった」を検出）と台帳ゲート（「`final` だが台帳が未完了」を検出）は1つの while ループで扱う。毎周「今の状態がどちらの継続を必要とするか」を判定し直す。上限は別枠（`_continue_limit`＝自動継続／`_LEDGER_CONTINUE_CAP`＝台帳／`st._plan_review_cap`＝見直しの一巡）。優先順位: 台帳未完了（`final` かつ未完了）＞ 見直しの一巡（台帳完了直後・上限内の1回）＞ 途中経過（`final` でない）。
     # 台帳ゲート分岐のトリガーは `_latest_structured` ではなく `_candidate_final()`（`_pick_structured_headline` と同じ採用候補の選び方）を使う（ゲートを通っていない final が受理されるのを防ぐ）。
     _continue_limit = env_int("SHERPA_CODEX_AUTO_CONTINUE", 3, 0, 5)
     _ledger_manifest_retry_used = False
@@ -148,7 +148,7 @@ def _continue_until_done(self, ctx, st, decision):
             _update_structured_state(st)
             _absorb_mcp_sidecar(st)
             continue
-        _ledger_gate_active = _schema_v2 and st._investigation_dir is not None
+        _ledger_gate_active = _schema_v2 and st._investigation_dir is not None and st._ledger_style == "json"
         _ledger_verdict = None
         if _ledger_gate_active:
             _ledger_snapshot = investigation_ledger.load_ledger(st._investigation_dir)
@@ -166,12 +166,48 @@ def _continue_until_done(self, ctx, st, decision):
             _ledger_prev_snapshot = _ledger_snapshot
             _ledger_prev_reviews = _ledger_reviews
         _has_candidate_final = _candidate_final(st) is not None
+        if (st._ledger_style == "plan_gate" and _schema_v2 and st._investigation_dir is not None
+                and _has_candidate_final and not st._turn_failed):
+            # ---- 計画書の受理判定（評価用 plan_gate）----
+            # final のたびに計画書の「## 母集団」を読み、差し戻す・見直しを頼む・受理するを決める（`plan_ledger.decide`）。
+            _plan_now = plan_ledger.read_plan(st._investigation_dir)
+            # 影響調査では、graph_impact の影響先（ID の集合）と採用候補の回答を照合し、欠落があれば見直しの枠で具体的に差し戻す。
+            _dry_run = plan_ledger.gate_dry_run()
+            _plan_target = plan_ledger.target_check_for_turn(
+                st, ctx.message, decision["lens"], (_candidate_final(st) or {}).get("answer"))
+            _plan_decision = plan_ledger.gate_step(
+                st._plan_gate, _plan_now, review_cap=st._plan_review_cap,
+                graph_incomplete=plan_ledger.graph_incomplete(st), target=_plan_target, dry_run=_dry_run)
+            if _plan_decision.action == "accept":
+                if st._plan_gate.unresolved and not _dry_run:
+                    st._answer_notices.append(
+                        ("target_unresolved", plan_ledger.unresolved_notice(st._plan_gate.unresolved)))
+                break
+            if _plan_decision.action == "review" and _plan_now is not None:
+                _cand_answer = ((_candidate_final(st) or {}).get("answer") or "").strip()
+                plan_ledger.dump_review_candidate(
+                    st, ctx, st._plan_gate.review_requests,
+                    plan_ledger.compose_with_model_answer(_plan_now, _cand_answer)[0] if _cand_answer
+                    else plan_ledger.compose_answer(_plan_now, ""))
+            st._structured_answers_valid_from = len(_structured_answers)
+            _plan_label = ("計画書の見直し" if _plan_decision.action == "review" else "調査計画書を確認")
+            yield _node(f"plan-{_plan_decision.action}-{st._plan_gate.continuations + st._plan_gate.review_requests}",
+                        "think", _plan_label,
+                        "確定する前に見直します" if _plan_decision.action == "review"
+                        else "グラフの結果が打ち切られているため補います" if _plan_decision.action == "reject_graph"
+                        else "影響先の一覧に欠けた対象があるため補います" if _plan_decision.action == "reject_targets"
+                        else "計画書に未完了の項目があるため続けます", "done")
+            yield from _attempt(self, ctx, st, decision, True, prompt_text=_plan_decision.prompt)
+            _absorb_last_message_fallback(st)
+            _update_structured_state(st)
+            _absorb_mcp_sidecar(st)
+            continue
         if _ledger_gate_active and _has_candidate_final:
             # ---- 台帳ゲート分岐（`_schema_v2` のときだけ効かせる）----
             if _ledger_verdict.complete:
                 # ---- 見直しの一巡 ----
-                # 完了と判定した回答の候補を受け取る前に、上限に達していなければ一度だけ Codex へ続きを頼む（台帳継続と同じ resume の流儀・別枠の上限 `_LEDGER_REVIEW_CAP`＝頼んだ回数で数える）。
-                if st._ledger_review_requests >= _LEDGER_REVIEW_CAP:
+                # 完了と判定した回答の候補を受け取る前に、上限に達していなければ一度だけ Codex へ続きを頼む（台帳継続と同じ resume の流儀・別枠の上限 `st._plan_review_cap`＝深さごとの表・頼んだ回数で数える）。
+                if st._ledger_review_requests >= st._plan_review_cap:
                     break
                 # 前の見直し以後が失敗・未完了・悪化のまま台帳が完了した場合は、次の見直しを頼まず、ループ後の安全弁で前の見直しの直前へ戻す。
                 if (st._ledger_review_pre_candidate is not None
@@ -182,6 +218,8 @@ def _continue_until_done(self, ctx, st, decision):
                 st._ledger_review_requests += 1
                 st._ledger_review_attempted = True
                 st._ledger_review_pre_candidate = _candidate_final(st)
+                plan_ledger.dump_review_candidate(
+                    st, ctx, st._ledger_review_requests, st._ledger_review_pre_candidate.get("answer") or "")
                 st._ledger_review_pre_len = len(_structured_answers)
                 st._ledger_review_pre_msgs_len = len(st._agent_msgs)
                 st._ledger_review_pre_valid_from = st._structured_answers_valid_from
@@ -196,7 +234,7 @@ def _continue_until_done(self, ctx, st, decision):
                 yield _node(
                     f"ledger-review-{st._ledger_review_requests}", "think", "回答前の点検",
                     f"確定する前に見直します（{st._ledger_review_requests}/"
-                    f"{_LEDGER_REVIEW_CAP}）", "done")
+                    f"{st._plan_review_cap}）", "done")
                 yield from _attempt(self, ctx, st, decision, True, prompt_text=_LEDGER_REVIEW_PROMPT)
                 _absorb_last_message_fallback(st)
                 _update_structured_state(st)
@@ -320,7 +358,7 @@ def _final_ledger_verdict(st):
     """台帳の最終判定を記録する（`env["investigation"]` と退避判定の根拠）。"""
     _schema_v2 = st._schema_v2
     # 台帳の最終判定: `_schema_v2` が有効なときだけ記録する。ゲート自体が1回も継続を発行しなくても（resume 不能・ask_user/停止で打ち切り等）、受理する回答の実状を記録する（`env["investigation"]`／退避判定の根拠）。
-    if _schema_v2 and st._investigation_dir is not None:
+    if _schema_v2 and st._investigation_dir is not None and st._ledger_style == "json":
         # 完了判定の前に、coverage.jsonl の記録に基づき `not_found_in_scope` を必要なら `unverified` へ機械的に置き換える（on-disk の item を書き換える・確認済みの状態は変えない）。以降の再読込はこの書換え後の状態を見る。
         st._investigation_snapshot = investigation_ledger.apply_unverified_downgrades(
             st._investigation_dir, investigation_ledger.load_ledger(st._investigation_dir),

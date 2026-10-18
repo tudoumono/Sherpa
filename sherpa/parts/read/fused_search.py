@@ -222,7 +222,7 @@ def _search_graph(world, query, sp, k, depth=IMPACT_MAX_DEPTH, include_presumed=
     from neo4j.exceptions import AuthError, ServiceUnavailable
 
     from ...ingest.world_neo4j import GraphQueryOverloadError, GraphSchemaEraError
-    kw = {} if include_presumed else {"include_presumed": False}
+    kw = {"flow_depth": 0} if include_presumed else {"flow_depth": 0, "include_presumed": False}   # 融合の入力は構造の影響だけ（流れの候補は使わない）
     if evidence_limit is not None:
         kw["evidence_limit"] = evidence_limit
     try:

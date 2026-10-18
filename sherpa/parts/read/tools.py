@@ -12,7 +12,7 @@ import re
 import stat
 from pathlib import Path
 
-from ... import citations, es_index, graph_coverage, grep_tool, redact_keys, scope_infer, worlds
+from ... import citations, es_index, graph_coverage, grep_tool, redact_keys, scope_infer, search_cache, worlds
 from ...env_int import env_int
 from ... import layer as layer_mod
 from ... import scope as scope_mod
@@ -93,6 +93,7 @@ _HIT_TEXT_MIN_BYTES = 512
 
 # es_search の方式。hybrid は語の一致＋意味の近さ・keyword は語の一致だけ・vector は意味の近さだけ
 _ES_MODES = ("hybrid", "keyword", "vector")
+_ES_NO_SOURCE_NOTICE = "ソース（コード）は全文検索の索引に含まれない。ソースは ripgrep_search で探す"
 # 意味検索（埋め込み）が使えず BM25 だけで返したことを示す縮退理由（`mode_used` を keyword にする）
 _ES_VECTOR_FALLBACK_REASONS = frozenset({
     "embedding_not_configured", "embedding_cloud_unavailable", "vector_feature_mismatch",
@@ -100,6 +101,30 @@ _ES_VECTOR_FALLBACK_REASONS = frozenset({
 # 親返し: es_search のヒットを doc_id で束ね、予算内なら rag.md の領域（P2）を返す（常時 ON）。
 # P2 の対象チャンク集合を ES から引く 1 クエリあたりの取得上限（`es_index.chunk_ids_for_parent` の `limit`）。env 化しない
 _PARENT_RETURN_REGION_CHUNKS_MAX = 5000
+
+
+def _narrow_scope_by_prefix(scope_paths, path_prefix) -> tuple[list, str | None]:
+    """es_search の `path_prefix` で、ターンの範囲をその内側へ狭めた範囲を返す（範囲を広げない）。
+
+    範囲の内側の指定はその prefix だけ、範囲より広い指定は範囲のうち配下のものだけにする。
+    範囲の外・`..`・絶対パスはエラー文を返す。
+    """
+    sp = scope_mod.normalize_scope_paths(scope_paths)
+    raw = str(path_prefix or "").strip()
+    if not raw:
+        return sp, None
+    prefix = raw.strip("/")
+    if raw.startswith("/") or "\\" in raw or ".." in Path(prefix).parts or not prefix:
+        return sp, "path_prefix は資料フォルダからの相対のフォルダで指定してください"
+    if not sp:
+        return [prefix], None
+    if any(prefix == s or prefix.startswith(s + "/") for s in sp):
+        return [prefix], None
+    inner = [s for s in sp if s.startswith(prefix + "/")]
+    if inner:
+        return inner, None
+    return sp, "path_prefix が検索範囲の外です"
+
 
 def _clip_utf8_bytes(s: str, max_bytes: int) -> str:
     """UTF-8 エンコード後のバイト数が `max_bytes` を超えないよう `s` を切り詰める（マルチバイト文字の境界で壊れた文字が残らないよう `errors="ignore"` で再デコードする）。"""
@@ -660,17 +685,59 @@ def _doc_reader_text_locator(name: str, result: dict) -> tuple[str | None, str |
         return text, "head"
     return None, None
 
-def _shrink_xlsx_range_field(orig_range: str | None, n_rows: int) -> str | None:
-    """`orig_range`（`xlsx_range` が返した A1 レンジ）を、行が `n_rows` 行へ削減された場合の範囲に更新する（列は不変・終了行だけ詰める）。解析できなければ元の値のまま返す。"""
+def _attach_doc_locator(name: str, r: dict, doc_id: str) -> dict:
+    """結果へ `doc_id`／`locator` を足す（中身が無ければ足さない）。`text` は足さない（本文は構造の欄にあり、同じ本文を 2 回載せると応答が倍になる）。"""
+    text, locator = _doc_reader_text_locator(name, r)
+    return {**r, "doc_id": doc_id, "locator": locator} if text else r
+
+def _shrink_xlsx_range_field(orig_range: str | None, n_rows: int, n_cols: int | None = None) -> str | None:
+    """`orig_range`（`xlsx_range` が返した A1 レンジ）を、行が `n_rows` 行（列が `n_cols` 列）へ削減された場合の範囲に更新する。解析できなければ元の値のまま返す。"""
     if not orig_range or n_rows <= 0:
         return orig_range
     try:
         from openpyxl.utils.cell import range_boundaries
         from openpyxl.utils import get_column_letter
         min_col, min_row, max_col, _max_row = range_boundaries(orig_range)
+        if n_cols is not None:
+            max_col = min_col + max(n_cols, 1) - 1
         return f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{min_row + n_rows - 1}"
     except Exception:
         return orig_range
+
+_A1_REF_RE = re.compile(r"^([A-Z]+)(\d+)")
+
+def _xlsx_trim_extras(r: dict, last_row: int, last_col: int | None = None) -> dict:
+    """`xlsx_range` の付帯欄（非表示の行・列、結合範囲、表示値）を、返す行・列の範囲（`last_row` まで・`last_col` 列目まで）に合わせて絞る。"""
+    from openpyxl.utils import column_index_from_string
+    from openpyxl.utils.cell import range_boundaries
+
+    def _keep_ref(ref: str) -> bool:
+        m = _A1_REF_RE.match(ref)
+        return bool(m) and int(m.group(2)) <= last_row and (
+            last_col is None or column_index_from_string(m.group(1)) <= last_col)
+
+    out = dict(r)
+    if out.get("hidden_rows"):
+        out["hidden_rows"] = [x for x in out["hidden_rows"] if x <= last_row]
+    if out.get("hidden_cols") and last_col is not None:
+        out["hidden_cols"] = [x for x in out["hidden_cols"] if column_index_from_string(x) <= last_col]
+    if out.get("merged"):
+        keep = []
+        for ref in out["merged"]:
+            try:
+                c0, r0, _c1, _r1 = range_boundaries(ref)
+            except Exception:
+                continue
+            if r0 <= last_row and (last_col is None or c0 <= last_col):
+                keep.append(ref)
+        out["merged"] = keep
+    for key in ("display", "display_format"):
+        if out.get(key):
+            out[key] = {k: v for k, v in out[key].items() if _keep_ref(k)}
+    for key in ("hidden_rows", "hidden_cols", "merged", "display", "display_format"):
+        if key in out and not out[key]:
+            del out[key]
+    return out
 
 # 二分探索で 1 件も残せない場合に「先頭 1 件の text を切り詰めて残す」対象のツール（dict 要素が str の `text` を持つ形）。それ以外は 1 件も入らなければ空のまま返す
 _SINGLE_ITEM_TEXT_FIELDS = frozenset({"pdf_pages"})
@@ -686,13 +753,12 @@ def _shrink_single_item_result(name: str, result: dict, doc_id: str, field: str,
 
     def _build_one(txt: str) -> dict:
         it = {**item, "text": txt, "text_truncated": True}
+        if name == "pdf_pages":
+            it["next_text_offset"] = int(item.get("text_offset") or 0) + len(txt)  # 続きは text_offset にこの値を渡す
         r = dict(result)
         r[field] = [it]
         # 鍵ブロックの伏せ字は呼び出し元（`run_tool` の `_redact_deep`）が適用済みなので、ここでは掛け直さない
-        text, locator = _doc_reader_text_locator(name, r)
-        if text:
-            r = {**r, "doc_id": doc_id, "text": text, "locator": locator}
-        return r
+        return _attach_doc_locator(name, r, doc_id)
 
     lo, hi, best_text = 0, len(text0), ""
     while lo <= hi:
@@ -763,10 +829,7 @@ def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int)
         r["paragraphs"] = paras[:n_paras]
         r["tables"] = _tables_for(n_rows_keep)
         # 合成元は呼び出し元（`run_tool`）の `_redact_deep` を通過済みなので、合成後に伏せ字を掛け直さない
-        text, locator = _doc_reader_text_locator("docx_paragraphs", r)
-        if text:
-            r = {**r, "doc_id": doc_id, "text": text, "locator": locator}
-        return r
+        return _attach_doc_locator("docx_paragraphs", r, doc_id)
 
     full = _build(len(paras), len(flat_rows))
     if _result_byte_size(full) <= tr_max_bytes:
@@ -815,10 +878,7 @@ def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int)
             def _with_tables(n_rows_keep: int) -> dict:
                 r = dict(shrunk)
                 r["tables"] = _tables_for(n_rows_keep)
-                text, locator = _doc_reader_text_locator("docx_paragraphs", r)
-                if text:
-                    r = {**r, "doc_id": doc_id, "text": text, "locator": locator}
-                return r
+                return _attach_doc_locator("docx_paragraphs", r, doc_id)
 
             lo, hi, rescued_n_rows = 0, len(flat_rows), 0
             while lo <= hi:
@@ -837,9 +897,43 @@ def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int)
     r["byte_clipped"] = True
     return r
 
+_XLSX_ROW_TOO_LARGE_ERROR = ("1 行（または 1 セル）が大きすぎて返せません。max_cols を小さくするか、"
+                              "列を絞った range（例 'B2:C2'）で読んでください")
+_XLSX_ROW_COLS_CLIPPED_NOTE = "1 行が大きいため先頭の列だけ返した。残りの列は range（列を絞った範囲）を指定して続きを取る"
+_READER_ZERO_ITEM_NOTE = "1 件が大きすぎて予算内に入らず 0 件で返した。範囲を絞って呼び直す"
+
+
+def _xlsx_first_row_columns(result: dict, doc_id: str, first_row: list, tr_max_bytes: int) -> dict | None:
+    """`xlsx_range` で 1 行も入らないとき、先頭 1 行を列で切って（入る列数を二分探索）返す。1 セルも入らなければ None。"""
+    def _build(n_cols: int) -> dict:
+        r = dict(result)
+        r["rows"] = [first_row[:n_cols]]
+        r["range"] = _shrink_xlsx_range_field(result.get("range"), 1, n_cols)
+        r = _xlsx_trim_extras(r, _row_start_from_a1_range(r["range"] or "") or 1, n_cols)
+        return _attach_doc_locator("xlsx_range", r, doc_id)
+
+    lo, hi, best = 1, len(first_row), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _result_byte_size(_build(mid)) <= tr_max_bytes:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best <= 0:
+        return None
+    out = _build(best)
+    out["truncated"] = True
+    out["byte_clipped"] = True
+    out["cols_clipped"] = True
+    out["note"] = _XLSX_ROW_COLS_CLIPPED_NOTE
+    return out
+
+
 def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: int) -> dict:
-    """原本読取ツール 6 本共通の仕上げ（`_redact_deep` の後に呼ぶ）。`doc_id`／`text`／`locator` の合成とバイト上限クリップを同時に行う（`text` は `result[field]` から毎回作り直すので、クリップ後も構造と食い違わない）。
-    二分探索は `doc_id`／`text`／`locator` を含めた最終形の JSON バイト数で判定する。エラー結果はそのまま。`docx_paragraphs` は表も削減対象にするため `_finish_docx_paragraphs_result` に委譲する。
+    """原本読取ツール 6 本共通の仕上げ（`_redact_deep` の後に呼ぶ）。`doc_id`／`locator` の付与とバイト上限クリップを同時に行う（`locator` は `result[field]` から毎回作り直すので、クリップ後も構造と食い違わない）。
+    二分探索は `doc_id`／`locator` を含めた最終形の JSON バイト数で判定する。エラー結果はそのまま。`docx_paragraphs` は表も削減対象にするため `_finish_docx_paragraphs_result` に委譲する。
+    1 件も残せないとき、`pdf_pages` は先頭ページの本文を切って残し、`xlsx_range` は先頭行を列で切って残す（入らなければエラー）。それ以外は 0 件と `note` で返す（空のデータと取り違えさせない）。
     """
     if not (isinstance(result, dict) and not result.get("error")):
         return result
@@ -854,11 +948,10 @@ def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: in
             if name == "xlsx_range":
                 # 行を削った分だけ `range`（延いては locator）も実際の範囲へ合わせる
                 r["range"] = _shrink_xlsx_range_field(result.get("range"), len(seq))
+                if len(seq) < len(result.get(field) or []) and len(seq) > 0:
+                    r = _xlsx_trim_extras(r, (_row_start_from_a1_range(r["range"] or "") or 1) + len(seq) - 1)
         # 合成元は `_redact_deep` を通過済みなので、合成後に伏せ字を掛け直さない
-        text, locator = _doc_reader_text_locator(name, r)
-        if text:
-            r = {**r, "doc_id": doc_id, "text": text, "locator": locator}
-        return r
+        return _attach_doc_locator(name, r, doc_id)
 
     full_seq = result.get(field) if field is not None else None
     full = _build(full_seq)
@@ -882,6 +975,13 @@ def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: in
             shrunk["truncated"] = True
             shrunk["byte_clipped"] = True  # バイト予算由来（件数上限と区別する計測用の印）
             return shrunk
+    if isinstance(full_seq, list) and full_seq and not best.get(field):
+        if name == "xlsx_range" and isinstance(full_seq[0], list):
+            rescued = _xlsx_first_row_columns(result, doc_id, full_seq[0], tr_max_bytes)
+            if rescued is not None:
+                return rescued
+            return {"error": _XLSX_ROW_TOO_LARGE_ERROR}
+        best["note"] = _READER_ZERO_ITEM_NOTE
     best["truncated"] = True
     best["byte_clipped"] = True
     return best
@@ -891,6 +991,43 @@ GRAPH_REINGEST_ERROR_CODE = "graph_reingest_required"
 
 # read_doc／read_around 自身の引数検証エラー（整数変換失敗・行範囲が総行数超過等）の固定コード。`_open_doc_stream` の「読めない」とは別枠で、coverage（項目ごとの未確認）には記録しない
 _READ_INVALID_ARGS_ERROR_CODE = "read_invalid_args"
+
+_PDF_PAGE_IMAGE_NEXT = "path を `tools.view_image({path})` で開き、`image(r.image_url)` で見る"
+
+
+def _render_pdf_page_image(f, world: str, doc_id: str, args: dict) -> dict:
+    """`pdf_page_image` の本体。検査済みの原本 `f` の 1 ページを派生領域へ PNG にして、その場所と大きさを返す。`f` はここで閉じる。"""
+    from ... import doc_readers, pdf_page_image
+    try:
+        try:
+            page = args.get("page")
+            if isinstance(page, str) and page.strip().isdigit():
+                page = int(page)
+            if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+                return {"error": "page は 1 以上の物理ページ番号で指定してください",
+                        "error_code": _READ_INVALID_ARGS_ERROR_CODE}
+            region = pdf_page_image.parse_region(args.get("region"))
+            dpi, dpi_clamped = pdf_page_image.clamp_dpi(args.get("dpi"))
+        except pdf_page_image.RenderError as e:
+            return {"error": str(e), "error_code": _READ_INVALID_ARGS_ERROR_CODE}
+        if doc_readers._too_big_fd(f):
+            return dict(doc_readers._SIZE_ERROR)
+        try:
+            r = pdf_page_image.render(f, rag_root=worlds.derived_rag_dir(world), doc_id=doc_id,
+                                      page=page, region=region, dpi=dpi)
+        except pdf_page_image.RenderError as e:
+            return {"error": str(e), "error_code": f"pdf_page_image_{e.code}"}
+    finally:
+        _close_quiet_local(f)
+    out = {"doc_id": doc_id, "page": page, "total_pages": r["total_pages"], "printed_page": r["printed_page"],
+           "path": r["path"], "width": r["width"], "height": r["height"], "dpi": r["dpi"],
+           "rotation": r["rotation"], "region": r["region"], "cache": r["cache"], "size_bytes": r["size_bytes"],
+           "next": _PDF_PAGE_IMAGE_NEXT}
+    if r["downscaled"]:
+        out["downscaled"] = True
+    if dpi_clamped:
+        out["dpi_clamped"] = True
+    return out
 
 
 # ---- ツール実行（読み取り専用・資料フォルダ＋範囲に限定）----
@@ -992,9 +1129,12 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         if name == "es_search":
             # 全文検索（ES hybrid）は offset ページングを持たない（kNN の候補集合がページを跨いで固定できず、順位の入れ替わりで重複と欠落が起きる）。続きが要るなら max_hits を増やす
             used_max_hits = max_hits or MAX_HITS
+            sp_es, prefix_error = _narrow_scope_by_prefix(sp, args.get("path_prefix"))
+            if prefix_error:
+                return ({"hits": [], "error": prefix_error}, docs, cites, cards)
             from ... import documents  # ES ヒットは現資料フォルダに実在する doc だけ採用
-            # 古い ES 索引由来の 404／別内容リンクを引用／出典に出さない。実在集合は 1 回だけ作る（per-hit のツリー走査を避ける）
-            valid = documents.world_rel_set(world, deadline=deadline)
+            # 古い ES 索引由来の 404／別内容リンクを引用／出典に出さない。実在の確認は返ったヒットの doc_id だけに行う（木は歩かない）
+            documents.existing_rels(world, (), deadline=deadline)  # 期限切れなら ES に問い合わせず ScopeWalkDeadlineExceeded
             # `es_index.search()` は (hits, degrade_reason) を返す。reason は tool result に生値のまま載せ、各ループが `_degrade_result_node()` で思考ノードへ変換する。
             # `k_ceiling=MAX_HITS_ABS_MAX`（grep と共通の絶対上限）で es_index 側の env 由来の再クランプを迂回する
             # `mode`: hybrid（既定）／keyword（語の一致だけ）／vector（意味の近さだけ）。不正値は hybrid。実際に使った方式を `mode_used` で返す
@@ -1003,26 +1143,34 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 mode = "hybrid"
             mode_used = mode
             es_hits, degrade_reason = [], None
-            if mode == "vector":
-                es_hits, degrade_reason = es_index.search_knn_only(world, q, scope_paths=sp, k=used_max_hits,
-                                                                   layer=layer, k_ceiling=MAX_HITS_ABS_MAX)
+            # `exact`（識別子の完全一致）。`query` が無ければ完全一致だけで引き（本文検索を使わない）、あれば完全一致で絞ってから本文で順位付けする
+            exact = es_index.normalize_exact(args.get("exact"))
+            exact_kw = {"exact": exact} if exact else {}
+            if exact and not q.strip():
+                mode_used = "keyword"
+                es_hits, degrade_reason = es_index.search_exact(world, exact, scope_paths=sp_es, k=used_max_hits,
+                                                                layer=layer, k_ceiling=MAX_HITS_ABS_MAX)
+            elif mode == "vector":
+                es_hits, degrade_reason = es_index.search_knn_only(world, q, scope_paths=sp_es, k=used_max_hits,
+                                                                   layer=layer, k_ceiling=MAX_HITS_ABS_MAX, **exact_kw)
                 if degrade_reason in _ES_VECTOR_FALLBACK_REASONS:
                     # ベクトルが使えない理由のときだけ語の一致（BM25）へ倒し、理由を返す（黙って変えない）。ES クエリ自体の失敗・拒否は倒さず、理由付きの空でそのまま返す
                     reason, mode_used = degrade_reason, "keyword"
-                    es_hits, bm25_reason = es_index.search(world, q, scope_paths=sp, k=used_max_hits, layer=layer,
-                                                           vector=False, k_ceiling=MAX_HITS_ABS_MAX)
+                    es_hits, bm25_reason = es_index.search(world, q, scope_paths=sp_es, k=used_max_hits, layer=layer,
+                                                           vector=False, k_ceiling=MAX_HITS_ABS_MAX, **exact_kw)
                     degrade_reason = bm25_reason or reason
             elif mode == "keyword":
-                es_hits, degrade_reason = es_index.search(world, q, scope_paths=sp, k=used_max_hits, layer=layer,
-                                                          vector=False, k_ceiling=MAX_HITS_ABS_MAX)
+                es_hits, degrade_reason = es_index.search(world, q, scope_paths=sp_es, k=used_max_hits, layer=layer,
+                                                          vector=False, k_ceiling=MAX_HITS_ABS_MAX, **exact_kw)
             else:
-                es_hits, degrade_reason = es_index.search(world, q, scope_paths=sp,
+                es_hits, degrade_reason = es_index.search(world, q, scope_paths=sp_es,
                                                           k=used_max_hits, layer=layer,
-                                                          k_ceiling=MAX_HITS_ABS_MAX)
+                                                          k_ceiling=MAX_HITS_ABS_MAX, **exact_kw)
                 if degrade_reason in _ES_VECTOR_FALLBACK_REASONS:
                     mode_used = "keyword"
             # 上限到達は実在チェック・秘匿名除外の前（生ヒット数）で判定する
             cap_reached = len(es_hits) >= used_max_hits
+            valid = documents.existing_rels(world, [h.get("doc_id") for h in es_hits], deadline=deadline)
             # 秘匿名文書（秘匿判定の導入前に索引化されたヒット）はここで一律に弾き、件数（`count`／`docs`）にも含めない（`_safe_doc_path` の秘匿ガードは es_search を通らないため）
             valid_es_hits = []
             hit_ranks = []  # valid_es_hits と同じ並びの、除外前の並びでの順位
@@ -1155,6 +1303,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                     view["next_offset"] = offset + used_max_hits
             if name == "es_search":
                 view["mode_used"] = mode_used
+                if layer != "docs":  # 層が code を含む。ソースは ES に入っていないので、探し方を案内する（エラーにはしない）
+                    view["notice"] = _ES_NO_SOURCE_NOTICE
             if degrade_reason:  # es_search のみ・BM25 継続時の縮退理由
                 view["degrade_reason"] = degrade_reason
             if truncated_docs:  # ripgrep_search のみ・打切りで探せていない文書
@@ -1194,7 +1344,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         if layer == "docs":
             return ({"error": graph_tools.LAYER_REJECT_MESSAGE}, docs, cites, cards)
         try:
-            result = graph_tools.run(name, args, world, sp, layer=layer)
+            result = graph_tools.run(name, args, world, sp, layer=layer, max_bytes=tr_max_bytes)
         except GraphSchemaEraError as e:
             return ({"error": GRAPH_REINGEST_ERROR_CODE, "world": e.world, "stored_era": e.stored_era},
                     docs, cites, cards)
@@ -1354,22 +1504,46 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         # 1 回のページ幅は read_around と同じ「200 行フロア」（`max(200, window_cap or READ_WINDOW)`）
         page = max(200, window_cap or READ_WINDOW)
         # `total_lines` の申告には全行数のカウントが要るが、行の内容はページ窓（`[start-1, target_end)`）の外なら保持しない
+        # ① 総行数が派生側のキャッシュ（ファイルの状態が一致するもの）にあれば、ページの終端までだけ読む ② 無ければ末尾まで読んで数え、結果を保存する
         target_end = start - 1 + page
         window_lines: list[str] = []
         total = 0
         key_tracker = redact_keys.KeyBlockRedactor(_redact_plain)  # 窓より前の行を辿って鍵ブロックの内側かを確定する
+        read_params = f"{_READ_AROUND_FILE_CAP_BYTES}:{_READ_LINE_MAX_BYTES}"
+        file_st = saved = None
+        try:
+            file_st = os.fstat(f.fileno())
+            saved = search_cache.read_meta_get(world, file_st, read_params)
+        except OSError:
+            file_st = saved = None
+        if saved is not None:
+            text_encoding.seed_cache(file_st, tuple(saved["quality"]))
+        quality = None
         try:
             reader, it, encoding_caution = _stream_doc_lines(f)
+            if file_st is not None and saved is None:
+                quality = text_encoding.detect_fd_quality(f.fileno())
             for idx, t in enumerate(it):
                 if start - 1 <= idx < target_end:
                     window_lines.append(t)
                 elif idx < start - 1:
                     key_tracker.track(t)
                 total += 1
+                if saved is not None and idx + 1 >= target_end:
+                    break
+            after_st = os.fstat(f.fileno()) if quality is not None else None
         finally:
             f.close()
         window_lines = redact_keys.redact_window_lines(window_lines, _redact_plain, key_tracker.in_key_block)
-        file_truncated = reader.truncated or reader.line_overflowed
+        if saved is not None:
+            total = saved["total"]
+            file_truncated = saved["file_truncated"]
+        else:
+            file_truncated = reader.truncated or reader.line_overflowed
+            if quality is not None and search_cache.stat_key(after_st) == search_cache.stat_key(file_st):
+                search_cache.read_meta_put(world, file_st, read_params,
+                                           {"total": total, "file_truncated": bool(file_truncated),
+                                            "quality": list(quality)})
         if total and start > total:
             return ({"error": f"range 外です（start_line={start}・全{total}行）",
                     "error_code": _READ_INVALID_ARGS_ERROR_CODE}, docs, cites, cards)
@@ -1467,14 +1641,14 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             if src:
                 docs.add(src)
         return (result, docs, cites, cards)
-    if name in ("xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"):
+    if name in ("xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "pdf_page_image"):
         # 原本読取ツール（`doc_readers.py`）: Office／PDF は常に docs 側扱い。探す対象（層）がソースに限定されたターンでは使わせない（file_head は別分岐で `_safe_original_path` の layer 引数を通す）
         if layer == "code":
             return ({"error": "探す対象がソースに限定されています"}, docs, cites, cards)
         doc_id = str(args.get("doc_id") or "")
         kinds = {"xlsx_sheets": _XLSX_KINDS, "xlsx_range": _XLSX_KINDS,
                  "docx_paragraphs": _DOCX_KINDS, "pptx_slides": _PPTX_KINDS,
-                 "pdf_pages": _PDF_KINDS}[name]
+                 "pdf_pages": _PDF_KINDS, "pdf_page_image": _PDF_KINDS}[name]
         resolved = _safe_original_path(world, doc_id, sp, kinds=kinds)
         if resolved is None:
             return ({"error": "doc_id が無効、または読み取り対象外です"}, docs, cites, cards)
@@ -1482,6 +1656,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         f, open_err = _open_verified_original(_root, _resolved_doc_id, st)  # TOCTOU 再検証
         if open_err is not None:
             return (open_err, docs, cites, cards)
+        if name == "pdf_page_image":
+            result = _render_pdf_page_image(f, world, _resolved_doc_id, args)
+            if not result.get("error"):
+                docs.add(doc_id)
+            return (result, docs, cites, cards)
         from ... import doc_readers
         if name == "xlsx_sheets":
             result = doc_readers.xlsx_sheets(f)
@@ -1518,11 +1697,14 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             kwargs = {"clean": _redact}
             if args.get("pages"):
                 kwargs["pages"] = str(args["pages"])
+            if args.get("text_offset") is not None:
+                kwargs["text_offset"] = args["text_offset"]
             result = doc_readers.pdf_pages(f, **kwargs)
         result = _redact_deep(result)
         if not (isinstance(result, dict) and result.get("error")):
-            docs.add(doc_id)  # 成功時だけ出典（sources）に載せる
             result = _finish_reader_result(name, result, doc_id, tr_max_bytes)
+            if not result.get("error"):
+                docs.add(doc_id)  # 成功時だけ出典（sources）に載せる
         return (result, docs, cites, cards)
     if name == "file_head":
         doc_id = str(args.get("doc_id") or "")

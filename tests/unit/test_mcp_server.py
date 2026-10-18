@@ -357,7 +357,7 @@ def test_tools_list_by_layer(monkeypatch, layer):
     # 影響の道具（構造の辺だけ）は資料のみの層でだけ外す＝ソース限定でも出す
     assert ({"graph_resolve", "graph_impact"} <= names) is (layer != "docs")
     assert not (layer == "docs" and {"graph_resolve", "graph_impact"} & names)
-    office = {"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"}
+    office = {"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "pdf_page_image"}
     assert (office <= names) is (layer != "code")
     assert not (layer == "code" and office & names)
 
@@ -477,7 +477,7 @@ def test_tools_call_graph_impact_and_resolve_stubbed(tmp_path, monkeypatch):
     monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
     seen = []
 
-    def fake_run(name, args, world, sp, layer=None):
+    def fake_run(name, args, world, sp, layer=None, **kw):
         seen.append((name, layer))
         if name == "graph_resolve":
             return {"candidates": [{"canonical_id": "c1", "name": "A"}], "count": 1,

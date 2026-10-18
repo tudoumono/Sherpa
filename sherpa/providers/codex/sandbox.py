@@ -97,11 +97,11 @@ def _codex_worker_model(system_settings: dict | None = None, *, main_model: str 
 def _write_codex_agent_role_configs(codex_home: Path, *, worker_model: str, worker_reasoning: str,
                                     evaluator_model: str, evaluator_reasoning: str,
                                     provider_lines: list | None = None) -> tuple[str, str]:
-    """`[agents.worker]`/`[agents.evaluator]` の `config_file` 実体（モデル・推論レベルだけの最小 TOML）を `codex_home/agents/` 配下に書く。戻り値は (worker の絶対パス, evaluator の絶対パス)。
+    """`[agents.worker]`/`[agents.evaluator]` の `config_file` 実体（モデル・推論レベルだけの最小 TOML）を `codex_home/agent-roles/` 配下に書く。戻り値は (worker の絶対パス, evaluator の絶対パス)。
     `codex_home` は `":root" = "deny"` の外側＝model-shell から不可視。
     `provider_lines`（省略可）: 親 config.toml と同じ `model_provider` 行。子 Codex が既定の `openai` provider へ出て資料本文が意図しない宛先へ渡らないよう、Azure/custom/Ollama 構成では必ず渡す。
     """
-    d = codex_home / "agents"
+    d = codex_home / "agent-roles"
     d.mkdir(parents=True, exist_ok=True)
     worker_path = d / "worker.toml"
     evaluator_path = d / "evaluator.toml"
@@ -117,6 +117,19 @@ def _write_codex_agent_role_configs(codex_home: Path, *, worker_model: str, work
         f'model = {_toml_str(evaluator_model)}\n'
         f'model_reasoning_effort = {_toml_str(evaluator_reasoning)}\n' + _evaluator_role + _provider_block,
         encoding="utf-8")
+    try:
+        legacy_fd = os.open(codex_home / "agents", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        pass
+    else:
+        try:
+            for name in ("worker.toml", "evaluator.toml"):
+                try:
+                    os.unlink(name, dir_fd=legacy_fd)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(legacy_fd)
     return str(worker_path), str(evaluator_path)
 
 
@@ -398,6 +411,15 @@ def _detect_chrome_path() -> str | None:
     return str(latest) if latest else None
 
 
+# Codex の機能のうち、資料を Sherpa の外のサービス・画面へ渡せるもの。常に無効にする（ターンの設定・-c の両経路）。
+EXTERNAL_FEATURES_OFF = ("apps", "plugins", "browser_use", "browser_use_external", "computer_use", "in_app_browser")
+
+
+def external_features_c_args() -> list:
+    """`EXTERNAL_FEATURES_OFF` を `-c features.X=false` の argv にする（config.toml を書かない経路用）。"""
+    return [a for f in EXTERNAL_FEATURES_OFF for a in ("-c", f"features.{f}=false")]
+
+
 # ---- web_search は既定 OFF。管理者が管理画面（system_settings.web_search_allowed）で許可した場合のみ、チャットごとの希望を尊重する。----
 def _web_search_admin_allowed(system_settings: dict | None = None) -> bool:
     """管理者フラグ `system_settings.web_search_allowed`（既定 false）。DB 不達は安全側 `False`。`system_settings`（省略可）は呼び出し側のスナップショットをそのまま使う。"""
@@ -614,6 +636,7 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
             api_version=_llm.openai_api_version(system_settings) or None,
             auth_header=_llm.openai_auth_header_style(system_settings))
         lines += _role_provider_lines
+    lines += ['', '[features]'] + [f'{f} = false' for f in EXTERNAL_FEATURES_OFF]
     lines += [
         '',
         '[permissions.sherpa-authoring]',

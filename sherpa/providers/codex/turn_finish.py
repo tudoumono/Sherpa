@@ -12,7 +12,7 @@ from ...store.investigation_records import trim_calls, trim_record
 from ... import layer as layer_mod
 from ...answer_shape import NO_TOOL_USE_NOTICE, STOPPED_EARLY_NOTICE, STOPPED_NOTICE, add_notice, seal, set_body
 from ..base import _evidence_gate_note, _log, _node, _verified_sources
-from .citations import parse_referenced_doc_lines, resolve_referenced_docs
+from .citations import parse_referenced_doc_lines, resolve_referenced_docs, resolve_referenced_docs_detail
 from .call_log import call_record_sections, call_stats, finalize_call_log, found_docs_for_answer, referenced_docs_for_answer
 from .codex_cli import apply_codex_usage, log_turn_end
 from .ledger_gate import _format_unconfirmed_items_section, _retire_investigation_ledger, _scope_no_source_notice, _unconfirmed_items_list
@@ -21,6 +21,7 @@ from .continuation import _pick_codex_headline
 from .impact_list import REASON_NO_RECORD, build_impact_list
 from .process import _CONTEXT_WINDOW_EXCEEDED_CODE, _masked_run_dir_path, _read_last_message_fallback
 from .sandbox import _detect_chrome_path, _marp_bin
+from . import plan_ledger
 from .structured import _DEMOTED_CLAIMS_NOTE, _INVALID_CLAIMS_NOTE, split_review_preamble, _apply_codex_evidence_gate, _claims_vs_ledger, verify_reconciliation
 from .turn_candidates import _continuation_pending, _pick_structured_claims, _pick_structured_claims_invalid, _pick_structured_headline, _pick_structured_reconciliation
 from .turn_consts import (_CREATED_FILES_FAILURE_NOTE, _MARP_FAILURE_NOTE, _MCP_SIDECAR_NAME, _SKILLS_BASE,
@@ -94,6 +95,7 @@ def close_session(self, ctx, st, decision, env):
             _discarded_for_question = 0
         if _discarded_for_question:
             codex_question["discarded_files"] = _discarded_for_question
+        plan_ledger.finish_report(st, ctx, env)
         yield codex_question
         return True
     # 調査台帳（回答 envelope への記録）: 本文・path は含めず、id 一覧は先頭50件に打ち切る。ゲートが1度も走らなかった（`_investigation_dir` が未確定＝早期 return 済み）ターンには載せない。
@@ -185,6 +187,8 @@ def close_session(self, ctx, st, decision, env):
                 "complete": False, "manifest": None, "items": {}, "coverage": {}, "reviews": [],
                 "coverage_detail": {}, "extras": _extras,
             }
+    if st._ledger_style != "json" and st._investigation_dir is not None:
+        env["investigation"] = {**(env.get("investigation") or {}), **plan_ledger.turn_report(st)}
     _call_stats = call_stats(st)
     if _call_stats is not None:
         env["call_stats"] = _call_stats  # 道具ごとの累計（利用統計の材料・中身は持たない）
@@ -193,6 +197,8 @@ def close_session(self, ctx, st, decision, env):
     # `_schema_on` は構造化 message から見出しを選ぶ（生 JSON をそのまま出さない・平文ヒューリスティックへは戻さない）。無効時は現行どおりの選び方（下記）。
     if _schema_on:
         st.answer = _pick_structured_headline(st)
+        st._adopted_answer = st.answer
+        plan_ledger.compose_turn_answer(st)
     else:
         # 集めた agent_message から結論を優先して headline を選ぶ（進行中の作業宣言を見出しにしない・最後の1件を鵜呑みにしない）。
         _picked = _pick_codex_headline(_agent_msgs, st._agent_partial,
@@ -203,6 +209,8 @@ def close_session(self, ctx, st, decision, env):
             st.answer = _read_last_message_fallback(_last_message_path, st._answer_notices, st._attempt_no) or _picked
         else:
             st.answer = _picked or _read_last_message_fallback(_last_message_path, st._answer_notices, st._attempt_no)
+        st._adopted_answer = st.answer
+    st._composed_answer = st.answer
     if st.answer:
         st.answer, _preamble = split_review_preamble(st.answer)
         if _preamble:
@@ -418,14 +426,16 @@ def assemble_result(self, ctx, st, decision, env):
                 _ref_seen.add(_r)
                 _ref_candidates.append(_r)
         # `xlsx_sheets`（シート一覧のみ）の doc_id も参照候補（sources）には合流させる。ただし「参照した資料:」にも書かれておらず本文精読ツール（`_mcp_read_docs`）でも読まれていない doc_id は、根拠ゲート（sources_verified）に数えない。参照ブロック＋本文精読ツールだけで確定する「精読済み」集合を先に確定させ、`xlsx_sheets` を足した後の verified との差分（`_listed_only_ids`）として区別する。
-        _verified_listed, _unverified_refs, _sensitive_refs = resolve_referenced_docs(
-            _ref_candidates, ctx.world, sp)
+        _ref_layer = layer_mod.effective_layer(ctx.scope_meta, decision["lens"])
+        _ref_detail = resolve_referenced_docs_detail(_ref_candidates, ctx.world, sp, _ref_layer)
+        _verified_listed, _unverified_refs, _sensitive_refs = (
+            _ref_detail["verified"], _ref_detail["unverified"], _ref_detail["hidden"])
         _verified_before_listed = set(_verified_listed)
         for _r in _mcp_listed_docs:
             if _r and _r not in _ref_seen:
                 _ref_seen.add(_r)
                 _ref_candidates.append(_r)
-        _verified_refs = resolve_referenced_docs(_ref_candidates, ctx.world, sp)[0]
+        _verified_refs = resolve_referenced_docs(_ref_candidates, ctx.world, sp, _ref_layer)[0]
         _listed_only_ids = set(_verified_refs) - _verified_before_listed
         if _verified_refs and ctx.make_sources:
             _ref_sources, _ = _verified_sources(ctx.make_sources, set(_verified_refs), ctx.world, sp)
@@ -438,6 +448,8 @@ def assemble_result(self, ctx, st, decision, env):
             # 実際に開いて根拠にした資料＝API 経路の「精読済み」と同じ意味＝出典の 2 区分（根拠／参考）に載せる。`xlsx_sheets` だけで到達した doc_id（`_listed_only_ids`）は除く。
             env["sources_verified"] = sorted(_ref_ids - _listed_only_ids)
         env["codex_referenced_docs"] = {"listed": len(_ref_candidates), "verified": len(_verified_refs)}
+        if _ref_detail["mappings"]:  # 参照行の対応付け（入力・資料 ID・分類）。評価で分類ごとに数える
+            env["codex_reference_resolution"] = _ref_detail["mappings"][:_SOURCES_UNVERIFIED_MAX * 5]
         # 新しい形の「参照した資料」（資料ごとの開いた行の範囲）。資料参照がオンの作成以外のターンだけ・0 件でも欄を入れる。
         if ctx.make_sources and decision["lens"] != "author":
             _ref_rows, _ref_more = referenced_docs_for_answer(st, _verified_refs)
@@ -477,14 +489,16 @@ def assemble_result(self, ctx, st, decision, env):
                     layer=layer_mod.effective_layer(ctx.scope_meta, decision["lens"]),
                     personal_facts=ctx.personal_facts)
                 # 台帳突合（claims は台帳からの投影）は根拠種別ゲートの後に適用する（両方の格下げが独立に効く）。
-                _claims, _claims_ledger_check = _claims_vs_ledger(
-                    _claims,
-                    investigation_ledger.load_ledger(st._investigation_dir)
-                    if st._investigation_dir is not None
-                    else investigation_ledger.LedgerSnapshot(manifest=None, items={}, invalid_ids=()),
-                    manifest_file_exists=(
-                        (st._investigation_dir / "manifest.json").is_file()
-                        if st._investigation_dir is not None else False))
+                _claims_ledger_check = {}
+                if st._ledger_style == "json":
+                    _claims, _claims_ledger_check = _claims_vs_ledger(
+                        _claims,
+                        investigation_ledger.load_ledger(st._investigation_dir)
+                        if st._investigation_dir is not None
+                        else investigation_ledger.LedgerSnapshot(manifest=None, items={}, invalid_ids=()),
+                        manifest_file_exists=(
+                            (st._investigation_dir / "manifest.json").is_file()
+                            if st._investigation_dir is not None else False))
                 env.setdefault("data", {})["claims"] = _claims
                 env["data"]["evidence_gate"] = _gate_meta
                 if _claims_invalid:
@@ -624,6 +638,7 @@ def assemble_result(self, ctx, st, decision, env):
         _log.warning("impact list build failed: %s", type(exc).__name__)
     if _impact_list is not None:
         env["impact_list"] = _impact_list
+    plan_ledger.finish_report(st, ctx, env)
     _finish_partial_status(ctx, st, env)
     yield {"type": "answer_delta", "text": env["headline"]}  # Codex は一括→フロントで段階表示
     yield {"type": "_result", "env": env, "decision": decision,

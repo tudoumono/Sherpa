@@ -88,7 +88,7 @@ def test_index_world_progress_callback():
     assert total >= r["indexed"]                            # total は対象一覧の長さ（スキップ分を含みうる）
     dones = [d for d, _ in calls]
     assert dones == sorted(dones)                           # 単調非減少
-    assert dones[-1] == r["indexed"]                         # 最終呼び出しは実際に索引した件数と一致
+    assert dones[-1] == total >= r["indexed"]                # 最終呼び出しは対象一覧の長さ（ソースなど索引に入れない文書も 1 件に数える）
 
 
 def test_vector_hybrid_stubbed():

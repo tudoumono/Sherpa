@@ -60,7 +60,7 @@ def _config_text(tmp_path, **kw) -> str:
 
 
 def _role_toml(tmp_path, role: str) -> str:
-    return (tmp_path / "ch" / "agents" / f"{role}.toml").read_text(encoding="utf-8")
+    return (tmp_path / "ch" / "agent-roles" / f"{role}.toml").read_text(encoding="utf-8")
 
 
 def _loads_toml(txt: str) -> None:

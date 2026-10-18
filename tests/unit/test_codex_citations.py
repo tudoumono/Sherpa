@@ -80,6 +80,11 @@ def test_parse_numbered_and_backtick_and_multi_split_and_paren_annotation():
     ]
 
 
+def test_parse_line_suffix_is_offered_as_a_path_candidate():
+    _, refs = _parse_flat("x\n参照した資料:\n- src/a.py:696-701, 884-885\n- src/b.py:12")
+    assert "src/a.py" in refs and "src/b.py" in refs
+
+
 def test_parse_dedupes_preserving_first_occurrence_order():
     answer = (
         "本文。\n\n"
@@ -399,3 +404,112 @@ def test_unverified_references_list_only_plain_document_paths_others_are_counted
     verified, rows, hidden = C.resolve_referenced_docs(refs, "v1")
     assert verified == [] and rows == [{"path": "存在しない.md", "reason": C.REASON_UNREADABLE}]
     assert hidden == 3
+
+
+# ===== ファイル名だけの参照の対応付け =====
+
+
+@pytest.fixture
+def _name_world(monkeypatch, tmp_path):
+    """実ファイルの資料フォルダ（架空の名前）。範囲内外・同名・秘匿・行数の異なる資料を置く。"""
+    from sherpa import worlds
+    root = tmp_path / "world"
+    files = {
+        "設計/帳票/ledger_a.md": "a\nb\nc\n",
+        "設計/共通/dup_name.md": "x\n",
+        "設計/共通2/dup_name.md": "y\n",
+        "設計/mix_name.md": "in\n",
+        "外/mix_name.md": "out\n",
+        "外/only_outside.md": "out\n",
+        "外/dup_out.md": "1\n",
+        "外/dup_out2/dup_out.md": "2\n",
+        "設計/src/prog_one.cbl": "line1\nline2\nline3\n",
+    }
+    for rel, body in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+    (root / "設計" / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    monkeypatch.setattr(worlds, "world_dir", lambda w: root)
+    return root
+
+
+def _detail(lines, scope=("設計",), layer=None):
+    return C.resolve_referenced_docs_detail([[[x] for x in ln] for ln in lines], "w", list(scope) if scope else None, layer)
+
+
+def _classes(d):
+    return [m["class"] for m in d["mappings"]]
+
+
+def test_bare_name_unique_in_scope_is_normalized_and_verified(_name_world):
+    d = _detail([["ledger_a.md"]])
+    assert d["verified"] == ["設計/帳票/ledger_a.md"] and d["unverified"] == []
+    assert d["mappings"] == [{"input": "ledger_a.md", "doc_id": "設計/帳票/ledger_a.md", "class": C.RES_UNIQUE}]
+
+
+def test_bare_name_duplicated_in_scope_is_ambiguous_and_not_picked(_name_world):
+    d = _detail([["dup_name.md"]])
+    assert d["verified"] == [] and d["unverified"] == [{"path": "dup_name.md", "reason": C.REASON_AMBIGUOUS}]
+    assert _classes(d) == [C.RES_AMBIGUOUS] and d["mappings"][0]["doc_id"] is None
+
+
+def test_bare_name_missing_is_not_found(_name_world):
+    d = _detail([["no_such.md"]])
+    assert d["unverified"] == [{"path": "no_such.md", "reason": C.REASON_UNREADABLE}] and _classes(d) == [C.RES_NOT_FOUND]
+
+
+def test_bare_name_only_outside_scope_is_reported_as_not_found_without_leaking(_name_world):
+    d = _detail([["only_outside.md"], ["dup_out.md"]])
+    assert d["verified"] == []
+    assert [r["reason"] for r in d["unverified"]] == [C.REASON_UNREADABLE, C.REASON_UNREADABLE]
+    assert C.REASON_OUT_OF_SCOPE not in str(d) and "外/" not in str(d) and "dup_out2" not in str(d)
+    assert _classes(d) == [C.RES_NOT_FOUND, C.RES_NOT_FOUND]
+
+
+def test_bare_name_in_and_outside_scope_resolves_to_the_inside_one(_name_world):
+    d = _detail([["mix_name.md"]])
+    assert d["verified"] == ["設計/mix_name.md"] and _classes(d) == [C.RES_UNIQUE]
+
+
+def test_bare_name_with_no_scope_searches_the_whole_world(_name_world):
+    d = _detail([["only_outside.md"], ["mix_name.md"]], scope=None)
+    assert d["verified"] == ["外/only_outside.md"] and _classes(d) == [C.RES_UNIQUE, C.RES_AMBIGUOUS]
+
+
+def test_bare_name_sensitive_stays_hidden(_name_world):
+    d = _detail([[".env"]])
+    assert d["verified"] == [] and d["unverified"] == [] and d["hidden"] == 1
+    assert d["mappings"] == [{"input": "", "doc_id": None, "class": C.RES_HIDDEN}]
+
+
+def test_bare_name_respects_layer(_name_world):
+    assert _detail([["prog_one.cbl"]], layer="docs")["verified"] == []
+    assert _detail([["prog_one.cbl"]], layer="code")["verified"] == ["設計/src/prog_one.cbl"]
+
+
+def test_full_path_reference_is_unchanged_and_out_of_scope_path_keeps_its_reason(_name_world):
+    d = _detail([["設計/帳票/ledger_a.md"], ["外/only_outside.md"]])
+    assert d["verified"] == ["設計/帳票/ledger_a.md"]
+    assert d["unverified"] == [{"path": "外/only_outside.md", "reason": C.REASON_OUT_OF_SCOPE}]
+    assert _classes(d) == [C.RES_DIRECT, C.RES_OUT_OF_SCOPE]
+
+
+def test_line_beyond_file_length_keeps_doc_verified_but_marks_position(_name_world):
+    _, lines = C.parse_referenced_doc_lines(
+        "x\n\n参照した資料:\n- 設計/src/prog_one.cbl:2\n- prog_one.cbl:99\n- 設計/src/prog_one.cbl:99")
+    d = C.resolve_referenced_docs_detail(lines, "w", ["設計"])
+    assert d["verified"] == ["設計/src/prog_one.cbl"] and d["unverified"] == []
+    assert _classes(d) == [C.RES_DIRECT, C.RES_POSITION_UNVERIFIED, C.RES_POSITION_UNVERIFIED]
+
+
+def test_broken_lines_are_hidden_and_do_not_resolve(_name_world):
+    d = _detail([["これは文章です"], ["../外/only_outside.md"]])
+    assert d["verified"] == [] and d["unverified"] == [] and d["hidden"] == 2
+
+
+def test_parsed_answer_line_with_bare_name_resolves_end_to_end(_name_world):
+    _, lines = C.parse_referenced_doc_lines("結論。\n\n参照した資料:\n- ledger_a.md:3\n- dup_name.md")
+    verified, rows, hidden = C.resolve_referenced_docs(lines, "w", ["設計"])
+    assert verified == ["設計/帳票/ledger_a.md"] and rows == [{"path": "dup_name.md", "reason": C.REASON_AMBIGUOUS}]
+    assert hidden == 0

@@ -28,7 +28,7 @@ SERVER_INFO = {"name": "sherpa", "version": "0.1.0"}
 
 # 読取系ツールの分類。`providers/codex/provider.py` の出典収集がこのタプルを import して使う。`LISTED_DOC_TOOLS`（シート一覧のみ）は sources_verified に数えない。
 READ_DOC_TOOLS = ("read_doc", "read_around", "doc_outline",
-                  "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head")
+                  "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "pdf_page_image", "file_head")
 LISTED_DOC_TOOLS = ("xlsx_sheets",)
 COMPARE_DOC_ID_ARGS = ("left_doc_id", "right_doc_id", "source_doc_id")
 
@@ -196,8 +196,9 @@ def _run_ledger_tool(name: str, args: dict) -> dict:
 
 
 def _toolset() -> str:
-    """MCP が公開するツールの絞り込み（`SHERPA_MCP_TOOLSET`）。`"plain"` だけを特別扱いし、それ以外（未設定・`"full"`・想定外の値）はフル公開に倒す。"""
-    return "plain" if os.environ.get("SHERPA_MCP_TOOLSET", "").strip().lower() == "plain" else "full"
+    """MCP が公開するツールの絞り込み（`SHERPA_MCP_TOOLSET`）。`"plain"` は最小構成、`"plan"` はJSON台帳の道具を除いた構成。それ以外はフル公開。"""
+    v = os.environ.get("SHERPA_MCP_TOOLSET", "").strip().lower()
+    return v if v in ("plain", "plan") else "full"
 
 
 # plain で公開するグラフの説明。standard 用の説明は plain で公開しないツールの使用を指示するため使わない。es_search は plain では出さない。
@@ -215,6 +216,13 @@ _DESC_GRAPH_PLAIN = (
 _PARAMS_GRAPH_PLAIN = {**agentic_search._PARAMS_GRAPH,
                       "properties": {k: v for k, v in agentic_search._PARAMS_GRAPH["properties"].items()
                                      if k != "item"}}
+
+
+def _without_item_param(d: dict) -> dict:
+    """評価用の計画書方式（`SHERPA_MCP_TOOLSET=plan`）では台帳が無いため、道具の定義から台帳の項目 id の引数と説明を外す。"""
+    props = {k: v for k, v in (d.get("inputSchema") or {}).get("properties", {}).items() if k != "item"}
+    desc = (d.get("description") or "").replace(agentic_search._ITEM_PARAM_NOTE, "")
+    return {**d, "description": desc, "inputSchema": {**d["inputSchema"], "properties": props}}
 
 
 def _tool_defs() -> list:
@@ -267,6 +275,8 @@ def _tool_defs() -> list:
                      "inputSchema": agentic_search._PARAMS_PPTX_SLIDES})
         defs.append({"name": "pdf_pages", "description": agentic_search._DESC_PDF_PAGES,
                      "inputSchema": agentic_search._PARAMS_PDF_PAGES})
+        defs.append({"name": "pdf_page_image", "description": agentic_search._DESC_PDF_PAGE_IMAGE,
+                     "inputSchema": agentic_search._PARAMS_PDF_PAGE_IMAGE})
     if _layer() in (None, "both"):
         defs.append({"name": "graph_neighbors", "description": agentic_search._DESC_GRAPH,
                      "inputSchema": agentic_search._PARAMS_GRAPH})
@@ -285,6 +295,8 @@ def _tool_defs() -> list:
         _idx = next(i for i, d in enumerate(defs) if d["name"] == "ripgrep_search") + 1
         defs.insert(_idx, {"name": "es_search", "description": agentic_search._DESC_ES,
                            "inputSchema": agentic_search._PARAMS_ES_SEARCH})
+    if _toolset() == "plan":
+        return [_without_item_param(d) for d in defs]
     return defs + _ledger_tool_defs()
 
 
@@ -386,11 +398,11 @@ def _sidecar_error_code(name, result) -> None:
 _ITEM_PARAM_TOOLS = frozenset({
     "ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors",
     "graph_resolve", "graph_impact", "doc_outline", "compare_documents", "xlsx_sheets", "xlsx_range",
-    "docx_paragraphs", "pptx_slides", "pdf_pages", "list_docs", "glob_search", "folder_tree"})
+    "docx_paragraphs", "pptx_slides", "pdf_pages", "pdf_page_image", "list_docs", "glob_search", "folder_tree"})
 _ITEM_HITS_TOOLS = frozenset({"ripgrep_search", "es_search"})  # `hits` 配列を持つ形
 # 単一文書読取の形（原本の Office／PDF の読み取り・見出し・比較を含む）。
 _ITEM_READ_TOOLS = frozenset({"read_doc", "read_around", "file_head", "doc_outline", "compare_documents",
-                              "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"})
+                              "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "pdf_page_image"})
 _ITEM_LIST_TOOLS = frozenset({"list_docs", "glob_search", "folder_tree"})  # 一覧の形（打ち切りだけを区分にする）
 # 単一文書読取の error は「その doc_id を読めなかった」とみなす。検索・グラフ系の error は、`error_code` が既知の「読めない」系コードのときだけ unreadable にする。
 _ITEM_UNREADABLE_ERROR_CODES = frozenset({"read_io_failed"})
@@ -508,6 +520,8 @@ def _coverage_detail(name: str, args) -> dict:
             detail["range"] = f"スライド {_s('pages') or '1-10'}"
         elif name == "pdf_pages":
             detail["range"] = f"ページ {_s('pages') or '1-5'}"
+        elif name == "pdf_page_image":
+            detail["range"] = f"ページ {_n('page') or '?'} の画像"
         elif name == "file_head":
             mb = _n("max_bytes")
             detail["range"] = f"先頭 {mb if mb is not None else 65536} バイト"
@@ -571,6 +585,20 @@ def _env_int_override(var_name: str) -> int | None:
     except ValueError:
         return None
     return v if v > 0 else None
+
+
+# 原本読取ツール 5 本。応答 1 件を Codex CLI が中央を落とす上限（約 40,000 バイト）より小さくするため、`SHERPA_MCP_READER_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
+_READER_BUDGET_TOOLS = frozenset({"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"})
+
+
+def _tool_budget_bytes(name: str) -> int | None:
+    """`run_tool` へ渡す 1 件あたりのバイト予算。原本読取ツールだけ `SHERPA_MCP_READER_BUDGET_BYTES` との小さい方（未設定なら全ツール共通の予算）。"""
+    base = _env_int_override("SHERPA_MCP_TOOL_BUDGET_BYTES")
+    if name in _READER_BUDGET_TOOLS:
+        cap = _env_int_override("SHERPA_MCP_READER_BUDGET_BYTES")
+        if cap:
+            return min(base, cap) if base else cap
+    return base
 
 
 def _json_bytes(obj) -> int:
@@ -854,6 +882,9 @@ _DUPLICATE_CALL_CACHE_MAX = 64
 _seen_tool_calls: "OrderedDict[tuple, str | None]" = OrderedDict()
 # ask_user は専用分岐で処理済みのため対象外。`_BUDGET_EXEMPT_TOOLS`（一覧のみの土台系）も対象外。
 _DUPLICATE_CHECK_EXEMPT_TOOLS = frozenset({"ask_user"}) | _BUDGET_EXEMPT_TOOLS
+# 同じ条件の呼び出しを拒否せず、同じ内容を返し直す道具。`graph_impact` はページ単位で取るので、取り直したページが拒否されて失われないようにする
+# （`offset`・`part`・`generation` が違う呼び出しは、キーが違うので元から別の呼び出し）。
+_DUPLICATE_REPLAY_TOOLS = frozenset({"graph_impact", "pdf_page_image"})
 
 
 def _dedup_key(name: str, args) -> tuple | None:
@@ -918,6 +949,10 @@ def _handle_tool_call(rid, params: dict) -> dict:
         err_body = {"error": f"unknown tool: {name}"}
         return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                          "isError": True})
+    if _toolset() == "plan" and name in _LEDGER_TOOLS:
+        err_body = {"error": f"unknown tool: {name}"}
+        return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
+                         "isError": True})
     if name in _LEDGER_TOOLS:
         # 台帳の応答は探索量に計上せず、クリップ・重複拒否・読取サイドカーの対象外にする。
         result = _run_ledger_tool(name, args)
@@ -938,7 +973,8 @@ def _handle_tool_call(rid, params: dict) -> dict:
         else:
             text = _ASK_RESULT_AGAIN
         return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": False})
-    if name not in _DUPLICATE_CHECK_EXEMPT_TOOLS and _is_duplicate_tool_call(name, args):
+    if (name not in _DUPLICATE_CHECK_EXEMPT_TOOLS and _is_duplicate_tool_call(name, args)
+            and name not in _DUPLICATE_REPLAY_TOOLS):
         # 同一条件の再実行は run_tool を呼ばず本文も再送しない。
         _sidecar_append({"kind": "limit", "field": "duplicate_tool_call", "ts": time.time()})
         _record_duplicate_item_coverage(name, args)  # 初回の結果区分をこの item にも転記
@@ -952,7 +988,7 @@ def _handle_tool_call(rid, params: dict) -> dict:
             name, args, _world(), _scope(), layer=_layer(),
             max_hits=_env_int_override("SHERPA_MCP_TOOL_MAX_HITS"),
             window_cap=_env_int_override("SHERPA_MCP_TOOL_WINDOW_CAP"),
-            tool_result_max_bytes=_env_int_override("SHERPA_MCP_TOOL_BUDGET_BYTES"),
+            tool_result_max_bytes=_tool_budget_bytes(name),
             graph_only=(_toolset() == "plain"))
     except GraphSchemaEraError as e:
         # `graph_neighbors` が検知した旧世代グラフは、JSON-RPC のプロトコルエラーにせず通常のツール結果（`isError` あり・`content[].text` に機械可読コード）で返す。`providers/codex/mcp.py::_graph_schema_era_from_item` が `GraphSchemaEraError` を再構成する。

@@ -1613,6 +1613,116 @@
       ]
     },
     {
+      "type": "FLOWS_TO",
+      "src": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-AMOUNT",
+      "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
+      "doc": "4期/03_開発/01_ソース/FEECALC.cbl",
+      "line": 7,
+      "status": "active",
+      "via": "use",
+      "sources": [
+        {
+          "via": "use",
+          "doc_id": "4期/03_開発/01_ソース/FEECALC.cbl",
+          "file": "4期/03_開発/01_ソース/FEECALC.cbl",
+          "line": 7,
+          "rule": "copy_item_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/FEECALC.cbl",
+            "key": null
+          }
+        }
+      ]
+    },
+    {
+      "type": "FLOWS_TO",
+      "src": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE",
+      "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
+      "doc": "4期/03_開発/01_ソース/FEECALC.cbl",
+      "line": 7,
+      "status": "active",
+      "via": "use",
+      "sources": [
+        {
+          "via": "use",
+          "doc_id": "4期/03_開発/01_ソース/FEECALC.cbl",
+          "file": "4期/03_開発/01_ソース/FEECALC.cbl",
+          "line": 7,
+          "rule": "copy_item_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/FEECALC.cbl",
+            "key": null
+          }
+        }
+      ]
+    },
+    {
+      "type": "FLOWS_TO",
+      "src": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-AMOUNT",
+      "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+      "doc": "4期/03_開発/01_ソース/TAXCALC.cbl",
+      "line": 7,
+      "status": "active",
+      "via": "use",
+      "sources": [
+        {
+          "via": "use",
+          "doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl",
+          "file": "4期/03_開発/01_ソース/TAXCALC.cbl",
+          "line": 7,
+          "rule": "copy_item_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/TAXCALC.cbl",
+            "key": null
+          }
+        }
+      ]
+    },
+    {
+      "type": "FLOWS_TO",
+      "src": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE",
+      "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
+      "doc": "4期/03_開発/01_ソース/TAXCALC.cbl",
+      "line": 7,
+      "status": "active",
+      "via": "use",
+      "sources": [
+        {
+          "via": "use",
+          "doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl",
+          "file": "4期/03_開発/01_ソース/TAXCALC.cbl",
+          "line": 7,
+          "rule": "copy_item_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/TAXCALC.cbl",
+            "key": null
+          }
+        }
+      ]
+    },
+    {
+      "type": "FLOWS_TO",
+      "src": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC.CUST-CODE",
+      "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT",
+      "doc": "4期/03_開発/01_ソース/CUSTMNT.cbl",
+      "line": 7,
+      "status": "active",
+      "via": "use",
+      "sources": [
+        {
+          "via": "use",
+          "doc_id": "4期/03_開発/01_ソース/CUSTMNT.cbl",
+          "file": "4期/03_開発/01_ソース/CUSTMNT.cbl",
+          "line": 7,
+          "rule": "copy_item_name",
+          "from_def": {
+            "file": "4期/03_開発/01_ソース/CUSTMNT.cbl",
+            "key": null
+          }
+        }
+      ]
+    },
+    {
       "type": "INVOKES",
       "src": "batch:v1_s3a_regress_test:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",

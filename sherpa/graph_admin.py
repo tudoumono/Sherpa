@@ -9,7 +9,7 @@ import logging
 from .ingest.model import NODE_LABELS
 from .ingest.world_neo4j import (
     WORLD_EDGE_TYPES,
-    _scope_pred,
+    _scope_pred, _flow_edge_pred, _flow_node_path,
     check_schema_era,
 )
 from .preview_service import _TYPE_JA
@@ -92,13 +92,14 @@ def _rows_to_graph(rows: list[dict], world: str, counts: dict | None = None) -> 
             "counts": counts or {"nodes": len(out_nodes), "edges": len(edges)}}
 
 
-def _ret(prefix: str, var: str) -> str:
+def _ret(prefix: str, var: str, *, flow: bool = False) -> str:
+    path = f"CASE WHEN {var}:Dataset THEN {_flow_node_path(var)} ELSE {var}.path END" if flow else f"{var}.path"
     return (
         f"{var}.canonical_id AS {prefix}id, {var}.name AS {prefix}name, "
         f"[l IN labels({var}) WHERE l<>'Entity'][0] AS {prefix}label, "
         f"coalesce({var}.status,'active') AS {prefix}status, {var}.value AS {prefix}value, "
         f"{var}.top_scope AS {prefix}top_scope, {var}.phase AS {prefix}phase, "
-        f"{var}.category AS {prefix}category, {var}.path AS {prefix}path"
+        f"{var}.category AS {prefix}category, {path} AS {prefix}path"
     )
 
 
@@ -117,22 +118,37 @@ def graph_search(session, world: str, relationship_types=None, field: str | None
     params = {"world": world, "prefixes": prefixes, "incl": include_deprecated,
               "cond_value": value or "", "limit": max(1, min(int(limit or 200), 1000))}
 
+    from .ingest import text_kind
+    flow_possible = not rels or "FLOWS_TO" in rels
+    if flow_possible:
+        params.update(s_exact=sorted(text_kind._SENSITIVE_NAME_EXACT), s_pre=list(text_kind._SENSITIVE_NAME_PREFIXES),
+                      s_ext=sorted(text_kind.SENSITIVE_EXT))
+
+    def node_scope(var):
+        return (f"CASE WHEN {var}:Dataset THEN {_flow_node_path(var)} IS NOT NULL "
+                f"ELSE {_scope_pred(var)} END")
+
+    flow_guard = (f"(type(r)<>'FLOWS_TO' OR ({_flow_edge_pred('r')} AND "
+                  f"{_flow_node_path('startNode(r)')} IS NOT NULL AND {_flow_node_path('endNode(r)')} IS NOT NULL))")
     if rels:
         rel_clause = "|".join(sorted(set(rels)))
         cond_a = _condition("a", field, value, op)
         cond_b = _condition("b", field, value, op)
         where = [
             "a.world_id=$world AND b.world_id=$world",
-            _scope_pred("a"), _scope_pred("b"),
+            node_scope("a") if flow_possible else _scope_pred("a"),
+            node_scope("b") if flow_possible else _scope_pred("b"),
             "($incl OR (coalesce(a.status,'active')='active' AND coalesce(b.status,'active')='active' "
             "AND coalesce(r.status,'active')='active'))",
         ]
+        if flow_possible:
+            where.append(flow_guard)
         if cond_a:
             where.append(f"({cond_a} OR {cond_b})")
         cy = (
             f"MATCH (a:Entity)-[r:{rel_clause}]->(b:Entity) "
             "WHERE " + " AND ".join(where) + " "
-            "RETURN " + _ret("source_", "a") + ", " + _ret("target_", "b") + ", "
+            "RETURN " + _ret("source_", "a", flow=flow_possible) + ", " + _ret("target_", "b", flow=flow_possible) + ", "
             "type(r) AS edge_type, "
             "coalesce(r.status,'active') AS edge_status "
             "ORDER BY edge_type, source_name, target_name LIMIT $limit"
@@ -147,13 +163,13 @@ def graph_search(session, world: str, relationship_types=None, field: str | None
     cond_m = _condition("m", field, value, op)
     cy = (
         "MATCH (n:Entity {world_id:$world}) "
-        f"WHERE {_scope_pred('n')} AND {cond_n} "
+        f"WHERE {node_scope('n')} AND {cond_n} "
         "  AND ($incl OR coalesce(n.status,'active')='active') "
         "WITH n LIMIT $limit "
         "OPTIONAL MATCH (n)-[r]-(m:Entity {world_id:$world}) "
-        f"WHERE {_scope_pred('m')} AND {cond_m} "
+        f"WHERE {node_scope('m')} AND {cond_m} AND {flow_guard} "
         "  AND ($incl OR (coalesce(m.status,'active')='active' AND coalesce(r.status,'active')='active')) "
-        "RETURN " + _ret("source_", "n") + ", " + _ret("target_", "m") + ", "
+        "RETURN " + _ret("source_", "n", flow=True) + ", " + _ret("target_", "m", flow=True) + ", "
         "type(r) AS edge_type, "
         "coalesce(r.status,'active') AS edge_status "
         "ORDER BY source_name, edge_type, target_name"

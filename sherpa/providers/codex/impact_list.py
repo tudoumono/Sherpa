@@ -114,7 +114,8 @@ def build_impact_list(st, env: dict, decision) -> dict | None:
     if lens == "author":
         return None
     merged = st.call_log
-    graph = list(merged.graph) if merged is not None else []
+    graph_calls = list(merged.graph) if merged is not None else []
+    graph = tool_call_log.merge_impact_pages(graph_calls)   # ページ送りの結果は 1 つの結果として扱う
     impact = [g for g in graph if g.get("tool") == "graph_impact" and isinstance(g.get("start"), dict)]
     traced = bool(impact)
     if not traced and lens != "impact":
@@ -131,7 +132,7 @@ def build_impact_list(st, env: dict, decision) -> dict | None:
     else:
         called = [r for r in merged.rows if r.get("tool") in tool_call_log.GRAPH_TOOLS]
         parent_n = sum(1 for tools in st._parent_mcp_tools.values() for t in tools if t in tool_call_log.GRAPH_TOOLS)
-        if len(called) > len(graph) or parent_n > len(called):
+        if len(called) > len(graph_calls) or parent_n > len(called):
             add(REASON_RECORD_MISSING)
         if merged.graph_broken or merged.missing:
             add(REASON_RECORD_GAP)

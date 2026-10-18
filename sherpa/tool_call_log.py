@@ -217,10 +217,110 @@ def graph_view(name: str, result) -> dict | None:
     out["count"] = result["count"] if _is_int(result.get("count")) else None
     if isinstance(cov, dict) and isinstance(cov.get("depth"), dict):
         out["depth_truncated"] = cov["depth"].get("truncated")
+    tr = result.get("transfer")
+    if isinstance(tr, dict) and tr.get("part") in ("impact", "flow", "related_documents"):
+        # ページ送りの記録。`rows` はモデルが実際に受け取ったページ、`total` はサーバだけが知る総数（別に残す）
+        out["page"] = {"part": tr["part"], **{k: tr[k] for k in ("offset", "returned", "total", "next_offset")
+                                              if _is_int(tr.get(k)) or (k == "next_offset" and tr.get(k) is None)},
+                       "has_more": tr.get("has_more") is True}
+        gen = result.get("generation")
+        if isinstance(gen, str):
+            out["generation"] = clip(gen, 80)
+        expl = result.get("exploration")
+        if isinstance(expl, dict) and isinstance(expl.get("complete"), bool):
+            out["exploration_complete"] = expl["complete"]
+        cov_depth = cov.get("depth") if isinstance(cov, dict) and isinstance(cov.get("depth"), dict) else {}
+        cov_flow = cov.get("flow") if isinstance(cov, dict) and isinstance(cov.get("flow"), dict) else {}
+        if start is not None:
+            out["qkey"] = f"{start.get('cid', '')}|{cov_depth.get('requested')}|{cov_flow.get('requested')}"
     un = result.get("unresolved")
     if isinstance(un, dict) and isinstance(un.get("items"), list):
         out["unresolved"] = len(un["items"]) + (un["omitted"] if _is_int(un.get("omitted")) and un["omitted"] > 0 else 0)
     return out
+
+
+_TRANSFER_STAGES = ("impact", "flow", "docs")
+
+
+def _is_transfer_limit(lim: dict) -> bool:
+    """続きのページが残るだけの印（`result_cap` の stage が影響先・流れの候補・関連資料）。探索の未完了ではない。"""
+    return lim.get("kind") == "result_cap" and lim.get("stage") in _TRANSFER_STAGES
+
+
+def merge_impact_pages(graph: list) -> list:
+    """`graph_impact` のページ送りの結果を、同じ結果（同じ起点・深さ・流れの段数・世代）ごとに 1 つへ合わせる。
+    ページ情報の無い結果（旧形式・エラー）はそのまま通す。影響先でない一覧（流れの候補・関連資料）のページは入れない。
+    `rows` はモデルが実際に受け取ったページの行の和、`total` はサーバだけが知る総数、`received` は受け取った行数。
+    先頭から総数まで途切れなく受け取れたときだけ `transfer_complete`（続きの印は消える）。世代が変わったら古い世代の分は捨てて取り直した分を使う。"""
+    out: list = []
+    groups: dict = {}
+    for g in graph:
+        page = g.get("page") if isinstance(g, dict) else None
+        if not isinstance(page, dict) or g.get("tool") != "graph_impact" or g.get("error"):
+            out.append(g)
+            continue
+        if page.get("part") != "impact":
+            continue
+        key = g.get("qkey")
+        cur = groups.get(key)
+        if cur is not None and cur["generation"] != g.get("generation"):
+            idx = out.index(cur["entry"])
+            entry = _new_page_group(g)
+            out[idx] = entry
+            groups[key] = {"entry": entry, "generation": g.get("generation"), "spans": [], "ids": set(), "pages": []}
+            cur = groups[key]
+            entry["generation_changes"] = 1 + (entry.get("generation_changes") or 0)
+        elif cur is None:
+            entry = _new_page_group(g)
+            out.append(entry)
+            cur = groups[key] = {"entry": entry, "generation": g.get("generation"), "spans": [], "ids": set(), "pages": []}
+        entry = cur["entry"]
+        for r in g.get("rows") or []:
+            rid = r.get("cid") or (r.get("name"), r.get("path"))
+            if rid not in cur["ids"]:
+                cur["ids"].add(rid)
+                entry["rows"].append(r)
+        off, ret, total = page.get("offset"), page.get("returned"), page.get("total")
+        if _is_int(off) and _is_int(ret):
+            cur["spans"].append((off, off + ret))
+        cur["pages"].append(g)
+        if _is_int(total):
+            entry["total"] = total
+        for k in ("unresolved",):
+            if _is_int(g.get(k)):
+                entry[k] = max(entry.get(k) or 0, g[k])
+    for cur in groups.values():
+        entry = cur["entry"]
+        total = entry.get("total")
+        covered = 0
+        for a, b in sorted(cur["spans"]):
+            if a <= covered:
+                covered = max(covered, b)
+        done = _is_int(total) and covered >= total
+        explore = [lim for p in cur["pages"] for lim in (p.get("limits") or []) if not _is_transfer_limit(lim)]
+        limits = []
+        for lim in explore:
+            if lim not in limits:
+                limits.append(lim)
+        if not done:
+            limits.append({"kind": "result_cap", "stage": "impact"})
+        depths = [p["depth_truncated"] for p in cur["pages"] if "depth_truncated" in p]
+        if depths:
+            entry["depth_truncated"] = True if True in depths else (None if None in depths else False)
+        entry["limits"] = limits
+        entry["count"] = total if _is_int(total) else entry.get("count")
+        entry["received"] = len(entry["rows"])
+        entry["transfer_complete"] = bool(done)
+        entry["pages_received"] = len(cur["pages"])
+        entry["complete"] = bool(done) and not limits and all(
+            p.get("exploration_complete", p.get("complete")) is True for p in cur["pages"])
+    return out
+
+
+def _new_page_group(g: dict) -> dict:
+    entry = {k: v for k, v in g.items() if k not in ("rows", "page")}
+    entry["rows"] = []
+    return entry
 
 
 class CallLogWriter:
@@ -464,7 +564,7 @@ def count_parent_shortfall(merged: MergedCallLog, parent_tools_by_attempt: dict[
 
 FOUND_TOOLS = ("ripgrep_search", "es_search")  # 見つかった資料の対象（grep と全文検索）。一覧（list_docs・glob_search・folder_tree）は名前を並べただけなので対象外
 OPEN_TOOLS = ("read_doc", "read_around", "doc_outline", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages",
-              "file_head", "compare_documents")  # 資料を開いた記録になる道具（シート名の一覧 `xlsx_sheets` は開いた扱いにしない）
+              "pdf_page_image", "file_head", "compare_documents")  # 資料を開いた記録になる道具（シート名の一覧 `xlsx_sheets` は開いた扱いにしない）
 ROUTE_MAX_ROWS = 2000  # 調査の記録に残す呼び出しの行の上限（超えた分は `omitted` の件数）
 FOUND_RECORD_MAX = 200  # 調査の記録に残す見つかった資料の上限（超えた分は `more` の件数）
 FOUND_ANSWER_MAX = 20  # 回答の `found_docs` に出す資料の上限（超えた分は `found_docs_more`）

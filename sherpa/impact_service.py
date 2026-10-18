@@ -15,11 +15,11 @@ IMPACT_MAX_DEPTH_ABS_MAX = 64
 # 種別ラベル → 結果カテゴリ。world_neo4j/lens_service が再利用する
 CATEGORY = {
     "Module": "ソース", "Copybook": "ソース", "DataItem": "ソース",
-    "Batch": "バッチ", "Document": "文書", "Table": "テーブル", "Config": "設定",
+    "Batch": "バッチ", "Document": "文書", "Table": "テーブル", "Config": "設定", "Dataset": "データセット",
 }
 
 # 推定トレースで拾う「コード成果物」ラベル（概念/文書は対象外）
-_CODE_LABELS = {"Module", "Copybook", "DataItem", "Batch", "Table"}
+_CODE_LABELS = {"Module", "Copybook", "DataItem", "Batch", "Table", "Dataset"}
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")  # COBOL 風識別子（3文字以上）
 # 実在ノード名と一致しても「関連」と見なさない一般語
 _STOP = {"DATA", "CODE", "RATE", "TOTAL", "INPUT", "OUTPUT", "FILE", "DATE", "TIME", "NAME", "TYPE",
@@ -146,9 +146,17 @@ def _depth_note(depth: int) -> str:
             "調べる深さを増やして再実行してください。")
 
 
+def _flow_depth_note(depth: int) -> str:
+    return (f"データの流れをたどる深さの上限（{depth}段）で止めたため、さらに先に候補が残っている可能性があります。")
+
+
+_FLOW_DEPTH_UNKNOWN_NOTE = ("データの流れの先に候補が残っているかを、時間内に確かめられませんでした"
+                            "（ここに示した候補は確認できた分です）。範囲（フォルダ）を絞って再実行してください。")
+
+
 def run_impact(session, term, world, scope_prefixes=None,
                depth=IMPACT_MAX_DEPTH, include_deprecated=False, include_presumed=True,
-               evidence_limit=None):
+               evidence_limit=None, flow_depth=None):
     """起点語 → 影響結果（world＋範囲フィルタ・emit_result 形）。`ingest.world_neo4j` に委譲する。
 
     既定は active のみ（`include_deprecated=True` で deprecated/hidden_candidate も含む）。`scope_prefixes` で絞る（空＝world 全体）。
@@ -158,18 +166,26 @@ def run_impact(session, term, world, scope_prefixes=None,
     時間切れ・件数上限は `GraphQueryOverloadError` のまま（空・部分結果にしない）。
     各影響の `evidence`（代表経路の辺）の `sources`（根拠）は、辺ごとに先頭 `evidence_limit` 件（省略時 `EDGE_SOURCES_RETURN_DEFAULT`＝3）に切り、
     切った分は辺の `sources_overflow_count` に足す。
+    `flow_depth`（省略時 `FLOW_DEPTH_DEFAULT`＝3・0 で流れをたどらない）が正のとき、構造の影響 `items` とは別に、データの流れ（ファイル受け渡しなど）で
+    届いた候補を `candidates` に返す。構造の結果が 0 件でも `presumed` は従来どおり構造の結果だけで決める。
     """
     from .ingest.world_neo4j import (  # 遅延 import（循環回避）
-        EDGE_SOURCES_RETURN_DEFAULT, GraphQueryOverloadError, limit_edge_sources, run_world_impact)
-    result = run_world_impact(session, term, world, scope_prefixes, depth, include_deprecated)
+        EDGE_SOURCES_RETURN_DEFAULT, FLOW_DEPTH_DEFAULT, GraphQueryOverloadError, limit_edge_sources, run_world_impact)
+    flow_depth = FLOW_DEPTH_DEFAULT if flow_depth is None else flow_depth
+    result = run_world_impact(session, term, world, scope_prefixes, depth, include_deprecated, flow_depth=flow_depth)
     limit = EDGE_SOURCES_RETURN_DEFAULT if evidence_limit is None else evidence_limit
-    for it in result.get("items") or []:
+    for it in (result.get("items") or []) + (result.get("candidates") or []):
         it["evidence"] = limit_edge_sources(it.get("evidence") or [], limit)
     coverage = result.get("coverage")
     if coverage and coverage.get("depth", {}).get("truncated"):
         result["notes"] = [_depth_note(coverage["depth"]["requested"])]
     elif coverage and "depth" in coverage and coverage["depth"]["truncated"] is None:
         result["notes"] = [_DEPTH_UNKNOWN_NOTE]
+    flow_cov = (coverage or {}).get("flow")
+    if flow_cov and flow_cov["truncated"]:
+        result.setdefault("notes", []).append(_flow_depth_note(flow_cov["requested"]))
+    elif flow_cov and flow_cov["truncated"] is None:
+        result.setdefault("notes", []).append(_FLOW_DEPTH_UNKNOWN_NOTE)
     plugin_note = plugin_failed_note(coverage)
     if plugin_note:
         result.setdefault("notes", []).append(plugin_note)

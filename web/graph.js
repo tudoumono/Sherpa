@@ -4,11 +4,11 @@ const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;   // 共通ユ�
 
 const COLOR = {
   Module: '#0d9488', Copybook: '#0891b2', DataItem: '#64748b',
-  Batch: '#ea580c', Document: '#16a34a', Table: '#0e7490', Config: '#a855f7',
+  Batch: '#ea580c', Document: '#16a34a', Table: '#0e7490', Config: '#a855f7', Dataset: '#ca8a04',
 };
 const TYPE_JA = {
   Module: 'プログラム', Copybook: 'コピーブック', DataItem: '項目',
-  Document: '文書', Batch: 'バッチ', Table: 'テーブル', Config: '設定',
+  Document: '文書', Batch: 'バッチ', Table: 'テーブル', Config: '設定', Dataset: 'データセット',
 };
 const FIELD_LABEL = {
   category: 'カテゴリ', phase: '工程', role: '種別', top_scope: '最上位フォルダ', status: '状態',

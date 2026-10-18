@@ -15,7 +15,7 @@ from pathlib import Path
 
 # ---- Codex × MCP（Codex は常に MCP 付きで起動する）----
 _MCP_PASSTHROUGH = ("NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "ES_URL",
-                    "SHERPA_USE_FIXTURES", "SHERPA_DERIVED_DIR", "SHERPA_KB_DIR")
+                    "SHERPA_USE_FIXTURES", "SHERPA_DERIVED_DIR", "SHERPA_KB_DIR", "SHERPA_DISABLE_EMBED")
 
 
 def _toml_str(s) -> str:

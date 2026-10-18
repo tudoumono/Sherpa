@@ -99,12 +99,12 @@ def test_run_tool_es_search_forwards_options_and_ignores_offset(monkeypatch):
         captured.update(kw, k=k, layer=layer)
         return [], None
 
-    def fake_rel_set(world, **kw):
+    def fake_existing_rels(world, rels, **kw):
         rel_set_kw.update(kw)
         return set()
 
     monkeypatch.setattr(A.es_index, "search", fake_search)
-    monkeypatch.setattr(documents, "world_rel_set", fake_rel_set)
+    monkeypatch.setattr(documents, "existing_rels", fake_existing_rels)
     TD.run_tool("es_search", {"query": "x", "offset": 40}, "v1", None, layer="docs", max_hits=60, deadline=123.5)
     assert captured["layer"] == "docs" and captured["k"] == 60 and "offset" not in captured
     assert rel_set_kw.get("deadline") == 123.5
@@ -115,6 +115,7 @@ def test_run_tool_es_search_surfaces_degrade_reason_in_result(monkeypatch):
     from sherpa import documents
 
     monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {"a.md"})
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: set(rels) & ({"a.md"}))
     monkeypatch.setattr(A.es_index, "search", lambda world, q, scope_paths=None, k=20, layer=None, **kw: (
         [{"doc_id": "a.md", "line": 1, "text": "x", "ext": ".md"}], "embedding_cloud_unavailable"))
     view, _docs, _cites, _cards = TD.run_tool("es_search", {"query": "x"}, "v1", None)
@@ -130,6 +131,7 @@ def test_run_tool_es_search_result_never_has_next_offset(monkeypatch):
     hits = [{"doc_id": f"a{i}.md", "line": 1, "text": "x", "ext": ".md", "score": 1.0} for i in range(5)]
     monkeypatch.setattr(A.es_index, "search", lambda *a, **kw: (hits, None))
     monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {h["doc_id"] for h in hits})
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: set(rels) & ({h["doc_id"] for h in hits}))
     res, _docs, _cites, _cards = TD.run_tool("es_search", {"query": "x"}, "v1", None, max_hits=5)
     assert res.get("truncated") is True and "next_offset" not in res
 
@@ -457,6 +459,7 @@ def _stub_es(monkeypatch, hits, rel_set):
     from sherpa import documents
     monkeypatch.setattr(A.es_index, "search", lambda world, q, scope_paths=None, k=20, layer=None, **kw: (hits, None))
     monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: rel_set)
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: set(rels) & (rel_set))
 
 
 def test_es_search_filters_stale_and_sensitive_named_hits(monkeypatch):
@@ -637,6 +640,7 @@ def _isolate_world_kb(monkeypatch, tmp_path, world: str, files: dict) -> None:
     for env in ("SHERPA_MCP_WORLD", "SHERPA_MCP_WORLD_ROOT"):
         monkeypatch.delenv(env, raising=False)
     monkeypatch.setattr(store, "get_world", lambda world_id: None)
+    monkeypatch.setattr(store, "get_world_root", lambda world_id: None)
 
 
 def test_unregistered_ext_reachable_grep_read_and_es_eligible(monkeypatch, tmp_path):
@@ -1607,6 +1611,7 @@ def _setup_parent_return_world(monkeypatch, tmp_path, world: str, hits: list, ra
     monkeypatch.setattr(worlds_mod, "derived_md_dir", lambda w: tmp_path / "md")
     monkeypatch.setattr(A.es_index, "search", lambda w, q, scope_paths=None, k=20, layer=None, **kw: (list(hits), None))
     monkeypatch.setattr(documents, "world_rel_set", lambda w, **kw: {h["doc_id"] for h in hits})
+    monkeypatch.setattr(documents, "existing_rels", lambda w, rels, **kw: set(rels) & ({h["doc_id"] for h in hits}))
 
 
 def _prepare_parent_return(monkeypatch, tmp_path, hits, rag_files, budget, chunk_ids=None):
@@ -1815,11 +1820,11 @@ def test_run_tool_xlsx_sheets_and_range_add_docs_and_redact(monkeypatch, tmp_pat
     _setup_office_world(monkeypatch, tmp_path, world)
     r, docs, _cites, _cards = TD.run_tool("xlsx_sheets", {"doc_id": "a.xlsx"}, world, None)
     assert r["sheets"] == [{"name": "Sheet1", "max_row": 1, "max_col": 1}]
-    assert r["doc_id"] == "a.xlsx" and r["locator"] == "sheets" and "Sheet1" in r["text"] and docs == {"a.xlsx"}
+    assert r["doc_id"] == "a.xlsx" and r["locator"] == "sheets" and "text" not in r and docs == {"a.xlsx"}
     r2, docs2, _, _ = TD.run_tool("xlsx_range", {"doc_id": "a.xlsx", "sheet": "Sheet1"}, world, None)
     assert docs2 == {"a.xlsx"} and r2["rows"] == [["秘密: [REDACTED]"]]
     assert r2["doc_id"] == "a.xlsx" and r2["locator"] == "Sheet1!A1:A1"
-    assert "[REDACTED]" in r2["text"] and "秘密: sk-" not in r2["text"]      # read_evidence 用の text も伏せ字済み
+    assert "text" not in r2 and "sk-" not in json.dumps(r2, ensure_ascii=False)      # 本文は rows にだけ載せる（text へ二重に載せない）
     r3, docs3, _, _ = TD.run_tool("xlsx_range", {"doc_id": "a.xlsx"}, world, None)
     assert r3 == {"error": "sheet が必要です"} and docs3 == set()          # 失敗時は出典に載せない
 
@@ -1922,12 +1927,12 @@ def test_redact_deep_redacts_pem_key_spanning_multiple_elements(result, texts_of
 # ===== _finish_reader_result / _doc_reader_text_locator（doc_readers の出力形を模した dict で直接検証） =====
 
 @pytest.mark.parametrize("tool, result, items_key, index_key", [
-    ("pdf_pages", {"total": 1, "pages": [{"no": 1, "text": "あ" * 3000}], "truncated": False}, "pages", "no"),
-    ("docx_paragraphs", {"total": 1, "total_tables": 0, "paragraphs": [{"i": 0, "style": "Normal", "text": "あ" * 3000}],
+    ("pdf_pages", {"total": 1, "pages": [{"no": 1, "text": "あ" * 6000}], "truncated": False}, "pages", "no"),
+    ("docx_paragraphs", {"total": 1, "total_tables": 0, "paragraphs": [{"i": 0, "style": "Normal", "text": "あ" * 6000}],
                          "tables": [], "truncated": False}, "paragraphs", "i"),
 ])
 def test_finish_reader_result_single_item_too_big_keeps_truncated_text(tool, result, items_key, index_key):
-    """1 件だけでもバイト予算を超えるとき（日本語 3000 字＝9000 バイト超）、二分探索で 0 件に潰して本文を消さず、
+    """1 件だけでもバイト予算を超えるとき（日本語 6000 字＝18000 バイト超）、二分探索で 0 件に潰して本文を消さず、
     先頭 1 件を予算内へ切り詰めて text_truncated:true で残す（番号・locator は保つ）。"""
     out = RT._finish_reader_result(tool, result, "big.bin", 16384)
     assert "error" not in out and len(json.dumps(out, ensure_ascii=False).encode("utf-8")) <= 16384
@@ -1942,8 +1947,8 @@ def test_finish_reader_result_docx_tables_are_clipped_to_budget():
     """表（tables）もバイト予算の削減対象（以前は段落だけを削り、50×8 の大きな表で予算を超えた）。"""
     rows = [[f"r{r}c{c}" * 20 for c in range(8)] for r in range(50)]
     result = {"paragraphs": [], "tables": [{"i": 0, "row_start": 0, "total_rows": 50, "rows": rows}], "truncated": False}
-    out = RT._finish_reader_result("docx_paragraphs", result, "big.docx", 65536)
-    assert "error" not in out and len(json.dumps(out, ensure_ascii=False).encode("utf-8")) <= 65536
+    out = RT._finish_reader_result("docx_paragraphs", result, "big.docx", 16384)
+    assert "error" not in out and len(json.dumps(out, ensure_ascii=False).encode("utf-8")) <= 16384
     assert out["truncated"] is True and len(out["tables"]) == 1
     assert 0 < len(out["tables"][0]["rows"]) < 50 and out["tables"][0]["row_truncated"] is True
 
@@ -1992,10 +1997,10 @@ def test_finish_docx_paragraphs_result_keeps_paragraphs_before_big_tables():
 
 @pytest.mark.parametrize("table_row, table_survives", [
     (["r1c1"], True),        # 小さな表 1 行があっても、段落 0 件のときは必ず救済（先頭段落を切り詰めて確保）を経由する
-    (["x" * 8050], False),   # 表の 1 行が予算の大半を占めるときは、表を 0 行にして先に段落を救済し、残り予算で表の行数を決める
+    (["x" * 16000], False),  # 表の 1 行が予算の大半を占めるときは、表を 0 行にして先に段落を救済し、残り予算で表の行数を決める
 ])
 def test_finish_docx_paragraphs_result_rescues_paragraph_before_table(table_row, table_survives):
-    result = {"total": 1, "total_tables": 1, "paragraphs": [{"i": 0, "style": "Normal", "text": "あ" * 3000}],
+    result = {"total": 1, "total_tables": 1, "paragraphs": [{"i": 0, "style": "Normal", "text": "あ" * 6000}],
               "tables": [{"i": 0, "row_start": 0, "total_rows": 1, "rows": [table_row]}], "truncated": False}
     r = RT._finish_docx_paragraphs_result(result, "big.docx", 16384)
     assert "error" not in r and len(json.dumps(r, ensure_ascii=False).encode("utf-8")) <= 16384
@@ -2137,6 +2142,7 @@ def test_run_tool_es_search_mode_routing(monkeypatch):
     from sherpa import documents
 
     monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {"a.md"})
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: set(rels) & ({"a.md"}))
     h = [{"doc_id": "a.md", "line": 1, "text": "x", "ext": ".md"}]
     calls = []
     knn_result = (h, None)
@@ -2175,6 +2181,28 @@ def test_run_tool_es_search_mode_routing(monkeypatch):
     v = run("vector")
     assert calls == [("knn", None)] and v["hits"] == []
     assert v["degrade_reason"] == "es_query_failed" and v["mode_used"] == "vector"
+
+
+def test_run_tool_es_search_notice_says_source_is_not_in_the_index(monkeypatch):
+    """層に code を含む（既定の both を含む）es_search は、ソースが索引に無いことを notice で案内する。docs はそのまま。エラーにはしない。"""
+    from sherpa import documents
+
+    monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {"a.md"})
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: set(rels) & ({"a.md"}))
+    h = [{"doc_id": "a.md", "line": 1, "text": "x", "ext": ".md"}]
+    monkeypatch.setattr(A.es_index, "search", lambda *a, **kw: (h, None))
+
+    def run(**kw):
+        return TD.run_tool("es_search", {"query": "x"}, "v1", None, **kw)[0]
+
+    for layer_kw in ({}, {"layer": "both"}, {"layer": "code"}):
+        v = run(**layer_kw)
+        assert "ripgrep_search" in v["notice"] and "error" not in v and v["hits"]
+    v = run(layer="docs")
+    assert "notice" not in v and v["hits"]
+    monkeypatch.setattr(A.es_index, "search", lambda *a, **kw: ([], None))
+    v = run(layer="code")                              # ヒットが無くてもエラーにせず案内する
+    assert v["hits"] == [] and "ripgrep_search" in v["notice"] and "error" not in v
 
 
 # ===== 黙って落とさない（COD-25 B）=====

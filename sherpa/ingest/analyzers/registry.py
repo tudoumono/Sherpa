@@ -236,8 +236,8 @@ def _validate_extension_analyzer(analyzer, filename_stem: str, upstream_ext: fro
 _ANALYZERS: tuple[Analyzer, ...] = _UPSTREAM_ANALYZERS + discover_extension_analyzers()
 
 # docs/05-グラフ語彙.md のクローズド語彙（アナライザが返してよいラベル/エッジ型の上限）。`ingest.model.NODE_LABELS`/`EDGE_TYPES` と同じ集合。
-NODE_LABELS = frozenset({"Module", "Copybook", "Batch", "DataItem", "Table", "Document", "Config"})
-EDGE_TYPES = frozenset({"COPIES", "CONTAINS", "INVOKES", "ACCESSES", "DOCUMENTS"})
+NODE_LABELS = frozenset({"Module", "Copybook", "Batch", "DataItem", "Table", "Document", "Config", "Dataset"})
+EDGE_TYPES = frozenset({"COPIES", "CONTAINS", "INVOKES", "ACCESSES", "DOCUMENTS", "FLOWS_TO"})
 
 # ---- FW プラグイン（本体のアナライザの結果へ FW 固有の定義・参照を足す部品） ----
 
@@ -510,7 +510,8 @@ def apply_fw_refs(plugins, text: str, rel_path: str, base_defs: DefResult, base_
         ambiguities.extend(tmp_amb)
         seen, seen_amb = t_seen, t_seen_amb
         dropped.extend(tmp_dropped)
-    return RefResult(refs=refs, dropped=dropped, file_context=base_refs.file_context), failures, ambiguities
+    return RefResult(refs=refs, dropped=dropped, file_context=base_refs.file_context, file_io=base_refs.file_io,
+                     dd_bindings=base_refs.dd_bindings, proc_names=base_refs.proc_names), failures, ambiguities
 
 
 # `accepts()`/`classify_document` の分類契約版。分類結果（kind/doctype/branch）に影響する意味変更があれば上げる（`config_signature()` の材料）。

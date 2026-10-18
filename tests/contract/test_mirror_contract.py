@@ -158,10 +158,10 @@ def _rich_summary(nodes, edges) -> dict:
     （判断・2026-09-04）。本 golden は `build_world()` を `concepts_path`/`semantic_path` 未指定で
     呼ぶ入力から採っており、Document は元々0件（S2 前の golden）——CODE-1a 移行が骨格を
     黙って欠かさないことの確認という本テストの意図に、S2 で新設された言及突合の結果を
-    混ぜない。
+    混ぜない。データの流れ（`FLOWS_TO` と `Dataset`）も骨格の外の語彙なので同じく除く。
     """
-    edges = [e for e in edges if e.get("via") != "mention"]
-    nodes = [n for n in nodes if n["label"] != "Document"]
+    edges = [e for e in edges if e.get("via") != "mention" and e["type"] != "FLOWS_TO"]
+    nodes = [n for n in nodes if n["label"] not in ("Document", "Dataset")]
     by_cid = {n["cid"]: n for n in nodes}
 
     def _endpoint(cid):

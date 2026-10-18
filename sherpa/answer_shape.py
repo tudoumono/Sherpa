@@ -22,7 +22,7 @@ NOTICE_KINDS = (
     "ledger_unfinished", "partial_followup", "truncated", "invalid_output", "answer_recovery", "review_reverted",
     "investigation_record_failed", "claims_omitted", "knowledge_off",
     "reconciliation_unverified", "reconciliation_more", "reconciliation_invalid", "scope_no_source",
-    "no_tool_use",
+    "no_tool_use", "target_unresolved",
 )
 
 STOPPED_NOTICE = "利用者の操作で停止しました。停止までに回収した部分回答です。"

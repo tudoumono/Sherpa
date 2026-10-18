@@ -30,6 +30,7 @@ STAGE_NEIGHBORS = "neighbors"  # 近傍の取得（Neo4j の近傍たどり）
 STAGE_DOCS = "docs"            # 文書のカード（起点名の grep）
 STAGE_CARDS = "cards"          # カードの件数・バイトの上限
 STAGE_IMPACT = "impact"        # 影響たどり
+STAGE_FLOW = "flow"            # データの流れの候補のたどり（影響たどりの第 2 段）
 STAGE_PRESUMED = "presumed"    # 構造の結果が無いときの資料からの推定（grep）
 
 _OVERLOAD_KIND = {"timeout": KIND_TIMEOUT, "too_many_rows": KIND_ROW_CAP}
@@ -112,13 +113,16 @@ class Coverage:
         c.limits = [dict(lim) for lim in self.limits]
         return c
 
-    def as_dict(self, *, omitted: int | None = None, depth: dict | None = None) -> dict:
-        """`{complete, limits, omitted, depth?}`。`omitted` は分かるときだけ渡す（打ち切り無しなら 0・分からなければ null）。"""
+    def as_dict(self, *, omitted: int | None = None, depth: dict | None = None, flow: dict | None = None) -> dict:
+        """`{complete, limits, omitted, depth?, flow?}`。`omitted` は分かるときだけ渡す（打ち切り無しなら 0・分からなければ null）。
+        `flow`＝データの流れの候補をたどった段数と打ち切り `{requested, truncated}`（流れをたどらない呼び出しでは付けない）。"""
         complete = not self.limits
         out: dict = {"complete": complete, "limits": [dict(lim) for lim in self.limits],
                      "omitted": 0 if complete else omitted}
         if depth is not None:
             out["depth"] = depth
+        if flow is not None:
+            out["flow"] = flow
         return out
 
 

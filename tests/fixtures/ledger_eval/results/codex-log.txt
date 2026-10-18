@@ -1,0 +1,2 @@
+2026-01-01 00:00:00,000 INFO sherpa.codex: end conv=3 uid=admin returncode=1 thread_id=x events={'thread.started': 1, 'error': 5, 'turn.failed': 1} mcp_calls=3
+2026-01-01 00:00:01,000 INFO sherpa.codex: end conv=1 uid=admin returncode=0 thread_id=y events={'thread.started': 1, 'turn.completed': 1} mcp_calls=3

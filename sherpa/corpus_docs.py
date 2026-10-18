@@ -229,6 +229,65 @@ def _text_quality_for(rp: Path) -> tuple[str, float, bool] | None:
         return None
 
 
+def _verdict_to_payload(result: dict, quality) -> dict:
+    """分類結果（`classify_document`）→ キャッシュに置ける dict。アナライザ本体は名前だけ、符号化の読み取り品質は `_q` に添える。"""
+    out = {k: v for k, v in result.items() if k != "analyzer"}
+    if "analyzer" in result:
+        a = result["analyzer"]
+        out["_analyzer"] = a.name if a is not None else None
+    out["_q"] = list(quality) if quality is not None else None
+    return out
+
+
+def _payload_to_verdict(payload: dict):
+    """`_verdict_to_payload` の逆。`(分類結果, 符号化の読み取り品質)`。アナライザを名前から戻せなければ None（キャッシュを使わない）。"""
+    result = {k: v for k, v in payload.items() if k not in ("_analyzer", "_q")}
+    if "_analyzer" in payload:
+        name = payload["_analyzer"]
+        if name is None:
+            result["analyzer"] = None
+        else:
+            found = next((a for a in _analyzer_registry.known_analyzers() if a.name == name), None)
+            if found is None:
+                return None
+            result["analyzer"] = found
+    q = payload.get("_q")
+    return result, (tuple(q) if q else None)
+
+
+def classify_file(rp: Path, rel: str, ext: str, *, cache=None) -> dict:
+    """`classify_document(..., text_quality=符号化の読み取り品質)` を 1 ファイルに掛ける（資料フォルダの列挙と grep が共有する）。
+    `cache`（`search_cache.ClassifyCache`）があり、ファイルの状態 `(dev, inode, size, mtime_ns)` が保存済みと一致するときは、先頭も本文も読まず保存済みの結果を返す。
+    読めなかった結果（`unreadable`・符号化の品質を取れなかった）は保存しない。
+    """
+    st = None
+    if cache is not None:
+        try:
+            st = os.stat(rp)
+        except OSError:
+            st = None
+        if st is not None:
+            payload = cache.get(rel, st)
+            hit = _payload_to_verdict(payload) if payload is not None else None
+            if hit is not None:
+                result, quality = hit
+                if quality is not None:
+                    text_encoding.seed_cache(st, quality)
+                return result
+    quality_box: list = []
+
+    def _quality():
+        q = _text_quality_for(rp)
+        quality_box.append(q)
+        return q
+
+    result = classify_document(rel, ext, lambda size=4096: _read_head(rp, size), text_quality=_quality)
+    if cache is not None and st is not None and result["kind"] != "unreadable" and (
+            not quality_box or quality_box[0] is not None):
+        cache.put(rel, st, _verdict_to_payload(result, quality_box[0] if quality_box else None))
+    return result
+
+
 # ツール結果（read_doc／read_around／ripgrep_search 等）へ添える短い注意文（判定結果 "partial"／"undetermined" だけで決まる）
 _ENCODING_CAUTION = {
     "partial": "この資料は文字コードの判別が不確実で、一部の文字が正しく読み取れていない可能性があります（要確認）。",
@@ -683,6 +742,23 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
 
 def iter_world_documents(world: str, include_rag: bool = False, *, root=None, deadline: float | None = None,
                          files=None):
+    """資料フォルダの文書一覧（`_iter_world_documents` の本体を、ファイル分類の派生側ディスクキャッシュ越しに回す）。
+    最後まで列挙し終えたときは、今回見なかったファイルのキャッシュ行を捨てる。引数と戻り値は `_iter_world_documents` と同じ。
+    設計: docs/design/data.md「ファイル」
+    """
+    from . import search_cache
+    cache = search_cache.ClassifyCache(world, preload=True)
+    completed = False
+    try:
+        yield from _iter_world_documents(world, include_rag, root=root, deadline=deadline, files=files, cache=cache)
+        completed = True
+    finally:
+        if cache is not None:
+            cache.flush(prune=completed)
+
+
+def _iter_world_documents(world: str, include_rag: bool = False, *, root=None, deadline: float | None = None,
+                          files=None, cache=None):
     """資料フォルダの文書一覧（rel_path＝doc_id・フォルダ由来の範囲メタ付き）。存在しない資料フォルダは空。
     本文（ソース／設計書／テキスト）＋MD 化できた Office（派生 `{rel}.md` あり）＋（画像変換が有効なときのみ）変換できた画像を載せる。
     未変換の Office は載せない（`scan_report.skipped_office` で可視化）。
@@ -720,8 +796,7 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
             continue
         ext = rp.suffix.lower()
         # コード判定は拡張子だけでなく accepts() まで見て確定する（`scan_report`／`status_document_doctype` と同じ `classify_document()` を共有）
-        result = classify_document(rel, ext, lambda rp=rp, size=4096: _read_head(rp, size),
-                                   text_quality=lambda rp=rp: _text_quality_for(rp))
+        result = classify_file(rp, rel, ext, cache=cache)
         if result.get("sensitive"):  # 秘匿名: 台帳に載せない・Office／画像へ再採用しない
             _log.warning("iter_world_documents: 秘匿名のため対象外にしました（doctype=対象外 ext=%s）", ext)
             continue

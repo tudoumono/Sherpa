@@ -93,11 +93,35 @@ def _other_error():
     return Neo4jError._hydrate_neo4j(code="Neo.ClientError.Statement.SyntaxError", message="bad cypher")
 
 
-def _impact_row(cid, name, label="Module", status="active", top="4期", path=None, analyzer=None):
+def _impact_row(cid, name, label="Module", status="active", top="4期", path=None, analyzer=None, to_cid="start:1"):
+    """影響たどり 1 段分の行（`to_cid` ＝ 広げた元のノード）。"""
     return {"cid": cid, "name": name, "label": label, "status": status,
-            "dpath": path or f"{top}/{name}.cbl", "top": top, "analyzer": analyzer,
-            "path_names": ["ORDER-LIMIT", name],
-            "edges": [{"type": "INVOKES", "doc": f"{top}/design.md", "line": 3}]}
+            "dpath": path or f"{top}/{name}.cbl", "top": top, "analyzer": analyzer, "to_cid": to_cid,
+            "edge": {"type": "INVOKES", "doc": f"{top}/design.md", "line": 3}}
+
+
+_START_ROW = {"cid": "start:1", "name": "ORDER-LIMIT", "path": "4期/ORDER-LIMIT.cbl"}
+
+
+class _BfsSession(_FakeSession):
+    """起点の確認・1 段の展開・深さの先の確認・世代プローブを問い合わせの中身で出し分ける session スタブ。
+    展開は 1 段目だけ `impact_rows` を返し、2 段目以降は空（`rows_by_call` で上書きできる）。"""
+
+    def __init__(self, impact_rows, starts=(_START_ROW,)):
+        super().__init__([])
+        self.impact_rows, self.starts, self.expansions = impact_rows, list(starts), 0
+
+    def run(self, query, **params):
+        self.calls.append((query, params))
+        text = query.text if hasattr(query, "text") else query
+        if "SherpaMeta" in text:
+            return _FakeResult([{"c": 1, "era": wn.GRAPH_SCHEMA_ERA}])
+        if "s.canonical_id IN $starts" in text:
+            return _FakeResult(self.starts)
+        if "$seen" in text:
+            return _FakeResult([])
+        self.expansions += 1
+        return _FakeResult(self.impact_rows if self.expansions == 1 else [])
 
 
 # ---- _run_read_capped: 緊急天井（fail-loud・lens_service と逆＝raise） ------
@@ -245,21 +269,17 @@ def test_run_world_impact_probes_schema_era_exactly_once():
     `world_impact` の合成）は世代プローブを1回だけ実行する——旧実装は両関数がそれぞれ独立に
     プローブしており、同じ world に対して era プローブが2回連続で走っていた（重複ラウンド
     トリップ）。"""
-    resolve_rows = [{"cid": "dataitem:w1:D", "label": "DataItem", "name": "TAX-RATE", "path": "gen1/D.cbl"}]
-    impact_rows = [_impact_row("cid:a", "NODE-A")]
-    era_rows = {"c": 1, "era": wn.GRAPH_SCHEMA_ERA}
+    resolve_rows = [{"cid": "start:1", "label": "DataItem", "name": "TAX-RATE", "path": "gen1/D.cbl"}]
 
-    class _SeqSession(_FakeSession):
+    class _SeqSession(_BfsSession):
         def run(self, query, **params):
-            self.calls.append((query, params))
             text = query.text if hasattr(query, "text") else query
-            if "SherpaMeta" in text:
-                return _FakeResult([era_rows])
             if "n.name=$name" in text:
+                self.calls.append((query, params))
                 return _FakeResult(resolve_rows)
-            return _FakeResult(impact_rows)
+            return super().run(query, **params)
 
-    s = _SeqSession([])
+    s = _SeqSession([_impact_row("cid:a", "NODE-A")])
     wn.run_world_impact(s, "TAX-RATE", "w1")
     era_probe_calls = [c for c in s.calls if "m.schema_era" in (c[0].text if hasattr(c[0], "text") else c[0])]
     assert len(era_probe_calls) == 1
@@ -267,14 +287,13 @@ def test_run_world_impact_probes_schema_era_exactly_once():
 
 def test_world_impact_shape_unchanged():
     """K12（判定表示の撤去）以降、items は judgement/extraction_method を持たない（全件同格）。
-    影響たどり自体は1本の Cypher で完結する（二重クエリ撤去は復活していない）——rv-s3-removal で
-    主クエリの後に `check_schema_era` の世代プローブが1回加わるため、呼び出し総数は2になる。
+    影響たどりは起点の確認 1 本・段ごとの展開・世代プローブ 1 本で、深さの先の確認は frontier が空なら問わない。
     """
     impact_rows = [_impact_row("cid:a", "NODE-A", analyzer="cobol"),
                   _impact_row("cid:b", "NODE-B")]     # analyzer 無し(None) の来歴も通る
-    s = _FakeSession([impact_rows])
+    s = _BfsSession(impact_rows)
     items = wn.world_impact(s, ["start:1"], "w1")
-    assert len(s.calls) == 2                          # K12: 影響たどりは1本の Cypher（+ era プローブ1本）
+    assert len(s.calls) == 4                          # 起点 + 展開 2 段（2 段目は空で打ち切り）+ era プローブ
     by = {i["name"]: i for i in items}
     assert by["NODE-A"]["analyzer"] == "cobol"                        # 担当アナライザの来歴が通る
     assert by["NODE-B"]["analyzer"] is None
@@ -282,17 +301,18 @@ def test_world_impact_shape_unchanged():
         assert set(it) == {"name", "label", "category", "status",
                            "analyzer", "top_scope", "path", "trace", "evidence"}
         assert "judgement" not in it and "extraction_method" not in it
-        assert it["trace"] == ["ORDER-LIMIT", it["name"]]
+        assert it["trace"] == [it["name"], "ORDER-LIMIT"]
         assert it["evidence"] and it["evidence"][0]["doc"].endswith("design.md")
 
 
 def test_world_impact_passes_query_timeout():
-    s = _FakeSession([[]])
+    s = _BfsSession([])
     wn.world_impact(s, ["start:1"], "w1")
-    assert len(s.calls) == 2                        # 主クエリ（timeout 付き）+ era プローブ（rv-s3-removal）
-    query, params = s.calls[0]
-    assert query.timeout == wn._NEO4J_QUERY_TIMEOUT_S
-    assert params["world"] == "w1" and params["starts"] == ["start:1"]
+    assert len(s.calls) == 3                        # 起点 + 展開 1 段（空で打ち切り）+ era プローブ
+    for query, params in s.calls[:2]:
+        assert query.timeout == wn._NEO4J_QUERY_TIMEOUT_S
+        assert params["world"] == "w1"
+    assert s.calls[0][1]["starts"] == ["start:1"] and s.calls[1][1]["frontier"] == ["start:1"]
 
 
 # ---- GRAPH-MEM（2026-09-04）: load_world の UNWIND バッチ化 -----------------

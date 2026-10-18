@@ -1100,6 +1100,45 @@ def _build_convert_cmd(bin_path: str, fmt: str, outdir, profile, src: Path) -> l
             f"-env:UserInstallation={Path(profile).as_uri()}", str(Path(src).resolve())]
 
 
+# .xls の保存値を残す変換用の Basic マクロ。LibreOffice は .xls の読み込み後に数式セルを再計算する設定を持たず、自動計算が有効なまま保存すると保存値が再計算値に置き換わる。自動計算を切ってから保存する。
+_KEEP_VALUES_MODULE = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE script:module PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "module.dtd">
+<script:module xmlns:script="http://openoffice.org/2000/script" script:name="Module1" script:language="StarBasic">
+Sub ConvertXlsx(sIn As String, sOut As String)
+  Dim a(0) As New com.sun.star.beans.PropertyValue
+  Dim b(0) As New com.sun.star.beans.PropertyValue
+  a(0).Name = "Hidden" : a(0).Value = True
+  doc = StarDesktop.loadComponentFromURL(ConvertToURL(sIn), "_blank", 0, a())
+  doc.enableAutomaticCalculation(False)
+  b(0).Name = "FilterName" : b(0).Value = "Calc MS Excel 2007 XML"
+  doc.storeToURL(ConvertToURL(sOut), b())
+  doc.close(True)
+End Sub
+</script:module>
+"""
+
+
+def _convert_xls_keep_values(bin_path: str, src: Path, profile: str, outdir: str) -> bool:
+    """.xls を、保存値を再計算せずに outdir/out.xlsx へ変換する。成否を返す。
+
+    ① プロファイルを初期化（Basic ライブラリが作られる） ② マクロを差し込む ③ マクロで読み込み→自動計算を切る→保存。
+    """
+    uri = Path(profile).as_uri()
+    if not _run_soffice([bin_path, "--headless", "--terminate_after_init", f"-env:UserInstallation={uri}"], src):
+        return False
+    module = Path(profile) / "user" / "basic" / "Standard" / "Module1.xba"
+    link = Path(outdir) / "src.xls"
+    try:
+        module.write_text(_KEEP_VALUES_MODULE, encoding="utf-8")
+        link.symlink_to(Path(src).resolve())
+    except OSError:
+        return False
+    target = Path(outdir) / "out.xlsx"
+    cmd = [bin_path, "--headless", "--norestore", f"-env:UserInstallation={uri}",
+           f'macro:///Standard.Module1.ConvertXlsx("{link}","{target}")']
+    return _run_soffice(cmd, src) and target.is_file()
+
+
 def _convert_libreoffice(src: Path, target_ext: str) -> bytes | None:
     bin_path = _soffice_bin()
     if not bin_path:
@@ -1108,6 +1147,15 @@ def _convert_libreoffice(src: Path, target_ext: str) -> bytes | None:
     profile = tempfile.mkdtemp(prefix="sherpa-lo-profile-")  # プロファイル分離（一時 dir・毎回破棄）
     outdir = tempfile.mkdtemp(prefix="sherpa-lo-out-")
     try:
+        if fmt == "xlsx" and Path(src).suffix.lower() == ".xls":
+            with _convert_lock:
+                kept = _convert_xls_keep_values(bin_path, src, profile, outdir)
+            if kept:
+                return (Path(outdir) / "out.xlsx").read_bytes()
+            if take_conversion_failure_reason() == "timeout":
+                _note_conversion_failure_reason("timeout")
+                return None
+            _log.warning("保存値を残す変換に失敗したため通常の変換へ切り替えます（数式の値は再計算される）: %s", src)
         cmd = _build_convert_cmd(bin_path, fmt, outdir, profile, src)
         with _convert_lock:  # 直列実行（LibreOffice の並列不安定を避ける）
             if not _run_soffice(cmd, src):

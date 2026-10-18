@@ -376,11 +376,10 @@ def test_layer_and_branch_agree_across_grep_and_es_index(monkeypatch, tmp_path):
 
     monkeypatch.setattr(es_index, "_req", fake_req)
     r = es_index.index_world("w")
-    assert r["indexed"] == 2
+    assert r["indexed"] == 1                                 # ソース（汎用コード）は ES に入れない。テキスト資料（第 2 段）は入れる
     bodies = [json.loads(ln) for i, ln in enumerate(captured["bulk"].strip().split("\n")) if i % 2 == 1]
     by_doc = {b["doc_id"]: b for b in bodies}
-    assert by_doc["app.py"]["branch"] == "source"
-    assert by_doc["data.csv"]["branch"] == "office"
+    assert set(by_doc) == {"data.csv"} and by_doc["data.csv"]["branch"] == "office"
     assert layer_mod.es_filter("code") == {"term": {"branch": "source"}}
 
 

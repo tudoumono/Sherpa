@@ -35,7 +35,7 @@ _CHUNK_LINES_DEFAULT = 40
 # `search()` が ES へ送る size の上限（資料検索のヒット数の既定 `parts.read.tools.MAX_HITS` を下回らない固定値）
 _ES_SEARCH_K_MAX = 50
 _TIMEOUT = 30
-ES_MAPPING_VERSION = "9"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
+ES_MAPPING_VERSION = "10"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
 # reindex のとき埋め込みはキャッシュから再利用される。
 # rag_chunks.jsonl 読み取りの安全弁: 1 行（1 チャンク）の大きさで判定する。桁違いに大きい行は破損とみなし、ファイル全体を無効にして legacy チャンクへ縮退する（`_validate_rag_chunks` 参照）。
 # ファイル全体の大きさは見ない（大きな表でも行ごとの切れを保つ）。読むときも上限＋1 文字で打ち切る
@@ -87,6 +87,13 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
         "parent_id": {"type": "keyword"},
         "logical_record_id": {"type": "keyword"},
         "section_path": {"type": "keyword"},
+        # 構造の欄（rag チャンクのみ）: 識別子の完全一致（`es_search` の `exact`）と、record・領域の文脈を引く欄。
+        # `identifier_values`＝チャンクに出る識別子の全役割、`record_identity_values`＝そのレコードが定義している識別子、
+        # `labels`＝レコードに同居する日本語の値（項目名など）、`region_context`＝所属領域の見出し・シート名
+        "identifier_values": {"type": "keyword"},
+        "record_identity_values": {"type": "keyword"},
+        "labels": {"type": "text", "analyzer": analyzer},
+        "region_context": {"type": "text", "analyzer": analyzer},
         # 登録者が `_重要度.txt` で付けた重要度。`importance` はブースト（function_score の term filter）とフィルタ／表示に使う。`importance_reason` は表示専用（`index: False`）
         "importance": {"type": "keyword"},
         "importance_reason": {"type": "keyword", "index": False},
@@ -705,6 +712,71 @@ def _chunk_context_meta(chunk: dict) -> dict:
     return out
 
 
+# 構造の欄の上限（1 チャンクの欄を有界にする）。識別子の上限は生成側（`IDENTIFIER_MAX_MENTIONS_PER_CHUNK`）が持つ
+_LABELS_MAX_PER_CHUNK = 32
+_LABEL_MAX_CHARS = 128
+_REGION_CONTEXT_MAX_CHARS = 512
+_JA_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+_BODY_FIELD_RE = re.compile(r"^([^:：\n]{1,64}): (.+)$")
+
+
+def _str_list(value) -> list:
+    return [v for v in value if isinstance(v, str) and v] if isinstance(value, list) else []
+
+
+def _chunk_identifier_values(chunk: dict) -> tuple:
+    """rag チャンクの識別子を `(identifier_values, record_identity_values)` で返す（`identifier_mentions` の値と、役割 `record_identity` の値。重複は除く）。"""
+    mentions = [m for m in chunk.get("identifier_mentions") or []
+                if isinstance(m, dict) and isinstance(m.get("value"), str) and m["value"]]
+    identity = _str_list(chunk.get("record_identity_values_exact"))
+    identity += [m["value"] for m in mentions if m.get("role") == "record_identity"]
+    identity = list(dict.fromkeys(identity))
+    return list(dict.fromkeys([m["value"] for m in mentions] + identity)), identity
+
+
+def _chunk_labels(chunk: dict, identifiers: list) -> list:
+    """レコード（`record_keys` を持つチャンク）の本文 `項目名: 値` の行から、識別子でない日本語の値を集める（項目名・状態など）。"""
+    if not chunk.get("record_keys") or not isinstance(chunk.get("body"), str):
+        return []
+    skip = set(identifiers)
+    out: list = []
+    for line in chunk["body"].split("\n"):
+        m = _BODY_FIELD_RE.match(line)
+        if m is None or "のExcel" in m.group(1):
+            continue
+        value = m.group(2).strip()
+        if value and len(value) <= _LABEL_MAX_CHARS and value not in skip and _JA_CHAR_RE.search(value):
+            out.append(value)
+    return list(dict.fromkeys(out))[:_LABELS_MAX_PER_CHUNK]
+
+
+def _chunk_region_text(chunk: dict) -> str:
+    """所属領域の見出しとシート名（`region_context` の title／sheet）を 1 本の文字列にする。無ければ空。"""
+    rc = chunk.get("region_context")
+    if not isinstance(rc, dict):
+        return ""
+    parts = [rc.get(k) for k in ("title", "sheet") if isinstance(rc.get(k), str) and rc.get(k)]
+    parts += _str_list(rc.get("section_path"))
+    return " ".join(dict.fromkeys(parts))[:_REGION_CONTEXT_MAX_CHARS]
+
+
+def _chunk_structure_meta(chunk: dict) -> dict:
+    """rag チャンクの構造の欄（`identifier_values`／`record_identity_values`／`labels`／`region_context`）。値が無い欄はキーを立てない。"""
+    identifiers, identity = _chunk_identifier_values(chunk)
+    out: dict = {}
+    if identifiers:
+        out["identifier_values"] = identifiers
+    if identity:
+        out["record_identity_values"] = identity
+    labels = _chunk_labels(chunk, identifiers)
+    if labels:
+        out["labels"] = labels
+    region = _chunk_region_text(chunk)
+    if region:
+        out["region_context"] = region
+    return out
+
+
 def _load_rag_md_anchors(md_path: Path | None) -> tuple:
     """`{rel}.rag.md`（RAG 正本）を読み、アンカー辞書 `(anchors, reason)` を返す。`reason` が付けば `anchors` は None。"""
     if md_path is None:
@@ -804,6 +876,7 @@ def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: 
             if locator is not None:
                 body["locator"] = locator
             body.update(_chunk_context_meta(row))  # 隣接キー（無ければ何も足さない）
+            body.update(_chunk_structure_meta(row))  # 構造の欄（無ければ何も足さない）
             yield _rag_chunk_es_id(rel, cid), body, text
 
 
@@ -846,7 +919,7 @@ def _bulk_batches(ids: list, bodies: list, vec_by_idx: dict) -> list:
     n_docs = 0
     n_bytes = 0
     for i, (cid, body) in enumerate(zip(ids, bodies)):
-        v = vec_by_idx.get(i)  # branch=="source"／軽量テキスト枠は埋め込み対象外＝常に None
+        v = vec_by_idx.get(i)  # テキスト資料（軽量テキスト枠の第 2 段）など埋め込み対象外のチャンクは None
         if v is not None:
             body = {**body, "embedding": v}
         action = json.dumps({"index": {"_id": cid}})
@@ -864,13 +937,18 @@ def _bulk_batches(ids: list, bodies: list, vec_by_idx: dict) -> list:
     return out
 
 
+def _is_source_doc(d: dict) -> bool:
+    """ES に入れない文書か。登録コード（`branch=="source"`）と汎用コード（`ingest.text_kind` の第 1 段）。第 2 段（csv・log などのテキスト資料）は入れる。"""
+    return d.get("branch") == "source" or d.get("doctype") == text_kind.CODE_DOCTYPE_LABEL
+
+
 def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts: frozenset,
                             res_map: dict | None = None) -> tuple:
     """1 文書分のチャンクを `(id, body, text, no_embed)` を 1 件ずつ返すジェネレータへ組み立てる（巨大な 1 文書でも 1 件ごとに flush 判定できるようにする）。
     rag_chunks 経路は yield を始める前に `_rag_chunks_validate()` で jsonl 全体を検証し終える。失敗なら 1 件も yield せず legacy 40 行チャンクへ縮退する（doc 単位の原子性）。検証成功後にファイルを開き直して `_iter_rag_chunk_entries` で yield する。
     `res_map`（省略可）: `importance.resolve_for_world()` の結果。あれば `importance`／`importance_reason` を全チャンクの body へ条件付きで焼き込む。
     返値 `(chunk_iter, degraded_entry)`。
-    - `chunk_iter`＝None: この文書はスキップ（unreadable／本文の読み取り失敗＝reason="text_read_failed"／本文が空白のみ＝reason="empty_text"）。
+    - `chunk_iter`＝None: この文書はスキップ（unreadable／ソース（登録コードと汎用コード）＝ES に入れない／本文の読み取り失敗＝reason="text_read_failed"／本文が空白のみ＝reason="empty_text"）。
     - `chunk_iter`＝`(id, body, text, no_embed)` を yield するジェネレータ（0 件もありうる）。
     - `degraded_entry`＝None または {"doc": rel, "reason": ...}（rag_chunks はあるが使えなかった場合のみ。yield を始める前に確定する）。
     """
@@ -878,10 +956,11 @@ def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts:
         return None, None
     rel = d["name"]
     ext = Path(rel).suffix.lower()
-    # 軽量テキスト枠（`ingest.text_kind`）の第 1 段・第 2 段はどちらも ES 索引の対象にする（`reachable_as_text` 契約）
-    is_light_text = d.get("doctype") in (text_kind.CODE_DOCTYPE_LABEL, text_kind.DOCUMENT_DOCTYPE_LABEL)
-    # 軽量テキスト枠は「ベクトル・グラフ・LLM を一切通さない」ため、登録コード（`branch=="source"`）と同様に embed 対象から除外する（`no_embed`）
-    no_embed = d.get("branch") == "source" or is_light_text
+    if _is_source_doc(d):
+        # ソース原文は ES に入れない（同じ識別子が何十回も出てキーワードの順位を占め、設計書を押し出すため）。探すのは ripgrep_search
+        return None, None
+    # テキスト資料（軽量テキスト枠の第 2 段）は「ベクトル・グラフ・LLM を一切通さない」ため、BM25 だけで索引する（`no_embed`）
+    no_embed = d.get("doctype") == text_kind.DOCUMENT_DOCTYPE_LABEL
     meta = {"doc_id": rel, "ext": ext, "branch": d.get("branch"),
             "top_scope": d.get("top_scope"), "scopes": _scopes(rel)}
     meta.update(_provenance_meta(d))  # 抽出来歴を搬送（無ければ省略）
@@ -1009,9 +1088,9 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     """資料フォルダをクリーン再索引する（delete→create→bulk）。埋め込み設定があればベクトルも付与する（kNN 用）。
     - 失敗は古い索引を残さず error を返す。埋め込みを一度も選んでいない構成は BM25 のみで索引する。明示選択したクラウドの埋め込みが解決できない・実際の embed が失敗した場合は、delete の前に打ち切る（既存のベクトル付き索引を BM25 のみで黙って上書きしない）。
     - `content_sig`＝索引時のフォルダ署名（`_meta` に保存・古い索引の検知に使う）。埋め込みは内容ハッシュキャッシュ（`_embed_cached`）経由で未変更チャンクの再 embed を省く。
-    - Office／PDF（`{rel}.rag_chunks.jsonl` を持つ）はレコード単位チャンク、それ以外（ソース／テキスト、rag_chunks が無い／検証に失敗した Office／PDF）は 40 行チャンク。rag_chunks があるのに使えなかった文書と本文が空白のみの文書（reason="empty_text"）は、戻り値の `rag_degraded`（件数）・`rag_degraded_docs`（内訳）・`rag_degraded_by_reason`（理由別の件数）で報告する。本文を読めず索引から外した文書は reason="text_read_failed"。
+    - Office／PDF（`{rel}.rag_chunks.jsonl` を持つ）はレコード単位チャンク、それ以外（テキスト資料、rag_chunks が無い／検証に失敗した Office／PDF）は 40 行チャンク。rag_chunks があるのに使えなかった文書と本文が空白のみの文書（reason="empty_text"）は、戻り値の `rag_degraded`（件数）・`rag_degraded_docs`（内訳）・`rag_degraded_by_reason`（理由別の件数）で報告する。本文を読めず索引から外した文書は reason="text_read_failed"。
       埋め込みに失敗して BM25 のみで索引したときは `embed_degraded=True`、日本語アナライザを作れず標準で作り直したときは `analyzer_fallback=True`（どちらも取り込みの状態へ出す）。
-    - `branch=="source"`（登録コード＋軽量テキスト枠の汎用コード）のチャンクは埋め込み対象から除く（BM25 は全チャンクに効く）。
+    - ソース（`branch=="source"` の登録コードと、軽量テキスト枠の第 1 段の汎用コード）は索引に入れない（`_is_source_doc`・探すのは ripgrep_search）。軽量テキスト枠の第 2 段（csv・log などのテキスト資料）は索引に入れるが、埋め込みはしない（BM25 のみ）。索引の `_meta.source_excluded` に印を残し、印の無い旧索引は `needs_reindex` が張り直す。
     - bulk 送信は `_bulk_batches()` で件数・バイト数ともに有界なバッチへ分割し、`refresh=true` は最後のバッチだけに付ける。途中のバッチが失敗したら `delete_world()` して空へ戻し、error を返す（全部か無しか）。
     - 2 パス構成（メモリを資料フォルダの規模に比例させない）:
       - Pass1（埋め込みのみ）: `_iter_doc_chunk_records()` でチャンクを 1 件ずつ受け取り、embed 対象テキストを `_EMBED_FLUSH_CHUNKS` 件程度に束ねて `_embed_cached()` を呼ぶ。
@@ -1124,6 +1203,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
              "arms_sig": _arms_config_sig(),  # アーム構成（変わったら reindex・fail-safe で None もありうる）
              "human_md_sig": human_md_sig,  # human_md 版（pending は書かない）
              "analyzer_config_sig": _analyzer_config_sig()}  # コード解析アナライザの有効構成（変わったら reindex）
+    emeta["source_excluded"] = True  # ソース（登録コードと汎用コード）のチャンクを含まない索引（印の無い旧索引は `needs_reindex` が張り直す）
     if _CHUNK_LINES != _CHUNK_LINES_DEFAULT:  # 既定(40)時は書かない
         emeta["chunk_lines"] = _CHUNK_LINES  # legacy チャンク粒度（既定と異なるときだけ記録・drift 検知用）
     # `content_sig` は bulk が全バッチ成功した後に書く（`_confirm_content_sig`）。先に書くと、途中でプロセスが落ちたとき「一部だけ入った索引＋有効な content_sig」が居座る。後書きなら、どう落ちても content_sig が無い＝次回 sync が必ず張り直す（fail-closed）
@@ -1341,7 +1421,7 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
         chunk_iter, _degraded = _iter_doc_chunk_records(world, d, worlds.derived_rag_dir(world),
                                                         _rag_chunk_source_exts(), res_map)
         if chunk_iter is None:
-            if (_degraded or {}).get("reason") != "empty_text":  # 読めない＝ES を変えずに止める（古い切れ端を消さない）
+            if not _is_source_doc(d) and (_degraded or {}).get("reason") != "empty_text":  # 読めない＝ES を変えずに止める（古い切れ端を消さない）。ソースは元から ES に無い（残りがあれば消す）
                 return {"available": True, "error": "chunk_read_failed"}
             continue
         for cid, body, text, skip in chunk_iter:
@@ -1403,7 +1483,7 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
 
 def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool:
     """ES 索引の張り直しが要るか（ES 稼働時のみ）。次のいずれかで True:
-    空／内容署名ズレ／アーム構成ズレ／マッピング版ズレ／チャンク粒度ズレ／人間向け MD 版ズレ／アナライザ構成ズレ／埋め込み素性（provider／model／dim／前処理アルゴリズム版）ズレ／実件数ズレ。
+    空／内容署名ズレ／ソース除外の印なし／アーム構成ズレ／マッピング版ズレ／チャンク粒度ズレ／人間向け MD 版ズレ／アナライザ構成ズレ／埋め込み素性（provider／model／dim／前処理アルゴリズム版）ズレ／実件数ズレ。
     `content_sig`（ソースファイルの rel／mtime／ctime／size のみ）はアーム構成・マッピング版等の変更を検知できないため、各署名を別途比較する。索引済みメタにフィールド自体が無い旧索引は比較先が None になり、不一致＝1 回だけ再索引される。
     例外: `human_md_sig` は pending 中は比較先がセンチネルになり、pending が解消するまで毎回再索引を試みる（fail-closed）。`chunk_lines` は欠落を旧既定 `_CHUNK_LINES_DEFAULT`（40）として扱う。
     実件数ズレ: `_meta.doc_count`（`_confirm_content_sig` が刻む）と `count(world)` が食い違えば True（資料は不変のまま ES の文書が欠けた状態の自己修復）。`doc_count` が無い旧索引ではこの条件だけ比較しない（スタンプを刻むためだけに有料の再埋め込みを走らせないため）。
@@ -1411,10 +1491,14 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
     if not available():
         return False
     n = count(world)
-    if not n:
+    if n is None:
         return True
     meta = _index_meta(world) or {}  # GET 失敗は未設定相当＝fail-closed で reindex を促す
     if meta.get("content_sig") != content_sig:
+        return True
+    if not n and meta.get("doc_count") != 0:  # 空は張り直す。ただしソースだけの資料フォルダは正当に 0 件なので、張り直し済み（件数 0 を刻んだ）なら毎回は張り直さない
+        return True
+    if meta.get("source_excluded") is not True:  # ソースのチャンクが残っている旧索引
         return True
     if meta.get("mapping_version") != ES_MAPPING_VERSION:
         return True
@@ -1552,12 +1636,57 @@ def _mark_keyword_matches(world: str, query: str, hits: list) -> list:
     return hits
 
 
+_EXACT_MAX_VALUES = 20
+_EXACT_VALUE_MAX_CHARS = 256
+
+
+def normalize_exact(exact) -> list:
+    """`es_search` の `exact`（文字列または配列）を、空白を除いた重複の無い文字列の並びにする（個数・長さの上限を超えた分は捨てる）。"""
+    items = [exact] if isinstance(exact, str) else list(exact) if isinstance(exact, (list, tuple)) else []
+    out = [v.strip() for v in items if isinstance(v, str)]
+    return list(dict.fromkeys(v for v in out if v and len(v) <= _EXACT_VALUE_MAX_CHARS))[:_EXACT_MAX_VALUES]
+
+
+def _exact_filter(exact: list) -> dict:
+    """識別子の完全一致（keyword の terms）。チャンクに出る識別子の全役割、またはそのレコードが定義している識別子のどちらかに一致すれば当たる。"""
+    return {"bool": {"should": [{"terms": {"identifier_values": exact}},
+                                {"terms": {"record_identity_values": exact}}],
+                     "minimum_should_match": 1}}
+
+
+def search_exact(world: str, exact: list, scope_paths=None, k: int = 20, layer=None,
+                 k_ceiling: int | None = None) -> tuple[list, str | None]:
+    """識別子の完全一致だけで引く（本文検索を使わない）。`exact` は `normalize_exact` 済みの値。
+    そのレコードが定義している識別子（`record_identity_values`）に当たるチャンクを先に並べる。範囲・層のフィルタは `search()` と同じ。
+    返値 `(hits, degrade_reason|None)`（`search()` と同じ形・全ヒットに `keyword_match` を付ける）。
+    """
+    if not exact:
+        return [], None
+    if not available():
+        return [], "es_unavailable"
+    k = max(1, min(k, k_ceiling if k_ceiling is not None else _ES_SEARCH_K_MAX))
+    flt = [_exact_filter(exact)]
+    sel = scope_mod.normalize_scope_paths(scope_paths)
+    if sel:
+        flt.append({"terms": {"scopes": sel}})
+    lfilt = layer_mod.es_filter(layer)
+    if lfilt:
+        flt.append(lfilt)
+    body = {"size": k, "query": _importance_boost_query(
+        {"bool": {"filter": flt, "should": [{"terms": {"record_identity_values": exact}}]}})}
+    try:
+        return _mark_keyword_all(_parse_hits(_req("POST", f"/{_index(world)}/_search", body))), None
+    except Exception as exc:
+        return [], _classify_query_exception(exc)
+
+
 def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict | None = None,
-          vector: bool = True, layer=None, k_ceiling: int | None = None) -> tuple[list, str | None]:
+          vector: bool = True, layer=None, k_ceiling: int | None = None, exact: list | None = None) -> tuple[list, str | None]:
     """検索。`vector=True` かつ埋め込み設定があれば kNN＋BM25 のハイブリッド、無ければ BM25。範囲フィルタ・graceful。
     `vector=False` は BM25 のみ（クエリ埋め込みを呼ばない・reason は常に None）。
     `k_ceiling`（省略可）: 呼び出し元が上限まで検証済みの `k` を渡す場合（`agentic_search.run_tool` の `es_search`）、`_ES_SEARCH_K_MAX` による再クランプを迂回してこちらを使う。
     `layer`（省略可・`"docs"|"code"|"both"`・既定 both）: `scopes` と同じ `filter` 節に `branch` の term／must_not フィルタを積む（`layer.es_filter`）。
+    `exact`（省略可・`normalize_exact` 済み）: 識別子の完全一致で先に絞ってから本文で順位付けする（BM25・kNN の両方に同じフィルタを掛ける）。
     各ヒットに `keyword_match`（語が一致したか）を付ける。hybrid は BM25 の上位に出たヒットは True、kNN だけで出たヒットは語の一致を問い合わせて付ける（問い合わせの失敗は False）・BM25 のみの経路は全件 True。
     返値 `(hits, degrade_reason|None)`（`search_knn_only()` と同じ形）。degrade 時も BM25 の hits をそのまま返す（reason は「hybrid でなく BM25 だけになった理由」の注記）。`es_unavailable`／クエリ空は `[]`。
     degrade_reason: `es_unavailable`／`embedding_not_configured`（埋め込み未設定）／`embedding_cloud_unavailable`／`vector_feature_mismatch`（索引の埋め込み素性が現在の設定と不一致＝再索引待ち）／`query_embed_failed`／`hybrid_query_failed`（hybrid が失敗し BM25 は成功）／`es_query_failed`（BM25 も失敗・一時的）／`es_query_rejected`（BM25 も失敗・クエリ不備）。`fused_search.DEGRADE_REASONS` と同一集合（増やすときは両方直す）。
@@ -1576,6 +1705,8 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     lfilt = layer_mod.es_filter(layer)
     if lfilt:
         flt.append(lfilt)
+    if exact:
+        flt.append(_exact_filter(exact))
     hl = {"fields": {"text": {"fragment_size": 240, "number_of_fragments": 1}}}
     bm25 = {"size": k, "query": _importance_boost_query({"bool": {"must": [{"match": {"text": q}}], "filter": flt}}),
            "highlight": hl}
@@ -1626,12 +1757,13 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
 
 
 def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
-                    settings: dict | None = None, layer=None, k_ceiling: int = 50) -> tuple[list, str | None]:
+                    settings: dict | None = None, layer=None, k_ceiling: int = 50,
+                    exact: list | None = None) -> tuple[list, str | None]:
     """純 kNN 検索（BM25 を混ぜない・fused_search の vector エンジン用）。`search()` は kNN＋BM25 のハイブリッド固定のため、engines=["vector"] 単独用に top-level `knn` のみのクエリを発行する。
     返値 `(hits, degrade_reason|None)`。hits は `_parse_hits` 形 `{doc_id, line, text, score, ext}`。
     degrade_reason: es_unavailable／embedding_not_configured／embedding_cloud_unavailable／vector_feature_mismatch／query_embed_failed／es_query_failed（一時的）／es_query_rejected（クエリ不備）（`parts/read/fused_search.py` の `DEGRADE_REASONS` と同一・増やすときは両方直す）。
     `embedding_cloud_unavailable`（明示選択したクラウドが解決できない）は、`embedding_not_configured`（クラウドを選んでいない通常の未設定）と区別する。
-    `layer`（省略可）: `search()` と同じ探す対象フィルタ。`k_ceiling`（省略可・既定 50）: `k` の上限（`search()` と同じく、上限まで検証済みの呼び出し元が引き上げる）。
+    `layer`（省略可）: `search()` と同じ探す対象フィルタ。`k_ceiling`（省略可・既定 50）: `k` の上限（`search()` と同じく、上限まで検証済みの呼び出し元が引き上げる）。`exact`（省略可）: `search()` と同じ識別子の完全一致フィルタ。
     """
     q = (query or "").strip()
     if not q:
@@ -1661,6 +1793,8 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
     lfilt = layer_mod.es_filter(layer)
     if lfilt:
         flt.append(lfilt)
+    if exact:
+        flt.append(_exact_filter(exact))
     # 上位ちょうど `k` 件を取ってから重要度で並べ替えると、「高」のヒットが取得時点で落選して浮上できない。有界の overfetch（`k*3`・上限 `k+50`）で多めに取り、補正・再ソートの後に `k` 件へ切る（重要度なしの資料フォルダは補正が no-op で結果不変）
     fetch_k = min(k * 3, k + 50)
     body = {"size": fetch_k,

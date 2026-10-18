@@ -16,12 +16,14 @@ _EXPORT = _ROOT / "fixtures" / "pdf_export"
 _OJA_PDF_EASY = _ROOT / "fixtures" / "eval" / "office_ja" / "inputs" / "OJA-PDF-EASY.pdf"
 
 
-def _pdf_with(path: Path, content: str) -> Path:
+def _pdf_with(path: Path, content: str, *, size: tuple[float, float] = (300, 300), rotate: int = 0) -> Path:
     from pypdf import PdfWriter
-    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject, NumberObject
 
     writer = PdfWriter()
-    page = writer.add_blank_page(width=300, height=300)
+    page = writer.add_blank_page(width=size[0], height=size[1])
+    if rotate:
+        page[NameObject("/Rotate")] = NumberObject(rotate)
     font = DictionaryObject({
         NameObject("/Type"): NameObject("/Font"),
         NameObject("/Subtype"): NameObject("/Type1"),
@@ -112,3 +114,70 @@ def test_adjacent_values_across_vertical_rule_stay_in_separate_cells(tmp_path):
         assert set(cells) == {"NAME", "VALUE", "123", "ABC"}
         assert (cells["123"]["row"], cells["123"]["column"]) == (2, 1)
         assert (cells["ABC"]["row"], cells["ABC"]["column"]) == (2, 2)
+
+
+def _table_content(left: float, top: float, columns: list[float], rows: list[list[str]], *, row_height: float = 20) -> str:
+    """縦横の罫線つきの表を、左上 (left, top) から表示される向きで描く content stream。"""
+    bottom = top - row_height * len(rows)
+    right = left + sum(columns)
+    xs = [left]
+    for width in columns:
+        xs.append(xs[-1] + width)
+    out = "".join(f"{x} {top} m {x} {bottom} l S\n" for x in xs)
+    out += "".join(f"{left} {top - row_height * k} m {right} {top - row_height * k} l S\n" for k in range(len(rows) + 1))
+    for k, row in enumerate(rows):
+        out += "".join(_text(xs[j] + 3, top - row_height * (k + 1) + 6, value) for j, value in enumerate(row))
+    return out
+
+
+def test_rotated_page_table_keeps_headers_rows_and_columns(tmp_path):
+    """/Rotate 90 のページの表は、表示される向きの行・列のまま取れる（見出しが逆順・文字ばらばらにならない）。"""
+    rows = [["ITEM", "TEMP", "PH"], ["A", "90", "4.6"], ["B", "88", "4.8"], ["C", "86", "5.0"]]
+    display = _table_content(60, 200, [80, 80, 80], rows)
+    # 表示される向き（幅 300・高さ 400）で描いた内容を、/Rotate 90 のページの user space へ写す
+    content = f"q 0 1 -1 0 400 0 cm\n{display}Q\n"
+    path = _pdf_with(tmp_path / "rotated.pdf", content, size=(400, 300), rotate=90)
+    tables = _elements(path, "table")
+    assert len(tables) == 1 and len(tables[0].extension["column_boundaries"]) == 4
+    by_slot = {(e.locator.extension["row"], e.locator.extension["column"]): e.value for e in _elements(path, "cell")}
+    for r, row in enumerate(rows, start=1):
+        for c, value in enumerate(row, start=1):
+            assert by_slot[(r, c)] == value
+    page = next(e for e in _elements(path, "page"))
+    assert page.locator.bbox[2:] == [300.0, 400.0]            # 表示される向きの幅・高さ
+
+
+def test_table_without_column_rules_keeps_rows_as_text_lines(tmp_path):
+    """枠と横罫線だけの統計表（縦罫線なし・3 桁空白区切り・途中の区切り行）は、列を 1 つのセルに押し込まず行ごとの文字で残る。"""
+    lines = [
+        ("CAUSE", "2023", "RATE", "2022"),
+        ("Total", "1 589 533", "100.0", "1 605 378"),
+        ("Cancer", "378 829", "23.8", "381 505"),
+        ("Male", "", "", ""),
+        ("Cancer", "220 339", "26.5", "221 572"),
+    ]
+    columns = [50, 150, 210, 270]
+    content = "50 100 m 50 220 l S\n350 100 m 350 220 l S\n"
+    for k in (0, 1, 3, 5):
+        content += f"50 {220 - 24 * k} m 350 {220 - 24 * k} l S\n"
+    for k, row in enumerate(lines):
+        content += "".join(_text(x, 220 - 24 * (k + 1) + 8, v) for x, v in zip(columns, row, strict=True) if v)
+    path = _pdf_with(tmp_path / "frame.pdf", content)
+    assert _elements(path, "table") == [] and _elements(path, "cell") == []
+    values = [e.value for e in _elements(path, "positioned_text")]
+    assert "Total 1 589 533 100.0 1 605 378" in "\n".join(values)
+    assert any(v.split("\n")[:2] == ["Male", "Cancer 220 339 26.5 221 572"] for v in values)
+    assert any(v.startswith("CAUSE 2023 RATE 2022") for v in values)
+
+
+def test_grid_with_several_columns_packed_into_one_cell_falls_back_to_text_lines(tmp_path):
+    """縦罫線が一部しか無く、1 セルの同じ行に 3 つ以上の列の値が並ぶ格子は、表にせず行ごとの文字で残る。"""
+    content = "".join(f"{x} 100 m {x} 200 l S\n" for x in (50, 120, 350))
+    content += "".join(f"50 {y} m 350 {y} l S\n" for y in (100, 150, 200))
+    for y, row in ((170, ("Total", "1 589 533", "100.0", "1 605 378")), (120, ("Cancer", "378 829", "23.8", "381 505"))):
+        content += _text(55, y, row[0])
+        content += "".join(_text(x, y, v) for x, v in zip((130, 200, 280), row[1:], strict=True))
+    path = _pdf_with(tmp_path / "packed.pdf", content)
+    assert _elements(path, "table") == []
+    values = [e.value for e in _elements(path, "positioned_text")]
+    assert any("Total 1 589 533 100.0 1 605 378" in v for v in values)

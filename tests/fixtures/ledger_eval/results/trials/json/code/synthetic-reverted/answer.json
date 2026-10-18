@@ -1,0 +1,79 @@
+{
+  "completion": "partial",
+  "stop_kind": "codex_partial",
+  "body": "架空の回答。docs/a.md を参照した。",
+  "notices": [
+    {
+      "kind": "review_continuation",
+      "text": "架空の通知"
+    },
+    {
+      "kind": "review_reverted",
+      "text": "架空の通知"
+    }
+  ],
+  "activity": {
+    "settings": {
+      "model": "synthetic-model",
+      "depth": "standard",
+      "mode": "standard",
+      "schema_level": 2
+    },
+    "agents": [
+      {
+        "role": "parent",
+        "tokens": {
+          "input_tokens": 10
+        },
+        "tools": {
+          "exec": {
+            "calls": 61
+          }
+        }
+      }
+    ]
+  },
+  "call_stats": {
+    "v": 1,
+    "calls": 7,
+    "missing": 0,
+    "tools": [
+      {
+        "ms": 3,
+        "role": "parent",
+        "tool": "es_search",
+        "calls": 0,
+        "found": 1,
+        "errors": 0,
+        "truncated": 0
+      },
+      {
+        "ms": 3,
+        "role": "child",
+        "tool": "es_search",
+        "calls": 0,
+        "found": 0,
+        "errors": 0,
+        "truncated": 0
+      },
+      {
+        "ms": 3,
+        "role": "parent",
+        "tool": "read_around",
+        "calls": 3,
+        "found": 0,
+        "errors": 0,
+        "truncated": 0
+      },
+      {
+        "ms": 3,
+        "role": "child",
+        "tool": "read_around",
+        "calls": 4,
+        "found": 0,
+        "errors": 0,
+        "truncated": 0
+      }
+    ]
+  }
+}

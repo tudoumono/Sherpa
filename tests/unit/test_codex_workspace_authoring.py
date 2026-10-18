@@ -134,7 +134,10 @@ def test_resolve_mcp_budget_ceiling_and_plain_dict():
     assert small["SHERPA_MCP_TOOL_BUDGET_BYTES"] == str(16 * 1024)
     result = _resolve_mcp_budget({})
     assert isinstance(result, dict)
-    assert set(result) == {"SHERPA_MCP_TOOL_BUDGET_BYTES", "SHERPA_MCP_TOOL_MAX_HITS", "SHERPA_MCP_TOOL_WINDOW_CAP"}
+    assert set(result) == {"SHERPA_MCP_TOOL_BUDGET_BYTES", "SHERPA_MCP_READER_BUDGET_BYTES",
+                           "SHERPA_MCP_TOOL_MAX_HITS", "SHERPA_MCP_TOOL_WINDOW_CAP"}
+    assert result["SHERPA_MCP_READER_BUDGET_BYTES"] == "30000"
+    assert small["SHERPA_MCP_READER_BUDGET_BYTES"] == str(16 * 1024)
 
 
 def test_resolve_mcp_budget_hits_and_window():
@@ -153,15 +156,50 @@ def test_resolve_mcp_budget_hits_and_window():
 
 # ===== config.toml の各種項目 =====
 
-def test_config_forwards_mcp_env_items(tmp_path):
+def test_config_disables_external_features(tmp_path):
+    """外部アプリ・プラグイン・ブラウザ・コンピュータ操作は、ターンの設定と -c の両経路で無効になる。"""
+    features = tomllib.loads(_cfg(tmp_path))["features"]
+    assert set(SB.EXTERNAL_FEATURES_OFF) >= {"apps", "plugins", "browser_use", "computer_use"}
+    assert all(features[f] is False for f in SB.EXTERNAL_FEATURES_OFF)
+    args = SB.external_features_c_args()
+    assert all(f"features.{f}=false" in args for f in SB.EXTERNAL_FEATURES_OFF)
+
+
+def test_config_forwards_mcp_env_items(tmp_path, monkeypatch):
     """extra_mcp_env・sidecar_path・layer は MCP サーバの env として書かれ、省略時や mcp=False では出ない。"""
+    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
     cfg = _cfg(tmp_path, extra_mcp_env={"SHERPA_MCP_TOOL_BUDGET_BYTES": "65536"}, name="a")
+    assert "SHERPA_DISABLE_EMBED" not in tomllib.loads(cfg)["mcp_servers"]["sherpa"]["env"]
     assert "SHERPA_MCP_TOOL_BUDGET_BYTES" in cfg and "65536" in cfg
     assert "SHERPA_MCP_SIDECAR" not in cfg and "SHERPA_MCP_LAYER" not in _cfg(tmp_path, name="b")
     assert "/tmp/run-x/.mcp_sidecar.jsonl" in _cfg(tmp_path, sidecar_path="/tmp/run-x/.mcp_sidecar.jsonl", name="c")
     assert 'SHERPA_MCP_LAYER = "code"' in _cfg(tmp_path, layer="code", name="d")
     off = _cfg(tmp_path, mcp=False, sidecar_path="/tmp/run-x/.mcp_sidecar.jsonl", name="e")
     assert "mcp_servers" not in off and "SHERPA_MCP_SIDECAR" not in off
+
+
+def test_config_mcp_child_inherits_disabled_embeddings_without_database_reads(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHERPA_DISABLE_EMBED", "1")
+    monkeypatch.setenv("PGPASSWORD", "fixture-db-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-api-key")
+    server = tomllib.loads(_cfg(tmp_path))["mcp_servers"]["sherpa"]
+    clean = SB._codex_clean_env(tmp_path / "ch", tmp_path / "tmp")
+    assert "SHERPA_DISABLE_EMBED" not in clean
+    assert not any(k.startswith("PG") or k == "OPENAI_API_KEY" for k in clean | server["env"])
+    child = subprocess.run([server["command"], "-c", """
+import json
+from sherpa import embeddings, es_index, store
+
+def forbid_database():
+    raise AssertionError("embedding disable must avoid database reads")
+
+store.get_system_settings = forbid_database
+print(json.dumps([es_index._embed_system_settings_snapshot(), embeddings.cfg(),
+                  embeddings.cloud_selected_but_unavailable()]))
+"""], env={**clean, **server["env"], "PYTHONDONTWRITEBYTECODE": "1"},
+                           cwd=tmp_path, text=True, capture_output=True, timeout=10)
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout) == [None, None, False]
 
 
 def test_config_mcp_creds_in_config_file_not_cmdline(tmp_path, monkeypatch):
@@ -267,13 +305,20 @@ def test_config_writes_agents_sections_when_multi_agent(tmp_path):
     assert "[agents]" not in off and "[agents.worker]" not in off
 
     ch = tmp_path / "on"
+    legacy = ch / "agents"
+    legacy.mkdir(parents=True)
+    for role in ("worker", "evaluator"):
+        (legacy / f"{role}.toml").write_text('model = "gpt-5.5"\n')
+    (legacy / "keep.txt").write_text("keep")
     SB._write_codex_authoring_config(ch, ["/kb"], "low", True, "test", None,
                                     multi_agent=True, orchestrator_model="gpt-5.5")
     cfg = (ch / "config.toml").read_text()
     assert "[agents]" in cfg and "[agents.worker]" in cfg and "[agents.evaluator]" in cfg
     assert f'default_subagent_model = "{SB._CODEX_WORKER_MODEL_FALLBACK}"' in cfg
     assert "max_concurrent_threads_per_session" in cfg
-    worker_path, evaluator_path = ch / "agents" / "worker.toml", ch / "agents" / "evaluator.toml"
+    worker_path, evaluator_path = ch / "agent-roles" / "worker.toml", ch / "agent-roles" / "evaluator.toml"
+    assert not (legacy / "worker.toml").exists() and not (legacy / "evaluator.toml").exists()
+    assert (legacy / "keep.txt").read_text() == "keep"
     assert f'config_file = "{worker_path}"' in cfg and f'config_file = "{evaluator_path}"' in cfg
     assert worker_path.is_file() and evaluator_path.is_file()
     assert ch.resolve() in worker_path.resolve().parents   # 子 config は codex_home 配下（model-shell から不可視）
@@ -291,7 +336,25 @@ def test_config_writes_agents_sections_when_multi_agent(tmp_path):
     # orchestrator_model 省略: evaluator は worker と同じモデル
     ch2 = tmp_path / "no-orch"
     SB._write_codex_authoring_config(ch2, ["/kb"], "low", True, "test", None, multi_agent=True)
-    assert f'model = "{SB._CODEX_WORKER_MODEL_FALLBACK}"' in (ch2 / "agents" / "evaluator.toml").read_text()
+    assert f'model = "{SB._CODEX_WORKER_MODEL_FALLBACK}"' in (ch2 / "agent-roles" / "evaluator.toml").read_text()
+
+
+def test_role_migration_does_not_follow_an_agents_directory_symlink(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for name in ("worker.toml", "evaluator.toml", "keep.txt"):
+        (outside / name).write_text(name)
+    ch = tmp_path / "codex-home"
+    ch.mkdir()
+    (ch / "agents").symlink_to(outside, target_is_directory=True)
+    try:
+        with pytest.raises(OSError):
+            SB._write_codex_agent_role_configs(
+                ch, worker_model="gpt-5.5", worker_reasoning="medium",
+                evaluator_model="gpt-5.5", evaluator_reasoning="low")
+    finally:
+        assert {p.name: p.read_text() for p in outside.iterdir()} == {
+            name: name for name in ("worker.toml", "evaluator.toml", "keep.txt")}
 
 
 def test_codex_worker_model_configurable_via_system_settings(tmp_path):
@@ -303,7 +366,7 @@ def test_codex_worker_model_configurable_via_system_settings(tmp_path):
     SB._write_codex_authoring_config(ch, ["/kb"], "low", True, "test", None, multi_agent=True,
                                     system_settings={"codex_worker_model": "gpt-5.9-custom"})
     assert 'default_subagent_model = "gpt-5.9-custom"' in (ch / "config.toml").read_text()
-    assert 'model = "gpt-5.9-custom"' in (ch / "agents" / "worker.toml").read_text()
+    assert 'model = "gpt-5.9-custom"' in (ch / "agent-roles" / "worker.toml").read_text()
 
 
 def test_agents_md_multi_agent_rounds_and_worker_usage(tmp_path):

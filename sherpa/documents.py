@@ -4,9 +4,12 @@
 """
 from __future__ import annotations
 
+import os
+import time
+
 from . import scope_infer, worlds
-from .ingest import importance
-from .ingest.world_graph import resolve_path
+from .ingest import importance, text_kind
+from .ingest.world_graph import resolve_path, valid_rel_parts
 
 
 def resolve(rel: str, world: str | None = None):
@@ -40,3 +43,43 @@ def world_rel_set(world: str | None = None, root=None, strict: bool = False, *,
     also = worlds.archives_dir(world) if world is not None else None
     return {r for _rp, r in scope_infer.safe_files(wd, strict=strict, deadline=deadline, also=also)
            if not importance.is_importance_control_path(r)}
+
+
+def _listed_by_walk(root, rel: str) -> bool:
+    """`scope_infer.safe_files(root)` が列挙するはずの rel か（木を歩かず、rel の各階層を直接 lstat して判定する）。
+    歩き方と同じ除外（版管理フォルダ配下・ノイズファイル・symlink・root 外）を適用する。"""
+    parts = valid_rel_parts(rel)
+    if parts is None or any(scope_infer.is_vcs_dir_name(p) for p in parts[:-1]):
+        return False
+    name = parts[-1]
+    if text_kind.is_noise(name, os.path.splitext(name)[1].lower()):
+        return False
+    return resolve_path(root, rel) is not None
+
+
+def existing_rels(world: str | None, rels, *, deadline: float | None = None) -> set:
+    """`rels` のうち資料フォルダ（とアーカイブ展開先）に実在するものの集合。`world_rel_set(world) & rels` と同じ結果を、木を全部歩かずに返す。
+    rel の形が不正で直接判定できないもの（`\\` を含む実ファイル名など）がある場合だけ、全走査の `world_rel_set` で確かめる。
+    """
+    if deadline is not None and time.monotonic() > deadline:
+        raise scope_infer.ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
+    rels = list(rels)
+    if not rels:
+        return set()
+    world = world or worlds.default_world()
+    wd = worlds.world_dir(world)
+    if not wd:
+        return set()
+    arch = worlds.archives_dir(world)
+    found, undecidable = set(), False
+    for rel in {r for r in rels if isinstance(r, str) and r}:
+        if importance.is_importance_control_path(rel):
+            continue
+        if valid_rel_parts(rel) is None:
+            undecidable = True
+        elif _listed_by_walk(wd, rel) or _listed_by_walk(arch, rel):
+            found.add(rel)
+    if undecidable:
+        full = world_rel_set(world, deadline=deadline)
+        found |= {r for r in rels if isinstance(r, str) and r in full}
+    return found

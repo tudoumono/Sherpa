@@ -120,6 +120,7 @@ from .worlds import (
     backfill_manifest_and_doc_count,
     delete_world_row,
     get_world,
+    get_world_root,
     get_world_status_row,
     list_worlds_db,
     restore_bind_invalidate_sig,

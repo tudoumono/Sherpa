@@ -1,0 +1,22 @@
+{
+  "commit": "synthetic-head-1",
+  "cli": "0.0.0",
+  "cli_sha256": "synthetic-cli",
+  "model": "synthetic-model",
+  "depth": "standard",
+  "mode": "standard",
+  "schema_level": 2,
+  "manifest_sha256": "synthetic-manifest",
+  "corpus_sha256": "synthetic-corpus",
+  "review_caps": {
+    "json": 2
+  },
+  "es": "BM25 only",
+  "seed": 7,
+  "project": "synthetic",
+  "database": "synthetic",
+  "ports": {
+    "api_port": 1
+  },
+  "fingerprint": "synthetic-fingerprint"
+}

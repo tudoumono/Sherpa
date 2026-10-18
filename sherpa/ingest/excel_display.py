@@ -225,11 +225,13 @@ def _format_decimal(value: int | float, code: str) -> str | None:
         return None
     first, last = placeholders[0], placeholders[-1]
     prefix = _unquote_literal(code[:first])
-    suffix = _unquote_literal(code[last + 1:])
+    tail = code[last + 1:]
+    scale_commas = len(tail) - len(tail.lstrip(","))
+    suffix = _unquote_literal(tail[scale_commas:])
     core = code[first:last + 1]
     percent_count = code.count("%")
     try:
-        number = Decimal(str(value)) * (Decimal(100) ** percent_count)
+        number = Decimal(str(value)) * (Decimal(100) ** percent_count) / (Decimal(1000) ** scale_commas)
     except InvalidOperation:
         return None
 

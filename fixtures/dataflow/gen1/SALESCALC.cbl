@@ -1,0 +1,25 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SALESCALC.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT CALC-OUT ASSIGN TO UT-S-CALCOUT
+               ORGANIZATION IS SEQUENTIAL.
+           SELECT AUDIT-OUT ASSIGN TO UT-S-AUDITDD.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  CALC-OUT.
+       01  CALC-REC            PIC X(80).
+       FD  AUDIT-OUT.
+       01  AUDIT-REC           PIC X(80).
+       WORKING-STORAGE SECTION.
+           COPY RATE-CPY.
+       01  WS-AMOUNT           PIC 9(7).
+       PROCEDURE DIVISION.
+           OPEN OUTPUT CALC-OUT
+                       AUDIT-OUT.
+           COMPUTE WS-AMOUNT = WS-AMOUNT * TAX-RATE.
+           MOVE WS-AMOUNT TO CALC-REC.
+           WRITE CALC-REC.
+           CLOSE CALC-OUT AUDIT-OUT.
+           STOP RUN.

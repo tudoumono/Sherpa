@@ -59,6 +59,9 @@ ALLOWED_REFS = {
     "config_key": frozenset({("ACCESSES", "Config")}),
     **{v: frozenset({("ACCESSES", "Table")}) for v in ("exec_sql", "mapper_sql", "vba_sql")},
     **{v: frozenset({("INVOKES", "Batch")}) for v in ("exec_proc", "include_member")},
+    "use": frozenset({("FLOWS_TO", "DataItem")}),
+    "write_file": frozenset({("FLOWS_TO", "Dataset")}),
+    "read_file": frozenset({("FLOWS_TO", "Dataset")}),
 }
 NAME_FORMS = frozenset({"plain", "qualified", "type_ref"})
 RULE_LANGUAGES = frozenset({"java", "xml_config"})

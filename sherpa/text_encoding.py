@@ -284,6 +284,11 @@ def detect_fd_quality(fd: int) -> tuple[str, float, bool]:
     return result
 
 
+def seed_cache(st: os.stat_result, value: tuple[str, float, bool]) -> None:
+    """ディスクキャッシュ由来の判定結果を、同じファイル状態 `st` の判定としてプロセス内キャッシュへ入れる。"""
+    _cache_put((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns), value)
+
+
 def detect_fd(fd: int) -> str:
     """開いた fd の先頭から最大 DETECT_CAP_BYTES を判定する。pread でファイル位置を保ち、I/O 失敗は呼出元へ伝える。"""
     return detect_fd_quality(fd)[0]

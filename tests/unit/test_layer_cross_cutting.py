@@ -93,13 +93,10 @@ def test_accept_vs_decline_classification_agrees_across_grep_agentic_es(monkeypa
 
     monkeypatch.setattr(es_index, "_req", fake_req)
     r = es_index.index_world(world)
-    assert r["indexed"] == 2
+    assert r["indexed"] == 1                                 # ソース（受理）は ES に入れない。資料落ちだけが入る
     bodies = [json.loads(ln) for i, ln in enumerate(captured["bulk"].strip().split("\n")) if i % 2 == 1]
     by_doc = {b["doc_id"]: b for b in bodies}
-    assert by_doc["accepted.txt"]["branch"] == "source"
+    assert set(by_doc) == {"declined.txt"}
     assert by_doc["declined.txt"]["branch"] == "office"
-    # `layer.es_filter("code")`=={"term": {"branch": "source"}}／`"docs"`==must_not 同条件と同じ選別。
-    code_side = {doc_id for doc_id, b in by_doc.items() if b["branch"] == "source"}
-    docs_side = {doc_id for doc_id, b in by_doc.items() if b["branch"] != "source"}
-    assert code_side == {"accepted.txt"}
-    assert docs_side == {"declined.txt"}
+    # `layer.es_filter("docs")`==must_not {"term": {"branch": "source"}} と同じ選別（索引にある文書は全て docs 側）。
+    assert all(b["branch"] != "source" for b in by_doc.values())

@@ -11,7 +11,8 @@ from ... import investigation_ledger
 from ... import layer as layer_mod
 from ..base import _log, _node
 from .codex_cli import build_launch, log_turn_start, resolve_reasoning
-from . import sandbox
+from . import sandbox, plan_ledger
+from ...env_int import env_int
 from .ledger_gate import (
     _FINAL_ANSWER_VOICE,
     _investigation_tree_has_symlink,
@@ -94,6 +95,9 @@ def enter_conversation(self, ctx, st, decision):
 def prepare_run(self, ctx, st, decision):
     """Codex を起動する準備: 層・直読の可否の確認（失敗は正直に伝えて True＝終了）・作業領域・調査台帳の復元・推論の設定・プロンプト・起動引数・開始ログ。"""
     _plain = st._plain
+    st._ledger_style = plan_ledger.effective_style(
+        plain=_plain, ollama=self._ollama_base_url is not None,
+        schema_level=env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 2, 0, 2))
     uid = st.uid
     users_dir = st.users_dir
     run_dir = st.run_dir
@@ -186,7 +190,7 @@ def prepare_run(self, ctx, st, decision):
     (st._investigation_dir / "items").mkdir(parents=True, exist_ok=True)
     # 前ターン退避の扱い（会話 id が無い非永続ターンは何もしない）: 永続台帳ディレクトリ（`workspace/.codex-sessions/{cid}`）に未完了台帳が残っていれば、「続き」宣言のときだけ復元し、それ以外は消す。判定は `_session_persistence_enabled`（conversation_id あり かつ サンドボックス有効）で行う（`SHERPA_CODEX_SANDBOX=0` は常に `--ephemeral` で `.codex-sessions/{cid}` を作らない）。
     # 素の Codex（plain）は台帳を使わず、standard が退避した台帳を復元も削除も退避もしない。
-    if st._session_persistence_enabled and not _plain:
+    if st._session_persistence_enabled and not _plain and st._ledger_style == "json":
         st._ledger_home = _safe_codex_sessions_home(users_dir, uid, ctx.conversation_id)
     if st._ledger_home is not None:
         _retired_investigation = st._ledger_home / "investigation"
@@ -213,7 +217,7 @@ def prepare_run(self, ctx, st, decision):
     # 復元が行われなかった・失敗したターンは `_investigation_dir` が空のままで `pending_continuation_review` は `None` を返し、注入しない側へ倒れる。
     _investigation_reviews_for_prompt = investigation_ledger.load_reviews(st._investigation_dir)
     _continuation_review_note = ""
-    if (not _plain
+    if (not _plain and st._ledger_style == "json"
             and (ctx.message or "").strip().startswith(("続き", "つづき", "続けて"))):
         _pending_review = investigation_ledger.pending_continuation_review(
             _investigation_reviews_for_prompt)

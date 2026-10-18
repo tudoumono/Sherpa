@@ -105,8 +105,6 @@ _LEDGER_REVIEW_PROMPT = (
     "具体的な値まで展開し、台帳と根拠にある事実以外は新たに足さないでください。"
     + _FINAL_ANSWER_VOICE
 )
-# 見直しを頼む回数の上限（2回まで）。台帳継続の上限（`_LEDGER_CONTINUE_CAP`）とは別枠。目録を増やさずに台帳を未完了へ戻した見直しも1回に数える。
-_LEDGER_REVIEW_CAP = 2
 
 
 # 台帳にまだ解決していない「追加の観点」の義務（`investigation_ledger.pending_continuation_review()`）が残っていたら、回答の末尾に定型文「追加で調べますか？」を付ける（AI の自由記述文はそのまま流さない）。

@@ -149,7 +149,7 @@ def test_cobol_jcl_copybook_graph_is_unaffected_by_the_extra_transparency_mechan
         src_node = by_cid.get(e["src"])
         if src_node and src_node.get("analyzer") in ("cobol", "jcl", "copybook"):
             is_cobol_call = src_node["analyzer"] == "cobol" and e["type"] == "INVOKES"
-            allowed = base_edge_keys | {"via"} if is_cobol_call else base_edge_keys
+            allowed = base_edge_keys | {"via"} if (is_cobol_call or e["type"] == "FLOWS_TO") else base_edge_keys   # データの流れ `FLOWS_TO` は `via` を持つ
             assert set(e) <= allowed, e
             if is_cobol_call and "via" in e:
                 assert e["via"] == "call"

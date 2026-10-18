@@ -336,7 +336,7 @@ def test_include_presumed_false_reaches_run_impact_only_when_changed(monkeypatch
     monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _AllDocs())
     ss.search("w", "q", engines=["graph"])
     ss.search("w", "q", engines=["graph"], include_presumed=False)
-    assert seen == [{}, {"include_presumed": False}]
+    assert seen == [{"flow_depth": 0}, {"flow_depth": 0, "include_presumed": False}]
 
 
 # ---- RV 1 巡目の指摘 -------------------------------------------------------------------------------
@@ -386,17 +386,20 @@ def test_depth_check_overload_keeps_main_result_and_marks_unknown(monkeypatch):
 
 
 def test_world_impact_converts_depth_check_overload_to_unknown(monkeypatch):
-    monkeypatch.setattr(world_neo4j, "_run_read_capped", lambda *a, **k: [{"cid": "x", "name": "B", "label": "Module",
-        "status": "active", "dpath": "p", "top": "t", "analyzer": None, "path_names": ["B"], "edges": []}])
+    start = {"cid": "c", "name": "A", "path": "p"}
+    row = {"cid": "x", "name": "B", "label": "Module", "status": "active", "dpath": "p", "top": "t",
+           "analyzer": None, "to_cid": "c", "edge": {"type": "INVOKES", "doc": "d", "line": 1}}
+
+    def _run(session, cypher, **k):
+        if "$seen" in cypher:
+            raise world_neo4j.GraphQueryOverloadError("timeout", world="w")
+        return [start] if "$starts" in cypher else [row]
+
+    monkeypatch.setattr(world_neo4j, "_run_read_capped", _run)
     monkeypatch.setattr(world_neo4j, "check_schema_era", lambda *a, **k: None)
     monkeypatch.setattr(world_neo4j, "_attach_importance", lambda *a, **k: None)
-
-    def _over(*a, **k):
-        raise world_neo4j.GraphQueryOverloadError("timeout", world="w")
-
-    monkeypatch.setattr(world_neo4j, "_impact_depth_truncated", _over)
     info: dict = {}
-    items = world_neo4j.world_impact(object(), ["c"], "w", info=info)
+    items = world_neo4j.world_impact(object(), ["c"], "w", depth=1, info=info)
     assert len(items) == 1 and info == {"depth_truncated": None, "depth_check_limit": "timeout"}
 
 

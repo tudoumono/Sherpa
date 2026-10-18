@@ -206,13 +206,13 @@ def test_index_world_excludes_unreadable_documents_even_if_reread_succeeds(monke
     assert {b["doc_id"] for b in bulk.bodies} == {"ok.md"}
 
 
-@pytest.mark.parametrize("docs,texts,no_embed,embedded", [
+@pytest.mark.parametrize("docs,texts,excluded,kept", [
     ([_doc("a.cbl", branch="source"), _doc("b.md", branch="office")],
      {"a.cbl": "コード本文", "b.md": "資料本文"}, "a.cbl", "b.md"),
-    ([_doc("data.csv", branch="office", doctype=text_kind.DOCUMENT_DOCTYPE_LABEL), _doc("note.md", branch="office", doctype="設計書")],
-     {"data.csv": "csv本文", "note.md": "設計書本文"}, "data.csv", "note.md"),
-], ids=["branch_source", "light_text_document_label"])
-def test_index_world_skips_embedding_for_source_and_light_text(monkeypatch, tmp_path, docs, texts, no_embed, embedded):
+    ([_doc("app.py", branch="source", doctype=text_kind.CODE_DOCTYPE_LABEL), _doc("note.md", branch="office", doctype="設計書")],
+     {"app.py": "汎用コード本文", "note.md": "設計書本文"}, "app.py", "note.md"),
+], ids=["branch_source", "light_text_code_label"])
+def test_index_world_does_not_send_source(monkeypatch, tmp_path, docs, texts, excluded, kept):
     bulk = _index_env(monkeypatch, docs, read=lambda w, d: texts[d["name"]], ec=_EC, tmp_path=tmp_path)
     embed_calls = []
 
@@ -222,15 +222,44 @@ def test_index_world_skips_embedding_for_source_and_light_text(monkeypatch, tmp_
 
     monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
     r = es_index.index_world("w")
-    assert embed_calls == [[texts[embedded]]]                   # 除外側のテキストは embed に一切渡さない
-    assert bulk.of(no_embed) and all("embedding" not in c for c in bulk.of(no_embed))
-    assert bulk.of(embedded) and all(c.get("embedding") == [0.1, 0.2, 0.3] for c in bulk.of(embedded))
-    assert r["vectors"] is True
+    assert bulk.of(excluded) == []                              # ES に送らない
+    assert embed_calls == [[texts[kept]]]                       # 除外側のテキストは embed にも渡さない
+    assert bulk.of(kept) and all(c.get("embedding") == [0.1, 0.2, 0.3] for c in bulk.of(kept))
+    assert r["indexed"] == 1 and r["vectors"] is True
 
 
-def test_index_world_includes_stage2_light_text_docs(monkeypatch):
+def test_index_world_sends_stage2_text_docs_without_embedding_them(monkeypatch, tmp_path):
+    """第 2 段（csv・log などのテキスト資料）は ES に送る（40 行チャンク）が、埋め込みには渡さない。第 1 段（汎用コード）は読まず送らない。"""
     docs = [_doc("app.py", branch="source", doctype=text_kind.CODE_DOCTYPE_LABEL),
-            _doc("README", branch="office", doctype=text_kind.DOCUMENT_DOCTYPE_LABEL)]
+            _doc("data.csv", branch="office", doctype=text_kind.DOCUMENT_DOCTYPE_LABEL),
+            _doc("note.md", branch="office", doctype="設計書")]
+    texts = {"app.py": "コード", "data.csv": "a,b\n1,2", "note.md": "設計書本文"}
+    read_calls = []
+
+    def fake_read(w, d):
+        read_calls.append(d["name"])
+        return texts[d["name"]]
+
+    bulk = _index_env(monkeypatch, docs, read=fake_read, ec=_EC, tmp_path=tmp_path)
+    embed_calls = []
+
+    def fake_embed(texts_, ec, **kw):
+        embed_calls.append(list(texts_))
+        return [[0.1, 0.2, 0.3] for _ in texts_]
+
+    monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
+    r = es_index.index_world("w")
+    assert "app.py" not in read_calls and set(read_calls) == {"data.csv", "note.md"}
+    assert r["indexed"] == 2 and r["chunks"] == 2 and "error" not in r
+    assert {b["doc_id"] for b in bulk.bodies} == {"data.csv", "note.md"}
+    assert bulk.of("data.csv") and all("embedding" not in c for c in bulk.of("data.csv"))
+    assert embed_calls == [[texts["note.md"]]]                  # テキスト資料は embed に渡さない
+    assert all(c.get("embedding") == [0.1, 0.2, 0.3] for c in bulk.of("note.md"))
+
+
+def test_index_world_excludes_source_only_world_without_reading_them(monkeypatch):
+    docs = [_doc("app.py", branch="source", doctype=text_kind.CODE_DOCTYPE_LABEL),
+            _doc("a.cbl", branch="source")]
     read_calls = []
 
     def fake_read(w, d):
@@ -239,10 +268,52 @@ def test_index_world_includes_stage2_light_text_docs(monkeypatch):
 
     bulk = _index_env(monkeypatch, docs, read=fake_read)
     r = es_index.index_world("w")
-    assert read_calls == ["app.py", "README"]
-    assert r["indexed"] == 2 and r["chunks"] == 2
-    assert {b["doc_id"] for b in bulk.bodies} == {"app.py", "README"}
-    assert all("embedding" not in b for b in bulk.bodies)
+    assert read_calls == []
+    assert r["indexed"] == 0 and r["chunks"] == 0 and "error" not in r   # ソースだけの資料フォルダは異常（no_chunks）にしない
+    assert bulk.bodies == []
+
+
+def test_index_world_marks_index_as_source_excluded(monkeypatch):
+    _index_env(monkeypatch, [_doc("a.md", branch="office")])
+    emeta_at_create = {}
+    monkeypatch.setattr(es_index, "ensure_index",
+                        lambda w, dim=None, emeta=None: emeta_at_create.update(emeta or {}) or True)
+    es_index.index_world("w")
+    assert emeta_at_create["source_excluded"] is True
+
+
+def test_source_only_world_converges_after_one_rebuild(monkeypatch):
+    """ソースだけの資料フォルダは正当に 0 件。張り直して件数 0 を刻んだあとは、毎回は張り直さない。"""
+    _reindex_env(monkeypatch)
+    monkeypatch.setattr(es_index, "count", lambda w: 0)
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: _full_meta(doc_count=0))
+    assert es_index.needs_reindex("w", "c1") is False
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: _full_meta())               # 件数の印なし＝未確定の空
+    assert es_index.needs_reindex("w", "c1") is True
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: _full_meta(doc_count=7))    # 件数の印があるのに空＝欠けた
+    assert es_index.needs_reindex("w", "c1") is True
+
+
+def test_replace_document_for_source_deletes_leftover_chunks_and_adds_none(monkeypatch, tmp_path):
+    src = tmp_path / "a.cbl"
+    src.write_text("本文\n", encoding="utf-8")
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: _full_meta())
+    counts = iter([3, 2])
+    monkeypatch.setattr(es_index, "count", lambda w: next(counts))
+    monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
+    monkeypatch.setattr(es_index.corpus_docs, "iter_world_documents",
+                        lambda w, **kw: [_doc("a.cbl", branch="source")])
+    monkeypatch.setattr(es_index.importance, "resolve_for_world", lambda *a, **k: {})
+    monkeypatch.setattr(es_index.worlds, "world_dir", lambda w: tmp_path)
+    monkeypatch.setattr(es_index.worlds, "derived_rag_dir", lambda w: tmp_path / "rag")
+    monkeypatch.setattr(es_index, "_scroll_hits", lambda w, q, src_: [{"_id": "a.cbl#1", "_source": {"text": "古い"}}])
+    sent = []
+    monkeypatch.setattr(es_index, "_send_bulk", lambda w, payloads: sent.extend(payloads))
+    monkeypatch.setattr(es_index, "_req", lambda *a, **k: {})
+    r = es_index.replace_document("w", "a.cbl", src, content_sig="c1")
+    assert "error" not in r and r["chunks"] == 0 and r["deleted"] == 1
+    assert len(sent) == 1 and '"delete"' in sent[0] and "a.cbl#1" in sent[0]
 
 
 @pytest.mark.parametrize("branch,text,expect_features", [
@@ -618,7 +689,7 @@ def _reindex_env(monkeypatch):
 
 def _full_meta(**over) -> dict:
     meta = {"content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-            "arms_sig": "sig-A", "analyzer_config_sig": "acfg-A"}
+            "arms_sig": "sig-A", "analyzer_config_sig": "acfg-A", "source_excluded": True}
     meta.update(over)
     return {k: v for k, v in meta.items() if v is not _DROP}
 
@@ -638,6 +709,7 @@ _DROP = object()
     ({"mapping_version": "5"}, {}, True),
     ({"mapping_version": "6"}, {}, True),
     ({"mapping_version": "7"}, {}, True),
+    ({"source_excluded": _DROP}, {}, True),     # ソースのチャンクが残っている旧索引（印なし）
     ({"chunk_lines": 40}, {}, False),
     ({"chunk_lines": 40}, {"_CHUNK_LINES": 80}, True),
     ({}, {"_CHUNK_LINES": 80}, True),          # chunk_lines 欠落は旧既定 40 として扱う
@@ -674,7 +746,7 @@ def test_needs_reindex_reacts_to_human_md_drift_regardless_of_rag_es_setting(mon
 
     def meta_with(sig):
         return lambda w: {"content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-                          "arms_sig": "sig-A", "human_md_sig": sig}
+                          "arms_sig": "sig-A", "human_md_sig": sig, "source_excluded": True}
 
     monkeypatch.setattr(es_index, "_index_meta", meta_with("human-md-vOLD"))
     assert es_index.needs_reindex("w", "c1") is True
@@ -861,7 +933,7 @@ def test_content_sig_written_only_after_all_batches_succeed(monkeypatch):
 
 
 def test_content_sig_not_confirmed_when_a_batch_fails(monkeypatch):
-    _index_env(monkeypatch, [_doc("a.cbl", branch="source")], read=lambda w, d: "本文")
+    _index_env(monkeypatch, [_doc("a.md", branch="office")], read=lambda w, d: "本文")
     confirmed = []
     monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig: confirmed.append(sig))
     monkeypatch.setattr(es_index, "_wipe_after_bulk_failure", lambda w: None)

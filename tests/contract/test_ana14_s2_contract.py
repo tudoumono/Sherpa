@@ -141,7 +141,8 @@ def test_edges_differ_from_baseline_only_by_start_node_within_the_same_file(buil
     old = Counter(tuple(e) for e in BASELINE[name]["edges"]
                   if not (e[3] == "mention" and _path(e[0]).split("/")[0] != _path(e[2]).split("/")[0]))
     new_list = [(e["src"], e["type"], e["dst"], e.get("via"), e.get("line")) for e in edges]
-    new_list = [e for e in new_list if (_short(e[0]), e[1], _short(e[2]), e[3], e[4]) not in S3_NEW_EDGES]
+    new_list = [e for e in new_list if (_short(e[0]), e[1], _short(e[2]), e[3], e[4]) not in S3_NEW_EDGES
+                and e[1] != "FLOWS_TO"]   # 基準に無い辺型（データの流れ）は始点の移動の比較に含めない
     new = Counter(new_list)
     assert max(new.values()) == 1, [k for k, v in new.items() if v > 1]
     assert max(old.values()) == 1

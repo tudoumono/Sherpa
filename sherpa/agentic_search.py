@@ -75,11 +75,15 @@ _PARAMS_SEARCH = {"type": "object", "properties": {
     "required": ["query"]}
 # es_search は offset を持たない（kNN の候補集合はページ間で固定できず、ページを跨ぐと順位の入れ替わりで重複/欠落が起きる）。続きが必要なら max_hits（絶対上限まで）を増やす。
 _PARAMS_ES_SEARCH = {"type": "object", "properties": {
-    "query": {"type": "string", "description": "検索キーワード（型番・関数名・固有名詞など具体語が有効）"},
+    "query": {"type": "string", "description": "検索キーワード（型番・関数名・固有名詞など具体語が有効）。exact だけで引くときは省略できる"},
     "mode": {"type": "string", "enum": ["hybrid", "keyword", "vector"],
              "description": "検索方式。hybrid（既定）＝語の一致＋意味の近さ・keyword＝語の一致だけ・vector＝意味の近さだけ"},
+    "exact": {"anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
+              "description": "識別子の完全一致（項目ID・画面ID・帳票ID など。文字列または配列）。query と併せると、完全一致で絞ってから本文で順位付けする"},
+    "path_prefix": {"type": "string",
+                    "description": "フォルダで絞る（例: 部署・年度のフォルダ。rel_path の先頭一致）。検索範囲の内側だけを狭められ、範囲は広がらない。省略可"},
     "item": _ITEM_PARAM_SCHEMA},
-    "required": ["query"]}
+    "required": []}
 _PARAMS_LIST_DOCS = {"type": "object", "properties": {
     "path_prefix": {"type": "string",
                     "description": "フォルダで絞る（rel_path の先頭一致・例: '4期保守'）。省略可＝範囲全体"},
@@ -176,6 +180,7 @@ _DESC_FOLDER_TREE = ("world のフォルダ階層を、深さ上限つき・フ�
                      "深さ上限でまだ配下があるフォルダは truncated:true（depth を上げて掘り下げる）。"
                      "フォルダ件数自体が多すぎるときは folders_truncated:true（count が打ち切り前の総数）＝続きは取れないので、その範囲は未確認として扱う。")
 _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素・意味の近さ・関連度ランキング）。"
+            "対象は資料（Office・PDF など）で、ソース（コード）は索引に含まれない——ソースは ripgrep_search で探す。"
             "言い回しが揺れる概念・日本語の同義語・自然文クエリに強い。"
             "ripgrep_search が0件/空振りのときはまずこれを試す。doc_id と抜粋を関連度順で返す。"
             "返す本文は該当箇所の周辺まで（文書全体は返さない）——文書全体を確認したいときは "
@@ -187,6 +192,7 @@ _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素�
             "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。"
             "es_search は候補の発見用——全件が必要な列挙は ripgrep_search"
             "（truncated:true なら next_offset を offset に渡して続きを取る）・list_docs・原本の読取で行う。"
+            "項目ID・画面ID・帳票ID のような鍵付きの問いは exact で引く（Office・PDF の資料のレコードが対象・query は省略できる・query と併せると exact で絞ってから本文で順位付け）。"
             "識別子・コード名・完全一致で探すときは mode:\"keyword\"（または ripgrep_search）、言い回しが揺れる概念・自然文は既定の hybrid、意味だけで広く集めたいときは mode:\"vector\"。各ヒットの keyword_match:false は、その語を含まない＝意味が近いだけ（根拠にする前に本文で確認する）。結果の mode_used が実際に使った方式（埋め込みが使えないときは keyword に縮退し degrade_reason が付く）。"
             f"{_ITEM_PARAM_NOTE}")
 _DESC_ASK = ("回答や検索条件を確定する前にユーザへ確認する。結果が大きく変わる曖昧さがある場合だけ使う。"
@@ -229,7 +235,7 @@ _DESC_GRAPH_RESOLVE = ("関係グラフから、名前（の一部）・種別�
                        f"{_ITEM_PARAM_NOTE}")
 _PARAMS_GRAPH_RESOLVE = {"type": "object", "properties": {
     "name": {"type": "string", "description": "名前の一部（大文字小文字を区別しない・修飾名も対象）。name と path のどちらかは必須"},
-    "kind": {"type": "string", "description": "種別で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config）"},
+    "kind": {"type": "string", "description": "種別で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config／Dataset）"},
     "path": {"type": "string", "description": "所属パスの一部で絞る（例: 'billing/'）"},
     "limit": {"type": "integer", "description": "返す候補の最大数（既定 20・最大 50）"},
     "item": _ITEM_PARAM_SCHEMA}}
@@ -238,20 +244,47 @@ _DESC_GRAPH_IMPACT = ("**起点の canonical_id**（graph_resolve で選んだ�
                       "（同名の別ノードを混ぜないため）。各影響先は canonical_id・kind・path・distance（起点からの段数）・"
                       "trace（影響先から起点までのノード名）・route（辺ごとの種類 type と向き from→to・参照元の資料 doc と行 line）を持つ。"
                       "DOCUMENTS（言及）は影響に数えず、related_documents（起点と影響先を言及する資料・層の限定がないときだけ）として別に返す"
-                      "＝影響先ではなく関連資料。evidence は route と同じ並びで辺ごとの根拠（via＝関係の種類・line・rule＝接続を決めた解決規則・"
+                      "＝影響先ではなく関連資料。データの流れ（ジョブの DD を介したファイルの受け渡し・コピーブックの項目の使用）で届く先は"
+                      "影響先に混ぜず flow_candidates（impact と同じ形＋flow_edges＝経路中の流れの辺の本数）に別に返す"
+                      "＝確証ではなく確かめる候補（レコード単位の過大を含む）。経路の via が write_file／read_file／use。"
+                      "flow_depth（既定 3・最大 10・0 で流れをたどらない）で流れの段数を決め、候補の総数は summary.flow_total、"
+                      "段数の先が残るときは coverage.flow.truncated が true。"
+                      "evidence は route と同じ並びで辺ごとの根拠（via＝関係の種類・line・rule＝接続を決めた解決規則・"
                       "sources＝参照元の資料 doc_id と行の先頭 evidence_limit 件・sources_overflow_count＝返さなかった件数）を持つ"
                       "＝確かめるときは原本のその行を開く。unresolved は起点の名前に一致する「解決できなかった参照」"
                       "（available:false なら未解決の情報が保存されていない旧いグラフ）で、ある場合は影響先が欠けている可能性＝未確認として扱う。"
-                      "depth（既定 5・最大 10）と limit（既定 50・最大 200）で範囲を決める。"
-                      "coverage.complete が false のとき（時間切れ・件数の天井・depth の先に影響先が残る・limit で切った）は、"
-                      "影響先が空でも「影響なし」とは言えない＝未確認（理由は coverage.limits[].kind・depth の先が残るときは "
-                      "coverage.depth.truncated が true）。depth や limit を上げて呼び直すか、範囲を未確認と明記する。"
+                      "depth（既定 5・最大 64）で深さを決める。影響先の総数は count、種別別・フォルダ別・段数別の件数は summary にある。"
+                      "**結果は安定した順序のページで返る**（1 ページは件数 limit〜既定 50・最大 200 と、応答の大きさ（約 24KB）の小さい方まで。"
+                      "根拠が長いと 1 ページの件数は減る）。応答の transfer は今回の範囲を示す"
+                      "（part＝何をページ送りしているか・total＝全件数・offset／returned＝今回返した範囲・next_offset＝続きの位置で無ければ null・"
+                      "has_more・complete）。**next_offset が null でないときは、同じ条件に offset=next_offset と応答の generation を付けて"
+                      "呼び直し、受け取った件数の合計が total になる（next_offset が null になる）まで続ける**。total と受け取った件数を照合し、"
+                      "続きを取るまでは一覧が途中であることを前提にする（先頭のページだけで影響先の全部とは言わない）。"
+                      "**一覧は evidence_limit=0 で最後まで取り**（各影響先は canonical_id・kind・name・path・distance と、経路の辺の種類を順に並べた via だけの軽い形で、"
+                      "list_form が light。trace・route・evidence は付かない）、根拠（route・evidence）が要る対象だけ evidence_limit を 1 以上にして取り直す。"
+                      "part で何をページ送りするかを選ぶ: impact（既定・影響先）／flow（流れの候補・flow_depth が 1 以上のとき）／"
+                      "related_documents（関連資料）。最初のページ（offset 0）には流れの候補と関連資料の先頭も付き、残りがあるものは "
+                      "transfer.other_parts に総数と next_offset が出るので、part を変えて同じ条件で続きを取る。"
+                      "generation は取り込みの世代と条件の印で、続きの呼び出しに同じ値を付ける。取り込みが更新された（graph_generation_mismatch）・"
+                      "条件が違う（graph_page_mismatch）・期限切れ（graph_page_expired）ときはエラーで返るので、offset を 0 にして最初から取り直す"
+                      "（世代の違うページは合わせない）。大きすぎて軽くした要素には item_slimmed が付く（詳細は原本で確かめる）。"
+                      "coverage は 2 つに分けて読む: exploration.complete＝指定した条件（深さ・時間・件数の天井）の中の探索を終えられたか"
+                      "（false のとき、時間切れ・件数の天井・depth の先に影響先が残る＝未確認。理由は exploration.limits[].kind・depth の先が残るときは "
+                      "coverage.depth.truncated が true）、transfer.complete＝探索した結果を最後まで受け取れたか。"
+                      "探索が終わっていても続きのページが残っていれば transfer.complete は false、最後のページで true になる。"
+                      "exploration.complete が false のときは影響先が空でも「影響なし」とは言えない＝未確認。"
+                      "depth を上げて呼び直すか、範囲を未確認と明記する。"
                       f"{_ITEM_PARAM_NOTE}")
 _PARAMS_GRAPH_IMPACT = {"type": "object", "properties": {
     "canonical_id": {"type": "string", "description": "起点の識別子（graph_resolve の candidates[].canonical_id）"},
-    "depth": {"type": "integer", "description": "たどる深さの上限（既定 5・最大 10）"},
-    "limit": {"type": "integer", "description": "返す影響先の最大数（既定 50・最大 200）"},
-    "evidence_limit": {"type": "integer", "description": "辺ごとに返す根拠（sources）の最大件数（既定 3・0〜10）"},
+    "depth": {"type": "integer", "description": "たどる深さの上限（既定 5・最大 64）"},
+    "limit": {"type": "integer", "description": "1 ページに載せる件数の上限（既定 50・最大 200）。応答の大きさでも区切るので、返る件数はこれ以下。続きは offset で取る"},
+    "offset": {"type": "integer", "description": "続きの位置（既定 0）。前の応答の transfer.next_offset をそのまま渡す"},
+    "part": {"type": "string", "enum": ["impact", "flow", "related_documents"],
+             "description": "ページ送りする対象（既定 impact＝影響先・flow＝流れの候補・related_documents＝関連資料）"},
+    "generation": {"type": "string", "description": "続きの呼び出しで、前の応答の generation をそのまま渡す（取り込みの世代と条件の確認用）"},
+    "evidence_limit": {"type": "integer", "description": "辺ごとに返す根拠（sources）の最大件数（既定 3・0〜10）。0 にすると trace・route・evidence の無い軽い一覧（via＝辺の種類の列だけ）になり、1 ページに多く入る。一覧は 0 で取り、根拠が要る対象だけ上げる"},
+    "flow_depth": {"type": "integer", "description": "データの流れの候補をたどる段数（既定 3・最大 10・0 でたどらない）。候補は flow_candidates に別に返る"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["canonical_id"]}
 _PARAMS_GLOB = {"type": "object", "properties": {
@@ -288,6 +321,7 @@ _PARAMS_COMPARE = {"type": "object", "properties": {
 # 原本読取ツール。Codex（MCP 経由）と API 経路の頭脳が同じ関数（`doc_readers.py`）で原本の中身を読む。毎回 Python を書かせず、トークンと実行時間を削り、再現性を上げる（突合・集計など定型外の作業だけ Python に任せる）。
 _DESC_XLSX_SHEETS = ("Excel（.xlsx）原本のシート一覧と大きさを返す（原本を直接読む・派生ではない）。"
                     "doc_id はシート名・行数・列数を先に確認してから xlsx_range で読む範囲を絞るのに使う。"
+                    "非表示のシートは hidden:true（very_hidden:true は Excel の画面からも出せないシート）。"
                     "大きすぎて時間内に数えられないシートは dims_estimated=true で、大きさは記録値（推定）か不明。"
                     "シート一覧が上限で切られたときは truncated:true＝続きは取れないので、その範囲（残りのシート）は未確認として扱う。")
 _PARAMS_XLSX_SHEETS = {"type": "object", "properties": {
@@ -295,9 +329,13 @@ _PARAMS_XLSX_SHEETS = {"type": "object", "properties": {
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _DESC_XLSX_RANGE = ("Excel（.xlsx）原本のセル範囲を表で返す（原本を直接読む・派生ではない）。"
-                    "range 省略時は先頭から max_rows×max_cols（既定200行×50列）。"
-                    "範囲が上限を超えたら切り詰めて truncated:true（range は実際に返した範囲）。"
-                    "セル値は切らない（cells_clipped は Excel の 1 セル上限を超えて切った件数・size_clipped は返却量の上限で行を打ち切った）。"
+                    "range 省略時は先頭から max_rows×max_cols（既定200行×50列）。逆順の範囲は正規化し、行・列が 0 の範囲は拒否する。"
+                    "範囲が上限を超えたら切り詰めて truncated:true（range は実際に返した範囲）。応答の大きさにも上限があり、超えると byte_clipped:true で行が減る"
+                    "（1行が大きいときは先頭の列だけ返して cols_clipped:true・それも入らなければエラー＝列を絞った range で読む）。"
+                    "セル値は書き換えない（cells_clipped は Excel の 1 セル上限を超えて切った件数・size_clipped は返却量の上限で行を打ち切った）。"
+                    "値は保存された値。表示が値と違うセル（割合・日付・千円表示等）は display（セル→表示値）、表示値を作れない書式は display_format（書式コード）で返す"
+                    "（display_clipped は載せきれなかった件数）。非表示の行・列は hidden_rows（行番号）・hidden_cols（列名）、結合セルは merged（値は左上のセルだけ）。"
+                    "非表示でも値は返す＝合計に含めるかは資料の意図で判断する。非表示シートは sheet_hidden:true。layout_check／display_check:unavailable は調べられなかった。"
                     "数式で保存値が無いセルは「値なし（数式）」と返す（formula_no_value が件数・formula_check:unavailable は数式かどうかを確かめられなかった）。"
                     "引用するときはシート名とセル範囲（例 'Sheet1!B3:D10'）で示す。")
 _PARAMS_XLSX_RANGE = {"type": "object", "properties": {
@@ -336,16 +374,38 @@ _PARAMS_PPTX_SLIDES = {"type": "object", "properties": {
     "required": ["doc_id"]}
 _DESC_PDF_PAGES = ("PDF 原本のページのテキストを返す（原本を直接読む・派生ではない）。"
                   "pages（例 '3'・'2-5'・'1,3,5'・既定 '1-5'）でページを指定する（1回10ページまで）。"
-                  "1ページの文字量だけで結果が予算を超える場合でもページ自体は残し、本文を"
-                  "切り詰めて text_truncated:true にする（ページ番号は保つ）。"
-                  "文字層の無いページは no_text_layer:true と「文字なし（スキャンの可能性）」を返す＝本文は読めていない（画像として確認する）。"
+                  "文字層（テキスト）だけを返す＝図・グラフ・画像の中の文字や数値、矢印の向きは読めない。"
+                  "画像があるページは image_count（件数）、線・図形が多いページは drawing_count を付け、"
+                  "それらと文字層の無いページ（白紙を除く）は view_pages（ページ番号）で返す＝pdf_page_image でページを画像にして確かめる。"
+                  "1ページの本文が長いと切って text_truncated:true と"
+                  "next_text_offset を返す（ページを1つだけ指定し、text_offset に next_text_offset を渡すと続きを返す）。"
+                  "文字層の無いページは no_text_layer:true と note を返す＝本文は読めていない"
+                  "（画像あり＝スキャンの可能性、図形のみ、blank:true＝画像も文字も図形もない白紙）。"
                   "指定が無い・既定のままで残りがあれば truncated:true と pages_remaining が付く。範囲外・不正な指定は pages_ignored に返す（有効が無ければエラー）。"
                   "引用するときはページ番号（no）で示す。")
 _PARAMS_PDF_PAGES = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .pdf）"},
     "pages": {"type": "string", "description": "ページ指定（例 '3'・'2-5'・'1,3,5'）。省略時 '1-5'"},
+    "text_offset": {"type": "integer", "description": "ページを1つだけ指定したとき、その本文の何文字目から返すか（text_truncated の next_text_offset の値）。省略時 0"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
+_DESC_PDF_PAGE_IMAGE = ("PDF 原本の 1 ページ（または一部の領域）を画像（PNG）に描き、その絶対パス `path` を返す"
+                       "（原本を直接読む・派生物の場所へ置く・同じ条件ならキャッシュを使い回す）。"
+                       "文字・線・矢印・図・画像を含むページ全体を描くので、図・フロー・スキャン・画像のページを確かめるのに使う"
+                       "（pdf_pages は文字層だけで、図の中や矢印の向きは読めない）。"
+                       "page は物理ページ番号（1 始まり・紙面に印刷されたページ番号ではない。わかれば printed_page を返す）。"
+                       "region は拡大する矩形 [x0, y0, x1, y1]（ページ内の相対座標 0〜1・左上が原点）で、小さな文字や図の一部を大きく見るときに使う。"
+                       "dpi は既定 150・最大 200。画素数・最長辺の上限を超えると縮小して downscaled:true（実際の dpi は dpi で返す）。"
+                       "返ってきた path は `tools.view_image({path})` で開き、`image(r.image_url)` で見る。"
+                       "開けない・読めないときは、読めないと書き、文字層から推定して補わない。")
+_PARAMS_PDF_PAGE_IMAGE = {"type": "object", "properties": {
+    "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .pdf）"},
+    "page": {"type": "integer", "description": "物理ページ番号（1 始まり・1 回 1 ページ）"},
+    "region": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
+               "description": "拡大する領域 [x0, y0, x1, y1]（ページ内の相対座標 0〜1・左上が原点）。省略時はページ全体"},
+    "dpi": {"type": "integer", "description": "解像度（既定 150・最大 200）"},
+    "item": _ITEM_PARAM_SCHEMA},
+    "required": ["doc_id", "page"]}
 _DESC_FILE_HEAD = ("テキスト・コード原本の先頭バイトをそのまま返す（原本を直接読む・派生ではない・"
                   "Office/PDF は対象外＝xlsx_sheets/docx_paragraphs/pptx_slides/pdf_pages を使う）。"
                   "max_bytes（既定65536）まで読み、上限で切れていたら truncated:true。"

@@ -1,0 +1,13 @@
+{
+  "style": "json",
+  "system": "code",
+  "id": "synthetic-overloaded",
+  "hop": 2,
+  "phase": "pilot",
+  "fingerprint": "synthetic-fingerprint",
+  "status": "ok",
+  "conversation_id": 3,
+  "wall_seconds": 400.0,
+  "recall": 1.0,
+  "precision": 0.5
+}

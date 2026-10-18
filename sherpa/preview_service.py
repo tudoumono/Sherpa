@@ -17,7 +17,7 @@ from .ingest import world_graph_service
 # 種別ラベル → 表示の日本語
 _TYPE_JA = {
     "Module": "プログラム", "Copybook": "コピーブック", "DataItem": "項目",
-    "Document": "文書", "Batch": "バッチ", "Table": "テーブル", "Config": "設定",
+    "Document": "文書", "Batch": "バッチ", "Table": "テーブル", "Config": "設定", "Dataset": "データセット",
 }
 
 

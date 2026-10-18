@@ -39,7 +39,7 @@ _CT = "{http://schemas.openxmlformats.org/package/2006/content-types}"
 XLSX_ADAPTER_VERSION = "xlsx-evidence-adapter-v5"
 DOCX_ADAPTER_VERSION = "docx-evidence-adapter-v4"
 PPTX_ADAPTER_VERSION = "pptx-evidence-adapter-v4"
-PDF_ADAPTER_VERSION = "pdf-evidence-adapter-v3"
+PDF_ADAPTER_VERSION = "pdf-evidence-adapter-v5"
 PDF_XOBJECT_MAX_DEPTH = 16
 PDF_XOBJECT_MAX_RESOLUTIONS = 4096
 
@@ -3060,6 +3060,7 @@ _PDF_RULE_MERGE_TOLERANCE = 2.0          # 同じ軸でこの距離以内に並�
 _PDF_RULE_COVER_TOLERANCE = 1.5          # セル境界を罫線が覆うかの端の許容（pt）
 _PDF_GROUP_GAP_RATIO = 0.6               # 同じ行の隣り合う矩形を1語群にまとめる間隔の上限（文字高さ比）
 _PDF_GROUP_LINE_RATIO = 0.3              # 同じ行とみなす下端のずれの上限（文字高さ比）
+_PDF_PACKED_CELL_GROUPS = 3              # 1セルの同じ行にこの数以上の語群が並ぶ格子は、列の罫線が足りない（表として信頼しない）。箱1つ・見出し+本文の2段の囲みは対象外
 _PDFIUM_LOCK = threading.Lock()          # pdfiumはスレッド安全でないため、呼び出しをこのロックで直列化する
 
 
@@ -3234,8 +3235,35 @@ def _pdf_merged_cells(
     return anchor_of, spans
 
 
-def _pdf_text_groups(page: Any, operations: list[tuple[list[Any], bytes]], page_bbox: list[float]) -> list[dict[str, Any]]:
-    """pypdfのdecoded textとlayout座標を安全に突き合わせる。ずれたPDFはpage textへ縮退する。"""
+def _pdf_display_mapper(page: Any):
+    """/Rotate 付きページの user space 座標を、表示される向き（左下原点・y 上向き）へ写す関数。回転なしは None。"""
+    try:
+        rotate = int(getattr(page, "rotation", 0) or 0) % 360
+        media = page.mediabox
+        x0, y0, x1, y1 = float(media.left), float(media.bottom), float(media.right), float(media.top)
+    except Exception:
+        return None
+    if rotate == 90:
+        return lambda x, y: (y - y0, x1 - x)
+    if rotate == 180:
+        return lambda x, y: (x1 - x, y1 - y)
+    if rotate == 270:
+        return lambda x, y: (y1 - y, x - x0)
+    return None
+
+
+def _pdf_map_bbox(mapper, bbox: list[float]) -> list[float]:
+    (ax, ay), (bx, by) = mapper(bbox[0], bbox[1]), mapper(bbox[2], bbox[3])
+    return [round(min(ax, bx), 3), round(min(ay, by), 3), round(max(ax, bx), 3), round(max(ay, by), 3)]
+
+
+def _pdf_text_groups(
+    page: Any, operations: list[tuple[list[Any], bytes]], page_bbox: list[float], *, positioned: bool = True,
+) -> list[dict[str, Any]]:
+    """pypdfのdecoded textとlayout座標を安全に突き合わせる。ずれたPDFはpage textへ縮退する。
+
+    `positioned=False`（/Rotate 付きページ）は座標を信用せず、最初からpage textへ縮退する。
+    """
     decoded: list[tuple[str, float, float]] = []
 
     def visitor(text: str, _cm: list[float], tm: list[float], _font: Any, _size: float) -> None:
@@ -3250,7 +3278,7 @@ def _pdf_text_groups(page: Any, operations: list[tuple[list[Any], bytes]], page_
                   if str(item.get("text", "")).strip()]
     except Exception:
         groups = []
-    if len(groups) != len(decoded):
+    if not positioned or len(groups) != len(decoded):
         return ([{"text": page_text.strip(), "bbox": page_bbox, "position_confidence": 0.0}]
                 if page_text.strip() else [])
     offsets = [tm_x - float(group["tx"]) for (_text, tm_x, _tm_y), group in zip(decoded, groups, strict=True) if tm_x]
@@ -3293,12 +3321,13 @@ def _pdfium_close(document: Any) -> None:
 
 
 def _pdfium_page_text(
-    document: Any, page_index: int, vertical_rules: list[tuple[float, float, float]] = (),
+    document: Any, page_index: int, vertical_rules: list[tuple[float, float, float]] = (), mapper=None,
 ) -> tuple[list[dict[str, Any]], str] | None:
     """pdfiumのtext pageから位置付きtext groupsとページ全文を得る。失敗・文字なしはNone。
 
     矩形は行ごとに取れる。同じ行で間隔が小さい矩形（同じセル内の語の分割）だけ1グループにまとめ、
     間に縦罫線（`vertical_rules`＝[(x, 下, 上)]）がある矩形はまとめない。
+    `mapper` を渡すと（/Rotate 付きページ）矩形・基線を表示される向きへ写してから行にまとめる。
     """
     try:
         import ctypes
@@ -3315,18 +3344,25 @@ def _pdfium_page_text(
                         text = textpage.get_text_bounded(left, bottom, right, top)
                         if not text.strip():
                             continue
+                        char_index = textpage.get_index(left + 0.5, (bottom + top) / 2, 1.0, 1.0)
+                        origin: tuple[float, float] | None = None
+                        size = 0.0
+                        if char_index is not None and char_index >= 0:
+                            origin_x, origin_y = ctypes.c_double(), ctypes.c_double()
+                            if pdfium_c.FPDFText_GetCharOrigin(textpage.raw, char_index, origin_x, origin_y):
+                                origin = (origin_x.value, origin_y.value)
+                            size = pdfium_c.FPDFText_GetFontSize(textpage.raw, char_index)
+                        if mapper is not None:
+                            left, bottom, right, top = _pdf_map_bbox(mapper, [left, bottom, right, top])
+                            if origin is not None:
+                                origin = mapper(*origin)
                         height = max(top - bottom, 1.0)
                         baseline = bottom + height * 0.2
                         font_size = height
-                        char_index = textpage.get_index(left + 0.5, (bottom + top) / 2, 1.0, 1.0)
-                        if char_index is not None and char_index >= 0:
-                            origin_x, origin_y = ctypes.c_double(), ctypes.c_double()
-                            if pdfium_c.FPDFText_GetCharOrigin(textpage.raw, char_index, origin_x, origin_y) \
-                                    and bottom - 1.0 <= origin_y.value <= top + 1.0:
-                                baseline = origin_y.value
-                            size = pdfium_c.FPDFText_GetFontSize(textpage.raw, char_index)
-                            if size > 0:
-                                font_size = size
+                        if origin is not None and bottom - 1.0 <= origin[1] <= top + 1.0:
+                            baseline = origin[1]
+                        if size > 0:
+                            font_size = size
                         rects.append({"text": text, "left": left, "bottom": bottom, "right": right, "top": top,
                                       "baseline": baseline, "font_size": font_size})
                     full_text = textpage.get_text_range().replace("\r\n", "\n").replace("\r", "\n")
@@ -3379,6 +3415,35 @@ def _pdf_rule_between(vertical_rules, left: dict[str, Any], right: dict[str, Any
                for x, low, high in vertical_rules)
 
 
+def _pdf_packed_cells(table_groups: dict[tuple[int, int], list[dict[str, Any]]]) -> bool:
+    """1セルの同じ行に語群が _PDF_PACKED_CELL_GROUPS 以上並ぶか（縦罫線が無く複数の列が1セルに入った格子）。"""
+    for groups in table_groups.values():
+        by_line: list[list[dict[str, Any]]] = []
+        for group in sorted(groups, key=lambda item: -item.get("baseline_y", item["bbox"][1])):
+            height = max(float(group["bbox"][3]) - float(group["bbox"][1]), 1.0)
+            if by_line and abs(by_line[-1][0].get("baseline_y", 0.0) - group.get("baseline_y", 0.0)) \
+                    <= max(1.0, _PDF_GROUP_LINE_RATIO * height):
+                by_line[-1].append(group)
+            else:
+                by_line.append([group])
+        if any(len(line) >= _PDF_PACKED_CELL_GROUPS for line in by_line):
+            return True
+    return False
+
+
+def _pdf_row_lines(groups: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """語群を上から下・同じ行は左から右にそろえた行のリストにする。"""
+    lines: list[list[dict[str, Any]]] = []
+    for group in sorted(groups, key=lambda item: -item.get("baseline_y", item["bbox"][1])):
+        height = max(float(group["bbox"][3]) - float(group["bbox"][1]), 1.0)
+        if lines and abs(lines[-1][0].get("baseline_y", 0.0) - group.get("baseline_y", 0.0)) \
+                <= max(1.0, _PDF_GROUP_LINE_RATIO * height):
+            lines[-1].append(group)
+        else:
+            lines.append([group])
+    return [sorted(line, key=lambda item: float(item["bbox"][0])) for line in lines]
+
+
 def _pdf_cell_slot(group: dict[str, Any], grid: tuple[Any, ...]) -> tuple[int, int] | None:
     xs, ys = grid[0], grid[1]
     bbox = group["bbox"]
@@ -3400,17 +3465,32 @@ def _pdf_objects(builder: _Builder, path: Path) -> None:
         _pdfium_close(document)
 
 
+def _pdf_info_title(reader: Any) -> str | None:
+    """PDF の文書情報（Info 辞書）の Title の原値。無い・読めない・空なら None。"""
+    try:
+        title = (reader.metadata or {}).get("/Title")
+    except Exception:
+        return None
+    return str(title) if title is not None and str(title).strip() else None
+
+
 def _pdf_page_objects(builder: _Builder, path: Path, pdfium_document: Any) -> None:
     from pypdf import PdfReader
     from pypdf.generic import ContentStream
 
     reader = PdfReader(path)
+    document_title = _pdf_info_title(reader)
     for page_number, page in enumerate(reader.pages, start=1):
         media = page.mediabox
         page_bbox = [float(media.left), float(media.bottom), float(media.right), float(media.top)]
-        page_locator = evidence_ir.Locator(part=f"page:{page_number}", page=page_number, bbox=page_bbox,
-                                           extension={"coordinate_system": "pdf-user-space"})
-        page_id = builder.add_element("page", page_locator, parent_id=None, order=page_number, value=None)
+        mapper = _pdf_display_mapper(page)       # /Rotate 付きページ: 文字・罫線・表は表示される向きの座標で扱う
+        text_bbox = _pdf_map_bbox(mapper, page_bbox) if mapper is not None else page_bbox
+        text_space = "pdf-display-space" if mapper is not None else "pdf-user-space"
+        page_locator = evidence_ir.Locator(part=f"page:{page_number}", page=page_number, bbox=text_bbox,
+                                           extension={"coordinate_system": text_space})
+        page_id = builder.add_element(
+            "page", page_locator, parent_id=None, order=page_number, value=None,
+            extension={"document_info_title": document_title} if page_number == 1 and document_title else None)
         builder.add_coverage(
             "part",
             page_locator,
@@ -3440,15 +3520,17 @@ def _pdf_page_objects(builder: _Builder, path: Path, pdfium_document: Any) -> No
         text_indexes = [index for index, (_args, operator) in enumerate(operations)
                         if operator in {b"Tj", b"TJ", b"'", b'"'}]
         segments = _pdf_axis_segments(operations)
+        if mapper is not None:
+            segments = [(*mapper(seg[0], seg[1]), *mapper(seg[2], seg[3])) for seg in segments]
         text_groups: list[dict[str, Any]] = []
         page_text = ""
         if text_indexes:
-            pdfium_text = (_pdfium_page_text(pdfium_document, page_number - 1, _pdf_vertical_rules(segments))
+            pdfium_text = (_pdfium_page_text(pdfium_document, page_number - 1, _pdf_vertical_rules(segments), mapper)
                            if pdfium_document is not None else None)
             if pdfium_text is not None:
                 text_groups, page_text = pdfium_text
             else:
-                text_groups = _pdf_text_groups(page, operations, page_bbox)
+                text_groups = _pdf_text_groups(page, operations, text_bbox, positioned=mapper is None)
                 page_text = page.extract_text() or ""
         image_specs = _pdf_xobject_specs(
             builder,
@@ -3476,8 +3558,8 @@ def _pdf_page_objects(builder: _Builder, path: Path, pdfium_document: Any) -> No
                 part=f"page:{page_number}/contents",
                 page=page_number,
                 object_id="text-layer",
-                bbox=page_bbox,
-                extension={"operator_indexes": text_indexes, "coordinate_system": "pdf-user-space"},
+                bbox=text_bbox,
+                extension={"operator_indexes": text_indexes, "coordinate_system": text_space},
             )
             text_id = builder.add_element(
                 "text_object",
@@ -3502,12 +3584,40 @@ def _pdf_page_objects(builder: _Builder, path: Path, pdfium_document: Any) -> No
                 xs, ys = grid[0], grid[1]
                 anchor_of, spans = _pdf_merged_cells(grid)
                 table_groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
+                grid_members: set[int] = set()
                 for group_index, group in enumerate(text_groups):
                     if (slot := _pdf_cell_slot(group, grid)) is not None:
                         table_groups.setdefault(anchor_of[slot], []).append(group)
-                        assigned.add(group_index)
+                        grid_members.add(group_index)
                 if not table_groups:
                     continue
+                if _pdf_packed_cells(table_groups):
+                    # 列を分ける縦罫線が無い格子（枠と横罫線だけの表）。セルに押し込まず、行の塊の文字として残す。
+                    for row in range(1, len(ys)):
+                        band = [text_groups[i] for i in sorted(grid_members)
+                                if (slot := _pdf_cell_slot(text_groups[i], grid)) is not None and slot[0] == row]
+                        if not band:
+                            continue
+                        lines = _pdf_row_lines(band)
+                        band_bbox = [min(float(g["bbox"][0]) for g in band), min(float(g["bbox"][1]) for g in band),
+                                     max(float(g["bbox"][2]) for g in band), max(float(g["bbox"][3]) for g in band)]
+                        builder.add_element(
+                            "positioned_text",
+                            evidence_ir.Locator(
+                                part=f"page:{page_number}/contents",
+                                page=page_number,
+                                object_id=f"text-rows:{table_index}:{row}",
+                                bbox=band_bbox,
+                                extension={"coordinate_system": text_space},
+                            ),
+                            parent_id=page_id, order=2000 + len(text_groups) + table_index * 1000 + row,
+                            value="\n".join(" ".join(g["text"] for g in line) for line in lines),
+                            extension={"font_size": max(float(g["font_size"]) for g in band),
+                                       "position_confidence": 1.0, "row_lines": len(lines)},
+                        )
+                    assigned.update(grid_members)
+                    continue
+                assigned.update(grid_members)
                 table_bbox = [xs[0], ys[-1], xs[-1], ys[0]]
                 title_candidates = [
                     group for index, group in enumerate(text_groups)
@@ -3520,7 +3630,7 @@ def _pdf_page_objects(builder: _Builder, path: Path, pdfium_document: Any) -> No
                     page=page_number,
                     object_id=f"table:{table_index}",
                     bbox=table_bbox,
-                    extension={"coordinate_system": "pdf-user-space"},
+                    extension={"coordinate_system": text_space},
                 )
                 table_id = builder.add_element(
                     "table", table_locator, parent_id=page_id, order=1000 + table_index, value=None,
@@ -3538,7 +3648,7 @@ def _pdf_page_objects(builder: _Builder, path: Path, pdfium_document: Any) -> No
                         object_id=f"table:{table_index}/cell:{row}:{column}",
                         bbox=[xs[column - 1], ys[row + row_span - 1], xs[column + column_span - 1], ys[row - 1]],
                         extension={"row": row, "column": column, "row_span": row_span, "column_span": column_span,
-                                   "coordinate_system": "pdf-user-space"},
+                                   "coordinate_system": text_space},
                     )
                     builder.add_element(
                         "cell", cell_locator, parent_id=table_id, order=row * 1000 + column, value=value,
@@ -3552,7 +3662,7 @@ def _pdf_page_objects(builder: _Builder, path: Path, pdfium_document: Any) -> No
                     page=page_number,
                     object_id=f"text:{group['group_index']}",
                     bbox=group["bbox"],
-                    extension={"coordinate_system": "pdf-user-space", "text_group_index": group["group_index"]},
+                    extension={"coordinate_system": text_space, "text_group_index": group["group_index"]},
                 )
                 builder.add_element(
                     "positioned_text", locator, parent_id=page_id, order=2000 + group_index,

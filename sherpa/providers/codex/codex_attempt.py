@@ -117,6 +117,8 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
             argv, env=popen_env, cwd=str(run_dir), stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=_stderr_f, text=True,
             start_new_session=True)
+        if use_resume and (st.thread_id or st.resume_sid):
+            st._resume_count += 1
         # プロンプト本文を標準入力へ書いて即座に閉じる（argv には `-` しか載っていない）。書き込みは別スレッドにする（本文が大きいとパイプバッファでブロックし、直後の `proc.stdout` の読み取りと双方向でデッドロックするため）。
         def _write_stdin(_p=proc, _text=_stdin_text):
             try:
@@ -281,6 +283,7 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                           "docx_paragraphs": "原本を読む（Word）",
                           "pptx_slides": "原本を読む（PowerPoint）",
                           "pdf_pages": "原本を読む（PDF）",
+                          "pdf_page_image": "原本のページを画像で確認（PDF）",
                           "file_head": "原本を読む（先頭）",
                           # 調査台帳の MCP ツール（`mcp_server._LEDGER_TOOLS`）。引数の本文は出さず、件数・状態語彙（閉集合）だけを表示する。
                           "ledger_manifest_set": "調査台帳に項目を登録",

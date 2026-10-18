@@ -20,7 +20,9 @@ Codex（MCP 経由）と API 経路の頭脳が同じ関数で Excel／Word／Po
 """
 from __future__ import annotations
 
+import io
 import os
+import re
 import struct
 import threading
 import time
@@ -354,7 +356,7 @@ def _parse_page_spec(spec: str | None, total: int, max_count: int,
                      ignored: list[str] | None = None) -> tuple[list[int], bool]:
     """`spec` を 1-based ページ番号の昇順リストへ解決する（`total` 範囲外・非数値は無視）。
     `spec` 省略／空文字は先頭から `max_count` 件。戻り値 `(ページ番号一覧, truncated)`（`truncated` は `max_count` で切り詰めたか）。
-    `ignored` を渡すと、無視した指定（非数値・`total` 範囲外にかかる部分）の文字列をそこへ積む（呼び出し元が注記として返す）。
+    `ignored` を渡すと、無視した指定（非数値・`total` 範囲に全く掛からない部分。一部が範囲内の範囲指定は読めた分を返し積まない）の文字列をそこへ積む（呼び出し元が注記として返す）。
     範囲指定は列挙前に `[1, total]` へ切り、`max_count` を超えた時点で列挙を打ち切る（巨大な範囲指定で長時間占有させない）。
     """
     spec = (spec or "").strip()
@@ -374,7 +376,7 @@ def _parse_page_spec(spec: str | None, total: int, max_count: int,
                 try:
                     a, sep, b = part.partition("-")
                     lo, hi = (int(a), int(b)) if sep else (int(part), int(part))
-                    if min(lo, hi) < 1 or max(lo, hi) > total:
+                    if min(lo, hi) > total or max(lo, hi) < 1:
                         ignored.append(part)
                 except ValueError:
                     ignored.append(part)
@@ -389,7 +391,7 @@ def _parse_page_spec(spec: str | None, total: int, max_count: int,
                 continue
             if lo > hi:
                 lo, hi = hi, lo
-            if ignored is not None and (lo < 1 or hi > total):
+            if ignored is not None and (lo > total or hi < 1):  # 一部でも範囲内なら読めた分を返し、無視には載せない
                 ignored.append(part)
             lo = max(lo, 1)  # total 範囲外を列挙前に切る
             hi = min(hi, total)
@@ -492,8 +494,18 @@ def _load_workbook(f):
     return openpyxl.load_workbook(f, read_only=True, data_only=True)
 
 
+def _sheet_entry(entry: dict, ws) -> dict:
+    """シート一覧の 1 件へ、非表示シートの印（`hidden: true`・「再表示」でも出せない very hidden は `very_hidden: true` も）を足す。"""
+    state = getattr(ws, "sheet_state", "visible")
+    if state != "visible":
+        entry["hidden"] = True
+        if state == "veryHidden":
+            entry["very_hidden"] = True
+    return entry
+
+
 def xlsx_sheets(f) -> dict:
-    """シート一覧と大きさ（`{"sheets": [{"name","max_row","max_col"}]}`）。開けなければ `{"error"}`。
+    """シート一覧と大きさ（`{"sheets": [{"name","max_row","max_col"}]}`・非表示シートは `hidden: true`）。開けなければ `{"error"}`。
     実寸の走査が時間予算を超えたシート以降は、シート名は返し、寸法は記録値（`dims_estimated: true`・記録が無ければ寸法キーを出さない）。
     `f` は呼び出し元が検証済みで開いたファイル（所有権はモジュール docstring 参照）。
     """
@@ -509,7 +521,7 @@ def xlsx_sheets(f) -> dict:
             if not over:
                 try:
                     r, c = _ws_dims(ws, budget)
-                    out.append({"name": ws.title, "max_row": r, "max_col": c})
+                    out.append(_sheet_entry({"name": ws.title, "max_row": r, "max_col": c}, ws))
                     continue
                 except _TimeOver:
                     over = True
@@ -520,10 +532,47 @@ def xlsx_sheets(f) -> dict:
                 entry["max_row"] = rec_r
             if rec_c:
                 entry["max_col"] = rec_c
-            out.append(entry)
+            out.append(_sheet_entry(entry, ws))
         return {"sheets": out}
     except Exception:
         return {"error": "Excel を開けませんでした"}
+
+
+class _PreadFile(io.RawIOBase):
+    """fd を `os.pread` で読む読み取り専用ファイル。元の fd と読み位置を共有しない（複製した fd で読むと、キャッシュ中の元ファイルの読み位置が狂う）。"""
+
+    def __init__(self, fd: int):
+        super().__init__()
+        self._fd = fd
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        data = os.pread(self._fd, len(b), self._pos)
+        b[:len(data)] = data
+        self._pos += len(data)
+        return len(data)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 1:
+            offset += self._pos
+        elif whence == 2:
+            offset += os.fstat(self._fd).st_size
+        self._pos = max(0, offset)
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def close(self) -> None:
+        if not self.closed:
+            os.close(self._fd)
+        super().close()
 
 
 def xlsx_range(f, sheet: str, range_a1: str | None = None,
@@ -531,7 +580,7 @@ def xlsx_range(f, sheet: str, range_a1: str | None = None,
               clean: Callable[[str], str] | None = None) -> dict:
     """`_xlsx_range` の入口。キャッシュ命中で `f` が閉じられても数式の判定に使えるよう、`f` の複製（別 fd）を用意して渡す。"""
     try:
-        formula_f = os.fdopen(os.dup(f.fileno()), "rb")
+        formula_f = io.BufferedReader(_PreadFile(os.dup(f.fileno())))
     except (OSError, ValueError):
         formula_f = None
     try:
@@ -548,6 +597,7 @@ def _xlsx_range(f, formula_f, sheet: str, range_a1: str | None, max_rows: int, m
     `KeyBlockRedactor(clean)` を行優先で 1 つ使い回す（鍵ブロックが複数セルにまたがっても伏せ続ける）。`max_rows`／`max_cols` は 1〜既定値にクランプする。
     数式で保存値が無いセルは空にせず `_FORMULA_NO_VALUE` を返し（`formula_no_value` に件数）、判定できなければ `formula_check: "unavailable"`。
     積んだ文字数が `_XLSX_TOTAL_CHARS_MAX` を超えたら行単位で打ち切り `size_clipped: true`。
+    返した範囲の非表示の行・列・結合範囲・表示値が値と違うセルは `_xlsx_range_extras` が付帯欄で足す（値は変えない）。逆順の範囲は正規化し、行・列が 0 の範囲は拒否する。
     上限を超えたら切り詰めて `truncated: true`（`range` は実際に返した範囲）。`clean` がある場合、状態のため 1 行目から選択範囲の最終行まで
     （行全体）を辿り、選択外の行は出力に残さない。
     """
@@ -576,8 +626,12 @@ def _xlsx_range(f, formula_f, sheet: str, range_a1: str | None, max_rows: int, m
         if range_a1:
             from openpyxl.utils.cell import range_boundaries
             min_col, min_row, max_col, max_row = range_boundaries(range_a1)
-            if None in (min_col, min_row, max_col, max_row):
+            if None in (min_col, min_row, max_col, max_row) or min(min_col, min_row, max_col, max_row) < 1:
                 return {"error": "range が不正です"}
+            if max_col < min_col:
+                min_col, max_col = max_col, min_col  # 逆順（C3:A1）は A1:C3 に正規化して読む
+            if max_row < min_row:
+                min_row, max_row = max_row, min_row
         else:
             min_col, min_row = 1, 1
             max_row, max_col = _ws_dims(ws, _range_budget)
@@ -605,6 +659,7 @@ def _xlsx_range(f, formula_f, sheet: str, range_a1: str | None, max_rows: int, m
         width = eff_max_col - min_col + 1
         rows_out = []
         empty_pos: set[tuple[int, int]] = set()
+        num_values: dict[tuple[int, int], object] = {}
         clipped_cells = 0
         total_chars = 0
         size_clipped = False
@@ -631,6 +686,8 @@ def _xlsx_range(f, formula_f, sheet: str, range_a1: str | None, max_rows: int, m
                         empty_pos.add((row_no, min_col + ci))
                     elif len(str(v)) > _CELL_MAX_CHARS:
                         clipped_cells += 1
+                    if v is not None and not isinstance(v, (str, bool)):
+                        num_values[(row_no, min_col + ci)] = v
                 total_chars += sum(len(c) for c in win)
                 rows_out.append(win + [""] * (width - len(win)))
         if budget.tick(every=1):
@@ -647,6 +704,8 @@ def _xlsx_range(f, formula_f, sheet: str, range_a1: str | None, max_rows: int, m
     from openpyxl.utils import get_column_letter
     actual_range = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(eff_max_col)}{last_row}"
     out = {"sheet": sheet, "range": actual_range, "rows": rows_out, "truncated": truncated or size_clipped}
+    out.update(_xlsx_range_extras(ws, formula_f, {k: v for k, v in num_values.items() if k[0] <= last_row},
+                                  min_row, last_row, min_col, eff_max_col))
     if size_clipped:
         out["size_clipped"] = True
     if clipped_cells:
@@ -655,6 +714,186 @@ def _xlsx_range(f, formula_f, sheet: str, range_a1: str | None, max_rows: int, m
         out["formula_no_value"] = len(formula_cells)
     if formula_cells is None:
         out["formula_check"] = "unavailable"
+    return out
+
+
+_DISPLAY_MAX_CELLS = 300  # 表示値を返すセル数の上限（超えた分は `display_clipped` に件数）
+_LAYOUT_LIST_MAX = 200  # 非表示の行・列／結合範囲を返す件数の上限
+_LAYOUT_CHUNK_BYTES = 1 << 20  # シート XML を流し読みする 1 回の大きさ
+_LAYOUT_TAG_RE = re.compile(rb"<(?:row|col|mergeCell)\b[^>]*>")
+_CELL_TAG_RE = re.compile(rb"<c\b[^>]*>")
+_XML_ATTR_RE = re.compile(rb'([A-Za-z:]+)="([^"]*)"')
+_XML_TRUE = (b"1", b"true")
+_TEXT_CELL_TYPES = (b"s", b"str", b"inlineStr", b"e", b"b")  # 文字・エラー・真偽のセルは数値の書式を当てない
+_A1_COL_RE = re.compile(r"^[A-Z]+")
+
+
+def _xlsx_sheet_layout(f, sheet_path: str, min_row: int, max_row: int, min_col: int, max_col: int,
+                       budget: "_TimeBudget") -> dict | None:
+    """シート XML を流し読みして、窓（行 min_row..max_row・列 min_col..max_col）内の非表示の行・列、窓に掛かる結合範囲、窓内のセルの書式番号を返す。
+    `{"rows": 行番号の昇順, "cols": 列番号の昇順, "merged": ["C2:E2", ...], "styles": {(行, 列): 書式番号}}`。読めない・時間内に終わらないときは None。
+    """
+    from openpyxl.utils import column_index_from_string
+    from openpyxl.utils.cell import range_boundaries
+    rows: set[int] = set()
+    cols: set[int] = set()
+    merged: list[str] = []
+    styles: dict[tuple[int, int], int] = {}
+    try:
+        f.seek(0)
+        with zipfile.ZipFile(f) as zf, zf.open(sheet_path.lstrip("/")) as fh:
+            buf = b""
+            row_no = 0
+            while True:
+                chunk = fh.read(_LAYOUT_CHUNK_BYTES)
+                if not chunk:
+                    break
+                if budget.tick(every=1):
+                    return None
+                buf += chunk
+                pos = 0
+                for m in _LAYOUT_TAG_RE.finditer(buf):
+                    tag = m.group(0)
+                    if tag.startswith(b"<row"):
+                        attrs = dict(_XML_ATTR_RE.findall(tag))
+                        this_row = int(attrs[b"r"]) if b"r" in attrs else row_no + 1
+                        in_window = min_row <= this_row <= max_row
+                        body_end = -1
+                        if in_window and not tag.endswith(b"/>"):
+                            body_end = buf.find(b"</row>", m.end())
+                            if body_end == -1:  # 行の途中でチャンクが切れた＝この行の頭から持ち越し、次のチャンクを足して読み直す
+                                pos = m.start()
+                                break
+                        row_no = this_row
+                        pos = m.end()
+                        if attrs.get(b"hidden") in _XML_TRUE and in_window:
+                            rows.add(row_no)
+                        for cm in (_CELL_TAG_RE.finditer(buf, m.end(), body_end) if body_end != -1 else ()):
+                            cattrs = dict(_XML_ATTR_RE.findall(cm.group(0)))
+                            sid = int(cattrs.get(b"s", b"0") or 0)
+                            ref = cattrs.get(b"r", b"").decode("ascii", "replace")
+                            letters = _A1_COL_RE.match(ref)
+                            if sid and cattrs.get(b"t") not in _TEXT_CELL_TYPES and letters:
+                                col = column_index_from_string(letters.group(0))
+                                if min_col <= col <= max_col:
+                                    styles[(row_no, col)] = sid
+                    elif tag.startswith(b"<col"):
+                        pos = m.end()
+                        attrs = dict(_XML_ATTR_RE.findall(tag))
+                        if attrs.get(b"hidden") in _XML_TRUE:
+                            lo, hi = int(attrs.get(b"min", 0)), int(attrs.get(b"max", 0))
+                            cols.update(range(max(lo, min_col), min(hi, max_col) + 1))
+                    else:
+                        pos = m.end()
+                        ref = dict(_XML_ATTR_RE.findall(tag)).get(b"ref", b"").decode("ascii", "replace")
+                        c0, r0, c1, r1 = range_boundaries(ref)
+                        if c0 <= max_col and c1 >= min_col and r0 <= max_row and r1 >= min_row:
+                            merged.append(ref)
+                cut = pos if pos < len(buf) and buf.startswith(b"<row", pos) else buf.rfind(b"<", pos)
+                buf = buf[cut:] if cut != -1 else b""
+    except Exception:
+        return None
+    return {"rows": sorted(rows), "cols": sorted(cols), "merged": merged, "styles": styles}
+
+
+def _xlsx_style_formats(f) -> list[str] | None:
+    """書式番号（セルの `s`）→ 表示形式コードの一覧（`xl/styles.xml` の cellXfs の並び）。読めなければ None。"""
+    from xml.etree import ElementTree as ET
+    from openpyxl.styles.numbers import BUILTIN_FORMATS
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    try:
+        f.seek(0)
+        with zipfile.ZipFile(f) as zf:
+            root = ET.fromstring(zf.read("xl/styles.xml"))
+    except Exception:
+        return None
+    custom = {int(n.get("numFmtId")): n.get("formatCode") or "General"
+              for n in root.iter(f"{ns}numFmt") if n.get("numFmtId") is not None}
+    xfs = root.find(f"{ns}cellXfs")
+    if xfs is None:
+        return None
+    out = []
+    for xf in xfs.findall(f"{ns}xf"):
+        fid = int(xf.get("numFmtId") or 0)
+        out.append(custom.get(fid) or BUILTIN_FORMATS.get(fid) or "General")
+    return out
+
+
+def _xlsx_display_cells(values: dict[tuple[int, int], object], styles: dict[tuple[int, int], int],
+                        formats: list[str]) -> tuple[dict, dict]:
+    """値と表示が違うセルの表示値を返す（`display`＝書式を当てた表示値・`display_format`＝当てられなかった書式コード。キーは A1 参照）。
+    桁区切りだけの違い（182400→「182,400」）と General は載せない。`values` は数値・日付のセルだけ。
+    """
+    from openpyxl.utils import get_column_letter
+    from .ingest import excel_display
+    shown: dict[str, str] = {}
+    unrendered: dict[str, str] = {}
+    for (r, c), v in sorted(values.items()):
+        sid = styles.get((r, c))
+        if not sid or sid >= len(formats):
+            continue
+        fmt = formats[sid]
+        if fmt == "General":
+            continue
+        ref = f"{get_column_letter(c)}{r}"
+        try:
+            res = excel_display.format_display(v, fmt)
+        except Exception:
+            unrendered[ref] = fmt
+            continue
+        if res.status != "rendered" or res.value is None:
+            unrendered[ref] = fmt
+        elif res.value != str(v) and not _same_number(res.value, v):
+            shown[ref] = res.value
+    return shown, unrendered
+
+
+def _same_number(shown: str, v) -> bool:
+    """表示値（桁区切りを除く）が数値として値と同じか（書式が値の見え方を変えていないか）。"""
+    if not isinstance(v, (int, float)):
+        return False
+    try:
+        return float(shown.replace(",", "")) == float(v)
+    except ValueError:
+        return False
+
+
+def _xlsx_range_extras(ws, formula_f, values: dict[tuple[int, int], object],
+                       min_row: int, last_row: int, min_col: int, max_col: int) -> dict:
+    """`xlsx_range` の結果へ足す付帯情報。値は変えない。`values` は窓内の数値・日付のセル（(行, 列)→値）。
+    ① 非表示シート（`sheet_hidden`）② 窓内の非表示の行（`hidden_rows`）・列（`hidden_cols`）と結合範囲（`merged`）③ 表示値が値と違うセル（`display`／`display_format`）。
+    ②③ が読めないときは `layout_check`／`display_check: "unavailable"`（無いことと取り違えさせない）。
+    """
+    from openpyxl.utils import get_column_letter
+    out: dict = {}
+    if getattr(ws, "sheet_state", "visible") != "visible":
+        out["sheet_hidden"] = True
+    if last_row < min_row:
+        return out
+    layout = None
+    sheet_path = getattr(ws, "_worksheet_path", None)
+    if formula_f is not None and sheet_path:
+        layout = _xlsx_sheet_layout(formula_f, sheet_path, min_row, last_row, min_col, max_col, _TimeBudget())
+    if layout is None:
+        out["layout_check"] = "unavailable"
+    else:
+        if layout["rows"]:
+            out["hidden_rows"] = layout["rows"][:_LAYOUT_LIST_MAX]
+        if layout["cols"]:
+            out["hidden_cols"] = [get_column_letter(c) for c in layout["cols"][:_LAYOUT_LIST_MAX]]
+        if layout["merged"]:
+            out["merged"] = layout["merged"][:_LAYOUT_LIST_MAX]
+    if values:
+        formats = _xlsx_style_formats(formula_f) if (layout is not None and formula_f is not None) else None
+        if formats is None:
+            out["display_check"] = "unavailable"
+        else:
+            shown, unrendered = _xlsx_display_cells(values, layout["styles"], formats)
+            items = [("display", k, v) for k, v in shown.items()] + [("display_format", k, v) for k, v in unrendered.items()]
+            if len(items) > _DISPLAY_MAX_CELLS:
+                out["display_clipped"] = len(items) - _DISPLAY_MAX_CELLS
+            for key, k, v in items[:_DISPLAY_MAX_CELLS]:
+                out.setdefault(key, {})[k] = v
     return out
 
 
@@ -1082,18 +1321,96 @@ def pptx_slides(f, pages: str | None = _PPTX_DEFAULT_PAGES,
 _PDF_PAGES_MAX = 10
 _PDF_DEFAULT_PAGES = "1-5"
 _PDF_NO_TEXT_NOTE = "文字なし（スキャンの可能性）"
+_PDF_IMAGE_ONLY_NOTE = "文字なし・画像あり（スキャンの可能性・画像の中身は読めない）"
+_PDF_DRAWING_ONLY_NOTE = "文字なし・画像なし（図形のみ）"
+_PDF_BLANK_NOTE = "文字も画像も図形もない（白紙の可能性）"
 _PDF_PAGE_TEXT_MAX_CHARS = 20000
+_PDF_DRAWING_HINT_MIN = 10  # 線・矩形・曲線の合計がこの数以上のページは図・フローの可能性として画像の確認を促す
+_PDF_VIEW_HINT = ("view_pages のページは文字層だけでは図・矢印・画像の中が読めない。"
+                  "pdf_page_image(doc_id, page) で画像にして確かめる（読めないときは推定で補わない）")
+
+
+def _pdf_lookback_clear(pdf, nos: list[int]) -> set[int]:
+    """`nos` のうち、鍵ブロックの記号（`PRIVATE KEY`）が無いと確かめられたページ番号。
+    軽い抽出器（pypdfium2）で文字を取り、空白を除いて見る。文字が取れない・開けない・例外のページは含めない（呼び出し元は従来どおり pdfplumber で辿る）。
+    """
+    stream = getattr(pdf, "stream", None)
+    if not nos or stream is None:
+        return set()
+    clear: set[int] = set()
+    try:
+        import pypdfium2
+        stream.seek(0)
+        doc = pypdfium2.PdfDocument(stream)
+        try:
+            for no in nos:
+                page = doc[no - 1]
+                try:
+                    tp = page.get_textpage()
+                    try:
+                        compact = re.sub(r"\s+", "", tp.get_text_range()).lower()
+                    finally:
+                        tp.close()
+                finally:
+                    page.close()
+                if compact and "privatekey" not in compact:
+                    clear.add(no)
+        finally:
+            doc.close()
+    except Exception:
+        return clear
+    finally:
+        try:
+            stream.seek(0)
+        except Exception:
+            pass
+    return clear
+
+
+def _pdf_page_marks(page, text: str) -> dict:
+    """ページの付帯情報。画像の件数（`image_count`）と、文字層が無いページの区別（画像あり／図形のみ／白紙）。"""
+    try:
+        n_img = len(page.images)
+        n_draw = len(page.lines) + len(page.rects) + len(page.curves)
+    except Exception:
+        n_img, n_draw = None, None
+    out: dict = {}
+    if n_img:
+        out["image_count"] = n_img
+    if n_draw and n_draw >= _PDF_DRAWING_HINT_MIN:
+        out["drawing_count"] = n_draw
+    if not text.strip():
+        out["no_text_layer"] = True
+        if n_img is None:
+            out["note"] = _PDF_NO_TEXT_NOTE
+        elif n_img:
+            out["note"] = _PDF_IMAGE_ONLY_NOTE
+        elif n_draw:
+            out["note"] = _PDF_DRAWING_ONLY_NOTE
+        else:
+            out["note"] = _PDF_BLANK_NOTE
+            out["blank"] = True
+    return out
 
 
 def pdf_pages(f, pages: str | None = _PDF_DEFAULT_PAGES,
-             clean: Callable[[str], str] | None = None) -> dict:
-    """ページのテキストを返す（1 回 10 ページ・1 ページ 20,000 文字まで）。文字層が無いページは `no_text_layer: true`＋`note` で返す。
+             clean: Callable[[str], str] | None = None, text_offset: int | None = None) -> dict:
+    """ページのテキストを返す（1 回 10 ページ・1 ページ 20,000 文字まで）。文字層が無いページは `no_text_layer: true`＋`note`
+    （画像あり＝スキャンの可能性／図形のみ／白紙の別）。画像のあるページは `image_count`（画像の中身は読めない）、線・図形が多いページは `drawing_count`。
+    画像・図形が多い・文字層が無い（白紙を除く）ページは `view_pages`（ページ番号）＋`view_hint`＝ページ画像（`pdf_page_image`）で確かめる案内。
+    1 ページが 20,000 文字を超えるときは `text_truncated: true`＋`next_text_offset`。ページを 1 つだけ指定して `text_offset`（文字数）を渡すと、その位置から続きを返す。
     ページ指定が既定のまま・省略で残りがあれば `truncated`＋`pages_remaining`、範囲外・不正な指定は `pages_ignored`（有効が 0 ならエラー）。`clean` は切り詰める前に適用し、`KeyBlockRedactor(clean)` を
-    ページ順で使い回す。走査は選択ページの `_KEY_LOOKBACK_PAGES` ページ前から最終ページまで行い、選択外は出力に残さない。
+    ページ順で使い回す。走査は選択ページの `_KEY_LOOKBACK_PAGES` ページ前から最終ページまで行い、選択外は出力に残さない
+    （前のページに `PRIVATE KEY` の記号が無いと確かめられたページは、状態が変わらないので抽出を省く）。
     """
     if _too_big_fd(f):
         _close_quiet(f)
         return dict(_SIZE_ERROR)
+    try:
+        offset = int(text_offset) if text_offset is not None else 0
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(offset, 0)
     try:
         import pdfplumber
         f.seek(0)
@@ -1106,9 +1423,12 @@ def pdf_pages(f, pages: str | None = _PDF_DEFAULT_PAGES,
         nos, truncated, page_err, page_notes = _resolve_pages(pages, total, _PDF_DEFAULT_PAGES, 5, _PDF_PAGES_MAX)
         if page_err is not None:
             return {**page_err, **page_notes}
+        if offset and len(nos) != 1:
+            return {"error": "text_offset はページを 1 つだけ指定したときに使います", **page_notes}
         want = set(nos)
         # 鍵ブロックの状態は選択ページごとに直前 _KEY_LOOKBACK_PAGES ページから辿って確定し、出力だけ要求範囲に絞る（`clean` 無しは要求ページのみ）
         scan_nos = _scan_pages_with_lookback(nos) if (cleaner is not None and nos) else nos
+        skip = _pdf_lookback_clear(pdf, [n for n in scan_nos if n not in want]) if cleaner is not None else set()
         out = []
         budget = _TimeBudget()
         prev_no = None
@@ -1118,19 +1438,26 @@ def pdf_pages(f, pages: str | None = _PDF_DEFAULT_PAGES,
             if cleaner is not None and prev_no is not None and no != prev_no + 1:
                 cleaner = redact_keys.KeyBlockRedactor(clean)  # 離れた区間へ前区間の状態を持ち越さない
             prev_no = no
-            text = pdf.pages[no - 1].extract_text() or ""
+            if no in skip:
+                continue
+            page = pdf.pages[no - 1]
+            text = page.extract_text() or ""
             if cleaner is not None and text:
                 text = cleaner(text)
             if no not in want:
                 continue
-            item = {"no": no, "text": text[:_PDF_PAGE_TEXT_MAX_CHARS]}
-            if not text.strip():
-                item["no_text_layer"] = True
-                item["note"] = _PDF_NO_TEXT_NOTE
-            if len(text) > _PDF_PAGE_TEXT_MAX_CHARS:
+            body = text[offset:offset + _PDF_PAGE_TEXT_MAX_CHARS]
+            item = {"no": no, "text": body, **_pdf_page_marks(page, text)}
+            if offset:
+                item["text_offset"] = offset
+            if len(text) > offset + _PDF_PAGE_TEXT_MAX_CHARS:
                 item["text_truncated"] = True
+                item["next_text_offset"] = offset + _PDF_PAGE_TEXT_MAX_CHARS
             out.append(item)
-        return {"total": total, "pages": out, "truncated": truncated, **page_notes}
+        view = [it["no"] for it in out if not it.get("blank")
+                and (it.get("image_count") or it.get("drawing_count") or it.get("no_text_layer"))]
+        hint = {"view_pages": view, "view_hint": _PDF_VIEW_HINT} if view else {}
+        return {"total": total, "pages": out, "truncated": truncated, **hint, **page_notes}
     except Exception:
         return {"error": "PDF の読み取りに失敗しました"}
 

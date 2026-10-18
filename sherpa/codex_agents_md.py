@@ -27,8 +27,18 @@ AGENTS_MD = f"""\
   python-pptx・pdfplumber。集計は pandas）で開く。
   台帳・検索・グラフ・出典の確定は MCP ツールで行う。
 - 回答は根拠ベースで作る。ツール・ファイル参照で最低 1 回は裏取りしてから答える。根拠は資料のパス
-  （Python で開いた場合はシート名／セル範囲・段落・ページ番号も添える）で示す。資料に無いことを補うときは
-  『推定』と明示する。
+  （Python で開いた場合はシート名／セル範囲・段落・ページ番号も添える）で示す。資料に基づいて答える依頼では、
+  資料外の知識で答えを補わない。①根拠がある肯定、②根拠がある否定（設計書に未実装と明記されている等。
+  根拠の範囲で否定する）、③証拠不足による判断保留（資料で見つからないことだけを理由に「存在しない」と
+  断定しない）を区別して書く。どうしても推定を述べるときは、資料外であることと推定であることを明示し、
+  答えとしては判断保留にする。
+- 図・フロー・スキャン・画像のページは、文字層の並び順から関係や矢印を推定せず、ページ画像を開いて確かめる
+  （pdf_pages が `view_pages` で示したページを pdf_page_image で画像にし、返った `path` を
+  `tools.view_image({{path}})` で開いて `image(r.image_url)` で見る）。開けない・読めないときは、読めないと書き、
+  推定で補わない。
+- 1 回の実行で複数のツールを呼んだときは、結果を全部表示せず、必要な欄（件数・パス・ページ・該当箇所）だけを
+  表示する。省いた内容があることと、続きの読み方（`offset`・`next_text_offset`・ページ範囲など）が分かるように
+  する。並列に呼んでよい。
 - 見直し（評価）は根拠の**件数**では判定しない。確定に必須の根拠種別は**ソース**（`src/` のコード）
   だけで、どの質問の型でも同じ（種別はソース／設計書（Office・PDF 由来の資料）／定義（DDL・copybook・
   設定ファイル）／ログ・設定（会話に貼られた・添付された資料）／呼出関係（グラフ、使えなければ grep
@@ -326,6 +336,90 @@ _INVESTIGATION_REVIEW_PARAGRAPH = """\
 """
 
 
+# 評価用（環境変数 `SHERPA_LEDGER_STYLE`）: JSON の台帳の代わりに、調査計画書（Markdown 1 枚）を使う場合の段落。
+_PLAN_TEMPLATE = """\
+# 調査計画: <質問の要約>
+## 前提
+（曖昧さをどう解釈したか・同義語・略語・日英の揺れ。自由文）
+## 範囲
+（どこからどこまで数えたか・道具の打ち切り。自由文）
+## 母集団
+- [ ] <id> · <種別> · <対象> · 要: source[, spec_doc...]
+- [x] <id> · <種別> · <対象> · 要: source
+      - source: <パス>:<行>
+- [-] <id> · <種別> · <対象> · 要: ...
+      - 範囲外: <何を試して届かなかったか>
+## 分かったこと
+（新しい要素・つながり・次に見るべきもの。自由文）
+## 観点
+- <観点>
+## 見直し
+- <回目>: 足した行・観点
+## 結論
+（最後に書く。各文に根拠の行の id を [pgm-a] のように添える）
+"""
+
+
+def _plan_common_paragraph(review_cap: int) -> str:
+    return f"""\
+- 調べる依頼（仕様問い合わせ・影響調査・トラブルシュート・比較・一覧）では、調べる前に調査計画書
+  `.tmp/investigation/plan.md` を apply_patch で作り、調べながら同じファイルを更新する（Markdown 1 枚・
+  台帳のツールは無い・ファイルを別の方法で書き換えない）。Codex の update_plan と Plan モードは使わない。作成系の依頼・1つの事実を答えるだけの単純な質問では
+  作らなくてよい。雛形は次のとおり。
+```
+{_PLAN_TEMPLATE}```
+  「## 母集団」だけ書式が固定で、他の節は自由に書いてよい。母集団は設計書とソースの両方から確定し
+  （どちらか一方にしか無い項目も落とさない）、1 行 1 要素にする。行は `- [ ]`（未着手）／`- [x]`（済）／
+  `- [-]`（打ち切り）で始め、` · ` 区切りで id・種別・対象・要る根拠の種別（`要: source` など）を書く。
+  `- [x]` の行で `要: source` を含むものには、直下に字下げして `- source: パス:行` を必ず付ける（付けないと
+  回答で「未確認」に下げられる）。`- [-]` の行には、直下に `- 範囲外:`／`- 読めない:`／`- 無い:` のいずれかで
+  「何を試して届かなかったか」を書く。調査中に見つけた新しい対象は、行（母集団）や観点として足す。
+- 道具が返した候補はそのまま事実にしない。ソースの該当行を開いて突き合わせてから `- [x]` にする。
+- 「## 結論」は最後に書く。各文に根拠の行の id を添える。最終応答の `answer` には「## 結論」と同じ内容を書く
+  （利用者に出す回答は、Sherpa が計画書を 結論 → 前提 → 調べた範囲 → 参照した資料 の順に整える。
+  文章の要約や言い換えはされないので、結論は省略せず詳しく書く）。
+- 深さの見直しは最大 {review_cap} 回。
+"""
+
+
+def _plan_gate_paragraph(review_cap: int) -> str:
+    return _plan_common_paragraph(review_cap) + f"""\
+- 最終応答（`status: final`）を返すたびに、Sherpa が計画書の「## 母集団」を読む。節が無い、または未着手の行が
+  残っていて前回から進んでいるときは差し戻される（指定された行から調査を再開する）。未着手が無くなると、
+  見直し（最大 {review_cap} 回）を頼まれることがある。そのときは「## 分かったこと」を読み返し、母集団にも
+  「## 観点」にも無い要素を行・観点として足して調べる。足すものが無ければ「## 見直し」に「追加なし」と書いて
+  最終応答を返す。
+"""
+
+
+def _plan_main_paragraph(review_cap: int) -> str:
+    return _plan_common_paragraph(review_cap) + f"""\
+- 計画書は自分（本体）の黒板で、受理の判定や見直しの依頼を Sherpa はしない。調べ終えたと判断したら自分で
+  最終応答を返す。見直しは最大 {review_cap} 回。見直しでは「## 分かったこと」を読み返し、母集団にも「## 観点」にも
+  無い要素（新しい名前・つながり・次に見るべきもの）があれば行・観点として足して調べ、「## 見直し」に
+  `- <回目>: 足した行・観点` を書く。足すものが無くなったらそこで終える。
+"""
+
+
+def _plan_gate_worker_paragraph(review_cap: int) -> str:
+    return "- " + _WORKER_USAGE_CONDITION + f"""
+  worker には計画書の担当行・前提を渡し、主張と根拠を返させる。計画書の更新は本体が行う。
+  見直しは Sherpa からの依頼に応じて最大 {review_cap} 回。依頼された見直しで必要なら evaluator に
+  観点を渡し、指摘を調査して計画書へ反映する。独自に追加の見直し巡を増やさない。
+"""
+
+
+def _plan_main_worker_paragraph() -> str:
+    return f"""\
+- 下調べ役（spawn_agent の worker）が使える。資料の検索と精読を 1 つの観点について任せ、主張と根拠
+  （ファイル:行）を返させる道具で、観点が互いに独立しているとき、読む量が多くて自分の文脈を節約したいとき、
+  同時に {_CODEX_MAX_CONCURRENT_SUBAGENTS} 体まで並べて調べたいときに役立つ。使うかどうかは自分で決めてよい。
+  使うときは、計画書の該当節（担当させる母集団の行と「## 前提」）を依頼文にそのまま貼って渡す。返ってきた
+  主張は鵜呑みにせず、根拠の行を自分で開いて突き合わせてから計画書（`- source:` の行）に反映する。足りなければ
+  観点を変えて投げ直す。worker には計画書を書かせない。
+"""
+
+
 # worker を使う条件・並列数・依頼の形。観点が 2 つ以上に分かれる依頼では必ず使い、観点の分け方・数だけ Codex が決める。並列数は `sandbox.py` の `[agents].max_concurrent_threads_per_session` と同じ値。
 _WORKER_USAGE_CONDITION = (
     "調べる観点が2つ以上に分かれる依頼（『〜ごと』『すべての』『各』『それぞれ』『一覧』『比較』"
@@ -428,7 +522,8 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
                     output_schema_v2: bool = False, multi_agent: bool = False,
                     review_rounds: int = 0, layer: str | None = None,
                     review_rounds_escalation: bool = False, mcp: bool = True,
-                    source_required: bool = False, plain: bool = False) -> None:
+                    source_required: bool = False, plain: bool = False,
+                    ledger_style: str = "json", plan_review_cap: int = 1) -> None:
     """authoring 直下へ AGENTS.md を書く（リクエストごと・冪等・上書き）。呼び出し側で try/except すること（書込失敗でも Codex 実行は継続できる＝fail-open）。
     - `plain`: 真なら他の引数を見ず `AGENTS_MD_PLAIN` だけを書く。
     - `mcp`: MCP 接続（台帳ツール）があるか。無ければ台帳の段落を出さない。
@@ -439,6 +534,7 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
       `review_rounds_escalation` は `review_rounds > 0` かつ共通上限に余地があるときだけ、見直しをもう 1 回足してよい旨を足す。
     - 調査台帳の段落は `output_schema` と `output_schema_v2` が両方真のときだけ足す（multi_agent では `ledger_enabled` も渡す）。
     - `source_required`: provider.py の `required_extra` と同じ判定の値を渡す（ずれると完了できなくなる）。
+    - `ledger_style`: `plan_gate`／`plan_main`（評価用・環境変数 `SHERPA_LEDGER_STYLE`）のとき、JSON 台帳と見直しの段落の代わりに調査計画書の段落を出す。`json` は従来どおり。
     書込は一時ファイルを `O_CREAT|O_EXCL|O_NOFOLLOW` で作り `os.replace()` で置換する（既存 AGENTS.md が symlink でも指す先へ書かない）。
     """
     if plain:
@@ -448,7 +544,8 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
         if output_schema:
             structured_paragraph = (_STRUCTURED_RESPONSE_PARAGRAPH_V2 if output_schema_v2
                                     else _STRUCTURED_RESPONSE_PARAGRAPH)
-        _ledger_enabled = bool(output_schema and output_schema_v2 and mcp)
+        _plan_style = ledger_style in ("plan_gate", "plan_main") and bool(output_schema and output_schema_v2)
+        _ledger_enabled = bool(output_schema and output_schema_v2 and mcp) and not _plan_style
         if output_schema and output_schema_v2:
             structured_paragraph += _CLAIM_ITEM_IDS_LEDGER if _ledger_enabled else _CLAIM_ITEM_IDS_EMPTY
         content = (AGENTS_MD + _source_verification_paragraph(direct_read, layer)
@@ -457,11 +554,18 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
                    + (_investigation_ledger_paragraph(direct_read, layer, source_required)
                       + _INVESTIGATION_REVIEW_PARAGRAPH
                       if _ledger_enabled else "")
-                   + (_multi_agent_role_paragraph(review_rounds, direct_read, layer,
+                   + ((_plan_gate_paragraph(plan_review_cap) if ledger_style == "plan_gate"
+                       else _plan_main_paragraph(plan_review_cap)) if _plan_style else "")
+                   + ((_plan_main_worker_paragraph() if ledger_style == "plan_main"
+                       else _plan_gate_worker_paragraph(plan_review_cap)) if multi_agent and _plan_style else
+                      _multi_agent_role_paragraph(review_rounds, direct_read, layer,
                                                   escalate=review_rounds_escalation,
                                                   ledger_enabled=_ledger_enabled)
                       if multi_agent else "")
                    + (_MULTI_AGENT_RESUME_FALLBACK_PARAGRAPH if multi_agent else ""))
+        if _plan_style:
+            content = content.replace("台帳・検索・グラフ・出典の確定は MCP ツールで行う。",
+                                      "検索・グラフ・出典の確定は MCP ツールで行う。")
     target = authoring / "AGENTS.md"
     tmp = authoring / f".AGENTS.md.tmp-{os.urandom(6).hex()}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)

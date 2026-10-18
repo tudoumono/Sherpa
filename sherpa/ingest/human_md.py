@@ -25,7 +25,7 @@ from .ooxml import excel
 HUMAN_MD_RENDERER_VERSION = "human-md-renderer-v7"
 
 # PDF の人向け MD（`render_pdf`）の版。`office_md._current_pdf_human_md_sig()` が PDF の変換キャッシュの鍵と再生成の判定に使う。出力形状を変えたら上げる
-PDF_HUMAN_MD_VERSION = "pdf-human-md-v2"
+PDF_HUMAN_MD_VERSION = "pdf-human-md-v3"
 
 # 1グループ（画面に1回に出すパイプ表の塊）あたりの目安上限文字数
 _MAX_GROUP_CHARS = 20_000
@@ -586,6 +586,10 @@ def _pdf_page_blocks(texts: list, tables: list, cells: dict[str, list]) -> list[
         if kind == "table":
             flush_rows()
             blocks.append(_pdf_table_md(cells.get(e.element_id, [])))
+            continue
+        if e.extension.get("row_lines"):         # 縦罫線の無い表の行の塊: 行ごとの改行を残す
+            flush_rows()
+            blocks.append(e.value.replace("\r\n", "\n").replace("\r", "\n").strip())
             continue
         value = " ".join(e.value.replace("\r\n", "\n").replace("\r", "\n").split("\n")).strip()
         if rows and row_top - y <= row_tolerance:

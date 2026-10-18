@@ -417,7 +417,7 @@ PRE_S7_REPRESENTATIVES = GOLDEN_DIR / "world_graph_pre_s7_edge_representatives.j
 def test_edge_representatives_are_unchanged_by_the_sources_change(name, world_id):
     """辺の根拠（S7）を足しても、辺の代表 `(src, type, dst, via, line)` は S7 の前の出力と同じ（基準は S7 の前の `build_world` の出力）。"""
     _n, edges, _f = world_graph.build_world(ROOT / "fixtures" / "corpus" / name, world_id)
-    actual = sorted([e["src"], e["type"], e["dst"], e.get("via"), e["line"]] for e in edges)
+    actual = sorted([e["src"], e["type"], e["dst"], e.get("via"), e["line"]] for e in edges if e["type"] != "FLOWS_TO")   # 基準の出力に無い辺型（データの流れ）は比べない
     assert actual == _load_golden(PRE_S7_REPRESENTATIVES)[name]
     for e in edges:
         if e.get("sources"):
