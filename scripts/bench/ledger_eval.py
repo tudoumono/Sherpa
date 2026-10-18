@@ -297,7 +297,12 @@ def review_gain(target: Path, gold: set[str], final_body: str, corpus_files: lis
     candidates = [{"k": int(p.stem[7:]), **score(p.read_text(encoding="utf-8"))} for p in files]
     final = score(final_body)
     before = candidates[0] if candidates else None
-    delta = lambda key: (final[key] - before[key]) if before and final[key] is not None and before[key] is not None else None
+
+    def delta(key):
+        if before and final[key] is not None and before[key] is not None:
+            return final[key] - before[key]
+        return None
+
     return {"review_cap": cap, "requests": requests if isinstance(requests, int) else (len(candidates) or None),
             "candidates": candidates, "before": before, "final": final,
             "recall_delta": delta("recall"), "precision_delta": delta("precision"),
