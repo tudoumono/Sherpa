@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..env_int import env_int
+from . import child_registry
 
 _log = logging.getLogger("sherpa.ingest.convert")   # 変換ログ（make logs convert）と同じ名前
 
@@ -192,7 +193,8 @@ class Prefetcher:
         self._unclaimed: dict[str, str] = {}               # 結果を取り出したが親がまだ描画結果を使っていない rel の素材
         self._closed = False
         self._pool: ProcessPoolExecutor | None = ProcessPoolExecutor(
-            max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
+            max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+            initializer=child_registry.guard_parent, initargs=(os.getpid(),))
         self._pump()
 
     def __enter__(self) -> "Prefetcher":

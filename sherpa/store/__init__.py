@@ -102,7 +102,10 @@ from .documents import (  # noqa: F401
 )
 from .ingest import (  # noqa: F401
     add_ingest_run,
+    claim_queued_run,
+    count_queued_runs,
     downgrade_orphaned_extracting_runs,
+    enqueue_ingest_run,
     fail_close_if_extracting,
     finish_ingest_run,
     finish_ingest_run_and_confirm_world,
@@ -111,9 +114,11 @@ from .ingest import (  # noqa: F401
     get_recent_es_attempts,
     get_latest_published_run_summary,
     get_latest_run_summary,
+    list_claimants_of_extracting_runs,
     list_ingest_runs,
     list_worlds_with_interrupted_latest_run,
     note_ingest_run_op,
+    restamp_queued_runs,
     start_ingest_run,
     update_ingest_run_progress,
 )

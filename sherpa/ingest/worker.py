@@ -73,7 +73,7 @@ def build_world_graph(world: str):
 def _reflect_graph_after_rag_rewrite(world: str) -> tuple[int, int]:
     """`.rag.md` の軽量書換え後、Neo4j のグラフ（言及エッジ）を追いつかせる。
 
-    言及エッジは `{rel}.rag.md` があればそれを本文として読む。`_llm_render_pass`／`regenerate_rag_rule_only`／
+    言及エッジは `{rel}.rag.md` があればそれを本文として読む。`llm_render_pass`／`regenerate_rag_rule_only`／
     `_refresh_derived_representations` は rag.md を書き換えるが世代（world 署名）を変えないため、`_run_locked` の
     `build_world_graph`→`load_world` を経由しない。ES 反映とは独立に常に呼ぶ。
     呼び出し元が `store.world_lock(world)` を保持している前提（ロックは再入不可）。失敗は例外のまま伝播させる。
@@ -108,16 +108,58 @@ def _office_md_stage_summary(drep: dict) -> dict:
 
 def _es_summary(esr) -> dict:
     """`es_index.index_world()` の結果から `extraction_snapshot.es` に残す要約を作る（counts の元データ＋取り込みの状態へ出す落とし・粗くした記録）。
-    `rag_degraded`（粗い区切りへ退避・本文の読み取り失敗・空文書の件数）と `rag_degraded_by_reason`（理由別）、`embed_degraded`（埋め込み失敗で BM25 のみ）、`analyzer_fallback`（日本語アナライザを作れず標準）は、あるときだけ載せる。
+    `rag_degraded`（粗い区切りへ退避・本文の読み取り失敗・空文書の件数）と `rag_degraded_by_reason`（理由別）、`embed_degraded`（ベクトルを持つチャンクが 1 件も無い）、`analyzer_fallback`（日本語アナライザを作れず標準）、`vectors_missing`（ベクトルの無いチャンクの数）、`vectors_filled`（後から足した数）は、あるときだけ載せる。
     """
     r = esr if isinstance(esr, dict) else {}
     out = {"available": r.get("available") if r else None, "error": r.get("error") if r else None,
            "chunks": r.get("chunks") if r else None, "indexed": r.get("indexed") if r else None,
            "embedded": r.get("embedded") if r else None, "reused": r.get("reused") if r else None,
            "embed_elapsed_ms": r.get("embed_elapsed_ms") if r else None}
-    for key in ("rag_degraded", "rag_degraded_by_reason", "embed_degraded", "analyzer_fallback"):
+    for key in ("rag_degraded", "rag_degraded_by_reason", "embed_degraded", "analyzer_fallback",
+                "vectors_missing", "vectors_filled"):
         if r.get(key):
             out[key] = r[key]
+    return out
+
+
+def _fill_missing_vectors_step(world: str) -> dict | None:
+    """ベクトルの無いチャンクを足し直す（取り込みの最後・best-effort）。失敗は取り込みの成否に影響させない。停止要求（`StopRequested`）だけは呼び出し元へ通す。"""
+    try:
+        return es_index.fill_missing_vectors(world)
+    except background.StopRequested:
+        raise
+    except Exception:
+        _log.warning("ベクトルの足し直しで例外が発生しました（次回 sync で再試行）: world=%s", world, exc_info=True)
+        return None
+
+
+def _previous_es_summary(world: str) -> dict | None:
+    """ES へ触れた直近の成功の要約（足し直しだけの更新が、前の要約の注意（粗い区切りなど）を引き継ぐため）。"""
+    try:
+        for es in store.get_recent_es_attempts(world, 20):
+            if es.get("available") is True and not es.get("error"):
+                return es
+    except Exception:
+        _log.debug("直近の ES の要約の取得に失敗しました（best-effort）", exc_info=True)
+    return None
+
+
+def _with_fill(es_summary: dict | None, fill: dict | None, world: str) -> dict | None:
+    """足し直しの結果（残り `vectors_missing`・足した `vectors_filled`）を ES の要約へ重ねる。足すものも残りも無ければそのまま。
+    ES を張り直していない run（要約なし）では、前回の要約を引き継いで重ねる（通知が「今の ES の状態」を表すよう、足し直しだけの更新も完全な要約を残す）。"""
+    if not fill or not (fill.get("filled") or fill.get("missing")):
+        return es_summary
+    base = es_summary if es_summary is not None else (_previous_es_summary(world) or _es_summary(
+        {"available": True, "error": None, "chunks": es_index.count(world)}))
+    out = dict(base)
+    if fill.get("filled"):
+        out.pop("embed_degraded", None)     # ベクトルが 1 件も無い、は足せた時点で成り立たない
+    out.pop("vectors_missing", None)
+    out.pop("vectors_filled", None)
+    if fill.get("missing"):
+        out["vectors_missing"] = fill["missing"]
+    if fill.get("filled"):
+        out["vectors_filled"] = fill["filled"]
     return out
 
 
@@ -561,7 +603,7 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
         # 署名は確定しない（last_sig は `''` のまま）。Neo4j 未反映を「同期済み」とみなさず、次の `sync(reflect=True)` が再構築する
         return _record("extracting", ledger=written, extra_flags=_office_flags(drep), drep=drep)
 
-    if background.stop_requested():                         # ここまでは何も反映していない。この先（グラフ置換・台帳・ES）は区切りが無いので終わるまで進める
+    if background.stop_requested():                         # ここまでは何も反映していない。この先のグラフ置換・台帳は区切りが無いので終わるまで進める（ES 索引は区切りごとに止まれる）
         return _record("failed", interrupted=True, drep=drep)
     # ④ グラフを資料フォルダ単位で atomic に置換する（`load_world`）。失敗時は tx がロールバックされ旧グラフが残り、台帳も書き換えない
     env = None
@@ -646,6 +688,11 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
         if esr.get("error"):                                # delete/create/bulk 失敗は error dict（未接続は warn しない）
             extra.append({"doc": None, "action": "warn", "reason": f"es_index_failed:{esr['error']}"})
         elif esr.get("available") is True:
+            fill = _fill_missing_vectors_step(world)       # ベクトルを取れなかったチャンクを、取り込みの最後にもう一度だけ足す
+            if fill:
+                esr = {**esr, "vectors_filled": fill.get("filled") or 0,
+                       "vectors_missing": (fill["missing"] if fill.get("missing") is not None
+                                           else esr.get("vectors_missing", 0))}
             # 全再構築は human_md も作り直すので、bulk 成功時だけ `.human_md_es_sig` を確定する（RAG_ES の設定に関わらず評価）
             wd = worlds.world_dir(world)
             dmd = worlds.derived_md_dir(world)
@@ -659,6 +706,10 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
                     # confirm の失敗は flags へ反映する（成功で覆い隠さない）
                     extra.append({"doc": None, "action": "warn",
                                   "reason": "human_md_es_sig_marker_confirm_failed"})
+    except background.StopRequested:                        # 停止要求＝ES の区切りで止まった。作りかけの索引は消してあり、署名は確定しない（次回は作り直す）
+        _log.info("停止要求により ES 索引の区切りで取り込みを中断しました: world=%s", world)
+        return _record("failed", interrupted=True, reflected={"nodes": n, "edges": m}, ledger=written,
+                       extra_flags=extra, drep=drep)
     except Exception as e:
         esr = {"available": None, "error": f"{e.__class__.__name__}@{_target_of(es_index._url())}"}
         extra.append({"doc": None, "action": "warn",
@@ -1062,6 +1113,8 @@ def index_world_with_human_md_holdback(world: str, *, content_sig=None, settings
         return {"available": False, "error": "human_md_es_sig_marker_drop_failed"}
     try:
         esr = es_index.index_world(world, content_sig=content_sig, settings=settings, progress=progress)
+    except background.StopRequested:                        # 停止要求は失敗として記録せず呼び出し元へ通す（マーカーは無効化したまま＝次回作り直す）
+        raise
     except Exception as e:
         _log.warning(
             "ES 再索引で例外が発生しました（次回 sync で再試行）: world=%s", world, exc_info=True)
@@ -1250,21 +1303,31 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
 
 
 def sync(world, *, reflect=True, force=False, run_id=None, on_run_id=None, op: str = "sync") -> dict:
-    """`_sync_impl` の薄いラッパー。成功後に rag.md の LLM 成形を背景で後追い起動する（`llm_render.schedule_background`）。
+    """`_sync_impl` の薄いラッパー。成功後に rag.md の LLM 成形を後追いの対象に登録する（`llm_render.request_followup`・実行は取り込みワーカーが run の後に行う）。
 
-    資料フォルダが解決できなかった（`status="unavailable"`）場合と、`SHERPA_TEST_DB_ISOLATED`（pytest 実行中に立つ内部フラグ）が立っている間は起動しない。
-    背景起動の失敗は best-effort で、`sync()` の戻り値・例外には影響させない。
+    資料フォルダが解決できなかった（`status="unavailable"`）場合と、`SHERPA_TEST_DB_ISOLATED`（pytest 実行中に立つ内部フラグ）が立っている間は登録しない。
+    登録の失敗は best-effort で、`sync()` の戻り値・例外には影響させない。
     """
-    with resolve_settings.pinned(world):        # 変更なしの分岐（グラフの自己修復）も含め、1 回の sync は同じ設定を使う
-        result = _sync_impl(world, reflect=reflect, force=force, run_id=run_id, on_run_id=on_run_id, op=op)
+    try:
+        with resolve_settings.pinned(world):        # 変更なしの分岐（グラフの自己修復）も含め、1 回の sync は同じ設定を使う
+            result = _sync_impl(world, reflect=reflect, force=force, run_id=run_id, on_run_id=on_run_id, op=op)
+    except background.StopRequested:                # 変更なしの分岐の ES の区切りで止まった＝失敗ではなく中断（起動時に自動で続きを始める）
+        _log.info("停止要求により ES 索引の区切りで同期を中断しました: world=%s", world)
+        if run_id is not None:
+            try:
+                store.finish_ingest_run(run_id, status="failed", extraction_snapshot={
+                    "changed": False, "interrupted": True, "op": op})
+            except Exception:
+                _log.warning("中断の記録に失敗しました（best-effort）: world=%s run_id=%s", world, run_id, exc_info=True)
+        return {"world": world, "changed": False, "status": "failed", "ledger": 0, "interrupted": True}
     if (result.get("status") != "unavailable" and not os.environ.get("SHERPA_TEST_DB_ISOLATED")
             and not background.stop_requested()):
         try:
             from . import llm_render
-            llm_render.schedule_background(world, _llm_render_pass)
+            llm_render.request_followup(world)
         except Exception:
             _log.warning(
-                "LLM 成形の背景起動に失敗しました（次回 sync で再試行）: world=%s", world, exc_info=True)
+                "LLM 成形の後追い登録に失敗しました（次回 sync で再試行）: world=%s", world, exc_info=True)
     return result
 
 
@@ -1479,10 +1542,14 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                     # 内部再索引の後に外側の再索引も走った場合は置換せず合成する（`_merge_es_runs`）
                     es_summary, _stage_timings["es_index"] = _merge_es_runs(
                         es_summary, _stage_timings.get("es_index"), _outer_summary, _outer_timing)
+            except background.StopRequested:                # 停止要求は `sync()` が中断として記録する
+                raise
             except Exception as e:
                 _log.warning(
                     "ES 自己修復中に予期しない例外が発生しました: world=%s", world, exc_info=True)
                 es_repair_failure = e.__class__.__name__
+            if es_repair_failure is None:
+                es_summary = _with_fill(es_summary, _fill_missing_vectors_step(world), world)   # ベクトルを取れなかったチャンクを、取り込みの最後に足す
             # drep（office_md 段別要約）／rows（台帳）は unchanged 分岐に無いので `_counts_summary` がキーごと省略する
             _counts = _counts_summary(None, es_summary, manifest, None)
             # `refresh_outcome == "rag_failed"` は ES 自己修復の成否と独立に run を failed にする（未反映のまま `auto_published` と記録しないため）
@@ -1543,14 +1610,14 @@ def _reindex_after_rag_rewrite(world: str) -> bool:
         return ok
 
 
-def _llm_render_pass(world: str) -> None:
-    """`sync()` 成功後に背景 thread から呼ばれる LLM 成形の1回分。
+def llm_render_pass(world: str, *, should_stop=None) -> None:
+    """`sync()` が登録した LLM 成形の1回分（取り込みワーカーが run の後に呼ぶ）。`should_stop()` が真になったら次の文書へ進まず止める。
 
     `llm_render.run_world_pass` がファイル書込までを担い、書き換わった rel が1件でもあればここで ES への反映（`_reindex_after_rag_rewrite`）まで行う。
     個々のファイル書込は `store.world_lock` を取らない（LLM 呼び出しで長時間になるため。書込自体は `write_text_atomic` で原子的）。
     """
     from . import llm_render
-    result = llm_render.run_world_pass(world)
+    result = llm_render.run_world_pass(world, should_stop=should_stop)
     if result.changed_rels:
         _reindex_after_rag_rewrite(world)
 

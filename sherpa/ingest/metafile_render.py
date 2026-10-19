@@ -1,4 +1,4 @@
-"""WMF/EMF の図全体の描画（LibreOffice）をバックグラウンドで 1 件ずつ進める。
+"""WMF/EMF の図全体の描画（LibreOffice）を、取り込みワーカーが待機中に 1 件ずつ進める（`ingest_worker.py` が `run_pass` を呼ぶ）。
 
 取り込み・今すぐ更新は LibreOffice を呼ばず、描画が要る図に状態（``pending``／``unavailable``）だけを
 ``{rel}.assets/_metafile/{親hash}.render.json`` へ残す。ここが派生領域を走査して、
@@ -210,23 +210,3 @@ def run_pass(targets: list[tuple[str, Path]] | None = None, *, max_renders: int 
         return {"rendered": rendered, "failed": failed, "remaining": remaining}
     finally:
         _pass_lock.release()
-
-
-def start_loop(stop: threading.Event, *, interval: float = 300.0, first_delay: float = 60.0) -> threading.Thread:
-    """アプリのプロセス内で ``run_pass`` を繰り返す daemon thread を起動する（``stop`` で止まる）。"""
-    def _run() -> None:
-        wait = first_delay
-        while not stop.wait(wait):
-            wait = interval
-            try:
-                result = run_pass()
-                if result.get("rendered") or result.get("failed"):
-                    _log.info("図全体の描画 pass: %s", result)
-                if result.get("remaining") and result.get("rendered"):
-                    wait = 15.0                          # まだ残っていれば間を詰める
-            except Exception:
-                _log.warning("図全体の描画 pass に失敗しました（次回に再試行）", exc_info=True)
-
-    thread = threading.Thread(target=_run, daemon=True, name="sherpa-metafile-render")
-    thread.start()
-    return thread

@@ -92,7 +92,8 @@ echo "=== Sherpa インストール（種類: ${KIND}・版: ${VERSION}・コミ
 mkdir -p "$ROOT/data"
 # shellcheck source=scripts/run-common.sh
 . "$ROOT/scripts/run-common.sh"
-if pid="$(live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE" 2>/dev/null)"; then
+if pid="$(live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE" 2>/dev/null)" \
+   || pid="$(live_matching_pid "$WORKER_PID_FILE" "$WORKER_PROC_NEEDLE" 2>/dev/null)"; then
   fail "Sherpa が動いています（pid ${pid}）。make stop で止めてから ./install.sh を実行してください。"
   exit 1
 fi

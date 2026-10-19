@@ -1,7 +1,7 @@
-"""起動時の取り込みの自動再開。
+"""取り込みワーカーの起動時の自動再開。
 
 停止要求で区切りに止まった run と、強制終了で中断へ格下げされた run のうち、資料フォルダの最新の run が
-中断のままのものについて、同期（sync）を背景で 1 回だけ始める。済んだファイルは変換キャッシュから取れる。
+中断のままのものについて、同期（refresh）の依頼を 1 回だけ積む（実行はそのままワーカーが拾う）。済んだファイルは変換キャッシュから取れる。
 設計: docs/design/operations.md「起動・停止・状態」
 """
 from __future__ import annotations
@@ -24,19 +24,12 @@ def enabled() -> bool:
 
 
 def _start_sync(world_id: str) -> bool:
-    from .. import world_admin_service
     from . import worker
 
-    def _create_run() -> int:
-        row = store.start_ingest_run(
-            world_id, scan_root=None, created_by="admin",
-            progress={"stage": "accepted", "stage_label": worker.STAGE_LABELS["accepted"],
-                      "done": None, "total": None, "updated_at": datetime.now(timezone.utc).isoformat()})
-        return row["id"]
-
-    _run_id, joined = background.start_or_join(
-        world_id, "refresh", "{}", _create_run,
-        lambda run_id: world_admin_service.refresh(world_id, run_id=run_id))
+    _run_id, joined = background.submit(
+        world_id, "refresh", "{}",
+        progress={"stage": "accepted", "stage_label": worker.STAGE_LABELS["accepted"],
+                  "done": None, "total": None, "updated_at": datetime.now(timezone.utc).isoformat()})
     return not joined
 
 

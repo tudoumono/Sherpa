@@ -226,16 +226,17 @@ def test_reconvert_non_target_returns_422(client, monkeypatch, tmp_path):
     assert client.post("/worlds/w1/reconvert", json={"rel": "a.cbl"}).status_code == 422
 
 
-def test_reconvert_accepts_202_and_runs_one_file_in_background(client, monkeypatch, tmp_path):
-    """受け付けたら 202 ですぐ返し、背景で 1 ファイルの再変換（`worker.reconvert`）を走らせて前後を監査する。"""
+def test_reconvert_accepts_202_and_the_worker_runs_one_file(client, monkeypatch, tmp_path):
+    """受け付けたら 202 ですぐ返し（依頼を積むだけ）、取り込みワーカーが 1 ファイルの再変換（`worker.reconvert`）を走らせて前後を監査する。"""
+    from sherpa.ingest import jobs
     from sherpa.ingest import worker as ingest_worker
     from sherpa.routers import worlds as worlds_routes
     _reconvert_env(monkeypatch, tmp_path)
     audits = _stub_audit(monkeypatch)
     dispatched = {}
 
-    def _fake_dispatch(wid, op, fingerprint, work_fn, **kw):
-        dispatched.update(wid=wid, op=op, fingerprint=fingerprint, work_fn=work_fn, **kw)
+    def _fake_dispatch(wid, op, fingerprint, payload=None, **kw):
+        dispatched.update(wid=wid, op=op, fingerprint=fingerprint, payload=payload, **kw)
         return 7, False
 
     monkeypatch.setattr(worlds_routes, "_dispatch", _fake_dispatch)
@@ -248,20 +249,24 @@ def test_reconvert_accepts_202_and_runs_one_file_in_background(client, monkeypat
     assert dispatched["op"] == "reconvert" and "旧資料.xlsx" in dispatched["fingerprint"]
     assert dispatched["initial_progress"]["rel"] == "旧資料.xlsx"
     assert calls == []                                    # 応答の時点ではまだ走らせない
-    dispatched["work_fn"](7)
+    jobs.run_job(dispatched["op"], dispatched["wid"], dispatched["payload"], 7)   # ワーカーが拾ったときの実行
     assert calls == [("w1", "旧資料.xlsx", 7)]
     assert audits.pairs() == [("world.reconvert_requested", "success"), ("world.reconverted", "success")]
 
 
 def test_reconvert_while_other_op_running_returns_409(client, monkeypatch, tmp_path):
-    """同じ資料フォルダで別の処理（ここでは更新）が実行中なら 409（run を作らない）。"""
-    from sherpa import store
+    """同じ資料フォルダで別の処理（ここでは更新）が積み済み・実行中なら 409（run を増やさない）。"""
     from sherpa.ingest import background
+    from sherpa.store import db as store_db
     _reconvert_env(monkeypatch, tmp_path)
-    monkeypatch.setattr(store, "start_ingest_run", lambda *a, **kw: pytest.fail("run を作らない"))
-    monkeypatch.setitem(background._REGISTRY, "w1",
-                        background._BgRun(world_id="w1", op="refresh", fingerprint="{}", run_id=3))
-    assert client.post("/worlds/w1/reconvert", json={"rel": "旧資料.xlsx"}).status_code == 409
+    try:
+        background.submit("w1", "refresh", "{}")
+        assert client.post("/worlds/w1/reconvert", json={"rel": "旧資料.xlsx"}).status_code == 409
+        with store_db._connect() as c:
+            assert c.execute("SELECT count(*) AS n FROM ingest_runs WHERE version='w1'").fetchone()["n"] == 1
+    finally:
+        with store_db._connect() as c:
+            c.execute("DELETE FROM ingest_runs WHERE version='w1'")
 
 
 # ===================================================================================

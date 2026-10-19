@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import threading
-import time
 
 import pytest
 
@@ -385,44 +383,28 @@ def test_clear_cache_removes_file_and_is_noop_when_absent(monkeypatch, tmp_path)
     assert not path.exists()
 
 
-# ---- 多重起動抑止 ----------------------------------------------------------------------------
+# ---- 後追いの登録・途中停止 -------------------------------------------------------------------
 
-def _wait_idle(world: str):
-    for _ in range(50):
-        if not llm_render.is_running(world):
-            break
-        time.sleep(0.05)
-
-
-def test_schedule_background_prevents_concurrent_runs():
-    started = threading.Event()
-    release = threading.Event()
-    calls = []
-
-    def _work(world):
-        calls.append(world)
-        started.set()
-        release.wait(timeout=5)
-
-    try:
-        assert llm_render.schedule_background("w-guard", _work) is True
-        assert started.wait(timeout=5)
-        assert llm_render.is_running("w-guard") is True
-        assert llm_render.schedule_background("w-guard", _work) is False
-        assert calls == ["w-guard"]
-    finally:
-        release.set()
-        _wait_idle("w-guard")
-    assert llm_render.is_running("w-guard") is False
+def test_followups_are_collapsed_per_world_and_taken_once():
+    llm_render.take_followups()
+    llm_render.request_followup("w-a")
+    llm_render.request_followup("w-b")
+    llm_render.request_followup("w-a")                  # 同じ world は 1 回にまとめる
+    assert llm_render.take_followups() == ["w-a", "w-b"]
+    assert llm_render.take_followups() == []
 
 
-def test_schedule_background_reports_failure_without_raising():
-    def _fail(world):
-        raise RuntimeError("背景処理の失敗")
+def test_run_world_pass_stops_before_next_document_when_asked(monkeypatch, tmp_path):
+    """待っている取り込みの依頼がある・停止要求が出たとき、LLM 成形は次の文書へ進まない（取りこぼしは次回の sync が拾う）。"""
+    world = _isolate(monkeypatch, tmp_path)
+    monkeypatch.setattr(llm_render, "available", lambda settings=None: {**CFG, "key": "test-key"})
+    _write_rag(world, "a.xlsx", _rule_md(BODY))
+    formatted = []
+    monkeypatch.setattr(llm_render, "format_document",
+                        lambda *a, **kw: formatted.append(a[1]) or None)
 
-    assert llm_render.schedule_background("w-fail", _fail) is True
-    _wait_idle("w-fail")
-    assert llm_render.is_running("w-fail") is False   # 例外を吸収しレジストリからも外れる
+    result = llm_render.run_world_pass(world, should_stop=lambda: True)
+    assert formatted == [] and result.docs_scanned == 0
 
 
 # ---- metering 配線（kind='rag_render'）-------------------------------------------------------

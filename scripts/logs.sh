@@ -112,6 +112,7 @@ _docker_canonical() {   # $1=生の名前 -> 一致すれば実サービス名�
 _describe_name() {
   case "$1" in
     api) echo "アプリ本体（Web リクエスト・エラー）" ;;
+    ingest-worker) echo "取り込みワーカー（Web とは別のプロセス）の起動・異常終了・処理の警告" ;;
     convert) echo "資料取り込みの MD 化（1 ファイルごとの開始/完了・秒数）" ;;
     libreoffice) echo "旧形式 Office（.doc/.xls/.ppt）の前段変換" ;;
     embed) echo "埋め込み（ベクトル化）の進行" ;;

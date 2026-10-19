@@ -53,6 +53,7 @@ audit
 backfill_all
 backfill_doc_count
 backfill_manifest_and_doc_count
+claim_queued_run
 claim_workspace_file_expired
 clear_failed_docs
 conversation_has_personal_message
@@ -60,6 +61,7 @@ conversation_is_personal_tainted
 count_and_list_documents
 count_documents
 count_ext_api_calls_by_key
+count_queued_runs
 count_self_issued_active_api_keys
 count_users_with_personal_keys
 create_announcement
@@ -78,6 +80,7 @@ depth_quality_stats
 dict_row
 document_exists
 downgrade_orphaned_extracting_runs
+enqueue_ingest_run
 expired_workspace_files
 extend_share
 fail_close_if_extracting
@@ -114,6 +117,7 @@ is_personal_tainted
 list_announcements
 list_api_keys
 list_audit
+list_claimants_of_extracting_runs
 list_conversations
 list_document_worlds
 list_documents
@@ -147,6 +151,7 @@ replace_documents
 replace_failed_docs
 resolve_self_issued_daily_quota_cap
 resolve_share_by_token
+restamp_queued_runs
 restore_announcement
 restore_announcement_state
 restore_bind_invalidate_sig

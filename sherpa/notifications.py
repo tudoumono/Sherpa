@@ -3,7 +3,7 @@
   a) 取り込み run の完了/失敗（`ingest_runs`）。全利用者に見せる。
   b) LLM 成形パスの完了（`usage_events` の `kind="rag_render"`）。admin のみ（失敗は通知しない）。
   c) OCR ジョブ群の完了＝rag.md への反映待ち（`ocr_jobs` の状態集計＋`.rag_sig` drift）。admin のみ。
-     反映待ちを検知したら `sherpa.ingest.background` の多重起動抑止に乗せて軽量 sync を1回だけ予約する（`_trigger_ocr_catchup`）。
+     反映待ちを検知したら `sherpa.ingest.background` の取り込みの依頼に乗せて軽量 sync を1回だけ予約する（`_trigger_ocr_catchup`）。
   d) 自分が所有する共有の期限が近い通知。所有者のみ。
 admin 限定イベントは `list_notifications(is_admin=...)` が絞る。
 """
@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from . import store, world_admin_service, worlds
+from . import store, worlds
 from .ingest import background as ingest_background
 from .ingest import office_md
 from .ingest import worker as ingest_worker
@@ -69,7 +69,7 @@ def _ingest_run_notifications(labels: dict[str, str]) -> list[dict]:
     items = []
     for wid, label in labels.items():
         run = store.get_latest_run_summary(wid)
-        if not run or run.get("status") == "extracting":
+        if not run or run.get("status") in ("queued", "extracting"):
             continue
         status = str(run.get("status") or "")
         failed = "failed" in status
@@ -106,19 +106,13 @@ def _llm_render_notifications(labels: dict[str, str]) -> list[dict]:
 def _trigger_ocr_catchup(world_id: str) -> None:
     """OCR 完了の反映待ちを検知した world の軽量 sync を1回だけ予約する（best-effort）。
 
-    `background.start_or_join` の world 単位多重起動抑止に乗る。他の操作が進行中（`ConflictError`）なら静かに諦める。
+    取り込みの依頼（`background.submit`）に乗せる＝同じ world で積み済み・実行中の更新があれば合流し、他の操作が進行中（`ConflictError`）なら静かに諦める。
     """
-    def _create_run() -> int:
-        row = store.start_ingest_run(
-            world_id, scan_root=None, created_by="admin",
+    try:
+        ingest_background.submit(
+            world_id, "refresh", _REFRESH_FP,
             progress={"stage": "accepted", "stage_label": ingest_worker.STAGE_LABELS["accepted"],
                      "done": None, "total": None, "updated_at": datetime.now(timezone.utc).isoformat()})
-        return row["id"]
-
-    try:
-        ingest_background.start_or_join(
-            world_id, "refresh", _REFRESH_FP, _create_run,
-            lambda run_id: world_admin_service.refresh(world_id, run_id=run_id))
     except (ingest_background.ConflictError, ingest_background.ShuttingDownError):
         pass
     except Exception:

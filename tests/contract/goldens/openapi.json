@@ -13788,6 +13788,26 @@
         ]
       }
     },
+    "/ingest/workers": {
+      "get": {
+        "description": "取り込みワーカーと Web アプリの版の照合（管理者のみ）。ワーカーが動いていない・版が違うときは `message` に画面に出すお知らせが入る。",
+        "operationId": "ingest_workers_status_ingest_workers_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Ingest Workers Status",
+        "tags": [
+          "資料フォルダ(World)管理"
+        ]
+      }
+    },
     "/notifications": {
       "get": {
         "description": "非同期処理の完了/要対応の通知を返す（ホーム画面「通知」区画用・ログイン必須）。\n誰でも取り込み run の完了/失敗が見える。admin はさらにグラフ drift・LLM 成形完了・OCR 反映待ちも見える。自分が所有する共有の期限が 7 日以内に来る場合は本人にだけ見える。既読管理はせず、毎回現在の状態から組み立てる。",

@@ -131,6 +131,7 @@ RUNNING="$(running_containers)"
 # アプリの稼働判定は compose の project 名と無関係（pid ファイルはこのリポジトリのアプリを指す）＝常に見る。
 # 以前は project=sherpa-mvp のときだけ見ていたため、別 project 名では稼働中でも個人領域を tar できていた（RV）。
 APP_RUNNING="$(live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE" 2>/dev/null || true)"
+[ -n "$APP_RUNNING" ] || APP_RUNNING="$(live_matching_pid "$WORKER_PID_FILE" "$WORKER_PROC_NEEDLE" 2>/dev/null || true)"   # 取り込みワーカーも派生物と DB に書く
 if { [ -n "$RUNNING" ] || [ -n "$APP_RUNNING" ]; } && [ "$STOP" = 1 ] && [ "$DRY_RUN" = 0 ]; then
   note "アプリ/ストアが動いているので止めます（--stop）: app=${APP_RUNNING:-停止} containers=$(echo "${RUNNING:-停止}" | tr '\n' ' ')"
   # app/Caddy は個人領域への書込みも止める。ストアは対象 volume を使うコンテナだけを明示停止する。
@@ -148,6 +149,7 @@ if { [ -n "$RUNNING" ] || [ -n "$APP_RUNNING" ]; } && [ "$STOP" = 1 ] && [ "$DRY
   fi
   RUNNING="$(running_containers)"
   APP_RUNNING="$(live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE" 2>/dev/null || true)"
+[ -n "$APP_RUNNING" ] || APP_RUNNING="$(live_matching_pid "$WORKER_PID_FILE" "$WORKER_PROC_NEEDLE" 2>/dev/null || true)"   # 取り込みワーカーも派生物と DB に書く
 fi
 if [ -n "$RUNNING" ] || [ -n "$APP_RUNNING" ]; then
   ACTIVE="app=${APP_RUNNING:-停止} containers=$(echo "${RUNNING:-停止}" | tr '\n' ' ')"

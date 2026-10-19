@@ -1,5 +1,5 @@
 """L5・§8.6-2「規則版で再生成」と、LLM 成形反映後の ES 再索引配線を pin する
-（`worker.regenerate_rag_rule_only`／`worker._reindex_after_rag_rewrite`／`worker._llm_render_pass`）。
+（`worker.regenerate_rag_rule_only`／`worker._reindex_after_rag_rewrite`／`worker.llm_render_pass`）。
 
 すべて monkeypatch のみ（実 DB/ES/LLM 呼び出しは発生しない）。
 """
@@ -149,25 +149,25 @@ def test_reindex_after_rag_rewrite_es_failure_does_not_write_marker(monkeypatch)
     assert worker._reindex_after_rag_rewrite("v1") is False
 
 
-# ---- _llm_render_pass ----------------------------------------------------------------------
+# ---- llm_render_pass ----------------------------------------------------------------------
 
 def test_llm_render_pass_triggers_reindex_only_when_something_changed(monkeypatch):
     class _Result:
         changed_rels = ["a.xlsx"]
-    monkeypatch.setattr(llm_render, "run_world_pass", lambda world: _Result())
+    monkeypatch.setattr(llm_render, "run_world_pass", lambda world, **kw: _Result())
     calls = []
     monkeypatch.setattr(worker, "_reindex_after_rag_rewrite", lambda world: calls.append(world))
-    worker._llm_render_pass("v1")
+    worker.llm_render_pass("v1")
     assert calls == ["v1"]
 
 
 def test_llm_render_pass_skips_reindex_when_nothing_changed(monkeypatch):
     class _Result:
         changed_rels = []
-    monkeypatch.setattr(llm_render, "run_world_pass", lambda world: _Result())
+    monkeypatch.setattr(llm_render, "run_world_pass", lambda world, **kw: _Result())
     calls = []
     monkeypatch.setattr(worker, "_reindex_after_rag_rewrite", lambda world: calls.append(world))
-    worker._llm_render_pass("v1")
+    worker.llm_render_pass("v1")
     assert calls == []
 
 

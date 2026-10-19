@@ -145,30 +145,75 @@ fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
 # --- 既に起動していれば二重起動しない（pid の所有者を検証してから判定・RV High-1） ---
+# アプリ（Web）と取り込みワーカーは別々に再起動できる（make restart-web / make restart-worker）ため、足りない方だけ起動する。
+app_running=0
+worker_running=0
+lp_rc=0
 if pid="$(live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE")"; then
-  echo "Sherpa は既に起動しています（pid ${pid}）。"
+  app_running=1
+else
+  lp_rc=$?
+fi
+if [ "$app_running" = 0 ] && [ "$lp_rc" = 2 ]; then
+  echo "pid ファイルが古いため掃除します（プロセスには触れません・pid 再利用の疑い）。"
+fi
+if wpid="$(live_matching_pid "$WORKER_PID_FILE" "$WORKER_PROC_NEEDLE")"; then
+  worker_running=1
+elif [ -f "$WORKER_PID_FILE" ]; then
+  rm -f "$WORKER_PID_FILE"
+fi
+if [ "$app_running" = 1 ] && [ "$worker_running" = 1 ]; then
+  echo "Sherpa は既に起動しています（アプリ pid ${pid}・取り込みワーカー pid ${wpid}）。"
   echo "  URL:    $CHAT_URL"
   echo "  状態:   make status"
   echo "  停止:   make stop"
-  echo "  再起動: make restart"
+  echo "  再起動: make restart（アプリだけ: make restart-web ・ ワーカーだけ: make restart-worker）"
   exit 0
 fi
-lp_rc=$?
-if [ "$lp_rc" = 2 ]; then
-  echo "pid ファイルが古いため掃除します（プロセスには触れません・pid 再利用の疑い）。"
-fi
 # pid ファイルの残骸（プロセスは死亡済み、または再利用された別プロセス）は掃除して起動を続ける。
-[ -f "$APP_PID_FILE" ] && rm -f "$APP_PID_FILE"
+[ "$app_running" = 1 ] || { [ -f "$APP_PID_FILE" ] && rm -f "$APP_PID_FILE"; }
 
 # --- pid ファイルが無いのに healthz が既に応答している＝管理外の別サーバがこのポートを使っている ---
 # （RV Med-1）。誤って「起動成功」と誤認しないよう、ここで止める。
-if healthz_ok; then
+if [ "$app_running" = 0 ] && healthz_ok; then
   cat >&2 <<EOF
 ✗ ポート ${PORT} で別のサーバが応答しています（この start.sh の管理外です）。
   make status で状況を確認し、必要なら該当プロセスを停止してから再実行してください。
 EOF
   exit 1
 fi
+
+# バックグラウンド起動ヘルパ: 子プロセス自身が PID を書き、指定コマンドを exec する
+# （exec で PID がそのコマンドに引き継がれる＝PID ファイルの pid = 実プロセスの pid）。
+# setsid があれば新セッション化（起動元ターミナルを閉じても止まらない・PID=PGID=SID）。
+# 無い環境（stock macOS 等）では nohup 単独にフォールバックする（RV High-2）。
+# その場合 group kill（stop.sh の `kill -TERM -$pid`）は失敗し、単独 kill にフォールバックする
+# 既存経路でそのまま正しく動く（exec 連鎖のため pid ファイルの pid = 実プロセスの pid は変わらない）。
+launch_bg() {  # $1=ログファイル  $2=pidファイル  $3...=exec するコマンドと引数
+  local log="$1" pf="$2"
+  shift 2
+  if command -v setsid >/dev/null 2>&1; then
+    setsid bash -c 'echo $$ > "$0"; exec "$@"' "$pf" "$@" >"$log" 2>&1 < /dev/null &
+  else
+    nohup bash -c 'echo $$ > "$0"; exec "$@"' "$pf" "$@" >"$log" 2>&1 < /dev/null &
+  fi
+}
+
+# 取り込みワーカー（見張りのスクリプト）を起動する。ワーカーは依頼を 1 件処理するたびに終了し、見張りが起動し直す。
+start_worker() {
+  sherpa_rotate_log "$WORKER_LOG"
+  echo "取り込みワーカーを起動します（ログ: ${WORKER_LOG#$ROOT/}）..."
+  launch_bg "$WORKER_LOG" "$WORKER_PID_FILE" ./scripts/run-ingest-worker.sh "$MODE"
+  sleep 2
+  if live_pid "$WORKER_PID_FILE" >/dev/null; then
+    return 0
+  fi
+  echo "" >&2
+  echo "✗ 取り込みワーカーの起動に失敗しました。ログの末尾:" >&2
+  tail -n 20 "$WORKER_LOG" >&2 || true
+  rm -f "$WORKER_PID_FILE"
+  return 1
+}
 
 # --- Python 環境（依存は requirements.txt / constraints.txt のハッシュが変わった時だけ再インストール）---
 if [ ! -x "$VENV/bin/python" ]; then
@@ -204,6 +249,14 @@ fi
 # 以降の起動で使う Python は venv 側。
 export PYTHON_BIN="$VENV/bin/python"
 export SHERPA_PORT="$PORT"
+
+# --- アプリは動いていて、取り込みワーカーだけ止まっている（make restart-worker）: ワーカーだけ起動する ---
+if [ "$app_running" = 1 ]; then
+  start_worker || exit 1
+  echo ""
+  echo "取り込みワーカーを起動しました（アプリは起動済みのまま）。状態: make status"
+  exit 0
+fi
 
 # --- 本番（SHERPA_ENV=production）は、起動の前に本番の検査（make prod-check と同じ）を自動で行う ---
 sherpa_env_default SHERPA_ENV
@@ -277,22 +330,6 @@ if [ "$LAN" = "1" ]; then
   echo "LAN 公開モード: アプリを 0.0.0.0:${PORT} で待受します（同一ネットワークの他端末から到達可）。"
 fi
 
-# バックグラウンド起動ヘルパ: 子プロセス自身が PID を書き、指定コマンドを exec する
-# （exec で PID がそのコマンドに引き継がれる＝PID ファイルの pid = 実プロセスの pid）。
-# setsid があれば新セッション化（起動元ターミナルを閉じても止まらない・PID=PGID=SID）。
-# 無い環境（stock macOS 等）では nohup 単独にフォールバックする（RV High-2）。
-# その場合 group kill（stop.sh の `kill -TERM -$pid`）は失敗し、単独 kill にフォールバックする
-# 既存経路でそのまま正しく動く（exec 連鎖のため pid ファイルの pid = 実プロセスの pid は変わらない）。
-launch_bg() {  # $1=ログファイル  $2=pidファイル  $3...=exec するコマンドと引数
-  local log="$1" pf="$2"
-  shift 2
-  if command -v setsid >/dev/null 2>&1; then
-    setsid bash -c 'echo $$ > "$0"; exec "$@"' "$pf" "$@" >"$log" 2>&1 < /dev/null &
-  else
-    nohup bash -c 'echo $$ > "$0"; exec "$@"' "$pf" "$@" >"$log" 2>&1 < /dev/null &
-  fi
-}
-
 # --- アプリをバックグラウンド起動 ---
 # 前回ログが非空なら退避してから空で作り直す（起動のたびに上書きしない・LOG-2）。
 sherpa_rotate_log "$APP_LOG"
@@ -339,6 +376,12 @@ if ! live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE" >/dev/null; then
   ポート ${PORT} を別プロセスが使っている可能性があります。make status で確認してください。
 EOF
   exit 1
+fi
+
+# --- 取り込みワーカーを起動する（アプリが起動してから＝アプリが先に前の版の中断 run を整える）。動いていれば何もしない ---
+worker_up_rc=0
+if [ "$worker_running" = 0 ]; then
+  start_worker || worker_up_rc=1
 fi
 
 # --- LAN 公開: Caddy（HTTPS）起動 or 平文 HTTP の警告 ---
@@ -395,10 +438,16 @@ if [ "$LAN" = "1" ]; then
 fi
 echo ""
 echo "  状態:   make status"
-echo "  停止:   make stop        （アプリ＋Caddy＋ストアを全部停止）"
-echo "  再起動: make restart"
-echo "  ログ:   tail -f ${APP_LOG#$ROOT/}"
+echo "  停止:   make stop        （アプリ＋取り込みワーカー＋Caddy＋ストアを全部停止）"
+echo "  再起動: make restart     （アプリだけ: make restart-web ・ 取り込みワーカーだけ: make restart-worker）"
+echo "  ログ:   tail -f ${APP_LOG#$ROOT/} ・ ${WORKER_LOG#$ROOT/}"
 echo "──────────────────────────────────────────────"
+if [ "$worker_up_rc" != 0 ]; then
+  echo ""
+  echo "【失敗】取り込みワーカーを起動できませんでした（上の表示を確認）。アプリ本体は起動していますが、取り込みは進みません。" >&2
+  echo "  直してから make restart-worker を実行してください。" >&2
+  exit 1
+fi
 if [ "$ocr_up_rc" != 0 ]; then
   echo ""
   echo "【失敗】OCR ワーカーを起動・更新できませんでした（上の表示を確認）。アプリ本体は起動しています。" >&2

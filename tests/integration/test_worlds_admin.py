@@ -13,6 +13,7 @@ import time
 
 import pytest
 from _corpus_helpers import _mk
+from _ingest_queue import drain_ingest_queue
 from _world_setup import driver
 
 from sherpa import store, worlds
@@ -84,11 +85,12 @@ def _resolved(path) -> pathlib.Path:
 
 
 def _wait_ingest_idle(c, wid, *, timeout=60.0) -> dict:
-    """即受付・背景実行のため、完了（または失敗）まで status をポーリングする（テスト専用）。
+    """即受付（依頼を積むだけ）のため、積み済みの依頼をこのプロセスで処理し、完了（または失敗）まで status を確かめる（テスト専用）。
     登録直後は world 行がまだ無く 404 になりうる＝「作成中」として継続する。"""
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
+        drain_ingest_queue()
         r = c.get(f"/worlds/{wid}/status")
         if r.status_code == 404:
             time.sleep(0.2)
@@ -102,10 +104,11 @@ def _wait_ingest_idle(c, wid, *, timeout=60.0) -> dict:
 
 
 def _wait_world_deleted(c, wid, *, timeout=60.0) -> None:
-    """DELETE /worlds/{wid} は背景実行のため、`GET .../status` が 404 になるまで待つ（テスト専用）。"""
+    """DELETE /worlds/{wid} は依頼を積むだけのため、積み済みの依頼を処理し、`GET .../status` が 404 になるまで確かめる（テスト専用）。"""
     deadline = time.monotonic() + timeout
     last_status = None
     while time.monotonic() < deadline:
+        drain_ingest_queue()
         r = c.get(f"/worlds/{wid}/status")
         last_status = r.status_code
         if r.status_code == 404:

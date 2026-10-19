@@ -6,7 +6,7 @@ OCR 反映待ち検知時の自動追いつき（軽量 sync を1回だけ予約
 """
 from __future__ import annotations
 
-from sherpa import notifications, world_admin_service
+from sherpa import notifications
 from sherpa.ingest import background as ingest_background
 from sherpa.ingest import office_md
 from sherpa.store import ocr_jobs, usage_events
@@ -105,8 +105,8 @@ def _stub_ocr_ready(monkeypatch, *, drift=True, pending=0, targets=1):
 def test_ocr_pending_notification_triggers_catchup_once(monkeypatch):
     _stub_ocr_ready(monkeypatch)
     calls = []
-    monkeypatch.setattr(ingest_background, "start_or_join",
-                        lambda world_id, op, fp, create_run, work_fn: calls.append(
+    monkeypatch.setattr(ingest_background, "submit",
+                        lambda world_id, op, fp, payload=None, **kw: calls.append(
                             (world_id, op, fp)) or (1, False))
     items = notifications._ocr_notifications(_label())
     assert len(items) == 1
@@ -118,7 +118,7 @@ def test_ocr_pending_notification_triggers_catchup_once(monkeypatch):
 def test_ocr_pending_skipped_when_not_drifted(monkeypatch):
     _stub_ocr_ready(monkeypatch, drift=False)
     calls = []
-    monkeypatch.setattr(ingest_background, "start_or_join",
+    monkeypatch.setattr(ingest_background, "submit",
                         lambda *a, **kw: calls.append(1))
     assert notifications._ocr_notifications(_label()) == []
     assert calls == []                          # 反映済みなら sync を予約しない
@@ -151,27 +151,15 @@ def test_ocr_catchup_conflict_error_is_swallowed(monkeypatch):
 
     def _raise(*a, **kw):
         raise ingest_background.ConflictError("w1", "extract", 9)
-    monkeypatch.setattr(ingest_background, "start_or_join", _raise)
+    monkeypatch.setattr(ingest_background, "submit", _raise)
     items = notifications._ocr_notifications(_label())
     assert len(items) == 1                       # 例外は外へ伝播しない
 
 
-def test_ocr_catchup_uses_world_admin_service_refresh(monkeypatch):
-    """予約された work_fn が既存の `POST /worlds/{wid}/refresh` と同じ実処理へ委譲することを固定する。"""
-    _stub_ocr_ready(monkeypatch)
-    captured = {}
-
-    def _start_or_join(world_id, op, fp, create_run, work_fn):
-        captured["work_fn"] = work_fn
-        return 1, False
-    monkeypatch.setattr(ingest_background, "start_or_join", _start_or_join)
-    refresh_calls = []
-    monkeypatch.setattr(world_admin_service, "refresh",
-                        lambda wid, run_id=None: refresh_calls.append((wid, run_id)))
-
-    notifications._ocr_notifications(_label())
-    captured["work_fn"](77)
-    assert refresh_calls == [("w1", 77)]
+def test_ocr_catchup_shares_fingerprint_with_manual_refresh():
+    """予約は手動の `POST /worlds/{wid}/refresh` と同じ操作名・同じ fingerprint で積む（積み済み・実行中の更新に合流させ、多重予約しない）。"""
+    from sherpa.routers import worlds as worlds_routes
+    assert notifications._REFRESH_FP == worlds_routes._fingerprint({})
 
 
 # ---- 全体の組み立て（役割による絞り込み・並び順） ---------------------------------------------------

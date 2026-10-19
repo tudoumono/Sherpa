@@ -25,7 +25,7 @@ def _row(rep=None):
 
 
 def _stub_runs(monkeypatch, snapshot=None, es_snapshot=None):
-    monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: [])
+    monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: [es_snapshot] if es_snapshot else [])
     monkeypatch.setattr(store, "get_latest_run_summary",
                         lambda wid: {"status": "auto_published_with_flags",
                                      "extraction_snapshot": snapshot or {}, "created_at": None})
@@ -229,3 +229,33 @@ def test_es_degraded_docs_and_bm25_only_are_recorded_without_extra_embedding_cal
     assert codes == {"es_text_read_failed": 1, "es_embed_failed_bm25_only": 1}
     _stub_runs(monkeypatch, es_snapshot={"available": True, "error": None, "rag_degraded_by_reason": {"empty_text": 2}})
     assert {"code": "es_empty_text", "count": 2} in worlds_router._ingest_summary("w", _row())["ingest_notices"]
+
+
+def test_es_vectors_missing_is_shown_as_a_notice_but_not_alongside_the_all_missing_notice(monkeypatch):
+    """ベクトルの無いチャンクの件数が取り込みの結果に出る。全部が未変換のときは既存の通知だけにする。"""
+    from sherpa.ingest import worker
+    summary = worker._es_summary({"available": True, "chunks": 10, "vectors_missing": 3, "vectors_filled": 2})
+    assert summary["vectors_missing"] == 3 and summary["vectors_filled"] == 2
+    _stub_runs(monkeypatch, es_snapshot=summary)
+    assert {"code": "es_vectors_missing", "count": 3} in worlds_router._ingest_summary("w", _row())["ingest_notices"]
+    _stub_runs(monkeypatch, es_snapshot={**summary, "embed_degraded": True})
+    codes = {n["code"] for n in worlds_router._ingest_summary("w", _row())["ingest_notices"]}
+    assert "es_vectors_missing" not in codes and "es_embed_failed_bm25_only" in codes
+    assert "vectors_missing" not in worker._es_summary({"available": True, "vectors_missing": 0})   # 0 件は載せない
+
+
+def test_vectors_missing_notice_clears_after_a_fill_only_run(monkeypatch):
+    """取れなかったベクトルを後の更新（足し直しだけ・反映済みの印が付かない run）で足し終えたら、通知は消える。"""
+    from sherpa.ingest import worker
+    first = worker._es_summary({"available": True, "chunks": 10, "vectors_missing": 3,
+                                "rag_degraded_by_reason": {"empty_text": 2}})
+    runs = [first]                                   # 新しい順の ES 記録
+    monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: list(runs))
+    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: {"status": "auto_published", "extraction_snapshot": {}})
+    monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
+    monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: {"extraction_snapshot": {"es": first}})
+    codes = lambda: {n["code"] for n in worlds_router._ingest_summary("w", _row())["ingest_notices"]}   # noqa: E731
+    assert "es_vectors_missing" in codes()
+
+    runs.insert(0, worker._with_fill(None, {"filled": 3, "missing": 0}, "w"))     # 足し直しだけの更新（ES の要約なし）
+    assert codes() == {"es_empty_text"}              # 残りの印は消え、索引を作ったときの注意は引き継がれる

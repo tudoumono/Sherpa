@@ -267,3 +267,41 @@ def test_run_dir_shell_and_python_agree_on_relative_path(tmp_path):
     assert sh.stdout == str(root / "data" / "run-x" / "api.log")
     assert py.stdout.strip() == str(root / "data" / "run-x")
     assert "SHERPA_LOG_DIR はもう使いません" in sh.stderr
+
+
+# ---- Web の再起動で取り込みのログを動かさない（Web とワーカーは別プロセス） ----
+
+def _fresh_logging(tmp_path, owner, rotate=True):
+    import logging
+    from sherpa import log_setup
+    for name, _f in log_setup._SUBSYSTEM_LOGGERS.values():
+        lg = logging.getLogger(name)
+        for h in list(lg.handlers):
+            lg.removeHandler(h)
+    log_setup.configure_logging(log_dir=tmp_path, force=True, rotate=rotate, owner=owner)
+
+
+def test_web_start_rotates_only_its_own_logs_and_worker_keeps_writing_to_the_current_convert_log(tmp_path):
+    import logging
+    (tmp_path / "convert.log").write_text("MD化を開始します: a.xlsx\n", encoding="utf-8")
+    (tmp_path / "codex.log").write_text("old codex\n", encoding="utf-8")
+    _fresh_logging(tmp_path, "ingest", rotate=False)          # ワーカーが convert.log に書き始める
+    logging.getLogger("sherpa.ingest.convert").info("MD化を開始します: b.xlsx")
+    _fresh_logging(tmp_path, "web")                            # Web の再起動（起動処理のログ退避）
+    names = sorted(p.name for p in tmp_path.glob("*.log"))
+    assert "convert.log" in names and not [n for n in names if n.startswith("convert-")]   # 取り込みのログは動かない
+    assert [n for n in names if n.startswith("codex-")]        # 自分（Web）の codex.log だけ退避
+    logging.getLogger("sherpa.ingest.convert").info("MD化が完了しました: b.xlsx")
+    text = (tmp_path / "convert.log").read_text(encoding="utf-8")
+    assert "a.xlsx" in text and "b.xlsx" in text
+
+
+def test_handler_reopens_when_another_process_renames_the_file(tmp_path):
+    import logging
+    _fresh_logging(tmp_path, "ingest", rotate=False)
+    lg = logging.getLogger("sherpa.ingest.convert")
+    lg.info("before")
+    (tmp_path / "convert.log").rename(tmp_path / "convert-20260101-000000.log")   # 別プロセスが退避した
+    lg.info("after")
+    assert "after" in (tmp_path / "convert.log").read_text(encoding="utf-8")
+    assert "after" not in (tmp_path / "convert-20260101-000000.log").read_text(encoding="utf-8")

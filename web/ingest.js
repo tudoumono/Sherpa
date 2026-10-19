@@ -153,7 +153,7 @@ async function trackNewRegistration(worldId, runId) {
     }
     const { runs } = await api('GET', `/ingest/runs?world=${encodeURIComponent(worldId)}`);
     const run = (runs || []).find((r) => r.id === runId);
-    if (run && run.status !== 'extracting') {
+    if (run && run.status !== 'extracting' && run.status !== 'queued') {
       $('regmsg').innerHTML = `<span class="danger">登録に失敗しました（状態: ${esc(run.status)}）。`
         + `もう一度お試しください。</span>`;
       $('regbtn').disabled = !_chosen;
@@ -459,7 +459,7 @@ async function loadStat(world_id) {                   // 各行の状況を非�
     setIngestBusy(world_id, running);
     if (running) _runningWorldIds.add(world_id); else _runningWorldIds.delete(world_id);
     _updatePickbtnState();
-    if (running) setTimeout(() => loadStat(world_id), 3000);   // 実行中の間だけ数秒間隔で追跡
+    if (running) { loadWorkerBanner(); setTimeout(() => loadStat(world_id), 3000); }   // 実行中の間だけ数秒間隔で追跡
   } catch (e) {
     if (e && e.status === 404) {          // 削除完了＝world 行自体が消えた（一覧側の表示を戻す）
       _runningWorldIds.delete(world_id);
@@ -470,7 +470,7 @@ async function loadStat(world_id) {                   // 各行の状況を非�
     el.innerHTML = '<span class="muted">状況を取得できませんでした</span>';
     // 404 以外の一時的な失敗（ネットワーク瞬断等）でポーリングを止めると、実行中と分かっている world_id が `_runningWorldIds` に残ったまま更新されず、pickbtn が「取り込み実行中」で固まる。
     // 既知の実行中 world だけ同じ3秒間隔で継続する（恒久的な失敗を無限リトライしない）。
-    if (_runningWorldIds.has(world_id)) setTimeout(() => loadStat(world_id), 3000);
+    if (_runningWorldIds.has(world_id)) { loadWorkerBanner(); setTimeout(() => loadStat(world_id), 3000); }
   }
 }
 
@@ -667,6 +667,7 @@ const INGEST_NOTICE_JA = {
   es_empty_text: (n) => `${n} 件の資料は本文が空のため、全文検索に入っていません`,
   es_text_read_failed: (n) => `${n} 件の資料は本文を読めず、全文検索に入っていません`,
   es_embed_failed_bm25_only: () => '意味検索用の変換に失敗したため、全文検索はキーワード検索だけで作りました',
+  es_vectors_missing: (n) => `${n} 件の資料の区切りは意味検索用の変換が済んでいません（キーワード検索では見つかります。次の更新で自動的に続きを行います）`,
   es_analyzer_fallback: () => '日本語用の解析器を使えず標準の解析器で全文検索を作りました（日本語の検索精度が下がります）',
 };
 
@@ -1033,7 +1034,21 @@ async function reloadStatusSection(_preferredWorldId) {
 }
 
 // ---- 上段一覧＋下段セレクタの同時再同期（fetchWorldsShared() を共有＝/worlds 取得は1回） ----
+// 取り込みのワーカーが動いていない・版が Web アプリと違うときのお知らせ（サーバ側で文を確定済み）。
+async function loadWorkerBanner() {
+  const el = $('workerbanner');
+  if (!el) return;
+  try {
+    const w = await api('GET', '/ingest/workers');
+    el.textContent = w.message || '';
+    el.hidden = !w.message;
+  } catch (e) {
+    el.hidden = true;
+  }
+}
+
 function reloadAll(preferredWorldId) {
+  loadWorkerBanner();
   loadList();
   reloadStatusSection(preferredWorldId);
 }

@@ -156,9 +156,11 @@ def finish_ingest_run(run_id, *, status, extraction_snapshot=None, published_sna
              Json(source_doc_ids or []), published, _KB_ID, run_id)).fetchone()
 
 
-def downgrade_orphaned_extracting_runs(world=None) -> list:
+def downgrade_orphaned_extracting_runs(world=None, *, legacy_only=False, claimed_by=None) -> list:
     """居ないプロセスの孤児 `extracting` run を `failed`（中断）へ格下げし、格下げした run の id 一覧を返す。
-    `world=None` は全 world 一括（起動時に呼ぶ）。`world` 指定はその world だけ（`ingest.worker._run_locked` が world_lock を持ったまま呼ぶ）。world 指定時は新しい行の INSERT（`start_ingest_run`）より前に呼ぶこと。
+    `world=None` は全 world 一括。`world` 指定はその world だけ。
+    `legacy_only=True` はワーカーに拾われていない行（`claimed_by IS NULL`＝0.18.x の Web アプリがプロセス内で動かしていたもの）だけ、
+    `claimed_by` 指定はそのワーカーが拾った行だけを対象にする。どちらも無ければ全ての `extracting`。
     """
     _ensure()
     q = ("UPDATE ingest_runs SET status='failed', progress=NULL, "
@@ -169,6 +171,11 @@ def downgrade_orphaned_extracting_runs(world=None) -> list:
     if world is not None:
         q += " AND version=%s"
         params.append(world)
+    if legacy_only:
+        q += " AND claimed_by IS NULL"
+    if claimed_by is not None:
+        q += " AND claimed_by=%s"
+        params.append(claimed_by)
     q += " RETURNING id"
     with _connect() as c:
         return [r["id"] for r in c.execute(q, params).fetchall()]
@@ -292,3 +299,86 @@ def get_recent_es_attempts(world, limit: int = 200) -> list[dict]:
             "WHERE kb_id=%s AND version=%s AND extraction_snapshot ? 'es' "
             "ORDER BY id DESC LIMIT %s", (_KB_ID, world, limit)).fetchall()
     return [r["es"] for r in rows if isinstance(r.get("es"), dict)]
+
+
+# ---- 取り込みの依頼（queued）の受付・取得 -------------------------------------------------------------
+
+_ENQUEUE_LOCK_KEY = 0x5348_4552_5041_0001   # 依頼の受付（合流／衝突の判定→INSERT）を直列化する advisory lock の鍵
+ACTIVE_STATUSES = ("queued", "extracting")
+
+
+def enqueue_ingest_run(world, op, payload, fingerprint, app_version, *, keys=(), created_by="admin",
+                       progress=None) -> tuple[str, dict]:
+    """取り込みの依頼を `status='queued'` の 1 行として積む（受付は O(1)・処理はワーカーが拾ってから始まる）。
+    `keys`＝同時に 1 つしか動かさない単位（資料フォルダ ID と、必要なら新規登録の枠など）。同じ単位に queued/extracting の行が
+    あるとき、`op`/`fingerprint` が一致すれば積まずに `("joined", 既存行)`、違えば `("conflict", 既存行)`。無ければ `("created", 新しい行)`。
+    判定と INSERT は同じトランザクションの advisory lock で直列化する（同時の受付が 2 本とも通らない）。
+    """
+    _ensure()
+    keys = list(dict.fromkeys([world, *keys]))
+    with _connect() as c:
+        c.execute("SELECT pg_advisory_xact_lock(%s)", (_ENQUEUE_LOCK_KEY,))
+        existing = c.execute(
+            "SELECT id, version, status, COALESCE(op, extraction_snapshot->>'op') AS op, fingerprint "
+            "FROM ingest_runs WHERE kb_id=%s AND status IN ('queued','extracting') "
+            "  AND (version = ANY(%s) OR arb_keys && %s) ORDER BY id DESC LIMIT 1",
+            (_KB_ID, keys, keys)).fetchone()
+        if existing is not None:
+            same = existing["op"] == op and existing["fingerprint"] == fingerprint
+            return ("joined" if same else "conflict"), existing
+        row = c.execute(
+            "INSERT INTO ingest_runs (kb_id, version, layer, status, progress, created_by, op, payload, "
+            "  fingerprint, app_version, arb_keys) "
+            "VALUES (%s,%s,'version','queued',%s,%s,%s,%s,%s,%s,%s) "
+            "RETURNING id, version, status, op, fingerprint",
+            (_KB_ID, world, Json(progress) if progress is not None else None, created_by, op,
+             Json(payload or {}), fingerprint, app_version, keys)).fetchone()
+        return "created", row
+
+
+def claim_queued_run(worker_id, app_version) -> dict | None:
+    """自分と同じ版の依頼を古い順に 1 件 `extracting` へ進めて返す（`FOR UPDATE SKIP LOCKED`・無ければ None）。
+    操作名は `extraction_snapshot.op` にも残す（中断した run を起動時に再開してよいかの判定が読む）。
+    """
+    _ensure()
+    with _connect() as c:
+        return c.execute(
+            "UPDATE ingest_runs SET status='extracting', claimed_by=%s, "
+            "  extraction_snapshot=COALESCE(extraction_snapshot, '{}'::jsonb) || jsonb_build_object('op', op) "
+            "WHERE id = (SELECT id FROM ingest_runs WHERE kb_id=%s AND status='queued' "
+            "              AND app_version IS NOT DISTINCT FROM %s "
+            "            ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) "
+            "RETURNING id, version, op, payload, created_by",
+            (worker_id, _KB_ID, app_version)).fetchone()
+
+
+def restamp_queued_runs(app_version) -> list:
+    """拾われていない依頼（queued）の版を `app_version` に付け替え、付け替えた run の id 一覧を返す。Web アプリの起動時に呼ぶ（前の版の Web アプリが積んだ依頼を、今の版のワーカーが拾えるようにする）。"""
+    _ensure()
+    with _connect() as c:
+        rows = c.execute(
+            "UPDATE ingest_runs SET app_version=%s WHERE kb_id=%s AND status='queued' "
+            "  AND app_version IS DISTINCT FROM %s RETURNING id", (app_version, _KB_ID, app_version)).fetchall()
+    return [r["id"] for r in rows]
+
+
+def count_queued_runs(app_version) -> tuple[int, int]:
+    """待ちの依頼の数 `(自分と同じ版, 違う版)`。違う版だけが残っているワーカーは `waiting_version` で待つ。"""
+    _ensure()
+    with _connect() as c:
+        row = c.execute(
+            "SELECT count(*) FILTER (WHERE app_version IS NOT DISTINCT FROM %s) AS same, "
+            "       count(*) FILTER (WHERE app_version IS DISTINCT FROM %s) AS other "
+            "FROM ingest_runs WHERE kb_id=%s AND status='queued'",
+            (app_version, app_version, _KB_ID)).fetchone()
+    return int(row["same"]), int(row["other"])
+
+
+def list_claimants_of_extracting_runs() -> list[str]:
+    """`extracting` の行を拾っているワーカーの ID 一覧（生死の判定は呼び出し側）。"""
+    _ensure()
+    with _connect() as c:
+        rows = c.execute(
+            "SELECT DISTINCT claimed_by FROM ingest_runs "
+            "WHERE kb_id=%s AND status='extracting' AND claimed_by IS NOT NULL", (_KB_ID,)).fetchall()
+    return [r["claimed_by"] for r in rows]

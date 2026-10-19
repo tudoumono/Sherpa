@@ -103,7 +103,7 @@ def test_run_records_stage_timings_and_counts_with_real_corpus():
 
 
 def test_rerun_endpoint_and_runs(auth_disabled):
-    """ING-3: `/ingest/rerun` は即受付（run_id・joined）。完了状況は `/ingest/runs` の
+    """ING-3: `/ingest/rerun` は即受付（依頼を積むだけ・run_id・joined）。完了状況は `/ingest/runs` の
     該当 run（`run_id` で照合）をポーリングして確認する（`GET /worlds/{wid}/status` は
     `worlds` テーブルへの登録〔root_path 付き〕が要るが、本ファイルの world は
     `worker.run()` 直呼びのみで作られ登録されていないため使えない）。"""
@@ -122,12 +122,14 @@ def test_rerun_endpoint_and_runs(auth_disabled):
     assert body["ok"] is True and body["world_id"] == V
     assert body["run_id"] is not None
 
+    from _ingest_queue import drain_ingest_queue
     deadline = time.monotonic() + 60.0
     run = None
     while time.monotonic() < deadline:
+        drain_ingest_queue()                                   # 受付は依頼を積むだけ。ワーカーが拾う 1 件の関数を直接呼ぶ
         runs = c.get("/ingest/runs", params={"world": V}).json()["runs"]
         run = next((x for x in runs if x["id"] == body["run_id"]), None)
-        if run is not None and run["status"] != "extracting":
+        if run is not None and run["status"] not in ("queued", "extracting"):
             break
         time.sleep(0.2)
     assert run is not None, f"取り込みが完了しませんでした: run_id={body['run_id']}"

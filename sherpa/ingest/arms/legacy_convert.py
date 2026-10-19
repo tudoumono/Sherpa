@@ -29,6 +29,7 @@ import uuid
 from pathlib import Path
 
 from sherpa import json_io
+from sherpa.ingest import child_registry
 
 # 専用ログ（sherpa.convert.libreoffice）へルーティングする（`sherpa/log_setup.py` の登録表参照）。office_com（http/direct）のログも同じ系統に乗る。
 _log = logging.getLogger("sherpa.convert.libreoffice")
@@ -648,6 +649,7 @@ def _run_direct_process(cmd: list[str], src: Path, timeout: float) -> bool:
     except OSError as e:
         _log.warning("office_com(direct) を実行できませんでした（%s）: %s", e.__class__.__name__, src)
         return False
+    child_registry.register(proc.pid, mode="group")
     try:
         proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -655,6 +657,8 @@ def _run_direct_process(cmd: list[str], src: Path, timeout: float) -> bool:
         _kill_process_group(proc)
         _note_conversion_failure_reason("timeout")
         return False
+    finally:
+        child_registry.unregister(proc.pid)
     if proc.returncode != 0:
         _log.warning("office_com(direct) が異常終了しました（rc=%s）: %s", proc.returncode, src)
         return False
@@ -1298,6 +1302,7 @@ def _run_soffice(cmd: list[str], src, *, timeout: float | None = None, quiet: bo
     if tracker is not None and not tracker.add(proc):
         _kill_process_group(proc)
         return False
+    child_registry.register(proc.pid, mode="group")
     try:
         proc.communicate(timeout=limit)
     except subprocess.TimeoutExpired:
@@ -1307,6 +1312,7 @@ def _run_soffice(cmd: list[str], src, *, timeout: float | None = None, quiet: bo
             _note_conversion_failure_reason("timeout")
         return False
     finally:
+        child_registry.unregister(proc.pid)
         if tracker is not None:
             tracker.discard(proc)
     if proc.returncode != 0:

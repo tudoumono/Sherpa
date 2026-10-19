@@ -105,6 +105,8 @@ def _stub(monkeypatch, tmp_path):
         calls["needs_reindex"].append(sig)
         return False
     monkeypatch.setattr(es_index, "needs_reindex", _needs_reindex)
+    monkeypatch.setattr(es_index, "fill_missing_vectors",
+                        lambda world, settings=None: {"available": True, "filled": 0, "missing": 0})
 
     def _run(world, **kw):
         # `run()`（⓪①）と `_run_locked()`（sidecar 欠落）のどちらでも同じ形で記録する

@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterator
 
+from . import memtrim
+
 _log = logging.getLogger("sherpa")
 
 # 同時実行の上限。超過は呼び出し側で 429 に変換する（TurnLimitError）。管理画面（system_settings）で上書きでき、下の 2 定数は未設定/DB 不達時の既定（`effective_limits()`）。
@@ -251,6 +253,7 @@ def start_turn(*, uid: str,
             rec.buffer.append({"type": "error", "message": "内部エラーが発生しました。もう一度お試しください。"})
         finally:
             rec.buffer.mark_done()
+            memtrim.release()   # 1 ターンで積んだ分のメモリを OS へ返す（Linux のみ・30 秒に 1 回まで）
 
     try:
         threading.Thread(target=_run, daemon=True, name=f"sherpa-turn-{turn_id[:8]}").start()

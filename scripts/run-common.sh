@@ -101,6 +101,10 @@ APP_PID_FILE="${APP_PID_FILE:-$RUN_DIR/api.pid}"
 APP_LOG="$RUN_DIR/api.log"
 CADDY_PID_FILE="$RUN_DIR/caddy.pid"
 CADDY_LOG="$RUN_DIR/caddy.log"
+# 取り込みワーカー（scripts/run-ingest-worker.sh の見張りが pid ファイルの pid）。処理状況ファイルはワーカー本体（Python）が書く。
+WORKER_PID_FILE="${WORKER_PID_FILE:-$RUN_DIR/ingest-worker.pid}"
+WORKER_LOG="$RUN_DIR/ingest-worker.log"
+WORKER_STATE_FILE="${SHERPA_INGEST_STATE_FILE:-$RUN_DIR/ingest_worker_active}"
 
 # 廃止した SHERPA_LOG_DIR が環境にあるときは黙って無視せず知らせる（ログは RUN_DIR に書く）。
 sherpa_warn_legacy_log_dir() {
@@ -215,6 +219,7 @@ CHAT_URL="http://127.0.0.1:${SHERPA_PORT}/ui/chat.html"
 # pid ファイルの所有プロセスを見分けるための部分文字列（コマンドラインに含まれる語）。
 APP_PROC_NEEDLE="${APP_PROC_NEEDLE:-uvicorn}"
 CADDY_PROC_NEEDLE="caddy"
+WORKER_PROC_NEEDLE="${WORKER_PROC_NEEDLE:-run-ingest-worker}"
 
 # pid ファイルから生存している PID を stdout に返す（0）。無い/空/死亡なら非0で何も出さない。
 # 注意: これだけでは「pid は生きているが再利用された別プロセス」を見分けられない。
@@ -335,4 +340,32 @@ sherpa_prune_log_family() {
     [ "$i" -le "$excess" ] || break
     rm -f -- "$f"
   done
+}
+
+# 取り込みワーカー（Python）が RUN_DIR/ingest_children/<pid> に置く子プロセスの控え（sherpa/ingest/child_registry.py）を読み、
+# 持ち主のワーカーが死んでいて、かつ pid の起動時刻が控えと一致する子だけを止める（pid の再利用で無関係なプロセスを殺さない）。
+# 控えの子が既に居ない／持ち主が生きている控えは触らない（居ない子の控えは消す）。止めた件数を標準出力へ出す。
+sherpa_reap_ingest_children() {
+  local dir="$RUN_DIR/ingest_children" f pid owner mode lstart cur n=0
+  [ -d "$dir" ] || { echo 0; return 0; }
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    pid="$(sed -n 's/^pid=//p' "$f" 2>/dev/null | head -1)"
+    owner="$(sed -n 's/^owner=//p' "$f" 2>/dev/null | head -1)"
+    mode="$(sed -n 's/^mode=//p' "$f" 2>/dev/null | head -1)"
+    lstart="$(sed -n 's/^lstart=//p' "$f" 2>/dev/null | head -1)"
+    case "$pid$owner" in ''|*[!0-9]*) rm -f -- "$f"; continue ;; esac
+    if [ -n "$(ps -o pid= -p "$owner" 2>/dev/null)" ]; then continue; fi
+    cur="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed -e 's/^ *//' -e 's/ *$//')"
+    if [ -n "$cur" ] && [ "$cur" = "$lstart" ]; then
+      if [ "$mode" = "group" ]; then
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      else
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+      n=$(( n + 1 ))
+    fi
+    rm -f -- "$f"
+  done
+  echo "$n"
 }

@@ -111,15 +111,49 @@ _SCHEMA = [
         scan_root TEXT,                            -- スキャンルート（P1b）
         scope_mapping_overrides JSONB,            -- 階層自動判定のUI上書き（P1b）
         source_doc_ids JSONB,                     -- 対象 documents.name[]
-        status TEXT NOT NULL DEFAULT 'extracting'  -- extracting/auto_published/auto_published_with_flags/failed
-            CHECK (status IN ('extracting','auto_published','auto_published_with_flags','failed')),
+        status TEXT NOT NULL DEFAULT 'extracting'  -- queued/extracting/auto_published/auto_published_with_flags/failed
+            CHECK (status IN ('queued','extracting','auto_published','auto_published_with_flags','failed')),
         extraction_snapshot JSONB,                -- 抽出スナップショット（件数・検証フラグ）
         published_snapshot JSONB,                 -- Neo4j 反映内容（差分・再反映の基準）
         created_by TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         published_at TIMESTAMPTZ,
         republished_at TIMESTAMPTZ,
-        progress JSONB                            -- 実行中 run の逐次進捗（段＋done/total/更新時刻）。`status='extracting'` の間だけ意味を持ち、完了時（`finish_ingest_run`）に NULL へ戻す
+        progress JSONB                            -- 実行中 run の逐次進捗（段＋done/total/更新時刻）。`status` が queued/extracting の間だけ意味を持ち、完了時（`finish_ingest_run`）に NULL へ戻す
+    )""",
+    # 取り込みの依頼（Web アプリが queued で積み、取り込みワーカーが拾う）。op/payload＝実行する操作と引数、fingerprint＝合流判定、
+    # app_version＝依頼を受けた Web アプリの版（同じ版のワーカーだけが拾う）、arb_keys＝同時に 1 つしか動かさない単位（資料フォルダ・新規登録の枠）、
+    # claimed_by＝拾ったワーカー。
+    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS op TEXT",
+    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS payload JSONB",
+    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS fingerprint TEXT",
+    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS app_version TEXT",
+    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS arb_keys TEXT[]",
+    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS claimed_by TEXT",
+    # 既存 DB の status 制約へ queued を足す（CREATE TABLE の制約は既存表に効かない）。足りているときは何もしない。
+    """DO $$ BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ingest_runs_status_check' AND conrelid = 'ingest_runs'::regclass
+          AND pg_get_constraintdef(oid) NOT LIKE '%queued%'
+      ) THEN
+        ALTER TABLE ingest_runs DROP CONSTRAINT ingest_runs_status_check;
+        ALTER TABLE ingest_runs ADD CONSTRAINT ingest_runs_status_check
+          CHECK (status IN ('queued','extracting','auto_published','auto_published_with_flags','failed'));
+      END IF;
+    END $$""",
+    "CREATE INDEX IF NOT EXISTS run_queued ON ingest_runs(kb_id, id) WHERE status = 'queued'",
+    # 取り込み画面の版の照合・停止待ちの表示のための、Web アプリと取り込みワーカーの心拍（一定時間書かれない行は無視する）。
+    """CREATE TABLE IF NOT EXISTS ingest_workers (
+        worker_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL CHECK (role IN ('web','ingest')),
+        app_version TEXT,
+        state TEXT NOT NULL DEFAULT 'idle' CHECK (state IN ('idle','running','waiting_version','stopping')),
+        run_id INTEGER,
+        current_file TEXT,
+        pid INTEGER,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        beat_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
     "CREATE INDEX IF NOT EXISTS run_ver ON ingest_runs(kb_id, version)",
     # `store.ingest.get_latest_run_summary`/`get_latest_published_run_summary` が `ORDER BY id DESC LIMIT 1` で最新 1 件を引くための索引。反映済み run 用は部分索引（`published_at IS NOT NULL`）で小さく保つ。

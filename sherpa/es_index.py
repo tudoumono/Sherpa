@@ -35,7 +35,7 @@ _CHUNK_LINES_DEFAULT = 40
 # `search()` が ES へ送る size の上限（資料検索のヒット数の既定 `parts.read.tools.MAX_HITS` を下回らない固定値）
 _ES_SEARCH_K_MAX = 50
 _TIMEOUT = 30
-ES_MAPPING_VERSION = "10"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
+ES_MAPPING_VERSION = "11"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
 # reindex のとき埋め込みはキャッシュから再利用される。
 # rag_chunks.jsonl 読み取りの安全弁: 1 行（1 チャンク）の大きさで判定する。桁違いに大きい行は破損とみなし、ファイル全体を無効にして legacy チャンクへ縮退する（`_validate_rag_chunks` 参照）。
 # ファイル全体の大きさは見ない（大きな表でも行ごとの切れを保つ）。読むときも上限＋1 文字で打ち切る
@@ -97,10 +97,12 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
         # 登録者が `_重要度.txt` で付けた重要度。`importance` はブースト（function_score の term filter）とフィルタ／表示に使う。`importance_reason` は表示専用（`index: False`）
         "importance": {"type": "keyword"},
         "importance_reason": {"type": "keyword", "index": False},
+        # ベクトルを取れなかったチャンクだけ "missing" を持つ（`fill_missing_vectors` が後から埋めて "ok" にする）
+        "vector_status": {"type": "keyword"},
     }
     if dim:
         props["embedding"] = {"type": "dense_vector", "dims": dim, "index": True, "similarity": "cosine"}
-    # `index_world()` はクリーン再索引（delete→create→bulk）。bulk 中に部分的な投入が検索から見えないよう、作成時は背景 refresh を止め（`-1`）、
+    # `index_world()` は新しい物理索引を作って全件入れ、最後にエイリアスを付け替える。作成時は背景 refresh を止め（`-1`）、
     # 最終バッチ（`refresh=true`・`_StreamingBulkSender.finish()`）で一度だけ refresh して全件を可視化し、通常値へ戻す（`_restore_refresh_interval`）
     m = {"settings": {"index": {"refresh_interval": "-1"}}, "mappings": {"properties": props}}
     if emeta:
@@ -108,12 +110,12 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
     return m
 
 
-def _index_meta(world: str) -> dict | None:
+def _index_meta(world: str, idx: str | None = None) -> dict | None:
     """index に記録した埋め込み素性（`_meta`）。取得失敗（GET 例外・到達不可等）は `None`、index はあるが `_meta` が無い正当な不在は `{}` で区別する。
     既存 `_meta` を読み直して書き戻す PUT 系（`confirm_human_md_meta`／`_confirm_content_sig`／`_wipe_after_bulk_failure`）は `None` のとき PUT をスキップする（`_meta` は丸ごと置換のため、一時失敗で既存値を消さない）。
     """
     try:
-        r = _req("GET", f"/{_index(world)}/_mapping")
+        r = _req("GET", f"/{idx or _index(world)}/_mapping")
         for v in r.values():
             return (v.get("mappings") or {}).get("_meta") or {}
         return {}
@@ -272,28 +274,149 @@ def confirm_human_md_meta(world: str) -> bool:
         return False
 
 
-def delete_world(world: str) -> bool:
-    """資料フォルダのインデックスを削除する（無ければ無視）。wipe の派生物伝播で呼ぶ。"""
+# 索引名の付け方（設計: docs/design/rag.md「ES 索引の構成」）。検索・単一文書の更新が使う名前（`_index(world)`）は**エイリアス**で、
+# 実体は `<エイリアス名>-g<世代>` の物理索引。全再構築は新しい世代を作って全件入れ、終わってからエイリアスを原子的に付け替える。
+# 0.18 以前の「エイリアス名と同じ名前の実の索引」は、付け替えと同じ 1 回の `_aliases` で消して置き換える。
+_PHYSICAL_SUFFIX_RE = re.compile(r"-g\d+$")
+_building: dict[str, str] = {}  # 資料フォルダ ID → 作成中の物理索引名（`ensure_index` が入れ、`index_world` が付け替え・破棄のときに取り出す）
+
+
+def _new_physical_name(world: str) -> str:
+    return f"{_index(world)}-g{time.time_ns() // 1_000_000}"
+
+
+def _physical_base(name: str) -> str:
+    """物理索引名からエイリアス名を返す（世代の接尾辞が無ければそのまま）。"""
+    return _PHYSICAL_SUFFIX_RE.sub("", name)
+
+
+def _alias_targets(world: str) -> list[str] | None:
+    """エイリアス `_index(world)` が指す物理索引。エイリアスでない（実の索引・無し）は []、取得失敗は None。"""
+    alias = _index(world)
     try:
-        _req("DELETE", "/" + _index(world))
-        return True
+        res = _req("GET", f"/_alias/{alias}")
     except urllib.error.HTTPError as e:
-        return e.code == 404  # 既に無い＝成功扱い
+        return [] if e.code == 404 else None
+    except Exception:
+        return None
+    if not isinstance(res, dict):
+        return []
+    return sorted(k for k, v in res.items() if isinstance(v, dict) and alias in (v.get("aliases") or {}))
+
+
+def _concrete_indices(world: str) -> list[str] | None:
+    """この資料フォルダの実の索引（エイリアス名と同名の旧索引と、世代付きの物理索引）。取得失敗は None。"""
+    alias = _index(world)
+    try:
+        rows = _req("GET", f"/_cat/indices/{alias}*?format=json&h=index&expand_wildcards=all")
+    except urllib.error.HTTPError as e:
+        return [] if e.code == 404 else None
+    except Exception:
+        return None
+    names = [r.get("index") for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    return sorted(n for n in names if n == alias or (n.startswith(alias + "-g") and _physical_base(n) == alias))
+
+
+def _index_kind(world: str) -> str | None:
+    """`"alias"`（0.19 の形）／`"index"`（エイリアス名と同名の実の索引＝0.18 以前）／`"none"`／取得失敗 None。"""
+    targets = _alias_targets(world)
+    if targets is None:
+        return None
+    if targets:
+        return "alias"
+    names = _concrete_indices(world)
+    if names is None:
+        return None
+    return "index" if _index(world) in names else "none"
+
+
+def delete_world(world: str) -> bool:
+    """資料フォルダの索引を全部削除する（エイリアスの指す物理索引・作りかけの物理索引・0.18 以前の実の索引。無ければ無視）。wipe の派生物伝播で呼ぶ。"""
+    names = _concrete_indices(world)
+    if names is None:
+        return False
+    ok = True
+    for n in names:
+        try:
+            _req("DELETE", "/" + n)
+        except urllib.error.HTTPError as e:
+            ok = ok and e.code == 404  # 既に無い＝成功扱い
+        except Exception:
+            ok = False
+    return ok
+
+
+def _discard_building(world: str) -> None:
+    """作りかけの物理索引を消す（エイリアスと古い索引には触れない）。失敗は次の作り直しの前の掃除に任せる。"""
+    name = _building.pop(world, None)
+    if not name or name == _index(world):
+        return
+    try:
+        _req("DELETE", "/" + name)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            _log.warning("es_index: 作りかけの索引を消せませんでした（次回の作り直しで掃除します）: %s", name)
+    except Exception:
+        _log.warning("es_index: 作りかけの索引を消せませんでした（次回の作り直しで掃除します）: %s", name)
+
+
+def _drop_stale_physicals(world: str) -> bool:
+    """エイリアスが指していない物理索引（前回落ちた作りかけ）を消す。一覧を取れなければ何も消さず False。"""
+    targets = _alias_targets(world)
+    names = _concrete_indices(world)
+    if targets is None or names is None:
+        return False
+    alias = _index(world)
+    for n in names:
+        if n == alias or n in targets:
+            continue
+        try:
+            _req("DELETE", "/" + n)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _activate_index(world: str, new_idx: str) -> bool:
+    """エイリアスを `new_idx` へ原子的に付け替え、古い物理索引を消す。0.18 以前の実の索引は同じ `_aliases` の中で消して置き換える。"""
+    alias = _index(world)
+    if new_idx == alias:
+        return True
+    targets = _alias_targets(world)
+    names = _concrete_indices(world)
+    if targets is None or names is None:
+        return False
+    actions: list = [{"remove": {"index": t, "alias": alias}} for t in targets]
+    if not targets and alias in names:
+        actions.append({"remove_index": {"index": alias}})
+    actions.append({"add": {"index": new_idx, "alias": alias}})
+    try:
+        _req("POST", "/_aliases", {"actions": actions})
     except Exception:
         return False
+    _building.pop(world, None)
+    for t in targets:
+        try:
+            _req("DELETE", "/" + t)
+        except Exception:
+            _log.warning("es_index: 古い索引を消せませんでした（次回の作り直しで掃除します）: %s", t)
+    return True
 
 
-def _confirm_content_sig(world: str, content_sig) -> None:
-    """bulk が全バッチ成功した後に `_meta.content_sig`・`_meta.doc_count` を 1 回の read-modify-write で書く（Put Mapping API で `_meta` だけ更新）。
+def _confirm_content_sig(world: str, content_sig, idx: str | None = None) -> None:
+    """bulk が全バッチ成功した後（エイリアスの付け替えの前）に、新しい物理索引 `idx` の `_meta.content_sig`・`_meta.doc_count` を 1 回の read-modify-write で書く（Put Mapping API で `_meta` だけ更新）。
     `doc_count` は ES 側の実件数（`count(world)`）で、`needs_reindex` の実件数照合に使う。content_sig と同じ書き込みにまとめ、件数取得か書き込みが失敗すれば content_sig も書かない（次回 sync が fail-closed で 1 回張り直す）。
     """
     if not content_sig:
         return
-    n = count(world)
+    n = count(world) if idx is None else count(world, idx)
     if n is None:
         _log.warning("es_index: 実件数の取得に失敗しました（次回 sync が1回だけ張り直す）: world=%s", world)
         return
-    existing = _index_meta(world)
+    existing = _index_meta(world) if idx is None else _index_meta(world, idx)
     if existing is None:  # GET 失敗＝既存 meta を消して PUT しない（次回 sync が再試行）
         _log.warning("es_index: content_sig 確定前の meta 取得に失敗しました（次回 sync が1回だけ張り直す）: world=%s", world)
         return
@@ -301,37 +424,19 @@ def _confirm_content_sig(world: str, content_sig) -> None:
         meta = dict(existing)
         meta["content_sig"] = content_sig
         meta["doc_count"] = n
-        _req("PUT", f"/{_index(world)}/_mapping", {"_meta": meta})
+        _req("PUT", f"/{idx or _index(world)}/_mapping", {"_meta": meta})
     except Exception:
         _log.warning("es_index: content_sig/doc_count の確定に失敗しました（次回 sync が1回だけ張り直す）: world=%s", world)
 
 
-def _restore_refresh_interval(world: str) -> None:
+def _restore_refresh_interval(world: str, idx: str | None = None) -> None:
     """`_mapping()` が索引作成時に立てた `refresh_interval:-1` を、bulk 全件成功後にクラスタ既定（"1s"）へ戻す（`null` を渡すと既定に復帰する）。
     失敗しても完全性には影響しない（最終バッチの `refresh=true` で全件可視化済み）。次回の `index_world()` が作り直す。
     """
     try:
-        _req("PUT", f"/{_index(world)}/_settings", {"index": {"refresh_interval": None}})
+        _req("PUT", f"/{idx or _index(world)}/_settings", {"index": {"refresh_interval": None}})
     except Exception:
         _log.warning("es_index: refresh_interval の復帰に失敗しました（次回 reindex で上書きされます）: world=%s", world)
-
-
-def _wipe_after_bulk_failure(world: str) -> None:
-    """bulk 途中失敗時に資料フォルダの索引を空へ戻す（全部か無しか）。wipe 自体が失敗しても次回 sync が張り直せる状態にする。
-    `ensure_index()` は bulk の前に `_meta.content_sig` を書くため、wipe が失敗すると「一部だけ入った索引＋有効な content_sig」が居座る。そこで wipe に失敗したら `_meta.content_sig` を落として fail-closed にする（content_sig が無い索引は `needs_reindex()` で必ず不一致になる）。
-    meta の書き換えにも失敗するなら ES 自体が落ちており、次回 sync の `available()` が False で索引は使われない。
-    """
-    if delete_world(world):
-        return
-    # 目的は meta の温存でなく索引の無効化。GET 失敗（None）でも `{}` として PUT し、少なくとも `content_sig` を落とす
-    existing = _index_meta(world) or {}
-    try:
-        meta = dict(existing)
-        meta.pop("content_sig", None)
-        _req("PUT", f"/{_index(world)}/_mapping", {"_meta": meta})
-    except Exception:
-        _log.warning("es_index: bulk 失敗後の wipe と meta 無効化の両方に失敗しました"
-                     "（次回 sync の再索引に委ねる）: world=%s", world)
 
 
 def list_kb_indices() -> list:
@@ -350,7 +455,7 @@ def reconcile(valid_worlds) -> list:
     keep = {_index(w) for w in (valid_worlds or [])}
     deleted = []
     for idx in list_kb_indices():
-        if idx in keep:
+        if idx in keep or _physical_base(idx) in keep:  # 世代付きの物理索引は、エイリアス名で所有者を判定する
             continue
         try:
             _req("DELETE", "/" + idx)
@@ -366,21 +471,23 @@ _created_analyzer: dict[str, str] = {}
 
 
 def ensure_index(world: str, dim=None, emeta=None) -> bool:
-    """index を作成する（既存なら True）。アナライザ不明（400）は standard で再試行する（作ったアナライザは `_created_analyzer`）。`dim`／`emeta` で kNN 用。"""
-    idx = "/" + _index(world)
+    """新しい世代の物理索引を作る（作った名前は `_building`）。アナライザ不明（400）は standard で再試行する（作ったアナライザは `_created_analyzer`）。`dim`／`emeta` で kNN 用。"""
+    name = _new_physical_name(world)
+    idx = "/" + name
     _created_analyzer.pop(world, None)
     for analyzer in ("kuromoji", "standard"):
         try:
             _req("PUT", idx, _mapping(dim, analyzer, emeta))
             _created_analyzer[world] = analyzer
+            _building[world] = name
             return True
         except urllib.error.HTTPError as e:
             try:
                 txt = e.read().decode("utf-8", "replace")
             except Exception:
                 txt = ""
-            if "resource_already_exists" in txt:  # 既存（delete 後は通常起きない）
-                return True
+            if "resource_already_exists" in txt:  # 世代名の衝突（通常起きない）
+                return False
             if e.code == 400 and analyzer == "kuromoji":
                 continue  # kuromoji 不明 → standard で再試行
             return False  # それ以外の 400／エラーは失敗
@@ -501,31 +608,68 @@ def _delete_embed_cache(world: str) -> None:
             pass
 
 
-def _prune_embed_cache(world: str, valid_keys: set) -> None:
-    """資料フォルダ全体の doc ストリームを一巡し、全チャンクの embed が完了した直後にだけ呼ぶ最終剪定。現存キー（`valid_keys`）以外を消す。`valid_keys` が空なら DB ごと削除する。
+def _live_keys_reset(world: str) -> None:
+    """今回の索引作りで生きているチャンクの鍵を溜める表（キャッシュ DB 内の `live`）を空にする。鍵を Python のメモリに持たず、剪定を SQL の差で行うための表。"""
+    conn = _embed_cache_connect(world, create=True)
+    if conn is None:
+        raise OSError(f"embed cache DB へ接続できません（world={world}）")
+    try:
+        with conn:
+            conn.execute("DROP TABLE IF EXISTS live")
+            conn.execute("CREATE TABLE live (key TEXT PRIMARY KEY) WITHOUT ROWID")
+    except sqlite3.Error as exc:
+        raise OSError(str(exc)) from exc
+    finally:
+        conn.close()
+
+
+def _live_keys_add(world: str, keys) -> None:
+    """生きている鍵を `live` 表へ足す（`_EMBED_FLUSH_CHUNKS` 件ずつ呼ぶ）。失敗は呼び出し元へ伝播させる。"""
+    rows = [(k,) for k in keys]
+    if not rows:
+        return
+    conn = _embed_cache_connect(world, create=True)
+    if conn is None:
+        raise OSError(f"embed cache DB へ接続できません（world={world}）")
+    try:
+        with conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS live (key TEXT PRIMARY KEY) WITHOUT ROWID")
+            conn.executemany("INSERT OR IGNORE INTO live(key) VALUES (?)", rows)
+    except sqlite3.Error as exc:
+        raise OSError(str(exc)) from exc
+    finally:
+        conn.close()
+
+
+def _prune_embed_cache(world: str, valid_keys=None) -> None:
+    """資料フォルダ全体の doc ストリームを一巡し終えた直後にだけ呼ぶ最終剪定。`live` 表に無い鍵を消す（SQL の差で行い、鍵の集合を Python に持たない）。`live` が空なら DB ごと削除する。
+    `valid_keys` を渡すとそれを `live` 表に入れ直してから剪定する（呼び出し側が先に `_live_keys_add` で溜めたなら省略）。
+    取れなかったチャンクの鍵はキャッシュに無いだけなので不足は異常にしない（後から `fill_missing_vectors` が足す）。
     `index_world()` から 1 回だけ呼ぶ（`_embed_cached()` は doc グループごとに複数回呼ばれるため、呼ぶたびに剪定すると前のグループ分を消す）。削除失敗は呼び出し元へ伝播させる。
     """
-    if not valid_keys:
-        _delete_embed_cache(world)
-        return
+    if valid_keys is not None:
+        _live_keys_reset(world)
+        keys = list(valid_keys)
+        for chunk in _sql_chunks(keys):
+            _live_keys_add(world, chunk)
     if not _embed_cache_db_path(world).exists():
         return  # キャッシュ自体が無い＝剪定するものが無い
     conn = _embed_cache_connect(world, create=False)
     if conn is None:
-        # DB が存在するのに接続できない（権限・ロック・破損）＝障害。OSError で打ち切らせる（黙って戻ると既存索引の delete へ進んで索引が消えたまま残る）
+        # DB が存在するのに接続できない（権限・ロック・破損）＝障害。OSError で打ち切らせる（黙って戻ると新しい索引の作成へ進んでしまう）
         raise OSError(f"embed cache DB へ接続できません（world={world}）")
     try:
-        valid_key_set = set(valid_keys)  # 1 回だけ set 化して使い回す
-        existing = {row[0] for row in conn.execute("SELECT key FROM kv").fetchall()}
-        missing = len(valid_key_set - existing)
-        if missing:
-            # Pass1 完了時点で現存キーは全て DB にあるはず。不足は異常（壊れた DB の作り直し等）なので OSError で打ち切り、既存索引を残す（次回 sync で再 embed される）
-            raise OSError(f"embed cache に現存キーが不足しています（world={world}・missing={missing}）")
-        to_delete = list(existing - valid_key_set)
+        try:
+            has_live = conn.execute("SELECT 1 FROM live LIMIT 1").fetchone() is not None
+        except sqlite3.OperationalError:  # `live` 表が無い＝生きている鍵が 1 件も溜まっていない
+            has_live = False
+        if not has_live:
+            conn.close()
+            _delete_embed_cache(world)
+            return
         with conn:
-            for chunk in _sql_chunks(to_delete):
-                placeholders = ",".join("?" * len(chunk))
-                conn.execute(f"DELETE FROM kv WHERE key IN ({placeholders})", chunk)
+            conn.execute("DELETE FROM kv WHERE key NOT IN (SELECT key FROM live)")
+            conn.execute("DROP TABLE live")
     except sqlite3.Error as exc:
         raise OSError(str(exc)) from exc
     else:
@@ -548,14 +692,47 @@ def _chunk_key(ec: dict, text: str) -> str:
     ).hexdigest()
 
 
-def _embed_cached(world: str, texts: list, ec) -> tuple:
-    """チャンク埋め込みを内容ハッシュでキャッシュし、未変更チャンクの再 embed（API コスト）を省く。
-    返値 `(vectors|None, reused, embedded)`。embed 失敗／次元不一致は `(None,0,0)`（呼び出し元は BM25 のみへ降格し、既存キャッシュは壊さない）。重複チャンクは 1 回だけ embed し、キャッシュ済みベクトルも形状を検証する（壊れは miss）。
-    `texts` は呼び出し元が有界なバッチに分けて渡す（`index_world()` は doc 単位に `_EMBED_FLUSH_CHUNKS` 件程度ずつ複数回呼ぶ）。本関数はこのバッチのキーを追加／更新するだけで、剪定は呼び出し元が 1 回だけ `_prune_embed_cache()` で行う。`ec` が None・`texts` が空なら `(None,0,0)`。
-    キャッシュ本体は SQLite KV（`_embed_cache_lookup_batch`／`_embed_cache_write_batch`）。不足分は `_EMBED_FLUSH_CHUNKS` 件単位のバッチに割り、成功のたびに DB へ即時フラッシュする（途中で落ちても次回キャッシュヒットで再開できる）。
+def _stop_point() -> None:
+    """区切りで停止要求を確かめる（背景実行のスレッド以外では何もしない）。"""
+    from .ingest import background
+    background.raise_if_stop_requested()
+
+
+_EMBED_GIVE_UP_AFTER = 3   # 埋め込みのまとまりがこの回数続けて失敗したら、その処理の残りでは送り先へ問い合わせない
+_EMBED_COOLDOWN_SEC = 600  # 失敗した直後の `fill_missing_vectors` は、送り先を叩き直さない時間
+_embed_failed_at: dict[str, float] = {}  # 資料フォルダ ID → 直近に埋め込みのまとまりが失敗した時刻（time.monotonic）
+
+
+class _EmbedGuard:
+    """1 回の処理（索引作り・足し直し）の中で、埋め込みの送り先が使えないときに問い合わせを打ち切る。"""
+
+    def __init__(self, world: str):
+        self.world = world
+        self.consecutive = 0
+        self.failed_groups = 0
+
+    @property
+    def gave_up(self) -> bool:
+        return self.consecutive >= _EMBED_GIVE_UP_AFTER
+
+    def ok(self) -> None:
+        self.consecutive = 0
+
+    def failed(self) -> None:
+        self.consecutive += 1
+        self.failed_groups += 1
+        _embed_failed_at[self.world] = time.monotonic()
+
+
+def _embed_fill(world: str, texts: list, ec, guard: _EmbedGuard | None = None, *, stop_points: bool = False) -> tuple:
+    """チャンク埋め込みを内容ハッシュでキャッシュし、未変更チャンクの再 embed（API コスト）を省く。取れなかったチャンクだけ `None` にして続ける。
+    返値 `(vectors, reused, embedded)`。`vectors` は `texts` と同じ長さで、取れなかった位置が `None`（再送を使い切ったまとまり・キャッシュ書込の失敗・`guard` の打ち切り後）。重複チャンクは 1 回だけ embed し、キャッシュ済みベクトルも形状を検証する（壊れは miss）。
+    `texts` は呼び出し元が有界なバッチに分けて渡す。本関数はこのバッチのキーを追加／更新するだけで、剪定は呼び出し元が 1 回だけ `_prune_embed_cache()` で行う。`ec` が None・`texts` が空なら全部 `None`。
+    キャッシュ本体は SQLite KV（`_embed_cache_lookup_batch`／`_embed_cache_write_batch`）。不足分は `_EMBED_FLUSH_CHUNKS` 件単位のまとまりに割り、成功のたびに DB へ即時フラッシュする（途中で止まっても次回キャッシュヒットで続きから取る）。
+    `stop_points` が真なら、まとまりごとの前に停止要求を確かめる。
     """
     if not ec or not texts:
-        return None, 0, 0
+        return [None] * len(texts), 0, 0
     dim = ec["dim"]
     keys = [_chunk_key(ec, t) for t in texts]
     key_text = {}  # distinct チャンク（重複本文は 1 回だけ embed）
@@ -563,30 +740,46 @@ def _embed_cached(world: str, texts: list, ec) -> tuple:
         key_text.setdefault(k, t)
     filled = _embed_cache_lookup_batch(world, list(key_text), dim)  # 形状検証済みの既存ベクトルだけ再利用
     need = [k for k in key_text if k not in filled]
+    embedded = 0
     if need:
         total = len(need)
         n_batches = (total + _EMBED_FLUSH_CHUNKS - 1) // _EMBED_FLUSH_CHUNKS
         for bi, start in enumerate(range(0, total, _EMBED_FLUSH_CHUNKS)):
+            if stop_points:
+                _stop_point()
+            if guard is not None and guard.gave_up:
+                break
             batch_keys = need[start:start + _EMBED_FLUSH_CHUNKS]
             new = embeddings.embed([key_text[k] for k in batch_keys], ec, world=world)
-            if not new:  # 失敗／次元不一致＝BM25 のみ（flush 済み分は温存）
-                return None, 0, 0
-            new_map = {}
-            for k, vec in zip(batch_keys, new):
-                filled[k] = vec
-                new_map[k] = vec
-            try:
-                _embed_cache_write_batch(world, new_map)  # 成功したバッチだけ即座に永続化
-            except OSError:
-                # DB 書込障害（ENOSPC 等）を flush 成功として扱わず、embed 失敗と同じ扱い（BM25 のみへ降格・既存キャッシュは壊さない）にする
-                _embed_log.warning(
-                    "es_index: embed キャッシュDBの書込に失敗（world=%s・ENOSPC等）"
-                    "——このバッチを embed 失敗として扱う", world)
-                return None, 0, 0
+            new_map = {k: vec for k, vec in zip(batch_keys, new)} if new else {}
+            if new_map:
+                try:
+                    _embed_cache_write_batch(world, new_map)  # 成功したバッチだけ即座に永続化
+                except OSError:
+                    # DB 書込障害（ENOSPC 等）は成功扱いにしない（このまとまりは取れなかった扱い）
+                    _embed_log.warning("es_index: embed キャッシュDBの書込に失敗（world=%s・ENOSPC等）"
+                                       "——このまとまりは取れなかった扱いにする", world)
+                    new_map = {}
+            if not new_map:
+                if guard is not None:
+                    guard.failed()
+                continue
+            filled.update(new_map)
+            embedded += len(new_map)
+            if guard is not None:
+                guard.ok()
             if bi == 0 or bi == n_batches - 1 or (bi + 1) % 10 == 0:  # 間引いて進捗を残す
                 _embed_log.info("es_index: embed 進捗 %d/%d チャンク（world=%s）",
                                  min(start + len(batch_keys), total), total, world)
-    return [filled[k] for k in keys], len(key_text) - len(need), len(need)
+    return [filled.get(k) for k in keys], len(key_text) - len(need), embedded
+
+
+def _embed_cached(world: str, texts: list, ec) -> tuple:
+    """`_embed_fill` の全部取れた場合だけ版。1 件でも取れなければ `(None, 0, 0)`（`replace_document` 用＝取れなかった文書は書かずにやり直しへ回す）。"""
+    vecs, reused, embedded = _embed_fill(world, texts, ec)
+    if not ec or not texts or any(v is None for v in vecs):
+        return None, 0, 0
+    return vecs, reused, embedded
 
 
 def _rag_chunk_source_exts() -> frozenset:
@@ -1015,18 +1208,20 @@ class _StreamingBulkSender:
     `refresh=true` は最後の送信だけに付ける。最後かどうかは全 doc を処理し終えるまで分からないため、直前に確定した 1 バッチを `_pending` として 1 つだけ持ち越し（lag-by-one）、`finish()` で最後の `_pending` を refresh 付きで送る。
     """
 
-    def __init__(self, world: str):
+    def __init__(self, world: str, idx: str | None = None):
         self.world = world
+        self.idx = idx or _index(world)  # 送り先＝作成中の物理索引（付け替え前なので検索は古い索引のまま）
         self._pending: str | None = None
         self.failed = False
         self.error: str | None = None
+        self.missing = 0  # ベクトル無し（`vector_status: missing`）で入れたチャンクの数
 
     def _send(self, payload: str, refresh: bool) -> bool:
-        path = f"/{_index(self.world)}/_bulk" + ("?refresh=true" if refresh else "")
+        path = f"/{self.idx}/_bulk" + ("?refresh=true" if refresh else "")
         try:
             res = _req("POST", path, payload, ndjson=True)
         except Exception:
-            # 途中バッチの失敗は呼び出し元が wipe する（全部か無しか。一部だけ入った索引は取りこぼしになる）
+            # 途中バッチの失敗は呼び出し元が作りかけの索引を捨てる（全部か無しか。付け替え前なので古い索引は残る）
             self.failed, self.error = True, "bulk_failed"
             return False
         if res.get("errors"):  # item-level の失敗（HTTP 200 でも起きる）
@@ -1065,9 +1260,10 @@ class _StreamingBulkSender:
 def _flush_doc_group(sender: _StreamingBulkSender, world: str, ids: list, bodies: list,
                      texts: list, no_embed: list, ec, embed_feature_applies: bool) -> bool:
     """Pass2 の 1 グループ（doc 数件・チャンク `_EMBED_FLUSH_CHUNKS` 件程度に有界）を、必要なら埋め込みキャッシュから embedding を引いて bulk 送信する（`sender.send_group` へ委譲）。
-    キャッシュ参照は `embed_feature_applies` が真の時だけ（Pass1 が全チャンクの embed を完了させている前提）。
-    埋め込み対象キーの miss は fail-loud にする（DB 破損・並行削除・書込障害等の異常。miss したチャンクだけ embedding 無しで送ると、同じ資料フォルダ内でベクトル付き／無しが混在するため）。miss を検知したら `sender.failed` を立てて bulk 送信ごと中止し、既存の「途中バッチ失敗＝ wipe」経路に乗せる。
+    キャッシュ参照は `embed_feature_applies` が真の時だけ。キャッシュに無い（Pass1 で取れなかった）埋め込み対象チャンクは、ベクトル無し・`vector_status: "missing"` で入れる（`fill_missing_vectors` が後から足す）。
+    送る前に停止要求を確かめる（止まったら呼び出し元の `index_world` が作りかけの索引を捨てる）。
     """
+    _stop_point()
     vec_by_idx: dict = {}
     if embed_feature_applies:
         embed_positions = [i for i, skip in enumerate(no_embed) if not skip]
@@ -1077,35 +1273,49 @@ def _flush_doc_group(sender: _StreamingBulkSender, world: str, ids: list, bodies
             for i, k in zip(embed_positions, keys):
                 v = hit.get(k)
                 if v is None:
-                    sender.failed, sender.error = True, "embed_cache_miss"
-                    return False
-                vec_by_idx[i] = v
+                    bodies[i] = {**bodies[i], "vector_status": "missing"}
+                    sender.missing += 1
+                else:
+                    vec_by_idx[i] = v
     return sender.send_group(ids, bodies, vec_by_idx)
 
 
 def index_world(world: str, settings: dict | None = None, content_sig: str | None = None,
                 progress: Callable[[int, int], None] | None = None) -> dict:
-    """資料フォルダをクリーン再索引する（delete→create→bulk）。埋め込み設定があればベクトルも付与する（kNN 用）。
-    - 失敗は古い索引を残さず error を返す。埋め込みを一度も選んでいない構成は BM25 のみで索引する。明示選択したクラウドの埋め込みが解決できない・実際の embed が失敗した場合は、delete の前に打ち切る（既存のベクトル付き索引を BM25 のみで黙って上書きしない）。
-    - `content_sig`＝索引時のフォルダ署名（`_meta` に保存・古い索引の検知に使う）。埋め込みは内容ハッシュキャッシュ（`_embed_cached`）経由で未変更チャンクの再 embed を省く。
+    """資料フォルダを再索引する（新しい物理索引を作って全件入れ、エイリアスを付け替える）。埋め込み設定があればベクトルも付与する（kNN 用）。
+    - 作り直しの間もエイリアスは古い索引を指し続け、検索は途切れない。途中の失敗・停止要求では作りかけの物理索引だけを消し、古い索引（とそのメタ）には触れない。
+    - 埋め込みのまとまりが再送を使い切って取れなくても、資料フォルダ全体を降格・打ち切りにはしない。そのチャンクだけ、ベクトル無し・`vector_status: "missing"` で入れる（件数は戻り値の `vectors_missing`・`fill_missing_vectors` が後から足す）。埋め込みを選んだクラウドが設定の段階で解決できないときだけ、何も変えずに打ち切る（`embedding_cloud_unavailable`）。
+    - `content_sig`＝索引時のフォルダ署名（`_meta` に保存・古い索引の検知に使う）。埋め込みは内容ハッシュキャッシュ（`_embed_fill`）経由で未変更チャンクの再 embed を省く。
     - Office／PDF（`{rel}.rag_chunks.jsonl` を持つ）はレコード単位チャンク、それ以外（テキスト資料、rag_chunks が無い／検証に失敗した Office／PDF）は 40 行チャンク。rag_chunks があるのに使えなかった文書と本文が空白のみの文書（reason="empty_text"）は、戻り値の `rag_degraded`（件数）・`rag_degraded_docs`（内訳）・`rag_degraded_by_reason`（理由別の件数）で報告する。本文を読めず索引から外した文書は reason="text_read_failed"。
-      埋め込みに失敗して BM25 のみで索引したときは `embed_degraded=True`、日本語アナライザを作れず標準で作り直したときは `analyzer_fallback=True`（どちらも取り込みの状態へ出す）。
+      ベクトルを持つチャンクが 1 件も無い索引になったときは `embed_degraded=True`、日本語アナライザを作れず標準で作り直したときは `analyzer_fallback=True`（どちらも取り込みの状態へ出す）。
     - ソース（`branch=="source"` の登録コードと、軽量テキスト枠の第 1 段の汎用コード）は索引に入れない（`_is_source_doc`・探すのは ripgrep_search）。軽量テキスト枠の第 2 段（csv・log などのテキスト資料）は索引に入れるが、埋め込みはしない（BM25 のみ）。索引の `_meta.source_excluded` に印を残し、印の無い旧索引は `needs_reindex` が張り直す。
-    - bulk 送信は `_bulk_batches()` で件数・バイト数ともに有界なバッチへ分割し、`refresh=true` は最後のバッチだけに付ける。途中のバッチが失敗したら `delete_world()` して空へ戻し、error を返す（全部か無しか）。
+    - bulk 送信は `_bulk_batches()` で件数・バイト数ともに有界なバッチへ分割し、`refresh=true` は最後のバッチだけに付ける。途中のバッチが失敗したら作りかけの索引を捨てて error を返す（全部か無しか）。
     - 2 パス構成（メモリを資料フォルダの規模に比例させない）:
-      - Pass1（埋め込みのみ）: `_iter_doc_chunk_records()` でチャンクを 1 件ずつ受け取り、embed 対象テキストを `_EMBED_FLUSH_CHUNKS` 件程度に束ねて `_embed_cached()` を呼ぶ。
-      - Pass2（bulk 送信）: 同じ `docs` をもう一度走査して id／body／text を 1 件ずつ受け取り、`_EMBED_FLUSH_CHUNKS` 件程度のグループに束ね、対象チャンクだけキャッシュから embedding を引いて `_StreamingBulkSender` で ES へ流す。
-      Pass1 が資料フォルダ全体の embed の成否を確定してから Pass2 が始まるため、doc ごとにベクトル付き／無しが混在しない。キャッシュの剪定（現存チャンクだけへ縮める）は Pass1 成功直後（ES 操作の前）に `_prune_embed_cache()` で 1 回だけ行う。
+      - Pass1（埋め込みのみ）: `_iter_doc_chunk_records()` でチャンクを 1 件ずつ受け取り、embed 対象テキストを `_EMBED_FLUSH_CHUNKS` 件程度に束ねて `_embed_fill()` を呼ぶ。生きている鍵はキャッシュ DB の `live` 表へ溜める。
+      - Pass2（bulk 送信）: 同じ `docs` をもう一度走査して id／body／text を 1 件ずつ受け取り、`_EMBED_FLUSH_CHUNKS` 件程度のグループに束ね、対象チャンクだけキャッシュから embedding を引いて `_StreamingBulkSender` で新しい物理索引へ流す。
+      キャッシュの剪定（現存チャンクだけへ縮める）は Pass1 直後（ES 操作の前）に `_prune_embed_cache()` で 1 回だけ行う。
+    - 区切りで停止要求を確かめる（Pass1 の `_EMBED_FLUSH_CHUNKS` 件ごと・Pass2 の bulk ごと）。止まったときは作りかけの物理索引を消して `background.StopRequested` を投げる（マーカーと `content_sig` は確定しない＝次の取り込みで作り直す。埋め込みはキャッシュ済みの分を飛ばして続きから取る）。
     - `progress`（省略可）: Pass1 は文書 1 件処理するたび、Pass2 は文書グループを flush するたびに `progress(done_docs, total_docs)` を呼ぶ（`total_docs` は `docs` の長さ）。Pass2 開始時に `progress(0, total_docs)` を 1 回呼ぶ。Pass2 の `done_docs` は対象外（チャンク 0 件）の文書も 1 件に数えるので、`indexed` とは別の目盛り。Pass1→Pass2 の切替で一度小さく戻るため、単調増加を前提にしない。呼び出しの間引きは呼び出し元の責務。
     設計: docs/design/rag.md「ES 索引の構成」
     """
+    _building.pop(world, None)
+    try:
+        return _index_world(world, settings, content_sig, progress)
+    except BaseException:  # 停止要求（StopRequested）・想定外の例外: 作りかけの物理索引を残さない
+        _discard_building(world)
+        raise
+    finally:
+        _building.pop(world, None)
+
+
+def _index_world(world: str, settings, content_sig, progress) -> dict:
     if not available():
         return {"available": False, "indexed": 0, "chunks": 0}
     # `cfg()` と `cloud_selected_but_unavailable()` を同じ system_settings スナップショットで呼ぶ（kill-switch 有効時は読まない）
     sys_s = _embed_system_settings_snapshot()
     ec = embeddings.cfg(_settings(settings), system_settings=sys_s)
     if ec is None and embeddings.cloud_selected_but_unavailable(system_settings=sys_s):
-        # 削除より前に打ち切る（既存索引を BM25 のみで上書きしない）
+        # 何も作る前に打ち切る（既存索引を BM25 のみで置き換えない）
         return {"available": True, "indexed": 0, "chunks": 0, "error": "embedding_cloud_unavailable"}
 
     derived = worlds.derived_rag_dir(world)  # RAG 正本層
@@ -1118,13 +1328,35 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
 
     # ---- Pass1: 埋め込みのみ（doc 単位でテキストを束ね、`_EMBED_FLUSH_CHUNKS` 件ごとに flush）----
     had_embed_eligible = False
-    embed_ok = True
-    valid_keys: set = set()
+    eligible_chunks = 0
     reused_total = 0
     embedded_total = 0
-    embed_elapsed_ms = 0.0  # `_embed_cached()` 呼び出しの合計所要時間
+    embed_elapsed_ms = 0.0  # `_embed_fill()` 呼び出しの合計所要時間
     embed_calls_made = False  # 0（呼んだが瞬時）と未計測（一度も呼んでいない）を区別する
+    guard = _EmbedGuard(world)
     if ec is not None:
+        try:
+            _live_keys_reset(world)
+        except OSError:
+            _embed_log.warning("es_index: embed キャッシュの準備に失敗（world=%s）——索引の作成前に中止する", world)
+            return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
+
+        def _flush_embed(buf: list) -> bool:
+            """束ねたテキストを埋め込む（取れなかった分は飛ばす）。キャッシュ DB に書けなければ False。"""
+            nonlocal reused_total, embedded_total, embed_elapsed_ms, embed_calls_made
+            _stop_point()
+            _t0 = time.monotonic()
+            _vecs, reused, embedded = _embed_fill(world, buf, ec, guard, stop_points=True)
+            embed_elapsed_ms += (time.monotonic() - _t0) * 1000
+            embed_calls_made = True
+            reused_total += reused
+            embedded_total += embedded
+            try:
+                _live_keys_add(world, [_chunk_key(ec, t) for t in buf])
+            except OSError:
+                return False
+            return True
+
         buf: list = []
         pass1_docs_done = 0
         for d in docs:
@@ -1135,62 +1367,41 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
                 if skip:
                     continue
                 had_embed_eligible = True
-                valid_keys.add(_chunk_key(ec, t))
+                eligible_chunks += 1
                 buf.append(t)
                 if len(buf) >= _EMBED_FLUSH_CHUNKS:
-                    _t0 = time.monotonic()
-                    vecs, reused, embedded = _embed_cached(world, buf, ec)
-                    embed_elapsed_ms += (time.monotonic() - _t0) * 1000
-                    embed_calls_made = True
-                    reused_total += reused
-                    embedded_total += embedded
+                    if not _flush_embed(buf):
+                        _embed_log.warning("es_index: embed キャッシュの書込に失敗（world=%s）"
+                                           "——索引の作成前に中止する", world)
+                        return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
                     buf = []
-                    if vecs is None:
-                        embed_ok = False
-                        break
-            if not embed_ok:
-                break
             pass1_docs_done += 1
             if progress is not None:
                 # Pass1 の進捗も呼ぶ（冷キャッシュ時は Pass1 が最長段になりうるため）。Pass2 開始時に done は一度小さく戻る
                 progress(pass1_docs_done, total_docs)
-        if embed_ok and buf:
-            _t0 = time.monotonic()
-            vecs, reused, embedded = _embed_cached(world, buf, ec)
-            embed_elapsed_ms += (time.monotonic() - _t0) * 1000
-            embed_calls_made = True
-            reused_total += reused
-            embedded_total += embedded
-            if vecs is None:
-                embed_ok = False
+        if buf:
+            if not _flush_embed(buf):
+                _embed_log.warning("es_index: embed キャッシュの書込に失敗（world=%s）"
+                                   "——索引の作成前に中止する", world)
+                return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
 
-    if ec is not None and had_embed_eligible and not embed_ok:
-        # `cfg()` は解決できたが実際の embed 呼び出しが失敗した
-        if embeddings.cloud_selected_but_unavailable(system_settings=sys_s):
-            # まだ `delete_world()` を呼んでいない＝既存索引はそのまま残る
-            out = {"available": True, "indexed": 0, "chunks": 0, "error": "embedding_cloud_unavailable"}
-            if embed_calls_made:
-                out["embed_elapsed_ms"] = round(embed_elapsed_ms)
-            return out
-        # クラウドを一度も選んでいない構成の実失敗は、BM25 のみへ降格して続行する
-
-    # 埋め込みキャッシュの最終剪定／削除は、資料フォルダ全体の doc ストリームを一巡し終えた直後（ES 操作の前）に 1 回だけ行う。embed_ok が False の間はキャッシュへ触れない（フラッシュ済み分を温存する）
+    # 埋め込みキャッシュの最終剪定／削除は、資料フォルダ全体の doc ストリームを一巡し終えた直後（ES 操作の前）に 1 回だけ行う
     if ec is None:
         _delete_embed_cache(world)
-    elif embed_ok:
+    else:
         try:
-            _prune_embed_cache(world, valid_keys)
+            _prune_embed_cache(world)
         except OSError:
-            # DB 書込障害（ENOSPC 等）は成功扱いせず `delete_world()` の前に打ち切る（既存索引を残す）
+            # DB 書込障害（ENOSPC 等）は成功扱いせず、索引の作成前に打ち切る（既存索引を残す）
             _embed_log.warning("es_index: embed キャッシュ剪定の書込に失敗（world=%s）"
-                               "——索引の delete 前に中止する", world)
+                               "——索引の作成前に中止する", world)
             return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
 
-    # `ec` が有効でも埋め込み対象チャンクが無い（`had_embed_eligible` が偽）資料フォルダは、embed が「この構成で最新」なので emeta に埋め込み素性を書く（書かないと `needs_reindex()` が毎 sync 不一致になる）。
-    # 真の embed 失敗（`had_embed_eligible` があるのに `embed_ok` が偽）は書かず、次回 sync で再試行させる
-    embed_feature_applies = ec is not None and (not had_embed_eligible or embed_ok)
+    # `ec` が有効なら、埋め込み対象チャンクが無い・取れなかったチャンクがある資料フォルダも「この構成」の索引なので emeta に埋め込み素性を書く
+    # （書かないと `needs_reindex()` が毎 sync 不一致になる）。取れなかったチャンクは `fill_missing_vectors` が後から足す
+    embed_feature_applies = ec is not None
 
-    if not delete_world(world):  # 削除失敗のまま bulk すると stale chunk が残る
+    if not _drop_stale_physicals(world):  # 前回落ちた作りかけを片付けられないまま新しく作らない
         return {"available": True, "indexed": 0, "chunks": 0, "error": "delete_failed"}
 
     dim = ec["dim"] if embed_feature_applies else None
@@ -1206,12 +1417,13 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     emeta["source_excluded"] = True  # ソース（登録コードと汎用コード）のチャンクを含まない索引（印の無い旧索引は `needs_reindex` が張り直す）
     if _CHUNK_LINES != _CHUNK_LINES_DEFAULT:  # 既定(40)時は書かない
         emeta["chunk_lines"] = _CHUNK_LINES  # legacy チャンク粒度（既定と異なるときだけ記録・drift 検知用）
-    # `content_sig` は bulk が全バッチ成功した後に書く（`_confirm_content_sig`）。先に書くと、途中でプロセスが落ちたとき「一部だけ入った索引＋有効な content_sig」が居座る。後書きなら、どう落ちても content_sig が無い＝次回 sync が必ず張り直す（fail-closed）
-    if embed_feature_applies:  # had_embed_eligible が偽でも ec 由来の素性を書く
+    # `content_sig` は bulk が全バッチ成功した後に書く（`_confirm_content_sig`）。先に書くと、途中でプロセスが落ちたとき「一部だけ入った索引＋有効な content_sig」が残りうる。後書きなら、どう落ちても content_sig が無い＝付け替えもされない（fail-closed）
+    if embed_feature_applies:
         emeta.update({"embed_provider": ec["provider"], "embed_model": ec["model"], "dim": ec["dim"],
                       "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID})  # 前処理アルゴリズム版（`_chunk_key` と同じ材料）
     if not ensure_index(world, dim=dim, emeta=(emeta or None)):
         return {"available": True, "indexed": 0, "chunks": 0, "error": "create_failed"}
+    new_idx = _building.get(world)  # ensure_index が作った物理索引（差し替えられた場合は None＝エイリアス名のまま）
     analyzer_fallback = _created_analyzer.pop(world, None) == "standard"  # 日本語アナライザを作れず標準で作り直した
 
     # ---- Pass2: チャンクを 1 件ずつ受け取り、`_EMBED_FLUSH_CHUNKS` 件ごとにグループ化して bulk 送信する ----
@@ -1219,7 +1431,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     total_chunks = 0
     rag_degraded = 0
     rag_degraded_docs: list = []
-    sender = _StreamingBulkSender(world)
+    sender = _StreamingBulkSender(world, new_idx)
     g_ids: list = []
     g_bodies: list = []
     g_texts: list = []
@@ -1268,29 +1480,31 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         for entry in rag_degraded_docs:
             by_reason[entry["reason"]] = by_reason.get(entry["reason"], 0) + 1
         rag_report["rag_degraded_by_reason"] = by_reason
-    if ec is not None and had_embed_eligible and not embed_ok:
-        rag_report["embed_degraded"] = True    # 埋め込みに失敗し、BM25 のみで索引した（クラウド未選択の構成）
+    if sender.missing:
+        rag_report["vectors_missing"] = sender.missing  # ベクトル無しで入れたチャンク（次の同期で足す）
+    if ec is not None and had_embed_eligible and sender.missing >= eligible_chunks:
+        rag_report["embed_degraded"] = True    # ベクトルを持つチャンクが 1 件も無い（全文検索のみ）
     if analyzer_fallback:
         rag_report["analyzer_fallback"] = True
 
+    def _failure(error: str) -> dict:
+        _discard_building(world)  # 作りかけの物理索引だけ捨てる（エイリアスの指す古い索引はそのまま）
+        out = {"available": True, "indexed": 0, "chunks": 0, "error": error, **rag_report}
+        if embed_calls_made:
+            out["embed_elapsed_ms"] = round(embed_elapsed_ms)
+        return out
+
     if sender.failed or not sender.finish():
-        # 途中バッチの失敗は資料フォルダを空へ戻す（全部か無しか）
-        _wipe_after_bulk_failure(world)
-        out = {"available": True, "indexed": 0, "chunks": 0, "error": sender.error, **rag_report}
-        if embed_calls_made:
-            out["embed_elapsed_ms"] = round(embed_elapsed_ms)
-        return out
+        return _failure(sender.error)
     if n_docs > 0 and total_chunks == 0:
-        # 文書があるのにチャンク 0 件は索引の異常として扱い、content_sig を確定させない（次回 sync が再索引する）。空の資料フォルダ（`n_docs==0`）は対象外
-        _restore_refresh_interval(world)  # 索引自体は作成済み（refresh_interval=-1 のまま）
-        out = {"available": True, "indexed": 0, "chunks": total_chunks, "error": "no_chunks", **rag_report}
-        if embed_calls_made:
-            out["embed_elapsed_ms"] = round(embed_elapsed_ms)
-        return out
-    _restore_refresh_interval(world)  # 全バッチ成功＝最終 refresh で可視化済み・背景 refresh を通常へ戻す
-    _confirm_content_sig(world, content_sig)  # 全バッチ成功後にだけ鮮度署名と実件数を確定する
+        # 文書があるのにチャンク 0 件は索引の異常として扱い、付け替えない（次回 sync が再索引する）。空の資料フォルダ（`n_docs==0`）は対象外
+        return _failure("no_chunks")
+    _restore_refresh_interval(world, new_idx)  # 全バッチ成功＝最終 refresh で可視化済み・背景 refresh を通常へ戻す
+    _confirm_content_sig(world, content_sig, new_idx)  # 全バッチ成功後にだけ鮮度署名と実件数を確定する
+    if new_idx is not None and not _activate_index(world, new_idx):
+        return _failure("alias_swap_failed")
     out = {"available": True, "indexed": n_docs, "chunks": total_chunks,
-          "vectors": bool(embed_feature_applies and had_embed_eligible),
+          "vectors": bool(embed_feature_applies and had_embed_eligible and sender.missing < eligible_chunks),
           "embedded": embedded_total, "reused": reused_total, **rag_report}
     if embed_calls_made:
         # `embed_elapsed_ms`: 埋め込み呼び出しの合計所要時間。一度も呼んでいなければキーを付けない（0 と欠落を区別する）
@@ -1298,9 +1512,9 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     return out
 
 
-def count(world: str) -> int | None:
+def count(world: str, idx: str | None = None) -> int | None:
     try:
-        return _req("GET", f"/{_index(world)}/_count").get("count")
+        return _req("GET", f"/{idx or _index(world)}/_count").get("count")
     except Exception:
         return None
 
@@ -1486,12 +1700,15 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
     空／内容署名ズレ／ソース除外の印なし／アーム構成ズレ／マッピング版ズレ／チャンク粒度ズレ／人間向け MD 版ズレ／アナライザ構成ズレ／埋め込み素性（provider／model／dim／前処理アルゴリズム版）ズレ／実件数ズレ。
     `content_sig`（ソースファイルの rel／mtime／ctime／size のみ）はアーム構成・マッピング版等の変更を検知できないため、各署名を別途比較する。索引済みメタにフィールド自体が無い旧索引は比較先が None になり、不一致＝1 回だけ再索引される。
     例外: `human_md_sig` は pending 中は比較先がセンチネルになり、pending が解消するまで毎回再索引を試みる（fail-closed）。`chunk_lines` は欠落を旧既定 `_CHUNK_LINES_DEFAULT`（40）として扱う。
+    エイリアス: 索引名がエイリアスでなく実の索引（0.18 以前の形）なら True（0.19 の最初の更新で 1 回だけ作り直す）。ベクトル無しのチャンクがあることは理由にしない（`fill_missing_vectors` が足す）。
     実件数ズレ: `_meta.doc_count`（`_confirm_content_sig` が刻む）と `count(world)` が食い違えば True（資料は不変のまま ES の文書が欠けた状態の自己修復）。`doc_count` が無い旧索引ではこの条件だけ比較しない（スタンプを刻むためだけに有料の再埋め込みを走らせないため）。
     """
     if not available():
         return False
     n = count(world)
     if n is None:
+        return True
+    if _index_kind(world) in ("index", "none"):  # エイリアスでない（0.18 以前の実の索引）＝新しい形へ 1 回作り直す
         return True
     meta = _index_meta(world) or {}  # GET 失敗は未設定相当＝fail-closed で reindex を促す
     if meta.get("content_sig") != content_sig:
@@ -1518,6 +1735,113 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
     doc_count = meta.get("doc_count")
     return doc_count is not None and n != doc_count
 
+
+
+_MISSING_QUERY = {"term": {"vector_status": "missing"}}
+_FILL_SCROLL = "10m"  # 1 ページ（`_EMBED_FLUSH_CHUNKS` 件）の埋め込みが再送で長引いても切れない長さ
+
+
+def count_missing_vectors(world: str) -> int | None:
+    """ベクトル無し（`vector_status: missing`）のチャンク数。取れなければ None。"""
+    try:
+        return _req("POST", f"/{_index(world)}/_count", {"query": _MISSING_QUERY}).get("count")
+    except Exception:
+        return None
+
+
+def _vector_update_batches(ids: list, vecs: list) -> list:
+    """`_update` 用の NDJSON（ベクトルと `vector_status` だけを書く＝本文は触らない）。件数・バイト数で有界に分ける。"""
+    out: list = []
+    lines: list = []
+    n_bytes = 0
+    for cid, vec in zip(ids, vecs):
+        action = json.dumps({"update": {"_id": cid}})
+        doc = json.dumps({"doc": {"embedding": vec, "vector_status": "ok"}})
+        pair = len(action) + len(doc) + 2
+        if lines and (len(lines) >= 2 * _ES_BULK_BATCH_MAX_DOCS or n_bytes + pair > _ES_BULK_BATCH_MAX_BYTES):
+            out.append("\n".join(lines) + "\n")
+            lines, n_bytes = [], 0
+        lines += [action, doc]
+        n_bytes += pair
+    if lines:
+        out.append("\n".join(lines) + "\n")
+    return out
+
+
+def fill_missing_vectors(world: str, settings: dict | None = None) -> dict:
+    """ベクトル無しで入れたチャンク（`vector_status: missing`）の埋め込みを取り直し、ベクトルと `vector_status` だけを書き足す。取り込み（変更あり・なし）の最後に呼ぶ。
+    設計: docs/design/rag.md「ベクトルの無いチャンク」
+    ① 索引の埋め込み素性が今の設定と同じか確かめる（違えば何もしない＝再索引が作り直す） ② scroll で一度に `_EMBED_FLUSH_CHUNKS` 件ずつ読み、埋め込みを取る（キャッシュに入れる）
+    ③ 取れたものだけ `_update` で書く（同じ ID への部分更新なので二重にならない）。取れなかったものは missing のまま次回へ。区切り（ページごと）で停止要求を確かめる。
+    直近に埋め込みのまとまりが失敗していれば（`_EMBED_COOLDOWN_SEC`）送り先を叩き直さない。
+    返値 `{available, filled, missing, error?, skipped?}`（`missing`＝終了後に残っている件数・取れなければ None）。
+    """
+    if not available():
+        return {"available": False, "filled": 0, "missing": None}
+    before = count_missing_vectors(world)
+    if not before:
+        return {"available": True, "filled": 0, "missing": before}
+    sys_s = _embed_system_settings_snapshot()
+    ec = embeddings.cfg(_settings(settings), system_settings=sys_s)
+    if ec is None:
+        return {"available": True, "filled": 0, "missing": before, "skipped": "embedding_not_configured"}
+    meta = _index_meta(world)
+    if meta is None:
+        return {"available": True, "filled": 0, "missing": before, "error": "index_missing"}
+    want = (ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID)
+    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"))
+    if want != have:  # 設定が変わった索引は再索引が作り直す
+        return {"available": True, "filled": 0, "missing": before, "skipped": "embed_config_changed"}
+    last_fail = _embed_failed_at.get(world)
+    if last_fail is not None and time.monotonic() - last_fail < _EMBED_COOLDOWN_SEC:
+        return {"available": True, "filled": 0, "missing": before, "skipped": "embed_recently_failed"}
+    guard = _EmbedGuard(world)
+    filled = 0
+    idx = _index(world)
+    scroll_id = None
+    try:
+        res = _req("POST", f"/{idx}/_search?scroll={_FILL_SCROLL}",
+                   {"size": _EMBED_FLUSH_CHUNKS, "query": _MISSING_QUERY, "_source": ["text"], "sort": ["_doc"]})
+        scroll_id = res.get("_scroll_id")
+        while True:
+            page = (res.get("hits") or {}).get("hits") or []
+            if not page:
+                break
+            _stop_point()
+            rows = [(h["_id"], (h.get("_source") or {}).get("text")) for h in page]
+            rows = [(i, t) for i, t in rows if isinstance(t, str) and t]
+            vecs, _reused, _embedded = _embed_fill(world, [t for _i, t in rows], ec, guard, stop_points=True)
+            got = [(i, v) for (i, _t), v in zip(rows, vecs) if v is not None]
+            for payload in _vector_update_batches([i for i, _v in got], [v for _i, v in got]):
+                r = _req("POST", f"/{idx}/_bulk", payload, ndjson=True)
+                if r.get("errors"):  # 読んだ後に消えた・置き換わった文書（404）は無視する。それ以外は止める
+                    bad = [it for it in (r.get("items") or []) if (it.get("update") or {}).get("error")
+                           and (it.get("update") or {}).get("status") != 404]
+                    if bad:
+                        raise RuntimeError("bulk_errors")
+            filled += len(got)
+            if guard.gave_up:
+                break
+            res = _req("POST", "/_search/scroll", {"scroll": _FILL_SCROLL, "scroll_id": scroll_id})
+            scroll_id = res.get("_scroll_id") or scroll_id
+    except Exception as exc:
+        from .ingest import background
+        if isinstance(exc, background.StopRequested):
+            raise
+        _log.warning("es_index: ベクトルの足し直しに失敗しました（次回 sync で再試行）: world=%s %s", world, type(exc).__name__)
+        return {"available": True, "filled": filled, "missing": count_missing_vectors(world), "error": "fill_failed"}
+    finally:
+        if scroll_id:
+            try:
+                _req("DELETE", "/_search/scroll", {"scroll_id": scroll_id})
+            except Exception:
+                pass
+        if filled:
+            try:
+                _req("POST", f"/{idx}/_refresh")
+            except Exception:
+                pass
+    return {"available": True, "filled": filled, "missing": count_missing_vectors(world)}
 
 
 def _mark_keyword_all(hits: list) -> list:

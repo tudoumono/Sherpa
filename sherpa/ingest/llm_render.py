@@ -4,8 +4,8 @@ LLM が書き換えてよいのは各レコード（`<!-- chunk:{chunk_id} -->` 
 本文だけ。アンカー行・可視性/状態の key-value 行・`出所:` 行・「」で囲まれた原値は変えない。
 機械検証で破れを検知したレコードは規則版のまま残す。
 ① 取り込み（sync）は規則版を即時生成し、`stamp_rule_only()` で `生成手段: 規則` を刻むだけ（LLM は呼ばない）。
-② LLM 成形は取り込み後に背景で実行する（`worker.py` が `run_world_pass()` を呼び、`schedule_background()` が
-   資料フォルダ単位の多重起動を防ぐ）。
+② LLM 成形は取り込み後に取り込みワーカーが実行する（`worker.sync()` が `request_followup()` で登録し、ワーカーが
+   run の後に `worker.llm_render_pass()` から `run_world_pass()` を呼ぶ）。
 ③ 結果はレコード本文の内容ハッシュでキャッシュし（`ir/` 層の JSON）、同一内容では LLM を呼ばない。
 プロバイダ選定・送信は `graph_extract.available()`/`complete_json()` を再利用する（用途セルは `render`・本文テキストのみ送る）。
 設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
@@ -18,7 +18,6 @@ import logging
 import re
 import threading
 from pathlib import Path
-from typing import Callable
 
 from .. import json_io, worlds
 from . import text_kind
@@ -344,10 +343,10 @@ class RunResult:
         self.model: str | None = None
 
 
-def run_world_pass(world: str, *, settings: dict | None = None) -> RunResult:
+def run_world_pass(world: str, *, settings: dict | None = None, should_stop=None) -> RunResult:
     """資料フォルダ配下の未成形（`生成手段: 規則`）な `.rag.md` を LLM 成形する（背景処理の本体）。
 
-    トグル OFF／LLM 未接続ならファイル I/O なしで即 return する。多重起動の抑止は `schedule_background()`、
+    トグル OFF／LLM 未接続ならファイル I/O なしで即 return する。`should_stop()` が真なら次の文書へ進まずに止める（取り込みの依頼が待っているとき・停止要求のとき）。
     ES への反映（`.rag_sig` の無効化・再索引・確定）は呼び出し元（`worker.py`）が `changed_rels` を見て行う。
     ① 開始時の `last_sig` を保存し、`office_md.drop_rag_sig_marker` で `.rag_sig` を未確定に落とす。
     ② 書込の直前に `store.world_lock` 内で現行 `last_sig` と照合し、不一致なら書込を破棄してパスを打ち切る
@@ -376,7 +375,11 @@ def run_world_pass(world: str, *, settings: dict | None = None) -> RunResult:
         cache = _load_cache(world)
         visited: set[str] = set()
         aborted = False
+        stopped = False
         for rag_path in sorted(rag_dir.rglob("*.rag.md")):
+            if should_stop is not None and should_stop():
+                stopped = True
+                break
             try:
                 rel = rag_path.relative_to(rag_dir).as_posix()[: -len(".rag.md")]
                 if text_kind.is_sensitive_doc_id(rel):
@@ -410,7 +413,9 @@ def run_world_pass(world: str, *, settings: dict | None = None) -> RunResult:
                         _log.warning(
                             "LLM 成形版 rag.md の書込に失敗しました（次回パスで再試行）: world=%s rel=%s",
                             world, rel, exc_info=True)
-        if not aborted:
+        if stopped:
+            _save_cache(world, cache)      # 途中までしか見ていないので剪定しない
+        elif not aborted:
             pruned = {k: v for k, v in cache.items() if k in visited}
             _save_cache(world, pruned)
     finally:
@@ -420,38 +425,24 @@ def run_world_pass(world: str, *, settings: dict | None = None) -> RunResult:
     return result
 
 
-# ---- 多重起動抑止（world 単位・単一 worker 前提） ------------------------------------------------
+# ---- 後追いの登録（world 単位） -----------------------------------------------------------------
 
-_RUNNING: set[str] = set()
-_RUNNING_LOCK = threading.Lock()
+_FOLLOWUPS: list[str] = []
+_FOLLOWUPS_LOCK = threading.Lock()
 
 
-def schedule_background(world: str, work_fn: Callable[[str], None]) -> bool:
-    """同一 world の LLM 成形が実行中でなければ daemon thread で起動する（多重起動抑止）。
-
-    実行中なら何もせず False（合流や待機はしない——呼び出し元〔`worker.sync()`〕は sync のたびに
-    毎回呼ぶ想定で、取りこぼしても次回 sync が再度契機になり収束する）。`work_fn` はこの thread の
-    中で `world` を引数に1回呼ばれる（例外は握って警告ログのみ・呼び出し元プロセスを落とさない）。
+def request_followup(world: str) -> None:
+    """この world の LLM 成形を、取り込みワーカーが今の run の後に行う対象として登録する（同じ world は 1 回にまとめる）。
+    `worker.sync()` が sync のたびに呼ぶ想定で、取りこぼしても次回 sync が再度契機になり収束する。
     """
-    with _RUNNING_LOCK:
-        if world in _RUNNING:
-            return False
-        _RUNNING.add(world)
-
-    def _runner() -> None:
-        try:
-            work_fn(world)
-        except Exception:
-            _log.warning("LLM 成形の背景実行が失敗しました: world=%s", world, exc_info=True)
-        finally:
-            with _RUNNING_LOCK:
-                _RUNNING.discard(world)
-
-    threading.Thread(target=_runner, daemon=True, name=f"sherpa-rag-llm-render-{world}").start()
-    return True
+    with _FOLLOWUPS_LOCK:
+        if world not in _FOLLOWUPS:
+            _FOLLOWUPS.append(world)
 
 
-def is_running(world: str) -> bool:
-    """この world の LLM 成形が in-process レジストリ上で「実行中」か（テスト/診断用）。"""
-    with _RUNNING_LOCK:
-        return world in _RUNNING
+def take_followups() -> list[str]:
+    """登録済みの後追い対象を取り出して空にする。"""
+    with _FOLLOWUPS_LOCK:
+        out = list(_FOLLOWUPS)
+        _FOLLOWUPS.clear()
+        return out

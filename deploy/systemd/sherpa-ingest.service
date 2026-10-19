@@ -1,0 +1,38 @@
+# 取り込み専用ワーカー（sherpa-api.service と対）。Web アプリ（sherpa-api）は取り込みを動かさず、このワーカーが依頼を拾って処理する。
+# 同じ Sherpa フォルダ・同じ env ファイルを使い、版（VERSION とコミット）が sherpa-api と違うと依頼を拾わず待つ。
+# 更新は「make stop → 上書き展開 → ./install.sh」の後、両方を起動し直す（sherpa-api と sherpa-ingest の順）。
+[Unit]
+Description=Sherpa ingest worker
+Documentation=file:/opt/sherpa/Sherpa/README.md
+Wants=network-online.target
+After=network-online.target docker.service sherpa-api.service
+
+[Service]
+Type=simple
+User=sherpa-api
+Group=sherpa-workspace
+WorkingDirectory=/opt/sherpa/Sherpa
+Environment=SHERPA_ENV_FILE=/etc/sherpa/sherpa.env
+Environment=PYTHON_BIN=/opt/sherpa/Sherpa/.venv/bin/python
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0007
+# 見張りのスクリプトが、1 件ごとに終了するワーカーをすぐ起動し直す（優先度は SHERPA_INGEST_NICE・既定 10）。
+ExecStart=/opt/sherpa/Sherpa/scripts/run-ingest-worker.sh serve
+Restart=always
+RestartSec=2
+RestartPreventExitStatus=78
+# 停止では処理中の 1 件の完了を待つ（長い 1 件に備えて 1800 秒より長く）。本体にだけ SIGTERM を送り、子は本体の終了後に片付ける。
+TimeoutStopSec=1900
+KillMode=mixed
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/srv/sherpa/kb
+# 取り込みが書く場所は sherpa-api.service と同じ（派生物・実行状態・ログ）。
+ReadWritePaths=/opt/sherpa/Sherpa/data -/srv/sherpa/users -/srv/sherpa/derived -/var/log/sherpa
+
+[Install]
+WantedBy=multi-user.target

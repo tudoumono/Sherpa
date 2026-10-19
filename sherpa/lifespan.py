@@ -1,31 +1,29 @@
 """FastAPI lifespan（起動処理の呼び出し順の集約）。
 
 起動時の順序（各処理の実体は `sherpa.api` 側）:
-① ログ設定（`log_setup.configure_logging()`・request_id filter の再適用） ② スキーマ初期化 ③ 取り込み中断 run の格下げ
+① ログ設定（`log_setup.configure_logging()`・request_id filter の再適用） ② スキーマ初期化 ③ 0.18.x の Web アプリがプロセス内で動かしていた取り込み run（ワーカーに拾われていない extracting）の中断への格下げと、前の版が積んだ queued の依頼の版の付け替え
 ④ 監査 writer・Codex ジョブワーカーの起動 ⑤ env の初回シード ⑥ 起動検査（`_warn_*`・`CHANGE_ME` と既定 admin パスワードの検査は
-auth bootstrap より前に置く） ⑦ auth bootstrap・孤児 reconcile・TTL sweep（起動時 1 回＋定期）・`turn_metrics` 補完。
-起動の最後に、中断していた取り込みの自動再開（`ingest.resume`）を始める。
-shutdown では新規受付を止め、取り込みへ止める要求を出して区切りで止まるのを待ち（上限 `SHERPA_STOP_DRAIN_SEC`）、writer・ワーカー・PG プール・Neo4j driver をクローズする。
+auth bootstrap より前に置く） ⑦ auth bootstrap・孤児 reconcile・TTL sweep（起動時 1 回＋定期）・`turn_metrics` 補完・Web アプリの心拍。
+取り込みはこのプロセスでは動かさない（取り込みワーカー `ingest.ingest_worker` が依頼を拾う）。中断した取り込みの再開もワーカーが行う。
+shutdown では新規の依頼の受付を止め（取り込みを持たないのですぐ終わる）、writer・ワーカー・PG プール・Neo4j driver をクローズする。
 循環 import を避けるため `sherpa.api` の参照は lifespan 実行時の遅延 import にする。
 設計: docs/design/operations.md「起動・停止・状態」
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import threading
 from contextlib import asynccontextmanager
 
 from sherpa import codex_jobs_worker, ext_api, log_setup, store
-from sherpa.env_int import env_int
 
 _log = logging.getLogger("sherpa")
 
 
 @asynccontextmanager
 async def lifespan(app):
-    _metafile_render_stop = threading.Event()
+    _maintenance_stop = threading.Event()
     _maintenance_threads: list = []  # 起動時掃除・定期掃除のスレッド（終了時に PG プールを閉じる前に join する）
     # `ext_api._attach_request_id_filter()` が作成済み logger の handlers を毎回スキャンするため、必ずそれより前に呼ぶ（失敗は起動を止めない）
     try:
@@ -42,13 +40,22 @@ async def lifespan(app):
         store.init_schema()
     except Exception as e:
         _log.warning("起動時のスキーマ初期化に失敗しました（DB 不達の可能性・lazy 初期化にフォールバックします）: %s", e)
-    # 起動直後に残る `status='extracting'` の run はプロセス強制死の孤児（単一 worker 前提）。failed へ一括格下げする
+    # ワーカーに拾われていない `status='extracting'` の run は、0.18.x の Web アプリがプロセス内で動かしていて強制死で残った孤児。
+    # failed（中断）へ格下げする。ワーカーが拾った run（claimed_by あり）はワーカーが生死を見て扱う
     try:
-        downgraded = store.downgrade_orphaned_extracting_runs()
+        downgraded = store.downgrade_orphaned_extracting_runs(legacy_only=True)
         if downgraded:
             _log.warning("起動時に中断された取り込み run を検知し failed へ格下げしました: ids=%s", downgraded)
     except Exception as e:
         _log.warning("起動時の孤児 run 格下げに失敗しました（DB 不達の可能性）: %s", e)
+    # 前の版の Web アプリが積んだまま拾われていない依頼（queued）の版を、この Web アプリの版に付け替える（同じ版のワーカーだけが拾うため、残すと誰も拾わず資料フォルダを塞ぐ）
+    try:
+        from sherpa import app_version
+        restamped = store.restamp_queued_runs(app_version.current())
+        if restamped:
+            _log.info("前の版が積んだ取り込みの依頼を、この版へ付け替えました: ids=%s", restamped)
+    except Exception as e:
+        _log.warning("取り込みの依頼の版の付け替えに失敗しました（DB 不達の可能性）: %s", e)
     # /ext/v1 監査書込み専用 writer スレッド。起動に失敗しても起動処理は止めず ERROR ログを残す（writer は自己回復する）
     if not ext_api._audit_writer.start():
         _log.error("ext_api audit writer の起動に失敗しました（旧世代のスレッドがまだ停止して"
@@ -81,29 +88,23 @@ async def lifespan(app):
         api._warn_multi_worker_chat_turns()
         api._warn_browse_roots_missing()
         api._reconcile_orphans()
-        _maintenance_threads.append(api._sweep_expired_on_startup(_metafile_render_stop))
-        _maintenance_threads.append(api._start_workspace_maintenance_loop(_metafile_render_stop))  # 期限切れ掃除などを定期実行
+        _maintenance_threads.append(api._sweep_expired_on_startup(_maintenance_stop))
+        _maintenance_threads.append(api._start_workspace_maintenance_loop(_maintenance_stop))  # 期限切れ掃除などを定期実行
         api._backfill_turn_metrics_on_startup()
-        from sherpa.ingest import metafile_render
-        metafile_render.start_loop(_metafile_render_stop)  # WMF/EMF の図全体の描画待ちを 1 件ずつ進める
-        from sherpa.ingest import background as _bg
-        _bg.mark_graceful_ready()  # stop.sh が、待って止まれる新しい版だと見分ける印
+        from sherpa.ingest import worker_state
+        worker_state.mark_web_ready()  # stop.sh が、取り込みを持たない（すぐ止められる）版だと見分ける印
         if not os.environ.get("SHERPA_TEST_DB_ISOLATED"):
-            from sherpa.ingest import resume
-            resume.resume_interrupted()  # 他の初期化が済んだ最後に、中断していた取り込みの続きを始める
+            _maintenance_threads.append(worker_state.start_web_heartbeat(_maintenance_stop))  # 取り込み画面の版の照合
         yield
     finally:
-        _metafile_render_stop.set()
-        # ① 新規受付を止める ② 止める要求を立てる ③ 実行中の run が区切りで止まる（または終わる）まで待つ（上限 SHERPA_STOP_DRAIN_SEC）
+        _maintenance_stop.set()
+        # 新規の依頼の受付を止める（積み済みの依頼は取り込みワーカーが続ける）
         try:
-            from sherpa.ingest import background
+            from sherpa.ingest import background, worker_state
             background.stop_accepting()
-            background.request_stop()
-            await asyncio.get_running_loop().run_in_executor(
-                None, lambda: background.drain(timeout=env_int("SHERPA_STOP_DRAIN_SEC", 1800, 0, 86400)))
-            background.clear_graceful_ready()
+            worker_state.clear_web_ready()
         except Exception as e:
-            _log.warning("背景実行の shutdown drain に失敗しました（best-effort）: %s", e)
+            _log.warning("取り込み依頼の受付停止に失敗しました（best-effort）: %s", e)
         ext_api._audit_writer.stop()  # 新規受付を止め、既存 queue を回収してから終了する
         try:
             codex_jobs_worker.stop()  # 新規 claim を止める（実行中ジョブは daemon のまま）

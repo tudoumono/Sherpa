@@ -217,6 +217,16 @@ def _ensure_worker_started() -> None:
         _worker_thread.start()
 
 
+def flush(timeout: float = 60.0) -> bool:
+    """積んだ通知が送り終わる（リトライ込み）まで待つ。送り終えたら True、`timeout` 秒で終わらなければ False。1 件で終わるプロセス（取り込みワーカー）が終了前に呼ぶ。"""
+    deadline = time.monotonic() + timeout
+    while _queue.unfinished_tasks > 0:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
 def _enqueue(key_id: int, url: str, secret: str, payload: dict) -> None:
     """1キー分の配送をキューへ積む。キューが飽和していれば即座に諦め、`webhook.dropped` を監査記録する。"""
     _ensure_worker_started()

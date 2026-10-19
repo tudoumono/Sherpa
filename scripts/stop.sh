@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Sherpa を全部停止する: アプリ（pid）→ Caddy（pid）→ ストア（docker compose down）の順。
+# Sherpa を全部停止する: アプリ（pid）→ 取り込みワーカー（pid）→ Caddy（pid）→ ストア（docker compose down）の順。
 #
-#   ./scripts/stop.sh              # アプリ・Caddy・ストアを全部停止
-#   KEEP_STORES=1 ./scripts/stop.sh  # ストア（DB/検索）は残し、アプリと Caddy だけ停止
+#   ./scripts/stop.sh              # アプリ・取り込みワーカー・Caddy・ストアを全部停止
+#   KEEP_STORES=1 ./scripts/stop.sh  # ストア（DB/検索）は残し、アプリ・ワーカー・Caddy だけ停止
+#   STOP_ONLY=app ./scripts/stop.sh    # アプリ（Web）だけ停止（取り込みワーカーは動かしたまま＝取り込みは続く）
+#   STOP_ONLY=worker ./scripts/stop.sh # 取り込みワーカーだけ停止
 #   FORCE=1 ./scripts/stop.sh        # 取り込み中でも待たず、短い猶予（10 秒）で強制終了
 #
-# 取り込み中は、処理中の 1 件が終わるまで待ってから止まります（上限 SHERPA_STOP_WAIT 秒・既定 1800）。
+# 取り込み中は、取り込みワーカーが処理中の 1 件が終わるまで待ってから止まります（上限 SHERPA_STOP_WAIT 秒・既定 1800）。
+# アプリ（Web）は取り込みを持たないのですぐ止まります（前の版のアプリが取り込みを抱えているときだけ、その 1 件を待ちます）。
 # 強制終了や上限超えで途中になった取り込みは、次の起動で自動的に続きから再開します。
 # pid ファイルの残骸（プロセスは既に死亡）は掃除します。
 set -euo pipefail
@@ -19,11 +22,17 @@ cd "$ROOT"
 
 KEEP_STORES="${KEEP_STORES:-0}"
 FORCE="${FORCE:-0}"
+STOP_ONLY="${STOP_ONLY:-all}"
+case "$STOP_ONLY" in
+  all|app|worker) ;;
+  *) echo "STOP_ONLY は all / app / worker のどれかです（指定: ${STOP_ONLY}）" >&2; exit 2 ;;
+esac
 # 取り込み中に終了を待つ上限（秒）。取り込みが動いていないときの猶予は IDLE_WAIT 秒（従来どおり）。FORCE=1 は取り込み中でも IDLE_WAIT 秒。
 IDLE_WAIT=10
 if [ "$FORCE" = "1" ]; then STOP_WAIT="$IDLE_WAIT"; else STOP_WAIT="${SHERPA_STOP_WAIT:-1800}"; fi
-# 取り込み側（sherpa/ingest/background.py）が書く処理状況。1 行目 pid=<アプリ>、以降 run<TAB>資料フォルダ<TAB>開始(epoch秒)<TAB>処理中ファイル
-INGEST_STATE_FILE="${SHERPA_INGEST_STATE_FILE:-$RUN_DIR/ingest_active}"
+# 前の版（0.18.x）のアプリが書く処理状況。1 行目 pid=<アプリ>、以降 run<TAB>資料フォルダ<TAB>開始(epoch秒)<TAB>処理中ファイル
+# 取り込みワーカー（sherpa/ingest/ingest_worker.py）が書く処理状況（${WORKER_STATE_FILE}）も同じ形式。
+INGEST_STATE_FILE="${SHERPA_INGEST_STATE_FILE_LEGACY:-$RUN_DIR/ingest_active}"
 TAB="$(printf '\t')"
 
 # 秒を「N 秒」「M 分 S 秒」に整える。
@@ -32,13 +41,14 @@ fmt_secs() {
   if [ "$n" -ge 60 ]; then echo "$(( n / 60 )) 分 $(( n % 60 )) 秒"; else echo "${n} 秒"; fi
 }
 
-# 指定 pid のアプリが取り込み中なら 0（NOTE_REL=処理中ファイル・NOTE_SINCE=その開始時刻）。取り込み中でなければ 1。
-ingest_active() {  # $1=アプリの pid（空なら pid を問わない）
-  local fpid line
-  [ -f "$INGEST_STATE_FILE" ] || return 1
-  fpid="$(sed -n 's/^pid=//p' "$INGEST_STATE_FILE" 2>/dev/null | head -1)"
+# 取り込み中なら 0（NOTE_REL=処理中ファイル・NOTE_SINCE=その開始時刻）。取り込み中でなければ 1。
+# $1=前の版のアプリの pid（空なら pid を問わない）。$2=処理状況ファイル（省略時は前の版のアプリのもの）。
+ingest_active() {
+  local fpid line file="${2:-$INGEST_STATE_FILE}"
+  [ -f "$file" ] || return 1
+  fpid="$(sed -n 's/^pid=//p' "$file" 2>/dev/null | head -1)"
   if [ -n "$1" ] && [ "$fpid" != "$1" ]; then return 1; fi
-  line="$(grep -m1 "^run${TAB}" "$INGEST_STATE_FILE" 2>/dev/null || true)"
+  line="$(grep -m1 "^run${TAB}" "$file" 2>/dev/null || true)"
   [ -n "$line" ] || return 1
   NOTE_REL=""
   NOTE_SINCE=""
@@ -141,15 +151,25 @@ report_leftovers() {  # $1=停止前に控えた pid の一覧（空白区切り
 }
 
 # pid の終了を待つ。取り込み中は STOP_WAIT 秒まで、そうでなければ IDLE_WAIT 秒まで（最後に取り込み中だった時刻から数える）。
-# 終了したら 0、上限を超えたら 1（WAITED_INGEST=1 なら取り込み中だった）。$2=1 のときだけ取り込みの状況を見て表示する（アプリ用）。
+# 終了したら 0、上限を超えたら 1（WAITED_INGEST=1 なら取り込み中だった）。$2=1 のときだけ取り込みの状況を見て表示する（アプリ・ワーカー用）。
+# $3=worker のときは取り込みワーカーの処理状況ファイルを見る（見張りの pid ではなく中の Python の pid が書かれるため pid は問わない）。
 WAITED_INGEST=0
-wait_for_exit() {  # $1=pid  $2=取り込みの状況を見るか(0/1)
-  local pid="$1" aware="$2" start now last_active
+wait_for_exit() {  # $1=pid  $2=取り込みの状況を見るか(0/1)  $3=app|worker
+  local pid="$1" aware="$2" kind="${3:-app}" start now last_active active=1
   start="$(date +%s)"; last_active="$start"
   WAITED_INGEST=0; NOTICE_ANNOUNCED=0; NOTICE_LAST=0
   while kill -0 "$pid" 2>/dev/null; do
     now="$(date +%s)"
-    if [ "$aware" = "1" ] && ingest_active "$pid"; then
+    if [ "$aware" = "1" ]; then
+      if [ "$kind" = "worker" ]; then
+        if ingest_active "" "$WORKER_STATE_FILE"; then active=0; else active=1; fi
+      else
+        if ingest_active "$pid"; then active=0; else active=1; fi
+      fi
+    else
+      active=1
+    fi
+    if [ "$active" = 0 ]; then
       last_active="$now"
       WAITED_INGEST=1
       ingest_notice "$now"
@@ -169,9 +189,17 @@ stop_systemd_units() {
   units="$(pkg_systemd_active_units)"
   [ -n "$units" ] || return 0
   for unit in $units; do
+    # 取り込みワーカーのユニット（sherpa-ingest*）かどうかで、STOP_ONLY の対象を分ける。
+    case "$unit" in
+      *ingest*) [ "$STOP_ONLY" != "app" ] || continue ;;
+      *) [ "$STOP_ONLY" != "worker" ] || continue ;;
+    esac
     echo "systemd のユニット ${unit} を停止します..."
     mpid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
-    case "$mpid" in ''|*[!0-9]*|0) ;; *) if ! app_is_graceful "$mpid"; then wait_old_app_boundary "$mpid"; fi ;; esac
+    case "$unit" in
+      *ingest*) ;;   # 取り込みワーカーは前の版のアプリではない（古い版の合図待ちは要らない）
+      *) case "$mpid" in ''|*[!0-9]*|0) ;; *) if ! app_is_graceful "$mpid"; then wait_old_app_boundary "$mpid"; fi ;; esac ;;
+    esac
     # 停止は終わるまで返らないため、背景で実行して取り込みの待ち状況を表示する。上限を超えたら SIGKILL で終わらせる。
     { systemctl stop "$unit" 2>/dev/null || sudo -n systemctl stop "$unit" 2>/dev/null; } &
     spid=$!
@@ -179,7 +207,7 @@ stop_systemd_units() {
     WAITED_INGEST=0; NOTICE_ANNOUNCED=0; NOTICE_LAST=0
     while kill -0 "$spid" 2>/dev/null; do
       now="$(date +%s)"
-      if ingest_active ""; then
+      if ingest_active "" || ingest_active "" "$WORKER_STATE_FILE"; then
         last_active="$now"
         WAITED_INGEST=1
         ingest_notice "$now"
@@ -205,14 +233,15 @@ stop_systemd_units() {
 }
 
 # pid ファイルのプロセスを穏当に停止する（SIGTERM→待って SIGKILL）。
-# アプリ（$4=app）は、取り込み中なら処理中の 1 件が終わるまで待つため、SIGTERM は本体の pid だけへ送る
+# アプリ（$4=app）と取り込みワーカー（$4=worker）は、取り込み中なら処理中の 1 件が終わるまで待つため、SIGTERM は本体の pid だけへ送る
 # （子プロセスを巻き込んで処理中の 1 件を壊さない）。終了後に残った子はグループへの SIGTERM で片付ける。
+# 取り込みを持たない新しい版のアプリはすぐ止まる。ワーカーの待ちはワーカーの処理状況ファイルで見る。
 # それ以外と FORCE=1 は、setsid 起動＝PID がプロセスグループ長のため、まずグループ全体に送る（子も巻き取る）。
 # kill する前に pid の所有者を検証する（RV High-1）: 再起動等で pid が別プロセスに再利用されて
 # いた場合、無関係なプロセス（グループ）を誤って殺さないよう、pid ファイルの掃除だけに留める。
-stop_pid() {  # $1=表示名  $2=pidファイル  $3=コマンドライン照合用の部分文字列（needle）  $4=app（アプリだけ指定）
+stop_pid() {  # $1=表示名  $2=pidファイル  $3=コマンドライン照合用の部分文字列（needle）  $4=app|worker（アプリ・取り込みワーカーだけ指定）
   local label="$1" pf="$2" needle="$3" kind="${4:-}" pid rc graceful=0 aware=0 kids=""
-  if [ "$kind" = "app" ]; then aware=1; if [ "$FORCE" != "1" ]; then graceful=1; fi; fi
+  if [ "$kind" = "app" ] || [ "$kind" = "worker" ]; then aware=1; if [ "$FORCE" != "1" ]; then graceful=1; fi; fi
   # set -e 下では非0を返す代入は if の条件式として評価しないとスクリプトごと終了してしまう
   # （bare statement は errexit の対象・if/while の条件だけが免除される）。
   if pid="$(live_matching_pid "$pf" "$needle")"; then
@@ -225,14 +254,14 @@ stop_pid() {  # $1=表示名  $2=pidファイル  $3=コマンドライン照合
       echo "$label を停止します（pid ${pid}）..."
       if [ "$aware" = "1" ]; then
         kids="$(descendants_of "$pid" | tr '\n' ' ')"
-        if ! app_is_graceful "$pid"; then wait_old_app_boundary "$pid"; fi
+        if [ "$kind" = "app" ] && ! app_is_graceful "$pid"; then wait_old_app_boundary "$pid"; fi
       fi
       if [ "$graceful" = "1" ]; then
         kill -TERM "$pid" 2>/dev/null || true
       else
         kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
       fi
-      if ! wait_for_exit "$pid" "$aware"; then
+      if ! wait_for_exit "$pid" "$aware" "$kind"; then
         report_forced "$WAITED_INGEST"
         kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
       elif [ "$graceful" = "1" ] && kill -0 -- "-$pid" 2>/dev/null; then
@@ -260,10 +289,23 @@ stop_pid() {  # $1=表示名  $2=pidファイル  $3=コマンドライン照合
 }
 
 stop_systemd_units
-stop_pid "Sherpa アプリ" "$APP_PID_FILE" "$APP_PROC_NEEDLE" app
-stop_pid "Caddy" "$CADDY_PID_FILE" "$CADDY_PROC_NEEDLE"
+if [ "$STOP_ONLY" != "worker" ]; then
+  stop_pid "Sherpa アプリ" "$APP_PID_FILE" "$APP_PROC_NEEDLE" app
+fi
+if [ "$STOP_ONLY" != "app" ]; then
+  stop_pid "取り込みワーカー" "$WORKER_PID_FILE" "$WORKER_PROC_NEEDLE" worker
+fi
+if [ "$STOP_ONLY" != "app" ]; then
+  reaped="$(sherpa_reap_ingest_children)"
+  if [ "${reaped:-0}" != 0 ]; then echo "取り込みワーカーが残した子プロセス ${reaped} 件を止めました。"; fi
+fi
+if [ "$STOP_ONLY" = "all" ]; then
+  stop_pid "Caddy" "$CADDY_PID_FILE" "$CADDY_PROC_NEEDLE"
+fi
 
-if [ "$KEEP_STORES" = "1" ]; then
+if [ "$STOP_ONLY" != "all" ]; then
+  :
+elif [ "$KEEP_STORES" = "1" ]; then
   echo "ストア（PostgreSQL / Neo4j / Elasticsearch）は KEEP_STORES=1 のため残します。"
 elif ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   echo "Docker が起動していません（Docker Desktop / dockerd を起動してください）。ストア停止をスキップします。" >&2

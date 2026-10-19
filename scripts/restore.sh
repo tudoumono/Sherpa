@@ -211,7 +211,8 @@ fi
 
 APP_RUNNING=""
 # アプリの稼働判定は project 名に依らない（pid ファイルはこのリポジトリのアプリを指す・RV）。
-if APP_RUNNING="$(live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE" 2>/dev/null)"; then
+if APP_RUNNING="$(live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE" 2>/dev/null)" \
+   || APP_RUNNING="$(live_matching_pid "$WORKER_PID_FILE" "$WORKER_PROC_NEEDLE" 2>/dev/null)"; then   # 取り込みワーカーも書き込む
   fail "アプリが稼働中です（pid=${APP_RUNNING}）。個人領域/ストアへの書込みを止めるため、make stop してから再実行してください。"
   exit 1
 fi

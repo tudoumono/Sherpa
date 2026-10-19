@@ -26,7 +26,7 @@ def stub(monkeypatch, tmp_path):
     state["dispatched"] = []
     state["dispatch_exc"] = None
 
-    def _dispatch(wid, op, fp, work_fn, **kw):
+    def _dispatch(wid, op, fp, payload=None, **kw):
         if state["dispatch_exc"]:
             raise state["dispatch_exc"]
         state["dispatched"].append((wid, op))

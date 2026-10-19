@@ -19,14 +19,14 @@
 | 6 | 全ログ（アプリ＋ストア） | `./sherpactl logs`（絞り込み例: `./sherpactl logs convert embed`・短縮 `./sherpactl logs c e`） | api/convert/embed/usage 等と PostgreSQL/Neo4j/Elasticsearch を1画面に合流して追う（`./sherpactl logs -h` で名前の一覧、`./sherpactl logs -r` で集計レポート） |
 
 > **してはいけないこと**: 復旧目的で `make nuke` を実行しない（ストアの**ボリュームごと削除**＝データ消去です。確認は 2 回・端末必須）。
-> 迷ったらまず `make up`（ストア再起動）と `make restart`（アプリ再起動）。どちらもデータは消しません。
+> 迷ったらまず `make up`（ストア再起動）と `make restart`（アプリと取り込みワーカーの再起動）。どちらもデータは消しません。
 
 ## 障害シナリオ別の手順
 
 ### S1. アプリ（FastAPI）が応答しない
 
 - **症状**: 画面が開かない／`curl -s http://127.0.0.1:8000/healthz` が返らない。ストアは `make ps` で healthy。
-- **復旧**: `make restart`（ストアは維持したままアプリだけ再起動）。
+- **復旧**: `make restart-web`（ストアも取り込みワーカーも止めず、アプリだけ再起動。取り込みは続きます）。コードを入れ替えたあとなど版が変わるときは `make restart`（アプリとワーカーの両方）。
 - **直らない場合**: `tail -n 200 data/run/api.log` で起動時の例外を確認。env 設定ミス（production の起動拒否ガード等）は
   ログに理由が明記されます。`make prod-check` で env/依存関係を点検。
 - **復旧確認**: `make status` が全緑 → ブラウザでログイン → ホームが表示される。

@@ -2,7 +2,8 @@
 
 - office_md の本体ループ: 停止要求が立つと次のファイルへ進まず、処理中の 1 件は変換キャッシュまで保存し、公開しない
 - worker: 中断した run は失敗ではなく「中断」として記録し、署名を確定せず、Webhook を送らない
-- 起動時の再開: 中断した run の資料フォルダの同期を 1 回だけ始める（無効化 env で始めない・実行中なら何もしない）
+- 起動時の再開（取り込みワーカーが行う）: 中断した run の資料フォルダの同期の依頼を 1 回だけ積む（無効化 env で積まない・積み済みなら何もしない）
+- 取り込みワーカーの処理状況ファイル（stop.sh が待ち状況を出すために読む）
 """
 from __future__ import annotations
 
@@ -14,7 +15,8 @@ import openpyxl
 import pytest
 
 from sherpa import corpus_docs, es_index, reconcile, store, webhooks, worlds
-from sherpa.ingest import background, office_md, resume, world_neo4j, worker
+from sherpa.ingest import background, ingest_worker, office_md, resume, world_neo4j, worker
+from sherpa.store import workers as store_workers
 
 
 @pytest.fixture(autouse=True)
@@ -160,6 +162,23 @@ def test_worker_stops_between_stages_before_touching_graph(monkeypatch, _stub_pi
     assert _stub_pipeline["loaded"] == [] and _stub_pipeline["confirmed"] == []
 
 
+def test_worker_stops_inside_the_es_stage_without_confirming_signature(monkeypatch, _stub_pipeline):
+    """ES 索引の区切りで止まった run は ES の失敗扱いにせず、中断として記録する（署名は確定しない・Webhook なし）。"""
+    monkeypatch.setattr(worker, "_build_derived", lambda world, **_kw: {"converted": 0, "failed": 0, "unsupported": 0, "by_ext": {}})
+
+    def stopped(world, content_sig=None, **_kw):
+        raise background.StopRequested()
+    monkeypatch.setattr(es_index, "index_world", stopped)
+
+    res = worker.run("w", op="refresh")
+
+    assert res["status"] == "failed" and res["interrupted"] is True
+    snap = _stub_pipeline["finished"][0]["extraction_snapshot"]
+    assert snap["interrupted"] is True and not any("es_index_failed" in str(f) for f in snap["flags"])
+    assert _stub_pipeline["sigs"] == [""] and _stub_pipeline["confirmed"] == []
+    assert _stub_pipeline["webhooks"] == []
+
+
 # ---- 起動時の自動再開 ----
 
 def test_resume_starts_one_sync_per_interrupted_world(monkeypatch):
@@ -170,8 +189,8 @@ def test_resume_starts_one_sync_per_interrupted_world(monkeypatch):
         {"world_id": "w4", "run_id": 8, "op": None}])          # 参照先が解決できない資料フォルダは対象外
     monkeypatch.setattr(worlds, "world_dir", lambda wid: "/x" if wid == "w3" else None)
     started = []
-    monkeypatch.setattr(background, "start_or_join",
-                        lambda wid, op, fp, create, work, **kw: started.append((wid, op)) or (1, False))
+    monkeypatch.setattr(background, "submit",
+                        lambda wid, op, fp, payload=None, **kw: started.append((wid, op)) or (1, False))
 
     assert resume.resume_interrupted() == ["w1", "w3"]
     assert started == [("w1", "refresh"), ("w3", "refresh")]
@@ -184,10 +203,10 @@ def test_resume_disabled_by_env(monkeypatch):
     assert resume.resume_interrupted() == []
 
 
-def test_resume_skips_world_already_running(monkeypatch):
+def test_resume_skips_world_already_queued(monkeypatch):
     monkeypatch.setattr(store, "list_worlds_with_interrupted_latest_run",
                         lambda: [{"world_id": "w1", "run_id": 5, "op": "register"}])
-    monkeypatch.setattr(background, "start_or_join", lambda *a, **kw: (9, True))   # 実行中の run に合流＝新しく始めていない
+    monkeypatch.setattr(background, "submit", lambda *a, **kw: (9, True))   # 積み済み・実行中の run に合流＝新しく積んでいない
     assert resume.resume_interrupted() == []
 
 
@@ -214,32 +233,22 @@ def test_interrupted_latest_run_query_against_db():
         store.delete_world_row(wid)
 
 
-def test_background_writes_and_clears_state_file_for_stop_script(monkeypatch, tmp_path):
+def test_worker_beat_writes_and_clears_state_file_for_stop_script(monkeypatch, tmp_path):
     """stop.sh が待ち状況を出せるよう、処理中のファイルを RUN_DIR の状態ファイルへ書き、終われば消す。"""
     import os
-    import time
-    state = tmp_path / "ingest_active"
+    state = tmp_path / "ingest_worker_active"
     monkeypatch.setenv("SHERPA_INGEST_STATE_FILE", str(state))
-    monkeypatch.setattr(store, "fail_close_if_extracting", lambda run_id, reason: False)
-    monkeypatch.setattr(store, "note_ingest_run_op", lambda run_id, op: None)
-    inside = threading.Event()
-    release = threading.Event()
-    seen = {}
-
-    def work(run_id):
+    monkeypatch.setattr(store_workers, "beat", lambda *a, **kw: None)
+    beat = ingest_worker._Beat("w-id", "v1")
+    background.bind_run(7)
+    try:
         background.note_file("sub/a.xls")
-        seen["text"] = state.read_text(encoding="utf-8")
-        inside.set()
-        release.wait(timeout=5)
-
-    background.start_or_join("w-state", "refresh", "", lambda: 7, work)
-    assert inside.wait(timeout=5)
-    lines = seen["text"].splitlines()
-    assert lines[0] == f"pid={os.getpid()}"
-    kind, world, since, rel = lines[1].split("\t")
-    assert (kind, world, rel) == ("run", "w-state", "sub/a.xls") and int(since) > 0
-    release.set()
-    deadline = time.monotonic() + 5
-    while state.exists() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert not state.exists()
+        beat.set_state("running", run_id=7, world="w-state")
+        lines = state.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == f"pid={os.getpid()}"
+        kind, world, since, rel = lines[1].split("\t")
+        assert (kind, world, rel) == ("run", "w-state", "sub/a.xls") and int(since) > 0
+        beat.stop("idle")
+        assert not state.exists()
+    finally:
+        background.unbind_run()

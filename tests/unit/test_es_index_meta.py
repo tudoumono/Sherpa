@@ -44,6 +44,7 @@ def _index_env(monkeypatch, docs=(), *, read=None, ec=None, tmp_path=None) -> _B
     monkeypatch.setattr(es_index.doc_text, "read_world_doc_text", read or (lambda w, d: "本文1\n本文2"))
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "delete_world", lambda w: True)
+    monkeypatch.setattr(es_index, "_drop_stale_physicals", lambda w: True)
     monkeypatch.setattr(es_index, "ensure_index", lambda w, dim=None, emeta=None: True)
     if ec is None:
         monkeypatch.setattr(es_index, "_embed_cached", lambda *a, **k: (None, 0, 0))
@@ -316,23 +317,29 @@ def test_replace_document_for_source_deletes_leftover_chunks_and_adds_none(monke
     assert len(sent) == 1 and '"delete"' in sent[0] and "a.cbl#1" in sent[0]
 
 
-@pytest.mark.parametrize("branch,text,expect_features", [
-    ("source", "コード本文", True),     # 純コード world は embed 対象 0 件でも素性を書く
-    ("office", "資料本文", False),      # 真の埋め込み失敗は素性を書かず次回 sync で再試行
-], ids=["pure_code_world", "true_embed_failure"])
-def test_embed_features_recorded_only_when_embedding_not_failed(monkeypatch, branch, text, expect_features):
+@pytest.mark.parametrize("branch,text,expect_embed_calls", [
+    ("source", "コード本文", False),    # 純コード world は embed 対象 0 件でも素性を書く
+    ("office", "資料本文", True),       # 埋め込みが全部失敗しても素性を書く（ベクトル無しで入れ、後で足す）
+], ids=["pure_code_world", "all_embeds_fail"])
+def test_embed_features_recorded_even_when_embedding_fails(monkeypatch, branch, text, expect_embed_calls):
     docs = [_doc("a.cbl" if branch == "source" else "設計.md", branch=branch)]
-    _index_env(monkeypatch, docs, read=lambda w, d: text)
+    bulk = _index_env(monkeypatch, docs, read=lambda w, d: text)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     ec = {"provider": "openai", "model": "text-embedding-3-small", "dim": 1536}
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: ec)
     monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: False)
+    monkeypatch.setattr(es_index.worlds, "semantic_dir", lambda w: Path(es_index.__file__).parent / "_unused")
+    calls = []
 
-    def fake_embed_cached(world, texts, ec_):
-        assert (texts == []) is expect_features
-        return (None, 0, 0)
+    def fake_fill(world, texts, ec_, guard=None, **kw):
+        calls.append(texts)
+        return [None] * len(texts), 0, 0
 
-    monkeypatch.setattr(es_index, "_embed_cached", fake_embed_cached)
+    monkeypatch.setattr(es_index, "_embed_fill", fake_fill)
+    monkeypatch.setattr(es_index, "_live_keys_reset", lambda w: None)
+    monkeypatch.setattr(es_index, "_live_keys_add", lambda w, keys: None)
+    monkeypatch.setattr(es_index, "_prune_embed_cache", lambda w, valid_keys=None: None)
+    monkeypatch.setattr(es_index, "_embed_cache_lookup_batch", lambda w, keys, dim: {})
     store: dict = {}
 
     def fake_ensure_index(w, dim=None, emeta=None):
@@ -341,17 +348,19 @@ def test_embed_features_recorded_only_when_embedding_not_failed(monkeypatch, bra
         return True
 
     monkeypatch.setattr(es_index, "ensure_index", fake_ensure_index)
-    if expect_features:      # 失敗側は実 `_confirm_content_sig`（実件数が取れず content_sig を確定しない）を通す
-        monkeypatch.setattr(es_index, "_confirm_content_sig",
-                            lambda w, sig: store.__setitem__("content_sig", sig) if sig else None)
+    monkeypatch.setattr(es_index, "_confirm_content_sig",
+                        lambda w, sig, idx=None: store.__setitem__("content_sig", sig) if sig else None)
     r = es_index.index_world("w", content_sig="c1")
     assert r.get("error") is None
-    assert ("embed_provider" in store) is expect_features
-    if expect_features:
-        assert store["embed_provider"] == "openai" and store["dim"] == 1536
+    assert bool(calls) is expect_embed_calls
+    assert store["embed_provider"] == "openai" and store["dim"] == 1536
+    if expect_embed_calls:
+        assert r["vectors_missing"] == 1 and r["embed_degraded"] is True and r["vectors"] is False
+        assert [b["vector_status"] for b in bulk.bodies] == ["missing"]
     monkeypatch.setattr(es_index, "_index_meta", lambda w: dict(store))
     monkeypatch.setattr(es_index, "count", lambda w: 1)
-    assert es_index.needs_reindex("w", "c1") is (not expect_features)
+    monkeypatch.setattr(es_index, "_index_kind", lambda w: "alias")
+    assert es_index.needs_reindex("w", "c1") is False           # ベクトル無しのチャンクがあることは作り直しの理由にしない
 
 
 # ---- EMBED-3: doc 単位ストリーミング化（メモリ有界性・一様 degrade・再開性） ----
@@ -376,7 +385,7 @@ def test_index_world_embed_calls_bounded_by_flush_size_not_world_total(monkeypat
     assert sum(call_sizes) == 23
 
 
-def test_index_world_embed_partial_failure_degrades_uniformly_no_doc_mixing(monkeypatch, tmp_path):
+def test_index_world_embed_partial_failure_marks_only_the_failed_group_missing(monkeypatch, tmp_path):
     bulk = _embed3_world(monkeypatch, tmp_path, n_docs=8, flush_chunks=3)
     call_n = {"n": 0}
 
@@ -386,9 +395,12 @@ def test_index_world_embed_partial_failure_degrades_uniformly_no_doc_mixing(monk
 
     monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
     r = es_index.index_world("w")
-    assert r.get("error") is None and r["vectors"] is False
+    assert r.get("error") is None and r["vectors"] is True and "embed_degraded" not in r
     assert len(bulk.bodies) == 8
-    assert all("embedding" not in b for b in bulk.bodies)       # 成功済みバッチの doc も含め誰もベクトルを持たない
+    missing = [b for b in bulk.bodies if b.get("vector_status") == "missing"]
+    assert len(missing) == r["vectors_missing"] == 3             # 失敗したまとまり（3 件）だけ
+    assert all("embedding" not in b for b in missing)
+    assert all(b.get("embedding") == [0.1, 0.2, 0.3] for b in bulk.bodies if b.get("vector_status") != "missing")
 
 
 def test_index_world_resumes_embed_cache_across_failed_and_retried_runs(monkeypatch, tmp_path):
@@ -403,11 +415,28 @@ def test_index_world_resumes_embed_cache_across_failed_and_retried_runs(monkeypa
         return [[0.1, 0.2, 0.3] for _ in texts]
 
     monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
-    assert es_index.index_world("w")["vectors"] is False
+    assert es_index.index_world("w")["vectors_missing"] == 3
     fail_second["on"] = False
     seen.clear()
-    assert es_index.index_world("w")["vectors"] is True
-    assert sum(len(t) for t in seen) < 8                         # 1 回目に成功したバッチ分はキャッシュヒット
+    r = es_index.index_world("w")
+    assert r["vectors"] is True and "vectors_missing" not in r
+    assert sum(len(t) for t in seen) == 3                        # 1 回目に成功したまとまり分はキャッシュヒット
+
+
+def test_embed_guard_stops_calling_the_destination_after_consecutive_failures(monkeypatch, tmp_path):
+    """送り先が全く使えないとき、まとまりごとに再送を使い切る時間を払い続けない。残りは問い合わせずベクトル無しで入れる。"""
+    bulk = _embed3_world(monkeypatch, tmp_path, n_docs=30, flush_chunks=3)
+    calls = []
+
+    def fake_embed(texts, ec, **kw):
+        calls.append(len(texts))
+        return None
+
+    monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
+    r = es_index.index_world("w")
+    assert r.get("error") is None and r["embed_degraded"] is True and r["vectors_missing"] == 30
+    assert len(calls) == es_index._EMBED_GIVE_UP_AFTER
+    assert len(bulk.bodies) == 30
 
 
 # ---- kill-switch（SHERPA_DISABLE_EMBED）・クラウド選択・system_settings スナップショット ----
@@ -440,36 +469,23 @@ def test_index_world_fails_before_delete_when_cloud_selected_but_unavailable(mon
     assert delete_calls == []
 
 
-def test_index_world_fails_before_delete_when_real_embed_call_fails(monkeypatch):
-    _index_env(monkeypatch, [_doc("a.md")])
-    delete_calls = []
-    monkeypatch.setattr(es_index, "delete_world", lambda w: delete_calls.append(w) or True)
-    monkeypatch.setattr(es_index.embeddings, "cfg",
-                        lambda settings=None, **kw: {"provider": "openai", "model": "m", "dim": 1536})
-    embed_cached_calls = []
-
-    def _fake_embed_cached(world, texts, ec):
-        embed_cached_calls.append(texts)
-        return None, 0, 0
-
-    monkeypatch.setattr(es_index, "_embed_cached", _fake_embed_cached)
-    monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: True)
+def test_index_world_does_not_abort_when_real_embed_call_fails_with_cloud_selected(monkeypatch, tmp_path):
+    """設定の段階で解決できたクラウドの埋め込みが実際に失敗しても、資料フォルダ全体は打ち切らない（全部ベクトル無しで入れる）。"""
+    bulk = _index_env(monkeypatch, [_doc("a.md", branch="office")], read=lambda w, d: "本文", ec=_EC, tmp_path=tmp_path)
+    monkeypatch.setattr(es_index.embeddings, "embed", lambda texts, ec, **kw: None)
     r = es_index.index_world("w")
-    assert r.pop("embed_elapsed_ms") >= 0
-    assert r == {"available": True, "indexed": 0, "chunks": 0, "error": "embedding_cloud_unavailable"}
-    assert delete_calls == []
-    assert embed_cached_calls and embed_cached_calls[0]
+    assert r.get("error") is None and r["vectors_missing"] == 1 and r["embed_degraded"] is True
+    assert [b["vector_status"] for b in bulk.bodies] == ["missing"]
 
 
-def test_index_world_still_graceful_when_embed_fails_and_cloud_never_selected(monkeypatch):
-    _index_env(monkeypatch, [_doc("a.md")])
+def test_index_world_still_graceful_when_embed_fails_and_cloud_never_selected(monkeypatch, tmp_path):
+    bulk = _index_env(monkeypatch, [_doc("a.md", branch="office")], read=lambda w, d: "本文", ec=_EC, tmp_path=tmp_path)
     delete_calls = []
     monkeypatch.setattr(es_index, "delete_world", lambda w: delete_calls.append(w) or True)
-    monkeypatch.setattr(es_index.embeddings, "cfg",
-                        lambda settings=None, **kw: {"provider": "ollama", "model": "m", "dim": 768})
-    monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: False)
+    monkeypatch.setattr(es_index.embeddings, "embed", lambda texts, ec, **kw: None)
     assert es_index.index_world("w").get("error") is None
-    assert delete_calls == ["w"]
+    assert delete_calls == []                                    # 古い索引は消さず、新しい物理索引へ入れて付け替える
+    assert len(bulk.bodies) == 1
 
 
 def test_search_knn_only_distinguishes_cloud_unavailable_from_not_configured(monkeypatch):
@@ -679,6 +695,7 @@ def test_index_world_records_signatures_in_meta(monkeypatch, chunk_lines, expect
 
 def _reindex_env(monkeypatch):
     monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "_index_kind", lambda w: "alias")
     monkeypatch.setattr(es_index, "count", lambda w: 5)
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
@@ -738,6 +755,7 @@ def test_needs_reindex_reacts_to_human_md_drift_regardless_of_rag_es_setting(mon
     from sherpa.ingest import office_md
     # `_human_md_config_sig` は実関数を使うので `_reindex_env` は使わない
     monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "_index_kind", lambda w: "alias")
     monkeypatch.setattr(es_index, "count", lambda w: 5)
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
@@ -765,12 +783,13 @@ def test_analyzer_config_sig_survives_json_round_trip():
 
 def test_stale_mapping_v4_index_triggers_reindex_once_then_stays_stable(monkeypatch):
     _index_env(monkeypatch)
+    monkeypatch.setattr(es_index, "_index_kind", lambda w: "alias")
     monkeypatch.setattr(es_index, "count", lambda w: 5)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     store = {"content_sig": "c1", "mapping_version": "4", "arms_sig": "sig-A"}
     monkeypatch.setattr(es_index, "_index_meta", lambda w: dict(store))
     monkeypatch.setattr(es_index, "_confirm_content_sig",
-                        lambda w, sig: store.__setitem__("content_sig", sig) if sig else None)
+                        lambda w, sig, idx=None: store.__setitem__("content_sig", sig) if sig else None)
     ensure_calls = {"n": 0}
 
     def fake_ensure_index(w, dim=None, emeta=None):
@@ -838,6 +857,7 @@ def test_human_md_config_sig_fail_closed_while_world_has_pending_human_md_drift(
 def test_confirm_human_md_meta_updates_field_and_converges_needs_reindex(monkeypatch, tmp_path):
     _human_md_world(monkeypatch, tmp_path, render_drift=False, es_drift=False)
     monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "_index_kind", lambda w: "alias")
     monkeypatch.setattr(es_index, "count", lambda w: 5)
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
@@ -883,37 +903,31 @@ def test_confirm_content_sig_skips_put_when_meta_get_fails(monkeypatch):
     assert put_calls == []
 
 
-# ---- bulk 途中失敗の wipe（fail-closed） ----
+# ---- bulk 途中失敗の後始末（作りかけの物理索引だけを捨てる） ----
 
-@pytest.mark.parametrize("meta", [{"content_sig": "c1", "mapping_version": "6", "world_id": "w"}, None],
-                         ids=["meta_ok", "meta_get_failed"])
-def test_wipe_after_bulk_failure_drops_content_sig_when_delete_fails(monkeypatch, meta):
-    monkeypatch.setattr(es_index, "delete_world", lambda w: False)
-    monkeypatch.setattr(es_index, "_index_meta", lambda w: meta)
+def test_discard_building_deletes_only_the_physical_index_in_progress(monkeypatch):
     sent = []
-    monkeypatch.setattr(es_index, "_req", lambda method, path, body=None, **kw: sent.append((method, path, body)) or {})
-    es_index._wipe_after_bulk_failure("w")
-    assert len(sent) == 1 and sent[0][0] == "PUT" and sent[0][1].endswith("/_mapping")
-    assert "content_sig" not in sent[0][2]["_meta"]
-    if meta:
-        assert sent[0][2]["_meta"]["world_id"] == "w"
+    monkeypatch.setattr(es_index, "_req", lambda method, path, body=None, **kw: sent.append((method, path)) or {})
+    es_index._building["w"] = es_index._index("w") + "-g123"
+    es_index._discard_building("w")
+    assert sent == [("DELETE", "/" + es_index._index("w") + "-g123")]
+    es_index._discard_building("w")                               # 2 回目は何もしない
+    assert len(sent) == 1
 
 
-def test_wipe_after_bulk_failure_edge_cases(monkeypatch):
-    monkeypatch.setattr(es_index, "delete_world", lambda w: True)
+def test_discard_building_never_touches_the_alias_name_and_swallows_errors(monkeypatch):
     called = []
     monkeypatch.setattr(es_index, "_req", lambda *a, **k: called.append(a) or {})
-    es_index._wipe_after_bulk_failure("w")
-    assert called == []                                           # 成功したら余計な PUT を出さない
-
-    monkeypatch.setattr(es_index, "delete_world", lambda w: False)
-    monkeypatch.setattr(es_index, "_index_meta", lambda w: {"content_sig": "c1"})
+    es_index._building["w"] = es_index._index("w")                # 差し替えで物理索引を作っていない場合
+    es_index._discard_building("w")
+    assert called == []
 
     def boom(*a, **k):
         raise RuntimeError("es down")
 
     monkeypatch.setattr(es_index, "_req", boom)
-    es_index._wipe_after_bulk_failure("w")                        # 例外を漏らさない
+    es_index._building["w"] = es_index._index("w") + "-g1"
+    es_index._discard_building("w")                               # 例外を漏らさない
 
 
 def test_content_sig_written_only_after_all_batches_succeed(monkeypatch):
@@ -926,7 +940,7 @@ def test_content_sig_written_only_after_all_batches_succeed(monkeypatch):
 
     monkeypatch.setattr(es_index, "ensure_index", fake_ensure_index)
     confirmed = []
-    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig: confirmed.append(sig))
+    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig, idx=None: confirmed.append(sig))
     es_index.index_world("w", content_sig="c1")
     assert "content_sig" not in emeta_at_create
     assert confirmed == ["c1"]
@@ -935,8 +949,7 @@ def test_content_sig_written_only_after_all_batches_succeed(monkeypatch):
 def test_content_sig_not_confirmed_when_a_batch_fails(monkeypatch):
     _index_env(monkeypatch, [_doc("a.md", branch="office")], read=lambda w, d: "本文")
     confirmed = []
-    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig: confirmed.append(sig))
-    monkeypatch.setattr(es_index, "_wipe_after_bulk_failure", lambda w: None)
+    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig, idx=None: confirmed.append(sig))
 
     def boom(method, path, body=None, ndjson=False):
         raise RuntimeError("bulk down")
@@ -1366,10 +1379,12 @@ def test_index_world_sends_multiple_bulk_batches_refresh_only_last(monkeypatch):
 
 
 @pytest.mark.parametrize("failure,error", [("raise", "bulk_failed"), ("item_errors", "bulk_errors")])
-def test_index_world_partial_batch_failure_wipes_index(monkeypatch, failure, error):
+def test_index_world_partial_batch_failure_discards_building_index_only(monkeypatch, failure, error):
     _multi_chunk_world(monkeypatch, 3)
     delete_calls = []
     monkeypatch.setattr(es_index, "delete_world", lambda w: delete_calls.append(w) or True)
+    discarded = []
+    monkeypatch.setattr(es_index, "_discard_building", lambda w: discarded.append(w))
     call_n = {"n": 0}
 
     def fake_req(method, path, body=None, **kw):
@@ -1385,7 +1400,8 @@ def test_index_world_partial_batch_failure_wipes_index(monkeypatch, failure, err
     r = es_index.index_world("w")
     assert r == {"available": True, "indexed": 0, "chunks": 0, "error": error, "rag_degraded": 0}
     assert call_n["n"] == 2                                       # 3 バッチ目は送らない
-    assert delete_calls == ["w", "w"]                             # クリーン再索引の delete ＋ 失敗後の wipe
+    assert delete_calls == []                                     # 古い索引（エイリアス）は消さない
+    assert discarded == ["w"]                                     # 作りかけの物理索引だけ捨てる
 
 
 def test_index_world_empty_text_only_world_converges_without_no_chunks(monkeypatch, tmp_path):
@@ -1397,7 +1413,7 @@ def test_index_world_empty_text_only_world_converges_without_no_chunks(monkeypat
     monkeypatch.setattr(es_index.worlds, "derived_md_dir", lambda w: tmp_path / "derived" / "md")
     monkeypatch.setattr(es_index.worlds, "derived_rag_dir", lambda w: tmp_path / "derived" / "rag")
     confirmed = []
-    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig: confirmed.append(sig))
+    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig, idx=None: confirmed.append(sig))
     monkeypatch.setattr(es_index, "_req", lambda *a, **k: {})
     for _ in range(2):
         r = es_index.index_world("w", content_sig="sig-x")
@@ -1544,10 +1560,29 @@ def test_embed_cache_write_recreates_page_corrupt_db(monkeypatch, tmp_path):
     assert es_index._embed_cache_lookup_batch(world, ["z1"], 1536) == {"z1": [0.1] * 1536}
 
 
-def test_prune_embed_cache_raises_when_valid_keys_are_missing_from_db(monkeypatch, tmp_path):
+def test_prune_embed_cache_tolerates_valid_keys_missing_from_db(monkeypatch, tmp_path):
+    """取れなかったチャンクの鍵はキャッシュに無いだけ。剪定は異常にせず、生きていない鍵だけ消す。"""
     world = "prune-missing-keys"
     _seed_cache(monkeypatch, tmp_path, world, 5)
-    with pytest.raises(OSError):
-        es_index._prune_embed_cache(world, {"k00000", "k00001", "not-in-db"})
-    es_index._prune_embed_cache(world, {"k00000", "k00001"})
-    assert es_index._embed_cache_lookup_batch(world, ["k00002"], 1536) == {}
+    es_index._prune_embed_cache(world, {"k00000", "k00001", "not-in-db"})
+    assert set(es_index._embed_cache_lookup_batch(world, [f"k{i:05d}" for i in range(5)], 1536)) == {"k00000", "k00001"}
+
+
+def test_prune_embed_cache_uses_a_table_not_a_python_set(monkeypatch, tmp_path):
+    """生きている鍵は `live` 表へ溜めて SQL の差で剪定する（鍵を全部は持たない）。剪定後に `live` 表は残らない。"""
+    import sqlite3
+    world = "prune-live-table"
+    p = _seed_cache(monkeypatch, tmp_path, world, 6)
+    es_index._live_keys_reset(world)
+    es_index._live_keys_add(world, ["k00001", "k00003"])
+    es_index._live_keys_add(world, ["k00003", "k00004"])           # 重複は無視される
+    es_index._prune_embed_cache(world)
+    assert set(es_index._embed_cache_lookup_batch(world, [f"k{i:05d}" for i in range(6)], 1536)) == {"k00001", "k00003", "k00004"}
+    conn = sqlite3.connect(str(p))
+    try:
+        assert conn.execute("SELECT name FROM sqlite_master WHERE name='live'").fetchone() is None
+    finally:
+        conn.close()
+    es_index._live_keys_reset(world)                              # 生きている鍵が 1 件も無い＝キャッシュごと消す
+    es_index._prune_embed_cache(world)
+    assert not p.exists()

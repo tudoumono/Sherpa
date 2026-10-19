@@ -65,6 +65,24 @@ fi
 printf '  URL(ローカル)         : %s\n' "$CHAT_URL"
 
 echo ""
+echo "=== 取り込みワーカー ==="
+worker_down=0
+if wpid="$(live_matching_pid "$WORKER_PID_FILE" "$WORKER_PROC_NEEDLE")"; then
+  printf '  [OK]   取り込みワーカー : 見張りの pid %s\n' "$wpid"
+  if [ -f "$WORKER_STATE_FILE" ] && grep -q "^run" "$WORKER_STATE_FILE" 2>/dev/null; then
+    printf '         処理中           : %s\n' "$(grep -m1 '^run' "$WORKER_STATE_FILE" | cut -f2)"
+  fi
+else
+  wrc=$?
+  if [ "$wrc" = 2 ]; then
+    echo "  [停止] 取り込みワーカー : pid ファイルが古い（pid 再利用の疑い・掃除は make stop で）"
+  else
+    echo "  [停止] 取り込みワーカー : 未起動（取り込みは進みません・make restart-worker で起動）"
+  fi
+  worker_down=1
+fi
+
+echo ""
 echo "=== LAN / Caddy ==="
 if pid="$(live_matching_pid "$CADDY_PID_FILE" "$CADDY_PROC_NEEDLE")"; then
   hn="$(hostname 2>/dev/null || echo localhost)"
@@ -133,9 +151,10 @@ elif docker image inspect sherpa/ocr-worker:paddleocr-3.7.0-cpu >/dev/null 2>&1;
 fi
 
 # 落ちているものへの案内。
-if [ "$stores_down" != 0 ] || [ "$app_down" != 0 ]; then
+if [ "$stores_down" != 0 ] || [ "$app_down" != 0 ] || [ "$worker_down" != 0 ]; then
   echo ""
   echo "── 起動していないものがあります ──"
   [ "$stores_down" != 0 ] && echo "  ストア起動:  make up   （ログ: make logs）"
   [ "$app_down" != 0 ]    && echo "  全部起動:    make start （初回セットアップ込み）"
+  [ "$worker_down" != 0 ] && [ "$app_down" = 0 ] && echo "  ワーカーだけ: make restart-worker"
 fi

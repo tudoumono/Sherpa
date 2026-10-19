@@ -77,6 +77,8 @@ fi
 
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
+# glibc の malloc が作る領域（arena）を絞り、解放済みメモリが OS へ戻りやすくする（Linux のみ効く・環境変数で上書き可）。
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 
 # Python は .venv を正とする（Makefile の PY と同じ規約）。以前は python3（システム）に落ちていたため、
 # `make serve` / `make api` を直接叩くと依存の無い python で uvicorn を起動しようとして転んでいた。

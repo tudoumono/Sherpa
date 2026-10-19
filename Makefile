@@ -1,8 +1,8 @@
 # Sherpa MVP — 起動・運用タスク
 #
 # `make` だけを打つと、下の一覧（help）が出ます。
-.PHONY: help hooks dev-setup start stop restart status check-ports up down ps logs l bootstrap install-docker ocr-models \
-        api serve prod-check verify-kit verify-extension dist package-full package-app nuke notice notice-check \
+.PHONY: help hooks dev-setup start stop restart restart-web restart-worker status check-ports up down ps logs l bootstrap install-docker ocr-models \
+        api serve ingest-worker prod-check verify-kit verify-extension dist package-full package-app nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e \
         test-db-reset screenshots backup restore usage-backfill trace azure-smoke codex-compat doctor sandbox-check \
         codex-install codex-version \
@@ -66,11 +66,19 @@ endif
 start:            ## 利用者向け: 依存/ストア/アプリを一括起動（LAN=1 で LAN 公開・MODE=dev で開発モード）
 	LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
-stop:             ## 利用者向け: 全部停止（アプリ＋Caddy＋ストア。取り込み中は処理中の 1 件の完了を待つ。KEEP_STORES=1 でストアを残す・FORCE=1 で待たずに強制終了）
+stop:             ## 利用者向け: 全部停止（アプリ＋取り込みワーカー＋Caddy＋ストア。取り込み中は処理中の 1 件の完了を待つ。KEEP_STORES=1 でストアを残す・FORCE=1 で待たずに強制終了）
 	KEEP_STORES="$(KEEP_STORES)" FORCE="$(FORCE)" ./scripts/stop.sh
 
-restart:          ## 利用者向け: アプリ（＋Caddy）を再起動（ストアは維持・LAN/MODE は start と同じ）
+restart:          ## 利用者向け: アプリ・取り込みワーカー（＋Caddy）を再起動（ストアは維持・LAN/MODE は start と同じ。取り込み中は 1 件の完了を待つ）
 	KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
+	LAN="$(LAN)" ./scripts/start.sh $(MODE)
+
+restart-web:      ## 利用者向け: アプリ（Web）だけ再起動（取り込みワーカーは止めない＝取り込みは続く。版を変えたときは make restart で両方）
+	STOP_ONLY=app KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
+	LAN="$(LAN)" ./scripts/start.sh $(MODE)
+
+restart-worker:   ## 利用者向け: 取り込みワーカーだけ再起動（アプリは止めない。処理中の 1 件の完了を待つ。FORCE=1 で待たずに強制終了）
+	STOP_ONLY=worker KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
 	LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
 status:           ## 利用者向け: 一枚看板の状態表示（ストア/アプリ/Caddy/URL）
@@ -213,8 +221,11 @@ api:               ## FastAPI 起動（dev 専用・fixtures フラグ ON＝架�
 	./scripts/run-api.sh dev
 endif
 
-serve:             ## FastAPI 起動（本番・fixtures 非参照。SHERPA_ENV=production で fixtures を指す設定があれば起動拒否＝継承フラグも遮断）
+serve:             ## FastAPI 起動（本番・fixtures 非参照。SHERPA_ENV=production で fixtures を指す設定があれば起動拒否＝継承フラグも遮断）。取り込みは別プロセス（make ingest-worker）
 	./scripts/run-api.sh serve
+
+ingest-worker:     ## 取り込みワーカーを前面で起動（MODE=dev で開発モード・既定 serve）。api／serve の前面起動のときは、取り込みを進めるためにこれも別の端末で動かす（make start は両方を起動する）
+	./scripts/run-ingest-worker.sh $(if $(filter dev,$(MODE)),dev,serve)
 
 prod-check:        ## 本番 env/依存関係の軽い事前点検（SHERPA_ENV_FILE で env ファイル指定）
 	./scripts/check-production.sh

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import logging.handlers
 import os
 import re
 import sys
@@ -27,6 +28,15 @@ _SUBSYSTEM_LOGGERS: dict[str, tuple[str, str]] = {
     # Codex CLI 実行の開始/終了サマリ
     "codex": ("sherpa.codex", "codex.log"),
 }
+
+# 専用ログを起動時に退避する側。web＝Web アプリ（起動時に自分の分だけ退避）、ingest＝取り込みワーカー
+# （退避は見張りの scripts/run-ingest-worker.sh の起動時。1 件ごとに起動し直すので Python 側では退避しない）、
+# shared＝両方が書く（起動時には退避せず、大きくなったときだけ退避する）。
+_SUBSYSTEM_OWNERS: dict[str, str] = {
+    "libreoffice": "ingest", "convert": "ingest", "embed": "shared", "usage": "shared", "codex": "web",
+}
+_MAX_BYTES = 50 * 1024 * 1024    # 専用ログが超えたら退避する大きさ（env `SHERPA_LOG_MAX_MB` で変更）
+_CHECK_EVERY = 200               # 何件書くごとに大きさを確かめるか
 
 _SUBSYSTEM_LEVEL = logging.INFO  # 専用ファイルへ書く下限
 _RUN_LOG_LEVEL = logging.WARNING  # "sherpa" ロガー（run ログ）へ残す下限
@@ -103,8 +113,27 @@ def _make_run_log_handler() -> logging.Handler:
     return handler
 
 
+class _WatchedRotatingFileHandler(logging.handlers.WatchedFileHandler):
+    """別プロセスが退避（rename）したら開き直し、大きくなったら自分で退避する専用ログのハンドラ。"""
+
+    def __init__(self, path, **kw):
+        super().__init__(path, **kw)
+        self._count = 0
+
+    def emit(self, record):
+        self._count += 1
+        if self._count % _CHECK_EVERY == 0:
+            try:
+                limit = int(os.environ.get("SHERPA_LOG_MAX_MB", "") or 0) * 1024 * 1024 or _MAX_BYTES
+                if Path(self.baseFilename).stat().st_size > limit:
+                    rotate_and_prune(self.baseFilename)    # 退避後の開き直しは WatchedFileHandler が行う
+            except OSError:
+                pass
+        super().emit(record)
+
+
 def _make_file_handler(path: Path) -> logging.Handler:
-    handler = logging.FileHandler(path, encoding="utf-8")
+    handler = _WatchedRotatingFileHandler(path, encoding="utf-8")
     handler.setLevel(logging.NOTSET)  # 絞り込みは logger 側の level で行う
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     setattr(handler, _HANDLER_MARK, True)
@@ -125,11 +154,14 @@ def _reset_marked_handlers(logger: logging.Logger) -> None:
                 pass
 
 
-def configure_logging(*, log_dir: Path | str | None = None, force: bool = False) -> None:
+def configure_logging(*, log_dir: Path | str | None = None, force: bool = False, rotate: bool = True,
+                      owner: str = "web") -> None:
     """サブシステム別ログを設定する（冪等・プロセスにつき実質1回。`lifespan` の起動処理の先頭から呼ぶ）。
 
     pytest 実行中は実ファイル操作をしない。`force=True, log_dir=tmp_path` で両ガードを迂回でき、その場合はこのモジュールが付けた
     handler（`_HANDLER_MARK`）だけを付け直す。
+    `owner` は呼び出したプロセスの種類（web／ingest）。起動時に退避するのは自分が書く専用ログ（`_SUBSYSTEM_OWNERS`）だけで、
+    別のプロセスが書くログには触れない。`rotate=False` は起動時に退避せず追記する（1 件ごとに起動し直す取り込みワーカー用・退避は見張りのスクリプトが行う）。
     """
     global _configured
     if _configured and not force:
@@ -155,7 +187,12 @@ def configure_logging(*, log_dir: Path | str | None = None, force: bool = False)
         elif _has_own_handler(logger):
             continue
         path = base / filename
-        rotate_and_prune(path, keep)
+        stream = next((k for k, v in _SUBSYSTEM_LOGGERS.items() if v[0] == logger_name), None)
+        if rotate and _SUBSYSTEM_OWNERS.get(stream) == owner:
+            rotate_and_prune(path, keep)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=True)
         logger.addHandler(_make_file_handler(path))
         logger.setLevel(_SUBSYSTEM_LEVEL)
         logger.propagate = True  # WARNING 以上は "sherpa" 経由で run ログにも残る

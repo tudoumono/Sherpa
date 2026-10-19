@@ -1,7 +1,7 @@
 """資料フォルダ(World)管理エンドポイント。3 つの router から成る:
 - `ingest_preview_router`: `GET /ingest/preview`
 - `worlds_router`: `GET /world-options`・`GET /fs/list`・`GET /worlds`・`GET /worlds/{wid}/status`・`POST /worlds/{wid}/recount`・`POST /worlds`・`POST /worlds/diff`・`POST /worlds/{wid}/rebind`・`POST /worlds/{wid}/refresh`・`POST /worlds/{wid}/reconvert`・`POST /worlds/{wid}/rag_regenerate_rules`・`GET`/`PUT /worlds/{wid}/resolve-settings`・`DELETE /worlds/{wid}`
-- `ingest_runs_router`: `POST /ingest/rerun`・`GET /ingest/runs`
+- `ingest_runs_router`: `POST /ingest/rerun`・`GET /ingest/runs`・`GET /ingest/workers`
 api.py が元の位置にそれぞれ `app.include_router(...)` する（ルート表 golden の定義順を保つため）。`_browse_roots`/`_under_roots` は `sherpa.deps` にある。
 モジュール名が `sherpa/worlds.py` と衝突するため、api.py 側は `from sherpa.routers import worlds as worlds_routes` と別名で import する。
 `sherpa.api` を import しない。
@@ -18,7 +18,7 @@ import psycopg
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
-from sherpa import corpus_docs, doc_ledger, store, webhooks, world_admin_service, worlds
+from sherpa import corpus_docs, doc_ledger, store, world_admin_service, worlds
 from sherpa.deps import (
     _WORLD_PATTERN,
     _WorldField,
@@ -29,7 +29,7 @@ from sherpa.deps import (
     _under_roots,
 )
 from sherpa.grep_tool import valid_world
-from sherpa.ingest import background, failure_reasons, resolve_settings, world_graph
+from sherpa.ingest import background, failure_reasons, resolve_settings, world_graph, worker_status
 from sherpa.ingest import worker as ingest_worker
 from sherpa.preview_service import build_preview
 from sherpa.routers.graph import _GRAPH_UNAVAILABLE_MESSAGE  # /ingest/preview も同じ固定文言で 503 にする。
@@ -94,22 +94,17 @@ def _fingerprint(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
 
 
-def _dispatch(wid: str, op: str, fingerprint: str, work_fn, *,
-             extra_registry_keys: tuple[str, ...] = (), initial_progress: dict | None = None) -> tuple[int, bool]:
-    """`background.start_or_join` へ委譲する共通ラッパー（登録/更新/削除/参照先変更/再取り込み等、world に触れる操作全般で共通）。
-    受付時に O(1) で `ingest_runs` 行を確保してから背景実行へ渡し、run_id を戻り値で返す。run 行は常に実際の `wid` に紐付ける。`extra_registry_keys` は多重クリック仲裁（`background._REGISTRY`）で `wid` に加えて登録する別名キー（`world_create` の未登録 root 分岐が `_NEW_WORLD_REGISTRY_KEY` を渡す）。
+def _dispatch(wid: str, op: str, fingerprint: str, payload: dict | None = None, *,
+             extra_registry_keys: tuple[str, ...] = (), initial_progress: dict | None = None,
+             created_by: str = "admin") -> tuple[int, bool]:
+    """`background.submit` へ委譲する共通ラッパー（登録/更新/削除/参照先変更/再取り込み等、world に触れる操作全般で共通）。
+    受付時に O(1) で `ingest_runs` へ `queued` の依頼（操作名＋`payload`）を積み、run_id を戻り値で返す。実行は取り込みワーカーが拾ってから始まる。run 行は常に実際の `wid` に紐付ける。`extra_registry_keys` は多重クリック仲裁で `wid` に加えて見る別名キー（`world_create` の未登録 root 分岐が `_NEW_WORLD_REGISTRY_KEY` を渡す）。
     `initial_progress` は受付時に run 行へ書く進捗（省略時は `_initial_progress()`）。
-    `work_fn(run_id)` は各操作の実処理。想定外の失敗は `background.start_or_join` の CAS セーフティネット（`store.fail_close_if_extracting`）が拾う。
-    実行中の run と `op`/`fingerprint` が不一致なら 409、シャットダウン処理中（`background.stop_accepting()` 済み）は 503。
+    同じ資料フォルダに queued／extracting の run があり `op`/`fingerprint` が不一致なら 409、終了処理中（`background.stop_accepting()` 済み）は 503。
     """
-    def _create_run() -> int:
-        row = store.start_ingest_run(wid, scan_root=None, created_by="admin",
-                                     progress=initial_progress or _initial_progress())
-        return row["id"]
-
     try:
-        return background.start_or_join(wid, op, fingerprint, _create_run, work_fn,
-                                        extra_keys=extra_registry_keys)
+        return background.submit(wid, op, fingerprint, payload, extra_keys=extra_registry_keys,
+                                 created_by=created_by, progress=initial_progress or _initial_progress())
     except background.ConflictError as exc:
         raise HTTPException(409, "別の処理が実行中です。しばらくしてからもう一度お試しください") from exc
     except background.ShuttingDownError as exc:
@@ -264,6 +259,8 @@ def _ingest_notices(rep: dict, flags_all: list, es_stage) -> list[dict]:
         _add("es_empty_text", by_reason.get("empty_text"))
         _add("es_embed_failed_bm25_only", 1 if es_stage.get("embed_degraded") is True else 0)
         _add("es_analyzer_fallback", 1 if es_stage.get("analyzer_fallback") is True else 0)
+        if es_stage.get("embed_degraded") is not True:   # 全部が未変換なら上の通知で足りる
+            _add("es_vectors_missing", es_stage.get("vectors_missing"))
     return out
 
 
@@ -273,7 +270,7 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     最終 ingest run の status と warn/blocked 理由も含める。`last_run_warnings` は reason 文字列のみの一覧で、対象ファイルが特定できる blocked flag は `last_run_blocked`（`doc`/`reason`）で別途通す。どちらも `extraction_snapshot.flags` を `_STATUS_FLAGS_LIMIT` 件で打ち切ってから導出し、`last_run_flags_total`/`last_run_flags_truncated` で打切りの有無を示す。
     `scanned`〜`unreadable` は `row["last_scan_report"]` を読むだけでフォルダを歩かない。graph/ES 件数も `graph_view()` や ES live `_count` は呼ばず、graph は最新の反映済み run（`store.get_latest_published_run_summary`）の `published_snapshot`、ES は別クエリ（`store.get_latest_es_run_summary`）の `extraction_snapshot.es` から読む（完了境界が異なり別々の run を指しうる）。`store.get_latest_run_summary` は `source_doc_ids` を含まない狭い SELECT（`last_run_status`/`last_run_warnings`/`failed_files`/`stage_summary` の由来）。DB 例外は捕捉せず呼び出し元へ伝播させる（全ゼロへ縮退しない）。キャッシュが無い world は全ゼロ＋`counts_as_of=None`（未集計・利用者が「再集計」を押すまで待つ）。
     `failed_files` は失敗の一覧（`world_failed_docs`）由来、`partial_extraction_suspected`/`stage_summary`（`stage_timings`/`counts` を含む）は最新 run の `extraction_snapshot` 由来（無ければ None）。`failure_reason_catalog`/`partial_extraction_advice` は静的な辞書（`sherpa.ingest.failure_reasons` が真実源）。
-    `last_run_id` は背景実行の受付応答の `run_id` と対応付ける。`running_progress` は実行中（`status='extracting'` かつ `progress` がある）時だけ `{stage, stage_label, done, total, updated_at}`（資料画面はこの間だけ数秒間隔でポーリングする）。
+    `last_run_id` は背景実行の受付応答の `run_id` と対応付ける。`running_progress` は実行中（`status` が `queued`／`extracting` かつ `progress` がある）時だけ `{stage, stage_label, done, total, updated_at}`（資料画面はこの間だけ数秒間隔でポーリングする）。
     """
     rep = row.get("last_scan_report")
     counts_as_of = row.get("last_scan_report_at")
@@ -326,7 +323,6 @@ def _ingest_summary(wid: str, row: dict) -> dict:
         graph_nodes = pub_snap.get("nodes") or 0
         graph_edges = pub_snap.get("edges") or 0
     es_chunks = None
-    es_notice_stage = None
     # graph（Neo4j）と ES は反映の完了境界が異なる（台帳 replace 失敗の run は Neo4j へは反映済みでも ES へは未到達）。`get_latest_published_run_summary` を ES にも使うと、実際に ES へ触れた直近の run を隠すため、ES 専用の別クエリ（`extraction_snapshot ? 'es'` で絞り込み済み）を使う。
     es_run = store.get_latest_es_run_summary(wid)
     if es_run:
@@ -336,14 +332,17 @@ def _ingest_summary(wid: str, row: dict) -> dict:
         # bulk 投入が実際に成功した（`available is True` かつ `error` 無し）ときだけ chunks を件数として見せる（不明なときは None＝UI「不明」表示）。
         if isinstance(pub_es, dict) and pub_es.get("available") is True and not pub_es.get("error"):
             es_chunks = _es_index_chunks(pub_es)
-            es_notice_stage = pub_es
-    # 実行中（`status='extracting'`）の run だけ進捗を載せる。`extracting` は `reflect=False`（staging・テスト専用経路）の成功時終端状態でもあるため、`progress` 自体の有無で最終判定する。
+    # 実行中（`status` が `queued`／`extracting`）の run だけ進捗を載せる。`extracting` は `reflect=False`（staging・テスト専用経路）の成功時終端状態でもあるため、`progress` 自体の有無で最終判定する。
     last_status = (last or {}).get("status")
-    running_progress = (last or {}).get("progress") if last_status == "extracting" else None
+    running_progress = (last or {}).get("progress") if last_status in ("queued", "extracting") else None
     running_progress = running_progress if isinstance(running_progress, dict) else None
     # 状態判定は「反映済みか」を問わない直近の ES 記録から（変更なしの再索引失敗も拾う）。
     es_attempts = store.get_recent_es_attempts(wid)
     es_state, es_error, es_index_kept = _es_reflect_state(es_attempts, running_progress)
+    # 通知（ベクトルの無いチャンクなど）は「今の ES の状態」を表す。足し直しだけで終わる更新は反映済みの印（`published_at`）を持たないので、
+    # 反映済みの run ではなく、ES へ触れた直近の成功の記録（足し直しの結果を含む）から読む。
+    es_notice_stage = next((a for a in es_attempts
+                            if a.get("available") is True and not a.get("error")), None)
     return {**rep, "counts_as_of": str(counts_as_of) if counts_as_of else None,
             "graph_nodes": graph_nodes, "graph_edges": graph_edges, "es_chunks": es_chunks,
             "es_state": es_state, "es_error": es_error, "es_index_kept": es_index_kept,
@@ -553,13 +552,10 @@ def world_create(req: WorldReq, request: Request):
 
     display_label = req.label or Path(root).name
 
-    def _work(run_id):
-        # `world_id=wid`（受付時に確定した値）・`root=root`（canonical・再解決しない）を使い、受付応答の判断に使った値と実際に登録される値を一致させる。
-        world_admin_service.register_or_rerun(req.path, label=req.label, world_id=wid,
-                                              root=root, run_id=run_id)
-
     fp = _fingerprint({"root": root, "label": display_label, "world_id": wid})
-    run_id, joined = _dispatch(wid, "register", fp, _work, extra_registry_keys=extra_registry_keys)
+    # `world_id=wid`（受付時に確定した値）・`root=root`（canonical・再解決しない）を渡し、受付応答の判断に使った値と実際に登録される値を一致させる。
+    run_id, joined = _dispatch(wid, "register", fp, {"path": req.path, "label": req.label, "root": root},
+                               extra_registry_keys=extra_registry_keys)
     return {"ok": True, "world_id": wid, "run_id": run_id, "joined": joined,
             "note": "既存の取り込みに合流しました。" if joined
                     else "受け付けました。状況は取り込み状況でご確認ください。"}
@@ -646,8 +642,7 @@ def world_resolve_settings_put(wid: str, req: ResolveSettingsReq, request: Reque
         # ② 「今すぐ更新」と同じ経路・同じ排他で取り込み直しを起こす。待機扱いは別の処理が実行中（409）だけ。
         # それ以外の失敗（受付停止の 503 など）は保存を取り消し、戻したことを監査に残して同じ状態コードを返す
         try:
-            _run_id, joined = _dispatch(wid, "refresh", _fingerprint({}),
-                                        lambda run_id: world_admin_service.refresh(wid, run_id=run_id))
+            _run_id, joined = _dispatch(wid, "refresh", _fingerprint({}))
             refresh_started = not joined
         except HTTPException as exc:
             if exc.status_code != 409:
@@ -684,8 +679,7 @@ def world_rebind(wid: str, req: RebindReq, request: Request):
         raise _world_admin_http_error(exc) from exc
 
     fp = _fingerprint({"path": req.path, "label": req.label})
-    run_id, joined = _dispatch(wid, "rebind", fp, lambda run_id: world_admin_service.rebind(
-        wid, req.path, label=req.label, run_id=run_id))
+    run_id, joined = _dispatch(wid, "rebind", fp, {"path": req.path, "label": req.label})
     return {"ok": True, "world_id": wid, "run_id": run_id, "joined": joined,
             "note": "既存の参照先変更処理に合流しました。" if joined
                     else "受け付けました。状況は取り込み状況でご確認ください。"}
@@ -700,38 +694,10 @@ def world_refresh(wid: str, request: Request):
         raise HTTPException(404, "資料フォルダが見つかりません")
 
     fp = _fingerprint({})
-    run_id, joined = _dispatch(wid, "refresh", fp,
-                               lambda run_id: world_admin_service.refresh(wid, run_id=run_id))
+    run_id, joined = _dispatch(wid, "refresh", fp)
     return {"ok": True, "world_id": wid, "run_id": run_id, "joined": joined,
             "note": "既存の更新に合流しました。" if joined
                     else "受け付けました。状況は取り込み状況でご確認ください。"}
-
-
-def _run_rag_regenerate_rules_background(wid: str, run_id: int) -> None:
-    """`world_rag_regenerate_rules` の背景実行本体。LLM 成形キャッシュの一掃・rag.md の規則版への作り直し・ES 反映を `ingest_worker.regenerate_rag_rule_only` へ委譲する（`store.world_lock` は同関数が確保し、`_run_locked` は経由しない）。"""
-    if not store.get_world(wid):
-        store.finish_ingest_run(run_id, status="failed", extraction_snapshot={
-            "flags": [{"doc": None, "action": "blocked", "reason": "world_not_found"}]})
-        return
-    if not worlds.world_dir(wid):
-        store.finish_ingest_run(run_id, status="failed", extraction_snapshot={
-            "flags": [{"doc": None, "action": "blocked", "reason": "world_dir_unreachable"}]})
-        return
-    try:
-        result = ingest_worker.regenerate_rag_rule_only(wid)
-    except Exception as e:
-        store.finish_ingest_run(run_id, status="failed", extraction_snapshot={
-            "flags": [{"doc": None, "action": "blocked",
-                      "reason": f"unexpected_error:{e.__class__.__name__}"}]})
-        _log.warning("規則版への再生成が想定外の例外で失敗しました: world=%s", wid, exc_info=True)
-        return
-    if result.get("status") == "ok":
-        store.finish_ingest_run(run_id, status="auto_published", extraction_snapshot={
-            "docs": result.get("rag_generated", 0)})
-    else:
-        store.finish_ingest_run(run_id, status="failed", extraction_snapshot={
-            "flags": [{"doc": None, "action": "blocked", "reason": str(result.get("status"))}],
-            "docs": result.get("rag_generated", 0)})
 
 
 @worlds_router.post("/worlds/{wid}/rag_regenerate_rules", tags=["資料フォルダ(World)管理"],
@@ -747,21 +713,10 @@ def world_rag_regenerate_rules(wid: str, request: Request):
         raise HTTPException(503, "参照元フォルダにアクセスできません")
 
     fp = _fingerprint({})
-    run_id, joined = _dispatch(wid, "rag_regenerate_rules", fp,
-                               lambda run_id: _run_rag_regenerate_rules_background(wid, run_id))
+    run_id, joined = _dispatch(wid, "rag_regenerate_rules", fp)
     return {"ok": True, "world_id": wid, "run_id": run_id, "joined": joined,
             "note": "既存の再生成に合流しました。" if joined
                     else "受け付けました。状況は取り込み状況でご確認ください。"}
-
-
-def _audit_reconvert(u: dict | None, action: str, wid: str, rel: str, *, outcome: str = "success") -> None:
-    """reconvert の pre/post 監査（best-effort・actor/world/rel/結果を記録）。"""
-    try:
-        store.audit(u["uid"] if u else None, action, "world", f"world:{wid}",
-                    detail={"world": wid, "rel": rel}, outcome=outcome)
-    except Exception:
-        _log.warning("reconvert 監査ログの記録に失敗しました（best-effort）: action=%s world=%s rel=%s",
-                     action, wid, rel, exc_info=True)
 
 
 @worlds_router.post("/worlds/{wid}/reconvert", tags=["資料フォルダ(World)管理"],
@@ -797,93 +752,12 @@ def world_reconvert(wid: str, req: ReconvertReq, request: Request):
     if req.rel not in failed:
         raise HTTPException(409, "失敗の一覧にない資料です。一覧を読み直してください")
 
-    def _work(run_id):
-        _audit_reconvert(u, "world.reconvert_requested", wid, req.rel)
-        outcome = "failure"
-        try:
-            res = ingest_worker.reconvert(wid, req.rel, run_id=run_id)
-            outcome = "failure" if res["status"] == "failed" else "success"
-        finally:
-            _audit_reconvert(u, "world.reconverted", wid, req.rel, outcome=outcome)
-
-    run_id, joined = _dispatch(wid, "reconvert", _fingerprint({"rel": req.rel}), _work,
+    run_id, joined = _dispatch(wid, "reconvert", _fingerprint({"rel": req.rel}),
+                               {"rel": req.rel, "uid": u["uid"] if u else None},
                                initial_progress={**_initial_progress(), "rel": req.rel})
     return {"ok": True, "world_id": wid, "run_id": run_id, "joined": joined,
             "note": "このファイルの再変換に合流しました。" if joined
                     else "受け付けました。このファイルだけを変換し直しています。"}
-
-
-def _notify_delete_terminal(wid: str, run_id: int, status: str) -> None:
-    """削除 run の terminal 化を Webhook 通知する（`_run_delete_background` の post-event 位置から呼ぶ・best-effort・削除自体の成否には影響させない）。`status` は `ingest_runs.status` と同じ語彙（"auto_published"|"failed"）。
-    呼び出し元は run の terminal 化（`finish_ingest_run*`）が実際に成功した場合だけ呼ぶ（通知内容と DB の状態を食い違わせない）。
-    """
-    try:
-        webhooks.notify_run_terminal(wid, run_id, "delete", status)
-    except Exception:
-        _log.warning("Webhook 通知の起動に失敗しました（削除自体は継続）: world=%s", wid, exc_info=True)
-
-
-def _run_delete_background(wid: str, u: dict | None, run_id: int) -> None:
-    """`world_delete` の背景実行本体（派生物 wipe＋レジストリ削除）。
-    world_lock は `world_admin_service.delete`→`worlds.delete` が内部で 1 回だけ取得する（ここで重ねて取らない）。`run_id` は受付時（`_dispatch`）に確保済み。進捗は「deleting」の 1 段のみ。
-    fail-closed: グラフ削除に失敗したら `world_admin_service.delete` が例外を投げ、world 行は残る。成功時は `world_admin_service.delete(run_id=run_id)` が world 行 DELETE と run 完了 UPDATE を同一トランザクションで確定する。失敗時はここで `finish_ingest_run` により run を理由付きで閉じる。post-event 監査（`world.deleted`）は実処理の成否が分かるここで行う（HTTP 応答は受付時点で返却済み）。
-    """
-    try:
-        store.update_ingest_run_progress(run_id, {
-            "stage": "deleting", "stage_label": ingest_worker.STAGE_LABELS["deleting"],
-            "done": None, "total": None,
-            "updated_at": datetime.now(timezone.utc).isoformat()})
-    except Exception:
-        _log.warning("進捗の記録に失敗しました（削除自体は継続）: world=%s stage=deleting", wid, exc_info=True)
-    uid = u["uid"] if u else None
-    try:
-        world_admin_service.delete(wid, run_id=run_id)
-    except world_admin_service.WorldAdminError as exc:  # グラフ削除失敗＝fail-closed（行は残す）。
-        # 通知は terminal 更新（`finish_ingest_run`）が実際に成功したときだけ行う（失敗なら run 行は `status='extracting'` のままで、`failed` を通知してはいけない）。
-        finished = False
-        try:
-            store.finish_ingest_run(
-                run_id, status="failed",
-                extraction_snapshot={"flags": [{"doc": None, "action": "blocked",
-                                                "reason": f"delete_failed:{exc.__class__.__name__}"}]})
-            finished = True
-        except Exception:
-            _log.warning("削除失敗の記録自体に失敗しました（best-effort）: world=%s", wid, exc_info=True)
-        try:
-            store.audit(uid, "world.deleted", "world", f"world:{wid}",
-                        outcome="failure", severity="critical", reason=exc.__class__.__name__)
-        except Exception:
-            pass
-        _log.warning("背景削除がグラフ削除失敗で中止しました（fail-closed・行は保持）: world=%s",
-                     wid, exc_info=True)
-        if finished:
-            _notify_delete_terminal(wid, run_id, "failed")
-        return
-    except Exception as e:
-        finished = False
-        try:
-            store.finish_ingest_run(
-                run_id, status="failed",
-                extraction_snapshot={"flags": [{"doc": None, "action": "blocked",
-                                                "reason": f"unexpected_error:{e.__class__.__name__}"}]})
-            finished = True
-        except Exception:
-            _log.warning("削除失敗の記録自体に失敗しました（best-effort）: world=%s", wid, exc_info=True)
-        try:
-            store.audit(uid, "world.deleted", "world", f"world:{wid}",
-                        outcome="failure", severity="critical", reason=e.__class__.__name__)
-        except Exception:
-            pass
-        _log.warning("背景削除が想定外の例外で失敗しました: world=%s", wid, exc_info=True)
-        if finished:
-            _notify_delete_terminal(wid, run_id, "failed")
-        return
-    # 成功: world 行の削除と run 完了は `world_admin_service.delete`（`worlds.delete` → `store.finish_ingest_run_and_delete_world`）が同一トランザクションで確定済み。
-    try:
-        store.audit(uid, "world.deleted", "world", f"world:{wid}", outcome="success", severity="critical")
-    except Exception:
-        pass
-    _notify_delete_terminal(wid, run_id, "auto_published")
 
 
 @worlds_router.delete("/worlds/{wid}", tags=["資料フォルダ(World)管理"],
@@ -907,8 +781,7 @@ def world_delete(wid: str, request: Request):
         raise HTTPException(500, "監査ログの記録に失敗しました（fail-closed・削除中止）")
 
     fp = _fingerprint({})
-    run_id, joined = _dispatch(wid, "delete", fp,
-                               lambda run_id: _run_delete_background(wid, u, run_id))
+    run_id, joined = _dispatch(wid, "delete", fp, {"uid": u["uid"] if u else None})
     return {"ok": True, "world_id": wid, "run_id": run_id, "joined": joined,
             "note": "既存の削除処理に合流しました。" if joined
                     else "受け付けました。削除が完了すると一覧から消えます。"}
@@ -927,10 +800,20 @@ def ingest_rerun(req: RerunReq, request: Request):
     if not valid_world(w):
         raise HTTPException(422, "不正な world ID")
     fp = _fingerprint({})
-    run_id, joined = _dispatch(w, "rerun", fp, lambda run_id: ingest_worker.rerun(w, run_id=run_id))
+    run_id, joined = _dispatch(w, "rerun", fp)
     return {"ok": True, "world_id": w, "run_id": run_id, "joined": joined,
             "note": "既存の再取り込みに合流しました。" if joined
                     else "受け付けました。状況は取り込み状況でご確認ください。"}
+
+
+@ingest_runs_router.get("/ingest/workers", tags=["資料フォルダ(World)管理"])
+def ingest_workers_status(request: Request):
+    """取り込みワーカーと Web アプリの版の照合（管理者のみ）。ワーカーが動いていない・版が違うときは `message` に画面に出すお知らせが入る。"""
+    _require_admin(_current_user(request))
+    try:
+        return worker_status.snapshot()
+    except Exception as e:
+        raise HTTPException(503, _INGEST_UNAVAILABLE_MESSAGE) from e
 
 
 @ingest_runs_router.get("/ingest/runs", tags=["資料フォルダ(World)管理"])
