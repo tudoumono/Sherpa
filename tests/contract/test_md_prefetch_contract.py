@@ -213,3 +213,107 @@ def test_worker_count_invalid_falls_back_to_default(monkeypatch, raw):
     assert 1 <= default <= 4
     monkeypatch.setenv("SHERPA_MD_WORKERS", "2")
     assert md_prefetch.worker_count() == 2
+
+
+def _plan_corpus(tmp_path: Path) -> Path:
+    src = tmp_path / "plansrc"
+    src.mkdir()
+    for i, name in enumerate(CORPUS):
+        for k in range(3):                                     # スレッドの取り合いが起きる件数にする
+            shutil.copy(FIXTURES / name, src / f"{i}_{k}_{Path(name).name}")
+    (src / "broken.docx").write_bytes(b"not a zip")
+    return src
+
+
+def _plan(src: Path, tmp_path: Path, threads: int, cache_hit=lambda rp, rel: None):
+    from sherpa.ingest import arms
+
+    memo: dict = {}
+    jobs = office_md._prefetch_jobs(
+        [(p, p.name) for p in sorted(src.iterdir())],
+        candidate=office_md.OFFICE_EXT | office_md.convertible_exts(), conv=office_md.convertible_exts(),
+        enabled=arms.enabled_arms(), cache_hit=cache_hit, obs_dir=None, assets_root=tmp_path / "rag",
+        threads=threads, precheck_memo=memo)
+    return jobs, memo
+
+
+def test_plan_threads_do_not_change_the_plan(tmp_path):
+    """計画（先読みの対象・順序・入口ガードの判定）はスレッド数に依らず同じ。"""
+    src = _plan_corpus(tmp_path)
+    hit = {p.name for p in src.iterdir() if p.name.startswith("3_1_")}
+
+    jobs1, memo1 = _plan(src, tmp_path, 1, cache_hit=lambda rp, rel: object() if rel in hit else None)
+    jobs8, memo8 = _plan(src, tmp_path, 8, cache_hit=lambda rp, rel: object() if rel in hit else None)
+
+    assert len(jobs1) > 10 and jobs8 == jobs1
+    assert memo8 == memo1
+    assert hit and not (hit & {j.rel for j in jobs1}) and not (hit & set(memo1))   # キャッシュに当たるものは確認しない
+    assert memo1["broken.docx"][1][0] == "ok"                  # 壊れた zip は測れない＝入口ガードは通し、変換側が失敗にする
+
+
+def test_cache_hit_skips_zip_and_xlsx_inspection(tmp_path, monkeypatch):
+    """変換キャッシュに当たるファイルは、zip を開く確認（非圧縮サイズ・セル数）をしない。"""
+    src = _plan_corpus(tmp_path)
+    opened = []
+    real = office_md._office_uncompressed_total_bytes
+    monkeypatch.setattr(office_md, "_office_uncompressed_total_bytes", lambda rp: opened.append(rp) or real(rp))
+
+    jobs, memo = _plan(src, tmp_path, 4, cache_hit=lambda rp, rel: object())
+
+    assert jobs == [] and memo == {} and opened == []
+
+
+def test_plan_threads_do_not_change_derived_bytes(tmp_path, monkeypatch, caplog):
+    """計画のスレッド数（1 と 8）を変えても、変換結果（派生ファイルと rep）は 1 バイトも変わらない。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    for name in CORPUS:
+        shutil.copy(FIXTURES / name, src / Path(name).name)
+    (src / "broken.docx").write_bytes(b"not a zip")
+
+    monkeypatch.setenv("SHERPA_MD_PLAN_THREADS", "1")
+    rep1, files1 = _build(src, tmp_path / "t1", 3, monkeypatch, caplog)
+    monkeypatch.setenv("SHERPA_MD_PLAN_THREADS", "8")
+    rep8, files8 = _build(src, tmp_path / "t8", 3, monkeypatch, caplog)
+
+    assert rep1["converted"] >= len(CORPUS) - 1 and rep1["failed"] >= 1
+    assert sorted(files8) == sorted(files1)
+    assert [k for k in files1 if files1[k] != files8[k]] == []
+    assert rep8 == rep1
+
+
+def test_stale_plan_is_not_used_when_source_changed(tmp_path, monkeypatch):
+    """計画の後に原本が変わったら、本体ループは計画の判定を使わず測り直す（stat が同じときだけ使う）。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-DOCX-HARD.docx", src / "a.docx")
+    shutil.copy(FIXTURES / "eval/office_ja/inputs/OJA-PPTX-HARD.pptx", src / "b.pptx")
+    monkeypatch.setenv("SHERPA_MD_WORKERS", "2")
+    real_jobs = office_md._prefetch_jobs
+
+    def _plan_then_grow(targets, **kw):
+        jobs = real_jobs(targets, **kw)
+        for rp, rel in targets:
+            if rel == "b.pptx":
+                rp.write_bytes(rp.read_bytes() + b"\0")        # 計画の後・本体ループの前に原本が変わる
+        return jobs
+
+    monkeypatch.setattr(office_md, "_prefetch_jobs", _plan_then_grow)
+    calls = []
+    real_pre = office_md._precheck_target
+    monkeypatch.setattr(office_md, "_precheck_target",
+                        lambda rp, ext, conv, *a: calls.append(Path(rp).name) or real_pre(rp, ext, conv, *a))
+
+    rep = office_md.build_derived(src, tmp_path / "out" / "md")
+
+    assert rep["converted"] == 2
+    assert calls.count("a.docx") == 1          # 変わっていない原本は、計画の判定を本体ループが使い回す
+    assert calls.count("b.pptx") == 2          # 変わった原本は、本体ループが測り直す
+
+
+def test_plan_threads_env_parse(monkeypatch):
+    monkeypatch.delenv("SHERPA_MD_PLAN_THREADS", raising=False)
+    assert md_prefetch.plan_threads() == 8
+    for raw, want in (("1", 1), ("32", 32), ("0", 8), ("33", 8), ("x", 8), ("", 8)):
+        monkeypatch.setenv("SHERPA_MD_PLAN_THREADS", raw)
+        assert md_prefetch.plan_threads() == want

@@ -339,7 +339,7 @@ def _prune_empty_ancestors(start: Path, stop: Path) -> None:
         cur = cur.parent
 
 
-def sync_world_archives(world_id: str, root: Path | None) -> dict:
+def sync_world_archives(world_id: str, root: Path | None, *, walk: scope_infer.WalkSnapshot | None = None) -> dict:
     """`root`（資料フォルダの原本）配下のアーカイブを展開先（`worlds.archives_dir(world_id)`）へ差分同期する。
 
     取り込みの都度呼ぶ。内容ハッシュ不変なら再展開しない。新規/更新は再展開して置き換え、消えたアーカイブは展開先ごと削除する。
@@ -349,6 +349,7 @@ def sync_world_archives(world_id: str, root: Path | None) -> dict:
     ② アーカイブの列挙は strict で行う。列挙が失敗したらこの回は何も変更せず前回の manifest を返す。
     ③ 個々の読み取り失敗（`OSError`）は「消えた」扱いにせず、前回の manifest 行を引き継いで `last_sync_error` を足す。
     ④ 展開は公開領域の外で行い、成功したときだけ入れ替える。
+    `walk`（同じ取り込みで走査済みの列挙）は、読めないものが無かったときだけ列挙に使う（strict の規律を変えない）。無ければ自分で歩く。
     """
     if root is None:
         return {}
@@ -369,7 +370,8 @@ def sync_world_archives(world_id: str, root: Path | None) -> dict:
 
     found: dict[str, Path] = {}
     try:
-        for rp, rel in scope_infer.safe_files(root, strict=True):
+        listed = walk.files_for(root, strict=True) if walk is not None else None
+        for rp, rel in (listed if listed is not None else scope_infer.safe_files(root, strict=True)):
             if archive_kind(rel) is not None and not text_kind.is_sensitive_doc_id(rel):
             # 秘匿名のアーカイブは展開しない（既存の展開先は下の削除伝播が後始末する）
                 found[rel] = rp

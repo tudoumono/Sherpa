@@ -1300,7 +1300,7 @@ WORLD_STATUS_RESP = {"ok": True, "world_id": "w1", "label": "4期更改", "root_
                      "es_state": "ok", "es_error": None, "es_index_kept": None,
                      "last_run_id": 500,
                      "last_run_status": "auto_published", "last_run_warnings": [], "last_run_blocked": [],
-                     "last_run_flags_total": 0, "last_run_flags_truncated": False,
+                     "last_run_interrupted": False, "last_run_flags_total": 0, "last_run_flags_truncated": False,
                      "failed_files": None, "partial_extraction_suspected": None, "stage_summary": None,
                      "running_progress": None,
                      "failure_reason_catalog": _FAILURE_REASON_CATALOG_MOCK,

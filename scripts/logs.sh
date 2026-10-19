@@ -206,7 +206,7 @@ _print_help() {
 
 アプリ側ログ（$LOG_DIR/*.log）と Docker ストアのログを1画面に合流して追います
 （-m を付けたときだけ [mem] 行＝メモリと主要プロセス RSS も出す）。名前を1つでも指定すると、
-指定していない側（アプリ/Docker）は出しません。
+指定していない側（アプリ/Docker）は出しません。名前を指定しないときは、日時付きの過去世代は出しません。
 
 オプション:
   -n N          追う前にまず末尾 N 行を表示（既定 20）
@@ -252,29 +252,36 @@ fi
 
 if [ ${#NAMES[@]} -gt 0 ] || [ ${#BAD_WORDS[@]} -gt 0 ]; then
   _resolve_list ${NAMES[@]+"${NAMES[@]}"} || exit 1
-  SEL_APP=("${RES_APP[@]}"); SEL_DOCKER=("${RES_DOCKER[@]}")
+  SEL_APP=(${RES_APP[@]+"${RES_APP[@]}"}); SEL_DOCKER=(${RES_DOCKER[@]+"${RES_DOCKER[@]}"})
 else
-  SEL_APP=("${APP_FILES[@]}")
+  # 名前を指定しないときは今のログだけ（日時付きの過去世代は名前で指定したときだけ出す）
+  SEL_APP=()
+  for f in ${APP_FILES[@]+"${APP_FILES[@]}"}; do
+    case "$(basename "$f" .log)" in
+      *-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+      *) SEL_APP+=("$f") ;;
+    esac
+  done
   if [ "$DOCKER_AVAILABLE" = 1 ]; then SEL_DOCKER=("${DOCKER_SERVICES[@]}"); else SEL_DOCKER=(); fi
 fi
 
 if [ ${#EXCLUDES[@]} -gt 0 ]; then
   _resolve_list "${EXCLUDES[@]}" || exit 1
-  EX_APP=("${RES_APP[@]}"); EX_DOCKER=("${RES_DOCKER[@]}")
+  EX_APP=(${RES_APP[@]+"${RES_APP[@]}"}); EX_DOCKER=(${RES_DOCKER[@]+"${RES_DOCKER[@]}"})
   NEW_APP=()
-  for f in "${SEL_APP[@]}"; do
+  for f in ${SEL_APP[@]+"${SEL_APP[@]}"}; do
     skip=0
-    for e in "${EX_APP[@]}"; do [ "$f" = "$e" ] && skip=1; done
+    for e in ${EX_APP[@]+"${EX_APP[@]}"}; do [ "$f" = "$e" ] && skip=1; done
     [ $skip -eq 0 ] && NEW_APP+=("$f")
   done
-  SEL_APP=("${NEW_APP[@]}")
+  SEL_APP=(${NEW_APP[@]+"${NEW_APP[@]}"})
   NEW_DOCKER=()
-  for s in "${SEL_DOCKER[@]}"; do
+  for s in ${SEL_DOCKER[@]+"${SEL_DOCKER[@]}"}; do
     skip=0
-    for e in "${EX_DOCKER[@]}"; do [ "$s" = "$e" ] && skip=1; done
+    for e in ${EX_DOCKER[@]+"${EX_DOCKER[@]}"}; do [ "$s" = "$e" ] && skip=1; done
     [ $skip -eq 0 ] && NEW_DOCKER+=("$s")
   done
-  SEL_DOCKER=("${NEW_DOCKER[@]}")
+  SEL_DOCKER=(${NEW_DOCKER[@]+"${NEW_DOCKER[@]}"})
 fi
 
 if [ ${#SEL_APP[@]} -eq 0 ] && [ ${#SEL_DOCKER[@]} -eq 0 ]; then
@@ -295,7 +302,7 @@ if [ "$REPORT" = 1 ]; then
   PYBIN="python3"
   [ -x "$ROOT/.venv/bin/python" ] && PYBIN="$ROOT/.venv/bin/python"
   REPORT_NAMES=()
-  for f in "${SEL_APP[@]}"; do REPORT_NAMES+=("$(basename "$f" .log)"); done
+  for f in ${SEL_APP[@]+"${SEL_APP[@]}"}; do REPORT_NAMES+=("$(basename "$f" .log)"); done
   ARGS_R=(--log-dir "$LOG_DIR")
   [ "$REPORT_ALL" = 1 ] && ARGS_R+=(--all)
   exec "$PYBIN" "$ROOT/scripts/log_report.py" "${ARGS_R[@]}" "${REPORT_NAMES[@]}"
@@ -304,12 +311,12 @@ fi
 # ---- -l/--list: 追わずに一覧・末尾だけ表示して終了 ----
 
 if [ "$LIST" = 1 ]; then
-  for f in "${SEL_APP[@]}"; do
+  for f in ${SEL_APP[@]+"${SEL_APP[@]}"}; do
     printf '\n\033[1m== %s（%s・%s行）==\033[0m\n' "$f" "$(du -h "$f" | cut -f1)" "$(wc -l < "$f")"
     tail -n 5 "$f"
   done
   if [ ${#SEL_DOCKER[@]} -gt 0 ]; then
-    for s in "${SEL_DOCKER[@]}"; do
+    for s in ${SEL_DOCKER[@]+"${SEL_DOCKER[@]}"}; do
       printf '\n\033[1m== docker:%s ==\033[0m\n' "$s"
       sherpa_compose logs --no-color --tail=5 "$s" 2>&1 || echo "（取得できません）"
     done
@@ -385,11 +392,11 @@ fi
 mkfifo "$FIFO"
 
 if [ ${#SEL_APP[@]} -gt 0 ]; then
-  tail -n "$LINES" -F "${SEL_APP[@]}" > "$FIFO" 2>/dev/null &
+  tail -n "$LINES" -F ${SEL_APP[@]+"${SEL_APP[@]}"} > "$FIFO" 2>/dev/null &
   TAIL_PID=$!
 fi
 if [ ${#SEL_DOCKER[@]} -gt 0 ] && [ "$DOCKER_AVAILABLE" = 1 ]; then
-  sherpa_compose logs -f --tail="$LINES" "${SEL_DOCKER[@]}" > "$FIFO" 2>&1 &
+  sherpa_compose logs -f --tail="$LINES" ${SEL_DOCKER[@]+"${SEL_DOCKER[@]}"} > "$FIFO" 2>&1 &
   DOCKER_PID=$!
 fi
 

@@ -1461,6 +1461,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     engine = PaddleProcessSupervisor(args.paddle_cache)
     current, load_ir, resolve_source, resolve_assets, generation_root, publisher = _runtime_callbacks()
+    last_printed: str | None = None
     try:
         while not stopping.is_set():
             result = run_once(
@@ -1472,7 +1473,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not stopping.is_set():
                 heartbeat("idle")
-            print(_canonical(asdict(result)), flush=True)
+            # 待機（idle）は続く間に 1 回だけ出す
+            if result.status != "idle" or last_printed != "idle":
+                print(_canonical(asdict(result)), flush=True)
+                last_printed = result.status
             if result.status != "idle" and args.once:
                 return 0 if result.status not in {"failed", "publish_failed"} else 1
             if result.status == "idle":
@@ -1490,6 +1494,7 @@ def main(argv: list[str] | None = None) -> int:
                     if not stopping.is_set():
                         heartbeat("idle")
                     print(_canonical(asdict(refresh_result)), flush=True)
+                    last_printed = refresh_result.status
                     if args.once:
                         return 0 if refresh_result.status != "failed" else 1
                     continue

@@ -378,6 +378,8 @@ function summaryNote(s, wid) {
     dangers.push(warns.includes('reconvert_needs_full_run')
       ? '前回の再変換はできませんでした。「今すぐ更新」で資料フォルダを取り込み直してから、もう一度お試しください'
       : '前回の再変換は終わりませんでした。理由は「詳細を表示」の失敗の一覧に出ています（「再変換」でやり直せます）');
+  } else if (s.last_run_status === 'failed' && s.last_run_interrupted) {
+    hints.push('前回の取り込みは停止のため途中で止まりました（起動後に自動で続きから始まります／始まっていないときは「今すぐ更新」を押してください）');
   } else if (s.last_run_status === 'failed') {
     // `failed` は派生物の公開後（グラフ反映・台帳更新等）の失敗も含みうるため、「検索は前回成功時点のまま」とは断定しない。
     dangers.push('前回の取り込みは失敗しました（次回の取り込みで自動的に再試行されます）');

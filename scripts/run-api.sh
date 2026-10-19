@@ -92,4 +92,5 @@ exec "$PYTHON_BIN" -m uvicorn "$APP" \
   --host "$HOST" \
   --port "$PORT" \
   --workers "$WORKERS" \
+  --timeout-graceful-shutdown "${SHERPA_UVICORN_GRACEFUL_SEC:-10}" \
   "$@"

@@ -7,16 +7,18 @@ OOXML の ``<v>`` を原値の権威、openpyxl の型変換結果を型付き�
 """
 from __future__ import annotations
 
-import gc
 import posixpath
 import re
 import zipfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .gc_relax import relaxed_gc
 from .ooxml import excel as _ooxml_excel
 from xml.etree import ElementTree as ET
 
@@ -142,9 +144,21 @@ def _raw_from_cell(cell: ET.Element, shared: list[str]) -> Any:
     return _number_or_text(raw)
 
 
-def _raw_cells(path: Path, targets: dict[str, set[str]]) -> dict[tuple[str, str], dict[str, Any]]:
-    """対象座標だけを worksheet XML から stream 抽出する。"""
-    out: dict[tuple[str, str], dict[str, Any]] = {}
+_CELL_TAG = f"{_MAIN}c"
+_FORMULA_TAG = f"{_MAIN}f"
+_VALUE_TAG = f"{_MAIN}v"
+
+
+def _raw_cells(
+    path: Path,
+    targets: dict[str, set[str]],
+    unaddressed: set[str] | None = None,
+) -> dict[tuple[str, str], tuple[Any, str | None, bool]]:
+    """対象座標だけを worksheet XML から stream 抽出する。値は ``(原値, 数式, キャッシュ有無)``。
+
+    `unaddressed` を渡すと、座標（`r`）の無いセルを持つシート名をそこへ足す（そのセルは座標で引けない）。
+    """
+    out: dict[tuple[str, str], tuple[Any, str | None, bool]] = {}
     with zipfile.ZipFile(path) as archive:
         parts = _sheet_parts(archive)
         shared = _shared_strings(archive)
@@ -155,18 +169,20 @@ def _raw_cells(path: Path, targets: dict[str, set[str]]) -> dict[tuple[str, str]
                 continue
             with archive.open(part) as stream:
                 for _event, cell in ET.iterparse(stream, events=("end",)):
-                    if cell.tag != f"{_MAIN}c":
+                    if cell.tag != _CELL_TAG:
                         continue
                     coordinate = cell.get("r", "").upper()
+                    if not coordinate and unaddressed is not None:
+                        unaddressed.add(sheet_name)
                     if coordinate in wanted:
-                        formula_node = cell.find(f"{_MAIN}f")
-                        value_node = cell.find(f"{_MAIN}v")
+                        formula_node = cell.find(_FORMULA_TAG)
+                        value_node = cell.find(_VALUE_TAG)
                         formula = None if formula_node is None else f"={formula_node.text or ''}"
-                        out[(sheet_name, coordinate)] = {
-                            "raw_value": _raw_from_cell(cell, shared),
-                            "formula": formula,
-                            "has_cache": value_node is not None and value_node.text not in (None, ""),
-                        }
+                        out[(sheet_name, coordinate)] = (
+                            _raw_from_cell(cell, shared),
+                            formula,
+                            value_node is not None and value_node.text not in (None, ""),
+                        )
                     cell.clear()
     return out
 
@@ -262,6 +278,7 @@ def _format_decimal(value: int | float, code: str) -> str | None:
     return prefix + rendered + suffix
 
 
+@lru_cache(maxsize=512)
 def _date_tokens(code: str) -> list[tuple[str, bool]] | None:
     """(text, is_token) 列へ分解する。quote/escape は literal に確定する。"""
     out: list[tuple[str, bool]] = []
@@ -336,6 +353,18 @@ def _format_date(value: date | datetime | time, code: str) -> str | None:
     return "".join(rendered)
 
 
+@lru_cache(maxsize=512)
+def _format_code(number_format: str | None) -> tuple[str, str]:
+    """表示形式を ``("multi_section", "")``・``("general", "")``・``("code", 書式コード)`` に分類する。"""
+    sections = _split_sections(number_format or "General")
+    if len(sections) != 1:
+        return "multi_section", ""
+    code = sections[0].strip() or "General"
+    if code.casefold() == "general":
+        return "general", ""
+    return "code", code
+
+
 def format_display(value: Any, number_format: str, *, formula_cache_missing: bool = False) -> DisplayResult:
     """主要な Excel 書式だけを表示し、未対応は推測しない。"""
     if formula_cache_missing:
@@ -347,11 +376,10 @@ def format_display(value: Any, number_format: str, *, formula_cache_missing: boo
     if isinstance(value, bool):
         return DisplayResult("TRUE" if value else "FALSE", EXCEL_DISPLAY_PROFILE, "rendered", None)
 
-    sections = _split_sections(number_format or "General")
-    if len(sections) != 1:
+    kind, code = _format_code(number_format)
+    if kind == "multi_section":
         return DisplayResult(None, EXCEL_DISPLAY_PROFILE, "unsupported", "multi_section_format")
-    code = sections[0].strip() or "General"
-    if code.casefold() == "general":
+    if kind == "general":
         return DisplayResult(str(_json_scalar(value)), "raw_value", "rendered", None)
     if isinstance(value, (datetime, date, time)):
         rendered = _format_date(value, code)
@@ -364,89 +392,116 @@ def format_display(value: Any, number_format: str, *, formula_cache_missing: boo
     return DisplayResult(None, EXCEL_DISPLAY_PROFILE, "unsupported", "unsupported_value_type")
 
 
-def extract_cell_metadata(path: str | Path, targets: dict[str, set[str]]) -> dict[tuple[str, str], dict[str, Any]]:
-    """対象セルの 10 項目契約を返す。targets は ``{sheet: {A1, ...}}``。
-
-    ① OOXML から原値・数式を読む ② 数式ブック（data_only=False）を読んで閉じる
-    ③ 値ブック（data_only=True）を読んで表示値を決める。2 冊を同時に開かない（メモリのピーク抑制）。
-    """
+def _formula_book_values(
+    source: Path,
+    wanted: dict[str, set[tuple[int, int]]],
+) -> dict[tuple[str, int, int], Any]:
+    """数式ブック（data_only=False・読み取り専用）から、指定セルの値（数式の復元結果）だけを読む。"""
     import openpyxl
 
+    found: dict[tuple[str, int, int], Any] = {}
+    workbook = openpyxl.load_workbook(source, data_only=False, read_only=True, keep_links=False)
+    try:
+        for sheet_name, positions in wanted.items():
+            if sheet_name not in workbook.sheetnames:
+                continue
+            first_row = min(row for row, _ in positions)
+            last_row = max(row for row, _ in positions)
+            last_column = max(column for _, column in positions)
+            by_row: dict[int, list[int]] = {}
+            for row, column in positions:
+                by_row.setdefault(row, []).append(column)
+            for offset, values in enumerate(
+                    workbook[sheet_name].iter_rows(
+                        min_row=first_row, max_row=last_row, min_col=1, max_col=last_column, values_only=True)):
+                columns = by_row.get(first_row + offset)
+                if not columns:
+                    continue
+                for column in columns:
+                    found[(sheet_name, first_row + offset, column)] = values[column - 1] if column <= len(values) else None
+    finally:
+        workbook.close()
+    return found
+
+
+_COORDINATE_RE = re.compile(r"([A-Z]+)([0-9]+)")
+_COLUMN_INDEX: dict[str, int] = {}
+
+
+def _cell_position(coordinate: str) -> tuple[int, int]:
+    """検証済みの A1 形式の座標を (行, 列) にする。"""
+    match = _COORDINATE_RE.fullmatch(coordinate)
+    assert match is not None
+    letters = match.group(1)
+    column = _COLUMN_INDEX.get(letters)
+    if column is None:
+        from openpyxl.utils import column_index_from_string
+        column = _COLUMN_INDEX[letters] = column_index_from_string(letters)
+    return int(match.group(2)), column
+
+
+def _iter_cell_metadata(
+    path: str | Path, targets: dict[str, set[str]],
+) -> Iterator[tuple[tuple[str, str], dict[str, Any]]]:
+    """`extract_cell_metadata` と同じ内容を、セルごとに（シート名・座標の昇順で）返す。全セル分の辞書を持たずに済む。"""
     source = Path(path)
     normalized_targets = {
         sheet: {coordinate.upper() for coordinate in coordinates if _CELL_REF_RE.fullmatch(coordinate.upper())}
         for sheet, coordinates in targets.items()
     }
-    raw = _raw_cells(source, normalized_targets)
+    unaddressed: set[str] = set()
+    raw = _raw_cells(source, normalized_targets, unaddressed)
 
-    def _load_formula_pass() -> dict[tuple[str, str], dict[str, Any]]:
-        """第 1 パス（数式ブック）: セルごとに必要な情報だけを中間 dict へ抽出してから閉じる。
-
-        Workbook を参照するローカル変数をこの関数の中に閉じ込め、戻った時点で GC が回収できるようにする。
-        """
-        intermediate: dict[tuple[str, str], dict[str, Any]] = {}
-        wb_formula = _ooxml_excel.load_workbook_fast(source, data_only=False, read_only=False, keep_links=False)
-        try:
-            for sheet_name in sorted(normalized_targets):
-                if sheet_name not in wb_formula.sheetnames:
-                    continue
-                formula_sheet = wb_formula[sheet_name]
-                for coordinate in sorted(normalized_targets[sheet_name]):
-                    formula_cell = formula_sheet[coordinate]
-                    xml = raw.get((sheet_name, coordinate), {})
-                    formula = xml.get("formula")
-                    # shared formula の follower は XML 直読だと式が単独の ``=`` になるため、openpyxl が復元した式で補う
-                    if (formula in {None, "="} and isinstance(formula_cell.value, str)
-                            and formula_cell.value.startswith("=")):
-                        formula = formula_cell.value
-                    has_cache = bool(xml.get("has_cache")) if formula else False
-                    intermediate[(sheet_name, coordinate)] = {
-                        "raw_value": xml.get("raw_value", _json_scalar(formula_cell.value)),
-                        "formula": formula,
-                        "has_cache": has_cache,
-                        "style_id": int(formula_cell.style_id),
-                        "number_format": formula_cell.number_format or "General",
-                        "formula_cell_value": formula_cell.value,
-                    }
-        finally:
-            wb_formula.close()
-        return intermediate
-
-    intermediate = _load_formula_pass()
-    # Workbook は循環参照を持つため、第 2 パスの前に GC を回して常に 1 冊だけ生かす
-    gc.collect()
-
-    # 第 2 パス（値ブック）: 数式セルの再計算値を取り、第 1 パスの中間 dict と合流する
-    out: dict[tuple[str, str], dict[str, Any]] = {}
     wb_values = _ooxml_excel.load_workbook_fast(source, data_only=True, read_only=False, keep_links=False)
     try:
+        # ① 式の復元に数式ブックが要るセル（共有数式の従属セル・座標の無いセルを持つシートで XML に見つからないセル）
+        needs_formula_value: dict[str, set[tuple[int, int]]] = {}
+        for sheet_name, coordinates in normalized_targets.items():
+            if sheet_name not in wb_values.sheetnames:
+                continue
+            for coordinate in coordinates:
+                entry = raw.get((sheet_name, coordinate))
+                if (entry is not None and entry[1] == "=") or (entry is None and sheet_name in unaddressed):
+                    needs_formula_value.setdefault(sheet_name, set()).add(_cell_position(coordinate))
+        formula_values = _formula_book_values(source, needs_formula_value) if needs_formula_value else {}
+
+        # ② セルごとに、書式と表示値を決める
         for sheet_name in sorted(normalized_targets):
             if sheet_name not in wb_values.sheetnames:
                 continue
             values_sheet = wb_values[sheet_name]
             for coordinate in sorted(normalized_targets[sheet_name]):
                 key = (sheet_name, coordinate)
-                mid = intermediate.get(key)
-                if mid is None:
-                    continue
-                formula = mid["formula"]
-                has_cache = mid["has_cache"]
-                values_cell = values_sheet[coordinate]
-                semantic_value = values_cell.value if formula else mid["formula_cell_value"]
+                row, column = _cell_position(coordinate)
+                values_cell = values_sheet.cell(row=row, column=column)
+                entry = raw.get(key)
+                formula = None if entry is None else entry[1]
+                if entry is not None and formula != "=":
+                    formula_cell_value = values_cell.value
+                else:
+                    formula_cell_value = formula_values.get((sheet_name, row, column), values_cell.value)
+                # shared formula の follower は XML 直読だと式が単独の ``=`` になるため、openpyxl が復元した式で補う
+                if (formula in {None, "="} and isinstance(formula_cell_value, str)
+                        and formula_cell_value.startswith("=")):
+                    formula = formula_cell_value
+                has_cache = bool(entry is not None and entry[2]) if formula else False
+                raw_value = _json_scalar(formula_cell_value) if entry is None else entry[0]
+                number_format = values_cell.number_format or "General"
+                semantic_value = values_cell.value if formula else formula_cell_value
                 calculation_status = "cached" if formula and has_cache else "cache_missing" if formula else "not_formula"
                 display = format_display(
                     semantic_value,
-                    mid["number_format"],
+                    number_format,
                     formula_cache_missing=bool(formula and not has_cache),
                 )
-                out[key] = {
-                    "raw_value": mid["raw_value"],
+                yield key, {
+                    "raw_value": raw_value,
                     "typed_value": _typed_value(semantic_value),
                     "formula": formula,
                     "cached_value": _json_scalar(values_cell.value) if formula and has_cache else None,
                     "calculation_status": calculation_status,
-                    "style_id": mid["style_id"],
-                    "number_format": mid["number_format"],
+                    "style_id": int(values_cell.style_id),
+                    "number_format": number_format,
                     "display_value": display.value,
                     "display_source": display.source,
                     "display_status": display.status,
@@ -454,9 +509,19 @@ def extract_cell_metadata(path: str | Path, targets: dict[str, set[str]]) -> dic
                 }
     finally:
         wb_values.close()
-    return out
 
 
+def extract_cell_metadata(path: str | Path, targets: dict[str, set[str]]) -> dict[tuple[str, str], dict[str, Any]]:
+    """対象セルの 10 項目契約を返す。targets は ``{sheet: {A1, ...}}``。
+
+    ① OOXML から原値・数式を読む ② 値ブック（data_only=True）を 1 冊だけ読み、書式・型付き値・表示値を決める。
+    数式ブック（data_only=False）が要るのは、OOXML 直読で式が空の共有数式の従属セルと、座標の無いセルを持つシートの未解決セルだけで、
+    その値だけを読み取り専用で読む（式の無いセルの値は 2 冊で同じ）。
+    """
+    return dict(_iter_cell_metadata(path, targets))
+
+
+@relaxed_gc
 def enrich_evidence(ir, path: str | Path) -> None:
     """XLSX Evidence の cell/formula extension へ表示契約を in-place で追加する。"""
     targets: dict[str, set[str]] = {}
@@ -471,7 +536,6 @@ def enrich_evidence(ir, path: str | Path) -> None:
         elements.append((element, coordinate))
     if not elements:
         return
-    metadata = extract_cell_metadata(path, targets)
     missing = {
         "raw_value": None,
         "typed_value": {"type": "blank", "value": None},
@@ -485,5 +549,13 @@ def enrich_evidence(ir, path: str | Path) -> None:
         "display_status": "unsupported",
         "display_reason": "cell_not_found",
     }
+    waiting: dict[tuple[str, str], list] = {}
     for element, coordinate in elements:
-        element.extension.update(metadata.get((element.locator.sheet, coordinate), missing))
+        waiting.setdefault((element.locator.sheet, coordinate), []).append(element)
+    del elements
+    for key, metadata in _iter_cell_metadata(path, targets):
+        for element in waiting.pop(key, ()):
+            element.extension.update(metadata)
+    for waiting_elements in waiting.values():                    # 値ブックに見つからなかったセル
+        for element in waiting_elements:
+            element.extension.update(missing)

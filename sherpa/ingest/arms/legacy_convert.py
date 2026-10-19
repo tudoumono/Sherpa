@@ -28,6 +28,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from sherpa import json_io
+
 # 専用ログ（sherpa.convert.libreoffice）へルーティングする（`sherpa/log_setup.py` の登録表参照）。office_com（http/direct）のログも同じ系統に乗る。
 _log = logging.getLogger("sherpa.convert.libreoffice")
 
@@ -1114,6 +1116,39 @@ Sub ConvertXlsx(sIn As String, sOut As String)
   doc.storeToURL(ConvertToURL(sOut), b())
   doc.close(True)
 End Sub
+
+Function ConvertOne(sIn As String, sOut As String) As Boolean
+  Dim a(0) As New com.sun.star.beans.PropertyValue
+  Dim b(0) As New com.sun.star.beans.PropertyValue
+  Dim doc As Object
+  On Error GoTo Failed
+  a(0).Name = "Hidden" : a(0).Value = True
+  doc = StarDesktop.loadComponentFromURL(ConvertToURL(sIn), "_blank", 0, a())
+  doc.enableAutomaticCalculation(False)
+  b(0).Name = "FilterName" : b(0).Value = "Calc MS Excel 2007 XML"
+  doc.storeToURL(ConvertToURL(sOut), b())
+  doc.close(True)
+  ConvertOne = True
+  Exit Function
+Failed:
+  On Error Resume Next
+  If Not IsEmpty(doc) Then
+    If Not IsNull(doc) Then doc.close(True)
+  End If
+  ConvertOne = False
+End Function
+
+Sub ConvertXlsxBatch(sDir As String, sOutDir As String)
+  Dim i As Long
+  i = 0
+  Do While FileExists(sDir &amp; "/" &amp; i &amp; ".xls")
+    If ConvertOne(sDir &amp; "/" &amp; i &amp; ".xls", sOutDir &amp; "/" &amp; i &amp; ".xlsx") Then
+      Open sOutDir &amp; "/" &amp; i &amp; ".ok" For Output As #1
+      Close #1
+    End If
+    i = i + 1
+  Loop
+End Sub
 </script:module>
 """
 
@@ -1130,13 +1165,33 @@ def _convert_xls_keep_values(bin_path: str, src: Path, profile: str, outdir: str
     link = Path(outdir) / "src.xls"
     try:
         module.write_text(_KEEP_VALUES_MODULE, encoding="utf-8")
-        link.symlink_to(Path(src).resolve())
+        shutil.copyfile(src, link)
     except OSError:
         return False
     target = Path(outdir) / "out.xlsx"
     cmd = [bin_path, "--headless", "--norestore", f"-env:UserInstallation={uri}",
            f'macro:///Standard.Module1.ConvertXlsx("{link}","{target}")']
     return _run_soffice(cmd, src) and target.is_file()
+
+
+def _convert_xls_keep_values_batch(bin_path: str, work: str, profile: str, outdir: str, label: str,
+                                   timeout: float, tracker: "SofficeTracker") -> None:
+    """`work/{i}.xls`（i=0,1,…）を、保存値を再計算せず `outdir/{i}.xlsx` へまとめて変換する。1 件ごとに成功したものだけ `outdir/{i}.ok` を残す。
+
+    ① プロファイルを 1 回初期化 ② マクロを差し込む ③ マクロ 1 回の起動で全件を順に変換する。呼び出し側は `.ok` のあるものだけを採る（途中で止まっても済んだ分は使える）。
+    """
+    uri = Path(profile).as_uri()
+    if not _run_soffice([bin_path, "--headless", "--terminate_after_init", f"-env:UserInstallation={uri}"],
+                        label, timeout=timeout, quiet=True, tracker=tracker):
+        return
+    module = Path(profile) / "user" / "basic" / "Standard" / "Module1.xba"
+    try:
+        module.write_text(_KEEP_VALUES_MODULE, encoding="utf-8")
+    except OSError:
+        return
+    cmd = [bin_path, "--headless", "--norestore", f"-env:UserInstallation={uri}",
+           f'macro:///Standard.Module1.ConvertXlsxBatch("{work}","{outdir}")']
+    _run_soffice(cmd, label, timeout=timeout, quiet=True, tracker=tracker)
 
 
 def _convert_libreoffice(src: Path, target_ext: str) -> bytes | None:
@@ -1195,26 +1250,67 @@ def render_metafile_png(data: bytes, kind: str) -> tuple[bytes | None, str | Non
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _run_soffice(cmd: list[str], src: Path) -> bool:
+class SofficeTracker:
+    """先変換が起動した soffice を覚えておき、`kill_all()` で（プロセスグループごと）止める。止めた後に起動しようとしたものは起動しない。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._procs: set[subprocess.Popen] = set()
+        self._closed = False
+
+    def add(self, proc: subprocess.Popen) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            self._procs.add(proc)
+            return True
+
+    def discard(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._procs.discard(proc)
+
+    def kill_all(self) -> None:
+        with self._lock:
+            self._closed = True
+            procs = list(self._procs)
+        for proc in procs:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def _run_soffice(cmd: list[str], src, *, timeout: float | None = None, quiet: bool = False,
+                 tracker: SofficeTracker | None = None) -> bool:
     """soffice を実行し成功/失敗を返す。タイムアウト/非0終了/起動失敗はすべて False。
 
     `subprocess.run(timeout=)` は直接の子しか kill せず、soffice は wrapper→`soffice.bin` の多段起動のため孫が残る。`start_new_session=True`（独立プロセスグループ）＋タイムアウト時 `os.killpg(...,SIGKILL)` でグループ全体を停止する。
+    `quiet`（先変換）は失敗を警告にも失敗理由（`take_conversion_failure_reason`）にも残さない＝本体ループの 1 件変換が同じ失敗を改めて報告する。`timeout` 省略は 1 件分（`_timeout_sec()`）。
     """
+    limit = _timeout_sec() if timeout is None else timeout
+    note = _log.debug if quiet else _log.warning
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 start_new_session=True)
     except OSError as e:
-        _log.warning("legacy 変換を実行できませんでした（%s）: %s", e.__class__.__name__, src)
+        note("legacy 変換を実行できませんでした（%s）: %s", e.__class__.__name__, src)
+        return False
+    if tracker is not None and not tracker.add(proc):
+        _kill_process_group(proc)
         return False
     try:
-        proc.communicate(timeout=_timeout_sec())
+        proc.communicate(timeout=limit)
     except subprocess.TimeoutExpired:
-        _log.warning("legacy 変換がタイムアウトしました（%ss）: %s", _timeout_sec(), src)
+        note("legacy 変換がタイムアウトしました（%ss）: %s", limit, src)
         _kill_process_group(proc)
-        _note_conversion_failure_reason("timeout")
+        if not quiet:
+            _note_conversion_failure_reason("timeout")
         return False
+    finally:
+        if tracker is not None:
+            tracker.discard(proc)
     if proc.returncode != 0:
-        _log.warning("legacy 変換が異常終了しました（rc=%s）: %s", proc.returncode, src)
+        note("legacy 変換が異常終了しました（rc=%s）: %s", proc.returncode, src)
         return False
     return True
 
@@ -1280,22 +1376,34 @@ def ensure_ooxml(src, rel: str, cache_root):
     except OSError:
         return None
     # キャッシュヒット（原本 unchanged）＝再変換しない。
-    if cache_path.is_file() and key_path.is_file():
-        try:
-            if key_path.read_text(encoding="utf-8").strip() == want:
-                return cache_path, _notes()
-        except OSError:
-            pass
+    if cache_valid(cache_path, key_path, want):
+        return cache_path, _notes()
     data = convert_to_ooxml(src, target_ext)
     if data is None:
         return None
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_bytes(data)
-        key_path.write_text(want, encoding="utf-8")
-    except OSError:
+    if not store_cache(cache_path, key_path, data, want):
         return None
     return cache_path, _notes()
+
+
+def cache_valid(cache_path: Path, key_path: Path, want: str) -> bool:
+    """変換キャッシュが原本の鍵（`_source_key`）と一致するか。"""
+    if not (cache_path.is_file() and key_path.is_file()):
+        return False
+    try:
+        return key_path.read_text(encoding="utf-8").strip() == want
+    except OSError:
+        return False
+
+
+def store_cache(cache_path: Path, key_path: Path, data: bytes, want: str) -> bool:
+    """変換結果→鍵の順に差し替え方式で書く（鍵が見えるときは必ず対応する中身がある）。書けなければ False。"""
+    try:
+        json_io.write_bytes_atomic(cache_path, data)
+        json_io.write_text_atomic(key_path, want)
+    except OSError:
+        return False
+    return True
 
 
 def drop_cache_entry(cache_root, rel: str) -> bool:

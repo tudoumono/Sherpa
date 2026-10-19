@@ -16,6 +16,8 @@ from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..env_int import env_int
+
 _log = logging.getLogger("sherpa.ingest.convert")   # 変換ログ（make logs convert）と同じ名前
 
 PREFETCH_ARMS = ("ooxml", "pdf_text")
@@ -36,12 +38,18 @@ def worker_count() -> int:
     return n if 1 <= n <= _MAX_WORKERS else default
 
 
+def plan_threads() -> int:
+    """先読みの対象の確認（キャッシュ照合・入口ガード・重さ）を並列にするスレッド数。env `SHERPA_MD_PLAN_THREADS`（1〜32・1 で直列）。未設定・不正値は 8。"""
+    return env_int("SHERPA_MD_PLAN_THREADS", 8, 1, 32)
+
+
 @dataclass(frozen=True)
 class Job:
     """先読み 1 件（原本 rel・原本の絶対パス・担当アーム名・拡張子）。
 
     `render`＝子で rag.md の描画まで行う（親が判定済み。VLM の補足観測が起きない・xlsx の Office 表示補完が無効のとき）。
     `assets_dir`＝子が素材を書く `dr_rag/(rel+".assets")`、`obs_dir`＝公開済み OCR 観測の置き場（親が解決済み）。
+    `size`＝計画で測った原本のサイズ（大きいものを先に出す並びに使う。None なら `Prefetcher` が測る）。
     """
     rel: str
     path: str
@@ -50,6 +58,7 @@ class Job:
     render: bool = False
     assets_dir: str | None = None
     obs_dir: str | None = None
+    size: int | None = None
 
 
 @dataclass
@@ -168,7 +177,7 @@ class Prefetcher:
 
     def __init__(self, jobs: list[Job], workers: int):
         self._order = {j.rel: i for i, j in enumerate(jobs)}
-        sizes = {j.rel: (source_stat(j.path) or (0,))[0] for j in jobs}
+        sizes = {j.rel: j.size if j.size is not None else (source_stat(j.path) or (0,))[0] for j in jobs}
         largest = sorted(jobs, key=lambda j: (-sizes[j.rel], j.rel))[:workers]
         self._early = {j.rel for j in largest}               # 最初に提出する大きいもの（窓の外に数える）
         self._queue: deque[Job] = deque(largest + [j for j in jobs if j.rel not in self._early])

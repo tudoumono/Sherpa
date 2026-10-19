@@ -4,17 +4,21 @@
 ① ログ設定（`log_setup.configure_logging()`・request_id filter の再適用） ② スキーマ初期化 ③ 取り込み中断 run の格下げ
 ④ 監査 writer・Codex ジョブワーカーの起動 ⑤ env の初回シード ⑥ 起動検査（`_warn_*`・`CHANGE_ME` と既定 admin パスワードの検査は
 auth bootstrap より前に置く） ⑦ auth bootstrap・孤児 reconcile・TTL sweep（起動時 1 回＋定期）・`turn_metrics` 補完。
-shutdown では新規受付を止め、writer・ワーカー・PG プール・Neo4j driver をクローズする。
+起動の最後に、中断していた取り込みの自動再開（`ingest.resume`）を始める。
+shutdown では新規受付を止め、取り込みへ止める要求を出して区切りで止まるのを待ち（上限 `SHERPA_STOP_DRAIN_SEC`）、writer・ワーカー・PG プール・Neo4j driver をクローズする。
 循環 import を避けるため `sherpa.api` の参照は lifespan 実行時の遅延 import にする。
 設計: docs/design/operations.md「起動・停止・状態」
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import threading
 from contextlib import asynccontextmanager
 
 from sherpa import codex_jobs_worker, ext_api, log_setup, store
+from sherpa.env_int import env_int
 
 _log = logging.getLogger("sherpa")
 
@@ -82,14 +86,22 @@ async def lifespan(app):
         api._backfill_turn_metrics_on_startup()
         from sherpa.ingest import metafile_render
         metafile_render.start_loop(_metafile_render_stop)  # WMF/EMF の図全体の描画待ちを 1 件ずつ進める
+        from sherpa.ingest import background as _bg
+        _bg.mark_graceful_ready()  # stop.sh が、待って止まれる新しい版だと見分ける印
+        if not os.environ.get("SHERPA_TEST_DB_ISOLATED"):
+            from sherpa.ingest import resume
+            resume.resume_interrupted()  # 他の初期化が済んだ最後に、中断していた取り込みの続きを始める
         yield
     finally:
         _metafile_render_stop.set()
-        # shutdown 時は取り込みの背景実行も新規受付を止め、実行中の run に短い猶予を与える（best-effort）
+        # ① 新規受付を止める ② 止める要求を立てる ③ 実行中の run が区切りで止まる（または終わる）まで待つ（上限 SHERPA_STOP_DRAIN_SEC）
         try:
             from sherpa.ingest import background
             background.stop_accepting()
-            background.drain(timeout=5.0)
+            background.request_stop()
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: background.drain(timeout=env_int("SHERPA_STOP_DRAIN_SEC", 1800, 0, 86400)))
+            background.clear_graceful_ready()
         except Exception as e:
             _log.warning("背景実行の shutdown drain に失敗しました（best-effort）: %s", e)
         ext_api._audit_writer.stop()  # 新規受付を止め、既存 queue を回収してから終了する

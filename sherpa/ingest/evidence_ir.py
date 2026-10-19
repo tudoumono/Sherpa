@@ -9,12 +9,14 @@ XLSX/DOCX/PPTX/PDF で共通の field だけを core に置き、形式固有の
 from __future__ import annotations
 
 import hashlib
+import io
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 from .. import json_io
+from .gc_relax import relaxed_gc
 
 
 EVIDENCE_IR_SCHEMA_VERSION = "evidence-ir-v1alpha2"
@@ -126,6 +128,19 @@ class EvidenceIR:
     coverage: list[CoverageItem] = field(default_factory=list)
 
 
+_FIELD_NAMES: dict[type, tuple[str, ...]] = {}
+
+
+def _field_names(cls: type) -> tuple[str, ...]:
+    names = _FIELD_NAMES.get(cls)
+    if names is None:
+        names = _FIELD_NAMES[cls] = tuple(f.name for f in fields(cls))
+    return names
+
+
+_LOCATOR_FIELDS = _field_names(Locator)
+
+
 def validation_errors(ir: EvidenceIR) -> list[str]:
     """参照整合性と coverage 全分類を検査する。"""
     errors: list[str] = []
@@ -201,22 +216,58 @@ def to_json_str(ir: EvidenceIR) -> str:
     return "".join(_json_parts(ir))
 
 
-def _compact(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+_ENCODE = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode
+_ARRAY_BATCH = 512
+
+
+def compact_json(value: Any) -> str:
+    """キーを並べ替えた最小の JSON 文字列（ID・ハッシュの素材用）。"""
+    return _ENCODE(value)
+
+
+def locator_payload(locator: Locator) -> dict[str, Any]:
+    """`asdict(locator)` と同じキーの dict（値は複製しない。直列化にだけ使う）。"""
+    payload = dict(locator.__dict__)
+    if len(payload) != len(_LOCATOR_FIELDS):
+        payload = {name: getattr(locator, name) for name in _LOCATOR_FIELDS}
+    return payload
 
 
 def make_coverage_id(scope: str, detected_kind: str, locator: Locator) -> str:
     """scope・検知種別・原本位置から coverage ID を決定生成する。"""
-    payload = "\n".join(_compact(value) for value in (scope, detected_kind, asdict(locator)))
+    try:
+        located = compact_json(locator_payload(locator))
+    except TypeError:
+        located = compact_json(asdict(locator))
+    payload = "\n".join((compact_json(scope), compact_json(detected_kind), located))
     return "coverage:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
+def _record_payload(value, names: tuple[str, ...]) -> dict[str, Any]:
+    """`asdict(value)` と同じキーの dict（`locator` だけ dict へ展開し、ほかの値は複製しない）。"""
+    payload = dict(value.__dict__)
+    if len(payload) != len(names):
+        payload = {name: getattr(value, name) for name in names}
+    locator = payload.get("locator")
+    if isinstance(locator, Locator):
+        payload["locator"] = locator_payload(locator)
+    return payload
+
+
 def _array_parts(values):
+    """配列要素を `asdict` 経由で 1 件ずつ直列化したのと同じ文字列を、まとめて直列化して返す。"""
     yield "["
-    for index, value in enumerate(values):
-        if index:
-            yield ","
-        yield _compact(asdict(value))
+    if values:
+        names = _field_names(type(values[0]))
+        for start in range(0, len(values), _ARRAY_BATCH):
+            batch = values[start:start + _ARRAY_BATCH]
+            if start:
+                yield ","
+            try:
+                text = _ENCODE([_record_payload(value, names) for value in batch])
+            except TypeError:                        # 入れ子の dataclass など、dict への展開が要る値は asdict で変換する
+                text = _ENCODE([asdict(value) for value in batch])
+            yield text[1:-1]
     yield "]"
 
 
@@ -227,13 +278,13 @@ def _json_parts(ir: EvidenceIR):
     yield ',"elements":'
     yield from _array_parts(ir.elements)
     yield ',"parser_profile":'
-    yield _compact(ir.parser_profile)
+    yield compact_json(ir.parser_profile)
     yield ',"relations":'
     yield from _array_parts(ir.relations)
     yield ',"schema_version":'
-    yield _compact(ir.schema_version)
+    yield compact_json(ir.schema_version)
     yield ',"source":'
-    yield _compact(asdict(ir.source))
+    yield compact_json(asdict(ir.source))
     yield "}\n"
 
 
@@ -245,6 +296,7 @@ def _checked_json_parts(ir: EvidenceIR):
     return _json_parts(ir)
 
 
+@relaxed_gc
 def write_json_atomic(path: str | Path, ir: EvidenceIR) -> Path:
     """Evidence IR を gzip で同一ディレクトリの tmp へ stream して原子置換する（設計: docs/design/rag.md「派生物」）。"""
     parts = _checked_json_parts(ir)
@@ -259,27 +311,244 @@ def to_gzip_bytes(ir: EvidenceIR) -> bytes:
     return json_io.gzip_text_bytes(_checked_json_parts(ir))
 
 
+_READ_CHUNK = 1 << 20
+_WS = " \t\n\r"
+_BATCH_ITEMS = 256
+
+
+class _JsonStream:
+    """テキストストリームから JSON の値を 1 つずつ取り出す（全文を 1 つの文字列に持たない）。"""
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._buf = ""
+        self._pos = 0
+        self._eof = False
+        self._decoder = json.JSONDecoder()
+
+    def _fill(self) -> bool:
+        if self._eof:
+            return False
+        chunk = self._stream.read(_READ_CHUNK)
+        if not chunk:
+            self._eof = True
+            return False
+        self._buf = self._buf[self._pos:] + chunk
+        self._pos = 0
+        return True
+
+    def peek(self) -> str:
+        """次の空白でない 1 文字（末尾なら ""）。位置は進めない。"""
+        while True:
+            buf, pos = self._buf, self._pos
+            while pos < len(buf) and buf[pos] in _WS:
+                pos += 1
+            self._pos = pos
+            if pos < len(buf):
+                return buf[pos]
+            if not self._fill():
+                return ""
+
+    def advance(self) -> None:
+        self._pos += 1
+
+    def value(self) -> Any:
+        """次の JSON 値を 1 つ読む。バッファ末尾で切れた可能性があるときは読み足してやり直す。"""
+        self.peek()
+        while True:
+            try:
+                obj, end = self._decoder.raw_decode(self._buf, self._pos)
+            except json.JSONDecodeError:
+                if not self._fill():
+                    raise
+                continue
+            if end == len(self._buf) and self._fill():     # 切れ目で終わった値は、読み足してからやり直す
+                continue
+            self._pos = end
+            return obj
+
+    def finish(self) -> None:
+        if self.peek():
+            raise json.JSONDecodeError("Extra data", self._buf, self._pos)
+
+    def _batch(self, delimiter: str) -> list | None:
+        """次の要素から `_BATCH_ITEMS` 個を、1 回の `raw_decode` でまとめて読む。
+
+        要素どうしの切れ目が `delimiter`（次の要素の頭までの区切り）で見つかり、その間が配列として読めたときだけ返す（位置は最後の要素の直後）。
+        1 回の読み込みの中ではキーの文字列が共有される。読めなければ None（呼び出し側は 1 件ずつ読む）。
+        """
+        if self.peek() != "{":
+            return None
+        while True:
+            buf, start = self._buf, self._pos
+            cut = start
+            for _ in range(_BATCH_ITEMS):
+                cut = buf.find(delimiter, cut + 1)
+                if cut < 0:
+                    break
+            else:
+                break
+            if not self._fill():
+                return None
+        text = "[" + buf[start:cut] + "]"
+        try:
+            items, end = self._decoder.raw_decode(text)
+        except json.JSONDecodeError:
+            return None
+        if end != len(text) or not isinstance(items, list):
+            return None
+        self._pos = cut
+        return items
+
+    def array_items(self, delimiter: str | None = None):
+        """"[" の直後から対応する "]" の直後までの要素を順に返す。`delimiter` を渡すと、要素をまとめて読む。"""
+        while True:
+            batch = self._batch(delimiter) if delimiter else None
+            if batch is not None:
+                yield from batch
+            else:
+                yield self.value()
+            separator = self.peek()
+            if separator == ",":
+                self.advance()
+            elif separator == "]":
+                self.advance()
+                return
+            else:
+                raise json.JSONDecodeError("Expecting ',' delimiter", self._buf, self._pos)
+
+
+_SHARED_EXTENSION_KEYS = (
+    "calculation_status", "display_source", "display_status", "display_reason", "number_format", "role",
+)
+_SHARED_ELEMENT_KEYS = ("type", "parent_id", "coverage_id", "visibility", "lifecycle")
+
+
+def _element_from_json(item: dict, pool: dict[str, str]) -> EvidenceElement:
+    setdefault = pool.setdefault                    # 同じ文字列を 1 つの実体に束ねる
+    locator = item["locator"]
+    part = locator["part"]
+    if type(part) is str:
+        locator["part"] = setdefault(part, part)
+    sheet = locator.get("sheet")
+    if type(sheet) is str:
+        locator["sheet"] = setdefault(sheet, sheet)
+    extension = item.get("extension")
+    if type(extension) is dict:
+        for key in _SHARED_EXTENSION_KEYS:
+            value = extension.get(key)
+            if type(value) is str:
+                extension[key] = setdefault(value, value)
+        typed = extension.get("typed_value")
+        if type(typed) is dict:
+            kind = typed.get("type")
+            if type(kind) is str:
+                typed["type"] = setdefault(kind, kind)
+    for key in _SHARED_ELEMENT_KEYS:
+        value = item.get(key)
+        if type(value) is str:
+            item[key] = setdefault(value, value)
+    item["locator"] = Locator(**locator)
+    return EvidenceElement(**item)
+
+
+def _relation_from_json(item: dict, pool: dict[str, str]) -> EvidenceRelation:
+    return EvidenceRelation(**item)
+
+
+def _coverage_from_json(item: dict, pool: dict[str, str]) -> CoverageItem:
+    return CoverageItem(**{**item, "locator": Locator(**item["locator"])})
+
+
+_ARRAY_BUILDERS = {
+    "elements": _element_from_json,
+    "relations": _relation_from_json,
+    "coverage": _coverage_from_json,
+}
+_ARRAY_DELIMITERS = {"elements": ',{"coverage_id":'}      # 要素の先頭のキー（キーは並べ替えて書かれる）
+
+
+def _read_payload(stream: _JsonStream) -> dict:
+    """トップレベルの object を読む。elements / relations / coverage は 1 件読むごとに型付きへ変換して持つ。
+
+    形の誤り（キー欠落・型違い）は JSON 全体を読み切ってから `ValueError` にする（構文エラーを先に報告する従来の順序を保つ）。
+    """
+    first = stream.peek()
+    if first != "{":
+        value = stream.value() if first else json.loads("")
+        stream.finish()
+        return value
+    stream.advance()
+    payload: dict = {}
+    shape_error = False
+    pool: dict[str, str] = {}
+    if stream.peek() == "}":
+        stream.advance()
+    else:
+        while True:
+            key = stream.value()
+            if stream.peek() != ":":
+                raise json.JSONDecodeError("Expecting ':' delimiter", stream._buf, stream._pos)
+            stream.advance()
+            build = _ARRAY_BUILDERS.get(key) if isinstance(key, str) else None
+            if build is not None and stream.peek() == "[":
+                stream.advance()
+                items: list = []
+                if stream.peek() == "]":
+                    stream.advance()
+                else:
+                    for item in stream.array_items(_ARRAY_DELIMITERS.get(key)):
+                        if not shape_error:
+                            try:
+                                items.append(build(item, pool))
+                            except (KeyError, TypeError):
+                                shape_error = True
+                payload[key] = items
+            else:
+                payload[key] = stream.value()
+                if build is not None:
+                    shape_error = True
+            separator = stream.peek()
+            if separator == ",":
+                stream.advance()
+            elif separator == "}":
+                stream.advance()
+                break
+            else:
+                raise json.JSONDecodeError("Expecting ',' delimiter", stream._buf, stream._pos)
+    stream.finish()
+    if shape_error:
+        raise ValueError("invalid Evidence IR shape")
+    return payload
+
+
+@relaxed_gc
 def read_json_file(path: str | Path) -> EvidenceIR:
-    """`{rel}.evidence.json`（gzip でも非圧縮でも）を型付き Evidence IR として読む。"""
-    return from_json_str(json_io.read_text_maybe_gzip(path))
+    """`{rel}.evidence.json`（gzip でも非圧縮でも）を型付き Evidence IR として読む。本文全体は持たず、要素を 1 件ずつ型付きへ変換する。"""
+    try:
+        with json_io.open_text_maybe_gzip(path) as stream:
+            payload = _read_payload(_JsonStream(stream))
+    except json_io.GZIP_READ_ERRORS as exc:
+        raise OSError(f"gzip が壊れています: {exc}") from exc
+    return _ir_from_payload(payload)
 
 
 def from_json_str(raw: str) -> EvidenceIR:
     """決定的 JSON を型付き Evidence IR へ戻し、参照整合性も再検証する。"""
-    payload = json.loads(raw)
+    return _ir_from_payload(_read_payload(_JsonStream(io.StringIO(raw))))
+
+
+def _ir_from_payload(payload: Any) -> EvidenceIR:
     if not isinstance(payload, dict):
         raise ValueError("Evidence IR must be a JSON object")
     try:
-        source_raw = payload["source"]
         ir = EvidenceIR(
             schema_version=payload["schema_version"],
             parser_profile=payload["parser_profile"],
-            source=EvidenceSource(**source_raw),
-            elements=[EvidenceElement(
-                **{**item, "locator": Locator(**item["locator"])}) for item in payload.get("elements", [])],
-            relations=[EvidenceRelation(**item) for item in payload.get("relations", [])],
-            coverage=[CoverageItem(
-                **{**item, "locator": Locator(**item["locator"])}) for item in payload.get("coverage", [])],
+            source=EvidenceSource(**payload["source"]),
+            elements=payload.get("elements", []),
+            relations=payload.get("relations", []),
+            coverage=payload.get("coverage", []),
         )
     except (KeyError, TypeError) as exc:
         raise ValueError("invalid Evidence IR shape") from exc

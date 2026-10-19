@@ -39,6 +39,7 @@ def _drive_lifespan_startup_and_shutdown(monkeypatch) -> None:
     （でなければ本ファイルの後に実行される他の全テストが `ShuttingDownError` で壊れる）。
     """
     monkeypatch.setattr(background, "_accepting", True)
+    monkeypatch.setattr(background, "_stop_event", threading.Event())
     monkeypatch.setattr(store, "init_schema", lambda: None)
     for name in (
         "_seed_settings_from_env", "_purge_personal_keys_if_disabled_on_startup",

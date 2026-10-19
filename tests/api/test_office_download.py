@@ -241,38 +241,83 @@ def test_download_rejects_traversal_and_missing():
     assert _CLIENT.get("/documents/download", params={"rel": "4期保守/NOPE.xlsx", "world": W}).status_code == 404
 
 
-def test_download_endpoint_waits_for_exclusive_world_lock():
-    """`world_lock_shared`（台帳確認〜fd の fstat 完了まで保持）は、rebind/削除/取り込みが使う
-    排他ロック（`world_lock`）と直列化する——排他ロックが取れている間は DL が完了しない
-    （RV2 是正 #1・台帳と root の世代整合）。"""
-    rel = XLSX_REL
+def test_download_does_not_wait_for_ingest_lock():
+    """取り込みは `world_lock` を最初から最後まで保持するが、原本のダウンロードはそれを待たずに返る。"""
     acquired = threading.Event()
     release = threading.Event()
 
-    def _hold_exclusive():
+    def _hold_ingest():
         with store.world_lock(W):
             acquired.set()
             release.wait(timeout=10)
 
-    holder = threading.Thread(target=_hold_exclusive)
+    holder = threading.Thread(target=_hold_ingest)
     holder.start()
     try:
         assert acquired.wait(timeout=5), "排他ロックを取得できなかった"
-        result = {}
-
-        def _download():
-            result["r"] = _CLIENT.get("/documents/download", params={"rel": rel, "world": W})
-
-        dl = threading.Thread(target=_download)
         t0 = time.monotonic()
-        dl.start()
-        time.sleep(0.3)
-        assert dl.is_alive(), "排他ロックを待たずに DL が完了した（世代整合の直列化が効いていない）"
-        release.set()
-        dl.join(timeout=10)
-        assert not dl.is_alive(), "DL がロック解放後も完了しなかった"
-        assert time.monotonic() - t0 >= 0.3
-        assert result["r"].status_code == 200
+        r = _CLIENT.get("/documents/download", params={"rel": XLSX_REL, "world": W})
+        assert r.status_code == 200
+        assert time.monotonic() - t0 < 5
     finally:
         release.set()
         holder.join(timeout=10)
+
+
+def test_download_returns_503_within_limit_while_swapping(monkeypatch):
+    """rebind／削除が参照先を入れ替えている間、ダウンロードは上限まで待って 503（無期限に待たない・食い違った原本を返さない）。
+    入れ替えが終われば同じ要求が 200 になる。"""
+    monkeypatch.setattr(doc_ledger, "SWAP_LOCK_WAIT_MS", 300)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def _hold_swap():
+        with store.world_swap_lock(W):
+            acquired.set()
+            release.wait(timeout=10)
+
+    holder = threading.Thread(target=_hold_swap)
+    holder.start()
+    try:
+        assert acquired.wait(timeout=5), "入れ替えロックを取得できなかった"
+        t0 = time.monotonic()
+        r = _CLIENT.get("/documents/download", params={"rel": XLSX_REL, "world": W})
+        assert r.status_code == 503
+        assert "切り替えている最中" in r.json()["detail"]
+        assert time.monotonic() - t0 < 5
+    finally:
+        release.set()
+        holder.join(timeout=10)
+    assert _CLIENT.get("/documents/download", params={"rel": XLSX_REL, "world": W}).status_code == 200
+
+
+def test_swap_lock_order_does_not_deadlock_with_download_and_ingest():
+    """rebind／削除と同じ順序（`world_lock → world_swap_lock`）で取る書き手と、取り込み（`world_lock` のみ）・
+    ダウンロード（入れ替えロックの共有のみ）を同時に走らせてもデッドロックせず、全員が完了する。"""
+    results: list = []
+
+    def _swapper():
+        with store.world_lock(W), store.world_swap_lock(W):
+            time.sleep(0.2)
+        results.append("swap")
+
+    def _ingest():
+        with store.world_lock(W):
+            time.sleep(0.2)
+        results.append("ingest")
+
+    def _download():
+        # 入れ替えが終わるまで待つ想定（既定の上限 5 秒より十分短い）
+        r = _CLIENT.get("/documents/download", params={"rel": XLSX_REL, "world": W})
+        results.append(r.status_code)
+
+    ts = [threading.Thread(target=f) for f in (_swapper, _ingest, _download, _download, _swapper)]
+    for t in ts:
+        t.start()
+        time.sleep(0.02)
+    for t in ts:
+        t.join(timeout=20)
+    assert not any(t.is_alive() for t in ts), "デッドロック"
+    assert sorted(map(str, results)) == sorted(["swap", "swap", "ingest", "200", "200"])
+
+

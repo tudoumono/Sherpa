@@ -8030,6 +8030,11 @@
             ],
             "title": "Last Run Id"
           },
+          "last_run_interrupted": {
+            "default": false,
+            "title": "Last Run Interrupted",
+            "type": "boolean"
+          },
           "last_run_status": {
             "anyOf": [
               {
@@ -8446,6 +8451,11 @@
               }
             ],
             "title": "Last Run Id"
+          },
+          "last_run_interrupted": {
+            "default": false,
+            "title": "Last Run Interrupted",
+            "type": "boolean"
           },
           "last_run_status": {
             "anyOf": [

@@ -678,6 +678,23 @@ def _fill_is_colored(fill, resolver: "ColorResolver") -> bool:
     return False
 
 
+def present_cells(ws, max_row: int, max_col: int) -> list:
+    """格子 `[1..max_row]×[1..max_col]` のうち、シートが実際に持っているセルだけを返す（順序は不定）。
+
+    `iter_rows` と違い、空セルを作らない。値・リンク・コメントを持たない空セルを数えない走査に使う。
+    """
+    return [cell for (row, column), cell in ws._cells.items() if row <= max_row and column <= max_col]
+
+
+def value_grid(ws, max_row: int, max_col: int) -> list[list]:
+    """`ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)` と同じ値グリッド（行のリストのリスト・無いセルは None）。空セルを作らない。"""
+    grid: list[list] = [[None] * max_col for _ in range(max_row)]
+    for (row, column), cell in ws._cells.items():
+        if row <= max_row and column <= max_col:
+            grid[row - 1][column - 1] = cell.value
+    return grid
+
+
 def filled_cells(ws, cap_rows: int, cap_cols: int, *, resolver: "ColorResolver | None" = None
                  ) -> set[tuple[int, int]]:
     """背景色（単色/縞模様パターン塗り・グラデーション塗り）が設定されているセルの1-based座標集合を返す（`regions()` の `filled` 引数用・`cap_rows`×`cap_cols` 以内・色の判定は `_fill_is_colored`）。白判定はセルが属するワークブック固有のパレット・テーマ定義を `resolver`（`ColorResolver`）で行う。
@@ -701,15 +718,22 @@ def filled_cells(ws, cap_rows: int, cap_cols: int, *, resolver: "ColorResolver |
     max_row = min(ws.max_row or 1, cap_rows)
     max_col = min(ws.max_column or 1, cap_cols)
     out: set[tuple[int, int]] = set()
-    for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-        for cell in row:
-            fill = cell.fill
-            if isinstance(cell, MergedCell):
-                anchor = anchor_of.get((cell.row, cell.column))
-                if anchor is not None:
-                    fill = ws.cell(row=anchor[0], column=anchor[1]).fill
-            if _fill_is_colored(fill, resolver):
-                out.add((cell.row, cell.column))
+    try:
+        blank_is_colored = _fill_is_colored(ws.parent._fills[0], resolver)    # 空セルの背景（先頭の塗り）が色付きなら、空セルも数える必要がある
+    except (AttributeError, IndexError):
+        blank_is_colored = True
+    cells = (
+        (cell for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col) for cell in row)
+        if blank_is_colored else present_cells(ws, max_row, max_col)
+    )
+    for cell in cells:
+        fill = cell.fill
+        if isinstance(cell, MergedCell):
+            anchor = anchor_of.get((cell.row, cell.column))
+            if anchor is not None:
+                fill = ws.cell(row=anchor[0], column=anchor[1]).fill
+        if _fill_is_colored(fill, resolver):
+            out.add((cell.row, cell.column))
     return out
 
 
@@ -731,11 +755,42 @@ def hidden_cols(ws) -> list[str]:
     return [get_column_letter(i) for i in sorted(idxs)]
 
 
+# 数式の要素（`<f>`）、または「=」で始まる文字列の値（`formulas()` が数式として数える）がシートの XML にあり得るかを判定する目印。
+# 判定は広めにとる（false なら確実に無い）。実体参照・CDATA は中身を見ずに「あり得る」とする。
+_FORMULA_HINT_RE = re.compile(rb"<(?:[\w.\-]+:)?(?:f[\s>/]|[vt](?:\s[^>]*)?>\s*(?:=|&#|<!\[CDATA\[))")
+
+
+def _may_have_formulas(ws_formula) -> bool:
+    """読み取り専用シートに、`formulas()` が数式として数えるセルが 1 つでもあり得るか。読めない・不明なときは True。"""
+    try:
+        workbook = ws_formula.parent
+        shared_equals = getattr(workbook, "_sherpa_shared_equals", None)
+        if shared_equals is None:
+            shared_equals = workbook._sherpa_shared_equals = any(
+                isinstance(text, str) and text.startswith("=") for text in ws_formula._shared_strings)
+        if shared_equals:
+            return True
+        with ws_formula._get_source() as source:
+            tail = b""
+            while True:
+                block = source.read(1 << 20)
+                if not block:
+                    return False
+                data = tail + block
+                if _FORMULA_HINT_RE.search(data) is not None:
+                    return True
+                tail = data[-256:]
+    except Exception:
+        return True
+
+
 def formulas(ws_formula, ws_values) -> list[dict]:
     """`ws_formula`（`data_only=False`）内の数式セル（`=` で始まる値）を走査し、`ws_values`（`data_only=True`）の同座標と突き合わせて `{"cell", "row", "column", "formula", "has_cached"}` のリストを `(row, column)` 昇順で返す。
 
     `has_cached`＝`ws_values` 側の同座標の値が `None` でないか（未計算式／キャッシュ破棄済みは `None`）。走査範囲は行・列上限と `DEFAULT_CAP_CELLS` の総セル予算（呼び出し時にモジュール属性を読む）で `min(ws.max_row, effective_cap+1)` に有界化する。
     """
+    if not _may_have_formulas(ws_formula):
+        return []
     max_row = min(ws_formula.max_row or 1, effective_cap_rows(ws_formula.max_column) + 1)
     max_col = min(ws_formula.max_column or 1, DEFAULT_CAP_COLS + 1)
     out: list[dict] = []
@@ -774,17 +829,16 @@ def cell_hyperlinks(ws) -> list[dict]:
     max_row = min(ws.max_row or 1, effective_cap_rows(ws.max_column) + 1)
     max_col = min(ws.max_column or 1, DEFAULT_CAP_COLS + 1)
     out: list[dict] = []
-    for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-        for cell in row:
-            h = cell.hyperlink
-            if h is None:
-                continue
-            target = h.target or (("#" + h.location) if h.location else None)
-            if not target:
-                continue
-            v = cell.value
-            out.append({"cell": cell.coordinate, "row": cell.row, "column": cell.column,
-                       "target": target, "text": "" if v is None else str(v)})
+    for cell in present_cells(ws, max_row, max_col):
+        h = cell.hyperlink
+        if h is None:
+            continue
+        target = h.target or (("#" + h.location) if h.location else None)
+        if not target:
+            continue
+        v = cell.value
+        out.append({"cell": cell.coordinate, "row": cell.row, "column": cell.column,
+                   "target": target, "text": "" if v is None else str(v)})
     out.sort(key=lambda e: (e["row"], e["column"]))
     return out
 
@@ -794,16 +848,15 @@ def cell_comments(ws) -> list[dict]:
     max_row = min(ws.max_row or 1, effective_cap_rows(ws.max_column) + 1)
     max_col = min(ws.max_column or 1, DEFAULT_CAP_COLS + 1)
     out: list[dict] = []
-    for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-        for cell in row:
-            c = cell.comment
-            if c is None:
-                continue
-            text = (c.text or "").strip()
-            if not text:
-                continue
-            out.append({"cell": cell.coordinate, "row": cell.row, "column": cell.column,
-                       "text": text, "author": c.author or ""})
+    for cell in present_cells(ws, max_row, max_col):
+        c = cell.comment
+        if c is None:
+            continue
+        text = (c.text or "").strip()
+        if not text:
+            continue
+        out.append({"cell": cell.coordinate, "row": cell.row, "column": cell.column,
+                   "text": text, "author": c.author or ""})
     out.sort(key=lambda e: (e["row"], e["column"]))
     return out
 
@@ -816,15 +869,14 @@ def strike_cells(ws) -> list[dict]:
     max_row = min(ws.max_row or 1, effective_cap_rows(ws.max_column) + 1)
     max_col = min(ws.max_column or 1, DEFAULT_CAP_COLS + 1)
     out: list[dict] = []
-    for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-        for cell in row:
-            font = cell.font
-            if font is None or not font.strike:
-                continue
-            v = cell.value
-            if v is None:
-                continue
-            out.append({"cell": cell.coordinate, "row": cell.row, "column": cell.column, "text": str(v)})
+    for cell in present_cells(ws, max_row, max_col):
+        font = cell.font
+        if font is None or not font.strike:
+            continue
+        v = cell.value
+        if v is None:
+            continue
+        out.append({"cell": cell.coordinate, "row": cell.row, "column": cell.column, "text": str(v)})
     out.sort(key=lambda e: (e["row"], e["column"]))
     return out
 

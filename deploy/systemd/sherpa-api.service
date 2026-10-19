@@ -21,6 +21,9 @@ ExecStart=/opt/sherpa/Sherpa/scripts/run-api.sh serve
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=78
+# 停止では取り込み中の 1 件の完了を待つ（アプリの SHERPA_STOP_DRAIN_SEC 既定 1800 秒より長く）。本体にだけ SIGTERM を送り、子は本体の終了後に片付ける。
+TimeoutStopSec=1900
+KillMode=mixed
 
 NoNewPrivileges=true
 PrivateTmp=true

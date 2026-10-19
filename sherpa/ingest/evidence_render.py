@@ -17,12 +17,13 @@ import hashlib
 import json
 import re
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping
 
 from .. import json_io
 from . import ai_observation, context_ir, evidence_ir, mermaid_render, pdf_chunking
+from .gc_relax import relaxed_gc
 
 
 RAG_RENDERER_VERSION = "evidence-rag-renderer-v1alpha13"
@@ -47,10 +48,27 @@ class RenderedEvidence:
     context: context_ir.ContextIR | None = None
 
 
+_MENTION_FIELDS = tuple(f.name for f in fields(context_ir.IdentifierMention))
+_RECORD_KEY_FIELDS = tuple(f.name for f in fields(context_ir.RecordKey))
+
+
+def _plain_copy(value: Any) -> Any:
+    """`asdict` が入れ子の dict・list・tuple にする複製と同じ（dataclass は含まない値だけに使う）。"""
+    if isinstance(value, dict):
+        return {key: _plain_copy(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_plain_copy(item) for item in value)
+    return value
+
+
+def _mention_dict(mention: context_ir.IdentifierMention) -> dict[str, Any]:
+    return {name: _plain_copy(getattr(mention, name)) for name in _MENTION_FIELDS}
+
+
 def _identifier_metadata_fields(batch: context_ir.IdentifierMentionBatch) -> dict[str, Any]:
     """識別子objectと完全性envelopeを同じpieceへ載せる。"""
     return {
-        "identifier_mentions": [asdict(mention) for mention in batch.mentions],
+        "identifier_mentions": [_mention_dict(mention) for mention in batch.mentions],
         "identifier_metadata_complete": batch.complete,
         "identifier_mention_count": batch.mention_count,
         "identifier_mention_overflow_count": batch.overflow_count,
@@ -69,6 +87,8 @@ def _extract_identifier_metadata(
     match_start: int | None = None,
     match_end: int | None = None,
 ) -> dict[str, Any]:
+    if isinstance(value, str) and not context_ir.has_identifier_candidate(value):
+        return _identifier_metadata_fields(context_ir._NO_MENTIONS)
     return _identifier_metadata_fields(context_ir.identifier_mentions_with_metadata(
         value,
         field_label=field_label,
@@ -81,8 +101,12 @@ def _extract_identifier_metadata(
     ))
 
 
+_COMPACT_JSON = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode
+_SORTED_JSON = json.JSONEncoder(ensure_ascii=False, sort_keys=True).encode
+
+
 def _stable_id(prefix: str, *parts: Any) -> str:
-    raw = json.dumps(parts, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    raw = _COMPACT_JSON(parts)
     return f"{prefix}:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
@@ -91,17 +115,28 @@ def _value_text(value: Any) -> str:
         return ""
     if isinstance(value, str):
         return value
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    kind = type(value)
+    if kind is int:
+        return int.__repr__(value)
+    if kind is float and value - value == 0:             # 有限の実数は json と同じ repr
+        return float.__repr__(value)
+    return _COMPACT_JSON(value)
 
 
 def _excel_value_metadata(cell: evidence_ir.EvidenceElement) -> dict[str, Any] | None:
-    if not any(key in cell.extension for key in _EXCEL_VALUE_KEYS):
-        return None
-    return {key: cell.extension.get(key) for key in _EXCEL_VALUE_KEYS}
+    extension = cell.extension
+    for key in _EXCEL_VALUE_KEYS:
+        if key in extension:
+            return {key: extension.get(key) for key in _EXCEL_VALUE_KEYS}
+    return None
 
 
-def _cell_render_text(cell: evidence_ir.EvidenceElement) -> str:
-    metadata = _excel_value_metadata(cell)
+_UNSET: Any = object()
+
+
+def _cell_render_text(cell: evidence_ir.EvidenceElement, metadata: Any = _UNSET) -> str:
+    if metadata is _UNSET:
+        metadata = _excel_value_metadata(cell)
     if metadata is not None and metadata.get("display_status") in {"rendered", "supported"}:
         display = metadata.get("display_value")
         if display is not None:
@@ -109,12 +144,12 @@ def _cell_render_text(cell: evidence_ir.EvidenceElement) -> str:
     return _value_text(cell.value)
 
 
-def _excel_value_note(metadata: dict[str, Any] | None) -> str:
+def _excel_value_note(metadata: dict[str, Any] | None, material: bool | None = None) -> str:
     """material な Excel メタデータを改行区切りの key-value 行として返す（呼び出し側は `+=` 直結）。
 
-    非空時は先頭に `\n` を含める。material でなければ `""`。
+    非空時は先頭に `\n` を含める。material でなければ `""`。`material` は `_excel_value_is_material` の結果が分かっていれば渡す。
     """
-    if metadata is None or not _excel_value_is_material(metadata):
+    if metadata is None or not (_excel_value_is_material(metadata) if material is None else material):
         return ""
     raw = _value_text(metadata.get("raw_value"))
     display = _value_text(metadata.get("display_value"))
@@ -133,15 +168,12 @@ def _excel_value_note(metadata: dict[str, Any] | None) -> str:
 
 
 def _excel_value_is_material(metadata: dict[str, Any]) -> bool:
-    raw = _value_text(metadata.get("raw_value"))
+    if metadata.get("formula") is not None or metadata.get("display_status") == "unsupported":
+        return True
+    if _value_text(metadata.get("number_format")).casefold() != "general":
+        return True
     display = _value_text(metadata.get("display_value"))
-    number_format = _value_text(metadata.get("number_format"))
-    return bool(
-        metadata.get("formula") is not None
-        or metadata.get("display_status") == "unsupported"
-        or number_format.casefold() != "general"
-        or (display and display != raw)
-    )
+    return bool(display and display != _value_text(metadata.get("raw_value")))
 
 
 # 可視性・廃止表現の表示側: `extension["visibility_reason"]` の平文ラベル対応表。
@@ -372,10 +404,12 @@ def _field_piece(
     *,
     allow_record_identity: bool = False,
     identifier_metadata: dict[str, Any] | None = None,
+    excel_metadata: Any = _UNSET,
 ) -> dict:
     row, column = _cell_row_column(cell)
     field_label = label or "記載値"
-    excel_metadata = _excel_value_metadata(cell)
+    if excel_metadata is _UNSET:
+        excel_metadata = _excel_value_metadata(cell)
     if span_count > 1:
         semantic = f"{field_label}（{span_index + 1}/{span_count}）:\n{exact}"
     else:
@@ -386,12 +420,13 @@ def _field_piece(
         elif relation["type"] == "separate":
             semantic += "（隣接行と左ラベルが異なる別項目）"
     occlusion_lines = _occlusion_kv_lines(cell.extension)
+    material = (span_index == 0 and excel_metadata is not None and _excel_value_is_material(excel_metadata))
     if span_index == 0:
-        semantic += _excel_value_note(excel_metadata)
+        semantic += _excel_value_note(excel_metadata, material)
         if occlusion_lines:
             semantic += "\n" + "\n".join(occlusion_lines)
     exact_lines = [f"{field_label}: {exact}"]
-    if span_index == 0 and excel_metadata is not None and _excel_value_is_material(excel_metadata):
+    if material:
         exact_lines.extend([
             f"{field_label}のExcel原値: {_value_text(excel_metadata.get('raw_value'))}",
             f"{field_label}のExcel書式: {_value_text(excel_metadata.get('number_format'))}",
@@ -426,8 +461,6 @@ def _field_piece(
         "relations": layout_relations,
         **identifier_metadata,
     }
-    if excel_metadata is not None:
-        piece["object_metadata"] = {"excel_value": excel_metadata}
     return piece
 
 
@@ -481,7 +514,7 @@ def _base_record(
         citations.append(_citation(piece))
         citations.extend(piece.get("extra_citations", []))
     citations = list({
-        json.dumps(citation, ensure_ascii=False, sort_keys=True): citation
+        _SORTED_JSON(citation): citation
         for citation in citations
     }.values())
     facts = "\n".join(piece["semantic"] for piece in pieces)
@@ -494,7 +527,7 @@ def _base_record(
         evidence_ids, [piece["text_span"] for piece in pieces], semantic,
     )
     all_identifier_mentions = list({
-        json.dumps(mention, ensure_ascii=False, sort_keys=True, separators=(",", ":")): mention
+        _COMPACT_JSON(mention): mention
         for piece in pieces
         for mention in piece.get("identifier_mentions", [])
         if isinstance(mention, dict)
@@ -535,7 +568,7 @@ def _base_record(
         "evidence_ids": evidence_ids,
         "citations": citations,
         "relations": list({
-            json.dumps(relation, ensure_ascii=False, sort_keys=True): relation
+            _SORTED_JSON(relation): relation
             for piece in pieces for relation in piece.get("relations", [])
         }.values()),
         "_sort_key": sort_key,
@@ -935,64 +968,70 @@ def _table_records(
         table = tables.get(table_id)
         regions = sorted(regions_by_table.get(table_id, []), key=lambda item: item.start_column)
         has_coordinate_fallback = any(region.mode == "coordinate_fallback" for region in regions)
+        positions = [(cell, *_cell_row_column(cell)) for cell in cells]
         if has_coordinate_fallback:
             block_by_row, relations_by_evidence = _table_layout(ir, table_id, cells)
             left_labels = _left_label_map(cells)
         else:
-            rows = {row for cell in cells if (row := _cell_row_column(cell)[0]) is not None}
+            rows = {row for _, row, _ in positions if row is not None}
             block_by_row = {
                 row: _stable_id("logical-block", ir.source.content_hash, table_id, f"row:{row}")
                 for row in rows
             }
             relations_by_evidence = {}
             left_labels = {}
-        cells_by_row: dict[int, list[evidence_ir.EvidenceElement]] = defaultdict(list)
-        for cell in cells:
-            row, _ = _cell_row_column(cell)
+        cells_by_row: dict[int, list[tuple[evidence_ir.EvidenceElement, int | None]]] = defaultdict(list)
+        for cell, row, column in positions:
             if row is not None:
-                cells_by_row[row].append(cell)
+                cells_by_row[row].append((cell, column))
         table_order = table.order if table else 0
         for region in regions:
             region_cells = [
-                cell for cell in cells
-                if (column := _cell_row_column(cell)[1]) is not None
-                and region.start_column <= column <= region.end_column
+                cell for cell, _, column in positions
+                if column is not None and region.start_column <= column <= region.end_column
             ]
+            field_labels: dict[int, str] = {}
             summary = _context_summary_record(ir, ctx, region, region_cells, table, aliases)
             if summary is not None:
                 records.append(summary)
             common_header = _common_header_prefix(region)
+            document_context = _document_context(ctx, region)       # 同じ領域のレコードで共有する（書き換えない）
+            region_context = _region_context(region)
             region_records = sorted(records_by_region.get(region.region_id, []), key=lambda item: item.row)
             for context_record in region_records:
                 row = context_record.row
                 key_evidence_ids = {key.evidence_id for key in context_record.keys}
                 row_cells = [
-                    cell for cell in cells_by_row.get(row, [])
-                    if (column := _cell_row_column(cell)[1]) is not None
+                    (cell, column) for cell, column in cells_by_row.get(row, [])
+                    if column is not None
                     and region.start_column <= column <= region.end_column
                     and _value_text(cell.value)
                 ]
                 row_cells = [
-                    cell for column in region.label_columns
+                    (cell, _cell_row_column(cell)[1]) for column in region.label_columns
                     if (cell := cell_at.get((region.sheet, row, column))) is not None
                     and _value_text(cell.value)
                 ] + row_cells
                 pieces: list[dict] = []
-                for cell in sorted(row_cells, key=lambda item: (_cell_row_column(item)[1] or 0, item.order)):
-                    _, column = _cell_row_column(cell)
-                    header = _field_label(region, column or 0, common_header)
+                for cell, column in sorted(row_cells, key=lambda item: (item[1] or 0, item[0].order)):
+                    column_key = column or 0
+                    header = field_labels.get(column_key)
+                    if header is None:
+                        header = field_labels[column_key] = _field_label(region, column_key, common_header)
                     if not header:
                         label = left_labels.get(cell.element_id)
                         header = _value_text(label.value) if label is not None else "記載値"
-                    exact = _cell_render_text(cell)
+                    excel_metadata = _excel_value_metadata(cell)
+                    exact = _cell_render_text(cell, excel_metadata)
                     spans = _split_exact(exact)
+                    allow_identity = cell.element_id in key_evidence_ids
                     for span_index, (start, end, part) in enumerate(spans):
                         identifier_metadata = _extract_identifier_metadata(
                             exact,
                             field_label=header,
                             evidence_id=cell.element_id,
                             locator=cell.locator,
-                            allow_record_identity=cell.element_id in key_evidence_ids,
+                            allow_record_identity=allow_identity,
                             match_start=start,
                             match_end=end,
                         )
@@ -1000,8 +1039,9 @@ def _table_records(
                             cell, header, span_index, len(spans), start, end, part,
                             (relations_by_evidence.get(cell.element_id, [])
                             if region.mode == "coordinate_fallback" else []),
-                            allow_record_identity=cell.element_id in key_evidence_ids,
+                            allow_record_identity=allow_identity,
                             identifier_metadata=identifier_metadata,
+                            **({"excel_metadata": excel_metadata} if span_index == 0 else {}),
                         )
                         if span_index == 0 and cell.element_id in aliases:
                             piece["extra_citations"] = [
@@ -1015,7 +1055,8 @@ def _table_records(
                 section_path = _region_section_path(ctx, region, (table or row_cells[0]).locator)
                 if region.title:
                     section_path.append(f"領域「{region.title}」")
-                record_keys = [asdict(key) for key in context_record.keys]
+                record_keys = [{name: getattr(key, name) for name in _RECORD_KEY_FIELDS}
+                               for key in context_record.keys]
                 for index, group in enumerate(groups, start=1):
                     records.append(_base_record(
                         source_hash=ir.source.content_hash,
@@ -1030,8 +1071,8 @@ def _table_records(
                         context_prefix=prefix,
                         parent_id=region.region_id,
                         source_name=ctx.source_name,
-                        document_context=_document_context(ctx, region),
-                        region_context=_region_context(region),
+                        document_context=document_context,
+                        region_context=region_context,
                         record_keys=record_keys,
                         related_record_ids=list(ctx.related_records.get(context_record.record_id, ())),
                         context_confidence=context_record.confidence,
@@ -2183,6 +2224,7 @@ def validation_errors(ir: evidence_ir.EvidenceIR, result: RenderedEvidence) -> l
     return sorted(set(errors))
 
 
+@relaxed_gc
 def render(
     ir: evidence_ir.EvidenceIR,
     *,
@@ -2240,6 +2282,7 @@ def render(
     return result
 
 
+@relaxed_gc
 def write_chunks_atomic(path: str | Path, chunks: list[dict]) -> Path:
     """chunk配列を巨大な中間文字列へ複製せず、1件ずつgzipのJSONLへ原子書込する（設計: docs/design/rag.md「派生物」）。"""
     target = Path(path)

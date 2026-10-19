@@ -14,6 +14,7 @@ from xml.etree import ElementTree as ET
 
 from . import ArmResult
 from .. import document_ir
+from ..gc_relax import relaxed_gc
 
 # OOXML＝外部ライブラリ不要（docx/pptx は XML 直読み・xlsx は openpyxl）で常時 MD化できる。
 _EXTS = {".docx", ".xlsx", ".pptx"}
@@ -76,6 +77,7 @@ class OoxmlArm:
     def accepts(self, path) -> bool:
         return Path(path).suffix.lower() in _EXTS
 
+    @relaxed_gc
     def convert(self, path) -> ArmResult | None:
         from .. import office_md
         p = Path(path)
@@ -682,8 +684,7 @@ def _build_xlsx_ir(p: Path) -> document_ir.DocumentIR | None:
             cap_rows = excel.effective_cap_rows(ws_v.max_column)
             max_row = min(ws_v.max_row or 1, cap_rows + 1)
             max_col = min(ws_v.max_column or 1, excel.DEFAULT_CAP_COLS + 1)
-            grid = [list(row) for row in
-                    ws_v.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)]
+            grid = excel.value_grid(ws_v, max_row, max_col)
             merges = excel.merged_map(ws_v, cap_rows, excel.DEFAULT_CAP_COLS)
             filled = excel.filled_cells(ws_v, cap_rows, excel.DEFAULT_CAP_COLS, resolver=color_resolver)
             sheet_regions = excel.expand_regions_for_merges(

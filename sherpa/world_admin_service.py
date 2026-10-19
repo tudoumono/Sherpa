@@ -206,7 +206,7 @@ def _sync(world_id: str, *, failure_message: str, run_id=None, on_run_id=None,
         result = ingest_worker.sync(world_id, run_id=run_id, on_run_id=on_run_id, op=op)
     except Exception as exc:
         raise WorldAdminUnavailableError(f"{failure_message}: {exc.__class__.__name__}") from exc
-    if result["status"] in ("failed", "unavailable"):  # 反映失敗/参照元消失は成功にしない
+    if result["status"] in ("failed", "unavailable") and not result.get("interrupted"):  # 反映失敗/参照元消失は成功にしない（停止による中断は失敗ではない）
         raise WorldAdminUnavailableError(f"{failure_message}（{result['status']}）")
     return result
 

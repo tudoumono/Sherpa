@@ -5,12 +5,14 @@
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import mimetypes
 import os
 import stat
 from pathlib import Path
 
+import psycopg
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from sherpa import doc_ledger, safe_open, store, worlds
@@ -18,13 +20,25 @@ from sherpa import scope as scope_mod
 from sherpa.deps import _DEFAULT_WORLD, _WORLD_PATTERN, _current_user, _require_admin, _resolve_world, validated_scope
 from sherpa.fd_response import FdFileResponse, FdOwner, content_disposition
 from sherpa.ingest import text_kind
-from sherpa.store.db import world_lock_shared
 
 _log = logging.getLogger("sherpa")
+
+_SWAP_BUSY_MESSAGE = "資料フォルダの参照先を切り替えている最中です。少し待ってからもう一度お試しください"
 
 # router に tags を持たせない（各デコレータの tags と二重になりルート表 golden が一致しなくなる）。
 download_router = APIRouter()
 documents_router = APIRouter()
+
+
+@contextlib.contextmanager
+def _swap_read(world: str):
+    """参照先の入れ替え（rebind／削除）と読み取りを排他にする。取り込み中は待たない。上限を超えたら 503。"""
+    with contextlib.ExitStack() as st:
+        try:
+            st.enter_context(store.world_swap_lock_shared(world, timeout_ms=doc_ledger.SWAP_LOCK_WAIT_MS))
+        except psycopg.errors.LockNotAvailable:
+            raise HTTPException(503, _SWAP_BUSY_MESSAGE)
+        yield
 
 
 @download_router.get("/documents/download", tags=["文書"])
@@ -34,8 +48,8 @@ def doc_download(request: Request, rel: str = Query(...), world: str = Query(_DE
     ダウンロードは監査に記録され、記録できなければ許可しない。
     """
     u = _current_user(request)
-    # world_lock_shared は台帳確認の直前から fd の fstat 完了まで保持し、root は取得後に一度だけ解決する
-    with world_lock_shared(world):
+    # world_swap_lock_shared は台帳確認の直前から fd の fstat 完了まで保持し、root は取得後に一度だけ解決する
+    with _swap_read(world):
         # ① 台帳に完全一致で載っているか確認する（別名は落ちる）・秘匿名を塞ぐ
         if not store.document_exists(world, rel):
             raise HTTPException(404, "原本が見つかりません（パス不一致／未実在）")
@@ -94,7 +108,10 @@ def documents_list(request: Request, world: str | None = Query(None, pattern=_WO
     """
     _current_user(request)  # ログイン必須（auth 有効時）。
     w = _resolve_world(world)
-    docs, total = doc_ledger.public_documents_page(w, limit=limit, offset=offset)
+    try:
+        docs, total = doc_ledger.public_documents_page(w, limit=limit, offset=offset)
+    except psycopg.errors.LockNotAvailable:
+        raise HTTPException(503, _SWAP_BUSY_MESSAGE)
     body = {"world": w, "documents": docs, "total": total, "has_more": offset + len(docs) < total}
     if limit is not None:
         body["limit"], body["offset"] = limit, offset

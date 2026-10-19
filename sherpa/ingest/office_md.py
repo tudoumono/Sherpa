@@ -20,11 +20,13 @@ import time
 import zipfile
 from collections import Counter
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
 
 from .. import json_io
 from ..env_int import env_int
+from . import background
 from . import text_kind
 
 # MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
@@ -1367,12 +1369,12 @@ def _proc_rss_gib() -> float | None:
     return None
 
 def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = None,
-                  world_sig: str | None = None, world: str | None = None) -> dict:
+                  world_sig: str | None = None, world: str | None = None, walk=None) -> dict:
     """公開中の派生物を壊さずに作り直す薄いラッパ。
 
     実体は `_build_derived_into_staging`。途中で例外が起きてもステージングを残さず、公開中の内容には触れない。
     `world_sig` を渡すと、公開する派生物にその中身を作った資料フォルダ署名を刻む（`.world_sig`・`derived_generation` 参照）。
-    `world` は `_build_derived_into_staging` 参照。
+    `world`・`walk` は `_build_derived_into_staging` 参照。
     """
     published = Path(derived)
     published_rag = _sibling_layer_dir(published, "rag")
@@ -1382,7 +1384,8 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
     staging_ir = published_ir.with_name(published_ir.name + _STAGING_SUFFIX)
     all_staging = (staging, staging_rag, staging_ir)
     try:
-        rep = _build_derived_into_staging(wd, derived, progress=progress, world=world)
+        rep = _build_derived_into_staging(wd, derived, progress=progress, world=world,
+                                          **({"walk": walk} if walk is not None else {}))
     except BaseException:
         for s in all_staging:
             shutil.rmtree(s, ignore_errors=True)
@@ -1814,10 +1817,20 @@ def _conv_cache_prune(cache_root: Path, seen_rels: set) -> None:
             pass
 
 
-def _precheck_target(rp: Path, ext: str, conv) -> tuple[str, str | None, dict | None]:
+def _measured(measured: dict | None, key: str, fn, rp: Path):
+    """`measured` が渡されたとき、同じ原本の同じ測定（zip を開く）を 1 回で済ませる。"""
+    if measured is None:
+        return fn(rp)
+    if key not in measured:
+        measured[key] = fn(rp)
+    return measured[key]
+
+
+def _precheck_target(rp: Path, ext: str, conv, measured: dict | None = None) -> tuple[str, str | None, dict | None]:
     """候補 1 件の変換前の判定。`("unsupported"|"guard"|"ok", 理由コード, 実測値)` を返す。
 
     `ext not in conv`＝未対応、サイズ/セル数/非圧縮サイズの入口ガードに掛かれば `guard`。ループ本体と先読みの計画が同じ判定を使う。
+    `measured` は `_prefetch_heavy` と共有する測定結果の置き場（同じ原本の zip を 2 度開かない）。
     """
     if ext not in conv:
         return "unsupported", None, None
@@ -1825,13 +1838,13 @@ def _precheck_target(rp: Path, ext: str, conv) -> tuple[str, str | None, dict | 
         return "guard", "size_exceeded", None
     if ext == ".xlsx":
         # 圧縮爆弾ガード: st_size は圧縮後サイズのため、zip 内 dimension だけ見てセル数を見積もり、欠落/不正なら `<c ` の実カウントへフォールバックする。
-        estimated_cells = _xlsx_estimated_cell_count(rp)
+        estimated_cells = _measured(measured, "cells", _xlsx_estimated_cell_count, rp)
         if estimated_cells is None:
             estimated_cells = _xlsx_actual_cell_count(rp, _XLSX_CELL_CAP)
         if estimated_cells is not None and estimated_cells > _XLSX_CELL_CAP:
             return "guard", "cell_count_exceeded", {"measured_cells": estimated_cells, "cap_cells": _XLSX_CELL_CAP}
     if ext in CONVERTIBLE_EXT:
-        uncompressed = _office_uncompressed_total_bytes(rp)
+        uncompressed = _measured(measured, "uncompressed", _office_uncompressed_total_bytes, rp)
         if uncompressed is not None and uncompressed > _OFFICE_UNCOMPRESSED_CAP_BYTES:
             return ("guard", "uncompressed_size_exceeded",
                     {"measured_bytes": uncompressed, "cap_bytes": _OFFICE_UNCOMPRESSED_CAP_BYTES})
@@ -1844,19 +1857,20 @@ _PREFETCH_MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 _PREFETCH_MAX_XLSX_CELLS = 50_000
 
 
-def _prefetch_heavy(rp: Path, ext: str) -> bool:
-    """原本・非圧縮の合計・xlsx のセル数のどれかが先読みの目安を超えるか。測れないものは超えない扱い（本体ループが同じ原本を扱う）。"""
+def _prefetch_heavy(rp: Path, ext: str, measured: dict | None = None) -> bool:
+    """原本・非圧縮の合計・xlsx のセル数のどれかが先読みの目安を超えるか。測れないものは超えない扱い（本体ループが同じ原本を扱う）。
+    `measured` は `_precheck_target` と共有する測定結果の置き場。"""
     try:
         if rp.stat().st_size > _PREFETCH_MAX_FILE_BYTES:
             return True
     except OSError:
         return False
     if ext in CONVERTIBLE_EXT:
-        uncompressed = _office_uncompressed_total_bytes(rp)
+        uncompressed = _measured(measured, "uncompressed", _office_uncompressed_total_bytes, rp)
         if uncompressed is not None and uncompressed > _PREFETCH_MAX_UNCOMPRESSED_BYTES:
             return True
     if ext == ".xlsx":
-        cells = _xlsx_estimated_cell_count(rp)
+        cells = _measured(measured, "cells", _xlsx_estimated_cell_count, rp)
         if cells is None:
             cells = _xlsx_actual_cell_count(rp, _PREFETCH_MAX_XLSX_CELLS)
         if cells is not None and cells > _PREFETCH_MAX_XLSX_CELLS:
@@ -1864,10 +1878,54 @@ def _prefetch_heavy(rp: Path, ext: str) -> bool:
     return False
 
 
-def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit, obs_dir=None, assets_root=None) -> list:
+_PLAN_CHUNK = 2048   # 計画のスレッドへ一度に渡す件数（結果を溜めすぎない）
+
+
+def _plan_candidate(rp: Path, rel: str, ext: str, *, conv, cache_hit) -> tuple[bool, tuple | None, int | None]:
+    """先読み候補 1 件の I/O を伴う確認。スレッドで並列に呼ぶ。返値 `(先読みの対象か, (原本の stat, 入口ガードの判定), 原本サイズ)`。
+
+    変換キャッシュに当たるものはここで外す（先読みしない点は入口ガードに掛かっても同じなので、zip を開かない）。
+    判定の失敗は外す扱い（本体ループが同じ判定で扱う）。
+    """
+    from . import md_prefetch
+    try:
+        if cache_hit(rp, rel) is not None:
+            return False, None, None
+        src = md_prefetch.source_stat(rp)
+        measured: dict = {}
+        verdict = _precheck_target(rp, ext, conv, measured)
+        memo = (src, verdict) if src is not None else None
+        if verdict[0] != "ok" or _prefetch_heavy(rp, ext, measured):
+            return False, memo, None
+        return True, memo, src[0] if src is not None else None
+    except Exception:
+        return False, None, None
+
+
+def _legacy_prefetch_items(targets, *, candidate, conv, cache_hit) -> list[tuple[Path, str]]:
+    """旧形式の先変換の対象（本体ループの順）。ループ本体と同じ判定（候補・秘匿/ノイズ・入口ガード・変換結果キャッシュのヒット）を通ったものだけ。"""
+    items = []
+    for rp, rel in targets:
+        ext = rp.suffix.lower()
+        if ext not in LEGACY_OFFICE_EXT or ext not in candidate or ext not in conv or _is_skipped_original(rp, ext):
+            continue
+        try:
+            if _precheck_target(rp, ext, conv)[0] != "ok" or cache_hit(rp, rel) is not None:
+                continue
+        except Exception:
+            continue                                      # 判定の失敗は本体ループが同じ判定で扱う
+        items.append((rp, rel))
+    return items
+
+
+def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit, obs_dir=None, assets_root=None,
+                   threads: int = 1, precheck_memo: dict | None = None) -> list:
     """先読みする対象。ループ本体と同じ判定（候補・ガード・変換キャッシュのヒット）を通り、ooxml／pdf_text が受理する前段変換なしのファイルだけ。
     重いファイル（`_prefetch_heavy`）は子へ渡さない。
 
+    ① 候補を絞る（拡張子・秘匿名・ノイズ）② キャッシュ照合・入口ガード・重さの確認を `threads` 本のスレッドで並列に行う（I/O 待ち）
+    ③ 受理するアームの選択は親スレッドで直列に行う（PDF の品質判定が PDFium を使うためスレッドに載せない）。`jobs` は `targets` の順。
+    `precheck_memo` を渡すと、本体ループが使い回せるよう `{rel: (原本の stat, 入口ガードの判定)}` を入れる（本体ループは stat が同じときだけ使う）。
     `assets_root` を渡すと、VLM の補足観測が起きない（xlsx は Office 表示補完も無効）ファイルは子で描画まで行う（`Job.render`）。判定はここで 1 回だけ。
     """
     from . import office_native_display
@@ -1875,31 +1933,42 @@ def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit, obs_dir=None
     prefetchable = CONVERTIBLE_EXT | PDF_EXT
     render_ok = assets_root is not None and not _vlm_observation_possible()
     native_display = office_native_display.config().enabled if render_ok else True
-    jobs = []
+    cands = []
     for rp, rel in targets:
         ext = rp.suffix.lower()
-        try:
-            if ext not in candidate or _is_skipped_original(rp, ext) or ext not in prefetchable:
-                continue
-            if _precheck_target(rp, ext, conv)[0] != "ok" or cache_hit(rp, rel) is not None:
-                continue
-            if _prefetch_heavy(rp, ext):
-                continue
-            arm = _select_arm(rp, enabled)
-        except Exception:
-            continue                                  # 判定の失敗は本体ループが同じ判定で扱う
-        if arm is not None and arm.name in PREFETCH_ARMS:
-            render = render_ok and not (ext == ".xlsx" and native_display)
-            jobs.append(Job(
-                rel=rel, path=str(rp), arm_name=arm.name, ext=ext, render=render,
-                assets_dir=str(assets_root / (rel + ".assets")) if render else None,
-                obs_dir=str(obs_dir) if render and obs_dir is not None else None))
+        if ext in candidate and ext in prefetchable and not _is_skipped_original(rp, ext):
+            cands.append((rp, rel, ext))
+
+    def _check(c):
+        return _plan_candidate(c[0], c[1], c[2], conv=conv, cache_hit=cache_hit)
+
+    jobs = []
+    with contextlib.ExitStack() as stack:
+        pool = stack.enter_context(ThreadPoolExecutor(max_workers=threads)) if threads > 1 else None
+        for i in range(0, len(cands), _PLAN_CHUNK):
+            chunk = cands[i:i + _PLAN_CHUNK]
+            for (rp, rel, ext), (ok, memo, size) in zip(
+                    chunk, pool.map(_check, chunk) if pool is not None else map(_check, chunk)):
+                if memo is not None and precheck_memo is not None:
+                    precheck_memo[rel] = memo
+                if not ok:
+                    continue
+                try:
+                    arm = _select_arm(rp, enabled)
+                except Exception:
+                    continue                              # 判定の失敗は本体ループが同じ判定で扱う
+                if arm is not None and arm.name in PREFETCH_ARMS:
+                    render = render_ok and not (ext == ".xlsx" and native_display)
+                    jobs.append(Job(
+                        rel=rel, path=str(rp), arm_name=arm.name, ext=ext, render=render,
+                        assets_dir=str(assets_root / (rel + ".assets")) if render else None,
+                        obs_dir=str(obs_dir) if render and obs_dir is not None else None, size=size))
     return jobs
 
 
 def _build_derived_into_staging(
     wd, derived, *, progress: Callable[[int, int], None] | None = None, world: str | None = None,
-    only: list[tuple[Path, str]] | None = None,
+    only: list[tuple[Path, str]] | None = None, walk=None,
 ) -> dict:
     """`wd` 配下の Office を MD 化して派生物を書き出す（毎回まるごと作り直す）。
 
@@ -1918,15 +1987,16 @@ def _build_derived_into_staging(
     - 失敗の知らせで公開した文書を除いて IR の失敗が 0 のときだけ `.document_ir_sig`、`evidence_ir_failed == 0` のときだけ `.evidence_ir_sig` を書く。
     - `only`（`[(原本 Path, rel)]`）を渡すと、資料フォルダを歩かずその原本だけを同じファイルごとの処理に通す（1 ファイルの再変換用）。
       このときキャッシュの剪定はしない（ステージングに書いた資料フォルダ単位の版の印は公開しない）。
+    - `walk`（`scope_infer.WalkSnapshot`）を渡すと、同じ取り込みで走査済みの本体の列挙を使い、本体を歩き直さない（アーカイブの展開先だけ歩く）。
     """
     with contextlib.ExitStack() as stack:
         return _build_derived_staging_body(
-            wd, derived, progress=progress, world=world, only=only, stack=stack)
+            wd, derived, progress=progress, world=world, only=only, stack=stack, walk=walk)
 
 
 def _build_derived_staging_body(
     wd, derived, *, progress: Callable[[int, int], None] | None = None, world: str | None = None,
-    only: list[tuple[Path, str]] | None = None, stack: contextlib.ExitStack,
+    only: list[tuple[Path, str]] | None = None, stack: contextlib.ExitStack, walk=None,
 ) -> dict:
     """`_build_derived_into_staging` の本体。`stack` には先読みのプールなど関数の終わりに閉じるものを積む。"""
     from .. import scope_infer as si
@@ -2263,7 +2333,16 @@ def _build_derived_staging_body(
 
     _also = _archive_also_root(world)   # アーカイブ取り込み: この関数内の全 safe_files 呼び出しで共有
 
-    targets = list(only) if only is not None else list(si.safe_files(wd, also=_also))
+    if only is not None:
+        targets = list(only)
+    else:
+        listed = walk.files_for(wd) if walk is not None else None
+        if listed is None:
+            targets = list(si.safe_files(wd, also=_also))
+        else:                                            # 本体は走査済みの列挙・アーカイブの展開先は展開後の今を歩く（`safe_files(also=)` と同じ並び）
+            targets = list(listed)
+            if _also is not None and Path(_also).is_dir():
+                targets.extend(si.safe_files(_also))
 
     def _conv_cache_hit(rp: Path, rel: str):
         """per-file キャッシュ照合。返値 `(キー, ヒット|None)`。キー None＝キャッシュ対象外。ループ本体と先読みの計画が共有する。"""
@@ -2277,11 +2356,13 @@ def _build_derived_staging_body(
         progress(0, candidate_total)
 
     prefetch = None
+    precheck_memo: dict = {}      # 先読みの計画が済ませた入口ガードの判定（rel → (原本の stat, 判定)）。本体ループは stat が同じときだけ使う
     workers = md_prefetch.worker_count()
     if workers > 1 and candidate_total > 1:
         jobs = _prefetch_jobs(targets, candidate=candidate, conv=conv, enabled=enabled,
                               cache_hit=lambda rp, rel: _conv_cache_hit(rp, rel)[1],
-                              obs_dir=obs_dir, assets_root=dr_rag)
+                              obs_dir=obs_dir, assets_root=dr_rag,
+                              threads=md_prefetch.plan_threads(), precheck_memo=precheck_memo)
         if len(jobs) > 1:
             workers = min(workers, len(jobs))
             _log.info("MD化の重い計算を先読みします: %d件・ワーカー %d", len(jobs), workers)
@@ -2291,7 +2372,20 @@ def _build_derived_staging_body(
                 _log.warning("MD化の先読みを始められませんでした（直列で処理します）", exc_info=True)
                 prefetch = None
 
+    legacy_prefetch = None
+    if legacy_convert.legacy_backend_name() == "libreoffice":
+        from .arms import legacy_prefetch as _legacy_prefetch
+        legacy_prefetch = _legacy_prefetch.start(
+            _legacy_prefetch_items(targets, candidate=candidate, conv=conv,
+                                   cache_hit=lambda rp, rel: _conv_cache_hit(rp, rel)[1]),
+            legacy_cache)
+        if legacy_prefetch is not None:
+            stack.enter_context(legacy_prefetch)
+            _log.info("旧形式の先変換を始めます: %d件", legacy_prefetch.planned)
+
     for rp, rel in targets:
+        if only is None:
+            background.raise_if_stop_requested()   # 停止要求は 1 件ごとの区切りで確かめる（処理中の 1 件は変換キャッシュへ保存するまで進む）
         pending_meta.clear()
         ext = rp.suffix.lower()
         if ext not in candidate:
@@ -2300,6 +2394,7 @@ def _build_derived_staging_body(
             # 秘匿名・ロックファイルは拡張子だけの `candidate` 集合では除けないため、変換ループで別途塞ぐ（派生 MD を一切作らない）
             _log.warning("MD化をスキップします（秘匿名またはノイズのため対象外・ext=%s）", ext)
             continue
+        background.note_file(rel)
         by[ext] += 1
         conv_cache_seen_rels.add(rel)        # 剪定用「今回の原本一覧」（成否問わず候補に入った rel すべて）
         # `accepts()`/`convert()` は各アーム実装由来の想定外例外を投げうるため、1 ファイル分の処理をまるごと try/except で包む
@@ -2321,7 +2416,11 @@ def _build_derived_staging_body(
         try:
             # 入口ガード群（`size_exceeded`・`cell_count_exceeded`/`uncompressed_size_exceeded`）は per-file キャッシュ照合より先に評価する
             # （逆順だとキャッシュヒットでガードが素通りする）。キャッシュ照合は全ガード通過後にのみ行う。
-            verdict, guard_code, guard_detail = _precheck_target(rp, ext, conv)
+            planned = precheck_memo.pop(rel, None)
+            if planned is not None and md_prefetch.source_stat(rp) == planned[0]:
+                verdict, guard_code, guard_detail = planned[1]   # 計画で判定済み・原本は変わっていない
+            else:
+                verdict, guard_code, guard_detail = _precheck_target(rp, ext, conv)
             if verdict == "unsupported":                     # PDF(バックエンド無)/旧バイナリ/該当アーム無効は未対応
                 if ext in LEGACY_OFFICE_EXT:
                     unavailable_evidence = legacy_provenance.build_unavailable_evidence(
@@ -2385,6 +2484,8 @@ def _build_derived_staging_body(
             conv_path, extra_notes = rp, []
             legacy_conversion = None
             if ext in legacy_convert.LEGACY_EXT_MAP:         # 旧形式＝先に OOXML へ前段変換（LibreOffice 等）
+                if legacy_prefetch is not None:
+                    legacy_prefetch.settle(rel)
                 materialized = legacy_convert.ensure_ooxml(rp, rel, legacy_cache)
                 if materialized is None:
                     # `backend_ready=False`（バックエンド未設定/未到達）は失敗ではなく未対応（「失敗」と「対象外」を混ぜない）。
@@ -2660,6 +2761,7 @@ def _build_derived_staging_body(
                 progress(processed_candidates, candidate_total)
     if prefetch is not None:
         prefetch.close()                                 # 子の終了を待ち、使われなかった素材を消す（公開前に済ませる）
+    background.note_file(None)
     # per-file ループを完走したときだけ剪定する（`_conv_cache_prune` 参照）。
     # 途中死では呼ばれず、生きている rel のキャッシュは次回 sync で再利用できる。
     if only is None:

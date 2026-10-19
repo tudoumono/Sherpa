@@ -1217,6 +1217,7 @@ class IngestSummaryFields(BaseModel):
     last_run_id: int | None
     last_run_status: str | None
     last_run_warnings: list[str]
+    last_run_interrupted: bool = False
     last_run_blocked: list[IngestBlockedDoc]
     last_run_flags_total: int
     last_run_flags_truncated: bool

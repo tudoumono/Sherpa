@@ -35,6 +35,8 @@ from .db import (
     workspace_file_lock,
     world_lock,
     world_registry_lock,
+    world_swap_lock,
+    world_swap_lock_shared,
 )  # noqa: F401
 # `_inited`/`dict_row` は db.py 側の実装詳細で、公開名一覧を保つためだけに re-export する。
 from .db import _inited, dict_row  # noqa: F401
@@ -95,7 +97,7 @@ from .failed_docs import (  # noqa: F401
 
 # documents・ingest の re-export。
 from .documents import (  # noqa: F401
-    count_documents, document_exists, get_document, list_document_worlds, list_documents,
+    count_and_list_documents, count_documents, document_exists, get_document, list_document_worlds, list_documents,
     list_documents_page, replace_document, replace_documents,
 )
 from .ingest import (  # noqa: F401
@@ -110,6 +112,8 @@ from .ingest import (  # noqa: F401
     get_latest_published_run_summary,
     get_latest_run_summary,
     list_ingest_runs,
+    list_worlds_with_interrupted_latest_run,
+    note_ingest_run_op,
     start_ingest_run,
     update_ingest_run_progress,
 )

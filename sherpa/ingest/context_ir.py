@@ -13,7 +13,8 @@ import json
 import re
 import unicodedata
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,10 @@ _IDENTIFIER_TOKEN_RE = re.compile(
     r"[A-Za-z0-9Ａ-Ｚａ-ｚ０-９])"
     r"(?![A-Za-z0-9Ａ-Ｚａ-ｚ０-９_＿])"
 )
+# 守ること: 候補の字種は `_IDENTIFIER_TOKEN_RE` の字種（半角・全角の英数字と記号）に限る。字種を足したら下の 3 つも合わせる
+_LETTER_RE = re.compile(r"[A-Za-zＡ-Ｚａ-ｚ]")
+_DIGIT_RE = re.compile(r"[0-9０-９]")
+_SEPARATOR_RE = re.compile(r"[_\-/:]")
 _REFERENCE_LABEL_MARKERS = (
     "呼び出し先", "呼出先", "真遷移先", "偽遷移先", "遷移先", "遷移元", "発生段落", "参照先", "参照元",
     "リンク先", "接続先", "転送先", "依存先", "参照", "親id", "子id", "関連id",
@@ -132,7 +137,11 @@ class ContextRegion:
     label_columns: tuple[int, ...] = ()
 
     def header_for(self, column: int) -> tuple[str, ...]:
-        return dict(self.header_paths).get(column, ())
+        mapping = self.__dict__.get("_header_map")
+        if mapping is None:
+            mapping = dict(self.header_paths)
+            object.__setattr__(self, "_header_map", mapping)
+        return mapping.get(column, ())
 
 
 @dataclass
@@ -226,6 +235,17 @@ def _identifier_role(field_label: str, text_before: str, *, allow_record_identit
     return "unclassified", f"{IDENTIFIER_ROLE_ANALYZER_VERSION}:unsupported_field_label"
 
 
+_NO_MENTIONS = IdentifierMentionBatch(mentions=(), mention_count=0, overflow_count=0)
+
+
+def has_identifier_candidate(text: str) -> bool:
+    """識別子の候補（英字を含む照合語）が 1 つでもあるか。無ければ `identifier_mentions_with_metadata` は何も返さない。"""
+    for match in _IDENTIFIER_TOKEN_RE.finditer(text):
+        if _LETTER_RE.search(match.group(0)) is not None:
+            return True
+    return False
+
+
 def identifier_mentions_with_metadata(
     value: Any,
     *,
@@ -249,7 +269,7 @@ def identifier_mentions_with_metadata(
     text = value if isinstance(value, str) else ("" if value is None else str(value))
     range_start = 0 if match_start is None else max(0, match_start)
     range_end = len(text) if match_end is None else min(len(text), max(range_start, match_end))
-    compact_locator = locator if isinstance(locator, dict) else _identifier_locator(locator)
+    compact_locator: dict[str, Any] | None = locator if isinstance(locator, dict) else None
     mentions: list[IdentifierMention] = []
     mention_count = 0
     for match in _IDENTIFIER_TOKEN_RE.finditer(text):
@@ -258,10 +278,10 @@ def identifier_mentions_with_metadata(
         candidate = match.group(0)
         if len(candidate) > IDENTIFIER_MAX_CHARS:
             continue
-        normalized_candidate = normalize_identifier_candidate(candidate)
-        if not any(char.isalpha() for char in candidate):
+        if _LETTER_RE.search(candidate) is None:
             continue
-        if not (any(char.isdigit() for char in candidate) or any(char in "_-/:" for char in normalized_candidate)):
+        normalized_candidate = normalize_identifier_candidate(candidate)
+        if _DIGIT_RE.search(candidate) is None and _SEPARATOR_RE.search(normalized_candidate) is None:
             continue
         mention_count += 1
         if len(mentions) >= max_mentions:
@@ -274,6 +294,8 @@ def identifier_mentions_with_metadata(
             role, role_basis = _identifier_role(
                 field_label, text[:match.start()], allow_record_identity=allow_record_identity,
             )
+        if compact_locator is None:
+            compact_locator = _identifier_locator(locator)
         mentions.append(IdentifierMention(
             value=candidate,
             normalized_value=normalized_candidate,
@@ -284,6 +306,8 @@ def identifier_mentions_with_metadata(
             locator=dict(compact_locator),
             text_span={"start": text_offset + match.start(), "end": text_offset + match.end()},
         ))
+    if not mention_count:
+        return _NO_MENTIONS
     return IdentifierMentionBatch(
         mentions=tuple(mentions),
         mention_count=mention_count,
@@ -349,11 +373,13 @@ def _span(cell: evidence_ir.EvidenceElement, name: str) -> int:
 def _sheet_titles(cells: list[evidence_ir.EvidenceElement]) -> dict[str, str]:
     candidates: dict[str, list[tuple[int, int, int, str]]] = defaultdict(list)
     for cell in cells:
+        width = _span(cell, "column_span")
+        if width < 2:
+            continue
         row, column = _row_column(cell)
         value = _text(cell.value)
         sheet = cell.locator.sheet
-        width = _span(cell, "column_span")
-        if sheet and row is not None and column is not None and value and width >= 2:
+        if sheet and row is not None and column is not None and value:
             candidates[sheet].append((row, -width, column, value))
     return {
         sheet: min(values)[3]
@@ -424,7 +450,7 @@ def _pdf_titles(ir: evidence_ir.EvidenceIR) -> dict[str, str]:
 def _region_specs(
     cells: list[evidence_ir.EvidenceElement],
 ) -> list[tuple[int, int, int | None, str | None]]:
-    positions = [(_row_column(cell), cell) for cell in cells if _row_column(cell)[0] is not None]
+    positions = [(position, cell) for cell in cells if (position := _row_column(cell))[0] is not None]
     min_row = min(position[0] for position, _ in positions)
     min_column = min(position[1] for position, _ in positions)
     max_column = max(position[1] + _span(cell, "column_span") - 1 for position, cell in positions)
@@ -500,8 +526,20 @@ def _is_header_band_row(row_cells: list[evidence_ir.EvidenceElement]) -> bool:
     return not any(len(text) > 40 or text.endswith(("。", "！", "？")) or "\n" in text for text in texts)
 
 
+def _text_cells_by_row(
+    cells: list[evidence_ir.EvidenceElement], first_row: int, last_row: int,
+) -> dict[int, list[evidence_ir.EvidenceElement]]:
+    """`first_row`〜`last_row` の各行にある、文字のあるセル（元の並びのまま）。"""
+    by_row: dict[int, list[evidence_ir.EvidenceElement]] = defaultdict(list)
+    for cell in cells:
+        row = _row_column(cell)[0]
+        if row is not None and first_row <= row <= last_row and _text(cell.value):
+            by_row[row].append(cell)
+    return by_row
+
+
 def _header_band_last_row(
-    cells: list[evidence_ir.EvidenceElement],
+    text_by_row: dict[int, list[evidence_ir.EvidenceElement]],
     start: int,
     chosen: int,
     end_column: int,
@@ -514,18 +552,18 @@ def _header_band_last_row(
     """
     first_data = None
     for row in range(start, chosen + 1):
-        row_cells = [cell for cell in cells if _row_column(cell)[0] == row and _text(cell.value)]
+        row_cells = text_by_row.get(row, [])
         if any(_is_data_number(cell.value) for cell in row_cells):
             first_data = row
             break
     if first_data is None or first_data == start:
         return None
     for row in range(start, first_data):
-        row_cells = [cell for cell in cells if _row_column(cell)[0] == row and _text(cell.value)]
+        row_cells = text_by_row.get(row, [])
         if not _is_header_band_row(row_cells):
             return None
     last = first_data - 1
-    last_cells = [cell for cell in cells if _row_column(cell)[0] == last and _text(cell.value)]
+    last_cells = text_by_row.get(last, [])
     return last if len(last_cells) >= min(2, end_column - start_column + 1) else None
 
 
@@ -539,9 +577,11 @@ def _header_row(
     min_row = min(row for cell in cells if (row := _row_column(cell)[0]) is not None)
     start = (title_row + 1) if title_row is not None else min_row
     stop = min(max_row - 1, start + 4)
+    text_by_row = _text_cells_by_row(cells, start, stop)
+    last_text_row = max((_row_column(cell)[0] or 0 for cell in cells if _text(cell.value)), default=None)
     candidates: list[tuple[int, float, int]] = []
     for row in range(start, stop + 1):
-        row_cells = [cell for cell in cells if _row_column(cell)[0] == row and _text(cell.value)]
+        row_cells = text_by_row.get(row, [])
         if not row_cells:
             continue
         # 縦結合 label で文章を束ねる小表を header 表と誤認しない
@@ -550,11 +590,7 @@ def _header_row(
         texts = [_text(cell.value) for cell in row_cells]
         if any(len(text) > 40 or text.endswith(("。", "！", "？")) or "\n" in text for text in texts):
             continue
-        later = any(
-            (_row_column(cell)[0] or 0) > row and _text(cell.value)
-            for cell in cells
-        )
-        if not later:
+        if last_text_row is None or last_text_row <= row:      # これより下に文字のあるセルが無い
             continue
         nonempty = len(row_cells)
         width = end_column - start_column + 1
@@ -567,9 +603,9 @@ def _header_row(
     if not candidates:
         return None, 0.0
     nonempty, score, neg_row = max(candidates)
-    band_last = _header_band_last_row(cells, start, -neg_row, end_column, start_column)
+    band_last = _header_band_last_row(text_by_row, start, -neg_row, end_column, start_column)
     if band_last is not None:
-        row_cells = [cell for cell in cells if _row_column(cell)[0] == band_last and _text(cell.value)]
+        row_cells = text_by_row.get(band_last, [])
         width = end_column - start_column + 1
         nonempty = len(row_cells)
         string_ratio = sum(isinstance(cell.value, str) for cell in row_cells) / nonempty
@@ -592,15 +628,35 @@ def _header_text(cell: evidence_ir.EvidenceElement) -> str:
     return _text(cell.value)
 
 
-def _covering_value(cells: list[evidence_ir.EvidenceElement], row: int, column: int) -> str | None:
-    candidates = []
+def _covering_values(
+    cells: list[evidence_ir.EvidenceElement], rows: set[int],
+) -> tuple[dict[int, list[evidence_ir.EvidenceElement]], dict[int, list[evidence_ir.EvidenceElement]]]:
+    """`rows` の各行について、その行を覆う文字のあるセル（縦結合の続きを含む）と、その行から始まるセルを 1 回の走査で集める。"""
+    first, last = min(rows), max(rows)
+    covering: dict[int, list[evidence_ir.EvidenceElement]] = {row: [] for row in rows}
+    starting: dict[int, list[evidence_ir.EvidenceElement]] = {row: [] for row in rows}
     for cell in cells:
         cell_row, cell_column = _row_column(cell)
-        if cell_row is None or cell_column is None or not _text(cell.value):
+        if cell_row is None or cell_column is None:
             continue
-        if not cell_row <= row < cell_row + _span(cell, "row_span"):
+        row_span = _span(cell, "row_span")
+        if cell_row > last or cell_row + row_span <= first:
             continue
-        if cell_column <= column < cell_column + _span(cell, "column_span"):
+        if cell_row in starting:
+            starting[cell_row].append(cell)
+        if not _text(cell.value):
+            continue
+        for row in range(max(cell_row, first), min(cell_row + row_span, last + 1)):
+            if row in covering:
+                covering[row].append(cell)
+    return covering, starting
+
+
+def _covering_value(covering: list[evidence_ir.EvidenceElement], column: int) -> str | None:
+    candidates = []
+    for cell in covering:
+        cell_column = _row_column(cell)[1]
+        if cell_column is not None and cell_column <= column < cell_column + _span(cell, "column_span"):
             candidates.append((cell_column, _header_text(cell)))
     return min(candidates)[1] if candidates else None
 
@@ -612,33 +668,37 @@ def _header_paths(
     title_row: int | None,
     header_row: int,
 ) -> tuple[tuple[int, tuple[str, ...]], ...]:
+    middle_rows = range(title_row + 1, header_row) if title_row is not None else range(0)
+    covering, starting = _covering_values(cells, {*middle_rows, header_row})
     paths: list[tuple[int, tuple[str, ...]]] = []
     for column in range(start_column, end_column + 1):
         values: list[str] = []
-        if title_row is not None:
-            for row in range(title_row + 1, header_row):
-                value = _covering_value(cells, row, column)
-                # 中間行は、複数列を束ねる見出しだけを header path にする
-                if value:
-                    owner = next((cell for cell in cells if _row_column(cell)[0] == row
-                                  and _row_column(cell)[1] is not None
-                                  and (_row_column(cell)[1] or 0) <= column
-                                  < (_row_column(cell)[1] or 0) + _span(cell, "column_span")
-                                  and _header_text(cell) == value), None)
-                    if owner is not None and _span(owner, "column_span") >= 2:
-                        values.append(value)
-        direct = _covering_value(cells, header_row, column)
+        for row in middle_rows:
+            value = _covering_value(covering[row], column)
+            # 中間行は、複数列を束ねる見出しだけを header path にする
+            if value:
+                owner = next((cell for cell in starting[row]
+                              if (_row_column(cell)[1] or 0) <= column
+                              < (_row_column(cell)[1] or 0) + _span(cell, "column_span")
+                              and _header_text(cell) == value), None)
+                if owner is not None and _span(owner, "column_span") >= 2:
+                    values.append(value)
+        direct = _covering_value(covering[header_row], column)
         if direct:
             values.append(direct)
         paths.append((column, tuple(dict.fromkeys(values))))
     return tuple(paths)
 
 
-def _key_score(label: str, value: str, column: int) -> tuple[int, int]:
+@lru_cache(maxsize=4096)
+def _keyword_score(label: str) -> int:
     normalized = label.casefold()
-    keyword = max((100 - index * 10 for index, word in enumerate(_KEY_WORDS) if word in normalized), default=0)
+    return max((100 - index * 10 for index, word in enumerate(_KEY_WORDS) if word in normalized), default=0)
+
+
+def _key_score(label: str, value: str, column: int) -> tuple[int, int]:
     id_bonus = 60 if _ID_RE.fullmatch(value) else 0
-    return keyword + id_bonus, -column
+    return _keyword_score(label) + id_bonus, -column
 
 
 def _record_for(
@@ -646,17 +706,20 @@ def _record_for(
     region: ContextRegion,
     row: int,
     row_cells: list[evidence_ir.EvidenceElement],
+    candidate_free: set[str] | None = None,
 ) -> ContextRecord:
     candidates: list[tuple[tuple[int, int], RecordKey]] = []
     identifiers: list[str] = []
-    for cell in sorted(row_cells, key=lambda item: _row_column(item)[1] or 0):
-        _, column = _row_column(cell)
+    columns = [(_row_column(cell)[1], cell) for cell in row_cells]
+    columns.sort(key=lambda item: item[0] or 0)
+    header_by_column = {column: " > ".join(path) for column, path in region.header_paths}
+    for column, cell in columns:
         if column is None:
             continue
         value = _text(cell.value)
         if not value:
             continue
-        header = " > ".join(region.header_for(column))
+        header = header_by_column.get(column, "")
         if _ID_RE.fullmatch(value):
             identifiers.append(value)
         score = _key_score(header, value, column)
@@ -675,13 +738,17 @@ def _record_for(
     key_evidence_ids = {key.evidence_id for key in keys}
     mentions: list[IdentifierMention] = []
     mention_count = 0
-    for cell in sorted(row_cells, key=lambda item: _row_column(item)[1] or 0):
-        column = _row_column(cell)[1]
+    for column, cell in columns:
         if column is None:
             continue
+        value = cell.value
+        if isinstance(value, str) and not has_identifier_candidate(value):
+            if candidate_free is not None:
+                candidate_free.add(cell.element_id)
+            continue
         batch = identifier_mentions_with_metadata(
-            cell.value,
-            field_label=" > ".join(region.header_for(column)),
+            value,
+            field_label=header_by_column.get(column, ""),
             evidence_id=cell.element_id,
             locator=cell.locator,
             allow_record_identity=cell.element_id in key_evidence_ids,
@@ -689,6 +756,8 @@ def _record_for(
         )
         mention_count += batch.mention_count
         mentions.extend(batch.mentions)
+        if candidate_free is not None and batch.mention_count == 0:
+            candidate_free.add(cell.element_id)
     overflow_count = max(0, mention_count - len(mentions))
     record_id = _stable_id("context-record", source_hash, region.region_id, row)
     return ContextRecord(
@@ -926,6 +995,7 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
         return ()
 
     label_candidates: dict[str, tuple[int, ...]] = {}
+    candidate_free: set[str] = set()          # 識別子の候補が 1 つも無いと分かったセル（要素ごとの再走査を省く）
     for table_id, table_cells in sorted(by_parent.items(), key=lambda item: min(cell.order for cell in item[1])):
         table = tables.get(table_id)
         rows = [row for cell in table_cells if (row := _row_column(cell)[0]) is not None]
@@ -1009,7 +1079,8 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
                 if row is not None and row >= data_start and _text(cell.value):
                     by_row[row].append(cell)
             for row, row_cells in sorted(by_row.items()):
-                context.records.append(_record_for(ir.source.content_hash, region, row, row_cells))
+                context.records.append(
+                    _record_for(ir.source.content_hash, region, row, row_cells, candidate_free))
 
     if source_type == "xlsx":
         _attach_row_labels(context, cells, label_candidates)
@@ -1040,7 +1111,7 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
         for mention in record.identifier_mentions:
             mentions_by_element[mention.evidence_id].append(mention)
     for element in ir.elements:
-        if element.element_id not in mentions_by_element:
+        if element.element_id not in mentions_by_element and element.element_id not in candidate_free:
             mentions_by_element[element.element_id].extend(identifier_mentions(
                 element.value,
                 field_label="",
@@ -1115,15 +1186,58 @@ def _context_from_payload(raw: dict[str, Any]) -> ContextIR:
     )
 
 
+_DATACLASS_FIELDS: dict[type, tuple[str, ...]] = {}
+
+
+def _dataclass_payload(value: Any) -> dict[str, Any]:
+    """dataclass を、`asdict` と同じキー順（フィールド順）の dict にする。入れ子は JSON 直列化器が辿る。"""
+    cls = type(value)
+    names = _DATACLASS_FIELDS.get(cls)
+    if names is None:
+        if not is_dataclass(value):
+            raise TypeError(f"Object of type {cls.__name__} is not JSON serializable")
+        names = _DATACLASS_FIELDS[cls] = tuple(f.name for f in fields(cls))
+    return {name: getattr(value, name) for name in names}
+
+
+_ENCODE_CONTEXT = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), default=_dataclass_payload).encode
+_CONTEXT_BATCH = 512
+
+
+def _json_parts(context: ContextIR, ir: evidence_ir.EvidenceIR):
+    """`to_json_str` と同じ文字列を、フィールドごと・512 件ごとの断片で返す。"""
+    yield '{"key":'
+    yield _ENCODE_CONTEXT(_current_key(ir, context.source_name))
+    yield ',"context":{'
+    for index, field_info in enumerate(fields(ContextIR)):
+        value = getattr(context, field_info.name)
+        yield ("," if index else "") + _ENCODE_CONTEXT(field_info.name) + ":"
+        if isinstance(value, list) and len(value) > _CONTEXT_BATCH:
+            yield "["
+            for start in range(0, len(value), _CONTEXT_BATCH):
+                text = _ENCODE_CONTEXT(value[start:start + _CONTEXT_BATCH])
+                yield ("," if start else "") + text[1:-1]
+            yield "]"
+        elif isinstance(value, dict) and len(value) > _CONTEXT_BATCH:
+            yield "{"
+            items = list(value.items())
+            for start in range(0, len(items), _CONTEXT_BATCH):
+                text = _ENCODE_CONTEXT(dict(items[start:start + _CONTEXT_BATCH]))
+                yield ("," if start else "") + text[1:-1]
+            yield "}"
+        else:
+            yield _ENCODE_CONTEXT(value)
+    yield "}}\n"
+
+
 def to_json_str(context: ContextIR, ir: evidence_ir.EvidenceIR) -> str:
     """Context IR を、作った元の Evidence を照合する鍵つきの JSON にする。"""
-    return json.dumps({"key": _current_key(ir, context.source_name), "context": asdict(context)},
-                      ensure_ascii=False, separators=(",", ":")) + "\n"
+    return "".join(_json_parts(context, ir))
 
 
 def to_gzip_bytes(context: ContextIR, ir: evidence_ir.EvidenceIR) -> bytes:
     """`write_json_atomic` が書くのと同じ gzip バイト列（別プロセスで直列化して親が書くとき用）。"""
-    return json_io.gzip_text_bytes([to_json_str(context, ir)])
+    return json_io.gzip_text_bytes(_json_parts(context, ir))
 
 
 def write_json_atomic(path: str | Path, context: ContextIR, ir: evidence_ir.EvidenceIR) -> Path:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import stat as stat_mod
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from .ingest import text_kind
@@ -154,6 +155,39 @@ def safe_files(root, *, strict: bool = False, deadline: float | None = None, als
         # 後処理完了時にも期限を確認する。
         if deadline is not None and time.monotonic() > deadline:
             raise ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
+
+
+@dataclass
+class WalkSnapshot:
+    """1 回の取り込みの中で共有する、登録フォルダ本体の `safe_files(root)`（非 strict）の列挙結果。
+
+    `files`＝`(resolved_path, rel_posix)` の列（`safe_files` の出力と同じ並び）。`complete`＝読めなかったもの
+    （`unreadable_dir`/`unreadable_file`）が 1 件も無かった。取り込みをまたいで持ち越さない。
+    """
+    root: Path
+    files: list
+    complete: bool
+    walked: bool
+
+    @classmethod
+    def from_walk(cls, root, files: list, skipped: dict) -> WalkSnapshot:
+        root = Path(root)
+        walked = root.is_dir() and not root.is_symlink()   # `safe_files` が実際に歩く root か
+        return cls(root=root, files=files, walked=walked,
+                   complete=not (skipped.get("unreadable_dir") or skipped.get("unreadable_file")))
+
+    def files_for(self, root, *, strict: bool = False) -> list | None:
+        """`root` を同じ規律で歩いた結果として使えるなら `files`、使えなければ None（呼び出し側が自分で歩く）。
+
+        strict で歩く呼び出し元は、非 strict の走査で読めないものがあった（strict なら例外になったはずの）ときは使えない。
+        """
+        if not self.walked or (strict and not self.complete):
+            return None
+        try:
+            same = Path(root).resolve() == self.root.resolve()
+        except OSError:
+            return None
+        return self.files if same else None
 
 
 def unique_index(items, keyfn):

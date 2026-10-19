@@ -981,6 +981,46 @@ def world_lock_shared(world_id, *, timeout_ms: int | None = None, connect_timeou
             conn.close()
 
 
+def _world_swap_lock_key(world_id) -> int:
+    """`world_swap_lock*` のキー導出。`world_lock` の鍵とは別の文字列から作る（別の名前空間）。"""
+    return int.from_bytes(hashlib.sha1(f"swap:{_KB_ID}:{world_id}".encode("utf-8")).digest()[:8],
+                          "big", signed=True)
+
+
+@contextlib.contextmanager
+def _advisory(key: int, *, shared: bool, timeout_ms: int | None):
+    """session-level advisory lock の共通部（専用接続・autocommit）。`timeout_ms` 超過は `LockNotAvailable`（最小 1ms にクランプ＝0 は無制限待ち）。"""
+    _ensure()
+    conn = psycopg.connect(_dsn(), autocommit=True)
+    sfx = "_shared" if shared else ""
+    try:
+        if timeout_ms is not None:
+            conn.execute(f"SET lock_timeout = '{max(1, int(timeout_ms))}ms'")
+        conn.execute(f"SELECT pg_advisory_lock{sfx}(%s)", (key,))
+        yield
+    finally:
+        try:
+            conn.execute(f"SELECT pg_advisory_unlock{sfx}(%s)", (key,))
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+
+def world_swap_lock(world_id, *, timeout_ms: int | None = None):
+    """資料フォルダの参照先・派生物の世代を入れ替える操作（rebind／削除）が排他で取るロック。
+    lock 順序は必ず ``world_registry_lock -> world_lock -> world_swap_lock``（逆順の経路は作らない）。取り込み（run/sync 等）は取らない。
+    """
+    return _advisory(_world_swap_lock_key(world_id), shared=False, timeout_ms=timeout_ms)
+
+
+def world_swap_lock_shared(world_id, *, timeout_ms: int | None = None):
+    """原本の配信・文書一覧など、root と台帳の世代が揃っている間だけ読みたい処理が共有で取るロック。
+    取り込み中も待たない（rebind／削除の最中だけ待つ）。`timeout_ms` 超過は `LockNotAvailable`。他のロックを取ってからこれを取る側にはならない（読み取り側は本ロックだけを持つ）。
+    """
+    return _advisory(_world_swap_lock_key(world_id), shared=True, timeout_ms=timeout_ms)
+
+
 # `world_registry_lock` 専用の鍵は 2 引数形（classid+key）にして、`_world_lock_key`（1 引数形）とは別の名前空間にする。world_id="world-registry" の `world_lock` と同じ鍵になる自己衝突を避ける。
 _WORLD_REGISTRY_LOCK_CLASSID = 0x52454757  # "REGW" の ASCII 値由来の固定クラス ID。
 _WORLD_REGISTRY_LOCK_KEY = 1

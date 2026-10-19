@@ -9,7 +9,7 @@ MD 出力と並行して作る構造化表現。取り込み・書き出しは�
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 
 DOCUMENT_IR_SCHEMA_VERSION = "document-ir-v3"          # JSON 形式の版（抽出処理の版とは別）
 
@@ -82,6 +82,35 @@ class DocumentIR:
     picture_count: int = 0
 
 
+def _plain(value, names: tuple[str, ...]) -> dict:
+    """平坦な dataclass を `asdict` と同じ dict にする（フィールド以外の属性が付いていれば名前で拾い直す）。"""
+    payload = dict(value.__dict__)
+    if len(payload) != len(names):
+        payload = {name: getattr(value, name) for name in names}
+    return payload
+
+
+def _payload(ir: DocumentIR) -> dict:
+    """`asdict(ir)` と同じ内容の dict。セル配列が大きいので、入れ子を 1 件ずつ再帰して複製することを避ける。"""
+    cell_names = tuple(f.name for f in fields(Cell))
+    element_names = tuple(f.name for f in fields(Element))
+    elements = []
+    for element in ir.elements:
+        item = _plain(element, element_names)
+        if isinstance(element.cells, list):
+            item["cells"] = [_plain(cell, cell_names) for cell in element.cells]
+        item["extraction"] = asdict(element.extraction)
+        elements.append(item)
+    payload = _plain(ir, tuple(f.name for f in fields(DocumentIR)))
+    payload["source"] = asdict(ir.source)
+    payload["elements"] = elements
+    return payload
+
+
 def to_json_str(ir: DocumentIR) -> str:
     """決定的に JSON 化する（キー順固定・タイムスタンプ無し）。"""
-    return json.dumps(asdict(ir), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    try:
+        payload = _payload(ir)
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    except TypeError:                                  # 入れ子の dataclass など、dict への展開が要る値は asdict で変換する
+        return json.dumps(asdict(ir), ensure_ascii=False, sort_keys=True, indent=2) + "\n"

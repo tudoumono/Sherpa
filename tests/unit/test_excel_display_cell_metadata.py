@@ -1,9 +1,8 @@
 """`excel_display.extract_cell_metadata` の出力固定テスト（MEM-1・2重フルロード是正のゴールデン）。
 
 `extract_cell_metadata` は元々 `wb_formula`（data_only=False）と `wb_values`（data_only=True）を
-**同時に**フルロードしていた（ピークメモリ2倍）。逐次化（`wb_formula` を読み終えてから閉じ、
-その後 `wb_values` を開く）に是正するにあたり、出力が byte-identical であることをこのテストで
-固定する。期待値（`_EXPECTED_JSON`）は**是正前のコード**を実際に実行して得た実測値
+**同時に**フルロードしていた（ピークメモリ2倍）。その後 `wb_values` の 1 冊だけを読む形にしたが、出力が
+byte-identical であることをこのテストで固定する。期待値（`_EXPECTED_JSON`）は**是正前のコード**を実際に実行して得た実測値
 （`json.dumps(sort_keys=True)` の決定的直列化）であり、推測値ではない。
 
 対象セル: formula（cache 有/無）・日付書式・素の整数・文字列・空セル（対象だが未使用の座標）。
@@ -11,7 +10,6 @@
 from __future__ import annotations
 
 import json
-import weakref
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -100,29 +98,51 @@ def test_extract_cell_metadata_skips_sheet_missing_from_either_workbook(tmp_path
     assert metadata == {}
 
 
-def test_extract_cell_metadata_frees_formula_workbook_before_second_pass(tmp_path, monkeypatch):
-    """RV是正#1: `wb_formula.close()` だけでは openpyxl 内部の循環参照ゆえセル木が即解放されない
-    前提のため、第2パス（`wb_values`）を開く**前**に第1パスのブックへの最後の参照を明示的に切り
-    （`del`）、GCを1回回す（`gc.collect()`）。tracemalloc 等のヒープ実測はプロセス全体の割当状況に
-    左右されflakyなため、より決定的な検証として「第2パスの `load_workbook` 呼び出し時点で第1パスの
-    ブックが既に GC 到達不能（weakref 死亡）になっている」ことを直接確認する——ピーク時に生きている
-    ブックが常に1冊であることの直接証拠になる。"""
+def test_extract_cell_metadata_loads_one_workbook_when_no_formula_restore_needed(tmp_path, monkeypatch):
+    """式の復元が要らないブックは、値ブック（data_only=True）の 1 冊だけを読む（式の無いセルの値は数式ブックと同じ）。"""
     fixture = _build_fixture_xlsx(tmp_path / "fixture3.xlsx")
     orig_load_workbook = openpyxl.load_workbook
-    state = {"calls": 0, "formula_wb_ref": None}
+    loads: list[dict] = []
 
     def wrapped_load_workbook(*args, **kwargs):
-        state["calls"] += 1
-        if state["calls"] == 2:
-            # 第2パスをロードする直前＝第1パスの del+gc.collect() が既に実行されているはず。
-            assert state["formula_wb_ref"] is not None
-            assert state["formula_wb_ref"]() is None, "第1パスのwb_formulaが第2パス開始時点でまだ生存"
-        wb = orig_load_workbook(*args, **kwargs)
-        if state["calls"] == 1:
-            state["formula_wb_ref"] = weakref.ref(wb)
-        return wb
+        loads.append(kwargs)
+        return orig_load_workbook(*args, **kwargs)
 
     monkeypatch.setattr(openpyxl, "load_workbook", wrapped_load_workbook)
-    metadata = excel_display.extract_cell_metadata(fixture, {"Sheet1": {"A1"}})
-    assert state["calls"] == 2                       # 第1パス・第2パスの2回ロードされたことの確認
+    metadata = excel_display.extract_cell_metadata(fixture, {"Sheet1": {"A1", "A3", "A4"}})
+    assert [(kw.get("data_only"), kw.get("read_only")) for kw in loads] == [(True, False)]
     assert metadata[("Sheet1", "A1")]["raw_value"] == 42
+    assert metadata[("Sheet1", "A4")]["formula"] == "=A1*2"
+    assert metadata[("Sheet1", "A4")]["cached_value"] == 84
+
+
+def test_extract_cell_metadata_restores_shared_formula_followers(tmp_path):
+    """共有数式の従属セルは OOXML 直読だと式が空になる。数式ブックから復元した式が入ること。"""
+    path = tmp_path / "shared.xlsx"
+    wb = openpyxl.Workbook()
+    wb.active.title = "Sheet1"
+    for row in range(1, 4):
+        wb.active.cell(row=row, column=1, value=row * 10)
+    wb.save(path)
+    with zipfile.ZipFile(path) as zin:
+        data = {n: zin.read(n) for n in zin.namelist()}
+    xml = data["xl/worksheets/sheet1.xml"].decode("utf-8")
+
+    for row in range(1, 4):
+        cell = (f'<c r="B{row}"><f t="shared" ref="B1:B3" si="0">A1*2</f><v>{row * 20}</v></c>' if row == 1
+                else f'<c r="B{row}"><f t="shared" si="0"/><v>{row * 20}</v></c>')
+        marker = f'<c r="A{row}"'
+        start = xml.index(marker)
+        end = xml.index("</c>", start) + len("</c>")
+        xml = xml[:end] + cell + xml[end:]
+    data["xl/worksheets/sheet1.xml"] = xml.encode("utf-8")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, body in data.items():
+            zout.writestr(name, body)
+
+    metadata = excel_display.extract_cell_metadata(path, {"Sheet1": {"B1", "B2", "B3", "A2"}})
+    assert metadata[("Sheet1", "B1")]["formula"] == "=A1*2"
+    assert metadata[("Sheet1", "B2")]["formula"] == "=A2*2"
+    assert metadata[("Sheet1", "B3")]["formula"] == "=A3*2"
+    assert metadata[("Sheet1", "B3")]["cached_value"] == 60
+    assert metadata[("Sheet1", "A2")]["formula"] is None

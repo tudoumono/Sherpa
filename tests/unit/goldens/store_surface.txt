@@ -57,6 +57,7 @@ claim_workspace_file_expired
 clear_failed_docs
 conversation_has_personal_message
 conversation_is_personal_tainted
+count_and_list_documents
 count_documents
 count_ext_api_calls_by_key
 count_self_issued_active_api_keys
@@ -127,8 +128,10 @@ list_users
 list_webhook_keys_for_world
 list_workspace_files
 list_worlds_db
+list_worlds_with_interrupted_latest_run
 live_workspace_rel_paths
 no_live_upload_for_path
+note_ingest_run_op
 owns_assistant_message
 owns_conversation
 purge_personal_api_keys
@@ -184,3 +187,5 @@ workspace_file_lock
 world_by_root
 world_lock
 world_registry_lock
+world_swap_lock
+world_swap_lock_shared

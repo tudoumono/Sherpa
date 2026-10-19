@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import psycopg
 from .. import corpus_docs, es_index, json_io, scope_infer, store, webhooks, worlds
 from . import (
     archive_extract,
+    background,
     failure_reasons,
     importance,
     office_md,
@@ -350,17 +352,18 @@ def _ledger_row(d: dict, res) -> dict:
 
 
 def run(world, *, reflect=True, created_by="admin",
-        scan_root=None, run_id=None, on_run_id=None, op: str = "sync") -> dict:
+        scan_root=None, run_id=None, on_run_id=None, op: str = "sync", scan: _Scan | None = None) -> dict:
     """資料フォルダ1つ分の取り込み（台帳＋グラフ反映）を実行し、`ingest_runs` に記録して要約を返す。
 
     資料フォルダ単位の advisory lock で直列化する。`reflect=False` は Neo4j 反映を省く（DB 無し検証/テスト用）。
     `run_id` は呼び出し元が受付時に確保済みの `ingest_runs` 行を渡すときだけ指定する（省略時はここで確保する）。
     `on_run_id` は確保された run_id が判明した時点で呼ばれるコールバック。
     `op` は Webhook 通知の情報用途（sync/refresh/rebind/rerun）。
+    `scan` は呼び出し元（`sync`）が同じ取り込みのために走査済みの結果。渡されれば冒頭で歩き直さず、MD 化前の工程もこの列挙を使う。
     """
     with store.world_lock(world):
         return _run_locked(world, reflect=reflect, created_by=created_by,
-                           scan_root=scan_root, run_id=run_id, on_run_id=on_run_id, op=op)
+                           scan_root=scan_root, run_id=run_id, on_run_id=on_run_id, op=op, scan=scan)
 
 
 def _run_locked(world, **kwargs) -> dict:
@@ -374,7 +377,8 @@ def _run_locked(world, **kwargs) -> dict:
 
 def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_run_id=None,
                      op: str = "sync",
-                     finalize: bool = True) -> dict:
+                     finalize: bool = True,
+                     scan: _Scan | None = None) -> dict:
     # lock 保持下で呼ぶ版。`worlds.rebind` はここを直接呼ぶ（`run` 経由だと同じ advisory lock を再入できず自己デッドロックする）。
     # last_sig はこの run の中で完結させる（他に書くのは `_wipe_locked` の pre-invalidate・`sync` の lock 内バックフィル・rebind 復旧の `restore_bind_invalidate_sig`）:
     #  - world 未解決（`sig is None`）は last_sig に触れず即 failed にする（`_record` の監査記録だけ書く）
@@ -424,7 +428,14 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
     # このグラフが使う設定のハッシュ（署名より先に読む＝保存が割り込んでも「未反映」側へ倒れる）
     # 設定は取り込みの始めに 1 回だけ読んだスナップショット（`run_locked` の `resolve_settings.pinned`）で、署名・グラフの構築・確定の記録が同じ値を使う
     applied_resolve_sig = resolve_settings.signature_of(world)
-    sig, manifest = world_state(world, progress=lambda n: _progress("scanning", done=n, total=None))
+    # ① 走査は取り込み 1 回につき 1 回（`sync` が走査済みで、資料フォルダが同じならその結果を使う）。以降の MD 化前の工程も同じ列挙を使い回す
+    wd_now = worlds.world_dir(world)
+    if scan is not None and wd_now and scan.walk.root == Path(wd_now):
+        state = _state_of(world, scan)
+    else:
+        state = world_state(world, progress=lambda n: _progress("scanning", done=n, total=None))
+    sig, manifest = state
+    walk = getattr(getattr(state, "scan", None), "walk", None)
 
     nodes, edges, flags, rows = [], [], [], []              # 台帳行は派生 MD の作成後に確定する
     rows_known = [False]                                    # 台帳が確定したか（確定前の失敗 run は counts.targeted を出さない）
@@ -432,9 +443,12 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
     def _record(status, reflected=None, ledger=0, extra_flags=(), drep=None,
                es_summary=None, neo4j_summary=None,
                confirm_sig=None, confirm_manifest=None, confirm_doc_count=None,
-               confirm_scan_report=None):
+               confirm_scan_report=None, interrupted=False):
         fl = list(flags) + list(extra_flags)
         snap = {"docs": len(rows), "nodes": len(nodes), "edges": len(edges), "flags": fl}
+        if interrupted:
+            snap["interrupted"] = True       # 停止要求で区切りに止まった（起動時に自動で続きを始める）。起動時の格下げと同じ表し方
+            snap["op"] = op
         if drep is not None:
             # office_md 段の要約（失敗した run でも、derive まで進んでいれば失敗ファイル一覧を残す）
             snap["office_md"] = _office_md_stage_summary(drep)
@@ -480,14 +494,16 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
             rec = store.finish_ingest_run(run_id, status=status, extraction_snapshot=snap,
                                           published_snapshot=reflected,
                                           source_doc_ids=pending["source_doc_ids"])
-        # terminal 化のこの1点から Webhook 通知を best-effort で発火する（取り込みの成否には影響させない）
-        try:
-            webhooks.notify_run_terminal(world, run_id, op, status, doc_count=len(rows))
-        except Exception:
-            _log.warning("Webhook 通知の起動に失敗しました（取り込み自体は継続）: world=%s", world,
-                        exc_info=True)
+        # terminal 化のこの1点から Webhook 通知を best-effort で発火する（取り込みの成否には影響させない）。停止による中断は失敗ではないので送らない
+        if not interrupted:
+            try:
+                webhooks.notify_run_terminal(world, run_id, op, status, doc_count=len(rows))
+            except Exception:
+                _log.warning("Webhook 通知の起動に失敗しました（取り込み自体は継続）: world=%s", world,
+                            exc_info=True)
         return {"world": world, "status": status, "ledger": ledger,
-                "nodes": len(nodes), "edges": len(edges), "flags": fl, "run": rec}
+                "nodes": len(nodes), "edges": len(edges), "flags": fl, "run": rec,
+                **({"interrupted": True} if interrupted else {})}
 
     def _office_flags(d):                                   # 派生 MD のセットアップ失敗を flag にする
         """派生 MD の失敗を集約 warn の flag にして返す。per-file の詳細は `failed_files` を単一の出所にし、ここへは複製しない（JSONB の肥大化を避ける）。"""
@@ -504,7 +520,7 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
     # アーカイブ（zip/tar(.gz)/tgz）は原本に書かず、展開先（`worlds.archives_dir`）を原本側のアーカイブ集合と突き合わせて差分同期する。
     # 以降のグラフ構築・台帳行は展開先を合流させるため、それらより前に展開を終える。個別の失敗は展開結果サマリへ閉じ込め、取り込み全体は止めない。
     try:
-        archive_extract.sync_world_archives(world, worlds.world_dir(world))
+        archive_extract.sync_world_archives(world, worlds.world_dir(world), walk=walk)
     except Exception:
         _log.warning("アーカイブの展開に失敗しました（取り込み自体は継続）: world=%s", world, exc_info=True)
 
@@ -519,11 +535,17 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
             _last_office_progress_done[0] = done
             _progress("office_md", done=done, total=total)
 
-    drep = _build_derived(world, world_sig=sig, progress=_office_progress)
+    try:
+        drep = _build_derived(world, world_sig=sig, progress=_office_progress, **({"walk": walk} if walk is not None else {}))
+    except background.StopRequested:                        # 停止要求＝1 件ごとの区切りで止まった。署名は確定しない（pre-invalidate のまま）
+        _log.info("停止要求により MD 化の区切りで取り込みを中断しました: world=%s", world)
+        return _record("failed", interrupted=True)
     if drep.get("error"):
         # 派生生成が公開 Gate で拒否された（不完全な世代）ときは、ここで打ち切る。進むと旧派生を基に反映した上で新しい署名を確定してしまう。
         # 署名は確定せず、冒頭の pre-invalidate（''）のまま終了する
         return _record("failed", extra_flags=_office_flags(drep), drep=drep)
+    if background.stop_requested():                         # 派生物の公開までは済んでいる＝次回は変換キャッシュで速く戻れる
+        return _record("failed", interrupted=True, drep=drep)
     # `build_world_graph` は時間がかかりうるので、入る前に段を「関係グラフを構築中」へ進める
     _progress("graph_build")
     nodes, edges, flags = build_world_graph(world)
@@ -539,6 +561,8 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
         # 署名は確定しない（last_sig は `''` のまま）。Neo4j 未反映を「同期済み」とみなさず、次の `sync(reflect=True)` が再構築する
         return _record("extracting", ledger=written, extra_flags=_office_flags(drep), drep=drep)
 
+    if background.stop_requested():                         # ここまでは何も反映していない。この先（グラフ置換・台帳・ES）は区切りが無いので終わるまで進める
+        return _record("failed", interrupted=True, drep=drep)
     # ④ グラフを資料フォルダ単位で atomic に置換する（`load_world`）。失敗時は tx がロールバックされ旧グラフが残り、台帳も書き換えない
     env = None
     neo4j_t0 = time.monotonic()
@@ -671,13 +695,16 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
                   confirm_doc_count=confirm_doc_count, confirm_scan_report=scan_rep)
 
 
-def _build_derived(world, *, world_sig: str | None = None, progress=None) -> dict:
-    """資料フォルダの Office を決定的 MD にして派生領域へ作る（grep の検索対象になる）。未解決は no-op。`progress` は `office_md.build_derived` の per-file 進捗コールバック（done, total）へ転送する。"""
+def _build_derived(world, *, world_sig: str | None = None, progress=None,
+                   walk: scope_infer.WalkSnapshot | None = None) -> dict:
+    """資料フォルダの Office を決定的 MD にして派生領域へ作る（grep の検索対象になる）。未解決は no-op。`progress` は `office_md.build_derived` の per-file 進捗コールバック（done, total）へ転送する。
+    `walk` は同じ取り込みで走査済みの本体の列挙（`office_md.build_derived` が歩き直さずに使う）。"""
     wd = worlds.world_dir(world)
     if not wd:
         return {"converted": 0, "failed": 0, "unsupported": 0, "by_ext": {}}
     rep = office_md.build_derived(
-        wd, worlds.derived_md_dir(world), world_sig=world_sig, progress=progress, world=world)
+        wd, worlds.derived_md_dir(world), world_sig=world_sig, progress=progress, world=world,
+        **({"walk": walk} if walk is not None else {}))
     if not rep.get("error") and not rep.get("ocr_routes_error") and _enqueue_ocr_refresh(world, world_sig):
         # ルート生成に成功し、公開済みで、refresh も積めたときだけ確定する（満たさなければ次回 sync が再試行する）
         office_md.write_ocr_route_sig_marker(worlds.derived_md_dir(world))
@@ -906,12 +933,25 @@ def _fix_ledger_row(world: str, wd, rp, rel: str, sig: str) -> None:
 _SCAN_PROGRESS_INTERVAL = 500   # 走査進捗の報告間隔（ファイル数）
 
 
-def _scan_dir(wd, progress=None) -> list:
-    """`wd` 配下の対象ファイルを `(rel, mtime_ns, ctime_ns, size)` のソート済みリストで返す（stat のみで中身は読まない）。
+@dataclass
+class _Scan:
+    """1 回の走査の結果。`walk`＝本体の列挙（同じ取り込みの MD 化前の工程が使い回す）・`parts`＝`(rel, mtime_ns, ctime_ns, size)` のソート済み。"""
+    walk: scope_infer.WalkSnapshot
+    parts: list
+
+
+class _WorldState(tuple):
+    """`world_state()` の戻り値 `(署名, 明細)`。同じ走査の結果（`scan`）を添える（添えない場合は None）。"""
+    scan: _Scan | None = None
+
+
+def _scan_walk(wd, progress=None) -> _Scan:
+    """`wd` 配下の対象ファイルを 1 回だけ歩き、列挙（`walk`）と `(rel, mtime_ns, ctime_ns, size)` のソート済みリスト（`parts`）を返す。
 
     `progress`（省略可）は走査済みファイル数を `_SCAN_PROGRESS_INTERVAL` 件ごとと最後に報告する。"""
-    parts = []
-    for rp, rel in scope_infer.safe_files(wd):
+    files, parts, skipped = [], [], {}
+    for rp, rel in scope_infer.safe_files(wd, skipped=skipped):
+        files.append((rp, rel))
         try:
             st = rp.stat()
             parts.append((rel, st.st_mtime_ns, st.st_ctime_ns, st.st_size))   # ctime も含める
@@ -922,7 +962,12 @@ def _scan_dir(wd, progress=None) -> list:
     if progress is not None:
         progress(len(parts))
     parts.sort()
-    return parts
+    return _Scan(scope_infer.WalkSnapshot.from_walk(wd, files, skipped), parts)
+
+
+def _scan_dir(wd, progress=None) -> list:
+    """`wd` 配下の対象ファイルを `(rel, mtime_ns, ctime_ns, size)` のソート済みリストで返す（stat のみで中身は読まない）。"""
+    return _scan_walk(wd, progress).parts
 
 
 def _sig(parts, resolve_sig: str = "") -> str:
@@ -959,12 +1004,21 @@ def world_signature(world) -> str | None:
 
 
 def world_state(world, progress=None):
-    """`(署名, ファイル明細)` を1スキャンで返す。資料フォルダ不在は `(None, None)`。`progress` は `_scan_dir` へ転送する。"""
+    """`(署名, ファイル明細)` を1スキャンで返す。資料フォルダ不在は `(None, None)`。`progress` は `_scan_walk` へ転送する。
+
+    戻り値の `.scan` に同じ走査の結果を添える（`run` が MD 化前の工程で歩き直さないため）。"""
     wd = worlds.world_dir(world)
     if not wd:
-        return None, None
-    parts = _scan_dir(wd, progress=progress)
-    return _sig(parts, resolve_settings.signature_of(world)), _manifest(parts)
+        return _WorldState((None, None))
+    scan = _scan_walk(wd, progress=progress)
+    return _state_of(world, scan)
+
+
+def _state_of(world, scan: _Scan) -> _WorldState:
+    """走査の結果から `(署名, 明細)` を作る（署名は今の解決範囲の設定で計算する）。"""
+    state = _WorldState((_sig(scan.parts, resolve_settings.signature_of(world)), _manifest(scan.parts)))
+    state.scan = scan
+    return state
 
 
 def diff_dir(wd, prev_manifest, prev_sig=None, resolve_sig: str = "") -> dict:
@@ -1203,7 +1257,8 @@ def sync(world, *, reflect=True, force=False, run_id=None, on_run_id=None, op: s
     """
     with resolve_settings.pinned(world):        # 変更なしの分岐（グラフの自己修復）も含め、1 回の sync は同じ設定を使う
         result = _sync_impl(world, reflect=reflect, force=force, run_id=run_id, on_run_id=on_run_id, op=op)
-    if result.get("status") != "unavailable" and not os.environ.get("SHERPA_TEST_DB_ISOLATED"):
+    if (result.get("status") != "unavailable" and not os.environ.get("SHERPA_TEST_DB_ISOLATED")
+            and not background.stop_requested()):
         try:
             from . import llm_render
             llm_render.schedule_background(world, _llm_render_pass)
@@ -1289,7 +1344,9 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
     _progress("scanning")
     _t_scan0 = time.monotonic()
     _scan_started_at = datetime.now(timezone.utc).isoformat()
-    sig, manifest = world_state(world, progress=lambda n: _progress("scanning", done=n, total=None))
+    state = world_state(world, progress=lambda n: _progress("scanning", done=n, total=None))
+    sig, manifest = state
+    scan_kw = {"scan": state.scan} if getattr(state, "scan", None) is not None else {}   # 取り込みへ走査結果を渡す
     _stage_timings["scanning"] = {
         "started_at": _scan_started_at,
         "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -1325,7 +1382,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             if refresh_outcome == "needs_full_run":
                 # 欠落検知→全再構築→`.rag_sig` 削除を同一 lock 区間で行う。`run()` は非再入 lock を取り直すので、lock-free 版の `_run_locked` を直接呼ぶ
                 res = _run_locked(world, reflect=reflect, created_by="admin", scan_root=None,
-                                  run_id=run_id, on_run_id=on_run_id, op=op)
+                                  run_id=run_id, on_run_id=on_run_id, op=op, **scan_kw)
                 if not office_md.drop_rag_sig_marker(worlds.derived_md_dir(world)):
                     _log.warning(
                         "sidecar欠落からの全再構築後、`.rag_sig`の削除に失敗しました"
@@ -1445,9 +1502,10 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             scan_pdf_ocr_status.settle(world, sig)           # スキャン PDF の OCR の状態を失敗の一覧へ反映する（best-effort）
             return {"world": world, "changed": False, "status": "unchanged", "ledger": 0}
     # `op` を渡して Webhook payload の `op` を呼び出し元の種別にそろえる
-    res = run(world, reflect=reflect, run_id=run_id, on_run_id=on_run_id, op=op)   # 署名の確定/無効化は run 内部（`_run_locked`）が lock 内で行う
+    res = run(world, reflect=reflect, run_id=run_id, on_run_id=on_run_id, op=op, **scan_kw)   # 署名の確定/無効化は run 内部（`_run_locked`）が lock 内で行う
     return {"world": world, "changed": True, "status": res["status"],
-            "ledger": res["ledger"], "flags": list(res.get("flags", []))}
+            "ledger": res["ledger"], "flags": list(res.get("flags", [])),
+            **({"interrupted": True} if res.get("interrupted") else {})}
 
 
 def _reindex_after_rag_rewrite(world: str) -> bool:
@@ -1525,7 +1583,7 @@ def wipe_world(world, *, reflect=True) -> dict:
     資料フォルダ単位の advisory lock で run と直列化する薄いラッパー（`_wipe_locked` へ委譲）。
     `worlds.delete` は外側で lock 取得済みなので lock-free の `_wipe_locked` を直接呼ぶ（lock は再入不可）。
     """
-    with store.world_lock(world):
+    with store.world_lock(world), store.world_swap_lock(world):
         return _wipe_locked(world, reflect=reflect)
 
 

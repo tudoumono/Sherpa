@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from . import corpus_docs, documents, scope_infer as si, store, worlds
 from .ingest import importance, text_kind
-from .store.db import world_lock_shared
 
 
 def documents_for(world: str, *, root=None, deadline: float | None = None, files=None) -> list:
@@ -99,17 +98,20 @@ def _reconcile_ledger_blocked(rows: list, blocked) -> list:
     return out
 
 
+# 参照先の入れ替え（rebind／削除）の最中に読み取りが待つ上限（ミリ秒）。超えたら `LockNotAvailable`（呼び出し元が 503 にする）。
+SWAP_LOCK_WAIT_MS = 5_000
+
+
 def public_documents_page(world: str, *, limit: int | None, offset: int = 0) -> tuple[list, int]:
     """`GET /documents` の応答本体（総件数＋文書一覧）。
     `limit=None` は全件、指定時のみ LIMIT/OFFSET。台帳に行があれば台帳だけを読み（フォルダは歩かない）、
-    COUNT・ページ取得・blocked 突き合わせを `world_lock_shared` で囲んで同一世代に固定する。
+    COUNT とページは 1 つの読み取りトランザクションで同じ世代に固定する（取り込みの最中も待たない）。
+    rebind／削除の最中だけ `world_swap_lock_shared` で待ち、上限（`SWAP_LOCK_WAIT_MS`）を超えたら `LockNotAvailable`。
     台帳が空なら `public_documents`（実走査）へ縮退してメモリ上でスライスする。
     """
-    with world_lock_shared(world):
-        total = store.count_documents(world)
+    with store.world_swap_lock_shared(world, timeout_ms=SWAP_LOCK_WAIT_MS):
+        total, rows = store.count_and_list_documents(world, limit=limit, offset=offset)
         if total > 0:
-            rows = (store.list_documents(world) if limit is None
-                   else store.list_documents_page(world, limit=limit, offset=offset))
             rows = _reconcile_ledger_blocked(rows, corpus_docs.last_run_blocked_docs(world))
             # 秘匿名の行は一覧に出さない（全件取得時は件数も再計算）
             rows = [r for r in rows if not text_kind.is_sensitive_doc_id(r["name"])]

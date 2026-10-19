@@ -222,97 +222,95 @@ def test_documents_endpoint_select_failure_propagates_not_silent_empty(auth_disa
     from fastapi.testclient import TestClient
     from sherpa.api import app
 
-    def _boom(world):
+    def _boom(world, **kw):
         raise RuntimeError("db down")
 
     import sherpa.doc_ledger as doc_ledger_mod
-    monkeypatch.setattr(doc_ledger_mod.store, "count_documents", _boom)
+    monkeypatch.setattr(doc_ledger_mod.store, "count_and_list_documents", _boom)
     c = TestClient(app, raise_server_exceptions=False)
     r = c.get("/documents", params={"world": V})
     assert r.status_code == 500
 
 
-def test_documents_endpoint_count_and_page_share_one_lock_scope(auth_disabled):
-    """RV1是正#5/RV2是正#b3④: COUNT〜ページ取得（〜blocked 突き合わせ）は**実際の**
-    `world_lock_shared`（実 PostgreSQL advisory lock）で保護されている——偽ロック（`__enter__`/
-    `__exit__` だけの字面上の scope 確認）では、ロック自体を差し替えてしまっている以上「本物の
-    ロックを取っている」ことの証明にならない（b3是正）。ここでは実際の排他ロック保持者
-    （writer・`store.world_lock` を直接保持する別スレッド）とレースさせ、`GET /documents` が
-    writer の解放**後**にしか完了しない（＝`doc_ledger.public_documents_page` が本物の
-    `world_lock_shared` を取得し、排他ロックと相互排他になっている）ことを実測する。
-    """
+def test_documents_endpoint_does_not_wait_for_ingest_lock(auth_disabled):
+    """取り込み（`store.world_lock` を最初から最後まで保持する）の最中でも、`GET /documents` は待たずに返る。"""
     import threading
-    import time
 
     from fastapi.testclient import TestClient
     from sherpa import store
     from sherpa.api import app
 
-    w = "docpage-reallock-test"
+    w = "docpage-ingestlock-test"
     store.replace_documents(w, [{"name": "a.md", "layer": "version", "scope_path": None,
                                  "doctype": "設計書", "branch": "office", "original_path": None,
                                  "md_path": None, "status": "indexed"}])
-    order: list[str] = []
-    writer_entered = threading.Event()
-    release_writer = threading.Event()
+    entered, release = threading.Event(), threading.Event()
 
-    def _hold_exclusive():
+    def _hold_ingest():
         with store.world_lock(w):
-            order.append("writer-in")
-            writer_entered.set()
-            release_writer.wait(timeout=5)
-            order.append("writer-out")
+            entered.set()
+            release.wait(timeout=10)
 
-    t = threading.Thread(target=_hold_exclusive)
+    t = threading.Thread(target=_hold_ingest)
     t.start()
     try:
-        assert writer_entered.wait(timeout=5), "writer が排他ロックへ入れなかった"
-
-        def _release_soon():
-            time.sleep(0.2)     # GET が実際にブロックされて待っている時間を作る
-            release_writer.set()
-
-        threading.Thread(target=_release_soon).start()
-
-        c = TestClient(app)
-        r = c.get("/documents", params={"world": w, "limit": 10})
-        order.append("reader-done")
+        assert entered.wait(timeout=5)
+        r = TestClient(app).get("/documents", params={"world": w, "limit": 10})
         assert r.status_code == 200, r.text
+        assert r.json()["total"] == 1
     finally:
-        t.join(timeout=5)
+        release.set()
+        t.join(timeout=10)
         store.replace_documents(w, [])
 
-    assert order.index("reader-done") > order.index("writer-out"), (
-        f"GET /documents が実 world_lock（排他）保持中にも進んでしまっている: {order}")
+
+def test_documents_endpoint_returns_503_while_swapping(auth_disabled, monkeypatch):
+    """rebind／削除が参照先を入れ替えている間、`GET /documents` は上限まで待って 503 を返す（無期限に待たない）。"""
+    import threading
+    import time
+
+    from fastapi.testclient import TestClient
+    from sherpa import doc_ledger as doc_ledger_mod
+    from sherpa import store
+    from sherpa.api import app
+
+    monkeypatch.setattr(doc_ledger_mod, "SWAP_LOCK_WAIT_MS", 300)
+    w = "docpage-swaplock-test"
+    entered, release = threading.Event(), threading.Event()
+
+    def _hold_swap():
+        with store.world_swap_lock(w):
+            entered.set()
+            release.wait(timeout=10)
+
+    t = threading.Thread(target=_hold_swap)
+    t.start()
+    try:
+        assert entered.wait(timeout=5)
+        t0 = time.monotonic()
+        r = TestClient(app).get("/documents", params={"world": w, "limit": 10})
+        assert r.status_code == 503, r.text
+        assert "切り替えている最中" in r.json()["detail"]
+        assert time.monotonic() - t0 < 5
+    finally:
+        release.set()
+        t.join(timeout=10)
 
 
-def test_documents_endpoint_ledger_queries_all_run_inside_shared_lock_scope(auth_disabled, monkeypatch):
-    """RV3是正#b2: 上記の実競合テスト（writer との相互排他）は「`GET /documents` が writer の
-    解放後にしか完了しない」ことは証明するが、`count_documents`・一覧取得・
-    `last_run_blocked_docs` の**3クエリ全てが同じ共有ロック区間（深度1）の中**で呼ばれている
-    かまでは保証しない——`with world_lock_shared(...): pass` のように空振りしてから3クエリを
-    ロック**外**へ移しても、writer との相互排他自体は（一瞬だけでも）成立するため実競合テストは
-    通ってしまう（RV1 finding #5 の世代整合が後退しても検出できない false green）。
-
-    ここでは実の `world_lock_shared`（本物の PostgreSQL advisory lock）を depth 追跡ラッパーで
-    包む——ロック自体は差し替えず実際に取得・解放させたまま、3クエリがそれぞれ深度1（ロック
-    保持中）で呼ばれることを直接固定する（旧 scope テスト相当の復活）。
-    """
+def test_documents_endpoint_ledger_queries_all_run_inside_swap_lock_scope(auth_disabled, monkeypatch):
+    """台帳の読み取り（COUNT とページ）と blocked 突き合わせが、どちらも入れ替えロック（共有）を保持している間に呼ばれる。
+    ロックは差し替えず、実際の advisory lock を深度追跡のラッパーで包む。"""
     import sherpa.doc_ledger as doc_ledger_mod
     from fastapi.testclient import TestClient
     from sherpa import corpus_docs as corpus_docs_mod
     from sherpa import store
     from sherpa.api import app
 
-    real_lock = doc_ledger_mod.world_lock_shared
+    real_lock = store.world_swap_lock_shared
     depth = {"n": 0}
     calls_inside: list[tuple[str, int]] = []
 
     class _DepthTrackingLock:
-        """本物のロック（`real_lock` が返す context manager）をそのまま delegate しつつ、
-        保持中かどうかを `depth` で追跡するだけの薄いラッパー（ロックの取得・解放自体は
-        差し替えない）。"""
-
         def __init__(self, world, **kw):
             self._cm = real_lock(world, **kw)
 
@@ -325,27 +323,21 @@ def test_documents_endpoint_ledger_queries_all_run_inside_shared_lock_scope(auth
             depth["n"] -= 1
             return self._cm.__exit__(*exc)
 
-    monkeypatch.setattr(doc_ledger_mod, "world_lock_shared",
+    monkeypatch.setattr(doc_ledger_mod.store, "world_swap_lock_shared",
                         lambda world, **kw: _DepthTrackingLock(world, **kw))
 
-    orig_count = doc_ledger_mod.store.count_documents
-    orig_page = doc_ledger_mod.store.list_documents_page
+    orig_read = doc_ledger_mod.store.count_and_list_documents
     orig_blocked = corpus_docs_mod.last_run_blocked_docs
 
-    def _count(world):
-        calls_inside.append(("count", depth["n"]))
-        return orig_count(world)
-
-    def _page(world, **kw):
-        calls_inside.append(("page", depth["n"]))
-        return orig_page(world, **kw)
+    def _read(world, **kw):
+        calls_inside.append(("read", depth["n"]))
+        return orig_read(world, **kw)
 
     def _blocked(world, **kw):
         calls_inside.append(("blocked", depth["n"]))
         return orig_blocked(world, **kw)
 
-    monkeypatch.setattr(doc_ledger_mod.store, "count_documents", _count)
-    monkeypatch.setattr(doc_ledger_mod.store, "list_documents_page", _page)
+    monkeypatch.setattr(doc_ledger_mod.store, "count_and_list_documents", _read)
     monkeypatch.setattr(corpus_docs_mod, "last_run_blocked_docs", _blocked)
 
     w = "docpage-lockdepth-test"
@@ -353,15 +345,61 @@ def test_documents_endpoint_ledger_queries_all_run_inside_shared_lock_scope(auth
                                  "doctype": "設計書", "branch": "office", "original_path": None,
                                  "md_path": None, "status": "indexed"}])
     try:
-        c = TestClient(app)
-        r = c.get("/documents", params={"world": w, "limit": 10})
+        r = TestClient(app).get("/documents", params={"world": w, "limit": 10})
         assert r.status_code == 200, r.text
     finally:
         store.replace_documents(w, [])
 
-    assert calls_inside == [("count", 1), ("page", 1), ("blocked", 1)], (
-        f"count_documents/list_documents_page/last_run_blocked_docs のいずれかが共有ロック"
-        f"（深度1）の外で呼ばれている: {calls_inside}")
+    assert calls_inside == [("read", 1), ("blocked", 1)], (
+        f"台帳の読み取り／blocked 突き合わせが入れ替えロック（深度1）の外で呼ばれている: {calls_inside}")
+
+
+def test_count_and_list_documents_reads_one_snapshot():
+    """COUNT とページの間に取り込みが台帳を丸ごと入れ替えても、総件数とページは同じ世代になる。"""
+    from sherpa import store
+
+    w = "docpage-snapshot-test"
+    row = lambda n: {"name": n, "layer": "version", "scope_path": None, "doctype": "設計書",
+                     "branch": "office", "original_path": None, "md_path": None, "status": "indexed"}
+    store.replace_documents(w, [row("a.md"), row("b.md")])
+    try:
+        from sherpa.store import documents as sd
+        orig = sd._connect
+
+        class _Conn:
+            """COUNT の直後（ページ取得の前）に別接続で台帳を入れ替える。"""
+            def __init__(self, c):
+                self._c, self._swapped = c, False
+
+            def __enter__(self):
+                self._c.__enter__()
+                return self
+
+            def __exit__(self, *a):
+                return self._c.__exit__(*a)
+
+            def execute(self, sql, *a, **k):
+                cur = self._c.execute(sql, *a, **k)
+                if "COUNT(*)" in sql and not self._swapped:
+                    self._swapped = True
+                    cur = cur  # 結果は呼び出し側が先に fetch する
+                    rows = cur.fetchall()
+                    store.replace_documents(w, [row("x.md"), row("y.md"), row("z.md")])
+
+                    class _R:
+                        def fetchone(self_inner):
+                            return rows[0]
+                    return _R()
+                return cur
+
+        sd._connect = lambda: _Conn(orig())
+        try:
+            total, rows = sd.count_and_list_documents(w, limit=10)
+        finally:
+            sd._connect = orig
+        assert total == 2 and [r["name"] for r in rows] == ["a.md", "b.md"]
+    finally:
+        store.replace_documents(w, [])
 
 
 def test_documents_endpoint_ledger_fast_path_reconciles_blocked_and_unknown(auth_disabled, monkeypatch):

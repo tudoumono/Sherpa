@@ -781,3 +781,56 @@ def test_sigterm_sets_stop_flag_and_records_stopping_heartbeat(monkeypatch, tmp_
 
     assert ocr_worker.main(["--worker-id", "test-worker", "--poll-seconds", "0.01"]) == 0
     assert heartbeat_statuses[-1] == "stopping"
+
+
+def test_idle_polls_print_one_line_until_status_changes(monkeypatch, tmp_path, capsys):
+    """待機が続く間、ワーカーは待機の行を 1 回だけ出す（2 秒ごとの出力でログが膨らまない）。"""
+    availability = ocr_worker.OCRAvailability(
+        available=True, unavailable_reason=None, model_hashes_valid=True, cache_home=str(tmp_path),
+        paddleocr_version="3.7.0", paddlepaddle_version="3.3.0", pypdfium2_version="5.11.0",
+        pillow_version="12.3.0", model_hashes={}, engine_profile_hash=ocr_worker.profile_hash(),
+    )
+
+    class FakeSupervisor:
+        engine_profile_hash = ocr_worker.profile_hash()
+
+        def __init__(self, cache_home):
+            pass
+
+        def close(self):
+            return None
+
+    statuses = iter(["idle", "idle", "idle", "succeeded", "idle", "idle"])
+    handlers = {}
+
+    def fake_signal(signum, handler):
+        previous = handlers.get(signum, signal.SIG_DFL)
+        handlers[signum] = handler
+        return previous
+
+    def fake_run_once(*args, **kwargs):
+        status = next(statuses, None)
+        if status is None:
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            return ocr_worker.WorkerResult(status="stopping")
+        return ocr_worker.WorkerResult(status=status)
+
+    monkeypatch.setattr(ocr_worker.signal, "signal", fake_signal)
+    monkeypatch.setattr(ocr_worker, "paddle_availability", lambda cache: availability)
+    monkeypatch.setattr(ocr_worker, "PaddleProcessSupervisor", FakeSupervisor)
+    monkeypatch.setattr(
+        ocr_worker, "_runtime_callbacks",
+        lambda: (
+            lambda *args: True, lambda *args: None, lambda *args: SOURCE, lambda *args: tmp_path,
+            lambda *args: tmp_path, lambda *args: None,
+        ),
+    )
+    monkeypatch.setattr(ocr_worker, "run_once", fake_run_once)
+    monkeypatch.setattr(ocr_worker, "run_refresh_once",
+                        lambda *args, **kwargs: ocr_worker.WorkerResult(status="idle"))
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "list_unpublished_generations", lambda: [])
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "record_worker_heartbeat", lambda *args, **kwargs: {})
+
+    assert ocr_worker.main(["--worker-id", "test-worker", "--poll-seconds", "0.001"]) == 0
+    printed = [json.loads(line)["status"] for line in capsys.readouterr().out.splitlines()]
+    assert printed == ["idle", "succeeded", "idle", "stopping"]

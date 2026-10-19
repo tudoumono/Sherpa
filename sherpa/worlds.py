@@ -668,6 +668,9 @@ def register(world_id: str, root_path: str, label=None, storage_mode="external_r
             # `_run_locked` の失敗（`failed` の返却・途中の例外）はどちらも `finally` の cleanup 後に伝播させる（registry 行だけが残る孤児状態を作らない）
             res = worker._run_locked(world_id, reflect=reflect, created_by="admin", scan_root=None,
                                      run_id=run_id, on_run_id=on_run_id)
+            if res.get("interrupted"):  # 停止要求による中断は失敗ではない＝登録は残し、起動時の自動再開が続きを取り込む
+                registered_ok = True
+                return res
             if res["status"] == "failed":
                 raise RuntimeError(f"register 失敗（取り込みエラー）: {res.get('flags')}")
             registered_ok = True
@@ -781,7 +784,7 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
     手順: ① バインドを新 root へ更新 ② `worker._run_locked`（`load_world` が world_id 単位の delete＋load を 1 tx で置換）で再構築 ③ 失敗時は旧状態への復元を試みる（fail-closed）。復元にも失敗した場合は旧状態を保証しない（`rebind_rollback_failed`）。
     復元: バインド・派生を旧へ戻す。Neo4j は失敗段階に依存し、load 段階の失敗なら tx ロールバックで旧グラフが残る。load 成功後に PG replace で失敗した場合は、旧 root から即時再構築して Neo4j を旧へ戻す（失敗時は `last_sig` を無効化して次回 sync の self-heal に委ねる）。
     `label=None` は既存 label を保持する。
-    ロック: `world_lock` は外側で 1 回だけ取り、lock-free の `_run_locked` を直接呼ぶ（`worker.run` を呼ぶと自己デッドロックする）。
+    ロック: `world_lock` は外側で 1 回だけ取り、lock-free の `_run_locked` を直接呼ぶ（`worker.run` を呼ぶと自己デッドロックする）。続けて `world_swap_lock`（原本・文書一覧の読み取りと排他）を取る。順序は `world_registry_lock → world_lock → world_swap_lock`。
     署名（last_sig／manifest）の確定は `_run_locked` 内部に任せる。外側で取り込み前にスキャンして `set_world_sig` で上書きしない（`world_lock` は参照元の外部変更を防がないため、古い署名で上書きすると `sync` が unchanged と誤判定する ABA 不整合になる）。例外は復旧経路の `restore_bind_invalidate_sig`（bind 復元と同一 tx で `last_sig` を無効化するだけ）。
     `run_id`: 呼び出し元が受付時に確保済みの `ingest_runs` 行。新 root 試行・旧 root 復旧はどちらも `_run_locked` を `finalize=False` で呼び、受付 run の terminal 化はこの関数の最後で 1 回だけ行う。
     rebind 失敗時は採用した内部段の snapshot を残し、status を `failed`、reason を `rebind_failed_rolled_back`（bind 復元＋旧 root 再構築が成功）または `rebind_rollback_failed`（それ以外）にする。`on_run_id` は確保された run_id が判明した時点で呼ばれるコールバック。
@@ -789,7 +792,7 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
     from . import store
     from .ingest import worker
     from .store.worlds import rebind_bind_invalidate_sig  # 内部専用・facade に re-export しない
-    with store.world_lock(world_id):
+    with store.world_lock(world_id), store.world_swap_lock(world_id):
         old = store.get_world(world_id)
         if not old:
             raise ValueError(f"world '{world_id}' は未登録です（新規は register）")
@@ -893,13 +896,13 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
 def delete(world_id: str, reflect=True, run_id=None) -> bool:
     """資料フォルダを完全削除する（派生物 wipe ＋ レジストリ行削除）。参照元（外部フォルダ）は消さない。
     `_wipe_locked` は Neo4j 削除失敗時に例外を投げる（fail-closed）ので、グラフ削除に成功した時だけ行を削除する。
-    `world_lock` は外側で 1 回だけ取り、wipe と行削除を同じ区間に収める（lock-free の `_wipe_locked` を直接呼ぶ）。
+    `world_lock` は外側で 1 回だけ取り、wipe と行削除を同じ区間に収める（lock-free の `_wipe_locked` を直接呼ぶ）。続けて `world_swap_lock` を取る（順序は rebind と同じ）。
     `run_id`: 受付時に確保済みの `ingest_runs` 行。指定時は行の DELETE と run 完了 UPDATE を `store.finish_ingest_run_and_delete_world` で同一トランザクションにする。省略時は `store.delete_world_row`。
     行削除に成功したら、`preview_service._GRAPH_VIEW_LOCK` を取ってグラフ view キャッシュ（`build_preview` と共有）を破棄する（並行中の構築が古い view を再挿入するのを防ぐ）。
     """
     from . import store
     from .ingest import worker
-    with store.world_lock(world_id):
+    with store.world_lock(world_id), store.world_swap_lock(world_id):
         worker._wipe_locked(world_id, reflect=reflect)  # 失敗なら例外＝行も run の terminal 化もしない
         if run_id is not None:
             _rec, ok = store.finish_ingest_run_and_delete_world(

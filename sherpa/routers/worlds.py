@@ -350,6 +350,7 @@ def _ingest_summary(wid: str, row: dict) -> dict:
             "ingest_notices": _ingest_notices(rep, flags_all, es_notice_stage),
             "last_run_id": (last or {}).get("id"),
             "last_run_status": last_status, "last_run_warnings": warns,
+            "last_run_interrupted": last_status == "failed" and snap.get("interrupted") is True,
             "last_run_blocked": blocked,
             "last_run_flags_total": flags_total, "last_run_flags_truncated": flags_truncated,
             "failed_files": failed_files if isinstance(failed_files, dict) else None,

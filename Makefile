@@ -66,11 +66,11 @@ endif
 start:            ## 利用者向け: 依存/ストア/アプリを一括起動（LAN=1 で LAN 公開・MODE=dev で開発モード）
 	LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
-stop:             ## 利用者向け: 全部停止（アプリ＋Caddy＋ストア。KEEP_STORES=1 でストアを残す）
-	KEEP_STORES="$(KEEP_STORES)" ./scripts/stop.sh
+stop:             ## 利用者向け: 全部停止（アプリ＋Caddy＋ストア。取り込み中は処理中の 1 件の完了を待つ。KEEP_STORES=1 でストアを残す・FORCE=1 で待たずに強制終了）
+	KEEP_STORES="$(KEEP_STORES)" FORCE="$(FORCE)" ./scripts/stop.sh
 
 restart:          ## 利用者向け: アプリ（＋Caddy）を再起動（ストアは維持・LAN/MODE は start と同じ）
-	KEEP_STORES=1 ./scripts/stop.sh || true
+	KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
 	LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
 status:           ## 利用者向け: 一枚看板の状態表示（ストア/アプリ/Caddy/URL）

@@ -97,3 +97,24 @@ def list_documents_page(world, *, limit: int, offset: int) -> list:
             "  importance, importance_reason, importance_source "
             "FROM documents WHERE kb_id=%s AND version=%s ORDER BY name LIMIT %s OFFSET %s",
             (_KB_ID, world, limit, offset)).fetchall()
+
+
+def count_and_list_documents(world, *, limit: int | None, offset: int = 0) -> tuple[int, list]:
+    """総件数と文書台帳のページ（`limit=None` は全件）を、1 つの読み取り専用 REPEATABLE READ トランザクションで読む。
+    取り込みの台帳書き込み（`replace_documents`）が COUNT とページの間に入っても、両者は同じ世代の台帳になる。
+    総件数が 0 のときは行を読まない。
+    """
+    _ensure()
+    cols = ("SELECT name, layer, scope_path, doctype, branch, original_path, md_path, status, "
+            "  importance, importance_reason, importance_source "
+            "FROM documents WHERE kb_id=%s AND version=%s ORDER BY name")
+    with _connect() as c:
+        c.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        row = c.execute("SELECT COUNT(*) AS n FROM documents WHERE kb_id=%s AND version=%s",
+                        (_KB_ID, world)).fetchone()
+        total = row["n"] if row else 0
+        if total == 0:
+            return 0, []
+        if limit is None:
+            return total, c.execute(cols, (_KB_ID, world)).fetchall()
+        return total, c.execute(cols + " LIMIT %s OFFSET %s", (_KB_ID, world, limit, offset)).fetchall()
