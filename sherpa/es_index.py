@@ -22,7 +22,7 @@ from . import corpus_docs, doc_text, embeddings, json_io, scope_infer, worlds
 from . import layer as layer_mod
 from . import scope as scope_mod
 from .env_int import env_int
-from .ingest import importance, text_kind
+from .ingest import importance, substage, text_kind
 from .ingest.analyzers import registry as analyzer_registry
 
 _log = logging.getLogger("sherpa")
@@ -1306,6 +1306,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         raise
     finally:
         _building.pop(world, None)
+        substage.end()                       # 早く抜けても小さな段を残さない（「まだ動いています」を出し続けない）
 
 
 def _index_world(world: str, settings, content_sig, progress) -> dict:
@@ -1359,6 +1360,7 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
 
         buf: list = []
         pass1_docs_done = 0
+        pass1_step = substage.begin("embed_vectors", "埋め込みを取っています", total=total_docs, logger=_embed_log)
         for d in docs:
             chunk_iter, _degraded = _iter_doc_chunk_records(world, d, derived, rag_exts)
             if chunk_iter is None:
@@ -1376,6 +1378,7 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
                         return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
                     buf = []
             pass1_docs_done += 1
+            pass1_step.tick(pass1_docs_done)
             if progress is not None:
                 # Pass1 の進捗も呼ぶ（冷キャッシュ時は Pass1 が最長段になりうるため）。Pass2 開始時に done は一度小さく戻る
                 progress(pass1_docs_done, total_docs)
@@ -1386,6 +1389,7 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
                 return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
 
     # 埋め込みキャッシュの最終剪定／削除は、資料フォルダ全体の doc ストリームを一巡し終えた直後（ES 操作の前）に 1 回だけ行う
+    substage.begin("embed_cache", "埋め込みのキャッシュを整理しています", logger=_embed_log)
     if ec is None:
         _delete_embed_cache(world)
     else:
@@ -1438,6 +1442,7 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
     g_no_embed: list = []
     # `docs_done` は Pass2 が見終えた文書数（対象外の文書も含む）。`n_docs`（実際に索引した文書数）とは別に持ち、対象外が連続しても `total_docs` へ収束させる
     docs_done = 0
+    pass2_step = substage.begin("es_bulk", "全文索引に書き込んでいます", total=total_docs, logger=_embed_log)
     if progress is not None:
         # Pass2 開始時に 0/total を明示通知する（間引きラッパーが Pass1 完走時の done を覚えているため）
         progress(0, total_docs)
@@ -1448,11 +1453,13 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
             rag_degraded_docs.append(degraded_entry)
         if chunk_iter is None:
             docs_done += 1
+            pass2_step.tick(docs_done)
             if progress is not None:
                 progress(docs_done, total_docs)
             continue
         n_docs += 1
         docs_done += 1
+        pass2_step.tick(docs_done)
         for cid, body, text, skip in chunk_iter:
             g_ids.append(cid)
             g_bodies.append(body)
@@ -1473,6 +1480,7 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
         # 末尾の leftover が 0 件でも最終呼び出し（`done == total`）を必ず 1 回行う
         progress(docs_done, total_docs)
 
+    substage.begin("es_swap", "全文索引を確定し、付け替えています", logger=_embed_log)
     rag_report = {"rag_degraded": rag_degraded}
     if rag_degraded_docs:
         rag_report["rag_degraded_docs"] = rag_degraded_docs
@@ -1509,6 +1517,9 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
     if embed_calls_made:
         # `embed_elapsed_ms`: 埋め込み呼び出しの合計所要時間。一度も呼んでいなければキーを付けない（0 と欠落を区別する）
         out["embed_elapsed_ms"] = round(embed_elapsed_ms)
+    _embed_log.info("es_index: 全文検索の登録が終わりました: world=%s・文書 %d 件・チャンク %d 件・埋め込みを取った %d 件"
+                    "・キャッシュから %d 件・ベクトル無し %d 件",
+                    world, n_docs, total_chunks, embedded_total, reused_total, sender.missing)
     return out
 
 
@@ -1799,6 +1810,7 @@ def fill_missing_vectors(world: str, settings: dict | None = None) -> dict:
     filled = 0
     idx = _index(world)
     scroll_id = None
+    fill_step = substage.begin("fill_vectors", "ベクトルを足し直しています", total=before, logger=_embed_log)
     try:
         res = _req("POST", f"/{idx}/_search?scroll={_FILL_SCROLL}",
                    {"size": _EMBED_FLUSH_CHUNKS, "query": _MISSING_QUERY, "_source": ["text"], "sort": ["_doc"]})
@@ -1820,6 +1832,7 @@ def fill_missing_vectors(world: str, settings: dict | None = None) -> dict:
                     if bad:
                         raise RuntimeError("bulk_errors")
             filled += len(got)
+            fill_step.tick(filled)
             if guard.gave_up:
                 break
             res = _req("POST", "/_search/scroll", {"scroll": _FILL_SCROLL, "scroll_id": scroll_id})
@@ -1841,6 +1854,7 @@ def fill_missing_vectors(world: str, settings: dict | None = None) -> dict:
                 _req("POST", f"/{idx}/_refresh")
             except Exception:
                 pass
+        fill_step.end()
     return {"available": True, "filled": filled, "missing": count_missing_vectors(world)}
 
 

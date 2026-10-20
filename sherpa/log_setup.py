@@ -1,7 +1,7 @@
 """起動時ログ設定の一元箇所。
 
 変換系・埋め込み系のログは、名前付き子ロガー（`"sherpa.convert.libreoffice"` 等）へ専用ファイルハンドラを付け、
-INFO 以下の詳細は専用ファイルのみへ書く。WARNING 以上は `sherpa` ロガー（stderr＝run ログ）にも伝播させて残す。
+INFO・WARNING は専用ファイルのみへ書く（run ログに重ねると `make logs` で同じ行が二重に並ぶため）。ERROR 以上は `sherpa` ロガー（stderr＝run ログ）にも伝播させて残す。
 系統の追加は `_SUBSYSTEM_LOGGERS` に1行足すだけでよい。
 `configure_logging()` は `ext_api._attach_request_id_filter()` より前（`lifespan` の起動処理の先頭）に呼ぶこと
 （ここで作る handler にも request_id フィルタが付くため）。
@@ -16,6 +16,8 @@ import logging.handlers
 import os
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 
 # ストリーム名 → (ロガー名, 専用ログファイル名)
@@ -35,8 +37,13 @@ _SUBSYSTEM_LOGGERS: dict[str, tuple[str, str]] = {
 _SUBSYSTEM_OWNERS: dict[str, str] = {
     "libreoffice": "ingest", "convert": "ingest", "embed": "shared", "usage": "shared", "codex": "web",
 }
-_MAX_BYTES = 50 * 1024 * 1024    # 専用ログが超えたら退避する大きさ（env `SHERPA_LOG_MAX_MB` で変更）
+_MAX_BYTES = 50 * 1024 * 1024    # ログ 1 つが超えたら退避する大きさ
+_TOTAL_MAX_BYTES = 2 * 1024 * 1024 * 1024    # RUN_DIR のログ全体の上限（超えたら退避済みを古い順に消す。scripts/run-common.sh と揃える）
 _CHECK_EVERY = 200               # 何件書くごとに大きさを確かめるか
+_WATCH_INTERVAL_SEC = 30         # run ログ（api.log・ingest-worker.log）の大きさを確かめる間隔
+
+# プロセスの標準出力・標準エラーをそのまま受けている run ログ（scripts/start.sh が追記モードで開く）。自分が書く方を自分で見張る。
+_RUN_LOG_FILES: dict[str, str] = {"web": "api.log", "ingest": "ingest-worker.log"}
 
 _SUBSYSTEM_LEVEL = logging.INFO  # 専用ファイルへ書く下限
 _RUN_LOG_LEVEL = logging.WARNING  # "sherpa" ロガー（run ログ）へ残す下限
@@ -75,15 +82,104 @@ def rotate_and_prune(path: Path | str, keep: int | None = None) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.stat().st_size > 0:
-        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        archived = path.with_name(f"{path.stem}-{ts}{path.suffix}")
-        n = 2
-        while archived.exists():
-            archived = path.with_name(f"{path.stem}-{ts}-{n}{path.suffix}")
-            n += 1
-        path.rename(archived)
+        path.rename(_archive_name(path))
     path.touch(exist_ok=True)
     _prune_family(path, _LOG_KEEP if keep is None else keep)
+    prune_run_dir_total(path.parent)
+
+
+def _archive_name(path: Path) -> Path:
+    ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    archived = path.with_name(f"{path.stem}-{ts}{path.suffix}")
+    n = 2
+    while archived.exists():
+        archived = path.with_name(f"{path.stem}-{ts}-{n}{path.suffix}")
+        n += 1
+    return archived
+
+
+def copytruncate_rotate(path: Path | str, keep: int | None = None) -> None:
+    """別のプロセスが開いたままのログを、改名せずに退避する（中身を日時付きの名前へ複写してから空にする）。
+
+    書き手は追記モードで開いていること（そうでないと空にした後も元の位置へ書き、穴あきのファイルになる）。
+    複写している間に増えた分は、空にした後に書き戻す。
+    """
+    path = Path(path)
+    archived = _archive_name(path)
+    copied = 0
+    with open(path, "rb") as src, open(archived, "wb") as dst:
+        while chunk := src.read(1024 * 1024):
+            dst.write(chunk)
+            copied += len(chunk)
+    with open(path, "r+b") as f:
+        f.seek(copied)
+        tail = f.read()
+        f.truncate(0)
+    if tail:
+        with open(path, "ab") as f:
+            f.write(tail)
+    _prune_family(path, _LOG_KEEP if keep is None else keep)
+    prune_run_dir_total(path.parent)
+
+
+def rotate_run_log_if_large(path: Path | str) -> bool:
+    """`path` が `_MAX_BYTES` を超えていたら `copytruncate_rotate` で退避する。無い・超えていなければ何もしない。"""
+    path = Path(path)
+    try:
+        if path.stat().st_size <= _MAX_BYTES:
+            return False
+        copytruncate_rotate(path)
+        return True
+    except OSError:
+        return False
+
+
+_ARCHIVED_LOG_RE = re.compile(r"^.+-(\d{8}-\d{6})(?:-\d+)?\.log$")
+
+
+def prune_run_dir_total(directory: Path | str, limit: int | None = None) -> None:
+    """`directory` の `*.log` の合計が上限（`limit`・未指定なら `_TOTAL_MAX_BYTES`）を超えていたら、退避済み（日時付き）のログを古い順に消す。
+
+    今書いているログ・ログ以外のファイルは消さない。
+    """
+    directory = Path(directory)
+    limit = _TOTAL_MAX_BYTES if limit is None else limit
+    try:
+        logs = [p for p in directory.iterdir() if p.is_file() and p.suffix == ".log"]
+        sizes = {p: p.stat().st_size for p in logs}
+    except OSError:
+        return
+    total = sum(sizes.values())
+    archived = sorted(
+        (p for p in logs if _ARCHIVED_LOG_RE.match(p.name)),
+        key=lambda p: (_ARCHIVED_LOG_RE.match(p.name).group(1), p.name),
+    )
+    for p in archived:
+        if total <= limit:
+            return
+        try:
+            p.unlink()
+            total -= sizes[p]
+        except OSError:
+            pass
+
+
+def _watch_run_log(path: Path) -> None:
+    while True:
+        time.sleep(_WATCH_INTERVAL_SEC)
+        rotate_run_log_if_large(path)
+
+
+_watch_threads: dict[Path, threading.Thread] = {}
+
+
+def _start_run_log_watcher(path: Path) -> None:
+    t = _watch_threads.get(path)
+    if t is not None and t.is_alive():
+        return
+    t = threading.Thread(target=_watch_run_log, args=(path,), name=f"log-watch-{path.name}", daemon=True)
+    _watch_threads[path] = t
+    t.start()
 
 
 def _prune_family(path: Path, keep: int) -> None:
@@ -105,9 +201,20 @@ def _prune_family(path: Path, keep: int) -> None:
             pass
 
 
+class _SkipSubsystemBelowError(logging.Filter):
+    """専用ログ（`_SUBSYSTEM_LOGGERS`）のロガーが出した ERROR 未満の行を run ログに出さない（専用ファイルにだけ残る）。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR:
+            return True
+        return not any(record.name == name or record.name.startswith(name + ".")
+                       for name, _filename in _SUBSYSTEM_LOGGERS.values())
+
+
 def _make_run_log_handler() -> logging.Handler:
     handler = logging.StreamHandler(sys.stderr)
     handler.setLevel(_RUN_LOG_LEVEL)
+    handler.addFilter(_SkipSubsystemBelowError())
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     setattr(handler, _HANDLER_MARK, True)
     return handler
@@ -124,8 +231,7 @@ class _WatchedRotatingFileHandler(logging.handlers.WatchedFileHandler):
         self._count += 1
         if self._count % _CHECK_EVERY == 0:
             try:
-                limit = int(os.environ.get("SHERPA_LOG_MAX_MB", "") or 0) * 1024 * 1024 or _MAX_BYTES
-                if Path(self.baseFilename).stat().st_size > limit:
+                if Path(self.baseFilename).stat().st_size > _MAX_BYTES:
                     rotate_and_prune(self.baseFilename)    # 退避後の開き直しは WatchedFileHandler が行う
             except OSError:
                 pass
@@ -195,19 +301,25 @@ def configure_logging(*, log_dir: Path | str | None = None, force: bool = False,
             path.touch(exist_ok=True)
         logger.addHandler(_make_file_handler(path))
         logger.setLevel(_SUBSYSTEM_LEVEL)
-        logger.propagate = True  # WARNING 以上は "sherpa" 経由で run ログにも残る
+        logger.propagate = True  # ERROR 以上は "sherpa" 経由で run ログにも残る（ERROR 未満は run ログ側の filter が落とす）
+
+    if not force and owner in _RUN_LOG_FILES:
+        _start_run_log_watcher(base / _RUN_LOG_FILES[owner])
 
     _attach_access_log_noise_filter()
     _reformat_uvicorn_handlers()
     _configured = True
 
 
-# uvicorn の access ログから落とす定期ポーリング系パス（取り込み・チャットのアクセス行は残す）
-_ACCESS_LOG_DROP_PATHS = frozenset({"/healthz", "/notifications"})
+# uvicorn の access ログから落とす、画面が定期的に問い合わせるパス（成功の行だけ。他の API の行は残す）
+_ACCESS_LOG_DROP_PATHS = frozenset({
+    "/healthz", "/notifications", "/ingest/workers", "/chat/turns/running", "/health/summary",
+})
+_ACCESS_LOG_DROP_PATTERNS = (re.compile(r"^/worlds/[^/]+/status$"),)
 
 
 class _AccessLogNoiseFilter(logging.Filter):
-    """uvicorn.access の定型メッセージから、`_ACCESS_LOG_DROP_PATHS` への成功応答だけを落とす。エラー応答（4xx/5xx）や想定外の args は残す。"""
+    """uvicorn.access の定型メッセージから、`_ACCESS_LOG_DROP_PATHS`・`_ACCESS_LOG_DROP_PATTERNS` への成功応答だけを落とす。エラー応答（4xx/5xx）や想定外の args は残す。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
@@ -216,7 +328,10 @@ class _AccessLogNoiseFilter(logging.Filter):
         path, status = args[2], args[4]
         if not isinstance(path, str) or not isinstance(status, int):
             return True
-        return not (status < 400 and path.split("?", 1)[0] in _ACCESS_LOG_DROP_PATHS)
+        if not (200 <= status < 300 or status == 304):
+            return True
+        bare = path.split("?", 1)[0]
+        return not (bare in _ACCESS_LOG_DROP_PATHS or any(p.match(bare) for p in _ACCESS_LOG_DROP_PATTERNS))
 
 
 def _reformat_uvicorn_handlers() -> None:

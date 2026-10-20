@@ -308,6 +308,32 @@ sherpa_rotate_log() {
   fi
   : > "$log"
   sherpa_prune_log_family "$log" "${2:-10}"
+  sherpa_prune_run_dir_total "$dir"
+}
+
+# $1=ログのフォルダ、$2=上限バイト（省略時 2GiB・sherpa/log_setup.py の _TOTAL_MAX_BYTES と揃える）。
+# フォルダ直下の *.log の合計が上限を超えていたら、退避済み（<名前>-YYYYmmdd-HHMMSS[-N].log）を古い順に消す。
+# 今書いているログとログ以外のファイルは消さない。
+sherpa_prune_run_dir_total() {
+  local dir="$1" limit="${2:-2147483648}" total=0 f sz ts line
+  for f in "$dir"/*.log; do
+    [ -f "$f" ] || continue
+    sz="$(wc -c < "$f" | tr -d ' ')"
+    total=$(( total + sz ))
+  done
+  [ "$total" -gt "$limit" ] || return 0
+  while IFS= read -r line; do
+    [ "$total" -gt "$limit" ] || break
+    f="${line#* }"
+    sz="$(wc -c < "$f" | tr -d ' ')"
+    rm -f -- "$f" && total=$(( total - sz ))
+  done < <(
+    for f in "$dir"/*.log; do
+      [ -f "$f" ] || continue
+      ts="$(basename "$f" | sed -nE 's/^.+-([0-9]{8}-[0-9]{6})(-[0-9]+)?\.log$/\1/p')"
+      [ -n "$ts" ] && printf '%s %s\n' "$ts" "$f"
+    done | sort
+  )
 }
 
 # $1=ログファイル、$2=保持数（省略時 10）。同ファミリーの退避ファイル（$1 と同じ dir・stem・拡張子で、退避の命名規約に

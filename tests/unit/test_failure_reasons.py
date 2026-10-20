@@ -35,6 +35,8 @@ _KNOWN_RAW_REASONS = {
     # office_md._build_derived_into_staging（xlsx セル数/非圧縮サイズガード・MEM-2・プレフィックス無し）
     "cell_count_exceeded": "cell_count_exceeded",
     "uncompressed_size_exceeded": "uncompressed_size_exceeded",
+    # office_md._precheck_target（パスワード付きの入口ガード・プレフィックス無し）
+    "password_protected": "password_protected",
     # ooxml_arm.OoxmlArm.convert（document_ir_failed:<detail>）
     "document_ir_failed:malformed_structure": "malformed_structure",
     "document_ir_failed:password_protected": "password_protected",

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from . import (
     text_kind,
     resolve_settings,
     scan_pdf_ocr_status,
+    substage,
     world_graph,
     world_graph_service,
     world_neo4j,
@@ -47,6 +49,53 @@ STAGE_LABELS = {
     "finalize": "仕上げ中",
     "deleting": "検索用データを削除しています",
 }
+
+class _RunProgress:
+    """`ingest_runs.progress` の書き手。段（stage）と、その中の小さな段（`substage`）を 1 つの辞書にして書く。記録の失敗で取り込みを止めない。"""
+
+    def __init__(self, run_id, world, *, fail_note: str):
+        self.run_id = run_id
+        self.world = world
+        self.fail_note = fail_note
+        self.stage = None
+        self.done = None
+        self.total = None
+        self.step: dict = {}
+        self._lock = threading.Lock()
+
+    def set_stage(self, stage, done=None, total=None) -> None:
+        if stage != self.stage:
+            substage.end(quiet=True)       # 先に閉じる（ロックの順序: substage → この書き手）
+        with self._lock:
+            if stage != self.stage:
+                self.step = {}
+            self.stage, self.done, self.total = stage, done, total
+        self._flush()
+
+    def set_step(self, info) -> None:
+        with self._lock:
+            self.step = dict(info or {})
+        self._flush()
+
+    def stage_label(self) -> str:
+        return STAGE_LABELS.get(self.stage, self.stage or "")
+
+    def attach(self) -> None:
+        substage.bind(self.set_step, self.stage_label)
+
+    def _flush(self) -> None:
+        if self.run_id is None or self.stage is None:
+            return
+        with self._lock:
+            payload = {"stage": self.stage, "stage_label": self.stage_label(),
+                       "done": self.done, "total": self.total, **self.step,
+                       "updated_at": datetime.now(timezone.utc).isoformat()}
+        try:
+            store.update_ingest_run_progress(self.run_id, payload)
+        except Exception:
+            _log.warning("進捗の記録に失敗しました（%s）: world=%s stage=%s",
+                         self.fail_note, self.world, self.stage, exc_info=True)
+
 
 # 逐次進捗の書き込み間隔（office_md 段の per-file 進捗をこの件数ごとに間引く）。最初（0件）と最後（総数一致）は必ず書く
 _PROGRESS_FILE_INTERVAL = 100
@@ -379,6 +428,20 @@ def _ledger_rows(world: str, *, sig: str | None = None) -> list:
     return [_ledger_row(d, res_map.get(d["name"])) for d in corpus_docs.world_documents(world, root=root, files=files)]
 
 
+def _ledger_rows_step(world: str, sig: str | None) -> list:
+    """`_ledger_rows` を小さな段（台帳の行を作る）として進み具合に出す。"""
+    with substage.step("ledger_rows", "台帳の行を作っています"):
+        return _ledger_rows(world, sig=sig)
+
+
+def _write_ledger_step(world: str, rows: list) -> int:
+    """台帳の入れ替え（`store.replace_documents`）を小さな段（台帳を書く）として進み具合に出す。"""
+    with substage.step("ledger_write", "台帳を書いています", total=len(rows)) as st:
+        written = store.replace_documents(world, rows)
+        st.tick(written)
+        return written
+
+
 def _ledger_row(d: dict, res) -> dict:
     """`corpus_docs` の文書 1 件と重要度の解決結果から、台帳の 1 行を作る。"""
     status = "unreadable" if d.get("state") == "unreadable" else "indexed"
@@ -417,10 +480,21 @@ def _run_locked(world, **kwargs) -> dict:
     return res
 
 
-def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_run_id=None,
-                     op: str = "sync",
-                     finalize: bool = True,
-                     scan: _Scan | None = None) -> dict:
+def _run_locked_body(world, **kwargs) -> dict:
+    """取り込み 1 回の本体（`_run_locked_body_impl`）を、小さな段の進み具合の書き先を外してから返す形で呼ぶ。"""
+    try:
+        res = _run_locked_body_impl(world, **kwargs)
+    except BaseException:
+        substage.unbind(failed=True)
+        raise
+    substage.unbind()
+    return res
+
+
+def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None, on_run_id=None,
+                          op: str = "sync",
+                          finalize: bool = True,
+                          scan: _Scan | None = None) -> dict:
     # lock 保持下で呼ぶ版。`worlds.rebind` はここを直接呼ぶ（`run` 経由だと同じ advisory lock を再入できず自己デッドロックする）。
     # last_sig はこの run の中で完結させる（他に書くのは `_wipe_locked` の pre-invalidate・`sync` の lock 内バックフィル・rebind 復旧の `restore_bind_invalidate_sig`）:
     #  - world 未解決（`sig is None`）は last_sig に触れず即 failed にする（`_record` の監査記録だけ書く）
@@ -449,6 +523,9 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
         stage_timings[stage]["finished_at"] = datetime.now(timezone.utc).isoformat()
         stage_timings[stage]["elapsed_ms"] = round((time.monotonic() - _stage_mono[stage]) * 1000)
 
+    run_progress = _RunProgress(run_id, world, fail_note="取り込み自体は継続")
+    run_progress.attach()
+
     def _progress(stage, done=None, total=None):
         if stage != _current_stage[0]:
             _close_stage_timing()
@@ -456,14 +533,7 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
             stage_timings[stage] = {"started_at": now_iso, "finished_at": None, "elapsed_ms": None}
             _stage_mono[stage] = time.monotonic()
             _current_stage[0] = stage
-        try:
-            store.update_ingest_run_progress(run_id, {
-                "stage": stage, "stage_label": STAGE_LABELS.get(stage, stage),
-                "done": done, "total": total,
-                "updated_at": datetime.now(timezone.utc).isoformat()})
-        except Exception:
-            _log.warning(
-                "進捗の記録に失敗しました（取り込み自体は継続）: world=%s stage=%s", world, stage, exc_info=True)
+        run_progress.set_stage(stage, done, total)
 
     _progress("scanning")
     # ① 走査（走査済み件数を逐次報告する。総数は走査完了まで不明）
@@ -566,7 +636,8 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
     # アーカイブ（zip/tar(.gz)/tgz）は原本に書かず、展開先（`worlds.archives_dir`）を原本側のアーカイブ集合と突き合わせて差分同期する。
     # 以降のグラフ構築・台帳行は展開先を合流させるため、それらより前に展開を終える。個別の失敗は展開結果サマリへ閉じ込め、取り込み全体は止めない。
     try:
-        archive_extract.sync_world_archives(world, worlds.world_dir(world), walk=walk)
+        with substage.step("archive_extract", "アーカイブ（zip など）の展開を確かめています"):
+            archive_extract.sync_world_archives(world, worlds.world_dir(world), walk=walk)
     except Exception:
         _log.warning("アーカイブの展開に失敗しました（取り込み自体は継続）: world=%s", world, exc_info=True)
 
@@ -601,9 +672,9 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
         return _record("failed", extra_flags=_office_flags(drep), drep=drep)
 
     if not reflect:                                         # staging のみ（DB 無し検証/テスト）＝台帳だけ
-        rows = _ledger_rows(world, sig=sig)
+        rows = _ledger_rows_step(world, sig)
         rows_known[0] = True
-        written = store.replace_documents(world, rows)
+        written = _write_ledger_step(world, rows)
         # 署名は確定しない（last_sig は `''` のまま）。Neo4j 未反映を「同期済み」とみなさず、次の `sync(reflect=True)` が再構築する
         return _record("extracting", ledger=written, extra_flags=_office_flags(drep), drep=drep)
 
@@ -625,10 +696,10 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
                        neo4j_summary={"error": f"{e.__class__.__name__}@{_target_of(env['uri'] if env else '')}",
                                      "duration_sec": round(time.monotonic() - neo4j_t0, 3)})
     neo4j_duration_sec = time.monotonic() - neo4j_t0
-    rows = _ledger_rows(world, sig=sig)                     # ⑤ 台帳（派生 .md ができた後）
+    rows = _ledger_rows_step(world, sig)                    # ⑤ 台帳（派生 .md ができた後）
     rows_known[0] = True
     try:
-        written = store.replace_documents(world, rows)      # グラフ成功後に書く（不一致を残さない）
+        written = _write_ledger_step(world, rows)           # グラフ成功後に書く（不一致を残さない）
     except Exception as e:
         # PG の台帳 replace が失敗すると Neo4j は新・台帳は旧のまま残る。記録は best-effort で、last_sig は pre-invalidate 済みなので次回 sync が全再構築で自己修復する。
         # office_md／neo4j は完了済みなので要約を残し、`published_snapshot` も記録する（Neo4j には既に新世代が入っているため）
@@ -721,7 +792,8 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
     _progress("finalize")     # ⑦ 仕上げ
     try:
         from .. import reconcile                            # 孤児派生物の自動掃除（registry が確実なときだけ）
-        reconcile.reconcile_derivatives(reflect=reflect)
+        with substage.step("reconcile", "使われなくなった派生物を掃除しています"):
+            reconcile.reconcile_derivatives(reflect=reflect)
     except Exception as e:
         extra.append({"doc": None, "action": "warn", "reason": f"reconcile_failed:{e.__class__.__name__}"})
     status = "auto_published_with_flags" if (flags or extra) else "auto_published"
@@ -736,7 +808,8 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
     if sig is not None:
         try:
             # `expected_rels`（冒頭の manifest の rel 集合）と実集合が食い違えば `scan_rep["document_count"]` は `None` になり、更新保留になる
-            scan_rep = corpus_docs.scan_report(world, expected_rels=frozenset(manifest))
+            with substage.step("scan_report", "取り込みの件数を数えています"):
+                scan_rep = corpus_docs.scan_report(world, expected_rels=frozenset(manifest))
         except Exception:
             scan_rep = None
             _log.warning(
@@ -1324,6 +1397,8 @@ def sync(world, *, reflect=True, force=False, run_id=None, on_run_id=None, op: s
             except Exception:
                 _log.warning("中断の記録に失敗しました（best-effort）: world=%s run_id=%s", world, run_id, exc_info=True)
         return {"world": world, "changed": False, "status": "failed", "ledger": 0, "interrupted": True}
+    finally:
+        substage.unbind()
     if (result.get("status") != "unavailable" and not os.environ.get("SHERPA_TEST_DB_ISOLATED")
             and not background.stop_requested()):
         try:
@@ -1382,18 +1457,12 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             _log.warning("Webhook 通知の起動に失敗しました（sync 自体は継続）: world=%s", world,
                         exc_info=True)
 
+    # `_run_locked` の同名クロージャと同じ形。unchanged 分岐は `_run_locked` を経由しないためここで進捗を配線する。`run_id` が無い分岐は no-op
+    run_progress = _RunProgress(run_id, world, fail_note="sync 自体は継続")
+    run_progress.attach()
+
     def _progress(stage, done=None, total=None):
-        # `_run_locked` の同名クロージャと同じ形。unchanged 分岐は `_run_locked` を経由しないためここで進捗を配線する。`run_id` が無い分岐は no-op
-        if run_id is None:
-            return
-        try:
-            store.update_ingest_run_progress(run_id, {
-                "stage": stage, "stage_label": STAGE_LABELS.get(stage, stage),
-                "done": done, "total": total,
-                "updated_at": datetime.now(timezone.utc).isoformat()})
-        except Exception:
-            _log.warning(
-                "進捗の記録に失敗しました（sync 自体は継続）: world=%s stage=%s", world, stage, exc_info=True)
+        run_progress.set_stage(stage, done, total)
 
     # ES 自己修復の progress は、`_run_locked` の `_es_progress` と同じ間引き（`_PROGRESS_FILE_INTERVAL` 件間隔・先頭/末尾は必ず書く）を掛けてから `_progress` へ渡す
     _last_unchanged_es_progress_done = [None]

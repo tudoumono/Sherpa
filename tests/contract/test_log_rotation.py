@@ -68,3 +68,15 @@ def test_keep_count_prunes_oldest_first_and_families_are_independent(tmp_path: P
     caddy.write_text("caddy run\n", encoding="utf-8")
     assert _run_rotate(caddy, keep="1").returncode == 0
     assert len(_archives(tmp_path, stem="caddy")) == 1 and len(_archives(tmp_path, stem="api")) == 2
+
+
+def test_run_dir_total_limit_removes_oldest_archives_only(tmp_path: Path):
+    (tmp_path / "api.log").write_text("c" * 30, encoding="utf-8")
+    (tmp_path / "api.pid").write_text("1" * 50, encoding="utf-8")
+    for name in ("api-20260101-000001.log", "convert-20260101-000002.log", "api-20260101-000003.log"):
+        (tmp_path / name).write_text("a" * 40, encoding="utf-8")
+    script = f'ROOT="{ROOT}"; . "{COMMON}"; sherpa_prune_run_dir_total "{tmp_path}" 100'
+    r = subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert left == ["api-20260101-000003.log", "api.log", "api.pid"]

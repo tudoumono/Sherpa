@@ -684,6 +684,8 @@ def _coverage_notice_records(ir: evidence_ir.EvidenceIR, source_name: str) -> li
             if isinstance(measured, int) and isinstance(cap, int):
                 semantic += (
                     f" セル数が多すぎるため取り込み対象外である（上限{cap}セル・このファイル約{measured}セル）。")
+        elif reason == "password_protected":
+            semantic += " パスワード付きで中身を読めないため取り込み対象外である（資料名だけを検索に載せる）。"
         elif reason == "uncompressed_size_exceeded":
             measured, cap = detail.get("measured_bytes"), detail.get("cap_bytes")
             if isinstance(measured, int) and isinstance(cap, int):

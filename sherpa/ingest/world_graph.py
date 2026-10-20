@@ -22,7 +22,7 @@ from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
 from .. import corpus_docs, doc_text, scope_infer, text_encoding, worlds
-from . import importance, resolve_settings, text_kind
+from . import importance, resolve_settings, substage, text_kind
 from .analyzers import registry as analyzer_registry
 from .analyzers import _vb_project as vb_project
 from .analyzers._base import FileContext, RefResult, TypeCandidate, TypeLookup, TypeRelations
@@ -799,10 +799,11 @@ def _mention_pass(world_dir, world_id: str, defs: dict, aliases: dict, files, no
         flags.append({"reason": "mention_ambiguous_names", "count": ambiguous_count})
     if not mdict:
         return
-    with worlds.pin_world_root(world_id, world_dir):
+    with worlds.pin_world_root(world_id, world_dir), substage.step("graph_mentions", "資料の言及を突き合わせています") as st:
         docs = corpus_docs.iter_world_documents(world_id, include_rag=True,
                                                 root=world_dir, files=files)
-        for d in docs:
+        for n_seen, d in enumerate(docs):
+            st.tick(n_seen)
             if d.get("branch") != "office" or d.get("state") != "ready":
                 continue
             rel = d["name"]
@@ -1205,7 +1206,9 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
                           "line": child.line, "status": "active"})
 
     # --- Pass 1: 定義収集＋ノード（拡張子→アナライザを引いて collect_defs を呼ぶ汎用ループ）---
-    for rp, rel in files:
+    pass1 = substage.begin("graph_defs", "ソースを解析しています", total=len(files))
+    for n_seen, (rp, rel) in enumerate(files):
+        pass1.tick(n_seen)
         candidates = analyzer_registry.candidates(rel)
         if not candidates:                                # どのアナライザも拡張子を担当しない＝資料
             continue
@@ -1569,7 +1572,10 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
             qualified_defs, defs, type_records,
             lambda rel: bool(texts[rel][1].resolves_parent_namespaces) if rel in texts else False)
 
-    for rel, (rp, analyzer, raw_sha1) in texts.items():
+    pass1.end()
+    pass2 = substage.begin("graph_links", "ソース同士の関係を結んでいます", total=len(texts))
+    for n_seen, (rel, (rp, analyzer, raw_sha1)) in enumerate(texts.items()):
+        pass2.tick(n_seen)
         # Pass1 は本文を保持しない（コード総量に比例したメモリを持たない）。Pass2 で 1 回読み直し、失敗時は Pass1 と同じ
         # fail-closed（blocked flag・部分グラフを確定しない）で扱う。
         try:
@@ -1706,6 +1712,7 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
     # Pass2 完了直後にコード本文を解放する（Pass3 は資料文書の本文を別経路で読み直す）
     texts.clear()
 
+    pass2.end()
     # Pass3: 辞書突合→言及エッジ
     _mention_pass(world_dir, world_id, defs, mention_aliases, files, nodes, edges, flags)
 

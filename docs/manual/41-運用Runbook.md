@@ -227,6 +227,18 @@ Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定して
 版を上げるときは、`make codex-compat` が全項目 OK になった版の番号・配布物名・sha256 を
 `scripts/codex-version.env` に書き換えます（取得できないネットワークでは閉域キットで運びます）。
 
+### S12. 取り込みが止まって見える（進み具合が変わらない）
+
+件数の多い資料フォルダでは、1つの作業が数十分かかることがあります。管理画面の「取り込み」の行に出る**「いまの作業」と「最後に進んだのは」**で、動いているかどうかを見分けます（[20-管理-取り込み](20-管理-取り込み.md)）。
+
+1. 画面の「最後に進んだのは」が数十秒〜数分前なら動いています（数えられない作業でも、動いている間は1分弱ごとに更新されます）。10分以上前のときは次へ。
+2. 全ログを並べて、最後に出た行を見ます: `make l`（変換の経過だけなら `make l c`、全文検索・埋め込みなら `make l e`）。
+   - 変換・OCR の対象の決定・公開・関係グラフ・Neo4j・台帳の作業は `convert.log` に、埋め込み・全文索引・ベクトルの足し直しは `embed.log` に出ます。
+   - 作業の始まりに「取り込みの進み具合: ○○ を始めます（全 N 件）」、件数のある作業は1割進むごと（または1分ごと）に「○○ 12000/48413 件（24%・経過 8 分）」、終わりに「○○ が終わりました（N 件・所要）」が出ます。
+   - 件数を出せない作業は、約45秒ごとに「まだ動いています: ＜段＞・＜作業＞・経過 N 分」が出ます。この行が続いていれば動いています。
+3. 始まりの行の後に何も出ず、「まだ動いています」も出ないときは、取り込みワーカーが止まっています。`./sherpactl status` でワーカーの状態を見て、取り込みワーカーのログ（`make l ingest-worker`）と `api.log`（`make l app`）に ERROR が無いか確かめます。
+4. 「途中で止まりました」の行が出ていれば、その作業が失敗または停止要求で中断しています。直前の WARNING／ERROR（`make l err`）を見ます。
+
 ## ログ
 
 ### 置き場所
@@ -235,7 +247,7 @@ Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定して
 
 | ログ | 場所 | 中身 |
 |------|------|------|
-| アプリ（run ログ） | `RUN_DIR/api.log` | アプリ全体の標準出力/標準エラー（起動処理・各リクエストの警告以上・uvicorn のアクセスログ等） |
+| アプリ（run ログ） | `RUN_DIR/api.log` | アプリ全体の標準出力/標準エラー（起動処理・各リクエストの警告以上・uvicorn のアクセスログ等）。画面が定期的に確かめる問い合わせ（`/healthz`・`/notifications`・`/health/summary`・`/chat/turns/running`・`/ingest/workers`・`/worlds/<ID>/status`）の成功の行は残さない（失敗は残す） |
 | Caddy（LAN 公開時のみ） | `RUN_DIR/caddy.log` | リバースプロキシ/HTTPS のログ |
 | LibreOffice 変換 | `RUN_DIR/libreoffice.log` | 旧形式 Office（.doc/.xls/.ppt）変換の詳細（`legacy_backend`＝libreoffice／office_com 両方。置き場は `RUN_DIR` で変更可） |
 | MD 変換（取り込み） | `RUN_DIR/convert.log` | 取り込み（資料フォルダスキャン→MD化→索引）の進行ログの詳細 |
@@ -244,10 +256,17 @@ Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定して
 | Codex 実行ログ | `./sherpactl logs codex`（`RUN_DIR/codex.log`） | Codex CLI 実行1回ごとの開始（構成種別/multi_agent/深さ/見直し回数/出力スキーマ段/モデル）・終了（returncode/イベント種類別件数/MCP呼出数/spawn_agent 子数/usage合計/エラーcode・message/経過秒/stderr末尾）サマリ。文脈枠超過（`context_window_exceeded`）等の原因切り分けに使う |
 | Codex 実行 | `RUN_DIR/codex.log` | Codex CLI 実行1回ごとの開始/終了サマリ（構成・深さ・イベント種別件数・MCP 呼出数・子スレッド数・使用トークン・エラーコード・所要時間。**stderr と失敗本文は保存しない**＝資料名・本文・環境変数値が残るため・2026-09-20） |
 
-**WARNING 以上（障害の疑いがある事象）はサブシステム別ログだけでなく `RUN_DIR/api.log`（run ログ）にも残ります**——
-上記の専用ログ（usage.log を除く）は INFO 以下の詳細を追うためのもので、見なくても障害には run ログだけで気づける設計です
-（LOG-2・裁定 2026-09-03）。障害調査でまず見るのは run ログ、原因が変換/埋め込み系だと分かった後に該当の専用ログを
-掘り下げる、という順で使います。
+**専用ログへ書いた行は `RUN_DIR/api.log`（run ログ）へ重ねません**——`./sherpactl logs`（`make l`）で全ログを並べたときに
+同じ行が二重に見えないようにするためです。ERROR 以上だけは専用ログと run ログの両方に残ります。WARNING（資料 1 件ごとの失敗・
+一部だけ外した画像・埋め込みの書き込み失敗など）は専用ログにだけ残るので、障害調査は `./sherpactl logs err`
+（全ログの ERROR・WARN 行）か、`convert`／`embed` を指定して見ます。
+
+取り込みで読み取れなかった資料 1 件は、理由が分かる日本語の 1 行（資料の場所つき・Traceback なし）で `convert.log` に出ます。
+例: 「パスワード付きのため変換できません」「ファイルが大きすぎるため変換しません」「セル数が多すぎるため変換しません」
+「旧形式の変換が時間切れになりました」「画像を取り出せなかったため、その画像だけ外して続けます（本文は通常どおり）」。
+Traceback が付くのは想定外の例外だけです。MD 化の段の最後には「MD化が終わりました: 対象 N 件・変換 N 件（うちキャッシュから N 件）・
+失敗 N 件（理由ごとの件数）・対象外 N 件」が 1 行、全文検索の登録の最後には `embed.log` に
+「全文検索の登録が終わりました: 文書・チャンク・埋め込みを取った数・キャッシュから・ベクトル無し」が 1 行出ます。
 
 **まとめて見る/集計する**: 上記は個別に `tail`/`cat` してもよいですが、`./sherpactl logs` は RUN_DIR/*.log と
 Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に合流して追えます
@@ -319,10 +338,30 @@ make の書き方（`make logs convert embed`・`make logs err`・`make l c e m`
 （`ls -t data/run/api-*.log | head` で新しい順に一覧できます）。
 
 退避ファイルは無限には残りません。同じファイル（例: `api.log`）由来の退避ファイル数が
-10 を超えたら、最古のものから自動で削除します。ディスク逼迫時は、古い退避ファイルを手で削除してください。
+10 を超えたら、最古のものから自動で削除します。
 
-実装: シェル起動経路（run/caddy ログ）は `scripts/run-common.sh::sherpa_rotate_log`、
-サブシステム別ログ（Python 側）は `sherpa/log_setup.py::rotate_and_prune`。命名規約・保持数の
+### 動いている間の退避（大きさ）
+
+起動し直さなくても、ログ 1 つが **50MB** を超えたら同じ名前規則で退避して、新しいファイルに書き続けます（同じく 10 世代）。
+退避するのは、そのログを書いている側です。
+
+| ログ | 退避するもの |
+|------|------|
+| `api.log` | アプリ（30 秒ごとに大きさを確かめる。アプリの標準出力・標準エラーをそのまま受けているため、ファイルを複写して空にする形で退避する） |
+| `ingest-worker.log` | 取り込みワーカー（同上） |
+| `convert.log`・`libreoffice.log`・`embed.log`・`usage.log`・`codex.log` | 書いている側が 200 行書くごとに確かめる |
+
+`api.log` と `ingest-worker.log` は、複写して空にする間に書かれた行が 1 行ほど前後することがあります。
+大きさは設定で変えられません（`SHERPA_LOG_MAX_MB` は廃止しました）。
+
+### ログ全体の上限
+
+`RUN_DIR` の `*.log` の合計が **2GB** を超えたら、退避済み（日時付き）のログを古い順に消します。確かめるのは、退避を行うとき（起動時と大きさでの退避）です。
+今書いているログ・pid・状態ファイルなど、ログ以外のファイルは消しません。
+上の 10 世代の保持と合わせて、先に当たった方が効きます。ディスク逼迫時は、古い退避ファイルを手で削除してください。
+
+実装: シェル起動経路（run/caddy ログ）は `scripts/run-common.sh::sherpa_rotate_log`・`sherpa_prune_run_dir_total`、
+サブシステム別ログ（Python 側）は `sherpa/log_setup.py::rotate_and_prune`・`copytruncate_rotate`・`prune_run_dir_total`。命名規約・保持数の
 意味論は両者で揃えています。
 
 ### 会話の流れを時刻順に書き出す（./sherpactl trace）

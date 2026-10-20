@@ -331,6 +331,29 @@ const INGEST_STAGE_STEPS = [
   ['es_index', '全文索引・ベクトル化'],
   ['finalize', '仕上げ'],
 ];
+// 段の中の小さな段（`step_*`）の表示: 名前・件数・経過・最後に進んだ時刻。最後に進んでから INGEST_STEP_SLOW_MS 以上たったら、止まったと決めつけずに注意を出す。
+const INGEST_STEP_SLOW_MS = 10 * 60 * 1000;
+function spanText(ms) {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  if (sec < 60) return `${sec}秒`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}分`;
+  return `${Math.floor(sec / 3600)}時間${Math.floor(sec % 3600 / 60)}分`;
+}
+function stepNote(p) {
+  if (!p || !p.step_label) return '';
+  const now = Date.now();
+  const counts = p.step_total != null ? `${p.step_done != null ? p.step_done : 0}/${p.step_total}件`
+    : (p.step_done ? `${p.step_done}件` : '');
+  const started = Date.parse(p.step_started_at || '');
+  const updated = Date.parse(p.updated_at || '');
+  const parts = [`いまの作業: ${esc(p.step_label)}`];
+  if (counts) parts.push(esc(counts));
+  if (!isNaN(started)) parts.push(`経過 ${spanText(now - started)}`);
+  if (!isNaN(updated)) parts.push(`最後に進んだのは ${spanText(now - updated)}前`);
+  const slow = !isNaN(updated) && now - updated >= INGEST_STEP_SLOW_MS
+    ? '<div class="muted">この段は時間がかかることがあります（ログ: make l）</div>' : '';
+  return `<div class="muted" style="margin-top:3px">${parts.join('・')}</div>${slow}`;
+}
 function progressNote(s) {
   const p = s && s.running_progress;
   if (!p) return '';
@@ -340,14 +363,15 @@ function progressNote(s) {
   const idx = INGEST_STAGE_STEPS.findIndex(([k]) => k === p.stage);
   if (idx < 0) {                                   // 未知の段（accepted/deleting 等）＝1行表示
     return `<div class="muted" style="margin-top:3px"><span class="loading-inline" role="status">`
-      + `<span class="spinner spinner-sm"></span><span>${esc(p.stage_label)}${counts}</span></span></div>`;
+      + `<span class="spinner spinner-sm"></span><span>${esc(p.stage_label)}${counts}</span></span></div>`
+      + stepNote(p);
   }
   const steps = INGEST_STAGE_STEPS.map(([k, label], i) => {
     if (i < idx) return `<span class="step done">✓ ${esc(label)}</span>`;
     if (i === idx) return `<span class="step now" role="status"><span class="spinner spinner-sm"></span>${esc(label)}${counts}</span>`;
     return `<span class="step todo">${esc(label)}</span>`;
   }).join('<span class="step-arrow">→</span>');
-  return `<div class="muted ingest-steps" style="margin-top:3px">${steps}</div>`;
+  return `<div class="muted ingest-steps" style="margin-top:3px">${steps}</div>${stepNote(p)}`;
 }
 function summaryNote(s, wid) {
   if (!s) return '';

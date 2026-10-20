@@ -187,15 +187,16 @@ fi
 # （exec で PID がそのコマンドに引き継がれる＝PID ファイルの pid = 実プロセスの pid）。
 # setsid があれば新セッション化（起動元ターミナルを閉じても止まらない・PID=PGID=SID）。
 # 無い環境（stock macOS 等）では nohup 単独にフォールバックする（RV High-2）。
+# ログは追記モード（>>）で開く（動いている間に sherpa/log_setup.py が複写して空にしても、書き手が元の位置へ書き続けて穴あきにならない）。
 # その場合 group kill（stop.sh の `kill -TERM -$pid`）は失敗し、単独 kill にフォールバックする
 # 既存経路でそのまま正しく動く（exec 連鎖のため pid ファイルの pid = 実プロセスの pid は変わらない）。
 launch_bg() {  # $1=ログファイル  $2=pidファイル  $3...=exec するコマンドと引数
   local log="$1" pf="$2"
   shift 2
   if command -v setsid >/dev/null 2>&1; then
-    setsid bash -c 'echo $$ > "$0"; exec "$@"' "$pf" "$@" >"$log" 2>&1 < /dev/null &
+    setsid bash -c 'echo $$ > "$0"; exec "$@"' "$pf" "$@" >>"$log" 2>&1 < /dev/null &
   else
-    nohup bash -c 'echo $$ > "$0"; exec "$@"' "$pf" "$@" >"$log" 2>&1 < /dev/null &
+    nohup bash -c 'echo $$ > "$0"; exec "$@"' "$pf" "$@" >>"$log" 2>&1 < /dev/null &
   fi
 }
 

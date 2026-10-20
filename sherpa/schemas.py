@@ -1167,13 +1167,20 @@ class IngestNotice(BaseModel):
 
 
 class RunProgress(BaseModel):
-    """実行中 run の逐次進捗。`stage_label` は内部段キー（`stage`）に対応する利用者向けの平文。`done`/`total` はファイル単位の進捗（件数を持たない段では両方 `None`）。"""
+    """実行中 run の逐次進捗。`stage_label` は内部段キー（`stage`）に対応する利用者向けの平文。`done`/`total` はファイル単位の進捗（件数を持たない段では両方 `None`）。
+    `step`〜`step_started_at` は段の中の「小さな段」（動いているときだけ）。`step_done`/`step_total` はその段の件数（数えられない段では `None`）。
+    `updated_at` は小さな段が動いている間、一定の間隔で進む。"""
     stage: str
     stage_label: str
     done: int | None
     total: int | None
     updated_at: str
     rel: str | None = None   # 1 ファイルの再変換の実行中だけ、その資料の rel
+    step: str | None = None
+    step_label: str | None = None
+    step_done: int | None = None
+    step_total: int | None = None
+    step_started_at: str | None = None
 
 
 class IngestSummaryFields(BaseModel):

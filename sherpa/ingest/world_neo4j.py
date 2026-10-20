@@ -21,7 +21,7 @@ from neo4j.exceptions import Neo4jError
 from .. import graph_coverage, worlds                # 未完了の申告・資料フォルダの root 解決（重要度の解決に使う）
 from ..env_int import env_int
 from ..impact_service import CATEGORY                # 種別→結果カテゴリ
-from . import importance                             # 文書の重要度（`_重要度.txt`）
+from . import importance, substage                   # 文書の重要度（`_重要度.txt`）・小さな段の進み具合
 from .model import EDGE_TYPES, NODE_LABELS           # 閉じた語彙（Cypher 直埋めの allowlist）
 
 _log = logging.getLogger("sherpa")
@@ -344,11 +344,14 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
         edges_by_type.setdefault(e["type"], []).append(e)
 
     driver = GraphDatabase.driver(uri, auth=(user, password))
+    step = substage.begin("neo4j_load", "Neo4j に反映しています", total=len(nodes) + len(edges))
+    loaded_ok = False
     try:
         with driver.session() as s:
             for c in WORLD_CONSTRAINTS:
                 s.run(c)
             def _apply(tx):
+                loaded = 0                                   # 失敗時の再試行で最初からやり直すので、数え直す
                 tx.run("MATCH (n:Entity {world_id:$w}) DETACH DELETE n", w=world_id)
                 for label, items in nodes_by_label.items():
                     node_cypher = (
@@ -366,6 +369,8 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
                     for batch in _batched(items, _NEO4J_BATCH_ROWS):
                         rows = [_node_row(n) for n in batch]
                         tx.run(node_cypher, rows=rows, world=world_id)
+                        loaded += len(batch)
+                        step.tick(loaded)
                 for etype, items in edges_by_type.items():
                     edge_cypher = (
                         "UNWIND $rows AS row "
@@ -379,6 +384,9 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
                     for batch in _batched(items, _NEO4J_BATCH_ROWS):
                         rows = [_edge_row(e) for e in batch]
                         tx.run(edge_cypher, rows=rows, world=world_id)
+                        loaded += len(batch)
+                        step.tick(loaded)
+                step.tick(loaded)
                 # 世代スタンプと実物件数を同一 tx で刻む（投入後の実物を数える＝`check_graph_counts` と同じ数え方）
                 node_count = tx.run(
                     "MATCH (n:Entity {world_id:$w}) RETURN count(n) AS c", w=world_id
@@ -395,9 +403,12 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
                     pf=json.dumps(list(plugin_failures or []), ensure_ascii=False),
                     us=json.dumps(dict(unparsed_sources or {}), ensure_ascii=False))
                 return len(nodes), len(edges)
-            return s.execute_write(_apply)
+            result = s.execute_write(_apply)
+            loaded_ok = True
+            return result
     finally:
         driver.close()
+        step.end(failed=not loaded_ok)
 
 
 def check_graph_counts(world_id, uri, user, password) -> str | None:

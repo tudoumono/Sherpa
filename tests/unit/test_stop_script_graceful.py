@@ -289,7 +289,7 @@ def test_stop_only_worker_force_does_not_wait_and_leaves_the_app(tmp_path):
             p.kill() if p.poll() is None else None
 
 
-_FAKE_WORKER = r'''
+_FAKE_VERSION_SWAP_WORKER = r'''
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
@@ -310,7 +310,7 @@ def test_watcher_stops_relaunching_when_files_are_replaced_by_another_version(tm
     (root / "VERSION").write_text("0.19.0\n", encoding="utf-8")
     (root / "data" / "run").mkdir(parents=True)
     fake = tmp_path / "fake_worker.py"
-    fake.write_text(_FAKE_WORKER, encoding="utf-8")
+    fake.write_text(_FAKE_VERSION_SWAP_WORKER, encoding="utf-8")
     # `python -m sherpa.ingest.ingest_worker` の代わりに、1 件処理して終わる擬似ワーカーを PYTHON_BIN として動かす
     shim = tmp_path / "pyshim"
     shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{fake}" "{root}"\n', encoding="utf-8")

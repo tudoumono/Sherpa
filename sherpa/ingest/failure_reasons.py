@@ -20,7 +20,8 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
     },
     "password_protected": {
         "label": "パスワード保護／暗号化",
-        "advice": "パスワードで保護（暗号化）されているため読み取れません。パスワードを解除して保存し直してください。",
+        "advice": "パスワードで保護（暗号化）されているため読み取れません（中身は読めないので、資料名だけが検索に出ます）。"
+                  "パスワードを解除して保存し直し、「再変換」で変換し直してください。",
     },
     "malformed_structure": {
         "label": "ファイル破損",
@@ -105,7 +106,7 @@ _DOCUMENT_IR_KNOWN_DETAILS = frozenset({"malformed_structure", "password_protect
 _PASSTHROUGH = frozenset({
     "legacy_conversion_timeout", "legacy_conversion_failed", "size_exceeded",
     "cell_count_exceeded", "uncompressed_size_exceeded", "source_parse_failed", "reconvert_reflect_failed",
-    "ocr_unavailable", "ocr_failed",
+    "ocr_unavailable", "ocr_failed", "password_protected",
 })
 
 # 書込失敗の別名

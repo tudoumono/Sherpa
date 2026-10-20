@@ -3838,12 +3838,20 @@ def extract(
     return builder.ir
 
 
-def extract_assets(path: str | Path, ir: evidence_ir.EvidenceIR, destination: str | Path) -> list[Path]:
+def extract_assets(
+    path: str | Path,
+    ir: evidence_ir.EvidenceIR,
+    destination: str | Path,
+    *,
+    skipped: list[dict[str, Any]] | None = None,
+) -> list[Path]:
     """OOXML/PDF内のEvidence画像をcontent hash名でgeneration stageへ取り出す。
 
     Evidence IRに記録済みの``media_part``だけを対象とし、書込前にbytesのSHA-256を再照合する。
     destinationは非公開stage内を呼び出し側が指定するため、ここでは同名hash assetを決定的に上書きする。
     PDFはpypdfが列挙したpage image bytesを同じhashで再照合する。
+    PDFで取り出せない・照合が合わない画像は、その1枚だけ外して``skipped``へ``{page, name, reason}``を積む
+    （文書全体は止めない）。
     """
     source_path = Path(path)
     if source_path.suffix.lower() not in {".xlsx", ".docx", ".pptx", ".pdf"}:
@@ -3860,30 +3868,39 @@ def extract_assets(path: str | Path, ir: evidence_ir.EvidenceIR, destination: st
         target_dir.mkdir(parents=True, exist_ok=True)
         written: dict[str, Path] = {}
         reader = PdfReader(source_path)
-        expected: set[str] = set()
         for element in requested:
             expected_digest = str(element.extension["asset_sha256"])
-            expected.add(expected_digest)
             page_number = element.locator.page
             xobject_path = element.extension.get("xobject_path")
+            reason = None
+            raw = b""
             if not isinstance(page_number, int) or not isinstance(xobject_path, list) or not xobject_path:
-                raise ValueError("PDF asset locator is incomplete")
-            try:
-                xobject = _pdf_xobject_at_path(reader.pages[page_number - 1], xobject_path)
-                _image_name, raw, _decoded_image = _pdf_image_payload(xobject, xobject_path[-1])
-            except (IndexError, KeyError) as exc:
-                raise ValueError("PDF asset locator cannot be resolved") from exc
-            actual_digest = hashlib.sha256(raw).hexdigest()
-            if actual_digest != expected_digest:
-                raise ValueError("PDF asset hash mismatch")
+                reason = "locator_incomplete"
+            else:
+                try:
+                    xobject = _pdf_xobject_at_path(reader.pages[page_number - 1], xobject_path)
+                    _image_name, raw, _decoded_image = _pdf_image_payload(xobject, xobject_path[-1])
+                except (IndexError, KeyError):
+                    reason = "locator_unresolved"
+                except Exception:
+                    reason = "decode_failed"
+            if reason is None and hashlib.sha256(raw).hexdigest() != expected_digest:
+                reason = "hash_mismatch"
+            if reason is not None:
+                if skipped is None:
+                    raise ValueError(f"PDF asset {reason}")
+                skipped.append({
+                    "page": page_number,
+                    "name": "/".join(str(name) for name in xobject_path) if isinstance(xobject_path, list) else "",
+                    "reason": reason,
+                })
+                continue
             suffix = element.extension.get("asset_extension", ".bin")
             suffix = suffix if isinstance(suffix, str) and suffix.startswith(".") else ".bin"
-            target = target_dir / f"{actual_digest}{suffix}"
-            if actual_digest not in written:
+            target = target_dir / f"{expected_digest}{suffix}"
+            if expected_digest not in written:
                 json_io.write_bytes_atomic(target, raw)
-                written[actual_digest] = target
-        if set(written) != expected:
-            raise ValueError("PDF asset inventory mismatch")
+                written[expected_digest] = target
         return [written[digest] for digest in sorted(written)]
     requested: dict[str, str] = {}
     for element in ir.elements:

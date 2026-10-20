@@ -4120,7 +4120,7 @@
         "type": "object"
       },
       "RunProgress": {
-        "description": "実行中 run の逐次進捗。`stage_label` は内部段キー（`stage`）に対応する利用者向けの平文。`done`/`total` はファイル単位の進捗（件数を持たない段では両方 `None`）。",
+        "description": "実行中 run の逐次進捗。`stage_label` は内部段キー（`stage`）に対応する利用者向けの平文。`done`/`total` はファイル単位の進捗（件数を持たない段では両方 `None`）。\n`step`〜`step_started_at` は段の中の「小さな段」（動いているときだけ）。`step_done`/`step_total` はその段の件数（数えられない段では `None`）。\n`updated_at` は小さな段が動いている間、一定の間隔で進む。",
         "properties": {
           "done": {
             "anyOf": [
@@ -4151,6 +4151,61 @@
           "stage_label": {
             "title": "Stage Label",
             "type": "string"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step"
+          },
+          "step_done": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Done"
+          },
+          "step_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Label"
+          },
+          "step_started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Started At"
+          },
+          "step_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Total"
           },
           "total": {
             "anyOf": [

@@ -75,17 +75,19 @@ def test_codex_subsystem_is_registered(tmp_path):
     assert "start conv=1" in (tmp_path / "codex.log").read_text(encoding="utf-8")
 
 
-def test_info_goes_to_subsystem_file_only_warning_also_reaches_run_logger(tmp_path, monkeypatch):
-    """INFO は専用ファイルのみ／WARNING 以上は専用ファイル＋run ログ（"sherpa" ロガー）の両方に残る
-    （専用ファイルを見ないと障害に気づけない、という新しい無音を作らない、の実測）。"""
+def test_subsystem_info_and_warning_are_not_repeated_in_run_log_but_error_is(tmp_path, monkeypatch):
+    """専用ログへ書いた INFO・WARNING は run ログ（stderr）へ重ねて出さない＝`make logs` に同じ行が二重に並ばない。
+    ERROR 以上と、専用ログ以外のロガーの WARNING は run ログへも出る。"""
     fake_stderr = io.StringIO()
     monkeypatch.setattr(log_setup.sys, "stderr", fake_stderr)
     log_setup.configure_logging(force=True, log_dir=tmp_path)
 
     embed_logger_name, embed_filename = log_setup._SUBSYSTEM_LOGGERS["embed"]
     logger = logging.getLogger(embed_logger_name)
-    logger.info("詳細情報（run ログには出ない想定）")
-    logger.warning("障害の疑いあり（run ログにも出る想定）")
+    logger.info("詳細情報")
+    logger.warning("障害の疑いあり")
+    logger.error("止まりました")
+    logging.getLogger("sherpa.ingest.worker").warning("ワーカー本体の警告")
     for h in logger.handlers:
         h.flush()
     for h in logging.getLogger("sherpa").handlers:
@@ -96,8 +98,10 @@ def test_info_goes_to_subsystem_file_only_warning_also_reaches_run_logger(tmp_pa
     assert "障害の疑いあり" in file_content
 
     run_output = fake_stderr.getvalue()
-    assert "障害の疑いあり" in run_output
+    assert "障害の疑いあり" not in run_output
     assert "詳細情報" not in run_output
+    assert "止まりました" in run_output
+    assert "ワーカー本体の警告" in run_output
 
 
 def test_run_logger_handler_level_is_warning(tmp_path):
@@ -108,7 +112,7 @@ def test_run_logger_handler_level_is_warning(tmp_path):
 
 
 def test_subsystem_loggers_are_children_of_sherpa_namespace(tmp_path):
-    """"sherpa" 配下の子ロガーであること＝ WARNING+ が自然に run ログへ伝播する前提（propagate 既定 True）。"""
+    """"sherpa" 配下の子ロガーであること＝ ERROR 以上が自然に run ログへ伝播する前提（propagate 既定 True）。"""
     log_setup.configure_logging(force=True, log_dir=tmp_path)
     for _name, (logger_name, _filename) in log_setup._SUBSYSTEM_LOGGERS.items():
         assert logger_name == "sherpa" or logger_name.startswith("sherpa.")
@@ -305,3 +309,58 @@ def test_handler_reopens_when_another_process_renames_the_file(tmp_path):
     lg.info("after")
     assert "after" in (tmp_path / "convert.log").read_text(encoding="utf-8")
     assert "after" not in (tmp_path / "convert-20260101-000000.log").read_text(encoding="utf-8")
+
+
+def test_polled_screen_requests_are_dropped_on_success_but_errors_and_other_apis_stay():
+    from sherpa.log_setup import _AccessLogNoiseFilter
+    f = _AccessLogNoiseFilter()
+    for path in ("/worlds/w1/status", "/worlds/ab-12_c/status?x=1", "/ingest/workers",
+                 "/chat/turns/running", "/health/summary"):
+        assert f.filter(_access_record(path, 200)) is False, path
+        assert f.filter(_access_record(path, 304)) is False, path
+        assert f.filter(_access_record(path, 500)) is True, path
+        assert f.filter(_access_record(path, 404)) is True, path
+    for path in ("/worlds/w1/refresh", "/worlds/w1/status/extra", "/worlds/status", "/ingest/runs",
+                 "/ingest/workers/x", "/worlds"):
+        assert f.filter(_access_record(path, 200)) is True, path
+
+
+def test_run_log_over_limit_is_archived_while_the_writer_keeps_appending(tmp_path, monkeypatch):
+    monkeypatch.setattr(log_setup, "_MAX_BYTES", 100)
+    log = tmp_path / "api.log"
+    with open(log, "ab") as writer:          # start.sh と同じ追記モードで開いたまま書き続ける書き手
+        writer.write(b"x" * 150 + b"\n")
+        writer.flush()
+        assert log_setup.rotate_run_log_if_large(log) is True
+        writer.write(b"after\n")
+        writer.flush()
+    archives = [p for p in tmp_path.glob("api-*.log")]
+    assert len(archives) == 1 and archives[0].read_bytes() == b"x" * 150 + b"\n"
+    assert log.read_bytes() == b"after\n"    # 空にした後も先頭から書かれ、穴あきにならない
+    assert log_setup.rotate_run_log_if_large(log) is False
+
+
+def test_run_log_rotation_keeps_only_ten_generations(tmp_path, monkeypatch):
+    monkeypatch.setattr(log_setup, "_MAX_BYTES", 10)
+    log = tmp_path / "ingest-worker.log"
+    for i in range(13):
+        (tmp_path / f"ingest-worker-20260101-0000{i:02d}.log").write_text("old", encoding="utf-8")
+    log.write_text("y" * 50, encoding="utf-8")
+    assert log_setup.rotate_run_log_if_large(log) is True
+    assert len(list(tmp_path.glob("ingest-worker-*.log"))) == 10
+
+
+def test_total_limit_removes_oldest_archives_but_not_current_logs_or_other_files(tmp_path):
+    (tmp_path / "api.log").write_text("c" * 30, encoding="utf-8")
+    (tmp_path / "api.pid").write_text("1" * 50, encoding="utf-8")
+    (tmp_path / "ingest_worker_active").write_text("s" * 50, encoding="utf-8")
+    (tmp_path / "notes-20260101-000000.txt").write_text("n" * 50, encoding="utf-8")
+    for name in ("api-20260101-000001.log", "convert-20260101-000002.log", "api-20260101-000003.log"):
+        (tmp_path / name).write_text("a" * 40, encoding="utf-8")
+    log_setup.prune_run_dir_total(tmp_path, limit=100)       # 合計 150 → 古い順に 2 つ消すと 70
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert "api-20260101-000001.log" not in left and "convert-20260101-000002.log" not in left
+    assert "api-20260101-000003.log" in left
+    assert {"api.log", "api.pid", "ingest_worker_active", "notes-20260101-000000.txt"} <= set(left)
+    log_setup.prune_run_dir_total(tmp_path, limit=1)          # 退避済みが尽きても今のログは消さない
+    assert (tmp_path / "api.log").exists() and not list(tmp_path.glob("api-2026*.log"))

@@ -273,7 +273,7 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     最終 ingest run の status と warn/blocked 理由も含める。`last_run_warnings` は reason 文字列のみの一覧で、対象ファイルが特定できる blocked flag は `last_run_blocked`（`doc`/`reason`）で別途通す。どちらも `extraction_snapshot.flags` を `_STATUS_FLAGS_LIMIT` 件で打ち切ってから導出し、`last_run_flags_total`/`last_run_flags_truncated` で打切りの有無を示す。
     `scanned`〜`unreadable` は `row["last_scan_report"]` を読むだけでフォルダを歩かない。graph/ES 件数も `graph_view()` や ES live `_count` は呼ばず、graph は最新の反映済み run（`store.get_latest_published_run_summary`）の `published_snapshot`、ES は別クエリ（`store.get_latest_es_run_summary`）の `extraction_snapshot.es` から読む（完了境界が異なり別々の run を指しうる）。`store.get_latest_run_summary` は `source_doc_ids` を含まない狭い SELECT（`last_run_status`/`last_run_warnings`/`failed_files`/`stage_summary` の由来）。DB 例外は捕捉せず呼び出し元へ伝播させる（全ゼロへ縮退しない）。キャッシュが無い world は全ゼロ＋`counts_as_of=None`（未集計・利用者が「再集計」を押すまで待つ）。
     `failed_files` は失敗の一覧（`world_failed_docs`）由来、`partial_extraction_suspected`/`stage_summary`（`stage_timings`/`counts` を含む）は最新 run の `extraction_snapshot` 由来（無ければ None）。`failure_reason_catalog`/`partial_extraction_advice` は静的な辞書（`sherpa.ingest.failure_reasons` が真実源）。
-    `last_run_id` は背景実行の受付応答の `run_id` と対応付ける。`running_progress` は実行中（`status` が `queued`／`extracting` かつ `progress` がある）時だけ `{stage, stage_label, done, total, updated_at}`（資料画面はこの間だけ数秒間隔でポーリングする）。
+    `last_run_id` は背景実行の受付応答の `run_id` と対応付ける。`running_progress` は実行中（`status` が `queued`／`extracting` かつ `progress` がある）時だけ `{stage, stage_label, done, total, updated_at}`（資料画面はこの間だけ数秒間隔でポーリングする）。段の中の小さな段が動いている間は `step`・`step_label`・`step_done`・`step_total`・`step_started_at` も付く。
     """
     rep = row.get("last_scan_report")
     counts_as_of = row.get("last_scan_report_at")
