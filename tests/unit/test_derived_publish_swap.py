@@ -47,40 +47,6 @@ def test_staging_is_used_and_published_dir_untouched_until_swap(tmp_path, monkey
     assert not (published.parent / "md.retired").exists()
 
 
-def test_incomplete_build_keeps_published_content(tmp_path, monkeypatch):
-    """縮退すらできない失敗（rag_failed 等）があれば公開しない＝旧内容が残る。
-
-    文書ごとの変換失敗は failed notice へ縮退するのが正常系（S3の契約）。ここで止めるのは
-    その縮退すらできなかった場合だけ（`_generate_evidence` のコメント参照）。
-    """
-    published = tmp_path / "md"
-    published.mkdir()
-    (published / "既存.md").write_text("前回の内容", encoding="utf-8")
-    source = tmp_path / "src"
-    source.mkdir()
-    (source / "資料.txt").write_text("本文", encoding="utf-8")
-
-    called = {"publish": 0}
-    monkeypatch.setattr(office_md, "_publish_staging",
-                        lambda staging, target: called.__setitem__("publish", called["publish"] + 1))
-
-    real_build = office_md._build_derived_into_staging
-
-    def _incomplete(wd, derived, *, progress=None, world=None):
-        rep = real_build(wd, derived, progress=progress, world=world)
-        rep["rag_failed"] = 2                      # notice すら作れなかった状態を模す
-        return rep
-
-    monkeypatch.setattr(office_md, "_build_derived_into_staging", _incomplete)
-    rep = office_md.build_derived(str(source), str(published))
-
-    assert rep["error"].startswith("derived_incomplete:"), rep.get("error")
-    assert "rag_failed=2" in rep["error"]
-    assert called["publish"] == 0, "作り切れていないのに公開している"
-    assert (published / "既存.md").read_text(encoding="utf-8") == "前回の内容"
-    assert not (tmp_path / "md.staging").exists()    # ステージングは片付ける
-
-
 def test_interrupted_swap_is_recovered(tmp_path):
     """改名2回の間で中断（公開中が無く .retired だけある）→ 次回に復旧する。"""
     published = tmp_path / "md"
@@ -136,11 +102,10 @@ def test_a_few_failed_documents_do_not_block_publishing(tmp_path, monkeypatch):
     assert called["publish"] > 0, "一部が作れなかっただけで公開をやめている"
 
 
-def test_too_many_failed_documents_still_block_publishing(tmp_path, monkeypatch):
-    """作れなかった文書が候補の割合（既定 1 割）を超えたら、今まで通り公開しない（公開中の内容を壊さない）。"""
+def test_many_failed_documents_still_publish_and_are_flagged(tmp_path, monkeypatch):
+    """作れなかった文書が候補の割合（既定 1 割）を超えても公開して先へ進み、多いことを知らせる印を付ける。"""
     published = tmp_path / "md"
     published.mkdir()
-    (published / "既存.md").write_text("前回の内容", encoding="utf-8")
     source = tmp_path / "src"
     source.mkdir()
     (source / "資料.txt").write_text("本文", encoding="utf-8")
@@ -158,6 +123,6 @@ def test_too_many_failed_documents_still_block_publishing(tmp_path, monkeypatch)
     monkeypatch.setattr(office_md, "_build_derived_into_staging", _mostly_failed)
     rep = office_md.build_derived(str(source), str(published))
 
-    assert rep["error"] == "derived_incomplete:rag_failed=11"
-    assert called["publish"] == 0
-    assert (published / "既存.md").read_text(encoding="utf-8") == "前回の内容"
+    assert not rep.get("error"), rep.get("error")
+    assert rep["derived_partial"] == {"rag_failed": 11} and rep["derived_partial_many"] is True
+    assert called["publish"] > 0

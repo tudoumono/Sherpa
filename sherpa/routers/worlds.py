@@ -250,6 +250,9 @@ def _ingest_notices(rep: dict, flags_all: list, es_stage) -> list[dict]:
     _add("graph_source_unparsed", dropped["syntax"])
     _add("graph_source_oversize", dropped["size_exceeded"])
     _add("graph_mention_doc_unreadable", mention_unreadable)
+    # MD 化で作れなかった文書が候補の一定割合を超えた（公開と全文検索・埋め込みは進めている。各文書は失敗の一覧に載る）
+    _add("md_docs_failed_many", sum(f.get("count") or 0 for f in dict_flags
+                                    if f.get("many") is True and str(f.get("reason", "")).startswith("office_md:derived_partial")))
     if isinstance(es_stage, dict):
         by_reason = es_stage.get("rag_degraded_by_reason")
         by_reason = by_reason if isinstance(by_reason, dict) else {}

@@ -1368,17 +1368,17 @@ def _proc_rss_gib() -> float | None:
         pass
     return None
 
-_DERIVED_FAIL_MAX_RATIO_DEFAULT = 0.1
+_DERIVED_FAIL_WARN_RATIO_DEFAULT = 0.1
 
 
-def derived_fail_max_ratio() -> float:
-    """作れなかった文書がこの割合（候補に対して）を超えたら派生物を公開しない。env `SHERPA_DERIVED_FAIL_MAX_RATIO`（0〜1・既定 0.1）。"""
-    raw = os.environ.get("SHERPA_DERIVED_FAIL_MAX_RATIO", "").strip()
+def derived_fail_warn_ratio() -> float:
+    """作れなかった文書がこの割合（候補に対して）を超えたら、管理画面で知らせる。env `SHERPA_DERIVED_FAIL_WARN_RATIO`（0〜1・既定 0.1）。"""
+    raw = os.environ.get("SHERPA_DERIVED_FAIL_WARN_RATIO", "").strip()
     try:
-        v = float(raw) if raw else _DERIVED_FAIL_MAX_RATIO_DEFAULT
+        v = float(raw) if raw else _DERIVED_FAIL_WARN_RATIO_DEFAULT
     except ValueError:
-        return _DERIVED_FAIL_MAX_RATIO_DEFAULT
-    return v if 0.0 <= v <= 1.0 else _DERIVED_FAIL_MAX_RATIO_DEFAULT
+        return _DERIVED_FAIL_WARN_RATIO_DEFAULT
+    return v if 0.0 <= v <= 1.0 else _DERIVED_FAIL_WARN_RATIO_DEFAULT
 
 
 def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = None,
@@ -1422,22 +1422,17 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
             json_io.write_text_atomic(staging / _WORLD_SIG_MARKER, world_sig + "\n")
         except OSError as e:                         # 署名が刻めなければ後段は「不明」として動かない
             rep["world_sig_error"] = f"{e.__class__.__name__}"
-    # 完了 Gate: 縮退すらできなかった文書（rag/evidence/想定外の失敗）が候補の一定割合を超えたときだけ公開しない
-    # （変換の不具合で大半が失敗したときに、公開中の内容を壊さない）。それ以下なら、失敗した文書だけを欠いたまま公開する。
-    # 失敗した文書は版の印を確定しないので、次回 sync が作り直す。止めた場合は公開中の旧内容が生き続ける。
+    # 完了 Gate: 縮退すらできなかった文書（rag/evidence/想定外の失敗）があっても公開して先（全文検索・埋め込み）へ進む。
+    # 作れなかった文書は失敗の一覧に載り、版の印を確定しないので次回 sync が作り直す。候補の一定割合を超えたら知らせる。
     # `document_ir_failed` はここに含めない（failed notice へ縮退する正常系。`.document_ir_sig` を確定せず次回 sync が再試行する）。
-    blocking = {key: rep.get(key) or 0 for key in (
+    failing = {key: rep.get(key) or 0 for key in (
         "rag_failed", "evidence_ir_failed", "unhandled_failed") if rep.get(key)}
-    if blocking:
+    if failing:
         total = rep.get("candidate_total") or 0
-        if total <= 0 or sum(blocking.values()) > total * derived_fail_max_ratio():
-            for s in all_staging:
-                shutil.rmtree(s, ignore_errors=True)
-            rep["error"] = "derived_incomplete:" + ",".join(f"{k}={v}" for k, v in sorted(blocking.items()))
-            return rep
-        rep["derived_partial"] = dict(blocking)
-        _log.warning("一部の文書の派生物を作れませんでした（その文書だけ欠いたまま公開し、次の更新で作り直します）: %s",
-                     ",".join(f"{k}={v}" for k, v in sorted(blocking.items())))
+        rep["derived_partial"] = dict(failing)
+        rep["derived_partial_many"] = total <= 0 or sum(failing.values()) > total * derived_fail_warn_ratio()
+        _log.warning("一部の文書の派生物を作れませんでした（その文書だけ欠いたまま公開し、次の更新で作り直します）: %s・候補 %d 件",
+                     ",".join(f"{k}={v}" for k, v in sorted(failing.items())), total)
     # 3 層それぞれ独立に改名 2 回で差し替える。跨ぎでの原子性は無く、1 層だけ失敗した場合は次回 sync の drift 検知/全再構築が自己修復する。
     # 1 層の失敗が他層の公開試行を止めない（`try/except` を層ごとに独立させる）。
     publish_failures: list[str] = []

@@ -785,8 +785,8 @@ def test_human_md_partial_failure_keeps_es_meta_pending_until_fixed(monkeypatch,
 
 # ---- 公開（staging→target）の fail-closed ----
 
-def test_build_derived_blocks_publish_on_unhandled_exception(tmp_path, monkeypatch):
-    """想定外の例外で終わった rel が1件でもあると `unhandled_failed` へ計上され公開しない（derived 自体が作られない）。"""
+def test_build_derived_publishes_and_records_unhandled_exception(tmp_path, monkeypatch):
+    """想定外の例外で終わった rel は `unhandled_failed` へ計上し失敗の一覧へ載せるが、公開は止めない（候補の 1 割を超えたので知らせる）。"""
     src, der = _dirs(tmp_path)
     _xlsx(src / "a.xlsx", A1="x")
 
@@ -794,13 +794,14 @@ def test_build_derived_blocks_publish_on_unhandled_exception(tmp_path, monkeypat
         raise RuntimeError("simulated unhandled crash")
     monkeypatch.setattr(office_md, "_convert_with_arms", _boom)
     rep = office_md.build_derived(src, der)
-    assert rep["unhandled_failed"] == 1 and rep["error"] == "derived_incomplete:unhandled_failed=1"
-    assert not der.is_dir()
+    assert rep["unhandled_failed"] == 1 and not rep.get("error")
+    assert rep["derived_partial"] == {"unhandled_failed": 1} and rep["derived_partial_many"] is True
+    assert der.is_dir()
     assert rep["unhandled_failures"] == [{"doc": "a.xlsx", "reason": "unhandled_exception:RuntimeError"}]
 
 
-def test_build_derived_blocks_publish_on_manifest_write_failure(tmp_path, monkeypatch):
-    """`{rel}.derived.json` の書込失敗も `unhandled_failed` へ計上され公開しない（書けなかったマニフェストを対象外と取り違えない）。"""
+def test_build_derived_records_manifest_write_failure(tmp_path, monkeypatch):
+    """`{rel}.derived.json` の書込失敗も `unhandled_failed` へ計上する（書けなかったマニフェストを対象外と取り違えない）。公開は止めない。"""
     src, der = _dirs(tmp_path)
     _xlsx(src / "a.xlsx", A1="x")
     original = json_io.write_text_atomic
@@ -811,8 +812,7 @@ def test_build_derived_blocks_publish_on_manifest_write_failure(tmp_path, monkey
         return original(path, *args, **kwargs)
     monkeypatch.setattr(office_md.json_io, "write_text_atomic", _boom)
     rep = office_md.build_derived(src, der)
-    assert rep["unhandled_failed"] == 1 and rep["error"] == "derived_incomplete:unhandled_failed=1"
-    assert not der.is_dir()
+    assert rep["unhandled_failed"] == 1 and not rep.get("error")
     assert rep["unhandled_failures"] == [{"doc": "a.xlsx", "reason": "manifest_write_failed"}]
 
 

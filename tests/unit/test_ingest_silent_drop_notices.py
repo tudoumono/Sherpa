@@ -259,3 +259,11 @@ def test_vectors_missing_notice_clears_after_a_fill_only_run(monkeypatch):
 
     runs.insert(0, worker._with_fill(None, {"filled": 3, "missing": 0}, "w"))     # 足し直しだけの更新（ES の要約なし）
     assert codes() == {"es_empty_text"}              # 残りの印は消え、索引を作ったときの注意は引き継がれる
+
+
+def test_many_md_failures_are_shown_as_a_notice_and_a_few_are_not(monkeypatch):
+    """MD 化で作れなかった文書が候補の割合を超えた run だけ、件数のお知らせを出す（少ないときは失敗の一覧だけ）。"""
+    many = [{"doc": None, "action": "warn", "reason": "office_md:derived_partial:rag_failed=12", "count": 12, "many": True}]
+    few = [{"doc": None, "action": "warn", "reason": "office_md:derived_partial:rag_failed=2", "count": 2, "many": False}]
+    assert {"code": "md_docs_failed_many", "count": 12} in worlds_router._ingest_notices({}, many, None)
+    assert all(n["code"] != "md_docs_failed_many" for n in worlds_router._ingest_notices({}, few, None))
