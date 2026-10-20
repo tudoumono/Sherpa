@@ -549,6 +549,9 @@ def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_r
 
     def _office_flags(d):                                   # 派生 MD のセットアップ失敗を flag にする
         """派生 MD の失敗を集約 warn の flag にして返す。per-file の詳細は `failed_files` を単一の出所にし、ここへは複製しない（JSONB の肥大化を避ける）。"""
+        if d.get("derived_partial"):              # 一部の文書を欠いたまま公開した（失敗の一覧に各文書が載る）
+            return [{"doc": None, "action": "warn", "reason": "office_md:derived_partial:" + ",".join(
+                f"{k}={v}" for k, v in sorted(d["derived_partial"].items()))}]
         if not d.get("error"):
             return []
         return [{"doc": None, "action": "warn", "reason": f"office_md:{d['error']}"}]

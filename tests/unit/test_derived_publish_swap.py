@@ -107,3 +107,57 @@ def test_recover_does_not_touch_healthy_published(tmp_path):
     office_md._recover_interrupted_swap(published)
 
     assert (published / "今の.md").exists() and not (published / "古い.md").exists()
+
+
+def test_a_few_failed_documents_do_not_block_publishing(tmp_path, monkeypatch):
+    """作れなかった文書が候補の 1 割以下なら、その文書だけを欠いたまま公開する（全文検索・埋め込みへ進める）。"""
+    published = tmp_path / "md"
+    published.mkdir()
+    (published / "既存.md").write_text("前回の内容", encoding="utf-8")
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "資料.txt").write_text("本文", encoding="utf-8")
+
+    called = {"publish": 0}
+    monkeypatch.setattr(office_md, "_publish_staging",
+                        lambda staging, target: called.__setitem__("publish", called["publish"] + 1))
+    real_build = office_md._build_derived_into_staging
+
+    def _partial(wd, derived, *, progress=None, world=None):
+        rep = real_build(wd, derived, progress=progress, world=world)
+        rep.update(candidate_total=48000, rag_failed=3, evidence_ir_failed=1)   # 4 万 8000 件のうち 4 件だけ作れなかった
+        return rep
+
+    monkeypatch.setattr(office_md, "_build_derived_into_staging", _partial)
+    rep = office_md.build_derived(str(source), str(published))
+
+    assert not rep.get("error"), rep.get("error")
+    assert rep["derived_partial"] == {"rag_failed": 3, "evidence_ir_failed": 1}
+    assert called["publish"] > 0, "一部が作れなかっただけで公開をやめている"
+
+
+def test_too_many_failed_documents_still_block_publishing(tmp_path, monkeypatch):
+    """作れなかった文書が候補の割合（既定 1 割）を超えたら、今まで通り公開しない（公開中の内容を壊さない）。"""
+    published = tmp_path / "md"
+    published.mkdir()
+    (published / "既存.md").write_text("前回の内容", encoding="utf-8")
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "資料.txt").write_text("本文", encoding="utf-8")
+
+    called = {"publish": 0}
+    monkeypatch.setattr(office_md, "_publish_staging",
+                        lambda staging, target: called.__setitem__("publish", called["publish"] + 1))
+    real_build = office_md._build_derived_into_staging
+
+    def _mostly_failed(wd, derived, *, progress=None, world=None):
+        rep = real_build(wd, derived, progress=progress, world=world)
+        rep.update(candidate_total=100, rag_failed=11)
+        return rep
+
+    monkeypatch.setattr(office_md, "_build_derived_into_staging", _mostly_failed)
+    rep = office_md.build_derived(str(source), str(published))
+
+    assert rep["error"] == "derived_incomplete:rag_failed=11"
+    assert called["publish"] == 0
+    assert (published / "既存.md").read_text(encoding="utf-8") == "前回の内容"
