@@ -93,6 +93,7 @@ from .usage_events import add_usage_event  # noqa: F401
 # failed_docs の re-export。
 from .failed_docs import (  # noqa: F401
     clear_failed_docs, list_failed_docs, record_failed_doc, remove_failed_doc, replace_failed_docs,
+    summarize_failed_docs,
 )
 
 # documents・ingest の re-export。
@@ -114,6 +115,7 @@ from .ingest import (  # noqa: F401
     get_recent_es_attempts,
     get_latest_published_run_summary,
     get_latest_run_summary,
+    get_latest_run_status,
     list_claimants_of_extracting_runs,
     list_ingest_runs,
     list_worlds_with_interrupted_latest_run,

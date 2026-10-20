@@ -11,6 +11,7 @@ name: sherpa-mvp
 services:
   postgres:                       # RDB 正本（documents / ingest_runs / analyses / users …）
     image: postgres:16
+    restart: unless-stopped       # OS に止められても戻る（make stop で止めたものは戻さない）
     environment:
       POSTGRES_USER: sherpa
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sherpa_dev}
@@ -29,9 +30,13 @@ services:
 
   neo4j:                          # GraphRAG（影響範囲分析・world ごと1グラフ）
     image: neo4j:5-community
+    restart: unless-stopped
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-sherpa_dev}
-      NEO4J_server_memory_pagecache_size: 512m
+      # 上限は scripts/lib/mem_budget.sh が全体のメモリから決めて渡す（直接 compose を呼んだときの既定は下の値）
+      NEO4J_server_memory_heap_initial__size: ${SHERPA_NEO4J_HEAP_RESOLVED:-1g}
+      NEO4J_server_memory_heap_max__size: ${SHERPA_NEO4J_HEAP_RESOLVED:-1g}
+      NEO4J_server_memory_pagecache_size: ${SHERPA_NEO4J_PAGECACHE_RESOLVED:-512m}
     ports: ["127.0.0.1:${SHERPA_NEO4J_HTTP_PORT:-7474}:7474", "127.0.0.1:${SHERPA_NEO4J_BOLT_PORT:-7687}:7687"]   # localhost のみ（dev）。変更時は NEO4J_URI も対で合わせる
     volumes:
       - neo4j:/data
@@ -44,10 +49,12 @@ services:
   elasticsearch:                  # ベクトル/BM25 検索（MVP は任意・影響分析は Neo4j 主体）
     build: ./docker/elasticsearch # 日本語形態素 analysis-kuromoji 入り（PG/Neo4j は素で日本語OK）
     image: sherpa/es-kuromoji:8.19.20
+    restart: unless-stopped
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
-      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      ES_JAVA_OPTS: "-Xms${SHERPA_ES_HEAP_RESOLVED:-512m} -Xmx${SHERPA_ES_HEAP_RESOLVED:-512m}"   # scripts/lib/mem_budget.sh が決めた値
+    mem_limit: ${SHERPA_ES_MEM_LIMIT_RESOLVED:-1536m}   # ヒープ×2＋余裕
     ports: ["127.0.0.1:${SHERPA_ES_PORT:-9200}:9200"]   # localhost のみ（ESは無認証＝外部公開しない・RV High）。変更時は ES_URL も対で合わせる
     volumes:
       - es:/usr/share/elasticsearch/data

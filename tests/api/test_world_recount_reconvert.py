@@ -25,8 +25,9 @@ def client(auth_disabled):
 
 def _stub_ingest_summary(monkeypatch, *, latest=None, published=None, es=None):
     """`_ingest_summary` の周辺（最新 run／反映済み run／ES run の狭い SELECT）を DB 不要に固定する。"""
+    from _run_status_view import status_view
     from sherpa import store
-    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: latest)
+    monkeypatch.setattr(store, "get_latest_run_status", lambda wid, limit=200: status_view(latest))
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: published)
     monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: es)
 
@@ -388,10 +389,11 @@ def test_status_es_chunks_is_none_when_available_false_or_error_set(client, monk
 def test_status_es_state_distinguishes_failed_unavailable_reflecting(client, monkeypatch, tmp_path):
     """`es_state`: 失敗した ES run（未反映の run も含む）は failed・旧索引が残ると言えるのは旧索引に触れる前の
     失敗で、かつ過去に成功した記録があるときだけ。接続不可は unavailable・ES の段の実行中だけ reflecting。"""
+    from _run_status_view import status_view
     from sherpa import store
     run = {"v": None}
     monkeypatch.setattr(store, "get_world_status_row", _status_row(tmp_path))
-    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: run["v"])
+    monkeypatch.setattr(store, "get_latest_run_status", lambda wid, limit=200: status_view(run["v"]))
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
     ok = {"available": True, "error": None, "chunks": 3}
 

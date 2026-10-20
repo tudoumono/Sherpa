@@ -15,6 +15,7 @@ os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 
 import pytest  # noqa: E402
 
+from _run_status_view import status_view  # noqa: E402
 from sherpa import api, store  # noqa: E402
 from sherpa.ingest import evidence_ir, ocr_router, office_md, substage, worker  # noqa: E402
 from sherpa.schemas import RunProgress  # noqa: E402
@@ -109,8 +110,8 @@ def test_status_api_running_progress_carries_step_and_counts(monkeypatch):
     written = payloads[-1]
 
     monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: [])
-    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: {
-        "status": "extracting", "extraction_snapshot": {}, "progress": written})
+    monkeypatch.setattr(store, "get_latest_run_status", lambda wid, limit=200: status_view({
+        "status": "extracting", "extraction_snapshot": {}, "progress": written}))
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: None)
     summary = api._ingest_summary("w", {"last_scan_report": None, "last_scan_report_at": None})

@@ -97,6 +97,7 @@ get_feedback_by_message_ids
 get_feedback_by_message_ids_for_user
 get_latest_es_run_summary
 get_latest_published_run_summary
+get_latest_run_status
 get_latest_run_summary
 get_messages_by_ids
 get_recent_es_attempts
@@ -177,6 +178,7 @@ set_system_settings
 set_world_sig
 start_ingest_run
 suggest_users
+summarize_failed_docs
 touch_api_key
 update_announcement
 update_ingest_run_progress

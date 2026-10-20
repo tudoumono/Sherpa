@@ -26,7 +26,7 @@ from xml.etree import ElementTree as ET
 
 from .. import json_io
 from ..env_int import env_int
-from . import background, encryption, substage
+from . import background, encryption, mem_guard, substage
 from . import text_kind
 
 # MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
@@ -1760,9 +1760,32 @@ def _conv_cache_lookup(cache_root: Path, rel: str, want_key: str) -> tuple[dict,
     if any(rep_delta.get(k) for k in _CONV_CACHE_FAILED_DELTA_KEYS):
         return None
     cached_meta = json_io.read_json(content_dir / "md" / (rel + ".md.meta.json"), default=None)
-    if failure_notice_reason(cached_meta) is not None and not rep_delta.get("password_protected"):
+    legacy_failure = rep_delta.get("legacy_failure")
+    if legacy_failure is not None and not _legacy_failure_still_valid(legacy_failure):
+        return None
+    if (failure_notice_reason(cached_meta) is not None
+            and not rep_delta.get("password_protected") and legacy_failure is None):
         return None
     return rep_delta, content_dir
+
+
+# 旧形式の変換の失敗は、同じ原本でこの回数続けて失敗したときだけ、原本が変わるまでやり直さない（一時的な失敗は次の更新で再試行する）。
+_LEGACY_FAILED_SKIP_AFTER = 2
+
+
+def _legacy_failure_still_valid(info) -> bool:
+    """前回の旧形式の変換の「時間切れ」「メモリの上限超え」「変換の失敗」の記録を、今も使い回してよいか。時間切れの設定・メモリの上限を前回より広げていれば、もう一度試す。"""
+    from .arms import legacy_convert
+    if isinstance(info, dict) and info.get("reason") == "legacy_conversion_failed":
+        return isinstance(info.get("limit"), int) and info["limit"] >= _LEGACY_FAILED_SKIP_AFTER
+    if not isinstance(info, dict) or not isinstance(info.get("limit"), (int, float)):
+        return False
+    if info.get("reason") == "legacy_conversion_timeout":
+        return legacy_convert._timeout_sec() <= info["limit"]
+    if info.get("reason") == "memory_exceeded":
+        current = mem_guard.soffice_limit_bytes()
+        return current is not None and current <= info["limit"]
+    return False
 
 
 def _link_or_copy(src, dst) -> None:
@@ -1896,8 +1919,12 @@ def _log_expected_failure(code: str, rel: str, detail: dict | None = None) -> No
                      cap // mib if isinstance(cap, int) else "-", measured // mib if isinstance(measured, int) else "-", rel)
     elif code == "legacy_conversion_timeout":
         _log.warning("旧形式の変換が時間切れになりました（資料名だけが検索に出ます）: %s", rel)
+    elif code == "memory_exceeded":
+        _log.warning("旧形式の変換がメモリの上限を超えました（資料名だけが検索に出ます・原本が変わるまでやり直しません）: %s", rel)
     elif code == "legacy_conversion_failed":
         _log.warning("旧形式の変換に失敗しました（資料名だけが検索に出ます）: %s", rel)
+    elif code == "conversion_failed":
+        _log.warning("変換できませんでした（中身が空か、読み取れる内容がありません）: %s", rel)
     elif code == "malformed_structure":
         _log.warning("ファイルの中身が壊れていて読み取れません（資料名だけが検索に出ます）: %s", rel)
     else:
@@ -2441,6 +2468,49 @@ def _build_derived_staging_body(
         rep_delta["password_protected"] = True
         _conv_cache_store(conv_cache_root, rel, key, rep_delta, dr, dr_rag, dr_ir)
 
+    def _previous_legacy_failed_count(rel: str, key: str) -> int:
+        """同じ原本（同じ鍵）で、前回までに続けて記録した変換の失敗の回数。"""
+        meta = json_io.read_json(_conv_cache_slot(conv_cache_root, rel)[0], default=None)
+        if not isinstance(meta, dict) or meta.get("key") != key:
+            return 0
+        info = (meta.get("rep_delta") or {}).get("legacy_failure")
+        if not isinstance(info, dict) or info.get("reason") != "legacy_conversion_failed":
+            return 0
+        return info["limit"] if isinstance(info.get("limit"), int) else 0
+
+    def _store_legacy_failure_notice(rp: Path, rel: str, rep_before: dict, reason: str) -> None:
+        """旧形式の変換の時間切れ・メモリの上限超え・失敗の結果（知らせ一式と、そのときの上限）を、原本が変わるまで使い回せるよう変換結果キャッシュへ保存する。"""
+        key = _conv_cache_source_key(rp, conv_cache_pipeline_sig)
+        if key is None:
+            return
+        rep_delta = _conv_cache_rep_delta(rep_before)
+        if any(rep_delta.get(k) for k in _CONV_CACHE_FAILED_DELTA_KEYS):
+            return
+        if reason == "legacy_conversion_failed":
+            limit = 1 + _previous_legacy_failed_count(rel, key)
+        else:
+            limit = legacy_convert._timeout_sec() if reason == "legacy_conversion_timeout" else mem_guard.soffice_limit_bytes()
+            if limit is None:
+                return
+        rep_delta["human_md_sig"] = None
+        rep_delta["legacy_failure"] = {"reason": reason, "limit": limit}
+        _conv_cache_store(conv_cache_root, rel, key, rep_delta, dr, dr_rag, dr_ir)
+
+    def _restore_legacy_failure_notice(rel: str, hit: tuple) -> bool:
+        """前回「時間切れ」「メモリの上限超え」「変換の失敗」と確かめた原本（大きさ・更新時刻が同じ）なら、作り済みの知らせを戻して True。変換はやり直さない。"""
+        nonlocal failed, published_notice_count
+        rep_delta, content_dir = hit
+        if not _conv_cache_restore(content_dir, rel, dr, dr_rag, dr_ir):
+            return False
+        _conv_cache_apply_rep_delta(rep_delta)
+        published_notice_count += 1
+        failed += 1
+        reason = rep_delta["legacy_failure"]["reason"]
+        legacy_conversion_failures.append({"doc": rel, "reason": reason})
+        _log.info("旧形式の変換は前回%sため、原本が変わるまでやり直しません（資料名だけが検索に出ます）: %s",
+                  {"memory_exceeded": "メモリの上限を超えた", "legacy_conversion_failed": "変換に失敗した"}.get(reason, "時間切れになった"), rel)
+        return True
+
     _also = _archive_also_root(world)   # アーカイブ取り込み: この関数内の全 safe_files 呼び出しで共有
 
     if only is not None:
@@ -2569,6 +2639,11 @@ def _build_derived_staging_body(
             # アーム実行・Evidence 生成・LLM/VLM 呼び出しを丸ごとスキップし、キャッシュ済み派生一式をステージングへコピーする。
             # ミスは下の通常経路へ流れる。
             conv_cache_key, hit = _conv_cache_hit(rp, rel)
+            if hit is not None and hit[0].get("legacy_failure"):
+                if _restore_legacy_failure_notice(rel, hit):
+                    _done_label = "完了（キャッシュ復元）"
+                    continue
+                hit = None
             if conv_cache_key is not None:
                 if hit is not None:
                     rep_delta, content_dir = hit
@@ -2615,9 +2690,11 @@ def _build_derived_staging_body(
                     backend_ready = ext in legacy_convert.legacy_exts()
                     if backend_ready:
                         detail = legacy_convert.take_conversion_failure_reason()
-                        status, reason = "failed", (
-                            "legacy_conversion_timeout" if detail == "timeout" else "legacy_conversion_failed")
+                        status, reason = "failed", {
+                            "timeout": "legacy_conversion_timeout", "memory": "memory_exceeded",
+                        }.get(detail, "legacy_conversion_failed")
                         _log_expected_failure(reason, rel)
+                        legacy_rep_before = _conv_cache_rep_snapshot()
                     else:
                         status, reason = "unsupported", "legacy_backend_unavailable"
                     failed_evidence = legacy_provenance.build_unavailable_evidence(
@@ -2638,6 +2715,8 @@ def _build_derived_staging_body(
                     if backend_ready:
                         failed += 1
                         legacy_conversion_failures.append({"doc": rel, "reason": reason})
+                        if notice_md is not None and reason in ("legacy_conversion_timeout", "memory_exceeded", "legacy_conversion_failed"):
+                            _store_legacy_failure_notice(rp, rel, legacy_rep_before, reason)
                     else:
                         unsupported += 1
                     continue
@@ -2755,6 +2834,8 @@ def _build_derived_staging_body(
                     "doc": rel,
                     "reason": "password_protected" if (ext == ".pdf" and _pdf_is_encrypted(rp)) else "conversion_failed",
                 }
+                _log_expected_failure(failure["reason"], rel)
+                _done_label = "失敗"
                 from .. import corpus_docs   # 遅延 import（循環回避）
                 pages = corpus_docs._pdf_pages_summary(result.notes) if result is not None else None
                 if pages:                                    # 画像で読んだ PDF が全ページ空・失敗だったときの読めなかったページ数

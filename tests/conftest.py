@@ -447,3 +447,11 @@ def _ledger_style_default_for_tests(monkeypatch):
     製品の既定（C-check）は tests/unit/test_ledger_style_default.py が確かめる。"""
     monkeypatch.setenv("SHERPA_LEDGER_STYLE", "json")
 
+
+
+@pytest.fixture(autouse=True)
+def _run_state_cache_off_for_tests(monkeypatch):
+    """状態の API の覚え（`routers.worlds._run_state_cached`）は、同じテストの中で stub や DB の状態を変えて続けて呼ぶ前提を崩すため、既定では覚えない。覚えを確かめるテストが秒数を明示で戻す。"""
+    from sherpa.routers import worlds as worlds_routes
+    monkeypatch.setattr(worlds_routes, "_RUN_STATE_TTL_SEC", 0.0)
+    worlds_routes._run_state_cache.clear()

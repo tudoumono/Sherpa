@@ -106,7 +106,7 @@ COMPOSE := docker compose $(COMPOSE_ENV_FLAG)
 COMPOSE_ALL := $(COMPOSE) --profile ocr
 
 up:                ## ストア起動（Postgres/Neo4j/ES）＋ OCR ワーカー（前提が揃っていれば）
-	$(COMPOSE) up -d
+	@bash -c '. scripts/run-common.sh && sherpa_compose up -d'
 	@./scripts/ocr-up.sh
 
 ocr-models:        ## OCR のモデルを取得（約134MB・閉域へはこのフォルダを丸ごとコピー）

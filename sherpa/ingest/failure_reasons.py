@@ -11,12 +11,17 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
     "legacy_conversion_timeout": {
         "label": "タイムアウト",
         "advice": "変換に時間がかかりすぎました。ファイルを分割するか、"
-                  "管理者が SHERPA_LEGACY_TIMEOUT を延ばすと通ることがあります。",
+                  "管理者が SHERPA_LEGACY_TIMEOUT を延ばすと通ることがあります（原本が変わるか時間切れの設定を延ばすまで、自動ではやり直しません）。",
+    },
+    "memory_exceeded": {
+        "label": "メモリの上限を超えた",
+        "advice": "変換に使えるメモリの上限を超えたため、この資料だけ変換を止めました（資料名だけが検索に出ます）。"
+                  "ファイルを分割するか、新しい形式で保存し直してください。2 回続けて失敗すると、原本が変わるまで自動ではやり直しません。",
     },
     "legacy_conversion_failed": {
         "label": "旧形式の変換に失敗",
         "advice": "旧形式（.doc/.xls/.ppt）から新しい形式への変換に失敗しました。"
-                  "ファイルが壊れていないか確認するか、新しい形式で保存し直してください。",
+                  "ファイルが壊れていないか確認するか、新しい形式で保存し直してください。2 回続けて失敗すると、原本が変わるまで自動ではやり直しません。",
     },
     "password_protected": {
         "label": "パスワード保護／暗号化",
@@ -104,7 +109,7 @@ _DOCUMENT_IR_KNOWN_DETAILS = frozenset({"malformed_structure", "password_protect
 
 # そのまま理由コードとして通す reason
 _PASSTHROUGH = frozenset({
-    "legacy_conversion_timeout", "legacy_conversion_failed", "size_exceeded",
+    "legacy_conversion_timeout", "legacy_conversion_failed", "memory_exceeded", "size_exceeded",
     "cell_count_exceeded", "uncompressed_size_exceeded", "source_parse_failed", "reconvert_reflect_failed",
     "ocr_unavailable", "ocr_failed", "password_protected",
 })

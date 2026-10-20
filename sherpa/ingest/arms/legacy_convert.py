@@ -29,7 +29,7 @@ import uuid
 from pathlib import Path
 
 from sherpa import json_io
-from sherpa.ingest import child_registry
+from sherpa.ingest import child_registry, mem_guard
 
 # 専用ログ（sherpa.convert.libreoffice）へルーティングする（`sherpa/log_setup.py` の登録表参照）。office_com（http/direct）のログも同じ系統に乗る。
 _log = logging.getLogger("sherpa.convert.libreoffice")
@@ -74,10 +74,21 @@ def _note_conversion_failure_reason(reason: str) -> None:
 def take_conversion_failure_reason() -> str | None:
     """直前の `ensure_ooxml()` 呼び出し（同一スレッド）が失敗した詳しい理由（読んだら消費・無ければ None）。
 
-    現状セットされ得るのは `"timeout"`（libreoffice subprocess・office_com の HTTP/direct の各タイムアウト経路）。`office_md` が失敗直後に読み、`legacy_conversion_timeout` の理由コードを rel 単位の失敗一覧へ残す。バックエンド未設定/未到達は `legacy_exts()` で判別できるのでこの経由は使わない。
+    セットされ得るのは `"timeout"`（libreoffice subprocess・office_com の HTTP/direct の各タイムアウト経路）と `"memory"`（libreoffice がメモリの上限を超えて落ちた）。`office_md` が失敗直後に読み、`legacy_conversion_timeout`／`memory_exceeded` の理由コードを rel 単位の失敗一覧へ残す。バックエンド未設定/未到達は `legacy_exts()` で判別できるのでこの経由は使わない。
     """
     reason = getattr(_conversion_failure_ctx, "reason", None)
     _conversion_failure_ctx.reason = None
+    return reason
+
+
+# 先変換のスレッドが、バッチの失敗の理由（"timeout"／"memory"／"error"）を読むための片方向シグナル。`_run_soffice` が実行のたびに書き直す。
+_soffice_failure_ctx = threading.local()
+
+
+def take_soffice_failure() -> str | None:
+    """直前の `_run_soffice()`（同一スレッド）の失敗の理由（読んだら消費・成功なら None）。"""
+    reason = getattr(_soffice_failure_ctx, "reason", None)
+    _soffice_failure_ctx.reason = None
     return reason
 
 
@@ -1211,8 +1222,9 @@ def _convert_libreoffice(src: Path, target_ext: str) -> bytes | None:
                 kept = _convert_xls_keep_values(bin_path, src, profile, outdir)
             if kept:
                 return (Path(outdir) / "out.xlsx").read_bytes()
-            if take_conversion_failure_reason() == "timeout":
-                _note_conversion_failure_reason("timeout")
+            failure = take_conversion_failure_reason()
+            if failure in ("timeout", "memory"):
+                _note_conversion_failure_reason(failure)
                 return None
             _log.warning("保存値を残す変換に失敗したため通常の変換へ切り替えます（数式の値は再計算される）: %s", src)
         cmd = _build_convert_cmd(bin_path, fmt, outdir, profile, src)
@@ -1262,6 +1274,10 @@ class SofficeTracker:
         self._procs: set[subprocess.Popen] = set()
         self._closed = False
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     def add(self, proc: subprocess.Popen) -> bool:
         with self._lock:
             if self._closed:
@@ -1289,25 +1305,30 @@ def _run_soffice(cmd: list[str], src, *, timeout: float | None = None, quiet: bo
     """soffice を実行し成功/失敗を返す。タイムアウト/非0終了/起動失敗はすべて False。
 
     `subprocess.run(timeout=)` は直接の子しか kill せず、soffice は wrapper→`soffice.bin` の多段起動のため孫が残る。`start_new_session=True`（独立プロセスグループ）＋タイムアウト時 `os.killpg(...,SIGKILL)` でグループ全体を停止する。
-    `quiet`（先変換）は失敗を警告にも失敗理由（`take_conversion_failure_reason`）にも残さない＝本体ループの 1 件変換が同じ失敗を改めて報告する。`timeout` 省略は 1 件分（`_timeout_sec()`）。
+    Linux では子に 1 本あたりのメモリの上限を付ける（`mem_guard.soffice_preexec`）。上限を超えて落ちたら理由を `"memory"` にする。
+    `quiet`（先変換）は失敗を警告にも失敗理由（`take_conversion_failure_reason`）にも残さない＝本体ループの 1 件変換が同じ失敗を改めて報告する（先変換の失敗の理由は `take_soffice_failure` で読む）。`timeout` 省略は 1 件分（`_timeout_sec()`）。
     """
     limit = _timeout_sec() if timeout is None else timeout
     note = _log.debug if quiet else _log.warning
+    _soffice_failure_ctx.reason = None
+    preexec = mem_guard.soffice_preexec()
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                start_new_session=True)
+                                start_new_session=True, preexec_fn=preexec)
     except OSError as e:
         note("legacy 変換を実行できませんでした（%s）: %s", e.__class__.__name__, src)
+        _soffice_failure_ctx.reason = "error"
         return False
     if tracker is not None and not tracker.add(proc):
         _kill_process_group(proc)
         return False
     child_registry.register(proc.pid, mode="group")
     try:
-        proc.communicate(timeout=limit)
+        _out, err = proc.communicate(timeout=limit)
     except subprocess.TimeoutExpired:
         note("legacy 変換がタイムアウトしました（%ss）: %s", limit, src)
         _kill_process_group(proc)
+        _soffice_failure_ctx.reason = "timeout"
         if not quiet:
             _note_conversion_failure_reason("timeout")
         return False
@@ -1316,7 +1337,16 @@ def _run_soffice(cmd: list[str], src, *, timeout: float | None = None, quiet: bo
         if tracker is not None:
             tracker.discard(proc)
     if proc.returncode != 0:
+        if tracker is not None and tracker.closed:
+            return False                                  # 先変換の後始末で止めたもの（失敗として数えない）
+        if preexec is not None and mem_guard.looks_memory_exceeded(proc.returncode, err):
+            _log.debug("legacy 変換がメモリの上限を超えて落ちました（rc=%s）: %s", proc.returncode, src)
+            _soffice_failure_ctx.reason = "memory"
+            if not quiet:
+                _note_conversion_failure_reason("memory")
+            return False
         note("legacy 変換が異常終了しました（rc=%s）: %s", proc.returncode, src)
+        _soffice_failure_ctx.reason = "error"
         return False
     return True
 

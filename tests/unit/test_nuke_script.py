@@ -17,8 +17,8 @@ TOKEN = "I-UNDERSTAND-ALL-DATA-WILL-BE-DELETED"
 @pytest.fixture()
 def sandbox(tmp_path):
     app = tmp_path / "app"
-    (app / "scripts").mkdir(parents=True)
-    for name in ("nuke.sh", "run-common.sh"):
+    (app / "scripts" / "lib").mkdir(parents=True)
+    for name in ("nuke.sh", "run-common.sh", "lib/mem_budget.sh"):
         shutil.copy(ROOT / "scripts" / name, app / "scripts" / name)
     (app / "scripts" / "stop.sh").write_text("#!/bin/sh\nexit 0\n")
     (app / "scripts" / "stop.sh").chmod(0o755)

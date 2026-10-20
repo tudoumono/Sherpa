@@ -16,6 +16,7 @@ import contextlib
 
 import pytest
 
+from _run_status_view import status_view
 from sherpa import corpus_docs, es_index, reconcile, store
 from sherpa.ingest import resolve_settings, world_neo4j, worker
 from sherpa.routers import worlds as worlds_router
@@ -338,7 +339,7 @@ def _stub_ingest_summary_deps(monkeypatch):
     monkeypatch.setattr(es_index, "count", _must_not_call("es_index.count"))
     monkeypatch.setattr(store, "get_world", _must_not_call("store.get_world"))   # row は引数で渡す・再取得しない
     monkeypatch.setattr(corpus_docs, "scan_report", _must_not_walk)
-    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: None)
+    monkeypatch.setattr(store, "get_latest_run_status", lambda wid, limit=200: None)
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: [])
@@ -371,9 +372,8 @@ def test_ingest_summary_unreachable_as_text_survives_unchanged_sync(monkeypatch)
              "sensitive_excluded": 1, "unreachable_as_text": 2, "unreachable_as_text_by_ext": {".bin": 1}}
     row = {"last_scan_report": cached, "last_scan_report_at": "2026-09-01T03:12:00+00:00"}
     # unchanged 経路の実際の snap 形（`_finalize_if_unused` docstring 参照）＝`counts` キー自体が無い。
-    monkeypatch.setattr(store, "get_latest_run_summary",
-                        lambda wid: {"status": "unchanged", "extraction_snapshot": {"changed": False},
-                                    "created_at": None})
+    monkeypatch.setattr(store, "get_latest_run_status",
+                        lambda wid, limit=200: status_view({"status": "unchanged", "extraction_snapshot": {"changed": False}}))
     s = worlds_router._ingest_summary("w", row)
     assert s["unreachable_as_text"] == 2
     assert s["sensitive_excluded"] == 1
@@ -425,9 +425,9 @@ def test_ingest_summary_es_chunks_survive_a_newer_pg_replace_failed_run(monkeypa
 def test_ingest_summary_db_failure_propagates_not_zeroes(monkeypatch):
     """最新 run の狭い SELECT が失敗したら、summary を全ゼロへ縮退させず例外を伝播する
     （明示エラー）。"""
-    def _boom(wid):
+    def _boom(wid, limit=200):
         raise RuntimeError("db down")
-    monkeypatch.setattr(store, "get_latest_run_summary", _boom)
+    monkeypatch.setattr(store, "get_latest_run_status", _boom)
     row = {"last_scan_report": None, "last_scan_report_at": None}
     with pytest.raises(RuntimeError, match="db down"):
         worlds_router._ingest_summary("w", row)

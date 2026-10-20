@@ -10,6 +10,7 @@ import logging
 import multiprocessing
 import os
 import shutil
+import sys
 from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..env_int import env_int
-from . import child_registry
+from . import child_registry, mem_guard
 
 _log = logging.getLogger("sherpa.ingest.convert")   # 変換ログ（make logs convert）と同じ名前
 
@@ -107,7 +108,8 @@ def _max_rss_kb() -> int:
     """この子プロセスの最大 RSS（KB）。取れなければ 0。"""
     try:
         import resource
-        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return rss // 1024 if sys.platform == "darwin" else rss   # macOS はバイト・Linux は KB
     except Exception:
         return 0
 
@@ -174,6 +176,7 @@ class Prefetcher:
     先に出した大きいものを除く提出済みで未取得（計算中＋完了待ち）は ワーカー数×2 件まで（未取得の合計は ワーカー数×3 件まで）。
     `take` した rel が未提出なら窓に関係なく先に提出する（超過は 1 件まで）。
     子の例外・プロセス死・想定外の形は `take` が None を返す＝呼び出し側が直列経路で計算し直す。
+    子に渡す前に空きメモリを確かめる。下限を下回る間は最初の提出で短く待ち、最大まで待っても空かなければ同時に走らせる子を 1 つ減らして進める。`take` の途中では待たず、その回は提出しない（親が待たされない）。
     """
 
     def __init__(self, jobs: list[Job], workers: int):
@@ -186,6 +189,8 @@ class Prefetcher:
         self._known = {j.rel for j in jobs}
         self._window = workers * _WINDOW_PER_WORKER
         self._planned = len(jobs)
+        self._workers = workers
+        self._parallel = workers                           # 同時に走らせてよい子の数（空きメモリが戻らないと減らす）
         self.used = 0
         self.rendered = 0
         self.max_rss_kb = 0                                # 子の最大メモリ（全子の最大値）
@@ -195,7 +200,7 @@ class Prefetcher:
         self._pool: ProcessPoolExecutor | None = ProcessPoolExecutor(
             max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
             initializer=child_registry.guard_parent, initargs=(os.getpid(),))
-        self._pump()
+        self._pump(wait=True)
 
     def __enter__(self) -> "Prefetcher":
         return self
@@ -214,10 +219,28 @@ class Prefetcher:
         self._inflight[job.rel] = (job, fut)
         return True
 
-    def _pump(self) -> None:
+    def _memory_ready(self, wait: bool) -> bool:
+        """子に渡してよいか。空きが下限未満なら、`wait` のとき待つ（最大まで待っても空かなければ並列を 1 つ減らして True）、待たないときは False。並列 1 では待たない。"""
+        if self._parallel <= 1 or mem_guard.memory_ok():
+            return True
+        if not wait:
+            return False
+        if not mem_guard.wait_for_free_memory("MD化の先読み"):
+            self._parallel -= 1
+            _log.warning("メモリの空きが戻らないため、MD化の先読みの並列を %d に減らして進めます", self._parallel)
+        return True
+
+    def _running(self) -> int:
+        return sum(1 for _job, f in self._inflight.values() if not f.done())
+
+    def _pump(self, wait: bool = False) -> None:
         while self._pool is not None and self._queue:
             job = self._queue[0]
             if job.rel not in self._early and self._windowed_inflight() >= self._window:
+                return
+            if self._parallel < self._workers and self._running() >= self._parallel:
+                return
+            if not self._memory_ready(wait):
                 return
             self._queue.popleft()
             if not self._submit(job):

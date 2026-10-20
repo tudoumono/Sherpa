@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 import stat
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -103,8 +105,10 @@ def _dispatch(wid: str, op: str, fingerprint: str, payload: dict | None = None, 
     同じ資料フォルダに queued／extracting の run があり `op`/`fingerprint` が不一致なら 409、終了処理中（`background.stop_accepting()` 済み）は 503。
     """
     try:
-        return background.submit(wid, op, fingerprint, payload, extra_keys=extra_registry_keys,
-                                 created_by=created_by, progress=initial_progress or _initial_progress())
+        accepted = background.submit(wid, op, fingerprint, payload, extra_keys=extra_registry_keys,
+                                     created_by=created_by, progress=initial_progress or _initial_progress())
+        _run_state_forget(wid)
+        return accepted
     except background.ConflictError as exc:
         raise HTTPException(409, "別の処理が実行中です。しばらくしてからもう一度お試しください") from exc
     except background.ShuttingDownError as exc:
@@ -231,9 +235,9 @@ def worlds_list(request: Request):
 _ES_NOT_COARSE_REASONS = ("empty_text", "text_read_failed")
 
 
-def _ingest_notices(rep: dict, flags_all: list, es_stage) -> list[dict]:
+def _ingest_notices(rep: dict, flag_counts: dict, es_stage) -> list[dict]:
     """取り込みで黙って落とした・粗くしたものを `[{code, count}]` にまとめる（件数のみ・名前は出さない）。
-    走査（`rep["walk_skipped"]`）・関係グラフ（action の無い `dropped_syntax`/`unreadable_mention_doc` flag を打切り前の全件から）・全文索引（`es_stage`）の順。
+    走査（`rep["walk_skipped"]`）・関係グラフ（action の無い `dropped_syntax`/`unreadable_mention_doc` flag を打切り前の全件から数えた `flag_counts`）・全文索引（`es_stage`）の順。
     """
     out: list[dict] = []
 
@@ -244,15 +248,11 @@ def _ingest_notices(rep: dict, flags_all: list, es_stage) -> list[dict]:
     walk = rep.get("walk_skipped")
     for key in ("symlink", "unreadable_dir", "unreadable_file", "outside_root"):
         _add("walk_" + key, walk.get(key) if isinstance(walk, dict) else None)
-    dict_flags = [f for f in flags_all if isinstance(f, dict)]
-    dropped = world_graph.unparsed_sources_from_flags(dict_flags)   # 関係グラフの coverage と同じ判定
-    mention_unreadable = sum(1 for f in dict_flags if f.get("reason") == "unreadable_mention_doc")
-    _add("graph_source_unparsed", dropped["syntax"])
-    _add("graph_source_oversize", dropped["size_exceeded"])
-    _add("graph_mention_doc_unreadable", mention_unreadable)
+    _add("graph_source_unparsed", flag_counts["unparsed_syntax"])
+    _add("graph_source_oversize", flag_counts["unparsed_oversize"])
+    _add("graph_mention_doc_unreadable", flag_counts["mention_unreadable"])
     # MD 化で作れなかった文書が候補の一定割合を超えた（公開と全文検索・埋め込みは進めている。各文書は失敗の一覧に載る）
-    _add("md_docs_failed_many", sum(f.get("count") or 0 for f in dict_flags
-                                    if f.get("many") is True and str(f.get("reason", "")).startswith("office_md:derived_partial")))
+    _add("md_docs_failed_many", flag_counts["md_failed_many"])
     if isinstance(es_stage, dict):
         by_reason = es_stage.get("rag_degraded_by_reason")
         by_reason = by_reason if isinstance(by_reason, dict) else {}
@@ -267,13 +267,14 @@ def _ingest_notices(rep: dict, flags_all: list, es_stage) -> list[dict]:
     return out
 
 
-def _ingest_summary(wid: str, row: dict) -> dict:
+def _ingest_summary(wid: str, row: dict, state: dict | None = None) -> dict:
     """取り込み状況の要約: インデックス件数・未対応(Office/PDF)件数・関係グラフ・ES 全文索引のチャンク数。
     `row`＝呼び出し元が取得済みの world 登録行（`store.get_world(wid)`・ここでは読み直さない）。
-    最終 ingest run の status と warn/blocked 理由も含める。`last_run_warnings` は reason 文字列のみの一覧で、対象ファイルが特定できる blocked flag は `last_run_blocked`（`doc`/`reason`）で別途通す。どちらも `extraction_snapshot.flags` を `_STATUS_FLAGS_LIMIT` 件で打ち切ってから導出し、`last_run_flags_total`/`last_run_flags_truncated` で打切りの有無を示す。
-    `scanned`〜`unreadable` は `row["last_scan_report"]` を読むだけでフォルダを歩かない。graph/ES 件数も `graph_view()` や ES live `_count` は呼ばず、graph は最新の反映済み run（`store.get_latest_published_run_summary`）の `published_snapshot`、ES は別クエリ（`store.get_latest_es_run_summary`）の `extraction_snapshot.es` から読む（完了境界が異なり別々の run を指しうる）。`store.get_latest_run_summary` は `source_doc_ids` を含まない狭い SELECT（`last_run_status`/`last_run_warnings`/`failed_files`/`stage_summary` の由来）。DB 例外は捕捉せず呼び出し元へ伝播させる（全ゼロへ縮退しない）。キャッシュが無い world は全ゼロ＋`counts_as_of=None`（未集計・利用者が「再集計」を押すまで待つ）。
+    最終 ingest run の status と warn/blocked 理由も含める。`last_run_warnings` は reason 文字列のみの一覧で、対象ファイルが特定できる blocked flag は `last_run_blocked`（`doc`/`reason`）で別途通す。どちらも `extraction_snapshot.flags` の先頭 `_STATUS_FLAGS_LIMIT` 件から導出し、`last_run_flags_total`/`last_run_flags_truncated` で打切りの有無を示す。
+    `scanned`〜`unreadable` は `row["last_scan_report"]` を読むだけでフォルダを歩かない。graph/ES 件数も `graph_view()` や ES live `_count` は呼ばず、graph は最新の反映済み run（`store.get_latest_published_run_summary`）の `published_snapshot`、ES は別クエリ（`store.get_latest_es_run_summary`）の `extraction_snapshot.es` から読む（完了境界が異なり別々の run を指しうる）。run の記録は `_run_state` が必要な値だけを DB 側で取り出す（`flags` 全件・`published_snapshot` を丸ごと読まない）。DB 例外は捕捉せず呼び出し元へ伝播させる（全ゼロへ縮退しない）。キャッシュが無い world は全ゼロ＋`counts_as_of=None`（未集計・利用者が「再集計」を押すまで待つ）。
     `failed_files` は失敗の一覧（`world_failed_docs`）由来、`partial_extraction_suspected`/`stage_summary`（`stage_timings`/`counts` を含む）は最新 run の `extraction_snapshot` 由来（無ければ None）。`failure_reason_catalog`/`partial_extraction_advice` は静的な辞書（`sherpa.ingest.failure_reasons` が真実源）。
     `last_run_id` は背景実行の受付応答の `run_id` と対応付ける。`running_progress` は実行中（`status` が `queued`／`extracting` かつ `progress` がある）時だけ `{stage, stage_label, done, total, updated_at}`（資料画面はこの間だけ数秒間隔でポーリングする）。段の中の小さな段が動いている間は `step`・`step_label`・`step_done`・`step_total`・`step_started_at` も付く。
+    `state`＝`_run_state_cached(wid)` の結果（省略時は毎回 `_run_state(wid)` を引く）。
     """
     rep = row.get("last_scan_report")
     counts_as_of = row.get("last_scan_report_at")
@@ -284,21 +285,42 @@ def _ingest_summary(wid: str, row: dict) -> dict:
         # `scan_report()` に項目が追加される前に保存された旧形式の集計は新しいキーを持たず、response_model の必須項目が欠けると 500 になる。欠けたキーだけ `empty_scan_report()` の既定値（0/空）で補い、`counts_as_of` は `None`（未集計）にする（補った 0 を古い時刻と一緒に返して実測 0 件に見せない）。
         rep = {**corpus_docs.empty_scan_report(), **rep}
         counts_as_of = None
-    last = store.get_latest_run_summary(wid)
+    st = state if state is not None else _run_state(wid)
+    return {**rep, "counts_as_of": str(counts_as_of) if counts_as_of else None,
+            "graph_nodes": st["graph_nodes"], "graph_edges": st["graph_edges"], "es_chunks": st["es_chunks"],
+            "es_state": st["es_state"], "es_error": st["es_error"], "es_index_kept": st["es_index_kept"],
+            "ingest_notices": _ingest_notices(rep, st["flag_counts"], st["es_notice_stage"]),
+            "last_run_id": st["last_run_id"],
+            "last_run_status": st["last_run_status"], "last_run_warnings": st["last_run_warnings"],
+            "last_run_interrupted": st["last_run_interrupted"],
+            "last_run_blocked": st["last_run_blocked"],
+            "last_run_flags_total": st["last_run_flags_total"],
+            "last_run_flags_truncated": st["last_run_flags_truncated"],
+            "failed_files": st["failed_files"],
+            "partial_extraction_suspected": st["partial_extraction_suspected"],
+            "stage_summary": st["stage_summary"],
+            "running_progress": st["running_progress"],
+            "failure_reason_catalog": failure_reasons.REASON_CATALOG,
+            "partial_extraction_advice": failure_reasons.PARTIAL_EXTRACTION_ADVICE}
+
+
+def _run_state(wid: str) -> dict:
+    """最新 run・反映済み run・ES の記録・失敗の一覧から、状態画面に要る値を取り出す（取り込みの記録だけに依存する部分）。
+    `flags` は DB 側で数える・先頭だけ取る（`store.get_latest_run_status`）。`extraction_snapshot` を丸ごと読まない。
+    """
+    last = store.get_latest_run_status(wid, _STATUS_FLAGS_LIMIT)
     snap = (last or {}).get("extraction_snapshot")
     snap = snap if isinstance(snap, dict) else {}  # JSONB は dict 以外もありうる（500 にしない）。
-    flags_all = snap.get("flags") or []
-    flags_total = len(flags_all)
+    flags_total = (last or {}).get("flags_total") or 0
     flags_truncated = flags_total > _STATUS_FLAGS_LIMIT
-    flags = flags_all[:_STATUS_FLAGS_LIMIT]
+    flags = (last or {}).get("flags_head") or []
+    flag_counts = (last or {}).get("flag_counts") or {
+        "always_shown": [], "unparsed_syntax": 0, "unparsed_oversize": 0, "mention_unreadable": 0, "md_failed_many": 0}
     warns = [f.get("reason") for f in flags
              if isinstance(f, dict) and f.get("action") in ("warn", "blocked") and f.get("reason")]
-    if "plugin_failed" not in warns and any(isinstance(f, dict) and f.get("reason") == "plugin_failed"
-                                            for f in flags_all):
-        warns.append("plugin_failed")   # 切り詰めの外にあっても取り込み画面の注意に必ず出す
-    for _r in ("rebind_failed_rolled_back", "rebind_rollback_failed"):
-        if _r not in warns and any(isinstance(f, dict) and f.get("reason") == _r for f in flags_all):
-            warns.append(_r)   # 参照先の変更の結果も切り詰めの外にあっても必ず出す
+    for _r in ("plugin_failed", "rebind_failed_rolled_back", "rebind_rollback_failed"):
+        if _r not in warns and _r in flag_counts["always_shown"]:
+            warns.append(_r)   # 切り詰めの外にあっても取り込み画面の注意に必ず出す（参照先の変更の結果も同じ）
     blocked = [{"doc": f.get("doc"), "reason": f.get("reason")} for f in flags
                if isinstance(f, dict) and f.get("action") == "blocked"
                and isinstance(f.get("doc"), str) and f.get("reason")]
@@ -346,10 +368,9 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     # 反映済みの run ではなく、ES へ触れた直近の成功の記録（足し直しの結果を含む）から読む。
     es_notice_stage = next((a for a in es_attempts
                             if a.get("available") is True and not a.get("error")), None)
-    return {**rep, "counts_as_of": str(counts_as_of) if counts_as_of else None,
-            "graph_nodes": graph_nodes, "graph_edges": graph_edges, "es_chunks": es_chunks,
+    return {"graph_nodes": graph_nodes, "graph_edges": graph_edges, "es_chunks": es_chunks,
             "es_state": es_state, "es_error": es_error, "es_index_kept": es_index_kept,
-            "ingest_notices": _ingest_notices(rep, flags_all, es_notice_stage),
+            "flag_counts": flag_counts, "es_notice_stage": es_notice_stage,
             "last_run_id": (last or {}).get("id"),
             "last_run_status": last_status, "last_run_warnings": warns,
             "last_run_interrupted": last_status == "failed" and snap.get("interrupted") is True,
@@ -358,9 +379,39 @@ def _ingest_summary(wid: str, row: dict) -> dict:
             "failed_files": failed_files if isinstance(failed_files, dict) else None,
             "partial_extraction_suspected": partial if isinstance(partial, dict) else None,
             "stage_summary": stage_summary,
-            "running_progress": running_progress,
-            "failure_reason_catalog": failure_reasons.REASON_CATALOG,
-            "partial_extraction_advice": failure_reasons.PARTIAL_EXTRACTION_ADVICE}
+            "running_progress": running_progress}
+
+
+# 同じ資料フォルダの `_run_state` をプロセス内で覚える秒数（複数のタブ・利用者からの定期的な問い合わせで使い回す）。
+# 取り込みの進み具合（`running_progress`）もこの秒数以内の古さで返る。この Web アプリ自身が受け付けた操作（`_dispatch`・変更操作の直後）では捨てて、すぐ新しい値を返す。
+_RUN_STATE_TTL_SEC = 5.0
+_run_state_cache: dict[str, tuple[float, dict]] = {}
+_run_state_locks: dict[str, threading.Lock] = {}
+_run_state_guard = threading.Lock()
+
+
+def _run_state_forget(wid: str) -> None:
+    with _run_state_guard:
+        _run_state_cache.pop(wid, None)
+
+
+def _run_state_cached(wid: str) -> dict:
+    """`_run_state` を `_RUN_STATE_TTL_SEC` だけ覚えて返す。同時の問い合わせは 1 本だけ DB へ行き、残りはその結果を待って使う。例外は覚えない。"""
+    with _run_state_guard:
+        hit = _run_state_cache.get(wid)
+        if hit and time.monotonic() - hit[0] < _RUN_STATE_TTL_SEC:
+            return hit[1]
+        lock = _run_state_locks.setdefault(wid, threading.Lock())
+    with lock:
+        with _run_state_guard:
+            hit = _run_state_cache.get(wid)
+            if hit and time.monotonic() - hit[0] < _RUN_STATE_TTL_SEC:
+                return hit[1]
+        started = time.monotonic()
+        state = _run_state(wid)
+        with _run_state_guard:
+            _run_state_cache[wid] = (started, state)
+        return state
 
 
 # ES 反映の失敗理由（`es_index.index_world` の error 値）→ 利用者向けの平文。未知の値は内部の
@@ -427,6 +478,7 @@ def _es_reflect_state(attempts, running_progress) -> tuple[str, str | None, bool
 
 def _ingest_summary_after_mutation(wid: str) -> dict:
     """変更操作（register/refresh/rebind/extract/concepts/recount 等）の直後に呼ぶ `_ingest_summary` ラッパー。行を取り直してから渡す。DB 例外は 503 に変換する（全ゼロへ縮退しない）。"""
+    _run_state_forget(wid)
     try:
         row = store.get_world(wid) or {}
         return _ingest_summary(wid, row)
@@ -455,7 +507,7 @@ def world_status(wid: str, request: Request):
     except OSError:
         raise HTTPException(503, "参照元フォルダにアクセスできません")
     try:
-        summary = _ingest_summary(wid, row)
+        summary = _ingest_summary(wid, row, _run_state_cached(wid))
     except Exception as e:
         raise HTTPException(503, _INGEST_UNAVAILABLE_MESSAGE) from e
     return {"ok": True, "world_id": wid, "label": row.get("label"), "root_path": row.get("root_path"),

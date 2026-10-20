@@ -386,22 +386,24 @@ def failed_files_from_table(world: str, snapshot_failed_files: dict | None = Non
 
     表が持たない PDF のページ内訳（`pdf_pages`）は、最新 run の `snapshot_failed_files` に同じ文書があれば引き継ぐ。
     """
-    rows = store.list_failed_docs(world)
-    if not rows:
+    summ = store.summarize_failed_docs(world, _FAILED_FILES_LIMIT)
+    if not summ["total"]:
         return None
     pages = {it["doc"]: it["pdf_pages"] for it in ((snapshot_failed_files or {}).get("items") or [])
              if isinstance(it, dict) and isinstance(it.get("pdf_pages"), dict)}
     items = []
-    by_reason: dict[str, int] = {}
-    for r in rows:
+    for r in summ["head"]:
         desc = failure_reasons.describe(r["reason"])
-        by_reason[desc["code"]] = by_reason.get(desc["code"], 0) + 1
         item = {"doc": r["rel"], "stage": "failed", "reason": desc["code"], "detail": desc["detail"]}
         if r["rel"] in pages:
             item["pdf_pages"] = pages[r["rel"]]
         items.append(item)
-    return {"items": items[:_FAILED_FILES_LIMIT], "total": len(items),
-            "truncated": len(items) > _FAILED_FILES_LIMIT, "by_reason": by_reason}
+    by_reason: dict[str, int] = {}
+    for raw, n in summ["by_raw_reason"].items():
+        code = failure_reasons.describe(raw)["code"]
+        by_reason[code] = by_reason.get(code, 0) + n
+    return {"items": items, "total": summ["total"],
+            "truncated": summ["total"] > _FAILED_FILES_LIMIT, "by_reason": by_reason}
 
 
 def _partial_extraction_summary(drep: dict) -> dict:
@@ -570,6 +572,8 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
             snap["es"] = es_summary
         if neo4j_summary is not None:
             snap["neo4j"] = neo4j_summary
+        if status == "failed" and not interrupted:
+            _log_run_failure(world, run_id, fl)
         # 失敗の一覧は、グラフ・ES・台帳の反映まで成功した run の確定（署名の確定と同じトランザクション）でだけ置き換える
         failed_docs = (_failed_doc_reasons(drep)
                        if confirm_sig is not None and drep is not None and "rag_failures" in drep else None)
@@ -704,6 +708,7 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
         # PG の台帳 replace が失敗すると Neo4j は新・台帳は旧のまま残る。記録は best-effort で、last_sig は pre-invalidate 済みなので次回 sync が全再構築で自己修復する。
         # office_md／neo4j は完了済みなので要約を残し、`published_snapshot` も記録する（Neo4j には既に新世代が入っているため）
         _close_stage_timing()   # pg_replace 段の時刻をここで確定する
+        _log_run_failure(world, run_id, [{"doc": None, "action": "blocked", "reason": f"pg_replace_failed:{e.__class__.__name__}"}])
         pending = {"status": "failed", "source_doc_ids": [r["name"] for r in rows],
                   "extraction_snapshot": {"docs": len(rows), "nodes": len(nodes), "edges": len(edges),
                                           "flags": list(flags), "degraded": True,
@@ -1209,6 +1214,14 @@ def index_world_with_human_md_holdback(world: str, *, content_sig=None, settings
     if failure_reason is not None:
         _record_es_index_failure(world, failure_reason, run_id=run_id)
     return esr
+
+
+def _log_run_failure(world: str, run_id, flags) -> None:
+    """失敗した run の理由（blocked と、資料単位でない warn の理由）を ERROR 1 行で残す。DB の記録を見なくても run ログで原因が分かる。"""
+    reasons = [(f"{f['doc']}: " if f.get("doc") else "") + str(f.get("reason"))
+               for f in flags if f.get("action") == "blocked" or (f.get("action") == "warn" and not f.get("doc"))]
+    shown = "・".join(reasons[:3]) + (f"（ほか {len(reasons) - 3} 件）" if len(reasons) > 3 else "")
+    _log.error("取り込みが失敗しました: world=%s run_id=%s 理由=%s", world, run_id, shown or "記録なし")
 
 
 def _record_es_index_failure(world: str, reason: str, *, run_id: int | None = None) -> None:

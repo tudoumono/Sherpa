@@ -307,6 +307,16 @@ EOF
   fi
 fi
 
+# --- メモリの割り振り（ES・Neo4j・OCR の上限を全体のメモリから決める）。結果は RUN_DIR/mem_budget.json にも書く ---
+# shellcheck source=scripts/lib/mem_budget.sh
+. "$ROOT/scripts/lib/mem_budget.sh"
+sherpa_env_default SHERPA_OCR_MEMORY_LIMIT
+mem_budget_apply
+if [ -n "${MB_TOTAL:-}" ]; then
+  mem_budget_line
+  mem_budget_write_json "$RUN_DIR/mem_budget.json" || true
+fi
+
 # --- ストア（PostgreSQL / Elasticsearch / Neo4j）起動 → healthy 3つを待つ ---
 echo "ストア（PostgreSQL / Elasticsearch / Neo4j）を起動します..."
 sherpa_compose up -d

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import pytest
 
+from _run_status_view import status_view
 from sherpa import store
 from sherpa.routers import worlds as worlds_router
 
@@ -31,10 +32,7 @@ def _row():
 
 
 def _stub_common(monkeypatch, run):
-    monkeypatch.setattr(store, "get_latest_run_summary",
-                        lambda wid: {"status": run["status"],
-                                    "extraction_snapshot": run["extraction_snapshot"],
-                                    "created_at": None} if run else None)
+    monkeypatch.setattr(store, "get_latest_run_status", lambda wid, limit=200: status_view(run))
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: None)
 

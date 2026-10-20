@@ -959,6 +959,25 @@ def test_content_sig_not_confirmed_when_a_batch_fails(monkeypatch):
     assert confirmed == []
 
 
+def test_bulk_exception_is_logged_once_with_type_and_short_message(monkeypatch, caplog):
+    _multi_chunk_world(monkeypatch, 3)
+    monkeypatch.setattr(es_index, "delete_world", lambda w: True)
+    monkeypatch.setattr(es_index, "_discard_building", lambda w: None)
+
+    def fake_req(method, path, body=None, **kw):
+        if isinstance(path, str) and "_bulk" in path:
+            raise ConnectionError("connection refused\n" + "x" * 1000)
+        return {}
+
+    monkeypatch.setattr(es_index, "_req", fake_req)
+    with caplog.at_level("WARNING", logger="sherpa"):
+        assert es_index.index_world("w").get("error") == "bulk_failed"
+    lines = [r for r in caplog.records if "ES への登録に失敗しました" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].exc_info is None
+    msg = lines[0].getMessage()
+    assert "ConnectionError" in msg and "connection refused" in msg and "\n" not in msg and len(msg) < 400
+
+
 # ---- rag_chunks / rag.md の安全な読み取りと検証 ----
 
 def test_rag_chunk_source_exts_limited_to_office_pdf():

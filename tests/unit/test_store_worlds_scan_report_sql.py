@@ -146,6 +146,7 @@ def test_get_latest_es_run_summary_select_requires_es_key_and_published(monkeypa
     conn = _Connection()
     monkeypatch.setattr(ingest_store, "_ensure", lambda: None)
     monkeypatch.setattr(ingest_store, "_connect", lambda: conn)
+    monkeypatch.setattr(conn, "execute", lambda sql, params=None: (conn.calls.append((sql, params)), _Cursor(one=None))[1])
 
     ingest_store.get_latest_es_run_summary("w1")
 

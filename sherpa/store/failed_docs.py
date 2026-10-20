@@ -57,6 +57,19 @@ def list_failed_docs(world) -> list:
             "WHERE world_id=%s ORDER BY rel", (world,)).fetchall()
 
 
+def summarize_failed_docs(world, limit: int) -> dict:
+    """失敗一覧の画面用の要約: 先頭 `limit` 行（rel 昇順）・総数・生の理由ごとの件数。全行は Python へ持ち込まない。"""
+    _ensure()
+    with _connect() as c:
+        head = c.execute(
+            "SELECT rel, reason FROM world_failed_docs WHERE world_id=%s ORDER BY rel LIMIT %s",
+            (world, limit)).fetchall()
+        by_raw = c.execute(
+            "SELECT reason, count(*) AS n FROM world_failed_docs WHERE world_id=%s GROUP BY reason",
+            (world,)).fetchall()
+    return {"head": head, "total": sum(r["n"] for r in by_raw), "by_raw_reason": {r["reason"]: r["n"] for r in by_raw}}
+
+
 def clear_failed_docs(world) -> int:
     """world の失敗一覧を全て消す（資料フォルダの削除・作り直しの前段）。"""
     _ensure()

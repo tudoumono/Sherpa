@@ -230,6 +230,20 @@ def test_unreadable_code_file_blocks_downstream_and_leaves_sig_unconfirmed(monke
     assert _stub_pipeline["set_world_sig_calls"] == [""]       # pre-invalidateのまま＝確定していない
 
 
+def test_graph_reflect_failure_reason_is_logged_as_one_error_line(monkeypatch, _stub_pipeline, caplog):
+    """Neo4j への反映が失敗したら、DB の記録だけでなくログにも理由（例外名@接続先）を ERROR 1 行で残す。"""
+    def _boom(*a, **k):
+        raise ConnectionError("down")
+    monkeypatch.setattr(world_neo4j, "load_world", _boom)
+
+    with caplog.at_level("ERROR", logger="sherpa.ingest.convert"):
+        res = worker.run("w")
+
+    assert res["status"] == "failed"
+    lines = [r.getMessage() for r in caplog.records if r.levelname == "ERROR" and "取り込みが失敗しました" in r.getMessage()]
+    assert len(lines) == 1 and "graph_reflect_failed:ConnectionError@" in lines[0] and "world=w" in lines[0]
+
+
 def test_build_derived_error_then_next_sync_retries(monkeypatch, _stub_pipeline):
     """(M) 1回目のsyncでbuild_derivedが失敗してsigが未確定のままだと、2回目のsyncは
     `prev != sig` により必ず全再構築（run）へ入り直す（既存派生A・更新原本Bのシナリオ）。"""

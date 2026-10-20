@@ -262,29 +262,82 @@ def get_latest_run_summary(world, *, connect_timeout: float | None = None,
             (_KB_ID, world)).fetchone()
 
 
-def get_latest_published_run_summary(world) -> dict | None:
-    """最新の反映済み（`published_at IS NOT NULL`）run 1件の軽量列（`published_snapshot`/`extraction_snapshot`/`created_at`）。graph（Neo4j）件数専用で、ES は `get_latest_es_run_summary` を使う。
-    直近の run が失敗していても Neo4j は直前の成功時点のままなので、これが現在の Neo4j の内容に最も近い。ES 段に触れていない run も拾いうるため ES 件数には流用しない。
+_FLAG_REASONS_ALWAYS_SHOWN = ("plugin_failed", "rebind_failed_rolled_back", "rebind_rollback_failed")
+
+
+def get_latest_run_status(world, flags_limit: int) -> dict | None:
+    """最新 run（成否問わず）1件を、状態画面に要る値だけに絞って引く。`extraction_snapshot.flags`（文書ごとの注意で数万件になりうる）は Python へ持ち込まず、
+    DB 側で数える・先頭だけ取る。返す値: `id`/`status`/`progress`、`extraction_snapshot`（`flags` を除いた残り）、`flags_total`、`flags_head`（先頭 `flags_limit` 件）、
+    `flag_counts`（`always_shown`＝先頭の外でも画面に出す reason、`unparsed_syntax`/`unparsed_oversize`/`mention_unreadable`/`md_failed_many`＝全件からの集計）。
     """
     _ensure()
     with _connect() as c:
-        return c.execute(
-            "SELECT published_snapshot, extraction_snapshot, created_at FROM ingest_runs "
+        row = c.execute(
+            "WITH r AS (SELECT id, status, progress, extraction_snapshot AS es FROM ingest_runs "
+            "           WHERE kb_id=%s AND version=%s ORDER BY id DESC LIMIT 1), "
+            "fl AS (SELECT f, o FROM r, jsonb_array_elements(CASE WHEN jsonb_typeof(r.es->'flags')='array' "
+            "                 THEN r.es->'flags' ELSE '[]'::jsonb END) WITH ORDINALITY AS t(f, o)) "
+            "SELECT r.id, r.status, r.progress, "
+            "  CASE WHEN jsonb_typeof(r.es)='object' THEN r.es - 'flags' END AS extraction_snapshot, "
+            "  (SELECT count(*) FROM fl) AS flags_total, "
+            "  (SELECT COALESCE(jsonb_agg(f ORDER BY o), '[]'::jsonb) FROM fl WHERE o <= %s) AS flags_head, "
+            "  (SELECT COALESCE(array_agg(DISTINCT f->>'reason'), '{}') FROM fl "
+            "    WHERE f->>'reason' = ANY(%s)) AS always_shown, "
+            "  (SELECT count(DISTINCT COALESCE(f->'from', 'null'::jsonb)) FROM fl "
+            "    WHERE f->>'reason' = 'source_not_registered') AS unparsed_syntax, "
+            "  (SELECT count(DISTINCT COALESCE(f->'from', 'null'::jsonb)) FROM fl "
+            "    WHERE f->>'reason' = 'dropped_syntax' AND f->>'why' = 'size_exceeded') AS unparsed_oversize, "
+            "  (SELECT count(*) FROM fl WHERE f->>'reason' = 'unreadable_mention_doc') AS mention_unreadable, "
+            "  (SELECT COALESCE(sum(CASE WHEN jsonb_typeof(f->'count')='number' THEN (f->>'count')::numeric "
+            "                            ELSE 0 END), 0) FROM fl "
+            "    WHERE f->'many' = 'true'::jsonb AND starts_with(f->>'reason', 'office_md:derived_partial')) "
+            "    AS md_failed_many "
+            "FROM r", (_KB_ID, world, flags_limit, list(_FLAG_REASONS_ALWAYS_SHOWN))).fetchone()
+    if row is None:
+        return None
+    md_many = row["md_failed_many"]
+    return {"id": row["id"], "status": row["status"], "progress": row["progress"],
+            "extraction_snapshot": row["extraction_snapshot"],
+            "flags_total": row["flags_total"], "flags_head": row["flags_head"],
+            "flag_counts": {"always_shown": list(row["always_shown"]),
+                            "unparsed_syntax": row["unparsed_syntax"],
+                            "unparsed_oversize": row["unparsed_oversize"],
+                            "mention_unreadable": row["mention_unreadable"],
+                            "md_failed_many": int(md_many) if md_many == int(md_many) else float(md_many)}}
+
+
+def get_latest_published_run_summary(world) -> dict | None:
+    """最新の反映済み（`published_at IS NOT NULL`）run 1件の `published_snapshot` の `nodes`/`edges` と `created_at`。graph（Neo4j）件数専用で、ES は `get_latest_es_run_summary` を使う。
+    直近の run が失敗していても Neo4j は直前の成功時点のままなので、これが現在の Neo4j の内容に最も近い。ES 段に触れていない run も拾いうるため ES 件数には流用しない。
+    JSONB は丸ごと取らず必要なキーだけ DB 側で取り出す。
+    """
+    _ensure()
+    with _connect() as c:
+        row = c.execute(
+            "SELECT published_snapshot->'nodes' AS nodes, published_snapshot->'edges' AS edges, created_at "
+            "FROM ingest_runs "
             "WHERE kb_id=%s AND version=%s AND published_at IS NOT NULL ORDER BY id DESC LIMIT 1",
             (_KB_ID, world)).fetchone()
+    if row is None:
+        return None
+    return {"published_snapshot": {k: row[k] for k in ("nodes", "edges") if row[k] is not None},
+            "created_at": row["created_at"]}
 
 
 def get_latest_es_run_summary(world) -> dict | None:
-    """ES 反映を実際に試みた（`published_at IS NOT NULL` かつ `extraction_snapshot` に `es` キーがある）最新 run 1件の軽量列（`extraction_snapshot`/`created_at`）。
+    """ES 反映を実際に試みた（`published_at IS NOT NULL` かつ `extraction_snapshot` に `es` キーがある）最新 run 1件の `extraction_snapshot.es` と `created_at`（`extraction_snapshot` は `es` だけを持つ）。
     `get_latest_published_run_summary`（Neo4j の完了境界）とは別の境界で、ES 段まで到達した run だけに絞る。
     """
     _ensure()
     with _connect() as c:
-        return c.execute(
-            "SELECT extraction_snapshot, created_at FROM ingest_runs "
+        row = c.execute(
+            "SELECT extraction_snapshot->'es' AS es, created_at FROM ingest_runs "
             "WHERE kb_id=%s AND version=%s AND published_at IS NOT NULL AND extraction_snapshot ? 'es' "
             "ORDER BY id DESC LIMIT 1",
             (_KB_ID, world)).fetchone()
+    if row is None:
+        return None
+    return {"extraction_snapshot": {"es": row["es"]}, "created_at": row["created_at"]}
 
 
 def get_recent_es_attempts(world, limit: int = 200) -> list[dict]:

@@ -41,6 +41,13 @@ else
   store_line "Neo4j"         "neo4j"
 fi
 
+# shellcheck source=scripts/lib/mem_budget.sh
+. "$ROOT/scripts/lib/mem_budget.sh"
+sherpa_env_default SHERPA_OCR_MEMORY_LIMIT
+mem_budget_detect
+mem_budget_compute "$MB_TOTAL_DETECTED"
+echo "  $(mem_budget_line)"
+
 echo ""
 echo "=== アプリ（FastAPI） ==="
 app_down=0

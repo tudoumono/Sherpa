@@ -8,13 +8,14 @@ monkeypatch＝DB 不要。
 
 `_ingest_summary(wid, row)` は呼び出し元が取得済みの world 行を受け取り、
 `corpus_docs.scan_report`／`graph_view`／`es_index.count` を一切呼ばない。最新 run の要約は
-`store.get_latest_run_summary`（狭い SELECT）から読み、DB 例外は握りつぶさず伝播させる
+`store.get_latest_run_status`（狭い SELECT）から読み、DB 例外は握りつぶさず伝播させる
 （全ゼロへ縮退して「集計できた」ように見せない・明示エラー）。
 """
 from __future__ import annotations
 
 import pytest
 
+from _run_status_view import status_view
 from sherpa import api, store
 
 
@@ -38,7 +39,7 @@ def test_warn_flags_surface_as_last_run_warnings(monkeypatch):
                {"doc": None, "action": "warn", "reason": "reconcile_failed:RuntimeError"},
                {"doc": "a.md", "action": "publish", "reason": "ok"},
            ]}}
-    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: run)
+    monkeypatch.setattr(store, "get_latest_run_status", lambda wid, limit=200: status_view(run))
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: None)
     s = api._ingest_summary("w", _ROW)
@@ -51,7 +52,7 @@ def test_warn_flags_surface_as_last_run_warnings(monkeypatch):
 def test_non_dict_snapshot_does_not_break_summary(monkeypatch):
     """extraction_snapshot が dict 以外（旧データ/手動投入）でも summary は落ちない（RV Low）。"""
     run = {"status": "auto_published", "extraction_snapshot": []}
-    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: run)
+    monkeypatch.setattr(store, "get_latest_run_status", lambda wid, limit=200: status_view(run))
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: None)
     s = api._ingest_summary("w", _ROW)
@@ -63,9 +64,9 @@ def test_store_failure_propagates_as_explicit_error(monkeypatch):
     """run 取得の DB 失敗は summary を全ゼロへ縮退させず、そのまま例外を伝播させる
     （呼び出し元＝`world_status`/`_ingest_summary_after_mutation` が 503 へ変換する）。
     """
-    def _boom(wid):
+    def _boom(wid, limit=200):
         raise RuntimeError("db down")
-    monkeypatch.setattr(store, "get_latest_run_summary", _boom)
+    monkeypatch.setattr(store, "get_latest_run_status", _boom)
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: None)
     try:
@@ -78,7 +79,7 @@ def test_store_failure_propagates_as_explicit_error(monkeypatch):
 
 def test_no_runs_yields_none_and_empty(monkeypatch):
     """run が1件も無い world（登録直後）は None/[]。"""
-    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: None)
+    monkeypatch.setattr(store, "get_latest_run_status", lambda wid, limit=200: None)
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: None)
     s = api._ingest_summary("w", _ROW)

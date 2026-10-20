@@ -29,6 +29,7 @@ def test_partial_extraction_advice_is_non_empty_string():
 _KNOWN_RAW_REASONS = {
     # office_md._build_derived_into_staging（legacy 変換・ING-1 タイムアウト分離）
     "legacy_conversion_timeout": "legacy_conversion_timeout",
+    "memory_exceeded": "memory_exceeded",
     "legacy_conversion_failed": "legacy_conversion_failed",
     # office_md._build_derived_into_staging（入口サイズガード・MEM-1・プレフィックス無し）
     "size_exceeded": "size_exceeded",

@@ -11,6 +11,7 @@ import urllib.error
 
 import pytest
 
+from _run_status_view import flag_counts, status_view
 from sherpa import corpus_docs, es_index, graph_coverage, store, worlds
 from sherpa.ingest import office_md, text_kind, world_graph
 from sherpa.ingest.arms import ArmResult, vision_arm
@@ -26,9 +27,9 @@ def _row(rep=None):
 
 def _stub_runs(monkeypatch, snapshot=None, es_snapshot=None):
     monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: [es_snapshot] if es_snapshot else [])
-    monkeypatch.setattr(store, "get_latest_run_summary",
-                        lambda wid: {"status": "auto_published_with_flags",
-                                     "extraction_snapshot": snapshot or {}, "created_at": None})
+    monkeypatch.setattr(store, "get_latest_run_status",
+                        lambda wid, limit=200: status_view({"status": "auto_published_with_flags",
+                                                 "extraction_snapshot": snapshot or {}}))
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_latest_es_run_summary",
                         lambda wid: {"extraction_snapshot": {"es": es_snapshot}} if es_snapshot else None)
@@ -251,7 +252,8 @@ def test_vectors_missing_notice_clears_after_a_fill_only_run(monkeypatch):
                                 "rag_degraded_by_reason": {"empty_text": 2}})
     runs = [first]                                   # 新しい順の ES 記録
     monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: list(runs))
-    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: {"status": "auto_published", "extraction_snapshot": {}})
+    monkeypatch.setattr(store, "get_latest_run_status",
+                        lambda wid, limit=200: status_view({"status": "auto_published", "extraction_snapshot": {}}))
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: {"extraction_snapshot": {"es": first}})
     codes = lambda: {n["code"] for n in worlds_router._ingest_summary("w", _row())["ingest_notices"]}   # noqa: E731
@@ -265,5 +267,5 @@ def test_many_md_failures_are_shown_as_a_notice_and_a_few_are_not(monkeypatch):
     """MD 化で作れなかった文書が候補の割合を超えた run だけ、件数のお知らせを出す（少ないときは失敗の一覧だけ）。"""
     many = [{"doc": None, "action": "warn", "reason": "office_md:derived_partial:rag_failed=12", "count": 12, "many": True}]
     few = [{"doc": None, "action": "warn", "reason": "office_md:derived_partial:rag_failed=2", "count": 2, "many": False}]
-    assert {"code": "md_docs_failed_many", "count": 12} in worlds_router._ingest_notices({}, many, None)
-    assert all(n["code"] != "md_docs_failed_many" for n in worlds_router._ingest_notices({}, few, None))
+    assert {"code": "md_docs_failed_many", "count": 12} in worlds_router._ingest_notices({}, flag_counts(many), None)
+    assert all(n["code"] != "md_docs_failed_many" for n in worlds_router._ingest_notices({}, flag_counts(few), None))

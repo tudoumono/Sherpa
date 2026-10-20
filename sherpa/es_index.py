@@ -1220,9 +1220,12 @@ class _StreamingBulkSender:
         path = f"/{self.idx}/_bulk" + ("?refresh=true" if refresh else "")
         try:
             res = _req("POST", path, payload, ndjson=True)
-        except Exception:
+        except Exception as e:
             # 途中バッチの失敗は呼び出し元が作りかけの索引を捨てる（全部か無しか。付け替え前なので古い索引は残る）
+            # 失敗後は `failed` で以降の送信を止めるので、原因の行は 1 つの送り手につき 1 回だけ出る
             self.failed, self.error = True, "bulk_failed"
+            _log.warning("ES への登録に失敗しました（作りかけの索引は捨てます）: world=%s 原因=%s: %s",
+                         self.world, e.__class__.__name__, " ".join(str(e).split())[:200])
             return False
         if res.get("errors"):  # item-level の失敗（HTTP 200 でも起きる）
             self.failed, self.error = True, "bulk_errors"

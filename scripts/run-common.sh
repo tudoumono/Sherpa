@@ -125,6 +125,11 @@ sherpa_compose() {
     echo "指定された SHERPA_ENV_FILE がありません: $file" >&2
     return 2
   fi
+  # ES・Neo4j・OCR のメモリ上限を全体のメモリから決めて compose に渡す（scripts/lib/mem_budget.sh・割り振り済みなら何もしない）。
+  # shellcheck source=scripts/lib/mem_budget.sh
+  . "$ROOT/scripts/lib/mem_budget.sh"
+  sherpa_env_default SHERPA_OCR_MEMORY_LIMIT
+  mem_budget_apply
   if [ -f "$file" ]; then
     docker compose --env-file "$file" "$@"
   else
