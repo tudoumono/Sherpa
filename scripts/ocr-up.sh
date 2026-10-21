@@ -78,7 +78,10 @@ if [ -n "$_ocr_base" ] && ! docker image inspect "$_ocr_base" >/dev/null 2>&1 \
   if [ "$(docker image inspect -f '{{index .Config.Labels "sherpa.overlay"}}' "$_ocr_image" 2>/dev/null)" != "1" ]; then
     docker tag "$_ocr_image" "$_ocr_image-base"
   fi
+  # 素のイメージの OS/アーキテクチャで作る（決め打ちせず、載せ替え元と食い違わせない）。
+  _ocr_platform="$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$_ocr_image-base" 2>/dev/null || true)"
   if ! docker build -q -f "$ROOT/docker/ocr/Dockerfile.overlay" \
+    ${_ocr_platform:+--platform "$_ocr_platform"} \
     --build-arg "BASE_IMAGE=$_ocr_image-base" --build-arg "SHERPA_APP_VERSION=$SHERPA_APP_VERSION" \
     -t "$_ocr_image" "$ROOT" >/dev/null; then
     # 黙って古いワーカーを動かし続けない（起動の成功に見せない）。意図したスキップ（exit 0）とは区別する。
@@ -86,7 +89,8 @@ if [ -n "$_ocr_base" ] && ! docker image inspect "$_ocr_base" >/dev/null 2>&1 \
     echo "    Docker の状態を確認し、もう一度 make up を実行してください。" >&2
     exit 1
   fi
-  sherpa_compose --profile ocr up -d ocr-worker
+  COMPOSE_FILE="$ROOT/docker-compose.yml:$ROOT/docker/ocr/compose.version.yml" \
+    sherpa_compose --profile ocr up -d ocr-worker
 else
   # 版ラベルは別ファイルで重ねる（docker-compose.yml 本体は固定測定に束縛されるため触らない）。
   COMPOSE_FILE="$ROOT/docker-compose.yml:$ROOT/docker/ocr/compose.version.yml" \

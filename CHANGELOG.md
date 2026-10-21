@@ -2,6 +2,23 @@
 
 このリポジトリの変更点を記録する。書式は [Keep a Changelog](https://keepachangelog.com/) に準拠する。
 
+## [0.19.7] - 2026-10-22
+
+0.19.6 から入れ替えて使える（取り込み直しは要らない）。
+
+### 直したこと
+
+- **Apple Silicon（arm64）の Mac で、OCR のワーカーが起動できなかった**のを直した。OCR の部品（paddlepaddle）は linux/amd64 の物しか無いため、
+  OCR のワーカーを amd64 に固定し、arm64 の Mac ではエミュレーションで動かす（`docker/ocr/compose.version.yml` の `platform`）。
+  素の Python のイメージが手元に無いときの載せ替えの経路（`scripts/ocr-up.sh`）も、素のイメージと同じ CPU の種類で作るようにした。
+  Linux・WSL（amd64）では動きは変わらない。
+- Apple Silicon の Mac では、Docker Desktop の「Use Rosetta for x86_64/amd64 emulation」を有効にすると、OCR のワーカーの作成と実行が速くなる。
+
+### 入れたあと（Apple Silicon の Mac）
+
+- `make up`（または `make start`）で OCR のワーカーが作られ、起動する。初回はイメージを作るのに時間がかかる。
+- `docker image inspect sherpa/ocr-worker:paddleocr-3.7.0-cpu -f '{{.Architecture}}'` が `amd64` になっていればよい。
+
 ## [0.19.6] - 2026-10-22
 
 0.19.5・0.19.4 から入れ替えて使える。**入れたあと、全部の資料フォルダの全文検索の索引を作り直す**（索引の作りが変わったため・自動で始まる）。

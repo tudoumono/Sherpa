@@ -1,7 +1,9 @@
-# ocr-worker のイメージへ「焼いたコードの版」を表示用ラベルとして付ける（scripts/ocr-up.sh が重ねて使う）。
+# ocr-worker のイメージへ「焼いたコードの版」を表示用ラベルとして付け、実行する CPU を amd64 に固定する（scripts/ocr-up.sh が重ねて使う）。
+# paddlepaddle の wheel が linux/amd64 にしか無いため、arm64 ホストでもエミュレーションで amd64 を動かす。
 # 固定測定に束縛される docker-compose.yml 本体は変えない。
 services:
   ocr-worker:
+    platform: linux/amd64
     build:
       labels:
         sherpa.code-version: ${SHERPA_APP_VERSION:-unknown}
