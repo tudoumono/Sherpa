@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import csv
 import io
 import json
@@ -292,9 +293,10 @@ def admin_usage_export(request: Request, days: int = Query(30, ge=1, le=365),
     # ZIP は大きくなりうるため、一時ファイル（大きければディスクへ退避）に書いて少しずつ返す。
     buf = tempfile.SpooledTemporaryFile(max_size=10 * 1024 * 1024)
     try:
-        usage_export.build_export_zip(
-            buf, summary=summary, turn_rows=turn_rows, aux_rows=aux_rows,
-            retrieved_at=datetime.now(timezone.utc), app_ver=app_version.current())
+        with contextlib.closing(turn_rows), contextlib.closing(aux_rows):
+            usage_export.build_export_zip(
+                buf, summary=summary, turn_rows=turn_rows, aux_rows=aux_rows,
+                retrieved_at=datetime.now(timezone.utc), app_ver=app_version.current())
         detail = {"days": days} if time_from is None and time_to is None else {"from": time_from, "to": time_to}
         try:
             store.audit(u["uid"], "admin.usage_exported", "usage", None, detail=detail,

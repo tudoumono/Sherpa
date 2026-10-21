@@ -71,6 +71,50 @@ export SHERPA_APP_VERSION
 # （ネットワーク不要）。ベースが引ける環境（開発機）は従来どおり毎回フルビルドする。
 _ocr_image=sherpa/ocr-worker:paddleocr-3.7.0-cpu
 _ocr_base="$(awk 'toupper($1)=="FROM"{print $2; exit}' "$ROOT/docker/ocr/Dockerfile" 2>/dev/null)"
+# 実行する CPU の種類（compose で決めた値）と食い違う古いイメージは、載せ替えの土台にせず作り直す。
+# 作り直せる前提（素のイメージを引けること）を確かめてから作り、できて合っていることを確かめてから古いものを消す。
+_ocr_want="$(awk '/^[[:space:]]*platform:/{print $2; exit}' "$ROOT/docker/ocr/compose.version.yml" 2>/dev/null)"
+_ocr_want="${_ocr_want:-linux/amd64}"
+_ocr_stale_ids=""
+for _t in "$_ocr_image" "$_ocr_image-base"; do
+  _p="$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$_t" 2>/dev/null || true)"
+  if [ -n "$_p" ] && [ "$_p" != "$_ocr_want" ]; then
+    _id="$(docker image inspect -f '{{.Id}}' "$_t" 2>/dev/null || true)"
+    echo "  OCR のイメージが ${_p#*/} のため、${_ocr_want#*/} で作り直します"
+    case " $_ocr_stale_ids " in *" $_id "*) ;; *) _ocr_stale_ids="$_ocr_stale_ids $_id" ;; esac
+  fi
+done
+if [ -n "$_ocr_stale_ids" ]; then
+  _bp="$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$_ocr_base" 2>/dev/null || true)"
+  if [ "$_bp" != "$_ocr_want" ] && ! docker pull -q --platform "$_ocr_want" "$_ocr_base" >/dev/null 2>&1; then
+    echo "  【失敗】OCR のイメージを ${_ocr_want#*/} で作り直せないため、古いイメージには触れずに止めます。" >&2
+    echo "    作り直しに要る素のイメージ（${_ocr_want#*/} 版）が手元に無く、取得もできませんでした。" >&2
+    echo "    オンラインの状態でもう一度 make up を実行するか、素のイメージを用意してください。" >&2
+    exit 1
+  fi
+  echo "  OCR のイメージを作り直しています..."
+  if ! COMPOSE_FILE="$ROOT/docker-compose.yml:$ROOT/docker/ocr/compose.version.yml" \
+       sherpa_compose --profile ocr build ocr-worker >/dev/null; then
+    echo "  【失敗】OCR のイメージの作り直しに失敗しました。古いイメージはそのまま残しています。" >&2
+    echo "    Docker の状態を確認し、もう一度 make up を実行してください。" >&2
+    exit 1
+  fi
+  _new_id="$(docker image inspect -f '{{.Id}}' "$_ocr_image" 2>/dev/null || true)"
+  _new_p="$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$_ocr_image" 2>/dev/null || true)"
+  if [ -z "$_new_id" ] || [ "$_new_p" != "$_ocr_want" ]; then
+    echo "  【失敗】作り直したイメージが ${_ocr_want#*/} になっていないため、古いイメージはそのまま残しています。" >&2
+    exit 1
+  fi
+  for _id in $_ocr_stale_ids; do
+    [ "$_id" = "$_new_id" ] && continue
+    if docker rmi -f "$_id" >/dev/null 2>&1; then
+      _short="${_id#sha256:}"
+      echo "  作り直しに成功したので、古いイメージを消しました（${_short:0:12}）"
+    else
+      echo "  古いイメージを消せませんでした（使用中の可能性があります）: ${_id#sha256:}" >&2
+    fi
+  done
+fi
 if [ -n "$_ocr_base" ] && ! docker image inspect "$_ocr_base" >/dev/null 2>&1 \
    && docker image inspect "$_ocr_image" >/dev/null 2>&1; then
   echo "  （ベースイメージが無いため、導入済みイメージにアプリのコードだけを載せ替えます）"

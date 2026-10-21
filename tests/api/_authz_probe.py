@@ -69,6 +69,7 @@ _JSON_BODY: dict[tuple[str, str], dict] = {
     ("PATCH", "/conversations/{cid}"): {"title": "x"},
     ("POST", "/worlds"): {"path": "/tmp/sherpa-auth-snapshot-probe"},
     ("POST", "/worlds/diff"): {"path": "/tmp/sherpa-auth-snapshot-probe"},
+    ("POST", "/worlds/disk-estimate"): {"path": "/tmp/sherpa-auth-snapshot-probe"},
     ("POST", "/worlds/{wid}/rebind"): {"path": "/tmp/sherpa-auth-snapshot-probe"},
     ("POST", "/worlds/{wid}/reconvert"): {"rel": "x"},
     ("POST", "/admin/usage/quality-runs"): {"rounds": 1, "condition": "main",

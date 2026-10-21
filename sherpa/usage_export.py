@@ -12,7 +12,10 @@ import csv
 import io
 import json
 import re
+import shutil
+import tempfile
 import zipfile
+from collections.abc import Iterable
 from datetime import datetime
 
 from fastapi.encoders import jsonable_encoder
@@ -206,6 +209,29 @@ def _csv_bytes(header: list[str], rows: list[list]) -> bytes:
     return buf.getvalue().encode("utf-8-sig")
 
 
+class _CsvStream:
+    """CSV（BOM 付き UTF-8・CRLF・セルは `csv_safe` 済み）を `dest`（バイト列の書き込み先）へ行ごとに流す。`_csv_bytes` と同じバイト列になる。"""
+
+    _FLUSH_AT = 64 * 1024
+
+    def __init__(self, dest, header: list[str]):
+        self._dest = dest
+        self._buf = io.StringIO()
+        self._writer = csv.writer(self._buf, lineterminator="\r\n")
+        dest.write(b"\xef\xbb\xbf")
+        self._writer.writerow(header)
+
+    def row(self, values: list) -> None:
+        self._writer.writerow([csv_safe(v) for v in values])
+        if self._buf.tell() >= self._FLUSH_AT:
+            self.flush()
+
+    def flush(self) -> None:
+        self._dest.write(self._buf.getvalue().encode("utf-8"))
+        self._buf.seek(0)
+        self._buf.truncate()
+
+
 def _readme_text(period: dict, retrieved_at: datetime, app_ver: str | None) -> str:
     lines = [
         "Sherpa 利用明細エクスポート",
@@ -242,52 +268,93 @@ def _readme_text(period: dict, retrieved_at: datetime, app_ver: str | None) -> s
     return "\n".join(lines) + "\n"
 
 
-def build_export_zip(fileobj, *, summary: dict, turn_rows: list[dict], aux_rows: list[dict],
+_SPOOL_MAX = 8 * 1024 * 1024
+
+
+def _copy_spool_into_zip(zf: zipfile.ZipFile, name: str, spool) -> None:
+    spool.seek(0)
+    with zf.open(name, "w") as dest:
+        shutil.copyfileobj(spool, dest, 1024 * 1024)
+
+
+def build_export_zip(fileobj, *, summary: dict, turn_rows: Iterable[dict], aux_rows: Iterable[dict],
                      retrieved_at: datetime, app_ver: str | None) -> None:
     """`fileobj`（シーク可能な書き込み先）へ ZIP を書き込む。
 
     `summary`: `store.usage_stats(...)` の結果（読み取るだけ）。`turn_rows`: `store.usage_export_turns(...)` の行
-    （数字・閉じた語彙の欄だけを抜き出し、本文は zip のどのファイルへも書かない）。`aux_rows`: `store.usage_export_aux_calls(...)` の行。
+    （会話番号順・数字・閉じた語彙の欄だけを抜き出し、本文は zip のどのファイルへも書かない）。`aux_rows`: `store.usage_export_aux_calls(...)` の行。
+    ① README・summary を書く ② 回答の行を1回だけ読み、turns.csv は ZIP へ直接流し、agents/tools/activity は一時ファイルへ書く
+    ③ 一時ファイルを ZIP へ移す ④ aux・daily を流す。activity は会話ごとに書いたら捨てる（全行をメモリに持たない）。
+    守ること: ZIP は同時に1つしか書き込み口を開けないため、turns.csv の書き込み中は他のファイルを ZIP へ書かない。
     """
     period = summary.get("period") or {}
-    turns_csv_rows: list[list] = []
-    agents_csv_rows: list[list] = []
-    tools_csv_rows: list[list] = []
-    activity_by_conv: dict = {}
-
-    for row in turn_rows:
-        answer = row.get("answer") if isinstance(row.get("answer"), dict) else {}
-        conv_id = row.get("conversation_id")
-        msg_id = row.get("message_id")
-
-        turns_csv_rows.append(_turns_row(row, answer))
-
-        activity = answer.get("activity") if isinstance(answer.get("activity"), dict) else None
-        if isinstance(activity, dict) and activity.get("source") == "codex_rollout":
-            agents = activity.get("agents") if isinstance(activity.get("agents"), list) else []
-            for label, agent in label_agents(agents):
-                agents_csv_rows.append(_agent_row(conv_id, msg_id, label, agent))
-                for name, t in merge_tools(agent.get("tools")).items():
-                    tools_csv_rows.append(_tool_row(conv_id, msg_id, label, name, t))
-
-        activity_by_conv.setdefault(conv_id, []).append({
-            "id": msg_id, "created_at": row.get("message_created_at"),
-            "activity": activity, "stop_kind": answer.get("stop_kind"),
-            "codex_error_code": answer.get("codex_error_code"),
-            "duration_ms": answer.get("duration_ms"),
-            "investigation": answer.get("investigation"),
-        })
-
-    with zipfile.ZipFile(fileobj, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX) as agents_spool, \
+            tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX) as tools_spool, \
+            tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX) as activity_spool, \
+            zipfile.ZipFile(fileobj, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("README.txt", _readme_text(period, retrieved_at, app_ver))
         zf.writestr("summary.json", json.dumps(jsonable_encoder(summary), ensure_ascii=False, indent=2))
-        zf.writestr("turns.csv", _csv_bytes(_TURNS_HEADER, turns_csv_rows))
-        zf.writestr("agents.csv", _csv_bytes(_AGENTS_HEADER, agents_csv_rows))
-        zf.writestr("tools.csv", _csv_bytes(_TOOLS_HEADER, tools_csv_rows))
-        zf.writestr("aux_calls.csv", _csv_bytes(_AUX_HEADER, [_aux_row(r) for r in aux_rows]))
+
+        agents_csv = _CsvStream(agents_spool, _AGENTS_HEADER)
+        tools_csv = _CsvStream(tools_spool, _TOOLS_HEADER)
+        activity_conv = None
+        activity_lines: list[str] = []
+        activity_count = 0
+
+        def _flush_activity() -> None:
+            if activity_count == 0:
+                return
+            text = [f"会話 {activity_conv}（回答 {activity_count} 件）", *activity_lines]
+            name = f"activity/{activity_conv}.txt".encode("utf-8")
+            body = ("\n".join(text) + "\n").encode("utf-8")
+            activity_spool.write(b"%d\n%s%d\n" % (len(name), name, len(body)))
+            activity_spool.write(body)
+
+        with zf.open("turns.csv", "w") as turns_dest:
+            turns_csv = _CsvStream(turns_dest, _TURNS_HEADER)
+            for row in turn_rows:
+                answer = row.get("answer") if isinstance(row.get("answer"), dict) else {}
+                conv_id = row.get("conversation_id")
+                msg_id = row.get("message_id")
+
+                turns_csv.row(_turns_row(row, answer))
+
+                activity = answer.get("activity") if isinstance(answer.get("activity"), dict) else None
+                if isinstance(activity, dict) and activity.get("source") == "codex_rollout":
+                    agents = activity.get("agents") if isinstance(activity.get("agents"), list) else []
+                    for label, agent in label_agents(agents):
+                        agents_csv.row(_agent_row(conv_id, msg_id, label, agent))
+                        for name, t in merge_tools(agent.get("tools")).items():
+                            tools_csv.row(_tool_row(conv_id, msg_id, label, name, t))
+
+                if activity_count and conv_id != activity_conv:
+                    _flush_activity()
+                    activity_lines, activity_count = [], 0
+                activity_conv = conv_id
+                activity_count += 1
+                activity_lines.extend(format_turn({
+                    "id": msg_id, "created_at": row.get("message_created_at"),
+                    "activity": activity, "stop_kind": answer.get("stop_kind"),
+                    "codex_error_code": answer.get("codex_error_code"),
+                    "duration_ms": answer.get("duration_ms"),
+                    "investigation": answer.get("investigation"),
+                }))
+            _flush_activity()
+            turns_csv.flush()
+        agents_csv.flush()
+        tools_csv.flush()
+
+        _copy_spool_into_zip(zf, "agents.csv", agents_spool)
+        _copy_spool_into_zip(zf, "tools.csv", tools_spool)
+        with zf.open("aux_calls.csv", "w") as aux_dest:
+            aux_csv = _CsvStream(aux_dest, _AUX_HEADER)
+            for r in aux_rows:
+                aux_csv.row(_aux_row(r))
+            aux_csv.flush()
         zf.writestr("daily.csv", _csv_bytes(_DAILY_HEADER, _daily_rows(summary)))
-        for conv_id, rows in sorted(activity_by_conv.items(), key=lambda kv: (kv[0] is None, kv[0])):
-            text = [f"会話 {conv_id}（回答 {len(rows)} 件）"]
-            for r in rows:
-                text.extend(format_turn(r))
-            zf.writestr(f"activity/{conv_id}.txt", "\n".join(text) + "\n")
+
+        activity_spool.seek(0)
+        while name_len := activity_spool.readline():
+            name = activity_spool.read(int(name_len)).decode("utf-8")
+            body = activity_spool.read(int(activity_spool.readline()))
+            zf.writestr(name, body)

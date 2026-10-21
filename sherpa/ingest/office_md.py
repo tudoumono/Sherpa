@@ -572,6 +572,7 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
     current = _current_human_md_sig()
     generated = failed = 0
     failures: list[dict] = []
+    drop_cache = _conv_cache_dropper(wd, dr, ocr_observation_marker=current_ocr_observation_marker(world))
     for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         ext = rp.suffix.lower()
         if ext not in (".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"):
@@ -627,6 +628,7 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
             failed += 1
             failures.append({"doc": rel, "reason": "manifest_write_failed"})
             continue
+        drop_cache(rel, rp)
         generated += 1
     return {"human_md_generated": generated, "human_md_failed": failed, "human_md_failures": failures}
 
@@ -1737,6 +1739,9 @@ def _conv_cache_lookup(cache_root: Path, rel: str, want_key: str) -> tuple[dict,
         return None
     if any(rep_delta.get(k) for k in _CONV_CACHE_FAILED_DELTA_KEYS):
         return None
+    files = meta.get("files")
+    if isinstance(files, list) and not all(isinstance(f, str) and (content_dir / f).is_file() for f in files):
+        return None                                       # 中身が欠けた枠（消す途中で止まった等）は当たりにしない
     cached_meta = json_io.read_json(content_dir / "md" / (rel + ".md.meta.json"), default=None)
     legacy_failure = rep_delta.get("legacy_failure")
     if legacy_failure is not None and not _legacy_failure_still_valid(legacy_failure):
@@ -1840,6 +1845,7 @@ def _conv_cache_store(cache_root: Path, rel: str, key: str, rep_delta: dict,
     try:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         wrote_any = False
+        files: list[str] = []
         for suffix in _CONV_CACHE_SIDECAR_SUFFIXES:
             layer = _LAYER_FOR_SIDECAR_SUFFIX[suffix]
             src = roots[layer] / (rel + suffix)
@@ -1848,6 +1854,7 @@ def _conv_cache_store(cache_root: Path, rel: str, key: str, rep_delta: dict,
             dst = tmp_dir / layer / (rel + suffix)
             dst.parent.mkdir(parents=True, exist_ok=True)
             _link_or_copy(src, dst)
+            files.append(f"{layer}/{rel}{suffix}")
             wrote_any = True
         assets_src = dr_rag / (rel + ".assets")
         if assets_src.is_dir():
@@ -1856,13 +1863,49 @@ def _conv_cache_store(cache_root: Path, rel: str, key: str, rep_delta: dict,
         if not wrote_any:                     # 何も書かれなかった rel はキャッシュする意味が無い
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return
+        meta_path.unlink(missing_ok=True)     # 守ること: 中身を入れ替える前に古い鍵を消す（途中で止まった枠を古い鍵で当てない）
         shutil.rmtree(content_dir, ignore_errors=True)
         tmp_dir.rename(content_dir)
-        json_io.write_json_atomic(meta_path, {"key": key, "rep_delta": rep_delta})
+        json_io.write_json_atomic(meta_path, {"key": key, "rep_delta": rep_delta, "files": files})
     except OSError:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         _log.warning(
             "変換結果キャッシュの保存に失敗しました（次回 sync も実変換します）: %s", rel, exc_info=True)
+
+
+def _conv_cache_drop(cache_root: Path, rel: str) -> None:
+    """この rel のキャッシュの枠を消す。鍵を最初に消す（途中で止まっても、鍵だけ残って中身が欠けた枠が当たらないように）。"""
+    meta_path, content_dir = _conv_cache_slot(cache_root, rel)
+    try:
+        meta_path.unlink(missing_ok=True)
+    except OSError:
+        return
+    shutil.rmtree(content_dir, ignore_errors=True)
+    shutil.rmtree(content_dir.with_name(content_dir.name + ".tmp"), ignore_errors=True)
+
+
+def _conv_cache_dropper(wd: Path, dr: Path, *, ocr_observation_marker: str | None):
+    """軽い作り直しで公開側を書き換えた rel のキャッシュの枠を消す関数 `(rel, 原本) -> None` を返す。
+
+    設計: docs/design/rag.md「変換結果の保存と戻し」。`store.world_lock` を保持した呼び出し元から、作り直しが成功した rel にだけ使う。
+    枠の鍵が今の署名で作った鍵と一致する枠は今の版の中身なので残し、一致しない枠だけ消す
+    （古い inode を持ったまま当たらない枠はディスクを二重に食う）。原本と派生物の置き場が重なるときは何もしない。
+    """
+    cache_root = _conv_cache_root_for(dr)
+    dr_rag, dr_ir = _sibling_layer_dir(dr, "rag"), _sibling_layer_dir(dr, "ir")
+    wd = Path(wd).resolve()
+    if (not cache_root.is_dir()
+            or any(_within(a, wd) or _within(wd, a) for a in (dr, dr_rag, dr_ir, cache_root))):
+        return lambda rel, rp: None
+    sig = _current_conv_cache_pipeline_sig(ocr_observation_marker=ocr_observation_marker)
+
+    def drop(rel: str, rp: Path) -> None:
+        meta = json_io.read_json(_conv_cache_slot(cache_root, rel)[0], default=None)
+        if isinstance(meta, dict) and meta.get("key") is not None and meta.get("key") == _conv_cache_source_key(rp, sig):
+            return
+        _conv_cache_drop(cache_root, rel)
+
+    return drop
 
 
 def _conv_cache_prune(cache_root: Path, seen_rels: set) -> None:
@@ -3228,6 +3271,7 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
     legacy_cache = legacy_convert.cache_root_for(dr)
     obs_dir = _resolve_ocr_observation_dir(world)          # 1回だけ解決
     ocr_observation_marker = _ocr_observation_marker_for(obs_dir)
+    drop_cache = _conv_cache_dropper(wd, dr, ocr_observation_marker=ocr_observation_marker)
     for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         if rp.suffix.lower() not in EVIDENCE_EXT:
             continue
@@ -3325,6 +3369,8 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
         if rel_ok and not _write_derived_sidecar_manifest(dr, dr_rag, dr_ir, rel):
             rag_failed += 1
             rag_failures.append({"doc": rel, "reason": "manifest_write_failed"})
+        elif rel_ok:
+            drop_cache(rel, rp)
 
     for suffix in (".evidence.json", ".context.json"):
         for evidence_path in dr_ir.rglob(f"*{suffix}"):
@@ -3414,6 +3460,7 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
     legacy_cache = legacy_convert.cache_root_for(dr)
     obs_dir = _resolve_ocr_observation_dir(world)          # 1回だけ解決
     ocr_observation_marker = _ocr_observation_marker_for(obs_dir)
+    drop_cache = _conv_cache_dropper(wd, dr, ocr_observation_marker=ocr_observation_marker)
     for evidence_path in sorted(dr_ir.rglob("*.evidence.json")):
         rel = evidence_path.relative_to(dr_ir).as_posix()[: -len(".evidence.json")]
         source_path = sources.get(rel)
@@ -3488,6 +3535,8 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
         if rel_ok and not _write_derived_sidecar_manifest(dr, dr_rag, dr_ir, rel):
             failed += 1
             failures.append({"doc": rel, "reason": "manifest_write_failed"})
+        elif rel_ok:
+            drop_cache(rel, source_path)
     for suffix in (".rag.md", ".rag_chunks.jsonl"):
         for rag_path in dr_rag.rglob(f"*{suffix}"):
             rel = rag_path.relative_to(dr_rag).as_posix()[: -len(suffix)]

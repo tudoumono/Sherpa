@@ -1363,6 +1363,34 @@
         "title": "DiffReq",
         "type": "object"
       },
+      "DiskEstimateReq": {
+        "properties": {
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "world_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "World Id"
+          }
+        },
+        "title": "DiskEstimateReq",
+        "type": "object"
+      },
       "ExtAnswerReq": {
         "additionalProperties": false,
         "properties": {
@@ -14445,6 +14473,46 @@
           }
         },
         "summary": "World Diff Path",
+        "tags": [
+          "資料フォルダ(World)管理"
+        ]
+      }
+    },
+    "/worlds/disk-estimate": {
+      "post": {
+        "description": "登録・更新を始める前の、ディスクの必要量と空きの見積もり（読み取り専用・警告のためだけで取り込みは止めない）。\n原本を数えるのは背景で行い、数え中は `state=\"counting\"`（`scanned`＝数えた件数）を返す。画面は同じ依頼を数秒おきに繰り返して結果（`state=\"ready\"`）を取りに来る。\n`world_id` があれば登録済みの資料フォルダの更新前、無ければ `path` のフォルダの登録前（登録済みのフォルダなら更新前として扱う）。\n設計: docs/design/operations.md「取り込み前のディスク容量の見積もり」",
+        "operationId": "world_disk_estimate_worlds_disk_estimate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiskEstimateReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "World Disk Estimate",
         "tags": [
           "資料フォルダ(World)管理"
         ]

@@ -214,44 +214,54 @@ def _audit_entry_hash(prev_hash, vals: dict) -> str:
     return hashlib.sha256(((prev_hash or "") + _audit_canonical(vals)).encode("utf-8")).hexdigest()
 
 
+# 検証が名前付きカーソルで1回に取り寄せる行数（全行をメモリに持たない）。
+_VERIFY_FETCH_SIZE = 2000
+
+
 def verify_audit_chain() -> dict:
     """audit_log の hash-chain を検証し、改ざん・欠落・並べ替え・末尾削除を検出する。
     legacy 行（entry_hash IS NULL）はスキップし、末尾は head アンカーと照合する。
     returns {"ok": bool, "checked": int, "broken_at": id|None, "reason": str|None}
+    設計: docs/design/users.md「監査ログ」
+    ① REPEATABLE READ（読み取り専用）の 1 つのスナップショットで head と行を読む（`_audit_insert` は行の追加と head の更新を 1 トランザクションで行うため、スナップショットでは常に整合する）。② 名前付きカーソルで id 順に少しずつ読み、1 行ずつ検証する。③ 末尾を head と照合する。
+    守ること: advisory lock を取らない（検証中も監査の書き込みを待たせない）。
     """
     _ensure()
-    with _connect() as c:
-        # audit() と同じ advisory lock を取ってから head/rows を1トランザクションで読む。
-        c.execute("SELECT pg_advisory_xact_lock(%s)", (_AUDIT_CHAIN_LOCK,))
-        head = c.execute(
-            "SELECT last_id, last_hash, cnt, chain_start_id FROM audit_chain_head WHERE singleton").fetchone()
-        rows = c.execute(
-            "SELECT id, actor_user_id, action, resource_type, resource_id, detail, outcome, "
-            "  reason, severity, request_id, session_id, ip_hash, user_agent, before_state, "
-            "  after_state, created_at, prev_hash, entry_hash FROM audit_log "
-            "WHERE entry_hash IS NOT NULL ORDER BY id ASC"
-        ).fetchall()
-        # chain 開始後の総行数。hashed 行数と一致しなければ NULL-hash 偽行の注入。
-        total_after_start = None
-        if head and head["chain_start_id"] is not None:
-            total_after_start = c.execute(
-                "SELECT count(*) AS n FROM audit_log WHERE id >= %s", (head["chain_start_id"],)).fetchone()["n"]
 
     def broken(bid, reason):
         return {"ok": False, "checked": checked, "broken_at": bid, "reason": reason}
 
     prev_hash = None
     checked = 0
-    last_id = last_hash = None
-    for r in rows:
-        if r["prev_hash"] != prev_hash:  # 直前行の entry_hash と繋がっているか。
-            return broken(r["id"], "prev_hash_mismatch")
-        expect = _audit_entry_hash(r["prev_hash"], {k: r[k] for k in _AUDIT_CANON_FIELDS})
-        if r["entry_hash"] != expect:  # 行内容の改ざん検出。
-            return broken(r["id"], "entry_hash_mismatch")
-        prev_hash = r["entry_hash"]
-        last_id, last_hash = r["id"], r["entry_hash"]
-        checked += 1
+    first_id = last_id = last_hash = None
+    with _connect() as c:
+        c.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        head = c.execute(
+            "SELECT last_id, last_hash, cnt, chain_start_id FROM audit_chain_head WHERE singleton").fetchone()
+        with c.cursor(name="sherpa_audit_verify") as cur:
+            cur.itersize = _VERIFY_FETCH_SIZE
+            cur.execute(
+                "SELECT id, actor_user_id, action, resource_type, resource_id, detail, outcome, "
+                "  reason, severity, request_id, session_id, ip_hash, user_agent, before_state, "
+                "  after_state, created_at, prev_hash, entry_hash FROM audit_log "
+                "WHERE entry_hash IS NOT NULL ORDER BY id ASC")
+            for r in cur:
+                if r["prev_hash"] != prev_hash:  # 直前行の entry_hash と繋がっているか。
+                    return broken(r["id"], "prev_hash_mismatch")
+                expect = _audit_entry_hash(r["prev_hash"], {k: r[k] for k in _AUDIT_CANON_FIELDS})
+                if r["entry_hash"] != expect:  # 行内容の改ざん検出。
+                    return broken(r["id"], "entry_hash_mismatch")
+                prev_hash = r["entry_hash"]
+                if first_id is None:
+                    first_id = r["id"]
+                last_id, last_hash = r["id"], r["entry_hash"]
+                checked += 1
+        # chain 開始後の総行数。hashed 行数と一致しなければ NULL-hash 偽行の注入。
+        total_after_start = None
+        if head and head["chain_start_id"] is not None:
+            total_after_start = c.execute(
+                "SELECT count(*) AS n FROM audit_log WHERE id >= %s", (head["chain_start_id"],)).fetchone()["n"]
+
     # head アンカー照合。
     if checked > 0 and not head:
         return broken(last_id, "missing_head")  # hashed 行があるのに anchor が無い。
@@ -267,8 +277,8 @@ def verify_audit_chain() -> dict:
                 return broken(head["last_id"], "missing_chain_start")
             if last_id != head["last_id"] or last_hash != head["last_hash"]:
                 return broken(head["last_id"], "head_mismatch")
-            if rows and rows[0]["id"] != head["chain_start_id"]:  # 先頭 hashed 行が chain_start と一致するか。
-                return broken(rows[0]["id"], "chain_start_mismatch")
+            if first_id is not None and first_id != head["chain_start_id"]:  # 先頭 hashed 行が chain_start と一致するか。
+                return broken(first_id, "chain_start_mismatch")
             if total_after_start is not None and total_after_start != head["cnt"]:
                 return broken(head["chain_start_id"], "null_row_injected")  # chain 開始後の NULL 偽行。
     return {"ok": True, "checked": checked, "broken_at": None, "reason": None}

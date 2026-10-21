@@ -1153,50 +1153,71 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     }
 
 
-def usage_export_turns(days: int = 30, *, time_from: str | None = None, time_to: str | None = None) -> list[dict]:
-    """管理者の利用明細エクスポート（ZIP）用: 期間内の回答（assistant 返答）1件=1行の生データ。
+# 利用明細エクスポートが名前付きカーソルで1回に取り寄せる行数（全行をメモリに持たない）。
+_EXPORT_FETCH_SIZE = 2000
+
+
+def usage_export_turns(days: int = 30, *, time_from: str | None = None, time_to: str | None = None):
+    """管理者の利用明細エクスポート（ZIP）用: 期間内の回答（assistant 返答）1件=1行の生データを、会話番号・回答番号の順に少しずつ返すイテレータ。
     母集団・期間境界は `usage_stats()` と同じ（`usage_turns`＝`c.origin='own'`・`deleted_at IS NULL`・境界は質問の `turn_created_at`・1 ターンの最初の返答）。返答の無い user 発言は除く。数字は画面の集計と同じ `turn_metrics` から読む。
     `answer` は数字と閉じた語彙の欄だけを `turn_metrics` から組み直した JSON（本文・出典・主張は DB から読まない）。
+    守ること: 読み切るか `close()` するまで DB 接続を1本使う（呼び出し側は `contextlib.closing` で囲む）。期間の誤りは呼び出し時に `UsagePeriodError` で送出する。
     """
     _ensure()
     start_ts, end_exclusive_ts, _period = _usage_period(days, time_from=time_from, time_to=time_to)
+    return _iter_usage_export_turns(start_ts, end_exclusive_ts)
+
+
+def _iter_usage_export_turns(start_ts, end_exclusive_ts):
     limits_obj = ", ".join(f"'{f}', tm.{f}" for f in _TURN_LIMIT_FIELDS)
     usage_obj = ", ".join(
         f"'{f}', tm.{f}" for f in ("provider", "model") + _TURN_TOKEN_FIELDS)
     with _connect() as c:
         _build_usage_turns(c, start_ts, end_exclusive_ts)
-        rows = c.execute(
-            "SELECT ut.conversation_id, ut.message_id, am.created_at AS message_created_at, "
-            "  ut.user_id AS uid, ut.lens, "
-            "  jsonb_build_object("
-            "    'usage', jsonb_build_object(" + usage_obj + "), "
-            "    'limits', jsonb_build_object(" + limits_obj + "), "
-            "    'activity', tm.activity_json, 'stop_kind', tm.stop_kind, "
-            "    'codex_error_code', tm.codex_error_code, 'duration_ms', tm.duration_ms, "
-            "    'investigation', jsonb_build_object("
-            "      'complete', tm.investigation_complete, "
-            "      'continuations', tm.investigation_continuations, "
-            "      'counts', tm.investigation_counts)) AS answer "
-            "FROM usage_turns ut JOIN turn_metrics tm ON tm.message_id = ut.message_id "
-            "JOIN messages am ON am.id = ut.message_id "
-            "ORDER BY ut.conversation_id, ut.message_id",
-        ).fetchall()
-    return [dict(r) for r in rows]
+        with c.cursor(name="sherpa_usage_export_turns") as cur:
+            cur.itersize = _EXPORT_FETCH_SIZE
+            cur.execute(
+                "SELECT ut.conversation_id, ut.message_id, am.created_at AS message_created_at, "
+                "  ut.user_id AS uid, ut.lens, "
+                "  jsonb_build_object("
+                "    'usage', jsonb_build_object(" + usage_obj + "), "
+                "    'limits', jsonb_build_object(" + limits_obj + "), "
+                "    'activity', tm.activity_json, 'stop_kind', tm.stop_kind, "
+                "    'codex_error_code', tm.codex_error_code, 'duration_ms', tm.duration_ms, "
+                "    'investigation', jsonb_build_object("
+                "      'complete', tm.investigation_complete, "
+                "      'continuations', tm.investigation_continuations, "
+                "      'counts', tm.investigation_counts)) AS answer "
+                "FROM usage_turns ut JOIN turn_metrics tm ON tm.message_id = ut.message_id "
+                "JOIN messages am ON am.id = ut.message_id "
+                "ORDER BY ut.conversation_id, ut.message_id",
+            )
+            for r in cur:
+                yield dict(r)
 
 
 def usage_export_aux_calls(days: int = 30, *, time_from: str | None = None,
-                           time_to: str | None = None) -> list[dict]:
-    """管理者の利用明細エクスポート（ZIP）用: 期間内の `usage_events`（査読の巡別記録を含む）1件=1行の生データ。会話所属では絞らず、境界はイベント自身の `ts` のみ。`world` 列は取り込みフォルダの名前になり得るため選ばない。"""
+                           time_to: str | None = None):
+    """管理者の利用明細エクスポート（ZIP）用: 期間内の `usage_events`（査読の巡別記録を含む）1件=1行の生データを `ts` 順に少しずつ返すイテレータ。会話所属では絞らず、境界はイベント自身の `ts` のみ。`world` 列は取り込みフォルダの名前になり得るため選ばない。
+    守ること: 読み切るか `close()` するまで DB 接続を1本使う。期間の誤りは呼び出し時に `UsagePeriodError` で送出する。
+    """
     _ensure()
     start_ts, end_exclusive_ts, _period = _usage_period(days, time_from=time_from, time_to=time_to)
+    return _iter_usage_export_aux_calls(start_ts, end_exclusive_ts)
+
+
+def _iter_usage_export_aux_calls(start_ts, end_exclusive_ts):
     with _connect() as c:
-        rows = c.execute(
-            "SELECT ts, kind, provider, model, input_tokens, cached_input_tokens, cache_write_tokens, "
-            "  output_tokens, reasoning_output_tokens, calls, elapsed_ms, user_id AS uid, conversation_id "
-            "FROM usage_events WHERE ts >= %s AND ts < %s ORDER BY ts",
-            (start_ts, end_exclusive_ts),
-        ).fetchall()
-    return [dict(r) for r in rows]
+        with c.cursor(name="sherpa_usage_export_aux") as cur:
+            cur.itersize = _EXPORT_FETCH_SIZE
+            cur.execute(
+                "SELECT ts, kind, provider, model, input_tokens, cached_input_tokens, cache_write_tokens, "
+                "  output_tokens, reasoning_output_tokens, calls, elapsed_ms, user_id AS uid, conversation_id "
+                "FROM usage_events WHERE ts >= %s AND ts < %s ORDER BY ts",
+                (start_ts, end_exclusive_ts),
+            )
+            for r in cur:
+                yield dict(r)
 
 
 # 品質採点の入口。ここは採点結果の集計済みカウントだけを受け取って積む/読む（質問文・回答本文は持たない）。

@@ -2052,6 +2052,35 @@ def count(world: str, idx: str | None = None) -> int | None:
         return None
 
 
+def store_bytes(world: str) -> int | None:
+    """この資料フォルダの索引（世代の物理索引を含む）が ES のディスクに占める大きさ（バイト）。取得失敗は None。"""
+    names = _concrete_indices(world)
+    if names is None:
+        return None
+    if not names:
+        return 0
+    try:
+        rows = _req("GET", f"/_cat/indices/{','.join(names)}?format=json&bytes=b&h=index,pri.store.size")
+        return sum(int(r.get("pri.store.size") or 0) for r in rows)
+    except Exception:
+        return None
+
+
+def fs_stats() -> dict | None:
+    """ES がデータを置いているファイルシステムの `{"total": バイト, "free": バイト}`（ES 自身の報告・複数ノードは最小の空き）。取得失敗は None。"""
+    try:
+        res = _req("GET", "/_nodes/stats/fs", timeout=_AVAILABLE_TIMEOUT * 3)
+        best = None
+        for node in (res.get("nodes") or {}).values():
+            tot = ((node.get("fs") or {}).get("total") or {})
+            t, f = int(tot["total_in_bytes"]), int(tot["available_in_bytes"])
+            if best is None or f < best["free"]:
+                best = {"total": t, "free": f}
+        return best
+    except Exception:
+        return None
+
+
 _SCROLL_PAGE = 1000
 
 

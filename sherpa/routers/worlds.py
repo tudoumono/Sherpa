@@ -1,6 +1,6 @@
 """資料フォルダ(World)管理エンドポイント。3 つの router から成る:
 - `ingest_preview_router`: `GET /ingest/preview`
-- `worlds_router`: `GET /world-options`・`GET /fs/list`・`GET /worlds`・`GET /worlds/{wid}/status`・`POST /worlds/{wid}/recount`・`POST /worlds`・`POST /worlds/diff`・`POST /worlds/{wid}/rebind`・`POST /worlds/{wid}/refresh`・`POST /worlds/{wid}/reconvert`・`POST /worlds/{wid}/rag_regenerate_rules`・`GET`/`PUT /worlds/{wid}/resolve-settings`・`DELETE /worlds/{wid}`
+- `worlds_router`: `GET /world-options`・`GET /fs/list`・`GET /worlds`・`GET /worlds/{wid}/status`・`POST /worlds/{wid}/recount`・`POST /worlds`・`POST /worlds/diff`・`POST /worlds/disk-estimate`・`POST /worlds/{wid}/rebind`・`POST /worlds/{wid}/refresh`・`POST /worlds/{wid}/reconvert`・`POST /worlds/{wid}/rag_regenerate_rules`・`GET`/`PUT /worlds/{wid}/resolve-settings`・`DELETE /worlds/{wid}`
 - `ingest_runs_router`: `POST /ingest/rerun`・`GET /ingest/runs`・`GET /ingest/workers`
 api.py が元の位置にそれぞれ `app.include_router(...)` する（ルート表 golden の定義順を保つため）。`_browse_roots`/`_under_roots` は `sherpa.deps` にある。
 モジュール名が `sherpa/worlds.py` と衝突するため、api.py 側は `from sherpa.routers import worlds as worlds_routes` と別名で import する。
@@ -20,7 +20,7 @@ import psycopg
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
-from sherpa import corpus_docs, doc_ledger, store, world_admin_service, worlds
+from sherpa import corpus_docs, disk_estimate, doc_ledger, store, world_admin_service, worlds
 from sherpa.deps import (
     _WORLD_PATTERN,
     _WorldField,
@@ -162,6 +162,11 @@ class ResolveSettingsReq(BaseModel):
 
 class DiffReq(BaseModel):
     path: str  # 差分チェック対象フォルダ（登録しない・読み取り専用）。
+
+
+class DiskEstimateReq(BaseModel):
+    path: str | None = None  # 登録前のフォルダ（フォルダ選択で得た WSL パス）。
+    world_id: str | None = None  # 登録済みの資料フォルダの更新前の見積もり。
 
 
 class ReconvertReq(BaseModel):
@@ -611,6 +616,8 @@ def world_create(req: WorldReq, request: Request):
     # `world_id=wid`（受付時に確定した値）・`root=root`（canonical・再解決しない）を渡し、受付応答の判断に使った値と実際に登録される値を一致させる。
     run_id, joined = _dispatch(wid, "register", fp, {"path": req.path, "label": req.label, "root": root},
                                extra_registry_keys=extra_registry_keys)
+    if not joined:
+        disk_estimate.log_start("register", root, wid if existing else None)
     return {"ok": True, "world_id": wid, "run_id": run_id, "joined": joined,
             "note": "既存の取り込みに合流しました。" if joined
                     else "受け付けました。状況は取り込み状況でご確認ください。"}
@@ -624,6 +631,32 @@ def world_diff_path(req: DiffReq, request: Request):
         return {"ok": True, **world_admin_service.diff_path(req.path)}
     except world_admin_service.WorldAdminError as exc:
         raise _world_admin_http_error(exc) from exc
+
+
+@worlds_router.post("/worlds/disk-estimate", tags=["資料フォルダ(World)管理"])
+def world_disk_estimate(req: DiskEstimateReq, request: Request):
+    """登録・更新を始める前の、ディスクの必要量と空きの見積もり（読み取り専用・警告のためだけで取り込みは止めない）。
+    原本を数えるのは背景で行い、数え中は `state="counting"`（`scanned`＝数えた件数）を返す。画面は同じ依頼を数秒おきに繰り返して結果（`state="ready"`）を取りに来る。
+    `world_id` があれば登録済みの資料フォルダの更新前、無ければ `path` のフォルダの登録前（登録済みのフォルダなら更新前として扱う）。
+    設計: docs/design/operations.md「取り込み前のディスク容量の見積もり」
+    """
+    _require_admin(_current_user(request))
+    wid = req.world_id
+    if wid:
+        if not valid_world(wid):
+            raise HTTPException(422, "不正な識別子")
+        row = store.get_world(wid)
+        if not row:
+            raise HTTPException(404, "資料フォルダが見つかりません")
+        root = row["root_path"]
+    else:
+        try:
+            root = world_admin_service.resolve_root(req.path or "")
+        except world_admin_service.WorldAdminError as exc:
+            raise _world_admin_http_error(exc) from exc
+        existing = store.world_by_root(root)
+        wid = existing["world_id"] if existing else None
+    return disk_estimate.request_estimate(root, wid)
 
 
 def _resolve_settings_payload(wid: str, settings: dict, *, changed: bool, note: str) -> dict:
@@ -745,11 +778,14 @@ def world_rebind(wid: str, req: RebindReq, request: Request):
 def world_refresh(wid: str, request: Request):
     """「今すぐ取り込み直す」を即受付する（背景実行）。変更があったときだけ再取り込みする（変更検知・即反映）。多重クリックは既存 run へ合流する。"""
     _require_admin(_current_user(request))
-    if not store.get_world(wid):
+    row = store.get_world(wid)
+    if not row:
         raise HTTPException(404, "資料フォルダが見つかりません")
 
     fp = _fingerprint({})
     run_id, joined = _dispatch(wid, "refresh", fp)
+    if not joined:
+        disk_estimate.log_start("refresh", row["root_path"], wid)
     return {"ok": True, "world_id": wid, "run_id": run_id, "joined": joined,
             "note": "既存の更新に合流しました。" if joined
                     else "受け付けました。状況は取り込み状況でご確認ください。"}

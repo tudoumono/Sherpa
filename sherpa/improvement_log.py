@@ -257,30 +257,50 @@ def _has_more_clean_rows(time_from, cursor_id) -> bool:
             return False
 
 
-def fetch_export_rows(*, time_from, output_cap: int) -> tuple[list[dict], bool]:
-    """`time_from` 以降の改善ログ対象メッセージを新しい順（id 降順）に取得する。
+class ExportScan:
+    """`time_from` 以降の改善ログ対象メッセージを新しい順（id 降順）に、1ページ分ずつ返す走査。
 
-    `store.list_export_messages` をキーセット方式でページングし、個人情報由来の行を除外する。`output_cap` に達したら、
-    除外後も後続候補が残っているかを `_has_more_clean_rows` で確認して打ち切り、`(rows, truncated)` の `truncated` で明示する。
+    `store.list_export_messages` をキーセット方式でページングし、個人情報由来の行を除外する。`batches()` を読み切ったあとの `truncated` は、
+    `output_cap` に達し、除外後も後続候補が残っているか（`_has_more_clean_rows`）を表す。全行をメモリに持たないための入口で、`fetch_export_rows` はこれを束ねた一括版。
     """
-    from sherpa import store
 
-    rows: list[dict] = []
-    cursor_id = None
-    while True:
-        batch = store.list_export_messages(time_from=time_from, cursor_id=cursor_id,
-                                           limit=_EXPORT_PAGE)
-        if not batch:
-            return rows, False
-        for r in batch:
-            if is_export_row_personal_tainted(r):
-                continue
-            rows.append(r)
-            if len(rows) >= output_cap:
-                return rows[:output_cap], _has_more_clean_rows(time_from, r["id"])
-        cursor_id = batch[-1]["id"]
-        if len(batch) < _EXPORT_PAGE:
-            return rows, False
+    def __init__(self, *, time_from, output_cap: int):
+        self._time_from = time_from
+        self._output_cap = output_cap
+        self.truncated = False
+
+    def batches(self):
+        from sherpa import store
+
+        total = 0
+        cursor_id = None
+        while True:
+            batch = store.list_export_messages(time_from=self._time_from, cursor_id=cursor_id,
+                                               limit=_EXPORT_PAGE)
+            if not batch:
+                return
+            clean: list[dict] = []
+            for r in batch:
+                if is_export_row_personal_tainted(r):
+                    continue
+                clean.append(r)
+                total += 1
+                if total >= self._output_cap:
+                    yield clean
+                    self.truncated = _has_more_clean_rows(self._time_from, r["id"])
+                    return
+            if clean:
+                yield clean
+            cursor_id = batch[-1]["id"]
+            if len(batch) < _EXPORT_PAGE:
+                return
+
+
+def fetch_export_rows(*, time_from, output_cap: int) -> tuple[list[dict], bool]:
+    """`ExportScan` を読み切って `(rows, truncated)` を返す一括版。`truncated` は `output_cap` に達したうえで後続候補が残るとき True。"""
+    scan = ExportScan(time_from=time_from, output_cap=output_cap)
+    rows = [r for batch in scan.batches() for r in batch]
+    return rows, scan.truncated
 
 
 

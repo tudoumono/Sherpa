@@ -735,14 +735,20 @@ _SCHEMA_LOCK_KEY = int.from_bytes(hashlib.sha1(f"schema:{_KB_ID}".encode("utf-8"
 # 索引構築専用の鍵は pg_advisory_lock の 2 引数形（class_id, key）を使う。1 引数形は world_lock 等の `sha1` 由来の鍵と同じ 64bit 空間を共有して衝突しうるため、別名前空間の固定の整数ペアにする（`tests/integration/test_schema_init_r5.py` の衝突なしテストで固定）。
 _CREATED_AT_INDEX_LOCK_CLASSID = 0x50455246  # "PERF" の ASCII 値由来の固定クラス ID。
 _CREATED_AT_INDEX_LOCK_KEY = 1
+_AUDIT_ASSISTANT_MSG_INDEX_LOCK_KEY = 2
+
+# 評価・改善ログが `chat.turn` 監査の `message_id_assistant` で回答の質問側を引く（`list_feedback_turns`/`list_export_messages` の LATERAL）ための部分の式索引。`_SCHEMA` に含めない理由は上と同じ。
+_AUDIT_ASSISTANT_MSG_INDEX = "idx_audit_chat_turn_assistant_msg"
+_AUDIT_ASSISTANT_MSG_INDEXDEF_FRAGMENT = "message_id_assistant"
 
 
-def ensure_messages_created_at_index() -> None:
-    """`idx_messages_created_at` を CONCURRENTLY で作成する（別 autocommit 接続・非ブロッキング）。単一 worker 前提。
+def _ensure_concurrent_index(name: str, create_sql: str, indexdef_fragment: str, lock_key: int,
+                             purpose: str) -> None:
+    """大きな既存表の索引 `name` を CONCURRENTLY で作成する（別 autocommit 接続・非ブロッキング）。単一 worker 前提。
     次の 2 段の advisory lock を掛ける:
     ① `_SCHEMA_LOCK_KEY`（schema 初期化と同じ鍵）を取得→即解放して、他プロセスの `init_schema()` の DDL 完了まで待つ。
-    ② `_CREATED_AT_INDEX_LOCK_CLASSID`/`_CREATED_AT_INDEX_LOCK_KEY`（2 引数形）を `pg_try_advisory_lock` で取得できたときだけ検査・修復・作成を行う。取れなければ他プロセスが処理中とみなして警告ログを残して return する（`indisvalid=false` は構築中の正常な中間状態でもあり、ロック無しで DROP すると構築中の索引を壊しうる）。
-    CONCURRENTLY は構築失敗時に INVALID な索引が残りうるため、ロック保持下で `pg_index.indisvalid` を確認し、INVALID なら `DROP INDEX CONCURRENTLY` してから作り直す（冪等）。DB 不達等の例外はログのみで握る（索引が無くても集計結果は変わらず性能にだけ影響する）。
+    ② `_CREATED_AT_INDEX_LOCK_CLASSID`/`lock_key`（2 引数形）を `pg_try_advisory_lock` で取得できたときだけ検査・修復・作成を行う。取れなければ他プロセスが処理中とみなして警告ログを残して return する（`indisvalid=false` は構築中の正常な中間状態でもあり、ロック無しで DROP すると構築中の索引を壊しうる）。
+    CONCURRENTLY は構築失敗時に INVALID な索引が残りうるため、ロック保持下で `pg_index.indisvalid` を確認し、INVALID なら `DROP INDEX CONCURRENTLY` してから作り直す（冪等）。同名で定義が `indexdef_fragment` を含まない有効な索引は壊さず警告のみ。DB 不達等の例外はログのみで握る（索引が無くても結果は変わらず `purpose` の性能にだけ影響する）。
     """
     conn = None
     try:
@@ -759,63 +765,81 @@ def ensure_messages_created_at_index() -> None:
 
         got_lock = conn.execute(
             "SELECT pg_try_advisory_lock(%s, %s) AS got",
-            (_CREATED_AT_INDEX_LOCK_CLASSID, _CREATED_AT_INDEX_LOCK_KEY),
+            (_CREATED_AT_INDEX_LOCK_CLASSID, lock_key),
         ).fetchone()["got"]
         if not got_lock:
             # 他プロセスが処理中（正常な CONCURRENTLY 構築中を含む）。何もせず次回の init_schema() での再試行に委ねる。
             _log.warning("%s の作成をスキップしました（他プロセスが処理中のため advisory lock を"
-                        "取得できず）。次回起動時に再試行します。", _MESSAGES_CREATED_AT_INDEX)
+                        "取得できず）。次回起動時に再試行します。", name)
             return
         try:
             row = conn.execute(
                 "SELECT i.indisvalid, pg_get_indexdef(c.oid) AS indexdef "
                 "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
                 "WHERE c.relname = %s",
-                (_MESSAGES_CREATED_AT_INDEX,),
+                (name,),
             ).fetchone()
             if row is not None and not row["indisvalid"]:
-                conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {_MESSAGES_CREATED_AT_INDEX}")
+                conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
                 row = None
             if row is not None:
-                # 有効な同名索引が既にある。定義が想定（messages(created_at)）と異なる場合は、別索引を壊さないよう DROP/CREATE せず警告ログのみ残す。
-                if _MESSAGES_CREATED_AT_INDEXDEF_FRAGMENT not in (row["indexdef"] or ""):
+                # 有効な同名索引が既にある。定義が想定と異なる場合は、別索引を壊さないよう DROP/CREATE せず警告ログのみ残す。
+                if indexdef_fragment not in (row["indexdef"] or ""):
                     _log.warning(
                         "%s という名前の索引が既に存在しますが、想定の定義（%s を含む）と"
                         "異なります（現在の定義: %s）。誤って別目的の索引を壊さないよう "
                         "DROP/CREATE をスキップしました。運用者による確認が必要です。",
-                        _MESSAGES_CREATED_AT_INDEX, _MESSAGES_CREATED_AT_INDEXDEF_FRAGMENT,
-                        row["indexdef"],
+                        name, indexdef_fragment, row["indexdef"],
                     )
                 return
-            conn.execute(
-                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {_MESSAGES_CREATED_AT_INDEX} "
-                "ON messages (created_at)"
-            )
+            conn.execute(create_sql)
         finally:
             try:
                 conn.execute("SELECT pg_advisory_unlock(%s, %s)",
-                            (_CREATED_AT_INDEX_LOCK_CLASSID, _CREATED_AT_INDEX_LOCK_KEY))
+                            (_CREATED_AT_INDEX_LOCK_CLASSID, lock_key))
             except Exception:
                 pass
     except Exception as e:
-        _log.warning("%s の作成に失敗しました（usage_stats の性能にのみ影響・次回起動時に"
-                    "再試行します）: %s", _MESSAGES_CREATED_AT_INDEX, e)
+        _log.warning("%s の作成に失敗しました（%s の性能にのみ影響・次回起動時に"
+                    "再試行します）: %s", name, purpose, e)
     finally:
         if conn is not None:
             conn.close()
 
 
+def ensure_messages_created_at_index() -> None:
+    """`idx_messages_created_at` を作成する（手順は `_ensure_concurrent_index`）。"""
+    _ensure_concurrent_index(
+        _MESSAGES_CREATED_AT_INDEX,
+        f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {_MESSAGES_CREATED_AT_INDEX} ON messages (created_at)",
+        _MESSAGES_CREATED_AT_INDEXDEF_FRAGMENT, _CREATED_AT_INDEX_LOCK_KEY, "usage_stats")
+
+
+def ensure_audit_assistant_message_index() -> None:
+    """`idx_audit_chat_turn_assistant_msg` を作成する（手順は `_ensure_concurrent_index`）。"""
+    _ensure_concurrent_index(
+        _AUDIT_ASSISTANT_MSG_INDEX,
+        f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {_AUDIT_ASSISTANT_MSG_INDEX} "
+        "ON audit_log (((detail->>'message_id_assistant')::integer), id) WHERE action = 'chat.turn'",
+        _AUDIT_ASSISTANT_MSG_INDEXDEF_FRAGMENT, _AUDIT_ASSISTANT_MSG_INDEX_LOCK_KEY,
+        "評価・改善ログの質問との対応付け")
+
+
 _created_at_index_thread_started = False
+_audit_index_thread_started = False
 
 
 def _ensure_messages_created_at_index_background() -> None:
-    """`ensure_messages_created_at_index()` を daemon スレッドで一度だけ起動する（プロセス生存期間で 1 回）。"""
-    global _created_at_index_thread_started
-    if _created_at_index_thread_started:
-        return
-    _created_at_index_thread_started = True
-    threading.Thread(target=ensure_messages_created_at_index, daemon=True,
-                     name="sherpa-idx-messages-created-at").start()
+    """大きな既存表の索引（`ensure_messages_created_at_index()`・`ensure_audit_assistant_message_index()`）を、それぞれ daemon スレッドで一度だけ起動する（プロセス生存期間で 1 回）。"""
+    global _created_at_index_thread_started, _audit_index_thread_started
+    if not _created_at_index_thread_started:
+        _created_at_index_thread_started = True
+        threading.Thread(target=ensure_messages_created_at_index, daemon=True,
+                         name="sherpa-idx-messages-created-at").start()
+    if not _audit_index_thread_started:
+        _audit_index_thread_started = True
+        threading.Thread(target=ensure_audit_assistant_message_index, daemon=True,
+                         name="sherpa-idx-audit-assistant-msg").start()
 
 
 # コード側スキーマの内容ハッシュ（`schema_version` スタンプ用・記録専用）。`tests/unit/test_store_surface.py` の golden 算出式（sha256("\n".join(_SCHEMA))）と同一。

@@ -101,6 +101,66 @@ async function saveResolveSettings() {
 }
 $('rs-save').addEventListener('click', saveResolveSettings);
 
+// ---- 取り込み前のディスク容量の見積もり（警告だけ。足りなくても「それでも始める」で進める）----
+// 見積もりは背景で数えるので、同じ依頼を繰り返して結果を取りに来る。十分なら確認なしでそのまま始め、警告があるときだけ利用者に確かめる。
+// 見積もりの失敗・応答なしは取り込みを妨げない（そのまま始める）。
+const _DISK_POLL_MS = 1500, _DISK_SKIP_AFTER_MS = 5000;
+let _diskBusy = false;
+function confirmDiskSpace(box, body) {
+  if (_diskBusy) return Promise.resolve(false);
+  _diskBusy = true;
+  return new Promise((resolve) => {
+    let done = false, timer = null;
+    const t0 = Date.now();
+    const finish = (go) => { if (done) return; done = true; clearTimeout(timer); _diskBusy = false; resolve(go); };
+    const actions = (items) => {
+      const el = document.createElement('div');
+      el.className = 'dact';
+      items.forEach(([label, cls, go]) => {
+        const b = document.createElement('button');
+        b.className = cls; b.textContent = label;
+        b.addEventListener('click', () => { if (!go) box.hidden = true; finish(go); });
+        el.appendChild(b);
+      });
+      box.appendChild(el);
+    };
+    const counting = (d) => {
+      const waited = Date.now() - t0 >= _DISK_SKIP_AFTER_MS;
+      box.hidden = false; box.className = 'diskbox';
+      box.innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span>'
+        + `<span>取り込みに必要なディスクの空きを確かめています...${d.scanned ? `（${esc(d.scanned)} 件を数えました）` : ''}</span></span>`;
+      actions(waited ? [['待たずに始める', 'btn-ghost mini', true], ['やめる', 'btn-ghost mini', false]]
+                     : [['やめる', 'btn-ghost mini', false]]);
+    };
+    const result = (d) => {
+      const warn = d.status === 'short' || d.status === 'tight';
+      box.hidden = false; box.className = 'diskbox' + (d.status === 'short' ? ' short' : warn ? ' warn' : '');
+      const lines = (d.lines || []).map((l) => `<div class="dline ${esc(l.status)}">${esc(l.text)}</div>`).join('');
+      if (d.unchanged) {
+        box.innerHTML = '<div class="dline">変更されたファイルは見つかりませんでした（追加のディスクはほぼ要りません）</div>';
+      } else {
+        const head = `<div class="dline">${esc(d.files)} 件を取り込む見込みです${d.changed_files != null ? `（うち変更・追加 ${esc(d.changed_files)} 件）` : ''}</div>`;
+        const tail = warn ? '<div class="dline">このまま始めると、途中でディスクが足りなくなって止まるおそれがあります。空きを増やしてからの取り込みをおすすめします。</div>' : '';
+        const valve = '<div class="dline">取り込み中に全文検索や検索用データの置き場の空きが10GBを切ると、安全のため取り込みを途中で止めます。</div>';
+        box.innerHTML = head + lines + tail + valve;
+      }
+      if (warn) { actions([['それでも始める', 'btn-primary mini', true], ['やめる', 'btn-ghost mini', false]]); return; }
+      finish(true);
+    };
+    const poll = async () => {
+      if (done) return;
+      let d;
+      try { d = await api('POST', '/worlds/disk-estimate', body, { timeoutMs: 10000 }); }
+      catch (e) { box.hidden = true; return finish(true); }
+      if (done) return;
+      if (d.state === 'counting') { counting(d); timer = setTimeout(poll, _DISK_POLL_MS); return; }
+      if (d.state === 'failed') { box.hidden = false; box.className = 'diskbox'; box.textContent = d.message || ''; return finish(true); }
+      result(d);
+    };
+    poll();
+  });
+}
+
 // ---- 追加 ----
 let _chosen = null;            // 追加フォーム用に選んだフォルダ path
 function setChosen(p) {
@@ -116,6 +176,7 @@ async function register() {
   if (!_chosen) return;
   const path = _chosen, label = $('label').value.trim();
   $('regmsg').textContent = ''; $('regbtn').disabled = true; $('diffout').innerHTML = '';
+  if (!await confirmDiskSpace($('regdisk'), { path })) { $('regbtn').disabled = !_chosen; return; }
   try {
     // 登録は即受付・取り込みは背景で継続する（`run_id`/`joined` のみ返る）。完了状況は下段（取り込み状況）の行が数秒間隔でポーリングして表示する（`loadStat` 参照）。
     const res = await api('POST', '/worlds', { path, label: label || null });
@@ -524,6 +585,8 @@ async function removeWorld(world_id) {
 
 // ---- 今すぐ更新（変更検知して再取り込み）----
 async function refresh(world_id) {
+  $('listmsg').innerHTML = '';
+  if (!await confirmDiskSpace($('listdisk'), { world_id })) return;
   $('listmsg').innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>更新を受け付けています...</span></span>';
   try {
     // 更新は即受付・再取り込みは背景で継続する。進捗・完了は行のポーリング（loadStat）が示す。

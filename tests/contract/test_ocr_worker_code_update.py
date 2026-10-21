@@ -108,3 +108,86 @@ def test_overlay_platform_follows_base_image_architecture(tmp_path):
 
 def test_ocr_worker_runs_as_amd64_via_version_compose():
     assert "platform: linux/amd64" in _read("docker/ocr/compose.version.yml")
+
+
+def _run_stale_arch(tmp_path: Path, *, pull_ok: bool, build_ok: bool):
+    """arm64 の古い OCR イメージがある状態で ocr-up.sh を流す。偽の docker の呼び出し行と終了コードを返す。"""
+    import os
+    import subprocess
+
+    log = tmp_path / "docker.log"
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "plat").write_text("linux/arm64", encoding="utf-8")
+    (state / "id").write_text("sha256:" + "a" * 64, encoding="utf-8")
+    fake = tmp_path / "bin" / "docker"
+    fake.parent.mkdir()
+    fake.write_text(
+        "#!/bin/sh\n"
+        'echo "ARGS $*" >> "$FAKE_DOCKER_LOG"\n'
+        'S="$FAKE_STATE"\n'
+        'case "$1" in\n'
+        "  pull) [ \"$FAKE_PULL_OK\" = 1 ] && touch \"$S/base\" && exit 0; exit 1 ;;\n"
+        "  compose)\n"
+        '    case " $* " in *" build "*)\n'
+        '      [ "$FAKE_BUILD_OK" = 1 ] || exit 1\n'
+        '      echo linux/amd64 > "$S/plat"; echo "sha256:$(printf b%.0s $(seq 64))" > "$S/id" ;;\n'
+        "    esac; exit 0 ;;\n"
+        "  image)\n"
+        '    case "$*" in\n'
+        "      *python:3.12-slim-bookworm*)\n"
+        '        [ -f "$S/base" ] || exit 1\n'
+        '        case "$*" in *Architecture*) echo linux/amd64 ;; esac; exit 0 ;;\n'
+        '      *"{{.Id}}"*) tr -d "\\n" < "$S/id"; echo; exit 0 ;;\n'
+        '      *Architecture*) tr -d "\\n" < "$S/plat"; echo; exit 0 ;;\n'
+        "    esac; exit 0 ;;\n"
+        "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    (tmp_path / "models" / "official_models").mkdir(parents=True)
+    (tmp_path / "world").mkdir()
+    env = {
+        **os.environ,
+        "PATH": f"{fake.parent}:{os.environ['PATH']}",
+        "FAKE_DOCKER_LOG": str(log),
+        "FAKE_STATE": str(state),
+        "FAKE_PULL_OK": "1" if pull_ok else "0",
+        "FAKE_BUILD_OK": "1" if build_ok else "0",
+        "SHERPA_OCR_MODEL_CACHE": str(tmp_path / "models"),
+        "SHERPA_OCR_WORLD_ROOT": str(tmp_path / "world"),
+        "SHERPA_OBSERVATION_DIR": str(tmp_path / "obs"),
+        "SHERPA_OCR_ENABLED": "1",
+    }
+    r = subprocess.run(["bash", str(ROOT / "scripts/ocr-up.sh")], env=env, capture_output=True, text=True)
+    lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return lines, r
+
+
+def test_stale_arch_image_is_rebuilt_then_old_image_removed(tmp_path):
+    lines, r = _run_stale_arch(tmp_path, pull_ok=True, build_ok=True)
+    assert r.returncode == 0, r.stderr
+    build = next(i for i, ln in enumerate(lines) if ln.startswith("ARGS compose") and " build " in ln + " ")
+    rmi = [i for i, ln in enumerate(lines) if ln.startswith("ARGS rmi")]
+    assert len(rmi) == 1 and rmi[0] > build and "sha256:" + "a" * 64 in lines[rmi[0]]
+    assert not any(ln.startswith("ARGS build ") for ln in lines)
+    assert "aaaaaaaaaaaa" in r.stdout and "古いイメージを消しました" in r.stdout
+
+
+def test_stale_arch_image_untouched_when_base_image_unavailable(tmp_path):
+    lines, r = _run_stale_arch(tmp_path, pull_ok=False, build_ok=True)
+    assert r.returncode == 1 and "オンライン" in r.stderr
+    assert not any(ln.startswith("ARGS rmi") for ln in lines)
+    assert not any(ln.startswith("ARGS compose") for ln in lines)
+
+
+def test_stale_arch_image_kept_when_rebuild_fails(tmp_path):
+    lines, r = _run_stale_arch(tmp_path, pull_ok=True, build_ok=False)
+    assert r.returncode == 1 and "古いイメージはそのまま残しています" in r.stderr
+    assert not any(ln.startswith("ARGS rmi") for ln in lines)
+
+
+def test_matching_arch_keeps_existing_flow_without_removal(tmp_path):
+    lines = _run_overlay_with_fake_docker(tmp_path, "linux/amd64")
+    assert not any(ln.startswith(("ARGS rmi", "ARGS pull")) for ln in lines)
