@@ -122,6 +122,7 @@ let _codexSessionRetentionDaysBaseline = '';
 // 素の Codex モード。configured を基準にする（''=未設定＝「標準」）。
 let _codexModeBaseline = '';
 let _embedParallelBaseline = '';   // 埋め込みの同時送信数
+let _embedDimBaseline = '';   // 意味検索の細かさ（''=既定）
 let _embedProviderBaseline = '';   // 埋め込みの接続先（''=回答と同じクラウド・既定）
 
 // 同時実行の上限（effective_limits）。_DEPTH_BASE_FIELDS と同型（GET は view.chat_max_turns.<view>・PUT は body.<put>）。
@@ -1244,6 +1245,19 @@ function renderResearchTab(view) {
   $('embed-parallel-hint').textContent = parallel.configured == null
     ? `未設定です（既定 ${parallel.effective} 件が適用されます）。`
     : `この値で固定中です（既定: ${parallel.default} 件）。`;
+  const dim = view.embed_dim || {};
+  _embedDimBaseline = dim.configured == null ? '' : String(dim.configured);
+  $('embed-dim').value = _embedDimBaseline;
+  $('embed-dim').min = dim.min || 64;
+  $('embed-dim').max = dim.max || 4096;
+  $('embed-dim').disabled = dim.applies === false;
+  $('embed-dim-hint').textContent = dim.applies === false
+    ? 'ローカル（Ollama）で埋め込む間は、この設定は使われません（モデルごとの値になります）。'
+    : dim.configured == null
+      ? `未設定です（${dim.default} が適用されます。これまでと同じ値です）。`
+      : dim.configured !== dim.effective
+        ? `この値はモデルが対応する値より大きいため、${dim.effective} が適用されます。`
+        : `この値で固定中です（空欄のときは ${dim.default}）。`;
 }
 
 // 素の Codex モード。depth-base-codex-reasoning と同型（空選択肢=未設定=「標準」）。
@@ -1288,6 +1302,10 @@ function codexSessionRetentionDaysChanged() {
 
 function embedParallelChanged() {
   return $('embed-parallel').value.trim() !== _embedParallelBaseline;
+}
+
+function embedDimChanged() {
+  return $('embed-dim').value.trim() !== _embedDimBaseline;
 }
 
 // 調べる深さの基準値（標準時の値）。表示上は適用先ごとに分け、保存済みのキーを引き継ぐ。
@@ -1757,6 +1775,9 @@ async function save() {
   if (embedParallelChanged()) {
     body.embed_parallel = embedParallel.value === '' ? null : Number(embedParallel.value);
   }
+  if (embedDimChanged()) {
+    body.embed_dim = $('embed-dim').value === '' ? null : Number($('embed-dim').value);
+  }
   collectChatMaxTurns(body);   // 同時実行の上限（変わった項目だけ送る）
   collectWorkspace(body);   // 個人ファイルの上限・保持日数（変わった項目だけ送る）
   if (chatExamplesChanged()) body.chat_examples = collectChatExamples();   // チャットの質問例
@@ -1861,6 +1882,7 @@ async function resetResearchTab() {
   const body = Object.fromEntries(_DEPTH_BASE_FIELDS.map(({ put }) => [put, null]));
   body.depth_base_codex_reasoning = null;
   body.embed_parallel = null;
+  body.embed_dim = null;
   body.max_review_rounds = null;
   body.codex_worker_model = null;
   body.codex_session_retention_days = null;
@@ -2012,7 +2034,7 @@ const TAB_DIRTY = {
   provider: () => cloudChanged() || ollamaAllowlistChanged() || webhookAllowlistChanged()
     || openaiEndpointChanged() || mcEmbedChanged() || embedProviderChanged()
     || chatMaxTurnsChanged() || workspaceChanged() || chatExamplesChanged(),
-  research: () => depthProfileChanged() || embedParallelChanged() || maxReviewRoundsChanged()
+  research: () => depthProfileChanged() || embedParallelChanged() || embedDimChanged() || maxReviewRoundsChanged()
     || codexWorkerModelChanged() || codexSessionRetentionDaysChanged() || agenticBudgetChanged() || codexModeChanged(),
   models: () => mcCatalogChangedExcludingEmbed(),
   ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged(),
@@ -2066,6 +2088,7 @@ function applyConfigChangedHighlights(view) {
   mark($('codex-session-retention-days'),
     view.codex_session_retention_days.effective !== view.codex_session_retention_days.default);
   mark($('embed-parallel'), view.embed_parallel.effective !== view.embed_parallel.default);
+  mark($('embed-dim'), (view.embed_dim || {}).effective !== (view.embed_dim || {}).default);
   const cmt = view.chat_max_turns || {};
   _CHAT_MAX_TURNS_FIELDS.forEach(({ view: vk, id }) => {
     const info = cmt[vk] || {};

@@ -4865,6 +4865,17 @@
             ],
             "title": "Depth Base Troubleshoot Depth"
           },
+          "embed_dim": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embed Dim"
+          },
           "embed_parallel": {
             "anyOf": [
               {

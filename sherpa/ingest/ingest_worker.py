@@ -5,7 +5,9 @@ Web アプリは取り込みを動かさず、`ingest_runs` に queued の依頼
 OS へ返しにくいため、重い処理のたびにプロセスごと捨てて全部戻す）。起動し直すのは見張りのスクリプト
 （`scripts/run-ingest-worker.sh`・systemd の `sherpa-ingest.service`）。
 ① 起動 → ② 持ち主の居ない extracting の run を中断へ格下げ → ③ 中断した取り込みの再開依頼 →
-④ 待機（短い間隔で確認・版の違う依頼しか無ければ waiting_version）→ ⑤ 1 件拾って実行 → LLM 成形の後追い → ⑥ 終了。
+③' 旧形式の埋め込みキャッシュの写し替え（依頼を拾う前。待っている依頼では止めず、停止要求でだけ止める）→
+④ 待機（短い間隔で確認・版の違う依頼しか無ければ waiting_version。依頼が無いあいだは旧形式の埋め込みキャッシュを 1 資料フォルダずつ新形式へ写し替える）→
+⑤ 1 件拾って実行 → LLM 成形の後追い → 埋め込みキャッシュの写し替え → ⑥ 終了。
 停止要求（SIGTERM）は処理中の 1 件の区切りで止まり、次の起動で続きから再開する。
 設計: docs/design/operations.md「取り込みワーカーと版の照合」
 """
@@ -167,6 +169,39 @@ def _run_followups(version: str | None, beat: _Beat) -> None:
             _log.warning("LLM 成形の後追いが失敗しました: world=%s", world, exc_info=True)
 
 
+def _migrate_embed_caches(version: str | None, beat: _Beat, tried: set, *, yield_to_queue: bool = True) -> bool:
+    """旧形式の埋め込みキャッシュを 1 資料フォルダずつ新形式へ写し替える。待っている依頼が来るか（`yield_to_queue`）停止要求が出たら、次の区切りで止める。写し替えた（メモリを返すためプロセスを終える合図）なら True。見送り・失敗は False。"""
+    from .. import embed_cache_migrate
+
+    last_check = [0.0]
+    waiting = [False]
+
+    def _should_stop() -> bool:
+        if _terminate.is_set():
+            return True
+        if not yield_to_queue:
+            return False
+        now = time.monotonic()
+        if now - last_check[0] >= FOLLOWUP_CHECK_SEC:
+            last_check[0] = now
+            try:
+                waiting[0] = store.count_queued_runs(version)[0] > 0
+            except Exception:
+                waiting[0] = False
+        return waiting[0]
+
+    def _on_world(world: str) -> None:
+        tried.add(world)
+        beat.set_state("running", world=world, label="埋め込みキャッシュの写し替え")
+
+    try:
+        results = embed_cache_migrate.migrate_pending(should_stop=_should_stop, skip=tried, on_world=_on_world)
+    except Exception:
+        _log.warning("埋め込みキャッシュの写し替えに失敗しました（古いファイルはそのまま使えます）", exc_info=True)
+        return False
+    return any(r.get("status") in ("migrated", "cleaned") for r in results)
+
+
 def _metafile_pass() -> bool:
     """図全体の描画待ちを進める。実際に描いた（または失敗した）なら True（メモリを返すためプロセスを終える合図）。"""
     from . import metafile_render
@@ -195,12 +230,19 @@ def _wait_and_process(worker_id: str, version: str | None, beat: _Beat) -> bool:
     started = time.monotonic()
     resume_at = started + RESUME_RECHECK_SEC
     meta_at = started + METAFILE_FIRST_DELAY_SEC
+    migrated: set = set()   # このプロセスで写し替えを試した資料フォルダ（見送り・失敗を待機のたびに繰り返さない）
+    # 依頼を拾う前に写し替える（取り込みの間に旧形式のキャッシュへ書き足して膨らませない）。
+    if _migrate_embed_caches(version, beat, migrated, yield_to_queue=False):
+        return True
     while not _terminate.is_set():
         try:
             if process_one(worker_id, version, beat):
                 _run_followups(version, beat)
+                _migrate_embed_caches(version, beat, migrated)
                 return True
             _same, other = store.count_queued_runs(version)
+            if not other and _migrate_embed_caches(version, beat, migrated):
+                return True
             beat.set_state("waiting_version" if other else "idle")
         except Exception:
             _log.warning("取り込みの依頼の確認に失敗しました（DB 不達の可能性・待機を続けます）", exc_info=True)

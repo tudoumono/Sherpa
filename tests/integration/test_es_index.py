@@ -166,7 +166,7 @@ def test_embed_cache_reuse():
     es.worlds.derived_dir = lambda w: pathlib.Path(tmp) / w
     ec = {"provider": "p", "model": "m", "dim": 4}
     w = "embcache_test"
-    db_path = pathlib.Path(tmp) / w / "semantic" / "embed_cache.sqlite3"
+    db_path = pathlib.Path(tmp) / w / "semantic" / es._EMBED_CACHE_F32_NAME
     try:
         # 初回: distinct {a,b}（重複 b は1回だけ）→ 2件 embed・3ベクトル返る
         vecs, reused, embedded = es._embed_cached(w, ["a", "b", "b"], ec)
@@ -234,7 +234,7 @@ def _all_cache_rows(world):
     if conn is None:
         return {}
     try:
-        return dict(conn.execute("SELECT key, vec FROM kv").fetchall())
+        return dict(conn.execute(f"SELECT key, vec FROM {conn.table}").fetchall())
     finally:
         conn.close()
 
@@ -273,7 +273,7 @@ def test_embed_cache_streaming_flush_and_resume():
         vecs, reused, embedded = es._embed_cached(w, ["a", "b", "c", "d"], ec)
         assert (reused, embedded) == (0, 4)
         assert [len(c) for c in calls] == [2, 2]                          # 2件ずつ2バッチで embed が呼ばれた
-        assert vecs == [vec_for(t, 4) for t in ["a", "b", "c", "d"]]      # (d) 順序・値が従来（単発呼び）と同一
+        assert [list(v) for v in vecs] == [vec_for(t, 4) for t in ["a", "b", "c", "d"]]      # (d) 順序・値が従来（単発呼び）と同一
         assert _all_cache_keys(w) == {es._chunk_key(ec, t) for t in "abcd"}   # フラッシュ済み
         # (c) 剪定は呼び出し元が明示的に行う（`index_world` が Pass1 完了後に1回だけ呼ぶのと同じ契約）。
         es._prune_embed_cache(w, {es._chunk_key(ec, "a")})

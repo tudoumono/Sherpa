@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+from array import array
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,9 @@ import pytest
 import _fresh_import as FI   # noqa: E402   # import-time 固定 env 定数の実プロセス検証
 from sherpa import es_index
 from sherpa.ingest import text_kind
+
+
+_F32_013 = array("f", [0.1, 0.2, 0.3]).tolist()   # ES へ送る値は float32 に丸めた数
 
 
 class _Bulk:
@@ -225,7 +229,7 @@ def test_index_world_does_not_send_source(monkeypatch, tmp_path, docs, texts, ex
     r = es_index.index_world("w")
     assert bulk.of(excluded) == []                              # ES に送らない
     assert embed_calls == [[texts[kept]]]                       # 除外側のテキストは embed にも渡さない
-    assert bulk.of(kept) and all(c.get("embedding") == [0.1, 0.2, 0.3] for c in bulk.of(kept))
+    assert bulk.of(kept) and all(c.get("embedding") == _F32_013 for c in bulk.of(kept))
     assert r["indexed"] == 1 and r["vectors"] is True
 
 
@@ -255,7 +259,7 @@ def test_index_world_sends_stage2_text_docs_without_embedding_them(monkeypatch, 
     assert {b["doc_id"] for b in bulk.bodies} == {"data.csv", "note.md"}
     assert bulk.of("data.csv") and all("embedding" not in c for c in bulk.of("data.csv"))
     assert embed_calls == [[texts["note.md"]]]                  # テキスト資料は embed に渡さない
-    assert all(c.get("embedding") == [0.1, 0.2, 0.3] for c in bulk.of("note.md"))
+    assert all(c.get("embedding") == _F32_013 for c in bulk.of("note.md"))
 
 
 def test_index_world_excludes_source_only_world_without_reading_them(monkeypatch):
@@ -400,7 +404,7 @@ def test_index_world_embed_partial_failure_marks_only_the_failed_group_missing(m
     missing = [b for b in bulk.bodies if b.get("vector_status") == "missing"]
     assert len(missing) == r["vectors_missing"] == 3             # 失敗したまとまり（3 件）だけ
     assert all("embedding" not in b for b in missing)
-    assert all(b.get("embedding") == [0.1, 0.2, 0.3] for b in bulk.bodies if b.get("vector_status") != "missing")
+    assert all(b.get("embedding") == _F32_013 for b in bulk.bodies if b.get("vector_status") != "missing")
 
 
 def test_index_world_resumes_embed_cache_across_failed_and_retried_runs(monkeypatch, tmp_path):
@@ -1563,7 +1567,7 @@ def test_embed_cache_write_recreates_corrupt_db_file(monkeypatch, tmp_path):
     assert es_index._embed_cache_lookup_batch(world, ["k1"], 4) == {}      # 読取側は miss 扱いで壊れた本体を消さない
     assert p.read_bytes().startswith(b"this is not")
     es_index._embed_cache_write_batch(world, {"k1": [0.1, 0.2, 0.3, 0.4]})
-    assert es_index._embed_cache_lookup_batch(world, ["k1"], 4) == {"k1": [0.1, 0.2, 0.3, 0.4]}
+    assert es_index._embed_cache_lookup_batch(world, ["k1"], 4) == {"k1": array("f", [0.1, 0.2, 0.3, 0.4])}
 
 
 def test_embed_cache_write_recreates_page_corrupt_db(monkeypatch, tmp_path):
@@ -1576,7 +1580,7 @@ def test_embed_cache_write_recreates_page_corrupt_db(monkeypatch, tmp_path):
     for f in (p.with_name(p.name + "-wal"), p.with_name(p.name + "-shm")):
         f.unlink(missing_ok=True)
     es_index._embed_cache_write_batch(world, {"z1": [0.1] * 1536})
-    assert es_index._embed_cache_lookup_batch(world, ["z1"], 1536) == {"z1": [0.1] * 1536}
+    assert es_index._embed_cache_lookup_batch(world, ["z1"], 1536) == {"z1": array("f", [0.1] * 1536)}
 
 
 def test_prune_embed_cache_tolerates_valid_keys_missing_from_db(monkeypatch, tmp_path):

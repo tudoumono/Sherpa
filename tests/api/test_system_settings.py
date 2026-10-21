@@ -244,6 +244,7 @@ _REJECTED_BODIES = [
     {"depth_base_impact_depth": 100}, {"depth_base_troubleshoot_depth": 0},
     {"depth_base_grep_max_hits": "twelve"}, {"depth_base_grep_max_hits": True},
     *[{"embed_parallel": b} for b in (0, -1, 17, True, "3", 1.5)],
+    *[{"embed_dim": b} for b in (0, 63, 4097, True, "512", 1.5)],
     *[{"max_review_rounds": b} for b in (0, -1, 33, True, "3", 1.5)],
     {"chat_max_turns_per_user": 0}, {"chat_max_turns_per_user": 17},
     {"chat_max_turns_global": 0}, {"chat_max_turns_global": 65},
@@ -337,6 +338,7 @@ _ROUNDTRIPS = [
     ("chat_max_turns_global", 30, ("chat_max_turns", "global"), None),
     ("agentic_budget_per_result", 100_000, ("agentic_budget", "per_result"), None),
     ("embed_parallel", 8, ("embed_parallel",), 4),
+    ("embed_dim", 512, ("embed_dim",), 1536),
     ("max_review_rounds", 3, ("max_review_rounds",), 7),
     ("embed_provider", "ollama", ("embed_provider",), "auto"),
     ("codex_mode", "plain", ("codex_mode",), "standard"),
@@ -1152,3 +1154,10 @@ def test_seed_vlm_ollama_url_from_env_only_when_central_unset(monkeypatch):
     store.set_system_settings("admin-uid", {"ollama_url": "http://central.internal:11434"})
     api_mod._seed_vlm_ollama_url_from_env()
     assert store.get_system_settings()["ollama_url"] == "http://central.internal:11434"
+
+
+def test_embed_dim_larger_than_model_default_is_rounded_down_in_view(admin):
+    r = _put(admin, {"embed_dim": 2048})
+    assert r.status_code == 200, r.text
+    v = r.json()["embed_dim"]
+    assert (v["configured"], v["effective"], v["default"]) == (2048, 1536, 1536)

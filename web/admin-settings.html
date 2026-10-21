@@ -454,6 +454,14 @@
               <div class="hint" id="embed-parallel-hint" style="margin:-8px 0 6px"></div>
               <p class="hint">資料の取り込み時に、埋め込み API へ同時に送るリクエスト数です。大きくすると取り込みが速くなりますが、
                 プロバイダ側の同時実行/レート制限に早く当たることがあります。保存した値は次に開始する取り込みから反映されます。</p>
+              <label class="vlm-field"><span class="vlm-l">意味検索の細かさ</span>
+                <input type="number" id="embed-dim" min="64" max="4096" step="1" placeholder="空欄＝1536" style="max-width:160px">
+              </label>
+              <div class="hint" id="embed-dim-hint" style="margin:-8px 0 6px"></div>
+              <p class="hint">意味検索の細かさです。空欄なら 1536（これまでと同じ値）になります。小さくするとディスクを節約できますが、検索の精度は少し下がることがあります。
+                変えると、全部の資料の意味検索の準備をやり直します（次の取り込みで始まり、時間と利用料がかかります）。
+                モデルが対応する値より大きい値は使えません（その場合はモデルが対応する最大の値になります）。
+                回答用のクラウドが OpenAI のときだけ効きます（Ollama は使うモデルで決まります）。</p>
             </div>
           </div>
           <div class="card sec" id="agentic-budget-card" tabindex="-1">

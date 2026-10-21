@@ -5,6 +5,8 @@ ES への操作・SQLite の埋め込みキャッシュ・停止要求の判定�
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from sherpa import es_index as es
@@ -131,6 +133,157 @@ def test_stop_in_pass2_discards_the_building_index(env, monkeypatch):
         es.index_world(world, content_sig="s2")
     assert es._alias_targets(world) == old and _physicals(world) == old   # 作りかけは消え、古い索引は無傷
     assert _hits(world, "old05") == ["o.md"] and es._index_meta(world)["content_sig"] == "s1"
+
+
+def test_low_space_drops_the_old_index_first_and_search_is_empty_until_the_switch(env, monkeypatch, caplog):
+    world, st = env
+    st["texts"] = {"a.md": "gamma11 本文"}
+    es.index_world(world, content_sig="s1")
+    old = es._alias_targets(world)
+    assert es._store_bytes(old) > 0 and es._es_free_bytes() > 0
+    monkeypatch.setattr(es, "_es_free_bytes", lambda: 1)       # ES の空きが古い索引の 2 倍に満たない
+    st["texts"] = {"c.md": "delta12 新しい"}
+    seen = []
+    orig = es._StreamingBulkSender.send_group
+
+    def spy(self, ids, bodies, vec_by_idx):
+        seen.append((es.search(world, "gamma11", k=5), es.search_knn_only(world, "gamma11", k=5)[0], _physicals(world)))
+        return orig(self, ids, bodies, vec_by_idx)
+
+    monkeypatch.setattr(es._StreamingBulkSender, "send_group", spy)
+    with caplog.at_level("WARNING", logger="sherpa"):
+        r = es.index_world(world, content_sig="s2")
+    assert r["indexed"] == 1 and "error" not in r
+    (bm25, knn, physicals), = seen
+    assert bm25[0] == [] and knn == [] and old[0] not in physicals   # 古い索引は先に消え、検索は空（例外にしない）
+    assert _hits(world, "delta12") == ["c.md"] and es._index_meta(world)["content_sig"] == "s2"
+    assert any("空きが足りない" in m for m in caplog.messages)
+
+
+def test_stop_after_low_space_drop_leaves_no_index_and_the_next_update_rebuilds(env, monkeypatch):
+    world, st = env
+    st["texts"] = {"o.md": "old13"}
+    es.index_world(world, content_sig="s1")
+    monkeypatch.setattr(es, "_es_free_bytes", lambda: 1)
+    st["texts"] = {f"d{i}.md": f"new14 t{i}" for i in range(10)}
+    flag = {"on": False}
+    _stop_when(monkeypatch, flag)
+    orig_ensure = es.ensure_index
+
+    def ensure_then_flag(*a, **k):
+        ok = orig_ensure(*a, **k)
+        flag["on"] = True
+        return ok
+
+    monkeypatch.setattr(es, "ensure_index", ensure_then_flag)
+    with pytest.raises(background.StopRequested):
+        es.index_world(world, content_sig="s2")
+    assert es._concrete_indices(world) == [] and es._alias_targets(world) == []
+    assert es.search(world, "old13", k=5)[0] == [] and es.needs_reindex(world, "s2")
+    monkeypatch.setattr(es, "ensure_index", orig_ensure)
+    flag["on"] = False
+    assert es.index_world(world, content_sig="s2")["indexed"] == 10
+    assert len(_hits(world, "new14")) == 10 and not es.needs_reindex(world, "s2")
+
+
+def test_bulk_progress_log_shows_es_free_space_and_warns_once_when_low(env, monkeypatch, caplog):
+    world, st = env
+    st["texts"] = {f"d{i}.md": f"free15 t{i}" for i in range(10)}
+    monkeypatch.setattr(es, "_LOW_FREE_WARN_BYTES", 1 << 62)    # 実の空きが必ず下回る
+    with caplog.at_level("INFO"):
+        assert es.index_world(world, content_sig="s1")["indexed"] == 10
+    progress = [m for m in caplog.messages if m.startswith("取り込みの進み具合: 全文索引に書き込んでいます ") and "件（" in m]
+    assert progress and all("ES の空き" in m for m in progress)
+    assert sum("5GB を切りました" in m for m in caplog.messages) == 1
+
+
+def _compact_small(monkeypatch, settle=0, segments=True):
+    monkeypatch.setattr(es, "_ES_COMPACT_MIN_CHUNKS", 1)
+    monkeypatch.setattr(es, "_ES_COMPACT_SETTLE_SEC", settle)
+    monkeypatch.setattr(es, "_ES_COMPACT_POLL_SEC", 0.05)
+    if segments:                                                # まとまりごとに flush してセグメントを増やす（畳む相手を作る）
+        orig = es._StreamingBulkSender.send_group
+
+        def send(self, ids, bodies, vec_by_idx):
+            ok = orig(self, ids, bodies, vec_by_idx)
+            es._req("POST", f"/{self.idx}/_flush")
+            return ok
+
+        monkeypatch.setattr(es, "_ES_BULK_BATCH_MAX_DOCS", 1)
+        monkeypatch.setattr(es._StreamingBulkSender, "send_group", send)
+
+
+def test_compaction_at_the_end_keeps_every_chunk(env, monkeypatch, caplog):
+    world, st = env
+    st["texts"] = {f"d{i}.md": f"compact16 t{i}" for i in range(10)}
+    _compact_small(monkeypatch)
+    calls, merges = [], []
+    orig, orig_req = es._compact_building, es._req
+    monkeypatch.setattr(es, "_compact_building", lambda w, idx: (calls.append(idx), orig(w, idx)))
+
+    def req(method, path, body=None, **kw):
+        if "/_forcemerge" in path:
+            merges.append(path)
+        return orig_req(method, path, body, **kw)
+
+    monkeypatch.setattr(es, "_req", req)
+    with caplog.at_level("INFO"):
+        r = es.index_world(world, content_sig="s1")
+    assert r["indexed"] == 10 and "error" not in r and r["vectors"] is True
+    assert calls == es._alias_targets(world) and len(merges) == 1  # 付け替える索引を、終わりに 1 回だけ畳む
+    assert sum("検索の索引を詰めています を始めます" in m for m in caplog.messages) == 1
+    assert len(_hits(world, "compact16")) == 10
+    assert _count_where(world, {"exists": {"field": "embedding"}}) == 10
+    assert not [x for x in caplog.records if x.levelname == "WARNING" and "詰め" in x.getMessage()]
+
+
+@pytest.mark.parametrize("broken", ["forcemerge_error", "task_never_ends"])
+def test_compaction_failure_or_timeout_warns_once_and_the_ingest_succeeds(env, monkeypatch, caplog, broken):
+    world, st = env
+    st["texts"] = {f"d{i}.md": f"compact17 t{i}" for i in range(4)}
+    _compact_small(monkeypatch)
+    monkeypatch.setattr(es, "_ES_COMPACT_TIMEOUT_SEC", 0.2)
+    orig = es._req
+
+    def req(method, path, body=None, **kw):
+        if broken == "forcemerge_error" and "/_forcemerge" in path:
+            raise OSError("boom")
+        if broken == "task_never_ends" and path.startswith("/_tasks/"):
+            return {"completed": False}
+        return orig(method, path, body, **kw)
+
+    monkeypatch.setattr(es, "_req", req)
+    with caplog.at_level("WARNING", logger="sherpa"):
+        r = es.index_world(world, content_sig="s1")
+    assert r["indexed"] == 4 and "error" not in r
+    assert len(_hits(world, "compact17")) == 4 and es._index_meta(world)["content_sig"] == "s1"
+    assert len([x for x in caplog.records if x.levelname == "WARNING" and "詰め" in x.getMessage()]) == 1
+
+
+def test_stop_while_waiting_to_compact_discards_the_building_index(env, monkeypatch):
+    world, st = env
+    st["texts"] = {"o.md": "old18"}
+    es.index_world(world, content_sig="s1")
+    old = es._alias_targets(world)
+    st["texts"] = {f"d{i}.md": f"new18 t{i}" for i in range(10)}
+    _compact_small(monkeypatch, settle=30, segments=False)
+    flag = {"on": False}
+    _stop_when(monkeypatch, flag)
+    orig_req = es._req
+
+    def req(method, path, body=None, **kw):
+        out = orig_req(method, path, body, **kw)
+        if path.endswith("/_flush"):
+            flag["on"] = True                                   # 詰める前の待ちの間に停止要求
+        return out
+
+    monkeypatch.setattr(es, "_req", req)
+    t0 = time.monotonic()
+    with pytest.raises(background.StopRequested):
+        es.index_world(world, content_sig="s2")
+    assert time.monotonic() - t0 < 10                           # 待ち（30 秒）の途中で止まる
+    assert es._alias_targets(world) == old and _physicals(world) == old
+    assert _hits(world, "old18") == ["o.md"] and es._index_meta(world)["content_sig"] == "s1"
 
 
 def test_resume_after_stop_does_not_ask_the_destination_for_cached_vectors(env, monkeypatch):

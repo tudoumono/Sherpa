@@ -1137,6 +1137,7 @@ SYSTEM_SETTINGS_VIEW = {
     # 埋め込み HTTP の同時送信数。既定（未設定）は
     # `sherpa/embeddings.py::EMBED_PARALLEL_DEFAULT`（4）。env フォールバックは持たない。
     "embed_parallel": {"configured": None, "effective": 4, "default": 4},
+    "embed_dim": {"configured": None, "effective": 1536, "default": 1536, "min": 64, "max": 4096, "applies": True},
     "embed_provider": {"configured": None, "effective": "auto", "default": "auto",
                        "options": ["auto", "ollama"], "ollama_model": "nomic-embed-text"},
     # 「最大」の深さが許す査読の巡数（`sherpa/depth_profile.py::MAX_REVIEW_ROUNDS_DEFAULT`＝7）。

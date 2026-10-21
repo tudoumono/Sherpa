@@ -152,6 +152,8 @@ class SystemSettingsReq(BaseModel):
     depth_base_codex_reasoning: str | None = None
     # 埋め込み HTTP の同時送信数（`sherpa.embeddings.embed()` の有界スレッドプール）。未指定(None)は `embeddings.EMBED_PARALLEL_DEFAULT`（4）。null は未設定へ戻す。
     embed_parallel: StrictInt | None = Field(default=None, ge=1, le=16)
+    # OpenAI の埋め込みの次元（64〜4096）。未指定(None)・null は 1536（これまでと同じ値）。変えると全資料の埋め込みを作り直す。Ollama には効かない。
+    embed_dim: StrictInt | None = None
     # 埋め込みの接続先。"auto"（回答用に選んだクラウドに従う・既定）／"ollama"（常に中央 Ollama）。null は未設定（既定 auto）へ戻す。回答側の cloud_provider とは独立。
     embed_provider: str | None = None
     # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・深く 4 は固定で、設定はこの 1 項目だけ。未指定(None)は `depth_profile.MAX_REVIEW_ROUNDS_DEFAULT`（7）。null は未設定へ戻す。
@@ -685,6 +687,7 @@ def _admin_settings_view() -> dict:
             "effective": embeddings.effective_embed_parallel(sysset),
             "default": embeddings.EMBED_PARALLEL_DEFAULT,
         },
+        "embed_dim": _embed_dim_view(sysset),
         # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・深く 4 はコード固定で、設定はこの 1 項目だけ。
         "max_review_rounds": {
             "configured": sysset.get("max_review_rounds"),
@@ -986,6 +989,34 @@ def _validate_codex_worker_model(value):
     return v
 
 
+def _embed_dim_view(sysset: dict) -> dict:
+    """設定画面の `embed_dim`。既定は使っている OpenAI 埋め込みモデルの次元。Ollama のときは `applies` が偽。"""
+    from sherpa import embeddings, llm, model_catalog
+    model = model_catalog.resolve_model("openai", "embed", None, system_settings=sysset) or embeddings._MODELS["openai"][0]
+    try:
+        ollama = (embeddings.effective_embed_provider(sysset) == "ollama"
+                  or llm.resolve_auto_provider(None, system_settings=sysset) == "ollama")
+    except Exception:
+        ollama = False
+    return {
+        "configured": sysset.get("embed_dim"),
+        "effective": embeddings.effective_embed_dim(sysset, model),
+        "default": embeddings.openai_model_default_dim(model),
+        "model_max": embeddings.openai_model_max_dim(model),
+        "min": embeddings.EMBED_DIM_MIN,
+        "max": embeddings.EMBED_DIM_MAX,
+        "applies": not ollama,
+    }
+
+
+def _validate_embed_dim(value):
+    """`embed_dim` の検証。None は未設定（1536）。64〜4096 以外は 422。"""
+    from sherpa import embeddings
+    if value is not None and not embeddings.EMBED_DIM_MIN <= value <= embeddings.EMBED_DIM_MAX:
+        raise HTTPException(422, f"embed_dim は {embeddings.EMBED_DIM_MIN}〜{embeddings.EMBED_DIM_MAX} の整数で指定してください")
+    return value
+
+
 def _validate_embed_provider(value):
     """`embed_provider` の検証。None は未設定（既定 "auto"）。閉じた語彙以外は 422。"""
     if value is None:
@@ -1181,6 +1212,8 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     if "embed_parallel" in provided:
         # StrictInt・範囲（1〜16）は pydantic Field が型検証済み。
         updates["embed_parallel"] = provided["embed_parallel"]
+    if "embed_dim" in provided:
+        updates["embed_dim"] = _validate_embed_dim(provided["embed_dim"])
     if "max_review_rounds" in provided:
         # StrictInt・範囲は pydantic Field が型検証済み。
         updates["max_review_rounds"] = provided["max_review_rounds"]

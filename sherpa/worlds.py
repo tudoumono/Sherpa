@@ -19,7 +19,7 @@ from .ingest import text_kind
 
 
 def semantic_dir(world_id: str) -> Path:
-    """派生 `semantic/` ディレクトリ（ES の埋め込みキャッシュ〔SQLite・`embed_cache.sqlite3`〕の置き場）。"""
+    """派生 `semantic/` ディレクトリ（ES の埋め込みキャッシュ〔SQLite・`embed_cache.f32.sqlite3`。写し替え前は旧形式の `embed_cache.sqlite3`〕の置き場）。"""
     return derived_dir(world_id) / "semantic"
 
 

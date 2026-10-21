@@ -12,8 +12,10 @@ import math
 import os
 import re
 import socket
+import sys
 import time
 import urllib.error
+from array import array
 
 from . import llm
 
@@ -26,6 +28,11 @@ _SAFE_REMOTE_ERROR_FIELD = re.compile(r"[A-Za-z0-9_.-]{1,80}")
 EMBED_PARALLEL_DEFAULT = 4
 EMBED_PARALLEL_MIN = 1
 EMBED_PARALLEL_MAX = 16
+# OpenAI の埋め込みの次元（システム設定 `embed_dim`）の範囲。Ollama はモデルごとの固定次元でこの設定を使わない
+EMBED_DIM_MIN = 64
+EMBED_DIM_MAX = 4096
+# OpenAI の埋め込みモデル名 → 既定の次元。表に無いモデル（Azure のデプロイ名など）は `_MODELS["openai"]` の次元
+_OPENAI_MODEL_DIMS = {"text-embedding-3-small": 1536, "text-embedding-3-large": 3072}
 # 429/5xx と一時的な通信エラーだけ再送する（429 以外の 4xx は再送しない）
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _RETRY_MAX_RETRIES = 5  # 最初の送信を含めない再送回数
@@ -51,6 +58,43 @@ _ollama_dim_failed: dict = {}  # (url, model) -> 失敗時刻
 _log = logging.getLogger("sherpa.embed")
 
 
+# ベクトルは float32 の `array('f')`（1536 次元で約 6KB）で持つ。保存（キャッシュ DB の BLOB）は常にリトルエンディアンの float32。
+# ES へ送るときだけ `vector_to_json()` で数の list にする。
+def to_vector(values) -> array:
+    """float の list／`array('f')` を float32 の `array('f')` にする（float32 に丸める）。"""
+    if isinstance(values, array) and values.typecode == "f":
+        return values
+    return array("f", values)
+
+
+def vector_to_bytes(vector) -> bytes:
+    """ベクトルを float32 リトルエンディアンのバイト列にする。"""
+    vec = to_vector(vector)
+    if sys.byteorder == "big":
+        vec = array("f", vec)
+        vec.byteswap()
+    return vec.tobytes()
+
+
+def vector_from_bytes(raw, dimension: int) -> array | None:
+    """バイト列を `array('f')` に戻す。長さが `dimension`×4 でない・有限でない値を含むものは None（キャッシュ miss）。"""
+    if not isinstance(raw, (bytes, bytearray, memoryview)) or len(raw) != dimension * 4 or dimension <= 0:
+        return None
+    vec = array("f")
+    vec.frombytes(bytes(raw))
+    if sys.byteorder == "big":
+        vec.byteswap()
+    try:
+        return vec if math.isfinite(math.fsum(vec)) else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def vector_to_json(vector) -> list:
+    """ES へ送る数の list（float32 に丸めた値）。list で来たものはそのまま通す。"""
+    return vector.tolist() if isinstance(vector, array) else vector
+
+
 def effective_embed_parallel(system_settings: dict | None) -> int:
     """埋め込み HTTP 送信の並列度。システム設定 `embed_parallel`（1〜16）を使い、未設定・範囲外・非整数は既定 4。"""
     configured = system_settings.get("embed_parallel") if isinstance(system_settings, dict) else None
@@ -58,6 +102,35 @@ def effective_embed_parallel(system_settings: dict | None) -> int:
         return EMBED_PARALLEL_DEFAULT
     if configured < EMBED_PARALLEL_MIN or configured > EMBED_PARALLEL_MAX:
         return EMBED_PARALLEL_DEFAULT
+    return configured
+
+
+def openai_model_max_dim(model: str | None) -> int:
+    """OpenAI の埋め込みモデルが返せる最大の次元。モデル名から分からなければ `_MODELS["openai"]` の次元。"""
+    return _OPENAI_MODEL_DIMS.get((model or "").strip(), _MODELS["openai"][1])
+
+
+def openai_model_default_dim(model: str | None) -> int:
+    """設定が空欄のときの次元。どのモデルでも `_MODELS["openai"]` の次元（1536・モデルの最大を超えない）。
+    守ること: モデルの最大（`-large` は 3072）を既定にしない（空欄のまま版を上げただけで次元が変わり、全部の埋め込みが使えなくなる）。
+    """
+    return min(_MODELS["openai"][1], openai_model_max_dim(model))
+
+
+def effective_embed_dim(system_settings: dict | None, model: str | None = None) -> int:
+    """OpenAI の埋め込みの次元。システム設定 `embed_dim`（64〜4096）を使い、未設定・範囲外・非整数は既定（1536）。
+    モデルの最大より大きい値は最大に丸める（`dimensions` はモデルの最大以下でないと API が失敗する）。
+    """
+    default = openai_model_default_dim(model)
+    limit = openai_model_max_dim(model)
+    configured = system_settings.get("embed_dim") if isinstance(system_settings, dict) else None
+    if isinstance(configured, bool) or not isinstance(configured, int):
+        return default
+    if configured < EMBED_DIM_MIN or configured > EMBED_DIM_MAX:
+        return default
+    if configured > limit:
+        _log.warning("embed_dim=%d is larger than the model maximum; using %d (model=%s)", configured, limit, model)
+        return limit
     return configured
 
 
@@ -108,10 +181,11 @@ def cfg(settings: dict | None = None, *, system_settings: dict | None = None) ->
     parallel = effective_embed_parallel(sys_s)
 
     def O(key):
-        m, d = _MODELS["openai"]
-        # Azure OpenAI は `model` にデプロイ名を送る。上書き元は `model_catalog`（openai/embed）。次元は変えない
+        m, _d = _MODELS["openai"]
+        # Azure OpenAI は `model` にデプロイ名を送る。上書き元は `model_catalog`（openai/embed）
         from . import model_catalog
         model = model_catalog.resolve_model("openai", "embed", None, system_settings=sys_s) or m
+        d = effective_embed_dim(sys_s, model)  # OpenAI だけ設定で次元を選べる（`dimensions` で送る）
         return {"provider": "openai", "key": key, "model": model, "dim": d, "parallel": parallel,
                 "system_settings": sys_s}  # `_embed_batch` の接続先解決へ引き継ぐ
 

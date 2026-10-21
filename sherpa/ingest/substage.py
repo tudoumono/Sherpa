@@ -49,8 +49,9 @@ def _stage_label() -> str:
 class Step:
     """動いている小さな段 1 つ。`tick(done)` で件数を進め、`end()`（または `with`）で閉じる。"""
 
-    def __init__(self, key: str, label: str, total: int | None, logger: logging.Logger):
+    def __init__(self, key: str, label: str, total: int | None, logger: logging.Logger, note=None):
         self.key = key
+        self.note = note
         self.label = label
         self.total = total
         self.done = 0
@@ -86,12 +87,23 @@ class Step:
             if decile > self.decile or now - self.t_log >= LOG_EVERY_SEC:
                 self.decile = max(self.decile, decile)
                 self.t_log = now
-                self.log.info("取り込みの進み具合: %s %d/%d 件（%d%%・経過 %s）",
+                self.log.info("取り込みの進み具合: %s %d/%d 件（%d%%・経過 %s%s）",
                               self.label, done, self.total, done * 100 // self.total,
-                              _fmt_elapsed(now - self.t0))
+                              _fmt_elapsed(now - self.t0), self._note())
         elif now - self.t_log >= LOG_EVERY_SEC:
             self.t_log = now
-            self.log.info("取り込みの進み具合: %s %d 件（経過 %s）", self.label, done, _fmt_elapsed(now - self.t0))
+            self.log.info("取り込みの進み具合: %s %d 件（経過 %s%s）", self.label, done, _fmt_elapsed(now - self.t0),
+                          self._note())
+
+    def _note(self) -> str:
+        """途中の行に添える一言（`note()` の戻り値・空なら何も添えない）。失敗しても進み具合のログは止めない。"""
+        if self.note is None:
+            return ""
+        try:
+            text = self.note()
+        except Exception:
+            return ""
+        return f"・{text}" if text else ""
 
     def end(self, *, quiet: bool = False, failed: bool = False) -> None:
         end(self, quiet=quiet, failed=failed)
@@ -119,10 +131,11 @@ def unbind(*, failed: bool = False) -> None:
         _sink = None
 
 
-def begin(key: str, label: str, total: int | None = None, *, logger: logging.Logger | None = None) -> Step:
-    """小さな段を始める。前の小さな段が残っていれば閉じる。"""
+def begin(key: str, label: str, total: int | None = None, *, logger: logging.Logger | None = None,
+          note=None) -> Step:
+    """小さな段を始める。前の小さな段が残っていれば閉じる。`note`（省略可）は途中のログの行に添える一言を返す関数。"""
     global _cur
-    st = Step(key, label, total, logger or _default_log)
+    st = Step(key, label, total, logger or _default_log, note)
     with _lock:
         _end_locked(quiet=False)
         _cur = st

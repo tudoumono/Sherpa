@@ -364,6 +364,17 @@ class CodexModeInfo(BaseModel):
     options: list[str]
 
 
+class EmbedDimInfo(BaseModel):
+    """`embed_dim`（OpenAI の埋め込みの次元）。`default`=空欄のときの値（1536）、`model_max`=使っているモデルの最大、`min`/`max`=記入できる範囲、`applies`=偽なら Ollama で使われない。"""
+    configured: int | None
+    effective: int
+    default: int
+    model_max: int | None = None
+    min: int
+    max: int
+    applies: bool
+
+
 class EmbedProviderInfo(BaseModel):
     """`embed_provider`（埋め込みの接続先）。`ollama_model` は "ollama" のとき使う埋め込みモデル名。"""
     configured: str | None
@@ -425,6 +436,7 @@ class AdminSettingsView(BaseModel):
     workspace: WorkspaceAdminInfo
     # 埋め込み HTTP の同時送信数。`DepthProfileBaseInfo` と同型
     embed_parallel: DepthProfileBaseInfo
+    embed_dim: EmbedDimInfo
     embed_provider: EmbedProviderInfo
     # 「最大」の深さが許す査読の巡数。`DepthProfileBaseInfo` と同型
     max_review_rounds: DepthProfileBaseInfo

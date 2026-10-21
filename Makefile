@@ -1,7 +1,7 @@
 # Sherpa MVP — 起動・運用タスク
 #
 # `make` だけを打つと、下の一覧（help）が出ます。
-.PHONY: help hooks dev-setup start stop restart restart-web restart-worker status check-ports up down ps logs l bootstrap install-docker ocr-models \
+.PHONY: help embed-cache-migrate hooks dev-setup start stop restart restart-web restart-worker status check-ports up down ps logs l bootstrap install-docker ocr-models \
         api serve ingest-worker prod-check verify-kit verify-extension dist package-full package-app nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e \
         test-db-reset screenshots backup restore usage-backfill trace azure-smoke codex-compat doctor sandbox-check \
@@ -223,6 +223,9 @@ endif
 
 serve:             ## FastAPI 起動（本番・fixtures 非参照。SHERPA_ENV=production で fixtures を指す設定があれば起動拒否＝継承フラグも遮断）。取り込みは別プロセス（make ingest-worker）
 	./scripts/run-api.sh serve
+
+embed-cache-migrate: ## 埋め込みキャッシュを新しい形式（約 1/2〜1/5 の大きさ）へ手で写し替える（資料フォルダごとに前後の大きさを 1 行ずつ出す。取り込み中の資料フォルダは見送る。WORLD=<名前> で 1 つに絞る・空きが足りないときの最後の手段 DROP=1 は古いキャッシュを消すだけ＝次の取り込みで埋め込み API を呼び直す）
+	WORLD="$(WORLD)" DROP="$(DROP)" MODE="$(MODE)" PYTHON_BIN="$(if $(filter .venv/bin/python,$(PY)),$(abspath $(PY)),$(if $(findstring /,$(PY)),$(PY),))" ./scripts/embed-cache-migrate.sh
 
 ingest-worker:     ## 取り込みワーカーを前面で起動（MODE=dev で開発モード・既定 serve）。api／serve の前面起動のときは、取り込みを進めるためにこれも別の端末で動かす（make start は両方を起動する）
 	./scripts/run-ingest-worker.sh $(if $(filter dev,$(MODE)),dev,serve)

@@ -70,7 +70,7 @@ def test_iter_rag_chunk_entries_maps_structure_fields(tmp_path):
     jsonl, md = _write(tmp_path, [_RECORD], [("rc1", "本文")])
     anchors, reason = es_index._load_rag_md_anchors(md)
     assert reason is None
-    (_id, body, text), = es_index._iter_rag_chunk_entries(jsonl, "a.xlsx", anchors, {"doc_id": "a.xlsx"})
+    (_id, body, text, _skip), = es_index._iter_rag_chunk_entries(jsonl, "a.xlsx", anchors, {"doc_id": "a.xlsx"})
     assert text == "本文" and body["text"] == "本文"
     assert body["identifier_values"] == ["A01", "B02"]
     assert body["record_identity_values"] == ["A01"]                         # 参照の B02 はレコードの定義ではない
@@ -83,7 +83,7 @@ def test_iter_rag_chunk_entries_omits_structure_fields_when_absent(tmp_path):
     row = {"chunk_id": "rc1", "source_rel_path": "a.xlsx", "body": "記載値: 備考"}
     jsonl, md = _write(tmp_path, [row], [("rc1", "本文")])
     anchors, _ = es_index._load_rag_md_anchors(md)
-    (_id, body, _text), = es_index._iter_rag_chunk_entries(jsonl, "a.xlsx", anchors, {"doc_id": "a.xlsx"})
+    (_id, body, _text, _skip), = es_index._iter_rag_chunk_entries(jsonl, "a.xlsx", anchors, {"doc_id": "a.xlsx"})
     assert not any(k in body for k in _STRUCT_KEYS)
 
 

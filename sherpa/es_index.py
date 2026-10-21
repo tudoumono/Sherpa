@@ -35,7 +35,7 @@ _CHUNK_LINES_DEFAULT = 40
 # `search()` が ES へ送る size の上限（資料検索のヒット数の既定 `parts.read.tools.MAX_HITS` を下回らない固定値）
 _ES_SEARCH_K_MAX = 50
 _TIMEOUT = 30
-ES_MAPPING_VERSION = "11"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
+ES_MAPPING_VERSION = "12"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
 # reindex のとき埋め込みはキャッシュから再利用される。
 # rag_chunks.jsonl 読み取りの安全弁: 1 行（1 チャンク）の大きさで判定する。桁違いに大きい行は破損とみなし、ファイル全体を無効にして legacy チャンクへ縮退する（`_validate_rag_chunks` 参照）。
 # ファイル全体の大きさは見ない（大きな表でも行ごとの切れを保つ）。読むときも上限＋1 文字で打ち切る
@@ -53,6 +53,14 @@ _ES_BULK_BATCH_MAX_BYTES = 8 * 1024 * 1024
 # （保持するベクトル量を有界にし、落ちても次回 sync でキャッシュヒットして再開できる）。`index_world()` の doc グループ化バッチサイズにも兼用する
 _EMBED_FLUSH_CHUNKS = 500
 _embed_log = logging.getLogger("sherpa.embed")  # 埋め込み進捗はここへ（log_setup.py の embed.log 行き）
+# ベクトルを持つ索引の作り直しで ES の大きさを抑える（ES はベクトルの写しを、flush の後のマージで初めて捨てる）。
+# 索引の設定（`_mapping`）と、Pass2 の終わりの「詰める」（`_compact_building`）の 2 つで効かせる
+_ES_TRANSLOG_FLUSH_SIZE = "256mb"
+_ES_MERGE_SEGMENTS_PER_TIER = 4
+_ES_COMPACT_MIN_CHUNKS = 100000     # 終わりに詰めるのは、この件数以上を入れた索引だけ
+_ES_COMPACT_SETTLE_SEC = 35         # flush の後、ES が写しを捨ててよいと決めるまでの待ち
+_ES_COMPACT_TIMEOUT_SEC = 1800      # forcemerge の終わりを待つ上限（過ぎたら待たずに先へ進む）
+_ES_COMPACT_POLL_SEC = 5
 
 # 重要度スコアブースト: `高`／`低` の function_score 係数。`中`／未設定は等倍で、重要度制御ファイルの無い資料フォルダはスコア不変
 _ES_IMPORTANCE_BOOST_HIGH = 1.2
@@ -99,12 +107,21 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
         "importance_reason": {"type": "keyword", "index": False},
         # ベクトルを取れなかったチャンクだけ "missing" を持つ（`fill_missing_vectors` が後から埋めて "ok" にする）
         "vector_status": {"type": "keyword"},
+        # 表の行のまとまりの先頭の行だけが持つ（設計: docs/design/rag.md「表の行のまとまり」）。どちらも検索の対象にしない
+        "vector_text": {"type": "text", "index": False},
+        "row_group": {"type": "object", "enabled": False},
     }
     if dim:
         props["embedding"] = {"type": "dense_vector", "dims": dim, "index": True, "similarity": "cosine"}
     # `index_world()` は新しい物理索引を作って全件入れ、最後にエイリアスを付け替える。作成時は背景 refresh を止め（`-1`）、
     # 最終バッチ（`refresh=true`・`_StreamingBulkSender.finish()`）で一度だけ refresh して全件を可視化し、通常値へ戻す（`_restore_refresh_interval`）
     m = {"settings": {"index": {"refresh_interval": "-1"}}, "mappings": {"properties": props}}
+    if dim:
+        m["mappings"]["_source"] = {"excludes": ["embedding"]}  # ベクトルは原本の写しに持たない（kNN は索引側で動く・再利用は埋め込みキャッシュから）
+        # 取り込み中に flush を増やしてマージを細かく起こし、ES が持ち続けるベクトルの写し（recovery source）を取り込み中に捨てさせる
+        m["settings"]["index"].update({"translog.flush_threshold_size": _ES_TRANSLOG_FLUSH_SIZE,
+                                       "merge.policy.segments_per_tier": _ES_MERGE_SEGMENTS_PER_TIER,
+                                       "merge.policy.max_merge_at_once": _ES_MERGE_SEGMENTS_PER_TIER})
     if emeta:
         m["mappings"]["_meta"] = emeta  # {embed_provider, embed_model, dim, embed_algo}（検索時の素性照合用）
     return m
@@ -406,6 +423,83 @@ def _activate_index(world: str, new_idx: str) -> bool:
     return True
 
 
+_REBUILD_FREE_FACTOR = 2  # 空きが古い索引の大きさのこの倍に満たなければ、作り直しの前に古い索引を消す
+
+
+def _es_free_bytes() -> int | None:
+    """ES のデータ置き場の空き（`/_nodes/stats/fs` の available・ノードが複数なら最も少ないもの）。取れなければ None。"""
+    try:
+        res = _req("GET", "/_nodes/stats/fs")
+    except Exception:
+        return None
+    nodes = res.get("nodes") if isinstance(res, dict) else None
+    vals = [((n.get("fs") or {}).get("total") or {}).get("available_in_bytes")
+            for n in (nodes.values() if isinstance(nodes, dict) else []) if isinstance(n, dict)]
+    vals = [v for v in vals if isinstance(v, int)]
+    return min(vals) if vals else None
+
+
+def _store_bytes(names: list) -> int | None:
+    """索引の大きさの合計（`_cat/indices` の store.size）。1 つでも取れなければ None。"""
+    try:
+        rows = _req("GET", f"/_cat/indices/{','.join(names)}?format=json&h=index,store.size&bytes=b&expand_wildcards=all")
+    except Exception:
+        return None
+    sizes = {r.get("index"): r.get("store.size") for r in rows if isinstance(r, dict)} if isinstance(rows, list) else {}
+    try:
+        return sum(int(sizes[n]) for n in names)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+_LOW_FREE_WARN_BYTES = 5 * 1024 ** 3  # 作り直しの途中で ES の空きがこれを切ったら WARNING を 1 回だけ出す
+
+
+def _free_space_note(world: str):
+    """作り直しの途中のログに添える ES の空き（`substage.begin` の `note`）。空きが `_LOW_FREE_WARN_BYTES` を切ったら WARNING を 1 回だけ出す（止めない）。"""
+    warned = False
+
+    def note() -> str:
+        nonlocal warned
+        free = _es_free_bytes()
+        if free is None:
+            return ""
+        if free < _LOW_FREE_WARN_BYTES and not warned:
+            warned = True
+            _log.warning("es_index: 作り直しの途中で ES の空きが 5GB を切りました（取り込みは続けます）: world=%s・空き %.1f GB",
+                         world, free / 1024 ** 3)
+        return f"ES の空き {free / 1024 ** 3:.1f} GB"
+
+    return note
+
+
+def _drop_old_for_space(world: str) -> bool:
+    """作り直しの前に、ES の空きが古い索引の大きさの `_REBUILD_FREE_FACTOR` 倍に満たなければ古い索引を先に消す。消したら True。
+    空き・大きさを取れないときは消さない（今まで通り新旧を持って付け替える）。
+    """
+    names = _concrete_indices(world)
+    if not names:
+        return False
+    size = _store_bytes(names)
+    free = _es_free_bytes()
+    if size is None or free is None or free >= size * _REBUILD_FREE_FACTOR:
+        return False
+    _log.warning("es_index: ES の空きが足りないため、古い索引を消してから作り直します（終わるまでこの資料フォルダは検索できません）"
+                 ": world=%s・空き %d バイト・古い索引 %d バイト", world, free, size)
+    dropped = False
+    for n in names:
+        try:
+            _req("DELETE", "/" + n)
+            dropped = True
+        except urllib.error.HTTPError as e:
+            dropped = dropped or e.code == 404
+            if e.code != 404:
+                _log.warning("es_index: 古い索引を消せませんでした: %s", n)
+        except Exception:
+            _log.warning("es_index: 古い索引を消せませんでした: %s", n)
+    return dropped
+
+
 def _confirm_content_sig(world: str, content_sig, idx: str | None = None) -> None:
     """bulk が全バッチ成功した後（エイリアスの付け替えの前）に、新しい物理索引 `idx` の `_meta.content_sig`・`_meta.doc_count` を 1 回の read-modify-write で書く（Put Mapping API で `_meta` だけ更新）。
     `doc_count` は ES 側の実件数（`count(world)`）で、`needs_reindex` の実件数照合に使う。content_sig と同じ書き込みにまとめ、件数取得か書き込みが失敗すれば content_sig も書かない（次回 sync が fail-closed で 1 回張り直す）。
@@ -497,29 +591,52 @@ def ensure_index(world: str, dim=None, emeta=None) -> bool:
 
 
 # 埋め込みキャッシュのストア（SQLite の KV 1 ファイル）。資料フォルダ全体のベクトルを dict で持たず、フラッシュに含まれるキーだけを SELECT／INSERT する
-# （メモリ有界・1 回のフラッシュの I/O がキー数に比例）
+# （メモリ有界・1 回のフラッシュの I/O がキー数に比例）。新形式 `embed_cache.f32.sqlite3`（表 `kv2`・float32 の BLOB）があればそれだけを使う。
+# 無ければ旧形式 `embed_cache.sqlite3`（表 `kv`・JSON）を今まで通り読み書きし、どちらも無ければ新形式を作る。旧→新の写し替えは `embed_cache_migrate`。
 _EMBED_CACHE_DB_NAME = "embed_cache.sqlite3"
+_EMBED_CACHE_F32_NAME = "embed_cache.f32.sqlite3"
 _EMBED_CACHE_SQL_CHUNK = 500  # 1 回の IN 節に含める上限（SQLite の変数上限への余裕）
 
 
+class _EmbedConn(sqlite3.Connection):
+    """どちらの形式の DB を開いたか（表名・BLOB かどうか）を持つ接続。"""
+    table = "kv2"
+    binary = True
+
+
+def _embed_cache_legacy_path(world: str) -> Path:
+    return worlds.semantic_dir(world) / _EMBED_CACHE_DB_NAME
+
+
+def _embed_cache_f32_path(world: str) -> Path:
+    return worlds.semantic_dir(world) / _EMBED_CACHE_F32_NAME
+
+
 def _embed_cache_db_path(world: str) -> Path:
-    """資料フォルダの埋め込みキャッシュ（SQLite・1 ファイル）の場所。"""
-    d = worlds.semantic_dir(world)
-    return d / _EMBED_CACHE_DB_NAME
+    """資料フォルダの埋め込みキャッシュ（SQLite・1 ファイル）の場所。新形式があればそれ、無くて旧形式があれば旧形式、どちらも無ければ新形式。"""
+    new = _embed_cache_f32_path(world)
+    old = _embed_cache_legacy_path(world)
+    return old if (not new.exists() and old.exists()) else new
 
 
-def _embed_cache_connect(world: str, *, create: bool) -> sqlite3.Connection | None:
+def _embed_cache_connect(world: str, *, create: bool) -> _EmbedConn | None:
     """埋め込みキャッシュ DB へ接続する。`create=False`（読み取り専用）で DB ファイルが無ければ接続せず None（空 DB を作らない）。WAL を有効化する。接続・初期化の失敗（権限等）は None（呼び出し元は miss／書込失敗として扱う）。"""
     p = _embed_cache_db_path(world)
+    binary = p.name == _EMBED_CACHE_F32_NAME
     if not create and not p.exists():
         return None
     for attempt in (0, 1):
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(p), timeout=30)
+            conn = sqlite3.connect(str(p), timeout=30, factory=_EmbedConn)
+            conn.binary = binary
+            conn.table = "kv2" if binary else "kv"
             try:
+                if binary:
+                    conn.execute("PRAGMA page_size=65536")  # 新しいファイルを作るときだけ効く（1 行が約 6KB のため大きなページにする）
                 conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, vec TEXT NOT NULL)")
+                conn.execute(f"CREATE TABLE IF NOT EXISTS {conn.table} "
+                             f"(key TEXT PRIMARY KEY, vec {'BLOB' if binary else 'TEXT'} NOT NULL)")
             except sqlite3.Error:
                 conn.close()
                 raise
@@ -543,7 +660,7 @@ def _sql_chunks(items: list, size: int = _EMBED_CACHE_SQL_CHUNK):
 
 
 def _embed_cache_lookup_batch(world: str, keys: list, dim: int) -> dict:
-    """`keys` のうちキャッシュ済み・形状検証 OK（list かつ次元一致）のものだけ返す（壊れ／型ズレは miss）。`_EMBED_CACHE_SQL_CHUNK` 件ずつ `SELECT ... WHERE key IN (...)` で引く。DB 接続・クエリの失敗も miss 扱い（呼び出し元は再 embed へ）。"""
+    """`keys` のうちキャッシュ済み・形状検証 OK（次元一致）のものだけ `array('f')` で返す（壊れ／型ズレは miss）。`_EMBED_CACHE_SQL_CHUNK` 件ずつ `SELECT ... WHERE key IN (...)` で引く。DB 接続・クエリの失敗も miss 扱い（呼び出し元は再 embed へ）。"""
     if not keys:
         return {}
     conn = _embed_cache_connect(world, create=False)
@@ -553,14 +670,19 @@ def _embed_cache_lookup_batch(world: str, keys: list, dim: int) -> dict:
     try:
         for chunk in _sql_chunks(keys):
             placeholders = ",".join("?" * len(chunk))
-            rows = conn.execute(f"SELECT key, vec FROM kv WHERE key IN ({placeholders})", chunk).fetchall()
+            rows = conn.execute(f"SELECT key, vec FROM {conn.table} WHERE key IN ({placeholders})", chunk).fetchall()
             for k, raw in rows:
+                if conn.binary:
+                    v = embeddings.vector_from_bytes(raw, dim)  # 長さが次元×4 でない BLOB は miss
+                    if v is not None:
+                        out[k] = v
+                    continue
                 try:
                     v = json.loads(raw)
                 except (TypeError, ValueError):
                     continue
                 if isinstance(v, list) and len(v) == dim:
-                    out[k] = v
+                    out[k] = embeddings.to_vector(v)
     except sqlite3.Error:
         pass  # ここまでに読めた分は活かす
     finally:
@@ -574,14 +696,17 @@ def _embed_cache_write_batch(world: str, new_vectors: dict) -> None:
     """
     if not new_vectors:
         return
-    rows = [(k, json.dumps(v)) for k, v in new_vectors.items()]
     for attempt in (0, 1):
         conn = _embed_cache_connect(world, create=True)
         if conn is None:
             raise OSError(f"embed cache DB へ接続できません（world={world}）")
+        if conn.binary:
+            rows = [(k, embeddings.vector_to_bytes(v)) for k, v in new_vectors.items()]
+        else:
+            rows = [(k, json.dumps(embeddings.vector_to_json(v))) for k, v in new_vectors.items()]
         try:
             with conn:
-                conn.executemany("INSERT OR REPLACE INTO kv(key, vec) VALUES (?, ?)", rows)
+                conn.executemany(f"INSERT OR REPLACE INTO {conn.table}(key, vec) VALUES (?, ?)", rows)
             return
         except sqlite3.DatabaseError as exc:
             # ページ破損は書込で初めて発覚する。書込側が 1 回だけ作り直す。OperationalError（ENOSPC・ロック・権限）は破損ではないので消さずに伝播する
@@ -600,12 +725,12 @@ def _embed_cache_write_batch(world: str, new_vectors: dict) -> None:
 
 def _delete_embed_cache(world: str) -> None:
     """埋め込み無効／現存チャンク無し時のキャッシュ全消去。DB 本体＋WAL／SHM を消す（失敗はベストエフォート）。"""
-    p = _embed_cache_db_path(world)
-    for f in (p, p.with_name(p.name + "-wal"), p.with_name(p.name + "-shm")):
-        try:
-            f.unlink()
-        except OSError:
-            pass
+    for p in (_embed_cache_f32_path(world), _embed_cache_legacy_path(world)):
+        for f in (p, p.with_name(p.name + "-wal"), p.with_name(p.name + "-shm")):
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
 
 def _live_keys_reset(world: str) -> None:
@@ -668,7 +793,7 @@ def _prune_embed_cache(world: str, valid_keys=None) -> None:
             _delete_embed_cache(world)
             return
         with conn:
-            conn.execute("DELETE FROM kv WHERE key NOT IN (SELECT key FROM live)")
+            conn.execute(f"DELETE FROM {conn.table} WHERE key NOT IN (SELECT key FROM live)")
             conn.execute("DROP TABLE live")
     except sqlite3.Error as exc:
         raise OSError(str(exc)) from exc
@@ -751,7 +876,7 @@ def _embed_fill(world: str, texts: list, ec, guard: _EmbedGuard | None = None, *
                 break
             batch_keys = need[start:start + _EMBED_FLUSH_CHUNKS]
             new = embeddings.embed([key_text[k] for k in batch_keys], ec, world=world)
-            new_map = {k: vec for k, vec in zip(batch_keys, new)} if new else {}
+            new_map = {k: embeddings.to_vector(vec) for k, vec in zip(batch_keys, new)} if new else {}
             if new_map:
                 try:
                     _embed_cache_write_batch(world, new_map)  # 成功したバッチだけ即座に永続化
@@ -1054,8 +1179,182 @@ def _rag_chunks_validate(rag_path: Path, anchors: dict, rel: str) -> tuple:
     return seen_chunk_ids, None
 
 
+# 表の行のまとまり（ベクトルを 1 本だけ付ける単位）。設計: docs/design/rag.md「表の行のまとまり」
+_ROW_GROUP_KINDS = frozenset({"table_record", "coordinate_record"})
+_ROW_GROUP_MAX_ROWS = 20
+_ROW_GROUP_CELL_MAX_CHARS = 32      # 1 つの値の上限（超えた分は切る）
+_ROW_GROUP_ROW_MAX_BYTES = 300      # 値を並べた 1 行の上限（UTF-8）
+_ROW_GROUP_HEAD_MAX_BYTES = 600     # 出所・列名の行それぞれの上限
+_ROW_GROUP_MAX_BYTES = 7600         # まとまり 1 本の上限（埋め込みの 1 窓＝約 8000 バイトに収める）
+_ROW_GROUP_SEP = " | "
+_A1_RE = re.compile(r"^\$?([A-Z]{1,3})\$?(\d{1,7})$")
+
+
+def _a1_cells(cell_range) -> list:
+    """`"A2"`／`"A2:C5"` を `[(列番号, 行番号), ...]` にする。読めなければ空。"""
+    if not isinstance(cell_range, str):
+        return []
+    out = []
+    for part in cell_range.split(":"):
+        m = _A1_RE.match(part.strip().upper())
+        if m is None:
+            return []
+        col = 0
+        for ch in m.group(1):
+            col = col * 26 + (ord(ch) - 64)
+        out.append((col, int(m.group(2))))
+    return out
+
+
+def _a1_name(col: int, row: int) -> str:
+    letters = ""
+    while col:
+        col, rem = divmod(col - 1, 26)
+        letters = chr(65 + rem) + letters
+    return f"{letters}{row}"
+
+
+def _row_group_locator(rows: list) -> dict | None:
+    """まとまりの行の citation のセル範囲の外枠（シート名つき）。セル範囲で表せない行があれば先頭の行の locator。"""
+    cells = []
+    for row in rows:
+        for citation in row.get("citations") or []:
+            locator = citation.get("locator") if isinstance(citation, dict) else None
+            found = _a1_cells(locator.get("cell_range")) if isinstance(locator, dict) else []
+            if not found:
+                return _chunk_locator(rows[0])
+            cells.extend(found)
+    if not cells:
+        return _chunk_locator(rows[0])
+    cols = [c for c, _ in cells]
+    nums = [r for _, r in cells]
+    out = {**(_chunk_locator(rows[0]) or {}),
+           "cell_range": f"{_a1_name(min(cols), min(nums))}:{_a1_name(max(cols), max(nums))}"}
+    sheet = (rows[0].get("region_context") or {}).get("sheet") if isinstance(rows[0].get("region_context"), dict) else None
+    if isinstance(sheet, str) and sheet:
+        out["sheet"] = sheet
+    return out
+
+
+_CUT_MARK = "…"
+
+
+def _cut_bytes(text: str, limit: int) -> str:
+    """UTF-8 で `limit` バイトに収まるよう末尾を切る（文字の途中では切らない）。切ったときは末尾に「…」を付ける。"""
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    return raw[:limit - len(_CUT_MARK.encode("utf-8"))].decode("utf-8", "ignore") + _CUT_MARK
+
+
+def _cut_value(v: str) -> str:
+    """束の中のセルの値を上限の文字数で切る。切ったときは末尾に「…」を付ける。"""
+    return v if len(v) <= _ROW_GROUP_CELL_MAX_CHARS else v[:_ROW_GROUP_CELL_MAX_CHARS - 1] + _CUT_MARK
+
+
+def _row_fields(row: dict, text: str) -> list:
+    """行の本文（`列名: 値` の並び）を `[(列名, 値), ...]` にする。Excel の付記の行は除き、続きの行は前の値へつなぐ。
+    `列名: 値` の行が無ければ rag.md の本文を値 1 つとして返す（列名は空）。
+    """
+    body = row.get("body")
+    fields: list = []
+    for line in (body if isinstance(body, str) else "").split("\n"):
+        m = _BODY_FIELD_RE.match(line)
+        if m is not None:
+            fields.append(None if "のExcel" in m.group(1) else [m.group(1).strip(), m.group(2)])
+        elif fields and fields[-1] is not None and line.strip():
+            fields[-1][1] += " " + line
+    fields = [(k, " ".join(v.split())) for k, v in (f for f in fields if f is not None)]
+    return fields or [("", " ".join(text.split()))]
+
+
+def _row_group_columns(fields: list) -> list:
+    """列の並び（同じ列名が何度も出る表は何番目かで区別する）。"""
+    seen: dict = {}
+    out = []
+    for name, _v in fields:
+        seen[name] = seen.get(name, 0) + 1
+        out.append((name, seen[name]))
+    return out
+
+
+_COORD_DEFAULT_LABEL = "記載値"   # 項目のラベルが無いセルに取り込みが付ける名前
+
+
+def _row_position(row: dict) -> str:
+    """見出しの無い配置の行（`coordinate_record`）の位置。セル範囲、無ければページと表の中の行・列。"""
+    citations = row.get("citations") or []
+    loc = citations[0].get("locator") if citations and isinstance(citations[0], dict) else None
+    if not isinstance(loc, dict):
+        return ""
+    if isinstance(loc.get("cell_range"), str) and loc["cell_range"]:
+        return loc["cell_range"]
+    grid = loc.get("grid") if isinstance(loc.get("grid"), dict) else {}
+    parts = [f"p{loc['page']}" if isinstance(loc.get("page"), int) else "",
+             f"r{grid['row']}c{grid.get('column')}" if isinstance(grid.get("row"), int) else ""]
+    return " ".join(p for p in parts if p)
+
+
+def _row_group_line(row: dict, fields: list, columns: list | None) -> str:
+    """1 行を束の 1 行にする。値・行の長さは上限で切る。
+    表の行は値だけを見出しの列の順に区切り文字で並べる（見出しに無い列の値は後ろに足す）。
+    見出しの無い配置の行（`columns is None`）は、列名の代わりにセルの位置と項目のラベルを値に添える。
+    """
+    if columns is None:
+        values = [(f"{k}: " if k and k != _COORD_DEFAULT_LABEL else "") + _cut_value(v) for k, v in fields]
+        line = " ".join(x for x in (_row_position(row), _ROW_GROUP_SEP.join(values)) if x)
+        return _cut_bytes(line, _ROW_GROUP_ROW_MAX_BYTES)
+    by_col = dict(zip(_row_group_columns(fields), (v for _k, v in fields)))
+    values = [by_col.pop(c, "") for c in columns] + list(by_col.values())
+    while values and not values[-1]:
+        values.pop()
+    line = _ROW_GROUP_SEP.join(_cut_value(v) for v in values)
+    return _cut_bytes(line, _ROW_GROUP_ROW_MAX_BYTES)
+
+
+def _row_group_head_lines(row: dict, text: str, fields: list) -> tuple:
+    """まとまりの先頭の行（出所・列名）と列の並び。出所は rag.md の本文の `出所:` の行、無ければ領域の見出しとシート名。
+    見出しの無い配置の行（`coordinate_record`）は列名の行を作らず、列の並びは None（各行が位置とラベルを持つ）。
+    """
+    first = text.split("\n", 1)[0].strip()
+    source = first if first.startswith("出所") else _chunk_region_text(row)
+    if row.get("content_type") == "coordinate_record":
+        columns = None
+        header = ""
+    else:
+        columns = _row_group_columns(fields)
+        header = "列: " + _ROW_GROUP_SEP.join(name for name, _n in columns) if any(name for name, _n in columns) else ""
+    lines = [_cut_bytes(x, _ROW_GROUP_HEAD_MAX_BYTES) for x in (source, header) if x]
+    return lines, columns
+
+
+def _row_group_entries(group: list, head_lines: list):
+    """連続する表の行 `[(es_id, body, text, row, line), ...]` を `(es_id, body, text, skip_embed)` で返す。
+    先頭の行だけがまとまりの文字（出所・列名の行 `head_lines`＋各行の値だけの行 `line`）でベクトルを取り、`vector_text`・`row_group` を持つ。
+    2 行目以降はベクトルを取らない。1 行だけのまとまりは rag.md の本文のまま埋め込む。
+    """
+    head_id, head_body, head_text, _head_row, _line = group[0]
+    if len(group) == 1:
+        yield head_id, head_body, head_text, False
+        return
+    vector_text = "\n".join(head_lines + [line for *_x, line in group])
+    row_group = {"chunk_ids": [b["chunk_id"] for _i, b, _t, _r, _l in group], "rows": len(group)}
+    locator = _row_group_locator([row for _i, _b, _t, row, _l in group])
+    if locator is not None:
+        row_group["locator"] = locator
+    yield head_id, {**head_body, "vector_text": vector_text, "row_group": row_group}, vector_text, False
+    for es_id, body, text, _row, _l in group[1:]:
+        yield es_id, body, text, True
+
+
 def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: dict):
-    """事前に `_rag_chunks_validate()` が `reason=None` を返した `rag_path` をもう一度走査し、`(id, body, text)` を 1 件ずつ yield する（常に 1 件分だけをメモリに持つ）。検証済みの `rag_path`／`anchors` でのみ呼ぶ。"""
+    """事前に `_rag_chunks_validate()` が `reason=None` を返した `rag_path` をもう一度走査し、`(id, body, text, skip_embed)` を 1 件ずつ yield する。検証済みの `rag_path`／`anchors` でのみ呼ぶ。
+    `text` は埋め込みの文字。表の行は連続する行をまとまりに束ね、先頭の行だけがまとまりの文字を持ち、残りは `skip_embed`（`_row_group_entries`）。持つメモリはまとまり 1 つ分まで。
+    """
+    group: list = []
+    head_lines: list = []
+    columns: list = []
+    group_bytes = 0
     with json_io.open_text_maybe_gzip(rag_path) as f:
         for raw_line in iter_capped_lines(f):
             line = raw_line.strip()
@@ -1070,7 +1369,30 @@ def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: 
                 body["locator"] = locator
             body.update(_chunk_context_meta(row))  # 隣接キー（無ければ何も足さない）
             body.update(_chunk_structure_meta(row))  # 構造の欄（無ければ何も足さない）
-            yield _rag_chunk_es_id(rel, cid), body, text
+            es_id = _rag_chunk_es_id(rel, cid)
+            kind = row.get("content_type")
+            if kind not in _ROW_GROUP_KINDS:
+                yield from _row_group_entries(group, head_lines) if group else ()
+                group = []
+                yield es_id, body, text, False
+                continue
+            fields = _row_fields(row, text)
+            if group:
+                head = group[0][3]
+                row_line = _row_group_line(row, fields, columns)
+                if (row.get("parent_id") != head.get("parent_id") or kind != head.get("content_type")
+                        or len(group) >= _ROW_GROUP_MAX_ROWS
+                        or group_bytes + len(row_line.encode("utf-8")) + 1 > _ROW_GROUP_MAX_BYTES):
+                    yield from _row_group_entries(group, head_lines)
+                    group = []
+            if not group:
+                head_lines, columns = _row_group_head_lines(row, text, fields)
+                row_line = _row_group_line(row, fields, columns)
+                group_bytes = len("\n".join(head_lines).encode("utf-8"))
+            group.append((es_id, body, text, row, row_line))
+            group_bytes += len(row_line.encode("utf-8")) + 1
+    if group:
+        yield from _row_group_entries(group, head_lines)
 
 
 def _validate_rag_chunks(rag_path: Path, md_path: Path | None, rel: str, base_meta: dict) -> tuple:
@@ -1096,7 +1418,7 @@ def _validate_rag_chunks(rag_path: Path, md_path: Path | None, rel: str, base_me
     if reason is not None:
         return [], [], [], reason
     ids, bodies, texts = [], [], []
-    for cid_key, body, text in _iter_rag_chunk_entries(rag_path, rel, anchors, base_meta):
+    for cid_key, body, text, _skip in _iter_rag_chunk_entries(rag_path, rel, anchors, base_meta):
         ids.append(cid_key)
         bodies.append(body)
         texts.append(text)
@@ -1114,7 +1436,7 @@ def _bulk_batches(ids: list, bodies: list, vec_by_idx: dict) -> list:
     for i, (cid, body) in enumerate(zip(ids, bodies)):
         v = vec_by_idx.get(i)  # テキスト資料（軽量テキスト枠の第 2 段）など埋め込み対象外のチャンクは None
         if v is not None:
-            body = {**body, "embedding": v}
+            body = {**body, "embedding": embeddings.vector_to_json(v)}
         action = json.dumps({"index": {"_id": cid}})
         doc = json.dumps(body, ensure_ascii=False)
         pair_bytes = len(action.encode("utf-8")) + len(doc.encode("utf-8")) + 2  # +2 = 各行の改行
@@ -1178,8 +1500,8 @@ def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts:
                     seen, reason = _rag_chunks_validate(rag_path, anchors, rel)
                 if reason is None and seen:  # 有効かつ 1 件以上
                     def _rag_chunk_iter(rag_path=rag_path, anchors=anchors, meta=meta, no_embed=no_embed):
-                        for cid_key, body, text in _iter_rag_chunk_entries(rag_path, rel, anchors, meta):
-                            yield cid_key, body, text, no_embed
+                        for cid_key, body, text, skip in _iter_rag_chunk_entries(rag_path, rel, anchors, meta):
+                            yield cid_key, body, text, no_embed or skip
                     return _rag_chunk_iter(), None
                 if reason is not None:
                     degraded_entry = {"doc": rel, "reason": reason}
@@ -1283,15 +1605,61 @@ def _flush_doc_group(sender: _StreamingBulkSender, world: str, ids: list, bodies
     return sender.send_group(ids, bodies, vec_by_idx)
 
 
+def _compact_building(world: str, idx: str) -> None:
+    """作りかけの物理索引を詰める（ベクトルの写しを捨てたセグメントへ畳み直す）。失敗・時間切れは WARNING 1 行で先へ進む（取り込みは失敗にしない）。
+    停止要求は待ちの間も確かめる（`StopRequested` は呼び出し元へ通す）。
+    """
+    # ① flush ② ES が写しを捨ててよいと決めるまで待つ ③ セグメントを半分に畳む forcemerge を投げ、終わりを待つ
+    try:
+        _req("POST", f"/{idx}/_flush")
+    except Exception as e:
+        _log.warning("es_index: 索引を詰める前の flush に失敗しました（詰めずに続けます）: world=%s 原因=%s", world, e.__class__.__name__)
+        return
+    until = time.monotonic() + _ES_COMPACT_SETTLE_SEC
+    while time.monotonic() < until:
+        _stop_point()
+        time.sleep(min(1.0, max(0.0, until - time.monotonic())))
+    try:
+        stats = _req("GET", f"/{idx}/_stats/segments")["indices"]
+        n = sum(v["primaries"]["segments"]["count"] for v in stats.values())
+        if n < 2:
+            return
+        task = _req("POST", f"/{idx}/_forcemerge?max_num_segments={n // 2}&wait_for_completion=false").get("task")
+    except Exception as e:
+        _log.warning("es_index: 索引を詰められませんでした（詰めずに続けます）: world=%s 原因=%s", world, e.__class__.__name__)
+        return
+    deadline = time.monotonic() + _ES_COMPACT_TIMEOUT_SEC
+    while task:
+        _stop_point()
+        try:
+            res = _req("GET", f"/_tasks/{task}")
+        except Exception as e:
+            _log.warning("es_index: 索引を詰める処理の終わりを確かめられませんでした（待たずに続けます）: world=%s 原因=%s",
+                         world, e.__class__.__name__)
+            return
+        if res.get("completed"):
+            if res.get("error"):
+                _log.warning("es_index: 索引を詰める処理が失敗しました（詰めずに続けます）: world=%s", world)
+            return
+        if time.monotonic() >= deadline:
+            _log.warning("es_index: 索引を詰める処理が %d 秒で終わりませんでした（待たずに続けます）: world=%s",
+                         _ES_COMPACT_TIMEOUT_SEC, world)
+            return
+        time.sleep(_ES_COMPACT_POLL_SEC)
+
+
 def index_world(world: str, settings: dict | None = None, content_sig: str | None = None,
                 progress: Callable[[int, int], None] | None = None) -> dict:
     """資料フォルダを再索引する（新しい物理索引を作って全件入れ、エイリアスを付け替える）。埋め込み設定があればベクトルも付与する（kNN 用）。
     - 作り直しの間もエイリアスは古い索引を指し続け、検索は途切れない。途中の失敗・停止要求では作りかけの物理索引だけを消し、古い索引（とそのメタ）には触れない。
+      ただし ES の空きが古い索引の大きさの 2 倍に満たなければ、新しい物理索引を作る直前に古い索引を消す（`_drop_old_for_space`・終わるまで検索は空。途中で止まれば索引が無い状態になり、次の更新が作り直す）。
     - 埋め込みのまとまりが再送を使い切って取れなくても、資料フォルダ全体を降格・打ち切りにはしない。そのチャンクだけ、ベクトル無し・`vector_status: "missing"` で入れる（件数は戻り値の `vectors_missing`・`fill_missing_vectors` が後から足す）。埋め込みを選んだクラウドが設定の段階で解決できないときだけ、何も変えずに打ち切る（`embedding_cloud_unavailable`）。
     - `content_sig`＝索引時のフォルダ署名（`_meta` に保存・古い索引の検知に使う）。埋め込みは内容ハッシュキャッシュ（`_embed_fill`）経由で未変更チャンクの再 embed を省く。
     - Office／PDF（`{rel}.rag_chunks.jsonl` を持つ）はレコード単位チャンク、それ以外（テキスト資料、rag_chunks が無い／検証に失敗した Office／PDF）は 40 行チャンク。rag_chunks があるのに使えなかった文書と本文が空白のみの文書（reason="empty_text"）は、戻り値の `rag_degraded`（件数）・`rag_degraded_docs`（内訳）・`rag_degraded_by_reason`（理由別の件数）で報告する。本文を読めず索引から外した文書は reason="text_read_failed"。
       ベクトルを持つチャンクが 1 件も無い索引になったときは `embed_degraded=True`、日本語アナライザを作れず標準で作り直したときは `analyzer_fallback=True`（どちらも取り込みの状態へ出す）。
     - ソース（`branch=="source"` の登録コードと、軽量テキスト枠の第 1 段の汎用コード）は索引に入れない（`_is_source_doc`・探すのは ripgrep_search）。軽量テキスト枠の第 2 段（csv・log などのテキスト資料）は索引に入れるが、埋め込みはしない（BM25 のみ）。索引の `_meta.source_excluded` に印を残し、印の無い旧索引は `needs_reindex` が張り直す。
+    - ベクトルを持つ索引は、`_ES_COMPACT_MIN_CHUNKS` 件以上入れたら Pass2 の終わり（付け替えの前）に詰める（`_compact_building`・失敗・時間切れでも取り込みは続ける）。
+      取り込みの途中では詰めない・refresh しない（forcemerge も refresh も、その後のマージで置き換わった古いセグメントを次の refresh まで残させる）。
     - bulk 送信は `_bulk_batches()` で件数・バイト数ともに有界なバッチへ分割し、`refresh=true` は最後のバッチだけに付ける。途中のバッチが失敗したら作りかけの索引を捨てて error を返す（全部か無しか）。
     - 2 パス構成（メモリを資料フォルダの規模に比例させない）:
       - Pass1（埋め込みのみ）: `_iter_doc_chunk_records()` でチャンクを 1 件ずつ受け取り、embed 対象テキストを `_EMBED_FLUSH_CHUNKS` 件程度に束ねて `_embed_fill()` を呼ぶ。生きている鍵はキャッシュ DB の `live` 表へ溜める。
@@ -1310,6 +1678,9 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     finally:
         _building.pop(world, None)
         substage.end()                       # 早く抜けても小さな段を残さない（「まだ動いています」を出し続けない）
+
+
+_ES_BULK_LABEL_DROPPED = "容量が足りないため、古い検索の索引を消して作り直しています（終わるまで検索できません）"
 
 
 def _index_world(world: str, settings, content_sig, progress) -> dict:
@@ -1428,6 +1799,7 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
     if embed_feature_applies:
         emeta.update({"embed_provider": ec["provider"], "embed_model": ec["model"], "dim": ec["dim"],
                       "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID})  # 前処理アルゴリズム版（`_chunk_key` と同じ材料）
+    old_dropped = _drop_old_for_space(world)  # 空きが足りなければ古い索引を先に消す（終わるまで検索できない）
     if not ensure_index(world, dim=dim, emeta=(emeta or None)):
         return {"available": True, "indexed": 0, "chunks": 0, "error": "create_failed"}
     new_idx = _building.get(world)  # ensure_index が作った物理索引（差し替えられた場合は None＝エイリアス名のまま）
@@ -1445,7 +1817,8 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
     g_no_embed: list = []
     # `docs_done` は Pass2 が見終えた文書数（対象外の文書も含む）。`n_docs`（実際に索引した文書数）とは別に持ち、対象外が連続しても `total_docs` へ収束させる
     docs_done = 0
-    pass2_step = substage.begin("es_bulk", "全文索引に書き込んでいます", total=total_docs, logger=_embed_log)
+    pass2_step = substage.begin("es_bulk", _ES_BULK_LABEL_DROPPED if old_dropped else "全文索引に書き込んでいます",
+                                total=total_docs, logger=_embed_log, note=_free_space_note(world))
     if progress is not None:
         # Pass2 開始時に 0/total を明示通知する（間引きラッパーが Pass1 完走時の done を覚えているため）
         progress(0, total_docs)
@@ -1510,6 +1883,10 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
     if n_docs > 0 and total_chunks == 0:
         # 文書があるのにチャンク 0 件は索引の異常として扱い、付け替えない（次回 sync が再索引する）。空の資料フォルダ（`n_docs==0`）は対象外
         return _failure("no_chunks")
+    if dim and total_chunks >= _ES_COMPACT_MIN_CHUNKS:  # 詰めるのはベクトルを持つ索引だけ
+        substage.begin("es_compact", "検索の索引を詰めています", logger=_embed_log, note=_free_space_note(world))
+        _compact_building(world, sender.idx)
+        substage.begin("es_swap", "全文索引を確定し、付け替えています", logger=_embed_log)
     _restore_refresh_interval(world, new_idx)  # 全バッチ成功＝最終 refresh で可視化済み・背景 refresh を通常へ戻す
     _confirm_content_sig(world, content_sig, new_idx)  # 全バッチ成功後にだけ鮮度署名と実件数を確定する
     if new_idx is not None and not _activate_index(world, new_idx):
@@ -1584,7 +1961,7 @@ def _embed_cache_delete_keys(world: str, keys: list) -> int:
         with conn:
             for chunk in _sql_chunks(list(keys)):
                 placeholders = ",".join("?" * len(chunk))
-                n += conn.execute(f"DELETE FROM kv WHERE key IN ({placeholders})", chunk).rowcount
+                n += conn.execute(f"DELETE FROM {conn.table} WHERE key IN ({placeholders})", chunk).rowcount
     except sqlite3.Error:
         _embed_log.warning("es_index: 埋め込みのキャッシュのキーを消せませんでした（world=%s）", world)
     finally:
@@ -1596,6 +1973,26 @@ def _delete_payloads(ids: list) -> list:
     """`ids` の切れ端を消す bulk 用の NDJSON（`_ES_BULK_BATCH_MAX_DOCS` 件ずつ）。"""
     return ["".join(json.dumps({"delete": {"_id": i}}) + "\n" for i in ids[s:s + _ES_BULK_BATCH_MAX_DOCS])
             for s in range(0, len(ids), _ES_BULK_BATCH_MAX_DOCS)]
+
+
+def _old_chunk_restore_payloads(world: str, ec, old_hits: list, vec_ids: set) -> list:
+    """`replace_document` の巻き戻し用に、古い切れ端を入れ直す NDJSON を作る。ベクトルは `_source` に無いので埋め込みのキャッシュから取り（API は呼ばない）、
+    ベクトルを持っていたのにキャッシュに無い切れ端は `vector_status: "missing"` で入れる（`fill_missing_vectors` が後から足す）。
+    """
+    ids = [h["_id"] for h in old_hits]
+    bodies = [dict(h.get("_source") or {}) for h in old_hits]
+    vec_by_idx: dict = {}
+    if ec and vec_ids:
+        keys = {i: _chunk_key(ec, b.get("vector_text") or b["text"]) for i, b in enumerate(bodies)
+                if ids[i] in vec_ids and isinstance(b.get("vector_text") or b.get("text"), str)}
+        cached = _embed_cache_lookup_batch(world, list(set(keys.values())), ec["dim"])
+        for i, k in keys.items():
+            if k in cached:
+                vec_by_idx[i] = cached[k]
+        for i, cid in enumerate(ids):
+            if cid in vec_ids and i not in vec_by_idx:
+                bodies[i]["vector_status"] = "missing"
+    return _bulk_batches(ids, bodies, vec_by_idx)
 
 
 def _send_bulk(world: str, payloads: list) -> str | None:
@@ -1668,6 +2065,9 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
     # ③ 書き込みと古い切れ端の削除（古い切れ端は全部を控え、途中で失敗したら古い切れ端だけの状態へ戻す）
     try:
         old_hits = _scroll_hits(world, {"term": {"doc_id": rel}}, True)
+        # `_source` にベクトルは無い。ベクトルを持つ切れ端の ID は `exists` で引く（巻き戻しと⑤で使う）
+        vec_ids = ({h["_id"] for h in _scroll_hits(world, {"bool": {"filter": [
+            {"term": {"doc_id": rel}}, {"exists": {"field": "embedding"}}]}}, False)} if with_vectors else set())
     except Exception:
         return {"available": True, "error": "search_failed"}
     old_ids = [h["_id"] for h in old_hits]
@@ -1678,11 +2078,11 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
         err = _send_bulk(world, _delete_payloads(stale))
     if err is not None:
         restore = (_delete_payloads(sorted(new_ids - set(old_ids)))
-                   + _bulk_batches(old_ids, [h.get("_source") or {} for h in old_hits], {}))
+                   + _old_chunk_restore_payloads(world, ec, old_hits, vec_ids))
         if restore and _send_bulk(world, restore) is not None:
             return {"available": True, "error": f"{err}_rollback_failed"}
         return {"available": True, "error": err}
-    old_embedded = [h for h in old_hits if with_vectors and "embedding" in (h.get("_source") or {})]
+    old_embedded = [h for h in old_hits if h["_id"] in vec_ids]
     # ④ 件数の印
     n = count(world)
     meta = _index_meta(world)
@@ -1698,6 +2098,8 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
         new_keys = {_chunk_key(ec, texts[i]) for i in embed_idx}
         candidates: dict = {}
         for h in old_embedded:
+            if (h.get("_source") or {}).get("vector_text"):
+                continue  # まとまりの文字は本文の索引で同じものを確かめられない＝キーを残す（次の全体の作り直しで剪定される）
             t = (h.get("_source") or {}).get("text")
             if isinstance(t, str):
                 k = _chunk_key(ec, t)
@@ -1770,7 +2172,7 @@ def _vector_update_batches(ids: list, vecs: list) -> list:
     n_bytes = 0
     for cid, vec in zip(ids, vecs):
         action = json.dumps({"update": {"_id": cid}})
-        doc = json.dumps({"doc": {"embedding": vec, "vector_status": "ok"}})
+        doc = json.dumps({"doc": {"embedding": embeddings.vector_to_json(vec), "vector_status": "ok"}})
         pair = len(action) + len(doc) + 2
         if lines and (len(lines) >= 2 * _ES_BULK_BATCH_MAX_DOCS or n_bytes + pair > _ES_BULK_BATCH_MAX_BYTES):
             out.append("\n".join(lines) + "\n")
@@ -1816,14 +2218,16 @@ def fill_missing_vectors(world: str, settings: dict | None = None) -> dict:
     fill_step = substage.begin("fill_vectors", "ベクトルを足し直しています", total=before, logger=_embed_log)
     try:
         res = _req("POST", f"/{idx}/_search?scroll={_FILL_SCROLL}",
-                   {"size": _EMBED_FLUSH_CHUNKS, "query": _MISSING_QUERY, "_source": ["text"], "sort": ["_doc"]})
+                   {"size": _EMBED_FLUSH_CHUNKS, "query": _MISSING_QUERY, "_source": ["text", "vector_text"],
+                    "sort": ["_doc"]})
         scroll_id = res.get("_scroll_id")
         while True:
             page = (res.get("hits") or {}).get("hits") or []
             if not page:
                 break
             _stop_point()
-            rows = [(h["_id"], (h.get("_source") or {}).get("text")) for h in page]
+            rows = [(h["_id"], (h.get("_source") or {}).get("vector_text") or (h.get("_source") or {}).get("text"))
+                    for h in page]
             rows = [(i, t) for i, t in rows if isinstance(t, str) and t]
             vecs, _reused, _embedded = _embed_fill(world, [t for _i, t in rows], ec, guard, stop_points=True)
             got = [(i, v) for (i, _t), v in zip(rows, vecs) if v is not None]
@@ -1867,7 +2271,22 @@ def _mark_keyword_all(hits: list) -> list:
     return hits
 
 
-def _parse_hits(res: dict) -> list:
+def _as_row_group_hit(hit: dict, src: dict) -> dict:
+    """意味検索で当たった表の行のまとまりの先頭の行を、まとまりの本文・範囲に差し替える（`chunk_id` は先頭の行のまま）。"""
+    group = src.get("row_group")
+    vector_text = src.get("vector_text")
+    if not isinstance(group, dict) or not isinstance(vector_text, str) or not vector_text:
+        return hit
+    hit["text"] = vector_text
+    if isinstance(group.get("locator"), dict):
+        hit["locator"] = group["locator"]
+    if isinstance(group.get("chunk_ids"), list):
+        hit["row_group_chunk_ids"] = group["chunk_ids"]
+    return hit
+
+
+def _parse_hits(res: dict, vector: bool = False) -> list:
+    """ES の応答をヒットの形にする。`vector=True`（kNN の応答）は表の行のまとまりをまとまりの本文で返す。"""
     out = []
     for h in res.get("hits", {}).get("hits", []):
         src = h.get("_source", {})
@@ -1881,7 +2300,7 @@ def _parse_hits(res: dict) -> list:
                   "importance", "importance_reason"):
             if src.get(k) is not None:
                 hit[k] = src[k]
-        out.append(hit)
+        out.append(_as_row_group_hit(hit, src) if vector else hit)
     return out
 
 
@@ -1948,7 +2367,7 @@ def _fuse_hybrid(bm25_res: dict, knn_res: dict, k: int) -> list:
     weights = {"keyword": _HYBRID_WEIGHT * 2.0, "vector": (1.0 - _HYBRID_WEIGHT) * 2.0}
     out = []
     for m in fuse_rrf(per_engine, weights, k):
-        hit = _parse_hits({"hits": {"hits": [raw[m["doc_id"]]]}})[0]
+        hit = _parse_hits({"hits": {"hits": [raw[m["doc_id"]]]}}, vector="vector" in m["sources"])[0]
         hit["score"] = m["score"]
         hit["keyword_match"] = "keyword" in m["sources"]
         hit["engine_ranks"] = dict(m["sources"])
@@ -2143,7 +2562,7 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
                     "num_candidates": max(50, fetch_k * 5), "filter": flt}}
     try:
         # 純 kNN は function_score で包めないため、取得後の再ランクで重要度ブーストを適用する
-        hits = _rerank_knn_by_importance(_parse_hits(_req("POST", f"/{_index(world)}/_search", body)))
+        hits = _rerank_knn_by_importance(_parse_hits(_req("POST", f"/{_index(world)}/_search", body), vector=True))
         return hits[:k], None
     except Exception as exc:
         return [], _classify_query_exception(exc)
