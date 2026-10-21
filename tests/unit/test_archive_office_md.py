@@ -79,7 +79,7 @@ def test_zip_docx_converts_to_md_rag_ir_and_is_listed_and_searchable(monkeypatch
     rel = "docs/design.zip/screen/doc1.docx"
     assert (dmd / (rel + ".md")).is_file()
     assert (worlds.derived_rag_dir(world) / (rel + ".rag.md")).is_file()
-    assert (worlds.derived_ir_dir(world) / (rel + ".document.json")).is_file()
+    assert not (worlds.derived_ir_dir(world) / (rel + ".document.json")).exists()
     assert (worlds.derived_ir_dir(world) / (rel + ".evidence.json")).is_file()
 
     # 台帳一覧（= ES 索引の材料・`es_index.index_world` と同じ `corpus_docs.world_documents`）に出る。

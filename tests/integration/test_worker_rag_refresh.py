@@ -79,7 +79,7 @@ def _rag(dmd):
 
 
 def _ir(dmd):
-    """`.document.json`／`.evidence.json`／`.derived.json` は ir 層（dmd＝md 層の兄弟・§8.1 三階層）。"""
+    """`.evidence.json`／`.derived.json` は ir 層（dmd＝md 層の兄弟・§8.1 三階層）。"""
     return dmd.parent / "ir"
 
 
@@ -312,7 +312,7 @@ def test_document_ir_drift_cascades_to_evidence_and_rag_via_sync(_world):
     assert office_md.document_ir_sig_drift(dmd) is False
     assert office_md.evidence_ir_sig_drift(dmd) is False
     assert office_md.rag_sig_drift(dmd) is False
-    assert (_ir(dmd) / "a.xlsx.document.json").read_text(encoding="utf-8") != "stale-document-ir"
+    assert not (_ir(dmd) / "a.xlsx.document.json").exists()   # Document IR は書かない（古い版の残りは消える）
     assert (_ir(dmd) / "a.xlsx.evidence.json").read_bytes() != b"stale-evidence-ir"
     assert (_rag(dmd) / "a.xlsx.rag.md").read_text(encoding="utf-8") != "stale-rag-md"
 

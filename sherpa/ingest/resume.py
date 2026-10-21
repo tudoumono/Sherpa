@@ -2,6 +2,7 @@
 
 停止要求で区切りに止まった run と、強制終了で中断へ格下げされた run のうち、資料フォルダの最新の run が
 中断のままのものについて、同期（refresh）の依頼を 1 回だけ積む（実行はそのままワーカーが拾う）。済んだファイルは変換キャッシュから取れる。
+ディスクの空きが少ないため止めた run は再開しない（利用者が空きを作って「更新」を押すまで待つ）。
 設計: docs/design/operations.md「起動・停止・状態」
 """
 from __future__ import annotations
@@ -54,6 +55,9 @@ def resume_interrupted() -> list[str]:
             except Exception:
                 continue
         elif op not in RESUMABLE_OPS:
+            continue
+        if c.get("stop_reason") == background.LOW_DISK_STOP_REASON:
+            _log.warning("ディスクの空きが少ないため止めた取り込みは自動では再開しません。空きを作ってから「更新」を押してください: world=%s", wid)
             continue
         try:
             if _start_sync(wid):

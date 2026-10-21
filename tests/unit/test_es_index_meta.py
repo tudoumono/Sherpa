@@ -15,7 +15,7 @@ from sherpa import es_index
 from sherpa.ingest import text_kind
 
 
-_F32_013 = array("f", [0.1, 0.2, 0.3]).tolist()   # ES へ送る値は float32 に丸めた数
+_F32_013 = [42, 85, 127]   # ES へ送る値は [0.1, 0.2, 0.3] を最大の絶対値で割って 127 倍した整数
 
 
 class _Bulk:
@@ -508,7 +508,7 @@ def test_search_knn_only_reacts_to_embed_algo_mismatch(monkeypatch):
         "provider": "openai", "model": "m", "dim": 3})
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "embed_provider": "openai", "embed_model": "m", "dim": 3,
-        "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID})
+        "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
     monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None: [[0.1, 0.2, 0.3]])
     monkeypatch.setattr(es_index, "_req", lambda *a, **k: {"hits": {"hits": []}})
     assert es_index.search_knn_only("w", "query")[1] is None
@@ -568,7 +568,7 @@ def test_search_hybrid_failure_with_bm25_success_is_hybrid_query_failed(monkeypa
     def _fake_req(method, path, body=None, **kw):
         if method == "GET" and path.endswith("/_mapping"):
             return {"idx": {"mappings": {"_meta": {
-                **_HYBRID_META, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID}}}}
+                **_HYBRID_META, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT}}}}
         if method == "POST" and path.endswith("/_search"):
             inner = (body or {}).get("query", {}).get("function_score", {}).get("query", {})
             if "knn" in inner:                          # hybrid の kNN 側のリクエスト
@@ -655,7 +655,7 @@ def test_search_hybrid_rrf_weight_follows_hybrid_weight(monkeypatch, weight):
     monkeypatch.setattr(es_index, "_HYBRID_WEIGHT", weight)
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
-        **_HYBRID_META, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID})
+        **_HYBRID_META, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: dict(
         provider="openai", model="m", dim=3))
     monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None: [[0.1, 0.2, 0.3]])
@@ -747,7 +747,7 @@ def test_needs_reindex_reacts_to_embed_algo_drift(monkeypatch):
     _reindex_env(monkeypatch)
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: {
         "provider": "openai", "model": "m", "dim": 3})
-    base = _full_meta(embed_provider="openai", embed_model="m", dim=3)
+    base = _full_meta(embed_provider="openai", embed_model="m", dim=3, quant=es_index.embeddings.ES_VECTOR_QUANT)
     for algo, expected in ((_DROP, True), (es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, False),
                            ("old-algo-v0", True)):
         meta = dict(base) if algo is _DROP else dict(base, embed_algo=algo)
@@ -1377,7 +1377,7 @@ def test_bulk_batches_applies_embedding_from_vec_by_idx(monkeypatch):
     batches = es_index._bulk_batches(["a", "b"], [{"doc_id": "d", "text": "t1"}, {"doc_id": "d", "text": "t2"}],
                                      {0: [0.1, 0.2]})
     docs = [json.loads(ln) for b in batches for i, ln in enumerate(b.strip().split("\n")) if i % 2 == 1]
-    assert docs[0].get("embedding") == [0.1, 0.2] and "embedding" not in docs[1]
+    assert docs[0].get("embedding") == [64, 127] and "embedding" not in docs[1]
 
 
 def _multi_chunk_world(monkeypatch, n: int):
@@ -1399,6 +1399,38 @@ def test_index_world_sends_multiple_bulk_batches_refresh_only_last(monkeypatch):
     assert r["indexed"] == 3 and r["chunks"] == 3 and r.get("error") is None
     assert [p.endswith("?refresh=true") for p, _ in calls] == [False, False, True]
     assert all(len(body.strip().split("\n")) == 2 for _, body in calls)
+
+
+def test_index_world_bulk_in_parallel_and_refresh_after_all_in_flight(monkeypatch):
+    import threading
+    import time
+
+    _multi_chunk_world(monkeypatch, 6)
+    lock = threading.Lock()
+    state = {"now": 0, "peak": 0, "done": 0, "done_at_refresh": None, "timeouts": set()}
+
+    def fake_req(method, path, body=None, **kw):
+        if "_bulk" not in str(path):
+            return {}
+        state["timeouts"].add(kw.get("timeout"))
+        refresh = str(path).endswith("?refresh=true")
+        with lock:
+            if refresh:
+                state["done_at_refresh"] = state["done"]
+            state["now"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+        time.sleep(0.05)
+        with lock:
+            state["now"] -= 1
+            state["done"] += 1
+        return {}
+
+    monkeypatch.setattr(es_index, "_req", fake_req)
+    r = es_index.index_world("w")
+    assert r["chunks"] == 6 and r.get("error") is None
+    assert state["peak"] > 1                      # 直列に戻っていない
+    assert state["done_at_refresh"] == 5          # refresh 付きは、先に出した 5 本が全部終わってから
+    assert state["timeouts"] == {es_index._TIMEOUT * es_index._ES_BULK_PARALLEL}   # 同時に送る分だけ待ちの上限を延ばす
 
 
 @pytest.mark.parametrize("failure,error", [("raise", "bulk_failed"), ("item_errors", "bulk_errors")])
@@ -1567,7 +1599,7 @@ def test_embed_cache_write_recreates_corrupt_db_file(monkeypatch, tmp_path):
     assert es_index._embed_cache_lookup_batch(world, ["k1"], 4) == {}      # 読取側は miss 扱いで壊れた本体を消さない
     assert p.read_bytes().startswith(b"this is not")
     es_index._embed_cache_write_batch(world, {"k1": [0.1, 0.2, 0.3, 0.4]})
-    assert es_index._embed_cache_lookup_batch(world, ["k1"], 4) == {"k1": array("f", [0.1, 0.2, 0.3, 0.4])}
+    assert es_index._embed_cache_lookup_batch(world, ["k1"], 4) == {"k1": array("b", [32, 64, 95, 127])}
 
 
 def test_embed_cache_write_recreates_page_corrupt_db(monkeypatch, tmp_path):
@@ -1580,7 +1612,7 @@ def test_embed_cache_write_recreates_page_corrupt_db(monkeypatch, tmp_path):
     for f in (p.with_name(p.name + "-wal"), p.with_name(p.name + "-shm")):
         f.unlink(missing_ok=True)
     es_index._embed_cache_write_batch(world, {"z1": [0.1] * 1536})
-    assert es_index._embed_cache_lookup_batch(world, ["z1"], 1536) == {"z1": array("f", [0.1] * 1536)}
+    assert es_index._embed_cache_lookup_batch(world, ["z1"], 1536) == {"z1": array("b", [127] * 1536)}
 
 
 def test_prune_embed_cache_tolerates_valid_keys_missing_from_db(monkeypatch, tmp_path):

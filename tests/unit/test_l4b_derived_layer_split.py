@@ -85,7 +85,7 @@ def test_real_placement_three_layers_physically_separated(monkeypatch, tmp_path)
         assert (drag / f"{rel}.rag.md").is_file(), rel
         assert (drag / f"{rel}.rag_chunks.jsonl").is_file(), rel
         assert (dir_ / f"{rel}.evidence.json").is_file(), rel
-        assert (dir_ / f"{rel}.document.json").is_file(), rel
+        assert not (dir_ / f"{rel}.document.json").exists(), rel     # Document IR はファイルに書かない
         assert (dir_ / f"{rel}.derived.json").is_file(), rel
 
     # md/ に rag/ir 系ファイルが生成されない（受け入れ条件の直接固定）。

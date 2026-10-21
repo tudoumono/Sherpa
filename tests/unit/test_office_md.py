@@ -313,7 +313,7 @@ def test_refresh_document_ir_skips_sensitive_original_name(tmp_path):
     rep = office_md.refresh_document_ir(src, der)
     assert rep["document_ir_failed"] == 0 and rep["document_ir_generated"] == 1    # a.xlsx のみ
     assert not (der.parent / "ir" / "id_rsa.xlsx.document.json").exists()
-    assert (der.parent / "ir" / "a.xlsx.document.json").exists()
+    assert not (der.parent / "ir" / "a.xlsx.document.json").exists()          # 構築できるかを確かめるだけで書かない
 
 
 # ---- 部分抽出の検知（ING-1）----

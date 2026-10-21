@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import pathlib
 import re
@@ -546,8 +547,8 @@ def test_xlsx_extractor_version_included_in_document_and_evidence_sig():
 
 def test_upgrade_from_v1_signature_regenerates_v2_region_structure(tmp_path):
     """v1（旧 XLSX_EXTRACTOR_VERSION）構築済みの world を模し、drift 判定→refresh 関数の直接呼び出しで Document/Evidence IR が
-    現行版へ更新される**成果物そのもの**を検証する。マーカーだけ書き換わって中身が古いままの取り違えを検出するため
-    `.document.json` を壊してから refresh し、v2 固有の領域構造（隣接2表の分割・`score`）が再生成されることを確認する。"""
+    現行版へ更新されることを検証する。Document IR はファイルに書かない（v2 固有の領域構造＝隣接2表の分割・`score` は
+    構築結果で確かめる）。マーカーだけ書き換わって中身が古いままの取り違えを検出するため `.evidence.json` を壊してから refresh する。"""
     world = tmp_path / "world"
     world.mkdir()
     derived = tmp_path / "derived"
@@ -565,9 +566,9 @@ def test_upgrade_from_v1_signature_regenerates_v2_region_structure(tmp_path):
     office_md.build_derived(world, derived)
     doc_path = derived.parent / "ir" / "a.xlsx.document.json"
     evidence_path = derived.parent / "ir" / "a.xlsx.evidence.json"
-    original_doc_json = doc_path.read_text(encoding="utf-8")
+    assert not doc_path.exists()
     original_evidence_json = evidence_path.read_bytes()
-    v2_tables = [e for e in json.loads(original_doc_json)["elements"] if e["type"] == "table"]
+    v2_tables = [e for e in dataclasses.asdict(ooxml_arm._build_xlsx_ir(world / "a.xlsx"))["elements"] if e["type"] == "table"]
     assert len(v2_tables) == 2 and all("score" in t["source_map"] for t in v2_tables)
 
     doc_marker = derived / office_md._DOCUMENT_IR_SIG_MARKER
@@ -578,7 +579,6 @@ def test_upgrade_from_v1_signature_regenerates_v2_region_structure(tmp_path):
     assert xlsx_component in current_doc_sig and f"{xlsx_component};" in current_evidence_sig
     doc_marker.write_text(current_doc_sig.replace(xlsx_component, "xlsx=xlsx-ooxml-v1"), encoding="utf-8")
     evidence_marker.write_text(current_evidence_sig.replace(f"{xlsx_component};", "xlsx=xlsx-ooxml-v1;"), encoding="utf-8")
-    doc_path.write_text('{"corrupted": "v1-era placeholder"}', encoding="utf-8")
     evidence_path.write_text('{"corrupted": "v1-era placeholder"}', encoding="utf-8")
     assert office_md.document_ir_sig_drift(derived) is True and office_md.evidence_ir_sig_drift(derived) is True
 
@@ -587,11 +587,8 @@ def test_upgrade_from_v1_signature_regenerates_v2_region_structure(tmp_path):
     assert office_md.document_ir_sig_drift(derived) is False and office_md.evidence_ir_sig_drift(derived) is False
     assert doc_marker.read_text(encoding="utf-8") == current_doc_sig
     assert evidence_marker.read_text(encoding="utf-8") == current_evidence_sig
-    regenerated = doc_path.read_text(encoding="utf-8")
-    assert regenerated == original_doc_json                      # 壊した内容ではなく v2 の中身が復元される
-    regen_tables = [e for e in json.loads(regenerated)["elements"] if e["type"] == "table"]
-    assert len(regen_tables) == 2 and all("score" in t["source_map"] for t in regen_tables)
-    assert evidence_path.read_bytes() == original_evidence_json
+    assert not doc_path.exists()
+    assert evidence_path.read_bytes() == original_evidence_json  # 壊した内容ではなく v2 の中身が復元される
 
 
 # ---- 結合セルの異常・巨大宣言 ----

@@ -80,7 +80,7 @@ def test_derive_one_publishes_same_output_as_full_build_and_leaves_other_docs(wo
     full = tmp_path / "full" / "md"
     office_md.build_derived(src, full, world_sig="sig1")
     for layer, name in (("md", "a.xlsx.md"), ("rag", "a.xlsx.rag.md"), ("rag", "a.xlsx.rag_chunks.jsonl"),
-                        ("ir", "a.xlsx.document.json"), ("ir", "a.xlsx.derived.json")):
+                        ("ir", "a.xlsx.evidence.json"), ("ir", "a.xlsx.derived.json")):
         assert (der.parent / layer / name).read_bytes() == (full.parent / layer / name).read_bytes(), name
 
 

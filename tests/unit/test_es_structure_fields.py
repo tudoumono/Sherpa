@@ -211,7 +211,7 @@ def test_knn_only_applies_exact_filter(monkeypatch):
     captured = _capture(monkeypatch)
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: {"provider": "p", "model": "m", "dim": 2})
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
-        "embed_provider": "p", "embed_model": "m", "dim": 2, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID})
+        "embed_provider": "p", "embed_model": "m", "dim": 2, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
     monkeypatch.setattr(es_index.embeddings, "embed", lambda texts, ec, **kw: [[0.1, 0.2]])
     es_index.search_knn_only("w", "q", exact=["A01", "B02"])
     assert captured["body"]["knn"]["filter"] == [_EXACT_CLAUSE]

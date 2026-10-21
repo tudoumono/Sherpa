@@ -72,3 +72,17 @@ def test_fill_step_is_best_effort_but_lets_a_stop_through(monkeypatch):
     monkeypatch.setattr(worker.es_index, "fill_missing_vectors", stop)
     with pytest.raises(background.StopRequested):
         worker._fill_missing_vectors_step("w")
+
+
+def test_sync_records_low_disk_stop_so_that_resume_skips_it(monkeypatch):
+    """空きの不足で止まった同期は、中断の印に止めた理由と空きを残す（起動時の自動再開はこれを見て再開しない）。"""
+    def stop(*a, **k):
+        raise background.LowDiskStop(8 * 1024 ** 3)
+
+    monkeypatch.setattr(worker, "_sync_impl", stop)
+    finished = []
+    monkeypatch.setattr(worker.store, "finish_ingest_run", lambda run_id, **kw: finished.append((run_id, kw)))
+    assert worker.sync("w", run_id=7, op="sync")["interrupted"] is True
+    snap = finished[0][1]["extraction_snapshot"]
+    assert snap["interrupted"] is True and snap["stop_reason"] == "low_disk"
+    assert snap["flags"] == [{"doc": None, "action": "warn", "reason": "low_disk_stop:8.0"}]

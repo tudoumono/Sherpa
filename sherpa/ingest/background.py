@@ -9,6 +9,7 @@ Web アプリは取り込みを動かさない。資料フォルダに触れる�
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -35,6 +36,30 @@ class StopRequested(Exception):
     """停止要求を受けて、取り込みが区切りで止まった（再開できる中断。失敗ではない）。"""
 
 
+LOW_DISK_STOP_REASON = "low_disk"
+
+
+class LowDiskStop(StopRequested):
+    """ディスクの空きが少ないため、取り込みが区切りで止まった（起動時に自動では再開しない＝利用者が「更新」を押すまで待つ）。"""
+
+    def __init__(self, free_bytes: int):
+        self.free_bytes = free_bytes
+        super().__init__(low_disk_message(free_bytes))
+
+
+def low_disk_message(free_bytes: int) -> str:
+    return f"ディスクの空きが少ないため取り込みを止めました（空き {free_bytes / 1024 ** 3:.1f} GB）"
+
+
+def stop_record(exc: BaseException) -> dict:
+    """止まった run の記録に足す欄（`stop_reason`）と注意の flag。空きの不足で止まったときだけ中身がある。"""
+    if not isinstance(exc, LowDiskStop):
+        return {}
+    return {"stop_reason": LOW_DISK_STOP_REASON,
+            "flags": [{"doc": None, "action": "warn",
+                       "reason": f"low_disk_stop:{exc.free_bytes / 1024 ** 3:.1f}"}]}
+
+
 _accepting = True                  # lifespan shutdown が False にする（新規受付停止）
 _ACCEPT_LOCK = threading.Lock()
 _stop_event = threading.Event()    # 立つと、取り込みは次の区切り（1 ファイル・1 段）へ進まずに止まる
@@ -57,6 +82,26 @@ def raise_if_stop_requested() -> None:
     """区切り（1 ファイル・1 段の前）で呼ぶ。停止要求が立っていれば `StopRequested`。"""
     if stop_requested():
         raise StopRequested()
+
+
+def in_run() -> bool:
+    """呼び出し元が取り込みの run を実行しているスレッドか。"""
+    return getattr(_tls, "run_id", None) is not None
+
+
+def in_followup() -> bool:
+    """呼び出し元が取り込みワーカーの run の後追い（`followup_scope` の中）か。"""
+    return bool(getattr(_tls, "followup", False))
+
+
+@contextlib.contextmanager
+def followup_scope():
+    """run の後追い（LLM 成形の反映など）の間だけ、ディスクの空きの確認（`es_index._space_point`）を有効にする。"""
+    _tls.followup = True
+    try:
+        yield
+    finally:
+        _tls.followup = False
 
 
 def bind_run(run_id: int) -> None:

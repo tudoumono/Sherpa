@@ -56,7 +56,7 @@ def test_workers_do_not_change_derived_bytes(tmp_path, monkeypatch, caplog):
     rep3, files3 = _build(src, tmp_path / "w3", 3, monkeypatch, caplog)
 
     assert rep1["converted"] >= len(CORPUS) - 1 and rep1["failed"] >= 1
-    assert any(k.endswith(".document.json") for k in files1) and any(k.endswith(".evidence.json") for k in files1)
+    assert not any(k.endswith(".document.json") for k in files1) and any(k.endswith(".evidence.json") for k in files1)
     assert sorted(files3) == sorted(files1)
     assert [k for k in files1 if files1[k] != files3[k]] == []
     assert rep3 == rep1

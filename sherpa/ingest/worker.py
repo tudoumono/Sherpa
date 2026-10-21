@@ -557,12 +557,15 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
     def _record(status, reflected=None, ledger=0, extra_flags=(), drep=None,
                es_summary=None, neo4j_summary=None,
                confirm_sig=None, confirm_manifest=None, confirm_doc_count=None,
-               confirm_scan_report=None, interrupted=False):
-        fl = list(flags) + list(extra_flags)
+               confirm_scan_report=None, interrupted=False, stop=None):
+        stop = stop or {}
+        fl = list(stop.get("flags", [])) + list(flags) + list(extra_flags)   # 止めた理由は切り詰めの外に落とさない
         snap = {"docs": len(rows), "nodes": len(nodes), "edges": len(edges), "flags": fl}
         if interrupted:
             snap["interrupted"] = True       # 停止要求で区切りに止まった（起動時に自動で続きを始める）。起動時の格下げと同じ表し方
             snap["op"] = op
+            if stop.get("stop_reason"):
+                snap["stop_reason"] = stop["stop_reason"]   # 空きの不足で止まった（起動時に自動では再開しない）
         if drep is not None:
             # office_md 段の要約（失敗した run でも、derive まで進んでいれば失敗ファイル一覧を残す）
             snap["office_md"] = _office_md_stage_summary(drep)
@@ -786,10 +789,10 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
                     # confirm の失敗は flags へ反映する（成功で覆い隠さない）
                     extra.append({"doc": None, "action": "warn",
                                   "reason": "human_md_es_sig_marker_confirm_failed"})
-    except background.StopRequested:                        # 停止要求＝ES の区切りで止まった。作りかけの索引は消してあり、署名は確定しない（次回は作り直す）
-        _log.info("停止要求により ES 索引の区切りで取り込みを中断しました: world=%s", world)
+    except background.StopRequested as e:                   # 停止要求・空きの不足＝ES の区切りで止まった。作りかけの索引は消してあり、署名は確定しない（次回は作り直す）
+        _log.info("ES 索引の区切りで取り込みを中断しました: world=%s・%s", world, str(e) or "停止要求")
         return _record("failed", interrupted=True, reflected={"nodes": n, "edges": m}, ledger=written,
-                       extra_flags=extra, drep=drep)
+                       extra_flags=extra, drep=drep, stop=background.stop_record(e))
     except Exception as e:
         esr = {"available": None, "error": f"{e.__class__.__name__}@{_target_of(es_index._url())}"}
         extra.append({"doc": None, "action": "warn",
@@ -1401,12 +1404,12 @@ def sync(world, *, reflect=True, force=False, run_id=None, on_run_id=None, op: s
     try:
         with resolve_settings.pinned(world):        # 変更なしの分岐（グラフの自己修復）も含め、1 回の sync は同じ設定を使う
             result = _sync_impl(world, reflect=reflect, force=force, run_id=run_id, on_run_id=on_run_id, op=op)
-    except background.StopRequested:                # 変更なしの分岐の ES の区切りで止まった＝失敗ではなく中断（起動時に自動で続きを始める）
-        _log.info("停止要求により ES 索引の区切りで同期を中断しました: world=%s", world)
+    except background.StopRequested as e:           # 変更なしの分岐の ES の区切りで止まった＝失敗ではなく中断（起動時に自動で続きを始める。空きの不足は除く）
+        _log.info("ES 索引の区切りで同期を中断しました: world=%s・%s", world, str(e) or "停止要求")
         if run_id is not None:
             try:
                 store.finish_ingest_run(run_id, status="failed", extraction_snapshot={
-                    "changed": False, "interrupted": True, "op": op})
+                    "changed": False, "interrupted": True, "op": op, **background.stop_record(e)})
             except Exception:
                 _log.warning("中断の記録に失敗しました（best-effort）: world=%s run_id=%s", world, run_id, exc_info=True)
         return {"world": world, "changed": False, "status": "failed", "ledger": 0, "interrupted": True}

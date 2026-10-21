@@ -19,7 +19,7 @@ from .ingest import text_kind
 
 
 def semantic_dir(world_id: str) -> Path:
-    """派生 `semantic/` ディレクトリ（ES の埋め込みキャッシュ〔SQLite・`embed_cache.f32.sqlite3`。写し替え前は旧形式の `embed_cache.sqlite3`〕の置き場）。"""
+    """派生 `semantic/` ディレクトリ（ES の埋め込みキャッシュ〔SQLite・`embed_cache.i8.sqlite3`。写し替え前は古い形式の `embed_cache.f32.sqlite3`・`embed_cache.sqlite3`〕の置き場）。"""
     return derived_dir(world_id) / "semantic"
 
 
@@ -86,7 +86,7 @@ def rag_md_path(world_id: str, doc_id: str) -> Path | None:
 
 
 def derived_ir_dir(world_id: str) -> Path:
-    """中間表現の置き場（`{rel}.document.json`／`{rel}.evidence.json`／`{rel}.context.json`／`{rel}.derived.json`／`{rel}.ocr_route.json`）。再生成可能・検索には出さない・drift 判定専用。"""
+    """中間表現の置き場（`{rel}.evidence.json`／`{rel}.context.json`／`{rel}.derived.json`／`{rel}.ocr_route.json`）。再生成可能・検索には出さない・drift 判定専用。"""
     return derived_dir(world_id) / "ir"
 
 

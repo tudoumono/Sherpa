@@ -1,6 +1,6 @@
-"""表の行のまとまり（ベクトルは行ごとでなく、まとまりに 1 本）の単体テスト。実 ES 不要。
+"""表の行・本文のまとまり（ベクトルはチャンクごとでなく、まとまりに 1 本）の単体テスト。実 ES 不要。
 
-設計: docs/design/rag.md「表の行のまとまり」。
+設計: docs/design/rag.md「表の行・本文のまとまり」。
 """
 from __future__ import annotations
 
@@ -85,11 +85,77 @@ def test_coordinate_rows_use_cell_position_and_label_instead_of_column_names(tmp
     assert entries[0][2].split("\n") == ["一覧", "A1 受入検査集計", "B2 作成: 品質保証部"]
 
 
-def test_non_table_chunks_keep_their_own_text_and_vector(tmp_path):
-    rows = [_row("p1", kind="paragraph"), _row("p2", kind="heading")]
-    entries = _entries(tmp_path, rows)
-    assert [(t, skip) for _i, _b, t, skip in entries] == [("本文 p1", False), ("本文 p2", False)]
+def _para(cid, kind="paragraph", parent=None, section=("節「1」",), page=None):
+    return {"chunk_id": cid, "source_rel_path": "a.xlsx", "content_type": kind, "parent_id": parent,
+            "section_path": list(section), "body": cid,
+            "citations": [{"locator": {"part": "word/document.xml", "object_id": cid, **({"page": page} if page else {})}}]}
+
+
+def _para_text(cid, n=20):
+    return f"出所: 原本「a」 / 節「1」\n本文: 「{cid}{'あ' * n}」"
+
+
+def test_body_chunks_of_one_section_get_one_vector_on_the_head(tmp_path):
+    rows = [_para("h1", kind="heading"), _para("p1"), _para("p2")]
+    anchors = {"h1": "## 節「1」\n\n出所: 原本「a」 / 節「1」\n見出し: 「1」", "p1": _para_text("p1"), "p2": _para_text("p2")}
+    entries = _entries(tmp_path, rows, anchors)
+    assert len(entries) == 3                                   # 全文検索の単位（1 チャンク 1 件）は変えない
+    assert _heads(entries) == [("h1", 3)]
+    _i, head, text, _skip = entries[0]
+    assert text == head["vector_text"] and head["text"] == anchors["h1"]
+    assert text.split("\n") == anchors["h1"].split("\n") + [f"本文: 「p1{'あ' * 20}」", f"本文: 「p2{'あ' * 20}」"]
+    assert head["row_group"]["chunk_ids"] == ["h1", "p1", "p2"]
+    assert head["row_group"]["locator"] == {"part": "word/document.xml", "object_id": "h1"}
+    assert [t for _i, _b, t, skip in entries if skip] == [anchors["p1"], anchors["p2"]]
+    assert all("vector_text" not in body and "row_group" not in body for _i, body, _t, skip in entries if skip)
+
+
+def test_body_groups_break_at_section_region_kind_and_size(tmp_path):
+    rows = [_para("a1"), _para("a2"), _para("b1", section=("節「2」",)), _para("b2", section=("節「2」",)),
+            _para("c1", section=("節「2」",), parent="region-9"), _para("c2", section=("節「2」",), parent="region-9"),
+            _para("img", kind="picture", section=("節「2」",), parent="region-9"),
+            _para("d1", section=("節「2」",), parent="region-9"), _para("f1", kind="formula", section=("節「2」",), parent="region-9"),
+            _para("f2", kind="formula", section=("節「2」",), parent="region-9")]
+    entries = _entries(tmp_path, rows, {r["chunk_id"]: _para_text(r["chunk_id"]) for r in rows})
+    assert _heads(entries) == [("a1", 2), ("b1", 2), ("c1", 2), ("img", 1), ("d1", 1), ("f1", 2)]
+
+    n = 30
+    rows = [_para(f"p{i}") for i in range(n)]
+    entries = _entries(tmp_path, rows, {r["chunk_id"]: _para_text(r["chunk_id"], 200) for r in rows})
+    heads = [(body, text) for _i, body, text, skip in entries if not skip]
+    assert len(heads) > 1 and sum(b.get("row_group", {}).get("rows", 1) for b, _t in heads) == n
+    assert all(len(t) <= es_index._BODY_GROUP_MAX_CHARS and len(t.encode("utf-8")) <= 8000 for b, t in heads if "row_group" in b)
+
+
+def test_single_body_chunk_and_long_chunk_keep_their_own_text(tmp_path):
+    long_text = _para_text("p2", 1200)
+    rows = [_para("p1", section=("節「0」",)), _para("p2"), _para("p3")]
+    entries = _entries(tmp_path, rows, {"p1": _para_text("p1"), "p2": long_text, "p3": _para_text("p3")})
+    assert [(t, skip) for _i, _b, t, skip in entries] == [(_para_text("p1"), False), (long_text, False),
+                                                       (_para_text("p3"), False)]
     assert all("vector_text" not in body for _i, body, _t, _s in entries)
+
+
+def test_body_and_table_rows_are_not_mixed(tmp_path):
+    rows = [_para("p1", parent="region-1", section=()), _para("p2", parent="region-1", section=()),
+            _row("r1"), _row("r2"), _para("p3", parent="region-1", section=()), _para("p4", parent="region-1", section=())]
+    entries = _entries(tmp_path, rows)
+    assert _heads(entries) == [("p1", 2), ("r1", 2), ("p3", 2)]
+    groups = {b["chunk_id"]: b["row_group"]["chunk_ids"] for _i, b, _t, skip in entries if not skip}
+    assert groups == {"p1": ["p1", "p2"], "r1": ["r1", "r2"], "p3": ["p3", "p4"]}
+
+
+def test_vector_hit_on_body_group_returns_group_text_and_range_keyword_hit_one_chunk(tmp_path):
+    rows = [_para("p1"), _para("p2")]
+    anchors = {"p1": _para_text("p1"), "p2": _para_text("p2")}
+    entries = _entries(tmp_path, rows, anchors)
+    res = {"hits": {"hits": [_es_hit(es_id, body) for es_id, body, _t, _s in entries]}}
+    vec = es_index._parse_hits(res, vector=True)
+    assert vec[0]["text"] == entries[0][1]["vector_text"] and vec[0]["chunk_id"] == "p1"
+    assert vec[0]["row_group_chunk_ids"] == ["p1", "p2"]
+    assert vec[0]["locator"] == {"part": "word/document.xml", "object_id": "p1"}
+    kw = es_index._parse_hits(res)
+    assert [h["text"] for h in kw] == [anchors["p1"], anchors["p2"]] and all("row_group_chunk_ids" not in h for h in kw)
 
 
 def test_rendered_excel_table_groups_rows_with_sheet_and_row_range(tmp_path):
@@ -182,7 +248,7 @@ def test_fill_missing_vectors_embeds_group_text_for_group_head(monkeypatch):
     monkeypatch.setattr(es_index, "_embed_system_settings_snapshot", lambda: None)
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "embed_provider": "openai", "embed_model": "m", "dim": 2,
-        "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID})
+        "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
     monkeypatch.setattr(es_index, "_req", fake_req)
     monkeypatch.setattr(es_index, "_embed_failed_at", {})
 

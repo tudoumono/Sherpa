@@ -63,7 +63,7 @@ DOCX_EXTRACTOR_VERSION = "docx-ooxml-v5"
 # PowerPoint 抽出器の版。docx/xlsx とは独立した版番号（`_current_document_ir_sig` が `docx=`/`pptx=`/`xlsx=` を別成分で持つ）。
 PPTX_EXTRACTOR_VERSION = "pptx-ooxml-v2"
 # Excel 抽出器の版。docx/pptx とは独立した版番号。座標解決・要素の抽出規則が変わったら上げる。この値は `_current_document_ir_sig`/`_current_evidence_ir_sig` の `xlsx=` 成分に入る。
-# 上げると `worker.sync`（`_refresh_derived_representations`）が `document_ir_sig_drift` を検知し、`refresh_document_ir` が document.json／evidence／rag（RAG_ES 有効時は ES 索引）まで連鎖再生成する。人間向け `{rel}.md` は別系統（`office_md._current_human_md_sig()`）だが、この版と `DOCX_EXTRACTOR_VERSION` が合成されるため、上げると `{rel}.md` も1回だけ作り直される。
+# 上げると `worker.sync`（`_refresh_derived_representations`）が `document_ir_sig_drift` を検知し、`refresh_document_ir` が IR の確かめ／evidence／rag（RAG_ES 有効時は ES 索引）まで連鎖再生成する。人間向け `{rel}.md` は別系統（`office_md._current_human_md_sig()`）だが、この版と `DOCX_EXTRACTOR_VERSION` が合成されるため、上げると `{rel}.md` も1回だけ作り直される。
 XLSX_EXTRACTOR_VERSION = "xlsx-ooxml-v7"
 
 # document-ir を並行構築する対象拡張子（legacy .xls は対象外＝来歴を汚さないため）。

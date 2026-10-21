@@ -368,38 +368,17 @@ def write_document_ir_sig_marker(derived_md_dir) -> None:
     _write_document_ir_sig_marker(Path(derived_md_dir))
 
 
-def _document_json_is_current(path: Path, rel: str) -> bool:
-    """`{rel}.document.json` が今の版で読めるか（先頭と末尾の一部だけを読む。全体は JSON として解析しない）。
-
-    決定的な出力（キー昇順・末尾が `}`）の先頭に自分の `doc_id`、末尾に現行の `schema_version` があることを確かめる。
-    途中で切れた・壊れた・旧いスキーマの document.json は False。
-    """
-    from . import document_ir
-    rel_json = json.dumps(rel, ensure_ascii=False)
-    n = len(rel_json.encode("utf-8"))  # 先頭の doc_id・末尾の source.path がパスの長さだけ伸びる
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as f:
-            head = f.read(1024 + n).decode("utf-8", errors="replace")
-            f.seek(max(0, size - 2048 - n))
-            tail = f.read().decode("utf-8", errors="replace")
-    except OSError:
-        return False
-    return (head.lstrip().startswith("{") and rel_json in head
-            and tail.rstrip().endswith("}")
-            and f'"schema_version": {json.dumps(document_ir.DOCUMENT_IR_SCHEMA_VERSION)}' in tail)
-
-
 def settle_document_ir_sig_for_notices(wd, derived, *, world: str | None = None) -> bool:
-    """`.document_ir_sig` が無く、document.json を持たない OOXML 原本が失敗の知らせの文書だけなら、印を現行値で確定する。
+    """`.document_ir_sig` が無く、Evidence IR が今の版（`.evidence_ir_sig`）で、`evidence.json` を持たない OOXML 原本が失敗の知らせの文書だけなら、印を現行値で確定する。
 
     失敗の知らせの文書の IR 失敗は失敗の一覧で管理する（`build_derived` と同じ扱い）。印が無いまま残った旧い派生が、
-    更新のたびに全 OOXML の再パースと下流の作り直しを呼ぶのを止める。知らせの文書が 1 件も無い・知らせ以外に今の版で読める document.json を持たない文書があるときは何もしない。
+    更新のたびに全 OOXML の再パースと下流の作り直しを呼ぶのを止める。知らせの文書が 1 件も無い・Evidence IR が今の版でない・
+    知らせ以外に `evidence.json` を持たない文書があるときは何もしない。
     """
     from .. import scope_infer as si
     from .arms import ooxml_arm
     dr = Path(derived)
-    if (dr / _DOCUMENT_IR_SIG_MARKER).exists():
+    if (dr / _DOCUMENT_IR_SIG_MARKER).exists() or evidence_ir_sig_drift(dr):
         return False
     dr_ir = _sibling_layer_dir(dr, "ir")
     notices = 0
@@ -409,7 +388,7 @@ def settle_document_ir_sig_for_notices(wd, derived, *, world: str | None = None)
             continue
         if _md_is_failure_notice(dr, rel):
             notices += 1
-        elif not _document_json_is_current(dr_ir / (rel + ".document.json"), rel):
+        elif not (dr_ir / (rel + ".evidence.json")).is_file():
             return False
     if notices == 0:
         return False
@@ -1202,13 +1181,12 @@ def _stamp_rule_only_rag_markdown(markdown: str) -> str:
 
 
 # `.derived.json`（sidecar マニフェスト）が記録する 5 種の sidecar 種別（`_MANIFEST_SIDECAR_SUFFIXES`）がどの層へ置かれるか。
-# 中間（ir）: document/evidence/derived/ocr_route の各 json。RAG 正本（rag）: rag.md・rag_chunks.jsonl・assets/。人間用（md）: md・md.meta.json。
+# 中間（ir）: evidence/context/derived/ocr_route の各 json。RAG 正本（rag）: rag.md・rag_chunks.jsonl・assets/。人間用（md）: md・md.meta.json。
 _LAYER_FOR_SIDECAR_SUFFIX = {
     ".md": "md",
     ".md.meta.json": "md",
     ".evidence.json": "ir",
     ".context.json": "ir",
-    ".document.json": "ir",
     ".derived.json": "ir",
     ".ocr_route.json": "ir",
     ".rag.md": "rag",
@@ -1699,7 +1677,7 @@ _CONV_CACHE_DIRNAME = "_conv_cache"
 # per-file キャッシュがミラーする sidecar 種別（`_LAYER_FOR_SIDECAR_SUFFIX` の部分集合）。
 # `.derived.json` は復元後に `_write_derived_sidecar_manifest` が毎回書き直し、`.ocr_route.json` は `build_derived` が資料フォルダ単位で書くため対象外。
 _CONV_CACHE_SIDECAR_SUFFIXES = (
-    ".md", ".md.meta.json", ".evidence.json", ".context.json", ".document.json", ".rag.md", ".rag_chunks.jsonl",
+    ".md", ".md.meta.json", ".evidence.json", ".context.json", ".rag.md", ".rag_chunks.jsonl",
 )
 # rep_delta のうち「MD 自体は成功したが一部書込が失敗した」ことを示すカウンタ。
 # いずれかが非ゼロの結果はキャッシュへ保存せず、既存キャッシュも復元時に拒否する（失敗を焼き付けず、次回 sync で再試行させる）。
@@ -1809,6 +1787,7 @@ def _conv_cache_restore(content_dir: Path, rel: str, dr: Path, dr_rag: Path, dr_
     """キャッシュ内容一式を 3 層のステージングへ戻す（ハードリンク・作れなければコピー。成功時 True）。失敗（OSError）したら呼び出し元は実変換へフォールバックする。"""
     roots = {"md": dr, "rag": dr_rag, "ir": dr_ir}
     try:
+        (content_dir / "ir" / (rel + ".document.json")).unlink(missing_ok=True)   # 旧版が残した読み手の無いファイル（公開側と実体を共有していて、残すとディスクが返らない）
         for suffix in _CONV_CACHE_SIDECAR_SUFFIXES:
             src = content_dir / _LAYER_FOR_SIDECAR_SUFFIX[suffix] / (rel + suffix)
             if not src.is_file():
@@ -1826,6 +1805,26 @@ def _conv_cache_restore(content_dir: Path, rel: str, dr: Path, dr_rag: Path, dr_
         _log.warning(
             "変換結果キャッシュの復元に失敗しました（実変換へフォールバックします）: %s", rel, exc_info=True)
         return False
+
+
+def remove_document_json(derived_md_dir) -> tuple[int, int]:
+    """公開中の `ir/` と変換結果キャッシュに残る `*.document.json` を消す。`(消した件数, 解放した大きさ)`。ハードリンクで同じ実体を共有するものは 1 つと数える。"""
+    count = freed = 0
+    seen: set = set()
+    for root in (_sibling_layer_dir(Path(derived_md_dir), "ir"), _conv_cache_root_for(derived_md_dir)):
+        if not root.is_dir():
+            continue
+        for p in root.rglob("*.document.json"):
+            try:
+                st = p.stat()
+                p.unlink()
+            except OSError:
+                continue
+            count += 1
+            if (st.st_dev, st.st_ino) not in seen:
+                seen.add((st.st_dev, st.st_ino))
+                freed += st.st_size
+    return count, freed
 
 
 def _conv_cache_store(cache_root: Path, rel: str, key: str, rep_delta: dict,
@@ -2147,7 +2146,6 @@ def _build_derived_staging_body(
         return rep
     from . import arms as _arms
     from . import context_ir
-    from . import document_ir
     from . import evidence_ir
     from . import evidence_render
     from . import legacy_provenance
@@ -2867,25 +2865,13 @@ def _build_derived_staging_body(
                 human_md_sig_for_rel = _current_pdf_human_md_sig()
             _write_prov(
                 dst, arm_name, result, legacy_conversion=legacy_conversion)  # 来歴サイドカーをESチャンクメタへ搬送
-            # IR は原本が素の .docx/.pptx/.xlsx のときだけ書く。旧 .doc/.ppt/.xls は前段変換後の一時 OOXML から IR を作れてしまうが、
-            # doc_id/source.path は原本 rel なのに file_type・content_hash が変換後ファイルの値になる（来歴汚染）ため、
-            # legacy 経路（`ext` が原本の拡張子）では document.json を書かない。
-            if ext in ooxml_arm._IR_EXTS:                     # document-ir-v2 の並行生成
+            # Document IR はメモリ上で Evidence へ移すだけでファイルには書かない（数えるのは原本が素の .docx/.pptx/.xlsx のときだけ）
+            if ext in ooxml_arm._IR_EXTS:
                 if doc_present:
-                    if pre is not None:
-                        document_json = pre.document_json
-                    else:
+                    if pre is None:
                         result.document.doc_id = rel
-                        result.document.source.path = rel    # 絶対パス（環境依存値）を派生物に残さない＝決定的
-                        document_json = document_ir.to_json_str(result.document)
-                    try:                                       # 失敗を握りつぶさず計上する（write_text_atomic）
-                        json_io.write_text_atomic(dr_ir / (rel + ".document.json"), document_json)
-                        document_ir_generated += 1
-                    except OSError:
-                        document_ir_failed += 1
-                        document_ir_failures.append({"doc": rel, "reason": "write_failed"})
-                        _log.warning(
-                            "document.json の書込に失敗しました（次回 sync の drift 検知で再試行）: %s", rel)
+                        result.document.source.path = rel    # 絶対パス（環境依存値）を Evidence に残さない＝決定的
+                    document_ir_generated += 1
                 else:
                     # アーム側で IR 構築自体が例外で失敗した場合は notes に `document_ir_failed:<ExcClassName>` が残る（md は継続）。IR の失敗も握りつぶさず計上する。
                     boom = next((n for n in result.notes if n.startswith("document_ir_failed:")), None)
@@ -2894,7 +2880,7 @@ def _build_derived_staging_body(
                         document_ir_failures.append(
                             {"doc": rel, "reason": f"build_failed:{boom.split(':', 1)[1]}"})
             if (ext in EVIDENCE_EXT and _evidence_arm_selected(ext, arm_name)) or legacy_conversion is not None:
-                # 現行 document.json/blocks/chunks を書き終えてから同じ Document IR を Evidence へ移す
+                # 同じ Document IR を Evidence へ移す
                 # （consume_legacy で table cell list を順次空にし、密表で 2 組の cell object を同時保持しない）
                 prerendered = pre.rendered if pre is not None else None
                 if prerendered is not None:
@@ -2914,9 +2900,7 @@ def _build_derived_staging_body(
                 if rel in source_failure_notices and evidence_md is not None:
                     # 通常 MD/Document IR は失敗 notice の検索表現と混在させない。文書単位 failed として notice chain だけを公開し、
                     # 他文書は同じ generation で継続する。
-                    artifact = dr_ir / (rel + ".document.json")
-                    if artifact.exists():
-                        artifact.unlink()
+                    if ext in ooxml_arm._IR_EXTS and doc_present:
                         document_ir_generated = max(0, document_ir_generated - 1)
                     human_md_sig_for_rel = None       # .md を失敗noticeで上書き＝human_md版の記録は無効
                     json_io.write_text_atomic(dst, evidence_md)
@@ -3020,8 +3004,8 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
     """IR だけの軽量再生成。`build_derived` と違い derived を全消去しない（MD／meta.json／`.arms_sig` には触れない）。
 
     `wd` を `scope_infer.safe_files` で歩き、原本が素の `.docx`/`.pptx`/`.xlsx`（旧形式は対象外）かつ対応する `derived/{rel}.md` が既に在る文書だけを
-    `ooxml_arm._build_docx_ir`/`_build_pptx_ir`/`_build_xlsx_ir` で再構築して原子書込し、原本が無くなった stale な `*.document.json` は削除する。
-    `world` を渡すと zip/tar 展開先（`_archive_also_root`）も歩く（省くと展開先の `.document.json` が stale として削除される）。
+    `ooxml_arm._build_docx_ir`/`_build_pptx_ir`/`_build_xlsx_ir` で再構築できるかを確かめる（ファイルには書かない）。古い版が書いた `*.document.json` が残っていれば消す。
+    `world` を渡すと zip/tar 展開先（`_archive_also_root`）も歩く。
     マーカー `.document_ir_sig` は資料フォルダ単位で 1 つのため、対象の OOXML 文書は全件再生成する。
 
     返値 `{document_ir_generated, document_ir_failed, document_ir_failures:[{doc, reason}]}`。
@@ -3030,22 +3014,20 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
     1 文書ごとの想定内の失敗は個別に計上し、想定外の例外は呼び出し元（`worker.sync`）へ伝播する。
     """
     from .. import scope_infer as si
-    from . import document_ir
     from .arms import ooxml_arm
     wd = Path(wd).resolve()
     try:
         dr = Path(derived).resolve()
     except OSError:
         dr = Path(derived)
-    dr_ir = _sibling_layer_dir(dr, "ir")           # `.document.json` は ir 層
-    # `build_derived` と同じ重なりガード: derived がソース配下と重なる/同一だと、`.document.json` 書込と stale 一掃 unlink が
-    # READ-ONLY source の汚染・削除になる。書く前に拒否する。
+    dr_ir = _sibling_layer_dir(dr, "ir")           # 古い `.document.json` は ir 層
+    # `build_derived` と同じ重なりガード: derived がソース配下と重なる/同一だと、古い `.document.json` の一掃 unlink が
+    # READ-ONLY source の削除になる。触る前に拒否する。
     if _within(dr, wd) or _within(wd, dr) or _within(dr_ir, wd) or _within(wd, dr_ir):
         return {"document_ir_generated": 0, "document_ir_failed": 0, "document_ir_failures": [],
                 "error": "derived_overlaps_source"}
     generated = failed = 0
     failures: list[dict] = []
-    seen_ir: set[str] = set()
     for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         ext = rp.suffix.lower()
         if ext not in ooxml_arm._IR_EXTS:
@@ -3058,7 +3040,6 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
             continue
         if _md_is_failure_notice(dr, rel):                   # 失敗の知らせは IR を持たない（知らせのまま触れない）
             continue
-        seen_ir.add(rel)
         try:
             if ext == ".docx":
                 ir = ooxml_arm._build_docx_ir(rp)
@@ -3074,21 +3055,12 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
             failed += 1
             failures.append({"doc": rel, "reason": "build_failed:None"})
             continue
-        ir.doc_id = rel
-        ir.source.path = rel                                  # 絶対パス（環境依存値）を派生物に残さない＝決定的
+        generated += 1
+    for doc_path in dr_ir.rglob("*.document.json"):           # 古い版が書いた document.json を一掃
         try:
-            json_io.write_text_atomic(dr_ir / (rel + ".document.json"), document_ir.to_json_str(ir))
-            generated += 1
+            doc_path.unlink()
         except OSError:
-            failed += 1
-            failures.append({"doc": rel, "reason": "write_failed"})
-    for doc_path in dr_ir.rglob("*.document.json"):           # stale な document.json（原本が消えた）を一掃
-        rel = doc_path.relative_to(dr_ir).as_posix()[: -len(".document.json")]
-        if rel not in seen_ir:
-            try:
-                doc_path.unlink()
-            except OSError:
-                pass
+            pass
     if failed == 0:
         if write_document_ir_sig_marker:                  # False＝呼び出し元が連鎖成功を確認後に確定する
             _write_document_ir_sig_marker(dr)

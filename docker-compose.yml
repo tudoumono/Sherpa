@@ -8,10 +8,18 @@
 #    ②Office COM は Windows-side の独立ワーカー＋API（11-Office変換.md）。
 name: sherpa-mvp
 
+# 各コンテナのログの上限（1 ファイル 50MB・3 世代）
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   postgres:                       # RDB 正本（documents / ingest_runs / analyses / users …）
     image: postgres:16
     restart: unless-stopped       # OS に止められても戻る（make stop で止めたものは戻さない）
+    logging: *default-logging
     environment:
       POSTGRES_USER: sherpa
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sherpa_dev}
@@ -31,8 +39,11 @@ services:
   neo4j:                          # GraphRAG（影響範囲分析・world ごと1グラフ）
     image: neo4j:5-community
     restart: unless-stopped
+    logging: *default-logging
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-sherpa_dev}
+      # トランザクションのログは大きさで区切る（db.tx_log.rotation.retention_policy。古いものは回転・checkpoint のときに消える）
+      NEO4J_db_tx__log_rotation_retention__policy: "512M size"
       # 上限は scripts/lib/mem_budget.sh が全体のメモリから決めて渡す（直接 compose を呼んだときの既定は下の値）
       NEO4J_server_memory_heap_initial__size: ${SHERPA_NEO4J_HEAP_RESOLVED:-1g}
       NEO4J_server_memory_heap_max__size: ${SHERPA_NEO4J_HEAP_RESOLVED:-1g}
@@ -50,6 +61,7 @@ services:
     build: ./docker/elasticsearch # 日本語形態素 analysis-kuromoji 入り（PG/Neo4j は素で日本語OK）
     image: sherpa/es-kuromoji:8.19.20
     restart: unless-stopped
+    logging: *default-logging
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
@@ -72,6 +84,7 @@ services:
       dockerfile: docker/ocr/Dockerfile
     image: sherpa/ocr-worker:paddleocr-3.7.0-cpu
     init: true
+    logging: *default-logging
     user: "${SHERPA_OCR_UID:-1000}:${SHERPA_OCR_GID:-1000}"
     depends_on:
       postgres:

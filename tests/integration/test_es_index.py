@@ -123,6 +123,44 @@ def test_vector_hybrid_stubbed():
         es.index_world(V, settings={})                        # BM25 索引へ戻す（DISABLE_EMBED）
 
 
+def test_byte_vector_knn_roundtrip():
+    """byte の dense_vector に縮めて入れた切れ端を、同じ本文の問いで kNN すると自分自身が最上位に来る（実 ES）。"""
+    if not es.available():
+        pytest.skip("ES 未起動")
+    import hashlib
+
+    from _world_registry import register_test_world
+
+    from sherpa import embeddings
+    register_test_world(V)
+
+    def vec_for(t):
+        h = hashlib.sha256(t.strip().encode("utf-8")).digest()
+        return [(b - 127.5) / 1000.0 for b in h[:16]]
+
+    oc, oe = embeddings.cfg, embeddings.embed
+    embeddings.cfg = lambda settings=None, **kw: {"provider": "stub", "key": "x", "model": "stub", "dim": 16}
+    embeddings.embed = lambda texts, c, **kw: [vec_for(t) for t in texts]
+    try:
+        r = es.index_world(V, settings={})
+        assert r.get("vectors") is True and r["chunks"] > 0
+        mapping = next(iter(es._req("GET", f"/{es._index(V)}/_mapping").values()))["mappings"]
+        assert mapping["properties"]["embedding"]["element_type"] == "byte"
+        assert mapping["_meta"]["quant"] == embeddings.ES_VECTOR_QUANT
+        res = es._req("POST", f"/{es._index(V)}/_search",
+                      {"size": 5, "_source": ["text", "vector_text"],
+                       "query": {"exists": {"field": "embedding"}}})
+        rows = [h["_source"] for h in res["hits"]["hits"]]
+        assert rows
+        for src in rows:
+            t = src.get("vector_text") or src["text"]
+            hits, reason = es.search_knn_only(V, t, k=3, settings={})
+            assert reason is None and hits and hits[0]["text"] == src["text"]
+    finally:
+        embeddings.cfg, embeddings.embed = oc, oe
+        es.index_world(V, settings={})
+
+
 def test_qa_merge_brings_in_es():
     """Codex/非agentic も ES を参照できる＝qa の facts(citations) に ES ヒットが統合される（stub・重複排除）。"""
     from sherpa import chat_service, documents, es_index
@@ -161,12 +199,12 @@ def test_embed_cache_reuse():
     from sherpa import embeddings
     calls = []                                            # embed に渡したテキスト群を記録（=実 API コール）
     o_embed, o_dd = embeddings.embed, es.worlds.derived_dir
-    embeddings.embed = lambda texts, c, **kw: (calls.append(list(texts)) or [[0.0] * c["dim"] for _ in texts])
+    embeddings.embed = lambda texts, c, **kw: (calls.append(list(texts)) or [[0.1] * c["dim"] for _ in texts])
     tmp = tempfile.mkdtemp()
     es.worlds.derived_dir = lambda w: pathlib.Path(tmp) / w
     ec = {"provider": "p", "model": "m", "dim": 4}
     w = "embcache_test"
-    db_path = pathlib.Path(tmp) / w / "semantic" / es._EMBED_CACHE_F32_NAME
+    db_path = pathlib.Path(tmp) / w / "semantic" / es._EMBED_CACHE_I8_NAME
     try:
         # 初回: distinct {a,b}（重複 b は1回だけ）→ 2件 embed・3ベクトル返る
         vecs, reused, embedded = es._embed_cached(w, ["a", "b", "b"], ec)
@@ -199,7 +237,7 @@ def test_embed_cache_reuse():
         assert _all_cache_rows(w) == before
         # `_embed_cached` 自体は現存チャンク無し/埋め込み無効でもキャッシュへ一切触れない（ADD-only）
         # ——削除は呼び出し元（`_delete_embed_cache`）の責務（削除残骸を残さない・鏡）。
-        embeddings.embed = lambda texts, c, **kw: (calls.append(list(texts)) or [[0.0] * c["dim"] for _ in texts])
+        embeddings.embed = lambda texts, c, **kw: (calls.append(list(texts)) or [[0.1] * c["dim"] for _ in texts])
         es._embed_cached(w, ["k1", "k2"], ec)
         assert db_path.is_file() and _all_cache_keys(w)
         assert es._embed_cached(w, [], ec) == (None, 0, 0)
@@ -273,7 +311,7 @@ def test_embed_cache_streaming_flush_and_resume():
         vecs, reused, embedded = es._embed_cached(w, ["a", "b", "c", "d"], ec)
         assert (reused, embedded) == (0, 4)
         assert [len(c) for c in calls] == [2, 2]                          # 2件ずつ2バッチで embed が呼ばれた
-        assert [list(v) for v in vecs] == [vec_for(t, 4) for t in ["a", "b", "c", "d"]]      # (d) 順序・値が従来（単発呼び）と同一
+        assert [list(v) for v in vecs] == [embeddings.vector_to_es_bytes(vec_for(t, 4)) for t in ["a", "b", "c", "d"]]      # (d) 順序・値が従来（単発呼び）と同一（キャッシュの値は縮めた整数）
         assert _all_cache_keys(w) == {es._chunk_key(ec, t) for t in "abcd"}   # フラッシュ済み
         # (c) 剪定は呼び出し元が明示的に行う（`index_world` が Pass1 完了後に1回だけ呼ぶのと同じ契約）。
         es._prune_embed_cache(w, {es._chunk_key(ec, "a")})

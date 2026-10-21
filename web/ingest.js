@@ -402,6 +402,11 @@ function summaryNote(s, wid) {
     dangers.push(warns.includes('reconvert_needs_full_run')
       ? '前回の再変換はできませんでした。「今すぐ更新」で資料フォルダを取り込み直してから、もう一度お試しください'
       : '前回の再変換は終わりませんでした。理由は「詳細を表示」の失敗の一覧に出ています（「再変換」でやり直せます）');
+  } else if (s.last_run_status === 'failed' && s.last_run_interrupted
+             && warns.some(w => typeof w === 'string' && w.startsWith('low_disk_stop:'))) {
+    const w = warns.find(x => typeof x === 'string' && x.startsWith('low_disk_stop:'));
+    dangers.push(`ディスクの空きが少ないため取り込みを止めました（空き ${esc(w.slice('low_disk_stop:'.length))} GB）。`
+      + '自動では再開しません。空きを作ってから「今すぐ更新」を押してください');
   } else if (s.last_run_status === 'failed' && s.last_run_interrupted) {
     hints.push('前回の取り込みは停止のため途中で止まりました（起動後に自動で続きから始まります／始まっていないときは「今すぐ更新」を押してください）');
   } else if (s.last_run_status === 'failed') {

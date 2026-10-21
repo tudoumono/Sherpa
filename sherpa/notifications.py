@@ -121,6 +121,13 @@ def _trigger_ocr_catchup(world_id: str) -> None:
             world_id, exc_info=True)
 
 
+def _stopped_for_low_disk(world_id: str) -> bool:
+    """最新の run が空きの不足で止まったものか（その場合は利用者が「更新」を押すまで自動で積み直さない）。"""
+    run = store.get_latest_run_summary(world_id)
+    snap = (run or {}).get("extraction_snapshot") or {}
+    return snap.get("stop_reason") == ingest_background.LOW_DISK_STOP_REASON
+
+
 def _ocr_notifications(labels: dict[str, str]) -> list[dict]:
     if not office_md.ocr_enabled():
         return []
@@ -134,7 +141,8 @@ def _ocr_notifications(labels: dict[str, str]) -> list[dict]:
         dmd = worlds.derived_md_dir(wid)
         if not office_md.rag_sig_drift(dmd, world=wid):
             continue
-        _trigger_ocr_catchup(wid)  # 自動追いつきを1回だけ予約
+        if not _stopped_for_low_disk(wid):
+            _trigger_ocr_catchup(wid)  # 自動追いつきを1回だけ予約（空きの不足で止めた直後は予約しない）
         items.append(_item(
             kind="ocr_pending", world=wid, world_label=label, status="warn",
             message=f"「{label}」の画像文字認識（OCR）が完了しました。反映には更新が必要です。",

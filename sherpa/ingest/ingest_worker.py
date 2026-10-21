@@ -164,7 +164,10 @@ def _run_followups(version: str | None, beat: _Beat) -> None:
             break
         beat.set_state("running", world=world, label="AI整形")
         try:
-            ingest_worker.llm_render_pass(world, should_stop=_should_stop)
+            with background.followup_scope():
+                ingest_worker.llm_render_pass(world, should_stop=_should_stop)
+        except background.LowDiskStop as e:
+            _log.warning("LLM 成形の後追いをディスクの空き不足で止めました（自動では繰り返しません。空きを作って「更新」を押してください）: world=%s %s", world, e)
         except Exception:
             _log.warning("LLM 成形の後追いが失敗しました: world=%s", world, exc_info=True)
 
@@ -195,6 +198,7 @@ def _migrate_embed_caches(version: str | None, beat: _Beat, tried: set, *, yield
         beat.set_state("running", world=world, label="埋め込みキャッシュの写し替え")
 
     try:
+        embed_cache_migrate.sweep_document_json(should_stop=_should_stop, skip=tried)
         results = embed_cache_migrate.migrate_pending(should_stop=_should_stop, skip=tried, on_world=_on_world)
     except Exception:
         _log.warning("埋め込みキャッシュの写し替えに失敗しました（古いファイルはそのまま使えます）", exc_info=True)

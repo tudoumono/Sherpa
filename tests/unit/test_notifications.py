@@ -100,6 +100,7 @@ def _stub_ocr_ready(monkeypatch, *, drift=True, pending=0, targets=1):
                         lambda wid: {"targets": targets, "pending": pending,
                                      "updated_at": "2026-09-03T03:00:00+00:00"})
     monkeypatch.setattr(office_md, "rag_sig_drift", lambda dmd, world=None: drift)
+    monkeypatch.setattr(notifications.store, "get_latest_run_summary", lambda wid: None)
 
 
 def test_ocr_pending_notification_triggers_catchup_once(monkeypatch):
@@ -113,6 +114,18 @@ def test_ocr_pending_notification_triggers_catchup_once(monkeypatch):
     assert items[0]["admin_only"] is True
     assert items[0]["action"]["path"] == "/worlds/w1/refresh"
     assert calls == [("w1", "refresh", "{}")]   # 手動更新と同じ op/fingerprint に合流できる
+
+
+def test_ocr_catchup_not_reserved_after_low_disk_stop(monkeypatch):
+    """空きの不足で止めた取り込みは、通知は出しても後追いの更新を自動で積み直さない。"""
+    _stub_ocr_ready(monkeypatch)
+    monkeypatch.setattr(notifications.store, "get_latest_run_summary",
+                        lambda wid: {"status": "failed", "extraction_snapshot": {"stop_reason": "low_disk"}})
+    calls = []
+    monkeypatch.setattr(ingest_background, "submit", lambda *a, **kw: calls.append(1))
+    items = notifications._ocr_notifications(_label())
+    assert len(items) == 1
+    assert calls == []
 
 
 def test_ocr_pending_skipped_when_not_drifted(monkeypatch):

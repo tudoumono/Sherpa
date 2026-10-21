@@ -191,13 +191,14 @@ def note_ingest_run_op(run_id, op: str) -> None:
 
 
 def list_worlds_with_interrupted_latest_run() -> list:
-    """最新の run が「中断（`extraction_snapshot.interrupted`）」で終わっている登録済み world を `{world_id, run_id, op}` で返す。
+    """最新の run が「中断（`extraction_snapshot.interrupted`）」で終わっている登録済み world を `{world_id, run_id, op, stop_reason}` で返す。
     最新の run だけを見る（その後に別の run が走っていれば再開済み）。world 行が無い（削除・登録解除済み）ものは含まない。`op` は記録が無ければ None。
     """
     _ensure()
     with _connect() as c:
         rows = c.execute(
-            "SELECT r.version AS world_id, r.id AS run_id, r.extraction_snapshot->>'op' AS op "
+            "SELECT r.version AS world_id, r.id AS run_id, r.extraction_snapshot->>'op' AS op, "
+            "r.extraction_snapshot->>'stop_reason' AS stop_reason "
             "FROM (SELECT DISTINCT ON (version) id, version, status, extraction_snapshot "
             "      FROM ingest_runs WHERE kb_id=%s AND version IS NOT NULL ORDER BY version, id DESC) r "
             "JOIN worlds w ON w.kb_id=%s AND w.world_id=r.version "

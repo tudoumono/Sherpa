@@ -11,18 +11,21 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from . import corpus_docs, doc_text, embeddings, json_io, scope_infer, worlds
 from . import layer as layer_mod
 from . import scope as scope_mod
 from .env_int import env_int
-from .ingest import importance, substage, text_kind
+from .ingest import importance, ocr_router, substage, text_kind
 from .ingest.analyzers import registry as analyzer_registry
 
 _log = logging.getLogger("sherpa")
@@ -35,7 +38,7 @@ _CHUNK_LINES_DEFAULT = 40
 # `search()` が ES へ送る size の上限（資料検索のヒット数の既定 `parts.read.tools.MAX_HITS` を下回らない固定値）
 _ES_SEARCH_K_MAX = 50
 _TIMEOUT = 30
-ES_MAPPING_VERSION = "12"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
+ES_MAPPING_VERSION = "14"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
 # reindex のとき埋め込みはキャッシュから再利用される。
 # rag_chunks.jsonl 読み取りの安全弁: 1 行（1 チャンク）の大きさで判定する。桁違いに大きい行は破損とみなし、ファイル全体を無効にして legacy チャンクへ縮退する（`_validate_rag_chunks` 参照）。
 # ファイル全体の大きさは見ない（大きな表でも行ごとの切れを保つ）。読むときも上限＋1 文字で打ち切る
@@ -49,6 +52,8 @@ _RAG_CHUNK_SEARCH_TEXT_MAX_CHARS = 20000  # 1 チャンクの索引本文の文�
 # bulk 送信のバッチ境界（件数とバイト数の両方。`_bulk_batches` 参照）。1 本の `_bulk` に詰めるとメモリが際限なく増えるため
 _ES_BULK_BATCH_MAX_DOCS = 2000
 _ES_BULK_BATCH_MAX_BYTES = 8 * 1024 * 1024
+# 同時に ES へ流す `_bulk` の本数（設計: docs/design/rag.md「ES 索引の構成」）
+_ES_BULK_PARALLEL = 4
 # 埋め込みのフラッシュ単位: `_embed_cached()` の不足分をこの件数のバッチに割り、成功ごとにキャッシュ DB へ即時フラッシュする
 # （保持するベクトル量を有界にし、落ちても次回 sync でキャッシュヒットして再開できる）。`index_world()` の doc グループ化バッチサイズにも兼用する
 _EMBED_FLUSH_CHUNKS = 500
@@ -72,7 +77,7 @@ _HYBRID_WEIGHT = 0.5
 
 
 def _mapping(dim, analyzer: str, emeta=None) -> dict:
-    """index マッピング。`analyzer`＝kuromoji／standard。`dim` で dense_vector(cosine)、`emeta` で埋め込み素性を `_meta` に記録する。"""
+    """index マッピング。`analyzer`＝kuromoji／standard。`dim` で byte の dense_vector(cosine・`embeddings.vector_to_es_bytes` で縮めた値)、`emeta` で埋め込み素性を `_meta` に記録する。"""
     props = {
         "doc_id": {"type": "keyword"}, "ext": {"type": "keyword"},
         # `corpus_docs.classify_document` の確定判定（"source"＝code／それ以外＝docs。`layer.es_filter` 参照）
@@ -107,12 +112,13 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
         "importance_reason": {"type": "keyword", "index": False},
         # ベクトルを取れなかったチャンクだけ "missing" を持つ（`fill_missing_vectors` が後から埋めて "ok" にする）
         "vector_status": {"type": "keyword"},
-        # 表の行のまとまりの先頭の行だけが持つ（設計: docs/design/rag.md「表の行のまとまり」）。どちらも検索の対象にしない
+        # 表の行・本文のまとまりの先頭だけが持つ（設計: docs/design/rag.md「表の行・本文のまとまり」）。どちらも検索の対象にしない
         "vector_text": {"type": "text", "index": False},
         "row_group": {"type": "object", "enabled": False},
     }
     if dim:
-        props["embedding"] = {"type": "dense_vector", "dims": dim, "index": True, "similarity": "cosine"}
+        props["embedding"] = {"type": "dense_vector", "dims": dim, "element_type": "byte", "index": True,
+                              "similarity": "cosine"}
     # `index_world()` は新しい物理索引を作って全件入れ、最後にエイリアスを付け替える。作成時は背景 refresh を止め（`-1`）、
     # 最終バッチ（`refresh=true`・`_StreamingBulkSender.finish()`）で一度だけ refresh して全件を可視化し、通常値へ戻す（`_restore_refresh_interval`）
     m = {"settings": {"index": {"refresh_interval": "-1"}}, "mappings": {"properties": props}}
@@ -123,7 +129,7 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
                                        "merge.policy.segments_per_tier": _ES_MERGE_SEGMENTS_PER_TIER,
                                        "merge.policy.max_merge_at_once": _ES_MERGE_SEGMENTS_PER_TIER})
     if emeta:
-        m["mappings"]["_meta"] = emeta  # {embed_provider, embed_model, dim, embed_algo}（検索時の素性照合用）
+        m["mappings"]["_meta"] = emeta  # {embed_provider, embed_model, dim, embed_algo, quant}（検索時の素性照合用）
     return m
 
 
@@ -591,17 +597,20 @@ def ensure_index(world: str, dim=None, emeta=None) -> bool:
 
 
 # 埋め込みキャッシュのストア（SQLite の KV 1 ファイル）。資料フォルダ全体のベクトルを dict で持たず、フラッシュに含まれるキーだけを SELECT／INSERT する
-# （メモリ有界・1 回のフラッシュの I/O がキー数に比例）。新形式 `embed_cache.f32.sqlite3`（表 `kv2`・float32 の BLOB）があればそれだけを使う。
-# 無ければ旧形式 `embed_cache.sqlite3`（表 `kv`・JSON）を今まで通り読み書きし、どちらも無ければ新形式を作る。旧→新の写し替えは `embed_cache_migrate`。
+# （メモリ有界・1 回のフラッシュの I/O がキー数に比例）。`embed_cache.i8.sqlite3`（表 `kv3`・ES へ渡すのと同じ 1 次元 1 バイトの BLOB）があればそれだけを使う。
+# 無ければ 0.19.5 の `embed_cache.f32.sqlite3`（表 `kv2`・float32 の BLOB）、0.19.4 以前の `embed_cache.sqlite3`（表 `kv`・JSON）の順に、残っている方を
+# 今まで通り読み書きし（読んだ値は `embeddings.quantize_vector` で縮めて返す）、どれも無ければ i8 を作る。写し替えは `embed_cache_migrate`。
 _EMBED_CACHE_DB_NAME = "embed_cache.sqlite3"
 _EMBED_CACHE_F32_NAME = "embed_cache.f32.sqlite3"
+_EMBED_CACHE_I8_NAME = "embed_cache.i8.sqlite3"
+_EMBED_CACHE_TABLES = {"i8": "kv3", "f32": "kv2", "json": "kv"}
 _EMBED_CACHE_SQL_CHUNK = 500  # 1 回の IN 節に含める上限（SQLite の変数上限への余裕）
 
 
 class _EmbedConn(sqlite3.Connection):
-    """どちらの形式の DB を開いたか（表名・BLOB かどうか）を持つ接続。"""
-    table = "kv2"
-    binary = True
+    """どの形式の DB を開いたか（`kind`＝i8／f32／json・表名）を持つ接続。"""
+    table = "kv3"
+    kind = "i8"
 
 
 def _embed_cache_legacy_path(world: str) -> Path:
@@ -612,31 +621,40 @@ def _embed_cache_f32_path(world: str) -> Path:
     return worlds.semantic_dir(world) / _EMBED_CACHE_F32_NAME
 
 
+def _embed_cache_i8_path(world: str) -> Path:
+    return worlds.semantic_dir(world) / _EMBED_CACHE_I8_NAME
+
+
+def _embed_cache_kind(p: Path) -> str:
+    return {_EMBED_CACHE_I8_NAME: "i8", _EMBED_CACHE_F32_NAME: "f32"}.get(p.name, "json")
+
+
 def _embed_cache_db_path(world: str) -> Path:
-    """資料フォルダの埋め込みキャッシュ（SQLite・1 ファイル）の場所。新形式があればそれ、無くて旧形式があれば旧形式、どちらも無ければ新形式。"""
-    new = _embed_cache_f32_path(world)
-    old = _embed_cache_legacy_path(world)
-    return old if (not new.exists() and old.exists()) else new
+    """資料フォルダの埋め込みキャッシュ（SQLite・1 ファイル）の場所。i8 があればそれ、無ければ残っている f32・JSON の順、どれも無ければ i8。"""
+    for p in (_embed_cache_i8_path(world), _embed_cache_f32_path(world), _embed_cache_legacy_path(world)):
+        if p.exists():
+            return p
+    return _embed_cache_i8_path(world)
 
 
 def _embed_cache_connect(world: str, *, create: bool) -> _EmbedConn | None:
     """埋め込みキャッシュ DB へ接続する。`create=False`（読み取り専用）で DB ファイルが無ければ接続せず None（空 DB を作らない）。WAL を有効化する。接続・初期化の失敗（権限等）は None（呼び出し元は miss／書込失敗として扱う）。"""
     p = _embed_cache_db_path(world)
-    binary = p.name == _EMBED_CACHE_F32_NAME
+    kind = _embed_cache_kind(p)
     if not create and not p.exists():
         return None
     for attempt in (0, 1):
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(p), timeout=30, factory=_EmbedConn)
-            conn.binary = binary
-            conn.table = "kv2" if binary else "kv"
+            conn.kind = kind
+            conn.table = _EMBED_CACHE_TABLES[kind]
             try:
-                if binary:
+                if kind == "f32":
                     conn.execute("PRAGMA page_size=65536")  # 新しいファイルを作るときだけ効く（1 行が約 6KB のため大きなページにする）
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute(f"CREATE TABLE IF NOT EXISTS {conn.table} "
-                             f"(key TEXT PRIMARY KEY, vec {'BLOB' if binary else 'TEXT'} NOT NULL)")
+                             f"(key TEXT PRIMARY KEY, vec {'TEXT' if kind == 'json' else 'BLOB'} NOT NULL)")
             except sqlite3.Error:
                 conn.close()
                 raise
@@ -660,7 +678,7 @@ def _sql_chunks(items: list, size: int = _EMBED_CACHE_SQL_CHUNK):
 
 
 def _embed_cache_lookup_batch(world: str, keys: list, dim: int) -> dict:
-    """`keys` のうちキャッシュ済み・形状検証 OK（次元一致）のものだけ `array('f')` で返す（壊れ／型ズレは miss）。`_EMBED_CACHE_SQL_CHUNK` 件ずつ `SELECT ... WHERE key IN (...)` で引く。DB 接続・クエリの失敗も miss 扱い（呼び出し元は再 embed へ）。"""
+    """`keys` のうちキャッシュ済み・形状検証 OK（次元一致）のものだけ、1 次元 1 バイトに縮めた `array('b')` で返す（壊れ／型ズレは miss）。`_EMBED_CACHE_SQL_CHUNK` 件ずつ `SELECT ... WHERE key IN (...)` で引く。DB 接続・クエリの失敗も miss 扱い（呼び出し元は再 embed へ）。"""
     if not keys:
         return {}
     conn = _embed_cache_connect(world, create=False)
@@ -672,17 +690,19 @@ def _embed_cache_lookup_batch(world: str, keys: list, dim: int) -> dict:
             placeholders = ",".join("?" * len(chunk))
             rows = conn.execute(f"SELECT key, vec FROM {conn.table} WHERE key IN ({placeholders})", chunk).fetchall()
             for k, raw in rows:
-                if conn.binary:
+                if conn.kind == "i8":
+                    v = embeddings.quantized_from_bytes(raw, dim)  # 長さが次元でない BLOB は miss
+                elif conn.kind == "f32":
                     v = embeddings.vector_from_bytes(raw, dim)  # 長さが次元×4 でない BLOB は miss
-                    if v is not None:
-                        out[k] = v
-                    continue
-                try:
-                    v = json.loads(raw)
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(v, list) and len(v) == dim:
-                    out[k] = embeddings.to_vector(v)
+                    v = embeddings.quantize_vector(v) if v is not None else None
+                else:
+                    try:
+                        v = json.loads(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    v = embeddings.quantize_vector(v) if isinstance(v, list) and len(v) == dim else None
+                if v is not None:
+                    out[k] = v
     except sqlite3.Error:
         pass  # ここまでに読めた分は活かす
     finally:
@@ -690,8 +710,8 @@ def _embed_cache_lookup_batch(world: str, keys: list, dim: int) -> dict:
     return out
 
 
-def _embed_cache_write_batch(world: str, new_vectors: dict) -> None:
-    """新規ベクトルを DB へ upsert する（1 トランザクション・呼び出しごとに commit）。フラッシュ済み分が次回キャッシュヒットすることで再開性を担保する（`_embed_cached` 参照）。
+def _embed_cache_write_batch(world: str, new_vectors: dict, quantized: dict | None = None) -> None:
+    """新規ベクトル（API から受けた float）を DB へ upsert する（1 トランザクション・呼び出しごとに commit）。i8 には `embeddings.quantize_vector` で縮めて書く（縮め済みの値は `quantized` で渡す）。フラッシュ済み分が次回キャッシュヒットすることで再開性を担保する（`_embed_cached` 参照）。
     書込失敗（ENOSPC・DB 接続不能を含む OSError）は呼び出し元へ伝播させる（握りつぶすと永続化されていないバッチを成功扱いにしてしまう）。
     """
     if not new_vectors:
@@ -700,7 +720,11 @@ def _embed_cache_write_batch(world: str, new_vectors: dict) -> None:
         conn = _embed_cache_connect(world, create=True)
         if conn is None:
             raise OSError(f"embed cache DB へ接続できません（world={world}）")
-        if conn.binary:
+        if conn.kind == "i8":
+            qs = quantized or {}
+            rows = [(k, q.tobytes()) for k, q in
+                    ((k, qs.get(k) or embeddings.quantize_vector(v)) for k, v in new_vectors.items()) if q is not None]
+        elif conn.kind == "f32":
             rows = [(k, embeddings.vector_to_bytes(v)) for k, v in new_vectors.items()]
         else:
             rows = [(k, json.dumps(embeddings.vector_to_json(v))) for k, v in new_vectors.items()]
@@ -725,7 +749,7 @@ def _embed_cache_write_batch(world: str, new_vectors: dict) -> None:
 
 def _delete_embed_cache(world: str) -> None:
     """埋め込み無効／現存チャンク無し時のキャッシュ全消去。DB 本体＋WAL／SHM を消す（失敗はベストエフォート）。"""
-    for p in (_embed_cache_f32_path(world), _embed_cache_legacy_path(world)):
+    for p in (_embed_cache_i8_path(world), _embed_cache_f32_path(world), _embed_cache_legacy_path(world)):
         for f in (p, p.with_name(p.name + "-wal"), p.with_name(p.name + "-shm")):
             try:
                 f.unlink()
@@ -823,6 +847,32 @@ def _stop_point() -> None:
     background.raise_if_stop_requested()
 
 
+_MIN_FREE_BYTES = 10 * 1024 ** 3  # 作り直しの途中で ES のデータ置き場か埋め込みキャッシュの置き場の空きがこれを切ったら、次の区切りで取り込みを止める
+
+
+def _space_point(world: str) -> None:
+    """作り直しの区切りで、ES のデータ置き場と埋め込みキャッシュの置き場の空きを確かめる（背景実行のスレッド以外では何もしない）。
+    どちらかが `_MIN_FREE_BYTES` を切っていれば `background.LowDiskStop`（停止要求と同じ止め方）。空きを取れないときは止めない。
+    """
+    from .ingest import background
+    if not (background.in_run() or background.in_followup()):
+        return
+    frees = [_es_free_bytes()]
+    try:
+        d = worlds.semantic_dir(world)
+        while not d.exists() and d != d.parent:
+            d = d.parent
+        frees.append(shutil.disk_usage(d).free)
+    except OSError:
+        pass
+    low = min((f for f in frees if isinstance(f, int)), default=None)
+    if low is not None and low < _MIN_FREE_BYTES:
+        msg = background.low_disk_message(low)
+        substage.begin("low_disk", msg, logger=_embed_log)
+        _log.warning("es_index: %s: world=%s", msg, world)
+        raise background.LowDiskStop(low)
+
+
 _EMBED_GIVE_UP_AFTER = 3   # 埋め込みのまとまりがこの回数続けて失敗したら、その処理の残りでは送り先へ問い合わせない
 _EMBED_COOLDOWN_SEC = 600  # 失敗した直後の `fill_missing_vectors` は、送り先を叩き直さない時間
 _embed_failed_at: dict[str, float] = {}  # 資料フォルダ ID → 直近に埋め込みのまとまりが失敗した時刻（time.monotonic）
@@ -877,9 +927,11 @@ def _embed_fill(world: str, texts: list, ec, guard: _EmbedGuard | None = None, *
             batch_keys = need[start:start + _EMBED_FLUSH_CHUNKS]
             new = embeddings.embed([key_text[k] for k in batch_keys], ec, world=world)
             new_map = {k: embeddings.to_vector(vec) for k, vec in zip(batch_keys, new)} if new else {}
+            q_map = {k: q for k, q in ((k, embeddings.quantize_vector(v)) for k, v in new_map.items()) if q is not None}
+            new_map = {k: new_map[k] for k in q_map}
             if new_map:
                 try:
-                    _embed_cache_write_batch(world, new_map)  # 成功したバッチだけ即座に永続化
+                    _embed_cache_write_batch(world, new_map, q_map)  # 成功したバッチだけ即座に永続化
                 except OSError:
                     # DB 書込障害（ENOSPC 等）は成功扱いにしない（このまとまりは取れなかった扱い）
                     _embed_log.warning("es_index: embed キャッシュDBの書込に失敗（world=%s・ENOSPC等）"
@@ -889,7 +941,7 @@ def _embed_fill(world: str, texts: list, ec, guard: _EmbedGuard | None = None, *
                 if guard is not None:
                     guard.failed()
                 continue
-            filled.update(new_map)
+            filled.update(q_map)
             embedded += len(new_map)
             if guard is not None:
                 guard.ok()
@@ -1179,7 +1231,7 @@ def _rag_chunks_validate(rag_path: Path, anchors: dict, rel: str) -> tuple:
     return seen_chunk_ids, None
 
 
-# 表の行のまとまり（ベクトルを 1 本だけ付ける単位）。設計: docs/design/rag.md「表の行のまとまり」
+# 表の行のまとまり（ベクトルを 1 本だけ付ける単位）。設計: docs/design/rag.md「表の行・本文のまとまり」
 _ROW_GROUP_KINDS = frozenset({"table_record", "coordinate_record"})
 _ROW_GROUP_MAX_ROWS = 20
 _ROW_GROUP_CELL_MAX_CHARS = 32      # 1 つの値の上限（超えた分は切る）
@@ -1187,6 +1239,10 @@ _ROW_GROUP_ROW_MAX_BYTES = 300      # 値を並べた 1 行の上限（UTF-8）
 _ROW_GROUP_HEAD_MAX_BYTES = 600     # 出所・列名の行それぞれの上限
 _ROW_GROUP_MAX_BYTES = 7600         # まとまり 1 本の上限（埋め込みの 1 窓＝約 8000 バイトに収める）
 _ROW_GROUP_SEP = " | "
+# 本文のまとまり（表の行でない連続するチャンクにベクトルを 1 本）。設計: docs/design/rag.md「表の行・本文のまとまり」
+_BODY_GROUP_MAX_CHARS = 1000        # まとまり 1 本の上限（文字）。UTF-8 で 4000 バイト以下＝埋め込みの 1 窓に収める
+_BODY_GROUP_TEXT_KINDS = frozenset({"paragraph", "heading"})   # 見出しと段落は同じ種類として束ねる
+_BODY_GROUP_TAIL_DROP = ("出所:", "出所：", "文書:", "見出し:", "## ", "### ")
 _A1_RE = re.compile(r"^\$?([A-Z]{1,3})\$?(\d{1,7})$")
 
 
@@ -1328,10 +1384,23 @@ def _row_group_head_lines(row: dict, text: str, fields: list) -> tuple:
     return lines, columns
 
 
+def _body_group_kind(kind) -> str | None:
+    """本文のまとまりで同じ種類として束ねる区分。表の行・画像は束ねない（None）。"""
+    if kind in _ROW_GROUP_KINDS or kind in ocr_router.RASTER_ELEMENT_TYPES:
+        return None
+    return "text" if kind in _BODY_GROUP_TEXT_KINDS else kind
+
+
+def _body_group_line(text: str) -> str:
+    """本文のまとまりの 2 件目以降の文字。先頭と重なる出所・見出しの行を除く。"""
+    return "\n".join(ln for ln in text.split("\n") if ln.strip() and not ln.startswith(_BODY_GROUP_TAIL_DROP))
+
+
 def _row_group_entries(group: list, head_lines: list):
-    """連続する表の行 `[(es_id, body, text, row, line), ...]` を `(es_id, body, text, skip_embed)` で返す。
-    先頭の行だけがまとまりの文字（出所・列名の行 `head_lines`＋各行の値だけの行 `line`）でベクトルを取り、`vector_text`・`row_group` を持つ。
-    2 行目以降はベクトルを取らない。1 行だけのまとまりは rag.md の本文のまま埋め込む。
+    """連続する表の行・本文のチャンク `[(es_id, body, text, row, line), ...]` を `(es_id, body, text, skip_embed)` で返す。
+    先頭だけがまとまりの文字（`head_lines`＋各件の `line`）でベクトルを取り、`vector_text`・`row_group` を持つ。
+    表の行は出所・列名の行＋各行の値だけの行、本文は先頭の本文＋2 件目以降の本文（`_body_group_line`）。
+    2 件目以降はベクトルを取らない。1 件だけのまとまりは rag.md の本文のまま埋め込む。
     """
     head_id, head_body, head_text, _head_row, _line = group[0]
     if len(group) == 1:
@@ -1349,12 +1418,15 @@ def _row_group_entries(group: list, head_lines: list):
 
 def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: dict):
     """事前に `_rag_chunks_validate()` が `reason=None` を返した `rag_path` をもう一度走査し、`(id, body, text, skip_embed)` を 1 件ずつ yield する。検証済みの `rag_path`／`anchors` でのみ呼ぶ。
-    `text` は埋め込みの文字。表の行は連続する行をまとまりに束ね、先頭の行だけがまとまりの文字を持ち、残りは `skip_embed`（`_row_group_entries`）。持つメモリはまとまり 1 つ分まで。
+    `text` は埋め込みの文字。表の行は連続する行を、表の行でないチャンクは同じ領域・同じ節・同じ種類の連続するチャンクを
+    `_BODY_GROUP_MAX_CHARS` 字までまとまりに束ね、先頭だけがまとまりの文字を持ち、残りは `skip_embed`（`_row_group_entries`）。持つメモリはまとまり 1 つ分まで。
     """
     group: list = []
     head_lines: list = []
     columns: list = []
     group_bytes = 0
+    body_group: list = []
+    body_chars = 0
     with json_io.open_text_maybe_gzip(rag_path) as f:
         for raw_line in iter_capped_lines(f):
             line = raw_line.strip()
@@ -1374,8 +1446,29 @@ def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: 
             if kind not in _ROW_GROUP_KINDS:
                 yield from _row_group_entries(group, head_lines) if group else ()
                 group = []
-                yield es_id, body, text, False
+                body_kind = _body_group_kind(kind)
+                section = tuple(row.get("section_path") or ())
+                if body_group:
+                    head = body_group[0][3]
+                    body_line = _body_group_line(text)
+                    if (body_kind != _body_group_kind(head.get("content_type"))
+                            or row.get("parent_id") != head.get("parent_id")
+                            or section != tuple(head.get("section_path") or ())
+                            or body_chars + len(body_line) + 1 > _BODY_GROUP_MAX_CHARS):
+                        yield from _row_group_entries(body_group, [])
+                        body_group = []
+                if body_kind is None:
+                    yield es_id, body, text, False
+                    continue
+                if not body_group:
+                    body_line = text
+                    body_chars = len(text)
+                else:
+                    body_chars += len(body_line) + 1
+                body_group.append((es_id, body, text, row, body_line))
                 continue
+            yield from _row_group_entries(body_group, []) if body_group else ()
+            body_group = []
             fields = _row_fields(row, text)
             if group:
                 head = group[0][3]
@@ -1393,6 +1486,8 @@ def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: 
             group_bytes += len(row_line.encode("utf-8")) + 1
     if group:
         yield from _row_group_entries(group, head_lines)
+    if body_group:
+        yield from _row_group_entries(body_group, [])
 
 
 def _validate_rag_chunks(rag_path: Path, md_path: Path | None, rel: str, base_meta: dict) -> tuple:
@@ -1436,7 +1531,8 @@ def _bulk_batches(ids: list, bodies: list, vec_by_idx: dict) -> list:
     for i, (cid, body) in enumerate(zip(ids, bodies)):
         v = vec_by_idx.get(i)  # テキスト資料（軽量テキスト枠の第 2 段）など埋め込み対象外のチャンクは None
         if v is not None:
-            body = {**body, "embedding": embeddings.vector_to_json(v)}
+            q = embeddings.vector_to_es_bytes(v)
+            body = {**body, "embedding": q} if q is not None else {**body, "vector_status": "missing"}
         action = json.dumps({"index": {"_id": cid}})
         doc = json.dumps(body, ensure_ascii=False)
         pair_bytes = len(action.encode("utf-8")) + len(doc.encode("utf-8")) + 2  # +2 = 各行の改行
@@ -1525,34 +1621,67 @@ def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts:
     return _legacy_chunk_iter(), degraded_entry
 
 
+_senders: dict[str, _StreamingBulkSender] = {}  # 資料フォルダ ID → 送信中の送り手（`index_world` が終わるときに飛行中の bulk を待つ）
+
+
 class _StreamingBulkSender:
     """`index_world()` Pass2 が doc グループ単位で積むチャンクを、bulk 送信の境界（件数／バイト数の閾値）に達し次第 ES へ流す。
-    `refresh=true` は最後の送信だけに付ける。最後かどうかは全 doc を処理し終えるまで分からないため、直前に確定した 1 バッチを `_pending` として 1 つだけ持ち越し（lag-by-one）、`finish()` で最後の `_pending` を refresh 付きで送る。
+    `_ES_BULK_PARALLEL` 本までを同時に流す。`refresh=true` は最後の送信だけに付ける。最後かどうかは全 doc を処理し終えるまで分からないため、直前に確定した 1 バッチを `_pending` として 1 つだけ持ち越し（lag-by-one）、`finish()` で飛行中の bulk が全部終わるのを待ってから、最後の `_pending` を refresh 付きで送る。
+    設計: docs/design/rag.md「ES 索引の構成」
     """
 
     def __init__(self, world: str, idx: str | None = None):
         self.world = world
         self.idx = idx or _index(world)  # 送り先＝作成中の物理索引（付け替え前なので検索は古い索引のまま）
         self._pending: str | None = None
+        self._pool = ThreadPoolExecutor(max_workers=_ES_BULK_PARALLEL, thread_name_prefix="es-bulk")
+        self._inflight: set = set()
+        self._lock = threading.Lock()
         self.failed = False
         self.error: str | None = None
         self.missing = 0  # ベクトル無し（`vector_status: missing`）で入れたチャンクの数
+        _senders[world] = self
 
     def _send(self, payload: str, refresh: bool) -> bool:
         path = f"/{self.idx}/_bulk" + ("?refresh=true" if refresh else "")
         try:
-            res = _req("POST", path, payload, ndjson=True)
+            # 同時に送る本数だけ ES の中で待たされるので、1 本の待ちの上限もその分延ばす
+            res = _req("POST", path, payload, ndjson=True, timeout=_TIMEOUT * _ES_BULK_PARALLEL)
         except Exception as e:
             # 途中バッチの失敗は呼び出し元が作りかけの索引を捨てる（全部か無しか。付け替え前なので古い索引は残る）
             # 失敗後は `failed` で以降の送信を止めるので、原因の行は 1 つの送り手につき 1 回だけ出る
-            self.failed, self.error = True, "bulk_failed"
-            _log.warning("ES への登録に失敗しました（作りかけの索引は捨てます）: world=%s 原因=%s: %s",
-                         self.world, e.__class__.__name__, " ".join(str(e).split())[:200])
+            with self._lock:
+                first, self.failed, self.error = not self.failed, True, "bulk_failed"
+            if first:
+                _log.warning("ES への登録に失敗しました（作りかけの索引は捨てます）: world=%s 原因=%s: %s",
+                             self.world, e.__class__.__name__, " ".join(str(e).split())[:200])
             return False
         if res.get("errors"):  # item-level の失敗（HTTP 200 でも起きる）
             self.failed, self.error = True, "bulk_errors"
             return False
         return True
+
+    def _submit(self, payload: str) -> bool:
+        """refresh 無しの 1 バッチを送る。飛行中が上限なら 1 本終わるまで待つ。"""
+        while len(self._inflight) >= _ES_BULK_PARALLEL:
+            _, self._inflight = wait(self._inflight, return_when=FIRST_COMPLETED)
+        if self.failed:
+            return False
+        self._inflight.add(self._pool.submit(self._send, payload, False))
+        return True
+
+    def drain(self) -> bool:
+        """飛行中の bulk が全部終わるのを待つ。ここまでに失敗が無ければ True。"""
+        wait(self._inflight)
+        self._inflight = set()
+        return not self.failed
+
+    def close(self) -> None:
+        """飛行中の bulk を待ち、送り手を片づける。作りかけの索引を消す前に必ず呼ぶ。"""
+        self.drain()
+        self._pool.shutdown(wait=True)
+        if _senders.get(self.world) is self:
+            del _senders[self.world]
 
     def send_group(self, ids: list, bodies: list, vec_by_idx: dict) -> bool:
         """1 グループ分（`_EMBED_FLUSH_CHUNKS` 件程度に有界）を bulk 用サブバッチへ分割し、持ち越し済みの前グループ分（refresh なし）→ このグループの内部境界（最後の 1 つ以外）の順で送る。このグループの最後のサブバッチは新たな `_pending` として持ち越す。"""
@@ -1562,18 +1691,18 @@ class _StreamingBulkSender:
         if not batches:
             return True
         if self._pending is not None:
-            if not self._send(self._pending, refresh=False):
+            if not self._submit(self._pending):
                 return False
             self._pending = None
         for payload in batches[:-1]:
-            if not self._send(payload, refresh=False):
+            if not self._submit(payload):
                 return False
         self._pending = batches[-1]
-        return True
+        return not self.failed
 
     def finish(self) -> bool:
-        """最後に残った持ち越し分を refresh 付きで送る（何も送っていなければ no-op）。"""
-        if self.failed:
+        """飛行中の bulk を待ち、最後に残った持ち越し分を refresh 付きで送る（何も送っていなければ no-op）。"""
+        if not self.drain():
             return False
         if self._pending is not None:
             ok = self._send(self._pending, refresh=True)
@@ -1582,13 +1711,20 @@ class _StreamingBulkSender:
         return True
 
 
+def _close_sender(world: str) -> None:
+    sender = _senders.get(world)
+    if sender is not None:
+        sender.close()
+
+
 def _flush_doc_group(sender: _StreamingBulkSender, world: str, ids: list, bodies: list,
                      texts: list, no_embed: list, ec, embed_feature_applies: bool) -> bool:
     """Pass2 の 1 グループ（doc 数件・チャンク `_EMBED_FLUSH_CHUNKS` 件程度に有界）を、必要なら埋め込みキャッシュから embedding を引いて bulk 送信する（`sender.send_group` へ委譲）。
     キャッシュ参照は `embed_feature_applies` が真の時だけ。キャッシュに無い（Pass1 で取れなかった）埋め込み対象チャンクは、ベクトル無し・`vector_status: "missing"` で入れる（`fill_missing_vectors` が後から足す）。
-    送る前に停止要求を確かめる（止まったら呼び出し元の `index_world` が作りかけの索引を捨てる）。
+    送る前に停止要求とディスクの空きを確かめる（止まったら呼び出し元の `index_world` が作りかけの索引を捨てる）。
     """
     _stop_point()
+    _space_point(world)
     vec_by_idx: dict = {}
     if embed_feature_applies:
         embed_positions = [i for i, skip in enumerate(no_embed) if not skip]
@@ -1673,9 +1809,11 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     try:
         return _index_world(world, settings, content_sig, progress)
     except BaseException:  # 停止要求（StopRequested）・想定外の例外: 作りかけの物理索引を残さない
+        _close_sender(world)
         _discard_building(world)
         raise
     finally:
+        _close_sender(world)
         _building.pop(world, None)
         substage.end()                       # 早く抜けても小さな段を残さない（「まだ動いています」を出し続けない）
 
@@ -1720,6 +1858,7 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
             """束ねたテキストを埋め込む（取れなかった分は飛ばす）。キャッシュ DB に書けなければ False。"""
             nonlocal reused_total, embedded_total, embed_elapsed_ms, embed_calls_made
             _stop_point()
+            _space_point(world)
             _t0 = time.monotonic()
             _vecs, reused, embedded = _embed_fill(world, buf, ec, guard, stop_points=True)
             embed_elapsed_ms += (time.monotonic() - _t0) * 1000
@@ -1798,7 +1937,9 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
     # `content_sig` は bulk が全バッチ成功した後に書く（`_confirm_content_sig`）。先に書くと、途中でプロセスが落ちたとき「一部だけ入った索引＋有効な content_sig」が残りうる。後書きなら、どう落ちても content_sig が無い＝付け替えもされない（fail-closed）
     if embed_feature_applies:
         emeta.update({"embed_provider": ec["provider"], "embed_model": ec["model"], "dim": ec["dim"],
-                      "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID})  # 前処理アルゴリズム版（`_chunk_key` と同じ材料）
+                      "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID,  # 前処理アルゴリズム版（`_chunk_key` と同じ材料）
+                      "quant": embeddings.ES_VECTOR_QUANT})  # ES へ渡すベクトルの縮め方
+    _space_point(world)  # 古い索引を消す前に空きを確かめる（対象が 0 件でも止める）
     old_dropped = _drop_old_for_space(world)  # 空きが足りなければ古い索引を先に消す（終わるまで検索できない）
     if not ensure_index(world, dim=dim, emeta=(emeta or None)):
         return {"available": True, "indexed": 0, "chunks": 0, "error": "create_failed"}
@@ -1872,6 +2013,7 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
         rag_report["analyzer_fallback"] = True
 
     def _failure(error: str) -> dict:
+        sender.close()
         _discard_building(world)  # 作りかけの物理索引だけ捨てる（エイリアスの指す古い索引はそのまま）
         out = {"available": True, "indexed": 0, "chunks": 0, "error": error, **rag_report}
         if embed_calls_made:
@@ -2030,8 +2172,9 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
         return {"available": True, "error": "count_failed"}
     sys_s = _embed_system_settings_snapshot()
     ec = embeddings.cfg(_settings(None), system_settings=sys_s)
-    want = (ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID) if ec else (None,) * 4
-    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"))
+    want = ((ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID, embeddings.ES_VECTOR_QUANT)
+            if ec else (None,) * 5)
+    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"), meta.get("quant"))
     if want != have:
         return {"available": True, "error": "embed_config_changed"}
     with_vectors = ec is not None
@@ -2113,7 +2256,7 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
 
 def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool:
     """ES 索引の張り直しが要るか（ES 稼働時のみ）。次のいずれかで True:
-    空／内容署名ズレ／ソース除外の印なし／アーム構成ズレ／マッピング版ズレ／チャンク粒度ズレ／人間向け MD 版ズレ／アナライザ構成ズレ／埋め込み素性（provider／model／dim／前処理アルゴリズム版）ズレ／実件数ズレ。
+    空／内容署名ズレ／ソース除外の印なし／アーム構成ズレ／マッピング版ズレ／チャンク粒度ズレ／人間向け MD 版ズレ／アナライザ構成ズレ／埋め込み素性（provider／model／dim／前処理アルゴリズム版／ES へ渡す縮め方）ズレ／実件数ズレ。
     `content_sig`（ソースファイルの rel／mtime／ctime／size のみ）はアーム構成・マッピング版等の変更を検知できないため、各署名を別途比較する。索引済みメタにフィールド自体が無い旧索引は比較先が None になり、不一致＝1 回だけ再索引される。
     例外: `human_md_sig` は pending 中は比較先がセンチネルになり、pending が解消するまで毎回再索引を試みる（fail-closed）。`chunk_lines` は欠落を旧既定 `_CHUNK_LINES_DEFAULT`（40）として扱う。
     エイリアス: 索引名がエイリアスでなく実の索引（0.18 以前の形）なら True（0.19 の最初の更新で 1 回だけ作り直す）。ベクトル無しのチャンクがあることは理由にしない（`fill_missing_vectors` が足す）。
@@ -2144,8 +2287,9 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
     if meta.get("analyzer_config_sig") != _analyzer_config_sig():
         return True
     ec = embeddings.cfg(_settings(settings))
-    want = (ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID) if ec else (None, None, None, None)
-    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"))
+    want = ((ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID, embeddings.ES_VECTOR_QUANT)
+            if ec else (None,) * 5)
+    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"), meta.get("quant"))
     if want != have:
         return True
     doc_count = meta.get("doc_count")
@@ -2171,8 +2315,11 @@ def _vector_update_batches(ids: list, vecs: list) -> list:
     lines: list = []
     n_bytes = 0
     for cid, vec in zip(ids, vecs):
+        q = embeddings.vector_to_es_bytes(vec)
+        if q is None:
+            continue
         action = json.dumps({"update": {"_id": cid}})
-        doc = json.dumps({"doc": {"embedding": embeddings.vector_to_json(vec), "vector_status": "ok"}})
+        doc = json.dumps({"doc": {"embedding": q, "vector_status": "ok"}})
         pair = len(action) + len(doc) + 2
         if lines and (len(lines) >= 2 * _ES_BULK_BATCH_MAX_DOCS or n_bytes + pair > _ES_BULK_BATCH_MAX_BYTES):
             out.append("\n".join(lines) + "\n")
@@ -2204,8 +2351,8 @@ def fill_missing_vectors(world: str, settings: dict | None = None) -> dict:
     meta = _index_meta(world)
     if meta is None:
         return {"available": True, "filled": 0, "missing": before, "error": "index_missing"}
-    want = (ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID)
-    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"))
+    want = (ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID, embeddings.ES_VECTOR_QUANT)
+    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"), meta.get("quant"))
     if want != have:  # 設定が変わった索引は再索引が作り直す
         return {"available": True, "filled": 0, "missing": before, "skipped": "embed_config_changed"}
     last_fail = _embed_failed_at.get(world)
@@ -2272,7 +2419,7 @@ def _mark_keyword_all(hits: list) -> list:
 
 
 def _as_row_group_hit(hit: dict, src: dict) -> dict:
-    """意味検索で当たった表の行のまとまりの先頭の行を、まとまりの本文・範囲に差し替える（`chunk_id` は先頭の行のまま）。"""
+    """意味検索で当たった表の行・本文のまとまりの先頭を、まとまりの本文・範囲に差し替える（`chunk_id` は先頭のまま）。"""
     group = src.get("row_group")
     vector_text = src.get("vector_text")
     if not isinstance(group, dict) or not isinstance(vector_text, str) or not vector_text:
@@ -2286,7 +2433,7 @@ def _as_row_group_hit(hit: dict, src: dict) -> dict:
 
 
 def _parse_hits(res: dict, vector: bool = False) -> list:
-    """ES の応答をヒットの形にする。`vector=True`（kNN の応答）は表の行のまとまりをまとまりの本文で返す。"""
+    """ES の応答をヒットの形にする。`vector=True`（kNN の応答）は表の行・本文のまとまりをまとまりの本文で返す。"""
     out = []
     for h in res.get("hits", {}).get("hits", []):
         src = h.get("_source", {})
@@ -2484,20 +2631,22 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     meta = (_index_meta(world) or {}) if ec else {}
     same = bool(ec) and (meta.get("embed_provider") == ec["provider"]
                          and meta.get("embed_model") == ec["model"] and meta.get("dim") == ec["dim"]
-                         and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID)
+                         and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID
+                         and meta.get("quant") == embeddings.ES_VECTOR_QUANT)
     if ec and not same:
         # 索引のベクトル素性が現在の埋め込み設定と合わない（再索引待ち）。kNN は打てないので BM25 のみへ縮退し、クエリ埋め込みも呼ばない。理由を返して静かな縮退にしない
         reason = "vector_feature_mismatch"
     if same:  # 索引のベクトル素性が一致する時だけ kNN
         qv = embeddings.embed([q], ec, world=world)
-        if qv:
+        qb = embeddings.vector_to_es_bytes(qv[0]) if qv else None
+        if qb is not None:
             # ① BM25（ハイライト付き）を先に引く。失敗は kNN を打たず BM25 失敗の reason で返す
             try:
                 bm25_res = _req("POST", f"/{_index(world)}/_search", bm25)
             except Exception as exc:
                 return [], _classify_query_exception(exc)
             # ② kNN（同じ filter・k・num_candidates）。重要度ブーストは function_score で kNN 側へ掛ける（重要度なしの資料フォルダでは不変）
-            knn_clause = {"knn": {"field": "embedding", "query_vector": qv[0], "k": k,
+            knn_clause = {"knn": {"field": "embedding", "query_vector": qb, "k": k,
                                   "num_candidates": max(50, k * 5), "filter": flt}}
             try:
                 knn_res = _req("POST", f"/{_index(world)}/_search",
@@ -2541,10 +2690,12 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
     meta = _index_meta(world) or {}  # GET 失敗は未設定相当＝ベクトル素性不一致として扱う
     if not (meta.get("embed_provider") == ec["provider"]
             and meta.get("embed_model") == ec["model"] and meta.get("dim") == ec["dim"]
-            and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID):
+            and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID
+            and meta.get("quant") == embeddings.ES_VECTOR_QUANT):
         return [], "vector_feature_mismatch"  # 索引素性ズレ
     qv = embeddings.embed([q], ec, world=world)
-    if not qv:
+    qb = embeddings.vector_to_es_bytes(qv[0]) if qv else None
+    if qb is None:
         return [], "query_embed_failed"
     flt = []
     sel = scope_mod.normalize_scope_paths(scope_paths)
@@ -2558,7 +2709,7 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
     # 上位ちょうど `k` 件を取ってから重要度で並べ替えると、「高」のヒットが取得時点で落選して浮上できない。有界の overfetch（`k*3`・上限 `k+50`）で多めに取り、補正・再ソートの後に `k` 件へ切る（重要度なしの資料フォルダは補正が no-op で結果不変）
     fetch_k = min(k * 3, k + 50)
     body = {"size": fetch_k,
-            "knn": {"field": "embedding", "query_vector": qv[0], "k": fetch_k,
+            "knn": {"field": "embedding", "query_vector": qb, "k": fetch_k,
                     "num_candidates": max(50, fetch_k * 5), "filter": flt}}
     try:
         # 純 kNN は function_score で包めないため、取得後の再ランクで重要度ブーストを適用する

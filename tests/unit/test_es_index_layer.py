@@ -91,7 +91,7 @@ def _stub_embeddings(monkeypatch):
     monkeypatch.setattr(embeddings, "cfg", lambda settings=None, **kw: ec)
     monkeypatch.setattr(es_index, "_index_meta", lambda world: {
         "embed_provider": "openai", "embed_model": "text-embedding-3-small", "dim": 3,
-        "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID})
+        "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": embeddings.ES_VECTOR_QUANT})
     monkeypatch.setattr(embeddings, "embed", lambda texts, c, **kw: [[0.1, 0.2, 0.3]])
 
 

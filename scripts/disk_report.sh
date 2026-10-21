@@ -330,6 +330,9 @@ NR == FNR {
     else if (b == "embed_cache.f32.sqlite3") e = "f32_db"
     else if (b == "embed_cache.f32.sqlite3-wal") e = "f32_wal"
     else if (b == "embed_cache.f32.sqlite3-shm") e = "f32_shm"
+    else if (b == "embed_cache.i8.sqlite3") e = "i8_db"
+    else if (b == "embed_cache.i8.sqlite3-wal") e = "i8_wal"
+    else if (b == "embed_cache.i8.sqlite3-shm") e = "i8_shm"
     else if (b ~ /\.tmp$/) e = "tmp"
     if (e != "") { en[e]++; eb[e] += bytes }
   }
@@ -497,11 +500,12 @@ sec_derived() {
     done
     D "_conv_cache のうちリンク数 1（公開側と共有せず二重持ちの疑い）: $(stv "$i" L conv_l1 3) 件 $(hs "$(stv "$i" L conv_l1 4)")"
     D "$(row '40:埋め込みキャッシュ' '-10:大きさ' '-9:件数')"
-    for g in json_db json_wal json_shm f32_db f32_wal f32_shm tmp; do
+    for g in json_db json_wal json_shm f32_db f32_wal f32_shm i8_db i8_wal i8_shm tmp; do
       [ "$(stv "$i" E "$g" 3)" = 0 ] && continue
       case "$g" in
         json_db) n="embed_cache.sqlite3（JSON 形式）" ;; json_wal) n="  -wal" ;; json_shm) n="  -shm" ;;
-        f32_db) n="embed_cache.f32.sqlite3（新形式）" ;; f32_wal) n="  f32 -wal" ;; f32_shm) n="  f32 -shm" ;; *) n=".tmp" ;;
+        f32_db) n="embed_cache.f32.sqlite3（float32 形式）" ;; f32_wal) n="  f32 -wal" ;; f32_shm) n="  f32 -shm" ;;
+        i8_db) n="embed_cache.i8.sqlite3（新形式）" ;; i8_wal) n="  i8 -wal" ;; i8_shm) n="  i8 -shm" ;; *) n=".tmp" ;;
       esac
       D "$(row "40: $n" "-10:$(hs "$(stv "$i" E "$g" 4)")" "-9:$(stv "$i" E "$g" 3)")"
     done
@@ -562,16 +566,24 @@ sec_embed() {
     if [ -f "$f" ]; then
       any=1
       tbl="$(sqlq "$f" "select name from sqlite_master where type = 'table' and name not like 'sqlite_%' order by name")"
-      if [ -n "$tbl" ]; then r="$(sqlq "$f" "select count(*) from \"$tbl\"")"; D "$lab 新形式: ${r:-調べられません} 行"
-      else D "$lab 新形式: 行数を調べられません"; fi
+      if [ -n "$tbl" ]; then r="$(sqlq "$f" "select count(*) from \"$tbl\"")"; D "$lab float32 形式: ${r:-調べられません} 行"
+      else D "$lab float32 形式: 行数を調べられません"; fi
+    fi
+    f="${WDIR[$i]}/semantic/embed_cache.i8.sqlite3"
+    if [ -f "$f" ]; then
+      any=1
+      r="$(sqlq "$f" 'select count(*) from kv3')"
+      D "$lab 新形式: ${r:-調べられません} 行"
     fi
   done
   [ "$any" = 1 ] || D "埋め込みキャッシュはありません"
-  local ej ef fl
+  local ej ef ei fl il
   ej="$(awk -F'\t' '$1 == "E" && ($2 == "json_db" || $2 == "json_wal" || $2 == "json_shm") { s += $4 } END { printf "%.0f", s }' "$TMP"/st.* 2>/dev/null)"
   ef="$(awk -F'\t' '$1 == "E" && ($2 == "f32_db" || $2 == "f32_wal" || $2 == "f32_shm") { s += $4 } END { printf "%.0f", s }' "$TMP"/st.* 2>/dev/null)"
+  ei="$(awk -F'\t' '$1 == "E" && ($2 == "i8_db" || $2 == "i8_wal" || $2 == "i8_shm") { s += $4 } END { printf "%.0f", s }' "$TMP"/st.* 2>/dev/null)"
   if [ "${ef:-0}" = 0 ]; then fl="-"; else fl="$(hs "$ef")"; fi
-  S "[埋め込み] キャッシュ JSON $(hs "${ej:-0}")  新形式 $fl  行数 $EMBED_ROWS"
+  if [ "${ei:-0}" = 0 ]; then il="-"; else il="$(hs "$ei")"; fi
+  S "[埋め込み] キャッシュ JSON $(hs "${ej:-0}")  float32 $fl  新形式 $il  行数 $EMBED_ROWS"
   return 0
 }
 

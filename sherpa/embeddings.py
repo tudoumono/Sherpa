@@ -58,8 +58,8 @@ _ollama_dim_failed: dict = {}  # (url, model) -> 失敗時刻
 _log = logging.getLogger("sherpa.embed")
 
 
-# ベクトルは float32 の `array('f')`（1536 次元で約 6KB）で持つ。保存（キャッシュ DB の BLOB）は常にリトルエンディアンの float32。
-# ES へ送るときだけ `vector_to_json()` で数の list にする。
+# API から受けたベクトルは float32 の `array('f')` にする。0.19.5 の float32 のキャッシュ（`embed_cache.f32.sqlite3`）の BLOB はリトルエンディアンの float32。
+# ES へ送る値と埋め込みキャッシュ（`embed_cache.i8.sqlite3`）の値は `quantize_vector()` で 1 次元 1 バイトに縮める。
 def to_vector(values) -> array:
     """float の list／`array('f')` を float32 の `array('f')` にする（float32 に丸める）。"""
     if isinstance(values, array) and values.typecode == "f":
@@ -91,8 +91,49 @@ def vector_from_bytes(raw, dimension: int) -> array | None:
 
 
 def vector_to_json(vector) -> list:
-    """ES へ送る数の list（float32 に丸めた値）。list で来たものはそのまま通す。"""
+    """数の list（float32 に丸めた値・JSON 形式の埋め込みキャッシュへ書く）。list で来たものはそのまま通す。"""
     return vector.tolist() if isinstance(vector, array) else vector
+
+
+# ES へ送るベクトル（索引に入れるもの・kNN の問い）と埋め込みキャッシュの値の縮め方の名前。索引の `_meta.quant` に刻み、違えば作り直す（`es_index.needs_reindex`）
+ES_VECTOR_QUANT = "byte_maxabs_v1"
+
+
+def vector_to_es_bytes(vector) -> list | None:
+    """ES の byte の dense_vector へ渡す -127〜127 の整数の list。ベクトルごとに最大の絶対値で割って 127 倍し、四捨五入する（0.5 は 0 から遠い側）。
+    float は float32 に丸めてから縮める（キャッシュの float32 から縮めても、API の値から縮めても同じ結果にする）。縮めた値をもう一度通しても変わらない。
+    全部 0・有限でない値・数でない値を含むものは None。
+    """
+    if isinstance(vector, array) and vector.typecode == "b":
+        return vector.tolist() if any(vector) else None
+    try:
+        vec = to_vector(vector)
+        if not math.isfinite(math.fsum(map(abs, vec))):
+            return None
+        peak = max(map(abs, vec), default=0.0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if peak <= 0:
+        return None
+    s = 127.0 / peak
+    return [int(x * s + 0.5) if x >= 0 else -int(0.5 - x * s) for x in vec]
+
+
+def quantize_vector(vector) -> array | None:
+    """`vector_to_es_bytes` で縮めた値を `array('b')`（1 次元 1 バイト）で返す。縮められないものは None。"""
+    q = vector_to_es_bytes(vector)
+    return array("b", q) if q is not None else None
+
+
+def quantized_from_bytes(raw, dimension: int) -> array | None:
+    """1 次元 1 バイトのバイト列を `array('b')` に戻す。長さが `dimension` でない・-128 を含む・全部 0 のものは None（キャッシュ miss）。"""
+    if not isinstance(raw, (bytes, bytearray, memoryview)) or len(raw) != dimension or dimension <= 0:
+        return None
+    vec = array("b")
+    vec.frombytes(bytes(raw))
+    if not any(vec) or min(vec) < -127:
+        return None
+    return vec
 
 
 def effective_embed_parallel(system_settings: dict | None) -> int:

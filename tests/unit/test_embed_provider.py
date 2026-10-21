@@ -61,7 +61,7 @@ def test_provider_switch_changes_cache_key_and_triggers_reindex(monkeypatch):
             "arms_sig": "a", "analyzer_config_sig": "z",
             "chunk_lines": es_index._CHUNK_LINES, "human_md_sig": None, "source_excluded": True,
             "embed_provider": "openai", "embed_model": oa["model"], "dim": oa["dim"],
-            "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID}
+            "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": embeddings.ES_VECTOR_QUANT}
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "count", lambda w: 5)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "a")

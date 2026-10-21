@@ -76,7 +76,7 @@ class Rendered:
 
 @dataclass
 class Prefetched:
-    """子の計算結果。`result.document` は常に None（実体は `document_json`／`evidence` に畳んで返す）。
+    """子の計算結果。`result.document` は常に None（実体は `evidence` に畳んで返す）。
 
     `has_document`＝アームが Document IR を作れたか。`partial`＝`_check_partial_extraction` の追記分。
     `evidence`＝Evidence を作る拡張子のときだけ（xlsx は `excel_display` 適用済み）。描画まで済んだとき（`rendered`）は None。
@@ -86,7 +86,6 @@ class Prefetched:
     arm_name: str
     result: object
     has_document: bool
-    document_json: str | None
     partial: list[dict]
     evidence: object | None
     source_stat: tuple | None = None
@@ -124,34 +123,32 @@ def compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = Fal
 
 def _compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = False,
              assets_dir: str | None = None, obs_dir: str | None = None) -> Prefetched:
-    """子プロセスで動く。① 原本の stat を取り入口ガードを判定し直す ② アームで変換 ③ 消費前の Document IR から document.json・部分抽出の疑いを作る
+    """子プロセスで動く。① 原本の stat を取り入口ガードを判定し直す ② アームで変換 ③ 消費前の Document IR から部分抽出の疑いを作る
     ④ Evidence を抽出する（pdf_text は人向け MD を組むため②の直後に抽出し `result.md` を差し替える）⑤ `render` のときは素材の書出し・描画まで行い、親が書く中身を返す（失敗したら素材を消して Evidence までで返す）。"""
-    from . import document_ir, evidence_spike, excel_display, office_md
+    from . import evidence_spike, excel_display, office_md
     from .arms import ooxml_arm, pdf_text_arm
 
     arm = {"ooxml": ooxml_arm.OoxmlArm, "pdf_text": pdf_text_arm.PdfTextArm}[arm_name]()
     path = Path(path_str)
     stat = source_stat(path)
     if office_md._precheck_target(path, ext, {ext})[0] != "ok":      # ガードに掛かる原本は子で開かない
-        return Prefetched(arm_name, None, False, None, [], None, stat, guard_ok=False)
+        return Prefetched(arm_name, None, False, [], None, stat, guard_ok=False)
     result = arm.convert(path)
     if result is None:
-        return Prefetched(arm_name, None, False, None, [], None, stat)
+        return Prefetched(arm_name, None, False, [], None, stat)
     document = result.document
     result.document = None
     if result.md is None:
-        return Prefetched(arm_name, result, document is not None, None, [], None, stat)
+        return Prefetched(arm_name, result, document is not None, [], None, stat)
     evidence = None
     if ext == ".pdf" and arm_name == "pdf_text":                     # 人向け MD は Evidence から組むので、先に抽出して差し替える
         evidence = evidence_spike.extract(path)
         office_md._apply_pdf_human_md(result, evidence, path)
     partial: list[dict] = []
     office_md._check_partial_extraction(path, result.md, rel, document, partial)
-    document_json = None
     if ext in ooxml_arm._IR_EXTS and document is not None:
         document.doc_id = rel
         document.source.path = rel
-        document_json = document_ir.to_json_str(document)
     if evidence is None and ext in office_md.EVIDENCE_EXT and office_md._evidence_arm_selected(ext, arm_name):
         evidence = evidence_spike.extract(path, legacy_ir=document, consume_legacy=document is not None)
         if path.suffix.lower() == ".xlsx":
@@ -166,7 +163,7 @@ def _compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = Fa
             shutil.rmtree(assets_dir, ignore_errors=True)
     if rendered is not None:
         evidence = None
-    return Prefetched(arm_name, result, document is not None, document_json, partial, evidence, stat,
+    return Prefetched(arm_name, result, document is not None, partial, evidence, stat,
                       rendered=rendered)
 
 

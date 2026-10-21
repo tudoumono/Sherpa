@@ -52,7 +52,7 @@ def test_embed_dim_changes_cfg_dim_cache_key_and_forces_reindex(monkeypatch):
     monkeypatch.setattr(es_index, "_CHUNK_LINES", 40)
     meta = {"content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION, "arms_sig": "sig-A",
             "analyzer_config_sig": "acfg-A", "source_excluded": True, "embed_provider": "openai",
-            "embed_model": ec1536["model"], "dim": 1536, "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID}
+            "embed_model": ec1536["model"], "dim": 1536, "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": embeddings.ES_VECTOR_QUANT}
     monkeypatch.setattr(es_index, "_index_meta", lambda w: meta)
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: ec1536)
     assert es_index.needs_reindex("w", "c1") is False
@@ -68,7 +68,7 @@ def test_replace_document_rollback_restores_vectors_from_cache_without_api(monke
     monkeypatch.setattr(es_index.worlds, "semantic_dir", lambda w: tmp_path / w / "semantic")
     es_index._embed_cache_write_batch("w", {es_index._chunk_key(ec, "古い1"): [0.1, 0.2, 0.3]})  # 「古い2」はキャッシュに無い
     meta = {"content_sig": "c1", "embed_provider": "openai", "embed_model": "m", "dim": 3,
-            "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID}
+            "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": embeddings.ES_VECTOR_QUANT}
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "_index_meta", lambda w: meta)
     monkeypatch.setattr(es_index, "count", lambda w: 2)
@@ -100,7 +100,7 @@ def test_replace_document_rollback_restores_vectors_from_cache_without_api(monke
     assert r == {"available": True, "error": "bulk_failed"}
     restore = [json.loads(ln) for p in sent[1] for i, ln in enumerate(p.strip().split("\n")) if i % 2 == 1]
     by_text = {b["text"]: b for b in restore if b["text"].startswith("古い")}
-    assert by_text["古い1"]["embedding"] == pytest.approx([0.1, 0.2, 0.3], rel=1e-6) and "vector_status" not in by_text["古い1"]
+    assert by_text["古い1"]["embedding"] == [42, 85, 127] and "vector_status" not in by_text["古い1"]
     assert "embedding" not in by_text["古い2"] and by_text["古い2"]["vector_status"] == "missing"
 
 
