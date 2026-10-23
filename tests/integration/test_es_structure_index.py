@@ -164,3 +164,30 @@ def test_mapping_version_bump_reindexes_once_and_reuses_embeddings(es_world, mon
     assert es.needs_reindex(es_world, "sig-1", settings={}) is False             # 以降の更新では入れ直さない
     assert sync() is False and calls == [1, 1]
     assert _raw_search(es_world, {"exists": {"field": "identifier_values"}})
+
+
+def test_exact_with_vector_finds_the_group_whichever_row_holds_the_id(es_world, monkeypatch):
+    """表の行のまとまりの先頭・中間・末尾のどの行の ID でも、exact と意味検索（mode=vector／hybrid）の併用でそのまとまりが候補に入り、当たった行の chunk_id が残る。"""
+    import hashlib
+
+    def vec_for(t):
+        h = hashlib.sha256(t.strip().encode("utf-8")).digest()
+        return [(b - 127.5) / 1000.0 for b in h[:16]]
+
+    monkeypatch.setattr(es.embeddings, "cfg", lambda settings=None, **kw: {"provider": "stub", "key": "x", "model": "stub", "dim": 16})
+    monkeypatch.setattr(es.embeddings, "embed", lambda texts, c, **kw: [vec_for(t) for t in texts])
+    assert es.index_world(es_world, settings={}).get("vectors") is True
+    left = [s for s in _raw_search(es_world, {"term": {"doc_id": "two.xlsx"}}) if (s.get("record_identity_values") or [""])[0].startswith("B")]
+    heads = [s for s in left if s.get("vector_text")]
+    assert len(heads) == 1 and len(left) == 3                                    # 3 行が 1 つのまとまり（ベクトルは先頭だけ）
+    head = heads[0]
+    assert head["row_group_identifier_values"] == ["B01", "B02", "B03"]
+    assert head["record_identity_values"] == ["B01"]                             # 他の行の ID は混ぜない
+    assert {s["row_group_head_chunk_id"] for s in left if s is not head} == {head["chunk_id"]}
+    row_chunk = {s["record_identity_values"][0]: s["chunk_id"] for s in left}
+    for value in ("B01", "B02", "B03"):                                          # 先頭・中間・末尾
+        for hits, reason in (es.search_knn_only(es_world, head["vector_text"], exact=[value], settings={}),
+                             es.search(es_world, head["vector_text"], exact=[value], settings={})):
+            assert reason is None
+            found = [h for h in hits if h["chunk_id"] == head["chunk_id"]]
+            assert len(found) == 1 and found[0]["row_group_exact_chunk_ids"] == [row_chunk[value]]

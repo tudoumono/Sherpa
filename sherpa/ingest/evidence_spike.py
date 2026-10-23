@@ -11,16 +11,20 @@ import json
 import mimetypes
 import threading
 import zipfile
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace as _dataclass_replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 from xml.etree import ElementTree as ET
 
 from .. import json_io
-from . import document_ir, evidence_ir
+from . import document_ir, drawing_fill, evidence_ir, image_alpha, observation_vocab
 from .gc_relax import relaxed_gc
 from .metafile_text import child_png_size
+from .ooxml import powerpoint
 from .ooxml.rels import load_relationships, resolve_target
+from .ooxml.text import paragraph_separated_text
 
 
 _R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
@@ -28,6 +32,7 @@ _A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
 _PIC = "{http://schemas.openxmlformats.org/drawingml/2006/picture}"
+_WPS = "{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}"
 _P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 _X = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _XDR = "{http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing}"
@@ -37,9 +42,9 @@ _V = "{urn:schemas-microsoft-com:vml}"
 _O = "{urn:schemas-microsoft-com:office:office}"
 _CT = "{http://schemas.openxmlformats.org/package/2006/content-types}"
 # 各形式の adapter 版。Evidence の中身が変わる変更をしたら上げる。
-XLSX_ADAPTER_VERSION = "xlsx-evidence-adapter-v5"
-DOCX_ADAPTER_VERSION = "docx-evidence-adapter-v4"
-PPTX_ADAPTER_VERSION = "pptx-evidence-adapter-v4"
+XLSX_ADAPTER_VERSION = "xlsx-evidence-adapter-v7"
+DOCX_ADAPTER_VERSION = "docx-evidence-adapter-v6"
+PPTX_ADAPTER_VERSION = "pptx-evidence-adapter-v6"
 PDF_ADAPTER_VERSION = "pdf-evidence-adapter-v5"
 PDF_XOBJECT_MAX_DEPTH = 16
 PDF_XOBJECT_MAX_RESOLUTIONS = 4096
@@ -157,6 +162,7 @@ class _Builder:
         self._coverage_by_id: dict[str, evidence_ir.CoverageItem] = {}
         self._element_coverage: dict[str, str] = {}
         self._element_index: dict[str, int] = {}
+        self._covers_by_target: dict[str, list[evidence_ir.EvidenceRelation]] = {}
 
     def add_coverage(
         self,
@@ -252,18 +258,51 @@ class _Builder:
     def coverage_for(self, element_id: str) -> str:
         return self._element_coverage[element_id]
 
-    def mark_hidden(self, element_id: str, *, reason: str, extra_extension: dict[str, Any] | None = None) -> None:
-        """既存要素の `visibility` を `"hidden"` へ差し替える（xlsx の図形/画像による覆いなど、要素追加後に幾何交差が判明するケース用）。
+    def element(self, element_id: str) -> evidence_ir.EvidenceElement:
+        return self.ir.elements[self._element_index[element_id]]
+
+    def set_state(self, element_id: str, *, visibility: str, extension: dict[str, Any]) -> None:
+        """既存要素の `visibility` と `extension` を差し替える（要素追加後に幾何関係が判明する遮蔽の反映用）。
 
         `EvidenceElement` は frozen のため `dataclasses.replace` で差し替え、`value`/`locator`/`coverage_id` は変えない。
-        複数の前面図形が同じ要素へ一致した場合は、最後の呼び出し（z_order 降順で最も手前）が勝つ。
         """
         index = self._element_index[element_id]
-        element = self.ir.elements[index]
-        merged_extension = {**element.extension, "visibility_reason": reason}
-        if extra_extension:
-            merged_extension.update(extra_extension)
-        self.ir.elements[index] = _dataclass_replace(element, visibility="hidden", extension=merged_extension)
+        self.ir.elements[index] = _dataclass_replace(
+            self.ir.elements[index], visibility=visibility, extension=extension)
+
+    def covers_to(self, element_id: str) -> list[evidence_ir.EvidenceRelation]:
+        """`element_id` を背面とする covers を、作った順に返す。"""
+        return self._covers_by_target.get(element_id, [])
+
+    def add_covers(
+        self,
+        front_id: str,
+        back_id: str,
+        *,
+        fill: str,
+        cover_ratio: float | None,
+        coordinate_system: str,
+        covers_bbox: bool = True,
+    ) -> None:
+        """前面 → 背面の `covers`（遮蔽の正本）。背面の状態は `_apply_cover_state` が導く。
+
+        `covers_bbox` は前面の形が外接矩形と同一視できるか。False（ドーナツ・楕円・カスタム形状など）なら、
+        不透明な塗りでも occlusion は undetermined になり、extension に `covers_bbox=False` を残す。
+        """
+        extension: dict[str, Any] = observation_vocab.relation_extension(
+            observation_vocab.BASIS_GEOMETRY,
+            observation_vocab.DIRECTION_UNDIRECTED,
+            fill=fill,
+            occlusion=observation_vocab.occlusion_of(fill, covers_bbox),
+            coordinate_system=coordinate_system,
+        )
+        if not covers_bbox:
+            extension["covers_bbox"] = False
+        if cover_ratio is not None:
+            extension["cover_ratio"] = cover_ratio
+        self.add_relation(
+            observation_vocab.RELATION_COVERS, front_id, back_id,
+            evidence_ids=[front_id, back_id], extension=extension)
 
     def add_relation(
         self,
@@ -285,6 +324,79 @@ class _Builder:
             confidence=confidence,
             extension=extension or {},
         ))
+        if relation_type == observation_vocab.RELATION_COVERS:
+            self._covers_by_target.setdefault(target_id, []).append(self.ir.relations[-1])
+
+
+def _apply_cover_state(
+    builder: _Builder,
+    back_id: str,
+    *,
+    file_type: str,
+    front_of: Callable[[str], evidence_ir.EvidenceElement] | None = None,
+) -> None:
+    """背面の要素の visibility・visibility_reason・occluded_by・covered_by_text を、その要素へ向かう covers から導く。
+
+    遮蔽の正本は covers で、背面の状態は xlsx・pptx ともこの関数だけが書く。
+    ① occlusion=confirmed の covers があれば、最後に作った（最も手前の）前面で hidden にし、前面を occluded_by に残す
+    ② なければ、文字を持つ前面（none_with_text）を covered_by_text に残す（visibility は変えない）。
+    すでに別の理由（原本の非表示の指定・スライド範囲外など遮蔽由来でないもの）を持つ要素は、可視性と理由を保つ。`front_of` は前面の要素の引き当て（既定は builder の要素）。
+    """
+    covers = builder.covers_to(back_id)
+    if not covers:
+        return
+    lookup = front_of or builder.element
+    back = builder.element(back_id)
+    extension = dict(back.extension)
+    visibility = back.visibility
+    confirmed = [c for c in covers if c.extension.get("occlusion") == observation_vocab.OCCLUSION_CONFIRMED]
+    if confirmed:
+        front = lookup(confirmed[-1].source_id)
+        occluded_by: dict[str, Any] = {
+            "kind": front.type, "element_id": front.element_id, "z_order": front.extension.get("z_order")}
+        if front.value:
+            occluded_by["text"] = front.value
+        elif front.extension.get("name"):
+            occluded_by["name"] = front.extension["name"]
+        extension["occluded_by"] = occluded_by
+        # 原本の直接の指定（非表示の行・列・スライドなど）の理由は、覆いで置き換えない。覆いは occluded_by と covers に残す。
+        existing_reason = extension.get("visibility_reason")
+        if not existing_reason or existing_reason in observation_vocab.COVER_DERIVED_REASONS:
+            visibility = "hidden"
+            extension["visibility_reason"] = observation_vocab.occlusion_reason(file_type, front.type)
+    else:
+        text_cover = next(
+            (c for c in covers if c.extension.get("fill") == observation_vocab.FILL_NONE_WITH_TEXT), None)
+        if text_cover is None:
+            return
+        front = lookup(text_cover.source_id)
+        extension["covered_by_text"] = {"element_id": front.element_id, "text": front.value}
+    builder.set_state(back_id, visibility=visibility, extension=extension)
+
+
+def _bbox_cover_ratio(back_bbox: Any, front_bbox: Any) -> float | None:
+    """背面の面積のうち前面と重なる割合。どちらかの bbox が無い・重ならないときは None。"""
+    if not back_bbox or not front_bbox:
+        return None
+    intersection = _bbox_intersection(list(back_bbox), list(front_bbox))
+    back_area = _area(list(back_bbox))
+    if intersection is None or not back_area:
+        return None
+    return _area(intersection) / back_area
+
+
+def _annotate_state_basis(ir: evidence_ir.EvidenceIR) -> None:
+    """可視性の理由と要素全体の書式の状態に、由来（原本の直接の指定 / 幾何の判定）を `extension.state_basis` で付ける。"""
+    for element in ir.elements:
+        extension = element.extension
+        basis: dict[str, str] = {}
+        visibility_basis = observation_vocab.state_basis_for(extension.get("visibility_reason"))
+        if visibility_basis is not None:
+            basis["visibility"] = visibility_basis
+        if extension.get("format_state"):
+            basis["format"] = observation_vocab.STATE_BASIS_OOXML_DIRECT
+        if basis:
+            extension["state_basis"] = basis
 
 
 def _part_for_element(file_type: str, element: document_ir.Element, slide_parts: dict[int, str]) -> str:
@@ -344,7 +456,7 @@ def _adapt_document_ir(
     ``consume_legacy`` は通常取り込みの巨大 XLSX 用。既存 IR 成果物と chunk を書き終えた後に限って使い、
     table ごとの cell を Evidence へ移し終えた時点で元 list を空にしてピークメモリを抑える。
     xlsx の cell は、親 `table:N` の `source_map` の `hidden_rows`/`hidden_columns` と `strike_text` 要素を突き合わせ、
-    cell 自身の `visibility`/`extension["visibility_reason"]` へ直接反映する。
+    cell 自身の `visibility`/`extension["visibility_reason"]`（非表示行・列）と `extension["format_state"]`（取り消し線）へ直接反映する。
     """
     if legacy is None:
         return
@@ -387,6 +499,10 @@ def _adapt_document_ir(
             front_evidence_id = ids.get(covered_by_text_id)
             if front_legacy is not None and front_evidence_id is not None:
                 extension["covered_by_text"] = {"element_id": front_evidence_id, "text": front_legacy.text}
+        # 要素全体の取り消し線などの書式の状態は可視性と分けて持つ。
+        format_state = element.source_map.get("format_state")
+        if isinstance(format_state, dict) and format_state:
+            extension["format_state"] = dict(format_state)
         # docx の浮動図形と段落の関連付けの事実（幾何断定なし）を Evidence extension へ運ぶ。
         # `_docx_host_objects` の EMU 座標 `overlaps` とは別物なのでキー名（"floating_anchors"）で区別する。
         floating_anchors = element.source_map.get("floating_anchors")
@@ -431,15 +547,15 @@ def _adapt_document_ir(
             cell_visibility = element.visibility
             cell_extension: dict[str, Any] = {"role": cell.role}
             if file_type == "xlsx":
-                # 優先順位: 非表示行 → 非表示列 → 取り消し線（取り消し線は本文が読めるため visibility は変えず reason だけ残す）
+                # 可視性: 非表示行 → 非表示列。取り消し線は本文が読めるので可視性を変えず、書式の状態として別に持つ。
                 if cell.row in hidden_rows:
                     cell_visibility = "hidden"
                     cell_extension["visibility_reason"] = "hidden_row"
                 elif _column_letter(cell.column) in hidden_columns:
                     cell_visibility = "hidden"
                     cell_extension["visibility_reason"] = "hidden_column"
-                elif (locator.sheet, cell_range) in xlsx_strike_cells:
-                    cell_extension["visibility_reason"] = "strike"
+                if (locator.sheet, cell_range) in xlsx_strike_cells:
+                    cell_extension["format_state"] = observation_vocab.whole_strike_state()
             builder.add_element(
                 "cell",
                 cell_locator,
@@ -852,17 +968,44 @@ def _occlusion_ratio() -> float:
     return office_md._OCCLUSION_RATIO
 
 
-def _xlsx_shape_has_solid_fill(node: ET.Element) -> bool:
-    """xlsx 図形（`xdr:sp`）が `xdr:spPr/a:solidFill` を持つか（`a:noFill` なら False）。
+def _drawing_front_fill(
+    node: ET.Element,
+    kind: str,
+    *,
+    ns: str,
+    text: str,
+    extension: dict[str, Any],
+    entries: dict[str, bytes],
+) -> str | None:
+    """セル・段落の上に重なる図形・画像の塗りの区分（`observation_vocab.FILL_*`）。図形・テキストボックス・画像以外は None。
 
-    `office_md._pptx_has_solid_fill` と同じ判定を spreadsheetDrawing 名前空間へ適用したもの。
+    画像は `extension["image_references"]`（`_drawing_asset`）で解決した埋め込み画像の透過の有無で決める（読めない・外部参照は unknown）。
     """
-    sp_pr = node.find(f"{_XDR}spPr")
-    if sp_pr is None:
-        return False
-    if sp_pr.find(f"{_A}noFill") is not None:
-        return False
-    return sp_pr.find(f"{_A}solidFill") is not None
+    if kind in ("shape", "textbox"):
+        return drawing_fill.shape_fill_kind(
+            node.find(f"{ns}spPr"), node.find(f"{ns}style"), has_text=bool(text.strip()))
+    if kind != "picture":
+        return None
+    references = {
+        reference.get("relationship_id"): reference
+        for reference in extension.get("image_references") or [] if isinstance(reference, dict)
+    }
+
+    def image_kind_of(embed: str | None, _link: str | None) -> str:
+        reference = references.get(embed) if embed else None
+        if reference is None or reference.get("binding_status") != "resolved":
+            return observation_vocab.FILL_UNKNOWN
+        return image_alpha.image_fill_kind(entries.get(reference.get("media_part")))
+
+    return drawing_fill.picture_fill_kind(node, image_kind_of)
+
+
+def _drawing_covers_bbox(sp_pr: ET.Element | None, kind: str) -> bool:
+    """図形・画像（`kind`）の `spPr` から、覆う範囲を外接矩形と同一視してよいか（`drawing_fill.covers_bounding_box`）。
+
+    xlsx・docx の図形はレイアウトから形状を受け継がないので、形状の指定が無い図形は False・画像は True。
+    """
+    return drawing_fill.covers_bounding_box(sp_pr, picture=kind == "picture")
 
 
 def _c_nv_pr(node: ET.Element, prefix: str, kind: str) -> ET.Element | None:
@@ -1580,6 +1723,47 @@ def _xlsx_sheet_geometry(builder: _Builder, cache: dict[str, _SheetGeometry], sh
     return geometry
 
 
+def _add_connector_relation(
+    builder: _Builder,
+    connector_id: str,
+    start_object_id: int | None,
+    end_object_id: int | None,
+    ids_by_object: dict[int, str],
+) -> None:
+    """コネクタの始点・終点の指定から `connects_to` を 1 本作る（xlsx・pptx 共通）。
+
+    両端が原本の図形に解決できれば 始点 → 終点。片端だけなら、解決できた図形とコネクタを結び
+    （`ends=source_only` は 始点 → コネクタ、`target_only` は コネクタ → 終点）、解決できなかった側の原本の図形 ID を
+    読めれば `unresolved_object_id` に残す。両端とも解決できなければ関係は作らない。
+    """
+    start_id, end_id = ids_by_object.get(start_object_id), ids_by_object.get(end_object_id)
+    if start_id and end_id:
+        source_id, target_id, ends, extra = start_id, end_id, observation_vocab.ENDS_BOTH, {}
+        evidence_ids = [start_id, connector_id, end_id]
+    elif start_id or end_id:
+        if start_id:
+            source_id, target_id, ends = start_id, connector_id, observation_vocab.ENDS_SOURCE_ONLY
+            unresolved_object_id = end_object_id
+        else:
+            source_id, target_id, ends = connector_id, end_id, observation_vocab.ENDS_TARGET_ONLY
+            unresolved_object_id = start_object_id
+        extra = {"unresolved_object_id": unresolved_object_id} if unresolved_object_id is not None else {}
+        evidence_ids = [source_id, target_id]
+    else:
+        return
+    builder.add_relation(
+        "connects_to",
+        source_id,
+        target_id,
+        evidence_ids=evidence_ids,
+        extension=observation_vocab.relation_extension(
+            observation_vocab.BASIS_OOXML_CONNECTOR,
+            observation_vocab.DIRECTION_ENDPOINT_ORDER_ONLY,
+            ends,
+            connector_element_id=connector_id, directed=True, **extra),
+    )
+
+
 def _xlsx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
     geometry_cache: dict[str, _SheetGeometry] = {}
     content_parts = {"xl/workbook.xml"}
@@ -1628,7 +1812,7 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                         order = z_order if order_base == 0 else order_base + local_index
                         props = _c_nv_pr(node, _XDR, kind)
                         object_id = _integer(props.get("id")) if props is not None else None
-                        text = "".join(part.text or "" for part in node.findall(f".//{_A}t"))
+                        text = paragraph_separated_text(node, _A)
                         extension: dict[str, Any] = {
                             **anchor_ext,
                             "z_order": z_order,
@@ -1736,23 +1920,22 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                                     element_id,
                                     target_id,
                                     evidence_ids=[element_id, target_id],
-                                    extension={
-                                        "coordinate_system": "normalized-cell",
-                                        "intersection_bbox": intersection,
-                                        "intersection_area": intersection_area,
-                                        "source_overlap_ratio": intersection_area / source_area if source_area else 0.0,
-                                        "target_overlap_ratio": intersection_area / target_area if target_area else 0.0,
-                                    },
+                                    extension=observation_vocab.relation_extension(
+                                        observation_vocab.BASIS_GEOMETRY,
+                                        observation_vocab.DIRECTION_UNDIRECTED,
+                                        coordinate_system="normalized-cell",
+                                        intersection_bbox=intersection,
+                                        intersection_area=intersection_area,
+                                        source_overlap_ratio=intersection_area / source_area if source_area else 0.0,
+                                        target_overlap_ratio=intersection_area / target_area if target_area else 0.0,
+                                    ),
                                 )
-                            # 不透明な前面図形/画像（塗りつぶし図形または画像）がセルを閾値以上覆うなら、そのセル要素を hidden へ差し替える
-                            # （`_field_piece` は cell 自身の `visibility` を見る）。前面図形の種別・テキスト・名前だけを `occluded_by` へ残す（意味の断定はしない）。
-                            is_opaque_occluder = kind == "picture" or (kind == "shape" and _xlsx_shape_has_solid_fill(node))
-                            if is_opaque_occluder:
-                                occluded_by: dict[str, Any] = {"kind": kind, "element_id": element_id, "z_order": z_order}
-                                if text:
-                                    occluded_by["text"] = text
-                                elif extension.get("name"):
-                                    occluded_by["name"] = extension["name"]
+                            # 前面の図形/画像がセルを閾値以上覆うなら、塗りの区分つきで前面 → セルの covers を作り、
+                            # セルの状態（hidden・理由・occluded_by）はそこから導く（`_field_piece` は cell 自身の `visibility` を見る）。
+                            # hidden になるのは不透明の塗りのときだけ（`_apply_cover_state`）。
+                            front_fill = _drawing_front_fill(
+                                node, kind, ns=_XDR, text=text, extension=extension, entries=entries)
+                            if front_fill is not None:
                                 for target_id, target_rect in near_cells:
                                     intersection = _bbox_intersection(source_rect, target_rect)
                                     if intersection is None:
@@ -1760,26 +1943,18 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                                     target_area = _area(target_rect)
                                     ratio = _area(intersection) / target_area if target_area else 0.0
                                     if ratio >= _occlusion_ratio():
-                                        builder.mark_hidden(
-                                            target_id,
-                                            reason="occluded_by_picture" if kind == "picture" else "occluded_by_shape",
-                                            extra_extension={"occluded_by": occluded_by},
-                                        )
+                                        builder.add_covers(
+                                            element_id, target_id, fill=front_fill,
+                                            cover_ratio=ratio, coordinate_system="normalized-cell",
+                                            covers_bbox=_drawing_covers_bbox(node.find(f"{_XDR}spPr"), kind))
+                                        _apply_cover_state(builder, target_id, file_type="xlsx")
                         if kind == "group":
                             child_nodes = [child for child in list(node) if _drawing_kind(child) is not None]
                             walk(child_nodes, element_id, order * 1000)
 
                 walk(list(anchor), sheet_ids.get(sheet_name), 0)
             for connector_id, start_object_id, end_object_id in pending_connectors:
-                start_id, end_id = ids_by_object.get(start_object_id), ids_by_object.get(end_object_id)
-                if start_id and end_id:
-                    builder.add_relation(
-                        "connects_to",
-                        start_id,
-                        end_id,
-                        evidence_ids=[start_id, connector_id, end_id],
-                        extension={"connector_element_id": connector_id, "directed": True},
-                    )
+                _add_connector_relation(builder, connector_id, start_object_id, end_object_id, ids_by_object)
         for ole_order, ole in enumerate(root.findall(f".//{_X}oleObject"), start=1):
             relationship_id = ole.get(f"{_R}id", "")
             if not relationship_id:
@@ -1827,6 +2002,80 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
     return content_parts
 
 
+# 位置の決まった浮動図形（`wp:anchor` の位置が `posOffset` で、基準がページ／余白）。同じ基準どうしだけ重なりを比べられる。
+_DOCX_ABSOLUTE_H_FRAMES = frozenset({"page", "margin", "leftMargin", "rightMargin"})
+_DOCX_ABSOLUTE_V_FRAMES = frozenset({"page", "margin", "topMargin", "bottomMargin"})
+
+
+def _docx_absolute_frame(anchor: ET.Element) -> tuple[str, str] | None:
+    """`wp:anchor` の位置が (横の基準, 縦の基準) の絶対値で決まっていればその組。段落・文字・行などの基準や `wp:align` は None。"""
+    if anchor.tag != f"{_WP}anchor":
+        return None
+    horizontal, vertical = anchor.find(f"{_WP}positionH"), anchor.find(f"{_WP}positionV")
+    if horizontal is None or vertical is None:
+        return None
+    if horizontal.find(f"{_WP}posOffset") is None or vertical.find(f"{_WP}posOffset") is None:
+        return None
+    frame = (horizontal.get("relativeFrom") or "", vertical.get("relativeFrom") or "")
+    if frame[0] in _DOCX_ABSOLUTE_H_FRAMES and frame[1] in _DOCX_ABSOLUTE_V_FRAMES:
+        return frame
+    return None
+
+
+def _docx_anchor_pages(root: ET.Element) -> tuple[dict[int, int], bool]:
+    """`wp:anchor`（`id(anchor)`）ごとのページ区切りの通し番号と、Word が組版したページ境界の記録があるかを返す。
+
+    本文を入れ子（`w:sdt`・`w:customXml`・`w:smartTag`・表のセルなど）も含めて文書順に 1 回だけ走査し、アンカーの位置と
+    区切りの位置を同じ順序で数える。区切りは、Word が最後に組版したときのページ境界（`w:lastRenderedPageBreak`）・
+    明示の改ページ（`w:br type=page`）・`w:pageBreakBefore`（その段落の前）・段落の `w:pPr/w:sectPr`（その段落の後）。
+    テキストボックスの中の段落はページを区切らない。同じページと確かめられるかは `_docx_same_page` が決める。
+    """
+    container = root.find(f"{_W}body")
+    container = container if container is not None else root
+    pages: dict[int, int] = {}
+    state = {"segment": 0, "rendered": False}
+
+    def walk(node: ET.Element, in_textbox: bool) -> None:
+        tag = node.tag
+        if tag == f"{_WP}anchor":
+            pages[id(node)] = state["segment"]
+        elif not in_textbox and tag == f"{_W}br" and node.get(f"{_W}type") == "page":
+            state["segment"] += 1
+        elif not in_textbox and tag == f"{_W}lastRenderedPageBreak":
+            state["segment"] += 1
+            state["rendered"] = True
+        paragraph = tag == f"{_W}p" and not in_textbox
+        if paragraph and node.find(f"{_W}pPr/{_W}pageBreakBefore") is not None:
+            state["segment"] += 1
+        inner_textbox = in_textbox or tag == f"{_W}txbxContent"
+        for child in node:
+            if not (paragraph and child.tag == f"{_W}pPr"):
+                walk(child, inner_textbox)
+        if paragraph and node.find(f"{_W}pPr/{_W}sectPr") is not None:
+            state["segment"] += 1
+
+    for child in container:
+        walk(child, False)
+    return pages, state["rendered"]
+
+
+def _docx_same_page(left: int | None, right: int | None, rendered: bool) -> bool:
+    """2 つの浮動図形が同じページにあると確かめられるか。Word が組版したページ境界の記録がある文書で、
+    2 つのアンカーの間にページ区切りが無いときだけ True（自動の改ページは組版の記録が無ければ原本から分からない）。"""
+    return rendered and left is not None and left == right
+
+
+def _docx_front_fill(anchor: ET.Element, kind: str, text: str, extension: dict[str, Any], entries: dict[str, bytes]) -> str | None:
+    """浮動図形の塗りの区分。画像と `wps:wsp` の図形だけ判定し、チャート・SmartArt などは None（covers を作らない）。"""
+    if kind == "picture":
+        return _drawing_front_fill(anchor, "picture", ns=_PIC, text=text, extension=extension, entries=entries)
+    shape_properties = anchor.find(f".//{_WPS}spPr")
+    if shape_properties is None:
+        return None
+    return drawing_fill.shape_fill_kind(
+        shape_properties, anchor.find(f".//{_WPS}style"), has_text=bool(text.strip()))
+
+
 def _bbox_intersection(a: list[int | float], b: list[int | float]) -> list[int | float] | None:
     x0, y0, x1, y1 = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
     return [x0, y0, x1, y1] if x1 > x0 and y1 > y0 else None
@@ -1869,6 +2118,9 @@ def _docx_host_objects(
     # 本文の既存locator/element IDは不変にし、追加hostだけに明示的なhost metadataを刻む。
     host_metadata = {} if host.host_kind == "document_body" else host.metadata()
     positioned: list[tuple[str, list[int | float], int]] = []
+    figures: dict[str, dict[str, Any]] = {}
+    anchor_pages, pages_rendered = _docx_anchor_pages(root)
+    wrap_none_anchors: list[tuple[str, ET.Element, bool]] = []
     for order, anchor in enumerate(root.findall(f".//{_WP}anchor") + root.findall(f".//{_WP}inline"), start=1):
         props = anchor.find(f"{_WP}docPr")
         object_id = _integer(props.get("id")) if props is not None else None
@@ -1893,7 +2145,7 @@ def _docx_host_objects(
         chart_relationship_id = chart.get(f"{_R}id", "") if chart is not None else ""
         chart_part = rels.get(chart_relationship_id)
         smartart_value, smartart_extension, smartart_parts = _smartart_payload(entries, host.part, anchor)
-        text = "".join(node.text or "" for node in anchor.findall(f".//{_W}t"))
+        text = paragraph_separated_text(anchor, _W)
         kind = (
             "picture" if is_picture else
             "chart" if chart_part in entries else
@@ -1913,6 +2165,8 @@ def _docx_host_objects(
             extension["alpha"] = alpha
         asset_role = "picture_content" if is_picture else "shape_fill"
         extension.update(_drawing_asset(entries, host.part, anchor, role=asset_role))
+        front_fill = _docx_front_fill(anchor, kind, text, extension, entries)
+        front_properties = anchor.find(f".//{_PIC}spPr") if kind == "picture" else anchor.find(f".//{_WPS}spPr")
         if chart_part in entries:
             content_parts.add(chart_part)
             _, chart_extension = _chart_payload(entries, chart_part)
@@ -1972,6 +2226,17 @@ def _docx_host_objects(
                 host_part=host.part,
                 object_token=str(object_id if object_id is not None else order_base + order),
             )
+        behind_doc = anchor.get("behindDoc") in {"1", "true"}
+        figures[element_id] = {
+            "frame": _docx_absolute_frame(anchor),
+            "page": anchor_pages.get(id(anchor)),
+            "fill": front_fill,
+            "covers_bbox": _drawing_covers_bbox(front_properties, kind),
+            # 手前にある順の比較キー: 本文より前面の図形 > 背面の図形、同じなら relativeHeight・出現順が大きいほう。
+            "stack": (not behind_doc, extension.get("z_order") or 0, order),
+        }
+        if anchor.find(f"{_WP}wrapNone") is not None:
+            wrap_none_anchors.append((element_id, anchor, behind_doc))
         if bbox is not None:
             positioned.append((element_id, bbox, extension.get("z_order") or order))
 
@@ -2028,21 +2293,102 @@ def _docx_host_objects(
             },
         )
 
-    # 幾何関係だけを確定し、「廃止」の適用や状態はSemantic viewまで保留する。
+    # 重なり（overlaps）はどの場合も残す。遮蔽（covers）は、位置の決まった図形どうしを同じ基準で比べられるときだけ作る。
+    # 位置が段落・文字などの基準で決まる図形や、同じページと確かめられない図形は、遮蔽を判定できない（undetermined）。
     for index, (left_id, left_bbox, left_z) in enumerate(positioned):
         for right_id, right_bbox, right_z in positioned[index + 1:]:
             intersection = _bbox_intersection(left_bbox, right_bbox)
             if intersection is None:
                 continue
             source_id, target_id = (left_id, right_id) if left_z >= right_z else (right_id, left_id)
+            left_frame, right_frame = figures[left_id]["frame"], figures[right_id]["frame"]
+            comparable = (
+                left_frame is not None and left_frame == right_frame
+                and _docx_same_page(figures[left_id]["page"], figures[right_id]["page"], pages_rendered))
+            extra: dict[str, Any] = {} if comparable else {"occlusion": observation_vocab.OCCLUSION_UNDETERMINED}
             builder.add_relation(
                 "overlaps",
                 source_id,
                 target_id,
                 evidence_ids=[source_id, target_id],
-                extension={"intersection_bbox": intersection, "coordinate_system": "word-page-emu"},
+                extension=observation_vocab.relation_extension(
+                    observation_vocab.BASIS_GEOMETRY, observation_vocab.DIRECTION_UNDIRECTED,
+                    intersection_bbox=intersection, coordinate_system="word-page-emu", **extra),
+            )
+            if comparable:
+                _docx_add_figure_covers(
+                    builder, (left_id, left_bbox), (right_id, right_bbox), figures, intersection)
+    if wrap_none_anchors and host.host_kind == "document_body":
+        paragraph_ids = _docx_anchor_paragraph_ids(builder, root, [anchor for _, anchor, _ in wrap_none_anchors])
+        for figure_id, anchor, behind_doc in wrap_none_anchors:
+            paragraph_id = paragraph_ids.get(id(anchor))
+            if paragraph_id is None:
+                continue
+            # 文字を避けない図形は本文の文字に重なり得るが、文字の位置は組版で決まるので覆っているかは判定できない。
+            # 背面の図形は文字の下にあるので覆わない。どちらも本文は hidden にしない。
+            occlusion = (observation_vocab.OCCLUSION_NOT_OCCLUDING if behind_doc
+                         else observation_vocab.OCCLUSION_UNDETERMINED)
+            builder.add_relation(
+                "overlaps",
+                figure_id,
+                paragraph_id,
+                evidence_ids=[figure_id, paragraph_id],
+                extension=observation_vocab.relation_extension(
+                    observation_vocab.BASIS_OOXML_ANCHOR, observation_vocab.DIRECTION_UNDIRECTED,
+                    occlusion=occlusion),
             )
     return content_parts
+
+
+def _docx_add_figure_covers(
+    builder: _Builder,
+    left: tuple[str, list[int | float]],
+    right: tuple[str, list[int | float]],
+    figures: dict[str, dict[str, Any]],
+    intersection: list[int | float],
+) -> None:
+    """位置の決まった図形どうしの重なりから、前面 → 背面の covers を作り、背面の状態を導く（覆う割合が閾値以上のときだけ）。"""
+    (front_id, _front_bbox), (back_id, back_bbox) = sorted(
+        (left, right), key=lambda item: figures[item[0]]["stack"], reverse=True)
+    front_fill = figures[front_id]["fill"]
+    back_area = _area(back_bbox)
+    if front_fill is None or not back_area:
+        return
+    ratio = _area(intersection) / back_area
+    if ratio < _occlusion_ratio():
+        return
+    builder.add_covers(
+        front_id, back_id, fill=front_fill, cover_ratio=ratio, coordinate_system="word-page-emu",
+        covers_bbox=figures[front_id]["covers_bbox"])
+    _apply_cover_state(builder, back_id, file_type="docx")
+
+
+def _docx_anchor_paragraph_ids(builder: _Builder, root: ET.Element, anchors: list[ET.Element]) -> dict[int, str]:
+    """本文直下の段落にある `wp:anchor`（`id(anchor)`）から、その段落の Evidence 要素 ID を引く。表の中・本文が空の段落は含まない。"""
+    body = root.find(f"{_W}body")
+    if body is None:
+        return {}
+    by_index: dict[int, str] = {}
+    for element in builder.ir.elements:
+        if element.type not in ("paragraph", "heading"):
+            continue
+        source_map = element.locator.extension.get("document_ir_source_map")
+        paragraph_index = source_map.get("paragraph_index") if isinstance(source_map, dict) else None
+        if isinstance(paragraph_index, int):
+            by_index[paragraph_index] = element.element_id
+    wanted = {id(anchor) for anchor in anchors}
+    found: dict[int, str] = {}
+    paragraph_index = -1
+    for child in body:
+        if child.tag != f"{_W}p":
+            continue
+        paragraph_index += 1
+        if paragraph_index not in by_index:
+            continue
+        for anchor in child.iter(f"{_WP}anchor"):
+            if id(anchor) in wanted:
+                found[id(anchor)] = by_index[paragraph_index]
+    return found
 
 
 def _external_vml_host_context(
@@ -2169,11 +2515,8 @@ def _child_transform(
 
 
 def _ppt_text(node: ET.Element) -> str:
-    """DrawingMLの段落境界を保って文字列化する。run境界は連結し、段落間だけLFにする。"""
-    paragraphs = [
-        "".join(part.text or "" for part in paragraph.findall(f".//{_A}t"))
-        for paragraph in node.findall(f".//{_A}p")
-    ]
+    """DrawingMLの段落境界を保って文字列化する。run境界は連結し、段落間だけLFにする。取り消し線のrunは`powerpoint.stated_text`が括る。"""
+    paragraphs = [powerpoint.stated_text(paragraph) for paragraph in node.findall(f".//{_A}p")]
     return "\n".join(text for text in paragraphs if text)
 
 
@@ -2418,6 +2761,45 @@ def _ppt_auxiliary_rasters(
     return {host.part}
 
 
+def _pptx_add_covers(
+    builder: _Builder,
+    top_level_ids: dict[int, str],
+    id_counts: Counter,
+    twin_by_native: dict[str, evidence_ir.EvidenceElement],
+) -> None:
+    """DocumentIR の前面の候補（fronts・covered_by_text）から前面 → 背面の covers を作り、背面の状態を導く。
+
+    前面は原本の図形 ID（cNvPr/@id）で原本の図形に解決する。塗りの区分は DocumentIR 側の判定のまま（ここでは変えない）。
+    背面が hidden になるのは occlusion=confirmed の covers があるときだけ（`_apply_cover_state`）。
+    """
+    native_by_twin = {twin.element_id: native_id for native_id, twin in twin_by_native.items()}
+
+    def front_of(element_id: str) -> evidence_ir.EvidenceElement:
+        return twin_by_native.get(element_id) or builder.element(element_id)
+
+    for back_id, twin in twin_by_native.items():
+        source_map = twin.locator.extension.get("document_ir_source_map", {})
+        if not isinstance(source_map, dict):
+            source_map = {}
+        fronts: list[tuple[str, str, bool]] = []  # (前面の element_id, 塗りの区分, 形が外接矩形と同一視できるか)
+        for candidate in source_map.get("fronts") or []:
+            shape_id = candidate.get("shape_id") if isinstance(candidate, dict) else None
+            front_id = top_level_ids.get(shape_id) if isinstance(shape_id, int) and id_counts[shape_id] == 1 else None
+            if front_id is not None and isinstance(candidate.get("fill"), str):
+                fronts.append((front_id, candidate["fill"], candidate.get("covers_bbox", True) is not False))
+        covered_by_text = twin.extension.get("covered_by_text")
+        if isinstance(covered_by_text, dict):
+            front_id = native_by_twin.get(covered_by_text.get("element_id"))
+            if front_id is not None and front_id not in {existing for existing, _, _ in fronts}:
+                fronts.append((front_id, observation_vocab.FILL_NONE_WITH_TEXT, True))
+        for front_id, fill, covers_bbox in fronts:
+            ratio = _bbox_cover_ratio(builder.element(back_id).locator.bbox, builder.element(front_id).locator.bbox)
+            builder.add_covers(
+                front_id, back_id, fill=fill, cover_ratio=ratio, coordinate_system="pptx-slide-emu", covers_bbox=covers_bbox)
+        if fronts:
+            _apply_cover_state(builder, back_id, file_type="pptx", front_of=front_of)
+
+
 def _pptx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
     content_parts = {"ppt/presentation.xml"}
     content_parts.update(_ppt_template_elements(builder, entries))
@@ -2457,21 +2839,16 @@ def _pptx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
         )
         for slide_number, part in enumerate(slide_parts, start=1)
     ] + auxiliary_hosts
-    adapted_by_slot: dict[tuple[int, int], evidence_ir.EvidenceElement] = {}
-    adapted_raw: list[tuple[evidence_ir.EvidenceElement, int, int]] = []
+    # DocumentIR 由来の shape は、スライドと原本の図形 ID（cNvPr/@id）で原本の図形に対応づける。同じ ID が複数あれば対応づけない。
+    adapted_candidates: dict[tuple[int, int], list[evidence_ir.EvidenceElement]] = {}
     for element in builder.ir.elements:
         source_map = element.locator.extension.get("document_ir_source_map", {})
         slide = element.locator.slide
-        z_index = source_map.get("z_index") if isinstance(source_map, dict) else None
+        shape_id = source_map.get("shape_id") if isinstance(source_map, dict) else None
         if (element.extension.get("origin") == "document-ir-v2-adapter"
-                and element.type == "shape" and isinstance(slide, int) and isinstance(z_index, int)):
-            adapted_raw.append((element, slide, z_index))
-    first_z = {
-        slide: min(z_index for _element, candidate_slide, z_index in adapted_raw if candidate_slide == slide)
-        for slide in {slide for _element, slide, _z_index in adapted_raw}
-    }
-    for element, slide, z_index in adapted_raw:
-        adapted_by_slot[(slide, z_index - first_z[slide] + 1)] = element
+                and element.type == "shape" and isinstance(slide, int) and isinstance(shape_id, int)):
+            adapted_candidates.setdefault((slide, shape_id), []).append(element)
+    adapted_by_shape = {key: items[0] for key, items in adapted_candidates.items() if len(items) == 1}
     for slide_number, part in enumerate(slide_parts, start=1):
         content_parts.add(part)
         root = _xml(entries, part)
@@ -2484,6 +2861,14 @@ def _pptx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
         pending_connectors: list[tuple[str, int | None, int | None]] = []
         ids_by_object: dict[int, str] = {}
         positioned: list[tuple[str, list[int | float], int]] = []
+        top_level_ids: dict[int, str] = {}
+        twin_by_native: dict[str, evidence_ir.EvidenceElement] = {}
+        top_level_id_counts = Counter(
+            _integer(props.get("id")) if props is not None else None
+            for node in sp_tree
+            for raw_kind in [_ppt_kind(node)] if raw_kind is not None
+            for props in [_ppt_props(node, raw_kind)]
+        )
 
         def walk(
             nodes: list[ET.Element],
@@ -2564,19 +2949,22 @@ def _pptx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                 end_id = _connection(node.find(f".//{_A}endCxn")) if kind == "connector" else None
                 if kind == "connector":
                     extension.update({"start_object_id": start_id, "end_object_id": end_id})
-                adapted = adapted_by_slot.get((slide_number, local_order)) if parent_id is None else None
+                adapted = (
+                    adapted_by_shape.get((slide_number, object_id))
+                    if parent_id is None and object_id is not None and top_level_id_counts[object_id] == 1 else None
+                )
+                # 遮蔽・前面文字による重なり（理由 occluded・covered_by_text）は、ここでは写さず covers から導く。
+                adapted_reason = adapted.extension.get("visibility_reason") if adapted is not None else None
+                derived_from_covers = adapted_reason in observation_vocab.COVER_DERIVED_REASONS
                 visibility = "hidden" if slide_number in hidden_slides else (
-                    adapted.visibility if adapted is not None else "visible"
+                    adapted.visibility if adapted is not None and not derived_from_covers else "visible"
                 )
                 reason = (
                     "hidden_slide_inherited" if slide_number in hidden_slides else
-                    adapted.extension.get("visibility_reason") if adapted is not None else None
+                    None if derived_from_covers else adapted_reason
                 )
                 if reason:
                     extension["visibility_reason"] = reason
-                # covered_by_text も adapted 要素から引き継ぐ（visibility_reason と同じ経路・二重に判定し直さない）
-                if adapted is not None and adapted.extension.get("covered_by_text") is not None:
-                    extension["covered_by_text"] = adapted.extension["covered_by_text"]
                 locator = evidence_ir.Locator(
                     part=part,
                     slide=slide_number,
@@ -2608,6 +2996,10 @@ def _pptx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                 )
                 if object_id is not None:
                     ids_by_object[object_id] = element_id
+                    if parent_id is None:
+                        top_level_ids[object_id] = element_id
+                if adapted is not None:
+                    twin_by_native[element_id] = adapted
                 if bbox is not None:
                     positioned.append((element_id, bbox, paint_order))
                 if kind == "table":
@@ -2646,16 +3038,9 @@ def _pptx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                     walk(child_nodes, element_id, _child_transform(node, transform), paint_order)
 
         walk(list(sp_tree), None)
+        _pptx_add_covers(builder, top_level_ids, top_level_id_counts, twin_by_native)
         for connector_id, start_object_id, end_object_id in pending_connectors:
-            start_id, end_id = ids_by_object.get(start_object_id), ids_by_object.get(end_object_id)
-            if start_id and end_id:
-                builder.add_relation(
-                    "connects_to",
-                    start_id,
-                    end_id,
-                    evidence_ids=[start_id, connector_id, end_id],
-                    extension={"connector_element_id": connector_id, "directed": True},
-                )
+            _add_connector_relation(builder, connector_id, start_object_id, end_object_id, ids_by_object)
         elements_by_id = {element.element_id: element for element in builder.ir.elements}
         for index, (left_id, left_bbox, left_z) in enumerate(positioned):
             for right_id, right_bbox, right_z in positioned[index + 1:]:
@@ -2674,7 +3059,9 @@ def _pptx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                     source_id,
                     target_id,
                     evidence_ids=[source_id, target_id],
-                    extension={"intersection_bbox": intersection, "coordinate_system": "pptx-slide-emu"},
+                    extension=observation_vocab.relation_extension(
+                        observation_vocab.BASIS_GEOMETRY, observation_vocab.DIRECTION_UNDIRECTED,
+                        intersection_bbox=intersection, coordinate_system="pptx-slide-emu"),
                 )
     for vml_index, vml_part in enumerate(sorted(
         candidate for candidate in entries
@@ -3832,6 +4219,7 @@ def extract(
             content_parts = _pptx_objects(builder, entries)
         content_parts.update(package_metadata)
         _package_coverage(builder, entries, content_parts, part_details=package_metadata)
+        _annotate_state_basis(builder.ir)
     errors = evidence_ir.validation_errors(builder.ir)
     if errors:
         raise ValueError("invalid Evidence IR spike: " + ",".join(errors))

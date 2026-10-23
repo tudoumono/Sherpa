@@ -53,6 +53,7 @@ def test_mapping_has_structure_fields():
 def test_mapping_version_is_bumped_so_old_index_is_rebuilt(monkeypatch):
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "count", lambda w: 5)
+    monkeypatch.setattr(es_index, "_index_kind", lambda w: "alias")  # 稼働中の ES の実の索引に左右されない
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     monkeypatch.setattr(es_index, "_human_md_config_sig", lambda world: None)
@@ -177,6 +178,18 @@ _EXACT_CLAUSE = {"bool": {"should": [{"terms": {"identifier_values": ["A01", "B0
                           "minimum_should_match": 1}}
 
 
+_KNN_EXACT_CLAUSE = {"bool": {"should": [*_EXACT_CLAUSE["bool"]["should"],
+                                         {"terms": {"row_group_identifier_values": ["A01", "B02"]}}],
+                              "minimum_should_match": 1}}
+
+
+def _stub_embedding(monkeypatch):
+    monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: {"provider": "p", "model": "m", "dim": 2})
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: {
+        "embed_provider": "p", "embed_model": "m", "dim": 2, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
+    monkeypatch.setattr(es_index.embeddings, "embed", lambda texts, ec, **kw: [[0.1, 0.2]])
+
+
 def test_search_exact_builds_terms_filter_without_text_match(monkeypatch):
     captured = _capture(monkeypatch)
     hits, reason = es_index.search_exact("w", ["A01", "B02"], scope_paths=["設計"], k=5, layer="code")
@@ -214,7 +227,30 @@ def test_knn_only_applies_exact_filter(monkeypatch):
         "embed_provider": "p", "embed_model": "m", "dim": 2, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
     monkeypatch.setattr(es_index.embeddings, "embed", lambda texts, ec, **kw: [[0.1, 0.2]])
     es_index.search_knn_only("w", "q", exact=["A01", "B02"])
-    assert captured["body"]["knn"]["filter"] == [_EXACT_CLAUSE]
+    assert captured["body"]["knn"]["filter"] == [_KNN_EXACT_CLAUSE]       # ベクトルは先頭にしか無い＝構成行の識別子にも当てる
+
+
+def test_hybrid_applies_group_identifiers_to_knn_side_only(monkeypatch):
+    bodies: list = []
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "_req", lambda method, path, body=None, **kw: (bodies.append(body) or {"hits": {"hits": []}}))
+    _stub_embedding(monkeypatch)
+    _hits, reason = es_index.search("w", "q", scope_paths=["設計"], exact=["A01", "B02"], settings={})
+    assert reason is None and len(bodies) == 2
+    bm25_filter = bodies[0]["query"]["function_score"]["query"]["bool"]["filter"]
+    knn_filter = bodies[1]["query"]["function_score"]["query"]["knn"]["filter"]
+    assert bm25_filter == [{"terms": {"scopes": ["設計"]}}, _EXACT_CLAUSE]                # BM25 側の exact は変えない
+    assert knn_filter == [{"terms": {"scopes": ["設計"]}}, _KNN_EXACT_CLAUSE]
+
+
+def test_hybrid_without_exact_has_same_filter_on_both_sides(monkeypatch):
+    bodies: list = []
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "_req", lambda method, path, body=None, **kw: (bodies.append(body) or {"hits": {"hits": []}}))
+    _stub_embedding(monkeypatch)
+    es_index.search("w", "q", settings={})
+    assert bodies[0]["query"]["function_score"]["query"]["bool"]["filter"] == []
+    assert bodies[1]["query"]["function_score"]["query"]["knn"]["filter"] == []
 
 
 # ===== es_search ツール =====

@@ -2,19 +2,22 @@
 
 外部境界（`shutil.disk_usage`・docker・ES）だけを差し替え、原本の木・ハードリンク・st_dev は実ファイルで確かめる。
 実害の再現: 同じディスクに乗る置き場の合算漏れ、更新で今の使用分を二重に数える、確かめられない置き場を「足りる」と出す、
-見積もりの失敗で取り込みを妨げる、の 4 点。
+見積もりの失敗で取り込みを妨げる、圧縮された OOXML の派生物とチャンク数を原本の大きさから外す、の 5 点。
 """
 from __future__ import annotations
 
 import logging
 import os
+import random
 import subprocess
 import time
+import zipfile
 
 import pytest
 
 from sherpa import disk_estimate as de
-from sherpa import es_index
+from sherpa import es_index, json_io
+from sherpa.ingest import office_md
 
 MB = de.MB
 GIB = de.GIB
@@ -354,3 +357,340 @@ def test_start_log_is_warning_only_when_started_with_a_warning(tmp_path, caplog,
     assert levels[(False, False, True)] == logging.INFO
     short_msg = next(m for m in recs if "判定=short" in m)
     assert "空き不明" in short_msg and "空き1GB" in short_msg
+
+
+# ---- OOXML の中身を数える ----
+
+_WORDS = ("処理", "確認", "受注", "請求", "在庫", "顧客", "更新", "登録", "削除", "出力", "帳票", "画面")
+
+
+def _sentence(rng: random.Random, n: int) -> str:
+    out = ""
+    while len(out) < n:
+        out += rng.choice(_WORDS) + rng.choice("をのにが")
+    return out[:n] + "。"
+
+
+def _make_xlsx(path, rows: int, cols: int = 6) -> None:
+    import openpyxl
+    rng = random.Random(1)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "一覧"
+    ws.append([f"項目{c}" for c in range(cols)])
+    for i in range(rows):
+        ws.append([f"ID-{i:05d}" if c == 0 else (_sentence(rng, 12) if c % 2 else i * c + 0.5) for c in range(cols)])
+    wb.save(path)
+
+
+def _make_docx(path, paras: int, table_rows: int = 0) -> None:
+    import docx
+    rng = random.Random(2)
+    d = docx.Document()
+    for _ in range(paras):
+        d.add_paragraph(_sentence(rng, 60))
+    if table_rows:
+        t = d.add_table(rows=table_rows, cols=4)
+        for i in range(table_rows):
+            for j in range(4):
+                t.cell(i, j).text = _sentence(rng, 20)
+    d.save(path)
+
+
+def _make_pptx(path, slides: int) -> None:
+    import pptx
+    rng = random.Random(3)
+    pr = pptx.Presentation()
+    for _ in range(slides):
+        s = pr.slides.add_slide(pr.slide_layouts[1])
+        s.shapes.title.text = _sentence(rng, 12)
+        s.placeholders[1].text = "\n".join(_sentence(rng, 30) for _ in range(5))
+    pr.save(path)
+
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_NOTE_XML = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:{root} xmlns:w="' + _W_NS + '">{items}</w:{root}>')
+
+
+def _inject_docx_parts(path, parts: dict) -> None:
+    """既存の docx に、脚注・文末脚注の部品を足す（python-docx には書く API が無い）。"""
+    with zipfile.ZipFile(path) as zin:
+        members = {n: zin.read(n) for n in zin.namelist()}
+    ctypes = members["[Content_Types].xml"].decode("utf-8")
+    rels = members["word/_rels/document.xml.rels"].decode("utf-8")
+    for name, (xml, ctype, rtype) in parts.items():
+        members[name] = xml.encode("utf-8")
+        ctypes = ctypes.replace("</Types>", f'<Override PartName="/{name}" ContentType="{ctype}"/></Types>')
+        rels = rels.replace("</Relationships>", f'<Relationship Id="rId{900 + len(members)}" Type="{rtype}" '
+                                                f'Target="{name.removeprefix("word/")}"/></Relationships>')
+    members["[Content_Types].xml"] = ctypes.encode("utf-8")
+    members["word/_rels/document.xml.rels"] = rels.encode("utf-8")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for n, b in members.items():
+            zout.writestr(n, b)
+
+
+def _make_docx_with_extras(path, paras: int = 20, notes: int = 15, comments: int = 10) -> None:
+    """本文のほかにヘッダー・フッター・脚注・文末脚注・コメントを持つ docx。"""
+    import docx
+    rng = random.Random(4)
+    d = docx.Document()
+    runs = [d.add_paragraph(_sentence(rng, 60)).runs[0] for _ in range(paras)]
+    d.sections[0].header.paragraphs[0].text = _sentence(rng, 80)
+    d.sections[0].footer.paragraphs[0].text = _sentence(rng, 80)
+    for i in range(comments):
+        d.add_comment(runs[i], text=_sentence(rng, 150), author="作成者", initials="作")
+    d.save(path)
+
+    def items(tag: str, n: int) -> str:
+        sep = (f'<w:{tag} w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:{tag}>'
+               f'<w:{tag} w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:{tag}>')
+        return sep + "".join(
+            f'<w:{tag} w:id="{i}"><w:p><w:r><w:t>{_sentence(rng, 300)}</w:t></w:r></w:p>'
+            f'<w:p><w:r><w:t>{_sentence(rng, 100)}</w:t></w:r></w:p></w:{tag}>' for i in range(1, n + 1))
+    ns = "application/vnd.openxmlformats-officedocument.wordprocessingml"
+    rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    _inject_docx_parts(path, {
+        "word/footnotes.xml": (_NOTE_XML.format(root="footnotes", items=items("footnote", notes)),
+                               f"{ns}.footnotes+xml", f"{rel}/footnotes"),
+        "word/endnotes.xml": (_NOTE_XML.format(root="endnotes", items=items("endnote", notes // 3)),
+                              f"{ns}.endnotes+xml", f"{rel}/endnotes"),
+    })
+
+
+def _make_pptx_with_notes(path, slides: int = 10, notes: bool = True) -> None:
+    """スライドのほかに発表者ノートを持つ pptx。"""
+    import pptx
+    rng = random.Random(5)
+    pr = pptx.Presentation()
+    for _ in range(slides):
+        s = pr.slides.add_slide(pr.slide_layouts[1])
+        s.shapes.title.text = _sentence(rng, 12)
+        s.placeholders[1].text = _sentence(rng, 30)
+        if notes:
+            s.notes_slide.notes_text_frame.text = "\n".join(_sentence(rng, 1000) for _ in range(3))
+    pr.save(path)
+
+
+_MAKERS = {"xlsx": _make_xlsx, "docx": _make_docx, "pptx": _make_pptx}
+
+
+def _convert(tmp_path, monkeypatch, name: str, make) -> tuple[int, int]:
+    """実際に変換して `(チャンク数, 派生物のバイト数)` を返す（DB には触れない）。"""
+    monkeypatch.setenv("SHERPA_PG_DSN", "postgresql://invalid:1/none")
+    wd = tmp_path / "world"
+    wd.mkdir()
+    make(wd / name)
+    derived = tmp_path / "derived"
+    rep = office_md.build_derived(wd, derived)
+    assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
+    chunks = size = 0
+    seen = set()
+    for p in derived.parent.rglob("*"):
+        if not p.is_file() or p.is_symlink() or wd in p.parents:
+            continue
+        st = p.stat()
+        if (st.st_dev, st.st_ino) in seen:       # 変換結果のキャッシュとはハードリンクで同じ実体
+            continue
+        seen.add((st.st_dev, st.st_ino))
+        size += st.st_size
+        if p.name.endswith(".rag_chunks.jsonl"):
+            with json_io.open_text_maybe_gzip(p) as f:
+                chunks += sum(1 for _ in f)
+    return chunks, size
+
+
+@pytest.mark.parametrize("family,name,make", [
+    ("xlsx", "a100.xlsx", lambda p: _make_xlsx(p, 100)),
+    ("xlsx", "a1000.xlsx", lambda p: _make_xlsx(p, 1000)),
+    ("xlsx", "a5000.xlsx", lambda p: _make_xlsx(p, 5000)),
+    ("docx", "a100.docx", lambda p: _make_docx(p, 100)),
+    ("docx", "a1000.docx", lambda p: _make_docx(p, 1000)),
+    ("docx", "table.docx", lambda p: _make_docx(p, 20, table_rows=200)),
+    ("pptx", "a20.pptx", lambda p: _make_pptx(p, 20)),
+    ("pptx", "a100.pptx", lambda p: _make_pptx(p, 100)),
+])
+def test_estimated_chunks_and_derived_bytes_match_a_real_conversion(tmp_path, monkeypatch, family, name, make):
+    # 実害: 原本の大きさ（ZIP で圧縮済み）から係数で出すと、文字の多い表で派生物もチャンク数も桁で外れる。
+    chunks, size = _convert(tmp_path, monkeypatch, name, make)
+    est_derived, est_chunks = de.measure_ooxml(tmp_path / "world" / name, family, deadline=time.monotonic() + 60)
+    assert chunks * 0.75 <= est_chunks <= chunks * 1.25
+    assert size * 0.75 <= est_derived <= size * 1.5
+
+
+@pytest.mark.parametrize("family,name,make", [
+    ("docx", "extras.docx", _make_docx_with_extras),
+    ("pptx", "notes.pptx", _make_pptx_with_notes),
+])
+def test_estimated_chunks_include_the_parts_ingest_reads_besides_the_body(tmp_path, monkeypatch, family, name, make):
+    # 実害: 本文（document.xml／スライド）だけを数えると、ヘッダー・脚注・コメント・発表者ノートの分のチャンクが見積もりから抜ける。
+    chunks, _size = _convert(tmp_path, monkeypatch, name, make)
+    est_derived, est_chunks = de.measure_ooxml(tmp_path / "world" / name, family, deadline=time.monotonic() + 60)
+    assert chunks * 0.75 <= est_chunks <= chunks * 1.25
+    plain = {"docx": lambda p: _make_docx(p, 20), "pptx": lambda p: _make_pptx_with_notes(p, notes=False)}[family]
+    (tmp_path / "plain").mkdir()
+    body_only, _ = _convert(tmp_path / "plain", monkeypatch, name, plain)
+    assert body_only < chunks * 0.75                                   # 本文だけでは足りない文書（抜けると 25% の許容を超える）
+
+
+def test_parts_that_cannot_be_counted_keep_the_coefficient_estimate(tmp_path, monkeypatch):
+    _make_docx_with_extras(tmp_path / "e.docx")
+    path = tmp_path / "e.docx"
+    full = de.measure_ooxml(path, "docx", deadline=time.monotonic() + 60)
+    with zipfile.ZipFile(path) as zf:
+        body = zf.getinfo("word/document.xml").file_size
+        extras = sum(i.compress_size for i in zf.infolist()
+                     if i.filename.startswith(("word/header", "word/footer", "word/footnotes", "word/endnotes", "word/comments")))
+        feat_full = de._scan_docx(zf, time.monotonic() + 10)
+        monkeypatch.setattr(de, "_MEASURE_FILE_BYTES", body)                 # 本文で 1 ファイルの上限を使い切る
+        feat = de._scan_docx(zf, time.monotonic() + 10)
+    assert feat_full["uncounted_bytes"] == 0 and feat["uncounted_bytes"] == extras
+    c = de.COEFS["docx"]
+    limited = de.measure_ooxml(path, "docx", deadline=time.monotonic() + 60)
+    assert limited[1] == pytest.approx(feat["chunks"] + feat["media_n"] + extras / MB * c.chunks_per_mb)
+    assert limited[0] > 0 and limited[1] < full[1]                           # 数えた分より少ない（係数の式は 1MB あたりなので小さな部品は小さく出る）
+
+
+def test_sampling_extrapolates_when_the_xml_is_larger_than_the_read_limit(tmp_path, monkeypatch):
+    path = tmp_path / "big.xlsx"
+    _make_xlsx(path, 5000)
+    full = de.measure_ooxml(path, "xlsx", deadline=time.monotonic() + 60)
+    monkeypatch.setattr(de, "_MEASURE_PART_BYTES", 64 * 1024)
+    monkeypatch.setattr(de, "_MEASURE_READ_BYTES", 16 * 1024)
+    sampled = de.measure_ooxml(path, "xlsx", deadline=time.monotonic() + 60)
+    with zipfile.ZipFile(path) as zf:
+        assert zf.getinfo("xl/worksheets/sheet1.xml").file_size > 64 * 1024     # 本当に途中で切って外挿している
+    assert abs(sampled[1] / full[1] - 1) < 0.1
+    assert abs(sampled[0] / full[0] - 1) < 0.2
+
+
+@pytest.mark.parametrize("family", ["xlsx", "docx", "pptx"])
+def test_unreadable_ooxml_falls_back_to_the_coefficient_formula(tmp_path, family):
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / f"garbage.{family}").write_bytes(b"x" * 5000)                       # ZIP ではない
+    (root / f"empty_file.{family}").write_bytes(b"")
+    with zipfile.ZipFile(root / f"no_parts.{family}", "w") as zf:               # ZIP だが本体の XML が無い
+        zf.writestr("readme.txt", "x")
+    good = root / f"truncated.{family}"
+    _MAKERS[family](good, 50)
+    good.write_bytes(good.read_bytes()[:-200])                                  # 中央ディレクトリが欠けた壊れた ZIP
+    for p in root.iterdir():
+        assert de.measure_ooxml(p, family, deadline=time.monotonic() + 10) is None
+    total, _ = de.count_sources(root)
+    n, size = total["families"][family]
+    assert n == 4 and total["measured"][family][0] == 0
+    assert de._family_needs(total, dim=1536) == de._family_needs(_counts(**{family: (n, size)}), dim=1536)
+
+
+def test_measured_files_replace_the_coefficients_and_the_rest_keep_them(tmp_path):
+    root = tmp_path / "docs"
+    root.mkdir()
+    _make_xlsx(root / "good.xlsx", 500)
+    (root / "broken.xlsx").write_bytes(b"PK\x03\x04" + b"x" * 3000)
+    total, _ = de.count_sources(root)
+    n, size = total["families"]["xlsx"]
+    m_n, m_size, m_derived, m_chunks = total["measured"]["xlsx"]
+    assert (n, m_n) == (2, 1)
+    need = de._family_needs(total, dim=0)
+    c = de.COEFS["xlsx"]
+    rest = size - m_size
+    derived = c.derived_ratio * rest + c.derived_file * 2 + m_derived + 2 * de._DERIVED_ALL_FILE_BYTES
+    assert need["derived"] == pytest.approx(derived * (1 + de._CONV_CACHE_OVERHEAD), rel=1e-6)
+    chunks = m_chunks + c.chunks_per_mb * rest / MB + c.chunks_file
+    assert need["es"] == pytest.approx(chunks * c.es_chunk_bytes, rel=1e-6)
+
+
+def test_update_measures_only_added_and_changed_files(tmp_path):
+    root = tmp_path / "docs"
+    root.mkdir()
+    _make_xlsx(root / "same.xlsx", 50)
+    _make_xlsx(root / "new.xlsx", 50)
+    st = (root / "same.xlsx").stat()
+    manifest = {"same.xlsx": [st.st_mtime_ns, st.st_ctime_ns, st.st_size]}
+    total, delta = de.count_sources(root, manifest=manifest)
+    assert delta["families"]["xlsx"][0] == 1 and delta["measured"]["xlsx"][0] == 1
+    assert total["measured"]["xlsx"][0] == 1
+
+
+def test_measuring_stops_when_the_time_budget_is_used_up(tmp_path, monkeypatch):
+    root = tmp_path / "docs"
+    root.mkdir()
+    for i in range(3):
+        _make_xlsx(root / f"b{i}.xlsx", 20)
+    monkeypatch.setattr(de, "_MEASURE_BUDGET_SEC", 0)
+    total, _ = de.count_sources(root)
+    assert total["families"]["xlsx"][0] == 3 and total["measured"]["xlsx"][0] == 0     # 残りは係数の式
+    assert de.measure_ooxml(root / "b0.xlsx", "xlsx", deadline=time.monotonic() - 1) is None
+
+
+def test_measuring_leaves_half_of_a_short_walk_deadline_for_walking(tmp_path, monkeypatch):
+    root = tmp_path / "docs"
+    root.mkdir()
+    _make_xlsx(root / "a.xlsx", 20)
+    seen = []
+    real = de.measure_ooxml
+    monkeypatch.setattr(de, "measure_ooxml", lambda *a, deadline, **k: seen.append(deadline) or real(*a, deadline=deadline, **k))
+    now = time.monotonic()
+    de.count_sources(root, deadline=now + 20)
+    assert len(seen) == 1 and seen[0] <= now + 10.5
+
+
+def test_measuring_does_not_touch_the_source_tree(tmp_path):
+    root = tmp_path / "docs"
+    root.mkdir()
+    _make_xlsx(root / "a.xlsx", 30)
+    _make_docx(root / "b.docx", 30)
+    _make_pptx(root / "c.pptx", 3)
+    before = {p.name: (p.stat().st_mtime_ns, p.read_bytes()) for p in root.iterdir()}
+    total, _ = de.count_sources(root)
+    assert [total["measured"][f][0] for f in ("docx", "xlsx", "pptx")] == [1, 1, 1]
+    assert {p.name: (p.stat().st_mtime_ns, p.read_bytes()) for p in root.iterdir()} == before
+
+
+def test_embedded_images_are_counted_once_by_content(tmp_path):
+    import io
+
+    import docx
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.frombytes("RGB", (64, 64), os.urandom(64 * 64 * 3)).save(buf, "PNG")
+    d = docx.Document()
+    d.add_paragraph("本文")
+    for _ in range(3):
+        d.add_picture(io.BytesIO(buf.getvalue()))                                # 同じ画像は ZIP の中に 1 つ
+    d.save(tmp_path / "img.docx")
+    with zipfile.ZipFile(tmp_path / "img.docx") as zf:
+        feat = de._scan_docx(zf, time.monotonic() + 10)
+    assert feat["media_n"] == 1 and feat["media_bytes"] == len(buf.getvalue())
+
+
+def test_estimate_output_shape_is_unchanged_with_measured_files(tmp_path, monkeypatch):
+    root = tmp_path / "docs"
+    root.mkdir()
+    _make_xlsx(root / "a.xlsx", 200)
+    monkeypatch.setattr(de, "place_filesystems", lambda wid: {p: de.Fs(("dev", 1), 500 * GIB, 600 * GIB) for p in de.PLACES})
+    res = de.estimate_now(str(root), None)
+    assert set(res) == {"status", "lines", "need_bytes", "es_settled_bytes", "mode", "files", "bytes", "changed_files",
+                        "needs", "unchanged"}
+    assert set(res["needs"]) == {"derived", "embed", "es", "neo4j", "ocr", "logs", "tmp"}
+    assert res["files"] == 1 and res["mode"] == "register"
+
+
+def test_file_read_limit_extrapolates_from_the_sheets_that_were_read(tmp_path, monkeypatch):
+    import openpyxl
+    rng = random.Random(4)
+    wb = openpyxl.Workbook()
+    for k in range(4):
+        ws = wb.active if k == 0 else wb.create_sheet()
+        ws.append(["No", "内容", "備考"])
+        for i in range(400):
+            ws.append([i, _sentence(rng, 20), _sentence(rng, 20)])
+    wb.save(tmp_path / "sheets.xlsx")
+    full = de.measure_ooxml(tmp_path / "sheets.xlsx", "xlsx", deadline=time.monotonic() + 60)
+    with zipfile.ZipFile(tmp_path / "sheets.xlsx") as zf:
+        one = zf.getinfo("xl/worksheets/sheet1.xml").file_size
+    monkeypatch.setattr(de, "_MEASURE_FILE_BYTES", one + one // 4)           # 3 枚目以降は読まない
+    limited = de.measure_ooxml(tmp_path / "sheets.xlsx", "xlsx", deadline=time.monotonic() + 60)
+    assert full[1] == 4 * 401
+    assert abs(limited[1] / full[1] - 1) < 0.1 and abs(limited[0] / full[0] - 1) < 0.1

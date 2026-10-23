@@ -28,6 +28,7 @@ from .. import json_io
 from ..env_int import env_int
 from . import background, encryption, mem_guard, substage
 from . import text_kind
+from .observation_vocab import FILL_OPAQUE, FILL_UNKNOWN
 
 # MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
 _log = logging.getLogger("sherpa.ingest.convert")
@@ -540,13 +541,48 @@ def _is_skipped_original(rp: Path, ext: str) -> bool:
     return _is_sensitive_original(rp, ext) or text_kind.is_noise(rp.name, ext)
 
 
+def _evidence_notes(path: Path, *, ir=None, slide_size=None, inline=False):
+    """人用 Markdown の注記（状態・関係・未解析／未対応の通知）の元になる Evidence IR を作る。作れなければ None（注記なしで続ける）。"""
+    from . import evidence_spike, human_md
+
+    try:
+        evidence = evidence_spike.extract(path, legacy_ir=ir)
+    except Exception:
+        _log.warning("人用 Markdown の注記に使う Evidence IR を作れませんでした: %s", path.name, exc_info=True)
+        return None
+    return human_md.EvidenceNotes(evidence, slide_size=slide_size, inline=inline)
+
+
+def _needs_object_notes(path: Path, ir, ext: str) -> bool:
+    """図形・画像・OLE・取り消し線のセルなど、注記を付ける対象が原本にありそうか（無いなら Evidence IR を作らない）。"""
+    try:
+        with zipfile.ZipFile(path) as z:
+            if ext == ".xlsx":
+                return (any(n.startswith(("xl/drawings/", "xl/embeddings/")) for n in z.namelist())
+                        or any(e.type == "strike_text"
+                               or (e.type == "table" and (e.source_map.get("hidden_rows") or e.source_map.get("hidden_columns")))
+                               for e in ir.elements))
+            data = z.read("word/document.xml")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return False
+    return any(token in data for token in (b"<w:drawing", b"<w:pict", b"<w:object", b"<mc:AlternateContent"))
+
+
 def _render_human_md(ir, path: Path, ext: str) -> str | None:
-    """docx/xlsx の document-ir から人間向け MD を作る（WMF/EMF 図の文字は原本パッケージから拾って添える）。"""
+    """docx/xlsx の document-ir から人間向け MD を作る（WMF/EMF 図の文字は原本パッケージから拾って添える）。
+
+    図形・画像・OLE などがあれば、Evidence IR から状態・関係・未解析／未対応の通知を作り、対象の位置に「※」の行で足す。
+    """
     from . import human_md, metafile_text
 
+    notes = _evidence_notes(path, ir=ir) if _needs_object_notes(path, ir, ext) else None
     if ext == ".docx":
-        return human_md.render_docx(ir, figure_texts=metafile_text.docx_figure_texts(path))
-    return human_md.render_xlsx(ir, figure_texts=metafile_text.xlsx_figure_texts(path))
+        docx_notes = None
+        if notes is not None:
+            with zipfile.ZipFile(path) as z:
+                docx_notes = human_md.docx_notes(z.read("word/document.xml"), notes)
+        return human_md.render_docx(ir, figure_texts=metafile_text.docx_figure_texts(path), notes=docx_notes)
+    return human_md.render_xlsx(ir, figure_texts=metafile_text.xlsx_figure_texts(path), notes=notes)
 
 
 def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
@@ -3641,7 +3677,9 @@ def to_markdown(path) -> str | None:
 # ---- .docx（word/document.xml 直読み）----
 
 def _para_text(p_el) -> str:
-    return "".join(t.text or "" for t in p_el.iter(f"{_W}t"))
+    """段落の本文。取り消し線・非表示の run は状態つきで書き、テキストボックスの中の文字は含めない（`ooxml.word.stated_text`）。"""
+    from .ooxml import word
+    return word.stated_text(p_el)
 
 
 def _heading_level(p_el) -> int | None:
@@ -3710,20 +3748,87 @@ def _slide_order(z) -> list[str]:
         return numeric
 
 
+# 注記を「対象の直後」へ差し込むための目印。図の文字の差し込み口（`figures`）に載せ、組み立ての後で注記の行へ置き換える
+_NOTE_MARK = "\x00note\x00"
+_NOTE_BLOCK_PREFIX = "図の中の文字（元の値）\n- " + _NOTE_MARK
+
+
+def _pptx_slide_notes(notes, slide_part: str, root) -> tuple[list[str], dict[int, list[str]]]:
+    """スライドの注記を `(スライドの見出し直後の行, spTree 直下の子の位置 → 注記の行)` にする。
+
+    入れ子の図形の注記は、それを含む最上位の図形の位置にまとめる。
+    """
+    from . import evidence_spike, human_md, observation_vocab
+
+    tree = root.find(f"{_PR}cSld/{_PR}spTree")
+    children = list(tree) if tree is not None else []
+    top_positions = [i for i, child in enumerate(children) if evidence_spike._ppt_kind(child) is not None]
+    heading_lines: list[str] = []
+    by_child: dict[int, list[str]] = {}
+    elements = notes.elements
+    for element in notes.evidence.elements:
+        if element.locator.part != slide_part:
+            continue
+        if element.type == "slide":
+            if element.visibility == "hidden":
+                label = observation_vocab.VISIBILITY_REASON_LABELS["hidden_slide"]
+                heading_lines.append(human_md.NOTE_PREFIX + observation_vocab.visibility_line(
+                    "hidden_slide", label, human=True, subject="このスライド"))
+            continue
+        if element.type not in human_md.OBJECT_TYPES or element.extension.get("origin") == "document-ir-v2-adapter":
+            continue
+        block = notes.block(element)
+        if not block:
+            continue
+        top = element
+        while top.parent_id in elements and elements[top.parent_id].type != "slide":
+            top = elements[top.parent_id]
+        z = top.extension.get("z_order")
+        if not isinstance(z, int) or not 1 <= z <= len(top_positions):
+            continue
+        by_child.setdefault(top_positions[z - 1], []).append(block)
+    return heading_lines, by_child
+
+
 def _pptx_md(p: Path) -> str | None:
+    """PPTX の人間向け MD。
+
+    図形・画像・OLE などの状態・関係・未解析／未対応の通知は、Evidence IR から作り、その図形の文字の直後に「※」の行で足す。
+    スライドの文字は従来どおり `_pptx_slide_texts` が作る。注記は図の文字と同じ差し込み口（`figures`）に載せて位置を決める。
+    """
     from . import metafile_text
+    from .ooxml import powerpoint
 
     out = []
     cache: dict[str, list[str]] = {}
     with zipfile.ZipFile(p) as z:
-        for i, n in enumerate(_slide_order(z), 1):
+        order = _slide_order(z)
+        notes = _pptx_notes(p, z)
+        for i, n in enumerate(order, 1):
             root = ET.fromstring(z.read(n))
             figures = metafile_text.pptx_slide_figures(p, n, cache)
-            texts = _pptx_slide_texts(root, figures)
-            if texts:
+            heading_lines: list[str] = []
+            if notes is not None:
+                heading_lines, by_child = _pptx_slide_notes(notes, n, root)
+                figures = {k: [list(block) for block in v] for k, v in figures.items()}
+                for index, blocks in by_child.items():
+                    figures.setdefault(index, []).extend([_NOTE_MARK + block] for block in blocks)
+            texts = _pptx_slide_texts(root, figures, powerpoint.slide_picture_fills(z, n, root),
+                                      powerpoint.slide_inherited_covers_bbox(z, n, root))
+            if notes is not None:
+                texts = [t.removeprefix(_NOTE_BLOCK_PREFIX) if t.startswith(_NOTE_BLOCK_PREFIX) else t for t in texts]
+            if texts or heading_lines:
                 out.append(f"## スライド {i}")
+                out.extend(heading_lines)
                 out.extend(texts)
     return "\n\n".join(out) if out else None
+
+
+def _pptx_notes(p: Path, z: zipfile.ZipFile):
+    """PPTX の注記の元（Evidence IR）。作れなければ None。位置の言葉に使うスライドの大きさも渡す。"""
+    from .ooxml import powerpoint as pptx_ooxml
+
+    return _evidence_notes(p, slide_size=pptx_ooxml.slide_size(z), inline=True)
 
 
 # ---- 幾何オクルージョン（覆い図形の座標判定・pptx）----
@@ -3738,14 +3843,16 @@ def _figure_text_line(lines: list[str]) -> str:
     return "図の中の文字（元の値）\n" + "\n".join("- " + line for line in lines)
 
 
-def _pptx_slide_texts(root, figures: dict[int, list[list[str]]] | None = None) -> list[str]:
+def _pptx_slide_texts(root, figures: dict[int, list[list[str]]] | None = None,
+                      picture_fills: dict[str, str] | None = None,
+                      inherited_covers_bbox: dict | None = None) -> list[str]:
     """1 スライド分のテキスト行（shape 単位・文書順・隠し候補マーカー付き）。
 
     shape 単位の歩行が失敗したら例外を握って、フラット抽出（`root.iter(f"{_A}t")`）にフォールバックする（テキストの取りこぼしを起こさない）。
-    非隠しスライドは shape 単位でもフラット抽出とバイト単位で一致する。
+    取り消し線の run（`a:rPr/@strike`）を持たない非隠しスライドは、shape 単位でもフラット抽出とバイト単位で一致する（持つ場合は `【取り消し線：…】` の括りが付く）。
     """
     try:
-        return _pptx_slide_texts_by_shape(root, figures)
+        return _pptx_slide_texts_by_shape(root, figures, picture_fills, inherited_covers_bbox)
     except Exception:
         flat = _pptx_slide_texts_flat(root)
         # 位置を決められないときは、図の文字をスライド末尾へまとめる。
@@ -3758,11 +3865,12 @@ def _pptx_slide_texts_flat(root) -> list[str]:
 
 
 def _pptx_shape_texts_list(sp) -> list[str]:
-    """`p:txBody` 内の非空テキスト行（run 単位・順序保持）。"""
+    """`p:txBody` 内の非空テキスト行（run 単位・順序保持。取り消し線の run は `ooxml.powerpoint.text_lines` が括る）。"""
+    from .ooxml import powerpoint
     txbody = sp.find(f"{_PR}txBody")
     if txbody is None:
         return []
-    return [t.text.strip() for t in txbody.iter(f"{_A}t") if t.text and t.text.strip()]
+    return powerpoint.text_lines(txbody)
 
 
 def _pptx_bbox(sp) -> tuple[int, int, int, int] | None:
@@ -3788,14 +3896,43 @@ def _pptx_bbox(sp) -> tuple[int, int, int, int] | None:
     return (x, y, x + cx, y + cy)
 
 
-def _pptx_has_solid_fill(sp) -> bool:
-    """`p:spPr/a:solidFill` を持つか（`a:noFill` の場合は False）。"""
-    spPr = sp.find(f"{_PR}spPr")
-    if spPr is None:
-        return False
-    if spPr.find(f"{_A}noFill") is not None:
-        return False
-    return spPr.find(f"{_A}solidFill") is not None
+def _pptx_fill_kind(el, picture_fills: dict[str, str] | None = None, *, has_text: bool = False) -> str:
+    """`p:sp` と `p:pic` の塗りの区分（`observation_vocab.FILL_*`）。文字の有無にかかわらず塗りを読む。
+
+    opaque のときだけ背面の文字を覆う候補（［隠し候補］）になる。`has_text` は `p:sp` が文字を持つか（塗りなしで文字だけなら
+    none_with_text）。`picture_fills` は埋め込み画像の関係 ID → 区分
+    （`ooxml.powerpoint.slide_picture_fills`）。引けない画像は unknown。
+    """
+    from . import drawing_fill
+    if el.tag == f"{_PR}pic":
+        fills = picture_fills or {}
+        return drawing_fill.picture_fill_kind(
+            el, lambda embed, link: fills.get(embed, FILL_UNKNOWN) if embed else FILL_UNKNOWN)
+    return drawing_fill.shape_fill_kind(el.find(f"{_PR}spPr"), el.find(f"{_PR}style"), has_text=has_text)
+
+
+def _pptx_covers_bbox(el, inherited_covers_bbox: dict | None = None) -> bool:
+    """`p:sp`・`p:pic` が覆う範囲を外接矩形と同一視してよいか。
+
+    形状の指定が直接あればそれで決める（ドーナツ・楕円・カスタム形状などは False）。指定が無いプレースホルダーは、
+    レイアウト・マスターから受け継いだ形状（`inherited_covers_bbox`＝`ooxml.powerpoint.slide_inherited_covers_bbox`）で決め、
+    解決できなければ False。プレースホルダーでない図形の形状の指定が無ければ、図形は False・画像は True（`drawing_fill.covers_bounding_box`）。
+    """
+    from . import drawing_fill
+    from .ooxml import powerpoint
+    sp_pr = el.find(f"{_PR}spPr")
+    if drawing_fill.explicit_geometry_covers_bounding_box(sp_pr) is None:
+        placeholder = powerpoint._placeholder(el)
+        if placeholder is not None:
+            return (inherited_covers_bbox or {}).get(placeholder, False)
+    return drawing_fill.covers_bounding_box(sp_pr, picture=el.tag == f"{_PR}pic")
+
+
+def _pptx_hides_behind(el, picture_fills: dict[str, str] | None, inherited_covers_bbox: dict | None = None,
+                       *, has_text: bool = False) -> bool:
+    """この図形の外接矩形が重なる背面の文字を隠す候補にしてよいか（塗りが opaque で、形が外接矩形と同一視できる）。"""
+    return (_pptx_fill_kind(el, picture_fills, has_text=has_text) == FILL_OPAQUE
+            and _pptx_covers_bbox(el, inherited_covers_bbox))
 
 
 def _bbox_intersection_ratio(inner: tuple, outer: tuple) -> float:
@@ -3812,12 +3949,15 @@ def _bbox_intersection_ratio(inner: tuple, outer: tuple) -> float:
     return (dx * dy) / inner_area
 
 
-def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None = None) -> list[str]:
+def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None = None,
+                               picture_fills: dict[str, str] | None = None,
+                               inherited_covers_bbox: dict | None = None) -> list[str]:
     """`p:cSld/p:spTree` 直下を文書順（=z順・背面→前面）で歩き、shape 単位でテキストを取る。
 
-    各テキスト shape について、後（前面）にある occluder 候補（無地塗りの空 shape／画像）と bbox の交差比が閾値以上なら
+    各テキスト shape について、後（前面）にある occluder 候補（不透明に塗った空 shape／不透明の画像）と bbox の交差比が閾値以上なら
     「隠し候補」とマークし、直前に独立行のマーカーを出す。`p:grpSp`（グループ）内は幾何判定せず、テキストのみ再帰抽出する。
     """
+    from .ooxml import powerpoint
     cSld = root.find(f"{_PR}cSld")
     if cSld is None:
         raise ValueError("p:cSld が見つからない")               # フォールバックへ
@@ -3825,7 +3965,7 @@ def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None 
     if spTree is None:
         raise ValueError("p:spTree が見つからない")
 
-    # 文書順の子要素を分類: テキストshape候補（p:sp）／occluder候補（p:sp 無地塗り or p:pic）／グループ
+    # 文書順の子要素を分類: テキストshape候補（p:sp）／occluder候補（不透明に塗った p:sp or 不透明の p:pic）／グループ
     children = list(spTree)
     entries = []                                                # [{kind, sp, texts, bbox, occluder}]
     for el in children:
@@ -3834,23 +3974,24 @@ def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None 
             texts = _pptx_shape_texts_list(el)
             bbox = _pptx_bbox(el)
             has_text = bool(texts)
-            is_occluder = (not has_text) and _pptx_has_solid_fill(el) and bbox is not None
+            is_occluder = _pptx_hides_behind(el, picture_fills, inherited_covers_bbox, has_text=has_text) and bbox is not None
             entries.append({"kind": "sp", "texts": texts, "bbox": bbox,
                              "occluder": is_occluder, "has_text": has_text})
         elif tag == f"{_PR}pic":
             bbox = _pptx_bbox(el)
             entries.append({"kind": "pic", "texts": [], "bbox": bbox,
-                             "occluder": bbox is not None, "has_text": False})
+                             "occluder": bbox is not None and _pptx_hides_behind(el, picture_fills, inherited_covers_bbox),
+                             "has_text": False})
         elif tag == f"{_PR}grpSp":
             group_texts = _pptx_group_texts(el)
             entries.append({"kind": "grpSp", "texts": group_texts, "bbox": None,
                              "occluder": False, "has_text": bool(group_texts)})
         elif tag == f"{_PR}graphicFrame":
-            texts = [t.text.strip() for t in el.iter(f"{_A}t") if t.text and t.text.strip()]
+            texts = powerpoint.text_lines(el)
             entries.append({"kind": "graphicFrame", "texts": texts, "bbox": None,
                              "occluder": False, "has_text": bool(texts)})
         else:                                                   # p:cxnSp／未知要素等: テキストのみ拾う
-            texts = [t.text.strip() for t in el.iter(f"{_A}t") if t.text and t.text.strip()]
+            texts = powerpoint.text_lines(el)
             entries.append({"kind": "other", "texts": texts, "bbox": None,
                              "occluder": False, "has_text": bool(texts)})
 
@@ -3880,15 +4021,13 @@ def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None 
 def _pptx_group_texts(grp) -> list[str]:
     """`p:grpSp` 内のテキストのみ再帰抽出（幾何判定は行わない＝グループ内 shape は occluder 候補にも
     被occlude対象にもしない）。ネストした `p:grpSp` も辿る。"""
+    from .ooxml import powerpoint
     out: list[str] = []
     for el in grp:
-        tag = el.tag
-        if tag in (f"{_PR}sp", f"{_PR}pic", f"{_PR}graphicFrame"):
-            out.extend([t.text.strip() for t in el.iter(f"{_A}t") if t.text and t.text.strip()])
-        elif tag == f"{_PR}grpSp":
+        if el.tag == f"{_PR}grpSp":
             out.extend(_pptx_group_texts(el))
         else:
-            out.extend([t.text.strip() for t in el.iter(f"{_A}t") if t.text and t.text.strip()])
+            out.extend(powerpoint.text_lines(el))
     return out
 
 

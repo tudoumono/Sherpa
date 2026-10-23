@@ -415,7 +415,8 @@ def _stream_doc_lines(f):
 def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, byte_cap: int,
                         info: dict | None = None) -> str | None:
     """親返し P2: rag.md をアンカー（`<!-- chunk:{chunk_id} -->`）単位でストリーミング走査し、`target_chunk_ids` に属するチャンクの本文だけを集める。
-    `info`（省略可）には、集められなかった対象チャンクの数を `info["missing_chunks"]` として返す（rag.md に無い・走査が cap で終わった等）。
+    `info`（省略可）には、集められなかった対象チャンクの数を `info["missing_chunks"]`（本文を返せたときだけ）として返す（rag.md に無い・走査が cap で終わった等）。
+    rag.md を開いて走査したときは `info["scanned"]`・`info["over"]`（`byte_cap` 超過で打ち切った）・`info["read_cut"]`（読込の上限で打ち切った＝`reader.truncated`／`line_overflowed`）・`info["found_ids"]`（見つけた chunk_id）も返す（`over`／`read_cut` のときの `found_ids` は途中までで、無かった証拠にならない）。
     対象外のチャンク本文は保持せず、全件そろうか `byte_cap` 超過で打ち切る。`byte_cap` を超えたら None を返し、集めた部分的な本文は使わない（途中で打ち切ったものを完全なものとして返さない）。
     """
     if not target_chunk_ids:
@@ -430,6 +431,7 @@ def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, by
     cur_buf: list = []
     total_bytes = 0
     over = False
+    reader = None
 
     def _close(cid: str, buf: list) -> None:
         nonlocal total_bytes, over
@@ -442,7 +444,7 @@ def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, by
             over = True
 
     try:
-        _reader, it, _enc_caution = _stream_doc_lines(f)  # 親返しの抜粋には注意文を付けない
+        reader, it, _enc_caution = _stream_doc_lines(f)  # 親返しの抜粋には注意文を付けない
         for line in it:
             anchor_id = es_index.rag_md_anchor_chunk_id(line)
             if anchor_id is not None:
@@ -457,11 +459,14 @@ def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, by
             if cur_id is not None and cur_id in remaining:
                 cur_buf.append(line)
         else:
-            # EOF（break していない）＝最後のアンカーの本文が未確定なら確定させる
-            if cur_id is not None and cur_id in remaining:
+            # EOF（break していない）＝最後のアンカーの本文が未確定なら確定させる。読込の上限で途切れたときは途中までの本文なので確定させない（`read_cut` が立つ）
+            if cur_id is not None and cur_id in remaining and not (reader.truncated or reader.line_overflowed):
                 _close(cur_id, cur_buf)
     finally:
         f.close()
+    if info is not None:
+        read_cut = bool(reader is not None and (reader.truncated or reader.line_overflowed) and remaining)
+        info.update(scanned=True, over=over, read_cut=read_cut, found_ids=set(collected))
     if over or not collected:
         return None
     if info is not None:
@@ -500,12 +505,70 @@ def pop_hit_scores() -> list:
     return out
 
 
+_ROW_GROUP_CUT_READ_MORE = "束ねた行の完全な本文は予算に入らず省いた（text は検索用に短くした文字）。続きは read_doc／read_around で doc_id を読む"
+_INGEST_TIME_NOTE = "（注: 取り込み時点の本文で、今の原本との対応は確かめていない）"
+
+
+def _chunk_tier_texts(world: str, doc_id: str, sp, layer, items: list, scan_info: dict,
+                      remaining: int, doc_ceiling: int) -> tuple:
+    """親返しが tier="chunk" に縮退した doc の各ヒットの本文を決める。
+    ① 行の束（`row_group_chunk_ids` あり）のヒットは、検索用に切った文字（vector_text）の代わりに rag.md から束の構成の完全な本文を読んで返す。予算（共有の残り・1 文書の上限）に入らなければ切った文字のまま省いた印を返す。
+    ② rag.md を走査して chunk_id が見つからなかったヒットは ES の本文のまま返し、取り込み時点の内容である注記を付ける（rag.md を開けなかったとき、読込の上限で打ち切られて「無い」と言えないときは比べる相手が無いので付けない）。
+    `scan_info`: 領域の読取（`_rag_md_region_text`）が返した `info`。戻り値: `(各ヒットの本文, 残り予算, 省いた束の chunk_id, 取り込み時点の chunk_id, 打ち切りで有無を確かめられなかった chunk_id)`。
+    """
+    texts = [it["text"] for it in items]
+    cut: list = []
+    ingest: list = []
+    unread: list = []
+    note_bytes = len(_INGEST_TIME_NOTE.encode("utf-8"))
+    scanned = bool(scan_info.get("scanned")) and not scan_info.get("over") and not scan_info.get("read_cut")  # 打ち切った走査は「無かった」の証拠にならない
+    scan_cut = bool(scan_info.get("scanned")) and bool(scan_info.get("read_cut")) and not scan_info.get("over")
+    found = scan_info.get("found_ids") or set()
+    for i, it in enumerate(items):
+        group_ids = it.get("row_group_chunk_ids")
+        unverified = False
+        if group_ids:
+            item_bytes = len(texts[i].encode("utf-8"))
+            doc_bytes = sum(len(t.encode("utf-8")) for t in texts)
+            cap = max(0, min(item_bytes + remaining, doc_ceiling - (doc_bytes - item_bytes)))
+            info: dict = {}
+            body = _rag_md_region_text(world, doc_id, sp, layer, group_ids, cap, info)
+            if info.get("over"):
+                cut.append(it["chunk_id"])
+                continue
+            if not info.get("scanned"):
+                continue
+            if body is None or info.get("missing_chunks"):
+                if info.get("read_cut"):
+                    unread.append(it["chunk_id"])  # 読込の上限で打ち切られた＝無いとは言えない
+                    continue
+                unverified = True
+            else:
+                hint = it.get("hint")
+                full = _redact(f"{body}（位置: {hint}）" if hint else body)
+                delta = len(full.encode("utf-8")) - item_bytes
+                if delta > remaining:
+                    cut.append(it["chunk_id"])
+                    continue
+                texts[i] = full
+                remaining -= delta
+        elif scanned and it["chunk_id"] not in found:
+            unverified = True
+        elif scan_cut and it["chunk_id"] not in found:
+            unread.append(it["chunk_id"])
+        if unverified:
+            ingest.append(it["chunk_id"])
+            texts[i] += _INGEST_TIME_NOTE
+            remaining = max(0, remaining - note_bytes)
+    return texts, remaining, cut, ingest, unread
+
+
 def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_rag: int) -> list:
     """親返し本体: doc_id ごとに束ねた rag チャンクのヒットを P2（領域）／chunk（子のみ）へ振り分ける。決定的な貪欲法:
     ① 全 doc の最低保証（子チャンク本文の合計＝`baseline`）を `budget_for_rag` から先に確保する（先頭の巨大文書が予算を食い尽くして子チャンクが消えるのを防ぐ）。
     ② 残り予算をベストスコア順（同点は doc_id 昇順）に使い、領域が「共有の残り予算」と「1 文書あたりの上限（`per_doc_cap`）」の両方に収まれば P2、収まらなければ chunk のままにする。`per_doc_cap` は総予算を doc 数で均等割り（下限 `_HIT_TEXT_MIN_BYTES`）した値。
     ③ 各 doc は必ず 1 エントリを返し、`tier` を必ず申告する。`per_doc_cap` に阻まれて領域を取れなかった doc には `text_truncated: true` を立てる（read_doc で補える余地を示す）。
-    `rag_groups`: `{doc_id: [{"chunk_id", "parent_id", "locator", "score", "text"}, ...]}`（`text` は redaction 済みの子チャンク本文）。`budget_for_rag`: この tool result のうち rag doc 群に残っている予算（呼び出し元が計算する）。
+    `rag_groups`: `{doc_id: [{"chunk_id", "parent_id", "locator", "score", "text"}, ...]}`（`text` は redaction 済みの子チャンク本文。行の束のヒットは `row_group_chunk_ids`・`hint` も持ち、tier="chunk" のとき `_chunk_tier_texts` が束の完全な本文を読み直す）。`budget_for_rag`: この tool result のうち rag doc 群に残っている予算（呼び出し元が計算する）。
     """
     groups = []
     for doc_id, items in rag_groups.items():
@@ -525,6 +588,7 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
         region_capped = False
         parent_unfetched = False
         region_info = {}
+        per_doc_ceiling = max(per_doc_cap, baseline)  # baseline（最低保証）自体は削らない
         parent_ids = sorted({it["parent_id"] for it in items if it.get("parent_id")})
         if parent_ids:
             es_ids = es_index.chunk_ids_for_parent(
@@ -535,7 +599,6 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
             target_ids = set(es_ids)
             target_ids |= set(chunk_ids)  # ヒット自身のチャンクは必ず含める（ES 反映漏れの安全弁）
             shared_cap = baseline + remaining
-            per_doc_ceiling = max(per_doc_cap, baseline)  # baseline（最低保証）自体は削らない
             region_cap = min(shared_cap, per_doc_ceiling)
             region_info = {}
             region_text = _rag_md_region_text(world, doc_id, sp, layer, target_ids, region_cap, region_info)
@@ -550,6 +613,14 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
             if tier != "region" and per_doc_ceiling < shared_cap:
                 # 1 文書あたりの上限が共有予算より先に効いた＝この文書は上限で頭打ちにされた
                 text_truncated = True
+        cut_chunks: list = []
+        ingest_chunks: list = []
+        if tier == "chunk":
+            texts, remaining, cut_chunks, ingest_chunks, unread_chunks = _chunk_tier_texts(
+                world, doc_id, sp, layer, items, region_info, remaining, per_doc_ceiling)
+            text = "\n\n".join(texts)
+            if cut_chunks or unread_chunks:
+                text_truncated = True
         entry = {"doc_id": doc_id, "tier": tier, "text": text,
                  "chunks": [{"chunk_id": it["chunk_id"],
                              **({"locator": it["locator"]} if it.get("locator") is not None else {})}
@@ -562,12 +633,19 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
             entry["fragment"] = True
             entry["text_truncated"] = True
             entry["parent_chunks_unfetched"] = True  # 親の領域のチャンクを取得できなかった（本文はヒットのチャンクだけ）
+        if cut_chunks:
+            entry["row_group_text_cut"] = {"chunks": cut_chunks, "read_more": _ROW_GROUP_CUT_READ_MORE}
+        if ingest_chunks:
+            entry["ingest_time_text"] = {"chunks": ingest_chunks}  # ES の本文のまま（今の rag.md に chunk_id が無い）＝取り込み時点の内容
         if region_capped:
             entry["region_chunks_capped"] = True  # 領域のチャンク取得が ES の取得上限（5000）に当たった
         if tier == "region" and region_info.get("missing_chunks"):
             entry["region_missing_chunks"] = region_info["missing_chunks"]  # 領域の一部のチャンクが集まらなかった
         if any(it.get("keyword_match") is not None for it in items):
             entry["keyword_match"] = any(it.get("keyword_match") for it in items)  # 束ねた子チャンクのどれかに語が一致していれば True
+        exact_chunk_ids = list(dict.fromkeys(c for it in items for c in (it.get("row_group_exact_chunk_ids") or [])))
+        if exact_chunk_ids:
+            entry["row_group_exact_chunk_ids"] = exact_chunk_ids  # exact で一致した束の中の行の chunk_id
         out.append(entry)
     return out
 
@@ -1191,7 +1269,9 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                      **({"keyword_match": h["keyword_match"]} if h.get("keyword_match") is not None else {}),
                      **({"locator": h["locator"]} if h.get("locator") is not None else {}),
                      **({"chunk_id": h["chunk_id"]} if h.get("chunk_id") is not None else {}),
-                     **({"parent_id": h["parent_id"]} if h.get("parent_id") is not None else {})}
+                     **({"parent_id": h["parent_id"]} if h.get("parent_id") is not None else {}),
+                     **({"row_group_chunk_ids": h["row_group_chunk_ids"]} if h.get("row_group_chunk_ids") else {}),
+                     **({"row_group_exact_chunk_ids": h["row_group_exact_chunk_ids"]} if h.get("row_group_exact_chunk_ids") else {})}
                     for h in valid_es_hits]
         else:
             try:
@@ -1236,6 +1316,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 }
                 if h.get("keyword_match") is not None:
                     rag_item["keyword_match"] = h["keyword_match"]
+                if h.get("row_group_chunk_ids"):
+                    rag_item["row_group_chunk_ids"] = h["row_group_chunk_ids"]
+                    rag_item["hint"] = hint
+                if h.get("row_group_exact_chunk_ids"):  # exact で当たった束の行（束の中のどの行の識別子で当たったか）
+                    rag_item["row_group_exact_chunk_ids"] = h["row_group_exact_chunk_ids"]
                 rag_groups.setdefault(h["doc_id"], []).append(rag_item)
                 if h["doc_id"] not in rag_slot_index:
                     # 最初に出現した位置＝その doc の最高スコア。2 件目以降は予約済みの枠へ集約するだけ

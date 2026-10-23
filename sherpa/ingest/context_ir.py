@@ -23,7 +23,7 @@ from . import evidence_ir
 
 
 CONTEXT_IR_SCHEMA_VERSION = "context-ir-v1alpha2"
-CONTEXT_ANALYZER_VERSION = "xlsx-context-rules-v8"
+CONTEXT_ANALYZER_VERSION = "xlsx-context-rules-v9"
 DOCX_CONTEXT_ANALYZER_VERSION = "docx-context-rules-v1"
 PPTX_CONTEXT_ANALYZER_VERSION = "pptx-context-rules-v1"
 PDF_CONTEXT_ANALYZER_VERSION = "pdf-context-rules-v1"
@@ -357,6 +357,47 @@ def _dedupe_identifier_mentions(items: list[IdentifierMention]) -> tuple[Identif
 
 def _data_like_count(values: list[str]) -> int:
     return sum(bool(_ID_RE.fullmatch(value) or _NUMBER_RE.fullmatch(value)) for value in values)
+
+
+# 単位の付いた値（30秒・3回・10桁）。暦の語（年・月・日…）で始まる単位は見出しに多いので値に数えない。
+_UNIT_VALUE_RE = re.compile(r"^[+-]?\d[\d,]*(?:\.\d+)?\s?(?![年月日週時期度曜号Qq四半])[A-Za-z%％ぁ-ゟ゠-ヿ一-鿿]{1,6}$")
+
+
+def _is_value_like(value: str) -> bool:
+    return bool(_ID_RE.fullmatch(value) or _NUMBER_RE.fullmatch(value) or _UNIT_VALUE_RE.fullmatch(value))
+
+
+def _first_row_is_vertical_item_value(
+    cells: list[evidence_ir.EvidenceElement], start_column: int, end_column: int, first_row: int,
+) -> bool:
+    """先頭行が、見出し無しの縦の項目・値の表（2 列・左列が項目名）の 1 行目かを返す。
+
+    左列が全行とも値らしくない文字で、先頭行の右列だけが値（単位付きの値、または他の行の右列にも値がある数値・ID）
+    のとき真。年のような数値は見出しになりうるため値に数えない。判断がつかなければ偽（見出し行のまま）。
+    """
+    by_row: dict[int, dict[int, str]] = defaultdict(dict)
+    for cell in cells:
+        row, column = _row_column(cell)
+        text = _text(cell.value)
+        if row is not None and column is not None and text and start_column <= column <= end_column:
+            by_row[row][column] = text
+    columns = {column for values in by_row.values() for column in values}
+    if len(columns) != 2 or len(by_row) < 2 or first_row not in by_row:
+        return False
+    label_column, value_column = sorted(columns)
+    if any(label_column not in values or _is_value_like(values[label_column]) for values in by_row.values()):
+        return False
+    first_value = by_row[first_row].get(value_column)
+    if first_value is None or _YEAR_RE.fullmatch(first_value):
+        return False
+    if _UNIT_VALUE_RE.fullmatch(first_value):
+        return True
+    if not _is_value_like(first_value):
+        return False
+    return any(
+        value_column in values and _is_value_like(values[value_column])
+        for row, values in by_row.items() if row != first_row
+    )
 
 
 def _row_column(cell: evidence_ir.EvidenceElement) -> tuple[int | None, int | None]:
@@ -1038,7 +1079,10 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
                     for cell in region_cells
                     if _row_column(cell)[0] == min_row and _text(cell.value)
                 ]
-                if title is None and header_row == min_row and _data_like_count(first_row_values) >= 2:
+                if title is None and header_row == min_row and (
+                    _data_like_count(first_row_values) >= 2
+                    or _first_row_is_vertical_item_value(region_cells, start_column, end_column, min_row)
+                ):
                     # 先頭 data row を header と誤認した可能性が高い（継続根拠も title もない）ため座標 fallback にする
                     header_row = None
                     confidence = 0.0

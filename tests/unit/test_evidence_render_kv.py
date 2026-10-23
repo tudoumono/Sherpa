@@ -147,11 +147,12 @@ def test_non_table_long_text_split_keeps_prefix():
     assert "は次のとおりである" not in records[0]["semantic_text"]
 
 
-def test_non_table_long_text_split_keeps_kv_tail_on_first_chunk():
+def test_non_table_long_text_split_keeps_state_kv_on_every_chunk():
     records = _non_table(visibility="hidden", lifecycle="deleted")
     assert len(records) == 2
     assert records[0]["semantic_text"].endswith("可視性: 「hidden」 / 状態: 「deleted」")
-    assert "可視性" not in records[1]["semantic_text"]
+    # 状態行は文字の解釈を変えるので、後続の片にも付く
+    assert records[1]["semantic_text"].endswith("可視性: 「hidden」 / 状態: 「deleted」")
 
 
 def test_non_table_long_text_split_keeps_shape_fill_asset_on_first_chunk():
@@ -574,14 +575,14 @@ def test_xlsx_rag_chunks_omit_excel_value_breakdown_but_evidence_keeps_it():
     assert cells and any(e.extension.get("number_format") for e in cells)
 
 
-def test_chunk_versions_are_v1alpha13():
+def test_chunk_versions_are_v1alpha16():
     chunks = _read_chunks(_build_wide_xlsx(4), "big.xlsx")
     assert chunks
     for chunk in chunks:
-        assert chunk["renderer_version"] == "evidence-rag-renderer-v1alpha13"
-        assert chunk["chunker_version"] == "evidence-rag-chunker-v1alpha13"
-    assert R.RAG_RENDERER_VERSION == "evidence-rag-renderer-v1alpha13"
-    assert R.RAG_CHUNKER_VERSION == "evidence-rag-chunker-v1alpha13"
+        assert chunk["renderer_version"] == "evidence-rag-renderer-v1alpha16"
+        assert chunk["chunker_version"] == "evidence-rag-chunker-v1alpha16"
+    assert R.RAG_RENDERER_VERSION == "evidence-rag-renderer-v1alpha16"
+    assert R.RAG_CHUNKER_VERSION == "evidence-rag-chunker-v1alpha16"
 
 
 def test_markdown_anchors_precede_each_chunk_and_match_chunk_ids_1to1():
@@ -622,7 +623,7 @@ def test_render_validation_errors_catch_anchor_chunk_mismatch():
     ({"visibility_reason": "hidden_slide_inherited"}, ["可視性: 「非表示スライド内の要素」"]),
     ({"visibility_reason": "off_slide"}, ["可視性: 「スライド範囲外」"]),
     ({"visibility_reason": "occluded"}, ["可視性: 「図形に覆われている」"]),
-    ({"visibility_reason": "strike"}, ["取り消し線: 「あり」"]),
+    ({"format_state": {"strike": "whole"}}, ["取り消し線: 「あり」"]),
     ({"occluded_by": {"kind": "shape", "text": "廃止"}}, ["重なり: 「廃止」"]),
     ({"covered_by_text": {"element_id": "shape:2", "text": "廃止"}}, ["重なり: 「廃止」"]),
     ({"occluded_by": {"kind": "picture", "z_index": 3}}, []),
@@ -640,7 +641,7 @@ def test_occlusion_kv_lines(ext, expected):
     ("使用中", "状態", {"visibility_reason": "occluded_by_picture",
                        "occluded_by": {"kind": "picture", "element_id": "shape:1", "z_order": 2}},
      "可視性: 「画像に覆われている」"),
-    ("廃止予定", "状態", {"visibility_reason": "strike"}, "取り消し線: 「あり」"),
+    ("廃止予定", "状態", {"format_state": {"strike": "whole"}}, "取り消し線: 「あり」"),
     ("非表示行", "状態", {"visibility_reason": "hidden_row"}, "可視性: 「行が非表示」"),
     ("X02", "内部コード", {"visibility_reason": "hidden_column"}, "可視性: 「列が非表示」"),
 ])
@@ -650,17 +651,19 @@ def test_field_piece_occlusion_kv(value, label, ext, expected):
     assert "occluded_by_picture" not in piece["semantic"]
 
 
-def test_field_piece_occlusion_kv_only_on_first_span():
-    cell = _cell("e1", "長文", row=2, column=2, visibility_reason="strike")
+def test_field_piece_occlusion_kv_on_every_span():
+    cell = _cell("e1", "長文", row=2, column=2, format_state={"strike": "whole"})
     p0 = R._field_piece(cell, "備考", 0, 2, 0, 2, "長文A", [])
     p1 = R._field_piece(cell, "備考", 1, 2, 2, 4, "長文B", [])
-    assert "取り消し線" in p0["semantic"] and "取り消し線" not in p1["semantic"]
+    for piece in (p0, p1):
+        assert piece["semantic"].endswith("\n取り消し線: 「あり」")
+        assert piece["exact"].endswith("\n取り消し線: 「あり」")
 
 
 @pytest.mark.parametrize("etype,value,ext,doc,path,expected", [
     ("hidden_text", "内部メモ", {"visibility": "hidden", "visibility_reason": "hidden_run"},
      "doc.docx", "見出し", "可視性: 「非表示文字」"),
-    ("strike_text", "旧料金プラン", {"visibility_reason": "strike"}, "doc.docx", "見出し", "取り消し線: 「あり」"),
+    ("strike_text", "旧料金プラン", {"format_state": {"strike": "whole"}}, "doc.docx", "見出し", "取り消し線: 「あり」"),
     ("shape", "旧料金体系: 月額1000円", {"covered_by_text": {"element_id": "shape:2", "text": "廃止"}},
      "deck.pptx", "スライド2", "重なり: 「廃止」"),
     ("shape", "旧仕様メモ", {"visibility": "hidden", "visibility_reason": "off_slide"},

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..env_int import env_int
-from . import child_registry, mem_guard
+from . import child_registry, mem_guard, resource_meter
 
 _log = logging.getLogger("sherpa.ingest.convert")   # 変換ログ（make logs convert）と同じ名前
 
@@ -222,7 +222,9 @@ class Prefetcher:
             return True
         if not wait:
             return False
-        if not mem_guard.wait_for_free_memory("MD化の先読み"):
+        with resource_meter.waiting(resource_meter.RESOURCE, task="md_prefetch_memory"):
+            freed = mem_guard.wait_for_free_memory("MD化の先読み")
+        if not freed:
             self._parallel -= 1
             _log.warning("メモリの空きが戻らないため、MD化の先読みの並列を %d に減らして進めます", self._parallel)
         return True
@@ -276,7 +278,11 @@ class Prefetcher:
         self._known.discard(rel)
         self._pump()
         try:
-            got = fut.result()
+            if fut.done():
+                got = fut.result()
+            else:
+                with resource_meter.waiting(resource_meter.WORKING, task="md_prefetch_result"):
+                    got = fut.result()
         except Exception as exc:
             _log.warning("MD化の先読みに失敗しました（直列で計算し直します）: %s", exc.__class__.__name__)
             if isinstance(exc, BrokenProcessPool):

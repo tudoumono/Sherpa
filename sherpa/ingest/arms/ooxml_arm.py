@@ -13,8 +13,9 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from . import ArmResult
-from .. import document_ir
+from .. import document_ir, observation_vocab
 from ..gc_relax import relaxed_gc
+from ..ooxml.text import paragraph_separated_text
 
 # OOXML＝外部ライブラリ不要（docx/pptx は XML 直読み・xlsx は openpyxl）で常時 MD化できる。
 _EXTS = {".docx", ".xlsx", ".pptx"}
@@ -59,12 +60,12 @@ _PARTIAL_XLSX_MIN_DECLARED_ROWS = 100  # これ未満の宣言行数は比率の
 _PARTIAL_XLSX_MAX_EXTRACTED_RATIO = 0.05  # 抽出行/宣言行がこの比率未満なら疑い
 
 # document-ir の JSON 形式の版（`document_ir.DOCUMENT_IR_SCHEMA_VERSION`）と、このアームの抽出処理自体の版を分離する。抽出対象（要素種別・採番規則・表の座標解決規則等）を増やしたらこちらを上げる（派生が `.document_ir_sig` の drift 経由で再生成される）。
-DOCX_EXTRACTOR_VERSION = "docx-ooxml-v5"
+DOCX_EXTRACTOR_VERSION = "docx-ooxml-v8"
 # PowerPoint 抽出器の版。docx/xlsx とは独立した版番号（`_current_document_ir_sig` が `docx=`/`pptx=`/`xlsx=` を別成分で持つ）。
-PPTX_EXTRACTOR_VERSION = "pptx-ooxml-v2"
+PPTX_EXTRACTOR_VERSION = "pptx-ooxml-v4"
 # Excel 抽出器の版。docx/pptx とは独立した版番号。座標解決・要素の抽出規則が変わったら上げる。この値は `_current_document_ir_sig`/`_current_evidence_ir_sig` の `xlsx=` 成分に入る。
 # 上げると `worker.sync`（`_refresh_derived_representations`）が `document_ir_sig_drift` を検知し、`refresh_document_ir` が IR の確かめ／evidence／rag（RAG_ES 有効時は ES 索引）まで連鎖再生成する。人間向け `{rel}.md` は別系統（`office_md._current_human_md_sig()`）だが、この版と `DOCX_EXTRACTOR_VERSION` が合成されるため、上げると `{rel}.md` も1回だけ作り直される。
-XLSX_EXTRACTOR_VERSION = "xlsx-ooxml-v7"
+XLSX_EXTRACTOR_VERSION = "xlsx-ooxml-v9"
 
 # document-ir を並行構築する対象拡張子（legacy .xls は対象外＝来歴を汚さないため）。
 _IR_EXTS = {".docx", ".pptx", ".xlsx"}
@@ -141,7 +142,7 @@ def _docx_floating_anchor_facts(p_el) -> list[dict]:
     for anchor in p_el.findall(f".//{_WP}anchor"):
         doc_pr = anchor.find(f"{_WP}docPr")
         name = doc_pr.get("name", "") if doc_pr is not None else ""
-        text = "".join(t.text or "" for t in anchor.iter(f"{office_md._W}t"))
+        text = paragraph_separated_text(anchor, office_md._W)
         fact: dict = {"behind_doc": anchor.get("behindDoc") in {"1", "true"}}
         if name:
             fact["name"] = name
@@ -166,7 +167,7 @@ def _build_docx_ir(p: Path) -> document_ir.DocumentIR | None:
 
     採番規則（World 再構築内で決定的な要素ID。原本に要素を前方追加すると後続の連番はずれる）。型ごとに独立したカウンタ（1-based・実際に要素を生成した時だけ増分）:
     - `para:N`／`heading:N`／`table:N`: 本文。
-    - `hidden:N`（隠し文字）／`strike:N`（取り消し線）／`deleted:N`（削除本文）／`link:N`（ハイパーリンク）／`textbox:N`（テキストボックス）: 文書全体を通した連番。`order` は同一段落内の出現順（段落ごとに1から数え直す）で、種別ごとにまとめた固定順（hidden→strike→deleted→hyperlink→textbox）で振る。`strike:N` は `visibility="visible"`・`status="active"` のまま `visibility_reason="strike"` だけを立てる。`parent_id` はホスト段落/見出しの `element_id`。段落全体が削除で本文ゼロの場合は `parent_id=None` とし、`source_map.paragraph_index` が原本位置を示す。
+    - `hidden:N`（隠し文字）／`strike:N`（取り消し線）／`deleted:N`（削除本文）／`link:N`（ハイパーリンク）／`textbox:N`（テキストボックス）: 文書全体を通した連番。`order` は同一段落内の出現順（段落ごとに1から数え直す）で、種別ごとにまとめた固定順（hidden→strike→deleted→hyperlink→textbox）で振る。`strike:N` は `visibility="visible"`・`status="active"`・`visibility_reason=None` のまま `source_map["format_state"]={"strike": "whole"}` で要素全体の取り消し線を表す。`parent_id` はホスト段落/見出しの `element_id`。段落全体が削除で本文ゼロの場合は `parent_id=None` とし、`source_map.paragraph_index` が原本位置を、`source_map.after_body_order` が直前の本文要素（見出し・段落・表）の `order`（文書の先頭なら 0）を示す。
     - `hyperlink` の `target`: `r:id`（`word/_rels/document.xml.rels` 経由の URL）優先、無ければ `w:anchor`（`"#"+anchor名`）。どちらも解決できなければ要素を作らない。
     - `footnote:N`／`endnote:N`／`comment:N`／`header:N`／`footer:N`（`word/header*.xml`／`footer*.xml` は zip 名ソート順）: その型内だけの連番で `order` も同じ値、`parent_id=None`。区切り線・空パートは要素を作らない。パートの欠落/壊れはその型を空扱いにする。
     - ネスト表（`w:tc` 内の `w:tbl`）: 外側表の `cells` は `tc` 直下の `w:p` のみ。ネスト表は独立した `table:N`（トップレベル表と同じグローバル連番）で、`parent_id=<外側 table:N>`・`order=<外側表内での出現順>`・`source_map={"table_index", "host_row", "host_column"}`（`host_row`/`host_column` は直接の親表内での 1-based 位置）。何段でも再帰する。空のネスト表は追加しない。
@@ -195,15 +196,19 @@ def _build_docx_ir(p: Path) -> document_ir.DocumentIR | None:
     hidden_seq = deleted_seq = link_seq = textbox_seq = strike_seq = 0
     para_index = table_index = 0  # 0-based・生の <w:p>/<w:tbl> 出現順（スキップされても増分）
 
-    def _append_paragraph_extras(p_el, host_id, para_idx, cell_map=None) -> None:
+    def _append_paragraph_extras(p_el, host_id, para_idx, cell_map=None, orphan_anchors=None) -> None:
         """段落付随要素（hidden/deleted/link/textbox）を出現順（種別ごとにまとめた固定順）で追加する。
 
         `cell_map` 指定時＝表セル内の段落: `source_map` は `{"table_index", "row", "column", "cell_paragraph_index"}`（row/column は cells と同じグリッド座標）になり、`host_id` にはホスト表の `element_id`（`table:N`）が入る。
+        `orphan_anchors`＝本文が空でホスト段落が無い段落の浮動図形の事実: この段落のテキストボックス要素の `source_map["floating_anchors"]` に載せる（テキストボックスが無ければ最初の付随要素に載せる）。
         """
         nonlocal hidden_seq, deleted_seq, link_seq, textbox_seq, strike_seq
+        first_extra = len(elements)
 
         def _sm(extra=None) -> dict:
             base = dict(cell_map) if cell_map is not None else {"paragraph_index": para_idx}
+            if cell_map is None and host_id is None:
+                base["after_body_order"] = body_order   # 本文の無い段落: 直前の本文要素（見出し・段落・表）の order。0 は文書の先頭
             if extra:
                 base.update(extra)
             return base
@@ -224,9 +229,9 @@ def _build_docx_ir(p: Path) -> document_ir.DocumentIR | None:
             strike_seq += 1
             elements.append(document_ir.Element(
                 element_id=f"strike:{strike_seq}", type="strike_text", parent_id=host_id,
-                order=sub_order, visibility="visible", visibility_reason="strike",
+                order=sub_order, visibility="visible",
                 status="active", text=text, cells=None,
-                source_map=_sm(), extraction=extraction))
+                source_map=_sm({"format_state": observation_vocab.whole_strike_state()}), extraction=extraction))
         for text in word.deleted_runs(p_el):
             sub_order += 1
             deleted_seq += 1
@@ -241,13 +246,20 @@ def _build_docx_ir(p: Path) -> document_ir.DocumentIR | None:
                 element_id=f"link:{link_seq}", type="hyperlink", parent_id=host_id,
                 order=sub_order, visibility="visible", status="active", text=link["text"], cells=None,
                 source_map=_sm({"target": link["target"]}), extraction=extraction))
-        for text in word.textboxes(p_el):
+        for text, object_ids in zip(word.textboxes(p_el), word.textbox_object_ids(p_el), strict=True):
             sub_order += 1
             textbox_seq += 1
+            extra = {"floating_anchors": orphan_anchors} if orphan_anchors else {}
+            if object_ids:          # 囲む図形の原本 ID（Evidence IR の図形と同じ原本かを ID で確かめる）
+                extra["object_ids"] = object_ids
             elements.append(document_ir.Element(
                 element_id=f"textbox:{textbox_seq}", type="textbox", parent_id=host_id,
                 order=sub_order, visibility="visible", status="active", text=text, cells=None,
-                source_map=_sm(), extraction=extraction))
+                source_map=_sm(extra or None),
+                extraction=extraction))
+        if orphan_anchors and len(elements) > first_extra and not any(
+                e.type == "textbox" for e in elements[first_extra:]):
+            elements[first_extra].source_map["floating_anchors"] = orphan_anchors
 
     def _append_table(tbl_el, parent_id, order, base_source_map) -> None:
         """1つの `w:tbl`（トップレベル/ネスト共通）を `table:N` として追加し、ネスト表を再帰的に追加する。
@@ -284,12 +296,12 @@ def _build_docx_ir(p: Path) -> document_ir.DocumentIR | None:
             para_index += 1
             text = office_md._para_text(el).strip()
             host_id = None
+            # この段落に浮動図形（`wp:anchor`）がアンカーされていれば、幾何断定なしの関連付けの事実を source_map へ載せる（本文が空なら付随要素へ）。
+            floating_anchors = _docx_floating_anchor_facts(el)
             if text:
                 lvl = office_md._heading_level(el)
                 body_order += 1
                 extraction = document_ir.Extraction(method="ooxml", confidence=1.0)
-                # この段落に浮動図形（`wp:anchor`）がアンカーされていれば、幾何断定なしの関連付けの事実を source_map へ載せる。
-                floating_anchors = _docx_floating_anchor_facts(el)
                 if lvl:
                     heading_seq += 1
                     host_id = f"heading:{heading_seq}"
@@ -313,7 +325,7 @@ def _build_docx_ir(p: Path) -> document_ir.DocumentIR | None:
                         text=text, cells=None, source_map=para_source_map,
                         extraction=extraction))
             # host_id は本文が空（段落全体が削除等）なら None のまま、隠し/削除/リンク/テキストボックスは独立に抽出する（`parent_id=None`＋`paragraph_index` で位置を示す）。
-            _append_paragraph_extras(el, host_id, idx)
+            _append_paragraph_extras(el, host_id, idx, orphan_anchors=None if host_id else floating_anchors)
         elif el.tag == f"{office_md._W}tbl":
             idx = table_index
             table_index += 1
@@ -381,15 +393,16 @@ def _build_docx_ir(p: Path) -> document_ir.DocumentIR | None:
 def _build_pptx_ir(p: Path) -> document_ir.DocumentIR | None:
     """PPTX から document-ir を構築する。
 
-    幾何・覆い判定は再実装せず、`office_md.py` のヘルパ（`_pptx_bbox`／`_pptx_has_solid_fill`／`_bbox_intersection_ratio`／`_OCCLUSION_RATIO`）と表示順解決（`_slide_order`）を消費する。非表示スライド・発表者ノート・スライドサイズ・shape 分類は `sherpa/ingest/ooxml/powerpoint.py` の純関数を消費する。MD 生成（`_pptx_md`／`_pptx_slide_texts*`）には触れない。
+    幾何・覆い判定は再実装せず、`office_md.py` のヘルパ（`_pptx_bbox`／`_pptx_fill_kind`／`_bbox_intersection_ratio`／`_OCCLUSION_RATIO`）と表示順解決（`_slide_order`）を消費する。非表示スライド・発表者ノート・スライドサイズ・shape 分類は `sherpa/ingest/ooxml/powerpoint.py` の純関数を消費する。MD 生成（`_pptx_md`／`_pptx_slide_texts*`）には触れない。
 
     採番規則（型ごとに独立したカウンタ・1-based・実際に要素を生成した時だけ増分）:
     - `slide:N`（`N`＝`_slide_order` の表示順＝MD の `## スライド N` と同じ番号）。`text=None`・`order=N`・`source_map={"slide": N, "part": <slide パート名>}`。非表示スライド（`p:sld @show="0"`）は `visibility="hidden"`／`visibility_reason="hidden_slide"`。
-    - `shape:N`（スライドをまたいだグローバル連番・テキストを持つ shape だけ要素化する）。`parent_id=<所属 slide:N>`・`text=<shape 内テキストの "\\n" 結合>`・`order=<スライド内の出現順>`（スライドごとに1から数え直す）。`source_map={"slide": n, "z_index": i}`（`z_index`＝`powerpoint.slide_shapes()` が返す配列内の 0-based 位置＝z順。テキストの無い occluder 候補にも振られ、`occluded_by` から前面 occluder を指すのに使う）。bbox が取れれば `bounds: [x, y, cx, cy]`（EMU）を追加し、取れなければキーを省略する。グループ内（`p:grpSp` 直下）は幾何判定せず bbox 不明のまま要素化し、`source_map` に `{"group": true}` を追加する（`bounds` は出さない）。
+    - `shape:N`（スライドをまたいだグローバル連番・テキストを持つ shape だけ要素化する）。`parent_id=<所属 slide:N>`・`text=<shape 内テキストの "\\n" 結合>`・`order=<スライド内の出現順>`（スライドごとに1から数え直す）。`source_map={"slide": n, "z_index": i, "shape_id": <cNvPr/@id>, "shape_name": <cNvPr/@name>}`（`z_index`＝`powerpoint.slide_shapes()` が返す配列内の 0-based 位置＝z順。テキストの無い occluder 候補にも振られる。`shape_id`／`shape_name` は原本の図形 ID と名前で、ID が読めなければ `shape_id` を省く。Evidence 側の図形との対応は `shape_id` で取る）。bbox が取れれば `bounds: [x, y, cx, cy]`（EMU）を追加し、取れなければキーを省略する。グループ内（`p:grpSp` 直下）は幾何判定せず bbox 不明のまま要素化し、`source_map` に `{"group": true}` を追加する（`bounds` は出さない）。
     - 可視性の判定は優先順 off_slide → occluded → covered_by_text で、最初に成立した1つだけを記録する。
       - 画面外: `powerpoint.slide_size()` が取れ、自 bbox がスライド矩形と交差しなければ `visibility="hidden"`／`visibility_reason="off_slide"`。
-      - 覆い: 前面の無地塗りの空 shape または画像が `_bbox_intersection_ratio(自bbox, 前面bbox) >= _OCCLUSION_RATIO` なら `visibility="hidden"`／`visibility_reason="occluded"`、`source_map["occluded_by"] = {"kind": "solid_shape"|"picture", "z_index": j}`。MD の `［隠し候補］` と同じ関数呼び出しで判定するので、MD で隠し候補になる shape は IR でも必ず `occluded` になる。
-      - 前面文字による上書き: 覆いに該当しない場合のみ、前面にテキストを持つ shape が同じ閾値以上重なっていれば（先着1件）、`visibility="visible"` のまま `source_map["covered_by_text"] = "shape:M"` を追加する。意味の確定は検索表現層の責務で、IR は幾何的な前後関係だけを記録する。
+      - 覆い: 前面の不透明な塗りの shape（文字の有無を問わない）または不透明の画像が `_bbox_intersection_ratio(自bbox, 前面bbox) >= _OCCLUSION_RATIO` なら `visibility="hidden"`／`visibility_reason="occluded"`、`source_map["occluded_by"] = {"kind": "solid_shape"|"picture", "z_index": j, "shape_id": <前面の cNvPr/@id>}`（前面の ID が読めなければ `shape_id` を省く）。MD の `［隠し候補］` と同じ塗りの区分で判定するので、MD で隠し候補になる shape は IR でも必ず `occluded` になる。透明・半透明・塗りなし・判定できない塗りは隠さない。
+      - 前面の候補: 前面の shape・画像（文字の有無・塗りの区分を問わない。隠れている前面文字は除く）が同じ閾値以上重なっていれば、`source_map["fronts"] = [{"z_index": j, "shape_id": <前面の cNvPr/@id>, "fill": <塗りの区分>, "covers_bbox": <形が外接矩形と同一視できるか>}]` に残す（前面の ID が読めないものは含めない）。Evidence 側が前面 → 背面の `covers` を作る材料で、可視性は変えない。
+      - 前面文字による上書き: 覆いに該当しない場合のみ、前面が塗りなしで文字だけ（none_with_text）の shape で同じ閾値以上重なっていれば（先着1件）、`visibility="visible"` のまま `source_map["covered_by_text"] = "shape:M"` を追加する。意味の確定は検索表現層の責務で、IR は幾何的な前後関係だけを記録する。
     - `notes:N`（スライドをまたいだグローバル連番・発表者ノートが非空のスライドだけ）: `parent_id=<所属 slide:N>`・`text=<発表者ノート>`・`order=1`・`source_map={"slide": n}`。
 
     ノートの rels（`powerpoint.notes_for_slide`）が壊れている/欠落している場合は None に縮退する。壊れて読めないスライドパートは、そのスライドの shape 抽出だけをスキップする（`slide:N` は作る）。`_slide_order` が1件も返さなければ None を返す。
@@ -403,14 +416,16 @@ def _build_pptx_ir(p: Path) -> document_ir.DocumentIR | None:
             return None
         hidden_names = pptx_ooxml.hidden_slide_names(z)
         size = pptx_ooxml.slide_size(z)
-        slide_data: list[tuple[str, object, tuple[str, str] | None]] = []
+        slide_data: list[tuple[str, object, tuple[str, str] | None, dict[str, str], dict]] = []
         for name in slide_names:
             try:
                 root = ET.fromstring(z.read(name))
             except (KeyError, ET.ParseError):
                 root = None
             notes_payload = pptx_ooxml.notes_with_part_for_slide(z, name)
-            slide_data.append((name, root, notes_payload))
+            picture_fills = pptx_ooxml.slide_picture_fills(z, name, root) if root is not None else {}
+            inherited = pptx_ooxml.slide_inherited_covers_bbox(z, name, root) if root is not None else {}
+            slide_data.append((name, root, notes_payload, picture_fills, inherited))
 
     content_hash = "sha256:" + hashlib.sha256(p.read_bytes()).hexdigest()
     source = document_ir.Source(path=str(p), content_hash=content_hash, file_type="pptx")
@@ -420,7 +435,7 @@ def _build_pptx_ir(p: Path) -> document_ir.DocumentIR | None:
 
     shape_seq = 0
     notes_seq = 0
-    for n, (name, root, notes_payload) in enumerate(slide_data, start=1):
+    for n, (name, root, notes_payload, picture_fills, inherited) in enumerate(slide_data, start=1):
         sid = f"slide:{n}"
         is_hidden_slide = name in hidden_names
         elements.append(document_ir.Element(
@@ -431,7 +446,7 @@ def _build_pptx_ir(p: Path) -> document_ir.DocumentIR | None:
             source_map={"slide": n, "part": name}, extraction=extraction))
 
         if root is not None:
-            entries = pptx_ooxml.slide_shapes(root)
+            entries = pptx_ooxml.slide_shapes(root, picture_fills, inherited)
             # ① このスライド内でテキストを持つ shape へ先に element_id/order を割り当てる（`covered_by_text` は z順で後に処理される前面 shape の element_id を参照するため、組み立て前に採番だけ済ませる）。
             entry_ids: dict[int, str] = {}
             entry_order: dict[int, int] = {}
@@ -459,8 +474,11 @@ def _build_pptx_ir(p: Path) -> document_ir.DocumentIR | None:
                         if not other["occluder"] or other["bbox"] is None:
                             continue
                         if office_md._bbox_intersection_ratio(bbox, other["bbox"]) >= office_md._OCCLUSION_RATIO:
-                            return "hidden", "occluded", {
+                            occluded_by = {
                                 "kind": "picture" if other["kind"] == "pic" else "solid_shape", "z_index": j}
+                            if other["shape_id"] is not None:
+                                occluded_by["shape_id"] = other["shape_id"]
+                            return "hidden", "occluded", occluded_by
                 return "visible", None, None
 
             states = {i: _own_state(i, e) for i, e in enumerate(entries) if e["has_text"]}
@@ -470,6 +488,9 @@ def _build_pptx_ir(p: Path) -> document_ir.DocumentIR | None:
                     continue
                 text = "\n".join(entry["texts"])
                 sm: dict = {"slide": n, "z_index": i}
+                if entry["shape_id"] is not None:
+                    sm["shape_id"] = entry["shape_id"]
+                sm["shape_name"] = entry["name"]
                 if entry["group"]:
                     sm["group"] = True
                 elif entry["bbox"] is not None:
@@ -480,10 +501,21 @@ def _build_pptx_ir(p: Path) -> document_ir.DocumentIR | None:
                 if occluded_by is not None:
                     sm["occluded_by"] = occluded_by
                 bbox = entry["bbox"]
+                if bbox is not None:
+                    fronts = [
+                        {"z_index": j, "shape_id": other["shape_id"], "fill": other["fill"],
+                         "covers_bbox": other.get("covers_bbox", True)}
+                        for j in range(i + 1, len(entries))
+                        for other in [entries[j]]
+                        if other["fill"] is not None and other["bbox"] is not None and other["shape_id"] is not None
+                        and (not other["has_text"] or states[j][0] == "visible")  # 自身が隠れている前面文字は覆わない
+                        and office_md._bbox_intersection_ratio(bbox, other["bbox"]) >= office_md._OCCLUSION_RATIO]
+                    if fronts:
+                        sm["fronts"] = fronts
                 if visibility == "visible" and bbox is not None:
                     for j in range(i + 1, len(entries)):
                         other = entries[j]
-                        if not other["has_text"] or other["bbox"] is None:
+                        if other["fill"] != observation_vocab.FILL_NONE_WITH_TEXT or other["bbox"] is None:
                             continue
                         if states[j][0] != "visible":  # 自身が隠れている前面文字は参照しない
                             continue
@@ -632,7 +664,7 @@ def _build_xlsx_ir(p: Path) -> document_ir.DocumentIR | None:
       - `named_range:N`: `text=<参照先文字列>`・`source_map={"name", "scope": "workbook"|<シート名>}`。`excel.defined_names()` の順。
       - `comment:N`: `text=<コメント本文>`・`source_map={"sheet", "cell", "author"}`。
       - `hyperlink:N`: `text=<セル表示値>`・`source_map={"sheet", "cell", "target"}`。
-      - `strike:N`: `visibility="visible"`／`status="active"`（取り消し線は可視性を変えない）。`text=<セル表示値>`・`source_map={"sheet", "cell"}`。値の無いセルは出さない（`excel.strike_cells()`）。`evidence_spike._adapt_document_ir` が同じ `(sheet, cell)` の `cell` 要素にも `extension["visibility_reason"]="strike"` を反映する。
+      - `strike:N`: `visibility="visible"`／`status="active"`（取り消し線は可視性を変えない）。`text=<セル表示値>`・`source_map={"sheet", "cell", "format_state": {"strike": "whole"}}`。値の無いセルは出さない（`excel.strike_cells()`）。`evidence_spike._adapt_document_ir` が同じ `(sheet, cell)` の `cell` 要素にも `extension["format_state"]` を反映する。
       - `external_link:N`: `text=None`・`source_map={"target": <zip 内 rels の Target>}`。`excel.external_link_targets()` の順。
 
     要素リストの並び: `external_link:*` → `named_range:*` →（シート順に）`sheet:N` とその `table:*`/`formula:*`/`comment:*`/`hyperlink:*`/`strike:*`。
@@ -814,7 +846,8 @@ def _build_xlsx_ir(p: Path) -> document_ir.DocumentIR | None:
                     element_id=f"strike:{strike_seq}", type="strike_text", parent_id=None,
                     order=strike_seq, visibility="visible", status="active",
                     text=sk["text"], cells=None,
-                    source_map={"sheet": name, "cell": sk["cell"]},
+                    source_map={"sheet": name, "cell": sk["cell"],
+                                "format_state": observation_vocab.whole_strike_state()},
                     extraction=extraction))
 
         return document_ir.DocumentIR(schema_version=document_ir.DOCUMENT_IR_SCHEMA_VERSION, doc_id="",

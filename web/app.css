@@ -187,6 +187,7 @@ tr.hideRow{display:none}
 .cite{padding:9px 11px;border:1px solid var(--border);border-radius:8px;margin-bottom:7px}
 .cite .doc{font-weight:600}
 .cite .span{font-size:var(--text-caption);color:var(--ink-3);margin-left:6px}
+.cite-prov{font-size:var(--text-caption);margin-right:8px}.cite .cite-prov{margin-left:6px}
 .cite pre{white-space:pre-wrap;font-size:var(--text-caption);color:var(--ink);background:var(--surface-2);border-radius:6px;padding:8px;margin:6px 0 0}
 
 /* 取り込みパイプライン表 */

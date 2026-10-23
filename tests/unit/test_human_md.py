@@ -572,3 +572,171 @@ def test_render_docx_table_flags_produce_notes():
     assert md is not None
     assert "結合/列の指定が異常に大きかった" in md
     assert "継続セルに本文があった" in md
+
+
+# ---- docx: テキストボックスはホストの直後に別の行として出す ----
+
+_DOCX_NS = ('xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:v="urn:schemas-microsoft-com:vml"')
+
+
+def _docx_md(tmp_path, body: str) -> str:
+    import zipfile
+
+    from sherpa.ingest.arms import ooxml_arm
+
+    path = tmp_path / "架空.docx"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("word/document.xml",
+                   f'<?xml version="1.0"?><w:document {_DOCX_NS}><w:body>{body}</w:body></w:document>')
+    ir = ooxml_arm._build_docx_ir(path)
+    assert ir is not None
+    md = human_md.render_docx(ir)
+    assert md is not None
+    return md
+
+
+def _box(text: str) -> str:
+    return (f"<w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
+            "</w:txbxContent></v:textbox></v:shape></w:pict></w:r>")
+
+
+def test_render_docx_textbox_in_paragraph_is_separate_line_after_host(tmp_path):
+    md = _docx_md(tmp_path, f"<w:p><w:r><w:t>本文A。</w:t></w:r>{_box('箱B。')}</w:p>"
+                            "<w:p><w:r><w:t>次の段落。</w:t></w:r></w:p>")
+    assert md == "本文A。\n\n（テキストボックス）箱B。\n\n次の段落。"
+
+
+def test_render_docx_textbox_in_table_cell_follows_the_table_with_position(tmp_path):
+    md = _docx_md(tmp_path, (
+        f"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>セルC</w:t></w:r>{_box('セル箱D')}</w:p></w:tc></w:tr></w:tbl>"
+        "<w:p><w:r><w:t>表の後。</w:t></w:r></w:p>"))
+    assert "セルC" in md and "セル箱D" in md
+    assert "（テキストボックス・1行1列）セル箱D" in md
+    assert md.index("セルC") < md.index("セル箱D") < md.index("表の後。")
+    assert "セルC セル箱D" not in md and "セルCセル箱D" not in md
+
+
+def test_render_docx_nested_table_textbox_follows_the_nested_table(tmp_path):
+    nested = f"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>内セル</w:t></w:r>{_box('内箱')}</w:p></w:tc></w:tr></w:tbl>"
+    md = _docx_md(tmp_path, (
+        f"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>外セル</w:t></w:r>{_box('外箱')}</w:p>{nested}</w:tc></w:tr></w:tbl>"))
+    assert md.index("外セル") < md.index("外箱") < md.index("#### ネスト表") < md.index("内セル") < md.index("内箱")
+
+
+def test_render_docx_same_text_textboxes_are_not_merged(tmp_path):
+    md = _docx_md(tmp_path, f"<w:p><w:r><w:t>本文。</w:t></w:r>{_box('同じ箱')}{_box('同じ箱')}</w:p>")
+    assert md.count("（テキストボックス）同じ箱") == 2
+
+
+def test_render_docx_textbox_keeps_state_marks_in_text(tmp_path):
+    body = ('<w:p><w:r><w:t>本文。</w:t></w:r><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p>'
+            '<w:r><w:t>前</w:t></w:r><w:r><w:rPr><w:strike/></w:rPr><w:t>旧</w:t></w:r>'
+            '</w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>')
+    assert "（テキストボックス）前【取り消し線：旧】" in _docx_md(tmp_path, body)
+
+
+def test_render_docx_without_textbox_is_unchanged_and_has_no_version_string(tmp_path):
+    md = _docx_md(tmp_path, (
+        '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>題</w:t></w:r></w:p>'
+        "<w:p><w:r><w:t>本文。</w:t></w:r></w:p>"
+        "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>セル</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>セル2</w:t></w:r></w:p></w:tc></w:tr>"
+        "<w:tr><w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"))
+    assert md == "# 題\n\n本文。\n\n| セル | セル2 |\n| a | b |"
+    assert human_md.HUMAN_MD_RENDERER_VERSION not in md
+
+
+def _textbox_element(element_id, parent_id, text, source_map=None) -> document_ir.Element:
+    return document_ir.Element(
+        element_id=element_id, type="textbox", parent_id=parent_id, order=1,
+        visibility="visible", status="active", text=text, cells=None,
+        source_map=source_map or {}, extraction=_EXTRACTION)
+
+
+def _docx_ir(elements) -> document_ir.DocumentIR:
+    return document_ir.DocumentIR(
+        schema_version=document_ir.DOCUMENT_IR_SCHEMA_VERSION, doc_id="x.docx",
+        source=document_ir.Source(path="x.docx", content_hash="sha256:0", file_type="docx"),
+        elements=elements)
+
+
+def test_render_docx_textbox_lines_count_in_omitted_when_budget_runs_out(monkeypatch):
+    """予算切れで出せなかったテキストボックスの行も「以降 N 要素を省略」に数える。"""
+    monkeypatch.setattr(human_md, "_MAX_HUMAN_MD_BYTES", 1024 + 90)
+    para = document_ir.Element(
+        element_id="para:1", type="paragraph", parent_id=None, order=1,
+        visibility="visible", status="active", text="本文は短い。", cells=None,
+        source_map={}, extraction=_EXTRACTION)
+    boxes = [_textbox_element(f"textbox:{i}", "para:1", f"箱{i}の本文はそこそこ長い文章です" * 2) for i in range(1, 6)]
+    md = human_md.render_docx(_docx_ir([para, *boxes]))
+    assert md is not None
+    shown = md.count("（テキストボックス）")
+    assert 0 < shown < 5
+    assert f"以降 {5 - shown} 要素を省略" in md
+
+
+def test_render_docx_omitted_host_counts_its_textboxes(monkeypatch):
+    """ホストの段落ごと省略されるときは、その段落のテキストボックスも数える。"""
+    monkeypatch.setattr(human_md, "_MAX_HUMAN_MD_BYTES", 70)
+    first = document_ir.Element(
+        element_id="para:1", type="paragraph", parent_id=None, order=1,
+        visibility="visible", status="active", text="先頭の本文", cells=None,
+        source_map={}, extraction=_EXTRACTION)
+    second = document_ir.Element(
+        element_id="para:2", type="paragraph", parent_id=None, order=2,
+        visibility="visible", status="active", text="二つ目の本文はとても長い文章です" * 3, cells=None,
+        source_map={}, extraction=_EXTRACTION)
+    md = human_md.render_docx(_docx_ir([
+        first, second, _textbox_element("textbox:1", "para:2", "箱1"), _textbox_element("textbox:2", "para:2", "箱2")]))
+    assert md is not None
+    assert "先頭の本文" in md and "二つ目" not in md
+    assert "以降 3 要素を省略" in md
+
+
+def test_render_docx_textbox_in_empty_paragraph_is_placed_between_neighbours(tmp_path):
+    """本文の無い段落にあるテキストボックス（ホストが無い）も、原本の位置の順で出る。"""
+    md = _docx_md(tmp_path, (
+        "<w:p><w:r><w:t>前の段落。</w:t></w:r></w:p>"
+        f"<w:p>{_box('空段落の箱')}</w:p>"
+        "<w:p><w:r><w:t>後の段落。</w:t></w:r></w:p>"))
+    assert md == "前の段落。\n\n（テキストボックス）空段落の箱\n\n後の段落。"
+
+
+def test_render_docx_textbox_in_empty_paragraph_after_table_stays_after_the_table(tmp_path):
+    """本文の無い段落が表の後ろにあれば、そのテキストボックスは表の直後に出る（表の前へ移らない）。"""
+    md = _docx_md(tmp_path, (
+        "<w:p><w:r><w:t>前の段落。</w:t></w:r></w:p>"
+        "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>セル</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+        f"<w:p>{_box('表の後の箱')}</w:p>"
+        "<w:p><w:r><w:t>後の段落。</w:t></w:r></w:p>"))
+    assert md.index("| セル |") < md.index("（テキストボックス）表の後の箱") < md.index("後の段落。")
+
+
+def test_render_docx_textbox_only_document_still_has_human_md(tmp_path):
+    """本文の段落が無く、空段落のテキストボックスだけの文書でも、人用 MD を作ってその文字を出す。"""
+    md = _docx_md(tmp_path, f"<w:p>{_box('箱だけの本文')}</w:p>")
+    assert md == "（テキストボックス）箱だけの本文"
+
+
+def test_render_docx_textbox_in_leading_empty_paragraph_comes_first(tmp_path):
+    md = _docx_md(tmp_path, (
+        f"<w:p>{_box('先頭の箱')}</w:p>"
+        "<w:p><w:r><w:t>本文。</w:t></w:r></w:p>"))
+    assert md == "（テキストボックス）先頭の箱\n\n本文。"
+
+
+def test_render_docx_orphan_textbox_lines_count_in_omitted_when_budget_runs_out(monkeypatch):
+    monkeypatch.setattr(human_md, "_MAX_HUMAN_MD_BYTES", 70)
+    first = document_ir.Element(
+        element_id="para:1", type="paragraph", parent_id=None, order=1,
+        visibility="visible", status="active", text="先頭の本文", cells=None,
+        source_map={"paragraph_index": 0}, extraction=_EXTRACTION)
+    second = document_ir.Element(
+        element_id="para:2", type="paragraph", parent_id=None, order=2,
+        visibility="visible", status="active", text="二つ目の本文はとても長い文章です" * 3, cells=None,
+        source_map={"paragraph_index": 2}, extraction=_EXTRACTION)
+    orphan = _textbox_element("textbox:1", None, "空段落の箱", {"paragraph_index": 3, "after_body_order": 2})
+    md = human_md.render_docx(_docx_ir([first, second, orphan]))
+    assert md is not None
+    assert "先頭の本文" in md and "二つ目" not in md and "空段落の箱" not in md
+    assert "以降 2 要素を省略" in md

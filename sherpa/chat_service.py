@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from . import agent_constructs, agentic_search, answer_shape, app_version, exec_event, intent_llm, scope, store, text_encoding, worlds
+from . import agent_constructs, agentic_search, answer_shape, app_version, citations, documents, exec_event, intent_llm, scope, store, text_encoding, worlds
 from . import depth_profile as depth_profile_mod
 from . import investigation_state as investigation_state_mod
 from . import layer as layer_mod
@@ -427,13 +427,16 @@ def _known_terms(session, world) -> list:
     return [r["name"] for r in rows if r["name"]]
 
 
-def _src_url(doc: str, world: str, res: "importance.Resolution | None" = None) -> dict:
+def _src_url(doc: str, world: str, res: "importance.Resolution | None" = None, modified_at: str | None = None) -> dict:
     """出典 1 件 → 原本 DL リンク（doc は rel_path で slash を含むため query で渡す）。
-    `res`（省略可）: 登録者が `_重要度.txt` で付けた重要度の解決結果。あれば `importance`/`importance_reason` を追加する（`importance_source` は出さない）。無ければ従来どおり 2 キーのまま。
+    `res`（省略可）: 登録者が `_重要度.txt` で付けた重要度の解決結果。あれば `importance`/`importance_reason` を追加する（`importance_source` は出さない）。
+    資料フォルダ直下のフォルダ（世代）は doc から、原本の更新時刻は `modified_at`（省略可）から `generation`/`modified_at` として足す（取れた欄だけ）。
     """
-    return {"doc_id": doc,
-            "download_url": f"/documents/download?world={quote(world)}&rel={quote(doc, safe='')}",
-            **importance.public_fields(res)}
+    return citations.with_provenance(
+        {"doc_id": doc,
+         "download_url": f"/documents/download?world={quote(world)}&rel={quote(doc, safe='')}",
+         **importance.public_fields(res)},
+        modified_at)
 
 
 def _sources(docs, world) -> list:
@@ -454,7 +457,8 @@ def _sources(docs, world) -> list:
         except Exception:
             sig = None
     res_map = importance.resolve_many(world, filtered, root=wd, sig=sig) if wd else {}
-    return [_src_url(d, world, res_map.get(d)) for d in filtered]
+    stamps = documents.modified_at_map(world, filtered) if wd else {}  # 資料ごとの原本の更新時刻（資料フォルダ全体の取り込み時刻ではない）
+    return [_src_url(d, world, res_map.get(d), stamps.get(d)) for d in filtered]
 
 
 def _redact(text: str) -> str:
@@ -524,6 +528,8 @@ def _answer_qa(result, world):
     headline = ("該当する記述は見つかりませんでした（確証なし）。検索語を変えて試してください。"
                 if not cites else f"該当箇所が {len(cites)}件見つかりました。")
     headline += _truncation_headline_suffix(result)
+    stamps = documents.modified_at_map(world, [c["doc_id"] for c in cites if c.get("doc_id")])
+    result = {**result, "citations": [citations.with_provenance(c, stamps.get(c.get("doc_id"))) for c in cites]}
     return {"headline": headline, "summary": {"total": len(cites)},
             "data": result, "sources": _sources([c["doc_id"] for c in cites], world)}
 
@@ -579,7 +585,7 @@ def _es_citations(world, query, sp, k=8, layer=None):
     """ES（BM25）上位ヒットを citation 形にする（Codex/非 agentic も ES を参照できるよう facts に混ぜる）。
     `rag_parent_return` で本文の完全性を上げたうえで、`excerpts.display_quote` で quote を人間向け MD の該当節へ引き直す。ES ヒットの選定自体は変えず、返す直前の後処理のみ。
     """
-    from . import citations, excerpts, rag_parent_return
+    from . import excerpts, rag_parent_return
     hits = rag_parent_return.apply_to_hits(world, _es_hits(world, query, sp, k=k, layer=layer))
     out = []
     for h in hits:
@@ -594,7 +600,6 @@ def _es_citations(world, query, sp, k=8, layer=None):
 
 def _merge_qa_with_es(result, world, query, sp, layer=None):
     """`run_qa`(grep) の citations に ES ヒットを統合する。grep↔ES を交互に並べて（先頭付近に ES も入れる）doc_id+span で重複排除する。`layer` は qa の ES 補完にのみ渡す（troubleshoot 補完は `_merge_troubleshoot_with_es` が layer 無しで呼ぶ）。"""
-    from . import citations
     grep = list(result.get("citations", []))
     es = _es_citations(world, query, sp, layer=layer)
     merged = citations.dedupe_round_robin_by_doc_span(grep, es)  # round-robin で先頭付近に ES も来る

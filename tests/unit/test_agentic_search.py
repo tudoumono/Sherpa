@@ -899,7 +899,7 @@ def _read_around_run_tool_script(doc_lines: int, center_line: int, window_arg: i
         args_literal += f", 'window': {window_arg}"
     return (
         "import json, os, tempfile\n"
-        "tmp = tempfile.mkdtemp()\n"
+        "tmp = os.path.realpath(tempfile.mkdtemp())\n"  # macOS の /var→/private/var のリンクで資料フォルダの外と判定されないよう実パスにする
         "wd = os.path.join(tmp, 'kb', 'freshworld')\n"
         "os.makedirs(wd, exist_ok=True)\n"
         f"content = chr(10).join(f'line {{i}}' for i in range(1, {doc_lines + 1}))\n"
@@ -2265,3 +2265,142 @@ def test_parent_return_marks_unfetched_parent_chunks_as_partial(monkeypatch, tmp
         chunk_ids=lambda w, doc_id, parent_ids, limit=5000: [])
     entry = res["hits"][0]
     assert entry["parent_chunks_unfetched"] is True and entry["fragment"] is True and entry["text_truncated"] is True
+
+
+# ===== 親返しが chunk に縮退したときの行の束の本文・取り込み時点の印 =====
+
+_GROUP_TAIL = "ただし検収日が月末を過ぎた場合は翌月の締めに回す（承認者の決裁が必要）"
+
+
+def _row_group_world(group_body_pad: str = ""):
+    """行の束 g1・g2（rag.md に完全な本文）と、領域を予算超過にする pad1 を持つ rag.md、束のヒット。"""
+    md = ("<!-- chunk:g1 -->\n条件A: 検収日が当月末までの場合は当月の締めに計上する" + group_body_pad + "\n\n"
+          "<!-- chunk:g2 -->\n条件B: " + _GROUP_TAIL + group_body_pad + "\n\n"
+          "<!-- chunk:pad1 -->\n" + "P" * 5000 + "\n")
+    short = "列: 条件\n条件A: 検収日が当月末までの"  # vector_text を値 32 字で切った形（後半の値は入らない）
+    hit = _chunk_hit("terms.xlsx", "g1", "p1", 1.0, short, ".xlsx", row_group_chunk_ids=["g1", "g2"])
+    return md, hit
+
+
+def test_parent_return_chunk_tier_row_group_returns_full_rag_md_body(monkeypatch, tmp_path):
+    """束のヒットが tier=chunk に縮退しても、切った vector_text でなく rag.md の完全な本文（32 字より後ろの値）を返す。秘匿値は伏せる。"""
+    md, hit = _row_group_world()
+    md = md.replace(_GROUP_TAIL, _GROUP_TAIL + " token=sk-1234567890ABCDEFGHIJ")
+    res, _ = _run_parent_return(monkeypatch, tmp_path, [hit], {"terms.xlsx": md}, 4000,
+                                chunk_ids=lambda w, doc_id, parent_ids, limit=5000: ["g1", "g2", "pad1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk"
+    assert _GROUP_TAIL in entry["text"] and "条件B" in entry["text"]
+    assert "sk-1234567890ABCDEFGHIJ" not in entry["text"] and "[REDACTED]" in entry["text"]
+    assert "row_group_text_cut" not in entry and "ingest_time_text" not in entry
+
+
+def test_parent_return_chunk_tier_row_group_over_budget_marks_cut_and_how_to_read(monkeypatch, tmp_path):
+    """束の完全な本文が予算に入らないときは、切った文字のまま省いた印と続きの読み方（read_around／read_doc）を返す。"""
+    md, hit = _row_group_world("あ" * 400)
+    res, _ = _run_parent_return(monkeypatch, tmp_path, [hit], {"terms.xlsx": md}, 1000,
+                                chunk_ids=lambda w, doc_id, parent_ids, limit=5000: ["g1", "g2", "pad1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and _GROUP_TAIL not in entry["text"]
+    assert entry["row_group_text_cut"]["chunks"] == ["g1"]
+    assert "read_around" in entry["row_group_text_cut"]["read_more"] and "read_doc" in entry["row_group_text_cut"]["read_more"]
+    assert entry["text_truncated"] is True and res["text_truncated"] is True
+
+
+def test_parent_return_chunk_tier_marks_ingest_time_text_when_chunk_missing_from_rag_md(monkeypatch, tmp_path):
+    """ES のヒットの chunk_id が今の rag.md に無く ES の本文を返すしかないとき、取り込み時点の内容である印を本文と結果に付ける。"""
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "old1", "p1", 1.0, "古い本文")],
+        {"a.docx": "<!-- chunk:new1 -->\n作り直し後の本文\n"}, 5000, chunk_ids=["old1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and entry["text"].startswith("古い本文") and "取り込み時点" in entry["text"]
+    assert entry["ingest_time_text"] == {"chunks": ["old1"]}
+
+
+def test_parent_return_chunk_tier_read_cut_rag_md_does_not_mark_ingest_time_text(monkeypatch, tmp_path):
+    """rag.md の読込が上限で打ち切られ chunk_id を見つけられなかったときは「無い」と言えないので、取り込み時点の印を付けない（読めなかった印は text_truncated）。最後まで読めて無いときは付く。"""
+    rag_md = "<!-- chunk:new1 -->\n作り直し後の本文\n" + "余白の行\n" * 400
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 512)
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "old1", "p1", 1.0, "古い本文")],
+        {"a.docx": rag_md}, 5000, chunk_ids=["old1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and entry["text"] == "古い本文"
+    assert "ingest_time_text" not in entry and entry["text_truncated"] is True
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024)
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "old1", "p1", 1.0, "古い本文")],
+        {"a.docx": rag_md}, 5000, chunk_ids=["old1"])
+    assert res["hits"][0]["ingest_time_text"] == {"chunks": ["old1"]}
+
+
+def test_parent_return_chunk_tier_row_group_read_cut_does_not_mark_ingest_time_text(monkeypatch, tmp_path):
+    """束の構成の chunk_id を探す途中で読込が打ち切られたときも、取り込み時点の印を付けない。"""
+    _md, hit = _row_group_world()
+    hit["row_group_chunk_ids"] = ["gone1", "gone2"]
+    md = "<!-- chunk:other1 -->\n" + "P" * 5000 + "\n"
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 512)
+    res, _ = _run_parent_return(monkeypatch, tmp_path, [hit], {"terms.xlsx": md}, 4000,
+                                chunk_ids=lambda w, doc_id, parent_ids, limit=5000: ["g1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and "ingest_time_text" not in entry and "取り込み時点" not in entry["text"]
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024)
+    res, _ = _run_parent_return(monkeypatch, tmp_path, [hit], {"terms.xlsx": md}, 4000,
+                                chunk_ids=lambda w, doc_id, parent_ids, limit=5000: ["g1"])
+    assert res["hits"][0]["ingest_time_text"] == {"chunks": ["g1"]}
+
+
+def test_parent_return_chunk_tier_row_group_missing_from_rag_md_keeps_es_text_with_ingest_mark(monkeypatch, tmp_path):
+    """束の構成の chunk_id が今の rag.md に無いときも、ES の本文（切った文字）に取り込み時点の印を付ける。"""
+    md, hit = _row_group_world()
+    hit["row_group_chunk_ids"] = ["gone1", "gone2"]
+    res, _ = _run_parent_return(monkeypatch, tmp_path, [hit], {"terms.xlsx": md}, 4000,
+                                chunk_ids=lambda w, doc_id, parent_ids, limit=5000: ["g1", "g2", "pad1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and _GROUP_TAIL not in entry["text"] and "取り込み時点" in entry["text"]
+    assert entry["ingest_time_text"] == {"chunks": ["g1"]}
+
+
+def test_parent_return_read_cut_mid_last_chunk_does_not_return_partial_body_as_complete(monkeypatch, tmp_path):
+    """rag.md の読込が最後のチャンクの途中で上限に当たったとき、途中までの本文を完全な本文として返さず、text_truncated を立てる。上限に当たらなければ従来どおり領域を返す。"""
+    tail = "余白の行\n" * 400
+    single_md = "<!-- chunk:c1 -->\n先頭の行\n" + tail
+    two_md = "<!-- chunk:c0 -->\n前のチャンクの本文\n\n<!-- chunk:c1 -->\n先頭の行\n" + tail
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 600)
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "c1", "p1", 1.0, "検索用の本文")],
+        {"a.docx": single_md}, 262144, chunk_ids=["c1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and entry["text"] == "検索用の本文"  # 途中までの本文は領域として返さない
+    assert entry["text_truncated"] is True and "ingest_time_text" not in entry and res["text_truncated"] is True
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "c1", "p1", 1.0, "検索用の本文")],
+        {"a.docx": two_md}, 262144, chunk_ids=["c0", "c1"])
+    entry = res["hits"][0]
+    assert "前のチャンクの本文" in entry["text"] and "余白の行" not in entry["text"]  # 読み切れたチャンクだけ
+    assert entry["text_truncated"] is True and entry["region_missing_chunks"] == 1
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024)
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "c1", "p1", 1.0, "検索用の本文")],
+        {"a.docx": two_md}, 262144, chunk_ids=["c0", "c1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "region" and entry["text"].count("余白の行") == 400
+    assert "text_truncated" not in entry and "region_missing_chunks" not in entry
+
+
+def test_parent_return_carries_row_group_exact_chunk_ids_to_es_search_result(monkeypatch, tmp_path):
+    """束の中間の行の識別子で exact と意味検索を併用して当たったとき、親返しの entry に exact で一致した行の chunk_id を重複なしで出す。"""
+    md = ("<!-- chunk:g1 -->\n行1\n\n<!-- chunk:g2 -->\n行2\n\n<!-- chunk:g3 -->\n行3\n")
+    hit1 = _chunk_hit("terms.xlsx", "g1", "p1", 2.0, "行1", ".xlsx",
+                      row_group_chunk_ids=["g1", "g2", "g3"], row_group_exact_chunk_ids=["g2"])
+    hit2 = _chunk_hit("terms.xlsx", "g3", "p1", 1.0, "行3", ".xlsx",
+                      row_group_chunk_ids=["g3"], row_group_exact_chunk_ids=["g2", "g3"])
+    _prepare_parent_return(monkeypatch, tmp_path, [hit1, hit2], {"terms.xlsx": md}, 262144,
+                           chunk_ids=["g1", "g2", "g3"])
+    monkeypatch.setattr(A.es_index, "search_knn_only",
+                        lambda w, q, scope_paths=None, k=20, layer=None, **kw: (
+                            [hit1, hit2] if kw.get("exact") == ["行2の識別子"] else [], None))
+    res, *_ = TD.run_tool("es_search", {"query": "q", "mode": "vector", "exact": ["行2の識別子"]},
+                          "parent-return-world", None)
+    assert res["mode_used"] == "vector"
+    assert res["hits"][0]["row_group_exact_chunk_ids"] == ["g2", "g3"]

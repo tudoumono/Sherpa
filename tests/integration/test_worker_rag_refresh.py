@@ -510,9 +510,9 @@ def test_render_covers_all_evidence_ir_values(tmp_path):
     """Evidence IR の値付き element が citation されること・値が chunk body に実在することを
     ID一致だけでなく本文レベルでも検証する。"""
     _, dmd = _build_world(tmp_path)
-    ir = IR.from_json_str((_ir(dmd) / "a.xlsx.evidence.json").read_text(encoding="utf-8"))
+    ir = IR.from_json_str(json_io.read_text_maybe_gzip(_ir(dmd) / "a.xlsx.evidence.json"))
     chunks = [json.loads(line) for line in
-              (_rag(dmd) / "a.xlsx.rag_chunks.jsonl").read_text(encoding="utf-8").splitlines()]
+              json_io.read_text_maybe_gzip(_rag(dmd) / "a.xlsx.rag_chunks.jsonl").splitlines()]
 
     cited_ids = {citation["evidence_id"] for chunk in chunks for citation in chunk["citations"]}
     value_element_ids = {el.element_id for el in ir.elements if _value_text(el.value)}
@@ -531,7 +531,7 @@ def test_render_value_lands_in_specific_chunk_with_expected_source_line(tmp_path
     索引本文は jsonl の`search_text`ではなくrag.mdのアンカーから取る（`es_index._parse_rag_md_chunks`）。"""
     _, dmd = _build_world(tmp_path)
     chunks = [json.loads(line) for line in
-              (_rag(dmd) / "a.xlsx.rag_chunks.jsonl").read_text(encoding="utf-8").splitlines()]
+              json_io.read_text_maybe_gzip(_rag(dmd) / "a.xlsx.rag_chunks.jsonl").splitlines()]
     assert all("search_text" not in c for c in chunks)   # D1: jsonlはもう索引本文を持たない
     rag_md_bodies, anchor_reason = es_index._parse_rag_md_chunks(
         (_rag(dmd) / "a.xlsx.rag.md").read_text(encoding="utf-8"))

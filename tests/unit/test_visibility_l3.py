@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import pathlib
 import re
 import tempfile
@@ -22,6 +23,7 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
 from openpyxl.styles import Font
 
+import _image_builders
 from sherpa.ingest import document_ir, evidence_ir, evidence_render, evidence_spike, office_md
 from sherpa.ingest.arms import ooxml_arm
 from sherpa.ingest.ooxml import excel, word
@@ -83,7 +85,7 @@ def _sp_drawing_xml(*, solid_fill: bool) -> str:
   <xdr:to><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
   <xdr:sp>
    <xdr:nvSpPr><xdr:cNvPr id="1" name="覆い図形"/><xdr:cNvSpPr/></xdr:nvSpPr>
-   <xdr:spPr>{fill}</xdr:spPr>
+   <xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>{fill}</xdr:spPr>
   </xdr:sp>
   <xdr:clientData/>
  </xdr:twoCellAnchor>
@@ -92,9 +94,7 @@ def _sp_drawing_xml(*, solid_fill: bool) -> str:
 
 # ---- xlsx: 図形/画像による覆い（occlusion） ----
 
-def test_xlsx_picture_occludes_covered_cells_with_real_stamp_asset(tmp_path):
-    """`廃止スタンプ.png`（実アセット）がセル範囲を覆うと、そのセルが hidden になり前面画像情報が残る。"""
-    assert _STAMP_ASSET.exists(), "廃止スタンプ.png fixture asset is missing"
+def _stamp_xlsx(tmp_path, image_path: pathlib.Path) -> pathlib.Path:
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "一覧"
@@ -102,7 +102,7 @@ def test_xlsx_picture_occludes_covered_cells_with_real_stamp_asset(tmp_path):
     ws["A2"] = "廃止された値"
     ws["B2"] = "廃止された値2"
     ws["C2"] = "覆われない値"
-    img = XLImage(str(_STAMP_ASSET))
+    img = XLImage(str(image_path))
     img.anchor = TwoCellAnchor(
         editAs="oneCell",
         _from=AnchorMarker(col=0, colOff=0, row=1, rowOff=0),
@@ -111,6 +111,14 @@ def test_xlsx_picture_occludes_covered_cells_with_real_stamp_asset(tmp_path):
     ws.add_image(img)
     p = tmp_path / "stamp.xlsx"
     wb.save(p)
+    return p
+
+
+def test_xlsx_opaque_picture_occludes_covered_cells(tmp_path):
+    """不透明な画像がセル範囲を覆うと、そのセルが hidden になり前面画像情報が残る。"""
+    image = tmp_path / "opaque.png"
+    image.write_bytes(_image_builders.opaque_png())
+    p = _stamp_xlsx(tmp_path, image)
 
     ir = evidence_spike.extract(p)
     assert evidence_ir.validation_errors(ir) == []
@@ -131,6 +139,25 @@ def test_xlsx_picture_occludes_covered_cells_with_real_stamp_asset(tmp_path):
 
     uncovered_a1 = cells_by_range["A1"]
     assert uncovered_a1.visibility == "visible"
+
+
+def test_xlsx_transparent_stamp_asset_overlaps_but_does_not_hide_cells(tmp_path):
+    """透過を含む画素のある実アセット（`廃止スタンプ.png`・RGBA）は覆いを確定させない（未確定）。重なり・covers（塗りの区分つき）は残る。"""
+    assert _STAMP_ASSET.exists(), "廃止スタンプ.png fixture asset is missing"
+    ir = evidence_spike.extract(_stamp_xlsx(tmp_path, _STAMP_ASSET))
+    cells_by_range = {el.locator.cell_range: el for el in ir.elements if el.type == "cell"}
+    picture = next(el for el in ir.elements if el.type == "picture")
+
+    for address in ("A2", "B2"):
+        cell = cells_by_range[address]
+        assert cell.visibility == "visible"
+        assert "visibility_reason" not in cell.extension and "occluded_by" not in cell.extension
+        assert any(r.type == "overlaps" and r.source_id == picture.element_id and r.target_id == cell.element_id
+                   for r in ir.relations)
+        (cover,) = [r for r in ir.relations
+                    if r.type == "covers" and r.source_id == picture.element_id and r.target_id == cell.element_id]
+        assert cover.extension["fill"] == "transparent_png"
+        assert cover.extension["occlusion"] == "undetermined"
 
 
 def test_xlsx_solid_fill_shape_occludes_cell(tmp_path):
@@ -194,7 +221,8 @@ def test_xlsx_strike_cells_become_strike_text_elements(tmp_path):
     assert strikes[0].text == "廃止された項目"
     assert strikes[0].visibility == "visible"          # 取り消し線は可視性を変えない幾何的事実
     assert strikes[0].status == "active"
-    assert strikes[0].source_map == {"sheet": "一覧", "cell": "A2"}
+    assert strikes[0].source_map == {"sheet": "一覧", "cell": "A2", "format_state": {"strike": "whole"}}
+    assert strikes[0].visibility_reason is None        # 取り消し線は可視性の理由ではなく書式の状態
 
     ir = evidence_spike.extract(p, legacy_ir=document)
     assert evidence_ir.validation_errors(ir) == []
@@ -204,7 +232,10 @@ def test_xlsx_strike_cells_become_strike_text_elements(tmp_path):
     # 独立要素だけでなく、対応する cell 要素自身にも構造的に反映される（`_field_piece` は cell を読む）。
     ev_cell = next(el for el in ir.elements if el.type == "cell" and el.locator.cell_range == "A2")
     assert ev_cell.visibility == "visible"              # 取り消し線は本文が読める状態のまま
-    assert ev_cell.extension["visibility_reason"] == "strike"
+    assert ev_cell.extension["format_state"] == {"strike": "whole"}
+    assert "visibility_reason" not in ev_cell.extension or ev_cell.extension["visibility_reason"] is None
+    assert ev_strike.extension["format_state"] == {"strike": "whole"}
+    assert ev_strike.extension.get("visibility_reason") is None
 
 
 def test_xlsx_hidden_row_marks_cell_hidden(tmp_path):
@@ -283,7 +314,8 @@ def test_docx_strike_runs_flow_to_evidence_ir_and_stay_visible(tmp_path):
     assert len(strike_els) == 1
     assert strike_els[0].text == "取り消し線本文"
     assert strike_els[0].visibility == "visible"
-    assert strike_els[0].visibility_reason == "strike"
+    assert strike_els[0].visibility_reason is None
+    assert strike_els[0].source_map["format_state"] == {"strike": "whole"}
     assert strike_els[0].status == "active"
 
     ir = evidence_spike.extract(p, legacy_ir=document)
@@ -291,7 +323,8 @@ def test_docx_strike_runs_flow_to_evidence_ir_and_stay_visible(tmp_path):
     by_type = {el.type: el for el in ir.elements if el.type in {"strike_text", "hidden_text", "deleted_text"}}
     assert by_type["strike_text"].value == "取り消し線本文"
     assert by_type["strike_text"].visibility == "visible"
-    assert by_type["strike_text"].extension["visibility_reason"] == "strike"
+    assert by_type["strike_text"].extension["format_state"] == {"strike": "whole"}
+    assert by_type["strike_text"].extension.get("visibility_reason") is None
     # 既存の隠し文字/削除本文（D-1で新規追加した取り消し線と同じ経路）が壊れていないことの回帰確認。
     assert by_type["hidden_text"].visibility == "hidden"
     assert by_type["deleted_text"].lifecycle == "deleted"
@@ -314,7 +347,13 @@ def test_docx_strike_inside_table_cell(tmp_path):
 
 _PPTX_NS = (
     'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
-    'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"'
+    'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+)
+_PPTX_IMAGE_RELS = (
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+    'Target="../media/image9.png"/></Relationships>'
 )
 
 
@@ -326,24 +365,32 @@ def _pptx_zip(tmp_path: pathlib.Path, shapes_xml: str, name: str = "occ.pptx") -
  </p:spTree></p:cSld>
 </p:sld>"""
     p = tmp_path / name
-    _write_zip(p, {"ppt/slides/slide1.xml": slide_xml.encode("utf-8")})
+    _write_zip(p, {
+        "ppt/slides/slide1.xml": slide_xml.encode("utf-8"),
+        "ppt/slides/_rels/slide1.xml.rels": _PPTX_IMAGE_RELS.encode("utf-8"),
+        "ppt/media/image9.png": _image_builders.opaque_png(),     # `_pic` の不透明な画像
+    })
     return p
+
+
+_PPTX_SHAPE_IDS = itertools.count(2)
 
 
 def _sp_text(text: str, x=0, y=0, cx=4000000, cy=2000000) -> str:
     return f"""<p:sp>
+  <p:nvSpPr><p:cNvPr id="{next(_PPTX_SHAPE_IDS)}" name="図形"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
   <p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm></p:spPr>
   <p:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody>
  </p:sp>"""
 
 
 def _pic(x=0, y=0, cx=4000000, cy=2000000) -> str:
-    return f"""<p:pic><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm></p:spPr></p:pic>"""
+    return f"""<p:pic><p:nvPicPr><p:cNvPr id="{next(_PPTX_SHAPE_IDS)}" name="画像"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId9"/></p:blipFill><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm></p:spPr></p:pic>"""
 
 
 def test_pptx_occlusion_reaches_both_evidence_representations(tmp_path):
     """`_build_pptx_ir` が確定した occluded 判定が、adapter経由・raw walk経由の両方のEvidence要素に
-    同じ理由で伝わる（`adapted_by_slot` 経由の1回だけの計算・二重実装ではない証拠）。
+    同じ理由で伝わる（DocumentIR の判定を図形 ID で対応づけて1回だけ使う・二重実装ではない証拠）。
     """
     p = _pptx_zip(tmp_path, _sp_text("画像に隠れる") + _pic())
     ir = evidence_spike.extract(p)
@@ -550,6 +597,44 @@ def test_docx_floating_anchor_paragraph_association(tmp_path):
 
     result = evidence_render.render(ir, source_name=str(p))
     assert evidence_render.validation_errors(ir, result) == []
+
+
+def test_docx_floating_anchor_keeps_paragraphs_apart(tmp_path):
+    """テキストボックスの段落「10」「20」は「1020」に連結せず、RAG の前面図形の行では改行を空白にして別の値と分かる。"""
+    body = """<w:p>
+ <w:r><w:t>基準値は次の枠に示す。</w:t></w:r>
+ <w:r><w:drawing xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+  <wp:anchor behindDoc="0" relativeHeight="1">
+   <wp:docPr id="1" name="基準値の枠"/>
+   <wp:extent cx="100" cy="100"/>
+   <w:txbxContent><w:p><w:r><w:t>10</w:t></w:r></w:p><w:p/><w:p><w:r><w:t>2</w:t></w:r><w:r><w:t>0</w:t></w:r></w:p></w:txbxContent>
+  </wp:anchor>
+ </w:drawing></w:r>
+</w:p>"""
+    p = _docx_zip(tmp_path, body)
+    document = ooxml_arm._build_docx_ir(p)
+    para = next(e for e in document.elements if e.type == "paragraph")
+    assert para.source_map["floating_anchors"] == [{"name": "基準値の枠", "text": "10\n20", "behind_doc": False}]
+    ir = evidence_spike.extract(p, legacy_ir=document)
+    rendered = evidence_render.render(ir, source_name=str(p)).markdown
+    assert "前面図形: 「10 20」" in rendered
+    assert "1020" not in rendered
+
+
+def test_xlsx_shape_text_keeps_paragraphs_apart(tmp_path):
+    """図形の文字が複数段落でも「1020」に連結しない。値は段落ごとに改行を残し、他の要素へ引く行では改行を空白にする。"""
+    from test_occlusion_fill_kinds import _RECT, _SOLID, _xlsx_with_drawing
+
+    text = "<xdr:txBody><a:bodyPr/><a:p><a:r><a:t>10</a:t></a:r></a:p><a:p><a:r><a:t>20</a:t></a:r></a:p></xdr:txBody>"
+    shape = ('<xdr:sp><xdr:nvSpPr><xdr:cNvPr id="1" name="枠"/><xdr:cNvSpPr/></xdr:nvSpPr>'
+             f"<xdr:spPr>{_RECT}{_SOLID}</xdr:spPr>{text}</xdr:sp>")
+    p = _xlsx_with_drawing(tmp_path, shape)
+    ir = evidence_spike.extract(p)
+    assert [e.value for e in ir.elements if e.type == "shape"] == ["10\n20"]
+    rendered = evidence_render.render(ir, source_name=p.name).markdown
+    assert "図形: 「10\n20」" in rendered
+    assert "重なり: 「10 20」" in rendered
+    assert "1020" not in rendered
 
 
 def test_docx_floating_anchor_behind_doc_distinguished(tmp_path):

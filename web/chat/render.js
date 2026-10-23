@@ -1123,12 +1123,23 @@ function renderTrouble(a) {
     ? `<details class="cand-more"><summary>${esc(label)}</summary>${rest.map(_candidateHTML).join('')}</details>`
     : `<div class="muted cand-more">${esc(label)}</div>`);
 }
+// 出典の世代（資料フォルダ直下のフォルダ）と原本の更新時刻。取れた欄だけ「（5期・2026-07-01 12:30 更新）」の形で添える。
+export function provenanceText(item) {
+  const gen = item && typeof item.generation === 'string' ? item.generation.trim() : '';
+  const at = item && typeof item.modified_at === 'string' ? fmtDateTime(item.modified_at) : '';
+  const parts = [gen, at ? `${at} 更新` : ''].filter(Boolean);
+  return parts.length ? `（${parts.join('・')}）` : '';
+}
+const provenanceHTML = (item) => {
+  const t = provenanceText(item);
+  return t ? `<span class="muted cite-prov" title="資料フォルダ直下のフォルダと、原本の更新時刻">${esc(t)}</span>` : '';
+};
 // 引用（該当箇所）カード。既定は折りたたみで、件数だけ見える見出しボタン＋hidden な本体にする。
 function renderQa(a) {
   const cites = (a.data && a.data.citations) || [];
   if (!cites.length) return '';
   const items = cites.map((c) =>
-    `<div class="cite"><span class="doc">${esc(c.doc_id)}</span><span class="sp">行 ${esc(c.span && c.span[0])}–${esc(c.span && c.span[1])}</span><pre>${esc(c.quote)}</pre></div>`).join('');
+    `<div class="cite"><span class="doc">${esc(c.doc_id)}</span>${provenanceHTML(c)}<span class="sp">行 ${esc(c.span && c.span[0])}–${esc(c.span && c.span[1])}</span><pre>${esc(c.quote)}</pre></div>`).join('');
   return `<div class="cites"><button class="cites-h" type="button" data-cites aria-expanded="false">`
     + `📄 該当箇所 (${cites.length})<span class="caret">▾</span></button>`
     + `<div class="cites-body" hidden>${items}</div></div>`;
@@ -1146,7 +1157,7 @@ function renderSources(sources, verifiedDocIds, evidencePacket) {
   const link = (s) => (s.download_url
     ? `<a href="${esc(s.download_url)}" data-dl>📄 ${esc(s.doc_id)}</a>`
     : `<span class="muted" title="この画面ではダウンロードできません">📄 ${esc(s.doc_id)}（ダウンロードできません）</span>`)
-    + `${verificationBadgeHTML(vmap.get(s.doc_id))}${importanceBadgeHTML(s)}`;
+    + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(s.doc_id))}${importanceBadgeHTML(s)}`;
   // sources_verified（精読済み doc_id）があれば、出典を「根拠（精読済み）」と「参考（ヒットのみ）」に分ける（除外はしない）
   if (Array.isArray(verifiedDocIds)) {
     const verified = new Set(verifiedDocIds);
@@ -1208,7 +1219,7 @@ function renderReferencedDocs(answer, evidencePacket) {
     return (s.download_url
       ? `<a href="${esc(s.download_url)}" data-dl>📄 ${esc(r.path)}</a>`
       : `<span class="muted" title="この画面ではダウンロードできません">📄 ${esc(r.path)}（ダウンロードできません）</span>`)
-      + `${verificationBadgeHTML(vmap.get(r.path))}${importanceBadgeHTML(s)}`;
+      + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(r.path))}${importanceBadgeHTML(s)}`;
   };
   return head
     + rows.map((r) => `<div class="sources-unverified-row">${link(r)}${r.ranges.length ? `<span class="muted">（${esc(rangeText(r))}${r.rangesMore ? `、ほか ${r.rangesMore} か所` : ''}）</span>` : (r.rangesMore ? `<span class="muted">（ほか ${r.rangesMore} か所）</span>` : '')}`

@@ -18,11 +18,11 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
-from . import document_ir
+from . import document_ir, observation_vocab
 from .ooxml import excel
 
 # レンダラの版。`office_md._current_human_md_sig()` が抽出器の版と合成し `{rel}.derived.json` に記録する。出力形状を変えたら上げる
-HUMAN_MD_RENDERER_VERSION = "human-md-renderer-v7"
+HUMAN_MD_RENDERER_VERSION = "human-md-renderer-v10"
 
 # PDF の人向け MD（`render_pdf`）の版。`office_md._current_pdf_human_md_sig()` が PDF の変換キャッシュの鍵と再生成の判定に使う。出力形状を変えたら上げる
 PDF_HUMAN_MD_VERSION = "pdf-human-md-v3"
@@ -124,11 +124,13 @@ def _table_min_row(table: document_ir.Element) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def render_xlsx(ir: document_ir.DocumentIR, figure_texts: dict[str, list] | None = None) -> str | None:
+def render_xlsx(ir: document_ir.DocumentIR, figure_texts: dict[str, list] | None = None,
+                notes: EvidenceNotes | None = None) -> str | None:
     """xlsx の document-ir から人間向け MD を生成する。`ir` にシートが無ければ None（表候補が0件でも None にしない）。
 
     ① シートごとに `## シート「{名前}」` を出す。
     ② 各シートの下に、`regions()` が検出した表候補ごとに `### {セル範囲}` の小見出し＋パイプ表を並べる。
+    `notes`（Evidence IR 由来）があれば、状態・関係・未解析／未対応の通知を、そのセルを含む表の直後・図形のアンカーの位置に「※」の行で足す。
     見出し・注記・表・区切りのすべてが `_MAX_HUMAN_MD_BYTES` の予算を文書全体で1つ共有する。
     予算切れ以降は残りのシートも省略し、末尾に1回だけ注記する（注記は予約枠から書く）。
     """
@@ -173,6 +175,8 @@ def render_xlsx(ir: document_ir.DocumentIR, figure_texts: dict[str, list] | None
         top_block = _figure_text_block(figure_slots.get(-1), with_cell=True)
         if top_block and budget.consume(top_block):
             sheet_parts.append(top_block)
+        note_slots = xlsx_sheet_notes(notes, sheet.source_map.get("sheet", ""), tables) if notes is not None else {}
+        _append_note_blocks(note_slots.get(-1, []), sheet_parts, budget)
         if not tables:
             note = "（このシートには値のあるセルが見つかりませんでした）"
             if budget.consume(note):
@@ -189,6 +193,7 @@ def render_xlsx(ir: document_ir.DocumentIR, figure_texts: dict[str, list] | None
                 block = _figure_text_block(figure_slots.get(ti), with_cell=True)
                 if block and budget.consume(block):
                     sheet_parts.append(block)
+                _append_note_blocks(note_slots.get(ti, []), sheet_parts, budget)
         if sheet_parts:
             out.append("\n\n".join(sheet_parts))
         elif budget.truncated:
@@ -200,6 +205,14 @@ def render_xlsx(ir: document_ir.DocumentIR, figure_texts: dict[str, list] | None
         note += f"・未表示のシート {omitted_sheets} 件）" if omitted_sheets else "）"
         out.append(budget.note(note))
     return "\n\n".join(out)
+
+
+def _append_note_blocks(blocks: list[str], parts: list[str], budget: _OutputBudget) -> None:
+    """注記の行を、予算が許す限り `parts` へ追記する（予算切れの打切り注記は呼び出し側の全体の注記に任せる）。"""
+    for block in blocks:
+        if not budget.consume(block):
+            return
+        parts.append(block)
 
 
 def _render_xlsx_table(table: document_ir.Element, budget: "_OutputBudget") -> str:
@@ -234,22 +247,29 @@ def _count_elements_with_descendants(elements, by_parent: dict) -> int:
     return sum(1 + _count_descendant_elements(e.element_id, by_parent) for e in elements)
 
 
-def render_docx(ir: document_ir.DocumentIR, figure_texts: list | None = None) -> str | None:
-    """docx の document-ir から人間向け MD を生成する。本文が1件も無ければ None。
+def render_docx(ir: document_ir.DocumentIR, figure_texts: list | None = None,
+                notes: DocxNotes | None = None) -> str | None:
+    """docx の document-ir から人間向け MD を生成する。本文・テキストボックス・画像・図の文字・出すべき注記のどれも無ければ None。
 
     見出し・段落・表を原本の出現順で並べる。表は `_docx_table_walk` が解決した結合をそのまま展開したパイプ表にし、
-    ネスト表は直後に小見出し付きで続ける。見出し・段落・表のすべてが文書全体で `_MAX_HUMAN_MD_BYTES` を共有し、
-    予算切れ以降は出力せず末尾に「（以降 N 要素を省略）」と注記する（N にはネスト表内の省略も含める）。
+    ネスト表は直後に小見出し付きで続ける。テキストボックスは、ホストの見出し・段落、または表（ネスト表ならそのネスト表）の
+    直後に「（テキストボックス）本文」の別の行として要素ごとに出す（表のセルの中なら位置を添える）。
+    見出し・段落・表・テキストボックスのすべてが文書全体で `_MAX_HUMAN_MD_BYTES` を共有し、
+    予算切れ以降は出力せず末尾に「（以降 N 要素を省略）」と注記する（N にはネスト表内・テキストボックスの省略も含める）。
     `ir.picture_count` があれば文書冒頭に画像枚数の事実だけを1回出す。
+    `notes`（Evidence IR 由来）があれば、図形・画像・OLE などの状態・関係・未解析／未対応の通知を、その図形がある本文の要素の直後に「※」の行で足す。
     `figure_texts`（WMF/EMF 図の文字）は、その図を含む本文直下の段落・表の直後へ出し、位置不明の図は本文の先頭にまとめる。
+    本文の無い段落にあるテキストボックス（ホストが無い）は、直前の本文要素（`source_map.after_body_order`）の直後
+    （文書の先頭なら本文の先頭）へ出し、同じ位置の図の文字より先に置く。
     """
     by_parent: dict[str | None, list[document_ir.Element]] = {}
     for e in ir.elements:
-        if e.type in ("heading", "paragraph", "table"):
+        if e.type in ("heading", "paragraph", "table") or (e.type == "textbox" and e.parent_id is not None):
             by_parent.setdefault(e.parent_id, []).append(e)
     top = sorted(by_parent.get(None, []), key=lambda e: e.order)
-    if not top:
-        return None
+    orphans = [e for e in ir.elements if e.type == "textbox" and e.parent_id is None]
+    if not top and not orphans and not ir.picture_count and not figure_texts and notes is None:
+        return None            # 本当に何も無い文書。画像・図の文字・出すべき注記があれば空とは扱わない
     budget = _OutputBudget()
     out: list[str] = []
     if ir.picture_count:
@@ -273,17 +293,41 @@ def render_docx(ir: document_ir.DocumentIR, figure_texts: list | None = None) ->
                 if before:
                     slot = index
         figure_slots.setdefault(slot, []).append(figure)
+    # ホストの無いテキストボックスは、直前の本文要素（`after_body_order`＝その要素の order）の直後へ（0・不明は先頭）
+    orphan_slots: dict[int, list[document_ir.Element]] = {}
+    for box in orphans:
+        after = box.source_map.get("after_body_order")
+        slot = -1
+        for index, element in enumerate(top):
+            if after is not None and element.order <= after:
+                slot = index
+        orphan_slots.setdefault(slot, []).append(box)
+    # 注記は「それを含む本文の子の位置以下で最後の本文要素」の直後へ（無ければ先頭）
+    note_slots: dict[int, list[str]] = {}
+    if notes is not None:
+        body_positions = [notes.body_index(e) for e in top]
+        for position, block in notes.entries:
+            slot = -1
+            for index, body_position in enumerate(body_positions):
+                if body_position is not None and body_position <= position:
+                    slot = index
+            note_slots.setdefault(slot, []).append(block)
+    omitted = [0]                                     # 再帰全体で共有する省略カウンタ
+    _append_textbox_lines(orphan_slots.get(-1, []), out, budget, omitted)
+    _append_note_blocks(note_slots.get(-1, []), out, budget)
     figure_block = _figure_text_block(figure_slots.get(-1))
     if figure_block and budget.consume(figure_block):
         out.append(figure_block)
-    omitted = [0]                                     # 再帰全体で共有する省略カウンタ
     for i, e in enumerate(top):
         if budget.truncated:
             omitted[0] += _count_elements_with_descendants(top[i:], by_parent)
+            omitted[0] += sum(len(orphan_slots.get(k, [])) for k in range(i, len(top)))
             break
         rendered = _render_docx_element(e, by_parent, budget, omitted)
         if rendered:
             out.append(rendered)
+        _append_textbox_lines(orphan_slots.get(i, []), out, budget, omitted)
+        _append_note_blocks(note_slots.get(i, []), out, budget)
         block = _figure_text_block(figure_slots.get(i))
         if block and budget.consume(block):
             out.append(block)
@@ -301,21 +345,22 @@ def _render_docx_element(e: document_ir.Element, by_parent: dict, budget: "_Outp
     """
     if budget.truncated:
         return ""
-    if e.type == "heading":
-        level = max(1, min(6, e.source_map.get("level") or 1))
-        text = "#" * level + " " + (e.text or "")
-        if budget.consume(text):
-            return text
-        omitted[0] += 1
-        return ""
-    if e.type == "paragraph":
-        text = e.text or ""
-        if not text:
-            return ""
-        if budget.consume(text):
-            return text
-        omitted[0] += 1
-        return ""
+    children = by_parent.get(e.element_id, [])
+    boxes = [c for c in children if c.type == "textbox"]   # 要素の並び（＝原本の出現順）のまま使う
+    if e.type in ("heading", "paragraph"):
+        if e.type == "heading":
+            level = max(1, min(6, e.source_map.get("level") or 1))
+            text = "#" * level + " " + (e.text or "")
+        else:
+            text = e.text or ""
+        lines: list[str] = []
+        if text:
+            if not budget.consume(text):
+                omitted[0] += 1 + len(boxes)
+                return ""
+            lines.append(text)
+        _append_textbox_lines(boxes, lines, budget, omitted)
+        return "\n\n".join(lines)
     parts: list[str] = []
     for note in _table_notes(e.source_map):
         if not budget.consume(note):
@@ -326,7 +371,8 @@ def _render_docx_element(e: document_ir.Element, by_parent: dict, budget: "_Outp
     grid = _render_cells_grid(e.cells or [], budget)
     if grid:
         parts.append(grid)
-    nested_list = sorted(by_parent.get(e.element_id, []), key=lambda c: c.order)
+    _append_textbox_lines(boxes, parts, budget, omitted)
+    nested_list = sorted((c for c in children if c.type == "table"), key=lambda c: c.order)
     for j, nested in enumerate(nested_list):
         if budget.truncated:
             omitted[0] += _count_elements_with_descendants(nested_list[j:], by_parent)
@@ -345,6 +391,24 @@ def _render_docx_element(e: document_ir.Element, by_parent: dict, budget: "_Outp
     if not parts and budget.truncated:
         omitted[0] += 1     # 表自体は何も出せなかった
     return "\n\n".join(p for p in parts if p)
+
+
+def _textbox_line(box: document_ir.Element) -> str:
+    """テキストボックス1つを、短い前置き付きの1ブロックにする。表のセルの中なら行・列を添える。"""
+    row, column = box.source_map.get("row"), box.source_map.get("column")
+    where = f"・{row}行{column}列" if row is not None and column is not None else ""
+    return f"（テキストボックス{where}）{box.text or ''}"
+
+
+def _append_textbox_lines(boxes: list[document_ir.Element], parts: list[str], budget: "_OutputBudget",
+                          omitted: list[int]) -> None:
+    """`boxes` を出現順に `parts` へ追記する。予算切れになったら、残りの件数を `omitted[0]` へ加算して止める。"""
+    for k, box in enumerate(boxes):
+        line = _textbox_line(box)
+        if not budget.consume(line):
+            omitted[0] += len(boxes) - k
+            return
+        parts.append(line)
 
 
 # `Element.source_map` の異常系フラグ → 注記文の対応表（xlsx・docx 共通）
@@ -615,3 +679,315 @@ def _pdf_table_md(cells: list) -> str:
     lines = ["| " + " | ".join(row) + " |" for row in grid]
     lines.insert(1, "| " + " | ".join("---" for _ in range(n_cols)) + " |")
     return "\n".join(lines)
+
+
+# ---- Evidence IR 由来の注記（状態・関係・未解析／未対応の通知） ----
+# 設計: docs/proposals/2026-10-22-Office観測の共通の扱い.md §1.6
+# 対象の直後に「※ 対象: 行」の形で短く書く。文言は `observation_vocab` の対応表から引く（RAG と同じ語）。
+# 原本の内部 ID や `visibility_reason` の生の値は出さず、スライド・シート・順番・位置の言葉で対象を区別する。
+
+NOTE_PREFIX = "※ "
+_NOTE_MAX_CELLS = observation_vocab.MAX_FRONT_ITEMS
+
+_KIND_LABELS = {
+    "shape": "図形", "picture": "画像", "connector": "コネクタ", "group": "グループ", "ole_object": "埋め込みオブジェクト",
+    "chart": "グラフ", "smartart": "SmartArt", "graphic_frame": "図表", "vml_shape": "図形",
+    "floating_object": "図形", "floating_textbox": "テキストボックス",
+}
+# 注記の対象にする図形・画像などの種別（段落・セル・表・見出しなどの本文は含めない）
+OBJECT_TYPES = frozenset(_KIND_LABELS)
+
+_POSITION_WORDS = {
+    (0, 0): "左上付近", (1, 0): "上部付近", (2, 0): "右上付近",
+    (0, 1): "左側付近", (1, 1): "中央付近", (2, 1): "右側付近",
+    (0, 2): "左下付近", (1, 2): "下部付近", (2, 2): "右下付近",
+}
+
+
+def _position_words(bbox, size) -> str:
+    """図形の中心がスライドのどのあたりか（3×3 の区画）。大きさ・位置が分からなければ空文字列。"""
+    if not bbox or not size or not size[0] or not size[1]:
+        return ""
+    cx = (bbox[0] + bbox[2]) / 2 / size[0]
+    cy = (bbox[1] + bbox[3]) / 2 / size[1]
+    return _POSITION_WORDS[(min(2, max(0, int(cx * 3))), min(2, max(0, int(cy * 3))))]
+
+
+class EvidenceNotes:
+    """Evidence IR の要素ごとの注記（状態・関係・通知）を、人用 Markdown の平文の短い文で作る。
+
+    ① 対象の参照は人の言葉（スライド・シート・順番・位置）で作る。② 関係は `observation_vocab.relation_note_lines` で
+    両端に分け、`relation_block` で行にする。③ 文は `observation_vocab.HUMAN_WORDING` から、RAG と同じ観測の鍵で引く。
+    `slide_size` は pptx の位置の言葉に使う（EMU）。`inline=True`（pptx）は注記が対象の文字の直後に出るので主語を「この図形」にし、
+    それ以外は対象の位置を主語に添える。セルは表の直後にまとめて書くので、主語は `_SUBJECT_SLOT` の差し込み口にする。
+    """
+
+    def __init__(self, evidence, slide_size: tuple[int, int] | None = None, inline: bool = False):
+        self.evidence = evidence
+        self.slide_size = slide_size
+        self.inline = inline
+        self.elements = {e.element_id: e for e in evidence.elements}
+        self.ordinals: dict[str, int] = {}
+        seen: dict[str, int] = {}
+        for e in sorted(evidence.elements, key=lambda item: item.order):
+            if e.type in OBJECT_TYPES:
+                seen[e.type] = seen.get(e.type, 0) + 1
+                self.ordinals[e.element_id] = seen[e.type]
+        self._entries = observation_vocab.relation_note_lines(
+            evidence.relations, self._ref_or_none, human=True, subject_of=self._subject_of)
+        self._coverage = {c.coverage_id: c for c in evidence.coverage}
+        hosts: dict[tuple, list] = {}
+        for e in evidence.elements:
+            if (e.type in OBJECT_TYPES and e.extension.get("origin") != "document-ir-v2-adapter"
+                    and e.locator.object_id is not None):
+                hosts.setdefault((e.locator.slide, e.locator.sheet, str(e.locator.object_id)), []).append(e)
+        self._unsupported: dict[str, list[str]] = {}
+        for item in evidence.coverage:
+            if item.status not in ("unsupported", "failed") or item.scope == "part" or item.locator.object_id is None:
+                continue
+            token = str(item.locator.object_id).split(":", 1)[-1]
+            host = self._host_for(hosts.get((item.locator.slide, item.locator.sheet, token), []), item)
+            if host is None:
+                continue
+            line = observation_vocab.notice_line(
+                item.status, item.reason_code, item.detected_kind, self._real_name(host) or self.kind(host), human=True)
+            if line:
+                self._unsupported.setdefault(host.element_id, []).append(self._place_notice(host, line))
+
+    @staticmethod
+    def _host_for(candidates: list, item):
+        """未対応の部品の通知を載せる図形。同じ ID が別の部品（本文とヘッダーなど）にもあるときは、部品が一致するものだけ。"""
+        if len(candidates) <= 1:
+            return candidates[0] if candidates else None
+        part = item.locator.part
+        matched = [c for c in candidates if part in (c.locator.part, c.extension.get("chart_part"))
+                   or part in (c.extension.get("diagram_parts") or {}).values()]
+        return matched[0] if len(matched) == 1 else None
+
+    def kind(self, element) -> str:
+        return _KIND_LABELS.get(element.type, "図形")
+
+    def _real_name(self, element) -> str:
+        return str(element.extension.get("name") or "").strip() or str(element.extension.get("prog_id") or "").strip()
+
+    def _z_label(self, element) -> str:
+        parent = self.elements.get(element.parent_id or "")
+        z = element.extension.get("z_order") or element.order
+        if parent is not None and parent.type == "group":
+            return f"{parent.extension.get('z_order') or parent.order} 番目の図形の中の {z} 番目の図形"
+        return f"{z} 番目の図形"
+
+    def where(self, element) -> str:
+        """対象の位置の言葉（スライド・シート・順番）。原本の内部 ID は含めない。"""
+        locator = element.locator
+        if locator.slide is not None and locator.sheet is None:
+            where = f"スライド {locator.slide} の {self._z_label(element)}"
+            position = _position_words(locator.bbox, self.slide_size)
+            return where + (f"・{position}" if position else "")
+        if locator.sheet:
+            return f"シート「{locator.sheet}」" + (f"のセル範囲 {locator.cell_range}" if locator.cell_range else "")
+        ordinal = self.ordinals.get(element.element_id)
+        return f"文書内で {ordinal} 番目の{self.kind(element)}" if ordinal else ""
+
+    def _ref_or_none(self, element_id: str) -> str | None:
+        element = self.elements.get(element_id)
+        return self.ref(element) if element is not None else None
+
+    def ref(self, element) -> str:
+        """関係の相手を指す参照。例: 「覆いの図形」（スライド 1 の 3 番目の図形・中央付近）。"""
+        if element.type == "cell":
+            return f"セル {element.locator.cell_range}" if element.locator.cell_range else "セル"
+        name = self._real_name(element)
+        label = f"「{name}」" if name else self.kind(element)
+        where = self.where(element)
+        return f"{label}（{where}）" if where else label
+
+    def _subject_of(self, element_id: str) -> str:
+        element = self.elements.get(element_id)
+        if element is None:
+            return ""
+        return self.subject(element)
+
+    def subject(self, element) -> str:
+        """注記の主語。pptx は対象の直後に出るので「この図形」、セルはまとめて書くので差し込み口、ほかは種類・名前・位置。"""
+        if element.type == "cell":
+            return _SUBJECT_SLOT
+        if self.inline:
+            return f"この{self.kind(element)}"
+        name = self._real_name(element)
+        where = self.where(element)
+        label = f"{self.kind(element)}「{name}」" if name else self.kind(element)
+        return f"{label}（{where}）" if where else label
+
+    def _place_notice(self, element, line: str) -> str:
+        """通知は「この…」で始まる。表の後ろにまとめて出る xlsx は、先に対象の位置を添える（pptx・docx は対象の直後に出る）。"""
+        where = self.where(element) if element.locator.sheet else ""
+        return f"{where}にある{line.removeprefix('この')}" if where else line
+
+    def lines(self, element) -> list[str]:
+        """要素の状態・関係・通知の文（`※` なし）。何も無ければ空。"""
+        out: list[str] = []
+        subject = self.subject(element)
+        reason = element.extension.get("visibility_reason")
+        label = observation_vocab.VISIBILITY_REASON_LABELS.get(reason) if isinstance(reason, str) else None
+        # 覆いによる非表示は、覆っている相手を書く関係の文（覆われていると判定）が同じことを言うので、状態の文は重ねない
+        if (element.visibility == "hidden" and label and reason not in observation_vocab.REASONS_ABOVE_COVERS
+                and reason not in observation_vocab.COVER_DERIVED_REASONS):
+            out.append(observation_vocab.visibility_line(reason, label, human=True, subject=subject))
+        if element.type not in ("strike_text", "hidden_text", "deleted_text") and observation_vocab.is_whole_strike(
+                element.extension):
+            out.append(observation_vocab.strike_line(human=True, subject=subject))
+        entries = self._entries.get(element.element_id)
+        if entries:
+            out.extend(observation_vocab.relation_block(entries, human=True))
+        item = self._coverage.get(element.coverage_id)
+        if item is not None:
+            line = observation_vocab.notice_line(
+                item.status, item.reason_code, item.detected_kind, self._real_name(element) or self.kind(element),
+                human=True)
+            if line:
+                out.append(self._place_notice(element, line))
+        out.extend(self._unsupported.get(element.element_id, []))
+        return list(dict.fromkeys(out))
+
+    def block(self, element) -> str:
+        """要素の注記を「※」の行にする。注記が無ければ空文字列。"""
+        return "\n".join(f"{NOTE_PREFIX}{line}" for line in self.lines(element))
+
+
+_SUBJECT_SLOT = "\x00subject\x00"
+
+
+def _cell_note_blocks(notes: EvidenceNotes, cells: list) -> list[str]:
+    """注記のあるセルを、同じ注記ごとに「セル A1、B2は…」の文へまとめる（並べるセルは最大 `_NOTE_MAX_CELLS` 件）。"""
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for cell in cells:
+        lines = tuple(notes.lines(cell))
+        if lines:
+            groups.setdefault(lines, []).append(cell.locator.cell_range or "")
+    out: list[str] = []
+    for lines, ranges in groups.items():
+        subject = "セル " + "、".join(ranges[:_NOTE_MAX_CELLS])
+        if len(ranges) > _NOTE_MAX_CELLS:
+            subject += f" ほか {len(ranges) - _NOTE_MAX_CELLS} 件"
+        out.append("\n".join(f"{NOTE_PREFIX}{line.replace(_SUBJECT_SLOT, subject)}" for line in lines))
+    return out
+
+
+_RANGE_RE = re.compile(r"^([A-Za-z]+)(\d+)(?::([A-Za-z]+)(\d+))?$")
+
+
+def _cell_rc(text: str) -> tuple[int, int] | None:
+    match = _RANGE_RE.match(text or "")
+    if not match:
+        return None
+    column = 0
+    for ch in match.group(1).upper():
+        column = column * 26 + ord(ch) - 64
+    return int(match.group(2)), column
+
+
+def _range_bounds(text: str) -> tuple[int, int, int, int] | None:
+    first = _cell_rc(text.split(":")[0])
+    last = _cell_rc(text.split(":")[-1])
+    if first is None or last is None:
+        return None
+    return first[0], first[1], last[0], last[1]
+
+
+def xlsx_sheet_notes(notes: EvidenceNotes, sheet_name: str, tables: list) -> dict[int, list[str]]:
+    """シートの注記を「表の添字 → 注記の行」にする（`-1` はシートの先頭＝どの表にも属さない位置）。
+
+    セルの注記はそのセルを含む表の直後、図形・画像などはアンカーの行より上から始まる最後の表の直後（図の文字と同じ置き方）。
+    """
+    bounds = [_range_bounds(str(t.source_map.get("range", ""))) for t in tables]
+    cells_by_table: dict[int, list] = {}
+    slots: dict[int, list[str]] = {}
+    for e in notes.evidence.elements:
+        if e.locator.sheet != sheet_name:
+            continue
+        if e.type == "cell":
+            rc = _cell_rc(e.locator.cell_range or "")
+            if rc is None:
+                continue
+            for ti, b in enumerate(bounds):
+                if b is not None and b[0] <= rc[0] <= b[2] and b[1] <= rc[1] <= b[3]:
+                    cells_by_table.setdefault(ti, []).append(e)
+                    break
+        elif e.type in OBJECT_TYPES:
+            block = notes.block(e)
+            if not block:
+                continue
+            first = _cell_rc((e.locator.cell_range or "").split(":")[0])
+            slot = -1
+            for ti, b in enumerate(bounds):
+                if first is not None and b is not None and b[0] <= first[0]:
+                    slot = ti
+            slots.setdefault(slot, []).append(block)
+    for ti, cells in cells_by_table.items():
+        slots.setdefault(ti, []).extend(_cell_note_blocks(notes, cells))
+    return slots
+
+
+class DocxNotes:
+    """docx の注記。各注記は「本文の並びのどこに置くか」（本文の子の位置）を持つ。"""
+
+    def __init__(self, entries: list[tuple[int, str]], paragraph_to_body: list[int], table_to_body: list[int]):
+        self.entries = entries
+        self.paragraph_to_body = paragraph_to_body
+        self.table_to_body = table_to_body
+
+    def body_index(self, element: document_ir.Element) -> int | None:
+        """本文の要素（見出し・段落・表）の、本文の子の位置。"""
+        sm = element.source_map
+        if element.type == "table":
+            index, table = sm.get("table_index"), self.table_to_body
+        else:
+            index, table = sm.get("paragraph_index"), self.paragraph_to_body
+        return table[index] if isinstance(index, int) and 0 <= index < len(table) else None
+
+
+def docx_notes(document_xml: bytes, notes: EvidenceNotes, part: str = "word/document.xml") -> DocxNotes | None:
+    """docx の図形・画像・OLE などの注記を、本文の子（段落・表）の位置へ結び付ける。注記が無ければ None。
+
+    ① 図形の ID（`docPr`・VML の `shape`・`OLEObject`）を、それを含む本文の子の位置に引く。② 注記を持つ Evidence の
+    図形を、`part`（`document_xml` の部品）と ID で引き当てる。ヘッダーなど別の部品の図形は、同じ ID でも本文に書かない。
+    引き当てられない図形は書かない（位置の分からない注記を文書の先頭や末尾に置かない）。
+    """
+    from xml.etree import ElementTree as ET
+
+    root = ET.fromstring(document_xml)
+    body = next((el for el in root if el.tag.endswith("}body")), None)
+    if body is None:
+        return None
+    id_to_body: dict[str, int] = {}
+    paragraph_to_body: list[int] = []
+    table_to_body: list[int] = []
+    for position, child in enumerate(body):
+        local = child.tag.rsplit("}", 1)[-1]
+        if local == "p":
+            paragraph_to_body.append(position)
+        elif local == "tbl":
+            table_to_body.append(position)
+        for node in child.iter():
+            tag = node.tag.rsplit("}", 1)[-1]
+            if tag in ("docPr", "shape"):
+                keys = [node.get("id")]
+            elif tag == "OLEObject":
+                keys = [node.get("ObjectID"), node.get("ShapeID")]
+            else:
+                continue
+            for key in keys:
+                if key:
+                    id_to_body.setdefault(str(key), position)
+    entries: list[tuple[int, str]] = []
+    for e in notes.evidence.elements:
+        if e.type not in OBJECT_TYPES or e.locator.object_id is None or e.locator.part != part:
+            continue
+        position = id_to_body.get(str(e.locator.object_id))
+        if position is None:
+            continue
+        block = notes.block(e)
+        if block:
+            entries.append((position, block))
+    return DocxNotes(entries, paragraph_to_body, table_to_body) if entries else None

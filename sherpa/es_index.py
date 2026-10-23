@@ -7,6 +7,7 @@ Office／PDF は `{rel}.rag.md`（RAG 正本）をアンカー分割した本文
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -38,7 +39,7 @@ _CHUNK_LINES_DEFAULT = 40
 # `search()` が ES へ送る size の上限（資料検索のヒット数の既定 `parts.read.tools.MAX_HITS` を下回らない固定値）
 _ES_SEARCH_K_MAX = 50
 _TIMEOUT = 30
-ES_MAPPING_VERSION = "14"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
+ES_MAPPING_VERSION = "15"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
 # reindex のとき埋め込みはキャッシュから再利用される。
 # rag_chunks.jsonl 読み取りの安全弁: 1 行（1 チャンク）の大きさで判定する。桁違いに大きい行は破損とみなし、ファイル全体を無効にして legacy チャンクへ縮退する（`_validate_rag_chunks` 参照）。
 # ファイル全体の大きさは見ない（大きな表でも行ごとの切れを保つ）。読むときも上限＋1 文字で打ち切る
@@ -115,6 +116,11 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
         # 表の行・本文のまとまりの先頭だけが持つ（設計: docs/design/rag.md「表の行・本文のまとまり」）。どちらも検索の対象にしない
         "vector_text": {"type": "text", "index": False},
         "row_group": {"type": "object", "enabled": False},
+        # まとまりの構成行（設計: docs/design/rag.md「表の行・本文のまとまり」）: 先頭以外の行＝先頭の chunk_id、先頭＝構成行の識別子の集合（kNN の exact が引く）と
+        # 行ごとの内訳（当たった行へ戻す表示用・検索の対象にしない）。`record_identity_values` には他の行の識別子を混ぜない
+        "row_group_head_chunk_id": {"type": "keyword"},
+        "row_group_identifier_values": {"type": "keyword"},
+        "row_group_identifier_rows": {"type": "object", "enabled": False},
     }
     if dim:
         props["embedding"] = {"type": "dense_vector", "dims": dim, "element_type": "byte", "index": True,
@@ -1239,6 +1245,10 @@ _ROW_GROUP_ROW_MAX_BYTES = 300      # 値を並べた 1 行の上限（UTF-8）
 _ROW_GROUP_HEAD_MAX_BYTES = 600     # 出所・列名の行それぞれの上限
 _ROW_GROUP_MAX_BYTES = 7600         # まとまり 1 本の上限（埋め込みの 1 窓＝約 8000 バイトに収める）
 _ROW_GROUP_SEP = " | "
+_ROW_GROUP_STATE_MAX_CHARS = 60     # 状態・重なりの行の値の上限（超えた分は切るが、末尾の括弧書き・閉じ括弧は残す）
+_ROW_GROUP_QUOTE_MAX_CHARS = 14     # 部分的な状態の対象として引用する文字数の上限
+_ROW_GROUP_KEEP_HEAD_MIN_CHARS = 8  # 状態の行を詰めるときに、括弧書きの手前に残す文字数の下限
+_ROW_GROUP_PLAIN_MIN_BYTES = 6      # 状態を残すために通常の値を切り詰めるときの、1 つの値の下限（UTF-8）
 # 本文のまとまり（表の行でない連続するチャンクにベクトルを 1 本）。設計: docs/design/rag.md「表の行・本文のまとまり」
 _BODY_GROUP_MAX_CHARS = 1000        # まとまり 1 本の上限（文字）。UTF-8 で 4000 バイト以下＝埋め込みの 1 窓に収める
 _BODY_GROUP_TEXT_KINDS = frozenset({"paragraph", "heading"})   # 見出しと段落は同じ種類として束ねる
@@ -1308,27 +1318,160 @@ def _cut_value(v: str) -> str:
     return v if len(v) <= _ROW_GROUP_CELL_MAX_CHARS else v[:_ROW_GROUP_CELL_MAX_CHARS - 1] + _CUT_MARK
 
 
+_STATE_BRACKET_RE = re.compile(r"【(非表示・取り消し線|取り消し線|非表示)(?:（続き）)?：(.*?)】", re.DOTALL)
+_STATE_TAIL_RE = re.compile(r"（[^（）]{1,30}）$|」$")
+# 行の部品の種類: 通常の値／観測の行の値（切らずに残す）／切らない固定部分（区切り・位置・見出し）／部分的な状態の書き添え／値の中の状態の括り（括りごと残す）
+_PLAIN, _KEEP, _SEP, _NOTE, _INLINE = 0, 1, 2, 3, 4
+# 部品は `(文字, 種類, 組)`。`組` は状態と対象・観測の行と見出しを一組として外す単位（無ければ None）。
+
+
+def _value_parts(v: str, observed_group: int | None, groups) -> list:
+    """束の中の 1 つの値を `[(文字, 種類, 組)]` にする。
+    観測の行（描画が付けた状態・重なり・関係の行。`observed_group` を持つ）は上限を広げ、末尾の括弧書き（覆われているかは未確定）を残す。
+    通常の値は `_cut_value` で切る。値の中の状態の括り（`【取り消し線：…】` など）は、見える範囲に収まるものを括りごと一組の部品にし、
+    収まらないものは `（一部「…」に取り消し線）` の書き添えにする（セル全体の状態にはしない。括りを途中で切らない）。
+    """
+    if observed_group is not None:
+        if len(v) > _ROW_GROUP_STATE_MAX_CHARS:
+            tail = m.group(0) if (m := _STATE_TAIL_RE.search(v)) else ""
+            v = v[:_ROW_GROUP_STATE_MAX_CHARS - len(tail) - 1] + _CUT_MARK + tail
+        return [(v, _KEEP, observed_group)]
+    brackets = list(_STATE_BRACKET_RE.finditer(v))
+    if not brackets:
+        return [(_cut_value(v), _PLAIN, None)]
+    if len(v) <= _ROW_GROUP_CELL_MAX_CHARS:
+        shown, limit = v, len(v)
+    else:
+        limit = next((m.start() for m in brackets if m.start() < _ROW_GROUP_CELL_MAX_CHARS - 1 < m.end()),
+                     _ROW_GROUP_CELL_MAX_CHARS - 1)
+        shown = v[:limit] + _CUT_MARK
+    parts: list = []
+    pos = 0
+    hidden: list = []
+    for m in brackets:
+        if m.end() > limit:
+            hidden.append(m)
+            continue
+        if m.start() > pos:
+            parts.append((shown[pos:m.start()], _PLAIN, None))
+        parts.append((shown[m.start():m.end()], _INLINE, next(groups)))
+        pos = m.end()
+    if pos < len(shown):
+        parts.append((shown[pos:], _PLAIN, None))
+    notes: list = []
+    for m in hidden:
+        quote = m.group(2).strip()
+        if len(quote) > _ROW_GROUP_QUOTE_MAX_CHARS:
+            quote = quote[:_ROW_GROUP_QUOTE_MAX_CHARS - 1] + _CUT_MARK
+        note = f"（一部「{quote}」に{m.group(1)}）"
+        if note not in notes:
+            notes.append(note)
+    return parts + [(n, _NOTE, next(groups)) for n in notes]
+
+
+def _shrink_keep(text: str, over: int) -> str:
+    """残す部品を `over` バイト以上短くする。末尾の括弧書き・閉じ括弧は残し、手前を切る（切れなければそのまま）。"""
+    tail = m.group(0) if (m := _STATE_TAIL_RE.search(text)) else ""
+    head = text[:len(text) - len(tail)]
+    mark = len(_CUT_MARK.encode("utf-8"))
+    keep, saved = len(head), -mark
+    while keep > _ROW_GROUP_KEEP_HEAD_MIN_CHARS and saved < over:
+        keep -= 1
+        saved += len(head[keep].encode("utf-8"))
+    return text if keep == len(head) else head[:keep] + _CUT_MARK + tail
+
+
+def _summary(count: int) -> str:
+    """外した状態・観測の件数の要約。"""
+    return f"（ほか{count}件）"
+
+
+def _cut_share(text: str, limit: int) -> str:
+    """`limit` バイトに収める。「…」も入らない幅なら空にする。"""
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    return _cut_bytes(text, limit) if limit >= len(_CUT_MARK.encode("utf-8")) else ""
+
+
+def _fit_row(parts: list) -> str:
+    """部品を連結して 1 行の上限（`_ROW_GROUP_ROW_MAX_BYTES`）に収める。
+    ① 収まるならそのまま ② 状態の部品が無ければ従来どおり末尾を切る ③ 観測の行を詰める（括弧書きは残す）
+    ④ なお収まらなければ、組（状態と対象・観測の行と見出し）を後ろから外し、外した件数の要約を、外す前に予算へ確保して残す
+    ⑤ 通常の値を残りの幅へ均等に切る。通常の値の下限を守って収まる範囲では、状態を外さない。守れないほど幅が広い行は、状態を全部外して件数にし、残りは末尾を切る。
+    """
+    line = "".join(t for t, _k, _g in parts)
+    if len(line.encode("utf-8")) <= _ROW_GROUP_ROW_MAX_BYTES:
+        return line
+    if not any(g is not None for _t, _k, g in parts):
+        return _cut_bytes(line, _ROW_GROUP_ROW_MAX_BYTES)
+    parts = list(parts)
+    limit = _ROW_GROUP_ROW_MAX_BYTES
+
+    def fixed_bytes(dropped: set) -> int:
+        return sum(len(t.encode("utf-8")) for t, k, g in parts if k != _PLAIN and g not in dropped)
+
+    plain = [i for i, (t, k, _g) in enumerate(parts) if k == _PLAIN and t]
+    floor = _ROW_GROUP_PLAIN_MIN_BYTES * len(plain)
+    for i in sorted((i for i, (_t, k, _g) in enumerate(parts) if k == _KEEP), key=lambda j: -len(parts[j][0])):
+        over = fixed_bytes(set()) + floor - limit
+        if over <= 0:
+            break
+        parts[i] = (_shrink_keep(parts[i][0], over), _KEEP, parts[i][2])
+    groups = sorted({g for _t, _k, g in parts if g is not None})
+
+    def cost(count: int) -> int:
+        dropped = set(groups[len(groups) - count:]) if count else set()
+        return fixed_bytes(dropped) + (len(_summary(count).encode("utf-8")) if count else 0)
+
+    count = next((c for c in range(len(groups) + 1) if cost(c) + floor <= limit), None)
+    fits = count is not None
+    count = len(groups) if count is None else count
+    summary_at = -1   # 挿入した要約の部品の添字（原本の値が同じ文字でも取り違えない）
+    if count:
+        dropped = set(groups[len(groups) - count:])
+        summary_at = next(i for i, p in enumerate(parts) if p[2] in dropped)
+        parts = [(_summary(count), _KEEP, None) if i == summary_at else ("", _SEP, None) if p[2] in dropped else p
+                 for i, p in enumerate(parts)]
+    if not fits:
+        # 通常の値の下限を守れないほど幅が広い行: 状態を全部外して件数にし、残りは従来どおり末尾を切る（要約は切らない）。
+        body = "".join(t for i, (t, _k, _g) in enumerate(parts) if i != summary_at)
+        return _cut_bytes(body, limit - len(_summary(count).encode("utf-8"))) + _summary(count)
+    plain = [i for i, (t, k, _g) in enumerate(parts) if k == _PLAIN and t]
+    free = max(limit - fixed_bytes(set()), 0)
+    shares: dict = {}
+    for n, i in enumerate(sorted(plain, key=lambda j: len(parts[j][0].encode("utf-8")))):
+        size = len(parts[i][0].encode("utf-8"))
+        shares[i] = min(size, free // (len(plain) - n))
+        free -= shares[i]
+    return "".join(_cut_share(t, shares[i]) if i in shares else t for i, (t, _k, _g) in enumerate(parts))
+
+
 def _row_fields(row: dict, text: str) -> list:
-    """行の本文（`列名: 値` の並び）を `[(列名, 値), ...]` にする。Excel の付記の行は除き、続きの行は前の値へつなぐ。
+    """行の本文（`列名: 値` の並び）を `[(列名, 値, 観測の行か), ...]` にする。Excel の付記の行は除き、続きの行は前の値へつなぐ。
+    観測の行（描画が付けた状態・重なり・関係の行）かどうかは、描画が JSONL に記録した行番号（`observation_lines`）で決める（見出しと値の見た目では決めない）。
     `列名: 値` の行が無ければ rag.md の本文を値 1 つとして返す（列名は空）。
     """
     body = row.get("body")
+    numbers = row.get("observation_lines")
+    observed = {n for n in numbers if isinstance(n, int) and not isinstance(n, bool)} if isinstance(numbers, list) else set()
     fields: list = []
-    for line in (body if isinstance(body, str) else "").split("\n"):
+    for number, line in enumerate((body if isinstance(body, str) else "").split("\n")):
         m = _BODY_FIELD_RE.match(line)
         if m is not None:
-            fields.append(None if "のExcel" in m.group(1) else [m.group(1).strip(), m.group(2)])
+            fields.append(None if "のExcel" in m.group(1) else [m.group(1).strip(), m.group(2), number in observed])
+        elif number in observed and line.strip():
+            fields.append(["", line, True])
         elif fields and fields[-1] is not None and line.strip():
             fields[-1][1] += " " + line
-    fields = [(k, " ".join(v.split())) for k, v in (f for f in fields if f is not None)]
-    return fields or [("", " ".join(text.split()))]
+    fields = [(k, " ".join(v.split()), o) for k, v, o in (f for f in fields if f is not None)]
+    return fields or [("", " ".join(text.split()), False)]
 
 
 def _row_group_columns(fields: list) -> list:
     """列の並び（同じ列名が何度も出る表は何番目かで区別する）。"""
     seen: dict = {}
     out = []
-    for name, _v in fields:
+    for name, *_rest in fields:
         seen[name] = seen.get(name, 0) + 1
         out.append((name, seen[name]))
     return out
@@ -1352,20 +1495,40 @@ def _row_position(row: dict) -> str:
 
 
 def _row_group_line(row: dict, fields: list, columns: list | None) -> str:
-    """1 行を束の 1 行にする。値・行の長さは上限で切る。
-    表の行は値だけを見出しの列の順に区切り文字で並べる（見出しに無い列の値は後ろに足す）。
+    """1 行を束の 1 行にする。値・行の長さは上限で切る（状態と対象・観測の行は `_value_parts`・`_fit_row` が組で残し、外した分は件数で示す）。
+    表の行は値だけを見出しの列の順に区切り文字で並べる（見出しに無い列の観測の行は後ろに足し、見出しを添える）。
     見出しの無い配置の行（`columns is None`）は、列名の代わりにセルの位置と項目のラベルを値に添える。
+    `fields` の要素は `(列名, 値, 観測の行か)`（観測の行かを省いた `(列名, 値)` も受ける）。
     """
+    groups = itertools.count()
+    parts: list = []
+
+    def add(key: str, v: str, observed: bool, *, heading: bool) -> None:
+        group = next(groups) if observed else None
+        if heading and key:
+            parts.append((f"{key}: ", _SEP, group))
+        parts.extend(_value_parts(v, group, groups))
+
     if columns is None:
-        values = [(f"{k}: " if k and k != _COORD_DEFAULT_LABEL else "") + _cut_value(v) for k, v in fields]
-        line = " ".join(x for x in (_row_position(row), _ROW_GROUP_SEP.join(values)) if x)
-        return _cut_bytes(line, _ROW_GROUP_ROW_MAX_BYTES)
-    by_col = dict(zip(_row_group_columns(fields), (v for _k, v in fields)))
-    values = [by_col.pop(c, "") for c in columns] + list(by_col.values())
-    while values and not values[-1]:
-        values.pop()
-    line = _ROW_GROUP_SEP.join(_cut_value(v) for v in values)
-    return _cut_bytes(line, _ROW_GROUP_ROW_MAX_BYTES)
+        position = _row_position(row)
+        if position:
+            parts.append((position, _SEP, None))
+        for n, (k, v, *rest) in enumerate(fields):
+            if n:
+                parts.append((_ROW_GROUP_SEP, _SEP, None))
+            elif position:
+                parts.append((" ", _SEP, None))
+            add(k, v, bool(rest and rest[0]), heading=k != _COORD_DEFAULT_LABEL)
+        return _fit_row(parts)
+    by_col = {c: (v, bool(rest and rest[0])) for c, (_k, v, *rest) in zip(_row_group_columns(fields), fields)}
+    cells = [(c[0], *by_col.pop(c, ("", False)), False) for c in columns] + [(c[0], *by_col[c], True) for c in by_col]
+    while cells and not cells[-1][1]:
+        cells.pop()
+    for n, (k, v, observed, extra) in enumerate(cells):
+        if n:
+            parts.append((_ROW_GROUP_SEP, _SEP, None))
+        add(k, v, observed, heading=extra and observed)
+    return _fit_row(parts)
 
 
 def _row_group_head_lines(row: dict, text: str, fields: list) -> tuple:
@@ -1396,11 +1559,26 @@ def _body_group_line(text: str) -> str:
     return "\n".join(ln for ln in text.split("\n") if ln.strip() and not ln.startswith(_BODY_GROUP_TAIL_DROP))
 
 
+def _row_group_identifier_meta(group: list) -> dict:
+    """まとまりの構成行の識別子。`row_group_identifier_values`＝全行の識別子の集合（kNN の exact が引く）、
+    `row_group_identifier_rows`＝識別子を持つ行ごとの `{chunk_id, values}`（当たった行へ戻す）。識別子が無ければ空。
+    """
+    rows = []
+    for _i, body, _t, _r, _l in group:
+        values = list(dict.fromkeys(_str_list(body.get("identifier_values")) + _str_list(body.get("record_identity_values"))))
+        if values:
+            rows.append({"chunk_id": body["chunk_id"], "values": values})
+    if not rows:
+        return {}
+    return {"row_group_identifier_values": list(dict.fromkeys(v for r in rows for v in r["values"])),
+            "row_group_identifier_rows": rows}
+
+
 def _row_group_entries(group: list, head_lines: list):
     """連続する表の行・本文のチャンク `[(es_id, body, text, row, line), ...]` を `(es_id, body, text, skip_embed)` で返す。
-    先頭だけがまとまりの文字（`head_lines`＋各件の `line`）でベクトルを取り、`vector_text`・`row_group` を持つ。
+    先頭だけがまとまりの文字（`head_lines`＋各件の `line`）でベクトルを取り、`vector_text`・`row_group` と、構成行の識別子（`row_group_identifier_values`／`row_group_identifier_rows`）を持つ。
     表の行は出所・列名の行＋各行の値だけの行、本文は先頭の本文＋2 件目以降の本文（`_body_group_line`）。
-    2 件目以降はベクトルを取らない。1 件だけのまとまりは rag.md の本文のまま埋め込む。
+    2 件目以降はベクトルを取らず、先頭の chunk_id（`row_group_head_chunk_id`）を持つ。1 件だけのまとまりは rag.md の本文のまま埋め込む。
     """
     head_id, head_body, head_text, _head_row, _line = group[0]
     if len(group) == 1:
@@ -1411,9 +1589,10 @@ def _row_group_entries(group: list, head_lines: list):
     locator = _row_group_locator([row for _i, _b, _t, row, _l in group])
     if locator is not None:
         row_group["locator"] = locator
-    yield head_id, {**head_body, "vector_text": vector_text, "row_group": row_group}, vector_text, False
+    group_meta = {"vector_text": vector_text, "row_group": row_group, **_row_group_identifier_meta(group)}
+    yield head_id, {**head_body, **group_meta}, vector_text, False
     for es_id, body, text, _row, _l in group[1:]:
-        yield es_id, body, text, True
+        yield es_id, {**body, "row_group_head_chunk_id": head_body["chunk_id"]}, text, True
 
 
 def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: dict):
@@ -2447,8 +2626,10 @@ def _mark_keyword_all(hits: list) -> list:
     return hits
 
 
-def _as_row_group_hit(hit: dict, src: dict) -> dict:
-    """意味検索で当たった表の行・本文のまとまりの先頭を、まとまりの本文・範囲に差し替える（`chunk_id` は先頭のまま）。"""
+def _as_row_group_hit(hit: dict, src: dict, exact: list | None = None) -> dict:
+    """意味検索で当たった表の行・本文のまとまりの先頭を、まとまりの本文・範囲に差し替える（`chunk_id` は先頭のまま）。
+    `exact` があれば、その識別子を持つ行の chunk_id を `row_group_exact_chunk_ids` に残す（先頭の行の識別子で当たった場合は先頭も含む）。
+    """
     group = src.get("row_group")
     vector_text = src.get("vector_text")
     if not isinstance(group, dict) or not isinstance(vector_text, str) or not vector_text:
@@ -2458,11 +2639,18 @@ def _as_row_group_hit(hit: dict, src: dict) -> dict:
         hit["locator"] = group["locator"]
     if isinstance(group.get("chunk_ids"), list):
         hit["row_group_chunk_ids"] = group["chunk_ids"]
+    rows = src.get("row_group_identifier_rows")
+    if exact and isinstance(rows, list):
+        wanted = set(exact)
+        matched = [r["chunk_id"] for r in rows
+                   if isinstance(r, dict) and isinstance(r.get("chunk_id"), str) and wanted.intersection(_str_list(r.get("values")))]
+        if matched:
+            hit["row_group_exact_chunk_ids"] = matched
     return hit
 
 
-def _parse_hits(res: dict, vector: bool = False) -> list:
-    """ES の応答をヒットの形にする。`vector=True`（kNN の応答）は表の行・本文のまとまりをまとまりの本文で返す。"""
+def _parse_hits(res: dict, vector: bool = False, exact: list | None = None) -> list:
+    """ES の応答をヒットの形にする。`vector=True`（kNN の応答）は表の行・本文のまとまりをまとまりの本文で返す（`exact` は `_as_row_group_hit` へ渡す）。"""
     out = []
     for h in res.get("hits", {}).get("hits", []):
         src = h.get("_source", {})
@@ -2476,7 +2664,7 @@ def _parse_hits(res: dict, vector: bool = False) -> list:
                   "importance", "importance_reason"):
             if src.get(k) is not None:
                 hit[k] = src[k]
-        out.append(_as_row_group_hit(hit, src) if vector else hit)
+        out.append(_as_row_group_hit(hit, src, exact) if vector else hit)
     return out
 
 
@@ -2527,7 +2715,7 @@ def _classify_query_exception(exc: Exception) -> str:
     return "es_query_rejected"
 
 
-def _fuse_hybrid(bm25_res: dict, knn_res: dict, k: int) -> list:
+def _fuse_hybrid(bm25_res: dict, knn_res: dict, k: int, exact: list | None = None) -> list:
     """BM25 と kNN の ES 応答を RRF（`fused_search.fuse_rrf`）で融合し、`_parse_hits` の形で上位 k 件を返す。
     重みは `_HYBRID_WEIGHT`（keyword）と残り（vector）を合計 2.0 に配分（0.5＝対等＝各 1.0）。score は RRF の点数。
     `keyword_match` はここでは BM25 の上位に出たか（kNN だけのヒットは `_mark_keyword_matches` が語の一致で付け直す）。本文・ハイライトは BM25 側を優先し、kNN だけのヒットは kNN 側の本文（ハイライトなし）。`engine_ranks` に融合前の順位を残す。
@@ -2543,7 +2731,7 @@ def _fuse_hybrid(bm25_res: dict, knn_res: dict, k: int) -> list:
     weights = {"keyword": _HYBRID_WEIGHT * 2.0, "vector": (1.0 - _HYBRID_WEIGHT) * 2.0}
     out = []
     for m in fuse_rrf(per_engine, weights, k):
-        hit = _parse_hits({"hits": {"hits": [raw[m["doc_id"]]]}}, vector="vector" in m["sources"])[0]
+        hit = _parse_hits({"hits": {"hits": [raw[m["doc_id"]]]}}, vector="vector" in m["sources"], exact=exact)[0]
         hit["score"] = m["score"]
         hit["keyword_match"] = "keyword" in m["sources"]
         hit["engine_ranks"] = dict(m["sources"])
@@ -2583,11 +2771,14 @@ def normalize_exact(exact) -> list:
     return list(dict.fromkeys(v for v in out if v and len(v) <= _EXACT_VALUE_MAX_CHARS))[:_EXACT_MAX_VALUES]
 
 
-def _exact_filter(exact: list) -> dict:
-    """識別子の完全一致（keyword の terms）。チャンクに出る識別子の全役割、またはそのレコードが定義している識別子のどちらかに一致すれば当たる。"""
-    return {"bool": {"should": [{"terms": {"identifier_values": exact}},
-                                {"terms": {"record_identity_values": exact}}],
-                     "minimum_should_match": 1}}
+def _exact_filter(exact: list, row_group: bool = False) -> dict:
+    """識別子の完全一致（keyword の terms）。チャンクに出る識別子の全役割、またはそのレコードが定義している識別子のどちらかに一致すれば当たる。
+    `row_group=True`（kNN 用・ベクトルはまとまりの先頭にしか無い）は、先頭が持つ構成行の識別子の集合（`row_group_identifier_values`）にも当たる。
+    """
+    should = [{"terms": {"identifier_values": exact}}, {"terms": {"record_identity_values": exact}}]
+    if row_group:
+        should.append({"terms": {"row_group_identifier_values": exact}})
+    return {"bool": {"should": should, "minimum_should_match": 1}}
 
 
 def search_exact(world: str, exact: list, scope_paths=None, k: int = 20, layer=None,
@@ -2641,6 +2832,7 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     lfilt = layer_mod.es_filter(layer)
     if lfilt:
         flt.append(lfilt)
+    knn_flt = flt + [_exact_filter(exact, row_group=True)] if exact else flt  # kNN だけ、まとまりの構成行の識別子にも当てる
     if exact:
         flt.append(_exact_filter(exact))
     hl = {"fields": {"text": {"fragment_size": 240, "number_of_fragments": 1}}}
@@ -2674,9 +2866,9 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
                 bm25_res = _req("POST", f"/{_index(world)}/_search", bm25)
             except Exception as exc:
                 return [], _classify_query_exception(exc)
-            # ② kNN（同じ filter・k・num_candidates）。重要度ブーストは function_score で kNN 側へ掛ける（重要度なしの資料フォルダでは不変）
+            # ② kNN（同じ k・num_candidates。filter は exact だけ構成行の識別子にも当てる）。重要度ブーストは function_score で kNN 側へ掛ける（重要度なしの資料フォルダでは不変）
             knn_clause = {"knn": {"field": "embedding", "query_vector": qb, "k": k,
-                                  "num_candidates": max(50, k * 5), "filter": flt}}
+                                  "num_candidates": max(50, k * 5), "filter": knn_flt}}
             try:
                 knn_res = _req("POST", f"/{_index(world)}/_search",
                                {"size": k, "query": _importance_boost_query(knn_clause)})
@@ -2684,7 +2876,7 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
                 # kNN だけの失敗は BM25 の結果をそのまま返す（hits は空にならない＝`es_query_failed` とは別の reason）
                 return _mark_keyword_all(_parse_hits(bm25_res)), "hybrid_query_failed"
             # ③ アプリ側で RRF 融合（設計: docs/design/rag.md「融合検索（RRF）」）④ kNN だけで出たヒットにも語が一致するかを付け直す
-            return _mark_keyword_matches(world, q, _fuse_hybrid(bm25_res, knn_res, k)), None
+            return _mark_keyword_matches(world, q, _fuse_hybrid(bm25_res, knn_res, k, exact)), None
         else:
             reason = "query_embed_failed"  # クエリ埋め込みの通信失敗 → BM25 へ
     try:
@@ -2734,7 +2926,7 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
     if lfilt:
         flt.append(lfilt)
     if exact:
-        flt.append(_exact_filter(exact))
+        flt.append(_exact_filter(exact, row_group=True))  # ベクトルはまとまりの先頭にしか無い＝構成行の識別子にも当てる
     # 上位ちょうど `k` 件を取ってから重要度で並べ替えると、「高」のヒットが取得時点で落選して浮上できない。有界の overfetch（`k*3`・上限 `k+50`）で多めに取り、補正・再ソートの後に `k` 件へ切る（重要度なしの資料フォルダは補正が no-op で結果不変）
     fetch_k = min(k * 3, k + 50)
     body = {"size": fetch_k,
@@ -2742,7 +2934,7 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
                     "num_candidates": max(50, fetch_k * 5), "filter": flt}}
     try:
         # 純 kNN は function_score で包めないため、取得後の再ランクで重要度ブーストを適用する
-        hits = _rerank_knn_by_importance(_parse_hits(_req("POST", f"/{_index(world)}/_search", body), vector=True))
+        hits = _rerank_knn_by_importance(_parse_hits(_req("POST", f"/{_index(world)}/_search", body), vector=True, exact=exact))
         return hits[:k], None
     except Exception as exc:
         return [], _classify_query_exception(exc)

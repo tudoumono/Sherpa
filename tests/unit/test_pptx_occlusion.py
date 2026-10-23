@@ -12,11 +12,18 @@ import pathlib
 import tempfile
 import zipfile
 
+import _image_builders
 from sherpa.ingest import office_md
 
 _NS = (
     'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
-    'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"'
+    'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+)
+_IMAGE_RELS = (
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+    'Target="../media/image9.png"/></Relationships>'
 )
 
 # 基準テキスト shape: (0,0) - (4000000, 2000000) EMU
@@ -47,7 +54,7 @@ def _sp_solid_fill(x, y, cx, cy, rot: str | None = None, no_fill: bool = False) 
     fill = "<a:noFill/>" if no_fill else "<a:solidFill><a:srgbClr val=\"FFFFFF\"/></a:solidFill>"
     xfrm = f'<a:xfrm{rot_attr}><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
     return f"""<p:sp>
-  <p:spPr>{xfrm}{fill}</p:spPr>
+  <p:spPr>{xfrm}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>{fill}</p:spPr>
  </p:sp>"""
 
 
@@ -64,6 +71,7 @@ def _pic(x, y, cx, cy, rot: str | None = None) -> str:
     rot_attr = f' rot="{rot}"' if rot is not None else ""
     xfrm = f'<a:xfrm{rot_attr}><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
     return f"""<p:pic>
+  <p:blipFill><a:blip r:embed="rId9"/></p:blipFill>
   <p:spPr>{xfrm}</p:spPr>
  </p:pic>"""
 
@@ -80,7 +88,11 @@ def _slide_xml(shapes: str) -> str:
 def _md_for_slide(shapes: str) -> str:
     d = tempfile.mkdtemp()
     p = pathlib.Path(d) / "a.pptx"
-    _zip(p, {"ppt/slides/slide1.xml": _slide_xml(shapes)})
+    _zip(p, {
+        "ppt/slides/slide1.xml": _slide_xml(shapes),
+        "ppt/slides/_rels/slide1.xml.rels": _IMAGE_RELS,
+        "ppt/media/image9.png": _image_builders.opaque_png(),     # `_pic` の不透明な画像
+    })
     md = office_md.to_markdown(p)
     assert md is not None
     return md

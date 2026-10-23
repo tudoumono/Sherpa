@@ -83,3 +83,28 @@ def existing_rels(world: str | None, rels, *, deadline: float | None = None) -> 
         full = world_rel_set(world, deadline=deadline)
         found |= {r for r in rels if isinstance(r, str) and r in full}
     return found
+
+
+def modified_at_map(world: str | None, rels) -> dict:
+    """出典の rel ごとに、原本ファイルの更新時刻（UTC・秒・`2026-10-22T03:04:05Z`）を返す。取れなかった rel は含めない。
+    資料フォルダの中の原本だけを `resolve` と同じ規則で解く。中身は読まず `stat` だけを行う。
+    守ること: アーカイブの中の資料は含めない（展開先の写しの時刻は原本の更新時刻ではない）。
+    設計: docs/design/chat.md「1ターンの流れ」
+    """
+    targets = list(dict.fromkeys(r for r in rels if isinstance(r, str) and r))
+    wd = worlds.world_dir(world or worlds.default_world()) if targets else None
+    if not wd:
+        return {}
+    out = {}
+    for rel in targets:
+        if importance.is_importance_control_path(rel):
+            continue
+        found = resolve_path(wd, rel)
+        if found is None:
+            continue
+        try:
+            mtime = found.stat().st_mtime
+        except OSError:
+            continue
+        out[rel] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))
+    return out

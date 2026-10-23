@@ -28,6 +28,7 @@ from . import (
     office_md,
     text_kind,
     resolve_settings,
+    resource_meter,
     scan_pdf_ocr_status,
     substage,
     world_graph,
@@ -488,8 +489,10 @@ def _run_locked_body(world, **kwargs) -> dict:
         res = _run_locked_body_impl(world, **kwargs)
     except BaseException:
         substage.unbind(failed=True)
+        resource_meter.end()
         raise
     substage.unbind()
+    resource_meter.end()
     return res
 
 
@@ -524,9 +527,16 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
             return
         stage_timings[stage]["finished_at"] = datetime.now(timezone.utc).isoformat()
         stage_timings[stage]["elapsed_ms"] = round((time.monotonic() - _stage_mono[stage]) * 1000)
+        try:
+            measured = resource_meter.stage_summary(stage)     # 待ちの理由ごとの時間とメモリの標本
+            stage_timings[stage].update(measured)
+            resource_meter.log_summary(STAGE_LABELS.get(stage, stage), stage_timings[stage]["elapsed_ms"], measured)
+        except Exception:
+            _log.debug("段の計測の記録に失敗しました（取り込み自体は継続）: stage=%s", stage, exc_info=True)
 
     run_progress = _RunProgress(run_id, world, fail_note="取り込み自体は継続")
     run_progress.attach()
+    resource_meter.begin()
 
     def _progress(stage, done=None, total=None):
         if stage != _current_stage[0]:
@@ -535,6 +545,7 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
             stage_timings[stage] = {"started_at": now_iso, "finished_at": None, "elapsed_ms": None}
             _stage_mono[stage] = time.monotonic()
             _current_stage[0] = stage
+            resource_meter.set_stage(stage)
         run_progress.set_stage(stage, done, total)
 
     _progress("scanning")
@@ -584,6 +595,10 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
         _close_stage_timing()
         if stage_timings:
             snap["stage_timings"] = {k: dict(v) for k, v in stage_timings.items()}
+        measured_run = resource_meter.snapshot()
+        if measured_run:
+            snap["resource"] = measured_run
+            resource_meter.log_summary(f"取り込み全体（資料フォルダ {world}）", None, measured_run)
         counts = _counts_summary(drep, es_summary, manifest, rows if rows_known[0] else None,
                                  scan_rep=confirm_scan_report)
         if counts:
@@ -711,6 +726,7 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
         # PG の台帳 replace が失敗すると Neo4j は新・台帳は旧のまま残る。記録は best-effort で、last_sig は pre-invalidate 済みなので次回 sync が全再構築で自己修復する。
         # office_md／neo4j は完了済みなので要約を残し、`published_snapshot` も記録する（Neo4j には既に新世代が入っているため）
         _close_stage_timing()   # pg_replace 段の時刻をここで確定する
+        measured_run = resource_meter.snapshot()
         _log_run_failure(world, run_id, [{"doc": None, "action": "blocked", "reason": f"pg_replace_failed:{e.__class__.__name__}"}])
         pending = {"status": "failed", "source_doc_ids": [r["name"] for r in rows],
                   "extraction_snapshot": {"docs": len(rows), "nodes": len(nodes), "edges": len(edges),
@@ -723,6 +739,7 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
                                           "neo4j": {"nodes": n, "edges": m,
                                                    "duration_sec": round(neo4j_duration_sec, 3)},
                                           "stage_timings": {k: dict(v) for k, v in stage_timings.items()},
+                                          **({"resource": measured_run} if measured_run else {}),
                                           "counts": _counts_summary(drep, None, manifest,
                                                                     rows if rows_known[0] else None)},
                   "published_snapshot": {"nodes": n, "edges": m},

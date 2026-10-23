@@ -83,6 +83,8 @@ git -C tmp/worktrees/rv-<name> checkout --detach <new-sha>
 
 `<new-sha>` は是正コミットの SHA。更新してから②へ戻る（`--target` は更新後の SHA を指定する）。
 
+是正ごとに回すのは変更に関係する試験だけ（`make gate-slice`）。全件の試験は RV がクローズした後、最終のコミットで 1 回だけ回す（クローズ後の変更が台帳・文書だけなら回し直さない）。RV の途中で全件を先回りして走らせない。
+
 **⑥ worktree を消す（クローズ後）**
 
 ```

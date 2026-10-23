@@ -213,6 +213,19 @@ def test_vector_hit_returns_group_text_rows_and_range_but_keyword_hit_stays_one_
     assert kw["text"] == "本文 r0" and kw["locator"] == {"cell_range": "A2"} and "row_group_chunk_ids" not in kw
 
 
+def test_exact_hit_rows_are_reported_only_for_vector_hits_with_matching_rows():
+    src = {**_HEAD_SRC, "row_group_identifier_values": ["A", "B"],
+           "row_group_identifier_rows": [{"chunk_id": "r0", "values": ["A"]}, {"chunk_id": "r1", "values": ["B", "C"]}]}
+    res = {"hits": {"hits": [_es_hit("h", src)]}}
+    assert es_index._parse_hits(res, vector=True, exact=["C", "X"])[0]["row_group_exact_chunk_ids"] == ["r1"]
+    assert es_index._parse_hits(res, vector=True, exact=["A", "B"])[0]["row_group_exact_chunk_ids"] == ["r0", "r1"]
+    assert "row_group_exact_chunk_ids" not in es_index._parse_hits(res, vector=True, exact=["X"])[0]
+    assert "row_group_exact_chunk_ids" not in es_index._parse_hits(res, vector=True)[0]
+    assert "row_group_exact_chunk_ids" not in es_index._parse_hits(res, exact=["A"])[0]
+    fused = es_index._fuse_hybrid({"hits": {"hits": []}}, res, 5, exact=["B"])
+    assert fused[0]["row_group_exact_chunk_ids"] == ["r1"]
+
+
 def test_hybrid_fusion_uses_group_only_for_hits_found_by_vector():
     other = {"doc_id": "b.docx", "chunk_id": "p1", "text": "段落"}
     bm25 = {"hits": {"hits": [_es_hit("p", other)]}}
@@ -226,6 +239,10 @@ def test_mapping_keeps_group_fields_out_of_search():
     props = es_index._mapping(1536, "kuromoji")["mappings"]["properties"]
     assert props["vector_text"] == {"type": "text", "index": False}
     assert props["row_group"] == {"type": "object", "enabled": False}
+    assert props["row_group_head_chunk_id"] == {"type": "keyword"}
+    assert props["row_group_identifier_values"] == {"type": "keyword"}
+    assert props["row_group_identifier_rows"] == {"type": "object", "enabled": False}
+    assert props["record_identity_values"] == {"type": "keyword"}
 
 
 def test_fill_missing_vectors_embeds_group_text_for_group_head(monkeypatch):
@@ -259,6 +276,67 @@ def test_fill_missing_vectors_embeds_group_text_for_group_head(monkeypatch):
     monkeypatch.setattr(es_index, "_embed_fill", fake_fill)
     es_index.fill_missing_vectors("w")
     assert calls == [["本文 r0\n\n列: r1", "段落"]]
+
+
+def _id_rows(n=3, with_ids=True):
+    rows = []
+    for i in range(n):
+        row = _row(f"r{i}", body=f"品番: ID-{i}\n品名: 部品{i}", cell=f"A{i + 2}")
+        if with_ids:
+            row["identifier_mentions"] = [{"value": f"ID-{i}", "role": "record_identity"}]
+        rows.append(row)
+    return rows
+
+
+def test_group_head_holds_member_identifiers_and_other_rows_point_to_head(tmp_path):
+    entries = _entries(tmp_path, _id_rows())
+    head, *others = [b for _i, b, _t, _s in entries]
+    assert head["row_group_identifier_values"] == ["ID-0", "ID-1", "ID-2"]
+    assert head["row_group_identifier_rows"] == [{"chunk_id": f"r{i}", "values": [f"ID-{i}"]} for i in range(3)]
+    assert head["record_identity_values"] == ["ID-0"]                       # 他の行の識別子は混ぜない
+    assert [b["row_group_head_chunk_id"] for b in others] == ["r0", "r0"]
+    assert [b["record_identity_values"] for b in others] == [["ID-1"], ["ID-2"]]
+    assert all("row_group_identifier_values" not in b and "row_group_identifier_rows" not in b for b in others)
+    assert "row_group_head_chunk_id" not in head
+
+
+def test_single_chunk_and_identifier_less_group_get_no_group_identifier_fields(tmp_path):
+    single = [b for _i, b, _t, _s in _entries(tmp_path, _id_rows(1))]
+    assert all(not k.startswith("row_group_") for k in single[0])
+    plain = [b for _i, b, _t, _s in _entries(tmp_path, _id_rows(3, with_ids=False))]
+    assert "row_group_identifier_values" not in plain[0] and "row_group_identifier_rows" not in plain[0]
+    assert plain[1]["row_group_head_chunk_id"] == "r0"
+
+
+def test_group_identifier_fields_do_not_change_embedding_text_or_cache_key(tmp_path):
+    with_ids = _entries(tmp_path, _id_rows())
+    without = _entries(tmp_path, _id_rows(with_ids=False))
+    assert [(i, t, skip) for i, _b, t, skip in with_ids] == [(i, t, skip) for i, _b, t, skip in without]
+    assert with_ids[0][1]["vector_text"] == without[0][1]["vector_text"] == with_ids[0][2]
+    ec = {"provider": "p", "model": "m", "dim": 2}
+    assert ([es_index._chunk_key(ec, b.get("vector_text") or b["text"]) for _i, b, _t, _s in with_ids]
+            == [es_index._chunk_key(ec, b.get("vector_text") or b["text"]) for _i, b, _t, _s in without])
+
+
+def _terms_match(clause, body):
+    """`_exact_filter` の bool/should/terms を、ES の keyword（配列の要素のどれかが一致）と同じ意味で 1 件の body に当てる。"""
+    return any(set(body.get(field) or ()) & set(values)
+               for c in clause["bool"]["should"] for field, values in c["terms"].items())
+
+
+def test_exact_with_vector_reaches_the_group_whichever_row_holds_the_id(tmp_path):
+    """同じレコードがまとまりの先頭・中間・末尾のどこにあっても、ベクトルを持つ先頭（kNN の候補）が exact の絞り込みを通り、当たった行の chunk_id が残る。"""
+    entries = _entries(tmp_path, _id_rows(5))
+    embedded = [(es_id, body) for es_id, body, _t, skip in entries if not skip]    # ベクトルを持つのは先頭だけ
+    assert [b["chunk_id"] for _i, b in embedded] == ["r0"]
+    for pos in (0, 2, 4):
+        exact = [f"ID-{pos}"]
+        assert [b["chunk_id"] for _i, b in embedded if _terms_match(es_index._exact_filter(exact, row_group=True), b)] == ["r0"]
+        if pos:
+            assert not [b for _i, b in embedded if _terms_match(es_index._exact_filter(exact), b)]   # 絞り込みを広げないと落ちる
+        hit = es_index._parse_hits({"hits": {"hits": [_es_hit(i, b) for i, b in embedded]}}, vector=True, exact=exact)[0]
+        assert hit["chunk_id"] == "r0" and hit["row_group_exact_chunk_ids"] == [f"r{pos}"]
+        assert hit["row_group_chunk_ids"] == [f"r{i}" for i in range(5)]
 
 
 def test_rendered_chunks_round_trip_through_gzip(tmp_path):
