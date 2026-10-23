@@ -310,7 +310,7 @@ fi
 # --- メモリの割り振り（ES・Neo4j・OCR の上限を全体のメモリから決める）。結果は RUN_DIR/mem_budget.json にも書く ---
 # shellcheck source=scripts/lib/mem_budget.sh
 . "$ROOT/scripts/lib/mem_budget.sh"
-sherpa_env_default SHERPA_OCR_MEMORY_LIMIT
+mem_budget_load_env
 mem_budget_apply
 if [ -n "${MB_TOTAL:-}" ]; then
   mem_budget_line
@@ -318,8 +318,16 @@ if [ -n "${MB_TOTAL:-}" ]; then
 fi
 
 # --- ストア（PostgreSQL / Elasticsearch / Neo4j）起動 → healthy 3つを待つ ---
-echo "ストア（PostgreSQL / Elasticsearch / Neo4j）を起動します..."
-sherpa_compose up -d
+# 取り込みを止めない再起動（make restart-web）では、動いているストアを作り直さない（設定の変更は make restart で反映する）。
+keep_stores=0
+if [ "${SHERPA_KEEP_RUNNING_STORES:-0}" = "1" ] \
+   && [ "$(sherpa_compose ps --status running --services 2>/dev/null | grep -c -E '^(postgres|elasticsearch|neo4j)$')" = "3" ]; then
+  keep_stores=1
+  echo "ストア（PostgreSQL / Elasticsearch / Neo4j）は動いているので、そのまま使います（設定の変更は make restart で反映します）"
+else
+  echo "ストア（PostgreSQL / Elasticsearch / Neo4j）を起動します..."
+  sherpa_compose up -d
+fi
 
 echo "ローカルデータを準備し、ストアの起動を待ちます..."
 # bootstrap.sh が .env 用意・ディレクトリ作成・3ストアの healthy 待ち（タイムアウト付き）を行う。
@@ -329,7 +337,7 @@ echo "ローカルデータを準備し、ストアの起動を待ちます..."
 # ストアが healthy になった後に呼ぶ。前提が足りなければ案内だけ出して起動は続行する。
 # 起動・更新に失敗（コード更新の失敗など）したときもアプリは起動を続け、最後に目立つ警告を出して非ゼロで終える。
 ocr_up_rc=0
-./scripts/ocr-up.sh || ocr_up_rc=$?
+[ "$keep_stores" = "1" ] || ./scripts/ocr-up.sh || ocr_up_rc=$?
 
 # OpenAI API キーの案内（未設定でもブロックしない）
 check_openai_key

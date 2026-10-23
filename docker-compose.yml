@@ -48,6 +48,8 @@ services:
       NEO4J_server_memory_heap_initial__size: ${SHERPA_NEO4J_HEAP_RESOLVED:-1g}
       NEO4J_server_memory_heap_max__size: ${SHERPA_NEO4J_HEAP_RESOLVED:-1g}
       NEO4J_server_memory_pagecache_size: ${SHERPA_NEO4J_PAGECACHE_RESOLVED:-512m}
+      # 1 回の書き込み（資料フォルダのグラフの置換）が使えるメモリの合計 dbms.memory.transaction.total.max。既定はヒープの 70%
+      NEO4J_dbms_memory_transaction_total_max: ${SHERPA_NEO4J_TX_MEMORY_RESOLVED:-700m}
     ports: ["127.0.0.1:${SHERPA_NEO4J_HTTP_PORT:-7474}:7474", "127.0.0.1:${SHERPA_NEO4J_BOLT_PORT:-7687}:7687"]   # localhost のみ（dev）。変更時は NEO4J_URI も対で合わせる
     volumes:
       - neo4j:/data

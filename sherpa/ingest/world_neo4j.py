@@ -313,6 +313,37 @@ def limit_edge_sources(edges: list, limit: int) -> list:
     return out
 
 
+# グラフの書き込みのメモリ不足（Neo4j の 1 回の書き込みの上限）を失敗の理由に添える文言。変数名は .env の設定名（scripts/lib/mem_budget.sh）
+MEMORY_POOL_ERROR = "MemoryPoolOutOfMemoryError"
+MEMORY_POOL_HINT = ("グラフの書き込みのメモリが足りません（Neo4j の 1 回の書き込みの上限）。"
+                    ".env の SHERPA_NEO4J_HEAP_FIXED（Neo4j のヒープ）か SHERPA_NEO4J_TX_MEMORY_MAX（1 回の書き込みの上限）を上げて make restart してください")
+
+
+def is_memory_pool_error(exc: BaseException) -> bool:
+    """Neo4j の 1 回の書き込みがメモリの上限に当たった失敗か（`Neo.TransientError.General.MemoryPoolOutOfMemoryError`）。"""
+    return MEMORY_POOL_ERROR in str(getattr(exc, "code", "") or "") or MEMORY_POOL_ERROR in str(exc)
+
+
+_WRITE_ATTEMPTS = 2
+
+
+def _write_world(session, apply):
+    """`apply(tx)` を明示のトランザクションで書いて確定する。一時的な失敗は 1 回だけやり直す。
+
+    守ること: 1 回の書き込みのメモリの上限（MemoryPoolOutOfMemoryError）に当たったら、やり直さずにそのまま失敗にする。
+    """
+    for attempt in range(1, _WRITE_ATTEMPTS + 1):
+        try:
+            with session.begin_transaction() as tx:
+                result = apply(tx)
+                tx.commit()
+                return result
+        except Exception as exc:
+            retryable = callable(getattr(exc, "is_retryable", None)) and exc.is_retryable()
+            if is_memory_pool_error(exc) or not retryable or attempt == _WRITE_ATTEMPTS:
+                raise
+
+
 def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None, unparsed_sources=None):
     """資料フォルダのグラフ（dict）を Neo4j へクリーン rebuild する（削除→全ロードを1つの write tx で行う）。
 
@@ -351,7 +382,7 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
             for c in WORLD_CONSTRAINTS:
                 s.run(c)
             def _apply(tx):
-                loaded = 0                                   # 失敗時の再試行で最初からやり直すので、数え直す
+                loaded = 0                                   # やり直しのときは最初から数え直す
                 tx.run("MATCH (n:Entity {world_id:$w}) DETACH DELETE n", w=world_id)
                 for label, items in nodes_by_label.items():
                     node_cypher = (
@@ -403,7 +434,7 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
                     pf=json.dumps(list(plugin_failures or []), ensure_ascii=False),
                     us=json.dumps(dict(unparsed_sources or {}), ensure_ascii=False))
                 return len(nodes), len(edges)
-            result = s.execute_write(_apply)
+            result = _write_world(s, _apply)
             loaded_ok = True
             return result
     finally:

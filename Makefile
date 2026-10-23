@@ -73,9 +73,9 @@ restart:          ## 利用者向け: アプリ・取り込みワーカー（＋
 	KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
 	LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
-restart-web:      ## 利用者向け: アプリ（Web）だけ再起動（取り込みワーカーは止めない＝取り込みは続く。版を変えたときは make restart で両方）
+restart-web:      ## 利用者向け: アプリ（Web）だけ再起動（取り込みワーカーは止めない＝取り込みは続く。動いているストアは作り直さない。版を変えたときは make restart で両方）
 	STOP_ONLY=app KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
-	LAN="$(LAN)" ./scripts/start.sh $(MODE)
+	SHERPA_KEEP_RUNNING_STORES=1 LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
 restart-worker:   ## 利用者向け: 取り込みワーカーだけ再起動（アプリは止めない。処理中の 1 件の完了を待つ。FORCE=1 で待たずに強制終了）
 	STOP_ONLY=worker KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true

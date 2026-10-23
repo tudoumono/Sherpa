@@ -696,11 +696,16 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
                                       plugin_failures=world_graph.plugin_failures_from_flags(flags),
                                       unparsed_sources=world_graph.unparsed_sources_from_flags(flags))
     except Exception as e:
-        # 失敗理由に接続先（ホスト:ポート）を含める（認証情報は含めない）。失敗した段も stage summary に所要時間とエラーを残す
-        return _record("failed", extra_flags=[{"doc": None, "action": "blocked",
-                       "reason": f"graph_reflect_failed:{e.__class__.__name__}@{_target_of(env['uri'] if env else '')}"}],
+        # 失敗理由に接続先（ホスト:ポート）を含める（認証情報は含めない）。失敗した段も stage summary に所要時間とエラーを残す。
+        # 書き込みのメモリ不足は、上げる設定名を理由に添える
+        target = _target_of(env["uri"] if env else "")
+        mem = world_neo4j.is_memory_pool_error(e)
+        name = world_neo4j.MEMORY_POOL_ERROR if mem else e.__class__.__name__
+        reason = f"graph_reflect_failed:{name}@{target}" + (f"（{world_neo4j.MEMORY_POOL_HINT}）" if mem else "")
+        return _record("failed", extra_flags=[{"doc": None, "action": "blocked", "reason": reason}],
                        drep=drep,
-                       neo4j_summary={"error": f"{e.__class__.__name__}@{_target_of(env['uri'] if env else '')}",
+                       neo4j_summary={"error": f"{name}@{target}",
+                                     **({"hint": world_neo4j.MEMORY_POOL_HINT} if mem else {}),
                                      "duration_sec": round(time.monotonic() - neo4j_t0, 3)})
     neo4j_duration_sec = time.monotonic() - neo4j_t0
     rows = _ledger_rows_step(world, sig)                    # ⑤ 台帳（派生 .md ができた後）
