@@ -76,7 +76,7 @@
   1. `data/run/api.log` の肥大 → `: > data/run/api.log`（稼働中でも安全に空にできます）。
   2. 使っていない Docker イメージ → `docker image prune`（**volume prune は実行しない**＝pg/neo4j/es のデータが消えます）。
   3. `data/derived/{world}/`（Office→MD の写し `md/`・RAG 正本 `rag/`・中間表現 `ir/`）は再生成可能ですが、直接消すより空きを確保してから「今すぐ更新」で
-     作り直す方が安全。`data/derived/{world}/semantic/` は退役済み（意味レイヤの残置・下の表参照）で、消しても支障ありません。
+     作り直す方が安全。**`data/derived/{world}/semantic/` は消さない**: 埋め込みのキャッシュ（`embed_cache.i8.sqlite3` など）がここにあり、消すと全文の意味検索のベクトルを外部の API で作り直すことになります（費用と時間がかかる）。中の旧い意味レイヤのファイル（`concepts.json`・`l_extract.json` 等）だけは消しても支障ありません。
 - **ES の読み取り専用ロック**: Elasticsearch は空き容量が閾値を切ると索引を自動で read-only 化します（ログに
   `flood stage disk watermark` ）。**空き容量を確保した後**、次で解除します:
 
@@ -414,7 +414,8 @@ make の書き方（`make trace CONV=136 MASK=1 MASK_MODELS=1 OUT=trace.txt`）�
 | 登録フォルダ（原本） | 外部フォルダ（例 `/mnt/c/...`、`data/kb` 配下に置く構成ならそこ） | **正本**（業務側） | 業務側のバックアップ運用に従う（Sherpa は読み取り専用） |
 | PostgreSQL | Docker ボリューム `pg` | **一次データ**（会話・台帳・レジストリ・ユーザー/設定・監査） | `make backup`（必須） |
 | 個人ファイル | `SHERPA_USERS_DIR`（既定 `data/users/`） | **一次データ** | tar（必須） |
-| 意味レイヤの状態（旧・LLM 意味抽出・業務語↔コードの自動橋渡し） | `data/derived/{world}/semantic/`（`concepts.json`/`l_extract.json` 等） | **退役済み**（ソース正典化・2026-09-04で撤去。既存環境の残置ファイルは無害・新規生成はされない） | 対象外（バックアップ不要・`--with-derived` に含めなくてよい） |
+| 埋め込みのキャッシュ | `data/derived/{world}/semantic/embed_cache.i8.sqlite3`（旧形式 `embed_cache.f32.sqlite3`・`embed_cache.sqlite3` が残っていればそれも） | 派生物（作り直すには外部 API の費用と時間がかかる） | **消さない**。`--with-derived` で守る（無くなると、次の取り込みで全チャンクの埋め込みをやり直す） |
+| 意味レイヤの状態（旧・LLM 意味抽出・業務語↔コードの自動橋渡し） | `data/derived/{world}/semantic/` の `concepts.json`/`l_extract.json` 等 | **退役済み**（ソース正典化・2026-09-04で撤去。既存環境の残置ファイルは無害・新規生成はされない） | 対象外（バックアップ不要）。同じフォルダの埋め込みのキャッシュは上の行のとおり守る |
 | env ファイル | `.env` または `SHERPA_ENV_FILE` の指す先 | 設定（API キー含む） | 安全な場所に控えを保管（アクセス制限必須） |
 | Neo4j グラフ / ES 索引 / `data/derived/{world}/`（`md/`・`rag/`・`ir/`） | ボリューム `neo4j`・`es`／派生の3層 | 派生物 | volume は `make backup` に含まれる。ローカル派生物は `--with-derived`（再取り込みでも再生成可） |
 

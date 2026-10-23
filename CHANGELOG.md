@@ -15,6 +15,11 @@
 - `make restart-web`（アプリだけの再起動）は、動いているストア（PostgreSQL・Elasticsearch・Neo4j）を作り直さない。取り込みを続けたまま版を入れ替えても、取り込み中のグラフの書き込みは切れない。Neo4j の設定の変更は、取り込みが終わってから `make restart` で反映する。
 - 手で `SHERPA_NEO4J_HEAP_RESOLVED` を付けてスクリプトから起動したときも、1 回の書き込みの上限はそのヒープの 7 割（`SHERPA_NEO4J_TX_MEMORY_MAX` があればその値）にする。スクリプトを通さずに `docker compose` を直接呼ぶときは、`SHERPA_NEO4J_TX_MEMORY_RESOLVED` も一緒に渡す（渡さないと 700MB になる）。
 
+### 運用の手引きの誤りを直した
+
+- 「`data/derived/{world}/semantic/` は消しても支障ない」は誤り。ここには**埋め込みのキャッシュ**（`embed_cache.i8.sqlite3` など）があり、消すと全チャンクの埋め込みを外部の API でやり直すことになる。
+  ディスクの空きを作るときも消さない。消してよいのは、同じフォルダの旧い意味レイヤのファイル（`concepts.json`・`l_extract.json` 等）だけ。バックアップでも守る対象に直した。
+
 ### 入れ替えの手順（取り込み中の環境）
 
 1. 版を上書きする。取り込み中は `make restart-web` だけを使う（ストアと取り込みはそのまま）。
