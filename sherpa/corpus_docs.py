@@ -346,6 +346,24 @@ def status_document_doctype(rel_path: str, world: str, *, allow_content_sniff: b
     return _doctype_for_count(result, ext)
 
 
+def classify_by_name(rel_path: str) -> tuple[str, str] | None:
+    """名前（拡張子・パス）だけで決まる `(doctype, branch)`。ファイルの中身を読まないと決まらない・秘匿名・対象外は `None`。
+    台帳の行に doctype／branch が無いときの補完用（`branch` は `iter_world_documents` と同じ `source`／`office`）。
+    """
+    ext = Path(rel_path).suffix.lower()
+
+    def _no_read(size: int = 4096) -> str:
+        raise _HeadUnreadable("name_only")
+
+    result = classify_document(rel_path, ext, _no_read, allow_content_sniff=False)
+    if result["kind"] == "unreadable":
+        return None
+    doctype = _doctype_for_count(result, ext)
+    if doctype is None:
+        return None
+    return doctype, ("source" if result["kind"] == "code" else "office")
+
+
 def _doctype_for_count(result: dict, ext: str) -> str | None:
     """`classify_document()` の戻り値から集計用 doctype を導く単一の判定（`status_document_doctype`／`manifest_doctype_count*`／`scan_report` が共有）。
     `result["sensitive"]` は Office／画像の拡張子分類へ倒さず無条件で `None`（件数に入れない）。

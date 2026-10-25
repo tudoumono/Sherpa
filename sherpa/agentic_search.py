@@ -171,14 +171,16 @@ _DESC_LIST_DOCS = ("文書台帳の一覧・件数を返す（本文は読まな
                    "完全一致）でも絞れる。docs は常に rel_path の昇順で並ぶ（offset を進めても順序は変わらない）。"
                    "count は絞り込み後の全件数（limit/offset と無関係）、docs は offset から limit 件までの"
                    "一覧（rel_path/doctype/state）。truncated:true なら残りがある——次回呼び出しの offset に"
-                   "next_offset をそのまま渡して続きを取る。")
+                   "next_offset をそのまま渡して続きを取る。"
+                   "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。")
 # list_docs（フラット一覧）に対する tree 相当のツール。フォルダ名の意味解釈はせず、クエリ時に呼び出し元の LLM が解釈する。
 _DESC_FOLDER_TREE = ("world のフォルダ階層を、深さ上限つき・フォルダごとの件数つきで俯瞰する"
                      "（本文は読まない・grep しない・list_docs のフラット一覧では階層の形が掴めない"
                      "大規模な範囲で使う）。path_prefix でフォルダ配下に絞り、depth（既定3）で列挙する深さを決める。"
                      "フォルダごとに直下ファイル数・配下（再帰）ファイル数・直下サブフォルダ数を返す。"
                      "深さ上限でまだ配下があるフォルダは truncated:true（depth を上げて掘り下げる）。"
-                     "フォルダ件数自体が多すぎるときは folders_truncated:true（count が打ち切り前の総数）＝続きは取れないので、その範囲は未確認として扱う。")
+                     "フォルダ件数自体が多すぎるときは folders_truncated:true（count が打ち切り前の総数）＝続きは取れないので、その範囲は未確認として扱う。"
+                     "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。")
 _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素・意味の近さ・関連度ランキング）。"
             "対象は資料（Office・PDF など）で、ソース（コード）は索引に含まれない——ソースは ripgrep_search で探す。"
             "言い回しが揺れる概念・日本語の同義語・自然文クエリに強い。"
@@ -218,12 +220,18 @@ _DESC_GRAPH = ("関係グラフから、ある名前（プログラム/コピー
                "接続が確認できていない参照として原本で確かめる（available が false なら申告を保存していない旧グラフ。candidates が null は 0 ではなく候補数を数えられなかった）。"
                "これは関連の近傍用（無向・言及を含む）。**変更の影響先を調べるときは graph_resolve で起点を選び graph_impact を使う**"
                "（構造の依存だけを矢印の逆向きにたどり、同名の別ノードを混ぜない）。"
+               "名前に当てはまる起点が多すぎる（既定 50 件超）ときは、関係をたどらずに too_broad（anchors＝起点の件数・"
+               "by_folder＝トップフォルダごと・by_kind＝種類ごとの件数）を返し、coverage に narrow_required が付く"
+               "＝近傍が空でも「近傍なし」ではない。**広すぎると返されたら、by_folder・by_kind を見て path_prefix（フォルダ）か kind（種類）で絞って聞き直す**。"
                "unverified は裏付け資料を確認できず一覧から除いたカード数（cards）・資料名を伏せた辺の数（edges）、"
                "excluded.data_items は粒度が細かすぎるため一覧に含めない DataItem の数、"
                "coverage.depth はたどる深さの上限（truncated が null は先に辺が残るか未判定）。"
                f"{_ITEM_PARAM_NOTE}")
 _PARAMS_GRAPH = {"type": "object", "properties": {
     "name": {"type": "string", "description": "関連をたどる起点の名前（プログラム名/データ項目名など・具体名）"},
+    "path_prefix": {"type": "string",
+                    "description": "フォルダで絞る（rel_path の先頭一致・例: '4期保守'）。選んだ範囲の内側だけを狭められ、範囲は広がらない。省略可"},
+    "kind": {"type": "string", "description": "起点を種類で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config／Dataset）。省略可"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["name"]}
 _DESC_GRAPH_RESOLVE = ("関係グラフから、名前（の一部）・種別・所属パス（の一部）に合う**起点の候補**を並べる。"
@@ -233,7 +241,7 @@ _DESC_GRAPH_RESOLVE = ("関係グラフから、名前（の一部）・種別�
                        "影響を調べる前に、候補の path などから正しい起点を選び、その canonical_id を graph_impact へ渡す"
                        "（候補が複数あって選べないときは、ユーザーに ask_user で確認してよい）。"
                        "候補が limit より多いときは count（総数）と coverage（complete:false・limits[].kind=result_cap・omitted）が付く"
-                       "＝path や kind で絞って呼び直す。coverage.complete が false のとき、候補が空でも「該当なし」とは言えない"
+                       "＝path・kind・path_prefix（フォルダ）で絞って呼び直す。coverage.complete が false のとき、候補が空でも「該当なし」とは言えない"
                        "（理由は coverage.limits[].kind）。"
                        f"{_ITEM_PARAM_NOTE}")
 _PARAMS_GRAPH_RESOLVE = {"type": "object", "properties": {
@@ -241,6 +249,8 @@ _PARAMS_GRAPH_RESOLVE = {"type": "object", "properties": {
     "kind": {"type": "string", "description": "種別で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config／Dataset）"},
     "path": {"type": "string", "description": "所属パスの一部で絞る（例: 'billing/'）"},
     "limit": {"type": "integer", "description": "返す候補の最大数（既定 20・最大 50）"},
+    "path_prefix": {"type": "string",
+                    "description": "フォルダで絞る（rel_path の先頭一致・例: '4期保守'）。選んだ範囲の内側だけを狭められ、範囲は広がらない。省略可"},
     "item": _ITEM_PARAM_SCHEMA}}
 _DESC_GRAPH_IMPACT = ("**起点の canonical_id**（graph_resolve で選んだもの）から、構造の依存（COPIES／CONTAINS／INVOKES／ACCESSES）だけを"
                       "矢印の逆向きにたどり、起点を変えたときに影響を受ける部品（影響先）を返す。名前は受け取らない"
@@ -276,7 +286,7 @@ _DESC_GRAPH_IMPACT = ("**起点の canonical_id**（graph_resolve で選んだ�
                       "coverage.depth.truncated が true）、transfer.complete＝探索した結果を最後まで受け取れたか。"
                       "探索が終わっていても続きのページが残っていれば transfer.complete は false、最後のページで true になる。"
                       "exploration.complete が false のときは影響先が空でも「影響なし」とは言えない＝未確認。"
-                      "depth を上げて呼び直すか、範囲を未確認と明記する。"
+                      "depth を上げて呼び直すか、範囲を未確認と明記する。時間切れ・件数の天井で届ききらないときは path_prefix（フォルダ）で範囲を狭めて呼び直せる。"
                       f"{_ITEM_PARAM_NOTE}")
 _PARAMS_GRAPH_IMPACT = {"type": "object", "properties": {
     "canonical_id": {"type": "string", "description": "起点の識別子（graph_resolve の candidates[].canonical_id）"},
@@ -288,6 +298,8 @@ _PARAMS_GRAPH_IMPACT = {"type": "object", "properties": {
     "generation": {"type": "string", "description": "続きの呼び出しで、前の応答の generation をそのまま渡す（取り込みの世代と条件の確認用）"},
     "evidence_limit": {"type": "integer", "description": "辺ごとに返す根拠（sources）の最大件数（既定 3・0〜10）。0 にすると trace・route・evidence の無い軽い一覧（via＝辺の種類の列だけ）になり、1 ページに多く入る。一覧は 0 で取り、根拠が要る対象だけ上げる"},
     "flow_depth": {"type": "integer", "description": "データの流れの候補をたどる段数（既定 3・最大 10・0 でたどらない）。候補は flow_candidates に別に返る"},
+    "path_prefix": {"type": "string",
+                    "description": "フォルダで絞る（rel_path の先頭一致・例: '4期保守'）。選んだ範囲の内側だけを狭められ、範囲は広がらない。省略可"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["canonical_id"]}
 _PARAMS_GLOB = {"type": "object", "properties": {
@@ -300,7 +312,8 @@ _PARAMS_GLOB = {"type": "object", "properties": {
 _DESC_GLOB = ("ファイル名・フォルダ名のパターンで対象範囲内のファイルを列挙する（中身は読まない・パスのみ）。"
              "大文字小文字は区別しない。該当パス一覧と総件数を返す（上限200件・超過分は打ち切り＝truncated:true。"
              "続きは取れないので、その範囲は未確認として扱い count との差を全件と断定しない）。"
-             "『x/**』は x 自体にも一致する（配下だけに絞るなら『x/**/*』）。")
+             "『x/**』は x 自体にも一致する（配下だけに絞るなら『x/**/*』）。"
+             "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。")
 # grep と同格の素朴な決定的ツール。2 文書の RAG 正本（.rag.md）の unified diff を返すだけで、レコード同定・業務キー対応付け・要約は呼び出し元の LLM が diff を読んで行う。
 _DESC_COMPARE = ("2つの文書のRAG正本（.rag.md）を突き合わせ、追加/削除/変更行の unified diff を返す"
                  "（grepと同格の決定的な文字列比較——要約や業務レコードの対応付けはしない・"

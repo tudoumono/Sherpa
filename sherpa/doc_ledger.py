@@ -4,8 +4,13 @@
 """
 from __future__ import annotations
 
+import logging
+from typing import NamedTuple
+
 from . import corpus_docs, documents, scope_infer as si, store, worlds
 from .ingest import importance, text_kind
+
+_log = logging.getLogger("sherpa")
 
 
 def documents_for(world: str, *, root=None, deadline: float | None = None, files=None) -> list:
@@ -31,6 +36,70 @@ def documents_for(world: str, *, root=None, deadline: float | None = None, files
             r = {**r, "state": "unreadable", "label": "読み取れません", "reason": reason}
         out.append(r)
     return out
+
+
+class Listing(NamedTuple):
+    """一覧の道具向けの文書行。`ledger_at`＝台帳から出したときの台帳の行の更新時刻（ISO 8601）・歩いたときは None。"""
+    rows: list
+    ledger_at: str | None
+
+
+def _listing_row_from_ledger(r: dict) -> dict | None:
+    """台帳の 1 行 → 一覧の道具が使う形（`name`／`doctype`／`branch`／`status`）。
+    doctype／branch が欠けていれば状態に関係なく名前から補い、補えなければ None（呼び出し元が歩く経路へ戻す）。
+    """
+    name = r["name"]
+    doctype, branch, status = r.get("doctype"), r.get("branch"), r.get("status")
+    if doctype is None or branch is None:
+        got = corpus_docs.classify_by_name(name)
+        if got is None:
+            return None
+        doctype, branch = doctype or got[0], branch or got[1]
+    return {"name": name, "doctype": doctype, "branch": branch, "status": status}
+
+
+def _blocked_of_ledger_run(run) -> dict | None:
+    """台帳を置き換えた run の blocked flag（`{doc: reason}`）。run が無い・まだ終わっていない（flags が確定していない）ときは None（呼び出し元が unknown に倒す）。"""
+    if run is None or run.get("status") in ("queued", "extracting"):
+        return None
+    flags = run.get("flags")
+    flags = flags if isinstance(flags, list) else []
+    return {f["doc"]: f["reason"] for f in flags
+            if isinstance(f, dict) and f.get("action") == "blocked"
+            and isinstance(f.get("doc"), str) and f.get("reason")}
+
+
+def listing_documents(world: str, *, deadline: float | None = None) -> Listing:
+    """一覧の道具（list_docs／glob_search／folder_tree）向けの文書行（`name` 昇順）。
+    台帳があればそれだけを読み（資料フォルダは歩かない）、`ledger_at`（台帳の行の更新時刻）を付ける。
+    台帳の行・時点・blocked の突き合わせ（台帳を置き換えた run の flags だけ）は `world_swap_lock_shared` の有界の待ちの中で、1 つのスナップショットから読む。
+    台帳が空・台帳が読めない・rebind／削除の待ちが上限を超えた・行を補えないときは `documents_for`（実走査）の結果を返す（`ledger_at=None`）。
+    台帳を置き換えた run を結びつけられないときは、突き合わせず `documents_for` と同じくソース枝の ready 文書を `unknown` に倒す。
+    行は `name`／`doctype`／`branch`／`state` を持つ（`documents_for` の同名キーと同じ意味）。
+    """
+    try:
+        with store.world_swap_lock_shared(world, timeout_ms=SWAP_LOCK_WAIT_MS):
+            snap = store.read_ledger_for_listing(world)
+    except Exception as e:
+        _log.warning("listing_documents: world=%s 台帳を読めないため資料フォルダを歩きます: %s", world, e)
+        snap = None
+    if snap is not None and snap["rows"]:
+        rows = []
+        for r in snap["rows"]:
+            if text_kind.is_sensitive_doc_id(r["name"]) or importance.is_importance_control_path(r["name"]):
+                continue
+            row = _listing_row_from_ledger(r)
+            if row is None:
+                rows = None
+                break
+            rows.append(row)
+        if rows is not None:
+            rows = _reconcile_ledger_blocked(rows, _blocked_of_ledger_run(snap["run"]))
+            out = [{"name": r["name"], "doctype": r["doctype"], "branch": r["branch"],
+                    "state": _LEDGER_STATUS_DISPLAY.get(r["status"], r["status"]) or "ready"}
+                   for r in sorted(rows, key=lambda r: r["name"])]
+            return Listing(out, snap["ledger_at"].isoformat())
+    return Listing(documents_for(world, deadline=deadline), None)
 
 
 def _importance_fields(rel: str, res_map: dict) -> dict:

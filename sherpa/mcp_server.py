@@ -208,7 +208,8 @@ _DESC_GRAPH_PLAIN = (
     "COPIES／INVOKES／ACCESSES／CONTAINS だけの経路は構造的な依存＝根拠にしてよい（影響は矢印をさかのぼる: "
     "A →COPIES→ B は B を変えると A が影響を受ける）。DOCUMENTS（言及）・CORRESPONDS_TO（同名の対応）や "
     "`unverified` の辺を含む経路は候補＝原本で確認する。名前は完全一致で引く（シェルで正確な名前を見つけてから"
-    "渡す）。近傍が上限で切られたときは truncated:true と count（総数）が付く＝その範囲は未確認として扱う。"
+    "渡す）。名前に当てはまる起点が多すぎる（既定 50 件超）ときは、関係をたどらずに too_broad（anchors・by_folder・by_kind の件数）を"
+    "返す＝path_prefix（フォルダ）か kind（種類）で絞って聞き直す。近傍が上限で切られたときは truncated:true と count（総数）が付く＝その範囲は未確認として扱う。"
     "coverage.complete が false のとき（時間切れ・件数の上限・文書探索の打ち切り・カード数の上限）は、近傍が空でも"
     "「近傍なし」とは言えない＝未確認（理由は coverage.limits[].kind）。"
 )

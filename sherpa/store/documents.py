@@ -118,3 +118,25 @@ def count_and_list_documents(world, *, limit: int | None, offset: int = 0) -> tu
         if limit is None:
             return total, c.execute(cols, (_KB_ID, world)).fetchall()
         return total, c.execute(cols + " LIMIT %s OFFSET %s", (_KB_ID, world, limit, offset)).fetchall()
+
+
+def read_ledger_for_listing(world) -> dict:
+    """一覧の道具向けに、台帳の行・台帳の時点・台帳を置き換えた run の blocked を 1 つの読み取り専用 REPEATABLE READ トランザクションで読む。
+    戻り値は `{"rows": [{name, doctype, branch, status}], "ledger_at": 台帳の行の最大 updated_at, "run": {status, flags} | None}`。行は一覧が使う 4 列だけ。
+    `run`＝台帳の時点より前に作られた最新の run（同じ資料フォルダの run は 1 つずつ動くので、台帳を最後に書いたのはこの run）。無ければ None。
+    台帳が空なら `rows=[]`・`ledger_at=None`・`run=None`。
+    """
+    _ensure()
+    with _connect() as c:
+        c.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        head = c.execute("SELECT COUNT(*) AS n, MAX(updated_at) AS at FROM documents WHERE kb_id=%s AND version=%s",
+                         (_KB_ID, world)).fetchone()
+        if not head or head["n"] == 0:
+            return {"rows": [], "ledger_at": None, "run": None}
+        rows = c.execute("SELECT name, doctype, branch, status FROM documents WHERE kb_id=%s AND version=%s",
+                         (_KB_ID, world)).fetchall()
+        run = c.execute(
+            "SELECT status, extraction_snapshot->'flags' AS flags FROM ingest_runs "
+            "WHERE kb_id=%s AND version=%s AND created_at <= %s ORDER BY id DESC LIMIT 1",
+            (_KB_ID, world, head["at"])).fetchone()
+        return {"rows": rows, "ledger_at": head["at"], "run": run}

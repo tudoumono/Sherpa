@@ -17,11 +17,13 @@ KIND_CARD_CAP = "card_cap"                        # 近傍カードの件数・�
 KIND_GRAPH_UNAVAILABLE = "graph_unavailable"
 KIND_GRAPH_REINGEST_REQUIRED = "graph_reingest_required"
 KIND_PLUGIN_FAILED = "plugin_failed"              # FW プラグインの失敗（`limits[].plugin` にプラグイン名。欠けはそのプラグインを直して取り込み直すまで残る）
+KIND_NARROW_REQUIRED = "narrow_required"          # 起点の候補が多すぎるため、たどらずに絞り込みを求めた（`path_prefix`・`kind` で絞って聞き直す）
 KIND_SOURCE_UNPARSED = "source_unparsed"          # 構文を読み切れない／大きすぎるソースをグラフに入れていない（`limits[].count` にそのファイル数。「関係が無い」とは言えない）
 
 LIMIT_KINDS = (
     KIND_TIMEOUT, KIND_ROW_CAP, KIND_DEPTH, KIND_RESULT_CAP, KIND_DOC_SEARCH_TRUNCATED, KIND_CARD_CAP,
     KIND_GRAPH_UNAVAILABLE, KIND_GRAPH_REINGEST_REQUIRED, KIND_PLUGIN_FAILED, KIND_SOURCE_UNPARSED,
+    KIND_NARROW_REQUIRED,
 )
 
 # 処理の段階（`limits[].stage`・Codex の道具と各レンズだけが付ける。外部 API の `limits` には出さない）。

@@ -153,6 +153,9 @@ def _result_byte_size(result) -> int:
 
 # graph_neighbors のカード件数上限（troubleshoot UI 用サイドカー・env 化しない）
 _GRAPH_CARDS_MAX = 30
+# graph_neighbors の起点が上限を超えたとき（たどらずに返す）の案内
+_TOO_BROAD_MESSAGE = ("起点の候補が多すぎるため、関係をたどっていません。path_prefix（フォルダ）か kind（種類）で絞って聞き直してください"
+                      "（by_folder・by_kind が当てはまる起点の件数）。")
 
 def _clip_cards(cards: list, max_count: int = _GRAPH_CARDS_MAX, max_bytes: int = TOOL_RESULT_MAX_BYTES) -> list:
     """`cards`（`graph_neighbors` のカード・troubleshoot UI 用サイドカー）を件数＋直列化バイト上限で切り詰める（超過分は捨てる・fail-closed）。
@@ -1166,7 +1169,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     # run 単位で snapshot 済みの値（無ければコード既定）
     tr_max_bytes = tool_result_max_bytes if tool_result_max_bytes is not None else TOOL_RESULT_MAX_BYTES
     if name == "list_docs":
-        from ... import doc_ledger  # 台帳＝資料フォルダのフォルダ木を走査（常に live）
+        from ... import doc_ledger  # 最後の取り込みの台帳（無ければ資料フォルダを走査）
         prefix = str(args.get("path_prefix") or "").strip().strip("/")
         pattern = str(args.get("name_pattern") or "").strip().lower()
         doctype_filter = str(args.get("doctype") or "").strip().lower()
@@ -1182,7 +1185,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             offset = 0
         offset = max(0, offset)
         # 層判定は `doc_ledger`（`classify_document` 確定済み）の `branch=="source"` を使う（grep／ES と同じ確定判定）
-        rows = [r for r in doc_ledger.documents_for(world, deadline=deadline)
+        listing = doc_ledger.listing_documents(world, deadline=deadline)
+        rows = [r for r in listing.rows
                if scope_mod.in_scope(r["name"], sp)
                and layer_mod.in_layer_code(r.get("branch") == "source", layer)]
         if prefix:
@@ -1202,8 +1206,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             docs.add(d["rel_path"])  # 一覧に出した分だけ出典（sources）に載せる
         shown_end = offset + len(out)
         truncated = shown_end < len(rows)
-        return ({"count": len(rows), "offset": offset, "docs": out, "truncated": truncated,
-                "next_offset": shown_end if truncated else None}, docs, cites, cards)
+        result = {"count": len(rows), "offset": offset, "docs": out, "truncated": truncated,
+                  "next_offset": shown_end if truncated else None}
+        if listing.ledger_at:
+            result["ledger_at"] = listing.ledger_at  # 最後の取り込みの時点の一覧（以降の変更は含まない）
+        return (result, docs, cites, cards)
     if name == "folder_tree":
         # フォルダは文書ではない（`docs`＝doc_id 集合には何も足さない・出典／引用の対象外）
         from ... import folder_tree as folder_tree_mod
@@ -1211,22 +1218,25 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                                        tool_result_max_bytes=tr_max_bytes)
         return (result, docs, cites, cards)
     if name == "glob_search":
-        from ... import doc_ledger  # list_docs と同じ台帳走査（常に live）
+        from ... import doc_ledger  # list_docs と同じ一覧の出所
         pattern = _validate_glob_pattern(args.get("pattern"))
         if pattern is None:
             return ({"error": "pattern が不正です（絶対パス・`..`・NUL・空文字・長すぎるパターンは使えません）"},
                     docs, cites, cards)
         match_pattern = _glob_match_pattern(pattern).lower()
         # 範囲・層は list_docs と同じ確定判定（`branch=="source"`）を使う
-        matched = [r["name"] for r in doc_ledger.documents_for(world, deadline=deadline)
+        listing = doc_ledger.listing_documents(world, deadline=deadline)
+        matched = [r["name"] for r in listing.rows
                   if scope_mod.in_scope(r["name"], sp)
                   and layer_mod.in_layer_code(r.get("branch") == "source", layer)
                   and importance._match_segment_glob(match_pattern, r["name"].lower())]
         shown = matched[:_GLOB_MAX_RESULTS]
         for p in shown:
             docs.add(p)  # 出した分だけ出典に載せる
-        return ({"count": len(matched), "paths": shown, "truncated": len(matched) > len(shown)},
-                docs, cites, cards)
+        result = {"count": len(matched), "paths": shown, "truncated": len(matched) > len(shown)}
+        if listing.ledger_at:
+            result["ledger_at"] = listing.ledger_at
+        return (result, docs, cites, cards)
     if name in ("ripgrep_search", "es_search"):
         q = str(args.get("query") or "")
         q_hit = q.strip()  # grep 本体と同じく前後の空白を除いた語で一致行を探す
@@ -1476,8 +1486,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         from ...ingest.world_neo4j import GraphSchemaEraError  # 遅延 import（循環回避）
         if layer == "docs":
             return ({"error": graph_tools.LAYER_REJECT_MESSAGE}, docs, cites, cards)
+        sp_g, prefix_error = _narrow_scope_by_prefix(sp, args.get("path_prefix"))   # 絞り込みは利用者の範囲の内側だけ（広げない）
+        if prefix_error:
+            return ({"error": graph_tools.INVALID_ARGS_ERROR, "message": prefix_error}, docs, cites, cards)
         try:
-            result = graph_tools.run(name, args, world, sp, layer=layer, max_bytes=tr_max_bytes)
+            result = graph_tools.run(name, args, world, sp_g, layer=layer, max_bytes=tr_max_bytes)
         except GraphSchemaEraError as e:
             return ({"error": GRAPH_REINGEST_ERROR_CODE, "world": e.world, "stored_era": e.stored_era},
                     docs, cites, cards)
@@ -1491,16 +1504,26 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         if layer not in (None, "both"):
             # 層が限定されている間は `graph_neighbors` 自体を拒否する（グラフ traversal は層フィルタ非適用のため、層外の名前・経路・doc_id が漏れる迂回路になる）
             return ({"error": "指定した探す対象（層）では関係グラフの照会は使えません"}, docs, cites, cards)
-        from ... import lens_service  # 遅延 import（循環回避）
+        from ... import graph_tools, lens_service  # 遅延 import（循環回避）
+        from ...ingest.model import NODE_LABELS
         from ...ingest.world_neo4j import GraphSchemaEraError  # 遅延 import（循環回避）
         term = str(args.get("name") or "")
+        kind = str(args.get("kind") or "").strip()
+        if kind and kind not in NODE_LABELS:
+            return ({"error": graph_tools.INVALID_ARGS_ERROR,
+                     "message": f"kind は {', '.join(sorted(NODE_LABELS))} のいずれか"}, docs, cites, cards)
+        sp_n, prefix_error = _narrow_scope_by_prefix(sp, args.get("path_prefix"))   # 絞り込みは利用者の範囲の内側だけ（広げない）
+        if prefix_error:
+            return ({"error": graph_tools.INVALID_ARGS_ERROR, "message": prefix_error}, docs, cites, cards)
+        sp = sp_n or None   # 以降の裏付け資料の検証も、狭めた範囲で行う
+        kind_kw = {"kind": kind} if kind else {}
         try:
             if not term:
                 raw_cards = []
             elif graph_only:
-                raw_cards = lens_service.neighbor_cards_graph_only(world, term, sp)
+                raw_cards = lens_service.neighbor_cards_graph_only(world, term, sp, **kind_kw)
             else:
-                raw_cards = lens_service.neighbor_cards(world, term, sp)
+                raw_cards = lens_service.neighbor_cards(world, term, sp, **kind_kw)
         except GraphSchemaEraError as e:
             # 世代不一致は調査を終端させず、MCP 側と同じ機械可読コードのツール結果へ変換して返す（`_record_tool_result_error_code` が `graph_schema_era_mismatch` を立てる）
             return ({"error": GRAPH_REINGEST_ERROR_CODE, "world": e.world, "stored_era": e.stored_era},
@@ -1529,6 +1552,10 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                  "path": c.get("path", []), "distance": c.get("distance"),
                  "edges": _card_edges_view(c, world, sp)} for c in cards]
         result = {"neighbors": view}
+        too_broad = getattr(raw_cards, "too_broad", None)
+        if too_broad:
+            # 起点が多すぎて、たどらずに絞り込みを求めた（近傍が空でも「近傍なし」ではない）。内訳は先頭のフォルダ別・種類別の起点の件数
+            result["too_broad"] = {**too_broad, "message": _TOO_BROAD_MESSAGE}
         unverified_edges = sum(1 for v in view for e in v["edges"] if e.get("unverified"))
         if unverified_cards or unverified_edges:
             # 裏付け資料を確認できなかったカード（一覧から除外）・辺（資料名を伏せて `unverified`）の数。名前は出さない

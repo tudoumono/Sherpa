@@ -1,6 +1,6 @@
 """`folder_tree` ツール本体: world のフォルダ階層を深さ上限つきで俯瞰する、LLM・索引を使わない決定的な木。
 
-`doc_ledger` が返す rel_path 一覧から、フォルダ単位で直下/再帰ファイル数・直下サブフォルダ数を集計するだけで、
+`doc_ledger.listing_documents` が返す rel_path 一覧から、フォルダ単位で直下/再帰ファイル数・直下サブフォルダ数を集計するだけで、
 フォルダ名の意味解釈はしない（クエリ時にエージェントが解釈する）。
 """
 from __future__ import annotations
@@ -40,6 +40,7 @@ def build(world: str, args: dict, *, scope_paths=None, deadline: float | None = 
     `{"path", "depth", "direct_files", "total_files", "subfolders", "truncated"}`。要素の `truncated` は深さ上限で配下を
     表示していない意味、`folders_truncated` は件数/バイトの安全弁で一部フォルダを返していない意味（別の事実）。
     `count` は打ち切り前の総フォルダ数。
+    一覧を最後の取り込みの台帳から出したときだけ `ledger_at`（その取り込みの時点・ISO 8601）を付ける。
     """
     args = args or {}
     prefix = str(args.get("path_prefix") or "").strip().strip("/")
@@ -48,7 +49,8 @@ def build(world: str, args: dict, *, scope_paths=None, deadline: float | None = 
     tr_max_bytes = (tool_result_max_bytes if tool_result_max_bytes is not None
                    else _DEFAULT_TOOL_RESULT_MAX_BYTES)
 
-    rows = doc_ledger.documents_for(world, deadline=deadline)
+    listing = doc_ledger.listing_documents(world, deadline=deadline)
+    rows = listing.rows
     base_parts = prefix.split("/") if prefix else []
     base_depth = len(base_parts)
 
@@ -102,10 +104,13 @@ def build(world: str, args: dict, *, scope_paths=None, deadline: float | None = 
         })
         cum_bytes += item_bytes
 
-    return {
+    result = {
         "path_prefix": prefix,
         "depth": depth,
         "count": total_count,
         "folders": folders,
         "folders_truncated": total_count > len(folders),
     }
+    if listing.ledger_at:
+        result["ledger_at"] = listing.ledger_at
+    return result

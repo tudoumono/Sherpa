@@ -77,6 +77,24 @@ def _scope_pred(var: str) -> str:
             f"{var}.path IS NOT NULL AND ({var}.path=pref OR {var}.path STARTS WITH pref+'/')))")
 
 
+def _member_scope_pred(var: str) -> str:
+    """範囲の述語。`membership_paths`（Dataset の所属パス全部）を持つノードは、そのどれかが範囲内なら範囲内。持たないノードは `_scope_pred`。"""
+    mp = f"{var}.membership_paths"
+    return (f"(CASE WHEN {mp} IS NOT NULL THEN size($prefixes)=0 OR any(mpath IN {mp} WHERE "
+            "any(pref IN $prefixes WHERE mpath=pref OR mpath STARTS WITH pref+'/')) "
+            f"ELSE {_scope_pred(var)} END)")
+
+
+def _member_visible_path(var: str) -> str:
+    """`_member_scope_pred` で範囲内と判定したノードの代表の所属パス。`membership_paths` があるときは、範囲内かつ秘匿名でない所属パスの先頭
+    （無ければ範囲内の先頭＝呼び出し側の秘匿名の除外に掛かる）。`membership_paths` が無いときは `path`。`$s_exact`・`$s_pre`・`$s_ext` を使う。"""
+    mp = f"{var}.membership_paths"
+    inscope = "(size($prefixes)=0 OR any(pref IN $prefixes WHERE mpath=pref OR mpath STARTS WITH pref+'/'))"
+    members = f"[mpath IN {mp} WHERE {inscope}"
+    return (f"(CASE WHEN {mp} IS NOT NULL THEN coalesce(head({members} AND {_not_sensitive_path('', path='mpath')}] + {members}]), {var}.path) "
+            f"ELSE {var}.path END)")
+
+
 # 影響分析の Neo4j 安全弁: per-query timeout・ストリーム反復・緊急天井（Cypher に LIMIT は入れない）。
 # timeout・天井到達のどちらも `GraphQueryOverloadError` を必ず raise し、部分結果や空を黙って返さない
 # （空は「影響なし」と誤読されるため。呼び出し側の `impact_service`/`routers/impact.py`/`chat_service` が利用者へ見せる）
@@ -566,14 +584,21 @@ def _impact_edge_where(mv: str) -> str:
     )
 
 
+def _sensitive_name_params() -> dict:
+    """`_not_sensitive_path` が使う秘匿名の規則（`text_kind`）のパラメータ。"""
+    from . import text_kind
+    return dict(s_exact=sorted(text_kind._SENSITIVE_NAME_EXACT), s_pre=list(text_kind._SENSITIVE_NAME_PREFIXES),
+                s_ext=sorted(text_kind.SENSITIVE_EXT))
+
+
 def _impact_start_nodes(session, start_cids, world_id, params) -> dict[str, dict]:
     """起点のうち、資料フォルダ・範囲・status を満たすものの `cid → {name, path}`（満たさない起点からは何も届かない）。"""
     rows = _run_read_capped(
         session,
         "MATCH (s:Entity) WHERE s.canonical_id IN $starts AND s.world_id=$world "
-        f"  AND {_scope_pred('s')} AND ($incl OR coalesce(s.status,'active')='active') "
-        "RETURN s.canonical_id AS cid, s.name AS name, s.path AS path",
-        world=world_id, starts=list(start_cids), **params)
+        f"  AND {_member_scope_pred('s')} AND ($incl OR coalesce(s.status,'active')='active') "
+        f"RETURN s.canonical_id AS cid, s.name AS name, {_member_visible_path('s')} AS path",
+        world=world_id, starts=list(start_cids), **params, **_sensitive_name_params())
     return {r["cid"]: {"name": r["name"], "path": r["path"]} for r in rows}
 
 
@@ -952,7 +977,7 @@ def list_world_candidates(session, name, world_id, scope_prefixes=None, *, kind=
                           exclude_documents: bool = False) -> list[dict]:
     """起点の候補（`graph_resolve` 用）。名前（表示名・修飾名の部分一致・大文字小文字無視）・種別（ラベル）・所属パスの一部で絞る。
     同名の複数候補はまとめず全て返す（並びは名前の完全一致 → 名前 → パス）。`match` は `exact`（名前または修飾名が一致）／`partial`。
-    範囲（`scope_prefixes`）・status は影響たどり（`world_impact`）と同じ述語。主クエリの後に `check_schema_era` を呼ぶ。
+    範囲（`scope_prefixes`）・status は影響たどり（`world_impact`）と同じ述語。`membership_paths` を持つノード（Dataset）は所属パスのどれかが範囲内なら範囲内で、返す `path` も範囲内の所属パス。主クエリの後に `check_schema_era` を呼ぶ。
     秘匿名のファイルに属するノードは返さない。`limit` を渡すと Cypher 側で上位 `limit` 件だけ取る（並びも Cypher で決める＝呼び出し側は
     `limit+1` を渡して超過の有無を見る）。`exclude_documents` が真なら資料（`Document`）を除く。
     過負荷は `GraphQueryOverloadError`（空・部分結果にしない）。
@@ -963,19 +988,20 @@ def list_world_candidates(session, name, world_id, scope_prefixes=None, *, kind=
         session,
         "MATCH (n:Entity {world_id:$w}) "
         "WHERE ($incl OR coalesce(n.status,'active')='active') "
-        f"  AND {_scope_pred('n')} "
+        f"  AND {_member_scope_pred('n')} "
         "  AND ($name = '' OR toLower(n.name) CONTAINS toLower($name) "
         "       OR toLower(coalesce(n.qualified_name,'')) CONTAINS toLower($name)) "
         "  AND ($kind = '' OR $kind IN labels(n)) "
-        "  AND ($pp = '' OR toLower(coalesce(n.path,'')) CONTAINS toLower($pp)) "
         "  AND ($docs_ok OR NOT 'Document' IN labels(n)) "
-        f"  AND {_not_sensitive_path('n')} "
+        f"WITH n, {_member_visible_path('n')} AS vpath "
+        "WHERE ($pp = '' OR toLower(coalesce(vpath,'')) CONTAINS toLower($pp)) "
+        f"  AND {_not_sensitive_path('n', path='vpath')} "
         "RETURN n.canonical_id AS cid, [l IN labels(n) WHERE l<>'Entity'][0] AS label, "
-        "  n.name AS name, n.path AS path, n.qualified_name AS qname, "
+        "  n.name AS name, vpath AS path, n.qualified_name AS qname, "
         "  coalesce(n.status,'active') AS status "
         "ORDER BY CASE WHEN toLower(n.name)=toLower($name) "
         "  OR toLower(coalesce(n.qualified_name,''))=toLower($name) THEN 0 ELSE 1 END, "
-        "  toLower(n.name), coalesce(n.path,''), n.canonical_id"
+        "  toLower(n.name), coalesce(vpath,''), n.canonical_id"
         + (" LIMIT $lim" if limit is not None else ""),
         world=world_id, w=world_id, name=term, kind=kind or "", pp=(path_part or "").strip(),
         incl=include_deprecated, prefixes=list(scope_prefixes or []), docs_ok=not exclude_documents,
@@ -1001,11 +1027,11 @@ def get_world_entities(session, cids, world_id, scope_prefixes=None, include_dep
         session,
         "MATCH (n:Entity {world_id:$w}) WHERE n.canonical_id IN $cids "
         "  AND ($incl OR coalesce(n.status,'active')='active') "
-        f"  AND {_scope_pred('n')} "
+        f"  AND {_member_scope_pred('n')} "
         "RETURN n.canonical_id AS cid, [l IN labels(n) WHERE l<>'Entity'][0] AS label, "
-        "  n.name AS name, n.path AS path, n.qualified_name AS qname",
+        f"  n.name AS name, {_member_visible_path('n')} AS path, n.qualified_name AS qname",
         world=world_id, w=world_id, cids=list(cids), incl=include_deprecated,
-        prefixes=list(scope_prefixes or []),
+        prefixes=list(scope_prefixes or []), **_sensitive_name_params(),
     )
     check_schema_era(session, world_id)
     return [{"canonical_id": r["cid"], "label": r["label"], "name": r["name"], "path": r["path"],

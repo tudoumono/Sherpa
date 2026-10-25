@@ -142,6 +142,7 @@ note_ingest_run_op
 owns_assistant_message
 owns_conversation
 purge_personal_api_keys
+read_ledger_for_listing
 recent_messages
 record_depth_quality_run
 record_failed_doc
