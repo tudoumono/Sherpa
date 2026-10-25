@@ -197,7 +197,7 @@ def test_search_with_exact_and_query_is_and(monkeypatch):
     captured = _capture(monkeypatch)
     es_index.search("w", "表示名", vector=False, exact=["A01", "B02"])
     q = captured["body"]["query"]["function_score"]["query"]["bool"]
-    assert q["must"] == [{"match": {"text": "表示名"}}]                       # 本文で順位付け
+    assert q["must"] == [es_index._keyword_clause("表示名")]                  # 本文（＋見出し系の欄）で順位付け
     assert q["filter"] == [_EXACT_CLAUSE]                                     # exact で絞る
 
 

@@ -11,8 +11,7 @@
   (c)（フェーズ7-1・response_model 実測）主要な mock 定数を `sherpa/schemas.py` の応答モデルで
       `TypeAdapter` 検証する。(a) の粒度（トップレベルのみ・ネスト1段の list は mock⊆実）より
       深い階層（nested dict の中身・2段目以降の list 要素）まで固定できるため、(a) では
-      検知できない mock drift をここで拾う（実装時に発見: `GET /graph` の `counts` が
-      `{"documents": 3}` のみで実の10フィールドを欠いていた等・是正済み）。
+      検知できない mock drift をここで拾う。
 
 比較の粒度（(a)(b) は意図的に緩い＝mock がテスト対象の全内部実装に追随する必要はない）:
   - トップレベル: キー集合の**完全一致**（mock だけのキー／実だけのキーの両方を検知）。
@@ -80,8 +79,6 @@ def client(auth_disabled):
 # S3 是正済み（ホイスト済みの定数を参照する＝二重管理しない）。
 _CASES = [
     ("/scopes", {"world": "v1"}, mock_api.SCOPES),
-    ("/graph", {"world": "v1"}, mock_api.GRAPH),
-    ("/graph/facets", {}, mock_api.GRAPH_FACETS_RESP),
     ("/world-options", {}, mock_api.WORLD_OPTIONS_RESP),
     ("/config", {}, mock_api.CONFIG_RESP),
     ("/settings", {}, mock_api.SETTINGS_RESP),
@@ -184,8 +181,6 @@ def test_mocked_routes_exist_in_route_table():
 # response_model 付与有無に関わらず検証する（TypeAdapter は response_model と無関係に動く）。
 _MOCK_SCHEMA_CASES = [
     (sc.ScopesResponse, mock_api.SCOPES, "SCOPES"),
-    (sc.GraphResponse, mock_api.GRAPH, "GRAPH"),
-    (sc.GraphFacetsResponse, mock_api.GRAPH_FACETS_RESP, "GRAPH_FACETS_RESP"),
     (sc.WorldOptionsResponse, mock_api.WORLD_OPTIONS_RESP, "WORLD_OPTIONS_RESP"),
     (sc.ConfigResponse, mock_api.CONFIG_RESP, "CONFIG_RESP"),
     (sc.SettingsResponse, mock_api.SETTINGS_RESP, "SETTINGS_RESP"),
@@ -200,7 +195,7 @@ _MOCK_SCHEMA_CASES = [
     (sc.ChatTurnsRunningResponse, mock_api.CHAT_TURNS_RUNNING_EMPTY, "CHAT_TURNS_RUNNING_EMPTY"),
     (list[sc.ConversationSummary], mock_api.CONVERSATIONS_LIST, "CONVERSATIONS_LIST"),
     # フェーズ7-1 再RV（Codex MEDIUM・2026-07-16）: 定数だけでなく handler が動的に組み立てる応答
-    # （個人ワークスペース・ナレッジグラフ・world 系）も、実関数（auth_me_response と同じ流儀で
+    # （個人ワークスペース・world 系）も、実関数（auth_me_response と同じ流儀で
     # mock_api.py 側が抽出済み）を代表引数で呼んで検証する（literal のままだと drift を検知できない）。
     (sc.WorkspaceFileUploadResponse, mock_api.workspace_upload_response(501, "note.md"),
      "workspace_upload_response"),
@@ -208,11 +203,6 @@ _MOCK_SCHEMA_CASES = [
      "workspace_delete_response"),
     (sc.WorkspaceSearchResponse, mock_api.workspace_search_response("消費税率"),
      "workspace_search_response"),
-    (sc.GraphSearchResponse,
-     mock_api.graph_search_response(
-         [{**n, "phase": None, "category": None} for n in mock_api.GRAPH["nodes"][:2]],
-         mock_api.GRAPH["edges"][:1], {"nodes": 2, "edges": 1}),
-     "graph_search_response"),
     (sc.WorldDiffResponse, mock_api.world_diff_response("/mnt/c/ProjectA"), "world_diff_response(未登録)"),
     (sc.WorldDiffResponse,
      mock_api.world_diff_response("/mnt/c/ProjectA", world_id="w1", label="4期更改",

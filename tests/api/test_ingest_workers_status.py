@@ -65,3 +65,17 @@ def test_stale_heartbeat_counts_as_not_running(client):
         c.execute("UPDATE ingest_workers SET beat_at = now() - interval '10 minutes'")
     body = client.get("/ingest/workers").json()
     assert body["worker_alive"] is False and body["message"] == worker_status.MSG_NO_WORKER
+
+
+def test_ocr_worker_stop_is_returned_as_plain_notice(client, monkeypatch):
+    from sherpa.ingest import ocr_worker, office_md
+    from sherpa.store import ocr_jobs
+
+    monkeypatch.setattr(office_md, "ocr_enabled", lambda: True)
+    monkeypatch.setattr(ocr_worker, "profile_hash", lambda: "sha256:test")
+    monkeypatch.setattr(ocr_jobs, "worker_availability_summary", lambda _profile: {"available": False})
+
+    body = client.get("/ingest/workers").json()
+
+    assert body["ocr_message"] == (
+        "画像の中の文字を読む処理が動いていません。検索には、すでに読み取れた内容だけが使われます")

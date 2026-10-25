@@ -35,6 +35,9 @@ async function loadList() {
   try {
     const ws = await fetchWorldsShared();
     const w = ws[0] || null;
+    const ids = new Set(ws.map((x) => x.world_id));
+    for (const wid of _statusAlerts.keys()) if (!ids.has(wid)) _statusAlerts.delete(wid);
+    renderNoticeCenter();
     $('regcard').hidden = !!w;                          // 登録済みなら登録フォームは出さない
     $('currentcard').hidden = !w;
     $('resolvecard').hidden = !w;
@@ -47,7 +50,7 @@ async function loadList() {
       + `<div class="rowmain"><span class="nm">${esc(w.label || w.world_id)}</span>`
       + `<span class="pth" title="${esc(w.root_path)}">${esc(w.root_path)}</span>`
       + `<button class="btn-primary mini" data-refresh="${esc(w.world_id)}">更新</button>`
-      + `<button class="btn-ghost mini" data-rag-rules="${esc(w.world_id)}" title="AI が読みやすく整えた検索用データを、AI を使わない元の形へ作り直します（監査等で AI 出力を一掃したい場合）">規則版で再生成</button>`
+      + `<button class="btn-ghost mini" data-rag-rules="${esc(w.world_id)}" title="AI が読みやすく整えた検索用データを、AI を使わない元の形へ戻します">AIで整える前の形に戻す</button>`
       + `<button class="btn-ghost mini danger" data-del="${esc(w.world_id)}" title="検索用データのみ削除（元のフォルダ・ファイルは消えません）">削除</button></div>`
       + `<div class="rowstat" data-stat="${esc(w.world_id)}"><span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>状況を確認中...</span></span></div></div>`;
     loadStat(w.world_id);                               // 入った件数/未対応/グラフ
@@ -260,13 +263,13 @@ async function checkDiff() {                          // 追加カード: 選ん
   }
 }
 
-// ---- 取り込み状況の要約（入った/未対応/グラフ） ----
+// ---- 取り込み状況の要約 ----
 function summaryText(s) {
   if (!s) return '';
-  const p = [`文書 ${esc(s.indexed)} 件を検索可能に`];
-  if (s.office_md) p.push(`うち Office ${esc(s.office_md)} 件をテキスト化`);
+  const p = [`検索できる資料 ${esc(s.indexed)} 件`];
+  if (s.office_md) p.push(`うち Office ${esc(s.office_md)} 件を読み取り済み`);
   if (s.skipped_office) p.push(`未対応 ${esc(s.skipped_office)} 件（PDF/旧形式）`);
-  if (s.office_failed) p.push(`変換失敗 ${esc(s.office_failed)} 件`);
+  if (s.office_failed) p.push(`読み取り失敗 ${esc(s.office_failed)} 件`);
   // accepts() 全滅（担当アナライザは居たが内容判定で不採用）の内訳: 既存の資料種別に該当すれば「資料扱い」（indexed に含まれる）、該当しなければ「未対応」（skipped_other に含まれる）。
   if (s.analyzer_declined_as_document || s.analyzer_declined) {
     const declined = [];
@@ -277,7 +280,7 @@ function summaryText(s) {
   if (s.skipped_other) p.push(`除外 ${esc(s.skipped_other)} 件`);
   // 本文が読めない（バイナリ・読み取り失敗・秘匿）ため grep/全文検索/精読のどれからも対象外にしたファイル数。
   // `scanned`/`skipped_other` と同じ資料フォルダ単位のキャッシュ値を使う（run 由来の値だと無変更の再同期後に表示が消える）。
-  // `counts_as_of` が無い（未集計）ときは件数を出さない（実測でない 0 を「対象外 0 件」と誤解させない）。
+  // `counts_as_of` が無い（件数未確認）ときは件数を出さない（実測でない 0 を「対象外 0 件」と誤解させない）。
   // 理由が判明している分（文字コード判別不能／バイナリ）だけ内訳をカッコ書きで添える（残りは秘匿/その他の未対応で、理由を出さない）。
   if (s.counts_as_of && s.unreachable_as_text) {
     const byReason = s.unreachable_by_reason || {};
@@ -289,23 +292,18 @@ function summaryText(s) {
   }
   // 「一部が化けている（要確認）」は対象外にしない別枠（`partial_extraction_suspected` と同型）。
   if (s.counts_as_of && s.encoding_partial_count) p.push(`一部が化けている（要確認） ${esc(s.encoding_partial_count)} 件`);
-  p.push(`関係グラフ ${esc(s.graph_nodes)} 件`);
-  // 全文検索の状態（`es_state`）。索引が残ると言えるのは `es_index_kept` のときだけ。
-  if (s.es_state === 'reflecting') p.push('全文検索 反映中');
+  p.push(`資料どうしの関係 ${esc(s.graph_nodes)} 件`);
+  if (s.es_state === 'reflecting') p.push('本文検索へ反映中');
   else if (s.es_state === 'failed') {
-    const why = s.es_error ? `（${esc(s.es_error)}）` : '';
-    p.push(`全文検索 前回の反映に失敗${why}${s.es_index_kept ? '・今ある索引で検索できます' : ''}`);
-  } else if (s.es_state === 'unavailable') { if (s.indexed > 0) p.push('全文検索 未接続'); }
-  else if (s.es_state === 'unknown') { if (s.indexed > 0) p.push('全文検索 確認中'); }
-  else if (s.es_chunks != null) p.push(`全文検索 ${esc(s.es_chunks)} 片`);
+    p.push(`本文検索への前回の反映に失敗${s.es_index_kept ? '・現在の検索結果は使えます' : ''}`);
+  } else if (s.es_state === 'unavailable') { if (s.indexed > 0) p.push('本文検索を利用できません'); }
+  else if (s.es_state === 'unknown') { if (s.indexed > 0) p.push('本文検索の状態を確認中'); }
+  else if (s.es_chunks != null) p.push(`本文検索に登録済み ${esc(s.es_chunks)} 件`);
   return p.join(' ／ ');
 }
 
-// 件数の集計時刻＋再集計ボタン（`GET /worlds/{id}/status` はキャッシュを読むだけでフォルダを歩かない）。保存済み集計が無い資料フォルダは counts_as_of=null＝「未集計」を促す。
-function countsAsOfNote(s, wid) {
-  const at = s.counts_as_of ? `（${esc(Sherpa.fmtDateTime(s.counts_as_of))} 時点）` : '（未集計）';
-  return ` <span class="muted" data-countsof="${esc(wid)}">${at}</span>`
-    + ` <button class="mini" data-recount="${esc(wid)}">再集計</button>`;
+function countsAsOfNote(wid) {
+  return ` <button class="mini" data-recount="${esc(wid)}">件数を数え直す</button>`;
 }
 
 // 理由コード → 平文（`failure_reason_catalog` はサーバ側の単一の真実源）。未知コードは raw のまま出す。
@@ -317,26 +315,26 @@ function stageSummaryHtml(stage) {
   if (!stage) return '';
   const lines = [];
   if (stage.office_md) {
-    lines.push(`MD変換: 変換 ${esc(stage.office_md.converted)} 件・失敗 ${esc(stage.office_md.failed)} 件・`
+    lines.push(`資料の読み取り: 完了 ${esc(stage.office_md.converted)} 件・失敗 ${esc(stage.office_md.failed)} 件・`
       + `未対応 ${esc(stage.office_md.unsupported)} 件`);
   }
   if (stage.es) {
-    // 1 ファイルの再変換の記録は、その文書の片数（chunks）と索引全体の片数（index_chunks）を分けて持つ
+    // 1 ファイルの読み取り直しでは、その資料の件数と検索全体の件数を分けて持つ。
     const esCount = stage.es.index_chunks != null
-      ? `${esc(stage.es.index_chunks)} 片（再変換したファイル ${esc(stage.es.chunks)} 片）`
-      : (stage.es.chunks != null ? esc(stage.es.chunks) + ' 片' : '-');
-    lines.push(`全文検索: ${esCount}`
-      + (stage.es.error ? `（エラー: ${esc(stage.es.error)}）` : ''));
+      ? `${esc(stage.es.index_chunks)} 件（読み取り直した資料 ${esc(stage.es.chunks)} 件）`
+      : (stage.es.chunks != null ? esc(stage.es.chunks) + ' 件' : '-');
+    lines.push(`本文検索への登録: ${esCount}`
+      + (stage.es.error ? '（登録できませんでした）' : ''));
     // 資料が不変の更新はキャッシュ再利用のみで新規0件になる（費用が掛からないことの可視化）。
     // reused を記録していない古い取り込み結果は「取れない値」であって0件ではないため、0で埋めない。
     if (stage.es.embedded != null) {
       lines.push(stage.es.reused != null
-        ? `埋め込み: 再利用 ${esc(stage.es.reused)} 件・新規 ${esc(stage.es.embedded)} 件`
-        : `埋め込み: 新規 ${esc(stage.es.embedded)} 件`);
+        ? `意味で探すための情報: 再利用 ${esc(stage.es.reused)} 件・新規 ${esc(stage.es.embedded)} 件`
+        : `意味で探すための情報: 新規 ${esc(stage.es.embedded)} 件`);
     }
   }
   if (stage.neo4j) {
-    lines.push(`関係グラフ: ノード ${esc(stage.neo4j.nodes)} 件・関係 ${esc(stage.neo4j.edges)} 件`
+    lines.push(`資料どうしの関係: 資料 ${esc(stage.neo4j.nodes)} 件・関係 ${esc(stage.neo4j.edges)} 件`
       + (stage.neo4j.duration_sec != null ? `（${esc(stage.neo4j.duration_sec)} 秒）` : ''));
   }
   return lines.length ? `<div class="ingest-stage"><b>各段の要約</b><ul>${lines.map((l) => `<li>${l}</li>`).join('')}</ul></div>` : '';
@@ -345,12 +343,12 @@ function stageSummaryHtml(stage) {
 function failedFilesHtml(wid, ff, catalog, running) {
   if (!ff || !ff.items || !ff.items.length) return '';
   const rows = ff.items.map((it) => {
-    // 実行中の再変換の対象は「やり直し中…」、ほかの処理の実行中はボタンを押せなくする（終わると一覧を読み直す）。
-    // 画像の読み取り（OCR）の理由は再変換では直らないため、ボタンを出さない。
+    // 実行中の読み取り直しの対象は「やり直し中…」、ほかの処理の実行中はボタンを押せなくする（終わると一覧を読み直す）。
+    // 画像の読み取りの理由はこの操作では直らないため、ボタンを出さない。
     const action = running && running.rel === it.doc
       ? '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>やり直し中…</span></span>'
       : (it.reason === 'ocr_unavailable' || it.reason === 'ocr_failed') ? ''
-      : `<button class="mini" data-reconvert-wid="${esc(wid)}" data-rel="${esc(it.doc)}"${running ? ' disabled' : ''}>再変換</button>`;
+      : `<button class="mini" data-reconvert-wid="${esc(wid)}" data-rel="${esc(it.doc)}">読み取り直す</button>`;
     const info = reasonInfo(catalog, it.reason);
     const pp = it.pdf_pages;
     const pages = pp ? `<div class="muted" style="font-size:var(--text-caption)">画像で読んだ PDF（全 ${esc(pp.total)} ページ）: `
@@ -362,7 +360,7 @@ function failedFilesHtml(wid, ff, catalog, running) {
       + `${action}</li>`;
   }).join('');
   const more = ff.truncated ? `<div class="muted">…他 ${esc(ff.total - ff.items.length)} 件</div>` : '';
-  return `<div class="ingest-failed"><b>変換失敗 ${esc(ff.total)} 件</b><ul>${rows}</ul>${more}</div>`;
+  return `<div class="ingest-failed"><b>読み取り失敗 ${esc(ff.total)} 件</b><ul>${rows}</ul>${more}</div>`;
 }
 
 function partialSuspectedHtml(ps, advice) {
@@ -387,9 +385,9 @@ function ingestDetailHtml(wid, s) {
 // 段の並びはサーバの `worker.STAGE_LABELS` の取り込み系5段のミラー（未知の段は1行表示へフォールバック）。ラベルはステッパー用の短縮形（正式な平文は stage_label）。
 const INGEST_STAGE_STEPS = [
   ['scanning', 'フォルダ確認'],
-  ['office_md', '読める写し(MD)作成'],
-  ['graph_build', '関係グラフ'],
-  ['es_index', '全文索引・ベクトル化'],
+  ['office_md', '資料を読み取り中'],
+  ['graph_build', '資料どうしの関係を確認中'],
+  ['es_index', '検索できるように登録中'],
   ['finalize', '仕上げ'],
 ];
 // 段の中の小さな段（`step_*`）の表示: 名前・件数・経過・最後に進んだ時刻。最後に進んでから INGEST_STEP_SLOW_MS 以上たったら、止まったと決めつけずに注意を出す。
@@ -434,6 +432,57 @@ function progressNote(s) {
   }).join('<span class="step-arrow">→</span>');
   return `<div class="muted ingest-steps" style="margin-top:3px">${steps}</div>${stepNote(p)}`;
 }
+
+function lastCompletedHtml(s, wid) {
+  if (!s.last_completed_at) {
+    return '<div class="status-section"><b>最後に最後まで終わった取り込み</b><span>まだありません</span></div>';
+  }
+  const c = s.last_completed_counts;
+  const counts = c
+    ? `件数は ${esc(Sherpa.fmtDateTime(c.as_of))} 時点: 確認 ${esc(c.scanned)} 件・検索できる資料 ${esc(c.indexed)} 件・読み取り失敗 ${esc(c.office_failed)} 件`
+    : '件数はまだ数えていません';
+  return `<div class="status-section"><b>最後に最後まで終わった取り込み</b>`
+    + `<span>${esc(Sherpa.fmtDateTime(s.last_completed_at))} に完了。${counts}</span>`
+    + `${countsAsOfNote(wid)}</div>`;
+}
+
+function availableStateNote(s) {
+  if (!s.counts_as_of) return '使える件数はまだ確認できません。「件数を数え直す」で確認できます。';
+  if (s.scanned === 0) return '使える資料はまだありません。本文検索と資料どうしの関係の確認はできません。資料を置いて「更新」を押してください。';
+  if (s.indexed === 0) return '本文検索への登録はまだ終わっていません。文字として読める資料の本文を直接探すことはできます。';
+  if (s.es_chunks === 0 || s.es_chunks == null) return '資料の本文を直接探すことはできます。本文検索の結果一覧はまだ準備中です。';
+  return '';
+}
+
+function statusAlertMessages(s) {
+  const out = [];
+  if (s.last_failure_message) out.push(s.last_failure_retrying ? `${s.last_failure_message}。今の取り込みで作り直しています` : s.last_failure_message);
+  const warns = s.last_run_warnings || [];
+  if (s.last_run_status === 'failed' && !s.last_failure_message) {
+    out.push('前回の取り込みは失敗しました（処理を最後まで終えられませんでした）');
+  }
+  if (warns.some(w => typeof w === 'string' && w.startsWith('office_md:'))) {
+    out.push('前回の取り込みで Office 資料を読み取れませんでした。次の取り込みで再び試します');
+  }
+  const officeDocs = warns
+    .filter(w => typeof w === 'string' && w.startsWith('office_md_blocked:'))
+    .map((w) => {
+      const rest = w.slice('office_md_blocked:'.length);
+      const tab = rest.indexOf('\t');
+      return tab >= 0 ? rest.slice(0, tab) : rest;
+    }).filter(Boolean);
+  if (officeDocs.length) out.push(`${officeDocs.join('・')} を読み取れませんでした`);
+  const blockedDocs = (s.last_run_blocked || [])
+    .filter((b) => b && b.reason === 'unreadable_code_file' && b.doc)
+    .map((b) => b.doc);
+  if (blockedDocs.length) out.push(`${blockedDocs.join('・')} を読み取れなかったため、取り込みを停止しました`);
+  const failed = s.failed_files && Number.isInteger(s.failed_files.total)
+    ? s.failed_files.total : (s.office_failed || 0);
+  if (failed > 0) out.push(`読み取れなかった資料が ${failed} 件あります。「詳細を表示」で理由を確認してください`);
+  if (s.resolve_settings_pending) out.push('資料の探し方の設定がまだ反映されていません。取り込みが終わってから「更新」を押してください');
+  return out;
+}
+
 function summaryNote(s, wid) {
   if (!s) return '';
   const hints = [];
@@ -443,92 +492,68 @@ function summaryNote(s, wid) {
       .map(([k, v]) => `${esc(k)} ${esc(v)}`).join('・');
     hints.push(`PDF・旧形式（${exts}）はまだ未対応です（今後対応）`);
   }
-  if (s.office_failed) hints.push(`${esc(s.office_failed)} 件は変換に失敗しました（ファイル破損などの可能性）`);
-  // 黙って落とした・粗くしたもの（走査・関係グラフ・全文索引）。件数だけで名前は出さない。
+  if (s.office_failed) hints.push(`${esc(s.office_failed)} 件は読み取りに失敗しました（ファイル破損などの可能性）`);
+  // 黙って落とした・粗くしたもの。件数だけで名前は出さない。
   for (const n of (s.ingest_notices || [])) {
     const t = INGEST_NOTICE_JA[n.code];
     if (t) hints.push(t(esc(n.count)));
   }
   if (s.graph_nodes === 0 && s.indexed > 0) {
-    hints.push('関係グラフはソースコード（COBOL/JCL等）から作られます。文書のみのフォルダでは空です（文書は検索で使えます）');
-  }
-  const warns = s.last_run_warnings || [];
-  const dangers = [];
-  if (s.resolve_settings_pending) {
-    dangers.push('資料の探し方の設定がまだ反映されていません（更新が必要です。「更新」を押すと資料を取り込み直します）');
-  }
-  const reconvertFailed = warns.some(w => typeof w === 'string' && w.startsWith('reconvert_'));
-  if (s.last_run_status === 'failed' && reconvertFailed) {
-    // 1 ファイルの再変換は自動ではやり直さない。理由は失敗の一覧の行に出る。
-    dangers.push(warns.includes('reconvert_needs_full_run')
-      ? '前回の再変換はできませんでした。「今すぐ更新」で資料フォルダを取り込み直してから、もう一度お試しください'
-      : '前回の再変換は終わりませんでした。理由は「詳細を表示」の失敗の一覧に出ています（「再変換」でやり直せます）');
-  } else if (s.last_run_status === 'failed' && s.last_run_interrupted
-             && warns.some(w => typeof w === 'string' && w.startsWith('low_disk_stop:'))) {
-    const w = warns.find(x => typeof x === 'string' && x.startsWith('low_disk_stop:'));
-    dangers.push(`ディスクの空きが少ないため取り込みを止めました（空き ${esc(w.slice('low_disk_stop:'.length))} GB）。`
-      + '自動では再開しません。空きを作ってから「今すぐ更新」を押してください');
-  } else if (s.last_run_status === 'failed' && s.last_run_interrupted) {
-    hints.push('前回の取り込みは停止のため途中で止まりました（起動後に自動で続きから始まります／始まっていないときは「今すぐ更新」を押してください）');
-  } else if (s.last_run_status === 'failed') {
-    // `failed` は派生物の公開後（グラフ反映・台帳更新等）の失敗も含みうるため、「検索は前回成功時点のまま」とは断定しない。
-    dangers.push('前回の取り込みは失敗しました（次回の取り込みで自動的に再試行されます）');
-  }
-  if (warns.some(w => typeof w === 'string' && w.startsWith('es_index_failed'))) {
-    dangers.push('前回の取り込みで全文検索への反映に失敗しました。検索結果が古い可能性があります（「今すぐ更新」でやり直せます）');
-  }
-  if (warns.some(w => typeof w === 'string' && w.startsWith('reconcile_failed'))) {
-    dangers.push('前回の取り込みで不要ファイルの掃除に失敗しました（次回の取り込みで再試行されます）');
-  }
-  if (warns.some(w => typeof w === 'string' && w.startsWith('office_md:'))) {
-    dangers.push('前回の取り込みでOffice文書のテキスト化処理自体に問題がありました（次回の取り込みで再試行されます）');
-  }
-  if (warns.some(w => w === 'plugin_failed')) {
-    dangers.push('前回の取り込みで、フレームワーク固有の解析に失敗した部分があります。関係グラフの結果が一部欠けているため、'
-      + '関連が無いとは言えません（原因を直して取り込み直すまで残ります）');
-  }
-  if (warns.includes('rebind_failed_rolled_back')) {
-    dangers.push('前回の参照先の変更は失敗しました。変更前の状態を保持しています');
-  }
-  if (warns.includes('rebind_rollback_failed')) {
-    dangers.push('前回の参照先の変更は失敗し、変更前の状態に戻せませんでした。「今すぐ更新」で作り直してください');
-  }
-  // `office_md_blocked:{doc}\t{reason}`（区切りはタブ・doc/reasonとも`:`を含みうるため`:`では分割しない）。
-  const blockedDocs = warns
-    .filter(w => typeof w === 'string' && w.startsWith('office_md_blocked:'))
-    .map((w) => {
-      const rest = w.slice('office_md_blocked:'.length);
-      const tab = rest.indexOf('\t');
-      return tab >= 0 ? rest.slice(0, tab) : rest;
-    })
-    .filter(Boolean);
-  if (blockedDocs.length) {
-    dangers.push(`前回の取り込みで一部の文書（${blockedDocs.map(esc).join('・')}）を想定外のエラーで`
-      + '変換できませんでした（次回の取り込みで再試行されます）');
-  }
-  // 不可読コードによる全体停止（`unreadable_code_file`）: 対象ファイルを名指しする（`last_run_warnings` は reason のみのため `last_run_blocked` を使う）。
-  const unreadableDocs = (s.last_run_blocked || [])
-    .filter((b) => b && b.reason === 'unreadable_code_file' && b.doc)
-    .map((b) => b.doc);
-  if (unreadableDocs.length) {
-    dangers.push(`⚠ 取り込みを止めました: ${unreadableDocs.map(esc).join('・')} を読み取れませんでした（やり直す）`);
+    hints.push('資料どうしの関係はソース資料から確認します。文書だけのフォルダでは 0 件でも、文書は検索できます');
   }
   const note = hints.length ? `<div class="muted" style="margin-top:3px">※ ${hints.join('。')}</div>` : '';
-  const dangerNote = dangers.length ? `<div class="danger" style="margin-top:3px">※ ${dangers.join('。')}</div>` : '';
-  const countsNote = wid ? countsAsOfNote(s, wid) : '';
   const detail = wid ? ingestDetailHtml(wid, s) : '';
-  return `<span>${summaryText(s)}</span>${countsNote}${progressNote(s)}${note}${dangerNote}${detail}`;
+  const availableNote = availableStateNote(s);
+  const running = s.ingest_active
+    ? `${progressNote(s)}<div class="muted">仕上げが終わるまで、上の完了時点の件数には反映されません。</div>`
+    : '<span>ありません</span>';
+  return `<div class="status-sections">${lastCompletedHtml(s, wid)}`
+    + `<div class="status-section"><b>現在使える状態</b><span>${summaryText(s)}</span>`
+    + `${availableNote ? `<div class="muted">${availableNote}</div>` : ''}${note}</div>`
+    + `<div class="status-section"><b>進行中の取り込み</b>${running}</div></div>${detail}`;
 }
-// 実行中（`running_progress` あり）は行の操作ボタンを無効化する（サーバ側も資料フォルダ単位の単一実行で多重クリックに安全だが、UI でも抑止する）。
-function setIngestBusy(world_id, busy) {
-  document.querySelectorAll(`[data-refresh="${world_id}"],`
-    + `[data-rag-rules="${world_id}"],[data-del="${world_id}"],[data-reconvert-wid="${world_id}"]`)
-    .forEach((b) => { b.disabled = busy; });
+
+function setIngestActions(world_id, actions) {
+  const row = document.querySelector(`[data-wid="${world_id}"]`);
+  if (!row || !actions) return;
+  const selectors = {
+    recount: `[data-recount="${world_id}"]`, refresh: `[data-refresh="${world_id}"]`,
+    rag_regenerate_rules: `[data-rag-rules="${world_id}"]`, delete: `[data-del="${world_id}"]`,
+    reconvert: `[data-reconvert-wid="${world_id}"]`,
+  };
+  let reason = '';
+  for (const [action, selector] of Object.entries(selectors)) {
+    const state = actions[action];
+    if (!state) continue;
+    row.querySelectorAll(selector).forEach((button) => {
+      button.disabled = !state.allowed;
+      if (!state.allowed && state.reason) button.title = state.reason;
+    });
+    if (!state.allowed && state.reason && !reason) reason = state.reason;
+  }
+  let note = row.querySelector('.action-lock-note');
+  if (reason && !note) {
+    note = document.createElement('div'); note.className = 'action-lock-note';
+    row.querySelector('.rowmain').insertAdjacentElement('afterend', note);
+  }
+  if (note) { note.textContent = reason; note.hidden = !reason; }
 }
 
 // 登録ボタン（`pickbtn`）は行ボタンと違い world_id に紐付かない（登録前は資料フォルダがまだ無い）ため、`loadStat` が集計した「実行中の world_id 集合」で管理する。
 // 登録処理は長時間かかりうる（グローバル advisory lock の下で実行される）ため、実行中に別の登録を投げると完了までブロックされる。
 const _runningWorldIds = new Set();
+const _statusAlerts = new Map();
+let _workerAlerts = [];
+function renderNoticeCenter() {
+  const el = $('workerbanner');
+  if (!el) return;
+  const messages = [..._workerAlerts, ...[..._statusAlerts.values()].flat()];
+  const unique = [...new Set(messages.filter(Boolean))];
+  el.innerHTML = unique.length
+    ? `<b>注意</b><ul style="margin:4px 0 0;padding-left:20px">${unique.map((m) => `<li>${esc(m)}</li>`).join('')}</ul>`
+    : '';
+  el.hidden = unique.length === 0;
+}
 function _updatePickbtnState() {
   const b = $('pickbtn');
   if (!b) return;
@@ -545,14 +570,18 @@ async function loadStat(world_id) {                   // 各行の状況を非�
     const detailOpen = !!el.querySelector('details.adv[open]');   // 読み直しで詳細（失敗の一覧）を閉じない
     el.innerHTML = summaryNote(s, world_id);
     if (detailOpen) { const d = el.querySelector('details.adv'); if (d) d.open = true; }
-    const running = !!s.running_progress;
-    setIngestBusy(world_id, running);
+    setIngestActions(world_id, s.actions);
+    _statusAlerts.set(world_id, statusAlertMessages(s));
+    renderNoticeCenter();
+    const running = s.ingest_active === true;
     if (running) _runningWorldIds.add(world_id); else _runningWorldIds.delete(world_id);
     _updatePickbtnState();
     if (running) { loadWorkerBanner(); setTimeout(() => loadStat(world_id), 3000); }   // 実行中の間だけ数秒間隔で追跡
   } catch (e) {
     if (e && e.status === 404) {          // 削除完了＝world 行自体が消えた（一覧側の表示を戻す）
       _runningWorldIds.delete(world_id);
+      _statusAlerts.delete(world_id);
+      renderNoticeCenter();
       _updatePickbtnState();
       reloadAll();
       return;
@@ -569,7 +598,7 @@ async function loadStat(world_id) {                   // 各行の状況を非�
 async function removeWorld(world_id) {
   const w = (await fetchWorldsShared()).find((x) => x.world_id === world_id) || {};
   if (!confirm(`「${(w.label || world_id)}」の登録を解除します。\n\n`
-    + `削除されるのは Sherpa の検索用データ（索引・テキスト化した写し・関係グラフ）だけです。\n`
+    + `削除されるのは Sherpa の検索用データと資料どうしの関係だけです。\n`
     + `元の Windows フォルダとファイルは一切消えません。\n\n`
     + `削除すると、別のフォルダを登録できるようになります。よろしいですか？`)) return;
   $('listmsg').innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>削除を受け付けています...</span></span>';
@@ -599,53 +628,53 @@ async function refresh(world_id) {
   }
 }
 
-// ---- 再集計（`corpus_docs.scan_report` を明示的にやり直す唯一の実走査）----
+// ---- 件数の数え直し（`corpus_docs.scan_report` を明示的にやり直す唯一の実走査）----
 async function recount(world_id) {
   const el = document.querySelector(`[data-stat="${world_id}"]`);
-  if (el) el.innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>集計しています...</span></span>';
+  if (el) el.innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>件数を数え直しています...</span></span>';
   try {
     await api('POST', `/worlds/${encodeURIComponent(world_id)}/recount`);
   } catch (e) {
-    if (el) el.innerHTML = `<span class="danger">集計できません: ${esc(e.message)}</span>`;
+    if (el) el.innerHTML = `<span class="danger">件数を数え直せません: ${esc(e.message)}</span>`;
     return;
   }
   loadStat(world_id);
 }
 
-// ---- 再変換（失敗一覧の1件だけを変換し直す・即受付で背景実行）----
+// ---- 読み取り直し（失敗一覧の1件だけ・即受付で背景実行）----
 async function reconvertFile(world_id, rel, btn) {
-  if (!confirm(`「${rel}」を再変換します。\n\nこのファイルだけを変換し直し、検索と関係グラフへ反映します（ほかの資料は変換し直しません）。続けますか？`)) return;
+  if (!confirm(`「${rel}」を読み取り直します。\n\nこの資料だけを読み取り直し、検索と資料どうしの関係へ反映します（ほかの資料は読み取り直しません）。続けますか？`)) return;
   if (btn) {
     btn.disabled = true;
     btn.textContent = 'やり直し中…';
   }
   try {
-    // 即受付・変換は背景で続く。進み具合と終わったあとの一覧（直ったものは消える）は loadStat のポーリングが示す。
+    // 即受付・読み取り直しは背景で続く。進み具合と終わったあとの一覧（直ったものは消える）は loadStat のポーリングが示す。
     await api('POST', `/worlds/${encodeURIComponent(world_id)}/reconvert`, { rel });
   } catch (e) {
-    $('listmsg').innerHTML = `<span class="danger">再変換できません: ${esc(e.message)}</span>`;
+    $('listmsg').innerHTML = `<span class="danger">読み取り直せません: ${esc(e.message)}</span>`;
     if (btn) {
       btn.disabled = false;
-      btn.textContent = '再変換';
+      btn.textContent = '読み取り直す';
     }
     return;
   }
   loadStat(world_id);
 }
 
-// ---- 規則版で再生成（管理操作・AI 成形の一掃）----
+// ---- AI で整える前の形へ戻す（管理操作）----
 async function regenerateRagRules(world_id) {
   const w = (await fetchWorldsShared()).find((x) => x.world_id === world_id) || {};
   if (!confirm(`「${w.label || world_id}」の検索用データを、AI を使わない元の形（規則版）へ作り直します。\n`
     + `AI が読みやすく整えた版は消えます（AI 成形は無効化していない限り、後で改めて作られることがあります）。続けますか？`)) return;
-  $('listmsg').innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>規則版への再生成を受け付けています...</span></span>';
+  $('listmsg').innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>AI で整える前の形へ戻す操作を受け付けています...</span></span>';
   try {
     // 即受付・作り直しは背景で継続する。進捗・完了は行のポーリング（loadStat）が示す。
     const res = await api('POST', `/worlds/${encodeURIComponent(world_id)}/rag_regenerate_rules`, {});
     $('listmsg').innerHTML = `✓ ${esc(res.note)}`;
     reloadAll(world_id);
   } catch (e) {
-    $('listmsg').innerHTML = `<span class="danger">規則版へ再生成できません: ${esc(e.message)}</span>`;
+    $('listmsg').innerHTML = `<span class="danger">AI で整える前の形へ戻せません: ${esc(e.message)}</span>`;
   }
 }
 
@@ -727,19 +756,19 @@ const REASON_JA = {
   read_failed: 'ファイルを読み取れませんでした',
   unreadable_code_file: 'コードを読み取れなかったため取り込みを止めました',
   encoding_undetermined: '文字コードを判別できないため読み取れません（UTF-8/CP932どちらも文字化けします）',
-  plugin_failed: 'フレームワーク固有の解析に失敗しました（関係グラフの結果が一部欠けています）',
+  plugin_failed: 'ソース資料の読み取りに失敗した部分があります（資料どうしの関係が一部欠けています）',
 };
-// Office 変換失敗の内側の理由（`office_md_blocked:{doc}\t{innerReason}` の innerReason 部）→ 平文。例外クラス名（`:` 以降）はそのまま出さない。
+// Office 読み取り失敗の内側の理由（`office_md_blocked:{doc}\t{innerReason}` の innerReason 部）→ 平文。例外クラス名（`:` 以降）はそのまま出さない。
 const OFFICE_INNER_REASON_JA = { manifest_write_failed: '記録の書き込みに失敗しました' };
 function officeBlockedReasonText(reason) {
   const rest = reason.slice('office_md_blocked:'.length);
   const tab = rest.indexOf('\t');
   const inner = tab >= 0 ? rest.slice(tab + 1) : '';
   if (inner.startsWith('unhandled_os_error:') || inner.startsWith('unhandled_exception:')) {
-    return 'Office 文書を変換できませんでした（想定外のエラー）';
+    return 'Office 文書を読み取れませんでした（想定外のエラー）';
   }
   const innerJa = OFFICE_INNER_REASON_JA[inner];
-  return innerJa ? `Office 文書を変換できませんでした（${innerJa}）` : 'Office 文書を変換できませんでした';
+  return innerJa ? `Office 文書を読み取れませんでした（${innerJa}）` : 'Office 文書を読み取れませんでした';
 }
 function reasonText(reason) {
   if (typeof reason === 'string' && reason.startsWith('office_md_blocked:')) return officeBlockedReasonText(reason);
@@ -752,16 +781,16 @@ const INGEST_NOTICE_JA = {
   walk_unreadable_dir: (n) => `${n} 件のフォルダを開けず、中のファイルを取り込めていません（権限などを確認してください）`,
   walk_unreadable_file: (n) => `${n} 件のファイルは情報を取得できず、取り込めていません`,
   walk_outside_root: (n) => `${n} 件は登録したフォルダの外を指しているため、取り込んでいません`,
-  graph_source_unparsed: (n) => `${n} 件のソースは構文を読み切れず、関係グラフに載っていない部分があります（関連が無いとは言えません）`,
-  graph_source_oversize: (n) => `${n} 件のソースは大きすぎて関係グラフに載せていません（検索はできます）`,
+  graph_source_unparsed: (n) => `${n} 件のソース資料は読み切れず、資料どうしの関係が一部欠けています（関連が無いとは言えません）`,
+  graph_source_oversize: (n) => `${n} 件のソース資料は大きすぎるため、資料どうしの関係に含めていません（検索はできます）`,
   graph_mention_doc_unreadable: (n) => `${n} 件の文書は読めず、文書からコードへの言及を拾えていません`,
-  es_rag_degraded: (n) => `${n} 件の資料は検索用の細かな区切りを使えず、粗い区切りで全文検索に入れています`,
-  es_empty_text: (n) => `${n} 件の資料は本文が空のため、全文検索に入っていません`,
-  md_docs_failed_many: (n) => `${n} 件の資料を MD にできませんでした（失敗が多めです。全文検索と意味検索の登録は続けています。失敗の一覧で原因を確かめてください。次の更新で作り直します）`,
-  es_text_read_failed: (n) => `${n} 件の資料は本文を読めず、全文検索に入っていません`,
-  es_embed_failed_bm25_only: () => '意味検索用の変換に失敗したため、全文検索はキーワード検索だけで作りました',
-  es_vectors_missing: (n) => `${n} 件の資料の区切りは意味検索用の変換が済んでいません（キーワード検索では見つかります。次の更新で自動的に続きを行います）`,
-  es_analyzer_fallback: () => '日本語用の解析器を使えず標準の解析器で全文検索を作りました（日本語の検索精度が下がります）',
+  es_rag_degraded: (n) => `${n} 件の資料は細かく分けられず、粗い区切りで本文検索に登録しています`,
+  es_empty_text: (n) => `${n} 件の資料は本文が空のため、本文検索に入っていません`,
+  md_docs_failed_many: (n) => `${n} 件の資料を読み取れませんでした（本文検索と意味で探すための登録は続けています。失敗の一覧で原因を確認してください）`,
+  es_text_read_failed: (n) => `${n} 件の資料は本文を読めず、本文検索に入っていません`,
+  es_embed_failed_bm25_only: () => '意味で探すための登録に失敗したため、キーワードだけで検索します',
+  es_vectors_missing: (n) => `${n} 件の資料は意味で探すための登録が済んでいません（キーワードでは見つかります。次の更新で続けます）`,
+  es_analyzer_fallback: () => '日本語向けの読み分けを使えず、標準の方法で本文検索を作りました（日本語の検索精度が下がります）',
 };
 
 // 「どう読み取ったか」の平文バッジ。データ源は取り込み時の来歴（provenance）で、表示のみ。method 1個＋（該当時のみ）旧形式変換／照合差分の最大2〜3個に抑える。
@@ -1039,9 +1068,11 @@ const statusTag = (s) => (s && s !== 'active')
 
 function openPrev() {
   if (!_pv) return;
-  const c = _pv.counts;
-  $('pv-bar').innerHTML = `抽出された要素 <b>${c.entities}</b>`
-    + ` ・ 関係 <b>${c.relations}</b> ・ 廃止/隠し <b>${c.deprecated + c.hidden}</b>`;
+  const c = _pv.counts, note = _pv.graph_note;
+  const num = (v) => (v == null ? '不明' : v);   // 取り込みの記録が無い件数は「不明」と出す
+  $('pv-bar').innerHTML = `抽出された要素 <b>${num(c.entities)}</b> ・ 関係 <b>${num(c.relations)}</b>`
+    + (c.deprecated == null || c.hidden == null ? '' : ` ・ 廃止/隠し <b>${c.deprecated + c.hidden}</b>`)
+    + (note ? `<div class="muted" style="margin-top:6px">${esc(note)}</div>` : '');
   // 担当アナライザの来歴（コード以外は analyzer=null＝出さない）。
   $('pv-ents').innerHTML = _pv.entities.map((e) => `<div class="ent"><span class="ico">${esc(ABBR[e.label] || e.label)}</span>`
     + `<span class="nm">${esc(e.name)}${statusTag(e.status)}<small>${esc(e.label)}${e.parent ? ' ・ ' + esc(e.parent) : ''}${e.value != null ? ' ・ 値 ' + esc(e.value) : ''}${e.analyzer ? ' ・ 解析: ' + esc(analyzerLabel(e.analyzer)) : ''}</small></span></div>`).join('');
@@ -1127,17 +1158,15 @@ async function reloadStatusSection(_preferredWorldId) {
 }
 
 // ---- 上段一覧＋下段セレクタの同時再同期（fetchWorldsShared() を共有＝/worlds 取得は1回） ----
-// 取り込みのワーカーが動いていない・版が Web アプリと違うときのお知らせ（サーバ側で文を確定済み）。
+// 取り込みに関する注意は、状態ごとの結果と合わせて画面上部の1か所へまとめる。
 async function loadWorkerBanner() {
-  const el = $('workerbanner');
-  if (!el) return;
   try {
     const w = await api('GET', '/ingest/workers');
-    el.textContent = w.message || '';
-    el.hidden = !w.message;
+    _workerAlerts = [w.message, w.ocr_message].filter(Boolean);
   } catch (e) {
-    el.hidden = true;
+    _workerAlerts = [];
   }
+  renderNoticeCenter();
 }
 
 function reloadAll(preferredWorldId) {

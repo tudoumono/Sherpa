@@ -6,7 +6,7 @@
 import { S } from './state.js';
 import {
   questionHTML, _renderDetail, appendAssistantRaw, appendUser,
-  ensureAnswerCard, finalizeAnswer, clearReveal, reveal,
+  ensureAnswerCard, finalizeAnswer, showAnswerText,
   TraceTreeV2, deriveTraceStopReason, stopReasonInfo, stopReasonCategoryFromError,
 } from './render.js';
 import { loadConversations, syncConvParam } from './history.js';
@@ -225,7 +225,6 @@ function onQuestion(thinking, q) {
 // ターンが異常終了したときの表示
 function onTurnFailed(thinking, message) {
   turnConcluded = true;
-  clearReveal();
   _stopThinkingTicker();
   _finalizeLiveTraceTree(stopReasonInfo(stopReasonCategoryFromError(message)));
   if (thinking && thinking.isConnected) thinking.remove();
@@ -315,7 +314,6 @@ async function stopStream() {
 }
 function onStopped(thinking) {
   turnConcluded = true;
-  clearReveal();
   _stopThinkingTicker();
   _finalizeLiveTraceTree(stopReasonInfo('stopped'));
   if (thinking && thinking.isConnected) thinking.remove();
@@ -343,7 +341,7 @@ export function subscribeTurn(thinking) {
     if (e.type === 'question') { onQuestion(thinking, e); return; }
     if (e.type === 'stopped') { onStopped(thinking); return; }
     if (e.type === 'error') { onTurnFailed(thinking, e.message); return; }
-    if (e.type === 'answer_delta') { ensureAnswerCard(thinking); reveal(e.text); return; }
+    if (e.type === 'answer_delta') { ensureAnswerCard(thinking); showAnswerText(e.text); return; }
     if (e.type === 'answer') {
       turnConcluded = true;
       S.cid = e.conversation_id;
@@ -375,7 +373,7 @@ export function subscribeTurn(thinking) {
     _stopThinkingTicker();
     const tree = _finalizeLiveTraceTree(stopReasonInfo(treatAsStopped ? 'stopped' : 'error'));
     if (wasPending) pendingStopTraceTree = tree;
-    setRt(treatAsStopped ? '停止しました' : '待機中', false); S.es.close(); S.es = null; S.turnId = null; clearReveal();
+    setRt(treatAsStopped ? '停止しました' : '待機中', false); S.es.close(); S.es = null; S.turnId = null;
     setSendButtonStopping(false); $('messages').setAttribute('aria-busy', 'false');
     if (thinking.isConnected) {
       const t = thinking.querySelector('.thinking');
@@ -395,7 +393,7 @@ export async function send(override) {
   $('input').value = '';
   const w = $('messages').querySelector('.welcome-msg'); if (w) w.remove();
   appendUser(message);
-  S.ansEl = null; S.ansHead = null; clearReveal();
+  S.ansEl = null; S.ansHead = null;
   setSendButtonStopping(true);
   $('send').disabled = true;
   $('messages').setAttribute('aria-busy', 'true');

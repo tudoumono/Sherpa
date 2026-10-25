@@ -571,6 +571,10 @@ def _safe_share_answer(answer):
         out["sources"] = [{k: s[k] for k in ("doc_id", "quote", "source", "title", "path",
                                               "importance", "importance_reason") if k in s}
                           for s in importance_filtered]
+        for row, src in zip(out["sources"], importance_filtered):  # 世代（トップフォルダ）と原本の更新時刻は文字列のときだけ通す
+            for k in ("generation", "modified_at"):
+                if isinstance(src.get(k), str) and src[k]:
+                    row[k] = src[k]
         for row, src in zip(out["sources"], importance_filtered):
             url = _safe_download_url(src.get("download_url"), src.get("doc_id"),
                                       (answer.get("scope") or {}).get("world") if isinstance(answer.get("scope"), dict) else None)

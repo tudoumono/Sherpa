@@ -18,7 +18,7 @@ import urllib.request
 
 import pytest
 
-from sherpa import embeddings, graph_admin, health, intent_llm, llm, store
+from sherpa import embeddings, health, intent_llm, llm, store
 from sherpa.ingest import graph_extract
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]

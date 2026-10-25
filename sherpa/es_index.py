@@ -72,6 +72,17 @@ _ES_IMPORTANCE_BOOST_HIGH = 1.2
 _ES_IMPORTANCE_BOOST_LOW = 0.85
 
 
+# 検索の質問の埋め込みの総期限（秒）。env `SHERPA_SEARCH_EMBED_TIMEOUT_SEC`（1〜120・不正は既定）。過ぎたら BM25 だけで続ける（`query_embed_failed`）。取り込みの埋め込みの再送は変えない
+_SEARCH_EMBED_TIMEOUT_DEFAULT = 10.0
+_SEARCH_EMBED_TIMEOUT_MIN = 1.0
+_SEARCH_EMBED_TIMEOUT_MAX = 120.0
+
+# BM25 の対象欄と重み。本文 `text` が最も重く、見出し系（`labels`＝項目名など・`region_context`＝見出し・シート名）は控えめに足す。`tie_breaker` は複数欄に当たった文書をわずかに押し上げる
+_BM25_FIELDS = ("text", "labels", "region_context")
+_BM25_FIELD_BOOSTS = {"text": 1.0, "labels": 0.3, "region_context": 0.3}
+_BM25_TIE_BREAKER = 0.1
+
+
 # `search()` のハイブリッドにおける BM25(keyword) 対 kNN(vector) の配分（0.0＝vector 寄り〜1.0＝keyword 寄り・0.5＝boost キーを書かない）
 _HYBRID_WEIGHT = 0.5
 
@@ -2441,6 +2452,40 @@ def fill_missing_vectors(world: str, settings: dict | None = None) -> dict:
     return {"available": True, "filled": filled, "missing": count_missing_vectors(world)}
 
 
+def _search_embed_timeout_s() -> float:
+    """検索の質問の埋め込みの総期限（秒）。env `SHERPA_SEARCH_EMBED_TIMEOUT_SEC` が範囲外・数値でなければ既定。"""
+    raw = os.environ.get("SHERPA_SEARCH_EMBED_TIMEOUT_SEC", "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return _SEARCH_EMBED_TIMEOUT_DEFAULT
+    return v if _SEARCH_EMBED_TIMEOUT_MIN <= v <= _SEARCH_EMBED_TIMEOUT_MAX else _SEARCH_EMBED_TIMEOUT_DEFAULT
+
+
+def _embed_query(q: str, ec: dict, world: str):
+    """検索の質問 1 件の埋め込み。総期限（`_search_embed_timeout_s`）内に取れなければ None。"""
+    return embeddings.embed([q], ec, world=world, deadline_s=_search_embed_timeout_s())
+
+
+def _keyword_clause(q: str) -> dict:
+    """本文＋見出し系の欄を引く BM25 の節（本文が最も重い）。"""
+    return {"multi_match": {"query": q, "type": "best_fields", "tie_breaker": _BM25_TIE_BREAKER,
+                            "fields": [f"{f}^{_BM25_FIELD_BOOSTS[f]}" for f in _BM25_FIELDS]}}
+
+
+def _keyword_highlight() -> dict:
+    """当たった欄を知るためのハイライト（一致した欄だけが応答に出る）。"""
+    return {"fields": {f: {"fragment_size": 240 if f == "text" else 120, "number_of_fragments": 1}
+                       for f in _BM25_FIELDS}}
+
+
+def _matched_fields(highlight) -> list:
+    """ハイライトの応答から、語が当たった欄を `_BM25_FIELDS` の順で返す。"""
+    if not isinstance(highlight, dict):
+        return []
+    return [f for f in _BM25_FIELDS if highlight.get(f)]
+
+
 def _mark_keyword_all(hits: list) -> list:
     for h in hits:
         h["keyword_match"] = True
@@ -2470,6 +2515,9 @@ def _parse_hits(res: dict, vector: bool = False) -> list:
         frag = (h.get("highlight", {}).get("text") or [full])[0]
         hit = {"doc_id": src.get("doc_id"), "line": src.get("line"),
                "text": frag, "score": h.get("_score"), "ext": src.get("ext")}
+        matched = _matched_fields(h.get("highlight"))
+        if matched:
+            hit["matched_fields"] = matched  # 語が当たった欄（text／labels／region_context）
         # 抽出来歴・rag_chunks 由来メタ・重要度を表示用にそのまま渡す（無ければ付けない）。`parent_id` は親返しが読む。`importance_source` は出典には出さないので含めない
         for k in ("extraction_method", "confidence", "has_conflicts", "chunk_id", "locator",
                   "previous_chunk_id", "next_chunk_id", "parent_id", "logical_record_id", "section_path",
@@ -2553,22 +2601,25 @@ def _fuse_hybrid(bm25_res: dict, knn_res: dict, k: int) -> list:
 
 
 def _mark_keyword_matches(world: str, query: str, hits: list) -> list:
-    """融合の結果のうち BM25 の上位に出なかったヒットについて、語が一致するか（`match` に当たるか）を ES に問い合わせて `keyword_match` を付け直す。
+    """融合の結果のうち BM25 の上位に出なかったヒットについて、語が一致するか（本文・見出し系の欄のどれかに当たるか）を ES に問い合わせて `keyword_match`・`matched_fields` を付け直す。
     問い合わせに失敗したら付け直さない（False のまま）。
     """
     es_ids = {id(h): h.pop("_es_id", None) for h in hits}
     ids = [es_ids[id(h)] for h in hits if not h.get("keyword_match") and es_ids[id(h)]]
     if not ids:
         return hits
-    body = {"size": len(ids), "_source": False,
-            "query": {"bool": {"filter": [{"ids": {"values": ids}}], "must": [{"match": {"text": query}}]}}}
+    body = {"size": len(ids), "_source": False, "highlight": _keyword_highlight(),
+            "query": {"bool": {"filter": [{"ids": {"values": ids}}], "must": [_keyword_clause(query)]}}}
     try:
-        matched = {h["_id"] for h in _req("POST", f"/{_index(world)}/_search", body).get("hits", {}).get("hits", [])}
+        matched = {h["_id"]: _matched_fields(h.get("highlight"))
+                   for h in _req("POST", f"/{_index(world)}/_search", body).get("hits", {}).get("hits", [])}
     except Exception:
         return hits
     for h in hits:
         if not h.get("keyword_match") and es_ids[id(h)] in matched:
             h["keyword_match"] = True
+            if matched[es_ids[id(h)]]:
+                h["matched_fields"] = matched[es_ids[id(h)]]
     return hits
 
 
@@ -2623,6 +2674,7 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     `k_ceiling`（省略可）: 呼び出し元が上限まで検証済みの `k` を渡す場合（`agentic_search.run_tool` の `es_search`）、`_ES_SEARCH_K_MAX` による再クランプを迂回してこちらを使う。
     `layer`（省略可・`"docs"|"code"|"both"`・既定 both）: `scopes` と同じ `filter` 節に `branch` の term／must_not フィルタを積む（`layer.es_filter`）。
     `exact`（省略可・`normalize_exact` 済み）: 識別子の完全一致で先に絞ってから本文で順位付けする（BM25・kNN の両方に同じフィルタを掛ける）。
+    BM25 は本文に加え、見出し系の欄（`labels`・`region_context`）も本文より軽い重みで引き、語が当たった欄を `matched_fields` に示す。質問の埋め込みは総期限（`_search_embed_timeout_s`）内に取れなければ `query_embed_failed` で BM25 だけにする。
     各ヒットに `keyword_match`（語が一致したか）を付ける。hybrid は BM25 の上位に出たヒットは True、kNN だけで出たヒットは語の一致を問い合わせて付ける（問い合わせの失敗は False）・BM25 のみの経路は全件 True。
     返値 `(hits, degrade_reason|None)`（`search_knn_only()` と同じ形）。degrade 時も BM25 の hits をそのまま返す（reason は「hybrid でなく BM25 だけになった理由」の注記）。`es_unavailable`／クエリ空は `[]`。
     degrade_reason: `es_unavailable`／`embedding_not_configured`（埋め込み未設定）／`embedding_cloud_unavailable`／`vector_feature_mismatch`（索引の埋め込み素性が現在の設定と不一致＝再索引待ち）／`query_embed_failed`／`hybrid_query_failed`（hybrid が失敗し BM25 は成功）／`es_query_failed`（BM25 も失敗・一時的）／`es_query_rejected`（BM25 も失敗・クエリ不備）。`fused_search.DEGRADE_REASONS` と同一集合（増やすときは両方直す）。
@@ -2643,9 +2695,8 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
         flt.append(lfilt)
     if exact:
         flt.append(_exact_filter(exact))
-    hl = {"fields": {"text": {"fragment_size": 240, "number_of_fragments": 1}}}
-    bm25 = {"size": k, "query": _importance_boost_query({"bool": {"must": [{"match": {"text": q}}], "filter": flt}}),
-           "highlight": hl}
+    bm25 = {"size": k, "query": _importance_boost_query({"bool": {"must": [_keyword_clause(q)], "filter": flt}}),
+           "highlight": _keyword_highlight()}
     # `cfg()` と `cloud_selected_but_unavailable()` を同じ system_settings スナップショットで呼ぶ（kill-switch 有効時は読まない）
     sys_s = _embed_system_settings_snapshot() if vector else None
     ec = embeddings.cfg(_settings(settings), system_settings=sys_s) if vector else None
@@ -2666,7 +2717,7 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
         # 索引のベクトル素性が現在の埋め込み設定と合わない（再索引待ち）。kNN は打てないので BM25 のみへ縮退し、クエリ埋め込みも呼ばない。理由を返して静かな縮退にしない
         reason = "vector_feature_mismatch"
     if same:  # 索引のベクトル素性が一致する時だけ kNN
-        qv = embeddings.embed([q], ec, world=world)
+        qv = _embed_query(q, ec, world)
         qb = embeddings.vector_to_es_bytes(qv[0]) if qv else None
         if qb is not None:
             # ① BM25（ハイライト付き）を先に引く。失敗は kNN を打たず BM25 失敗の reason で返す
@@ -2722,7 +2773,7 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
             and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID
             and meta.get("quant") == embeddings.ES_VECTOR_QUANT):
         return [], "vector_feature_mismatch"  # 索引素性ズレ
-    qv = embeddings.embed([q], ec, world=world)
+    qv = _embed_query(q, ec, world)
     qb = embeddings.vector_to_es_bytes(qv[0]) if qv else None
     if qb is None:
         return [], "query_embed_failed"

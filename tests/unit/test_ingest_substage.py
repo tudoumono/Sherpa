@@ -118,5 +118,5 @@ def test_status_api_running_progress_carries_step_and_counts(monkeypatch):
 
     out = RunProgress.model_validate(summary["running_progress"]).model_dump()
     assert (out["step"], out["step_label"], out["step_done"], out["step_total"]) == (
-        "neo4j_load", "Neo4j に反映しています", 300, 500)
+        "neo4j_load", "資料どうしの関係を保存しています", 300, 500)
     assert out["stage"] == "graph_build" and out["step_started_at"]

@@ -69,9 +69,9 @@ def _raw_search(world: str, query: dict, size: int = 200) -> list:
 def _snapshot(world: str) -> dict:
     out = {}
     for q in _QUERIES:
-        hits, reason = es.search(world, q, k=20, vector=False)
-        assert reason is None
-        out[q] = [(h["doc_id"], h.get("chunk_id"), round(h["score"], 4)) for h in hits]
+        res = es._req("POST", f"/{es._index(world)}/_search", {"size": 20, "query": {"match": {"text": q}}})
+        out[q] = [(h["_source"]["doc_id"], h["_source"].get("chunk_id"), round(h["_score"], 4))
+                  for h in res["hits"]["hits"]]
     return out
 
 

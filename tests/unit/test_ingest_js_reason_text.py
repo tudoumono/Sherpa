@@ -48,26 +48,26 @@ def test_office_blocked_unhandled_exception_does_not_leak_class_name():
     """`office_md_blocked:{doc}\\t{unhandled_exception:ClassName}` は例外クラス名を出さない
     （専門用語ゼロ・内部実装の詳細を利用者に見せない）。"""
     out = _run_reason_text("office_md_blocked:broken.xlsx\tunhandled_exception:RuntimeError")
-    assert out == "Office 文書を変換できませんでした（想定外のエラー）"
+    assert out == "Office 文書を読み取れませんでした（想定外のエラー）"
     assert "RuntimeError" not in out
 
 
 def test_office_blocked_unhandled_os_error_does_not_leak_class_name():
     out = _run_reason_text("office_md_blocked:broken.xlsx\tunhandled_os_error:PermissionError")
-    assert out == "Office 文書を変換できませんでした（想定外のエラー）"
+    assert out == "Office 文書を読み取れませんでした（想定外のエラー）"
     assert "PermissionError" not in out
 
 
 def test_office_blocked_manifest_write_failed_maps_to_plain_text():
     out = _run_reason_text("office_md_blocked:broken.xlsx\tmanifest_write_failed")
-    assert out == "Office 文書を変換できませんでした（記録の書き込みに失敗しました）"
+    assert out == "Office 文書を読み取れませんでした（記録の書き込みに失敗しました）"
 
 
 def test_office_blocked_unknown_inner_reason_falls_back_without_leaking_raw_value():
     """未知の内側理由（将来の新規コード）は fail-open で汎用メッセージへ倒す
     （raw 値をそのまま出さない）。"""
     out = _run_reason_text("office_md_blocked:broken.xlsx\tsome_future_reason_code")
-    assert out == "Office 文書を変換できませんでした"
+    assert out == "Office 文書を読み取れませんでした"
     assert "some_future_reason_code" not in out
 
 

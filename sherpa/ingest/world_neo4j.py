@@ -120,7 +120,7 @@ class GraphSchemaEraError(RuntimeError):
             f"graph schema era mismatch: world={world} stored={stored_era!r} current={GRAPH_SCHEMA_ERA!r}")
 
 
-# 利用者向けの平文メッセージ（`routers/impact.py`・`routers/graph.py` の 503 と `chat_service` が共有する）
+# 利用者向けの平文メッセージ（`routers/impact.py` の 503 と `chat_service` が共有する）
 GRAPH_SCHEMA_ERA_USER_MESSAGE = (
     "この資料フォルダの検索用データが古い内部形式のままです（内部形式が更新されました）。"
     "管理者に『今すぐ更新』を依頼してください。"
@@ -132,7 +132,7 @@ def check_schema_era(session, world: str, *, lens: str | None = None) -> None:
 
     実データ（`world_id` を持つ `:Entity`）のない資料フォルダは対象外。実データがあり、保存世代
     （`:SherpaMeta{world_id}.schema_era`・未保存を含む）が現行 `GRAPH_SCHEMA_ERA` と違うときだけ raise する。
-    グラフ読み取りの入口（`world_impact`/`resolve_world_entity`/`lens_service.neo4j_related`/`graph_admin.graph_search`）が
+    グラフ読み取りの入口（`world_impact`/`resolve_world_entity`/`lens_service.neo4j_related`）が
     主クエリの後に1回ずつ呼ぶ。存在確認は `LIMIT 1` で打ち切る。
     世代プローブが `Neo4jError` で失敗したときは警告ログを残して re-raise する（黙って戻ると旧世代の検知が無効になる）。
     """

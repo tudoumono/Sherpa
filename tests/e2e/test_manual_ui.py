@@ -81,8 +81,8 @@ def test_manual_anchor_deep_link_opens_matching_chapter(page, web_base_url):
 
 
 def test_manual_sysadmin_anchor_still_resolves(page, web_base_url):
-    """admin-settings.html / ingest.html / workspace.html / graph.html の help-link が指す
-    既存アンカー（#sysadmin/#register/#workspace/#graph）が引き続き解決されることの回帰。"""
+    """admin-settings.html / ingest.html / workspace.html の help-link が指す
+    既存アンカー（#sysadmin/#register/#workspace/#search）が引き続き解決されることの回帰。"""
     from playwright.sync_api import expect
 
     _install_manual_mocks(page)
@@ -90,7 +90,7 @@ def test_manual_sysadmin_anchor_still_resolves(page, web_base_url):
         ("sysadmin", "sysadmin", "システム管理"),
         ("register", "register", "取り込み"),
         ("workspace", "workspace", "マイワークスペース"),
-        ("graph", "graph", "グラフ"),
+        ("search", "search", "全文検索"),
     ):
         page.goto(f"{web_base_url}/manual.html#{anchor}")
         expect(page.locator(".manual-nav a.on")).to_have_attribute("data-doc", doc_id)

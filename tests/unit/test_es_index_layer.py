@@ -125,13 +125,13 @@ def test_search_mode_query_shapes(monkeypatch):
     _stub_embeddings(monkeypatch)
     es_index.search("v1", "q", k=5)
     bm25, knn = bodies[-2], bodies[-1]
-    assert bm25["query"]["function_score"]["query"]["bool"]["must"] == [{"match": {"text": "q"}}]
+    assert bm25["query"]["function_score"]["query"]["bool"]["must"] == [es_index._keyword_clause("q")]
     assert "highlight" in bm25
     assert "knn" in knn["query"]["function_score"]["query"] and "highlight" not in knn
     bodies.clear()
     es_index.search("v1", "q", k=5, vector=False)
     q = bodies[-1]["query"]["function_score"]["query"]["bool"]
-    assert len(bodies) == 1 and q["must"] == [{"match": {"text": "q"}}] and "should" not in q
+    assert len(bodies) == 1 and q["must"] == [es_index._keyword_clause("q")] and "should" not in q
     es_index.search_knn_only("v1", "q", k=5)
     assert "knn" in bodies[-1] and "query" not in bodies[-1]
 

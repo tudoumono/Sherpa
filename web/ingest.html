@@ -27,6 +27,10 @@
   .folders .row .pth{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
     font-size:var(--text-small);color:var(--ink-3,#8b95a3)}
   .folders .rowstat{margin-top:6px;font-size:var(--text-small);color:var(--ink-2,#5b6573)}
+  .folders .status-sections{display:grid;gap:7px;margin-top:8px}
+  .folders .status-section{border-left:3px solid var(--border,#e3e6ea);padding-left:9px}
+  .folders .status-section b{display:block;color:var(--ink,#1f2937);font-size:var(--text-small)}
+  .folders .action-lock-note{margin:6px 0 0;font-size:var(--text-small);color:var(--ink-2,#5b6573)}
   .folders .mini{font-size:var(--text-small);padding:4px 10px}
   /* 差分チェック結果 */
   .diffout:empty{display:none}
@@ -83,7 +87,7 @@
     <a class="help-link" href="manual.html#register">この画面の使い方 →</a>
   </div>
 
-  <!-- 取り込みのワーカーが動いていない・版が Web アプリと違うときのお知らせ -->
+  <!-- 取り込みに関する注意は、この1か所へまとめる。 -->
   <div class="answer-notice" id="workerbanner" role="status" hidden style="margin:12px 0;padding:8px 12px;font-size:var(--text-label)"></div>
 
   <!-- ===== 上: 資料フォルダ（登録・一覧） ===== -->
@@ -119,7 +123,7 @@
       <div id="list"><div class="muted">読み込み中…</div></div>
       <div class="muted" style="font-size:var(--text-small);margin-top:8px">
         ※「更新」は変更があったファイルだけを取り込み直します。「削除」は Sherpa の
-        <b>検索用データ（索引・テキスト化した写し・関係グラフ）だけ</b>を消します。
+        <b>検索用データと資料どうしの関係だけ</b>を消します。
         元の Windows フォルダ・ファイルは一切消えません。</div>
       <div class="note" id="listmsg"></div>
       <div class="diskbox" id="listdisk" role="status" hidden></div>
@@ -147,8 +151,7 @@
   <div class="section-head">
     <div><div class="section-title">取り込み状況</div>
       <div class="sub" style="font-size:var(--text-small)">どの資料が使えるかを確認し、失敗したものをやり直します</div>
-      <div class="sub" id="curpath" style="font-size:var(--text-small)"></div>
-      <a class="help-link" href="graph.html">ナレッジグラフで見る →</a></div>
+      <div class="sub" id="curpath" style="font-size:var(--text-small)"></div></div>
     <div class="spacer"></div>
     <span class="field"><label>資料フォルダ</label><select id="version"><option value="v1">v1</option></select></span>
     <button class="btn-ghost" id="detailbtn" hidden>詳細（管理）</button>
@@ -177,7 +180,7 @@
         <span class="lbl" id="count"></span>
       </div>
       <div class="card es-card">
-        <div class="card-head"><span class="ico">🔎</span><div><div class="title">全文検索</div>
+        <div class="card-head"><span class="ico">🔎</span><div><div class="title">資料の本文を検索</div>
           <div class="sub" id="es-scope">現在の資料フォルダ全体</div></div></div>
         <div class="es-searchbar">
           <span class="field" style="flex:1"><span>🔎</span>
@@ -200,19 +203,19 @@
   </div>
 </div>
 
-<!-- 詳細（管理）: 抽出プレビュー（関係・廃止ラベルの精度監査） -->
+<!-- 詳細（管理） -->
 <div class="overlay" id="overlay">
   <div class="rv">
     <div class="rv-h">
       <div><div class="hl">取り込み内容の詳細（管理）</div>
-        <div class="sub">関係・廃止ラベルの精度監査</div></div>
+        <div class="sub">資料どうしの関係と表示状態を確認します</div></div>
       <div class="spacer"></div>
       <button class="closebtn" onclick="closePrev()">✕</button>
     </div>
     <div class="rv-bar" id="pv-bar"></div>
     <div class="rv-cols">
       <div class="col left">
-        <h4>抽出された要素</h4><div id="pv-ents"></div>
+        <h4>見つかった要素</h4><div id="pv-ents"></div>
       </div>
       <div class="col"><h4>関係</h4><div id="pv-rels"></div></div>
     </div>

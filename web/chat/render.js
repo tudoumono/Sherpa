@@ -832,7 +832,7 @@ function answerHTML(answer, trace, feedback) {
     + budgetNoteHTML(answer.data && answer.data.evidence_packet)
     + investigationSummaryHTML(answer)
     + retryHintsHTML(answer.retry_hints) + body
-    + refGraphHTML(answer) + renderCreatedFiles(answer.created_files)
+    + renderCreatedFiles(answer.created_files)
     + renderReconciliation(answer)
     + renderImpactList(answer)
     + (hasReferencedDocs(answer) ? renderReferencedDocs(answer, evidencePacketForBadges)
@@ -919,52 +919,6 @@ function investigationSummaryHTML(answer) {
     `<div class="investigation-summary-item"><span class="investigation-summary-label">${esc(String(i.label || ''))}</span> ${esc(i.text)}</div>`).join('') + '</div>';
 }
 
-// 回答が参照したノード/関係から小さな部分グラフを組む（impact=経路、troubleshoot=近傍チェーン）
-function subgraphFromAnswer(a) {
-  const items = a.lens === 'impact' ? ((a.data && a.data.items) || [])
-    : a.lens === 'troubleshoot' ? ((a.data && a.data.candidates) || []) : [];
-  const nodes = new Map(), edges = new Set(), SEP = '';
-  const add = (name) => { if (name && !nodes.has(name)) nodes.set(name, { name }); return nodes.get(name); };
-  const ts = a.lens === 'troubleshoot';   // 経路の向きが逆（impact=影響→…→起点・troubleshoot=起点→…→候補）
-  for (const it of items) {
-    if (it.name) add(it.name).affected = true;
-    const path = (ts ? it.path : it.trace) || [];
-    path.forEach((nm, k) => { add(nm); if (k > 0 && path[k - 1] && nm) edges.add(path[k - 1] + SEP + nm); });
-    if (path.length) add(path[ts ? 0 : path.length - 1]).start = true;   // ts は先頭=起点／impact は末端=起点
-  }
-  return { nodes: [...nodes.values()], edges: [...edges].map((e) => e.split(SEP)) };
-}
-function refGraphHTML(answer) {   // 「参照したナレッジグラフ」の折りたたみ（impact/troubleshoot）
-  if (answer.lens !== 'impact' && answer.lens !== 'troubleshoot') return '';
-  const sub = subgraphFromAnswer(answer);
-  if (sub.nodes.length < 2) return '';
-  return `<div class="refgraph"><button class="refgraph-h" data-rg="${esc(JSON.stringify(sub))}">`
-    + `🕸 参照したナレッジグラフ（${sub.nodes.length}件・つながり${sub.edges.length}本）<span class="caret">▾</span></button>`
-    + '<div class="refgraph-body" hidden></div></div>';
-}
-export function initRefGraph(el, sub) {   // 部分グラフを cytoscape で描く（起点=オレンジ大／影響=teal）
-  const dark = document.documentElement.dataset.theme === 'dark';
-  const els = [
-    ...sub.nodes.map((n) => ({ data: { id: n.name, label: n.name, role: n.start ? 'start' : (n.affected ? 'affected' : 'mid') } })),
-    ...sub.edges.filter(([a, b]) => a && b).map(([a, b]) => ({ data: { source: a, target: b } })),
-  ];
-  const cy = cytoscape({
-    container: el, elements: els, wheelSensitivity: 0.2, maxZoom: 1.6, minZoom: 0.1,
-    style: [
-      { selector: 'node', style: { label: 'data(label)', 'font-size': 9, width: 16, height: 16,
-        'background-color': '#94a3b8', color: dark ? '#e6edf3' : '#1f2937', 'text-valign': 'bottom', 'text-margin-y': 2,
-        'text-outline-width': 2, 'text-outline-color': dark ? '#0f1419' : '#fff', 'text-max-width': 90, 'text-wrap': 'ellipsis' } },
-      { selector: 'node[role="start"]', style: { 'background-color': '#d97706', width: 22, height: 22 } },
-      { selector: 'node[role="affected"]', style: { 'background-color': '#0d9488' } },
-      { selector: 'edge', style: { width: 1.2, 'line-color': dark ? '#3a4550' : '#cbd5e1', 'target-arrow-shape': 'triangle',
-        'target-arrow-color': dark ? '#3a4550' : '#cbd5e1', 'curve-style': 'bezier', 'arrow-scale': 0.7 } },
-    ],
-    layout: { name: 'breadthfirst', directed: true, padding: 12, spacingFactor: 1.05,
-      roots: sub.nodes.filter((n) => n.start).map((n) => n.name) },
-  });
-  cy.one('layoutstop', () => cy.fit(undefined, 16));
-  return cy;
-}
 // 回答カードを追加する。
 export function appendAnswer(answer, messageId, trace, feedback) {
   const el = answer ? appendAssistantRaw(answerHTML(answer, trace, feedback)) : appendAssistantRaw('<div class="muted">（内容なし）</div>');
@@ -973,18 +927,11 @@ export function appendAnswer(answer, messageId, trace, feedback) {
   return el;
 }
 
-// 最終回答の段階表示（answer_delta を一定ペースで描く）
-let _revPending = '', _revTimer = null;
-export function clearReveal() { if (_revTimer) clearInterval(_revTimer); _revTimer = null; _revPending = ''; }
-export function reveal(text) {
-  _revPending += text;
-  if (_revTimer || !S.ansHead) return;
-  // 一括到着でも一定ペースで描くよう、1回の文字数に上限を設ける
-  _revTimer = setInterval(() => {
-    if (!_revPending) { clearInterval(_revTimer); _revTimer = null; return; }
-    const n = Math.max(2, Math.min(6, Math.ceil(_revPending.length / 40)));
-    S.ansHead.textContent += _revPending.slice(0, n); _revPending = _revPending.slice(n); scroll();
-  }, 20);
+// answer_delta で届いた回答を、そのまま一度に描く。
+export function showAnswerText(text) {
+  if (!S.ansHead) return;
+  S.ansHead.textContent += text;
+  scroll();
 }
 // 逐次表示用の回答カードを（無ければ）作る。
 export function ensureAnswerCard(thinking) {
@@ -995,7 +942,6 @@ export function ensureAnswerCard(thinking) {
 }
 // 逐次表示中のカードを確定した回答で置き換える（無ければ新規に追加し、trace があれば思考の流れボタンを添える）。
 export function finalizeAnswer(thinking, answer, turnId, messageId, trace) {
-  clearReveal();
   let el;
   if (!S.ansEl) {
     if (thinking) thinking.remove();
@@ -1123,12 +1069,23 @@ function renderTrouble(a) {
     ? `<details class="cand-more"><summary>${esc(label)}</summary>${rest.map(_candidateHTML).join('')}</details>`
     : `<div class="muted cand-more">${esc(label)}</div>`);
 }
+// 出典の世代（資料フォルダ直下のフォルダ）と原本の更新時刻。取れた欄だけ「（5期・2026-07-01 12:30 更新）」の形で添える。
+export function provenanceText(item) {
+  const gen = item && typeof item.generation === 'string' ? item.generation.trim() : '';
+  const at = item && typeof item.modified_at === 'string' ? fmtDateTime(item.modified_at) : '';
+  const parts = [gen, at ? `${at} 更新` : ''].filter(Boolean);
+  return parts.length ? `（${parts.join('・')}）` : '';
+}
+const provenanceHTML = (item) => {
+  const t = provenanceText(item);
+  return t ? `<span class="muted cite-prov" title="資料フォルダ直下のフォルダと、原本の更新時刻">${esc(t)}</span>` : '';
+};
 // 引用（該当箇所）カード。既定は折りたたみで、件数だけ見える見出しボタン＋hidden な本体にする。
 function renderQa(a) {
   const cites = (a.data && a.data.citations) || [];
   if (!cites.length) return '';
   const items = cites.map((c) =>
-    `<div class="cite"><span class="doc">${esc(c.doc_id)}</span><span class="sp">行 ${esc(c.span && c.span[0])}–${esc(c.span && c.span[1])}</span><pre>${esc(c.quote)}</pre></div>`).join('');
+    `<div class="cite"><span class="doc">${esc(c.doc_id)}</span>${provenanceHTML(c)}<span class="sp">行 ${esc(c.span && c.span[0])}–${esc(c.span && c.span[1])}</span><pre>${esc(c.quote)}</pre></div>`).join('');
   return `<div class="cites"><button class="cites-h" type="button" data-cites aria-expanded="false">`
     + `📄 該当箇所 (${cites.length})<span class="caret">▾</span></button>`
     + `<div class="cites-body" hidden>${items}</div></div>`;
@@ -1146,7 +1103,7 @@ function renderSources(sources, verifiedDocIds, evidencePacket) {
   const link = (s) => (s.download_url
     ? `<a href="${esc(s.download_url)}" data-dl>📄 ${esc(s.doc_id)}</a>`
     : `<span class="muted" title="この画面ではダウンロードできません">📄 ${esc(s.doc_id)}（ダウンロードできません）</span>`)
-    + `${verificationBadgeHTML(vmap.get(s.doc_id))}${importanceBadgeHTML(s)}`;
+    + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(s.doc_id))}${importanceBadgeHTML(s)}`;
   // sources_verified（精読済み doc_id）があれば、出典を「根拠（精読済み）」と「参考（ヒットのみ）」に分ける（除外はしない）
   if (Array.isArray(verifiedDocIds)) {
     const verified = new Set(verifiedDocIds);
@@ -1208,7 +1165,7 @@ function renderReferencedDocs(answer, evidencePacket) {
     return (s.download_url
       ? `<a href="${esc(s.download_url)}" data-dl>📄 ${esc(r.path)}</a>`
       : `<span class="muted" title="この画面ではダウンロードできません">📄 ${esc(r.path)}（ダウンロードできません）</span>`)
-      + `${verificationBadgeHTML(vmap.get(r.path))}${importanceBadgeHTML(s)}`;
+      + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(r.path))}${importanceBadgeHTML(s)}`;
   };
   return head
     + rows.map((r) => `<div class="sources-unverified-row">${link(r)}${r.ranges.length ? `<span class="muted">（${esc(rangeText(r))}${r.rangesMore ? `、ほか ${r.rangesMore} か所` : ''}）</span>` : (r.rangesMore ? `<span class="muted">（ほか ${r.rangesMore} か所）</span>` : '')}`

@@ -95,10 +95,12 @@ get_conversation_for_read
 get_document
 get_feedback_by_message_ids
 get_feedback_by_message_ids_for_user
+get_latest_completed_run_at
 get_latest_es_run_summary
 get_latest_published_run_summary
 get_latest_run_status
 get_latest_run_summary
+get_latest_terminal_run_failure
 get_messages_by_ids
 get_recent_es_attempts
 get_session_id

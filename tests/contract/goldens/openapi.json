@@ -3373,402 +3373,6 @@
         "title": "FsListResponse",
         "type": "object"
       },
-      "GraphCounts": {
-        "description": "グラフの件数。",
-        "properties": {
-          "deprecated": {
-            "title": "Deprecated",
-            "type": "integer"
-          },
-          "documents": {
-            "title": "Documents",
-            "type": "integer"
-          },
-          "entities": {
-            "title": "Entities",
-            "type": "integer"
-          },
-          "hidden": {
-            "title": "Hidden",
-            "type": "integer"
-          },
-          "relations": {
-            "title": "Relations",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "entities",
-          "relations",
-          "deprecated",
-          "hidden",
-          "documents"
-        ],
-        "title": "GraphCounts",
-        "type": "object"
-      },
-      "GraphEdge": {
-        "description": "グラフのエッジ（GET /graph の edges）。",
-        "properties": {
-          "source": {
-            "title": "Source",
-            "type": "string"
-          },
-          "status": {
-            "title": "Status",
-            "type": "string"
-          },
-          "target": {
-            "title": "Target",
-            "type": "string"
-          },
-          "type": {
-            "title": "Type",
-            "type": "string"
-          }
-        },
-        "required": [
-          "source",
-          "target",
-          "type",
-          "status"
-        ],
-        "title": "GraphEdge",
-        "type": "object"
-      },
-      "GraphFacetsResponse": {
-        "description": "グラフの絞り込み候補（GET /graph/facets）。",
-        "properties": {
-          "condition_fields": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Condition Fields",
-            "type": "array"
-          },
-          "node_labels": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Node Labels",
-            "type": "array"
-          },
-          "node_labels_ja": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Node Labels Ja",
-            "type": "object"
-          },
-          "relationship_types": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Relationship Types",
-            "type": "array"
-          }
-        },
-        "required": [
-          "node_labels",
-          "node_labels_ja",
-          "relationship_types",
-          "condition_fields"
-        ],
-        "title": "GraphFacetsResponse",
-        "type": "object"
-      },
-      "GraphNode": {
-        "description": "グラフのノード（GET /graph の nodes）。",
-        "properties": {
-          "id": {
-            "title": "Id",
-            "type": "string"
-          },
-          "name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Name"
-          },
-          "path": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Path"
-          },
-          "status": {
-            "title": "Status",
-            "type": "string"
-          },
-          "top_scope": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Top Scope"
-          },
-          "type": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Type"
-          },
-          "type_ja": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Type Ja"
-          },
-          "value": {
-            "title": "Value"
-          }
-        },
-        "required": [
-          "id",
-          "name",
-          "type",
-          "type_ja",
-          "status",
-          "value",
-          "top_scope",
-          "path"
-        ],
-        "title": "GraphNode",
-        "type": "object"
-      },
-      "GraphResponse": {
-        "description": "グラフ全体（GET /graph）。",
-        "properties": {
-          "counts": {
-            "$ref": "#/components/schemas/GraphCounts"
-          },
-          "edges": {
-            "items": {
-              "$ref": "#/components/schemas/GraphEdge"
-            },
-            "title": "Edges",
-            "type": "array"
-          },
-          "nodes": {
-            "items": {
-              "$ref": "#/components/schemas/GraphNode"
-            },
-            "title": "Nodes",
-            "type": "array"
-          },
-          "total_edges": {
-            "title": "Total Edges",
-            "type": "integer"
-          },
-          "total_nodes": {
-            "title": "Total Nodes",
-            "type": "integer"
-          },
-          "truncated": {
-            "title": "Truncated",
-            "type": "boolean"
-          },
-          "world": {
-            "title": "World",
-            "type": "string"
-          }
-        },
-        "required": [
-          "world",
-          "nodes",
-          "edges",
-          "counts",
-          "total_nodes",
-          "total_edges",
-          "truncated"
-        ],
-        "title": "GraphResponse",
-        "type": "object"
-      },
-      "GraphSearchCounts": {
-        "description": "検索結果の件数（`{\"nodes\":.., \"edges\":..}`・`GraphCounts` と別形）。",
-        "properties": {
-          "edges": {
-            "title": "Edges",
-            "type": "integer"
-          },
-          "nodes": {
-            "title": "Nodes",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "nodes",
-          "edges"
-        ],
-        "title": "GraphSearchCounts",
-        "type": "object"
-      },
-      "GraphSearchNode": {
-        "description": "検索結果のノード（GET /graph/search。`GraphNode` と別形で phase/category を持つ）。",
-        "properties": {
-          "category": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Category"
-          },
-          "id": {
-            "title": "Id",
-            "type": "string"
-          },
-          "name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Name"
-          },
-          "path": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Path"
-          },
-          "phase": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Phase"
-          },
-          "status": {
-            "title": "Status",
-            "type": "string"
-          },
-          "top_scope": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Top Scope"
-          },
-          "type": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Type"
-          },
-          "type_ja": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Type Ja"
-          },
-          "value": {
-            "title": "Value"
-          }
-        },
-        "required": [
-          "id",
-          "name",
-          "type",
-          "type_ja",
-          "status",
-          "value",
-          "top_scope",
-          "phase",
-          "category",
-          "path"
-        ],
-        "title": "GraphSearchNode",
-        "type": "object"
-      },
-      "GraphSearchResponse": {
-        "description": "グラフ検索の結果（GET /graph/search）。",
-        "properties": {
-          "counts": {
-            "$ref": "#/components/schemas/GraphSearchCounts"
-          },
-          "edges": {
-            "items": {
-              "$ref": "#/components/schemas/GraphEdge"
-            },
-            "title": "Edges",
-            "type": "array"
-          },
-          "nodes": {
-            "items": {
-              "$ref": "#/components/schemas/GraphSearchNode"
-            },
-            "title": "Nodes",
-            "type": "array"
-          },
-          "world": {
-            "title": "World",
-            "type": "string"
-          }
-        },
-        "required": [
-          "world",
-          "nodes",
-          "edges",
-          "counts"
-        ],
-        "title": "GraphSearchResponse",
-        "type": "object"
-      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -3801,6 +3405,31 @@
         "title": "HealthSummaryResponse",
         "type": "object"
       },
+      "IngestActionAvailability": {
+        "description": "取り込み画面の操作可否。`reason` は操作できないときに画面へそのまま出す平文。",
+        "properties": {
+          "allowed": {
+            "title": "Allowed",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "required": [
+          "allowed"
+        ],
+        "title": "IngestActionAvailability",
+        "type": "object"
+      },
       "IngestBlockedDoc": {
         "description": "`last_run_blocked` の要素（対象ファイルが特定できる blocked flag の doc/reason）。",
         "properties": {
@@ -3818,6 +3447,35 @@
           "reason"
         ],
         "title": "IngestBlockedDoc",
+        "type": "object"
+      },
+      "IngestCompletedCounts": {
+        "description": "最後に最後まで終わった取り込みに対応する件数の集計。`as_of` 時点の値であり、現在値ではない。",
+        "properties": {
+          "as_of": {
+            "title": "As Of",
+            "type": "string"
+          },
+          "indexed": {
+            "title": "Indexed",
+            "type": "integer"
+          },
+          "office_failed": {
+            "title": "Office Failed",
+            "type": "integer"
+          },
+          "scanned": {
+            "title": "Scanned",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "as_of",
+          "scanned",
+          "indexed",
+          "office_failed"
+        ],
+        "title": "IngestCompletedCounts",
         "type": "object"
       },
       "IngestNotice": {
@@ -7980,8 +7638,15 @@
         "type": "object"
       },
       "WorldRecountResponse": {
-        "description": "再集計（POST /worlds/{wid}/recount）。スキャンを明示的に再実行してキャッシュし直し、取り込み状況をフラットに展開して返す（同期）。",
+        "description": "件数の数え直し（POST /worlds/{wid}/recount）。資料を明示的に数えて記録を更新し、取り込み状況をフラットに展開して返す（同期）。",
         "properties": {
+          "actions": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/IngestActionAvailability"
+            },
+            "title": "Actions",
+            "type": "object"
+          },
           "analyzer_declined": {
             "title": "Analyzer Declined",
             "type": "integer"
@@ -8090,6 +7755,10 @@
             "title": "Indexed",
             "type": "integer"
           },
+          "ingest_active": {
+            "title": "Ingest Active",
+            "type": "boolean"
+          },
           "ingest_notices": {
             "default": [],
             "items": {
@@ -8097,6 +7766,43 @@
             },
             "title": "Ingest Notices",
             "type": "array"
+          },
+          "last_completed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Completed At"
+          },
+          "last_completed_counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IngestCompletedCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_failure_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Failure Message"
+          },
+          "last_failure_retrying": {
+            "default": false,
+            "title": "Last Failure Retrying",
+            "type": "boolean"
           },
           "last_run_blocked": {
             "items": {
@@ -8285,6 +7991,11 @@
           "last_run_blocked",
           "last_run_flags_total",
           "last_run_flags_truncated",
+          "last_completed_at",
+          "last_completed_counts",
+          "last_failure_message",
+          "ingest_active",
+          "actions",
           "failed_files",
           "partial_extraction_suspected",
           "stage_summary",
@@ -8393,6 +8104,13 @@
       "WorldStatusResponse": {
         "description": "資料フォルダの状況（GET /worlds/{wid}/status）。取り込み状況の全キーをフラットに展開する。`last_synced_at` は文字列。",
         "properties": {
+          "actions": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/IngestActionAvailability"
+            },
+            "title": "Actions",
+            "type": "object"
+          },
           "analyzer_declined": {
             "title": "Analyzer Declined",
             "type": "integer"
@@ -8501,6 +8219,10 @@
             "title": "Indexed",
             "type": "integer"
           },
+          "ingest_active": {
+            "title": "Ingest Active",
+            "type": "boolean"
+          },
           "ingest_notices": {
             "default": [],
             "items": {
@@ -8519,6 +8241,43 @@
               }
             ],
             "title": "Label"
+          },
+          "last_completed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Completed At"
+          },
+          "last_completed_counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IngestCompletedCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_failure_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Failure Message"
+          },
+          "last_failure_retrying": {
+            "default": false,
+            "title": "Last Failure Retrying",
+            "type": "boolean"
           },
           "last_run_blocked": {
             "items": {
@@ -8733,6 +8492,11 @@
           "last_run_blocked",
           "last_run_flags_total",
           "last_run_flags_truncated",
+          "last_completed_at",
+          "last_completed_counts",
+          "last_failure_message",
+          "ingest_active",
+          "actions",
           "failed_files",
           "partial_extraction_suspected",
           "stage_summary",
@@ -13471,236 +13235,6 @@
         ]
       }
     },
-    "/graph": {
-      "get": {
-        "description": "ナレッジグラフの可視化用データ（nodes/edges・読み取り専用）を返す。\n既定は主要ノードのみ（次数上位・`limit` 未指定は 100 件）。`limit=0` で全件。内容署名の ETag を付け、`If-None-Match` が一致すれば 304 を返す。\nworld 世代の確認に失敗した場合は、握り潰さずログ付きの 503 にする。",
-        "operationId": "graph_get_graph_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "world",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "World"
-            }
-          },
-          {
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "maximum": 100000,
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Limit"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GraphResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Graph Get",
-        "tags": [
-          "ナレッジグラフ"
-        ]
-      }
-    },
-    "/graph/facets": {
-      "get": {
-        "description": "グラフ検索の選択肢（label/relationship の閉じた語彙）を返す。",
-        "operationId": "graph_facets_graph_facets_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GraphFacetsResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Graph Facets",
-        "tags": [
-          "ナレッジグラフ"
-        ]
-      }
-    },
-    "/graph/search": {
-      "get": {
-        "description": "関係種別/属性条件でグラフを検索し、可視化と同じ nodes/edges 形で返す。",
-        "operationId": "graph_search_graph_search_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "world",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "World"
-            }
-          },
-          {
-            "in": "query",
-            "name": "relationship",
-            "required": false,
-            "schema": {
-              "items": {
-                "type": "string"
-              },
-              "title": "Relationship",
-              "type": "array"
-            }
-          },
-          {
-            "in": "query",
-            "name": "field",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Field"
-            }
-          },
-          {
-            "in": "query",
-            "name": "value",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Value"
-            }
-          },
-          {
-            "in": "query",
-            "name": "op",
-            "required": false,
-            "schema": {
-              "default": "eq",
-              "title": "Op",
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "include_deprecated",
-            "required": false,
-            "schema": {
-              "default": false,
-              "title": "Include Deprecated",
-              "type": "boolean"
-            }
-          },
-          {
-            "in": "query",
-            "name": "scope_paths",
-            "required": false,
-            "schema": {
-              "items": {
-                "type": "string"
-              },
-              "title": "Scope Paths",
-              "type": "array"
-            }
-          },
-          {
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "default": 200,
-              "maximum": 1000,
-              "minimum": 1,
-              "title": "Limit",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GraphSearchResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Graph Search",
-        "tags": [
-          "ナレッジグラフ"
-        ]
-      }
-    },
     "/health/summary": {
       "get": {
         "description": "バックエンド健全性のサマリを返す（全画面の状態ドット用・ログイン必須）。Postgres 停止時にも例外にならず down を返す（未ログインは 401）。",
@@ -13745,7 +13279,7 @@
     },
     "/ingest/preview": {
       "get": {
-        "description": "取り込み・抽出プレビュー（読み取り専用）。world グラフの抽出内容を返す。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする（`/graph` と同じ固定文言）。",
+        "description": "取り込み・抽出プレビュー（読み取り専用）。資料の一覧と world グラフの抽出内容を返す。取り込み中・一度も完了していない資料フォルダはグラフを組み立てず、`graph_note` に理由を返す。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする。",
         "operationId": "ingest_preview_ingest_preview_get",
         "parameters": [
           {
@@ -13884,7 +13418,7 @@
     },
     "/ingest/workers": {
       "get": {
-        "description": "取り込みワーカーと Web アプリの版の照合（管理者のみ）。ワーカーが動いていない・版が違うときは `message` に画面に出すお知らせが入る。",
+        "description": "取り込みと画像文字読み取りの稼働状況（管理者のみ）。画面上部へ出す平文のお知らせを返す。",
         "operationId": "ingest_workers_status_ingest_workers_get",
         "responses": {
           "200": {
@@ -14712,7 +14246,7 @@
     },
     "/worlds/{wid}/recount": {
       "post": {
-        "description": "取り込み集計を明示的にやり直す（唯一の明示的な実走査）。\n`GET /worlds/{wid}/status` はキャッシュを読むだけなので、未集計の world や手動でファイルを触った world を最新化したいときに呼ぶ。参照元フォルダを 1 回走査して集計を更新するだけで、グラフ/台帳/ES には触れない。走査中に取り込み・付け替えが入って世代が変わっていたら 409 で終え（再試行しない）、参照元が消失・置換された場合や走査自体の失敗は 503 とし、集計結果を保存しない。",
+        "description": "取り込み集計を明示的にやり直す（唯一の明示的な実走査）。\n`GET /worlds/{wid}/status` はキャッシュを読むだけなので、件数をまだ確認していない world や手動でファイルを触った world を最新化したいときに呼ぶ。参照元フォルダを 1 回走査して集計を更新するだけで、グラフ/台帳/ES には触れない。走査中に取り込み・付け替えが入って世代が変わっていたら 409 で終え（再試行しない）、参照元が消失・置換された場合や走査自体の失敗は 503 とし、集計結果を保存しない。",
         "operationId": "world_recount_worlds__wid__recount_post",
         "parameters": [
           {
@@ -14986,10 +14520,6 @@
     {
       "description": "登録ディレクトリ（world）の登録・状態確認・差分・再取込・削除、フォルダ選択。",
       "name": "資料フォルダ(World)管理"
-    },
-    {
-      "description": "ナレッジグラフの可視化データ・検索。",
-      "name": "ナレッジグラフ"
     },
     {
       "description": "ヘルスチェック・ルート・静的UI配信。",

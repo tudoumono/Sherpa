@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shutil
 import time
 import urllib.error
@@ -227,16 +228,26 @@ def _md_hit(doc_id="a.md", text="short"):
     return {"doc_id": doc_id, "line": 1, "span": [1, 1], "text": text, "ext": ".md"}
 
 
-@pytest.mark.parametrize("max_hits, expected_bytes", [(30, 2184), (200, 512)])
-def test_run_tool_ripgrep_search_hit_text_clipped_to_per_hit_budget(monkeypatch, max_hits, expected_bytes):
-    """per_hit = max(_HIT_TEXT_MIN_BYTES, tool_result_max_bytes // max_hits) で text を末尾クリップし、
+@pytest.mark.parametrize("n_hits, expected_bytes", [(8, 8192), (200, 512)])
+def test_run_tool_ripgrep_search_hit_text_clipped_to_per_hit_budget(monkeypatch, n_hits, expected_bytes):
+    """per_hit = max(_HIT_TEXT_MIN_BYTES, tool_result_max_bytes // 実際に返すヒット数) に text を収め、
     切ったヒットだけに text_truncated を付ける（下限 512）。"""
-    big_text = "x" * 5000
-    res = _run_rg_with_hits(monkeypatch, [_md_hit(text=big_text)], max_hits=max_hits)
+    big_text = "x" * 20000
+    hits = [_md_hit(f"d{i:03d}.md", big_text) for i in range(n_hits)]
+    res = _run_rg_with_hits(monkeypatch, hits, max_hits=30)
     hit = res["hits"][0]
-    assert len(hit["text"].encode("utf-8")) == expected_bytes and hit["text"] == big_text[:expected_bytes]
+    size = len(hit["text"].encode("utf-8"))
+    lower = expected_bytes // 2 if expected_bytes > 512 else expected_bytes - 8
+    assert lower < size <= expected_bytes and hit["text"].startswith("xxxx")
     assert hit["text_truncated"] is True
     assert RT._HIT_TEXT_MIN_BYTES == 512
+
+
+def test_run_tool_ripgrep_search_single_hit_budget_is_not_divided_by_max_hits(monkeypatch):
+    """1 件だけのヒットは max_hits（上限）で割られず、予算いっぱいまで本文を返す。"""
+    text = "\n".join(f"line {i}" for i in range(1, 2001))  # 約 16KB
+    res = _run_rg_with_hits(monkeypatch, [_md_hit(text=text)], max_hits=45, tool_result_max_bytes=64 * 1024)
+    assert res["hits"][0]["text"] == text and "text_truncated" not in res["hits"][0]
 
 
 def test_run_tool_ripgrep_search_serialized_view_stays_within_budget_despite_per_hit_overhead(monkeypatch):
@@ -251,7 +262,7 @@ def test_run_tool_ripgrep_search_serialized_view_stays_within_budget_despite_per
 def test_run_tool_ripgrep_search_text_truncated_flags(monkeypatch):
     """いずれかのヒットが切られたら最上位にも text_truncated（統計・MCP は最上位だけを見る）。
     切られないヒット・1 件も切られない結果にはキー自体を作らない。"""
-    res = _run_rg_with_hits(monkeypatch, [_md_hit("a.md", "x" * 5000), _md_hit("b.md", "short")])
+    res = _run_rg_with_hits(monkeypatch, [_md_hit("a.md", "x" * 40000), _md_hit("b.md", "short")])
     by_doc = {h["doc_id"]: h for h in res["hits"]}
     assert res["text_truncated"] is True and by_doc["a.md"]["text_truncated"] is True
     assert "text_truncated" not in by_doc["b.md"]
@@ -270,9 +281,87 @@ def test_run_tool_ripgrep_search_md_heading_survives_per_hit_clip(monkeypatch, t
         "ripgrep_search", {"query": "NEEDLE"}, world, None, max_hits=2, tool_result_max_bytes=4096)
     by_doc = {h["doc_id"]: h for h in res["hits"]}
     big_hit = by_doc["big.md"]
-    assert len(big_hit["text"].encode("utf-8")) == 2048 and big_hit["text"].startswith(heading)
+    assert 1500 < len(big_hit["text"].encode("utf-8")) <= 2048 and big_hit["text"].startswith(heading)
+    assert "NEEDLE line" in big_hit["text"]
     assert big_hit["text_truncated"] is True
     assert by_doc["small.md"]["text"] == "NEEDLE small line" and "text_truncated" not in by_doc["small.md"]
+
+
+def _long_section_md(n_lines: int, hit_line: int, hit_word: str, pad: int) -> str:
+    """見出し 1 行＋本文 n_lines-1 行の 1 節だけの Markdown。hit_line 行目だけに hit_word を置く。"""
+    body = ["# 節の見出し"] + [f"行{i:04d} " + "a" * pad for i in range(2, n_lines + 1)]
+    body[hit_line - 1] = f"行{hit_line:04d} 注目の語 {hit_word} がここにある"
+    return "\n".join(body) + "\n"
+
+
+def test_ripgrep_search_keeps_match_line_of_single_section_under_old_divided_budget(monkeypatch, tmp_path):
+    """約 2.9KB の 1 節の 152 行目の一致語が、ヒット 1 件でも本文に残る（上限 45 で割った予算では消えていた）。"""
+    world = "hit-window-small"
+    md = _long_section_md(152 + 10, 152, "NEEDLE_MID", pad=9)
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"one.md": md})
+    assert 2500 < len(md.encode("utf-8")) < 3500
+    res, _docs, cites, _cards = TD.run_tool("ripgrep_search", {"query": "NEEDLE_MID"}, world, None,
+                                            max_hits=45, tool_result_max_bytes=64 * 1024)
+    hit = res["hits"][0]
+    assert "NEEDLE_MID" in hit["text"] and hit["line"] == 152
+    assert "text_truncated" not in hit  # 1 件なので予算は割られず、節がそのまま収まる
+    # 予算を絞って節が収まらなくても、見出し行＋一致行の前後が残り、省略の印に行の位置がある
+    res2, _d, cites2, _c = TD.run_tool("ripgrep_search", {"query": "NEEDLE_MID"}, world, None,
+                                       max_hits=45, tool_result_max_bytes=1200)
+    t2 = res2["hits"][0]["text"]
+    assert t2.startswith("# 節の見出し") and "NEEDLE_MID" in t2 and res2["hits"][0]["text_truncated"] is True
+    assert "⋯（2〜" in t2 and "行目を省略）⋯" in t2
+    assert "NEEDLE_MID" in cites2[0]["quote"]  # 引用の抜粋にも一致行が入る
+
+
+def test_ripgrep_search_keeps_match_line_beyond_grep_section_cap_and_quote(monkeypatch, tmp_path):
+    """約 79KiB の 1 節（grep 内部の上限 64KiB を超える）の 2,202 行目の一致語が本文と引用に残る。"""
+    world = "hit-window-huge"
+    md = _long_section_md(2300, 2202, "NEEDLE_FAR", pad=26)
+    assert 78 * 1024 < len(md.encode("utf-8")) < 82 * 1024
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"huge.md": md})
+    hits = grep_tool_mod.grep_search("NEEDLE_FAR", world)
+    assert len(hits) == 1 and hits[0]["line"] == 2202 and hits[0]["section_truncated"] is True
+    assert "NEEDLE_FAR" in hits[0]["text"] and hits[0]["text"].startswith("# 節の見出し")
+    assert len(hits[0]["text"].encode("utf-8")) <= 64 * 1024
+    assert "⋯（2〜2198行目を省略）⋯" in hits[0]["text"] and "⋯（2206行目以降を省略）⋯" in hits[0]["text"]
+    res, _docs, cites, _cards = TD.run_tool("ripgrep_search", {"query": "NEEDLE_FAR"}, world, None,
+                                            tool_result_max_bytes=36000)
+    text = res["hits"][0]["text"]
+    assert "NEEDLE_FAR" in text and "行2202 注目の語" in text and text.startswith("# 節の見出し")
+    assert "⋯（2〜2198行目を省略）⋯" in text  # 離れた箇所の行の位置が分かる（連続した原文に見せない）
+    assert res["hits"][0]["section_truncated"] is True
+    assert "NEEDLE_FAR" in cites[0]["quote"] and len(cites[0]["quote"]) <= 500
+
+
+def test_ripgrep_search_45_hits_fit_codex_cli_budget_and_keep_structure(monkeypatch, tmp_path):
+    """45 件の結果が Codex CLI の通常の経路（中央を落とす約 40,000 バイト）に収まり、構造・全ヒットの一致語・next_offset が残る。"""
+    from sherpa import mcp_server as M
+    from sherpa.providers.codex.usage import _resolve_mcp_budget
+    world = "hit-window-45"
+    files = {f"d{i:02d}.md": _long_section_md(150, 100, f"NEEDLE_{i:02d}", pad=12) for i in range(48)}
+    _isolate_world_kb(monkeypatch, tmp_path, world, files)
+    for k, v in _resolve_mcp_budget({}).items():
+        monkeypatch.setenv(k, v)
+    budget = M._tool_budget_bytes("ripgrep_search")
+    assert budget is not None and budget <= 40_000 - 2_000
+    # 他の検索語は含まない共通語で 45 件を引く
+    res, _docs, _cites, _cards = TD.run_tool("ripgrep_search", {"query": "注目の語"}, world, None,
+                                             max_hits=45, tool_result_max_bytes=budget)
+    assert len(res["hits"]) == 45 and res["truncated"] is True and res["next_offset"] == 45
+    assert len(json.dumps(res, ensure_ascii=False).encode("utf-8")) <= budget
+    for h in res["hits"]:
+        assert "注目の語" in h["text"] and h["doc_id"].endswith(".md") and h["line"] == 100
+    clipped, was_clipped = M._clip_tool_result(res, name="ripgrep_search", args={})
+    assert was_clipped is False and clipped is res
+
+
+def test_tool_budget_bytes_search_tools_use_search_budget(monkeypatch):
+    from sherpa import mcp_server as M
+    monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", str(64 * 1024))
+    monkeypatch.setenv("SHERPA_MCP_SEARCH_BUDGET_BYTES", "36000")
+    assert M._tool_budget_bytes("ripgrep_search") == 36000 and M._tool_budget_bytes("es_search") == 36000
+    assert M._tool_budget_bytes("read_doc") == 64 * 1024
 
 
 def test_run_tool_window_cap_raises_read_around_ceiling(monkeypatch, tmp_path):
@@ -899,7 +988,7 @@ def _read_around_run_tool_script(doc_lines: int, center_line: int, window_arg: i
         args_literal += f", 'window': {window_arg}"
     return (
         "import json, os, tempfile\n"
-        "tmp = tempfile.mkdtemp()\n"
+        "tmp = os.path.realpath(tempfile.mkdtemp())\n"  # macOS の /var→/private/var のリンクで資料フォルダの外と判定されないよう実パスにする
         "wd = os.path.join(tmp, 'kb', 'freshworld')\n"
         "os.makedirs(wd, exist_ok=True)\n"
         f"content = chr(10).join(f'line {{i}}' for i in range(1, {doc_lines + 1}))\n"
@@ -2265,3 +2354,194 @@ def test_parent_return_marks_unfetched_parent_chunks_as_partial(monkeypatch, tmp
         chunk_ids=lambda w, doc_id, parent_ids, limit=5000: [])
     entry = res["hits"][0]
     assert entry["parent_chunks_unfetched"] is True and entry["fragment"] is True and entry["text_truncated"] is True
+
+
+# ===== 親返しが chunk に縮退したときの行の束の本文・取り込み時点の印 =====
+
+_GROUP_TAIL = "ただし検収日が月末を過ぎた場合は翌月の締めに回す（承認者の決裁が必要）"
+
+
+def _row_group_world(group_body_pad: str = ""):
+    """行の束 g1・g2（rag.md に完全な本文）と、領域を予算超過にする pad1 を持つ rag.md、束のヒット。"""
+    md = ("<!-- chunk:g1 -->\n条件A: 検収日が当月末までの場合は当月の締めに計上する" + group_body_pad + "\n\n"
+          "<!-- chunk:g2 -->\n条件B: " + _GROUP_TAIL + group_body_pad + "\n\n"
+          "<!-- chunk:pad1 -->\n" + "P" * 5000 + "\n")
+    short = "列: 条件\n条件A: 検収日が当月末までの"  # vector_text を値 32 字で切った形（後半の値は入らない）
+    hit = _chunk_hit("terms.xlsx", "g1", "p1", 1.0, short, ".xlsx", row_group_chunk_ids=["g1", "g2"])
+    return md, hit
+
+
+def test_parent_return_chunk_tier_row_group_returns_full_rag_md_body(monkeypatch, tmp_path):
+    """束のヒットが tier=chunk に縮退しても、切った vector_text でなく rag.md の完全な本文（32 字より後ろの値）を返す。秘匿値は伏せる。"""
+    md, hit = _row_group_world()
+    md = md.replace(_GROUP_TAIL, _GROUP_TAIL + " token=sk-1234567890ABCDEFGHIJ")
+    res, _ = _run_parent_return(monkeypatch, tmp_path, [hit], {"terms.xlsx": md}, 4000,
+                                chunk_ids=lambda w, doc_id, parent_ids, limit=5000: ["g1", "g2", "pad1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk"
+    assert _GROUP_TAIL in entry["text"] and "条件B" in entry["text"]
+    assert "sk-1234567890ABCDEFGHIJ" not in entry["text"] and "[REDACTED]" in entry["text"]
+    assert "row_group_text_cut" not in entry and "ingest_time_text" not in entry
+
+
+def test_parent_return_chunk_tier_row_group_over_budget_marks_cut_and_how_to_read(monkeypatch, tmp_path):
+    """束の完全な本文が予算に入らないときは、切った文字のまま省いた印と続きの読み方（read_around／read_doc）を返す。"""
+    md, hit = _row_group_world("あ" * 400)
+    res, _ = _run_parent_return(monkeypatch, tmp_path, [hit], {"terms.xlsx": md}, 1000,
+                                chunk_ids=lambda w, doc_id, parent_ids, limit=5000: ["g1", "g2", "pad1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and _GROUP_TAIL not in entry["text"]
+    assert entry["row_group_text_cut"]["chunks"] == ["g1"]
+    assert "read_around" in entry["row_group_text_cut"]["read_more"] and "read_doc" in entry["row_group_text_cut"]["read_more"]
+    assert entry["text_truncated"] is True and res["text_truncated"] is True
+
+
+def test_parent_return_chunk_tier_row_groups_of_same_doc_scan_rag_md_once(monkeypatch, tmp_path):
+    """同じ文書の束のヒットが複数あっても、束の本文のための rag.md の走査は文書ごとに 1 回（領域の読取 1 回＋束の走査 1 回）。返す本文は束ごとに自分の構成だけ。"""
+    md = ("<!-- chunk:g1 -->\n条件A: 一つ目の束の本文\n\n<!-- chunk:g2 -->\n条件B: 一つ目の束の続き\n\n"
+          "<!-- chunk:h1 -->\n条件C: 二つ目の束の本文\n\n<!-- chunk:pad1 -->\n" + "P" * 5000 + "\n")
+    hits = [_chunk_hit("terms.xlsx", "g1", "p1", 2.0, "短1", ".xlsx", row_group_chunk_ids=["g1", "g2"]),
+            _chunk_hit("terms.xlsx", "h1", "p1", 1.0, "短2", ".xlsx", row_group_chunk_ids=["h1"])]
+    opened: list = []
+    real_open = RT._open_doc_stream
+
+    def _counting_open(*a, **kw):
+        opened.append(a[1])
+        return real_open(*a, **kw)
+
+    monkeypatch.setattr(RT, "_open_doc_stream", _counting_open)
+    res, _ = _run_parent_return(monkeypatch, tmp_path, hits, {"terms.xlsx": md}, 4000,
+                                chunk_ids=lambda w, doc_id, parent_ids, limit=5000: ["g1", "g2", "h1", "pad1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk"
+    assert entry["text"] == "条件A: 一つ目の束の本文\n\n条件B: 一つ目の束の続き\n\n条件C: 二つ目の束の本文"
+    assert opened == ["terms.xlsx", "terms.xlsx"]   # 領域の読取 1 回＋束の走査 1 回（ヒットごとの読み直しをしない）
+    assert "row_group_text_cut" not in entry and "ingest_time_text" not in entry
+
+
+def test_parent_return_chunk_tier_marks_ingest_time_text_when_chunk_missing_from_rag_md(monkeypatch, tmp_path):
+    """ES のヒットの chunk_id が今の rag.md に無く ES の本文を返すしかないとき、取り込み時点の内容である印を本文と結果に付ける。"""
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "old1", "p1", 1.0, "古い本文")],
+        {"a.docx": "<!-- chunk:new1 -->\n作り直し後の本文\n"}, 5000, chunk_ids=["old1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and entry["text"].startswith("古い本文") and "取り込み時点" in entry["text"]
+    assert entry["ingest_time_text"] == {"chunks": ["old1"]}
+
+
+def test_parent_return_chunk_tier_read_cut_rag_md_does_not_mark_ingest_time_text(monkeypatch, tmp_path):
+    """rag.md の読込が上限で打ち切られ chunk_id を見つけられなかったときは「無い」と言えないので、取り込み時点の印を付けない（読めなかった印は text_truncated）。最後まで読めて無いときは付く。"""
+    rag_md = "<!-- chunk:new1 -->\n作り直し後の本文\n" + "余白の行\n" * 400
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 512)
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "old1", "p1", 1.0, "古い本文")],
+        {"a.docx": rag_md}, 5000, chunk_ids=["old1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and entry["text"] == "古い本文"
+    assert "ingest_time_text" not in entry and entry["text_truncated"] is True
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024)
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "old1", "p1", 1.0, "古い本文")],
+        {"a.docx": rag_md}, 5000, chunk_ids=["old1"])
+    assert res["hits"][0]["ingest_time_text"] == {"chunks": ["old1"]}
+
+
+def test_parent_return_chunk_tier_row_group_read_cut_does_not_mark_ingest_time_text(monkeypatch, tmp_path):
+    """束の構成の chunk_id を探す途中で読込が打ち切られたときも、取り込み時点の印を付けない。"""
+    _md, hit = _row_group_world()
+    hit["row_group_chunk_ids"] = ["gone1", "gone2"]
+    md = "<!-- chunk:other1 -->\n" + "P" * 5000 + "\n"
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 512)
+    res, _ = _run_parent_return(monkeypatch, tmp_path, [hit], {"terms.xlsx": md}, 4000,
+                                chunk_ids=lambda w, doc_id, parent_ids, limit=5000: ["g1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and "ingest_time_text" not in entry and "取り込み時点" not in entry["text"]
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024)
+    res, _ = _run_parent_return(monkeypatch, tmp_path, [hit], {"terms.xlsx": md}, 4000,
+                                chunk_ids=lambda w, doc_id, parent_ids, limit=5000: ["g1"])
+    assert res["hits"][0]["ingest_time_text"] == {"chunks": ["g1"]}
+
+
+def test_parent_return_chunk_tier_row_group_missing_from_rag_md_keeps_es_text_with_ingest_mark(monkeypatch, tmp_path):
+    """束の構成の chunk_id が今の rag.md に無いときも、ES の本文（切った文字）に取り込み時点の印を付ける。"""
+    md, hit = _row_group_world()
+    hit["row_group_chunk_ids"] = ["gone1", "gone2"]
+    res, _ = _run_parent_return(monkeypatch, tmp_path, [hit], {"terms.xlsx": md}, 4000,
+                                chunk_ids=lambda w, doc_id, parent_ids, limit=5000: ["g1", "g2", "pad1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and _GROUP_TAIL not in entry["text"] and "取り込み時点" in entry["text"]
+    assert entry["ingest_time_text"] == {"chunks": ["g1"]}
+
+
+def test_parent_return_read_cut_mid_last_chunk_does_not_return_partial_body_as_complete(monkeypatch, tmp_path):
+    """rag.md の読込が最後のチャンクの途中で上限に当たったとき、途中までの本文を完全な本文として返さず、text_truncated を立てる。上限に当たらなければ従来どおり領域を返す。"""
+    tail = "余白の行\n" * 400
+    single_md = "<!-- chunk:c1 -->\n先頭の行\n" + tail
+    two_md = "<!-- chunk:c0 -->\n前のチャンクの本文\n\n<!-- chunk:c1 -->\n先頭の行\n" + tail
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 600)
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "c1", "p1", 1.0, "検索用の本文")],
+        {"a.docx": single_md}, 262144, chunk_ids=["c1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "chunk" and entry["text"] == "検索用の本文"  # 途中までの本文は領域として返さない
+    assert entry["text_truncated"] is True and "ingest_time_text" not in entry and res["text_truncated"] is True
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "c1", "p1", 1.0, "検索用の本文")],
+        {"a.docx": two_md}, 262144, chunk_ids=["c0", "c1"])
+    entry = res["hits"][0]
+    assert "前のチャンクの本文" in entry["text"] and "余白の行" not in entry["text"]  # 読み切れたチャンクだけ
+    assert entry["text_truncated"] is True and entry["region_missing_chunks"] == 1
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024)
+    res, _ = _run_parent_return(
+        monkeypatch, tmp_path, [_chunk_hit("a.docx", "c1", "p1", 1.0, "検索用の本文")],
+        {"a.docx": two_md}, 262144, chunk_ids=["c0", "c1"])
+    entry = res["hits"][0]
+    assert entry["tier"] == "region" and entry["text"].count("余白の行") == 400
+    assert "text_truncated" not in entry and "region_missing_chunks" not in entry
+
+
+def test_parent_return_carries_row_group_exact_chunk_ids_to_es_search_result(monkeypatch, tmp_path):
+    """束の中間の行の識別子で exact と意味検索を併用して当たったとき、親返しの entry に exact で一致した行の chunk_id を重複なしで出す。"""
+    md = ("<!-- chunk:g1 -->\n行1\n\n<!-- chunk:g2 -->\n行2\n\n<!-- chunk:g3 -->\n行3\n")
+    hit1 = _chunk_hit("terms.xlsx", "g1", "p1", 2.0, "行1", ".xlsx",
+                      row_group_chunk_ids=["g1", "g2", "g3"], row_group_exact_chunk_ids=["g2"])
+    hit2 = _chunk_hit("terms.xlsx", "g3", "p1", 1.0, "行3", ".xlsx",
+                      row_group_chunk_ids=["g3"], row_group_exact_chunk_ids=["g2", "g3"])
+    _prepare_parent_return(monkeypatch, tmp_path, [hit1, hit2], {"terms.xlsx": md}, 262144,
+                           chunk_ids=["g1", "g2", "g3"])
+    monkeypatch.setattr(A.es_index, "search_knn_only",
+                        lambda w, q, scope_paths=None, k=20, layer=None, **kw: (
+                            [hit1, hit2] if kw.get("exact") == ["行2の識別子"] else [], None))
+    res, *_ = TD.run_tool("es_search", {"query": "q", "mode": "vector", "exact": ["行2の識別子"]},
+                          "parent-return-world", None)
+    assert res["mode_used"] == "vector"
+    assert res["hits"][0]["row_group_exact_chunk_ids"] == ["g2", "g3"]
+
+
+def test_ripgrep_search_keeps_match_line_when_query_has_surrounding_spaces(monkeypatch, tmp_path):
+    """前後に空白のある検索語でも、切り詰めた本文と引用に一致行が残る（grep 本体と同じく空白を除いて探す）。"""
+    world = "hit-window-space"
+    md = _long_section_md(152 + 10, 152, "NEEDLE_SP", pad=9)
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"one.md": md})
+    res, _d, cites, _c = TD.run_tool("ripgrep_search", {"query": "\tNEEDLE_SP\t"}, world, None,
+                                     max_hits=45, tool_result_max_bytes=1200)
+    assert "NEEDLE_SP" in res["hits"][0]["text"] and "NEEDLE_SP" in cites[0]["quote"]
+
+
+def test_ripgrep_search_omission_marks_keep_line_numbers_after_a_redacted_key(monkeypatch, tmp_path):
+    """節の中の秘密鍵を伏せても行の数は変わらず、省略の印の行の位置が原本と合う。"""
+    world = "hit-window-key"
+    lines = ["# 節の見出し", "前置き",
+             "-----BEGIN PRIVATE KEY-----", "MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA", "abcdefghijABCDEFGHIJ0123456789+/abcdefghijABCD",
+             "-----END PRIVATE KEY-----"]
+    lines += [f"埋め草の行 {i} " + "あ" * 40 for i in range(7, 10)] + ["NEEDLE_KEY がある行"] + [f"後ろの行 {i}" for i in range(11, 14)]
+    md = "\n".join(lines) + "\n"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"k.md": md})
+    res, _d, _c, _cards = TD.run_tool("ripgrep_search", {"query": "NEEDLE_KEY"}, world, None,
+                                      max_hits=45, tool_result_max_bytes=512)
+    text = res["hits"][0]["text"]
+    assert "NEEDLE_KEY" in text and "BEGIN PRIVATE KEY" not in text and "MIIBVQ" not in text
+    marks = re.findall(r"⋯（(\d+)〜(\d+)行目を省略）⋯", text)
+    assert marks and marks[0][0] == "2", text              # 見出しの次（2 行目）から省略が始まる
+    shown_first = int(marks[0][1]) + 1                     # 省略の直後に出る行の番号は、原本のその行と一致する
+    assert text.split(marks[0][1] + "行目を省略）⋯\n", 1)[1].split("\n", 1)[0] == lines[shown_first - 1], text

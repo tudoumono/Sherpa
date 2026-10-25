@@ -570,6 +570,20 @@ def test_chat_stop_failure_after_partial_answer_removed_thinking_still_corrects_
     expect(page.locator(".thinking")).to_have_count(0)
 
 
+def test_chat_answer_delta_is_shown_at_once_not_typed_out(page, web_base_url):
+    """answer_delta で届いた回答は数文字ずつ出さず、届いた時点で全文を一度に描く。"""
+    install_api_mocks(page)
+    pending, _stops = _hold_stop_flow(page, abort_on_stop=False)
+    page.goto(f"{web_base_url}/chat.html")
+    text = "消費税率の変更は計算プログラムと請求の締め処理に影響します。" * 6
+
+    _send(page, Q_IMPACT)
+    _wait_stream(page, pending)
+    pending.pop("route").fulfill(status=200, headers=SSE, body=_sse_body([{"type": "answer_delta", "text": text}]))
+
+    expect(page.locator("#messages .headline").last).to_have_text(text, timeout=200)
+
+
 def test_chat_stop_failure_after_answer_already_landed_is_ignored(page, web_base_url):
     install_api_mocks(page)
     pending, stops = _hold_stop_flow(page, abort_on_stop=False)
@@ -619,15 +633,6 @@ def test_chat_qa_citations_collapsed_by_default_and_toggle(page, web_base_url):
     cites_h.click()
     expect(cites_body).to_be_hidden()
     expect(cites_h).to_have_attribute("aria-expanded", "false")
-
-
-def test_chat_prefills_question_from_graph_bridge(page, web_base_url):
-    install_api_mocks(page)
-    page.add_init_script("localStorage.setItem('sherpa-ask', '消費税率を変えたい。影響は？')")
-    page.goto(f"{web_base_url}/chat.html")
-
-    expect(page.locator("#input")).to_have_value(Q_IMPACT)
-    assert page.evaluate("localStorage.getItem('sherpa-ask')") is None
 
 
 def test_chat_row_click_opens_conversation_with_turn_stack_and_local_time(page, web_base_url):
@@ -1129,6 +1134,68 @@ def test_chat_sources_split_grounded_and_reference_and_export_follows(page, web_
     md = md_path.read_text(encoding="utf-8")
     assert "**根拠:** 4期/02_設計/01_基本設計/税計算仕様書.md" in md
     assert "**参考:** 参考資料.md" in md
+
+
+_STAMP = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} 更新")  # 表示は端末の時刻帯へ変換されるため日付は固定しない
+_PROV_ANSWER = {
+    "lens": "qa",
+    "headline": "確認しました。",
+    "route": {"path": ["文書を検索"]},
+    "summary": {"total": 2},
+    "scope": {"world": "w1", "scope_paths": [], "source": "all"},
+    "data": {"citations": [
+        {"doc_id": DOC, "quote": "消費税率は10%", "span": [3, 3], "generation": "4期", "modified_at": "2026-07-01T03:04:05Z"},
+        {"doc_id": "直下メモ.md", "quote": "直下の本文", "span": [1, 1], "modified_at": "2026-07-01T03:04:05Z"},
+    ]},
+    "sources": [
+        {"doc_id": DOC, "download_url": "/documents/download?world=w1&rel=x", "generation": "4期", "modified_at": "2026-07-01T03:04:05Z"},
+        {"doc_id": "直下メモ.md", "download_url": "/documents/download?world=w1&rel=y", "modified_at": "2026-07-01T03:04:05Z"},
+        {"doc_id": "古い仕様.md", "download_url": "/documents/download?world=w1&rel=z"},
+    ],
+}
+
+
+def test_chat_sources_show_generation_and_modified_at_per_document(page, web_base_url):
+    _open(page, web_base_url, stream_events=_answer_events(_PROV_ANSWER, conv=111))
+    _send(page, "消費税率は?")
+
+    sources = page.locator(".sources").first
+    expect(sources).to_contain_text("税計算仕様書.md")
+    rows = sources.locator(".cite-prov")
+    expect(rows).to_have_count(2)  # 古い仕様.md は世代も時点も無いので何も添えない
+    first, second = rows.nth(0).inner_text(), rows.nth(1).inner_text()
+    assert first.startswith("（4期・") and _STAMP.search(first), first
+    assert "4期" not in second and _STAMP.search(second), second  # 資料フォルダ直下の資料は世代を出さず時点だけ
+    expect(sources.locator("a[data-dl]")).to_have_count(3)  # 既存のリンクは変わらない
+    expect(sources.locator("a[data-dl]").first).to_have_text(re.compile(r"税計算仕様書\.md"))
+
+
+def test_chat_cites_card_shows_generation_and_modified_at(page, web_base_url):
+    _open(page, web_base_url, stream_events=_answer_events(_PROV_ANSWER, conv=112))
+    _send(page, "消費税率は?")
+
+    cites = page.locator(".cites-body .cite")
+    expect(cites).to_have_count(2)
+    page.locator("[data-cites]").click()
+    assert cites.nth(0).locator(".cite-prov").inner_text().startswith("（4期・")
+    assert "4期" not in cites.nth(1).locator(".cite-prov").inner_text()
+    expect(cites.nth(0).locator(".sp")).to_have_text("行 3–3")
+
+
+def test_chat_referenced_docs_show_generation_and_modified_at(page, web_base_url):
+    answer = {**_PROV_ANSWER, "referenced_docs": [
+        {"path": DOC, "ranges": [[3, 5]], "unopened": False},
+        {"path": "直下メモ.md", "ranges": [], "unopened": False},
+        {"path": "古い仕様.md", "ranges": [], "unopened": False}]}
+    _open(page, web_base_url, stream_events=_answer_events(answer, conv=113))
+    _send(page, "消費税率は?")
+
+    block = page.locator(".referenced-docs")
+    expect(block).to_contain_text("参照した資料（原本をダウンロード）")
+    expect(block.locator(".cite-prov")).to_have_count(2)
+    assert block.locator(".cite-prov").nth(0).inner_text().startswith("（4期・")
+    assert "4期" not in block.locator(".cite-prov").nth(1).inner_text()
+    expect(block).to_contain_text("行3-5")
 
 
 def test_inquiry_block_lens_segment_sets_body_lens_and_grays_layer(page, web_base_url):

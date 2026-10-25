@@ -135,8 +135,10 @@ def test_resolve_mcp_budget_ceiling_and_plain_dict():
     result = _resolve_mcp_budget({})
     assert isinstance(result, dict)
     assert set(result) == {"SHERPA_MCP_TOOL_BUDGET_BYTES", "SHERPA_MCP_READER_BUDGET_BYTES",
-                           "SHERPA_MCP_TOOL_MAX_HITS", "SHERPA_MCP_TOOL_WINDOW_CAP"}
+                           "SHERPA_MCP_SEARCH_BUDGET_BYTES", "SHERPA_MCP_TOOL_MAX_HITS", "SHERPA_MCP_TOOL_WINDOW_CAP"}
     assert result["SHERPA_MCP_READER_BUDGET_BYTES"] == "30000"
+    assert result["SHERPA_MCP_SEARCH_BUDGET_BYTES"] == "36000"
+    assert small["SHERPA_MCP_SEARCH_BUDGET_BYTES"] == str(16 * 1024)
     assert small["SHERPA_MCP_READER_BUDGET_BYTES"] == str(16 * 1024)
 
 

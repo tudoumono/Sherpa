@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -35,55 +34,14 @@ SCOPES = {
     ],
 }
 
-# S3: 実形状（sherpa/preview_service.py::graph_view）は世代/位置に top_scope・path を持つ（旧モックの
-# "parent" キーは実 API に存在しない＝実ドリフト是正。web/graph.js の `d.parent` 参照はレガシー耐性の
-# 防御コードで、未定義でも支障なし）。edges にも実際は status がある。
-# ソース正典化（`docs/archive/2026-09-04-グラフのソース正典化.md`・K9〜K13）: 意味層 LLM 抽出・
-# 概念ラベル（Parameter/Function 等）・REALIZES/IMPLEMENTED_BY・em（確実/要確認）は撤去済み。
-# 4ノードの旧「消費税率(Parameter)→TAX-RATE」REALIZES 橋は「税計算仕様書.md(Document) が
-# DOCUMENTS(via=mention) で TAX-RATE を言及」に置換（K3 の言及エッジ）。旧「請求機能(Function・
-# LLM由来)」は「請求機能(Batch) が INVOKES で TAXCALC を呼ぶ」という静的解析由来のノードに置換
-# （全ノード extraction_method=static・K12）。
-# 注記（並行バックエンドレーンとの突合が必要）: 実 API の counts/summary の最終形が未確定のため、
-# ここでは K12 の方針どおり「count のみ・judgement/em 無し」で組んでいる。
-GRAPH = {
-    "world": "w1",
-    "nodes": [
-        {"id": "doc:w1:taxspec", "name": "税計算仕様書.md", "type": "Document", "type_ja": "文書",
-         "status": "active", "value": None, "top_scope": "4期",
-         "path": "4期/02_設計/01_基本設計/税計算仕様書.md"},
-        {"id": "data:w1:TAX-RATE", "name": "TAX-RATE", "type": "DataItem", "type_ja": "項目",
-         "status": "active", "value": None, "top_scope": "4期",
-         "path": "4期/03_開発/01_ソース/TAXCALC.cbl"},
-        {"id": "module:w1:TAXCALC", "name": "TAXCALC", "type": "Module", "type_ja": "プログラム",
-         "status": "active", "value": None, "top_scope": "4期",
-         "path": "4期/03_開発/01_ソース/TAXCALC.cbl"},
-        {"id": "batch:w1:billing", "name": "請求機能", "type": "Batch", "type_ja": "バッチ",
-         "status": "active", "value": None, "top_scope": "4期", "path": None},
-    ],
-    "edges": [
-        {"source": "doc:w1:taxspec", "target": "data:w1:TAX-RATE", "type": "DOCUMENTS",
-         "status": "active"},
-        {"source": "module:w1:TAXCALC", "target": "data:w1:TAX-RATE", "type": "CONTAINS",
-         "status": "active"},
-        {"source": "batch:w1:billing", "target": "module:w1:TAXCALC", "type": "INVOKES",
-         "status": "active"},
-    ],
-    # GraphCounts と IngestPreviewCounts は同一の `preview_service.py::_counts()` が作る同一形。
-    "counts": {"entities": 4, "relations": 3,
-              "deprecated": 0, "hidden": 0, "documents": 3},
-    # ②graph 軽量化（段階読み込み）: 4 ノードは既定 limit に収まる＝非truncated（実 API と同じ応答形）。
-    "total_nodes": 4, "total_edges": 3, "truncated": False,
-}
-# ETag は GRAPH 本体の内容連動（実 API の内容署名を模す・②graph 軽量化 RV是正2026-07-08 Low#3）。
-_GRAPH_CONTENT_HASH = hashlib.sha1(json.dumps(GRAPH, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
-
 PREVIEW = {
     # S3: 実形状（sherpa/preview_service.py::build_preview）は world/label/issues も持つ
     # （旧モックは無かった＝実ドリフト是正）。issues は build_preview の `flags`（未解決の抽出警告）。
     # 実 API（doc_ledger.control_diagnostics 経由）は importance_diagnostics も常に持つ
     # （`_重要度.txt` の構文診断・無ければ空リスト）。
     "world": "w1", "label": "4期更改", "issues": [], "importance_diagnostics": [],
+    # グラフを組み立てていない理由（組み立てたときは None）。
+    "graph_note": None,
     # 資料の画面のツリー用のフォルダの一覧（資料の無いフォルダも含む）。
     "folders": [], "folders_truncated": False,
     "counts": {"entities": 4, "relations": 3,
@@ -119,7 +77,7 @@ PREVIEW = {
          "provenance": {"method": "markitdown_ocr", "confidence": 0.4}},
     ],
     # S3: 実形状（sherpa/preview_service.py::build_preview の entities）は top_scope/phase/path を
-    # 持つ（旧モックの "parent" キーは実 API に存在しない＝GRAPH と同じ実ドリフト是正）。
+    # 持つ（旧モックの "parent" キーは実 API に存在しない＝実ドリフト是正）。
     # `analyzer`＝担当アナライザの来歴（コード分のみ非 None・§7 裁定2）。ソース正典化（K12）で
     # extraction_method は撤去済み（全件 static＝表示不要）。「消費税率(Parameter・analyzer=None)」は
     # 「税計算仕様書.md(Document・analyzer=None＝Documentはコード分析対象外)」に置換。
@@ -545,8 +503,7 @@ def auth_me_response(current_user: dict) -> dict:
     }
 
 
-# フェーズ7-1 再RV（Codex MEDIUM・2026-07-16）: handler 内で動的に組み立てる応答（個人ワークスペース・
-# ナレッジグラフ）も関数へ抽出する（auth_me_response と同じ理由＝契約テストがこの実関数を実行して
+# フェーズ7-1 再RV（Codex MEDIUM・2026-07-16）: handler 内で動的に組み立てる応答（個人ワークスペース）も関数へ抽出する（auth_me_response と同じ理由＝契約テストがこの実関数を実行して
 # 実 API と突合できるようにする・literal のままだと mock drift を検知できない）。
 
 def workspace_upload_response(file_id: int, rel_path: str, size_bytes: int = 18,
@@ -573,14 +530,6 @@ def workspace_search_response(q: str) -> dict:
              "text": f"{q}: TAX-RATE は個人メモ側にも記載されています。", "match": q},
         ] if q else [],
     }
-
-
-def graph_search_response(nodes: list, edges: list, counts: dict) -> dict:
-    """GET /graph/search の mock 応答（実形状＝graph_admin.py::_rows_to_graph と同キー。nodes[] は
-    GET /graph（preview_service.py::graph_view）と別形＝ phase/category に加え em も持つ
-    （graph_admin.py::_node は S3 でも em を撤去していない）ため、呼び出し側で
-    `GRAPH["nodes"]` に `em`/`phase`/`category` を足してから渡すこと）。"""
-    return {"world": "w1", "nodes": nodes, "edges": edges, "counts": counts}
 
 
 def world_diff_response(path: str | None, world_id: str | None = None, label: str | None = None,
@@ -1269,11 +1218,6 @@ SETTINGS_RESP = {"agent": "simple",   # construct_id="simple" と一致させる
 
 WORLD_OPTIONS_RESP = {"worlds": ["w1"], "labels": {"w1": "4期更改"}}
 
-GRAPH_FACETS_RESP = {"relationship_types": ["COPIES", "CONTAINS", "INVOKES", "DOCUMENTS"],
-                     "condition_fields": ["category", "phase", "role", "status"],
-                     "node_labels": ["Batch", "DataItem", "Document", "Module"],
-                     "node_labels_ja": {"Module": "プログラム", "Batch": "バッチ"}}
-
 # GET /worlds/{wid}/status（sherpa/routers/worlds.py::world_status）: last_synced_at/
 # last_run_status/last_run_warnings は旧モックに無かった（S3 実ドリフト是正）。
 # フェーズ7-1（response_model 実測）で発見した実ドリフト是正: 実 GET /worlds/{wid}/status
@@ -1302,6 +1246,12 @@ WORLD_STATUS_RESP = {"ok": True, "world_id": "w1", "label": "4期更改", "root_
                      "last_run_id": 500,
                      "last_run_status": "auto_published", "last_run_warnings": [], "last_run_blocked": [],
                      "last_run_interrupted": False, "last_run_flags_total": 0, "last_run_flags_truncated": False,
+                     "last_completed_at": "2026-07-03T09:00:00+00:00",
+                     "last_completed_counts": {"as_of": "2026-07-03T09:00:00+00:00", "scanned": 3,
+                                               "indexed": 3, "office_failed": 0},
+                     "last_failure_message": None, "ingest_active": False,
+                     "actions": {name: {"allowed": True, "reason": None} for name in
+                                 ("recount", "refresh", "rag_regenerate_rules", "delete", "reconvert")},
                      "failed_files": None, "partial_extraction_suspected": None, "stage_summary": None,
                      "running_progress": None,
                      "failure_reason_catalog": _FAILURE_REASON_CATALOG_MOCK,
@@ -2572,28 +2522,6 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             return _json(route, {"ok": True, "share_id": 77, "expires_at": "2026-08-30T09:00:00+00:00"})
         if method == "GET" and path == "/scopes":
             return _json(route, SCOPES)
-        if method == "GET" and path == "/graph":
-            # ②graph 軽量化: ETag（未変更なら 304）を付ける（実 API と同じ再検証経路）。デモ4ノードは
-            # 既定 limit に収まるため常に非truncated＝全件（truncated 表示の検証は個別テストが上書き）。
-            # ETag は GRAPH 本体の内容ハッシュ＋表示範囲トークンで合成（内容連動・RV是正2026-07-08 Low#3）。
-            token = "all" if (query.get("limit") or [""])[0] == "0" else "default"
-            etag = f'"g.{_GRAPH_CONTENT_HASH}.{token}"'
-            if (request.headers or {}).get("if-none-match") == etag:
-                route.fulfill(status=304, headers={"ETag": etag})   # 304 は body なし（実 API と同じ再検証経路）
-                return
-            return _json(route, GRAPH, headers={"ETag": etag})
-        if method == "GET" and path == "/graph/facets":
-            return _json(route, GRAPH_FACETS_RESP)
-        if method == "GET" and path == "/graph/search":
-            # GET /graph/search の nodes[] は GET /graph（graph_view）と別形＝ phase/category を持つ。
-            # GRAPH["nodes"] を直接使い回さず個別に足してから graph_search_response へ渡す。
-            rel = (query.get("relationship") or [""])[0]
-            search_nodes = [{**n, "phase": None, "category": None} for n in GRAPH["nodes"]]
-            if rel:
-                return _json(route, graph_search_response(
-                    search_nodes[:2], GRAPH["edges"][:1], {"nodes": 2, "edges": 1}))
-            return _json(route, graph_search_response(
-                search_nodes[:1], [], {"nodes": 1, "edges": 0}))
         if method == "GET" and path == "/ingest/preview":
             return _json(route, PREVIEW)
         if method == "GET" and path == "/admin/es/search":
@@ -2876,9 +2804,6 @@ MOCKED: list[tuple[str, str]] = [
     ("GET", "/conversations/{cid}/shares"),
     ("POST", "/conversation-shares/{share_id}/extend"),
     ("GET", "/scopes"),
-    ("GET", "/graph"),
-    ("GET", "/graph/facets"),
-    ("GET", "/graph/search"),
     ("GET", "/ingest/preview"),
     ("GET", "/admin/es/search"),
     ("GET", "/fs/list"),

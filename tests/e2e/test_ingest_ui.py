@@ -7,8 +7,10 @@ import pytest
 from mock_api import PREVIEW, USER_MEMBER, WORLD, WORLD_STATUS_RESP, install_api_mocks
 from playwright.sync_api import expect
 
-RUNNING_PROGRESS = {"stage": "es_index", "stage_label": "全文索引に登録し、ベクトル化中",
+RUNNING_PROGRESS = {"stage": "es_index", "stage_label": "検索できるように登録中",
                     "done": 42, "total": 100, "updated_at": "2026-09-04T00:00:00+00:00"}
+BUSY_ACTIONS = {name: {"allowed": False, "reason": "取り込み中のため、この操作はできません。終わってからお試しください"}
+                for name in ("recount", "refresh", "rag_regenerate_rules", "delete", "reconvert")}
 ACCEPTED = "受け付けました。状況は取り込み状況でご確認ください。"
 SCAN_PDF = "4期/02_設計/01_基本設計/スキャン図面.pdf"
 
@@ -50,7 +52,7 @@ def _pick_project_a(page):
       "last_run_warnings": ["office_md:derived_publish_failed:OSError",
                             "office_md_blocked:a:b.xlsx\tunhandled_exception:RuntimeError"]},
      # `:` を含むファイル名でも途切れない（doc と reason はタブ区切り）
-     ["前回の取り込みは失敗しました", "Office文書のテキスト化処理自体に問題がありました", "a:b.xlsx"]),
+     ["前回の取り込みは失敗しました", "Office 資料を読み取れませんでした", "a:b.xlsx"]),
     ({"analyzer_declined_as_document": 2, "analyzer_declined": 3},
      ["担当なし（資料扱い）2 件", "未対応 3 件"]),
     ({"unreachable_as_text": 5, "unreachable_by_reason": {"encoding_undetermined": 2, "binary": 1},
@@ -58,17 +60,17 @@ def _pick_project_a(page):
      ["本文が読めず対象外 5 件", "文字コード判別不能 2", "バイナリ 1", "一部が化けている（要確認） 4 件"]),
     ({"last_run_status": "failed", "last_run_warnings": ["unreadable_code_file"],
       "last_run_blocked": [{"doc": "PROG.cbl", "reason": "unreadable_code_file"}]},
-     ["取り込みを止めました", "PROG.cbl", "読み取れませんでした"]),
+     ["前回の取り込みは失敗しました", "PROG.cbl", "取り込みを停止しました"]),
     ({"ingest_notices": [{"code": "walk_unreadable_dir", "count": 2}, {"code": "graph_source_oversize", "count": 1},
                          {"code": "es_analyzer_fallback", "count": 1}]},
-     ["2 件のフォルダを開けず", "1 件のソースは大きすぎて関係グラフに載せていません", "標準の解析器で全文検索を作りました"]),
+     ["2 件のフォルダを開けず", "1 件のソース資料は大きすぎるため、資料どうしの関係に含めていません", "標準の方法で本文検索を作りました"]),
 ], ids=["failed_and_generic_office_md", "analyzer_declined", "unreachable_breakdown", "unreadable_code_blocked",
         "silent_drops_noticed"])
 def test_status_summary_shows_run_failures_and_breakdowns(page, web_base_url, status, texts):
     """状況欄: 前回の失敗・汎用 office_md warning・アナライザ不採用の内訳・読めず対象外の理由別内訳・
     不可読コードによる停止（対象ファイル名付き）を平文で出す。"""
     _open(page, web_base_url, status=status)
-    stat = page.locator('[data-stat="w1"]')
+    stat = page.locator('#main-content')
     for text in texts:
         expect(stat).to_contain_text(text)
 
@@ -246,12 +248,14 @@ def test_delete_returns_screen_to_unregistered_state(page, web_base_url):
 
     def handle_status(route):
         if not state["accepted"]:
-            _fulfill(route, {**counts, "running_progress": None})
+            _fulfill(route, {**counts, "running_progress": None, "ingest_active": False,
+                             "actions": WORLD_STATUS_RESP["actions"]})
         elif not state["done"]:
             state["done"] = True   # 次回ポーリングから完了（404）を返す
             _fulfill(route, {**counts, "running_progress": {
-                "stage": "deleting", "stage_label": "検索用データを削除しています",
-                "done": None, "total": None, "updated_at": "2026-09-01T00:00:00+00:00"}})
+                "stage": "deleting", "stage_label": "検索用データを削除中",
+                "done": None, "total": None, "updated_at": "2026-09-01T00:00:00+00:00"},
+                "ingest_active": True, "actions": BUSY_ACTIONS})
         else:
             _fulfill(route, {"detail": "資料フォルダが見つかりません"}, status=404)
 
@@ -267,7 +271,7 @@ def test_delete_returns_screen_to_unregistered_state(page, web_base_url):
 
     page.once("dialog", lambda d: d.accept())
     page.locator('[data-del="w1"]').click()
-    expect(page.locator('[data-stat="w1"]')).to_contain_text("検索用データを削除しています")
+    expect(page.locator('[data-stat="w1"]')).to_contain_text("検索用データを削除中")
 
     page.clock.fast_forward(3500)
     expect(page.locator("#regcard")).to_be_visible()
@@ -431,12 +435,25 @@ def test_importance_badge_and_diagnostics_banner(page, web_base_url):
     expect(page.locator("#impdiag")).to_be_hidden()
 
 
+def test_detail_overlay_shows_why_graph_is_not_built(page, web_base_url):
+    """要素・関係を組み立てていないとき（取り込み中など）は、詳細の画面に理由を出し、記録の無い件数は「不明」と出す。"""
+    note = "取り込み中のため、要素と関係の詳細は取り込みが終わってから表示します。"
+    preview = {**PREVIEW, "graph_note": note, "entities": [], "relations": [], "issues": [],
+               "counts": {"entities": 120, "relations": None, "deprecated": None, "hidden": None, "documents": 3}}
+    _open(page, web_base_url, preview=preview)
+    page.locator("#detailbtn").click()
+    bar = page.locator("#pv-bar")
+    expect(bar).to_contain_text("120")
+    expect(bar).to_contain_text("不明")
+    expect(bar).to_contain_text(note)
+    expect(bar).not_to_contain_text("廃止/隠し")
+
+
 def test_status_shows_counts_as_of_and_recount_button(page, web_base_url):
-    """件数の後ろに集計時刻を表示し、「再集計」ボタンで `POST /worlds/{id}/recount` を呼んで表示を更新する
-    （未集計＝`counts_as_of=None` は「（未集計）」）。"""
-    _open(page, web_base_url, status={"counts_as_of": None})
+    """完了時点の件数に集計時刻を表示し、「件数を数え直す」で更新する。"""
+    _open(page, web_base_url, status={"counts_as_of": None, "last_completed_counts": None})
     stat = page.locator('[data-stat="w1"]')
-    expect(stat).to_contain_text("（未集計）")
+    expect(stat).to_contain_text("件数はまだ数えていません")
 
     recount_calls = []
 
@@ -450,7 +467,7 @@ def test_status_shows_counts_as_of_and_recount_button(page, web_base_url):
 
     stat.locator('[data-recount="w1"]').click()
     expect(stat).to_contain_text("時点")
-    expect(stat).not_to_contain_text("未集計")
+    expect(stat).not_to_contain_text("件数はまだ数えていません")
     assert recount_calls == ["POST"]
 
 
@@ -488,7 +505,7 @@ def test_status_detail_shows_failed_files_and_reconvert_button_calls_endpoint(pa
     expect(details).to_contain_text("旧料金表.xls")
     expect(details).to_contain_text("タイムアウト")
     expect(details).to_contain_text("時間をおいて再試行してください")
-    expect(details).to_contain_text("MD変換")
+    expect(details).to_contain_text("資料の読み取り")
 
     btn = details.locator('[data-reconvert-wid="w1"][data-rel="旧料金表.xls"]')
     expect(btn).to_have_count(1)
@@ -503,7 +520,8 @@ def test_pickbtn_disabled_while_ingest_running(page, web_base_url):
     """登録ボタン（`pickbtn`）は、実行中の資料フォルダが1件でもあれば無効化し平文の理由（`title`）を添える
     （登録処理全体は長時間かつ排他のため、実行中に別の登録を投げると固まって見える）。実行中でなくなれば再び有効化される。
     登録済みのため `regcard` 自体は非表示だが、`disabled`/`title` は表示状態と独立に検証できる。"""
-    _open(page, web_base_url, status={"running_progress": RUNNING_PROGRESS})
+    _open(page, web_base_url, status={"running_progress": RUNNING_PROGRESS, "ingest_active": True,
+                                      "actions": BUSY_ACTIONS})
 
     pickbtn = page.locator("#pickbtn")
     expect(pickbtn).to_be_disabled()
@@ -511,12 +529,41 @@ def test_pickbtn_disabled_while_ingest_running(page, web_base_url):
     steps = page.locator(".ingest-steps")   # 取り込み系の段では 済✓/現在(件数付き)/残り が1行に並ぶ
     expect(steps).to_be_visible()
     expect(steps.locator(".step.done")).to_have_count(3)          # scanning/office_md/graph_build が済
-    expect(steps.locator(".step.now")).to_contain_text("全文索引・ベクトル化（42/100）")
+    expect(steps.locator(".step.now")).to_contain_text("検索できるように登録中（42/100）")
     expect(steps.locator(".step.todo")).to_have_count(1)          # finalize が残り
 
     _route_json(page, "**/worlds/w1/status", WORLD_STATUS_RESP)
     page.reload()
     expect(pickbtn).to_be_enabled()
+
+
+def test_status_separates_completed_available_and_running_and_uses_api_action_locks(page, web_base_url):
+    _open(page, web_base_url, status={
+        "indexed": 0, "scanned": 2, "es_chunks": 0,
+        "running_progress": RUNNING_PROGRESS, "ingest_active": True, "actions": BUSY_ACTIONS,
+    })
+    stat = page.locator('[data-stat="w1"]')
+    expect(stat).to_contain_text("最後に最後まで終わった取り込み")
+    expect(stat).to_contain_text("現在使える状態")
+    expect(stat).to_contain_text("進行中の取り込み")
+    expect(stat).to_contain_text("文字として読める資料の本文を直接探すことはできます")
+    expect(stat).to_contain_text("仕上げが終わるまで")
+    reason = "取り込み中のため、この操作はできません。終わってからお試しください"
+    expect(page.locator('.action-lock-note')).to_have_text(reason)
+    for selector in ('[data-recount="w1"]', '[data-refresh="w1"]', '[data-rag-rules="w1"]', '[data-del="w1"]'):
+        expect(page.locator(selector)).to_be_disabled()
+
+
+def test_top_notice_collects_previous_failure_and_failed_documents(page, web_base_url):
+    _open(page, web_base_url, status={
+        "last_run_status": "failed",
+        "last_failure_message": "前回の取り込みは失敗しました（資料どうしの関係を書き込めませんでした）",
+        "failed_files": {"items": [], "total": 3, "truncated": False},
+    })
+    notice = page.locator("#workerbanner")
+    expect(notice).to_be_visible()
+    expect(notice).to_contain_text("資料どうしの関係を書き込めませんでした")
+    expect(notice).to_contain_text("読み取れなかった資料が 3 件")
 
 
 def test_pickbtn_recovers_after_transient_status_failure_during_polling(page, web_base_url):
@@ -528,7 +575,8 @@ def test_pickbtn_recovers_after_transient_status_failure_during_polling(page, we
     def handle_status(route):
         state["calls"] += 1
         if state["calls"] == 1:
-            _fulfill(route, {**WORLD_STATUS_RESP, "running_progress": RUNNING_PROGRESS})
+            _fulfill(route, {**WORLD_STATUS_RESP, "running_progress": RUNNING_PROGRESS,
+                             "ingest_active": True, "actions": BUSY_ACTIONS})
         elif state["calls"] == 2:
             _fulfill(route, {"detail": "boom"}, status=500)
         else:
@@ -565,4 +613,4 @@ def test_resolve_settings_save_confirms_and_shows_warning(page, web_base_url):
 def test_unreflected_resolve_settings_stay_visible_after_reload(page, web_base_url):
     """未反映の設定は、状況の API が返す限り画面を開き直しても「更新が必要」と出続ける。"""
     _open(page, web_base_url, status={"resolve_settings_pending": True})
-    expect(page.locator("#list")).to_contain_text("更新が必要です")
+    expect(page.locator("#workerbanner")).to_contain_text("まだ反映されていません")

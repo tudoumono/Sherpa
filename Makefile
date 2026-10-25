@@ -1,7 +1,7 @@
 # Sherpa MVP — 起動・運用タスク
 #
 # `make` だけを打つと、下の一覧（help）が出ます。
-.PHONY: help embed-cache-migrate hooks dev-setup start stop restart restart-web restart-worker status check-ports up down ps logs l bootstrap install-docker ocr-models \
+.PHONY: help embed-cache-migrate hooks dev-setup start stop restart restart-web restart-worker status ingest-status check-ports up down ps logs l bootstrap install-docker ocr-models \
         api serve ingest-worker prod-check verify-kit verify-extension dist package-full package-app nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e \
         test-db-reset screenshots backup restore usage-backfill trace azure-smoke codex-compat doctor sandbox-check \
@@ -60,7 +60,7 @@ help:             ## このコマンド一覧を表示
 		| sed -E 's/^([a-zA-Z0-9_-]+):[^#]*## /  \1|/' \
 		| awk -F'|' '{printf "  %-18s %s\n", $$1, $$2}'
 	@echo
-	@echo "  よく使う順: make start → make status → make stop"
+	@echo "  よく使う順: make start → make status → make ingest-status → make stop"
 endif
 
 start:            ## 利用者向け: 依存/ストア/アプリを一括起動（LAN=1 で LAN 公開・MODE=dev で開発モード）
@@ -81,8 +81,11 @@ restart-worker:   ## 利用者向け: 取り込みワーカーだけ再起動（
 	STOP_ONLY=worker KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
 	LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
-status:           ## 利用者向け: 一枚看板の状態表示（ストア/アプリ/Caddy/URL）
+status:           ## 利用者向け: サーバーの状態（ストア/アプリ/ワーカー/Caddy/OCR/メモリ）
 	./scripts/status.sh
+
+ingest-status:    ## 利用者向け: 資料フォルダごとの取り込みと画像内文字の読み取りの状態
+	./scripts/ingest_status.sh
 
 check-ports:      ## ポートの整合（compose 公開⇔アプリ接続先）と占有（他プロセス）を検査
 	./scripts/check-ports.sh

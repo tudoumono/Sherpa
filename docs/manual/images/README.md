@@ -19,7 +19,7 @@ Playwright（chromium・headless）で各画面を再現し、要素またはビ
 `scripts/capture_screenshots.py` の `SCENES`（シーン登録簿）に `Scene(...)` を 1 つ足します。
 
 ```python
-Scene("21-新しい図", "graph.html",        # 画像名（.png なし）／対象ページ
+Scene("21-新しい図", "ingest.html",       # 画像名（.png なし）／対象ページ
       "何をどう撮るかの一言（--list に出る）",
       setup=lambda p: p.click("#something"),  # goto 後の前準備（省略可）
       crop="#element",                       # 要素を切り出す（None=ビューポート全体）
@@ -52,11 +52,7 @@ Scene("21-新しい図", "graph.html",        # 画像名（.png なし）／対
 - `20-ingest-new.png` — 「資料フォルダ」画面（フォルダ登録→取り込み）
 - `20-ingest-status.png` — 「取り込み状況」画面（状態・フォルダツリー・原本DL）
 
-### 21. 管理：グラフと検索
-- `21-graph.png` — ナレッジグラフ（色分け・近傍・名前検索）
-- `21-graph-search.png` — 関係/条件でのグラフ検索の結果
+### 21. 管理：全文検索
 - `21-es-search.png` — 「取り込み状況」内の**全文検索パネル**（ヒット一覧）
 
-> 備考: デモデータが小規模なため、`21-graph.png`（cytoscape の力学レイアウト）はノード配置が
-> 実行ごとに多少変わります（画素完全一致ではなく「同じ画面が同じレイアウトで撮れる」水準）。
-> 他の画面は要素/DOM ベースでほぼ安定します。
+> 備考: 画面は要素/DOM ベースでほぼ安定します。

@@ -75,8 +75,6 @@ BUNDLED: list[dict] = [
      "note": "閉域キットに同梱（--skip-codex で除外可）。同梱の ripgrep 等の来歴は npm パッケージの LICENSE/NOTICE を参照。"},
     {"name": "marked", "version": "13.0.3", "license": "MIT", "kind": "web",
      "source": "https://github.com/markedjs/marked"},
-    {"name": "cytoscape.js", "version": "(vendored)", "license": "MIT", "kind": "web",
-     "source": "https://github.com/cytoscape/cytoscape.js"},
     {"name": "Swagger UI", "version": "5.32.14", "license": "Apache-2.0", "kind": "web",
      "source": "https://github.com/swagger-api/swagger-ui",
      "note": "web/vendor/swagger-ui-bundle.js が同梱する第三者コンポーネント個別ライセンスは"

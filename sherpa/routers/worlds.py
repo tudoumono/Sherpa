@@ -34,7 +34,7 @@ from sherpa.grep_tool import valid_world
 from sherpa.ingest import background, failure_reasons, resolve_settings, world_graph, worker_status
 from sherpa.ingest import worker as ingest_worker
 from sherpa.preview_service import build_preview
-from sherpa.routers.graph import _GRAPH_UNAVAILABLE_MESSAGE  # /ingest/preview も同じ固定文言で 503 にする。
+from sherpa.store import ingest as ingest_store
 from sherpa.schemas import (
     FsListResponse,
     WorldDiffResponse,
@@ -47,6 +47,7 @@ from sherpa.schemas import (
 )
 
 _log = logging.getLogger("sherpa")
+_GRAPH_UNAVAILABLE_MESSAGE = "取り込み状況を読み込めませんでした。時間をおいてやり直してください"
 
 # 短時間ロック（recount/reconvert 等）の待ち上限。他の排他処理（rebind/delete 等）と競合したら長時間ブロックせず 409 を返して再試行を促す。
 _EXTRACT_LOCK_TIMEOUT_MS = 10_000
@@ -56,9 +57,96 @@ _INGEST_UNAVAILABLE_MESSAGE = "取り込み台帳を読めませんでした。�
 # `extraction_snapshot.flags` は際限なく増えうる（`worker._failed_files_summary` の 200 件上限と同様）ため、status 応答では打ち切って total/truncated を併記する。
 _STATUS_FLAGS_LIMIT = 200
 
+_ACTION_BLOCKED_REASON = "取り込み中のため、この操作はできません。終わってからお試しください"
+_INGEST_ACTIONS = ("recount", "refresh", "rag_regenerate_rules", "delete", "reconvert")
+_STAGE_LABELS = {
+    "accepted": "受け付けました",
+    "scanning": "フォルダを確認中",
+    "office_md": "資料を読み取り中",
+    "graph_build": "資料どうしの関係を確認中",
+    "es_index": "検索できるように登録中",
+    "finalize": "仕上げ中",
+    "deleting": "検索用データを削除中",
+}
+_STEP_LABELS = {
+    "archive_extract": "圧縮ファイルの中身を確認しています",
+    "staging_clean": "前回の作りかけを片付けています",
+    "prefetch_plan": "資料を読み取る順序を準備しています",
+    "prefetch_close": "資料の読み取り準備を片付けています",
+    "cache_prune": "古い読み取り結果を片付けています",
+    "ocr_routes": "画像の中の文字を読む準備をしています",
+    "publish": "読み取った資料を使える状態にしています",
+    "graph_defs": "ソース資料を読み取っています",
+    "graph_links": "ソース資料どうしの関係を確認しています",
+    "graph_mentions": "資料に書かれた名前を確認しています",
+    "ledger_rows": "資料の一覧を作っています",
+    "neo4j_load": "資料どうしの関係を保存しています",
+    "ledger_write": "資料の一覧を保存しています",
+    "embed_vectors": "意味でも探せるように登録しています",
+    "embed_cache": "検索の準備結果を整理しています",
+    "es_bulk": "検索できるように登録しています",
+    "es_swap": "新しい検索結果へ切り替えています",
+    "es_compact": "検索用データを整理しています",
+    "fill_vectors": "意味で探すための情報を補っています",
+    "reconcile": "使われなくなった検索用データを片付けています",
+    "scan_report": "取り込みの件数を数えています",
+    "mem_wait": "メモリの空きを待っています",
+}
+
 # 単一登録契約（標準 MVP は登録元フォルダを全体で 1 本）の下で、まだ存在しない world を新規登録する試みを仲裁する固定キー（`world_create` 専用）。
 # 暫定 wid ごとに `background._REGISTRY` へ登録すると別フォルダの競合登録が衝突せず、負けた方が 202 受付済みのまま背景で failed になるため、新規登録の試みは全てこの固定キーで仲裁する（単一 worker 前提）。`op`/`fingerprint` が一致（同一 path/label/world_id の二重クリック）すれば合流、不一致なら受付前に 409。ただし DB の先読みと登録の間のごく短い窓で競合した場合は、202 を返したあと背景で failed になりうる。
 _NEW_WORLD_REGISTRY_KEY = "__new_world__"
+
+
+def _action_availability(last_status: str | None) -> tuple[bool, dict[str, dict]]:
+    """背景受付が競合とする状態と同じ `ACTIVE_STATUSES` から、画面操作の可否を返す。"""
+    active = last_status in ingest_store.ACTIVE_STATUSES
+    state = {"allowed": not active, "reason": _ACTION_BLOCKED_REASON if active else None}
+    return active, {action: dict(state) for action in _INGEST_ACTIONS}
+
+
+def _plain_progress(progress: dict | None) -> dict | None:
+    """内部の段キーは保ったまま、画面へ返す名前だけを平文へ置き換える。"""
+    if not isinstance(progress, dict):
+        return None
+    out = dict(progress)
+    out["stage_label"] = _STAGE_LABELS.get(out.get("stage"), "取り込みを進めています")
+    if out.get("step"):
+        if out["step"] == "low_disk":
+            out["step_label"] = "ディスクの空きを確認しています"
+        else:
+            out["step_label"] = _STEP_LABELS.get(out["step"], "現在の作業を進めています")
+    return out
+
+
+def _last_failure_message(status: str | None, warnings: list[str], blocked: list[dict]) -> str | None:
+    """直近の失敗理由コードを、画面と API の利用者向けの一文へ畳み込む。"""
+    if status != "failed":
+        return None
+    low_disk = next((w for w in warnings if w.startswith("low_disk_stop:")), None)
+    if low_disk:
+        return ("前回の取り込みは、ディスクの空きが少ないため停止しました"
+                f"（空き {low_disk.split(':', 1)[1]} GB）")
+    unreadable = [b["doc"] for b in blocked
+                  if b.get("reason") == "unreadable_code_file" and b.get("doc")]
+    if unreadable:
+        return f"前回の取り込みは、{ '・'.join(unreadable) } を読み取れなかったため停止しました"
+    mappings = (
+        ("graph_reflect_failed", "資料どうしの関係を書き込めませんでした"),
+        ("ledger_", "資料の一覧を保存できませんでした"),
+        ("es_index_failed", "検索できる状態に更新できませんでした"),
+        ("reconcile_failed", "使われなくなった検索用データを片付けられませんでした"),
+        ("office_md", "Office 資料を読み取れませんでした"),
+        ("reconvert_", "指定した資料を読み取り直せませんでした"),
+        ("rebind_", "参照先を変更できませんでした"),
+        ("unexpected_error", "想定外のエラーで最後まで終わりませんでした"),
+    )
+    for prefix, message in mappings:
+        if any(w.startswith(prefix) for w in warnings):
+            return f"前回の取り込みは失敗しました（{message}）"
+    if status == "failed":
+        return "前回の取り込みは失敗しました（処理を最後まで終えられませんでした）"
+    return None
 
 
 def _run_worker_or_503(wid: str, fn):
@@ -123,7 +211,7 @@ ingest_runs_router = APIRouter()
 
 @ingest_preview_router.get("/ingest/preview", tags=["資料フォルダ(World)管理"])
 def ingest_preview(request: Request, world: str | None = Query(None, pattern=_WORLD_PATTERN)):
-    """取り込み・抽出プレビュー（読み取り専用）。world グラフの抽出内容を返す。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする（`/graph` と同じ固定文言）。"""
+    """取り込み・抽出プレビュー（読み取り専用）。資料の一覧と world グラフの抽出内容を返す。取り込み中・一度も完了していない資料フォルダはグラフを組み立てず、`graph_note` に理由を返す。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする。"""
     _require_admin(_current_user(request))
     wid = _resolve_world(world)
     try:
@@ -276,7 +364,7 @@ def _ingest_summary(wid: str, row: dict, state: dict | None = None) -> dict:
     """取り込み状況の要約: インデックス件数・未対応(Office/PDF)件数・関係グラフ・ES 全文索引のチャンク数。
     `row`＝呼び出し元が取得済みの world 登録行（`store.get_world(wid)`・ここでは読み直さない）。
     最終 ingest run の status と warn/blocked 理由も含める。`last_run_warnings` は reason 文字列のみの一覧で、対象ファイルが特定できる blocked flag は `last_run_blocked`（`doc`/`reason`）で別途通す。どちらも `extraction_snapshot.flags` の先頭 `_STATUS_FLAGS_LIMIT` 件から導出し、`last_run_flags_total`/`last_run_flags_truncated` で打切りの有無を示す。
-    `scanned`〜`unreadable` は `row["last_scan_report"]` を読むだけでフォルダを歩かない。graph/ES 件数も `graph_view()` や ES live `_count` は呼ばず、graph は最新の反映済み run（`store.get_latest_published_run_summary`）の `published_snapshot`、ES は別クエリ（`store.get_latest_es_run_summary`）の `extraction_snapshot.es` から読む（完了境界が異なり別々の run を指しうる）。run の記録は `_run_state` が必要な値だけを DB 側で取り出す（`flags` 全件・`published_snapshot` を丸ごと読まない）。DB 例外は捕捉せず呼び出し元へ伝播させる（全ゼロへ縮退しない）。キャッシュが無い world は全ゼロ＋`counts_as_of=None`（未集計・利用者が「再集計」を押すまで待つ）。
+    `scanned`〜`unreadable` は `row["last_scan_report"]` を読むだけでフォルダを歩かない。graph/ES 件数も `graph_view()` や ES live `_count` は呼ばず、graph は最新の反映済み run（`store.get_latest_published_run_summary`）の `published_snapshot`、ES は別クエリ（`store.get_latest_es_run_summary`）の `extraction_snapshot.es` から読む（完了境界が異なり別々の run を指しうる）。run の記録は `_run_state` が必要な値だけを DB 側で取り出す（`flags` 全件・`published_snapshot` を丸ごと読まない）。DB 例外は捕捉せず呼び出し元へ伝播させる（全ゼロへ縮退しない）。キャッシュが無い world は全ゼロ＋`counts_as_of=None`（件数未確認・利用者が「件数を数え直す」を押すまで待つ）。
     `failed_files` は失敗の一覧（`world_failed_docs`）由来、`partial_extraction_suspected`/`stage_summary`（`stage_timings`/`counts` を含む）は最新 run の `extraction_snapshot` 由来（無ければ None）。`failure_reason_catalog`/`partial_extraction_advice` は静的な辞書（`sherpa.ingest.failure_reasons` が真実源）。
     `last_run_id` は背景実行の受付応答の `run_id` と対応付ける。`running_progress` は実行中（`status` が `queued`／`extracting` かつ `progress` がある）時だけ `{stage, stage_label, done, total, updated_at}`（資料画面はこの間だけ数秒間隔でポーリングする）。段の中の小さな段が動いている間は `step`・`step_label`・`step_done`・`step_total`・`step_started_at` も付く。
     `state`＝`_run_state_cached(wid)` の結果（省略時は毎回 `_run_state(wid)` を引く）。
@@ -287,26 +375,58 @@ def _ingest_summary(wid: str, row: dict, state: dict | None = None) -> dict:
         rep = corpus_docs.empty_scan_report()
         counts_as_of = None
     elif corpus_docs.scan_report_missing_fields(rep):
-        # `scan_report()` に項目が追加される前に保存された旧形式の集計は新しいキーを持たず、response_model の必須項目が欠けると 500 になる。欠けたキーだけ `empty_scan_report()` の既定値（0/空）で補い、`counts_as_of` は `None`（未集計）にする（補った 0 を古い時刻と一緒に返して実測 0 件に見せない）。
+        # `scan_report()` に項目が追加される前に保存された旧形式の集計は新しいキーを持たず、response_model の必須項目が欠けると 500 になる。欠けたキーだけ `empty_scan_report()` の既定値（0/空）で補い、`counts_as_of` は `None`（件数未確認）にする（補った 0 を古い時刻と一緒に返して実測 0 件に見せない）。
         rep = {**corpus_docs.empty_scan_report(), **rep}
         counts_as_of = None
     st = state if state is not None else _run_state(wid)
+    last_status = st["last_run_status"]
+    ingest_active, actions = _action_availability(last_status)
+    completed_at = st.get("last_completed_at")
+    last_completed_at = str(completed_at) if completed_at else None
+    prior_failure = st.get("prior_failure") if ingest_active else None
+    if prior_failure:
+        failure_message = _last_failure_message("failed", prior_failure["warnings"], prior_failure["blocked"])
+    else:
+        failure_message = _last_failure_message(last_status, st["last_run_warnings"], st["last_run_blocked"])
+    completed_counts = None
+    if last_completed_at and counts_as_of:
+        completed_counts = {
+            "as_of": str(counts_as_of),
+            "scanned": rep["scanned"],
+            "indexed": rep["indexed"],
+            "office_failed": rep["office_failed"],
+        }
     return {**rep, "counts_as_of": str(counts_as_of) if counts_as_of else None,
             "graph_nodes": st["graph_nodes"], "graph_edges": st["graph_edges"], "es_chunks": st["es_chunks"],
             "es_state": st["es_state"], "es_error": st["es_error"], "es_index_kept": st["es_index_kept"],
             "ingest_notices": _ingest_notices(rep, st["flag_counts"], st["es_notice_stage"]),
             "last_run_id": st["last_run_id"],
-            "last_run_status": st["last_run_status"], "last_run_warnings": st["last_run_warnings"],
+            "last_run_status": last_status, "last_run_warnings": st["last_run_warnings"],
             "last_run_interrupted": st["last_run_interrupted"],
             "last_run_blocked": st["last_run_blocked"],
             "last_run_flags_total": st["last_run_flags_total"],
             "last_run_flags_truncated": st["last_run_flags_truncated"],
+            "last_completed_at": last_completed_at,
+            "last_completed_counts": completed_counts,
+            "last_failure_message": failure_message,
+            "last_failure_retrying": bool(prior_failure),
+            "ingest_active": ingest_active,
+            "actions": actions,
             "failed_files": st["failed_files"],
             "partial_extraction_suspected": st["partial_extraction_suspected"],
             "stage_summary": st["stage_summary"],
-            "running_progress": st["running_progress"],
+            "running_progress": _plain_progress(st["running_progress"]),
             "failure_reason_catalog": failure_reasons.REASON_CATALOG,
             "partial_extraction_advice": failure_reasons.PARTIAL_EXTRACTION_ADVICE}
+
+
+def _warns_and_blocked(flags: list) -> tuple[list[str], list[dict]]:
+    warns = [f.get("reason") for f in flags
+             if isinstance(f, dict) and f.get("action") in ("warn", "blocked") and f.get("reason")]
+    blocked = [{"doc": f.get("doc"), "reason": f.get("reason")} for f in flags
+               if isinstance(f, dict) and f.get("action") == "blocked"
+               and isinstance(f.get("doc"), str) and f.get("reason")]
+    return warns, blocked
 
 
 def _run_state(wid: str) -> dict:
@@ -321,14 +441,10 @@ def _run_state(wid: str) -> dict:
     flags = (last or {}).get("flags_head") or []
     flag_counts = (last or {}).get("flag_counts") or {
         "always_shown": [], "unparsed_syntax": 0, "unparsed_oversize": 0, "mention_unreadable": 0, "md_failed_many": 0}
-    warns = [f.get("reason") for f in flags
-             if isinstance(f, dict) and f.get("action") in ("warn", "blocked") and f.get("reason")]
+    warns, blocked = _warns_and_blocked(flags)
     for _r in ("plugin_failed", "rebind_failed_rolled_back", "rebind_rollback_failed"):
         if _r not in warns and _r in flag_counts["always_shown"]:
             warns.append(_r)   # 切り詰めの外にあっても取り込み画面の注意に必ず出す（参照先の変更の結果も同じ）
-    blocked = [{"doc": f.get("doc"), "reason": f.get("reason")} for f in flags
-               if isinstance(f, dict) and f.get("action") == "blocked"
-               and isinstance(f.get("doc"), str) and f.get("reason")]
     ingest_worker.seed_failed_docs_once(wid)   # 失敗の一覧の導入前に取り込んだ資料フォルダは、初回だけ派生から集めて入れる
     failed_files = ingest_worker.failed_files_from_table(wid, snap.get("failed_files"))   # 失敗の一覧は表から読む（変化の無い更新で消えない）
     partial = snap.get("partial_extraction_suspected")
@@ -366,6 +482,14 @@ def _run_state(wid: str) -> dict:
     last_status = (last or {}).get("status")
     running_progress = (last or {}).get("progress") if last_status in ("queued", "extracting") else None
     running_progress = running_progress if isinstance(running_progress, dict) else None
+    # 実行中・待機中の run は失敗の理由を持たない。直前の終端 run が失敗なら、今の run が正常に終わるまでその理由を出し続ける。
+    prior_failure = None
+    if last_status in ("queued", "extracting"):
+        prev = store.get_latest_terminal_run_failure(wid, _STATUS_FLAGS_LIMIT)
+        if prev and prev.get("status") == "failed":
+            prev_flags = prev.get("flags_head")
+            prior_warns, prior_blocked = _warns_and_blocked(prev_flags if isinstance(prev_flags, list) else [])
+            prior_failure = {"warnings": prior_warns, "blocked": prior_blocked}
     # 状態判定は「反映済みか」を問わない直近の ES 記録から（変更なしの再索引失敗も拾う）。
     es_attempts = store.get_recent_es_attempts(wid)
     es_state, es_error, es_index_kept = _es_reflect_state(es_attempts, running_progress)
@@ -377,6 +501,8 @@ def _run_state(wid: str) -> dict:
             "es_state": es_state, "es_error": es_error, "es_index_kept": es_index_kept,
             "flag_counts": flag_counts, "es_notice_stage": es_notice_stage,
             "last_run_id": (last or {}).get("id"),
+            "last_completed_at": store.get_latest_completed_run_at(wid),
+            "prior_failure": prior_failure,
             "last_run_status": last_status, "last_run_warnings": warns,
             "last_run_interrupted": last_status == "failed" and snap.get("interrupted") is True,
             "last_run_blocked": blocked,
@@ -422,13 +548,13 @@ def _run_state_cached(wid: str) -> dict:
 # ES 反映の失敗理由（`es_index.index_world` の error 値）→ 利用者向けの平文。未知の値は内部の
 # 例外名や接続先を含みうるため原文を出さず汎用文にする。
 _ES_ERROR_TEXT = {
-    "embedding_cloud_unavailable": "検索用の AI（埋め込み）に接続できませんでした",
+    "embedding_cloud_unavailable": "検索に必要な AI に接続できませんでした",
     "embed_cache_write_failed": "一時データの保存に失敗しました（ディスクの空きを確認してください）",
-    "delete_failed": "古い索引の入れ替えに失敗しました",
-    "create_failed": "索引の作成に失敗しました（ディスクの空きを確認してください）",
-    "bulk_failed": "索引への書き込みに失敗しました（ディスクの空きを確認してください）",
-    "bulk_errors": "索引への書き込みが一部拒否されました（ディスクの空きを確認してください）",
-    "no_chunks": "検索用の断片を作れませんでした",
+    "delete_failed": "古い検索用データの入れ替えに失敗しました",
+    "create_failed": "検索用データを作れませんでした（ディスクの空きを確認してください）",
+    "bulk_failed": "検索用データを書き込めませんでした（ディスクの空きを確認してください）",
+    "bulk_errors": "検索用データの一部を書き込めませんでした（ディスクの空きを確認してください）",
+    "no_chunks": "検索に使う本文を準備できませんでした",
 }
 # 旧索引に触れる前に打ち切られる失敗＝直前までの索引が残る。delete_failed は削除の成否を
 # 証明できず、bulk 失敗は索引を空へ戻し、create 失敗・no_chunks は空のため「残る」と言えない。
@@ -524,7 +650,7 @@ def world_status(wid: str, request: Request):
 @worlds_router.post("/worlds/{wid}/recount", tags=["資料フォルダ(World)管理"], response_model=WorldRecountResponse)
 def world_recount(wid: str, request: Request):
     """取り込み集計を明示的にやり直す（唯一の明示的な実走査）。
-    `GET /worlds/{wid}/status` はキャッシュを読むだけなので、未集計の world や手動でファイルを触った world を最新化したいときに呼ぶ。参照元フォルダを 1 回走査して集計を更新するだけで、グラフ/台帳/ES には触れない。走査中に取り込み・付け替えが入って世代が変わっていたら 409 で終え（再試行しない）、参照元が消失・置換された場合や走査自体の失敗は 503 とし、集計結果を保存しない。
+    `GET /worlds/{wid}/status` はキャッシュを読むだけなので、件数をまだ確認していない world や手動でファイルを触った world を最新化したいときに呼ぶ。参照元フォルダを 1 回走査して集計を更新するだけで、グラフ/台帳/ES には触れない。走査中に取り込み・付け替えが入って世代が変わっていたら 409 で終え（再試行しない）、参照元が消失・置換された場合や走査自体の失敗は 503 とし、集計結果を保存しない。
     """
     _require_admin(_current_user(request))
     if not valid_world(wid):
@@ -899,12 +1025,24 @@ def ingest_rerun(req: RerunReq, request: Request):
 
 @ingest_runs_router.get("/ingest/workers", tags=["資料フォルダ(World)管理"])
 def ingest_workers_status(request: Request):
-    """取り込みワーカーと Web アプリの版の照合（管理者のみ）。ワーカーが動いていない・版が違うときは `message` に画面に出すお知らせが入る。"""
+    """取り込みと画像文字読み取りの稼働状況（管理者のみ）。画面上部へ出す平文のお知らせを返す。"""
     _require_admin(_current_user(request))
     try:
-        return worker_status.snapshot()
+        result = worker_status.snapshot()
     except Exception as e:
         raise HTTPException(503, _INGEST_UNAVAILABLE_MESSAGE) from e
+    try:
+        from sherpa.ingest import ocr_worker, office_md
+        from sherpa.store import ocr_jobs
+        if not office_md.ocr_enabled():
+            result["ocr_message"] = "画像の中の文字の読み取りは設定で停止しています"
+        else:
+            ocr = ocr_jobs.worker_availability_summary(ocr_worker.profile_hash())
+            result["ocr_message"] = None if ocr.get("available") else (
+                "画像の中の文字を読む処理が動いていません。検索には、すでに読み取れた内容だけが使われます")
+    except Exception:
+        result["ocr_message"] = "画像の中の文字を読む処理の状態を確認できませんでした"
+    return result
 
 
 @ingest_runs_router.get("/ingest/runs", tags=["資料フォルダ(World)管理"])

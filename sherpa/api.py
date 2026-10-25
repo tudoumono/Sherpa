@@ -37,7 +37,6 @@ from sherpa.routers import (
     chat,
     conversations,
     feedback_admin,
-    graph,
     impact,
     improvement_log,
     shares,
@@ -84,7 +83,6 @@ _TAGS_METADATA = [
     {"name": "会話管理", "description": "会話履歴の一覧・取得・削除・ピン留め・改名。"},
     {"name": "文書", "description": "文書台帳の参照と原本ダウンロード。"},
     {"name": "資料フォルダ(World)管理", "description": "登録ディレクトリ（world）の登録・状態確認・差分・再取込・削除、フォルダ選択。"},
-    {"name": "ナレッジグラフ", "description": "ナレッジグラフの可視化データ・検索。"},
     {"name": "システム", "description": "ヘルスチェック・ルート・静的UI配信。"},
     {"name": "管理者:外部APIキー", "description": "外部連携 API（/ext/v1）のキー発行・一覧・失効（管理者のみ）。"},
 ]
@@ -185,9 +183,6 @@ app.include_router(documents_routes.documents_router)
 
 
 app.include_router(worlds_routes.worlds_router)
-
-
-app.include_router(graph.router)
 
 
 app.include_router(worlds_routes.ingest_runs_router)

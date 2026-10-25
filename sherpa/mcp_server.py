@@ -589,13 +589,17 @@ def _env_int_override(var_name: str) -> int | None:
 
 # 原本読取ツール 5 本。応答 1 件を Codex CLI が中央を落とす上限（約 40,000 バイト）より小さくするため、`SHERPA_MCP_READER_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
 _READER_BUDGET_TOOLS = frozenset({"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"})
+# 検索ツール 2 本。同じく CLI が中央を落とさない大きさにするため、`SHERPA_MCP_SEARCH_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
+_SEARCH_BUDGET_TOOLS = frozenset({"ripgrep_search", "es_search"})
 
 
 def _tool_budget_bytes(name: str) -> int | None:
-    """`run_tool` へ渡す 1 件あたりのバイト予算。原本読取ツールだけ `SHERPA_MCP_READER_BUDGET_BYTES` との小さい方（未設定なら全ツール共通の予算）。"""
+    """`run_tool` へ渡す 1 件あたりのバイト予算。原本読取ツールは `SHERPA_MCP_READER_BUDGET_BYTES`、検索ツールは `SHERPA_MCP_SEARCH_BUDGET_BYTES` との小さい方（未設定なら全ツール共通の予算）。"""
     base = _env_int_override("SHERPA_MCP_TOOL_BUDGET_BYTES")
-    if name in _READER_BUDGET_TOOLS:
-        cap = _env_int_override("SHERPA_MCP_READER_BUDGET_BYTES")
+    cap_var = ("SHERPA_MCP_READER_BUDGET_BYTES" if name in _READER_BUDGET_TOOLS
+               else "SHERPA_MCP_SEARCH_BUDGET_BYTES" if name in _SEARCH_BUDGET_TOOLS else None)
+    if cap_var:
+        cap = _env_int_override(cap_var)
         if cap:
             return min(base, cap) if base else cap
     return base
@@ -835,8 +839,7 @@ def _clip_tool_result(result, name: str | None = None, args: dict | None = None)
     """
     if not isinstance(result, dict):
         return result, False
-    max_bytes = _env_int_override("SHERPA_MCP_TOOL_BUDGET_BYTES") \
-        or agentic_search.effective_tool_result_max_bytes()
+    max_bytes = _tool_budget_bytes(name) or agentic_search.effective_tool_result_max_bytes()
     size = _json_bytes(result)
     if size <= max_bytes:
         return result, False

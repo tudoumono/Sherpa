@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 from _world_setup import SPEC, TAXCALC
 
+from sherpa import preview_service
 from sherpa.preview_service import build_preview
 
 V = "v1"
@@ -15,7 +16,15 @@ def _compat_mode(monkeypatch):
     monkeypatch.setenv("SHERPA_AUTH_DISABLED", "1")
 
 
-def test_preview_extraction_structure():
+@pytest.fixture
+def _completed(monkeypatch):
+    """取り込みが一度完了した資料フォルダとして扱う（世代の記録 `last_sig` あり・実行中の run なし）。"""
+    monkeypatch.setattr(preview_service, "_current_world_status",
+                        lambda world, **kw: {"sig": "sig-done", "synced_at": "t0", "root_path": None})
+    preview_service._GRAPH_VIEW_CACHE.clear()
+
+
+def test_preview_extraction_structure(_completed):
     """S3（2026-09-04-グラフのソース正典化.md §4・K9-K11）: 意味層フル抽出・REALIZES 橋・名寄せ
     （merges）は撤去済み——entities/relations は骨格（Pass1/Pass2）＋言及エッジ（Pass3）のみ。
     K12: entities_llm/entities_both 等は撤去済み（全件 static のため無意味）。"""
@@ -48,8 +57,7 @@ def test_preview_endpoint_and_ui_served():
     pv = c.get("/ingest/preview", params={"world": V})
     assert pv.status_code == 200 and {"counts", "entities", "relations", "documents"} <= pv.json().keys()
     assert "merges" not in pv.json()   # S3・K9-K11: 名寄せ（REALIZES 由来）は撤去済み
-    for page in ("chat.html", "chat.js", "graph.html", "graph.js", "ingest.html", "ingest.js",
-                 "app.css", "vendor/cytoscape.min.js"):
+    for page in ("chat.html", "chat.js", "ingest.html", "ingest.js", "app.css"):
         r = c.get(f"/ui/{page}")
         assert r.status_code == 200, f"/ui/{page} -> {r.status_code}"
     assert "Sherpa" in c.get("/ui/chat.html").text
@@ -69,16 +77,11 @@ def test_ui_static_cache_control_no_cache():
         assert r.status_code == 200 and r.headers.get("cache-control") == "no-cache", page
 
 
-def test_graph_and_worlds():
+def test_worlds_and_root():
     from fastapi.testclient import TestClient
     from sherpa.api import app
     c = TestClient(app)
-    g = c.get("/graph", params={"world": V}).json()
-    assert g["nodes"] and g["edges"]
-    ids = {n["id"] for n in g["nodes"]}
-    assert all(e["source"] in ids and e["target"] in ids for e in g["edges"])   # 孤立エッジなし
-    # S3・K9-K11: 業務 Parameter（REALIZES 由来）は撤去済み——骨格ノード（コード）で確認する。
-    assert any(n["name"] == "TAXCALC" and n["type_ja"] == "プログラム" for n in g["nodes"])
     assert "v1" in c.get("/world-options").json()["worlds"]
     root = c.get("/", follow_redirects=False)
     assert root.status_code in (307, 308) and root.headers["location"] == "/ui/home.html"
+

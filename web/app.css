@@ -187,6 +187,7 @@ tr.hideRow{display:none}
 .cite{padding:9px 11px;border:1px solid var(--border);border-radius:8px;margin-bottom:7px}
 .cite .doc{font-weight:600}
 .cite .span{font-size:var(--text-caption);color:var(--ink-3);margin-left:6px}
+.cite-prov{font-size:var(--text-caption);margin-right:8px}.cite .cite-prov{margin-left:6px}
 .cite pre{white-space:pre-wrap;font-size:var(--text-caption);color:var(--ink);background:var(--surface-2);border-radius:6px;padding:8px;margin:6px 0 0}
 
 /* 取り込みパイプライン表 */
@@ -396,7 +397,7 @@ tr.hideRow{display:none}
 .cite{padding:9px 11px;border:1px solid var(--border);border-radius:8px;margin:7px 0}
 .cite .doc{font-weight:600}.cite .sp{font-size:var(--text-caption);color:var(--ink-3);margin-left:6px}
 .cite pre{white-space:pre-wrap;font-size:var(--text-caption);color:var(--ink);background:var(--surface-2);border-radius:6px;padding:8px;margin:6px 0 0}
-/* 引用（該当箇所）カードの折りたたみ見出し（.refgraph-h と同じトーン） */
+/* 引用（該当箇所）カードの折りたたみ見出し */
 .cites{margin-top:4px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
 .cites-h{width:100%;text-align:left;border:none;background:var(--surface-2);color:var(--ink-2);
   display:flex;align-items:center;gap:6px;padding:8px 11px;font-size:var(--text-small);cursor:pointer}
@@ -804,15 +805,6 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .example .exarrow{color:var(--ink-3);font-size:var(--text-small)}
 .example:hover .exarrow{color:var(--accent-ink)}
 @media(max-width:640px){.examples{grid-template-columns:1fr}}
-/* 回答の「参照したナレッジグラフ」折りたたみ */
-.refgraph{margin-top:10px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
-.refgraph-h{width:100%;text-align:left;border:none;background:var(--surface-2);color:var(--ink-2);
-  font-family:inherit;font-size:var(--text-small);padding:8px 12px;cursor:pointer;display:flex;align-items:center;gap:6px}
-.refgraph-h:hover{background:var(--surface)}
-.refgraph-h .caret{margin-left:auto;color:var(--ink-3)}
-.refgraph-body{height:240px;background:var(--bg)}
-.refgraph-body[hidden]{display:none}
-.rg-canvas{width:100%;height:100%}
 .iconbtn{width:36px;height:36px;border-radius:8px;border:1px solid var(--border);background:var(--surface);
   color:var(--ink-2);display:grid;place-items:center;font-size:var(--text-body)}
 
@@ -871,70 +863,6 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
   padding:9px 16px;border-radius:999px;font-size:var(--text-small);opacity:0;visibility:hidden;
   transition:opacity .2s,visibility .2s;pointer-events:none;z-index:50}
 .toast.show{opacity:.95;visibility:visible}   /* 非表示時は visibility:hidden で合成レイヤごと消す */
-
-/* ===== ナレッジグラフ可視化 ===== */
-.graphwrap{height:calc(100dvh - 52px);display:flex;flex-direction:column;padding:20px 24px 24px;gap:16px}
-.graphhead{display:flex;align-items:center;justify-content:space-between;gap:16px}
-.graphhead h1{font-size:var(--text-heading);line-height:1.3;margin:0 0 4px}
-.graphhead p{margin:0;font-size:var(--text-small);color:var(--ink-3)}
-.graphworkspace{display:grid;grid-template-columns:minmax(0,1fr) 320px;flex:1;min-height:0;
-  border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;background:var(--surface)}
-.graphmain{display:flex;flex-direction:column;position:relative;min-width:0;min-height:0}
-.graphbar{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;padding:16px;border-bottom:1px solid var(--border)}
-.gsearch-field{display:flex;flex-direction:column;gap:4px;flex:1;min-width:200px;font-size:var(--text-small);font-weight:600}
-.graphbar .gsearch,.graphbar .gselect{width:100%;font-size:var(--text-label)}
-.gconditions{font-size:var(--text-small)}
-.gconditions[open]{flex-basis:100%}
-.gconditions summary{cursor:pointer;min-height:40px;align-content:center;color:var(--accent-ink)}
-.gcondition-fields{display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px;margin-top:8px}
-.gcondition-fields label{flex:1;min-width:120px;display:grid;gap:4px}
-.graphstatus{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:10px 16px;border-bottom:1px solid var(--border)}
-.gcount{font-size:var(--text-small);color:var(--ink-2);overflow-wrap:anywhere}
-.graphview-actions{display:flex;gap:6px;margin-left:auto}
-.graphstage{position:relative;flex:1;min-height:0;background:var(--bg)}
-#cy{position:absolute;inset:0}
-.graphhint{padding:8px 16px;border-top:1px solid var(--border);font-size:var(--text-caption);color:var(--ink-3)}
-.graphlegend{border-left:1px solid var(--border);overflow:auto;padding:0 18px 18px;scrollbar-gutter:stable}
-.graphlegend section{padding:18px 0;border-bottom:1px solid var(--border)}
-.graphlegend h2{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:var(--text-label);margin:0 0 12px}
-.graphlegend>.help-link{display:block;margin-top:16px}
-.legrow{display:flex;align-items:center;gap:8px;font-size:var(--text-small);color:var(--ink-2);margin-bottom:6px;
-  border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);width:100%;padding:7px 10px;text-align:left}
-.legrow:hover{background:var(--surface-2)}
-.legrow.off{background:var(--surface-2);color:var(--ink-3);text-decoration:line-through}
-.legrow .legcount{margin-left:auto;color:var(--ink-3)}
-.gdep{margin-top:12px;font-size:var(--text-caption)}
-.gdep[aria-pressed="true"]{background:var(--accent-weak);color:var(--accent-ink)}
-.legdot{width:13px;height:13px;border-radius:50%;flex:0 0 auto;border:2px solid var(--surface)}
-.leg-help{font-size:var(--text-small);color:var(--ink-3);line-height:1.7;margin:10px 0 0}
-.gresults{display:grid;gap:6px;max-height:260px;overflow:auto}
-.gresult{display:block;width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);
-  background:var(--surface);color:var(--ink);text-align:left;font-size:var(--text-small);overflow-wrap:anywhere}
-.gresult:hover{background:var(--accent-weak)}
-.gresult small{display:block;font-size:var(--text-caption);color:var(--ink-3)}
-#gresults-count{color:var(--ink-3);font-size:var(--text-caption);font-weight:400}
-.gempty{position:absolute;inset:0;display:grid;place-items:center;color:var(--ink-3);font-size:var(--text-label)}
-.nodecard{display:none;overflow-wrap:anywhere}
-.nodecard.show{display:block}
-.nodecard .nt{font-size:var(--text-caption);color:var(--accent-ink);background:var(--accent-weak);padding:2px 9px;border-radius:999px}
-.nodecard .nn{font-weight:700;font-size:var(--text-body);margin:8px 0 2px}
-.nodecard .nrow{font-size:var(--text-small);color:var(--ink-2);margin-top:5px}
-.nodecard .nrow b{color:var(--ink)}
-.nodecard .ask{margin-top:12px;width:100%;justify-content:center}
-.nodecard h3{font-size:var(--text-small);margin:16px 0 8px}
-.nconnections{display:grid;gap:6px;max-height:240px;overflow:auto}
-@media(max-width:1000px){
-  .graphwrap{padding:16px;gap:12px}
-  .graphworkspace{grid-template-columns:minmax(0,1fr) 280px}
-}
-@media(max-width:760px),(max-height:600px){
-  .graphwrap{height:auto;min-height:calc(100dvh - 52px);padding:12px}
-  .graphworkspace{display:flex;flex-direction:column;overflow:visible}
-  .graphstage{flex:none;height:440px}
-  .graphlegend{border-left:0;border-top:1px solid var(--border);overflow:visible}
-  .graphhead{align-items:flex-start}
-  .graphhint{font-size:var(--text-caption)}
-}
 
 /* ===== 取り込み: フォルダツリー副導線 ===== */
 .ingestwrap{display:flex;gap:18px;align-items:flex-start}

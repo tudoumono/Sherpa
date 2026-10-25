@@ -307,6 +307,27 @@ def get_latest_run_status(world, flags_limit: int) -> dict | None:
                             "md_failed_many": int(md_many) if md_many == int(md_many) else float(md_many)}}
 
 
+def get_latest_terminal_run_failure(world, flags_limit: int) -> dict | None:
+    """実行中・待機中を除く最新 run の `id`/`status`/`flags_head` を引く。`flags_head` は `status='failed'` のときだけ、注意・停止の flag（`action` が `warn`/`blocked`）の先頭 `flags_limit` 件（それ以外は空）。
+    次の取り込みが走っている間も、直前の失敗の理由を出し続けるための読み取り。`flags` 全件は Python へ持ち込まない。
+    """
+    _ensure()
+    with _connect() as c:
+        row = c.execute(
+            "WITH r AS (SELECT id, status, extraction_snapshot->'flags' AS fl FROM ingest_runs "
+            "           WHERE kb_id=%s AND version=%s AND status NOT IN ('queued','extracting') "
+            "           ORDER BY id DESC LIMIT 1) "
+            "SELECT r.id, r.status, CASE WHEN r.status='failed' THEN "
+            "  (SELECT COALESCE(jsonb_agg(s.f ORDER BY s.o), '[]'::jsonb) FROM ("
+            "     SELECT f, o FROM jsonb_array_elements(CASE WHEN jsonb_typeof(r.fl)='array' "
+            "                        THEN r.fl ELSE '[]'::jsonb END) WITH ORDINALITY AS t(f, o) "
+            "     WHERE f->>'action' IN ('warn','blocked') ORDER BY o LIMIT %s) s) "
+            "  ELSE '[]'::jsonb END AS flags_head FROM r", (_KB_ID, world, flags_limit)).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "status": row["status"], "flags_head": row["flags_head"]}
+
+
 def get_latest_published_run_summary(world) -> dict | None:
     """最新の反映済み（`published_at IS NOT NULL`）run 1件の `published_snapshot` の `nodes`/`edges` と `created_at`。graph（Neo4j）件数専用で、ES は `get_latest_es_run_summary` を使う。
     直近の run が失敗していても Neo4j は直前の成功時点のままなので、これが現在の Neo4j の内容に最も近い。ES 段に触れていない run も拾いうるため ES 件数には流用しない。
@@ -323,6 +344,18 @@ def get_latest_published_run_summary(world) -> dict | None:
         return None
     return {"published_snapshot": {k: row[k] for k in ("nodes", "edges") if row[k] is not None},
             "created_at": row["created_at"]}
+
+
+def get_latest_completed_run_at(world):
+    """正常終了（`auto_published`/`auto_published_with_flags`）で反映した最新 run の `published_at`。無ければ None。"""
+    _ensure()
+    with _connect() as c:
+        row = c.execute(
+            "SELECT published_at FROM ingest_runs "
+            "WHERE kb_id=%s AND version=%s AND status IN ('auto_published','auto_published_with_flags') "
+            "AND published_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (_KB_ID, world)).fetchone()
+    return row["published_at"] if row else None
 
 
 def get_latest_es_run_summary(world) -> dict | None:

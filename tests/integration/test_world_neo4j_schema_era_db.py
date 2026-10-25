@@ -8,8 +8,8 @@
   - `load_world()` が world ごとに現行 `GRAPH_SCHEMA_ERA` を `:SherpaMeta{world_id}.schema_era`
     として保存し、読み取れる。
   - 保存済み era を故意に旧値へ書き換えると、`world_impact`/`resolve_world_entity`
-    （`run_world_impact` 経由）・`lens_service.neo4j_related`（`run_troubleshoot` 経由）・
-    `graph_admin.graph_search` のいずれも `GraphSchemaEraError` を raise する（fail-loud）。
+    （`run_world_impact` 経由）・`lens_service.neo4j_related`（`run_troubleshoot` 経由）
+    のいずれも `GraphSchemaEraError` を raise する（fail-loud）。
   - 未投入 world（`:Entity` が0件）は era 未保存でもゲートが発動しない（既存の空応答のまま）。
 """
 from __future__ import annotations
@@ -66,9 +66,9 @@ def test_load_world_stamps_readable_schema_era():
 
 
 def test_stale_schema_era_fails_loud_across_all_gated_read_entrypoints():
-    """era を故意に旧値へ書き換えると、影響/troubleshoot/管理グラフ検索のいずれも
+    """era を故意に旧値へ書き換えると、影響/troubleshoot のいずれも
     `GraphSchemaEraError` で fail-loud になる（旧世代の実データを黙って読まない）。"""
-    from sherpa import graph_admin, lens_service
+    from sherpa import lens_service
     from sherpa.ingest import world_neo4j
     _load()
     drv = _driver()
@@ -84,9 +84,6 @@ def test_stale_schema_era_fails_loud_across_all_gated_read_entrypoints():
             with pytest.raises(world_neo4j.GraphSchemaEraError) as ei2:
                 lens_service.run_troubleshoot(s, "ORDER-MAIN で ABEND", WORLD)
             assert ei2.value.lens == "troubleshoot"
-
-            with pytest.raises(world_neo4j.GraphSchemaEraError):
-                graph_admin.graph_search(s, WORLD, field="category", value="01_ソース", op="prefix")
     finally:
         _cleanup(drv, WORLD)
         drv.close()

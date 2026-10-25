@@ -509,7 +509,7 @@ def test_search_knn_only_reacts_to_embed_algo_mismatch(monkeypatch):
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "embed_provider": "openai", "embed_model": "m", "dim": 3,
         "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
-    monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None: [[0.1, 0.2, 0.3]])
+    monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None, **kw: [[0.1, 0.2, 0.3]])
     monkeypatch.setattr(es_index, "_req", lambda *a, **k: {"hits": {"hits": []}})
     assert es_index.search_knn_only("w", "query")[1] is None
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
@@ -658,7 +658,7 @@ def test_search_hybrid_rrf_weight_follows_hybrid_weight(monkeypatch, weight):
         **_HYBRID_META, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: dict(
         provider="openai", model="m", dim=3))
-    monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None: [[0.1, 0.2, 0.3]])
+    monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None, **kw: [[0.1, 0.2, 0.3]])
 
     def hit(i):
         return {"_id": i, "_source": {"doc_id": f"{i}.md", "text": "t"}, "_score": 1.0}

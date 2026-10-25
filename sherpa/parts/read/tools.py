@@ -59,6 +59,10 @@ def _redact(text: str) -> str:
     """秘密値の伏せ字。BEGIN だけ・END だけ・本文の base64 連続行だけの断片（窓や切り詰めで片側が無い鍵）も伏せる。"""
     return redact_keys.mask_orphan_key_body(redact_keys.KeyBlockRedactor(_redact_plain)(text or ""))
 
+def _redact_keep_lines(text: str) -> str:
+    """`_redact` と同じ伏せ字を、行の数を変えずに行う（行の位置つきの切り詰めの前に使う）。"""
+    return "\n".join(redact_keys.redact_window_lines((text or "").split("\n"), _redact_plain))
+
 def _walk_redact(obj, redactor):
     if isinstance(obj, str):
         return redactor(obj)
@@ -90,6 +94,8 @@ _TRUNCATED_DOCS_MAX = 20
 
 # ripgrep_search／es_search: ヒット単位のバイト上限の下限（日本語で約 170 文字＝見出し＋冒頭数行）。件数ではなく本文量をヒット単位で頭打ちにする
 _HIT_TEXT_MIN_BYTES = 512
+# 引用の抜粋（先頭 500 文字に一致行が無いとき一致行の前後から作る）のバイト上限
+_QUOTE_MAX_BYTES = 500
 
 # es_search の方式。hybrid は語の一致＋意味の近さ・keyword は語の一致だけ・vector は意味の近さだけ
 _ES_MODES = ("hybrid", "keyword", "vector")
@@ -412,11 +418,10 @@ def _stream_doc_lines(f):
     caution = corpus_docs.encoding_caution_for_ratio(ratio, majority_garbled)
     return reader, grep_tool._logical_lines(reader, _READ_AROUND_FILE_CAP_BYTES, encoding=enc), caution
 
-def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, byte_cap: int,
-                        info: dict | None = None) -> str | None:
-    """親返し P2: rag.md をアンカー（`<!-- chunk:{chunk_id} -->`）単位でストリーミング走査し、`target_chunk_ids` に属するチャンクの本文だけを集める。
-    `info`（省略可）には、集められなかった対象チャンクの数を `info["missing_chunks"]` として返す（rag.md に無い・走査が cap で終わった等）。
-    対象外のチャンク本文は保持せず、全件そろうか `byte_cap` 超過で打ち切る。`byte_cap` を超えたら None を返し、集めた部分的な本文は使わない（途中で打ち切ったものを完全なものとして返さない）。
+def _scan_rag_md_chunks(world: str, doc_id: str, sp, layer, target_chunk_ids, byte_cap: int | None) -> dict | None:
+    """rag.md をアンカー（`<!-- chunk:{chunk_id} -->`）単位でストリーミング走査し、`target_chunk_ids` に属するチャンクの本文だけを集める（1 回の走査）。
+    対象外のチャンク本文は保持せず、全件そろうか `byte_cap`（None は無制限）超過か読込の上限で打ち切る。
+    戻り値: `{"collected": {chunk_id: 本文}, "order": 見つけた順の chunk_id, "over": byte_cap 超過で打ち切った, "reader_cut": 読込の上限で打ち切った}`。対象が空・開けないときは None。
     """
     if not target_chunk_ids:
         return None
@@ -430,6 +435,7 @@ def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, by
     cur_buf: list = []
     total_bytes = 0
     over = False
+    reader = None
 
     def _close(cid: str, buf: list) -> None:
         nonlocal total_bytes, over
@@ -438,11 +444,11 @@ def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, by
         order.append(cid)
         remaining.discard(cid)
         total_bytes += len(body.encode("utf-8"))
-        if total_bytes > byte_cap:
+        if byte_cap is not None and total_bytes > byte_cap:
             over = True
 
     try:
-        _reader, it, _enc_caution = _stream_doc_lines(f)  # 親返しの抜粋には注意文を付けない
+        reader, it, _enc_caution = _stream_doc_lines(f)  # 親返しの抜粋には注意文を付けない
         for line in it:
             anchor_id = es_index.rag_md_anchor_chunk_id(line)
             if anchor_id is not None:
@@ -457,16 +463,41 @@ def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, by
             if cur_id is not None and cur_id in remaining:
                 cur_buf.append(line)
         else:
-            # EOF（break していない）＝最後のアンカーの本文が未確定なら確定させる
-            if cur_id is not None and cur_id in remaining:
+            # EOF（break していない）＝最後のアンカーの本文が未確定なら確定させる。読込の上限で途切れたときは途中までの本文なので確定させない
+            if cur_id is not None and cur_id in remaining and not (reader.truncated or reader.line_overflowed):
                 _close(cur_id, cur_buf)
     finally:
         f.close()
-    if over or not collected:
+    return {"collected": collected, "order": order, "over": over,
+            "reader_cut": bool(reader is not None and (reader.truncated or reader.line_overflowed))}
+
+
+def _region_text_from_scan(scan: dict, target_chunk_ids, byte_cap: int, info: dict | None = None) -> str | None:
+    """`_scan_rag_md_chunks` の結果から、`target_chunk_ids` に属するチャンクの本文を見つけた順につないで返す（`byte_cap` 超過・1 件も無いときは None）。`info` の中身は `_rag_md_region_text` と同じ。"""
+    ids = set(target_chunk_ids)
+    order = [cid for cid in scan["order"] if cid in ids]
+    missing = len(ids) - len(order)
+    over = sum(len(scan["collected"][cid].encode("utf-8")) for cid in order) > byte_cap
+    if info is not None:
+        info.update(scanned=True, over=over, read_cut=bool(scan["reader_cut"] and missing), found_ids=set(order))
+    if over or not order:
         return None
     if info is not None:
-        info["missing_chunks"] = len(remaining)
-    return "\n\n".join(collected[cid] for cid in order)
+        info["missing_chunks"] = missing
+    return "\n\n".join(scan["collected"][cid] for cid in order)
+
+
+def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, byte_cap: int,
+                        info: dict | None = None) -> str | None:
+    """親返し P2: rag.md をアンカー（`<!-- chunk:{chunk_id} -->`）単位でストリーミング走査し、`target_chunk_ids` に属するチャンクの本文だけを集める。
+    `info`（省略可）には、集められなかった対象チャンクの数を `info["missing_chunks"]`（本文を返せたときだけ）として返す（rag.md に無い・走査が cap で終わった等）。
+    rag.md を開いて走査したときは `info["scanned"]`・`info["over"]`（`byte_cap` 超過で打ち切った）・`info["read_cut"]`（読込の上限で打ち切った＝`reader.truncated`／`line_overflowed`）・`info["found_ids"]`（見つけた chunk_id）も返す（`over`／`read_cut` のときの `found_ids` は途中までで、無かった証拠にならない）。
+    `byte_cap` を超えたら None を返し、集めた部分的な本文は使わない（途中で打ち切ったものを完全なものとして返さない）。
+    """
+    scan = _scan_rag_md_chunks(world, doc_id, sp, layer, target_chunk_ids, byte_cap)
+    if scan is None:
+        return None
+    return _region_text_from_scan(scan, target_chunk_ids, byte_cap, info)
 
 _hit_scores: list = []
 
@@ -500,12 +531,72 @@ def pop_hit_scores() -> list:
     return out
 
 
+_ROW_GROUP_CUT_READ_MORE = "束ねた行の完全な本文は予算に入らず省いた（text は検索用に短くした文字）。続きは read_doc／read_around で doc_id を読む"
+_INGEST_TIME_NOTE = "（注: 取り込み時点の本文で、今の原本との対応は確かめていない）"
+
+
+def _chunk_tier_texts(world: str, doc_id: str, sp, layer, items: list, scan_info: dict,
+                      remaining: int, doc_ceiling: int) -> tuple:
+    """親返しが tier="chunk" に縮退した doc の各ヒットの本文を決める。
+    ① 行の束（`row_group_chunk_ids` あり）のヒットは、検索用に切った文字（vector_text）の代わりに rag.md から束の構成の完全な本文を読んで返す。予算（共有の残り・1 文書の上限）に入らなければ切った文字のまま省いた印を返す。
+    ② rag.md を走査して chunk_id が見つからなかったヒットは ES の本文のまま返し、取り込み時点の内容である注記を付ける（rag.md を開けなかったとき、読込の上限で打ち切られて「無い」と言えないときは比べる相手が無いので付けない）。
+    `scan_info`: 領域の読取（`_rag_md_region_text`）が返した `info`。戻り値: `(各ヒットの本文, 残り予算, 省いた束の chunk_id, 取り込み時点の chunk_id, 打ち切りで有無を確かめられなかった chunk_id)`。
+    """
+    texts = [it["text"] for it in items]
+    cut: list = []
+    ingest: list = []
+    unread: list = []
+    note_bytes = len(_INGEST_TIME_NOTE.encode("utf-8"))
+    scanned = bool(scan_info.get("scanned")) and not scan_info.get("over") and not scan_info.get("read_cut")  # 打ち切った走査は「無かった」の証拠にならない
+    scan_cut = bool(scan_info.get("scanned")) and bool(scan_info.get("read_cut")) and not scan_info.get("over")
+    found = scan_info.get("found_ids") or set()
+    group_union = {c for it in items for c in (it.get("row_group_chunk_ids") or [])}
+    group_scan = _scan_rag_md_chunks(world, doc_id, sp, layer, group_union, None)  # 束の本文は文書ごとに 1 回の走査で集め、ヒットごとに配る
+    for i, it in enumerate(items):
+        group_ids = it.get("row_group_chunk_ids")
+        unverified = False
+        if group_ids:
+            item_bytes = len(texts[i].encode("utf-8"))
+            doc_bytes = sum(len(t.encode("utf-8")) for t in texts)
+            cap = max(0, min(item_bytes + remaining, doc_ceiling - (doc_bytes - item_bytes)))
+            info: dict = {}
+            body = _region_text_from_scan(group_scan, group_ids, cap, info) if group_scan is not None else None
+            if info.get("over"):
+                cut.append(it["chunk_id"])
+                continue
+            if not info.get("scanned"):
+                continue
+            if body is None or info.get("missing_chunks"):
+                if info.get("read_cut"):
+                    unread.append(it["chunk_id"])  # 読込の上限で打ち切られた＝無いとは言えない
+                    continue
+                unverified = True
+            else:
+                hint = it.get("hint")
+                full = _redact(f"{body}（位置: {hint}）" if hint else body)
+                delta = len(full.encode("utf-8")) - item_bytes
+                if delta > remaining:
+                    cut.append(it["chunk_id"])
+                    continue
+                texts[i] = full
+                remaining -= delta
+        elif scanned and it["chunk_id"] not in found:
+            unverified = True
+        elif scan_cut and it["chunk_id"] not in found:
+            unread.append(it["chunk_id"])
+        if unverified:
+            ingest.append(it["chunk_id"])
+            texts[i] += _INGEST_TIME_NOTE
+            remaining = max(0, remaining - note_bytes)
+    return texts, remaining, cut, ingest, unread
+
+
 def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_rag: int) -> list:
     """親返し本体: doc_id ごとに束ねた rag チャンクのヒットを P2（領域）／chunk（子のみ）へ振り分ける。決定的な貪欲法:
     ① 全 doc の最低保証（子チャンク本文の合計＝`baseline`）を `budget_for_rag` から先に確保する（先頭の巨大文書が予算を食い尽くして子チャンクが消えるのを防ぐ）。
     ② 残り予算をベストスコア順（同点は doc_id 昇順）に使い、領域が「共有の残り予算」と「1 文書あたりの上限（`per_doc_cap`）」の両方に収まれば P2、収まらなければ chunk のままにする。`per_doc_cap` は総予算を doc 数で均等割り（下限 `_HIT_TEXT_MIN_BYTES`）した値。
     ③ 各 doc は必ず 1 エントリを返し、`tier` を必ず申告する。`per_doc_cap` に阻まれて領域を取れなかった doc には `text_truncated: true` を立てる（read_doc で補える余地を示す）。
-    `rag_groups`: `{doc_id: [{"chunk_id", "parent_id", "locator", "score", "text"}, ...]}`（`text` は redaction 済みの子チャンク本文）。`budget_for_rag`: この tool result のうち rag doc 群に残っている予算（呼び出し元が計算する）。
+    `rag_groups`: `{doc_id: [{"chunk_id", "parent_id", "locator", "score", "text"}, ...]}`（`text` は redaction 済みの子チャンク本文。行の束のヒットは `row_group_chunk_ids`・`hint` も持ち、tier="chunk" のとき `_chunk_tier_texts` が束の完全な本文を読み直す）。`budget_for_rag`: この tool result のうち rag doc 群に残っている予算（呼び出し元が計算する）。
     """
     groups = []
     for doc_id, items in rag_groups.items():
@@ -525,6 +616,7 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
         region_capped = False
         parent_unfetched = False
         region_info = {}
+        per_doc_ceiling = max(per_doc_cap, baseline)  # baseline（最低保証）自体は削らない
         parent_ids = sorted({it["parent_id"] for it in items if it.get("parent_id")})
         if parent_ids:
             es_ids = es_index.chunk_ids_for_parent(
@@ -535,7 +627,6 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
             target_ids = set(es_ids)
             target_ids |= set(chunk_ids)  # ヒット自身のチャンクは必ず含める（ES 反映漏れの安全弁）
             shared_cap = baseline + remaining
-            per_doc_ceiling = max(per_doc_cap, baseline)  # baseline（最低保証）自体は削らない
             region_cap = min(shared_cap, per_doc_ceiling)
             region_info = {}
             region_text = _rag_md_region_text(world, doc_id, sp, layer, target_ids, region_cap, region_info)
@@ -550,6 +641,14 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
             if tier != "region" and per_doc_ceiling < shared_cap:
                 # 1 文書あたりの上限が共有予算より先に効いた＝この文書は上限で頭打ちにされた
                 text_truncated = True
+        cut_chunks: list = []
+        ingest_chunks: list = []
+        if tier == "chunk":
+            texts, remaining, cut_chunks, ingest_chunks, unread_chunks = _chunk_tier_texts(
+                world, doc_id, sp, layer, items, region_info, remaining, per_doc_ceiling)
+            text = "\n\n".join(texts)
+            if cut_chunks or unread_chunks:
+                text_truncated = True
         entry = {"doc_id": doc_id, "tier": tier, "text": text,
                  "chunks": [{"chunk_id": it["chunk_id"],
                              **({"locator": it["locator"]} if it.get("locator") is not None else {})}
@@ -562,12 +661,22 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
             entry["fragment"] = True
             entry["text_truncated"] = True
             entry["parent_chunks_unfetched"] = True  # 親の領域のチャンクを取得できなかった（本文はヒットのチャンクだけ）
+        if cut_chunks:
+            entry["row_group_text_cut"] = {"chunks": cut_chunks, "read_more": _ROW_GROUP_CUT_READ_MORE}
+        if ingest_chunks:
+            entry["ingest_time_text"] = {"chunks": ingest_chunks}  # ES の本文のまま（今の rag.md に chunk_id が無い）＝取り込み時点の内容
         if region_capped:
             entry["region_chunks_capped"] = True  # 領域のチャンク取得が ES の取得上限（5000）に当たった
         if tier == "region" and region_info.get("missing_chunks"):
             entry["region_missing_chunks"] = region_info["missing_chunks"]  # 領域の一部のチャンクが集まらなかった
         if any(it.get("keyword_match") is not None for it in items):
             entry["keyword_match"] = any(it.get("keyword_match") for it in items)  # 束ねた子チャンクのどれかに語が一致していれば True
+        matched_fields = list(dict.fromkeys(f for it in items for f in (it.get("matched_fields") or [])))
+        if matched_fields:
+            entry["matched_fields"] = matched_fields  # 束ねた子チャンクで語が当たった欄（text／labels／region_context）
+        exact_chunk_ids = list(dict.fromkeys(c for it in items for c in (it.get("row_group_exact_chunk_ids") or [])))
+        if exact_chunk_ids:
+            entry["row_group_exact_chunk_ids"] = exact_chunk_ids  # exact で一致した束の中の行の chunk_id
         out.append(entry)
     return out
 
@@ -1043,7 +1152,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     - `max_hits`（省略可）: 調べる深さが計算した grep／ES のヒット上限の実効値（`grep_search` の `max_hits`／`es_index.search` の `k` へ渡す）。
     - `window_cap`（省略可）: `read_around` の読み取り窓の既定値と `max(200, READ_WINDOW)` クランプの `READ_WINDOW` 部分を置き換える（200 の下限は維持）。`read_doc` の 1 ページ幅にも `max(200, window_cap or READ_WINDOW)` を使う。read_doc は 1 行ずつバイト予算を累積し、超える直前の行で止めてそこを `end_line` にする（超過時は `text_truncated: true`）。`doc_outline` は見出し件数（`_OUTLINE_MAX_HEADINGS`）とタイトルの累積バイト数の両方で打ち切る（`truncated`）。読み込みが `_READ_AROUND_FILE_CAP_BYTES` に達したら `file_truncated: true` を返す。`ripgrep_search` も `_GREP_FILE_CAP_BYTES` で打ち切ったファイル由来のヒットに `hits[i].file_truncated: true` を付ける。
     - `ripgrep_search` のページング: `args["offset"]`（省略時 0・負値は 0）を `grep_tool.grep_search` へそのまま渡す（巻き戻さない）。1 ページのヒット数 `used_max_hits` は `max_hits` と `MAX_HITS_ABS_MAX - offset` の小さい方（`offset` はクランプせず、件数を縮める側で絶対上限を守る）。`offset >= MAX_HITS_ABS_MAX` なら検索せず空を返す。`next_offset` は `offset+used_max_hits < MAX_HITS_ABS_MAX` のときだけ付く。`es_search` は offset ページングを持たず（続きが要るなら `max_hits` を増やす）、`truncated:true` のみ。
-    - ヒットの本文: 両ツールとも `hits[i].text` は `tool_result_max_bytes` をヒット数で均等割りしたバイト数（下限 `_HIT_TEXT_MIN_BYTES`）で末尾クリップし、切ったヒットに `text_truncated: true` を付ける（親返しの rag doc 群は別予算配分で、`_resolve_parent_return` が独自に付ける）。`view` を組んだ後に直列化後の実バイト数を測り、`tr_max_bytes` 超過なら per_hit を詰めて再構築する（最大 4 回）。それでも収まらなければ呼び出し元の外側クリップに委ねる。
+    - ヒットの本文: 両ツールとも `hits[i].text` は `tool_result_max_bytes` を実際に返すヒット数で均等割りしたバイト数（下限 `_HIT_TEXT_MIN_BYTES`）に収め、`ripgrep_search` は見出し行＋一致行の前後を残して離れた箇所を省略の印（行の位置つき）でつなぎ（`grep_tool.clip_hit_text`）、`es_search` は末尾をクリップし、切ったヒットに `text_truncated: true` を付ける（親返しの rag doc 群は別予算配分で、`_resolve_parent_return` が独自に付ける）。`view` を組んだ後に直列化後の実バイト数を測り、`tr_max_bytes` 超過なら per_hit を詰めて再構築する（最大 4 回）。それでも収まらなければ呼び出し元の外側クリップに委ねる。
     - `deadline`（省略可・`time.monotonic()` 系の絶対期限）: ツリー走査を伴うツール（`ripgrep_search`／`list_docs`／`glob_search`／`es_search`）へそのまま渡し、実行中の呼び出しを打ち切る。超過時は `grep_tool.GrepDeadlineExceeded`／`scope_infer.ScopeWalkDeadlineExceeded` を送出する（呼び出し元が 504 相当へ再分類する）。
     - `tool_result_max_bytes`（省略可）: run 開始時に 1 回解決したツール結果 1 件あたりのバイト予算。本関数内のバイトクリップは全てこの実効値を使う。
     - `graph_only`（省略可）: 真のとき `graph_neighbors` は `lens_service.neighbor_cards_graph_only`（grep をせず、起点は名前の一致で直接引く）を使う（MCP が `SHERPA_MCP_TOOLSET=plain` のときだけ）。
@@ -1120,6 +1229,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 docs, cites, cards)
     if name in ("ripgrep_search", "es_search"):
         q = str(args.get("query") or "")
+        q_hit = q.strip()  # grep 本体と同じく前後の空白を除いた語で一致行を探す
         degrade_reason = None
         truncated_docs: list = []  # ripgrep_search のみ（es_search は空のまま）
         grep_stats: dict = {}  # ripgrep_search のみ（読めずに飛ばしたファイルの件数）
@@ -1189,9 +1299,12 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                      "span": [h.get("line"), h.get("line")], "ext": h.get("ext"),
                      "score": h.get("score"),  # 親返しの並び順にのみ使う・LLM 出力へは出さない
                      **({"keyword_match": h["keyword_match"]} if h.get("keyword_match") is not None else {}),
+                     **({"matched_fields": h["matched_fields"]} if h.get("matched_fields") else {}),
                      **({"locator": h["locator"]} if h.get("locator") is not None else {}),
                      **({"chunk_id": h["chunk_id"]} if h.get("chunk_id") is not None else {}),
-                     **({"parent_id": h["parent_id"]} if h.get("parent_id") is not None else {})}
+                     **({"parent_id": h["parent_id"]} if h.get("parent_id") is not None else {}),
+                     **({"row_group_chunk_ids": h["row_group_chunk_ids"]} if h.get("row_group_chunk_ids") else {}),
+                     **({"row_group_exact_chunk_ids": h["row_group_exact_chunk_ids"]} if h.get("row_group_exact_chunk_ids") else {})}
                     for h in valid_es_hits]
         else:
             try:
@@ -1220,13 +1333,19 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         rag_slot_index: dict[str, int] = {}  # doc_id -> template 内の予約位置（代表ヒットの位置）
         template_scores: list = []  # template と同じ並びの点数（呼び出しの記録だけが使う・結果には出さない）
         template_ranks: list = []  # template と同じ並びの元の順位（同上）
+        template_span_start: list = []  # template と同じ並びの本文の先頭行番号（ripgrep_search の一致行の復元に使う）
         for h, hit_rank in zip(hits, hit_ranks):
             docs.add(h["doc_id"])
-            redacted_text = _redact(h["text"])
+            redact_hit = _redact_keep_lines if name == "ripgrep_search" else _redact
+            redacted_text = redact_hit(h["text"])
             quote = redacted_text[:500]  # citation の quote（出典カードの表示用）だけ固定上限・LLM 向け本文は切らない
+            if name == "ripgrep_search" and q_hit and q_hit.lower() not in quote.lower() and q_hit.lower() in redacted_text.lower():
+                # 先頭 500 文字に一致行が無い節は、見出し行＋一致行の前後を抜粋にする
+                quote = grep_tool.clip_hit_text(redacted_text, q_hit, h.get("line"), _QUOTE_MAX_BYTES,
+                                                span_start=(h.get("span") or [None])[0])[:500]
             # rag_chunks 由来（locator あり）は位置ヒントを LLM への text にだけ添える（citation の quote は hint 抜き）。hint は本文と結合してから redaction を通す
             hint = citations.locator_hint(h.get("locator"))
-            text_for_llm = _redact(f"{h['text']}（位置: {hint}）") if hint else redacted_text
+            text_for_llm = redact_hit(f"{h['text']}（位置: {hint}）") if hint else redacted_text
             # 引用（cites）は tier に関わらず子チャンク単位のまま（親返しで粒度を落とさない）
             cites.append(citations.from_grep_hit(h, quote=quote, include_match=False))  # match 無し・整形は citations に集約
             if parent_return_on and h.get("chunk_id"):
@@ -1236,6 +1355,13 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 }
                 if h.get("keyword_match") is not None:
                     rag_item["keyword_match"] = h["keyword_match"]
+                if h.get("matched_fields"):
+                    rag_item["matched_fields"] = h["matched_fields"]
+                if h.get("row_group_chunk_ids"):
+                    rag_item["row_group_chunk_ids"] = h["row_group_chunk_ids"]
+                    rag_item["hint"] = hint
+                if h.get("row_group_exact_chunk_ids"):  # exact で当たった束の行（束の中のどの行の識別子で当たったか）
+                    rag_item["row_group_exact_chunk_ids"] = h["row_group_exact_chunk_ids"]
                 rag_groups.setdefault(h["doc_id"], []).append(rag_item)
                 if h["doc_id"] not in rag_slot_index:
                     # 最初に出現した位置＝その doc の最高スコア。2 件目以降は予約済みの枠へ集約するだけ
@@ -1243,10 +1369,13 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                     template.append(("rag", h["doc_id"]))
                     template_scores.append(h.get("score"))
                     template_ranks.append(hit_rank)
+                    template_span_start.append(None)
                 continue
             hit_view = {"doc_id": h["doc_id"], "line": h["line"], "text": text_for_llm}
             if h.get("keyword_match") is not None:
                 hit_view["keyword_match"] = h["keyword_match"]
+            if h.get("matched_fields"):
+                hit_view["matched_fields"] = h["matched_fields"]
             # grep ヒットが持つ登録者重要度（`grep_search` が条件付きで付ける）を LLM 向け tool result にも転送する（重要文書を優先して精読できるように）。理由が無ければキーを作らない
             if h.get("importance"):
                 hit_view["importance"] = h["importance"]
@@ -1265,20 +1394,24 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             template.append(("legacy", hit_view))
             template_scores.append(h.get("score"))
             template_ranks.append(hit_rank)
+            template_span_start.append((h.get("span") or [None])[0])
 
         # ② per_hit を割り当てて `view` を組み立て、直列化後の実バイト数で収まりを保証する
         def _build_view(per_hit: int) -> dict:
             out = []
             any_clipped = False
             legacy_bytes = 0
-            for kind, payload in template:
+            for (kind, payload), span_start in zip(template, template_span_start):
                 if kind == "rag":
                     out.append(None)  # 集約結果が確定するまでの予約枠
                     continue
                 hv = dict(payload)  # per_hit ごとに作り直す（元の template は不変に保つ）
-                clipped_text = _clip_utf8_bytes(hv["text"], per_hit)
+                if name == "ripgrep_search":
+                    # 一致行を落とさない: 見出し行＋一致行の前後を残し、離れた箇所は省略の印でつなぐ
+                    clipped_text = grep_tool.clip_hit_text(hv["text"], q_hit, hv.get("line"), per_hit, span_start=span_start)
+                else:
+                    clipped_text = _clip_utf8_bytes(hv["text"], per_hit)
                 if clipped_text != hv["text"]:
-                    # 末尾だけを切る（MD ヒットの見出し行は section 本文の先頭行のため失われない）
                     hv["text"] = clipped_text
                     hv["text_truncated"] = True
                     any_clipped = True
@@ -1322,7 +1455,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 view["text_truncated"] = True
             return view
 
-        per_hit = max(_HIT_TEXT_MIN_BYTES, tr_max_bytes // max(1, used_max_hits))
+        per_hit = max(_HIT_TEXT_MIN_BYTES, tr_max_bytes // max(1, len(hits)))  # 実際に返すヒット数で割る
         view = _build_view(per_hit)
         # `per_hit` は text だけの割当てで、付帯情報と JSON 構造分を数えていない。直列化後の実バイト数が `tr_max_bytes` を超えたら、`per_hit` を詰めて再構築する（最大 4 回・下限 `_HIT_TEXT_MIN_BYTES`）。
         # 超過のまま外側の `mcp_server._clip_tool_result` に任せると `next_offset` 等の構造が失われるため。それでも収まらない極端なケースだけ外側のクリップ（fail-open）に委ねる

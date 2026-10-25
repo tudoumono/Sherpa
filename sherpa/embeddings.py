@@ -454,21 +454,27 @@ def _parse_openai_embeddings(r, n: int) -> list | None:
         return None
 
 
-def _embed_batch(texts: list, c: dict) -> list | None:
-    """1 バッチ分の送信＋429/5xx・一時的通信エラーの再送（`Retry-After` 優先・無ければ指数バックオフ・最大 `_RETRY_MAX_RETRIES` 回・合計 `_RETRY_MAX_TOTAL_SECONDS` 秒で打ち切り None）。"""
+def _embed_batch(texts: list, c: dict, deadline: float | None = None) -> list | None:
+    """1 バッチ分の送信＋429/5xx・一時的通信エラーの再送（`Retry-After` 優先・無ければ指数バックオフ・最大 `_RETRY_MAX_RETRIES` 回・合計 `_RETRY_MAX_TOTAL_SECONDS` 秒で打ち切り None）。
+    `deadline`（`time.monotonic()` の絶対時刻・省略可）を渡すと、合計の打ち切りをそれより早め、初回を含む各送信の応答待ちも残り時間で切る（検索の質問用）。省略時の動作は変えない。
+    """
     from . import metering
     start = time.monotonic()
+    give_up_at = start + _RETRY_MAX_TOTAL_SECONDS if deadline is None else min(start + _RETRY_MAX_TOTAL_SECONDS, deadline)
     retries = 0
     while True:
         # 合計上限は HTTP の応答待ちも含めて守る（再送時は残り時間を timeout の上限にする）
         timeout = _TIMEOUT
-        if retries:
-            remaining = _RETRY_MAX_TOTAL_SECONDS - (time.monotonic() - start)
+        if retries or deadline is not None:
+            remaining = give_up_at - time.monotonic()
             if remaining < 1:
                 return None  # 1 秒未満では送らない
             timeout = min(_TIMEOUT, int(remaining))
         try:
-            return _embed_batch_once(texts, c, timeout)
+            got = _embed_batch_once(texts, c, timeout)
+            if deadline is not None and time.monotonic() > deadline:
+                return None  # 期限を過ぎて届いた応答は使わない（検索は全文検索で続ける）
+            return got
         except Exception as exc:
             # 失敗した試行も物理送信として数える（トークンは不明なので `acc_add(None)`）。送信前ガードの拒否は送っていないので数えない
             if not isinstance(exc, llm.PreflightRejected):
@@ -479,7 +485,7 @@ def _embed_batch(texts: list, c: dict) -> list | None:
             wait = _retry_after_seconds(exc)
             if wait is None:
                 wait = _RETRY_BACKOFF_SCHEDULE[min(retries, len(_RETRY_BACKOFF_SCHEDULE) - 1)]
-            if time.monotonic() - start + wait > _RETRY_MAX_TOTAL_SECONDS:
+            if time.monotonic() + wait > give_up_at:
                 _log_embed_failure(c, exc)
                 return None
             retries += 1
@@ -491,16 +497,17 @@ def _embed_batch(texts: list, c: dict) -> list | None:
             _sleep(wait)
 
 
-def _embed_batch_worker(batch: list, c: dict) -> tuple[list | None, dict | None, int]:
+def _embed_batch_worker(batch: list, c: dict, deadline: float | None = None) -> tuple[list | None, dict | None, int]:
     """スレッドプールのワーカー本体。`metering` の積み上げはスレッド専有のため、ワーカー自身で 1 バッチ分を閉じ、`(vectors, tokens, calls)` で主スレッドへ返す。"""
     from . import metering
     metering.acc_begin()
-    vecs = _embed_batch(batch, c)
+    vecs = _embed_batch(batch, c) if deadline is None else _embed_batch(batch, c, deadline)
     tokens, calls = metering.acc_end()
     return vecs, tokens, calls
 
 
-def _embed_batches_parallel(batches: list[tuple[list, list]], c: dict, parallel: int) -> list[list] | None:
+def _embed_batches_parallel(batches: list[tuple[list, list]], c: dict, parallel: int,
+                            deadline: float | None = None) -> list[list] | None:
     """有界スレッドプールで複数バッチを並列送信する（`origins` による順序復元は呼び出し元）。
     一部でも失敗したら None。早期打ち切り時も、走り始めたバッチは完了を待つ（未着手だけ cancel）。
     ワーカーは `contextvars.copy_context().run()` で起動する（`llm.no_proxy_requests()` を伝播させるため）。
@@ -524,7 +531,7 @@ def _embed_batches_parallel(batches: list[tuple[list, list]], c: dict, parallel:
     try:
         for index, (_origins, batch) in enumerate(batches):
             ctx = contextvars.copy_context()
-            future = executor.submit(ctx.run, _embed_batch_worker, batch, c)
+            future = executor.submit(ctx.run, _embed_batch_worker, batch, c, *(() if deadline is None else (deadline,)))
             future_to_index[future] = index
         for future in concurrent.futures.as_completed(future_to_index):
             index = future_to_index[future]
@@ -551,9 +558,11 @@ def _embed_batches_parallel(batches: list[tuple[list, list]], c: dict, parallel:
     return None if failed else results
 
 
-def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None = None) -> list | None:
+def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None = None,
+          deadline_s: float | None = None) -> list | None:
     """テキスト群 → ベクトル群（順序対応）。一部でも失敗したら None（ベクトル無効＝BM25 へ）。
     バッチループ全体を `metering.acc_begin()`／`acc_end()` で囲み、`kind='embed'` で 1 呼び出し 1 行記録する。
+    `deadline_s`（省略可）: 呼び出し全体の総期限（秒）。通信の応答待ちと再送をこの残り時間で打ち切り、間に合わなければ None。取り込みは渡さない。
     """
     if not isinstance(c, dict) or not texts or not isinstance(texts, list) or any(not isinstance(text, str) for text in texts):
         return None
@@ -562,6 +571,7 @@ def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None
     if not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0 or not isinstance(provider, str):
         return None
     from . import metering
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
     metering.acc_begin()
     try:
         grouped: list[list[list]] = [[] for _text in texts]
@@ -573,7 +583,7 @@ def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None
         if not isinstance(parallel, int) or isinstance(parallel, bool) or parallel < 1:
             parallel = 1
         if len(batches) >= 2 and parallel > 1:
-            results = _embed_batches_parallel(batches, c, parallel)
+            results = _embed_batches_parallel(batches, c, parallel) if deadline is None else _embed_batches_parallel(batches, c, parallel, deadline)
             if results is None:
                 return None
             for (origins, _batch), vecs in zip(batches, results):
@@ -583,7 +593,7 @@ def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None
                     grouped[origin].append(vector)
         else:
             for origins, batch in batches:
-                vecs = _embed_batch(batch, c)
+                vecs = _embed_batch(batch, c) if deadline is None else _embed_batch(batch, c, deadline)
                 if not isinstance(vecs, list) or len(vecs) != len(batch):
                     return None
                 for origin, vector in zip(origins, vecs):

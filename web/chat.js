@@ -10,7 +10,7 @@
 // scope.js/menus.js は toast/updateShareButtonState をこのファイルから相対 import する（関数宣言＝hoisted のため、循環 import でも実行時に呼ぶ限り安全）。
 import { S, EXAMPLES } from './chat/state.js';
 import { openShareDialog } from './chat/share-dialog.js';
-import { welcome, initRefGraph, deriveTraceStopReason } from './chat/render.js';
+import { welcome, deriveTraceStopReason } from './chat/render.js';
 import {
   loadConversations, deleteConversation, togglePin, renameConversation,
   newConversation, openConversation, resumeRunningTurn, forkConversation, syncConvParam,
@@ -26,7 +26,7 @@ const $ = Sherpa.$, esc = Sherpa.esc;   // 共通ユーティリティ（nav.js�
 
 // ===== 委譲 =====
 // 影響一覧の行展開/折りたたみ（行全体が role=button・aria-expanded で開閉）。
-// セレクタは .ilist 内の data-toggle に限定（refgraph-h の data-rg とは別ハンドラ）。
+// セレクタは .ilist 内の data-toggle に限定。
 $('messages').addEventListener('click', async (e) => {
   const tg = e.target.closest('.ilist [data-toggle]');
   if (tg) {
@@ -110,26 +110,13 @@ $('messages').addEventListener('click', (e) => {
   $('input').focus();
   $('input').setSelectionRange(0, $('input').value.length);   // 置き換え対象を選択状態に
 });
-// 引用（該当箇所）カードの折りたたみ（refgraph と同じ見出しボタン開閉パターン）。
+// 引用（該当箇所）カードの折りたたみ。
 $('messages').addEventListener('click', (e) => {
   const h = e.target.closest('[data-cites]'); if (!h) return;
   const body = h.parentNode.querySelector('.cites-body');
   const open = !body.hidden;
   body.hidden = open; h.querySelector('.caret').textContent = open ? '▾' : '▴';
   h.setAttribute('aria-expanded', open ? 'false' : 'true');
-});
-// 参照したナレッジグラフの折りたたみ（開いた時だけ cytoscape を遅延 init）
-$('messages').addEventListener('click', (e) => {
-  const rg = e.target.closest('[data-rg]'); if (!rg) return;
-  const body = rg.parentNode.querySelector('.refgraph-body');
-  const open = !body.hidden;
-  body.hidden = open; rg.querySelector('.caret').textContent = open ? '▾' : '▴';
-  if (!open && !body._cy) {
-    body.innerHTML = '<div class="rg-canvas"></div>';
-    try { body._cy = initRefGraph(body.querySelector('.rg-canvas'), JSON.parse(rg.dataset.rg)); }
-    catch (err) { body.innerHTML = '<div class="muted" style="padding:10px">グラフを表示できませんでした</div>'; }
-    setTimeout(() => { if (body._cy) { body._cy.resize(); body._cy.fit(undefined, 16); } }, 40);
-  }
 });
 // 回答フィードバック（👍/👎＋定型タグ/一言）。👍は即送信・👎はタグ/一言のポップを開閉する。
 // 送信は所有会話のみ許可（サーバ側 403）＝共有された会話を開いている場合はエラー toast にする。
@@ -491,9 +478,6 @@ $('version').addEventListener('change', () => {
   S.scope = []; S.scopeTree = null; S.scopeLabels = {}; S.currentScopeMeta = null;
   loadScopes();
 });
-// グラフからの「この語で影響を調べる」を受け取って入力に流し込む
-const _ask = localStorage.getItem('sherpa-ask');
-if (_ask) { localStorage.removeItem('sherpa-ask'); $('input').value = _ask; $('input').focus(); }
 
 // ===== テスト専用 seam =====
 // e2e（Playwright）が chat.js の内部変数・関数へ触れる唯一の入口。module スコープの内部は外から見えないため、window に明示公開する。

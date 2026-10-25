@@ -1138,10 +1138,11 @@ class IngestPreviewRelation(BaseModel):
 
 
 class IngestPreviewCounts(BaseModel):
-    entities: int
-    relations: int
-    deprecated: int
-    hidden: int
+    """件数。グラフを組み立てないとき（`graph_note` あり）は取り込みの記録から出し、記録が無いもの・内訳は None（不明）。"""
+    entities: int | None
+    relations: int | None
+    deprecated: int | None
+    hidden: int | None
     documents: int
 
 
@@ -1164,6 +1165,7 @@ class IngestPreviewResponse(BaseModel):
     entities: list[IngestPreviewEntity]
     relations: list[IngestPreviewRelation]
     importance_diagnostics: list[ImportanceDiagnostic]
+    graph_note: str | None = None
 
 
 class IngestBlockedDoc(BaseModel):
@@ -1176,6 +1178,20 @@ class IngestNotice(BaseModel):
     """`ingest_notices` の要素。取り込みで黙って落とした・粗くしたものの種類（`code`）と件数（`count`）。`count` は数えられない種類では 1。"""
     code: str
     count: int
+
+
+class IngestActionAvailability(BaseModel):
+    """取り込み画面の操作可否。`reason` は操作できないときに画面へそのまま出す平文。"""
+    allowed: bool
+    reason: str | None = None
+
+
+class IngestCompletedCounts(BaseModel):
+    """最後に最後まで終わった取り込みに対応する件数の集計。`as_of` 時点の値であり、現在値ではない。"""
+    as_of: str
+    scanned: int
+    indexed: int
+    office_failed: int
 
 
 class RunProgress(BaseModel):
@@ -1199,7 +1215,7 @@ class IngestSummaryFields(BaseModel):
     """資料フォルダの取り込み状況（スキャン結果のキャッシュ＋グラフ/ES 件数・最終実行状態）。
 
     `scanned`〜`unreadable` は sync 完走時と `POST /worlds/{wid}/recount` のときだけ更新されるキャッシュで、このエンドポイント自身はフォルダを歩かない。
-    `counts_as_of` はそのキャッシュの記録時刻（`None`＝未集計）。`sensitive_excluded`/`unreachable_as_text`/`unreachable_as_text_by_ext`/
+    `counts_as_of` はそのキャッシュの記録時刻（`None`＝件数未確認）。`sensitive_excluded`/`unreachable_as_text`/`unreachable_as_text_by_ext`/
     `unreachable_by_reason`（`"encoding_undetermined"`/`"binary"`）/`encoding_partial_count`（一部が化けている件数）も同じキャッシュ由来。
     `failed_files`/`partial_extraction_suspected`/`stage_summary` は最新 run の由来（無ければ `None`）。
     `failure_reason_catalog`/`partial_extraction_advice` は閉じた理由語彙の平文辞書。
@@ -1207,6 +1223,9 @@ class IngestSummaryFields(BaseModel):
     `ingest_notices`＝黙って落とした・粗くしたものの `{code, count}`（走査・関係グラフ・全文索引の各段から導出・名前は持たない。無ければ空）。
     `last_run_warnings`/`last_run_blocked` は flags を打ち切って導出したもの（`last_run_flags_total`=打切り前の総数・`last_run_flags_truncated`=打切りの有無）。
     `last_run_id`/`running_progress` は最新 run の id と実行中進捗（実行中でなければ `running_progress` は `None`）。
+    `last_completed_at` は最新の正常終了 run の時刻、`last_completed_counts` は別途記録された集計時点の件数。
+    `last_failure_retrying`＝直前の失敗の知らせを、今の取り込みの実行中も出し続けている間だけ true（今の run が正常終了すると消える）。
+    `actions` は背景受付と同じ queued/extracting 条件から返す操作可否で、画面は独自判定しない。
     """
     scanned: int
     indexed: int
@@ -1240,6 +1259,12 @@ class IngestSummaryFields(BaseModel):
     last_run_blocked: list[IngestBlockedDoc]
     last_run_flags_total: int
     last_run_flags_truncated: bool
+    last_completed_at: str | None
+    last_completed_counts: IngestCompletedCounts | None
+    last_failure_message: str | None
+    last_failure_retrying: bool = False
+    ingest_active: bool
+    actions: dict[str, IngestActionAvailability]
     failed_files: dict[str, Any] | None
     partial_extraction_suspected: dict[str, Any] | None
     stage_summary: dict[str, Any] | None
@@ -1304,87 +1329,9 @@ class WorldIngestAcceptedResponse(BaseModel):
 
 
 class WorldRecountResponse(IngestSummaryFields):
-    """再集計（POST /worlds/{wid}/recount）。スキャンを明示的に再実行してキャッシュし直し、取り込み状況をフラットに展開して返す（同期）。"""
+    """件数の数え直し（POST /worlds/{wid}/recount）。資料を明示的に数えて記録を更新し、取り込み状況をフラットに展開して返す（同期）。"""
     ok: bool
     world_id: str
-
-
-# ===== ナレッジグラフ（sherpa/routers/graph.py） =====
-
-class GraphNode(BaseModel):
-    """グラフのノード（GET /graph の nodes）。"""
-    id: str
-    name: str | None
-    type: str | None
-    type_ja: str | None
-    status: str
-    value: Any
-    top_scope: str | None
-    path: str | None
-
-
-class GraphEdge(BaseModel):
-    """グラフのエッジ（GET /graph の edges）。"""
-    source: str
-    target: str
-    type: str
-    status: str
-
-
-class GraphCounts(BaseModel):
-    """グラフの件数。"""
-    entities: int
-    relations: int
-    deprecated: int
-    hidden: int
-    documents: int
-
-
-class GraphResponse(BaseModel):
-    """グラフ全体（GET /graph）。"""
-    world: str
-    nodes: list[GraphNode]
-    edges: list[GraphEdge]
-    counts: GraphCounts
-    total_nodes: int
-    total_edges: int
-    truncated: bool
-
-
-class GraphFacetsResponse(BaseModel):
-    """グラフの絞り込み候補（GET /graph/facets）。"""
-    node_labels: list[str]
-    node_labels_ja: dict[str, str]
-    relationship_types: list[str]
-    condition_fields: list[str]
-
-
-class GraphSearchNode(BaseModel):
-    """検索結果のノード（GET /graph/search。`GraphNode` と別形で phase/category を持つ）。"""
-    id: str
-    name: str | None
-    type: str | None
-    type_ja: str | None
-    status: str
-    value: Any
-    top_scope: str | None
-    phase: str | None
-    category: str | None
-    path: str | None
-
-
-class GraphSearchCounts(BaseModel):
-    """検索結果の件数（`{"nodes":.., "edges":..}`・`GraphCounts` と別形）。"""
-    nodes: int
-    edges: int
-
-
-class GraphSearchResponse(BaseModel):
-    """グラフ検索の結果（GET /graph/search）。"""
-    world: str
-    nodes: list[GraphSearchNode]
-    edges: list[GraphEdge]
-    counts: GraphSearchCounts
 
 
 # ===== 範囲（sherpa/routers/impact.py::scopes） =====
