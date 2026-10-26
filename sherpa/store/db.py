@@ -978,6 +978,26 @@ def _connect(**kw):
     return psycopg.connect(_dsn(), row_factory=dict_row, **kw)
 
 
+def _connect_bounded(connect_timeout: float | None = None, statement_timeout_ms: int | None = None):
+    """読み取り1回ごとに閉じる専用接続（プールを使わない）。
+    どちらも None ならプールの `_connect()`。打ち切りはサーバー側の `statement_timeout` に任せ、クライアント側から例外を投げて接続を中断しない（中断した接続をプールへ戻すと次の問い合わせが壊れる）。
+    """
+    if connect_timeout is None and statement_timeout_ms is None:
+        return _connect()
+    kw: dict = {}
+    if connect_timeout is not None:
+        kw["connect_timeout"] = max(1, math.ceil(connect_timeout))
+    if statement_timeout_ms is not None:
+        kw["options"] = f"-c statement_timeout={int(statement_timeout_ms)}"
+    return psycopg.connect(_dsn(), row_factory=dict_row, **kw)
+
+
+def _ensure_unless_bounded(connect_timeout: float | None, statement_timeout_ms: int | None) -> None:
+    """上限付きの読み取り（状態コマンド）はスキーマ初期化を走らせない（schema の lock と DDL は上限の外で待つため）。引数なしの従来の呼び出しは `_ensure()`。"""
+    if connect_timeout is None and statement_timeout_ms is None:
+        _ensure()
+
+
 def _world_lock_key(world_id) -> int:
     """`world_lock`/`world_lock_shared` 共通のキー導出（同じ world_id は同じ鍵になる）。"""
     return int.from_bytes(hashlib.sha1(f"{_KB_ID}:{world_id}".encode("utf-8")).digest()[:8],

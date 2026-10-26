@@ -103,29 +103,34 @@ def _completed_at_from(runs):
                  and r.get("published_at") is not None), None)
 
 
+def _brief(run):
+    """run の行を、store の `get_last_finished_run_brief` が返す形にする。"""
+    return {"status": run["status"], "created_at": run["created_at"], "snapshot": run.get("extraction_snapshot")}
+
+
+def _patch_reads(module, monkeypatch, *, worlds, latest=None, finished=None, completed_at=None, ocr=None):
+    monkeypatch.setattr(module.store, "list_worlds_db", lambda **_k: worlds)
+    monkeypatch.setattr(module.ingest_store, "get_latest_run_progress", lambda *_a, **_k: latest)
+    monkeypatch.setattr(module.ingest_store, "get_last_finished_run_brief", lambda *_a, **_k: finished)
+    monkeypatch.setattr(module.ingest_store, "get_latest_completed_run_at", lambda *_a, **_k: completed_at)
+    monkeypatch.setattr(module.ocr_jobs, "get_progress_counts", lambda *_a, **_k: ocr or {
+        "pending": 0, "processed": 0, "failed": 0, "unpublished": 0,
+    })
+
+
 def test_ingest_status_prints_one_folder_from_read_boundaries(monkeypatch, capsys):
     module = _ingest_status_module()
     now = datetime.now(UTC)
-    monkeypatch.setattr(module.store, "list_worlds_db", lambda: [
-        {"world_id": "sample", "label": "共有資料", "last_sig": "a" * 64},
-    ])
-    monkeypatch.setattr(module.ingest_store, "get_latest_run_summary", lambda *_a, **_k: {
-        "status": "extracting", "created_at": now - timedelta(seconds=65),
-        "progress": {"stage_label": "全文検索へ反映中"},
-    })
-    runs = [
-        {"status": "extracting", "created_at": now - timedelta(seconds=65), "published_at": None},
-        {"status": "failed", "created_at": now - timedelta(days=1), "published_at": None,
-         "extraction_snapshot": {"flags": [{"reason": "es_index_failed:bulk_failed"}]}},
-        {"status": "auto_published", "created_at": now - timedelta(days=3),
-         "published_at": now - timedelta(days=2)},
-    ]
-    monkeypatch.setattr(module.ingest_store, "list_ingest_runs", lambda *_a, **_k: runs)
-    monkeypatch.setattr(module.ingest_store, "get_latest_completed_run_at", lambda *_a: _completed_at_from(runs))
-    monkeypatch.setattr(module.ocr_jobs, "status_summary", lambda *_a: {
-        "pending": 2, "processed": 3, "failed": 1,
-    })
-    monkeypatch.setattr(module.ocr_jobs, "generation_state", lambda *_a: {"unpublished_jobs": 4})
+    _patch_reads(
+        module, monkeypatch,
+        worlds=[{"world_id": "sample", "label": "共有資料", "last_sig": "a" * 64}],
+        latest={"status": "extracting", "created_at": now - timedelta(seconds=65),
+                "progress": {"stage_label": "全文検索へ反映中"}},
+        finished=_brief({"status": "failed", "created_at": now - timedelta(days=1),
+                         "extraction_snapshot": {"flags": [{"reason": "es_index_failed:bulk_failed"}]}}),
+        completed_at=now - timedelta(days=2),
+        ocr={"pending": 2, "processed": 3, "failed": 1, "unpublished": 4},
+    )
 
     assert module.main() == 0
     output = capsys.readouterr().out
@@ -137,15 +142,14 @@ def test_ingest_status_prints_one_folder_from_read_boundaries(monkeypatch, capsy
 
 
 def _print_status_for_runs(module, monkeypatch, capsys, runs, *, last_sig="a" * 64, completed_at=None):
-    monkeypatch.setattr(module.store, "list_worlds_db", lambda: [
-        {"world_id": "sample", "label": "sample", "last_sig": last_sig},
-    ])
-    monkeypatch.setattr(module.ingest_store, "get_latest_run_summary", lambda *_a, **_k: runs[0] if runs else None)
-    monkeypatch.setattr(module.ingest_store, "list_ingest_runs", lambda *_a, **_k: runs)
-    monkeypatch.setattr(module.ingest_store, "get_latest_completed_run_at",
-                        lambda *_a: completed_at if completed_at is not None else _completed_at_from(runs))
-    monkeypatch.setattr(module.ocr_jobs, "status_summary", lambda *_a: {})
-    monkeypatch.setattr(module.ocr_jobs, "generation_state", lambda *_a: {})
+    finished = next((run for run in runs if run.get("status") not in ("queued", "extracting")), None)
+    _patch_reads(
+        module, monkeypatch,
+        worlds=[{"world_id": "sample", "label": "sample", "last_sig": last_sig}],
+        latest=runs[0] if runs else None,
+        finished=_brief(finished) if finished else None,
+        completed_at=completed_at if completed_at is not None else _completed_at_from(runs),
+    )
     assert module.main() == 0
     return capsys.readouterr().out
 
@@ -198,32 +202,56 @@ def test_ingest_status_queries_ocr_by_generation_id(monkeypatch, capsys):
     signature = "world-signature-not-a-generation-id"
     expected = module.derived_generation.generation_id_for(signature)
     seen = []
-    monkeypatch.setattr(module.store, "list_worlds_db", lambda: [
-        {"world_id": "sample", "label": "sample", "last_sig": signature},
-    ])
-    monkeypatch.setattr(module.ingest_store, "get_latest_run_summary", lambda *_a, **_k: None)
-    monkeypatch.setattr(module.ingest_store, "list_ingest_runs", lambda *_a, **_k: [])
-    monkeypatch.setattr(module.ingest_store, "get_latest_completed_run_at", lambda *_a: None)
-    monkeypatch.setattr(module.ocr_jobs, "status_summary", lambda *a: seen.append(a) or {"pending": 1})
-    monkeypatch.setattr(module.ocr_jobs, "generation_state", lambda *a: seen.append(a) or {"unpublished_jobs": 2})
+    _patch_reads(module, monkeypatch, worlds=[{"world_id": "sample", "label": "sample", "last_sig": signature}])
+    monkeypatch.setattr(module.ocr_jobs, "get_progress_counts", lambda *a, **_k: seen.append(a) or {
+        "pending": 1, "processed": 0, "failed": 0, "unpublished": 2,
+    })
     assert module.main() == 0
     output = capsys.readouterr().out
-    assert seen == [("sample", expected), ("sample", expected)]
+    assert seen == [("sample", expected)]
     assert "待ち 1件／" in output and "公開待ち 2件" in output
 
 
 def test_ingest_status_handles_no_folders_and_database_failure(monkeypatch, capsys):
     module = _ingest_status_module()
-    monkeypatch.setattr(module.store, "list_worlds_db", list)
+    monkeypatch.setattr(module.store, "list_worlds_db", lambda **_k: [])
     assert module.main() == 0
     assert capsys.readouterr().out == "取り込みの状態\n資料フォルダはありません。\n"
 
-    def unavailable():
+    def unavailable(**_k):
         raise OSError("unreachable")
 
     monkeypatch.setattr(module.store, "list_worlds_db", unavailable)
     assert module.main() == 0
     assert capsys.readouterr().out == "データベースに届きません\n"
+
+    def timed_out(**_k):
+        raise module.pg_errors.QueryCanceled("canceled")
+
+    monkeypatch.setattr(module.store, "list_worlds_db", timed_out)
+    assert module.main() == 0
+    assert capsys.readouterr().out == "データベースに届きません\n"
+
+
+def test_ingest_status_classified_reasons_match_failure_reasons():
+    module = _ingest_status_module()
+    for raw in module._CLASSIFIED_REASONS:
+        known = module.failure_reasons.describe(raw)["code"] != "other"
+        assert known or raw in ("world_not_found", "world_dir_unreachable"), raw
+        assert module._reason_text({"flags": [{"reason": raw}]}) != "詳しい理由はログを確認してください", raw
+    for prefix in module._CLASSIFIED_PREFIXES:
+        assert module._reason_text({"flags": [{"reason": prefix + ":x"}]}) != "詳しい理由はログを確認してください"
+
+
+def test_ingest_status_read_timeout_follows_environment(monkeypatch):
+    module = _ingest_status_module()
+    monkeypatch.delenv("SHERPA_INGEST_STATUS_TIMEOUT_SEC", raising=False)
+    assert module._read_timeout_ms() == 10000
+    monkeypatch.setenv("SHERPA_INGEST_STATUS_TIMEOUT_SEC", "2.5")
+    assert module._read_timeout_ms() == 2500
+    for broken in ("abc", "0", "-3"):
+        monkeypatch.setenv("SHERPA_INGEST_STATUS_TIMEOUT_SEC", broken)
+        assert module._read_timeout_ms() == 10000
 
 
 def test_makefile_exposes_both_status_commands():

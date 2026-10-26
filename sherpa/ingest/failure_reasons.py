@@ -145,3 +145,9 @@ def describe(raw_reason: str | None) -> dict[str, str]:
     code = classify(raw_reason)
     info = REASON_CATALOG[code]
     return {"code": code, "label": info["label"], "advice": info["advice"], "detail": raw_reason or ""}
+
+
+def known_reasons() -> frozenset[str]:
+    """`classify` が `other` 以外にする生 reason の全体（完全一致）。"""
+    return _PASSTHROUGH | _WRITE_FAILED_ALIASES | frozenset(
+        f"document_ir_failed:{detail}" for detail in _DOCUMENT_IR_KNOWN_DETAILS)

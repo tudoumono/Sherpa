@@ -8,7 +8,7 @@ import time
 
 from psycopg.types.json import Json
 
-from .db import _KB_ID, _connect, _ensure
+from .db import _KB_ID, _connect, _connect_bounded, _ensure, _ensure_unless_bounded
 from .failed_docs import replace_failed_docs_in
 
 
@@ -328,6 +328,57 @@ def get_latest_terminal_run_failure(world, flags_limit: int) -> dict | None:
     return {"id": row["id"], "status": row["status"], "flags_head": row["flags_head"]}
 
 
+def get_latest_run_progress(world, *, connect_timeout: float | None = None,
+                            statement_timeout_ms: int | None = None) -> dict | None:
+    """最新 run（成否問わず）1件の `status`/`progress`/`created_at` だけを引く（状態コマンド専用・`extraction_snapshot` と `source_doc_ids` を読まない）。
+    `connect_timeout`/`statement_timeout_ms` は `get_latest_completed_run_at` と同じ方式。
+    """
+    _ensure_unless_bounded(connect_timeout, statement_timeout_ms)
+    with _connect_bounded(connect_timeout, statement_timeout_ms) as c:
+        return c.execute(
+            "SELECT status, progress, created_at FROM ingest_runs "
+            "WHERE kb_id=%s AND version=%s ORDER BY id DESC LIMIT 1", (_KB_ID, world)).fetchone()
+
+
+def get_last_finished_run_brief(world, classified_reasons=(), classified_prefixes=(), *,
+                                connect_timeout: float | None = None,
+                                statement_timeout_ms: int | None = None) -> dict | None:
+    """実行中・待機中を除く最新 run の `status`/`created_at` と、失敗の理由の判定に要る値だけを引く（状態コマンド専用）。
+    `status='failed'` のときだけ `snapshot` を持つ（`stop_reason`/`interrupted`/`flags`）。`flags` は全件を走査したうえで、`classified_reasons`（完全一致）か `classified_prefixes`（前方一致）に当たる最初の reason、無ければ最初の reason を1つだけ `{"reason": …}` で返す（reason が無ければ空）。
+    スナップショットがオブジェクトでなければ `snapshot` は None、`flags` が配列でなければ `snapshot` に `flags` キーを持たない。数万件の flags と `source_doc_ids` は Python へ持ち込まない。
+    """
+    _ensure_unless_bounded(connect_timeout, statement_timeout_ms)
+    with _connect_bounded(connect_timeout, statement_timeout_ms) as c:
+        row = c.execute(
+            "WITH r AS (SELECT status, created_at, "
+            "  CASE WHEN status='failed' AND jsonb_typeof(extraction_snapshot)='object' "
+            "       THEN extraction_snapshot END AS es "
+            "  FROM ingest_runs WHERE kb_id=%s AND version=%s AND status NOT IN ('queued','extracting') "
+            "  ORDER BY id DESC LIMIT 1), "
+            "fl AS (SELECT t.f->>'reason' AS reason, t.o FROM r, "
+            "  jsonb_array_elements(CASE WHEN jsonb_typeof(r.es->'flags')='array' "
+            "                       THEN r.es->'flags' ELSE '[]'::jsonb END) WITH ORDINALITY AS t(f, o) "
+            "  WHERE jsonb_typeof(t.f)='object' AND jsonb_typeof(t.f->'reason')='string') "
+            "SELECT r.status, r.created_at, r.es IS NOT NULL AS has_snapshot, "
+            "  r.es->'stop_reason' AS stop_reason, r.es->'interrupted' AS interrupted, "
+            "  COALESCE(jsonb_typeof(r.es->'flags')='array', false) AS has_flags, "
+            "  (SELECT reason FROM fl WHERE reason = ANY(%s::text[]) "
+            "     OR EXISTS (SELECT 1 FROM unnest(%s::text[]) AS p WHERE starts_with(fl.reason, p)) "
+            "   ORDER BY o LIMIT 1) AS classified_reason, "
+            "  (SELECT reason FROM fl ORDER BY o LIMIT 1) AS first_reason "
+            "FROM r",
+            (_KB_ID, world, list(classified_reasons), list(classified_prefixes))).fetchone()
+    if row is None:
+        return None
+    snapshot = None
+    if row["has_snapshot"]:
+        snapshot = {"stop_reason": row["stop_reason"], "interrupted": row["interrupted"]}
+        if row["has_flags"]:
+            reason = row["classified_reason"] if row["classified_reason"] is not None else row["first_reason"]
+            snapshot["flags"] = [] if reason is None else [{"reason": reason}]
+    return {"status": row["status"], "created_at": row["created_at"], "snapshot": snapshot}
+
+
 def get_latest_published_run_summary(world) -> dict | None:
     """最新の反映済み（`published_at IS NOT NULL`）run 1件の `published_snapshot` の `nodes`/`edges` と `created_at`。graph（Neo4j）件数専用で、ES は `get_latest_es_run_summary` を使う。
     直近の run が失敗していても Neo4j は直前の成功時点のままなので、これが現在の Neo4j の内容に最も近い。ES 段に触れていない run も拾いうるため ES 件数には流用しない。
@@ -346,10 +397,13 @@ def get_latest_published_run_summary(world) -> dict | None:
             "created_at": row["created_at"]}
 
 
-def get_latest_completed_run_at(world):
-    """正常終了（`auto_published`/`auto_published_with_flags`）で反映した最新 run の `published_at`。無ければ None。"""
-    _ensure()
-    with _connect() as c:
+def get_latest_completed_run_at(world, *, connect_timeout: float | None = None,
+                                statement_timeout_ms: int | None = None):
+    """正常終了（`auto_published`/`auto_published_with_flags`）で反映した最新 run の `published_at`。無ければ None。
+    `connect_timeout`/`statement_timeout_ms` を渡すと、プールを使わない専用接続で読み、サーバー側の `statement_timeout` で打ち切る。
+    """
+    _ensure_unless_bounded(connect_timeout, statement_timeout_ms)
+    with _connect_bounded(connect_timeout, statement_timeout_ms) as c:
         row = c.execute(
             "SELECT published_at FROM ingest_runs "
             "WHERE kb_id=%s AND version=%s AND status IN ('auto_published','auto_published_with_flags') "

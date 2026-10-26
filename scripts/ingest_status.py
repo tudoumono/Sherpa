@@ -3,59 +3,52 @@
 from __future__ import annotations
 
 import os
-import signal
 from collections.abc import Callable
-from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
+
+from psycopg import errors as pg_errors
 
 from sherpa import store
 from sherpa.ingest import derived_generation, failure_reasons
 from sherpa.store import ingest as ingest_store
 from sherpa.store import ocr_jobs
 
-_QUERY_TIMEOUT_SEC = 3
-_IN_FLIGHT_STATUSES = ("queued", "extracting")
+_CONNECT_TIMEOUT_SEC = 3.0
+_DEFAULT_READ_TIMEOUT_SEC = 10.0
+_UNREAD_TEXT = "時間内に読めませんでした"
 
 
-@contextmanager
-def _database_timeouts():
-    """このコマンドの問い合わせだけに短い上限を付ける。"""
-    values = {
-        "PGCONNECT_TIMEOUT": "2",
-        "PGOPTIONS": "-c statement_timeout=2000",
-        "SHERPA_PG_POOL_TIMEOUT": "2",
-    }
-    previous = {name: os.environ.get(name) for name in values}
-    os.environ.update(values)
-    try:
-        yield
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+class _Unread:
+    """時間内に読めなかった欄の印。"""
 
 
-class _QueryTimeout(TimeoutError):
+_UNREAD = _Unread()
+
+
+class _Unreachable(Exception):
     pass
 
 
-def _timed_read(reader: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """1回の読み取りを短い時間で打ち切る。"""
-    previous = signal.getsignal(signal.SIGALRM)
-
-    def _expired(_signum: int, _frame: Any) -> None:
-        raise _QueryTimeout
-
-    signal.signal(signal.SIGALRM, _expired)
-    signal.setitimer(signal.ITIMER_REAL, _QUERY_TIMEOUT_SEC)
+def _read_timeout_ms() -> int:
+    """読み取り1回の上限（ミリ秒）。サーバー側の statement_timeout に渡す。"""
     try:
-        return reader(*args, **kwargs)
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
+        seconds = float(os.environ.get("SHERPA_INGEST_STATUS_TIMEOUT_SEC", ""))
+    except ValueError:
+        seconds = 0.0
+    if seconds <= 0:
+        seconds = _DEFAULT_READ_TIMEOUT_SEC
+    return max(1, int(seconds * 1000))
+
+
+def _bounded_read(reader: Callable[..., Any], *args: Any) -> Any:
+    """専用接続で1回読む。時間切れなら `_UNREAD`、接続できないなどは `_Unreachable`。"""
+    try:
+        return reader(*args, connect_timeout=_CONNECT_TIMEOUT_SEC, statement_timeout_ms=_read_timeout_ms())
+    except pg_errors.QueryCanceled:
+        return _UNREAD
+    except Exception as exc:  # noqa: BLE001 - DB例外の種類にかかわらず「届かない」として扱う。
+        raise _Unreachable from exc
 
 
 def _time_text(value: Any) -> str:
@@ -77,6 +70,11 @@ def _elapsed_text(started: Any) -> str:
     if minutes:
         return f"{minutes}分{seconds}秒"
     return f"{seconds}秒"
+
+
+_CLASSIFIED_PREFIXES = ("es_index_failed", "graph_reflect_failed", "pg_replace_failed", "rebind_")
+_CLASSIFIED_REASONS = tuple(sorted(
+    failure_reasons.known_reasons() | {"world_not_found", "world_dir_unreachable"}))
 
 
 def _reason_text(snapshot: Any) -> str:
@@ -137,45 +135,39 @@ def _folder_name(row: dict[str, Any]) -> str:
 
 def _read_folder(row: dict[str, Any]) -> dict[str, Any]:
     world_id = str(row["world_id"])
-    latest = _timed_read(
-        ingest_store.get_latest_run_summary, world_id,
-        connect_timeout=2.0, statement_timeout_ms=2000,
-    )
-    runs = _timed_read(
-        ingest_store.list_ingest_runs, world_id, 50,
-        connect_timeout=2.0, statement_timeout_ms=2000,
-    )
-    completed_at = _timed_read(ingest_store.get_latest_completed_run_at, world_id)
-    last_finished = next((run for run in runs if run.get("status") not in _IN_FLIGHT_STATUSES), None)
-    failed = last_finished if (last_finished or {}).get("status") == "failed" else None
+    completed_at = _bounded_read(ingest_store.get_latest_completed_run_at, world_id)
+    latest = _bounded_read(ingest_store.get_latest_run_progress, world_id)
+    finished = _bounded_read(
+        ingest_store.get_last_finished_run_brief, world_id, _CLASSIFIED_REASONS, _CLASSIFIED_PREFIXES)
 
     signature = str(row.get("last_sig") or "").strip()
     generation = derived_generation.generation_id_for(signature) if signature else None
-    ocr = _timed_read(ocr_jobs.status_summary, world_id, generation)
-    publication_wait = 0
-    if generation is not None:
-        generation_status = _timed_read(ocr_jobs.generation_state, world_id, generation)
-        publication_wait = int(generation_status.get("unpublished_jobs") or 0)
+    ocr = _bounded_read(ocr_jobs.get_progress_counts, world_id, generation)
+
+    failed_at: Any = None
+    failed_reason: str | None = None
+    if finished is not _UNREAD and finished is not None and finished.get("status") == "failed":
+        failed_at = finished.get("created_at")
+        failed_reason = _reason_text(finished.get("snapshot"))
 
     return {
         "name": _folder_name(row),
         "published_at": completed_at,
-        "current": _current_text(latest),
-        "failed_at": (failed or {}).get("created_at"),
-        "failed_reason": _reason_text((failed or {}).get("extraction_snapshot")) if failed else None,
-        "ocr_pending": int(ocr.get("pending") or 0),
-        "ocr_processed": int(ocr.get("processed") or 0),
-        "ocr_failed": int(ocr.get("failed") or 0),
-        "ocr_publication_wait": publication_wait,
+        "current": _UNREAD_TEXT if latest is _UNREAD else _current_text(latest),
+        "failed_unread": finished is _UNREAD,
+        "failed_at": failed_at,
+        "failed_reason": failed_reason,
+        "ocr": ocr,
     }
 
 
 def main() -> int:
     try:
-        with _database_timeouts():
-            rows = _timed_read(store.list_worlds_db)
-            folders = [_read_folder(row) for row in rows]
-    except Exception:  # noqa: BLE001 - DB例外の種類にかかわらず状態表示を最後まで返す。
+        rows = _bounded_read(store.list_worlds_db)
+        if rows is _UNREAD:
+            raise _Unreachable
+        folders = [_read_folder(row) for row in rows]
+    except _Unreachable:
         print("データベースに届きません")
         return 0
 
@@ -187,19 +179,26 @@ def main() -> int:
         if index:
             print()
         print(f"資料フォルダ: {folder['name']}")
-        print(f"  最後まで終わった取り込み: {_time_text(folder['published_at'])}")
+        published = folder["published_at"]
+        print(f"  最後まで終わった取り込み: {_UNREAD_TEXT if published is _UNREAD else _time_text(published)}")
         print(f"  今の取り込み: {folder['current']}")
-        if folder["failed_reason"] is None:
+        if folder["failed_unread"]:
+            print(f"  前回の失敗: {_UNREAD_TEXT}")
+        elif folder["failed_reason"] is None:
             print("  前回の失敗: なし")
         else:
             print(f"  前回の失敗: {_time_text(folder['failed_at'])}／{folder['failed_reason']}")
-        print(
-            "  画像内文字の読み取り: "
-            f"待ち {folder['ocr_pending']}件／"
-            f"読み取り済み {folder['ocr_processed']}件／"
-            f"失敗 {folder['ocr_failed']}件／"
-            f"公開待ち {folder['ocr_publication_wait']}件"
-        )
+        ocr = folder["ocr"]
+        if ocr is _UNREAD:
+            print(f"  画像内文字の読み取り: {_UNREAD_TEXT}")
+        else:
+            print(
+                "  画像内文字の読み取り: "
+                f"待ち {ocr['pending']}件／"
+                f"読み取り済み {ocr['processed']}件／"
+                f"失敗 {ocr['failed']}件／"
+                f"公開待ち {ocr['unpublished']}件"
+            )
     return 0
 
 
