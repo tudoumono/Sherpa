@@ -250,12 +250,13 @@ def _bare_name(candidates: list, world: str) -> str | None:
 
 
 def _name_index(world: str, scope_paths, layer) -> dict[str, list[str]]:
-    """許可された範囲（scope_paths・層）にある非秘匿の資料の、ファイル名 → rel_path 一覧。範囲外の資料は入れない。"""
+    """許可された範囲（scope_paths・層）にある非秘匿の資料の、ファイル名 → rel_path 一覧。範囲外の資料は入れない。
+    資料の一覧は取り込みの台帳から出し、台帳が無いときだけ資料フォルダを（期限つきで）歩く。"""
     from ... import documents, layer as layer_mod, scope as scope_mod
     from ...ingest import text_kind
 
     try:
-        rels = documents.world_rel_set(world)
+        rels = documents.known_rels(world)
     except Exception:
         return {}
     index: dict[str, list[str]] = {}

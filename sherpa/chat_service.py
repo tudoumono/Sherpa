@@ -561,13 +561,13 @@ def _resolve_scope(message, world, scope_paths, layer=None, lens_source="auto", 
 
 def _es_hits(world, query, sp, k=8, redact=False, layer=None):
     """ES（BM25）上位ヒットを、現 world に実在する doc だけに絞って返す。BM25 のみ（`vector=False`・クエリ埋め込みコストを避ける）。
-    現 world の実在集合は 1 回だけ作る（古い ES 索引由来のリンクを出さない）。`layer`（省略可）は qa 補完のときだけ渡す（troubleshoot 補完は渡さない）。
+    実在はヒットした doc だけを 1 回で確かめる（資料フォルダの木は歩かない。古い ES 索引由来のリンクを出さない）。`layer`（省略可）は qa 補完のときだけ渡す（troubleshoot 補完は渡さない）。
     """
     try:
         from . import documents, es_index
-        valid = documents.world_rel_set(world)
         # `es_index.search()` は (hits, reason)。BM25 実クエリ失敗はこの経路に degraded 報告の仕組みが無いため捨てる（構造化された degraded 集計は `fused_search._search_keyword()`）。
         hits, _reason = es_index.search(world, query, scope_paths=sp, k=k, vector=False, layer=layer)
+        valid = documents.existing_rels(world, [h.get("doc_id") for h in hits])
     except Exception:
         return []
     out = []

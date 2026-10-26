@@ -164,12 +164,12 @@ def test_byte_vector_knn_roundtrip():
 def test_qa_merge_brings_in_es():
     """Codex/非agentic も ES を参照できる＝qa の facts(citations) に ES ヒットが統合される（stub・重複排除）。"""
     from sherpa import chat_service, documents, es_index
-    o_s, o_r = es_index.search, documents.world_rel_set
+    o_s, o_r = es_index.search, documents.existing_rels
     # RV2（FBK-1・2026-09-01）: `es_index.search()` は (hits, degrade_reason) を返す。
     es_index.search = lambda world, q, scope_paths=None, k=8, vector=True, layer=None, **kw: ([
         {"doc_id": "案件/x.md", "line": 3, "text": "ES固有ヒット", "ext": ".md"},
         {"doc_id": "案件/dup.md", "line": 1, "text": "重複", "ext": ".md"}], None)
-    documents.world_rel_set = lambda world=None, **kw: {"案件/x.md", "案件/dup.md"}      # 実在チェックを通す（stub）
+    documents.existing_rels = lambda world, rels, **kw: {r for r in rels if r in {"案件/x.md", "案件/dup.md"}}      # 実在チェックを通す（stub）
     try:
         base = {"citations": [{"doc_id": "案件/dup.md", "span": [1, 1], "quote": "grep"}]}
         merged = chat_service._merge_qa_with_es(base, V, "クエリ", None)
@@ -177,7 +177,7 @@ def test_qa_merge_brings_in_es():
         assert "案件/x.md" in docs                       # ES 固有ヒットが入る
         assert docs.count("案件/dup.md") == 1           # doc_id+span で重複排除
     finally:
-        es_index.search, documents.world_rel_set = o_s, o_r
+        es_index.search, documents.existing_rels = o_s, o_r
 
 
 def test_delete_missing_is_ok():

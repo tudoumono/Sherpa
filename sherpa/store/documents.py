@@ -68,6 +68,14 @@ def list_documents(world) -> list:
             "FROM documents WHERE kb_id=%s AND version=%s ORDER BY name", (_KB_ID, world)).fetchall()
 
 
+def list_document_names(world) -> list:
+    """world の文書台帳の `name` だけ（`name` 昇順・範囲の選択肢や実在の判定が使う）。"""
+    _ensure()
+    with _connect() as c:
+        return [r["name"] for r in c.execute(
+            "SELECT name FROM documents WHERE kb_id=%s AND version=%s ORDER BY name", (_KB_ID, world)).fetchall()]
+
+
 def document_exists(world, name) -> bool:
     """world の文書台帳に `name`（正準表記）が完全一致で存在するか。原本DL の別名拒否に使う。"""
     _ensure()

@@ -263,9 +263,10 @@ def _scope_kinds_cache_key(world: str, scope_paths, layer) -> tuple:
 def _scope_evidence_kinds(world: str, scope_paths, layer, *,
                           deadline: float | None = None) -> tuple[set, set] | None:
     """このターンの範囲に実在する根拠種別と、そのうち探す対象（層）で読める種別の2つ組 `(範囲内, 層内)`。
-    範囲は world root の実ファイル走査（`scope_infer.safe_files`）と同じ範囲・層フィルタで列挙する（台帳は Office 原本を派生MDが無いと載せないため使わない）。
-    走査失敗・期限超過は `None`（判定不能として必須種別を落とさない）。結果は `(world, 範囲, 層)` 単位で `_SCOPE_KINDS_CACHE_SECONDS` 秒だけ保持する。
+    文書は取り込みの台帳から列挙する（資料フォルダは歩かない。派生MDの無い Office 原本は台帳に載らない＝検索・精読できないので数えない）。
+    台帳が空・読めないときだけ `scope_infer.safe_files` で歩く。走査失敗・期限超過は `None`（判定不能として必須種別を落とさない）。結果は `(world, 範囲, 層)` 単位で `_SCOPE_KINDS_CACHE_SECONDS` 秒だけ保持する。
     """
+    from .. import doc_ledger
     from .. import investigation_state as _inv
     from .. import scope as scope_mod
     from .. import scope_infer as si
@@ -280,24 +281,27 @@ def _scope_evidence_kinds(world: str, scope_paths, layer, *,
             _hit = None
     if _hit is not None:
         return _hit[1]
-    if deadline is None:
-        deadline = time.monotonic() + _SCOPE_KINDS_WALK_SECONDS
-    wd = worlds.world_dir(world)
-    if not wd:
-        _log.warning("範囲内の根拠種別を判定できませんでした（world root 不明・必須種別はそのまま適用します）")
-        return None
-    try:
-        entries = list(si.safe_files(wd, deadline=deadline, also=worlds.archives_dir(world)))
-    except Exception:
-        _log.warning("範囲内の根拠種別を判定できませんでした（必須種別はそのまま適用します）",
-                     exc_info=True)
-        return None
-    if not entries:
-        # 0 件は root 解決失敗・マウント切断でも起こるため、必須種別を全部「該当なし」へ倒さない。
-        _log.warning("範囲内の文書を1件も列挙できませんでした（必須種別はそのまま適用します）")
-        return None
+    rels = doc_ledger.ledger_rels(world)  # 取り込みの台帳があれば資料フォルダは歩かない
+    if rels is None:
+        if deadline is None:
+            deadline = time.monotonic() + _SCOPE_KINDS_WALK_SECONDS
+        wd = worlds.world_dir(world)
+        if not wd:
+            _log.warning("範囲内の根拠種別を判定できませんでした（world root 不明・必須種別はそのまま適用します）")
+            return None
+        try:
+            entries = list(si.safe_files(wd, deadline=deadline, also=worlds.archives_dir(world)))
+        except Exception:
+            _log.warning("範囲内の根拠種別を判定できませんでした（必須種別はそのまま適用します）",
+                         exc_info=True)
+            return None
+        if not entries:
+            # 0 件は root 解決失敗・マウント切断でも起こるため、必須種別を全部「該当なし」へ倒さない。
+            _log.warning("範囲内の文書を1件も列挙できませんでした（必須種別はそのまま適用します）")
+            return None
+        rels = [rel for _rp, rel in entries]
     in_scope, in_layer = set(), set()
-    for _rp, rel in entries:
+    for rel in rels:
         if importance.is_importance_control_path(rel):  # 重要度設定ファイルは文書ではない（検索・精読も除外する）
             continue
         if text_kind.is_sensitive_doc_id(rel):  # 秘匿名: 根拠種別の判定対象に含めない

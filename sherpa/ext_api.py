@@ -1140,6 +1140,8 @@ def ext_search(req: ExtSearchReq, request: Request, key: dict = Depends(require_
             res = fused_search.search(req.world, req.query, engines=req.engines, k=req.k,
                                         scope_paths=req.scope_paths, weights=req.weights,
                                         depth=req.depth, root=root, strict=True, layer=req.layer, **extra)
+        except scope_infer.ScopeWalkDeadlineExceeded:
+            raise HTTPException(503, "資料フォルダの一覧を時間内に取得できませんでした。取り込みが終わってから、もう一度お試しください") from None
         except OSError as e:
             raise HTTPException(
                 503, "資料フォルダの走査中にエラーが発生しました（一時的な障害の可能性があります）") from e
@@ -1340,6 +1342,8 @@ def ext_codex_job_submit(req: ExtCodexJobSubmitReq, request: Request,
         try:
             if not scope_mod.valid_scope_paths(req.world, req.scope_paths, root=root, strict=True):
                 raise HTTPException(422, "不明な範囲（scope_paths）が指定されました")
+        except scope_infer.ScopeWalkDeadlineExceeded:
+            raise HTTPException(503, "資料フォルダの一覧を時間内に取得できませんでした。取り込みが終わってから、もう一度お試しください") from None
         except OSError as e:
             raise HTTPException(
                 503, "資料フォルダの走査中にエラーが発生しました（一時的な障害の可能性があります）") from e

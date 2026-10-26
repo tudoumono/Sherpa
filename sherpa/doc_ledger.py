@@ -102,6 +102,22 @@ def listing_documents(world: str, *, deadline: float | None = None) -> Listing:
     return Listing(documents_for(world, deadline=deadline), None)
 
 
+def ledger_rels(world: str) -> list | None:
+    """台帳の文書名（rel_path・`name` 昇順）。秘匿名・重要度の設定ファイルは除く。
+    資料フォルダは歩かない。台帳が空・読めない・rebind／削除の待ちが上限を超えたときは None（呼び出し元が歩く経路へ戻す）。
+    """
+    try:
+        with store.world_swap_lock_shared(world, timeout_ms=SWAP_LOCK_WAIT_MS):
+            names = store.list_document_names(world)
+    except Exception as e:
+        _log.warning("ledger_rels: world=%s 台帳を読めないため資料フォルダを歩きます: %s", world, e)
+        return None
+    if not names:
+        return None
+    return [n for n in names
+            if not text_kind.is_sensitive_doc_id(n) and not importance.is_importance_control_path(n)]
+
+
 def _importance_fields(rel: str, res_map: dict) -> dict:
     """`importance`／`importance_reason`／`importance_source` を値があれば返す（無ければ空 dict）。"""
     res = res_map.get(rel)
@@ -113,20 +129,21 @@ def _importance_fields(rel: str, res_map: dict) -> dict:
     return out
 
 
-def public_documents(world: str) -> list:
+def public_documents(world: str, *, deadline: float | None = None) -> list:
     """API／画面向けの文書一覧（物理パスは出さない）。`status` は `documents_for()` の `state` をそのまま通す。
-    重要度（値・理由・由来）はあれば付ける。
+    重要度（値・理由・由来）はあれば付ける。`deadline` を超えて歩き終えないときは `scope_infer.ScopeWalkDeadlineExceeded`。
     """
-    # 文書列挙と重要度解決は同一 root から行う（root 未解決なら空を返す）
+    # 文書列挙と重要度解決は同一 root・同一の列挙結果から行う（root 未解決なら空を返す）
     wd = worlds.world_dir(world)
     if not wd:
         return []
-    res_map = importance.resolve_for_world(world, root=wd)
+    files = list(si.safe_files(wd, deadline=deadline, also=worlds.archives_dir(world)))
+    res_map = importance.resolve_for_world(world, root=wd, files=files)
     return [{"name": r["name"], "top_scope": r.get("top_scope"), "phase": r.get("phase"),
              "category": r.get("category"), "doctype": r.get("doctype"),
              "branch": r.get("branch"), "status": r.get("state", "ready"),
              **_importance_fields(r["name"], res_map)}
-            for r in documents_for(world, root=wd)]
+            for r in documents_for(world, root=wd, files=files)]
 
 
 # 台帳の `status` を `public_documents()` の表示語彙へ合わせる（`indexed`→`ready`）
@@ -176,7 +193,7 @@ def public_documents_page(world: str, *, limit: int | None, offset: int = 0) -> 
     `limit=None` は全件、指定時のみ LIMIT/OFFSET。台帳に行があれば台帳だけを読み（フォルダは歩かない）、
     COUNT とページは 1 つの読み取りトランザクションで同じ世代に固定する（取り込みの最中も待たない）。
     rebind／削除の最中だけ `world_swap_lock_shared` で待ち、上限（`SWAP_LOCK_WAIT_MS`）を超えたら `LockNotAvailable`。
-    台帳が空なら `public_documents`（実走査）へ縮退してメモリ上でスライスする。
+    台帳が空なら `public_documents`（実走査・期限つき）へ縮退してメモリ上でスライスする。期限を超えたら `scope_infer.ScopeWalkDeadlineExceeded`。
     """
     with store.world_swap_lock_shared(world, timeout_ms=SWAP_LOCK_WAIT_MS):
         total, rows = store.count_and_list_documents(world, limit=limit, offset=offset)
@@ -186,7 +203,7 @@ def public_documents_page(world: str, *, limit: int | None, offset: int = 0) -> 
             rows = [r for r in rows if not text_kind.is_sensitive_doc_id(r["name"])]
             docs = [_ledger_row_to_public(r) for r in rows]
             return docs, (len(docs) if limit is None else total)
-    all_docs = public_documents(world)
+    all_docs = public_documents(world, deadline=si.user_op_deadline())
     if limit is None:
         return all_docs, len(all_docs)
     return all_docs[offset:offset + limit], len(all_docs)

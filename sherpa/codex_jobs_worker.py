@@ -18,6 +18,7 @@ import time
 
 from . import agentic_search, chat_service, chat_turns, store, worlds
 from . import scope as scope_mod
+from . import scope_infer
 from .agents import Ctx, CodexProvider, get_provider
 from .store import codex_jobs as store_jobs
 from .store import investigation_records as store_investigation
@@ -150,7 +151,7 @@ def _execute_job(job: dict, stop_event: threading.Event) -> None:
                 if not scope_mod.valid_scope_paths(job["world"], job["scope_paths"], root=root, strict=True):
                     store_jobs.mark_failed(job_id, error_code="codex_failed")
                     return
-            except OSError:
+            except (OSError, scope_infer.ScopeWalkDeadlineExceeded):
                 store_jobs.mark_failed(job_id, error_code="codex_failed")
                 return
             scope_meta = chat_service._resolve_scope(

@@ -57,9 +57,21 @@ def _listed_by_walk(root, rel: str) -> bool:
     return resolve_path(root, rel) is not None
 
 
-def existing_rels(world: str | None, rels, *, deadline: float | None = None) -> set:
+def known_rels(world: str, *, deadline: float | None = None) -> set:
+    """資料フォルダの文書名（rel_path）の集合。取り込みの台帳から出し（歩かない）、台帳が空・読めないときだけ `world_rel_set` で歩く。
+    歩くときの `deadline` は省略時に利用者の操作向けの短い期限を付ける（超過で `scope_infer.ScopeWalkDeadlineExceeded`）。
+    """
+    from . import doc_ledger
+    names = doc_ledger.ledger_rels(world)
+    if names is not None:
+        return set(names)
+    return world_rel_set(world, deadline=deadline if deadline is not None else scope_infer.user_op_deadline())
+
+
+def existing_rels(world: str | None, rels, *, deadline: float | None = None, root=None) -> set:
     """`rels` のうち資料フォルダ（とアーカイブ展開先）に実在するものの集合。`world_rel_set(world) & rels` と同じ結果を、木を全部歩かずに返す。
-    rel の形が不正で直接判定できないもの（`\\` を含む実ファイル名など）がある場合だけ、全走査の `world_rel_set` で確かめる。
+    rel の形が不正で直接判定できないもの（`\\` を含む実ファイル名など）がある場合だけ、全走査の `world_rel_set` で確かめる（`deadline` 省略時は短い期限を付ける）。
+    `root`: 解決済みの資料フォルダ root を渡すと `worlds.world_dir()` を呼び直さない。
     """
     if deadline is not None and time.monotonic() > deadline:
         raise scope_infer.ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
@@ -67,7 +79,7 @@ def existing_rels(world: str | None, rels, *, deadline: float | None = None) -> 
     if not rels:
         return set()
     world = world or worlds.default_world()
-    wd = worlds.world_dir(world)
+    wd = root if root is not None else worlds.world_dir(world)
     if not wd:
         return set()
     arch = worlds.archives_dir(world)
@@ -80,7 +92,7 @@ def existing_rels(world: str | None, rels, *, deadline: float | None = None) -> 
         elif _listed_by_walk(wd, rel) or _listed_by_walk(arch, rel):
             found.add(rel)
     if undecidable:
-        full = world_rel_set(world, deadline=deadline)
+        full = world_rel_set(world, root=wd, deadline=deadline if deadline is not None else scope_infer.user_op_deadline())
         found |= {r for r in rels if isinstance(r, str) and r in full}
     return found
 

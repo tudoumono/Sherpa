@@ -64,8 +64,8 @@ def search(world: str, query: str, engines=None, k: int = 10,
       失敗したエンジンは `coverage` を持たず、`degraded[].detail`（`timeout`・`row_cap` など）で理由を伝える。
       keyword／vector は ES の上位 `k` 件で、`k` を超える一致の件数が ES から返らないため `omitted` は null。
     - layer（`"docs"|"code"|"both"`・既定 both）: keyword／vector にのみ適用する。graph は言及エッジが木を跨ぐため非適用。
-    - root: 呼び出し側が解決済みの資料フォルダ root を渡すと、実在フィルタ（`documents.world_rel_set`）が再解決しない。
-    - strict: `root` 指定時のみ有効。`safe_files` の OSError を re-raise する（呼び出し側が 503 にする）。
+    - root: 呼び出し側が解決済みの資料フォルダ root を渡すと、実在フィルタ（`documents.existing_rels`）が再解決しない。
+    - strict: 受け取るだけで使わない（実在フィルタは木を歩かない）。
     - scope_paths は `scope_mod.normalize_scope_paths` で正規化（全エンジン共通のフォルダフィルタ）。
     - 資料フォルダ・範囲の妥当性検証は呼び出し側（ext_api）の責務。
     - 各エンジンは (hits, reason|None) を返す。reason ありなら degraded に積み、hits は空扱い。engines_used は degrade しなかったエンジン。
@@ -75,10 +75,8 @@ def search(world: str, query: str, engines=None, k: int = 10,
     sel = [e for e in ENGINES if e in set(engines or DEFAULT_ENGINES)]  # 正規化（決定的順序）
     sp = scope_mod.normalize_scope_paths(scope_paths)
     w = {e: float((weights or {}).get(e, 1.0)) for e in sel}
-    valid = (documents.world_rel_set(world, root=root, strict=strict) if root is not None
-             else documents.world_rel_set(world))
-    per_engine, degraded, coverage = {}, [], {}
     runners = {"keyword": _search_keyword, "vector": _search_vector, "graph": _search_graph}
+    raw = []  # (engine, hits, reason)
     for e in sel:
         # graph だけ depth（と、既定と違うときの include_presumed）を渡し、keyword／vector は layer を渡す
         if e == "graph":
@@ -88,6 +86,12 @@ def search(world: str, query: str, engines=None, k: int = 10,
             hits, reason = runners[e](world, query, sp, k, depth, **extra)
         else:
             hits, reason = runners[e](world, query, sp, k, settings, layer)
+        raw.append((e, hits, reason))
+    # 実在はヒットした doc だけを 1 回で確かめる（資料フォルダの木は歩かない）
+    ids = [h.get("doc_id") for _e, hits, reason in raw if not reason for h in _hits_to_filter(hits)]
+    valid = documents.existing_rels(world, ids, root=root)
+    per_engine, degraded, coverage = {}, [], {}
+    for e, hits, reason in raw:
         if reason:
             entry = {"engine": e, "reason": str(reason)}
             if getattr(reason, "detail", None):
@@ -134,6 +138,11 @@ def _engine_coverage(engine: str, k: int, returned: int, graph_info: "GraphHits 
     out["structural_count"] = graph_info.structural_count
     out["presumed_count"] = graph_info.presumed_count
     return out
+
+
+def _hits_to_filter(hits) -> list:
+    """実在フィルタにかけるヒット（graph は切る前の全件）。"""
+    return (hits.all_hits or list(hits)) if isinstance(hits, GraphHits) else list(hits)
 
 
 def _filter_existing(hits: list, valid: set) -> list:

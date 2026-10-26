@@ -1379,7 +1379,8 @@ def test_qa_headline_carries_truncation_note_on_zero_hits():
 def test_es_hits_excludes_sensitive_doc_ids(monkeypatch):
     from sherpa import documents as documents_mod
     from sherpa import es_index as es_index_mod
-    monkeypatch.setattr(documents_mod, "world_rel_set", lambda world: {"a/credentials.xlsx", "a/report.xlsx"})
+    monkeypatch.setattr(documents_mod, "existing_rels",
+                        lambda world, rels, **kw: {r for r in rels if r in {"a/credentials.xlsx", "a/report.xlsx"}})
     monkeypatch.setattr(es_index_mod, "search", lambda world, query, scope_paths=None, k=8, vector=False, layer=None: (
         [{"doc_id": "a/credentials.xlsx", "text": "secret"}, {"doc_id": "a/report.xlsx", "text": "ok"}], None))
     assert [h["doc_id"] for h in CS._es_hits("w", "q", None)] == ["a/report.xlsx"]

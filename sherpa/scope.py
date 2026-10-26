@@ -8,8 +8,9 @@ world のフォルダ階層そのものが範囲＝`scope_prefixes`（rel_path �
 from __future__ import annotations
 
 import re
+from pathlib import PurePosixPath
 
-from . import scope_infer, worlds
+from . import doc_ledger, scope_infer, worlds
 from .ingest import importance, text_kind
 from .ingest.analyzers import registry as _analyzer_registry
 
@@ -40,11 +41,18 @@ def normalize_scope_paths(scope_paths) -> list:
 def _content_rels(world: str, root=None, strict: bool = False, deadline: float | None = None):
     """world 内の本文ファイルの rel_path を列挙する（範囲ツリー・既知 prefix の元）。
 
-    `root` を渡すと再解決しない。`strict`/`deadline` は `scope_infer.safe_files` へ渡す（OSError の re-raise／木走査の打ち切り）。
+    取り込みの台帳（`documents` の name）があればそれだけから出し、資料フォルダは歩かない（`root`／`strict`／`deadline` は使わない）。
+    台帳が空・読めないときだけ `scope_infer.safe_files` で歩く。`root` を渡すと再解決しない。`strict`／`deadline` は `safe_files` へ渡す
+    （OSError の re-raise／木走査の打ち切り）。`deadline` 省略時は利用者の操作向けの短い期限を付ける（超過で `ScopeWalkDeadlineExceeded`）。
     """
+    names = doc_ledger.ledger_rels(world)
+    if names is not None:
+        return [rel for rel in names if PurePosixPath(rel).suffix.lower() in _CONTENT_EXT]
     wd = root if root is not None else worlds.world_dir(world)
     if not wd:
         return []
+    if deadline is None:
+        deadline = scope_infer.user_op_deadline()
     also = worlds.archives_dir(world)  # アーカイブの展開先も範囲ツリーの対象にする
     return [rel for rp, rel in scope_infer.safe_files(wd, strict=strict, deadline=deadline, also=also)
            if rp.suffix.lower() in _CONTENT_EXT and not importance.is_importance_control_path(rel)]
@@ -87,16 +95,14 @@ def _leaf_token(path: str) -> str:
 
 
 def scope_tree(world: str) -> dict:
-    """範囲セレクタ用ツリー。world のフォルダ prefix（祖先込み・件数・見出し）を返す。画面は選んだ `path` を `scope_paths` として送る。"""
+    """範囲セレクタ用ツリー。world のフォルダ prefix（祖先込み・件数・見出し）を返す。画面は選んだ `path` を `scope_paths` として送る。
+    台帳があれば台帳から出す（`_content_rels`）。台帳が無く歩くときの期限超過は `scope_infer.ScopeWalkDeadlineExceeded`。"""
     rels = _content_rels(world)
-    prefixes = set()
+    counts: dict = {}
     for rel in rels:
-        prefixes.update(scope_infer.ancestor_scopes(rel))  # 祖先 prefix
-    counts = {p: 0 for p in prefixes}
-    for rel in rels:
-        for p in prefixes:
-            if rel == p or rel.startswith(p + "/"):
-                counts[p] += 1
+        for p in scope_infer.ancestor_scopes(rel):  # 祖先 prefix ごとに配下の件数を数える
+            counts[p] = counts.get(p, 0) + 1
+    prefixes = counts.keys()
     scopes = [{"path": p, "label": _leaf_token(p) or p, "depth": p.count("/"), "count": counts[p]}
               for p in sorted(prefixes)]
     return {"world": world, "label": worlds.world_label(world), "scopes": scopes}

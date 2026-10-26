@@ -16,6 +16,14 @@ class ScopeWalkDeadlineExceeded(Exception):
     """`safe_files(deadline=...)` が走査中に期限を超えたことを示す。"""
 
 
+USER_OP_WALK_SECONDS = 10.0  # 利用者の操作の中で、台帳が使えず資料フォルダを歩くときに許す秒数
+
+
+def user_op_deadline() -> float:
+    """利用者の操作の中の走査に付ける期限（`time.monotonic()` 系の絶対時刻）。"""
+    return time.monotonic() + USER_OP_WALK_SECONDS
+
+
 _DEADLINE_CHECK_ENTRIES = 256  # ディレクトリ内エントリ処理中に期限を再確認する間隔
 
 

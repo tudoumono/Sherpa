@@ -124,6 +124,7 @@ list_api_keys
 list_audit
 list_claimants_of_extracting_runs
 list_conversations
+list_document_names
 list_document_worlds
 list_documents
 list_documents_page

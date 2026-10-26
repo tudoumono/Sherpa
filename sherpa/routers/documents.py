@@ -15,9 +15,9 @@ from pathlib import Path
 import psycopg
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from sherpa import doc_ledger, safe_open, store, worlds
+from sherpa import doc_ledger, safe_open, scope_infer, store, worlds
 from sherpa import scope as scope_mod
-from sherpa.deps import _DEFAULT_WORLD, _WORLD_PATTERN, _current_user, _require_admin, _resolve_world, validated_scope
+from sherpa.deps import SCOPE_WALK_TIMEOUT_MESSAGE, _DEFAULT_WORLD, _WORLD_PATTERN, _current_user, _require_admin, _resolve_world, validated_scope
 from sherpa.fd_response import FdFileResponse, FdOwner, content_disposition
 from sherpa.ingest import text_kind
 
@@ -104,7 +104,7 @@ def documents_list(request: Request, world: str | None = Query(None, pattern=_WO
                    limit: int | None = Query(None, ge=1, le=1000), offset: int = Query(0, ge=0)):
     """文書台帳（doc_id＝rel_path＋フォルダ由来の範囲メタ）を返す。物理パスは出さない。
     ページング（`limit`/`offset`・上限 1000）は明示指定したときだけ有効で、省略時は全件を返す。応答の `world`/`documents` はそのままで、`total`/`has_more` を常に追加し、`limit`/`offset` を指定したときだけその実効値も追加する。
-    取り込み済みの文書台帳から返す。台帳が空の world だけはフォルダを走査して返す。
+    取り込み済みの文書台帳から返す。台帳が空の world だけはフォルダを（期限つきで）走査して返し、期限を超えたら 503。
     """
     _current_user(request)  # ログイン必須（auth 有効時）。
     w = _resolve_world(world)
@@ -112,6 +112,8 @@ def documents_list(request: Request, world: str | None = Query(None, pattern=_WO
         docs, total = doc_ledger.public_documents_page(w, limit=limit, offset=offset)
     except psycopg.errors.LockNotAvailable:
         raise HTTPException(503, _SWAP_BUSY_MESSAGE)
+    except scope_infer.ScopeWalkDeadlineExceeded:
+        raise HTTPException(503, SCOPE_WALK_TIMEOUT_MESSAGE) from None
     body = {"world": w, "documents": docs, "total": total, "has_more": offset + len(docs) < total}
     if limit is not None:
         body["limit"], body["offset"] = limit, offset
@@ -129,10 +131,13 @@ def _admin_es_search_endpoint(request: Request,
     _require_admin(_current_user(request))
     w = _resolve_world(world)
     sp = validated_scope(w, scope_paths) or None
-    valid = documents.world_rel_set(w)
     hits = []
     # `es_index.search()` は (hits, reason) のタプルを返す。この読み取り専用検索には degraded 報告が無いため BM25 失敗（es_query_failed）の reason は捨てる（構造化された degraded 集計が要る呼び出し元は `fused_search._search_keyword()`）。
     es_hits, _reason = es_index.search(w, query, scope_paths=sp, k=k, vector=False)
+    try:
+        valid = documents.existing_rels(w, [h.get("doc_id") for h in es_hits])  # 実在はヒットした doc だけを確かめる（木は歩かない）
+    except scope_infer.ScopeWalkDeadlineExceeded:
+        raise HTTPException(503, SCOPE_WALK_TIMEOUT_MESSAGE) from None
     for h in es_hits:
         doc = h.get("doc_id")
         if not doc or doc not in valid or not scope_mod.in_scope(doc, sp):

@@ -424,7 +424,7 @@ def test_search_degraded_all_engines_down(monkeypatch):
 
 
 def test_search_filters_nonexistent_docs(monkeypatch):
-    """削除直後の窓で ES 索引に古いまま残る doc_id は返さない（`documents.world_rel_set` の実在フィルタ）。"""
+    """削除直後の窓で ES 索引に古いまま残る doc_id は返さない（`documents.existing_rels` の実在フィルタ）。"""
     def _hit(rel):
         return {"key": rel, "doc_id": rel, "path": rel, "line": 1, "snippet": "s",
                 "engine_score": 1.0, "judgement": None, "paths": None}
@@ -432,8 +432,8 @@ def test_search_filters_nonexistent_docs(monkeypatch):
     monkeypatch.setattr(fused_search, "_search_keyword",
                         lambda world, query, sp, k, settings, layer=None: (
                             [_hit("real.md"), _hit("deleted.md")], None))
-    monkeypatch.setattr(documents, "world_rel_set",
-                        lambda world=None, root=None, strict=False, **kw: {"real.md"})
+    monkeypatch.setattr(documents, "existing_rels",
+                        lambda world, rels, **kw: {r for r in rels if r in {"real.md"}})
 
     r = _search({"world": "v1", "query": "x", "engines": ["keyword"]}, _key("realfilter")["key"])
     assert r.status_code == 200, r.text
@@ -460,7 +460,7 @@ def test_search_audit_written():
 
 def _stub_engines(monkeypatch, graph_result, keyword_docs=()):
     """keyword は固定ヒット、graph は `run_impact` 相当の結果を実の `_graph_hits` で変換する（ES/Neo4j は使わない）。"""
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, root=None, strict=False, **kw: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     monkeypatch.setattr(fused_search, "_search_keyword",
                         lambda world, query, sp, k, settings, layer=None: ([
                             {"key": d, "doc_id": d, "path": d, "line": 1, "snippet": "s",
@@ -473,11 +473,6 @@ def _stub_engines(monkeypatch, graph_result, keyword_docs=()):
 
     monkeypatch.setattr(fused_search, "_search_graph", _graph)
     return seen
-
-
-class _AllDocs:
-    def __contains__(self, item):
-        return True
 
 
 _GRAPH_RESULT = {
@@ -510,7 +505,7 @@ def test_search_coverage_shape_and_graph_origin(monkeypatch):
 def test_search_overload_is_degraded_detail_without_coverage(monkeypatch):
     from sherpa.ingest.world_neo4j import GraphQueryOverloadError
 
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, root=None, strict=False, **kw: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
 
     @contextmanager
     def _session():

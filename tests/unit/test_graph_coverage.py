@@ -262,13 +262,8 @@ def _kw(doc):
             "judgement": None, "paths": None}
 
 
-class _AllDocs:
-    def __contains__(self, item):
-        return True
-
-
 def _search(monkeypatch, graph_result, k, keyword_docs=(), **kw):
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kwa: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     monkeypatch.setattr(ss, "_search_keyword",
                         lambda w, q, sp, kk, s, layer=None: ([_kw(d) for d in keyword_docs], None))
     monkeypatch.setattr(ss, "_search_graph",
@@ -316,7 +311,7 @@ def test_overload_is_a_degraded_detail_not_a_coverage(monkeypatch, exc, detail):
 
     monkeypatch.setattr(ss, "_neo4j_session", _session)
     monkeypatch.setattr(ss, "run_impact", _boom)
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     res = ss.search("w", "q", engines=["graph"], k=3)
     assert res["degraded"] == [{"engine": "graph", "reason": "graph_query_failed", "detail": detail}]
     assert "graph" not in res["coverage"] and res["engines_used"] == []
@@ -333,7 +328,7 @@ def test_include_presumed_false_reaches_run_impact_only_when_changed(monkeypatch
     monkeypatch.setattr(ss, "_neo4j_session", _session)
     monkeypatch.setattr(ss, "run_impact", lambda s, q, w, scope_prefixes=None, depth=10, **kw: seen.append(kw) or
                         {"items": [], "presumed": []})
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     ss.search("w", "q", engines=["graph"])
     ss.search("w", "q", engines=["graph"], include_presumed=False)
     assert seen == [{"flow_depth": 0}, {"flow_depth": 0, "include_presumed": False}]
@@ -446,7 +441,8 @@ def test_graph_neighbors_clip_below_required_fields_keeps_minimal_or_errors(monk
 
 
 def test_stale_graph_hits_are_not_counted_in_omitted_or_origin_counts(monkeypatch):
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: {"s0.cbl", "s2.cbl", "p0.md"})
+    monkeypatch.setattr(documents, "existing_rels",
+                        lambda world, rels, **kw: {r for r in rels if r in {"s0.cbl", "s2.cbl", "p0.md"}})
     monkeypatch.setattr(ss, "_search_graph",
                         lambda w, q, sp, k, d=10, **ex: (ss._graph_hits(_graph_result(n_structure=3, n_presumed=1), k), None))
     res = ss.search("w", "q", engines=["graph"], k=2)

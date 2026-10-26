@@ -24,21 +24,11 @@ def _hit(key, judgement=None, snippet="s", line=None, doc_id=None, paths=None):
             "snippet": snippet, "engine_score": 1.0, "judgement": judgement, "paths": paths}
 
 
-class _AllDocs:
-    """`in` に常に True を返すダミー実在集合（実在フィルタを無効化するテスト用スタブ）。"""
-
-    def __contains__(self, item):
-        return True
-
-
-_ALL_DOCS = _AllDocs()   # フィルタ挙動を検証しないテストの既定値（doc_id はどれも「実在」扱い）
-
-
 # ==== engines 正規化 ====
 
 def test_default_engines_keyword_vector(monkeypatch):
     calls = []
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _ALL_DOCS)
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     monkeypatch.setattr(ss, "_search_keyword",
                         lambda w, q, sp, k, s, layer=None: (calls.append("keyword") or ([_hit("a")], None)))
     monkeypatch.setattr(ss, "_search_vector",
@@ -56,7 +46,7 @@ def test_default_engines_keyword_vector(monkeypatch):
 
 def test_engine_normalization(monkeypatch):
     """順序・重複を ENGINES 順に正規化する（決定的順序）。"""
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _ALL_DOCS)
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     monkeypatch.setattr(ss, "_search_keyword", lambda w, q, sp, k, s, layer=None: ([_hit("a")], None))
     monkeypatch.setattr(ss, "_search_vector", lambda w, q, sp, k, s, layer=None: ([_hit("b")], None))
     monkeypatch.setattr(ss, "_search_graph", lambda w, q, sp, k, d=8: ([_hit("c", judgement="sure")], None))
@@ -66,7 +56,7 @@ def test_engine_normalization(monkeypatch):
 
 def test_seven_combinations(monkeypatch):
     """ENGINES の非空部分集合7通り全てで engines_used が正しく決定的に決まる。"""
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _ALL_DOCS)
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     monkeypatch.setattr(ss, "_search_keyword", lambda w, q, sp, k, s, layer=None: ([_hit("k")], None))
     monkeypatch.setattr(ss, "_search_vector", lambda w, q, sp, k, s, layer=None: ([_hit("k")], None))
     monkeypatch.setattr(ss, "_search_graph", lambda w, q, sp, k, d=8: ([_hit("k", judgement="sure")], None))
@@ -85,18 +75,19 @@ def test_search_filters_nonexistent_docs(monkeypatch):
     monkeypatch.setattr(ss, "_search_keyword",
                         lambda w, q, sp, k, s, layer=None: ([_hit("real.md"), _hit("stale.md")], None))
     monkeypatch.setattr(ss, "_search_vector", lambda w, q, sp, k, s, layer=None: ([], None))
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: {"real.md"})
+    monkeypatch.setattr(documents, "existing_rels",
+                        lambda world, rels, **kw: {r for r in rels if r in {"real.md"}})
     res = ss.search("w", "q", engines=["keyword", "vector"])
     ids = {h["doc_id"] for h in res["hits"]}
     assert ids == {"real.md"}
     assert res["engines_used"] == ["keyword", "vector"]   # フィルタで0件になっても degrade 扱いにはしない
 
 
-def test_search_calls_world_rel_set_once(monkeypatch):
-    """実在集合は per-engine ではなく search() 呼び出し全体で1回だけ作る（rv MED と同型の懸念）。"""
+def test_search_checks_existence_once(monkeypatch):
+    """実在の確認は per-engine ではなく search() 呼び出し全体で1回だけ行う（rv MED と同型の懸念）。"""
     calls = []
-    monkeypatch.setattr(documents, "world_rel_set",
-                        lambda world=None, **kw: (calls.append(world) or _ALL_DOCS))
+    monkeypatch.setattr(documents, "existing_rels",
+                        lambda world, rels, **kw: (calls.append(world) or {r for r in rels if r}))
     monkeypatch.setattr(ss, "_search_keyword", lambda w, q, sp, k, s, layer=None: ([_hit("a")], None))
     monkeypatch.setattr(ss, "_search_vector", lambda w, q, sp, k, s, layer=None: ([_hit("b")], None))
     monkeypatch.setattr(ss, "_search_graph", lambda w, q, sp, k, d=8: ([_hit("c", judgement="sure")], None))
@@ -111,7 +102,7 @@ def test_search_forwards_layer_to_keyword_and_vector_but_not_graph(monkeypatch):
     繋ぐため非適用（§3.5・裁定1）——graph の fake は layer 引数を受け付けない形にし、渡されたら
     TypeError で検出する（黙って無視ではなく構造的に非適用を固定する）。"""
     captured: dict = {}
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _ALL_DOCS)
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
 
     def kw_spy(w, q, sp, k, s, layer=None):
         captured["keyword_layer"] = layer
@@ -137,7 +128,7 @@ def test_search_forwards_layer_to_keyword_and_vector_but_not_graph(monkeypatch):
 def test_search_layer_omitted_defaults_to_none_forwarded_unchanged(monkeypatch):
     """layer 省略時は None がそのまま keyword/vector へ渡る（既存呼び出し元は無変更＝both 相当）。"""
     captured: dict = {}
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _ALL_DOCS)
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
 
     def kw_spy(w, q, sp, k, s, layer=None):
         captured["layer"] = layer
@@ -371,9 +362,9 @@ def test_search_keyword_propagates_es_index_search_reason(monkeypatch):
 
 def test_search_keyword_failure_surfaces_in_outer_degraded(monkeypatch):
     """RV3（境界回帰#3）: `_search_keyword()` が拾った reason は `search()` の `degraded` 集計まで
-    そのまま届く（`documents.world_rel_set` 等は他エンジンを使わない構成にして keyword 単体で
+    そのまま届く（`documents.existing_rels` 等は他エンジンを使わない構成にして keyword 単体で
     確認する）。"""
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _ALL_DOCS)
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     monkeypatch.setattr(ss, "_search_keyword", lambda w, q, sp, k, s, layer=None: ([], "es_query_failed"))
     res = ss.search("w", "q", engines=["keyword"])
     assert res["engines_used"] == []                      # degrade したエンジンは used に入らない

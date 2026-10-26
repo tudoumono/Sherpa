@@ -11012,7 +11012,7 @@
     },
     "/documents": {
       "get": {
-        "description": "文書台帳（doc_id＝rel_path＋フォルダ由来の範囲メタ）を返す。物理パスは出さない。\nページング（`limit`/`offset`・上限 1000）は明示指定したときだけ有効で、省略時は全件を返す。応答の `world`/`documents` はそのままで、`total`/`has_more` を常に追加し、`limit`/`offset` を指定したときだけその実効値も追加する。\n取り込み済みの文書台帳から返す。台帳が空の world だけはフォルダを走査して返す。",
+        "description": "文書台帳（doc_id＝rel_path＋フォルダ由来の範囲メタ）を返す。物理パスは出さない。\nページング（`limit`/`offset`・上限 1000）は明示指定したときだけ有効で、省略時は全件を返す。応答の `world`/`documents` はそのままで、`total`/`has_more` を常に追加し、`limit`/`offset` を指定したときだけその実効値も追加する。\n取り込み済みの文書台帳から返す。台帳が空の world だけはフォルダを（期限つきで）走査して返し、期限を超えたら 503。",
         "operationId": "documents_list_documents_get",
         "parameters": [
           {
@@ -13458,7 +13458,7 @@
     },
     "/scopes": {
       "get": {
-        "description": "範囲セレクタ用のツリー。world のフォルダ prefix（件数つき）を返す。",
+        "description": "範囲セレクタ用のツリー。world のフォルダ prefix（件数つき）を返す。取り込みの台帳から出し、台帳が無いときだけ資料フォルダを（期限つきで）歩く。",
         "operationId": "scopes_scopes_get",
         "parameters": [
           {
