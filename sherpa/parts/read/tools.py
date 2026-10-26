@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import stat
+import time
 from pathlib import Path
 
 from ... import citations, es_index, graph_coverage, grep_tool, redact_keys, scope_infer, search_cache, worlds
@@ -100,6 +101,11 @@ _QUOTE_MAX_BYTES = 500
 # es_search の方式。hybrid は語の一致＋意味の近さ・keyword は語の一致だけ・vector は意味の近さだけ
 _ES_MODES = ("hybrid", "keyword", "vector")
 _ES_NO_SOURCE_NOTICE = "ソース（コード）は全文検索の索引に含まれない。ソースは ripgrep_search で探す"
+# 期限で探索を止めたときの案内（MCP 経路）。見つかった分だけを返していることと、次の手を伝える
+_GREP_DEADLINE_NOTICE = ("時間内に全部を探し終えられませんでした。見つかった分だけを返しています。"
+                         "path_prefix で範囲を絞るか、es_search を使ってください")
+_NEIGHBORS_DEADLINE_NOTICE = ("起点名の資料検索が時間内に終わらず、見つかった分だけで近傍を返しています。"
+                              "path_prefix か kind で範囲を絞って聞き直してください")
 # 意味検索（埋め込み）が使えず BM25 だけで返したことを示す縮退理由（`mode_used` を keyword にする）
 _ES_VECTOR_FALLBACK_REASONS = frozenset({
     "embedding_not_configured", "embedding_cloud_unavailable", "vector_feature_mismatch",
@@ -1144,11 +1150,24 @@ def _render_pdf_page_image(f, world: str, doc_id: str, args: dict) -> dict:
 
 # ---- ツール実行（読み取り専用・資料フォルダ＋範囲に限定）----
 
+# 本文・原本を読む道具。期限が既に過ぎていれば読まずに期限切れとして扱う。
+_READ_DEADLINE_TOOLS = frozenset({
+    "file_head", "read_around", "read_doc", "doc_outline", "compare_documents",
+    "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "pdf_page_image"})
+_READ_DEADLINE_CHECK_LINES = 256  # 行の読取ループ中に `deadline` を再確認する間隔
+
+
+def _raise_if_past(deadline: float | None) -> None:
+    """`deadline` を過ぎていれば `grep_tool.GrepDeadlineExceeded` を送出する（呼び出し元が期限切れの結果に翻訳する）。"""
+    if deadline is not None and time.monotonic() > deadline:
+        raise grep_tool.GrepDeadlineExceeded("読み取りがデッドラインを超えました")
+
+
 def run_tool(name: str, args: dict, world: str, scope_paths,
             deadline: float | None = None, layer=None,
             max_hits: int | None = None, window_cap: int | None = None,
             tool_result_max_bytes: int | None = None,
-            graph_only: bool = False) -> tuple[dict, set, list, list]:
+            graph_only: bool = False, partial_on_deadline: bool = False) -> tuple[dict, set, list, list]:
     """ツールを実行し `(結果, 触れた doc_id 集合, 引用候補, 候補カード)` を返す。範囲外・未解決・秘匿は安全に error にする。tool result の本文は秘密を伏せて返す。
     引用候補＝`{doc_id, span, quote, ext}`（grep／ES ヒット由来）。候補カード＝`graph_neighbors` 由来の原因候補（troubleshoot の UI／エクスポート用）。
     - `layer`（省略可・`"docs"|"code"|"both"`・既定 both）: `scope_paths` と同じ会話ターン全体の硬いフィルタ。`ripgrep_search`／`glob_search`／`es_search`／`list_docs` の対象を絞り、`read_around`／`read_doc`／`doc_outline` は層外の doc_id を範囲外と同じく拒否する。`graph_neighbors` は層で結果を絞れない（言及エッジが木を跨ぐ）ため、層が限定されている間はツール自体を拒否する（層外の名前・経路が漏れる迂回路になるため）。
@@ -1156,11 +1175,14 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     - `window_cap`（省略可）: `read_around` の読み取り窓の既定値と `max(200, READ_WINDOW)` クランプの `READ_WINDOW` 部分を置き換える（200 の下限は維持）。`read_doc` の 1 ページ幅にも `max(200, window_cap or READ_WINDOW)` を使う。read_doc は 1 行ずつバイト予算を累積し、超える直前の行で止めてそこを `end_line` にする（超過時は `text_truncated: true`）。`doc_outline` は見出し件数（`_OUTLINE_MAX_HEADINGS`）とタイトルの累積バイト数の両方で打ち切る（`truncated`）。読み込みが `_READ_AROUND_FILE_CAP_BYTES` に達したら `file_truncated: true` を返す。`ripgrep_search` も `_GREP_FILE_CAP_BYTES` で打ち切ったファイル由来のヒットに `hits[i].file_truncated: true` を付ける。
     - `ripgrep_search` のページング: `args["offset"]`（省略時 0・負値は 0）を `grep_tool.grep_search` へそのまま渡す（巻き戻さない）。1 ページのヒット数 `used_max_hits` は `max_hits` と `MAX_HITS_ABS_MAX - offset` の小さい方（`offset` はクランプせず、件数を縮める側で絶対上限を守る）。`offset >= MAX_HITS_ABS_MAX` なら検索せず空を返す。`next_offset` は `offset+used_max_hits < MAX_HITS_ABS_MAX` のときだけ付く。`es_search` は offset ページングを持たず（続きが要るなら `max_hits` を増やす）、`truncated:true` のみ。
     - ヒットの本文: 両ツールとも `hits[i].text` は `tool_result_max_bytes` を実際に返すヒット数で均等割りしたバイト数（下限 `_HIT_TEXT_MIN_BYTES`）に収め、`ripgrep_search` は見出し行＋一致行の前後を残して離れた箇所を省略の印（行の位置つき）でつなぎ（`grep_tool.clip_hit_text`）、`es_search` は末尾をクリップし、切ったヒットに `text_truncated: true` を付ける（親返しの rag doc 群は別予算配分で、`_resolve_parent_return` が独自に付ける）。`view` を組んだ後に直列化後の実バイト数を測り、`tr_max_bytes` 超過なら per_hit を詰めて再構築する（最大 4 回）。それでも収まらなければ呼び出し元の外側クリップに委ねる。
-    - `deadline`（省略可・`time.monotonic()` 系の絶対期限）: ツリー走査を伴うツール（`ripgrep_search`／`list_docs`／`glob_search`／`es_search`）へそのまま渡し、実行中の呼び出しを打ち切る。超過時は `grep_tool.GrepDeadlineExceeded`／`scope_infer.ScopeWalkDeadlineExceeded` を送出する（呼び出し元が 504 相当へ再分類する）。
+    - `deadline`（省略可・`time.monotonic()` 系の絶対期限）: ツリー走査を伴うツール（`ripgrep_search`／`list_docs`／`glob_search`／`es_search`）へそのまま渡し、実行中の呼び出しを打ち切る。超過時は `grep_tool.GrepDeadlineExceeded`／`scope_infer.ScopeWalkDeadlineExceeded` を送出する（呼び出し元が 504 相当へ再分類する）。`graph_neighbors` の起点名の grep にも渡す。
+    - `partial_on_deadline`（省略可・既定 False）: 真のとき、`ripgrep_search` と `graph_neighbors`（起点名の grep）は期限切れで例外にせず、期限までに見つけた分を `deadline_exceeded: true`・`truncated: true`・平文の `notice` つきで返す（MCP 経路）。偽なら従来どおり例外。
     - `tool_result_max_bytes`（省略可）: run 開始時に 1 回解決したツール結果 1 件あたりのバイト予算。本関数内のバイトクリップは全てこの実効値を使う。
     - `graph_only`（省略可）: 真のとき `graph_neighbors` は `lens_service.neighbor_cards_graph_only`（grep をせず、起点は名前の一致で直接引く）を使う（MCP が `SHERPA_MCP_TOOLSET=plain` のときだけ）。
     設計: docs/design/codex.md「MCP の道具」
     """
+    if name in _READ_DEADLINE_TOOLS:
+        _raise_if_past(deadline)
     sp = scope_mod.normalize_scope_paths(scope_paths) or None
     args = args or {}
     docs: set = set()
@@ -1331,7 +1353,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             # `truncated_docs`: `_GREP_FILE_CAP_BYTES` で打ち切られた文書の doc_id（ヒット 0 件の打切り文書も載る）
             hits = grep_tool.grep_search(q, world, max_hits=used_max_hits, scope_paths=sp,
                                          deadline=deadline, layer=layer, truncated_docs=truncated_docs,
-                                         offset=offset, stats=grep_stats)
+                                         offset=offset, stats=grep_stats,
+                                         **({"partial_on_deadline": True} if partial_on_deadline else {}))
             hit_ranks = list(range(offset + 1, offset + len(hits) + 1))  # 続きのページは元の検索の順位で数える
         # 親返し（es_search 限定）: rag チャンク由来のヒット（`chunk_id` あり）は doc_id ごとに束ねて `_resolve_parent_return` へ渡し、legacy ヒット（40 行チャンク由来）は素通しする。
         # ① 引用（cites）・doc 収集・rag_groups の組み立て（1 回だけ）
@@ -1454,6 +1477,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 view["truncated_docs"] = truncated_docs[:_TRUNCATED_DOCS_MAX]
                 if len(truncated_docs) > _TRUNCATED_DOCS_MAX:
                     view["truncated_docs_total"] = len(truncated_docs)  # 一覧は先頭だけ・総数
+            if grep_stats.get("deadline_exceeded"):  # ripgrep_search のみ・期限までに見つかった分だけ（続きの offset は付けない）
+                view["deadline_exceeded"] = True
+                view["truncated"] = True
+                view.pop("next_offset", None)
+                view["notice"] = _GREP_DEADLINE_NOTICE
             if grep_stats.get("unreadable_files"):  # ripgrep_search のみ・開けず／読めずに探せていないファイルの件数（名前は出さない）
                 view["unreadable_files"] = grep_stats["unreadable_files"]
             if excluded["not_current"] or excluded["withheld"]:  # es_search のみ・結果から除いたヒット
@@ -1523,7 +1551,9 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             elif graph_only:
                 raw_cards = lens_service.neighbor_cards_graph_only(world, term, sp, **kind_kw)
             else:
-                raw_cards = lens_service.neighbor_cards(world, term, sp, **kind_kw)
+                raw_cards = lens_service.neighbor_cards(
+                    world, term, sp, **kind_kw,
+                    **({"deadline": deadline} if partial_on_deadline and deadline is not None else {}))
         except GraphSchemaEraError as e:
             # 世代不一致は調査を終端させず、MCP 側と同じ機械可読コードのツール結果へ変換して返す（`_record_tool_result_error_code` が `graph_schema_era_mismatch` を立てる）
             return ({"error": GRAPH_REINGEST_ERROR_CODE, "world": e.world, "stored_era": e.stored_era},
@@ -1556,6 +1586,9 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         if too_broad:
             # 起点が多すぎて、たどらずに絞り込みを求めた（近傍が空でも「近傍なし」ではない）。内訳は先頭のフォルダ別・種類別の起点の件数
             result["too_broad"] = {**too_broad, "message": _TOO_BROAD_MESSAGE}
+        if getattr(raw_cards, "deadline_exceeded", False):
+            result["deadline_exceeded"] = True
+            result["notice"] = _NEIGHBORS_DEADLINE_NOTICE
         unverified_edges = sum(1 for v in view for e in v["edges"] if e.get("unverified"))
         if unverified_cards or unverified_edges:
             # 裏付け資料を確認できなかったカード（一覧から除外）・辺（資料名を伏せて `unverified`）の数。名前は出さない
@@ -1616,6 +1649,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         try:
             reader, it, encoding_caution = _stream_doc_lines(f)
             for idx, t in enumerate(it):
+                if deadline is not None and idx % _READ_DEADLINE_CHECK_LINES == 0:
+                    _raise_if_past(deadline)
                 if idx >= e_target:
                     reached_eof = False
                     break
@@ -1684,6 +1719,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             if file_st is not None and saved is None:
                 quality = text_encoding.detect_fd_quality(f.fileno())
             for idx, t in enumerate(it):
+                if deadline is not None and idx % _READ_DEADLINE_CHECK_LINES == 0:
+                    _raise_if_past(deadline)
                 if start - 1 <= idx < target_end:
                     window_lines.append(t)
                 elif idx < start - 1:
@@ -1746,6 +1783,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         try:
             reader, it, _enc_caution = _stream_doc_lines(f)  # doc_outline は見出しのみ返す＝注意文は付けない
             for idx, t in enumerate(it):
+                if deadline is not None and idx % _READ_DEADLINE_CHECK_LINES == 0:
+                    _raise_if_past(deadline)
                 m = _HEADING_RE.match(t.lstrip())
                 if m:
                     full_title = _redact(m.group(2).strip())
@@ -1822,44 +1861,48 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 docs.add(doc_id)
             return (result, docs, cites, cards)
         from ... import doc_readers
-        if name == "xlsx_sheets":
-            result = doc_readers.xlsx_sheets(f)
-        elif name == "xlsx_range":
-            sheet = str(args.get("sheet") or "")
-            if not sheet:
-                _close_quiet_local(f)
-                return ({"error": "sheet が必要です"}, docs, cites, cards)
-            kwargs = {"clean": _redact}
-            if args.get("range"):
-                kwargs["range_a1"] = str(args["range"])
-            if args.get("max_rows") is not None:
-                kwargs["max_rows"] = args["max_rows"]
-            if args.get("max_cols") is not None:
-                kwargs["max_cols"] = args["max_cols"]
-            result = doc_readers.xlsx_range(f, sheet, **kwargs)
-        elif name == "docx_paragraphs":
-            kwargs = {"clean": _redact}
-            if args.get("start") is not None:
-                kwargs["start"] = args["start"]
-            if args.get("count") is not None:
-                kwargs["count"] = args["count"]
-            if args.get("table_start") is not None:
-                kwargs["table_start"] = args["table_start"]
-            if args.get("table_row_start") is not None:
-                kwargs["table_row_start"] = args["table_row_start"]
-            result = doc_readers.docx_paragraphs(f, **kwargs)
-        elif name == "pptx_slides":
-            kwargs = {"clean": _redact}
-            if args.get("pages"):
-                kwargs["pages"] = str(args["pages"])
-            result = doc_readers.pptx_slides(f, **kwargs)
-        else:  # pdf_pages
-            kwargs = {"clean": _redact}
-            if args.get("pages"):
-                kwargs["pages"] = str(args["pages"])
-            if args.get("text_offset") is not None:
-                kwargs["text_offset"] = args["text_offset"]
-            result = doc_readers.pdf_pages(f, **kwargs)
+        with doc_readers.call_deadline(deadline):
+            if name == "xlsx_sheets":
+                result = doc_readers.xlsx_sheets(f)
+            elif name == "xlsx_range":
+                sheet = str(args.get("sheet") or "")
+                if not sheet:
+                    _close_quiet_local(f)
+                    return ({"error": "sheet が必要です"}, docs, cites, cards)
+                kwargs = {"clean": _redact}
+                if args.get("range"):
+                    kwargs["range_a1"] = str(args["range"])
+                if args.get("max_rows") is not None:
+                    kwargs["max_rows"] = args["max_rows"]
+                if args.get("max_cols") is not None:
+                    kwargs["max_cols"] = args["max_cols"]
+                result = doc_readers.xlsx_range(f, sheet, **kwargs)
+            elif name == "docx_paragraphs":
+                kwargs = {"clean": _redact}
+                if args.get("start") is not None:
+                    kwargs["start"] = args["start"]
+                if args.get("count") is not None:
+                    kwargs["count"] = args["count"]
+                if args.get("table_start") is not None:
+                    kwargs["table_start"] = args["table_start"]
+                if args.get("table_row_start") is not None:
+                    kwargs["table_row_start"] = args["table_row_start"]
+                result = doc_readers.docx_paragraphs(f, **kwargs)
+            elif name == "pptx_slides":
+                kwargs = {"clean": _redact}
+                if args.get("pages"):
+                    kwargs["pages"] = str(args["pages"])
+                result = doc_readers.pptx_slides(f, **kwargs)
+            else:  # pdf_pages
+                kwargs = {"clean": _redact}
+                if args.get("pages"):
+                    kwargs["pages"] = str(args["pages"])
+                if args.get("text_offset") is not None:
+                    kwargs["text_offset"] = args["text_offset"]
+                result = doc_readers.pdf_pages(f, **kwargs)
+        if (deadline is not None and time.monotonic() > deadline
+                and isinstance(result, dict) and result.get("error") == doc_readers._TIME_ERROR["error"]):
+            raise grep_tool.GrepDeadlineExceeded("読み取りがデッドラインを超えました")
         result = _redact_deep(result)
         if not (isinstance(result, dict) and result.get("error")):
             result = _finish_reader_result(name, result, doc_id, tr_max_bytes)

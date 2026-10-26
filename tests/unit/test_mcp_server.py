@@ -447,7 +447,7 @@ def test_tools_call_graph_neighbors_stubbed(monkeypatch):
     from sherpa import lens_service
     fake = [{"name": "BILLINGJOB", "label": "Module", "category": "プログラム", "role": "実装",
              "distance": 2, "path": ["請求", "BILLINGJOB"], "evidence": {"edges": [], "grep": []}}]
-    monkeypatch.setattr(lens_service, "neighbor_cards", lambda world, term, sp=None: list(fake))
+    monkeypatch.setattr(lens_service, "neighbor_cards", lambda world, term, sp=None, **kw: list(fake))
     n = _body(_call("graph_neighbors", {"name": "請求"}))["neighbors"][0]
     assert n["name"] == "BILLINGJOB" and n["role"] == "実装" and n["path"]
 

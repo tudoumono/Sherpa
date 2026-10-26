@@ -17,6 +17,8 @@ from pathlib import Path
 
 from . import scope_infer, worlds
 
+_DEADLINE_CHECK_ENTRIES = 256  # フォルダ内の列挙中に `deadline` を再確認する間隔
+
 _log = logging.getLogger("sherpa")
 
 # 保存形式の版。上げると既存のキャッシュは作り直される。
@@ -223,20 +225,26 @@ def read_meta_put(world: str, st: os.stat_result, params: str, payload: dict) ->
         con.close()
 
 
-def tree_signature(dirs) -> str:
+def tree_signature(dirs, deadline: float | None = None) -> str:
     """フォルダ木の署名。フォルダ（ファイルは見ない）の更新時刻を畳む。ファイルの追加・削除・改名で変わる。
     版管理の記録のフォルダ（`scope_infer.VCS_DIR_NAMES`）には入らず、シンボリックリンクは辿らない。
+    `deadline`（`time.monotonic()` 系の絶対期限）を渡すと、フォルダごと・`_DEADLINE_CHECK_ENTRIES` 件ごとに確認し、超過で `scope_infer.ScopeWalkDeadlineExceeded` を送出する。
     """
     h = hashlib.sha1()
     for root in dirs:
         stack = [str(root)]
         while stack:
+            if deadline is not None and time.monotonic() > deadline:
+                raise scope_infer.ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
             d = stack.pop()
             try:
                 mt = os.stat(d).st_mtime_ns
                 h.update(f"{d}\0{mt}\n".encode("utf-8", "surrogateescape"))
                 with os.scandir(d) as it:
-                    for e in it:
+                    for i, e in enumerate(it):
+                        if (deadline is not None and i > 0 and i % _DEADLINE_CHECK_ENTRIES == 0
+                                and time.monotonic() > deadline):
+                            raise scope_infer.ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
                         if e.is_dir(follow_symlinks=False) and not scope_infer.is_vcs_dir_name(e.name):
                             stack.append(e.path)
             except OSError:

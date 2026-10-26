@@ -286,6 +286,7 @@ class _Cards(list):
     depth: dict | None = None
     dataitems_excluded: int = 0
     too_broad: dict | None = None   # 起点が多すぎてたどらなかったときの内訳（`AnchorsTooBroad.breadth`）
+    deadline_exceeded: bool = False  # 起点名の grep が期限で止まった（文書側の根拠が途中まで）
 
     def __init__(self, items, coverage: Coverage):
         super().__init__(items)
@@ -294,12 +295,13 @@ class _Cards(list):
 
 def _troubleshoot_cards(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH, include_deprecated=False, scope_paths=None,
                         sources_limit: int = EDGE_SOURCES_RETURN_DEFAULT, anchor_cap: int | None = None,
-                        kind: str | None = None):
+                        kind: str | None = None, deadline: float | None = None):
     """症状 → 原因候補カード（内部専用・`cid` 付き）。`run_troubleshoot`（`cid` 除去）と `neighbor_cards`（agentic `graph_neighbors`・`cid` 保持）が共有する。
     戻り値を直接 API・会話保存・共有・JSON 書き出しへ渡さない（内部専用フィールドが漏れる）。
     戻り値は `(anchor_names, cards, truncated_docs)`。`truncated_docs` は `run_troubleshoot` が平文の注記にする。
     `cards` は `_Cards`（`.coverage`＝起点の解決・近傍の取得・文書の探索で見つかった打ち切り）。
     `kind`＝起点を種類で絞る。`anchor_cap`＝起点の数の上限（超えたらたどらず `AnchorsTooBroad` を送出する）。
+    `deadline`＝起点名の grep の絶対期限（`time.monotonic()` 系）。超えたら例外にせず、そこまでに見つけた文書側の根拠でカードを組み、`.deadline_exceeded` を立てて `coverage` に `timeout`（stage `docs`）を足す。
     """
     sp = scope.normalize_scope_paths(scope_paths) or None
     coverage = Coverage()
@@ -315,12 +317,20 @@ def _troubleshoot_cards(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH,
 
     grep_by_doc: dict[str, list] = {}
     truncated_docs: list = []
+    deadline_exceeded = False
     for nm in anchor_names:
-        found = grep_search(nm, world, scope_paths=sp, truncated_docs=truncated_docs)
+        grep_stats: dict = {}
+        deadline_kw = ({"deadline": deadline, "stats": grep_stats, "partial_on_deadline": True}
+                       if deadline is not None else {})
+        found = grep_search(nm, world, scope_paths=sp, truncated_docs=truncated_docs, **deadline_kw)
         if len(found) >= _CARD_GREP_MAX_HITS:  # 起点名 1 つあたりのヒット上限に達した＝文書側の根拠が一部だけ
             coverage.add(graph_coverage.KIND_RESULT_CAP, graph_coverage.STAGE_DOCS)
         for h in found:
             grep_by_doc.setdefault(h["doc_id"], []).append(h)
+        if grep_stats.get("deadline_exceeded"):
+            deadline_exceeded = True
+            coverage.add(graph_coverage.KIND_TIMEOUT, graph_coverage.STAGE_DOCS)
+            break
 
     cards: list[dict] = []
     covered_docs: set[str] = set()
@@ -357,6 +367,7 @@ def _troubleshoot_cards(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH,
     out_cards = _Cards(cards, coverage)
     out_cards.depth = {"requested": int(depth), "truncated": None}
     out_cards.dataitems_excluded = dataitems_excluded
+    out_cards.deadline_exceeded = deadline_exceeded
     return anchor_names, out_cards, truncated_docs
 
 
@@ -432,11 +443,12 @@ class NeighborCardsFailure(list):
         self.error_code = error_code
 
 
-def neighbor_cards(world, term, scope_paths=None, kind=None) -> list:
+def neighbor_cards(world, term, scope_paths=None, kind=None, deadline=None) -> list:
     """関係グラフの近傍カード（原因候補）を返す。agentic ツール `graph_neighbors` 専用で、自前で Neo4j セッションを開いて `_troubleshoot_cards` を呼ぶ（`cid` 付き）。
     戻り値のカードは `.coverage`（`Coverage`）を持つ（時間切れ・行数の天井・文書探索の打ち切り）。
     `kind`＝起点を種類（ラベル）で絞る。起点が `graph_anchor_max()` を超えるときはたどらず、空のカードに内訳 `.too_broad` と
     `narrow_required`（stage `anchor`）を付けて返す。
+    `deadline`＝起点名の grep の絶対期限。超えたらそこまでの根拠でカードを返し、`.deadline_exceeded` を真にする。
     Neo4j 不可・未解決は `[]`。捕捉した障害は `NeighborCardsFailure`（`error_code`）で返す:
     接続系（`DriverError`/`TransientError`）は `"graph_unavailable"`（回復可能）、それ以外は `"graph_internal_error"`（回復不可）。型名だけログに残す。
     `GraphSchemaEraError` だけは再送出する（呼び出し元が `graph_reingest_required` に変換）。
@@ -454,7 +466,8 @@ def neighbor_cards(world, term, scope_paths=None, kind=None) -> list:
             # 3 件目（truncated_docs）は無視（agentic 経路は `ripgrep_search` が別途申告する）。
             anchor_names, cards, _truncated_docs = _troubleshoot_cards(
                 s, term, world, scope_paths=scope_paths, sources_limit=EDGE_SOURCES_RETURN_MAX,
-                anchor_cap=graph_anchor_max(), **({"kind": kind} if kind else {}))
+                anchor_cap=graph_anchor_max(), **({"kind": kind} if kind else {}),
+                **({"deadline": deadline} if deadline is not None else {}))
             _attach_unresolved(s, cards, world, anchor_names, scope.normalize_scope_paths(scope_paths) or None)
         return cards
     except GraphSchemaEraError:
@@ -564,20 +577,21 @@ def neighbor_cards_graph_only(world, term, scope_paths=None, kind=None) -> list:
                 pass
 
 
-def run_qa(question, world, max_hits=20, scope_paths=None, layer=None):
+def run_qa(question, world, max_hits=20, scope_paths=None, layer=None, deadline=None):
     """検索語 → 仕様書の該当節を引用（doc_id＝rel_path＋span）。範囲（フォルダ prefix）で引用源を絞る。
-    `layer`（省略可・`None`＝`"both"`）は探す対象で、`grep_search` へそのまま渡す。
+    `layer`（省略可・`None`＝`"both"`）は探す対象、`deadline`（省略可）は絶対期限で、どちらも `grep_search` へそのまま渡す（超過は `GrepDeadlineExceeded`）。
     打ち切られた文書があれば `notes`（平文の注記 1 件）を添える。
     """
     sp = scope.normalize_scope_paths(scope_paths) or None
     truncated_docs: list = []
+    deadline_kw = {"deadline": deadline} if deadline is not None else {}
     hits = grep_search(question, world, max_hits=max_hits, scope_paths=sp, layer=layer,
-                       truncated_docs=truncated_docs)
+                       truncated_docs=truncated_docs, **deadline_kw)
     if not hits:  # 自然文 → 語に分割し具体的な語から試す
         for t in sorted(_terms(question), key=len, reverse=True):
             found, seen = [], set()
             for h in grep_search(t, world, max_hits=max_hits, scope_paths=sp, layer=layer,
-                                 truncated_docs=truncated_docs):
+                                 truncated_docs=truncated_docs, **deadline_kw):
                 key = (h["doc_id"], tuple(h["span"]))
                 if key not in seen:
                     seen.add(key)

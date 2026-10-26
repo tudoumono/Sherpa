@@ -20,6 +20,8 @@ Codex（MCP 経由）と API 経路の頭脳が同じ関数で Excel／Word／Po
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import io
 import os
 import re
@@ -245,6 +247,20 @@ def _max_seconds() -> float:
     return v if v > 0 else _MAX_SECONDS_DEFAULT
 
 
+# 呼び出し元の絶対期限（`time.monotonic()` 系）。`call_deadline()` の中で呼んだ読取ループは `_TimeBudget.tick()` で期限切れを検知して打ち切る。
+_CALL_DEADLINE: "contextvars.ContextVar[float | None]" = contextvars.ContextVar("doc_readers_call_deadline", default=None)
+
+
+@contextlib.contextmanager
+def call_deadline(deadline: float | None):
+    """このブロックの間、読取ループの時間予算に呼び出し元の絶対期限を重ねる（`None` なら何もしない）。"""
+    token = _CALL_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _CALL_DEADLINE.reset(token)
+
+
 class _TimeBudget:
     """読取ループの時間予算。`tick()` を要素ごとに呼び、超過したら True を返す。"""
 
@@ -257,6 +273,9 @@ class _TimeBudget:
         self._n += 1
         if self._n % every:
             return False
+        deadline = _CALL_DEADLINE.get()
+        if deadline is not None and time.monotonic() > deadline:
+            return True
         return (time.monotonic() - self._t0) > self._limit
 
 

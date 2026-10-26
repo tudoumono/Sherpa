@@ -7,6 +7,8 @@
 - `ask_user` は Codex にも公開する。質問カードはラッパー（`agents._run_authoring`）が届け、ここは「届いた・調査をやめて要約せよ」のツール結果を返すだけ。
   1 実行 1 回の上限は本サーバのプロセス寿命で数える（エージェント＝MCP 接続ごとに別プロセスなので、multi_agent の子は親と別カウント）。
 - `SHERPA_MCP_ASK_DISABLED=1`（確認ID 付き再送）では `ask_user` を tools/list から外す。それでも呼ばれたら初回でも `_ASK_RESULT_AGAIN` を返す（質問カードを出さないまま調査を打ち切らせない）。
+- 道具 1 回ごとに期限（`SHERPA_MCP_TOOL_DEADLINE_SEC`・既定 120 秒）を付ける。サーバーは 1 行ずつ同期で処理するため、1 件が止まると後続の呼び出しも待たされる。
+  `ripgrep_search`／`graph_neighbors` は期限までに見つけた分を `deadline_exceeded: true`・`notice` つきで返し、それ以外で期限を超えた道具は `{"error": "tool_deadline_exceeded"}`（`isError`）の通常の結果にする。
 - `SHERPA_MCP_SIDECAR`（JSONL パス・codex_home 配下など model-shell の書込許可領域の外）が設定されていれば、読取系ツールの doc_id と ask_user の質問だけを本文なしで追記する。
   multi_agent の子の MCP 呼出は親の `--json` に現れないため、`providers/codex/provider.py` が codex exec 終了後にこのファイルを読み、子が読んだ資料を出典へ・子の ask_user を確認カードへ合流させる。未設定なら何もしない。
 """
@@ -20,7 +22,8 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import agentic_search, es_index, graph_coverage, graph_tools, investigation_ledger, tool_call_log, tool_dispatch
+from . import (agentic_search, es_index, graph_coverage, graph_tools, grep_tool, investigation_ledger, scope_infer,
+               tool_call_log, tool_dispatch)
 from .ingest.world_neo4j import GraphSchemaEraError
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -38,6 +41,12 @@ _ASK_RESULT_FIRST = "質問はユーザーに届きました。追加調査は�
 _ASK_RESULT_AGAIN = "既に質問済みです。調査を続けて回答をまとめてください。"
 
 _LEDGER_TOOLS = frozenset({"ledger_manifest_set", "ledger_item_put", "ledger_status", "ledger_review_put"})
+
+# 道具 1 回あたりの期限（秒）。Codex CLI の MCP 道具の待ち上限（300 秒）より必ず短くする。
+_TOOL_DEADLINE_DEFAULT_SEC = 120.0
+_TOOL_DEADLINE_MAX_SEC = 280.0
+_TOOL_DEADLINE_NOTICE = ("時間内に探し終えられませんでした。path_prefix や name_pattern で範囲を絞るか、"
+                         "別の道具（es_search など）で調べてください")
 
 # 素の Codex モード（`plain`）で公開するツールの全体。`_tool_defs()`・`handle()` のどちらもこの集合だけを見る。
 _PLAIN_TOOLSET = frozenset({"graph_neighbors", "ask_user"})
@@ -418,6 +427,8 @@ def _coverage_outcome(name: str, result, is_error: bool) -> str | None:
     if not isinstance(result, dict):
         return "error"
     if is_error:
+        if result.get("error") == "tool_deadline_exceeded":
+            return "timeout"
         if name in _ITEM_READ_TOOLS:
             if result.get("error_code") == agentic_search._READ_INVALID_ARGS_ERROR_CODE:
                 return None  # 呼び出し側の引数誤り（範囲外・型不正）は読めない扱いにしない
@@ -944,6 +955,18 @@ def _err(rid, code: int, msg: str) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
 
 
+def _tool_deadline_sec() -> float:
+    """`SHERPA_MCP_TOOL_DEADLINE_SEC`（秒）。未設定・不正値・0 以下は既定、上限は `_TOOL_DEADLINE_MAX_SEC`。"""
+    raw = os.environ.get("SHERPA_MCP_TOOL_DEADLINE_SEC", "").strip()
+    try:
+        v = float(raw) if raw else _TOOL_DEADLINE_DEFAULT_SEC
+    except ValueError:
+        return _TOOL_DEADLINE_DEFAULT_SEC
+    if not (v > 0) or v == float("inf"):
+        return _TOOL_DEADLINE_DEFAULT_SEC
+    return min(v, _TOOL_DEADLINE_MAX_SEC)
+
+
 def _handle_tool_call(rid, params: dict) -> dict:
     """`tools/call` 1 件を処理して応答を返す（台帳・ask_user・重複拒否・通常の道具）。"""
     name = params.get("name")
@@ -986,6 +1009,7 @@ def _handle_tool_call(rid, params: dict) -> dict:
                    "hint": "同じ条件の検索は既に実行済みです。条件を変えてください。"}
         return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                          "isError": True})
+    deadline = time.monotonic() + _tool_deadline_sec()
     try:
         # 調べる深さ連動込みの実効 hits/window（`SHERPA_MCP_TOOL_MAX_HITS`/`_WINDOW_CAP`）とバイト予算を `run_tool()` の内部クリップにも渡す。env 未設定/不正値は `None`＝`run_tool()` の既定。後段の `_clip_tool_result` は最終形を保証する多層防御。
         result, _docs, _cites, _cards = tool_dispatch.run_tool(
@@ -993,7 +1017,14 @@ def _handle_tool_call(rid, params: dict) -> dict:
             max_hits=_env_int_override("SHERPA_MCP_TOOL_MAX_HITS"),
             window_cap=_env_int_override("SHERPA_MCP_TOOL_WINDOW_CAP"),
             tool_result_max_bytes=_tool_budget_bytes(name),
-            graph_only=(_toolset() == "plain"))
+            graph_only=(_toolset() == "plain"), deadline=deadline, partial_on_deadline=True)
+    except (grep_tool.GrepDeadlineExceeded, scope_infer.ScopeWalkDeadlineExceeded):
+        # 期限を超えた道具は JSON-RPC のエラーにせず通常の道具の失敗として返し、サーバーは次の行へ進む。
+        err_body = {"error": "tool_deadline_exceeded", "notice": _TOOL_DEADLINE_NOTICE}
+        _sidecar_append({"kind": "limit", "field": "search_truncated", "ts": time.time()})
+        _record_item_coverage(name, args, err_body, True)
+        return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
+                         "isError": True})
     except GraphSchemaEraError as e:
         # `graph_neighbors` が検知した旧世代グラフは、JSON-RPC のプロトコルエラーにせず通常のツール結果（`isError` あり・`content[].text` に機械可読コード）で返す。`providers/codex/mcp.py::_graph_schema_era_from_item` が `GraphSchemaEraError` を再構成する。
         err_body = {"error": agentic_search.GRAPH_REINGEST_ERROR_CODE,

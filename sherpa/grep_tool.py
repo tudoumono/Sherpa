@@ -379,8 +379,10 @@ def _prepare_roots(world: str, roots):
     return roots_spec, wd, der_rag
 
 
-def _walk_importance(world: str, wd) -> dict:
-    """ヒットの優先順位付け（`_offer`）用に world の重要度を 1 回だけ解決する（`_重要度.txt` が無ければ空 dict）。純 Python 走査用で、フォルダ木を歩く。"""
+def _walk_importance(world: str, wd, deadline: float | None = None) -> dict:
+    """ヒットの優先順位付け（`_offer`）用に world の重要度を 1 回だけ解決する（`_重要度.txt` が無ければ空 dict）。純 Python 走査用で、フォルダ木を歩く。
+    `deadline` があるときは木の列挙に期限を掛け（超過は `GrepDeadlineExceeded`）、列挙済みの一覧を `resolve_for_world` へ渡して期限なしの再走査を避ける。
+    """
     from .ingest import importance  # 遅延 import（循環回避）
     # `sig` を渡すと `resolve_for_world` が world 全体をもう一度全木走査しない（registry の `last_sig` を使う）。
     # 取得できなくても fail-closed にはせず `sig=None` のまま自前計算へ戻す。
@@ -391,7 +393,13 @@ def _walk_importance(world: str, wd) -> dict:
         sig = (row or {}).get("last_sig") or None
     except Exception:
         sig = None
-    return importance.resolve_for_world(world, root=wd, sig=sig)
+    if deadline is None:
+        return importance.resolve_for_world(world, root=wd, sig=sig)
+    try:
+        files = list(scope_infer.safe_files(wd, deadline=deadline))
+    except scope_infer.ScopeWalkDeadlineExceeded as e:
+        raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました") from e
+    return importance.resolve_for_world(world, root=wd, sig=sig if sig is not None else "", files=files)
 
 
 def _candidate_importance(world: str, wd, controls: list, entries: list) -> dict:
@@ -410,7 +418,7 @@ def _candidate_importance(world: str, wd, controls: list, entries: list) -> dict
 
 
 def _discover_candidates(terms: list, roots_spec: list, wd, world: str, *, cacheable: bool, offset: int,
-                         budget):
+                         budget, deadline: float | None = None):
     """rg で候補のファイルを集める。`(候補 {パス: {語の添字: 行}}, 重要度の設定ファイルのパス一覧)`。
     ① `offset` 付きの呼び出しは、同じ（検索語・roots・資料フォルダの状態）で保存済みの候補一覧があればそれを切り出して使う
     ② 無ければ原本の木と派生 MD の木を rg で走査する（Office／PDF／画像と、`.rag.md` がある文書だけの `md/` のフォルダは歩かない＝`rg_prune`・非 ASCII の語は CP932 の 2 回目も）③ 重要度の設定ファイルを探す ④ 候補一覧を保存する
@@ -424,7 +432,10 @@ def _discover_candidates(terms: list, roots_spec: list, wd, world: str, *, cache
     if cacheable:
         key = hashlib.sha1(json.dumps([terms, [[str(r), d] for r, d in roots_spec]],
                                       ensure_ascii=False).encode("utf-8")).hexdigest()
-        sig = search_cache.tree_signature(orig_roots + der_roots)
+        try:
+            sig = search_cache.tree_signature(orig_roots + der_roots, deadline=deadline)
+        except scope_infer.ScopeWalkDeadlineExceeded as e:
+            raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました") from e
         if offset > 0:
             saved = search_cache.pages_get(world, key, sig)
             if saved is not None:
@@ -456,10 +467,12 @@ def _discover_candidates(terms: list, roots_spec: list, wd, world: str, *, cache
     return cand, controls
 
 
-def _candidate_entries(cand: dict, roots_spec: list, der_rag, scope_paths, want: int | None = None):
+def _candidate_entries(cand: dict, roots_spec: list, der_rag, scope_paths, want: int | None = None,
+                       deadline: float | None = None):
     """rg の候補 `cand`（`{パス: {語の添字: 行}}`）を（根の順・Path の順）に並べ、検索対象になるファイルだけ `(パス, rel, is_derived, 当たった語の添字)` で返す。
-    `want` があれば、その語に当たったファイルだけ。ファイルの中身は読まない。
+    `want` があれば、その語に当たったファイルだけ。ファイルの中身は読まない。`deadline` があれば `_DEADLINE_CHECK_ENTRIES` 件ごとに確認し、超過で `GrepDeadlineExceeded`。
     """
+    n = 0
     for root, is_derived in roots_spec:
         if not root.is_dir():
             continue
@@ -468,13 +481,17 @@ def _candidate_entries(cand: dict, roots_spec: list, der_rag, scope_paths, want:
         mine = sorted((Path(pth), hit) for pth, hit in cand.items()
                       if pth.startswith(prefix) and (want is None or want in hit))
         for p, hit in mine:
+            n += 1
+            if deadline is not None and n % _DEADLINE_CHECK_ENTRIES == 0 and time.monotonic() > deadline:
+                raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")
             rel = _resolve_entry(p, rootr, is_derived, der_rag, scope_paths)
             if rel is not None:
                 yield p, rel, is_derived, hit
 
 
 def _search_term(q: str, *, roots_spec: list, der_rag, imp_map: dict, entries, classify_cache, max_hits: int,
-                 scope_paths, deadline: float | None, layer, truncated_docs, offset: int, stats):
+                 scope_paths, deadline: float | None, layer, truncated_docs, offset: int, stats,
+                 partial_on_deadline: bool = False):
     """1 つの検索語 `q` のヒットを選抜して返す（`grep_search` の本体）。
     `entries` が None なら `roots_spec` のフォルダ木を全量歩く（純 Python 走査）。反復可能なら候補ファイル `(パス, rel, is_derived)` だけを開く（rg で絞った走査）。
     どちらも、開いたファイルは同じ判定・同じ整形を通す。
@@ -713,43 +730,48 @@ def _search_term(q: str, *, roots_spec: list, der_rag, imp_map: dict, entries, c
         # ファイル境界の打切り点。以後のファイル・root を開かない。
         return _closed(file_rank)
 
-    if entries is None:
-        stop_scan = False  # ファイル境界の打切り点
-        for root, is_derived in roots_spec:
-            _check_deadline()
-            if not root.is_dir():
-                continue
-            rootr = root.resolve()
-            walked = []
-            for i, p in enumerate(_walk_pruned(root)):
-                if (deadline is not None and i > 0 and i % _DEADLINE_CHECK_ENTRIES == 0
-                        and time.monotonic() > deadline):
-                    raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")
-                walked.append(p)
-            for p in sorted(walked):
-                # 各エントリの処理（ファイル読込・全文走査を含む）ごとに期限を確認する。
+    try:
+        if entries is None:
+            stop_scan = False  # ファイル境界の打切り点
+            for root, is_derived in roots_spec:
                 _check_deadline()
-                rel = _resolve_entry(p, rootr, is_derived, der_rag, scope_paths)
-                if rel is None:
+                if not root.is_dir():
                     continue
-                if _scan_entry(p, rel, is_derived):
-                    stop_scan = True
+                rootr = root.resolve()
+                walked = []
+                for i, p in enumerate(_walk_pruned(root)):
+                    if (deadline is not None and i > 0 and i % _DEADLINE_CHECK_ENTRIES == 0
+                            and time.monotonic() > deadline):
+                        raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")
+                    walked.append(p)
+                for p in sorted(walked):
+                    # 各エントリの処理（ファイル読込・全文走査を含む）ごとに期限を確認する。
+                    _check_deadline()
+                    rel = _resolve_entry(p, rootr, is_derived, der_rag, scope_paths)
+                    if rel is None:
+                        continue
+                    if _scan_entry(p, rel, is_derived):
+                        stop_scan = True
+                        break
+                if stop_scan:
                     break
-            if stop_scan:
-                break
-    elif heap_cap > 0:
-        # 重要度の設定が無ければ rank は一様＝発見順にそのまま開く（遅延列挙・満杯で打ち切り）。あれば rank 降順（同 rank は発見順）に並べて開く。
-        ordered_entries = entries
-        if imp_map:
-            ordered_entries = sorted(enumerate(entries), key=lambda ie: (-importance.rank_of(imp_map.get(ie[1][1])), ie[0]))
-            ordered_entries = (e for _i, e in ordered_entries)
-        for p, rel, is_derived in ordered_entries:
-            _check_deadline()
-            if bool(heap) and len(heap) >= heap_cap and importance.rank_of(imp_map.get(rel)) <= heap[0][0]:
-                break
-            if _scan_entry(p, rel, is_derived):
-                break
-    _check_deadline()
+        elif heap_cap > 0:
+            # 重要度の設定が無ければ rank は一様＝発見順にそのまま開く（遅延列挙・満杯で打ち切り）。あれば rank 降順（同 rank は発見順）に並べて開く。
+            ordered_entries = entries
+            if imp_map:
+                ordered_entries = sorted(enumerate(entries), key=lambda ie: (-importance.rank_of(imp_map.get(ie[1][1])), ie[0]))
+                ordered_entries = (e for _i, e in ordered_entries)
+            for p, rel, is_derived in ordered_entries:
+                _check_deadline()
+                if bool(heap) and len(heap) >= heap_cap and importance.rank_of(imp_map.get(rel)) <= heap[0][0]:
+                    break
+                if _scan_entry(p, rel, is_derived):
+                    break
+        _check_deadline()
+    except GrepDeadlineExceeded:
+        if not (partial_on_deadline and stats is not None):
+            raise
+        stats["deadline_exceeded"] = True  # 期限までに選抜できたヒットだけを返す
     # heap は有界。最終順序だけ `(-rank, seq)` 昇順（重要度が高いほど先・同 rank は発見順）へ並べ替える。`entry`=(rank, -seq, hit)。
     heap.sort(key=lambda entry: (-entry[0], -entry[1]))
     ordered = [hit for _rank, _neg_seq, hit in heap]
@@ -758,7 +780,7 @@ def _search_term(q: str, *, roots_spec: list, der_rag, imp_map: dict, entries, c
 
 
 def _grep_terms(terms: list, world: str, roots, max_hits: int, scope_paths, deadline, layer, truncated_docs,
-                offset: int, stats, engine: str) -> dict:
+                offset: int, stats, engine: str, partial_on_deadline: bool = False) -> dict:
     """`terms`（前後の空白を除いた空でない語）ごとのヒットを `{語: ヒット列}` で返す。`grep_search`／`grep_search_many` の共通の入口。
     ① 範囲の根（roots_spec）を決める ② rg が使えれば候補のファイルを 1 回の走査で集める（使えなければ純 Python 走査）
     ③ 重要度を解決する ④ 語ごとに `_search_term` でヒットを選抜する。
@@ -779,6 +801,8 @@ def _grep_terms(terms: list, world: str, roots, max_hits: int, scope_paths, dead
     roots_spec, wd, der_rag = _prepare_roots(world, roots)
     use_cache = roots is None
     classify_cache = search_cache.ClassifyCache(world) if use_cache else None
+    partial = partial_on_deadline and stats is not None
+    out: dict = {}
     try:
         entries = None
         imp_map: dict = {}
@@ -789,9 +813,9 @@ def _grep_terms(terms: list, world: str, roots, max_hits: int, scope_paths, dead
                 try:
                     budget = rg_search.Budget(_check_deadline())
                     cand, controls = _discover_candidates(terms, roots_spec, wd, world, cacheable=use_cache,
-                                                          offset=max(0, offset), budget=budget)
+                                                          offset=max(0, offset), budget=budget, deadline=deadline)
                     if roots is None and wd and controls:
-                        resolved = list(_candidate_entries(cand, roots_spec, der_rag, scope_paths))
+                        resolved = list(_candidate_entries(cand, roots_spec, der_rag, scope_paths, deadline=deadline))
                         imp_map = _candidate_importance(world, wd, controls, [(p, rel) for p, rel, _d, _h in resolved])
                         entries = resolved
                     else:
@@ -800,23 +824,27 @@ def _grep_terms(terms: list, world: str, roots, max_hits: int, scope_paths, dead
                     _log_rg_fallback(f"rg を使えません（{e}）")
                     entries = None
         if entries is None and roots is None and wd:
-            imp_map = _walk_importance(world, wd)
-        out: dict = {}
+            imp_map = _walk_importance(world, wd, deadline)
         for i, t in enumerate(terms):
             if entries is None:
                 mine = None
             else:
                 want = None if len(terms) == 1 else i
                 if entries is True:
-                    stream = _candidate_entries(cand, roots_spec, der_rag, scope_paths, want)
+                    stream = _candidate_entries(cand, roots_spec, der_rag, scope_paths, want, deadline)
                 else:
                     stream = (e for e in entries if want is None or want in e[3])
                 mine = ((p, rel, d) for p, rel, d, _h in stream)
             out[t] = _search_term(t, roots_spec=roots_spec, der_rag=der_rag, imp_map=imp_map, entries=mine,
                                   classify_cache=classify_cache, max_hits=max_hits, scope_paths=scope_paths,
                                   deadline=deadline, layer=layer, truncated_docs=truncated_docs,
-                                  offset=offset, stats=stats)
+                                  offset=offset, stats=stats, partial_on_deadline=partial)
         return out
+    except GrepDeadlineExceeded:
+        if not partial:
+            raise
+        stats["deadline_exceeded"] = True
+        return {t: out.get(t, []) for t in terms}
     finally:
         if classify_cache is not None:
             classify_cache.flush()
@@ -825,7 +853,7 @@ def _grep_terms(terms: list, world: str, roots, max_hits: int, scope_paths, dead
 def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 scope_paths=None, deadline: float | None = None, layer=None,
                 truncated_docs: list | None = None, offset: int = 0, stats: dict | None = None, *,
-                engine: str = "auto"):
+                engine: str = "auto", partial_on_deadline: bool = False):
     """`query` を含む行を world のフォルダ木から探し、根拠つきヒットを返す（read-only）。
     各ヒット: `{doc_id(=rel_path), path(内部用・API 非露出), ext, line, span:[start,end], text, match}`。
     登録者の重要度（`_重要度.txt`・`ingest.importance`）があれば `importance`/`importance_reason` を追加する（無ければキー自体を作らない）。
@@ -854,16 +882,21 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
     `deadline`（`time.monotonic()` 系の絶対期限・既定 None＝無期限）: 関数の開始直後・ルートごとの走査開始時・ツリー列挙中（ソートの前・`_DEADLINE_CHECK_ENTRIES` 件ごと）・
     各エントリの処理直前・ファイル読込直後・行走査ループ内（`_DEADLINE_CHECK_LINES` 行ごと）・各 `return` の直前で確認し、超過で `GrepDeadlineExceeded` を送出する（部分結果は返さない）。rg の走査中の超過も同じ例外にする。
 
+    `partial_on_deadline`（既定 False）: 真で `stats` も渡されたときは、期限切れで例外を送出せず、期限までに選抜できたヒットを返して `stats["deadline_exceeded"] = True` を立てる（呼び出し元が打ち切りを申告する）。既定は従来どおり `GrepDeadlineExceeded`。
+
     `offset`（既定 0）: 上位 `offset + max_hits` 件を選抜し、`[offset:offset+max_hits]` を返す。
     設計: docs/design/rag.md「読み取り部品の道具」
     """
     if deadline is not None and time.monotonic() > deadline:
-        raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")
+        if not (partial_on_deadline and stats is not None):
+            raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")
+        stats["deadline_exceeded"] = True
+        return []
     q = (query or "").strip()
     if not q:
         return []
     return _grep_terms([q], world, roots, max_hits, scope_paths, deadline, layer, truncated_docs, offset, stats,
-                       engine)[q]
+                       engine, partial_on_deadline)[q]
 
 
 def grep_search_many(queries, world: str = "v1", roots=None, max_hits: int = 50,
