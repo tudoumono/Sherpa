@@ -119,6 +119,7 @@ init_schema
 insert_api_key
 is_invited
 is_personal_tainted
+ledger_stamp
 list_announcements
 list_api_keys
 list_audit

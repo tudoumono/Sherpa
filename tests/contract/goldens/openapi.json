@@ -13458,7 +13458,7 @@
     },
     "/scopes": {
       "get": {
-        "description": "範囲セレクタ用のツリー。world のフォルダ prefix（件数つき）を返す。取り込みの台帳から出し、台帳が無いときだけ資料フォルダを（期限つきで）歩く。",
+        "description": "範囲セレクタ用のツリー。world のフォルダ prefix（件数つき）を返す。取り込みの台帳から出し、台帳が無いときだけ資料フォルダを（期限つきで）歩く。\n台帳の変更印から作る ETag を付け、`If-None-Match` が一致すれば本文を作らず 304 を返す（`Cache-Control: private, no-cache`＝毎回確かめる）。",
         "operationId": "scopes_scopes_get",
         "parameters": [
           {

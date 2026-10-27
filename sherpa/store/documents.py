@@ -76,6 +76,17 @@ def list_document_names(world) -> list:
             "SELECT name FROM documents WHERE kb_id=%s AND version=%s ORDER BY name", (_KB_ID, world)).fetchall()]
 
 
+def ledger_stamp(world) -> tuple:
+    """world の文書台帳の変更印 `(件数, 行の最大 updated_at)`。台帳が空なら `(0, None)`。
+    索引 `doc_ver` で引く 1 行の集計で、台帳の全件は読まない（置き換えると updated_at が進む）。
+    """
+    _ensure()
+    with _connect() as c:
+        row = c.execute("SELECT COUNT(*) AS n, MAX(updated_at) AS at FROM documents WHERE kb_id=%s AND version=%s",
+                        (_KB_ID, world)).fetchone()
+    return (row["n"], row["at"]) if row else (0, None)
+
+
 def document_exists(world, name) -> bool:
     """world の文書台帳に `name`（正準表記）が完全一致で存在するか。原本DL の別名拒否に使う。"""
     _ensure()

@@ -99,7 +99,7 @@ from .failed_docs import (  # noqa: F401
 # documents・ingest の re-export。
 from .documents import (  # noqa: F401
     count_and_list_documents, count_documents, document_exists, get_document, list_document_names, list_document_worlds,
-    list_documents, list_documents_page, read_ledger_for_listing, replace_document, replace_documents,
+    list_documents, list_documents_page, ledger_stamp, read_ledger_for_listing, replace_document, replace_documents,
 )
 from .ingest import (  # noqa: F401
     add_ingest_run,

@@ -7,12 +7,18 @@ world のフォルダ階層そのものが範囲＝`scope_prefixes`（rel_path �
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
+import threading
 from pathlib import PurePosixPath
+from typing import NamedTuple
 
-from . import doc_ledger, scope_infer, worlds
+from . import doc_ledger, scope_infer, store, worlds
 from .ingest import importance, text_kind
 from .ingest.analyzers import registry as _analyzer_registry
+
+_log = logging.getLogger("sherpa")
 
 # 範囲ツリーに数える本文の拡張子（grep 対象＋旧形式 Office・画像 Evidence・軽量テキスト枠）。
 # ソース原文の拡張子はアナライザ登録簿が真実源。office_md は import が重いため値を複製する
@@ -38,16 +44,15 @@ def normalize_scope_paths(scope_paths) -> list:
     return out
 
 
-def _content_rels(world: str, root=None, strict: bool = False, deadline: float | None = None):
-    """world 内の本文ファイルの rel_path を列挙する（範囲ツリー・既知 prefix の元）。
+def _by_ext(names) -> list:
+    return [rel for rel in names if PurePosixPath(rel).suffix.lower() in _CONTENT_EXT]
 
-    取り込みの台帳（`documents` の name）があればそれだけから出し、資料フォルダは歩かない（`root`／`strict`／`deadline` は使わない）。
-    台帳が空・読めないときだけ `scope_infer.safe_files` で歩く。`root` を渡すと再解決しない。`strict`／`deadline` は `safe_files` へ渡す
-    （OSError の re-raise／木走査の打ち切り）。`deadline` 省略時は利用者の操作向けの短い期限を付ける（超過で `ScopeWalkDeadlineExceeded`）。
+
+def _walk_rels(world: str, root=None, strict: bool = False, deadline: float | None = None) -> list:
+    """台帳が無いときだけ資料フォルダを歩いて本文の rel_path を列挙する。`root` を渡すと再解決しない。
+    `strict`／`deadline` は `safe_files` へ渡す（OSError の re-raise／木走査の打ち切り）。
+    `deadline` 省略時は利用者の操作向けの短い期限を付ける（超過で `ScopeWalkDeadlineExceeded`）。
     """
-    names = doc_ledger.ledger_rels(world)
-    if names is not None:
-        return [rel for rel in names if PurePosixPath(rel).suffix.lower() in _CONTENT_EXT]
     wd = root if root is not None else worlds.world_dir(world)
     if not wd:
         return []
@@ -58,25 +63,98 @@ def _content_rels(world: str, root=None, strict: bool = False, deadline: float |
            if rp.suffix.lower() in _CONTENT_EXT and not importance.is_importance_control_path(rel)]
 
 
+def _content_rels(world: str, root=None, strict: bool = False, deadline: float | None = None):
+    """world 内の本文ファイルの rel_path を列挙する（範囲ツリー・既知 prefix の元）。
+
+    取り込みの台帳（`documents` の name）があればそれだけから出し、資料フォルダは歩かない（`root`／`strict`／`deadline` は使わない）。
+    台帳が空・読めないときだけ `_walk_rels` で歩く。
+    """
+    names = doc_ledger.ledger_rels(world)
+    if names is not None:
+        return _by_ext(names)
+    return _walk_rels(world, root, strict, deadline)
+
+
+class _PrefixIndex(NamedTuple):
+    """本文の rel の一覧から出る結果。`scopes`＝(path, label, depth, count) を path 昇順・`known`＝選べる prefix の集合。不変。"""
+    scopes: tuple
+    known: frozenset
+
+
+def _build_index(rels) -> _PrefixIndex:
+    counts: dict = {}
+    for rel in rels:
+        for p in scope_infer.ancestor_scopes(rel):  # 祖先 prefix ごとに配下の件数を数える
+            counts[p] = counts.get(p, 0) + 1
+    scopes = tuple((p, _leaf_token(p) or p, p.count("/"), counts[p]) for p in sorted(counts))
+    return _PrefixIndex(scopes, frozenset(counts))
+
+
+# 資料フォルダごとの台帳由来の結果。鍵＝台帳の変更印（`store.ledger_stamp`）で、変われば作り直す。
+_INDEX_CACHE: dict = {}
+_INDEX_LOCKS: dict = {}
+_INDEX_LOCKS_GUARD = threading.Lock()
+
+
+def _index_lock(world: str) -> threading.Lock:
+    with _INDEX_LOCKS_GUARD:
+        return _INDEX_LOCKS.setdefault(world, threading.Lock())
+
+
+def _prefix_index(world: str, root=None, strict: bool = False, deadline: float | None = None) -> _PrefixIndex:
+    """台帳があれば資料フォルダごとに 1 回だけ作って使い回し、台帳が変わったら作り直す。台帳が無いときは歩いて都度作る（保存しない）。
+    ① 変更印を引く（台帳が空→歩く・引けない→従来どおり `_content_rels`） ② 同じ印のキャッシュがあれば返す
+    ③ 無ければ資料フォルダごとのロックで 1 本だけ、印を引き直してから台帳を読んで作る。
+    守ること: 印は台帳の全件読みより先に引く（古い印に新しい中身が付くのは許すが、逆は許さない）。
+    """
+    try:
+        stamp = store.ledger_stamp(world)
+    except Exception as e:
+        _log.warning("scope: world=%s 台帳の変更印を引けません: %s", world, e)
+        return _build_index(_content_rels(world, root, strict, deadline))
+    if not stamp[0]:
+        _INDEX_CACHE.pop(world, None)
+        return _build_index(_walk_rels(world, root, strict, deadline))
+    hit = _INDEX_CACHE.get(world)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    with _index_lock(world):
+        try:
+            stamp = store.ledger_stamp(world)
+        except Exception as e:
+            _log.warning("scope: world=%s 台帳の変更印を引けません: %s", world, e)
+            return _build_index(_content_rels(world, root, strict, deadline))
+        if not stamp[0]:
+            _INDEX_CACHE.pop(world, None)
+            return _build_index(_walk_rels(world, root, strict, deadline))
+        hit = _INDEX_CACHE.get(world)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+        names = doc_ledger.ledger_rels(world)
+        if names is None:
+            _INDEX_CACHE.pop(world, None)
+            return _build_index(_walk_rels(world, root, strict, deadline))
+        index = _build_index(_by_ext(names))
+        _INDEX_CACHE[world] = (stamp, index)
+        return index
+
+
 def known_scope_prefixes(world: str, root=None, strict: bool = False,
                          deadline: float | None = None) -> set:
-    """選択可能なフォルダ prefix の集合（全祖先パス込み）。`root`/`strict`/`deadline` は `_content_rels` 参照。"""
-    out = set()
-    for rel in _content_rels(world, root, strict, deadline):
-        out.update(scope_infer.ancestor_scopes(rel))
-    return out
+    """選択可能なフォルダ prefix の集合（全祖先パス込み）。`root`/`strict`/`deadline` は `_walk_rels` 参照。"""
+    return set(_prefix_index(world, root, strict, deadline).known)
 
 
 def valid_scope_paths(world: str, scope_paths, root=None, strict: bool = False,
                       deadline: float | None = None) -> bool:
     """選択 prefix が全て既知のフォルダ prefix か（未知は弾く）。空は真（world 全体）。
 
-    `root`・`strict` は `_content_rels` 参照。`deadline` 超過時は `scope_infer.ScopeWalkDeadlineExceeded` を送出する。
+    `root`・`strict` は `_walk_rels` 参照。`deadline` 超過時は `scope_infer.ScopeWalkDeadlineExceeded` を送出する。
     """
     sel = normalize_scope_paths(scope_paths)
     if not sel:
         return True
-    known = known_scope_prefixes(world, root, strict, deadline)
+    known = _prefix_index(world, root, strict, deadline).known
     return bool(known) and all(s in known for s in sel)
 
 
@@ -96,16 +174,25 @@ def _leaf_token(path: str) -> str:
 
 def scope_tree(world: str) -> dict:
     """範囲セレクタ用ツリー。world のフォルダ prefix（祖先込み・件数・見出し）を返す。画面は選んだ `path` を `scope_paths` として送る。
-    台帳があれば台帳から出す（`_content_rels`）。台帳が無く歩くときの期限超過は `scope_infer.ScopeWalkDeadlineExceeded`。"""
-    rels = _content_rels(world)
-    counts: dict = {}
-    for rel in rels:
-        for p in scope_infer.ancestor_scopes(rel):  # 祖先 prefix ごとに配下の件数を数える
-            counts[p] = counts.get(p, 0) + 1
-    prefixes = counts.keys()
-    scopes = [{"path": p, "label": _leaf_token(p) or p, "depth": p.count("/"), "count": counts[p]}
-              for p in sorted(prefixes)]
+    台帳があれば台帳から出し（資料フォルダごとに 1 回作って使い回す・`_prefix_index`）、台帳が無く歩くときの期限超過は `scope_infer.ScopeWalkDeadlineExceeded`。"""
+    scopes = [{"path": p, "label": label, "depth": depth, "count": count}
+              for p, label, depth, count in _prefix_index(world).scopes]
     return {"world": world, "label": worlds.world_label(world), "scopes": scopes}
+
+
+_ETAG_FORMAT = "1"  # 木の形を変えたら上げる（ブラウザの古い写しを無効にする）
+
+
+def scope_tree_etag(world: str) -> str | None:
+    """`scope_tree(world)` の ETag（台帳の変更印と見出しから作る）。台帳が空・印を引けないときは None。"""
+    try:
+        count, at = store.ledger_stamp(world)
+    except Exception:
+        return None
+    if not count:
+        return None
+    raw = f"{_ETAG_FORMAT}|{world}|{worlds.world_label(world)}|{count}|{at.isoformat() if at else ''}"
+    return '"' + hashlib.sha1(raw.encode("utf-8")).hexdigest() + '"'
 
 
 # ---- レンズ（grep/近傍）の根拠を範囲で剪定（traversal は Cypher 側で絞る）----

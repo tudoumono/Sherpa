@@ -160,7 +160,9 @@ export async function loadScopes() {
   let tree = null;
   try { tree = await getJSON('/scopes?world=' + encodeURIComponent($('version').value)); } catch (e) { }
   const scopes = (tree && tree.scopes) || [];
-  const leaves = scopes.filter((s) => !scopes.some((o) => o.path !== s.path && o.path.startsWith(s.path + '/')));
+  // 範囲は祖先のフォルダを全部含むので、子を持つフォルダ＝いずれかの path の親
+  const parents = new Set(scopes.map((s) => (s.path.includes('/') ? s.path.slice(0, s.path.lastIndexOf('/')) : null)));
+  const leaves = scopes.filter((s) => !parents.has(s.path));
   _scopeAvail = leaves.length > 1;   // 選べる末端が1つ以下なら範囲指定は出さない
   if (!_scopeAvail) { updateScopeVisibility(); return; }
   S.scopeTree = tree; S.scopeLabels = {}; scopes.forEach((s) => { S.scopeLabels[s.path] = s.label; });
