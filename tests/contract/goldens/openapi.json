@@ -13279,7 +13279,7 @@
     },
     "/ingest/preview": {
       "get": {
-        "description": "取り込み・抽出プレビュー（読み取り専用）。資料の一覧と world グラフの抽出内容を返す。取り込み中・一度も完了していない資料フォルダはグラフを組み立てず、`graph_note` に理由を返す。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする。",
+        "description": "取り込み・抽出プレビュー（読み取り専用）。資料の一覧（台帳から）・フォルダ・重要度の診断と、取り込みの記録の件数を返す。要素・関係は `GET /ingest/preview/graph`。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする。",
         "operationId": "ingest_preview_ingest_preview_get",
         "parameters": [
           {
@@ -13321,6 +13321,55 @@
           }
         },
         "summary": "Ingest Preview",
+        "tags": [
+          "資料フォルダ(World)管理"
+        ]
+      }
+    },
+    "/ingest/preview/graph": {
+      "get": {
+        "description": "資料フォルダのグラフ（要素・関係・件数）。画面が「関係を確認」を押したときだけ呼ぶ。取り込み中・一度も完了していない・資料が多い資料フォルダは組み立てず、`graph_note` に理由を返す。",
+        "operationId": "ingest_preview_graph_ingest_preview_graph_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "world",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "World"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ingest Preview Graph",
         "tags": [
           "資料フォルダ(World)管理"
         ]

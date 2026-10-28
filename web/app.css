@@ -324,7 +324,7 @@ tr.hideRow{display:none}
 .a-body{flex:1;min-width:0}
 .composer{flex:0 0 auto;padding:12px 18px;border-top:1px solid var(--border);background:var(--surface)}
 .composer .box{max-width:min(var(--chatmax,1040px),100%);margin:0 auto;border:1px solid var(--border);border-radius:var(--radius);padding:8px 10px;display:flex;align-items:flex-end;gap:8px}
-.composer textarea{flex:1;border:none;outline:none;resize:none;font-family:inherit;font-size:var(--text-body);max-height:120px;background:transparent;color:var(--ink);padding:6px 2px}
+.composer textarea{flex:1;border:none;outline:none;resize:none;font-family:inherit;font-size:var(--text-body);max-height:40vh;overflow-y:auto;background:transparent;color:var(--ink);padding:6px 2px}
 .sendbtn{width:44px;height:44px;border-radius:8px;border:none;background:var(--action-bg);color:var(--action-fg);display:grid;place-items:center;flex:0 0 auto;font-size:var(--text-body);cursor:pointer}
 .sendbtn.stopping{background:var(--warn);color:var(--action-fg);font-size:var(--text-label)}   /* ストリーミング中は「■ 停止」に切り替える */
 .sendbtn.stopping:hover{filter:brightness(0.95)}

@@ -391,6 +391,7 @@ export async function send(override) {
   S.sending = true;
   S.turnStartedAtMs = Date.now();
   $('input').value = '';
+  $('input').style.height = '';   // 広げた入力欄を 1 行に戻す
   const w = $('messages').querySelector('.welcome-msg'); if (w) w.remove();
   appendUser(message);
   S.ansEl = null; S.ansHead = null;

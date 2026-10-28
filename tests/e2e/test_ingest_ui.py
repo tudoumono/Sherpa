@@ -4,7 +4,7 @@ import json
 import re
 
 import pytest
-from mock_api import PREVIEW, USER_MEMBER, WORLD, WORLD_STATUS_RESP, install_api_mocks
+from mock_api import PREVIEW, PREVIEW_GRAPH, USER_MEMBER, WORLD, WORLD_STATUS_RESP, install_api_mocks
 from playwright.sync_api import expect
 
 RUNNING_PROGRESS = {"stage": "es_index", "stage_label": "検索できるように登録中",
@@ -12,6 +12,7 @@ RUNNING_PROGRESS = {"stage": "es_index", "stage_label": "検索できるよう�
 BUSY_ACTIONS = {name: {"allowed": False, "reason": "取り込み中のため、この操作はできません。終わってからお試しください"}
                 for name in ("recount", "refresh", "rag_regenerate_rules", "delete", "reconvert")}
 ACCEPTED = "受け付けました。状況は取り込み状況でご確認ください。"
+_PREVIEW_URL = re.compile(r"/ingest/preview(\?|$)")   # 一覧の応答。`/ingest/preview/graph`（関係を確認）は含めない
 SCAN_PDF = "4期/02_設計/01_基本設計/スキャン図面.pdf"
 
 
@@ -23,13 +24,15 @@ def _route_json(page, pattern, body, status=200):
     page.route(pattern, lambda route: _fulfill(route, body, status))
 
 
-def _open(page, web_base_url, status=None, preview=None, **mock_kw):
-    """ingest.html を開く。status／preview を渡すと /worlds/w1/status・/ingest/preview の応答を差し替える。"""
+def _open(page, web_base_url, status=None, preview=None, graph=None, **mock_kw):
+    """ingest.html を開く。status／preview／graph を渡すと /worlds/w1/status・/ingest/preview・/ingest/preview/graph の応答を差し替える。"""
     records = install_api_mocks(page, **mock_kw)
     if status is not None:
         _route_json(page, "**/worlds/w1/status", {**WORLD_STATUS_RESP, **status})
     if preview is not None:
-        _route_json(page, "**/ingest/preview**", preview)
+        _route_json(page, _PREVIEW_URL, preview)
+    if graph is not None:
+        _route_json(page, "**/ingest/preview/graph**", graph)
     page.goto(f"{web_base_url}/ingest.html")
     return records
 
@@ -188,7 +191,7 @@ def test_register_success_resyncs_status_section(page, web_base_url):
         _fulfill(route, new_preview if (state["registered"] and "world=w2" in route.request.url) else PREVIEW)
 
     page.route("**/worlds", handle_worlds)
-    page.route("**/ingest/preview**", handle_preview)
+    page.route(_PREVIEW_URL, handle_preview)
     _route_json(page, "**/worlds/*/status",
                 {"ok": True, "indexed": 1, "office_md": 1, "skipped_office": 0, "office_failed": 0,
                  "skipped_other": 0, "graph_nodes": 0, "es_chunks": 1})
@@ -283,7 +286,7 @@ def test_ingest_status_page_shows_loading_then_rows(page, web_base_url):
     """一覧・ツリーに読み込み中表示が出て、データ到着後に一覧へ切り替わる（応答を保留して決定的に観測）。"""
     install_api_mocks(page)
     pending: dict = {}
-    page.route("**/ingest/preview**", lambda route: pending.update(route=route))
+    page.route(_PREVIEW_URL, lambda route: pending.update(route=route))
     page.goto(f"{web_base_url}/ingest.html")
 
     expect(page.locator("#rows")).to_contain_text("読み込み中")
@@ -310,7 +313,7 @@ def test_preview_unavailable_shows_plain_state_not_stuck_spinner(page, web_base_
 
     if not registered:
         _route_json(page, "**/worlds", {"worlds": []})
-    page.route("**/ingest/preview**", handle_preview)
+    page.route(_PREVIEW_URL, handle_preview)
     page.goto(f"{web_base_url}/ingest.html")
 
     text = "取り込み状況を取得できません" if registered else "まだ資料フォルダが登録されていません"
@@ -430,7 +433,7 @@ def test_importance_badge_and_diagnostics_banner(page, web_base_url):
     expect(banner).to_contain_text("_重要度.txt")
     expect(banner).to_contain_text("4期/02_設計/_重要度.txt:3行目")
 
-    _route_json(page, "**/ingest/preview**", PREVIEW)
+    _route_json(page, _PREVIEW_URL, PREVIEW)
     page.goto(f"{web_base_url}/ingest.html")
     expect(page.locator("#impdiag")).to_be_hidden()
 
@@ -438,15 +441,47 @@ def test_importance_badge_and_diagnostics_banner(page, web_base_url):
 def test_detail_overlay_shows_why_graph_is_not_built(page, web_base_url):
     """要素・関係を組み立てていないとき（取り込み中など）は、詳細の画面に理由を出し、記録の無い件数は「不明」と出す。"""
     note = "取り込み中のため、要素と関係の詳細は取り込みが終わってから表示します。"
-    preview = {**PREVIEW, "graph_note": note, "entities": [], "relations": [], "issues": [],
-               "counts": {"entities": 120, "relations": None, "deprecated": None, "hidden": None, "documents": 3}}
-    _open(page, web_base_url, preview=preview)
+    graph = {**PREVIEW_GRAPH, "graph_note": note, "entities": [], "relations": [], "issues": [],
+             "counts": {"entities": 120, "relations": None, "deprecated": None, "hidden": None, "documents": 3}}
+    _open(page, web_base_url, graph=graph)
     page.locator("#detailbtn").click()
     bar = page.locator("#pv-bar")
     expect(bar).to_contain_text("120")
     expect(bar).to_contain_text("不明")
     expect(bar).to_contain_text(note)
     expect(bar).not_to_contain_text("廃止/隠し")
+
+
+def test_detail_overlay_lists_entities_and_relations_from_graph(page, web_base_url):
+    """「詳細（管理）」を開いたときだけ関係の取得を呼び、要素と関係を一覧に出す（資料の一覧を開くだけでは呼ばない）。"""
+    calls = []
+    page.on("request", lambda r: calls.append(r.url) if "/ingest/preview/graph" in r.url else None)
+    _open(page, web_base_url)
+    expect(page.locator("#rows")).to_contain_text("4期")
+    assert calls == []
+
+    page.locator("#detailbtn").click()
+    expect(page.locator("#pv-ents .ent", has_text="TAX-RATE")).to_contain_text("解析: COBOL")
+    expect(page.locator("#pv-rels")).to_contain_text("DOCUMENTS")
+    assert len(calls) == 1
+
+
+def test_detail_overlay_shows_plain_error_when_graph_fails(page, web_base_url):
+    """「詳細（管理）」で関係の取得に失敗したら、読み込み中のまま止めず平文で出す。"""
+    _open(page, web_base_url)
+    _route_json(page, "**/ingest/preview/graph**", {"detail": "取り込み状況を読み込めませんでした"}, 503)
+    page.locator("#detailbtn").click()
+    bar = page.locator("#pv-bar")
+    expect(bar).to_contain_text("関係を取得できません")
+    expect(bar.locator(".spinner")).to_have_count(0)
+
+
+def test_partial_folder_scan_and_pending_list_are_shown_in_plain_words(page, web_base_url):
+    """フォルダの走査が期限で止まったときはツリーの下に、一覧を出せないときは一覧の空欄にその理由を平文で出す。"""
+    note = "まだ取り込みが終わっていないため、資料の一覧は取り込みのあとに出します。"
+    _open(page, web_base_url, preview={**PREVIEW, "documents": [], "documents_note": note, "folders_partial": True})
+    expect(page.locator("#tree")).to_contain_text("資料の無いフォルダと重要度の設定は一部だけ確認しています")
+    expect(page.locator("#rows")).to_contain_text(note)
 
 
 def test_status_shows_counts_as_of_and_recount_button(page, web_base_url):

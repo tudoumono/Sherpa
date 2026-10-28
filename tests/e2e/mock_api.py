@@ -35,15 +35,17 @@ SCOPES = {
 }
 
 PREVIEW = {
-    # S3: 実形状（sherpa/preview_service.py::build_preview）は world/label/issues も持つ
-    # （旧モックは無かった＝実ドリフト是正）。issues は build_preview の `flags`（未解決の抽出警告）。
-    # 実 API（doc_ledger.control_diagnostics 経由）は importance_diagnostics も常に持つ
-    # （`_重要度.txt` の構文診断・無ければ空リスト）。
+    # 実形状（sherpa/preview_service.py::build_preview）: 画面を開いたときの応答は要素・関係・警告を持たない
+    # （空で返る。中身は GET /ingest/preview/graph = PREVIEW_GRAPH）。
+    # S3: 実形状は world/label/issues も持つ。実 API（doc_ledger.control_diagnostics 経由）は
+    # importance_diagnostics も常に持つ（`_重要度.txt` の構文診断・無ければ空リスト）。
     "world": "w1", "label": "4期更改", "issues": [], "importance_diagnostics": [],
-    # グラフを組み立てていない理由（組み立てたときは None）。
+    # グラフを今は組み立てられない理由（組み立てられるときは None）。
     "graph_note": None,
-    # 資料の画面のツリー用のフォルダの一覧（資料の無いフォルダも含む）。
-    "folders": [], "folders_truncated": False,
+    # 一覧を出せない理由（台帳が空で、資料フォルダを歩く期限を超えたとき）。
+    "documents_note": None,
+    # 資料の画面のツリー用のフォルダの一覧（資料の無いフォルダも含む）。`folders_partial` は走査が期限で止まったこと。
+    "folders": [], "folders_truncated": False, "folders_partial": False,
     "counts": {"entities": 4, "relations": 3,
                "deprecated": 0, "hidden": 0, "documents": 3},
     # フェーズ7-1: 実 doc（doc_ledger.py::preview_documents）は phase/category/label/reason も常に持つ
@@ -76,6 +78,14 @@ PREVIEW = {
          "phase": None, "category": "01_基本設計", "label": "使えます（画像OCR）", "reason": None,
          "provenance": {"method": "markitdown_ocr", "confidence": 0.4}},
     ],
+    "entities": [], "relations": [],
+}
+
+PREVIEW_GRAPH = {
+    # GET /ingest/preview/graph（sherpa/preview_service.py::build_preview_graph）の実形状。
+    "world": "w1", "issues": [], "graph_note": None,
+    "counts": {"entities": 4, "relations": 3,
+               "deprecated": 0, "hidden": 0, "documents": 3},
     # S3: 実形状（sherpa/preview_service.py::build_preview の entities）は top_scope/phase/path を
     # 持つ（旧モックの "parent" キーは実 API に存在しない＝実ドリフト是正）。
     # `analyzer`＝担当アナライザの来歴（コード分のみ非 None・§7 裁定2）。ソース正典化（K12）で
@@ -2524,6 +2534,8 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             return _json(route, SCOPES)
         if method == "GET" and path == "/ingest/preview":
             return _json(route, PREVIEW)
+        if method == "GET" and path == "/ingest/preview/graph":
+            return _json(route, PREVIEW_GRAPH)
         if method == "GET" and path == "/admin/es/search":
             # S2: ヒットに由来（extraction_method）と照合差分（has_conflicts）を通す。
             q = (query.get("query") or [""])[0]
@@ -2805,6 +2817,7 @@ MOCKED: list[tuple[str, str]] = [
     ("POST", "/conversation-shares/{share_id}/extend"),
     ("GET", "/scopes"),
     ("GET", "/ingest/preview"),
+    ("GET", "/ingest/preview/graph"),
     ("GET", "/admin/es/search"),
     ("GET", "/fs/list"),
     ("GET", "/worlds/{wid}/status"),

@@ -5,7 +5,7 @@ import pytest
 from _world_setup import SPEC, TAXCALC
 
 from sherpa import preview_service
-from sherpa.preview_service import build_preview
+from sherpa.preview_service import build_preview, build_preview_graph
 
 V = "v1"
 
@@ -27,8 +27,10 @@ def _completed(monkeypatch):
 def test_preview_extraction_structure(_completed):
     """S3（2026-09-04-グラフのソース正典化.md §4・K9-K11）: 意味層フル抽出・REALIZES 橋・名寄せ
     （merges）は撤去済み——entities/relations は骨格（Pass1/Pass2）＋言及エッジ（Pass3）のみ。
-    K12: entities_llm/entities_both 等は撤去済み（全件 static のため無意味）。"""
-    pv = build_preview(V)
+    K12: entities_llm/entities_both 等は撤去済み（全件 static のため無意味）。
+    要素・関係は画面を開いたときの `build_preview` ではなく `build_preview_graph` が返す。"""
+    assert build_preview(V)["entities"] == []
+    pv = build_preview_graph(V)
     assert "merges" not in pv
     ents = {(e["name"], e["label"]) for e in pv["entities"]}
     assert ("TAX-RATE", "DataItem") in ents
@@ -56,7 +58,10 @@ def test_preview_endpoint_and_ui_served():
     c = TestClient(app)
     pv = c.get("/ingest/preview", params={"world": V})
     assert pv.status_code == 200 and {"counts", "entities", "relations", "documents"} <= pv.json().keys()
+    assert pv.json()["entities"] == [] and pv.json()["relations"] == []   # 要素・関係は /ingest/preview/graph
     assert "merges" not in pv.json()   # S3・K9-K11: 名寄せ（REALIZES 由来）は撤去済み
+    graph = c.get("/ingest/preview/graph", params={"world": V})
+    assert graph.status_code == 200 and {"counts", "entities", "relations", "issues", "graph_note"} <= graph.json().keys()
     for page in ("chat.html", "chat.js", "ingest.html", "ingest.js", "app.css"):
         r = c.get(f"/ui/{page}")
         assert r.status_code == 200, f"/ui/{page} -> {r.status_code}"

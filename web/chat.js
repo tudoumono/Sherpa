@@ -107,6 +107,7 @@ $('messages').addEventListener('click', (e) => {
 $('messages').addEventListener('click', (e) => {
   const ex = e.target.closest('[data-ex]'); if (!ex) return;
   $('input').value = EXAMPLES[Number(ex.dataset.ex)] || '';
+  fitInput();
   $('input').focus();
   $('input').setSelectionRange(0, $('input').value.length);   // 置き換え対象を選択状態に
 });
@@ -234,6 +235,13 @@ $('forkbtn').addEventListener('click', () => {
 
 $('send').addEventListener('click', sendOrStop);
 // IME の変換確定の Enter では送信しない（isComposing が無い組み合わせに備えて keyCode 229 も見る・usage.js と同じ）。
+// 入力欄を書いた分だけ広げる（上限は CSS の max-height・超えたら欄の中でスクロール）
+function fitInput() {
+  const t = $('input');
+  t.style.height = 'auto';
+  t.style.height = `${t.scrollHeight}px`;
+}
+$('input').addEventListener('input', fitInput);
 $('input').addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
 
 // コピー（メッセージ全体）。secure context 外では textarea フォールバック。

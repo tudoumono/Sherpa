@@ -2032,3 +2032,16 @@ def test_export_includes_budget_stop_and_personal_sources_but_not_when_shared(pa
     own, shared_txt = texts
     assert "調査の上限に達したため、途中までの結果で答えています" in own and "調査の上限に達したため" in shared_txt
     assert "個人メモ.txt" in own and "個人メモ.txt" not in shared_txt
+
+
+def test_input_grows_with_long_text_and_returns_to_one_line_after_send(page, web_base_url):
+    _open(page, web_base_url)
+    box = page.locator("#input")
+    one_line = box.evaluate("t => t.clientHeight")
+    box.fill("\n".join(f"{i} 行目の長い依頼文です。" for i in range(12)))
+    grown = box.evaluate("t => t.clientHeight")
+    assert grown > one_line * 3
+    assert grown <= page.evaluate("innerHeight") * 0.4 + 1   # 上限を超えたら欄の中でスクロールする
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+    assert box.evaluate("t => t.clientHeight") == one_line

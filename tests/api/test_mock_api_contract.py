@@ -89,6 +89,7 @@ _CASES = [
     ("/announcements", {}, {"announcements": mock_api.ANNOUNCEMENTS}),
     ("/chat/turns/running", {}, mock_api.CHAT_TURNS_RUNNING_EMPTY),
     ("/ingest/preview", {"world": "v1"}, mock_api.PREVIEW),
+    ("/ingest/preview/graph", {"world": "v1"}, mock_api.PREVIEW_GRAPH),
 ]
 
 
@@ -192,6 +193,7 @@ _MOCK_SCHEMA_CASES = [
     (list[sc.WorkspaceFileRow], mock_api.WORKSPACE_FILES, "WORKSPACE_FILES"),
     (list[sc.AnnouncementOut], mock_api.ANNOUNCEMENTS, "ANNOUNCEMENTS"),
     (sc.IngestPreviewResponse, mock_api.PREVIEW, "PREVIEW"),
+    (sc.IngestPreviewGraphResponse, mock_api.PREVIEW_GRAPH, "PREVIEW_GRAPH"),
     (sc.ChatTurnsRunningResponse, mock_api.CHAT_TURNS_RUNNING_EMPTY, "CHAT_TURNS_RUNNING_EMPTY"),
     (list[sc.ConversationSummary], mock_api.CONVERSATIONS_LIST, "CONVERSATIONS_LIST"),
     # フェーズ7-1 再RV（Codex MEDIUM・2026-07-16）: 定数だけでなく handler が動的に組み立てる応答

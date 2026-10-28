@@ -1156,7 +1156,8 @@ class ImportanceDiagnostic(BaseModel):
 
 
 class IngestPreviewResponse(BaseModel):
-    """取り込みのプレビュー（GET /ingest/preview）。response_model は付与しない（条件付きキーのため）。"""
+    """取り込みのプレビュー（GET /ingest/preview）。response_model は付与しない（条件付きキーのため）。
+    要素・関係・警告は常に空（`GET /ingest/preview/graph` が返す）。`documents_note` は一覧を出せない理由、`folders_partial` はフォルダの走査が期限で止まったこと。"""
     world: str
     label: str | None
     counts: IngestPreviewCounts
@@ -1165,6 +1166,18 @@ class IngestPreviewResponse(BaseModel):
     entities: list[IngestPreviewEntity]
     relations: list[IngestPreviewRelation]
     importance_diagnostics: list[ImportanceDiagnostic]
+    graph_note: str | None = None
+    documents_note: str | None = None
+    folders_partial: bool = False
+
+
+class IngestPreviewGraphResponse(BaseModel):
+    """資料フォルダのグラフ（GET /ingest/preview/graph）。response_model は付与しない（`GET /ingest/preview` と同じ）。"""
+    world: str
+    counts: IngestPreviewCounts
+    entities: list[IngestPreviewEntity]
+    relations: list[IngestPreviewRelation]
+    issues: list[Any]
     graph_note: str | None = None
 
 

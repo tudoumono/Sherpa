@@ -1,5 +1,5 @@
 """資料フォルダ(World)管理エンドポイント。3 つの router から成る:
-- `ingest_preview_router`: `GET /ingest/preview`
+- `ingest_preview_router`: `GET /ingest/preview`・`GET /ingest/preview/graph`
 - `worlds_router`: `GET /world-options`・`GET /fs/list`・`GET /worlds`・`GET /worlds/{wid}/status`・`POST /worlds/{wid}/recount`・`POST /worlds`・`POST /worlds/diff`・`POST /worlds/disk-estimate`・`POST /worlds/{wid}/rebind`・`POST /worlds/{wid}/refresh`・`POST /worlds/{wid}/reconvert`・`POST /worlds/{wid}/rag_regenerate_rules`・`GET`/`PUT /worlds/{wid}/resolve-settings`・`DELETE /worlds/{wid}`
 - `ingest_runs_router`: `POST /ingest/rerun`・`GET /ingest/runs`・`GET /ingest/workers`
 api.py が元の位置にそれぞれ `app.include_router(...)` する（ルート表 golden の定義順を保つため）。`_browse_roots`/`_under_roots` は `sherpa.deps` にある。
@@ -33,7 +33,7 @@ from sherpa.deps import (
 from sherpa.grep_tool import valid_world
 from sherpa.ingest import background, failure_reasons, resolve_settings, world_graph, worker_status
 from sherpa.ingest import worker as ingest_worker
-from sherpa.preview_service import build_preview
+from sherpa.preview_service import build_preview, build_preview_graph
 from sherpa.store import ingest as ingest_store
 from sherpa.schemas import (
     FsListResponse,
@@ -211,13 +211,25 @@ ingest_runs_router = APIRouter()
 
 @ingest_preview_router.get("/ingest/preview", tags=["資料フォルダ(World)管理"])
 def ingest_preview(request: Request, world: str | None = Query(None, pattern=_WORLD_PATTERN)):
-    """取り込み・抽出プレビュー（読み取り専用）。資料の一覧と world グラフの抽出内容を返す。取り込み中・一度も完了していない資料フォルダはグラフを組み立てず、`graph_note` に理由を返す。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする。"""
+    """取り込み・抽出プレビュー（読み取り専用）。資料の一覧（台帳から）・フォルダ・重要度の診断と、取り込みの記録の件数を返す。要素・関係は `GET /ingest/preview/graph`。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする。"""
     _require_admin(_current_user(request))
     wid = _resolve_world(world)
     try:
         return build_preview(wid)
     except Exception as e:
         _log.warning("取り込みプレビューの構築に失敗しました wid=%s", wid, exc_info=True)
+        raise HTTPException(503, _GRAPH_UNAVAILABLE_MESSAGE) from e
+
+
+@ingest_preview_router.get("/ingest/preview/graph", tags=["資料フォルダ(World)管理"])
+def ingest_preview_graph(request: Request, world: str | None = Query(None, pattern=_WORLD_PATTERN)):
+    """資料フォルダのグラフ（要素・関係・件数）。画面が「関係を確認」を押したときだけ呼ぶ。取り込み中・一度も完了していない・資料が多い資料フォルダは組み立てず、`graph_note` に理由を返す。"""
+    _require_admin(_current_user(request))
+    wid = _resolve_world(world)
+    try:
+        return build_preview_graph(wid)
+    except Exception as e:
+        _log.warning("取り込みプレビューのグラフの構築に失敗しました wid=%s", wid, exc_info=True)
         raise HTTPException(503, _GRAPH_UNAVAILABLE_MESSAGE) from e
 
 

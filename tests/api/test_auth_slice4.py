@@ -322,6 +322,7 @@ def test_admin_gate_management_endpoints_for_user_and_admin():
     for path, kwargs in [
         ("/worlds", {}),
         ("/ingest/preview", {}),
+        ("/ingest/preview/graph", {}),
         ("/ingest/runs", {}),
         ("/admin/es/search", {"params": {"query": "slice4"}}),
         ("/admin/users", {}),

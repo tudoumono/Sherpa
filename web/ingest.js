@@ -937,6 +937,7 @@ function renderTree() {                       // フォルダツリー（範囲�
     html += `<div class="tnode ${_folder === path ? 'on' : ''}" data-folder="${esc(path)}" style="padding-left:${8 + depth * 15}px">📁 ${esc(name)}<span class="tc">${counts[path]}</span></div>`;
   }
   if (_pv && _pv.folders_truncated) html += '<div class="muted" style="font-size:var(--text-caption);padding:6px 8px">フォルダが多いため、資料の無いフォルダは一部だけ出しています</div>';
+  if (_pv && _pv.folders_partial) html += '<div class="muted" style="font-size:var(--text-caption);padding:6px 8px">フォルダが多いため、資料の無いフォルダと重要度の設定は一部だけ確認しています</div>';
   $('tree').innerHTML = html;
 }
 
@@ -957,7 +958,7 @@ function render() {
   const shown = browsing ? docs.filter((d) => (d.folder || '') === _folder) : docs;
   const subRows = browsing ? childFolders().map(folderRow).join('') : '';
   $('rows').innerHTML = (subRows + shown.map(row).join(''))
-    || `<tr><td colspan="6"><div class="empty">${browsing ? 'このフォルダは空です' : '該当する資料がありません'}</div></td></tr>`;
+    || `<tr><td colspan="6"><div class="empty">${esc((_pv && _pv.documents_note) || (browsing ? 'このフォルダは空です' : '該当する資料がありません'))}</div></td></tr>`;
   updateEsScope();
 }
 
@@ -1066,21 +1067,37 @@ async function checkAdmin() {
 const statusTag = (s) => (s && s !== 'active')
   ? `<span class="statustag ${s === 'deprecated' ? 'deprecated' : 'hidden_candidate'}">${s === 'deprecated' ? '廃止' : '未使用の疑い'}</span>` : '';
 
-function openPrev() {
+let _prevSeq = 0;                              // 「関係を確認」の応答が古くなったか（資料フォルダの切り替え・閉じた後）を見分ける
+async function openPrev() {
   if (!_pv) return;
-  const c = _pv.counts, note = _pv.graph_note;
+  const world = $('version').value, seq = ++_prevSeq;
+  const stale = () => seq !== _prevSeq || world !== $('version').value;
+  $('pv-bar').innerHTML = _LOADING_INLINE;
+  $('pv-ents').innerHTML = '';
+  $('pv-rels').innerHTML = '';
+  $('overlay').classList.add('open');
+  try {
+    const g = await getJSON(`/ingest/preview/graph?world=${encodeURIComponent(world)}`);
+    if (stale()) return;
+    renderPrev(g);
+  } catch (e) {
+    if (stale()) return;
+    $('pv-bar').innerHTML = `<div class="danger">関係を取得できません: ${esc(e.message)}</div>`;
+  }
+}
+function renderPrev(g) {
+  const c = g.counts, note = g.graph_note;
   const num = (v) => (v == null ? '不明' : v);   // 取り込みの記録が無い件数は「不明」と出す
   $('pv-bar').innerHTML = `抽出された要素 <b>${num(c.entities)}</b> ・ 関係 <b>${num(c.relations)}</b>`
     + (c.deprecated == null || c.hidden == null ? '' : ` ・ 廃止/隠し <b>${c.deprecated + c.hidden}</b>`)
     + (note ? `<div class="muted" style="margin-top:6px">${esc(note)}</div>` : '');
   // 担当アナライザの来歴（コード以外は analyzer=null＝出さない）。
-  $('pv-ents').innerHTML = _pv.entities.map((e) => `<div class="ent"><span class="ico">${esc(ABBR[e.label] || e.label)}</span>`
+  $('pv-ents').innerHTML = g.entities.map((e) => `<div class="ent"><span class="ico">${esc(ABBR[e.label] || e.label)}</span>`
     + `<span class="nm">${esc(e.name)}${statusTag(e.status)}<small>${esc(e.label)}${e.parent ? ' ・ ' + esc(e.parent) : ''}${e.value != null ? ' ・ 値 ' + esc(e.value) : ''}${e.analyzer ? ' ・ 解析: ' + esc(analyzerLabel(e.analyzer)) : ''}</small></span></div>`).join('');
-  $('pv-rels').innerHTML = _pv.relations.map((r) => `<div class="rel"><div class="chain">${esc(r.src)} ─${esc(r.type)}→ ${esc(r.dst)}</div>`
+  $('pv-rels').innerHTML = g.relations.map((r) => `<div class="rel"><div class="chain">${esc(r.src)} ─${esc(r.type)}→ ${esc(r.dst)}</div>`
     + `<div class="meta">${statusTag(r.status)}${r.doc ? '<span>' + esc(r.doc) + '</span>' : ''}</div></div>`).join('');
-  $('overlay').classList.add('open');
 }
-function closePrev() { $('overlay').classList.remove('open'); }
+function closePrev() { _prevSeq++; $('overlay').classList.remove('open'); }
 
 async function download(name) {
   // doc_id＝rel_path（slash を含む）＝パス基準DL（world＋rel を query で渡す・鏡モデル）
