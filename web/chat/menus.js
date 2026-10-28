@@ -185,7 +185,7 @@ document.addEventListener('focusin', (e) => {
 $('convlist').closest('.pane-body').addEventListener('scroll', () => closeConversationMenu(true));
 window.addEventListener('resize', () => closeConversationMenu(true));
 
-// ===== 書き出し（会話全体・回答単位／Markdown・テキスト・JSON・PDF(印刷)）=====
+// ===== 書き出し（会話全体・回答単位／Markdown・テキスト・JSON・PDF(印刷で保存)）=====
 function _stamp() {
   const d = new Date(), p = (n) => String(n).padStart(2, '0');
   return { human: `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`,
@@ -313,14 +313,73 @@ function _download(name, content, mime) {
 }
 // 回答単位の書き出し（chat.js の data-export 委譲リスナーが呼ぶ）。
 export function exportMessages(title, messages, format, shared = false) {
-  if (format === 'pdf') { window.print(); return; }   // 印刷ダイアログから PDF 保存
   if (format === 'json') _download(_exportName(title, 'json'), JSON.stringify({ title, exported_at: _stamp().human, messages }, null, 2), 'application/json');
   else if (format === 'txt') _download(_exportName(title, 'txt'), _buildText(title, messages, false, shared), 'text/plain;charset=utf-8');
   else _download(_exportName(title, 'md'), _buildText(title, messages, true, shared), 'text/markdown;charset=utf-8');
   toast('エクスポートしました');
 }
+// 会話全体の PDF（印刷で保存）。画面に描かれた質問と回答カードを #print-root へ複製して印刷する。
+// 設計: docs/design/chat.md「会話全体の書き出し（PDF）」
+// 複製から除くもの（操作・思考の流れ・実行の詳細・入力欄）。
+const PRINT_DROP = 'button, input, textarea, select, .msg-feedback, .usage-meta, .provider-summary, .investigation-record, '
+  + '.created-files-link, .retry-hints, .pathbtn, .caret';
+function _printLabel(text) {
+  const d = document.createElement('div'); d.className = 'pr-label'; d.textContent = text; return d;
+}
+// 回答カード（.msg）を印刷用に複製する。畳まれた部分は開き、ボタン類は除く。
+function _printAnswer(msg, running) {
+  const wrap = document.createElement('div'); wrap.className = 'pr-a';
+  wrap.appendChild(_printLabel('回答'));
+  // 回答中のターン（考え中の表示・逐次表示中のカード）は「回答中」の一行にする。
+  if (running) {
+    const d = document.createElement('div'); d.className = 'pr-pending';
+    d.textContent = '（回答中です。この回答は含まれていません）';
+    wrap.appendChild(d); return wrap;
+  }
+  const clone = (msg.querySelector('.a-body') || msg).cloneNode(true);
+  clone.querySelectorAll('.cites-h').forEach((h) => {
+    const t = document.createElement('div'); t.className = 'cites-h';
+    t.textContent = h.textContent.replace('▾', '').trim(); h.replaceWith(t);
+  });
+  clone.querySelectorAll('.cites-body').forEach((b) => { b.hidden = false; });
+  clone.querySelectorAll('.ilist li').forEach((li) => li.classList.add('open'));
+  clone.querySelectorAll('details').forEach((d) => { d.open = true; });
+  clone.querySelectorAll(PRINT_DROP).forEach((el) => el.remove());
+  wrap.appendChild(clone);
+  return wrap;
+}
+let _printRoot = null;   // 書き出し中の #print-root（次の書き出しで前のものを消す）
+function printConversation(title) {
+  if (_printRoot) _printRoot.remove();
+  const root = document.createElement('div'); root.id = 'print-root';
+  const h = document.createElement('h1'); h.className = 'pr-title'; h.textContent = title;
+  const meta = document.createElement('div'); meta.className = 'pr-meta'; meta.textContent = `書き出し: ${_stamp().human}`;
+  root.append(h, meta);
+  const msgs = [...$('messages').querySelectorAll(':scope > .msg')].filter((m) => !m.classList.contains('welcome-msg'));
+  // 実行中（送信中・購読中）のときだけ、最後の回答カードを回答中とみなす（止めた・失敗した回答はそのまま載せる）
+  const last = msgs[msgs.length - 1];
+  const runningMsg = (S.es || S.sending) && last && !last.classList.contains('user')
+    && (last.querySelector('.thinking') || last === S.ansEl) ? last : null;
+  let n = 0;
+  msgs.forEach((msg) => {
+    n++;
+    if (msg.classList.contains('user')) {
+      const q = document.createElement('div'); q.className = 'pr-q';
+      const t = document.createElement('div'); t.className = 'pr-qtext';
+      t.textContent = (msg.querySelector('.bubble-user') || msg).textContent;
+      q.append(_printLabel('質問'), t); root.appendChild(q);
+    } else root.appendChild(_printAnswer(msg, msg === runningMsg));
+  });
+  if (!n) { toast('書き出す内容がありません'); return; }
+  document.body.appendChild(root);
+  _printRoot = root;
+  document.documentElement.classList.add('printing');
+  window.addEventListener('afterprint', () => { root.remove(); document.documentElement.classList.remove('printing'); }, { once: true });
+  window.print();
+}
 async function exportChat(format) {
   const title = $('conv-title').textContent || 'chat';
+  if (format === 'pdf') { printConversation(title); return; }
   let messages = [], shared = false;
   if (S.cid) {
     try {
@@ -334,7 +393,7 @@ async function exportChat(format) {
 }
 function renderExportMenu() {
   $('exportmenu').innerHTML = '<div class="bm-h">この会話を書き出し</div>'
-    + [['md', 'Markdown'], ['txt', 'テキスト'], ['json', 'JSON'], ['pdf', 'PDF（印刷）']].map(([f, l]) => `<button class="fontitem" data-exp="${f}">${l}</button>`).join('');
+    + [['md', 'Markdown'], ['txt', 'テキスト'], ['json', 'JSON'], ['pdf', 'PDF（印刷で保存）']].map(([f, l]) => `<button class="fontitem" data-exp="${f}">${l}</button>`).join('');
 }
 $('exportbtn').addEventListener('click', (e) => { e.stopPropagation(); renderExportMenu(); $('exportmenu').hidden = !$('exportmenu').hidden; });
 $('exportmenu').addEventListener('click', (e) => { const it = e.target.closest('[data-exp]'); if (!it) return; $('exportmenu').hidden = true; exportChat(it.dataset.exp); });

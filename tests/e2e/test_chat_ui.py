@@ -895,7 +895,7 @@ def test_export_and_font_menus(page, web_base_url):
     expect(page.locator("#exportmenu")).to_be_visible()
     items = page.locator("#exportmenu [data-exp]")
     expect(items).to_have_count(4)
-    expect(items).to_have_text(["Markdown", "テキスト", "JSON", "PDF（印刷）"])
+    expect(items).to_have_text(["Markdown", "テキスト", "JSON", "PDF（印刷で保存）"])
 
     expect(page.locator("#fontmenu")).to_be_hidden()
     page.locator("#fontbtn").click()

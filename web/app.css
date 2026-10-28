@@ -1004,3 +1004,39 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
   .spinner,.status.wait .d,.rhead .rt.live .dot,.fstep.active .fnode,.fstep.active .fnode::after{
     animation:none;transition:none}
 }
+
+/* ===== 印刷（チャットの「PDF（印刷で保存）」）。html.printing の間だけ #print-root を白地・黒字で通常の流れに出す ===== */
+#print-root{display:none}
+@media print{
+  html.printing,html.printing[data-theme="dark"]{
+    --bg:#fff; --surface:#fff; --surface-2:#f1f3f5; --border:#c7ced8;
+    --ink:#000; --ink-2:#222; --ink-3:#444;
+    --accent:#0d9488; --accent-weak:#ccfbf1; --accent-ink:#0f766e;
+    --action-bg:#0f766e; --action-fg:#fff; --control-border:#7c8794;
+    --ok:#15803d; --ok-bg:#e9f7ef; --warn:#9a4d05; --warn-bg:#fdf3e7; --danger:#b91c1c; --danger-bg:#fdecec;
+    --shadow:none; --shadow-lg:none;
+  }
+  html.printing,html.printing body{height:auto !important;overflow:visible !important;background:#fff !important;color:#000}
+  html.printing body > *:not(#print-root){display:none !important}
+  #print-root{display:block;font-size:11pt;line-height:1.7;color:#000;background:#fff}
+  #print-root *{overflow:visible !important;max-height:none !important;animation:none !important;transition:none !important}
+  #print-root a{color:#0f766e;text-decoration:underline}
+  #print-root .pr-title{font-size:18pt;margin:0 0 4px}
+  #print-root .pr-meta{font-size:9pt;color:#444;margin-bottom:14px;padding-bottom:8px;border-bottom:2px solid #000}
+  #print-root .pr-label{font-size:9pt;font-weight:700;color:#444;letter-spacing:.06em;margin-bottom:3px}
+  #print-root .pr-q{margin-top:18px;padding:8px 0 6px;border-top:1px solid #000;break-after:avoid}
+  #print-root .pr-qtext{font-size:13pt;font-weight:700;white-space:pre-wrap;overflow-wrap:anywhere}
+  #print-root .pr-a{margin-top:6px}
+  #print-root .pr-pending{color:#444;font-style:italic}
+  #print-root .headline{white-space:normal}
+  #print-root pre,#print-root .headline pre.md-code{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
+  #print-root .cite,#print-root .askcard,#print-root .created-files,#print-root .chips,#print-root .ilist li,
+  #print-root .sources-group,#print-root tr,#print-root .budget-note{break-inside:avoid}
+  #print-root table,#print-root .headline table.md-table{display:table;width:100%;table-layout:auto;border-collapse:collapse}
+  #print-root td,#print-root th{overflow-wrap:anywhere;word-break:break-word}
+  #print-root thead{display:table-header-group}
+  #print-root .ilist li .ixdetail{max-height:none;opacity:1;margin-top:9px}
+  #print-root .a-avatar{display:none}
+  #print-root .a-row{display:block}
+  #print-root .sources a,#print-root .doc,#print-root .src-name{overflow-wrap:anywhere;word-break:break-all}
+}
