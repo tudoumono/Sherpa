@@ -284,6 +284,14 @@ Traceback が付くのは想定外の例外だけです。MD 化の段の最後�
 上限を超えた資料は OS に落とされる前に「旧形式の変換がメモリの上限を超えました」の 1 行で名前が残ります。空きメモリが少ない間は
 「メモリの空きを待っています」の行が出て、先読みが待ちます（`cat /proc/meminfo | grep MemAvailable` で今の空きが分かります）。
 
+**旧形式の変換の時間切れがどの資料に偏っているかを見るとき**: 直近の取り込みの失敗の一覧から、時間切れになった資料を拡張子ごと・原本の大きさの帯ごとに数えます。
+`.xls` はシート数・行数の目安も出します（読むだけ・何も書き換えない・資料の名前やパスは出さず件数だけ）。どのフォルダからでも実行できます。
+
+```bash
+bash <Sherpaの置き場所>/scripts/lo_timeout_report.sh                # 全部の資料フォルダ
+WORLD=<資料フォルダ名> bash <Sherpaの置き場所>/scripts/lo_timeout_report.sh   # 1 つに絞る
+```
+
 **まとめて見る/集計する**: 上記は個別に `tail`/`cat` してもよいですが、`./sherpactl logs` は RUN_DIR/*.log と
 Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に合流して追えます
 （`./sherpactl logs convert embed` で絞り込み・`./sherpactl logs -r` で追わずに集計レポート・
