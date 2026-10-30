@@ -1141,6 +1141,20 @@
             "title": "Conversation Id",
             "type": "integer"
           },
+          "scope_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope Paths"
+          },
           "started_at": {
             "title": "Started At",
             "type": "string"

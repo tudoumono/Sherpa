@@ -11,7 +11,7 @@ import {
   setSendButtonStopping, startFlow, subscribeTurn, resetFlow, _questionAnswerState, appendRestoredQuestion,
   invalidateStopContext, startThinkingTicker,
 } from './stream.js';
-import { renderScopePanel, setScopeLabel, applyConversationScope, setKb } from './scope.js';
+import { renderScopePanel, setScopeLabel, applyConversationScope, applyRunningTurnScope, setKb } from './scope.js';
 import { resetInquiryForNewConversation, applyInquiryOpenDefault } from './inquiry.js';
 import { toast, updateShareButtonState } from '../chat.js';
 
@@ -278,6 +278,7 @@ export async function resumeRunningTurn(cid, turns) {
   if (S.es && S.turnId === hit.turn_id) return;
   // 別の turnId を購読済みなら上書きしない
   if (S.es && S.turnId && S.turnId !== hit.turn_id) return;
+  if (Array.isArray(hit.scope_paths)) applyRunningTurnScope(hit.scope_paths);
   S.turnId = hit.turn_id;
   // 経過秒はサーバの started_at を起点にする
   S.turnStartedAtMs = Date.parse(hit.started_at) || Date.now();

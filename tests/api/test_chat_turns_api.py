@@ -220,6 +220,7 @@ def test_turn_stop_via_turn_id_skips_assistant_save_and_yields_stopped_and_leave
     assert hit is not None, "開始直後は running 一覧に出るはず"
     assert hit["conversation_id"] == cid
     assert hit.get("started_at")
+    assert hit["scope_paths"] == [], "送信時の範囲（未指定＝全体）が running 一覧に載っていない"
 
     assert c.post(f"/chat/turns/{tid}/stop").json() == {"ok": True}
     r = c.post("/chat/turns/no-such-turn-id/stop")

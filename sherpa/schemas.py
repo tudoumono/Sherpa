@@ -1471,6 +1471,7 @@ class ChatTurnRunning(BaseModel):
     turn_id: str
     conversation_id: int
     started_at: str
+    scope_paths: list[str] | None = None  # 送信時の範囲（空＝全体・社内資料オフと `all=true` は null）
     uid: str | None = None  # `all=true`（管理者）のときだけ値が入る（それ以外は null）
 
 

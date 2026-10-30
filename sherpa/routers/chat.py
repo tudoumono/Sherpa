@@ -319,8 +319,9 @@ def chat_turns_start(req: ChatReq, request: Request):
     # settings を一度だけ読み、knowledge の実効値と Provider を同じスナップショットから準備する。接続先検証→可用性チェックの順で行い、受付（422判定）と背景実行本体（`_turn_run_fn`）へ同じ Provider/settings/snapshot を渡す。
     knowledge, provider, settings, sys_settings, tools_availability = _prepare_agentic_snapshot(
         uid, req.knowledge, req.web_search)
+    turn_scope = None
     if knowledge:
-        validated_scope(w, req.scope_paths)  # 実在 world のみ＋scope 検証（開始前に弾く）。
+        turn_scope = validated_scope(w, req.scope_paths)  # 実在 world のみ＋scope 検証（開始前に弾く）。
         _validate_tools_availability(req.tools, availability=tools_availability)  # 明示ON指定の不達ツールは 422（ツール名つき）。
 
     def _make_conversation() -> int:
@@ -339,7 +340,8 @@ def chat_turns_start(req: ChatReq, request: Request):
         # `known_conversation_id`: リクエストが既存会話への継続（`req.conversation_id` 明示）のときだけ渡す。新規会話（None）は会話単位の排他判定の対象外。
         rec = chat_turns.start_turn(uid=uid, conversation_factory=_make_conversation,
                                     run_fn_factory=run_fn_factory,
-                                    known_conversation_id=req.conversation_id)
+                                    known_conversation_id=req.conversation_id,
+                                    scope_paths=turn_scope)
     except chat_turns.TurnLimitError as e:
         if e.scope == "conversation":
             raise HTTPException(429, "この会話の別の回答を実行中です。終わってからもう一度お試しください。")
@@ -368,7 +370,8 @@ def chat_turns_running(request: Request, all: bool = Query(False)):
         raise HTTPException(403, "管理者のみ")
     recs = chat_turns.list_running(u["uid"], all_users=all)
     return {"turns": [{"turn_id": r.turn_id, "conversation_id": r.conversation_id,
-                       "started_at": r.started_at.isoformat(), **({"uid": r.uid} if all else {})}
+                       "started_at": r.started_at.isoformat(),
+                       **({"uid": r.uid} if all else {"scope_paths": r.scope_paths})}
                       for r in recs]}
 
 

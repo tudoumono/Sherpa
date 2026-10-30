@@ -68,6 +68,14 @@ export function applyConversationScope(messages) {
   if (S.scopeTree) renderScopePanel(S.scopeTree);
   updateScopeHeader(sc);
 }
+// 回答待ちの質問がある会話を開いたとき、その質問で送った範囲を選択に戻す（最後の回答の範囲より優先する）。
+export function applyRunningTurnScope(paths) {
+  S.scope = paths.slice();
+  S.currentScopeMeta = { ...(S.currentScopeMeta || {}), scope_paths: S.scope.slice(),
+    source: S.scope.length ? 'explicit' : 'all' };
+  if (S.scopeTree) renderScopePanel(S.scopeTree);
+  setScopeLabel(scopeChipLabel());
+}
 function _scopeAncestors(path) {   // "a/b/c" → ["a","a/b"]（自分自身は含まない）
   const parts = path.split('/');
   const out = [];
