@@ -1393,7 +1393,10 @@ def test_plan_main_accepts_its_final_without_tool_zero_or_ledger_review(tmp_path
     report = env["investigation"]
     assert report["review_requests"] == 0 and report["stopped_reason"] == "self_final"
     assert len(report["unconfirmed_items"]) == 1 and env["headline"].startswith("自分で完了")
-    assert "未確認:" not in env["headline"] and "- 架空対象（調べ終わっていません）" in env["headline"]
+    assert "未確認:" not in env["headline"] and "調べた範囲" not in env["headline"]
+    items = [(i["label"], i["text"]) for i in env["investigation_summary"]["items"]]
+    assert ("調べた項目", "対象 1 件のうち、確かめた 0 件・確かめられなかった 0 件・未着手 1 件") in items
+    assert ("確認できなかった項目", "架空対象（調べ終わっていません）") in items
     assert "ledger_" not in json.loads(capture.read_text())["agents"]
     assert "使うかどうかは自分で決めてよい" in json.loads(capture.read_text())["agents"]
 
@@ -1431,7 +1434,8 @@ def test_plan_modes_keep_the_model_answer_and_verified_sources(tmp_path, monkeyp
     body = env["body"]
     assert "- src/demo_one.cbl 受付処理" in body and "- src/demo_two.cbl 集計処理" in body
     assert "未確認:" not in body and "短い結論です" not in body
-    assert "## 調べた範囲（調査計画書）" in body
+    assert "調べた範囲" not in body and "[a]" not in body and "参照した資料" not in body
+    assert "前提" not in body and "仮定です" not in body
     ids = {s["doc_id"] for s in env["sources"]}
     assert ids == {"4期/02_設計/01_基本設計/税計算仕様書.md"}
     assert "存在しない資料.md" not in ids
@@ -1440,7 +1444,22 @@ def test_plan_modes_keep_the_model_answer_and_verified_sources(tmp_path, monkeyp
     assert saved["candidate"]["reason"] == "refs_block" and saved["candidate"]["picked_index"] == 0
     assert saved["review"]["app_gating"] is (style == "plan_gate")
     assert (tmp_path / "eval/conv-710.adopted.md").read_text() == _LIST_ANSWER.strip()
-    assert "## 調べた範囲" in (tmp_path / "eval/conv-710.composed.md").read_text()
+    assert "- src/demo_one.cbl 受付処理" in (tmp_path / "eval/conv-710.composed.md").read_text()
+
+
+def test_plan_conclusion_paths_become_reference_candidates(tmp_path, monkeypatch):
+    plan = _PLAN_SHORT.replace("短い結論です [a]。", "短い結論です [a]。4期/01_標準/消費税法.md と「4期/無い/存在しない結論先.md」も関係。")
+    _setup(tmp_path, monkeypatch, [_st("PLAN-CONC", _final("答えです。"), plan_md=plan)] * 2,
+           users_dirname=_users("plan-conc"))
+    monkeypatch.setenv("SHERPA_LEDGER_STYLE", "plan_main")
+    ctx = helper._ctx(uid="plan-conc", conversation_id=712)
+    ctx.make_sources = lambda docs: [{"doc_id": d, "download_url": f"/dl?rel={d}"} for d in docs]
+    env = helper._result_env(helper._run(A.CodexProvider(), ctx))
+    paths = {r["path"] for r in env["referenced_docs"]}
+    assert paths == {"4期/02_設計/01_基本設計/税計算仕様書.md", "4期/01_標準/消費税法.md"}
+    assert not any(r.get("mentioned_only") for r in env["referenced_docs"])      # 参照の候補＝本文で触れただけの扱いにはしない
+    assert env["sources_unverified"] == [{"path": "4期/無い/存在しない結論先.md",
+                                          "reason": "見つからないか、読めない形式です"}]
 
 
 def test_json_style_answer_is_unchanged_by_plan_composition(tmp_path, monkeypatch):

@@ -5,7 +5,7 @@
 
 import { S, setChatExamples } from './state.js';
 import { setSimpleMode, setWebSearchEligible } from './inquiry.js';
-import { refreshWelcomeExamples, answerBody, answerNotices, unverifiedSourceRows, reconciliationRows, referencedDocRows, rangeText, impactListView, foundDocRows, howText, budgetNoteText, clipPersonalQuote } from './render.js';
+import { refreshWelcomeExamples, answerBody, answerNotices, unverifiedSourceRows, reconciliationRows, referencedDocRows, mentionedOnlyNote, rangeText, impactListView, foundDocRows, howText, budgetNoteText, clipPersonalQuote } from './render.js';
 import { toast } from '../chat.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;
@@ -261,14 +261,14 @@ function _answerLines(ans, md, shared) {
   if (newRefs) {
     L.push(md ? '**参照した資料**' : '参照した資料');
     if (!ref.rows.length && !ref.hidden && !ref.more) L.push('参照した資料はありません');
-    const rangeNote = (r) => (r.ranges.length || r.rangesMore ? '（' + [r.ranges.length ? rangeText(r) : '', r.rangesMore ? `ほか ${r.rangesMore} か所` : ''].filter(Boolean).join('、') + '）' : '');
-    ref.rows.forEach((r) => L.push(`${bullet}${r.path}${rangeNote(r)}${r.unopened ? '（Codex の読み取り記録なし）' : ''}`));
+    const rangeNote = (r) => (r.ranges.length || r.rangesMore ? '（Sherpa の読み取り機能で開いた: ' + [r.ranges.length ? rangeText(r) : '', r.rangesMore ? `ほか ${r.rangesMore} か所` : ''].filter(Boolean).join('、') + '）' : '');
+    ref.rows.forEach((r) => L.push(`${bullet}${r.path}${rangeNote(r)}${r.unopened && !r.mentionedOnly ? '（Sherpa の読み取り機能で開いた記録なし）' : ''}${r.mentionedOnly ? mentionedOnlyNote(r) : ''}`));
     if (ref.more) L.push(`${bullet}ほか ${ref.more} 件`);
     if (ref.hidden) L.push(`${bullet}名前を表示できない資料 ${ref.hidden} 件`);
   }
   const fnd = foundDocRows(ans);
   if (fnd.rows.length || fnd.hidden || fnd.more) {
-    L.push(md ? '**ほかに見つかった資料（Codex の読み取り記録なし）**' : 'ほかに見つかった資料（Codex の読み取り記録なし）');
+    L.push(md ? '**ほかに見つかった資料（Sherpa の読み取り機能で開いた記録なし）**' : 'ほかに見つかった資料（Sherpa の読み取り機能で開いた記録なし）');
     fnd.rows.forEach((p) => L.push(`${bullet}${p}`));
     if (fnd.more) L.push(`${bullet}ほか ${fnd.more} 件（上限で省略）`);
     if (fnd.hidden) L.push(`${bullet}名前を表示できない資料 ${fnd.hidden} 件`);

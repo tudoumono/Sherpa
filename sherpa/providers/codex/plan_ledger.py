@@ -14,7 +14,7 @@ from typing import NamedTuple
 
 from ... import depth_profile as depth_profile_mod
 from ... import tool_call_log
-from .citations import _HEADING_RE as _REFS_HEADING_RE, _looks_like_ref
+from .citations import _HEADING_RE as _REFS_HEADING_RE, _looks_like_ref, code_block_lines, last_heading_index
 from .ledger_gate import _FINAL_ANSWER_VOICE
 
 STYLE_ENV = "SHERPA_LEDGER_STYLE"
@@ -46,7 +46,7 @@ _UNSTARTED_PHRASE = "調べ終わっていません"
 _NO_SOURCE_PHRASE = "ソースの根拠（パス:行）が記載されていないため未確認として扱います"
 _TAG_RE = re.compile(r"\s*\[([^\[\]\s]+)\]")
 _REF_RE = re.compile(r":\d+(?:-\d+)?(?:,\s*\d+(?:-\d+)?)*$")
-_PATH_TOKEN_RE = re.compile(r"(?:[\w\-.]+/)*[\w\-.]+\.[A-Za-z][A-Za-z0-9]{0,5}")
+_PATH_TOKEN_RE = re.compile(r"(?:[\w\-.]+/)*[\w\-.]+\.[A-Za-z][A-Za-z0-9]{0,15}")
 _PLAN_ONLY_PATHS_MAX = 50
 
 
@@ -676,9 +676,73 @@ def strip_refs_block(body: str) -> str:
     return body[:idx].rstrip() if idx >= 0 else body.rstrip()
 
 
+_CODE_SPAN_RE = re.compile(r"(?P<t>`+)(?:(?!(?P=t)).)+?(?P=t)")
+_ID_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
+_LINK_DEF_RE = re.compile(r"^ {0,3}\[[^\]\n]+\]:[ \t]*\S")
+_LINK_DEF_LABEL_RE = re.compile(r"^(?: {0,3}>)*(?: ?>)* {0,3}\[([^\]\n]+)\]:[ \t]*\S", re.M)
+_QUOTE_PREFIX_RE = re.compile(r"^ {0,3}>(?: ?>)* ?")
+_TASK_BOX_RE = re.compile(r"^\s*(?:>\s*)*(?:[-*+]|\d{1,9}[.)])\s+\[[ xX]\](?=\s|$)")
+
+
+def _strip_tags_in_text(text: str, ids: set[str]) -> str:
+    """コードの外の文字から、独立した引用の印として付いた id の `[id]`（`[A1][A2]` の連続を含む）だけを除く。
+    直前が英数字・`_`・`]`・`)` の `[…]`（添字・参照。数字だけの id は日本語の文字も含む）と、直後が `(`・`[`・英数字の `[…]`（リンク）は残す。"""
+    runs: list[list[re.Match]] = []
+    for m in _TAG_RE.finditer(text):
+        if m.group(1) not in ids:
+            continue
+        if runs and runs[-1][-1].end() == m.start():
+            runs[-1].append(m)
+        else:
+            runs.append([m])
+    out, pos = [], 0
+    for run in runs:
+        first, last = run[0], run[-1]
+        tag_start = first.start(1) - 1
+        before = text[tag_start - 1] if tag_start > 0 else ""
+        after = text[last.end()] if last.end() < len(text) else ""
+        # 数字だけの id は添字（`値[0]`）と区別できないので、日本語を含む文字の直後も外さない。英字を含む id は日本語の直後なら外す
+        numeric = first.group(1).isdigit()
+        word_char = (before.isalnum() or before == "_") if numeric else bool(_ID_CHAR_RE.match(before))
+        glued_before = not first.group(0)[:1].isspace() and before and (word_char or before in "])")
+        glued_after = after and (_ID_CHAR_RE.match(after) or after in "([")
+        if glued_before or glued_after:
+            continue
+        out.append(text[pos:first.start()])
+        pos = last.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _strip_id_tags(text: str, ids: set[str]) -> str:
-    """結論の各文に添えた根拠の行の id（`[id]`）だけを除く。id 以外の角括弧は残す。"""
-    return _TAG_RE.sub(lambda m: "" if m.group(1) in ids else m.group(0), text)
+    """回答の文に添えた根拠の行の id（`[id]`）だけを除く。id 以外の角括弧、コードスパン・コードブロック（字下げのものを含む）の中、添字やリンクに隣接する角括弧、行頭のチェックボックス（`- [x]`）・リンクの定義（`[a]: URL`）と、定義のある名前の `[a]`（リンク）は残す。"""
+    lines = text.splitlines(keepends=True)
+    codes = code_block_lines([ln.rstrip("\r\n") for ln in lines])
+    # リンクの定義はコードブロックの外のものだけを数える
+    defined = {m.group(1).casefold() for ln, code in zip(lines, codes) if not code
+               for m in _LINK_DEF_LABEL_RE.finditer(ln)}
+    ids = {i for i in ids if i.casefold() not in defined}
+    out: list[str] = []
+    for line, code in zip(lines, codes):
+        # コードブロック（囲み・字下げ・引用や箇条書きの中）の行は触らない
+        if code:
+            out.append(line)
+            continue
+        quote = _QUOTE_PREFIX_RE.match(line)
+        inner = line[quote.end():] if quote else line
+        if _LINK_DEF_RE.match(inner):
+            out.append(line)
+            continue
+        box = _TASK_BOX_RE.match(line)
+        head, line = (line[:box.end()], line[box.end():]) if box else ("", line)
+        parts, pos = [head], 0
+        for c in _CODE_SPAN_RE.finditer(line):
+            parts.append(_strip_tags_in_text(line[pos:c.start()], ids))
+            parts.append(c.group(0))
+            pos = c.end()
+        parts.append(_strip_tags_in_text(line[pos:], ids))
+        out.append("".join(parts))
+    return "".join(out)
 
 
 def _conclusion_line(line: str, ids: set[str], unknown: set[str]) -> str:
@@ -689,6 +753,11 @@ def _conclusion_line(line: str, ids: set[str], unknown: set[str]) -> str:
                   or re.fullmatch(r"\s*(?:[-*_]\s*){3,}", line))
     prefix = "未確認: " if not formatting and (not tags.intersection(ids) or tags.intersection(unknown)) else ""
     return prefix + _strip_id_tags(line, ids)
+
+
+def _is_format_issue(r: PlanRow) -> bool:
+    """計画書の記載の不備の行（書式不正、または済なのに読める source 行が無い）。"""
+    return r.malformed or (r.mark == "x" and "source" in r.needs and not r.sources)
 
 
 def plan_gaps(plan: Plan) -> tuple[list[dict], list[dict]]:
@@ -713,10 +782,7 @@ def plan_gaps(plan: Plan) -> tuple[list[dict], list[dict]]:
 def _split_ref_block(answer: str) -> tuple[str, list[str]]:
     """回答を（参照ブロックを除いた本文, ブロックの行）に分ける。ブロックの範囲は `citations.parse_referenced_doc_lines` と同じ（最後の見出し・続く参照らしい行まで）。ブロックが無ければ（本文, [])。"""
     lines = answer.splitlines()
-    idx = None
-    for i, line in enumerate(lines):
-        if _REFS_HEADING_RE.match(line):
-            idx = i
+    idx = last_heading_index(lines, _REFS_HEADING_RE)
     if idx is None:
         return answer.rstrip(), []
     j = idx + 1
@@ -773,46 +839,27 @@ def _plan_only_paths(plan: Plan, refs: dict[str, list[str]], model_answer: str) 
     return out[:_PLAN_ONLY_PATHS_MAX]
 
 
-def _plan_supplement(plan: Plan, fmt: list[dict], unverified: list[dict]) -> str:
-    """本文の後ろに付ける補足の節「調べた範囲（調査計画書）」。計画書の前提・範囲・目録の件数・未完了の2種を並べる。"""
-    parts = []
-    premise = (_section(plan.sections, "前提") or "").strip()
-    if premise:
-        parts.append("### 前提\n" + premise)
-    scope_text = (_section(plan.sections, "範囲") or "").strip()
-    if scope_text:
-        parts.append("### 範囲\n" + scope_text)
-    kinds: dict[str, int] = {}
-    for r in plan.rows:
-        kinds[r.kind or "種別なし"] = kinds.get(r.kind or "種別なし", 0) + 1
-    n_closed = sum(1 for r in plan.rows if r.mark == "-" and not r.malformed)
-    n_open = sum(1 for r in plan.rows if r.mark == " " and not r.malformed)
-    n_done = sum(1 for r in plan.rows if r.mark == "x" and not r.malformed
-                 and not ("source" in r.needs and not r.sources))
-    parts.append(
-        f"母集団 {len(plan.rows)} 件（" + "・".join(f"{k} {v} 件" for k, v in kinds.items()) + "）。"
-        f"確認済み {n_done} 件・確認できなかった {n_closed} 件・未着手 {n_open} 件"
-        + (f"・計画書の記載の不備 {len(fmt)} 件" if fmt else "") + "。")
-    if unverified:
-        parts.append("### 確認できなかった項目\n" + "\n".join(f"- {u['item']}（{u['reason']}）" for u in unverified))
-    if fmt:
-        parts.append("### 計画書の記載の不備\n" + "\n".join(f"- {u['item']}（{u['reason']}）" for u in fmt))
-    return "## 調べた範囲（調査計画書）\n\n" + "\n\n".join(parts)
+def conclusion_text(st) -> str:
+    """このターンの計画書の結論の節（無ければ空）。"""
+    plan = getattr(st, "_plan_final", None)
+    return (_section(plan.sections, "結論") or "") if plan is not None else ""
 
 
 def compose_with_model_answer(plan: Plan, model_answer: str) -> tuple[str, dict]:
-    """モデルの回答を本文のまま残し、計画書を補足の節と参照の追記で後ろに付ける（本文・参照行は書き換えない）。
-    順序は 本文 → 補足の節 → 「参照した資料:」（モデルの参照行 → 計画書にだけある参照）。戻り値＝（組んだ本文, 記録用の要約）。"""
+    """モデルの回答を本文に残し（計画書の行の id だけ外す）、計画書の source 行にだけある参照を「参照した資料:」に追記する。
+    順序は 本文 → 「参照した資料:」（モデルの参照行 → 計画書にだけある参照）。戻り値＝（組んだ本文, 記録用の要約）。
+    設計: docs/design/codex.md「評価用の計画書では誰が完了を決めるか」"""
     refs = _plan_refs(plan)
     fmt, unverified = plan_gaps(plan)
     body, block = _split_ref_block(model_answer)
+    body = _strip_id_tags(body, {r.id for r in plan.rows if r.id})
     known = _block_ranges(block)
     added = []
     for p, ranges in refs.items():
         new = [x for x in ranges if x not in known.get(p, set())]
         if new:
             added.append(f"- {p}:{', '.join(new)}")
-    parts = [body, _plan_supplement(plan, fmt, unverified)]
+    parts = [body]
     if block or added:
         parts.append("\n".join(block or ["参照した資料:"]) + ("\n" + "\n".join(added) if added else ""))
     parts = [x for x in parts if x]
@@ -824,7 +871,8 @@ def compose_with_model_answer(plan: Plan, model_answer: str) -> tuple[str, dict]
 
 
 def compose_answer(plan: Plan, fallback_body: str = "") -> str:
-    """計画書を回答に整える（結論 → 前提 → 調べた範囲 → 参照した資料）。機械的な並べ替えと id の除去だけで、文章は要約も言い換えもしない。"""
+    """計画書の結論を回答にする（結論 → 参照した資料。モデルの回答が空のときだけ）。機械的な並べ替えと id の除去だけで、文章は要約も言い換えもしない。
+    確認の状況（件数・確認できなかった項目）は本文に入れない（`turn_report` から回答の補足の欄と調査の記録に出る）。"""
     ids = {r.id for r in plan.rows if r.id}
     conclusion = (_section(plan.sections, "結論") or "").strip()
     if not conclusion:
@@ -832,32 +880,6 @@ def compose_answer(plan: Plan, fallback_body: str = "") -> str:
     unknown = {u["id"] for u in unconfirmed_items(plan)}
     conclusion = "\n".join(_conclusion_line(line, ids, unknown) for line in conclusion.splitlines()).strip()
     parts = [conclusion] if conclusion else []
-    premise = (_section(plan.sections, "前提") or "").strip()
-    if premise:
-        parts.append("## 前提\n" + premise)
-    scope_lines = []
-    scope_text = (_section(plan.sections, "範囲") or "").strip()
-    if scope_text:
-        scope_lines.append(scope_text)
-    if plan.rows:
-        kinds: dict[str, int] = {}
-        for r in plan.rows:
-            kinds[r.kind or "種別なし"] = kinds.get(r.kind or "種別なし", 0) + 1
-        unconf = unconfirmed_items(plan)
-        n_done = sum(1 for r in plan.rows if r.mark == "x" and not r.malformed
-                     and not ("source" in r.needs and not r.sources))
-        n_closed = sum(1 for r in plan.rows if r.mark == "-" and not r.malformed)
-        n_open = len(plan.unstarted)
-        scope_lines.append(
-            f"母集団 {len(plan.rows)} 件（" + "・".join(f"{k} {v} 件" for k, v in kinds.items()) + "）。"
-            f"確認済み {n_done} 件・確認できなかった {n_closed} 件・未着手 {n_open} 件"
-            + (f"・根拠の行が無く未確認に格下げ {len(unconf) - n_closed - n_open} 件" if len(unconf) > n_closed + n_open else "")
-            + "。")
-        if unconf:
-            scope_lines.append("確認できなかった項目:\n" + "\n".join(
-                f"- {u['item']}（{u['reason']}）" for u in unconf))
-    if scope_lines:
-        parts.append("## 調べた範囲\n" + "\n\n".join(scope_lines))
     refs: dict[str, list[str]] = {}
     for r in plan.rows:
         for s in r.sources:
@@ -905,9 +927,10 @@ EVAL_DIR_ENV = "SHERPA_LEDGER_EVAL_DIR"
 
 
 def compose_turn_answer(st) -> None:
-    """計画書方式のターンで、モデルの回答を本文のまま残して計画書の補足を後ろに付ける（モデルの回答が空のときだけ計画書の結論を本文にする。計画書に目録の行が無いときは何もしない）。"""
+    """計画書方式のターンで、モデルの回答を本文に残し（計画書の行の id だけ外す）、計画書にだけある参照を追記する（モデルの回答が空のときだけ計画書の結論を本文にする。計画書に目録の行が無いときは何もしない）。"""
     stats = {"applied": False, "body_source": "unchanged", "plan_present": False, "plan_rows": 0,
-             "format_issues": [], "unverified_items": [], "plan_only_paths": [], "refs_added_from_plan": 0}
+             "format_issues": [], "unverified_items": [], "plan_only_paths": [],
+             "refs_added_from_plan": 0}
     st._compose_stats = stats
     if st._ledger_style == "json" or st._investigation_dir is None:
         return
@@ -938,10 +961,20 @@ def turn_report(st) -> dict:
         for r in plan.rows:
             marks["unstarted" if r.malformed else _MARKS[r.mark]] += 1
     review_text = (_section(plan.sections, "見直し") or "") if plan is not None else ""
+    unconfirmed = unconfirmed_items(plan) if plan is not None else []
+    fmt, unverified = plan_gaps(plan) if plan is not None else ([], [])
+    n_unstarted = sum(1 for r in plan.rows if r.mark == " " and not r.malformed) if plan is not None else 0
+    n_unverified = len(unverified) - n_unstarted
+    n_confirmed = (len(plan.rows) - len(fmt) - len(unverified)) if plan is not None else 0
     return {
         "ledger": "plan", "style": st._ledger_style, "plan_present": plan is not None,
         "rows": len(plan.rows) if plan is not None else 0, "marks": marks,
-        "unconfirmed_items": unconfirmed_items(plan) if plan is not None else [],
+        # 回答に出す件数。記載の不備の行（形式不正・source 欠落）は数えず、調査の記録に残す
+        "plan_counts": {"total": n_confirmed + len(unverified), "confirmed": n_confirmed,
+                        "unconfirmed": n_unverified, "unstarted": n_unstarted},
+        "plan_unverified_items": unverified,
+        "plan_format_issues": fmt,
+        "unconfirmed_items": unconfirmed,
         "plan_review_lines": sum(1 for ln in review_text.splitlines() if ln.strip().startswith("-")),
         "review_requests": gate.review_requests if gate else 0,
         "review_rounds": gate.review_rounds if gate else 0,

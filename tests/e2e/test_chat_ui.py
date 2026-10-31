@@ -1195,7 +1195,31 @@ def test_chat_referenced_docs_show_generation_and_modified_at(page, web_base_url
     expect(block.locator(".cite-prov")).to_have_count(2)
     assert block.locator(".cite-prov").nth(0).inner_text().startswith("（4期・")
     assert "4期" not in block.locator(".cite-prov").nth(1).inner_text()
-    expect(block).to_contain_text("行3-5")
+    expect(block).to_contain_text("Sherpa の読み取り機能で開いた: 行3-5")
+
+
+def test_chat_body_doc_names_become_links_and_mentioned_only_docs_are_marked(page, web_base_url):
+    answer = {**_PROV_ANSWER, "headline": f"{DOC} に書かれています。`古い仕様.md` も見ました。",
+              "body": f"{DOC} に書かれています。`古い仕様.md` も見ました。",
+              "referenced_docs": [
+                  {"path": DOC, "ranges": [[3, 5]], "unopened": False},
+                  {"path": "古い仕様.md", "ranges": [], "unopened": False, "mentioned_only": True},
+                  {"path": "直下メモ.md", "ranges": [[2, 4]], "unopened": False, "mentioned_only": True}]}
+    _open(page, web_base_url, stream_events=_answer_events(answer, conv=114))
+    _send(page, "消費税率は?")
+
+    head = page.locator(".headline").last
+    links = head.locator("a[data-dl]")
+    expect(links).to_have_count(2)
+    expect(links.nth(0)).to_have_text(DOC)
+    assert links.nth(0).get_attribute("href") == "/documents/download?world=w1&rel=x"
+    expect(links.nth(1)).to_have_text("古い仕様.md")
+    block = page.locator(".referenced-docs")
+    expect(block.locator(".sources-unverified-row").nth(1)).to_contain_text("（本文で名前が出た資料・Sherpa の読み取り機能で開いた記録なし）")
+    expect(block.locator(".sources-unverified-row").nth(0)).not_to_contain_text("本文で名前が出た資料")
+    # 下調べ役などが開いた資料は、本文で名前が出ただけでも開いた記録なしと言わない
+    expect(block.locator(".sources-unverified-row").nth(2)).to_contain_text("（Sherpa の読み取り機能で開いた: 行2-4）（本文で名前が出た資料）")
+    expect(block.locator(".sources-unverified-row").nth(2)).not_to_contain_text("開いた記録なし")
 
 
 def test_inquiry_block_lens_segment_sets_body_lens_and_grays_layer(page, web_base_url):
@@ -1627,6 +1651,22 @@ def test_old_and_new_rows_render_and_export_with_notices(page, web_base_url, tmp
     assert answer.get("body", answer["headline"]) in txt
     assert ("※ 注記の文。" in txt and "途中までの回答" in txt) == expect_notice
     assert txt.count("旧形式の回答です。" if not expect_notice else "注記の文。") == 1
+
+
+def test_export_marks_mentioned_only_docs(page, web_base_url, tmp_path):
+    answer = {**_PROV_ANSWER, "referenced_docs": [
+        {"path": DOC, "ranges": [], "unopened": False},
+        {"path": "古い仕様.md", "ranges": [], "unopened": False, "mentioned_only": True}]}
+    _open(page, web_base_url, stream_events=_answer_events(answer, conv=121))
+    with page.expect_download() as dl_info:
+        page.evaluate(
+            "async (msgs) => { const m = await import('/chat/menus.js'); m.exportMessages('t', msgs, 'txt'); }",
+            [{"role": "user", "content": "質問です"}, {"role": "assistant", "answer": answer}])
+    out = tmp_path / "export.txt"
+    dl_info.value.save_as(out)
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert f"・{DOC}" in lines
+    assert "・古い仕様.md（本文で名前が出た資料・Sherpa の読み取り機能で開いた記録なし）" in lines
 
 
 def _confirm_first_resend(page, base, question, text, settings=_CODEX_SETTINGS):

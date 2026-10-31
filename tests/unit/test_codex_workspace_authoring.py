@@ -1377,13 +1377,20 @@ def test_referenced_docs_block_promotes_verified_docs_to_sources(tmp_path, monke
     assert env["sources_verified"] == [_DOC]
 
 
-def test_referenced_docs_block_keeps_body_when_zero_verified(tmp_path, monkeypatch):
+def test_referenced_docs_block_is_removed_from_body_even_when_zero_verified(tmp_path, monkeypatch):
     answer = "消費税率は10%です。\n\n参照した資料:\n- 存在しない1.md\n- 存在しない2.md\n"
     _, env = _run_fake(tmp_path, monkeypatch, _PY + _msg(answer), "citation-zero-u1", make_sources=_make_sources)
     assert env["codex_referenced_docs"] == {"listed": 2, "verified": 0}
-    assert env["body"].strip() == answer.strip()         # 本文は書き換えず、確認できなかった旨は注記に出る
+    assert env["body"].strip() == "消費税率は10%です。"   # 参照の欄は本文から外し、通らなかった行は「確認できなかった資料」に出る
+    assert [r["path"] for r in env["sources_unverified"]] == ["存在しない1.md", "存在しない2.md"]
     assert [n["kind"] for n in env["notices"]] == ["sources_unverified"] and "2 件" in env["notices"][0]["text"]
     assert not env.get("sources") and "sources_verified" not in env
+
+
+def test_referenced_docs_block_stays_when_removing_it_would_empty_the_body(tmp_path, monkeypatch):
+    answer = "参照した資料:\n- 存在しない1.md\n"
+    _, env = _run_fake(tmp_path, monkeypatch, _PY + _msg(answer), "citation-empty-u1", make_sources=_make_sources)
+    assert env["body"].strip() == answer.strip()
 
 
 @pytest.mark.parametrize("tool,extra,verified", [

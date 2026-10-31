@@ -828,7 +828,7 @@ function answerHTML(answer, trace, feedback) {
     : hasReferencedDocs(answer) ? '' : renderQa(answer);
   // 検証バッジは trace_version=2 の回答だけに付ける
   const evidencePacketForBadges = answer.trace_version === 2 ? (answer.data && answer.data.evidence_packet) : null;
-  return chip + answerNoticesHTML(answer) + `<div class="headline">${mdLite(answerBody(answer))}</div>`
+  return chip + answerNoticesHTML(answer) + `<div class="headline">${linkDocsInBodyHTML(mdLite(answerBody(answer)), answer)}</div>`
     + budgetNoteHTML(answer.data && answer.data.evidence_packet)
     + investigationSummaryHTML(answer)
     + retryHintsHTML(answer.retry_hints) + body
@@ -1124,10 +1124,68 @@ const _isLine = (v) => Number.isInteger(v) && v > 0;
 export function referencedDocRows(answer) {
   const list = answer && Array.isArray(answer.referenced_docs) ? answer.referenced_docs : [];
   const rows = list.filter((r) => r && typeof r.path === 'string' && r.path.trim()).map((r) => ({
-    path: r.path, unopened: r.unopened === true, rangesMore: _cnt(r.ranges_more),
+    path: r.path, unopened: r.unopened === true, mentionedOnly: r.mentioned_only === true, rangesMore: _cnt(r.ranges_more),
     ranges: (Array.isArray(r.ranges) ? r.ranges : []).filter((x) => Array.isArray(x) && x.length === 2 && _isLine(x[0]) && _isLine(x[1]) && x[1] >= x[0]),
   }));
   return { rows, hidden: _cnt(answer && answer.referenced_docs_hidden), more: _cnt(answer && answer.referenced_docs_more) };
+}
+// 本文の中の資料名を、出典の欄でダウンロードできる資料へのリンクにする。対象は HTML の文字のノードだけ（`<a>`・`<pre>` の中は除く）。
+// リンクにするのは、インラインコード・「」・『』の中身がそのまま資料名（パスか、出典の欄の中で一意なファイル名。後ろの行番号は除く）のものと、
+// 囲まれていなくても出典の資料のパスとそのまま一致するものだけ（サーバー側の拾い方と同じ）。エスケープ済みの文字のまま置き換えるので、エスケープは変わらない。
+export function linkDocsInBodyHTML(html, answer) {
+  const { rows } = referencedDocRows(answer);
+  const urls = new Map((Array.isArray(answer && answer.sources) ? answer.sources : [])
+    .filter((s) => s && typeof s.doc_id === 'string' && typeof s.download_url === 'string' && s.download_url)
+    .map((s) => [s.doc_id, s.download_url]));
+  // ファイル名が一意かは、表示しきれなかった分を含む出典の資料全部で数える
+  const baseCount = new Map();
+  const allDocs = (Array.isArray(answer && answer.sources) ? answer.sources : []).filter((x) => x && typeof x.doc_id === 'string').map((x) => x.doc_id);
+  new Set([...rows.map((r) => r.path), ...allDocs]).forEach((p) => { const b = p.split('/').pop(); baseCount.set(b, (baseCount.get(b) || 0) + 1); });
+  // 「確認できなかった資料」に同じ名前がある（範囲の中で名前が重なる）ファイル名は、ファイル名だけではリンクにしない。
+  // 確認できなかった資料に表示しきれなかった分があるときは、ファイル名だけのリンクはどれも付けない
+  (Array.isArray(answer && answer.sources_unverified) ? answer.sources_unverified : [])
+    .filter((u) => u && typeof u.path === 'string').forEach((u) => { const b = u.path.split('/').pop(); baseCount.set(b, (baseCount.get(b) || 0) + 2); });
+  const unverifiedMore = Number.isInteger(answer && answer.sources_unverified_more) && answer.sources_unverified_more > 0;
+  const targets = new Map();
+  rows.forEach((r) => {
+    if (!urls.has(r.path)) return;
+    const base = r.path.split('/').pop();
+    targets.set(esc(r.path), urls.get(r.path));
+    if (!unverifiedMore && baseCount.get(base) === 1 && !targets.has(esc(base))) targets.set(esc(base), urls.get(r.path));
+  });
+  if (!targets.size) return html;
+  const lookup = (name) => targets.get(name.trim().replace(/:\d+(?:-\d+)?(?:,\s*\d+(?:-\d+)?)*\s*$/, ''));
+  const link = (name, url) => `<a href="${esc(url)}" data-dl>${name}</a>`;
+  const pathAlts = [...targets.keys()].filter((t) => t.includes('/')).sort((a, b) => b.length - a.length)
+    .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const re = new RegExp('(「|『)([^「」『』]+)(」|』)' + (pathAlts.length ? '|(' + pathAlts.join('|') + ')' : ''), 'g');
+  // 囲まれていないパスは、英数字・`/`・`\`・`:`・`@`・`=`・`?`・`&`・`#` の続き（長いパス・URL の一部）や、名前の続きの前ではリンクにしない
+  const badBefore = (ch) => !!ch && /[A-Za-z0-9_.\-\/\\:@=?&#\uFF10-\uFF19\uFF21-\uFF3A\uFF41-\uFF5A]/.test(ch);
+  const charBefore = (tok, at) => (tok.slice(0, at).endsWith('&amp;') ? '&' : tok[at - 1]);
+  const badAfter = (rest) => /^(?:&amp;|[A-Za-z0-9_\-\/\\@?#=\uFF10-\uFF19\uFF21-\uFF3A\uFF41-\uFF5A]|\.[A-Za-z0-9]|:(?!\d))/.test(rest);
+  let skip = 0;
+  let code = 0;
+  return String(html).replace(/<[^>]*>|[^<]+/g, (tok) => {
+    if (tok[0] === '<') {
+      const m = /^<(\/?)(a|pre|code)(?=[\s>\/])/i.exec(tok);
+      if (m && m[2].toLowerCase() === 'code') code = Math.max(0, code + (m[1] ? -1 : 1));
+      else if (m) skip = Math.max(0, skip + (m[1] ? -1 : 1));
+      return tok;
+    }
+    if (skip) return tok;
+    if (code) {
+      const url = lookup(tok);
+      return url ? tok.replace(tok.trim(), (name) => link(name, url)) : tok;
+    }
+    return tok.replace(re, (all, open, inner, close, path, ...rest) => {
+      if (open) {
+        const url = lookup(inner);
+        return url ? `${open}${link(inner, url)}${close}` : all;
+      }
+      const at = rest[rest.length - 2];
+      return badBefore(charBefore(tok, at)) || badAfter(tok.slice(at + path.length)) ? all : link(path, targets.get(path));
+    });
+  });
 }
 export function impactListView(answer) {
   const s = answer && answer.impact_list;
@@ -1149,10 +1207,13 @@ export function howText(answer) {
   const base = h.mode === 'author' ? '作る' : h.mode === 'investigate' ? '調べる' : '';
   return base ? (h.doc_focus === true && h.mode === 'investigate' ? '資料中心の指定で調べました' : base) : '';
 }
+export const MENTIONED_ONLY_NOTE = '（本文で名前が出た資料・Sherpa の読み取り機能で開いた記録なし）';
+// 本文で名前が出ただけの資料の印。開いた行の範囲がある行（下調べ役が開いた資料など）では開いた記録なしと言わない。
+export const mentionedOnlyNote = (r) => (r.ranges.length || r.rangesMore ? '（本文で名前が出た資料）' : MENTIONED_ONLY_NOTE);
 export const rangeText = (r) => r.ranges.map((x) => (x[0] === x[1] ? `行${x[0]}` : `行${x[0]}-${x[1]}`)).join('、');
 // 新しい形の回答（`referenced_docs` の欄がある）。無い古い回答は出典の 2 群（`renderSources`）と該当箇所（`renderQa`）で出す。
 const hasReferencedDocs = (answer) => !!answer && Array.isArray(answer.referenced_docs);
-// 参照した資料（原本をダウンロード）。資料ごとに原本のリンク・Codex が開いた行の範囲・中身を確かめていない注記を出す。
+// 参照した資料（原本をダウンロード）。資料ごとに原本のリンク・Sherpa の読み取り機能で開いた行の範囲・中身を確かめていない注記を出す。
 // 設計: docs/design/chat.md「1ターンの流れ」
 function renderReferencedDocs(answer, evidencePacket) {
   const { rows, hidden, more } = referencedDocRows(answer);
@@ -1168,8 +1229,9 @@ function renderReferencedDocs(answer, evidencePacket) {
       + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(r.path))}${importanceBadgeHTML(s)}`;
   };
   return head
-    + rows.map((r) => `<div class="sources-unverified-row">${link(r)}${r.ranges.length ? `<span class="muted">（${esc(rangeText(r))}${r.rangesMore ? `、ほか ${r.rangesMore} か所` : ''}）</span>` : (r.rangesMore ? `<span class="muted">（ほか ${r.rangesMore} か所）</span>` : '')}`
-      + `${r.unopened ? '<span class="muted">（Codex の読み取り記録なし）</span>' : ''}</div>`).join('')
+    + rows.map((r) => `<div class="sources-unverified-row">${link(r)}${r.ranges.length ? `<span class="muted">（Sherpa の読み取り機能で開いた: ${esc(rangeText(r))}${r.rangesMore ? `、ほか ${r.rangesMore} か所` : ''}）</span>` : (r.rangesMore ? `<span class="muted">（Sherpa の読み取り機能で開いた: ほか ${r.rangesMore} か所）</span>` : '')}`
+      + `${r.unopened && !r.mentionedOnly ? '<span class="muted">（Sherpa の読み取り機能で開いた記録なし）</span>' : ''}`
+      + `${r.mentionedOnly ? `<span class="muted">${mentionedOnlyNote(r)}</span>` : ''}</div>`).join('')
     + (more ? `<div class="sources-unverified-row muted">ほか ${more} 件</div>` : '')
     + (hidden ? `<div class="sources-unverified-row muted">名前を表示できない資料 ${hidden} 件</div>` : '') + '</div>';
 }
@@ -1193,7 +1255,7 @@ function renderImpactList(answer) {
 function renderFoundDocs(answer) {
   const { rows, hidden, more } = foundDocRows(answer);
   if (!rows.length && !hidden && !more) return '';
-  return '<details class="sources found-docs"><summary class="h">ほかに見つかった資料（Codex の読み取り記録なし）</summary>'
+  return '<details class="sources found-docs"><summary class="h">ほかに見つかった資料（Sherpa の読み取り機能で開いた記録なし）</summary>'
     + rows.map((p) => `<div class="sources-unverified-row">${esc(p)}</div>`).join('')
     + (more ? `<div class="sources-unverified-row muted">ほか ${more} 件（上限で省略）</div>` : '')
     + (hidden ? `<div class="sources-unverified-row muted">名前を表示できない資料 ${hidden} 件</div>` : '') + '</details>';

@@ -87,7 +87,7 @@ def _is_line(v) -> bool:
 
 
 def referenced_docs_of(answer) -> list[dict]:
-    """参照した資料 `[{path, ranges:[[開始行, 終了行]], unopened, ranges_more?}]` を型の正しい形だけで返す。`unopened` は読み取り道具でしか読めない資料で開いた記録が無いもの・`ranges_more` は範囲の上限で省いた個数。無い・壊れていれば空リスト。"""
+    """参照した資料 `[{path, ranges:[[開始行, 終了行]], unopened, ranges_more?, mentioned_only?}]` を型の正しい形だけで返す。`unopened` は読み取り道具でしか読めない資料で開いた記録が無いもの・`ranges_more` は範囲の上限で省いた個数・`mentioned_only` は本文に名前が出ただけで「参照した資料:」の記載が無い資料。無い・壊れていれば空リスト。"""
     rows = answer.get("referenced_docs") if isinstance(answer, dict) else None
     if not isinstance(rows, list):
         return []
@@ -100,6 +100,8 @@ def referenced_docs_of(answer) -> list[dict]:
         row = {"path": r["path"], "ranges": ranges, "unopened": r.get("unopened") is True}
         if _is_count(r.get("ranges_more")):
             row["ranges_more"] = r["ranges_more"]
+        if r.get("mentioned_only") is True:
+            row["mentioned_only"] = True
         out.append(row)
     return out
 
@@ -121,7 +123,7 @@ def impact_list_of(answer) -> dict | None:
 
 
 def found_docs_of(answer) -> list[dict]:
-    """ほかに見つかった資料（Codex の読み取り記録なし）`[{path}]` を型の正しい形だけで返す。省いた件数は `found_docs_more`。"""
+    """ほかに見つかった資料（Sherpa の読み取り機能で開いた記録なし）`[{path}]` を型の正しい形だけで返す。省いた件数は `found_docs_more`。"""
     rows = answer.get("found_docs") if isinstance(answer, dict) else None
     if not isinstance(rows, list):
         return []

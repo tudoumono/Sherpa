@@ -13,8 +13,11 @@ from ...store.investigation_records import trim_calls, trim_record
 from ... import layer as layer_mod
 from ...answer_shape import NO_TOOL_USE_NOTICE, STOPPED_EARLY_NOTICE, STOPPED_NOTICE, add_notice, seal, set_body
 from ..base import _evidence_gate_note, _log, _node, _verified_sources
-from .citations import parse_referenced_doc_lines, resolve_referenced_docs, resolve_referenced_docs_detail
-from .call_log import call_record_sections, call_stats, finalize_call_log, found_docs_for_answer, referenced_docs_for_answer
+from .citations import (MENTION_MAX, MENTION_SCAN_MAX, _name_index, extract_doc_tokens, normalize_doc_ref,
+                        parse_referenced_doc_lines, plausible_doc_tokens, resolve_referenced_docs,
+                        resolve_referenced_docs_detail, screen_by_layer, index_paths, REASON_AMBIGUOUS)
+from .call_log import (REFERENCED_DOCS_MAX, call_record_sections, call_stats, finalize_call_log, found_docs_for_answer,
+                       referenced_docs_for_answer)
 from .codex_cli import apply_codex_usage, log_turn_end
 from .ledger_gate import _format_unconfirmed_items_section, _retire_investigation_ledger, _scope_no_source_notice, _unconfirmed_items_list
 from .mcp import _apply_codex_neighbors
@@ -395,6 +398,30 @@ def register_created_files(st):
                     run_dir.name, e)
 
 
+def _in_layer_safe(rel: str, layer) -> bool:
+    """`rel` が今回の層に入るか（判定できない名前は入らないとみなす）。"""
+    try:
+        return layer_mod.in_layer(rel, layer)
+    except ValueError:
+        return False
+
+
+def _flat_strings(v) -> list[str]:
+    """入れ子のリストの中の文字列を順に並べる（「参照した資料:」の行の候補群）。"""
+    if isinstance(v, str):
+        return [v]
+    return [x for item in (v if isinstance(v, (list, tuple)) else []) for x in _flat_strings(item)]
+
+
+def _is_sensitive_ref(ref: str, world: str) -> bool:
+    """資料名の候補が秘匿名の資料を指すか（指す資料が分からなければ候補の名前で判定する）。"""
+    from ...ingest import text_kind
+    try:
+        return text_kind.is_sensitive_doc_id(normalize_doc_ref(ref, world) or ref)
+    except ValueError:
+        return False
+
+
 def assemble_result(self, ctx, st, decision, env):
     """env への合流（limits・縮退・usage・作成ファイル）・回答の組み立て・`answer_delta` と `_result` を出す。"""
     sp = st.sp
@@ -473,17 +500,50 @@ def assemble_result(self, ctx, st, decision, env):
         ]
     if st.answer:
         env["headline"] = st.answer
-        # 直読した資料は MCP の結果に載らず env["sources"] に反映されない。回答末尾の「参照した資料:」ブロックを解析し、read 系 MCP ツール引数から拾った doc_id（記載漏れの補完・出現順で後ろに合流）と合わせて機械検証（実在・文書種別・scope・秘匿名除外）を通ったものだけを sources の先頭へ足す（`_gather` 由来の既存 sources は後ろに残す・doc_id 重複は除外）。verified が0件なら参照ブロックの記載を消さず本文をそのまま残す。
+        # 直読した資料は MCP の結果に載らず env["sources"] に反映されない。回答末尾の「参照した資料:」ブロックを解析し、read 系 MCP ツール引数から拾った doc_id（記載漏れの補完・出現順で後ろに合流）と合わせて機械検証（実在・文書種別・scope・秘匿名除外）を通ったものだけを sources の先頭へ足す（`_gather` 由来の既存 sources は後ろに残す・doc_id 重複は除外）。参照ブロックは本文から外す（本文が空になるときだけ外さない）。
         _body, _listed_lines = parse_referenced_doc_lines(st.answer)
         _ref_candidates: list = list(_listed_lines)
+        _ref_layer = layer_mod.effective_layer(ctx.scope_meta, decision["lens"])
+        # ① 計画書の結論に書かれた資料を参照の候補に足す。② 本文（参照の欄を除く）に名前が出る資料を拾う（資料参照オンの作成以外のターンだけ）。
+        # 拾うのは、バッククォート・「」・『』で囲まれた名前と、範囲にある資料のパスとそのまま一致するものだけ。
+        _name_idx = None
+        _scope_idx: dict = {}
+        _layer_out: list = []
+        _want_mentions = bool(ctx.make_sources) and decision["lens"] != "author"
+        _mention_tokens: list = []
+        _conclusion_paths: list = []
+        _conc_text = plan_ledger.conclusion_text(st) if decision["lens"] != "author" else ""
+        _listed_strs = _flat_strings(_listed_lines)
+        _listed_text = "\n".join(_listed_strs)
+        _listed_docs = set(_listed_strs) | {d for d in (normalize_doc_ref(x, ctx.world) for x in _listed_strs) if d}
+        _maybe_names = lambda t: bool(t) and any(c in t for c in "`「『/")
+        if _maybe_names(_conc_text) or (_want_mentions and _maybe_names(_body)):
+            # パスの照らし合わせは範囲だけで行い（層の外のものは後の層の確かめで分ける）、名前の索引は今回の層に絞る
+            _scope_idx = _name_index(ctx.world, sp, "both")
+            _paths = index_paths(_scope_idx)
+            _name_idx = {}
+            for _n, _rels in _scope_idx.items():
+                _in = [r for r in _rels if _in_layer_safe(r, _ref_layer)]
+                if _in:
+                    _name_idx[_n] = _in
+            if _want_mentions:
+                _mention_tokens = extract_doc_tokens(_body, limit=MENTION_SCAN_MAX, paths=_paths)
+            # 結論の資料のうち、回答の「参照した資料:」に書かれているものは除く
+            _conclusion_paths = [t for t in extract_doc_tokens(_conc_text, limit=MENTION_SCAN_MAX, paths=_paths)
+                                 if t not in _listed_docs and normalize_doc_ref(t, ctx.world) not in _listed_docs]
+            _conclusion_paths, _layer_out = screen_by_layer(
+                plausible_doc_tokens(_conclusion_paths, _name_idx), ctx.world, _ref_layer)
+            _mention_tokens, _mention_layer_out = screen_by_layer(
+                plausible_doc_tokens(_mention_tokens, _name_idx), ctx.world, _ref_layer)
+            _layer_out += _mention_layer_out
+            _ref_candidates += [[[p]] for p in _conclusion_paths]
         _ref_seen: set[str] = set()
         for _r in _mcp_read_docs:
             if _r and _r not in _ref_seen:
                 _ref_seen.add(_r)
                 _ref_candidates.append(_r)
         # `xlsx_sheets`（シート一覧のみ）の doc_id も参照候補（sources）には合流させる。ただし「参照した資料:」にも書かれておらず本文精読ツール（`_mcp_read_docs`）でも読まれていない doc_id は、根拠ゲート（sources_verified）に数えない。参照ブロック＋本文精読ツールだけで確定する「精読済み」集合を先に確定させ、`xlsx_sheets` を足した後の verified との差分（`_listed_only_ids`）として区別する。
-        _ref_layer = layer_mod.effective_layer(ctx.scope_meta, decision["lens"])
-        _ref_detail = resolve_referenced_docs_detail(_ref_candidates, ctx.world, sp, _ref_layer)
+        _ref_detail = resolve_referenced_docs_detail(_ref_candidates, ctx.world, sp, _ref_layer, index=_name_idx)
         _verified_listed, _unverified_refs, _sensitive_refs = (
             _ref_detail["verified"], _ref_detail["unverified"], _ref_detail["hidden"])
         _verified_before_listed = set(_verified_listed)
@@ -493,46 +553,94 @@ def assemble_result(self, ctx, st, decision, env):
                 _ref_candidates.append(_r)
         _verified_refs = resolve_referenced_docs(_ref_candidates, ctx.world, sp, _ref_layer)[0]
         _listed_only_ids = set(_verified_refs) - _verified_before_listed
+        # 本文に名前が出る資料: 参照に載った資料と同じ名前のものは除き、残りを同じ確かめにかける。通ったもので参照に無いものは「本文で名前が出た資料」として足す（根拠の区分には数えない）。
+        _mention_new: list[str] = []
+        _mention_unverified: list = []
+        _mention_hidden = 0
+        _verified_set = set(_verified_refs)
+        _layer_out = [r for r in _layer_out if r["path"] not in _verified_set]
+        _ref_names = {d.rsplit("/", 1)[-1] for d in _verified_refs}
+        # 「参照した資料:」に挙げて確かめられなかった資料も、本文の候補から先に除く（同じ資料を二度数えない）
+        _listed_failed = {r.get("path") for r in _unverified_refs if isinstance(r, dict)}
+        _mention_tokens = [t for t in _mention_tokens
+                           if t not in _verified_set and ("/" in t or t not in _ref_names)
+                           and t not in _listed_failed and normalize_doc_ref(t, ctx.world) not in _listed_failed
+                           and not (t in _listed_text and _is_sensitive_ref(t, ctx.world))]
+        # 確かめるのは先頭の MENTION_MAX 件まで。残りは「確認できなかった資料」の件数に入れる
+        _mention_skipped = max(0, len(_mention_tokens) - MENTION_MAX)
+        _mention_tokens = _mention_tokens[:MENTION_MAX]
+        # ファイル名だけの候補は、範囲で同じ名前が 2 つ以上あれば（資料フォルダ直下の同名を含む）どれにも当てない
+        _same_name = [t for t in _mention_tokens if "/" not in t and len(_scope_idx.get(t, [])) > 1]
+        _mention_tokens = [t for t in _mention_tokens if t not in _same_name]
+        if _mention_tokens:
+            _m_detail = resolve_referenced_docs_detail([[[t]] for t in _mention_tokens], ctx.world, sp, _ref_layer,
+                                                       index=_name_idx)
+            _mention_new = [d for d in _m_detail["verified"] if d not in _verified_set]
+            _mention_unverified, _mention_hidden = _m_detail["unverified"], _m_detail["hidden"]
+        _mention_unverified = list(_mention_unverified) + [{"path": t, "reason": REASON_AMBIGUOUS} for t in _same_name]
+        _ref_ids: set = set()
+        _ref_sources: list = []
         if _verified_refs and ctx.make_sources:
             _ref_sources, _ = _verified_sources(ctx.make_sources, set(_verified_refs), ctx.world, sp)
             # 参照ブロックの記載順（→ MCP 引数の順）に並べ直し、既存（`_gather` 由来）と重複する資料は先頭側（参照した資料）を残す。
             _order = {d: i for i, d in enumerate(_verified_refs)}
             _ref_sources = sorted(_ref_sources, key=lambda s: _order.get(s.get("doc_id"), len(_order)))
             _ref_ids = {s.get("doc_id") for s in _ref_sources}
-            env["sources"] = _ref_sources + [s for s in (env.get("sources") or [])
-                                             if s.get("doc_id") not in _ref_ids]
-            # 実際に開いて根拠にした資料＝API 経路の「精読済み」と同じ意味＝出典の 2 区分（根拠／参考）に載せる。`xlsx_sheets` だけで到達した doc_id（`_listed_only_ids`）は除く。
+        _mention_sources: list = []
+        if _mention_new and ctx.make_sources:
+            _mention_sources, _ = _verified_sources(ctx.make_sources, set(_mention_new), ctx.world, sp)
+            _order = {d: i for i, d in enumerate(_mention_new)}
+            _mention_sources = sorted((s for s in _mention_sources if s.get("doc_id") not in _ref_ids),
+                                      key=lambda s: _order.get(s.get("doc_id"), len(_order)))
+        if _ref_sources or _mention_sources:
+            _all_ids = _ref_ids | {s.get("doc_id") for s in _mention_sources}
+            env["sources"] = _ref_sources + _mention_sources + [s for s in (env.get("sources") or [])
+                                                               if s.get("doc_id") not in _all_ids]
+        if _verified_refs and ctx.make_sources:
+            # 実際に開いて根拠にした資料＝API 経路の「精読済み」と同じ意味＝出典の 2 区分（根拠／参考）に載せる。`xlsx_sheets` だけで到達した doc_id（`_listed_only_ids`）と、本文で触れただけの資料は除く。
             env["sources_verified"] = sorted(_ref_ids - _listed_only_ids)
         env["codex_referenced_docs"] = {"listed": len(_ref_candidates), "verified": len(_verified_refs)}
         if _ref_detail["mappings"]:  # 参照行の対応付け（入力・資料 ID・分類）。評価で分類ごとに数える
             env["codex_reference_resolution"] = _ref_detail["mappings"][:_SOURCES_UNVERIFIED_MAX * 5]
-        # 新しい形の「参照した資料」（資料ごとの開いた行の範囲）。資料参照がオンの作成以外のターンだけ・0 件でも欄を入れる。
+        # 新しい形の「参照した資料」（資料ごとの開いた行の範囲）。資料参照がオンの作成以外のターンだけ・0 件でも欄を入れる。本文で触れただけの資料は `mentioned_only` を付けて後ろに足す。
         if ctx.make_sources and decision["lens"] != "author":
             _ref_rows, _ref_more = referenced_docs_for_answer(st, _verified_refs)
+            if _mention_new:
+                _m_rows, _m_more = referenced_docs_for_answer(st, _mention_new)
+                _all_rows = _ref_rows + [{**r, "mentioned_only": True} for r in _m_rows]
+                _ref_more += _m_more + max(0, len(_all_rows) - REFERENCED_DOCS_MAX)
+                _ref_rows = _all_rows[:REFERENCED_DOCS_MAX]
             env["referenced_docs"] = _ref_rows
             if _ref_more:
                 env["referenced_docs_more"] = _ref_more
         # 検索で見つかったが Sherpa の読み取り道具で開かれず「参照した資料」にも無い資料（秘匿の資料名は件数）。
-        _found, _found_hidden, _found_more = found_docs_for_answer(st, [_verified_refs, _ref_candidates])
+        _found, _found_hidden, _found_more = found_docs_for_answer(st, [_verified_refs, _ref_candidates, _mention_new])
         if _found:
             env["found_docs"] = _found
         if _found_hidden:
             env["found_docs_hidden"] = _found_hidden
         if _found_more:
             env["found_docs_more"] = _found_more
-        # 「参照した資料」の行のうち検証を通らなかったもの（理由つき・秘匿名は名前を出さず件数だけ）。
+        # 「参照した資料」の行・本文に名前が出た資料のうち検証を通らなかったもの（理由つき・秘匿名は名前を出さず件数だけ）。注記は「参照した資料」の行の分だけ数える。
         _unverified_total = len(_unverified_refs) + _sensitive_refs
+        _unverified_rows = list(_unverified_refs)
+        for _r in _layer_out + _mention_unverified:
+            if _r not in _unverified_rows:
+                _unverified_rows.append(_r)
+        _hidden_total = _sensitive_refs + _mention_hidden
+        if _unverified_rows or _hidden_total or _mention_skipped:
+            env["sources_unverified"] = _unverified_rows[:_SOURCES_UNVERIFIED_MAX]
+            if _hidden_total:
+                env["sources_unverified_hidden"] = _hidden_total
+            _more = max(0, len(_unverified_rows) - _SOURCES_UNVERIFIED_MAX) + _mention_skipped
+            if _more:
+                env["sources_unverified_more"] = _more
         if _unverified_total:
-            env["sources_unverified"] = _unverified_refs[:_SOURCES_UNVERIFIED_MAX]
-            if _sensitive_refs:
-                env["sources_unverified_hidden"] = _sensitive_refs
-            if len(_unverified_refs) > _SOURCES_UNVERIFIED_MAX:
-                env["sources_unverified_more"] = len(_unverified_refs) - _SOURCES_UNVERIFIED_MAX
             add_notice(env, "sources_unverified",
                        f"回答が出典として挙げた資料のうち {_unverified_total} 件は、確認できなかったため出典に載せていません"
                        "（出典の欄の下の「確認できなかった資料」を参照）"
                        + ("。名前を表示できない資料があります。" if _sensitive_refs else "。"))
-        env["headline"] = _body if (_verified_refs and _body.strip()) else st.answer  # 空本文には差し替えない
+        env["headline"] = _body if _body.strip() else st.answer  # 参照の欄は本文から外す（空本文には差し替えない）
         if _schema_on:
             # v2 のときだけ主張配列を持つ（v1 は常に空リスト）。区分と理由コードを envelope にも載せる（共有・監査で消えないよう `sherpa/store/shares.py::_safe_claim` が既知フィールドのみで再構築する）。
             _claims = _pick_structured_claims(st)

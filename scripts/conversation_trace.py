@@ -1733,7 +1733,7 @@ def _route_section(record, masker: Masker, gaps: list) -> list[str]:
         lines.append(f"    {f['doc']}  ヒット {f['hits'] if f['hits'] is not None else '-'}"
                      + (f"  行 {','.join(str(x) for x in f['lines'])}" if f["lines"] else "")
                      + (f"  語 {' '.join(f['queries'])}" if f["queries"] else "")
-                     + f"  Codex の読み取り記録 {'あり' if f['opened'] else '確かめられない' if view.get('opened_unknown') else 'なし'}")
+                     + f"  {'Sherpa の読み取り機能で開いた' if f['opened'] else 'Sherpa の読み取り機能で開いた記録: 確かめられません（記録が欠けています）' if view.get('opened_unknown') else 'Sherpa の読み取り機能で開いた記録なし'}")
     for k, word in (("found_more", "上限で省略した見つかった資料"), ("found_hidden", "名前を出せない資料"),
                     ("found_hits_omitted", "呼び出しの上限で取り込めなかったヒット")):
         if view.get(k):
@@ -1816,6 +1816,8 @@ def turn_row(no: int, turn: dict, data: dict, masker: Masker) -> dict | None:
         e = {"path": _jpath(masker, r["path"]), "ranges": r["ranges"], "unopened": r["unopened"]}
         if r.get("ranges_more"):
             e["ranges_more"] = r["ranges_more"]
+        if r.get("mentioned_only"):
+            e["mentioned_only"] = True
         refs.append(e)
     row["referenced_docs"] = refs if "referenced_docs" in safe else None
     row["referenced_docs_extra"] = {k: safe[k] for k in ("referenced_docs_hidden", "referenced_docs_more") if k in safe} or None

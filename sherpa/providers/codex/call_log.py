@@ -130,7 +130,7 @@ def _strings(value) -> set[str]:
 
 
 def found_docs_for_answer(st, referenced) -> tuple[list[dict], int, int]:
-    """回答の `found_docs`（Codex の読み取り記録が無い見つかった資料）。Sherpa の読み取り道具で開いておらず `referenced`（回答の「参照した資料」の候補・入れ子でもよい）にも無い資料だけ。
+    """回答の `found_docs`（開いた記録が無い見つかった資料）。Sherpa の読み取り道具で開いておらず `referenced`（回答の「参照した資料」の候補・入れ子でもよい）にも無い資料だけ。
     戻り値は `([{path}], 秘匿で伏せた件数, 上限で省いた件数)`。
     """
     merged = st.call_log
@@ -179,7 +179,7 @@ def _tool_only_doc(doc_id: str) -> bool:
 
 
 def referenced_docs_for_answer(st, verified_refs) -> tuple[list[dict], int]:
-    """回答の `referenced_docs`（確かめを通った資料ごとに、Codex が開いた行の範囲と、開いた記録の無い Excel・Word・PowerPoint・PDF の印）。戻り値は `(行, 上限で省いた件数)`。
+    """回答の `referenced_docs`（確かめを通った資料ごとに、Sherpa の読み取り道具で開いた行の範囲と、開いた記録の無い Excel・Word・PowerPoint・PDF の印）。戻り値は `(行, 上限で省いた件数)`。
     設計: docs/design/chat.md「出典」
     """
     merged = st.call_log

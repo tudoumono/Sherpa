@@ -177,12 +177,24 @@ def test_compose_order_strips_id_tags_and_lists_unconfirmed():
         ROWS_DONE + "- [ ] c · program · 対象C · 要: source\n",
         conclusion="Aが影響を受ける [a]。Bは未確認 [b]。配列 [x] は残る。"))
     out = PL.compose_answer(plan, "本文\n参照した資料:\n- src/z.cbl")
-    assert out.index("Aが影響を受ける") < out.index("## 前提") < out.index("## 調べた範囲") < out.index("参照した資料:")
+    assert out.index("Aが影響を受ける") < out.index("参照した資料:")
     assert "[a]" not in out and "[b]" not in out and "[x]" in out
-    assert "- 対象B（範囲外のため確認できませんでした: ジョブ定義を探したが無かった）" in out
-    assert "- 対象C（調べ終わっていません）" in out
-    assert "母集団 3 件（program 2 件・job 1 件）" in out
+    # 確認の状況は本文に入れず、回答の補足の欄と調査の記録へ渡す（`turn_report` と同じ `plan_gaps`）
+    assert "## 調べた範囲" not in out and "対象C" not in out and "母集団" not in out
+    _, unverified = PL.plan_gaps(plan)
+    assert {"item": "対象C", "reason": "調べ終わっていません"} in [{k: u[k] for k in ("item", "reason")} for u in unverified]
     assert out.rstrip().endswith("- src/a.cbl:12\n- src/z.cbl")
+
+
+def test_compose_fallback_leaves_premise_scope_and_format_issues_out_of_the_body():
+    rows = ("- [ ] a · program · 対象A · 要: source\n- [x] b · program · 対象B · 要: source\n"
+            "- [x] c · program · 対象C\n- [-] d · job · 対象D · 要: source\n    - 無い: 探したが無し\n")
+    plan = PL.parse_plan("## 前提\n仮定の写し\n## 範囲\n範囲の写し\n## 母集団\n" + rows + "## 結論\n結論です [d]。\n")
+    out = PL.compose_answer(plan)
+    assert "仮定の写し" not in out and "範囲の写し" not in out and "## 前提" not in out
+    assert "## 調べた範囲" not in out and "対象" not in out.replace("結論", "")  # 確認の状況も記載の不備の行も本文に出さない
+    fmt, unverified = PL.plan_gaps(plan)
+    assert [u["item"] for u in unverified] == ["対象A", "対象D"] and len(fmt) == 2
 
 
 def test_compose_falls_back_to_codex_body_without_conclusion():
@@ -264,7 +276,7 @@ def test_source_with_backticks_around_only_the_path(path):
 ])
 def test_conclusion_requires_a_known_confirmed_id(conclusion, expected):
     plan = PL.parse_plan(_plan(ROWS_DONE, conclusion=conclusion))
-    assert PL.compose_answer(plan).split("\n\n## 前提")[0] == expected
+    assert PL.compose_answer(plan).split("\n\n参照した資料:")[0] == expected
 
 
 def test_conclusion_formatting_does_not_mask_unreferenced_claims():
@@ -340,29 +352,98 @@ _MODEL = ("影響するプログラムは次の通りです。\n- src/a.cbl 受�
           "参照した資料:\n- src/q.cbl:5\n- src/a.cbl:12")
 
 
-def test_model_answer_stays_as_body_with_plan_as_supplement():
+def test_model_answer_stays_as_body_without_plan_supplement():
     plan = PL.parse_plan(_plan(ROWS_DONE, conclusion="短い結論 [a]。src/only.cbl も関係。"))
     out, info = PL.compose_with_model_answer(plan, _MODEL)
-    body = _MODEL.split("\n\n参照した資料:")[0]
-    assert out.startswith(body + "\n\n## 調べた範囲（調査計画書）")
-    assert "未確認:" not in out and "短い結論" not in out
-    assert out.index("## 調べた範囲") < out.index("参照した資料:")
-    assert "確認済み 1 件・確認できなかった 1 件・未着手 0 件" in out
-    assert "### 確認できなかった項目\n- 対象B（範囲外のため確認できませんでした: ジョブ定義を探したが無かった）" in out
-    assert "計画書の記載の不備" not in out
-    assert info["plan_only_paths"] == ["src/only.cbl"] and info["refs_added_from_plan"] == 0
+    assert out == _MODEL
+    assert "調べた範囲" not in out and "未確認:" not in out and "短い結論" not in out
+    assert info["plan_only_paths"] == ["src/only.cbl"]
+    assert info["refs_added_from_plan"] == 0
 
 
-def test_supplement_splits_unverified_and_format_issues():
+def test_plan_row_ids_are_removed_from_the_model_body_but_other_brackets_stay():
+    plan = PL.parse_plan(_plan(ROWS_DONE, conclusion="結論 [a]。"))
+    out, _ = PL.compose_with_model_answer(plan, "Aは受付です [a]。配列は x[0] と [注] を使う [b]。\n\n参照した資料:\n- src/a.cbl:12")
+    assert out.startswith("Aは受付です。配列は x[0] と [注] を使う。\n\n参照した資料:")
+
+
+def test_supplement_gaps_are_kept_in_the_info_not_in_the_body():
     rows = ("- [ ] a · program · 対象A · 要: source\n- [x] b · program · 対象B · 要: source\n"
             "- [x] c · program · 対象C\n- [-] d · job · 対象D · 要: source\n    - 無い: 探したが無し\n")
     plan = PL.parse_plan(_plan(rows))
     out, info = PL.compose_with_model_answer(plan, "本文です。")
-    assert "### 確認できなかった項目\n- 対象A（調べ終わっていません）\n- 対象D（" in out
-    assert "### 計画書の記載の不備\n- 対象B（" in out and "- 対象C（" in out
+    assert out == "本文です。"
     assert [x["id"] for x in info["unverified_items"]] == ["a", "d"]
     assert [x["id"] for x in info["format_issues"]] == ["b", "c"]
-    assert "未確認" not in out
+
+
+def test_turn_report_keeps_format_issues_out_of_the_answer_counts_and_items(tmp_path):
+    rows = ("- [ ] a · program · 対象A · 要: source\n- [x] b · program · 対象B · 要: source\n"
+            "    - source: src/b.cbl:1\n- [x] c · program · 対象C · 要: source\n"
+            "- [-] d · job · 対象D · 要: source\n    - 無い: 探したが無し\n- [x] 壊れた行\n")
+    st = _St(tmp_path, "本文です。", _plan(rows))
+    st._plan_gate = None
+    st._investigation_stopped_reason = None
+    st._plan_final = PL.read_plan(st._investigation_dir)
+    report = PL.turn_report(st)
+    # 記載の不備（c: source 欠落・壊れた行: 形式不正）は件数にも確認できなかった項目にも入れず、別に残す
+    assert report["plan_counts"] == {"total": 3, "confirmed": 1, "unconfirmed": 1, "unstarted": 1}
+    assert [x["item"] for x in report["plan_unverified_items"]] == ["対象A", "対象D"]
+    assert {x["id"] for x in report["plan_format_issues"]} >= {"c"} and len(report["plan_format_issues"]) == 2
+    assert len(report["unconfirmed_items"]) == 4          # 外部 API 向けの従来の一覧は変えない
+
+
+def test_ids_that_look_like_indexes_links_or_code_are_not_removed():
+    ids = {"0", "a", "A1", "A2"}
+    f = PL._strip_id_tags
+    assert f("x[0] を使う [0]。", ids) == "x[0] を使う。"             # 添字は残し、独立した印だけ外す
+    assert f("`x[0] [a]` とあります [a]。", ids) == "`x[0] [a]` とあります。"   # インラインコードの中は対象外
+    assert f("``a `[a]` b`` です [A1][A2]。", ids) == "``a `[a]` b`` です。"
+    assert f("[a](http://example.com) と [a][ref] と m[a] と f(x)[a]", ids) == "[a](http://example.com) と [a][ref] と m[a] と f(x)[a]"
+    assert f("文末です[a]\n", ids) == "文末です\n"                      # 日本語の直後は独立した印
+    # 数字だけの id は日本語の直後でも添字として残し、英字を含む id は日本語の直後でも外す
+    assert f("値[0] と 注記 [0]。", ids) == "値[0] と 注記。" and f("x[0]", ids) == "x[0]"
+    assert f("である[A1]。", ids) == "である。" and f("である[a]。", ids) == "である。"
+    assert f("[A1]", ids) == "" and f("説明 [A1] [A2]\n次 [zz]", ids) == "説明\n次 [zz]"
+    fenced = "前 [a]\n```py\nx[0] = [a]\n```\n後 [a]\n"
+    assert f(fenced, ids) == "前\n```py\nx[0] = [a]\n```\n後\n"
+    assert f("~~~\n[a]\n```\n[a]\n~~~\n[a]", ids) == "~~~\n[a]\n```\n[a]\n~~~\n"
+
+
+def test_fences_inside_list_items_and_link_definitions_without_a_space_stay():
+    text = "- 例 [a]\n    ```md\n    参照した資料:\n    [a]\n    ```\n\n詳細は [b]。\n\n[b]:https://example.com\n"
+    assert PL._strip_id_tags(text, {"a", "b"}) == (
+        "- 例\n    ```md\n    参照した資料:\n    [a]\n    ```\n\n詳細は [b]。\n\n[b]:https://example.com\n")
+
+
+def test_link_definitions_inside_code_blocks_do_not_protect_ids():
+    assert PL._strip_id_tags("本文 [a]。\n```md\n[a]:https://example.com\n```\n", {"a"}) == "本文。\n```md\n[a]:https://example.com\n```\n"
+
+
+def test_link_reference_definitions_stay():
+    assert PL._strip_id_tags("詳細は[資料][a]。\n\n[a]: https://example.com\n", {"a"}) == "詳細は[資料][a]。\n\n[a]: https://example.com\n"
+    assert PL._strip_id_tags("詳細は [a] を参照 [b]。\n\n[a]: https://example.com\n", {"a", "b"}) == (
+        "詳細は [a] を参照。\n\n[a]: https://example.com\n")                 # 定義のある名前の [a] はリンクとして残す
+    assert PL._strip_id_tags("詳細は [A]。\n\n[a]: https://example.com\n", {"A"}) == "詳細は [A]。\n\n[a]: https://example.com\n"
+
+
+def test_task_list_checkboxes_stay_when_a_plan_id_is_x():
+    ids = {"x", "a"}
+    f = PL._strip_id_tags
+    assert f("- [x] 対象の確認 [a]\n- [ ] 残り\n1. [X] 済み\n", ids) == "- [x] 対象の確認\n- [ ] 残り\n1. [X] 済み\n"
+    assert f("文の途中の [x] は印として外す。", ids) == "文の途中の は印として外す。"
+    assert f("> - [x] 引用の中の項目 [a]\n>> 1. [ ] 入れ子\n", ids) == "> - [x] 引用の中の項目\n>> 1. [ ] 入れ子\n"
+    code = '前 [a]\n\n    print("[a]")\n\n    x = [a]\n後 [a]\n'
+    assert f(code, ids) == '前\n\n    print("[a]")\n\n    x = [a]\n後\n'          # 空行の後の字下げはコードの塊
+    assert f("- 項目 [a]\n    - 子の項目 [a]\n", ids) == "- 項目\n    - 子の項目\n"   # 箇条書きの続きの字下げは本文
+    quoted = "> 引用 [a]\n> ```md\n> [a]\n> ```\n>\n>     x = [a]\n> 後 [a]\n"
+    assert f(quoted, ids) == "> 引用\n> ```md\n> [a]\n> ```\n>\n>     x = [a]\n> 後\n"    # 引用の中のコードも触らない
+
+
+def test_model_body_keeps_array_subscripts_when_a_plan_id_is_numeric():
+    plan = PL.parse_plan(_plan("- [x] 0 · k · 対象 · 要: source\n    - source: src/a.cbl:1\n", conclusion="結論 [0]。"))
+    out, _ = PL.compose_with_model_answer(plan, "配列は x[0] です [0]。\n\n参照した資料:\n- src/a.cbl:1")
+    assert out.startswith("配列は x[0] です。")
 
 
 @pytest.mark.parametrize("text", ["", "## 母集団\n- [x] 壊れた行\n", "# 見出しだけ\n"])
@@ -389,10 +470,10 @@ def test_plan_refs_make_a_block_when_the_model_has_none():
     assert out.endswith("参照した資料:\n- src/a.cbl:12")
 
 
-def test_text_after_the_model_block_moves_before_the_supplement():
+def test_text_after_the_model_block_moves_before_the_references():
     plan = PL.parse_plan(_plan(ROWS_DONE))
     out, _ = PL.compose_with_model_answer(plan, "本文。\n\n参照した資料:\n- src/a.cbl:12\n\n注意書きです。")
-    assert out.index("注意書きです。") < out.index("## 調べた範囲") < out.rindex("参照した資料:")
+    assert out.index("注意書きです。") < out.rindex("参照した資料:")
 
 
 class _St:
@@ -699,3 +780,10 @@ def test_format_only_problems_do_not_reject_but_real_unstarted_rows_do():
     assert d.action == "reject_unstarted" and "b" in d.prompt and st.continuations == 1
     stray = PL.parse_plan(_plan("- [x] a · k · 対象A · 要: source\n    - source: src/a.cbl:1\n説明の文です\n"))
     assert PL.decide(PL.PlanGateState(), stray, review_cap=0).action == "accept"
+
+
+def test_reference_heading_inside_a_code_block_is_not_moved_by_composition():
+    plan = PL.parse_plan(_plan(ROWS_DONE, conclusion="結論 [a]。"))
+    model = "説明。\n```text\n参照した資料:\n- missing.md\n```\n続き。\n\n参照した資料:\n- src/a.cbl:12"
+    out, _ = PL.compose_with_model_answer(plan, model)
+    assert out.startswith("説明。\n```text\n参照した資料:\n- missing.md\n```\n続き。")

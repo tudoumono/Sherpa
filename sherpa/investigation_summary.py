@@ -11,6 +11,7 @@ UNCONFIRMED_LIST_MAX = 50
 
 _LABEL_LIMIT = "打ち切り"
 _LABEL_CONFIRMED = "確認できた項目"
+_LABEL_PLAN_COUNTS = "調べた項目"
 _LABEL_UNCONFIRMED = "確認できなかった項目"
 _LABEL_OMITTED = "回答に入っていない項目"
 _LABEL_BROKEN = "壊れていた項目"
@@ -62,11 +63,11 @@ def _split_names(names) -> tuple[list[str], int]:
 
 def build_items(env: dict) -> list[dict]:
     """回答に付ける `[{label, text}]`。確認の状態・確認できた／できなかった項目・壊れた項目・見直しの読み取りの省略・調査記録の欠落の順。
-    道具の打ち切りと調べた量は入れない（`record_lines` で調査の記録に残す）。計画書の方式では、確認できなかった項目は本文の補足に出るので入れない。"""
+    道具の打ち切りと調べた量は入れない（`record_lines` で調査の記録に残す）。計画書の方式では確認の状況を件数 1 項目（`plan_counts`）で入れる。"""
     items: list[dict] = []
     limits = env.get("limits") if isinstance(env.get("limits"), dict) else {}
     inv = env.get("investigation") if isinstance(env.get("investigation"), dict) else {}
-    plan_style = inv.get("ledger") == "plan"
+    plan_counts = inv.get("plan_counts") if inv.get("ledger") == "plan" and isinstance(inv.get("plan_counts"), dict) else {}
     for key, text in _ACTION_TEXTS:
         if limits.get(key) is True or _count(limits.get(key)):
             items.append({"label": _LABEL_NOTE, "text": text})
@@ -87,9 +88,13 @@ def build_items(env: dict) -> list[dict]:
     if total:
         parts = "・".join(f"{label} {n} 件" for label, n in confirmed if n)
         items.append({"label": _LABEL_CONFIRMED, "text": f"{total} 件（{parts}）"})
-    unconfirmed = [u for u in (inv.get("unconfirmed_items") or [])
-                   if not plan_style and isinstance(u, dict) and isinstance(u.get("item"), str)
-                   and isinstance(u.get("reason"), str)]
+    if _count(plan_counts.get("total")):
+        done, failed, waiting = (_count(plan_counts.get(k)) for k in ("confirmed", "unconfirmed", "unstarted"))
+        items.append({"label": _LABEL_PLAN_COUNTS,
+                      "text": f"対象 {plan_counts['total']} 件のうち、確かめた {done} 件・確かめられなかった {failed} 件・未着手 {waiting} 件"})
+    # 計画書の方式の記載の不備（形式不正・source 欠落）は回答に出さず調査の記録に残すので、確認できなかった項目は別の欄から読む
+    unconfirmed = [u for u in (inv.get("plan_unverified_items" if inv.get("ledger") == "plan" else "unconfirmed_items") or [])
+                   if isinstance(u, dict) and isinstance(u.get("item"), str) and isinstance(u.get("reason"), str)]
     hidden = 0
     for u in unconfirmed[:UNCONFIRMED_LIST_MAX]:
         if _split_names([u["item"]])[1]:

@@ -137,9 +137,9 @@ def _calls_section(calls) -> list[str]:
             extra.append("行: " + "、".join(str(x) for x in r["lines"]))
         if r.get("queries"):
             extra.append("検索語: " + "、".join(_esc_cell(q) for q in r["queries"]))
-        extra.append("Codex の読み取り記録: " + ("あり" if r.get("opened")
-                                                 else "確かめられません（記録が欠けています）" if calls.get("opened_unknown")
-                                                 else "なし"))
+        extra.append("Sherpa の読み取り機能で開いた" if r.get("opened")
+                     else "Sherpa の読み取り機能で開いた記録: 確かめられません（記録が欠けています）" if calls.get("opened_unknown")
+                     else "Sherpa の読み取り機能で開いた記録なし")
         lines.append(f"- {_esc_cell(r.get('doc'))}（{' / '.join(extra)}）")
     if calls.get("found_more"):
         lines.append(f"- ほか {calls['found_more']} 件（上限で省略）")

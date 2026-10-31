@@ -112,7 +112,8 @@ def test_summary_hides_sensitive_names_shows_broken_overflow_and_share_keeps_cou
 
 _NEW_SHAPE = {
     "referenced_docs": [{"path": "docs/a.md", "ranges": [[3, 9], [0, 1], "x"], "unopened": True},
-                        {"path": "src/secrets/.env", "ranges": [[1, 2]]}, {"path": 5}],
+                        {"path": "src/secrets/.env", "ranges": [[1, 2]]}, {"path": 5},
+                        {"path": "docs/m.md", "mentioned_only": True}, {"path": "docs/n.md", "mentioned_only": "yes"}],
     "referenced_docs_more": 2,
     "impact_list": {"v": 1, "traced": True, "reasons": ["深さの上限で打ち切りました"],
                     "rows": [{"name": "OrderBatch", "path": "src/OrderBatch.java", "role": "origin", "state": "used"},
@@ -124,7 +125,9 @@ _NEW_SHAPE = {
 
 def test_new_shape_fields_are_shared_without_sensitive_names_and_survive_seal():
     shared = _safe_share_answer(answer_shape.seal({"lens": "qa", "headline": "本文", "sources": [], **_NEW_SHAPE}))
-    assert shared["referenced_docs"] == [{"path": "docs/a.md", "ranges": [[3, 9]], "unopened": True}]
+    assert shared["referenced_docs"] == [{"path": "docs/a.md", "ranges": [[3, 9]], "unopened": True},
+                                         {"path": "docs/m.md", "ranges": [], "unopened": False, "mentioned_only": True},
+                                         {"path": "docs/n.md", "ranges": [], "unopened": False}]
     assert shared["referenced_docs_hidden"] == 1 and shared["referenced_docs_more"] == 2
     il = shared["impact_list"]
     assert [r["name"] for r in il["rows"]] == ["OrderBatch"] and il["hidden"] == 1 and il["traced"] is True
@@ -149,18 +152,24 @@ def test_old_answers_get_no_new_fields_and_stay_unfaked():
 def test_received_share_read_path_hides_sensitive_names_in_new_fields():
     from sherpa.store.shares import _strip_shared_message
     out = _strip_shared_message({"role": "assistant", "answer": {"headline": "本文", **_NEW_SHAPE}})["answer"]
-    assert [r["path"] for r in out["referenced_docs"]] == ["docs/a.md"] and out["referenced_docs_hidden"] == 1
+    assert [r["path"] for r in out["referenced_docs"]] == ["docs/a.md", "docs/m.md", "docs/n.md"] and out["referenced_docs_hidden"] == 1
     assert out["found_docs_hidden"] == 1 and ".env" not in str(out)
 
 
-def test_plan_style_summary_leaves_unconfirmed_items_to_the_body_and_keeps_quality_notes():
-    """計画書の方式（C-check）では、確認できなかった項目は本文の補足に出るので要約に重ねない。主張を推定に下げた知らせは残す。"""
+def test_plan_style_summary_shows_counts_and_unconfirmed_items_and_keeps_quality_notes():
+    """計画書の方式（C-check）でも、件数 1 項目と確認できなかった項目を要約に出す（秘匿名は件数だけ）。主張を推定に下げた知らせも残す。"""
     env = {"headline": "回答", "limits": {"claims_unmatched": 1, "search_truncated": 3},
-           "investigation": {"ledger": "plan", "unconfirmed_items": [{"item": "対象A", "reason": "範囲外"}]}}
+           "investigation": {"ledger": "plan", "plan_counts": {"total": 5, "confirmed": 2, "unconfirmed": 2, "unstarted": 1},
+                             "plan_unverified_items": [{"item": "対象A", "reason": "範囲外"}, {"item": "credentials.xlsx", "reason": "無い"}],
+                             "plan_format_issues": [{"item": "対象F", "reason": "行の書式または打ち切りの理由が読み取れません"}],
+                             "unconfirmed_items": [{"item": "対象F", "reason": "計画書の形式・id または打ち切りの理由が不正です"}]}}
     texts = [(i["label"], i["text"]) for i in answer_shape.seal(env)["investigation_summary"]["items"]]
-    assert not any(label == "確認できなかった項目" for label, _t in texts)
+    assert ("調べた項目", "対象 5 件のうち、確かめた 2 件・確かめられなかった 2 件・未着手 1 件") in texts
+    assert ("確認できなかった項目", "対象A（範囲外）") in texts
+    assert ("確認できなかった項目", "名前を表示できない項目 1 件") in texts and not any("credentials" in t for _l, t in texts)
     assert ("打ち切り", "調べた記録と合わない主張があったため、「推定」に下げています。") in texts
     assert not any("検索の結果が多く" in t for _l, t in texts)
+    assert not any("対象F" in t or "計画書の形式" in t for _l, t in texts)    # 計画書の記載の不備は回答に出さない
 
 
 def test_search_cutoff_is_shown_with_what_to_do_only_for_exhaustive_requests():
