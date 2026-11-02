@@ -192,13 +192,14 @@ _step "2. Python 実行系＋基本ツール"
 # R4: `python3 -c 'import venv'` は python3-venv が未導入の Debian/Ubuntu でも成功する
 # （venv モジュール自体は python3-minimal に含まれ、実体の ensurepip 相当が別パッケージ）。
 # 実際に venv を作れるかで判定する（一時ディレクトリに作って即削除）。
-# 同梱 .deb には xz-utils/unzip/fontconfig（Node 展開・HackGen 展開・fc-cache）も含むため、
+# 同梱 .deb には xz-utils/unzip/fontconfig（Node 展開・HackGen 展開・fc-cache）と make・curl も含むため、
 # それらの有無も併せて判定する。
 _PROBE_VENV="$(mktemp -d "${TMPDIR:-/tmp}/sherpa.XXXXXX")/venv-probe"
 if command -v python3 >/dev/null 2>&1 && python3 -m venv "$_PROBE_VENV" >/dev/null 2>&1 \
-    && command -v xz >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 && command -v fc-cache >/dev/null 2>&1; then
+    && command -v xz >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 && command -v fc-cache >/dev/null 2>&1 \
+    && command -v make >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
   rm -rf "$(dirname "$_PROBE_VENV")"
-  note "python3/venv・xz・unzip・fontconfig は既に使えるため、同梱分の導入をスキップします。"
+  note "python3/venv・xz・unzip・fontconfig・make・curl は既に使えるため、同梱分の導入をスキップします。"
 else
   rm -rf "$(dirname "$_PROBE_VENV")" 2>/dev/null || true
   rc=0
