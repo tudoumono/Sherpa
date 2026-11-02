@@ -275,6 +275,9 @@ PACKAGE_VERSION := $(patsubst v%,%,$(SHERPA_VERSION))
 # VERSION が `<版>+<公開リポの中身のコミット>` ならその `+` の後ろ、無ければ HEAD の 9 桁。
 PACKAGE_COMMIT := $(shell v="$$(cat VERSION 2>/dev/null)"; if printf '%s' "$$v" | grep -q +; then printf '%s' "$$v" | cut -d+ -f2; else git rev-parse --short=9 HEAD 2>/dev/null || echo unknown; fi)
 
+# 展開の前に単独で流せる事前確認（圧縮ファイルの隣に .sha256 つきで置く）。
+PACKAGE_PRECHECK = sherpa-$(PACKAGE_VERSION)-precheck-$(PACKAGE_COMMIT).sh
+
 package-full:      ## フルのパッケージを生成（dist/sherpa-<版>-full-<コミット>.tar.gz＋.sha256）。初回導入・依存が変わる更新用
 	$(MAKE) package-build PACKAGE_KIND=full
 
@@ -289,6 +292,12 @@ package-build: notice
 	cp dist/notice/NOTICE.md dist/notice/THIRD-PARTY-LICENSES.txt dist/notice/sbom.cdx.json $(PACKAGE_STAGE)/Sherpa/
 	$(PY) scripts/lib/pkg_tool.py build --kind $(PACKAGE_KIND) --source $(PACKAGE_STAGE)/Sherpa --kit "$(PACKAGE_KIT)" \
 		--out-dir dist --version "$(PACKAGE_VERSION)" --commit "$(PACKAGE_COMMIT)"
+	cp $(PACKAGE_STAGE)/Sherpa/precheck.sh dist/$(PACKAGE_PRECHECK)
+	if command -v sha256sum >/dev/null 2>&1; then \
+		cd dist && sha256sum $(PACKAGE_PRECHECK) > $(PACKAGE_PRECHECK).sha256; \
+	else \
+		$(PY) scripts/lib/portable_tools.py sha256 --basename dist/$(PACKAGE_PRECHECK) > dist/$(PACKAGE_PRECHECK).sha256; \
+	fi
 	rm -rf $(PACKAGE_STAGE)
 
 backup:            ## データを退避（停止中のストア＋個人領域＋.env → data/backups/<日時>/。ARGS=--stop/--with-derived/--dry-run）
