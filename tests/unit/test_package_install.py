@@ -405,7 +405,7 @@ def test_export_public_version_is_version_only(tmp_path: Path):
     assert r.returncode == 0, r.stdout + r.stderr
     base = (ROOT / "VERSION").read_text(encoding="utf-8").strip().split("+", 1)[0]
     assert (dest / "VERSION").read_text(encoding="utf-8").strip() == base
-    assert (dest / "install.sh").is_file() and (dest / "INSTALL.md").is_file()
+    assert (dest / "install.sh").is_file() and (dest / "INSTALL.md").is_file() and (dest / "precheck.sh").is_file()
     assert not (dest / "scripts" / "publish_public_commit.sh").exists()
 
 
@@ -524,3 +524,12 @@ def test_macos_install_stops_before_building_when_python_differs_from_package(tm
     r = run_install(root, tmp_path, extra_env={"SHERPA_INSTALL_PLATFORM": "darwin_arm64", "PYTHON_BIN": str(fake)})
     assert r.returncode != 0 and "3.12" in r.stderr and "PYTHON_BIN" in r.stderr
     assert not (root / ".venv").exists()
+
+
+def test_package_build_places_precheck_and_sha256_next_to_archive(tmp_path: Path):
+    (tmp_path / "VERSION").write_text("1.2.3+pub123456\n")
+    out = subprocess.run(["make", "-n", "-f", str(ROOT / "Makefile"), "-C", str(tmp_path), "package-build", "PACKAGE_KIND=app"],
+                         capture_output=True, text=True).stdout
+    name = "sherpa-1.2.3-precheck-pub123456.sh"
+    assert f"cp dist/package-stage/Sherpa/precheck.sh dist/{name}" in out
+    assert f"sha256sum {name} > {name}.sha256" in out
