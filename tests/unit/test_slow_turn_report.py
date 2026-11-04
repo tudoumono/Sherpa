@@ -95,3 +95,51 @@ def test_ledger_section_tells_whether_listing_walks_and_hides_names(ledger_world
     assert "資料フォルダを全部歩く" in text
     for secret in ("secretsys", "SECRET", "secrethost", "7687", ledger_world):
         assert secret not in text
+
+
+def test_degrade_reasons_are_counted_per_day_and_tool_once():
+    """結果のいちばん外側の degrade_reason だけを実際の道具ごとに数え、本文の中の同じ文字列や数え済みの呼び出しは数えない。"""
+    th = SimpleNamespace(tid="t1")
+    calls = [
+        CT.Call(ts=1762300800.0, thread=th, call_id="c1", name="es_search",
+                result_text='{"hits": [], "degrade_reason": "query_embed_failed", "mode_used": "keyword"}'),
+        CT.Call(ts=1762300801.0, thread=th, call_id="c2", name="es_search",
+                result_text='{"hits": [{"text": "{\\"degrade_reason\\": \\"es_unavailable\\"} secretdoc"}], "degrade_reason": null}'),
+        CT.Call(ts=1762300802.0, thread=th, call_id="c3", name="read_doc",
+                result_text='{"text": "degrade_reason: query_embed_failed"}'),
+    ]
+    seen: set = set()
+    got = R.degrade_counts(CT, calls, seen)
+    day = R.datetime.fromtimestamp(1762300800.0, R._JST).strftime("%m/%d")
+    assert got == {f"{day}|es_search": {"query_embed_failed": 1, "なし": 1}}
+    assert R.degrade_counts(CT, calls, seen) == {}          # 次の回答の窓に入っても数え直さない
+    recent = {"since": "a", "until": "b", "conversations": 0, "truncated": False, "turns": [], "tools": {},
+              "degrade": got}
+    text = R.render([], [], recent, detail=True)
+    assert "query_embed_failed 1" in text and "es_unavailable" not in text and "secretdoc" not in text
+
+
+@pytest.fixture
+def embed_settings():
+    from sherpa import store
+    before = store.get_system_settings()
+    keys = ("embed_provider", "ollama_url")
+    yield lambda **kv: store.set_system_settings("admin", kv)
+    store.set_system_settings("admin", {k: before.get(k) for k in keys})
+
+
+def test_embed_trial_reports_failure_kind_without_the_address(embed_settings, monkeypatch):
+    """質問の埋め込みが届かないとき、失敗の種類だけを出し、接続先を出さない。"""
+    for k in R._PROXY_ENV_KEYS:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
+    embed_settings(embed_provider="ollama", ollama_url="http://127.0.0.1:9")
+    got = R.embed_trial()
+    assert got["provider"] == "ollama" and got["url_kind"] == "loopback" and got["proxy_env"] is False
+    assert got["result"] == "failed" and got["error_type"]
+    text = R.render([], [], None, detail=True, searches=[{"world": "W1", "index": {"es": "unavailable"},
+                                                          "embed_tool": got, "embed_app": got}])
+    assert "**失敗**" in text and "127.0.0.1" not in text and ":9" not in text
+
+    monkeypatch.setenv("SHERPA_DISABLE_EMBED", "1")
+    assert R.embed_trial()["result"] == "disabled"

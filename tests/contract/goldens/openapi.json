@@ -127,6 +127,46 @@
         "title": "AdminFeedbackSummaryResponse",
         "type": "object"
       },
+      "AdminOllamaTestResponse": {
+        "description": "管理画面の Ollama 接続テストの結果（POST /admin/settings/ollama-test）。",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "missing": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing",
+            "type": "array"
+          },
+          "models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "host",
+          "models",
+          "missing",
+          "detail"
+        ],
+        "title": "AdminOllamaTestResponse",
+        "type": "object"
+      },
       "AdminUsageQualityRunAck": {
         "properties": {
           "inserted": {
@@ -3541,6 +3581,24 @@
           "ok"
         ],
         "title": "OkResponse",
+        "type": "object"
+      },
+      "OllamaTestReq": {
+        "description": "管理画面「ローカル AI（Ollama）の既定接続先」の接続テスト（admin 専用・`POST /admin/settings/ollama-test`）。保存前の入力中の値でその場だけ試し、DB は書かない。",
+        "properties": {
+          "ollama_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ollama Url"
+          }
+        },
+        "title": "OllamaTestReq",
         "type": "object"
       },
       "OllamaUrlChoiceInfo": {
@@ -9538,6 +9596,48 @@
         ]
       }
     },
+    "/admin/settings/ollama-test": {
+      "post": {
+        "description": "ローカル AI（Ollama）の既定接続先を、保存前の入力中の値でその場だけ試す（admin 専用・`/api/tags` を 1 回だけ読む・DB は書かない）。\n実行を監査する（`ollama_endpoint.tested`・記録は host:port のみ）。監査の書き込みに失敗したら接続せず 500 で中断する。",
+        "operationId": "admin_ollama_test_admin_settings_ollama_test_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OllamaTestReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminOllamaTestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Ollama Test",
+        "tags": [
+          "管理者:全体設定"
+        ]
+      }
+    },
     "/admin/settings/openai-endpoint-test": {
       "post": {
         "description": "OpenAI 互換 API の接続先（管理画面「接続先」欄）を、保存前の入力中の値でその場だけ試す（admin 専用・1 回だけ最小リクエスト・DB は書かない）。\n`PUT /admin/settings` と同じ検証（種別・URL 妥当性・userinfo 禁止・kind が openai 以外なら base_url 必須）を通信前に行い、不正な入力は 422 で接続しない。キー・モデルは常に中央設定で解決し、provider=codex は Codex(OpenAI) 構成の接続先ブロック判定を同じ入力で試す。\n実行を監査する（`openai_endpoint.tested`・記録は actor・provider・endpoint_kind・host のみで、キー・生 URL・エラー本文は含めない）。監査の書き込みに失敗したら接続せず 500 で中断する（fail-closed）。",
@@ -13592,7 +13692,7 @@
         ]
       },
       "put": {
-        "description": "現在ユーザーの設定を更新する（未指定フィールドは変更しない）。\n`agent` は許可された頭脳のみ（閉じた頭脳は 422）。`ollama_url` は宛先ポリシー（loopback／admin allowlist）に合わないと 422（到達可否の詳細は返さない）。管理画面で個人キーが許可されていない（`personal_api_keys_allowed` が偽）ときは、クラウド AI のキーを保存できず 422。",
+        "description": "現在ユーザーの設定を更新する（未指定フィールドは変更しない）。\n`agent` は許可された頭脳のみ（閉じた頭脳は 422）。`ollama_url` は宛先ポリシー（loopback／中央の既定接続先／admin allowlist）に合わないと 422（到達可否の詳細は返さない）。管理画面で個人キーが許可されていない（`personal_api_keys_allowed` が偽）ときは、クラウド AI のキーを保存できず 422。",
         "operationId": "settings_put_settings_put",
         "requestBody": {
           "content": {
@@ -13634,7 +13734,7 @@
     },
     "/settings/test": {
       "post": {
-        "description": "API キー/モデルの接続テスト（1 回だけ最小リクエスト）。保存はしない。入力中のキーで試せる。\n返値 `{ok, provider, model, detail}`。ok=False の detail に実エラー（401=認証/429=クォータ/モデル不明 等）を載せる。\nprovider=ollama は宛先ポリシー（loopback／admin allowlist）に合わないと接続せず 422 を返す。接続後の失敗は、到達可否の区別を出さず丸める（401 相当の認証失敗だけ区別を残す）。",
+        "description": "API キー/モデルの接続テスト（1 回だけ最小リクエスト）。保存はしない。入力中のキーで試せる。\n返値 `{ok, provider, model, detail}`。ok=False の detail に実エラー（401=認証/429=クォータ/モデル不明 等）を載せる。\nprovider=ollama は宛先ポリシー（loopback／中央の既定接続先／admin allowlist）に合わないと接続せず 422 を返す。接続後の失敗は、到達可否の区別を出さず丸める（401 相当の認証失敗だけ区別を残す）。",
         "operationId": "settings_test_settings_test_post",
         "requestBody": {
           "content": {

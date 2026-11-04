@@ -234,3 +234,23 @@ def test_ollama_url_choice_handles_ipv6_current_value():
     choice = c.get("/settings").json()["ollama_url_choice"]
     assert "http://[2001:db8::1]:11434" in choice["allowed"]
     assert choice["legacy"] is None
+
+
+def test_user_can_save_and_check_central_ollama_on_another_pc_without_allowlist():
+    """既定の接続先が別のパソコンの Ollama のとき、利用者は選択肢に出るその接続先を保存でき、
+    「利用者が選べる接続先」に無い宛先は今までどおり保存できない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin = _admin_client()
+    assert admin.put("/admin/settings", json={"ollama_url": "http://10.9.9.7:11434"}).status_code == 200
+
+    sfx = _sfx()
+    uid, pw = f"ourlcentral{sfx}", f"pw-{sfx}"
+    _mk_user(uid, pw)
+    c = _login(uid, pw)
+    assert "http://10.9.9.7:11434" in c.get("/settings").json()["ollama_url_choice"]["allowed"]
+    r = c.put("/settings", json={"ollama_url": "http://10.9.9.7:11434"})
+    assert r.status_code == 200, r.text
+    r2 = c.put("/settings", json={"ollama_url": "http://10.9.9.6:11434"})
+    assert r2.status_code == 422, r2.text
+    assert "allowlist" not in r2.json()["detail"]

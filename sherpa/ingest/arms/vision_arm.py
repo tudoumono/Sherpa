@@ -2,7 +2,7 @@
 
 - 既定はローカル（Ollama の視覚モデル・既定モデル `qwen2.5vl`・接続先は管理画面の中央の Ollama 接続先 `ollama_url` ＞ `http://localhost:11434`・許可リストの判定も同じ）。
 - クラウド（OpenAI）は管理者が `system_settings.vlm.cloud_allowed=true` にした場合のみ。false（既定）なら provider=openai が指定されていても画像を送らない。
-- Ollama の接続先は loopback か管理画面の Ollama 許可一覧にある宛先（IP・DNS 名とも）ならクラウド許可は不要。許可されていない宛先へは送らない（`_ollama_url_permitted`）。
+- Ollama の接続先は loopback・中央の Ollama 接続先・管理画面の Ollama 許可一覧にある宛先（IP・DNS 名とも）ならクラウド許可は不要。許可されていない宛先へは送らない（`_ollama_url_permitted`）。
 
 対象（`accepts`）: (a) ラスタ画像（`office_md.IMAGE_EXT`）を VLM へ（PNG・JPEG 以外は PNG にしてから送る・複数ページの TIFF はページごと）。(b) テキスト層ゼロの PDF（`office_md.pdf_escalation_target == "vision"`）を PDFium でページ画像化して VLM へ（`raster` を共用）。Office 文書は担当しない。
 出力: 先頭に `> [OCR抽出（AI視覚読み取り）: 信頼度=低〜中]`・`method="vision"`・confidence 0.4・notes に `vlm_provider`/`vlm_model`/`numeric_verified=false`（VLM は数値を誤りうる）。到達不可/失敗/未対応は None。
@@ -122,7 +122,7 @@ def _cloud_allowed_now(system_settings: dict | None = None) -> bool:
 
 
 def _ollama_url_permitted(url: str) -> bool:
-    """`url` が Ollama の接続許可ポリシー（loopback＋管理画面の許可一覧＝回答用の Ollama と同じ `llm.assert_ollama_url_allowed`）を満たすか。I/O なし。不許可・不正 URL は False。"""
+    """`url` が Ollama の接続許可ポリシー（loopback＋中央の接続先＋管理画面の許可一覧＝回答用の Ollama と同じ `llm.assert_ollama_url_allowed`）を満たすか。I/O なし。不許可・不正 URL は False。"""
     from sherpa import llm
     hp = llm._canonical_host_port(url)
     if hp is not None and llm.is_loopback_host(hp[0]):
@@ -507,7 +507,7 @@ def _read_ollama(image_path: Path, cfg: dict, timeout: float) -> str | None:
     from sherpa import llm, metering
     body = {"model": cfg["model"], "stream": False,
             "messages": [{"role": "user", "content": _VLM_PROMPT, "images": [_read_image_b64(image_path)]}]}
-    # 接続先は中央の Ollama 接続先と同じ許可リスト（loopback＋管理画面の許可一覧）で検証する。
+    # 接続先は回答用の Ollama と同じ許可リスト（loopback＋中央の接続先＋管理画面の許可一覧）で検証する。
     resp = llm.post_json(llm.ollama_url(url, "/api/chat"),
                          llm.JSON_HEADERS, body, timeout=max(1, int(timeout)))
     metering.acc_add(metering.usage_from_ollama_chat(resp))

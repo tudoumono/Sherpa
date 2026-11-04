@@ -120,6 +120,18 @@ class SettingsTestResponse(BaseModel):
     detail: str | None
 
 
+class AdminOllamaTestResponse(BaseModel):
+    """管理画面の Ollama 接続テストの結果（POST /admin/settings/ollama-test）。"""
+    ok: bool
+    # 試した接続先（host:port だけ）
+    host: str
+    # 接続先で取得済みのモデル名
+    models: list[str]
+    # 使えるモデル一覧の Ollama のモデルのうち、接続先で取得されていないもの
+    missing: list[str]
+    detail: str
+
+
 # ---- 管理者:全体設定 ----
 
 class CloudInfo(BaseModel):

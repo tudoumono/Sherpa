@@ -152,13 +152,13 @@ def test_intent_llm_classify_degrades_without_network_for_unlisted_url(monkeypat
     assert _no_network_by_default.calls == []
 
 
-def test_simple_provider_is_unwired_without_network_for_unlisted_url(_no_network_by_default):
-    """許可外の接続先なら `_resolve_llm` で止まり頭脳は未接続（ナレッジ参照のオン/オフどちらも通信なし）。"""
+def test_simple_provider_is_unwired_without_network_for_malformed_central_url(_no_network_by_default):
+    """保存済みの中央の接続先が解釈できない形なら `_resolve_llm` で止まり頭脳は未接続（ナレッジ参照のオン/オフどちらも通信なし）。"""
     from sherpa import providers as providers_pkg
     from sherpa.agents import Ctx
 
     p = providers_pkg.get_provider({"agent": "simple"},
-                                   system_settings={"ollama_url": _UNLISTED_EXTERNAL})
+                                   system_settings={"ollama_url": f"{_UNLISTED_EXTERNAL}/api"})
     assert isinstance(p, providers_pkg._UnwiredProvider)
     for knowledge in (True, False):
         ctx = Ctx(message="消費税率は?", world="v1", knowledge=knowledge,
@@ -290,12 +290,10 @@ def test_assert_ollama_url_allowed_rejects_userinfo_even_for_loopback():
 
 def test_assert_ollama_url_allowed_malformed_url_does_not_leak_raw_value():
     """解釈不能な URL のエラー文言に生の base（資格情報）を埋め込まない（503 detail へ反射されるため）。"""
-    for fn in (lambda u: llm.assert_ollama_url_allowed(u),
-               lambda u: llm.assert_ollama_url_allowed_in(u, set())):
-        with pytest.raises(llm.SsrfBlocked) as exc:
-            fn("http://user:secret-password@localhost:11434")
-        assert "secret-password" not in str(exc.value)
-        assert "user:secret-password" not in str(exc.value)
+    with pytest.raises(llm.SsrfBlocked) as exc:
+        llm.assert_ollama_url_allowed("http://user:secret-password@localhost:11434")
+    assert "secret-password" not in str(exc.value)
+    assert "user:secret-password" not in str(exc.value)
 
 
 def test_assert_ollama_url_allowed_omitted_port_does_not_alias_explicit_allowlist_entry(monkeypatch):

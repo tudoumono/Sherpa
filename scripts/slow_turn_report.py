@@ -7,6 +7,10 @@
 ② 道具のサーバーの試し: 回答のときと同じ環境変数で `sherpa.mcp_server` を起動し、起動・`es_search`・`ripgrep_search` の
    時間と失敗の種類を測る。DB の接続設定を道具のサーバーへ渡しているかも見る。
 ③ 直近の回答の内訳: 会話ごとの Codex のセッション記録から、回答ごとの時間・道具（シェルのコマンドを含む）ごとの回数と時間を集める。
+⑤ 全文検索の状態: 資料フォルダごとの全文検索の索引（検索が見ている索引と作りかけの索引の件数・作った時刻・ベクトルの無い
+   チャンク数・索引の埋め込みの設定が今の設定と同じか）と、質問の埋め込みを試した結果（回答のときの道具のサーバーと
+   同じ環境変数・アプリと同じ環境変数の 2 通り。全文検索と同じ再送と総期限。接続先の種類・鍵が見えるか・失敗の種類だけ）を出す。
+   ③には、道具が結果に載せた落とした理由（`degrade_reason`）を道具ごと・日ごとに数えた表も出す。
 ④ 台帳と直近の取り込み: 一覧の道具（`list_docs`・`glob_search`・`folder_tree`）が資料フォルダを歩かずに台帳から一覧を出せるか
    （`doc_ledger.listing_documents` と同じ判定）と、その理由になる台帳の行数・直近の取り込みの結果・止めた理由ごとの件数を出す。
 
@@ -141,7 +145,8 @@ def exists_check(world: str, sample: int = 50) -> dict | None:
     return {"n": len(picked), "found": len(found), "seconds": sec, "per_file_ms": sec * 1000 / len(picked)}
 
 
-def _in_child(kind: str, target: str, timeout_s: float, extra: list[str] | None = None) -> dict | list | None:
+def _in_child(kind: str, target: str, timeout_s: float, extra: list[str] | None = None,
+              env: dict | None = None) -> dict | list | None:
     """ネットワークの上や大きな記録で止まりうる調べを別のプロセスで動かし、`timeout_s` で止める。止めたら打ち切りの印だけ返す。"""
     # 子はプロセスのまとまりごと止める。ファイルシステムの読み込みで固まった子は、回収を待ちきれなければ置いて進む
     proc = None
@@ -164,7 +169,7 @@ def _in_child(kind: str, target: str, timeout_s: float, extra: list[str] | None 
         try:
             proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--_child", kind, "--_target",
                                      target, *(extra or [])], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                    env=os.environ.copy(), start_new_session=True)
+                                    env=env if env is not None else os.environ.copy(), start_new_session=True)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         out, _ = proc.communicate(timeout=timeout_s)
@@ -297,6 +302,161 @@ def ledger_status(world: str, runs: int = 3) -> dict:
                 "blocked": sum(reasons.values()), "reasons": reasons})
     except Exception as e:
         out["runs_error"] = _code(type(e).__name__)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ⑤ 全文検索の状態
+# ---------------------------------------------------------------------------
+
+_PROXY_ENV_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+_EMBED_TRIAL_TEXT = "接続の確かめ"
+_EMBED_TRIAL_TIMEOUT_S = 10
+
+
+def _search_embed_cfg():
+    """全文検索（`es_index.search`）が質問の埋め込みに使うのと同じ解決で、埋め込みの設定を返す（解決できなければ None）。"""
+    from sherpa import embeddings, es_index
+    try:
+        sys_s = es_index._embed_system_settings_snapshot()
+        return embeddings.cfg(es_index._settings(None), system_settings=sys_s)
+    except Exception:
+        return None
+
+
+def _same_embed_feature(meta: dict, ec) -> bool:
+    """索引の埋め込みの素性が今の設定と同じか（`es_index.search` が kNN を打つかどうかと同じ 5 項目）。"""
+    from sherpa import embeddings
+    return bool(ec) and (meta.get("embed_provider") == ec["provider"] and meta.get("embed_model") == ec["model"]
+                         and meta.get("dim") == ec["dim"]
+                         and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID
+                         and meta.get("quant") == embeddings.ES_VECTOR_QUANT)
+
+
+def search_index_status(world: str) -> dict:
+    """全文検索の索引（検索が見ている索引と作りかけの索引）の件数・作った時刻・ベクトルの無いチャンク数・埋め込みの設定が今と同じか（別のプロセスの中で動かす）。"""
+    from sherpa import embeddings, es_index, store
+    if not es_index.available():
+        return {"es": "unavailable"}
+    alias = es_index._index(world)
+    try:
+        rows = es_index._req("GET", f"/_cat/indices/{alias}*?format=json&h=index,creation.date,docs.count"
+                                    "&expand_wildcards=all")
+    except Exception as e:
+        return {"es": "error", "error": _code(type(e).__name__)}
+    targets = set(es_index._alias_targets(world) or [])
+    out: dict = {"es": "ok", "indices": []}
+    for r in rows if isinstance(rows, list) else []:
+        name = r.get("index") if isinstance(r, dict) else None
+        if not isinstance(name, str) or not (name == alias or name.startswith(alias + "-g")):
+            continue
+        try:
+            made = datetime.fromtimestamp(int(r.get("creation.date")) / 1000, _JST).strftime("%m/%d %H:%M")
+        except (TypeError, ValueError):
+            made = None
+        out["indices"].append({"role": "current" if (name in targets or (name == alias and not targets)) else "building",
+                               "made": made, "chunks": int(r["docs.count"]) if str(r.get("docs.count", "")).isdigit() else None})
+    if not any(i["role"] == "current" for i in out["indices"]):
+        return out
+    out["missing_vectors"] = es_index.count_missing_vectors(world)
+    try:
+        got = es_index._req("POST", f"/{alias}/_search",
+                            {"size": 0, "aggs": {"docs": {"cardinality": {"field": "doc_id"}}}})
+        out["docs"] = got["aggregations"]["docs"]["value"]
+    except Exception:
+        out["docs"] = None
+    meta = es_index._index_meta(world) or {}
+    out["index_embed"] = _code(meta.get("embed_provider")) if meta.get("embed_provider") else "none"
+    ec = _search_embed_cfg()
+    if not ec and not meta.get("embed_provider"):
+        out["same_embed"] = None   # どちらも埋め込みを使っていない
+    else:
+        out["same_embed"] = _same_embed_feature(meta, ec)
+    return out
+
+
+def embed_trial() -> dict:
+    """質問の埋め込みを全文検索と同じ再送と総期限で 1 回試す（呼び出した側の環境変数のまま）。接続先の種類・鍵が見えるか・失敗の種類だけを返す。"""
+    from sherpa import embeddings, llm, metering, store
+    out: dict = {"proxy_env": any(os.environ.get(k) for k in _PROXY_ENV_KEYS)}
+    if os.environ.get("SHERPA_DISABLE_EMBED"):
+        return {**out, "result": "disabled"}
+    from sherpa import es_index
+    try:
+        sys_s = es_index._embed_system_settings_snapshot()
+    except Exception as e:
+        return {**out, "result": "settings_error", "error_type": _code(type(e).__name__)}
+    try:
+        ec = embeddings.cfg(es_index._settings(None), system_settings=sys_s)
+    except Exception as e:
+        return {**out, "result": "config_error", "error_type": _code(type(e).__name__)}
+    if ec is None:
+        if embeddings.effective_embed_provider(sys_s) == "ollama":
+            return {**out, "provider": "ollama", "result": "ollama_dim_unknown"}
+        unavailable = embeddings.cloud_selected_but_unavailable(system_settings=sys_s)
+        return {**out, "result": "cloud_unavailable" if unavailable else "not_configured"}
+    out["provider"] = _code(ec["provider"])
+    if ec["provider"] == "openai":
+        out["key_seen"] = bool(ec.get("key"))
+    else:
+        hp = llm._canonical_host_port(str(ec.get("url") or ""))
+        out["url_kind"] = "invalid" if hp is None else ("loopback" if llm.is_loopback_host(hp[0]) else "other_host")
+    # ① 全文検索と同じ再送と総期限で 1 回取る ② 取れなければ失敗の種類を知るために再送なしで 1 回だけ送り直す（使った量は記録しない）
+    metering.acc_begin()
+    try:
+        t0 = time.monotonic()
+        vecs = embeddings._embed_batch([_EMBED_TRIAL_TEXT], ec, t0 + es_index._search_embed_timeout_s())
+        out["seconds"] = time.monotonic() - t0
+        if isinstance(vecs, list) and len(vecs) == 1 and embeddings.is_valid_vector(vecs[0], ec["dim"]):
+            out["result"] = "ok"
+            return out
+        out["result"] = "failed"
+        try:
+            embeddings._embed_batch_once([_EMBED_TRIAL_TEXT], ec, _EMBED_TRIAL_TIMEOUT_S)
+            out["error_type"] = "bad_response_or_deadline"
+        except Exception as exc:
+            status, error_type, error_code = embeddings._safe_failure_fields(exc)
+            out.update(status=status, error_type=_code(error_type),
+                       **({"error_code": _code(error_code)} if error_code else {}))
+    finally:
+        metering.acc_end()
+    return out
+
+
+def search_rows(world: str, label: str) -> dict:
+    """⑤ の 1 行分（索引の状態と、2 通りの環境での質問の埋め込みの試し）。どれも別のプロセスで動かし、止まったら打ち切る。"""
+    row: dict = {"world": label}
+    got = _in_child("search", world, 120)
+    row["index"] = got if isinstance(got, dict) and not got.get("child_timeout") else {"es": "timeout" if got else "error"}
+    budget = 120 + _EMBED_TRIAL_TIMEOUT_S + 60
+    app = _in_child("embed", "-", budget)
+    row["embed_app"] = app if isinstance(app, dict) and not app.get("child_timeout") else {"result": "timeout" if app else "error"}
+    got = _in_child("mcpenv", world, 60)
+    if isinstance(got, dict) and isinstance(got.get("env"), dict):
+        tool = _in_child("embed", "-", budget, env=got["env"])
+        row["embed_tool"] = tool if isinstance(tool, dict) and not tool.get("child_timeout") else {"result": "timeout" if tool else "error"}
+    else:
+        row["embed_tool"] = {"result": "error"}
+    return row
+
+
+def degrade_counts(ct, calls, seen: set) -> dict:
+    """道具の結果のいちばん外側の `degrade_reason` を、呼び出しの日（日本時間）と実際の道具の名前ごとに数える。
+    結果が JSON として読める呼び出しだけを見る（本文の中の同じ文字列は数えない）。`seen` は数え済みの呼び出し（回答をまたいで二重に数えない）。
+    """
+    out: dict = {}
+    for c in calls:
+        key = (c.thread.tid, c.call_id)
+        if not c.call_id or key in seen:
+            continue
+        parsed = ct._parsed_result(c)
+        if not isinstance(parsed, dict) or "degrade_reason" not in parsed:
+            continue
+        seen.add(key)
+        reason = parsed.get("degrade_reason")
+        k = _code(reason) if isinstance(reason, str) and reason else "なし"
+        e = out.setdefault(f"{datetime.fromtimestamp(c.ts, _JST):%m/%d}|{_tool_name(str(c.name or ''))}", {})
+        e[k] = e.get(k, 0) + 1
     return out
 
 
@@ -524,7 +684,7 @@ def recent_turns(days: int, timeout_s: float) -> dict:
     since = until - timedelta(days=max(1, days) - 1)
     ids, over = ct.select_conversation_ids(since, until)
     masker = ct.Masker(mask=True, mask_models=True)
-    turns, tools = [], {}
+    turns, tools, degrade, degrade_seen = [], {}, {}, set()
     for cid in ids:
         if time.monotonic() - t0 > timeout_s:
             timed_out = True
@@ -558,6 +718,10 @@ def recent_turns(days: int, timeout_s: float) -> dict:
             calls = ct.collect_calls(tt, w_start, w_end) if tt else []
             stages = ct.build_stages(tt, w_start, w_end, masker) if tt else []
             parts = {id(c): _call_parts(ct, c, inputs) for c in calls}
+            for k, e in degrade_counts(ct, calls, degrade_seen).items():
+                d = degrade.setdefault(k, {})
+                for reason, n in e.items():
+                    d[reason] = d.get(reason, 0) + n
             longest = max(calls, key=lambda c: c.duration_ms or 0, default=None)
             row = {"conv": cid, "turn": no, "seconds": (dur_ms / 1000) if dur_ms else end - start,
                    "calls": len(calls), "tool_uses": sum(len(v) for v in parts.values()),
@@ -582,14 +746,23 @@ def recent_turns(days: int, timeout_s: float) -> dict:
                 e["deadline_like"] += int(s >= _DEADLINE_LIKE_S)
                 e["slow_turn_calls"] += int(slow)
     return {"since": since.isoformat(), "until": until.isoformat(), "conversations": len(ids), "truncated": over,
-            "turns": turns, "tools": tools, "skipped_large": skipped_large, "timed_out": timed_out}
+            "turns": turns, "tools": tools, "degrade": degrade, "skipped_large": skipped_large, "timed_out": timed_out}
 
 
 # ---------------------------------------------------------------------------
 # 出力
 # ---------------------------------------------------------------------------
 
-def render(places: list, mcp: list, recent: dict | None, *, detail: bool, ledgers: list | None = None) -> str:
+_ES_STATE = {"unavailable": "全文検索に繋がらない", "error": "読めない", "timeout": "応答なし（打ち切り）"}
+_EMBED_RESULT = {"ok": "成功", "failed": "**失敗**", "bad_response": "**応答の形が違う**", "timeout": "応答なし（打ち切り）",
+                 "error": "試せない", "not_configured": "埋め込みの設定なし", "cloud_unavailable": "**クラウドの埋め込みを解決できない**",
+                 "settings_error": "**設定を読めない**", "config_error": "**設定の解決に失敗**",
+                 "ollama_dim_unknown": "**Ollama の埋め込みモデルに届かない**",
+                 "disabled": "**埋め込みを止める設定（SHERPA_DISABLE_EMBED）が入っている**"}
+
+
+def render(places: list, mcp: list, recent: dict | None, *, detail: bool, ledgers: list | None = None,
+           searches: list | None = None) -> str:
     L = [f"# 回答の時間の調べ  {datetime.now(_JST):%Y-%m-%d %H:%M}（日本時間）"]
     if places:
         L += ["", "## ① 資料の置き場の速さ",
@@ -649,6 +822,13 @@ def render(places: list, mcp: list, recent: dict | None, *, detail: bool, ledger
             for k, e in sorted(recent["tools"].items(), key=lambda kv: -kv[1]["total_s"])[:12 if not detail else None]:
                 L.append(f"| {k} | {e['calls']} | {_sec(e['total_s'])} | {_sec(e['max_s'])} | {e['deadline_like']} "
                          f"| {e['errors']} | {e['slow_turn_calls']} |")
+        if recent.get("degrade"):
+            L += ["", "道具が落とした理由（日ごと・結果に degrade_reason を載せる道具だけ・なし＝落とさず答えた）",
+                  "| 日 | 道具 | 理由ごとの件数 |", "|---|---|---|"]
+            for k in sorted(recent["degrade"]):
+                day, tool = k.split("|", 1)
+                e = recent["degrade"][k]
+                L.append(f"| {day} | {tool} | " + "・".join(f"{r} {n}" for r, n in sorted(e.items(), key=lambda kv: -kv[1])) + " |")
     if ledgers:
         L += ["", "## ④ 台帳と直近の取り込み（一覧の道具が資料フォルダを歩かずに台帳から出せるか）",
               "| 資料フォルダ | 台帳の行 | 種類が空の行 | 名前で補えない行 | 台帳の時刻 | 一覧の出し方 |",
@@ -678,6 +858,38 @@ def render(places: list, mcp: list, recent: dict | None, *, detail: bool, ledger
                 why = "・".join(f"{k} {n}" for k, n in sorted(r["reasons"].items(), key=lambda kv: -kv[1])) or "-"
                 L.append(f"| {g['world']} | {r['status']} | {r['started'] or '-'} | {r['published'] or '-'} "
                          f"| {r['blocked']} | {why} |")
+    if searches:
+        L += ["", "## ⑤ 全文検索の状態",
+              "| 資料フォルダ | 索引 | 作った時刻 | チャンク | 資料 | ベクトル無し | 索引の埋め込み | 今の設定と同じ |",
+              "|---|---|---|---:|---:|---:|---|---|"]
+        for g in searches:
+            ix = g["index"]
+            if ix.get("es") != "ok":
+                L.append(f"| {g['world']} | {_ES_STATE.get(ix.get('es'), '読めない')} | - | - | - | - | - | - |")
+                continue
+            if not ix["indices"]:
+                L.append(f"| {g['world']} | 索引なし | - | - | - | - | - | - |")
+            for i in ix["indices"]:
+                cur = i["role"] == "current"
+                L.append(f"| {g['world']} | {'検索が見ている索引' if cur else '作りかけ'} | {i['made'] or '-'} "
+                         f"| {i['chunks'] if i['chunks'] is not None else '-'} "
+                         f"| {ix.get('docs', '-') if cur and ix.get('docs') is not None else '-'} "
+                         f"| {ix.get('missing_vectors') if cur and ix.get('missing_vectors') is not None else '-'} "
+                         f"| {ix.get('index_embed', '-') if cur else '-'} "
+                         f"| {({True: 'はい', False: 'いいえ'}.get(ix.get('same_embed'), '-')) if cur else '-'} |")
+        L += ["", "質問の埋め込みの試し（全文検索と同じ再送と総期限で 1 回・取れないときだけ失敗の種類を知るためにもう 1 回送る）",
+              "| 資料フォルダ | 環境 | 結果 | 時間 | 埋め込みの接続先 | 鍵が見える | プロキシの設定 | 失敗の種類 |",
+              "|---|---|---|---:|---|---|---|---|"]
+        for g in searches:
+            for env_name, key in (("道具のサーバー（回答のとき）", "embed_tool"), ("アプリと同じ", "embed_app")):
+                e = g.get(key) or {}
+                kind = {"loopback": "Ollama（このサーバー）", "other_host": "Ollama（別のパソコン）",
+                        "invalid": "Ollama（接続先が不正）"}.get(e.get("url_kind")) or e.get("provider") or "-"
+                why = "・".join(str(x) for x in (e.get("status"), e.get("error_type"), e.get("error_code")) if x) or "-"
+                L.append(f"| {g['world']} | {env_name} | {_EMBED_RESULT.get(e.get('result'), '-')} "
+                         f"| {_sec(e.get('seconds')) if e.get('seconds') is not None else '-'} | {kind} "
+                         f"| {('はい' if e['key_seen'] else 'いいえ') if 'key_seen' in e else '-'} "
+                         f"| {('あり' if e.get('proxy_env') else 'なし') if 'proxy_env' in e else '-'} | {why} |")
     return "\n".join(L) + "\n"
 
 
@@ -685,7 +897,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="回答に時間がかかる原因の調べ（読むだけ）")
     ap.add_argument("--world", help="1 つの資料フォルダに絞る")
     ap.add_argument("--days", type=int, default=2, help="③で見る期間（日・既定 2）")
-    ap.add_argument("--skip", default="", help="飛ばす調べ（walk,rg,mcp,turns,ledger をカンマ区切り）")
+    ap.add_argument("--skip", default="", help="飛ばす調べ（walk,rg,mcp,turns,ledger,search をカンマ区切り）")
     ap.add_argument("--rg-timeout", type=float, default=120.0)
     ap.add_argument("--walk-timeout", type=float, default=300.0)
     ap.add_argument("--turns-timeout", type=float, default=300.0)
@@ -712,6 +924,15 @@ def main(argv: list[str] | None = None) -> int:
         t0 = time.monotonic()
         print(json.dumps({"result": exists_check(ns._target), "seconds": time.monotonic() - t0}))
         return 0
+    if ns._child == "search":
+        print(json.dumps(search_index_status(ns._target)))
+        return 0
+    if ns._child == "embed":
+        print(json.dumps(embed_trial()))
+        return 0
+    if ns._child == "mcpenv":
+        print(json.dumps({"env": mcp_env(ns._target)}))
+        return 0
     if ns._child == "ledger":
         print(json.dumps(ledger_status(ns._target)))
         return 0
@@ -728,8 +949,11 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         ids = got
     labels = {w: f"W{i}" for i, w in enumerate(ids, 1)}
-    places, mcp, ledgers = [], [], []
+    places, mcp, ledgers, searches = [], [], [], []
     for w in ids:
+        if "search" not in skip:
+            print(f"{labels[w]} の全文検索の状態を見ています…", file=sys.stderr)
+            searches.append(search_rows(w, labels[w]))
         if "ledger" not in skip:
             print(f"{labels[w]} の台帳と直近の取り込みを見ています…", file=sys.stderr)
             got = _in_child("ledger", w, 120)
@@ -770,8 +994,9 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(_JST).strftime("%Y%m%d-%H%M%S")
     detail_path = out_dir / f"slow-turn-report-{stamp}-detail.txt"
-    detail_path.write_text(render(places, mcp, recent, detail=True, ledgers=ledgers), encoding="utf-8")
-    sys.stdout.write(render(places, mcp, recent, detail=False, ledgers=ledgers))
+    detail_path.write_text(render(places, mcp, recent, detail=True, ledgers=ledgers, searches=searches),
+                           encoding="utf-8")
+    sys.stdout.write(render(places, mcp, recent, detail=False, ledgers=ledgers, searches=searches))
     shown = detail_path.relative_to(_ROOT) if detail_path.is_relative_to(_ROOT) else f"（--out-dir で指定した場所）/{detail_path.name}"
     print(f"\n詳しい結果: {shown}")
     return 0

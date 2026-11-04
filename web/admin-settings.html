@@ -231,7 +231,14 @@
               <label class="vlm-field"><span class="vlm-l">ローカル AI（Ollama）の既定接続先</span>
                 <input type="text" id="cloud-ollama-url" placeholder="http://localhost:11434" style="max-width:360px">
               </label>
-              <div class="hint">クラウドの選択に関わらず、常に使えます（社内のローカル AI・排他選択の対象外）。</div>
+              <div class="testrow">
+                <button class="mini" id="cloud-ollama-test" type="button">接続テスト</button>
+                <span class="tres muted" id="cloud-ollama-test-res"></span>
+              </div>
+              <div class="hint">クラウドの選択に関わらず、常に使えます（社内のローカル AI・排他選択の対象外）。
+別のパソコンの Ollama を使うときは、そのパソコンの名前か IP アドレスで入力します（例: http://192.168.0.10:11434）。
+「利用者が選べる接続先」への登録は要りません。相手のパソコンでは、ほかのパソコンからの接続を受け付ける設定
+（環境変数 <code>OLLAMA_HOST=0.0.0.0</code>）で Ollama を起動し、ポート 11434 への接続を許可してください。</div>
             </div>
 
             <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px" id="openai-endpoint-block">
@@ -290,7 +297,7 @@
                 <textarea id="cloud-ollama-allowlist" rows="3" style="max-width:360px"
                           placeholder="例: 10.0.0.5:11434（1行に1つ）"></textarea>
               </label>
-              <div class="hint">自分のパソコンだけなら空のままで構いません（localhost は常に使えます）。</div>
+              <div class="hint">既定の接続先と localhost は、登録しなくても使えます。利用者の「個人設定」で別の接続先も選ばせたいときだけ登録します。</div>
               <label class="vlm-field" style="align-items:flex-start;margin-top:14px">
                 <span class="vlm-l">Webhook の許可先</span>
                 <textarea id="webhook-allowlist" rows="3" style="max-width:360px"

@@ -562,10 +562,24 @@ def test_admin_settings_ollama_url_and_allowlist_set_together_then_removable(adm
     assert r3.json()["ollama_allowlist"]["configured"] == ["10.9.9.8:11434"]
 
 
-def test_admin_settings_ollama_url_change_must_be_authorized_by_pending_allowlist_not_old(admin):
-    """新 URL は置換後の allowlist で検証する（旧一覧にだけ残るホストへ旧権限で変更できない）。"""
-    assert _put(admin, {"ollama_allowlist": ["10.9.9.9:11434"]}).status_code == 200
-    r = _put(admin, {"ollama_allowlist": ["10.9.9.8:11434"], "ollama_url": "http://10.9.9.9:11434"})
+def test_admin_settings_ollama_url_on_another_pc_saves_without_allowlist_and_is_usable(admin):
+    """別のパソコンの Ollama を既定の接続先にするとき、「利用者が選べる接続先」へ登録しなくても保存でき、
+    回答・埋め込み・画像の読み取りが使う宛先の判定も通る。"""
+    from sherpa import llm
+    assert _put(admin, {"ollama_allowlist": []}).status_code == 200
+    r = _put(admin, {"ollama_url": "http://10.9.9.7:11434"})
+    assert r.status_code == 200, r.text
+    assert r.json()["cloud"]["ollama_url"] == "http://10.9.9.7:11434"
+    assert r.json()["ollama_allowlist"]["configured"] is None
+    llm.assert_ollama_url_allowed("http://10.9.9.7:11434", system_settings=store.get_system_settings())
+    with pytest.raises(llm.SsrfBlocked):   # 既定以外の未登録の宛先は今までどおり通さない
+        llm.assert_ollama_url_allowed("http://10.9.9.6:11434", system_settings=store.get_system_settings())
+
+
+@pytest.mark.parametrize("url", ["http://user:pw@10.9.9.7:11434", "http://10.9.9.7:11434/api",
+                                 "http://10.9.9.7:11434/?x=1", "ftp://10.9.9.7:11434", "10.9.9.7:11434"])
+def test_admin_settings_ollama_url_rejects_malformed_url(admin, url):
+    r = _put(admin, {"ollama_url": url})
     assert r.status_code == 422, r.text
 
 
@@ -577,6 +591,7 @@ def test_admin_settings_ollama_url_unchanged_allowed_even_if_allowlist_narrowed_
     assert r2.status_code == 200, r2.text
     assert r2.json()["ollama_allowlist"]["configured"] is None
     assert r2.json()["cloud"]["ollama_url"] == "http://10.9.9.9:11434"
+    assert r2.json()["ollama_allowlist"]["effective"] == ["10.9.9.9:11434"]   # 一覧を空にしても既定の接続先は使える
 
 
 # ===== openai_endpoint_kind/openai_base_url のクロス検証（書込み直前の原子性） =====
@@ -745,34 +760,6 @@ def test_seed_system_settings_once_does_not_reinsert_key_deleted_after_marker_se
     assert applied == {}
     assert conflicts == {"openai_api_key": None}
     assert store.get_system_settings().get("openai_api_key") is None
-
-
-def test_seed_system_settings_once_ollama_allowlist_merge_only_when_url_newly_inserted():
-    """URL を新規挿入できたときだけ既存 allowlist へ host:port を追記する。URL 行が既にあれば allowlist に触れない。"""
-    merge = ("ollama_url", "central.internal:11434")
-    store.set_system_settings("admin-uid", {"ollama_allowlist": ["10.1.1.1:11434"]})
-    applied, _ = store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434", "env_seed_version": 1},
-        guard_key="env_seed_version", ollama_allowlist_merge=merge)
-    assert applied["ollama_url"] == "http://central.internal:11434"
-    assert set(applied["ollama_allowlist"]) == {"10.1.1.1:11434", "central.internal:11434"}
-    assert set(store.get_system_settings()["ollama_allowlist"]) == {"10.1.1.1:11434", "central.internal:11434"}
-
-    _clear_system_settings()
-    store.set_system_settings("admin-uid", {"ollama_url": "http://already-set.internal:11434"})
-    applied, conflicts = store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434", "env_seed_version": 1},
-        guard_key="env_seed_version", ollama_allowlist_merge=merge)
-    assert "ollama_url" not in applied and "ollama_allowlist" not in applied
-    assert conflicts["ollama_url"] == "http://already-set.internal:11434"
-    assert store.get_system_settings().get("ollama_allowlist") is None
-
-
-def test_seed_system_settings_once_rejects_ollama_allowlist_in_updates_with_merge():
-    with pytest.raises(ValueError):
-        store.seed_system_settings_once(
-            {"ollama_url": "http://x:11434", "ollama_allowlist": ["x:11434"]},
-            guard_key="env_seed_version", ollama_allowlist_merge=("ollama_url", "x:11434"))
 
 
 # ===== A6: personal_api_keys_allowed=false → 個人キーの一括削除 =====
@@ -1142,13 +1129,13 @@ def test_seed_user_agent_from_env_fills_only_unselected_users(monkeypatch):
 
 
 def test_seed_vlm_ollama_url_from_env_only_when_central_unset(monkeypatch):
-    """旧 `SHERPA_VLM_OLLAMA_URL` は中央の `ollama_url` が未保存のときだけ中央の値（と許可一覧）へ取り込む。"""
+    """旧 `SHERPA_VLM_OLLAMA_URL` は中央の `ollama_url` が未保存のときだけ中央の値へ取り込む（許可一覧には足さない）。"""
     from sherpa import api as api_mod
     monkeypatch.setenv("SHERPA_VLM_OLLAMA_URL", "http://vlm-host.internal:11434")
     api_mod._seed_vlm_ollama_url_from_env()
     got = store.get_system_settings()
     assert got["ollama_url"] == "http://vlm-host.internal:11434"
-    assert got["ollama_allowlist"] == ["vlm-host.internal:11434"]
+    assert got.get("ollama_allowlist") is None
 
     _clear_system_settings()
     store.set_system_settings("admin-uid", {"ollama_url": "http://central.internal:11434"})
