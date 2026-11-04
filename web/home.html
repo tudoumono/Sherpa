@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sherpa — ホーム</title>
+<title>Slouch — ホーム</title>
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="fonts.css">
 <script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
@@ -17,8 +17,9 @@
     display:flex;align-items:center;gap:22px;flex-wrap:wrap;position:relative;overflow:hidden}
   /* ロゴの透かし: ボタンの裏に薄く敷く（読みやすさ優先で薄め・操作は透過） */
   .home-hero::after{content:"";position:absolute;right:8px;top:50%;transform:translateY(-50%);
-    width:240px;height:220px;background:url(hero-logo.png) no-repeat center/contain;
+    width:240px;height:220px;background:url(slouch-logo-stacked-clear.svg) no-repeat center/contain;
     opacity:.16;pointer-events:none}
+  [data-theme="dark"] .home-hero::after{background-image:url(slouch-logo-stacked-clear-dark.svg)}
   .home-hero>*{position:relative;z-index:1}
   .home-hero .txt{flex:1;min-width:240px}
   .home-hero h1{font-size:var(--text-heading);line-height:1.3;margin:0 0 8px}
@@ -87,9 +88,9 @@
 <div class="wrap">
   <div class="home-hero">
     <div class="txt">
-      <h1>Sherpa へようこそ</h1>
+      <h1>Slouch へようこそ</h1>
       <p>社内資料をチャットで調べる・分析する業務AI基盤です。まずはチャットを開いて質問してみましょう。</p>
-      <p class="home-hero-note">Sherpa（シェルパ）は、ヒマラヤ登山で道を知り荷を担ぐ案内人の呼び名。社内資料の山を知り尽くした案内役、という意味を込めています。</p>
+      <p class="home-hero-note">社内の資料とソースに、ひとつの入口から。面倒な調べ物は AI に任せて、あなたは頂上で考えるだけ。</p>
       <a class="btn-primary home-cta" href="chat.html">💬 チャットを開く</a>
     </div>
   </div>

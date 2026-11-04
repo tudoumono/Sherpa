@@ -598,7 +598,7 @@ async function loadStat(world_id) {                   // 各行の状況を非�
 async function removeWorld(world_id) {
   const w = (await fetchWorldsShared()).find((x) => x.world_id === world_id) || {};
   if (!confirm(`「${(w.label || world_id)}」の登録を解除します。\n\n`
-    + `削除されるのは Sherpa の検索用データと資料どうしの関係だけです。\n`
+    + `削除されるのは Slouch の検索用データと資料どうしの関係だけです。\n`
     + `元の Windows フォルダとファイルは一切消えません。\n\n`
     + `削除すると、別のフォルダを登録できるようになります。よろしいですか？`)) return;
   $('listmsg').innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>削除を受け付けています...</span></span>';

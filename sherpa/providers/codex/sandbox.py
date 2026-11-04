@@ -450,7 +450,7 @@ def _web_search_endpoint_note(user_enabled: bool, endpoint_kind: str,
     """接続先が既定以外（Azure 等）のせいで web_search が強制 OFF になっている時だけ、ユーザー向けの一言を返す（それ以外は None）。条件は `_web_search_disabled_value` と二重管理しない。"""
     if endpoint_kind != "openai" and bool(user_enabled) and _web_search_admin_allowed(system_settings):
         return ("接続先が Azure OpenAI（または OpenAI 以外の互換エンドポイント）のため、"
-                "現在の Sherpa＋Codex 構成では Web 検索は未検証として無効にしています。")
+                "現在の Slouch＋Codex 構成では Web 検索は未検証として無効にしています。")
     return None
 
 

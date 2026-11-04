@@ -1411,7 +1411,7 @@ def main(argv: list[str] | None = None) -> int:
     """隔離 Compose profile から起動する1-concurrency worker loop。"""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Sherpa offline PaddleOCR observation worker")
+    parser = argparse.ArgumentParser(description="Slouch offline PaddleOCR observation worker")
     parser.add_argument("--once", action="store_true", help="1件またはidleを処理して終了")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--worker-id", default=f"{socket.gethostname()}:{os.getpid()}")

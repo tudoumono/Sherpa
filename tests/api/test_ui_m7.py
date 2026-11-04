@@ -65,7 +65,7 @@ def test_preview_endpoint_and_ui_served():
     for page in ("chat.html", "chat.js", "ingest.html", "ingest.js", "app.css"):
         r = c.get(f"/ui/{page}")
         assert r.status_code == 200, f"/ui/{page} -> {r.status_code}"
-    assert "Sherpa" in c.get("/ui/chat.html").text
+    assert "Slouch" in c.get("/ui/chat.html").text
 
 
 def test_ui_static_cache_control_no_cache():
