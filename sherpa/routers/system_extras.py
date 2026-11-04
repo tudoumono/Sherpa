@@ -32,6 +32,7 @@ from sherpa.agents import _web_search_admin_allowed
 from sherpa.providers.codex import sandbox as codex_sandbox
 from sherpa.deps import _current_user, _require_admin
 from sherpa.schemas import (
+    AdminOllamaTestResponse,
     AnnouncementMutateResponse,
     AnnouncementsListResponse,
     ExtKeyCreatedResponse,
@@ -115,7 +116,7 @@ class SystemSettingsReq(BaseModel):
     # rag.md の LLM 成形トグル。on|off。null は既定 off へフォールバックする（`legacy_backend` と同型）。
     rag_llm_render: str | None = None
     vlm: dict | None = None  # 視覚読み取りの VLM 設定 {provider,model,cloud_allowed}。null は既定へ。
-    # Ollama 接続先の SSRF allowlist（host:port の配列）。未設定(None)は loopback のみ許可（`llm.assert_ollama_url_allowed`）。null は未設定へ戻す。
+    # 利用者が個人設定で選べる Ollama 接続先（host:port の配列）。未設定(None)は loopback と中央の既定接続先だけ（`llm.assert_ollama_url_allowed`）。null は未設定へ戻す。
     ollama_allowlist: list[str] | None = None
     # Webhook 宛先の SSRF allowlist（host:port の配列）。`ollama_allowlist` と違い loopback も例外にせず、未設定(None)は全拒否（`webhooks.assert_webhook_url_allowed`）。null は未設定へ戻す。
     webhook_allowlist: list[str] | None = None
@@ -611,10 +612,10 @@ def _admin_settings_view() -> dict:
             "providers": list(vision_arm._KNOWN_PROVIDERS),  # ローカル(ollama)/クラウド(openai)。
             "openai_key_present": bool(vision_arm._openai_key()),  # クラウド選択時のキー未設定案内用。
         },
-        # Ollama 接続先の SSRF allowlist。loopback（localhost・127.0.0.0/8・::1）は常に暗黙許可されるため、ここに出るのはそれ以外（RFC1918 含む）の許可先のみ（`llm.assert_ollama_url_allowed`）。
+        # Ollama 接続先の SSRF allowlist。loopback（localhost・127.0.0.0/8・::1）と中央の既定接続先は常に許可されるため、ここに登録するのはそれ以外に利用者へ選ばせる接続先だけ（`llm.assert_ollama_url_allowed`）。
         "ollama_allowlist": {
-            "configured": sysset.get("ollama_allowlist"),  # 生値（未設定=None＝loopback のみ許可）。
-            # 実際に許可される非 loopback 接続先（DB の admin allowlist のみ・env は初回シード時の一度きりの追加を除き影響しない・`llm._allowlisted_hosts()`）。host:port のみで秘密情報は含まない。
+            "configured": sysset.get("ollama_allowlist"),  # 生値（未設定=None＝loopback と中央の既定接続先だけ許可）。
+            # 実際に許可される非 loopback 接続先（中央の既定接続先＋DB の admin allowlist・env は初回シード時の一度きりの追加を除き影響しない・`llm._allowlisted_hosts()`）。host:port のみで秘密情報は含まない。
             "effective": sorted(f"{h}:{p}" for h, p in llm._allowlisted_hosts(sysset)),
         },
         # Webhook 宛先の SSRF allowlist。`ollama_allowlist` と型は同じだが loopback を暗黙許可せず、ここに出る host:port が許可先の全て（`webhooks.assert_webhook_url_allowed`）。
@@ -833,7 +834,7 @@ def _validate_vlm(value):
 
 
 def _validate_ollama_allowlist(value):
-    """`ollama_allowlist` の検証。None/空リストは None（未設定＝loopback のみ許可・`llm.assert_ollama_url_allowed`）。
+    """`ollama_allowlist` の検証。None/空リストは None（未設定＝loopback と中央の既定接続先だけ許可・`llm.assert_ollama_url_allowed`）。
     各エントリは scheme・空白を含まない `host[:port]` の文字列のみ許可し、`llm._canonical_host_port` で `host:port` に正規化して保存する（読取側の比較を文字列一致で済ませ、表記ゆれで迂回できないようにする）。不正な形式・解釈不能なホストは 422。
     """
     if value is None:
@@ -909,12 +910,9 @@ def _validate_secret_key(value, field_label: str):
     return v or None
 
 
-def _validate_central_ollama_url(value, pending_allowlist: list[str] | None = None, *,
-                                 strict_pending: bool = False):
-    """中央既定の Ollama 接続先の検証。空文字/None は未設定（既定 localhost へ）。宛先ポリシーは個人設定の `ollama_url` と同じ `llm.assert_ollama_url_allowed`（loopback／admin allowlist）。
-    `pending_allowlist`（省略可）: 同じ PUT で `ollama_allowlist` も更新されるとき、検証済みの新しい候補値（`_validate_ollama_allowlist` の戻り値）を渡す（DB はまだ更新前のため）。
-    `strict_pending=True`（この PUT で `ollama_url` が実際に新しい値へ変わる場合だけ渡す・`admin_settings_put` 参照）: `pending_allowlist` を置換後の正本として `llm.assert_ollama_url_allowed_in` で検証し、DB の現行 allowlist は見ない。
-    `strict_pending=False`（既定）: DB の現行 allowlist に `extra_allowed` としてこの検証だけ重ねる（URL が変わらない再送を、同時の allowlist 縮小で 422 にしないための緩さ）。
+def _validate_central_ollama_url(value):
+    """中央既定の Ollama 接続先の検証。空文字/None は未設定（既定 localhost へ）。
+    admin が決めた接続先なので許可一覧への登録は要らない（`llm._allowlisted_hosts` が中央の接続先を含める）。形式は `http(s)://host:port` だけを受け付ける（userinfo・path・query は 422）。
     """
     if value is None:
         return None
@@ -924,26 +922,9 @@ def _validate_central_ollama_url(value, pending_allowlist: list[str] | None = No
     if not v:
         return None
     from sherpa import llm
-    try:
-        if strict_pending:
-            allowed = set()
-            for entry in (pending_allowlist or []):
-                hp = llm._canonical_host_port(f"http://{entry}")
-                if hp is not None:
-                    allowed.add(hp)
-            llm.assert_ollama_url_allowed_in(v, allowed)
-        else:
-            extra_allowed = None
-            if pending_allowlist is not None:
-                extra_allowed = set()
-                for entry in pending_allowlist:
-                    hp = llm._canonical_host_port(f"http://{entry}")
-                    if hp is not None:
-                        extra_allowed.add(hp)
-            llm.assert_ollama_url_allowed(v, extra_allowed=extra_allowed)
-    except llm.SsrfBlocked:
-        raise HTTPException(422, "指定された Ollama 接続先は許可されていません"
-                                 "（admin が allowlist に登録した host:port のみ保存できます）")
+    if llm._canonical_host_port(v) is None:
+        raise HTTPException(422, "Ollama の接続先は http://ホスト名:ポート の形で入力してください"
+                                 "（例: http://192.168.0.10:11434）")
     return v
 
 
@@ -1239,15 +1220,7 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
         if _k in provided:
             updates[_k] = _validate_secret_key(provided[_k], _k)
     if "ollama_url" in provided:
-        # 同じ PUT で ollama_allowlist も更新される場合は、その新しい候補（検証済み）で ollama_url を検証する。
-        _pending_allowlist = updates["ollama_allowlist"] if "ollama_allowlist" in updates else None
-        # URL 自体が実際に新しい値へ変わる場合だけ、pending allowlist を置換後の正本として厳密検証する（strict_pending）。URL が変わらない再送は、同時の allowlist 縮小でそのホストが外れても拒否しない。
-        _strict_pending = False
-        if "ollama_allowlist" in provided and isinstance(provided["ollama_url"], str):
-            _cur_central = (store.get_system_settings().get("ollama_url") or "").strip()
-            _strict_pending = provided["ollama_url"].strip() != _cur_central
-        updates["ollama_url"] = _validate_central_ollama_url(
-            provided["ollama_url"], _pending_allowlist, strict_pending=_strict_pending)
+        updates["ollama_url"] = _validate_central_ollama_url(provided["ollama_url"])
     # OpenAI 互換 API の接続先（4 キー）。
     if "openai_endpoint_kind" in provided:
         updates["openai_endpoint_kind"] = _validate_openai_endpoint_kind(provided["openai_endpoint_kind"])
@@ -1380,6 +1353,87 @@ def admin_openai_endpoint_test(req: OpenaiEndpointTestReq, request: Request):
                                       "openai_endpoint_override": pending},
                                      timeout=_ENDPOINT_TEST_TIMEOUT_S)
     return {"ok": ok, "provider": "openai", "model": model, "detail": "接続OK" if ok else detail}
+
+
+class OllamaTestReq(BaseModel):
+    """管理画面「ローカル AI（Ollama）の既定接続先」の接続テスト（admin 専用・`POST /admin/settings/ollama-test`）。保存前の入力中の値でその場だけ試し、DB は書かない。"""
+    ollama_url: str | None = None  # 空・省略時は保存済みの中央の接続先（無ければ既定 localhost）。
+
+
+_OLLAMA_TEST_MAX_BYTES = 1_048_576
+
+
+def _ollama_test_hint(e: Exception, port: int) -> str:
+    """Ollama の接続テストの失敗を、管理者向けの平文の手がかりにする（到達できない理由の区別は出す）。"""
+    import socket
+    import urllib.error
+    if isinstance(e, urllib.error.HTTPError):
+        return f"Ollama から HTTP {e.code} が返りました。接続先が Ollama か確かめてください"
+    reason = e.reason if isinstance(e, urllib.error.URLError) else e
+    if isinstance(reason, ConnectionRefusedError):
+        return ("接続を拒否されました。相手のパソコンで Ollama が起動しているか、"
+                "ほかのパソコンからの接続を受け付ける設定（OLLAMA_HOST=0.0.0.0）で起動しているかを確かめてください")
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return (f"応答がありません（時間切れ）。相手のパソコンのファイアウォールで"
+                f"ポート {port} への接続が許可されているかを確かめてください")
+    if isinstance(reason, socket.gaierror):
+        return "接続先の名前からパソコンを見つけられません。IP アドレスで入力してみてください"
+    if isinstance(e, (ValueError, TypeError)):
+        return "応答を Ollama の応答として読めませんでした。接続先が Ollama か確かめてください"
+    return f"接続できませんでした（{type(reason).__name__}）"
+
+
+@extras_router.post("/admin/settings/ollama-test", tags=["管理者:全体設定"],
+                    response_model=AdminOllamaTestResponse)
+def admin_ollama_test(req: OllamaTestReq, request: Request):
+    """ローカル AI（Ollama）の既定接続先を、保存前の入力中の値でその場だけ試す（admin 専用・`/api/tags` を 1 回だけ読む・DB は書かない）。
+    実行を監査する（`ollama_endpoint.tested`・記録は host:port のみ）。監査の書き込みに失敗したら接続せず 500 で中断する。
+    """
+    import json as _json
+
+    from sherpa import keys, llm
+    u = _current_user(request)
+    _require_admin(u)
+    sys_s = store.get_system_settings()
+    # ① 接続先を決めて形式を検証する（入力中の値 → 保存済みの中央 → 既定 localhost・不正なら通信しない）
+    url = (_validate_central_ollama_url(req.ollama_url)
+           or str(keys.resolve_ollama_url(None, system_settings=sys_s) or "").strip())
+    hp = llm._canonical_host_port(url)
+    if hp is None:
+        raise HTTPException(422, "保存されている Ollama の接続先が不正です。接続先を入力し直してください")
+    host = llm.format_host_port(hp[0], hp[1])
+    # ② 接続の前に監査する（host:port だけ）
+    try:
+        store.audit(u["uid"], "ollama_endpoint.tested", "system_settings", None,
+                    detail={"host": host}, outcome="success", severity="info")
+    except Exception:
+        _log.critical("audit write failed for ollama_endpoint.tested (fail-closed) – probe を実行しません")
+        raise HTTPException(500, "接続テストの監査記録に失敗したため中断しました")
+    # ③ /api/tags を 1 回だけ読む
+    try:
+        with llm.urlopen_no_redirect(
+                llm.ollama_url(url, "/api/tags", extra_allowed={hp}, system_settings=sys_s),
+                timeout=_ENDPOINT_TEST_TIMEOUT_S) as r:
+            raw = r.read(_OLLAMA_TEST_MAX_BYTES + 1)
+        if len(raw) > _OLLAMA_TEST_MAX_BYTES:
+            raise ValueError("response too large")
+        data = _json.loads(raw)
+        listed = (data.get("models") if isinstance(data, dict) else None) or []
+        if not isinstance(data, dict) or not isinstance(listed, list):
+            raise TypeError("models is not a list")
+    except Exception as e:
+        return {"ok": False, "host": host, "models": [], "missing": [],
+                "detail": _ollama_test_hint(e, hp[1])}
+    names = sorted({str(m.get("name")) for m in listed if isinstance(m, dict) and m.get("name")})
+    # ④ 使えるモデル一覧の Ollama のモデルと突き合わせる（タグ無しは `:latest` とみなす）
+    wanted: set[str] = set()
+    for cell in (model_catalog.get_catalog(sys_s).get("ollama") or {}).values():
+        wanted.update(m for m in (cell.get("allowed") or []) if m)
+        if cell.get("default"):
+            wanted.add(cell["default"])
+    have = set(names)
+    missing = sorted(m for m in wanted if m not in have and f"{m}:latest" not in have)
+    return {"ok": True, "host": host, "models": names, "missing": missing, "detail": "接続OK"}
 
 
 def _validate_allowed_worlds_or_error(allowed_worlds: list[str] | None) -> None:

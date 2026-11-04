@@ -426,6 +426,8 @@ function renderCloud(cloud) {
   if (ourl) ourl.value = cloud.ollama_url || '';
   const res = $('cloud-key-test-res');
   if (res) { res.className = 'tres muted'; res.textContent = ''; }
+  const ores = $('cloud-ollama-test-res');
+  if (ores) { ores.className = 'tres muted'; ores.textContent = ''; }
 }
 
 // クラウド設定が render() 時点の基準値（_cloudBaseline）から変わっているか。キー入力欄は基準値が常に空文字＝入力が空でなければ変更あり。
@@ -618,6 +620,40 @@ async function testOpenaiEndpoint() {
     res.className = 'tres danger'; res.textContent = '✗ テストに失敗しました';
   } finally {
     _endpointTestBusy = false;
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Ollama の接続テスト（POST /admin/settings/ollama-test）。入力中の既定接続先で1回だけ試し、保存しない。
+let _ollamaTestBusy = false;   // 多重クリック防止
+async function testCentralOllama() {
+  if (_ollamaTestBusy) return;
+  _ollamaTestBusy = true;
+  const btn = $('cloud-ollama-test');
+  if (btn) btn.disabled = true;
+  const res = $('cloud-ollama-test-res');
+  res.className = 'tres muted';
+  res.innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>接続を確認中...</span></span>';
+  const body = { ollama_url: (($('cloud-ollama-url') || {}).value || '').trim() };
+  try {
+    const d = await (await fetch('/admin/settings/ollama-test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })).json();
+    if (!d.ok) {
+      res.className = 'tres danger';
+      res.textContent = '✗ ' + (typeof d.detail === 'string' ? d.detail : '失敗');
+      return;
+    }
+    const models = d.models || [];
+    const missing = d.missing || [];
+    let text = `✓ 接続OK（${d.host}）。取得済みのモデル: ${models.length ? models.join(', ') : 'なし'}`;
+    if (missing.length) text += `。使えるモデル一覧のうち未取得: ${missing.join(', ')}（相手のパソコンで ollama pull を実行してください）`;
+    res.className = 'tres ' + (missing.length ? 'danger' : 'ok');
+    res.textContent = text;
+  } catch (e) {
+    res.className = 'tres danger'; res.textContent = '✗ テストに失敗しました';
+  } finally {
+    _ollamaTestBusy = false;
     if (btn) btn.disabled = false;
   }
 }
@@ -2148,6 +2184,8 @@ const _cloudKeyInput = $('cloud-key');
 // キー入力中＝これから保存/削除が起きうる状態。入力の時点で世代を進め、古い削除応答の影響を避ける。
 if (_cloudKeyInput) _cloudKeyInput.addEventListener('input', () => _invalidateCloudKeyClear());
 
+const _cloudOllamaTest = $('cloud-ollama-test');
+if (_cloudOllamaTest) _cloudOllamaTest.addEventListener('click', testCentralOllama);
 const _openaiEndpointTest = $('openai-endpoint-test');
 if (_openaiEndpointTest) _openaiEndpointTest.addEventListener('click', testOpenaiEndpoint);
 

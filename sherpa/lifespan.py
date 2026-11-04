@@ -70,7 +70,6 @@ async def lifespan(app):
         from sherpa import api, model_catalog
         api._seed_settings_from_env()
         api._seed_ollama_url_from_env()  # OLLAMA_URL は独立マーカーで一度だけシード
-        api._warn_central_ollama_not_allowed()
         api._seed_openai_endpoint_from_env()
         api._seed_depth_profile_from_env()
         api._seed_screen_settings_from_env()

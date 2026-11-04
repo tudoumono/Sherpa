@@ -1007,6 +1007,21 @@ def test_openai_endpoint_test_button_sends_input_values_without_saving(page, web
     assert records["admin_settings_put"] == []
 
 
+def test_central_ollama_test_button_sends_input_url_without_saving(page, web_base_url):
+    """既定接続先の横の接続テストは、入力中の別のパソコンの URL をそのまま試し、保存しない。"""
+    records = _admin(page, web_base_url)
+
+    page.locator("#cloud-ollama-url").fill("http://10.9.9.21:11434")
+    page.locator("#cloud-ollama-test").click()
+
+    res = page.locator("#cloud-ollama-test-res")
+    expect(res).to_contain_text("接続OK（10.9.9.21:11434）")
+    expect(res).to_contain_text("qwen2.5:latest")
+    expect(res).to_contain_text("未取得: nomic-embed-text")
+    assert records["admin_ollama_test"][-1] == {"ollama_url": "http://10.9.9.21:11434"}
+    assert records["admin_settings_put"] == []
+
+
 @pytest.mark.parametrize("trigger,result", [("#save", "#msg"),
                                             ("#openai-endpoint-test", "#openai-endpoint-test-res")],
                          ids=["save", "connection-test"])

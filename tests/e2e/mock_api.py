@@ -1584,6 +1584,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         "ext_key_self_create": [],
         "ext_key_self_revoke": [],
         "admin_openai_endpoint_test": [],
+        "admin_ollama_test": [],
     }
     # 発行済み API キーの簡易台帳（プレーンキーは発行応答にだけ含め、ここには保持しない）。
     # `owner_uid=None`＝admin 発行（従来どおり誰でも使えるシステムキー）・非 None＝利用者自己発行。
@@ -1930,6 +1931,20 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             if _cross_err:
                 return _json(route, {"detail": _cross_err}, status=422)
             return _json(route, {"ok": True, "provider": provider, "model": model, "detail": "接続OK"})
+        if method == "POST" and path == "/admin/settings/ollama-test":
+            # 実サーバ `admin_ollama_test` と同じく保存はしない。形式だけ検証し、通れば接続OK を返す。
+            body = _post_json(request)
+            records["admin_ollama_test"].append(body)
+            if current_user.get("role") != "admin":
+                return _json(route, {"detail": "管理者権限が必要です"}, status=403)
+            url = (body.get("ollama_url") or "").strip() or "http://localhost:11434"
+            _op = urlparse(url)
+            if _op.scheme not in ("http", "https") or not _op.hostname or _op.username or _op.path not in ("", "/"):
+                return _json(route, {"detail": "Ollama の接続先は http://ホスト名:ポート の形で入力してください"},
+                             status=422)
+            host = f"{_op.hostname}:{_op.port or (443 if _op.scheme == 'https' else 80)}"
+            return _json(route, {"ok": True, "host": host, "models": ["qwen2.5:latest"],
+                                 "missing": ["nomic-embed-text"], "detail": "接続OK"})
         if method == "POST" and path == "/auth/login":
             body = _post_json(request)
             records["auth_login"].append(body)
@@ -2786,6 +2801,7 @@ MOCKED: list[tuple[str, str]] = [
     ("GET", "/admin/settings"),
     ("PUT", "/admin/settings"),
     ("POST", "/admin/settings/openai-endpoint-test"),
+    ("POST", "/admin/settings/ollama-test"),
     ("POST", "/auth/login"),
     ("POST", "/auth/logout"),
     ("GET", "/admin/users"),

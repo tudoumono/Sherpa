@@ -472,8 +472,7 @@ def _seed_ollama_url_from_env():
 
     未設定なら正常としてマーカーだけ確定する。DB 到達不可・形式不正（userinfo/path/query 混入・不正 scheme 等）ならマーカーを立てず
     warning を残して return する（env を直せば次回起動で再評価）。
-    正当な値は host:port へ正規化して保存し、非 loopback ホストは同一トランザクションで `ollama_allowlist` へも追記する
-    （`ollama_url` を新規挿入できたときだけ・URL と認可を原子的に確定）。
+    正当な値は host:port へ正規化して保存する（中央の接続先は許可一覧への登録が要らない）。
     """
     from sherpa import llm, store
     log = logging.getLogger("sherpa")
@@ -500,36 +499,13 @@ def _seed_ollama_url_from_env():
         from urllib.parse import urlparse as _urlparse
         scheme = _urlparse(raw).scheme.lower()
         normalized = f"{scheme}://{llm.format_host_port(hp[0], hp[1])}"
-        ollama_host_entry = None if llm.is_loopback_host(hp[0]) else llm.format_host_port(hp[0], hp[1])
         candidate = {"ollama_url": normalized, _OLLAMA_URL_SEED_MARKER_KEY: _OLLAMA_URL_SEED_VERSION}
         applied, _conflicts = store.seed_system_settings_once(
-            candidate, guard_key=_OLLAMA_URL_SEED_MARKER_KEY,
-            ollama_allowlist_merge=("ollama_url", ollama_host_entry) if ollama_host_entry else None)
+            candidate, guard_key=_OLLAMA_URL_SEED_MARKER_KEY)
         if "ollama_url" in applied:
             log.info("起動時シード: env から system_settings へ取り込みました（ollama_url）")
     except Exception as e:
         log.warning("起動時シード（OLLAMA_URL）に失敗しました（DB 不達の可能性）: %s", e)
-
-
-def _warn_central_ollama_not_allowed():
-    """現在の中央 `ollama_url`（非 loopback）が `ollama_allowlist` に無ければ警告ログを1行残す（自動修復はせず、管理画面での手動追加へ誘導する）。"""
-    from sherpa import llm, store
-    log = logging.getLogger("sherpa")
-    try:
-        sysset = store.get_system_settings()
-    except Exception as e:
-        log.warning("起動時点検（ollama_allowlist）に失敗しました（DB 不達の可能性）: %s", e)
-        return
-    central = str(sysset.get("ollama_url") or "").strip()
-    if not central:
-        return
-    hp = llm._canonical_host_port(central)
-    if hp is None or llm.is_loopback_host(hp[0]):
-        return
-    entry = llm.format_host_port(hp[0], hp[1])
-    if entry not in (sysset.get("ollama_allowlist") or []):
-        log.warning(
-            "Ollama 中央接続先(%s)が許可一覧にありません。管理画面で追加してください。", entry)
 
 
 # OpenAI 接続先の env→system_settings 初回シード。独立した完了マーカーを持つ
@@ -749,7 +725,7 @@ _VLM_OLLAMA_URL_SEED_VERSION = 1
 
 
 def _seed_vlm_ollama_url_from_env():
-    """旧 `SHERPA_VLM_OLLAMA_URL` を、中央の `ollama_url` が未保存のときだけ中央の値として一生に一度だけ保存する（非 loopback は許可一覧へも追記）。
+    """旧 `SHERPA_VLM_OLLAMA_URL` を、中央の `ollama_url` が未保存のときだけ中央の値として一生に一度だけ保存する。
     中央の値が既にあり旧値と違うときは警告を 1 行だけ残す（自動では変えない）。`_seed_ollama_url_from_env` の後に呼ぶ。env が無い・形式不正・DB 不達のときはマーカーを立てず return する。
     """
     from sherpa import llm
@@ -779,10 +755,8 @@ def _seed_vlm_ollama_url_from_env():
             return
         from urllib.parse import urlparse as _urlparse
         normalized = f"{_urlparse(raw).scheme.lower()}://{llm.format_host_port(hp[0], hp[1])}"
-        entry = None if llm.is_loopback_host(hp[0]) else llm.format_host_port(hp[0], hp[1])
         applied, _conflicts = store.seed_system_settings_once(
-            {"ollama_url": normalized, **marker}, guard_key=_VLM_OLLAMA_URL_SEED_MARKER_KEY,
-            ollama_allowlist_merge=("ollama_url", entry) if entry else None)
+            {"ollama_url": normalized, **marker}, guard_key=_VLM_OLLAMA_URL_SEED_MARKER_KEY)
         if "ollama_url" in applied:
             log.info("起動時シード: SHERPA_VLM_OLLAMA_URL を中央の Ollama 接続先へ取り込みました（ollama_url）")
     except Exception as e:
