@@ -292,6 +292,18 @@ bash <Sherpaの置き場所>/scripts/lo_timeout_report.sh                # 全�
 WORLD=<資料フォルダ名> bash <Sherpaの置き場所>/scripts/lo_timeout_report.sh   # 1 つに絞る
 ```
 
+**回答に時間がかかるとき**: 次の 3 つを測ります（DB・原本は書き換えない・資料の名前やパスは出さず件数と時間だけ。②の文字列検索だけは、回答のときと同じく検索の使い回し用の置き場に書きます）。
+① 資料の置き場（原本・派生の Markdown・RAG 用）ごとの種類（ネットワークドライブか）・フォルダを全部歩く時間・`rg` 1 回の時間・資料 1 件があるかの確かめの時間、
+② 回答のときと同じ設定で起動した道具のサーバーの起動・全文検索・文字列検索の時間と失敗の種類、
+③ 直近の回答ごとの時間と、道具（シェルのコマンドを含む）ごとの回数・合計・最長。
+画面には要約だけを出し、詳しい結果は `data/run/slow-turn-report/` に残します。ネットワークドライブの上の資料フォルダでは①に数分かかることがあります。
+
+```bash
+bash <Sherpaの置き場所>/scripts/slow_turn_report.sh                       # 全部の資料フォルダ・直近 2 日の回答
+WORLD=<資料フォルダ名> DAYS=7 bash <Sherpaの置き場所>/scripts/slow_turn_report.sh
+SKIP=rg bash <Sherpaの置き場所>/scripts/slow_turn_report.sh                # rg を飛ばす（walk・rg・mcp・turns を選べる）
+```
+
 **まとめて見る/集計する**: 上記は個別に `tail`/`cat` してもよいですが、`./sherpactl logs` は RUN_DIR/*.log と
 Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に合流して追えます
 （`./sherpactl logs convert embed` で絞り込み・`./sherpactl logs -r` で追わずに集計レポート・
