@@ -47,3 +47,51 @@ def test_busy_time_does_not_double_count_overlapping_calls():
     calls = [SimpleNamespace(ts=0.0, duration_ms=10_000), SimpleNamespace(ts=5.0, duration_ms=10_000),
              SimpleNamespace(ts=30.0, duration_ms=2_000), SimpleNamespace(ts=40.0, duration_ms=None)]
     assert R._busy_seconds(calls) == pytest.approx(17.0)
+
+
+@pytest.fixture
+def ledger_world():
+    import uuid
+    from sherpa import store
+    wid = "slowledger_" + uuid.uuid4().hex[:8]
+    yield wid
+    store.replace_documents(wid, [])
+    with store._connect() as c:
+        c.execute("DELETE FROM ingest_runs WHERE version=%s", (wid,))
+
+
+def _row(name, doctype="cobol", branch="source", status="indexed"):
+    return {"name": name, "layer": "version", "scope_path": "secretsys", "doctype": doctype, "branch": branch,
+            "original_path": None, "md_path": None, "status": status}
+
+
+def test_ledger_section_tells_whether_listing_walks_and_hides_names(ledger_world):
+    """一覧の道具が台帳から出せるか（空の台帳・名前で補えない行は歩く）を、資料の名前と接続先を出さずに示す。"""
+    from sherpa import store
+    assert R.ledger_status(ledger_world)["listing"] == "walk"          # 台帳が空
+
+    store.replace_documents(ledger_world, [_row("secretsys/src/SECRETPROG.cbl"),
+                                           _row("secretsys/src/SECRETX.cbl", None, None, "unreadable")])
+    run = store.start_ingest_run(ledger_world)
+    store.finish_ingest_run(run["id"], status="failed", extraction_snapshot={"flags": [
+        {"doc": "secretsys/src/SECRETBAD.cbl", "action": "blocked", "reason": "unreadable_code_file"},
+        {"doc": None, "action": "blocked", "reason": "graph_reflect_failed:MemoryPoolOutOfMemoryError@secrethost:7687（上げる設定）"}]})
+    got = R.ledger_status(ledger_world)
+    assert got["listing"] == "ledger" and got["rows"] == 2 and got["missing_kind"] == 1 and got["not_completable"] == 0
+    assert got["runs"][0]["blocked"] == 2
+    assert got["runs"][0]["reasons"] == {"unreadable_code_file": 1, "graph_reflect_failed:MemoryPoolOutOfMemoryError": 1}
+
+    run = store.start_ingest_run(ledger_world)    # 空きの不足で止まった取り込みは、止めた件数が 0 でも止まったと分かる
+    store.finish_ingest_run(run["id"], status="failed", extraction_snapshot={
+        "stop_reason": "low_disk", "flags": [{"doc": None, "action": "warn", "reason": "low_disk_stop:1.2"}]})
+    assert R.ledger_status(ledger_world)["runs"][0]["status"] == "failed（low_disk）"
+
+    store.replace_documents(ledger_world, [_row("secretsys/src/SECRETPROG.cbl"),
+                                           _row("secretsys/src/SECRETNOEXT", None, None, "unreadable")])
+    got = R.ledger_status(ledger_world)
+    assert got["listing"] == "walk" and got["not_completable"] == 1   # 名前で種類を補えない行が 1 件で台帳をあきらめる
+
+    text = R.render([], [], None, detail=True, ledgers=[{"world": "W1", **got}])
+    assert "資料フォルダを全部歩く" in text
+    for secret in ("secretsys", "SECRET", "secrethost", "7687", ledger_world):
+        assert secret not in text

@@ -7,6 +7,8 @@
 ② 道具のサーバーの試し: 回答のときと同じ環境変数で `sherpa.mcp_server` を起動し、起動・`es_search`・`ripgrep_search` の
    時間と失敗の種類を測る。DB の接続設定を道具のサーバーへ渡しているかも見る。
 ③ 直近の回答の内訳: 会話ごとの Codex のセッション記録から、回答ごとの時間・道具（シェルのコマンドを含む）ごとの回数と時間を集める。
+④ 台帳と直近の取り込み: 一覧の道具（`list_docs`・`glob_search`・`folder_tree`）が資料フォルダを歩かずに台帳から一覧を出せるか
+   （`doc_ledger.listing_documents` と同じ判定）と、その理由になる台帳の行数・直近の取り込みの結果・止めた理由ごとの件数を出す。
 
 守ること:
 - DB・原本を書き換えない（②の文字列検索だけは、回答のときと同じく派生の側の検索の使い回し用の置き場に書く）。
@@ -220,6 +222,82 @@ def place_rows(world: str, label: str, skip: set, rg_timeout: float, walk_timeou
         else:
             rows[0]["exists"] = got.get("result")
     return rows
+
+
+# ---------------------------------------------------------------------------
+# ④ 台帳と直近の取り込み
+# ---------------------------------------------------------------------------
+
+class _WouldWalk(Exception):
+    """一覧の道具が台帳をあきらめて資料フォルダを歩こうとした印。"""
+
+
+def _reason_code(reason) -> str:
+    """止めた理由を、接続先（`@` より後ろ）を落とした短い記号にする。"""
+    head = str(reason or "").split("@", 1)[0]
+    return ":".join(_code(part) for part in head.split(":", 1))
+
+
+def ledger_status(world: str, runs: int = 3) -> dict:
+    """台帳の行数・種類が空の行・名前で種類を補えない行・台帳の時刻と、一覧の道具が台帳から出せるか。直近 `runs` 件の取り込みの結果と止めた理由ごとの件数も返す（別のプロセスの中で動かす）。"""
+    from sherpa import doc_ledger, store
+    out: dict = {}
+    # ① 台帳の行（一覧の道具が読むのと同じ読み取り）
+    try:
+        snap = store.read_ledger_for_listing(world)
+    except Exception as e:
+        out["ledger_error"] = _code(type(e).__name__)
+        snap = None
+    if snap is not None:
+        rows = snap["rows"]
+        missing = [r for r in rows if r.get("doctype") is None or r.get("branch") is None]
+        out.update(rows=len(rows), missing_kind=len(missing),
+                   not_completable=sum(1 for r in missing if doc_ledger._listing_row_from_ledger(r) is None),
+                   ledger_at=snap["ledger_at"].astimezone(_JST).strftime("%m/%d %H:%M") if snap["ledger_at"] else None)
+    # ② 一覧の道具と同じ判定で、台帳から出せるか（歩く経路に入ったら歩かずに止める）
+    real_walk = doc_ledger.documents_for
+
+    def _no_walk(*_a, **_k):
+        raise _WouldWalk()
+
+    doc_ledger.documents_for = _no_walk
+    try:
+        doc_ledger.listing_documents(world)
+        out["listing"] = "ledger"
+    except _WouldWalk:
+        out["listing"] = "walk"
+    except Exception as e:
+        out["listing"] = "error"
+        out["listing_error"] = _code(type(e).__name__)
+    finally:
+        doc_ledger.documents_for = real_walk
+    # ③ 直近の取り込み（資料の名前は読まない）
+    try:
+        with store._connect() as c:
+            c.execute("SET TRANSACTION READ ONLY")
+            got = c.execute(
+                "SELECT id, status, created_at, published_at, extraction_snapshot->>'stop_reason' AS stop_reason, "
+                "  (extraction_snapshot->>'interrupted') = 'true' AS interrupted, "
+                "  (SELECT COALESCE(jsonb_agg(f->'reason'), '[]'::jsonb) "
+                "     FROM jsonb_array_elements(COALESCE(extraction_snapshot->'flags', '[]'::jsonb)) f "
+                "    WHERE f->>'action' = 'blocked') AS blocked "
+                "FROM ingest_runs WHERE kb_id=%s AND version=%s ORDER BY id DESC LIMIT %s",
+                (store._KB_ID, world, runs)).fetchall()
+        out["runs"] = []
+        for r in got:
+            reasons: dict = {}
+            for reason in r["blocked"] or []:
+                k = _reason_code(reason)
+                reasons[k] = reasons.get(k, 0) + 1
+            stopped = "low_disk" if r["stop_reason"] else ("interrupted" if r["interrupted"] else None)
+            out["runs"].append({
+                "status": _code(r["status"]) + (f"（{_code(r['stop_reason'] or stopped)}）" if stopped else ""),
+                "started": r["created_at"].astimezone(_JST).strftime("%m/%d %H:%M") if r["created_at"] else None,
+                "published": r["published_at"].astimezone(_JST).strftime("%m/%d %H:%M") if r["published_at"] else None,
+                "blocked": sum(reasons.values()), "reasons": reasons})
+    except Exception as e:
+        out["runs_error"] = _code(type(e).__name__)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +589,7 @@ def recent_turns(days: int, timeout_s: float) -> dict:
 # 出力
 # ---------------------------------------------------------------------------
 
-def render(places: list, mcp: list, recent: dict | None, *, detail: bool) -> str:
+def render(places: list, mcp: list, recent: dict | None, *, detail: bool, ledgers: list | None = None) -> str:
     L = [f"# 回答の時間の調べ  {datetime.now(_JST):%Y-%m-%d %H:%M}（日本時間）"]
     if places:
         L += ["", "## ① 資料の置き場の速さ",
@@ -571,6 +649,35 @@ def render(places: list, mcp: list, recent: dict | None, *, detail: bool) -> str
             for k, e in sorted(recent["tools"].items(), key=lambda kv: -kv[1]["total_s"])[:12 if not detail else None]:
                 L.append(f"| {k} | {e['calls']} | {_sec(e['total_s'])} | {_sec(e['max_s'])} | {e['deadline_like']} "
                          f"| {e['errors']} | {e['slow_turn_calls']} |")
+    if ledgers:
+        L += ["", "## ④ 台帳と直近の取り込み（一覧の道具が資料フォルダを歩かずに台帳から出せるか）",
+              "| 資料フォルダ | 台帳の行 | 種類が空の行 | 名前で補えない行 | 台帳の時刻 | 一覧の出し方 |",
+              "|---|---:|---:|---:|---|---|"]
+        for g in ledgers:
+            if g.get("error"):
+                L.append(f"| {g['world']} | {g['error']} | - | - | - | - |")
+                continue
+            if g.get("ledger_error"):
+                rows = f"読めない（{g['ledger_error']}）"
+            else:
+                rows = str(g.get("rows", "-"))
+            how = {"ledger": "台帳から（歩かない）", "walk": "**資料フォルダを全部歩く**",
+                   "error": f"失敗（{g.get('listing_error', '-')}）"}.get(g.get("listing"), "-")
+            L.append(f"| {g['world']} | {rows} | {g.get('missing_kind', '-')} | {g.get('not_completable', '-')} "
+                     f"| {g.get('ledger_at') or '-'} | {how} |")
+        L += ["", "直近の取り込み（新しい順・止めた理由は件数の多い順）",
+              "| 資料フォルダ | 結果 | 始めた時刻 | 反映した時刻 | 止めた件数 | 止めた理由 |", "|---|---|---|---|---:|---|"]
+        for g in ledgers:
+            if g.get("runs_error"):
+                L.append(f"| {g['world']} | 読めない（{g['runs_error']}） | - | - | - | - |")
+                continue
+            if not g.get("runs"):
+                L.append(f"| {g['world']} | 取り込みの記録なし | - | - | - | - |")
+                continue
+            for r in g["runs"]:
+                why = "・".join(f"{k} {n}" for k, n in sorted(r["reasons"].items(), key=lambda kv: -kv[1])) or "-"
+                L.append(f"| {g['world']} | {r['status']} | {r['started'] or '-'} | {r['published'] or '-'} "
+                         f"| {r['blocked']} | {why} |")
     return "\n".join(L) + "\n"
 
 
@@ -578,7 +685,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="回答に時間がかかる原因の調べ（読むだけ）")
     ap.add_argument("--world", help="1 つの資料フォルダに絞る")
     ap.add_argument("--days", type=int, default=2, help="③で見る期間（日・既定 2）")
-    ap.add_argument("--skip", default="", help="飛ばす調べ（walk,rg,mcp,turns をカンマ区切り）")
+    ap.add_argument("--skip", default="", help="飛ばす調べ（walk,rg,mcp,turns,ledger をカンマ区切り）")
     ap.add_argument("--rg-timeout", type=float, default=120.0)
     ap.add_argument("--walk-timeout", type=float, default=300.0)
     ap.add_argument("--turns-timeout", type=float, default=300.0)
@@ -605,6 +712,9 @@ def main(argv: list[str] | None = None) -> int:
         t0 = time.monotonic()
         print(json.dumps({"result": exists_check(ns._target), "seconds": time.monotonic() - t0}))
         return 0
+    if ns._child == "ledger":
+        print(json.dumps(ledger_status(ns._target)))
+        return 0
     if ns._child == "worlds":
         from sherpa import worlds
         print(json.dumps(worlds.discover_world_ids()))
@@ -618,8 +728,17 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         ids = got
     labels = {w: f"W{i}" for i, w in enumerate(ids, 1)}
-    places, mcp = [], []
+    places, mcp, ledgers = [], [], []
     for w in ids:
+        if "ledger" not in skip:
+            print(f"{labels[w]} の台帳と直近の取り込みを見ています…", file=sys.stderr)
+            got = _in_child("ledger", w, 120)
+            if got is None:
+                ledgers.append({"world": labels[w], "error": "読めない"})
+            elif got.get("child_timeout"):
+                ledgers.append({"world": labels[w], "error": "2.0分 以上応答なし（打ち切り）"})
+            else:
+                ledgers.append({"world": labels[w], **got})
         if not ({"walk", "rg"} <= skip):
             print(f"{labels[w]} の置き場を測っています…", file=sys.stderr)
             places += place_rows(w, labels[w], skip, ns.rg_timeout, ns.walk_timeout)
@@ -651,8 +770,8 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(_JST).strftime("%Y%m%d-%H%M%S")
     detail_path = out_dir / f"slow-turn-report-{stamp}-detail.txt"
-    detail_path.write_text(render(places, mcp, recent, detail=True), encoding="utf-8")
-    sys.stdout.write(render(places, mcp, recent, detail=False))
+    detail_path.write_text(render(places, mcp, recent, detail=True, ledgers=ledgers), encoding="utf-8")
+    sys.stdout.write(render(places, mcp, recent, detail=False, ledgers=ledgers))
     shown = detail_path.relative_to(_ROOT) if detail_path.is_relative_to(_ROOT) else f"（--out-dir で指定した場所）/{detail_path.name}"
     print(f"\n詳しい結果: {shown}")
     return 0
