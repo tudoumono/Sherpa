@@ -64,12 +64,12 @@
 - **まず容量レポート**: 何がどれだけ使っているかを 1 本で調べます（読むだけ・何も消しません）。どのフォルダからでも実行できます。
 
   ```bash
-  bash <Sherpaの置き場所>/scripts/disk_report.sh          # 数分以内。画面に 1 画面ぶんの要約
-  bash <Sherpaの置き場所>/scripts/disk_report.sh --deep   # 重い調べ（ES の集計・チャンクの種類）も行う
+  bash <Slouchの置き場所>/scripts/disk_report.sh          # 数分以内。画面に 1 画面ぶんの要約
+  bash <Slouchの置き場所>/scripts/disk_report.sh --deep   # 重い調べ（ES の集計・チャンクの種類）も行う
   ```
 
   詳細版と要約版は `data/run/disk-report/disk-report-<日時>-{detail,summary}.txt` に保存されます（書けないときは `/tmp/disk-report/`・
-  新しい 10 回分だけ残る・保存先は `--out <フォルダ>` で変更、Sherpa の置き場所は `--root <フォルダ>` で指定）。資料フォルダの名前・ファイル名・
+  新しい 10 回分だけ残る・保存先は `--out <フォルダ>` で変更、Slouch の置き場所は `--root <フォルダ>` で指定）。資料フォルダの名前・ファイル名・
   ホスト名・`.env` の値は出ず、資料フォルダは大きい順に W1, W2… と表示されます。「ゴミ候補」は消せるかもしれないものを数えただけです。
 - **確認**: `df -h`（ホスト全体）／`docker system df`（イメージ・ボリューム）／`du -sh data/*`（アプリ側の内訳）。
 - **よくある解消先**（安全な順）:
@@ -224,13 +224,13 @@ set_openai_endpoint_seed_blocked`）で OpenAI 系 I/O 全体を止める設計�
 
 次の資料の取り込み（または任意のタイミング）で Codex CLI を新しい版へ上げる前に、
 `make codex-compat` を流してください。実 API を一切呼ばずに（課金なし・Azure 等へ接続しない）、
-偽の接続先を使って Sherpa の本番の Codex 実行経路（設定の生成・サンドボックス・MCP・multi_agent の
+偽の接続先を使って Slouch の本番の Codex 実行経路（設定の生成・サンドボックス・MCP・multi_agent の
 役割ファイル・出力スキーマ）を実際の Codex CLI で1ターン走らせ、認証ヘッダ・`api-version`・モデル名
 （デプロイ名）が正しく届くか、プロンプトが標準入力経由で渡るか、役割ファイルが拒否されないかを確認します。
 全項目 OK（終了コード 0）を確認してから版を上げてください。NG があれば、上げる前に原因を確認してください
 （このスクリプトが検証する契約は `sherpa/providers/codex/sandbox.py`／`sherpa/providers/codex/provider.py`）。
 
-Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定しています。`make start`（と
+Slouch が使う Codex CLI の版は `scripts/codex-version.env` で固定しています。`make start`（と
 `make codex-install`）は固定版を `tools/codex/` へ入れ（公式リリースの package 一式＝本体 `bin/codex` に、サンドボックスの
 `bwrap`（Linux）・`rg` などの付属物を加えたもの。sha256 と版を照合し、`tools/codex/` 全体を入れ替えます。
 本体だけの古い配置は一式で入れ直されます）、`PATH` 上の他の codex より優先して使います。いまの状態は `make codex-version` で確かめられます。
@@ -253,7 +253,7 @@ Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定して
 
 ### 置き場所
 
-以下の `RUN_DIR` は、ログと pid の置き場（`.env` の `RUN_DIR`・既定 `data/run`・相対パスは Sherpa のフォルダ基準）です。`RUN_DIR` を変えたときは、この手順書の `data/run/` もその場所に読み替えてください。
+以下の `RUN_DIR` は、ログと pid の置き場（`.env` の `RUN_DIR`・既定 `data/run`・相対パスは Slouch のフォルダ基準）です。`RUN_DIR` を変えたときは、この手順書の `data/run/` もその場所に読み替えてください。
 
 | ログ | 場所 | 中身 |
 |------|------|------|
@@ -288,8 +288,8 @@ Traceback が付くのは想定外の例外だけです。MD 化の段の最後�
 `.xls` はシート数・行数の目安も出します（読むだけ・何も書き換えない・資料の名前やパスは出さず件数だけ）。どのフォルダからでも実行できます。
 
 ```bash
-bash <Sherpaの置き場所>/scripts/lo_timeout_report.sh                # 全部の資料フォルダ
-WORLD=<資料フォルダ名> bash <Sherpaの置き場所>/scripts/lo_timeout_report.sh   # 1 つに絞る
+bash <Slouchの置き場所>/scripts/lo_timeout_report.sh                # 全部の資料フォルダ
+WORLD=<資料フォルダ名> bash <Slouchの置き場所>/scripts/lo_timeout_report.sh   # 1 つに絞る
 ```
 
 **回答に時間がかかるとき**: 次の 3 つを測ります（DB・原本は書き換えない・資料の名前やパスは出さず件数と時間だけ。②の文字列検索だけは、回答のときと同じく検索の使い回し用の置き場に書きます）。
@@ -299,9 +299,9 @@ WORLD=<資料フォルダ名> bash <Sherpaの置き場所>/scripts/lo_timeout_re
 画面には要約だけを出し、詳しい結果は `data/run/slow-turn-report/` に残します。ネットワークドライブの上の資料フォルダでは①に数分かかることがあります。
 
 ```bash
-bash <Sherpaの置き場所>/scripts/slow_turn_report.sh                       # 全部の資料フォルダ・直近 2 日の回答
-WORLD=<資料フォルダ名> DAYS=7 bash <Sherpaの置き場所>/scripts/slow_turn_report.sh
-SKIP=rg bash <Sherpaの置き場所>/scripts/slow_turn_report.sh                # rg を飛ばす（walk・rg・mcp・turns を選べる）
+bash <Slouchの置き場所>/scripts/slow_turn_report.sh                       # 全部の資料フォルダ・直近 2 日の回答
+WORLD=<資料フォルダ名> DAYS=7 bash <Slouchの置き場所>/scripts/slow_turn_report.sh
+SKIP=rg bash <Slouchの置き場所>/scripts/slow_turn_report.sh                # rg を飛ばす（walk・rg・mcp・turns を選べる）
 ```
 
 **まとめて見る/集計する**: 上記は個別に `tail`/`cat` してもよいですが、`./sherpactl logs` は RUN_DIR/*.log と
@@ -431,7 +431,7 @@ make の書き方（`make trace CONV=136 MASK=1 MASK_MODELS=1 OUT=trace.txt`）�
 
 | データ | 場所 | 種別 | 守り方 |
 |--------|------|------|--------|
-| 登録フォルダ（原本） | 外部フォルダ（例 `/mnt/c/...`、`data/kb` 配下に置く構成ならそこ） | **正本**（業務側） | 業務側のバックアップ運用に従う（Sherpa は読み取り専用） |
+| 登録フォルダ（原本） | 外部フォルダ（例 `/mnt/c/...`、`data/kb` 配下に置く構成ならそこ） | **正本**（業務側） | 業務側のバックアップ運用に従う（Slouch は読み取り専用） |
 | PostgreSQL | Docker ボリューム `pg` | **一次データ**（会話・台帳・レジストリ・ユーザー/設定・監査） | `make backup`（必須） |
 | 個人ファイル | `SHERPA_USERS_DIR`（既定 `data/users/`） | **一次データ** | tar（必須） |
 | 埋め込みのキャッシュ | `data/derived/{world}/semantic/embed_cache.i8.sqlite3`（旧形式 `embed_cache.f32.sqlite3`・`embed_cache.sqlite3` が残っていればそれも） | 派生物（作り直すには外部 API の費用と時間がかかる） | **消さない**。`--with-derived` で守る（無くなると、次の取り込みで全チャンクの埋め込みをやり直す） |

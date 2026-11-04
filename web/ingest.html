@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sherpa — 資料</title>
+<title>Slouch — 資料</title>
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="fonts.css">
 <script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
@@ -61,7 +61,7 @@
   .picker .cur{flex:1;min-width:0;font-size:var(--text-small);color:var(--ink-3,#8b95a3);word-break:break-all}
   .picker .body{overflow:auto;padding:6px 8px}
   .fitem{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;cursor:pointer;color:var(--ink,#1f2937)}
-  .fitem:hover{background:var(--accent-weak,#ccfbf1)}
+  .fitem:hover{background:var(--accent-weak,#edf1f8)}
   .picker .pf{padding:12px 16px;border-top:1px solid var(--border,#e3e6ea);display:flex;gap:10px;justify-content:flex-end}
   /* admin ガード: この画面のデータ（`/worlds`・`/ingest/preview`・`/admin/es/search`）は全て admin 限定 API に依存するため、非 admin は access-denied だけ見せる。 */
   #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
@@ -122,7 +122,7 @@
       <div class="card-head">登録中の資料フォルダ</div>
       <div id="list"><div class="muted">読み込み中…</div></div>
       <div class="muted" style="font-size:var(--text-small);margin-top:8px">
-        ※「更新」は変更があったファイルだけを取り込み直します。「削除」は Sherpa の
+        ※「更新」は変更があったファイルだけを取り込み直します。「削除」は Slouch の
         <b>検索用データと資料どうしの関係だけ</b>を消します。
         元の Windows フォルダ・ファイルは一切消えません。</div>
       <div class="note" id="listmsg"></div>

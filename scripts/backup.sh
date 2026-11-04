@@ -184,7 +184,7 @@ for v in "${VOLUMES[@]}"; do
   _docker volume inspect "$v" >/dev/null 2>&1 || MISSING_VOL+=("$v")
 done
 
-echo "=== Sherpa バックアップ ==="
+echo "=== Slouch バックアップ ==="
 echo "出力先:        $DEST"
 echo "プロジェクト:  $PROJECT"
 echo "ボリューム:    ${VOLUMES[*]}"

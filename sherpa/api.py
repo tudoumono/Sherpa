@@ -88,7 +88,7 @@ _TAGS_METADATA = [
 ]
 
 app = FastAPI(
-    title="Sherpa MVP",
+    title="Slouch MVP",
     description="社内文書向け Agentic RAG 基盤。取り込み→抽出→ナレッジグラフ→影響分析／チャット／トラブルシュートまでを提供するAPI。",
     openapi_tags=_TAGS_METADATA,
     lifespan=lifespan,

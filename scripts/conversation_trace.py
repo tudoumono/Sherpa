@@ -1945,7 +1945,7 @@ def _ledger_section(cid, a, calls, record, answer, masker: Masker, gaps) -> list
             lines.append(f"  {masker.item(iid)}  状態 {masker.word(it.get('status'), 'status')}  担当 {masker.word(it.get('owner'), 'owner')}"
                          f"  根拠 {ev_txt or 'なし'}  理由 {masker.text(it.get('reason'))}")
             if ledger_calls and it.get("status") == "unverified" and last_status.get(iid) == "not_found_in_scope":
-                lines.append(f"      Sherpa が not_found_in_scope → unverified へ自動で下げた（最終形からの推定・時刻の記録なし）")
+                lines.append(f"      Slouch が not_found_in_scope → unverified へ自動で下げた（最終形からの推定・時刻の記録なし）")
             elif ledger_calls and iid in last_status and last_status[iid] != it.get("status"):
                 lines.append("      最後の書き込みと最終形の状態が違う（書き換えた記録なし）")
         cov = record.get("coverage") if isinstance(record.get("coverage"), dict) else {}
@@ -1965,7 +1965,7 @@ def _ledger_section(cid, a, calls, record, answer, masker: Masker, gaps) -> list
         lines.append(f"  台帳のダウンロード: /conversations/{cid}/messages/{(a or {}).get('id')}/investigation?format=md（json も可）")
     elif a is not None and (ledger_calls or inv):
         gaps.append("調査台帳の最終形（investigation_records）が無い")
-    gaps.append("Sherpa が自動で台帳の状態を下げたこと・台帳の途中のファイル（道具名・時刻付きの検索の結果）は記録なし")
+    gaps.append("Slouch が自動で台帳の状態を下げたこと・台帳の途中のファイル（道具名・時刻付きの検索の結果）は記録なし")
     return lines
 
 

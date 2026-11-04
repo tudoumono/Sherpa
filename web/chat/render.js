@@ -24,7 +24,7 @@ export function welcome() {
   $('messages').innerHTML = '';
   // 固定文言のみ（利用者入力を含まない）
   const steps =
-    '<div class="headline">ようこそ Sherpa へ</div>'
+    '<div class="headline">ようこそ Slouch へ</div>'
     + '<ol class="welcome-steps">'
     + '<li><b>資料フォルダを登録</b><br><span class="muted">管理画面で、調べたい社内資料フォルダを登録します。</span></li>'
     + '<li><b>チャットで質問</b><br><span class="muted">例:「消費税率を変えると何に影響する？」／「夜間バッチの異常終了の原因候補は？」</span></li>'

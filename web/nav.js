@@ -91,7 +91,7 @@
       const here = location.pathname.split('/').pop() || 'chat.html';
       this.className = 'topbar';
       this.innerHTML =
-        '<div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>'
+        '<div class="brand"><img class="brand-mark" src="slouch-mark.svg" alt="" height="24"><img class="brand-mark brand-mark-dark" src="slouch-mark-dark.svg" alt="" height="24"><span class="brand-name">Slouch</span> <small>業務AI基盤</small></div>'
         + '<nav class="nav" id="sherpa-nav" aria-label="ページ">'
         + '<div class="navlist" id="navlist">'
         + LINKS.map(([href, label]) => {

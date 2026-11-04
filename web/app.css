@@ -1,12 +1,12 @@
 /* 全画面共通のスタイル。冒頭の :root に配色・角丸・影などのデザイントークンを定義する。 */
 :root{
-  --accent:#0d9488; --accent-weak:#ccfbf1; --accent-ink:#0f766e;
-  --action-bg:#0f766e; --action-fg:#ffffff;
+  --accent:#1e3a6e; --accent-weak:#edf1f8; --accent-ink:#152a50;
+  --action-bg:#152a50; --action-fg:#ffffff;
   --text-caption:.8125rem; --text-small:.875rem; --text-label:.9375rem;
   --text-body:1rem; --text-section:1.125rem; --text-stat:1.5rem; --text-heading:1.625rem; --text-hero:1.75rem;
   --chatfont-small:.875rem; --chatfont-standard:1rem; --chatfont-large:1.125rem; --chatfont-largest:1.25rem;
   --chatfont:var(--chatfont-standard);
-  --control-border:#7c8794; --focus:#0f766e;
+  --control-border:#7c8794; --focus:#1e3a6e;
   --bg:#f6f7f9; --surface:#fff; --surface-2:#f1f3f5; --border:#c7ced8;
   --ink:#1f2937; --ink-2:#5b6573; --ink-3:#606b78;
   --ok:#15803d; --ok-bg:#e9f7ef; --warn:#9a4d05; --warn-bg:#fdf3e7;
@@ -35,6 +35,10 @@ input::placeholder,textarea::placeholder{color:var(--ink-3);opacity:1}
 .brand{display:flex;align-items:center;gap:9px;font-weight:700;letter-spacing:.02em;flex:none;white-space:nowrap}
 .brand .mark{width:26px;height:26px;border-radius:7px;background:var(--action-bg);
   display:grid;place-items:center;color:var(--action-fg);font-size:var(--text-body)}
+.brand .brand-mark{height:24px;width:49.7px;flex:none}
+.brand-mark-dark{display:none}
+[data-theme="dark"] .brand-mark:not(.brand-mark-dark){display:none}
+[data-theme="dark"] .brand-mark-dark{display:inline-block}
 .brand small{font-weight:500;color:var(--ink-3);margin-left:2px}
 .nav{flex:1 1 auto;min-width:0;position:relative}
 .navlist{display:flex;gap:4px;overflow:hidden;white-space:nowrap}
@@ -540,7 +544,7 @@ details.fturn[open]>.fturn-head::before{transform:rotate(90deg)}
 .fstep.active .fnode{border-color:var(--accent);background:var(--accent-weak);animation:glow 1.5s infinite}
 .fstep.active .flabel{color:var(--accent-ink)}
 .fstep.active .fnode::after{content:"";width:9px;height:9px;border-radius:50%;background:var(--accent);animation:corepulse 1.2s infinite}
-@keyframes glow{0%{box-shadow:0 0 0 0 rgba(13,148,136,.45)}70%{box-shadow:0 0 0 11px rgba(13,148,136,0)}100%{box-shadow:0 0 0 0 rgba(13,148,136,0)}}
+@keyframes glow{0%{box-shadow:0 0 0 0 rgba(30,58,110,.45)}70%{box-shadow:0 0 0 11px rgba(30,58,110,0)}100%{box-shadow:0 0 0 0 rgba(30,58,110,0)}}
 @keyframes corepulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.6);opacity:.6}}
 /* ツールノード（実ツール実行）＝思考ノードと色で区別 */
 .fstep.tool .fnode{border-color:var(--accent)}
@@ -568,7 +572,7 @@ details.fturn[open]>.fturn-head::before{transform:rotate(90deg)}
 .fhist-item{font-size:var(--text-caption);color:var(--ink-3);padding-left:8px;border-left:2px solid var(--border)}
 /* active ステップの柔らかいパルス（done で停止） */
 .fstep.active{border-radius:10px;animation:fstep-pulse 1.6s ease-in-out infinite}
-@keyframes fstep-pulse{0%,100%{box-shadow:0 0 0 0 rgba(13,148,136,0)}50%{box-shadow:0 0 10px 0 rgba(13,148,136,.12)}}
+@keyframes fstep-pulse{0%,100%{box-shadow:0 0 0 0 rgba(30,58,110,0)}50%{box-shadow:0 0 10px 0 rgba(30,58,110,.12)}}
 @media (prefers-reduced-motion: reduce){
   .fstep.active{animation:none}
   .fhist-list,.fhist .caret{transition-duration:.001ms !important}
@@ -663,8 +667,8 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 [data-theme="dark"]{
   --bg:#0f1419; --surface:#161c23; --surface-2:#212a33; --border:#3c4957;
   --ink:#e6edf3; --ink-2:#9fb0c0; --ink-3:#9aaab9;
-  --accent:#2dd4bf; --accent-weak:#0c3b35; --accent-ink:#5eead4;
-  --action-bg:#2dd4bf; --action-fg:#04201c; --control-border:#758899; --focus:#5eead4;
+  --accent:#6f8fd0; --accent-weak:#18243a; --accent-ink:#9db8ec;
+  --action-bg:#3b5b99; --action-fg:#ffffff; --control-border:#758899; --focus:#9db8ec;
   --ok:#34d399; --ok-bg:#0e3a2c; --warn:#fbbf24; --warn-bg:#3a2f10;
   --danger:#f87171; --danger-bg:#3a1c1c;
   --shadow:0 1px 2px rgba(0,0,0,.45),0 1px 3px rgba(0,0,0,.5);
@@ -994,6 +998,9 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
   .treeside{position:static;width:100%;max-height:240px}
   .ingestmain{width:100%}
 }
+@media(max-width:400px){
+  .brand .brand-name{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+}
 @media(max-height:600px){
   .pane.right{overflow:auto}
   .flow{flex:1 0 140px}
@@ -1011,8 +1018,8 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
   html.printing,html.printing[data-theme="dark"]{
     --bg:#fff; --surface:#fff; --surface-2:#f1f3f5; --border:#c7ced8;
     --ink:#000; --ink-2:#222; --ink-3:#444;
-    --accent:#0d9488; --accent-weak:#ccfbf1; --accent-ink:#0f766e;
-    --action-bg:#0f766e; --action-fg:#fff; --control-border:#7c8794;
+    --accent:#1e3a6e; --accent-weak:#edf1f8; --accent-ink:#152a50;
+    --action-bg:#152a50; --action-fg:#fff; --control-border:#7c8794;
     --ok:#15803d; --ok-bg:#e9f7ef; --warn:#9a4d05; --warn-bg:#fdf3e7; --danger:#b91c1c; --danger-bg:#fdecec;
     --shadow:none; --shadow-lg:none;
   }
@@ -1020,7 +1027,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
   html.printing body > *:not(#print-root){display:none !important}
   #print-root{display:block;font-size:11pt;line-height:1.7;color:#000;background:#fff}
   #print-root *{overflow:visible !important;max-height:none !important;animation:none !important;transition:none !important}
-  #print-root a{color:#0f766e;text-decoration:underline}
+  #print-root a{color:#152a50;text-decoration:underline}
   #print-root .pr-title{font-size:18pt;margin:0 0 4px}
   #print-root .pr-meta{font-size:9pt;color:#444;margin-bottom:14px;padding-bottom:8px;border-bottom:2px solid #000}
   #print-root .pr-label{font-size:9pt;font-weight:700;color:#444;letter-spacing:.06em;margin-bottom:3px}

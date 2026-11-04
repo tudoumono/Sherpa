@@ -148,7 +148,7 @@ def _ollama_models(kit: pathlib.Path) -> list[str]:
 def _render_notice(groups: dict[str, list[dict]]) -> str:
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip().split("+", 1)[0] if (ROOT / "VERSION").exists() else "0.0.0"
     lines = [
-        f"# Sherpa {version} — 第三者ソフトウェアの帰属表示（NOTICE）",
+        f"# Slouch {version} — 第三者ソフトウェアの帰属表示（NOTICE）",
         "",
         "本製品には以下の第三者ソフトウェアが含まれます。各ソフトウェアの著作権は各権利者に帰属し、",
         "それぞれのライセンス条件に従って利用・再配布されます。ライセンス全文は同梱の",
@@ -187,7 +187,7 @@ def _render_notice(groups: dict[str, list[dict]]) -> str:
 
 
 def _render_license_texts(groups: dict[str, list[dict]]) -> str:
-    parts = ["Sherpa — 第三者ソフトウェアのライセンス全文",
+    parts = ["Slouch — 第三者ソフトウェアのライセンス全文",
              "=" * 60,
              "本ファイルは scripts/gen_notice.py が生成します（手で編集しない）。",
              "Python 依存については、各配布物（wheel）が同梱するライセンス全文をそのまま連結しています。",

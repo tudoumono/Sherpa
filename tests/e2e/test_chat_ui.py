@@ -1085,7 +1085,7 @@ def test_chat_welcome_examples_hidden_when_admin_disabled(page, web_base_url):
     _open(page, web_base_url, settings={**mock_api.SETTINGS_RESP, "chat_examples": []})
 
     expect(page.locator(".example")).to_have_count(0)
-    expect(page.locator(".headline")).to_contain_text("ようこそ Sherpa へ")
+    expect(page.locator(".headline")).to_contain_text("ようこそ Slouch へ")
 
 
 _EV0_ANSWER = {

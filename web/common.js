@@ -2,6 +2,9 @@
 // 全ページ共通の favicon（各 HTML に <link> を書かず、読み込まれた時点で1回だけ挿入する）
 (function(){
   if (!document.querySelector('link[rel="icon"]')) {
+    var s = document.createElement('link');
+    s.rel = 'icon'; s.type = 'image/svg+xml'; s.href = 'favicon.svg';
+    document.head.appendChild(s);
     var l = document.createElement('link');
     l.rel = 'icon'; l.type = 'image/x-icon'; l.href = 'favicon.ico';
     document.head.appendChild(l);

@@ -54,7 +54,7 @@ dev-setup:         ## 新しい貢献者向け: venv＋開発依存＋git フッ
 
 ifeq ($(LOGS_WORDS),)
 help:             ## このコマンド一覧を表示
-	@echo "Sherpa — make の使い方"
+	@echo "Slouch — make の使い方"
 	@echo
 	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) \
 		| sed -E 's/^([a-zA-Z0-9_-]+):[^#]*## /  \1|/' \

@@ -2063,7 +2063,7 @@ def _ext_openapi_subset(app) -> dict:
         need |= more
     return {
         "openapi": full["openapi"],
-        "info": {"title": "Sherpa External API", "version": "1.0.0",
+        "info": {"title": "Slouch External API", "version": "1.0.0",
                  "description": "MD変換・RAG検索の外部連携 API（X-API-Key 認証）"},
         "paths": paths,
         "components": {
