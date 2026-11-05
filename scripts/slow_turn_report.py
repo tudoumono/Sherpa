@@ -3,10 +3,13 @@
 
 ① 資料の置き場の速さ: 資料フォルダごとに、原本・派生の Markdown・RAG 用の置き場の種類、フォルダを全部歩く時間
    （`ripgrep_search` が毎回行う `search_cache.tree_signature` と同じ歩き方）、資料 1 件があるかの確かめの時間
-   （`es_search` が使う `documents.existing_rels`）、`rg` 1 回の時間を測る。
+   （`es_search` が使う `documents.existing_rels`）、`rg` 1 回の時間を測る。原本は、今の文字列検索と同じ外し方で
+   Office・PDF・画像を外したとき（外す拡張子を決める下調べの時間も）と、台帳のソースと種類不明のファイルだけをパスで渡したとき
+   （フォルダは歩かない）の `rg` 1 回も測る。
 ② 道具のサーバーの試し: 回答のときと同じ環境変数で `sherpa.mcp_server` を起動し、起動・`es_search`・`ripgrep_search` の
    時間と失敗の種類を測る。DB の接続設定を道具のサーバーへ渡しているかも見る。
-③ 直近の回答の内訳: 会話ごとの Codex のセッション記録から、回答ごとの時間・道具（シェルのコマンドを含む）ごとの回数と時間を集める。
+③ 直近の回答の内訳: 会話ごとの Codex のセッション記録から、回答ごとの時間・道具（シェルのコマンドを含む）ごとの回数と時間・
+   道具のサーバーが期限で止めた件数を集める。
 ⑤ 全文検索の状態: 資料フォルダごとの全文検索の索引（検索が見ている索引と作りかけの索引の件数・作った時刻・ベクトルの無い
    チャンク数・索引の埋め込みの設定が今の設定と同じか）と、質問の埋め込みを試した結果（回答のときの道具のサーバーと
    同じ環境変数・アプリと同じ環境変数の 2 通り。全文検索と同じ再送と総期限。接続先の種類・鍵が見えるか・失敗の種類だけ）を出す。
@@ -120,16 +123,113 @@ def walk_dirs(root: Path, timeout_s: float) -> dict:
     return {"dirs": dirs, "files": files, "seconds": time.monotonic() - t0, "done": done}
 
 
-def rg_once(rg: str, root: Path, timeout_s: float) -> dict:
-    """見つからない語で `rg` を 1 回かけ、全部を読み終えるまでの時間を測る。"""
-    token = "zq" + "".join(random.choice("0123456789abcdef") for _ in range(16))
+def _absent_token() -> str:
+    return "zq" + "".join(random.choice("0123456789abcdef") for _ in range(16))
+
+
+def _rg_base(rg: str) -> list[str]:
+    """文字列検索（`rg_search._base_cmd`）と同じ対象の選び方（隠し・無視の指定も読む・版管理のフォルダは除く）で件数だけを出す rg。"""
+    from sherpa import scope_infer
+    cmd = [rg, "-c", "--no-messages", "-F", "-i", "--no-config", "--hidden", "--no-ignore"]
+    for name in sorted(scope_infer.VCS_DIR_NAMES):
+        cmd += ["-g", f"!{name}/"]
+    return cmd
+
+
+def rg_once(rg: str, root, timeout_s: float, extra: list[str] | None = None) -> dict:
+    """見つからない語で `rg` を 1 回かけ、全部を読み終えるまでの時間を測る。`root` は 1 つか複数の場所、`extra` は rg に足す引数（対象の絞り込み）。"""
+    roots = [str(r) for r in (root if isinstance(root, (list, tuple)) else [root])]
     t0 = time.monotonic()
     try:
-        subprocess.run([rg, "-c", "--no-messages", "--", token, str(root)], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=timeout_s, check=False)
-        return {"seconds": time.monotonic() - t0, "done": True}
+        rc = subprocess.run([*_rg_base(rg), *(extra or []), "--", _absent_token(), *roots],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout_s, check=False).returncode
+        return {"seconds": time.monotonic() - t0, "done": True, "unreadable": rc not in (0, 1)}
     except subprocess.TimeoutExpired:
         return {"seconds": timeout_s, "done": False}
+
+
+class _Budget:
+    def __init__(self, seconds: float):
+        self.end = time.monotonic() + seconds
+
+    def remaining(self) -> float:
+        return max(0.0, self.end - time.monotonic())
+
+
+def rg_skip_kinds(rg: str, roots: list, timeout_s: float) -> dict:
+    """文字列検索（`rg_prune`）と同じ決め方で外す拡張子（Office・PDF・画像）を決め、それを外して `roots` に rg を 1 回かける。下調べの時間も返す。"""
+    from sherpa import rg_prune, rg_search
+    t0 = time.monotonic()
+    try:
+        exts = rg_prune._skip_exts(roots, _Budget(timeout_s))
+    except (rg_search.RgDeadlineExceeded, subprocess.TimeoutExpired):
+        return {"plan_s": timeout_s, "plan_done": False}
+    except rg_search.RgUnavailable:
+        return {"error": "rg"}
+    plan_s = time.monotonic() - t0
+    extra = []
+    for ext in exts:  # 拡張子だけの名前（`.pdf`）は除外に含めない
+        extra += ["--iglob", f"!?*{ext}"]
+    return {"plan_s": plan_s, "plan_done": True, "exts": len(exts), **rg_once(rg, roots, timeout_s, extra)}
+
+
+_RG_ARGS_MAX_BYTES = 100_000
+
+
+def _in_archive(name: str) -> bool:
+    from sherpa.ingest import archive_extract
+    return any(archive_extract.archive_kind(part) for part in Path(name).parts[:-1])
+
+
+def rg_ledger_files(world: str, rg: str, root: Path, timeout_s: float, archives: Path | None = None) -> dict:
+    """台帳でソースの枝と分かる行と、名前で種類を決められない行のファイルだけをパスで渡して rg をかける（フォルダは歩かない）。
+    アーカイブの中の行は展開先 `archives` から渡す。"""
+    from sherpa import doc_ledger, store
+    from sherpa.ingest import text_kind
+    try:
+        rows = store.read_ledger_for_listing(world)["rows"]
+    except Exception as e:
+        return {"error": _code(type(e).__name__)}
+    if not rows:
+        return {"empty": True}
+    names = []
+    for r in rows:
+        if text_kind.is_sensitive_doc_id(r["name"]):
+            continue
+        got = doc_ledger._listing_row_from_ledger(r)
+        if got is None or got["branch"] == "source":
+            names.append(r["name"])
+    if not names:
+        return {"files": 0, "seconds": 0.0, "done": True}
+    token = _absent_token()
+    t0 = time.monotonic()
+    runs = 0
+    unreadable = False
+    groups = [(root, [n for n in names if not (archives and _in_archive(n))])]
+    if archives:
+        groups.append((archives, [n for n in names if _in_archive(n)]))
+    for cwd, group in groups:
+        i = 0
+        while i < len(group):
+            batch, size = [], 0
+            while i < len(group) and (not batch or size + len(group[i]) + 1 <= _RG_ARGS_MAX_BYTES):
+                batch.append(group[i])
+                size += len(group[i]) + 1
+                i += 1
+            left = timeout_s - (time.monotonic() - t0)
+            if left <= 0:
+                return {"files": len(names), "seconds": timeout_s, "done": False, "runs": runs, "unreadable": unreadable}
+            try:
+                # 台帳の名前がフォルダに変わっていても中へ入らない
+                rc = subprocess.run([*_rg_base(rg), "--max-depth", "0", "--", token, *batch], cwd=str(cwd),
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=left,
+                                    check=False).returncode
+            except subprocess.TimeoutExpired:
+                return {"files": len(names), "seconds": timeout_s, "done": False, "runs": runs + 1,
+                        "unreadable": unreadable}
+            runs += 1
+            unreadable = unreadable or rc not in (0, 1)
+    return {"files": len(names), "seconds": time.monotonic() - t0, "done": True, "runs": runs, "unreadable": unreadable}
 
 
 def exists_check(world: str, sample: int = 50) -> dict | None:
@@ -202,14 +302,21 @@ def measure_place(world: str, index: int, skip: set, rg_timeout: float, walk_tim
     rg = rg_search.find_rg()
     if "rg" not in skip and rg:
         row["rg"] = rg_once(rg, p, rg_timeout)
+        if index == 0:
+            # 文字列検索と同じく、アーカイブの展開先も原本の側として探す
+            arch = worlds.archives_dir(world)
+            roots = [p, arch] if arch.is_dir() else [p]
+            row["rg_all"] = rg_once(rg, roots, rg_timeout) if len(roots) > 1 else row["rg"]
+            row["rg_skip_kinds"] = rg_skip_kinds(rg, roots, rg_timeout)
+            row["rg_ledger"] = rg_ledger_files(world, rg, p, rg_timeout, arch if arch.is_dir() else None)
     return row
 
 
 def place_rows(world: str, label: str, skip: set, rg_timeout: float, walk_timeout: float) -> list[dict]:
     """資料フォルダ 1 つの置き場（原本・派生の Markdown・RAG 用）ごとの測った値。置き場ごとに別のプロセスで測り、止まったら打ち切る。"""
-    budget = walk_timeout + rg_timeout + 30
     rows = []
     for i, name in enumerate(_PLACE_NAMES):
+        budget = walk_timeout + rg_timeout * (5 if i == 0 else 1) + 30
         got = _in_child("place", world, budget, ["--_index", str(i), "--skip", ",".join(sorted(skip)),
                                                   "--rg-timeout", str(rg_timeout), "--walk-timeout", str(walk_timeout)])
         if got is None:
@@ -438,6 +545,13 @@ def search_rows(world: str, label: str) -> dict:
     else:
         row["embed_tool"] = {"result": "error"}
     return row
+
+
+def deadline_hit(ct, c) -> bool:
+    """道具のサーバーが期限で止めた呼び出しか（途中までの結果の `deadline_exceeded`・`tool_deadline_exceeded` の失敗）。"""
+    parsed = ct._parsed_result(c)
+    return isinstance(parsed, dict) and (parsed.get("deadline_exceeded") is True
+                                         or parsed.get("error") == "tool_deadline_exceeded")
 
 
 def degrade_counts(ct, calls, seen: set) -> dict:
@@ -685,6 +799,7 @@ def recent_turns(days: int, timeout_s: float) -> dict:
     ids, over = ct.select_conversation_ids(since, until)
     masker = ct.Masker(mask=True, mask_models=True)
     turns, tools, degrade, degrade_seen = [], {}, {}, set()
+    readable = 0
     for cid in ids:
         if time.monotonic() - t0 > timeout_s:
             timed_out = True
@@ -730,23 +845,28 @@ def recent_turns(days: int, timeout_s: float) -> dict:
                    "longest_s": (longest.duration_ms or 0) / 1000 if longest else 0,
                    "longest_tool": _call_key(parts[id(longest)]) if longest else "-",
                    "deadline_like": sum(1 for c in calls if (c.duration_ms or 0) / 1000 >= _DEADLINE_LIKE_S),
+                   "deadline_hit": sum(1 for c in calls if deadline_hit(ct, c)),
                    "errors": sum(1 for c in calls if c.is_error),
                    "stages": len(stages), "agents": len({c.thread.tid for c in calls}),
                    "session_found": bool(tt)}
             turns.append(row)
             slow = row["seconds"] >= 600
             for c in calls:
+                if c.name not in _EXEC_TOOLS:
+                    readable += int(isinstance(ct._parsed_result(c), dict))
                 e = tools.setdefault(_call_key(parts[id(c)]), {"calls": 0, "total_s": 0.0, "max_s": 0.0, "errors": 0,
-                                                        "deadline_like": 0, "slow_turn_calls": 0})
+                                                        "deadline_like": 0, "deadline_hit": 0, "slow_turn_calls": 0})
                 s = (c.duration_ms or 0) / 1000
                 e["calls"] += 1
                 e["total_s"] += s
                 e["max_s"] = max(e["max_s"], s)
                 e["errors"] += int(bool(c.is_error))
                 e["deadline_like"] += int(s >= _DEADLINE_LIKE_S)
+                e["deadline_hit"] += int(deadline_hit(ct, c))
                 e["slow_turn_calls"] += int(slow)
     return {"since": since.isoformat(), "until": until.isoformat(), "conversations": len(ids), "truncated": over,
-            "turns": turns, "tools": tools, "degrade": degrade, "skipped_large": skipped_large, "timed_out": timed_out}
+            "turns": turns, "tools": tools, "degrade": degrade, "skipped_large": skipped_large, "timed_out": timed_out,
+            "readable": {"calls": sum(e["calls"] for e in tools.values()), "readable": readable}}
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +907,30 @@ def render(places: list, mcp: list, recent: dict | None, *, detail: bool, ledger
                 ex_s = f"{_sec(r['exists_timeout'])} 以上（打ち切り）"
             L.append(f"| {r['world']} | {r['place']} | {kind} | {w['dirs'] if w else '-'} | {w['files'] if w else '-'} "
                      f"| {walk_s} | {rg_s} | {ex_s} |")
+        narrowed = [r for r in places if r.get("rg_skip_kinds") or r.get("rg_ledger")]
+        if narrowed:
+            L += ["", "原本の rg を絞ったとき（文字列検索の原本の探し方を変えたときの見込み・アーカイブの展開先を含む・見つからない語で 1 回）",
+                  "| 資料フォルダ | 探し方 | 対象のファイル | rg 1回 |", "|---|---|---:|---:|"]
+            for r in narrowed:
+                sk = r.get("rg_skip_kinds") or {}
+                if sk.get("plan_s") is not None:
+                    L.append(f"| {r['world']} | 外す拡張子を決める下調べ（今の文字列検索と同じ・rg --files） | - "
+                             f"| {_sec(sk['plan_s']) + ('' if sk['plan_done'] else ' 以上（打ち切り）')} |")
+                for label, g in (("木全体（何も外さない）", r.get("rg_all") or r.get("rg")),
+                                 ("Office・PDF・画像を外して木全体（今の文字列検索と同じ）",
+                                  sk if "seconds" in sk or sk.get("error") else None),
+                                 ("台帳のソースと種類不明のファイルだけ（フォルダは歩かない）", r.get("rg_ledger"))):
+                    if not g:
+                        continue
+                    if g.get("error") or g.get("empty"):
+                        L.append(f"| {r['world']} | {label} | {'台帳が読めない' if g.get('error') else '台帳が空'} | - |")
+                        continue
+                    took = _sec(g["seconds"]) + ("" if g["done"] else " 以上（打ち切り）")
+                    if g.get("runs", 1) > 1:
+                        took += f"（rg {g['runs']} 回の合計）"
+                    if g.get("unreadable"):
+                        took += "・読めないファイルあり"
+                    L.append(f"| {r['world']} | {label} | {g['files'] if 'files' in g else '-'} | {took} |")
     if mcp:
         L += ["", "## ② 道具のサーバーの試し（回答のときと同じ環境変数で起動・範囲は全体・既定の深さ）"]
         for m in mcp:
@@ -811,17 +955,21 @@ def render(places: list, mcp: list, recent: dict | None, *, detail: bool, ledger
             L.append(f"- 回答の時間: 中央 {_sec(secs[len(secs) // 2])}・最長 {_sec(secs[-1])}・10 分以上 "
                      f"{sum(1 for s in secs if s >= 600)} 件・セッション記録の無い回答 {sum(1 for t in turns if not t['session_found'])} 件")
             L += ["", "遅い回答（上から 10 件）",
-                  "| 会話 | 回答 | 時間 | 呼び出し（中の道具） | まとめて呼んだ | 道具が動いた時間 | 最長の 1 回 | 110秒以上 | 失敗 | 段 | エージェント |",
-                  "|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|"]
+                  "| 会話 | 回答 | 時間 | 呼び出し（中の道具） | まとめて呼んだ | 道具が動いた時間 | 最長の 1 回 | 110秒以上 | 期限切れ | 失敗 | 段 | エージェント |",
+                  "|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|"]
             for t in sorted(turns, key=lambda t: -t["seconds"])[:10 if not detail else len(turns)]:
                 L.append(f"| {t['conv']} | {t['turn']} | {_sec(t['seconds'])} | {t['calls']}（{t['tool_uses']}） | {t['batched']} | {_sec(t['busy_s'])} "
-                         f"| {_sec(t['longest_s'])} {t['longest_tool']} | {t['deadline_like']} | {t['errors']} "
+                         f"| {_sec(t['longest_s'])} {t['longest_tool']} | {t['deadline_like']} | {t.get('deadline_hit', 0)} | {t['errors']} "
                          f"| {t['stages']} | {t['agents']} |")
             L += ["", "道具ごと（合計の時間が長い順）",
-                  "| 道具 | 回数 | 合計 | 最長 | 110秒以上 | 失敗 | 10分以上の回答の中 |", "|---|---:|---:|---:|---:|---:|---:|"]
+                  "| 道具 | 回数 | 合計 | 最長 | 110秒以上 | 期限切れ | 失敗 | 10分以上の回答の中 |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
             for k, e in sorted(recent["tools"].items(), key=lambda kv: -kv[1]["total_s"])[:12 if not detail else None]:
                 L.append(f"| {k} | {e['calls']} | {_sec(e['total_s'])} | {_sec(e['max_s'])} | {e['deadline_like']} "
-                         f"| {e['errors']} | {e['slow_turn_calls']} |")
+                         f"| {e.get('deadline_hit', 0)} | {e['errors']} | {e['slow_turn_calls']} |")
+        rd = recent.get("readable")
+        if rd and turns:
+            L += ["", f"期限切れ・落とした理由は、道具の結果が記録に残っている呼び出しだけを数える（結果を読めた呼び出し "
+                      f"{rd['readable']}／全部 {rd['calls']} 回。exec の中から呼んだ道具は結果が残らないので数えない）"]
         if recent.get("degrade"):
             L += ["", "道具が落とした理由（日ごと・結果に degrade_reason を載せる道具だけ・なし＝落とさず答えた）",
                   "| 日 | 道具 | 理由ごとの件数 |", "|---|---|---|"]
