@@ -143,3 +143,40 @@ def test_embed_trial_reports_failure_kind_without_the_address(embed_settings, mo
 
     monkeypatch.setenv("SHERPA_DISABLE_EMBED", "1")
     assert R.embed_trial()["result"] == "disabled"
+
+
+def test_rg_on_ledger_files_reads_only_source_and_unknown_kinds(ledger_world, tmp_path):
+    """原本の rg を台帳で絞るとき、ソースと種類不明のファイルだけを渡し、資料の名前を出さない。"""
+    from sherpa import rg_search, store
+    rg = rg_search.find_rg()
+    if not rg:
+        pytest.skip("rg が無い")
+    root, archives = tmp_path / "kb", tmp_path / "archives"
+    for base, name in ((root, "secretsys/src/SECRETPROG.cbl"), (root, "secretsys/src/SECRETNOEXT"),
+                       (root, "secretsys/doc/SECRETSPEC.docx"), (archives, "secretsys/SECRETPKG.zip/SECRETIN.cbl")):
+        (base / name).parent.mkdir(parents=True, exist_ok=True)
+        (base / name).write_text("x")
+    store.replace_documents(ledger_world, [_row("secretsys/src/SECRETPROG.cbl"),
+                                           _row("secretsys/src/SECRETNOEXT", None, None, "unreadable"),
+                                           _row("secretsys/doc/SECRETSPEC.docx", "Word", "office"),
+                                           _row("secretsys/SECRETPKG.zip/SECRETIN.cbl")])
+    got = R.rg_ledger_files(ledger_world, rg, root, 30, archives)
+    assert got["files"] == 3 and got["done"] is True and got["unreadable"] is False   # アーカイブの中は展開先から読む
+    row = {"world": "W1", "place": "原本", "fs": "ext4", "network": False, "rg": {"seconds": 1.0, "done": True},
+           "rg_skip_kinds": {"plan_s": 0.2, "plan_done": True, "exts": 3, "seconds": 0.5, "done": True}, "rg_ledger": got}
+    text = R.render([row], [], None, detail=True)
+    assert "台帳のソースと種類不明のファイルだけ" in text and "| 3 |" in text
+    for secret in ("secretsys", "SECRET", str(tmp_path)):
+        assert secret not in text
+
+
+def test_deadline_stops_are_counted_from_the_tool_result():
+    """道具のサーバーが期限で止めた呼び出し（途中までの結果・期限切れの失敗）だけを期限切れと数える。"""
+    th = SimpleNamespace(tid="t1")
+    partial = CT.Call(ts=0.0, thread=th, call_id="c1", name="ripgrep_search",
+                      result_text='{"hits": [], "deadline_exceeded": true}')
+    stopped = CT.Call(ts=0.0, thread=th, call_id="c2", name="list_docs", is_error=True,
+                      result_text='{"error": "tool_deadline_exceeded", "notice": "x"}')
+    plain = CT.Call(ts=0.0, thread=th, call_id="c3", name="read_doc",
+                    result_text='{"text": "deadline_exceeded tool_deadline_exceeded"}')
+    assert [R.deadline_hit(CT, c) for c in (partial, stopped, plain)] == [True, True, False]
