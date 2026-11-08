@@ -91,7 +91,7 @@ def test_codex_clean_env_has_no_secrets_and_passes_proxy_only_when_set(monkeypat
     assert "PATH" in env and "CODEX_HOME" in env
     assert "SHERPA_MCP_LEDGER_DIR" not in env
     assert "OPENAI_API_KEY" not in env
-    assert not any(k in env for k in SB._CODEX_PASSTHROUGH_ENV)   # 未設定なのに透過しない
+    assert not any(k in env for k in SB._CODEX_PASSTHROUGH_ENV if "NO_PROXY" not in k.upper())   # 未設定なのに透過しない（NO_PROXY だけは社内の宛先で常に渡る）
 
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
     monkeypatch.setenv("no_proxy", "localhost,127.0.0.1")
@@ -100,7 +100,7 @@ def test_codex_clean_env_has_no_secrets_and_passes_proxy_only_when_set(monkeypat
     monkeypatch.setenv("HTTP_PROXY", "")                    # 空文字は未設定扱い
     env = SB._codex_clean_env(tmp_path / "ch", tmp_path / "tmp")
     assert env["HTTPS_PROXY"] == "http://proxy.internal:8080"
-    assert env["no_proxy"] == "localhost,127.0.0.1"
+    assert {"localhost", "127.0.0.1"} <= set(env["no_proxy"].split(","))
     assert env["SSL_CERT_FILE"] == env["NODE_EXTRA_CA_CERTS"] == "/etc/ssl/certs/corp.pem"
     assert "HTTP_PROXY" not in env and "ALL_PROXY" not in env
     assert "OPENAI_API_KEY" not in env and "NEO4J_PASSWORD" not in env
@@ -1653,3 +1653,10 @@ def test_author_lens_keeps_its_own_reasoning_under_quick(tmp_path, monkeypatch):
         route=lambda msg: {"lens": "author", "input": msg, "reason": "test", "confident": True})
     list(A.CodexProvider().run(ctx))
     assert "model_reasoning_effort=medium" in next(tmp_path.rglob("argv.txt")).read_text()
+
+
+def test_workspace_itself_is_the_project_root(tmp_path):
+    """作業領域が git の中にあっても、Codex は上の階層の `.git`・AGENTS.md を探しに行かない（macOS では読めずに起動が止まり、開発者向けの AGENTS.md も混ざり得る）。"""
+    import tomllib
+    cfg = tomllib.loads(_cfg(tmp_path))
+    assert cfg["project_root_markers"] == []

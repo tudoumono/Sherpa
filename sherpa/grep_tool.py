@@ -5,7 +5,6 @@ RAG（ES/Neo4j）を経由しない素の grep 経路。`doc_id` は world root 
 from __future__ import annotations
 
 import hashlib
-import heapq
 import json
 import logging
 import os
@@ -326,8 +325,8 @@ def _log_rg_fallback(reason: str) -> None:
         _log.warning("grep_search: %s。純 Python 走査に縮退します（結果の形は同じで、遅くなります）", reason)
 
 
-def _resolve_entry(p: Path, rootr: Path, is_derived: bool, der_rag, scope_paths) -> str | None:
-    """走査対象のファイル `p` → 検索結果の `doc_id`（rel）。対象外（ファイルでない・重要度の設定ファイル・派生 MD の選ばれなかった側・秘匿名・範囲外）は None。ファイルの中身は読まない。"""
+def _resolve_entry(p: Path, rootr: Path, is_derived: bool, der_rag, scope_paths, rules=None) -> str | None:
+    """走査対象のファイル `p` → 検索結果の `doc_id`（rel）。対象外（ファイルでない・重要度の設定ファイル・派生 MD の選ばれなかった側・秘匿名・範囲外・管理者の除外）は None。ファイルの中身は読まない。"""
     from . import scope  # 遅延 import（循環回避）
     from .ingest import importance  # 遅延 import（循環回避）
     ext = p.suffix.lower()
@@ -354,6 +353,8 @@ def _resolve_entry(p: Path, rootr: Path, is_derived: bool, der_rag, scope_paths)
             return None
     if not scope.in_scope(rel, scope_paths):  # 範囲外の文書はそもそも読まない
         return None
+    if rules is not None and rules.excluded(rel):  # 管理者の除外は利用者の範囲に関わらず読まない（rg の候補にも純 Python 走査にも効く）
+        return None
     return rel
 
 
@@ -379,73 +380,41 @@ def _prepare_roots(world: str, roots):
     return roots_spec, wd, der_rag
 
 
-def _walk_importance(world: str, wd, deadline: float | None = None) -> dict:
-    """ヒットの優先順位付け（`_offer`）用に world の重要度を 1 回だけ解決する（`_重要度.txt` が無ければ空 dict）。純 Python 走査用で、フォルダ木を歩く。
-    `deadline` があるときは木の列挙に期限を掛け（超過は `GrepDeadlineExceeded`）、列挙済みの一覧を `resolve_for_world` へ渡して期限なしの再走査を避ける。
-    """
-    from .ingest import importance  # 遅延 import（循環回避）
-    # `sig` を渡すと `resolve_for_world` が world 全体をもう一度全木走査しない（registry の `last_sig` を使う）。
-    # 取得できなくても fail-closed にはせず `sig=None` のまま自前計算へ戻す。
-    sig = None
-    try:
-        from . import store  # 遅延 import（循環回避）
-        row = store.get_world_status_row(world)
-        sig = (row or {}).get("last_sig") or None
-    except Exception:
-        sig = None
-    if deadline is None:
-        return importance.resolve_for_world(world, root=wd, sig=sig)
-    try:
-        files = list(scope_infer.safe_files(wd, deadline=deadline))
-    except scope_infer.ScopeWalkDeadlineExceeded as e:
-        raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました") from e
-    return importance.resolve_for_world(world, root=wd, sig=sig if sig is not None else "", files=files)
-
-
-def _candidate_importance(world: str, wd, controls: list, entries: list) -> dict:
-    """候補ファイルだけの重要度（フォルダ木は歩かない）。`controls` は rg が見つけた全ての `_重要度.txt`、`entries` は候補の `(パス, rel)`。設定ファイルが無ければ空 dict。"""
-    from .ingest import importance  # 遅延 import（循環回避）
-    files = []
-    for c in controls:
-        try:
-            files.append((Path(c), Path(c).relative_to(wd).as_posix()))
-        except ValueError:
-            continue
-    if not files:
-        return {}
-    # `sig` は空文字を渡す（None だとフォルダ木を再走査する）。
-    return importance.resolve_for_world(world, root=wd, sig="", files=files + list(entries))
-
-
-def _discover_candidates(terms: list, roots_spec: list, wd, world: str, *, cacheable: bool, offset: int,
-                         budget, deadline: float | None = None):
-    """rg で候補のファイルを集める。`(候補 {パス: {語の添字: 行}}, 重要度の設定ファイルのパス一覧)`。
-    ① `offset` 付きの呼び出しは、同じ（検索語・roots・資料フォルダの状態）で保存済みの候補一覧があればそれを切り出して使う
-    ② 無ければ原本の木と派生 MD の木を rg で走査する（Office／PDF／画像と、`.rag.md` がある文書だけの `md/` のフォルダは歩かない＝`rg_prune`・非 ASCII の語は CP932 の 2 回目も）③ 重要度の設定ファイルを探す ④ 候補一覧を保存する
+def _discover_candidates(terms: list, roots_spec: list, world: str, *, cacheable: bool, offset: int,
+                         budget, deadline: float | None = None, scope_paths=None):
+    """rg で候補のファイルを集める。候補 `{パス: {語の添字: 行}}` を返す。
+    ① `scope_paths`（範囲）があれば、起点は根のまま、rg には範囲に当たるファイルだけを含める条件（`-g`）で渡す。木の署名・除外の計画・候補の保存の鍵も範囲ごとにする。-g に書けない名前の範囲は範囲なしと同じに根から全体を歩く（`doc_id` の範囲の絞り込みは呼び出し元が行う）
+    ② `offset` 付きの呼び出しは、同じ（検索語・roots・範囲・資料フォルダの状態）で保存済みの候補一覧があればそれを切り出して使う
+    ③ 無ければ原本の木と派生 MD の木を rg で走査する（Office／PDF／画像と、`.rag.md` がある文書だけの `md/` のフォルダは歩かない＝`rg_prune`・非 ASCII の語は CP932 のバイト列も同じ走査で探す）④ 候補一覧を保存する
     rg を使えない・失敗したときは `rg_search.RgUnavailable`、期限切れは `GrepDeadlineExceeded`。
     """
-    from . import rg_prune, rg_search, search_cache
-    from .ingest import importance
+    from . import rg_prune, rg_search, scope, search_cache
+    sp = scope.normalize_scope_paths(scope_paths)
+    prefixes = rg_search.scope_prefixes(sp) if sp else None
+    if prefixes is None:  # -g に書けない名前の範囲は絞らず、範囲なしと同じに全体を歩く
+        sp = None
     orig_roots = [r for r, d in roots_spec if not d and r.is_dir()]
     der_roots = [r for r, d in roots_spec if d and r.is_dir()]
     key = sig = None
     if cacheable:
-        key = hashlib.sha1(json.dumps([terms, [[str(r), d] for r, d in roots_spec]],
+        key = hashlib.sha1(json.dumps([terms, [[str(r), d] for r, d in roots_spec], *([sp] if sp else [])],
                                       ensure_ascii=False).encode("utf-8")).hexdigest()
         try:
-            sig = search_cache.tree_signature(orig_roots + der_roots, deadline=deadline)
+            sig = search_cache.tree_signature(orig_roots + der_roots, deadline=deadline,
+                                              **({"scope_paths": sp} if sp else {}))
         except scope_infer.ScopeWalkDeadlineExceeded as e:
             raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました") from e
-        if offset > 0:
+        if sig is None:  # 範囲の途中にリンクがある等＝候補の保存を使わず毎回 rg を走らせる
+            key = None
+        elif offset > 0:
             saved = search_cache.pages_get(world, key, sig)
             if saved is not None:
-                return ({p: {int(i): ln for i, ln in d.items()} for p, d in saved["cand"].items()},
-                        saved["controls"])
+                return {p: {int(i): ln for i, ln in d.items()} for p, d in saved["cand"].items()}
     first_only = len(terms) == 1
     skip_exts: tuple = ()
     try:
-        if cacheable:  # 資料フォルダの署名があるときだけ、rg に歩かせない場所を決める（`rg_prune`）
-            pl = rg_prune.plan(world, orig_roots, der_roots, sig, budget)
+        if sig is not None:  # 資料フォルダの署名があるときだけ、rg に歩かせない場所を決める（`rg_prune`）
+            pl = rg_prune.plan(world, orig_roots, der_roots, sig, budget, scope=sp)
             skip_exts = tuple(pl["skip_exts"])
             der_roots = rg_prune.derived_roots(der_roots, pl)
         cand: dict = {}
@@ -454,21 +423,20 @@ def _discover_candidates(terms: list, roots_spec: list, wd, world: str, *, cache
                 continue
             for path, hit in rg_search.discover(terms, root_list, derived=derived, budget=budget,
                                                 first_only=first_only,
-                                                exclude_exts=() if derived else skip_exts).items():
+                                                exclude_exts=() if derived else skip_exts,
+                                                prefixes=prefixes).items():
                 slot = cand.setdefault(path, {})
                 for i, ln in hit.items():
                     slot.setdefault(i, ln)
-        controls = (rg_search.list_files_named([wd], importance.CONTROL_FILENAME, budget=budget)
-                    if wd else [])
     except rg_search.RgDeadlineExceeded as e:
         raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました") from e
     if key is not None:
-        search_cache.pages_put(world, key, sig, {"cand": cand, "controls": controls})
-    return cand, controls
+        search_cache.pages_put(world, key, sig, {"cand": cand})
+    return cand
 
 
 def _candidate_entries(cand: dict, roots_spec: list, der_rag, scope_paths, want: int | None = None,
-                       deadline: float | None = None):
+                       deadline: float | None = None, rules=None):
     """rg の候補 `cand`（`{パス: {語の添字: 行}}`）を（根の順・Path の順）に並べ、検索対象になるファイルだけ `(パス, rel, is_derived, 当たった語の添字)` で返す。
     `want` があれば、その語に当たったファイルだけ。ファイルの中身は読まない。`deadline` があれば `_DEADLINE_CHECK_ENTRIES` 件ごとに確認し、超過で `GrepDeadlineExceeded`。
     """
@@ -478,26 +446,49 @@ def _candidate_entries(cand: dict, roots_spec: list, der_rag, scope_paths, want:
             continue
         rootr = root.resolve()
         prefix = str(root) + os.sep
-        mine = sorted((Path(pth), hit) for pth, hit in cand.items()
-                      if pth.startswith(prefix) and (want is None or want in hit))
-        for p, hit in mine:
+        # 並びは `Path` の順と同じ（部品ごとの文字列の比較）。`Path` は開く順に 1 件ずつ作る。
+        mine = sorted(((pth.split(os.sep), pth, hit) for pth, hit in cand.items()
+                       if pth.startswith(prefix) and (want is None or want in hit)), key=lambda e: e[0])
+        for _parts, pth, hit in mine:
+            p = Path(pth)
             n += 1
             if deadline is not None and n % _DEADLINE_CHECK_ENTRIES == 0 and time.monotonic() > deadline:
                 raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")
-            rel = _resolve_entry(p, rootr, is_derived, der_rag, scope_paths)
+            rel = _resolve_entry(p, rootr, is_derived, der_rag, scope_paths, rules)
             if rel is not None:
                 yield p, rel, is_derived, hit
 
 
-def _search_term(q: str, *, roots_spec: list, der_rag, imp_map: dict, entries, classify_cache, max_hits: int,
+def _walk_entries(roots_spec: list, der_rag, scope_paths, rules, deadline: float | None) -> list:
+    """純 Python 走査と同じ順（根の順・Path の順）で、検索対象になるファイルを `(パス, rel, is_derived)` で集める。ファイルの中身は読まない（優先の並べ替え用）。"""
+    out: list = []
+    for root, is_derived in roots_spec:
+        if deadline is not None and time.monotonic() > deadline:
+            raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")
+        if not root.is_dir():
+            continue
+        rootr = root.resolve()
+        walked = []
+        for i, p in enumerate(_walk_pruned(root)):
+            if (deadline is not None and i > 0 and i % _DEADLINE_CHECK_ENTRIES == 0
+                    and time.monotonic() > deadline):
+                raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")
+            walked.append(p)
+        for p in sorted(walked):
+            rel = _resolve_entry(p, rootr, is_derived, der_rag, scope_paths, rules)
+            if rel is not None:
+                out.append((p, rel, is_derived))
+    return out
+
+
+def _search_term(q: str, *, roots_spec: list, der_rag, entries, classify_cache, max_hits: int,
                  scope_paths, deadline: float | None, layer, truncated_docs, offset: int, stats,
-                 partial_on_deadline: bool = False):
-    """1 つの検索語 `q` のヒットを選抜して返す（`grep_search` の本体）。
+                 partial_on_deadline: bool = False, rules=None):
+    """1 つの検索語 `q` のヒットを選抜して返す（`grep_search` の本体）。管理者の優先（`rules.priority_paths`）があるときだけ、その下のファイルを先に開く（無いときの並びは従来のまま）。
     `entries` が None なら `roots_spec` のフォルダ木を全量歩く（純 Python 走査）。反復可能なら候補ファイル `(パス, rel, is_derived)` だけを開く（rg で絞った走査）。
     どちらも、開いたファイルは同じ判定・同じ整形を通す。
     """
     from . import corpus_docs  # 遅延 import（循環回避）
-    from .ingest import importance  # 遅延 import（循環回避）
 
     def _check_deadline() -> None:
         if deadline is not None and time.monotonic() > deadline:
@@ -508,40 +499,23 @@ def _search_term(q: str, *, roots_spec: list, der_rag, imp_map: dict, entries, c
             stats["unreadable_files"] = stats.get("unreadable_files", 0) + 1
 
     ql = q.lower()
-    # top-K（優先度つき）ヒット選抜。ヒットは `_offer` を通じて有界ヒープ（容量 `heap_cap`）へ出し入れする。
-    # `(rank, -seq)` の昇順（重要度が高いほど・同 rank は発見順が早いほど）で最下位を追い出す。`seq` は全ルート・全ファイルを通した発見順の単調増加カウンタ（tie-break）。
-    # 純 Python 走査は `imp_map` が空なら選抜結果が発見順の先頭 `heap_cap` 件になるため満杯で打ち切る。非空なら常に全量走査する。
-    # 候補だけを開く走査は候補を（重要度 rank 降順, 発見順）に並べて開き、満杯でそれ以後のファイルの rank が最下位以下になった時点で打ち切る（選抜結果は変わらない）。
-    heap: list[tuple[int, int, dict]] = []
-    seq = 0
+    # ヒット選抜は発見順の先頭 `heap_cap` 件（満杯になったら以後は採用しない）。
+    heap: list[dict] = []
     offset = max(0, offset)  # 負値は 0 扱い
     # `heap_cap`: offset 分だけ余分に選抜し、末尾で `[offset:offset+max_hits]` を切り出す。
     heap_cap = max_hits + offset
 
     def _offer(hit: dict) -> None:
-        nonlocal seq
-        seq += 1
-        if max_hits <= 0:
-            return
-        res = imp_map.get(hit["doc_id"])
-        rank = importance.rank_of(res)
-        hit.update(importance.public_fields(res))  # importance/importance_reason（条件付き）
-        entry = (rank, -seq, hit)
-        if len(heap) < heap_cap:
-            heapq.heappush(heap, entry)
-        elif entry > heap[0]:
-            heapq.heapreplace(heap, entry)
+        if max_hits > 0 and len(heap) < heap_cap:
+            heap.append(hit)
 
-    def _closed(file_rank: int) -> bool:
-        """以後このファイルのヒットが採用され得ないか（満杯のヒープの最下位以下の rank）。"""
-        if entries is None:
-            return not imp_map and len(heap) >= heap_cap
-        return len(heap) >= heap_cap and bool(heap) and file_rank <= heap[0][0]
+    def _closed() -> bool:
+        """以後のヒットが採用され得ないか（選抜が満杯）。"""
+        return bool(heap) and len(heap) >= heap_cap
 
     def _scan_entry(p: Path, rel: str, is_derived: bool) -> bool:
         """1 ファイルの判定（範囲・層・秘匿・サイズ）と走査。以後を開く必要がなければ True。"""
         ext = p.suffix.lower()
-        file_rank = importance.rank_of(imp_map.get(rel))
         is_code = False
         encoding_caution = None  # 対象外にしない「一部が化けている」ヒットへの注意文
         if not is_derived:
@@ -701,7 +675,7 @@ def _search_term(q: str, *, roots_spec: list, der_rag, imp_map: dict, entries, c
                             _add_hit(h, s, e, clipped_text, clipped=clipped_text != text)
                     line_i += 1
                     # ヒープが満杯でこのファイルのヒットが採用され得ないなら、ファイル内で break する（最終節／未確定 pending 行の flush は行わない）。
-                    if _closed(file_rank):
+                    if _closed():
                         hit_limit_reached = True
                         break
                 if not hit_limit_reached:
@@ -722,15 +696,21 @@ def _search_term(q: str, *, roots_spec: list, der_rag, imp_map: dict, entries, c
         effective_truncated = reader.truncated or reader.line_overflowed
         if effective_truncated:
             p_str = str(p)
-            for _rank, _neg_seq, h in heap:
+            for h in heap:
                 if h["path"] == p_str:
                     h["file_truncated"] = True
             if truncated_docs is not None and rel not in truncated_docs:
                 truncated_docs.append(rel)
         # ファイル境界の打切り点。以後のファイル・root を開かない。
-        return _closed(file_rank)
+        return _closed()
 
+    prioritized = rules is not None and bool(rules.priority_paths) and heap_cap > 0
     try:
+        if prioritized:
+            # 管理者の優先: 開く順を「優先の下 → それ以外」にする（それぞれの中は従来の順）。選抜は発見順の先頭なので、優先のヒットが先に埋まる。
+            found = (list(entries) if entries is not None
+                     else _walk_entries(roots_spec, der_rag, scope_paths, rules, deadline))
+            entries = sorted(found, key=lambda e: 0 if rules.priority(e[1]) else 1)
         if entries is None:
             stop_scan = False  # ファイル境界の打切り点
             for root, is_derived in roots_spec:
@@ -747,7 +727,7 @@ def _search_term(q: str, *, roots_spec: list, der_rag, imp_map: dict, entries, c
                 for p in sorted(walked):
                     # 各エントリの処理（ファイル読込・全文走査を含む）ごとに期限を確認する。
                     _check_deadline()
-                    rel = _resolve_entry(p, rootr, is_derived, der_rag, scope_paths)
+                    rel = _resolve_entry(p, rootr, is_derived, der_rag, scope_paths, rules)
                     if rel is None:
                         continue
                     if _scan_entry(p, rel, is_derived):
@@ -756,14 +736,10 @@ def _search_term(q: str, *, roots_spec: list, der_rag, imp_map: dict, entries, c
                 if stop_scan:
                     break
         elif heap_cap > 0:
-            # 重要度の設定が無ければ rank は一様＝発見順にそのまま開く（遅延列挙・満杯で打ち切り）。あれば rank 降順（同 rank は発見順）に並べて開く。
-            ordered_entries = entries
-            if imp_map:
-                ordered_entries = sorted(enumerate(entries), key=lambda ie: (-importance.rank_of(imp_map.get(ie[1][1])), ie[0]))
-                ordered_entries = (e for _i, e in ordered_entries)
-            for p, rel, is_derived in ordered_entries:
+            # 候補は発見順にそのまま開く（遅延列挙・満杯で打ち切り）。
+            for p, rel, is_derived in entries:
                 _check_deadline()
-                if bool(heap) and len(heap) >= heap_cap and importance.rank_of(imp_map.get(rel)) <= heap[0][0]:
+                if _closed():
                     break
                 if _scan_entry(p, rel, is_derived):
                     break
@@ -772,20 +748,17 @@ def _search_term(q: str, *, roots_spec: list, der_rag, imp_map: dict, entries, c
         if not (partial_on_deadline and stats is not None):
             raise
         stats["deadline_exceeded"] = True  # 期限までに選抜できたヒットだけを返す
-    # heap は有界。最終順序だけ `(-rank, seq)` 昇順（重要度が高いほど先・同 rank は発見順）へ並べ替える。`entry`=(rank, -seq, hit)。
-    heap.sort(key=lambda entry: (-entry[0], -entry[1]))
-    ordered = [hit for _rank, _neg_seq, hit in heap]
     # ページング: 後ろ `max_hits` 件を返す（offset=0 なら結果は不変）。
-    return ordered[offset:offset + max_hits]
+    return heap[offset:offset + max_hits]
 
 
 def _grep_terms(terms: list, world: str, roots, max_hits: int, scope_paths, deadline, layer, truncated_docs,
                 offset: int, stats, engine: str, partial_on_deadline: bool = False) -> dict:
     """`terms`（前後の空白を除いた空でない語）ごとのヒットを `{語: ヒット列}` で返す。`grep_search`／`grep_search_many` の共通の入口。
     ① 範囲の根（roots_spec）を決める ② rg が使えれば候補のファイルを 1 回の走査で集める（使えなければ純 Python 走査）
-    ③ 重要度を解決する ④ 語ごとに `_search_term` でヒットを選抜する。
+    ③ 語ごとに `_search_term` でヒットを選抜する。
     """
-    from . import rg_search, search_cache  # 遅延 import（循環回避）
+    from . import path_rules, rg_search, search_cache  # 遅延 import（循環回避）
 
     def _check_deadline() -> float | None:
         """期限を確認し、超過なら送出する。期限ありのときは残り秒数を返す（rg の走査の制限時間に使う）。"""
@@ -798,47 +771,43 @@ def _grep_terms(terms: list, world: str, roots, max_hits: int, scope_paths, dead
 
     if not valid_world(world):
         return {t: [] for t in terms}
-    roots_spec, wd, der_rag = _prepare_roots(world, roots)
+    roots_spec, _wd, der_rag = _prepare_roots(world, roots)
     use_cache = roots is None
+    # 管理者の優先・除外（`path_rules`）。根を明示した呼び出しは資料フォルダの外のため対象外。「範囲の外でも読む」は範囲に足す
+    rules = path_rules.rules_for(world) if roots is None else path_rules.EMPTY
+    scope_paths = rules.extend_scope(scope_paths)
     classify_cache = search_cache.ClassifyCache(world) if use_cache else None
     partial = partial_on_deadline and stats is not None
     out: dict = {}
     try:
         entries = None
-        imp_map: dict = {}
         if engine != "python" and roots_spec and all(rg_search.usable_query(t) for t in terms):
             if rg_search.find_rg() is None:
                 _log_rg_fallback("rg が見つかりません")
             else:
                 try:
                     budget = rg_search.Budget(_check_deadline())
-                    cand, controls = _discover_candidates(terms, roots_spec, wd, world, cacheable=use_cache,
-                                                          offset=max(0, offset), budget=budget, deadline=deadline)
-                    if roots is None and wd and controls:
-                        resolved = list(_candidate_entries(cand, roots_spec, der_rag, scope_paths, deadline=deadline))
-                        imp_map = _candidate_importance(world, wd, controls, [(p, rel) for p, rel, _d, _h in resolved])
-                        entries = resolved
-                    else:
-                        entries = True  # 候補の列挙は語ごとに遅延して行う
+                    cand = _discover_candidates(terms, roots_spec, world, cacheable=use_cache,
+                                                offset=max(0, offset), budget=budget, deadline=deadline,
+                                                scope_paths=scope_paths)
+                    entries = True  # 候補の列挙は語ごとに遅延して行う
                 except rg_search.RgUnavailable as e:
                     _log_rg_fallback(f"rg を使えません（{e}）")
                     entries = None
-        if entries is None and roots is None and wd:
-            imp_map = _walk_importance(world, wd, deadline)
         for i, t in enumerate(terms):
             if entries is None:
                 mine = None
             else:
                 want = None if len(terms) == 1 else i
                 if entries is True:
-                    stream = _candidate_entries(cand, roots_spec, der_rag, scope_paths, want, deadline)
+                    stream = _candidate_entries(cand, roots_spec, der_rag, scope_paths, want, deadline, rules)
                 else:
                     stream = (e for e in entries if want is None or want in e[3])
                 mine = ((p, rel, d) for p, rel, d, _h in stream)
-            out[t] = _search_term(t, roots_spec=roots_spec, der_rag=der_rag, imp_map=imp_map, entries=mine,
+            out[t] = _search_term(t, roots_spec=roots_spec, der_rag=der_rag, entries=mine,
                                   classify_cache=classify_cache, max_hits=max_hits, scope_paths=scope_paths,
                                   deadline=deadline, layer=layer, truncated_docs=truncated_docs,
-                                  offset=offset, stats=stats, partial_on_deadline=partial)
+                                  offset=offset, stats=stats, partial_on_deadline=partial, rules=rules)
         return out
     except GrepDeadlineExceeded:
         if not partial:
@@ -856,7 +825,6 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 engine: str = "auto", partial_on_deadline: bool = False):
     """`query` を含む行を world のフォルダ木から探し、根拠つきヒットを返す（read-only）。
     各ヒット: `{doc_id(=rel_path), path(内部用・API 非露出), ext, line, span:[start,end], text, match}`。
-    登録者の重要度（`_重要度.txt`・`ingest.importance`）があれば `importance`/`importance_reason` を追加する（無ければキー自体を作らない）。
     MD は該当見出し節を `text`/`span`、ソースは該当行＋前後数行。同一 (doc, 節) は 1 件に集約する。
     `scope_paths`（フォルダ prefix）を渡すと、その範囲の文書だけ読む。
 
@@ -864,9 +832,8 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
     rg が見つからない・失敗したときは、フォルダ木を全量歩く純 Python 走査に縮退してログで知らせる（結果の形は同じ）。`engine="python"` は純 Python 走査を強制する。
     `roots` 明示指定でない呼び出しは、候補の一覧とファイル分類の結果を派生側のディスクキャッシュ（`search_cache`）に置き、`offset` 付きの呼び出しは候補の一覧を再利用する。
 
-    ヒットの選抜: 上限 `max_hits` 件の top-K。優先度は `(重要度 rank 降順, 発見順昇順)`。`offset` 対応のためヒープ容量は `heap_cap`（=`max_hits+offset`）。
-    `_重要度.txt` が無い world（または `roots` 明示指定）は rank が一様で、ヒープが満杯になった時点で以後のヒットは採用され得ないため、ファイル内とファイル境界の 2 点で走査を早期終了する
-    （早期終了した最終節／未確定の pending 行は flush しないが、選抜結果は変わらない）。純 Python 走査で `imp_map` が非空の world は常に全量走査する（rg の候補走査は rank 順に開いて同じ結果で打ち切る）。
+    ヒットの選抜: 発見順の先頭 `max_hits` 件。`offset` 対応のため選抜数は `heap_cap`（=`max_hits+offset`）。
+    選抜が満杯になった時点で以後のヒットは採用され得ないため、ファイル内とファイル境界の 2 点で走査を早期終了する（早期終了した最終節／未確定の pending 行は flush しないが、選抜結果は変わらない）。
 
     打切りの申告（読み込みが `_GREP_FILE_CAP_BYTES` に達し、cap より後ろは検索できていない可能性）:
     - ヒット元が打ち切られていたら、そのヒットにだけ `file_truncated: True` を付ける（通常のヒットにはキーを作らない）。
@@ -904,7 +871,7 @@ def grep_search_many(queries, world: str = "v1", roots=None, max_hits: int = 50,
                      truncated_docs: list | None = None, offset: int = 0, stats: dict | None = None, *,
                      engine: str = "auto") -> dict:
     """複数の検索語を 1 回の走査にまとめて探し、語ごとのヒットを `{語: ヒット列}`（語は前後の空白を除き、空と重複は捨てる）で返す。
-    語ごとの結果は `grep_search(語, ...)` と同じ（同じ引数・同じ整形・同じ上限）。rg の走査・重要度の解決・候補の一覧を語の間で共有する。
+    語ごとの結果は `grep_search(語, ...)` と同じ（同じ引数・同じ整形・同じ上限）。rg の走査・候補の一覧を語の間で共有する。
     `truncated_docs`・`stats` は全ての語の分を足し込む。
     設計: docs/design/rag.md「読み取り部品の道具」
     """

@@ -13,10 +13,12 @@
 |---|----------|-----------------|------------|
 | 1 | 状態ドット | 画面右上（全画面共通）。管理者はクリックで詳細 | 緑＝正常／黄＝一部機能制限／赤＝停止 |
 | 2 | システム状態画面 | 管理メニュー「システム状態」（[24-システム管理](24-システム管理.md)） | どのコンポーネントが止まっているか＋対処ヒント（停止中が最上部に並ぶ） |
-| 3 | 一枚看板 | `make status` | ストア3つ・アプリ（healthz）・LAN/Caddy・URL |
+| 3 | 一枚看板 | `make status` | 先頭に全体の判定。ストア3つ・アプリ（healthz）・取り込みワーカー・Caddy・OCR ワーカー・メモリの割り振り・URL |
 | 4 | 死活応答 | `curl -s http://127.0.0.1:8000/healthz` | `{"ok":true}` が返ればアプリ核は生きている |
 | 5 | アプリログ | `tail -n 100 data/run/api.log` | 例外・起動失敗の直接の手がかり |
 | 6 | 全ログ（アプリ＋ストア） | `./sherpactl logs`（絞り込み例: `./sherpactl logs convert embed`・短縮 `./sherpactl logs c e`） | api/convert/embed/usage 等と PostgreSQL/Neo4j/Elasticsearch を1画面に合流して追う（`./sherpactl logs -h` で名前の一覧、`./sherpactl logs -r` で集計レポート） |
+| 7 | 設定の検査 | `./sherpactl doctor`（`make doctor`） | ストア・Elasticsearch・設定・AI への最小の問い合わせ・Codex のサンドボックスを読み取りだけで確かめる |
+| 8 | 取り込みの状態 | `make ingest-status` | 資料フォルダごとの現在の段・経過時間・前回の失敗 |
 
 > **してはいけないこと**: 復旧目的で `make nuke` を実行しない（ストアの**ボリュームごと削除**＝データ消去です。確認は 2 回・端末必須）。
 > 迷ったらまず `make up`（ストア再起動）と `make restart`（アプリと取り込みワーカーの再起動）。どちらもデータは消しません。
@@ -77,6 +79,7 @@
   2. 使っていない Docker イメージ → `docker image prune`（**volume prune は実行しない**＝pg/neo4j/es のデータが消えます）。
   3. `data/derived/{world}/`（Office→MD の写し `md/`・RAG 正本 `rag/`・中間表現 `ir/`）は再生成可能ですが、直接消すより空きを確保してから「今すぐ更新」で
      作り直す方が安全。**`data/derived/{world}/semantic/` は消さない**: 埋め込みのキャッシュ（`embed_cache.i8.sqlite3` など）がここにあり、消すと全文の意味検索のベクトルを外部の API で作り直すことになります（費用と時間がかかる）。中の旧い意味レイヤのファイル（`concepts.json`・`l_extract.json` 等）だけは消しても支障ありません。
+     古い形式のキャッシュ（`embed_cache.f32.sqlite3`・`embed_cache.sqlite3`）が大きいときは、新しい形式（`embed_cache.i8.sqlite3`・約 1/2〜1/5 の大きさ）への写し替えを取り込みワーカーが取り込みの後と待機中に自動で行います。手で行うときは `make embed-cache-migrate`（資料フォルダごとに前後の大きさを表示。取り込み中の資料フォルダは見送る。`WORLD=<資料フォルダ名>` で 1 つに絞る）。空きが足りないときの最後の手段 `DROP=1` は古いキャッシュを消すだけなので、次の取り込みで埋め込みの API を呼び直します。
 - **ES の読み取り専用ロック**: Elasticsearch は空き容量が閾値を切ると索引を自動で read-only 化します（ログに
   `flood stage disk watermark` ）。**空き容量を確保した後**、次で解除します:
 
@@ -263,8 +266,8 @@ Slouch が使う Codex CLI の版は `scripts/codex-version.env` で固定して
 | MD 変換（取り込み） | `RUN_DIR/convert.log` | 取り込み（資料フォルダスキャン→MD化→索引）の進行ログの詳細 |
 | LLM 埋め込み | `RUN_DIR/embed.log` | ベクトル埋め込み生成（OpenAI/Ollama）の詳細 |
 | AI 利用量 | `RUN_DIR/usage.log` | LLM 呼び出し1回ごとの kind/provider/model/トークン数/経過秒（`sherpa/metering.py::record`・チャット本回答含む・LOG-UX・2026-09-04） |
-| Codex 実行ログ | `./sherpactl logs codex`（`RUN_DIR/codex.log`） | Codex CLI 実行1回ごとの開始（構成種別/multi_agent/深さ/見直し回数/出力スキーマ段/モデル）・終了（returncode/イベント種類別件数/MCP呼出数/spawn_agent 子数/usage合計/エラーcode・message/経過秒/stderr末尾）サマリ。文脈枠超過（`context_window_exceeded`）等の原因切り分けに使う |
-| Codex 実行 | `RUN_DIR/codex.log` | Codex CLI 実行1回ごとの開始/終了サマリ（構成・深さ・イベント種別件数・MCP 呼出数・子スレッド数・使用トークン・エラーコード・所要時間。**stderr と失敗本文は保存しない**＝資料名・本文・環境変数値が残るため・2026-09-20） |
+| 取り込みワーカー | `RUN_DIR/ingest-worker.log` | 取り込みワーカーの起動・異常終了・処理の警告（`./sherpactl logs ingest-worker`）。pid は `RUN_DIR/ingest-worker.pid` |
+| Codex 実行 | `./sherpactl logs codex`（`RUN_DIR/codex.log`） | Codex CLI 実行1回ごとの開始/終了サマリ（構成・深さ・イベント種別件数・MCP 呼出数・子スレッド数・使用トークン・エラーコード・所要時間。**stderr と失敗本文は保存しない**＝資料名・本文・環境変数値が残るため）。文脈枠超過（`context_window_exceeded`）等の原因切り分けに使う |
 
 **専用ログへ書いた行は `RUN_DIR/api.log`（run ログ）へ重ねません**——`./sherpactl logs`（`make l`）で全ログを並べたときに
 同じ行が二重に見えないようにするためです。ERROR 以上だけは専用ログと run ログの両方に残ります。WARNING（資料 1 件ごとの失敗・
@@ -325,6 +328,8 @@ Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に�
 | 名前 | 中身 |
 |---|---|
 | `api` | アプリ全般（Web リクエスト・エラー。全行に時刻付き） |
+| `ingest-worker` | 取り込みワーカー（Web とは別のプロセス）の起動・異常終了・処理の警告 |
+| `caddy` | HTTPS の受け口（LAN 公開で Caddy を使うとき） |
 | `convert` | 資料取り込みの MD 化（1ファイルごとの開始/完了・秒数・メモリ） |
 | `libreoffice` | 旧形式 Office（.doc/.xls/.ppt）の前段変換 |
 | `embed` | 埋め込み（ベクトル化）の進行 |
@@ -415,7 +420,13 @@ make の書き方（`make logs convert embed`・`make logs err`・`make l c e m`
 ./sherpactl trace 136 --mask --mask-models -o trace.txt   # モデル名も伏せる（社外に渡すとき）
 ```
 
-make の書き方（`make trace CONV=136 MASK=1 MASK_MODELS=1 OUT=trace.txt`）も使えます。
+会話番号の代わりに期間で選ぶこともできます（日本時間・会話は 500 件まで・会話番号とはどちらか片方）。`--format jsonl` を付けると 1 行 1 ターンの分析用の形で出ます。
+
+```
+./sherpactl trace --since 2026-11-01 --until 2026-11-07 --mask --format jsonl -o trace.jsonl
+```
+
+make の書き方（`make trace CONV=136 MASK=1 MASK_MODELS=1 OUT=trace.txt`・期間は `SINCE=2026-11-01 UNTIL=2026-11-07`・`FORMAT=jsonl`）も使えます。
 
 - **会話番号**は `./sherpactl logs codex` の `conv=…` と同じ番号です。
 - **分かること**（回答ごと）: 開始・終了・所要（準備・Codex・後処理の内訳）／終了理由とエラー／頭脳とモデル・推論の強さ・調べる深さ・範囲／実際に効いた設定とアプリの版／質問と回答の先頭／段の区切り（本体・自動の続き・台帳の続き・見直し・下調べ役）と段ごとのトークン／道具の呼び出し（時刻・段・道具・引数の要旨・所要・結果の大きさ・ヒット件数・打ち切り）／往復ごとのトークンの増分と累計（回答の記録と食い違えば注記）／調査台帳（完了したか・継続の回数・状態ごとの件数・書き換えの流れ・最終形とダウンロードの窓口）／道具ごとの集計（本体と下調べ役それぞれの入力（うちキャッシュ）・出力・推論・往復の回数・1 往復の最大入力・圧縮した回数と位置、道具ごとの呼び出し回数・結果の合計量・最大・かかった時間の合計・切り詰めや失敗の回数）。

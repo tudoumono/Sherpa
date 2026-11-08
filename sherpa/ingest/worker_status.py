@@ -11,13 +11,18 @@ MSG_VERSION_MISMATCH = ("ワーカーの版が Web アプリと違うため、�
 MSG_NO_WORKER = "取り込みのワーカーが動いていません。make restart-worker で起動してください"
 
 
+def live_workers() -> list[dict]:
+    """心拍が新しい取り込みワーカー（停止の途中の行は、もう依頼を拾わないので除く）。"""
+    return [w for w in store_workers.list_live("ingest") if w["state"] != "stopping"]
+
+
 def snapshot() -> dict:
     """Web アプリ自身の版・心拍が新しい取り込みワーカーの版と状態・待っている依頼の数・お知らせ文（無ければ None）。
     ワーカーが複数見えるとき（入れ替え中）は、Web アプリと同じ版が 1 つでもいれば版は合っているとみなす。
     停止の途中（`stopping`）の行は、もう依頼を拾わないので数えない。
     """
     web_version = app_version.current()
-    live = [w for w in store_workers.list_live("ingest") if w["state"] != "stopping"]
+    live = live_workers()
     mine = next((w for w in live if w["app_version"] == web_version), None)
     head = mine or (live[0] if live else None)
     mismatch = bool(live) and mine is None

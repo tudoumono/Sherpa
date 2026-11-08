@@ -579,6 +579,23 @@ def test_referenced_docs_that_failed_verification_are_listed_with_reason_and_sec
     assert env["completion"] == "complete"      # 出典の欠落は完了状態を変えない
 
 
+def test_bare_name_missing_from_ledger_walks_the_original_tree_once_per_turn(tmp_path, monkeypatch):
+    """台帳に無い名前だけの参照がある 1 ターンで、原本の木は 1 回しか歩かない（一覧だけで開いた資料があっても）。"""
+    from sherpa import documents
+    calls: list = []
+    real = documents.scope_rel_set
+
+    def counting(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+    monkeypatch.setattr(documents, "scope_rel_set", counting)
+    answer = f"確認しました。\n\n参照した資料:\n- 台帳にも原本にも無い名前.md\n- {H._DOC}\n"
+    body = H._PY + H._mcp_call("xlsx_sheets", {"doc_id": H._DOC2}, id="x1") + H._msg(answer)
+    _, env, _ = _run(tmp_path, monkeypatch, body, "walkonce-u1", make_sources=H._make_sources)
+    assert env["sources_verified"] == [H._DOC]
+    assert len(calls) == 1
+
+
 def test_files_made_outside_authoring_are_discarded_and_say_so(tmp_path, monkeypatch, registry):
     """資料作成でないターンに作られたファイルは保存せず、捨てた件数を注記する。"""
     _, env, _ = _run(tmp_path, monkeypatch, _WRITE_REPORT + H._msg("説明します。"), "discard-u1", lens="qa")

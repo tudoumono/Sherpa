@@ -84,6 +84,7 @@
     <div><h1>資料</h1>
       <div class="sub">資料フォルダを登録して取り込み、どの資料が使えるかを確認します（フォルダ構成がそのまま範囲）。</div></div>
     <div class="spacer"></div>
+    <a class="help-link" href="rules.html">資料の優先と除外 →</a>
     <a class="help-link" href="manual.html#register">この画面の使い方 →</a>
   </div>
 
@@ -145,6 +146,17 @@
       <div class="muted" style="font-size:var(--text-small);margin-top:8px">
         ※ 保存すると資料フォルダを取り込み直します（時間がかかります）。</div>
     </div>
+    <!-- フォルダの置き方の点検 -->
+    <div class="card" id="checkcard" style="margin-top:16px">
+      <div class="card-head">フォルダの置き方を点検</div>
+      <div class="muted" style="font-size:var(--text-small);margin-bottom:8px">
+        登録した資料フォルダが、期ごとにフォルダを分ける置き方の決まりに合っているかを確かめます。見るだけで、資料は変わりません。
+        次の取り込み直しの版で使う置き方の確認で、今の取り込みの動きは変わりません。
+        その版を入れるまで今のフォルダは動かさないでください（動かすと今の版で期をまたいでつながり、全部取り込み直しになります）。
+        最後に取り込んだときの資料の名前で点検します。</div>
+      <button class="btn-primary mini" id="chk-btn">点検する</button>
+      <div id="chk-out" role="status" style="margin-top:10px"></div>
+    </div>
   </div>
 
   <!-- ===== 下: 取り込み状況（文書一覧・全文検索） ===== -->
@@ -161,7 +173,6 @@
     <!-- 副導線: フォルダツリー（構造把握＋範囲選択） -->
     <aside class="treeside">
       <div class="treehead">範囲</div>
-      <div id="impdiag" class="impdiag" hidden></div>
       <div id="tree"></div>
     </aside>
 
@@ -192,7 +203,7 @@
       <div class="card" style="box-shadow:none">
         <table class="grid">
           <thead><tr><th>名前</th><th style="width:96px">種類</th><th style="width:150px">状態</th>
-            <th style="width:160px">場所（範囲）</th><th style="width:90px">重要度</th><th style="width:170px"></th></tr></thead>
+            <th style="width:160px">場所（範囲）</th><th style="width:170px"></th></tr></thead>
           <tbody id="rows"></tbody>
         </table>
       </div>
@@ -238,5 +249,6 @@
 </div>
 
 <script src="ingest.js"></script>
+<script src="ingest-check.js"></script>
 </body>
 </html>

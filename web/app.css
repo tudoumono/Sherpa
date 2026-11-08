@@ -217,11 +217,6 @@ tr.hideRow{display:none}
 .provbadge{font-size:var(--text-caption);padding:1px 7px;border-radius:6px;background:var(--surface-2);color:var(--ink-3);font-weight:500}
 .provbadge.warn{background:var(--warn-bg);color:var(--warn);cursor:help}
 /* 重要度バッジ（登録者による注記）。高=押し上げ／中=中立／低=後回し */
-.impbadge{display:inline-block;font-size:var(--text-caption);padding:2px 8px;border-radius:999px;font-weight:600;cursor:help;white-space:nowrap}
-.impbadge.imp-high{background:var(--accent-weak);color:var(--accent-ink)}
-.impbadge.imp-mid{background:var(--surface-2);color:var(--ink-2)}
-.impbadge.imp-low{background:var(--surface-2);color:var(--ink-3)}
-.impdiag{font-size:var(--text-caption);color:var(--warn);background:var(--warn-bg);border-radius:8px;padding:8px 10px;margin-bottom:10px;line-height:1.5}
 .note{font-size:var(--text-caption);color:var(--ink-3);margin-top:10px}
 .mini{min-height:36px;padding:0 11px;border-radius:7px;border:1px solid var(--border);background:var(--surface);font-size:var(--text-small);color:var(--ink-2)}
 .mini.prev{border-color:var(--accent);color:var(--accent-ink);font-weight:600}
@@ -651,10 +646,6 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .verif-badge.unknown{background:var(--surface);color:var(--ink-3);border:1px solid var(--border)}
 
 /* 登録者重要度バッジ（出典リンクの右に添える）。「高」は強調・「低」は淡色。「中」・未設定は描かない。 */
-.importance-badge{display:inline-flex;align-items:center;min-height:24px;padding:0 7px;border-radius:999px;
-  font-size:var(--text-caption);font-weight:600;margin-left:4px;vertical-align:middle}
-.importance-badge.high{background:var(--accent-weak);color:var(--accent-ink)}
-.importance-badge.low{background:var(--surface);color:var(--ink-3)}
 
 /* 実行の分担サマリ（回答カード末尾） */
 .provider-summary{font-size:var(--text-caption);margin-top:6px}
@@ -724,7 +715,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .retry-hint-btn{border:1px solid var(--accent);background:var(--accent-weak);color:var(--accent-ink);
   border-radius:999px;padding:6px 13px;font-size:var(--text-small);font-family:inherit;cursor:pointer}
 .retry-hint-btn:hover{background:var(--action-bg);color:var(--action-fg)}
-/* 調査予算の到達（途中までの結果）の注記。本文と分離した独立要素で、.impdiag と同じ配色・寸法。 */
+/* 調査予算の到達（途中までの結果）の注記。本文と分離した独立要素。 */
 .budget-note{font-size:var(--text-caption);color:var(--warn);background:var(--warn-bg);border-radius:8px;
   padding:8px 10px;margin:4px 0 10px;line-height:1.5}
 /* 回答の注記（answer.notices）。本文の上に出す控えめな帯。 */

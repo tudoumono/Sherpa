@@ -633,11 +633,16 @@ def target_check_record(state: PlanGateState | None, *, dry_run: bool) -> dict |
 
 def unconfirmed_items(plan: Plan) -> list[dict]:
     """未確認の一覧（`{"item","reason"}`）。未着手・打ち切り・済でも「要: source」に `- source:` が無い行。理由行の文は転記する（言い換えない）。"""
+    return _unconfirmed_rows(plan.rows)
+
+
+def _unconfirmed_rows(rows) -> list[dict]:
+    """渡した行のうち未確認のものを `{"item","reason"}` にする。"""
     out = []
-    for r in plan.rows:
+    for r in rows:
         name = r.subject or r.id
         if r.malformed:
-            out.append({"item": name, "id": r.id, "reason": "計画書の形式・id または打ち切りの理由が不正です"})
+            out.append({"item": name, "id": r.id, "reason": "記載の形が読み取れず、確かめられませんでした"})
         elif r.mark == " ":
             out.append({"item": name, "id": r.id, "reason": _UNSTARTED_PHRASE})
         elif r.mark == "-":
@@ -846,13 +851,12 @@ def conclusion_text(st) -> str:
 
 
 def compose_with_model_answer(plan: Plan, model_answer: str) -> tuple[str, dict]:
-    """モデルの回答を本文に残し（計画書の行の id だけ外す）、計画書の source 行にだけある参照を「参照した資料:」に追記する。
+    """モデルの回答を本文にそのまま残し、計画書の source 行にだけある参照を「参照した資料:」に追記する。
     順序は 本文 → 「参照した資料:」（モデルの参照行 → 計画書にだけある参照）。戻り値＝（組んだ本文, 記録用の要約）。
     設計: docs/design/codex.md「評価用の計画書では誰が完了を決めるか」"""
     refs = _plan_refs(plan)
     fmt, unverified = plan_gaps(plan)
     body, block = _split_ref_block(model_answer)
-    body = _strip_id_tags(body, {r.id for r in plan.rows if r.id})
     known = _block_ranges(block)
     added = []
     for p, ranges in refs.items():
@@ -927,7 +931,7 @@ EVAL_DIR_ENV = "SHERPA_LEDGER_EVAL_DIR"
 
 
 def compose_turn_answer(st) -> None:
-    """計画書方式のターンで、モデルの回答を本文に残し（計画書の行の id だけ外す）、計画書にだけある参照を追記する（モデルの回答が空のときだけ計画書の結論を本文にする。計画書に目録の行が無いときは何もしない）。"""
+    """計画書方式のターンで、モデルの回答を本文にそのまま残し、計画書にだけある参照を追記する（モデルの回答が空のときだけ計画書の結論を本文にする。計画書に目録の行が無いときは何もしない）。"""
     stats = {"applied": False, "body_source": "unchanged", "plan_present": False, "plan_rows": 0,
              "format_issues": [], "unverified_items": [], "plan_only_paths": [],
              "refs_added_from_plan": 0}
@@ -962,17 +966,18 @@ def turn_report(st) -> dict:
             marks["unstarted" if r.malformed else _MARKS[r.mark]] += 1
     review_text = (_section(plan.sections, "見直し") or "") if plan is not None else ""
     unconfirmed = unconfirmed_items(plan) if plan is not None else []
-    fmt, unverified = plan_gaps(plan) if plan is not None else ([], [])
+    fmt, _unverified = plan_gaps(plan) if plan is not None else ([], [])
     n_unstarted = sum(1 for r in plan.rows if r.mark == " " and not r.malformed) if plan is not None else 0
-    n_unverified = len(unverified) - n_unstarted
-    n_confirmed = (len(plan.rows) - len(fmt) - len(unverified)) if plan is not None else 0
+    # 回答に出す件数と一覧の材料。目録の行だけを数える（本文の stray 行は目録の行ではない）
+    listed_rows = [r for r in plan.rows if not r.stray] if plan is not None else []
+    listed = _unconfirmed_rows(listed_rows)
+    n_total = len(listed_rows)
     return {
         "ledger": "plan", "style": st._ledger_style, "plan_present": plan is not None,
         "rows": len(plan.rows) if plan is not None else 0, "marks": marks,
-        # 回答に出す件数。記載の不備の行（形式不正・source 欠落）は数えず、調査の記録に残す
-        "plan_counts": {"total": n_confirmed + len(unverified), "confirmed": n_confirmed,
-                        "unconfirmed": n_unverified, "unstarted": n_unstarted},
-        "plan_unverified_items": unverified,
+        "plan_counts": {"total": n_total, "confirmed": n_total - len(listed),
+                        "unconfirmed": len(listed) - n_unstarted, "unstarted": n_unstarted},
+        "plan_unverified_items": listed,
         "plan_format_issues": fmt,
         "unconfirmed_items": unconfirmed,
         "plan_review_lines": sum(1 for ln in review_text.splitlines() if ln.strip().startswith("-")),

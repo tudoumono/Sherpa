@@ -92,7 +92,7 @@ def build_items(env: dict) -> list[dict]:
         done, failed, waiting = (_count(plan_counts.get(k)) for k in ("confirmed", "unconfirmed", "unstarted"))
         items.append({"label": _LABEL_PLAN_COUNTS,
                       "text": f"対象 {plan_counts['total']} 件のうち、確かめた {done} 件・確かめられなかった {failed} 件・未着手 {waiting} 件"})
-    # 計画書の方式の記載の不備（形式不正・source 欠落）は回答に出さず調査の記録に残すので、確認できなかった項目は別の欄から読む
+    # 計画書の方式は確認できなかった項目を `plan_unverified_items` から読む（記載の不備の行も含む）
     unconfirmed = [u for u in (inv.get("plan_unverified_items" if inv.get("ledger") == "plan" else "unconfirmed_items") or [])
                    if isinstance(u, dict) and isinstance(u.get("item"), str) and isinstance(u.get("reason"), str)]
     hidden = 0

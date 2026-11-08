@@ -16,6 +16,16 @@ from pathlib import Path
 # ---- Codex × MCP（Codex は常に MCP 付きで起動する）----
 _MCP_PASSTHROUGH = ("NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "ES_URL",
                     "SHERPA_USE_FIXTURES", "SHERPA_DERIVED_DIR", "SHERPA_KB_DIR", "SHERPA_DISABLE_EMBED")
+# 外へ出る経路の設定（プロキシ・社内 CA）。Codex 本体（`sandbox._codex_clean_env`）と MCP サブプロセスの両方へ、親環境にあるときだけ渡す。
+NETWORK_PASSTHROUGH_ENV: tuple[str, ...] = (
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+)
+
+
+# 値が秘密になり得る変数（パスワード・資格情報入りの URL）。Codex の引数へ値を出さず、名前だけ `env_vars` で渡す。
+SECRET_PASSTHROUGH_ENV: tuple[str, ...] = ("NEO4J_PASSWORD", "NEO4J_URI", "ES_URL")
 
 
 def _toml_str(s) -> str:
@@ -33,7 +43,7 @@ def _abs_kb_or_derived(raw_value: str | None, subpath: str) -> str:
     return str((worlds._repo_root() / subpath).resolve())
 
 
-def _mcp_env(world: str, scope_paths, ask_disabled: bool = False, layer=None) -> dict:
+def _mcp_env(world: str, scope_paths, ask_disabled: bool = False, layer=None, rules=None) -> dict:
     """MCP サーバ（Sherpa 側プロセス）が world/scope と Neo4j/ES を解決するための env。
 
     MCP サブプロセスは cwd=authoring で走り、PG creds を持たない（`_MCP_PASSTHROUGH` に含めない）。
@@ -42,12 +52,17 @@ def _mcp_env(world: str, scope_paths, ask_disabled: bool = False, layer=None) ->
     (c) `ask_disabled`（確認ID 付き再送）なら `SHERPA_MCP_ASK_DISABLED=1` を渡し、ツール自体を隠す。
     (d) 有効アーム・旧形式変換バックエンド・実効拡張子集合・VLM 可用性は親プロセスの実効値スナップショット（`SHERPA_MCP_ARMS`/`SHERPA_MCP_LEGACY_BACKEND`/`SHERPA_LEGACY_EXTS`/`SHERPA_VLM_USABLE`）を渡す。
     (e) `SHERPA_OFFICE_COM_URL`/`SHERPA_OFFICE_COM_TOKEN` は渡さない（共有シークレットを露出させない）。
+    (h) `rules`（省略可）: 1 回の依頼で読んだ管理者の除外の規則。渡されたら読み直さずその写しを子へ渡す（permission profile の deny と同じスナップショット）。
     (f) `layer` は `layer.normalize_layer()` で検証し、`"docs"/"code"` のときだけ `SHERPA_MCP_LAYER` を渡す（不正値は `ValueError`）。qa レンズだけが実値を渡す。
+    (g) 管理者の優先・除外（`path_rules`）は、設定がある資料フォルダだけ `SHERPA_MCP_PATH_RULES` に JSON の写しを渡す（子は DB を読めない）。
     """
     from ... import worlds
     from ...ingest import arms as ingest_arms
     from ...ingest.arms import legacy_convert, vision_arm
+    from ... import proxy_bypass
+    proxy_bypass.apply()  # 子へ渡す NO_PROXY に社内の宛先を足してから読む
     env = {k: os.environ[k] for k in _MCP_PASSTHROUGH if k in os.environ}
+    env.update({k: v for k in NETWORK_PASSTHROUGH_ENV if (v := os.environ.get(k))})  # 空文字は未設定と同じ
     # 接続先は親が解決した ES/Neo4j の URL を明示して渡す（ポート変数だけの構成で MCP 側が既定ポートへ繋ぐのを防ぐ）。
     from sherpa import es_index as _es
     from sherpa.ingest import world_neo4j as _neo
@@ -67,6 +82,8 @@ def _mcp_env(world: str, scope_paths, ask_disabled: bool = False, layer=None) ->
     if ask_disabled:
         env["SHERPA_MCP_ASK_DISABLED"] = "1"
     env["SHERPA_MCP_ARMS"] = ",".join(ingest_arms.enabled_arm_names())  # 実効アームのスナップショット
+    from ... import path_rules
+    env.update(path_rules.snapshot_env(world, rules))  # 管理者の優先・除外のスナップショット（子は DB を読めない・設定があるときだけ）
     env["SHERPA_MCP_LEGACY_BACKEND"] = legacy_convert.legacy_backend_name()  # 実効バックエンドのスナップショット
     # 実効拡張子集合のスナップショット（URL/TOKEN を渡さずに済む）。
     env["SHERPA_LEGACY_EXTS"] = ",".join(sorted(legacy_convert.legacy_exts()))
@@ -190,18 +207,24 @@ def _codex_ask_capture(item: dict, ask_disabled: bool) -> dict | None:
 
 
 def _mcp_config_args(world: str, scope_paths, ask_disabled: bool = False, layer=None,
-                     extra_env: dict | None = None) -> list:
+                     extra_env: dict | None = None, rules=None) -> list:
     """codex exec に sherpa MCP サーバ(stdio)を登録する -c 引数（per-request＝~/.codex 設定を汚さない）。
     `extra_env`（省略可）: `_mcp_env` の結果に上書きマージする追加 env。
     """
     py = sys.executable or "python3"
-    env = _mcp_env(world, scope_paths, ask_disabled, layer=layer)
+    env = _mcp_env(world, scope_paths, ask_disabled, layer=layer, rules=rules)
     if extra_env:
         env.update(extra_env)
-    env_toml = "{" + ", ".join(f"{k} = {_toml_str(v)}" for k, v in env.items()) + "}"
+    # 経路の設定（プロキシ URL は認証情報を含み得る）と DB の秘密は値を引数へ出さない。名前だけ渡し、値は Codex を起こす env から受け継がせる。
+    by_name = NETWORK_PASSTHROUGH_ENV + SECRET_PASSTHROUGH_ENV
+    forwarded = [k for k in by_name if k in env]
+    env_toml = "{" + ", ".join(f"{k} = {_toml_str(v)}" for k, v in env.items()
+                               if k not in by_name) + "}"
+    env_vars_toml = "[" + ", ".join(_toml_str(k) for k in forwarded) + "]"
     # MCP ツール承認は approval_policy と別系統。default_tools_approval_mode="approve" で sandbox(-s read-only) を保ったまま自動承認する。
     return ["-c", f"mcp_servers.sherpa.command={_toml_str(py)}",
             "-c", 'mcp_servers.sherpa.args = ["-m", "sherpa.mcp_server"]',
             "-c", f"mcp_servers.sherpa.env = {env_toml}",
+            "-c", f"mcp_servers.sherpa.env_vars = {env_vars_toml}",
             "-c", 'mcp_servers.sherpa.default_tools_approval_mode = "approve"',
             "-c", 'approval_policy = "never"']

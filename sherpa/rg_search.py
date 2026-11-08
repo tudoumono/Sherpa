@@ -7,14 +7,17 @@ from __future__ import annotations
 
 import base64
 import functools
+import itertools
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 
 from . import scope_infer
 
@@ -73,15 +76,142 @@ def usable_query(q: str) -> bool:
     return bool(q) and not any(c in q for c in _LINE_BREAK_CHARS)
 
 
-def _base_cmd(rg: str, *, glob_md: bool, exclude_exts=()) -> list[str]:
-    cmd = [rg, "--json", "-F", "-i", "--no-config", "--hidden", "--no-ignore"]
+def _base_cmd(rg: str, *, whitelist: list[str], exclude_exts=(), fixed: bool = True) -> list[str]:
+    """`whitelist` は含める条件の引数（`-g`／`--iglob` の並び）。除外より先に置く（後の指定が優先されるため、除外が勝つ）。
+    `fixed=False` は検索語を正規表現（`_term_pattern`）で渡す。
+    """
+    cmd = [rg, "--json", *(["-F"] if fixed else []), "-i", "--no-config", "--hidden", "--no-ignore", *whitelist]
     for name in sorted(scope_infer.VCS_DIR_NAMES):
         cmd += ["-g", f"!{name}/"]
     for ext in exclude_exts:  # 拡張子だけの名前（`.pdf`）は除外に含めない
         cmd += ["--iglob", f"!?*{ext}"]
-    if glob_md:
-        cmd += ["--iglob", "*.md", "--iglob", "*.markdown"]
     return cmd
+
+
+# rg の正規表現で字面にするために `\\` を前に置く文字。
+_REGEX_META = "\\.+*?()|[]{}^$#&-~"
+
+
+@functools.lru_cache(maxsize=1)
+def _cp932_fold_table() -> dict[str, tuple[bytes, ...]]:
+    """CP932 の 1・2 バイトの並び → 解読した 1 文字の `casefold()`。その値ごとに、同じ値になる並びを全部まとめる（NEC・IBM の重複も含む）。"""
+    seqs = [bytes([b]) for b in range(0x100)]
+    seqs += [bytes([lead, tr]) for lead in (*range(0x81, 0xA0), *range(0xE0, 0xFD))
+             for tr in (*range(0x40, 0x7F), *range(0x80, 0xFD))]
+    table: dict[str, list[bytes]] = {}
+    for seq in seqs:
+        try:
+            ch = seq.decode("cp932")
+        except UnicodeDecodeError:
+            continue
+        if len(ch) == 1:
+            table.setdefault(ch.casefold(), []).append(seq)
+    return {k: tuple(v) for k, v in table.items()}
+
+
+def _cp932_alts(term: str) -> list[tuple[bytes, ...]] | None:
+    """`term` を CP932 で書いたときの文字ごとの並びの候補（大文字小文字の違う字と、重複した符号の並びを含む）。CP932 で書けない文字を含む語は None。"""
+    table = _cp932_fold_table()
+    out = []
+    for ch in term:
+        seqs = table.get(ch.casefold())
+        if not seqs:
+            return None
+        out.append(seqs)
+    return out
+
+
+def _cp932_pattern(term: str) -> str | None:
+    """`term` の CP932 のバイト列に当たる rg の正規表現。`-E sjis -i` で解読してから当てたときに当たる場所は必ず当たる（余計に当たる分は呼び出し元の確定で落ちる）。"""
+    alts = _cp932_alts(term)
+    if alts is None:
+        return None
+    parts = []
+    for seqs in alts:
+        xs = sorted({"".join(f"\\x{b:02x}" for b in seq) for seq in seqs})
+        parts.append(xs[0] if len(xs) == 1 else "(?:" + "|".join(xs) + ")")
+    return "(?-u:" + "".join(parts) + ")"
+
+
+@functools.lru_cache(maxsize=256)
+def _cp932_bytes_re(term: str) -> re.Pattern | None:
+    """`_cp932_pattern` と同じ並びに当たる Python の正規表現（行のバイト列から、どの語に当たったかを決める用）。"""
+    alts = _cp932_alts(term)
+    if alts is None:
+        return None
+    return re.compile(b"".join(b"(?:" + b"|".join(re.escape(x) for x in seqs) + b")" for seqs in alts),
+                      re.IGNORECASE)
+
+
+def _term_pattern(term: str, with_cp932: bool) -> str:
+    """rg に `-e` で渡す 1 語の正規表現。字面の語（UTF-8 のまま当てる）と、`with_cp932` のときは非 ASCII の語の CP932 のバイト列のどちらか。"""
+    plain = "".join("\\" + c if c in _REGEX_META else c for c in term)
+    cp = _cp932_pattern(term) if with_cp932 and not term.isascii() else None
+    return plain if cp is None else f"(?:{plain})|{cp}"
+
+
+_GLOB_SPECIAL = "\\*?[]{}!"
+
+
+def _esc(name: str) -> str | None:
+    """フォルダ名・ファイル名 1 つを rg のグロブの字面に直す（特別な文字は `\\` で打ち消す・途中の空白や記号はそのまま書ける）。
+    gitignore の書き方で表せない名前（前後の空白・制御文字・改行・タブ・リンクの名前に混じる不正なバイト）は None。
+    """
+    if not name or name != name.strip() or any(unicodedata.category(c) in ("Cc", "Cs") for c in name):
+        return None
+    return "".join("\\" + c if c in _GLOB_SPECIAL else c for c in name)
+
+
+def fold_case(text: str) -> str:
+    """英字を `[xX]` の文字クラスにして、グロブの一部だけを大文字小文字の両方に当てる（範囲の部分は区別したまま、拡張子だけ畳む用）。"""
+    return "".join(f"[{c}{c.upper()}]" if c.isalpha() and c.isascii() else "\\" + c if c in _GLOB_SPECIAL else c
+                   for c in text)
+
+
+def scope_prefixes(scope_paths) -> list[str] | None:
+    """正規化済みの範囲 → rg のグロブの頭（`/a/b`）の列。グロブにできない名前が 1 つでもあれば None（範囲で絞らず根から歩く）。
+    `.`／`..`／空の部品を含む範囲は、どのファイルにも当たらないので読み飛ばす（全部そうなら空の列＝何も歩かない）。
+    """
+    out: list[str] = []
+    for s in scope_paths:
+        parts = s.split("/")
+        if any(x in ("", ".", "..") for x in parts):
+            continue
+        esc = [_esc(x) for x in parts]
+        if None in esc:
+            return None
+        out.append("/" + "/".join(esc))
+    return out
+
+
+def _whitelist(derived: bool, prefixes: list[str] | None) -> list[str]:
+    """含める条件の引数。範囲なしの派生 MD の木は `.md`／`.markdown` だけ。範囲ありは、範囲が指す物理ファイルだけ
+    （派生 MD の木は、原本 rel が範囲の下にある `.md`／`.markdown` と、範囲がファイルを指すときの物理名 `p`・`p.rag.md`・`p.md`）。
+    範囲の部分は大文字小文字を区別する（`--iglob` にしない）。拡張子は `[mM][dD]` の形で畳む。
+    """
+    if prefixes is None:
+        return ["--iglob", "*.md", "--iglob", "*.markdown"] if derived else []
+    globs: list[str] = []
+    for p in prefixes:
+        if not derived:
+            globs += [p, p + "/**"]
+            continue
+        globs += [p, p + ".rag.md", p + ".md"]
+        globs += [f"{p}/**/*.{fold_case(e)}" for e in ("md", "markdown")]
+    return [a for g in globs for a in ("-g", g)]
+
+
+def _starts(roots, scoped: bool) -> list[tuple[str | None, list[str]]]:
+    """rg を起こす単位 `(cwd, 起点の列)`。範囲あり（グロブは cwd からの相対で当たる）は根ごとに cwd=根・起点 `.`。範囲なしは根をそのまま渡す。"""
+    roots = [str(r) for r in roots]
+    if not scoped:
+        return [(None, roots)] if roots else []
+    return [(r, ["."]) for r in roots]
+
+
+def _absolute(cwd: str | None, path: str) -> str:
+    """cwd 起点の相対パス `./x` を根の絶対パスに戻す。"""
+    return cwd + path[1:] if cwd is not None and path.startswith("./") else path
 
 
 def _decode_path(path: dict) -> str | None:
@@ -95,7 +225,7 @@ def _decode_path(path: dict) -> str | None:
     return None
 
 
-def _error_paths(err) -> list[str]:
+def _error_paths(err, cwd: str | None = None) -> list[str]:
     """rg が標準エラーに出した `rg: <パス>: <理由>` の行から、読めなかった通常ファイルのパスを取り出す（フォルダは含めない）。"""
     err.seek(0)
     out = []
@@ -103,19 +233,19 @@ def _error_paths(err) -> list[str]:
         line = os.fsdecode(raw)
         if not line.startswith("rg: ") or ": " not in line[4:]:
             continue
-        path = line[4:line.rindex(": ")]
+        path = _absolute(cwd, line[4:line.rindex(": ")])
         if os.path.isfile(path) and not os.path.islink(path):
             out.append(path)
     return out
 
 
-def _run(cmd: list[str], budget: Budget | None, unreadable: list):
+def _run(cmd: list[str], budget: Budget | None, unreadable: list, cwd: str | None = None):
     """rg を走らせ、JSON の match イベントを順に返す。正常終了（summary イベントを受信）しなければ `RgUnavailable`。
     rg が読めなかったファイルのパスを `unreadable` に足す（呼び出し元が候補に加え、純 Python 走査と同じ「読めなかったファイル」の扱いにする）。
     """
     err = tempfile.TemporaryFile()
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, cwd=cwd)
     except OSError as e:
         err.close()
         raise RgUnavailable(f"rg を起動できません ({type(e).__name__})") from e
@@ -144,7 +274,7 @@ def _run(cmd: list[str], budget: Budget | None, unreadable: list):
         proc.wait()
         if proc.stdout is not None:
             proc.stdout.close()
-        unreadable.extend(_error_paths(err))
+        unreadable.extend(_error_paths(err, cwd))
         err.close()
     if killed.is_set():
         raise RgDeadlineExceeded("rg の走査が期限を超えました")
@@ -153,36 +283,40 @@ def _run(cmd: list[str], budget: Budget | None, unreadable: list):
 
 
 def discover(terms: list[str], roots, *, derived: bool, budget: Budget | None = None,
-             first_only: bool = False, exclude_exts=()) -> dict[str, dict[int, int]]:
+             first_only: bool = False, exclude_exts=(), prefixes: list[str] | None = None) -> dict[str, dict[int, int]]:
     """`roots`（フォルダの列）を rg で走査し、`terms` のどれかを含む行があるファイルを `{パス: {語の添字: 最初の行番号}}` で返す。
-    `derived=True` は派生 MD の木（`.md`／`.markdown` だけ・UTF-8 のみ）。それ以外は原本の木で、非 ASCII の語があるときだけ CP932 の 2 回目も走らせる。
+    `derived=True` は派生 MD の木（`.md`／`.markdown` だけ・UTF-8 のみ）。それ以外は原本の木で、非 ASCII の語は UTF-8 と CP932 のバイト列のどちらかを 1 回の走査で探す（`_term_pattern`）。
+    `\ufffd` を含む語があるときだけ、今までどおり CP932 で解読する 2 回目を走らせる。
     `first_only=True` は 1 語専用で、ファイルごとに最初の 1 行で止める（語の添字は 0）。複数語は行の本文から語ごとの当たりを判定し、判定できない行はすべての語に当たったものとして残す（候補は漏らさない）。
     `exclude_exts`（`.pdf` のような拡張子の列）に一致するファイルは歩かない。呼び出し元が、同じ綴りのフォルダが木に無いことを確かめてから渡す（フォルダにも当たり中身ごと消えるため）。
+    `prefixes`（`scope_prefixes` の結果）があれば、根はそのまま起点にし、範囲に当たるファイルだけを含める条件（`-g`）で絞る。起点のパスを範囲の中へ明示して渡さないので、根の中の symlink は辿らない。空の列は何も歩かない。
     ASCII の語は大文字小文字を区別せず探す。非 ASCII の畳み方は rg の簡易ケースフォールディングで、Python の `lower()` とは一部異なる（確定は呼び出し元が Python で行う）。
     """
     rg = find_rg()
     if rg is None:
         raise RgUnavailable("rg が見つかりません")
-    roots = [str(r) for r in roots]
-    if not roots:
+    if prefixes is not None and not prefixes:
         return {}
+    starts = _starts(roots, prefixes is not None)
     lowered = [t.lower() for t in terms]
-    passes: list[list[str]] = [[]]
-    if not derived and any(not t.isascii() for t in terms):
-        passes.append(["-E", "sjis"])
+    cp932 = not derived and any(not t.isascii() for t in terms)
+    passes: list[tuple[bool, list[str]]] = [(not cp932, [])]  # (検索語を字面で渡すか, 足す引数)
+    if cp932 and any("\ufffd" in t for t in terms):
+        passes = [(True, []), (True, ["-E", "sjis"])]
     out: dict[str, dict[int, int]] = {}
-    for extra in passes:
-        cmd = _base_cmd(rg, glob_md=derived, exclude_exts=exclude_exts) + extra
+    for (fixed, extra), (cwd, begin) in itertools.product(passes, starts):
+        cmd = _base_cmd(rg, whitelist=_whitelist(derived, prefixes), exclude_exts=exclude_exts, fixed=fixed) + extra
         if first_only:
             cmd += ["-m", "1"]
         for t in terms:
-            cmd += ["-e", t]
-        cmd += ["--", *roots]
+            cmd += ["-e", t if fixed else _term_pattern(t, True)]
+        cmd += ["--", *begin]
         unreadable: list = []
-        for data in _run(cmd, budget, unreadable):
+        for data in _run(cmd, budget, unreadable, cwd):
             path = _decode_path(data.get("path") or {})
             if path is None:
                 continue
+            path = _absolute(cwd, path)
             line_no = data.get("line_number") or 0
             slot = out.setdefault(path, {})
             if first_only:
@@ -190,7 +324,10 @@ def discover(terms: list[str], roots, *, derived: bool, budget: Budget | None = 
                 continue
             text = (data.get("lines") or {}).get("text")
             text_l = text.lower() if text is not None else None
-            hit = [i for i, tl in enumerate(lowered) if text_l is not None and tl in text_l]
+            raw = text.encode("utf-8") if text is not None and not fixed else None
+            hit = [i for i, tl in enumerate(lowered) if text_l is not None and (
+                tl in text_l or (raw is not None and not terms[i].isascii()
+                                 and (rx := _cp932_bytes_re(terms[i])) is not None and rx.search(raw)))]
             for i in (hit or range(len(terms))):
                 slot.setdefault(i, line_no)
         for path in unreadable:  # 読めなかったファイルも候補に残す（開いて読めないことを純 Python 走査と同じ形で申告するため）
@@ -198,43 +335,3 @@ def discover(terms: list[str], roots, *, derived: bool, budget: Budget | None = 
             for i in range(len(terms)):
                 slot.setdefault(i, 0)
     return out
-
-
-def list_files_named(roots, name: str, *, budget: Budget | None = None) -> list[str]:
-    """`roots` 配下の、ファイル名が `name` に一致するファイルのパス（重要度の設定ファイルの発見用）。"""
-    rg = find_rg()
-    if rg is None:
-        raise RgUnavailable("rg が見つかりません")
-    roots = [str(r) for r in roots]
-    if not roots:
-        return []
-    cmd = [rg, "--files", "--no-config", "--no-messages", "--hidden", "--no-ignore", "-0"]
-    for vcs in sorted(scope_infer.VCS_DIR_NAMES):
-        cmd += ["-g", f"!{vcs}/"]
-    cmd += ["-g", name, "--", *roots]
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    except OSError as e:
-        raise RgUnavailable(f"rg を起動できません ({type(e).__name__})") from e
-    killed = threading.Event()
-    timer = None
-    remaining = budget.remaining() if budget is not None else None
-    if remaining is not None:
-        timer = threading.Timer(remaining, lambda: (killed.set(), proc.kill()))
-        timer.daemon = True
-        timer.start()
-    try:
-        raw = proc.stdout.read()
-    finally:
-        if timer is not None:
-            timer.cancel()
-        if proc.poll() is None:
-            proc.kill()
-        proc.wait()
-        proc.stdout.close()
-    if killed.is_set():
-        raise RgDeadlineExceeded("rg の走査が期限を超えました")
-    found = [os.fsdecode(p) for p in raw.split(b"\0") if p]
-    if proc.returncode not in (0, 1) and not found:
-        raise RgUnavailable(f"rg が正常に終わりませんでした (rc={proc.returncode})")
-    return found

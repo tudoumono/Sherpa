@@ -153,7 +153,7 @@ def test_importance_schema_version_bump_repopulates_null_columns_on_next_sync(mo
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_documents_endpoint_reflects_importance_from_real_ingest(auth_disabled):
+def test_documents_endpoint_does_not_expose_importance_after_real_ingest(auth_disabled):
     """RV2是正#b3③: `tests/api/test_ledger_p3.py::test_documents_endpoint_uses_ledger_when_populated`
     は importance 3列を手投入しており、`_ledger_rows`（ingest 時の実解決・materialize）と
     既存デプロイの移行（旧行 importance=NULL → 次回 sync で再構築）を検証していなかった。
@@ -181,9 +181,7 @@ def test_documents_endpoint_reflects_importance_from_real_ingest(auth_disabled):
         c = TestClient(app)
         body = c.get("/documents", params={"world": wid}).json()
         by_name = {d["name"]: d for d in body["documents"]}
-        assert by_name["a.cpy"]["importance"] == "高"
-        assert by_name["a.cpy"]["importance_reason"] == "一次資料"
-        assert by_name["b.cpy"]["importance"] == "高"
+        assert not any(k.startswith("importance") for d in by_name.values() for k in d)
     finally:
         _cleanup_world(wid)
         shutil.rmtree(root, ignore_errors=True)

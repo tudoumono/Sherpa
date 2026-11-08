@@ -166,7 +166,7 @@ def _execute_job(job: dict, stop_event: threading.Event) -> None:
                 return
             ctx = Ctx(message=job["query"], world=job["world"], route=_qa_route,
                       dispatch=_qa_dispatch_fallback, knowledge=True, scope_meta=scope_meta,
-                      make_sources=lambda docs: chat_service._sources(docs, job["world"]),
+                      make_sources=lambda docs: chat_service._sources(docs, job["world"], (scope_meta or {}).get("scope_paths")),
                       uid=_CODEX_JOB_UID, stop_event=stop_event,
                       tools_availability=agentic_search.tool_availability())
             result = None
@@ -193,7 +193,8 @@ def _execute_job(job: dict, stop_event: threading.Event) -> None:
                 return
             env = chat_service._finalize(result["env"], result["decision"], job["query"])
             elapsed_ms = round((time.monotonic() - t0) * 1000)
-            sources = [{"doc_id": s["doc_id"]} for s in (env.get("sources") or []) if s.get("doc_id")]
+            sources = [{"doc_id": s["doc_id"], **({"note": s["note"]} if s.get("note") else {})}
+                       for s in (env.get("sources") or []) if s.get("doc_id")]
             unconfirmed_items = list((env.get("investigation") or {}).get("unconfirmed_items") or [])
             # ジョブの結果にも調査の記録を載せる（チャット経路と同じ切り詰めルール・ジョブと一緒に期限切れで消える）。
             _investigation_record = result.get("investigation_record")
@@ -208,9 +209,13 @@ def _execute_job(job: dict, stop_event: threading.Event) -> None:
                                  "truncated": _truncated,
                                  "manifest": _manifest,
                                  "items": _items, "coverage": _coverage, "reviews": _reviews}
-            store_jobs.mark_completed(job_id, answer=env.get("headline") or "", sources=sources,
-                                      unconfirmed_items=unconfirmed_items, elapsed_ms=elapsed_ms,
-                                      investigation=investigation)
+            # 保存の前の最後の網: 管理者の除外の資料を落とす（設定が無ければそのまま）
+            from . import path_rules
+            kept = path_rules.filter_output(
+                {"sources": sources, "unconfirmed_items": unconfirmed_items, "investigation": investigation}, job["world"])
+            store_jobs.mark_completed(job_id, answer=env.get("headline") or "", sources=kept["sources"],
+                                      unconfirmed_items=kept["unconfirmed_items"], elapsed_ms=elapsed_ms,
+                                      investigation=kept["investigation"])
     except Exception:
         _log.exception("codex job: 予期しない例外で終端化します job_id=%s", job_id)
         try:

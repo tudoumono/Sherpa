@@ -209,31 +209,39 @@ def _evidence_docs(item) -> list:
     return [d for d in docs if d and d not in NON_DOC]
 
 
-def _keep_ev(doc, scope_paths) -> bool:
+def _keep_ev(doc, scope_paths, rules=None) -> bool:
     if not doc or doc in NON_DOC:  # マーカーは doc でない＝範囲対象外（残す）
         return True
+    if rules is not None and rules.excluded(doc):  # 管理者の除外
+        return False
     return in_scope(doc, scope_paths)
 
 
-def _prune_evidence(item, scope_paths) -> dict:
+def _prune_evidence(item, scope_paths, rules=None) -> dict:
     it = dict(item)
     ev = item.get("evidence")
     if isinstance(ev, list):
-        it["evidence"] = [e for e in ev if _keep_ev(e.get("doc"), scope_paths)]
+        it["evidence"] = [e for e in ev if _keep_ev(e.get("doc"), scope_paths, rules)]
     elif isinstance(ev, dict):
         it["evidence"] = {**ev,
-                          "edges": [e for e in ev.get("edges", []) if _keep_ev(e.get("doc"), scope_paths)],
-                          "grep": [g for g in ev.get("grep", []) if _keep_ev(g.get("doc_id"), scope_paths)]}
+                          "edges": [e for e in ev.get("edges", []) if _keep_ev(e.get("doc"), scope_paths, rules)],
+                          "grep": [g for g in ev.get("grep", []) if _keep_ev(g.get("doc_id"), scope_paths, rules)]}
     return it
 
 
-def filter_items(items, scope_paths):
-    """近傍/根拠 item を範囲で絞り evidence を範囲内に剪定する（根拠なしの構造ノードは残す）。空選択は素通し。"""
-    if not normalize_scope_paths(scope_paths):
+def filter_items(items, scope_paths, rules=None):
+    """近傍/根拠 item を範囲で絞り evidence を範囲内に剪定する（根拠なしの構造ノードは残す）。空選択は素通し。
+    `rules`（管理者の除外・省略可）があれば、除外の資料だけを根拠にする item は落とし、evidence からも除外の資料を除く。"""
+    hide = rules is not None and bool(rules.exclude_paths)
+    if not normalize_scope_paths(scope_paths) and not hide:
         return items
     out = []
     for it in items:
         docs = _evidence_docs(it)
+        if hide:
+            docs = [d for d in docs if not rules.excluded(d)] if any(rules.excluded(d) for d in docs) else docs
+            if _evidence_docs(it) and not docs:
+                continue
         if not docs or any(in_scope(d, scope_paths) for d in docs):
-            out.append(_prune_evidence(it, scope_paths))
+            out.append(_prune_evidence(it, scope_paths, rules if hide else None))
     return out

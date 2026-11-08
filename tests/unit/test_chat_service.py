@@ -48,30 +48,11 @@ _NODE = {"type": "node", "id": "understand", "kind": "think", "label": "質問�
          "detail": "内容を把握しました", "status": "done"}
 
 
-def test_sources_importance_and_control_file(monkeypatch):
-    from sherpa.ingest import importance as imp
-    # `_重要度.txt`（設定ファイル自体）は出典に出さない
-    assert {s["doc_id"] for s in CS._sources(["a.md", "_重要度.txt", "4期/_重要度.txt"], "v1")} == {"a.md"}
-    # 解決できれば importance/importance_reason を足す（importance_source は出さない）・解決の無い doc は持たない
-    monkeypatch.setattr(CS.worlds, "world_dir", lambda w: "/tmp/x")
-    res = imp.Resolution(value="高", reason="契約書", config_path="_重要度.txt", rule_line=1)
-    monkeypatch.setattr(CS.importance, "resolve_many", lambda w, rels, root=None, sig=None: {"a.md": res})
-    out = {s["doc_id"]: s for s in CS._sources(["a.md", "b.md"], "v1")}
-    assert out["a.md"]["importance"] == "高" and out["a.md"]["importance_reason"] == "契約書"
-    assert "importance_source" not in out["a.md"] and "importance" not in out["b.md"]
-
-
-def test_sources_unregistered_world_skips_resolve_call_and_stays_two_keys(monkeypatch):
-    called = {"n": 0}
-
-    def _boom(*a, **k):
-        called["n"] += 1
-        return {}
-
+def test_sources_exclude_control_file_and_carry_no_importance(monkeypatch):
+    # `_重要度.txt`（設定ファイル自体）は出典に出さない・重要度の欄は付けない
     monkeypatch.setattr(CS.worlds, "world_dir", lambda w: None)
-    monkeypatch.setattr(CS.importance, "resolve_many", _boom)
-    out = CS._sources(["a.md"], "v1")
-    assert called["n"] == 0 and set(out[0]) == {"doc_id", "download_url"}
+    out = CS._sources(["a.md", "_重要度.txt", "4期/_重要度.txt"], "v1")
+    assert [s["doc_id"] for s in out] == ["a.md"] and set(out[0]) == {"doc_id", "download_url"}
 
 
 # ---- _cap_trace_v2 の二段上限（純関数・DB 不要） ----

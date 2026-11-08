@@ -848,29 +848,6 @@ function encodingPartialBadge(d) {
   return `<div class="provrow"><span class="provbadge warn" title="${esc(ENCODING_PARTIAL_TIP)}">一部が化けている（要確認）</span></div>`;
 }
 
-// 重要度バッジ（登録フォルダの `_重要度.txt` による登録者の注記・無ければ空文字＝後方互換）。
-const IMP_CLASS = { 高: 'imp-high', 中: 'imp-mid', 低: 'imp-low' };
-function impBadge(d) {
-  const cls = IMP_CLASS[d.importance];
-  if (!cls) return '';   // 高/中/低以外（未知値・欠落）は何も表示しない（「中」などへ推測して見せない）
-  const tip = ['登録者による注記：重要度 ' + d.importance,
-    d.importance_reason ? `理由: ${d.importance_reason}` : '',
-    d.importance_source ? `由来: ${d.importance_source}` : ''].filter(Boolean).join(' ／ ');
-  return `<span class="impbadge ${cls}" title="${esc(tip)}">${esc(d.importance)}</span>`;
-}
-
-function renderImportanceDiagnostics() {      // 重要度設定の構文エラーをツリー付近に小さく知らせる
-  const diags = (_pv && _pv.importance_diagnostics) || [];
-  const el = $('impdiag');
-  if (!diags.length) { el.hidden = true; el.innerHTML = ''; return; }
-  el.hidden = false;
-  el.innerHTML = `⚠ 重要度の設定（_重要度.txt）に読み取れない行があります（${diags.length}件）`
-    + `<ul style="margin:4px 0 0 18px;padding:0">`
-    + diags.slice(0, 5).map((d) =>
-        `<li>${esc(d.config_path)}${d.line != null ? `:${esc(d.line)}行目` : ''} — ${esc(d.message)}</li>`).join('')
-    + `</ul>`;
-}
-
 // `/ingest/preview` は world 未指定/空文字を 422 で拒否するため、worlds 0件（未登録）のときは fetch 自体を行わず平文の空状態へ倒す。
 // それ以外の失敗（503・ネットワーク断等）も try/catch で拾って平文のエラー表示に倒す（スピナー放置を無くす）。
 const _NO_WORLD_MSG = 'まだ資料フォルダが登録されていません。上の「登録」から追加してください。';
@@ -880,25 +857,23 @@ async function load() {
   if (!world) {
     _pv = null;
     $('type').innerHTML = '<option value="">すべて</option>';
-    renderImportanceDiagnostics();
     $('tree').innerHTML = `<div class="empty">${esc(_NO_WORLD_MSG)}</div>`;
-    $('rows').innerHTML = `<tr><td colspan="6"><div class="empty">${esc(_NO_WORLD_MSG)}</div></td></tr>`;
+    $('rows').innerHTML = `<tr><td colspan="5"><div class="empty">${esc(_NO_WORLD_MSG)}</div></td></tr>`;
     $('count').textContent = '';
     return;
   }
   $('tree').innerHTML = _LOADING_INLINE;
-  $('rows').innerHTML = `<tr><td colspan="6">${_LOADING_INLINE}</td></tr>`;
+  $('rows').innerHTML = `<tr><td colspan="5">${_LOADING_INLINE}</td></tr>`;
   try {
     _pv = await getJSON(`/ingest/preview?world=${encodeURIComponent(world)}`);
     const types = [...new Set(_pv.documents.map((d) => d.doctype))].sort();
     $('type').innerHTML = '<option value="">すべて</option>' + types.map((t) => `<option>${esc(t)}</option>`).join('');
-    renderImportanceDiagnostics();
     renderTree();
     render();
   } catch (e) {
     _pv = null;
     $('tree').innerHTML = `<div class="danger">取り込み状況を取得できません: ${esc(e.message)}</div>`;
-    $('rows').innerHTML = `<tr><td colspan="6"><div class="danger">取り込み状況を取得できません: ${esc(e.message)}</div></td></tr>`;
+    $('rows').innerHTML = `<tr><td colspan="5"><div class="danger">取り込み状況を取得できません: ${esc(e.message)}</div></td></tr>`;
     $('count').textContent = '';
   }
 }
@@ -937,7 +912,7 @@ function renderTree() {                       // フォルダツリー（範囲�
     html += `<div class="tnode ${_folder === path ? 'on' : ''}" data-folder="${esc(path)}" style="padding-left:${8 + depth * 15}px">📁 ${esc(name)}<span class="tc">${counts[path]}</span></div>`;
   }
   if (_pv && _pv.folders_truncated) html += '<div class="muted" style="font-size:var(--text-caption);padding:6px 8px">フォルダが多いため、資料の無いフォルダは一部だけ出しています</div>';
-  if (_pv && _pv.folders_partial) html += '<div class="muted" style="font-size:var(--text-caption);padding:6px 8px">フォルダが多いため、資料の無いフォルダと重要度の設定は一部だけ確認しています</div>';
+  if (_pv && _pv.folders_partial) html += '<div class="muted" style="font-size:var(--text-caption);padding:6px 8px">フォルダが多いため、資料の無いフォルダは一部だけ確認しています</div>';
   $('tree').innerHTML = html;
 }
 
@@ -958,7 +933,7 @@ function render() {
   const shown = browsing ? docs.filter((d) => (d.folder || '') === _folder) : docs;
   const subRows = browsing ? childFolders().map(folderRow).join('') : '';
   $('rows').innerHTML = (subRows + shown.map(row).join(''))
-    || `<tr><td colspan="6"><div class="empty">${esc((_pv && _pv.documents_note) || (browsing ? 'このフォルダは空です' : '該当する資料がありません'))}</div></td></tr>`;
+    || `<tr><td colspan="5"><div class="empty">${esc((_pv && _pv.documents_note) || (browsing ? 'このフォルダは空です' : '該当する資料がありません'))}</div></td></tr>`;
   updateEsScope();
 }
 
@@ -976,7 +951,6 @@ function folderRow([path, n]) {
     <td><span class="dtype">フォルダ</span></td>
     <td class="muted">資料 ${n} 件</td>
     <td class="muted">${esc(_folder)}</td>
-    <td></td>
     <td><div class="rowact"><button class="mini" data-open-folder="${esc(path)}">開く</button></div></td>
   </tr>`;
 }
@@ -996,7 +970,6 @@ function row(d) {
     <td><span class="dtype">${esc(d.doctype)}</span></td>
     <td><span class="status ${st.cls}"><span class="d"></span>${esc(st.mark)}</span></td>
     <td class="muted">${esc(place)}</td>
-    <td>${impBadge(d)}</td>
     <td><div class="rowact">${rerun}<button class="mini" data-dl="${esc(d.name)}">原本をひらく</button></div></td>
   </tr>`;
 }

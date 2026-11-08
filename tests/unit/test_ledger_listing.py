@@ -109,8 +109,15 @@ _CALLS = [
 ]
 
 
-def _run_all(wid):
-    return [tool_dispatch.run_tool(name, args, wid, sp, layer=layer)[0] for name, args, sp, layer in _CALLS]
+def _run_all(wid, walks=None):
+    """全呼び出しの結果。`walks` を渡すと、path_prefix つきの list_docs（取り込みの後の資料を確かめるため歩く）以外の走査数を `walks["unexpected"]` に積む。"""
+    out = []
+    for name, args, sp, layer in _CALLS:
+        before = walks["n"] if walks else 0
+        out.append(tool_dispatch.run_tool(name, args, wid, sp, layer=layer)[0])
+        if walks and not (name == "list_docs" and args.get("path_prefix")):
+            walks["unexpected"] = walks.get("unexpected", 0) + walks["n"] - before
+    return out
 
 
 def test_listing_from_ledger_matches_walk_and_does_not_walk(world, monkeypatch):
@@ -118,8 +125,8 @@ def test_listing_from_ledger_matches_walk_and_does_not_walk(world, monkeypatch):
     _ingest(world, flags=[{"doc": "gen1/src/PROG2.cbl", "action": "blocked", "reason": "unreadable_code_file"}])
 
     walks = _count_walks(monkeypatch)
-    from_ledger = _run_all(world)
-    assert walks["n"] == 0, "台帳がある資料フォルダで一覧の道具が資料フォルダを歩いた"
+    from_ledger = _run_all(world, walks)
+    assert walks.get("unexpected", 0) == 0, "台帳がある資料フォルダで一覧の道具が資料フォルダを歩いた"
     assert all(r.get("ledger_at") for r in from_ledger)
 
     store.replace_documents(world, [])          # 台帳を消すと、同じ資料を歩いて答える
@@ -128,7 +135,8 @@ def test_listing_from_ledger_matches_walk_and_does_not_walk(world, monkeypatch):
     assert not any("ledger_at" in r for r in from_walk)
 
     for (name, args, sp, layer), a, b in zip(_CALLS, from_ledger, from_walk):
-        a = {k: v for k, v in a.items() if k != "ledger_at"}
+        a = {k: v for k, v in a.items() if k not in ("ledger_at", "generation")}
+        b = {k: v for k, v in b.items() if k not in ("generation", "notice")}
         assert a == b, (name, args, sp, layer)
     # 比較が空振りでないこと（読み取れない文書が 1 件、両方に出ている）
     idx = _CALLS.index(("list_docs", {"state": "unreadable"}, None, None))
@@ -229,7 +237,7 @@ def test_missing_doctype_and_branch_are_filled_from_name(world, monkeypatch):
     assert code["paths"] == ["gen1/src/PROG1.cbl", "gen2/src/PROG1.cbl"]
 
 
-def test_row_not_completable_from_name_falls_back_to_walk(world, monkeypatch):
+def test_row_not_completable_from_name_does_not_fall_back_to_walk(world, monkeypatch):
     _ingest(world)
     rows = store.list_documents(world)
     for r in rows:
@@ -240,7 +248,7 @@ def test_row_not_completable_from_name_falls_back_to_walk(world, monkeypatch):
     store.replace_documents(world, rows)
     walks = _count_walks(monkeypatch)
     res = tool_dispatch.run_tool("list_docs", {}, world, None)[0]
-    assert walks["n"] > 0 and "ledger_at" not in res
+    assert walks["n"] == 0 and res["ledger_at"] and res["count"] == len(_FILES)
 
 
 def test_listing_documents_returns_rows_sorted_by_name(world):
@@ -266,7 +274,7 @@ def test_unreadable_row_missing_doctype_and_branch_is_filled_and_not_listed_as_d
     assert all(r.get("ledger_at") for r in from_ledger)
 
 
-def test_unreadable_row_not_completable_from_name_falls_back_to_walk(world, monkeypatch):
+def test_unreadable_row_not_completable_from_name_does_not_fall_back_to_walk(world, monkeypatch):
     _ingest(world)
     rows = store.list_documents(world)
     for r in rows:
@@ -274,8 +282,9 @@ def test_unreadable_row_not_completable_from_name_falls_back_to_walk(world, monk
             r["name"], r["status"], r["doctype"], r["branch"] = "unknown_kind.zzzqqq", "unreadable", None, None
     store.replace_documents(world, rows)
     walks = _count_walks(monkeypatch)
-    res = tool_dispatch.run_tool("list_docs", {}, world, None)[0]
-    assert walks["n"] > 0 and "ledger_at" not in res
+    res = tool_dispatch.run_tool("list_docs", {"state": "unreadable"}, world, None)[0]
+    assert walks["n"] == 0 and res["ledger_at"]
+    assert [d["rel_path"] for d in res["docs"]] == ["unknown_kind.zzzqqq"]
 
 
 def test_ledger_is_not_read_while_world_is_being_swapped(world, monkeypatch):

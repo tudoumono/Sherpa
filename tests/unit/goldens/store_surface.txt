@@ -141,6 +141,7 @@ list_workspace_files
 list_worlds_db
 list_worlds_with_interrupted_latest_run
 live_workspace_rel_paths
+modify_system_setting
 no_live_upload_for_path
 note_ingest_run_op
 owns_assistant_message

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import time
 from pathlib import Path
 
@@ -225,12 +226,103 @@ def read_meta_put(world: str, st: os.stat_result, params: str, payload: dict) ->
         con.close()
 
 
-def tree_signature(dirs, deadline: float | None = None) -> str:
+def _scoped_fd_supported() -> bool:
+    return (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+            and os.open in os.supports_dir_fd and os.scandir in os.supports_fd)
+
+
+def _DIR_FLAGS() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _fold_dir(fd: int, path: str, h, deadline: float | None) -> bool:
+    """`fd` のフォルダの更新時刻を畳み、子のフォルダへリンクを辿らずに降りる。列挙・open の失敗（消えた子も含む）が 1 つでもあれば False（署名を作らない）。"""
+    if deadline is not None and time.monotonic() > deadline:
+        raise scope_infer.ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
+    names: list[str] = []
+    try:
+        h.update(f"{path}\0{os.fstat(fd).st_mtime_ns}\n".encode("utf-8", "surrogateescape"))
+        with os.scandir(fd) as it:
+            for i, e in enumerate(it):
+                if (deadline is not None and i > 0 and i % _DEADLINE_CHECK_ENTRIES == 0
+                        and time.monotonic() > deadline):
+                    raise scope_infer.ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
+                if e.is_dir(follow_symlinks=False) and not scope_infer.is_vcs_dir_name(e.name):
+                    names.append(e.name)
+    except OSError:
+        return False
+    ok = True
+    for name in sorted(names):
+        child = os.path.join(path, name)
+        try:
+            cfd = os.open(name, _DIR_FLAGS(), dir_fd=fd)
+        except OSError:
+            ok = False
+            continue
+        try:
+            if not _fold_dir(cfd, child, h, deadline):
+                ok = False
+        finally:
+            os.close(cfd)
+    return ok
+
+
+def _fold_scope(root: str, scope_paths, h, deadline: float | None) -> bool:
+    """範囲があるときの署名。根から範囲の起点まで 1 段ずつリンクを辿らずに開き、途中のフォルダの更新時刻と範囲の部分木（互いに含み合うものは外側 1 つ）を `h` に畳む。選んだ範囲そのもの（根から範囲までの途中を含む）が実在しないときだけ見ない。途中・部分木・根がリンク・フォルダでない・読めないときは False（署名を作らない）。"""
+    paths = sorted({s for s in scope_paths if not any(x in ("", ".", "..") for x in s.split("/"))},
+                   key=lambda x: (x.count("/"), x))
+    top: list[str] = []
+    for s in paths:
+        if not any(s == t or s.startswith(t + "/") for t in top):
+            top.append(s)
+    for s in top:
+        parts = s.split("/")
+        try:
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            h.update(f"{root}\0!\n".encode("utf-8", "surrogateescape"))
+            continue
+        except OSError:
+            return False
+        d = root
+        try:
+            for i, name in enumerate(parts):
+                try:
+                    h.update(f"{d}\0{os.fstat(fd).st_mtime_ns}\n".encode("utf-8", "surrogateescape"))
+                except OSError:
+                    h.update(f"{d}\0!\n".encode("utf-8", "surrogateescape"))
+                d = os.path.join(d, name)
+                try:
+                    nfd = os.open(name, _DIR_FLAGS(), dir_fd=fd)
+                except FileNotFoundError:
+                    h.update(f"{d}\0!\n".encode("utf-8", "surrogateescape"))
+                    break
+                except OSError:
+                    return False
+                os.close(fd)
+                fd = nfd
+                if i == len(parts) - 1 and not _fold_dir(fd, d, h, deadline):
+                    return False
+        finally:
+            os.close(fd)
+    return True
+
+
+def tree_signature(dirs, deadline: float | None = None, scope_paths=None) -> str | None:
     """フォルダ木の署名。フォルダ（ファイルは見ない）の更新時刻を畳む。ファイルの追加・削除・改名で変わる。
     版管理の記録のフォルダ（`scope_infer.VCS_DIR_NAMES`）には入らず、シンボリックリンクは辿らない。
+    `scope_paths`（正規化済みの範囲）があれば、各 `dirs` の中の範囲の部分木と、根から範囲の親までの途中のフォルダだけを見る。
+    範囲の途中にリンクがある・開けない、またはこの環境で fd 指定の走査ができないときは None（キャッシュを使わない）。
     `deadline`（`time.monotonic()` 系の絶対期限）を渡すと、フォルダごと・`_DEADLINE_CHECK_ENTRIES` 件ごとに確認し、超過で `scope_infer.ScopeWalkDeadlineExceeded` を送出する。
     """
     h = hashlib.sha1()
+    if scope_paths is not None:
+        if not _scoped_fd_supported():
+            return None
+        for root in dirs:
+            if not _fold_scope(str(root), scope_paths, h, deadline):
+                return None
+        return h.hexdigest()
     for root in dirs:
         stack = [str(root)]
         while stack:

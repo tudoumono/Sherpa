@@ -37,9 +37,8 @@ SCOPES = {
 PREVIEW = {
     # 実形状（sherpa/preview_service.py::build_preview）: 画面を開いたときの応答は要素・関係・警告を持たない
     # （空で返る。中身は GET /ingest/preview/graph = PREVIEW_GRAPH）。
-    # S3: 実形状は world/label/issues も持つ。実 API（doc_ledger.control_diagnostics 経由）は
-    # importance_diagnostics も常に持つ（`_重要度.txt` の構文診断・無ければ空リスト）。
-    "world": "w1", "label": "4期更改", "issues": [], "importance_diagnostics": [],
+    # S3: 実形状は world/label/issues も持つ。
+    "world": "w1", "label": "4期更改", "issues": [],
     # グラフを今は組み立てられない理由（組み立てられるときは None）。
     "graph_note": None,
     # 一覧を出せない理由（台帳が空で、資料フォルダを歩く期限を超えたとき）。
@@ -51,11 +50,6 @@ PREVIEW = {
     # フェーズ7-1: 実 doc（doc_ledger.py::preview_documents）は phase/category/label/reason も常に持つ
     # （旧モックは欠落＝実ドリフト是正。reason は失敗時のみ非 None・他は None）。
     "documents": [
-        # 重要度バッジ用フィールド（importance/importance_reason/importance_source）は、
-        # `_重要度.txt` の解決結果がある時だけ付く（無ければ3キーとも省略・real fixtures/corpus/v1
-        # には `_重要度.txt` が無いため、既定の PREVIEW はここでは付けない＝test_mock_api_contract
-        # の mock⊆実 契約を保つ。バッジ表示自体のe2eは test_ingest_ui.py 側でこの3キーを
-        # ローカルに追加した preview を個別に用意して確認する）。
         {"name": "4期/02_設計/01_基本設計/税計算仕様書.md", "folder": "4期/02_設計/01_基本設計",
          "branch": "office", "doctype": "md", "analyzer": None, "state": "ready", "top_scope": "4期",
          "phase": None, "category": "01_基本設計", "label": "使えます", "reason": None},

@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -17,7 +18,7 @@ import time
 from collections import Counter, OrderedDict
 from pathlib import Path
 
-from . import graph_coverage, layer as layer_mod, scope
+from . import graph_coverage, layer as layer_mod, path_rules, scope
 from .graph_coverage import Coverage
 from .ingest import text_kind
 from .ingest.model import NODE_LABELS
@@ -78,9 +79,13 @@ def json_bytes(obj) -> int:
     return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
 
+# `run` の間だけ入る管理者の優先・除外（`_sensitive_path` が除外の資料を結果に出さないために見る）
+_RULES: contextvars.ContextVar = contextvars.ContextVar("graph_tools_path_rules", default=path_rules.EMPTY)
+
+
 def _sensitive_path(path) -> bool:
-    """秘匿名のファイル（`text_kind.is_sensitive_doc_id`）か。パスが無いノードは対象外。"""
-    return bool(path) and text_kind.is_sensitive_doc_id(str(path))
+    """秘匿名のファイル（`text_kind.is_sensitive_doc_id`）、または管理者が検索から外している資料か。パスが無いノードは対象外。"""
+    return bool(path) and (text_kind.is_sensitive_doc_id(str(path)) or _RULES.get().excluded(str(path)))
 
 
 def _node_view(n: dict) -> dict:
@@ -118,6 +123,16 @@ def _open_driver():
 
 
 def run(name: str, args: dict, world: str, scope_paths, layer=None, max_bytes: int | None = None) -> dict:
+    """管理者の優先・除外（`path_rules`）を当てた `_run`。除外の資料は起点・経路・根拠・関連資料のどれにも出さず、「範囲の外でも読む」優先は範囲に足す。"""
+    rules = path_rules.rules_for(world)
+    token = _RULES.set(rules)
+    try:
+        return path_rules.filter_output(_run(name, args, world, rules.extend_scope(scope_paths), layer, max_bytes), world)
+    finally:
+        _RULES.reset(token)
+
+
+def _run(name: str, args: dict, world: str, scope_paths, layer=None, max_bytes: int | None = None) -> dict:
     """`graph_resolve`／`graph_impact` を実行して結果の辞書を返す（層 docs の拒否は呼び出し側）。
 
     `GraphSchemaEraError`（旧世代のグラフ）は再送出する（呼び出し側が `graph_reingest_required` のツール結果へ変換する）。
@@ -330,6 +345,8 @@ def _edge_evidence(raw_edges: list, cids: list, sp, evidence_limit: int, code_on
         e = edge_view(raw)
         if "sources" in e:
             e["sources"] = _safe_sources(e["sources"], sp, code_only)
+            if _RULES.get().exclude_paths:
+                e["sources_overflow_count"] = 0  # 保存済みの超過の数に除外の根拠が混ざっているか分からない＝捨てて、見える根拠の返す上限の超過だけを数える
         ev = {"from": cids[i], "to": cids[i + 1], **{k: e[k] for k in ("via", "line", "rule") if k in e}}
         if "sources" in e:
             ev.update({k: v for k, v in limit_edge_sources([e], evidence_limit)[0].items()
@@ -615,6 +632,7 @@ def _impact(session, world, sp, code_only, with_documents, out_dir=None, *, cano
         # 起点の名前に一致する未解決の参照（影響の起点の解決と同じ完全一致）。起点の調べが時間切れ・天井なら付けない
         try:
             unresolved = world_neo4j.read_unresolved(session, world, [start["name"]], sp, fold_case=False)
+            unresolved = path_rules.scrub_unresolved(unresolved, _RULES.get())
             unresolved["items"] = [u for u in unresolved["items"] if _route_doc(u.get("path"), None, code_only)]
         except GraphQueryOverloadError as e:
             cov.add(graph_coverage.kind_of_overload(e.reason), graph_coverage.STAGE_IMPACT)

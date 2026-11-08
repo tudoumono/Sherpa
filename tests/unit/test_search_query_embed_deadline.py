@@ -111,7 +111,7 @@ def test_bm25_queries_body_and_heading_fields_with_body_heaviest(monkeypatch):
     bodies = _setup_search(monkeypatch)
     es_index.search("w", "項目名", vector=False)
     body = bodies[0]
-    mm = body["query"]["function_score"]["query"]["bool"]["must"][0]["multi_match"]
+    mm = body["query"]["bool"]["must"][0]["multi_match"]
     weights = {f.split("^")[0]: float(f.split("^")[1]) for f in mm["fields"]}
     assert set(weights) == {"text", "labels", "region_context"}
     assert weights["text"] > weights["labels"] > 0 and weights["text"] > weights["region_context"] > 0

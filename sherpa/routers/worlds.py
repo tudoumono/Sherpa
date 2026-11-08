@@ -211,7 +211,7 @@ ingest_runs_router = APIRouter()
 
 @ingest_preview_router.get("/ingest/preview", tags=["資料フォルダ(World)管理"])
 def ingest_preview(request: Request, world: str | None = Query(None, pattern=_WORLD_PATTERN)):
-    """取り込み・抽出プレビュー（読み取り専用）。資料の一覧（台帳から）・フォルダ・重要度の診断と、取り込みの記録の件数を返す。要素・関係は `GET /ingest/preview/graph`。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする。"""
+    """取り込み・抽出プレビュー（読み取り専用）。資料の一覧（台帳から）・フォルダと、取り込みの記録の件数を返す。要素・関係は `GET /ingest/preview/graph`。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする。"""
     _require_admin(_current_user(request))
     wid = _resolve_world(world)
     try:

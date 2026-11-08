@@ -36,9 +36,12 @@ from sherpa.routers import (
     audit_usage,
     chat,
     conversations,
+    connectivity_admin,
     feedback_admin,
+    folder_check,
     impact,
     improvement_log,
+    path_rules_admin,
     shares,
     system,
     system_extras,
@@ -155,6 +158,12 @@ app.include_router(improvement_log.improvement_log_router)
 app.include_router(feedback_admin.feedback_admin_router)
 
 
+app.include_router(connectivity_admin.connectivity_admin_router)
+
+
+app.include_router(path_rules_admin.path_rules_admin_router)
+
+
 app.include_router(shares.router)
 
 
@@ -177,6 +186,9 @@ app.include_router(documents_routes.download_router)
 
 
 app.include_router(worlds_routes.ingest_preview_router)
+
+
+app.include_router(folder_check.router)
 
 
 app.include_router(documents_routes.documents_router)

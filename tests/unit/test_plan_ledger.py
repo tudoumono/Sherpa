@@ -75,7 +75,7 @@ def test_reason_words(word):
 def test_closed_row_without_reason_word_is_still_unconfirmed():
     p = PL.parse_plan(_plan("- [-] a · k · s · 要: source\n"))
     assert p.rows[0].malformed and p.unstarted
-    assert "理由が不正" in PL.unconfirmed_items(p)[0]["reason"]
+    assert "読み取れず" in PL.unconfirmed_items(p)[0]["reason"]
 
 
 # ---- 進捗 ----
@@ -364,7 +364,13 @@ def test_model_answer_stays_as_body_without_plan_supplement():
 def test_plan_row_ids_are_removed_from_the_model_body_but_other_brackets_stay():
     plan = PL.parse_plan(_plan(ROWS_DONE, conclusion="結論 [a]。"))
     out, _ = PL.compose_with_model_answer(plan, "Aは受付です [a]。配列は x[0] と [注] を使う [b]。\n\n参照した資料:\n- src/a.cbl:12")
-    assert out.startswith("Aは受付です。配列は x[0] と [注] を使う。\n\n参照した資料:")
+    assert out.startswith("Aは受付です [a]。配列は x[0] と [注] を使う [b]。\n\n参照した資料:")
+
+
+def test_compose_keeps_a_bracketed_value_that_equals_a_row_id():
+    plan = PL.parse_plan(_plan("- [x] A1 · k · 対象A · 要: source\n    - source: src/a.cbl:1\n"))
+    out, _ = PL.compose_with_model_answer(plan, "状態 [A1] は保留を表します。")
+    assert out == "状態 [A1] は保留を表します。\n\n参照した資料:\n- src/a.cbl:1"
 
 
 def test_supplement_gaps_are_kept_in_the_info_not_in_the_body():
@@ -377,7 +383,7 @@ def test_supplement_gaps_are_kept_in_the_info_not_in_the_body():
     assert [x["id"] for x in info["format_issues"]] == ["b", "c"]
 
 
-def test_turn_report_keeps_format_issues_out_of_the_answer_counts_and_items(tmp_path):
+def test_turn_report_counts_format_issues_as_unconfirmed_in_the_answer_counts_and_items(tmp_path):
     rows = ("- [ ] a · program · 対象A · 要: source\n- [x] b · program · 対象B · 要: source\n"
             "    - source: src/b.cbl:1\n- [x] c · program · 対象C · 要: source\n"
             "- [-] d · job · 対象D · 要: source\n    - 無い: 探したが無し\n- [x] 壊れた行\n")
@@ -386,11 +392,33 @@ def test_turn_report_keeps_format_issues_out_of_the_answer_counts_and_items(tmp_
     st._investigation_stopped_reason = None
     st._plan_final = PL.read_plan(st._investigation_dir)
     report = PL.turn_report(st)
-    # 記載の不備（c: source 欠落・壊れた行: 形式不正）は件数にも確認できなかった項目にも入れず、別に残す
-    assert report["plan_counts"] == {"total": 3, "confirmed": 1, "unconfirmed": 1, "unstarted": 1}
-    assert [x["item"] for x in report["plan_unverified_items"]] == ["対象A", "対象D"]
+    # 記載の不備（c: source 欠落・壊れた行: 形式不正）も、全行の件数と確認できなかった項目に入れ、調査の記録にも残す
+    assert report["plan_counts"] == {"total": 5, "confirmed": 1, "unconfirmed": 3, "unstarted": 1}
+    assert [x["item"] for x in report["plan_unverified_items"]] == ["対象A", "対象C", "対象D", "壊れた行"]
     assert {x["id"] for x in report["plan_format_issues"]} >= {"c"} and len(report["plan_format_issues"]) == 2
-    assert len(report["unconfirmed_items"]) == 4          # 外部 API 向けの従来の一覧は変えない
+    assert report["plan_unverified_items"] == report["unconfirmed_items"]
+
+
+def test_turn_report_counts_a_source_less_done_row_among_two_needing_source(tmp_path):
+    rows = "- [x] a · k · 対象A · 要: source\n    - source: src/a.cbl:1\n- [x] b · k · 対象B · 要: source\n"
+    st = _St(tmp_path, "本文です。", _plan(rows))
+    st._plan_gate = None
+    st._investigation_stopped_reason = None
+    st._plan_final = PL.read_plan(st._investigation_dir)
+    report = PL.turn_report(st)
+    assert report["plan_counts"] == {"total": 2, "confirmed": 1, "unconfirmed": 1, "unstarted": 0}
+    assert [x["item"] for x in report["plan_unverified_items"]] == ["対象B"]
+
+
+def test_turn_report_does_not_count_body_text_lines_as_items(tmp_path):
+    rows = "対象は次の 2 件。\n- [x] a · k · 対象A · 要: source\n    - source: src/a.cbl:1\n- [x] b · k · 対象B · 要: source\n"
+    st = _St(tmp_path, "本文です。", _plan(rows))
+    st._plan_gate = None
+    st._investigation_stopped_reason = None
+    st._plan_final = PL.read_plan(st._investigation_dir)
+    report = PL.turn_report(st)
+    assert report["plan_counts"] == {"total": 2, "confirmed": 1, "unconfirmed": 1, "unstarted": 0}
+    assert [x["item"] for x in report["plan_unverified_items"]] == ["対象B"]
 
 
 def test_ids_that_look_like_indexes_links_or_code_are_not_removed():
@@ -440,10 +468,10 @@ def test_task_list_checkboxes_stay_when_a_plan_id_is_x():
     assert f(quoted, ids) == "> 引用\n> ```md\n> [a]\n> ```\n>\n>     x = [a]\n> 後\n"    # 引用の中のコードも触らない
 
 
-def test_model_body_keeps_array_subscripts_when_a_plan_id_is_numeric():
+def test_model_body_keeps_brackets_when_a_plan_id_is_numeric():
     plan = PL.parse_plan(_plan("- [x] 0 · k · 対象 · 要: source\n    - source: src/a.cbl:1\n", conclusion="結論 [0]。"))
     out, _ = PL.compose_with_model_answer(plan, "配列は x[0] です [0]。\n\n参照した資料:\n- src/a.cbl:1")
-    assert out.startswith("配列は x[0] です。")
+    assert out.startswith("配列は x[0] です [0]。")
 
 
 @pytest.mark.parametrize("text", ["", "## 母集団\n- [x] 壊れた行\n", "# 見出しだけ\n"])

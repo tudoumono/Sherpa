@@ -22,8 +22,8 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (agentic_search, es_index, graph_coverage, graph_tools, grep_tool, investigation_ledger, scope_infer,
-               tool_call_log, tool_dispatch)
+from . import (agentic_search, es_index, graph_coverage, graph_tools, grep_tool, investigation_ledger, proxy_bypass,
+               scope_infer, tool_call_log, tool_dispatch)
 from .ingest.world_neo4j import GraphSchemaEraError
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -454,7 +454,7 @@ def _coverage_outcome(name: str, result, is_error: bool) -> str | None:
             return "truncated"
         return "hit"
     if name in _ITEM_LIST_TOOLS:
-        return "truncated" if result.get("truncated") else "hit"
+        return "truncated" if (result.get("truncated") or result.get("next_offset") is not None) else "hit"
     if name in ("graph_resolve", "graph_impact"):
         if result.get("error_code"):  # `graph_unavailable`/`graph_internal_error`（isError ではない縮退）
             return "error"
@@ -840,6 +840,29 @@ def _clip_graph_neighbors(result: dict, max_bytes: int):
     return (err, True) if _json_bytes(err) <= max_bytes else None
 
 
+def _clip_glob_paths(result: dict, max_bytes: int):
+    """`glob_search` の結果を、`count`・`generation` などの固定欄を残したまま `paths` の末尾から削って収める。
+    `next_offset` は「そのページの offset＋残した件数」に計算し直す（続きで重複も欠けも出さない）。1 件も収まらなければ `tool_result_budget_too_small`（続きの位置は返さない）。
+    """
+    paths = result.get("paths")
+    if not isinstance(paths, list):
+        return None
+    offset = result.get("offset") if isinstance(result.get("offset"), int) else 0
+    for keep in range(len(paths), 0, -1):
+        r = dict(result)
+        r["paths"] = paths[:keep]
+        if keep < len(paths):
+            r["truncated"] = True
+            r["next_offset"] = offset + keep
+        if _json_bytes(r) <= max_bytes:
+            return r, True
+    if not paths:
+        return None
+    # 1 件も収まらない: 進まない続きの位置は返さず、予算不足として返す
+    err = {"error": "tool_result_budget_too_small", "hint": _TOOL_RESULT_BUDGET_TOO_SMALL_HINT, "offset": offset}
+    return (err, True) if _json_bytes(err) <= max_bytes else None
+
+
 def _clip_tool_result(result, name: str | None = None, args: dict | None = None):
     """1 件あたりのバイト予算を超えた結果を切り詰める（`SHERPA_MCP_TOOL_BUDGET_BYTES` 優先・無ければ `effective_tool_result_max_bytes`）。
     `run_tool` 自身が収まりを保証するため、ここに来るのは通常その保証が効かない極端なケースだけの最終防衛線。
@@ -862,6 +885,8 @@ def _clip_tool_result(result, name: str | None = None, args: dict | None = None)
         structured = graph_tools.fit_to_bytes(result, max_bytes)
     if structured is None and name == "graph_neighbors":
         structured = _clip_graph_neighbors(result, max_bytes)
+    if structured is None and name == "glob_search":
+        structured = _clip_glob_paths(result, max_bytes)
     if structured is None:
         structured = _clip_read_doc_field(result, max_bytes)
     if structured is not None:
@@ -902,11 +927,32 @@ _DUPLICATE_CHECK_EXEMPT_TOOLS = frozenset({"ask_user"}) | _BUDGET_EXEMPT_TOOLS
 _DUPLICATE_REPLAY_TOOLS = frozenset({"graph_impact", "pdf_page_image"})
 
 
+def _glob_key_args(args: dict) -> dict:
+    """`glob_search` の重複のキー用の引数。検索と同じ形にする（pattern は検索と同じ検証・照合の形・offset 0 では offset も generation も見ない）。"""
+    from .parts.read import tools as read_tools
+    out = {k: args[k] for k in ("pattern", "offset", "generation") if k in args}   # 検索が使う引数だけ（未定義の引数は無視する）
+    if isinstance(out.get("pattern"), str):
+        valid = read_tools._validate_glob_pattern(out["pattern"])
+        out["pattern"] = read_tools._glob_match_pattern(valid).lower() if valid is not None else out["pattern"]
+    try:
+        offset = int(out.get("offset") or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    if offset <= 0:
+        out.pop("generation", None)
+        out.pop("offset", None)
+    else:
+        out["offset"] = offset
+    return out
+
+
 def _dedup_key(name: str, args) -> tuple | None:
     """重複判定と結果区分キャッシュが共有する正規化キー。`item`（台帳の項目 id）は除く。直列化できない引数は `None`（同一性を判定できない・fail-open）。"""
     try:
         _key_args = ({k: v for k, v in args.items() if k != "item"}
                     if isinstance(args, dict) else args)
+        if name == "glob_search" and isinstance(_key_args, dict):
+            _key_args = _glob_key_args(_key_args)
         return (name, json.dumps(_key_args, sort_keys=True, ensure_ascii=False))
     except TypeError:
         return None
@@ -926,6 +972,17 @@ def _is_duplicate_tool_call(name: str, args: dict) -> bool:
     if len(_seen_tool_calls) > _DUPLICATE_CALL_CACHE_MAX:
         _seen_tool_calls.popitem(last=False)
     return False
+
+
+def _forget_glob_first_page(args: dict) -> None:
+    """`glob_search` が generation の違いを返したとき、先頭ページ（offset 0・generation なし）の重複のキーを消し、取り直しを通す。ほかの呼び出しのキーは消さない。"""
+    if not isinstance(args, dict):
+        return
+    base = {k: v for k, v in args.items() if k not in ("offset", "generation")}
+    for cand in (base, {**base, "offset": 0}):
+        key = _dedup_key("glob_search", cand)
+        if key is not None:
+            _seen_tool_calls.pop(key, None)
 
 
 def _record_duplicate_item_coverage(name: str, args: dict) -> None:
@@ -1034,6 +1091,8 @@ def _handle_tool_call(rid, params: dict) -> dict:
         return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                          "isError": True})
     is_error = bool(isinstance(result, dict) and result.get("error"))
+    if name == "glob_search" and is_error and result.get("error") == "glob_generation_mismatch":
+        _forget_glob_first_page(args)
     _sidecar_error_code(name, result)
     # `run_tool()` 自身が内部で行った打ち切りをサイドカーへ記録する（API 経路の `agentic_search._SEARCH_TRUNCATED_TOOLS`/`_BYTE_CLIP_TOOLS` と同じ判定キー・語彙）。`_tool_result_clipped_recorded` は 1 回の呼び出しで `tool_result_clipped` を二重に書かないためのフラグ。
     _tool_result_clipped_recorded = False
@@ -1066,9 +1125,18 @@ def _handle_tool_call(rid, params: dict) -> dict:
         is_error = is_error or bool(isinstance(result, dict) and result.get("error"))
     # `item` 付き呼出しの結果区分を台帳へ記録する（Codex へ返す最終形＝クリップ後の `result`/`is_error` を使う）。
     _record_item_coverage(name, args, result, is_error)
-    # MCP 標準＝content[].text。Codex が読む本文は run_tool の結果。
+    # MCP 標準＝content[].text。Codex が読む本文は run_tool の結果。外へ出る最後の網として、管理者の除外の資料を落とす（設定が無ければそのまま）。
+    from . import path_rules
+    result = path_rules.filter_output(result, _world())
+    _recount_returned_docs(result)
     text = json.dumps(result, ensure_ascii=False)
     return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": is_error})
+
+
+def _recount_returned_docs(result) -> None:
+    """最終のクリップと管理者の除外の濾過の後に `returned_docs` を数え直す（`parts.read.tools.recount_returned_docs`）。"""
+    from .parts.read.tools import recount_returned_docs
+    recount_returned_docs(result)
 
 
 _call_log_writer: tool_call_log.CallLogWriter | None = None
@@ -1209,4 +1277,5 @@ def serve(stdin=None, stdout=None) -> None:
 
 
 if __name__ == "__main__":
+    proxy_bypass.apply({})  # 設定 DB には繋がない（親が組んだ NO_PROXY を使う）
     serve()

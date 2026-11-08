@@ -239,7 +239,7 @@ def test_expired_folder_scan_is_partial_keeps_ledger_folders_and_is_reused_per_g
 
     _generation(monkeypatch, synced_at="t2")
     again = ps.build_preview(world)
-    assert again["folders_partial"] is False and again["importance_diagnostics"]
+    assert again["folders_partial"] is False and "importance_diagnostics" not in again
 
 
 def test_scan_without_a_generation_is_never_reused(world, monkeypatch):
@@ -250,7 +250,7 @@ def test_scan_without_a_generation_is_never_reused(world, monkeypatch):
     assert ps.build_preview(world)["folders_partial"] is False
 
 
-def test_folder_scan_rules_and_diagnostics_survive_the_folder_limit(world, monkeypatch, tmp_path):
+def test_folder_scan_rules_survive_the_folder_limit(world, monkeypatch, tmp_path):
     _generation(monkeypatch)
     wd = tmp_path / "world"
     (wd / "link_target").mkdir()
@@ -265,8 +265,7 @@ def test_folder_scan_rules_and_diagnostics_survive_the_folder_limit(world, monke
     assert out["folders_truncated"] is True and out["folders_partial"] is False
     assert len(out["folders"]) >= 2
     assert not any(f.startswith((".", "link/")) or f == "link" or "/.git" in f for f in out["folders"])
-    assert {d["config_path"] for d in out["importance_diagnostics"]} == {
-        "gen1/" + importance.CONTROL_FILENAME, ".hidden/" + importance.CONTROL_FILENAME}
+    assert "importance_diagnostics" not in out
 
 
 def test_folder_scan_lists_empty_folders_without_a_ledger(world, monkeypatch, tmp_path):
@@ -275,3 +274,15 @@ def test_folder_scan_lists_empty_folders_without_a_ledger(world, monkeypatch, tm
     out = ps.build_preview(world)
     assert "empty_dir" in out["folders"] and "gen1/design/sub" in out["folders"]
     assert "gen1/.git" not in out["folders"]
+
+
+def test_scan_folders_does_not_walk_the_archives_dir(world, monkeypatch, tmp_path):
+    """アーカイブの展開先は歩かない（歩くと単一 worker を占有し、集めるものも無いのに partial を誤って立てる）。"""
+    arch = worlds.archives_dir(world)
+    (arch / "展開先").mkdir()
+    walked = []
+    real = ps._scan_tree
+    monkeypatch.setattr(ps, "_scan_tree", lambda top, *a, **kw: walked.append(str(top)) or real(top, *a, **kw))
+    out = ps.scan_folders(world, worlds.world_dir(world), time.monotonic() + 10)
+    assert walked == [str(worlds.world_dir(world))]
+    assert not out["partial"]

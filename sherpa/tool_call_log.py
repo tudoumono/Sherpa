@@ -68,7 +68,7 @@ def summarize_result(name: str, args, result, is_error: bool, detail: dict, scor
     res = result if isinstance(result, dict) else None
     truncated = False
     if res is not None:
-        truncated = any(res.get(k) for k in _TRUNC_FLAGS)
+        truncated = any(res.get(k) for k in _TRUNC_FLAGS) or (name == "glob_search" and res.get("next_offset") is not None)
         cov = res.get("coverage")
         if isinstance(cov, dict) and cov.get("complete") is False:
             truncated = True
@@ -91,6 +91,8 @@ def summarize_result(name: str, args, result, is_error: bool, detail: dict, scor
         if isinstance(res.get(key), list):
             count = len(res[key])
             break
+    if name == "glob_search" and isinstance(res.get("paths"), list):
+        count = len(res["paths"])  # ページで返した件数（総数×ページ数に水増ししない）
     if count is None and _is_int(res.get("count")):
         count = res["count"]
     if count is None:

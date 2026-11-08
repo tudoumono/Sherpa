@@ -1108,7 +1108,7 @@ class FsListResponse(BaseModel):
 
 
 # ---- GET /ingest/preview ----
-# response_model は付与しない（`documents[].provenance`・`documents[].importance` が条件付きキーのため。TypeAdapter 契約のみ）
+# response_model は付与しない（`documents[].provenance` が条件付きキーのため。TypeAdapter 契約のみ）
 
 class IngestPreviewDocument(BaseModel):
     name: str
@@ -1123,9 +1123,6 @@ class IngestPreviewDocument(BaseModel):
     label: str
     reason: str | None
     provenance: dict[str, Any] | None = None
-    importance: Literal["高", "中", "低"] | None = None
-    importance_reason: str | None = None
-    importance_source: str | None = None
 
 
 class IngestPreviewEntity(BaseModel):
@@ -1158,15 +1155,6 @@ class IngestPreviewCounts(BaseModel):
     documents: int
 
 
-class ImportanceDiagnostic(BaseModel):
-    """`_重要度.txt` の構文診断1件。"""
-    config_path: str
-    line: int | None
-    column: int
-    code: str
-    message: str
-
-
 class IngestPreviewResponse(BaseModel):
     """取り込みのプレビュー（GET /ingest/preview）。response_model は付与しない（条件付きキーのため）。
     要素・関係・警告は常に空（`GET /ingest/preview/graph` が返す）。`documents_note` は一覧を出せない理由、`folders_partial` はフォルダの走査が期限で止まったこと。"""
@@ -1177,7 +1165,6 @@ class IngestPreviewResponse(BaseModel):
     issues: list[Any]
     entities: list[IngestPreviewEntity]
     relations: list[IngestPreviewRelation]
-    importance_diagnostics: list[ImportanceDiagnostic]
     graph_note: str | None = None
     documents_note: str | None = None
     folders_partial: bool = False
@@ -1554,3 +1541,30 @@ class AdminFeedbackItemsResponse(BaseModel):
     """評価の一覧（GET /admin/feedback/items）。"""
     items: list[FeedbackItem]
     next_before: int | None
+
+
+class ConnectivityCheckRequest(BaseModel):
+    include_paid: bool = False
+
+
+class ConnectivityResult(BaseModel):
+    id: str
+    label: str
+    status: Literal["ok", "ng", "skipped", "incomplete"]
+    route: str | None = None
+    host: str | None = None
+    elapsed_ms: int = 0
+    reason: str | None = None
+    paid: bool = False
+    note: str | None = None
+
+
+class ConnectivityPath(BaseModel):
+    path: str
+    label: str
+    results: list[ConnectivityResult]
+
+
+class ConnectivityCheckResponse(BaseModel):
+    """つながりの確認の結果（POST /admin/connectivity/check）。"""
+    paths: list[ConnectivityPath]

@@ -160,16 +160,17 @@ def test_plan_style_summary_shows_counts_and_unconfirmed_items_and_keeps_quality
     """計画書の方式（C-check）でも、件数 1 項目と確認できなかった項目を要約に出す（秘匿名は件数だけ）。主張を推定に下げた知らせも残す。"""
     env = {"headline": "回答", "limits": {"claims_unmatched": 1, "search_truncated": 3},
            "investigation": {"ledger": "plan", "plan_counts": {"total": 5, "confirmed": 2, "unconfirmed": 2, "unstarted": 1},
-                             "plan_unverified_items": [{"item": "対象A", "reason": "範囲外"}, {"item": "credentials.xlsx", "reason": "無い"}],
-                             "plan_format_issues": [{"item": "対象F", "reason": "行の書式または打ち切りの理由が読み取れません"}],
-                             "unconfirmed_items": [{"item": "対象F", "reason": "計画書の形式・id または打ち切りの理由が不正です"}]}}
+                             "plan_unverified_items": [{"item": "対象A", "reason": "範囲外"}, {"item": "credentials.xlsx", "reason": "無い"},
+                                                       {"item": "対象F", "reason": "記載の形が読み取れず、確かめられませんでした"}],
+                             "unconfirmed_items": [{"item": "対象G", "reason": "別の一覧"}]}}
     texts = [(i["label"], i["text"]) for i in answer_shape.seal(env)["investigation_summary"]["items"]]
     assert ("調べた項目", "対象 5 件のうち、確かめた 2 件・確かめられなかった 2 件・未着手 1 件") in texts
     assert ("確認できなかった項目", "対象A（範囲外）") in texts
     assert ("確認できなかった項目", "名前を表示できない項目 1 件") in texts and not any("credentials" in t for _l, t in texts)
     assert ("打ち切り", "調べた記録と合わない主張があったため、「推定」に下げています。") in texts
     assert not any("検索の結果が多く" in t for _l, t in texts)
-    assert not any("対象F" in t or "計画書の形式" in t for _l, t in texts)    # 計画書の記載の不備は回答に出さない
+    assert ("確認できなかった項目", "対象F（記載の形が読み取れず、確かめられませんでした）") in texts    # 記載の不備の行も出す
+    assert not any("対象G" in t for _l, t in texts)
 
 
 def test_search_cutoff_is_shown_with_what_to_do_only_for_exhaustive_requests():
