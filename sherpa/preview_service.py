@@ -1,4 +1,4 @@
-"""取り込み・抽出プレビュー（読み取り専用）。資料の一覧・フォルダ・重要度の診断（`build_preview`）と、資料フォルダのグラフ
+"""取り込み・抽出プレビュー（読み取り専用）。資料の一覧・フォルダ（`build_preview`）と、資料フォルダのグラフ
 （`world_graph.build_world`）の要素・関係・件数（`build_preview_graph`）を画面が描ける形に整形する。Neo4j は使わず、書き込みもしない。
 資料の一覧は取り込みの台帳から出し、台帳が空のときだけ期限つきで資料フォルダを歩く。グラフは画面が求めたときだけ組み立てる。
 取り込み中・一度も完了していない資料フォルダ・資料が多い資料フォルダではグラフを組み立てず、件数は取り込みの記録から出す。
@@ -6,7 +6,6 @@
 """
 from __future__ import annotations
 
-import dataclasses
 import os
 import stat
 import threading
@@ -62,7 +61,7 @@ def _preview_entities_relations(nodes, edges) -> tuple[list, list]:
 
 
 # 資料フォルダ → グラフ構築結果のプロセス内キャッシュ（単一 worker 前提）。
-# キャッシュ対象はグラフ構築のみ（文書一覧・重要度・診断は毎回計算する）
+# キャッシュ対象はグラフ構築のみ（文書一覧は毎回計算する）
 _GRAPH_VIEW_CACHE: dict[str, dict] = {}
 
 # miss 時の構築を 1 本のロックで直列化する（single-flight）
@@ -118,7 +117,7 @@ class _GraphTooLarge(Exception):
 def _build_full_view(world: str, status: dict) -> dict:
     """グラフを 1 回構築する。
     登録済みで `root_path` が到達可能なら、構築全体をその root に `pin_world_root` で固定する。戻り値 `resolved` が False の結果はキャッシュへ公開しない。
-    pin 済み root から `safe_files` を 1 回だけ materialize し、構築と文書列挙・重要度解決・診断で使い回す。
+    pin 済み root から `safe_files` を 1 回だけ materialize し、構築と文書列挙で使い回す。
     """
     resolved = _resolved_root(status["root_path"])
 
@@ -263,17 +262,12 @@ def _with_ancestors(folders) -> frozenset:
 
 
 def _ledger_row_view(r: dict) -> tuple[dict, str | None]:
-    """台帳の 1 行 → (状態以外の画面の行, 台帳の status)。範囲メタは名前から導き、重要度は台帳の列をそのまま通す。派生 MD があれば読み取り方法の要約（`provenance`）を付ける。"""
+    """台帳の 1 行 → (状態以外の画面の行, 台帳の status)。範囲メタは名前から導く。派生 MD があれば読み取り方法の要約（`provenance`）を付ける。"""
     name = r["name"]
     meta = si.rel_scope_meta(name)
     out = {"name": name, "doctype": r.get("doctype"), "branch": r.get("branch"), "analyzer": None,
            "top_scope": meta["top_scope"], "phase": meta["phase"], "category": meta["category"],
            "folder": "/".join(name.split("/")[:-1])}
-    if r.get("importance") is not None:
-        out["importance"] = r["importance"]
-        out["importance_source"] = r.get("importance_source")
-        if r.get("importance_reason"):
-            out["importance_reason"] = r["importance_reason"]
     prov = corpus_docs.provenance_summary(r.get("md_path"))
     if prov:
         out["provenance"] = prov
@@ -348,7 +342,7 @@ def _row_with_state(row: dict, status: str | None, blocked) -> dict:
     return {**row, "state": state, "label": _STATE_LABELS[state], "reason": reason}
 
 
-def _preview_documents(world: str, root, sig: str) -> tuple[list, frozenset, str | None]:
+def _preview_documents(world: str, root) -> tuple[list, frozenset, str | None]:
     """画面の資料の一覧と、その資料のフォルダ、一覧を出せない理由。
     台帳があれば台帳だけから出す（資料フォルダは歩かない）。台帳が空（一度も取り込んでいない）ときだけ、期限つきで資料フォルダを歩いて分類する。
     期限を超えたときは一覧を空にして理由（平文）を返す。
@@ -363,7 +357,7 @@ def _preview_documents(world: str, root, sig: str) -> tuple[list, frozenset, str
         files = list(si.safe_files(root, deadline=si.user_op_deadline(), also=worlds.archives_dir(world)))
     except si.ScopeWalkDeadlineExceeded:
         return [], frozenset(), _NOTE_LIST_PENDING
-    docs = doc_ledger.preview_documents(world, root=root, files=files, sig=sig or None)
+    docs = doc_ledger.preview_documents(world, root=root, files=files)
     return docs, _with_ancestors({d["folder"] for d in docs}), None
 
 
@@ -372,15 +366,14 @@ _DEADLINE_CHECK_ENTRIES = 256  # フォルダ内のエントリを数えなが�
 
 
 def _scan_tree(top, deadline: float, *, listing: bool, out: dict) -> bool:
-    """`top` 配下を 1 回歩き、フォルダ（`listing` のとき）と重要度の設定ファイルの診断を `out` に足す。期限を超えたら歩くのをやめて False（歩き終えたら True）。
+    """`top` 配下を 1 回歩き、フォルダ（`listing` のとき）を `out` に足す。期限を超えたら歩くのをやめて False（歩き終えたら True）。
     シンボリックリンクは辿らない・版管理の記録のフォルダには入らない・読めないフォルダは飛ばす。
-    フォルダの一覧には名前が `.` で始まるフォルダとその配下を出さない（重要度の設定ファイルは、そこでも探す）。
+    フォルダの一覧には名前が `.` で始まるフォルダとその配下を出さない。
     """
     top = Path(top)
     try:
         if not stat.S_ISDIR(os.lstat(top).st_mode):
             return True
-        top_resolved = top.resolve()
     except OSError:
         out["root_unreadable"] = True
         return True
@@ -413,29 +406,18 @@ def _scan_tree(top, deadline: float, *, listing: bool, out: dict) -> bool:
                         else:
                             out["folders"].append(Path(e.path).relative_to(top).as_posix())
                     stack.append((Path(e.path), child_listed))
-                elif importance.is_importance_control_path(e.name) and e.is_file(follow_symlinks=False):
-                    p = Path(e.path)
-                    if text_kind.is_noise(p.name, p.suffix.lower()):
-                        continue
-                    rp = p.resolve()
-                    if rp.is_relative_to(top_resolved):
-                        _rules, diags = importance.parse_control_file(rp, config_rel=p.relative_to(top).as_posix())
-                        out["diagnostics"].extend(dataclasses.asdict(d) for d in diags)
             except OSError:
                 continue
     return True
 
 
-def scan_folders_and_diagnostics(world: str, root, deadline: float) -> dict:
-    """資料フォルダを 1 回歩き、フォルダの木と重要度の設定ファイルの診断をまとめて集める。期限を超えたらそこまでの結果を `partial=True` で返す。
-    戻り値: `{"folders": 並べたフォルダ, "folders_truncated": 上限で打ち切ったか, "partial": 期限で止まったか, "diagnostics": [...], "root_unreadable": 読めなかったか}`。
-    フォルダの木は `root` だけ（アーカイブの展開先は出さない）。診断は展開先の設定ファイルも対象にする。
+def scan_folders(world: str, root, deadline: float) -> dict:
+    """資料フォルダを 1 回歩き、フォルダの木を集める。期限を超えたらそこまでの結果を `partial=True` で返す。
+    戻り値: `{"folders": 並べたフォルダ, "folders_truncated": 上限で打ち切ったか, "partial": 期限で止まったか, "root_unreadable": 読めなかったか}`。
+    フォルダの木は `root` だけ（アーカイブの展開先は出さない）。
     """
-    out = {"folders": [], "folders_truncated": False, "diagnostics": [], "root_unreadable": False}
+    out = {"folders": [], "folders_truncated": False, "root_unreadable": False}
     complete = _scan_tree(root, deadline, listing=True, out=out)
-    archives = worlds.archives_dir(world)
-    if complete and archives is not None and Path(archives).is_dir():
-        complete = _scan_tree(archives, deadline, listing=False, out=out)
     out["folders"] = sorted(out["folders"])
     out["partial"] = not complete or out["root_unreadable"]
     return out
@@ -446,12 +428,12 @@ _SCAN_CACHE: dict[str, tuple[tuple, dict]] = {}
 _SCAN_LOCKS: dict[str, threading.Lock] = {}
 
 
-def _folders_and_diagnostics(world: str, root, status: dict) -> dict:
-    """`scan_folders_and_diagnostics` を世代ごとに 1 回だけ行って使い回す（`sig` が空の間と、`root` を読めなかったときは使い回さない）。
+def _folders(world: str, root, status: dict) -> dict:
+    """`scan_folders` を世代ごとに 1 回だけ行って使い回す（`sig` が空の間と、`root` を読めなかったときは使い回さない）。
     同じ世代の走査は資料フォルダごとのロックで 1 本にする。期限は `scope_infer.user_op_deadline()`。
     """
     if not root:
-        return {"folders": [], "folders_truncated": False, "partial": False, "diagnostics": [], "root_unreadable": False}
+        return {"folders": [], "folders_truncated": False, "partial": False, "root_unreadable": False}
     key = (status["sig"], status["synced_at"])
     cacheable = bool(status["sig"])
     if cacheable:
@@ -463,24 +445,24 @@ def _folders_and_diagnostics(world: str, root, status: dict) -> dict:
             hit = _SCAN_CACHE.get(world)
             if hit is not None and hit[0] == key:
                 return hit[1]
-        scan = scan_folders_and_diagnostics(world, root, si.user_op_deadline())
+        scan = scan_folders(world, root, si.user_op_deadline())
         if cacheable and not scan["root_unreadable"]:
             _SCAN_CACHE[world] = (key, scan)
         return scan
 
 
 def build_preview(world: str | None = None) -> dict:
-    """抽出プレビュー（読み取り専用）。資料の一覧・フォルダ・重要度の診断と、取り込みの記録の件数を返す。要素・関係は返さない（`build_preview_graph`）。
+    """抽出プレビュー（読み取り専用）。資料の一覧・フォルダと、取り込みの記録の件数を返す。要素・関係は返さない（`build_preview_graph`）。
     資料の一覧は台帳から出し（資料フォルダの世代ごとに使い回す）、台帳が空のときだけ期限つきで資料フォルダを歩く（期限を超えたら一覧は空にして `documents_note` に理由を返す）。
-    フォルダの木と重要度の診断は期限つきの 1 回の走査で集める（止まったら `folders_partial`）。台帳の資料のフォルダは必ず木に入れる。
+    フォルダの木は期限つきの 1 回の走査で集める（止まったら `folders_partial`）。台帳の資料のフォルダは必ず木に入れる。
     `graph_note` は要素・関係を今は組み立てられない理由（取り込み中など）で、組み立てられるなら None。
     """
     world = world or worlds.default_world()
     status = _current_world_status(world)
     sig = status["sig"]
     wd = worlds.world_dir(world)
-    preview_docs, doc_folders, docs_note = _preview_documents(world, wd, sig)
-    scan = _folders_and_diagnostics(world, wd, status)
+    preview_docs, doc_folders, docs_note = _preview_documents(world, wd)
+    scan = _folders(world, wd, status)
     return {"world": world, "label": worlds.world_label(world),
             "counts": _recorded_counts(world, len(preview_docs)),
             "documents": preview_docs, "documents_note": docs_note,
@@ -488,9 +470,7 @@ def build_preview(world: str | None = None) -> dict:
             "folders": sorted(set(scan["folders"]) | doc_folders),
             "folders_truncated": scan["folders_truncated"], "folders_partial": scan["partial"],
             "issues": [], "entities": [], "relations": [],
-            "graph_note": _hold_graph_note(world, sig),
-            # `importance_diagnostics`: 重要度設定ファイルの構文診断（`issues` はグラフ構築の警告で別物）
-            "importance_diagnostics": scan["diagnostics"]}
+            "graph_note": _hold_graph_note(world, sig)}
 
 
 def build_preview_graph(world: str | None = None) -> dict:

@@ -43,7 +43,6 @@ def tree(tmp_path, monkeypatch):
     monkeypatch.setattr(worlds, "world_dir", lambda w: root if w == _W else None)
     monkeypatch.setattr(worlds, "archives_dir", lambda w: arch)
     monkeypatch.setattr(CS.store, "get_world_status_row", lambda w: None)
-    monkeypatch.setattr(CS.importance, "resolve_many", lambda w, rels, root=None, sig=None: {})
     return root
 
 

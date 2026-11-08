@@ -1151,7 +1151,8 @@ def ext_search(req: ExtSearchReq, request: Request, key: dict = Depends(require_
         if not all(complete.values()):
             # 打ち切りのあったエンジンがあるときだけ、エンジンごとの調べ切れ（`complete`）を残す（既定の要求の詳細は今と同じ）
             audit.detail["coverage_complete"] = complete
-        return {"world": req.world, "query": req.query, **res}
+        from sherpa import path_rules  # 外へ出る境界の最後の網（管理者の除外の資料を落とす・設定が無ければそのまま）
+        return path_rules.filter_output({"world": req.world, "query": req.query, **res}, req.world)
 
 
 # ==== 出典（sources）共通モデル（`C-EXT-ANSWER-01`／Codex ジョブ結果と共有）====
@@ -1164,6 +1165,7 @@ class ExtSourceItem(BaseModel):
     """
     doc_id: str
     locator: str | None = None
+    note: str | None = None  # 利用者の範囲の外にある、管理者が「範囲の外でも読む」優先にしている資料への注記（無ければ省く）
 
 
 # ==== POST /ext/v1/answer（簡易チャットの同期応答・`C-EXT-ANSWER-01`）====
@@ -1261,7 +1263,8 @@ def ext_answer(req: ExtAnswerReq, request: Request, key: dict = Depends(require_
             raise HTTPException(503, str(e)) from None
         audit.detail.update({"tool_calls": result["tool_calls"], "unconfirmed": result["unconfirmed"],
                              "result_count": len(result["sources"])})
-        return result
+        from sherpa import path_rules
+        return path_rules.filter_output(result, req.world)
 
 
 # ==== Codex ジョブ（非同期・`C-EXT-CODEXJOB-*`）====
@@ -1466,10 +1469,12 @@ def ext_codex_job_result(job_id: str, request: Request, key: dict = Depends(requ
             # 契約どおりの形（`{"status", "error_code"?}`）をそのまま返すため `JSONResponse` を直接使う（`HTTPException` だと `{"detail": body}` に包まれる）
             audit.business_outcome = "failed"
             return JSONResponse(status_code=409, content=body)
-        return {"answer": job.get("answer") or "", "sources": list(job.get("sources") or []),
-                "unconfirmed_items": list(job.get("unconfirmed_items") or []),
-                "elapsed_ms": job.get("elapsed_ms") or 0,
-                "investigation": job.get("investigation")}
+        from sherpa import path_rules
+        return path_rules.filter_output(
+            {"answer": job.get("answer") or "", "sources": list(job.get("sources") or []),
+             "unconfirmed_items": list(job.get("unconfirmed_items") or []),
+             "elapsed_ms": job.get("elapsed_ms") or 0,
+             "investigation": job.get("investigation")}, job.get("world") or "")
 
 
 # ---- POST /codex/jobs/{job_id}/cancel（取消）----
@@ -1983,6 +1988,13 @@ def ext_doc(request: Request, world: str = Query(..., min_length=1, max_length=1
         audit.detail.update({"world": world, "path": path})
         _enforce_world_scope(request, key, world)  # scope 外は世界の存在有無を明かさず先に 403
         ext = Path(path).suffix.lower()
+        from sherpa import path_rules
+        try:
+            hidden = path_rules.rules_for(world).excluded(path)
+        except path_rules.PathRulesUnavailable:
+            raise HTTPException(503, path_rules.UNAVAILABLE_MESSAGE)
+        if hidden:  # 管理者が検索から外している資料は配らない（存在を示さず 404）
+            raise HTTPException(404, "文書が見つかりません（パス不一致／未実在）")
         # `allow_content_sniff=True`（単発の解決のため軽量テキスト枠の第2段も内容を読んで判定する）。`status_document_reachable` が `True` のときだけ配信し、
         # 判定不能（`None`）は拒否する（fail-closed。配信側の open 経路は判定側と長さ制約が異なるため）
         if corpus_docs.status_document_reachable(path, world, allow_content_sniff=True) is not True:

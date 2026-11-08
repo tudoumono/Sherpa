@@ -73,17 +73,30 @@ def test_safe_share_answer_passes_scope_with_layer_wholesale():
     assert store._safe_share_answer({"lens": "qa", "headline": "h", "scope": scope})["scope"] == scope
 
 
-def test_importance_fields_kept_in_both_paths_but_not_source():
-    """importance/importance_reason は両経路（allowlist／denylist）で出し、importance_source は
-    allowlist 経路では出さない。"""
+@pytest.mark.parametrize("via", [_via_safe, _via_strip], ids=["sanitized_share", "received_share"])
+def test_importance_fields_not_shared_in_either_path(via):
+    """過去に保存された回答の出典に importance 系の欄があっても、両経路（allowlist／denylist）で出さない。"""
     answer = {"lens": "qa", "headline": "h",
               "sources": [{"doc_id": "real.md", "download_url": "/x", "importance": "高",
                            "importance_reason": "契約書", "importance_source": "_重要度.txt:1行目"}]}
-    s = _via_safe(answer)["sources"][0]
-    assert s["importance"] == "高" and s["importance_reason"] == "契約書"
-    assert "importance_source" not in s
-    stripped = _via_strip(answer)["sources"][0]
-    assert stripped["importance"] == "高" and stripped["importance_reason"] == "契約書"
+    s = via(answer)["sources"][0]
+    assert s["doc_id"] == "real.md"
+    assert not {"importance", "importance_reason", "importance_source"} & set(s)
+
+
+@pytest.mark.parametrize("via", [_via_safe, _via_strip], ids=["sanitized_share", "received_share"])
+def test_importance_fields_not_shared_from_answer_data_rows(via):
+    """過去に保存された回答の data（citations/candidates/items/presumed）の行に重要度の欄があっても、両経路で出さない。"""
+    imp = {"importance": "高", "importance_reason": "契約書", "importance_source": "x:1", "importance_mixed": True}
+    out = via({"lens": "impact", "headline": "h", "data": {
+        "citations": [{"doc_id": "real.md", **imp}],
+        "candidates": [{"name": "ORDER-MAIN", "source": "grep", "evidence": {"edges": [], "grep": []}, **imp}],
+        "items": [{"name": "ORDER-MAIN", "evidence": [], **imp}],
+        "presumed": [{"name": "BILLGEN", "evidence": [], **imp}]}})
+    data = out["data"]
+    for k in ("citations", "candidates", "items", "presumed"):
+        assert data[k] and not set(imp) & set(data[k][0]), k
+    assert data["items"][0]["name"] == "ORDER-MAIN"
 
 
 @pytest.mark.parametrize("via", [_via_safe, _via_strip], ids=["sanitized_share", "received_share"])

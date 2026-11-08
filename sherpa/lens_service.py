@@ -6,20 +6,21 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 
 from neo4j import Query
 from neo4j.exceptions import Neo4jError
 
-from . import citations, graph_coverage, scope
+from . import citations, graph_coverage, path_rules, scope
 from .env_int import env_int
 from .graph_coverage import Coverage
 from .grep_tool import grep_search
 from .impact_service import CATEGORY, plugin_failed_note, source_unparsed_note
 from .ingest.world_neo4j import (
-    EDGE_SOURCE_FIELDS, EDGE_SOURCES_RETURN_DEFAULT, EDGE_SOURCES_RETURN_MAX, GraphQueryOverloadError, GraphSchemaEraError, _member_scope_pred,
-    _member_visible_path, _scope_pred, _sensitive_name_params,
+    EDGE_SOURCE_FIELDS, EDGE_SOURCES_RETURN_DEFAULT, EDGE_SOURCES_RETURN_MAX, GraphQueryOverloadError, GraphSchemaEraError, _member_scope_pred, member_scope_visible,
+    _member_visible_path, _scope_pred, _sensitive_name_params, exclude_edge_expr, exclude_expr, exclude_node_expr, exclude_scope,
     _flow_edge_pred, _flow_node_path, _safe_flow_edge,
     check_schema_era, edge_view, limit_edge_sources, read_plugin_failures, read_unparsed_sources,
     read_unresolved)
@@ -116,15 +117,17 @@ def _anchor_breadth(session, world, match_where: str, prefixes, kind, cap: int, 
                     include_deprecated: bool = False, **params) -> dict:
     """当てはまる起点（`match_where` を満たす範囲内・たどる status のノード）の件数を、トップフォルダごと・種類（ラベル）ごとに数える（集計だけでたどらない）。
     数えられなかったとき（時間切れ）は `anchors` が None。"""
+    x_expr, x_params = exclude_node_expr(world, "n")  # 除外の資料のフォルダ名・件数を内訳に出さない（所属ごとに判定）
+    x_mem, _ = exclude_expr(world, "mpath")  # 代表のパスは除外でない所属から選ぶ
     rows = _run_capped(
         session,
-        f"MATCH (n:Entity {{world_id:$w}}) WHERE {_member_scope_pred('n')} AND ($kind='' OR $kind IN labels(n)) "
+        f"MATCH (n:Entity {{world_id:$w}}) WHERE {member_scope_visible(world, 'n')} AND ($kind='' OR $kind IN labels(n)) "
         f"AND {_ANCHOR_STATUS} AND ({match_where}) "
-        f"WITH n, {_member_visible_path('n')} AS vpath "
+        f"AND {x_expr} WITH n, {_member_visible_path('n', excl=x_mem)} AS vpath "
         "RETURN CASE WHEN vpath IS NULL THEN '(不明)' WHEN vpath CONTAINS '/' THEN split(vpath,'/')[0] "
         "  ELSE '(直下)' END AS folder, [l IN labels(n) WHERE l<>'Entity'][0] AS label, count(n) AS c",
         log_world=world, w=world, prefixes=list(prefixes or []), kind=kind or "", incl=include_deprecated,
-        **_sensitive_name_params(),
+        **_sensitive_name_params(), **x_params,
         coverage=coverage, stage=graph_coverage.STAGE_ANCHOR, **params)
     by_folder: dict[str, int] = {}
     by_kind: dict[str, int] = {}
@@ -203,13 +206,14 @@ def resolve_anchor(session, text, world, scope_prefixes=None, coverage: Coverage
                    cap: int | None = None, include_deprecated: bool = False):
     """症状文 → グラフ上のアンカー `[(cid, name)]`（入力に現れるノード名で同定・範囲内・たどる status）。`kind`＝種類（ラベル）で絞る。
     名前の一致は Cypher 側で判定する。`cap` を渡すと一致する起点を `cap+1` 件だけ取る（呼び出し側が超過を見る）。"""
+    x_expr, x_params = exclude_node_expr(world, "n")  # 管理者の除外の資料のノードは起点にしない
     rows = _run_capped(
         session,
-        f"MATCH (n:Entity {{world_id:$w}}) WHERE {_member_scope_pred('n')} AND ($kind='' OR $kind IN labels(n)) "
-        f"AND {_ANCHOR_STATUS} AND {_ANCHOR_NAME_IN_TEXT} "
+        f"MATCH (n:Entity {{world_id:$w}}) WHERE {member_scope_visible(world, 'n')} AND ($kind='' OR $kind IN labels(n)) "
+        f"AND {_ANCHOR_STATUS} AND {_ANCHOR_NAME_IN_TEXT} AND {x_expr} "
         "RETURN DISTINCT n.canonical_id AS cid, n.name AS name" + (" LIMIT $lim" if cap is not None else ""),
         log_world=world, w=world, prefixes=list(scope_prefixes or []), kind=kind or "", text=text or "",
-        incl=include_deprecated, lim=None if cap is None else cap + 1,
+        incl=include_deprecated, lim=None if cap is None else cap + 1, **x_params,
         coverage=coverage, stage=graph_coverage.STAGE_ANCHOR,
     )
     return [(r["cid"], r["name"]) for r in rows]
@@ -234,43 +238,77 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
         _plugin_failures()
         return []
     from .ingest import text_kind
-    cy = (
-        "MATCH (a:Entity) WHERE a.canonical_id IN $anchors "
-        f"MATCH p=(a)-[r:{_RELATED_REL}*1..%(d)d]-(nb:Entity) "
-        f"WHERE nb.world_id=$world AND nb.canonical_id <> a.canonical_id "
-        f"  AND all(n IN nodes(p) WHERE n.world_id=$world AND "
-        f"CASE WHEN n:Dataset THEN {_flow_node_path('n')} IS NOT NULL ELSE {_scope_pred('n')} END) "  # 経路全体を範囲内に（scope 外を経由させない）
-        "  AND all(e IN relationships(p) WHERE type(e)<>'FLOWS_TO' OR "
-        f"({_flow_edge_pred()} AND {_flow_node_path('startNode(e)')} IS NOT NULL "
-        f"AND {_flow_node_path('endNode(e)')} IS NOT NULL)) "
-        "  AND ($incl OR all(n IN nodes(p) WHERE coalesce(n.status,'active')='active')) "
-        "  AND ($incl OR all(e IN relationships(p) WHERE coalesce(e.status,'active')='active')) "
-        "WITH nb, p ORDER BY length(p) "
-        "WITH nb, head(collect(p)) AS path "
-        "RETURN nb.canonical_id AS cid, nb.name AS name, "
-        "  [l IN labels(nb) WHERE l<>'Entity'][0] AS label, "
-        "  coalesce(nb.status,'active') AS status, "
-        "  [n IN nodes(path) | n.name] AS path_names, "
-        f"  [e IN relationships(path) | {{type:type(e), from:startNode(e).name, to:endNode(e).name, doc:e.doc, line:e.line, {EDGE_SOURCE_FIELDS}}}] AS edges, "
-        "  length(path) AS dist"
-    ) % {"d": int(depth)}
+    x_expr, x_params = exclude_node_expr(world, "n")  # 管理者の除外の資料のノードは、起点にも経路にもしない
+    x_edge, x_edge_params = exclude_edge_expr(world, "e")  # 代表の資料が除外でも、見える根拠が残る辺は通す（行数の天井の前）
+    x_params = {**x_params, **x_edge_params}
+    with exclude_scope(world):
+        cy = (
+            "MATCH (a:Entity) WHERE a.canonical_id IN $anchors "
+            f"MATCH p=(a)-[r:{_RELATED_REL}*1..%(d)d]-(nb:Entity) "
+            f"WHERE nb.world_id=$world AND nb.canonical_id <> a.canonical_id "
+            f"  AND all(n IN nodes(p) WHERE n.world_id=$world AND {x_expr} AND "
+            f"CASE WHEN n:Dataset THEN {_flow_node_path('n')} IS NOT NULL ELSE {_scope_pred('n')} END) "  # 経路全体を範囲内に（scope 外を経由させない）
+            "  AND all(e IN relationships(p) WHERE type(e)<>'FLOWS_TO' OR "
+            f"({_flow_edge_pred()} AND {_flow_node_path('startNode(e)')} IS NOT NULL "
+            f"AND {_flow_node_path('endNode(e)')} IS NOT NULL)) "
+            "  AND ($incl OR all(n IN nodes(p) WHERE coalesce(n.status,'active')='active')) "
+            "  AND ($incl OR all(e IN relationships(p) WHERE coalesce(e.status,'active')='active')) "
+            + (f"  AND all(e IN relationships(p) WHERE {x_edge}) " if x_edge != "true" else "") +
+            "WITH nb, p ORDER BY length(p) "
+            "WITH nb, head(collect(p)) AS path "
+            "RETURN nb.canonical_id AS cid, nb.name AS name, "
+            "  [l IN labels(nb) WHERE l<>'Entity'][0] AS label, "
+            "  coalesce(nb.status,'active') AS status, "
+            "  [n IN nodes(path) | n.name] AS path_names, "
+            f"  [e IN relationships(path) | {{type:type(e), from:startNode(e).name, to:endNode(e).name, doc:e.doc, line:e.line, {EDGE_SOURCE_FIELDS}}}] AS edges, "
+            "  length(path) AS dist"
+        ) % {"d": int(depth)}
     out = []
     rows = _run_capped(session, cy, log_world=world, anchors=list(anchors), world=world,
                        prefixes=list(scope_prefixes or []), incl=include_deprecated,
                        s_exact=sorted(text_kind._SENSITIVE_NAME_EXACT), s_pre=list(text_kind._SENSITIVE_NAME_PREFIXES),
-                       s_ext=sorted(text_kind.SENSITIVE_EXT),
+                       s_ext=sorted(text_kind.SENSITIVE_EXT), **x_params,
                        coverage=coverage, stage=graph_coverage.STAGE_NEIGHBORS)
     check_schema_era(session, world, lens="troubleshoot")
     _plugin_failures()
+    rules = path_rules.rules_for(world)
+    hide = bool(rules.exclude_paths)
+
+    def _clean(e: dict) -> dict:
+        """根拠（本文の抜粋 `evidence_text`・`from_def` を含む）を資料のパス単位で組み直す（`edge_view` が先頭を切る前に除く）。"""
+        if not (hide and e.get("sources")):
+            return e
+        try:
+            srcs = json.loads(e["sources"])
+        except (TypeError, ValueError):
+            srcs = []
+        srcs = [x for x in srcs if not path_rules.source_hidden(rules, x)]
+        # 保存済みの超過の数に除外の根拠が混ざっているか分からない＝捨てて、見える根拠の返す上限の超過だけを数える
+        return {**e, "sources": json.dumps(srcs, ensure_ascii=False) if srcs else None, "sources_overflow": 0}
+
     for r in rows:
+        edges, dropped = [], False
+        for raw in r["edges"]:
+            e = _clean(raw)
+            if hide and path_rules.hidden_doc(rules, raw.get("doc")):
+                # 代表の資料が除外でも、見える根拠が残る辺は、見える根拠の先頭から代表の資料・行を選び直す。無ければ行ごと落とす
+                try:
+                    vis = json.loads(e["sources"]) if e.get("sources") else []
+                except (TypeError, ValueError):
+                    vis = []
+                if not vis:
+                    dropped = True
+                    break
+                e = {**e, "doc": vis[0].get("doc_id") or vis[0].get("file"), "line": vis[0].get("line")}
+            edges.append(edge_view(_safe_flow_edge(e, scope_prefixes) if e["type"] == "FLOWS_TO" else e))
+        if dropped:
+            continue
         out.append({
             "cid": r["cid"], "name": r["name"], "label": r["label"],
             "category": CATEGORY.get(r["label"], r["label"]),
             "status": r["status"],
             "path": r["path_names"], "distance": r["dist"],
-            "edges": limit_edge_sources([
-                edge_view(_safe_flow_edge(e, scope_prefixes) if e["type"] == "FLOWS_TO" else e)
-                for e in r["edges"]], sources_limit),
+            "edges": limit_edge_sources(edges, sources_limit),
         })
     return out
 
@@ -361,7 +399,7 @@ def _troubleshoot_cards(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH,
 
     cards.sort(key=lambda c: (_ROLE_RANK.get(c["label"], 9),
                               c["distance"] if c["distance"] is not None else 99, c["name"]))
-    cards = scope.filter_items(cards, sp)
+    cards = scope.filter_items(cards, sp, path_rules.rules_for(world))
     if truncated_docs:
         coverage.add(graph_coverage.KIND_DOC_SEARCH_TRUNCATED, graph_coverage.STAGE_DOCS)
     out_cards = _Cards(cards, coverage)
@@ -423,7 +461,9 @@ def _attach_unresolved(session, cards, world, anchor_names, scope_prefixes) -> N
     if cards.coverage.has(graph_coverage.KIND_TIMEOUT, graph_coverage.KIND_ROW_CAP):
         return
     try:
-        cards.unresolved = read_unresolved(session, world, sorted(anchor_names), scope_prefixes, fold_case=True)
+        cards.unresolved = path_rules.scrub_unresolved(
+            read_unresolved(session, world, sorted(anchor_names), scope_prefixes, fold_case=True),
+            path_rules.rules_for(world))  # 除外の資料が書いた未解決の参照は出さない
     except GraphQueryOverloadError as e:
         cards.coverage.add(graph_coverage.kind_of_overload(e.reason), graph_coverage.STAGE_NEIGHBORS)
 
@@ -497,12 +537,13 @@ def _resolve_anchor_by_name(session, term, world, scope_prefixes=None, coverage:
     `kind`＝種類（ラベル）で絞る。たどる status の起点だけを数える。`cap`＝起点の数の上限（`cap+1` 件で読むのを止め、超えたら内訳を数えて `AnchorsTooBroad` を送出する）。"""
     sp = list(scope_prefixes or [])
     where = "n.name = $term"
+    x_expr, x_params = exclude_node_expr(world, "n")
     for _ in range(2):
         rows = _run_capped(
             session,
-            f"MATCH (n:Entity {{world_id:$w}}) WHERE {_member_scope_pred('n')} AND ($kind='' OR $kind IN labels(n)) AND {_ANCHOR_STATUS} AND {where} "
+            f"MATCH (n:Entity {{world_id:$w}}) WHERE {member_scope_visible(world, 'n')} AND ($kind='' OR $kind IN labels(n)) AND {_ANCHOR_STATUS} AND {where} AND {x_expr} "
             "RETURN DISTINCT n.canonical_id AS cid, n.name AS name" + (" LIMIT $lim" if cap is not None else ""),
-            log_world=world, w=world, prefixes=sp, term=term, kind=kind or "", incl=include_deprecated, lim=None if cap is None else cap + 1,
+            log_world=world, w=world, prefixes=sp, term=term, kind=kind or "", incl=include_deprecated, lim=None if cap is None else cap + 1, **x_params,
             coverage=coverage, stage=graph_coverage.STAGE_ANCHOR,
         )
         if rows:
@@ -552,7 +593,7 @@ def neighbor_cards_graph_only(world, term, scope_paths=None, kind=None) -> list:
             })
         cards.sort(key=lambda c: (_ROLE_RANK.get(c["label"], 9),
                                   c["distance"] if c["distance"] is not None else 99, c["name"]))
-        result = _Cards(scope.filter_items(cards, sp), coverage)
+        result = _Cards(scope.filter_items(cards, sp, path_rules.rules_for(world)), coverage)
         result.unresolved = unresolved
         result.depth = {"requested": TROUBLESHOOT_GRAPH_DEPTH, "truncated": None}
         result.dataitems_excluded = dataitems_excluded

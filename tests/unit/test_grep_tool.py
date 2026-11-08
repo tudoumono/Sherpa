@@ -1,7 +1,7 @@
 """grep_tool（直接 grep ツール）の契約テスト。
 
 読込バイト上限・ヒット引用バイト上限・打切り申告・ストリーミング走査のメモリ上界・deadline・
-重要度 top-K・layer・rag 優先の派生 MD・秘匿名/サイズ超過の除外を確かめる。
+先頭 K 件の選抜・layer・rag 優先の派生 MD・秘匿名/サイズ超過の除外を確かめる。
 """
 from __future__ import annotations
 
@@ -41,6 +41,8 @@ def _derived_world(monkeypatch, tmp_path, legacy=None, rag=None, obs=None, world
     monkeypatch.setattr(W, "derived_md_dir", lambda w: der)
     monkeypatch.setattr(W, "derived_rag_dir", lambda w: der_rag)
     monkeypatch.setattr(W, "observation_current_dir", lambda w: obs_root)
+    # 管理者の優先・除外（system_settings の DB 読み）は無し。deadline の確認回数を数える試験が DB 読みの時計の呼び出しに影響されないようにする
+    monkeypatch.setenv("SHERPA_MCP_PATH_RULES", "")
 
 
 def _clock_exceeding_after(monkeypatch, ok_calls: int):
@@ -364,14 +366,13 @@ def test_grep_search_stops_scanning_at_max_hits_when_imp_map_empty(monkeypatch, 
     assert [h["doc_id"] for h in hits] == ["a.md"] and calls["n"] == 5
 
 
-def test_grep_search_continues_scanning_past_max_hits_when_imp_map_nonempty(monkeypatch, tmp_path):
-    """_重要度.txt がある world は max_hits 到達後も全量走査する（2 文書目で期限超過すれば例外）。"""
+def test_grep_search_stops_scanning_at_max_hits_even_when_control_file_exists(monkeypatch, tmp_path):
+    """_重要度.txt があっても重要度は使わない＝max_hits 到達後は走査を打ち切る（全量走査しないので期限超過にならない）。"""
     _derived_world(monkeypatch, tmp_path, world_files={
         "a.md": "NEEDLE\n", "b.md": "NEEDLE\n", "_重要度.txt": "a.md: 中\n"})
-    calls = _clock_exceeding_after(monkeypatch, 6)
-    with pytest.raises(G.GrepDeadlineExceeded):
-        list(G.grep_search("NEEDLE", world="anyworld", max_hits=1, deadline=50.0, engine="python"))
-    assert calls["n"] >= 7
+    _clock_exceeding_after(monkeypatch, 6)
+    hits = G.grep_search("NEEDLE", world="anyworld", max_hits=1, deadline=50.0, engine="python")
+    assert [h["doc_id"] for h in hits] == ["a.md"]
 
 
 # ===== valid_world =====
@@ -413,7 +414,7 @@ def test_grep_search_layer_code_with_derived_office_md_is_always_zero_hits(monke
     assert len(docs_hits) == 1 and docs_hits[0]["doc_id"] == "report.docx"
 
 
-# ===== 重要度（_重要度.txt）の除外と top-K 選抜 =====
+# ===== 重要度設定ファイルの除外と、重要度を使わない選抜 =====
 
 def test_grep_search_excludes_importance_control_file(tmp_path):
     _write(tmp_path, "a.md", "NEEDLE here\n")
@@ -429,30 +430,13 @@ def test_grep_search_no_control_file_preserves_discovery_order(tmp_path):
     assert all("importance" not in h and "importance_reason" not in h for h in hits)
 
 
-def test_grep_search_prioritizes_high_importance_hit_discovered_after_max_hits(monkeypatch, tmp_path):
+def test_grep_search_ignores_importance_settings_and_keeps_discovery_order(monkeypatch, tmp_path):
     _derived_world(monkeypatch, tmp_path, world_files={
-        "a.md": "NEEDLE here\n", "b.md": "NEEDLE here\n", "z_important.md": "NEEDLE here\n",
-        "_重要度.txt": "z_important.md: 高\n"})
+        "a_low.md": "NEEDLE here\n", "b.md": "NEEDLE here\n", "z_high.md": "NEEDLE here\n",
+        "_重要度.txt": "z_high.md: 高  # 契約書\na_low.md: 低\n"})
     hits = G.grep_search("NEEDLE", world="anyworld", max_hits=2)
-    doc_ids = [h["doc_id"] for h in hits]
-    assert len(doc_ids) == 2 and doc_ids[0] == "z_important.md" and hits[0]["importance"] == "高"
-    assert "a.md" in doc_ids or "b.md" in doc_ids
-
-
-def test_grep_search_low_importance_hit_dropped_first_when_over_capacity(monkeypatch, tmp_path):
-    _derived_world(monkeypatch, tmp_path, world_files={
-        "a_low.md": "NEEDLE here\n", "b.md": "NEEDLE here\n", "c.md": "NEEDLE here\n",
-        "_重要度.txt": "a_low.md: 低\n"})
-    hits = G.grep_search("NEEDLE", world="anyworld", max_hits=2)
-    assert [h["doc_id"] for h in hits] == ["b.md", "c.md"]
-
-
-def test_grep_search_importance_reason_is_conditional_key(monkeypatch, tmp_path):
-    _derived_world(monkeypatch, tmp_path, world_files={
-        "a.md": "NEEDLE here\n", "b.md": "NEEDLE here\n", "_重要度.txt": "a.md: 高  # 契約書\nb.md: 低\n"})
-    hits = {h["doc_id"]: h for h in G.grep_search("NEEDLE", world="anyworld", max_hits=10)}
-    assert hits["a.md"]["importance"] == "高" and hits["a.md"]["importance_reason"] == "契約書"
-    assert hits["b.md"]["importance"] == "低" and "importance_reason" not in hits["b.md"]
+    assert [h["doc_id"] for h in hits] == ["a_low.md", "b.md"]
+    assert all("importance" not in h and "importance_reason" not in h for h in hits)
 
 
 # ===== ページング =====

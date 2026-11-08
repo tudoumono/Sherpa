@@ -259,7 +259,31 @@ def set_system_settings(uid, updates: dict, secret_keys: frozenset | None = None
         _facade._audit_insert(c, uid, "system_settings.updated", "system_settings", None,
                       before_state=audit_before, after_state=audit_after, severity="warning")
     _invalidate_system_settings_cache()
+    from sherpa import proxy_bypass  # 遅延 import（循環回避）。Ollama の接続先・許可リストの変更をプロキシの例外へ反映する
+    proxy_bypass.apply()
     return updates
+
+
+def modify_system_setting(uid, key: str, mutate) -> object:
+    """`system_settings` の 1 キーを、読み取り・変更・書き込みを 1 つのトランザクション（`_ENV_SEED_LOCK` の advisory lock と行ロック）の中で行う。
+    `mutate(現在の値 or None)` が新しい値（None は行の削除）を返す。同じキーを同時に保存する別の呼び出しの変更を失わない。
+    監査（`system_settings.updated`・before/after）と設定キャッシュの無効化は `set_system_settings` と同じ。戻り値は書いた値。
+    """
+    _ensure()
+    from sherpa import store as _facade
+    with _connect() as c:
+        c.execute("SELECT pg_advisory_xact_lock(%s)", (_ENV_SEED_LOCK,))
+        row = c.execute("SELECT value FROM system_settings WHERE key=%s FOR UPDATE", (key,)).fetchone()
+        before = row["value"] if row else None
+        new = mutate(before)
+        if new == before:
+            return new  # 変えるものが無ければ書かず、監査も残さない
+        _system_settings_apply(c, {key: new}, uid)
+        _facade._audit_insert(c, uid, "system_settings.updated", "system_settings", None,
+                              before_state=_redact_secret_settings({key: before}), after_state=_redact_secret_settings({key: new}),
+                              severity="warning")
+    _invalidate_system_settings_cache()
+    return new
 
 
 # 固定 advisory lock key（"SEED"）。env→system_settings シード試行を直列化し、`set_system_settings` にも同じ lock を取らせて、`ollama_url`/`ollama_allowlist` の行ロック取得順序が経路ごとに違ってもデッドロックしないようにする。

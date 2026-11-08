@@ -6,8 +6,12 @@ Codex が直接開いた資料は MCP の戻り値に載らないため、回答
 """
 from __future__ import annotations
 
+import logging
 import re
+import time
 from pathlib import Path
+
+_log = logging.getLogger("sherpa")
 
 # 見出し行（前後の Markdown 装飾・全角/半角コロンを許容し、同一行の内容を捕捉する）。
 _HEADING_RE = re.compile(
@@ -223,6 +227,7 @@ def _verify_one(ref: str, world: str, scope_paths) -> str | None:
 REASON_OUT_OF_SCOPE = "今回の範囲の外です"
 REASON_UNREADABLE = "見つからないか、読めない形式です"
 REASON_AMBIGUOUS = "同じ名前の資料が複数あり、どれか特定できません"
+REASON_UNCHECKED = "時間内に確かめきれませんでした"
 UNVERIFIED_PATH_MAX_LEN = 200
 
 # 参照 1 行の対応付けの分類（内部の記録・評価で数える）。
@@ -230,6 +235,7 @@ RES_DIRECT = "direct"                    # パスのとおりに実在を確認�
 RES_UNIQUE = "unique_by_name"            # ファイル名だけの指定が、範囲内で 1 件に決まった
 RES_AMBIGUOUS = "ambiguous"              # 範囲内に同名が複数ある（どれも選ばない）
 RES_NOT_FOUND = "not_found"              # 資料が無い（ファイル名だけの指定では、範囲外にだけ有る場合も含める）
+RES_UNCHECKED = "unchecked"              # 台帳に無い名前を原本で引き直す途中で期限を超えた（有るか無いか分からない）
 RES_OUT_OF_SCOPE = "out_of_scope"        # パスつきの指定が、許可された範囲の外
 RES_POSITION_UNVERIFIED = "position_unverified"  # 資料は特定できたが行番号が資料の行数を超える
 RES_HIDDEN = "hidden"                    # 秘匿名・自由な文・解釈できない行（名前を残さない）
@@ -249,16 +255,11 @@ def _bare_name(candidates: list, world: str) -> str | None:
     return None
 
 
-def _name_index(world: str, scope_paths, layer) -> dict[str, list[str]]:
-    """許可された範囲（scope_paths・層）にある非秘匿の資料の、ファイル名 → rel_path 一覧。範囲外の資料は入れない。
-    資料の一覧は取り込みの台帳から出し、台帳が無いときだけ資料フォルダを（期限つきで）歩く。"""
-    from ... import documents, layer as layer_mod, scope as scope_mod
+def _index_rels(rels, scope_paths, layer) -> dict[str, list[str]]:
+    """rel_path の集合から、許可された範囲（scope_paths・層）にある非秘匿のものだけを、ファイル名 → rel_path 一覧にする。"""
+    from ... import layer as layer_mod, scope as scope_mod
     from ...ingest import text_kind
 
-    try:
-        rels = documents.known_rels(world)
-    except Exception:
-        return {}
     index: dict[str, list[str]] = {}
     for rel in sorted(rels):
         if text_kind.is_sensitive_doc_id(rel):
@@ -272,6 +273,67 @@ def _name_index(world: str, scope_paths, layer) -> dict[str, list[str]]:
             continue
         index.setdefault(rel.rsplit("/", 1)[-1], []).append(rel)
     return index
+
+
+def _name_index(world: str, scope_paths, layer) -> dict[str, list[str]]:
+    """許可された範囲（scope_paths・層）にある非秘匿の資料の、ファイル名 → rel_path 一覧。範囲外の資料は入れない。
+    資料の一覧は取り込みの台帳から出し、台帳が無いときだけ資料フォルダを（期限つきで）歩く。"""
+    from ... import documents
+
+    try:
+        rels = documents.known_rels(world)
+    except Exception:
+        return {}
+    return _index_rels(rels, scope_paths, layer)
+
+
+class _WalkNameIndex:
+    """台帳の索引に無かった名前の引き直し用。範囲の部分木だけを、最初に引かれたときだけ 1 回（期限つきで）歩いて名前の索引にする。
+    層は拡張子でなく取り込みと同じ分類で、引いた候補だけに当てる。期限を超えた・読めない部分があったときは `timed_out` を立てる（歩いた分だけでは決めない）。"""
+
+    def __init__(self, world: str, scope_paths, layer) -> None:
+        self._args = (world, scope_paths, layer)
+        self._index: dict[str, list[str]] | None = None
+        self._deadline: float | None = None
+        self.timed_out = False
+
+    def get(self, name: str) -> list[str]:
+        from ... import doc_reach
+
+        if self._index is None:
+            self._index = self._build()
+        if self.timed_out:
+            return []
+        world, _scope_paths, layer = self._args
+        out = []
+        for r in self._index.get(name, []):
+            if time.monotonic() > self._deadline:
+                self.timed_out = True
+                return []
+            if doc_reach.in_layer_confirmed(r, world, layer):
+                out.append(r)
+        if time.monotonic() > self._deadline:
+            self.timed_out = True
+            return []
+        return out
+
+    def _build(self) -> dict[str, list[str]]:
+        from ... import documents, scope_infer
+
+        world, scope_paths, layer = self._args
+        self._deadline = scope_infer.user_op_deadline()
+        try:
+            skipped: dict = {}
+            rels = documents.scope_rel_set(world, scope_paths, deadline=self._deadline, skipped=skipped)
+        except scope_infer.ScopeWalkDeadlineExceeded:
+            _log.warning("citations: name lookup walk exceeded deadline; shown as unchecked world=%s", world)
+            self.timed_out = True
+            return {}
+        if documents.walk_incomplete(skipped):
+            _log.warning("citations: name lookup walk could not read part of the tree; shown as unchecked world=%s", world)
+            self.timed_out = True
+            return {}
+        return _index_rels(rels, scope_paths, None)
 
 
 def _position_unverified(doc: str, candidates: list, world: str) -> bool:
@@ -327,7 +389,7 @@ def resolve_referenced_docs_detail(refs: list, world: str, scope_paths=None, lay
     """参照の候補 → 検証結果。キーは `verified`（検証を通った doc_id）・`unverified`（通らなかった行の {path, reason}）・
     `hidden`（名前を出さず件数だけにした数）・`mappings`（行ごとの {input, doc_id, class}。評価で数える。名前を出せない行の input は空）。
     ファイル名だけの指定は、パスのとおりに実在しないとき、範囲（scope_paths・層）内で同名が 1 件だけなら、その資料の相対パスへ
-    置き換えて同じ検証（実在・文書種別・範囲・秘匿）を通す。2 件以上は曖昧として選ばず、範囲外の同名は候補に入れない（存在を漏らさない）。
+    置き換えて同じ検証（実在・文書種別・範囲・秘匿）を通す。台帳の索引で見つからない名前だけ、範囲内の原本の木を 1 回（期限つき）歩いて引き直す。2 件以上は曖昧として選ばず、範囲外の同名は候補に入れない（存在を漏らさない）。
     行番号つきの指定が資料の行数を超えても資料の検証は変えず、`mappings` にだけ位置の未確認を残す。
     """
     out: list[str] = []
@@ -336,6 +398,7 @@ def resolve_referenced_docs_detail(refs: list, world: str, scope_paths=None, lay
     mappings: list[dict] = []
     sensitive = 0
     index: dict[str, list[str]] | None = None
+    walked = _WalkNameIndex(world, scope_paths, layer)
 
     def _add(doc: str | None) -> None:
         if doc and doc not in seen:
@@ -359,7 +422,7 @@ def resolve_referenced_docs_detail(refs: list, world: str, scope_paths=None, lay
         if bare is not None:
             if index is None:
                 index = _name_index(world, scope_paths, layer)
-            hits = index.get(bare, [])
+            hits = index.get(bare, []) or walked.get(bare)
             if len(hits) == 1:
                 doc = _verify_one(hits[0], world, scope_paths)
                 if doc:
@@ -370,6 +433,9 @@ def resolve_referenced_docs_detail(refs: list, world: str, scope_paths=None, lay
             if len(hits) > 1:
                 row = {"path": bare[:UNVERIFIED_PATH_MAX_LEN], "reason": REASON_AMBIGUOUS}
                 cls = RES_AMBIGUOUS
+            elif not hits and walked.timed_out:
+                row = {"path": bare[:UNVERIFIED_PATH_MAX_LEN], "reason": REASON_UNCHECKED}
+                cls = RES_UNCHECKED
             else:
                 row = {"path": bare[:UNVERIFIED_PATH_MAX_LEN], "reason": REASON_UNREADABLE}
                 cls = RES_NOT_FOUND

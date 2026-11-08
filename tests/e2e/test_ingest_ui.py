@@ -410,32 +410,23 @@ def test_page_and_detail_button_admin_only(page, web_base_url):
     expect(page.locator("#detailbtn")).to_be_hidden()
 
 
-def test_importance_badge_and_diagnostics_banner(page, web_base_url):
-    """台帳（文書一覧）に `_重要度.txt` 由来の重要度バッジが出る（値・理由・由来はホバー・重要度が無い文書は空のまま）。
-    `_重要度.txt` の構文エラーはツリー付近の小さな警告バナーに出る（無ければ非表示）。"""
+def test_importance_is_not_shown_even_if_the_response_carries_it(page, web_base_url):
+    """重要度は画面に使わない＝応答に重要度の欄があっても、バッジ・列・警告バナーは出ない。"""
     preview_with_importance = {**PREVIEW, "importance_diagnostics": [
-        {"config_path": "4期/02_設計/_重要度.txt", "line": 3, "column": 1,
-         "code": "invalid_value", "message": "値が正しくありません。「高」「中」「低」「なし」のいずれかにしてください"},
+        {"config_path": "4期/02_設計/_重要度.txt", "line": 3, "column": 1, "code": "invalid_value", "message": "x"},
     ], "documents": [
-        ({**d, "importance": "高", "importance_reason": "税制改正の一次資料",
-          "importance_source": "4期/02_設計/_重要度.txt:1行目"}
+        ({**d, "importance": "高", "importance_reason": "税制改正の一次資料"}
          if d["name"] == "4期/02_設計/01_基本設計/税計算仕様書.md" else d)
         for d in PREVIEW["documents"]
     ]}
     _open(page, web_base_url, preview=preview_with_importance)
+    for folder in ("4期", "4期/02_設計", "4期/02_設計/01_基本設計"):
+        page.locator(f'#rows button[data-open-folder="{folder}"]').click()
 
-    badge = page.locator("#rows tr", has_text="税計算仕様書.md").locator(".impbadge")
-    expect(badge).to_have_text("高")
-    expect(badge).to_have_attribute("title", re.compile("重要度 高.*税制改正の一次資料.*_重要度\\.txt"))
-    expect(page.locator("#rows tr", has_text="TAXCALC.cbl").locator(".impbadge")).to_have_count(0)
-    banner = page.locator("#impdiag")
-    expect(banner).to_be_visible()
-    expect(banner).to_contain_text("_重要度.txt")
-    expect(banner).to_contain_text("4期/02_設計/_重要度.txt:3行目")
-
-    _route_json(page, _PREVIEW_URL, PREVIEW)
-    page.goto(f"{web_base_url}/ingest.html")
-    expect(page.locator("#impdiag")).to_be_hidden()
+    expect(page.locator("#rows tr", has_text="税計算仕様書.md")).to_be_visible()
+    expect(page.locator(".impbadge")).to_have_count(0)
+    expect(page.locator("#impdiag")).to_have_count(0)
+    expect(page.locator("thead")).not_to_contain_text("重要度")
 
 
 def test_detail_overlay_shows_why_graph_is_not_built(page, web_base_url):
@@ -480,7 +471,7 @@ def test_partial_folder_scan_and_pending_list_are_shown_in_plain_words(page, web
     """フォルダの走査が期限で止まったときはツリーの下に、一覧を出せないときは一覧の空欄にその理由を平文で出す。"""
     note = "まだ取り込みが終わっていないため、資料の一覧は取り込みのあとに出します。"
     _open(page, web_base_url, preview={**PREVIEW, "documents": [], "documents_note": note, "folders_partial": True})
-    expect(page.locator("#tree")).to_contain_text("資料の無いフォルダと重要度の設定は一部だけ確認しています")
+    expect(page.locator("#tree")).to_contain_text("資料の無いフォルダは一部だけ確認しています")
     expect(page.locator("#rows")).to_contain_text(note)
 
 
@@ -649,3 +640,26 @@ def test_unreflected_resolve_settings_stay_visible_after_reload(page, web_base_u
     """未反映の設定は、状況の API が返す限り画面を開き直しても「更新が必要」と出続ける。"""
     _open(page, web_base_url, status={"resolve_settings_pending": True})
     expect(page.locator("#workerbanner")).to_contain_text("まだ反映されていません")
+
+
+def test_folder_check_button_shows_three_levels_and_items(page, web_base_url):
+    """「フォルダの置き方を点検」を押すと、3 段の件数と、合わない・注意を先にした項目の表が出る。"""
+    check = {"root": "ProjectA", "ledger_at": "2026-11-05T01:02:03+00:00", "not_counted": ["ビルドの設定は数えていない。"],
+             "summary": {}, "items": [
+                 {"rule": "決まり1", "result": "合う", "path": "", "what": "PJ は root の直下にある", "treatment": "そのまま使う", "fix": "",
+                  "count": 2, "examples": [], "extra": {}},
+                 {"rule": "決まり4", "result": "注意", "path": "サブA", "what": "名前に番号がない", "treatment": "仮定つきで答える",
+                  "fix": "名前に期の番号を付ける", "count": 1, "examples": ["サブA/共通"], "extra": {}},
+                 {"rule": "決まり2", "result": "合わない", "path": "サブB", "what": "期が同じ高さにない", "treatment": "期として読まない",
+                  "fix": "期のフォルダを同じ高さに並べる", "count": 1, "examples": [], "extra": {}}]}
+    _open(page, web_base_url)
+    _route_json(page, re.compile(r"/worlds/w1/folder-check(\?|$)"), check)
+    page.locator("#chk-btn").click()
+    out = page.locator("#chk-out")
+    expect(out).to_contain_text("合わない 1 件")
+    expect(out).to_contain_text("注意 1 件")
+    expect(out).to_contain_text("合う 1 件")
+    expect(out.locator("tbody tr").first).to_contain_text("サブB")
+    expect(out).to_contain_text("期のフォルダを同じ高さに並べる")
+    expect(out).to_contain_text("数えていないもの（1 件）")
+    expect(out.locator("#chk-md")).to_have_attribute("href", re.compile(r"/worlds/w1/folder-check\?format=md$"))

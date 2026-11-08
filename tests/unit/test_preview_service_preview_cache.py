@@ -110,9 +110,9 @@ def test_preview_does_not_build_graph_and_graph_walks_exactly_once(monkeypatch, 
     assert calls["n"] == 1
     assert build_calls == []
     assert [d["name"] for d in out["documents"]] == ["a.md"]
-    assert out["documents"][0]["importance"] == "高"
+    assert not any(k.startswith("importance") for k in out["documents"][0])
     assert out["counts"]["documents"] == 1
-    assert out["importance_diagnostics"] == []
+    assert "importance_diagnostics" not in out
     assert out["entities"] == [] and out["relations"] == [] and out["issues"] == []
     assert "wtest" not in ps._GRAPH_VIEW_CACHE
 
@@ -159,19 +159,16 @@ def test_graph_bundle_and_build_preview_graph_share_graph_cache(monkeypatch, tmp
     assert len(bundle["raw_nodes"]) == pv["counts"]["entities"]
 
 
-def test_importance_edit_without_resync_is_reflected_next_call(monkeypatch, tmp_path):
-    """台帳が空のとき、重要度（`_重要度.txt` の内容）は sig（世代）が変わらなくても次回呼び出しへ
-    即座に反映される（文書一覧・重要度の解決は世代のキャッシュから読まない）。"""
+def test_importance_edit_does_not_change_the_document_list(monkeypatch, tmp_path):
+    """`_重要度.txt` の中身は一覧に影響しない（重要度は画面に使わない）。"""
     wd = _world(monkeypatch, tmp_path)
-    _patch_status(monkeypatch, _status("sig-a", "t1"))   # sig は両呼び出しで同一（sync していない想定）
+    _patch_status(monkeypatch, _status("sig-a", "t1"))
 
     out1 = ps.build_preview("wtest")
-    assert out1["documents"][0]["importance"] == "高"
-
-    _write(wd / "_重要度.txt", "*.md: 低")                # sync を経ずに直接編集
+    _write(wd / "_重要度.txt", "*.md: 低")
     out2 = ps.build_preview("wtest")
 
-    assert out2["documents"][0]["importance"] == "低"     # 次回 sync を待たず反映される
+    assert out1["documents"] == out2["documents"]
 
 
 def test_documents_and_importance_are_never_served_from_a_cache(monkeypatch, tmp_path):

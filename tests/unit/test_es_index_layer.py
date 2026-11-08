@@ -27,10 +27,8 @@ def _capture_req(monkeypatch):
 
 
 def _bm25_bool(body: dict) -> dict:
-    """`search()` の BM25 クエリは I2（重要度ブースト）で `function_score` に包まれた
-    （`es_index._importance_boost_query` 参照）——テストが見たい `bool`（`must`/`filter`）節は
-    その内側の `query` にある。"""
-    return body["query"]["function_score"]["query"]["bool"]
+    """`search()` の BM25 クエリの `bool`（`must`/`filter`）節。"""
+    return body["query"]["bool"]
 
 
 # ===== search()（BM25・vector=False で埋め込みを一切呼ばない経路）=====
@@ -113,7 +111,7 @@ def test_search_knn_only_layer_omitted_matches_current_behavior(monkeypatch):
 # ===== es_search の方式（hybrid／keyword／vector）=====
 
 def test_search_mode_query_shapes(monkeypatch):
-    """hybrid は BM25 と kNN を別々に投げる（kNN は function_score 包みの query-level knn）・keyword は BM25 だけ・vector は knn だけ。"""
+    """hybrid は BM25 と kNN を別々に投げる（kNN は query-level knn）・keyword は BM25 だけ・vector は knn だけ。"""
     bodies: list = []
 
     def fake_req(method, path, body=None, **kw):
@@ -125,12 +123,12 @@ def test_search_mode_query_shapes(monkeypatch):
     _stub_embeddings(monkeypatch)
     es_index.search("v1", "q", k=5)
     bm25, knn = bodies[-2], bodies[-1]
-    assert bm25["query"]["function_score"]["query"]["bool"]["must"] == [es_index._keyword_clause("q")]
+    assert bm25["query"]["bool"]["must"] == [es_index._keyword_clause("q")]
     assert "highlight" in bm25
-    assert "knn" in knn["query"]["function_score"]["query"] and "highlight" not in knn
+    assert "knn" in knn["query"] and "highlight" not in knn
     bodies.clear()
     es_index.search("v1", "q", k=5, vector=False)
-    q = bodies[-1]["query"]["function_score"]["query"]["bool"]
+    q = bodies[-1]["query"]["bool"]
     assert len(bodies) == 1 and q["must"] == [es_index._keyword_clause("q")] and "should" not in q
     es_index.search_knn_only("v1", "q", k=5)
     assert "knn" in bodies[-1] and "query" not in bodies[-1]
@@ -145,7 +143,7 @@ def test_search_hybrid_marks_keyword_match(monkeypatch):
         return {"_id": str(i), "_source": {"doc_id": f"{i}.md", "text": "t"}, "_score": 1.0}
 
     def fake_req(m, p, body=None, **kw):
-        q = body["query"]["function_score"]["query"]
+        q = body["query"]
         return {"hits": {"hits": [hit(1)] if "bool" in q else [hit(2)]}}
 
     monkeypatch.setattr(es_index, "_req", fake_req)

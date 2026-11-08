@@ -178,6 +178,7 @@
         <button class="tab-btn" type="button" role="tab" data-tab="feedback" aria-selected="false" id="tab-btn-feedback" title="利用者が回答に付けた 👍👎・理由・一言。" aria-controls="tabpanel-feedback" tabindex="-1">回答への評価</button>
         <button class="tab-btn" type="button" role="tab" data-tab="audit" aria-selected="false" id="tab-btn-audit" title="誰が・いつ・何をしたかの記録。" aria-controls="tabpanel-audit" tabindex="-1">監査ログ</button>
         <button class="tab-btn" type="button" role="tab" data-tab="status" aria-selected="false" id="tab-btn-status" title="各サービス（DB・検索・AI）の稼働状況。" aria-controls="tabpanel-status" tabindex="-1">システム状態</button>
+        <button class="tab-btn" type="button" role="tab" data-tab="connectivity" aria-selected="false" id="tab-btn-connectivity" title="画面・回答・調べものの道具が各サービスにつながるかの確認。" aria-controls="tabpanel-connectivity" tabindex="-1">つながりの確認</button>
       </div>
 
       <div class="admin-panels">
@@ -695,6 +696,9 @@
       </div>
       <div class="tabpanel tabpanel-embed" id="tabpanel-status" data-tabpanel="status" role="tabpanel" aria-labelledby="tab-btn-status" tabindex="0" hidden>
         <iframe class="embed-frame" id="embed-frame-status" title="システム状態" data-src="status.html?embed=1"></iframe>
+      </div>
+      <div class="tabpanel tabpanel-embed" id="tabpanel-connectivity" data-tabpanel="connectivity" role="tabpanel" aria-labelledby="tab-btn-connectivity" tabindex="0" hidden>
+        <iframe class="embed-frame" id="embed-frame-connectivity" title="つながりの確認" data-src="connectivity.html?embed=1"></iframe>
       </div>
       </div>
     </div>

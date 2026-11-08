@@ -8,12 +8,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import hashlib
 import re
 import stat
 import time
 from pathlib import Path
 
-from ... import citations, es_index, graph_coverage, grep_tool, redact_keys, scope_infer, search_cache, worlds
+from ... import citations, doc_reach, es_index, graph_coverage, grep_tool, path_rules, redact_keys, scope_infer, search_cache, worlds
 from ...env_int import env_int
 from ... import layer as layer_mod
 from ... import scope as scope_mod
@@ -116,6 +117,12 @@ _PARENT_RETURN_REGION_CHUNKS_MAX = 5000
 
 
 def _narrow_scope_by_prefix(scope_paths, path_prefix) -> tuple[list, str | None]:
+    """`_narrow_scope_by_prefix_raw` の結果を `path_rules.Fixed` にする（下の検索が管理者の優先を範囲へ足し直して、`path_prefix` の絞り込みを広げないため）。"""
+    sp, err = _narrow_scope_by_prefix_raw(scope_paths, path_prefix)
+    return path_rules.Fixed(sp), err
+
+
+def _narrow_scope_by_prefix_raw(scope_paths, path_prefix) -> tuple[list, str | None]:
     """es_search の `path_prefix` で、ターンの範囲をその内側へ狭めた範囲を返す（範囲を広げない）。
 
     範囲の内側の指定はその prefix だけ、範囲より広い指定は範囲のうち配下のものだけにする。
@@ -177,6 +184,11 @@ def _clip_cards(cards: list, max_count: int = _GRAPH_CARDS_MAX, max_bytes: int =
 
 # glob_search の返却上限（打ち切りは明示する）。env 化しない
 _GLOB_MAX_RESULTS = 200
+# 続きの呼び出しで一覧の同一性を確かめる印。台帳から出したときは `ledger_at`、資料フォルダを歩いたときはこの値
+_GLOB_WALK_GENERATION = "walk"
+_GLOB_GENERATION_ERROR = "glob_generation_mismatch"
+_GLOB_GENERATION_REQUIRED_ERROR = "glob_generation_required"
+_GLOB_WALK_NOTICE = "資料フォルダを歩いて出した一覧なので、ページの間で一覧が変わることがある。"
 
 # `_重要度.txt` の glob と同じ長さ上限を流用する（`importance._match_segment_glob` を共有するため）
 _GLOB_PATTERN_MAX_LEN = importance._MAX_PATTERN_LEN
@@ -188,6 +200,20 @@ _HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$")
 _OUTLINE_MAX_HEADINGS = 200
 
 _OUTLINE_TITLE_MAX_CHARS = 300
+
+def _glob_generation(listing, rules) -> str:
+    """続きの呼び出しで一覧の同一性を確かめる印。台帳から出したときは `ledger_at` に全行の（名前・種類・状態）と管理者の除外・範囲を広げる優先（`outside_scope`）の規則のハッシュを足し、行の追加・更新・削除・除外／優先の変更のどれでも変わる値にする。
+    歩いたときは `walk`（除外・範囲を広げる優先があれば `walk:` にその規則のハッシュを付ける）。`rules` は 1 回の呼び出しで使っているものを渡す（読み直さない）。"""
+    h = hashlib.sha1()
+    for p in sorted(rules.exclude_paths):
+        h.update(f"x\0{p}\n".encode("utf-8"))
+    for p in sorted(rules.outside_paths):
+        h.update(f"o\0{p}\n".encode("utf-8"))
+    if not listing.ledger_at:
+        return f"{_GLOB_WALK_GENERATION}:{h.hexdigest()[:12]}" if (rules.exclude_paths or rules.outside_paths) else _GLOB_WALK_GENERATION
+    for r in listing.rows:
+        h.update(f"{r['name']}\0{r.get('doctype')}\0{r.get('branch')}\0{r.get('state')}\n".encode("utf-8"))
+    return f"{listing.ledger_at}#{len(listing.rows)}:{h.hexdigest()[:12]}"
 
 def _validate_glob_pattern(raw) -> str | None:
     """`glob_search` の `pattern` 引数を検証する（無効なら None）。`doc_id`（`_safe_doc_path`）と同じトラバーサル拒否（絶対パス・バックスラッシュ・NUL・`..`／空セグメント）を適用する。"""
@@ -307,7 +333,7 @@ def _safe_original_path(world: str, doc_id: str, scope_paths, *, kinds: frozense
     if text_kind.is_sensitive(Path(doc_id).name, ext):
         _log.warning("read_original: 秘匿名のため対象外にしました（ext=%s）", ext)
         return None
-    if not scope_mod.in_scope(doc_id, scope_paths):
+    if not scope_mod.in_scope(doc_id, path_rules.rules_for(world).extend_scope(scope_paths)):
         return None
     root = worlds.world_dir(world)
     if not root:
@@ -381,12 +407,20 @@ def _close_quiet_local(f) -> None:
     except OSError:
         pass
 
+def _excluded_error() -> dict:
+    """管理者の除外の資料を読もうとしたときの結果（道具の結果に理由を載せ、名前を挙げて聞かれたときに答えられるようにする）。"""
+    return {"error": path_rules.EXCLUDED_MESSAGE, "error_code": path_rules.EXCLUDED_ERROR_CODE}
+
+
 def _open_doc_stream(world: str, doc_id: str, sp, layer) -> tuple:
     """`doc_id` を安全に解決し、読み取り用に open 済みのバイナリファイルオブジェクトを返す（`read_around`／`read_doc`／`doc_outline` が共有する土台）。
     範囲・層フィルタと symlink TOCTOU 対策（`_safe_doc_path` の結果を信頼アンカーに、`lexical_rel` を `_open_file_nofollow_walk` で 1 段ずつ open）を 3 ツールで共通にする。
     戻り値 `(f, error)`。成功時 `f` は呼び出し元が close する（ストリーミング走査の間じゅう開いておく）。失敗時 `(None, {"error": ...})`。全文の一括ロードはせず、`grep_tool._CappedStreamReader`／`_logical_lines` で bounded に走査する（`_stream_doc_lines` 参照）。
     """
-    if not scope_mod.in_scope(doc_id, sp):  # 範囲外は読まない
+    rules = path_rules.rules_for(world)
+    if rules.excluded(doc_id):  # 管理者が検索から外している資料は、名前を挙げられても読まない（理由は伝える）
+        return None, _excluded_error()
+    if not scope_mod.in_scope(doc_id, rules.extend_scope(sp)):  # 範囲外は読まない
         return None, {"error": "指定 doc_id は対象範囲外です"}
     resolved = _safe_doc_path(world, doc_id, layer=layer)
     if resolved is None:
@@ -1163,7 +1197,76 @@ def _raise_if_past(deadline: float | None) -> None:
         raise grep_tool.GrepDeadlineExceeded("読み取りがデッドラインを超えました")
 
 
-def run_tool(name: str, args: dict, world: str, scope_paths,
+# 取り込みの後に置かれた資料を歩く時間の上限（秒）。道具の期限と、この上限の早い方まで歩く
+_AFTER_INGEST_WALK_SECONDS = 20.0
+# `after_ingest` に載せる最大件数（名前の昇順）
+_AFTER_INGEST_MAX = 50
+_AFTER_INGEST_NOTICE = ("取り込みの後に置かれた資料です。検索の索引（全文検索・意味の検索・グラフ）には入っていません。"
+                        "中身は読む道具で開けます。")
+_AFTER_INGEST_UNCHECKED_NOTICE = ("取り込みの後に置かれた資料は、時間内に確かめきれませんでした。"
+                                  "フォルダを絞ると確かめられます。")
+
+
+def _after_ingest(world: str, prefix: str, sp, layer, listed: set, pattern: str, doctype_filter: str,
+                  deadline: float | None, rules=None) -> tuple[list | None, int]:
+    """台帳に無い実ファイルを `prefix` の部分木から歩いて `(全件を名前の昇順に並べた一覧, 件数)` で返す。期限切れ・読めない部分があったときは `(None, 0)`。
+    守ること: 秘匿名・重要度の設定ファイル・版管理のフォルダは出さない（歩き方は `documents.scope_rel_set` と同じ）。中身は読まない。
+    設計: docs/design/codex.md「MCP の道具」
+    """
+    from ... import corpus_docs, documents
+
+    if sp:
+        targets = []
+        for s in sp:
+            if s == prefix or s.startswith(prefix + "/"):
+                targets.append(s)
+            elif prefix.startswith(s + "/"):
+                targets.append(prefix)
+        targets = list(dict.fromkeys(targets))
+        if not targets:
+            return [], 0
+    else:
+        targets = [prefix]
+    limit = time.monotonic() + _AFTER_INGEST_WALK_SECONDS
+    walk_deadline = limit if deadline is None else min(deadline, limit)
+    skipped: dict = {}
+    try:
+        rels = documents.scope_rel_set(world, targets, deadline=walk_deadline, skipped=skipped)
+    except scope_infer.ScopeWalkDeadlineExceeded:
+        return None, 0
+    if documents.walk_incomplete(skipped):
+        return None, 0
+    out = []
+    for rel in sorted(rels):
+        if time.monotonic() > walk_deadline:
+            return None, 0
+        if rel in listed or text_kind.is_sensitive_doc_id(rel) or not scope_mod.in_scope(rel, sp):
+            continue
+        if rules is not None and rules.excluded(rel):
+            continue
+        cls = corpus_docs.classify_by_name(rel)
+        doctype = cls[0] if cls else None
+        if pattern and pattern not in rel.lower():
+            continue
+        if doctype_filter and str(doctype or "").lower() != doctype_filter:
+            continue
+        if not doc_reach.in_layer_confirmed(rel, world, layer):
+            continue
+        found = documents.resolve(rel, world)
+        if found is None:
+            continue
+        try:
+            st = found.stat()
+        except OSError:
+            continue
+        out.append({"rel_path": rel, "doctype": doctype, "size": st.st_size,
+                    "modified": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))})
+    if time.monotonic() > walk_deadline:
+        return None, 0
+    return out, len(out)
+
+
+def _run_tool_inner(name: str, args: dict, world: str, scope_paths,
             deadline: float | None = None, layer=None,
             max_hits: int | None = None, window_cap: int | None = None,
             tool_result_max_bytes: int | None = None,
@@ -1173,7 +1276,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     - `layer`（省略可・`"docs"|"code"|"both"`・既定 both）: `scope_paths` と同じ会話ターン全体の硬いフィルタ。`ripgrep_search`／`glob_search`／`es_search`／`list_docs` の対象を絞り、`read_around`／`read_doc`／`doc_outline` は層外の doc_id を範囲外と同じく拒否する。`graph_neighbors` は層で結果を絞れない（言及エッジが木を跨ぐ）ため、層が限定されている間はツール自体を拒否する（層外の名前・経路が漏れる迂回路になるため）。
     - `max_hits`（省略可）: 調べる深さが計算した grep／ES のヒット上限の実効値（`grep_search` の `max_hits`／`es_index.search` の `k` へ渡す）。
     - `window_cap`（省略可）: `read_around` の読み取り窓の既定値と `max(200, READ_WINDOW)` クランプの `READ_WINDOW` 部分を置き換える（200 の下限は維持）。`read_doc` の 1 ページ幅にも `max(200, window_cap or READ_WINDOW)` を使う。read_doc は 1 行ずつバイト予算を累積し、超える直前の行で止めてそこを `end_line` にする（超過時は `text_truncated: true`）。`doc_outline` は見出し件数（`_OUTLINE_MAX_HEADINGS`）とタイトルの累積バイト数の両方で打ち切る（`truncated`）。読み込みが `_READ_AROUND_FILE_CAP_BYTES` に達したら `file_truncated: true` を返す。`ripgrep_search` も `_GREP_FILE_CAP_BYTES` で打ち切ったファイル由来のヒットに `hits[i].file_truncated: true` を付ける。
-    - `ripgrep_search` のページング: `args["offset"]`（省略時 0・負値は 0）を `grep_tool.grep_search` へそのまま渡す（巻き戻さない）。1 ページのヒット数 `used_max_hits` は `max_hits` と `MAX_HITS_ABS_MAX - offset` の小さい方（`offset` はクランプせず、件数を縮める側で絶対上限を守る）。`offset >= MAX_HITS_ABS_MAX` なら検索せず空を返す。`next_offset` は `offset+used_max_hits < MAX_HITS_ABS_MAX` のときだけ付く。`es_search` は offset ページングを持たず（続きが要るなら `max_hits` を増やす）、`truncated:true` のみ。
+    - `ripgrep_search` のページング: `args["offset"]`（省略時 0・負値は 0）を `grep_tool.grep_search` へそのまま渡す（巻き戻さない）。1 ページのヒット数 `used_max_hits` は `max_hits` と `MAX_HITS_ABS_MAX - offset` の小さい方（`offset` はクランプせず、件数を縮める側で絶対上限を守る）。`offset >= MAX_HITS_ABS_MAX` なら検索せず空を返す。`next_offset` は `offset+used_max_hits < MAX_HITS_ABS_MAX` のときだけ付く。`es_search` は offset ページングを持たず、上限（断片の数）に当たると `truncated:true` と `fetched_chunks`（取得した断片の数）・`returned_docs`（返した資料の数）・`fetch_cap`（この呼び出しの `used_max_hits`）を返す。`max_hits` は調べる深さが決める内部の値で AI は渡せない。
     - ヒットの本文: 両ツールとも `hits[i].text` は `tool_result_max_bytes` を実際に返すヒット数で均等割りしたバイト数（下限 `_HIT_TEXT_MIN_BYTES`）に収め、`ripgrep_search` は見出し行＋一致行の前後を残して離れた箇所を省略の印（行の位置つき）でつなぎ（`grep_tool.clip_hit_text`）、`es_search` は末尾をクリップし、切ったヒットに `text_truncated: true` を付ける（親返しの rag doc 群は別予算配分で、`_resolve_parent_return` が独自に付ける）。`view` を組んだ後に直列化後の実バイト数を測り、`tr_max_bytes` 超過なら per_hit を詰めて再構築する（最大 4 回）。それでも収まらなければ呼び出し元の外側クリップに委ねる。
     - `deadline`（省略可・`time.monotonic()` 系の絶対期限）: ツリー走査を伴うツール（`ripgrep_search`／`list_docs`／`glob_search`／`es_search`）へそのまま渡し、実行中の呼び出しを打ち切る。超過時は `grep_tool.GrepDeadlineExceeded`／`scope_infer.ScopeWalkDeadlineExceeded` を送出する（呼び出し元が 504 相当へ再分類する）。`graph_neighbors` の起点名の grep にも渡す。
     - `partial_on_deadline`（省略可・既定 False）: 真のとき、`ripgrep_search` と `graph_neighbors`（起点名の grep）は期限切れで例外にせず、期限までに見つけた分を `deadline_exceeded: true`・`truncated: true`・平文の `notice` つきで返す（MCP 経路）。偽なら従来どおり例外。
@@ -1184,6 +1287,14 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     if name in _READ_DEADLINE_TOOLS:
         _raise_if_past(deadline)
     sp = scope_mod.normalize_scope_paths(scope_paths) or None
+    try:
+        rules = path_rules.rules_for(world)  # 管理者の優先・除外。「範囲の外でも読む」は以降の全ツールの範囲に足す
+    except path_rules.PathRulesUnavailable:  # 除外が効いているか分からないので止める（fail-closed）
+        return ({"error": path_rules.UNAVAILABLE_MESSAGE, "error_code": path_rules.UNAVAILABLE_ERROR_CODE},
+                set(), [], [])
+    sp = rules.extend_scope(sp)
+    if sp:
+        sp = path_rules.Fixed(sp)  # 足し込み済み。下の検索が足し直さない
     args = args or {}
     docs: set = set()
     cites: list = []
@@ -1210,11 +1321,13 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         listing = doc_ledger.listing_documents(world, deadline=deadline)
         rows = [r for r in listing.rows
                if scope_mod.in_scope(r["name"], sp)
-               and layer_mod.in_layer_code(r.get("branch") == "source", layer)]
+               and not rules.excluded(r["name"])
+               and layer_mod.in_layer_row(r, layer)]
         if prefix:
             rows = [r for r in rows if scope_mod.in_scope(r["name"], [prefix])]  # 同じ prefix 一致ロジックを再利用
         if pattern:
             rows = [r for r in rows if pattern in r["name"].lower()]
+        unknown_total = sum(1 for r in rows if doc_ledger.is_kind_unknown(r))  # 種類・状態の絞り込み前（落とした分も数える）
         if doctype_filter:
             rows = [r for r in rows if str(r.get("doctype") or "").lower() == doctype_filter]
         # state（"ready"／"unreadable"／"unknown"）も通す（読み取り不可な文書を「使える」文書と同列に見せない）
@@ -1232,12 +1345,32 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                   "next_offset": shown_end if truncated else None}
         if listing.ledger_at:
             result["ledger_at"] = listing.ledger_at  # 最後の取り込みの時点の一覧（以降の変更は含まない）
+        if unknown_total:
+            shown_unknown = sum(1 for r in rows if doc_ledger.is_kind_unknown(r))
+            result["kind_unknown"] = shown_unknown
+            result["kind_unknown_dropped"] = unknown_total - shown_unknown  # doctype／state の絞り込みで落とした分
+            result["kind_unknown_notice"] = doc_ledger.kind_unknown_notice(unknown_total)
+        # 取り込みの後に置かれた資料（path_prefix があるときだけ歩く。state は台帳の状態なので指定時は対象外）
+        if prefix and not state_filter:
+            listed = {r["name"] for r in listing.rows}
+            extra, n = _after_ingest(world, prefix, sp, layer, listed, pattern, doctype_filter, deadline, rules)
+            if extra is None:
+                result["after_ingest_unchecked"] = True
+                result["after_ingest_notice"] = _AFTER_INGEST_UNCHECKED_NOTICE
+            elif extra:
+                shown_extra = extra[:_AFTER_INGEST_MAX]
+                result["after_ingest"] = shown_extra
+                if n > len(shown_extra):
+                    result["after_ingest_truncated"] = True
+                    result["after_ingest_count"] = n
+                result["after_ingest_notice"] = _AFTER_INGEST_NOTICE
+                docs.update(d["rel_path"] for d in shown_extra)
         return (result, docs, cites, cards)
     if name == "folder_tree":
         # フォルダは文書ではない（`docs`＝doc_id 集合には何も足さない・出典／引用の対象外）
         from ... import folder_tree as folder_tree_mod
         result = folder_tree_mod.build(world, args, scope_paths=sp, deadline=deadline, layer=layer,
-                                       tool_result_max_bytes=tr_max_bytes)
+                                       tool_result_max_bytes=tr_max_bytes, rules=rules)
         return (result, docs, cites, cards)
     if name == "glob_search":
         from ... import doc_ledger  # list_docs と同じ一覧の出所
@@ -1248,16 +1381,41 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         match_pattern = _glob_match_pattern(pattern).lower()
         # 範囲・層は list_docs と同じ確定判定（`branch=="source"`）を使う
         listing = doc_ledger.listing_documents(world, deadline=deadline)
-        matched = [r["name"] for r in listing.rows
-                  if scope_mod.in_scope(r["name"], sp)
-                  and layer_mod.in_layer_code(r.get("branch") == "source", layer)
-                  and importance._match_segment_glob(match_pattern, r["name"].lower())]
-        shown = matched[:_GLOB_MAX_RESULTS]
+        matched_rows = [r for r in listing.rows
+                        if scope_mod.in_scope(r["name"], sp)
+                        and not rules.excluded(r["name"])
+                        and layer_mod.in_layer_row(r, layer)
+                        and importance._match_segment_glob(match_pattern, r["name"].lower())]
+        matched_rows.sort(key=lambda r: r["name"])  # rel_path 昇順固定（同じ名前は無いので offset が安定する）
+        try:
+            offset = max(0, int(args.get("offset") or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        generation = _glob_generation(listing, rules)
+        if offset > 0 and not args.get("generation"):
+            return ({"error": _GLOB_GENERATION_REQUIRED_ERROR,
+                     "message": "続き（offset が 1 以上）には前の応答の generation が要ります。generation を付けて呼び直してください"},
+                    docs, cites, cards)
+        if offset > 0 and args.get("generation") != generation:
+            # 続きは同じ一覧の続きでなければ返さない（入れ替わった一覧の別の並びを黙って返さない）
+            return ({"error": _GLOB_GENERATION_ERROR,
+                     "message": "資料が入れ替わりました。offset 0 から取り直してください（generation を付けずに呼び直す）"},
+                    docs, cites, cards)
+        unknown_matched = sum(1 for r in matched_rows if doc_ledger.is_kind_unknown(r))  # 全一致について数える
+        shown = [r["name"] for r in matched_rows[offset:offset + _GLOB_MAX_RESULTS]]
         for p in shown:
             docs.add(p)  # 出した分だけ出典に載せる
-        result = {"count": len(matched), "paths": shown, "truncated": len(matched) > len(shown)}
+        shown_end = offset + len(shown)
+        truncated = shown_end < len(matched_rows)
+        result = {"count": len(matched_rows), "offset": offset, "paths": shown, "truncated": truncated,
+                  "next_offset": shown_end if truncated else None, "generation": generation}
         if listing.ledger_at:
             result["ledger_at"] = listing.ledger_at
+        else:
+            result["notice"] = _GLOB_WALK_NOTICE
+        if unknown_matched:
+            result["kind_unknown"] = unknown_matched
+            result["kind_unknown_notice"] = doc_ledger.kind_unknown_notice(unknown_matched)
         return (result, docs, cites, cards)
     if name in ("ripgrep_search", "es_search"):
         q = str(args.get("query") or "")
@@ -1269,7 +1427,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         cap_reached = False  # ヒット上限に達した（母集団の一部しか見ていない）
         offset = 0  # ripgrep_search のみ意味を持つ（es_search は常に 0＝ページングしない）
         if name == "es_search":
-            # 全文検索（ES hybrid）は offset ページングを持たない（kNN の候補集合がページを跨いで固定できず、順位の入れ替わりで重複と欠落が起きる）。続きが要るなら max_hits を増やす
+            # 全文検索（ES hybrid）は offset ページングを持たない（kNN の候補集合がページを跨いで固定できず、順位の入れ替わりで重複と欠落が起きる）。上限 `max_hits` は管理画面の調べる深さが決める内部の値で、AI が渡す引数ではない
             used_max_hits = max_hits or MAX_HITS
             sp_es, prefix_error = _narrow_scope_by_prefix(sp, args.get("path_prefix"))
             if prefix_error:
@@ -1409,11 +1567,6 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 hit_view["keyword_match"] = h["keyword_match"]
             if h.get("matched_fields"):
                 hit_view["matched_fields"] = h["matched_fields"]
-            # grep ヒットが持つ登録者重要度（`grep_search` が条件付きで付ける）を LLM 向け tool result にも転送する（重要文書を優先して精読できるように）。理由が無ければキーを作らない
-            if h.get("importance"):
-                hit_view["importance"] = h["importance"]
-                if h.get("importance_reason"):
-                    hit_view["importance_reason"] = h["importance_reason"]
             if h.get("file_truncated"):
                 # `file_truncated`（`_GREP_FILE_CAP_BYTES` で打ち切られたファイル由来のヒット）を転送する（読む経路と同じ語彙で、cap より後ろが検索できていない可能性を黙らせない）
                 hit_view["file_truncated"] = True
@@ -1467,6 +1620,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 view["truncated"] = True
                 if name == "ripgrep_search" and offset + used_max_hits < MAX_HITS_ABS_MAX:
                     view["next_offset"] = offset + used_max_hits
+                if name == "es_search":
+                    # 上限は断片（チャンク）の数。同じ資料の断片で枠が埋まると、返した資料の数は取得した断片の数より少ない
+                    view["fetched_chunks"] = len(es_hits)
+                    view["returned_docs"] = len({h["doc_id"] for h in valid_es_hits})
+                    view["fetch_cap"] = used_max_hits
             if name == "es_search":
                 view["mode_used"] = mode_used
                 if layer != "docs":  # 層が code を含む。ソースは ES に入っていないので、探し方を案内する（エラーにはしない）
@@ -1818,6 +1976,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     if name == "compare_documents":
         # 実装本体は独立モジュール（`compare_docs.py`）。ここでは範囲・deadline を渡して呼び、① 出典（docs）への反映、② 予算クリップだけを担う
         from ... import compare_docs
+        if any(rules.excluded(v) for v in args.values() if isinstance(v, str)):
+            return (_excluded_error(), docs, cites, cards)
         result = compare_docs.compare(world, args, scope_paths=sp, deadline=deadline)
         status = result.get("status")
         if status == "comparable":
@@ -1845,6 +2005,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         if layer == "code":
             return ({"error": "探す対象がソースに限定されています"}, docs, cites, cards)
         doc_id = str(args.get("doc_id") or "")
+        if rules.excluded(doc_id):
+            return (_excluded_error(), docs, cites, cards)
         kinds = {"xlsx_sheets": _XLSX_KINDS, "xlsx_range": _XLSX_KINDS,
                  "docx_paragraphs": _DOCX_KINDS, "pptx_slides": _PPTX_KINDS,
                  "pdf_pages": _PDF_KINDS, "pdf_page_image": _PDF_KINDS}[name]
@@ -1911,6 +2073,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         return (result, docs, cites, cards)
     if name == "file_head":
         doc_id = str(args.get("doc_id") or "")
+        if rules.excluded(doc_id):
+            return (_excluded_error(), docs, cites, cards)
         resolved = _safe_original_path(world, doc_id, sp, kinds=_FILE_HEAD_KINDS, layer=layer)
         if resolved is None:
             return ({"error": "doc_id が無効、または読み取り対象外です"}, docs, cites, cards)
@@ -1935,20 +2099,16 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
 
 
 def verify_doc_exists(doc_id: str, world: str, scope_paths=None) -> bool:
-    """doc_id が資料フォルダ内に文書として実在するかを確認する（`sources`＝出典フッターの DL リンク・graph card の裏付け doc を機械検証で絞る用途）。次の 3 つを全て満たす必要がある。
-    (1) 実在: `documents.resolve`（`world_graph.resolve_path`＝root 配下への直接解決）。種別を問わず解決するため、これだけでは秘匿ファイルや鍵・内部設定ファイルも通ってしまう。
-    (2) 文書種別: `corpus_docs.status_document_reachable(doc_id, world, allow_content_sniff=True)` が `True`（読めると確定）であること（fail-closed。`None`＝判定不能も「読める」扱いにしない）。画像は派生 MD の有無でなくこの分類で許可する（「本文を読めるか」と「文書として実在するか」は別の問い）。`allow_content_sniff=True` は軽量テキスト枠の第 2 段の文書を「存在しない」と誤判定して出典から除外しないため（本関数は 1 doc_id につき 1 回だけ呼ばれる）。
-    (3) 範囲: `scope_paths` を渡した場合は `scope_mod.in_scope(doc_id, scope_paths)` も満たすこと（多層防御）。
+    """doc_id が資料フォルダ内に文書として実在するかを確認する（`sources`＝出典フッターの DL リンク・graph card の裏付け doc を機械検証で絞る用途）。次の 2 つを全て満たす必要がある。
+    (1) 実在・文書種別・取り込みが外すもの（版管理フォルダ・秘匿名・重要度設定ファイル）でないこと: `doc_reach.doc_reachable`（原本ダウンロードと共有）。画像は派生 MD の有無でなくこの分類で許可する（「本文を読めるか」と「文書として実在するか」は別の問い）。
+    (2) 範囲: `scope_paths` を渡した場合は `scope_mod.in_scope(doc_id, scope_paths)` も満たすこと（多層防御）。
     """
-    if scope_paths is not None and not scope_mod.in_scope(doc_id, scope_paths):
+    rules = path_rules.rules_for(world)
+    if rules.excluded(doc_id):  # 管理者の除外は出典・精読の確かめでも通さない
         return False
-    try:
-        from ... import corpus_docs, documents
-        if corpus_docs.status_document_reachable(doc_id, world, allow_content_sniff=True) is not True:
-            return False
-        return documents.resolve(doc_id, world) is not None
-    except Exception:
+    if scope_paths is not None and not scope_mod.in_scope(doc_id, rules.extend_scope(scope_paths)):
         return False
+    return doc_reach.doc_reachable(doc_id, world)
 
 def _card_source_ok(doc, world: str, sp, cache: dict) -> bool:
     """辺の根拠が指す資料が、実在・範囲内・非秘匿か（辺の `doc` と同じ検証。同じ資料は 1 度だけ調べる）。"""
@@ -2004,3 +2164,31 @@ def _card_verified_doc_ids(card: dict, world: str, scope_paths=None) -> set:
     """
     doc_ids = _card_claimed_doc_ids(card)
     return {d for d in doc_ids if verify_doc_exists(d, world, scope_paths)}
+
+
+def run_tool(name: str, args: dict, world: str, scope_paths,
+             deadline: float | None = None, layer=None,
+             max_hits: int | None = None, window_cap: int | None = None,
+             tool_result_max_bytes: int | None = None,
+             graph_only: bool = False, partial_on_deadline: bool = False) -> tuple[dict, set, list, list]:
+    """道具を実行する（本体は `_run_tool_inner`・仕様はそちらの docstring）。外へ出る境界の最後の網として、結果・触れた資料・引用候補・候補カードから、
+    管理者が検索から外している資料を `path_rules.filter_output` で落とす（設定が無ければ何も変えない）。"""
+    result, docs, cites, cards = _run_tool_inner(
+        name, args, world, scope_paths, deadline=deadline, layer=layer, max_hits=max_hits, window_cap=window_cap,
+        tool_result_max_bytes=tool_result_max_bytes, graph_only=graph_only, partial_on_deadline=partial_on_deadline)
+    try:
+        rules = path_rules.rules_for(world)
+    except path_rules.PathRulesUnavailable:
+        return result, docs, cites, cards
+    if not rules.exclude_paths:
+        return result, docs, cites, cards
+    return (recount_returned_docs(path_rules.filter_output(result, world)), {d for d in docs if not rules.excluded(d)},
+            path_rules.filter_output(cites, world), path_rules.filter_output(cards, world))
+
+
+def recount_returned_docs(result):
+    """`returned_docs` を持つ結果は、残った `hits` の一意の doc_id の数へ数え直して返す（取得時点の `fetched_chunks`・`fetch_cap` は変えない）。
+    AI へ返す出口（簡易チャットの `run_tool`・MCP の最終のクリップの後）で必ず通す。"""
+    if isinstance(result, dict) and "returned_docs" in result and isinstance(result.get("hits"), list):
+        result["returned_docs"] = len({h["doc_id"] for h in result["hits"] if isinstance(h, dict) and h.get("doc_id")})
+    return result

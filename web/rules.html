@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Slouch — 資料の優先と除外</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  .layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}
+  .tasks{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0}
+  .task{display:flex;gap:10px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px}
+  .task .q{font-weight:700}
+  .task .a{font-size:var(--text-small);color:var(--ink-2)}
+  .pill.pri{background:var(--ok-bg);color:var(--ok)}
+  .pill.exc{background:var(--danger-bg);color:var(--danger)}
+  .toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+  .toolbar input[type=search]{flex:1;min-width:180px;min-height:36px;padding:0 10px;border:1px solid var(--control-border);border-radius:var(--radius-sm);background:var(--surface);color:var(--ink);font:inherit}
+  .filterchip{min-height:32px;padding:0 12px;border:1px solid var(--border);border-radius:999px;background:var(--surface);color:var(--ink);font:inherit;font-size:var(--text-small);cursor:pointer}
+  .filterchip.on{background:var(--accent-weak);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+  .treehead,.trow{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:10px;align-items:center;padding:5px 8px}
+  .treehead{font-size:var(--text-caption);color:var(--ink-3);border-bottom:2px solid var(--border)}
+  .trow{border-bottom:1px solid var(--border)}
+  .trow.changed{background:var(--warn-bg)}
+  .tname{display:flex;gap:6px;align-items:center;min-width:0;word-break:break-all}
+  .tname .tog{border:none;background:transparent;cursor:pointer;color:var(--ink-3);font:inherit;padding:0 4px}
+  .tset{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:var(--text-small)}
+  .tset select{min-height:32px;border:1px solid var(--control-border);border-radius:var(--radius-sm);background:var(--surface);color:var(--ink);font:inherit}
+  .tnote{font-size:var(--text-caption);color:var(--ink-3)}
+  .side .item{display:flex;gap:6px;align-items:baseline;padding:4px 0;border-bottom:1px solid var(--border);font-size:var(--text-small);word-break:break-all}
+  .acts{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+  .banner{margin:8px 0;padding:8px 12px;border-radius:var(--radius-sm);background:var(--warn-bg);color:var(--warn);font-size:var(--text-label)}
+  .ovl{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:50}
+  .ovl[hidden]{display:none}
+  .dlg{background:var(--surface);color:var(--ink);border-radius:var(--radius);max-width:620px;width:92vw;max-height:80vh;display:flex;flex-direction:column;box-shadow:var(--shadow-lg)}
+  .dlg .dh{padding:14px 16px;font-weight:700;font-size:var(--text-section);border-bottom:1px solid var(--border)}
+  .dlg .db{padding:12px 16px;overflow:auto;font-size:var(--text-label)}
+  .dlg .df{padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:10px;justify-content:flex-end}
+  #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
+</style>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div class="wrap">
+  <div id="access-denied">
+    <div style="font-size:32px;margin-bottom:12px">🚫</div>
+    <div style="font-size:var(--text-body);font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:var(--text-label)">管理者権限が必要です。</div>
+  </div>
+
+  <div id="main-content">
+    <a class="crumb" href="ingest.html">← 資料</a>
+    <div class="pagehead">
+      <div><h1>資料の優先と除外</h1>
+        <div class="sub">質問に答えるとき、先に読ませたい資料と、検索に出したくない資料を選びます。設定できるのは管理者だけです。</div></div>
+      <div class="spacer"></div>
+      <a class="help-link" href="manual.html#importance">この画面の使い方 →</a>
+    </div>
+
+    <div class="banner" id="removed-banner" role="status" hidden></div>
+
+    <div class="tasks">
+      <div class="task"><span class="pill pri">優先</span><div>
+        <div class="q">正本の設計書を、回答で先に使わせたい</div>
+        <div class="a">選んだ範囲の中で先に読み、上の方に出します。「範囲の外でも読む」を付けると、利用者がほかの範囲を選んでいても、その資料を探す対象に足します。</div></div></div>
+      <div class="task"><span class="pill exc">除外</span><div>
+        <div class="q">古い版や下書きを、回答に使わせたくない</div>
+        <div class="a">利用者が何を選んでいても、検索に出しません。Windows のフォルダ・ファイルは消えません。いつでも「なし」に戻せます。</div></div></div>
+    </div>
+
+    <div class="layout">
+      <div class="card" style="margin-bottom:0">
+        <div class="card-head"><div><div class="title" id="world-title">資料フォルダ</div>
+          <div class="sub">フォルダかファイルを 1 つずつ選びます。フォルダに付けると、中のフォルダ・ファイルすべてに効きます。</div></div></div>
+        <div class="toolbar">
+          <input type="search" id="q" placeholder="フォルダ名・ファイル名で探す" aria-label="フォルダ名・ファイル名で探す">
+          <span class="muted">表示:</span>
+          <button class="filterchip on" type="button" data-f="all">すべて</button>
+          <button class="filterchip" type="button" data-f="pri">優先</button>
+          <button class="filterchip" type="button" data-f="exc">除外</button>
+          <button class="filterchip" type="button" data-f="unsaved">まだ保存していない</button>
+        </div>
+        <div class="treehead"><span>名前</span><span>設定</span></div>
+        <div id="tree" aria-busy="true"></div>
+        <div id="rootmore" style="padding:8px"></div>
+      </div>
+
+      <aside class="card side" style="margin-bottom:0">
+        <div class="card-head"><div><div class="title">今の設定</div>
+          <div class="sub" id="sidesub"></div></div></div>
+        <div id="sidelist"></div>
+        <div class="acts">
+          <button class="btn-primary" type="button" id="savebtn" disabled>保存する…</button>
+          <button class="btn-ghost" type="button" id="discardbtn" disabled>まだ保存していない変更を取り消す</button>
+        </div>
+      </aside>
+    </div>
+  </div>
+</div>
+
+<div class="ovl" id="ovl" role="dialog" aria-modal="true" aria-labelledby="dlgh" hidden>
+  <div class="dlg">
+    <div class="dh" id="dlgh">この内容で保存しますか</div>
+    <div class="db" id="dlgbody"></div>
+    <div class="df">
+      <button class="btn-ghost" type="button" id="cancelbtn">キャンセル（保存しない）</button>
+      <button class="btn-primary" type="button" id="okbtn">保存する</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast" role="status"></div>
+<script src="rules.js"></script>
+</body>
+</html>

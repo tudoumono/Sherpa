@@ -73,7 +73,7 @@ _PARAMS_SEARCH = {"type": "object", "properties": {
               "description": "ヒットの開始位置（既定0）。truncated:true のときは next_offset をそのまま渡すと続きが取れる"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["query"]}
-# es_search は offset を持たない（kNN の候補集合はページ間で固定できず、ページを跨ぐと順位の入れ替わりで重複/欠落が起きる）。続きが必要なら max_hits（絶対上限まで）を増やす。
+# es_search は offset を持たない（kNN の候補集合はページ間で固定できず、ページを跨ぐと順位の入れ替わりで重複/欠落が起きる）。上限 max_hits は管理画面の調べる深さが決める内部の値で、AI が渡せる引数ではない。
 _PARAMS_ES_SEARCH = {"type": "object", "properties": {
     "query": {"type": "string", "description": "検索キーワード（型番・関数名・固有名詞など具体語が有効）。exact だけで引くときは省略できる"},
     "mode": {"type": "string", "enum": ["hybrid", "keyword", "vector"],
@@ -95,7 +95,7 @@ _PARAMS_LIST_DOCS = {"type": "object", "properties": {
                               "'Excel' では .xls を含まない。値が不明なら doctype なしで1回呼んで確認する）。省略可"},
     "state": {"type": "string",
              "description": "状態の完全一致で絞る（'ready'=使える・'unreadable'=読み取れない・"
-                            "'unknown'=直近確認が未実施）。省略可"},
+                            "'unknown'=直近確認が未実施か、台帳から種類が分からない＝kind_unknown の行）。省略可"},
     "limit": {"type": "integer", "description": "一覧に含める最大件数（既定200・上限500）。件数(count)は limit/offset と無関係に全件を返す"},
     "offset": {"type": "integer",
               "description": "一覧の開始位置（既定0）。truncated:true のときは next_offset をそのまま渡すと続きが取れる"},
@@ -172,7 +172,12 @@ _DESC_LIST_DOCS = ("文書台帳の一覧・件数を返す（本文は読まな
                    "count は絞り込み後の全件数（limit/offset と無関係）、docs は offset から limit 件までの"
                    "一覧（rel_path/doctype/state）。truncated:true なら残りがある——次回呼び出しの offset に"
                    "next_offset をそのまま渡して続きを取る。"
-                   "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。")
+                   "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。"
+                   "path_prefix を指定すると、そのフォルダに取り込みの後に置かれた資料（索引に入っていない）も"
+                   "after_ingest に出す。"
+                   "結果に kind_unknown（種類が分からない資料の件数。台帳から種類を補えない）と kind_unknown_notice が付くときは、"
+                   "層・種類（doctype）の絞り込みの件数や「該当なし」は確定しない（kind_unknown_dropped は doctype／state の絞り込みで落とした分）——"
+                   "その資料は state:'unknown' で絞って中身で確かめる。")
 # list_docs（フラット一覧）に対する tree 相当のツール。フォルダ名の意味解釈はせず、クエリ時に呼び出し元の LLM が解釈する。
 _DESC_FOLDER_TREE = ("world のフォルダ階層を、深さ上限つき・フォルダごとの件数つきで俯瞰する"
                      "（本文は読まない・grep しない・list_docs のフラット一覧では階層の形が掴めない"
@@ -180,7 +185,8 @@ _DESC_FOLDER_TREE = ("world のフォルダ階層を、深さ上限つき・フ�
                      "フォルダごとに直下ファイル数・配下（再帰）ファイル数・直下サブフォルダ数を返す。"
                      "深さ上限でまだ配下があるフォルダは truncated:true（depth を上げて掘り下げる）。"
                      "フォルダ件数自体が多すぎるときは folders_truncated:true（count が打ち切り前の総数）＝続きは取れないので、その範囲は未確認として扱う。"
-                     "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。")
+                     "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。"
+                     "結果に kind_unknown（種類が分からない資料の件数）が付くときは、層ごとの件数は確定しない（層が分からない資料はどの層にも数えている）——中身で確かめる。")
 _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素・意味の近さ・関連度ランキング）。"
             "対象は資料（Office・PDF など）で、ソース（コード）は索引に含まれない——ソースは ripgrep_search で探す。"
             "言い回しが揺れる概念・日本語の同義語・自然文クエリに強い。"
@@ -194,7 +200,11 @@ _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素�
             "row_group_text_cut は表の行の束の本文を予算のため省いた（chunks の行は read_around か read_doc で読む）。"
             "row_group_exact_chunk_ids は exact で一致した束の中の行の chunk_id（束のどの行の識別子で当たったか）。"
             "ingest_time_text は取り込み時点の本文で、今の原本との対応を確かめていない（変更中の資料の可能性がある・確定の根拠にする前に原本を読む）。"
-            "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。"
+            "truncated:true は取得の上限に達した＝母集団の一部しか見ていない（続きは取れない）。上限は資料の数ではなく断片（チャンク）の数で、"
+            "同じ資料の断片で枠が埋まることがある——fetched_chunks（取得した断片の数）・returned_docs（返した資料の数）・fetch_cap（この呼び出しの取得の上限）で内訳を見る。"
+            "上限に当たったら、path_prefix でフォルダを絞る・exact で完全一致にする・mode を変える・具体語で言い換える・ripgrep_search のページ送りに切り替える、のどれかで探し直す。"
+            "意味検索は残りがあるだけで全部を読む必要はない——未解決の論点に合わせて、絞る・言い換える・別の道具で続きを取るを選び、読み切れない範囲は未確認として扱う"
+            "（全件が要る列挙は別）。"
             "es_search は候補の発見用——全件が必要な列挙は ripgrep_search"
             "（truncated:true なら next_offset を offset に渡して続きを取る）・list_docs・原本の読取で行う。"
             "項目ID・画面ID・帳票ID のような鍵付きの問いは exact で引く（Office・PDF の資料のレコードが対象・query は省略できる・query と併せると exact で絞ってから本文で順位付け）。"
@@ -240,7 +250,7 @@ _DESC_GRAPH_RESOLVE = ("関係グラフから、名前（の一部）・種別�
                        "match（exact＝名前が一致／partial＝部分一致）を持つ。"
                        "影響を調べる前に、候補の path などから正しい起点を選び、その canonical_id を graph_impact へ渡す"
                        "（候補が複数あって選べないときは、ユーザーに ask_user で確認してよい）。"
-                       "候補が limit より多いときは count（総数）と coverage（complete:false・limits[].kind=result_cap・omitted）が付く"
+                       "候補が limit より多いときは count が null（limit+1 件までしか取らないので総数は分からない）で、coverage（complete:false・limits[].kind=result_cap）が付く"
                        "＝path・kind・path_prefix（フォルダ）で絞って呼び直す。coverage.complete が false のとき、候補が空でも「該当なし」とは言えない"
                        "（理由は coverage.limits[].kind）。"
                        f"{_ITEM_PARAM_NOTE}")
@@ -307,13 +317,20 @@ _PARAMS_GLOB = {"type": "object", "properties": {
                "description": ("ファイル名/パスのワイルドカードパターン。`*`/`?`/`[seq]` は1階層内のみ・"
                                "`**` は複数階層をまたぐ。スラッシュを含まなければファイル名として"
                                "どの階層でも探す（例: '*.jcl'・'*請求書*.xlsx'・'**/障害対応/*.md'）")},
+    "offset": {"type": "integer", "description": "続きの位置（既定 0）。前の応答の next_offset をそのまま渡す"},
+    "generation": {"type": "string", "description": "続き（offset が 1 以上）の呼び出しで、前の応答の generation をそのまま渡す（一覧が入れ替わっていないことの確認用）"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["pattern"]}
 _DESC_GLOB = ("ファイル名・フォルダ名のパターンで対象範囲内のファイルを列挙する（中身は読まない・パスのみ）。"
-             "大文字小文字は区別しない。該当パス一覧と総件数を返す（上限200件・超過分は打ち切り＝truncated:true。"
-             "続きは取れないので、その範囲は未確認として扱い count との差を全件と断定しない）。"
+             "大文字小文字は区別しない。該当パス一覧と総件数（count）を返す（1 ページ 200 件・パスの昇順。"
+             "残りがあれば truncated:true と next_offset が付く。**next_offset が null でないときは、同じ pattern に offset=next_offset と"
+             "応答の generation を付けて呼び直し**、next_offset が null になるまで続ける。続きを取るまでは一覧が途中であることを前提にし、"
+             "先頭のページだけで全件とは言わない）。generation が無いときは glob_generation_required、違うときは glob_generation_mismatch のエラーになる"
+             "（mismatch は資料が入れ替わった印＝generation を付けずに offset 0 から取り直す。required は generation を付けて呼び直す）。"
              "『x/**』は x 自体にも一致する（配下だけに絞るなら『x/**/*』）。"
-             "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。")
+             "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。"
+             "付いていない（generation が walk）ときは資料フォルダを歩いた一覧で、ページの間で一覧が変わることがある（notice）。"
+             "結果に kind_unknown（種類が分からない資料の件数。ページ内でなく全一致の件数）が付くときは、層の絞り込みの件数は確定しない（層が分からない資料はどの層にも含めている）——中身で確かめる。")
 # grep と同格の素朴な決定的ツール。2 文書の RAG 正本（.rag.md）の unified diff を返すだけで、レコード同定・業務キー対応付け・要約は呼び出し元の LLM が diff を読んで行う。
 _DESC_COMPARE = ("2つの文書のRAG正本（.rag.md）を突き合わせ、追加/削除/変更行の unified diff を返す"
                  "（grepと同格の決定的な文字列比較——要約や業務レコードの対応付けはしない・"

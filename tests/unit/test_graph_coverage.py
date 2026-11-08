@@ -373,7 +373,6 @@ def test_depth_check_overload_keeps_main_result_and_marks_unknown(monkeypatch):
 
     monkeypatch.setattr(world_neo4j, "world_impact", _wi)
     monkeypatch.setattr(world_neo4j, "read_unresolved", lambda *a, **k: {"available": False, "items": [], "omitted": 0})
-    monkeypatch.setattr(world_neo4j.worlds, "world_dir", lambda w: None)
     res = world_neo4j.run_world_impact(object(), "A", "w", depth=3)
     assert res["items"] == items
     assert res["coverage"] == {"complete": False, "limits": [{"kind": "timeout", "stage": "impact"}],
@@ -392,7 +391,6 @@ def test_world_impact_converts_depth_check_overload_to_unknown(monkeypatch):
 
     monkeypatch.setattr(world_neo4j, "_run_read_capped", _run)
     monkeypatch.setattr(world_neo4j, "check_schema_era", lambda *a, **k: None)
-    monkeypatch.setattr(world_neo4j, "_attach_importance", lambda *a, **k: None)
     info: dict = {}
     items = world_neo4j.world_impact(object(), ["c"], "w", depth=1, info=info)
     assert len(items) == 1 and info == {"depth_truncated": None, "depth_check_limit": "timeout"}

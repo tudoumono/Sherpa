@@ -6,6 +6,7 @@
 - 同一ファイル内は glob がフォルダ既定（`*`）より優先し、複数一致は後勝ち。
 - `なし` は祖先の指定を打ち消して中立に戻す（それより上へは遡らない）。
 - どれにも一致しなければ値を持たない（戻り dict にキーが現れない）。
+検索・回答・画面は使わない。取り込みの台帳・ES へ値を書く処理のためだけに残している。
 `_重要度.txt` 自体は文書として扱わない（`is_importance_control_path`）が、ファイル署名
 （`ingest.worker.world_signature`）には残す。構文エラーは行単位で無効化し `Diagnostic` に集約する。
 解決結果は `(world_id, root の実パス, 実効署名)` をキーにプロセス内でキャッシュする。
@@ -17,7 +18,7 @@ import hashlib
 import logging
 import re
 from collections import OrderedDict
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .. import scope_infer, worlds
@@ -70,16 +71,6 @@ class Resolution:
     reason: str | None
     config_path: str          # 勝者となった `_重要度.txt` の world 相対 rel_path（監査用）
     rule_line: int            # 勝者となった規則の行番号（監査用）
-
-
-# 検索/影響の並び順だけが使う順位専用スケール（表示値ではない）。未設定は「中」と同格
-RANK: dict[str, int] = {"高": 2, "中": 1, "低": 0}
-RANK_UNSET = 1   # 未設定（dict にキーが無い rel）の rank（＝「中」と同格）
-
-
-def rank_of(res: "Resolution | None") -> int:
-    """順位専用スケール（`RANK`）での rank。未解決（`res is None`）は `RANK_UNSET`。"""
-    return RANK.get(res.value, RANK_UNSET) if res is not None else RANK_UNSET
 
 
 def public_fields(res: "Resolution | None") -> dict:
@@ -396,24 +387,3 @@ def resolve_for_world(world_id: str, *, root=None, sig: str | None = None, files
     if len(_CACHE) > _CACHE_MAX:
         _CACHE.popitem(last=False)                       # 最も古いキーを追い出す
     return result
-
-
-def resolve_many(world_id: str, rels, *, root=None, sig: str | None = None, files=None) -> dict[str, Resolution]:
-    """`resolve_for_world` の結果から指定した rel だけを取り出す。`root`/`sig`/`files` はそのまま転送する。"""
-    all_res = resolve_for_world(world_id, root=root, sig=sig, files=files)
-    return {r: all_res[r] for r in rels if r in all_res}
-
-
-def diagnostics_for_world(world_id: str, *, root=None, files=None) -> list[dict]:
-    """資料フォルダ内の全 `_重要度.txt` の構文診断（台帳の `control_diagnostics` 用）。`root`/`files` は解決・列挙済みなら渡す。"""
-    wd = root if root is not None else worlds.world_dir(world_id)
-    if not wd:
-        return []
-    out: list[dict] = []
-    entries = files if files is not None else scope_infer.safe_files(wd)
-    for rp, rel in entries:
-        if not is_importance_control_path(rel):
-            continue
-        _rules, diags = parse_control_file(rp, config_rel=rel)
-        out.extend(asdict(d) for d in diags)
-    return out

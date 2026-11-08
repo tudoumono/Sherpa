@@ -238,15 +238,6 @@ def test_grep_search_tree_signature_walk_raises_grep_deadline(tmp_path, monkeypa
     assert stats["deadline_exceeded"] is True
 
 
-def test_walk_importance_fallback_walk_honors_deadline(tmp_path):
-    for i in range(5):
-        (tmp_path / f"f{i}.txt").write_text("x\n", encoding="utf-8")
-    assert grep_tool._walk_importance("v1", tmp_path) == {}
-    assert grep_tool._walk_importance("v1", tmp_path, time.monotonic() + 60) == {}
-    with pytest.raises(grep_tool.GrepDeadlineExceeded):
-        grep_tool._walk_importance("v1", tmp_path, time.monotonic() - 1)
-
-
 def test_candidate_entries_checks_deadline_periodically(tmp_path):
     cand = {}
     for i in range(grep_tool._DEADLINE_CHECK_ENTRIES + 20):

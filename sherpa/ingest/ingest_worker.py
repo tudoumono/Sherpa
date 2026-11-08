@@ -22,7 +22,7 @@ import time
 from .. import app_version, store, webhooks
 from ..env_int import env_int
 from ..store import workers as store_workers
-from . import background, jobs, worker_state
+from . import background, connectivity_relay, jobs, worker_state
 
 _log = logging.getLogger("sherpa")
 
@@ -47,16 +47,25 @@ class _Beat:
         self._world: str | None = None
         self._label: str | None = None     # run 以外の処理（LLM 成形）を状態ファイルへ出すときの表示名
         self._stop = threading.Event()
+        self._relay = connectivity_relay.Relay()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="sherpa-ingest-worker-beat")
 
     def start(self) -> None:
         self.write()
         self._thread.start()
+        self._poll_relay()  # 取り込み 1 件で終わるワーカーも、起動したときに頼みを 1 度見る
+
+    def _poll_relay(self) -> None:
+        try:
+            self._relay.poll()
+        except Exception:
+            _log.debug("つながりの確認の頼みの確認に失敗しました（best-effort）", exc_info=True)
 
     def stop(self, state: str) -> None:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=5)
+        self._relay.wait()
         with self._lock:
             self._state, self._run_id, self._world, self._label = state, None, None, None
         self.write()
@@ -88,6 +97,7 @@ class _Beat:
     def _loop(self) -> None:
         while not self._stop.wait(worker_state.BEAT_SEC):
             self.write()
+            self._poll_relay()
 
 
 def run_claimed(row: dict) -> None:
@@ -279,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
     worker_id = worker_state.new_worker_id("ingest")
     version = app_version.current()
     store.init_schema()
+    from .. import proxy_bypass
+    proxy_bypass.apply()
     liveness = store_workers.hold_liveness_lock(worker_id)
     beat = _Beat(worker_id, version)
     beat.start()

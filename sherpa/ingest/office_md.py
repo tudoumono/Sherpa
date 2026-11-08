@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
 
-from .. import json_io
+from .. import derived_suffixes, json_io
 from ..env_int import env_int
 from . import background, encryption, mem_guard, substage
 from . import text_kind
@@ -1029,7 +1029,7 @@ def _load_ocr_observation_sets(extracted_evidence, rel: str, obs_dir: Path | Non
 
     rel_posix = PurePosixPath(rel.replace("\\", "/"))
     base = obs_dir.joinpath(*rel_posix.parts)
-    jsonl_path = Path(str(base) + ".ai_observations.jsonl")
+    jsonl_path = Path(str(base) + derived_suffixes.OBSERVATION)
     if not jsonl_path.is_file():
         return []
     sets = []
@@ -1464,9 +1464,9 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
 # 設計: docs/design/rag.md「失敗した資料のやり直し」
 # 公開中の md／rag／ir のうち 1 つの rel に属するファイル（`.derived.json` は最後に置き換えるので別に扱う）。
 _REL_FILE_SUFFIXES = {
-    "ir": (".document.json", ".evidence.json", ".context.json", ".ocr_route.json"),
-    "rag": (".rag.md", ".rag_chunks.jsonl"),
-    "md": (".md", ".md.meta.json"),
+    "ir": derived_suffixes.IR,
+    "rag": derived_suffixes.RAG,
+    "md": derived_suffixes.MD,
 }
 
 
@@ -1562,9 +1562,9 @@ def _publish_targets(derived, rel: str) -> tuple[dict, list]:
     roots = {"md": published, "rag": _sibling_layer_dir(published, "rag"),
              "ir": _sibling_layer_dir(published, "ir")}
     names = [(layer, rel + suffix) for layer in ("ir", "rag", "md") for suffix in _REL_FILE_SUFFIXES[layer]]
-    names.insert(len(_REL_FILE_SUFFIXES["ir"]) + len(_REL_FILE_SUFFIXES["rag"]), ("rag", rel + ".assets"))
+    names.insert(len(_REL_FILE_SUFFIXES["ir"]) + len(_REL_FILE_SUFFIXES["rag"]), ("rag", rel + derived_suffixes.ASSETS))
     # 回答時に描いたページ画像（pdf_page_image の置き場所）も、差し替えで古い原本の分を残さない
-    names.insert(len(_REL_FILE_SUFFIXES["ir"]) + len(_REL_FILE_SUFFIXES["rag"]) + 1, ("rag", rel + ".pages"))
+    names.insert(len(_REL_FILE_SUFFIXES["ir"]) + len(_REL_FILE_SUFFIXES["rag"]) + 1, ("rag", rel + derived_suffixes.PAGES))
     names.append(("ir", rel + _DERIVED_MANIFEST_SUFFIX))
     return roots, names
 
@@ -3112,7 +3112,7 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
     return {"document_ir_generated": generated, "document_ir_failed": failed, "document_ir_failures": failures}
 
 
-_DERIVED_MANIFEST_SUFFIX = ".derived.json"
+_DERIVED_MANIFEST_SUFFIX = derived_suffixes.MANIFEST
 # `{rel}.derived.json` は原本ごとに、検索 consumer 側の設定（ES への RAG 反映の有無等）に関係なく常時生成する。
 # マニフェスト形式のバージョン（`sidecars`/`assets` キーの構成が変わったら上げる）。現行値と一致しないマニフェスト
 # （キー自体を持たない旧世代を含む）は `rag_sidecars_missing` が「欠落」として扱い、全再構築で書き直させる。

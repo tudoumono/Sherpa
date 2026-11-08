@@ -173,6 +173,7 @@ from .settings import (
     count_users_with_personal_keys,
     get_settings,
     get_system_settings,
+    modify_system_setting,
     purge_personal_api_keys,
     seed_user_agent_once,
     seed_system_settings_once,

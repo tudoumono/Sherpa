@@ -29,8 +29,8 @@ def _clamp_depth(raw) -> int:
 
 
 def build(world: str, args: dict, *, scope_paths=None, deadline: float | None = None, layer=None,
-         tool_result_max_bytes: int | None = None) -> dict:
-    """`folder_tree` ツール本体。
+         tool_result_max_bytes: int | None = None, rules=None) -> dict:
+    """`folder_tree` ツール本体。管理者の除外（`rules`）の下のファイルは数えない。
 
     `path_prefix` 配下・`depth`（省略時3・1〜10 にクランプ）までの各フォルダについて、パス・直下ファイル数・配下（再帰）
     ファイル数・直下サブフォルダ数を返す。`scope_paths` と `layer`（`list_docs` と同じ確定判定）は硬いフィルタ。
@@ -56,16 +56,21 @@ def build(world: str, args: dict, *, scope_paths=None, deadline: float | None = 
 
     # フォルダ集計: {folder_parts: {"direct", "total", "children"}}。集計は depth でクランプせず、出力時にだけ絞る
     agg: dict = {}
+    unknown = 0
     for r in rows:
         rel = r.get("name")
         if not rel:
             continue
         if not scope_mod.in_scope(rel, sp):
             continue
+        if rules is not None and rules.excluded(rel):
+            continue
         if prefix and not scope_mod.in_scope(rel, [prefix]):
             continue
-        if not layer_mod.in_layer_code(r.get("branch") == "source", layer):
+        if not layer_mod.in_layer_row(r, layer):
             continue
+        if doc_ledger.is_kind_unknown(r):
+            unknown += 1
         dir_parts = rel.split("/")[:-1]  # ファイル名を除いたフォルダ階層
         if len(dir_parts) <= base_depth:
             continue
@@ -113,4 +118,7 @@ def build(world: str, args: dict, *, scope_paths=None, deadline: float | None = 
     }
     if listing.ledger_at:
         result["ledger_at"] = listing.ledger_at
+    if unknown:
+        result["kind_unknown"] = unknown
+        result["kind_unknown_notice"] = doc_ledger.kind_unknown_notice(unknown)
     return result

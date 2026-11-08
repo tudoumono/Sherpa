@@ -121,6 +121,7 @@ POLICY: dict[tuple[str, str], str] = {
     ("PUT", "/admin/settings"): "admin",
     ("POST", "/admin/settings/openai-endpoint-test"): "admin",
     ("POST", "/admin/settings/ollama-test"): "admin",
+    ("POST", "/admin/connectivity/check"): "admin",
     ("GET", "/admin/users"): "admin",
     ("POST", "/admin/users"): "admin",
     ("POST", "/admin/users/import"): "admin",
@@ -141,11 +142,15 @@ POLICY: dict[tuple[str, str], str] = {
     ("POST", "/worlds/diff"): "admin",
     ("POST", "/worlds/disk-estimate"): "admin",
     ("GET", "/worlds/{wid}/status"): "admin",
+    ("GET", "/worlds/{wid}/folder-check"): "admin",
     ("POST", "/worlds/{wid}/recount"): "admin",
     ("POST", "/worlds/{wid}/rebind"): "admin",
     ("POST", "/worlds/{wid}/refresh"): "admin",
     ("POST", "/worlds/{wid}/reconvert"): "admin",
     ("POST", "/worlds/{wid}/rag_regenerate_rules"): "admin",
+    ("GET", "/admin/path-rules"): "admin",
+    ("PUT", "/admin/path-rules"): "admin",
+    ("GET", "/admin/path-rules/files"): "admin",
     ("GET", "/worlds/{wid}/resolve-settings"): "admin",
     ("PUT", "/worlds/{wid}/resolve-settings"): "admin",
     ("DELETE", "/worlds/{wid}"): "admin",
@@ -357,7 +362,10 @@ def test_policy_covers_all_routes():
     # admin=取り込みワーカーの版の照合（GET /ingest/workers）で45、ディスク容量の見積もり（POST /worlds/disk-estimate）で46。
     # admin=ナレッジグラフ画面の廃止（GET /graph・/graph/facets・/graph/search）3件撤去で43、資料フォルダのグラフ（GET /ingest/preview/graph）で44。
     # admin=管理画面の Ollama 接続テスト（POST /admin/settings/ollama-test）1件追加で45。
-    assert len(ADMIN_ROUTES) == 45
+    # admin=管理画面の「つながりの確認」（POST /admin/connectivity/check）1件追加で46。
+    # admin=資料の優先と除外（GET/PUT /admin/path-rules・GET /admin/path-rules/files）3件追加で49。
+    # admin=フォルダの置き方の点検（GET /worlds/{wid}/folder-check）1件追加で50。
+    assert len(ADMIN_ROUTES) == 50
     # ext_key=旧6＋Codex ジョブ API 4本（受付・状態・結果・取消・`C-EXT-CODEXJOB-*`）で10。
     assert len(EXT_KEY_ROUTES) == 10
     assert len(SPECIAL_ROUTES) == 7

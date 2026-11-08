@@ -174,28 +174,6 @@ def test_index_world_carries_importance_meta_to_chunks(monkeypatch, tmp_path, re
             assert all("importance" not in c and "importance_reason" not in c for c in chunks)
 
 
-def test_importance_boost_query_wraps_in_function_score_with_high_low_only():
-    wrapped = es_index._importance_boost_query({"bool": {"must": [{"match": {"text": "q"}}], "filter": []}})
-    fs = wrapped["function_score"]
-    assert fs["query"] == {"bool": {"must": [{"match": {"text": "q"}}], "filter": []}}
-    assert fs["score_mode"] == "first" and fs["boost_mode"] == "multiply"
-    assert {f["filter"]["term"]["importance"] for f in fs["functions"]} == {"高", "低"}
-
-
-def test_rerank_knn_by_importance(monkeypatch):
-    monkeypatch.setattr(es_index, "_ES_IMPORTANCE_BOOST_HIGH", 2.0)
-    monkeypatch.setattr(es_index, "_ES_IMPORTANCE_BOOST_LOW", 0.5)
-    hits = [{"doc_id": "a", "score": 1.0, "importance": "低"}, {"doc_id": "b", "score": 1.0},
-            {"doc_id": "c", "score": 1.0, "importance": "高"}]
-    out = es_index._rerank_knn_by_importance(hits)
-    assert [h["doc_id"] for h in out] == ["c", "b", "a"]
-    assert out[0]["score"] == 2.0 and out[2]["score"] == 0.5
-    # importance を誰も持たなければスコア・順序とも不変
-    plain = [{"doc_id": "a", "score": 3.0}, {"doc_id": "b", "score": 2.0}, {"doc_id": "c", "score": 1.0}]
-    out = es_index._rerank_knn_by_importance(list(plain))
-    assert [h["doc_id"] for h in out] == ["a", "b", "c"] and [h["score"] for h in out] == [3.0, 2.0, 1.0]
-
-
 def test_index_world_pass2_progress_resets_to_zero_and_advances_for_excluded_docs(monkeypatch):
     _index_env(monkeypatch, [_doc("skip.md", state="unreadable"), _doc("a.md")])
     calls = []
@@ -570,7 +548,7 @@ def test_search_hybrid_failure_with_bm25_success_is_hybrid_query_failed(monkeypa
             return {"idx": {"mappings": {"_meta": {
                 **_HYBRID_META, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT}}}}
         if method == "POST" and path.endswith("/_search"):
-            inner = (body or {}).get("query", {}).get("function_score", {}).get("query", {})
+            inner = (body or {}).get("query", {})
             if "knn" in inner:                          # hybrid の kNN 側のリクエスト
                 raise RuntimeError("hybrid query failed (dimension mismatch etc.)")
             return {"hits": {"hits": [{"_source": {"doc_id": "a.md", "line": 1, "text": "hit"}, "_score": 1.0}]}}
@@ -664,7 +642,7 @@ def test_search_hybrid_rrf_weight_follows_hybrid_weight(monkeypatch, weight):
         return {"_id": i, "_source": {"doc_id": f"{i}.md", "text": "t"}, "_score": 1.0}
 
     def fake_req(method, path, body=None, **kw):
-        inner = body["query"]["function_score"]["query"]
+        inner = body["query"]
         return {"hits": {"hits": [hit("v" if "knn" in inner else "k")]}}
 
     monkeypatch.setattr(es_index, "_req", fake_req)

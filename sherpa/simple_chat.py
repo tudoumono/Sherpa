@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterator
 
-from . import agentic_search, keys, llm, metering, model_catalog, store
+from . import agentic_search, keys, llm, metering, model_catalog, path_rules, store
 from .parts.read.tools import verify_doc_exists
 from .tool_dispatch import run_tool
 
@@ -243,6 +243,34 @@ def _check_deadline(absolute_deadline: float | None) -> float:
     return remaining
 
 
+def round_messages(system_prompt: str, query: str, *, history: list | None = None, extra_context: str = "") -> list:
+    """道具ループの最初の messages（system・直前までの会話・今回の質問）。`iter_tool_loop` とつながりの確認が共有する。"""
+    system = system_prompt + (("\n\n" + extra_context) if extra_context else "")
+    return [{"role": "system", "content": system}, *(history or []), {"role": "user", "content": query}]
+
+
+def round_body(provider: str, model: str, msgs: list, tools: list) -> dict:
+    """道具ループの 1 往復の本文。`iter_tool_loop` とつながりの確認が共有する。"""
+    body = {"model": model, "messages": msgs}
+    if tools:
+        body["tools"] = tools
+    if provider == "ollama":
+        body["stream"] = False
+        body["options"] = {"temperature": 0.2}
+    return body
+
+
+def round_message_raw(resp):
+    """1 往復の応答から assistant の message を取り出す（OpenAI 形式と Ollama 形式）。無ければ None。つながりの確認と `round_message` が共有する。"""
+    return ((resp.get("choices") or [{}])[0].get("message") if "choices" in resp
+            else resp.get("message"))
+
+
+def round_message(resp) -> dict:
+    """`iter_tool_loop` が使う assistant の message（無ければ空）。"""
+    return round_message_raw(resp) or {}
+
+
 def iter_tool_loop(state: LoopState, *, provider: str, model: str, endpoint: str, headers: dict,
                    system_prompt: str, query: str, world: str, scope_paths: list | None,
                    history: list | None = None, stop_event=None, extra_context: str = "",
@@ -263,21 +291,14 @@ def iter_tool_loop(state: LoopState, *, provider: str, model: str, endpoint: str
     tools = (_build_tools(availability if availability is not None else agentic_search.tool_availability())
              if offer_tools else [])
     offered_names = frozenset(_TOOL_DEFS.keys()) & {t["function"]["name"] for t in tools}
-    system = system_prompt + (("\n\n" + extra_context) if extra_context else "")
-    msgs = [{"role": "system", "content": system}, *(history or []),
-            {"role": "user", "content": query}]
+    msgs = round_messages(system_prompt, query, history=history, extra_context=extra_context)
     seen_docs = set(state.touched_docs)
 
     for _round in range(MAX_ROUND_TRIPS):
         if _stopped():
             state.stopped = True
             return
-        body = {"model": model, "messages": msgs}
-        if tools:
-            body["tools"] = tools
-        if provider == "ollama":
-            body["stream"] = False
-            body["options"] = {"temperature": 0.2}
+        body = round_body(provider, model, msgs, tools)
         try:
             resp = agentic_search._post(endpoint, headers, body, timeout=_per_call_timeout())
         except AnswerTimeout:
@@ -290,8 +311,7 @@ def iter_tool_loop(state: LoopState, *, provider: str, model: str, endpoint: str
             raise LLMUnavailable("既定の AI に接続できませんでした。管理者に設定を確認してください。") from e
         state.llm_calls += 1
         agentic_search._acc_openai_usage(state.usage_acc, resp, provider == "ollama")
-        msg = ((resp.get("choices") or [{}])[0].get("message") if "choices" in resp
-              else resp.get("message")) or {}
+        msg = round_message(resp)
         calls = msg.get("tool_calls") or []
         if not calls or not offer_tools:   # 道具なしは 1 回で終える（tool call が返っても呼び直さない）
             state.final_text = agentic_search._openai_style_text(msg)
@@ -352,6 +372,9 @@ def verify_sources(state: LoopState, world: str, scope_paths: list | None,
         if not verify_doc_exists(doc_id, world, scope_paths):
             continue
         source = {"doc_id": doc_id}
+        note = path_rules.rules_for(world).outside_note(doc_id, scope_paths)
+        if note:
+            source["note"] = note  # 範囲の外でも読む優先の資料に注記を付ける
         for c in state.cites:
             if c.get("doc_id") == doc_id:
                 locator = _locator_from_span(c.get("span"))

@@ -46,7 +46,7 @@ class Listing(NamedTuple):
 
 def _listing_row_from_ledger(r: dict) -> dict | None:
     """台帳の 1 行 → 一覧の道具が使う形（`name`／`doctype`／`branch`／`status`）。
-    doctype／branch が欠けていれば状態に関係なく名前から補い、補えなければ None（呼び出し元が歩く経路へ戻す）。
+    doctype／branch が欠けていれば状態に関係なく名前から補い、補えなければ None（呼び出し元が `_unresolved_listing_row` で扱う）。
     """
     name = r["name"]
     doctype, branch, status = r.get("doctype"), r.get("branch"), r.get("status")
@@ -56,6 +56,15 @@ def _listing_row_from_ledger(r: dict) -> dict | None:
             return None
         doctype, branch = doctype or got[0], branch or got[1]
     return {"name": name, "doctype": doctype, "branch": branch, "status": status}
+
+
+def _unresolved_listing_row(r: dict) -> dict:
+    """名前から種類を補えない台帳の行。台帳の値のまま（空は空）で、歩かずに出す。
+    補えない行は、歩くと `unreadable` で `doctype`／`branch` が空になる行か、古い版が書いた行・中身を読まないと種類が決まらない行。
+    後者は `_listing_state` が `unknown`（種類が分からない）にする。
+    """
+    return {"name": r["name"], "doctype": r.get("doctype"), "branch": r.get("branch"),
+            "status": r.get("status"), "kind_unknown": True}
 
 
 def _blocked_of_ledger_run(run) -> dict | None:
@@ -73,9 +82,11 @@ def listing_documents(world: str, *, deadline: float | None = None) -> Listing:
     """一覧の道具（list_docs／glob_search／folder_tree）向けの文書行（`name` 昇順）。
     台帳があればそれだけを読み（資料フォルダは歩かない）、`ledger_at`（台帳の行の更新時刻）を付ける。
     台帳の行・時点・blocked の突き合わせ（台帳を置き換えた run の flags だけ）は `world_swap_lock_shared` の有界の待ちの中で、1 つのスナップショットから読む。
-    台帳が空・台帳が読めない・rebind／削除の待ちが上限を超えた・行を補えないときは `documents_for`（実走査）の結果を返す（`ledger_at=None`）。
+    台帳が空・台帳が読めない・rebind／削除の待ちが上限を超えたときは `documents_for`（実走査）の結果を返す（`ledger_at=None`）。
+    名前から種類を補えない行があっても台帳は捨てない。`unreadable` の行は歩いたときと同じ（`doctype`／`branch` 空・`state="unreadable"`）、それ以外は `doctype`／`branch` 空・`state="unknown"`（種類が分からない）で出す。
     台帳を置き換えた run を結びつけられないときは、突き合わせず `documents_for` と同じくソース枝の ready 文書を `unknown` に倒す。
     行は `name`／`doctype`／`branch`／`state` を持つ（`documents_for` の同名キーと同じ意味）。
+    設計: docs/design/codex.md「一覧の道具」
     """
     try:
         with store.world_swap_lock_shared(world, timeout_ms=SWAP_LOCK_WAIT_MS):
@@ -88,18 +99,38 @@ def listing_documents(world: str, *, deadline: float | None = None) -> Listing:
         for r in snap["rows"]:
             if text_kind.is_sensitive_doc_id(r["name"]) or importance.is_importance_control_path(r["name"]):
                 continue
-            row = _listing_row_from_ledger(r)
-            if row is None:
-                rows = None
-                break
-            rows.append(row)
-        if rows is not None:
-            rows = _reconcile_ledger_blocked(rows, _blocked_of_ledger_run(snap["run"]))
-            out = [{"name": r["name"], "doctype": r["doctype"], "branch": r["branch"],
-                    "state": _LEDGER_STATUS_DISPLAY.get(r["status"], r["status"]) or "ready"}
-                   for r in sorted(rows, key=lambda r: r["name"])]
-            return Listing(out, snap["ledger_at"].isoformat())
+            rows.append(_listing_row_from_ledger(r) or _unresolved_listing_row(r))
+        rows = _reconcile_ledger_blocked(rows, _blocked_of_ledger_run(snap["run"]))
+        out = [_listing_out(r) for r in sorted(rows, key=lambda r: r["name"])]
+        return Listing(out, snap["ledger_at"].isoformat())
     return Listing(documents_for(world, deadline=deadline), None)
+
+
+def is_kind_unknown(row: dict) -> bool:
+    """一覧の行が「種類が分からない」行か（台帳から名前で種類を補えず、読み取れない行でもない行。doctype か branch のどちらかが欠ける）。"""
+    return row.get("state") == "unknown" and (row.get("doctype") is None or row.get("branch") is None)
+
+
+def kind_unknown_notice(n: int) -> str:
+    """種類が分からない行があるときに結果へ付ける注意（層・種類の絞り込みの件数や「該当なし」を確定させないため）。"""
+    return (f"種類が分からない資料が {n} 件ある。層・種類の絞り込みの件数や「該当なし」は確定しない。"
+            "中身で確かめる。")
+
+
+def _listing_out(r: dict) -> dict:
+    """一覧の 1 行。名前から種類を補えず、最終の状態が読み取れない行は、歩いたときと同じ形（種類なし・資料の層）にそろえる。"""
+    state = _listing_state(r)
+    if r.get("kind_unknown") and state == "unreadable":
+        return {"name": r["name"], "doctype": None, "branch": None, "state": state}
+    return {"name": r["name"], "doctype": r["doctype"], "branch": r["branch"], "state": state}
+
+
+def _listing_state(r: dict) -> str:
+    """一覧の行の `state`。種類が分からない行（`kind_unknown`）は、読み取れない行以外を `unknown` にする。"""
+    status = _LEDGER_STATUS_DISPLAY.get(r["status"], r["status"]) or "ready"
+    if r.get("kind_unknown") and status != "unreadable":
+        return "unknown"
+    return status
 
 
 def ledger_rels(world: str) -> list | None:
@@ -118,31 +149,18 @@ def ledger_rels(world: str) -> list | None:
             if not text_kind.is_sensitive_doc_id(n) and not importance.is_importance_control_path(n)]
 
 
-def _importance_fields(rel: str, res_map: dict) -> dict:
-    """`importance`／`importance_reason`／`importance_source` を値があれば返す（無ければ空 dict）。"""
-    res = res_map.get(rel)
-    if res is None:
-        return {}
-    out = {"importance": res.value, "importance_source": f"{res.config_path}:{res.rule_line}行目"}
-    if res.reason:
-        out["importance_reason"] = res.reason
-    return out
-
-
 def public_documents(world: str, *, deadline: float | None = None) -> list:
     """API／画面向けの文書一覧（物理パスは出さない）。`status` は `documents_for()` の `state` をそのまま通す。
-    重要度（値・理由・由来）はあれば付ける。`deadline` を超えて歩き終えないときは `scope_infer.ScopeWalkDeadlineExceeded`。
+    `deadline` を超えて歩き終えないときは `scope_infer.ScopeWalkDeadlineExceeded`。
     """
-    # 文書列挙と重要度解決は同一 root・同一の列挙結果から行う（root 未解決なら空を返す）
+    # root 未解決なら空を返す
     wd = worlds.world_dir(world)
     if not wd:
         return []
     files = list(si.safe_files(wd, deadline=deadline, also=worlds.archives_dir(world)))
-    res_map = importance.resolve_for_world(world, root=wd, files=files)
     return [{"name": r["name"], "top_scope": r.get("top_scope"), "phase": r.get("phase"),
              "category": r.get("category"), "doctype": r.get("doctype"),
-             "branch": r.get("branch"), "status": r.get("state", "ready"),
-             **_importance_fields(r["name"], res_map)}
+             "branch": r.get("branch"), "status": r.get("state", "ready")}
             for r in documents_for(world, root=wd, files=files)]
 
 
@@ -151,17 +169,12 @@ _LEDGER_STATUS_DISPLAY = {"indexed": "ready"}
 
 
 def _ledger_row_to_public(r: dict) -> dict:
-    """台帳の 1 行 → 公開形（`public_documents()` と同じ形）。範囲メタは `name` から導出し、重要度は台帳列をそのまま通す（実走査しない）。"""
+    """台帳の 1 行 → 公開形（`public_documents()` と同じ形）。範囲メタは `name` から導出する（実走査しない）。"""
     meta = si.rel_scope_meta(r["name"])
     status = r.get("status")
     out = {"name": r["name"], "top_scope": meta["top_scope"], "phase": meta["phase"],
            "category": meta["category"], "doctype": r.get("doctype"), "branch": r.get("branch"),
            "status": _LEDGER_STATUS_DISPLAY.get(status, status or "ready")}
-    if r.get("importance") is not None:
-        out["importance"] = r["importance"]
-        out["importance_source"] = r.get("importance_source")
-        if r.get("importance_reason"):
-            out["importance_reason"] = r["importance_reason"]
     return out
 
 
@@ -209,18 +222,16 @@ def public_documents_page(world: str, *, limit: int | None, offset: int = 0) -> 
     return all_docs[offset:offset + limit], len(all_docs)
 
 
-def preview_documents(world: str, *, root=None, files=None, sig: str | None = None) -> list:
+def preview_documents(world: str, *, root=None, files=None) -> list:
     """取り込みプレビュー用の文書一覧（走査結果 → 画面の形・物理パスは出さない）。
-    派生 MD を持つ文書には読み取り方法の要約（`provenance`）、重要度（値・理由・由来）を best-effort で付ける。
+    派生 MD を持つ文書には読み取り方法の要約（`provenance`）を best-effort で付ける。
     `state`／`label`／`reason` は `documents_for()` のものを通す。`encoding_partial` は符号化が不確実な資料（画面が「要確認」を出す材料）。
     `analyzer` は担当アナライザの内部名（コード文書のみ）。
-    `root`／`files`／`sig`: 呼び出し側が解決・列挙・署名取得済みなら渡す（二重の木走査を避ける）。未登録の資料フォルダの `sig`（空文字）は渡さない。
+    `root`／`files`: 呼び出し側が解決・列挙済みなら渡す（二重の木走査を避ける）。
     """
-    # 文書列挙と重要度解決は同一 root から行う
     wd = root if root is not None else worlds.world_dir(world)
     if not wd:
         return []
-    res_map = importance.resolve_for_world(world, root=wd, files=files, sig=sig)
     out = []
     for r in documents_for(world, root=wd, files=files):
         doc = {"name": r["name"], "doctype": r.get("doctype"), "branch": r.get("branch"),
@@ -228,8 +239,7 @@ def preview_documents(world: str, *, root=None, files=None, sig: str | None = No
                "top_scope": r.get("top_scope"), "phase": r.get("phase"),
                "category": r.get("category"), "folder": "/".join(r["name"].split("/")[:-1]),
                "state": r.get("state", "ready"), "label": r.get("label", "使えます"),
-               "reason": r.get("reason"),
-               **_importance_fields(r["name"], res_map)}
+               "reason": r.get("reason")}
         if r.get("encoding_partial"):
             doc["encoding_partial"] = True
         prov = corpus_docs.provenance_summary(r.get("md_path"))
@@ -237,11 +247,6 @@ def preview_documents(world: str, *, root=None, files=None, sig: str | None = No
             doc["provenance"] = prov
         out.append(doc)
     return out
-
-
-def control_diagnostics(world: str, *, root=None, files=None) -> list:
-    """`_重要度.txt` の構文診断（台帳・取り込みプレビューの警告バナー用）。引数は `importance.diagnostics_for_world` へ渡す。"""
-    return importance.diagnostics_for_world(world, root=root, files=files)
 
 
 def original_path(rel: str, world: str):

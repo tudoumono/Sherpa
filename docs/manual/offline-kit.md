@@ -205,6 +205,7 @@ Docker が使えない収集マシンの場合は `--skip-docker` を付けて D
 （その場合、Docker イメージは別途・別マシンで収集して同じ `dist/offline-kit/docker-images/` に合流させてください）。
 同様に、不要な資材は個別に除外できます: `--skip-docker-engine`（Docker Engine 本体）・
 `--skip-python-system`（python3 系）・`--skip-fonts`・`--skip-node`・`--skip-chromium`・`--skip-libreoffice`・
+`--skip-ocr`（画像内文字の読み取りの資材）・`--skip-codex`（Codex CLI）・
 `--skip-base`（土台の閉包。閉域ホストの土台がキットより古いと導入が unmet で止まるため、通常は省略しない）。
 
 収集結果は `dist/offline-kit/`（`dist/` は Git 管理外）にまとまり、`MANIFEST.txt` に内容一覧が記録されます。
@@ -277,9 +278,9 @@ Docker が使えない収集マシンの場合は `--skip-docker` を付けて D
    導入の流れは次のとおりです。展開したファイルの照合（`PACKAGE-MANIFEST.sha256`）→ このプラットフォームの指紋の
    項目の確認 → Python 実行系（python3/venv/pip）→ Docker Engine 本体（未導入の場合のみ・
    `systemctl enable --now docker` と `usermod -aG docker` を含む）→ Docker イメージの `docker load` →
-   `pip install --no-index`（`.venv` 作成込み）→ Node.js/marp-cli の展開 → Playwright Chromium
+   `pip install --no-index`（`.venv` 作成込み）→ Node.js/marp-cli の展開 → 同梱の Codex CLI の展開（`tools/codex/`）→ Playwright Chromium
    （本体＋システム依存 .deb）の展開 → LibreOffice/フォントの導入 → Ollama モデルデータのコピー →
-   **最終検証**（各資材の動作確認一覧）→ 導入後の環境の指紋とパッケージの指紋の照合 → 記録の更新。
+   OCR ワーカーのイメージの読み込みとモデルの配置（`data/ocr-models`）→ **最終検証**（各資材の動作確認一覧）→ 導入後の環境の指紋とパッケージの指紋の照合 → 記録の更新。
    収集済みの資材があるものだけ順に実行されます（未収集の資材は「スキップしました」と表示して次へ進みます）。
    今の `.venv` と `tools/` の実行物は `.prev` に退避してから最終の場所で作り直し、失敗したら元へ戻します。
 
@@ -478,8 +479,9 @@ OLLAMA_URL=http://127.0.0.1:11434
 ストアの起動・以降のアプリ起動は通常の本番手順と同じです（[40-運用](40-運用.md) の「本番展開の標準手順」）。
 `docker-compose.yml` の `POSTGRES_PASSWORD` / `NEO4J_PASSWORD` は Compose の変数展開なので、**シェル環境か
 `--env-file` で明示的に渡さない限り `/etc/sherpa/sherpa.env` を読みません**（プロジェクト直下の `.env` だけが
-既定で読まれる）。既定パスワードのまま起動してアプリ側 env と食い違う事故を避けるため、必ず
-`--env-file` を付けて起動してください。`docker load` 済みでタグ（`sherpa/es-kuromoji:8.19.20` 等）が
+既定で読まれる）。既定パスワードのまま起動してアプリ側 env と食い違う事故を避けるため、`make start` と各スクリプトは `SHERPA_ENV_FILE` で指した
+ファイルを `--env-file` として自動で渡します（`SHERPA_ENV_FILE=/etc/sherpa/sherpa.env make start`）。`docker compose` を手で叩くときだけ、
+必ず `--env-file` を付けてください。`docker load` 済みでタグ（`sherpa/es-kuromoji:8.19.20` 等）が
 ローカルに揃っていれば、pull もビルドも行わず既存イメージをそのまま使います。
 
 Elasticsearch の起動には `vm.max_map_count=262144` 以上が要ります（閉域実機報告・2026-08-18）。

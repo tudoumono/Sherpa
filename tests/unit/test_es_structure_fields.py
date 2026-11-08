@@ -181,7 +181,7 @@ def test_search_exact_builds_terms_filter_without_text_match(monkeypatch):
     captured = _capture(monkeypatch)
     hits, reason = es_index.search_exact("w", ["A01", "B02"], scope_paths=["設計"], k=5, layer="code")
     assert hits == [] and reason is None
-    q = captured["body"]["query"]["function_score"]["query"]["bool"]
+    q = captured["body"]["query"]["bool"]
     assert _EXACT_CLAUSE in q["filter"] and {"terms": {"scopes": ["設計"]}} in q["filter"]
     assert "must" not in q and '{"match"' not in json.dumps(captured["body"])
     assert q["should"] == [{"terms": {"record_identity_values": ["A01", "B02"]}}]   # 定義しているレコードを先に
@@ -196,7 +196,7 @@ def test_search_exact_empty_values_is_no_query(monkeypatch):
 def test_search_with_exact_and_query_is_and(monkeypatch):
     captured = _capture(monkeypatch)
     es_index.search("w", "表示名", vector=False, exact=["A01", "B02"])
-    q = captured["body"]["query"]["function_score"]["query"]["bool"]
+    q = captured["body"]["query"]["bool"]
     assert q["must"] == [es_index._keyword_clause("表示名")]                  # 本文（＋見出し系の欄）で順位付け
     assert q["filter"] == [_EXACT_CLAUSE]                                     # exact で絞る
 
@@ -204,7 +204,7 @@ def test_search_with_exact_and_query_is_and(monkeypatch):
 def test_search_without_exact_keeps_previous_query(monkeypatch):
     captured = _capture(monkeypatch)
     es_index.search("w", "表示名", vector=False)
-    assert captured["body"]["query"]["function_score"]["query"]["bool"]["filter"] == []
+    assert captured["body"]["query"]["bool"]["filter"] == []
 
 
 def test_knn_only_applies_exact_filter(monkeypatch):

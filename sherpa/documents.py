@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import os
+import stat
 import time
+from pathlib import Path
 
 from . import scope_infer, worlds
 from .ingest import importance, text_kind
@@ -30,19 +32,90 @@ def resolve(rel: str, world: str | None = None):
 
 
 def world_rel_set(world: str | None = None, root=None, strict: bool = False, *,
-                  deadline: float | None = None) -> set:
+                  deadline: float | None = None, skipped: dict | None = None) -> set:
     """資料フォルダ内の実在 rel_path 集合（`safe_files` を 1 回だけ走査する batch 版）。資料フォルダ未解決は空集合。
-    `root`: 解決済みの root を渡すと `worlds.world_dir()` を呼び直さない。`strict`／`deadline` は `scope_infer.safe_files` へそのまま渡す。
+    `root`: 解決済みの root を渡すと `worlds.world_dir()` を呼び直さない。`strict`／`deadline`／`skipped` は `scope_infer.safe_files` へそのまま渡す。
+    `skipped` を渡したとき、資料フォルダの置き場所に届かない場合も `unreadable_dir` に数える。
     """
     wd = root
     if wd is None:
         world = world or worlds.default_world()
         wd = worlds.world_dir(world)
     if not wd:
+        _count_unreadable(skipped)
         return set()
     also = worlds.archives_dir(world) if world is not None else None
-    return {r for _rp, r in scope_infer.safe_files(wd, strict=strict, deadline=deadline, also=also)
+    return {r for _rp, r in scope_infer.safe_files(wd, strict=strict, deadline=deadline, also=also, skipped=skipped)
            if not importance.is_importance_control_path(r)}
+
+
+def _count_unreadable(skipped: dict | None) -> None:
+    if skipped is not None:
+        skipped["unreadable_dir"] = skipped.get("unreadable_dir", 0) + 1
+
+
+def _reachable_dir(root, *, optional: bool, skipped: dict | None) -> bool:
+    """`root` が歩けるフォルダか。届かない（存在はするが lstat できない・フォルダでない）ときは `skipped` に数える。
+    `optional`（アーカイブ展開先）は、無いこと自体は異常にしない。"""
+    try:
+        return stat.S_ISDIR(os.stat(root).st_mode)
+    except FileNotFoundError:
+        if not optional:
+            _count_unreadable(skipped)
+        return False
+    except OSError:
+        _count_unreadable(skipped)
+        return False
+
+
+def _scope_dir(root, prefix: str, skipped: dict | None = None):
+    """範囲の prefix のフォルダ（root から 1 段ずつ lstat で降り、symlink・版管理フォルダ・root 外を拒否）。無ければ None。
+    途中で本当に無い（`FileNotFoundError`）のとは別に、権限などで lstat できないときは `skipped` の `unreadable_dir` に数える。"""
+    parts = valid_rel_parts(prefix)
+    if parts is None or any(scope_infer.is_vcs_dir_name(p) for p in parts):
+        return None
+    cur = Path(root)
+    for part in ("", *parts):
+        cur = cur / part if part else cur
+        try:
+            if not stat.S_ISDIR(os.lstat(cur).st_mode):
+                return None
+        except FileNotFoundError:
+            return None
+        except OSError:
+            _count_unreadable(skipped)
+            return None
+    return cur
+
+
+def scope_rel_set(world: str, scope_paths, *, deadline: float | None = None, skipped: dict | None = None) -> set:
+    """範囲（フォルダの prefix・ファイル）の部分木だけを歩いた実在 rel_path の集合。範囲が無ければ `world_rel_set` と同じ。
+    歩き方と除外は `world_rel_set` と同じ（`safe_files`・重要度の設定ファイルを除く）。期限は全体で 1 つ。
+    `skipped`: 渡すと `scope_infer.safe_files` の数えられなかった件数を足す（`walk_incomplete` で「見えなかった」を判定する）。
+    """
+    prefixes = [s.strip("/") for s in (scope_paths or []) if isinstance(s, str) and s.strip("/")]
+    if not prefixes:
+        return world_rel_set(world, deadline=deadline, skipped=skipped)
+    wd = worlds.world_dir(world)
+    if not wd:
+        _count_unreadable(skipped)
+        return set()
+    out: set = set()
+    for root, optional in ((wd, False), (worlds.archives_dir(world), True)):
+        if not _reachable_dir(root, optional=optional, skipped=skipped):
+            continue
+        for prefix in prefixes:
+            d = _scope_dir(root, prefix, skipped)
+            if d is not None:
+                out |= {f"{prefix}/{r}" for _rp, r in scope_infer.safe_files(d, deadline=deadline, skipped=skipped)}
+            elif _listed_by_walk(root, prefix):
+                out.add(prefix)
+    return {r for r in out if not importance.is_importance_control_path(r)}
+
+
+def walk_incomplete(skipped: dict) -> bool:
+    """`scope_rel_set(skipped=...)` の走査で、読めずに飛ばしたフォルダ・ファイルがあったか（あれば「無い」と言い切れない）。"""
+    return bool(skipped.get("unreadable_dir") or skipped.get("unreadable_file"))
 
 
 def _listed_by_walk(root, rel: str) -> bool:

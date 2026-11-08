@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextvars
+import dataclasses
 import json
 import logging
 import math
@@ -295,8 +296,31 @@ def _safe_failure_fields(exc: Exception) -> tuple[int | None, str, str | None]:
     return status, error_type, error_code
 
 
+@dataclasses.dataclass(frozen=True)
+class EmbedFailure:
+    """埋め込みが失敗した理由（接続診断用）。状態コード・例外の型名・期限切れ・応答の検証だけを持ち、鍵や本文は入れない。
+    kind: "http"｜"error"（通信などの例外）｜"deadline"｜"dimension"（次元不一致）｜"invalid"（応答の形が不正）
+    """
+    kind: str
+    status: int | None = None
+    error_type: str | None = None
+    got_dim: int | None = None
+
+
+# `embed_with_failure` が立てる失敗の受け皿（最初の 1 件だけ残す）。並列ワーカーへはコンテキストごと渡る
+_failure_sink: contextvars.ContextVar[list | None] = contextvars.ContextVar("embed_failure_sink", default=None)
+
+
+def _note_failure(failure: EmbedFailure) -> None:
+    sink = _failure_sink.get()
+    if sink is not None and not sink:
+        sink.append(failure)
+
+
 def _log_embed_failure(c: dict, exc: Exception) -> None:
+    """最後の失敗をログに残し、受け皿があれば同じ分類を渡す。守ること: `_safe_failure_fields` は応答の本文を読み切るので 1 回だけ呼ぶ。"""
     status, error_type, error_code = _safe_failure_fields(exc)
+    _note_failure(EmbedFailure("http" if status is not None else "error", status=status, error_type=error_type))
     _log.warning(
         "embedding request failed: provider=%s status=%s error_type=%s error_code=%s",
         c.get("provider"), status, error_type, error_code,
@@ -468,12 +492,16 @@ def _embed_batch(texts: list, c: dict, deadline: float | None = None) -> list | 
         if retries or deadline is not None:
             remaining = give_up_at - time.monotonic()
             if remaining < 1:
+                _note_failure(EmbedFailure("deadline"))
                 return None  # 1 秒未満では送らない
             timeout = min(_TIMEOUT, int(remaining))
         try:
             got = _embed_batch_once(texts, c, timeout)
             if deadline is not None and time.monotonic() > deadline:
+                _note_failure(EmbedFailure("deadline"))
                 return None  # 期限を過ぎて届いた応答は使わない（検索は全文検索で続ける）
+            if got is None:
+                _note_failure(EmbedFailure("invalid"))
             return got
         except Exception as exc:
             # 失敗した試行も物理送信として数える（トークンは不明なので `acc_add(None)`）。送信前ガードの拒否は送っていないので数えない
@@ -558,6 +586,23 @@ def _embed_batches_parallel(batches: list[tuple[list, list]], c: dict, parallel:
     return None if failed else results
 
 
+def _note_bad_vector(vector, dimension: int) -> None:
+    got = len(vector) if isinstance(vector, (list, tuple)) else None
+    _note_failure(EmbedFailure("dimension" if got is not None and got != dimension else "invalid", got_dim=got))
+
+
+def embed_with_failure(texts: list, c: dict, *, user_id: str | None = None, world: str | None = None,
+                       deadline_s: float | None = None) -> tuple[list | None, EmbedFailure | None]:
+    """`embed` と同じ送信を 1 回行い、`(ベクトル群, 失敗理由)` を返す（接続診断用）。成功時の失敗理由は None。"""
+    sink: list = []
+    token = _failure_sink.set(sink)
+    try:
+        vecs = embed(texts, c, user_id=user_id, world=world, deadline_s=deadline_s)
+    finally:
+        _failure_sink.reset(token)
+    return vecs, (sink[0] if sink and vecs is None else None)
+
+
 def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None = None,
           deadline_s: float | None = None) -> list | None:
     """テキスト群 → ベクトル群（順序対応）。一部でも失敗したら None（ベクトル無効＝BM25 へ）。
@@ -589,15 +634,18 @@ def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None
             for (origins, _batch), vecs in zip(batches, results):
                 for origin, vector in zip(origins, vecs):
                     if not is_valid_vector(vector, dimension):
+                        _note_bad_vector(vector, dimension)
                         return None
                     grouped[origin].append(vector)
         else:
             for origins, batch in batches:
                 vecs = _embed_batch(batch, c) if deadline is None else _embed_batch(batch, c, deadline)
                 if not isinstance(vecs, list) or len(vecs) != len(batch):
+                    _note_failure(EmbedFailure("invalid"))
                     return None
                 for origin, vector in zip(origins, vecs):
                     if not is_valid_vector(vector, dimension):
+                        _note_bad_vector(vector, dimension)
                         return None
                     grouped[origin].append(vector)
         out: list = []

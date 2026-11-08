@@ -294,3 +294,67 @@ def test_startup_stderr_logged_only_when_no_events_and_failed(caplog):
     text = caplog.text
     assert "config rejected" in text
     assert "streamed body" not in text and "normal" not in text
+
+
+def test_codex_link_dirs_follow_a_symlinked_folder_on_the_way(monkeypatch, tmp_path):
+    """単体の導入（`bin/codex` → `…/current/bin/codex`・`current` → `releases/<版>`）でも、途中の symlink を置いたフォルダまで読ませる。"""
+    import shutil
+    import sys
+
+    from sherpa.providers.codex import sandbox as SB
+    release = tmp_path / "pkgs" / "standalone" / "releases" / "0.0.0"
+    (release / "bin").mkdir(parents=True)
+    (release / "bin" / "codex").write_text("#!/bin/sh\n", encoding="utf-8")
+    (release / "codex-package.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "pkgs" / "standalone" / "current").symlink_to(release)
+    launcher = tmp_path / "localbin"
+    launcher.mkdir()
+    (launcher / "codex").symlink_to(tmp_path / "pkgs" / "standalone" / "current" / "bin" / "codex")
+    monkeypatch.setattr(shutil, "which", lambda name: str(launcher / "codex") if name == "codex" else None)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert SB._codex_install_root() == release
+    assert SB._codex_link_dirs() == [launcher, tmp_path / "pkgs" / "standalone"]
+    assert SB._codex_launcher_dir() == launcher
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert SB._codex_link_dirs() == []
+
+
+def test_codex_link_dirs_never_open_the_home_folder(monkeypatch, tmp_path):
+    """途中の symlink がホームの直下にあっても、ホームのフォルダ（とその上）は読ませない（読取の封じ込めを破らない）。"""
+    import shutil
+    import sys
+    from pathlib import Path
+
+    from sherpa.providers.codex import sandbox as SB
+    home = tmp_path / "home"
+    release = home / "pkgs" / "releases" / "0.0.0"
+    (release / "bin").mkdir(parents=True)
+    (release / "bin" / "codex").write_text("#!/bin/sh\n", encoding="utf-8")
+    (home / "standalone-current").symlink_to(release)
+    launcher = home / ".local" / "bin"
+    launcher.mkdir(parents=True)
+    (launcher / "codex").symlink_to(home / "standalone-current" / "bin" / "codex")
+    monkeypatch.setattr(shutil, "which", lambda name: str(launcher / "codex") if name == "codex" else None)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(sys, "platform", "darwin")
+    dirs = SB._codex_link_dirs()
+    assert home not in dirs and not any(d in home.parents for d in dirs)
+    assert dirs == [launcher]
+
+
+
+def test_codex_link_dirs_reject_shallow_folders_directly(monkeypatch):
+    """`/` から 3 段より浅いフォルダ（`/opt` など）は、導入先の近くでも読ませない。"""
+    import shutil
+    import sys
+    from pathlib import Path
+
+    from sherpa.providers.codex import sandbox as SB
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(SB, "_codex_install_root", lambda: Path("/opt/releases/0.0.0"))
+    monkeypatch.setattr(shutil, "which", lambda name: "/opt/current/bin/codex" if name == "codex" else None)
+    real_is_symlink = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda self: str(self) == "/opt/current" or (
+        real_is_symlink(self) if not str(self).startswith("/opt") else False))
+    monkeypatch.setattr("os.readlink", lambda p: "/opt/releases/0.0.0")
+    assert SB._codex_link_dirs() == []

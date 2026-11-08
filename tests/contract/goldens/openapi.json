@@ -1296,6 +1296,143 @@
         "title": "ConfigResponse",
         "type": "object"
       },
+      "ConnectivityCheckRequest": {
+        "properties": {
+          "include_paid": {
+            "default": false,
+            "title": "Include Paid",
+            "type": "boolean"
+          }
+        },
+        "title": "ConnectivityCheckRequest",
+        "type": "object"
+      },
+      "ConnectivityCheckResponse": {
+        "description": "つながりの確認の結果（POST /admin/connectivity/check）。",
+        "properties": {
+          "paths": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectivityPath"
+            },
+            "title": "Paths",
+            "type": "array"
+          }
+        },
+        "required": [
+          "paths"
+        ],
+        "title": "ConnectivityCheckResponse",
+        "type": "object"
+      },
+      "ConnectivityPath": {
+        "properties": {
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectivityResult"
+            },
+            "title": "Results",
+            "type": "array"
+          }
+        },
+        "required": [
+          "path",
+          "label",
+          "results"
+        ],
+        "title": "ConnectivityPath",
+        "type": "object"
+      },
+      "ConnectivityResult": {
+        "properties": {
+          "elapsed_ms": {
+            "default": 0,
+            "title": "Elapsed Ms",
+            "type": "integer"
+          },
+          "host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "paid": {
+            "default": false,
+            "title": "Paid",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "route": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "ng",
+              "skipped",
+              "incomplete"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "status"
+        ],
+        "title": "ConnectivityResult",
+        "type": "object"
+      },
       "ConstructChoice": {
         "description": "GET・PUT /settings の `constructs_available[]` 要素。`agent`/`codex_model_provider` は画面がそのまま PUT する設定値。",
         "properties": {
@@ -3100,6 +3237,17 @@
               }
             ],
             "title": "Locator"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
           }
         },
         "required": [
@@ -3723,6 +3871,206 @@
           "confirm_password"
         ],
         "title": "PasswordChangeReq",
+        "type": "object"
+      },
+      "PathRuleFilesResponse": {
+        "properties": {
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "folder": {
+            "title": "Folder",
+            "type": "string"
+          },
+          "next_offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Offset"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "folder",
+          "files",
+          "truncated",
+          "total",
+          "next_offset"
+        ],
+        "title": "PathRuleFilesResponse",
+        "type": "object"
+      },
+      "PathRuleFolder": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "depth": {
+            "title": "Depth",
+            "type": "integer"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "label",
+          "depth",
+          "count"
+        ],
+        "title": "PathRuleFolder",
+        "type": "object"
+      },
+      "PathRuleItem": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "outside_scope": {
+            "default": false,
+            "title": "Outside Scope",
+            "type": "boolean"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "target_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Type"
+          }
+        },
+        "required": [
+          "path",
+          "kind"
+        ],
+        "title": "PathRuleItem",
+        "type": "object"
+      },
+      "PathRulesPutReq": {
+        "additionalProperties": false,
+        "properties": {
+          "rules": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PathRuleItem"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "world": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "World"
+          }
+        },
+        "title": "PathRulesPutReq",
+        "type": "object"
+      },
+      "PathRulesResponse": {
+        "properties": {
+          "folders": {
+            "items": {
+              "$ref": "#/components/schemas/PathRuleFolder"
+            },
+            "title": "Folders",
+            "type": "array"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "removed_missing": {
+            "title": "Removed Missing",
+            "type": "integer"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/PathRuleItem"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "world": {
+            "title": "World",
+            "type": "string"
+          }
+        },
+        "required": [
+          "world",
+          "label",
+          "rules",
+          "removed_missing",
+          "folders"
+        ],
+        "title": "PathRulesResponse",
+        "type": "object"
+      },
+      "PathRulesSaveResponse": {
+        "properties": {
+          "dropped_children": {
+            "items": {
+              "$ref": "#/components/schemas/PathRuleItem"
+            },
+            "title": "Dropped Children",
+            "type": "array"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/PathRuleItem"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "world": {
+            "title": "World",
+            "type": "string"
+          }
+        },
+        "required": [
+          "world",
+          "rules",
+          "dropped_children"
+        ],
+        "title": "PathRulesSaveResponse",
         "type": "object"
       },
       "PinReq": {
@@ -9210,6 +9558,48 @@
         ]
       }
     },
+    "/admin/connectivity/check": {
+      "post": {
+        "description": "経路ごとに決まった確認を流す（管理者のみ・同時に 1 本・有料を含む実行は監査に残す）。",
+        "operationId": "admin_connectivity_check_admin_connectivity_check_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectivityCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectivityCheckResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Connectivity Check",
+        "tags": [
+          "管理者:つながりの確認"
+        ]
+      }
+    },
     "/admin/es/search": {
       "get": {
         "description": "管理者向けの ES 検索（読み取り専用）。クエリ param `world` は他の API と同じ取込ディレクトリ（world id）。",
@@ -9535,6 +9925,181 @@
         "summary": "Admin Improvement Log Export",
         "tags": [
           "管理者:改善ログ"
+        ]
+      }
+    },
+    "/admin/path-rules": {
+      "get": {
+        "description": "資料フォルダの優先・除外の設定とフォルダの木を返す（管理者のみ）。\n開いたときに、もう存在しない場所の設定を取り除いて保存し、取り除いた件数を `removed_missing` で返す（定期の走査はしない）。",
+        "operationId": "admin_path_rules_get_admin_path_rules_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "world",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "World"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PathRulesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Path Rules Get",
+        "tags": [
+          "管理者:資料の優先と除外"
+        ]
+      },
+      "put": {
+        "description": "資料フォルダ 1 つの優先・除外の設定を置き換えて保存する（管理者のみ・`system_settings` の監査に残る）。\n不正（`..`・絶対パス・種類・「範囲の外でも読む」を除外に付ける等）は 422。親に設定がある場所の配下の設定は保存の時点で落とし、落とした設定を返す。",
+        "operationId": "admin_path_rules_put_admin_path_rules_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PathRulesPutReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PathRulesSaveResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Path Rules Put",
+        "tags": [
+          "管理者:資料の優先と除外"
+        ]
+      }
+    },
+    "/admin/path-rules/files": {
+      "get": {
+        "description": "フォルダ直下のファイルの一覧（管理者のみ・名前順）。`folder` が空なら資料フォルダの直下。\n`offset`／`limit` でページ送りする（続きがあれば `next_offset`・無ければ null）。`total` は直下のファイルの総数。",
+        "operationId": "admin_path_rules_files_admin_path_rules_files_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "world",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "World"
+            }
+          },
+          {
+            "in": "query",
+            "name": "folder",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Folder",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PathRuleFilesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Path Rules Files",
+        "tags": [
+          "管理者:資料の優先と除外"
         ]
       }
     },
@@ -11204,7 +11769,7 @@
     },
     "/documents/download": {
       "get": {
-        "description": "根拠の原本をダウンロードする。doc_id＝rel_path（world root 相対）。\n台帳に載っているファイルだけが対象で、秘匿ファイル・台帳に無い名前・root 外は 404。アーカイブ取り込み（zip/tar(.gz)/tgz）の中のファイルは、展開した写しを返す（原本アーカイブそのものではない）。\nダウンロードは監査に記録され、記録できなければ許可しない。",
+        "description": "根拠の原本をダウンロードする。doc_id＝rel_path（world root 相対）。\n対象は台帳に載っているファイル、または出典の確かめと同じ条件（`doc_reach.doc_reachable`＝実在・文書種別・取り込みが外すものでない）を満たすファイル。秘匿ファイル・それ以外の名前・root 外は 404（理由は区別しない）。アーカイブ取り込み（zip/tar(.gz)/tgz）の中のファイルは、展開した写しを返す（原本アーカイブそのものではない）。\nダウンロードは監査に記録され、記録できなければ許可しない。",
         "operationId": "doc_download_documents_download_get",
         "parameters": [
           {
@@ -13393,7 +13958,7 @@
     },
     "/ingest/preview": {
       "get": {
-        "description": "取り込み・抽出プレビュー（読み取り専用）。資料の一覧（台帳から）・フォルダ・重要度の診断と、取り込みの記録の件数を返す。要素・関係は `GET /ingest/preview/graph`。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする。",
+        "description": "取り込み・抽出プレビュー（読み取り専用）。資料の一覧（台帳から）・フォルダと、取り込みの記録の件数を返す。要素・関係は `GET /ingest/preview/graph`。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする。",
         "operationId": "ingest_preview_ingest_preview_get",
         "parameters": [
           {
@@ -14253,6 +14818,59 @@
           }
         },
         "summary": "World Delete",
+        "tags": [
+          "資料フォルダ(World)管理"
+        ]
+      }
+    },
+    "/worlds/{wid}/folder-check": {
+      "get": {
+        "description": "資料フォルダの置き方が、期ごとにフォルダを分ける置き方の決まりに合うかを点検する。`format=md` は Markdown のダウンロード。\n次の取り込み直しの版で使う置き方の確認で、今の取り込みの動きは変わらない。\n名前は最後の取り込みの時点の台帳から読む（`ledger_at`）。台帳が無いときは歩かず 409。",
+        "operationId": "folder_check_worlds__wid__folder_check_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+              "title": "Wid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "default": "json",
+              "pattern": "^(json|md)$",
+              "title": "Format",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Folder Check",
         "tags": [
           "資料フォルダ(World)管理"
         ]

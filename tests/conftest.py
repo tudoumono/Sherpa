@@ -442,6 +442,22 @@ def upstream_only_registry(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _restore_no_proxy_env(monkeypatch):
+    """`proxy_bypass.apply()` が書く NO_PROXY／no_proxy をテストの外へ漏らさない。"""
+    import os
+
+    from sherpa import proxy_bypass
+    for k in ("NO_PROXY", "no_proxy"):
+        if k in os.environ:
+            monkeypatch.setenv(k, os.environ[k])
+        else:
+            monkeypatch.delenv(k, raising=False)
+    proxy_bypass.reset_base()
+    yield
+    proxy_bypass.reset_base()
+
+
+@pytest.fixture(autouse=True)
 def _ledger_style_default_for_tests(monkeypatch):
     """既存のテストは JSON 台帳（A）の挙動を確かめるため、方式を指定していないテストは json で動かす（外の環境の値も持ち込まない）。
     製品の既定（C-check）は tests/unit/test_ledger_style_default.py が確かめる。"""

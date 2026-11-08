@@ -89,10 +89,10 @@ def test_ledger_section_tells_whether_listing_walks_and_hides_names(ledger_world
     store.replace_documents(ledger_world, [_row("secretsys/src/SECRETPROG.cbl"),
                                            _row("secretsys/src/SECRETNOEXT", None, None, "unreadable")])
     got = R.ledger_status(ledger_world)
-    assert got["listing"] == "walk" and got["not_completable"] == 1   # 名前で種類を補えない行が 1 件で台帳をあきらめる
+    assert got["listing"] == "ledger" and got["not_completable"] == 1   # 名前で種類を補えない行が 1 件あっても台帳から出す
 
     text = R.render([], [], None, detail=True, ledgers=[{"world": "W1", **got}])
-    assert "資料フォルダを全部歩く" in text
+    assert "台帳から（歩かない）" in text
     for secret in ("secretsys", "SECRET", "secrethost", "7687", ledger_world):
         assert secret not in text
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from ... import documents, es_index, graph_coverage, rag_parent_return
+from ... import documents, es_index, graph_coverage, path_rules, rag_parent_return
 from ... import scope as scope_mod
 from ...impact_service import IMPACT_MAX_DEPTH, run_impact
 from ...ingest import text_kind
@@ -73,7 +73,8 @@ def search(world: str, query: str, engines=None, k: int = 10,
       パスの存在しか見ないため、rebind 後の再索引が未完了だと同じ相対パスの古いヒットが通りうる。
     """
     sel = [e for e in ENGINES if e in set(engines or DEFAULT_ENGINES)]  # 正規化（決定的順序）
-    sp = scope_mod.normalize_scope_paths(scope_paths)
+    # 管理者の「範囲の外でも読む」を範囲に足す（keyword／vector／graph のどのエンジンにも同じ範囲を渡す。足し込み済みなら足し直さない）
+    sp = scope_mod.normalize_scope_paths(path_rules.rules_for(world).extend_scope(scope_paths))
     w = {e: float((weights or {}).get(e, 1.0)) for e in sel}
     runners = {"keyword": _search_keyword, "vector": _search_vector, "graph": _search_graph}
     raw = []  # (engine, hits, reason)

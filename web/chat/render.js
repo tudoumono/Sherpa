@@ -132,15 +132,6 @@ function verificationBadgeHTML(method) {
   const cls = method === 'span_unmatched' ? 'warn' : 'ok';
   return ` <span class="verif-badge ${cls}">${esc(label)}</span>`;
 }
-// 登録者重要度バッジ。出典の importance が「高」「低」のときだけ表示する（「中」・未設定は出さない）。importance_reason があれば title に添える。
-const IMPORTANCE_BADGE_LABEL = { '高': '登録者重要度：高', '低': '登録者重要度：低' };
-function importanceBadgeHTML(source) {
-  const v = source && source.importance;
-  if (v !== '高' && v !== '低') return '';
-  const cls = v === '高' ? 'high' : 'low';
-  const title = source.importance_reason ? ` title="${esc(source.importance_reason)}"` : '';
-  return ` <span class="importance-badge ${cls}"${title}>${esc(IMPORTANCE_BADGE_LABEL[v])}</span>`;
-}
 // doc ごとの verification_method を集める。source_path に加え、集計 Evidence の matched_doc_ids も見る。
 function _verificationMethodByDoc(evidencePacket) {
   const map = new Map();
@@ -1078,7 +1069,8 @@ export function provenanceText(item) {
 }
 const provenanceHTML = (item) => {
   const t = provenanceText(item);
-  return t ? `<span class="muted cite-prov" title="資料フォルダ直下のフォルダと、原本の更新時刻">${esc(t)}</span>` : '';
+  const note = item && typeof item.note === 'string' && item.note ? `<span class="muted cite-prov">（${esc(item.note)}）</span>` : '';
+  return (t ? `<span class="muted cite-prov" title="資料フォルダ直下のフォルダと、原本の更新時刻">${esc(t)}</span>` : '') + note;
 };
 // 引用（該当箇所）カード。既定は折りたたみで、件数だけ見える見出しボタン＋hidden な本体にする。
 function renderQa(a) {
@@ -1103,7 +1095,7 @@ function renderSources(sources, verifiedDocIds, evidencePacket) {
   const link = (s) => (s.download_url
     ? `<a href="${esc(s.download_url)}" data-dl>📄 ${esc(s.doc_id)}</a>`
     : `<span class="muted" title="この画面ではダウンロードできません">📄 ${esc(s.doc_id)}（ダウンロードできません）</span>`)
-    + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(s.doc_id))}${importanceBadgeHTML(s)}`;
+    + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(s.doc_id))}`;
   // sources_verified（精読済み doc_id）があれば、出典を「根拠（精読済み）」と「参考（ヒットのみ）」に分ける（除外はしない）
   if (Array.isArray(verifiedDocIds)) {
     const verified = new Set(verifiedDocIds);
@@ -1165,7 +1157,7 @@ function renderReferencedDocs(answer, evidencePacket) {
     return (s.download_url
       ? `<a href="${esc(s.download_url)}" data-dl>📄 ${esc(r.path)}</a>`
       : `<span class="muted" title="この画面ではダウンロードできません">📄 ${esc(r.path)}（ダウンロードできません）</span>`)
-      + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(r.path))}${importanceBadgeHTML(s)}`;
+      + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(r.path))}`;
   };
   return head
     + rows.map((r) => `<div class="sources-unverified-row">${link(r)}${r.ranges.length ? `<span class="muted">（${esc(rangeText(r))}${r.rangesMore ? `、ほか ${r.rangesMore} か所` : ''}）</span>` : (r.rangesMore ? `<span class="muted">（ほか ${r.rangesMore} か所）</span>` : '')}`

@@ -79,15 +79,14 @@ def test_run_tool_forwards_options_to_grep_search(monkeypatch, call_kw, args_ext
     assert {k: captured.get(k) for k in expected} == expected
 
 
-def test_run_tool_ripgrep_search_hit_view_carries_importance_conditionally(monkeypatch):
+def test_run_tool_ripgrep_search_hit_view_does_not_carry_importance(monkeypatch):
     hits = [{"doc_id": "a.md", "line": 1, "span": [1, 1], "text": "本文A", "ext": ".md",
              "importance": "高", "importance_reason": "契約書"},
             {"doc_id": "b.md", "line": 1, "span": [1, 1], "text": "本文B", "ext": ".md"}]
     monkeypatch.setattr(grep_tool_mod, "grep_search", lambda *a, **kw: hits)
     res, _docs, _cites, _cards = TD.run_tool("ripgrep_search", {"query": "x"}, "v1", None)
     by_doc = {h["doc_id"]: h for h in res["hits"]}
-    assert by_doc["a.md"]["importance"] == "高" and by_doc["a.md"]["importance_reason"] == "契約書"
-    assert "importance" not in by_doc["b.md"] and "importance_reason" not in by_doc["b.md"]
+    assert all("importance" not in h and "importance_reason" not in h for h in by_doc.values())
 
 
 def test_run_tool_es_search_forwards_options_and_ignores_offset(monkeypatch):
@@ -1024,7 +1023,7 @@ def test_codex_mcp_config_builder():
     from sherpa.providers.codex import mcp
     args = mcp._mcp_config_args("v1", ["4期", "00_共通"])
     joined = " ".join(args)
-    assert args.count("-c") == 5
+    assert args.count("-c") == 6
     assert "mcp_servers.sherpa.command=" in joined and 'sherpa.args = ["-m", "sherpa.mcp_server"]' in joined
     assert 'SHERPA_MCP_WORLD = "v1"' in joined and 'SHERPA_MCP_SCOPE = "4期\\n00_共通"' in joined
     assert 'default_tools_approval_mode = "approve"' in joined and 'approval_policy = "never"' in joined
@@ -1408,9 +1407,9 @@ def test_glob_search_slash_pattern_matches_hierarchical_segments():
 
 def test_glob_search_zero_hits_and_session_scope():
     res, docs, cites, cards = TD.run_tool("glob_search", {"pattern": "*.no-such-ext"}, "v1", None)
-    assert res == {"count": 0, "paths": [], "truncated": False} and docs == set() and cites == [] and cards == []
+    assert (res["count"], res["paths"], res["truncated"], res["next_offset"]) == (0, [], False, None) and docs == set() and cites == [] and cards == []
     scoped, docs, _, _ = TD.run_tool("glob_search", {"pattern": "*.md"}, "v1", ["4期/03_開発"])    # 03_開発 配下に .md は無い
-    assert scoped == {"count": 0, "paths": [], "truncated": False} and docs == set()
+    assert (scoped["count"], scoped["paths"], scoped["truncated"]) == (0, [], False) and docs == set()
     assert TD.run_tool("glob_search", {"pattern": "*.md"}, "v1", None)[0]["count"] > 0
 
 

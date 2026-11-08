@@ -487,11 +487,17 @@ def assemble_result(self, ctx, st, decision, env):
         _verified_listed, _unverified_refs, _sensitive_refs = (
             _ref_detail["verified"], _ref_detail["unverified"], _ref_detail["hidden"])
         _verified_before_listed = set(_verified_listed)
+        _new_listed: list[str] = []
         for _r in _mcp_listed_docs:
             if _r and _r not in _ref_seen:
                 _ref_seen.add(_r)
                 _ref_candidates.append(_r)
-        _verified_refs = resolve_referenced_docs(_ref_candidates, ctx.world, sp, _ref_layer)[0]
+                _new_listed.append(_r)
+        _verified_refs = list(_verified_listed)
+        if _new_listed:
+            for _d in resolve_referenced_docs(_new_listed, ctx.world, sp, _ref_layer)[0]:
+                if _d not in _verified_before_listed and _d not in _verified_refs:
+                    _verified_refs.append(_d)
         _listed_only_ids = set(_verified_refs) - _verified_before_listed
         if _verified_refs and ctx.make_sources:
             _ref_sources, _ = _verified_sources(ctx.make_sources, set(_verified_refs), ctx.world, sp)

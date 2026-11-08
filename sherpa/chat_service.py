@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from . import agent_constructs, agentic_search, answer_shape, app_version, citations, documents, exec_event, intent_llm, scope, store, text_encoding, worlds
+from . import agent_constructs, agentic_search, answer_shape, app_version, citations, documents, exec_event, intent_llm, path_rules, scope, store, text_encoding, worlds
 from . import depth_profile as depth_profile_mod
 from . import investigation_state as investigation_state_mod
 from . import layer as layer_mod
@@ -427,38 +427,35 @@ def _known_terms(session, world) -> list:
     return [r["name"] for r in rows if r["name"]]
 
 
-def _src_url(doc: str, world: str, res: "importance.Resolution | None" = None, modified_at: str | None = None) -> dict:
+def _src_url(doc: str, world: str, modified_at: str | None = None) -> dict:
     """出典 1 件 → 原本 DL リンク（doc は rel_path で slash を含むため query で渡す）。
-    `res`（省略可）: 登録者が `_重要度.txt` で付けた重要度の解決結果。あれば `importance`/`importance_reason` を追加する（`importance_source` は出さない）。
     資料フォルダ直下のフォルダ（世代）は doc から、原本の更新時刻は `modified_at`（省略可）から `generation`/`modified_at` として足す（取れた欄だけ）。
     """
     return citations.with_provenance(
         {"doc_id": doc,
-         "download_url": f"/documents/download?world={quote(world)}&rel={quote(doc, safe='')}",
-         **importance.public_fields(res)},
+         "download_url": f"/documents/download?world={quote(world)}&rel={quote(doc, safe='')}"},
         modified_at)
 
 
-def _sources(docs, world) -> list:
+def _sources(docs, world, scope_paths=None) -> list:
+    """出典の一覧。管理者の除外の資料は載せず、利用者の範囲の外にある「範囲の外でも読む」優先の資料には `note` を付ける。"""
+    from . import path_rules
+    rules = path_rules.rules_for(world)
     seen, filtered = set(), []
     for d in docs:
         if (d and d not in seen and d not in _NON_DOC  # 内部来歴は出典に出さない
-                and not importance.is_importance_control_path(d)):  # 重要度設定ファイル自体は出典に出さない
+                and not importance.is_importance_control_path(d)  # 重要度設定ファイル自体は出典に出さない
+                and not rules.excluded(d)):  # 管理者が検索から外している資料は出典に出さない
             seen.add(d)
             filtered.append(d)
-    # world 全体を 1 回だけ解決し（`resolve_many`）、対象の doc だけ引く。未登録 world は解決しない（2 キーのまま）。
-    wd = worlds.world_dir(world)
-    sig = None
-    # `sig` を渡さないと `resolve_for_world` が world 全体をもう一度全木走査する。registry の `last_sig`（`store.get_world_status_row`）を渡して省く。取得できなくても fail-closed にせず自前計算へ戻す。
-    if wd:
-        try:
-            row = store.get_world_status_row(world)
-            sig = (row or {}).get("last_sig") or None
-        except Exception:
-            sig = None
-    res_map = importance.resolve_many(world, filtered, root=wd, sig=sig) if wd else {}
+    wd = worlds.world_dir(world)  # 未登録 world は更新時刻を引かない
     stamps = documents.modified_at_map(world, filtered) if wd else {}  # 資料ごとの原本の更新時刻（資料フォルダ全体の取り込み時刻ではない）
-    return [_src_url(d, world, res_map.get(d), stamps.get(d)) for d in filtered]
+    out = [_src_url(d, world, stamps.get(d)) for d in filtered]
+    for src in out:
+        note = rules.outside_note(src["doc_id"], scope_paths)
+        if note:
+            src["note"] = note
+    return out
 
 
 def _redact(text: str) -> str:
@@ -475,7 +472,7 @@ def _truncation_headline_suffix(result) -> str:
     return ("　⚠ " + " ".join(notes)) if notes else ""
 
 
-def _answer_impact(result, world):
+def _answer_impact(result, world, scope_paths=None):
     """`items` は全件同格（構造的な影響として同じ扱い）。presumed（grep 共起の推定）だけは別枠のまま残す。"""
     items = result["items"]
     start = result["start"]
@@ -503,12 +500,12 @@ def _answer_impact(result, world):
         summary["candidates"] = len(candidates)
     return {"headline": headline,
             "summary": summary,
-            "data": result, "sources": _sources(docs, world),
+            "data": result, "sources": _sources(docs, world, scope_paths),
             # 検索へ誘導する次の一手（UI がボタン化できる・構造的な影響が無い時のみ）
             "suggest": ({"lens": "qa", "query": start, "reason": "構造的な影響が見つからない"} if code_silent else None)}
 
 
-def _answer_troubleshoot(result, world):
+def _answer_troubleshoot(result, world, scope_paths=None):
     cands = result.get("candidates", [])
     top = [c["name"] for c in cands[:3]]
     headline = ("症状に対応する原因候補は見つかりませんでした。起点となる名称を含めて言い換えてください。"
@@ -520,10 +517,10 @@ def _answer_troubleshoot(result, world):
         docs += [g.get("doc_id") for g in ev.get("grep", [])]
     headline += _truncation_headline_suffix(result)
     return {"headline": headline, "summary": {"total": len(cands)},
-            "data": result, "sources": _sources(docs, world)}
+            "data": result, "sources": _sources(docs, world, scope_paths)}
 
 
-def _answer_qa(result, world):
+def _answer_qa(result, world, scope_paths=None):
     cites = result.get("citations", [])
     headline = ("該当する記述は見つかりませんでした（確証なし）。検索語を変えて試してください。"
                 if not cites else f"該当箇所が {len(cites)}件見つかりました。")
@@ -531,7 +528,7 @@ def _answer_qa(result, world):
     stamps = documents.modified_at_map(world, [c["doc_id"] for c in cites if c.get("doc_id")])
     result = {**result, "citations": [citations.with_provenance(c, stamps.get(c.get("doc_id"))) for c in cites]}
     return {"headline": headline, "summary": {"total": len(cites)},
-            "data": result, "sources": _sources([c["doc_id"] for c in cites], world)}
+            "data": result, "sources": _sources([c["doc_id"] for c in cites], world, scope_paths)}
 
 
 def _resolve_scope(message, world, scope_paths, layer=None, lens_source="auto", lens_block=None,
@@ -568,13 +565,14 @@ def _es_hits(world, query, sp, k=8, redact=False, layer=None):
         # `es_index.search()` は (hits, reason)。BM25 実クエリ失敗はこの経路に degraded 報告の仕組みが無いため捨てる（構造化された degraded 集計は `fused_search._search_keyword()`）。
         hits, _reason = es_index.search(world, query, scope_paths=sp, k=k, vector=False, layer=layer)
         valid = documents.existing_rels(world, [h.get("doc_id") for h in hits])
+        sp_eff = path_rules.rules_for(world).extend_scope(sp)  # 「範囲の外でも読む」を足した範囲（ES が足したヒットを元の範囲で落とし直さない）
     except Exception:
         return []
     out = []
     for h in hits:
         doc = h.get("doc_id")
         # 秘匿名（更新前に索引化された `credentials.xlsx` 等）は facts/カードへ出さない。
-        if doc and doc in valid and scope.in_scope(doc, sp) and not text_kind.is_sensitive_doc_id(doc):
+        if doc and doc in valid and scope.in_scope(doc, sp_eff) and not text_kind.is_sensitive_doc_id(doc):
             if redact:
                 h = {**h, "text": _redact(h.get("text", ""))[:500]}
             out.append(h)
@@ -716,7 +714,7 @@ def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=No
             qa_result = {"type": "qa", "question": payload, "answered": bool(es_cites), "citations": es_cites}
         else:  # 資料を探す手段が 1 つも無い（グラフ縮退時のみ起こりうる）
             qa_result = {"type": "qa", "question": payload, "answered": False, "citations": []}
-        return _answer_qa(qa_result, world)
+        return _answer_qa(qa_result, world, sp)
 
     if blocked and lens in agentic_search._DISPATCH_REQUIRES_GRAPH and (eff["grep"] or eff["fulltext"]):
         # グラフ必須レンズでグラフだけが不達／OFF のときは、明示エラーで終わらせず grep 相当の下地へ縮退する。縮退の印が無いと Codex 経路で告知だけが消える。
@@ -732,26 +730,27 @@ def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=No
     elif lens in ("impact", "troubleshoot"):
         # グラフ不調（世代不一致・接続断）は事前検索を落とさず、grep 相当の下地＋縮退の印で調査を続けさせる。縮退してよいのは回復可能な障害（`DriverError` と `TransientError`）だけで、`ConfigurationError`・`ClientError` は握り潰さず送出する（`lens_service.neighbor_cards`・`agentic_search._is_recoverable_tool_exception` と同じ分類）。
         from neo4j.exceptions import ConfigurationError, DriverError, TransientError
+        sp_eff = path_rules.rules_for(world).extend_scope(sp)  # 管理者の「範囲の外でも読む」を足した実効の範囲
         try:
             if lens == "impact":
                 base_depth = depth_profile_mod.effective_base(sys_settings, "impact_depth", IMPACT_MAX_DEPTH)
                 depth = depth_profile_mod.scaled_depth(base_depth, profile, abs_max=IMPACT_MAX_DEPTH_ABS_MAX)
-                result = run_impact(session, payload, world, scope_prefixes=sp, depth=depth)  # 範囲は Cypher で絞る
+                result = run_impact(session, payload, world, scope_prefixes=sp_eff, depth=depth)  # 範囲は Cypher で絞る（範囲の外でも読むを足した実効の範囲）
                 # 構造的な影響も推定も 0 件のとき、グラフ未構築なら「影響なし」と誤読させず、grep 相当の下地＋縮退の印へ切り替える。ヒットが 1 件でもあれば追加クエリを発行しない。
                 if not result["items"] and not result.get("presumed") and world_graph_is_empty(session, world):
                     env = _graph_empty_env(lens, eff, _qa_fallback_env)
                 else:
-                    env = _answer_impact(result, world)
+                    env = _answer_impact(result, world, sp)
             else:
                 base_depth = depth_profile_mod.effective_base(
                     sys_settings, "troubleshoot_depth", TROUBLESHOOT_GRAPH_DEPTH)
                 depth = depth_profile_mod.scaled_depth(base_depth, profile, abs_max=TROUBLESHOOT_GRAPH_DEPTH_ABS_MAX)
-                res = run_troubleshoot(session, payload, world, depth=depth, scope_paths=sp)
+                res = run_troubleshoot(session, payload, world, depth=depth, scope_paths=sp_eff)
                 res = _merge_troubleshoot_with_es(res, world, payload, sp) if eff["fulltext"] else res
                 if not res.get("candidates") and world_graph_is_empty(session, world):
                     env = _graph_empty_env(lens, eff, _qa_fallback_env)
                 else:
-                    env = _answer_troubleshoot(res, world)
+                    env = _answer_troubleshoot(res, world, sp)
         except (GraphSchemaEraError, DriverError, TransientError) as e:
             if isinstance(e, ConfigurationError):
                 raise  # 非一時的な設定不備＝縮退しない
@@ -907,6 +906,9 @@ def _finalize(env, decision, message: str = ""):
         # 「続きから調べ直せる」案内は、出典 0 件時の案内と同じボタン機構（retry_hints・data-retry-kind）に載せ、0 件案内とは独立に常に追加する。クリック時は kind="resume" 専用分岐（`web/chat.js`）が固定文言を送り、`codex_session_id` の継続に委ねる。
         env.setdefault("retry_hints", []).append(
             {"kind": "resume", "label": "続きを調べる", "action": {"message": "続きを調べて"}})
+    _world = (env.get("scope") or {}).get("world")
+    if _world:  # 外へ出る境界の最後の網（チャットの回答・Codex ジョブが通る）: 管理者の除外の資料を落とす。設定が無ければ何もしない
+        env = path_rules.filter_output(env, _world)
     return answer_shape.seal(env)
 
 
@@ -1328,7 +1330,7 @@ def stream_message(session, message, world="v1",
                  (lambda lens, inp: _dispatch(session, lens, inp, world, scope_meta, sys_settings,
                                               tools_availability)),
         scope_meta=scope_meta,
-        make_sources=((lambda docs: _sources(docs, world)) if knowledge else None),
+        make_sources=((lambda docs: _sources(docs, world, (scope_meta or {}).get("scope_paths"))) if knowledge else None),
         uid=user_id,
         # agentic/plain 経路にも個人ヒットを伝搬する。
         personal_facts=_personal_facts(personal_hits, message) if personal_hits else "",
