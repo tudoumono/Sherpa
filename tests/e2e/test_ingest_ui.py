@@ -745,3 +745,82 @@ def test_failed_list_retry_reconverts_one_file_and_never_rebuilds_the_whole_fold
     page.wait_for_load_state("networkidle")
     assert ("POST", "worlds/w1/reconvert") in requests
     assert not [r for r in requests if r[1] == "ingest/rerun"]
+
+
+_MARK_RULES = [{"path": "4期/02_設計", "kind": "priority", "outside_scope": True},
+               {"path": "4期/03_開発/01_ソース/BILLGEN.cbl", "kind": "exclude", "outside_scope": False}]
+
+
+def test_status_table_marks_own_and_inherited_rules_without_reading_the_rules_api(page, web_base_url):
+    """表の行に、自分に付いた印と親から受けた印が出る。画面を開いただけでは設定の API を呼ばない（呼ぶと設定を書き換えることがある）。
+    「優先と除外」タブで変えて保存すると、戻った表の印が変わる。"""
+    records = _open(page, web_base_url, path_rules=_MARK_RULES)
+    page.locator("#q").fill("税計算")
+    inherited = page.locator("#rows tr", has_text="税計算仕様書.md")
+    expect(inherited.locator(".pill.pri")).to_have_text("優先")
+    expect(inherited.locator(".pill.pri")).to_have_attribute("title", re.compile("親の「02_設計」に従います"))
+    expect(inherited.locator(".pill.pri")).to_have_attribute("title", re.compile("範囲の外でも読みます"))
+    page.locator("#q").fill("BILLGEN")
+    expect(page.locator("#rows tr", has_text="BILLGEN.cbl").locator(".pill.exc")).to_have_text("除外")
+    assert records["path_rules_get"] == []
+
+    _open_tab(page, "rules")
+    expect(page.locator("#rules-tree")).to_contain_text("README.md")
+    page.locator("#rules-q").fill("BILLGEN")
+    page.locator('[data-set="4期/03_開発/01_ソース/BILLGEN.cbl"]').select_option("none")
+    page.locator("#savebtn").click()
+    page.locator("#okbtn").click()
+    expect(page.locator("#rules-ovl")).to_be_hidden()
+    _open_tab(page, "status")
+    expect(page.locator("#rows tr", has_text="BILLGEN.cbl")).to_be_visible()
+    expect(page.locator("#rows tr", has_text="BILLGEN.cbl").locator(".pill")).to_have_count(0)
+    page.locator("#q").fill("税計算")
+    expect(page.locator("#rows tr", has_text="税計算仕様書.md").locator(".pill.pri")).to_have_text("優先")
+
+
+def test_setting_button_reveals_the_row_even_when_it_is_not_on_the_first_page_and_filters_are_on(page, web_base_url):
+    """表の「設定」を押すと「優先と除外」タブへ移り、1 ページ目に無いファイルでも、絞り込み中でも、その行が見えて設定欄に焦点が行く。"""
+    target = "4期/02_設計/01_基本設計/税計算仕様書.md"
+
+    def files(route):
+        folder = (re.search(r"folder=([^&]*)", route.request.url) or [None, ""])[1]
+        from urllib.parse import unquote
+        folder = unquote(folder)
+        if folder == "4期/02_設計/01_基本設計":
+            _fulfill(route, {"folder": folder, "files": ["4期/02_設計/01_基本設計/a.md"], "truncated": False,
+                             "total": 2, "next_offset": 1})
+        else:
+            _fulfill(route, {"folder": folder, "files": [], "truncated": False, "total": 0, "next_offset": None})
+
+    records = _open(page, web_base_url)
+    page.route("**/admin/path-rules/files**", files)
+    _open_tab(page, "rules")
+    page.locator('.filterchip[data-f="pri"]').click()
+    page.locator("#rules-q").fill("zzz")
+    _open_tab(page, "status")
+    page.locator("#q").fill("税計算")
+    page.locator("#rows tr", has_text="税計算仕様書.md").locator("[data-rule-goto]").click()
+    expect(page.locator("#tab-rules")).to_be_visible()
+    row = page.locator("#rules-tree [data-row]").filter(has=page.locator(f'select[data-set="{target}"]'))
+    expect(row).to_have_class(re.compile(r"\breveal\b"))
+    expect(row.locator("select[data-set]")).to_be_focused()
+    expect(page.locator("#rules-q")).to_have_value("")
+    assert len(records["path_rules_get"]) == 2   # タブに入るたびに 1 回
+
+
+def test_folder_setting_button_does_not_open_the_folder_and_is_absent_for_empty_folders(page, web_base_url):
+    """フォルダの行の「設定」はフォルダを開かずタブだけ移す。資料が 0 件のフォルダの行には出さない。"""
+    _open(page, web_base_url, preview={**PREVIEW, "folders": ["4期/空き"]})
+    folder = page.locator('tr.folderrow[data-open-folder="4期"]')
+    folder.locator("[data-rule-goto]").click()
+    expect(page.locator("#tab-rules")).to_be_visible()
+    expect(page.locator('#rules-tree [data-row="4期"]')).to_have_class(re.compile(r"\breveal\b"))
+    _open_tab(page, "status")
+    expect(page.locator("#count")).not_to_contain_text("範囲:")
+    expect(folder).to_be_visible()
+
+    folder.locator("button", has_text="開く").click()
+    expect(page.locator("#count")).to_contain_text("範囲: 4期")
+    expect(page.locator('tr.folderrow[data-open-folder="4期/02_設計"] [data-rule-goto]')).to_have_count(1)
+    expect(page.locator('tr.folderrow[data-open-folder="4期/空き"]')).to_be_visible()
+    expect(page.locator('tr.folderrow[data-open-folder="4期/空き"] [data-rule-goto]')).to_have_count(0)

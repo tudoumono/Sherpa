@@ -1168,6 +1168,7 @@ class IngestPreviewResponse(BaseModel):
     graph_note: str | None = None
     documents_note: str | None = None
     folders_partial: bool = False
+    path_rules: list[dict[str, Any]] | None = None
 
 
 class IngestPreviewGraphResponse(BaseModel):

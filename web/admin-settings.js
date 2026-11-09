@@ -59,7 +59,7 @@ const OPENAI_ENDPOINT_KIND_LABELS = {
 // 使えるモデル（model_catalog）。用途名 → 平文の表示名。
 const MC_USAGE_LABELS = {
   chat: '接続テスト用', intent: '依頼の仕分け',
-  embed: '検索の索引づくり', subsearch: '簡易回答のモデル', codex: 'Codex',
+  embed: '埋め込み', subsearch: '簡易回答のモデル', codex: 'Codex',
   render: '検索用文書の整形',
 };
 // クラウド選択かつキー未設定のとき。キーは「プロバイダ＋接続先」タブで設定する。
@@ -125,7 +125,7 @@ let _codexSessionRetentionDaysBaseline = '';
 // 素の Codex モード。configured を基準にする（''=未設定＝「標準」）。
 let _codexModeBaseline = '';
 let _embedParallelBaseline = '';   // 埋め込みの同時送信数
-let _embedDimBaseline = '';   // 意味検索の細かさ（''=既定）
+let _embedDimBaseline = '';   // 埋め込みの細かさ（''=既定）
 let _embedProviderBaseline = '';   // 埋め込みの接続先（''=回答と同じクラウド・既定）
 
 // 同時実行の上限（effective_limits）。_DEPTH_BASE_FIELDS と同型（GET は view.chat_max_turns.<view>・PUT は body.<put>）。
@@ -390,10 +390,13 @@ function selectedCloudProvider() {
   return el ? el.dataset.cloudProvider : 'openai';
 }
 
+// 選択肢が1つで保存値が未設定か openai のときは出さない。廃止済み・不正な保存値のときだけ、選び直すために出す。
 function renderCloudProviderRadios(cloud) {
   const wrap = $('cloud-provider-radios');
   if (!wrap) return;
   const providers = cloud.providers || ['openai'];
+  const raw = String(cloud.provider_raw || '').trim().toLowerCase();
+  if (providers.length === 1 && (raw === '' || raw === 'openai')) { wrap.innerHTML = ''; return; }
   const current = cloud.provider || 'openai';
   wrap.innerHTML = providers.map((p) => {
     const meta = CLOUD_PROVIDER_LABELS[p] || { label: p, desc: '' };
@@ -436,7 +439,7 @@ function renderCloudStatus(cloud) {
   if (!el) return;
   const provider = cloud.provider || 'openai';
   const meta = CLOUD_PROVIDER_LABELS[provider] || { label: provider };
-  el.textContent = `現在選択中のクラウド AI: ${meta.label}`
+  el.textContent = `クラウド AI: ${meta.label}`
     + (cloud.personal_api_keys_allowed ? '（個人キーの利用を許可中）' : '（個人キーは無効・中央設定のみ）');
 }
 
@@ -708,7 +711,7 @@ async function testCloudKey() {
 // 中央 API キーの削除。確認ダイアログを挟み、確定した操作でだけ空文字を PUT する（キー欄を空のまま保存しても「未入力＝変更しない」）。
 // 要求時点のプロバイダ・世代を捕捉し、応答到着時に両方一致する時だけ反映する（不一致なら _view・表示に触れず捨てる）。
 let _cloudKeyClearGen = 0;
-// プロバイダ切替・キー入力・保存・タブのリセットのいずれでも呼ぶ。破棄した削除待ちの結果表示をニュートラルへ戻す。
+// プロバイダ切替・キー入力・保存のいずれでも呼ぶ。破棄した削除待ちの結果表示をニュートラルへ戻す。
 function _invalidateCloudKeyClear() {
   _cloudKeyClearGen++;
   const res = $('cloud-key-clear-res');
@@ -912,8 +915,11 @@ function renderExtKeysToggle(extKeys) {
     // 今後の新規発行にのみ効く（発行済みキーの上限は発行時の値のまま）。
     hint.textContent = base + '変更は新規発行から適用されます（発行済みのキーの上限は変わりません）。';
   }
-  // 簡易回答に使う AI（ollama/openai の2択）。保存値がどちらでもない場合は、select の一時的な選択肢とヒントでその旨を示す。
-  const rdp = (extKeys && extKeys.research_default_provider) || {};
+}
+
+// 簡易回答に使う AI（ollama/openai の2択）。保存値がどちらでもない場合は、select の一時的な選択肢とヒントでその旨を示す。
+function renderResearchDefaultProvider(rdp) {
+  rdp = rdp || {};
   const rdpKnown = rdp.effective === 'openai' || rdp.effective === 'ollama';
   const rdpSel = $('ext-research-default-provider');
   if (rdpSel) {
@@ -948,6 +954,8 @@ function renderExtKeysToggle(extKeys) {
         : `未設定です（組み込みの既定 ${label(rdp.default)} が適用されます）。`;
     }
   }
+  // 保存値が破損している間は、その破損状態自体を基準値にする（'ollama' を基準にすると未保存の変更なしに見えて破損に気付けない）。
+  _extKeysResearchProviderBaseline = rdpKnown ? rdp.effective : _RESEARCH_PROVIDER_INVALID;
 }
 
 function extKeyStatus(row) {
@@ -1246,7 +1254,7 @@ if (_extKeysList) _extKeysList.addEventListener('click', async (e) => {
 });
 
 // ===== タブ単位の描画 =====
-// 各タブの render はそのタブのフィールドの baseline も更新する。タブ単位リセットは対応する関数だけを呼び、他タブには触れない。
+// 各タブの render はそのタブのフィールドの baseline も更新する。
 
 function renderProviderTab(view) {
   const cloud = view.cloud || {};
@@ -1254,7 +1262,7 @@ function renderProviderTab(view) {
   renderOllamaAllowlist(view.ollama_allowlist);
   renderWebhookAllowlist(view.webhook_allowlist);
   renderOpenaiEndpoint(view.openai_endpoint);   // _mcState（使えるモデル）を先に更新してから読む
-  renderEmbedProvider(view.embed_provider);
+  renderEmbedProvider(view.embed_provider, cloud);
   _cloudBaseline = {
     provider: cloud.provider || 'openai',
     providerRaw: cloud.provider_raw || null,
@@ -1273,6 +1281,10 @@ function renderProviderTab(view) {
     auth_header: cfg.auth_header || 'bearer',
     api_version: cfg.api_version || '',
   };
+}
+
+// 「チャットと個人ファイル」タブ。接続設定と独立して描画・リセットする。
+function renderChatTab(view) {
   renderChatMaxTurns(view.chat_max_turns);
   renderWorkspace(view.workspace);
   renderChatExamples(view.chat_examples);
@@ -1280,6 +1292,7 @@ function renderProviderTab(view) {
 
 // 「調査・回答」タブは接続設定と独立して描画・リセットする。
 function renderResearchTab(view) {
+  renderResearchDefaultProvider((view.ext_keys || {}).research_default_provider);
   renderAgenticBudget(view.agentic_budget);   // ツール結果バイト予算
   renderCodexMode(view.codex_mode);
   renderDepthProfile(view.depth_profile);
@@ -1303,25 +1316,6 @@ function renderResearchTab(view) {
   $('codex-session-retention-days-hint').textContent =
     `現在の適用値: ${retention.effective} 日（0=無制限）。既定: ${retention.default} 日。`
     + (retention.configured == null ? '未設定です。' : 'この値で固定中です。');
-  const parallel = view.embed_parallel;
-  _embedParallelBaseline = parallel.configured == null ? '' : String(parallel.configured);
-  $('embed-parallel').value = _embedParallelBaseline;
-  $('embed-parallel-hint').textContent = parallel.configured == null
-    ? `未設定です（既定 ${parallel.effective} 件が適用されます）。`
-    : `この値で固定中です（既定: ${parallel.default} 件）。`;
-  const dim = view.embed_dim || {};
-  _embedDimBaseline = dim.configured == null ? '' : String(dim.configured);
-  $('embed-dim').value = _embedDimBaseline;
-  $('embed-dim').min = dim.min || 64;
-  $('embed-dim').max = dim.max || 4096;
-  $('embed-dim').disabled = dim.applies === false;
-  $('embed-dim-hint').textContent = dim.applies === false
-    ? 'ローカル（Ollama）で埋め込む間は、この設定は使われません（モデルごとの値になります）。'
-    : dim.configured == null
-      ? `未設定です（${dim.default} が適用されます。これまでと同じ値です）。`
-      : dim.configured !== dim.effective
-        ? `この値はモデルが対応する値より大きいため、${dim.effective} が適用されます。`
-        : `この値で固定中です（空欄のときは ${dim.default}）。`;
 }
 
 // 素の Codex モード。depth-base-codex-reasoning と同型（空選択肢=未設定=「標準」）。
@@ -1334,13 +1328,22 @@ function renderCodexMode(cm) {
     : 'この値で固定中です（既定: 標準）。';
 }
 
-function renderEmbedProvider(ep) {
+// 保存済みの設定で実際に埋め込む先を説明する文。判定は `embeddings.cfg` と同じ順にする。
+function embedProviderHint(ep, cloud) {
+  if (ep.effective === 'ollama') return `ローカル（Ollama）で埋め込みます。使うモデル: ${ep.ollama_model}（次元はモデルから自動で決まります）`;
+  const raw = String(cloud.provider_raw || '').trim().toLowerCase();
+  const unusable = '回答に使うクラウドが使えない状態なので、埋め込みができません。クラウドの設定を直すか「ローカル（Ollama）」を選んでください。';
+  if (raw && !(cloud.providers || ['openai']).includes(raw)) return unusable;
+  if (cloud.openai_key_set) return '回答に使うクラウド（OpenAI）で埋め込みます。';
+  if (raw) return unusable;
+  return 'クラウドが未設定なので Ollama で埋め込みます。このとき正しく動くのは 768 次元のモデルだけです。ほかのモデルを使うときは「ローカル（Ollama）」を選んでください。';
+}
+
+function renderEmbedProvider(ep, cloud) {
   ep = ep || {};
   _embedProviderBaseline = ep.configured || '';
   $('embed-provider').value = _embedProviderBaseline;
-  $('embed-provider-hint').textContent = ep.effective === 'ollama'
-    ? `ローカル（Ollama）で埋め込みます。使うモデル: ${ep.ollama_model}`
-    : '回答に使うクラウドと同じ接続先で埋め込みます（既定）。';
+  $('embed-provider-hint').textContent = embedProviderHint(ep, cloud || {});
 }
 
 function embedProviderChanged() {
@@ -1415,7 +1418,7 @@ function depthProfileChanged() {
   return intChanged || (!!sel && sel.value !== _depthReasoningBaseline);
 }
 
-// 同時実行の上限（chat_max_turns）。renderDepthProfile/collectDepthProfile/depthProfileChanged と同じ流儀。「プロバイダ＋接続先」タブの追加カード。
+// 同時実行の上限（chat_max_turns）。renderDepthProfile/collectDepthProfile/depthProfileChanged と同じ流儀。「チャットと個人ファイル」タブのカード。
 function renderChatMaxTurns(cmt) {
   cmt = cmt || {};
   _chatMaxTurnsBaseline = {};
@@ -1504,7 +1507,7 @@ function validateWorkspaceInputs() {
   return errors;
 }
 
-// チャット画面のクイック入力例（chat_examples）。「プロバイダ＋接続先」タブの3つ目のカード。
+// チャット画面のクイック入力例（chat_examples）。「チャットと個人ファイル」タブのカード。
 function renderChatExamples(ce) {
   ce = ce || {};
   const configured = ce.configured;
@@ -1566,7 +1569,7 @@ function _fmtDocumentPages(bytes) {
   return pages < 1 ? 'A4資料1ページ未満' : `A4資料約${Math.round(pages).toLocaleString('ja-JP')}ページ分`;
 }
 
-// 調べる深さの基準値と同じ流儀の別カード（取り込みタブ）。表示/入力欄は KB 単位、GET/PUT（bytes）とは境界でだけ変換する。
+// 調べる深さの基準値と同じ流儀の別カード（調査・回答タブ）。表示/入力欄は KB 単位、GET/PUT（bytes）とは境界でだけ変換する。
 function renderAgenticBudget(ab) {
   ab = ab || {};
   _agenticBudgetBaseline = {};
@@ -1679,6 +1682,25 @@ function renderIngestTab(view) {
     model: vlm.effective.model || '', cloud_allowed: !!vlm.effective.cloud_allowed,
   } : null;
   _ragLlmRenderBaseline = !!(view.rag_llm_render && view.rag_llm_render.effective);
+  const parallel = view.embed_parallel;
+  _embedParallelBaseline = parallel.configured == null ? '' : String(parallel.configured);
+  $('embed-parallel').value = _embedParallelBaseline;
+  $('embed-parallel-hint').textContent = parallel.configured == null
+    ? `未設定です（既定 ${parallel.effective} 件が適用されます）。`
+    : `この値で固定中です（既定: ${parallel.default} 件）。`;
+  const dim = view.embed_dim || {};
+  _embedDimBaseline = dim.configured == null ? '' : String(dim.configured);
+  $('embed-dim').value = _embedDimBaseline;
+  $('embed-dim').min = dim.min || 64;
+  $('embed-dim').max = dim.max || 4096;
+  $('embed-dim').disabled = dim.applies === false;
+  $('embed-dim-hint').textContent = dim.applies === false
+    ? 'ローカル（Ollama）で埋め込む間は、この設定は使われません（モデルごとの値になります）。'
+    : dim.configured == null
+      ? `未設定です（${dim.default} が適用されます。これまでと同じ値です）。`
+      : dim.configured !== dim.effective
+        ? `この値はモデルが対応する値より大きいため、${dim.effective} が適用されます。`
+        : `この値で固定中です（空欄のときは ${dim.default}）。`;
 }
 
 // 外部連携（API キー）タブの描画（利用量タブとは baseline を分けて持つ）。
@@ -1688,10 +1710,6 @@ function renderExtKeysTab(view) {
   _extKeysAllowedBaseline = !!extKeys.user_api_keys_allowed;
   const quota = extKeys.daily_quota_default || {};
   _extKeysQuotaBaseline = quota.configured != null ? String(quota.configured) : '';
-  const rdp = extKeys.research_default_provider || {};
-  // 保存値が破損している間は、その破損状態自体を基準値にする（'ollama' を基準にすると未保存の変更なしに見えて破損に気付けない）。
-  _extKeysResearchProviderBaseline = (rdp.effective === 'openai' || rdp.effective === 'ollama')
-    ? rdp.effective : _RESEARCH_PROVIDER_INVALID;
 }
 
 function render(view) {
@@ -1702,8 +1720,13 @@ function render(view) {
   renderModelsTab(view);   // _mcState を先に更新（renderProviderTab の埋め込み欄表示が読むため）
   renderProviderTab(view);
   renderResearchTab(view);
+  renderChatTab(view);
   renderIngestTab(view);
   renderExtKeysTab(view);
+  _nullPlan = [];   // 保存が成功した描画で、既定に戻した予定とその案内を消す
+  document.querySelectorAll('[id^="tab-reset-res-"], #chat-examples-reset-res').forEach((el) => {
+    el.className = 'tres muted'; el.textContent = '';
+  });
   applyConfigChangedHighlights(view);
   refreshTabDots();
 }
@@ -1874,6 +1897,7 @@ async function save() {
   collectWorkspace(body);   // 個人ファイルの上限・保持日数（変わった項目だけ送る）
   if (chatExamplesChanged()) body.chat_examples = collectChatExamples();   // チャットの質問例
   collectAgenticBudget(body);   // ツール結果1件あたりの予算（変わった項目だけ送る）
+  applyNullPlan(body);   // 「既定に戻す」で欄を既定にした固定中の項目は null で解除する
   try {
     const view = await api('PUT', '/admin/settings', body);
     render(view);
@@ -1887,191 +1911,207 @@ async function save() {
 }
 
 // ===== タブ単位「既定に戻す」=====
-// 秘密（API キー）は対象外（キー欄を個別にクリアしてもらう）。真偽値トグル（personal_api_keys_allowed／user_api_keys_allowed）は実効既定と同値の明示 false を送る（一括削除・失効は値が厳密に false のときだけ発火する）。
-async function _putResetBody(body, resEl) {
-  // 5タブ共通のリセット送信口。削除待ちの応答を無効化する（保存済みのクラウドキー削除待ちが巻き戻し得るため）。
-  _invalidateCloudKeyClear();
+// 欄を既定の値にするだけで確定は「保存」。欄を既定にしても save が null を送らない（固定中が残る）項目だけ _nullPlan に持ち、
+// 保存時に欄が既定のままの項目だけ null を送る。API キー欄は対象外。
+let _nullPlan = [];   // { tab, key, isDefault }。保存が成功した render() で空にする
+
+function _planNull(tab, key, isDefault) {
+  _nullPlan = _nullPlan.filter((p) => p.key !== key);
+  _nullPlan.push({ tab, key, isDefault });
+}
+function _clearNullPlan(tab) {
+  _nullPlan = _nullPlan.filter((p) => p.tab !== tab);
+}
+function nullPlanActive(tab) {
+  return _nullPlan.some((p) => p.tab === tab && p.isDefault());
+}
+function applyNullPlan(body) {
+  _nullPlan.forEach((p) => { if (p.isDefault()) body[p.key] = null; });
+}
+
+function _setVal(id, v) { const el = $(id); if (el) el.value = v; }
+function _setChecked(id, v) { const el = $(id); if (el) el.checked = !!v; }
+function _val(id) { return (($(id) || {}).value || '').trim(); }
+
+function _markResetDone(resEl) {
   const el = $(resEl);
-  el.className = 'tres muted';
-  el.textContent = '既定に戻しています...';
-  try {
-    return await api('PUT', '/admin/settings', body);
-  } catch (e) {
-    el.className = 'tres danger';
-    el.textContent = '✗ ' + e.message;
-    throw e;
-  }
-}
-function _markResetOk(resEl) {
-  const el = $(resEl);
-  el.className = 'tres ok';
-  el.textContent = '✓ 既定に戻しました';
-}
-
-// プロバイダタブから「埋め込みのデプロイ名」だけを既定へ戻すための model_catalog body を作る。
-// _mcConfiguredRaw（保存済みの生値）から openai.embed キーだけを取り除く（他タブの未保存編集は含めない）。
-function _configuredRawWithoutOpenaiEmbed() {
-  if (!_mcConfiguredRaw) return null;
-  const clone = JSON.parse(JSON.stringify(_mcConfiguredRaw));
-  if (clone.openai) {
-    delete clone.openai.embed;
-    if (Object.keys(clone.openai).length === 0) delete clone.openai;
-  }
-  return Object.keys(clone).length ? clone : null;
-}
-
-async function resetProviderTab() {
-  if (_view && _view.cloud && _view.cloud.personal_api_keys_allowed) {
-    const n = _view.cloud.personal_keys_in_use_count || 0;
-    if (n > 0 && !window.confirm(
-      `既定に戻すと個人キーの許可がオフになり、現在 ${n} 人の利用者の個人キーが削除されます。続けますか？`)) {
-      return;
-    }
-  }
-  const resEl = 'tab-reset-res-provider';
-  const body = {
-    cloud_provider: null,
-    personal_api_keys_allowed: false,
-    web_search_allowed: false,
-    ollama_url: null,
-    ollama_allowlist: null,
-    webhook_allowlist: null,
-    openai_endpoint_kind: null,
-    openai_base_url: null,
-    openai_auth_header: null,
-    openai_api_version: null,
-    embed_provider: null,
-    // 埋め込みのデプロイ名（model_catalog.openai.embed）だけ組み込み既定へ戻す。
-    model_catalog: _configuredRawWithoutOpenaiEmbed(),
-    chat_max_turns_per_user: null,
-    chat_max_turns_global: null,
-    workspace_max_bytes: null,
-    workspace_ttl_days: null,
-    chat_examples: null,
-  };
-  let view;
-  try { view = await _putResetBody(body, resEl); } catch (e) { return; }
-  _view = view;
-  // 埋め込みセルだけ最新の実効値へ同期する。列プロバイダは応答の cloud_provider へ追従させる。
-  const mc = view.model_catalog || {};
-  const eff = mc.effective || {};
-  const embedEff = (eff.openai || {}).embed || (_mcBuiltin.openai || {}).embed || { allowed: [], default: '' };
-  _mcState.openai = _mcState.openai || {};
-  _mcState.openai.embed = JSON.parse(JSON.stringify(embedEff));
-  _mcBaseline.openai = _mcBaseline.openai || {};
-  _mcBaseline.openai.embed = JSON.parse(JSON.stringify(embedEff));
-  _mcConfiguredRaw = mc.configured ? JSON.parse(JSON.stringify(mc.configured)) : null;
-  _mcCloudProvider = (view.cloud || {}).provider || 'openai';
-  renderProviderTab(view);
-  renderModelCatalogTable();   // 表の埋め込みセル・列プロバイダの見た目も追従させる
-  updateVlmUrlHint(view.vlm);
-  applyConfigChangedHighlights(view);
+  if (el) { el.className = 'tres muted'; el.textContent = '既定の値を入れました。下の「保存」で確定します'; }
   refreshTabDots();
-  _markResetOk(resEl);
 }
 
-async function resetResearchTab() {
-  const resEl = 'tab-reset-res-research';
-  const body = Object.fromEntries(_DEPTH_BASE_FIELDS.map(({ put }) => [put, null]));
-  body.depth_base_codex_reasoning = null;
-  body.embed_parallel = null;
-  body.embed_dim = null;
-  body.max_review_rounds = null;
-  body.codex_worker_model = null;
-  body.codex_session_retention_days = null;
-  body.agentic_budget_per_result = null;
-  body.codex_mode = null;
-  let view;
-  try { view = await _putResetBody(body, resEl); } catch (e) { return; }
-  _view = view;
-  renderResearchTab(view);
-  applyConfigChangedHighlights(view);
-  refreshTabDots();
-  _markResetOk(resEl);
+// 使えるモデルのセルを組み込み既定へ戻す（保存時 buildModelCatalogBody が既定と同じセルを外す）。
+function _mcResetCell(provider, usage) {
+  const b = (_mcBuiltin[provider] || {})[usage];
+  if (!b) return;
+  _mcState[provider] = _mcState[provider] || {};
+  _mcState[provider][usage] = JSON.parse(JSON.stringify(b));
+  _mcTouched.add(provider + '/' + usage);
 }
 
-async function resetModelsTab() {
-  const resEl = 'tab-reset-res-models';
-  // 対象キーのみ・null で送る。model_catalog を丸ごと既定へ戻すため、プロバイダタブの埋め込みデプロイ名も一緒に戻る。
-  const body = { model_catalog: null };
-  let view;
-  try { view = await _putResetBody(body, resEl); } catch (e) { return; }
-  _view = view;
-  renderModelsTab(view);
-  // 列プロバイダは「プロバイダタブの現在の未保存選択」に合わせる（保存済み値へ戻さない）。
-  _mcCloudProvider = selectedCloudProvider();
+function resetProviderTab() {
+  const view = _view || {};
+  _clearNullPlan('provider');
+  const radios = document.querySelectorAll('#cloud-provider-radios input[data-cloud-provider]');
+  if (radios.length) {
+    radios.forEach((r) => { r.checked = r.dataset.cloudProvider === 'openai'; });
+    _cloudProviderTouched = true;
+  }
+  if ((view.cloud || {}).provider_raw != null) _planNull('provider', 'cloud_provider', () => selectedCloudProvider() === 'openai');
+  _setChecked('personal-keys-allowed', false);
+  _setChecked('web-search-allowed', false);
+  // 未設定のときの表示値は既定の接続先そのもの。固定中のときだけ空にして、保存で既定へ戻す。
+  _setVal('cloud-ollama-url', _cloudBaseline.ollamaUrl === 'http://localhost:11434' ? _cloudBaseline.ollamaUrl : '');
+  _setVal('cloud-ollama-allowlist', '');
+  _setVal('webhook-allowlist', '');
+  _setVal('embed-provider', '');
+  const kind = document.querySelector('#openai-endpoint-radios input[data-openai-endpoint-kind="openai"]');
+  if (kind) kind.checked = true;
+  _setVal('openai-endpoint-base-url', '');
+  _setVal('openai-endpoint-auth-header', 'bearer');
+  _setVal('openai-endpoint-api-version', '');
+  updateOpenaiEndpointFieldsVisibility();
+  const cfg = (view.openai_endpoint || {}).configured || {};
+  if (cfg.kind) _planNull('provider', 'openai_endpoint_kind', () => selectedOpenaiEndpointKind() === 'openai');
+  if (cfg.base_url) _planNull('provider', 'openai_base_url', () => _val('openai-endpoint-base-url') === '');
+  if (cfg.auth_header) {
+    _planNull('provider', 'openai_auth_header', () => (_val('openai-endpoint-auth-header') || 'bearer') === 'bearer');
+  }
+  if (cfg.api_version) _planNull('provider', 'openai_api_version', () => _val('openai-endpoint-api-version') === '');
+  _mcResetCell('openai', 'embed');
+  syncEmbedDeploymentField();
   renderModelCatalogTable();
-  syncEmbedDeploymentField();   // プロバイダ＋接続先タブ側の表示も新しい実効値へ追従させる
-  applyConfigChangedHighlights(view);
-  refreshTabDots();
-  _markResetOk(resEl);
+  _markResetDone('tab-reset-res-provider');
 }
 
-async function resetIngestTab() {
-  const resEl = 'tab-reset-res-ingest';
-  const body = {
-    arms_enabled: null, legacy_backend: null, vlm: null, rag_llm_render: null,
-  };
-  let view;
-  try { view = await _putResetBody(body, resEl); } catch (e) { return; }
-  _view = view;
-  renderIngestTab(view);
-  renderMcVlmLine(view.vlm);
-  applyConfigChangedHighlights(view);
-  refreshTabDots();
-  _markResetOk(resEl);
+function _resetChatExamplesFields() {
+  _clearNullPlan('chat');
+  _setChecked('chat-examples-enabled', true);
+  _setVal('chat-examples-items', '');
+  const ce = (_view || {}).chat_examples || {};
+  if (ce.configured != null) {
+    _planNull('chat', 'chat_examples', () => !!($('chat-examples-enabled') || {}).checked && _collectChatExamplesItems().length === 0);
+  }
 }
 
-// 外部連携（API キー）タブの既定リセット。対象は user_api_keys_allowed（明示 false）と quota のみ。
-async function resetExtKeysTab() {
-  if (_view && _view.ext_keys && _view.ext_keys.user_api_keys_allowed) {
-    const n = _view.ext_keys.self_issued_active_count || 0;
-    if (n > 0 && !window.confirm(
-      `既定に戻すと利用者のキー発行が許可されなくなり、現在有効な利用者発行キー ${n} 件が`
-      + '失効します。続けますか？')) {
-      return;
+function resetChatTab() {
+  _CHAT_MAX_TURNS_FIELDS.forEach(({ id }) => _setVal(id, ''));
+  _WORKSPACE_FIELDS.forEach(({ id }) => _setVal(id, ''));
+  _resetChatExamplesFields();
+  _markResetDone('tab-reset-res-chat');
+}
+
+function resetResearchTab() {
+  _clearNullPlan('research');
+  _DEPTH_BASE_FIELDS.forEach(({ id }) => _setVal(id, ''));
+  _setVal('depth-base-codex-reasoning', '');
+  _setVal('codex-mode', '');
+  _setVal('max-review-rounds', '');
+  _setVal('codex-worker-model', '');
+  _setVal('codex-session-retention-days', '');
+  _AGENTIC_BUDGET_FIELDS.forEach(({ id }) => _setVal(id, ''));
+  const rdp = ((_view || {}).ext_keys || {}).research_default_provider || {};
+  const def = rdp.default === 'openai' ? 'openai' : 'ollama';
+  _setVal('ext-research-default-provider', def);
+  if (rdp.configured) {
+    _planNull('research', 'research_default_provider', () => _val('ext-research-default-provider') === def);
+  }
+  _markResetDone('tab-reset-res-research');
+}
+
+function resetModelsTab() {
+  // 保存時に既定と同じセルは外れ、全部外れれば model_catalog が null になる。
+  const touched = new Set();
+  [_mcState, _mcBuiltin, _mcConfiguredRaw || {}].forEach((cat) => {
+    Object.keys(cat).forEach((provider) => Object.keys(cat[provider] || {}).forEach((usage) => touched.add(provider + '/' + usage)));
+  });
+  touched.forEach((key) => {
+    const [provider, usage] = key.split('/');
+    if ((_mcBuiltin[provider] || {})[usage]) _mcResetCell(provider, usage);
+    else if (_mcState[provider]) delete _mcState[provider][usage];
+    _mcTouched.add(key);
+  });
+  renderModelCatalogTable();
+  syncEmbedDeploymentField();
+  _markResetDone('tab-reset-res-models');
+}
+
+function resetIngestTab() {
+  const view = _view || {};
+  _clearNullPlan('ingest');
+  _setVal('embed-parallel', '');
+  _setVal('embed-dim', '');
+
+  const arms = view.arms || {};
+  const armsDefault = [...(arms.env_default || [])].sort();
+  document.querySelectorAll('#arms-list input[data-arm]').forEach((el) => {
+    el.checked = armsDefault.includes(el.dataset.arm);
+  });
+  if (arms.configured != null) {
+    _planNull('ingest', 'arms_enabled', () => JSON.stringify([...collectArms()].sort()) === JSON.stringify(armsDefault));
+  }
+
+  const lb = view.legacy_backend;
+  if (lb && Array.isArray(lb.options) && lb.options.length) {
+    const legacyDefault = lb.default || 'none';
+    document.querySelectorAll('#legacy-radios input[data-legacy]').forEach((el) => {
+      el.checked = el.dataset.legacy === legacyDefault;
+    });
+    if (lb.configured != null) _planNull('ingest', 'legacy_backend', () => collectLegacy() === legacyDefault);
+  }
+
+  const vlm = view.vlm;
+  if (vlm && vlm.effective) {
+    const d = vlm.default || {};
+    const defProvider = d.provider === 'openai' ? 'openai' : 'ollama';
+    _setVal('vlm-provider', defProvider);
+    _setVal('vlm-model', d.model || '');
+    _setChecked('vlm-cloud-allowed', d.cloud_allowed);
+    updateVlmKeyHint();
+    updateVlmUrlHint();
+    if (vlm.configured != null) {
+      _planNull('ingest', 'vlm', () => {
+        const cur = collectVlm();
+        return cur.provider === defProvider && (!cur.model || cur.model === (d.model || ''))
+          && cur.cloud_allowed === !!d.cloud_allowed;
+      });
     }
   }
-  const resEl = 'tab-reset-res-extkeys';
-  const body = {
-    user_api_keys_allowed: false,
-    user_api_keys_daily_quota_default: null,
-    research_default_provider: null,
-  };
-  let view;
-  try { view = await _putResetBody(body, resEl); } catch (e) { return; }
-  _view = view;
-  renderExtKeysTab(view);
-  await loadExtKeys();   // OFF リセットで一括失効された可能性があるため一覧も再取得する
-  applyConfigChangedHighlights(view);
-  refreshTabDots();
-  _markResetOk(resEl);
+
+  const rr = view.rag_llm_render;
+  if (rr) {
+    _setChecked('rag-llm-render', rr.default);
+    if (rr.configured != null) {
+      _planNull('ingest', 'rag_llm_render', () => !!($('rag-llm-render') || {}).checked === !!rr.default);
+    }
+  }
+  _markResetDone('tab-reset-res-ingest');
+}
+
+// 外部連携（API キー）タブ。利用者のキー発行の許可と呼び出し上限だけが対象。
+function resetExtKeysTab() {
+  _setChecked('ext-keys-user-allowed', false);
+  _setVal('ext-keys-user-quota-default', '');
+  _markResetDone('tab-reset-res-extkeys');
 }
 
 const _TAB_RESET_HANDLERS = {
-  provider: resetProviderTab, research: resetResearchTab, models: resetModelsTab, ingest: resetIngestTab,
-  extkeys: resetExtKeysTab,
+  provider: resetProviderTab, research: resetResearchTab, chat: resetChatTab, models: resetModelsTab,
+  ingest: resetIngestTab, extkeys: resetExtKeysTab,
 };
 document.querySelectorAll('[data-reset-tab]').forEach((b) => {
   const handler = _TAB_RESET_HANDLERS[b.dataset.resetTab];
   if (handler) b.addEventListener('click', handler);
 });
 
-// チャットの質問例カードだけの「未設定に戻す」（_putResetBody を共用）。
+// チャットの質問例カードだけの「未設定に戻す」。
 const _chatExamplesReset = $('chat-examples-reset');
-if (_chatExamplesReset) _chatExamplesReset.addEventListener('click', async () => {
-  const resEl = 'chat-examples-reset-res';
-  let view;
-  try { view = await _putResetBody({ chat_examples: null }, resEl); } catch (e) { return; }
-  _view = view;
-  renderChatExamples(view.chat_examples);
-  applyConfigChangedHighlights(view);
-  refreshTabDots();
-  _markResetOk(resEl);
+if (_chatExamplesReset) _chatExamplesReset.addEventListener('click', () => {
+  _resetChatExamplesFields();
+  _markResetDone('chat-examples-reset-res');
 });
 
 // ===== タブ切り替え（URL ハッシュで記憶）・未保存タブの丸印 =====
-const TAB_KEYS = ['provider', 'research', 'models', 'ingest', 'extkeys'];
+const TAB_KEYS = ['provider', 'research', 'chat', 'models', 'ingest', 'extkeys'];
 // 埋め込みタブ（管理系ページを iframe で表示）。保存対象がないため TAB_DIRTY を持たず、切替に未保存確認は挟まない。
 const EMBED_TAB_KEYS = ['users', 'usage-page', 'feedback', 'audit', 'status', 'connectivity'];
 const ALL_TAB_KEYS = TAB_KEYS.concat(EMBED_TAB_KEYS);
@@ -2126,13 +2166,15 @@ window.addEventListener('hashchange', () => activateTab(location.hash.replace('#
 // （埋め込みデプロイ名欄は物理的に「プロバイダ＋接続先」タブにあるため、そちらで判定する）。
 const TAB_DIRTY = {
   provider: () => cloudChanged() || ollamaAllowlistChanged() || webhookAllowlistChanged()
-    || openaiEndpointChanged() || mcEmbedChanged() || embedProviderChanged()
-    || chatMaxTurnsChanged() || workspaceChanged() || chatExamplesChanged(),
-  research: () => depthProfileChanged() || embedParallelChanged() || embedDimChanged() || maxReviewRoundsChanged()
-    || codexWorkerModelChanged() || codexSessionRetentionDaysChanged() || agenticBudgetChanged() || codexModeChanged(),
+    || openaiEndpointChanged() || mcEmbedChanged() || embedProviderChanged() || nullPlanActive('provider'),
+  research: () => depthProfileChanged() || maxReviewRoundsChanged()
+    || codexWorkerModelChanged() || codexSessionRetentionDaysChanged() || agenticBudgetChanged() || codexModeChanged()
+    || extKeysResearchProviderChanged() || nullPlanActive('research'),
+  chat: () => chatMaxTurnsChanged() || workspaceChanged() || chatExamplesChanged() || nullPlanActive('chat'),
   models: () => mcCatalogChangedExcludingEmbed(),
-  ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged(),
-  extkeys: () => extKeysAllowedChanged() || extKeysQuotaChanged() || extKeysResearchProviderChanged(),
+  ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged()
+    || embedParallelChanged() || embedDimChanged() || nullPlanActive('ingest'),
+  extkeys: () => extKeysAllowedChanged() || extKeysQuotaChanged(),
 };
 function refreshTabDots() {
   TAB_KEYS.forEach((k) => {
@@ -2157,7 +2199,7 @@ document.addEventListener('change', (e) => {
 // document を対象にするのは、モーダルが #main-content の外にあり、そこでの操作も拾うため。
 ['input', 'change', 'click'].forEach((evt) => document.addEventListener(evt, refreshTabDots));
 
-// 既定から変えた項目だけ強調する（5タブすべて）。組み込み既定の値そのものと比較する。使えるモデルの表はセル単位で mcCellChanged() が強調する。
+// 既定から変えた項目だけ強調する（全タブ）。組み込み既定の値そのものと比較する。使えるモデルの表はセル単位で mcCellChanged() が強調する。
 function applyConfigChangedHighlights(view) {
   const mark = (el, changed) => { if (el) el.classList.toggle('cfg-changed', !!changed); };
   const cloud = view.cloud || {};

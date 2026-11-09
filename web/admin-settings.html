@@ -26,8 +26,8 @@
   .armrow:last-child{border-bottom:none}
   .armrow input[type=checkbox],.armrow input[type=radio]{margin-top:3px;width:16px;height:16px;flex:none}
   .armrow input:disabled{opacity:.5}
-  .armrow .arm-t{font-weight:600;font-size:var(--text-label);color:var(--ink)}
-  .armrow .arm-d{font-size:var(--text-small);color:var(--ink-3);margin-top:2px}
+  .arm-t{font-weight:600;font-size:var(--text-label);color:var(--ink)}
+  .arm-d{font-size:var(--text-small);color:var(--ink-3);margin-top:2px}
   .armrow code{font-size:var(--text-caption);color:var(--ink-3)}
   /* 旧形式変換バックエンド */
   #legacy-block{margin-top:16px;border-top:1px solid var(--border);padding-top:14px}
@@ -92,11 +92,11 @@
     border:1px solid var(--control-border);border-radius:var(--radius);background:var(--surface);color:var(--ink)}
   #ek-reveal-key{font-size:var(--text-label);word-break:break-all;padding:10px;border:1px solid var(--border);
     border-radius:var(--radius);background:var(--surface-2);margin:10px 0}
-  .tabs{display:flex;flex-direction:column;gap:4px;overflow:auto;padding:0 8px 16px 0;
+  .tabs{display:flex;flex-direction:column;gap:2px;overflow:auto;padding:0 8px 8px 0;
     border-right:1px solid var(--border)}
-  .tab-group-title{padding:8px 12px;font-size:var(--text-small);font-weight:600;color:var(--ink-2)}
-  .tab-group-operations{margin-top:20px;border-top:1px solid var(--border);padding-top:20px}
-  .tab-btn{position:relative;flex:none;min-height:44px;padding:10px 12px;border:1px solid transparent;
+  .tab-group-title{padding:4px 12px;font-size:var(--text-small);font-weight:600;color:var(--ink-2)}
+  .tab-group-operations{margin-top:8px;border-top:1px solid var(--border);padding-top:8px}
+  .tab-btn{position:relative;flex:none;min-height:32px;padding:5px 12px;border:1px solid transparent;
     border-radius:var(--radius-sm);background:transparent;font-size:var(--text-label);line-height:1.5;
     font-weight:500;color:var(--ink-2);cursor:pointer;text-align:left;overflow-wrap:anywhere}
   .tab-btn:hover{background:var(--surface-2);color:var(--ink)}
@@ -169,6 +169,7 @@
         <div class="tab-group-title" role="presentation">設定</div>
         <button class="tab-btn" type="button" role="tab" data-tab="provider" aria-selected="true" id="tab-btn-provider" aria-controls="tabpanel-provider" tabindex="0">プロバイダ＋接続先<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-provider" hidden></span></button>
         <button class="tab-btn" type="button" role="tab" data-tab="research" aria-selected="false" id="tab-btn-research" aria-controls="tabpanel-research" tabindex="-1">調査・回答<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-research" hidden></span></button>
+        <button class="tab-btn" type="button" role="tab" data-tab="chat" aria-selected="false" id="tab-btn-chat" aria-controls="tabpanel-chat" tabindex="-1">チャットと個人ファイル<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-chat" hidden></span></button>
         <button class="tab-btn" type="button" role="tab" data-tab="models" aria-selected="false" id="tab-btn-models" aria-controls="tabpanel-models" tabindex="-1">使えるモデル<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-models" hidden></span></button>
         <button class="tab-btn" type="button" role="tab" data-tab="ingest" aria-selected="false" id="tab-btn-ingest" aria-controls="tabpanel-ingest" tabindex="-1">取り込み<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-ingest" hidden></span></button>
         <button class="tab-btn" type="button" role="tab" data-tab="extkeys" aria-selected="false" id="tab-btn-extkeys" aria-controls="tabpanel-extkeys" tabindex="-1">外部連携<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-extkeys" hidden></span></button>
@@ -191,7 +192,32 @@
             <div class="hint danger" id="cloud-retired-warn" hidden></div>
             <div id="cloud-provider-radios"><!-- JS が描画: クラウド AI のラジオ --></div>
 
-            <div id="cloud-key-block" style="margin-top:14px">
+            <div style="margin-top:14px" id="openai-endpoint-block">
+              <span class="vlm-l" style="display:block;margin-bottom:6px">OpenAI の接続先</span>
+              <div id="openai-endpoint-radios"><!-- JS が描画: openai/azure/custom ラジオ --></div>
+              <div id="openai-endpoint-fields" style="margin-top:10px">
+                <label class="vlm-field"><span class="vlm-l">接続先 URL</span>
+                  <input type="text" id="openai-endpoint-base-url"
+                         placeholder="例: https://<リソース名>.openai.azure.com/openai/v1" style="max-width:360px">
+                </label>
+                <div class="hint">「その他 OpenAI 互換」を選んだ場合、接続先 URL のホストが私有アドレス（10.x/172.16-31.x/192.168.x/
+                  100.64.0.0-100.127.255.255 等）・localhost・.local/.internal/.lan 等の非公開名・ドット無しの裸のホスト名の
+                  いずれかならチャット画面に「社内サーバ」、公開ホスト（例: api.example.com）なら「クラウド（OpenAI 互換）」と
+                  表示されます。この判定は DNS 解決をせず URL 上のホスト表記だけで行うため、私有 IP に解決される公開ホスト名を
+                  設定している場合でも表記どおり「クラウド（OpenAI 互換）」表示になります。</div>
+                <label class="vlm-field"><span class="vlm-l">埋め込みのデプロイ名</span>
+                  <input type="text" id="openai-endpoint-embed-deployment"
+                         placeholder="空欄なら既定のモデル名" style="max-width:360px">
+                </label>
+                <div class="testrow">
+                  <button class="mini" id="openai-endpoint-test" type="button">接続テスト</button>
+                  <span class="tres muted" id="openai-endpoint-test-res"></span>
+                </div>
+              </div>
+              <div class="hint">接続先を変えると、埋め込みが今の設定と合わなくなることがあります。切替後は資料フォルダの再取り込みが必要になる場合があります。</div>
+            </div>
+
+            <div id="cloud-key-block" style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px">
               <label class="vlm-field"><span class="vlm-l" id="cloud-key-label">キー</span>
                 <input type="password" id="cloud-key" placeholder="未設定" autocomplete="off" style="max-width:360px">
               </label>
@@ -242,32 +268,8 @@
 （環境変数 <code>OLLAMA_HOST=0.0.0.0</code>）で Ollama を起動し、ポート 11434 への接続を許可してください。</div>
             </div>
 
-            <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px" id="openai-endpoint-block">
-              <span class="vlm-l" style="display:block;margin-bottom:6px">OpenAI の接続先</span>
-              <div id="openai-endpoint-radios"><!-- JS が描画: openai/azure/custom ラジオ --></div>
-              <div id="openai-endpoint-fields" style="margin-top:10px">
-                <label class="vlm-field"><span class="vlm-l">接続先 URL</span>
-                  <input type="text" id="openai-endpoint-base-url"
-                         placeholder="例: https://<リソース名>.openai.azure.com/openai/v1" style="max-width:360px">
-                </label>
-                <div class="hint">「その他 OpenAI 互換」を選んだ場合、接続先 URL のホストが私有アドレス（10.x/172.16-31.x/192.168.x/
-                  100.64.0.0-100.127.255.255 等）・localhost・.local/.internal/.lan 等の非公開名・ドット無しの裸のホスト名の
-                  いずれかならチャット画面に「社内サーバ」、公開ホスト（例: api.example.com）なら「クラウド（OpenAI 互換）」と
-                  表示されます。この判定は DNS 解決をせず URL 上のホスト表記だけで行うため、私有 IP に解決される公開ホスト名を
-                  設定している場合でも表記どおり「クラウド（OpenAI 互換）」表示になります。</div>
-                <label class="vlm-field"><span class="vlm-l">埋め込みのデプロイ名</span>
-                  <input type="text" id="openai-endpoint-embed-deployment"
-                         placeholder="空欄なら既定のモデル名" style="max-width:360px">
-                </label>
-                <div class="testrow">
-                  <button class="mini" id="openai-endpoint-test" type="button">接続テスト</button>
-                  <span class="tres muted" id="openai-endpoint-test-res"></span>
-                </div>
-              </div>
-              <div class="hint">接続先を変えると、検索の索引（埋め込み）が今の設定と合わなくなることがあります。切替後は資料フォルダの再取り込みが必要になる場合があります。</div>
-            </div>
-
             <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px" id="embed-provider-block">
+              <div class="hint" style="margin-bottom:8px">埋め込み＝資料を意味で探すための検索データです。</div>
               <label class="vlm-field"><span class="vlm-l">埋め込みの接続先</span>
                 <select id="embed-provider" style="max-width:360px">
                   <option value="">回答と同じクラウド（既定）</option>
@@ -275,8 +277,8 @@
                 </select>
               </label>
               <div class="hint" id="embed-provider-hint" style="margin:-8px 0 6px"></div>
-              <div class="hint">切り替えると、検索用のベクトルをすべて作り直します。時間はかかりますが、ローカルなら API の費用はかかりません。
-                ローカルを選ぶ場合は、日本語に対応した多言語の埋め込みモデルをおすすめします（使うモデルは「使えるモデル」タブの Ollama の埋め込み欄で決めます）。
+              <div class="hint">切り替えると、埋め込みをすべて作り直します。時間はかかりますが、ローカルなら API の費用はかかりません。
+                ローカルを選ぶ場合は、日本語に対応した多言語の埋め込みモデルをおすすめします（使うモデルは「使えるモデル」タブの「埋め込み」の行、Ollama の列で決めます）。
                 切り替えた後は、各資料フォルダで「今すぐ更新」を実行してください（実行しなくても、次の取り込み・更新のときに作り直されます）。</div>
             </div>
 
@@ -308,99 +310,45 @@
                 このサーバー自身（localhost）宛てでも登録が必要で、空のままだと通知はどこにも送れません
                 （誤って社内の他システムへ通知が飛ぶことを防ぐ・「外部連携（API キー）」タブで宛先を登録）。</div>
             </details>
-
-            <div class="sec-actions">
-              <button class="btn-ghost" data-reset-tab="provider" type="button">このタブを既定に戻す</button>
-              <span class="tres muted" id="tab-reset-res-provider"></span>
-            </div>
           </div>
         </div>
-
-        <!-- 同時実行の上限。チャットの送信（背景実行のターン）を同時にいくつまで受け付けるかの上限。空欄なら組み込みの既定が使われる。 -->
-        <!-- このタブの「既定に戻す」ボタンがこのカードの項目も一緒に既定へ戻す。 -->
-        <div class="card sec" id="chat-max-turns-card">
-          <div class="card-head"><span class="title">同時実行の上限</span></div>
-          <div class="body">
-            <div class="hint" style="margin-bottom:10px">チャットで送信した、回答を作成中の質問を同時にいくつまで
-              受け付けるかの上限です。上限に達した分は待たされることなく、その場で
-              「実行中の回答が終わってからもう一度お試しください」という案内になります。空欄のままなら
-              組み込みの既定が使われます。</div>
-
-            <label class="vlm-field"><span class="vlm-l">同時に実行できる質問の数（1 人あたり）</span>
-              <input type="number" id="chat-max-turns-per-user" min="1" max="16" step="1" style="max-width:160px">
-            </label>
-            <div class="hint" id="chat-max-turns-per-user-hint" style="margin:-8px 0 14px"></div>
-
-            <label class="vlm-field"><span class="vlm-l">同時に実行できる質問の数（全員の合計）</span>
-              <input type="number" id="chat-max-turns-global" min="1" max="64" step="1" style="max-width:160px">
-            </label>
-            <div class="hint" id="chat-max-turns-global-hint" style="margin:-8px 0 6px"></div>
-          </div>
+        <div class="sec-actions">
+          <button class="btn-ghost" data-reset-tab="provider" type="button">このタブを既定に戻す</button>
+          <span class="tres muted" id="tab-reset-res-provider"></span>
         </div>
 
-        <!-- 個人ファイル（作業領域）。利用者がアップロードするファイルの 1 件あたりの上限と保持日数。空欄なら組み込みの既定が使われる。 -->
-        <div class="card sec" id="workspace-card">
-          <div class="card-head"><span class="title">個人ファイル（作業領域）</span></div>
-          <div class="body">
-            <div class="hint" style="margin-bottom:10px">利用者が自分の作業領域へアップロードするファイルと、Codex が作成した成果物の扱いです。
-              保持日数を過ぎたファイルは自動で削除されます。空欄のままなら組み込みの既定が使われます。</div>
-
-            <label class="vlm-field"><span class="vlm-l">1 件あたりのアップロード上限（MB）</span>
-              <input type="number" id="workspace-max-mb" min="1" max="1024" step="1" style="max-width:160px">
-            </label>
-            <div class="hint" id="workspace-max-mb-hint" style="margin:-8px 0 14px"></div>
-
-            <label class="vlm-field"><span class="vlm-l">保持日数（0 は無期限）</span>
-              <input type="number" id="workspace-ttl-days" min="0" max="3650" step="1" style="max-width:160px">
-            </label>
-            <div class="hint" id="workspace-ttl-days-hint" style="margin:-8px 0 6px"></div>
-          </div>
-        </div>
-
-        <!-- チャット画面のクイック入力例（ウェルカム画面のチップ）。導入先ごとに例文を差し替えられる（既定は組み込みの4例）。 -->
-        <div class="card sec" id="chat-examples-card">
-          <div class="card-head"><span class="title">チャットの質問例（クイック入力）</span></div>
-          <div class="body">
-            <div class="hint" style="margin-bottom:10px">チャット画面を開いたときに表示される、クリックで入力欄に読み込める質問例です。
-              空欄のまま保存すると質問例は表示されません。組み込みの既定（4例）に戻すには、下の「未設定に戻す」を使ってください。</div>
-
-            <label class="armrow">
-              <input type="checkbox" id="chat-examples-enabled" checked>
-              <span><span class="arm-t">質問例を表示する</span>
-                <div class="arm-d">オフにすると、下欄の内容にかかわらず質問例のブロック自体を表示しません。</div></span>
-            </label>
-
-            <label class="vlm-field" style="margin-top:10px">
-              <span class="vlm-l">質問例（1行に1つ・最大8件・各200文字まで）</span>
-              <textarea id="chat-examples-items" rows="4"
-                        placeholder="例: 消費税率を変更すると、影響がありそうな箇所を教えてください。"></textarea>
-            </label>
-            <div class="hint" id="chat-examples-status"><!-- JS が描画: 既定に従っているか/固定中か --></div>
-
-            <div class="sec-actions">
-              <button class="btn-ghost" id="chat-examples-reset" type="button">未設定に戻す（組み込みの既定を使う）</button>
-              <span class="tres muted" id="chat-examples-reset-res"></span>
-            </div>
-          </div>
-        </div>
       </div>
 
       <div class="tabpanel" id="tabpanel-research" data-tabpanel="research" role="tabpanel" aria-labelledby="tab-btn-research" tabindex="0" hidden>
-        <p class="hint">調査に使う AI の設定と、共通の検索設定を調整します。</p>
+        <p class="hint">Codex の調査の設定と、簡易回答に使う AI を調整します。</p>
         <div class="card sec" id="review-rounds-card">
           <div class="card-head"><span class="title">見直しの回数</span></div>
           <div class="body">
             <p class="hint">チャットの「調べる深さ」で見直しの回数が決まります。既定の方式（Codex 調査（OpenAI））では、クイック＝見直しなし、標準＝1 回、深く＝3 回、最大＝6 回までです。AI が十分に調べたと判断したときは、途中で終わります。</p>
             <p class="hint">調査計画書を使わない構成（Codex 調査（Ollama）、または評価用の SHERPA_LEDGER_STYLE=json）では、下調べ役の結果を見直す回数が、クイック＝0 回、標準＝2 回、深く＝4 回、最大＝下の設定値までになります。下の「最大の見直しの回数」はこの構成にだけ効き、既定の方式には効きません。</p>
             <label class="vlm-field"><span class="vlm-l">最大の見直しの回数</span>
-              <input type="number" id="max-review-rounds" min="1" max="32" step="1" placeholder="既定: 7" style="max-width:160px">
+              <input type="number" id="max-review-rounds" min="1" max="32" step="1" placeholder="既定: 7" style="width:160px">
             </label>
             <div class="hint" id="max-review-rounds-hint" style="margin:-8px 0 6px"></div>
             <p class="hint">1〜32 回で指定できます。空欄で保存すると既定に戻ります。</p>
           </div>
         </div>
+        <div class="card sec" id="simple-answer-card">
+          <div class="card-head"><span class="title">簡易回答</span></div>
+          <div class="body">
+            <label class="vlm-field">
+              <span class="vlm-l">簡易回答に使う AI（チャットの簡易・外部 API）</span>
+              <select id="ext-research-default-provider" style="max-width:260px">
+                <option value="ollama">ローカル（Ollama・既定）</option>
+                <option value="openai">クラウド（OpenAI）</option>
+              </select>
+            </label>
+            <div class="hint" id="ext-research-default-provider-hint" style="margin:-8px 0 14px"></div>
+            <div class="hint danger" id="ext-research-default-provider-invalid" hidden style="margin:-8px 0 14px"><!-- JS が描画: 保存値が不正な場合の案内 --></div>
+          </div>
+        </div>
         <section class="research-group" aria-labelledby="research-codex-heading">
-          <h2 id="research-codex-heading">Codex 専用</h2>
+          <h2 id="research-codex-heading">Codex の動かし方</h2>
           <div class="card sec" id="codex-mode-card">
             <div class="card-head"><span class="title">Codex の調べ方</span></div>
             <div class="body">
@@ -451,28 +399,6 @@
               <div class="hint" id="codex-session-retention-days-hint" style="margin:-8px 0 6px"></div>
             </div>
           </div>
-        </section>
-        <section class="research-group" aria-labelledby="research-api-heading">
-          <h2 id="research-api-heading">取り込み・検索の共通設定</h2>
-          <div class="card sec" id="api-investigation-card">
-            <div class="card-head"><span class="title">埋め込みの同時送信数</span></div>
-            <div class="body">
-              <label class="vlm-field"><span class="vlm-l">埋め込みの同時送信数</span>
-                <input type="number" id="embed-parallel" min="1" max="16" step="1" style="max-width:160px">
-              </label>
-              <div class="hint" id="embed-parallel-hint" style="margin:-8px 0 6px"></div>
-              <p class="hint">資料の取り込み時に、埋め込み API へ同時に送るリクエスト数です。大きくすると取り込みが速くなりますが、
-                プロバイダ側の同時実行/レート制限に早く当たることがあります。保存した値は次に開始する取り込みから反映されます。</p>
-              <label class="vlm-field"><span class="vlm-l">意味検索の細かさ</span>
-                <input type="number" id="embed-dim" min="64" max="4096" step="1" placeholder="空欄＝1536" style="max-width:160px">
-              </label>
-              <div class="hint" id="embed-dim-hint" style="margin:-8px 0 6px"></div>
-              <p class="hint">意味検索の細かさです。空欄なら 1536（これまでと同じ値）になります。小さくするとディスクを節約できますが、検索の精度は少し下がることがあります。
-                変えると、全部の資料の意味検索の準備をやり直します（次の取り込みで始まり、時間と利用料がかかります）。
-                モデルが対応する値より大きい値は使えません（その場合はモデルが対応する最大の値になります）。
-                回答用のクラウドが OpenAI のときだけ効きます（Ollama は使うモデルで決まります）。</p>
-            </div>
-          </div>
           <div class="card sec" id="agentic-budget-card" tabindex="-1">
             <div class="card-head"><span class="title">Codex の調査で受け取る情報量</span></div>
             <div class="body">
@@ -491,7 +417,7 @@
         <section class="research-group" aria-labelledby="research-shared-heading">
           <h2 id="research-shared-heading">Codex の資料検索・関係探索</h2>
           <div class="card sec" id="search-investigation-card">
-            <div class="card-head"><span class="title">共通の資料検索・関係探索</span></div>
+            <div class="card-head"><span class="title">資料検索・関係探索の基準値</span></div>
             <div class="body">
               <p class="hint">資料を探す件数・読む行数・関係をたどる段数の基準値です。ここで保存した値は深さを変えても変わりませんが、実際に使う値は深さに応じて変わります（件数・行数はクイック×0.5・深く×1.5・最大×2、段数は深く+2・最大+4）。</p>
               <label class="vlm-field"><span class="vlm-l">資料検索のヒット件数上限（基準値）</span>
@@ -536,13 +462,87 @@
         </div>
       </div>
 
+      <!-- ===== タブ: チャットと個人ファイル ===== -->
+      <div class="tabpanel" id="tabpanel-chat" data-tabpanel="chat" role="tabpanel" aria-labelledby="tab-btn-chat" tabindex="0" hidden>
+        <!-- 同時実行の上限。チャットの送信（背景実行のターン）を同時にいくつまで受け付けるかの上限。空欄なら組み込みの既定が使われる。 -->
+        <div class="card sec" id="chat-max-turns-card">
+          <div class="card-head"><span class="title">同時実行の上限</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:10px">チャットで送信した、回答を作成中の質問を同時にいくつまで
+              受け付けるかの上限です。上限に達した分は待たされることなく、その場で
+              「実行中の回答が終わってからもう一度お試しください」という案内になります。空欄のままなら
+              組み込みの既定が使われます。</div>
+
+            <label class="vlm-field"><span class="vlm-l">同時に実行できる質問の数（1 人あたり）</span>
+              <input type="number" id="chat-max-turns-per-user" min="1" max="16" step="1" style="max-width:160px">
+            </label>
+            <div class="hint" id="chat-max-turns-per-user-hint" style="margin:-8px 0 14px"></div>
+
+            <label class="vlm-field"><span class="vlm-l">同時に実行できる質問の数（全員の合計）</span>
+              <input type="number" id="chat-max-turns-global" min="1" max="64" step="1" style="max-width:160px">
+            </label>
+            <div class="hint" id="chat-max-turns-global-hint" style="margin:-8px 0 6px"></div>
+          </div>
+        </div>
+
+        <!-- 個人ファイル（作業領域）。利用者がアップロードするファイルの 1 件あたりの上限と保持日数。空欄なら組み込みの既定が使われる。 -->
+        <div class="card sec" id="workspace-card">
+          <div class="card-head"><span class="title">個人ファイル（作業領域）</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:10px">利用者が自分の作業領域へアップロードするファイルと、Codex が作成した成果物の扱いです。
+              保持日数を過ぎたファイルは自動で削除されます。空欄のままなら組み込みの既定が使われます。</div>
+
+            <label class="vlm-field"><span class="vlm-l">1 件あたりのアップロード上限（MB）</span>
+              <input type="number" id="workspace-max-mb" min="1" max="1024" step="1" style="max-width:160px">
+            </label>
+            <div class="hint" id="workspace-max-mb-hint" style="margin:-8px 0 14px"></div>
+
+            <label class="vlm-field"><span class="vlm-l">保持日数（0 は無期限）</span>
+              <input type="number" id="workspace-ttl-days" min="0" max="3650" step="1" style="max-width:160px">
+            </label>
+            <div class="hint" id="workspace-ttl-days-hint" style="margin:-8px 0 6px"></div>
+          </div>
+        </div>
+
+        <!-- チャット画面のクイック入力例（ウェルカム画面のチップ）。導入先ごとに例文を差し替えられる（既定は組み込みの4例）。 -->
+        <div class="card sec" id="chat-examples-card">
+          <div class="card-head"><span class="title">チャットの質問例（クイック入力）</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:10px">チャット画面を開いたときに表示される、クリックで入力欄に読み込める質問例です。
+              空欄のまま保存すると質問例は表示されません。組み込みの既定（4例）に戻すには、下の「未設定に戻す」を押して、「保存」で確定してください。</div>
+
+            <label class="armrow">
+              <input type="checkbox" id="chat-examples-enabled" checked>
+              <span><span class="arm-t">質問例を表示する</span>
+                <div class="arm-d">オフにすると、下欄の内容にかかわらず質問例のブロック自体を表示しません。</div></span>
+            </label>
+
+            <label class="vlm-field" style="margin-top:10px">
+              <span class="vlm-l">質問例（1行に1つ・最大8件・各200文字まで）</span>
+              <textarea id="chat-examples-items" rows="4"
+                        placeholder="例: 消費税率を変更すると、影響がありそうな箇所を教えてください。"></textarea>
+            </label>
+            <div class="hint" id="chat-examples-status"><!-- JS が描画: 既定に従っているか/固定中か --></div>
+
+            <div class="sec-actions">
+              <button class="btn-ghost" id="chat-examples-reset" type="button">未設定に戻す（組み込みの既定を使う）</button>
+              <span class="tres muted" id="chat-examples-reset-res"></span>
+            </div>
+          </div>
+        </div>
+        <div class="sec-actions">
+          <button class="btn-ghost" data-reset-tab="chat" type="button">このタブを既定に戻す</button>
+          <span class="tres muted" id="tab-reset-res-chat"></span>
+        </div>
+      </div>
+
       <!-- ===== タブ2: 使えるモデル ===== -->
       <div class="tabpanel" id="tabpanel-models" data-tabpanel="models" role="tabpanel" aria-labelledby="tab-btn-models" tabindex="0" hidden>
         <div class="card sec" id="model-catalog-card">
           <div class="card-head"><span class="title">使えるモデル</span></div>
           <div class="body">
             <div class="hint" style="margin-bottom:6px">用途ごとに、選べるモデルと既定を決めます（表示は選択中のクラウド AI・Ollama・Codex のみ）。</div>
-            <div class="hint" style="margin-bottom:6px">この表にない設定は、それぞれのタブにあります。視覚読み取りの AI は「取り込み」タブ、下調べ役のモデルは「調査・回答」タブ、簡易回答に使う AI は「外部連携」タブ、埋め込みの接続先は「プロバイダ＋接続先」タブで決めます。</div>
+            <div class="hint" style="margin-bottom:6px">この表にない設定は、それぞれのタブにあります。視覚読み取りの AI は「取り込み」タブ、下調べ役のモデルと簡易回答に使う AI は「調査・回答」タブ、埋め込みの接続先は「プロバイダ＋接続先」タブで決めます。</div>
             <div class="hint" id="mc-vlm-line" style="margin-bottom:6px" hidden><!-- JS: 視覚読み取りのモデル名（vlm.effective を読むだけ） --></div>
             <div id="model-catalog-table"><!-- JS が描画 --></div>
             <div class="sec-actions">
@@ -590,10 +590,6 @@
               <div class="hint danger" id="vlm-key-missing" hidden><!-- JS: クラウド選択かつキー未設定時の案内 --></div>
               <div class="hint" id="vlm-status"><!-- JS: 既定に従っているか/固定中か --></div>
             </div>
-            <div class="sec-actions">
-              <button class="btn-ghost" data-reset-tab="ingest" type="button">このタブを既定に戻す</button>
-              <span class="tres muted" id="tab-reset-res-ingest"></span>
-            </div>
 
             <!-- 高度な設定（旧形式変換）はこのタブの「詳細」折りたたみ1箇所にまとめる。 -->
             <details class="adv">
@@ -637,6 +633,26 @@
           </div>
         </div>
 
+        <div class="card sec" id="embed-settings-card">
+          <div class="card-head"><span class="title">埋め込み</span></div>
+          <div class="body">
+            <label class="vlm-field"><span class="vlm-l">埋め込みの同時送信数</span>
+              <input type="number" id="embed-parallel" min="1" max="16" step="1" style="max-width:160px">
+            </label>
+            <div class="hint" id="embed-parallel-hint" style="margin:-8px 0 6px"></div>
+            <p class="hint">資料の取り込み時に、埋め込み API へ同時に送るリクエスト数です。大きくすると取り込みが速くなりますが、
+              プロバイダ側の同時実行/レート制限に早く当たることがあります。保存した値は次に開始する取り込みから反映されます。</p>
+            <label class="vlm-field"><span class="vlm-l">埋め込みの細かさ</span>
+              <input type="number" id="embed-dim" min="64" max="4096" step="1" placeholder="空欄＝1536" style="max-width:160px">
+            </label>
+            <div class="hint" id="embed-dim-hint" style="margin:-8px 0 6px"></div>
+            <p class="hint">埋め込みの細かさです。空欄なら 1536（これまでと同じ値）になります。小さくするとディスクを節約できますが、検索の精度は少し下がることがあります。
+              変えると、全部の資料の埋め込みをやり直します（次の取り込みで始まり、時間と利用料がかかります）。
+              モデルが対応する値より大きい値は使えません（その場合はモデルが対応する最大の値になります）。
+              回答用のクラウドが OpenAI のときだけ効きます（Ollama は使うモデルで決まります）。</p>
+          </div>
+        </div>
+
         <div class="card sec" id="required-tools-card" hidden>
           <div class="card-head"><span class="title">必要な道具</span></div>
           <div class="body">
@@ -648,7 +664,10 @@
           </div>
         </div>
 
-
+        <div class="sec-actions">
+          <button class="btn-ghost" data-reset-tab="ingest" type="button">このタブを既定に戻す</button>
+          <span class="tres muted" id="tab-reset-res-ingest"></span>
+        </div>
       </div>
 
       <!-- ===== タブ5: 外部連携（API キー） ===== -->
@@ -666,21 +685,11 @@
                 <div class="arm-d">オンにすると、利用者は「個人設定」で自分の API キーを発行・管理できます
                   （アクセス範囲は本人の権限内に限られます）。オフ（既定）に戻すと、利用者が発行したキーはすべて失効します。</div></span>
             </label>
-            <label class="vlm-field" style="margin-bottom:14px;border-bottom:1px solid var(--border);padding-bottom:14px">
+            <label class="vlm-field">
               <span class="vlm-l">利用者キーの1日あたりの呼び出し上限</span>
               <input type="number" id="ext-keys-user-quota-default" min="1" step="1" style="max-width:160px">
             </label>
             <div class="hint" id="ext-keys-user-quota-default-hint" style="margin:-8px 0 14px"></div>
-
-            <label class="vlm-field" style="margin-bottom:14px;border-bottom:1px solid var(--border);padding-bottom:14px">
-              <span class="vlm-l">簡易回答に使う AI（チャットの簡易・外部 API 共通）</span>
-              <select id="ext-research-default-provider" style="max-width:260px">
-                <option value="ollama">ローカル（Ollama・既定）</option>
-                <option value="openai">クラウド（OpenAI）</option>
-              </select>
-            </label>
-            <div class="hint" id="ext-research-default-provider-hint" style="margin:-8px 0 14px"></div>
-            <div class="hint danger" id="ext-research-default-provider-invalid" hidden style="margin:-8px 0 14px"><!-- JS が描画: 保存値が不正な場合の案内 --></div>
 
             <div id="ext-keys-list"><!-- JS が描画 --></div>
             <div class="sec-actions">

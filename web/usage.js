@@ -789,7 +789,7 @@ const KIND_LABEL = {
   extract: 'ナレッジ抽出（旧機能）',
   propose: '概念の候補づくり（旧機能）',
   chat: '会話', intent: '依頼の仕分け',
-  embed: '検索の索引づくり', graph_ask: 'グラフへの質問', vlm: '画像の読み取り',
+  embed: '埋め込み', graph_ask: 'グラフへの質問', vlm: '画像の読み取り',
   // 複数プロファイル自動選択の計画呼び出し。
   'chat-plan': '進め方の計画',
   usage_chat: '利用統計チャット',
