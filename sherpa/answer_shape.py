@@ -144,39 +144,22 @@ NEW_SHAPE_KEYS = ("referenced_docs", "referenced_docs_hidden", "referenced_docs_
 
 
 def safe_new_fields(answer) -> dict:
-    """新しい欄を、秘匿の資料（`text_kind.is_sensitive_doc_id`）の名前・パスと、それを含む理由の文を除いた形で返す。除いた分は `*_hidden`（影響一覧は `hidden`）に数える。主の配列が無くても正の件数の欄は写す。"""
-    import re
-    from .ingest import text_kind
+    """新しい欄を型の正しい形だけで返す（資料の名前・パスは出す。守るのは本文の中身）。主の配列が無くても正の件数の欄は写す。"""
     if not isinstance(answer, dict):
         return {}
-
-    def visible(path: str) -> bool:
-        return not text_kind.is_sensitive_doc_id(path)
-
-    def clean_text(text: str) -> bool:
-        return all(visible(t) for t in re.findall(r"[A-Za-z0-9_.\-/\\]+", text))
-
     out: dict = {}
     for key, rows_of in (("referenced_docs", referenced_docs_of), ("found_docs", found_docs_of)):
         rows = rows_of(answer)
-        kept = [r for r in rows if visible(r["path"])]
         if isinstance(answer.get(key), list):
-            out[key] = kept
-        hidden = len(rows) - len(kept) + count_of(answer, key + "_hidden")
-        if hidden:
-            out[key + "_hidden"] = hidden
-        more = count_of(answer, key + "_more")
-        if more:
-            out[key + "_more"] = more
+            out[key] = rows
+        for suffix in ("_hidden", "_more"):
+            n = count_of(answer, key + suffix)
+            if n:
+                out[key + suffix] = n
     il = impact_list_of(answer)
     if il is not None:
-        kept_src = [r for r in il["rows"] if visible(r["name"]) and (not r["path"] or visible(r["path"]))]
-        rows = [{**r, "reason": r["reason"] if clean_text(r["reason"]) else ""} for r in kept_src]
-        masked = sum(1 for r, k in zip(kept_src, rows) if r["reason"] != k["reason"])
-        reasons = [x for x in il["reasons"] if clean_text(x)]
-        out["impact_list"] = {**il, "rows": rows, "reasons": reasons}
-        hidden = (len(il["rows"]) - len(rows) + masked + len(il["reasons"]) - len(reasons)
-                  + count_of(answer.get("impact_list"), "hidden"))
+        out["impact_list"] = il
+        hidden = count_of(answer.get("impact_list"), "hidden")
         if hidden:
             out["impact_list"]["hidden"] = hidden
     how = how_of(answer)

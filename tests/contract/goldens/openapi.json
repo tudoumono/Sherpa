@@ -3597,6 +3597,17 @@
         "title": "FeedbackTagCount",
         "type": "object"
       },
+      "FileStateReq": {
+        "properties": {
+          "start": {
+            "default": false,
+            "title": "Start",
+            "type": "boolean"
+          }
+        },
+        "title": "FileStateReq",
+        "type": "object"
+      },
       "FsEntry": {
         "properties": {
           "name": {
@@ -5120,6 +5131,17 @@
               }
             ],
             "title": "Model Catalog"
+          },
+          "ocr_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ocr Enabled"
           },
           "ollama_allowlist": {
             "anyOf": [
@@ -14983,6 +15005,64 @@
           }
         },
         "summary": "World Delete",
+        "tags": [
+          "資料フォルダ(World)管理"
+        ]
+      }
+    },
+    "/worlds/{wid}/file-state": {
+      "post": {
+        "description": "ファイルの状態を更新する（管理者のみ）。フォルダを背景で歩き、増えたファイルを台帳へ「一部使えます」で足し、なくなったファイルの行を消す。内容が変わったファイルは件数と名前を返すだけで台帳を書かない。\n歩いている間は `state=\"scanning\"`（`scanned`＝確認した件数）を返す。画面は同じ依頼を数秒おきに繰り返して結果（`state=\"ready\"`）を取る。`start=true` は終わった結果を捨てて新しく始める。\n取り込み中・一度も取り込みが終わっていない・前回の明細が無いとき、および書く直前に取り込みや付け替えで世代が変わっていたときは 409（書かない）。\n設計: docs/design/scope.md「ファイルの状態を更新」",
+        "operationId": "world_file_state_worlds__wid__file_state_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "title": "Wid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/FileStateReq"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Req"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "World File State",
         "tags": [
           "資料フォルダ(World)管理"
         ]

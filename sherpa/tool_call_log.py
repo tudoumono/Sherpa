@@ -2,7 +2,7 @@
 設計: docs/design/codex.md「道具の呼び出しの記録」
 
 - 書くのは Sherpa の道具（MCP サーバー）の入口だけ。ターンの作業フォルダの `toolcalls/` の中にプロセスごとの `calls-<プロセス番号>-<起動時刻>.jsonl` を作る。
-- 資料の中身・グラフの行は書かない。秘匿の資料名は書かない。
+- 資料の中身・グラフの行は書かない。秘匿名の資料も名前と範囲は書く（守るのは中身）。
 - グラフの道具（`graph_resolve`・`graph_impact`）の結果の行だけは、同じ置き場の別ファイル `graph-<プロセス番号>-<起動時刻>.jsonl` へ書く（影響一覧の素材・ターンの終わりに置き場ごと消す・ログには出さない）。
 - まとめる側（Sherpa のアプリ）は時刻→プロセス→通し番号の順に 1 本へ並べ、違うターンの行は取り込まず、同じ ID は 1 つにし、壊れた行・読めないファイル・通し番号の抜けは件数で残す。
 """
@@ -58,12 +58,10 @@ def _is_int(v) -> bool:
 def summarize_result(name: str, args, result, is_error: bool, detail: dict, scores: list | None = None,
                      ranks: list | None = None) -> dict:
     """道具の結果から、記録に残す要点（結果・件数・返した資料と行の範囲・切り詰め・エラーの種類）を取り出す。
-    `detail` は `mcp_server._coverage_detail` の戻り値（秘匿の資料名を除いた doc・range）。本文・グラフの行は入れない。
+    `detail` は `mcp_server._coverage_detail` の戻り値（doc・range。秘匿名の資料も名前は入れる）。本文・グラフの行は入れない。
     検索（`ripgrep_search`・`es_search`）の資料には順位 `rank`、`es_search` にはあれば点数 `score`・当たり方 `via`、行に検索の形 `mode` を足す。
     `scores` は `es_search` の結果の `hits` と同じ並びの点数、`ranks` は検索の結果の `hits` と同じ並びの元の順位（結果には出さない）。
     """
-    from .ingest import text_kind
-
     out: dict = {}
     res = result if isinstance(result, dict) else None
     truncated = False
@@ -103,7 +101,6 @@ def summarize_result(name: str, args, result, is_error: bool, detail: dict, scor
     if count is not None:
         out["count"] = count
     docs: list[dict] = []
-    hidden = 0
     hits = res.get("hits")
     if isinstance(hits, list):
         is_search = name in ("ripgrep_search", "es_search")
@@ -115,9 +112,6 @@ def summarize_result(name: str, args, result, is_error: bool, detail: dict, scor
         use_ranks = is_search and isinstance(ranks, list) and len(ranks) == len(hits)
         for i, h in enumerate(hits):
             if not isinstance(h, dict) or not isinstance(h.get("doc_id"), str):
-                continue
-            if text_kind.is_sensitive_doc_id(h["doc_id"]):
-                hidden += 1
                 continue
             row = {"doc": clip(h["doc_id"])}
             if _is_int(h.get("line")):
@@ -148,8 +142,6 @@ def summarize_result(name: str, args, result, is_error: bool, detail: dict, scor
         out["docs"] = docs[:MAX_DOCS]
         if len(docs) > MAX_DOCS:
             out["docs_omitted"] = len(docs) - MAX_DOCS
-    if hidden:
-        out["docs_hidden"] = hidden
     return out
 
 
@@ -179,9 +171,7 @@ def _graph_limits(cov) -> list[dict]:
 
 
 def graph_view(name: str, result) -> dict | None:
-    """`graph_resolve`／`graph_impact` の結果から、影響一覧の素材（起点・返った行・coverage・未解決の件数・エラー）を取り出す。秘匿名のファイルの行は入れない。道具が違う・結果が辞書でないときは None。"""
-    from .ingest import text_kind
-
+    """`graph_resolve`／`graph_impact` の結果から、影響一覧の素材（起点・返った行・coverage・未解決の件数・エラー）を取り出す。道具が違う・結果が辞書でないときは None。"""
     if name not in GRAPH_TOOLS or not isinstance(result, dict):
         return None
     out: dict = {}
@@ -201,8 +191,6 @@ def graph_view(name: str, result) -> dict | None:
         if not isinstance(n, dict) or not isinstance(n.get("name"), str) or not n["name"].strip():
             return None
         path = n.get("path") if isinstance(n.get("path"), str) else ""
-        if path and text_kind.is_sensitive_doc_id(path):
-            return None
         r = {"name": clip(n["name"]), "path": clip(path, 400)}
         if isinstance(n.get("canonical_id"), str):
             r["cid"] = clip(n["canonical_id"], 400)
@@ -577,16 +565,11 @@ ROLES = ("parent", "child", "undetermined")
 
 
 def _visible_docs(row: dict) -> tuple[list[dict], int]:
-    """行の資料のうち秘匿でないものと、秘匿として伏せた件数（記録を作る側でも念のため判定し直す）。"""
-    from .ingest import text_kind
-
+    """行の資料のうち名前の正しいものと、過去の記録が持つ伏せた件数。"""
     out, hidden = [], _count(row.get("docs_hidden"))
     for d in row.get("docs") or []:
         name = d.get("doc") if isinstance(d, dict) else None
         if not isinstance(name, str) or not name:
-            continue
-        if text_kind.is_sensitive_doc_id(name):
-            hidden += 1
             continue
         out.append(d)
     return out, hidden

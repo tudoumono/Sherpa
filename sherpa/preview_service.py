@@ -231,7 +231,8 @@ _NOTE_GRAPH_TOO_MANY = "資料が多いため、要素と関係の一覧は出�
 _NOTE_GRAPH_NO_COUNT = "資料の件数を確認できなかったため、要素と関係の一覧は出しません。件数は最後に完了した取り込みの記録です。"
 _NOTE_LIST_PENDING = "まだ取り込みが終わっていないため、資料の一覧は取り込みのあとに出します。"
 
-_STATE_LABELS = {"ready": "使えます", "unreadable": "読み取れません", "unknown": "状態を確認できませんでした"}
+_STATE_LABELS = {"ready": "使えます", "unreadable": "読み取れません", "unknown": "状態を確認できませんでした",
+                 "partial": "一部使えます"}
 
 
 class _LedgerView(NamedTuple):
@@ -330,7 +331,10 @@ def _ledger_view(world: str) -> _LedgerView | None:
 def _row_with_state(row: dict, status: str | None, blocked) -> dict:
     """台帳の status と直近の取り込みの blocked（`{doc: reason}`・確認できなければ None）から、画面の行の `state`／`label`／`reason` を決める。
     確認できないときは、ソース枝の indexed を「状態を確認できませんでした」にする（黙って「使えます」にしない）。
+    台帳の status が `partial`（「ファイルの状態を更新」で足した行）は、取り込みの記録によらず「一部使えます」。
     """
+    if status == "partial":
+        return {**row, "state": "partial", "label": _STATE_LABELS["partial"], "reason": None}
     state, reason = ("unreadable" if status == "unreadable" else "ready"), None
     if blocked is None:
         if row["branch"] == "source" and status == "indexed":

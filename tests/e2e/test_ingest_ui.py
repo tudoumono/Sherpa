@@ -95,7 +95,7 @@ def test_status_summary_shows_run_failures_and_breakdowns(page, web_base_url, st
 ], ids=["unreadable", "unknown", "unreadable_code_file"])
 def test_document_list_shows_unreadable_and_unknown_as_distinct_from_ready(page, web_base_url, doc, texts):
     """`state=unreadable`／`unknown` は `STATE.ready` へ倒れず（黙って「使えます」にしない）専用の表示になり、
-    「⚠ 失敗」フィルタでも消えない。表の行に「やり直す」は出さず、読み取り不可の行は元のファイルを直してからの「更新」を案内する。"""
+    「⚠ 失敗」フィルタでも消えない。表の行に「やり直す」は出さず、読み取り不可の行は元のファイルを直してからの「今すぐ更新」を案内する。"""
     _open(page, web_base_url, preview={**PREVIEW, "documents": [doc]})
 
     row = page.locator("#rows tr", has_text="PROG.cbl")
@@ -108,7 +108,7 @@ def test_document_list_shows_unreadable_and_unknown_as_distinct_from_ready(page,
     expect(row).to_be_visible()
     expect(row.locator("[data-rerun]")).to_have_count(0)
     if doc["state"] == "unreadable":
-        expect(row).to_contain_text("元のファイルを直してから「更新」を押してください")
+        expect(row).to_contain_text("元のファイルを直してから「今すぐ更新」を押してください")
 
 
 def test_scanned_pdf_with_unread_pages_shows_warning_badge(page, web_base_url):

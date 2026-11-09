@@ -59,7 +59,7 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
     # 文字の層が無いスキャン PDF の画像の読み取り（OCR）の状態（`scan_pdf_ocr_status`）
     "ocr_unavailable": {
         "label": "画像の読み取り（OCR）が動いていません",
-        "advice": "管理者に OCR の起動状態を確認してもらってください。"
+        "advice": "管理者に、管理画面の取り込みタブで OCR が入っているかと、OCR の処理が動いているかを確認してもらってください。"
                   "文字の層が無いスキャン PDF のため、読み取りが動くまで本文は検索に出ません。",
     },
     "ocr_failed": {

@@ -452,6 +452,18 @@ def test_tools_call_graph_neighbors_stubbed(monkeypatch):
     assert n["name"] == "BILLINGJOB" and n["role"] == "実装" and n["path"]
 
 
+def test_graph_neighbors_continuation_is_not_rejected_as_duplicate(monkeypatch):
+    from sherpa import lens_service
+    cards = [{"name": f"N{i:03d}", "label": "Module", "category": "プログラム", "role": "実装", "distance": 1,
+              "path": [], "evidence": {"edges": [], "grep": []}} for i in range(40)]
+    monkeypatch.setattr(lens_service, "neighbor_cards", lambda world, term, sp=None, **kw: list(cards))
+    first = _body(_call("graph_neighbors", {"name": "請求"}))
+    assert first["truncated"] is True and first["next_offset"] == len(first["neighbors"])
+    second = _body(_call("graph_neighbors", {"name": "請求", "offset": first["next_offset"]}))
+    assert "error" not in second and second["neighbors"][0]["name"] == "N%03d" % first["next_offset"]
+    assert _body(_call("graph_neighbors", {"name": "請求"}))["error"] == "duplicate_tool_call"
+
+
 def test_graph_schema_era_error_is_structured_tool_error_with_sidecar_code_and_coverage(tmp_path, monkeypatch):
     """旧世代グラフは JSON-RPC エラーでなく isError の通常ツール結果（graph_reingest_required）で返す。
     サイドカーには閉じたコードだけ（world/stored_era は書かない）、item 付きなら coverage へ error を記録する。"""
@@ -980,18 +992,18 @@ def test_office_and_pdf_reads_are_recorded_in_coverage_with_range_and_write_fail
     assert {"kind": "limit", "field": "coverage_write_failed"}.items() <= _entries(sidecar)[-1].items()
 
 
-def test_coverage_detail_never_stores_sensitive_doc_names_and_drops_queries_for_personal_turns(tmp_path, monkeypatch):
-    """秘匿名の資料は coverage に記録しない。個人ファイルを使うターンでは検索語も記録しない。"""
+def test_coverage_detail_stores_doc_names_and_drops_queries_for_personal_turns(tmp_path, monkeypatch):
+    """資料の名前は秘匿名でも coverage に記録する（本文は持たない）。個人ファイルを使うターンでは検索語は記録しない。"""
     directory = tmp_path / "investigation"
     monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
-    _stub_run_tool(monkeypatch, {"text": "x"})
+    _stub_run_tool(monkeypatch, {"text": "BODYMARK"})
     assert not _call("read_doc", {"doc_id": "鍵/server.pem", "item": "s"})["result"]["isError"]
     _stub_run_tool(monkeypatch, {"hits": [{"doc_id": "a.md", "text": "x"}]})
     assert not _call("ripgrep_search", {"query": "COVNOQ-1", "item": "s"})["result"]["isError"]
     monkeypatch.setenv("SHERPA_MCP_COVERAGE_NO_QUERY", "1")
     assert not _call("ripgrep_search", {"query": "COVNOQ-2", "item": "s"})["result"]["isError"]
     text = (directory / "coverage.jsonl").read_text(encoding="utf-8")
-    assert "server.pem" not in text and "COVNOQ-1" in text and "COVNOQ-2" not in text
+    assert "鍵/server.pem" in text and "BODYMARK" not in text and "COVNOQ-1" in text and "COVNOQ-2" not in text
 
 
 

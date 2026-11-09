@@ -102,6 +102,7 @@ services:
       SHERPA_OBSERVATION_DIR: /observations
       # worker起動時に必須検査する。未設定時は空のまま渡し、sentinel mountから処理へ進ませない。
       SHERPA_OCR_WORLD_ROOT: ${SHERPA_OCR_WORLD_ROOT:-}
+      SHERPA_OCR_ENABLED: ${SHERPA_OCR_ENABLED:-}
       PADDLE_PDX_CACHE_HOME: /models
       HOME: /tmp/ocr-home
       PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"

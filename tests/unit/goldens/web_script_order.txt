@@ -1,5 +1,6 @@
 admin-settings.html	common.js	(none)
 admin-settings.html	nav.js	(none)
+admin-settings.html	admin-settings-ocr.js	(none)
 admin-settings.html	admin-settings.js	(none)
 admin-users.html	common.js	(none)
 admin-users.html	nav.js	(none)

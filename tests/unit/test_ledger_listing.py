@@ -314,3 +314,14 @@ def test_listing_reads_only_the_columns_the_tools_use(world):
     assert all(set(r) == {"name", "doctype", "branch", "status"} for r in snap["rows"])
     assert snap["ledger_at"] == _ledger_time(world)
     assert set(snap["run"]) == {"status", "flags"}
+
+
+def test_partial_rows_added_later_do_not_move_the_run_that_wrote_the_ledger(world):
+    _ingest(world, flags=_BLOCK_PROG1)                              # R1: 台帳を書き、PROG1 を blocked にした
+    run = store.start_ingest_run(world)                              # R2: 変更なしの更新（台帳を書かず flags もない）
+    store.finish_ingest_run(run["id"], status="auto_published", extraction_snapshot={"flags": []})
+    with store._connect() as c:                                      # 「ファイルの状態を更新」が足した行（status=partial）
+        c.execute("INSERT INTO documents (kb_id, version, name, layer, doctype, branch, status) "
+                  "VALUES (%s,%s,'gen1/design/added.md','version','markdown','office','partial')", (store._KB_ID, world))
+    res = tool_dispatch.run_tool("list_docs", {"state": "unreadable"}, world, None)[0]
+    assert [d["rel_path"] for d in res["docs"]] == ["gen1/src/PROG1.cbl"]

@@ -105,6 +105,8 @@ _PARAMS_FOLDER_TREE = {"type": "object", "properties": {
     "path_prefix": {"type": "string",
                     "description": "この配下のフォルダ階層だけを見る（rel_path の先頭一致・例: '4期保守'）。省略可＝範囲全体"},
     "depth": {"type": "integer", "description": "列挙するフォルダの深さ上限（既定3・1〜10にクランプ）"},
+    "offset": {"type": "integer",
+              "description": "フォルダ一覧の開始位置（既定0）。folders_truncated:true のときは next_offset をそのまま渡すと続きが取れる"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": []}
 _PARAMS_READ = {"type": "object", "properties": {
@@ -138,6 +140,8 @@ _PARAMS_ASK = {"type": "object", "properties": {
     "allow_free_text": {"type": "boolean", "description": "自由入力も許可するか"}},
     "required": ["prompt", "mode", "options"]}
 _DESC_SEARCH = ("社内資料を全文 grep して当たりを付ける（doc_id と行番号つきのヒットを返す）。完全一致・固有名詞に強い。"
+                "ヒットの char は一致した語の行の中の文字位置（0 始まり）——read_doc の start_line に line、start_char に char を渡すと、その語から読み始められる"
+                "（極端に長い行の途中で見つけたときは付かない）。"
                 "file_truncated が付くヒットは、その文書がまだ検索し切れていない可能性がある——"
                 "read_doc で続きを確認する。text_truncated が付くヒットは本文が途中で切れている——"
                 "read_around（周辺）か read_doc（続き）で読む。"
@@ -170,14 +174,16 @@ _DESC_OUTLINE = ("文書の見出し構造（Markdown の #/##/### 見出し・�
 _DESC_LIST_DOCS = ("文書台帳の一覧・件数を返す（本文は読まない・grep しない）。"
                    "「ドキュメント数」「どんな資料があるか」「フォルダ構成」等の台帳質問はこれで答える。"
                    "path_prefix でフォルダ配下に絞り、name_pattern でパス（フォルダ名/ファイル名）の部分一致に絞れる。"
-                   "doctype（種別の完全一致・大文字小文字は無視）・state（'ready'/'unreadable'/'unknown' の"
+                   "doctype（種別の完全一致・大文字小文字は無視）・state（'ready'/'unreadable'/'unknown'/'partial' の"
                    "完全一致）でも絞れる。docs は常に rel_path の昇順で並ぶ（offset を進めても順序は変わらない）。"
                    "count は絞り込み後の全件数（limit/offset と無関係）、docs は offset から limit 件までの"
                    "一覧（rel_path/doctype/state）。truncated:true なら残りがある——次回呼び出しの offset に"
                    "next_offset をそのまま渡して続きを取る。"
-                   "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。"
+                   "結果に ledger_at が付いていれば、最後に資料の状態を更新した時点の一覧（以降に変えた資料は含まない）。"
                    "path_prefix を指定すると、そのフォルダに取り込みの後に置かれた資料（索引に入っていない）も"
                    "after_ingest に出す。"
+                   "state:'partial' の資料（結果に partial と partial_notice が付く）は、ファイル名で見つかり読む道具で開けるが、"
+                   "意味の索引と資料どうしの関係には入っていない（Office・PDF は文字列の中身検索にも当たらない）。"
                    "結果に kind_unknown（種類が分からない資料の件数。台帳から種類を補えない）と kind_unknown_notice が付くときは、"
                    "層・種類（doctype）の絞り込みの件数や「該当なし」は確定しない（kind_unknown_dropped は doctype／state の絞り込みで落とした分）——"
                    "その資料は state:'unknown' で絞って中身で確かめる。")
@@ -187,8 +193,9 @@ _DESC_FOLDER_TREE = ("world のフォルダ階層を、深さ上限つき・フ�
                      "大規模な範囲で使う）。path_prefix でフォルダ配下に絞り、depth（既定3）で列挙する深さを決める。"
                      "フォルダごとに直下ファイル数・配下（再帰）ファイル数・直下サブフォルダ数を返す。"
                      "深さ上限でまだ配下があるフォルダは truncated:true（depth を上げて掘り下げる）。"
-                     "フォルダ件数自体が多すぎるときは folders_truncated:true（count が打ち切り前の総数）＝続きは取れないので、その範囲は未確認として扱う。"
-                     "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。"
+                     "フォルダ件数自体が多すぎるときは folders_truncated:true（count が全体の総数）＋next_offset＝同じ条件に offset=next_offset を付けて呼び直すと続きが取れる（並びは path 昇順で固定）。"
+                     "結果に ledger_at が付いていれば、最後に資料の状態を更新した時点の一覧（以降に変えた資料は含まない）。"
+                     "結果に partial（state が partial の資料の件数。意味の索引と資料どうしの関係には入っていない）が付くときは、ファイル名では見つかり開けるが意味での検索・影響の分析には出ない。"
                      "結果に kind_unknown（種類が分からない資料の件数）が付くときは、層ごとの件数は確定しない（層が分からない資料はどの層にも数えている）——中身で確かめる。")
 _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素・意味の近さ・関連度ランキング）。"
             "対象は資料（Office・PDF など）で、ソース（コード）は索引に含まれない——ソースは ripgrep_search で探す。"
@@ -227,7 +234,7 @@ _DESC_GRAPH = ("関係グラフから、ある名前（プログラム/コピー
                "材料のソース（実行名は材料のソースとビルドの定義の行を根拠に書く）。"
                "名前が一つでも判明したら、その関連の広がりは grep を反復するより先にこれで辿るほうが早い。"
                "原因の手がかり集め（トラブルシュート）に有効。grep で正確な名前を見つけてから渡すと精度が上がる。"
-               "近傍が上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。"
+               "近傍が上限で切られたときは truncated:true・count（総数）・next_offset が付く＝同じ条件に offset=next_offset を付けて呼び直すと続きが取れる（並びは固定）。truncated:true で next_offset が無いとき（時間切れ・取得の天井）は続きが取れないので、その範囲は未確認として扱う。"
                "coverage.complete が false のとき（時間切れ・件数の上限・文書探索の打ち切り・カード数の上限）は、近傍が空でも"
                "「近傍なし」とは言えない＝未確認（理由は coverage.limits[].kind）。"
                "unresolved は、この名前を参照しているのに接続先を決められなかった箇所（曖昧・未解決）の一覧＝"
@@ -246,6 +253,8 @@ _PARAMS_GRAPH = {"type": "object", "properties": {
     "path_prefix": {"type": "string",
                     "description": "フォルダで絞る（rel_path の先頭一致・例: '4期保守'）。選んだ範囲の内側だけを狭められ、範囲は広がらない。省略可"},
     "kind": {"type": "string", "description": "起点を種類で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config／Dataset／Executable）。省略可"},
+    "offset": {"type": "integer",
+              "description": "近傍の開始位置（既定0）。truncated:true で next_offset が付いたときは、その値をそのまま渡すと続きが取れる"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["name"]}
 _DESC_GRAPH_RESOLVE = ("関係グラフから、名前（の一部）・種別・所属パス（の一部）に合う**起点の候補**を並べる。"
@@ -332,8 +341,9 @@ _DESC_GLOB = ("ファイル名・フォルダ名のパターンで対象範囲�
              "先頭のページだけで全件とは言わない）。generation が無いときは glob_generation_required、違うときは glob_generation_mismatch のエラーになる"
              "（mismatch は資料が入れ替わった印＝generation を付けずに offset 0 から取り直す。required は generation を付けて呼び直す）。"
              "『x/**』は x 自体にも一致する（配下だけに絞るなら『x/**/*』）。"
-             "結果に ledger_at が付いていれば、最後の取り込みの時点の一覧（以降に変えた資料は含まない）。"
+             "結果に ledger_at が付いていれば、最後に資料の状態を更新した時点の一覧（以降に変えた資料は含まない）。"
              "付いていない（generation が walk）ときは資料フォルダを歩いた一覧で、ページの間で一覧が変わることがある（notice）。"
+             "結果に partial_paths と partial_notice が付くときは、その資料は名前で見つかり開けるが意味の索引と資料どうしの関係には入っていない。"
              "結果に kind_unknown（種類が分からない資料の件数。ページ内でなく全一致の件数）が付くときは、層の絞り込みの件数は確定しない（層が分からない資料はどの層にも含めている）——中身で確かめる。")
 # grep と同格の素朴な決定的ツール。2 文書の RAG 正本（.rag.md）の unified diff を返すだけで、レコード同定・業務キー対応付け・要約は呼び出し元の LLM が diff を読んで行う。
 _DESC_COMPARE = ("2つの文書のRAG正本（.rag.md）を突き合わせ、追加/削除/変更行の unified diff を返す"

@@ -272,6 +272,7 @@ REASON_UNREADABLE = "見つからないか、読めない形式です"
 REASON_AMBIGUOUS = "同じ名前の資料が複数あり、どれか特定できません"
 REASON_OUT_OF_LAYER = "今回調べる対象の種類（資料／ソース）の外です"
 REASON_UNCHECKED = "時間内に確かめきれませんでした"
+REASON_SENSITIVE = "秘匿の資料のため、出典には載せられません"
 UNVERIFIED_PATH_MAX_LEN = 200
 
 # 参照 1 行の対応付けの分類（内部の記録・評価で数える）。
@@ -282,7 +283,8 @@ RES_NOT_FOUND = "not_found"              # 資料が無い（ファイル名だ�
 RES_UNCHECKED = "unchecked"              # 台帳に無い名前を原本で引き直す途中で期限を超えた（有るか無いか分からない）
 RES_OUT_OF_SCOPE = "out_of_scope"        # パスつきの指定が、許可された範囲の外
 RES_POSITION_UNVERIFIED = "position_unverified"  # 資料は特定できたが行番号が資料の行数を超える
-RES_HIDDEN = "hidden"                    # 秘匿名・自由な文・解釈できない行（名前を残さない）
+RES_SENSITIVE = "sensitive"              # 秘匿の資料（名前は出す・出典には載せない）
+RES_HIDDEN = "hidden"                    # 自由な文・解釈できない行（名前を残さない）
 _POSITION_CHECK_MAX_BYTES = 8 * 1024 * 1024
 _POSITION_SKIP_EXT = {".docx", ".xlsx", ".pptx", ".pdf", ".doc", ".xls", ".ppt", ".png", ".jpg", ".jpeg", ".zip"}
 
@@ -408,10 +410,10 @@ def _position_unverified(doc: str, candidates: list, world: str) -> bool:
 
 def _classify_failure(candidates: list, world: str, scope_paths) -> tuple[dict | None, bool]:
     """検証を通らなかった 1 件（候補の列）の理由。`(行, 名前を出せないか)`。
-    名前を出すのは、資料フォルダ内の資料パスとして正規化でき（拡張子で終わる）、秘匿名でないものだけ。
-    秘匿名・自由な文・解釈できない行は名前を返さず（行は None）、件数だけに使う。"""
+    名前を出すのは、資料フォルダ内の資料パスとして正規化できるもの（秘匿の資料は実在し範囲内のときだけ名前を出す。本文は出さない）。
+    自由な文・解釈できない行は名前を返さず（行は None）、件数だけに使う。"""
     from ...ingest import text_kind
-    from ... import scope as scope_mod
+    from ... import documents, scope as scope_mod
 
     first_doc = None
     for c in candidates:
@@ -419,8 +421,16 @@ def _classify_failure(candidates: list, world: str, scope_paths) -> tuple[dict |
         if not doc:
             continue
         if text_kind.is_sensitive_doc_id(doc):
-            return None, True
-        if first_doc is None and _EXT_END_RE.search(doc) and not any(ord(ch) < 32 for ch in doc):
+            try:  # 秘匿名を含む自由な文を名前にしない＝実在し範囲内の資料だけを行にする
+                exists = documents.resolve(doc, world) is not None
+            except Exception:
+                exists = False
+            if exists and (scope_paths is None or scope_mod.in_scope(doc, scope_paths)):
+                return {"path": doc[:UNVERIFIED_PATH_MAX_LEN], "reason": REASON_SENSITIVE}, False
+            continue
+        if not _EXT_END_RE.search(doc) or any(ch.isspace() or ord(ch) < 32 for ch in doc):
+            continue
+        if first_doc is None:
             first_doc = doc
     if first_doc is not None:
         reason = (REASON_OUT_OF_SCOPE if scope_paths is not None and not scope_mod.in_scope(first_doc, scope_paths)
@@ -431,7 +441,7 @@ def _classify_failure(candidates: list, world: str, scope_paths) -> tuple[dict |
 
 def resolve_referenced_docs_detail(refs: list, world: str, scope_paths=None, layer=None, index=None) -> dict:
     """参照の候補 → 検証結果。キーは `verified`（検証を通った doc_id）・`unverified`（通らなかった行の {path, reason}）・
-    `hidden`（名前を出さず件数だけにした数）・`mappings`（行ごとの {input, doc_id, class}。評価で数える。名前を出せない行の input は空）。
+    `hidden`（名前を出さず件数だけにした数）・`mappings`（行ごとの {input, doc_id, class}。評価で数える。自由な文・解釈できない行の input は空）。
     ファイル名だけの指定は、パスのとおりに実在しないとき、範囲（scope_paths・層）内で同名が 1 件だけなら、その資料の相対パスへ
     置き換えて同じ検証（実在・文書種別・範囲・秘匿）を通す。台帳の索引で見つからない名前だけ、範囲内の原本の木を 1 回（期限つき）歩いて引き直す。2 件以上は曖昧として選ばず、範囲外の同名は候補に入れない（存在を漏らさない）。
     行番号つきの指定が資料の行数を超えても資料の検証は変えず、`mappings` にだけ位置の未確認を残す。
@@ -456,8 +466,8 @@ def resolve_referenced_docs_detail(refs: list, world: str, scope_paths=None, lay
                 return d, c
         return None, ""
 
-    def _record(group: list, doc: str | None, cls: str) -> None:
-        shown = "" if cls == RES_HIDDEN else (group[0] if group else "")[:UNVERIFIED_PATH_MAX_LEN]
+    def _record(cls: str, doc: str | None, row_path: str) -> None:
+        shown = "" if cls == RES_HIDDEN else row_path[:UNVERIFIED_PATH_MAX_LEN]  # 行の path だけ残す（注記は残さない）
         mappings.append({"input": shown, "doc_id": doc, "class": cls})
 
     def _fail(group: list) -> None:
@@ -467,12 +477,16 @@ def resolve_referenced_docs_detail(refs: list, world: str, scope_paths=None, lay
             if index is None:
                 index = _name_index(world, scope_paths, layer)
             hits = index.get(bare, []) or walked.get(bare)
+            if any(ch.isspace() for ch in bare) and len(hits) != 1:
+                sensitive += 1  # 空白を含む名前は索引で 1 件に決まらなければ自由な文として件数だけ
+                _record(RES_HIDDEN, None, "")
+                return
             if len(hits) == 1:
                 doc = _verify_one(hits[0], world, scope_paths)
                 if doc:
                     _add(doc)
                     pos = _position_unverified(doc, group, world)
-                    _record(group, doc, RES_POSITION_UNVERIFIED if pos else RES_UNIQUE)
+                    _record(RES_POSITION_UNVERIFIED if pos else RES_UNIQUE, doc, bare)
                     return
             if len(hits) > 1:
                 row = {"path": bare[:UNVERIFIED_PATH_MAX_LEN], "reason": REASON_AMBIGUOUS}
@@ -483,22 +497,23 @@ def resolve_referenced_docs_detail(refs: list, world: str, scope_paths=None, lay
             else:
                 row = {"path": bare[:UNVERIFIED_PATH_MAX_LEN], "reason": REASON_UNREADABLE}
                 cls = RES_NOT_FOUND
-            _record(group, None, cls)
+            _record(cls, None, bare)
             if row not in failures:
                 failures.append(row)
             return
         row, is_sensitive = _classify_failure(group, world, scope_paths)
         if is_sensitive:
-            sensitive += 1  # 名前を出せない参照（秘匿名・自由な文・解釈できない行）は件数だけ
-            _record(group, None, RES_HIDDEN)
+            sensitive += 1  # 名前を出せない参照（自由な文・解釈できない行）は件数だけ
+            _record(RES_HIDDEN, None, "")
         elif row is not None:
-            _record(group, None, RES_OUT_OF_SCOPE if row["reason"] == REASON_OUT_OF_SCOPE else RES_NOT_FOUND)
+            _record({REASON_OUT_OF_SCOPE: RES_OUT_OF_SCOPE,
+                     REASON_SENSITIVE: RES_SENSITIVE}.get(row["reason"], RES_NOT_FOUND), None, row["path"])
             if row not in failures:
                 failures.append(row)
 
     def _hit(group: list, doc: str, cand: str) -> None:
         _add(doc)
-        _record(group, doc, RES_POSITION_UNVERIFIED if _position_unverified(doc, group, world) else RES_DIRECT)
+        _record(RES_POSITION_UNVERIFIED if _position_unverified(doc, group, world) else RES_DIRECT, doc, doc)
 
     for r in refs:
         if isinstance(r, str):
@@ -616,7 +631,7 @@ def plausible_doc_tokens(tokens: list[str], index: dict[str, list[str]]) -> list
 def resolve_referenced_docs(refs: list, world: str, scope_paths=None, layer=None) -> tuple[list[str], list[dict], int]:
     """参照の候補 → `(検証を通った doc_id の一覧, 通らなかった行の {path, reason} の一覧, 名前を出さず件数だけにした数)`。
     `refs` の要素は文字列か行の候補群（`verified_referenced_docs` と同じ採り方）。通らなかったものを数えるのは行の候補群（回答の「参照した資料」の行）だけで、
-    文字列（道具の引数から拾った資料）は検証を通らなくても数えない。名前を出せない参照（秘匿名・自由な文・解釈できない行）は名前を出さず件数だけ返す。
+    文字列（道具の引数から拾った資料）は検証を通らなくても数えない。名前を出せない参照（自由な文・解釈できない行）は名前を出さず件数だけ返す。
     """
     d = resolve_referenced_docs_detail(refs, world, scope_paths, layer)
     return d["verified"], d["unverified"], d["hidden"]

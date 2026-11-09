@@ -2524,6 +2524,8 @@ def _parse_hits(res: dict, vector: bool = False) -> list:
         frag = (h.get("highlight", {}).get("text") or [full])[0]
         hit = {"doc_id": src.get("doc_id"), "line": src.get("line"),
                "text": frag, "score": h.get("_score"), "ext": src.get("ext")}
+        if h.get("highlight", {}).get("text"):
+            hit["highlight_fragment"] = True  # text は原本の行に合わない断片
         matched = _matched_fields(h.get("highlight"))
         if matched:
             hit["matched_fields"] = matched  # 語が当たった欄（text／labels／region_context）

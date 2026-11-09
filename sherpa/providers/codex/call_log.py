@@ -6,7 +6,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from ...ingest import text_kind
 from ... import tool_call_log
 from ..base import _log, _log_codex
 
@@ -46,10 +45,10 @@ def _call_line(st, ctx, row: dict) -> str:
     docs = []
     for d in row.get("docs") or []:
         name = d.get("doc") if isinstance(d, dict) else None
-        if not isinstance(name, str) or not name or text_kind.is_sensitive_doc_id(name):
+        if not isinstance(name, str) or not name:
             continue
         docs.append(f"{name}@{d['range']}" if d.get("range") else name)
-    if not docs and isinstance(args.get("doc"), str) and not text_kind.is_sensitive_doc_id(args["doc"]):
+    if not docs and isinstance(args.get("doc"), str):
         docs.append(args["doc"])
     if docs:
         parts.append("doc=" + ", ".join(docs))

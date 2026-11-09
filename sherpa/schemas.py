@@ -300,6 +300,14 @@ class RagLlmRenderInfo(BaseModel):
     options: list[str]
 
 
+class OcrInfo(BaseModel):
+    """OCR の入切。`configured` は全体設定の生値（未設定=null＝既定の切）、`env_override` は環境変数 SHERPA_OCR_ENABLED=0 で切に固定されているとき false（それ以外は null＝設定に従う）。"""
+    configured: bool | None
+    effective: bool
+    default: bool
+    env_override: bool | None
+
+
 class VlmInfo(BaseModel):
     configured: dict[str, Any] | None
     effective: dict[str, Any]
@@ -438,6 +446,7 @@ class AdminSettingsView(BaseModel):
     legacy_backend: LegacyBackendInfo
     required_tools: list[RequiredToolInfo]
     rag_llm_render: RagLlmRenderInfo
+    ocr: OcrInfo
     vlm: VlmInfo
     ollama_allowlist: OllamaAllowlistInfo
     webhook_allowlist: WebhookAllowlistInfo

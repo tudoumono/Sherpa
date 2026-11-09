@@ -434,6 +434,7 @@ def _pin_ingest(v):
     v["vlm"]["configured"] = {"provider": "openai", "cloud_allowed": True}
     v["vlm"]["effective"] = {**v["vlm"]["effective"], "provider": "openai", "cloud_allowed": True}
     v["rag_llm_render"] = {"configured": "off", "effective": False, "default": True, "options": ["on", "off"]}
+    v["ocr"] = {"configured": True, "effective": True, "default": False, "env_override": None}
 
 
 def _pin_extkeys(v):
@@ -455,7 +456,7 @@ def _pin_cloud_provider(v):
 
 @pytest.mark.parametrize("tab,patch,expected,field_after", [
     ("ingest", _pin_ingest,
-     {"arms_enabled": None, "legacy_backend": None, "vlm": None, "rag_llm_render": None},
+     {"arms_enabled": None, "legacy_backend": None, "vlm": None, "rag_llm_render": None, "ocr_enabled": None},
      ("#rag-llm-render", True)),
     ("extkeys", _pin_extkeys,
      {"user_api_keys_allowed": False, "user_api_keys_daily_quota_default": None},

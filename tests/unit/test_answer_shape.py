@@ -89,7 +89,7 @@ def test_investigation_summary_lists_limits_unconfirmed_and_broken_items_in_plai
 
 
 def test_summary_hides_sensitive_names_shows_broken_overflow_and_share_keeps_counts_only():
-    """秘匿名の項目は件数に落とし、壊れた項目は総数と「ほか N 件」を示す。共有には項目名を載せず件数だけ・確認できなかった資料は秘匿名を除いて通す。"""
+    """秘匿名の項目は件数に落とし、壊れた項目は総数と「ほか N 件」を示す。共有には項目名を載せず件数だけ・確認できなかった資料は名前を含めて通す（資料の名前は出してよい）。"""
     env = {"headline": "回答", "limits": {},
            "sources_unverified": [{"path": "仕様/a.md", "reason": "今回の範囲の外です"},
                                   {"path": "鍵/id.pem", "reason": "今回の範囲の外です"}],
@@ -106,8 +106,9 @@ def test_summary_hides_sensitive_names_shows_broken_overflow_and_share_keeps_cou
     assert "田中さん" not in str(s_items) and "b1" not in str(s_items)
     assert {"label": "壊れていた項目", "text": "73 件（項目名は共有では表示しません）"} in s_items
     assert {"label": "確認できなかった項目", "text": "2 件（項目名は共有では表示しません）"} in s_items
-    assert shared["sources_unverified"] == [{"path": "仕様/a.md", "reason": "今回の範囲の外です"}]
-    assert shared["sources_unverified_hidden"] == 2
+    assert shared["sources_unverified"] == [{"path": "仕様/a.md", "reason": "今回の範囲の外です"},
+                                            {"path": "鍵/id.pem", "reason": "今回の範囲の外です"}]
+    assert shared["sources_unverified_hidden"] == 1
 
 
 _NEW_SHAPE = {
@@ -123,22 +124,22 @@ _NEW_SHAPE = {
 }
 
 
-def test_new_shape_fields_are_shared_without_sensitive_names_and_survive_seal():
+def test_new_shape_fields_are_shared_with_names_and_survive_seal():
     shared = _safe_share_answer(answer_shape.seal({"lens": "qa", "headline": "本文", "sources": [], **_NEW_SHAPE}))
     assert shared["referenced_docs"] == [{"path": "docs/a.md", "ranges": [[3, 9]], "unopened": True},
+                                         {"path": "src/secrets/.env", "ranges": [[1, 2]], "unopened": False},
                                          {"path": "docs/m.md", "ranges": [], "unopened": False, "mentioned_only": True},
                                          {"path": "docs/n.md", "ranges": [], "unopened": False}]
-    assert shared["referenced_docs_hidden"] == 1 and shared["referenced_docs_more"] == 2
+    assert "referenced_docs_hidden" not in shared and shared["referenced_docs_more"] == 2
     il = shared["impact_list"]
-    assert [r["name"] for r in il["rows"]] == ["OrderBatch"] and il["hidden"] == 1 and il["traced"] is True
-    assert shared["found_docs"] == [{"path": "docs/b.md"}] and shared["found_docs_hidden"] == 1
+    assert [r["name"] for r in il["rows"]] == ["OrderBatch", "src/secrets/.env"] and "hidden" not in il and il["traced"] is True
+    assert shared["found_docs"] == [{"path": "docs/b.md"}, {"path": "src/secrets/.env"}]
     assert shared["found_docs_more"] == 4 and shared["how"] == {"mode": "investigate", "doc_focus": True}
-    assert ".env" not in str(shared)
-    leaky = {"impact_list": {"traced": True, "reasons": ["src/secrets/.env を解析できません", "深さの上限です"],
+    named = {"impact_list": {"traced": True, "reasons": ["src/secrets/.env を解析できません", "深さの上限です"],
                              "rows": [{"name": "A", "state": "used", "reason": "id_rsa.pem を参照"}]}}
-    il2 = _safe_share_answer({"lens": "qa", "headline": "h", **leaky})["impact_list"]
-    assert il2["reasons"] == ["深さの上限です"] and il2["rows"][0]["reason"] == ""
-    assert ".env" not in str(il2) and "id_rsa" not in str(il2)
+    il2 = _safe_share_answer({"lens": "qa", "headline": "h", **named})["impact_list"]
+    assert il2["reasons"] == ["src/secrets/.env を解析できません", "深さの上限です"]
+    assert il2["rows"][0]["reason"] == "id_rsa.pem を参照"
 
 
 def test_old_answers_get_no_new_fields_and_stay_unfaked():
@@ -149,11 +150,11 @@ def test_old_answers_get_no_new_fields_and_stay_unfaked():
     assert answer_shape.impact_list_of({"impact_list": {"traced": "yes"}}) is None
 
 
-def test_received_share_read_path_hides_sensitive_names_in_new_fields():
+def test_received_share_read_path_keeps_names_in_new_fields():
     from sherpa.store.shares import _strip_shared_message
     out = _strip_shared_message({"role": "assistant", "answer": {"headline": "本文", **_NEW_SHAPE}})["answer"]
-    assert [r["path"] for r in out["referenced_docs"]] == ["docs/a.md", "docs/m.md", "docs/n.md"] and out["referenced_docs_hidden"] == 1
-    assert out["found_docs_hidden"] == 1 and ".env" not in str(out)
+    assert [r["path"] for r in out["referenced_docs"]] == ["docs/a.md", "src/secrets/.env", "docs/m.md", "docs/n.md"]
+    assert "referenced_docs_hidden" not in out and "found_docs_hidden" not in out
 
 
 def test_plan_style_summary_shows_counts_and_unconfirmed_items_and_keeps_quality_notes():

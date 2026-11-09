@@ -697,6 +697,24 @@ def test_refresh_worker_streams_manifests_and_persists_cursor(monkeypatch, tmp_p
     assert progress[0]["cursor_rel_path"].endswith(".ocr_route.json")
 
 
+def test_refresh_worker_pauses_without_consuming_attempts_when_switched_off_during_run(monkeypatch, tmp_path):
+    generation_root, refresh = _refresh_world(tmp_path, "excel/JPX-015.xlsx", 9)
+    enqueue_calls, progress, failed, paused = [], [], [], []
+    _patch_refresh(monkeypatch, refresh, enqueue_calls, progress)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "fail_refresh_run",
+                        lambda *args, **kwargs: failed.append(kwargs))
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "pause_refresh_run",
+                        lambda *args, **kwargs: paused.append(kwargs))
+    monkeypatch.setattr(ocr_worker.ocr_switch, "lease_refresh_run", lambda *a, **kw: refresh)
+    monkeypatch.setattr(ocr_worker.ocr_switch, "enabled", lambda *a, **kw: False)
+
+    result = _run_refresh(generation_root)
+
+    assert result.status == "stopping"
+    assert enqueue_calls == [] and progress == []
+    assert failed == [] and len(paused) == 1
+
+
 def test_refresh_worker_excludes_sensitive_evidence_and_does_not_reenqueue(monkeypatch, tmp_path):
     # 秘匿名の Evidence は読まず（`from_json_str` へ到達させない）、再投入もしない。
     generation_root, refresh = _refresh_world(tmp_path, "credentials.png", 8)

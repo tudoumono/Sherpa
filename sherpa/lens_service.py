@@ -331,6 +331,12 @@ class _Cards(list):
         self.coverage = coverage
 
 
+def _card_order(c: dict) -> tuple:
+    """カードの並び（役割・距離・名前）。同順位は cid・経路で決め、取得のたびに並びが変わらないようにする（`graph_neighbors` の続きが重複も抜けも出さないため）。"""
+    return (_ROLE_RANK.get(c["label"], 9), c["distance"] if c["distance"] is not None else 99, c["name"],
+            c.get("cid") or "", "\x1f".join(str(x) for x in (c.get("path") or [])))
+
+
 def _troubleshoot_cards(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH, include_deprecated=False, scope_paths=None,
                         sources_limit: int = EDGE_SOURCES_RETURN_DEFAULT, anchor_cap: int | None = None,
                         kind: str | None = None, deadline: float | None = None):
@@ -397,8 +403,7 @@ def _troubleshoot_cards(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH,
             "source": "grep", "evidence": {"edges": [], "grep": _public_grep(world, gh)},
         })
 
-    cards.sort(key=lambda c: (_ROLE_RANK.get(c["label"], 9),
-                              c["distance"] if c["distance"] is not None else 99, c["name"]))
+    cards.sort(key=_card_order)
     cards = scope.filter_items(cards, sp, path_rules.rules_for(world))
     if truncated_docs:
         coverage.add(graph_coverage.KIND_DOC_SEARCH_TRUNCATED, graph_coverage.STAGE_DOCS)
@@ -591,8 +596,7 @@ def neighbor_cards_graph_only(world, term, scope_paths=None, kind=None) -> list:
                 "evidence": {"edges": nb["edges"], "grep": []},
                 "cid": nb["cid"],
             })
-        cards.sort(key=lambda c: (_ROLE_RANK.get(c["label"], 9),
-                                  c["distance"] if c["distance"] is not None else 99, c["name"]))
+        cards.sort(key=_card_order)
         result = _Cards(scope.filter_items(cards, sp, path_rules.rules_for(world)), coverage)
         result.unresolved = unresolved
         result.depth = {"requested": TROUBLESHOOT_GRAPH_DEPTH, "truncated": None}

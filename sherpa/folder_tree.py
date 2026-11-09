@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import json
+
 from . import doc_ledger
 from . import layer as layer_mod
 from . import scope as scope_mod
@@ -34,9 +36,11 @@ def build(world: str, args: dict, *, scope_paths=None, deadline: float | None = 
 
     `path_prefix` 配下・`depth`（省略時3・1〜10 にクランプ）までの各フォルダについて、パス・直下ファイル数・配下（再帰）
     ファイル数・直下サブフォルダ数を返す。`scope_paths` と `layer`（`list_docs` と同じ確定判定）は硬いフィルタ。
-    `folders` は件数上限と `tool_result_max_bytes`（`path` の累積バイト）で打ち切る。
+    `folders` は `path` の昇順固定で、`offset`（省略時 0）から件数上限と `tool_result_max_bytes`（要素ごとの JSON バイトの累積）まで返す。
+    1 ページに最低 1 件は入れる（続きの位置が進まなくなるのを防ぐ）。
 
-    戻り値: `{"path_prefix", "depth", "count", "folders": [...], "folders_truncated"}`。`folders` の各要素:
+    戻り値: `{"path_prefix", "depth", "count", "offset", "folders": [...], "folders_truncated", "next_offset"}`。
+    `next_offset` は残りがあるときだけ int（`offset` に渡すと続きが取れる）、無ければ None。`folders` の各要素:
     `{"path", "depth", "direct_files", "total_files", "subfolders", "truncated"}`。要素の `truncated` は深さ上限で配下を
     表示していない意味、`folders_truncated` は件数/バイトの安全弁で一部フォルダを返していない意味（別の事実）。
     `count` は打ち切り前の総フォルダ数。
@@ -46,6 +50,10 @@ def build(world: str, args: dict, *, scope_paths=None, deadline: float | None = 
     prefix = str(args.get("path_prefix") or "").strip().strip("/")
     depth = _clamp_depth(args.get("depth"))
     sp = scope_mod.normalize_scope_paths(scope_paths) or None
+    try:
+        offset = max(0, int(args.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
     tr_max_bytes = (tool_result_max_bytes if tool_result_max_bytes is not None
                    else _DEFAULT_TOOL_RESULT_MAX_BYTES)
 
@@ -57,6 +65,7 @@ def build(world: str, args: dict, *, scope_paths=None, deadline: float | None = 
     # フォルダ集計: {folder_parts: {"direct", "total", "children"}}。集計は depth でクランプせず、出力時にだけ絞る
     agg: dict = {}
     unknown = 0
+    partial = 0
     for r in rows:
         rel = r.get("name")
         if not rel:
@@ -71,6 +80,8 @@ def build(world: str, args: dict, *, scope_paths=None, deadline: float | None = 
             continue
         if doc_ledger.is_kind_unknown(r):
             unknown += 1
+        if r.get("state") == "partial":
+            partial += 1
         dir_parts = rel.split("/")[:-1]  # ファイル名を除いたフォルダ階層
         if len(dir_parts) <= base_depth:
             continue
@@ -87,38 +98,49 @@ def build(world: str, args: dict, *, scope_paths=None, deadline: float | None = 
     ordered_keys = sorted(within_depth.keys())
     total_count = len(ordered_keys)
 
+    result = {
+        "path_prefix": prefix,
+        "depth": depth,
+        "count": total_count,
+        "offset": offset,
+        "folders": [],
+        "folders_truncated": False,
+        "next_offset": None,
+    }
+    if listing.ledger_at:
+        result["ledger_at"] = listing.ledger_at
+    if partial:
+        result["partial"] = partial
+        result["partial_notice"] = doc_ledger.partial_notice(partial)
+    if unknown:
+        result["kind_unknown"] = unknown
+        result["kind_unknown_notice"] = doc_ledger.kind_unknown_notice(unknown)
+    used = len(json.dumps(result, ensure_ascii=False).encode("utf-8"))  # フォルダ以外の欄の分
+
     folders = []
-    cum_bytes = 0
-    for key in ordered_keys:
+    for key in ordered_keys[offset:]:
         if len(folders) >= _MAX_FOLDERS:
-            break
-        path = "/".join(key)
-        # バイト予算はエントリの `path` の累積バイト数で判定する
-        item_bytes = len(path.encode("utf-8"))
-        if cum_bytes + item_bytes > tr_max_bytes:
             break
         entry = within_depth[key]
         rel_depth = len(key) - base_depth
-        folders.append({
-            "path": path,
+        item = {
+            "path": "/".join(key),
             "depth": rel_depth,
             "direct_files": entry["direct"],
             "total_files": entry["total"],
             "subfolders": len(entry["children"]),
             "truncated": rel_depth == depth and bool(entry["children"]),
-        })
-        cum_bytes += item_bytes
+        }
+        # バイト予算は要素ごとの JSON の実バイト数（区切りの ", " を含む）で累積する
+        item_bytes = len(json.dumps(item, ensure_ascii=False).encode("utf-8")) + (2 if folders else 0)
+        if folders and used + item_bytes > tr_max_bytes:
+            break
+        folders.append(item)
+        used += item_bytes
 
-    result = {
-        "path_prefix": prefix,
-        "depth": depth,
-        "count": total_count,
-        "folders": folders,
-        "folders_truncated": total_count > len(folders),
-    }
-    if listing.ledger_at:
-        result["ledger_at"] = listing.ledger_at
-    if unknown:
-        result["kind_unknown"] = unknown
-        result["kind_unknown_notice"] = doc_ledger.kind_unknown_notice(unknown)
+    shown_end = offset + len(folders)
+    more = shown_end < total_count
+    result["folders"] = folders
+    result["folders_truncated"] = more
+    result["next_offset"] = shown_end if more else None
     return result

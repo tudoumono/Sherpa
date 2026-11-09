@@ -32,6 +32,40 @@ def replace_documents(world, rows) -> int:
     return len(rows)
 
 
+_FILE_STATE_GENERATION_COLUMNS = ("root_path", "last_sig", "created_at", "updated_at", "last_synced_at")
+
+
+def apply_file_state_delta(world, *, add_rows, remove_names, expected: dict) -> bool:
+    """「ファイルの状態を更新」専用: 台帳へ指定の行だけ足し、指定の名前の行だけ消す（他の行・`worlds` の署名と明細は触らない）。
+    `worlds` の行が読み取り時点の世代（`expected` の `_FILE_STATE_GENERATION_COLUMNS`）と同じで、台帳の変更印も `expected["ledger_stamp"]` と同じときだけ、1 トランザクションで書く。
+    戻り値: 書いたら True・世代が変わっていたら False（書かない）。取り込み（`replace_documents`）からは呼ばない。
+    """
+    _ensure()
+    gen = [expected[k] for k in _FILE_STATE_GENERATION_COLUMNS]
+    with _connect() as c:
+        locked = c.execute(
+            "SELECT 1 FROM worlds WHERE kb_id=%s AND world_id=%s AND root_path=%s "
+            "AND last_sig IS NOT DISTINCT FROM %s AND created_at IS NOT DISTINCT FROM %s "
+            "AND updated_at IS NOT DISTINCT FROM %s AND last_synced_at IS NOT DISTINCT FROM %s FOR UPDATE",
+            (_KB_ID, world, *gen)).fetchone()
+        if locked is None:
+            return False
+        stamp = c.execute("SELECT COUNT(*) AS n, MAX(updated_at) AS at FROM documents WHERE kb_id=%s AND version=%s",
+                          (_KB_ID, world)).fetchone()
+        if (stamp["n"], stamp["at"]) != tuple(expected["ledger_stamp"]):
+            return False
+        for name in remove_names:
+            c.execute("DELETE FROM documents WHERE kb_id=%s AND version=%s AND name=%s", (_KB_ID, world, name))
+        for r in add_rows:
+            c.execute(
+                "INSERT INTO documents (kb_id, version, name, layer, scope_path, doctype, branch, "
+                "  original_path, md_path, status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (kb_id, version, name) DO NOTHING",
+                (_KB_ID, world, r["name"], r.get("layer") or "version", r.get("scope_path"), r.get("doctype"),
+                 r.get("branch"), r.get("original_path"), r.get("md_path"), r.get("status")))
+    return True
+
+
 def get_document(world, name) -> dict | None:
     """world の文書台帳の 1 行（`list_documents` と同じ列・無ければ None）。"""
     _ensure()
@@ -142,7 +176,7 @@ def count_and_list_documents(world, *, limit: int | None, offset: int = 0) -> tu
 def read_ledger_for_listing(world) -> dict:
     """一覧の道具向けに、台帳の行・台帳の時点・台帳を置き換えた run の blocked を 1 つの読み取り専用 REPEATABLE READ トランザクションで読む。
     戻り値は `{"rows": [{name, doctype, branch, status}], "ledger_at": 台帳の行の最大 updated_at, "run": {status, flags} | None}`。行は一覧が使う 4 列だけ。
-    `run`＝台帳の時点より前に作られた最新の run（同じ資料フォルダの run は 1 つずつ動くので、台帳を最後に書いたのはこの run）。無ければ None。
+    `run`＝台帳を書いた時点（`partial` 以外の行の最大 updated_at＝後から足された行は含めない）より前に作られた最新の run（同じ資料フォルダの run は 1 つずつ動くので、台帳を最後に書いたのはこの run）。無ければ None。
     台帳が空なら `rows=[]`・`ledger_at=None`・`run=None`。
     """
     _ensure()
@@ -154,8 +188,11 @@ def read_ledger_for_listing(world) -> dict:
             return {"rows": [], "ledger_at": None, "run": None}
         rows = c.execute("SELECT name, doctype, branch, status FROM documents WHERE kb_id=%s AND version=%s",
                          (_KB_ID, world)).fetchall()
+        written = c.execute(
+            "SELECT MAX(updated_at) AS at FROM documents WHERE kb_id=%s AND version=%s AND status IS DISTINCT FROM 'partial'",
+            (_KB_ID, world)).fetchone()["at"]
         run = c.execute(
             "SELECT status, extraction_snapshot->'flags' AS flags FROM ingest_runs "
             "WHERE kb_id=%s AND version=%s AND created_at <= %s ORDER BY id DESC LIMIT 1",
-            (_KB_ID, world, head["at"])).fetchone()
+            (_KB_ID, world, written or head["at"])).fetchone()
         return {"rows": rows, "ledger_at": head["at"], "run": run}

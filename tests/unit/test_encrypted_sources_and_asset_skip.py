@@ -25,7 +25,7 @@ _BODY = "BODYTEXT_ALPHA_9137"
 def _env(monkeypatch):
     monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     monkeypatch.setenv("SHERPA_MD_WORKERS", "1")
-    monkeypatch.delenv(office_md._OCR_ENABLED_ENV, raising=False)
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
 
 
 def _pdf_with_image(path: Path, text: str = _BODY) -> Path:

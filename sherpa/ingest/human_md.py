@@ -545,8 +545,8 @@ def render_pdf(evidence, page_body: Callable[[int], str]) -> str | None:
     return "\n\n".join(out) if out else None
 
 
-_PDF_NO_TEXT_NOTICE = ("（文字の層が無いスキャン PDF のため、ここには本文がありません。本文は画像の読み取り（OCR）で検索できます"
-                       "（読み取りが終わるまでは検索に出ません）。内容は原本で確認してください）")
+_PDF_NO_TEXT_NOTICE = ("（この PDF は文字の層が無いスキャンです。中の文字は OCR で読み取った分だけが検索に入ります。"
+                       "読み取りの状況は資料の画面で確かめられます。内容は原本で確認してください）")
 
 
 def render_pdf_without_text(evidence) -> str:

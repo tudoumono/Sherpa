@@ -82,14 +82,35 @@ def _assemble_lines(kept: list[tuple[int, str]], last_line: int | None) -> str:
     return "\n".join(out)
 
 
+def match_span(line: str, ql: str) -> tuple[int, int] | None:
+    """小文字化した `line` 中の `ql`（小文字）の最初の一致を、原文 `line` 上の文字位置 (開始, 終了)（0 始まり・終了は含まない）で返す。
+    一致が無い、または小文字化で文字数が変わって原文の位置に戻せないときは None。位置を原文に使う箇所はすべてこれを通す。
+    """
+    idx = line.lower().find(ql)
+    if idx < 0:
+        return None
+    starts: dict[int, int] = {}
+    pos = 0
+    for i, c in enumerate(line):
+        starts[pos] = i
+        pos += len(c.lower())
+    starts[pos] = len(line)
+    lo, hi = starts.get(idx), starts.get(idx + len(ql))
+    return None if lo is None or hi is None else (lo, hi)
+
+
+def _match_char(line: str, ql: str) -> int | None:
+    """`line` 中の `ql`（小文字）の一致位置（原文の文字位置・0 始まり）。戻せないときは None。"""
+    span = match_span(line, ql)
+    return None if span is None else span[0]
+
+
 def _clip_line_around(line: str, ql: str, max_bytes: int) -> str:
     """1 行が `max_bytes` を超えるとき、`ql`（小文字）の一致位置を含む前後を残す（切れた側に `…`）。"""
     if len(line.encode("utf-8")) <= max_bytes:
         return line
-    pos = line.lower().find(ql)
-    if pos < 0:
-        pos = 0
-    end = min(len(line), pos + len(ql))
+    span = match_span(line, ql)
+    pos, end = span if span is not None else (0, min(len(line), len(ql)))
 
     def _cut(k: int) -> str:
         a, b = max(0, pos - k), min(len(line), end + k)
@@ -202,27 +223,97 @@ _GREP_LINE_MAX_BYTES = 2 * 1024 * 1024
 _SEEN_RECENT_MAX = 16
 
 
+# `str.splitlines()` が行の区切りとみなす文字（`\n` は読み取り側で除いてあるので含めない）。
+_LOGICAL_BREAK_RE = re.compile("[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+class _LongLine:
+    """上限を超えた 1 行を、メモリを有界に保ったまま最後まで見る。先頭の `line_max` バイトと、語の長さぶん重ねた区切り窓を順に `matcher` で調べ、一致した区切りを返す。"""
+
+    def __init__(self, line_max: int, seam: int, matcher, encoding: str = "utf-8"):
+        self._line_max = line_max
+        self._encoding = "utf-8" if encoding == "utf-8-sig" else encoding
+        self._seam = seam
+        self._matcher = matcher
+        self._head = b""
+        self._win = b""
+        self._hit_head = False
+        self._hit_win: bytes | None = None
+        self.overflowed = False  # 行の途中に行区切りがあり窓を使えない（窓では行番号が狂う）。先頭だけを返す
+        self._scan_tail = b""
+
+    def _has_inner_break(self, part: bytes) -> bool:
+        """これまでに渡した全部の片（窓の側も含む）に、行末の CR 以外の論理改行があるか。多バイトの区切り文字が片の境目をまたぐ分は直前の 3 バイトを重ねて拾う。"""
+        data = self._scan_tail + part
+        self._scan_tail = data[-3:]
+        text = text_encoding.decode(data, self._encoding)
+        return bool(_LOGICAL_BREAK_RE.search(text[:-1] if text.endswith("\r") else text))
+
+    def feed(self, part: bytes) -> None:
+        if self.overflowed:
+            return
+        broke = bool(part) and self._has_inner_break(part)
+        if len(self._head) < self._line_max:
+            take = part[: self._line_max - len(self._head)]
+            self._head += take
+            part = part[len(take):]
+            if len(self._head) == self._line_max and not broke:
+                self._hit_head = bool(self._matcher(self._head))
+                self._win = self._head[-self._seam:]
+        if broke:
+            self.overflowed = True
+            return
+        if not part or self._hit_head or self._hit_win is not None:
+            return
+        self._win += part
+        if len(self._win) >= self._line_max:
+            if self._matcher(self._win):
+                self._hit_win = self._win
+            self._win = self._win[-self._seam:]
+
+    @property
+    def windowed(self) -> bool:
+        return self._hit_win is not None and not self._hit_head
+
+    def finish(self) -> bytes:
+        if self.overflowed:
+            return self._head
+        if not self._hit_head and self._hit_win is None and self._win and self._matcher(self._win):
+            self._hit_win = self._win
+        return self._head if self._hit_win is None or self._hit_head else self._hit_win
+
+
 class _CappedStreamReader:
     """open 済みバイナリファイル `f` を bounded chunk で読み、`cap` バイトまでの行（改行を含まない生バイト列）を順に yield する。
-    メモリは `_SCAN_CHUNK_BYTES`・`_GREP_LINE_MAX_BYTES`・繰り越し中の未確定バイト列だけで頭打ち。
+    メモリは `_SCAN_CHUNK_BYTES`・`line_max_bytes`・繰り越し中の未確定バイト列だけで頭打ち。
+    `long_line_matcher`（バイト列→一致したか）を渡すと、`line_max_bytes` を超えた行も最後まで見て、語が先頭に無ければ一致した区切り（`seam_bytes` 重ねた窓）を、その行として返す（行番号は変わらない）。渡さないと超えた分は捨てる。
     属性は列挙の進行に伴って更新される:
     - `total_read`: これまでに読んだ総バイト数。
     - `truncated`: `total_read > cap` になった時点で True（ちょうど cap のファイルは False）。
-    - `line_overflowed`: 1 行が `line_max_bytes` を超えて内容の一部を破棄したら True（探せていない範囲がある）。
+    - `last_line_windowed`: 直前に返した行が、上限超えの行から切り出した窓か。
+    - `line_overflowed`: 1 行が `line_max_bytes` を超えて、見ていない範囲を残したら True（`long_line_matcher` ありで最後まで見たときは立たない。ただし行の途中（先頭の保持部より後ろも含む）に CR などの行区切りを含む超過行は窓で行番号が狂うため、先頭だけを返して立てる）。
     """
 
-    def __init__(self, f, line_max_bytes: int | None = None):
+    def __init__(self, f, line_max_bytes: int | None = None, *, long_line_matcher=None, seam_bytes: int = 0, encoding: str = "utf-8"):
         self._f = f
+        self._encoding = encoding  # 超過行の論理改行を、本体の行分割（`_logical_lines`）と同じ符号化で判定する
         self.total_read = 0
         self.truncated = False
         self.line_overflowed = False
+        self.last_line_windowed = False  # 直前に返した行が、上限超えの行の途中の窓（行頭からの文字位置が分からない）
         # `None` は呼び出し時点の `_GREP_LINE_MAX_BYTES` を使う（`__init__` 実行時に解決）。
         self._line_max_bytes = _GREP_LINE_MAX_BYTES if line_max_bytes is None else line_max_bytes
+        self._matcher = long_line_matcher
+        self._seam = max(1, min(seam_bytes, self._line_max_bytes // 2))
+
+    def _long(self) -> _LongLine:
+        return _LongLine(self._line_max_bytes, self._seam, self._matcher, self._encoding)
 
     def lines(self, cap: int):
         budget = cap + 1
         carry = b""
         line_max = self._line_max_bytes
+        long: _LongLine | None = None  # 改行が来ないまま上限を超えて読み進めている行
         while budget > 0:
             chunk = self._f.read(min(_SCAN_CHUNK_BYTES, budget))
             if not chunk:
@@ -236,23 +327,55 @@ class _CappedStreamReader:
             start = 0
             while True:
                 nl = data.find(b"\n", start)
+                if long is not None:
+                    long.feed(data[start:] if nl == -1 else data[start:nl])
+                    if nl == -1:
+                        start = len(data)
+                        break
+                    line_done = long.finish()
+                    self.last_line_windowed = long.windowed
+                    self.line_overflowed = self.line_overflowed or long.overflowed
+                    yield line_done
+                    long = None
+                    start = nl + 1
+                    continue
                 if nl == -1:
                     break
                 line_bytes = data[start:nl]
+                self.last_line_windowed = False
                 if len(line_bytes) > line_max:
-                    # 同じ chunk 内で改行が見つかった場合も、1 行の保持上限を一律に適用する。
-                    line_bytes = line_bytes[:line_max]
-                    self.line_overflowed = True
+                    if self._matcher is not None:
+                        one = self._long()
+                        one.feed(line_bytes)
+                        line_bytes = one.finish()
+                        self.last_line_windowed = one.windowed
+                        self.line_overflowed = self.line_overflowed or one.overflowed
+                    else:
+                        # 同じ chunk 内で改行が見つかった場合も、1 行の保持上限を一律に適用する。
+                        line_bytes = line_bytes[:line_max]
+                        self.line_overflowed = True
                 yield line_bytes
                 start = nl + 1
             tail = data[start:]
             if len(tail) > line_max:
-                tail = tail[:line_max]
-                self.line_overflowed = True
+                if self._matcher is not None:
+                    long = self._long()
+                    long.feed(tail)
+                    tail = b""
+                else:
+                    tail = tail[:line_max]
+                    self.line_overflowed = True
             carry = tail
         # cap で打ち切られた場合、未完の行は丸ごと破棄する（中途行を誤ヒットさせない）。EOF に達した場合は最終行として残す。
-        if carry and not self.truncated:
-            yield carry
+        if not self.truncated:
+            if long is not None:
+                line_done = long.finish()
+                self.last_line_windowed = long.windowed
+                self.line_overflowed = self.line_overflowed or long.overflowed
+                yield line_done
+            elif carry:
+                self.last_line_windowed = False
+                yield carry
 
 
 def _logical_lines(reader, cap: int, encoding: str = "utf-8"):
@@ -561,7 +684,9 @@ def _search_term(q: str, *, roots_spec: list, der_rag, entries, classify_cache, 
             except OSError:
                 _count_unreadable()
                 return False  # この 1 件だけ飛ばす
-            reader = _CappedStreamReader(f)
+            reader = _CappedStreamReader(
+                f, long_line_matcher=lambda b: ql in text_encoding.decode(b, enc).lower(),
+                seam_bytes=4 * len(ql) + 8, encoding=enc)
             is_md = is_derived or ext in _MD_EXT
             out_ext = Path(rel).suffix.lower()  # doc_id（元ファイル）の拡張子で表示
             # `seen`（隣接ヒット窓の同一 span 重複排除）は `maxlen` 付き `deque` の小さな有界窓にする（重複は直近の窓どうしでしか起きないため、ヒット総数に比例させない）。
@@ -571,6 +696,7 @@ def _search_term(q: str, *, roots_spec: list, der_rag, entries, classify_cache, 
                 section_start = 1
                 section_has_hit = False
                 section_hit_line = 0
+                section_hit_char: int | None = None
                 section_buf: list[str] = []
                 section_buf_bytes = 0
                 section_capped = False
@@ -581,8 +707,9 @@ def _search_term(q: str, *, roots_spec: list, der_rag, entries, classify_cache, 
             else:
                 recent: deque = deque(maxlen=5)  # 直近 5 行（前後 2 行窓の復元に必要な最小限）
                 pending: list[int] = []  # まだ確定していないヒット行（1-based）
+                pending_char: dict[int, int] = {}  # ヒット行 → 行の中の文字位置
 
-            def _add_hit(hit_line: int, s: int, e: int, text: str, clipped: bool = False) -> None:
+            def _add_hit(hit_line: int, s: int, e: int, text: str, clipped: bool = False, char: int | None = None) -> None:
                 key = (str(p), s, e)
                 if key in seen:
                     return
@@ -601,6 +728,8 @@ def _search_term(q: str, *, roots_spec: list, der_rag, entries, classify_cache, 
                     hit["encoding_caution"] = encoding_caution
                 if clipped:
                     hit["section_truncated"] = True
+                if char is not None:
+                    hit["char"] = char  # 一致行の中の文字位置（0 始まり）。read_doc の start_char へそのまま渡せる
                 _offer(hit)
 
             def _emit_md_section(end_line: int) -> None:
@@ -615,7 +744,7 @@ def _search_term(q: str, *, roots_spec: list, der_rag, entries, classify_cache, 
                     kept.extend(x for x in hit_ctx if not kept or x[0] > kept[0][0])
                     text = _assemble_lines(kept, end_line)
                     clipped_text = clip_hit_text(text, q, section_hit_line, _GREP_HIT_TEXT_MAX_BYTES)
-                    _add_hit(section_hit_line, section_start, end_line, clipped_text, clipped=True)
+                    _add_hit(section_hit_line, section_start, end_line, clipped_text, clipped=True, char=section_hit_char)
                     section_has_hit = False
                     return
                 text = "\n".join(section_buf)
@@ -624,7 +753,7 @@ def _search_term(q: str, *, roots_spec: list, der_rag, entries, classify_cache, 
                 clipped_text = clip_hit_text(text, q, section_hit_line, _GREP_HIT_TEXT_MAX_BYTES,
                                              span_start=section_start)
                 _add_hit(section_hit_line, section_start, end_line, clipped_text,
-                         clipped=section_capped or clipped_text != text)
+                         clipped=section_capped or clipped_text != text, char=section_hit_char)
                 section_has_hit = False
 
             hit_limit_reached = False  # ファイル内でヒット数上限に達したか（達したら flush を省く）
@@ -659,6 +788,7 @@ def _search_term(q: str, *, roots_spec: list, der_rag, entries, classify_cache, 
                         if ql in t.lower() and not section_has_hit:
                             section_has_hit = True
                             section_hit_line = line_no
+                            section_hit_char = None if reader.last_line_windowed else _match_char(t, ql)
                             if line_no - section_start >= len(section_buf):
                                 hit_outside_buf = True
                                 hit_ctx = list(section_recent)
@@ -667,12 +797,14 @@ def _search_term(q: str, *, roots_spec: list, der_rag, entries, classify_cache, 
                         recent.append((line_no, t))
                         if ql in t.lower():
                             pending.append(line_no)
+                            if not reader.last_line_windowed:
+                                pending_char[line_no] = _match_char(t, ql)
                         while pending and pending[0] <= line_no - 2:
                             h = pending.pop(0)
                             s, e = max(1, h - 2), h + 2
                             text = "\n".join(txt for (ln, txt) in recent if s <= ln <= e)
                             clipped_text = clip_hit_text(text, q, h, _GREP_HIT_TEXT_MAX_BYTES, span_start=s)
-                            _add_hit(h, s, e, clipped_text, clipped=clipped_text != text)
+                            _add_hit(h, s, e, clipped_text, clipped=clipped_text != text, char=pending_char.pop(h, None))
                     line_i += 1
                     # ヒープが満杯でこのファイルのヒットが採用され得ないなら、ファイル内で break する（最終節／未確定 pending 行の flush は行わない）。
                     if _closed():
@@ -686,7 +818,7 @@ def _search_term(q: str, *, roots_spec: list, der_rag, entries, classify_cache, 
                             s, e = max(1, h - 2), min(line_i, h + 2)
                             text = "\n".join(txt for (ln, txt) in recent if s <= ln <= e)
                             clipped_text = clip_hit_text(text, q, h, _GREP_HIT_TEXT_MAX_BYTES, span_start=s)
-                            _add_hit(h, s, e, clipped_text, clipped=clipped_text != text)
+                            _add_hit(h, s, e, clipped_text, clipped=clipped_text != text, char=pending_char.pop(h, None))
             except OSError:
                 _count_unreadable()
         finally:

@@ -27,7 +27,7 @@ from xml.etree import ElementTree as ET
 from .. import derived_suffixes, json_io
 from ..env_int import env_int
 from . import background, encryption, mem_guard, substage
-from . import text_kind
+from . import ocr_switch, text_kind
 
 # MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
 _log = logging.getLogger("sherpa.ingest.convert")
@@ -426,10 +426,10 @@ def _current_human_md_sig() -> str:
 def _current_pdf_human_md_sig() -> str:
     """今の PDF 人向け MD（`human_md.render_pdf`／`render_pdf_without_text`）の版。PDF の変換キャッシュの鍵と、`rag_sidecars_missing` の再生成判定に使う。
 
-    OCR の有効/無効で文字の層が無いスキャン PDF の扱い（知らせの MD／失敗）が変わるため、版に含める。
+    OCR の形は環境変数だけで決める（`ocr_switch.convert_mode_on`）。管理画面の入切は含めない。
     """
     from . import human_md
-    return f"{human_md.PDF_HUMAN_MD_VERSION};ocr={'on' if ocr_enabled() else 'off'}"
+    return f"{human_md.PDF_HUMAN_MD_VERSION};ocr={'on' if ocr_switch.convert_mode_on() else 'off'}"
 
 
 _LEGACY_HUMAN_MD_EXT = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}
@@ -754,15 +754,17 @@ def _archive_also_root(world: str | None) -> Path | None:
 
 
 def _resolve_ocr_observation_dir(world: str | None) -> Path | None:
-    """`world` の公開中 OCR 観測ディレクトリ（無効/未指定/未公開は None）。
+    """`world` の公開中 OCR 観測ディレクトリ（環境変数で OCR を止めている/未指定/未公開は None）。
 
+    入切どちらでも、公開中の世代と一致する観測があればそれを、無ければ最後に公開した観測を返す（新しい世代の観測が公開されるまで
+    印を動かさず、入切の切り替えだけで rag.md を作り直さない）。文書ごとの `source_content_hash` の照合は読む側が行う。
     `worlds.observation_dir` は `derived_dir` と物理 root を分ける（隔離 OCR worker への read-only 境界）ため、
     `world` 文字列でしか辿れない。循環を避けて `worlds` を遅延 import する。
     """
-    if not world or not ocr_enabled():
+    if not world or not ocr_switch.convert_mode_on():
         return None
     from .. import worlds
-    return worlds.observation_current_dir(world)
+    return worlds.observation_current_dir(world) or worlds.observation_latest_dir(world)
 
 
 def _ocr_observation_marker_for(obs_dir: Path | None) -> str | None:
@@ -1196,19 +1198,11 @@ _LAYER_FOR_SIDECAR_SUFFIX = {
 }
 # 公開中の派生物が「どの資料フォルダの内容から作られたか」を刻む印（`derived_generation` 参照）
 _WORLD_SIG_MARKER = ".world_sig"
-_OCR_ENABLED_ENV = "SHERPA_OCR_ENABLED"
 
 
 def ocr_enabled() -> bool:
-    """OCR 観測が有効か。既定 ON。
-
-    取り込み側で有効なのはルート生成（どのラスタを読むかを決めるだけ）。読み取り本体は隔離ワーカーが行う。
-    `SHERPA_OCR_ENABLED=0` で止められる。
-    """
-    raw = os.environ.get(_OCR_ENABLED_ENV)
-    if raw is None or not raw.strip():
-        return True
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    """OCR の対象づくり・予約が有効か（`ocr_switch.enabled`）。読み取り本体は隔離ワーカーが行う。"""
+    return ocr_switch.enabled()
 
 
 def write_ocr_route_sig_marker(dr) -> None:
@@ -1300,8 +1294,8 @@ def _write_ocr_routes(stage_ir: Path, stage_rag: Path) -> dict:
 
 
 def _pdf_ocr_route_inputs(dr_ir: Path, dr_rag: Path, rel: str) -> tuple[int, object | None]:
-    """OCR が有効なとき、生成済みの `{rel}.evidence.json` から OCR の対象（selected）の入力数と Evidence を返す。無効・読めないときは `(0, None)`。"""
-    if not ocr_enabled():
+    """生成済みの `{rel}.evidence.json` から OCR の対象（selected）の入力数と Evidence を返す。環境変数で OCR を止めている・読めないときは `(0, None)`。管理画面の入切には左右されない。"""
+    if not ocr_switch.convert_mode_on():
         return 0, None
     from . import evidence_ir, ocr_router
     try:
@@ -1599,7 +1593,7 @@ def publish_one(derived, rel: str) -> None:
     staged = {"md": staging_md, "rag": staging_rag, "ir": staging_ir}
     moved: list[tuple[Path, Path | None]] = []          # (公開中の場所, 控え〔元が無ければ None〕)
     try:
-        if ocr_enabled():
+        if ocr_switch.routes_wanted(derived):
             try:
                 _write_ocr_routes(staging_ir, staging_rag)
             except Exception:                        # OCR は任意＝変換の公開を巻き添えにしない

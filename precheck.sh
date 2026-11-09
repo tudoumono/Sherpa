@@ -348,7 +348,7 @@ case "${MEM_MB}" in
       r_must "メモリが足りません（${MEM_TEXT}・8GB 以上が必要）。" "${MEM_HINT}"
     elif [ "${MEM_JUDGE_MB}" -lt "${MEM_WARN_MB}" ]; then
       r_warn "メモリが少なめです（${MEM_TEXT}・16GB 以上を推奨）。" \
-        "画像内の文字の読み取り（OCR）は重いので、動きが悪いときは .env に SHERPA_OCR_ENABLED=0 と書いて OCR を止めてください。${MEM_HINT}"
+        "画像内の文字の読み取り（OCR）は重いので、OCR は管理画面の取り込みタブで入れたときだけ動きます（既定は切）。動きが悪いときは切のままにしてください。${MEM_HINT}"
     else
       r_ok "メモリ: ${MEM_TEXT}"
     fi ;;
