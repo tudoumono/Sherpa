@@ -175,9 +175,8 @@ export function openShareDialog(cid, title) {
       if (!confirm('この共有を取消します。招待者は開けなくなります。よろしいですか？')) return;
       revokeBtn.disabled = true;
       try {
-        const r = await fetch(`/conversation-shares/${revokeBtn.dataset.shareRevoke}/revoke`, { method: 'POST' });
-        if (!r.ok) throw new Error(String(r.status));
-      } catch (_) { revokeBtn.disabled = false; return; }
+        await Sherpa.api('POST', `/conversation-shares/${revokeBtn.dataset.shareRevoke}/revoke`);
+      } catch (err) { revokeBtn.disabled = false; toast(err.message); return; }
       loadShareExistingList(cid);
       return;
     }
@@ -185,11 +184,8 @@ export function openShareDialog(cid, title) {
     if (extendBtn) {
       extendBtn.disabled = true;
       try {
-        const r = await fetch(`/conversation-shares/${extendBtn.dataset.shareExtend}/extend`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ days: 30 }),
-        });
-        if (!r.ok) throw new Error(String(r.status));
-      } catch (_) { extendBtn.disabled = false; toast('延長できませんでした'); return; }
+        await Sherpa.api('POST', `/conversation-shares/${extendBtn.dataset.shareExtend}/extend`, { days: 30 });
+      } catch (err) { extendBtn.disabled = false; toast(err.message); return; }
       await loadShareExistingList(cid);
       toast('期限を今から30日後に延ばしました');
       return;
@@ -198,9 +194,8 @@ export function openShareDialog(cid, title) {
     if (refreshBtn) {
       refreshBtn.disabled = true;
       try {
-        const r = await fetch(`/conversation-shares/${refreshBtn.dataset.shareRefresh}/refresh`, { method: 'POST' });
-        if (!r.ok) throw new Error(String(r.status));
-      } catch (_) { refreshBtn.disabled = false; return; }
+        await Sherpa.api('POST', `/conversation-shares/${refreshBtn.dataset.shareRefresh}/refresh`);
+      } catch (err) { refreshBtn.disabled = false; toast(err.message); return; }
       await loadShareExistingList(cid);
       toast('更新しました（招待者には次に開いたときから最新が見えます）');
     }
@@ -284,11 +279,7 @@ export function openShareDialog(cid, title) {
     if (submitBtn.disabled) return;   // 二重発行の防止
     submitBtn.disabled = true;
     try {
-      const d = await (await fetch(`/conversations/${cid}/shares`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ invitee_user_ids: invitees, expires_at: expires }),
-      })).json();
+      const d = await Sherpa.api('POST', `/conversations/${cid}/shares`, { invitee_user_ids: invitees, expires_at: expires });
       if (d.ok) {
         // 共有 URL は一度だけ表示する
         const absUrl = location.origin + d.url;
@@ -300,7 +291,7 @@ export function openShareDialog(cid, title) {
         errEl.textContent = d.detail || '共有に失敗しました';
       }
     } catch (err) {
-      errEl.textContent = '通信エラーが発生しました';
+      errEl.textContent = err.message;
     } finally {
       submitBtn.disabled = false;
     }

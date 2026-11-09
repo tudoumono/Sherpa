@@ -158,3 +158,15 @@ def test_no_failure_message_while_running_after_a_success(world):
 
     assert summary["last_failure_message"] is None
     assert summary["last_failure_retrying"] is False
+
+
+def test_ingest_runs_list_carries_failure_message_from_flags(monkeypatch, auth_disabled):
+    from fastapi.testclient import TestClient
+    from sherpa.api import app
+    runs = [{"id": 1, "version": "w", "status": "failed",
+             "extraction_snapshot": {"flags": [{"doc": None, "action": "warn", "reason": "low_disk_stop:9.8"}]}},
+            {"id": 2, "version": "w", "status": "published", "extraction_snapshot": {}}]
+    monkeypatch.setattr(store, "list_ingest_runs", lambda w: runs)
+    body = TestClient(app).get("/ingest/runs", params={"world": "w"}).json()
+    assert "ディスクの空きが少ない" in body["runs"][0]["failure_message"]
+    assert body["runs"][1]["failure_message"] is None

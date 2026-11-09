@@ -143,8 +143,9 @@ def _admin_es_search_endpoint(request: Request,
     w = _resolve_world(world)
     sp = validated_scope(w, scope_paths) or None
     hits = []
-    # `es_index.search()` は (hits, reason) のタプルを返す。この読み取り専用検索には degraded 報告が無いため BM25 失敗（es_query_failed）の reason は捨てる（構造化された degraded 集計が要る呼び出し元は `fused_search._search_keyword()`）。
-    es_hits, _reason = es_index.search(w, query, scope_paths=sp, k=k, vector=False)
+    es_hits, reason = es_index.search(w, query, scope_paths=sp, k=k, vector=False)
+    if reason in es_index._ES_QUERY_FAILURES:
+        raise HTTPException(503, "全文検索のサービスを使えません。システム状態を確認してから、もう一度お試しください")
     from sherpa import path_rules
     sp_eff = path_rules.rules_for(w).extend_scope(sp)  # 「範囲の外でも読む」を足した範囲（ES が足したヒットを落とし直さない）
     try:

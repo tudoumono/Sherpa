@@ -205,7 +205,7 @@ def reachable_as_text(rel_path: str, ext: str, read_head) -> bool:
 
 
 def _read_head(rp: Path, size: int = 4096) -> str:
-    """先頭 `size` バイトを読み UTF-8／CP932（不正バイトは置換）でデコードする（`registry.resolve_lazy` の内容判定用）。読めなければ `_HeadUnreadable`。
+    """先頭 `size` バイトを読み UTF-8／CP932／EUC-JP（不正バイトは置換）でデコードする（`registry.resolve_lazy` の内容判定用）。読めなければ `_HeadUnreadable`。
     バイナリで `size` バイトちょうど読んでからデコードする（`Analyzer.head_bytes` の宣言どおりのバイト境界を守るため）。
     """
     try:
@@ -309,7 +309,7 @@ def encoding_caution_for(rp: Path) -> str | None:
 
 
 def read_full_text_and_raw(rp: Path) -> tuple[str, bytes]:
-    """ファイルをバイナリで 1 回だけ読み、全文（UTF-8／CP932・不正バイトは置換）と生バイト列の両方を返す。読めなければ `OSError`。
+    """ファイルをバイナリで 1 回だけ読み、全文（UTF-8／CP932／EUC-JP・不正バイトは置換）と生バイト列の両方を返す。読めなければ `OSError`。
     `ingest.world_graph` の Pass1 専用（構文解析用の全文と、アナライザごとの `head_bytes` でスライスする生バイト列を同一の読み取りから得る）。
     """
     raw = rp.read_bytes()

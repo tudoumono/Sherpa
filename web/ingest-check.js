@@ -14,9 +14,10 @@
   function row(it) {
     const ex = (it.examples || []).length
       ? `<div class="muted" style="font-size:var(--text-small);margin-top:4px">${it.examples.map(esc).join('<br>')}</div>` : '';
+    const now = it.rule === '決まり5' ? '（今の版）' : '';
     return `<tr><td><span class="badge ${TAG[it.result]}">${esc(it.result)}</span></td>`
       + `<td>${esc(it.path || '（全体）')}</td>`
-      + `<td>${esc(it.what)}${ex}</td><td>${esc(it.treatment)}</td><td>${esc(it.fix || '')}</td></tr>`;
+      + `<td>${esc(it.what)}${ex}</td><td>${now}${esc(it.treatment)}</td><td>${now}${esc(it.fix || '')}</td></tr>`;
   }
 
   function table(items) {

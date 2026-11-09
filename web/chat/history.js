@@ -125,17 +125,15 @@ export async function loadConversations() {
 
 export async function deleteConversation(id) {                 // 確認してから削除（メッセージも消える）
   if (!confirm('このチャット履歴を削除します。元に戻せません。よろしいですか？')) return;
-  try { const r = await fetch('/conversations/' + id, { method: 'DELETE' }); if (!r.ok) throw new Error(r.status); }
-  catch (e) { toast('削除に失敗しました'); return; }
+  try { await Sherpa.api('DELETE', '/conversations/' + id); }
+  catch (e) { toast(e.message); return; }
   if (id === S.cid) newConversation(); else loadConversations();
   toast('履歴を削除しました');
 }
 export async function togglePin(id, pinned) {                  // ピン止め/解除
   try {
-    const r = await fetch('/conversations/' + id + '/pin', { method: 'POST',
-      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pinned }) });
-    if (!r.ok) throw new Error(r.status);
-  } catch (e) { toast('変更に失敗しました'); return; }
+    await Sherpa.api('POST', '/conversations/' + id + '/pin', { pinned });
+  } catch (e) { toast(e.message); return; }
   loadConversations();
 }
 export async function renameConversation(id, current) {        // 履歴タイトルの変更
@@ -143,10 +141,8 @@ export async function renameConversation(id, current) {        // 履歴タイ�
   if (title == null) return;                            // キャンセル
   const t = title.trim(); if (!t) return;
   try {
-    const r = await fetch('/conversations/' + id, { method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: t }) });
-    if (!r.ok) throw new Error(r.status);
-  } catch (e) { toast('名前の変更に失敗しました'); return; }
+    await Sherpa.api('PATCH', '/conversations/' + id, { title: t });
+  } catch (e) { toast(e.message); return; }
   if (id === S.cid) $('conv-title').textContent = t;
   loadConversations(); toast('名前を変更しました');
 }

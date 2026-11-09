@@ -8,8 +8,8 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
-from sherpa import doc_ledger, path_rules, scope, scope_infer, worlds
-from sherpa.ingest import importance, text_kind
+from sherpa import build_marks, doc_ledger, path_rules, scope, scope_infer, worlds
+from sherpa.ingest import build_link, importance, text_kind
 from sherpa.deps import (
     SCOPE_WALK_TIMEOUT_MESSAGE,
     _WORLD_PATTERN,
@@ -174,3 +174,66 @@ def admin_path_rules_put(req: PathRulesPutReq, request: Request):
         _log.warning("path_rules: 保存に失敗しました: %s", type(e).__name__)
         raise HTTPException(503, "設定を保存できませんでした。時間をおいてやり直してください") from e
     return {"world": w, "rules": [r.as_dict() for r in kept], "dropped_children": [r.as_dict() for r in dropped]}
+
+
+class BuildMarkItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str
+    mark: str
+
+
+class BuildMarksPutReq(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    world: str | None = None
+    marks: list[BuildMarkItem] = []
+
+
+class BuildMarksResponse(BaseModel):
+    world: str
+    marks: list[BuildMarkItem]
+    layout_folders: list[str]
+
+
+@path_rules_admin_router.get("/admin/build-marks", tags=["管理者:資料の優先と除外"], response_model=BuildMarksResponse)
+def admin_build_marks_get(request: Request, world: str | None = Query(None, pattern=_WORLD_PATTERN)):
+    """ビルドの定義を読む場所の印と、置き方から読むフォルダ（ソースの組のフォルダ）を返す（管理者のみ）。"""
+    _require_admin(_current_user(request))
+    w = _resolve_world(world)
+    _require_world(w)
+    try:
+        rels = _listing_rels(w)
+    except scope_infer.ScopeWalkDeadlineExceeded:
+        raise HTTPException(503, SCOPE_WALK_TIMEOUT_MESSAGE) from None
+    try:
+        marks = build_marks.load(w)
+    except Exception as e:
+        _log.warning("build_marks: 設定を読めません: %s", type(e).__name__)
+        raise HTTPException(503, "設定を読み込めませんでした。時間をおいてやり直してください") from e
+    return {"world": w, "marks": [{"path": p, "mark": m} for p, m in sorted(marks.items())],
+            "layout_folders": build_link.source_group_dirs(rels)}
+
+
+@path_rules_admin_router.put("/admin/build-marks", tags=["管理者:資料の優先と除外"], response_model=BuildMarksResponse)
+def admin_build_marks_put(req: BuildMarksPutReq, request: Request):
+    """ビルドの定義を読む場所の印を置き換えて保存する（管理者のみ・`system_settings` の監査に残る）。次の「今すぐ更新」でグラフだけを作り直して効かせる。
+    不正な指定・資料フォルダに無い場所は 422。"""
+    u = _current_user(request)
+    _require_admin(u)
+    w = _resolve_world(req.world)
+    _require_world(w)
+    try:
+        marks = build_marks.validate_entries([m.model_dump() for m in req.marks])
+    except path_rules.PathRulesError as e:
+        raise HTTPException(422, str(e)) from e
+    try:
+        _, missing = path_rules.prune_missing(w, [path_rules.Rule(p, path_rules.KIND_EXCLUDE) for p in marks])
+    except path_rules.ExistenceUnknown as e:
+        raise HTTPException(503, "資料フォルダの中を確かめられませんでした。時間をおいてやり直してください") from e
+    if missing:
+        raise HTTPException(422, "資料フォルダの中に見つからない場所があります")
+    try:
+        build_marks.save_world(u["uid"], w, marks)
+    except Exception as e:
+        _log.warning("build_marks: 保存に失敗しました: %s", type(e).__name__)
+        raise HTTPException(503, "設定を保存できませんでした。時間をおいてやり直してください") from e
+    return {"world": w, "marks": [{"path": p, "mark": m} for p, m in sorted(marks.items())], "layout_folders": []}

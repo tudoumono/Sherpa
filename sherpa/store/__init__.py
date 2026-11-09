@@ -163,6 +163,7 @@ from .audit import (
 
 # settings の全名（私的名含む）を re-export する。`set_system_settings` 内の `_audit_insert` 呼び出しは facade 属性経由で実行時に解決する。`_system_settings_cache`/`_system_settings_cache_ts` は公開名一覧を保つためだけの re-export。
 from .settings import (
+    CHILD_SNAPSHOT_ENV,
     OpenAIEndpointSettingsConflict,
     PersonalKeysDisallowedError,
     _SETTINGS_FIELDS,

@@ -1023,7 +1023,7 @@ def test_codex_mcp_config_builder():
     from sherpa.providers.codex import mcp
     args = mcp._mcp_config_args("v1", ["4期", "00_共通"])
     joined = " ".join(args)
-    assert args.count("-c") == 6
+    assert args.count("-c") == 7
     assert "mcp_servers.sherpa.command=" in joined and 'sherpa.args = ["-m", "sherpa.mcp_server"]' in joined
     assert 'SHERPA_MCP_WORLD = "v1"' in joined and 'SHERPA_MCP_SCOPE = "4期\\n00_共通"' in joined
     assert 'default_tools_approval_mode = "approve"' in joined and 'approval_policy = "never"' in joined
@@ -1032,6 +1032,30 @@ def test_codex_mcp_config_builder():
     assert "SHERPA_MCP_ASK_DISABLED" not in env
     p = agents.CodexProvider()._prompt_mcp("請求でエラー。原因は?", "troubleshoot", "v1")
     assert "graph_neighbors" in p and "参考（構造化済みの事実）" not in p    # MCP は自律＝事実を前渡ししない
+
+
+def test_mcp_child_uses_parent_settings_without_db_and_keeps_key_out_of_argv(monkeypatch):
+    """道具の子プロセスは親が読んだ設定の写しを DB なしで使う。鍵は引数に出さない。"""
+    import json
+    from sherpa.providers.codex import mcp
+    from sherpa.store import settings as settings_mod
+    monkeypatch.setattr(store, "get_system_settings",
+                        lambda: {"embed_provider": "openai", "openai_api_key": "sk-not-in-argv", "path_rules": {"x": 1}})
+    monkeypatch.setattr(store, "get_settings", lambda: {"ollama_url": "http://embed-host:11434"})
+    raw = mcp._mcp_env("v1", None)[store.CHILD_SNAPSHOT_ENV]
+    assert "path_rules" not in json.loads(raw)["system"]
+    argv = mcp._mcp_config_args("v1", None)
+    assert not any("sk-not-in-argv" in a for a in argv)
+    assert any("env_vars" in a and store.CHILD_SNAPSHOT_ENV in a for a in argv)
+    assert any("shell_environment_policy.exclude" in a and store.CHILD_SNAPSHOT_ENV in a for a in argv)
+
+    def no_db(*a, **k):
+        raise AssertionError("子が DB につないだ")
+    monkeypatch.setattr(settings_mod, "_ensure", no_db)
+    monkeypatch.setattr(settings_mod, "_connect", no_db)
+    monkeypatch.setenv(store.CHILD_SNAPSHOT_ENV, raw)
+    assert settings_mod._read_system_settings_fresh()["openai_api_key"] == "sk-not-in-argv"
+    assert settings_mod.get_settings()["ollama_url"] == "http://embed-host:11434"
 
 
 def test_mcp_env_includes_effective_arms_and_legacy_backend_snapshot(monkeypatch):
@@ -2544,3 +2568,58 @@ def test_ripgrep_search_omission_marks_keep_line_numbers_after_a_redacted_key(mo
     assert marks and marks[0][0] == "2", text              # 見出しの次（2 行目）から省略が始まる
     shown_first = int(marks[0][1]) + 1                     # 省略の直後に出る行の番号は、原本のその行と一致する
     assert text.split(marks[0][1] + "行目を省略）⋯\n", 1)[1].split("\n", 1)[0] == lines[shown_first - 1], text
+
+
+def test_run_tool_read_doc_long_line_continues_with_start_char_until_original_text(monkeypatch, tmp_path):
+    """予算より長い 1 行は next_char から読み続けられ、つなぐと原文に一致する（毎回 1 文字以上進む）。"""
+    world = "read-doc-long-line-world"
+    long_line = "".join(f"{i:05d}あ" for i in range(1500))
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"doc.md": f"first\n{long_line}\nlast"})
+    parts, start_char, guard = [], 0, 0
+    while True:
+        guard += 1
+        assert guard < 100
+        args = {"doc_id": "doc.md", "start_line": 2, **({"start_char": start_char} if start_char else {})}
+        res, _, _, _ = TD.run_tool("read_doc", args, world, None, tool_result_max_bytes=3000)
+        assert "error" not in res, res
+        assert res["text"].startswith("2: ")
+        parts.append(res["text"].split("\n")[0][len("2: "):])
+        if "next_char" not in res:
+            assert "partial_line" not in res and res["end_line"] >= 2
+            break
+        assert res["end_line"] == 2
+        assert res["next_char"] > start_char and res["partial_line"] is True
+        start_char = res["next_char"]
+    assert "".join(parts) == long_line
+
+
+def test_read_doc_start_char_beyond_line_is_error(monkeypatch, tmp_path):
+    world = "read-doc-start-char-world"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"doc.md": "abc\ndef"})
+    res, _, _, _ = TD.run_tool("read_doc", {"doc_id": "doc.md", "start_line": 1, "start_char": 3}, world, None)
+    assert "error" in res
+
+
+def test_run_tool_read_around_cut_line_reports_where_read_doc_continues(monkeypatch, tmp_path):
+    world = "read-around-next-world"
+    long_line = "".join(f"{i:05d}" for i in range(1000))
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"doc.md": f"one\n{long_line}\nthree"})
+    res, _, _, _ = TD.run_tool("read_around", {"doc_id": "doc.md", "line": 2, "window": 2}, world, None,
+                               tool_result_max_bytes=1000)
+    assert res["text_truncated"] is True and res["next_line"] == 2 and res["next_char"] > 0
+    rest, _, _, _ = TD.run_tool("read_doc", {"doc_id": "doc.md", "start_line": res["next_line"],
+                                              "start_char": res["next_char"]}, world, None)
+    assert res["text"].split("\n")[1][len("2: "):] + rest["text"].split("\n")[0][len("2: "):] == long_line
+
+
+def test_read_around_cut_keeps_next_line_and_next_char_through_mcp_clip(monkeypatch, tmp_path):
+    from sherpa import mcp_server
+    world = "read-around-mcp-world"
+    long_line = "x" * 100000
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"doc.md": f"one\n{long_line}\nthree"})
+    for budget in (3000, 65536):
+        res, _, _, _ = TD.run_tool("read_around", {"doc_id": "doc.md", "line": 2, "window": 2}, world, None,
+                                   tool_result_max_bytes=budget)
+        monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", str(budget))
+        clipped, was_clipped = mcp_server._clip_tool_result(res, name="read_around", args={})
+        assert not was_clipped and clipped.get("next_line") == 2 and clipped.get("next_char", 0) > 0, (budget, sorted(res), sorted(clipped))

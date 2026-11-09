@@ -92,26 +92,60 @@ def _base_cmd(rg: str, *, whitelist: list[str], exclude_exts=(), fixed: bool = T
 _REGEX_META = "\\.+*?()|[]{}^$#&-~"
 
 
-@functools.lru_cache(maxsize=1)
-def _cp932_fold_table() -> dict[str, tuple[bytes, ...]]:
-    """CP932 の 1・2 バイトの並び → 解読した 1 文字の `casefold()`。その値ごとに、同じ値になる並びを全部まとめる（NEC・IBM の重複も含む）。"""
+# 非 ASCII の語を探すときに、UTF-8 の字面と並べてバイト列でも探す文字コード（rg の `-E` の名前）。
+LEGACY_ENCODINGS = ("sjis", "euc-jp")
+_ROWS = range(0xA1, 0xFF)
+
+
+def _jis_to_sjis(lead: int, trail: int) -> bytes:
+    """EUC-JP の 2 バイト（JIS X 0208 の区・点）→ 同じ字の CP932 の 2 バイト。"""
+    row, cell = lead - 0xA0, trail - 0xA0
+    first = ((row + 1) >> 1) + (0x80 if row <= 62 else 0xC0)
+    second = (cell + 0x3F if cell <= 63 else cell + 0x40) if row % 2 else cell + 0x9E
+    return bytes([first, second])
+
+
+def _decode_one(seq: bytes, encoding: str) -> str | None:
+    """rg（WHATWG の解読）が `seq` を読んだときの 1 文字。読めない・1 文字にならないときは None。
+    CP932 は Python の `cp932` と同じ。EUC-JP の 2 バイトは CP932 と同じ表（JIS X 0208・NEC と IBM の拡張を含む）で、
+    3 バイトの 0x8FA2B7 は全角のチルダに読む。
+    """
+    try:
+        if encoding == "sjis":
+            ch = seq.decode("cp932")
+        elif len(seq) == 2 and seq[0] in _ROWS:
+            ch = _jis_to_sjis(seq[0], seq[1]).decode("cp932")
+        elif seq == b"\x8f\xa2\xb7":
+            ch = "\uff5e"
+        else:
+            ch = seq.decode("euc_jp")
+    except UnicodeDecodeError:
+        return None
+    return ch if len(ch) == 1 else None
+
+
+@functools.lru_cache(maxsize=2)
+def _fold_table(encoding: str) -> dict[str, tuple[bytes, ...]]:
+    """`encoding` の 1〜3 バイトの並び → 解読した 1 文字の `casefold()`。その値ごとに、同じ値になる並びを全部まとめる（重複した符号も含む）。"""
     seqs = [bytes([b]) for b in range(0x100)]
-    seqs += [bytes([lead, tr]) for lead in (*range(0x81, 0xA0), *range(0xE0, 0xFD))
-             for tr in (*range(0x40, 0x7F), *range(0x80, 0xFD))]
+    if encoding == "sjis":
+        seqs += [bytes([lead, tr]) for lead in (*range(0x81, 0xA0), *range(0xE0, 0xFD))
+                 for tr in (*range(0x40, 0x7F), *range(0x80, 0xFD))]
+    else:
+        seqs += [bytes([a, b]) for a in _ROWS for b in _ROWS]
+        seqs += [bytes([0x8E, b]) for b in range(0xA1, 0xE0)]
+        seqs += [bytes([0x8F, a, b]) for a in _ROWS for b in _ROWS]
     table: dict[str, list[bytes]] = {}
     for seq in seqs:
-        try:
-            ch = seq.decode("cp932")
-        except UnicodeDecodeError:
-            continue
-        if len(ch) == 1:
+        ch = _decode_one(seq, encoding)
+        if ch is not None:
             table.setdefault(ch.casefold(), []).append(seq)
     return {k: tuple(v) for k, v in table.items()}
 
 
-def _cp932_alts(term: str) -> list[tuple[bytes, ...]] | None:
-    """`term` を CP932 で書いたときの文字ごとの並びの候補（大文字小文字の違う字と、重複した符号の並びを含む）。CP932 で書けない文字を含む語は None。"""
-    table = _cp932_fold_table()
+def _legacy_alts(term: str, encoding: str) -> list[tuple[bytes, ...]] | None:
+    """`term` を `encoding` で書いたときの文字ごとの並びの候補（大文字小文字の違う字と、重複した符号の並びを含む）。書けない文字を含む語は None。"""
+    table = _fold_table(encoding)
     out = []
     for ch in term:
         seqs = table.get(ch.casefold())
@@ -121,9 +155,9 @@ def _cp932_alts(term: str) -> list[tuple[bytes, ...]] | None:
     return out
 
 
-def _cp932_pattern(term: str) -> str | None:
-    """`term` の CP932 のバイト列に当たる rg の正規表現。`-E sjis -i` で解読してから当てたときに当たる場所は必ず当たる（余計に当たる分は呼び出し元の確定で落ちる）。"""
-    alts = _cp932_alts(term)
+def _legacy_pattern(term: str, encoding: str) -> str | None:
+    """`term` の `encoding` のバイト列に当たる rg の正規表現。`-E <encoding> -i` で解読してから当てたときに当たる場所は必ず当たる（余計に当たる分は呼び出し元の確定で落ちる）。"""
+    alts = _legacy_alts(term, encoding)
     if alts is None:
         return None
     parts = []
@@ -134,20 +168,23 @@ def _cp932_pattern(term: str) -> str | None:
 
 
 @functools.lru_cache(maxsize=256)
-def _cp932_bytes_re(term: str) -> re.Pattern | None:
-    """`_cp932_pattern` と同じ並びに当たる Python の正規表現（行のバイト列から、どの語に当たったかを決める用）。"""
-    alts = _cp932_alts(term)
-    if alts is None:
-        return None
-    return re.compile(b"".join(b"(?:" + b"|".join(re.escape(x) for x in seqs) + b")" for seqs in alts),
-                      re.IGNORECASE)
+def _legacy_bytes_res(term: str) -> tuple[re.Pattern, ...]:
+    """`_legacy_pattern` と同じ並びに当たる Python の正規表現（文字コードごと・行のバイト列から、どの語に当たったかを決める用）。"""
+    out = []
+    for enc in LEGACY_ENCODINGS:
+        alts = _legacy_alts(term, enc)
+        if alts is not None:
+            out.append(re.compile(b"".join(b"(?:" + b"|".join(re.escape(x) for x in seqs) + b")" for seqs in alts),
+                                  re.IGNORECASE))
+    return tuple(out)
 
 
-def _term_pattern(term: str, with_cp932: bool) -> str:
-    """rg に `-e` で渡す 1 語の正規表現。字面の語（UTF-8 のまま当てる）と、`with_cp932` のときは非 ASCII の語の CP932 のバイト列のどちらか。"""
+def _term_pattern(term: str, with_legacy: bool) -> str:
+    """rg に `-e` で渡す 1 語の正規表現。字面の語（UTF-8 のまま当てる）と、`with_legacy` のときは非 ASCII の語の CP932・EUC-JP のバイト列のどれか。"""
     plain = "".join("\\" + c if c in _REGEX_META else c for c in term)
-    cp = _cp932_pattern(term) if with_cp932 and not term.isascii() else None
-    return plain if cp is None else f"(?:{plain})|{cp}"
+    alts = [p for enc in LEGACY_ENCODINGS
+            if with_legacy and not term.isascii() and (p := _legacy_pattern(term, enc)) is not None]
+    return "|".join([f"(?:{plain})", *alts]) if alts else plain
 
 
 _GLOB_SPECIAL = "\\*?[]{}!"
@@ -285,8 +322,8 @@ def _run(cmd: list[str], budget: Budget | None, unreadable: list, cwd: str | Non
 def discover(terms: list[str], roots, *, derived: bool, budget: Budget | None = None,
              first_only: bool = False, exclude_exts=(), prefixes: list[str] | None = None) -> dict[str, dict[int, int]]:
     """`roots`（フォルダの列）を rg で走査し、`terms` のどれかを含む行があるファイルを `{パス: {語の添字: 最初の行番号}}` で返す。
-    `derived=True` は派生 MD の木（`.md`／`.markdown` だけ・UTF-8 のみ）。それ以外は原本の木で、非 ASCII の語は UTF-8 と CP932 のバイト列のどちらかを 1 回の走査で探す（`_term_pattern`）。
-    `\ufffd` を含む語があるときだけ、今までどおり CP932 で解読する 2 回目を走らせる。
+    `derived=True` は派生 MD の木（`.md`／`.markdown` だけ・UTF-8 のみ）。それ以外は原本の木で、非 ASCII の語は UTF-8・CP932・EUC-JP のバイト列のどれかを 1 回の走査で探す（`_term_pattern`）。
+    `\ufffd` を含む語があるときだけ、今までどおり CP932・EUC-JP で解読する 2・3 回目を走らせる。
     `first_only=True` は 1 語専用で、ファイルごとに最初の 1 行で止める（語の添字は 0）。複数語は行の本文から語ごとの当たりを判定し、判定できない行はすべての語に当たったものとして残す（候補は漏らさない）。
     `exclude_exts`（`.pdf` のような拡張子の列）に一致するファイルは歩かない。呼び出し元が、同じ綴りのフォルダが木に無いことを確かめてから渡す（フォルダにも当たり中身ごと消えるため）。
     `prefixes`（`scope_prefixes` の結果）があれば、根はそのまま起点にし、範囲に当たるファイルだけを含める条件（`-g`）で絞る。起点のパスを範囲の中へ明示して渡さないので、根の中の symlink は辿らない。空の列は何も歩かない。
@@ -299,10 +336,10 @@ def discover(terms: list[str], roots, *, derived: bool, budget: Budget | None = 
         return {}
     starts = _starts(roots, prefixes is not None)
     lowered = [t.lower() for t in terms]
-    cp932 = not derived and any(not t.isascii() for t in terms)
-    passes: list[tuple[bool, list[str]]] = [(not cp932, [])]  # (検索語を字面で渡すか, 足す引数)
-    if cp932 and any("\ufffd" in t for t in terms):
-        passes = [(True, []), (True, ["-E", "sjis"])]
+    legacy = not derived and any(not t.isascii() for t in terms)
+    passes: list[tuple[bool, list[str]]] = [(not legacy, [])]  # (検索語を字面で渡すか, 足す引数)
+    if legacy and any("\ufffd" in t for t in terms):
+        passes = [(True, []), *((True, ["-E", enc]) for enc in LEGACY_ENCODINGS)]
     out: dict[str, dict[int, int]] = {}
     for (fixed, extra), (cwd, begin) in itertools.product(passes, starts):
         cmd = _base_cmd(rg, whitelist=_whitelist(derived, prefixes), exclude_exts=exclude_exts, fixed=fixed) + extra
@@ -327,7 +364,7 @@ def discover(terms: list[str], roots, *, derived: bool, budget: Budget | None = 
             raw = text.encode("utf-8") if text is not None and not fixed else None
             hit = [i for i, tl in enumerate(lowered) if text_l is not None and (
                 tl in text_l or (raw is not None and not terms[i].isascii()
-                                 and (rx := _cp932_bytes_re(terms[i])) is not None and rx.search(raw)))]
+                                 and any(rx.search(raw) for rx in _legacy_bytes_res(terms[i]))))]
             for i in (hit or range(len(terms))):
                 slot.setdefault(i, line_no)
         for path in unreadable:  # 読めなかったファイルも候補に残す（開いて読めないことを純 Python 走査と同じ形で申告するため）

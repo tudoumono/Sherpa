@@ -33,7 +33,7 @@ WORLD_EDGE_TYPES = EDGE_TYPES | {"CORRESPONDS_TO"}
 
 # 影響たどりで辿るのは構造（コード依存）のエッジだけ。対応エッジ `CORRESPONDS_TO` と添付 `DOCUMENTS`（言及エッジ含む）は辿らない。
 # データの流れ `FLOWS_TO` は構造の影響に混ぜず、`world_impact` の第 2 段（`flow_depth`）で候補として別に辿る
-_IMPACT_REL = "COPIES|CONTAINS|INVOKES|ACCESSES"
+_IMPACT_REL = "COPIES|CONTAINS|INVOKES|ACCESSES|BUILT_FROM"
 _FLOW_REL = "FLOWS_TO"
 
 # 流れの候補を辿る段数の既定（道具・画面とも既定で出す）
@@ -64,14 +64,20 @@ def _compute_graph_schema_era() -> str:
     原本の変更で動く `ingest.worker._sig`（last_sig）とは別物で、保存済みグラフを読んでよい前提が崩れたときだけ動く。
     材料モジュールは循環 import を避けるため関数内で import し、呼び出しは module import 時の1回だけ。
     """
+    return _era_of(NODE_LABELS, EDGE_TYPES)
+
+
+def _era_of(labels, edge_types) -> str:
     from .analyzers.registry import CODE_ANALYZERS_SCHEMA_VERSION, config_signature
     from .world_graph import MENTION_SCHEMA_VERSION
     material = repr((CODE_ANALYZERS_SCHEMA_VERSION, config_signature(), MENTION_SCHEMA_VERSION,
-                     GRAPH_STORAGE_VERSION, tuple(sorted(NODE_LABELS)), tuple(sorted(EDGE_TYPES))))
+                     GRAPH_STORAGE_VERSION, tuple(sorted(labels)), tuple(sorted(edge_types))))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
 
 
 GRAPH_SCHEMA_ERA = _compute_graph_schema_era()
+# 実行名の語彙（`Executable`・`BUILT_FROM`）を足す前の世代。線が無いだけでそのまま読めるので読み取りの入口だけが許す。作り直しの判定（`check_graph_counts`）には使わない
+_READABLE_PRIOR_ERA = _era_of(NODE_LABELS - {"Executable"}, EDGE_TYPES - {"BUILT_FROM"})
 
 # 検索スコープ（フォルダ prefix）述語。`$prefixes` が空なら全体。ノードは全て `path` を持つので `path` の prefix 一致だけで判定する
 def _scope_pred(var: str) -> str:
@@ -211,7 +217,7 @@ def check_schema_era(session, world: str, *, lens: str | None = None) -> None:
     """資料フォルダの保存済みスキーマ世代を確認する（不一致なら `GraphSchemaEraError`）。
 
     実データ（`world_id` を持つ `:Entity`）のない資料フォルダは対象外。実データがあり、保存世代
-    （`:SherpaMeta{world_id}.schema_era`・未保存を含む）が現行 `GRAPH_SCHEMA_ERA` と違うときだけ raise する。
+    （`:SherpaMeta{world_id}.schema_era`・未保存を含む）が現行 `GRAPH_SCHEMA_ERA` と違うときだけ raise する（語彙を足す前の世代 `_READABLE_PRIOR_ERA` は読める）。
     グラフ読み取りの入口（`world_impact`/`resolve_world_entity`/`lens_service.neo4j_related`）が
     主クエリの後に1回ずつ呼ぶ。存在確認は `LIMIT 1` で打ち切る。
     世代プローブが `Neo4jError` で失敗したときは警告ログを残して re-raise する（黙って戻ると旧世代の検知が無効になる）。
@@ -232,7 +238,7 @@ def check_schema_era(session, world: str, *, lens: str | None = None) -> None:
     if not row or not row.get("c"):
         return
     era = row.get("era")
-    if era != GRAPH_SCHEMA_ERA:
+    if era != GRAPH_SCHEMA_ERA and era != _READABLE_PRIOR_ERA:
         raise GraphSchemaEraError(world, era, lens=lens)
 
 
@@ -424,7 +430,7 @@ def _write_world(session, apply):
                 raise
 
 
-def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None, unparsed_sources=None):
+def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None, unparsed_sources=None, build_report=None):
     """資料フォルダのグラフ（dict）を Neo4j へクリーン rebuild する（削除→全ロードを1つの write tx で行う）。
 
     ① schema コマンドはデータ tx と混ぜられないので先に流す。
@@ -437,6 +443,7 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
     メタの `unresolved_stored` を立てる（`read_unresolved` が「申告の保存が無い」と「0 件」を区別する）。
     FW プラグインの失敗（`world_graph.plugin_failures_from_flags`）はメタの `plugin_failures`（JSON 文字列・失敗なしは `[]`）に同じ tx で保存する（`read_plugin_failures`）。
     グラフに入れなかったソースのファイル数（`world_graph.unparsed_sources_from_flags`）はメタの `unparsed_sources`（JSON 文字列）に同じ tx で保存する（`read_unparsed_sources`）。
+    ビルドの定義の読み取りの報告（`world_graph.pop_build_report`）はメタの `build_report`（JSON 文字列）に、当てはめた印の値は `build_marks_sig` に同じ tx で保存する。
     """
     from neo4j import GraphDatabase  # 遅延 import（解析だけなら不要）
 
@@ -509,7 +516,10 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
                 tx.run(
                     "MERGE (m:SherpaMeta {world_id:$w}) "
                     "SET m.schema_era=$era, m.node_count=$nc, m.edge_count=$ec, m.unresolved_stored=true, "
-                    "m.plugin_failures=$pf, m.unparsed_sources=$us, m.generation=$gen",
+                    "m.plugin_failures=$pf, m.unparsed_sources=$us, m.generation=$gen, "
+                    "m.build_report=$br, m.build_marks_sig=$bms",
+                    br=json.dumps(dict(build_report or {}), ensure_ascii=False),
+                    bms=(build_report or {}).get("marks_sig") or "",
                     w=world_id, era=GRAPH_SCHEMA_ERA, nc=node_count, ec=edge_count, gen=uuid.uuid4().hex[:16],
                     pf=json.dumps(list(plugin_failures or []), ensure_ascii=False),
                     us=json.dumps(dict(unparsed_sources or {}), ensure_ascii=False))
@@ -522,13 +532,14 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
         step.end(failed=not loaded_ok)
 
 
-def check_graph_counts(world_id, uri, user, password) -> str | None:
+def check_graph_counts(world_id, uri, user, password, build_marks_sig: str = "") -> str | None:
     """保存済み `:SherpaMeta` の世代・件数スタンプを実際のグラフ内容と照合する（`load_world` が刻む値と対）。
 
     作り直しが要る理由コードを返す。整合していれば `None`。
     - `"no_stamp"`: `node_count`/`edge_count` が無い（`:SherpaMeta` 自体が無い場合を含む）
     - `"era_mismatch"`: 保存済み `schema_era` が現行 `GRAPH_SCHEMA_ERA` と不一致
     - `"count_mismatch"`: スタンプ済み件数と実物（`:Entity{world_id}` の数・その資料フォルダのノードから出る `r.world_id` 一致リレーションの数）が違う
+    - `"build_marks_changed"`: ビルドの定義を読む場所の印が、グラフを作ったときの印と違う（`build_marks_sig`）
     ドライバは自前で開閉し、接続/クエリ例外はそのまま呼び出し元へ伝播する。
     """
     from neo4j import GraphDatabase
@@ -537,7 +548,7 @@ def check_graph_counts(world_id, uri, user, password) -> str | None:
         with driver.session() as s:
             rows = s.run(
                 "MATCH (m:SherpaMeta {world_id:$w}) "
-                "RETURN m.schema_era AS era, m.node_count AS nc, m.edge_count AS ec",
+                "RETURN m.schema_era AS era, m.node_count AS nc, m.edge_count AS ec, m.build_marks_sig AS bms",
                 w=world_id,
             ).data()
             meta = rows[0] if rows else None
@@ -554,6 +565,8 @@ def check_graph_counts(world_id, uri, user, password) -> str | None:
             ).single()["c"]
             if actual_nc != meta["nc"] or actual_ec != meta["ec"]:
                 return "count_mismatch"
+            if (meta.get("bms") or "") != (build_marks_sig or ""):
+                return "build_marks_changed"
             return None
     finally:
         driver.close()
@@ -833,7 +846,7 @@ def _world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPA
                   include_deprecated=False, info: dict | None = None, detail: bool = False, flow_depth: int = 0):
     """範囲フィルタ付きで影響ノードを 1 段ずつ広げて引き、構造化 item を返す（`impact_service.neo4j_impact` の資料フォルダ版）。
 
-    start・affected・経路の全ノードが `world_id` と `scope_prefixes` 内。骨格エッジ（`_IMPACT_REL`＝COPIES/CONTAINS/INVOKES/ACCESSES）
+    start・affected・経路の全ノードが `world_id` と `scope_prefixes` 内。骨格エッジ（`_IMPACT_REL`＝COPIES/CONTAINS/INVOKES/ACCESSES/BUILT_FROM）
     だけを辿る決定的な構造たどりで、全件を同格に扱う。
     ① 起点を確かめる ② 段 k ごとに frontier から逆向きに 1 段だけ問い、初めて届いたノードに最初の辺（親）を記録する
     ③ `check_schema_era`（旧世代の実データがあれば `GraphSchemaEraError`） ④ 深さの先に未到達のノードが残るかを 1 回だけ問う。
@@ -991,6 +1004,22 @@ def read_plugin_failures(session, world_id) -> list:
     if not rows or not rows[0].get("pf"):
         return []
     return json.loads(rows[0]["pf"])
+
+
+def read_build_report(world_id) -> dict | None:
+    """グラフを作ったときのビルドの定義の読み取りの報告。何も読まなかったグラフは空、グラフが無い・保存が無いときは None。接続の失敗は例外のまま伝える。"""
+    from neo4j import GraphDatabase
+    env = _env()
+    driver = GraphDatabase.driver(env["uri"], auth=(env["user"], env["pw"]), connection_timeout=5)
+    try:
+        with driver.session() as s:
+            rows = s.run("MATCH (m:SherpaMeta {world_id:$w}) RETURN m.build_report AS br", w=world_id).data()
+    finally:
+        driver.close()
+    if not rows or rows[0].get("br") is None:
+        return None
+    info = json.loads(rows[0]["br"])
+    return info if isinstance(info, dict) else None
 
 
 def read_generation(session, world_id) -> str | None:

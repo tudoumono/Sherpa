@@ -24,13 +24,6 @@ function _syncWebSearchEligibility() {
   setWebSearchEligible(_webSearchAvailable && _constructId === 'codex_openai' && _openaiEndpointKind === 'openai');
 }
 
-// テーマ切替
-function applyThemeIcon() { $('themebtn').textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙'; }
-$('themebtn').addEventListener('click', () => {
-  const d = document.documentElement, next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-  d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
-});
-applyThemeIcon();
 
 // 頭脳バッジ＋設定
 function setBrainBadge(c) {
@@ -84,12 +77,8 @@ async function setConstruct(id) {
   if (!c) return;
   _constructId = id; _agent = c.agent;
   try {
-    const r = await fetch('/settings', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent: c.agent, codex_model_provider: c.codex_model_provider || null }),
-    });
-    if (!r.ok) throw new Error(r.status);
-  } catch (e) { toast('切替に失敗しました'); await loadConfig(); renderBrainMenu(); return; }  // 失敗時はサーバ状態へ戻す
+    await Sherpa.api('PUT', '/settings', { agent: c.agent, codex_model_provider: c.codex_model_provider || null });
+  } catch (e) { toast(e.message); await loadConfig(); renderBrainMenu(); return; }  // 失敗時はサーバ状態へ戻す
   await loadConfig(); toast('AIを切り替えました');
 }
 $('brainbadge').addEventListener('click', async (e) => {

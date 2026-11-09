@@ -2,7 +2,7 @@
 
 2 段で使う: `graph_resolve` で同名を含む候補（`canonical_id`・種別・所属パス・表示名・修飾名）を見て起点を選び、
 `graph_impact` へ `canonical_id` を渡す。名前の曖昧さは呼び出し側が解く（`graph_neighbors` の名前の完全一致とは別の経路）。
-`graph_impact` は構造の辺（COPIES・CONTAINS・INVOKES・ACCESSES）だけをたどり、言及（DOCUMENTS）は影響に数えず
+`graph_impact` は構造の辺（COPIES・CONTAINS・INVOKES・ACCESSES・BUILT_FROM）だけをたどり、言及（DOCUMENTS）は影響に数えず
 関連文書として別に返す（層が both のときだけ）。データの流れ（FLOWS_TO・ファイル受け渡しなど）で届く先は影響に混ぜず `flow_candidates` に別に返す。層がソースに限定されている間も使える（コード同士の閉じた辺だけ・資料は一切返さない）。
 未探索（時間切れ・件数の天井・深さ・返却件数）は `coverage`（`graph_coverage.py` の欄）で申告する。
 契約: docs/design/interfaces.md「graph_resolve・graph_impact」・docs/proposals/2026-10-04-アナライザとグラフの改善.md S6・docs/proposals/2026-10-16-データフロー層.md §4。

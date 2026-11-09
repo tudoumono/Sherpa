@@ -237,3 +237,50 @@ def test_unreachable_world_dir_gives_unchecked(world, monkeypatch):
     monkeypatch.setattr(worlds, "world_dir", lambda w: None)
     res = _list(world, {"path_prefix": "gen1"})[0]
     assert res["after_ingest_unchecked"] is True
+
+
+def test_file_placed_after_ingest_is_found_by_name_without_folder(world):
+    _put(world, "gen1/design/placed_later.md")
+    by_name = _list(world, {"name_pattern": "placed_later"})[0]
+    assert [d["rel_path"] for d in by_name["after_ingest"]] == ["gen1/design/placed_later.md"]
+    by_glob = tool_dispatch.run_tool("glob_search", {"pattern": "**/placed_later*"}, world, None, layer=None)[0]
+    assert [d["rel_path"] for d in by_glob["after_ingest"]] == ["gen1/design/placed_later.md"]
+    assert "には入っていません" in by_glob["after_ingest_notice"]
+
+
+def test_name_search_after_ingest_stays_inside_the_scope(world):
+    _put(world, "gen2/design/placed_later.md")
+    res = tool_dispatch.run_tool("glob_search", {"pattern": "**/placed_later*"}, world, ["gen1"], layer=None)[0]
+    assert "after_ingest" not in res
+
+
+def _count_scandir(monkeypatch):
+    import os
+    calls = {"n": 0}
+    real = os.scandir
+
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+    monkeypatch.setattr(os, "scandir", counting)
+    return calls
+
+
+def test_name_search_with_a_ledger_hit_does_not_walk(world, monkeypatch):
+    calls = _count_scandir(monkeypatch)
+    res = tool_dispatch.run_tool("glob_search", {"pattern": "**/PROG1*"}, world, None, layer=None)[0]
+    assert res["count"] == 1 and "after_ingest" not in res
+    assert calls["n"] == 0
+
+
+def test_tool_process_walks_only_once_per_request_on_misses(world, monkeypatch):
+    from sherpa.parts.read import tools as read_tools
+    monkeypatch.setenv("SHERPA_MCP_WORLD", world)
+    monkeypatch.setattr(read_tools, "_after_ingest_walks", {})
+    _put(world, "gen1/design/placed_later.md")
+    first = tool_dispatch.run_tool("glob_search", {"pattern": "**/placed_later*"}, world, None, layer=None)[0]
+    assert [d["rel_path"] for d in first["after_ingest"]] == ["gen1/design/placed_later.md"]
+    calls = _count_scandir(monkeypatch)
+    again = _list(world, {"name_pattern": "placed_later"})[0]
+    assert [d["rel_path"] for d in again["after_ingest"]] == ["gen1/design/placed_later.md"]
+    assert calls["n"] == 0

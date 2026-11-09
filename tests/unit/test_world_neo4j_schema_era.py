@@ -119,6 +119,12 @@ def test_check_schema_era_no_op_when_era_matches():
     wn.check_schema_era(s, "w1")   # raise しない
 
 
+def test_check_schema_era_reads_graph_from_before_the_executable_vocabulary(monkeypatch):
+    prior = wn._era_of(wn.NODE_LABELS - {"Executable"}, wn.EDGE_TYPES - {"BUILT_FROM"})
+    assert prior != wn.GRAPH_SCHEMA_ERA
+    wn.check_schema_era(_FakeSession(rows=[{"c": 3, "era": prior}]), "w1", lens="impact")   # 止めない
+
+
 def test_check_schema_era_raises_when_era_mismatches():
     s = _FakeSession(rows=[{"c": 3, "era": "old-era-stamp"}])
     try:

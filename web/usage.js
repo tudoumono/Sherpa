@@ -161,12 +161,24 @@ function toast(msg) {
 }
 
 // ===== admin ガード =====
+let _adminErr = '';
+// 戻り値は 'admin'／'denied'（401・403・管理者でない）／'unreachable'（判定できなかった。理由は _adminErr）。
 async function checkAdmin() {
   try {
     const u = await getJSON('/auth/me');
-    if (u && u.role === 'admin') return true;
-  } catch (_) { /* compat */ }
-  return false;
+    return u && u.role === 'admin' ? 'admin' : 'denied';
+  } catch (e) {
+    if (e && (e.status === 401 || e.status === 403)) return 'denied';
+    _adminErr = (e && e.message) || '';
+    return 'unreachable';
+  }
+}
+
+function showUnreachable(denied) {
+  const d = denied && denied.querySelectorAll('div');
+  if (!d || d.length < 3) return;
+  d[1].textContent = '権限を確認できませんでした: ' + _adminErr;
+  d[2].textContent = '時間をおいて画面を開き直してください。';
 }
 
 function fmtDate(iso) {
@@ -809,7 +821,7 @@ function renderTokenKindTable(rows) {
     const name = `${esc(providerLabel(r.provider))}`
       + (r.model ? ` <span class="user-uid">${esc(r.model)}</span>` : '');
     return `<tr>
-      <td>${esc(kindLabel(r.kind))}</td>
+      <td class="nw">${esc(kindLabel(r.kind))}</td>
       <td>${name}</td>
       <td class="num">${(r.calls || 0).toLocaleString('ja-JP')}</td>
       <td class="num">${fmtTokOrDash(r.input)}</td>
@@ -837,7 +849,7 @@ function renderTokenUserKindTable(rows) {
   if (card) card.hidden = false;
   tb.innerHTML = rows.map((r) => `<tr>
     <td><div class="user-name">${esc(r.display_name || r.uid)}</div><div class="user-uid">${esc(r.uid)}</div></td>
-    <td>${esc(kindLabel(r.kind))}</td>
+    <td class="nw">${esc(kindLabel(r.kind))}</td>
     <td class="num">${(r.calls || 0).toLocaleString('ja-JP')}</td>
     <td class="num">${fmtTokOrDash(r.input)}</td>
     <td class="num">${fmtTokOrDash(r.cached_input)}</td>
@@ -1159,29 +1171,15 @@ $('usage-tbody').addEventListener('click', (e) => {
   row.classList.toggle('u-open');
 });
 
-// テーマ切替
-function applyThemeIcon() {
-  const tb = $('themebtn');
-  if (tb) tb.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙';
-}
-const themebtn = $('themebtn');
-if (themebtn) {
-  themebtn.addEventListener('click', () => {
-    const d = document.documentElement;
-    const next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-    d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
-  });
-}
-applyThemeIcon();
-
 // ===== 初期化 =====
 (async () => {
   const isAdmin = await checkAdmin();
-  if (!isAdmin) {
+  if (isAdmin !== 'admin') {
     const main = $('main-content');
     const denied = $('access-denied');
     if (main) main.style.display = 'none';
     if (denied) denied.style.display = 'block';
+    if (isAdmin === 'unreachable') showUnreachable(denied);
     return;
   }
   _adminReady = true;

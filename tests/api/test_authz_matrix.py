@@ -151,6 +151,8 @@ POLICY: dict[tuple[str, str], str] = {
     ("GET", "/admin/path-rules"): "admin",
     ("PUT", "/admin/path-rules"): "admin",
     ("GET", "/admin/path-rules/files"): "admin",
+    ("GET", "/admin/build-marks"): "admin",
+    ("PUT", "/admin/build-marks"): "admin",
     ("GET", "/worlds/{wid}/resolve-settings"): "admin",
     ("PUT", "/worlds/{wid}/resolve-settings"): "admin",
     ("DELETE", "/worlds/{wid}"): "admin",
@@ -365,7 +367,7 @@ def test_policy_covers_all_routes():
     # admin=管理画面の「つながりの確認」（POST /admin/connectivity/check）1件追加で46。
     # admin=資料の優先と除外（GET/PUT /admin/path-rules・GET /admin/path-rules/files）3件追加で49。
     # admin=フォルダの置き方の点検（GET /worlds/{wid}/folder-check）1件追加で50。
-    assert len(ADMIN_ROUTES) == 50
+    assert len(ADMIN_ROUTES) == 52
     # ext_key=旧6＋Codex ジョブ API 4本（受付・状態・結果・取消・`C-EXT-CODEXJOB-*`）で10。
     assert len(EXT_KEY_ROUTES) == 10
     assert len(SPECIAL_ROUTES) == 7

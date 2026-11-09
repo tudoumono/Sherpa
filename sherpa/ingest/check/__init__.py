@@ -10,6 +10,7 @@ from sherpa.ingest.periods import Periods, read_periods
 
 from .model import BAD, GOOD, RESULTS, RULES, WARN, Item, Report
 from .records import records
+from .rules_build import rule5
 from .report import json_text, summarize, to_json, to_markdown, write_json, write_markdown
 from .rules_near import near_and_outside
 from .rules_periods import rule3, rule4
@@ -19,8 +20,10 @@ __all__ = ["BAD", "GOOD", "Item", "RESULTS", "RULES", "Report", "WARN", "inspect
            "to_json", "to_markdown", "write_json", "write_markdown"]
 
 
-def inspect_folder(rels: Iterable[str], read_text: Callable[[str], "str | None"], periods: Periods | None = None) -> Report:
-    """決まり 1〜4 と今ある記録の報告を組む。periods（期の読み取りの結果）を渡せば rels・read_text からは読み直さない。"""
+def inspect_folder(rels: Iterable[str], read_text: Callable[[str], "str | None"], periods: Periods | None = None,
+                   build: dict | None = None) -> Report:
+    """決まり 1〜5 と今ある記録の報告を組む。periods（期の読み取りの結果）を渡せば rels・read_text からは読み直さない。
+    build（`{"report", "marks_sig"}`）を渡したときだけ決まり 5 を入れる。"""
     periods = periods or read_periods(rels, read_text)
     rep = Report()
     rule1(rep, periods)
@@ -28,5 +31,7 @@ def inspect_folder(rels: Iterable[str], read_text: Callable[[str], "str | None"]
     near_and_outside(rep, periods)
     rule3(rep, periods)
     rule4(rep, periods)
+    if build is not None:
+        rule5(rep, build.get("report"), build.get("marks_sig") or "")
     records(rep, periods)
     return rep

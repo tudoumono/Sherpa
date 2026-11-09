@@ -137,6 +137,8 @@ def summarize_result(name: str, args, result, is_error: bool, detail: dict, scor
         if len(names) == 1:
             s, e = res.get("start_line"), res.get("end_line")
             rng = f"{s}-{e}" if _is_int(s) and _is_int(e) else detail.get("range")
+            if rng and _is_int(res.get("next_char")):
+                rng += "（行の途中まで）"
         for n in names:
             row = {"doc": clip(n)}
             if rng:

@@ -1,4 +1,5 @@
 AnnouncementOrderError
+CHILD_SNAPSHOT_ENV
 ClientOpIdConflictError
 ForkNotAllowedError
 MESSAGE_FEEDBACK_COMMENT_MAX_LEN

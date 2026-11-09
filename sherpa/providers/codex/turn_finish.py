@@ -621,8 +621,6 @@ def assemble_result(self, ctx, st, decision, env):
         # `_gather` が組み立てた決定的回答をそのまま返さず、利用者に「AI が答えていない」ことが伝わるよう `_UnwiredProvider` と同じ文体の正直な文言に上書きする。summary/sources は `_gather` の実結果のまま残すが、sources が空なら data も `{}` へ揃える（`chat_service._no_genuine_results` の honest failure 規約と一致させる）。
         # 無出力失敗はプロキシ/CA 証明書の不備・sandbox の起動失敗・CLI のクラッシュでも起きるため、認証だけに断定せず、観測事実（応答を返す前に終了）を述べて考えられる原因を複数挙げる。returncode は利用者向け本文には出さずログにだけ残す。stderr は破棄している。
         # `turn.failed`／`error` で閉じた attempt（agent_message 無し）は「回答を返せずに終了しました」とし、既存の無出力失敗と文言を分ける（スキーマ違反なども原因になり得るため）。
-        _reason = ("回答を返せずに終了しました" if st._turn_failed
-                  else "応答を返す前に終了しました")
         if st._turn_failed_code:
             # 閉集合ではない生の診断コード（統計・分類には使わない・管理者向け補助情報）。
             env["codex_error_code"] = st._turn_failed_code
@@ -633,9 +631,16 @@ def assemble_result(self, ctx, st, decision, env):
                 "範囲（フォルダ）を絞るか、質問を分けてやり直してください。"
             )
             env["limits"] = {**(env.get("limits") or {}), "total_budget_hit": True}
+        elif st._turn_failed:
+            _code = f"（コード: {st._turn_failed_code}）" if st._turn_failed_code else ""
+            env["headline"] = (
+                f"Codex が回答を返せずに終了しました{_code}。"
+                "利用上限やモデルの指定など、Codex 側の設定を管理者に確認してもらってください。"
+                "詳細は管理者向けの Codex ログ（codex.log）を参照してください。"
+            )
         else:
             env["headline"] = (
-                f"Codex に接続できませんでした（Codex CLI が{_reason}）。考えられる原因はいくつかあります: "
+                "Codex に接続できませんでした（Codex CLI が応答を返す前に終了しました）。考えられる原因はいくつかあります: "
                 "認証が設定されていない（`codex login`）／プロキシや CA 証明書などのネットワーク設定が"
                 "不足している／サンドボックスの起動に失敗した／Codex CLI 自体が異常終了した、のいずれかです。"
                 "管理者にログの確認を依頼してください。詳細は管理者向けの Codex ログ（codex.log）を参照してください。"

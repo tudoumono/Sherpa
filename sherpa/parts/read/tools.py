@@ -856,6 +856,23 @@ def _shrink_xlsx_range_field(orig_range: str | None, n_rows: int, n_cols: int | 
     except Exception:
         return orig_range
 
+def _xlsx_refresh_next(r: dict, orig: dict) -> dict:
+    """行・列を削った `r` の `range` に合わせて `next_range`／`next_cols_range` を付け直す（要求した広がりは元の結果の `range` と `next_*` から戻す）。"""
+    from openpyxl.utils.cell import range_boundaries
+    from ... import doc_readers
+    try:
+        c0, r0, c1, r1 = range_boundaries(r["range"])
+        _oc0, _or0, req_c, req_r = range_boundaries(orig["range"])
+        for key in ("next_range", "next_cols_range"):
+            if orig.get(key):
+                _a, _b, nc, nr = range_boundaries(orig[key])
+                req_c, req_r = max(req_c, nc), max(req_r, nr)
+    except Exception:
+        return r
+    out = {k: v for k, v in r.items() if k not in ("next_range", "next_cols_range")}
+    out.update(doc_readers.xlsx_next_ranges(c0, r0, c1, r1, req_c, req_r))
+    return out
+
 _A1_REF_RE = re.compile(r"^([A-Z]+)(\d+)")
 
 def _xlsx_trim_extras(r: dict, last_row: int, last_col: int | None = None) -> dict:
@@ -1051,8 +1068,17 @@ def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int)
 
 _XLSX_ROW_TOO_LARGE_ERROR = ("1 行（または 1 セル）が大きすぎて返せません。max_cols を小さくするか、"
                               "列を絞った range（例 'B2:C2'）で読んでください")
-_XLSX_ROW_COLS_CLIPPED_NOTE = "1 行が大きいため先頭の列だけ返した。残りの列は range（列を絞った範囲）を指定して続きを取る"
+_XLSX_ROW_COLS_CLIPPED_NOTE = "1 行が大きいため先頭の列だけ返した。右の列は next_cols_range、下の行は next_range を range に渡して続きを取る"
 _READER_ZERO_ITEM_NOTE = "1 件が大きすぎて予算内に入らず 0 件で返した。範囲を絞って呼び直す"
+
+
+def _range_right_col(a1_range: str | None, fallback: int) -> int:
+    """A1 レンジの右端の絶対列番号。解析できなければ `fallback`。"""
+    from openpyxl.utils.cell import range_boundaries
+    try:
+        return range_boundaries(a1_range)[2]
+    except Exception:
+        return fallback
 
 
 def _xlsx_first_row_columns(result: dict, doc_id: str, first_row: list, tr_max_bytes: int) -> dict | None:
@@ -1061,7 +1087,12 @@ def _xlsx_first_row_columns(result: dict, doc_id: str, first_row: list, tr_max_b
         r = dict(result)
         r["rows"] = [first_row[:n_cols]]
         r["range"] = _shrink_xlsx_range_field(result.get("range"), 1, n_cols)
-        r = _xlsx_trim_extras(r, _row_start_from_a1_range(r["range"] or "") or 1, n_cols)
+        r = _xlsx_trim_extras(r, _row_start_from_a1_range(r["range"] or "") or 1, _range_right_col(r["range"], n_cols))
+        r = _xlsx_refresh_next(r, result)
+        r["truncated"] = True
+        r["byte_clipped"] = True
+        r["cols_clipped"] = True
+        r["note"] = _XLSX_ROW_COLS_CLIPPED_NOTE
         return _attach_doc_locator("xlsx_range", r, doc_id)
 
     lo, hi, best = 1, len(first_row), 0
@@ -1074,12 +1105,7 @@ def _xlsx_first_row_columns(result: dict, doc_id: str, first_row: list, tr_max_b
             hi = mid - 1
     if best <= 0:
         return None
-    out = _build(best)
-    out["truncated"] = True
-    out["byte_clipped"] = True
-    out["cols_clipped"] = True
-    out["note"] = _XLSX_ROW_COLS_CLIPPED_NOTE
-    return out
+    return _build(best)
 
 
 def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: int) -> dict:
@@ -1102,6 +1128,7 @@ def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: in
                 r["range"] = _shrink_xlsx_range_field(result.get("range"), len(seq))
                 if len(seq) < len(result.get(field) or []) and len(seq) > 0:
                     r = _xlsx_trim_extras(r, (_row_start_from_a1_range(r["range"] or "") or 1) + len(seq) - 1)
+                    r = _xlsx_refresh_next(r, result)
         # 合成元は `_redact_deep` を通過済みなので、合成後に伏せ字を掛け直さない
         return _attach_doc_locator(name, r, doc_id)
 
@@ -1207,15 +1234,57 @@ _AFTER_INGEST_UNCHECKED_NOTICE = ("取り込みの後に置かれた資料は、
                                   "フォルダを絞ると確かめられます。")
 
 
+_after_ingest_walks: dict = {}  # 道具の子プロセスだけが使う（子は 1 回の依頼で終わる）
+
+
+def _walk_after_ingest(world: str, targets: list, deadline: float) -> set | None:
+    """`targets` の部分木の実ファイルを歩く。期限切れ・読めない部分があれば None。"""
+    from ... import documents
+
+    skipped: dict = {}
+    try:
+        rels = documents.scope_rel_set(world, targets, deadline=deadline, skipped=skipped)
+    except scope_infer.ScopeWalkDeadlineExceeded:
+        return None
+    return None if documents.walk_incomplete(skipped) else rels
+
+
+def _walk_after_ingest_once(world: str, targets: list, deadline: float) -> set | None:
+    """名前の検索で台帳に無かったときの走査。道具の子プロセスの中では 1 回の依頼で 1 度だけ歩く。"""
+    if not os.environ.get("SHERPA_MCP_WORLD"):
+        return _walk_after_ingest(world, targets, deadline)
+    key = (world, tuple(sorted(targets)))
+    if key not in _after_ingest_walks:
+        _after_ingest_walks[key] = _walk_after_ingest(world, targets, deadline)
+    return _after_ingest_walks[key]
+
+
+def _attach_after_ingest(result: dict, docs: set, extra: list | None, n: int) -> None:
+    """台帳に無い実ファイルの一覧を道具の結果へ添える。確かめきれなかったときはその旨を添える。"""
+    if extra is None:
+        result["after_ingest_unchecked"] = True
+        result["after_ingest_notice"] = _AFTER_INGEST_UNCHECKED_NOTICE
+    elif extra:
+        shown_extra = extra[:_AFTER_INGEST_MAX]
+        result["after_ingest"] = shown_extra
+        if n > len(shown_extra):
+            result["after_ingest_truncated"] = True
+            result["after_ingest_count"] = n
+        result["after_ingest_notice"] = _AFTER_INGEST_NOTICE
+        docs.update(d["rel_path"] for d in shown_extra)
+
+
 def _after_ingest(world: str, prefix: str, sp, layer, listed: set, pattern: str, doctype_filter: str,
-                  deadline: float | None, rules=None) -> tuple[list | None, int]:
+                  deadline: float | None, rules=None, glob_pattern: str | None = None) -> tuple[list | None, int]:
     """台帳に無い実ファイルを `prefix` の部分木から歩いて `(全件を名前の昇順に並べた一覧, 件数)` で返す。期限切れ・読めない部分があったときは `(None, 0)`。
     守ること: 秘匿名・重要度の設定ファイル・版管理のフォルダは出さない（歩き方は `documents.scope_rel_set` と同じ）。中身は読まない。
     設計: docs/design/codex.md「MCP の道具」
     """
     from ... import corpus_docs, documents
 
-    if sp:
+    if not prefix:
+        targets = list(sp or [])
+    elif sp:
         targets = []
         for s in sp:
             if s == prefix or s.startswith(prefix + "/"):
@@ -1229,12 +1298,9 @@ def _after_ingest(world: str, prefix: str, sp, layer, listed: set, pattern: str,
         targets = [prefix]
     limit = time.monotonic() + _AFTER_INGEST_WALK_SECONDS
     walk_deadline = limit if deadline is None else min(deadline, limit)
-    skipped: dict = {}
-    try:
-        rels = documents.scope_rel_set(world, targets, deadline=walk_deadline, skipped=skipped)
-    except scope_infer.ScopeWalkDeadlineExceeded:
-        return None, 0
-    if documents.walk_incomplete(skipped):
+    rels = (_walk_after_ingest(world, targets, walk_deadline) if prefix
+            else _walk_after_ingest_once(world, targets, walk_deadline))
+    if rels is None:
         return None, 0
     out = []
     for rel in sorted(rels):
@@ -1247,6 +1313,8 @@ def _after_ingest(world: str, prefix: str, sp, layer, listed: set, pattern: str,
         cls = corpus_docs.classify_by_name(rel)
         doctype = cls[0] if cls else None
         if pattern and pattern not in rel.lower():
+            continue
+        if glob_pattern and not importance._match_segment_glob(glob_pattern, rel.lower()):
             continue
         if doctype_filter and str(doctype or "").lower() != doctype_filter:
             continue
@@ -1350,21 +1418,11 @@ def _run_tool_inner(name: str, args: dict, world: str, scope_paths,
             result["kind_unknown"] = shown_unknown
             result["kind_unknown_dropped"] = unknown_total - shown_unknown  # doctype／state の絞り込みで落とした分
             result["kind_unknown_notice"] = doc_ledger.kind_unknown_notice(unknown_total)
-        # 取り込みの後に置かれた資料（path_prefix があるときだけ歩く。state は台帳の状態なので指定時は対象外）
-        if prefix and not state_filter:
+        # 取り込みの後に置かれた資料（フォルダで絞ったとき・名前で台帳に無かったときだけ歩く。state は台帳の状態なので指定時は対象外）
+        if (prefix or (pattern and listing.ledger_at and not rows)) and not state_filter:
             listed = {r["name"] for r in listing.rows}
             extra, n = _after_ingest(world, prefix, sp, layer, listed, pattern, doctype_filter, deadline, rules)
-            if extra is None:
-                result["after_ingest_unchecked"] = True
-                result["after_ingest_notice"] = _AFTER_INGEST_UNCHECKED_NOTICE
-            elif extra:
-                shown_extra = extra[:_AFTER_INGEST_MAX]
-                result["after_ingest"] = shown_extra
-                if n > len(shown_extra):
-                    result["after_ingest_truncated"] = True
-                    result["after_ingest_count"] = n
-                result["after_ingest_notice"] = _AFTER_INGEST_NOTICE
-                docs.update(d["rel_path"] for d in shown_extra)
+            _attach_after_ingest(result, docs, extra, n)
         return (result, docs, cites, cards)
     if name == "folder_tree":
         # フォルダは文書ではない（`docs`＝doc_id 集合には何も足さない・出典／引用の対象外）
@@ -1411,6 +1469,11 @@ def _run_tool_inner(name: str, args: dict, world: str, scope_paths,
                   "next_offset": shown_end if truncated else None, "generation": generation}
         if listing.ledger_at:
             result["ledger_at"] = listing.ledger_at
+            if not matched_rows and offset == 0:  # 名前で台帳に無かったときだけ歩く
+                listed = {r["name"] for r in listing.rows}
+                extra, n = _after_ingest(world, "", sp, layer, listed, "", "", deadline, rules,
+                                         glob_pattern=match_pattern)
+                _attach_after_ingest(result, docs, extra, n)
         else:
             result["notice"] = _GLOB_WALK_NOTICE
         if unknown_matched:
@@ -1821,26 +1884,61 @@ def _run_tool_inner(name: str, args: dict, world: str, scope_paths,
             f.close()
         red_lines = redact_keys.redact_window_lines([t for _, t in collected], _redact_plain, key_tracker.in_key_block)
         text = "\n".join(f"{i}: {r}" for (i, _), r in zip(collected, red_lines))
-        # 返却テキストを UTF-8 バイト上限で切り詰め、実際に短くなった時だけ `text_truncated` を明示する（read_doc／doc_outline と同じ語彙）
-        read_around_truncated = len(text.encode("utf-8")) > tr_max_bytes
-        text = _clip_utf8_bytes(text, tr_max_bytes)
+        full_text = text
+        full_lines = full_text.split("\n")
         docs.add(doc_id)
-        # `encoding_caution` は `text` より前に置く（後ろだと大きな本文の陰で切り落とされる）
-        result: dict = {"doc_id": doc_id}
-        if encoding_caution:  # 対象外にしないが符号化の読み取りが不確実な資料の印
-            result["encoding_caution"] = encoding_caution
-        result["text"] = text
-        if read_around_truncated:
-            result["text_truncated"] = True
-        if reader.truncated or reader.line_overflowed:
-            result["file_truncated"] = True  # 読み取りの上限（ファイル 64MiB・単一行 2MiB）で一部を読めていない
-            if reader.line_overflowed:
-                result["line_overflowed"] = True
-        if window_requested > window:
-            result["window_clamped"] = {"requested": window_requested, "used": window}
-        if reached_eof and not reader.truncated and line > total_seen:
-            result["line_beyond_eof"] = True  # 指定した行はファイルの末尾より後ろ
-            result["total_lines"] = total_seen
+
+        def _around_result(limit: int | None) -> dict:
+            """本文を UTF-8 で `limit` バイトまでに切った結果。切れたら次に渡す位置（next_line／next_char）も付ける。"""
+            around_next: dict = {}
+            body = full_text if limit is None else _clip_utf8_bytes(full_text, limit)
+            clipped = limit is not None
+            if clipped:
+                # 返した範囲の次（read_doc の start_line／start_char に渡す位置）。行の途中で切れたらその行の続き
+                kept = body.split("\n")
+                if kept[-1] == "":
+                    kept.pop()
+                if kept and kept[-1] == full_lines[len(kept) - 1]:
+                    if len(kept) < len(collected):
+                        around_next = {"next_line": collected[len(kept)][0]}
+                elif kept:
+                    no = collected[len(kept) - 1][0]
+                    done = len(kept[-1]) - len(f"{no}: ")
+                    around_next = {"next_line": no, **({"next_char": done} if done > 0 else {})}
+                else:
+                    around_next = {"next_line": collected[0][0]}
+            # `encoding_caution` は `text` より前に置く（後ろだと大きな本文の陰で切り落とされる）
+            result: dict = {"doc_id": doc_id}
+            if encoding_caution:  # 対象外にしないが符号化の読み取りが不確実な資料の印
+                result["encoding_caution"] = encoding_caution
+            result["text"] = body
+            if clipped:
+                result["text_truncated"] = True
+                result.update(around_next)
+            if reader.truncated or reader.line_overflowed:
+                result["file_truncated"] = True  # 読み取りの上限（ファイル 64MiB・単一行 2MiB）で一部を読めていない
+                if reader.line_overflowed:
+                    result["line_overflowed"] = True
+            if window_requested > window:
+                result["window_clamped"] = {"requested": window_requested, "used": window}
+            if reached_eof and not reader.truncated and line > total_seen:
+                result["line_beyond_eof"] = True  # 指定した行はファイルの末尾より後ろ
+                result["total_lines"] = total_seen
+            return result
+
+        # 本文を予算ちょうどまで詰めると封筒（doc_id・next_line など）の分で予算を超えるため、最終形の JSON が予算内に入る最大の長さを探す
+        result = _around_result(None)
+        if _result_byte_size(result) > tr_max_bytes:
+            lo, hi = 0, len(full_text.encode("utf-8"))
+            result = _around_result(0)
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                cand = _around_result(mid)
+                if _result_byte_size(cand) <= tr_max_bytes:
+                    result = cand
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
         return (result, docs, cites, cards)
     if name == "read_doc":
         doc_id = str(args.get("doc_id") or "")
@@ -1851,6 +1949,11 @@ def _run_tool_inner(name: str, args: dict, world: str, scope_paths,
                     "error_code": _READ_INVALID_ARGS_ERROR_CODE}, docs, cites, cards)
         if start < 1:
             start = 1
+        try:
+            start_char = max(0, int(args.get("start_char") or 0))
+        except (TypeError, ValueError):
+            return ({"error": "start_char は整数で",
+                    "error_code": _READ_INVALID_ARGS_ERROR_CODE}, docs, cites, cards)
         f, err = _open_doc_stream(world, doc_id, sp, layer)
         if err is not None:
             return (err, docs, cites, cards)
@@ -1907,6 +2010,12 @@ def _run_tool_inner(name: str, args: dict, world: str, scope_paths,
         cum_bytes = 0
         actual_end = start - 1
         text_truncated = False
+        next_char = None
+        if start_char and window_lines:
+            if start_char >= len(window_lines[0]):
+                return ({"error": f"start_char が行の長さを超えています（{start}行目は{len(window_lines[0])}文字）",
+                        "error_code": _READ_INVALID_ARGS_ERROR_CODE}, docs, cites, cards)
+            window_lines[0] = window_lines[0][start_char:]  # 行の途中からの続き（番号は元の行のまま）
         for offset, wline in enumerate(window_lines):
             i = start - 1 + offset
             ln = f"{i + 1}: {wline}"
@@ -1914,8 +2023,13 @@ def _run_tool_inner(name: str, args: dict, world: str, scope_paths,
             sep_bytes = 1 if out_lines else 0  # 結合する "\n" の分
             if cum_bytes + sep_bytes + ln_bytes > tr_max_bytes:
                 if not out_lines:
-                    out_lines.append(_clip_utf8_bytes(ln, tr_max_bytes))
+                    prefix = f"{i + 1}: "
+                    clipped = _clip_utf8_bytes(ln, tr_max_bytes)
+                    kept_chars = max(1, len(clipped) - len(prefix))  # 毎回 1 文字以上進める
+                    out_lines.append(prefix + wline[:kept_chars])
                     actual_end = i + 1
+                    if kept_chars < len(wline):
+                        next_char = start_char + kept_chars
                 text_truncated = True
                 break
             out_lines.append(ln)
@@ -1924,8 +2038,13 @@ def _run_tool_inner(name: str, args: dict, world: str, scope_paths,
         docs.add(doc_id)
         result = {"doc_id": doc_id, "start_line": start, "end_line": actual_end,
                  "total_lines": total, "text": "\n".join(out_lines)}
+        if start_char:
+            result["start_char"] = start_char
         if text_truncated:
             result["text_truncated"] = True
+        if next_char is not None:
+            result["partial_line"] = True
+            result["next_char"] = next_char  # end_line の行はここまでしか読んでいない（続きは start_line=end_line・start_char=next_char）
         if file_truncated:
             result["file_truncated"] = True
         if encoding_caution:  # 対象外にしないが符号化の読み取りが不確実な資料の印
@@ -2031,7 +2150,7 @@ def _run_tool_inner(name: str, args: dict, world: str, scope_paths,
                 if not sheet:
                     _close_quiet_local(f)
                     return ({"error": "sheet が必要です"}, docs, cites, cards)
-                kwargs = {"clean": _redact}
+                kwargs = {"clean": _redact, "budget_chars": tr_max_bytes}
                 if args.get("range"):
                     kwargs["range_a1"] = str(args["range"])
                 if args.get("max_rows") is not None:

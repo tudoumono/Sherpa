@@ -5,7 +5,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from .model import GOOD, RESULTS, RULES, WARN, BAD, Report, label, where
+from .model import GOOD, NOW_RULES, RESULTS, RULES, WARN, BAD, Report, label, where
 
 
 def summarize(items: list) -> dict:
@@ -28,7 +28,7 @@ def json_text(report: Report, root_name: str) -> str:
 def to_markdown(report: Report, root_name: str) -> str:
     items = report.items
     summary = summarize(items)
-    intro = ("登録するフォルダを、次の取り込み直しの版で使う置き方の決まりに照らした点検です。今の取り込みの動きは変わりません。その版を入れるまで今のフォルダは動かさないでください（動かすと今の版で期をまたいでつながり、全部取り込み直しになります）。結果は「合う」（決まりどおり）・「注意」（仮定つきの答えになる、または確かめてほしい）・"
+    intro = ("登録するフォルダを、次の取り込み直しの版で使う置き方の決まりに照らした点検です。今の取り込みの動きは変わりません（決まり5 だけは今の版で効いています）。その版を入れるまで今のフォルダは動かさないでください（動かすと今の版で期をまたいでつながり、全部取り込み直しになります）。結果は「合う」（決まりどおり）・「注意」（仮定つきの答えになる、または確かめてほしい）・"
              "「合わない」（その範囲は期として読めず、「確かめられない」が増える。使えなくなることはない）の 3 段です。")
     lines = [f"# フォルダの点検報告（{root_name}）", "", intro, "", "| 決まり | 合う | 注意 | 合わない |", "|---|---:|---:|---:|"]
     for name, title in RULES:
@@ -41,9 +41,10 @@ def to_markdown(report: Report, root_name: str) -> str:
             lines.append("該当する項目は無い。")
         for it in mine:
             lines.append(f"- **{it.result}** `{where(it.path)}` — {it.what}")
-            lines.append(f"  - 次の取り込み直しの版での扱い: {it.treatment}")
+            now = it.rule in NOW_RULES
+            lines.append(f"  - {'今の版での扱い' if now else '次の取り込み直しの版での扱い'}: {it.treatment}")
             if it.fix:
-                lines.append(f"  - 次の取り込み直しの版に向けた直し方: {it.fix}")
+                lines.append(f"  - {'直し方' if now else '次の取り込み直しの版に向けた直し方'}: {it.fix}")
             if it.examples:
                 more = f"（全 {it.count} 件、上限まで）" if it.count is not None and it.count > len(it.examples) else ""
                 lines.append(f"  - 例{more}:")

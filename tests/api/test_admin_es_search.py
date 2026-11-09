@@ -157,3 +157,20 @@ def test_admin_es_search_hides_sensitive_named_hits(auth_disabled):
         finally:
             worlds.world_dir, es_index.search = old_world_dir, old_search
 
+
+
+def test_admin_es_search_returns_503_when_es_query_fails(auth_disabled):
+    """ES の問い合わせ自体の失敗は、空のヒット（200）にせず 503 と理由で返す。"""
+    from sherpa import es_index, worlds
+    old_world_dir, old_search = worlds.world_dir, es_index.search
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        worlds.world_dir = lambda w: root if w == W else old_world_dir(w)
+        es_index.search = lambda *a, **k: ([], "es_unavailable")
+        try:
+            r = TestClient(app, raise_server_exceptions=False).get(
+                "/admin/es/search", params={"world": W, "query": "hit"})
+            assert r.status_code == 503, r.text
+            assert "全文検索のサービスを使えません" in r.json()["detail"]
+        finally:
+            worlds.world_dir, es_index.search = old_world_dir, old_search

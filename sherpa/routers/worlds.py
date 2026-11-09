@@ -1065,4 +1065,10 @@ def ingest_runs_list(request: Request, world: str | None = Query(None)):
     w = world
     if w is not None and not valid_world(w):
         raise HTTPException(422, "不正な world ID")
-    return {"world": w, "runs": store.list_ingest_runs(w)}
+    runs = []
+    for r in store.list_ingest_runs(w):
+        snap = r.get("extraction_snapshot")
+        flags = snap.get("flags") if isinstance(snap, dict) else None
+        warns, blocked = _warns_and_blocked(flags[:_STATUS_FLAGS_LIMIT] if isinstance(flags, list) else [])
+        runs.append({**r, "failure_message": _last_failure_message(r.get("status"), warns, blocked)})
+    return {"world": w, "runs": runs}

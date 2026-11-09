@@ -967,7 +967,7 @@ const _WHY_VIA = {
   cics_xctl: 'を呼び出しています', cics_link: 'を呼び出しています', mapper_sql: 'の表を SQL で参照しています', vba_sql: 'の表を SQL で参照しています',
   write_file: 'に書き出されています', read_file: 'を読み込んでいます', use: 'を使っています',
 };
-const _WHY_TYPE = { INVOKES: 'を呼び出しています', COPIES: 'を取り込んでいます', ACCESSES: 'を参照しています', CONTAINS: 'を含んでいます' };
+const _WHY_TYPE = { INVOKES: 'を呼び出しています', COPIES: 'を取り込んでいます', ACCESSES: 'を参照しています', CONTAINS: 'を含んでいます', BUILT_FROM: 'を材料にして作られています' };
 const _WHY_RULE = {
   alias: '別名の指定で決まりました', single_import: 'import で指定された型に一致しました', same_package: '同じ package（名前空間）の名前に一致しました',
   wildcard: 'import（まとめて指定）の範囲で一致しました', qualified_name: '完全な名前で一致しました', path_exact: '書かれたパスのとおりに一致しました',
@@ -975,6 +975,7 @@ const _WHY_RULE = {
   schema_unqualified: '名前が一致しました（定義側にスキーマ名なし）', table_name: '表の名前で一致しました', nearest_name: '一番近い場所の同じ名前に一致しました',
   di_qualifier: '注入で指定された名前が実装の名前に一致しました', di_primary: '実装のうち優先の指定が付いたものに決まりました',
   di_single_impl: '実装が 1 つだけでした',
+  build_definition: 'ビルドの定義に書かれた実行名と材料の組で決まりました',
   dd_name_match: 'プログラムのファイル名の指定と、ジョブのデータセットの指定が一致しました', copy_item_name: 'COPY で取り込んだ項目の名前に一致しました',
 };
 // 辺 1 本の「参照元」の平文（文書と行を複数・切った分は「ほか N 件」）。根拠（sources）のある辺だけ出す。

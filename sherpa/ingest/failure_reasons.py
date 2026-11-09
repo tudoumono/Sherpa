@@ -73,7 +73,7 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
     # 文字コード/内容の読み取り判定（`corpus_docs`/`text_encoding`/`ingest.text_kind` 由来）
     "encoding_undetermined": {
         "label": "文字コードを判別できない",
-        "advice": "UTF-8でもCP932（Shift-JIS系）でも文字化けするため読み取れません。"
+        "advice": "UTF-8・CP932（Shift-JIS系）・EUC-JPのどれでも文字化けするため読み取れません。"
                   "文字コードを確認し、UTF-8で保存し直してください。",
     },
     "binary": {

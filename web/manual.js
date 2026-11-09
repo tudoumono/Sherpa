@@ -213,11 +213,6 @@ async function renderDoc(id) {
   }
 }
 
-function applyThemeIcon() {
-  const b = document.getElementById('themebtn');
-  if (b) b.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙';
-}
-
 async function init() {
   const res = await fetch(MANIFEST_URL);
   if (!res.ok) throw new Error(`目次を読み込めませんでした（${res.status}）`);
@@ -231,18 +226,9 @@ async function init() {
     renderNav(e.target.value);
   });
   window.addEventListener('hashchange', () => renderDoc(currentId()));
-  document.addEventListener('click', (e) => {
-    if (!e.target.closest('#themebtn')) return;
-    const d = document.documentElement;
-    const next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-    d.dataset.theme = next;
-    localStorage.setItem('sherpa-theme', next);
-    applyThemeIcon();
-  });
 
   renderNav('');
   renderDoc(currentId());
-  applyThemeIcon();
 }
 
 init().catch(() => {

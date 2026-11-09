@@ -1,6 +1,6 @@
 // 資料画面: 「資料フォルダの登録・取り込み」と「取り込み状況の確認」の統合画面。
-//   上＝資料フォルダ（登録フォーム＋登録済み一覧・差分/更新/削除）
-//   下＝取り込み状況（文書一覧・状態・フォルダツリー・全文検索・原本DL）
+//   資料フォルダ（登録フォーム＋登録済み一覧・差分/更新/削除）は常に見える位置
+//   取り込み状況（文書一覧・状態・フォルダツリー・全文検索・原本DL）はタブの一つ（切り替えは ingest-tabs.js）
 // 設計: docs/design/rag.md「更新と削除」
 // 専門用語は出さず状態3つに集約。XSS: 全データ esc()・インラインハンドラ無し（委譲）。API は相対パス。
 'use strict';
@@ -40,7 +40,7 @@ async function loadList() {
     renderNoticeCenter();
     $('regcard').hidden = !!w;                          // 登録済みなら登録フォームは出さない
     $('currentcard').hidden = !w;
-    $('resolvecard').hidden = !w;
+    $('tabarea').hidden = !w;                           // 未登録のときはタブごと隠す
     if (!w) {
       $('list').innerHTML = '';
       return;
@@ -198,6 +198,7 @@ async function register() {
 function showOptimisticRegisteredRow(worldId, label, path) {
   $('regcard').hidden = true;
   $('currentcard').hidden = false;
+  $('tabarea').hidden = false;
   $('list').innerHTML = `<div class="row" data-wid="${esc(worldId)}" data-path="${esc(path)}">`
     + `<div class="rowmain"><span class="nm">${esc(label)}</span>`
     + `<span class="pth" title="${esc(path)}">${esc(path)}</span></div>`
@@ -218,8 +219,9 @@ async function trackNewRegistration(worldId, runId) {
     const { runs } = await api('GET', `/ingest/runs?world=${encodeURIComponent(worldId)}`);
     const run = (runs || []).find((r) => r.id === runId);
     if (run && run.status !== 'extracting' && run.status !== 'queued') {
-      $('regmsg').innerHTML = `<span class="danger">登録に失敗しました（状態: ${esc(run.status)}）。`
-        + `もう一度お試しください。</span>`;
+      $('regmsg').innerHTML = run.failure_message
+        ? `<span class="danger">${esc(run.failure_message)}</span>`
+        : `<span class="danger">登録に失敗しました（状態: ${esc(run.status)}）。もう一度お試しください。</span>`;
       $('regbtn').disabled = !_chosen;
       reloadAll();
       return;
@@ -348,7 +350,7 @@ function failedFilesHtml(wid, ff, catalog, running) {
     const action = running && running.rel === it.doc
       ? '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>やり直し中…</span></span>'
       : (it.reason === 'ocr_unavailable' || it.reason === 'ocr_failed') ? ''
-      : `<button class="mini" data-reconvert-wid="${esc(wid)}" data-rel="${esc(it.doc)}">読み取り直す</button>`;
+      : `<button class="mini" data-reconvert-wid="${esc(wid)}" data-rel="${esc(it.doc)}">やり直す</button>`;
     const info = reasonInfo(catalog, it.reason);
     const pp = it.pdf_pages;
     const pages = pp ? `<div class="muted" style="font-size:var(--text-caption)">画像で読んだ PDF（全 ${esc(pp.total)} ページ）: `
@@ -586,7 +588,7 @@ async function loadStat(world_id) {                   // 各行の状況を非�
       reloadAll();
       return;
     }
-    el.innerHTML = '<span class="muted">状況を取得できませんでした</span>';
+    el.innerHTML = `<span class="muted">状況を取得できません: ${esc(e.message)}</span>`;
     // 404 以外の一時的な失敗（ネットワーク瞬断等）でポーリングを止めると、実行中と分かっている world_id が `_runningWorldIds` に残ったまま更新されず、pickbtn が「取り込み実行中」で固まる。
     // 既知の実行中 world だけ同じ3秒間隔で継続する（恒久的な失敗を無限リトライしない）。
     if (_runningWorldIds.has(world_id)) { loadWorkerBanner(); setTimeout(() => loadStat(world_id), 3000); }
@@ -655,7 +657,7 @@ async function reconvertFile(world_id, rel, btn) {
     $('listmsg').innerHTML = `<span class="danger">読み取り直せません: ${esc(e.message)}</span>`;
     if (btn) {
       btn.disabled = false;
-      btn.textContent = '読み取り直す';
+      btn.textContent = 'やり直す';
     }
     return;
   }
@@ -742,7 +744,7 @@ const STATE = {  // state → 表示（記号・クラス）。enum のみ。
   unreadable: { mark: '⚠ 読み取り不可', cls: 'fail' },   // 内容判定に必要なヘッダが読み取れない（`STATE.ready` へ倒さない）
   unknown: { mark: '❓ 状態を確認できませんでした', cls: 'fail' },  // 直近取り込みの状況が確認できない（`STATE.ready` へ倒さない）
 };
-const ABBR = { Module: 'Mod', Copybook: 'Cpy', DataItem: '項目', Document: '文書', Batch: 'ジョブ', Table: '表', Config: '設定', Dataset: 'データ' };
+const ABBR = { Module: 'Mod', Copybook: 'Cpy', DataItem: '項目', Document: '文書', Batch: 'ジョブ', Table: '表', Config: '設定', Dataset: 'データ', Executable: '実行' };
 
 let _pv = null, _q = '', _type = '', _state = 'all', _folder = '';
 
@@ -850,7 +852,7 @@ function encodingPartialBadge(d) {
 
 // `/ingest/preview` は world 未指定/空文字を 422 で拒否するため、worlds 0件（未登録）のときは fetch 自体を行わず平文の空状態へ倒す。
 // それ以外の失敗（503・ネットワーク断等）も try/catch で拾って平文のエラー表示に倒す（スピナー放置を無くす）。
-const _NO_WORLD_MSG = 'まだ資料フォルダが登録されていません。上の「登録」から追加してください。';
+const _NO_WORLD_MSG = 'まだ資料フォルダが登録されていません。「資料フォルダを登録」から追加してください。';
 
 async function load() {
   const world = $('version').value;
@@ -906,7 +908,7 @@ function renderTree() {                       // フォルダツリー（範囲�
   const docs = _pv ? _pv.documents : [];
   const counts = folderCounts();
   let html = `<div class="tnode ${_folder === '' ? 'on' : ''}" data-folder="">📂 すべて<span class="tc">${docs.length}</span></div>`;
-  for (const path of Object.keys(counts).sort()) {
+  for (const path of Object.keys(counts).sort((a, b) => Sherpa.comparePath({ path: a, dir: true }, { path: b, dir: true }))) {
     const depth = path.split('/').length - 1, name = path.split('/').pop();
     // フォルダは全て同列（common layer 概念は無い）。
     html += `<div class="tnode ${_folder === path ? 'on' : ''}" data-folder="${esc(path)}" style="padding-left:${8 + depth * 15}px">📁 ${esc(name)}<span class="tc">${counts[path]}</span></div>`;
@@ -930,7 +932,8 @@ function render() {
   // 絞り込み（名前・種類・状態）が無いときは、エクスプローラーと同じく選んだフォルダの直下（フォルダ→資料）だけを出す。
   // 絞り込みがあるときは、選んだフォルダより下の全部から探す。
   const browsing = !_q && !_type && _state === 'all';
-  const shown = browsing ? docs.filter((d) => (d.folder || '') === _folder) : docs;
+  const shown = (browsing ? docs.filter((d) => (d.folder || '') === _folder) : docs)
+    .sort((a, b) => Sherpa.comparePath({ path: a.name, dir: false }, { path: b.name, dir: false }));
   const subRows = browsing ? childFolders().map(folderRow).join('') : '';
   $('rows').innerHTML = (subRows + shown.map(row).join(''))
     || `<tr><td colspan="5"><div class="empty">${esc((_pv && _pv.documents_note) || (browsing ? 'このフォルダは空です' : '該当する資料がありません'))}</div></td></tr>`;
@@ -941,7 +944,7 @@ function render() {
 function childFolders() {
   const counts = folderCounts();
   const depth = _folder ? _folder.split('/').length : 0;
-  return Object.keys(counts).sort()
+  return Object.keys(counts).sort((a, b) => Sherpa.comparePath({ path: a, dir: true }, { path: b, dir: true }))
     .filter((p) => p.split('/').length === depth + 1 && (!_folder || p.startsWith(_folder + '/')))
     .map((p) => [p, counts[p]]);
 }
@@ -964,13 +967,15 @@ function row(d) {
   const place = d.folder || (d.branch === 'source' ? 'プログラム' : '設計書・仕様書');
   const reason = isFailureState(d.state) && d.reason
     ? `<div class="muted" style="font-size:var(--text-caption);margin-top:3px">理由: ${esc(reasonText(d.reason))}</div>` : '';
-  const rerun = isFailureState(d.state) ? `<button class="mini" data-rerun="${esc(d.name)}">やり直す</button>` : '';
+  // 1 件だけでは直せない読み取り不可の資料は、元のファイルを直してからの「更新」を案内する。
+  const fixHint = d.state === 'unreadable'
+    ? '<div class="muted" style="font-size:var(--text-caption);margin-top:3px">元のファイルを直してから「更新」を押してください</div>' : '';
   return `<tr>
-    <td><span class="fname" title="${esc(d.name)}">${icon} ${esc(shownName(d.name))}</span>${reason}${provBadges(d.provenance)}${analyzerBadgeRow(d)}${encodingPartialBadge(d)}</td>
+    <td><span class="fname" title="${esc(d.name)}">${icon} ${esc(shownName(d.name))}</span>${reason}${fixHint}${provBadges(d.provenance)}${analyzerBadgeRow(d)}${encodingPartialBadge(d)}</td>
     <td><span class="dtype">${esc(d.doctype)}</span></td>
     <td><span class="status ${st.cls}"><span class="d"></span>${esc(st.mark)}</span></td>
     <td class="muted">${esc(place)}</td>
-    <td><div class="rowact">${rerun}<button class="mini" data-dl="${esc(d.name)}">原本をひらく</button></div></td>
+    <td><div class="rowact"><button class="mini" data-dl="${esc(d.name)}">原本をひらく</button></div></td>
   </tr>`;
 }
 
@@ -1020,7 +1025,7 @@ async function searchEs() {
     const d = await api('GET', `/admin/es/search?${ps.toString()}`);
     renderEsHits(d.hits || []);
   } catch (e) {
-    $('eshits').innerHTML = `<div class="danger">検索できません: ${esc(e.message)}。検索語、資料フォルダ、ログイン状態を確認してください。</div>`;
+    $('eshits').innerHTML = `<div class="danger">検索できません: ${esc(e.message)}</div>`;
   } finally {
     $('eshits').setAttribute('aria-busy', 'false');
   }
@@ -1029,12 +1034,24 @@ async function searchEs() {
 // ===== admin ガード =====
 // 資料フォルダ登録/更新/削除・取り込み状況（/ingest/preview）・全文検索（/admin/es/search）は全て admin 限定 API。
 // この画面は丸ごと admin 専用＝admin-settings.js / audit.js と同じ自前 checkAdmin() パターン。判定失敗時は非表示のまま。
+let _adminErr = '';
+// 戻り値は 'admin'／'denied'（401・403・管理者でない）／'unreachable'（判定できなかった。理由は _adminErr）。
 async function checkAdmin() {
   try {
     const u = await getJSON('/auth/me');
-    if (u && u.role === 'admin') return true;
-  } catch (_) { /* compat */ }
-  return false;
+    return u && u.role === 'admin' ? 'admin' : 'denied';
+  } catch (e) {
+    if (e && (e.status === 401 || e.status === 403)) return 'denied';
+    _adminErr = (e && e.message) || '';
+    return 'unreachable';
+  }
+}
+
+function showUnreachable(denied) {
+  const d = denied && denied.querySelectorAll('div');
+  if (!d || d.length < 3) return;
+  d[1].textContent = '権限を確認できませんでした: ' + _adminErr;
+  d[2].textContent = '時間をおいて画面を開き直してください。';
 }
 
 const statusTag = (s) => (s && s !== 'active')
@@ -1081,18 +1098,6 @@ async function download(name) {
   Sherpa.downloadBlob(blob, name.split('/').pop());   // revoke のタイミング問題は共通ヘルパで回避
 }
 
-async function rerun() {
-  // 鏡＝即反映ライブ鏡: 資料フォルダ全体のクリーン rebuild（doc 単位の差分やり直しは無い）。
-  // 即受付・背景実行のため、他のボタン（更新/削除）と同じ共通 api()＋エラー確認＋reloadAll() を使う（進捗・完了は上段の行ポーリング loadStat が示す）。
-  try {
-    const res = await api('POST', '/ingest/rerun', { world: $('version').value });
-    alert(res.note || '再取り込みを受け付けました');
-    reloadAll(res.world_id);
-  } catch (e) {
-    alert(`再取り込みできません: ${e.message}`);
-  }
-}
-
 // 委譲（検索・フィルタ・行操作）
 $('q').addEventListener('input', (e) => { _q = e.target.value; render(); });
 $('type').addEventListener('change', (e) => { _type = e.target.value; render(); });
@@ -1115,7 +1120,6 @@ $('rows').addEventListener('click', (e) => {
     return;
   }
   const dl = e.target.closest('[data-dl]'); if (dl) return download(dl.dataset.dl);
-  const rr = e.target.closest('[data-rerun]'); if (rr) return rerun(rr.dataset.rerun);
 });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePrev(); });
 
@@ -1168,24 +1172,20 @@ function reloadAll(preferredWorldId) {
 // =====================================================================
 // 共通: テーマ切替（単一ハンドラ・両セクション共通）
 // =====================================================================
-function applyThemeIcon() { const b = $('themebtn'); if (b) b.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙'; }
-$('themebtn').addEventListener('click', () => {
-  const d = document.documentElement, next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-  d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
-});
-applyThemeIcon();
 
 // =====================================================================
 // 初期化（admin ガード）: 非 admin には access-denied だけを見せ、資料フォルダ一覧・取り込み状況・全文検索のいずれも取得しない（admin-settings.js と同じ「本体を読まずに弾く」パターン）。
 // admin 判明後に上＝一覧／下＝セレクタを読む（取込ディレクトリ確定後に状況を読む。/worlds 取得は1回に共有）。
 (async () => {
   const isAdmin = await checkAdmin();
-  if (!isAdmin) {
+  if (isAdmin !== 'admin') {
     const main = $('main-content'), denied = $('access-denied');
     if (main) main.style.display = 'none';
     if (denied) denied.style.display = 'block';
+    if (isAdmin === 'unreachable') showUnreachable(denied);
     return;
   }
   $('detailbtn').hidden = false;
   reloadAll();
+  if (location.hash === '#rules') window.IngestTabs.select('rules');
 })();

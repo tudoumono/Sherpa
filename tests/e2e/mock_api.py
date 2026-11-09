@@ -10,6 +10,15 @@ WORLD = {"world_id": "w1", "label": "4期更改", "root_path": "/mnt/c/ProjectA"
          "storage_mode": "external_reference"}
 
 
+# 優先と除外（GET /admin/path-rules）の既定のフォルダの木と、フォルダ直下のファイル。
+PATH_RULES_FOLDERS = [
+    {"path": "4期", "label": "4期", "depth": 0, "count": 5},
+    {"path": "4期/02_設計", "label": "02_設計", "depth": 1, "count": 3},
+    {"path": "4期/03_開発", "label": "03_開発", "depth": 1, "count": 2},
+]
+PATH_RULES_FILES = {"": ["README.md"], "4期": ["4期/概要.md"]}
+
+
 def _ann_status(a: dict) -> str:
     """S4: サーバ側 _announcement_status のミニ版（mock 専用・厳密な一致は API テスト側で担保）。"""
     if not a.get("published", True):
@@ -1541,6 +1550,8 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
     # で不達を模せる・既定は3経路とも到達可＝既存 e2e の「全チップ表示」前提を崩さない）。
     tools_availability_resp = tools_availability if tools_availability is not None else {
         "grep": True, "fulltext": True, "graph": True}
+    path_rules_saved: list = []      # PUT /admin/path-rules で置き換わる（優先と除外）
+    build_marks_saved: list = []
     records = {
         "turn_starts": [],
         "turn_stream_urls": [],
@@ -1554,6 +1565,9 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         "world_register": [],
         "world_refresh": [],
         "resolve_settings_put": [],
+        "path_rules_get": [],
+        "path_rules_put": [],
+        "build_marks_put": [],
         "auth_login": [],
         "auth_logout": [],
         "share_create": [],
@@ -2541,6 +2555,8 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             return _json(route, {"ok": True, "share_id": 77, "expires_at": "2026-08-30T09:00:00+00:00"})
         if method == "GET" and path == "/scopes":
             return _json(route, SCOPES)
+        if method == "GET" and path == "/ingest/workers":
+            return _json(route, {"ocr_message": None})
         if method == "GET" and path == "/ingest/preview":
             return _json(route, PREVIEW)
         if method == "GET" and path == "/ingest/preview/graph":
@@ -2587,6 +2603,27 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                                               for p in body.get("copy_paths", [])],
                                  "changed": True, "refresh_started": True,
                                  "note": "保存しました。資料を取り込み直しています（時間がかかります）。"})
+        if method == "GET" and path == "/admin/path-rules":
+            records["path_rules_get"].append(query)
+            return _json(route, {"world": "w1", "label": "4期更改", "rules": path_rules_saved, "removed_missing": 0,
+                                 "folders": PATH_RULES_FOLDERS})
+        if method == "GET" and path == "/admin/path-rules/files":
+            folder = (query.get("folder") or [""])[0]
+            files = PATH_RULES_FILES.get(folder, [])
+            return _json(route, {"folder": folder, "files": files, "truncated": False, "total": len(files),
+                                 "next_offset": None})
+        if method == "PUT" and path == "/admin/path-rules":
+            body = _post_json(request)
+            records["path_rules_put"].append(body)
+            path_rules_saved[:] = body.get("rules", [])
+            return _json(route, {"world": "w1", "rules": path_rules_saved, "dropped_children": []})
+        if method == "GET" and path == "/admin/build-marks":
+            return _json(route, {"world": "w1", "marks": build_marks_saved, "layout_folders": []})
+        if method == "PUT" and path == "/admin/build-marks":
+            body = _post_json(request)
+            records["build_marks_put"].append(body)
+            build_marks_saved[:] = body.get("marks", [])
+            return _json(route, {"world": "w1", "marks": build_marks_saved, "layout_folders": []})
         if method == "POST" and path == "/worlds/w1/refresh":
             records["world_refresh"].append(True)
             return _json(route, world_ingest_accepted_response("w1"))
@@ -2826,6 +2863,7 @@ MOCKED: list[tuple[str, str]] = [
     ("GET", "/conversations/{cid}/shares"),
     ("POST", "/conversation-shares/{share_id}/extend"),
     ("GET", "/scopes"),
+    ("GET", "/ingest/workers"),
     ("GET", "/ingest/preview"),
     ("GET", "/ingest/preview/graph"),
     ("GET", "/admin/es/search"),
@@ -2834,6 +2872,11 @@ MOCKED: list[tuple[str, str]] = [
     ("POST", "/worlds/diff"),
     ("POST", "/worlds"),
     ("POST", "/worlds/{wid}/refresh"),
+    ("GET", "/admin/path-rules"),
+    ("GET", "/admin/path-rules/files"),
+    ("PUT", "/admin/path-rules"),
+    ("GET", "/admin/build-marks"),
+    ("PUT", "/admin/build-marks"),
     ("GET", "/worlds/{wid}/resolve-settings"),
     ("PUT", "/worlds/{wid}/resolve-settings"),
     ("POST", "/chat/turns"),

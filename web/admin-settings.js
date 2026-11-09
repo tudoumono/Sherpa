@@ -12,11 +12,11 @@ const ARM_LABELS = {
   },
   pdf_text: {
     label: 'PDF の文字を抽出',
-    desc: 'PDF に埋め込まれた文字を抽出します（画像だけの PDF は読み取れません）。',
+    desc: 'PDF に埋め込まれた文字を抽出します。画像だけの PDF は、この方式だけでは読み取れません（OCR や視覚読み取りが有効なら読める場合があります）。',
   },
   vision: {
     label: '画像・スキャン文書を AI が見て読み取り（視覚読み取り）',
-    desc: '画像やスキャンした文書を AI（視覚モデル）が見て読み取ります。既定はこのパソコンのローカル AI（Ollama）で処理します。クラウド AI は下の「視覚読み取りの AI」で明示的に許可したときだけ使います。',
+    desc: '画像やスキャンした文書を AI（視覚モデル）が見て読み取ります。読み取りには「プロバイダ＋接続先」タブの既定接続先の Ollama を使います。クラウド AI は下の「視覚読み取りの AI」で明示的に許可したときだけ使います。',
   },
 };
 
@@ -58,10 +58,13 @@ const OPENAI_ENDPOINT_KIND_LABELS = {
 
 // 使えるモデル（model_catalog）。用途名 → 平文の表示名。
 const MC_USAGE_LABELS = {
-  chat: 'チャット', intent: '依頼の仕分け',
+  chat: '接続テスト用', intent: '依頼の仕分け',
   embed: '検索の索引づくり', subsearch: '簡易回答のモデル', codex: 'Codex',
   render: '検索用文書の整形',
 };
+// クラウド選択かつキー未設定のとき。キーは「プロバイダ＋接続先」タブで設定する。
+const VLM_KEY_MISSING_TEXT = 'クラウド（OpenAI）を選んでいますが、OpenAI の API キーが設定されていません。'
+  + '「プロバイダ＋接続先」タブでキーを設定してください。設定するまで視覚読み取りは行われません。';
 const MC_COLUMN_LABELS = { ollama: 'ローカル（Ollama）', codex: 'Codex' };
 
 let _view = null;       // 直近の GET/PUT 応答（描画・保存の基準）
@@ -167,12 +170,24 @@ function toast(msg) {
   clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 1800);
 }
 
+let _adminErr = '';
+// 戻り値は 'admin'／'denied'（401・403・管理者でない）／'unreachable'（判定できなかった。理由は _adminErr）。
 async function checkAdmin() {
   try {
     const u = await getJSON('/auth/me');
-    if (u && u.role === 'admin') return true;
-  } catch (_) { /* compat */ }
-  return false;
+    return u && u.role === 'admin' ? 'admin' : 'denied';
+  } catch (e) {
+    if (e && (e.status === 401 || e.status === 403)) return 'denied';
+    _adminErr = (e && e.message) || '';
+    return 'unreachable';
+  }
+}
+
+function showUnreachable(denied) {
+  const d = denied && denied.querySelectorAll('div');
+  if (!d || d.length < 3) return;
+  d[1].textContent = '権限を確認できませんでした: ' + _adminErr;
+  d[2].textContent = '時間をおいて画面を開き直してください。';
 }
 
 // ===== 描画 =====
@@ -191,7 +206,7 @@ function renderArms(arms) {
       ? `<div class="arm-d danger">${esc(ARM_MISSING_HINT[name])}</div>` : '';
     return `<label class="armrow">`
       + `<input type="checkbox" data-arm="${esc(name)}"${checked}${disabled}>`
-      + `<span><span class="arm-t">${esc(meta.label)}</span> <code>${esc(name)}</code>`
+      + `<span><span class="arm-t">${esc(meta.label)}</span>`
       + (meta.desc ? `<div class="arm-d">${esc(meta.desc)}</div>` : '')
       + hint
       + `</span></label>`;
@@ -324,10 +339,22 @@ function renderVlm(vlm) {
     const needKey = (provSel && provSel.value === 'openai') && !vlm.openai_key_present;
     if (needKey) {
       keyMiss.hidden = false;
-      keyMiss.textContent = 'クラウド（OpenAI）を選んでいますが、OpenAI の API キー（OPENAI_API_KEY）が設定されていません。'
-        + 'キーを設定するまで視覚読み取りは行われません。';
+      keyMiss.textContent = VLM_KEY_MISSING_TEXT;
     } else { keyMiss.hidden = true; keyMiss.textContent = ''; }
   }
+  updateVlmUrlHint(vlm);
+}
+
+// Ollama を選んでいるときだけ、画像の実際の送り先（応答の vlm.effective.ollama_url）を見せる。
+function updateVlmUrlHint(vlm) {
+  const el = $('vlm-ollama-url');
+  const provSel = $('vlm-provider');
+  if (!el || !provSel) return;
+  const url = String(((vlm || (_view && _view.vlm) || {}).effective || {}).ollama_url || '').trim();
+  if (provSel.value === 'ollama' && url) {
+    el.hidden = false;
+    el.textContent = `今の接続先: ${url}（画像はこの接続先の Ollama へ送られます）`;
+  } else { el.hidden = true; el.textContent = ''; }
 }
 
 function renderVlmStatus(vlm) {
@@ -611,13 +638,13 @@ async function testOpenaiEndpoint() {
     if (k) body.openai_api_key = k;
   }
   try {
-    const d = await (await fetch('/admin/settings/openai-endpoint-test', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    })).json();
+    const r = await fetch('/admin/settings/openai-endpoint-test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const d = await r.json().catch(() => null);
+    if (!d) { res.className = 'tres danger'; res.textContent = `✗ サーバーが処理できませんでした（HTTP ${r.status}）`; return; }
     res.className = 'tres ' + (d.ok ? 'ok' : 'danger');
     res.textContent = (d.ok ? '✓ 接続OK' : '✗ ' + (d.detail || '失敗')) + (d.model ? `（${d.model}）` : '');
   } catch (e) {
-    res.className = 'tres danger'; res.textContent = '✗ テストに失敗しました';
+    res.className = 'tres danger'; res.textContent = '✗ 通信に失敗しました。ネットワークを確認してください';
   } finally {
     _endpointTestBusy = false;
     if (btn) btn.disabled = false;
@@ -636,9 +663,9 @@ async function testCentralOllama() {
   res.innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>接続を確認中...</span></span>';
   const body = { ollama_url: (($('cloud-ollama-url') || {}).value || '').trim() };
   try {
-    const d = await (await fetch('/admin/settings/ollama-test', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    })).json();
+    const r = await fetch('/admin/settings/ollama-test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const d = await r.json().catch(() => null);
+    if (!d) { res.className = 'tres danger'; res.textContent = `✗ サーバーが処理できませんでした（HTTP ${r.status}）`; return; }
     if (!d.ok) {
       res.className = 'tres danger';
       res.textContent = '✗ ' + (typeof d.detail === 'string' ? d.detail : '失敗');
@@ -651,7 +678,7 @@ async function testCentralOllama() {
     res.className = 'tres ' + (missing.length ? 'danger' : 'ok');
     res.textContent = text;
   } catch (e) {
-    res.className = 'tres danger'; res.textContent = '✗ テストに失敗しました';
+    res.className = 'tres danger'; res.textContent = '✗ 通信に失敗しました。ネットワークを確認してください';
   } finally {
     _ollamaTestBusy = false;
     if (btn) btn.disabled = false;
@@ -668,13 +695,13 @@ async function testCloudKey() {
   const k = ($('cloud-key') || {}).value.trim();
   if (k) body[provider + '_api_key'] = k;
   try {
-    const d = await (await fetch('/settings/test', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    })).json();
+    const r = await fetch('/settings/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const d = await r.json().catch(() => null);
+    if (!d) { res.className = 'tres danger'; res.textContent = `✗ サーバーが処理できませんでした（HTTP ${r.status}）`; return; }
     res.className = 'tres ' + (d.ok ? 'ok' : 'danger');
     res.textContent = (d.ok ? '✓ 接続OK' : '✗ ' + (d.detail || '失敗')) + (d.model ? `（${d.model}）` : '');
   } catch (e) {
-    res.className = 'tres danger'; res.textContent = '✗ テストに失敗しました';
+    res.className = 'tres danger'; res.textContent = '✗ 通信に失敗しました。ネットワークを確認してください';
   }
 }
 
@@ -979,7 +1006,7 @@ async function loadExtKeys() {
   } catch (e) {
     if (myGen !== _ekListGen) return;
     const wrap = $('ext-keys-list');
-    if (wrap) wrap.innerHTML = '<div class="hint danger">キー一覧を読み込めませんでした</div>';
+    if (wrap) wrap.innerHTML = `<div class="hint danger">キー一覧を読み込めませんでした: ${esc(e.message)}</div>`;
   }
 }
 
@@ -1260,7 +1287,8 @@ function renderResearchTab(view) {
   _maxReviewRoundsBaseline = rounds.configured == null ? '' : String(rounds.configured);
   $('max-review-rounds').value = _maxReviewRoundsBaseline;
   $('max-review-rounds-hint').textContent = `現在の適用値: ${rounds.effective} 回。既定: ${rounds.default} 回。`
-    + (rounds.configured == null ? '未設定です。' : 'この値で固定中です。');
+    + (rounds.configured == null ? '未設定です。' : 'この値で固定中です。')
+    + '（既定の方式には効きません）';
   const workerModel = view.codex_worker_model;
   _codexWorkerModelBaseline = workerModel.configured == null ? '' : String(workerModel.configured);
   $('codex-worker-model').value = _codexWorkerModelBaseline;
@@ -1587,6 +1615,33 @@ function validateAgenticBudgetInputs() {
 
 function renderModelsTab(view) {
   renderModelCatalog(view.model_catalog, (view.cloud || {}).provider);
+  renderMcVlmLine(view.vlm);
+}
+
+// 視覚読み取りのモデルはこの表では変えない。取り込みタブの設定を読むだけで見せる。
+function renderMcVlmLine(vlm) {
+  const el = $('mc-vlm-line');
+  if (!el) return;
+  const eff = vlm && vlm.effective;
+  if (!eff) { el.hidden = true; el.textContent = ''; return; }
+  const prov = eff.provider === 'openai' ? 'クラウド（OpenAI）' : 'Ollama';
+  el.hidden = false;
+  el.textContent = `視覚読み取りのモデル（今の設定）: ${prov} の ${eff.model || '未設定'}`;
+}
+
+// 画像の文字の読み取り（OCR）の状態。GET /ingest/workers の ocr_message を平文で言い換える（表示だけ）。
+function ocrStatusText(msg) {
+  return msg || '稼働中です。';
+}
+async function loadOcrStatus() {
+  const el = $('ocr-status');
+  if (!el) return;
+  try {
+    const w = await getJSON('/ingest/workers');
+    el.textContent = '今の状態: ' + ocrStatusText(w && w.ocr_message);
+  } catch (e) {
+    el.textContent = '今の状態: 確認できませんでした（' + (e && e.message ? e.message : '通信に失敗しました') + '）';
+  }
 }
 
 // 「必要な道具」表。応答に required_tools が無ければカードごと隠す（前方互換）。
@@ -1606,6 +1661,7 @@ function renderRequiredTools(tools) {
 }
 
 function renderIngestTab(view) {
+  loadOcrStatus();
   renderRequiredTools(view.required_tools);
   renderArms(view.arms || {});
   renderArmsStatus(view.arms || {});
@@ -1656,9 +1712,9 @@ async function load() {
   try {
     render(await getJSON('/admin/settings'));
   } catch (e) {
-    $('msg').innerHTML = '<span class="danger">設定を読み込めませんでした</span>';
+    const message = `設定を読み込めませんでした: ${e.message}。サーバーの更新・稼働状態を確認して、画面を再読み込みしてください。`;
+    $('msg').innerHTML = `<span class="danger">${esc(message)}</span>`;
     // 初期描画が止まった場合も、各タブに失敗を表示する。未読込の値は保存させない。
-    const message = '設定を読み込めませんでした。サーバーの更新・稼働状態を確認して、画面を再読み込みしてください。';
     document.querySelectorAll('.tabpanel:not(.tabpanel-embed)').forEach(panel => {
       const notice = document.createElement('p');
       notice.className = 'hint danger';
@@ -1908,6 +1964,7 @@ async function resetProviderTab() {
   _mcCloudProvider = (view.cloud || {}).provider || 'openai';
   renderProviderTab(view);
   renderModelCatalogTable();   // 表の埋め込みセル・列プロバイダの見た目も追従させる
+  updateVlmUrlHint(view.vlm);
   applyConfigChangedHighlights(view);
   refreshTabDots();
   _markResetOk(resEl);
@@ -1959,6 +2016,7 @@ async function resetIngestTab() {
   try { view = await _putResetBody(body, resEl); } catch (e) { return; }
   _view = view;
   renderIngestTab(view);
+  renderMcVlmLine(view.vlm);
   applyConfigChangedHighlights(view);
   refreshTabDots();
   _markResetOk(resEl);
@@ -2083,6 +2141,10 @@ function refreshTabDots() {
   });
   $('unsaved-note').hidden = !document.querySelector('#admin-tabs .tab-dot:not([hidden])');
 }
+// 保存していない変更（タブの丸印）があるまま離れるときだけ、ブラウザ標準の確認を出す。
+window.addEventListener('beforeunload', (e) => {
+  if (document.querySelector('#admin-tabs .tab-dot:not([hidden])')) e.preventDefault();
+});
 
 // 接続先関連（種別ラジオ・埋め込みデプロイ名）の変更監視は、対象の id/属性だけで判定する（DOM 構造に依存しない）。埋め込み欄は 'change' で反映する。
 // このブロックは下の refreshTabDots 登録より前に置く: どちらも document に直接束縛するため登録順が実行順になり、先に状態を更新してから refreshTabDots で読ませる必要がある。
@@ -2224,13 +2286,12 @@ function updateVlmKeyHint() {
   const needKey = provSel.value === 'openai' && !keyPresent;
   if (needKey) {
     keyMiss.hidden = false;
-    keyMiss.textContent = 'クラウド（OpenAI）を選んでいますが、OpenAI の API キー（OPENAI_API_KEY）が設定されていません。'
-      + 'キーを設定するまで視覚読み取りは行われません。';
+    keyMiss.textContent = VLM_KEY_MISSING_TEXT;
   } else { keyMiss.hidden = true; keyMiss.textContent = ''; }
 }
 const _vlmBlock = $('vlm-block');
 if (_vlmBlock) _vlmBlock.addEventListener('change', (e) => {
-  if (e.target.matches('#vlm-provider, #vlm-model, #vlm-cloud-allowed')) updateVlmKeyHint();
+  if (e.target.matches('#vlm-provider, #vlm-model, #vlm-cloud-allowed')) { updateVlmKeyHint(); updateVlmUrlHint(); }
 });
 $('save').addEventListener('click', save);
 // Ctrl+S（Cmd+S）でも保存。ただし API キー発行モーダルが開いている間は、ブラウザの既定動作だけを止めて保存は呼ばない。
@@ -2242,28 +2303,24 @@ document.addEventListener('keydown', (e) => {
     if (!$('save').disabled) save();
   }
 });
-function applyThemeIcon() { const b = $('themebtn'); if (b) b.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙'; }
 function syncFrameTheme(frame) {
   frame.contentDocument.documentElement.dataset.theme = document.documentElement.dataset.theme;
 }
 document.querySelectorAll('.embed-frame').forEach((frame) => {
   frame.addEventListener('load', () => syncFrameTheme(frame));
 });
-document.addEventListener('click', (e) => {
-  if (!e.target.closest('#themebtn')) return;
-  const d = document.documentElement, next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-  d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
+document.addEventListener('sherpa-themechange', () => {
   document.querySelectorAll('.embed-frame[src]').forEach(syncFrameTheme);
 });
-applyThemeIcon();
 
 // ===== 初期化（admin ガード）=====
 (async () => {
   const isAdmin = await checkAdmin();
-  if (!isAdmin) {
+  if (isAdmin !== 'admin') {
     const main = $('main-content'), denied = $('access-denied'), bar = $('save-bar');
     if (main) main.style.display = 'none';
     if (denied) denied.style.display = 'block';
+    if (isAdmin === 'unreachable') showUnreachable(denied);
     if (bar) bar.style.display = 'none';   // 非 admin には保存バーも出さない
     return;
   }

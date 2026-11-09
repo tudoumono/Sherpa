@@ -366,6 +366,21 @@ const _analyzerLabel = (name) => {
   return Object.prototype.hasOwnProperty.call(_ANALYZER_LABEL, key) ? _ANALYZER_LABEL[key] : key;
 };
 
+// パス一覧の並び（a, b は { path, dir }）。階層ごとに比べ、各階層ではフォルダが先・次にファイル、数字は数として比べる。親は子の前に来る。
+const _pathCollator = new Intl.Collator('ja', { numeric: true });
+const _comparePath = (a, b) => {
+  const x = a.path.split('/'), y = b.path.split('/');
+  const n = Math.min(x.length, y.length);
+  for (let i = 0; i < n; i++) {
+    const xDir = i < x.length - 1 || !!a.dir, yDir = i < y.length - 1 || !!b.dir;
+    if (xDir !== yDir) return xDir ? -1 : 1;
+    const c = _pathCollator.compare(x[i], y[i]);
+    if (c !== 0) return c;
+    if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+  }
+  return x.length - y.length;
+};
+
 window.Sherpa = window.Sherpa || {
   $: (id) => document.getElementById(id),
   esc: _sherpaEsc,
@@ -376,4 +391,5 @@ window.Sherpa = window.Sherpa || {
   analyzerLabel: _analyzerLabel,
   mdLite: _mdLite,
   visibilityInterval: _sherpaVisibilityInterval,
+  comparePath: _comparePath,
 };

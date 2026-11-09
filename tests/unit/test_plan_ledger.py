@@ -699,3 +699,22 @@ def test_format_only_problems_do_not_reject_but_real_unstarted_rows_do():
     assert d.action == "reject_unstarted" and "b" in d.prompt and st.continuations == 1
     stray = PL.parse_plan(_plan("- [x] a · k · 対象A · 要: source\n    - source: src/a.cbl:1\n説明の文です\n"))
     assert PL.decide(PL.PlanGateState(), stray, review_cap=0).action == "accept"
+
+
+def test_executables_in_one_build_definition_stay_separate_and_match_by_name():
+    rows = [{"kind": "Executable", "cid": "executable:w:src/Makefile#build:calc", "path": "src/Makefile", "name": "CALC", "distance": 1},
+            {"kind": "Executable", "cid": "executable:w:src/Makefile#build:tool", "path": "src/Makefile", "name": "TOOL", "distance": 1}]
+    targets, _calls = PL.required_targets([{"rows": rows}])
+    assert len(targets) == 2
+    regexes = PL._target_regexes(targets)
+    calc = regexes["executable:w:src/Makefile#build:calc"]
+    assert calc.search("CALC を直す") and not calc.search("TOOL を直す")
+
+
+def test_same_executable_name_in_two_definitions_needs_each_definition():
+    rows = [{"kind": "Executable", "cid": "c1", "path": "a/src/Makefile", "name": "CALC", "distance": 1},
+            {"kind": "Executable", "cid": "c2", "path": "b/src/Makefile", "name": "CALC", "distance": 1}]
+    targets, _calls = PL.required_targets([{"rows": rows}])
+    regexes = PL._target_regexes(targets)
+    assert regexes["c1"].search("a/src/Makefile を直す") and not regexes["c2"].search("a/src/Makefile を直す")
+    assert not regexes["c1"].search("Makefile を直す")

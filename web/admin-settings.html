@@ -219,7 +219,7 @@
               <label class="vlm-cloud">
                 <input type="checkbox" id="web-search-allowed">
                 <span><span class="arm-t">Web 検索を許可する（Codex のみ）</span>
-                  <div class="arm-d">オンにすると、頭脳が Codex（OpenAI 直結）の利用者はチャットごとに Web 検索を
+                  <div class="arm-d">オンにすると、チャットの AI が Codex（OpenAI 直結）の利用者はチャットごとに Web 検索を
                     ON/OFF できます（やりたいことブロックの「参照する」行）。オフ（既定）では Web 検索の行自体が
                     表示されません。Azure OpenAI 等の接続先では、この設定に関わらず Web 検索は使えません。
                     外部に送られるのは調べものの検索語だけで、社内資料そのものが外部へ送られることはありません。
@@ -390,7 +390,8 @@
         <div class="card sec" id="review-rounds-card">
           <div class="card-head"><span class="title">見直しの回数</span></div>
           <div class="body">
-            <p class="hint">チャットの「調べる深さ」で見直しの回数が決まります。クイック＝見直しなし、標準＝1 回、深く＝3 回、最大＝6 回まで。AI が十分に調べたと判断したときは、途中で終わります。下の「最大の見直しの回数」は、調査の方式を JSON 台帳（評価用・SHERPA_LEDGER_STYLE=json）にしたときと、下調べ役の見直しにだけ効きます。</p>
+            <p class="hint">チャットの「調べる深さ」で見直しの回数が決まります。既定の方式（Codex 調査（OpenAI））では、クイック＝見直しなし、標準＝1 回、深く＝3 回、最大＝6 回までです。AI が十分に調べたと判断したときは、途中で終わります。</p>
+            <p class="hint">調査計画書を使わない構成（Codex 調査（Ollama）、または評価用の SHERPA_LEDGER_STYLE=json）では、下調べ役の結果を見直す回数が、クイック＝0 回、標準＝2 回、深く＝4 回、最大＝下の設定値までになります。下の「最大の見直しの回数」はこの構成にだけ効き、既定の方式には効きません。</p>
             <label class="vlm-field"><span class="vlm-l">最大の見直しの回数</span>
               <input type="number" id="max-review-rounds" min="1" max="32" step="1" placeholder="既定: 7" style="max-width:160px">
             </label>
@@ -541,6 +542,8 @@
           <div class="card-head"><span class="title">使えるモデル</span></div>
           <div class="body">
             <div class="hint" style="margin-bottom:6px">用途ごとに、選べるモデルと既定を決めます（表示は選択中のクラウド AI・Ollama・Codex のみ）。</div>
+            <div class="hint" style="margin-bottom:6px">この表にない設定は、それぞれのタブにあります。視覚読み取りの AI は「取り込み」タブ、下調べ役のモデルは「調査・回答」タブ、簡易回答に使う AI は「外部連携」タブ、埋め込みの接続先は「プロバイダ＋接続先」タブで決めます。</div>
+            <div class="hint" id="mc-vlm-line" style="margin-bottom:6px" hidden><!-- JS: 視覚読み取りのモデル名（vlm.effective を読むだけ） --></div>
             <div id="model-catalog-table"><!-- JS が描画 --></div>
             <div class="sec-actions">
               <button class="btn-ghost" data-reset-tab="models" type="button">このタブを既定に戻す</button>
@@ -556,16 +559,43 @@
           <div class="card-head"><span class="title">取り込み設定（資料の読み取り方）</span></div>
           <div class="body">
             <div class="hint" style="margin-bottom:6px">資料フォルダの文書をどう読み取って検索対象にするかを選びます。
-              変更は次回の取り込み・再取り込みから反映されます。</div>
+              変更は次回の取り込み・再取り込みから反映されます。読み取り方式を変えると、次の同期で全資料の作り直しになります。</div>
             <div id="arms-list"><!-- JS が描画 --></div>
             <div class="hint" id="arms-status"><!-- JS が描画: 既定に従っているか/固定中か --></div>
             <div class="hint">すべて外すと既定の構成（標準）に戻ります。</div>
+
+            <!-- 視覚読み取り（markitdown_ocr）の VLM 設定 -->
+            <div id="vlm-block" hidden>
+              <div class="arm-t">視覚読み取りの AI</div>
+              <div class="hint" style="margin-bottom:8px">上の「画像・スキャン文書を AI が見て読み取り（視覚読み取り）」を
+                使うときに、どの AI で画像を読み取るかを選びます。AI やモデルを変えると、次の同期で全資料の作り直しになります。</div>
+              <label class="vlm-field"><span class="vlm-l">使う AI</span>
+                <select id="vlm-provider">
+                  <option value="ollama">Ollama（既定接続先の Ollama）</option>
+                  <option value="openai">クラウド（OpenAI）</option>
+                </select>
+              </label>
+              <div class="hint" style="margin:-4px 0 8px">Ollama は「プロバイダ＋接続先」タブの既定接続先を使います。
+                接続先が IP アドレスでも名前でも、クラウド利用の許可は要りません。</div>
+              <div class="hint" id="vlm-ollama-url" style="margin:-4px 0 8px" hidden><!-- JS: 実際の接続先 --></div>
+              <label class="vlm-field"><span class="vlm-l">モデル名</span>
+                <input type="text" id="vlm-model" placeholder="qwen2.5vl" autocomplete="off">
+              </label>
+              <label class="vlm-cloud">
+                <input type="checkbox" id="vlm-cloud-allowed">
+                <span><span class="arm-t">クラウド AI（OpenAI）の利用を許可する</span>
+                  <div class="arm-d danger">許可すると、画像が外部の AI（OpenAI）に送信されます。機密資料では特にご注意ください。
+                    許可しない場合は、クラウドを選んでも画像は送信されません（読み取りは行われません）。</div></span>
+              </label>
+              <div class="hint danger" id="vlm-key-missing" hidden><!-- JS: クラウド選択かつキー未設定時の案内 --></div>
+              <div class="hint" id="vlm-status"><!-- JS: 既定に従っているか/固定中か --></div>
+            </div>
             <div class="sec-actions">
               <button class="btn-ghost" data-reset-tab="ingest" type="button">このタブを既定に戻す</button>
               <span class="tres muted" id="tab-reset-res-ingest"></span>
             </div>
 
-            <!-- 高度な設定（旧形式変換・視覚読み取り）はこのタブの「詳細」折りたたみ1箇所にまとめる。 -->
+            <!-- 高度な設定（旧形式変換）はこのタブの「詳細」折りたたみ1箇所にまとめる。 -->
             <details class="adv">
               <summary>詳細設定</summary>
               <!-- 旧形式（.doc/.xls/.ppt）の変換バックエンド（none/libreoffice/office_com） -->
@@ -579,32 +609,16 @@
                 <div class="hint danger" id="legacy-oc-missing" hidden><!-- JS が描画: Office 連携ワーカー不達時の案内 --></div>
               </div>
 
-              <!-- 視覚読み取り（markitdown_ocr）の VLM 設定 -->
-              <div id="vlm-block" hidden>
-                <div class="arm-t">視覚読み取りの AI</div>
-                <div class="hint" style="margin-bottom:8px">上の「画像・スキャン文書を AI が見て読み取り（視覚読み取り）」を
-                  使うときに、どの AI で画像を読み取るかを選びます。</div>
-                <label class="vlm-field"><span class="vlm-l">使う AI</span>
-                  <select id="vlm-provider">
-                    <option value="ollama">ローカル（Ollama・このパソコン内で処理）</option>
-                    <option value="openai">クラウド（OpenAI）</option>
-                  </select>
-                </label>
-                <div class="hint" style="margin:-4px 0 8px">社内ネットワークの Ollama を使う場合は、接続先を IP アドレスで指定してください
-                  （ドメイン名を使う場合は、下のクラウド利用の許可が必要です）。</div>
-                <label class="vlm-field"><span class="vlm-l">モデル名</span>
-                  <input type="text" id="vlm-model" placeholder="qwen2.5vl" autocomplete="off">
-                </label>
-                <label class="vlm-cloud">
-                  <input type="checkbox" id="vlm-cloud-allowed">
-                  <span><span class="arm-t">クラウド AI（OpenAI）の利用を許可する</span>
-                    <div class="arm-d danger">許可すると、画像が外部の AI（OpenAI）に送信されます。機密資料では特にご注意ください。
-                      許可しない場合は、クラウドを選んでも画像は送信されません（読み取りは行われません）。</div></span>
-                </label>
-                <div class="hint danger" id="vlm-key-missing" hidden><!-- JS: クラウド選択かつキー未設定時の案内 --></div>
-                <div class="hint" id="vlm-status"><!-- JS: 既定に従っているか/固定中か --></div>
-              </div>
             </details>
+          </div>
+        </div>
+
+        <div class="card sec" id="ocr-card">
+          <div class="card-head"><span class="title">画像の文字の読み取り（OCR）</span></div>
+          <div class="body">
+            <div class="hint" id="ocr-status" role="status">状態を確認しています…</div>
+            <div class="hint">視覚読み取りは AI モデルに画像を読ませて取り込み中に実行しますが、OCR は AI モデルの選択が無く、別のワーカーが後から読み取ります。</div>
+            <div class="hint">使う・使わないは .env の <code>SHERPA_OCR_ENABLED</code> で決めます。変えると次の同期で全資料の作り直しになります（この画面にスイッチはありません）。</div>
           </div>
         </div>
 

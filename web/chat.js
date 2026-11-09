@@ -303,8 +303,9 @@ async function uploadPersonalFilesFromChat(fileList) {
     if (ok.length) {
       status.textContent = `${ok.join(', ')} を個人ワークスペースへ保存しました。参照するには「個人ファイル参照」をオンにしてください。参照した会話は共有できません。`;
     } else {
-      status.textContent = `アップロードできませんでした。${ng[0] || 'ファイル形式やサイズを確認してください。'}`;
+      status.textContent = `アップロードできませんでした。${ng.join(' / ') || 'ファイル形式やサイズを確認してください。'}`;
     }
+    if (ok.length && ng.length) status.textContent += ` 保存できなかったファイル: ${ng.join(' / ')}`;
   }
   if (ok.length) toast(`${ok.length} 件を個人ファイルへ保存しました`);
   if (ng.length) toast(`${ng.length} 件のアップロードに失敗しました`);

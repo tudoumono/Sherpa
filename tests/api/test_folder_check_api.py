@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from sherpa import store
 from sherpa.api import app
 from sherpa.ingest.check import inspect_folder, summarize
-from sherpa.routers.folder_check import NO_LEDGER_MESSAGE, READ_LIMIT_BYTES, read_text_of
+from sherpa.routers.folder_check import NO_LEDGER_MESSAGE, READ_LIMIT_BYTES, _build_state, read_text_of
 
 W = f"fcheck{os.getpid()}"
 EMPTY_W = f"fcheckempty{os.getpid()}"
@@ -54,7 +54,7 @@ def test_counts_match_inspect_folder(client, kb):
     r = client.get(f"/worlds/{W}/folder-check")
     assert r.status_code == 200, r.text
     body = r.json()
-    direct = inspect_folder(RELS, read_text_of(W))
+    direct = inspect_folder(RELS, read_text_of(W), build=_build_state(W))
     assert body["summary"] == summarize(direct.items)
     assert len(body["items"]) == len(direct.items)
     assert body["ledger_at"]
@@ -102,3 +102,14 @@ def test_read_text_decodes_cp932_and_skips_oversize_sensitive_and_outside(kb, tm
     assert rd("../" + outside.name) is None
     assert rd("無い.md") is None
     outside.unlink()
+
+
+def test_build_marks_save_and_reject_missing_place(client, kb):
+    r = client.put("/admin/build-marks", json={"world": W, "marks": [{"path": "サブA/第2期/ソース", "mark": "read"}]})
+    assert r.status_code == 200, r.text
+    got = client.get("/admin/build-marks", params={"world": W}).json()
+    assert got["marks"] == [{"path": "サブA/第2期/ソース", "mark": "read"}]
+    assert "サブA/第1期/ソース" in got["layout_folders"]
+    assert client.put("/admin/build-marks", json={"world": W, "marks": [{"path": "無い場所", "mark": "read"}]}).status_code == 422
+    assert client.put("/admin/build-marks", json={"world": W, "marks": [{"path": "サブA", "mark": "?"}]}).status_code == 422
+    assert client.put("/admin/build-marks", json={"world": W, "marks": []}).status_code == 200

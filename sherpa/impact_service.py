@@ -16,10 +16,11 @@ IMPACT_MAX_DEPTH_ABS_MAX = 64
 CATEGORY = {
     "Module": "ソース", "Copybook": "ソース", "DataItem": "ソース",
     "Batch": "バッチ", "Document": "文書", "Table": "テーブル", "Config": "設定", "Dataset": "データセット",
+    "Executable": "実行モジュール",
 }
 
 # 推定トレースで拾う「コード成果物」ラベル（概念/文書は対象外）
-_CODE_LABELS = {"Module", "Copybook", "DataItem", "Batch", "Table", "Dataset"}
+_CODE_LABELS = {"Module", "Copybook", "DataItem", "Batch", "Table", "Dataset", "Executable"}
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")  # COBOL 風識別子（3文字以上）
 # 実在ノード名と一致しても「関連」と見なさない一般語
 _STOP = {"DATA", "CODE", "RATE", "TOTAL", "INPUT", "OUTPUT", "FILE", "DATE", "TIME", "NAME", "TYPE",

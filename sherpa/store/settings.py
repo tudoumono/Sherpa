@@ -4,7 +4,9 @@
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
 
 from psycopg.types.json import Json
@@ -30,8 +32,20 @@ class OpenAIEndpointSettingsConflict(ValueError):
     """`openai_endpoint_kind`/`openai_base_url` の書込み直前（advisory lock 取得後）に読み直した実効値が、kind が openai 以外なら base_url も必要という整合を満たさなかった（`admin_settings_put` が 422 に変換する）。"""
 
 
+CHILD_SNAPSHOT_ENV = "SHERPA_MCP_SETTINGS"
+
+
+def _child_snapshot() -> dict | None:
+    """調べものの道具の子プロセスが親から受け取った設定の写し（子以外は None）。"""
+    raw = os.environ.get(CHILD_SNAPSHOT_ENV)
+    return json.loads(raw) if raw else None
+
+
 def get_settings(user_id="admin") -> dict:
     """ユーザの頭脳/モデル/キー設定（行が無ければ既定）。キーも含むためサーバ内部用。"""
+    snapshot = _child_snapshot()
+    if snapshot is not None:
+        return {**_SETTINGS_DEFAULT, **snapshot["user"]}
     _ensure()
     with _connect() as c:
         row = c.execute(
@@ -104,6 +118,9 @@ def _read_system_settings_fresh(*, connect_timeout: float | None = None,
     """system_settings 全件を DB から直接読む（共有キャッシュ `_system_settings_cache` を参照も更新もしない）。
     `get_system_settings()` のキャッシュミス時の実体で、timeout 予算の配分は同一。`providers/__init__.py::get_provider` はこちらを直接呼び、他スレッドのキャッシュ状態に依らない値を得る。
     """
+    snapshot = _child_snapshot()
+    if snapshot is not None:
+        return dict(snapshot["system"])
     budget_started = time.monotonic()
     _ensure(connect_timeout=connect_timeout)
     connect_kwargs = {}

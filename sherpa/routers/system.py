@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 
 from fastapi import APIRouter, HTTPException, Request
@@ -260,9 +261,12 @@ def _audit_settings_update(uid: str, fields: dict) -> None:
 
 
 def _round_ollama_probe_detail(detail: str) -> str:
-    """`POST /settings/test`（provider=ollama）の失敗理由を丸める。Connection refused/timeout/reset/DNS 失敗の区別を出さない（内部ホスト/ポートの生死判別に使われないため）。認証失敗（401 相当）だけは区別を残す（`graph_extract._http_detail` の `f"{e.code} ...: ..."` 形式に先頭一致する）。"""
+    """`POST /settings/test`（provider=ollama）の失敗理由を丸める。Connection refused/timeout/reset/DNS 失敗の区別を出さない（内部ホスト/ポートの生死判別に使われないため）。認証失敗（401 相当）は詳細を残し、HTTP 応答が返った失敗（`graph_extract._http_detail` の `f"{e.code} ..."`／`HTTP {e.code}` 形式）は状態番号だけ残す。"""
     if detail.startswith("401"):
         return detail
+    m = re.match(r"(?:HTTP )?([1-5]\d\d)\b", detail)
+    if m:
+        return f"Ollama は応答しましたが、リクエストが失敗しました（HTTP {m.group(1)}）。モデルを取得済みか、接続先の設定を確認してください"
     return "Ollama への接続に失敗しました（詳細は表示しません）"
 
 
