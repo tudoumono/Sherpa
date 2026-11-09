@@ -123,7 +123,7 @@ def impact_list_of(answer) -> dict | None:
 
 
 def found_docs_of(answer) -> list[dict]:
-    """ほかに見つかった資料（Sherpa の読み取り機能で開いた記録なし）`[{path}]` を型の正しい形だけで返す。省いた件数は `found_docs_more`。"""
+    """ほかに見つかった資料（読み取り機能で開いた記録なし）`[{path}]` を型の正しい形だけで返す。省いた件数は `found_docs_more`。"""
     rows = answer.get("found_docs") if isinstance(answer, dict) else None
     if not isinstance(rows, list):
         return []

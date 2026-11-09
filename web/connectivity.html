@@ -20,7 +20,7 @@
   td{padding:7px 10px;border-bottom:1px solid var(--border);color:var(--ink);vertical-align:top}
   tr:hover td{background:var(--surface-2)}
   .state-cell{white-space:nowrap;font-weight:600}
-  .host-cell{font-family:var(--font-code,monospace);font-size:var(--text-caption);color:var(--ink-3);word-break:break-all}
+  .host-cell{font-family:var(--font-code,monospace);font-size:var(--text-caption);color:var(--ink-3);overflow-wrap:anywhere}
   .reason-cell{max-width:360px;font-size:var(--text-caption);color:var(--ink-3)}
   .time-cell{text-align:right;color:var(--ink-3);font-variant-numeric:tabular-nums;white-space:nowrap}
   .btnrow{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
@@ -60,7 +60,7 @@
             <button class="btn-secondary" id="check-paid-btn">お金のかかる分も確かめる</button>
           </div>
         </div>
-        <div class="hint">「確かめる」は無料の分だけです。お金のかかる分（埋め込み・回答の AI・Codex を OpenAI で使う場合）は、短い文を 1 回ずつ送ります。</div>
+        <div class="card-body"><div class="hint">「確かめる」は無料の分だけです。お金のかかる分（埋め込み・回答の AI・Codex を OpenAI で使う場合）は、短い文を 1 回ずつ送ります。</div></div>
       </div>
 
       <div id="paths"></div>

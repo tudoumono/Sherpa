@@ -1586,12 +1586,13 @@ def test_context_window_exceeded_sets_budget_headline_and_stop_kind(tmp_path, mo
     assert any("codex turn failed" in r.message and "context_window_exceeded" in r.message for r in caplog.records)
 
 
-def test_turn_failed_generic_code_keeps_legacy_headline(tmp_path, monkeypatch):
+def test_turn_failed_generic_code_shows_code_not_connection_failure(tmp_path, monkeypatch):
     from sherpa import stop_kind
     body = _PY + _emit({"type": "turn.failed", "error": {"code": "boom"}})
     _, env = _run_fake(tmp_path, monkeypatch, body, "turn-failed-generic-u1")
     assert env.get("codex_silent_failure") is True and env.get("codex_error_code") == "boom"
-    assert "Codex に接続できませんでした" in env["headline"] and "codex.log" in env["headline"]
+    assert "回答を返せずに終了しました（コード: boom）" in env["headline"] and "codex.log" in env["headline"]
+    assert "接続できませんでした" not in env["headline"]
     assert not (env.get("limits") or {}).get("total_budget_hit")
     assert stop_kind.resolve(env) == "codex_silent"
 

@@ -11,7 +11,7 @@ READ_LIMIT_BYTES = 2 * 1024 * 1024
 
 def read_text_via(resolve):
     """rel → 原本 Path（無ければ None）を返す `resolve` から、変更一覧を読む関数を作る。
-    2MB 以下のファイルを UTF-8（BOM 付き可）→ CP932 で読み、読めなければ None。秘匿名は読まない。"""
+    2MB 以下のファイルを UTF-8（BOM 付き可）→ CP932 → EUC-JP の順に判定して読み、読めなければ None。秘匿名は読まない。"""
     def read_text(rel: str):
         if text_kind.is_sensitive_doc_id(rel):
             return None

@@ -14,7 +14,7 @@ import { updateScopeHeader } from './scope.js';
 import { isSimpleMode, normalizeLens, setInquiryOpen, toolsForSend, toolsExplicitForSend } from './inquiry.js';
 import { updateShareButtonState } from '../chat.js';
 
-const $ = Sherpa.$, esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime;
+const $ = Sherpa.$, esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime, getJSON = Sherpa.getJSON;
 
 // ===== 思考の流れ（右ペイン） =====
 // 右ペイン見出しの状態表示を更新する（render.js からも呼ぶ）。
@@ -373,13 +373,34 @@ export function subscribeTurn(thinking) {
     _stopThinkingTicker();
     const tree = _finalizeLiveTraceTree(stopReasonInfo(treatAsStopped ? 'stopped' : 'error'));
     if (wasPending) pendingStopTraceTree = tree;
+    const lostTurnId = S.turnId, lostAnsEl = S.ansEl;
     setRt(treatAsStopped ? '停止しました' : '待機中', false); S.es.close(); S.es = null; S.turnId = null;
     setSendButtonStopping(false); $('messages').setAttribute('aria-busy', 'false');
-    if (thinking.isConnected) {
-      const t = thinking.querySelector('.thinking');
-      if (t) t.textContent = treatAsStopped ? '（停止しました）' : '接続エラー。もう一度お試しください。';
+    if (treatAsStopped) {
+      const t = thinking.isConnected && thinking.querySelector('.thinking');
+      if (t) t.textContent = '（停止しました）';
+    } else {
+      showDisconnectNote(thinking, lostAnsEl, lostTurnId);
     }
   };
+}
+// 購読が切れたとき、回答がサーバーで続いているかを 1 回だけ見て文を選ぶ。
+async function showDisconnectNote(thinking, ansEl, turnId) {
+  let msg = '接続エラー。もう一度お試しください。';
+  try {
+    const running = await getJSON('/chat/turns/running');
+    if ((running.turns || []).some((t) => t.turn_id === turnId)) {
+      msg = '接続が切れました。回答は続いています。会話を開き直すと続きが見られます。';
+    }
+  } catch (_) { /* 確認できなければ今の文のまま */ }
+  const t = thinking.isConnected && thinking.querySelector('.thinking');
+  if (t) { t.textContent = msg; return; }
+  if (ansEl && ansEl.isConnected) {
+    const note = document.createElement('div');
+    note.className = 'muted';
+    note.textContent = msg;
+    ansEl.appendChild(note);
+  }
 }
 // 入力欄の質問を送信する（POST /chat/turns → SSE 購読）。
 // override（省略可）: {lens, scope_paths, depth_profile, tools, doc_focus} の指定キーだけ、この1回の送信でブロックの設定の代わりに使う（確認カードの回答再送用）。

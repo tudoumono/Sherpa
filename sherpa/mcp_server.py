@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from collections import OrderedDict
@@ -214,9 +215,10 @@ def _toolset() -> str:
 _DESC_GRAPH_PLAIN = (
     "関係グラフから、ある名前（プログラム/コピーブック/ジョブ/データ項目/テーブルなど）の関連部品"
     "（コピー・呼び出し・参照・関連文書（言及）の近傍）を、辺ごとの種類と向き（from→to）付きの経路で返す。"
-    "COPIES／INVOKES／ACCESSES／CONTAINS だけの経路は構造的な依存＝根拠にしてよい（影響は矢印をさかのぼる: "
+    "COPIES／INVOKES／ACCESSES／CONTAINS／BUILT_FROM だけの経路は構造的な依存＝根拠にしてよい（影響は矢印をさかのぼる: "
     "A →COPIES→ B は B を変えると A が影響を受ける）。DOCUMENTS（言及）・CORRESPONDS_TO（同名の対応）や "
-    "`unverified` の辺を含む経路は候補＝原本で確認する。名前は完全一致で引く（シェルで正確な名前を見つけてから"
+    "`unverified` の辺を含む経路は候補＝原本で確認する。種類 Executable は呼ばれる実行名で、BUILT_FROM の先が材料のソース"
+    "（実行名は材料のソースとビルドの定義の行を根拠に書く）。名前は完全一致で引く（シェルで正確な名前を見つけてから"
     "渡す）。名前に当てはまる起点が多すぎる（既定 50 件超）ときは、関係をたどらずに too_broad（anchors・by_folder・by_kind の件数）を"
     "返す＝path_prefix（フォルダ）か kind（種類）で絞って聞き直す。近傍が上限で切られたときは truncated:true と count（総数）が付く＝その範囲は未確認として扱う。"
     "coverage.complete が false のとき（時間切れ・件数の上限・文書探索の打ち切り・カード数の上限）は、近傍が空でも"
@@ -518,7 +520,7 @@ def _coverage_detail(name: str, args) -> dict:
     elif name in READ_DOC_TOOLS or name in LISTED_DOC_TOOLS:
         detail["doc"] = _s("doc_id")
         if name == "read_doc":
-            detail["range"] = f"{_n('start_line') or 1} 行目から"
+            detail["range"] = f"{_n('start_line') or 1} 行目" + (f"の {_n('start_char')} 文字目" if _n("start_char") else "") + "から"
         elif name == "read_around":
             line, window = _n("line"), _n("window")
             if line is not None:
@@ -599,8 +601,8 @@ def _env_int_override(var_name: str) -> int | None:
     return v if v > 0 else None
 
 
-# 原本読取ツール 5 本。応答 1 件を Codex CLI が中央を落とす上限（約 40,000 バイト）より小さくするため、`SHERPA_MCP_READER_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
-_READER_BUDGET_TOOLS = frozenset({"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"})
+# 原本読取ツール 7 本（`read_doc`／`read_around` を含む）。応答 1 件を Codex CLI が中央を落とす上限（約 40,000 バイト）より小さくするため、`SHERPA_MCP_READER_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
+_READER_BUDGET_TOOLS = frozenset({"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "read_doc", "read_around"})
 # 検索ツール 2 本。同じく CLI が中央を落とさない大きさにするため、`SHERPA_MCP_SEARCH_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
 _SEARCH_BUDGET_TOOLS = frozenset({"ripgrep_search", "es_search"})
 
@@ -725,25 +727,33 @@ def _clip_hits_field(result: dict, max_bytes: int, *, offset: int, allow_next_of
     return _clip_hits_partial_first_hit(result, max_bytes, offset=offset, allow_next_offset=allow_next_offset)
 
 
-_PARTIAL_LINE_NOTE_TMPL = "先頭行が長すぎるため行の途中まで。以降は start_line={next_start} から"
+_PARTIAL_LINE_NOTE_TMPL = "行の途中まで。続きは start_line={line}・start_char={next_char} から"
 
 
 def _clip_read_doc_partial_first_line(result: dict, max_bytes: int, first_line: str, start_line: int):
-    """`_clip_read_doc_field` で 1 行も丸ごとは残せないときの最終手段。先頭行の本文をバイト単位で縮めて、空文字を返さない。
-    `end_line=start_line`（その行を消費済み扱い）にして進捗を保証する（進捗ゼロだと続きが重複拒否で進まない）。行の残りは読めない（`partial_line=true`・`note` で明示）。
+    """`_clip_read_doc_field` で 1 行も丸ごとは残せないときの最終手段。先頭行の本文を文字単位で縮める（毎回 1 文字以上進める）。
+    返した分だけを読んだ扱いにし、`next_char`（その行の続きの位置）と `partial_line=true` を付ける。
     """
-    first_bytes = first_line.encode("utf-8")
+    m = re.match(r"\d+: ", first_line)
+    prefix = m.group(0) if m else ""
+    content = first_line[len(prefix):]
+    base = result.get("start_char") if isinstance(result.get("start_char"), int) else 0
 
-    def _build(byte_len: int) -> dict:
+    def _build(n_chars: int) -> dict:
         r = dict(result)
-        r["text"] = agentic_search._clip_utf8_bytes(first_line, byte_len)
+        r["text"] = prefix + content[:n_chars]
         r["truncated"] = True
-        r["partial_line"] = True
         r["end_line"] = start_line
-        r["note"] = _PARTIAL_LINE_NOTE_TMPL.format(next_start=start_line + 1)
+        if n_chars < len(content):
+            r["partial_line"] = True
+            r["next_char"] = base + n_chars
+            r["note"] = _PARTIAL_LINE_NOTE_TMPL.format(line=start_line, next_char=base + n_chars)
+        else:
+            r.pop("next_char", None)
+            r.pop("partial_line", None)
         return r
 
-    lo, hi, best = 0, len(first_bytes), -1
+    lo, hi, best = 1, len(content), 0
     while lo <= hi:
         mid = (lo + hi) // 2
         if _json_bytes(_build(mid)) <= max_bytes:
@@ -751,7 +761,7 @@ def _clip_read_doc_partial_first_line(result: dict, max_bytes: int, first_line: 
             lo = mid + 1
         else:
             hi = mid - 1
-    if best < 0:
+    if best < 1:
         return None
     return _build(best), True
 

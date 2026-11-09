@@ -223,7 +223,7 @@ def test_calls_section_is_dropped_before_the_ledger_and_is_rendered_in_the_downl
         {"complete": True, "truncated": False, "manifest": {"question_kind": "qa"}, "items": items, "coverage": {},
          "reviews": [], "detail": {"calls": small}})
     assert "## 調べた経路" in md and "記録の欠け 1 行" in md and "es_search" in md and "下調べ役" in md
-    assert "## 見つかった資料（検索の結果）" in md and "a.md（行: 3 / 検索語: 端数 / Sherpa の読み取り機能で開いた記録なし）" in md
+    assert "## 見つかった資料（検索の結果）" in md and "a.md（行: 3 / 検索語: 端数 / 読み取り機能で開いた記録なし）" in md
     # 経路の無い記録のダウンロードは今までどおり（節が増えない）
     plain = investigation_record_render.render_markdown(
         {"complete": True, "truncated": False, "manifest": None, "items": items, "coverage": {}, "reviews": [], "detail": {}})

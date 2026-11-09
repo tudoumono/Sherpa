@@ -1,7 +1,8 @@
 // 全ページ共通の上部ナビ（タブ）＝再利用コンポーネント。各ページは <sherpa-topbar></sherpa-topbar>
 // を置き、このファイルを <head> で読み込むだけ。現在の画面は URL から判定してタブを強調する。
-// テーマ切替ボタン(#themebtn)は要素だけ用意し、挙動は各ページのスクリプトが担う（ページ固有の
-// 再描画があるため）。リンク/ラベルはすべて固定値＝XSS 非該当。
+// テーマ切替ボタン(#themebtn)の印と切り替え（dataset.theme・localStorage）もここが担い、切り替えたら
+// document へ 'sherpa-themechange' を出す（別ドキュメントの埋め込み枠を持つ画面だけが受ける）。
+// リンク/ラベルはすべて固定値＝XSS 非該当。
 'use strict';
 
 (function () {
@@ -114,6 +115,20 @@
         + '<button class="umitem" id="um-logout" type="button" role="menuitem">ログアウト</button>'
         + '<div class="um-note" id="um-note" hidden>認証は無効です（開発モード）</div>'
         + '</div></div>';
+
+      const themeBtn = document.getElementById('themebtn');
+      const themeIcon = () => {
+        themeBtn.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙';
+      };
+      themeIcon();
+      themeBtn.addEventListener('click', () => {
+        const d = document.documentElement;
+        const next = d.dataset.theme === 'dark' ? 'light' : 'dark';
+        d.dataset.theme = next;
+        try { localStorage.setItem('sherpa-theme', next); } catch (e) { /* 保存できなくても切り替えは効く */ }
+        themeIcon();
+        document.dispatchEvent(new CustomEvent('sherpa-themechange'));
+      });
 
       // ユーザードロップダウン（全ページ共通）。開閉は #topbar-user クリックでトグル、外側クリック／Escape で閉じる（.brainmenu と同じ流儀＋a11y追加）。
       const userBtn = document.getElementById('topbar-user');

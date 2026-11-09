@@ -10,11 +10,13 @@ import logging
 from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.responses import Response
 
-from sherpa import doc_ledger, documents, store, worlds
+from sherpa import build_marks, doc_ledger, documents, store, worlds
 from sherpa.deps import _WORLD_PATTERN, _current_user, _require_admin
 from sherpa.fd_response import content_disposition
-from sherpa.ingest.period_text import READ_LIMIT_BYTES, read_text_via  # noqa: F401
+from sherpa.ingest import world_neo4j
+from sherpa.ingest.build_link import marks_signature
 from sherpa.ingest.check import inspect_folder, to_json, to_markdown
+from sherpa.ingest.period_text import READ_LIMIT_BYTES, read_text_via  # noqa: F401
 
 _log = logging.getLogger("sherpa")
 
@@ -38,6 +40,15 @@ def _ledger_at(world: str):
     return at.isoformat() if at else None
 
 
+def _build_state(world: str) -> dict:
+    """決まり 5 の材料（最後のグラフの報告と今の印の値）。グラフを読めないときの報告は None。"""
+    try:
+        return {"report": world_neo4j.read_build_report(world), "marks_sig": marks_signature(build_marks.load(world))}
+    except Exception:  # noqa: BLE001
+        _log.warning("folder-check: グラフの報告を読めませんでした world=%s", world, exc_info=True)
+        return {"report": None, "marks_sig": ""}
+
+
 @router.get("/worlds/{wid}/folder-check", tags=["資料フォルダ(World)管理"])
 def folder_check(request: Request, wid: str = Path(..., pattern=_WORLD_PATTERN),
                  format: str = Query("json", pattern="^(json|md)$")):
@@ -52,7 +63,7 @@ def folder_check(request: Request, wid: str = Path(..., pattern=_WORLD_PATTERN),
     if rels is None:
         raise HTTPException(409, NO_LEDGER_MESSAGE)
     name = worlds.world_label(wid)
-    report = inspect_folder(rels, read_text_of(wid))
+    report = inspect_folder(rels, read_text_of(wid), build=_build_state(wid))
     if format == "md":
         return Response(to_markdown(report, name), media_type="text/markdown; charset=utf-8",
                         headers={"Content-Disposition": content_disposition(f"{name}-点検.md")})

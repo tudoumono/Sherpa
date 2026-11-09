@@ -30,12 +30,24 @@ let _seq = 0;   // 期間・絞り込みの連打で、後着の古い応答が�
 function fmtDate(iso) { return iso ? String(iso).slice(0, 16).replace('T', ' ') : '—'; }
 function fmtMs(ms) { return ms == null ? '—' : (ms >= 1000 ? `${(ms / 1000).toFixed(1)} 秒` : `${ms} ms`); }
 
+let _adminErr = '';
+// 戻り値は 'admin'／'denied'（401・403・管理者でない）／'unreachable'（判定できなかった。理由は _adminErr）。
 async function checkAdmin() {
   try {
     const u = await getJSON('/auth/me');
-    if (u && u.role === 'admin') return true;
-  } catch (_) { /* 管理者でない扱い */ }
-  return false;
+    return u && u.role === 'admin' ? 'admin' : 'denied';
+  } catch (e) {
+    if (e && (e.status === 401 || e.status === 403)) return 'denied';
+    _adminErr = (e && e.message) || '';
+    return 'unreachable';
+  }
+}
+
+function showUnreachable(denied) {
+  const d = denied && denied.querySelectorAll('div');
+  if (!d || d.length < 3) return;
+  d[1].textContent = '権限を確認できませんでした: ' + _adminErr;
+  d[2].textContent = '時間をおいて画面を開き直してください。';
 }
 
 function pairRows(rows, keyName, map) {
@@ -73,8 +85,8 @@ function itemRow(it) {
   return `<tr><td class="nw">${esc(fmtDate(it.created_at))}</td><td>${esc(user)}</td>`
     + `<td class="nw ${it.rating === 'up' ? 'up' : 'down'}">${it.rating === 'up' ? '👍' : '👎'}</td>`
     + `<td>${tags}</td><td>${esc(it.comment || '')}</td><td>${esc(it.question_head || '')}</td>`
-    + `<td>${esc(label(MODE_LABEL, it.mode))}</td><td>${esc(label(PROVIDER_LABEL, it.provider))}</td>`
-    + `<td>${esc(label(COMPLETION_LABEL, it.completion))}</td><td class="num nw">${esc(fmtMs(it.duration_ms))}</td></tr>`;
+    + `<td class="nw">${esc(label(MODE_LABEL, it.mode))}</td><td class="nw">${esc(label(PROVIDER_LABEL, it.provider))}</td>`
+    + `<td class="nw">${esc(label(COMPLETION_LABEL, it.completion))}</td><td class="num nw">${esc(fmtMs(it.duration_ms))}</td></tr>`;
 }
 
 function itemsQuery(before) {
@@ -116,7 +128,7 @@ async function load() {
     await loadItems(false);
     if (seq === _seq) $('load-status').textContent = `直近 ${_days} 日間の評価です。`;
   } catch (e) {
-    if (seq === _seq) $('load-status').textContent = '読み込めませんでした。時間をおいてもう一度お試しください。';
+    if (seq === _seq) $('load-status').textContent = `読み込めませんでした: ${e.message}`;
   }
 }
 
@@ -126,17 +138,19 @@ document.querySelectorAll('.period-bar .filterchip').forEach((b) => b.addEventLi
 }));
 ['f-rating', 'f-tag'].forEach((id) => $(id).addEventListener('change', () => {
   _seq++;
-  loadItems(false).catch(() => { $('load-status').textContent = '一覧を読み込めませんでした。'; });
+  loadItems(false).catch((e) => { $('load-status').textContent = `読み込めませんでした: ${e.message}`; });
 }));
 $('more-btn').addEventListener('click', () => {
-  loadItems(true).catch(() => { $('load-status').textContent = '続きを読み込めませんでした。'; });
+  loadItems(true).catch((e) => { $('load-status').textContent = `読み込めませんでした: ${e.message}`; });
 });
 
 (async () => {
-  if (!(await checkAdmin())) {
+  const adminState = await checkAdmin();
+  if (adminState !== 'admin') {
     const main = $('main-content'), denied = $('access-denied');
     if (main) main.style.display = 'none';
     if (denied) denied.style.display = 'block';
+    if (adminState === 'unreachable') showUnreachable(denied);
     return;
   }
   await load();

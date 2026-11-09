@@ -67,6 +67,13 @@ function renderPath(p) {
 
 let _busy = false;
 
+// 前回の表を残さず、今回は確認できなかったことを出す。
+function showFailed(reason) {
+  $('paths').innerHTML = `<div class="hint">確認できませんでした: ${esc(String(reason))}</div>`;
+  $('checked-at').textContent = '最終確認: 失敗（' + new Date().toLocaleString('ja-JP', { hour12: false }) + '）';
+  toast('確認に失敗しました');
+}
+
 async function runCheck(includePaid) {
   if (_busy) return;
   _busy = true;
@@ -81,12 +88,16 @@ async function runCheck(includePaid) {
       body: JSON.stringify({ include_paid: includePaid }),
     });
     if (r.status === 409) { toast('ほかの確認が実行中です。終わってからもう一度お試しください'); return; }
-    if (!r.ok) { toast('確認に失敗しました'); return; }
+    if (!r.ok) {
+      const body = await r.json().catch(() => null);
+      showFailed((body && typeof body.detail === 'string' && body.detail) || `HTTP ${r.status}`);
+      return;
+    }
     const d = await r.json();
     $('paths').innerHTML = (d.paths || []).map(renderPath).join('');
     $('checked-at').textContent = '最終確認: ' + new Date().toLocaleString('ja-JP', { hour12: false });
-  } catch (_) {
-    toast('確認に失敗しました');
+  } catch (e) {
+    showFailed((e && e.message) || '通信に失敗しました');
   } finally {
     free.textContent = origFree; paid.textContent = origPaid;
     free.disabled = false; paid.disabled = false;

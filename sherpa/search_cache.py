@@ -51,7 +51,7 @@ def _stamp() -> str:
              sorted(text_kind.SENSITIVE_EXT), text_kind.MAX_BYTES, sorted(text_kind._SENSITIVE_NAME_EXACT),
              text_kind._SENSITIVE_NAME_PREFIXES, text_kind.NOISE_NAME_PREFIXES,
              sorted(corpus_docs._NONCODE_DOCTYPE.items()), sorted(corpus_docs._OFFICE_DOCTYPE.items()),
-             text_encoding.UNDETERMINED_RATIO, text_encoding.DETECT_CAP_BYTES)
+             text_encoding.UNDETERMINED_RATIO, text_encoding.DETECT_CAP_BYTES, text_encoding.DETECT_VERSION)
     return f"{_SCHEMA}:{hashlib.sha1(repr(parts).encode('utf-8')).hexdigest()}"
 
 

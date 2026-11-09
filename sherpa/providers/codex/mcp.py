@@ -25,7 +25,7 @@ NETWORK_PASSTHROUGH_ENV: tuple[str, ...] = (
 
 
 # 値が秘密になり得る変数（パスワード・資格情報入りの URL）。Codex の引数へ値を出さず、名前だけ `env_vars` で渡す。
-SECRET_PASSTHROUGH_ENV: tuple[str, ...] = ("NEO4J_PASSWORD", "NEO4J_URI", "ES_URL")
+SECRET_PASSTHROUGH_ENV: tuple[str, ...] = ("NEO4J_PASSWORD", "NEO4J_URI", "ES_URL", "SHERPA_MCP_SETTINGS")
 
 
 def _toml_str(s) -> str:
@@ -43,6 +43,17 @@ def _abs_kb_or_derived(raw_value: str | None, subpath: str) -> str:
     return str((worlds._repo_root() / subpath).resolve())
 
 
+def _settings_snapshot_env(excluded_key: str) -> dict:
+    """親が読んだ全体設定と管理者の設定の写しを env にする。DB が読めないときは空の写しを渡す。"""
+    from ... import store
+    try:
+        system = {k: v for k, v in store.get_system_settings().items() if k != excluded_key}
+        user = store.get_settings()
+    except Exception:
+        system, user = {}, {}
+    return {store.CHILD_SNAPSHOT_ENV: json.dumps({"system": system, "user": user})}
+
+
 def _mcp_env(world: str, scope_paths, ask_disabled: bool = False, layer=None, rules=None) -> dict:
     """MCP サーバ（Sherpa 側プロセス）が world/scope と Neo4j/ES を解決するための env。
 
@@ -54,6 +65,7 @@ def _mcp_env(world: str, scope_paths, ask_disabled: bool = False, layer=None, ru
     (e) `SHERPA_OFFICE_COM_URL`/`SHERPA_OFFICE_COM_TOKEN` は渡さない（共有シークレットを露出させない）。
     (h) `rules`（省略可）: 1 回の依頼で読んだ管理者の除外の規則。渡されたら読み直さずその写しを子へ渡す（permission profile の deny と同じスナップショット）。
     (f) `layer` は `layer.normalize_layer()` で検証し、`"docs"/"code"` のときだけ `SHERPA_MCP_LAYER` を渡す（不正値は `ValueError`）。qa レンズだけが実値を渡す。
+    (i) 全体設定と管理者の設定は、親が読んだ写しを `SHERPA_MCP_SETTINGS` で渡す（埋め込みの接続先と鍵を子が DB なしで使う・鍵を含むので引数に出さない）。
     (g) 管理者の優先・除外（`path_rules`）は、設定がある資料フォルダだけ `SHERPA_MCP_PATH_RULES` に JSON の写しを渡す（子は DB を読めない）。
     """
     from ... import worlds
@@ -89,6 +101,7 @@ def _mcp_env(world: str, scope_paths, ask_disabled: bool = False, layer=None, ru
     env["SHERPA_LEGACY_EXTS"] = ",".join(sorted(legacy_convert.legacy_exts()))
     # vision（VLM）の実効可用性スナップショット（1bit のみ・secrets は渡さない）。
     env["SHERPA_VLM_USABLE"] = "1" if vision_arm.resolve_vlm() is not None else "0"
+    env.update(_settings_snapshot_env(path_rules.SETTINGS_KEY))
     try:
         wd = worlds.world_dir(world)
         if wd:
@@ -211,6 +224,7 @@ def _mcp_config_args(world: str, scope_paths, ask_disabled: bool = False, layer=
     """codex exec に sherpa MCP サーバ(stdio)を登録する -c 引数（per-request＝~/.codex 設定を汚さない）。
     `extra_env`（省略可）: `_mcp_env` の結果に上書きマージする追加 env。
     """
+    from ... import store
     py = sys.executable or "python3"
     env = _mcp_env(world, scope_paths, ask_disabled, layer=layer, rules=rules)
     if extra_env:
@@ -226,5 +240,7 @@ def _mcp_config_args(world: str, scope_paths, ask_disabled: bool = False, layer=
             "-c", 'mcp_servers.sherpa.args = ["-m", "sherpa.mcp_server"]',
             "-c", f"mcp_servers.sherpa.env = {env_toml}",
             "-c", f"mcp_servers.sherpa.env_vars = {env_vars_toml}",
+            # 設定の写しは鍵を含む。Codex のシェルの env には載せない。
+            "-c", f"shell_environment_policy.exclude = [{_toml_str(store.CHILD_SNAPSHOT_ENV)}]",
             "-c", 'mcp_servers.sherpa.default_tools_approval_mode = "approve"',
             "-c", 'approval_policy = "never"']

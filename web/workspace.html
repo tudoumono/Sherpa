@@ -77,6 +77,7 @@
     <!-- アップロードエリア -->
     <div class="card" style="margin-bottom:18px">
       <div class="card-head">ファイルをアップロード</div>
+      <div class="card-body">
       <div class="upload-zone" id="dropzone">
         <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.cbl,.cob,.cobol,.cpy,.copybook,.jcl,.sql,.py,.sh,.bat">
         <div class="uh">クリックまたはドラッグ＆ドロップ</div>
@@ -86,6 +87,7 @@
         <div class="progress-bar" id="progress-bar" style="width:0%"></div>
       </div>
       <div id="upload-msg" style="font-size:var(--text-small);margin-top:6px;min-height:16px"></div>
+      </div>
     </div>
 
     <!-- ファイル一覧 -->
@@ -104,6 +106,7 @@
     <!-- 個人 grep 検索 -->
     <div class="card">
       <div class="card-head">個人ファイル内を検索</div>
+      <div class="card-body">
       <div class="notice" style="margin-bottom:10px">
         この検索は <strong>あなたのファイルだけ</strong> を対象にします。
         社内資料の引用源にはなりません。
@@ -113,6 +116,7 @@
         <button class="btn-primary" id="search-btn">検索</button>
       </div>
       <div id="search-results"></div>
+      </div>
     </div>
   </div>
 </div>

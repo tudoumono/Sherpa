@@ -967,7 +967,7 @@ const _WHY_VIA = {
   cics_xctl: 'を呼び出しています', cics_link: 'を呼び出しています', mapper_sql: 'の表を SQL で参照しています', vba_sql: 'の表を SQL で参照しています',
   write_file: 'に書き出されています', read_file: 'を読み込んでいます', use: 'を使っています',
 };
-const _WHY_TYPE = { INVOKES: 'を呼び出しています', COPIES: 'を取り込んでいます', ACCESSES: 'を参照しています', CONTAINS: 'を含んでいます' };
+const _WHY_TYPE = { INVOKES: 'を呼び出しています', COPIES: 'を取り込んでいます', ACCESSES: 'を参照しています', CONTAINS: 'を含んでいます', BUILT_FROM: 'を材料にして作られています' };
 const _WHY_RULE = {
   alias: '別名の指定で決まりました', single_import: 'import で指定された型に一致しました', same_package: '同じ package（名前空間）の名前に一致しました',
   wildcard: 'import（まとめて指定）の範囲で一致しました', qualified_name: '完全な名前で一致しました', path_exact: '書かれたパスのとおりに一致しました',
@@ -975,6 +975,7 @@ const _WHY_RULE = {
   schema_unqualified: '名前が一致しました（定義側にスキーマ名なし）', table_name: '表の名前で一致しました', nearest_name: '一番近い場所の同じ名前に一致しました',
   di_qualifier: '注入で指定された名前が実装の名前に一致しました', di_primary: '実装のうち優先の指定が付いたものに決まりました',
   di_single_impl: '実装が 1 つだけでした',
+  build_definition: 'ビルドの定義に書かれた実行名と材料の組で決まりました',
   dd_name_match: 'プログラムのファイル名の指定と、ジョブのデータセットの指定が一致しました', copy_item_name: 'COPY で取り込んだ項目の名前に一致しました',
 };
 // 辺 1 本の「参照元」の平文（文書と行を複数・切った分は「ほか N 件」）。根拠（sources）のある辺だけ出す。
@@ -1199,13 +1200,13 @@ export function howText(answer) {
   const base = h.mode === 'author' ? '作る' : h.mode === 'investigate' ? '調べる' : '';
   return base ? (h.doc_focus === true && h.mode === 'investigate' ? '資料中心の指定で調べました' : base) : '';
 }
-export const MENTIONED_ONLY_NOTE = '（本文で名前が出た資料・Sherpa の読み取り機能で開いた記録なし）';
+export const MENTIONED_ONLY_NOTE = '（本文で名前が出た資料・読み取り機能で開いた記録なし）';
 // 本文で名前が出ただけの資料の印。開いた行の範囲がある行（下調べ役が開いた資料など）では開いた記録なしと言わない。
 export const mentionedOnlyNote = (r) => (r.ranges.length || r.rangesMore ? '（本文で名前が出た資料）' : MENTIONED_ONLY_NOTE);
 export const rangeText = (r) => r.ranges.map((x) => (x[0] === x[1] ? `行${x[0]}` : `行${x[0]}-${x[1]}`)).join('、');
 // 新しい形の回答（`referenced_docs` の欄がある）。無い古い回答は出典の 2 群（`renderSources`）と該当箇所（`renderQa`）で出す。
 const hasReferencedDocs = (answer) => !!answer && Array.isArray(answer.referenced_docs);
-// 参照した資料（原本をダウンロード）。資料ごとに原本のリンク・Sherpa の読み取り機能で開いた行の範囲・中身を確かめていない注記を出す。
+// 参照した資料（原本をダウンロード）。資料ごとに原本のリンク・読み取り機能で開いた行の範囲・中身を確かめていない注記を出す。
 // 設計: docs/design/chat.md「1ターンの流れ」
 function renderReferencedDocs(answer, evidencePacket) {
   const { rows, hidden, more } = referencedDocRows(answer);
@@ -1221,8 +1222,8 @@ function renderReferencedDocs(answer, evidencePacket) {
       + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(r.path))}`;
   };
   return head
-    + rows.map((r) => `<div class="sources-unverified-row">${link(r)}${r.ranges.length ? `<span class="muted">（Sherpa の読み取り機能で開いた: ${esc(rangeText(r))}${r.rangesMore ? `、ほか ${r.rangesMore} か所` : ''}）</span>` : (r.rangesMore ? `<span class="muted">（Sherpa の読み取り機能で開いた: ほか ${r.rangesMore} か所）</span>` : '')}`
-      + `${r.unopened && !r.mentionedOnly ? '<span class="muted">（Sherpa の読み取り機能で開いた記録なし）</span>' : ''}`
+    + rows.map((r) => `<div class="sources-unverified-row">${link(r)}${r.ranges.length ? `<span class="muted">（読み取り機能で開いた: ${esc(rangeText(r))}${r.rangesMore ? `、ほか ${r.rangesMore} か所` : ''}）</span>` : (r.rangesMore ? `<span class="muted">（読み取り機能で開いた: ほか ${r.rangesMore} か所）</span>` : '')}`
+      + `${r.unopened && !r.mentionedOnly ? '<span class="muted">（読み取り機能で開いた記録なし）</span>' : ''}`
       + `${r.mentionedOnly ? `<span class="muted">${mentionedOnlyNote(r)}</span>` : ''}</div>`).join('')
     + (more ? `<div class="sources-unverified-row muted">ほか ${more} 件</div>` : '')
     + (hidden ? `<div class="sources-unverified-row muted">名前を表示できない資料 ${hidden} 件</div>` : '') + '</div>';
@@ -1247,7 +1248,7 @@ function renderImpactList(answer) {
 function renderFoundDocs(answer) {
   const { rows, hidden, more } = foundDocRows(answer);
   if (!rows.length && !hidden && !more) return '';
-  return '<details class="sources found-docs"><summary class="h">ほかに見つかった資料（Sherpa の読み取り機能で開いた記録なし）</summary>'
+  return '<details class="sources found-docs"><summary class="h">ほかに見つかった資料（読み取り機能で開いた記録なし）</summary>'
     + rows.map((p) => `<div class="sources-unverified-row">${esc(p)}</div>`).join('')
     + (more ? `<div class="sources-unverified-row muted">ほか ${more} 件（上限で省略）</div>` : '')
     + (hidden ? `<div class="sources-unverified-row muted">名前を表示できない資料 ${hidden} 件</div>` : '') + '</details>';

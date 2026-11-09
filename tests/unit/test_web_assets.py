@@ -74,10 +74,11 @@ _NAV_SHERPA_MEMBER_RE = re.compile(r"^\s*([A-Za-z_$][\w$]*)\s*:", re.M)
 _WINDOW_ASSIGN_RE = re.compile(r"window\.([A-Za-z_$][\w$]*)\s*=")
 
 NAV_SHERPA_MEMBERS = {"$", "esc", "api", "getJSON", "fmtDateTime", "downloadBlob", "analyzerLabel", "mdLite",
-                      "visibilityInterval"}  # POLL-1（性能台帳 QW4）: 非表示タブで止まる setInterval ラッパ
-# 例外は common.js の Sherpa（共通ユーティリティ・フェーズ6 S2 で nav.js から分離）と
-# chat.js の e2e seam __sherpaChatTest のみ（危険地雷1・window 公開名 golden 節）。
-WINDOW_ASSIGNMENT_ALLOWLIST = {"Sherpa", "__sherpaChatTest"}
+                      "visibilityInterval",  # POLL-1（性能台帳 QW4）: 非表示タブで止まる setInterval ラッパ
+                      "comparePath"}         # 資料の画面の木・表・優先と除外の木の並び
+# 例外は common.js の Sherpa（共通ユーティリティ・フェーズ6 S2 で nav.js から分離）・
+# chat.js の e2e seam __sherpaChatTest・資料の画面のタブ切り替え IngestTabs と優先と除外 RulesTab のみ（危険地雷1・window 公開名 golden 節）。
+WINDOW_ASSIGNMENT_ALLOWLIST = {"Sherpa", "__sherpaChatTest", "IngestTabs", "RulesTab"}
 
 
 def _web_js_files() -> list[pathlib.Path]:
@@ -138,7 +139,7 @@ def test_dom_id_references_resolve_to_existing_ids():
     for html_path in sorted(WEB.glob("*.html")):
         page_js = _page_js_closure(html_path)
         if not page_js:
-            continue   # ingest-new.html: リダイレクト stub・自前 JS 無し
+            continue   # ingest-new.html・rules.html: リダイレクト stub・自前 JS 無し
         html_ids = set(_ID_ATTR_RE.findall(html_path.read_text(encoding="utf-8")))
         used_ids: set[str] = set()
         own_generated_ids: set[str] = set()
@@ -228,7 +229,7 @@ def test_script_tag_order_matches_golden():
 
 def test_nav_sherpa_members_match_fixed_set():
     """`window.Sherpa`（common.js の共通ユーティリティ・フェーズ6 S2 で nav.js から分離）の
-    メンバー構成が固定9種のまま変わっていない（9種目= POLL-1 の visibilityInterval）。"""
+    メンバー構成が固定10種のまま変わっていない（9種目= POLL-1 の visibilityInterval・10種目= comparePath）。"""
     text = (WEB / "common.js").read_text(encoding="utf-8")
     m = re.search(r"window\.Sherpa\s*=\s*window\.Sherpa\s*\|\|\s*\{(.*?)\n\};", text, re.S)
     assert m, "window.Sherpa の定義が見つからない（common.js の実装が変わった）"

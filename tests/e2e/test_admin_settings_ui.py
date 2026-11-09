@@ -416,7 +416,7 @@ def test_vlm_renders_and_saves(page, web_base_url):
 
     page.locator("#vlm-provider").select_option("openai")
     expect(page.locator("#vlm-key-missing")).to_be_visible()
-    expect(page.locator("#vlm-key-missing")).to_contain_text("OPENAI_API_KEY")
+    expect(page.locator("#vlm-key-missing")).to_contain_text("「プロバイダ＋接続先」タブ")
     page.locator("#vlm-cloud-allowed").check()
     page.locator("#vlm-model").fill("gpt-4o")
     _save_ok(page)
@@ -498,7 +498,7 @@ def test_extkeys_tab_reset_confirms_when_self_issued_keys_active(page, web_base_
 
 
 def test_research_tab_reset_nulls_all_keys_and_keeps_provider_draft(page, web_base_url):
-    """調査・回答タブのリセットは12キー全てを null で送り、プロバイダタブの未保存キー入力は残す。"""
+    """調査・回答タブのリセットは13キー全てを null で送り、プロバイダタブの未保存キー入力は残す。"""
     view = _view()
     view["depth_profile"]["grep_max_hits"] = {"configured": 20, "effective": 20, "default": 30}
     view["agentic_budget"]["per_result"] = {"configured": 100_000, "effective": 100_000, "default": 262144}
@@ -512,11 +512,11 @@ def test_research_tab_reset_nulls_all_keys_and_keeps_provider_draft(page, web_ba
     page.locator('[data-reset-tab="research"]').click()
     expect(page.locator('#tab-reset-res-research')).to_contain_text('既定に戻しました')
     body = records['admin_settings_put'][-1]
-    assert len(body) == 12 and all(value is None for value in body.values())
+    assert len(body) == 13 and all(value is None for value in body.values())
     assert set(body) == {
         'depth_base_grep_max_hits', 'depth_base_qa_max_hits',
         'depth_base_read_window', 'depth_base_impact_depth', 'depth_base_troubleshoot_depth',
-        'depth_base_codex_reasoning', 'embed_parallel',
+        'depth_base_codex_reasoning', 'embed_parallel', 'embed_dim',
         'max_review_rounds', 'codex_worker_model', 'codex_session_retention_days',
         'agentic_budget_per_result', 'codex_mode',
     }
@@ -720,7 +720,7 @@ def test_cloud_key_clear_preserves_unsaved_edits_dot_and_updates_vlm_warning(pag
 
     open_tab(page, "ingest")
     expect(page.locator("#vlm-key-missing")).to_be_visible()
-    expect(page.locator("#vlm-key-missing")).to_contain_text("OPENAI_API_KEY")
+    expect(page.locator("#vlm-key-missing")).to_contain_text("「プロバイダ＋接続先」タブ")
 
 
 def _start_pending_key_clear(page, web_base_url):

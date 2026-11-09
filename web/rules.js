@@ -1,9 +1,10 @@
-// 資料の優先と除外の画面（admin 専用）。フォルダの木（GET /admin/path-rules）とフォルダ直下のファイル（GET /admin/path-rules/files）に、
+// 資料の画面の「優先と除外」タブ（admin 専用）。フォルダの木（GET /admin/path-rules）とフォルダ直下のファイル（GET /admin/path-rules/files）に、
 // 「なし／優先／除外」と、優先の「範囲の外でも読む」を付ける。保存は「保存する…」で変更の一覧を確かめてから PUT /admin/path-rules。
 // 設計: docs/design/settings.md「優先と除外」
 // セキュリティ: server data（フォルダ名・ファイル名）は全て esc()。インラインハンドラ無し（委譲）。
 'use strict';
 
+(() => {
 const $ = Sherpa.$, esc = Sherpa.esc, api = Sherpa.api;
 
 const LABEL = { priority: '優先', exclude: '除外', none: 'なし' };
@@ -15,6 +16,9 @@ const state = {
   open: new Set(['']),
   saved: new Map(),       // path → {kind, outside}
   draft: new Map(),
+  buildSaved: new Map(),  // path → 'read'｜'skip'
+  buildDraft: new Map(),
+  layout: new Set(),      // 置き方から読むフォルダ
   filter: 'all',
   query: '',
 };
@@ -23,14 +27,6 @@ function toast(msg) {
   const t = $('toast'); if (!t) return;
   t.textContent = msg; t.classList.add('show');
   clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2800);
-}
-
-async function checkAdmin() {
-  let r;
-  try { r = await fetch('/auth/me'); } catch (_) { return 'unreachable'; }
-  if (r.status === 401 || r.status === 403) return 'denied';
-  if (!r.ok) return 'unreachable';
-  try { const u = await r.json(); return u && u.role === 'admin' ? 'admin' : 'denied'; } catch (_) { return 'unreachable'; }
 }
 
 const base = (p) => p.split('/').pop();
@@ -57,6 +53,31 @@ function effective(p, m) {
 
 const changedPaths = () => [...new Set([...state.draft.keys(), ...state.saved.keys()])]
   .filter((p) => !sameRule(ruleOf(state.draft, p), ruleOf(state.saved, p))).sort();
+
+const BUILD_LABEL = { '': '置き方に従う', read: '読む場所にする', skip: '読む場所にしない' };
+const changedBuild = () => [...new Set([...state.buildDraft.keys(), ...state.buildSaved.keys()])]
+  .filter((p) => (state.buildDraft.get(p) || '') !== (state.buildSaved.get(p) || '')).sort();
+const isDirty = () => changedPaths().length > 0 || changedBuild().length > 0;
+const inLayout = (p, dir) => (dir && state.layout.has(p)) || ancestors(p).some((a) => state.layout.has(a));
+
+function buildCell(e) {
+  const own = state.buildDraft.get(e.path) || '';
+  const opt = (v) => `<option value="${v}"${own === v ? ' selected' : ''}>${BUILD_LABEL[v]}</option>`;
+  const anc = ancestors(e.path).find((a) => state.buildDraft.has(a));
+  const note = own ? '' : (anc ? `親の「${base(anc)}」の印に従います` : (inLayout(e.path, e.dir) ? '置き方から: ビルドの定義を読む場所' : ''));
+  return `<span class="tset"><select data-build="${esc(e.path)}" aria-label="${esc(base(e.path))}のビルドの定義の印">${opt('')}${opt('read')}${opt('skip')}</select>`
+    + (note ? `<span class="tnote">${esc(note)}</span>` : '') + '</span>';
+}
+
+function setBuild(path, mark) {
+  if (mark) state.buildDraft.set(path, mark); else state.buildDraft.delete(path);
+  render();
+}
+
+// 保存していない変更があるまま離れるときだけ、ブラウザ標準の確認を出す。
+window.addEventListener('beforeunload', (e) => {
+  if (isDirty()) e.preventDefault();
+});
 
 function setRule(path, kind, outside) {
   if (ruledAncestor(path, state.draft) !== null) return;  // 親に付いている間は、配下は個別に変えられない
@@ -100,8 +121,8 @@ function visibleRows() {
   const seen = new Set(state.folders.map((f) => f.path));
   for (const list of state.files.values()) for (const p of list) if (!seen.has(p)) { seen.add(p); entries.push({ path: p, dir: false }); }
   // まだ開いていないフォルダの中のファイルでも、設定が付いているものは一覧に出す（絞り込みで見つけられるように）
-  for (const p of [...state.draft.keys(), ...state.saved.keys()]) if (!seen.has(p)) { seen.add(p); entries.push({ path: p, dir: false }); }
-  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  for (const p of [...state.draft.keys(), ...state.saved.keys(), ...state.buildDraft.keys()]) if (!seen.has(p)) { seen.add(p); entries.push({ path: p, dir: false }); }
+  entries.sort(Sherpa.comparePath);
   const keep = new Set();
   if (filtering) {
     for (const e of entries) if (matches(e.path)) { keep.add(e.path); ancestors(e.path).forEach((a) => keep.add(a)); }
@@ -141,18 +162,19 @@ function rowHTML(e) {
         ? `<label><input type="checkbox" data-out="${esc(e.path)}"${own.outside ? ' checked' : ''}> 範囲の外でも読む</label>` : '')
       + (changed ? '<span class="tnote">（まだ保存していません）</span>' : '') + '</span>';
   }
-  return `<div class="trow${changed ? ' changed' : ''}" data-row="${esc(e.path)}">${name}${set}</div>`;
+  const buildChanged = (state.buildDraft.get(e.path) || '') !== (state.buildSaved.get(e.path) || '');
+  return `<div class="trow${changed || buildChanged ? ' changed' : ''}" data-row="${esc(e.path)}">${name}${set}${buildCell(e)}</div>`;
 }
 
 function render() {
   const rows = visibleRows();
-  $('tree').innerHTML = rows.length ? rows.map(rowHTML).join('')
+  $('rules-tree').innerHTML = rows.length ? rows.map(rowHTML).join('')
     : '<div class="muted" style="padding:14px">該当するフォルダ・ファイルはありません</div>';
-  $('tree').setAttribute('aria-busy', 'false');
+  $('rules-tree').setAttribute('aria-busy', 'false');
   const rm = state.more.get('');
   $('rootmore').innerHTML = rm
     ? `<button class="btn-ghost" type="button" data-more="">資料フォルダ直下のファイルの続きを読み込む（あと ${esc(String(rm.total - (state.files.get('') || []).length))} 件）</button>` : '';
-  document.querySelectorAll('.filterchip').forEach((b) => b.classList.toggle('on', b.dataset.f === state.filter));
+  document.querySelectorAll('.filterchip[data-f]').forEach((b) => b.classList.toggle('on', b.dataset.f === state.filter));
   const own = [...state.draft.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
   const pri = own.filter(([, r]) => r.kind === 'priority').length;
   const exc = own.filter(([, r]) => r.kind === 'exclude').length;
@@ -160,9 +182,15 @@ function render() {
   $('sidelist').innerHTML = own.map(([p, r]) =>
     `<div class="item"><span class="pill ${r.kind === 'priority' ? 'pri' : 'exc'}">${esc(LABEL[r.kind])}</span><span>${esc(p)}${
       r.kind === 'priority' && r.outside ? ' <span class="tnote">（範囲の外でも読む）</span>' : ''}</span></div>`).join('');
-  const dirty = changedPaths().length > 0;
+  const dirty = isDirty();
   $('savebtn').disabled = !dirty;
   $('discardbtn').disabled = !dirty;
+  $('rules-dot').hidden = !dirty;
+}
+
+function applyBuild(marks) {
+  state.buildSaved = new Map(marks.map((m) => [m.path, m.mark]));
+  state.buildDraft = new Map(state.buildSaved);
 }
 
 function applySaved(rules) {
@@ -171,9 +199,11 @@ function applySaved(rules) {
 }
 
 async function loadFiles(folder, more) {
-  if (state.files.has(folder) && !more) return;
+  const files = state.files;
+  if (files.has(folder) && !more) return;
   const off = more && state.more.has(folder) ? state.more.get(folder).next : 0;
   const d = await api('GET', `/admin/path-rules/files?world=${encodeURIComponent(state.world)}&folder=${encodeURIComponent(folder)}&offset=${off}`);
+  if (files !== state.files) return;   // 読み込み中にタブが読み直された
   state.files.set(folder, (off ? state.files.get(folder) || [] : []).concat(d.files || []));
   if (d.next_offset === null || d.next_offset === undefined) state.more.delete(folder);
   else state.more.set(folder, { next: d.next_offset, total: d.total });
@@ -197,12 +227,16 @@ function openConfirm() {
   const ch = changedPaths();
   const rows = ch.map((p) => `<div class="item" style="padding:4px 0;border-bottom:1px solid var(--border)"><b>${esc(p)}</b><br>`
     + `<span class="muted">${esc(describe(ruleOf(state.saved, p)))} → ${esc(describe(ruleOf(state.draft, p)))}</span></div>`).join('');
+  const bch = changedBuild();
+  const buildRows = bch.map((p) => `<div class="item" style="padding:4px 0;border-bottom:1px solid var(--border)"><b>${esc(p)}</b><br>`
+    + `<span class="muted">ビルドの定義: ${esc(BUILD_LABEL[state.buildSaved.get(p) || ''])} → ${esc(BUILD_LABEL[state.buildDraft.get(p) || ''])}</span></div>`).join('');
   const dropped = droppedBySave();
   const note = dropped.length
     ? `<div class="banner">親のフォルダに設定を付けたため、その下に個別に付けていた設定 ${dropped.length} 件は保存と同時に消えます。<br>`
       + dropped.map((p) => esc(p)).join('<br>') + '</div>' : '';
-  $('dlgbody').innerHTML = `<div>${ch.length} 件を変えます。保存すると、次の質問からすぐ検索に効きます（作り直しは要りません）。</div>${note}${rows}`;
-  $('ovl').hidden = false;
+  $('dlgbody').innerHTML = (ch.length ? `<div>${ch.length} 件を変えます。保存すると、次の質問からすぐ検索に効きます（作り直しは要りません）。</div>${note}${rows}` : '')
+    + (bch.length ? `<div>ビルドの定義の印を ${bch.length} 件変えます。次の「更新」でグラフだけを作り直して効かせます。</div>${buildRows}` : '');
+  $('rules-ovl').hidden = false;
   $('okbtn').focus();
 }
 
@@ -210,10 +244,17 @@ async function save() {
   const rules = [...state.draft.entries()].map(([path, r]) => ({ path, kind: r.kind, outside_scope: r.kind === 'priority' && !!r.outside }));
   $('okbtn').disabled = true;
   try {
-    const d = await api('PUT', '/admin/path-rules', { world: state.world, rules });
-    applySaved(d.rules || []);
-    $('ovl').hidden = true;
-    toast('保存しました。次の質問から効きます');
+    if (changedPaths().length) {
+      const d = await api('PUT', '/admin/path-rules', { world: state.world, rules });
+      applySaved(d.rules || []);
+    }
+    if (changedBuild().length) {
+      const marks = [...state.buildDraft.entries()].map(([path, mark]) => ({ path, mark }));
+      const b = await api('PUT', '/admin/build-marks', { world: state.world, marks });
+      applyBuild(b.marks || []);
+    }
+    $('rules-ovl').hidden = true;
+    toast('保存しました');
   } catch (e) {
     toast('保存できませんでした: ' + (e && e.message ? e.message : '時間をおいてやり直してください'));
   } finally {
@@ -227,63 +268,106 @@ function bind() {
     const m = ev.target.closest('[data-more]');
     if (m) loadMore(m.dataset.more);
   };
-  $('tree').addEventListener('click', (ev) => {
+  $('rules-tree').addEventListener('click', (ev) => {
     const t = ev.target.closest('[data-tog]');
     if (t) toggle(t.dataset.tog);
     onMore(ev);
   });
   $('rootmore').addEventListener('click', onMore);
-  $('tree').addEventListener('change', (ev) => {
+  $('rules-tree').addEventListener('change', (ev) => {
+    const bsel = ev.target.closest('[data-build]');
+    if (bsel) { setBuild(bsel.dataset.build, bsel.value); return; }
     const sel = ev.target.closest('[data-set]');
     if (sel) { setRule(sel.dataset.set, sel.value, ruleOf(state.draft, sel.dataset.set).outside); return; }
     const out = ev.target.closest('[data-out]');
     if (out) setRule(out.dataset.out, 'priority', out.checked);
   });
-  document.querySelectorAll('.filterchip').forEach((b) => b.addEventListener('click', () => { state.filter = b.dataset.f; render(); }));
-  $('q').addEventListener('input', (ev) => { state.query = ev.target.value; render(); });
+  document.querySelectorAll('.filterchip[data-f]').forEach((b) => b.addEventListener('click', () => { state.filter = b.dataset.f; render(); }));
+  $('rules-q').addEventListener('input', (ev) => { state.query = ev.target.value; render(); });
   $('savebtn').addEventListener('click', openConfirm);
-  $('discardbtn').addEventListener('click', () => { state.draft = new Map(state.saved); render(); });
-  $('cancelbtn').addEventListener('click', () => { $('ovl').hidden = true; });
+  $('discardbtn').addEventListener('click', () => { state.draft = new Map(state.saved); state.buildDraft = new Map(state.buildSaved); render(); });
+  $('cancelbtn').addEventListener('click', () => { $('rules-ovl').hidden = true; });
   $('okbtn').addEventListener('click', save);
-  $('ovl').addEventListener('keydown', (ev) => { if (ev.key === 'Escape') $('ovl').hidden = true; });
+  $('rules-ovl').addEventListener('keydown', (ev) => { if (ev.key === 'Escape') $('rules-ovl').hidden = true; });
+}
+
+// タブを開くたびに読み直す。読み込み前に、前回の木・設定・開閉・消えた場所の知らせを空に戻す。
+let _loadSeq = 0;
+function resetState() {
+  state.world = ''; state.label = '';
+  state.folders = []; state.files = new Map(); state.more = new Map(); state.open = new Set(['']);
+  state.saved = new Map(); state.draft = new Map();
+  state.buildSaved = new Map(); state.buildDraft = new Map(); state.layout = new Set();
+  $('rules-ovl').hidden = true;
+  $('removed-banner').hidden = true;
+  $('world-title').textContent = '資料フォルダ';
+}
+
+function showTreeMessage(html) {
+  render();
+  $('rules-tree').innerHTML = html;
+  $('rules-tree').setAttribute('aria-busy', 'false');
 }
 
 async function load() {
+  const seq = ++_loadSeq;
+  resetState();
+  render();
+  $('rules-tree').innerHTML = '<div class="muted" style="padding:14px">読み込み中…</div>';
+  $('rules-tree').setAttribute('aria-busy', 'true');
   const ws = (await api('GET', '/worlds')).worlds || [];
   if (!ws.length) {
     // 登録が無くても、検索が使う既定の資料フォルダ（開発用の試験データなど）があればそれを使う
     const opt = await api('GET', '/world-options').catch(() => ({ worlds: [] }));
     if ((opt.worlds || []).length) ws.push({ world_id: opt.worlds[0] });
   }
+  if (seq !== _loadSeq) return;
   if (!ws.length) {
-    $('tree').innerHTML = '<div class="muted" style="padding:14px">資料フォルダがまだ登録されていません</div>';
-    $('tree').setAttribute('aria-busy', 'false');
+    showTreeMessage('<div class="muted" style="padding:14px">資料フォルダがまだ登録されていません</div>');
     return;
   }
-  state.world = ws[0].world_id;
-  const d = await api('GET', `/admin/path-rules?world=${encodeURIComponent(state.world)}`);
-  state.label = d.label || state.world;
+  const world = ws[0].world_id;
+  const d = await api('GET', `/admin/path-rules?world=${encodeURIComponent(world)}`);
+  if (seq !== _loadSeq) return;
+  state.world = world;
+  state.label = d.label || world;
   $('world-title').textContent = `資料フォルダ「${state.label}」`;
   state.folders = d.folders || [];
   applySaved(d.rules || []);
+  try {
+    const b = await api('GET', `/admin/build-marks?world=${encodeURIComponent(world)}`);
+    if (seq !== _loadSeq) return;
+    applyBuild(b.marks || []);
+    state.layout = new Set(b.layout_folders || []);
+  } catch (_) { toast('ビルドの定義の印を読み込めませんでした'); }
   if (d.removed_missing) {
     const b = $('removed-banner');
     b.textContent = `消えた場所の設定を ${d.removed_missing} 件取り除きました`;
     b.hidden = false;
   }
   try { await loadFiles(''); } catch (_) { /* 直下のファイルが読めなくてもフォルダの木は使える */ }
+  if (seq !== _loadSeq) return;
   render();
 }
 
-async function init() {
-  const adminState = await checkAdmin();
-  if (adminState === 'denied') {
-    $('main-content').style.display = 'none';
-    $('access-denied').style.display = 'block';
-    return;
+// 資料の画面のタブから呼ぶ。保存していない変更があるときは読み直さない（下書きを消さない）。
+async function open() {
+  if (isDirty()) return;
+  const seq = _loadSeq + 1;
+  try { await load(); } catch (e) {
+    if (seq !== _loadSeq) return;
+    resetState();
+    showTreeMessage(`<div class="muted" style="padding:14px">読み込めませんでした: ${esc(e.message)}</div>`);
   }
-  bind();
-  try { await load(); } catch (_) { toast('読み込めませんでした。時間をおいてやり直してください'); }
 }
 
-init();
+// 資料フォルダが無くなったときに呼ぶ。下書きは元のフォルダと一緒に無効になるので捨てる。
+function discard() {
+  _loadSeq++;
+  resetState();
+  render();
+}
+
+bind();
+window.RulesTab = { open, isDirty, discard };
+})();

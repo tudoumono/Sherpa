@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterator
 
-from . import memtrim
+from . import memtrim, stop_kind
 
 _log = logging.getLogger("sherpa")
 
@@ -252,10 +252,13 @@ def start_turn(*, uid: str,
     def _run():
         try:
             run_fn(rec.stop_event, rec.buffer.append)
-        except Exception:
+        except Exception as e:
             # 未捕捉の例外でも枠を占有したまま残さない。DB への永続は呼び出し側（run_fn）の責務で、ここは buffer にエラーを積んで枠を解放するだけ。
             _log.exception("chat turn crashed: turn_id=%s uid=%s", turn_id, uid)
-            rec.buffer.append({"type": "error", "message": "内部エラーが発生しました。もう一度お試しください。"})
+            message = {"timeout": "回答の作成がタイムアウトしました。もう一度お試しください。",
+                       "transport_error": "AI との通信に失敗しました。時間をおいてもう一度お試しください。"
+                       }.get(stop_kind.from_exception(e), "内部エラーが発生しました。もう一度お試しください。")
+            rec.buffer.append({"type": "error", "message": message})
         finally:
             rec.buffer.mark_done()
             memtrim.release()   # 1 ターンで積んだ分のメモリを OS へ返す（Linux のみ・30 秒に 1 回まで）

@@ -27,6 +27,7 @@ input,select,textarea{font-family:inherit;font-size:var(--text-body);color:var(-
   background:var(--surface);border:1px solid var(--control-border);border-radius:var(--radius-sm)}
 input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=file]),select{min-height:40px;padding:8px 10px}
 input[type=checkbox],input[type=radio]{accent-color:var(--accent-ink)}
+textarea{padding:8px 10px}
 input::placeholder,textarea::placeholder{color:var(--ink-3);opacity:1}
 
 /* トップバー＋ナビ。収まらないタブは nav.js（fitNav）が「その他 ▾」へ畳む。.nav だけが余白を取る（flex:1）ので、タブの出し入れで .nav の幅は変わらない。 */
@@ -112,13 +113,14 @@ input::placeholder,textarea::placeholder{color:var(--ink-3);opacity:1}
 /* カード */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
   overflow:hidden;margin-bottom:20px}
-.card-head{display:flex;align-items:center;gap:10px;padding:16px 20px;border-bottom:1px solid var(--border)}
+.card-head{display:flex;align-items:center;gap:10px;padding:16px 20px;border-bottom:1px solid var(--border);font-weight:600}
+.card-body{padding:16px 20px}
 .card-head .ico{width:28px;height:28px;border-radius:7px;background:var(--accent-weak);color:var(--accent-ink);
   display:grid;place-items:center;font-size:var(--text-body)}
 .card-head .title{font-weight:600;font-size:var(--text-section)}
 .card-head .sub{font-size:var(--text-small);color:var(--ink-3)}
 .card-head .spacer{flex:1}
-.pill{font-size:var(--text-caption);padding:2px 8px;border-radius:999px;font-weight:600}
+.pill{font-size:var(--text-caption);padding:2px 8px;border-radius:999px;font-weight:600;flex:none;white-space:nowrap}
 .pill.ok{background:var(--ok-bg);color:var(--ok)}
 .pill.warn{background:var(--warn-bg);color:var(--warn)}
 .pill.muted{background:var(--surface-2);color:var(--ink-3)}
@@ -656,6 +658,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 
 /* ===== ダークモード（変数の上書きだけで全画面に効く） ===== */
 [data-theme="dark"]{
+  color-scheme:dark;
   --bg:#0f1419; --surface:#161c23; --surface-2:#212a33; --border:#3c4957;
   --ink:#e6edf3; --ink-2:#9fb0c0; --ink-3:#9aaab9;
   --accent:#6f8fd0; --accent-weak:#18243a; --accent-ink:#9db8ec;
@@ -1007,6 +1010,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 #print-root{display:none}
 @media print{
   html.printing,html.printing[data-theme="dark"]{
+    color-scheme:light;
     --bg:#fff; --surface:#fff; --surface-2:#f1f3f5; --border:#c7ced8;
     --ink:#000; --ink-2:#222; --ink-3:#444;
     --accent:#1e3a6e; --accent-weak:#edf1f8; --accent-ink:#152a50;

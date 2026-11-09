@@ -1032,6 +1032,80 @@
         "title": "Body_workspace_file_upload_workspace_files_post",
         "type": "object"
       },
+      "BuildMarkItem": {
+        "additionalProperties": false,
+        "properties": {
+          "mark": {
+            "title": "Mark",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "mark"
+        ],
+        "title": "BuildMarkItem",
+        "type": "object"
+      },
+      "BuildMarksPutReq": {
+        "additionalProperties": false,
+        "properties": {
+          "marks": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/BuildMarkItem"
+            },
+            "title": "Marks",
+            "type": "array"
+          },
+          "world": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "World"
+          }
+        },
+        "title": "BuildMarksPutReq",
+        "type": "object"
+      },
+      "BuildMarksResponse": {
+        "properties": {
+          "layout_folders": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Layout Folders",
+            "type": "array"
+          },
+          "marks": {
+            "items": {
+              "$ref": "#/components/schemas/BuildMarkItem"
+            },
+            "title": "Marks",
+            "type": "array"
+          },
+          "world": {
+            "title": "World",
+            "type": "string"
+          }
+        },
+        "required": [
+          "world",
+          "marks",
+          "layout_folders"
+        ],
+        "title": "BuildMarksResponse",
+        "type": "object"
+      },
       "ChatReq": {
         "properties": {
           "conversation_id": {
@@ -9555,6 +9629,97 @@
         "summary": "Admin Audit Verify",
         "tags": [
           "管理者:監査ログ"
+        ]
+      }
+    },
+    "/admin/build-marks": {
+      "get": {
+        "description": "ビルドの定義を読む場所の印と、置き方から読むフォルダ（ソースの組のフォルダ）を返す（管理者のみ）。",
+        "operationId": "admin_build_marks_get_admin_build_marks_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "world",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "World"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildMarksResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Build Marks Get",
+        "tags": [
+          "管理者:資料の優先と除外"
+        ]
+      },
+      "put": {
+        "description": "ビルドの定義を読む場所の印を置き換えて保存する（管理者のみ・`system_settings` の監査に残る）。次の「今すぐ更新」でグラフだけを作り直して効かせる。\n不正な指定・資料フォルダに無い場所は 422。",
+        "operationId": "admin_build_marks_put_admin_build_marks_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildMarksPutReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildMarksResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Build Marks Put",
+        "tags": [
+          "管理者:資料の優先と除外"
         ]
       }
     },

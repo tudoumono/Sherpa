@@ -471,6 +471,8 @@ def _resolve_pages(spec: str | None, total: int, default_spec: str, default_coun
 
 _CELL_MAX_CHARS = 32767  # Excel 自体の 1 セル上限（通常のセルは切らない）
 _XLSX_TOTAL_CHARS_MAX = 2_000_000  # 1 回の返却で積む文字数の上限（超えたら行単位で打ち切り印を付ける）
+_XLSX_CALL_MAX_ROWS = 5000  # max_rows として指定できる上限（実効の上限は積む文字数と応答のバイト）
+_XLSX_CALL_MAX_COLS = 1000  # max_cols として指定できる上限
 _FORMULA_NO_VALUE = "値なし（数式）"  # 数式セルで保存値（キャッシュ）が無いときの表示
 
 
@@ -596,28 +598,41 @@ class _PreadFile(io.RawIOBase):
 
 def xlsx_range(f, sheet: str, range_a1: str | None = None,
               max_rows: int = 200, max_cols: int = 50,
-              clean: Callable[[str], str] | None = None) -> dict:
-    """`_xlsx_range` の入口。キャッシュ命中で `f` が閉じられても数式の判定に使えるよう、`f` の複製（別 fd）を用意して渡す。"""
+              clean: Callable[[str], str] | None = None, budget_chars: int | None = None) -> dict:
+    """`_xlsx_range` の入口。`budget_chars` は呼び出し側が返せる大きさの目安で、積んだ文字数がこれを超えた行で読むのをやめる（呼び出し側がどうせ切る分を読まない）。キャッシュ命中で `f` が閉じられても数式の判定に使えるよう、`f` の複製（別 fd）を用意して渡す。"""
     try:
         formula_f = io.BufferedReader(_PreadFile(os.dup(f.fileno())))
     except (OSError, ValueError):
         formula_f = None
     try:
-        return _xlsx_range(f, formula_f, sheet, range_a1, max_rows, max_cols, clean)
+        return _xlsx_range(f, formula_f, sheet, range_a1, max_rows, max_cols, clean, budget_chars)
     finally:
         if formula_f is not None:
             _close_quiet(formula_f)
 
 
+def xlsx_next_ranges(min_col: int, min_row: int, last_col: int, last_row: int, req_max_col: int, req_max_row: int) -> dict:
+    """返した窓（列 min_col..last_col・行 min_row..last_row）の次を A1 で返す。
+    `next_range`＝窓の下（要求の列幅いっぱい・行 last_row+1 から要求の末尾まで）、`next_cols_range`＝窓の右（窓と同じ行・列 last_col+1 から要求の末尾まで）。全部返したときは空。
+    """
+    from openpyxl.utils import get_column_letter
+    out = {}
+    if last_row < req_max_row:
+        out["next_range"] = f"{get_column_letter(min_col)}{last_row + 1}:{get_column_letter(req_max_col)}{req_max_row}"
+    if last_col < req_max_col:
+        out["next_cols_range"] = f"{get_column_letter(last_col + 1)}{min_row}:{get_column_letter(req_max_col)}{last_row}"
+    return out
+
+
 def _xlsx_range(f, formula_f, sheet: str, range_a1: str | None, max_rows: int, max_cols: int,
-                clean: Callable[[str], str] | None) -> dict:
+                clean: Callable[[str], str] | None, budget_chars: int | None = None) -> dict:
     """セル範囲を表で返す（`range_a1` 省略時は先頭から `max_rows`×`max_cols`）。
     セル値は文字列化する（Excel の 1 セル上限 `_CELL_MAX_CHARS` を超える分だけ切り、`cells_clipped` に件数）。`clean` は切り詰める前に適用し、
-    `KeyBlockRedactor(clean)` を行優先で 1 つ使い回す（鍵ブロックが複数セルにまたがっても伏せ続ける）。`max_rows`／`max_cols` は 1〜既定値にクランプする。
+    `KeyBlockRedactor(clean)` を行優先で 1 つ使い回す（鍵ブロックが複数セルにまたがっても伏せ続ける）。`max_rows`／`max_cols` は 1〜`_XLSX_CALL_MAX_ROWS`／`_XLSX_CALL_MAX_COLS` にクランプする。
     数式で保存値が無いセルは空にせず `_FORMULA_NO_VALUE` を返し（`formula_no_value` に件数）、判定できなければ `formula_check: "unavailable"`。
     積んだ文字数が `_XLSX_TOTAL_CHARS_MAX` を超えたら行単位で打ち切り `size_clipped: true`。
     返した範囲の非表示の行・列・結合範囲・表示値が値と違うセルは `_xlsx_range_extras` が付帯欄で足す（値は変えない）。逆順の範囲は正規化し、行・列が 0 の範囲は拒否する。
-    上限を超えたら切り詰めて `truncated: true`（`range` は実際に返した範囲）。`clean` がある場合、状態のため 1 行目から選択範囲の最終行まで
+    上限を超えたら切り詰めて `truncated: true`（`range` は実際に返した範囲・続きは `next_range`＝下の行／`next_cols_range`＝右の列を A1 で返す）。`clean` がある場合、状態のため 1 行目から選択範囲の最終行まで
     （行全体）を辿り、選択外の行は出力に残さない。
     """
     err = _precheck_office(f)
@@ -634,12 +649,12 @@ def _xlsx_range(f, formula_f, sheet: str, range_a1: str | None, max_rows: int, m
         max_rows = int(max_rows) if max_rows is not None else 200
     except (TypeError, ValueError):
         max_rows = 200
-    max_rows = min(max(max_rows, 1), 200)  # 上限もクランプ
+    max_rows = min(max(max_rows, 1), _XLSX_CALL_MAX_ROWS)  # 上限もクランプ
     try:
         max_cols = int(max_cols) if max_cols is not None else 50
     except (TypeError, ValueError):
         max_cols = 50
-    max_cols = min(max(max_cols, 1), 50)
+    max_cols = min(max(max_cols, 1), _XLSX_CALL_MAX_COLS)
     _range_budget = _TimeBudget()  # 呼び出し全体（実寸算出＋走査）で 1 つの予算
     try:
         if range_a1:
@@ -681,7 +696,9 @@ def _xlsx_range(f, formula_f, sheet: str, range_a1: str | None, max_rows: int, m
         num_values: dict[tuple[int, int], object] = {}
         clipped_cells = 0
         total_chars = 0
+        clip_chars = 0  # 打ち切り判定用。空セルも JSON で 1 セル 4 バイト前後使うため len+4 で数える
         size_clipped = False
+        budget_stop = False
         last_row = eff_max_row
         budget = _range_budget
         for row_no, row in enumerate(
@@ -708,7 +725,12 @@ def _xlsx_range(f, formula_f, sheet: str, range_a1: str | None, max_rows: int, m
                     if v is not None and not isinstance(v, (str, bool)):
                         num_values[(row_no, min_col + ci)] = v
                 total_chars += sum(len(c) for c in win)
+                clip_chars += sum(len(c) + 4 for c in win) + 4 * (width - len(win))
                 rows_out.append(win + [""] * (width - len(win)))
+                if budget_chars and clip_chars > budget_chars and row_no < eff_max_row:
+                    budget_stop = True
+                    last_row = row_no
+                    break
         if budget.tick(every=1):
             return dict(_TIME_ERROR)
     except Exception:
@@ -722,7 +744,8 @@ def _xlsx_range(f, formula_f, sheet: str, range_a1: str | None, max_rows: int, m
                 rows_out[r - min_row][c - min_col] = _FORMULA_NO_VALUE
     from openpyxl.utils import get_column_letter
     actual_range = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(eff_max_col)}{last_row}"
-    out = {"sheet": sheet, "range": actual_range, "rows": rows_out, "truncated": truncated or size_clipped}
+    out = {"sheet": sheet, "range": actual_range, "rows": rows_out, "truncated": truncated or size_clipped or budget_stop}
+    out.update(xlsx_next_ranges(min_col, min_row, eff_max_col, last_row, max_col, max_row))
     out.update(_xlsx_range_extras(ws, formula_f, {k: v for k, v in num_values.items() if k[0] <= last_row},
                                   min_row, last_row, min_col, eff_max_col))
     if size_clipped:
@@ -1488,7 +1511,7 @@ _FILE_HEAD_DEFAULT = 65536
 
 def file_head(f, max_bytes: int = _FILE_HEAD_DEFAULT,
              clean: Callable[[str], str] | None = None) -> dict:
-    """先頭 max_bytes バイトを UTF-8 / CP932 で返す。不正・途中で切れた文字は置換する。
+    """先頭 max_bytes バイトを UTF-8 / CP932 / EUC-JP で返す。不正・途中で切れた文字は置換する。
     符号化の判定は先頭の最大 DETECT_CAP_BYTES を対象に、返却量とは独立に行う（max_bytes を超える範囲を読むことがある）。
     clean は返却対象の全文に適用する（max_bytes の境界をまたぐ秘密は未読）。渡された f はこの関数が閉じる。
     """

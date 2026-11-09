@@ -118,6 +118,8 @@ _PARAMS_READ_DOC = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "list_docs/ripgrep_search 等が返した doc_id（資料の相対パス）"},
     "start_line": {"type": "integer",
                   "description": "読み始める行（既定1）。続きが必要なら前回の返却が示す次の行を指定して呼び直す"},
+    "start_char": {"type": "integer",
+                  "description": "start_line の行の中の読み始める文字位置（既定0）。前回の返却に next_char があれば、その行の続きとしてその値を渡す"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _PARAMS_OUTLINE = {"type": "object", "properties": {
@@ -147,7 +149,7 @@ _DESC_SEARCH = ("社内資料を全文 grep して当たりを付ける（doc_id
                 "unreadable_files は開けず・読めずに検索できなかったファイルの件数（名前は出さない・その分は未確認）。"
                 f"{_ITEM_PARAM_NOTE}")
 _DESC_READ = ("ヒット箇所の周辺行だけを精読する（全文は読まない）。doc_id と line を渡す。"
-             "text_truncated が付いたら本文が上限で切れている——read_doc で続き（次の開始行）を読む。"
+             "text_truncated が付いたら本文が上限で切れている——next_line を start_line（next_char があれば start_char）に渡して read_doc で続きを読む。"
              "file_truncated は読み取りの上限（ファイル 64MiB・1 行 2MiB。line_overflowed は 1 行が長すぎた）で一部を読めていない・"
              "window_clamped は窓を上限（200 行）に丸めた・line_beyond_eof は指定した行がファイルの末尾より後ろ（total_lines が総行数）。"
              f"{_ITEM_PARAM_NOTE}")
@@ -155,7 +157,8 @@ _DESC_READ_DOC = ("文書を開始行から連続して読む（通読向け・�
                   "doc_id と start_line（省略時1）を渡す。1回の返却行数には上限があり、"
                   "「全◯行中 X〜Y行目」を返すので、続きが必要なら次の開始行（end_line+1）を"
                   "指定して再度呼び出す（range 外の start_line はエラーで明示）。"
-                  "text_truncated が付くときは行内容が大きすぎて途中で切れている・"
+                  "text_truncated が付くときは行内容が大きすぎて途中で切れている——next_char があれば"
+                  "end_line の行の続きを start_line=end_line・start_char=next_char で読む・"
                   "file_truncated が付くときは文書自体が大きすぎて total_lines が過小申告の可能性がある。"
                   f"{_ITEM_PARAM_NOTE}")
 _DESC_OUTLINE = ("文書の見出し構造（Markdown の #/##/### 見出し・派生MDの表/シート見出しを含む）を"
@@ -217,10 +220,11 @@ _DESC_ASK = ("回答や検索条件を確定する前にユーザへ確認する
              "選択肢はラジオボタンまたはチェックボックスとして表示される。")
 _DESC_GRAPH = ("関係グラフから、ある名前（プログラム/コピーブック/ジョブ/データ項目/テーブルなど）の**関連部品**をたどる"
                "（コピー・呼び出し・参照・関連文書（言及）などの近傍を、つながりの経路つきで返す）。"
-               "各近傍の経路は**辺ごとの種類と向き（from→to）**付き。COPIES／INVOKES／ACCESSES／CONTAINS だけの"
+               "各近傍の経路は**辺ごとの種類と向き（from→to）**付き。COPIES／INVOKES／ACCESSES／CONTAINS／BUILT_FROM だけの"
                "経路は構造的な依存＝根拠にしてよい（影響は矢印をさかのぼる: A →COPIES→ B は B を変えると A が"
                "影響を受ける）。DOCUMENTS（言及）・CORRESPONDS_TO（同名の対応）を含む経路や `unverified` の辺（裏付け原本が"
-               "実在確認できない）を含む経路は候補＝原本で確認する。"
+               "実在確認できない）を含む経路は候補＝原本で確認する。種類 Executable は呼ばれる実行名で、BUILT_FROM の先が"
+               "材料のソース（実行名は材料のソースとビルドの定義の行を根拠に書く）。"
                "名前が一つでも判明したら、その関連の広がりは grep を反復するより先にこれで辿るほうが早い。"
                "原因の手がかり集め（トラブルシュート）に有効。grep で正確な名前を見つけてから渡すと精度が上がる。"
                "近傍が上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。"
@@ -241,7 +245,7 @@ _PARAMS_GRAPH = {"type": "object", "properties": {
     "name": {"type": "string", "description": "関連をたどる起点の名前（プログラム名/データ項目名など・具体名）"},
     "path_prefix": {"type": "string",
                     "description": "フォルダで絞る（rel_path の先頭一致・例: '4期保守'）。選んだ範囲の内側だけを狭められ、範囲は広がらない。省略可"},
-    "kind": {"type": "string", "description": "起点を種類で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config／Dataset）。省略可"},
+    "kind": {"type": "string", "description": "起点を種類で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config／Dataset／Executable）。省略可"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["name"]}
 _DESC_GRAPH_RESOLVE = ("関係グラフから、名前（の一部）・種別・所属パス（の一部）に合う**起点の候補**を並べる。"
@@ -256,13 +260,13 @@ _DESC_GRAPH_RESOLVE = ("関係グラフから、名前（の一部）・種別�
                        f"{_ITEM_PARAM_NOTE}")
 _PARAMS_GRAPH_RESOLVE = {"type": "object", "properties": {
     "name": {"type": "string", "description": "名前の一部（大文字小文字を区別しない・修飾名も対象）。name と path のどちらかは必須"},
-    "kind": {"type": "string", "description": "種別で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config／Dataset）"},
+    "kind": {"type": "string", "description": "種別で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config／Dataset／Executable）"},
     "path": {"type": "string", "description": "所属パスの一部で絞る（例: 'billing/'）"},
     "limit": {"type": "integer", "description": "返す候補の最大数（既定 20・最大 50）"},
     "path_prefix": {"type": "string",
                     "description": "フォルダで絞る（rel_path の先頭一致・例: '4期保守'）。選んだ範囲の内側だけを狭められ、範囲は広がらない。省略可"},
     "item": _ITEM_PARAM_SCHEMA}}
-_DESC_GRAPH_IMPACT = ("**起点の canonical_id**（graph_resolve で選んだもの）から、構造の依存（COPIES／CONTAINS／INVOKES／ACCESSES）だけを"
+_DESC_GRAPH_IMPACT = ("**起点の canonical_id**（graph_resolve で選んだもの）から、構造の依存（COPIES／CONTAINS／INVOKES／ACCESSES／BUILT_FROM）だけを"
                       "矢印の逆向きにたどり、起点を変えたときに影響を受ける部品（影響先）を返す。名前は受け取らない"
                       "（同名の別ノードを混ぜないため）。各影響先は canonical_id・kind・path・distance（起点からの段数）・"
                       "trace（影響先から起点までのノード名）・route（辺ごとの種類 type と向き from→to・参照元の資料 doc と行 line）を持つ。"
@@ -362,9 +366,10 @@ _PARAMS_XLSX_SHEETS = {"type": "object", "properties": {
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _DESC_XLSX_RANGE = ("Excel（.xlsx）原本のセル範囲を表で返す（原本を直接読む・派生ではない）。"
-                    "range 省略時は先頭から max_rows×max_cols（既定200行×50列）。逆順の範囲は正規化し、行・列が 0 の範囲は拒否する。"
+                    "range 省略時は先頭から max_rows×max_cols（既定200行×50列・指定は5000行×1000列まで）。逆順の範囲は正規化し、行・列が 0 の範囲は拒否する。"
                     "範囲が上限を超えたら切り詰めて truncated:true（range は実際に返した範囲）。応答の大きさにも上限があり、超えると byte_clipped:true で行が減る"
                     "（1行が大きいときは先頭の列だけ返して cols_clipped:true・それも入らなければエラー＝列を絞った range で読む）。"
+                    "どの切り詰めでも、続きは next_range（返した範囲の下の行）・next_cols_range（右の列）をそのまま range に渡して読む（全部返したときは付かない）。"
                     "セル値は書き換えない（cells_clipped は Excel の 1 セル上限を超えて切った件数・size_clipped は返却量の上限で行を打ち切った）。"
                     "値は保存された値。表示が値と違うセル（割合・日付・千円表示等）は display（セル→表示値）、表示値を作れない書式は display_format（書式コード）で返す"
                     "（display_clipped は載せきれなかった件数）。非表示の行・列は hidden_rows（行番号）・hidden_cols（列名）、結合セルは merged（値は左上のセルだけ）。"
@@ -375,8 +380,8 @@ _PARAMS_XLSX_RANGE = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .xlsx）"},
     "sheet": {"type": "string", "description": "シート名（xlsx_sheets が返す name）"},
     "range": {"type": "string", "description": "セル範囲（A1形式・例 'B3:D10'）。省略可＝先頭から既定サイズ"},
-    "max_rows": {"type": "integer", "description": "返す最大行数（既定200）"},
-    "max_cols": {"type": "integer", "description": "返す最大列数（既定50）"},
+    "max_rows": {"type": "integer", "description": "返す最大行数（既定200・上限5000）"},
+    "max_cols": {"type": "integer", "description": "返す最大列数（既定50・上限1000）"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id", "sheet"]}
 _DESC_DOCX_PARAGRAPHS = ("Word（.docx）原本の段落と表を返す（原本を直接読む・派生ではない）。"

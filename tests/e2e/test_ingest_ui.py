@@ -43,6 +43,11 @@ def _doc(name, **kw):
             "folder": "", "top_scope": "", "phase": "", "category": "", **kw}
 
 
+def _open_tab(page, name):
+    page.locator(f"#tabbtn-{name}").click()
+    expect(page.locator(f"#tab-{name}")).to_be_visible()
+
+
 def _pick_project_a(page):
     page.locator("#pickbtn").click()
     page.locator("#pbody [data-cd='/mnt/c']").click()
@@ -90,7 +95,7 @@ def test_status_summary_shows_run_failures_and_breakdowns(page, web_base_url, st
 ], ids=["unreadable", "unknown", "unreadable_code_file"])
 def test_document_list_shows_unreadable_and_unknown_as_distinct_from_ready(page, web_base_url, doc, texts):
     """`state=unreadable`／`unknown` は `STATE.ready` へ倒れず（黙って「使えます」にしない）専用の表示になり、
-    「⚠ 失敗」フィルタでも消えない。読み取り不可の行は理由と「やり直す」を出す。"""
+    「⚠ 失敗」フィルタでも消えない。表の行に「やり直す」は出さず、読み取り不可の行は元のファイルを直してからの「更新」を案内する。"""
     _open(page, web_base_url, preview={**PREVIEW, "documents": [doc]})
 
     row = page.locator("#rows tr", has_text="PROG.cbl")
@@ -101,8 +106,9 @@ def test_document_list_shows_unreadable_and_unknown_as_distinct_from_ready(page,
 
     page.click('[data-state="failed"]')
     expect(row).to_be_visible()
+    expect(row.locator("[data-rerun]")).to_have_count(0)
     if doc["state"] == "unreadable":
-        expect(row.locator('button[data-rerun="PROG.cbl"]')).to_be_visible()
+        expect(row).to_contain_text("元のファイルを直してから「更新」を押してください")
 
 
 def test_scanned_pdf_with_unread_pages_shows_warning_badge(page, web_base_url):
@@ -198,7 +204,7 @@ def test_register_success_resyncs_status_section(page, web_base_url):
 
     page.goto(f"{web_base_url}/ingest.html")
     expect(page.locator("#regcard")).to_be_visible()
-    expect(page.locator("#version")).to_be_hidden()
+    expect(page.locator("#tabarea")).to_be_hidden()   # 未登録のあいだはタブごと出さない
 
     _pick_project_a(page)
     page.locator("#regbtn").click()
@@ -206,6 +212,7 @@ def test_register_success_resyncs_status_section(page, web_base_url):
     expect(page.locator("#regmsg")).to_contain_text("受け付けました")
     expect(page.locator("#rows")).to_contain_text("新フォルダ文書.md")
     expect(page.locator("#version")).to_have_value("w2")
+    expect(page.locator("#tabarea")).to_be_visible()
     expect(page.locator("#version")).to_be_hidden()   # 1件でも選択UIは出さない
 
 
@@ -272,6 +279,10 @@ def test_delete_returns_screen_to_unregistered_state(page, web_base_url):
     expect(page.locator("#list")).to_contain_text("4期更改")
     expect(page.locator("#regcard")).to_be_hidden()
 
+    _open_tab(page, "rules")
+    page.locator('[data-set="README.md"]').select_option("exclude")
+    expect(page.locator("#rules-dot")).to_be_visible()
+
     page.once("dialog", lambda d: d.accept())
     page.locator('[data-del="w1"]').click()
     expect(page.locator('[data-stat="w1"]')).to_contain_text("検索用データを削除中")
@@ -280,6 +291,8 @@ def test_delete_returns_screen_to_unregistered_state(page, web_base_url):
     expect(page.locator("#regcard")).to_be_visible()
     expect(page.locator("#currentcard")).to_be_hidden()
     expect(page.locator("#list")).not_to_contain_text("4期更改")
+    expect(page.locator("#tabarea")).to_be_hidden()
+    assert page.evaluate("window.RulesTab.isDirty()") is False   # 消えた資料フォルダの下書きを次の登録へ持ち越さない
 
 
 def test_ingest_status_page_shows_loading_then_rows(page, web_base_url):
@@ -616,7 +629,7 @@ def test_pickbtn_recovers_after_transient_status_failure_during_polling(page, we
     expect(pickbtn).to_be_disabled()
 
     page.clock.fast_forward(3500)   # 2回目のポーリング＝一時的な500失敗（ポーリングは継続する）
-    expect(page.locator('[data-stat="w1"]')).to_contain_text("状況を取得できませんでした")
+    expect(page.locator('[data-stat="w1"]')).to_contain_text("状況を取得できません: boom")
     expect(pickbtn).to_be_disabled()
 
     page.clock.fast_forward(3500)   # 3回目のポーリング＝復旧して running_progress が無くなる
@@ -626,6 +639,7 @@ def test_pickbtn_recovers_after_transient_status_failure_during_polling(page, we
 def test_resolve_settings_save_confirms_and_shows_warning(page, web_base_url):
     """資料の探し方の設定: 保存は確認してから送り、取り込み直しの案内と見つからない場所の警告を出す。"""
     records = _open(page, web_base_url)
+    _open_tab(page, "setup")
     expect(page.locator("#resolvecard")).to_be_visible()
     page.wait_for_load_state("networkidle")              # 設定の読み込み（GET）が終わってから入力する
     page.once("dialog", lambda d: d.accept())
@@ -654,6 +668,7 @@ def test_folder_check_button_shows_three_levels_and_items(page, web_base_url):
                   "fix": "期のフォルダを同じ高さに並べる", "count": 1, "examples": [], "extra": {}}]}
     _open(page, web_base_url)
     _route_json(page, re.compile(r"/worlds/w1/folder-check(\?|$)"), check)
+    _open_tab(page, "setup")
     page.locator("#chk-btn").click()
     out = page.locator("#chk-out")
     expect(out).to_contain_text("合わない 1 件")
@@ -663,3 +678,70 @@ def test_folder_check_button_shows_three_levels_and_items(page, web_base_url):
     expect(out).to_contain_text("期のフォルダを同じ高さに並べる")
     expect(out).to_contain_text("数えていないもの（1 件）")
     expect(out.locator("#chk-md")).to_have_attribute("href", re.compile(r"/worlds/w1/folder-check\?format=md$"))
+
+
+def test_rules_tab_loads_on_open_and_its_dialog_does_not_clash_with_the_folder_picker(page, web_base_url):
+    """「優先と除外」は、タブを開いたとき（または #rules で開いたとき）だけ読み込む。保存の確認小窓とフォルダ選択の小窓は
+    同じ名前の部品を共有せず、どちらを開いてももう一方が開きっぱなしにならない。"""
+    records = _open(page, web_base_url)
+    expect(page.locator("#rows")).to_contain_text("4期")
+    assert records["path_rules_get"] == []                       # 画面を開いただけでは読まない（読むと書き込むことがある）
+    expect(page.locator("#tab-rules")).to_be_hidden()
+
+    _open_tab(page, "rules")
+    expect(page.locator("#rules-tree")).to_contain_text("README.md")
+    assert len(records["path_rules_get"]) == 1
+    expect(page.locator("#rules-dot")).to_be_hidden()
+
+    page.locator('[data-set="README.md"]').select_option("exclude")
+    expect(page.locator("#rules-dot")).to_be_visible()            # 保存していない変更がある印
+    page.locator("#savebtn").click()
+    expect(page.locator("#rules-ovl")).to_be_visible()
+    expect(page.locator("#ovl")).to_be_hidden()
+    page.locator("#okbtn").click()
+    expect(page.locator("#rules-ovl")).to_be_hidden()
+    expect(page.locator("#rules-dot")).to_be_hidden()
+    assert records["path_rules_put"] == [
+        {"world": "w1", "rules": [{"path": "README.md", "kind": "exclude", "outside_scope": False}]}]
+
+    page.goto(f"{web_base_url}/ingest.html?from=old#rules")
+    expect(page.locator("#tab-rules")).to_be_visible()
+    expect(page.locator("#rules-tree")).to_contain_text("README.md")
+    assert len(records["path_rules_get"]) == 2
+
+    _route_json(page, "**/worlds", {"worlds": []})                # 未登録: 登録カードのフォルダ選択の小窓
+    page.goto(f"{web_base_url}/ingest.html?unregistered=1")
+    page.locator("#pickbtn").click()
+    expect(page.locator("#ovl")).to_have_class(re.compile(r"\bopen\b"))
+    expect(page.locator("#ovl")).to_be_visible()
+    expect(page.locator("#rules-ovl")).to_be_hidden()
+
+
+def test_failed_list_retry_reconverts_one_file_and_never_rebuilds_the_whole_folder(page, web_base_url):
+    """失敗の一覧の「やり直す」は、その 1 件だけの読み取り直し（POST /worlds/{id}/reconvert）を呼ぶ。
+    資料フォルダ全体の作り直し（POST /ingest/rerun）は呼ばず、表の行にも「やり直す」を出さない。"""
+    requests = []
+    page.on("request", lambda r: requests.append((r.method, r.url.split("?")[0].split("/", 3)[3])))
+    _open(page, web_base_url, status={
+        "office_failed": 1,
+        "failed_files": {"items": [{"doc": "旧料金表.xls", "stage": "legacy_conversion", "reason": "legacy_conversion_timeout"}],
+                         "total": 1, "truncated": False},
+        "failure_reason_catalog": {"legacy_conversion_timeout": {"label": "タイムアウト", "advice": ""}},
+    })
+    _route_json(page, "**/worlds/w1/reconvert", {"ok": True, "world_id": "w1", "run_id": 7, "joined": False,
+                                                 "note": ACCEPTED}, status=202)
+
+    page.click('[data-state="failed"]')
+    expect(page.locator("#rows tr", has_text="BILLGEN.cbl")).to_be_visible()
+    expect(page.locator("#rows button", has_text="やり直す")).to_have_count(0)
+
+    stat = page.locator('[data-stat="w1"]')
+    stat.locator("details.adv summary").click()
+    btn = stat.locator('[data-reconvert-wid="w1"][data-rel="旧料金表.xls"]')
+    expect(btn).to_have_text("やり直す")
+    page.once("dialog", lambda d: d.accept())
+    btn.click()
+
+    page.wait_for_load_state("networkidle")
+    assert ("POST", "worlds/w1/reconvert") in requests
+    assert not [r for r in requests if r[1] == "ingest/rerun"]

@@ -29,7 +29,7 @@
     border-top:1px solid var(--border);
     background:color-mix(in srgb,var(--surface) 88%,transparent);
     backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
-  .action-bar-inner{max-width:1052px;width:100%;display:flex;gap:10px;align-items:center}
+  .action-bar-inner{max-width:calc(min(90vw,1200px) - 48px);width:100%;display:flex;gap:10px;align-items:center}
   /* 固定バーの高さぶん、最後のカードが隠れないように余白を確保。 */
   .wrap2.frm{padding-bottom:76px}
   /* 外部連携（自分の API キー）カード */
@@ -48,7 +48,7 @@
     border-radius:var(--radius,8px);background:var(--surface-2);margin:10px 0}
   body{height:100dvh;display:flex;flex-direction:column;overflow:hidden}
   body > sherpa-topbar{flex:none}
-  body > .wrap{flex:1;min-height:0;overflow:auto;width:100%;max-width:1200px}
+  body > .wrap{flex:1;min-height:0;overflow:auto;width:100%}
   .wrap2.frm{padding-bottom:0}
   .frm > .card{padding:0 24px 24px}
   .frm > .card > .card-head{margin:0 -24px 20px;font-size:var(--text-section);font-weight:600}

@@ -385,7 +385,7 @@ def _discover_candidates(terms: list, roots_spec: list, world: str, *, cacheable
     """rg で候補のファイルを集める。候補 `{パス: {語の添字: 行}}` を返す。
     ① `scope_paths`（範囲）があれば、起点は根のまま、rg には範囲に当たるファイルだけを含める条件（`-g`）で渡す。木の署名・除外の計画・候補の保存の鍵も範囲ごとにする。-g に書けない名前の範囲は範囲なしと同じに根から全体を歩く（`doc_id` の範囲の絞り込みは呼び出し元が行う）
     ② `offset` 付きの呼び出しは、同じ（検索語・roots・範囲・資料フォルダの状態）で保存済みの候補一覧があればそれを切り出して使う
-    ③ 無ければ原本の木と派生 MD の木を rg で走査する（Office／PDF／画像と、`.rag.md` がある文書だけの `md/` のフォルダは歩かない＝`rg_prune`・非 ASCII の語は CP932 のバイト列も同じ走査で探す）④ 候補一覧を保存する
+    ③ 無ければ原本の木と派生 MD の木を rg で走査する（Office／PDF／画像と、`.rag.md` がある文書だけの `md/` のフォルダは歩かない＝`rg_prune`・非 ASCII の語は CP932・EUC-JP のバイト列も同じ走査で探す）④ 候補一覧を保存する
     rg を使えない・失敗したときは `rg_search.RgUnavailable`、期限切れは `GrepDeadlineExceeded`。
     """
     from . import rg_prune, rg_search, scope, search_cache

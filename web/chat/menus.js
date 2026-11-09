@@ -24,13 +24,6 @@ function _syncWebSearchEligibility() {
   setWebSearchEligible(_webSearchAvailable && _constructId === 'codex_openai' && _openaiEndpointKind === 'openai');
 }
 
-// テーマ切替
-function applyThemeIcon() { $('themebtn').textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙'; }
-$('themebtn').addEventListener('click', () => {
-  const d = document.documentElement, next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-  d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
-});
-applyThemeIcon();
 
 // 頭脳バッジ＋設定
 function setBrainBadge(c) {
@@ -84,12 +77,8 @@ async function setConstruct(id) {
   if (!c) return;
   _constructId = id; _agent = c.agent;
   try {
-    const r = await fetch('/settings', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent: c.agent, codex_model_provider: c.codex_model_provider || null }),
-    });
-    if (!r.ok) throw new Error(r.status);
-  } catch (e) { toast('切替に失敗しました'); await loadConfig(); renderBrainMenu(); return; }  // 失敗時はサーバ状態へ戻す
+    await Sherpa.api('PUT', '/settings', { agent: c.agent, codex_model_provider: c.codex_model_provider || null });
+  } catch (e) { toast(e.message); await loadConfig(); renderBrainMenu(); return; }  // 失敗時はサーバ状態へ戻す
   await loadConfig(); toast('AIを切り替えました');
 }
 $('brainbadge').addEventListener('click', async (e) => {
@@ -261,14 +250,14 @@ function _answerLines(ans, md, shared) {
   if (newRefs) {
     L.push(md ? '**参照した資料**' : '参照した資料');
     if (!ref.rows.length && !ref.hidden && !ref.more) L.push('参照した資料はありません');
-    const rangeNote = (r) => (r.ranges.length || r.rangesMore ? '（Sherpa の読み取り機能で開いた: ' + [r.ranges.length ? rangeText(r) : '', r.rangesMore ? `ほか ${r.rangesMore} か所` : ''].filter(Boolean).join('、') + '）' : '');
-    ref.rows.forEach((r) => L.push(`${bullet}${r.path}${rangeNote(r)}${r.unopened && !r.mentionedOnly ? '（Sherpa の読み取り機能で開いた記録なし）' : ''}${r.mentionedOnly ? mentionedOnlyNote(r) : ''}`));
+    const rangeNote = (r) => (r.ranges.length || r.rangesMore ? '（読み取り機能で開いた: ' + [r.ranges.length ? rangeText(r) : '', r.rangesMore ? `ほか ${r.rangesMore} か所` : ''].filter(Boolean).join('、') + '）' : '');
+    ref.rows.forEach((r) => L.push(`${bullet}${r.path}${rangeNote(r)}${r.unopened && !r.mentionedOnly ? '（読み取り機能で開いた記録なし）' : ''}${r.mentionedOnly ? mentionedOnlyNote(r) : ''}`));
     if (ref.more) L.push(`${bullet}ほか ${ref.more} 件`);
     if (ref.hidden) L.push(`${bullet}名前を表示できない資料 ${ref.hidden} 件`);
   }
   const fnd = foundDocRows(ans);
   if (fnd.rows.length || fnd.hidden || fnd.more) {
-    L.push(md ? '**ほかに見つかった資料（Sherpa の読み取り機能で開いた記録なし）**' : 'ほかに見つかった資料（Sherpa の読み取り機能で開いた記録なし）');
+    L.push(md ? '**ほかに見つかった資料（読み取り機能で開いた記録なし）**' : 'ほかに見つかった資料（読み取り機能で開いた記録なし）');
     fnd.rows.forEach((p) => L.push(`${bullet}${p}`));
     if (fnd.more) L.push(`${bullet}ほか ${fnd.more} 件（上限で省略）`);
     if (fnd.hidden) L.push(`${bullet}名前を表示できない資料 ${fnd.hidden} 件`);

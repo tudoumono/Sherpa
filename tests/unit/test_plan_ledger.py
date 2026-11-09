@@ -815,3 +815,22 @@ def test_reference_heading_inside_a_code_block_is_not_moved_by_composition():
     model = "説明。\n```text\n参照した資料:\n- missing.md\n```\n続き。\n\n参照した資料:\n- src/a.cbl:12"
     out, _ = PL.compose_with_model_answer(plan, model)
     assert out.startswith("説明。\n```text\n参照した資料:\n- missing.md\n```\n続き。")
+
+
+def test_executables_in_one_build_definition_stay_separate_and_match_by_name():
+    rows = [{"kind": "Executable", "cid": "executable:w:src/Makefile#build:calc", "path": "src/Makefile", "name": "CALC", "distance": 1},
+            {"kind": "Executable", "cid": "executable:w:src/Makefile#build:tool", "path": "src/Makefile", "name": "TOOL", "distance": 1}]
+    targets, _calls = PL.required_targets([{"rows": rows}])
+    assert len(targets) == 2
+    regexes = PL._target_regexes(targets)
+    calc = regexes["executable:w:src/Makefile#build:calc"]
+    assert calc.search("CALC を直す") and not calc.search("TOOL を直す")
+
+
+def test_same_executable_name_in_two_definitions_needs_each_definition():
+    rows = [{"kind": "Executable", "cid": "c1", "path": "a/src/Makefile", "name": "CALC", "distance": 1},
+            {"kind": "Executable", "cid": "c2", "path": "b/src/Makefile", "name": "CALC", "distance": 1}]
+    targets, _calls = PL.required_targets([{"rows": rows}])
+    regexes = PL._target_regexes(targets)
+    assert regexes["c1"].search("a/src/Makefile を直す") and not regexes["c2"].search("a/src/Makefile を直す")
+    assert not regexes["c1"].search("Makefile を直す")

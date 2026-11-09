@@ -827,7 +827,7 @@ def test_clip_tool_result_read_doc_single_long_line_keeps_partial_text_and_progr
     assert was_clipped is True and _final_bytes(clipped) <= 40000
     assert clipped["text"] != "" and clipped["end_line"] == 5
     assert clipped["partial_line"] is True and clipped["truncated"] is True
-    assert "start_line=6" in clipped["note"]
+    assert clipped["next_char"] > 0 and "start_char=%d" % clipped["next_char"] in clipped["note"]
 
 
 def test_clip_tool_result_unknown_shape_falls_back_with_note(monkeypatch):
@@ -993,3 +993,21 @@ def test_coverage_detail_never_stores_sensitive_doc_names_and_drops_queries_for_
     text = (directory / "coverage.jsonl").read_text(encoding="utf-8")
     assert "server.pem" not in text and "COVNOQ-1" in text and "COVNOQ-2" not in text
 
+
+
+def test_clip_tool_result_read_doc_long_line_next_char_advances_from_start_char(monkeypatch):
+    """行の途中から読んだ結果をさらに縮めても、next_char は読んだ分だけ進む（start_char 起点・毎回 1 文字以上）。"""
+    monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "1000")
+    result = {"doc_id": "a.md", "start_line": 5, "start_char": 40, "end_line": 5, "total_lines": 100,
+              "text": "5: " + "x" * 5000}
+    clipped, was_clipped = M._clip_tool_result(result)
+    assert was_clipped is True and _final_bytes(clipped) <= 1000
+    n = len(clipped["text"]) - len("5: ")
+    assert n >= 1 and clipped["next_char"] == 40 + n and clipped["partial_line"] is True
+    assert "start_char=%d" % clipped["next_char"] in clipped["note"]
+
+
+def test_dedup_key_differs_when_only_start_char_differs():
+    a = M._dedup_key("read_doc", {"doc_id": "a.md", "start_line": 2, "start_char": 100})
+    b = M._dedup_key("read_doc", {"doc_id": "a.md", "start_line": 2, "start_char": 200})
+    assert a != b

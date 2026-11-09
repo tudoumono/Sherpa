@@ -32,7 +32,7 @@ _ANCHOR_NAME_IN_TEXT = "size(n.name)>=2 AND toLower($text) CONTAINS toLower(n.na
 _ANCHOR_STATUS = "($incl OR coalesce(n.status,'active')='active')"
 
 # 近傍たどりのエッジ（実効語彙）。
-_RELATED_REL = "COPIES|CONTAINS|INVOKES|ACCESSES|DOCUMENTS|CORRESPONDS_TO|FLOWS_TO"
+_RELATED_REL = "COPIES|CONTAINS|INVOKES|ACCESSES|BUILT_FROM|DOCUMENTS|CORRESPONDS_TO|FLOWS_TO"
 
 _ROLE = {"Document": "関連文書", "Module": "実装", "Batch": "ジョブ"}
 _ROLE_RANK = {"Document": 1, "Batch": 2, "Module": 3}

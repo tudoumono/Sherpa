@@ -13,10 +13,12 @@ RULES = (
     ("決まり2", "期のフォルダが同じ高さに並ぶ"),
     ("決まり3", "期をまたいで同じ部品は同じ場所にある"),
     ("決まり4", "名前で前後が分かる"),
+    ("決まり5", "ソースもビルドの定義もソースの組のフォルダに置く"),
     ("今ある記録", "（変更一覧）"),
 )
 EXAMPLE_LIMIT = 5
-NOT_COUNTED = ("ビルドの設定（pom・Gradle・pyproject・requirements・package.json・csproj・sln）の件数と、読めない書き方の Gradle は、この点検では数えない。",)
+NOW_RULES = ("決まり5",)   # 今の版で効いている決まり（ほかは次の取り込み直しの版の話）
+NOT_COUNTED = ("ビルドの設定（pom・Gradle・pyproject・requirements・package.json・csproj・sln）の件数と、読めない書き方の Gradle は、決まり1〜4 では数えない。",)
 _KANJI_NUMBER_RE = re.compile(r"第?[〇一二三四五六七八九十百千]+(?:期|次|年度|年|版|回|弾|段階)?")
 KANJI_NOTE = "漢数字は番号として読まない（漢数字だけの名前: {names}）"
 
