@@ -327,6 +327,27 @@ def fail_refresh_run(
         ).fetchone()
 
 
+def pause_refresh_run(
+    run_id: int,
+    lease_token: str,
+    *,
+    error_code: str,
+    error_detail: str | None = None,
+) -> dict[str, Any] | None:
+    """停止（切・ワーカー停止）でrunをqueuedへ戻す。leaseで増えたattemptsを戻し、cursorは保つ。"""
+    if not error_code.strip():
+        raise ValueError("refresh error_code is required")
+    _ensure()
+    with _connect() as connection:
+        return connection.execute(
+            "UPDATE ocr_refresh_runs SET status='queued', attempts=GREATEST(attempts-1, 0), "
+            "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, error_code=%s, error_detail=%s, "
+            "updated_at=now(), finished_at=NULL "
+            "WHERE id=%s AND status='leased' AND lease_token=%s RETURNING *",
+            (error_code.strip(), error_detail, run_id, lease_token),
+        ).fetchone()
+
+
 def mark_refresh_run_stale(run_id: int, lease_token: str) -> dict[str, Any] | None:
     _ensure()
     with _connect() as connection:

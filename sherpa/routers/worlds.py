@@ -1,6 +1,6 @@
 """資料フォルダ(World)管理エンドポイント。3 つの router から成る:
 - `ingest_preview_router`: `GET /ingest/preview`・`GET /ingest/preview/graph`
-- `worlds_router`: `GET /world-options`・`GET /fs/list`・`GET /worlds`・`GET /worlds/{wid}/status`・`POST /worlds/{wid}/recount`・`POST /worlds`・`POST /worlds/diff`・`POST /worlds/disk-estimate`・`POST /worlds/{wid}/rebind`・`POST /worlds/{wid}/refresh`・`POST /worlds/{wid}/reconvert`・`POST /worlds/{wid}/rag_regenerate_rules`・`GET`/`PUT /worlds/{wid}/resolve-settings`・`DELETE /worlds/{wid}`
+- `worlds_router`: `GET /world-options`・`GET /fs/list`・`GET /worlds`・`GET /worlds/{wid}/status`・`POST /worlds/{wid}/recount`・`POST /worlds`・`POST /worlds/diff`・`POST /worlds/disk-estimate`・`POST /worlds/{wid}/file-state`・`POST /worlds/{wid}/rebind`・`POST /worlds/{wid}/refresh`・`POST /worlds/{wid}/reconvert`・`POST /worlds/{wid}/rag_regenerate_rules`・`GET`/`PUT /worlds/{wid}/resolve-settings`・`DELETE /worlds/{wid}`
 - `ingest_runs_router`: `POST /ingest/rerun`・`GET /ingest/runs`・`GET /ingest/workers`
 api.py が元の位置にそれぞれ `app.include_router(...)` する（ルート表 golden の定義順を保つため）。`_browse_roots`/`_under_roots` は `sherpa.deps` にある。
 モジュール名が `sherpa/worlds.py` と衝突するため、api.py 側は `from sherpa.routers import worlds as worlds_routes` と別名で import する。
@@ -20,7 +20,7 @@ import psycopg
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
-from sherpa import corpus_docs, disk_estimate, doc_ledger, path_rules, store, world_admin_service, worlds
+from sherpa import corpus_docs, disk_estimate, doc_ledger, file_state, path_rules, store, world_admin_service, worlds
 from sherpa.deps import (
     _WORLD_PATTERN,
     _WorldField,
@@ -58,7 +58,7 @@ _INGEST_UNAVAILABLE_MESSAGE = "取り込み台帳を読めませんでした。�
 _STATUS_FLAGS_LIMIT = 200
 
 _ACTION_BLOCKED_REASON = "取り込み中のため、この操作はできません。終わってからお試しください"
-_INGEST_ACTIONS = ("recount", "refresh", "rag_regenerate_rules", "delete", "reconvert")
+_INGEST_ACTIONS = ("recount", "file_state", "refresh", "rag_regenerate_rules", "delete", "reconvert")
 _STAGE_LABELS = {
     "accepted": "受け付けました",
     "scanning": "フォルダを確認中",
@@ -270,6 +270,10 @@ class ResolveSettingsReq(BaseModel):
 
 class DiffReq(BaseModel):
     path: str  # 差分チェック対象フォルダ（登録しない・読み取り専用）。
+
+
+class FileStateReq(BaseModel):
+    start: bool = False
 
 
 class DiskEstimateReq(BaseModel):
@@ -805,6 +809,25 @@ def world_disk_estimate(req: DiskEstimateReq, request: Request):
     return disk_estimate.request_estimate(root, wid)
 
 
+@worlds_router.post("/worlds/{wid}/file-state", tags=["資料フォルダ(World)管理"])
+def world_file_state(wid: str, request: Request, req: FileStateReq | None = None):
+    """ファイルの状態を更新する（管理者のみ）。フォルダを背景で歩き、増えたファイルを台帳へ「一部使えます」で足し、なくなったファイルの行を消す。内容が変わったファイルは件数と名前を返すだけで台帳を書かない。
+    歩いている間は `state="scanning"`（`scanned`＝確認した件数）を返す。画面は同じ依頼を数秒おきに繰り返して結果（`state="ready"`）を取る。`start=true` は終わった結果を捨てて新しく始める。
+    取り込み中・一度も取り込みが終わっていない・前回の明細が無いとき、および書く直前に取り込みや付け替えで世代が変わっていたときは 409（書かない）。
+    設計: docs/design/scope.md「ファイルの状態を更新」
+    """
+    _require_admin(_current_user(request))
+    if not valid_world(wid):
+        raise HTTPException(422, "不正な識別子")
+    try:
+        snap = file_state.request(wid, start=bool(req and req.start))
+    except file_state.FileStateError as e:
+        raise HTTPException(e.status, e.message) from e
+    if snap["state"] == "conflict":
+        raise HTTPException(409, snap["message"])
+    return snap
+
+
 def _resolve_settings_payload(wid: str, settings: dict, *, changed: bool, note: str) -> dict:
     """設定の応答。実在しない場所の警告は、資料フォルダの root とアーカイブ展開先を見て作る（読み取りのみ）。"""
     root = worlds.world_dir(wid)
@@ -1052,10 +1075,12 @@ def ingest_workers_status(request: Request):
     except Exception as e:
         raise HTTPException(503, _INGEST_UNAVAILABLE_MESSAGE) from e
     try:
-        from sherpa.ingest import ocr_worker, office_md
+        from sherpa.ingest import ocr_switch, ocr_worker, office_md
         from sherpa.store import ocr_jobs
         if not office_md.ocr_enabled():
-            result["ocr_message"] = "画像の中の文字の読み取りは設定で停止しています"
+            kept = ("環境変数で止めると次の同期で読み取り済みの文字も検索から外れます" if ocr_switch.env_override() is False
+                    else "これまでに読み取った分は残っています")
+            result["ocr_message"] = f"OCR は止めています（これから取り込む画像の中の文字は検索に入りません。{kept}）"
         else:
             ocr = ocr_jobs.worker_availability_summary(ocr_worker.profile_hash())
             result["ocr_message"] = None if ocr.get("available") else (

@@ -46,8 +46,8 @@ _LEDGER_TOOLS = frozenset({"ledger_manifest_set", "ledger_item_put", "ledger_sta
 # 道具 1 回あたりの期限（秒）。Codex CLI の MCP 道具の待ち上限（300 秒）より必ず短くする。
 _TOOL_DEADLINE_DEFAULT_SEC = 120.0
 _TOOL_DEADLINE_MAX_SEC = 280.0
-_TOOL_DEADLINE_NOTICE = ("時間内に探し終えられませんでした。path_prefix や name_pattern で範囲を絞るか、"
-                         "別の道具（es_search など）で調べてください")
+_TOOL_DEADLINE_NOTICE = ("時間内に探し終えられませんでした。検索語をより具体的な語に絞るか、範囲を選び直すか、"
+                         "別の道具（es_search や、name_pattern で名前を絞れる list_docs など）で調べてください")
 
 # 素の Codex モード（`plain`）で公開するツールの全体。`_tool_defs()`・`handle()` のどちらもこの集合だけを見る。
 _PLAIN_TOOLSET = frozenset({"graph_neighbors", "ask_user"})
@@ -220,7 +220,7 @@ _DESC_GRAPH_PLAIN = (
     "`unverified` の辺を含む経路は候補＝原本で確認する。種類 Executable は呼ばれる実行名で、BUILT_FROM の先が材料のソース"
     "（実行名は材料のソースとビルドの定義の行を根拠に書く）。名前は完全一致で引く（シェルで正確な名前を見つけてから"
     "渡す）。名前に当てはまる起点が多すぎる（既定 50 件超）ときは、関係をたどらずに too_broad（anchors・by_folder・by_kind の件数）を"
-    "返す＝path_prefix（フォルダ）か kind（種類）で絞って聞き直す。近傍が上限で切られたときは truncated:true と count（総数）が付く＝その範囲は未確認として扱う。"
+    "返す＝path_prefix（フォルダ）か kind（種類）で絞って聞き直す。近傍が上限で切られたときは truncated:true・count（総数）・next_offset が付く＝同じ条件に offset=next_offset を付けて呼び直すと続きが取れる。truncated:true で next_offset が無いときは続きが取れない＝その範囲は未確認として扱う。"
     "coverage.complete が false のとき（時間切れ・件数の上限・文書探索の打ち切り・カード数の上限）は、近傍が空でも"
     "「近傍なし」とは言えない＝未確認（理由は coverage.limits[].kind）。"
 )
@@ -539,11 +539,7 @@ def _coverage_detail(name: str, args) -> dict:
         elif name == "file_head":
             mb = _n("max_bytes")
             detail["range"] = f"先頭 {mb if mb is not None else 65536} バイト"
-    # 資料名は秘匿名なら記録しない。検索語・グラフの名前は、個人ファイルを使ったターン（`SHERPA_MCP_COVERAGE_NO_QUERY`）では記録しない。
-    from .ingest import text_kind
-    if detail.get("doc"):
-        names = [d for d in detail["doc"].split(" ⇔ ") if not text_kind.is_sensitive_doc_id(d)]
-        detail["doc"] = " ⇔ ".join(names)
+    # 検索語・グラフの名前は、個人ファイルを使ったターン（`SHERPA_MCP_COVERAGE_NO_QUERY`）では記録しない。
     if os.environ.get("SHERPA_MCP_COVERAGE_NO_QUERY") == "1":
         detail.pop("query", None)
     return {k: v for k, v in detail.items() if v}
@@ -603,8 +599,8 @@ def _env_int_override(var_name: str) -> int | None:
 
 # 原本読取ツール 7 本（`read_doc`／`read_around` を含む）。応答 1 件を Codex CLI が中央を落とす上限（約 40,000 バイト）より小さくするため、`SHERPA_MCP_READER_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
 _READER_BUDGET_TOOLS = frozenset({"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "read_doc", "read_around"})
-# 検索ツール 2 本。同じく CLI が中央を落とさない大きさにするため、`SHERPA_MCP_SEARCH_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
-_SEARCH_BUDGET_TOOLS = frozenset({"ripgrep_search", "es_search"})
+# 検索ツール 4 本（`folder_tree`・`graph_neighbors` を含む）。同じく CLI が中央を落とさない大きさにするため、`SHERPA_MCP_SEARCH_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
+_SEARCH_BUDGET_TOOLS = frozenset({"ripgrep_search", "es_search", "folder_tree", "graph_neighbors"})
 
 
 def _tool_budget_bytes(name: str) -> int | None:
@@ -814,6 +810,8 @@ def _clip_graph_neighbors(result: dict, max_bytes: int):
     if not isinstance(neighbors, list):
         return None
     kept = list(neighbors)
+    offset = result.get("offset") if isinstance(result.get("offset"), int) else 0
+    unverified_cards = (result.get("unverified") or {}).get("cards", 0)
     up = result.get("coverage") or {}
     unknown = not up.get("complete", True) and up.get("omitted") is None  # 上流が部分結果で総数が不明
 
@@ -835,6 +833,11 @@ def _clip_graph_neighbors(result: dict, max_bytes: int):
             r["coverage"] = _cov(dropped)
             r["truncated"] = True
             r["count"] = count
+            # 続きは最初に落とした近傍から。確認できず除いたカードがある・取得が部分結果のときは元の位置を数えられないので、続きの位置は付けない
+            if unverified_cards or unknown or not kept:
+                r.pop("next_offset", None)
+            else:
+                r["next_offset"] = offset + len(kept)
         if _json_bytes(r) <= max_bytes:
             return r, True
         if not kept:
@@ -842,6 +845,8 @@ def _clip_graph_neighbors(result: dict, max_bytes: int):
         kept.pop()
     # 近傍を 0 件にしても収まらない: 固定欄だけの最小形、それも入らなければ明示のエラー（`hit` に分類させない）
     minimal = {"neighbors": [], "truncated": True, "count": count, "coverage": _cov(len(neighbors))}
+    if offset:
+        minimal["offset"] = offset
     if result.get("error_code"):
         minimal["error_code"] = result["error_code"]
     if _json_bytes(minimal) <= max_bytes:

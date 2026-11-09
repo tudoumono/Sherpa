@@ -442,15 +442,13 @@ def _share_summary(summary: dict) -> dict:
 
 
 def _share_sources_unverified(answer: dict) -> dict:
-    """確認できなかった資料を共有向けに写す。資料パスは秘匿名でないものだけ、それ以外は件数に回す。"""
-    from ..ingest import text_kind
+    """確認できなかった資料を共有向けに写す。型の正しい行だけ写し、それ以外は件数に回す。"""
     rows = answer.get("sources_unverified")
     if not isinstance(rows, list):
         return {}
     kept, hidden = [], 0
     for r in rows:
-        if (isinstance(r, dict) and isinstance(r.get("path"), str) and isinstance(r.get("reason"), str)
-                and not text_kind.is_sensitive_doc_id(r["path"])):
+        if isinstance(r, dict) and isinstance(r.get("path"), str) and isinstance(r.get("reason"), str):
             kept.append({"path": r["path"], "reason": r["reason"]})
         else:
             hidden += 1
@@ -468,7 +466,7 @@ def _share_sources_unverified(answer: dict) -> dict:
 
 
 def _share_new_shape_fields(answer: dict) -> dict:
-    """新しい欄を共有向けにする（秘匿の資料の名前・パスは出さず件数に回す・`answer_shape.safe_new_fields`）。"""
+    """新しい欄を共有向けにする（`answer_shape.safe_new_fields`）。"""
     out = answer_shape.safe_new_fields(answer)
     if isinstance(out.get("referenced_docs"), list):  # 共有の出典から外れる資料（重要度設定ファイル）は参照した資料の行からも外す
         out["referenced_docs"] = [r for r in out["referenced_docs"] if not importance.is_importance_control_path(r["path"])]

@@ -28,8 +28,8 @@ def _impact_result(n=3):
     return {"start": {"canonical_id": "c0", "kind": "Class", "name": "OrderBatch", "path": "src/OrderBatch.java"},
             "impact": [{"canonical_id": f"c{i}", "kind": "Class", "name": f"Caller{i}", "path": f"src/Caller{i}.java",
                         "distance": 1, "route": [{"doc": "x"}]} for i in range(1, n + 1)]
-            + [{"canonical_id": "cs", "kind": "File", "name": "secret", "path": "keys/server.pem", "distance": 2}],
-            "count": n + 1,
+            ,
+            "count": n,
             "coverage": {"complete": False, "omitted": 4,
                          "limits": [{"kind": "depth", "stage": "impact"}, {"kind": "plugin_failed", "plugin": "p1"}],
                          "depth": {"requested": 5, "truncated": True}},
@@ -66,7 +66,7 @@ def test_mcp_writes_graph_rows_to_their_own_file_and_not_to_the_call_log(tmp_pat
     T.merge_graph_results(tmp_path, TURN, merged)
     (g,) = merged.graph
     assert g["call_id"] == merged.rows[0]["call_id"] and g["role"] == merged.rows[0].get("role", "undetermined")
-    assert [r["name"] for r in g["rows"]] == ["Caller1", "Caller2", "Caller3"]  # 秘匿名のファイルの行は入れない
+    assert [r["name"] for r in g["rows"]] == ["Caller1", "Caller2", "Caller3"]
     assert g["start"]["name"] == "OrderBatch" and g["unresolved"] == 2 and g["complete"] is False
 
 
@@ -78,7 +78,6 @@ def test_rows_carry_origin_states_and_fixed_reasons_and_cap_with_more(monkeypatc
     by = {r["name"]: r for r in out["rows"]}
     assert out["traced"] is True and by["OrderBatch"]["role"] == "origin"
     assert (by["Caller1"]["state"], by["Caller2"]["state"], by["Caller3"]["state"]) == ("used", "inspected", "candidate")
-    assert "secret" not in by
     assert IL._LIMIT_REASON["depth"] in out["reasons"] and IL._LIMIT_REASON["plugin_failed"] in out["reasons"]
     assert "解決できなかった参照が 2 件あります" in out["reasons"]
     monkeypatch.setattr(IL, "IMPACT_LIST_MAX_ROWS", 3)

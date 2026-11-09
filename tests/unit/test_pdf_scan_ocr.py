@@ -18,8 +18,8 @@ from PIL import Image, ImageDraw  # noqa: E402
 from sherpa.ingest import office_md  # noqa: E402
 
 _EXPECTED_MD = (
-    "（文字の層が無いスキャン PDF のため、ここには本文がありません。本文は画像の読み取り（OCR）で検索できます"
-    "（読み取りが終わるまでは検索に出ません）。内容は原本で確認してください）\n\n"
+    "（この PDF は文字の層が無いスキャンです。中の文字は OCR で読み取った分だけが検索に入ります。"
+    "読み取りの状況は資料の画面で確かめられます。内容は原本で確認してください）\n\n"
     "## ページ 1\n\n（画像だけのページです）"
 )
 
@@ -28,7 +28,7 @@ _EXPECTED_MD = (
 def _arms(monkeypatch):
     monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     monkeypatch.setenv("SHERPA_MD_WORKERS", "1")
-    monkeypatch.delenv(office_md._OCR_ENABLED_ENV, raising=False)
+    monkeypatch.delenv("SHERPA_OCR_ENABLED", raising=False)
 
 
 @pytest.fixture
@@ -67,7 +67,7 @@ def test_scan_pdf_with_ocr_is_converted_with_notice(world):
 
 
 def test_scan_pdf_without_ocr_stays_failed_and_does_not_loop(world, monkeypatch):
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "0")
+    monkeypatch.setenv("SHERPA_OCR_ENABLED", "0")
     src, md_dir = world
     rep = office_md.build_derived(src, md_dir)
 
@@ -108,7 +108,7 @@ def test_second_build_restores_from_cache_and_ocr_off_misses_it(world, monkeypat
     assert any("キャッシュ復元" in r.getMessage() for r in caplog.records)
     assert (md_dir / "scan.pdf.md").read_bytes() == first
 
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "0")
+    monkeypatch.setenv("SHERPA_OCR_ENABLED", "0")
     caplog.clear()
     with caplog.at_level(logging.INFO, logger=office_md._log.name):
         rep = office_md.build_derived(src, md_dir)

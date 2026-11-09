@@ -282,12 +282,12 @@ def test_omission_not_counted_when_some_claims_lack_item_ids():
     assert "omitted_items" not in stats
 
 
-def test_sensitive_omitted_item_name_is_kept_only_as_count():
+def test_sensitive_omitted_item_name_is_listed_as_a_name():
     from sherpa import investigation_summary
     items = {"a": _ledger_item("a", _EVIDENCE_A), "b": {**_ledger_item("b", _EVIDENCE_B), "subject": ".env"}}
     claims = [{**_claim(evidence_refs=["src/a.py:12"]), "item_ids": ["a"]}]
     _, stats = STRUCT._claims_vs_ledger(claims, _snapshot(items), manifest_file_exists=True)
-    assert stats["omitted_items"] == [] and stats["omitted_hidden"] == 1
+    assert stats["omitted_items"] == [".env"] and "omitted_hidden" not in stats
     texts = investigation_summary.build_items(
         {"investigation": {"omitted_items": [], "omitted_hidden": 1}})
     assert any(i["text"].startswith("1 件") and ".env" not in i["text"] for i in texts)

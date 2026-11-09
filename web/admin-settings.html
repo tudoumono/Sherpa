@@ -612,9 +612,15 @@
         <div class="card sec" id="ocr-card">
           <div class="card-head"><span class="title">画像の文字の読み取り（OCR）</span></div>
           <div class="body">
+            <label class="armrow">
+              <input type="checkbox" id="ocr-enabled">
+              <span><span class="arm-t">画像の文字を OCR で読み取る</span>
+                <div class="arm-d">スキャンした PDF や画像の中の文字を OCR で読み取って検索に入れます。時間とメモリを多く使います。
+                  画面で止めても、これまでに読み取った文字は残ります。変えても資料の作り直しにはなりません。入れたあとに「今すぐ更新」を押すと、止めていた間の分から読み始めます。</div></span>
+            </label>
+            <div class="hint" id="ocr-enabled-status"><!-- JS が描画: 既定に従っているか/固定中か --></div>
             <div class="hint" id="ocr-status" role="status">状態を確認しています…</div>
             <div class="hint">視覚読み取りは AI モデルに画像を読ませて取り込み中に実行しますが、OCR は AI モデルの選択が無く、別のワーカーが後から読み取ります。</div>
-            <div class="hint">使う・使わないは .env の <code>SHERPA_OCR_ENABLED</code> で決めます。変えると次の同期で全資料の作り直しになります（この画面にスイッチはありません）。</div>
           </div>
         </div>
 
@@ -797,6 +803,7 @@
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
+<script src="admin-settings-ocr.js"></script>
 <script src="admin-settings.js"></script>
 </body>
 </html>

@@ -1674,6 +1674,7 @@ function renderIngestTab(view) {
   renderVlmStatus(view.vlm);
   renderRagLlmRender(view.rag_llm_render);
   renderRagLlmRenderStatus(view.rag_llm_render);
+  renderOcrSwitch(view);
   _armsBaseline = [...((view.arms || {}).enabled || [])].sort();
   _legacyBaseline = _legacySelectedValue(view.legacy_backend);
   const vlm = view.vlm;
@@ -1854,6 +1855,7 @@ async function save() {
   if (legacyChanged()) { const lb = collectLegacy(); if (lb) body.legacy_backend = lb; }
   if (vlmChanged()) body.vlm = collectVlm();
   if (ragLlmRenderChanged()) body.rag_llm_render = ($('rag-llm-render') || {}).checked ? 'on' : 'off';
+  collectOcrSwitch(body);
   collectCloud(body);
   collectOpenaiEndpoint(body);
   // 使えるモデルを変えたときだけ送る。全置換の契約のため buildModelCatalogBody で組み立てる（_mcState をそのまま送らない）。
@@ -1898,11 +1900,13 @@ async function save() {
   if (chatExamplesChanged()) body.chat_examples = collectChatExamples();   // チャットの質問例
   collectAgenticBudget(body);   // ツール結果1件あたりの予算（変わった項目だけ送る）
   applyNullPlan(body);   // 「既定に戻す」で欄を既定にした固定中の項目は null で解除する
+  const ocrTurnedOn = body.ocr_enabled === true;   // 切→入のときだけ送られる
   try {
     const view = await api('PUT', '/admin/settings', body);
     render(view);
     await loadExtKeys();   // OFF 保存で一括失効された可能性があるため一覧も再取得する
-    $('msg').innerHTML = '<span class="ok">✓ 保存しました</span>';
+    $('msg').innerHTML = '<span class="ok">✓ 保存しました</span>' + (ocrTurnedOn
+      ? '<span class="hint"> 画像の文字の読み取りは、「今すぐ更新」を押すと、止めていた間の分から始まります。</span>' : '');
   } catch (e) {
     $('msg').innerHTML = `<span class="danger">${esc(e.message)}</span>`;
   } finally {
@@ -2084,6 +2088,7 @@ function resetIngestTab() {
       _planNull('ingest', 'rag_llm_render', () => !!($('rag-llm-render') || {}).checked === !!rr.default);
     }
   }
+  resetOcrSwitch(view);
   _markResetDone('tab-reset-res-ingest');
 }
 
@@ -2172,7 +2177,7 @@ const TAB_DIRTY = {
     || extKeysResearchProviderChanged() || nullPlanActive('research'),
   chat: () => chatMaxTurnsChanged() || workspaceChanged() || chatExamplesChanged() || nullPlanActive('chat'),
   models: () => mcCatalogChangedExcludingEmbed(),
-  ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged()
+  ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged() || ocrSwitchChanged()
     || embedParallelChanged() || embedDimChanged() || nullPlanActive('ingest'),
   extkeys: () => extKeysAllowedChanged() || extKeysQuotaChanged(),
 };
@@ -2254,6 +2259,7 @@ function applyConfigChangedHighlights(view) {
     || !!vlm.effective.cloud_allowed !== !!vlmDefault.cloud_allowed));
   const ragRender = view.rag_llm_render || {};
   mark($('rag-llm-render-card'), !!ragRender.effective !== !!ragRender.default);
+  markOcrSwitch(mark, view);
   const ab = view.agentic_budget || {};
   _AGENTIC_BUDGET_FIELDS.forEach(({ view: vk, id }) => {
     const info = ab[vk] || {};

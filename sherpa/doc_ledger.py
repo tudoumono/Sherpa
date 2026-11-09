@@ -117,6 +117,15 @@ def kind_unknown_notice(n: int) -> str:
             "中身で確かめる。")
 
 
+def partial_notice(n: int) -> str:
+    """state が `partial`（一部使えます）の資料があるときに結果へ付ける注意。名前で見つかり開けるが、意味の索引・資料どうしの関係には入っていない。"""
+    return (f"state が partial の資料が {n} 件ある。ファイル名では見つかり、読む道具で開ける。"
+            "意味の索引（es_search）と資料どうしの関係（graph_neighbors）には入っていない。"
+            "テキスト・ソースは文字列の検索（ripgrep_search）で中身も探せるが、Office・PDF は"
+            "変換されるまで文字列の中身検索に当たらない（開いて読む）。"
+            "旧形式の Office（.doc・.xls・.ppt）は変換されるまで開けない。")
+
+
 def _listing_out(r: dict) -> dict:
     """一覧の 1 行。名前から種類を補えず、最終の状態が読み取れない行は、歩いたときと同じ形（種類なし・資料の層）にそろえる。"""
     state = _listing_state(r)

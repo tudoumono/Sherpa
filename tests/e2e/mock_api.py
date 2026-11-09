@@ -1072,7 +1072,7 @@ SYSTEM_SETTINGS_VIEW = {
          "detail": None},
     ],
     # L5（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1）: rag.md の LLM 成形トグル。既定 on。
-    "rag_llm_render": {"configured": None, "effective": True, "default": True, "options": ["on", "off"]},
+    "rag_llm_render": {"configured": None, "effective": True, "default": True, "options": ["on", "off"]}, "ocr": {"configured": None, "effective": False, "default": False, "env_override": None},
     # R2a-S2（2026-07-13 横断レビュー対応）: Ollama 接続先の SSRF allowlist。既定（未設定）は
     # loopback のみ許可＝配下 effective は空（loopback 自体は暗黙許可のためここには出ない）。
     "ollama_allowlist": {"configured": None, "effective": []},

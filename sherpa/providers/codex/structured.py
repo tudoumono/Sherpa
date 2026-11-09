@@ -411,14 +411,10 @@ def _claims_vs_ledger(claims: list[dict], snapshot: investigation_ledger.LedgerS
         out.append(c)
     stats = {"ledger": True, "checked": checked, "downgraded": downgraded,
              "unmatched_refs": unmatched_refs, "manifest_state": manifest_state}
-    # ① 全主張が item_ids を持つときだけ数える ② 秘匿名は名前を残さず件数にする。
+    # 全主張が item_ids を持つときだけ数える。
     if uses_item_ids and all(c.get("item_ids") is not None for c in claims):
-        from ...ingest import text_kind
-        names = [(snapshot.items[i].get("subject") or "").strip() or i for i in sorted(per_item) if i not in referenced]
-        shown = [n for n in names if not text_kind.is_sensitive_doc_id(n)]
-        stats["omitted_items"] = shown
-        if len(names) > len(shown):
-            stats["omitted_hidden"] = len(names) - len(shown)
+        stats["omitted_items"] = [(snapshot.items[i].get("subject") or "").strip() or i
+                                  for i in sorted(per_item) if i not in referenced]
     return out, stats
 
 

@@ -526,7 +526,7 @@ def assemble_result(self, ctx, st, decision, env):
             env["found_docs_hidden"] = _found_hidden
         if _found_more:
             env["found_docs_more"] = _found_more
-        # 「参照した資料」の行のうち検証を通らなかったもの（理由つき・秘匿名は名前を出さず件数だけ）。
+        # 「参照した資料」の行のうち検証を通らなかったもの（理由つき・自由な文や解釈できない行だけ件数）。
         _unverified_total = len(_unverified_refs) + _sensitive_refs
         if _unverified_total:
             env["sources_unverified"] = _unverified_refs[:_SOURCES_UNVERIFIED_MAX]

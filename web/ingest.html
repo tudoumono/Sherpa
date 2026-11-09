@@ -139,7 +139,7 @@
       <div class="muted" style="font-size:var(--text-label);margin-bottom:8px">
         Windows のフォルダを指定すると、その中身をそのまま検索・分析できるようになります。
         <b>ファイルの追加・編集・削除は今までどおり Windows のエクスプローラーで</b>行ってください
-        （ここでフォルダを作ったりアップロードはしません。変更は「更新」か自動チェックで反映）。
+        （ここでフォルダを作ったりアップロードはしません。変更は「ファイルの状態を更新」か「今すぐ更新」で反映）。
         登録できるフォルダは<b>1つ</b>です。</div>
       <div class="formrow">
         <button class="btn-ghost" id="pickbtn">📁 フォルダを選ぶ…</button>
@@ -166,7 +166,7 @@
       <div class="card-body">
       <div id="list"><div class="muted">読み込み中…</div></div>
       <div class="muted" style="font-size:var(--text-small);margin-top:8px">
-        ※「更新」は変更があったファイルだけを取り込み直します。「削除」は Slouch の
+        ※「ファイルの状態を更新」はフォルダの中の増減を一覧に反映します。増えたファイルは AI が名前で見つけて開けますが、意味での検索と影響の分析は「今すぐ更新」の後です。「今すぐ更新」は変更があったファイルだけを取り込み直します。「削除」は Slouch の
         <b>検索用データと資料どうしの関係だけ</b>を消します。
         元の Windows フォルダ・ファイルは一切消えません。</div>
       <div class="note" id="listmsg"></div>
@@ -211,6 +211,7 @@
         <span class="lbl">状態:</span>
         <button class="filterchip on" data-state="all" onclick="setState(this)">すべて</button>
         <button class="filterchip" data-state="ready" onclick="setState(this)">✓ 使えます</button>
+        <button class="filterchip" data-state="partial" onclick="setState(this)">一部使えます</button>
         <button class="filterchip" data-state="processing" onclick="setState(this)">⏳ 処理中</button>
         <button class="filterchip" data-state="failed" onclick="setState(this)">⚠ 失敗</button>
         <span class="spacer"></span>
@@ -233,7 +234,7 @@
           <tbody id="rows"></tbody>
         </table>
       </div>
-      <div class="note">✓ 使えます＝検索・影響分析の対象 ／ ⏳ 処理中 ／ ⚠ 失敗＝理由を見て、元のファイルを直してから「更新」を押してください。
+      <div class="note">✓ 使えます＝検索・影響分析の対象 ／ 一部使えます＝増えたばかりで、名前では見つかります（「今すぐ更新」の後に使えます） ／ ⏳ 処理中 ／ ⚠ 失敗＝理由を見て、元のファイルを直してから「今すぐ更新」を押してください。
         1 件だけやり直すときは、資料フォルダの「詳細を表示」にある失敗の一覧から行います。
         <b>範囲</b>（フォルダの木）で絞れます（どの階層でも部分木を1範囲として検索）。共有資料は閲覧のみ。</div>
     </div>
@@ -255,7 +256,7 @@
         <div class="q">古い版や下書きを、回答に使わせたくない</div>
         <div class="a">利用者が何を選んでいても、検索に出しません。Windows のフォルダ・ファイルは消えません。いつでも「なし」に戻せます。</div></div></div>
     </div>
-    <div class="sub" style="margin-bottom:8px">「ビルドの定義」の列は検索の設定とは別です。ソースの組のフォルダ（src・source・sources・ソース・ソースコード）の下の Makefile・*.csproj などは、印を付けなくても読みます。違うときだけ印を付けます。次の「更新」でグラフだけを作り直して効かせます。</div>
+    <div class="sub" style="margin-bottom:8px">「ビルドの定義」の列は検索の設定とは別です。ソースの組のフォルダ（src・source・sources・ソース・ソースコード）の下の Makefile・*.csproj などは、印を付けなくても読みます。違うときだけ印を付けます。次の「今すぐ更新」でグラフだけを作り直して効かせます。</div>
 
     <div class="layout">
       <div class="card" style="margin-bottom:0">

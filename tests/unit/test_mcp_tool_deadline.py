@@ -73,7 +73,9 @@ def test_serve_answers_both_calls_when_search_exceeds_deadline(slow_world):
     assert set(responses) == {1, 2}
     first = json.loads(responses[1]["result"]["content"][0]["text"])
     assert first["deadline_exceeded"] is True and first["truncated"] is True
-    assert "path_prefix" in first["notice"] and "es_search" in first["notice"]
+    assert first["notice"] == (
+        "時間内に全部を探し終えられませんでした。見つかった分だけを返しています。"
+        "検索語をより具体的な語に絞るか、es_search（path_prefix で範囲を絞れる）を使ってください")
     assert "next_offset" not in first
     assert responses[1]["result"]["isError"] is False
     second = json.loads(responses[2]["result"]["content"][0]["text"])
@@ -285,3 +287,12 @@ def test_doc_reader_time_budget_honors_call_deadline():
     with doc_readers.call_deadline(time.monotonic() - 1):
         assert doc_readers._TimeBudget().tick(every=1) is True
     assert doc_readers._TimeBudget().tick(every=1) is False
+
+
+def test_deadline_notice_names_only_arguments_the_tools_accept():
+    """期限切れの案内は、ripgrep_search などに無い引数（path_prefix）を勧めず、勧める引数は実際にその道具が持つ。"""
+    from sherpa import agentic_search
+    notice = M._TOOL_DEADLINE_NOTICE
+    assert "path_prefix" not in notice
+    assert "name_pattern" in agentic_search._PARAMS_LIST_DOCS["properties"] and "list_docs" in notice
+    assert "path_prefix" not in agentic_search._PARAMS_SEARCH["properties"]

@@ -13,6 +13,8 @@ Sherpa 管理のベーススキル（自作）。型は「まずツールで当�
 ## 1. 最初に開くもの（当たりの付け方）
 
 1. 固有名詞・型番・関数名など具体語がある場合は `ripgrep_search(query=...)` で全文 grep する（完全一致に強い）。
+   資料で見つけた識別子（表名・項目名・画面 ID など）は、そこで止めずソースも同じ語で探し、使われている場所を確かめる
+   （ソースは `es_search` に入らず、言語によってはソース中の SQL はグラフにも出ない。グラフに無くても未使用とは言えない）。
 2. 言い回しが揺れる概念・自然文の問い合わせは `es_search(query=...)`（0件/空振りのときも試す）。
 3. どちらもヒットが弱いときは `doc_outline(doc_id=...)` で見出し構造を見て、該当しそうな章・シートの
    当たりを付けてから読む箇所を絞る。
@@ -85,8 +87,9 @@ for name in wb.sheetnames:
    （`pdf_pages` の `total`）を先に把握する。
 2. 把握した範囲を順に読む。`truncated`／`text_truncated`／`file_truncated` が付く、または `total` が
    `start+count` を超えるときは続きを読む（読まずに打ち切らない）。続きを取得する手段が無い打ち切り
-   （`file_truncated`・pdf_pages の `text_truncated`・glob_search／doc_outline の `truncated`・folder_tree の `folders_truncated`・xlsx_sheets／ripgrep_search／es_search の `truncated`＝ヒット数上限）は、その範囲を
-   未確認として明示する（4. へ）。
+   （`file_truncated`・pdf_pages の `text_truncated`・glob_search／doc_outline／xlsx_sheets／es_search の `truncated`）は、その範囲を
+   未確認として明示する（4. へ）。ripgrep_search／graph_neighbors の `truncated`・folder_tree の `folders_truncated` は
+   `next_offset` があれば `offset` に渡して続きを取り、無ければ未確認として明示する。
 3. 項目の同一性（同じ項目か）と出典位置（どのシート/段落/ページか）を保ったまま重複を整理する。
    件数の一致だけで、欠落と重複が相殺された状態を合格にしない。
 4. 読めない・読み切れない範囲が残る場合は、その範囲を明示したうえで全件性を主張しない（§4）。

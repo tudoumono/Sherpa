@@ -80,10 +80,10 @@ def test_name_only_outside_scope_is_not_matched(world):
 def test_sensitive_name_is_not_matched(world):
     wid, wd = world
     _put(wd, "gen1/design/credentials.xlsx", "x")
-    res = _resolve(wid, "credentials.xlsx", ["gen1"])
+    res = _resolve(wid, "gen1/design/credentials.xlsx", ["gen1"])
     assert res["verified"] == []
-    assert res["unverified"] == []
-    assert res["hidden"] == 1
+    assert res["unverified"] == [{"path": "gen1/design/credentials.xlsx", "reason": C.REASON_SENSITIVE}]
+    assert res["hidden"] == 0
 
 
 def test_name_in_ledger_does_not_walk(world, monkeypatch):

@@ -313,6 +313,31 @@ def test_ripgrep_search_keeps_match_line_of_single_section_under_old_divided_bud
     assert "NEEDLE_MID" in cites2[0]["quote"]  # 引用の抜粋にも一致行が入る
 
 
+def test_ripgrep_search_hit_has_no_char_when_redaction_changed_the_text(monkeypatch, tmp_path):
+    """伏せ字で本文が変わったヒットは、read_doc が返す行と文字位置が合わないので char を付けない。"""
+    world = "hit-char-redact-world"
+    src = "line1\npassword = hunter2hunter2  # NEEDLE_CHAR here\nline3\n"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"prog.txt": src})
+    res, _d, _c, _k = TD.run_tool("ripgrep_search", {"query": "needle_char"}, world, None)
+    hit = res["hits"][0]
+    assert "[REDACTED]" in hit["text"] and "NEEDLE_CHAR" in hit["text"] and "char" not in hit
+
+
+def test_ripgrep_search_hit_gives_the_char_position_that_read_doc_accepts(monkeypatch, tmp_path):
+    """ヒットの char（行内・0 始まり）を start_line=line と一緒に read_doc へ渡すと、一致した語から読み始める。"""
+    world = "hit-char-world"
+    md = "# 見出し\n" + "あ" * 3000 + "いNEEDLE_CHAR" + "う" * 40 + "\n短い行\n"
+    src = "line1\n  x = 1  # NEEDLE_CHAR here\nline3\n"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"doc.md": md, "prog.txt": src})
+    res, _d, _c, _k = TD.run_tool("ripgrep_search", {"query": "needle_char"}, world, None)
+    by_doc = {h["doc_id"]: h for h in res["hits"]}
+    assert (by_doc["doc.md"]["line"], by_doc["doc.md"]["char"]) == (2, 3001)
+    assert (by_doc["prog.txt"]["line"], by_doc["prog.txt"]["char"]) == (2, src.splitlines()[1].index("NEEDLE_CHAR"))
+    got, _d, _c, _k = TD.run_tool("read_doc", {"doc_id": "doc.md", "start_line": 2, "start_char": by_doc["doc.md"]["char"]},
+                                  world, None)
+    assert got["text"].startswith("2: NEEDLE_CHAR")
+
+
 def test_ripgrep_search_keeps_match_line_beyond_grep_section_cap_and_quote(monkeypatch, tmp_path):
     """約 79KiB の 1 節（grep 内部の上限 64KiB を超える）の 2,202 行目の一致語が本文と引用に残る。"""
     world = "hit-window-huge"
@@ -571,6 +596,34 @@ def test_es_search_tolerates_hit_without_line(monkeypatch):
     assert res["hits"] == [{"doc_id": "a.docx", "tier": "chunk", "text": "rag_chunks 由来", "chunks": [{"chunk_id": "rc1"}],
                               "fragment": True}]
     assert docs == {"a.docx"} and cites[0]["span"] == [None, None]
+
+
+def test_es_search_long_chunk_keeps_the_term_near_the_end_and_gives_a_read_position(monkeypatch):
+    """21 万字級の 1 チャンクでも、末尾にある検索語の周辺を残し、続きを読む位置（行・行内の文字位置）を返す。語が本文に無い（意味検索の）ヒットは先頭から。"""
+    body = "a" * 210_000 + "NEEDLE_END" + "b" * 50
+    _stub_es(monkeypatch, [
+        {"doc_id": "big.md", "line": 41, "text": "見出し\n" + body, "span": [41, 41], "ext": ".md"},
+        {"doc_id": "sem.md", "line": 3, "text": "c" * 210_000, "span": [3, 3], "ext": ".md"}], {"big.md", "sem.md"})
+    res, _, _, _ = TD.run_tool("es_search", {"query": "NEEDLE_END"}, "v1", None)
+    by_doc = {h["doc_id"]: h for h in res["hits"]}
+    big, sem = by_doc["big.md"], by_doc["sem.md"]
+    assert "NEEDLE_END" in big["text"] and big["text_truncated"] is True
+    assert big["match_line"] == 42 and "match_char" not in big  # 本文が原本の行と一致すると確かめられないので文字位置は返さない
+    assert sem["text"].startswith("cccc") and sem["text_truncated"] is True and "match_line" not in sem
+
+
+def test_es_search_clipped_hit_gives_no_char_and_no_position_for_a_highlight_fragment(monkeypatch):
+    """旧方式のチャンクは先頭の空行が落ちて本文の行がずれ得る＝文字位置は返さない。ハイライトの断片には行の目安も付けない。"""
+    body = "\n".join(["a" * 40] * 6000) + "\nNEEDLE_END"
+    _stub_es(monkeypatch, [
+        {"doc_id": "lead.md", "line": 1, "text": body, "span": [1, 40], "ext": ".md"},
+        {"doc_id": "frag.md", "line": 1, "text": body, "span": [1, 40], "ext": ".md", "highlight_fragment": True}],
+        {"lead.md", "frag.md"})
+    res, _, _, _ = TD.run_tool("es_search", {"query": "NEEDLE_END"}, "v1", None)
+    by_doc = {h["doc_id"]: h for h in res["hits"]}
+    assert "match_char" not in by_doc["lead.md"] and by_doc["lead.md"]["match_line"] == 6001
+    assert by_doc["frag.md"]["text_truncated"] is True
+    assert "match_line" not in by_doc["frag.md"] and "match_char" not in by_doc["frag.md"]
 
 
 def test_es_search_locator_hint_goes_to_llm_text_only_and_absent_locator_is_unchanged(monkeypatch):
@@ -1545,7 +1598,7 @@ def test_run_tool_ripgrep_search_reports_file_truncated_only_on_capped_hit(monke
         "doc.txt": line1 + "x" * 200 + "\n", "doc.md": "# 見出し\n本文中に NEEDLE を含む一行\n"})
     res, _, _, _ = TD.run_tool("ripgrep_search", {"query": "NEEDLE"}, world, None)
     normal = next(h for h in res["hits"] if h["doc_id"] == "doc.md")
-    assert "file_truncated" not in normal and set(normal) == {"doc_id", "line", "text"}
+    assert "file_truncated" not in normal and set(normal) == {"doc_id", "line", "text", "char"}
     monkeypatch.setattr(grep_tool_mod, "_GREP_FILE_CAP_BYTES", len(line1.encode("utf-8")) + 10)
     res, _, _, _ = TD.run_tool("ripgrep_search", {"query": "NEEDLE"}, world, None)
     assert "error" not in res
@@ -2623,3 +2676,13 @@ def test_read_around_cut_keeps_next_line_and_next_char_through_mcp_clip(monkeypa
         monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", str(budget))
         clipped, was_clipped = mcp_server._clip_tool_result(res, name="read_around", args={})
         assert not was_clipped and clipped.get("next_line") == 2 and clipped.get("next_char", 0) > 0, (budget, sorted(res), sorted(clipped))
+
+
+def test_ripgrep_search_hit_has_no_char_when_the_match_line_is_clipped(monkeypatch, tmp_path):
+    """64KiB を超える一致行は本文が切れる。切れた側に秘密があると read_doc の伏せ字化後の位置と合わないので char を付けない。"""
+    world = "hit-char-clip-world"
+    src = "password = hunter2hunter2 " + "x" * 70000 + "NEEDLE_CHAR\n"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"prog.txt": src})
+    res, _d, _c, _k = TD.run_tool("ripgrep_search", {"query": "needle_char"}, world, None)
+    hit = res["hits"][0]
+    assert "NEEDLE_CHAR" in hit["text"] and "char" not in hit

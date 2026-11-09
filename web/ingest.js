@@ -12,7 +12,7 @@ const _LOADING_INLINE = '<div class="loading-inline" role="status"><span class="
 
 // =====================================================================
 // 上: 資料フォルダ（登録・一覧）。専門用語ゼロ。
-// フォルダを「選んで」追加／今すぐ更新（全削除して作り直し）／削除。パスは手入力させず picker で選ぶ。
+// フォルダを「選んで」追加／ファイルの状態を更新／今すぐ更新／削除。パスは手入力させず picker で選ぶ。
 // =====================================================================
 
 // /worlds 取得の共有: 初期ロード時の loadList と下段セレクタ初期化の同時多発フェッチを1本化する。
@@ -28,7 +28,7 @@ function fetchWorldsShared() {
 }
 
 // ---- 登録中のフォルダ（単一World・登録済みなら1件だけ表示） ----
-// 資料フォルダは全体で1本。未登録なら登録カード、登録済みなら現在のフォルダと操作（更新／削除）だけを出す（更新の入口を1つにする）。
+// 資料フォルダは全体で1本。未登録なら登録カード、登録済みなら現在のフォルダと操作（ファイルの状態を更新／今すぐ更新／削除）だけを出す。
 async function loadList() {
   $('list').setAttribute('aria-busy', 'true');
   $('list').innerHTML = '<div class="loading" role="status" style="padding:14px 0"><span class="spinner spinner-sm"></span><span>資料フォルダを読み込んでいます...</span></div>';
@@ -49,7 +49,8 @@ async function loadList() {
     $('list').innerHTML = `<div class="row" data-wid="${esc(w.world_id)}" data-path="${esc(w.root_path)}">`
       + `<div class="rowmain"><span class="nm">${esc(w.label || w.world_id)}</span>`
       + `<span class="pth" title="${esc(w.root_path)}">${esc(w.root_path)}</span>`
-      + `<button class="btn-primary mini" data-refresh="${esc(w.world_id)}">更新</button>`
+      + `<button class="btn-ghost mini" data-file-state="${esc(w.world_id)}" title="フォルダの中の増減だけを一覧に反映します（検索の準備はしません）">ファイルの状態を更新</button>`
+      + `<button class="btn-primary mini" data-refresh="${esc(w.world_id)}" title="変更があったファイルを取り込み直します">今すぐ更新</button>`
       + `<button class="btn-ghost mini" data-rag-rules="${esc(w.world_id)}" title="AI が読みやすく整えた検索用データを、AI を使わない元の形へ戻します">AIで整える前の形に戻す</button>`
       + `<button class="btn-ghost mini danger" data-del="${esc(w.world_id)}" title="検索用データのみ削除（元のフォルダ・ファイルは消えません）">削除</button></div>`
       + `<div class="rowstat" data-stat="${esc(w.world_id)}"><span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>状況を確認中...</span></span></div></div>`;
@@ -234,14 +235,14 @@ async function trackNewRegistration(worldId, runId) {
 }
 
 // ---- 差分チェック（read-only・登録しない）----
-function _difflist(title, arr) {
+function _difflist(title, arr, total) {
   if (!arr || !arr.length) return '';
-  const cap = 50, shown = arr.slice(0, cap).map((r) => `<li>${esc(r)}</li>`).join('');
-  const more = arr.length > cap ? `<div class="muted">…他 ${arr.length - cap} 件</div>` : '';
-  return `<div><b>${esc(title)}（${arr.length}）</b><ul>${shown}</ul>${more}</div>`;
+  const n = total ?? arr.length, cap = 50, shown = arr.slice(0, cap).map((r) => `<li>${esc(r)}</li>`).join('');
+  const more = n > cap ? `<div class="muted">…他 ${n - cap} 件</div>` : '';
+  return `<div><b>${esc(title)}（${n}）</b><ul>${shown}</ul>${more}</div>`;
 }
 function renderDiff(el, d, where) {
-  const a = (d.added || []).length, c = (d.changed || []).length, r = (d.removed || []).length;
+  const a = d.added_total ?? (d.added || []).length, c = d.changed_total ?? (d.changed || []).length, r = d.removed_total ?? (d.removed || []).length;
   const head = where ? `<div class="muted" style="margin-bottom:6px">${esc(where)}</div>` : '';
   if (!a && !c && !r) {
     el.innerHTML = head + `<div class="diffsum">差分なし（取り込み済みと同じ ／ 現在 ${esc(d.total)} 件）</div>`
@@ -251,7 +252,7 @@ function renderDiff(el, d, where) {
   el.innerHTML = head
     + `<div class="diffsum"><span class="pill add">追加 ${a}</span><span class="pill chg">変更 ${c}</span>`
     + `<span class="pill del">削除 ${r}</span>現在 ${esc(d.total)} 件 / 取込済 ${esc(d.indexed)} 件</div>`
-    + `<div class="difflist">${_difflist('追加', d.added)}${_difflist('変更', d.changed)}${_difflist('削除', d.removed)}</div>`
+    + `<div class="difflist">${_difflist('追加', d.added, d.added_total)}${_difflist('変更', d.changed, d.changed_total)}${_difflist('削除', d.removed, d.removed_total)}</div>`
     + (d.registered ? '' : `<div class="difflist muted">※ 未登録。「このフォルダを登録」で ${a} 件を取り込みます。</div>`);
 }
 
@@ -450,7 +451,7 @@ function lastCompletedHtml(s, wid) {
 
 function availableStateNote(s) {
   if (!s.counts_as_of) return '使える件数はまだ確認できません。「件数を数え直す」で確認できます。';
-  if (s.scanned === 0) return '使える資料はまだありません。本文検索と資料どうしの関係の確認はできません。資料を置いて「更新」を押してください。';
+  if (s.scanned === 0) return '使える資料はまだありません。本文検索と資料どうしの関係の確認はできません。資料を置いて「今すぐ更新」を押してください。';
   if (s.indexed === 0) return '本文検索への登録はまだ終わっていません。文字として読める資料の本文を直接探すことはできます。';
   if (s.es_chunks === 0 || s.es_chunks == null) return '資料の本文を直接探すことはできます。本文検索の結果一覧はまだ準備中です。';
   return '';
@@ -481,7 +482,7 @@ function statusAlertMessages(s) {
   const failed = s.failed_files && Number.isInteger(s.failed_files.total)
     ? s.failed_files.total : (s.office_failed || 0);
   if (failed > 0) out.push(`読み取れなかった資料が ${failed} 件あります。「詳細を表示」で理由を確認してください`);
-  if (s.resolve_settings_pending) out.push('資料の探し方の設定がまだ反映されていません。取り込みが終わってから「更新」を押してください');
+  if (s.resolve_settings_pending) out.push('資料の探し方の設定がまだ反映されていません。取り込みが終わってから「今すぐ更新」を押してください');
   return out;
 }
 
@@ -519,7 +520,7 @@ function setIngestActions(world_id, actions) {
   const row = document.querySelector(`[data-wid="${world_id}"]`);
   if (!row || !actions) return;
   const selectors = {
-    recount: `[data-recount="${world_id}"]`, refresh: `[data-refresh="${world_id}"]`,
+    recount: `[data-recount="${world_id}"]`, file_state: `[data-file-state="${world_id}"]`, refresh: `[data-refresh="${world_id}"]`,
     rag_regenerate_rules: `[data-rag-rules="${world_id}"]`, delete: `[data-del="${world_id}"]`,
     reconvert: `[data-reconvert-wid="${world_id}"]`,
   };
@@ -618,7 +619,7 @@ async function removeWorld(world_id) {
 async function refresh(world_id) {
   $('listmsg').innerHTML = '';
   if (!await confirmDiskSpace($('listdisk'), { world_id })) return;
-  $('listmsg').innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>更新を受け付けています...</span></span>';
+  $('listmsg').innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>今すぐ更新を受け付けています...</span></span>';
   try {
     // 更新は即受付・再取り込みは背景で継続する。進捗・完了は行のポーリング（loadStat）が示す。
     const res = await api('POST', `/worlds/${encodeURIComponent(world_id)}/refresh`);
@@ -626,7 +627,44 @@ async function refresh(world_id) {
     // 更新受付後は下段も再同期し、対象の資料フォルダの状況を表示する。
     reloadAll(world_id);
   } catch (e) {
-    $('listmsg').innerHTML = `<span class="danger">更新できません: ${esc(e.message)}</span>`;
+    $('listmsg').innerHTML = `<span class="danger">今すぐ更新できません: ${esc(e.message)}</span>`;
+  }
+}
+
+// ---- ファイルの状態を更新（フォルダを歩いて増減だけを一覧に反映・検索の準備はしない）----
+// 歩くのは背景で行うので、同じ依頼を繰り返して結果を取りに来る。最初の依頼だけ start を付けて前の結果を捨てる。
+const _FILE_STATE_POLL_MS = 1500;
+const _FILE_STATE_MAX_WAIT_MS = 12 * 60 * 1000;   // サーバーの歩く期限（10 分）と猶予（1 分）より少し長い
+let _fileStateBusy = false;
+async function fileState(world_id) {
+  if (_fileStateBusy) return;
+  _fileStateBusy = true;
+  const out = $('rowdiff'), url = `/worlds/${encodeURIComponent(world_id)}/file-state`;
+  $('listmsg').innerHTML = '';
+  out.innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>フォルダを確認中...</span></span>';
+  try {
+    let d = await api('POST', url, { start: true }, { timeoutMs: 10000 });
+    const giveUpAt = Date.now() + _FILE_STATE_MAX_WAIT_MS;
+    while (d.state === 'scanning') {
+      if (Date.now() > giveUpAt) { out.innerHTML = '<span class="danger">確認が終わりませんでした。時間をおいてやり直してください</span>'; return; }
+      out.innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span>'
+        + `<span>フォルダを確認中${d.scanned ? `（${esc(d.scanned)} 件確認済み）` : ''}</span></span>`;
+      await new Promise((r) => setTimeout(r, _FILE_STATE_POLL_MS));
+      d = await api('POST', url, {}, { timeoutMs: 10000 });
+    }
+    if (d.state !== 'ready') { out.innerHTML = `<span class="danger">${esc(d.message || '確認できませんでした')}</span>`; return; }
+    renderDiff(out, { ...d, registered: true, indexed: d.total - (d.added_total || 0) });
+    if (d.skipped_new_total && !d.added_total && !d.changed_total && !d.removed_total) {
+      out.innerHTML = `<div class="diffsum">一覧に載せていない新しいファイルが ${esc(d.skipped_new_total)} 件あります。「今すぐ更新」で取り込みます</div>`;
+      return;
+    }
+    out.insertAdjacentHTML('beforeend', '<div class="muted" style="margin-top:6px">一覧に反映しました。意味での検索と影響の分析に使うには「今すぐ更新」を押してください。'
+      + (d.changed_total ? '内容が変わったファイルは一覧の行には出していません。' : '') + `${d.note ? esc(d.note) : ''}</div>`);
+    if (d.added_total || d.removed_total) load();
+  } catch (e) {
+    out.innerHTML = `<span class="danger">ファイルの状態を更新できません: ${esc(e.message)}</span>`;
+  } finally {
+    _fileStateBusy = false;
   }
 }
 
@@ -720,6 +758,7 @@ $('regbtn').addEventListener('click', register);
 $('diffbtn').addEventListener('click', checkDiff);
 $('list').addEventListener('click', (e) => {
   const rr = e.target.closest('[data-rag-rules]'); if (rr) return regenerateRagRules(rr.dataset.ragRules);
+  const fs = e.target.closest('[data-file-state]'); if (fs) return fileState(fs.dataset.fileState);
   const rf = e.target.closest('[data-refresh]'); if (rf) return refresh(rf.dataset.refresh);
   const dl = e.target.closest('[data-del]'); if (dl) return removeWorld(dl.dataset.del);
   const rc = e.target.closest('[data-recount]'); if (rc) return recount(rc.dataset.recount);
@@ -742,6 +781,7 @@ const STATE = {  // state → 表示（記号・クラス）。enum のみ。
   processing: { mark: '⏳ 処理中…', cls: 'wait' },
   failed: { mark: '⚠ 失敗', cls: 'fail' },
   unreadable: { mark: '⚠ 読み取り不可', cls: 'fail' },   // 内容判定に必要なヘッダが読み取れない（`STATE.ready` へ倒さない）
+  partial: { mark: '一部使えます', cls: 'wait' },   // 増えたファイル。名前で見つかり開ける・意味の索引には入っていない
   unknown: { mark: '❓ 状態を確認できませんでした', cls: 'fail' },  // 直近取り込みの状況が確認できない（`STATE.ready` へ倒さない）
 };
 const ABBR = { Module: 'Mod', Copybook: 'Cpy', DataItem: '項目', Document: '文書', Batch: 'ジョブ', Table: '表', Config: '設定', Dataset: 'データ', Executable: '実行' };
@@ -818,7 +858,7 @@ const INGEST_NOTICE_JA = {
   md_docs_failed_many: (n) => `${n} 件の資料を読み取れませんでした（本文検索と意味で探すための登録は続けています。失敗の一覧で原因を確認してください）`,
   es_text_read_failed: (n) => `${n} 件の資料は本文を読めず、本文検索に入っていません`,
   es_embed_failed_bm25_only: () => '意味で探すための登録に失敗したため、キーワードだけで検索します',
-  es_vectors_missing: (n) => `${n} 件の資料は意味で探すための登録が済んでいません（キーワードでは見つかります。次の更新で続けます）`,
+  es_vectors_missing: (n) => `${n} 件の資料は意味で探すための登録が済んでいません（キーワードでは見つかります。次の「今すぐ更新」で続けます）`,
   es_analyzer_fallback: () => '日本語向けの読み分けを使えず、標準の方法で本文検索を作りました（日本語の検索精度が下がります）',
 };
 
@@ -953,10 +993,10 @@ function render() {
     && (!_type || d.doctype === _type)
     && (_state === 'all' || (_state === 'failed' ? isFailureState(d.state) : d.state === _state)));
   const scoped = (_pv ? _pv.documents : []).filter(inFolder);
-  const n = { ready: 0, processing: 0, failed: 0 };
+  const n = { ready: 0, partial: 0, processing: 0, failed: 0 };
   // 集計は3状態に寄せる: unreadable/unknown は行の表示は個別（`STATE.unreadable`/`STATE.unknown`）だが、集計上は failed の一種として数える。
   scoped.forEach((d) => { const b = isFailureState(d.state) ? 'failed' : d.state; n[b] = (n[b] || 0) + 1; });
-  $('count').textContent = (_folder ? `範囲: ${_folder} ・ ` : '') + `使えます ${n.ready | 0} ・ 処理中 ${n.processing | 0} ・ 失敗 ${n.failed | 0}`;
+  $('count').textContent = (_folder ? `範囲: ${_folder} ・ ` : '') + `使えます ${n.ready | 0} ・ 一部使えます ${n.partial | 0} ・ 処理中 ${n.processing | 0} ・ 失敗 ${n.failed | 0}`;
   // 絞り込み（名前・種類・状態）が無いときは、エクスプローラーと同じく選んだフォルダの直下（フォルダ→資料）だけを出す。
   // 絞り込みがあるときは、選んだフォルダより下の全部から探す。
   const browsing = !_q && !_type && _state === 'all';
@@ -989,6 +1029,11 @@ function folderRow([path, n]) {
 function shownName(name) {
   return _folder && name.startsWith(_folder + '/') ? name.slice(_folder.length + 1) : name;
 }
+const _LEGACY_OFFICE_EXT = ['.doc', '.xls', '.ppt'];   // sherpa/ingest/office_md.py の LEGACY_OFFICE_EXT と同じ
+function isLegacyOffice(name) {
+  const m = /\.[^./]+$/.exec(String(name || '').toLowerCase());
+  return !!m && _LEGACY_OFFICE_EXT.includes(m[0]);
+}
 function row(d) {
   const st = STATE[d.state] || STATE.ready;
   const icon = d.branch === 'source' ? '📜' : '📄';
@@ -997,9 +1042,13 @@ function row(d) {
     ? `<div class="muted" style="font-size:var(--text-caption);margin-top:3px">理由: ${esc(reasonText(d.reason))}</div>` : '';
   // 1 件だけでは直せない読み取り不可の資料は、元のファイルを直してからの「更新」を案内する。
   const fixHint = d.state === 'unreadable'
-    ? '<div class="muted" style="font-size:var(--text-caption);margin-top:3px">元のファイルを直してから「更新」を押してください</div>' : '';
+    ? '<div class="muted" style="font-size:var(--text-caption);margin-top:3px">元のファイルを直してから「今すぐ更新」を押してください</div>' : '';
+  const partialHint = d.state !== 'partial' ? ''
+    : isLegacyOffice(d.name)
+      ? '<div class="muted" style="font-size:var(--text-caption);margin-top:3px">AI は名前で見つけられますが、旧形式の Office は変換されるまで開けません</div>'
+      : '<div class="muted" style="font-size:var(--text-caption);margin-top:3px">AI は名前で見つけて開けます。意味での検索と影響の分析は「今すぐ更新」の後です</div>';
   return `<tr>
-    <td><span class="fname" title="${esc(d.name)}">${icon} ${esc(shownName(d.name))}${ruleBadge(d.name)}</span>${reason}${fixHint}${provBadges(d.provenance)}${analyzerBadgeRow(d)}${encodingPartialBadge(d)}</td>
+    <td><span class="fname" title="${esc(d.name)}">${icon} ${esc(shownName(d.name))}${ruleBadge(d.name)}</span>${reason}${fixHint}${partialHint}${provBadges(d.provenance)}${analyzerBadgeRow(d)}${encodingPartialBadge(d)}</td>
     <td><span class="dtype">${esc(d.doctype)}</span></td>
     <td><span class="status ${st.cls}"><span class="d"></span>${esc(st.mark)}</span></td>
     <td class="muted">${esc(place)}</td>

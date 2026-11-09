@@ -65,10 +65,11 @@ AGENTS_MD = f"""\
   完了としない。対象範囲（ファイル一覧なら台帳・本文中の項目一覧なら対象資料のシート/段落/ページ総数）
   の確認を終え、該当項目が回答にそろってから完了とする。`truncated`／`text_truncated`／`file_truncated`／
   `total > start+count` は続きを取得する。続きを取得する手段が無い打ち切り（`file_truncated`・
-  pdf_pages の `text_truncated`・compare_documents／graph_neighbors／glob_search／doc_outline の `truncated`・folder_tree の `folders_truncated`・xlsx_sheets／es_search の `truncated`＝ヒット数上限）は、その範囲を未確認として明示し全件性を主張しない。
+  pdf_pages の `text_truncated`・compare_documents／glob_search／doc_outline の `truncated`・xlsx_sheets／es_search の `truncated`＝ヒット数上限）は、その範囲を未確認として明示し全件性を主張しない。
   結果に付く欠落の印（`section_truncated`・`fragment`・`unreadable_files`・`excluded_hits`・`unverified`・`excluded`・`no_text_layer`・`unread_shapes`・`unread_objects`・`formula_no_value`・`pages_remaining`・`pages_ignored`・`line_beyond_eof`・`window_clamped`・`candidates_total`・`title_truncated` など）が付いた範囲も、確かめるまで未確認として扱う。
   ripgrep_search の `truncated`（ヒット数上限）は続きを取得できる——`next_offset` を
-  そのまま次回呼び出しの `offset` に渡す。
+  そのまま次回呼び出しの `offset` に渡す。graph_neighbors の `truncated`・folder_tree の `folders_truncated` も
+  同じで、`next_offset` があれば `offset` に渡して続きを取り、無ければその範囲は未確認。
   利用者停止・通信エラー・既存の反復／情報量予算への到達で
   中断するときは、確認済みの結果・未確認の範囲・理由を分けて書き、部分結果を「全件」「すべて」
   「該当なし」と断定しない。
@@ -109,6 +110,8 @@ _INVESTIGATE_SKILLS_PARAGRAPH = """\
   CP932 と確認したソースに `rg -E sjis` を使う。cat／sed で読む場合もそのファイルだけ
   `iconv -f CP932 -t UTF-8` を通す。UTF-8 のファイルには適用しない。
   EUC-JP のソースは `-E euc-jp`・`iconv -f EUC-JP` を使う。
+- 資料で見つけた識別子（表名・項目名・画面 ID・プログラム ID など）は、そこで止めず ripgrep_search で
+  そのままソースからも探し、使われている場所を確かめる（ソースは es_search に入らず、言語によってはソース中の SQL はグラフにも出ない。グラフに無くても未使用とは言えない。資料だけを探すターンでは ripgrep_search はソースを返さないので、0 件を未使用としない）。
 """
 
 # 本体自身のソース確認要件（深さに関わらず常時）。worker の主張を鵜呑みにせず、根拠のファイル:行を自分で開いて突き合わせる。

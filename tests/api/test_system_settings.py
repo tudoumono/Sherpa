@@ -235,7 +235,7 @@ _REJECTED_BODIES = [
     {"model_catalog": {"opneai": {"chat": {"allowed": ["x"], "default": "x"}}}},          # 未知 provider
     {"model_catalog": {"openai": {"bogus-usage": {"allowed": ["x"], "default": "x"}}}},   # 未知 usage
     # 真偽値・語彙
-    {"web_search_allowed": "yes"}, {"web_search_allowed": 1}, {"web_search_allowed": "true"},
+    {"web_search_allowed": "yes"}, {"web_search_allowed": 1}, {"web_search_allowed": "true"}, {"ocr_enabled": "yes"}, {"ocr_enabled": 1},
     {"research_default_provider": "gemini"},
     {"depth_base_codex_reasoning": "ultra"}, {"codex_mode": "invalid"},
     {"embed_provider": "gemini"}, {"embed_provider": ""}, {"embed_provider": 3},

@@ -94,7 +94,7 @@ apt 系の資材（python3 系・Docker Engine・フォント・Chromium のシ�
 | Playwright Chromium 本体（Marp の PDF/PPTX 出力に必須） | 一時 venv で `playwright install chromium`（`chromium-*`系ディレクトリのみ tar 化） | `dist/offline-kit/chromium/ms-playwright-chromium.tar.gz` |
 | Playwright Chromium のシステム依存（libnss3 等） | playwright 公式の依存リスト（ubuntu24.04-x64・全21個）を素の対象OSコンテナで download-only | `dist/offline-kit/chromium/deps-debs/` |
 | LibreOffice（旧形式 Office 変換の選択肢の一つ） | 素の対象OSコンテナで `apt-get install --download-only`（依存込み・数百MB） | `dist/offline-kit/libreoffice/debs/` |
-| OCR ワーカーのイメージ（画像内文字の読み取り・既定ON） | `docker compose --profile ocr build` → `docker save`（約550MB） | `dist/offline-kit/ocr/ocr-worker-paddleocr-3.7.0-cpu.tar` |
+| OCR ワーカーのイメージ（画像内文字の読み取り・管理画面で入れたときに使う） | `docker compose --profile ocr build` → `docker save`（約550MB） | `dist/offline-kit/ocr/ocr-worker-paddleocr-3.7.0-cpu.tar` |
 | OCR の Python 依存（wheel一式） | `pip download -r requirements-ocr.txt`（コアとは**別**＝numpy の要求が両立しない） | `dist/offline-kit/ocr/wheels/`（+`SHA256SUMS`） |
 | **土台の閉包 .deb**（libc6/perl-base/zlib1g 等・収集コンテナに導入済みの全パッケージ） | 素の対象OSコンテナで `apt-get install --download-only --reinstall $(dpkg-query -W …)`（`--skip-base` で除外可）。収集イメージの土台は再ビルドで更新済みのことがあり、閉域ホスト（リリース版）より新しい＝依存が土台で満たされる前提が崩れるため同梱する | `dist/offline-kit/base/debs/` |
 | **repo 索引＋BASELINE**（`Packages`/`Packages.gz`/`Release`・`BASELINE`・各グループの `debs/PACKAGES`） | 素のコンテナで `apt-utils` を入れ `apt-ftparchive packages/release`。BASELINE は収集元の OS/版/arch/収集日/イメージ digest | `dist/offline-kit/` 直下 |
@@ -150,7 +150,7 @@ PostgreSQL / Neo4j は素の公式イメージのままで日本語（UTF-8）�
 
 ### OCR（画像内文字の読み取り）
 
-**既定で有効**な機能なので、閉域でも使うなら3つそろえて搬入します。1つでも欠けると読み取りだけが
+既定は切で、管理画面の取り込みタブで入れたときだけ動く機能です。閉域で使うなら3つそろえて搬入します。1つでも欠けると読み取りだけが
 行われません（取り込みと検索は通常どおり動きます）。
 
 | 要るもの | 理由 |

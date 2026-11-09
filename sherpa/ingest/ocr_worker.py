@@ -28,7 +28,7 @@ from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Callable, Protocol
 
-from . import ai_observation, evidence_ir, observation_render, ocr_router, text_kind
+from . import ai_observation, evidence_ir, observation_render, ocr_router, ocr_switch, text_kind
 from ..store import ocr_jobs
 from ..store.db import world_lock
 
@@ -864,7 +864,7 @@ def run_once(
         raise ValueError("inference timeout and lease TTL must be positive")
     if lease_renew_interval_seconds <= 0 or lease_renew_interval_seconds >= lease_seconds:
         raise ValueError("lease monitor interval must be shorter than the lease TTL")
-    job = ocr_jobs.lease_next(worker_id, lease_seconds=lease_seconds)
+    job = ocr_switch.lease_next(worker_id, lease_seconds=lease_seconds)
     if job is None:
         return WorkerResult(status="idle")
     job_id, lease_token = int(job["id"]), str(job["lease_token"])
@@ -1063,7 +1063,7 @@ def run_refresh_once(
     """1 refresh run を stream 展開する。HTTP request はこの走査を実行しない。"""
     if lease_seconds <= 0 or lease_renew_interval_seconds <= 0 or lease_renew_interval_seconds >= lease_seconds:
         raise ValueError("refresh lease interval must be shorter than the positive lease TTL")
-    run = ocr_jobs.lease_refresh_run(worker_id, lease_seconds=lease_seconds)
+    run = ocr_switch.lease_refresh_run(worker_id, lease_seconds=lease_seconds)
     if run is None:
         return RefreshWorkerResult(status="idle")
     run_id, lease_token = int(run["id"]), str(run["lease_token"])
@@ -1112,6 +1112,8 @@ def run_refresh_once(
             counts = {"selected": 0, "excluded": 0, "failed_binding": 0}
             for decision in manifest.decisions:
                 counts[decision.status] += 1
+            if not ocr_switch.enabled():
+                raise OCRStoppingError("OCR was switched off during refresh")
             rows = ocr_jobs.enqueue_manifest_jobs(
                 world,
                 manifest,
@@ -1155,9 +1157,7 @@ def run_refresh_once(
             status="lease_lost", run_id=run_id, manifests_processed=processed, jobs_enqueued=jobs_enqueued,
         )
     except OCRStoppingError as exc:
-        ocr_jobs.fail_refresh_run(
-            run_id, lease_token, error_code=exc.error_code, error_detail=str(exc), retryable=True,
-        )
+        ocr_jobs.pause_refresh_run(run_id, lease_token, error_code=exc.error_code, error_detail=str(exc))
         return RefreshWorkerResult(
             status="stopping", run_id=run_id, manifests_processed=processed,
             jobs_enqueued=jobs_enqueued, error_code=exc.error_code,

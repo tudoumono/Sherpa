@@ -144,6 +144,7 @@ POLICY: dict[tuple[str, str], str] = {
     ("GET", "/worlds/{wid}/status"): "admin",
     ("GET", "/worlds/{wid}/folder-check"): "admin",
     ("POST", "/worlds/{wid}/recount"): "admin",
+    ("POST", "/worlds/{wid}/file-state"): "admin",
     ("POST", "/worlds/{wid}/rebind"): "admin",
     ("POST", "/worlds/{wid}/refresh"): "admin",
     ("POST", "/worlds/{wid}/reconvert"): "admin",
@@ -367,7 +368,8 @@ def test_policy_covers_all_routes():
     # admin=管理画面の「つながりの確認」（POST /admin/connectivity/check）1件追加で46。
     # admin=資料の優先と除外（GET/PUT /admin/path-rules・GET /admin/path-rules/files）3件追加で49。
     # admin=フォルダの置き方の点検（GET /worlds/{wid}/folder-check）1件追加で50。
-    assert len(ADMIN_ROUTES) == 52
+    # admin=ファイルの状態を更新（POST /worlds/{wid}/file-state）1件追加で53。
+    assert len(ADMIN_ROUTES) == 53
     # ext_key=旧6＋Codex ジョブ API 4本（受付・状態・結果・取消・`C-EXT-CODEXJOB-*`）で10。
     assert len(EXT_KEY_ROUTES) == 10
     assert len(SPECIAL_ROUTES) == 7

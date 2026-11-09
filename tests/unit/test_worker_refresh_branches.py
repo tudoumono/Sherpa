@@ -24,6 +24,12 @@ from sherpa import es_index, json_io, store, worlds
 from sherpa.ingest import office_md, worker, world_neo4j
 
 
+@pytest.fixture(autouse=True)
+def _ocr_on(monkeypatch):
+    """OCR の既定は切。この file は OCR を入れた状態の挙動を見る。"""
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
+
+
 def _build_world(tmp_path):
     wd = tmp_path / "world"
     wd.mkdir()

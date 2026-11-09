@@ -115,6 +115,7 @@ class SystemSettingsReq(BaseModel):
     legacy_backend: str | None = None  # 旧形式変換バックエンド: none|libreoffice|office_com。null は既定へ。
     # rag.md の LLM 成形トグル。on|off。null は既定 off へフォールバックする（`legacy_backend` と同型）。
     rag_llm_render: str | None = None
+    ocr_enabled: StrictBool | None = None  # OCR の入切（既定は切・環境変数 SHERPA_OCR_ENABLED=0 のときだけ切に固定）。null は既定へ。
     vlm: dict | None = None  # 視覚読み取りの VLM 設定 {provider,model,cloud_allowed}。null は既定へ。
     # 利用者が個人設定で選べる Ollama 接続先（host:port の配列）。未設定(None)は loopback と中央の既定接続先だけ（`llm.assert_ollama_url_allowed`）。null は未設定へ戻す。
     ollama_allowlist: list[str] | None = None
@@ -491,7 +492,7 @@ def _admin_settings_view() -> dict:
     """GET/PUT 共通の応答。現行値（system_settings の生値）と実効値（既定込みの解決結果）を返す。`configured` は生値（未設定なら null）、`env_default`/`default` は未設定に戻したときの値で、UI の既定表示に使う。"""
     from sherpa import agentic_search, chat_service, chat_turns, embeddings, impact_service, keys, lens_service, llm
     from sherpa.ingest import arms as ingest_arms
-    from sherpa.ingest import llm_render
+    from sherpa.ingest import llm_render, ocr_switch
     from sherpa.ingest.arms import legacy_convert, vision_arm
     sysset = store.get_system_settings()
     # `sysset["openai_base_url"]`/`sysset["openai_endpoint_kind"]` は JSONB のため非文字列の破損値がありうる。`llm.openai_endpoint_kind()`/`llm.openai_base_url()` は判定より先に型検査して不正なら `ValueError` を送出するため、両方を同じ try で解決する。管理画面が生値を確認・修正できるよう、表示は落とさず固定文字列へ倒す（`system.py::_INVALID_SAVED_BASE_URL_LABEL` と同じ）。`openai_auth_header_style()`/`openai_api_version()` も内部で `openai_endpoint_kind()` を呼ぶため同じ try に含める。
@@ -602,6 +603,7 @@ def _admin_settings_view() -> dict:
             "default": llm_render.env_default_enabled(),  # 未設定に戻したときの実効（コード既定）。
             "options": ["on", "off"],
         },
+        "ocr": ocr_switch.admin_view(sysset),
         # 視覚読み取り（vision）の VLM 設定。既定＝ローカル（Ollama）。クラウド（OpenAI）は cloud_allowed=true（管理者が明示許可）のときだけ有効。
         "vlm": {
             "configured": sysset.get("vlm"),  # 生値（未設定=None＝既定へ）。
@@ -1171,6 +1173,8 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     if "web_search_allowed" in provided:
         # StrictBool が型検証済み（非 bool は pydantic が 422 にする）。
         updates["web_search_allowed"] = provided["web_search_allowed"]
+    if "ocr_enabled" in provided:
+        updates["ocr_enabled"] = provided["ocr_enabled"]  # StrictBool が型検証済み。
     if "user_api_keys_allowed" in provided:
         # StrictBool が型検証済み（非 bool は pydantic が 422 にする）。
         updates["user_api_keys_allowed"] = provided["user_api_keys_allowed"]

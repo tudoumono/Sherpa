@@ -79,3 +79,19 @@ def test_ocr_worker_stop_is_returned_as_plain_notice(client, monkeypatch):
 
     assert body["ocr_message"] == (
         "画像の中の文字を読む処理が動いていません。検索には、すでに読み取れた内容だけが使われます")
+
+
+@pytest.mark.parametrize("env, expected", [
+    (None, "OCR は止めています（これから取り込む画像の中の文字は検索に入りません。これまでに読み取った分は残っています）"),
+    ("0", "OCR は止めています（これから取り込む画像の中の文字は検索に入りません。"
+          "環境変数で止めると次の同期で読み取り済みの文字も検索から外れます）"),
+], ids=["screen-off", "env-off"])
+def test_ocr_off_notice_tells_whether_read_text_stays(client, monkeypatch, env, expected):
+    from sherpa.ingest import office_md
+
+    monkeypatch.delenv("SHERPA_OCR_ENABLED", raising=False)
+    if env is not None:
+        monkeypatch.setenv("SHERPA_OCR_ENABLED", env)
+    monkeypatch.setattr(office_md, "ocr_enabled", lambda: False)
+
+    assert client.get("/ingest/workers").json()["ocr_message"] == expected

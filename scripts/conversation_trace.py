@@ -5,7 +5,8 @@
 守ること:
 - 読み取りだけ。DB は SELECT だけ・ファイルは Codex のセッション記録を読むだけ。書くのは OUT の 1 ファイルだけ。
 - 個人の資料を参照したターンは出さない。
-- 秘匿ファイル（`text_kind.is_sensitive`）の名前は伏せ字の有無にかかわらず出さない。
+- 秘匿ファイル（`text_kind.is_sensitive`）の名前は出す（守るのは中身）。本文は出さず、秘匿ファイルを出典に持つ回答の本文も出さない。
+  鍵・トークンなどの値は伏せ字（MASK=1）の規則どおり。
 - 期間（SINCE／UNTIL・日本時間の日付）で選ぶときは対象の会話に上限（`CONV_LIMIT`）を設け、超えたら出力の先頭と標準エラーに出す。
 - `--format jsonl` は 1 行 1 ターンの機械で読める形（本文・結果の本文は入れない）。伏せ字と自己検査はテキストと同じ。
 - 伏せ字（MASK=1）は、同じ値に同じ記号（実行ごとの塩で作る短いハッシュ）を振る。書き出す前に、入力から
@@ -232,7 +233,6 @@ _PUBLIC_PROGRAMS = frozenset({
 })
 _PROG_RE = re.compile(r"^[A-Za-z0-9_.+-]{1,32}$")
 _EXEC_CMD_RE = re.compile(r'"cmd"\s*:\s*("(?:[^"\\]|\\.)*")')
-_PATHLIKE_RE = re.compile(r"[^\s\"'`()（）「」<>|;,]+")
 _SELFCHECK_SPLIT = re.compile(r"[\s/\\、。，,（）()\[\]{}:=;\"'<>|「」『』・→←]+")
 _PIECE_SPLIT = re.compile(r"[\s/\\]+")
 _OLLAMA_PUBLIC = frozenset({"llama3", "llama3.1", "llama3.2", "llama3.3", "llama4", "qwen2.5", "qwen2.5-coder", "qwen3",
@@ -362,7 +362,7 @@ class Masker:
         if not isinstance(value, str) or not value:
             return "-"
         if not self.mask_models or _public_model(value):
-            shown = _clip(self.scrub(value), 80)
+            shown = _clip(value, 80)
             self.vocab.add(value)
             return shown
         self.needles.add(value)
@@ -373,7 +373,7 @@ class Masker:
         if not isinstance(value, str) or not value:
             return "-"
         if not self.mask:
-            return _clip(self.scrub(value), 60)
+            return _clip(value, 60)
         if value in _TRACE_LABELS:
             return value
         return self.text(value)
@@ -387,9 +387,6 @@ class Masker:
     def path(self, value) -> str:
         if not isinstance(value, str) or not value.strip():
             return "-"
-        if _sensitive(value):
-            self._note_sensitive(value)
-            return "（秘匿ファイル）"
         if not self.mask:
             return _clip(value, 160)
         self.needles.add(value.strip())
@@ -405,7 +402,7 @@ class Masker:
         if not isinstance(value, str):
             return "-"
         if not self.mask:
-            return '"' + _clip(self.scrub(value), 80) + '"'
+            return '"' + _clip(value, 80) + '"'
         self.needles.add(value.strip())
         return self._sym("語", value.strip())
 
@@ -418,8 +415,8 @@ class Masker:
             return f"{self._sym('文', value.strip())}（{len(value)} 字）"
         if lines:
             kept = [ln for ln in value.strip().splitlines() if ln.strip()][:lines]
-            return " / ".join(_clip(self.scrub(ln), 160) for ln in kept)
-        return _clip(self.scrub(value), 160)
+            return " / ".join(_clip(ln, 160) for ln in kept)
+        return _clip(value, 160)
 
     def scope(self, value) -> str:
         if not isinstance(value, str) or not value.strip():
@@ -441,21 +438,11 @@ class Masker:
         if not isinstance(value, str) or not value:
             return "-"
         if not self.mask:
-            return _clip(self.scrub(value), 60)
+            return _clip(value, 60)
         self.needles.add(value)
         if value not in self._items:
             self._items[value] = f"項目{len(self._items) + 1}"
         return self._items[value]
-
-    def scrub(self, text: str) -> str:
-        """素の表示でも、秘匿ファイルに当たる語だけは伏せる。"""
-        def _sub(m: re.Match) -> str:
-            tok = m.group(0)
-            if _sensitive(tok):
-                self._note_sensitive(tok)
-                return "（秘匿ファイル）"
-            return tok
-        return _PATHLIKE_RE.sub(_sub, text)
 
     def note_all(self, value) -> None:
         """出さない値（入れ子も）を自己検査の対象として控える。"""
@@ -466,7 +453,7 @@ class Masker:
             for v in value:
                 self.note_all(v)
         elif isinstance(value, str):
-            if _sensitive(value):
+            if self.mask and _sensitive(value):
                 self._note_sensitive(value)
             self.note(value)
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -489,9 +476,6 @@ class Masker:
             return str(value) if kind == "num" else self.number(value)
         if not isinstance(value, str):
             return "-"
-        if _sensitive(value):
-            self._note_sensitive(value)
-            return "（秘匿ファイル）"
         if kind == "item":
             return self.item(value)
         if kind == "path":
@@ -1614,17 +1598,17 @@ _LINE_RANGE = re.compile(r"^\d{1,9}(-\d{1,9})?$")
 
 
 def _jterm(masker: Masker, value):
-    """検索語など。伏せ字では記号・素では秘匿ファイルの名前だけ伏せた全文。"""
+    """検索語など。伏せ字では記号・素では全文。"""
     if not isinstance(value, str) or not value.strip():
         return None
-    return masker.term(value) if masker.mask else masker.scrub(value)
+    return masker.term(value) if masker.mask else value
 
 
 def _jpath(masker: Masker, value):
-    """資料のパス。伏せ字では記号・秘匿ファイルは伏せ・それ以外の素はそのまま。"""
+    """資料のパス。伏せ字では記号・素ではそのまま（秘匿ファイルの名前も出す）。"""
     if not isinstance(value, str) or not value.strip():
         return None
-    return masker.path(value) if (masker.mask or _sensitive(value)) else value
+    return masker.path(value) if masker.mask else value
 
 
 def _jrange(masker: Masker, value):

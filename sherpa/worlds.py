@@ -241,6 +241,18 @@ def observation_current_dir(world_id: str) -> Path | None:
     return observation_render.active_observation_dir(base, canonical_generation_id=canonical)
 
 
+def observation_latest_dir(world_id: str) -> Path | None:
+    """最後に公開した OCR 観測のディレクトリ（無ければ None）。Canonical の世代との一致は求めない。
+    OCR を切っているあいだ、資料の更新で世代が進んでも読み取り済みの文字を残すために使う（文書ごとの `source_content_hash` の照合は読む側が行う）。
+    """
+    from .ingest import observation_render
+
+    try:
+        return observation_render.active_observation_dir(observation_dir(world_id))
+    except ValueError:
+        return None
+
+
 def _configured_ocr_world_root() -> Path:
     """OCR worker へ read-only で渡す、明示された参照元 root。広い既定値は持たない（未設定・相対・symlink・到達不可は設定エラー）。"""
     raw = os.environ.get("SHERPA_OCR_WORLD_ROOT", "").strip()
