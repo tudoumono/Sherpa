@@ -54,6 +54,8 @@ PREVIEW = {
     "documents_note": None,
     # 資料の画面のツリー用のフォルダの一覧（資料の無いフォルダも含む）。`folders_partial` は走査が期限で止まったこと。
     "folders": [], "folders_truncated": False, "folders_partial": False,
+    # 表の印用の優先と除外（読み取りだけ）。読めないときは None。
+    "path_rules": [],
     "counts": {"entities": 4, "relations": 3,
                "deprecated": 0, "hidden": 0, "documents": 3},
     # フェーズ7-1: 実 doc（doc_ledger.py::preview_documents）は phase/category/label/reason も常に持つ
@@ -1512,7 +1514,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                       system_settings: dict | None = None, settings: dict | None = None,
                       stream_events: list | None = None, extra_users: list | None = None,
                       tools_availability: dict | None = None, notifications: list | None = None,
-                      world_options: dict | None = None):
+                      world_options: dict | None = None, path_rules: list | None = None):
     current_user = user or USER_ADMIN
     # GET /admin/users の既定2件（admin/sato）に加え、呼び出し元が `extra_users=` で行を追加
     # できる（例: pending 状態のユーザーなど、既定の POST/PATCH mock 経路では作れない状態を
@@ -1550,7 +1552,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
     # で不達を模せる・既定は3経路とも到達可＝既存 e2e の「全チップ表示」前提を崩さない）。
     tools_availability_resp = tools_availability if tools_availability is not None else {
         "grep": True, "fulltext": True, "graph": True}
-    path_rules_saved: list = []      # PUT /admin/path-rules で置き換わる（優先と除外）
+    path_rules_saved: list = [dict(r) for r in (path_rules or [])]      # PUT /admin/path-rules で置き換わる（優先と除外）
     build_marks_saved: list = []
     records = {
         "turn_starts": [],
@@ -2558,7 +2560,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         if method == "GET" and path == "/ingest/workers":
             return _json(route, {"ocr_message": None})
         if method == "GET" and path == "/ingest/preview":
-            return _json(route, PREVIEW)
+            return _json(route, {**PREVIEW, "path_rules": path_rules_saved})
         if method == "GET" and path == "/ingest/preview/graph":
             return _json(route, PREVIEW_GRAPH)
         if method == "GET" and path == "/admin/es/search":

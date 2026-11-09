@@ -747,6 +747,33 @@ const STATE = {  // state → 表示（記号・クラス）。enum のみ。
 const ABBR = { Module: 'Mod', Copybook: 'Cpy', DataItem: '項目', Document: '文書', Batch: 'ジョブ', Table: '表', Config: '設定', Dataset: 'データ', Executable: '実行' };
 
 let _pv = null, _q = '', _type = '', _state = 'all', _folder = '';
+let _rules = new Map();   // path → {kind, outside_scope}（優先と除外の印・読み取りだけ）
+
+function rulesMap(list) {
+  return new Map((Array.isArray(list) ? list : []).map((r) => [r.path, { kind: r.kind, outside_scope: !!r.outside_scope }]));
+}
+
+// 自分に付いた設定、無ければ親（根の方）に付いた設定。親から受けるときは from に親のパスを入れる。
+function ruleMark(path) {
+  for (let p = path, own = true; p; p = p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '', own = false) {
+    const r = _rules.get(p);
+    if (r && (r.kind === 'priority' || r.kind === 'exclude')) return { ...r, from: own ? null : p };
+  }
+  return null;
+}
+function ruleBadge(path) {
+  const m = ruleMark(path);
+  if (!m) return '';
+  const tips = [];
+  if (m.from) tips.push(`親の「${m.from.split('/').pop()}」に従います`);
+  if (m.kind === 'priority' && m.outside_scope) tips.push('範囲の外でも読みます');
+  const tip = tips.length ? ` title="${esc(tips.join('。'))}"` : '';
+  return m.kind === 'priority' ? `<span class="pill pri"${tip}>優先</span>` : `<span class="pill exc"${tip}>除外</span>`;
+}
+function ruleGoto(path, isDir) {
+  const nm = path.split('/').pop();
+  return `<button class="mini" data-rule-goto="${esc(path)}"${isDir ? ' data-rule-dir="1"' : ''} aria-label="${esc(nm)}の優先と除外を設定">設定</button>`;
+}
 
 // unreadable/unknown は「⚠ 失敗」フィルタ・理由・やり直すの対象にも含める（バッジ表示は個別）。失敗フィルタで消えたり、理由/再実行の導線を失ったりしないようにする。
 function isFailureState(state) {
@@ -868,6 +895,7 @@ async function load() {
   $('rows').innerHTML = `<tr><td colspan="5">${_LOADING_INLINE}</td></tr>`;
   try {
     _pv = await getJSON(`/ingest/preview?world=${encodeURIComponent(world)}`);
+    _rules = rulesMap(_pv.path_rules);
     const types = [...new Set(_pv.documents.map((d) => d.doctype))].sort();
     $('type').innerHTML = '<option value="">すべて</option>' + types.map((t) => `<option>${esc(t)}</option>`).join('');
     renderTree();
@@ -950,11 +978,11 @@ function childFolders() {
 }
 function folderRow([path, n]) {
   return `<tr class="folderrow" data-open-folder="${esc(path)}" style="cursor:pointer">
-    <td><span class="fname" title="${esc(path)}">📁 ${esc(shownName(path))}</span></td>
+    <td><span class="fname" title="${esc(path)}">📁 ${esc(shownName(path))}${ruleBadge(path)}</span></td>
     <td><span class="dtype">フォルダ</span></td>
     <td class="muted">資料 ${n} 件</td>
     <td class="muted">${esc(_folder)}</td>
-    <td><div class="rowact"><button class="mini" data-open-folder="${esc(path)}">開く</button></div></td>
+    <td><div class="rowact"><button class="mini" data-open-folder="${esc(path)}">開く</button>${n > 0 ? ruleGoto(path, true) : ''}</div></td>
   </tr>`;
 }
 // 一覧の名前は、ツリーで選んだフォルダより下の部分だけを出す（全体のパスは title に残す）。
@@ -971,13 +999,16 @@ function row(d) {
   const fixHint = d.state === 'unreadable'
     ? '<div class="muted" style="font-size:var(--text-caption);margin-top:3px">元のファイルを直してから「更新」を押してください</div>' : '';
   return `<tr>
-    <td><span class="fname" title="${esc(d.name)}">${icon} ${esc(shownName(d.name))}</span>${reason}${fixHint}${provBadges(d.provenance)}${analyzerBadgeRow(d)}${encodingPartialBadge(d)}</td>
+    <td><span class="fname" title="${esc(d.name)}">${icon} ${esc(shownName(d.name))}${ruleBadge(d.name)}</span>${reason}${fixHint}${provBadges(d.provenance)}${analyzerBadgeRow(d)}${encodingPartialBadge(d)}</td>
     <td><span class="dtype">${esc(d.doctype)}</span></td>
     <td><span class="status ${st.cls}"><span class="d"></span>${esc(st.mark)}</span></td>
     <td class="muted">${esc(place)}</td>
-    <td><div class="rowact"><button class="mini" data-dl="${esc(d.name)}">原本をひらく</button></div></td>
+    <td><div class="rowact"><button class="mini" data-dl="${esc(d.name)}">原本をひらく</button>${ruleGoto(d.name, false)}</div></td>
   </tr>`;
 }
+
+// 「優先と除外」タブが設定を読み込んだ・保存したときに呼ばれ、表の印を差し替える。
+window.RulesTab.onRules((rules) => { _rules = rulesMap(rules); if (_pv) render(); });
 
 // ===== 全文検索（共有KB・read-only） =====
 function updateEsScope() {
@@ -1112,6 +1143,8 @@ $('detailbtn').addEventListener('click', openPrev);
 $('esbtn').addEventListener('click', searchEs);
 $('esq').addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter') searchEs(); });
 $('rows').addEventListener('click', (e) => {
+  const rg = e.target.closest('[data-rule-goto]');
+  if (rg) { window.RulesTab.reveal(rg.dataset.ruleGoto, !!rg.dataset.ruleDir); return; }   // tr 全体が data-open-folder のため先に見る
   const of = e.target.closest('[data-open-folder]');
   if (of) {                                                  // フォルダの行: そのフォルダを開く（ツリーで選ぶのと同じ）
     _folder = of.dataset.openFolder; renderTree(); render();

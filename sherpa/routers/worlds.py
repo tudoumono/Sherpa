@@ -20,7 +20,7 @@ import psycopg
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
-from sherpa import corpus_docs, disk_estimate, doc_ledger, store, world_admin_service, worlds
+from sherpa import corpus_docs, disk_estimate, doc_ledger, path_rules, store, world_admin_service, worlds
 from sherpa.deps import (
     _WORLD_PATTERN,
     _WorldField,
@@ -215,10 +215,18 @@ def ingest_preview(request: Request, world: str | None = Query(None, pattern=_WO
     _require_admin(_current_user(request))
     wid = _resolve_world(world)
     try:
-        return build_preview(wid)
+        out = build_preview(wid)
     except Exception as e:
         _log.warning("取り込みプレビューの構築に失敗しました wid=%s", wid, exc_info=True)
         raise HTTPException(503, _GRAPH_UNAVAILABLE_MESSAGE) from e
+    # 表の印用。読み取りだけ（`GET /admin/path-rules` と違い設定を書き換えない）。読めないときは印を出さないだけで一覧は返す。
+    try:
+        out["path_rules"] = [{"path": r.path, "kind": r.kind, "outside_scope": r.outside_scope}
+                             for r in path_rules.rules_for(wid).items]
+    except Exception:
+        _log.warning("優先と除外の印を読めませんでした wid=%s", wid, exc_info=True)
+        out["path_rules"] = None
+    return out
 
 
 @ingest_preview_router.get("/ingest/preview/graph", tags=["資料フォルダ(World)管理"])

@@ -82,8 +82,8 @@
   #tab-rules .task{display:flex;align-items:flex-start;gap:10px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px}
   #tab-rules .task .q{font-weight:700}
   #tab-rules .task .a{font-size:var(--text-small);color:var(--ink-2)}
-  #tab-rules .pill.pri{background:var(--ok-bg);color:var(--ok)}
-  #tab-rules .pill.exc{background:var(--danger-bg);color:var(--danger)}
+  #tab-rules .pill.pri,#tab-status .pill.pri{background:var(--ok-bg);color:var(--ok)}
+  #tab-rules .pill.exc,#tab-status .pill.exc{background:var(--danger-bg);color:var(--danger)}
   #tab-rules .toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0;padding:0}
   #tab-rules .toolbar input[type=search]{flex:1;min-width:180px;min-height:36px;padding:0 10px;border:1px solid var(--control-border);border-radius:var(--radius-sm);background:var(--surface);color:var(--ink);font:inherit}
   #tab-rules .filterchip{min-height:32px;padding:0 12px;border:1px solid var(--border);border-radius:999px;background:var(--surface);color:var(--ink);font:inherit;font-size:var(--text-small);cursor:pointer}
@@ -91,6 +91,7 @@
   #tab-rules .treehead,#tab-rules .trow{display:grid;grid-template-columns:minmax(0,1fr) 300px 230px;gap:10px;align-items:center;padding:5px 8px}
   #tab-rules .treehead{font-size:var(--text-caption);color:var(--ink-3);border-bottom:2px solid var(--border)}
   #tab-rules .trow{border-bottom:1px solid var(--border)}
+  #tab-rules .trow.reveal{background:var(--accent-weak)}
   #tab-rules .trow.changed{background:var(--warn-bg)}
   #tab-rules .tname{display:flex;gap:6px;align-items:center;min-width:0;word-break:break-all}
   #tab-rules .tname .tog{border:none;background:transparent;cursor:pointer;color:var(--ink-3);font:inherit;padding:0 4px}
@@ -228,7 +229,7 @@
       <div class="card" style="box-shadow:none">
         <table class="grid">
           <thead><tr><th>名前</th><th style="width:96px">種類</th><th style="width:150px">状態</th>
-            <th style="width:160px">場所（範囲）</th><th style="width:170px"></th></tr></thead>
+            <th style="width:160px">場所（範囲）</th><th style="width:190px"></th></tr></thead>
           <tbody id="rows"></tbody>
         </table>
       </div>

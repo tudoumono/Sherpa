@@ -21,6 +21,7 @@ const state = {
   layout: new Set(),      // 置き方から読むフォルダ
   filter: 'all',
   query: '',
+  reveal: null,           // {path, dir}（資料の画面の「設定」から来た行）
 };
 
 function toast(msg) {
@@ -121,7 +122,9 @@ function visibleRows() {
   const seen = new Set(state.folders.map((f) => f.path));
   for (const list of state.files.values()) for (const p of list) if (!seen.has(p)) { seen.add(p); entries.push({ path: p, dir: false }); }
   // まだ開いていないフォルダの中のファイルでも、設定が付いているものは一覧に出す（絞り込みで見つけられるように）
-  for (const p of [...state.draft.keys(), ...state.saved.keys(), ...state.buildDraft.keys()]) if (!seen.has(p)) { seen.add(p); entries.push({ path: p, dir: false }); }
+  const pinned = [...state.draft.keys(), ...state.saved.keys(), ...state.buildDraft.keys()];
+  if (state.reveal && !state.reveal.dir) pinned.push(state.reveal.path);
+  for (const p of pinned) if (!seen.has(p)) { seen.add(p); entries.push({ path: p, dir: false }); }
   entries.sort(Sherpa.comparePath);
   const keep = new Set();
   if (filtering) {
@@ -163,7 +166,8 @@ function rowHTML(e) {
       + (changed ? '<span class="tnote">（まだ保存していません）</span>' : '') + '</span>';
   }
   const buildChanged = (state.buildDraft.get(e.path) || '') !== (state.buildSaved.get(e.path) || '');
-  return `<div class="trow${changed || buildChanged ? ' changed' : ''}" data-row="${esc(e.path)}">${name}${set}${buildCell(e)}</div>`;
+  const revealed = state.reveal && state.reveal.path === e.path;
+  return `<div class="trow${changed || buildChanged ? ' changed' : ''}${revealed ? ' reveal' : ''}" data-row="${esc(e.path)}">${name}${set}${buildCell(e)}</div>`;
 }
 
 function render() {
@@ -193,9 +197,14 @@ function applyBuild(marks) {
   state.buildDraft = new Map(state.buildSaved);
 }
 
+// 設定を読み込んだ・保存したときに呼ぶ先（取り込み状況の表の印）。
+let _onRules = null;
+function onRules(fn) { _onRules = fn; }
+
 function applySaved(rules) {
   state.saved = new Map(rules.map((r) => [r.path, { kind: r.kind, outside: !!r.outside_scope }]));
   state.draft = new Map(state.saved);
+  if (_onRules) _onRules(rules.map((r) => ({ path: r.path, kind: r.kind, outside_scope: !!r.outside_scope })));
 }
 
 async function loadFiles(folder, more) {
@@ -294,6 +303,7 @@ function bind() {
 // タブを開くたびに読み直す。読み込み前に、前回の木・設定・開閉・消えた場所の知らせを空に戻す。
 let _loadSeq = 0;
 function resetState() {
+  state.reveal = null;
   state.world = ''; state.label = '';
   state.folders = []; state.files = new Map(); state.more = new Map(); state.open = new Set(['']);
   state.saved = new Map(); state.draft = new Map();
@@ -351,14 +361,43 @@ async function load() {
 }
 
 // 資料の画面のタブから呼ぶ。保存していない変更があるときは読み直さない（下書きを消さない）。
-async function open() {
-  if (isDirty()) return;
+let _opening = Promise.resolve();
+function open() {
+  if (isDirty()) return _opening;
   const seq = _loadSeq + 1;
-  try { await load(); } catch (e) {
-    if (seq !== _loadSeq) return;
-    resetState();
-    showTreeMessage(`<div class="muted" style="padding:14px">読み込めませんでした: ${esc(e.message)}</div>`);
-  }
+  _opening = (async () => {
+    try { await load(); } catch (e) {
+      if (seq !== _loadSeq) return;
+      resetState();
+      showTreeMessage(`<div class="muted" style="padding:14px">読み込めませんでした: ${esc(e.message)}</div>`);
+    }
+  })();
+  return _opening;
+}
+
+// 資料の画面の表の「設定」から呼ぶ。① タブを移す ② 読み込みを待つ ③ 絞り込みを外し親を開く ④ その行を見える所へ出す。
+// 連打されたときは最後の呼び出しだけが残る。
+let _revealSeq = 0;
+async function reveal(path, isDir) {
+  const seq = ++_revealSeq;
+  window.IngestTabs.select('rules');
+  await _opening;
+  if (seq !== _revealSeq || !state.world) return;
+  state.filter = 'all'; state.query = '';
+  $('rules-q').value = '';
+  const files = state.files;
+  const parents = ancestors(path);
+  for (const a of parents) state.open.add(a);
+  const loaded = await Promise.all(parents.map((a) => loadFiles(a).then(() => true, () => false)));
+  if (seq !== _revealSeq || files !== state.files) return;
+  state.reveal = { path, dir: !!isDir };
+  render();
+  if (loaded.includes(false)) toast('ファイルの一覧を読み込めませんでした');
+  const row = [...$('rules-tree').querySelectorAll('[data-row]')].find((el) => el.dataset.row === path);
+  if (!row) { toast('この場所は「優先と除外」の一覧にありません'); return; }
+  row.scrollIntoView({ block: 'center' });
+  const sel = [...row.querySelectorAll('select[data-set]')][0];
+  if (sel) sel.focus();
 }
 
 // 資料フォルダが無くなったときに呼ぶ。下書きは元のフォルダと一緒に無効になるので捨てる。
@@ -369,5 +408,5 @@ function discard() {
 }
 
 bind();
-window.RulesTab = { open, isDirty, discard };
+window.RulesTab = { open, isDirty, discard, reveal, onRules };
 })();

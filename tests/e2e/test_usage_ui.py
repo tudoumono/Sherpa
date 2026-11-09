@@ -142,8 +142,8 @@ def test_usage_stat4_new_metrics_render_with_default_seed(page, web_base_url):
     chat_row = kind_tbody.locator("tr", has_text="会話").first
     expect(chat_row).to_contain_text("未計測")        # chat 行は所要時間を持たない（API 契約＝None）
     expect(chat_row).not_to_contain_text("秒")
-    embed_row = kind_tbody.locator("tr", has_text="検索の索引づくり")   # 報告不能マーカー（null）＝未計測
-    expect(embed_row).to_contain_text("検索の索引づくり")
+    embed_row = kind_tbody.locator("tr", has_text="埋め込み")   # 報告不能マーカー（null）＝未計測
+    expect(embed_row).to_contain_text("埋め込み")
     expect(embed_row).to_contain_text("未計測")
 
     stopkind_svg = page.locator("#chart-stopkind-svg")
