@@ -1,10 +1,10 @@
 """社内の宛先をプロキシの例外（`NO_PROXY`／`no_proxy`）へ自動で足す。
 
-設定から分かる宛先のホスト（ES・Neo4j・Postgres の接続先・ループバック・社内と分かる Ollama の接続先と許可リスト）を、環境の
+設定から分かる宛先のホスト（ES・Neo4j・Postgres の接続先・ループバック・Ollama の既定の接続先と許可リスト）を、環境の
 `NO_PROXY` に重複なく足して `os.environ` を更新する。urllib はプロキシの例外を要求のたびに環境から読み、
 子プロセス（Codex・MCP）は更新後の環境を受け継ぐ。プロキシの設定そのもの（`HTTP_PROXY` など）は触らない。
 呼ぶ時機は ① プロセスの起動時（API・取り込みワーカー・MCP の道具のサーバー） ② system_settings の保存時
-③ Codex と MCP の子プロセスを起こす直前。設定を読めなくても例外を出さず、足せた分だけ足す。
+③ Codex と MCP の子プロセスを起こす直前 ④ 取り込みワーカーが依頼を 1 件拾うたび ⑤ 取り込みワーカーの中のつながりの確認の前。設定を読めなくても例外を出さず、足せた分だけ足す。
 設計: docs/design/operations.md「起動・停止・状態」
 """
 from __future__ import annotations
@@ -39,17 +39,29 @@ def host_of(value: str | None) -> str | None:
     return host or None
 
 
-def is_internal_host(host: str) -> bool:
-    """社内と分かるホストか（DNS は引かない）。IP はプライベート・ループバック・リンクローカル、名前は
-    `localhost`・`.local` 終わり・ドットの無い名前。"""
-    h = host.strip().strip("[]").lower().rstrip(".")
-    if not h:
-        return False
+def _is_plain_host(host: str) -> bool:
+    """Ollama の登録から足してよい形か（ゾーン ID なしの IP のリテラル、または英数字・ハイフン・下線・ドットだけの名前）。
+    末尾のドット 1 つは許す。`*`・先頭ドット・空白・ゾーン ID・記号を含むものは足さない（ワイルドカード・先頭ドットの指定を入れない）。"""
+    h = host.strip("[]")
     try:
-        ip = ipaddress.ip_address(h)
+        ipaddress.ip_address(h)
+        return "%" not in h
     except ValueError:
-        return h == "localhost" or h.endswith(".local") or "." not in h
-    return ip.is_private or ip.is_loopback or ip.is_link_local
+        pass
+    name = h[:-1] if h.endswith(".") else h
+    return bool(name) and not name.startswith(".") and not name.endswith(".") and all(
+        c.isascii() and (c.isalnum() or c in "-._") for c in name)
+
+
+def _forms(host: str) -> list[str]:
+    """IPv6 のリテラルは角括弧なし・ありの両方（urllib は `[::1]:port` の形で照合する）。"""
+    h = host.strip("[]")
+    try:
+        if ipaddress.ip_address(h).version == 6:
+            return [h, f"[{h}]"]
+    except ValueError:
+        pass
+    return [h]
 
 
 def _collect(name: str, getter) -> list[str]:
@@ -61,7 +73,8 @@ def _collect(name: str, getter) -> list[str]:
 
 
 def internal_hosts(system_settings: dict | None = None) -> list[str]:
-    """設定から分かる社内の宛先のホスト（重複なし・順序保持）。"""
+    """設定から分かる宛先のホスト（重複なし・順序保持）。ES・Neo4j・Postgres・ループバックはそのまま足し、
+    Ollama の登録だけ `_is_plain_host` の形のものに絞る。"""
     def settings() -> dict:
         if system_settings is not None:
             return system_settings
@@ -83,24 +96,16 @@ def internal_hosts(system_settings: dict | None = None) -> list[str]:
         raw = str(conninfo_to_dict(store._dsn()).get("host") or "")
         return [h for h in raw.split(",") if h and not h.startswith("/")]
 
-    skipped = 0
-
     def ollama():
-        nonlocal skipped
         ss = settings()
-        hosts = [host_of(x) for x in (ss.get("ollama_url") or "", *(ss.get("ollama_allowlist") or []))]
-        hosts = [h for h in hosts if h]
-        internal = [h for h in hosts if is_internal_host(h)]
-        skipped = len(hosts) - len(internal)
-        return internal
+        hosts = (host_of(x) for x in (ss.get("ollama_url") or "", *(ss.get("ollama_allowlist") or [])))
+        return [f"[{h}]" if ":" in h else h for h in hosts if h and _is_plain_host(h)]
 
     hosts: list[str] = []
     for name, getter in (("ES", es), ("Neo4j", neo4j), ("Postgres", postgres), ("Ollama", ollama)):
         hosts += _collect(name, getter)
-    if skipped:
-        _log.info("社内と分からない Ollama の宛先はプロキシの例外へ足しません（%d 件）", skipped)
     hosts += LOOPBACK_HOSTS
-    return list(dict.fromkeys(h.lower() for h in hosts))
+    return list(dict.fromkeys(f.lower() for h in hosts for f in _forms(h)))
 
 
 def merged_no_proxy(extra: list[str], existing: str = "") -> str:

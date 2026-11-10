@@ -268,23 +268,6 @@ def _check_embed(ctx: _Ctx, paid: bool) -> dict:
     return {"route": route, "host": host, "note": note, "paid": provider == "openai"}
 
 
-def _says_no_tools(e: BaseException) -> bool:
-    """400 の応答の本文が「道具に対応していない」旨か（本文は判定にだけ使い、どこにも出さない）。"""
-    c = e
-    for _ in range(4):
-        if isinstance(c, urllib.error.HTTPError):
-            if c.code != 400:
-                return False
-            try:
-                return "does not support tools" in c.read(4096).decode("utf-8", "replace").lower()
-            except Exception:
-                return False
-        c = c.__cause__ or c.__context__
-        if c is None:
-            return False
-    return False
-
-
 def _check_answer_ai(ctx: _Ctx, paid: bool) -> dict:
     """簡易の回答と同じ部品（`simple_chat._resolve_llm` の接続先・見出し、`round_messages`・`round_body`・同じ道具の一覧、
     `agentic_search._post`・1 送信の上限時間・応答の取り出し `round_message_raw`）で 1 往復送り、assistant の message があるときだけ成功にする。OpenAI に送るときは有料（`paid` のときだけ）。Ollama は無料で送る。
@@ -319,7 +302,7 @@ def _check_answer_ai(ctx: _Ctx, paid: bool) -> dict:
         resp = agentic_search._post(endpoint, headers, body, timeout=simple_chat._MAX_PER_CALL_TIMEOUT_S)
     except Exception as e:
         reason = "モデルが道具の呼び出しに対応していない（使えるモデルで別のモデルを選ぶ）" \
-            if tools and _says_no_tools(e) else classify(e)
+            if tools and simple_chat.says_no_tools(e) else classify(e)
         raise _Ng(reason, route=route, host=host, paid=is_paid)
     try:
         msg = simple_chat.round_message_raw(resp)

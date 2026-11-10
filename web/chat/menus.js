@@ -226,7 +226,7 @@ function _answerLines(ans, md, shared) {
   if (showCitations) (d.citations || []).forEach((c) => L.push(`${md ? '> ' : ''}${c.doc_id}（行${(c.span || [])[0]}-${(c.span || [])[1]}）: ${c.quote || ''}`));
   const recon = reconciliationRows(ans);
   if (recon.length) {
-    const ref = (sd) => sd.doc_id + (sd.line ? `:${sd.line}${sd.lineEnd ? `-${sd.lineEnd}` : ''}` : '');
+    const ref = (sd) => [sd.label, ...(sd.also || []).map((x) => x.label)].filter(Boolean).join('、');
     const cellText = (sd) => [sd.text, ref(sd) ? `（${ref(sd)}）` : ''].join('').replace(/\s+/g, ' ').replace(/\|/g, '/').trim();
     if (md) {
       L.push('**設計書とソースの照らし合わせ**', '', '| 項目 | 設計書の記述 | ソースの実装 | 判定 |', '| --- | --- | --- | --- |');

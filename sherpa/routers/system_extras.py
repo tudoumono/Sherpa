@@ -1365,6 +1365,7 @@ class OllamaTestReq(BaseModel):
 
 
 _OLLAMA_TEST_MAX_BYTES = 1_048_576
+_OLLAMA_SHOW_MAX_MODELS = 8  # 道具の呼び出しへの対応を確かめるモデル数の上限
 
 
 def _ollama_test_hint(e: Exception, port: int) -> str:
@@ -1390,10 +1391,12 @@ def _ollama_test_hint(e: Exception, port: int) -> str:
 @extras_router.post("/admin/settings/ollama-test", tags=["管理者:全体設定"],
                     response_model=AdminOllamaTestResponse)
 def admin_ollama_test(req: OllamaTestReq, request: Request):
-    """ローカル AI（Ollama）の既定接続先を、保存前の入力中の値でその場だけ試す（admin 専用・`/api/tags` を 1 回だけ読む・DB は書かない）。
+    """ローカル AI（Ollama）の既定接続先を、保存前の入力中の値でその場だけ試す（admin 専用・`/api/tags` を 1 回と、簡易回答・Codex のモデルへ `/api/show` を数回読む・DB は書かない・プロキシを通さず直接つなぐ）。
     実行を監査する（`ollama_endpoint.tested`・記録は host:port のみ）。監査の書き込みに失敗したら接続せず 500 で中断する。
     """
     import json as _json
+    import time
+    import urllib.request
 
     from sherpa import keys, llm
     u = _current_user(request)
@@ -1413,9 +1416,9 @@ def admin_ollama_test(req: OllamaTestReq, request: Request):
     except Exception:
         _log.critical("audit write failed for ollama_endpoint.tested (fail-closed) – probe を実行しません")
         raise HTTPException(500, "接続テストの監査記録に失敗したため中断しました")
-    # ③ /api/tags を 1 回だけ読む
+    # ③ /api/tags を読む
     try:
-        with llm.urlopen_no_redirect(
+        with llm.no_proxy_requests(), llm.urlopen_no_redirect(
                 llm.ollama_url(url, "/api/tags", extra_allowed={hp}, system_settings=sys_s),
                 timeout=_ENDPOINT_TEST_TIMEOUT_S) as r:
             raw = r.read(_OLLAMA_TEST_MAX_BYTES + 1)
@@ -1426,7 +1429,7 @@ def admin_ollama_test(req: OllamaTestReq, request: Request):
         if not isinstance(data, dict) or not isinstance(listed, list):
             raise TypeError("models is not a list")
     except Exception as e:
-        return {"ok": False, "host": host, "models": [], "missing": [],
+        return {"ok": False, "host": host, "models": [], "missing": [], "no_tools": [],
                 "detail": _ollama_test_hint(e, hp[1])}
     names = sorted({str(m.get("name")) for m in listed if isinstance(m, dict) and m.get("name")})
     # ④ 使えるモデル一覧の Ollama のモデルと突き合わせる（タグ無しは `:latest` とみなす）
@@ -1437,7 +1440,41 @@ def admin_ollama_test(req: OllamaTestReq, request: Request):
             wanted.add(cell["default"])
     have = set(names)
     missing = sorted(m for m in wanted if m not in have and f"{m}:latest" not in have)
-    return {"ok": True, "host": host, "models": names, "missing": missing, "detail": "接続OK"}
+    # ⑤ 道具の呼び出しが要るモデル（簡易回答・Codex）のうち取得済みのものへ `/api/show` を送り、`tools` を持たないものを挙げる
+    catalog = model_catalog.get_catalog(sys_s)
+    needs_tools: set[str] = set()
+    defaults: set[str] = set()
+    for provider, usage in (("ollama", "subsearch"), ("codex", "codex")):
+        cell = (catalog.get(provider) or {}).get(usage) or {}
+        needs_tools.update(m for m in (cell.get("allowed") or []) if m)
+        default = cell.get("default") or model_catalog.hardcoded_fallback(provider, usage)
+        if default:
+            needs_tools.add(default)
+            defaults.add(default)
+    targets = sorted((m for m in needs_tools if m in have or f"{m}:latest" in have),
+                     key=lambda m: (m not in defaults, m))
+    no_tools: list[str] = []
+    started = time.monotonic()
+    for m in targets[:_OLLAMA_SHOW_MAX_MODELS]:
+        left = _ENDPOINT_TEST_TIMEOUT_S - (time.monotonic() - started)
+        if left <= 0:
+            break
+        try:
+            show_req = urllib.request.Request(
+                llm.ollama_url(url, "/api/show", extra_allowed={hp}, system_settings=sys_s),
+                data=_json.dumps({"model": m}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with llm.no_proxy_requests(), llm.urlopen_no_redirect(show_req, timeout=left) as r:
+                raw = r.read(_OLLAMA_TEST_MAX_BYTES + 1)
+            if len(raw) > _OLLAMA_TEST_MAX_BYTES:
+                continue
+            caps = _json.loads(raw).get("capabilities")
+        except Exception:
+            continue
+        if isinstance(caps, list) and "tools" not in caps:
+            no_tools.append(m)
+    return {"ok": True, "host": host, "models": names, "missing": missing, "no_tools": sorted(no_tools),
+            "detail": "接続OK"}
 
 
 def _validate_allowed_worlds_or_error(allowed_worlds: list[str] | None) -> None:

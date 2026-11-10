@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import urllib.error
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -169,6 +170,27 @@ class LLMUnavailable(RuntimeError):
     """既定の AI が未設定・未接続、または送信に失敗した（503 相当）。"""
 
 
+class ModelLacksTools(LLMUnavailable):
+    """接続先が「このモデルは道具の呼び出しに対応していない」と答えた。"""
+
+
+def says_no_tools(e: BaseException) -> bool:
+    """400 の応答の本文が「道具に対応していない」旨か（本文は判定にだけ使い、どこにも出さない）。"""
+    c = e
+    for _ in range(4):
+        if isinstance(c, urllib.error.HTTPError):
+            if c.code != 400:
+                return False
+            try:
+                return "does not support tools" in c.read(4096).decode("utf-8", "replace").lower()
+            except Exception:
+                return False
+        c = c.__cause__ or c.__context__
+        if c is None:
+            return False
+    return False
+
+
 class AnswerTimeout(RuntimeError):
     """リクエスト全体の絶対期限（`absolute_deadline`）を超過した（504 相当）。"""
 
@@ -304,10 +326,16 @@ def iter_tool_loop(state: LoopState, *, provider: str, model: str, endpoint: str
         except AnswerTimeout:
             raise
         except Exception as e:
+            no_tools = bool(tools) and says_no_tools(e)
             from .ingest.graph_extract import _log_masked_exception
             _log_masked_exception(_log, "simple_chat: LLM 送信に失敗", e)
             if _remaining_s(absolute_deadline) <= 0:
                 raise AnswerTimeout("回答の作成が制限時間内に完了しませんでした") from e
+            if no_tools:
+                _log.warning("simple_chat: 接続先が道具の呼び出しに対応していないと答えた")
+                raise ModelLacksTools(
+                    "既定の AI のモデルが道具の呼び出しに対応していません。"
+                    "管理者に「使えるモデル」の設定を確認してください。") from e
             raise LLMUnavailable("既定の AI に接続できませんでした。管理者に設定を確認してください。") from e
         state.llm_calls += 1
         agentic_search._acc_openai_usage(state.usage_acc, resp, provider == "ollama")

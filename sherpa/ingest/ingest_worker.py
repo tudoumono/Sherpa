@@ -19,7 +19,7 @@ import signal
 import threading
 import time
 
-from .. import app_version, store, webhooks
+from .. import app_version, proxy_bypass, store, webhooks
 from ..env_int import env_int
 from ..store import workers as store_workers
 from . import background, connectivity_relay, jobs, worker_state
@@ -103,6 +103,7 @@ class _Beat:
 def run_claimed(row: dict) -> None:
     """拾った依頼 1 件を実行する。想定外の例外はここで捕まえ、終端に届かなかった run は failed へ落とす（最外周のセーフティネット）。"""
     run_id, world, op = row["id"], row["version"], row.get("op")
+    proxy_bypass.apply()
     background.bind_run(run_id)
     try:
         jobs.run_job(op, world, row.get("payload"), run_id)
@@ -289,7 +290,6 @@ def main(argv: list[str] | None = None) -> int:
     worker_id = worker_state.new_worker_id("ingest")
     version = app_version.current()
     store.init_schema()
-    from .. import proxy_bypass
     proxy_bypass.apply()
     liveness = store_workers.hold_liveness_lock(worker_id)
     beat = _Beat(worker_id, version)

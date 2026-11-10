@@ -504,7 +504,7 @@ _no_proxy_ctx: contextvars.ContextVar[bool] = contextvars.ContextVar("_llm_no_pr
 @contextlib.contextmanager
 def no_proxy_requests():
     """`with` ブロック内の `urlopen_no_redirect()`（延いては `post_json()`）を、環境変数 HTTP(S)_PROXY を無視する専用 opener で行う。
-    ローカル/allowlist 済みの Ollama 宛リクエスト専用（現在の呼び出し元は `embeddings._embed_batch` の ollama 分岐）。OpenAI 宛は経由しない。
+    ローカル/allowlist 済みの Ollama 宛リクエスト専用（呼び出し元は `embeddings` の ollama 分岐と管理画面の Ollama 接続テスト）。OpenAI 宛は経由しない。
     """
     token = _no_proxy_ctx.set(True)
     try:

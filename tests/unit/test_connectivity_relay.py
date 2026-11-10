@@ -69,6 +69,17 @@ def test_worker_runs_a_request_once_and_writes_the_result(run_dir, monkeypatch):
     assert calls == [(True, "ingest"), (False, "ingest")] and relay.read_result(new) == [{"id": "x"}]
 
 
+def test_worker_applies_proxy_bypass_before_running_the_checks(run_dir, monkeypatch):
+    from sherpa import proxy_bypass
+    order = []
+    monkeypatch.setattr(proxy_bypass, "apply", lambda *a, **k: order.append("apply"))
+    monkeypatch.setattr(connectivity, "run_checks", lambda *a, **k: order.append("run") or [])
+    relay.write_request(False)
+    r = relay.Relay()
+    r._run("rid", False)
+    assert order == ["apply", "run"]
+
+
 def test_worker_ignores_a_stale_request(run_dir, monkeypatch):
     calls = []
     monkeypatch.setattr(connectivity, "run_checks", lambda *a, **k: calls.append(1) or [])

@@ -68,14 +68,59 @@ def test_destination_removed_from_settings_leaves_no_proxy(proxied_env, monkeypa
     assert ".corp.example" in value.split(",")
 
 
-def test_external_ollama_hosts_never_become_proxy_exceptions(proxied_env):
+def test_registered_ollama_hosts_all_become_proxy_exceptions(proxied_env):
     from sherpa import proxy_bypass
-    ss = {"ollama_url": "https://api.openai.com:443",
-          "ollama_allowlist": ["api.openai.com:443", "8.8.8.8:11434", "gpu.corp.example",
-                               "gpu1.local:11434", "172.16.0.5", "169.254.1.1", "[fd00::1]:11434", "intra"]}
+    ss = {"ollama_url": "https://gpu.vendor.example:443",
+          "ollama_allowlist": ["gpu.corp.example", "8.8.8.8:11434", "gpu1.local:11434", "172.16.0.5", "intra"]}
     hosts = set(proxy_bypass.apply(ss).split(","))
-    assert {"gpu1.local", "172.16.0.5", "169.254.1.1", "intra"} <= hosts
-    assert not hosts & {"api.openai.com", "8.8.8.8", "gpu.corp.example"}
+    assert {"gpu.vendor.example", "gpu.corp.example", "8.8.8.8", "gpu1.local", "172.16.0.5", "intra"} <= hosts
+    for host in ("gpu.corp.example:11434", "8.8.8.8:11434"):
+        assert urllib.request.proxy_bypass(host), host
+
+
+def test_wildcard_and_suffix_forms_never_reach_proxy_exceptions(proxied_env):
+    from sherpa import proxy_bypass
+    ss = {"ollama_allowlist": ["*:11434", ".corp.example:11434", "a b:11434", "gpu.corp.example:11434"]}
+    parts = proxy_bypass.apply(ss).split(",")
+    assert "*" not in parts and not [p for p in parts if p.startswith(".")]
+    assert "gpu.corp.example" in parts
+
+
+def test_underscore_and_trailing_dot_hosts_are_added(proxied_env, monkeypatch):
+    from sherpa import proxy_bypass
+    monkeypatch.setenv("ES_URL", "http://es_node.corp.example.:9200")
+    value = proxy_bypass.apply({"ollama_allowlist": ["gpu_1.corp.example:11434"]})
+    parts = value.split(",")
+    assert "gpu_1.corp.example" in parts and "es_node.corp.example." in parts
+    assert urllib.request.proxy_bypass("gpu_1.corp.example:11434")
+    assert urllib.request.proxy_bypass("es_node.corp.example.:9200")
+
+
+def test_zone_id_with_wildcard_never_reaches_proxy_exceptions(proxied_env):
+    from sherpa import proxy_bypass
+    ss = {"ollama_allowlist": ["[fe80::1%a,.example.com,*]:11434", "[fe80::2%eth0]:11434"]}
+    parts = proxy_bypass.apply(ss).split(",")
+    assert "*" not in parts and not [p for p in parts if p.startswith(".") or "%" in p]
+
+
+def test_ipv6_literals_match_urllib_bracket_form(proxied_env):
+    from sherpa import proxy_bypass
+    proxy_bypass.apply({"ollama_allowlist": ["[fd00::1]:11434"]})
+    assert urllib.request.proxy_bypass("[::1]:11434")
+    assert urllib.request.proxy_bypass("[fd00::1]:11434")
+
+
+def test_ingest_worker_applies_proxy_bypass_per_claimed_run(monkeypatch):
+    from sherpa import proxy_bypass, store
+    from sherpa.ingest import background, ingest_worker, jobs
+    calls = []
+    monkeypatch.setattr(proxy_bypass, "apply", lambda *a, **k: calls.append(1))
+    monkeypatch.setattr(background, "bind_run", lambda run_id: None)
+    monkeypatch.setattr(jobs, "run_job", lambda op, world, payload, run_id: None)
+    monkeypatch.setattr(store, "fail_close_if_extracting", lambda run_id, reason=None: False)
+    for i in (1, 2):
+        ingest_worker.run_claimed({"id": i, "version": "w", "op": "sync", "payload": None})
+    assert len(calls) == 2
 
 
 def test_mcp_tool_server_start_does_not_read_settings_db(proxied_env, monkeypatch):

@@ -1163,6 +1163,7 @@ def test_central_ollama_test_button_sends_input_url_without_saving(page, web_bas
     expect(res).to_contain_text("接続OK（10.9.9.21:11434）")
     expect(res).to_contain_text("qwen2.5:latest")
     expect(res).to_contain_text("未取得: nomic-embed-text")
+    expect(res).to_contain_text("道具の呼び出しに対応していないモデル: gemma3:12b")
     assert records["admin_ollama_test"][-1] == {"ollama_url": "http://10.9.9.21:11434"}
     assert records["admin_settings_put"] == []
 
