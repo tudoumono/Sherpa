@@ -41,7 +41,7 @@ $('messages').addEventListener('click', async (e) => {
     if (!r.ok) { alert((await r.json().catch(() => ({}))).detail || '原本は未取り込みです'); return; }
     const blob = await r.blob();
     // 保存名は doc_id（rel_path）末尾＝原本のファイル名（サーバの Content-Disposition basename と一致）
-    const name = dl.textContent.replace(/^📄\s*/, '').split('/').filter(Boolean).pop() || 'download';
+    const name = dl.dataset.name || dl.textContent.replace(/^📄\s*/, '').split('/').filter(Boolean).pop() || 'download';
     Sherpa.downloadBlob(blob, name);   // revoke のタイミング問題は共通ヘルパで回避
   }
   // 調査台帳の href は、クリック時に .msg._messageId と S.cid から組み立てる（answer 自体は会話id/メッセージidを持たない）。

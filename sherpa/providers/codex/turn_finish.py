@@ -598,7 +598,7 @@ def assemble_result(self, ctx, st, decision, env):
                 env.setdefault("data", {})["reconciliation"] = _recon_rows
                 if _recon_meta["unverified"]:
                     add_notice(env, "reconciliation_unverified",
-                               f"設計書とソースの照らし合わせのうち {_recon_meta['unverified']} 件は、根拠の資料を確認できなかったため「未確認」にしています。")
+                               f"設計書とソースの照らし合わせのうち {_recon_meta['unverified']} 件は、根拠の資料か、その中の位置を確かめられなかったため「未確認」にしています。")
                 if _recon_meta["more"]:
                     add_notice(env, "reconciliation_more",
                                f"設計書とソースの照らし合わせは件数が多いため、{_recon_meta['more']} 件を表に出していません。")

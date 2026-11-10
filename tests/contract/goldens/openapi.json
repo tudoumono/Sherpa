@@ -152,6 +152,13 @@
             "title": "Models",
             "type": "array"
           },
+          "no_tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "No Tools",
+            "type": "array"
+          },
           "ok": {
             "title": "Ok",
             "type": "boolean"
@@ -162,6 +169,7 @@
           "host",
           "models",
           "missing",
+          "no_tools",
           "detail"
         ],
         "title": "AdminOllamaTestResponse",
@@ -10350,7 +10358,7 @@
     },
     "/admin/settings/ollama-test": {
       "post": {
-        "description": "ローカル AI（Ollama）の既定接続先を、保存前の入力中の値でその場だけ試す（admin 専用・`/api/tags` を 1 回だけ読む・DB は書かない）。\n実行を監査する（`ollama_endpoint.tested`・記録は host:port のみ）。監査の書き込みに失敗したら接続せず 500 で中断する。",
+        "description": "ローカル AI（Ollama）の既定接続先を、保存前の入力中の値でその場だけ試す（admin 専用・`/api/tags` を 1 回と、簡易回答・Codex のモデルへ `/api/show` を数回読む・DB は書かない・プロキシを通さず直接つなぐ）。\n実行を監査する（`ollama_endpoint.tested`・記録は host:port のみ）。監査の書き込みに失敗したら接続せず 500 で中断する。",
         "operationId": "admin_ollama_test_admin_settings_ollama_test_post",
         "requestBody": {
           "content": {

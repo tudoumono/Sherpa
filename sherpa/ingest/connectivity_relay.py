@@ -144,8 +144,9 @@ class Relay:
             self._thread.join(timeout)
 
     def _run(self, rid: str, include_paid: bool) -> None:
-        from .. import connectivity, json_io
+        from .. import connectivity, json_io, proxy_bypass
         try:
+            proxy_bypass.apply()
             rows = connectivity.run_checks(include_paid, path="ingest")
         except Exception:
             _log.warning("つながりの確認（取り込みの係）に失敗しました", exc_info=True)

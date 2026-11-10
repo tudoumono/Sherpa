@@ -1954,7 +1954,8 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                              status=422)
             host = f"{_op.hostname}:{_op.port or (443 if _op.scheme == 'https' else 80)}"
             return _json(route, {"ok": True, "host": host, "models": ["qwen2.5:latest"],
-                                 "missing": ["nomic-embed-text"], "detail": "接続OK"})
+                                 "missing": ["nomic-embed-text"], "no_tools": ["gemma3:12b"],
+                                 "detail": "接続OK"})
         if method == "POST" and path == "/auth/login":
             body = _post_json(request)
             records["auth_login"].append(body)

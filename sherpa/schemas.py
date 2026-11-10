@@ -129,6 +129,8 @@ class AdminOllamaTestResponse(BaseModel):
     models: list[str]
     # 使えるモデル一覧の Ollama のモデルのうち、接続先で取得されていないもの
     missing: list[str]
+    # 道具の呼び出しが要る用途のモデルのうち、接続先が「対応していない」と答えたもの
+    no_tools: list[str]
     detail: str
 
 

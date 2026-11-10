@@ -678,7 +678,9 @@ async function testCentralOllama() {
     const missing = d.missing || [];
     let text = `✓ 接続OK（${d.host}）。取得済みのモデル: ${models.length ? models.join(', ') : 'なし'}`;
     if (missing.length) text += `。使えるモデル一覧のうち未取得: ${missing.join(', ')}（相手のパソコンで ollama pull を実行してください）`;
-    res.className = 'tres ' + (missing.length ? 'danger' : 'ok');
+    const noTools = d.no_tools || [];
+    if (noTools.length) text += `。道具の呼び出しに対応していないモデル: ${noTools.join(', ')}（資料を調べる回答には使えません。「使えるモデル」で別のモデルを選んでください）`;
+    res.className = 'tres ' + (missing.length || noTools.length ? 'danger' : 'ok');
     res.textContent = text;
   } catch (e) {
     res.className = 'tres danger'; res.textContent = '✗ 通信に失敗しました。ネットワークを確認してください';

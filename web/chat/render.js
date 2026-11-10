@@ -1200,19 +1200,29 @@ const RECON_VERDICT_LABEL = { match: '一致', mismatch: '食い違い（ソー�
   source_missing: 'ソースに見当たらない', unverified: '未確認' };
 export function reconciliationRows(answer) {
   const list = answer && answer.data && Array.isArray(answer.data.reconciliation) ? answer.data.reconciliation : [];
-  const side = (v) => ({ text: v && typeof v.text === 'string' ? v.text : '',
-    doc_id: v && typeof v.doc_id === 'string' && v.doc_id ? v.doc_id : '',
-    line: v && Number.isInteger(v.line) && v.line > 0 ? v.line : 0,
-    lineEnd: v && Number.isInteger(v.line) && v.line > 0 && Number.isInteger(v.line_end) && v.line_end > v.line ? v.line_end : 0 });
+  const ref = (v) => {
+    const o = { doc_id: v && typeof v.doc_id === 'string' && v.doc_id ? v.doc_id : '',
+      loc: v && typeof v.loc === 'string' ? v.loc : '',
+      line: v && Number.isInteger(v.line) && v.line > 0 ? v.line : 0,
+      lineEnd: v && Number.isInteger(v.line) && v.line > 0 && Number.isInteger(v.line_end) && v.line_end > v.line ? v.line_end : 0 };
+    const pos = o.loc || (o.line ? `${o.line}${o.lineEnd ? `-${o.lineEnd}` : ''}` : '');
+    o.label = o.doc_id + (pos ? `:${pos}` : '');
+    return o;
+  };
+  const side = (v) => ({ text: v && typeof v.text === 'string' ? v.text : '', ...ref(v),
+    also: v && Array.isArray(v.also) ? v.also.map(ref).filter((x) => x.doc_id) : [] });
   return list.filter((r) => r && typeof r.item === 'string' && r.item.trim() && RECON_VERDICT_LABEL[r.verdict])
     .map((r) => ({ item: r.item, verdict: r.verdict, label: RECON_VERDICT_LABEL[r.verdict], spec: side(r.spec), source: side(r.source) }));
 }
+function _reconLinkHTML(sd, world) {
+  const fileName = sd.doc_id.split('/').filter(Boolean).pop() || 'download';
+  return world
+    ? `<a href="/documents/download?world=${encodeURIComponent(world)}&rel=${encodeURIComponent(sd.doc_id)}" data-dl data-name="${esc(fileName)}">📄 ${esc(sd.label)}</a>`
+    : `<span class="muted">📄 ${esc(sd.label)}</span>`;
+}
 function _reconRefHTML(sd, world) {
   if (!sd.doc_id) return '';
-  const name = sd.doc_id + (sd.line ? `:${sd.line}${sd.lineEnd ? `-${sd.lineEnd}` : ''}` : '');
-  return world
-    ? `<a href="/documents/download?world=${encodeURIComponent(world)}&rel=${encodeURIComponent(sd.doc_id)}" data-dl>📄 ${esc(name)}</a>`
-    : `<span class="muted">📄 ${esc(name)}</span>`;
+  return _reconLinkHTML(sd, world) + (sd.also || []).map((x) => `<div>${_reconLinkHTML(x, world)}</div>`).join('');
 }
 function renderReconciliation(answer) {
   const rows = reconciliationRows(answer);

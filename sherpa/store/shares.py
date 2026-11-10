@@ -371,17 +371,32 @@ _RECON_VERDICTS = ("match", "mismatch", "spec_missing", "source_missing", "unver
 
 
 def _safe_reconciliation_side(side) -> dict:
-    """照らし合わせの片側（`{text, doc_id?, line?}`）を既知の形だけで再構築する。重要度設定ファイルを指す参照は落とす。"""
+    """照らし合わせの片側（`{text, doc_id?, loc?, line?, line_end?, also?}`）を既知の形だけで再構築する。重要度設定ファイルを指す参照は落とす。"""
     out = {"text": side["text"] if isinstance(side, dict) and isinstance(side.get("text"), str) else ""}
-    if isinstance(side, dict) and isinstance(side.get("doc_id"), str) and side["doc_id"] \
-            and not importance.is_importance_control_path(side["doc_id"]):
-        out["doc_id"] = side["doc_id"]
-        line = side.get("line")
-        if isinstance(line, int) and not isinstance(line, bool) and line > 0:
-            out["line"] = line
-            end = side.get("line_end")
-            if isinstance(end, int) and not isinstance(end, bool) and end > line:
-                out["line_end"] = end
+    out.update(_safe_reconciliation_ref(side))
+    also = side.get("also") if isinstance(side, dict) and "doc_id" in out else None
+    if isinstance(also, list):
+        kept = [x for x in (_safe_reconciliation_ref(e) for e in also[:4]) if x]
+        if kept:
+            out["also"] = kept
+    return out
+
+
+def _safe_reconciliation_ref(ref) -> dict:
+    """照らし合わせの参照 1 件（`{doc_id, loc?, line?, line_end?}`）を既知の欄だけで作り直す。資料が無い・重要度設定ファイルなら空。"""
+    if not isinstance(ref, dict) or not isinstance(ref.get("doc_id"), str) or not ref["doc_id"] \
+            or importance.is_importance_control_path(ref["doc_id"]):
+        return {}
+    out = {"doc_id": ref["doc_id"]}
+    loc = ref.get("loc")
+    if isinstance(loc, str) and loc:
+        out["loc"] = loc[:120]
+    line = ref.get("line")
+    if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+        out["line"] = line
+        end = ref.get("line_end")
+        if isinstance(end, int) and not isinstance(end, bool) and end > line:
+            out["line_end"] = end
     return out
 
 
