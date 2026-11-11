@@ -488,6 +488,32 @@ def test_partial_folder_scan_and_pending_list_are_shown_in_plain_words(page, web
     expect(page.locator("#rows")).to_contain_text(note)
 
 
+def test_folder_tree_starts_collapsed_and_opens_on_click(page, web_base_url):
+    """ツリーは最上位だけを出して閉じておき、行で範囲を選んで開く。▸ は範囲を変えずに開閉する。"""
+    doc = {**_doc("製品A/設計/詳細/画面.xlsx"), "folder": "製品A/設計/詳細"}
+    _open(page, web_base_url, preview={**PREVIEW, "documents": [doc], "folders": []})
+    tree = page.locator("#tree")
+    row = lambda name: tree.locator(".tnode", has_text=name)
+    expect(row("製品A")).to_have_count(1)
+    expect(row("設計")).to_have_count(0)
+
+    row("製品A").click()
+    expect(page.locator("#count")).to_contain_text("範囲: 製品A")
+    expect(row("設計")).to_have_count(1)
+    expect(row("詳細")).to_have_count(0)
+
+    row("設計").locator("[data-tree-toggle]").click()
+    expect(row("詳細")).to_have_count(1)
+    expect(page.locator("#count")).not_to_contain_text("製品A/設計")
+
+    row("製品A").click()
+    expect(row("設計")).to_have_count(0)
+
+    page.locator("#rows button[data-open-folder='製品A/設計']").click()
+    expect(row("詳細")).to_have_count(1)
+    expect(row("設計")).to_have_class(re.compile(r"\bon\b"))
+
+
 def test_status_shows_counts_as_of_and_recount_button(page, web_base_url):
     """完了時点の件数に集計時刻を表示し、「件数を数え直す」で更新する。"""
     _open(page, web_base_url, status={"counts_as_of": None, "last_completed_counts": None})
