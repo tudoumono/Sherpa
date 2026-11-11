@@ -787,6 +787,7 @@ const STATE = {  // state → 表示（記号・クラス）。enum のみ。
 const ABBR = { Module: 'Mod', Copybook: 'Cpy', DataItem: '項目', Document: '文書', Batch: 'ジョブ', Table: '表', Config: '設定', Dataset: 'データ', Executable: '実行' };
 
 let _pv = null, _q = '', _type = '', _state = 'all', _folder = '';
+const _openFolders = new Set();              // ツリーで開いているフォルダ（既定はすべて閉じる）
 let _rules = new Map();   // path → {kind, outside_scope}（優先と除外の印・読み取りだけ）
 
 function rulesMap(list) {
@@ -972,14 +973,35 @@ function folderCounts() {
   return counts;
 }
 
+// `path` までの親フォルダと `path` 自身をツリーで開く。
+function openFolderPath(path) {
+  let cur = '';
+  for (const p of path.split('/').filter(Boolean)) { cur = cur ? cur + '/' + p : p; _openFolders.add(cur); }
+}
+
+function toggleFolder(path) { if (!_openFolders.delete(path)) _openFolders.add(path); }
+
+function parentFolder(path) { return path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''; }
+
+function folderVisible(path) {                // 親フォルダがすべて開いているか
+  for (let p = parentFolder(path); p; p = parentFolder(p)) if (!_openFolders.has(p)) return false;
+  return true;
+}
+
 function renderTree() {                       // フォルダツリー（範囲）を作る。資料の無いフォルダも出す
   const docs = _pv ? _pv.documents : [];
   const counts = folderCounts();
   let html = `<div class="tnode ${_folder === '' ? 'on' : ''}" data-folder="">📂 すべて<span class="tc">${docs.length}</span></div>`;
-  for (const path of Object.keys(counts).sort((a, b) => Sherpa.comparePath({ path: a, dir: true }, { path: b, dir: true }))) {
+  const paths = Object.keys(counts).sort((a, b) => Sherpa.comparePath({ path: a, dir: true }, { path: b, dir: true }));
+  const parents = new Set(paths.map(parentFolder));
+  for (const path of paths) {
+    if (!folderVisible(path)) continue;
     const depth = path.split('/').length - 1, name = path.split('/').pop();
+    const toggle = parents.has(path)
+      ? `<span class="tw" data-tree-toggle="${esc(path)}" title="開く・閉じる">${_openFolders.has(path) ? '▾' : '▸'}</span>`
+      : '<span class="tw"></span>';
     // フォルダは全て同列（common layer 概念は無い）。
-    html += `<div class="tnode ${_folder === path ? 'on' : ''}" data-folder="${esc(path)}" style="padding-left:${8 + depth * 15}px">📁 ${esc(name)}<span class="tc">${counts[path]}</span></div>`;
+    html += `<div class="tnode ${_folder === path ? 'on' : ''}" data-folder="${esc(path)}" style="padding-left:${8 + depth * 15}px">${toggle}📁 ${esc(name)}<span class="tc">${counts[path]}</span></div>`;
   }
   if (_pv && _pv.folders_truncated) html += '<div class="muted" style="font-size:var(--text-caption);padding:6px 8px">フォルダが多いため、資料の無いフォルダは一部だけ出しています</div>';
   if (_pv && _pv.folders_partial) html += '<div class="muted" style="font-size:var(--text-caption);padding:6px 8px">フォルダが多いため、資料の無いフォルダは一部だけ確認しています</div>';
@@ -1181,9 +1203,12 @@ async function download(name) {
 // 委譲（検索・フィルタ・行操作）
 $('q').addEventListener('input', (e) => { _q = e.target.value; render(); });
 $('type').addEventListener('change', (e) => { _type = e.target.value; render(); });
-$('tree').addEventListener('click', (e) => {                 // 範囲で絞る
+$('tree').addEventListener('click', (e) => {                 // 行: 範囲で絞って開く（選択中の行はもう一度で閉じる）。▸: 開閉だけ
+  const tog = e.target.closest('[data-tree-toggle]');
+  if (tog) { toggleFolder(tog.dataset.treeToggle); renderTree(); return; }
   const t = e.target.closest('[data-folder]'); if (!t) return;
-  _folder = t.dataset.folder; renderTree(); render();
+  if (t.dataset.folder === _folder) { if (_folder) toggleFolder(_folder); renderTree(); return; }
+  _folder = t.dataset.folder; openFolderPath(_folder); renderTree(); render();
   // 全文検索結果は範囲依存＝範囲変更で古い結果を残さない（検索語があれば新範囲で再検索）。
   if ($('esq').value.trim()) searchEs();
   else $('eshits').innerHTML = '<div class="muted">検索語を入力してください</div>';
@@ -1196,7 +1221,7 @@ $('rows').addEventListener('click', (e) => {
   if (rg) { window.RulesTab.reveal(rg.dataset.ruleGoto, !!rg.dataset.ruleDir); return; }   // tr 全体が data-open-folder のため先に見る
   const of = e.target.closest('[data-open-folder]');
   if (of) {                                                  // フォルダの行: そのフォルダを開く（ツリーで選ぶのと同じ）
-    _folder = of.dataset.openFolder; renderTree(); render();
+    _folder = of.dataset.openFolder; openFolderPath(_folder); renderTree(); render();
     if ($('esq').value.trim()) searchEs();
     else $('eshits').innerHTML = '<div class="muted">検索語を入力してください</div>';
     return;
