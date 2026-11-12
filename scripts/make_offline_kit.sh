@@ -794,8 +794,8 @@ if [ "$FETCH" = 1 ] && [ "$SKIP_NODE" != 1 ]; then
   if [ -d "$ROOT/tools/marp/node_modules" ]; then
     note "既存の tools/marp/node_modules を tar 化します..."
   elif command -v npm >/dev/null 2>&1; then
-    note "npm --prefix tools/marp install @marp-team/marp-cli を実行します（ネットワーク要）..."
-    npm --prefix "$ROOT/tools/marp" install @marp-team/marp-cli
+    note "npm --prefix tools/marp ci で固定の版を入れます（ネットワーク要）..."
+    npm --prefix "$ROOT/tools/marp" ci
   else
     fail "tools/marp/node_modules が無く、npm も見つかりません。marp-cli を導入できません。"
     exit 1
@@ -806,7 +806,7 @@ elif [ "$SKIP_NODE" = 1 ]; then
   warn "--skip-node が指定されたため、Node.js/marp-cli の収集をスキップしました。"
 else
   note "[計画] curl -fsSL $NODE_URL -o $OUT/node/${NODE_TARBALL}（+ SHASUMS256.txt で sha256 検証）"
-  note "[計画] tools/marp/node_modules が無ければ npm --prefix tools/marp install @marp-team/marp-cli"
+  note "[計画] tools/marp/node_modules が無ければ npm --prefix tools/marp ci（package-lock.json の固定の版）"
   note "  → tar czf $OUT/marp/tools-marp-node_modules.tar.gz"
   note "→ 実行するには --fetch を指定してください（--skip-node で除外可）。"
 fi

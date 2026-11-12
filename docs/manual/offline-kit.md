@@ -90,7 +90,7 @@ apt 系の資材（python3 系・Docker Engine・フォント・Chromium のシ�
 | フォント：Noto Sans CJK JP | 素の対象OSコンテナで `apt-get install --download-only`（SIL OFL 1.1・バンドル可） | `dist/offline-kit/fonts/noto-cjk-debs/` |
 | フォント：HackGen | GitHub releases API から最新 zip（通常版優先）を解決してダウンロード（SIL OFL 1.1・バンドル可） | `dist/offline-kit/fonts/hackgen/` |
 | Node.js 本体（v22 系・marp 実行に必須） | 公式 tarball を curl 取得＋`SHASUMS256.txt` で sha256 検証 | `dist/offline-kit/node/` |
-| marp-cli 本体 | `tools/marp/node_modules` を tar 化（無ければ `npm install` 後に tar 化） | `dist/offline-kit/marp/tools-marp-node_modules.tar.gz` |
+| marp-cli 本体 | `tools/marp/node_modules` を tar 化（無ければ `npm ci` で `package-lock.json` の固定の版を入れてから tar 化） | `dist/offline-kit/marp/tools-marp-node_modules.tar.gz` |
 | Playwright Chromium 本体（Marp の PDF/PPTX 出力に必須） | 一時 venv で `playwright install chromium`（`chromium-*`系ディレクトリのみ tar 化） | `dist/offline-kit/chromium/ms-playwright-chromium.tar.gz` |
 | Playwright Chromium のシステム依存（libnss3 等） | playwright 公式の依存リスト（ubuntu24.04-x64・全21個）を素の対象OSコンテナで download-only | `dist/offline-kit/chromium/deps-debs/` |
 | LibreOffice（旧形式 Office 変換の選択肢の一つ） | 素の対象OSコンテナで `apt-get install --download-only`（依存込み・数百MB） | `dist/offline-kit/libreoffice/debs/` |
