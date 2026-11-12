@@ -31,7 +31,7 @@ from ..env_int import env_int
 from ..store import replace_rows
 from ..store.replace_rows import ReplaceRow
 from . import background, derived_numbers, encryption, mem_guard, pptx_flat, substage
-from . import ocr_switch, text_kind
+from . import ocr_switch, text_kind, xlsx_guard
 from .observation_vocab import FILL_OPAQUE, FILL_UNKNOWN
 from .derived_carryover import keep_previous_outputs
 from .derived_swap import (
@@ -140,44 +140,15 @@ def _xlsx_estimated_cell_count(rp: Path) -> int | None:
                 if area is None:
                     return None
                 total += area
-            return total
     except (OSError, zipfile.BadZipFile):
         return None
-
-
-_XLSX_CELL_TAG_NEEDLE = b"<c "         # OOXML のセル要素は必ず `r="..."` 属性を伴うため空白まで含める
-_XLSX_CELL_COUNT_CHUNK_BYTES = 1 << 20  # 1MiB ずつ（シート全体を一度にメモリへ載せない）
+    loaded = xlsx_guard.cell_load(rp, _XLSX_CELL_CAP)   # dimension の過小申告・巨大な結合範囲を見逃さない
+    return total if loaded is None else max(total, loaded)
 
 
 def _xlsx_actual_cell_count(rp: Path, cap: int) -> int | None:
-    """`<dimension>` が欠落/不正な xlsx 向けに、シート XML の `<c ` 出現数を実際にストリーミングでカウントする。
-
-    1MiB チャンクで読み、チャンク境界をまたぐ `<c ` は直前チャンク末尾（needle 長-1 バイト）を持ち越して拾う。
-    `cap` を超えた時点で打ち切る。壊れた zip/シート皆無は None。
-    """
-    try:
-        with zipfile.ZipFile(rp) as zf:
-            sheet_names = [n for n in zf.namelist()
-                           if n.startswith("xl/worksheets/") and n.lower().endswith(".xml")]
-            if not sheet_names:
-                return None
-            total = 0
-            carry_len = len(_XLSX_CELL_TAG_NEEDLE) - 1
-            for name in sheet_names:
-                with zf.open(name) as fh:
-                    carry = b""
-                    while True:
-                        chunk = fh.read(_XLSX_CELL_COUNT_CHUNK_BYTES)
-                        if not chunk:
-                            break
-                        buf = carry + chunk
-                        total += buf.count(_XLSX_CELL_TAG_NEEDLE)
-                        if total > cap:
-                            return total
-                        carry = buf[-carry_len:] if carry_len else b""
-            return total
-    except (OSError, zipfile.BadZipFile):
-        return None
+    """dimension の自己申告に頼らず、シート XML の実セル数と結合範囲の面積を数える（`xlsx_guard.cell_load`）。"""
+    return xlsx_guard.cell_load(rp, cap)
 
 
 def _office_uncompressed_total_bytes(rp: Path) -> int | None:
@@ -2007,6 +1978,11 @@ def _precheck_target(rp: Path, ext: str, conv, measured: dict | None = None,
     if ext in OFFICE_EXT and (password_protected if password_protected is not None
                               else encryption.is_password_protected(rp, ext)):
         return "guard", "password_protected", None
+    if ext in CONVERTIBLE_EXT:
+        uncompressed = _measured(measured, "uncompressed", _office_uncompressed_total_bytes, rp)
+        if uncompressed is not None and uncompressed > _OFFICE_UNCOMPRESSED_CAP_BYTES:
+            return ("guard", "uncompressed_size_exceeded",
+                    {"measured_bytes": uncompressed, "cap_bytes": _OFFICE_UNCOMPRESSED_CAP_BYTES})
     if ext == ".xlsx":
         # 圧縮爆弾ガード: st_size は圧縮後サイズのため、zip 内 dimension だけ見てセル数を見積もり、欠落/不正なら `<c ` の実カウントへフォールバックする。
         estimated_cells = _measured(measured, "cells", _xlsx_estimated_cell_count, rp)
@@ -2014,11 +1990,6 @@ def _precheck_target(rp: Path, ext: str, conv, measured: dict | None = None,
             estimated_cells = _xlsx_actual_cell_count(rp, _XLSX_CELL_CAP)
         if estimated_cells is not None and estimated_cells > _XLSX_CELL_CAP:
             return "guard", "cell_count_exceeded", {"measured_cells": estimated_cells, "cap_cells": _XLSX_CELL_CAP}
-    if ext in CONVERTIBLE_EXT:
-        uncompressed = _measured(measured, "uncompressed", _office_uncompressed_total_bytes, rp)
-        if uncompressed is not None and uncompressed > _OFFICE_UNCOMPRESSED_CAP_BYTES:
-            return ("guard", "uncompressed_size_exceeded",
-                    {"measured_bytes": uncompressed, "cap_bytes": _OFFICE_UNCOMPRESSED_CAP_BYTES})
     return "ok", None, None
 
 

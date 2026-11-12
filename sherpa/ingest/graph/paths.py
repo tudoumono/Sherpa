@@ -1,19 +1,26 @@
 """原本のパスの検証と解決（資料フォルダ root 相対の POSIX パス → 原本 Path）。symlink と root の外への脱出を拒否する。"""
 from __future__ import annotations
 
+import errno
 import os
 import stat as stat_mod
 from pathlib import Path
 
 
-def _lstat_kind(p) -> str | None:
+_ABSENT_ERRNOS = (errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG)  # 「そこに無い」ことを表す errno（権限・I/O 障害は含めない）
+
+
+def _lstat_kind(p, strict: bool = False) -> str | None:
     """`os.lstat()` ベースで種別を返す（`"dir"`/`"file"`/`"symlink"`/`None`＝不在扱い）。
 
     `Path.is_dir()` 等は `OSError` を握るため使わない。`OSError` は種別不明＝`None` にする。
+    `strict=True` は、無いこと（`_ABSENT_ERRNOS`）と読めないこと（権限・I/O 障害）を区別し、後者を re-raise する。
     """
     try:
         st = os.lstat(p)
-    except OSError:
+    except OSError as e:
+        if strict and e.errno not in _ABSENT_ERRNOS:
+            raise
         return None
     if stat_mod.S_ISLNK(st.st_mode):
         return "symlink"
@@ -38,8 +45,8 @@ def valid_rel_parts(rel: str) -> tuple[str, ...] | None:
     return parts
 
 
-def resolve_path(world_dir, rel: str):
-    """`rel`（資料フォルダ root 相対 POSIX）→ 原本 Path（パス基準・無ければ None）。
+def resolve_path(world_dir, rel: str, strict: bool = False):
+    """`rel`（資料フォルダ root 相対 POSIX）→ 原本 Path（パス基準・無ければ None）。`strict=True` は読めない（権限・I/O 障害）ときを None にせず `OSError` を送出する。
 
     ① `rel` を `valid_rel_parts` で検証する（FS アクセスより前）。
     ② root から `rel` の各階層へ直接 `os.lstat` して降りる（資料フォルダ全体は走査しない）。途中経路に symlink があれば拒否する。
@@ -49,12 +56,12 @@ def resolve_path(world_dir, rel: str):
     if parts is None:
         return None
     root = Path(world_dir)
-    if _lstat_kind(root) != "dir":
+    if _lstat_kind(root, strict) != "dir":
         return None
     cur = root
     for i, part in enumerate(parts):
         cur = cur / part
-        kind = _lstat_kind(cur)
+        kind = _lstat_kind(cur, strict)
         if i == len(parts) - 1:
             if kind != "file":
                 return None
@@ -64,6 +71,8 @@ def resolve_path(world_dir, rel: str):
         rp = cur.resolve()
         rootr = root.resolve()
     except OSError:
+        if strict:
+            raise
         return None
     if not rp.is_relative_to(rootr):
         return None

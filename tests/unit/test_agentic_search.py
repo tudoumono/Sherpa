@@ -1076,7 +1076,7 @@ def test_codex_mcp_config_builder():
     from sherpa.providers.codex import mcp
     args = mcp._mcp_config_args("v1", ["4期", "00_共通"])
     joined = " ".join(args)
-    assert args.count("-c") == 7
+    assert args.count("-c") == 8 and 'shell_environment_policy.inherit = "core"' in joined
     assert "mcp_servers.sherpa.command=" in joined and 'sherpa.args = ["-m", "sherpa.mcp_server"]' in joined
     assert 'SHERPA_MCP_WORLD = "v1"' in joined and 'SHERPA_MCP_SCOPE = "4期\\n00_共通"' in joined
     assert 'default_tools_approval_mode = "approve"' in joined and 'approval_policy = "never"' in joined

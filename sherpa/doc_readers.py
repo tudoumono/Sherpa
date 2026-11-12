@@ -33,7 +33,7 @@ import zlib
 from collections import OrderedDict
 from typing import Callable
 
-from . import redact_keys, text_encoding
+from . import image_input, redact_keys, text_encoding
 
 # ---- サイズ上限（既定 50 MiB・env で上書き可）----
 
@@ -1498,7 +1498,7 @@ def pdf_pages(f, pages: str | None = _PDF_DEFAULT_PAGES,
             out.append(item)
         view = [it["no"] for it in out if not it.get("blank")
                 and (it.get("image_count") or it.get("drawing_count") or it.get("no_text_layer"))]
-        hint = {"view_pages": view, "view_hint": _PDF_VIEW_HINT} if view else {}
+        hint = {"view_pages": view, "view_hint": image_input.pdf_view_hint(_PDF_VIEW_HINT)} if view else {}
         return {"total": total, "pages": out, "truncated": truncated, **hint, **page_notes}
     except Exception:
         return {"error": "PDF の読み取りに失敗しました"}

@@ -401,11 +401,15 @@ def emit_pace() -> float:
     return _STREAM_PACE
 
 
+class _KnownTerms(list):
+    """起点語ヒント。グラフの照会が失敗して空で続行したときは `failed` が真（回答冒頭の告知に使う）。"""
+    failed = False
+
+
 def _known_terms(session, world) -> list:
     """起点語抽出のヒント（world 内の全ノード名）。knowledge=true の全チャットが通るため、`lens_service._run_capped`（timeout→空リスト・緊急天井→部分リストの warning 付き縮退）を再利用する。
     ルーティング補助のヒントなので、厳密解は不要でソフト縮退のままでよい。返却形は name 文字列のリスト。
     """
-    from neo4j.exceptions import DriverError, TransientError
     try:
         rows = _run_capped(
             session, "OPTIONAL MATCH (gm:SherpaMeta {world_id:$v}) WITH gm "
@@ -413,11 +417,13 @@ def _known_terms(session, world) -> list:
                      f"WHERE {_generation_pred('n')} RETURN DISTINCT n.name AS name",
             log_world=world, v=world,
         )
-    except (DriverError, TransientError) as e:
-        # 接続断・一時障害は、ターン全体を落とさず空で続ける（落とすとグラフ不調時の縮退へ到達できない）。
-        _log.warning("起点語ヒントの取得に失敗（グラフ接続断・空で続行・world=%s）: %s",
+    except Exception as e:
+        # 認証・権限・接続断など種類を問わず、ターン全体を落とさず空で続ける（落とすとグラフ不調時の直読へ到達できない）。
+        _log.warning("起点語ヒントの取得に失敗（グラフ不調・空で続行・world=%s）: %s",
                     world, type(e).__name__)
-        return []
+        failed = _KnownTerms()
+        failed.failed = True
+        return failed
     return [r["name"] for r in rows if r["name"]]
 
 
@@ -953,6 +959,8 @@ def stream_message(session, message, world="v1",
                 continue
         if ev["type"] == "_result":
             _stopped_pending = False
+            if getattr(known, "failed", False):
+                ev["env"].setdefault("graph_degraded", "graph_unavailable")
             msg, committed_node = _persist_result(
                 ev, ctx=ctx, message=message, conversation_id=conversation_id, user_id=user_id,
                 settings=settings, world=world, scope_meta=scope_meta, user_msg=_user_msg,

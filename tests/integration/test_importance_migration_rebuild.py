@@ -21,7 +21,7 @@ import tempfile
 import pytest
 from _world_registry import register_test_world
 
-from sherpa import es_index, store, worlds
+from sherpa import corpus_docs, es_index, store, text_encoding, worlds
 from sherpa.ingest import worker, world_neo4j
 from tests._replace_row import offline_row
 
@@ -205,7 +205,8 @@ def test_es_mapping_version_bump_triggers_reindex_on_next_sync(monkeypatch):
         register_test_world(wid)
 
         sig, manifest = worker.world_state(wid)
-        store.set_world_sig(wid, sig, manifest=manifest, doc_count=1)
+        store.set_world_sig(wid, sig, manifest=manifest, doc_count=1,
+                            scan_report=text_encoding.stamp_detect_version(corpus_docs.empty_scan_report()))
         store.replace_documents(wid, [
             {"name": "a.md", "layer": "version", "scope_path": None, "doctype": "設計書",
              "branch": "source", "original_path": None, "md_path": None, "status": "indexed"},

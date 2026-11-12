@@ -23,7 +23,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (agentic_search, es_index, graph_coverage, graph_tools, grep_tool, investigation_ledger, path_rules, proxy_bypass,
+from . import (agentic_search, es_index, graph_coverage, graph_tools, grep_tool, image_input, investigation_ledger, path_rules, proxy_bypass,
                scope_infer, tool_call_log, tool_dispatch)
 from .ingest.world_neo4j import GraphSchemaEraError
 from .mcp_coverage_outcome import coverage_outcome as _coverage_outcome
@@ -285,10 +285,10 @@ def _tool_defs() -> list:
                      "inputSchema": agentic_search._PARAMS_DOCX_PARAGRAPHS})
         defs.append({"name": "pptx_slides", "description": agentic_search._DESC_PPTX_SLIDES,
                      "inputSchema": agentic_search._PARAMS_PPTX_SLIDES})
-        defs.append({"name": "pdf_pages", "description": agentic_search._DESC_PDF_PAGES,
+        defs.append({"name": "pdf_pages", "description": image_input.pdf_pages_description(agentic_search._DESC_PDF_PAGES),
                      "inputSchema": agentic_search._PARAMS_PDF_PAGES})
-        defs.append({"name": "pdf_page_image", "description": agentic_search._DESC_PDF_PAGE_IMAGE,
-                     "inputSchema": agentic_search._PARAMS_PDF_PAGE_IMAGE})
+        defs += image_input.pdf_page_image_defs([{"name": "pdf_page_image", "description": agentic_search._DESC_PDF_PAGE_IMAGE,
+                                                  "inputSchema": agentic_search._PARAMS_PDF_PAGE_IMAGE}])
     if _layer() in (None, "both"):
         defs.append({"name": "graph_neighbors", "description": agentic_search._DESC_GRAPH,
                      "inputSchema": agentic_search._PARAMS_GRAPH})

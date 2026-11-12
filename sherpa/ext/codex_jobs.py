@@ -133,6 +133,8 @@ class ExtCodexJobStatusRes(BaseModel):
     started_at: str | None = None
     finished_at: str | None = None
     expires_at: str | None = None
+    completion: str | None = None  # 終端のとき: complete／partial（途中までの回答）／failed
+    stop_kind: str | None = None  # 終了理由（閉じた語彙）
 
 
 _CODEX_JOB_STATUS_RESPONSES = {
@@ -165,7 +167,8 @@ def ext_codex_job_status(job_id: str, request: Request, response: Response,
             response.headers["Retry-After"] = retry_after
         return {"job_id": job["id"], "status": job["status"], "created_at": _iso(job["created_at"]),
                 "started_at": _iso(job["started_at"]), "finished_at": _iso(job["finished_at"]),
-                "expires_at": _iso(job["expires_at"])}
+                "expires_at": _iso(job["expires_at"]), "completion": job.get("completion"),
+                "stop_kind": job.get("stop_kind")}
 
 
 # ---- GET /codex/jobs/{job_id}/result（結果取得）----
@@ -191,6 +194,8 @@ class ExtCodexJobResultRes(BaseModel):
     sources: list[ExtSourceItem]  # 出典の共通スキーマ（`ExtSourceItem`・`C-EXT-ANSWER-01` と同一）
     unconfirmed_items: list[ExtCodexJobUnconfirmedItem]
     elapsed_ms: int
+    completion: str | None = None  # complete／partial（途中までの回答。不足があり得る）
+    stop_kind: str | None = None  # 終了理由（閉じた語彙）
     investigation: ExtInvestigationRecord | None = None  # 記録が無ければ省く（response_model_exclude_none）
 
 
@@ -226,11 +231,13 @@ def ext_codex_job_result(job_id: str, request: Request, key: dict = Depends(requ
             body = {"status": status}
             if status == "failed" and job.get("error_code"):
                 body["error_code"] = job["error_code"]
+            body.update({k: job[k] for k in ("completion", "stop_kind") if job.get(k)})
             # 契約どおりの形（`{"status", "error_code"?}`）をそのまま返すため `JSONResponse` を直接使う（`HTTPException` だと `{"detail": body}` に包まれる）
             audit.business_outcome = "failed"
             return JSONResponse(status_code=409, content=body)
         return path_rules.filter_output({"answer": job.get("answer") or "", "sources": list(job.get("sources") or []),
-                                         "unconfirmed_items": list(job.get("unconfirmed_items") or []), "elapsed_ms": job.get("elapsed_ms") or 0, "investigation": job.get("investigation")}, job.get("world") or "")
+                                         "unconfirmed_items": list(job.get("unconfirmed_items") or []), "elapsed_ms": job.get("elapsed_ms") or 0, "completion": job.get("completion"),
+                                         "stop_kind": job.get("stop_kind"), "investigation": job.get("investigation")}, job.get("world") or "")
 
 
 # ---- POST /codex/jobs/{job_id}/cancel（取消）----

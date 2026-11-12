@@ -112,6 +112,20 @@ def test_areas_and_structural_candidates(tmp_path):
     assert matched and ("self", "tests/api/conftest.py") not in candidates and ("dir", "api") in candidates
 
 
+def test_areas_follow_the_selected_suites_not_only_the_changed_paths(tmp_path):
+    """`store/`・`parts/read/` の変更や試験ファイルだけの変更でも、選んだ結合・API・ブラウザの試験の領域がマージのゲートに渡る。"""
+    _make(tmp_path, [("tests/integration/test_store_real.py", "from sherpa.store import name_ledger\n"),
+                     ("tests/api/test_read_api.py", "from sherpa.parts.read import tools\n"),
+                     ("tests/e2e/test_ui_only.py", "")])
+    result = _select(["sherpa/store/name_ledger.py"], tmp_path)
+    assert not result.escalated and result.areas == {"integration"}
+    result = _select(["sherpa/parts/read/tools.py"], tmp_path)
+    assert not result.escalated and result.areas == {"api"}
+    assert _select(["tests/integration/test_store_real.py"], tmp_path).areas == {"integration"}
+    assert _select(["tests/api/test_read_api.py"], tmp_path).areas == {"api"}
+    assert _select(["tests/e2e/test_ui_only.py"], tmp_path).areas == {"e2e"}
+
+
 def test_import_scan_skips_syntax_error_file_and_reports_it(tmp_path):
     _touch(tmp_path / "tests" / "unit" / "test_broken.py", "def test_x(:\n    pass\n")
     result = _select(["sherpa/foo/bar.py"], tmp_path)

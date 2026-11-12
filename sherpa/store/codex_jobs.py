@@ -65,7 +65,8 @@ def _notify_terminal(c, dropped: list, rows: list[dict], status: str) -> None:
     for r in rows:
         if not r.get("webhook"):
             continue
-        payload = webhooks.codex_job_payload(r["id"], status, r["finished_at"])
+        payload = webhooks.codex_job_payload(r["id"], status, r["finished_at"], completion=r.get("completion"),
+                                             stop_kind=r.get("stop_kind"), error_code=r.get("error_code"))
         try:
             outbox.add_in(c, "webhook", payload, key_id=r["key_id"])
         except outbox.OutboxFull:
@@ -98,7 +99,7 @@ def insert_job(*, job_id: str, key_id: int, world: str, query: str,
             "VALUES (%s,%s,%s,%s,%s,%s,'queued',%s, now() + make_interval(mins => %s)) "
             "RETURNING id, key_id, world, query, scope_paths, depth, status, error_code, "
             "  answer, sources, unconfirmed_items, investigation, elapsed_ms, created_at, "
-            "  started_at, finished_at, expires_at",
+            "  started_at, finished_at, expires_at, completion, stop_kind",
             (job_id, key_id, world, query, scope_paths, depth, webhook, QUEUE_WAIT_MINUTES),
         ).fetchone()
 
@@ -110,7 +111,7 @@ def get_job(job_id: str) -> dict | None:
         return c.execute(
             "SELECT id, key_id, world, query, scope_paths, depth, status, error_code, "
             "  answer, sources, unconfirmed_items, investigation, elapsed_ms, created_at, "
-            "  started_at, finished_at, expires_at "
+            "  started_at, finished_at, expires_at, completion, stop_kind "
             "FROM codex_jobs WHERE id=%s", (job_id,),
         ).fetchone()
 
@@ -133,31 +134,38 @@ def claim_queued_jobs(limit: int) -> list[dict]:
 
 
 def mark_completed(job_id: str, *, answer: str, sources: list, unconfirmed_items: list,
-                   elapsed_ms: int, investigation: dict | None = None) -> None:
-    """`investigation`（省略可）: 調査の記録（`trim_to_budget` 済みの `{complete, truncated, manifest, items, coverage}`）。None＝台帳ゲートが走らなかったジョブ。"""
+                   elapsed_ms: int, investigation: dict | None = None,
+                   completion: str | None = None, stop_kind: str | None = None) -> None:
+    """`investigation`（省略可）: 調査の記録（`trim_to_budget` 済みの `{complete, truncated, manifest, items, coverage}`）。None＝台帳ゲートが走らなかったジョブ。
+    `completion`（`complete`/`partial`）と `stop_kind` は回答の完了状態と終了理由。途中までの回答（`partial`）は結果・通知にそのまま出る。
+    """
     _prepare()
     expires_at = datetime.now(timezone.utc) + timedelta(days=RETENTION_DAYS)
     with _terminal_tx() as (c, dropped):
         rows = c.execute(
             "UPDATE codex_jobs SET status='completed', answer=%s, sources=%s, "
             "  unconfirmed_items=%s, investigation=%s, elapsed_ms=%s, finished_at=now(), "
-            "  expires_at=%s "
-            "WHERE id=%s AND status='running' RETURNING id, key_id, webhook, finished_at",
+            "  expires_at=%s, completion=%s, stop_kind=%s "
+            "WHERE id=%s AND status='running' RETURNING id, key_id, webhook, finished_at, completion, stop_kind",
             (answer, Json(sources), Json(unconfirmed_items),
              Json(investigation) if investigation is not None else None,
-             elapsed_ms, expires_at, job_id)).fetchall()
+             elapsed_ms, expires_at, completion, stop_kind, job_id)).fetchall()
         _notify_terminal(c, dropped, rows, "completed")
 
 
-def mark_failed(job_id: str, *, error_code: str, from_status: str = "running") -> None:
-    """`error_code` は閉じた語彙（`interrupted`/`timeout`/`codex_failed`）。`from_status`（既定 `running`）を条件にし、終端化済みのジョブは書き換えない。"""
+def mark_failed(job_id: str, *, error_code: str, from_status: str = "running",
+                completion: str | None = None, stop_kind: str | None = None) -> None:
+    """`error_code` は閉じた語彙（`interrupted`/`timeout`/`codex_failed`）。`from_status`（既定 `running`）を条件にし、終端化済みのジョブは書き換えない。
+    `completion`/`stop_kind` は回答側が報告した完了状態と終了理由（省略可）。
+    """
     _prepare()
     expires_at = datetime.now(timezone.utc) + timedelta(days=RETENTION_DAYS)
     with _terminal_tx() as (c, dropped):
         rows = c.execute(
             "UPDATE codex_jobs SET status='failed', error_code=%s, finished_at=now(), "
-            "  expires_at=%s WHERE id=%s AND status=%s RETURNING id, key_id, webhook, finished_at",
-            (error_code, expires_at, job_id, from_status)).fetchall()
+            "  expires_at=%s, completion=%s, stop_kind=%s WHERE id=%s AND status=%s "
+            "RETURNING id, key_id, webhook, finished_at, error_code, completion, stop_kind",
+            (error_code, expires_at, completion, stop_kind, job_id, from_status)).fetchall()
         _notify_terminal(c, dropped, rows, "failed")
 
 
@@ -267,7 +275,7 @@ def expire_job_if_due(job_id: str, row: dict) -> dict:
                     "  AND expires_at < now() "
                     "RETURNING id, key_id, world, query, scope_paths, depth, status, "
                     "  error_code, answer, sources, unconfirmed_items, investigation, "
-                    "  elapsed_ms, created_at, started_at, finished_at, expires_at",
+                    "  elapsed_ms, created_at, started_at, finished_at, expires_at, completion, stop_kind",
                     (job_id,),
                 ).fetchone()
             return fresh if fresh is not None else row

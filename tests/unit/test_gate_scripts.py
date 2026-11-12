@@ -196,6 +196,32 @@ def test_term_signal_stops_running_test_releases_lock_and_preserves_log(tmp_path
             proc.wait(timeout=5)
 
 
+def test_all_skipped_group_still_leaves_skip_count_and_reasons_in_the_log(tmp_path):
+    """全件 skip の群でも、skip の件数と理由がゲートの出力とログに残る（成功扱いの終了コードのまま）。"""
+    skipping = tmp_path / "test_all_skipped_rv.py"
+    skipping.write_text(
+        "import pytest\n"
+        "def test_a():\n    pytest.skip('ブラウザ未導入（検証用）')\n"
+        "def test_b():\n    pytest.skip('DB 不達（検証用）')\n")
+    logfile = tmp_path / "gate.log"
+    script = (
+        "set -u\n"
+        "cd " + str(ROOT) + "\n"
+        ". scripts/lib/gate_common.sh\n"
+        "GATE_LOG_FILE='" + str(logfile) + "'\n"
+        "PY=" + PY + "\n"
+        "GROUP_TIMEOUT=45m\n"
+        "gate_run_group skipping " + str(skipping) + "\n"
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    log = logfile.read_text()
+    assert r.returncode == 0, r.stdout + r.stderr
+    for text in (r.stdout, log):
+        assert "2 skipped" in text and "skip の理由 2 件" in text, text
+        assert "ブラウザ未導入（検証用）" in text and "DB 不達（検証用）" in text, text
+    assert "exit=0" in log
+
+
 def test_term_signal_does_not_let_next_group_start(tmp_path):
     """複数群を順に呼ぶ想定（gate-lane.sh の unit; contract; ...）を最小再現する——1群目を kill したら、2群目（マーカーファイル作成の直後）が起動しないことを確認する。"""
     marker = tmp_path / "second_group_started.marker"

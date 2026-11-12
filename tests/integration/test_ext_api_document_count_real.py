@@ -18,9 +18,10 @@ import threading
 
 from _world_setup import driver
 
-from sherpa import store, worlds
+from sherpa import corpus_docs, store, text_encoding, worlds
 
 W = "test_ext_doc_count_real"
+_STAMPED = text_encoding.stamp_detect_version(corpus_docs.empty_scan_report())   # 版の印だけの集計は「集計の失敗」扱いで別経路になるため、項目の揃った集計にする
 
 
 def _mk_cbl(root, gen, prog):
@@ -214,7 +215,7 @@ def test_sync_backfills_last_doc_count_for_existing_null_row():
         store.upsert_world(wid, str(root.resolve()))
         sig, manifest = worker.world_state(wid)
         assert sig is not None
-        store.set_world_sig(wid, sig, manifest=manifest)   # doc_count 省略＝旧仕様を模擬
+        store.set_world_sig(wid, sig, manifest=manifest, scan_report=_STAMPED)   # doc_count 省略＝旧仕様を模擬
         before = store.get_world(wid)
         assert before["last_doc_count"] is None
         assert before["last_synced_at"] is not None
@@ -253,7 +254,7 @@ def test_sync_backfills_manifest_and_doc_count_together_when_both_null():
         store.upsert_world(wid, str(root.resolve()))
         sig, _manifest = worker.world_state(wid)
         assert sig is not None
-        store.set_world_sig(wid, sig)   # manifest/doc_count 両方省略＝より古い旧仕様を模擬
+        store.set_world_sig(wid, sig, scan_report=_STAMPED)   # manifest/doc_count 両方省略＝より古い旧仕様を模擬
         before = store.get_world(wid)
         assert before["last_manifest"] is None
         assert before["last_doc_count"] is None
@@ -294,7 +295,7 @@ def test_sync_of_empty_world_does_not_bump_last_synced_at_on_repeated_calls():
         assert sig is not None
         assert manifest == {}, "前提: 空ディレクトリの manifest は空 dict のはず"
         # `_run_locked` の確定パスと同じ形（manifest・doc_count を両方渡す）で確定済み状態を作る。
-        store.set_world_sig(wid, sig, manifest=manifest, doc_count=0)
+        store.set_world_sig(wid, sig, manifest=manifest, doc_count=0, scan_report=_STAMPED)
         before = store.get_world(wid)
         assert before["last_manifest"] == {}
         assert before["last_doc_count"] == 0

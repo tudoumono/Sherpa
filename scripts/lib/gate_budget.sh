@@ -15,7 +15,7 @@ gate_run_unit_contract_budgeted() {
   # 置くと errexit で赤の瞬間に関数ごと即終了し、下の所要秒数・終了コードの表示に到達しない。
   # if の条件式に置くことで errexit の対象から外し、赤でも必ず結果行を出してから非ゼロで返す。
   local rc
-  if SHERPA_USE_FIXTURES=1 "$py" -m pytest tests/unit tests/contract -q; then
+  if SHERPA_USE_FIXTURES=1 "$py" -m pytest tests/unit tests/contract -q -rs; then
     rc=0
   else
     rc=$?

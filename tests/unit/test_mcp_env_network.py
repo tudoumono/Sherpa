@@ -48,3 +48,40 @@ def test_db_secrets_never_appear_in_codex_argv(monkeypatch):
     assert not any(k in env_arg for k in ("NEO4J_PASSWORD", "NEO4J_URI", "ES_URL"))
     env = mcp._mcp_env("v1", None)
     assert env["NEO4J_PASSWORD"] == "pw-topsecret" and "uri-topsecret" in env["NEO4J_URI"] and "es-topsecret" in env["ES_URL"]
+
+
+def test_shell_env_policy_keeps_proxy_and_api_key_out_of_model_shell(tmp_path, monkeypatch):
+    """認証つきプロキシ URL と接続用 API キーは Codex 本体の env にあっても、モデルの実行シェルの env には継承させない。"""
+    import tomllib
+    from sherpa.providers.codex import mcp, sandbox
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:topsecret@proxy.internal:8080")
+    home = tmp_path / "ch"
+    home.mkdir()
+    sandbox._write_codex_authoring_config(home, ["/kb"], "low", False, "test", None)
+    policy = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))["shell_environment_policy"]
+    assert policy.get("inherit") in ("core", "none")
+    assert 'shell_environment_policy.inherit = "core"' in mcp._mcp_config_args("v1", None)
+
+
+def test_mcp_env_forwards_tool_deadline_and_search_embed_timeout(monkeypatch):
+    """道具の待ち時間（道具 1 回の期限・検索の埋め込みの期限）の設定は、Codex 経由の道具にも同じ値で届く。未設定・空は渡さない。"""
+    from sherpa.providers.codex import mcp
+    monkeypatch.setenv("SHERPA_MCP_TOOL_DEADLINE_SEC", "240")
+    monkeypatch.setenv("SHERPA_SEARCH_EMBED_TIMEOUT_SEC", "60")
+    env = mcp._mcp_env("v1", None)
+    assert env["SHERPA_MCP_TOOL_DEADLINE_SEC"] == "240" and env["SHERPA_SEARCH_EMBED_TIMEOUT_SEC"] == "60"
+    monkeypatch.setenv("SHERPA_MCP_TOOL_DEADLINE_SEC", "")
+    monkeypatch.delenv("SHERPA_SEARCH_EMBED_TIMEOUT_SEC")
+    env = mcp._mcp_env("v1", None)
+    assert "SHERPA_MCP_TOOL_DEADLINE_SEC" not in env and "SHERPA_SEARCH_EMBED_TIMEOUT_SEC" not in env
+
+
+def test_embed_tuning_settings_reach_mcp_child_via_snapshot(monkeypatch):
+    """管理画面の埋め込みの待ち時間・件数は、設定の写しで道具の子プロセスに同じ値で届く。"""
+    import json
+    from sherpa import embeddings, store
+    from sherpa.providers.codex import mcp
+    monkeypatch.setattr(store, "get_system_settings", lambda: {"embed_request_timeout_s": 120, "embed_batch_size": 20})
+    monkeypatch.setattr(store, "get_settings", lambda: {})
+    snap = json.loads(mcp._mcp_env("v1", None)[store.CHILD_SNAPSHOT_ENV])["system"]
+    assert embeddings.effective_embed_request_timeout(snap) == 120 and embeddings.effective_embed_batch_size(snap) == 20

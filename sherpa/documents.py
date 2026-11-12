@@ -118,7 +118,7 @@ def walk_incomplete(skipped: dict) -> bool:
     return bool(skipped.get("unreadable_dir") or skipped.get("unreadable_file"))
 
 
-def _listed_by_walk(root, rel: str) -> bool:
+def _listed_by_walk(root, rel: str, strict: bool = False) -> bool:
     """`scope_infer.safe_files(root)` が列挙するはずの rel か（木を歩かず、rel の各階層を直接 lstat して判定する）。
     歩き方と同じ除外（版管理フォルダ配下・ノイズファイル・symlink・root 外）を適用する。"""
     parts = valid_rel_parts(rel)
@@ -127,7 +127,7 @@ def _listed_by_walk(root, rel: str) -> bool:
     name = parts[-1]
     if text_kind.is_noise(name, os.path.splitext(name)[1].lower()):
         return False
-    return resolve_path(root, rel) is not None
+    return resolve_path(root, rel, strict) is not None
 
 
 def known_rels(world: str, *, deadline: float | None = None) -> set:
@@ -141,10 +141,11 @@ def known_rels(world: str, *, deadline: float | None = None) -> set:
     return world_rel_set(world, deadline=deadline if deadline is not None else scope_infer.user_op_deadline())
 
 
-def existing_rels(world: str | None, rels, *, deadline: float | None = None, root=None) -> set:
+def existing_rels(world: str | None, rels, *, deadline: float | None = None, root=None, strict: bool = False) -> set:
     """`rels` のうち資料フォルダ（とアーカイブ展開先）に実在するものの集合。`world_rel_set(world) & rels` と同じ結果を、木を全部歩かずに返す。
     rel の形が不正で直接判定できないもの（`\\` を含む実ファイル名など）がある場合だけ、全走査の `world_rel_set` で確かめる（`deadline` 省略時は短い期限を付ける）。
     `root`: 解決済みの資料フォルダ root を渡すと `worlds.world_dir()` を呼び直さない。
+    `strict=True`: 原本が読めない（権限・I/O 障害）ときは「無い」にせず `OSError` を送出する（呼び出し側が失敗として知らせる）。
     """
     if deadline is not None and time.monotonic() > deadline:
         raise scope_infer.ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
@@ -162,7 +163,7 @@ def existing_rels(world: str | None, rels, *, deadline: float | None = None, roo
             continue
         if valid_rel_parts(rel) is None:
             undecidable = True
-        elif _listed_by_walk(wd, rel) or _listed_by_walk(arch, rel):
+        elif _listed_by_walk(wd, rel, strict) or _listed_by_walk(arch, rel, strict):
             found.add(rel)
     if undecidable:
         full = world_rel_set(world, root=wd, deadline=deadline if deadline is not None else scope_infer.user_op_deadline())

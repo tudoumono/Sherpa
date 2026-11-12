@@ -164,11 +164,24 @@ gate_acquire_lane_slot() {
 # ＋ gate_handle_signal が書く `SCRIPT_EXIT` マーカー行——両方を同じ語彙として扱う（ログを後から
 # 走査するときに「テストの合否」と「launcher 自体が signal で終了したか」を同じ抽出基準で
 # 拾えるようにするため）。
-GATE_EXTRACT_PATTERN='^FAILED|passed|failed|Killed|MemoryError|Timeout|^SCRIPT_EXIT'
+GATE_EXTRACT_PATTERN='^FAILED|passed|failed|skipped|Killed|MemoryError|Timeout|^SCRIPT_EXIT'
+# skip の理由行（pytest の `-rs`）は件数が多くても失敗の行を押し出さないよう、別枠で残す。
+GATE_SKIP_PATTERN='^SKIPPED'
 GATE_HELD_FDS=()
 GATE_RUN_PID=""
 GATE_RUN_OUT=""
 GATE_LOG_FILE=""
+
+# pytest の生出力から、合否の要約（tail -30）と skip の件数・理由（`-rs` の行）を GATE_LOG_FILE へ残す。
+gate_extract_log() {
+  local out="$1" n
+  grep -E "$GATE_EXTRACT_PATTERN" "$out" | tail -30 | tee -a "${GATE_LOG_FILE:-/dev/null}"
+  n=$(grep -cE "$GATE_SKIP_PATTERN" "$out" || true)
+  if [ "${n:-0}" -gt 0 ]; then
+    echo "skip の理由 ${n} 件（先頭 30 件）:" | tee -a "${GATE_LOG_FILE:-/dev/null}"
+    grep -E "$GATE_SKIP_PATTERN" "$out" | head -30 | tee -a "${GATE_LOG_FILE:-/dev/null}"
+  fi
+}
 
 gate_run_group() {
   local name="$1"; shift
@@ -181,15 +194,15 @@ gate_run_group() {
       [ -n "$_held" ] && eval "exec ${_held}>&-"
     done
     if command -v setsid >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
-      exec setsid timeout -s INT "$GROUP_TIMEOUT" "$PY" -m pytest "$@" -q -p no:cacheprovider -rf > "$out" 2>&1
+      exec setsid timeout -s INT "$GROUP_TIMEOUT" "$PY" -m pytest "$@" -q -p no:cacheprovider -rfs > "$out" 2>&1
     fi
     exec "$(_gate_python)" "$GATE_PORTABLE_TOOLS" run-group "$GROUP_TIMEOUT" \
-      "$PY" -m pytest "$@" -q -p no:cacheprovider -rf > "$out" 2>&1
+      "$PY" -m pytest "$@" -q -p no:cacheprovider -rfs > "$out" 2>&1
   ) &
   GATE_RUN_PID=$!
   wait "$GATE_RUN_PID"
   local rc=$?
-  grep -E "$GATE_EXTRACT_PATTERN" "$out" | tail -30 | tee -a "${GATE_LOG_FILE:-/dev/null}"
+  gate_extract_log "$out"
   rm -f "$out"
   echo "exit=${rc}" | tee -a "${GATE_LOG_FILE:-/dev/null}"
   [ -n "${RC_FILE:-}" ] && echo "$rc" >> "$RC_FILE"
@@ -213,7 +226,7 @@ gate_handle_signal() {
     wait "$GATE_RUN_PID" 2>/dev/null
     local rc=$?
     if [ -n "$GATE_RUN_OUT" ]; then
-      grep -E "$GATE_EXTRACT_PATTERN" "$GATE_RUN_OUT" | tail -30 | tee -a "${GATE_LOG_FILE:-/dev/null}"
+      gate_extract_log "$GATE_RUN_OUT"
       rm -f "$GATE_RUN_OUT"
     fi
     echo "exit=${rc}（signal ${sig} を受けて停止）" | tee -a "${GATE_LOG_FILE:-/dev/null}"

@@ -54,6 +54,8 @@ cd "$ROOT"
 . "$ROOT/scripts/codex-version.env"
 # shellcheck source=scripts/lib/codex_pin.sh
 . "$ROOT/scripts/lib/codex_pin.sh"
+# shellcheck source=scripts/lib/docker_save.sh
+. "$ROOT/scripts/lib/docker_save.sh"
 
 OUT="$ROOT/dist/offline-kit"
 # shellcheck source=scripts/node-version.env
@@ -634,9 +636,9 @@ if [ "$FETCH" = 1 ] && [ "$SKIP_DOCKER" != 1 ]; then
   docker build -t "$ES_IMAGE" ./docker/elasticsearch
   reset_dir "$OUT/docker-images"
   note "docker save でイメージを書き出します（数百MB〜1GB超・時間がかかります）..."
-  docker save "$PG_IMAGE" -o "$OUT/docker-images/postgres-16.tar"
-  docker save "$NEO4J_IMAGE" -o "$OUT/docker-images/neo4j-5-community.tar"
-  docker save "$ES_IMAGE" -o "$OUT/docker-images/es-kuromoji-8.19.20.tar"
+  docker_save_image "$PG_IMAGE" "$OUT/docker-images/postgres-16.tar"
+  docker_save_image "$NEO4J_IMAGE" "$OUT/docker-images/neo4j-5-community.tar"
+  docker_save_image "$ES_IMAGE" "$OUT/docker-images/es-kuromoji-8.19.20.tar"
   ok "docker イメージ: $OUT/docker-images/"
 elif [ "$SKIP_DOCKER" = 1 ]; then
   warn "--skip-docker が指定されたため、Docker イメージの収集をスキップしました。"
@@ -908,7 +910,7 @@ if [ "$FETCH" = 1 ] && [ "$SKIP_OCR" != 1 ]; then
   # ① 隔離ワーカーのイメージ（アプリのコードを焼き込むため、配布物の版と対で作る）
   rm -rf "$OUT/ocr"; mkdir -p "$OUT/ocr"
   if sherpa_compose --profile ocr build ocr-worker >/dev/null 2>&1; then
-    docker save sherpa/ocr-worker:paddleocr-3.7.0-cpu -o "$OUT/ocr/ocr-worker-paddleocr-3.7.0-cpu.tar"
+    docker_save_image sherpa/ocr-worker:paddleocr-3.7.0-cpu "$OUT/ocr/ocr-worker-paddleocr-3.7.0-cpu.tar"
     ok "OCR ワーカーのイメージ: $OUT/ocr/ocr-worker-paddleocr-3.7.0-cpu.tar"
   else
     fail "OCR ワーカーのイメージ作成に失敗しました（--skip-ocr で除外できます）。"

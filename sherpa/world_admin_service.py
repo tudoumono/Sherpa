@@ -12,7 +12,7 @@ import secrets
 from pathlib import Path
 from typing import Any
 
-from sherpa import store, worlds
+from sherpa import source_separation, store, worlds
 from sherpa.deps import _USERS_DIR, _browse_roots, _under_roots
 from sherpa.grep_tool import valid_world
 from sherpa.ingest import resolve_settings
@@ -65,6 +65,9 @@ def resolve_root(path: str) -> str:
     # `SHERPA_BROWSE_ROOTS` を明示設定したら登録/再バインドも同じ許可ルート配下に限定する
     if os.environ.get("SHERPA_BROWSE_ROOTS") and not _under_roots(resolved, _browse_roots()):
         raise WorldAdminValidationError("そのフォルダは選べません（許可された範囲外）")
+    reason = source_separation.source_overlap_reason(resolved)
+    if reason:
+        raise WorldAdminValidationError(reason)
     return str(resolved)
 
 

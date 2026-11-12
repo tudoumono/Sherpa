@@ -22,7 +22,7 @@ os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 import openpyxl
 import pytest
 
-from sherpa import build_marks, es_index, json_io, store, worlds
+from sherpa import build_marks, corpus_docs, es_index, json_io, store, text_encoding, worlds
 from sherpa.ingest import evidence_ir as IR
 from sherpa.ingest import evidence_render as R
 from sherpa.ingest import office_md, worker, world_graph, world_neo4j
@@ -120,7 +120,8 @@ def _apply_world_monkeypatches(monkeypatch, wd, dmd) -> list:
 
     monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
     monkeypatch.setattr(store, "get_world",
-                         lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
+                         lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0,
+                                        "last_scan_report": text_encoding.stamp_detect_version(corpus_docs.empty_scan_report())})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
     # グラフ修復（`check_graph_counts`）も実 Neo4j に触れる——world_id "w" は実 Neo4j に無いため
     # モックしなければ「スタンプ無し」と判定され、このファイルの docstring が明言する「実 Neo4j に
@@ -202,7 +203,8 @@ def test_rag_refresh_regenerates_once_then_noop(_world_with_asset, monkeypatch):
     assert rag_calls == [1] and evidence_calls == []    # 軽量経路のrefresh_rag()だけが1回呼ばれる
     # 実 ES へは一切通信していない（フェイクの GET/PUT だけで confirm_human_md_meta が完結した）。
     mapping_path = f"/{es_index._index('w')}/_mapping"
-    assert _world_with_asset["req_calls"] == [("GET", mapping_path), ("PUT", mapping_path)]
+    # 末尾の GET は、sync の最後の `read_ingest_no`（索引の取り込み番号の読み出し）
+    assert _world_with_asset["req_calls"] == [("GET", mapping_path), ("PUT", mapping_path), ("GET", mapping_path)]
 
     assert (_rag(dmd) / "a.xlsx.rag.md").read_text(encoding="utf-8") == correct_md              # 置換された
     assert (_rag(dmd) / "a.xlsx.rag_chunks.jsonl").read_bytes() == correct_chunks
@@ -386,7 +388,7 @@ def _clean_failed_docs_w():
 def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
         tmp_path, monkeypatch, build_fixture):
     """正当に一部 sidecar が無いケース（空 OOXML の legacy `.md`・image-only PDF）を sidecar 欠落として誤検知しないこと。
-    image-only PDF は OCR の入切に関わらず人向け MD の知らせができる。
+    image-only PDF は環境変数 `SHERPA_OCR_ENABLED=0` でないかぎり人向け MD の知らせができる（`0` のときは出ない）。
     2回連続 sync してもフルリビルドが起きないことを固定する（過検知は既定 OFF でも毎 sync の全再取り込みという実害を生むため）。
     """
     wd = tmp_path / "world"
@@ -413,14 +415,16 @@ def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
         image.save(wd / "scan.pdf", "PDF")
         rep = office_md.build_derived(wd, dmd, row=offline_row("w"))
         assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
-        assert (dmd / "scan.pdf.md").is_file()   # OCR の入切に関わらず同じ知らせの人用 MD（変換の出力を入切で変えない）
+        # 変換の出力は環境変数 SHERPA_OCR_ENABLED だけで決まる（`0` のときは知らせの MD を出さず、未設定なら出す）
+        assert (dmd / "scan.pdf.md").is_file() is (build_fixture != "image_only_pdf_ocr_off")
         assert office_md.rag_sidecars_missing(wd, dmd) is False
 
     monkeypatch.setattr(worlds, "world_dir", lambda world: wd)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
     monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
     monkeypatch.setattr(store, "get_world",
-                         lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
+                         lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0,
+                                        "last_scan_report": text_encoding.stamp_detect_version(corpus_docs.empty_scan_report())})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
     # グラフ修復（`check_graph_counts`）も実 Neo4j に触れる——world_id "w" は実 Neo4j に無いため
     # モックしなければ「スタンプ無し」と判定され実際に投入してしまう（本関数のテスト対象外）。
@@ -437,9 +441,9 @@ def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
     for _ in range(2):                                    # 2回連続でフルリビルドが起きないことを固定
         res = worker.sync("w")
         assert res["status"] == "unchanged" and res["changed"] is False
-    # OCR の観測が無いスキャン PDF は、OCR が切でも（worker が動いていない構成でも）失敗の一覧に ocr_unavailable で載る（他は載らない）
+    # OCR の観測が無いスキャン PDF は、知らせの MD ができる構成（環境変数が `0` でない）なら失敗の一覧に ocr_unavailable で載る（他は載らない）
     assert {r["rel"]: r["reason"] for r in store.list_failed_docs("w")} == (
-        {"scan.pdf": "ocr_unavailable"} if build_fixture.startswith("image_only_pdf") else {})
+        {"scan.pdf": "ocr_unavailable"} if build_fixture == "image_only_pdf" else {})
 
 
 def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_path, monkeypatch):
@@ -466,7 +470,8 @@ def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
     monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
     monkeypatch.setattr(store, "get_world",
-                         lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
+                         lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0,
+                                        "last_scan_report": text_encoding.stamp_detect_version(corpus_docs.empty_scan_report())})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
     # グラフ修復（`check_graph_counts`）も実 Neo4j に触れる——world_id "w" は実 Neo4j に無いため
     # モックしなければ「スタンプ無し」と判定され実際に投入してしまう（本関数のテスト対象外）。
@@ -507,7 +512,8 @@ def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_
     # 実 ES へは一切通信していない（1回目の sync だけが confirm_human_md_meta まで到達し、
     # フェイクの GET/PUT で完結した——drift 解消済みの2回目は ES 自体に触れない）。
     mapping_path = f"/{es_index._index('w')}/_mapping"
-    assert req_calls == [("GET", mapping_path), ("PUT", mapping_path)]
+    # 各 sync の最後の `read_ingest_no`（索引の取り込み番号の読み出し）が GET を 1 回ずつ足す
+    assert req_calls == [("GET", mapping_path), ("PUT", mapping_path), ("GET", mapping_path), ("GET", mapping_path)]
 
 
 def _value_text(value) -> str:

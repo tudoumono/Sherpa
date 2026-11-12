@@ -82,6 +82,7 @@ delete_world_row
 depth_quality_stats
 dict_row
 document_exists
+document_names_match
 downgrade_orphaned_extracting_runs
 enqueue_ingest_run
 expired_workspace_files

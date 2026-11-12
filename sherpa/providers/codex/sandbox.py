@@ -15,7 +15,7 @@ from pathlib import Path
 
 from ... import path_rules
 from ..base import _log
-from .mcp import NETWORK_PASSTHROUGH_ENV, _mcp_env, _toml_str
+from .mcp import NETWORK_PASSTHROUGH_ENV, SHELL_ENV_POLICY_LINES, _mcp_env, _toml_str
 from .sandbox_exclude import _derived_read_roots, _exclude_deny_entries, strict_for, turn_deny  # noqa: F401  除外の deny（他の部品がここから引く）
 
 
@@ -681,7 +681,7 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
             api_version=_llm.openai_api_version(system_settings) or None,
             auth_header=_llm.openai_auth_header_style(system_settings))
         lines += _role_provider_lines
-    lines += ['', '[features]'] + [f'{f} = false' for f in EXTERNAL_FEATURES_OFF]
+    lines += SHELL_ENV_POLICY_LINES + ['', '[features]'] + [f'{f} = false' for f in EXTERNAL_FEATURES_OFF]
     lines += [
         '',
         '[permissions.sherpa-authoring]',

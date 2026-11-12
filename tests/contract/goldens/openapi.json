@@ -1853,6 +1853,17 @@
             "title": "Answer",
             "type": "string"
           },
+          "completion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion"
+          },
           "elapsed_ms": {
             "title": "Elapsed Ms",
             "type": "integer"
@@ -1874,6 +1885,17 @@
             "title": "Sources",
             "type": "array"
           },
+          "stop_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop Kind"
+          },
           "unconfirmed_items": {
             "items": {
               "$ref": "#/components/schemas/ExtCodexJobUnconfirmedItem"
@@ -1893,6 +1915,17 @@
       },
       "ExtCodexJobStatusRes": {
         "properties": {
+          "completion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
@@ -1937,6 +1970,17 @@
           "status": {
             "title": "Status",
             "type": "string"
+          },
+          "stop_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop Kind"
           }
         },
         "required": [

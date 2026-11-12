@@ -8,7 +8,7 @@ import os
 import shutil
 import time
 
-from ... import codex_agents_md, codex_skills, investigation_ledger, metering, tool_call_log
+from ... import codex_agents_md, codex_skills, image_input, investigation_ledger, metering, tool_call_log
 from ... import depth_profile as depth_profile_mod
 from ..base import _log, _log_chat_usage, _log_codex, _node, _usage_meta
 from . import sandbox
@@ -220,7 +220,9 @@ def write_run_files(self, ctx, st):
                                             review_rounds_escalation=_review_rounds_escalation,
                                             source_required="source" in st._ledger_required_extra,
                                             ledger_style=st._ledger_style,
-                                            plan_review_cap=st._plan_review_cap)
+                                            plan_review_cap=st._plan_review_cap,
+                                            image_input=image_input.codex_image_input(
+                                                self._system_settings, ollama=self._ollama_base_url is not None))
     except Exception as e:
         _log.warning("AGENTS.md write failed: %s", type(e).__name__)
         raise RunFilesError(RUN_FILES_FAILED_MESSAGE) from e
@@ -393,9 +395,9 @@ def build_launch(self, ctx, st):
     _last_message_path = _tmp / f"last-message-{hashlib.sha1(os.urandom(8)).hexdigest()[:12]}.txt"
     # MCP ツール結果の予算・grep ヒット上限・読み取り窓を親側で1回だけ解決し、子プロセスの env として渡す（`mcp_server.py::_env_budget_bytes` が最優先で読む）。
     _mcp_budget_env: dict[str, str]
-    _mcp_budget_env = _resolve_mcp_budget(
-        self._system_settings,
-        None if _plain else (ctx.scope_meta or {}).get("depth_profile"))
+    _mcp_budget_env = {**_resolve_mcp_budget(
+        self._system_settings, None if _plain else (ctx.scope_meta or {}).get("depth_profile")),
+        **image_input.mcp_env(self._system_settings, ollama=self._ollama_base_url is not None)}
     # 評価用の計画書方式。標準モードの構造化出力（v2）のときだけ有効（それ以外は常に json＝従来の動作）。
     _style = st._ledger_style
     st._plan_review_cap = plan_ledger.review_cap_for((ctx.scope_meta or {}).get("depth_profile"))

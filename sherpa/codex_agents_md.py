@@ -14,6 +14,19 @@ from .providers.codex.sandbox import _CODEX_MAX_CONCURRENT_SUBAGENTS
 # AGENTS.md の網羅要求の検知語。定義は `investigation_state.COVERAGE_KEYWORDS`（唯一の真実源）。
 _COVERAGE_KEYWORD_LIST = "「" + "」「".join(COVERAGE_KEYWORDS) + "」"
 
+# 図・スキャンの確かめ方の項目。画像を読めない構成（`image_input.codex_image_input` が偽）では `_NO_IMAGE_CHECK_BULLET` に差し替える。
+_IMAGE_CHECK_BULLET = """\
+- 図・フロー・スキャン・画像のページは、文字層の並び順から関係や矢印を推定せず、ページ画像を開いて確かめる
+  （pdf_pages が `view_pages` で示したページを pdf_page_image で画像にし、返った `path` を
+  `tools.view_image({path})` で開いて `image(r.image_url)` で見る）。開けない・読めないときは、読めないと書き、
+  推定で補わない。
+"""
+_NO_IMAGE_CHECK_BULLET = """\
+- このモデルは画像を読めない。図・フロー・スキャン・画像のページは、文字層の並び順から関係や矢印を推定せず、
+  ページ画像も開かない。文字になっている範囲（抽出済みの文字・OCR の観測）だけで答え、図や画像にしか
+  無い根拠は確かめられなかったと回答に書く（どの資料のどの箇所かを添える）。推定で補わない。
+"""
+
 AGENTS_MD = f"""\
 # Sherpa 共通ルール（Codex 実行時）
 
@@ -32,11 +45,7 @@ AGENTS_MD = f"""\
   根拠の範囲で否定する）、③証拠不足による判断保留（資料で見つからないことだけを理由に「存在しない」と
   断定しない）を区別して書く。どうしても推定を述べるときは、資料外であることと推定であることを明示し、
   答えとしては判断保留にする。
-- 図・フロー・スキャン・画像のページは、文字層の並び順から関係や矢印を推定せず、ページ画像を開いて確かめる
-  （pdf_pages が `view_pages` で示したページを pdf_page_image で画像にし、返った `path` を
-  `tools.view_image({{path}})` で開いて `image(r.image_url)` で見る）。開けない・読めないときは、読めないと書き、
-  推定で補わない。
-- 1 回の実行で複数のツールを呼んだときは、結果を全部表示せず、必要な欄（件数・パス・ページ・該当箇所）だけを
+{_IMAGE_CHECK_BULLET}- 1 回の実行で複数のツールを呼んだときは、結果を全部表示せず、必要な欄（件数・パス・ページ・該当箇所）だけを
   表示する。省いた内容があることと、続きの読み方（`offset`・`next_text_offset`・ページ範囲など）が分かるように
   する。並列に呼んでよい。
 - 見直し（評価）は根拠の**件数**では判定しない。確定に必須の根拠種別は**ソース**（`src/` のコード）
@@ -515,7 +524,8 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
                     review_rounds: int = 0, layer: str | None = None,
                     review_rounds_escalation: bool = False, mcp: bool = True,
                     source_required: bool = False, plain: bool = False,
-                    ledger_style: str = "json", plan_review_cap: int = 1) -> None:
+                    ledger_style: str = "json", plan_review_cap: int = 1,
+                    image_input: bool = True) -> None:
     """authoring 直下へ AGENTS.md を書く（リクエストごと・冪等・上書き）。呼び出し側で try/except すること（書込失敗でも Codex 実行は継続できる＝fail-open）。
     - `plain`: 真なら他の引数を見ず `AGENTS_MD_PLAIN` だけを書く。
     - `mcp`: MCP 接続（台帳ツール）があるか。無ければ台帳の段落を出さない。
@@ -526,6 +536,7 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
       `review_rounds_escalation` は `review_rounds > 0` かつ共通上限に余地があるときだけ、見直しをもう 1 回足してよい旨を足す。
     - 調査台帳の段落は `output_schema` と `output_schema_v2` が両方真のときだけ足す（multi_agent では `ledger_enabled` も渡す）。
     - `source_required`: provider.py の `required_extra` と同じ判定の値を渡す（ずれると完了できなくなる）。
+    - `image_input`: 偽（画像を読めない構成）なら、ページ画像で確かめる指示を「画像は確かめられないと回答に書く」指示へ差し替える。
     - `ledger_style`: `plan_main` のとき、JSON 台帳と見直しの段落の代わりに調査計画書の段落を出す。`json` は従来どおり。
     書込は一時ファイルを `O_CREAT|O_EXCL|O_NOFOLLOW` で作り `os.replace()` で置換する（既存 AGENTS.md が symlink でも指す先へ書かない）。
     """
@@ -553,6 +564,8 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
                                                   ledger_enabled=_ledger_enabled)
                       if multi_agent else "")
                    + (_MULTI_AGENT_RESUME_FALLBACK_PARAGRAPH if multi_agent else ""))
+        if not image_input:
+            content = content.replace(_IMAGE_CHECK_BULLET, _NO_IMAGE_CHECK_BULLET)
         if _plan_style:
             content = content.replace("台帳・検索・グラフ・出典の確定は MCP ツールで行う。",
                                       "検索・グラフ・出典の確定は MCP ツールで行う。")

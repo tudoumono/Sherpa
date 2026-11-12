@@ -347,3 +347,20 @@ def test_mcp_call_replays_page_image_instead_of_rejecting_duplicate(env, monkeyp
         assert not resp["result"]["isError"]
         bodies.append(json.loads(resp["result"]["content"][0]["text"]))
     assert bodies[0]["cache"] == "miss" and bodies[1]["cache"] == "hit" and bodies[0]["path"] == bodies[1]["path"]
+
+
+# ===== 画像を読めない構成では、道具の側でも画像で確かめる案内を出さない =====
+
+def test_without_image_input_tools_drop_the_page_image_guidance(env, monkeypatch, tmp_path):
+    from sherpa import image_input
+    assert image_input.mcp_env({}, ollama=True) == {image_input.MCP_ENV: "0"}      # Ollama 既定＝読めない
+    assert image_input.mcp_env({}, ollama=False) == {}                            # OpenAI 系既定＝今と同じ
+    monkeypatch.setenv(image_input.MCP_ENV, "0")
+    names = _tool_names_for(monkeypatch, None)
+    assert "pdf_page_image" not in names and "pdf_page_image" not in names["pdf_pages"]["description"]
+    p = tmp_path / "t.pdf"
+    _pdf(p, [{"text": "with image", "image": True}])
+    out = DR.pdf_pages(open(p, "rb"), pages="1")
+    assert out["view_pages"] == [1] and "pdf_page_image" not in out["view_hint"]
+    _pdf(env.wd / "a.pdf", [{"ops": BLACK_TOP_LEFT}])
+    assert "view_image" not in _call(env, {"doc_id": "a.pdf", "page": 1})["next"]

@@ -24,6 +24,13 @@ NETWORK_PASSTHROUGH_ENV: tuple[str, ...] = (
 )
 
 
+# 道具のサーバー（MCP）が読む待ち時間の env。親の値を子へそのまま渡す（秘密ではない）。
+TUNING_PASSTHROUGH_ENV: tuple[str, ...] = ("SHERPA_MCP_TOOL_DEADLINE_SEC", "SHERPA_SEARCH_EMBED_TIMEOUT_SEC")
+
+# モデルの実行シェルへ渡す env を最小（PATH・HOME・LANG など）に絞る。プロキシの認証つき URL・接続用の API キーは Codex 本体と道具のサーバーだけが受け取り、シェルへは渡さない。
+SHELL_ENV_POLICY_LINES: list[str] = ['', '[shell_environment_policy]', 'inherit = "core"']
+
+
 # 値が秘密になり得る変数（パスワード・資格情報入りの URL）。Codex の引数へ値を出さず、名前だけ `env_vars` で渡す。
 SECRET_PASSTHROUGH_ENV: tuple[str, ...] = ("NEO4J_PASSWORD", "NEO4J_URI", "ES_URL", "SHERPA_MCP_SETTINGS")
 
@@ -74,7 +81,7 @@ def _mcp_env(world: str, scope_paths, ask_disabled: bool = False, layer=None, ru
     from ... import proxy_bypass
     proxy_bypass.apply()  # 子へ渡す NO_PROXY に社内の宛先を足してから読む
     env = {k: os.environ[k] for k in _MCP_PASSTHROUGH if k in os.environ}
-    env.update({k: v for k in NETWORK_PASSTHROUGH_ENV if (v := os.environ.get(k))})  # 空文字は未設定と同じ
+    env.update({k: v for k in NETWORK_PASSTHROUGH_ENV + TUNING_PASSTHROUGH_ENV if (v := os.environ.get(k))})  # 空文字は未設定と同じ
     # 接続先は親が解決した ES/Neo4j の URL を明示して渡す（ポート変数だけの構成で MCP 側が既定ポートへ繋ぐのを防ぐ）。
     from sherpa import es_index as _es
     from sherpa.ingest import world_neo4j as _neo
@@ -241,6 +248,7 @@ def _mcp_config_args(world: str, scope_paths, ask_disabled: bool = False, layer=
             "-c", f"mcp_servers.sherpa.env = {env_toml}",
             "-c", f"mcp_servers.sherpa.env_vars = {env_vars_toml}",
             # 設定の写しは鍵を含む。Codex のシェルの env には載せない。
+            "-c", 'shell_environment_policy.inherit = "core"',
             "-c", f"shell_environment_policy.exclude = [{_toml_str(store.CHILD_SNAPSHOT_ENV)}]",
             "-c", 'mcp_servers.sherpa.default_tools_approval_mode = "approve"',
             "-c", 'approval_policy = "never"']

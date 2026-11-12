@@ -252,8 +252,13 @@ def _import_matches(dotted: str, test_asts: dict[Path, ast.Module]) -> list[Path
     return [path for path, tree in test_asts.items() if _ast_references_module(tree, dotted)]
 
 
-def _compute_areas(changed_files: list[str]) -> set[str]:
-    areas: set[str] = set()
+_SUITE_AREAS = {"e2e": "e2e", "integration": "integration", "api": "api"}
+
+
+def _compute_areas(changed_files: list[str], selected: list[str] | tuple[str, ...] = ()) -> set[str]:
+    """変更ファイルの置き場所からの領域に、選んだ試験の所属スイート（api/integration/e2e）を足す。
+    後者が無いと、`store/` などの変更で選んだ結合・API の試験をマージのゲートが流さない。"""
+    areas: set[str] = {_SUITE_AREAS[s] for s in map(_suite_of, selected) if s in _SUITE_AREAS}
     for f in changed_files:
         if f.startswith("web/"):
             areas.add("e2e")
@@ -421,7 +426,7 @@ def select_tests(
         areas = {"e2e", "integration", "api"}
     else:
         final_selected = sorted(selected)
-        areas = _compute_areas(changed_files)
+        areas = _compute_areas(changed_files, final_selected)
 
     return SelectionResult(
         selected=final_selected,

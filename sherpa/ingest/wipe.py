@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import shutil
 
-from .. import es_index, store, worlds
+from .. import es_index, source_separation, store, worlds
 from ..store.replace_rows import ReplaceAborted, ReplaceRow
 from . import replace_guard, world_neo4j
 
@@ -21,9 +21,11 @@ def wipe_locked(world, *, reflect, row: ReplaceRow) -> dict:
        書けなければ削除を開始せず、書けた後はどこで失敗しても次回 sync が必ず再構築する。
     ③ グラフを削除する（失敗は握りつぶさず例外にする）。④ 成功してから台帳をクリアする（「台帳空・グラフ残」を作らない）。
     ⑤ OCR 観測ディレクトリと OCR の job/cache/run を消す。⑥ 派生物を消す。⑦ ES インデックスを消す。⑧ 全部成功してから失敗の一覧も消す。
+    守ること: 原本の置き場の中は消さない（①で派生物の木が原本と重ならないことを確かめる）。
     どの段も失敗は伝播させる（呼び出し側は行を残し、資料フォルダの行を消さない）。参照元の外部フォルダは消さない。
     """
     obs_dir = worlds.observation_removal_target(world)     # ①
+    source_separation.assert_derived_removable(world)      # ①（派生物の木が原本と重なるなら何も消さない）
     store.set_world_sig(world, "")                          # ②
     deleted = 0
     if reflect:                                            # ③

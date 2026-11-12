@@ -11,7 +11,7 @@ scripts/disk_report.sh	1058
 scripts/doctor_checks.py	2074
 scripts/doctor_checks.py::check_cloud_llm_probes	123
 scripts/gate_slice.py::select_tests	169
-scripts/make_offline_kit.sh	1042
+scripts/make_offline_kit.sh	1044
 scripts/slow_turn_report.py	1184
 scripts/slow_turn_report.py::main	107
 scripts/slow_turn_report.py::render	158
@@ -45,7 +45,7 @@ sherpa/ingest/ocr_worker.py	1719
 sherpa/ingest/ocr_worker.py::main	120
 sherpa/ingest/ocr_worker.py::run_once	165
 sherpa/ingest/ocr_worker.py::run_refresh_once	131
-sherpa/ingest/office_md.py	4312
+sherpa/ingest/office_md.py	4283
 sherpa/ingest/office_md.py::_build_derived_staging_body	1021
 sherpa/ingest/office_md.py::_build_derived_staging_body._generate_evidence	141
 sherpa/ingest/office_md.py::refresh_evidence_ir	178

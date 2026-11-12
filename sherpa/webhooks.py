@@ -248,9 +248,14 @@ def notify_run_terminal(world: str, run_id: int | None, op: str, status: str, *,
         _enqueue(key["id"], payload)
 
 
-def codex_job_payload(job_id: str, status: str, finished_at) -> dict:
-    """Codex ジョブの終了通知の本文（専用の4項目のみ・回答本文は載せない）。保存は `store.codex_jobs` が終端化と同じトランザクションで行う。
+def codex_job_payload(job_id: str, status: str, finished_at, *, completion: str | None = None,
+                      stop_kind: str | None = None, error_code: str | None = None) -> dict:
+    """Codex ジョブの終了通知の本文（4項目＋途中まで・失敗のときの `completion`/`stop_kind`/`error_code`・回答本文は載せない）。保存は `store.codex_jobs` が終端化と同じトランザクションで行う。
     宛先は送信時に鍵から読み、外されていれば `_deliver_row` が `destination_removed` で諦めて監査する。
     """
-    return {"event": f"codex_job.{status}", "job_id": job_id, "status": status,
+    body = {"event": f"codex_job.{status}", "job_id": job_id, "status": status,
             "finished_at": str(finished_at) if finished_at is not None else None}
+    # 通常の完了（`complete`/`completed`）は従来の4項目のまま。途中まで・失敗のときだけ足す。
+    body.update({k: v for k, v in (("completion", completion), ("stop_kind", stop_kind),
+                                   ("error_code", error_code)) if v and v not in ("complete", "completed")})
+    return body

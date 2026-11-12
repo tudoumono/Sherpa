@@ -13,7 +13,7 @@ import stat
 import time
 from pathlib import Path
 
-from ... import citations, doc_reach, es_index, graph_coverage, grep_tool, path_rules, redact_keys, scope_infer, search_cache, worlds
+from ... import citations, doc_reach, es_index, graph_coverage, grep_tool, image_input, path_rules, redact_keys, scope_infer, search_cache, worlds
 from ...env_int import env_int
 from ... import layer as layer_mod
 from ... import scope as scope_mod
@@ -1131,7 +1131,7 @@ def _render_pdf_page_image(f, world: str, doc_id: str, args: dict) -> dict:
     out = {"doc_id": doc_id, "page": page, "total_pages": r["total_pages"], "printed_page": r["printed_page"],
            "path": r["path"], "width": r["width"], "height": r["height"], "dpi": r["dpi"],
            "rotation": r["rotation"], "region": r["region"], "cache": r["cache"], "size_bytes": r["size_bytes"],
-           "next": _PDF_PAGE_IMAGE_NEXT}
+           "next": image_input.pdf_page_image_next(_PDF_PAGE_IMAGE_NEXT)}
     if r["downscaled"]:
         out["downscaled"] = True
     if dpi_clamped:

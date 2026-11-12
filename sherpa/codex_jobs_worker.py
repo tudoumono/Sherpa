@@ -118,6 +118,17 @@ def _qa_route(msg: str) -> dict:
     return {"lens": "qa", "input": msg, "reason": "ext_codex_job", "confident": True}
 
 
+def _finalize_or_fail(job_id: str, result: dict | None, query: str) -> dict | None:
+    """回答を整えて返す。回答が無い・失敗・停止の回答は完了として返さず `failed` にして None を返す（連携先が状態だけで失敗を検知できるように）。途中まで（`partial`）は完了のまま呼び出し側が保存する。"""
+    env = chat_service._finalize(result["env"], result["decision"], query) if result is not None else None
+    completion, stop_kind = (env or {}).get("completion"), (env or {}).get("stop_kind")
+    if env is not None and completion not in ("failed", "stopped"):
+        return env
+    store_jobs.mark_failed(job_id, error_code="timeout" if stop_kind == "timeout" else "codex_failed",
+                           completion=completion, stop_kind=stop_kind)
+    return None
+
+
 def _execute_job(job: dict, stop_event: threading.Event) -> None:
     """1 ジョブを実行し、終了状態を DB へ書く（`queued`→`running` は呼び出し元の `claim_queued_jobs()` が済み）。
     例外は内部で捕捉して `codex_failed` で終端化し、呼び出し元へ伝播させない。
@@ -183,10 +194,9 @@ def _execute_job(job: dict, stop_event: threading.Event) -> None:
                 # 取消要求による終了は、部分的な回答があっても「取消」として扱う（取消ジョブに結果は持たせない）。
                 store_jobs.mark_cancelled(job_id)
                 return
-            if result is None:
-                store_jobs.mark_failed(job_id, error_code="codex_failed")
+            env = _finalize_or_fail(job_id, result, job["query"])
+            if env is None:
                 return
-            env = chat_service._finalize(result["env"], result["decision"], job["query"])
             elapsed_ms = round((time.monotonic() - t0) * 1000)
             sources = [{"doc_id": s["doc_id"], **({"note": s["note"]} if s.get("note") else {})}
                        for s in (env.get("sources") or []) if s.get("doc_id")]
@@ -207,7 +217,7 @@ def _execute_job(job: dict, stop_event: threading.Event) -> None:
             kept = path_rules.filter_output({"sources": sources, "unconfirmed_items": unconfirmed_items, "investigation": investigation}, job["world"])  # 保存の前の最後の網（管理者の除外の資料を落とす）
             store_jobs.mark_completed(job_id, answer=env.get("headline") or "", sources=kept["sources"],
                                       unconfirmed_items=kept["unconfirmed_items"], elapsed_ms=elapsed_ms,
-                                      investigation=kept["investigation"])
+                                      investigation=kept["investigation"], completion=env.get("completion"), stop_kind=env.get("stop_kind"))
     except Exception:
         _log.exception("codex job: 予期しない例外で終端化します job_id=%s", job_id)
         try:

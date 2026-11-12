@@ -65,7 +65,7 @@ def search(world: str, query: str, engines=None, k: int = 10,
       keyword／vector は ES の上位 `k` 件で、`k` を超える一致の件数が ES から返らないため `omitted` は null。
     - layer（`"docs"|"code"|"both"`・既定 both）: keyword／vector にのみ適用する。graph は言及エッジが木を跨ぐため非適用。
     - root: 呼び出し側が解決済みの資料フォルダ root を渡すと、実在フィルタ（`documents.existing_rels`）が再解決しない。
-    - strict: 受け取るだけで使わない（実在フィルタは木を歩かない）。
+    - strict: 真なら、実在の確認で原本が読めない（権限・I/O 障害）ときを「無い」にせず `OSError` を送出する（呼び出し側が失敗として知らせる）。
     - scope_paths は `scope_mod.normalize_scope_paths` で正規化（全エンジン共通のフォルダフィルタ）。
     - 資料フォルダ・範囲の妥当性検証は呼び出し側（ext_api）の責務。
     - 各エンジンは (hits, reason|None) を返す。reason ありなら degraded に積み、hits は空扱い。engines_used は degrade しなかったエンジン。
@@ -90,7 +90,7 @@ def search(world: str, query: str, engines=None, k: int = 10,
         raw.append((e, hits, reason))
     # 実在はヒットした doc だけを 1 回で確かめる（資料フォルダの木は歩かない）
     ids = [h.get("doc_id") for _e, hits, reason in raw if not reason for h in _hits_to_filter(hits)]
-    valid = documents.existing_rels(world, ids, root=root)
+    valid = documents.existing_rels(world, ids, root=root, strict=strict)
     per_engine, degraded, coverage = {}, [], {}
     for e, hits, reason in raw:
         if reason:

@@ -636,7 +636,7 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS codex_jobs_key_id ON codex_jobs(key_id)",
     "CREATE INDEX IF NOT EXISTS codex_jobs_expires_at ON codex_jobs(expires_at) WHERE status IN ('completed','failed','cancelled')",
     # ジョブ結果に載せる調査台帳の記録。本体（`answer` 等）と同じ 7 日保存で、`expire_due_jobs`/`expire_job_if_due` が一緒に NULL へ消す。
-    "ALTER TABLE codex_jobs ADD COLUMN IF NOT EXISTS investigation JSONB",
+    "ALTER TABLE codex_jobs ADD COLUMN IF NOT EXISTS investigation JSONB, ADD COLUMN IF NOT EXISTS completion TEXT, ADD COLUMN IF NOT EXISTS stop_kind TEXT",
     # 終了通知を受付時に希望したか（通知先は送信時に鍵から読む）。
     "ALTER TABLE codex_jobs ADD COLUMN IF NOT EXISTS webhook BOOLEAN NOT NULL DEFAULT false",
     "ALTER TABLE codex_jobs ADD COLUMN IF NOT EXISTS queue_deadline TIMESTAMPTZ",

@@ -136,53 +136,38 @@ def test_stop_in_pass2_discards_the_building_index(env, monkeypatch):
     assert _hits(world, "old05") == ["o.md"] and es._index_meta(world)["content_sig"] == "s1"
 
 
-def test_low_space_drops_the_old_index_first_and_search_is_empty_until_the_switch(env, monkeypatch, caplog):
+def test_low_space_keeps_the_old_index_and_reports_the_shortfall(env, monkeypatch):
     world, st = env
     st["texts"] = {"a.md": "gamma11 本文"}
     es.index_world(world, content_sig="s1", row=offline_row(world))
     old = es._alias_targets(world)
-    assert es._store_bytes(old) > 0 and es._es_free_bytes() > 0
+    size = es._store_bytes(old)
+    assert size > 0 and es._es_free_bytes() > 0
     monkeypatch.setattr(es, "_es_free_bytes", lambda: 1)       # ES の空きが古い索引の 2 倍に満たない
     st["texts"] = {"c.md": "delta12 新しい"}
-    seen = []
-    orig = es._StreamingBulkSender.send_group
-
-    def spy(self, ids, bodies, vec_by_idx):
-        seen.append((es.search(world, "gamma11", k=5), es.search_knn_only(world, "gamma11", k=5)[0], _physicals(world)))
-        return orig(self, ids, bodies, vec_by_idx)
-
-    monkeypatch.setattr(es._StreamingBulkSender, "send_group", spy)
-    with caplog.at_level("WARNING", logger="sherpa"):
-        r = es.index_world(world, content_sig="s2", row=offline_row(world))
-    assert r["indexed"] == 1 and "error" not in r
-    (bm25, knn, physicals), = seen
-    assert bm25[0] == [] and knn == [] and old[0] not in physicals   # 古い索引は先に消え、検索は空（例外にしない）
-    assert _hits(world, "delta12") == ["c.md"] and es._index_meta(world)["content_sig"] == "s2"
-    assert any("空きが足りない" in m for m in caplog.messages)
+    r = es.index_world(world, content_sig="s2", row=offline_row(world))
+    assert r["error"] == "insufficient_space" and r["indexed"] == 0
+    assert r["free_bytes"] == 1 and r["need_bytes"] == size * 2 and r["shortfall_bytes"] == size * 2 - 1
+    assert es._alias_targets(world) == old and _physicals(world) == old   # 古い索引はそのまま残り、作りかけも無い
+    assert _hits(world, "gamma11") == ["a.md"] and _hits(world, "delta12") == []   # 検索は空にならない
+    assert es._index_meta(world)["content_sig"] == "s1" and es.needs_reindex(world, "s2")
 
 
-def test_stop_after_low_space_drop_leaves_no_index_and_the_next_update_rebuilds(env, monkeypatch):
+def test_low_space_stop_in_a_run_keeps_the_old_index_and_the_next_update_rebuilds(env, monkeypatch):
     world, st = env
     st["texts"] = {"o.md": "old13"}
     es.index_world(world, content_sig="s1", row=offline_row(world))
+    old = es._alias_targets(world)
+    orig_free, orig_in_run = es._es_free_bytes, background.in_run
     monkeypatch.setattr(es, "_es_free_bytes", lambda: 1)
+    monkeypatch.setattr(background, "in_run", lambda: True)
     st["texts"] = {f"d{i}.md": f"new14 t{i}" for i in range(10)}
-    flag = {"on": False}
-    _stop_when(monkeypatch, flag)
-    orig_ensure = es.ensure_index
-
-    def ensure_then_flag(*a, **k):
-        ok = orig_ensure(*a, **k)
-        flag["on"] = True
-        return ok
-
-    monkeypatch.setattr(es, "ensure_index", ensure_then_flag)
-    with pytest.raises(background.StopRequested):
+    with pytest.raises(background.LowDiskStop):
         es.index_world(world, content_sig="s2", row=offline_row(world))
-    assert es._concrete_indices(world) == [] and es._alias_targets(world) == []
-    assert es.search(world, "old13", k=5)[0] == [] and es.needs_reindex(world, "s2")
-    monkeypatch.setattr(es, "ensure_index", orig_ensure)
-    flag["on"] = False
+    assert es._alias_targets(world) == old and _physicals(world) == old
+    assert _hits(world, "old13") == ["o.md"] and es.needs_reindex(world, "s2")
+    monkeypatch.setattr(es, "_es_free_bytes", orig_free)       # 空きが戻った次の更新
+    monkeypatch.setattr(background, "in_run", orig_in_run)
     assert es.index_world(world, content_sig="s2", row=offline_row(world))["indexed"] == 10
     assert len(_hits(world, "new14")) == 10 and not es.needs_reindex(world, "s2")
 
