@@ -34,7 +34,7 @@ class Cell:
     """表1セル（原本の行/列位置を保持した位置付きセル）。
 
     `row`/`column` は結合を解決した後の 1-based グリッド座標。`row_span`/`column_span` は結合の起点セルにだけ
-    2 以上が入り、継続セルは要素を作らない（`arms/ooxml_arm.py` の `_docx_table_cells`）。
+    2 以上が入り、継続セルは要素を作らない（`arms/ooxml_arm.py` の `_docx_table_walk`）。
     `role` は常に `"unknown"`（ヘッダ判定は検索用表現の生成側）。
     """
     row: int
@@ -52,8 +52,8 @@ class Element:
     表要素（`type="table"`）は行の子要素を持たず、`cells`（位置付きセル配列）だけで表現する。
 
     `visibility_reason` は `visibility="hidden"` の理由（`hidden_run`／`hidden_slide`／`occluded`／
-    `off_slide`／`hidden_sheet`／`very_hidden`）。例外は `"strike"`（取り消し線）で、本文が読めるため
-    `visibility="visible"` のまま設定する。前面テキストによる上書き（`covered_by_text`）は `source_map` に置く。
+    `off_slide`／`hidden_sheet`／`very_hidden`）だけを持つ。要素全体の取り消し線は可視性ではないので
+    `source_map["format_state"]={"strike": "whole"}` に置く。前面テキストによる上書き（`covered_by_text`）も `source_map` に置く。
     """
     element_id: str
     type: str                              # "paragraph" | "heading" | "table" | "slide" | "shape" | "notes" | ...

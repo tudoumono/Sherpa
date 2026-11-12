@@ -47,15 +47,15 @@ def test_vlm_ollama_follows_central_url_and_admin_allowlist(monkeypatch, tiny_im
     assert vision_arm.vlm_config()["ollama_url"] == "http://localhost:11434"
 
 
-def test_resolve_vlm_ollama_uses_central_allowlist_not_ip_literal(monkeypatch):
-    """許可一覧にある DNS 名は cloud_allowed=false でも使え、許可されていない宛先は使えない。"""
+def test_resolve_vlm_ollama_uses_central_url_without_allowlist(monkeypatch):
+    """中央の接続先は DNS 名でも許可一覧なし・cloud_allowed=false で使え、解釈できない形なら使えない。"""
     monkeypatch.delenv("SHERPA_VLM_USABLE", raising=False)
     host = "http://host.docker.internal:11434"
-    base = {"vlm": {"provider": "ollama"}, "ollama_url": host}
     monkeypatch.setattr("sherpa.store.get_system_settings",
-                        lambda: {**base, "ollama_allowlist": ["host.docker.internal:11434"]})
+                        lambda: {"vlm": {"provider": "ollama"}, "ollama_url": host})
     assert vision_arm.resolve_vlm()["ollama_url"] == host
-    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: base)
+    monkeypatch.setattr("sherpa.store.get_system_settings",
+                        lambda: {"vlm": {"provider": "ollama"}, "ollama_url": f"{host}/api"})
     assert vision_arm.resolve_vlm() is None
 
 

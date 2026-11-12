@@ -21,7 +21,6 @@ import pytest
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 from sherpa import agents as A  # noqa: E402
 from sherpa.providers import base as BASE  # noqa: E402
-from _det_provider import DeterministicTestProvider  # noqa: E402
 
 _ENV = {"lens": "qa", "headline": "h", "summary": {"total": 0}, "data": {}, "sources": []}
 
@@ -31,61 +30,21 @@ def _ctx(lens="author", knowledge=True, message="消費税率の一覧をExcel�
         message=message,
         world="v1",
         route=lambda msg: {"lens": lens, "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline",
-            "summary": {"total": 2}, "data": {"citations": []}, "sources": [],
-        },
         knowledge=knowledge,
         **kw,
     )
-
-
-def _ctx_with_blocked_dispatch(lens="qa"):
-    return A.Ctx(
-        message="消費税率とは？",
-        world="v1",
-        route=lambda msg: {"lens": lens, "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "headline": "資料の「使う検索」がすべてOFF/利用できません。",
-            "summary": {"total": 0}, "data": {}, "sources": [], "_tools_blocked": True,
-        },
-        knowledge=True,
-    )
-
-
-def _tool_done(events):
-    return [e for e in events if e.get("type") == "node" and e.get("kind") == "tool"
-            and e.get("status") == "done"]
 
 
 def _result_envs(events):
     return [e["env"] for e in events if isinstance(e, dict) and e.get("type") == "_result"]
 
 
-# ===== _TOOLS / _LENS_INTENT =====
+# ===== _LENS_INTENT =====
 
-def test_tools_and_lens_intent_have_author_entry():
-    assert "author" in BASE._TOOLS and BASE._TOOLS["author"]
+def test_lens_intent_has_author_entry():
     assert BASE._LENS_INTENT.get("author")
 
 
-# ===== _gather の検索経路 trace =====
-
-def test_gather_tools_blocked_trace_and_sidecar():
-    """`_tools_blocked` の envelope は「N件を確認」ではなくブロック文言になり、サイドカーは公開 env に残らない。"""
-    events = list(DeterministicTestProvider().run(_ctx_with_blocked_dispatch()))
-    tool_done = _tool_done(events)
-    assert tool_done
-    for n in tool_done:
-        assert "件を確認" not in n["detail"]
-        assert "使う検索が無効" in n["detail"]
-    result = next(e for e in events if e.get("type") == "_result")
-    assert "_tools_blocked" not in result["env"]
-
-
-def test_gather_not_blocked_keeps_existing_done_wording():
-    tool_done = _tool_done(list(DeterministicTestProvider().run(_ctx(lens="qa"))))
-    assert tool_done and all("件を確認" in n["detail"] for n in tool_done)
 
 
 # ===== _plain_text（参照 OFF の安全網） =====
@@ -225,10 +184,6 @@ def _run_ctx(uid, lens="qa", message="質問", **kw):
     return A.Ctx(
         message=message, world="v1",
         route=lambda msg: {"lens": lens, "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline",
-            "summary": {"total": 0}, "data": {}, "sources": [],
-        },
         knowledge=True, uid=uid, **kw,
     )
 

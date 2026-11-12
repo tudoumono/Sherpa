@@ -268,12 +268,21 @@ def _retired(tmp_path: Path, uid: str, cid) -> Path:
     return tmp_path / _users(uid) / uid / "workspace" / ".codex-sessions" / str(cid) / "investigation"
 
 
+def _use_style(monkeypatch, style):
+    """調査の方式を差し替える（製品には切り替えの環境変数が無い）。"""
+    from sherpa.providers.codex import plan_ledger
+    monkeypatch.setattr(plan_ledger, "effective_style", lambda **_kw: style)
+
+
 def _t(tmp_path, monkeypatch, steps, uid, cid, *, message=None, log="argv.log", env=None, prov=None,
        depth_profile=None):
     """1 ターン実行して (events, env, calls) を返す。同一 uid の複数ターンは同じ users dir を共有する。"""
     argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname=_users(uid), argv_log_name=log)
     for k, v in (env or {}).items():
-        monkeypatch.setenv(k, v)
+        if k == "style":
+            _use_style(monkeypatch, v)
+        else:
+            monkeypatch.setenv(k, v)
     kw = {} if message is None else {"message": message}
     ctx = helper._ctx(uid=uid, conversation_id=cid, **kw)
     if depth_profile is not None:
@@ -866,7 +875,7 @@ def test_partial_restore_failure_preserves_original_retired_ledger(tmp_path, mon
     _copy2_boom_on_b(monkeypatch)
     _, env, _ = _t(tmp_path, monkeypatch, [_st("TH-PARTIAL-RESTORE", _final("続きの調査です。"))],
                    uid, cid, message="続きをお願いします")
-    assert env["investigation"]["restored"] is False
+    assert env["agentic_failure"] == "error" and "復元できませんでした" in env["headline"]   # 空の台帳で「続き」を走らせない
     assert (retire_dir / "manifest.json").is_file()
     assert (retire_dir / "items" / "a.json").is_file() and (retire_dir / "items" / "b.json").is_file()
     assert json.loads((retire_dir / "manifest.json").read_text(encoding="utf-8"))["items"] == ["a", "b"]
@@ -1321,7 +1330,7 @@ def test_review_rollback_keeps_answer_read_only_from_last_message_file(tmp_path)
     from sherpa.providers.codex.turn_loop import _revert_review_if_worse
     from sherpa.providers.codex.turn_state import CodexTurnState
 
-    st = CodexTurnState(helper._ctx("review-file", 33003), turn_t0=0, plain=False, skip_presearch=True)
+    st = CodexTurnState(helper._ctx("review-file", 33003), turn_t0=0, plain=False)
     st._schema_on = st._schema_v2 = True
     st._last_message_path = tmp_path / "last-message.txt"
     original, review = "回収済みの結論です。", "見直しで別の確認点を見つけました。"
@@ -1358,42 +1367,20 @@ _PLAN_OPEN = "## 前提\n仮定です\n## 母集団\n- [ ] a · program · 架�
 _PLAN_DONE = _PLAN_OPEN.replace("- [ ]", "- [x]").replace("## 結論", "    - source: src/demo.cbl:1\n## 結論")
 
 
-def test_plan_gate_runtime_counts_requested_reviews_and_resumes(tmp_path, monkeypatch):
-    capture = tmp_path / "plan-config.json"
-    events, env, calls = _t(tmp_path, monkeypatch, [
-        _st("PLAN-B", _final("初回"), plan_md=_PLAN_OPEN, capture_plan_config=str(capture)),
-        _st("PLAN-B", _final("調査済み"), plan_md=_PLAN_DONE),
-        _st("PLAN-B", _final("見直し済み"), plan_md=_PLAN_DONE + "\n## 見直し\n- 1: 追加なし\n"),
-    ], "plan-gate", 701, env={"SHERPA_LEDGER_STYLE": "plan_gate", "SHERPA_LEDGER_EVAL_DIR": str(tmp_path / "eval")})
-    assert len(calls) == 3 and sum("resume" in c for c in calls) == 2
-    report = env["investigation"]
-    assert report["review_requests"] == 1 and report["review_rounds"] == 0
-    assert report["continuations"] == 1 and report["stopped_reason"] == "complete"
-    saved = json.loads((tmp_path / "eval/conv-701.stats.json").read_text())
-    assert saved["resume_count"] == 2 and saved["plan"]["review_requests"] == 1
-    assert (tmp_path / "eval/conv-701.plan.md").read_text().endswith("- 1: 追加なし\n")
-    assert saved["review_cap"] == 1
-    assert saved["graph"] == {"impact_calls": 0, "impact_incomplete": 0, "impact_depth_truncated": 0}
-    assert saved["gate"] == {"graph_nudges": 0, "accepted_with_graph_incomplete": False, "closed_rows": []}
-    review = (tmp_path / "eval/conv-701.review-1.md").read_text()
-    assert "src/demo.cbl:1" in review and not (tmp_path / "eval/conv-701.review-2.md").exists()
-    config = json.loads(capture.read_text())
-    assert config["toolset"] == "plan" and not config["ledger_dir"]
-    assert "worker) を必ず使う" in config["agents"] and "ledger_item_put" not in config["agents"]
-    assert "見直しの回数は 2" not in config["agents"]
-
-
 def test_plan_main_accepts_its_final_without_tool_zero_or_ledger_review(tmp_path, monkeypatch):
     capture = tmp_path / "plan-config.json"
     _events, env, calls = _t(tmp_path, monkeypatch, [
         _st("PLAN-C", _final("自分で完了"), plan_md=_PLAN_OPEN, no_tools=True,
             capture_plan_config=str(capture)),
-    ], "plan-main", 702, env={"SHERPA_LEDGER_STYLE": "plan_main", "SHERPA_LEDGER_EVAL_DIR": str(tmp_path / "eval")})
+    ], "plan-main", 702, env={"style": "plan_main", "SHERPA_LEDGER_EVAL_DIR": str(tmp_path / "eval")})
     assert len(calls) == 1 and not env["tool_use"]["nudged"]
     report = env["investigation"]
-    assert report["review_requests"] == 0 and report["stopped_reason"] == "self_final"
+    assert report["stopped_reason"] == "self_final"
     assert len(report["unconfirmed_items"]) == 1 and env["headline"].startswith("自分で完了")
-    assert "未確認:" not in env["headline"] and "- 架空対象（調べ終わっていません）" in env["headline"]
+    assert "未確認:" not in env["headline"] and "調べた範囲" not in env["headline"]
+    items = [(i["label"], i["text"]) for i in env["investigation_summary"]["items"]]
+    assert ("調べた項目", "対象 1 件のうち、確かめた 0 件・確かめられなかった 0 件・未着手 1 件") in items
+    assert ("確認できなかった項目", "架空対象（調べ終わっていません）") in items
     assert "ledger_" not in json.loads(capture.read_text())["agents"]
     assert "使うかどうかは自分で決めてよい" in json.loads(capture.read_text())["agents"]
 
@@ -1402,7 +1389,7 @@ def test_plan_main_accepts_its_final_without_tool_zero_or_ledger_review(tmp_path
 def test_plan_main_turn_saves_the_plan_in_the_investigation_record(tmp_path, monkeypatch):
     events, env, _calls = _t(tmp_path, monkeypatch, [
         _st("PLAN-REC", _final("値は 10 です。"), plan_md=_PLAN_OPEN),
-    ], "plan-rec", 704, env={"SHERPA_LEDGER_STYLE": "plan_main"})
+    ], "plan-rec", 704, env={"style": "plan_main"})
     result = next(e for e in events if isinstance(e, dict) and e.get("type") == "_result")
     record = result["investigation_record"]
     assert record is not None and record["extras"]["ledger"] == "plan"
@@ -1417,13 +1404,13 @@ _PLAN_SHORT = ("## 前提\n仮定です\n## 母集団\n- [x] a · program · 架
                "    - source: 4期/02_設計/01_基本設計/税計算仕様書.md:3\n## 結論\n短い結論です [a]。\n")
 
 
-@pytest.mark.parametrize("style", ["plan_gate", "plan_main"])
+@pytest.mark.parametrize("style", ["plan_main"])
 def test_plan_modes_keep_the_model_answer_and_verified_sources(tmp_path, monkeypatch, style):
     argv_log = _setup(tmp_path, monkeypatch, [
         _st("PLAN-KEEP", _final(_LIST_ANSWER), plan_md=_PLAN_SHORT),
         _st("PLAN-KEEP", _final(_LIST_ANSWER), plan_md=_PLAN_SHORT + "\n## 見直し\n- 1: 追加なし\n"),
     ], users_dirname=_users("plan-keep"))
-    monkeypatch.setenv("SHERPA_LEDGER_STYLE", style)
+    _use_style(monkeypatch, style)
     monkeypatch.setenv("SHERPA_LEDGER_EVAL_DIR", str(tmp_path / "eval"))
     ctx = helper._ctx(uid="plan-keep", conversation_id=710)
     ctx.make_sources = lambda docs: [{"doc_id": d, "download_url": f"/dl?rel={d}"} for d in docs]
@@ -1431,16 +1418,32 @@ def test_plan_modes_keep_the_model_answer_and_verified_sources(tmp_path, monkeyp
     body = env["body"]
     assert "- src/demo_one.cbl 受付処理" in body and "- src/demo_two.cbl 集計処理" in body
     assert "未確認:" not in body and "短い結論です" not in body
-    assert "## 調べた範囲（調査計画書）" in body
+    assert "調べた範囲" not in body and "[a]" not in body and "参照した資料" not in body
+    assert "前提" not in body and "仮定です" not in body
     ids = {s["doc_id"] for s in env["sources"]}
     assert ids == {"4期/02_設計/01_基本設計/税計算仕様書.md"}
     assert "存在しない資料.md" not in ids
     saved = json.loads((tmp_path / "eval/conv-710.stats.json").read_text())
     assert saved["compose"]["body_source"] == "model_answer" and saved["compose"]["refs_added_from_plan"] == 1  # 範囲 :3 が足される
     assert saved["candidate"]["reason"] == "refs_block" and saved["candidate"]["picked_index"] == 0
-    assert saved["review"]["app_gating"] is (style == "plan_gate")
+    assert saved["review"]["app_gating"] is False
     assert (tmp_path / "eval/conv-710.adopted.md").read_text() == _LIST_ANSWER.strip()
-    assert "## 調べた範囲" in (tmp_path / "eval/conv-710.composed.md").read_text()
+    assert "- src/demo_one.cbl 受付処理" in (tmp_path / "eval/conv-710.composed.md").read_text()
+
+
+def test_plan_conclusion_paths_become_reference_candidates(tmp_path, monkeypatch):
+    plan = _PLAN_SHORT.replace("短い結論です [a]。", "短い結論です [a]。4期/01_標準/消費税法.md と「4期/無い/存在しない結論先.md」も関係。")
+    _setup(tmp_path, monkeypatch, [_st("PLAN-CONC", _final("答えです。"), plan_md=plan)] * 2,
+           users_dirname=_users("plan-conc"))
+    _use_style(monkeypatch, "plan_main")
+    ctx = helper._ctx(uid="plan-conc", conversation_id=712)
+    ctx.make_sources = lambda docs: [{"doc_id": d, "download_url": f"/dl?rel={d}"} for d in docs]
+    env = helper._result_env(helper._run(A.CodexProvider(), ctx))
+    paths = {r["path"] for r in env["referenced_docs"]}
+    assert paths == {"4期/02_設計/01_基本設計/税計算仕様書.md", "4期/01_標準/消費税法.md"}
+    assert not any(r.get("mentioned_only") for r in env["referenced_docs"])      # 参照の候補＝本文で触れただけの扱いにはしない
+    assert env["sources_unverified"] == [{"path": "4期/無い/存在しない結論先.md",
+                                          "reason": "見つからないか、読めない形式です"}]
 
 
 def test_json_style_answer_is_unchanged_by_plan_composition(tmp_path, monkeypatch):
@@ -1459,12 +1462,12 @@ def test_plan_main_keeps_work_declaration_continuation_and_counts_review_records
     _events, env, calls = _t(tmp_path, monkeypatch, [
         _st("PLAN-CONT", _inprog("調べます"), plan_md=_PLAN_OPEN),
         _st("PLAN-CONT", _final("完了"), plan_md=_PLAN_DONE + "\n## 見直し\n- 1: 追加なし\n"),
-    ], "plan-cont", 703, env={"SHERPA_LEDGER_STYLE": "plan_main"})
+    ], "plan-cont", 703, env={"style": "plan_main"})
     assert len(calls) == 2 and env["investigation"]["auto_continue_count"] == 1
     assert env["investigation"]["plan_review_lines"] == 1 and env["investigation"]["resume_count"] == 1
 
 
-@pytest.mark.parametrize("style", ["plan_gate", "plan_main"])
+@pytest.mark.parametrize("style", ["plan_main"])
 def test_plan_modes_do_not_restore_previous_json_investigation(tmp_path, monkeypatch, style):
     uid, cid = "plan-old", 704
     retired = _retired(tmp_path, uid, cid)
@@ -1474,7 +1477,7 @@ def test_plan_modes_do_not_restore_previous_json_investigation(tmp_path, monkeyp
     _events, env, calls = _t(tmp_path, monkeypatch, [
         _st("PLAN-OLD", _final("新しい依頼の結果"), plan_md=_PLAN_DONE),
         _st("PLAN-OLD", _final("見直し"), plan_md=_PLAN_DONE),
-    ], uid, cid, message="続きの依頼", env={"SHERPA_LEDGER_STYLE": style})
+    ], uid, cid, message="続きの依頼", env={"style": style})
     assert "ledger_manifest_set" not in calls[0][-1]
     assert retired.joinpath("manifest.json").is_file()
     assert not env["investigation"].get("restored")
@@ -1498,7 +1501,7 @@ def test_json_style_still_saves_eval_stats_with_unchanged_acceptance(tmp_path, m
 def test_previous_turn_plan_is_not_reused_when_the_new_turn_has_no_plan(tmp_path, monkeypatch):
     eval_dir = tmp_path / "eval"
     _t(tmp_path, monkeypatch, [_st("PLAN-OLD-TURN", _final("前回"), plan_md=_PLAN_DONE)],
-       "plan-turns", 706, env={"SHERPA_LEDGER_STYLE": "plan_main", "SHERPA_LEDGER_EVAL_DIR": str(eval_dir)})
+       "plan-turns", 706, env={"style": "plan_main", "SHERPA_LEDGER_EVAL_DIR": str(eval_dir)})
     assert (eval_dir / "conv-706.plan.md").is_file()
     _events, env, calls = _t(tmp_path, monkeypatch, [_st("PLAN-NEW-TURN", _final("今回だけの回答"))],
                               "plan-turns", 706, log="second.log")
@@ -1506,88 +1509,9 @@ def test_previous_turn_plan_is_not_reused_when_the_new_turn_has_no_plan(tmp_path
     assert not env["investigation"]["plan_present"] and not (eval_dir / "conv-706.plan.md").exists()
 
 
-# ---- 影響先の対象の照合（plan_gate） ----
-
-def _graph_rows():
-    def row(path):
-        return {"name": path.rsplit("/", 1)[-1], "path": path, "cid": "cid:" + path, "kind": "program", "distance": 1}
-    return [{"tool": "graph_impact", "complete": True, "count": 3,
-             "start": {"name": "ZCPY", "path": "copy/ZCPY.cpy", "cid": "cid:copy/ZCPY.cpy"},
-             "rows": [row("src/alpha.cbl"), row("src/beta.cbl"), row("src/gamma.cbl")]}]
-
-
-_PART = "影響先です。\n- src/alpha.cbl\n- src/beta.cbl\n\n参照した資料:\n- src/alpha.cbl:1\n- src/beta.cbl:1\n"
-_FULL = _PART.replace("- src/beta.cbl\n\n", "- src/beta.cbl\n- src/gamma.cbl\n\n")
-
-
-def _impact_turn(tmp_path, monkeypatch, steps, cid, *, dry_run=False):
-    from sherpa.providers.codex import plan_ledger as PL
-    monkeypatch.setattr(PL, "graph_impact_results", lambda st: _graph_rows())
-    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname=_users("tgt"))
-    monkeypatch.setenv("SHERPA_LEDGER_STYLE", "plan_gate")
-    monkeypatch.setenv("SHERPA_LEDGER_EVAL_DIR", str(tmp_path / "eval"))
-    if dry_run:
-        monkeypatch.setenv("SHERPA_LEDGER_GATE_DRYRUN", "1")
-    ctx = helper._ctx(uid="tgt", conversation_id=cid, message="コピーブック ZCPY の項目を変えたときの影響範囲を全件")
-    ctx.route = lambda msg: {"lens": "impact", "input": msg, "reason": "test", "confident": True}
-    events = helper._run(A.CodexProvider(), ctx)
-    saved = json.loads((tmp_path / f"eval/conv-{cid}.stats.json").read_text())
-    return helper._result_env(events), helper._read_argv_log(argv_log), saved
-
-
-def test_plan_gate_rejects_missing_targets_once_and_accepts_the_resolved_answer(tmp_path, monkeypatch):
-    env, calls, saved = _impact_turn(tmp_path, monkeypatch, [
-        _st("TGT", _final(_PART), plan_md=_PLAN_DONE),
-        _st("TGT", _final(_FULL), plan_md=_PLAN_DONE),
-    ], 801)
-    assert len(calls) == 2 and "src/gamma.cbl" in calls[1][-1] and "欠けた対象" in calls[1][-1]
-    assert "- src/gamma.cbl" in env["body"] and env["completion"] == "complete"
-    assert not [n for n in env.get("notices", []) if n["kind"] == "target_unresolved"]
-    tc = saved["target_check"]
-    assert tc["status"] == "no_missing" and tc["decision"] == "reject_missing" and tc["dry_run"] is False
-    assert [g["action"] for g in saved["gate_log"]] == ["reject_targets", "accept"]
-    assert saved["review"]["app_review_requests"] == 1
-
-
-def test_plan_gate_keeps_the_body_and_marks_partial_when_the_slot_is_used_up(tmp_path, monkeypatch):
-    env, calls, saved = _impact_turn(tmp_path, monkeypatch, [
-        _st("TGT2", _final(_PART), plan_md=_PLAN_DONE),
-        _st("TGT2", _final(_PART), plan_md=_PLAN_DONE),
-    ], 802)
-    assert len(calls) == 2
-    assert "- src/beta.cbl" in env["body"] and env["completion"] == "partial"
-    notices = [n for n in env["notices"] if n["kind"] == "target_unresolved"]
-    assert len(notices) == 1 and "src/gamma.cbl" in notices[0]["text"]
-    assert saved["target_check"]["decision"] == "accepted_unresolved" and saved["target_check"]["missing"] == ["src/gamma.cbl"]
-
-
-def test_gate_dryrun_records_the_decision_without_sending_anything(tmp_path, monkeypatch):
-    env, calls, saved = _impact_turn(tmp_path, monkeypatch, [
-        _st("TGT3", _final(_PART), plan_md=_PLAN_DONE),
-        _st("TGT3", _final(_FULL), plan_md=_PLAN_DONE),
-    ], 803, dry_run=True)
-    assert len(calls) == 1 and env["completion"] == "complete" and "src/gamma.cbl" not in env["body"]
-    assert not [n for n in env.get("notices", []) if n["kind"] == "target_unresolved"]
-    tc = saved["target_check"]
-    assert tc["dry_run"] is True and tc["decision"] == "recorded_only" and tc["missing_count"] == 1
-    assert saved["gate_log"][0]["action"] == "reject_targets" and saved["gate_log"][0]["dry_run"] is True
-    assert saved["review"]["app_review_requests"] == 0
-
-
-def test_plan_gate_without_graph_results_is_unchanged_and_records_not_applicable(tmp_path, monkeypatch):
-    _events, env, calls = _t(tmp_path, monkeypatch, [
-        _st("TGT4", _final("初回"), plan_md=_PLAN_DONE),
-        _st("TGT4", _final("見直し済み"), plan_md=_PLAN_DONE),
-    ], "tgt4", 804, env={"SHERPA_LEDGER_STYLE": "plan_gate", "SHERPA_LEDGER_EVAL_DIR": str(tmp_path / "eval")})
-    assert len(calls) == 2 and "欠けた対象" not in calls[1][-1]
-    saved = json.loads((tmp_path / "eval/conv-804.stats.json").read_text())
-    assert saved["target_check"]["status"] == "not_applicable" and saved["target_check"]["decision"] == "none"
-    assert saved["plan_normalizations"] == []
-
-
 def test_plan_normalizations_reach_the_eval_record(tmp_path, monkeypatch):
     plan = "## 母集団\n- [x] [n1] · program · 対象 · 要: source\n    - source: src/a.cbl:1\n## 結論\nx\n"
     _t(tmp_path, monkeypatch, [_st("TGT5", _final("完了"), plan_md=plan, no_tools=True)], "tgt5", 805,
-       env={"SHERPA_LEDGER_STYLE": "plan_main", "SHERPA_LEDGER_EVAL_DIR": str(tmp_path / "eval")})
+       env={"style": "plan_main", "SHERPA_LEDGER_EVAL_DIR": str(tmp_path / "eval")})
     saved = json.loads((tmp_path / "eval/conv-805.stats.json").read_text())
-    assert saved["plan_normalizations"][0]["kinds"] == ["id_brackets"] and saved["target_check"] is None
+    assert saved["plan_normalizations"][0]["kinds"] == ["id_brackets"]

@@ -139,3 +139,16 @@ def test_lan_can_be_persisted_in_dotenv_and_explicit_flag_wins(tmp_path: Path):
     assert subprocess.run(["bash", "-c", snippet], env=base, capture_output=True, text=True, timeout=30).stdout == "1"
     assert subprocess.run(["bash", "-c", snippet], env=dict(base, LAN="0"), capture_output=True, text=True, timeout=30).stdout == "0"
     assert 'sherpa_env_default SHERPA_LAN' in (ROOT / "scripts" / "start.sh").read_text(encoding="utf-8")
+
+
+def test_env_default_strips_inline_comments_like_compose(tmp_path: Path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "A=2         # 本数\nB=\"mobile\"  # c\nC=ab#cd\nD=\"x # y\"\nE='s q' # c\nF= v # c\nG= # 既定\nH=#abc\n", encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k not in {"A", "B", "C", "D", "E", "F", "G", "H"}}
+    env["SHERPA_ENV_FILE"] = str(env_file)
+    r = subprocess.run(
+        ["bash", "-c", f'ROOT="{ROOT}"; . "{COMMON}"; sherpa_env_default A B C D E F G H; '
+                       'printf "[%s]" "$A" "$B" "$C" "$D" "$E" "$F" "${G-unset}" "$H"'],
+        env=env, capture_output=True, text=True, timeout=30, check=True)
+    assert r.stdout == "[2][mobile][ab#cd][x # y][s q][v][][#abc]"

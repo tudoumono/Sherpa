@@ -120,6 +120,8 @@ POLICY: dict[tuple[str, str], str] = {
     ("GET", "/admin/settings"): "admin",
     ("PUT", "/admin/settings"): "admin",
     ("POST", "/admin/settings/openai-endpoint-test"): "admin",
+    ("POST", "/admin/settings/ollama-test"): "admin",
+    ("POST", "/admin/connectivity/check"): "admin",
     ("GET", "/admin/users"): "admin",
     ("POST", "/admin/users"): "admin",
     ("POST", "/admin/users/import"): "admin",
@@ -130,11 +132,10 @@ POLICY: dict[tuple[str, str], str] = {
     ("GET", "/admin/es/search"): "admin",
     ("GET", "/admin/health"): "admin",
     ("GET", "/fs/list"): "admin",
-    ("GET", "/graph"): "admin",
-    ("GET", "/graph/facets"): "admin",
-    ("GET", "/graph/search"): "admin",
     ("GET", "/ingest/preview"): "admin",
+    ("GET", "/ingest/preview/graph"): "admin",
     ("GET", "/ingest/runs"): "admin",
+    ("GET", "/ingest/runs/mark"): "admin",
     ("GET", "/ingest/workers"): "admin",
     ("POST", "/ingest/rerun"): "admin",
     ("GET", "/worlds"): "admin",
@@ -142,11 +143,18 @@ POLICY: dict[tuple[str, str], str] = {
     ("POST", "/worlds/diff"): "admin",
     ("POST", "/worlds/disk-estimate"): "admin",
     ("GET", "/worlds/{wid}/status"): "admin",
+    ("GET", "/worlds/{wid}/folder-check"): "admin",
     ("POST", "/worlds/{wid}/recount"): "admin",
+    ("POST", "/worlds/{wid}/file-state"): "admin",
     ("POST", "/worlds/{wid}/rebind"): "admin",
     ("POST", "/worlds/{wid}/refresh"): "admin",
     ("POST", "/worlds/{wid}/reconvert"): "admin",
     ("POST", "/worlds/{wid}/rag_regenerate_rules"): "admin",
+    ("GET", "/admin/path-rules"): "admin",
+    ("PUT", "/admin/path-rules"): "admin",
+    ("GET", "/admin/path-rules/files"): "admin",
+    ("GET", "/admin/build-marks"): "admin",
+    ("PUT", "/admin/build-marks"): "admin",
     ("GET", "/worlds/{wid}/resolve-settings"): "admin",
     ("PUT", "/worlds/{wid}/resolve-settings"): "admin",
     ("DELETE", "/worlds/{wid}"): "admin",
@@ -267,6 +275,8 @@ ALLOW_PROBE_BODY: dict[tuple[str, str], dict] = {
     # 通信前 422」の安全な body を明示する（admin 認可の ALLOW 確認自体は 200/404/422 いずれでも
     # 401/403 でなければ成立するため、実通信を避けつつ認可判定だけを固定できる）。
     ("POST", "/admin/settings/openai-endpoint-test"): {"provider": "__authz_probe__"},
+    # 形式検証で通信前に 422 になる URL（admin の ALLOW 確認だけを固定する）。
+    ("POST", "/admin/settings/ollama-test"): {"ollama_url": "ftp://authz-probe"},
     ("POST", "/chat/turns"): {"message": "authz-probe", "conversation_id": 999999999},
 }
 
@@ -354,7 +364,13 @@ def test_policy_covers_all_routes():
     # admin=資料フォルダの解決範囲の設定（GET/PUT /worlds/{wid}/resolve-settings）2件追加で42。
     # admin=回答への評価（GET /admin/feedback/summary・GET /admin/feedback/items）2件追加で44。
     # admin=取り込みワーカーの版の照合（GET /ingest/workers）で45、ディスク容量の見積もり（POST /worlds/disk-estimate）で46。
-    assert len(ADMIN_ROUTES) == 46
+    # admin=ナレッジグラフ画面の廃止（GET /graph・/graph/facets・/graph/search）3件撤去で43、資料フォルダのグラフ（GET /ingest/preview/graph）で44。
+    # admin=管理画面の Ollama 接続テスト（POST /admin/settings/ollama-test）1件追加で45。
+    # admin=フォルダの置き方の点検（GET /worlds/{wid}/folder-check）1件追加で46。
+    # admin=管理画面の「つながりの確認」（POST /admin/connectivity/check）1件追加で47。
+    # admin=資料の優先と除外（GET/PUT /admin/path-rules・GET /admin/path-rules/files）3件追加で50。
+    # admin=ファイルの状態を更新（POST /worlds/{wid}/file-state）1件・ビルドの定義の印（GET/PUT /admin/build-marks）2件・取り込み run の確認（GET /ingest/runs/mark）1件追加で54。
+    assert len(ADMIN_ROUTES) == 54
     # ext_key=旧6＋Codex ジョブ API 4本（受付・状態・結果・取消・`C-EXT-CODEXJOB-*`）で10。
     assert len(EXT_KEY_ROUTES) == 10
     assert len(SPECIAL_ROUTES) == 7

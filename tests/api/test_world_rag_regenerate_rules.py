@@ -31,6 +31,7 @@ def _clean_runs():
     yield
     with store_db._connect() as c:
         c.execute("DELETE FROM ingest_runs WHERE version='w1'")
+        c.execute("DELETE FROM ingest_replacements WHERE world='w1'")
 
 
 def _common_stubs(monkeypatch, *, world_dir="/tmp/fake-world-dir") -> None:
@@ -62,10 +63,11 @@ def test_success_accepted_and_finalizes_run(client, monkeypatch):
 
     _common_stubs(monkeypatch)
     monkeypatch.setattr(ingest_worker, "regenerate_rag_rule_only",
-                        lambda wid: {"status": "ok", "rag_generated": 5, "rag_failed": 0})
+                        lambda wid, run_id: {"status": "ok", "rag_generated": 5, "rag_failed": 0})
     recorded = []
-    monkeypatch.setattr(store, "finish_ingest_run",
-                        lambda run_id, **k: recorded.append({"run_id": run_id, **k}) or {"id": run_id})
+    record = lambda run_id, **k: recorded.append({"run_id": run_id, **k}) or {"id": run_id}  # noqa: E731
+    monkeypatch.setattr(store, "finish_ingest_run", record)
+    monkeypatch.setattr(store, "finish_ingest_run_and_drop_row", record)   # 成功は入れ替えの行を消す記録で閉じる
 
     r = client.post("/worlds/w1/rag_regenerate_rules")
     assert r.status_code == 202, r.text
@@ -86,10 +88,11 @@ def test_background_failure_status_finalizes_run_as_failed(client, monkeypatch):
 
     _common_stubs(monkeypatch)
     monkeypatch.setattr(ingest_worker, "regenerate_rag_rule_only",
-                        lambda wid: {"status": "es_reindex_failed", "rag_generated": 2})
+                        lambda wid, run_id: {"status": "es_reindex_failed", "rag_generated": 2})
     recorded = []
-    monkeypatch.setattr(store, "finish_ingest_run",
-                        lambda run_id, **k: recorded.append({"run_id": run_id, **k}) or {"id": run_id})
+    record = lambda run_id, **k: recorded.append({"run_id": run_id, **k}) or {"id": run_id}  # noqa: E731
+    monkeypatch.setattr(store, "finish_ingest_run", record)
+    monkeypatch.setattr(store, "finish_ingest_run_and_drop_row", record)   # 何も入れ替えないうちの失敗は行を消す記録で閉じる
 
     r = client.post("/worlds/w1/rag_regenerate_rules")
     assert r.status_code == 202, r.text
@@ -107,12 +110,13 @@ def test_background_unexpected_exception_finalizes_run_as_failed(client, monkeyp
 
     _common_stubs(monkeypatch)
 
-    def _boom(wid):
+    def _boom(wid, run_id):
         raise RuntimeError("boom")
     monkeypatch.setattr(ingest_worker, "regenerate_rag_rule_only", _boom)
     recorded = []
-    monkeypatch.setattr(store, "finish_ingest_run",
-                        lambda run_id, **k: recorded.append({"run_id": run_id, **k}) or {"id": run_id})
+    record = lambda run_id, **k: recorded.append({"run_id": run_id, **k}) or {"id": run_id}  # noqa: E731
+    monkeypatch.setattr(store, "finish_ingest_run", record)
+    monkeypatch.setattr(store, "finish_ingest_run_and_drop_row", record)   # 何も入れ替えないうちの失敗は行を消す記録で閉じる
 
     r = client.post("/worlds/w1/rag_regenerate_rules")
     assert r.status_code == 202, r.text

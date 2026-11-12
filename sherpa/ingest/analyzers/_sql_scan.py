@@ -408,12 +408,17 @@ def _function_from_positions(keyword_scan: str) -> frozenset:
 
 
 def table_refs(sanitized: str, *, base_offset: int = 0) -> list:
+    """`table_ref_spans` の `(name, offset)` だけ。"""
+    return [(name, start) for name, start, _end in table_ref_spans(sanitized, base_offset=base_offset)]
+
+
+def table_ref_spans(sanitized: str, *, base_offset: int = 0) -> list:
     """`sanitized` から `FROM`/`JOIN`/`INSERT INTO`/`MERGE INTO`/`UPDATE`/`DELETE FROM` 直後のテーブル名候補を `[(name, offset), ...]`（出現順）で返す。schema を書いた参照の `name` は修飾名 `SCHEMA.NAME`（解決側が schema で引く）、書いていなければ `NAME`。
 
     文ごとに走査し、CTE 名の除外はその文の中だけで有効。
     カンマ区切りの複数テーブル・別名は読み飛ばす。`:`・`(`・`#`/`$` で始まる項目は打ち切る。
     `FROM`/`JOIN` では未修飾の CTE 名・`LATERAL`・DB link 先を除く。関数呼び出しの括弧（識別子の直後の `(`）の直下の `FROM`（`EXTRACT(… FROM 列)` など）は表の句として読まない。ただし括弧の中が `SELECT`/`WITH` で始まる副問い合わせは読む。句キーワードの探索は `_blank_quoted_idents` の結果に対して行う。
-    `offset` はテーブル名トークンの開始位置に `base_offset` を加えた値。
+    戻りは `[(name, 開始, 終わり), ...]`。開始・終わりは原文の上のテーブル名トークン（修飾部を含む）の位置に `base_offset` を加えた値（`name` は正規化済みで原文と長さが違う）。
     """
     refs: list = []
     for stmt_offset, stmt in _split_sql_statements(sanitized):
@@ -443,7 +448,7 @@ def table_refs(sanitized: str, *, base_offset: int = 0) -> list:
                 full = im.group(0).strip()
                 schema, simple_name, supported = table_schema_name(full)
                 simple = split_qualified(full)[-1]
-                pos = im.end()
+                pos = tok_end = im.end()
                 if pos < n and stmt[pos] == "@":  # Oracle の DB link は除外
                     dm = _DBLINK_SUFFIX.match(stmt, pos + 1)
                     pos = dm.end() if dm else pos + 1
@@ -457,7 +462,7 @@ def table_refs(sanitized: str, *, base_offset: int = 0) -> list:
                     break
                 normalized = TableName(schema, simple_name, supported)
                 if not (is_from_or_join and not qualified and normalized in cte):
-                    refs.append((normalized, base_offset + stmt_offset + im.start()))
+                    refs.append((normalized, base_offset + stmt_offset + im.start(), base_offset + stmt_offset + tok_end))
                 am = _ALIAS.match(stmt, pos)
                 if am and am.group("word").upper() not in _CLAUSE_STOP:
                     pos = am.end()  # 別名（`AS name`／`name`）を読み飛ばす

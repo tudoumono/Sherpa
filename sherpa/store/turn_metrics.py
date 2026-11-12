@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+from collections import OrderedDict
 
 from psycopg.types.json import Json
 
@@ -544,6 +546,18 @@ def _write_call_stats(c, message_id: int, answer: dict) -> None:
                   "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (message_id, *row))
 
 
+# 書込に失敗した message_id（新しい順に最大 `_FAILED_KEEP` 件）。回答を保存した側が `pop_failure` で拾い、回答に欠測の注記を足す。
+_FAILED_KEEP = 1000
+_failed: OrderedDict[int, None] = OrderedDict()
+_failed_lock = threading.Lock()
+
+
+def pop_failure(message_id: int) -> bool:
+    """`upsert_best_effort` がその message_id の書込に失敗していたか（拾ったら忘れる）。"""
+    with _failed_lock:
+        return _failed.pop(message_id, 0) is None
+
+
 def upsert_best_effort(c, *, message_id: int, conversation_id: int, created_at, lens: str | None,
                        personal: bool, answer: dict) -> bool:
     """`upsert()` を Postgres SAVEPOINT（`c.transaction()`）で保護して呼ぶ。書込失敗を呼び出し元のトランザクションへ伝播させない（欠けた行は `ensure_rows()` が後で埋める）。
@@ -555,6 +569,10 @@ def upsert_best_effort(c, *, message_id: int, conversation_id: int, created_at, 
                   created_at=created_at, lens=lens, personal=personal, answer=answer)
         return True
     except Exception as e:
+        with _failed_lock:
+            _failed[message_id] = None
+            while len(_failed) > _FAILED_KEEP:
+                _failed.popitem(last=False)
         _log.warning("turn_metrics 書込に失敗しました（回答の保存は継続・ensure_rows が後で埋めます）"
                     " message_id=%s: %s errno=%s",
                     message_id, type(e).__name__, getattr(e, "errno", None))

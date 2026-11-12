@@ -26,7 +26,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from _test_users import register_test_uid
-from sherpa import agentic_search, auth, documents, es_index, ext_api, store, worlds
+from sherpa import agentic_search, auth, documents, es_index, ext, ext_api, store, worlds
 from sherpa.api import app
 from sherpa.parts.read import fused_search
 
@@ -290,7 +290,7 @@ def test_convert_docx_roundtrip():
 ], ids=["extension", "size_limit", "zip_bomb"])
 def test_convert_rejects(monkeypatch, name, content, patch, status):
     for k, v in patch.items():
-        monkeypatch.setattr(ext_api, k, v)
+        monkeypatch.setattr(next(m for m in (ext.convert, ext.doc, ext.zipsafe) if hasattr(m, k)), k, v)  # 定数を読むモジュール
     r = _convert(name, content, _key("convrej")["key"])
     assert r.status_code == status, r.text
 
@@ -313,13 +313,13 @@ def test_convert_broken_file_is_unsupported_200_and_audited_as_failed_business_o
 
 def test_convert_tmpfile_cleaned(monkeypatch):
     created: list[Path] = []
-    orig_to_markdown = ext_api.office_md.to_markdown
+    orig_to_markdown = ext.convert.office_md.to_markdown
 
     def _spy(path):
         created.append(Path(path))
         return orig_to_markdown(path)
 
-    monkeypatch.setattr(ext_api.office_md, "to_markdown", _spy)
+    monkeypatch.setattr(ext.convert.office_md, "to_markdown", _spy)
     r = _convert("clean.docx", _make_docx_bytes(), _key("tmpclean")["key"])
     assert r.status_code == 200, r.text
     assert created, "to_markdown が呼ばれていない（スパイ未到達）"
@@ -347,7 +347,7 @@ def test_search_unknown_scope_422():
 def test_search_failure_audits_normalized_prefix(monkeypatch, patch, allowed, world, scope_in,
                                                  scope_audited, status, outcome, reason):
     if patch == "scope_oserror":
-        monkeypatch.setattr(ext_api.scope_mod, "valid_scope_paths", _raise(
+        monkeypatch.setattr(ext.search.scope_mod, "valid_scope_paths", _raise(
             OSError("simulated permission error during scope validation")))
     elif patch == "registry_down":
         monkeypatch.setattr(worlds, "resolve_external_world", _raise(
@@ -424,7 +424,7 @@ def test_search_degraded_all_engines_down(monkeypatch):
 
 
 def test_search_filters_nonexistent_docs(monkeypatch):
-    """削除直後の窓で ES 索引に古いまま残る doc_id は返さない（`documents.world_rel_set` の実在フィルタ）。"""
+    """削除直後の窓で ES 索引に古いまま残る doc_id は返さない（`documents.existing_rels` の実在フィルタ）。"""
     def _hit(rel):
         return {"key": rel, "doc_id": rel, "path": rel, "line": 1, "snippet": "s",
                 "engine_score": 1.0, "judgement": None, "paths": None}
@@ -432,8 +432,8 @@ def test_search_filters_nonexistent_docs(monkeypatch):
     monkeypatch.setattr(fused_search, "_search_keyword",
                         lambda world, query, sp, k, settings, layer=None: (
                             [_hit("real.md"), _hit("deleted.md")], None))
-    monkeypatch.setattr(documents, "world_rel_set",
-                        lambda world=None, root=None, strict=False, **kw: {"real.md"})
+    monkeypatch.setattr(documents, "existing_rels",
+                        lambda world, rels, **kw: {r for r in rels if r in {"real.md"}})
 
     r = _search({"world": "v1", "query": "x", "engines": ["keyword"]}, _key("realfilter")["key"])
     assert r.status_code == 200, r.text
@@ -460,7 +460,7 @@ def test_search_audit_written():
 
 def _stub_engines(monkeypatch, graph_result, keyword_docs=()):
     """keyword は固定ヒット、graph は `run_impact` 相当の結果を実の `_graph_hits` で変換する（ES/Neo4j は使わない）。"""
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, root=None, strict=False, **kw: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     monkeypatch.setattr(fused_search, "_search_keyword",
                         lambda world, query, sp, k, settings, layer=None: ([
                             {"key": d, "doc_id": d, "path": d, "line": 1, "snippet": "s",
@@ -473,11 +473,6 @@ def _stub_engines(monkeypatch, graph_result, keyword_docs=()):
 
     monkeypatch.setattr(fused_search, "_search_graph", _graph)
     return seen
-
-
-class _AllDocs:
-    def __contains__(self, item):
-        return True
 
 
 _GRAPH_RESULT = {
@@ -510,7 +505,7 @@ def test_search_coverage_shape_and_graph_origin(monkeypatch):
 def test_search_overload_is_degraded_detail_without_coverage(monkeypatch):
     from sherpa.ingest.world_neo4j import GraphQueryOverloadError
 
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, root=None, strict=False, **kw: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
 
     @contextmanager
     def _session():
@@ -772,7 +767,7 @@ def test_doc_not_found_404(world, path):
 
 
 def test_doc_size_limit(monkeypatch):
-    monkeypatch.setattr(ext_api, "_DOC_MAX_BYTES", 10)
+    monkeypatch.setattr(ext.doc, "_DOC_MAX_BYTES", 10)
     assert _doc("v1", _TAX_DOC, _key("docsize")["key"]).status_code == 413
 
 
@@ -884,7 +879,7 @@ def test_doc_serving_safety(tmp_path, monkeypatch, case):
     outside = tmp_path / "outside"
     outside.mkdir()
     for k, v in patch.items():
-        monkeypatch.setattr(ext_api, k, v)
+        monkeypatch.setattr(next(m for m in (ext.convert, ext.doc, ext.zipsafe) if hasattr(m, k)), k, v)  # 定数を読むモジュール
     content = setup(root, outside)
     _mock_external_world(monkeypatch, root, world_dir=world_dir)
 
@@ -1508,9 +1503,9 @@ def test_request_id_present_on_representative_error_statuses(monkeypatch):
         (422, _search({"world": "v1", "query": "x", "scope_paths": ["no-such-scope-xyz"]}, plain,
                            "probe-422")),
     ]
-    monkeypatch.setattr(ext_api, "_CONVERT_MAX_BYTES", 10)
+    monkeypatch.setattr(ext.convert, "_CONVERT_MAX_BYTES", 10)
     cases.append((413, _convert("big.docx", b"x" * 100, plain, "probe-413")))
-    monkeypatch.setattr(ext_api.ratelimit, "check_ext_api_rate_limit", lambda key_id: 3)
+    monkeypatch.setattr(ext.auth.ratelimit, "check_ext_api_rate_limit", lambda key_id: 3)
     cases.append((429, _capabilities(plain, "probe-429")))
     for status, r in cases:
         assert r.status_code == status, r.text
@@ -1681,7 +1676,7 @@ def test_audit_write_does_not_block_event_loop(monkeypatch):
         release.wait(timeout=5)
         return orig_write(pending, *a, **kw)
 
-    monkeypatch.setattr(ext_api, "_write_pending_audit", _slow_write)
+    monkeypatch.setattr(ext.audit, "_write_pending_audit", _slow_write)
     rid = f"probe-evloop-{_sfx()}"
 
     async def _run():

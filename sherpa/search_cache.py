@@ -12,10 +12,13 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import time
 from pathlib import Path
 
 from . import scope_infer, worlds
+
+_DEADLINE_CHECK_ENTRIES = 256  # フォルダ内の列挙中に `deadline` を再確認する間隔
 
 _log = logging.getLogger("sherpa")
 
@@ -48,7 +51,7 @@ def _stamp() -> str:
              sorted(text_kind.SENSITIVE_EXT), text_kind.MAX_BYTES, sorted(text_kind._SENSITIVE_NAME_EXACT),
              text_kind._SENSITIVE_NAME_PREFIXES, text_kind.NOISE_NAME_PREFIXES,
              sorted(corpus_docs._NONCODE_DOCTYPE.items()), sorted(corpus_docs._OFFICE_DOCTYPE.items()),
-             text_encoding.UNDETERMINED_RATIO, text_encoding.DETECT_CAP_BYTES)
+             text_encoding.UNDETERMINED_RATIO, text_encoding.DETECT_CAP_BYTES, text_encoding.DETECT_VERSION)
     return f"{_SCHEMA}:{hashlib.sha1(repr(parts).encode('utf-8')).hexdigest()}"
 
 
@@ -87,7 +90,8 @@ def _connect(world: str) -> sqlite3.Connection | None:
             " mtime_ns INTEGER, payload TEXT);"
             "CREATE TABLE IF NOT EXISTS readmeta(dev INTEGER, ino INTEGER, size INTEGER, mtime_ns INTEGER,"
             " params TEXT, payload TEXT, PRIMARY KEY(dev, ino, size, mtime_ns, params));"
-            "CREATE TABLE IF NOT EXISTS pages(key TEXT PRIMARY KEY, created REAL, sig TEXT, payload TEXT);")
+            "CREATE TABLE IF NOT EXISTS pages(key TEXT PRIMARY KEY, created REAL, sig TEXT, payload TEXT);"
+            "CREATE TABLE IF NOT EXISTS listing(ledger_at TEXT, rel TEXT, payload TEXT, PRIMARY KEY(ledger_at, rel));")
         stamp = _stamp()
         row = con.execute("SELECT v FROM meta WHERE k='stamp'").fetchone()
         if row is None or row[0] != stamp:
@@ -95,6 +99,7 @@ def _connect(world: str) -> sqlite3.Connection | None:
             con.execute("DELETE FROM classify")
             con.execute("DELETE FROM readmeta")
             con.execute("DELETE FROM pages")
+            con.execute("DELETE FROM listing")
             con.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('stamp', ?)", (stamp,))
             con.execute("COMMIT")
         return con
@@ -223,20 +228,117 @@ def read_meta_put(world: str, st: os.stat_result, params: str, payload: dict) ->
         con.close()
 
 
-def tree_signature(dirs) -> str:
+def _scoped_fd_supported() -> bool:
+    return (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+            and os.open in os.supports_dir_fd and os.scandir in os.supports_fd)
+
+
+def _DIR_FLAGS() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _fold_dir(fd: int, path: str, h, deadline: float | None) -> bool:
+    """`fd` のフォルダの更新時刻を畳み、子のフォルダへリンクを辿らずに降りる。列挙・open の失敗（消えた子も含む）が 1 つでもあれば False（署名を作らない）。"""
+    if deadline is not None and time.monotonic() > deadline:
+        raise scope_infer.ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
+    names: list[str] = []
+    try:
+        h.update(f"{path}\0{os.fstat(fd).st_mtime_ns}\n".encode("utf-8", "surrogateescape"))
+        with os.scandir(fd) as it:
+            for i, e in enumerate(it):
+                if (deadline is not None and i > 0 and i % _DEADLINE_CHECK_ENTRIES == 0
+                        and time.monotonic() > deadline):
+                    raise scope_infer.ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
+                if e.is_dir(follow_symlinks=False) and not scope_infer.is_vcs_dir_name(e.name):
+                    names.append(e.name)
+    except OSError:
+        return False
+    ok = True
+    for name in sorted(names):
+        child = os.path.join(path, name)
+        try:
+            cfd = os.open(name, _DIR_FLAGS(), dir_fd=fd)
+        except OSError:
+            ok = False
+            continue
+        try:
+            if not _fold_dir(cfd, child, h, deadline):
+                ok = False
+        finally:
+            os.close(cfd)
+    return ok
+
+
+def _fold_scope(root: str, scope_paths, h, deadline: float | None) -> bool:
+    """範囲があるときの署名。根から範囲の起点まで 1 段ずつリンクを辿らずに開き、途中のフォルダの更新時刻と範囲の部分木（互いに含み合うものは外側 1 つ）を `h` に畳む。選んだ範囲そのもの（根から範囲までの途中を含む）が実在しないときだけ見ない。途中・部分木・根がリンク・フォルダでない・読めないときは False（署名を作らない）。"""
+    paths = sorted({s for s in scope_paths if not any(x in ("", ".", "..") for x in s.split("/"))},
+                   key=lambda x: (x.count("/"), x))
+    top: list[str] = []
+    for s in paths:
+        if not any(s == t or s.startswith(t + "/") for t in top):
+            top.append(s)
+    for s in top:
+        parts = s.split("/")
+        try:
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            h.update(f"{root}\0!\n".encode("utf-8", "surrogateescape"))
+            continue
+        except OSError:
+            return False
+        d = root
+        try:
+            for i, name in enumerate(parts):
+                try:
+                    h.update(f"{d}\0{os.fstat(fd).st_mtime_ns}\n".encode("utf-8", "surrogateescape"))
+                except OSError:
+                    h.update(f"{d}\0!\n".encode("utf-8", "surrogateescape"))
+                d = os.path.join(d, name)
+                try:
+                    nfd = os.open(name, _DIR_FLAGS(), dir_fd=fd)
+                except FileNotFoundError:
+                    h.update(f"{d}\0!\n".encode("utf-8", "surrogateescape"))
+                    break
+                except OSError:
+                    return False
+                os.close(fd)
+                fd = nfd
+                if i == len(parts) - 1 and not _fold_dir(fd, d, h, deadline):
+                    return False
+        finally:
+            os.close(fd)
+    return True
+
+
+def tree_signature(dirs, deadline: float | None = None, scope_paths=None) -> str | None:
     """フォルダ木の署名。フォルダ（ファイルは見ない）の更新時刻を畳む。ファイルの追加・削除・改名で変わる。
     版管理の記録のフォルダ（`scope_infer.VCS_DIR_NAMES`）には入らず、シンボリックリンクは辿らない。
+    `scope_paths`（正規化済みの範囲）があれば、各 `dirs` の中の範囲の部分木と、根から範囲の親までの途中のフォルダだけを見る。
+    範囲の途中にリンクがある・開けない、またはこの環境で fd 指定の走査ができないときは None（キャッシュを使わない）。
+    `deadline`（`time.monotonic()` 系の絶対期限）を渡すと、フォルダごと・`_DEADLINE_CHECK_ENTRIES` 件ごとに確認し、超過で `scope_infer.ScopeWalkDeadlineExceeded` を送出する。
     """
     h = hashlib.sha1()
+    if scope_paths is not None:
+        if not _scoped_fd_supported():
+            return None
+        for root in dirs:
+            if not _fold_scope(str(root), scope_paths, h, deadline):
+                return None
+        return h.hexdigest()
     for root in dirs:
         stack = [str(root)]
         while stack:
+            if deadline is not None and time.monotonic() > deadline:
+                raise scope_infer.ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
             d = stack.pop()
             try:
                 mt = os.stat(d).st_mtime_ns
                 h.update(f"{d}\0{mt}\n".encode("utf-8", "surrogateescape"))
                 with os.scandir(d) as it:
-                    for e in it:
+                    for i, e in enumerate(it):
+                        if (deadline is not None and i > 0 and i % _DEADLINE_CHECK_ENTRIES == 0
+                                and time.monotonic() > deadline):
+                            raise scope_infer.ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")
                         if e.is_dir(follow_symlinks=False) and not scope_infer.is_vcs_dir_name(e.name):
                             stack.append(e.path)
             except OSError:
@@ -273,5 +375,36 @@ def pages_put(world: str, key: str, sig: str, payload: dict) -> None:
                     "(SELECT key FROM pages ORDER BY created DESC LIMIT ?)", (now - _PAGES_TTL, _PAGES_MAX_ROWS))
     except sqlite3.Error as e:
         _log.debug("search_cache: 候補一覧の書き込みに失敗しました (%s)", type(e).__name__)
+    finally:
+        con.close()
+
+
+def listing_get(world: str, ledger_at: str) -> dict:
+    """台帳の時点 `ledger_at` で保存済みの一覧用の分類（`{rel: payload}`）。保存先が無い・読めないときは空。"""
+    con = _connect(world)
+    if con is None:
+        return {}
+    try:
+        return {rel: json.loads(payload) for rel, payload in
+                con.execute("SELECT rel, payload FROM listing WHERE ledger_at=?", (ledger_at,))}
+    except (sqlite3.Error, ValueError):
+        return {}
+    finally:
+        con.close()
+
+
+def listing_put(world: str, ledger_at: str, entries: dict) -> None:
+    """一覧用の分類を台帳の時点つきで保存する。別の時点の分は捨てる。保存先が無い・書けないときは何もしない。"""
+    con = _connect(world)
+    if con is None:
+        return
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("DELETE FROM listing WHERE ledger_at<>?", (ledger_at,))
+        con.executemany("INSERT OR REPLACE INTO listing(ledger_at, rel, payload) VALUES(?,?,?)",
+                        [(ledger_at, rel, json.dumps(p, ensure_ascii=False)) for rel, p in entries.items()])
+        con.execute("COMMIT")
+    except sqlite3.Error as e:
+        _log.debug("search_cache: 一覧の分類の書き込みに失敗しました (%s)", type(e).__name__)
     finally:
         con.close()

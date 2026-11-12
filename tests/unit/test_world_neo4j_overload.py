@@ -22,6 +22,7 @@ from neo4j.exceptions import Neo4jError
 
 import _fresh_import as FI   # noqa: E402   # import-time 固定 env 定数の実プロセス検証
 from sherpa.ingest import world_neo4j as wn
+from tests._replace_row import offline_row
 
 
 class _FakeRecord:
@@ -114,12 +115,12 @@ class _BfsSession(_FakeSession):
     def run(self, query, **params):
         self.calls.append((query, params))
         text = query.text if hasattr(query, "text") else query
-        if "SherpaMeta" in text:
-            return _FakeResult([{"c": 1, "era": wn.GRAPH_SCHEMA_ERA}])
         if "s.canonical_id IN $starts" in text:
             return _FakeResult(self.starts)
         if "$seen" in text:
             return _FakeResult([])
+        if "m.schema_era AS era" in text:
+            return _FakeResult([{"c": 1, "era": wn.GRAPH_SCHEMA_ERA}])
         self.expansions += 1
         return _FakeResult(self.impact_rows if self.expansions == 1 else [])
 
@@ -224,7 +225,13 @@ def test_impact_max_depth_default_is_shared_by_signatures_and_ignores_env():
     assert out["impact_max_depth"] == 10
     assert out["world_impact_depth"] == 10
     assert out["run_world_impact_depth"] == 10
-    assert out["batch_rows"] == 5000
+    assert out["batch_rows"] == 1000
+
+
+def test_write_batch_rows_is_configurable():
+    out = json.loads(FI.run_script(_neo4j_env_constants_script(),
+                                   env={"SHERPA_NEO4J_WRITE_BATCH_ROWS": "50"}))
+    assert out["batch_rows"] == 50
 
 
 # ---- resolve_world_entity / world_impact: overload が fail-loud で伝播 ------
@@ -315,26 +322,24 @@ def test_world_impact_passes_query_timeout():
     assert s.calls[0][1]["starts"] == ["start:1"] and s.calls[1][1]["frontier"] == ["start:1"]
 
 
-# ---- GRAPH-MEM（2026-09-04）: load_world の UNWIND バッチ化 -----------------
+# ---- load_world の世代付き小分け書き込み -----------------------------------
 # `load_world` は `GraphDatabase.driver(...)` を関数内で遅延 import して直接呼ぶため、
-# `neo4j.GraphDatabase.driver` 自体を fake に差し替える（実 Neo4j 不要）。実 driver の managed
-# transaction が本当にロールバックすることの確認（fake では検証できない）と、バッチ行数を変えても
-# 最終結果が同一であることの確認は `tests/integration/test_world_neo4j_batch_load.py` に置く。
+# `neo4j.GraphDatabase.driver` 自体を fake に差し替える（実 Neo4j 不要）。旧世代の可視性と次回掃除、
+# バッチ行数を変えても最終結果が同一であることは `tests/integration/test_world_neo4j_batch_load.py` に置く。
 
 class _FakeCountResult:
-    """`tx.run(...).single()["c"]` に応えるだけの最小スタブ（`load_world` が投入後に刻む
-    node_count/edge_count の件数照会向け・本ファイルの対象である UNWIND バッチ本体の検証には
-    無関係のため値は固定 0 でよい）。"""
+    """`tx.run(...).single()` に応える最小スタブ。"""
+
+    def __init__(self, row=None):
+        self.row = row or {"c": 0}
 
     def single(self):
-        return {"c": 0}
+        return self.row
 
 
 class _FakeBatchTx:
     """`tx.run(cypher, **params)` を記録する最小スタブ。`fail_on_call`（1始まりの通し番号）に
-    達したら例外を投げる——`session.execute_write` に渡す関数が例外を投げれば実 driver は tx を
-    コミットしない（＝ロールバック）契約を、この fake は `_FakeBatchSession.committed` が
-    立たないことで表現する。"""
+    達したら例外を投げる。成功した明示トランザクションだけを session の commit 数へ反映する。"""
 
     def __init__(self, log, fail_on_call=None):
         self.log = log
@@ -344,9 +349,38 @@ class _FakeBatchTx:
     def run(self, cypher, **params):
         self._i += 1
         self.log.append((cypher, params))
-        if self.fail_on_call is not None and self._i == self.fail_on_call:
+        if self.fail_on_call is not None and len(self.log) == self.fail_on_call:
             raise RuntimeError("boom mid-batch")
+        if "DETACH DELETE" in cypher:
+            return _FakeCountResult({"c": 0})
+        if "RETURN count(n) AS c" in cypher:
+            count = sum(len(p.get("rows", [])) for q, p in self.log if "MERGE (x:Entity" in q)
+            return _FakeCountResult({"c": count})
+        if "RETURN count(r) AS c" in cypher:
+            count = sum(len(p.get("rows", [])) for q, p in self.log if "MERGE (a)-[r:" in q)
+            return _FakeCountResult({"c": count})
         return _FakeCountResult()
+
+
+class _FakeExplicitTx:
+    """`session.begin_transaction()` の最小スタブ。`commit()` で session.committed を立て、確定せずに抜けたら確定しない。"""
+
+    def __init__(self, session, inner):
+        self.session = session
+        self.inner = inner
+
+    def run(self, cypher, **params):
+        return self.inner.run(cypher, **params)
+
+    def commit(self):
+        self.session.committed = True
+        self.session.commits += 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
 
 
 class _FakeBatchSession:
@@ -355,15 +389,22 @@ class _FakeBatchSession:
         self.fail_on_call = fail_on_call
         self.schema_calls: list[str] = []
         self.committed = False
+        self.commits = 0
 
     def run(self, cypher, **params):             # schema コマンド（制約作成）はここを通る
         self.schema_calls.append(cypher)
+        if "active_generation AS g" in cypher:
+            return _FakeCountResult({"g": None})
+        return _FakeCountResult()
 
     def execute_write(self, fn):
         tx = _FakeBatchTx(self.log, self.fail_on_call)
         result = fn(tx)                           # 例外はそのまま伝播＝ committed は立たない
         self.committed = True
         return result
+
+    def begin_transaction(self):
+        return _FakeExplicitTx(self, _FakeBatchTx(self.log, self.fail_on_call))
 
     def __enter__(self):
         return self
@@ -417,7 +458,7 @@ def test_load_world_sends_n_unwind_batches_for_batch_rows_boundary(monkeypatch):
     log: list = []
     _patch_fake_driver(monkeypatch, log)
     nodes = [_node("c1"), _node("c2"), _node("c3")]
-    n, m = wn.load_world(nodes, [], "w1", "bolt://x", "u", "p")
+    n, m = wn.load_world(nodes, [], "w1", "bolt://x", "u", "p", row=offline_row("w1"))
     assert (n, m) == (3, 0)
     unwind_calls = [(cypher, params) for cypher, params in log if "UNWIND" in cypher]
     assert len(unwind_calls) == 2
@@ -425,12 +466,12 @@ def test_load_world_sends_n_unwind_batches_for_batch_rows_boundary(monkeypatch):
 
 
 def test_load_world_single_batch_when_rows_fit_default(monkeypatch):
-    """既定バッチ行数（5000）以下なら1回の UNWIND に収まる（小 world で余計な往復を増やさない）。"""
+    """既定バッチ行数（1000）以下なら1回の UNWIND に収まる（小 world で余計な往復を増やさない）。"""
     log: list = []
     _patch_fake_driver(monkeypatch, log)
     nodes = [_node("c1"), _node("c2")]
     edges = [{"src": "c1", "dst": "c2", "type": "INVOKES"}]
-    wn.load_world(nodes, edges, "w1", "bolt://x", "u", "p")
+    wn.load_world(nodes, edges, "w1", "bolt://x", "u", "p", row=offline_row("w1"))
     unwind_calls = [(cypher, params) for cypher, params in log if "UNWIND" in cypher]
     assert len(unwind_calls) == 2                 # ノード1バッチ＋エッジ1バッチ
     assert len(unwind_calls[0][1]["rows"]) == 2
@@ -439,18 +480,18 @@ def test_load_world_single_batch_when_rows_fit_default(monkeypatch):
 
 def test_load_world_propagates_exception_on_mid_batch_failure(monkeypatch):
     """途中バッチで例外が起きたら `load_world` はそのまま伝播する（呼び出し元 worker.py は成功を
-    確定しない・pre-invalidate 済みの last_sig がそのまま次回 sync を強制する）。tx はコミットされず
-    （fake の `committed` が立たない）、driver は必ず close される（finally 節・既存契約の回帰確認）。
+    確定しない・pre-invalidate 済みの last_sig がそのまま次回 sync を強制する）。失敗したバッチだけは
+    コミットされず、先に確定した非公開バッチは次回の前掃除に残る。driver は必ず close される。
     """
     monkeypatch.setattr(wn, "_NEO4J_BATCH_ROWS", 2)
     log: list = []
-    # DETACH DELETE(1回目) + ノード batch1(2件・2回目) + ノード batch2(1件・3回目) → 3回目で失敗。
+    # 残骸削除(1回目) + ノード batch1(2件・2回目) + ノード batch2(1件・3回目) → 3回目で失敗。
     driver = _patch_fake_driver(monkeypatch, log, fail_on_call=3)
     nodes = [_node("c1"), _node("c2"), _node("c3")]
     with pytest.raises(RuntimeError, match="boom mid-batch"):
-        wn.load_world(nodes, [], "w1", "bolt://x", "u", "p")
+        wn.load_world(nodes, [], "w1", "bolt://x", "u", "p", row=offline_row("w1"))
     session = driver.sessions[-1]
-    assert session.committed is False
+    assert session.commits == 2                 # 残骸削除とbatch1は確定済み、失敗batchは未確定
     assert driver.closed is True
     unwind_calls = [c for c in log if "UNWIND" in c[0]]
     assert len(unwind_calls) == 2                 # batch1 は送信済み・batch2 は送信して例外
@@ -462,5 +503,64 @@ def test_load_world_unknown_vocab_rejected_before_any_write(monkeypatch):
     _patch_fake_driver(monkeypatch, log)
     nodes = [_node("c1", label="NotARealLabel")]
     with pytest.raises(ValueError):
-        wn.load_world(nodes, [], "w1", "bolt://x", "u", "p")
+        wn.load_world(nodes, [], "w1", "bolt://x", "u", "p", row=offline_row("w1"))
     assert log == []                               # 検証前に落ちるので tx すら開始しない
+
+
+class _MemoryPoolError(Exception):
+    code = "Neo.TransientError.General.MemoryPoolOutOfMemoryError"
+
+    def is_retryable(self):
+        return True
+
+
+class _OtherTransientError(Exception):
+    code = "Neo.TransientError.Transaction.DeadlockDetected"
+
+    def is_retryable(self):
+        return True
+
+
+class _CommitFailingSession:
+    """確定（commit）で、渡された例外を順に投げる session。投げ終わったら確定する。"""
+
+    def __init__(self, errors):
+        self.errors = list(errors)
+        self.attempts = 0
+
+    def begin_transaction(self):
+        session = self
+
+        class _Tx:
+            def run(self, cypher, **params):
+                return _FakeCountResult()
+
+            def commit(self):
+                session.attempts += 1
+                if session.errors:
+                    raise session.errors.pop(0)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        return _Tx()
+
+
+def test_graph_write_is_not_retried_after_the_write_memory_limit():
+    session = _CommitFailingSession([_MemoryPoolError("limit"), _MemoryPoolError("limit")])
+    with pytest.raises(_MemoryPoolError):
+        wn._write_world(session, lambda tx: ("n", "m"))
+    assert session.attempts == 1
+
+
+def test_other_transient_graph_write_failures_are_retried_once():
+    session = _CommitFailingSession([_OtherTransientError("deadlock")])
+    assert wn._write_world(session, lambda tx: ("n", "m")) == ("n", "m")
+    assert session.attempts == 2
+    session = _CommitFailingSession([_OtherTransientError("a"), _OtherTransientError("b")])
+    with pytest.raises(_OtherTransientError):
+        wn._write_world(session, lambda tx: ("n", "m"))
+    assert session.attempts == 2

@@ -100,18 +100,12 @@ PDF は `pdfplumber.open(path)` で両世代のページテキストを列（1 �
 ```python
 import difflib
 
-# 旧/新のソースは CP932（Shift_JIS）のことがあるため、決め打ちで utf-8 置換読みにせず実際の
-# 符号化を判定してから読む（unified_diff への入力は readlines() と同じく改行を残す＝keepends）。
+# 旧/新のソースは CP932（Shift_JIS）や EUC-JP のことがある。文字コードを Python で推測せず、UTF-8 で読めない
+# 原本は read_doc（Sherpa の共通の判定で読む）か compare_documents で読む（unified_diff への入力は
+# readlines() と同じく改行を残す＝keepends）。
 def read_src(p):
-    with open(p, "rb") as f:
-        b = f.read()
-    if b.startswith(b"\xef\xbb\xbf"):
-        return b[3:].decode("utf-8", "replace")
-    try:
-        return b.decode("utf-8")
-    except UnicodeDecodeError:
-        u, c = b.decode("utf-8", "replace"), b.decode("cp932", "replace")
-        return c if c.count("�") < u.count("�") else u
+    with open(p, encoding="utf-8-sig") as f:
+        return f.read()   # UnicodeDecodeError ＝ CP932・EUC-JP の原本。その原本は read_doc で読む
 
 old_lines = read_src(old_path).splitlines(keepends=True)
 new_lines = read_src(new_path).splitlines(keepends=True)

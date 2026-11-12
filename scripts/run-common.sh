@@ -61,6 +61,13 @@ sherpa_env_default() {  # VAR...  （既に環境にあれば何もしない）
     line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${name}=" "$file" | tail -1 || true)"
     [ -n "$line" ] || continue
     value="${line#*=}"
+    case "$value" in [[:space:]]*\#*) [ -z "$(printf '%s' "${value%%#*}" | tr -d '[:space:]')" ] && value="" ;; esac   # 「= # …」は空の値
+    value="${value#"${value%%[![:space:]]*}"}"      # 「=」の後ろの空白を外す
+    case "$value" in   # compose と同じく、引用符の無い値は「空白＋#」から後、引用符の値は閉じた後ろの空白とコメントを外す
+      \"*) value="$(printf '%s' "$value" | sed -E 's/^("[^"]*")[[:space:]]*(#.*)?$/\1/')" ;;
+      \'*) value="$(printf '%s' "$value" | sed -E "s/^('[^']*')[[:space:]]*(#.*)?\$/\\1/")" ;;
+      *) value="$(printf '%s' "$value" | sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//')" ;;
+    esac
     value="${value%\"}"; value="${value#\"}"      # 前後の引用符だけ外す
     value="${value%\'}"; value="${value#\'}"
     printf -v "$name" '%s' "$value"
@@ -128,7 +135,7 @@ sherpa_compose() {
   # ES・Neo4j・OCR のメモリ上限を全体のメモリから決めて compose に渡す（scripts/lib/mem_budget.sh・割り振り済みなら何もしない）。
   # shellcheck source=scripts/lib/mem_budget.sh
   . "$ROOT/scripts/lib/mem_budget.sh"
-  sherpa_env_default SHERPA_OCR_MEMORY_LIMIT
+  mem_budget_load_env
   mem_budget_apply
   if [ -f "$file" ]; then
     docker compose --env-file "$file" "$@"

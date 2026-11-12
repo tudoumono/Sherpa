@@ -13,6 +13,7 @@ from _world_registry import register_test_world
 
 from scripts.bench import eval_gate
 from sherpa.ingest import world_neo4j
+from tests._replace_row import offline_row
 
 WORLD = "impact_eval_s"          # 使い捨て（テスト後に削除）
 EVAL_DEPTH = 30                  # S の gold の最長の鎖は 13 段（既定の IMPACT_MAX_DEPTH=10 を超える）
@@ -31,7 +32,7 @@ def session(eval_set):
     env = world_neo4j._env()
     drv = GraphDatabase.driver(env["uri"], auth=(env["user"], env["pw"]))
     try:
-        world_neo4j.load_world(graph.nodes, graph.edges, WORLD, env["uri"], env["user"], env["pw"])
+        world_neo4j.load_world(graph.nodes, graph.edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))
         register_test_world(WORLD)
         with drv.session() as s:
             yield s

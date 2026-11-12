@@ -177,3 +177,23 @@ def test_delete_conversation_blocked_while_codex_execution_lock_held():
     assert r2.status_code == 200, r2.text
     assert store.owns_conversation(uid, cid) is False, "解放後の削除で DB 行が消えていない"
     assert not d.exists(), "解放後の削除でセッションディレクトリが消えていない"
+
+
+def test_delete_conversation_reports_when_session_dir_cannot_be_removed(monkeypatch):
+    """継続セッションを消せなかったら、会話の削除は成功でも sessions_removed:false で知らせる。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid, pw = f"convdelu6{sfx}", f"ConvDelPw6{sfx}"
+    _mk_user(uid, pw)
+    cid = store.create_conversation(user_id=uid, world="v1", title="会話6")["id"]
+    d = _mk_session_files(uid, cid)
+
+    def _fail(target, base):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(deps, "_remove_codex_session_dir", _fail)
+    r = _login(uid, pw).delete(f"/conversations/{cid}")
+    assert r.status_code == 200, r.text
+    assert r.json()["sessions_removed"] is False
+    assert d.is_dir()

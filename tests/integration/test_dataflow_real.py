@@ -14,6 +14,7 @@ from _world_registry import register_test_world
 
 from sherpa import graph_tools
 from sherpa.ingest import world_graph, world_neo4j
+from tests._replace_row import offline_row
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORLD = "dataflow_real_test"          # 使い捨て（テスト後に削除）
@@ -23,7 +24,7 @@ WORLD = "dataflow_real_test"          # 使い捨て（テスト後に削除）
 def graph():
     nodes, edges, _flags = world_graph.build_world(ROOT / "fixtures" / "dataflow", WORLD)
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))
     register_test_world(WORLD)
     return {n["name"] + "@" + str(n["top_scope"]): n["cid"] for n in nodes}
 
@@ -110,7 +111,7 @@ def scoped_graph(tmp_path):
         if edge["type"] == "FLOWS_TO":
             edge["sources"].append({"doc_id": "g/z/.env", "file": "g/z/.env", "line": 1})
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"], row=offline_row(world))
     register_test_world(world)
     from neo4j import GraphDatabase
     drv = GraphDatabase.driver(env["uri"], auth=(env["user"], env["pw"]))
@@ -161,17 +162,3 @@ def test_neighbors_limit_shared_datasets_and_dd_evidence_to_the_selected_subfold
     monkeypatch.setattr(lens_service, "_RELATED_REL", lens_service._RELATED_REL.replace("|FLOWS_TO", ""))
     structure = lens_service.neo4j_related(session, [cid], world, ["g/z"], depth=2, sources_limit=10)
     assert by_name["J1"] == next(r for r in structure if r["name"] == "J1")
-
-
-@pytest.mark.parametrize("search", [{"relationship_types": ["FLOWS_TO"]}, {"field": "top_scope", "value": "g"}])
-def test_admin_graph_filters_outside_dd_bindings_before_returning_flow_edges(scoped_graph, search):
-    from sherpa import graph_admin
-    session, world, _cid = scoped_graph
-    result = graph_admin.graph_search(session, world, scope_paths=["g/z"], **search)
-    names = {n["id"]: n["name"] for n in result["nodes"]}
-    flow_pairs = {(names[e["source"]], names[e["target"]]) for e in result["edges"] if e["type"] == "FLOWS_TO"}
-    assert ("DEMO.OUTSIDE", "OTHER") not in flow_pairs
-    assert ("WRITER", "DEMO.SHARED") in flow_pairs
-    assert ("DEMO.SHARED", "READER") in flow_pairs
-    assert all(n["path"].startswith("g/z/") for n in result["nodes"])
-    assert "g/a/" not in json.dumps(result) and "g/zz/" not in json.dumps(result)

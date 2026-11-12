@@ -6,7 +6,7 @@ OS へ返しにくいため、重い処理のたびにプロセスごと捨て�
 （`scripts/run-ingest-worker.sh`・systemd の `sherpa-ingest.service`）。
 ① 起動 → ② 持ち主の居ない extracting の run を中断へ格下げ → ③ 中断した取り込みの再開依頼 →
 ③' 旧形式の埋め込みキャッシュの写し替え（依頼を拾う前。待っている依頼では止めず、停止要求でだけ止める）→
-④ 待機（短い間隔で確認・版の違う依頼しか無ければ waiting_version。依頼が無いあいだは旧形式の埋め込みキャッシュを 1 資料フォルダずつ新形式へ写し替える）→
+④ 待機（短い間隔で確認・版の違う依頼しか無ければ waiting_version。依頼が無いあいだは旧形式の埋め込みキャッシュを 1 資料フォルダずつ新形式へ写し替え、公開済みの OCR 観測が検索へ反映されていなければ更新を予約する）→
 ⑤ 1 件拾って実行 → LLM 成形の後追い → 埋め込みキャッシュの写し替え → ⑥ 終了。
 停止要求（SIGTERM）は処理中の 1 件の区切りで止まり、次の起動で続きから再開する。
 設計: docs/design/operations.md「取り込みワーカーと版の照合」
@@ -18,11 +18,13 @@ import os
 import signal
 import threading
 import time
+from datetime import datetime, timezone
 
-from .. import app_version, store, webhooks
+from .. import app_version, proxy_bypass, store, webhooks
 from ..env_int import env_int
 from ..store import workers as store_workers
-from . import background, jobs, worker_state
+from ..store.replace_rows import ClaimedRun, ReplaceAborted, RowLockLost
+from . import background, connectivity_relay, jobs, llm_rewrite_failure, replace_guard, worker_state
 
 _log = logging.getLogger("sherpa")
 
@@ -30,6 +32,7 @@ POLL_SEC = 2.0                 # 待機中に依頼を確かめる間隔（env `
 RESUME_RECHECK_SEC = 30.0      # 起動の直後に間に合わなかった中断 run を拾い直す時刻
 METAFILE_FIRST_DELAY_SEC = 60.0
 METAFILE_INTERVAL_SEC = 300.0
+OCR_CATCHUP_INTERVAL_SEC = 60.0   # 公開済みの OCR 観測が検索へ反映されているかを確かめる間隔
 FOLLOWUP_CHECK_SEC = 2.0       # LLM 成形の途中で「待っている依頼があるか」を確かめる間隔
 
 _terminate = threading.Event()   # SIGTERM／SIGINT で立つ
@@ -47,16 +50,25 @@ class _Beat:
         self._world: str | None = None
         self._label: str | None = None     # run 以外の処理（LLM 成形）を状態ファイルへ出すときの表示名
         self._stop = threading.Event()
+        self._relay = connectivity_relay.Relay()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="sherpa-ingest-worker-beat")
 
     def start(self) -> None:
         self.write()
         self._thread.start()
+        self._poll_relay()  # 取り込み 1 件で終わるワーカーも、起動したときに頼みを 1 度見る
+
+    def _poll_relay(self) -> None:
+        try:
+            self._relay.poll()
+        except Exception:
+            _log.debug("つながりの確認の頼みの確認に失敗しました（best-effort）", exc_info=True)
 
     def stop(self, state: str) -> None:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=5)
+        self._relay.wait()
         with self._lock:
             self._state, self._run_id, self._world, self._label = state, None, None, None
         self.write()
@@ -88,22 +100,44 @@ class _Beat:
     def _loop(self) -> None:
         while not self._stop.wait(worker_state.BEAT_SEC):
             self.write()
+            self._poll_relay()
 
 
-def run_claimed(row: dict) -> None:
-    """拾った依頼 1 件を実行する。想定外の例外はここで捕まえ、終端に届かなかった run は failed へ落とす（最外周のセーフティネット）。"""
+def run_claimed(claimed: ClaimedRun) -> None:
+    """拾った依頼 1 件を実行する。想定外の例外はここで捕まえ、終端に届かなかった run は failed へ落とす（最外周のセーフティネット）。
+    入れ替えを続けられない例外（`ReplaceAborted`）は回を failed で終え、`interrupted` は行の lock を失ったときだけ立てる。回の lock は最後に接続を閉じて外す。
+    拾った行が消す仕事（`kind='delete'`）なら、依頼の操作に関わらず消去を実行する（途中で止まった消去を「更新」で作り直さない）。
+    """
+    row = claimed.run
     run_id, world, op = row["id"], row["version"], row.get("op")
+    proxy_bypass.apply()
     background.bind_run(run_id)
+    drop = None
     try:
+        held = replace_guard.row_for_run(world, run_id)
+        if held is not None and held.kind == "delete":
+            op = "delete"
         jobs.run_job(op, world, row.get("payload"), run_id)
     except Exception:
         _log.warning("取り込みの実行が未捕捉の例外で終了しました: world=%s op=%s run_id=%s",
                      world, op, run_id, exc_info=True)
+        try:
+            drop = replace_guard.refused_check(replace_guard.row_for_run(world, run_id), run_id)
+        except Exception:
+            _log.warning("入れ替えの行の確認に失敗しました（行は残す）: run_id=%s", run_id, exc_info=True)
+    except ReplaceAborted as e:
+        _log.warning("入れ替えを続けられないため取り込みを終えました: world=%s op=%s run_id=%s %s",
+                     world, op, run_id, e.__class__.__name__)
+        try:
+            store.fail_close_if_extracting(run_id, reason=f"replace_aborted:{e.__class__.__name__}",
+                                           interrupted=isinstance(e, RowLockLost))
+        except Exception:
+            _log.warning("入れ替えの中止の記録に失敗しました（best-effort）: run_id=%s", run_id, exc_info=True)
     finally:
         # 操作が terminal 化しなかった行（status='extracting' のまま）だけ failed へ落とす
         try:
             if store.fail_close_if_extracting(
-                    run_id, reason="background_worker_exited_without_terminal_status"):
+                    run_id, reason="background_worker_exited_without_terminal_status", drop=drop):
                 _log.warning("取り込みが run を terminal 化せずに終了したため failed へ格下げしました: "
                              "world=%s op=%s run_id=%s", world, op, run_id)
                 try:
@@ -114,17 +148,19 @@ def run_claimed(row: dict) -> None:
         except Exception:
             _log.warning("最外周の failed 格下げ自体に失敗しました（best-effort）: world=%s run_id=%s",
                          world, run_id, exc_info=True)
-        background.unbind_run()
+        finally:
+            background.unbind_run()
+            claimed.close()
 
 
 def process_one(worker_id: str, version: str | None, beat: _Beat | None = None) -> bool:
     """自分と同じ版の依頼を 1 件拾って実行する。拾えなければ False。（`main` の 1 回分。テストもこれを直接呼ぶ）"""
-    row = store.claim_queued_run(worker_id, version)
-    if row is None:
+    claimed = store.claim_queued_run(worker_id, version)
+    if claimed is None:
         return False
     if beat is not None:
-        beat.set_state("running", run_id=row["id"], world=row["version"])
-    run_claimed(row)
+        beat.set_state("running", run_id=claimed.run["id"], world=claimed.run["version"])
+    run_claimed(claimed)
     return True
 
 
@@ -163,13 +199,15 @@ def _run_followups(version: str | None, beat: _Beat) -> None:
         if _should_stop():
             break
         beat.set_state("running", world=world, label="AI整形")
+        started_at = datetime.now(timezone.utc)
         try:
             with background.followup_scope():
                 ingest_worker.llm_render_pass(world, should_stop=_should_stop)
         except background.LowDiskStop as e:
             _log.warning("LLM 成形の後追いをディスクの空き不足で止めました（自動では繰り返しません。空きを作って「更新」を押してください）: world=%s %s", world, e)
-        except Exception:
+        except (ReplaceAborted, Exception) as e:
             _log.warning("LLM 成形の後追いが失敗しました: world=%s", world, exc_info=True)
+            llm_rewrite_failure.record(world, e, started_at=started_at)
 
 
 def _migrate_embed_caches(version: str | None, beat: _Beat, tried: set, *, yield_to_queue: bool = True) -> bool:
@@ -228,12 +266,22 @@ def _resume() -> None:
         _log.warning("中断した取り込みの再開依頼に失敗しました（best-effort）", exc_info=True)
 
 
+def _ocr_catchup() -> None:
+    """公開済みの OCR 観測が検索へ反映されていなければ、通常の更新を予約する（同じ観測の世代につき自動は1回）。"""
+    from . import worker as ingest_worker
+    try:
+        ingest_worker.enqueue_published_observation_catchup()
+    except Exception:
+        _log.warning("公開済み OCR 観測の反映の予約に失敗しました（次回の周期で再試行）", exc_info=True)
+
+
 def _wait_and_process(worker_id: str, version: str | None, beat: _Beat) -> bool:
     """依頼を待ち、拾えたら実行する。実行した（プロセスを終える）なら True、停止要求で抜けたら False。"""
     poll = float(env_int("SHERPA_INGEST_POLL_SEC", int(POLL_SEC), 1, 60))
     started = time.monotonic()
     resume_at = started + RESUME_RECHECK_SEC
     meta_at = started + METAFILE_FIRST_DELAY_SEC
+    catchup_at = started
     migrated: set = set()   # このプロセスで写し替えを試した資料フォルダ（見送り・失敗を待機のたびに繰り返さない）
     # 依頼を拾う前に写し替える（取り込みの間に旧形式のキャッシュへ書き足して膨らませない）。
     if _migrate_embed_caches(version, beat, migrated, yield_to_queue=False):
@@ -254,6 +302,9 @@ def _wait_and_process(worker_id: str, version: str | None, beat: _Beat) -> bool:
         if now >= resume_at:
             resume_at = float("inf")
             _resume()
+        if now >= catchup_at:
+            catchup_at = now + OCR_CATCHUP_INTERVAL_SEC
+            _ocr_catchup()
         if now >= meta_at:
             if _metafile_pass():
                 return True
@@ -279,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     worker_id = worker_state.new_worker_id("ingest")
     version = app_version.current()
     store.init_schema()
+    proxy_bypass.apply()
     liveness = store_workers.hold_liveness_lock(worker_id)
     beat = _Beat(worker_id, version)
     beat.start()
@@ -289,7 +341,12 @@ def main(argv: list[str] | None = None) -> int:
         _resume()
         _wait_and_process(worker_id, version, beat)
     finally:
-        webhooks.flush(timeout=60)
+        try:
+            left = webhooks.drain(timeout=60)
+            if left:
+                _log.warning("送り切れなかった Webhook 通知 %d 件は配送待ちに残し、API のプロセスの送り手に引き継ぎます", left)
+        except Exception:
+            _log.warning("Webhook 通知の送信を完了できませんでした（配送待ちに残ります）", exc_info=True)
         beat.stop("stopping" if _terminate.is_set() else "idle")
         try:
             liveness.close()

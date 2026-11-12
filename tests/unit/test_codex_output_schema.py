@@ -100,7 +100,7 @@ def test_status_final_is_accepted_without_heuristic_continuation(tmp_path, monke
     assert len(calls) == 2
 
 
-# ===== 無効化（env 0 / Codex(Ollama)） =====
+# ===== Codex(Ollama) も使う・無効化（env 0） =====
 
 def test_env_disabled_skips_output_schema_and_uses_heuristic(tmp_path, monkeypatch):
     steps = [
@@ -116,14 +116,13 @@ def test_env_disabled_skips_output_schema_and_uses_heuristic(tmp_path, monkeypat
     assert "status" not in calls[1][-1]
 
 
-def test_ollama_construct_skips_output_schema(tmp_path, monkeypatch):
-    steps = [{"thread_id": "TH-SCHEMA-OLLAMA", "agent_messages": ["確認した結果、対象はありません。"],
+def test_ollama_construct_uses_output_schema(tmp_path, monkeypatch):
+    steps = [{"thread_id": "TH-SCHEMA-OLLAMA", "agent_messages": [_sj("final", "確認した結果、対象はありません。")],
               "usage": helper._usage()}]
     env, calls = _go(tmp_path, monkeypatch, steps, "schema-ollama", None,
                      prov=A.CodexProvider(ollama_base_url="http://localhost:11434"))
-    assert env["headline"] == "確認した結果、対象はありません。"
-    assert len(calls) == 1
-    assert "--output-schema" not in calls[0]
+    assert "確認した結果、対象はありません。" in env["headline"]
+    assert "--output-schema" in calls[0]
 
 
 # ===== 不正な最終出力は完了扱いにしない =====
@@ -253,7 +252,7 @@ def test_turn_failed_without_agent_message_is_explicit_failure(tmp_path, monkeyp
                      ctx=helper._ctx(uid="schema-turnfailed", conversation_id=None,
                                      message="偽 codex turn.failed テスト"))
     assert env["headline"] != "dispatch-headline"
-    assert "接続できません" in env["headline"] and "回答を返せずに終了しました" in env["headline"]
+    assert "接続できません" not in env["headline"] and "回答を返せずに終了しました" in env["headline"]
     assert not env.get("codex_stopped_early") and not env.get("codex_timed_out")
     assert len(calls) == 1
 

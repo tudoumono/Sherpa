@@ -11,6 +11,7 @@ from PIL import Image
 
 from sherpa import worlds
 from sherpa.ingest import evidence_render, human_md, office_md
+from tests._replace_row import offline_row
 
 
 def _setup(tmp_path, monkeypatch, world_id: str, make) -> tuple[Path, Path]:
@@ -19,7 +20,7 @@ def _setup(tmp_path, monkeypatch, world_id: str, make) -> tuple[Path, Path]:
     monkeypatch.setenv("SHERPA_DERIVED_DIR", str(tmp_path / "derived"))
     make(source)
     dmd = worlds.derived_md_dir(world_id)
-    assert office_md.build_derived(source, dmd, world_sig="s1").get("error") is None
+    assert office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w")).get("error") is None
     return source, dmd
 
 
@@ -46,7 +47,7 @@ def test_light_refresh_drops_the_slot_so_no_second_copy_stays(monkeypatch, tmp_p
     assert all(office_md._conv_cache_slot(root, r)[1].is_dir() for r in ("a.xlsx", "b.xlsx"))
     monkeypatch.setattr(evidence_render, "RAG_RENDERER_VERSION", str(evidence_render.RAG_RENDERER_VERSION) + "-bump")
 
-    res = office_md.refresh_rag(source, dmd, write_rag_sig_marker=True)
+    res = office_md.refresh_rag(source, dmd, write_rag_sig_marker=True, row=offline_row("w"))
     assert res["rag_failed"] == 0 and res["rag_generated"] == 2
 
     for rel in ("a.xlsx", "b.xlsx"):
@@ -54,7 +55,7 @@ def test_light_refresh_drops_the_slot_so_no_second_copy_stays(monkeypatch, tmp_p
         assert not meta.exists() and not content.exists()      # 古い inode を持つ枠が残らない
 
     calls = _count_conversions(monkeypatch)
-    assert office_md.build_derived(source, dmd, world_sig="s1").get("error") is None
+    assert office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w")).get("error") is None
     assert sorted(calls) == ["a.xlsx", "b.xlsx"]               # 次の取り込みで変換し直す（変更前と同じ）
 
 
@@ -69,7 +70,7 @@ def test_failed_rel_keeps_its_slot(monkeypatch, tmp_path):
         return orig(path, chunks)
 
     monkeypatch.setattr(evidence_render, "write_chunks_atomic", fail_for_a)
-    assert office_md.refresh_rag(source, dmd, write_rag_sig_marker=True)["rag_failed"] == 1
+    assert office_md.refresh_rag(source, dmd, write_rag_sig_marker=True, row=offline_row("w"))["rag_failed"] == 1
     root = office_md._conv_cache_root_for(dmd)
     assert office_md._conv_cache_slot(root, "a.xlsx")[0].exists()
     assert not office_md._conv_cache_slot(root, "b.xlsx")[0].exists()
@@ -91,8 +92,8 @@ def test_stale_raster_md_is_not_restored_after_light_refresh(monkeypatch, tmp_pa
     assert "OLDRENDER" in (dmd / "a.png.md").read_text()
     tag["v"] = "NEWRENDER"
     monkeypatch.setattr(evidence_render, "RAG_RENDERER_VERSION", str(evidence_render.RAG_RENDERER_VERSION) + "-bump")
-    assert office_md.refresh_rag(source, dmd, write_rag_sig_marker=True)["rag_failed"] == 0
-    assert office_md.build_derived(source, dmd, world_sig="s2").get("error") is None
+    assert office_md.refresh_rag(source, dmd, write_rag_sig_marker=True, row=offline_row("w"))["rag_failed"] == 0
+    assert office_md.build_derived(source, dmd, world_sig="s2", row=offline_row("w")).get("error") is None
     assert "OLDRENDER" not in (dmd / "a.png.md").read_text()   # 古い .md が戻らない
 
 
@@ -100,12 +101,12 @@ def test_human_md_and_rag_bump_together_does_not_repeat_conversion(monkeypatch, 
     source, dmd = _setup(tmp_path, monkeypatch, "drop-loop", _xlsx(["a.xlsx"]))
     monkeypatch.setattr(human_md, "HUMAN_MD_RENDERER_VERSION", human_md.HUMAN_MD_RENDERER_VERSION + "-bump")
     monkeypatch.setattr(evidence_render, "RAG_RENDERER_VERSION", str(evidence_render.RAG_RENDERER_VERSION) + "-bump")
-    assert office_md.refresh_human_md(source, dmd)["human_md_failed"] == 0
-    assert office_md.refresh_rag(source, dmd, write_rag_sig_marker=True)["rag_failed"] == 0
-    assert office_md.build_derived(source, dmd, world_sig="s2").get("error") is None
+    assert office_md.refresh_human_md(source, dmd, row=offline_row("w"))["human_md_failed"] == 0
+    assert office_md.refresh_rag(source, dmd, write_rag_sig_marker=True, row=offline_row("w"))["rag_failed"] == 0
+    assert office_md.build_derived(source, dmd, world_sig="s2", row=offline_row("w")).get("error") is None
     assert not office_md.human_md_sig_drift(source, dmd)
     calls = _count_conversions(monkeypatch)
-    assert office_md.build_derived(source, dmd, world_sig="s2").get("error") is None
+    assert office_md.build_derived(source, dmd, world_sig="s2", row=offline_row("w")).get("error") is None
     assert calls == []                                          # 2 回目は枠が当たり、作り直しが繰り返されない
 
 
@@ -113,11 +114,11 @@ def test_refresh_without_version_change_keeps_matching_slots(monkeypatch, tmp_pa
     from sherpa.ingest import md_prefetch
     source, dmd = _setup(tmp_path, monkeypatch, "drop-same", _xlsx(["a.xlsx", "b.xlsx", "c.xlsx"]))
     assert office_md.drop_rag_sig_marker(dmd)                  # 版は変わらないが rag の印が無い（LLM 成形・欠落からの再構築と同じ）
-    assert office_md.refresh_rag(source, dmd, write_rag_sig_marker=True)["rag_failed"] == 0
+    assert office_md.refresh_rag(source, dmd, write_rag_sig_marker=True, row=offline_row("w"))["rag_failed"] == 0
     _xlsx(["d.xlsx"])(source)
     monkeypatch.setattr(md_prefetch, "worker_count", lambda: 1)
     calls = _count_conversions(monkeypatch)
-    assert office_md.build_derived(source, dmd, world_sig="s2").get("error") is None
+    assert office_md.build_derived(source, dmd, world_sig="s2", row=offline_row("w")).get("error") is None
     assert calls == ["d.xlsx"]                                  # 今の版の枠は当たり、増えた 1 件だけ変換する
 
 
@@ -130,7 +131,7 @@ def test_slot_with_missing_contents_is_not_a_hit(monkeypatch, tmp_path):
     assert meta.exists()
     monkeypatch.setattr(md_prefetch, "worker_count", lambda: 1)
     calls = _count_conversions(monkeypatch)
-    assert office_md.build_derived(source, dmd, world_sig="s2").get("error") is None
+    assert office_md.build_derived(source, dmd, world_sig="s2", row=offline_row("w")).get("error") is None
     assert calls == ["a.xlsx"]
     assert (office_md._sibling_layer_dir(dmd, "rag") / "a.xlsx.rag.md").exists()
 

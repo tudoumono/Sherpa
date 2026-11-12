@@ -22,9 +22,13 @@ import zipfile
 from pathlib import Path
 
 from .. import json_io, scope_infer, worlds
-from . import text_kind
+from ..store import replace_rows
+from ..store.replace_rows import ReplaceRow
+from . import substage, text_kind
+from .run_flags import archive_sync_errors
 
 _log = logging.getLogger("sherpa.ingest.archive")
+_NUMBER_KEYS = ("ingest_no", "settings_sig")   # `archive_manifest.json` の先頭の階層で、アーカイブの rel と並べて置く取り込みの番号と設定の値
 
 
 class ArchiveRootOverlapError(RuntimeError):
@@ -273,7 +277,7 @@ def _extract_tar(archive_path: Path, dest_dir: Path) -> dict:
         return base
 
 
-def extract_archive(archive_path: Path, dest_dir: Path, *, work_root: Path, rel: str) -> dict:
+def extract_archive(archive_path: Path, dest_dir: Path, *, work_root: Path, rel: str, row: ReplaceRow) -> dict:
     """1アーカイブを安全に展開し、`dest_dir`（公開領域の展開先）を置き換える。
 
     展開は公開領域の外（`work_root`）で最後まで行い、`dest_dir` へは書きかけを書かない。
@@ -307,6 +311,7 @@ def extract_archive(archive_path: Path, dest_dir: Path, *, work_root: Path, rel:
         shutil.rmtree(staging, ignore_errors=True)
         _remove_dest(dest_dir)
         return summary
+    replace_rows.before_swap(row, row.world, "archives", old=[str(retired)])
     try:
         _publish_archive_staging(staging, dest_dir, retired)
     except OSError:
@@ -339,7 +344,8 @@ def _prune_empty_ancestors(start: Path, stop: Path) -> None:
         cur = cur.parent
 
 
-def sync_world_archives(world_id: str, root: Path | None, *, walk: scope_infer.WalkSnapshot | None = None) -> dict:
+def sync_world_archives(world_id: str, root: Path | None, *, row: ReplaceRow,
+                        walk: scope_infer.WalkSnapshot | None = None) -> dict:
     """`root`（資料フォルダの原本）配下のアーカイブを展開先（`worlds.archives_dir(world_id)`）へ差分同期する。
 
     取り込みの都度呼ぶ。内容ハッシュ不変なら再展開しない。新規/更新は再展開して置き換え、消えたアーカイブは展開先ごと削除する。
@@ -349,6 +355,7 @@ def sync_world_archives(world_id: str, root: Path | None, *, walk: scope_infer.W
     ② アーカイブの列挙は strict で行う。列挙が失敗したらこの回は何も変更せず前回の manifest を返す。
     ③ 個々の読み取り失敗（`OSError`）は「消えた」扱いにせず、前回の manifest 行を引き継いで `last_sync_error` を足す。
     ④ 展開は公開領域の外で行い、成功したときだけ入れ替える。
+    ⑤ 展開先を入れ替える前に旧展開物の名前と「入れ替えた」を行へ書き、最後の manifest に `ingest_no`・`settings_sig` を書いてから「古いものを消した」にする。
     `walk`（同じ取り込みで走査済みの列挙）は、読めないものが無かったときだけ列挙に使う（strict の規律を変えない）。無ければ自分で歩く。
     """
     if root is None:
@@ -367,6 +374,8 @@ def sync_world_archives(world_id: str, root: Path | None, *, walk: scope_infer.W
     manifest = json_io.read_json(manifest_path, default={})
     if not isinstance(manifest, dict):
         manifest = {}
+    for key in _NUMBER_KEYS:
+        manifest.pop(key, None)
 
     found: dict[str, Path] = {}
     try:
@@ -391,7 +400,7 @@ def sync_world_archives(world_id: str, root: Path | None, *, walk: scope_infer.W
                 next_manifest[rel] = prev
                 continue
         # 展開先の入替・削除は extract_archive が成否に応じて行う
-            summary = extract_archive(rp, dest, work_root=work_root, rel=rel)
+            summary = extract_archive(rp, dest, work_root=work_root, rel=rel, row=row)
         except OSError:
             _log.warning(
                 "アーカイブを読めませんでした（展開先・前回の記録はそのまま維持）: %s", rp,
@@ -412,7 +421,8 @@ def sync_world_archives(world_id: str, root: Path | None, *, walk: scope_infer.W
         _prune_empty_ancestors(dest.parent, archives_root)
 
     if next_manifest:
-        json_io.write_json_atomic(manifest_path, next_manifest)
+        json_io.write_json_atomic(manifest_path, {**next_manifest, "ingest_no": row.ingest_no,
+                                                  "settings_sig": replace_rows.settings_sig(row, "archives")})
     elif manifest:
         try:
             manifest_path.unlink()
@@ -420,4 +430,18 @@ def sync_world_archives(world_id: str, root: Path | None, *, walk: scope_infer.W
             pass
         if archives_root.exists():
             shutil.rmtree(archives_root, ignore_errors=True)
+    replace_rows.after_old_removed(row, row.world, "archives")
     return next_manifest
+
+
+def sync_step(world_id: str, *, row: ReplaceRow, walk: scope_infer.WalkSnapshot | None = None) -> list[str | None]:
+    """取り込みの回のアーカイブの展開。読めなかったアーカイブの rel を返す。
+    展開全体の例外は取り込みを止めず（`[None]` を返す）、行へ「失敗」を残して次の「更新」で展開し直す。個々のアーカイブの失敗は行に残さない。
+    """
+    try:
+        with substage.step("archive_extract", "アーカイブ（zip など）の展開を確かめています"):
+            return archive_sync_errors(sync_world_archives(world_id, worlds.world_dir(world_id), row=row, walk=walk))
+    except Exception:
+        _log.warning("アーカイブの展開に失敗しました（取り込み自体は継続）: world=%s", world_id, exc_info=True)
+        replace_rows.mark_failed(row, world_id, "archives", "archive_extract_failed")
+        return [None]

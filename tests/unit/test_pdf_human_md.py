@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 from sherpa.ingest import office_md
+from tests._replace_row import offline_row
 
 _ROOT = Path(__file__).resolve().parents[2]
 _MERGED = _ROOT / "fixtures" / "pdf_export" / "PDFX-MERGED.pdf"
@@ -15,7 +16,7 @@ _MERGED = _ROOT / "fixtures" / "pdf_export" / "PDFX-MERGED.pdf"
 
 def _build_md(src: Path, tmp_path: Path, name: str) -> str:
     out = tmp_path / "out"
-    rep = office_md.build_derived(src, out / "md")
+    rep = office_md.build_derived(src, out / "md", row=offline_row("w"))
     assert rep["failed"] == 0 and rep["converted"] >= 1
     return (out / "md" / (name + ".md")).read_text(encoding="utf-8")
 
@@ -89,7 +90,7 @@ def test_existing_pdf_md_is_rebuilt_once_after_version_change(tmp_path):
     src.mkdir()
     shutil.copy(_MERGED, src / "a.pdf")
     out = tmp_path / "out"
-    office_md.build_derived(src, out / "md")
+    office_md.build_derived(src, out / "md", row=offline_row("w"))
     assert office_md.rag_sidecars_missing(src, out / "md") is False
     manifest_path = out / "ir" / "a.pdf.derived.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

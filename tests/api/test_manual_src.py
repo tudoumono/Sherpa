@@ -4,7 +4,7 @@ web の「使い方」が正本 docs/manual/*.md をその場でレンダリン�
 - `/ui/manual-src/<name>.md` と `/ui/manual-src/manifest.json` は配信される。
 - README.md・images/ 配下・拡張子違いは対象外（404）。
 - ディレクトリ外への `..` トラバーサルは 404。
-- manifest.json は旧アンカー互換に必要な id（start/chat/register/graph/workspace/settings/sysadmin）を含む。
+- manifest.json は旧アンカー互換に必要な id（start/chat/register/search/workspace/settings/sysadmin）を含む。
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def test_manual_src_manifest_served():
     assert r.status_code == 200
     data = json.loads(r.text)
     ids = {ch["id"] for ch in data["chapters"]}
-    for required in ("start", "chat", "register", "graph", "workspace", "settings", "sysadmin"):
+    for required in ("start", "chat", "register", "search", "workspace", "settings", "sysadmin"):
         assert required in ids, f"missing compat id: {required}"
     # 書き込み系は静的マウントでは提供されない（GET 専用）。
     assert c.put("/ui/manual-src/manifest.json").status_code in (404, 405)

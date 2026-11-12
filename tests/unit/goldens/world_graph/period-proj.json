@@ -1,0 +1,20 @@
+{
+  "counts": {
+    "edge_types": {
+      "DOCUMENTS": 1,
+      "INVOKES": 6
+    },
+    "edges": 7,
+    "flag_reasons": {
+      "parent_period_undetermined": 1
+    },
+    "flags": 1,
+    "node_labels": {
+      "Document": 1,
+      "Module": 16
+    },
+    "nodes": 17
+  },
+  "sha256": "a939710893c9b67c413e81228ba6a84e9af6ee8c525144482e66e74a18c212ca",
+  "world": "period-proj"
+}

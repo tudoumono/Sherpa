@@ -11,14 +11,16 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import pathlib
 import re
 import urllib.request
+from array import array
 
 import pytest
 
-from sherpa import embeddings, graph_admin, health, intent_llm, llm, store
+from sherpa import embeddings, health, intent_llm, llm, store
 from sherpa.ingest import graph_extract
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -148,22 +150,23 @@ def test_graph_extract_probe_degrades_without_network_for_unlisted_url(_no_netwo
 
 def test_intent_llm_classify_degrades_without_network_for_unlisted_url(monkeypatch, _no_network_by_default):
     _only_ollama_candidate(monkeypatch)
-    assert intent_llm.classify("消費税率は?", {"ollama_url": _UNLISTED_LAN}) is None  # clarify へフォールバック
+    with pytest.raises(intent_llm.IntentClassifierError):   # 通信せずに失敗として返す（曖昧さと区別する）
+        intent_llm.classify("消費税率は?", {"ollama_url": _UNLISTED_LAN})
     assert _no_network_by_default.calls == []
 
 
-def test_simple_provider_is_unwired_without_network_for_unlisted_url(_no_network_by_default):
-    """許可外の接続先なら `_resolve_llm` で止まり頭脳は未接続（ナレッジ参照のオン/オフどちらも通信なし）。"""
+def test_simple_provider_is_unwired_without_network_for_malformed_central_url(_no_network_by_default):
+    """保存済みの中央の接続先が解釈できない形なら `_resolve_llm` で止まり頭脳は未接続（ナレッジ参照のオン/オフどちらも通信なし）。"""
     from sherpa import providers as providers_pkg
     from sherpa.agents import Ctx
 
     p = providers_pkg.get_provider({"agent": "simple"},
-                                   system_settings={"ollama_url": _UNLISTED_EXTERNAL})
+                                   system_settings={"ollama_url": f"{_UNLISTED_EXTERNAL}/api"})
     assert isinstance(p, providers_pkg._UnwiredProvider)
     for knowledge in (True, False):
         ctx = Ctx(message="消費税率は?", world="v1", knowledge=knowledge,
                   route=lambda m: {"lens": "qa", "input": m, "reason": "t"},
-                  dispatch=lambda lens, inp: {}, make_sources=lambda docs: [])
+                  make_sources=lambda docs: [])
         result = next(ev for ev in p.run(ctx) if ev["type"] == "_result")
         assert "接続されていません" in result["env"]["headline"]
     assert _no_network_by_default.calls == []
@@ -290,12 +293,10 @@ def test_assert_ollama_url_allowed_rejects_userinfo_even_for_loopback():
 
 def test_assert_ollama_url_allowed_malformed_url_does_not_leak_raw_value():
     """解釈不能な URL のエラー文言に生の base（資格情報）を埋め込まない（503 detail へ反射されるため）。"""
-    for fn in (lambda u: llm.assert_ollama_url_allowed(u),
-               lambda u: llm.assert_ollama_url_allowed_in(u, set())):
-        with pytest.raises(llm.SsrfBlocked) as exc:
-            fn("http://user:secret-password@localhost:11434")
-        assert "secret-password" not in str(exc.value)
-        assert "user:secret-password" not in str(exc.value)
+    with pytest.raises(llm.SsrfBlocked) as exc:
+        llm.assert_ollama_url_allowed("http://user:secret-password@localhost:11434")
+    assert "secret-password" not in str(exc.value)
+    assert "user:secret-password" not in str(exc.value)
 
 
 def test_assert_ollama_url_allowed_omitted_port_does_not_alias_explicit_allowlist_entry(monkeypatch):
@@ -441,10 +442,12 @@ def test_embeddings_ollama_sends_post_json_body_within_no_proxy_requests_context
             return False
 
         def read(self):
-            return b'{"embeddings": [[0.25, 0.5]]}'
+            return json.dumps({"data": [{"index": 0, "embedding": base64.b64encode(
+                array("f", [0.25, 0.5]).tobytes()).decode("ascii")}]}).encode("utf-8")
 
     def _fake_open(req, timeout=None):
         captured["method"] = req.get_method()
+        captured["url"] = req.full_url
         captured["body"] = json.loads(req.data.decode("utf-8"))
         captured["ctx"] = llm._no_proxy_ctx.get()
         return _Resp()
@@ -454,7 +457,8 @@ def test_embeddings_ollama_sends_post_json_body_within_no_proxy_requests_context
     c = embeddings.cfg({"ollama_url": "http://127.0.0.1:11434"})
     assert c is not None and c["provider"] == "ollama"
     c = {**c, "dim": 2}   # フェイク応答のベクトル長に合わせる
-    assert embeddings.embed(["hello"], c) == [[0.25, 0.5]]
+    assert embeddings.embed(["hello"], c) == [array("f", [0.25, 0.5])]
     assert captured.get("method") == "POST"
-    assert captured.get("body") == {"model": c["model"], "input": ["hello"]}
+    assert captured.get("url") == "http://127.0.0.1:11434/v1/embeddings"
+    assert captured.get("body") == {"model": c["model"], "input": ["hello"], "encoding_format": "base64"}
     assert captured.get("ctx") is True, "no_proxy_requests() のコンテキスト外で送信された"

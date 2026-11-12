@@ -274,10 +274,10 @@ def test_settings_test_ollama_allows_admin_allowlisted_lan_host(monkeypatch):
     assert r.json()["ok"] is True
 
 
-# ===== POST /settings/test（provider=ollama の probe 失敗詳細の丸め・到達オラクル低減） =====
+# ===== POST /settings/test（provider=ollama の probe 失敗の種類を定型の文で返す） =====
 
-def test_settings_test_ollama_probe_failure_detail_is_rounded(monkeypatch):
-    """Connection refused 等の詳細は丸められる（内部ホスト/ポートの生死判別に使えるオラクルを塞ぐ）。"""
+def test_settings_test_ollama_probe_failure_kind_is_reported(monkeypatch):
+    """許可済みの接続先の接続拒否は、生の例外文ではなく定型の文（拒否）で返る。"""
     if not _try_init():
         pytest.skip("DB down")
     monkeypatch.setattr(graph_extract, "_probe", lambda cfg: (False, "Connection refused（サービス停止の可能性）"))
@@ -286,11 +286,11 @@ def test_settings_test_ollama_probe_failure_detail_is_rounded(monkeypatch):
     assert r.status_code == 200, r.text
     d = r.json()
     assert d["ok"] is False
-    assert "Connection refused" not in d["detail"]
+    assert "Connection refused" not in d["detail"] and "拒否" in d["detail"]
 
 
 def test_settings_test_ollama_probe_auth_failure_detail_is_not_rounded(monkeypatch):
-    """401 相当の認証失敗だけは詳細を残す（`_round_ollama_probe_detail` の例外）。"""
+    """401 相当の認証失敗だけは詳細を残す（`_ollama_probe_detail` の例外）。"""
     if not _try_init():
         pytest.skip("DB down")
     monkeypatch.setattr(graph_extract, "_probe", lambda cfg: (False, "401 unauthorized: bad token"))
@@ -300,3 +300,11 @@ def test_settings_test_ollama_probe_auth_failure_detail_is_not_rounded(monkeypat
     d = r.json()
     assert d["ok"] is False
     assert d["detail"].startswith("401")
+
+
+def test_round_ollama_probe_detail_keeps_http_status_only():
+    from sherpa.routers.system import _ollama_probe_detail as _round_ollama_probe_detail
+    assert "HTTP 404" in _round_ollama_probe_detail("HTTP 404")
+    assert "HTTP 500" in _round_ollama_probe_detail("500 server_error: secret-host")
+    assert "secret-host" not in _round_ollama_probe_detail("500 server_error: secret-host")
+    assert "拒否" in _round_ollama_probe_detail("Connection refused")

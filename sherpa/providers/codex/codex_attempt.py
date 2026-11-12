@@ -10,7 +10,7 @@ import threading
 import time
 
 from ...mcp_server import _LEDGER_TOOLS, COMPARE_DOC_ID_ARGS, LISTED_DOC_TOOLS, READ_DOC_TOOLS
-from ..base import _log, _node
+from ..base import _answer_partial, _log, _node
 from . import process
 from .ledger_gate import _LEDGER_TOOL_DETAILS
 from .mcp import (
@@ -274,7 +274,7 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                 tlabel = {"graph_neighbors": "関係グラフをたどる", "graph_resolve": "影響調査の起点を探す",
                           "graph_impact": "影響先をたどる", "ripgrep_search": "資料を検索（語句そのまま）",
                           "es_search": "資料を検索（全文）", "read_around": "該当箇所を精読",
-                          "list_docs": "資料の一覧を確認", "folder_tree": "フォルダ構成を確認",
+                          "list_docs": "資料の一覧を確認", "folder_tree": "フォルダ構成を確認", "name_lookup": "名前からソースを探す",
                           "compare_documents": "世代間の差分を比較",
                           "read_doc": "文書を通読", "doc_outline": "見出し構造を確認",
                           "glob_search": "ファイル名で検索",
@@ -336,12 +336,12 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                     st._tool_use.record_unreliable = True
                     continue
                 _txt = (item.get("text") or "").strip()
-                if e.get("type") == "item.completed":
-                    if _txt:
-                        _agent_msgs.append(_txt)
-                    st._agent_partial = ""
-                else:  # item.updated＝成長中の未完 message（打ち切り保険）
-                    st._agent_partial = _txt
+                _done = e.get("type") == "item.completed"
+                if _done and _txt:
+                    _agent_msgs.append(_txt)
+                st._agent_partial = "" if _done else _txt   # item.updated＝成長中の未完 message（打ち切り保険）
+                if (_p := _answer_partial(_txt)):
+                    yield _p
     except Exception as exc:
         st._stream_error = True
         st._tool_use.record_unreliable = True

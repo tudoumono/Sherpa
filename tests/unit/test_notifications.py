@@ -7,7 +7,6 @@ OCR 反映待ち検知時の自動追いつき（軽量 sync を1回だけ予約
 from __future__ import annotations
 
 from sherpa import notifications
-from sherpa.ingest import background as ingest_background
 from sherpa.ingest import office_md
 from sherpa.store import ocr_jobs, usage_events
 
@@ -70,24 +69,28 @@ def test_ingest_run_missing_run_is_skipped(monkeypatch):
     assert notifications._ingest_run_notifications(_label()) == []
 
 
-# ---- b) LLM 成形パス完了（admin のみ） -------------------------------------------------------------
+# ---- 警告つきの取り込みは「完了しました」と言わない ------------------------------------------------
 
-def test_llm_render_notification_keeps_latest_per_world(monkeypatch):
-    rows = [
-        {"ts": "2026-09-03T02:00:00+00:00", "world": "w1", "calls": 3},
-        {"ts": "2026-09-03T01:00:00+00:00", "world": "w1", "calls": 1},   # 同じ world の古い方は無視
-    ]
-    monkeypatch.setattr(usage_events, "list_recent_events", lambda kind, limit=200: rows)
-    items = notifications._llm_render_notifications(_label())
-    assert len(items) == 1
-    assert items[0]["created_at"] == "2026-09-03T02:00:00+00:00"
-    assert items[0]["admin_only"] is True
+def test_ingest_run_with_flags_is_not_announced_as_completed(monkeypatch):
+    monkeypatch.setattr(notifications.store, "get_latest_run_summary",
+                        lambda wid: {"status": "auto_published_with_flags", "extraction_snapshot": {},
+                                     "created_at": "2026-09-03T01:00:00+00:00"})
+    items = notifications._ingest_run_notifications(_label())
+    assert items[0]["status"] == "warn"
+    assert "完了しました" not in items[0]["message"]
+    assert "取り込み状況をご確認ください" in items[0]["message"]
 
 
-def test_llm_render_notification_skips_unregistered_world(monkeypatch):
+# ---- AI 整形は、利用量の記録から完了を作らない ---------------------------------------------------------
+
+def test_llm_render_usage_event_does_not_make_a_completion_notification(monkeypatch):
+    """利用量は整形の成否と独立に記録される。記録があっても、管理者への通知に AI 整形の完了を出さない。"""
+    monkeypatch.setattr(notifications, "_world_labels", lambda: _label())
+    monkeypatch.setattr(notifications.store, "get_latest_run_summary", lambda wid: None)
     monkeypatch.setattr(usage_events, "list_recent_events",
-                        lambda kind, limit=200: [{"ts": "2026-09-03T02:00:00+00:00", "world": "gone"}])
-    assert notifications._llm_render_notifications(_label()) == []
+                        lambda kind, limit=200: [{"ts": "2026-09-03T02:00:00+00:00", "world": "w1", "calls": 3}])
+    monkeypatch.setattr(office_md, "ocr_enabled", lambda: False)
+    assert notifications.list_notifications(is_admin=True) == []
 
 
 # ---- c) OCR 反映待ち（admin のみ・自動追いつき） ----------------------------------------------------
@@ -106,14 +109,13 @@ def _stub_ocr_ready(monkeypatch, *, drift=True, pending=0, targets=1):
 def test_ocr_pending_notification_triggers_catchup_once(monkeypatch):
     _stub_ocr_ready(monkeypatch)
     calls = []
-    monkeypatch.setattr(ingest_background, "submit",
-                        lambda world_id, op, fp, payload=None, **kw: calls.append(
-                            (world_id, op, fp)) or (1, False))
+    monkeypatch.setattr(notifications.ingest_worker, "enqueue_ocr_catchup",
+                        lambda world_id: calls.append(world_id) or True)
     items = notifications._ocr_notifications(_label())
     assert len(items) == 1
     assert items[0]["admin_only"] is True
     assert items[0]["action"]["path"] == "/worlds/w1/refresh"
-    assert calls == [("w1", "refresh", "{}")]   # 手動更新と同じ op/fingerprint に合流できる
+    assert calls == ["w1"]
 
 
 def test_ocr_catchup_not_reserved_after_low_disk_stop(monkeypatch):
@@ -122,17 +124,40 @@ def test_ocr_catchup_not_reserved_after_low_disk_stop(monkeypatch):
     monkeypatch.setattr(notifications.store, "get_latest_run_summary",
                         lambda wid: {"status": "failed", "extraction_snapshot": {"stop_reason": "low_disk"}})
     calls = []
-    monkeypatch.setattr(ingest_background, "submit", lambda *a, **kw: calls.append(1))
+    monkeypatch.setattr(notifications.ingest_worker.background, "submit", lambda *a, **kw: calls.append(1))
     items = notifications._ocr_notifications(_label())
     assert len(items) == 1
     assert calls == []
 
 
+def test_ocr_partial_failure_is_reported_not_called_completed(monkeypatch):
+    """一部の画像の読み取りが失敗していたら、「完了しました」ではなく成功・失敗の件数を出す（待機 0 件を成功と見なさない）。"""
+    _stub_ocr_ready(monkeypatch)
+    monkeypatch.setattr(ocr_jobs, "status_summary",
+                        lambda wid: {"targets": 2, "pending": 0, "processed": 1, "failed": 1,
+                                     "updated_at": "2026-09-03T03:00:00+00:00"})
+    monkeypatch.setattr(notifications.ingest_worker, "enqueue_ocr_catchup", lambda world_id: True)
+    items = notifications._ocr_notifications(_label())
+    assert len(items) == 1
+    assert "完了しました" not in items[0]["message"]
+    assert "1件成功、1件失敗" in items[0]["message"]
+    assert items[0]["action"]["path"] == "/worlds/w1/refresh"
+
+
+def test_ocr_failure_is_reported_even_when_nothing_to_reflect(monkeypatch):
+    _stub_ocr_ready(monkeypatch, drift=False)
+    monkeypatch.setattr(ocr_jobs, "status_summary",
+                        lambda wid: {"targets": 2, "pending": 0, "processed": 1, "failed": 1,
+                                     "updated_at": "2026-09-03T03:00:00+00:00"})
+    items = notifications._ocr_notifications(_label())
+    assert len(items) == 1 and items[0]["action"] is None
+    assert "1件失敗" in items[0]["message"]
+
+
 def test_ocr_pending_skipped_when_not_drifted(monkeypatch):
     _stub_ocr_ready(monkeypatch, drift=False)
     calls = []
-    monkeypatch.setattr(ingest_background, "submit",
-                        lambda *a, **kw: calls.append(1))
+    monkeypatch.setattr(notifications.ingest_worker, "enqueue_ocr_catchup", lambda *a, **kw: calls.append(1))
     assert notifications._ocr_notifications(_label()) == []
     assert calls == []                          # 反映済みなら sync を予約しない
 
@@ -162,9 +187,7 @@ def test_ocr_catchup_conflict_error_is_swallowed(monkeypatch):
     （通知自体は返す・次回検知時に再試行すれば足りる）。"""
     _stub_ocr_ready(monkeypatch)
 
-    def _raise(*a, **kw):
-        raise ingest_background.ConflictError("w1", "extract", 9)
-    monkeypatch.setattr(ingest_background, "submit", _raise)
+    monkeypatch.setattr(notifications.ingest_worker, "enqueue_ocr_catchup", lambda _world: False)
     items = notifications._ocr_notifications(_label())
     assert len(items) == 1                       # 例外は外へ伝播しない
 
@@ -172,7 +195,9 @@ def test_ocr_catchup_conflict_error_is_swallowed(monkeypatch):
 def test_ocr_catchup_shares_fingerprint_with_manual_refresh():
     """予約は手動の `POST /worlds/{wid}/refresh` と同じ操作名・同じ fingerprint で積む（積み済み・実行中の更新に合流させ、多重予約しない）。"""
     from sherpa.routers import worlds as worlds_routes
-    assert notifications._REFRESH_FP == worlds_routes._fingerprint({})
+    assert notifications.ingest_worker.background.OCR_CATCHUP_REFRESH_FP == worlds_routes._fingerprint({})
+    assert notifications.ingest_worker.background.OCR_CATCHUP_STAGE_LABEL == \
+        notifications.ingest_worker.STAGE_LABELS["accepted"]
 
 
 # ---- 全体の組み立て（役割による絞り込み・並び順） ---------------------------------------------------
@@ -190,7 +215,7 @@ def test_list_notifications_hides_admin_only_from_non_admin(monkeypatch):
     admin = notifications.list_notifications(is_admin=True)
 
     assert [it["kind"] for it in non_admin] == ["ingest_run"]
-    assert {it["kind"] for it in admin} == {"ingest_run", "llm_render"}
+    assert {it["kind"] for it in admin} == {"ingest_run"}
 
 
 def test_list_notifications_sorts_newest_first(monkeypatch):

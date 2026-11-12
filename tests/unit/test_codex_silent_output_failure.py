@@ -40,10 +40,6 @@ def _ctx(uid: str, stop_event=None) -> "A.Ctx":
         message="偽 codex 無出力失敗テスト",
         world="v1",
         route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline-should-not-leak-as-real-answer",
-            "summary": {"total": 0}, "data": {}, "sources": [],
-        },
         knowledge=True,
         uid=uid,
         stop_event=stop_event,
@@ -200,54 +196,6 @@ def test_https_proxy_userinfo_never_leaks_into_headline_or_log(tmp_path, monkeyp
         assert "proxyuser" not in msg, f"ログに userinfo（ユーザー名）が漏れている: {msg!r}"
 
 
-# ===== RV2 #2: honest failure は data も空にして通常の0件検索結果と区別する =====
-# `_ctx()` の固定フェイク dispatch は元々 data:{}/sources:[] を返すため、data のクリア自体を
-# 検証できない（既にクリアされた形と区別が付かない）。ここでは dispatch が「実際に検索はしたが
-# 0件」だった場合の env 形（citations 等のキーを持つ非空 data・sources は空）を模し、Codex の
-# 無出力失敗（honest failure）がそれを `chat_service._no_genuine_results` の規約（data={}）へ
-# 揃えることを確認する。
-
-def _ctx_with_zero_hit_search_shape(uid: str) -> "A.Ctx":
-    return A.Ctx(
-        message="偽 codex 無出力失敗テスト（検索0件形）",
-        world="v1",
-        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline-should-not-leak-as-real-answer",
-            "summary": {"total": 0}, "data": {"type": "qa", "citations": []}, "sources": [],
-        },
-        knowledge=True,
-        uid=uid,
-    )
-
-
-def test_zero_output_failure_clears_data_when_sources_empty(tmp_path, monkeypatch):
-    """dispatch が「検索はしたが0件」の env 形（data 非空・sources 空）を返していても、
-    無出力失敗（honest failure）は data を `{}` にする——`_no_genuine_results` が真になり
-    `_retry_hints`/確定文言が誤って付かないようにするため。"""
-    bin_dir = _setup(tmp_path, monkeypatch, users_dirname="users_authfail_datashape")
-    _write_fake_codex(bin_dir, (
-        "#!/bin/bash\n"
-        "echo 'Error: No API key or auth.json found. Run `codex login --with-api-key`.' 1>&2\n"
-        "exit 1\n"
-    ))
-    prov = A.CodexProvider()
-    ctx = _ctx_with_zero_hit_search_shape(uid="authfail-u2")
-
-    env = _result_env(_run(prov, ctx))
-    assert "接続できません" in env["headline"]
-    assert env["data"] == {}, f"honest failure なのに data が実検索結果のまま: {env!r}"
-    assert env["codex_silent_failure"] is True, (
-        "STAT-3 T3: 利用統計の終了理由分布が判定できるよう codex_silent_failure を立てる契約")
-
-    from sherpa import chat_service as CS
-    assert CS._no_genuine_results(env) is False
-    finalized = CS._finalize(dict(env), {"lens": "qa", "reason": "Codex 未接続"})
-    assert "retry_hints" not in finalized
-    assert finalized["headline"] == env["headline"], "headline が確定文言へ誤って置換されている"
-    assert finalized["stop_kind"] == "codex_silent"
-
-
 # ===== Popen 自体が起動に失敗した場合も codex_silent として印を付ける =====
 # `shutil.which("codex")` は実行ビットの有無だけを見て中身は検査しないため、shebang が壊れた
 # 実行ファイルでも「見つかった」扱いになる——実際に `subprocess.Popen` が exec しようとした
@@ -309,53 +257,3 @@ def test_popen_exec_failure_marks_codex_silent(tmp_path, monkeypatch):
     assert env["completion"] == "failed"
     from sherpa import stop_kind
     assert stop_kind.resolve(env) == "codex_silent"
-
-
-# ===== ツール遮断の env を受けても実際に回答できたターンは agentic_failure を消す =====
-
-def _ctx_with_tools_blocked_env(uid: str) -> "A.Ctx":
-    """`chat_service._dispatch` がツール遮断（必須ツール全 OFF/不達）と判定したときと同じ形
-    （`agentic_search.tools_blocked_env`）を dispatch から直接返す——Codex が実際にこの env を
-    受け取った状態を再現する（`_gather` は `_tools_blocked` だけ pop して `agentic_failure` は
-    残したまま渡す）。"""
-    from sherpa import agentic_search
-
-    def _dispatch(lens_, inp):
-        env = agentic_search.tools_blocked_env(lens_)
-        env["lens"] = lens_
-        return env
-
-    return A.Ctx(
-        message="偽 codex ツール遮断からの回復テスト",
-        world="v1",
-        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
-        dispatch=_dispatch,
-        knowledge=True,
-        uid=uid,
-    )
-
-
-def test_tools_blocked_agentic_failure_is_cleared_when_codex_produces_headline(tmp_path, monkeypatch):
-    """`_dispatch` がツール遮断で `agentic_failure="error"` を立てた env を渡されても、Codex が
-    実際に `codex exec` を起動して回答（headline）を生成できたなら、遮断時の印を残さない
-    （`stop_kind.resolve()` がこのターンを `unknown` に落とさない）。"""
-    bin_dir = _setup(tmp_path, monkeypatch, users_dirname="users_toolsblocked")
-    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")   # 平文 agent_message で足りる（構造化は対象外）
-    _write_fake_codex(bin_dir, (
-        "#!/bin/bash\n"
-        "echo '{\"type\":\"item.completed\",\"item\":{\"id\":\"1\",\"type\":\"agent_message\","
-        "\"text\":\"実際に調べた回答\"}}'\n"
-        "exit 0\n"
-    ))
-    prov = A.CodexProvider()
-    ctx = _ctx_with_tools_blocked_env(uid="toolsblocked-u1")
-
-    env = _result_env(_run(prov, ctx))
-
-    assert env["headline"] == "実際に調べた回答", f"Codex の実回答が headline に反映されていない: {env!r}"
-    assert "agentic_failure" not in env, (
-        f"ツール遮断で立った印が実回答後も残っている: {env!r}")
-    from sherpa import stop_kind
-    # `agentic_failure` が残っていれば resolve() は None（集計側の unknown）に落ちるはず——
-    # 印が消えたことで通常どおり判定できることも併せて確認する。
-    assert stop_kind.resolve(env) is not None

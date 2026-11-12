@@ -7,6 +7,11 @@
             "title": "Count",
             "type": "integer"
           },
+          "ext_audit_write_failures": {
+            "default": 0,
+            "title": "Ext Audit Write Failures",
+            "type": "integer"
+          },
           "limit": {
             "title": "Limit",
             "type": "integer"
@@ -125,6 +130,54 @@
           "daily"
         ],
         "title": "AdminFeedbackSummaryResponse",
+        "type": "object"
+      },
+      "AdminOllamaTestResponse": {
+        "description": "管理画面の Ollama 接続テストの結果（POST /admin/settings/ollama-test）。",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "missing": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing",
+            "type": "array"
+          },
+          "models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "no_tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "No Tools",
+            "type": "array"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "host",
+          "models",
+          "missing",
+          "no_tools",
+          "detail"
+        ],
+        "title": "AdminOllamaTestResponse",
         "type": "object"
       },
       "AdminUsageQualityRunAck": {
@@ -380,6 +433,11 @@
       },
       "AdminUserCreateResponse": {
         "properties": {
+          "audit_recorded": {
+            "default": true,
+            "title": "Audit Recorded",
+            "type": "boolean"
+          },
           "ok": {
             "title": "Ok",
             "type": "boolean"
@@ -397,6 +455,11 @@
       },
       "AdminUserImportResponse": {
         "properties": {
+          "audit_recorded": {
+            "default": true,
+            "title": "Audit Recorded",
+            "type": "boolean"
+          },
           "created": {
             "title": "Created",
             "type": "integer"
@@ -418,6 +481,11 @@
       },
       "AdminUserPatchResponse": {
         "properties": {
+          "audit_recorded": {
+            "default": true,
+            "title": "Audit Recorded",
+            "type": "boolean"
+          },
           "ok": {
             "title": "Ok",
             "type": "boolean"
@@ -992,6 +1060,80 @@
         "title": "Body_workspace_file_upload_workspace_files_post",
         "type": "object"
       },
+      "BuildMarkItem": {
+        "additionalProperties": false,
+        "properties": {
+          "mark": {
+            "title": "Mark",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "mark"
+        ],
+        "title": "BuildMarkItem",
+        "type": "object"
+      },
+      "BuildMarksPutReq": {
+        "additionalProperties": false,
+        "properties": {
+          "marks": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/BuildMarkItem"
+            },
+            "title": "Marks",
+            "type": "array"
+          },
+          "world": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "World"
+          }
+        },
+        "title": "BuildMarksPutReq",
+        "type": "object"
+      },
+      "BuildMarksResponse": {
+        "properties": {
+          "layout_folders": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Layout Folders",
+            "type": "array"
+          },
+          "marks": {
+            "items": {
+              "$ref": "#/components/schemas/BuildMarkItem"
+            },
+            "title": "Marks",
+            "type": "array"
+          },
+          "world": {
+            "title": "World",
+            "type": "string"
+          }
+        },
+        "required": [
+          "world",
+          "marks",
+          "layout_folders"
+        ],
+        "title": "BuildMarksResponse",
+        "type": "object"
+      },
       "ChatReq": {
         "properties": {
           "conversation_id": {
@@ -1141,6 +1283,20 @@
             "title": "Conversation Id",
             "type": "integer"
           },
+          "scope_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope Paths"
+          },
           "started_at": {
             "title": "Started At",
             "type": "string"
@@ -1240,6 +1396,143 @@
           "model"
         ],
         "title": "ConfigResponse",
+        "type": "object"
+      },
+      "ConnectivityCheckRequest": {
+        "properties": {
+          "include_paid": {
+            "default": false,
+            "title": "Include Paid",
+            "type": "boolean"
+          }
+        },
+        "title": "ConnectivityCheckRequest",
+        "type": "object"
+      },
+      "ConnectivityCheckResponse": {
+        "description": "つながりの確認の結果（POST /admin/connectivity/check）。",
+        "properties": {
+          "paths": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectivityPath"
+            },
+            "title": "Paths",
+            "type": "array"
+          }
+        },
+        "required": [
+          "paths"
+        ],
+        "title": "ConnectivityCheckResponse",
+        "type": "object"
+      },
+      "ConnectivityPath": {
+        "properties": {
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectivityResult"
+            },
+            "title": "Results",
+            "type": "array"
+          }
+        },
+        "required": [
+          "path",
+          "label",
+          "results"
+        ],
+        "title": "ConnectivityPath",
+        "type": "object"
+      },
+      "ConnectivityResult": {
+        "properties": {
+          "elapsed_ms": {
+            "default": 0,
+            "title": "Elapsed Ms",
+            "type": "integer"
+          },
+          "host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "paid": {
+            "default": false,
+            "title": "Paid",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "route": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "ng",
+              "skipped",
+              "incomplete"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "status"
+        ],
+        "title": "ConnectivityResult",
         "type": "object"
       },
       "ConstructChoice": {
@@ -3046,6 +3339,17 @@
               }
             ],
             "title": "Locator"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
           }
         },
         "required": [
@@ -3321,6 +3625,17 @@
         "title": "FeedbackTagCount",
         "type": "object"
       },
+      "FileStateReq": {
+        "properties": {
+          "start": {
+            "default": false,
+            "title": "Start",
+            "type": "boolean"
+          }
+        },
+        "title": "FileStateReq",
+        "type": "object"
+      },
       "FsEntry": {
         "properties": {
           "name": {
@@ -3373,402 +3688,6 @@
         "title": "FsListResponse",
         "type": "object"
       },
-      "GraphCounts": {
-        "description": "グラフの件数。",
-        "properties": {
-          "deprecated": {
-            "title": "Deprecated",
-            "type": "integer"
-          },
-          "documents": {
-            "title": "Documents",
-            "type": "integer"
-          },
-          "entities": {
-            "title": "Entities",
-            "type": "integer"
-          },
-          "hidden": {
-            "title": "Hidden",
-            "type": "integer"
-          },
-          "relations": {
-            "title": "Relations",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "entities",
-          "relations",
-          "deprecated",
-          "hidden",
-          "documents"
-        ],
-        "title": "GraphCounts",
-        "type": "object"
-      },
-      "GraphEdge": {
-        "description": "グラフのエッジ（GET /graph の edges）。",
-        "properties": {
-          "source": {
-            "title": "Source",
-            "type": "string"
-          },
-          "status": {
-            "title": "Status",
-            "type": "string"
-          },
-          "target": {
-            "title": "Target",
-            "type": "string"
-          },
-          "type": {
-            "title": "Type",
-            "type": "string"
-          }
-        },
-        "required": [
-          "source",
-          "target",
-          "type",
-          "status"
-        ],
-        "title": "GraphEdge",
-        "type": "object"
-      },
-      "GraphFacetsResponse": {
-        "description": "グラフの絞り込み候補（GET /graph/facets）。",
-        "properties": {
-          "condition_fields": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Condition Fields",
-            "type": "array"
-          },
-          "node_labels": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Node Labels",
-            "type": "array"
-          },
-          "node_labels_ja": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Node Labels Ja",
-            "type": "object"
-          },
-          "relationship_types": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Relationship Types",
-            "type": "array"
-          }
-        },
-        "required": [
-          "node_labels",
-          "node_labels_ja",
-          "relationship_types",
-          "condition_fields"
-        ],
-        "title": "GraphFacetsResponse",
-        "type": "object"
-      },
-      "GraphNode": {
-        "description": "グラフのノード（GET /graph の nodes）。",
-        "properties": {
-          "id": {
-            "title": "Id",
-            "type": "string"
-          },
-          "name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Name"
-          },
-          "path": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Path"
-          },
-          "status": {
-            "title": "Status",
-            "type": "string"
-          },
-          "top_scope": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Top Scope"
-          },
-          "type": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Type"
-          },
-          "type_ja": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Type Ja"
-          },
-          "value": {
-            "title": "Value"
-          }
-        },
-        "required": [
-          "id",
-          "name",
-          "type",
-          "type_ja",
-          "status",
-          "value",
-          "top_scope",
-          "path"
-        ],
-        "title": "GraphNode",
-        "type": "object"
-      },
-      "GraphResponse": {
-        "description": "グラフ全体（GET /graph）。",
-        "properties": {
-          "counts": {
-            "$ref": "#/components/schemas/GraphCounts"
-          },
-          "edges": {
-            "items": {
-              "$ref": "#/components/schemas/GraphEdge"
-            },
-            "title": "Edges",
-            "type": "array"
-          },
-          "nodes": {
-            "items": {
-              "$ref": "#/components/schemas/GraphNode"
-            },
-            "title": "Nodes",
-            "type": "array"
-          },
-          "total_edges": {
-            "title": "Total Edges",
-            "type": "integer"
-          },
-          "total_nodes": {
-            "title": "Total Nodes",
-            "type": "integer"
-          },
-          "truncated": {
-            "title": "Truncated",
-            "type": "boolean"
-          },
-          "world": {
-            "title": "World",
-            "type": "string"
-          }
-        },
-        "required": [
-          "world",
-          "nodes",
-          "edges",
-          "counts",
-          "total_nodes",
-          "total_edges",
-          "truncated"
-        ],
-        "title": "GraphResponse",
-        "type": "object"
-      },
-      "GraphSearchCounts": {
-        "description": "検索結果の件数（`{\"nodes\":.., \"edges\":..}`・`GraphCounts` と別形）。",
-        "properties": {
-          "edges": {
-            "title": "Edges",
-            "type": "integer"
-          },
-          "nodes": {
-            "title": "Nodes",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "nodes",
-          "edges"
-        ],
-        "title": "GraphSearchCounts",
-        "type": "object"
-      },
-      "GraphSearchNode": {
-        "description": "検索結果のノード（GET /graph/search。`GraphNode` と別形で phase/category を持つ）。",
-        "properties": {
-          "category": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Category"
-          },
-          "id": {
-            "title": "Id",
-            "type": "string"
-          },
-          "name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Name"
-          },
-          "path": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Path"
-          },
-          "phase": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Phase"
-          },
-          "status": {
-            "title": "Status",
-            "type": "string"
-          },
-          "top_scope": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Top Scope"
-          },
-          "type": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Type"
-          },
-          "type_ja": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Type Ja"
-          },
-          "value": {
-            "title": "Value"
-          }
-        },
-        "required": [
-          "id",
-          "name",
-          "type",
-          "type_ja",
-          "status",
-          "value",
-          "top_scope",
-          "phase",
-          "category",
-          "path"
-        ],
-        "title": "GraphSearchNode",
-        "type": "object"
-      },
-      "GraphSearchResponse": {
-        "description": "グラフ検索の結果（GET /graph/search）。",
-        "properties": {
-          "counts": {
-            "$ref": "#/components/schemas/GraphSearchCounts"
-          },
-          "edges": {
-            "items": {
-              "$ref": "#/components/schemas/GraphEdge"
-            },
-            "title": "Edges",
-            "type": "array"
-          },
-          "nodes": {
-            "items": {
-              "$ref": "#/components/schemas/GraphSearchNode"
-            },
-            "title": "Nodes",
-            "type": "array"
-          },
-          "world": {
-            "title": "World",
-            "type": "string"
-          }
-        },
-        "required": [
-          "world",
-          "nodes",
-          "edges",
-          "counts"
-        ],
-        "title": "GraphSearchResponse",
-        "type": "object"
-      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -3801,6 +3720,31 @@
         "title": "HealthSummaryResponse",
         "type": "object"
       },
+      "IngestActionAvailability": {
+        "description": "取り込み画面の操作可否。`reason` は操作できないときに画面へそのまま出す平文。",
+        "properties": {
+          "allowed": {
+            "title": "Allowed",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "required": [
+          "allowed"
+        ],
+        "title": "IngestActionAvailability",
+        "type": "object"
+      },
       "IngestBlockedDoc": {
         "description": "`last_run_blocked` の要素（対象ファイルが特定できる blocked flag の doc/reason）。",
         "properties": {
@@ -3818,6 +3762,35 @@
           "reason"
         ],
         "title": "IngestBlockedDoc",
+        "type": "object"
+      },
+      "IngestCompletedCounts": {
+        "description": "最後に最後まで終わった取り込みに対応する件数の集計。`as_of` 時点の値であり、現在値ではない。",
+        "properties": {
+          "as_of": {
+            "title": "As Of",
+            "type": "string"
+          },
+          "indexed": {
+            "title": "Indexed",
+            "type": "integer"
+          },
+          "office_failed": {
+            "title": "Office Failed",
+            "type": "integer"
+          },
+          "scanned": {
+            "title": "Scanned",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "as_of",
+          "scanned",
+          "indexed",
+          "office_failed"
+        ],
+        "title": "IngestCompletedCounts",
         "type": "object"
       },
       "IngestNotice": {
@@ -3869,6 +3842,24 @@
           "ok"
         ],
         "title": "OkResponse",
+        "type": "object"
+      },
+      "OllamaTestReq": {
+        "description": "管理画面「ローカル AI（Ollama）の既定接続先」の接続テスト（admin 専用・`POST /admin/settings/ollama-test`）。保存前の入力中の値でその場だけ試し、DB は書かない。",
+        "properties": {
+          "ollama_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ollama Url"
+          }
+        },
+        "title": "OllamaTestReq",
         "type": "object"
       },
       "OllamaUrlChoiceInfo": {
@@ -3993,6 +3984,206 @@
           "confirm_password"
         ],
         "title": "PasswordChangeReq",
+        "type": "object"
+      },
+      "PathRuleFilesResponse": {
+        "properties": {
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "folder": {
+            "title": "Folder",
+            "type": "string"
+          },
+          "next_offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Offset"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "folder",
+          "files",
+          "truncated",
+          "total",
+          "next_offset"
+        ],
+        "title": "PathRuleFilesResponse",
+        "type": "object"
+      },
+      "PathRuleFolder": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "depth": {
+            "title": "Depth",
+            "type": "integer"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "label",
+          "depth",
+          "count"
+        ],
+        "title": "PathRuleFolder",
+        "type": "object"
+      },
+      "PathRuleItem": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "outside_scope": {
+            "default": false,
+            "title": "Outside Scope",
+            "type": "boolean"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "target_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Type"
+          }
+        },
+        "required": [
+          "path",
+          "kind"
+        ],
+        "title": "PathRuleItem",
+        "type": "object"
+      },
+      "PathRulesPutReq": {
+        "additionalProperties": false,
+        "properties": {
+          "rules": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PathRuleItem"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "world": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "World"
+          }
+        },
+        "title": "PathRulesPutReq",
+        "type": "object"
+      },
+      "PathRulesResponse": {
+        "properties": {
+          "folders": {
+            "items": {
+              "$ref": "#/components/schemas/PathRuleFolder"
+            },
+            "title": "Folders",
+            "type": "array"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "removed_missing": {
+            "title": "Removed Missing",
+            "type": "integer"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/PathRuleItem"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "world": {
+            "title": "World",
+            "type": "string"
+          }
+        },
+        "required": [
+          "world",
+          "label",
+          "rules",
+          "removed_missing",
+          "folders"
+        ],
+        "title": "PathRulesResponse",
+        "type": "object"
+      },
+      "PathRulesSaveResponse": {
+        "properties": {
+          "dropped_children": {
+            "items": {
+              "$ref": "#/components/schemas/PathRuleItem"
+            },
+            "title": "Dropped Children",
+            "type": "array"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/PathRuleItem"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "world": {
+            "title": "World",
+            "type": "string"
+          }
+        },
+        "required": [
+          "world",
+          "rules",
+          "dropped_children"
+        ],
+        "title": "PathRulesSaveResponse",
         "type": "object"
       },
       "PinReq": {
@@ -4133,6 +4324,17 @@
               "type": "string"
             },
             "title": "Copy Paths",
+            "type": "array"
+          },
+          "name_rules": {
+            "default": [],
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Name Rules",
             "type": "array"
           },
           "path_aliases": {
@@ -4841,32 +5043,6 @@
             ],
             "title": "Depth Base Grep Max Hits"
           },
-          "depth_base_impact_depth": {
-            "anyOf": [
-              {
-                "maximum": 64.0,
-                "minimum": 1.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Depth Base Impact Depth"
-          },
-          "depth_base_qa_max_hits": {
-            "anyOf": [
-              {
-                "maximum": 1000.0,
-                "minimum": 1.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Depth Base Qa Max Hits"
-          },
           "depth_base_read_window": {
             "anyOf": [
               {
@@ -4880,18 +5056,16 @@
             ],
             "title": "Depth Base Read Window"
           },
-          "depth_base_troubleshoot_depth": {
+          "embed_batch_size": {
             "anyOf": [
               {
-                "maximum": 16.0,
-                "minimum": 1.0,
                 "type": "integer"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Depth Base Troubleshoot Depth"
+            "title": "Embed Batch Size"
           },
           "embed_dim": {
             "anyOf": [
@@ -4927,6 +5101,17 @@
               }
             ],
             "title": "Embed Provider"
+          },
+          "embed_request_timeout_s": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embed Request Timeout S"
           },
           "legacy_backend": {
             "anyOf": [
@@ -4968,6 +5153,17 @@
               }
             ],
             "title": "Model Catalog"
+          },
+          "ocr_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ocr Enabled"
           },
           "ollama_allowlist": {
             "anyOf": [
@@ -7681,6 +7877,11 @@
             "title": "Ok",
             "type": "boolean"
           },
+          "physical_deleted": {
+            "default": true,
+            "title": "Physical Deleted",
+            "type": "boolean"
+          },
           "rel_path": {
             "title": "Rel Path",
             "type": "string"
@@ -7828,6 +8029,14 @@
           "source": {
             "title": "Source",
             "type": "string"
+          },
+          "unsearched": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Unsearched",
+            "type": "array"
           }
         },
         "required": [
@@ -7980,8 +8189,15 @@
         "type": "object"
       },
       "WorldRecountResponse": {
-        "description": "再集計（POST /worlds/{wid}/recount）。スキャンを明示的に再実行してキャッシュし直し、取り込み状況をフラットに展開して返す（同期）。",
+        "description": "件数の数え直し（POST /worlds/{wid}/recount）。資料を明示的に数えて記録を更新し、取り込み状況をフラットに展開して返す（同期）。",
         "properties": {
+          "actions": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/IngestActionAvailability"
+            },
+            "title": "Actions",
+            "type": "object"
+          },
           "analyzer_declined": {
             "title": "Analyzer Declined",
             "type": "integer"
@@ -8090,6 +8306,10 @@
             "title": "Indexed",
             "type": "integer"
           },
+          "ingest_active": {
+            "title": "Ingest Active",
+            "type": "boolean"
+          },
           "ingest_notices": {
             "default": [],
             "items": {
@@ -8097,6 +8317,43 @@
             },
             "title": "Ingest Notices",
             "type": "array"
+          },
+          "last_completed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Completed At"
+          },
+          "last_completed_counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IngestCompletedCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_failure_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Failure Message"
+          },
+          "last_failure_retrying": {
+            "default": false,
+            "title": "Last Failure Retrying",
+            "type": "boolean"
           },
           "last_run_blocked": {
             "items": {
@@ -8285,6 +8542,11 @@
           "last_run_blocked",
           "last_run_flags_total",
           "last_run_flags_truncated",
+          "last_completed_at",
+          "last_completed_counts",
+          "last_failure_message",
+          "ingest_active",
+          "actions",
           "failed_files",
           "partial_extraction_suspected",
           "stage_summary",
@@ -8333,7 +8595,7 @@
         "type": "object"
       },
       "WorldResolveSettingsResponse": {
-        "description": "資料フォルダの解決範囲の設定（GET/PUT /worlds/{wid}/resolve-settings）。\n\n`copy_paths`＝COPY の取り込み元の場所（優先順・資料フォルダの root からの相対パス）。`path_aliases`＝パスの別名 → 場所。\n`warnings` は資料フォルダの中に見つからない場所（保存は止めない）。`changed` は PUT で内容が変わったか\n（変わると資料フォルダ全体を取り込み直す）。`refresh_started` は PUT でその取り込み直しを起こせたか（false で changed なら別の処理が実行中＝更新待ち）。GET では常に false。",
+        "description": "資料フォルダの解決範囲の設定（GET/PUT /worlds/{wid}/resolve-settings）。\n\n`copy_paths`＝COPY の取り込み元の場所（優先順・資料フォルダの root からの相対パス）。`path_aliases`＝パスの別名 → 場所。`name_rules`＝名前の対応（順序付きの `{from, to}`）。\n`warnings` は資料フォルダの中に見つからない場所（保存は止めない）。`changed` は PUT で内容が変わったか\n（変わると資料フォルダ全体を取り込み直す）。`refresh_started` は PUT でその取り込み直しを起こせたか（false で changed なら別の処理が実行中＝更新待ち）。GET では常に false。",
         "properties": {
           "changed": {
             "title": "Changed",
@@ -8344,6 +8606,16 @@
               "type": "string"
             },
             "title": "Copy Paths",
+            "type": "array"
+          },
+          "name_rules": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Name Rules",
             "type": "array"
           },
           "note": {
@@ -8382,6 +8654,7 @@
           "world_id",
           "copy_paths",
           "path_aliases",
+          "name_rules",
           "warnings",
           "changed",
           "refresh_started",
@@ -8393,6 +8666,13 @@
       "WorldStatusResponse": {
         "description": "資料フォルダの状況（GET /worlds/{wid}/status）。取り込み状況の全キーをフラットに展開する。`last_synced_at` は文字列。",
         "properties": {
+          "actions": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/IngestActionAvailability"
+            },
+            "title": "Actions",
+            "type": "object"
+          },
           "analyzer_declined": {
             "title": "Analyzer Declined",
             "type": "integer"
@@ -8501,6 +8781,10 @@
             "title": "Indexed",
             "type": "integer"
           },
+          "ingest_active": {
+            "title": "Ingest Active",
+            "type": "boolean"
+          },
           "ingest_notices": {
             "default": [],
             "items": {
@@ -8519,6 +8803,43 @@
               }
             ],
             "title": "Label"
+          },
+          "last_completed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Completed At"
+          },
+          "last_completed_counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IngestCompletedCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_failure_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Failure Message"
+          },
+          "last_failure_retrying": {
+            "default": false,
+            "title": "Last Failure Retrying",
+            "type": "boolean"
           },
           "last_run_blocked": {
             "items": {
@@ -8733,6 +9054,11 @@
           "last_run_blocked",
           "last_run_flags_total",
           "last_run_flags_truncated",
+          "last_completed_at",
+          "last_completed_counts",
+          "last_failure_message",
+          "ingest_active",
+          "actions",
           "failed_files",
           "partial_extraction_suspected",
           "stage_summary",
@@ -8797,7 +9123,7 @@
   },
   "info": {
     "description": "社内文書向け Agentic RAG 基盤。取り込み→抽出→ナレッジグラフ→影響分析／チャット／トラブルシュートまでを提供するAPI。",
-    "title": "Sherpa MVP",
+    "title": "Slouch MVP",
     "version": "0.1.0"
   },
   "openapi": "3.1.0",
@@ -8958,7 +9284,7 @@
     },
     "/admin/audit": {
       "get": {
-        "description": "監査ログを閲覧する（管理者のみ）。actor/action/resource 等で絞り込める。閲覧自体が `admin.audit_viewed` として記録される（記録できなければ応答しない）。",
+        "description": "監査ログを閲覧する（管理者のみ）。actor/action/resource 等で絞り込める。閲覧自体が `admin.audit_viewed` として記録される（記録できなければ応答しない）。\n`ext_audit_write_failures` は外部 API の監査行を書けなかった件数（サーバー起動後の累計）。0 でなければ監査ログに欠けがある。",
         "operationId": "admin_audit_list_admin_audit_get",
         "parameters": [
           {
@@ -9374,6 +9700,139 @@
         ]
       }
     },
+    "/admin/build-marks": {
+      "get": {
+        "description": "ビルドの定義を読む場所の印と、置き方から読むフォルダ（ソースの組のフォルダ）を返す（管理者のみ）。",
+        "operationId": "admin_build_marks_get_admin_build_marks_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "world",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "World"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildMarksResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Build Marks Get",
+        "tags": [
+          "管理者:資料の優先と除外"
+        ]
+      },
+      "put": {
+        "description": "ビルドの定義を読む場所の印を置き換えて保存する（管理者のみ・`system_settings` の監査に残る）。次の「今すぐ更新」でグラフだけを作り直して効かせる。\n不正な指定・資料フォルダに無い場所は 422。",
+        "operationId": "admin_build_marks_put_admin_build_marks_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildMarksPutReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildMarksResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Build Marks Put",
+        "tags": [
+          "管理者:資料の優先と除外"
+        ]
+      }
+    },
+    "/admin/connectivity/check": {
+      "post": {
+        "description": "経路ごとに決まった確認を流す（管理者のみ・同時に 1 本・有料を含む実行は監査に残す）。",
+        "operationId": "admin_connectivity_check_admin_connectivity_check_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectivityCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectivityCheckResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Connectivity Check",
+        "tags": [
+          "管理者:つながりの確認"
+        ]
+      }
+    },
     "/admin/es/search": {
       "get": {
         "description": "管理者向けの ES 検索（読み取り専用）。クエリ param `world` は他の API と同じ取込ディレクトリ（world id）。",
@@ -9702,6 +10161,181 @@
         ]
       }
     },
+    "/admin/path-rules": {
+      "get": {
+        "description": "資料フォルダの優先・除外の設定とフォルダの木を返す（管理者のみ）。\n開いたときに、もう存在しない場所の設定を取り除いて保存し、取り除いた件数を `removed_missing` で返す（定期の走査はしない）。",
+        "operationId": "admin_path_rules_get_admin_path_rules_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "world",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "World"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PathRulesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Path Rules Get",
+        "tags": [
+          "管理者:資料の優先と除外"
+        ]
+      },
+      "put": {
+        "description": "資料フォルダ 1 つの優先・除外の設定を置き換えて保存する（管理者のみ・`system_settings` の監査に残る）。\n不正（`..`・絶対パス・種類・「範囲の外でも読む」を除外に付ける等）は 422。親に設定がある場所の配下の設定は保存の時点で落とし、落とした設定を返す。",
+        "operationId": "admin_path_rules_put_admin_path_rules_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PathRulesPutReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PathRulesSaveResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Path Rules Put",
+        "tags": [
+          "管理者:資料の優先と除外"
+        ]
+      }
+    },
+    "/admin/path-rules/files": {
+      "get": {
+        "description": "フォルダ直下のファイルの一覧（管理者のみ・名前順）。`folder` が空なら資料フォルダの直下。\n`offset`／`limit` でページ送りする（続きがあれば `next_offset`・無ければ null）。`total` は直下のファイルの総数。",
+        "operationId": "admin_path_rules_files_admin_path_rules_files_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "world",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "World"
+            }
+          },
+          {
+            "in": "query",
+            "name": "folder",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Folder",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PathRuleFilesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Path Rules Files",
+        "tags": [
+          "管理者:資料の優先と除外"
+        ]
+      }
+    },
     "/admin/settings": {
       "get": {
         "description": "全体設定（取り込みアーム・旧形式変換バックエンド）の現行値＋実効値を返す（admin のみ）。`legacy_backend.libreoffice` に soffice の検出状態（有無＋バージョン）を含める。",
@@ -9722,7 +10356,7 @@
         ]
       },
       "put": {
-        "description": "全体設定を部分更新する（admin のみ・検証・監査・fail-closed）。応答は GET と同形。\n未指定キーは変更せず、`null` は未設定へ戻す（コードの既定へ戻る）。検証:\n- arms_enabled: 既知アーム名のみ。legacy_backend: none|libreoffice|office_com。rag_llm_render: on|off。vlm: provider/model/cloud_allowed の型。\n- ollama_allowlist/webhook_allowlist: 各エントリを host:port に正規化して保存（不正は 422）。\n- codex_session_retention_days: 0 以上の整数（0=無制限）。\n- openai_endpoint_kind/base_url/auth_header/api_version: 種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら実効 base_url が空でないことも確認する。\n- research_default_provider: ollama/openai のみ。\"openai\" への変更は適用後の実効設定で実送信可能性も確認する。\n- depth_base_*: 整数 5 項目は範囲検証済み。depth_base_codex_reasoning は定義済みの推論レベルのみ。\n- chat_max_turns_per_user/chat_max_turns_global: 1〜16／1〜64。agentic_budget_per_result: 1024〜8MiB。\n- workspace_max_bytes: 1MiB〜1GiB。workspace_ttl_days: 0〜3650（0=無期限）。\n- chat_examples: `{enabled, items}`（items は最大 8 件・各 1〜200 文字）。codex_worker_model: 文字列のみ（空文字/null は未設定へ戻す）。codex_mode: standard/plain のみ。\n設定変更と監査は同一トランザクションで行い、監査に失敗すれば設定変更も取り消されて 500 を返す。",
+        "description": "全体設定を部分更新する（admin のみ・検証・監査・fail-closed）。応答は GET と同形。\n未指定キーは変更せず、`null` は未設定へ戻す（コードの既定へ戻る）。検証:\n- arms_enabled: 既知アーム名のみ。legacy_backend: none|libreoffice|office_com。rag_llm_render: on|off。vlm: provider/model/cloud_allowed の型。\n- ollama_allowlist/webhook_allowlist: 各エントリを host:port に正規化して保存（不正は 422）。\n- codex_session_retention_days: 0 以上の整数（0=無制限）。\n- openai_endpoint_kind/base_url/auth_header/api_version: 種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら実効 base_url が空でないことも確認する。\n- research_default_provider: ollama/openai のみ。\"openai\" への変更は適用後の実効設定で実送信可能性も確認する。\n- depth_base_*: 整数 2 項目は範囲検証済み。depth_base_codex_reasoning は定義済みの推論レベルのみ。\n- chat_max_turns_per_user/chat_max_turns_global: 1〜16／1〜64。agentic_budget_per_result: 1024〜8MiB。\n- workspace_max_bytes: 1MiB〜1GiB。workspace_ttl_days: 0〜3650（0=無期限）。\n- chat_examples: `{enabled, items}`（items は最大 8 件・各 1〜200 文字）。codex_worker_model: 文字列のみ（空文字/null は未設定へ戻す）。codex_mode: standard/plain のみ。\n設定変更と監査は同一トランザクションで行い、監査に失敗すれば設定変更も取り消されて 500 を返す。",
         "operationId": "admin_settings_put_admin_settings_put",
         "requestBody": {
           "content": {
@@ -9755,6 +10389,48 @@
           }
         },
         "summary": "Admin Settings Put",
+        "tags": [
+          "管理者:全体設定"
+        ]
+      }
+    },
+    "/admin/settings/ollama-test": {
+      "post": {
+        "description": "ローカル AI（Ollama）の既定接続先を、保存前の入力中の値でその場だけ試す（admin 専用・`/api/tags` を 1 回と、簡易回答・Codex のモデルへ `/api/show` を数回読む・DB は書かない・プロキシを通さず直接つなぐ）。\n実行を監査する（`ollama_endpoint.tested`・記録は host:port のみ）。監査の書き込みに失敗したら接続せず 500 で中断する。",
+        "operationId": "admin_ollama_test_admin_settings_ollama_test_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OllamaTestReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminOllamaTestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Ollama Test",
         "tags": [
           "管理者:全体設定"
         ]
@@ -10866,7 +11542,7 @@
     },
     "/conversations/{cid}": {
       "delete": {
-        "description": "会話を削除する（所有会話・受領ラッパーいずれも可）。\n生きた受領ラッパーがこの会話を参照している場合は論理削除（自分の一覧からは消えるが受領側は引き続き読める）、無ければ物理削除する。どちらも Codex の継続セッションは即時に削除する。\nCodex が実行中の会話は DB に触れず 409 を返す（Codex の実行と同じ会話単位のロックを、DB を変える前に待たずに取る）。",
+        "description": "会話を削除する（所有会話・受領ラッパーいずれも可）。\n生きた受領ラッパーがこの会話を参照している場合は論理削除（自分の一覧からは消えるが受領側は引き続き読める）、無ければ物理削除する。どちらも Codex の継続セッションは即時に削除し、消せなかったときは `sessions_removed: false` で知らせる。\nCodex が実行中の会話は DB に触れず 409 を返す（Codex の実行と同じ会話単位のロックを、DB を変える前に待たずに取る）。",
         "operationId": "conversation_delete_conversations__cid__delete",
         "parameters": [
           {
@@ -11248,7 +11924,7 @@
     },
     "/documents": {
       "get": {
-        "description": "文書台帳（doc_id＝rel_path＋フォルダ由来の範囲メタ）を返す。物理パスは出さない。\nページング（`limit`/`offset`・上限 1000）は明示指定したときだけ有効で、省略時は全件を返す。応答の `world`/`documents` はそのままで、`total`/`has_more` を常に追加し、`limit`/`offset` を指定したときだけその実効値も追加する。\n取り込み済みの文書台帳から返す。台帳が空の world だけはフォルダを走査して返す。",
+        "description": "文書台帳（doc_id＝rel_path＋フォルダ由来の範囲メタ）を返す。物理パスは出さない。\nページング（`limit`/`offset`・上限 1000）は明示指定したときだけ有効で、省略時は全件を返す。応答の `world`/`documents` はそのままで、`total`/`has_more` を常に追加し、`limit`/`offset` を指定したときだけその実効値も追加する。\n取り込み済みの文書台帳から返す。台帳が空の world だけはフォルダを（期限つきで）走査して返し、期限を超えたら 503。",
         "operationId": "documents_list_documents_get",
         "parameters": [
           {
@@ -11326,7 +12002,7 @@
     },
     "/documents/download": {
       "get": {
-        "description": "根拠の原本をダウンロードする。doc_id＝rel_path（world root 相対）。\n台帳に載っているファイルだけが対象で、秘匿ファイル・台帳に無い名前・root 外は 404。アーカイブ取り込み（zip/tar(.gz)/tgz）の中のファイルは、展開した写しを返す（原本アーカイブそのものではない）。\nダウンロードは監査に記録され、記録できなければ許可しない。",
+        "description": "根拠の原本をダウンロードする。doc_id＝rel_path（world root 相対）。\n対象は台帳に載っているファイル、または出典の確かめと同じ条件（`doc_reach.doc_reachable`＝実在・文書種別・取り込みが外すものでない）を満たすファイル。秘匿ファイル・それ以外の名前・root 外は 404（理由は区別しない）。アーカイブ取り込み（zip/tar(.gz)/tgz）の中のファイルは、展開した写しを返す（原本アーカイブそのものではない）。\nダウンロードは監査に記録され、記録できなければ許可しない。",
         "operationId": "doc_download_documents_download_get",
         "parameters": [
           {
@@ -12148,7 +12824,7 @@
             }
           },
           "429": {
-            "description": "レート制限を超過しました",
+            "description": "レート制限を超過しました、または待ち列が上限（全体・鍵ごと）に達しています（`Retry-After` 秒後に再試行）",
             "headers": {
               "X-Request-Id": {
                 "description": "リクエスト追跡ID",
@@ -12624,6 +13300,23 @@
           "429": {
             "description": "レート制限を超過しました",
             "headers": {
+              "X-Request-Id": {
+                "description": "リクエスト追跡ID",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "変換が混み合っています（Retry-After 秒後に再試行してください）",
+            "headers": {
+              "Retry-After": {
+                "description": "再試行までの目安秒数",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "X-Request-Id": {
                 "description": "リクエスト追跡ID",
                 "schema": {
@@ -13471,236 +14164,6 @@
         ]
       }
     },
-    "/graph": {
-      "get": {
-        "description": "ナレッジグラフの可視化用データ（nodes/edges・読み取り専用）を返す。\n既定は主要ノードのみ（次数上位・`limit` 未指定は 100 件）。`limit=0` で全件。内容署名の ETag を付け、`If-None-Match` が一致すれば 304 を返す。\nworld 世代の確認に失敗した場合は、握り潰さずログ付きの 503 にする。",
-        "operationId": "graph_get_graph_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "world",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "World"
-            }
-          },
-          {
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "maximum": 100000,
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Limit"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GraphResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Graph Get",
-        "tags": [
-          "ナレッジグラフ"
-        ]
-      }
-    },
-    "/graph/facets": {
-      "get": {
-        "description": "グラフ検索の選択肢（label/relationship の閉じた語彙）を返す。",
-        "operationId": "graph_facets_graph_facets_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GraphFacetsResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Graph Facets",
-        "tags": [
-          "ナレッジグラフ"
-        ]
-      }
-    },
-    "/graph/search": {
-      "get": {
-        "description": "関係種別/属性条件でグラフを検索し、可視化と同じ nodes/edges 形で返す。",
-        "operationId": "graph_search_graph_search_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "world",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "World"
-            }
-          },
-          {
-            "in": "query",
-            "name": "relationship",
-            "required": false,
-            "schema": {
-              "items": {
-                "type": "string"
-              },
-              "title": "Relationship",
-              "type": "array"
-            }
-          },
-          {
-            "in": "query",
-            "name": "field",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Field"
-            }
-          },
-          {
-            "in": "query",
-            "name": "value",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Value"
-            }
-          },
-          {
-            "in": "query",
-            "name": "op",
-            "required": false,
-            "schema": {
-              "default": "eq",
-              "title": "Op",
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "include_deprecated",
-            "required": false,
-            "schema": {
-              "default": false,
-              "title": "Include Deprecated",
-              "type": "boolean"
-            }
-          },
-          {
-            "in": "query",
-            "name": "scope_paths",
-            "required": false,
-            "schema": {
-              "items": {
-                "type": "string"
-              },
-              "title": "Scope Paths",
-              "type": "array"
-            }
-          },
-          {
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "default": 200,
-              "maximum": 1000,
-              "minimum": 1,
-              "title": "Limit",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GraphSearchResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Graph Search",
-        "tags": [
-          "ナレッジグラフ"
-        ]
-      }
-    },
     "/health/summary": {
       "get": {
         "description": "バックエンド健全性のサマリを返す（全画面の状態ドット用・ログイン必須）。Postgres 停止時にも例外にならず down を返す（未ログインは 401）。",
@@ -13745,7 +14208,7 @@
     },
     "/ingest/preview": {
       "get": {
-        "description": "取り込み・抽出プレビュー（読み取り専用）。world グラフの抽出内容を返す。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする（`/graph` と同じ固定文言）。",
+        "description": "取り込み・抽出プレビュー（読み取り専用）。資料の一覧（台帳から）・フォルダと、取り込みの記録の件数を返す。要素・関係は `GET /ingest/preview/graph`。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする。",
         "operationId": "ingest_preview_ingest_preview_get",
         "parameters": [
           {
@@ -13787,6 +14250,55 @@
           }
         },
         "summary": "Ingest Preview",
+        "tags": [
+          "資料フォルダ(World)管理"
+        ]
+      }
+    },
+    "/ingest/preview/graph": {
+      "get": {
+        "description": "資料フォルダのグラフ（要素・関係・件数）。画面が「関係を確認」を押したときだけ呼ぶ。取り込み中・一度も完了していない・資料が多い資料フォルダは組み立てず、`graph_note` に理由を返す。",
+        "operationId": "ingest_preview_graph_ingest_preview_graph_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "world",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "World"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ingest Preview Graph",
         "tags": [
           "資料フォルダ(World)管理"
         ]
@@ -13882,9 +14394,73 @@
         ]
       }
     },
+    "/ingest/runs/mark": {
+      "get": {
+        "description": "取り込み run 1 件の `id` と `status` だけ。run が無ければ `run=null`。",
+        "operationId": "ingest_run_mark_ingest_runs_mark_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "world",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "World"
+            }
+          },
+          {
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ingest Run Mark",
+        "tags": [
+          "資料フォルダ(World)管理"
+        ]
+      }
+    },
     "/ingest/workers": {
       "get": {
-        "description": "取り込みワーカーと Web アプリの版の照合（管理者のみ）。ワーカーが動いていない・版が違うときは `message` に画面に出すお知らせが入る。",
+        "description": "取り込みと画像文字読み取りの稼働状況（管理者のみ）。画面上部へ出す平文のお知らせを返す。",
         "operationId": "ingest_workers_status_ingest_workers_get",
         "responses": {
           "200": {
@@ -13924,7 +14500,7 @@
     },
     "/scopes": {
       "get": {
-        "description": "範囲セレクタ用のツリー。world のフォルダ prefix（件数つき）を返す。",
+        "description": "範囲セレクタ用のツリー。world のフォルダ prefix（件数つき）を返す。取り込みの台帳から出し、台帳が無いときだけ資料フォルダを（期限つきで）歩く。\n台帳の変更印から作る ETag を付け、`If-None-Match` が一致すれば本文を作らず 304 を返す（`Cache-Control: private, no-cache`＝毎回確かめる）。",
         "operationId": "scopes_scopes_get",
         "parameters": [
           {
@@ -13995,7 +14571,7 @@
         ]
       },
       "put": {
-        "description": "現在ユーザーの設定を更新する（未指定フィールドは変更しない）。\n`agent` は許可された頭脳のみ（閉じた頭脳は 422）。`ollama_url` は宛先ポリシー（loopback／admin allowlist）に合わないと 422（到達可否の詳細は返さない）。管理画面で個人キーが許可されていない（`personal_api_keys_allowed` が偽）ときは、クラウド AI のキーを保存できず 422。",
+        "description": "現在ユーザーの設定を更新する（未指定フィールドは変更しない）。\n`agent` は許可された頭脳のみ（閉じた頭脳は 422）。`ollama_url` は宛先ポリシー（loopback／中央の既定接続先／admin allowlist）に合わないと 422（到達可否の詳細は返さない）。管理画面で個人キーが許可されていない（`personal_api_keys_allowed` が偽）ときは、クラウド AI のキーを保存できず 422。",
         "operationId": "settings_put_settings_put",
         "requestBody": {
           "content": {
@@ -14037,7 +14613,7 @@
     },
     "/settings/test": {
       "post": {
-        "description": "API キー/モデルの接続テスト（1 回だけ最小リクエスト）。保存はしない。入力中のキーで試せる。\n返値 `{ok, provider, model, detail}`。ok=False の detail に実エラー（401=認証/429=クォータ/モデル不明 等）を載せる。\nprovider=ollama は宛先ポリシー（loopback／admin allowlist）に合わないと接続せず 422 を返す。接続後の失敗は、到達可否の区別を出さず丸める（401 相当の認証失敗だけ区別を残す）。",
+        "description": "API キー/モデルの接続テスト（1 回だけ最小リクエスト）。保存はしない。入力中のキーで試せる。\n返値 `{ok, provider, model, detail}`。ok=False の detail に実エラー（401=認証/429=クォータ/モデル不明 等）を載せる。\nprovider=ollama は宛先ポリシー（loopback／中央の既定接続先／admin allowlist）に合わないと接続せず 422 を返す。接続後の失敗は、到達可否の区別を出さず丸める（401 相当の認証失敗だけ区別を残す）。",
         "operationId": "settings_test_settings_test_post",
         "requestBody": {
           "content": {
@@ -14561,6 +15137,117 @@
         ]
       }
     },
+    "/worlds/{wid}/file-state": {
+      "post": {
+        "description": "ファイルの状態を更新する（管理者のみ）。フォルダを背景で歩き、増えたファイルを台帳へ「一部使えます」で足し、なくなったファイルの行を消す。内容が変わったファイルは件数と名前を返すだけで台帳を書かない。\n歩いている間は `state=\"scanning\"`（`scanned`＝確認した件数）を返す。画面は同じ依頼を数秒おきに繰り返して結果（`state=\"ready\"`）を取る。`start=true` は終わった結果を捨てて新しく始める。\n取り込み中・一度も取り込みが終わっていない・前回の明細が無いとき、および書く直前に取り込みや付け替えで世代が変わっていたときは 409（書かない）。\n設計: docs/design/scope.md「ファイルの状態を更新」",
+        "operationId": "world_file_state_worlds__wid__file_state_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "title": "Wid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/FileStateReq"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Req"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "World File State",
+        "tags": [
+          "資料フォルダ(World)管理"
+        ]
+      }
+    },
+    "/worlds/{wid}/folder-check": {
+      "get": {
+        "description": "資料フォルダの置き方が、期のある置き方（案 B）の決まりに合うかを点検する。`format=md` は Markdown のダウンロード。\n名前は最後の取り込みの時点の台帳から読む（`ledger_at`）。台帳が無いときは歩かず 409。",
+        "operationId": "folder_check_worlds__wid__folder_check_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+              "title": "Wid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "default": "json",
+              "pattern": "^(json|md)$",
+              "title": "Format",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Folder Check",
+        "tags": [
+          "資料フォルダ(World)管理"
+        ]
+      }
+    },
     "/worlds/{wid}/rag_regenerate_rules": {
       "post": {
         "description": "rag.md の LLM 成形を一掃し規則版へ作り直すことを即受付する（管理者の明示操作・背景実行）。監査要件等で LLM 出力を今すぐ一掃したいときに使う。\nLLM 成形の既定トグル（`rag_llm_render`）自体は変えない（トグルが ON のままなら次回の後追いパスが再び LLM 成形を試みうる。恒久的に止めるにはトグルも OFF にする）。",
@@ -14712,7 +15399,7 @@
     },
     "/worlds/{wid}/recount": {
       "post": {
-        "description": "取り込み集計を明示的にやり直す（唯一の明示的な実走査）。\n`GET /worlds/{wid}/status` はキャッシュを読むだけなので、未集計の world や手動でファイルを触った world を最新化したいときに呼ぶ。参照元フォルダを 1 回走査して集計を更新するだけで、グラフ/台帳/ES には触れない。走査中に取り込み・付け替えが入って世代が変わっていたら 409 で終え（再試行しない）、参照元が消失・置換された場合や走査自体の失敗は 503 とし、集計結果を保存しない。",
+        "description": "取り込み集計を明示的にやり直す（唯一の明示的な実走査）。\n`GET /worlds/{wid}/status` はキャッシュを読むだけなので、件数をまだ確認していない world や手動でファイルを触った world を最新化したいときに呼ぶ。参照元フォルダを 1 回走査して集計を更新するだけで、グラフ/台帳/ES には触れない。走査中に取り込み・付け替えが入って世代が変わっていたら 409 で終え（再試行しない）、参照元が消失・置換された場合や走査自体の失敗は 503 とし、集計結果を保存しない。",
         "operationId": "world_recount_worlds__wid__recount_post",
         "parameters": [
           {
@@ -14986,10 +15673,6 @@
     {
       "description": "登録ディレクトリ（world）の登録・状態確認・差分・再取込・削除、フォルダ選択。",
       "name": "資料フォルダ(World)管理"
-    },
-    {
-      "description": "ナレッジグラフの可視化データ・検索。",
-      "name": "ナレッジグラフ"
     },
     {
       "description": "ヘルスチェック・ルート・静的UI配信。",

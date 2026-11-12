@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
-from sherpa import app_version, store, usage_export
+from sherpa import app_version, ext_audit_health, store, usage_export
 from sherpa.deps import _current_user, _require_admin
 from sherpa.schemas import (
     AdminAuditListResponse,
@@ -47,7 +47,8 @@ def admin_audit_list(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
-    """監査ログを閲覧する（管理者のみ）。actor/action/resource 等で絞り込める。閲覧自体が `admin.audit_viewed` として記録される（記録できなければ応答しない）。"""
+    """監査ログを閲覧する（管理者のみ）。actor/action/resource 等で絞り込める。閲覧自体が `admin.audit_viewed` として記録される（記録できなければ応答しない）。
+    `ext_audit_write_failures` は外部 API の監査行を書けなかった件数（サーバー起動後の累計）。0 でなければ監査ログに欠けがある。"""
     u = _current_user(request)
     _require_admin(u)
 
@@ -73,7 +74,8 @@ def admin_audit_list(
         _log.critical("audit write failed for admin.audit_viewed – fail-closed")
         raise HTTPException(500, "監査ログの記録に失敗しました（fail-closed）")
 
-    return {"rows": rows, "count": len(rows), "offset": offset, "limit": limit}
+    return {"rows": rows, "count": len(rows), "offset": offset, "limit": limit,
+            "ext_audit_write_failures": ext_audit_health.failure_count()}
 
 
 @audit_usage_router.get("/admin/audit/verify", tags=["管理者:監査ログ"])
@@ -178,7 +180,7 @@ def _join_chat_content(rows: list[dict]) -> None:
             msgs.get(uid_msg), turn_personal=turn_personal) if uid_msg else None
         d["assistant_answer"] = _chat_content_for_export(
             msgs.get(aid_msg), turn_personal=turn_personal) if aid_msg else None
-        r["detail"] = store._redact(d)  # 追加後にもう一度 redaction する（多層防御）。
+        r["detail"] = d
 
 
 @audit_usage_router.get("/admin/audit/export", tags=["管理者:監査ログ"])

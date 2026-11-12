@@ -62,10 +62,6 @@ def _ctx(uid: str, stop_event=None, conversation_id=None) -> "A.Ctx":
         message="偽 codex kill/timeout テスト",
         world="v1",
         route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline",
-            "summary": {"total": 0}, "data": {}, "sources": [],
-        },
         knowledge=True,
         uid=uid,
         stop_event=stop_event,
@@ -344,10 +340,6 @@ def test_prompt_delivered_via_stdin_not_argv(tmp_path, monkeypatch):
     ctx = A.Ctx(
         message=marker, world="v1",
         route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline",
-            "summary": {"total": 0}, "data": {}, "sources": [],
-        },
         knowledge=True, uid="stdin-prompt-u1",
     )
     list(A.CodexProvider().run(ctx))

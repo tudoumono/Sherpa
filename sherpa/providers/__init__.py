@@ -11,7 +11,7 @@ import shutil
 from typing import Iterator
 
 from .. import layer as layer_mod
-from .base import Ctx, Provider, _node, _plain_run
+from .base import CODEX_CLI_MISSING_HOWTO, Ctx, Provider, _node, _plain_run
 
 
 class _UnwiredProvider(Provider):
@@ -167,8 +167,7 @@ def _select_provider(s: dict, system_settings: dict | None = None) -> Provider:
     if agent == "codex":
         # Codex CLI 不在は未接続として正直に返す。
         if not shutil.which("codex"):
-            return _facade._UnwiredProvider(
-                "Codex", "Codex CLI が見つかりません（閉域キットの tools/codex か npm で導入）")
+            return _facade._UnwiredProvider("Codex", CODEX_CLI_MISSING_HOWTO)
         # Codex(Ollama) は Codex CLI を Ollama へ向ける。接続先は `ollama_url` 設定を使う。
         # 宛先ポリシー（loopback または admin allowlist）をここで検証し、不許可なら未接続として返す。
         ollama_base_url = None
@@ -229,10 +228,7 @@ def _select_provider(s: dict, system_settings: dict | None = None) -> Provider:
                                          openai_api_key=openai_api_key, system_settings=sys_s)
         except model_catalog.InvalidModelNameError as e:
             return _facade._UnwiredProvider("Codex", f"モデル名が不正です（{e}）")
-    if agent == "simple":
-        return _select_simple(sys_s)
-    return _facade._UnwiredProvider(
-        "AI の選択", "選べる AI は「簡易」か「Codex 調査」です。設定画面で選び直してください。")
+    return _select_simple(sys_s)
 
 
 def get_provider(settings: dict | None = None, system_settings: dict | None = None) -> Provider:

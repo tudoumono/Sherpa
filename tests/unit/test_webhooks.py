@@ -1,21 +1,18 @@
 """Webhook 通知（PART-6・sherpa/webhooks.py・docs/archive/2026-09-05-Webhook通知.md）の unit テスト。
 
 対象: 宛先検証（allowlist必須〔loopback含む〕/userinfo拒否/fail-closed・W3・RV是正#1/#8）・
-署名の既知ベクトル（W4）・リトライ回数とバックオフ・試行毎の宛先再評価（W1・RV是正#6・
-`time.sleep` を monkeypatch）・配送キュー（単一 worker＋有界キュー・RV是正#4）・監査記録の
-detail に secret/フル URL が含まれないこと。ネットワーク I/O は一切発生させない
-（`_send_once`/`llm.urlopen_no_redirect` を monkeypatch で差し替える）。
+署名の既知ベクトル（W4）・1 回分の配送（送信のたびの宛先再評価・不許可と宛先なしは再送しない）・
+配送待ちへの保存・監査記録の detail に secret/フル URL が含まれないこと。ネットワーク I/O は一切発生させない
+（`_send_once`/`llm.urlopen_no_redirect` を monkeypatch で差し替える）。再送の間隔と上限・永続は `tests/api/test_outbox_delivery.py`。
 """
 from __future__ import annotations
 
 import hashlib
 import hmac
-import queue
-import threading
 
 import pytest
 
-from sherpa import webhooks
+from sherpa import outbox_sender, webhooks
 
 
 # ---- 宛先検証（W3） ----
@@ -118,25 +115,31 @@ class _FakeStore:
     `webhooks.py` 内の遅延 import にもそのまま効く）。"""
 
 
-@pytest.fixture(autouse=True)
-def _no_sleep(monkeypatch):
-    """リトライのバックオフを待たない（テストを高速化する・回数自体は別途検証する）。"""
-    monkeypatch.setattr(webhooks.time, "sleep", lambda *_a, **_kw: None)
+def _row(key_id=7, payload=None, attempts=1, row_id=11):
+    return {"id": row_id, "kind": "webhook", "key_id": key_id, "attempts": attempts,
+            "payload": payload or {"event": "ingest.completed", "world": "test", "run_id": 1}}
 
 
-def test_deliver_success_on_first_attempt_records_delivered_audit(monkeypatch):
+def _dest(monkeypatch, url="https://example.com/hook", secret="sec"):
+    from sherpa import store
+    monkeypatch.setattr(store, "get_api_key_webhook",
+                        lambda kid: {"webhook_url": url, "webhook_secret": secret} if url else None)
+
+
+def test_deliver_row_success_sends_once_and_records_delivered_audit(monkeypatch):
     from sherpa import store
 
     sent = []
     monkeypatch.setattr(webhooks, "_send_once", lambda *a, **kw: sent.append(a))
     monkeypatch.setattr(webhooks, "assert_webhook_url_allowed", lambda *a, **kw: None)
+    _dest(monkeypatch)
     audits = []
     monkeypatch.setattr(store, "audit", lambda *a, **kw: audits.append((a, kw)))
 
-    webhooks._deliver(7, "https://example.com/hook", "sec", {
-        "event": "ingest.completed", "world": "test", "run_id": 1})
+    webhooks._deliver_row(_row())
 
-    assert len(sent) == 1   # 即時送信で成功＝リトライしない
+    assert len(sent) == 1
+    assert sent[0][:2] == ("https://example.com/hook", "sec")
     assert len(audits) == 1
     args, kwargs = audits[0]
     assert args[1] == "webhook.delivered"
@@ -151,64 +154,30 @@ def test_deliver_success_on_first_attempt_records_delivered_audit(monkeypatch):
     assert "/hook" not in detail_str
 
 
-def test_deliver_retries_three_times_then_gives_up(monkeypatch):
-    """即時送信＋失敗時リトライ3回＝合計4回試行してから諦める（W1）。"""
-    from sherpa import store
-
-    attempts = []
-
-    def _always_fail(*a, **kw):
-        attempts.append(1)
+def test_deliver_row_send_failure_propagates_so_the_sender_can_retry(monkeypatch):
+    def _fail(*a, **kw):
         raise ConnectionError("boom")
 
-    monkeypatch.setattr(webhooks, "_send_once", _always_fail)
+    monkeypatch.setattr(webhooks, "_send_once", _fail)
     monkeypatch.setattr(webhooks, "assert_webhook_url_allowed", lambda *a, **kw: None)
-    sleeps = []
-    monkeypatch.setattr(webhooks.time, "sleep", lambda s: sleeps.append(s))
-    audits = []
-    monkeypatch.setattr(store, "audit", lambda *a, **kw: audits.append((a, kw)))
-
-    webhooks._deliver(9, "https://example.com/hook", "sec", {
-        "event": "ingest.failed", "world": "test", "run_id": 2})
-
-    assert len(attempts) == 4                 # 即時1回＋リトライ3回
-    assert sleeps == [2, 8, 30]                # W1 の裁定どおりのバックオフ間隔
-    assert len(audits) == 1
-    args, kwargs = audits[0]
-    assert args[1] == "webhook.failed"
-    assert kwargs["outcome"] == "failure"
-    assert kwargs["detail"]["attempts"] == 4
-    assert kwargs["reason"] == "ConnectionError"
+    _dest(monkeypatch)
+    with pytest.raises(ConnectionError):
+        webhooks._deliver_row(_row())
 
 
-def test_deliver_succeeds_on_retry_stops_immediately(monkeypatch):
-    """2回目で成功したら3回目以降は送らない。"""
-    from sherpa import store
-
-    attempts = []
-
-    def _fail_once_then_succeed(*a, **kw):
-        attempts.append(1)
-        if len(attempts) < 2:
-            raise TimeoutError("slow")
-
-    monkeypatch.setattr(webhooks, "_send_once", _fail_once_then_succeed)
+def test_deliver_row_uses_the_same_request_id_on_every_attempt(monkeypatch):
+    rids = []
+    monkeypatch.setattr(webhooks, "_send_once", lambda url, secret, body, rid, event: rids.append(rid))
     monkeypatch.setattr(webhooks, "assert_webhook_url_allowed", lambda *a, **kw: None)
-    audits = []
-    monkeypatch.setattr(store, "audit", lambda *a, **kw: audits.append((a, kw)))
-
-    webhooks._deliver(1, "https://example.com/hook", "sec", {
-        "event": "ingest.completed", "world": "test", "run_id": 3})
-
-    assert len(attempts) == 2
-    assert audits[0][1]["outcome"] == "success"
-    assert audits[0][1]["detail"]["attempts"] == 2
+    monkeypatch.setattr("sherpa.store.audit", lambda *a, **kw: None)
+    _dest(monkeypatch)
+    webhooks._deliver_row(_row(attempts=1))
+    webhooks._deliver_row(_row(attempts=2))
+    assert len(set(rids)) == 1
 
 
-def test_deliver_invalid_destination_skips_network_and_retries(monkeypatch):
-    """送信直前の宛先再検証で不許可なら、ネットワークへは一切出さず1回で打ち切る（リトライしない）。"""
-    from sherpa import store
-
+def test_deliver_row_invalid_destination_skips_network_and_gives_up(monkeypatch):
+    """送信直前の宛先再検証で不許可なら、ネットワークへは一切出さず再送もしない（`GiveUp`）。"""
     sent = []
     monkeypatch.setattr(webhooks, "_send_once", lambda *a, **kw: sent.append(a))
 
@@ -216,54 +185,35 @@ def test_deliver_invalid_destination_skips_network_and_retries(monkeypatch):
         raise webhooks.WebhookUrlInvalid("拒否")
 
     monkeypatch.setattr(webhooks, "assert_webhook_url_allowed", _reject)
-    audits = []
-    monkeypatch.setattr(store, "audit", lambda *a, **kw: audits.append((a, kw)))
+    _dest(monkeypatch, url="https://evil.example.com/hook")
 
-    webhooks._deliver(3, "https://evil.example.com/hook", "sec", {
-        "event": "ingest.completed", "world": "test", "run_id": 4})
-
+    with pytest.raises(outbox_sender.GiveUp, match="destination_not_allowed"):
+        webhooks._deliver_row(_row(key_id=3))
     assert sent == []
-    assert len(audits) == 1
-    args, kwargs = audits[0]
-    assert args[1] == "webhook.failed"
-    assert kwargs["detail"]["attempts"] == 0
 
 
-def test_deliver_reevaluates_allowlist_before_each_attempt(monkeypatch):
-    """RV是正#6: 宛先ポリシーは試行ごとに再評価する——3回目の直前で admin が allowlist を
-    変更した想定にすると、2回（送信失敗）した時点で打ち切り、3回目は `_send_once` へ到達しない。
-    """
+def test_deliver_row_destination_removed_after_queued_gives_up_without_sending(monkeypatch):
+    """積んだ後に宛先が無効になったら（失効・削除・所有者無効化）送らず、再送もしない。"""
+    sent = []
+    monkeypatch.setattr(webhooks, "_send_once", lambda *a, **kw: sent.append(a))
+    monkeypatch.setattr(webhooks, "assert_webhook_url_allowed", lambda *a, **kw: None)
+    _dest(monkeypatch, url=None)
+    with pytest.raises(outbox_sender.GiveUp, match="destination_removed"):
+        webhooks._deliver_row(_row())
+    assert sent == []
+
+
+def test_record_gave_up_audits_the_reason(monkeypatch):
     from sherpa import store
-
-    check_calls = []
-
-    def _check(url, **kw):
-        check_calls.append(1)
-        if len(check_calls) >= 3:
-            raise webhooks.WebhookUrlInvalid("拒否（途中で allowlist が変わった想定）")
-
-    monkeypatch.setattr(webhooks, "assert_webhook_url_allowed", _check)
-
-    send_calls = []
-
-    def _always_fail(*a, **kw):
-        send_calls.append(1)
-        raise ConnectionError("boom")
-
-    monkeypatch.setattr(webhooks, "_send_once", _always_fail)
+    _dest(monkeypatch)
     audits = []
     monkeypatch.setattr(store, "audit", lambda *a, **kw: audits.append((a, kw)))
-
-    webhooks._deliver(5, "https://example.com/hook", "sec", {
-        "event": "ingest.failed", "world": "test", "run_id": 6})
-
-    assert len(check_calls) == 3    # 1・2回目は許可・3回目の再評価で不許可
-    assert len(send_calls) == 2     # 3回目は _send_once へ到達しない
-    assert len(audits) == 1
+    webhooks._record_gave_up(_row(attempts=4), "ConnectionError")
     args, kwargs = audits[0]
     assert args[1] == "webhook.failed"
-    assert kwargs["detail"]["attempts"] == 2
-    assert kwargs["reason"] == "WebhookUrlInvalid"
+    assert kwargs["outcome"] == "failure"
+    assert kwargs["reason"] == "ConnectionError"
+    assert kwargs["detail"]["attempts"] == 4
 
 
 def test_send_once_does_not_read_response_body(monkeypatch):
@@ -285,9 +235,8 @@ def test_send_once_does_not_read_response_body(monkeypatch):
 
 
 # ---- notify_run_terminal のイベント/対象キー解決 ----
-# RV是正#4: 実送信は単一 daemon worker＋有界キューへ変わった（`threading.Thread` をキーごとに
-# 起こす旧実装ではない）ため、ここでは `_enqueue`（キュー投入の直前まで）を monkeypatch して
-# 検証する。`_enqueue` 自体・worker/キューの挙動は下の「配送キュー」節で別途検証する。
+# 配送待ちへの保存は `_enqueue` が担う。ここでは `_enqueue` を monkeypatch して対象キューと本文だけを検証する。
+# 保存・送り手の挙動は `tests/api/test_outbox_delivery.py`。
 
 def test_notify_run_terminal_maps_status_to_event_and_enqueues_per_key(monkeypatch):
     from sherpa import store
@@ -302,10 +251,8 @@ def test_notify_run_terminal_maps_status_to_event_and_enqueues_per_key(monkeypat
     webhooks.notify_run_terminal("test", 42, "sync", "auto_published_with_flags", doc_count=5)
 
     assert len(enqueued) == 2
-    key_id0, url0, secret0, payload0 = enqueued[0]
+    key_id0, payload0 = enqueued[0]
     assert key_id0 == 1
-    assert url0 == "https://a.example.com/hook"
-    assert secret0 == "sa"
     assert payload0["event"] == "ingest.completed"
     assert payload0["world"] == "test"
     assert payload0["run_id"] == 42
@@ -323,7 +270,7 @@ def test_notify_run_terminal_failed_status_maps_to_ingest_failed(monkeypatch):
 
     webhooks.notify_run_terminal("test", 1, "delete", "failed")
 
-    assert enqueued[0][3]["event"] == "ingest.failed"
+    assert enqueued[0][1]["event"] == "ingest.failed"
 
 
 def test_notify_run_terminal_no_keys_does_not_enqueue(monkeypatch):
@@ -345,114 +292,42 @@ def test_notify_run_terminal_swallows_store_errors(monkeypatch):
     webhooks.notify_run_terminal("test", 1, "sync", "auto_published")   # 例外を投げなければ成功
 
 
-# ---- 配送キュー: 単一 worker＋有界キュー（W1・RV是正#4） ----
+# ---- 配送待ちへの保存 ----
 
-@pytest.fixture
-def _isolated_queue(monkeypatch):
-    """モジュール共有のグローバル `_queue`/`_worker_thread` をテスト間で汚染しないよう、
-    各テストで専用のインスタンスに差し替える（本番は単一プロセス内で1つを使い回す設計のため、
-    モジュール変数を直接 monkeypatch する。実スレッドは起こさない——`_ensure_worker_started`
-    は各テストで個別に monkeypatch/検証する）。"""
-    fake_q: queue.Queue = queue.Queue(maxsize=2)
-    monkeypatch.setattr(webhooks, "_queue", fake_q)
-    monkeypatch.setattr(webhooks, "_worker_thread", None)
-    return fake_q
+def test_enqueue_saves_to_the_outbox(monkeypatch):
+    saved = []
+    monkeypatch.setattr(webhooks.outbox, "add", lambda kind, payload, key_id=None: saved.append((kind, payload, key_id)))
+    webhooks._enqueue(1, {"world": "test", "run_id": 1})
+    assert saved == [("webhook", {"world": "test", "run_id": 1}, 1)]
 
 
-def test_enqueue_starts_worker_and_puts_item(monkeypatch, _isolated_queue):
-    monkeypatch.setattr(webhooks, "_ensure_worker_started", lambda: None)
-    webhooks._enqueue(1, "https://example.com/hook", "sec", {"world": "test", "run_id": 1})
-    assert _isolated_queue.qsize() == 1
-    assert _isolated_queue.get_nowait() == (
-        1, "https://example.com/hook", "sec", {"world": "test", "run_id": 1})
-
-
-def test_enqueue_drops_and_audits_when_queue_full(monkeypatch, _isolated_queue):
-    """RV是正#4: キュー飽和時はその1件だけ捨てて `webhook.dropped` を監査記録する
-    （他キー・取り込み自体には影響させない）。"""
+def test_enqueue_audits_dropped_when_outbox_is_full(monkeypatch):
+    """配送待ちが上限のときは、その1件だけ保存せず `webhook.dropped` を監査記録する（他キー・取り込み自体には影響させない）。"""
     from sherpa import store
-    monkeypatch.setattr(webhooks, "_ensure_worker_started", lambda: None)
-    _isolated_queue.put_nowait((0, "u", "s", {}))   # maxsize=2 を先に埋める
-    _isolated_queue.put_nowait((0, "u", "s", {}))
+
+    def _full(*a, **kw):
+        raise webhooks.outbox.OutboxFull("webhook")
+
+    monkeypatch.setattr(webhooks.outbox, "add", _full)
+    _dest(monkeypatch)
     audits = []
     monkeypatch.setattr(store, "audit", lambda *a, **kw: audits.append((a, kw)))
 
-    webhooks._enqueue(9, "https://example.com/hook", "sec",
-                      {"world": "test", "run_id": 3, "event": "ingest.completed"})
+    webhooks._enqueue(9, {"world": "test", "run_id": 3, "event": "ingest.completed"})
 
-    assert _isolated_queue.qsize() == 2   # 溢れた分は積まれない
     assert len(audits) == 1
     args, kwargs = audits[0]
     assert args[1] == "webhook.dropped"
     assert args[3] == "9"
-    assert kwargs["reason"] == "queue_full"
+    assert kwargs["reason"] == "outbox_full"
     assert kwargs["detail"]["world"] == "test"
     assert kwargs["detail"]["run_id"] == 3
 
 
-def test_ensure_worker_started_starts_only_one_thread(monkeypatch, _isolated_queue):
-    """worker は lazy start・複数回呼んでも生存中なら1本しか起動しない。"""
-    starts = []
+def test_enqueue_swallows_save_errors(monkeypatch):
+    """保存に失敗しても例外を呼び出し元（取り込み）へ伝えない。"""
+    def _boom(*a, **kw):
+        raise RuntimeError("db down")
 
-    class _FakeThread:
-        def __init__(self, target=None, daemon=None, name=None):
-            self._alive = True
-
-        def start(self):
-            starts.append(1)
-
-        def is_alive(self):
-            return self._alive
-
-    monkeypatch.setattr(webhooks.threading, "Thread", _FakeThread)
-    webhooks._ensure_worker_started()
-    webhooks._ensure_worker_started()
-    assert len(starts) == 1
-
-
-def test_process_queue_item_calls_deliver(monkeypatch):
-    """`_worker_loop` の本体（1件分の処理）を実スレッド/実キューなしで直接検証する。"""
-    calls = []
-    monkeypatch.setattr(webhooks, "_deliver", lambda *a: calls.append(a))
-    webhooks._process_queue_item((1, "https://example.com/hook", "sec", {"a": 1}))
-    assert calls == [(1, "https://example.com/hook", "sec", {"a": 1})]
-
-
-def test_process_queue_item_swallows_deliver_exceptions(monkeypatch):
-    """`_deliver` が想定外の例外を投げても worker（呼び出し元のループ）を落とさない。"""
-    def _boom(*a):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(webhooks, "_deliver", _boom)
-    webhooks._process_queue_item((1, "https://example.com/hook", "sec", {}))   # 例外を投げなければ成功
-
-
-def test_codex_job_notice_rechecks_destination_before_each_attempt(monkeypatch):
-    """Codex ジョブの終了通知は積んだ後に宛先が無効になったら（失効・削除・所有者無効化）送らず、
-    再送も打ち切る。送信は外部境界（`_send_once`）だけ差し替える。"""
-    from sherpa import store
-    sent = []
-    dest = {"webhook_url": "http://h.example/x", "webhook_secret": "s"}
-    monkeypatch.setattr(webhooks, "assert_webhook_url_allowed", lambda url, **kw: None)
-    monkeypatch.setattr(webhooks.time, "sleep", lambda s: None)
-    monkeypatch.setattr(store, "audit", lambda *a, **k: None)
-    monkeypatch.setattr(webhooks, "_send_once", lambda *a: sent.append(a))
-    payload = {"event": "codex_job.completed", "job_id": "j", "status": "completed", "finished_at": "t"}
-
-    monkeypatch.setattr(store, "get_api_key_webhook", lambda kid: None)   # 積んだ後に無効化
-    webhooks._deliver(1, "http://old.example/x", "", payload)
-    assert sent == []
-
-    calls = {"n": 0}
-
-    def _first_fail_then_revoked(kid):
-        calls["n"] += 1
-        return dest if calls["n"] == 1 else None
-    monkeypatch.setattr(store, "get_api_key_webhook", _first_fail_then_revoked)
-
-    def _fail(*a):
-        sent.append(a)
-        raise OSError("down")
-    monkeypatch.setattr(webhooks, "_send_once", _fail)
-    webhooks._deliver(1, "http://old.example/x", "", payload)
-    assert len(sent) == 1          # 1 回目だけ送り、再送の直前に失効を検知して打ち切る
+    monkeypatch.setattr(webhooks.outbox, "add", _boom)
+    webhooks._enqueue(1, {"world": "test"})

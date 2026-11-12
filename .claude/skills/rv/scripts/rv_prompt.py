@@ -34,7 +34,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--proposal", help="設計の裁定をまとめた文書へのパス（任意）")
     p.add_argument("--ledger", help="RV 台帳ファイルへのパス（任意・指定すると全文を同梱する）")
     p.add_argument("--intent", required=True, help="このスライスでのユーザーの意図・完成形の要約（必須）")
-    p.add_argument("--round", type=int, default=1, help="何巡目のレビューか（既定 1）")
+    p.add_argument("--round", type=int, default=1, help="区切りの中で何巡目のレビューか（既定 1）")
+    p.add_argument("--block", type=int, default=1,
+                   help="何区切り目か（3 巡を 1 区切りとし、根本の見直しの後に 1 つ進める・既定 1）")
     p.add_argument("--premises", default=_DEFAULT_PREMISES,
                     help="前提（既定: 閉域 LAN・最大 20 人程度・単一 worker）")
     p.add_argument("--focus", help="レビュアーに確認してほしい事項（任意）")
@@ -47,11 +49,17 @@ def build_prompt(args: argparse.Namespace) -> str:
     """`args` から定型プロンプトを組み立てる（純関数・副作用なし＝決定的出力の実体）。"""
     sections: list[str] = []
 
+    where = f"{args.block} 区切り目の {args.round} 巡目" if args.block > 1 else f"{args.round} 巡目"
     sections.append(
-        f"あなたは敵対レビュアー（{args.round} 巡目）です。差分に含まれる実害のある欠陥だけを指摘し、"
+        f"あなたは敵対レビュアー（{where}）です。差分に含まれる実害のある欠陥だけを指摘し、"
         "最小の是正を促してください。この依頼の外の会話の文脈は見えないため、以下に書かれていない"
         "情報を推測で補わないでください。"
     )
+    if args.block > 1:
+        sections.append(
+            "前の区切りの 3 巡目でも高・中の指摘が多かったため、依頼者が根本から見直した。台帳の「見直し」の節を先に読み、"
+            "見直しで変えた前提・足した観点に照らして見ること。前の区切りの指摘の当て直しだけで済ませていないかも確かめること。"
+        )
 
     target_lines = [
         "## 対象",

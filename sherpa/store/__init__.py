@@ -8,6 +8,8 @@ Postgres の読み書きはドメイン別モジュールに分かれる:
     workspace_files.py 個人 workspace ファイル台帳・TTL
     documents.py      文書台帳
     ingest.py         ingest_runs
+    schema_ingest.py  ingest_runs・名前の台帳・入れ替えの行の DDL（`db._SCHEMA` に展開される）
+    replace_rows.py   入れ替えの行 ingest_replacements・取り込みの番号
     worlds.py         world レジストリ
     audit.py          監査ログ・チェーン検証
     settings.py       ユーザー設定＋全体設定 system_settings
@@ -96,25 +98,36 @@ from .failed_docs import (  # noqa: F401
     summarize_failed_docs,
 )
 
-# documents・ingest の re-export。
+# documents・ingest・replace_rows の re-export。
+from .ledger_stage import purge_stale_ledger, stage_ledger, switch_ledger  # noqa: F401
 from .documents import (  # noqa: F401
-    count_and_list_documents, count_documents, document_exists, get_document, list_document_worlds, list_documents,
-    list_documents_page, replace_document, replace_documents,
+    apply_file_state_delta, count_and_list_documents, count_documents, document_exists, document_names_match, get_document,
+    list_document_names, list_document_worlds, list_documents, list_documents_page, ledger_stamp,
+    read_ledger_for_listing, replace_document, replace_documents,
 )
 from .ingest import (  # noqa: F401
     add_ingest_run,
     claim_queued_run,
+    close_dead_extracting,
     count_queued_runs,
     downgrade_orphaned_extracting_runs,
     enqueue_ingest_run,
     fail_close_if_extracting,
     finish_ingest_run,
+    has_ocr_catchup_run,
     finish_ingest_run_and_confirm_world,
     finish_ingest_run_and_delete_world,
+    finish_ingest_run_and_drop_row,
+    get_latest_ingest_metrics,
+    get_last_finished_run_brief,
+    get_latest_completed_run_at,
     get_latest_es_run_summary,
+    get_latest_terminal_run_failure,
     get_recent_es_attempts,
     get_latest_published_run_summary,
+    get_latest_run_progress,
     get_latest_run_summary,
+    get_run_mark,
     get_latest_run_status,
     list_claimants_of_extracting_runs,
     list_ingest_runs,
@@ -123,7 +136,9 @@ from .ingest import (  # noqa: F401
     restamp_queued_runs,
     start_ingest_run,
     update_ingest_run_progress,
+    update_ingest_run_snapshot,
 )
+from .replace_rows import unfinished_docs, unfinished_state  # noqa: F401
 
 # worlds の re-export。`rebind_bind_invalidate_sig` は内部専用のため re-export せず、必要なら `from sherpa.store.worlds import ...` の直 import を使う。
 from .worlds import (
@@ -131,12 +146,14 @@ from .worlds import (
     backfill_manifest_and_doc_count,
     delete_world_row,
     get_world,
+    read_resolve_settings,
     get_world_root,
     get_world_status_row,
     list_worlds_db,
     restore_bind_invalidate_sig,
     set_resolve_settings,
     set_scan_report,
+    set_scan_report_and_doc_count,
     set_scan_report_if_unchanged,
     set_world_sig,
     upsert_world,
@@ -159,6 +176,7 @@ from .audit import (
 
 # settings の全名（私的名含む）を re-export する。`set_system_settings` 内の `_audit_insert` 呼び出しは facade 属性経由で実行時に解決する。`_system_settings_cache`/`_system_settings_cache_ts` は公開名一覧を保つためだけの re-export。
 from .settings import (
+    CHILD_SNAPSHOT_ENV,
     OpenAIEndpointSettingsConflict,
     PersonalKeysDisallowedError,
     _SETTINGS_FIELDS,
@@ -169,6 +187,7 @@ from .settings import (
     count_users_with_personal_keys,
     get_settings,
     get_system_settings,
+    modify_system_setting,
     purge_personal_api_keys,
     seed_user_agent_once,
     seed_system_settings_once,

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sherpa — 利用統計</title>
+<title>Slouch — 利用統計</title>
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="fonts.css">
 <script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
@@ -31,6 +31,7 @@
     border-radius:50%;background:var(--surface-2);color:var(--ink-3);font-size:var(--text-caption);font-weight:700}
   .rank.top1{background:var(--accent-weak);color:var(--accent-ink)}
   .num{text-align:right;font-variant-numeric:tabular-nums}
+  td.nw{white-space:nowrap}
   .user-name{font-weight:600}
   .user-uid{font-size:var(--text-caption);color:var(--ink-3);font-family:var(--font-code,monospace)}
   .u-detail{display:none}
@@ -92,6 +93,9 @@
   .chart-total{font-size:var(--text-caption);font-weight:400;color:var(--ink-3);margin-left:4px;font-variant-numeric:tabular-nums}
   .zhr-cell{cursor:help}
 
+  .card:not(.chart-card) > :is(.chart-title,.hint,h2,p,summary,#review-stats){padding-left:20px;padding-right:20px}
+  .card:not(.chart-card) > :is(.chart-title,h2,summary):first-child{padding-top:14px}
+  .card:not(.chart-card) > :is(.hint,p,#review-stats):last-child{padding-bottom:14px}
   /* 会話別上位の「用途別」列＝用途ごとの回数・トークン・所要時間を1行ずつ積む小さな内訳リスト。 */
   .convkinds{margin:0;padding:0;list-style:none;font-size:var(--text-caption)}
   .convkinds li{white-space:nowrap}
@@ -103,7 +107,6 @@
   .usage-controls .period-bar{margin:0}
   .period-range{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-left:8px}
   .period-range input[type=date]{font-size:var(--text-small)}
-  [data-theme="dark"] .period-range input[type=date]{color-scheme:dark}
   .period-range-error{font-size:var(--text-small);color:var(--danger)}
   .period-range-error:empty{display:none}
   .usage-definitions{grid-column:1/-1}
@@ -474,7 +477,7 @@
           <tbody id="token-model-tbody"></tbody>
         </table>
       </div>
-      <!-- 用途別: チャット以外の LLM 呼び出し（依頼の仕分け・ナレッジ抽出・検索の索引づくり・admin グラフ質問・画像の読み取り）も含む内訳。tokens.by_kind が空/不在なら JS がカードごと隠す。 -->
+      <!-- 用途別: チャット以外の LLM 呼び出し（依頼の仕分け・ナレッジ抽出・埋め込み・admin グラフ質問・画像の読み取り）も含む内訳。tokens.by_kind が空/不在なら JS がカードごと隠す。 -->
       <div class="card" id="token-kind-card" style="overflow-x:auto;margin-bottom:14px" hidden>
         <div class="chart-title">用途別</div>
         <table>
@@ -560,5 +563,9 @@
 
 <div class="toast" id="toast"></div>
 <script src="usage.js"></script>
+<script src="usage-charts.js"></script>
+<script src="usage-trends.js"></script>
+<script src="usage-tokens.js"></script>
+<script src="usage-load.js"></script>
 </body>
 </html>

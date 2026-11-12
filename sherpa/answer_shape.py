@@ -22,7 +22,9 @@ NOTICE_KINDS = (
     "ledger_unfinished", "partial_followup", "truncated", "invalid_output", "answer_recovery", "review_reverted",
     "investigation_record_failed", "claims_omitted", "knowledge_off",
     "reconciliation_unverified", "reconciliation_more", "reconciliation_invalid", "scope_no_source",
-    "no_tool_use", "target_unresolved",
+    "no_tool_use",
+    "ledger_retire_failed", "run_files_failed", "skills_unavailable", "resume_restarted",
+    "session_unsaved", "personal_unreadable", "stats_unsaved", "ingest_incomplete",
 )
 
 STOPPED_NOTICE = "利用者の操作で停止しました。停止までに回収した部分回答です。"
@@ -87,7 +89,7 @@ def _is_line(v) -> bool:
 
 
 def referenced_docs_of(answer) -> list[dict]:
-    """参照した資料 `[{path, ranges:[[開始行, 終了行]], unopened, ranges_more?}]` を型の正しい形だけで返す。`unopened` は読み取り道具でしか読めない資料で開いた記録が無いもの・`ranges_more` は範囲の上限で省いた個数。無い・壊れていれば空リスト。"""
+    """参照した資料 `[{path, ranges:[[開始行, 終了行]], unopened, ranges_more?, mentioned_only?}]` を型の正しい形だけで返す。`unopened` は読み取り道具でしか読めない資料で開いた記録が無いもの・`ranges_more` は範囲の上限で省いた個数・`mentioned_only` は本文に名前が出ただけで「参照した資料:」の記載が無い資料。無い・壊れていれば空リスト。"""
     rows = answer.get("referenced_docs") if isinstance(answer, dict) else None
     if not isinstance(rows, list):
         return []
@@ -100,6 +102,8 @@ def referenced_docs_of(answer) -> list[dict]:
         row = {"path": r["path"], "ranges": ranges, "unopened": r.get("unopened") is True}
         if _is_count(r.get("ranges_more")):
             row["ranges_more"] = r["ranges_more"]
+        if r.get("mentioned_only") is True:
+            row["mentioned_only"] = True
         out.append(row)
     return out
 
@@ -121,7 +125,7 @@ def impact_list_of(answer) -> dict | None:
 
 
 def found_docs_of(answer) -> list[dict]:
-    """ほかに見つかった資料（Codex の読み取り記録なし）`[{path}]` を型の正しい形だけで返す。省いた件数は `found_docs_more`。"""
+    """ほかに見つかった資料（読み取り機能で開いた記録なし）`[{path}]` を型の正しい形だけで返す。省いた件数は `found_docs_more`。"""
     rows = answer.get("found_docs") if isinstance(answer, dict) else None
     if not isinstance(rows, list):
         return []
@@ -142,39 +146,22 @@ NEW_SHAPE_KEYS = ("referenced_docs", "referenced_docs_hidden", "referenced_docs_
 
 
 def safe_new_fields(answer) -> dict:
-    """新しい欄を、秘匿の資料（`text_kind.is_sensitive_doc_id`）の名前・パスと、それを含む理由の文を除いた形で返す。除いた分は `*_hidden`（影響一覧は `hidden`）に数える。主の配列が無くても正の件数の欄は写す。"""
-    import re
-    from .ingest import text_kind
+    """新しい欄を型の正しい形だけで返す（資料の名前・パスは出す。守るのは本文の中身）。主の配列が無くても正の件数の欄は写す。"""
     if not isinstance(answer, dict):
         return {}
-
-    def visible(path: str) -> bool:
-        return not text_kind.is_sensitive_doc_id(path)
-
-    def clean_text(text: str) -> bool:
-        return all(visible(t) for t in re.findall(r"[A-Za-z0-9_.\-/\\]+", text))
-
     out: dict = {}
     for key, rows_of in (("referenced_docs", referenced_docs_of), ("found_docs", found_docs_of)):
         rows = rows_of(answer)
-        kept = [r for r in rows if visible(r["path"])]
         if isinstance(answer.get(key), list):
-            out[key] = kept
-        hidden = len(rows) - len(kept) + count_of(answer, key + "_hidden")
-        if hidden:
-            out[key + "_hidden"] = hidden
-        more = count_of(answer, key + "_more")
-        if more:
-            out[key + "_more"] = more
+            out[key] = rows
+        for suffix in ("_hidden", "_more"):
+            n = count_of(answer, key + suffix)
+            if n:
+                out[key + suffix] = n
     il = impact_list_of(answer)
     if il is not None:
-        kept_src = [r for r in il["rows"] if visible(r["name"]) and (not r["path"] or visible(r["path"]))]
-        rows = [{**r, "reason": r["reason"] if clean_text(r["reason"]) else ""} for r in kept_src]
-        masked = sum(1 for r, k in zip(kept_src, rows) if r["reason"] != k["reason"])
-        reasons = [x for x in il["reasons"] if clean_text(x)]
-        out["impact_list"] = {**il, "rows": rows, "reasons": reasons}
-        hidden = (len(il["rows"]) - len(rows) + masked + len(il["reasons"]) - len(reasons)
-                  + count_of(answer.get("impact_list"), "hidden"))
+        out["impact_list"] = il
+        hidden = count_of(answer.get("impact_list"), "hidden")
         if hidden:
             out["impact_list"]["hidden"] = hidden
     how = how_of(answer)

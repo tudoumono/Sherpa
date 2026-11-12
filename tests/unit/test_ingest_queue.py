@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from sherpa import app_version, store, webhooks
-from sherpa.ingest import background, ingest_worker, jobs, resume
+from sherpa.ingest import background, ingest_worker, jobs, resume, worker
 from sherpa.store import db as store_db
 from sherpa.store import workers as store_workers
 
@@ -49,6 +49,13 @@ def _clean() -> None:
 def _row(run_id: int) -> dict:
     with store_db._connect() as c:
         return c.execute("SELECT * FROM ingest_runs WHERE id=%s", (run_id,)).fetchone()
+
+
+def _finish_running(run_id: int, **kw) -> None:
+    """積んだだけの依頼を実行中にしてから閉じる（完了の更新は実行中の回にしか効かない）。"""
+    with store_db._connect() as c:
+        c.execute("UPDATE ingest_runs SET status='extracting' WHERE id=%s", (run_id,))
+    store.finish_ingest_run(run_id, **kw)
 
 
 def _finish_op(world, payload, run_id):
@@ -107,9 +114,102 @@ def test_same_op_joins_other_op_conflicts_and_finished_run_frees_the_world():
     other, joined = background.submit("qtest-other", "refresh", "{}")      # 別の資料フォルダは独立
     assert joined is False and other != first
 
-    store.finish_ingest_run(first, status="auto_published")
+    _finish_running(first, status="auto_published")
     after, joined = background.submit("qtest-b", "rebind", '{"path":"/x"}', {"path": "/x"})
     assert joined is False and after != first                              # 終わった run には合流しない
+
+
+def _observation_dir(tmp_path, monkeypatch, generation: str) -> None:
+    from sherpa import worlds
+    monkeypatch.setattr(worlds, "observation_current_dir", lambda _world: tmp_path / "obs" / generation)
+
+
+def test_ocr_catchup_queues_once_and_does_not_compete_with_active_ingest(tmp_path, monkeypatch):
+    world = "qtest-ocr-catchup"
+    _observation_dir(tmp_path, monkeypatch, "g1")
+
+    assert worker.enqueue_ocr_catchup(world) is True
+    assert worker.enqueue_ocr_catchup(world) is False      # 同じ世代は積み済み
+    rows = store.list_ingest_runs(world)
+    assert len(rows) == 1 and rows[0]["status"] == "queued"
+
+    _finish_running(rows[0]["id"], status="auto_published")
+    active, _ = background.submit(world, "rebind", '{"path":"/x"}', {"path": "/x"})
+    assert worker.enqueue_ocr_catchup(world) is False
+    assert [row["id"] for row in store.list_ingest_runs(world)] == [active, rows[0]["id"]]
+
+
+def test_ocr_catchup_is_reserved_once_per_observation_generation(tmp_path, monkeypatch):
+    world = "qtest-ocr-gen"
+    _observation_dir(tmp_path, monkeypatch, "g1")
+    assert worker.enqueue_ocr_catchup(world) is True
+    first = store.list_ingest_runs(world)[0]["id"]
+    assert _row(first)["payload"] == {"ocr_catchup": "obs/g1"}
+
+    _finish_running(first, status="failed")        # 反映が失敗で終わった
+    assert worker.enqueue_ocr_catchup(world) is False      # 同じ世代は自動では積み直さない
+    assert len(store.list_ingest_runs(world)) == 1
+
+    manual, joined = background.submit(world, "refresh", "{}")   # 利用者の「更新」は通る
+    assert joined is False
+    _finish_running(manual, status="failed")
+
+    _observation_dir(tmp_path, monkeypatch, "g2")          # 新しい観測の世代はまた1回積む
+    assert worker.enqueue_ocr_catchup(world) is True
+    assert worker.enqueue_ocr_catchup(world) is False      # 積み済み
+    assert len(store.list_ingest_runs(world)) == 3
+
+
+def test_ocr_catchup_not_reserved_after_low_disk_stop(tmp_path, monkeypatch):
+    world = "qtest-ocr-lowdisk"
+    _observation_dir(tmp_path, monkeypatch, "g1")
+    run_id, _ = background.submit(world, "refresh", "{}")
+    _finish_running(run_id, status="failed", extraction_snapshot={"stop_reason": "low_disk"})
+    assert worker.enqueue_ocr_catchup(world) is False
+    assert len(store.list_ingest_runs(world)) == 1
+
+
+def test_host_worker_cycle_reserves_unreflected_observation_once_with_host_version(tmp_path, monkeypatch):
+    """反映されていない公開済みの観測は、ホストの取り込み worker の周期が1回だけ予約し、run の版はホストの版になる。"""
+    from sherpa import worlds
+    world = "qtest-ocr-host"
+    monkeypatch.setattr(store, "list_worlds_db", lambda: [{"world_id": world}])
+    monkeypatch.setattr(worlds, "derived_md_dir", lambda _w: tmp_path / "md")
+    (tmp_path / "md").mkdir()
+    (tmp_path / "md" / ".rag_sig").write_text("renderer=x;ocr_observation=none", encoding="utf-8")
+    _observation_dir(tmp_path, monkeypatch, "g1")
+    monkeypatch.setattr(app_version, "current", lambda: "host-v1")
+
+    ingest_worker._ocr_catchup()
+    ingest_worker._ocr_catchup()
+    rows = store.list_ingest_runs(world)
+    assert len(rows) == 1
+    assert _row(rows[0]["id"])["app_version"] == "host-v1"
+    with store.claim_queued_run("qtest-host-wk", "host-v1") as claimed:
+        assert claimed.run["id"] == rows[0]["id"]
+
+    store.finish_ingest_run(rows[0]["id"], status="failed")
+    ingest_worker._ocr_catchup()                           # 失敗の後は自動では積まない
+    assert len(store.list_ingest_runs(world)) == 1
+
+    _observation_dir(tmp_path, monkeypatch, "g2")
+    ingest_worker._ocr_catchup()                           # 新しい世代はまた1回
+    assert len(store.list_ingest_runs(world)) == 2
+
+
+def test_host_worker_cycle_skips_reflected_observation_and_active_ingest(tmp_path, monkeypatch):
+    from sherpa import worlds
+    reflected, busy = "qtest-ocr-reflected", "qtest-ocr-busy"
+    monkeypatch.setattr(store, "list_worlds_db", lambda: [{"world_id": reflected}, {"world_id": busy}])
+    monkeypatch.setattr(worlds, "derived_md_dir", lambda w: tmp_path / w / "md")
+    (tmp_path / reflected / "md").mkdir(parents=True)
+    (tmp_path / reflected / "md" / ".rag_sig").write_text("renderer=x;ocr_observation=obs/g1", encoding="utf-8")
+    monkeypatch.setattr(worlds, "observation_current_dir", lambda _w: tmp_path / "obs" / "g1")
+    active, _ = background.submit(busy, "rebind", '{"path":"/x"}', {"path": "/x"})   # 取り込み中
+
+    ingest_worker._ocr_catchup()
+    assert store.list_ingest_runs(reflected) == []
+    assert [r["id"] for r in store.list_ingest_runs(busy)] == [active]
 
 
 def test_extra_key_arbitrates_new_registrations_across_worlds():
@@ -241,6 +341,48 @@ def test_orphan_of_dead_worker_is_downgraded_but_live_worker_is_left_alone():
         assert _row(live_id)["status"] == "extracting"
     finally:
         lock.close()
+
+
+def test_orphan_downgrade_keeps_progress_stage_times_and_metrics_reader():
+    wid = "qtest-h4"
+    run_id = _extracting_run(wid, "qtest-dead-worker-2")
+    progress = {"stage": "office_md", "done": 3, "total": 10}
+    stage = {"started_at": "2026-10-24T00:00:00+00:00",
+             "observed_at": "2026-10-24T00:01:00+00:00",
+             "finished_at": None, "elapsed_ms": 60000}
+    store.update_ingest_run_progress(run_id, progress)
+    store.update_ingest_run_snapshot(
+        run_id, {"stage_timings": {"office_md": stage}, "counts": {"scan_passes": 1}})
+
+    assert store.downgrade_orphaned_extracting_runs(wid) == [run_id]
+
+    row = _row(run_id)
+    assert row["status"] == "failed" and row["progress"] == progress
+    assert row["extraction_snapshot"]["interrupted"] is True
+    assert row["extraction_snapshot"]["stage_timings"]["office_md"] == stage
+    latest = store.get_latest_ingest_metrics(wid)
+    assert latest["id"] == run_id and latest["progress"] == progress
+    assert latest["stage_timings"]["office_md"] == stage
+    assert latest["counts"] == {"scan_passes": 1}
+
+
+def test_worker_fail_close_keeps_last_progress_and_stage_observation():
+    wid = "qtest-h5"
+    run_id = _extracting_run(wid, "qtest-crashed-worker")
+    progress = {"stage": "es_index", "done": 100, "total": 500}
+    timing = {"started_at": "2026-10-24T00:00:00+00:00",
+              "observed_at": "2026-10-24T00:01:00+00:00",
+              "finished_at": None, "elapsed_ms": 60000}
+    store.update_ingest_run_progress(run_id, progress)
+    store.update_ingest_run_snapshot(run_id, {"stage_timings": {"es_index": timing}})
+
+    assert store.fail_close_if_extracting(run_id, reason="worker_exited") is True
+
+    row = _row(run_id)
+    assert row["progress"] == progress
+    assert row["extraction_snapshot"]["stage_timings"]["es_index"] == timing
+    assert row["extraction_snapshot"]["flags"] == [
+        {"doc": None, "action": "blocked", "reason": "worker_exited"}]
 
 
 def test_start_requests_resume_for_interrupted_world(tmp_path):

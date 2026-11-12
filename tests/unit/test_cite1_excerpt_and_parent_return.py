@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -25,6 +24,7 @@ os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 
 from sherpa import citations, excerpts, json_io, rag_parent_return, worlds
 from sherpa.ingest import office_md
+from tests._replace_row import offline_row
 
 _ROOT = Path(__file__).resolve().parents[2]
 _DEP_INPUTS = _ROOT / "fixtures" / "eval" / "deprecation_markers" / "inputs"
@@ -40,7 +40,7 @@ def _xlsx_world(monkeypatch, tmp_path):
     wd.mkdir()
     shutil.copy(_DEP_INPUTS / "DEP-XLSX-MARKERS.xlsx", wd / "DEP-XLSX-MARKERS.xlsx")
     world = "cite1-xlsx"
-    rep = office_md.build_derived(wd, worlds.derived_md_dir(world))
+    rep = office_md.build_derived(wd, worlds.derived_md_dir(world), row=offline_row("w"))
     assert rep["rag_failed"] == 0, rep
     return world
 
@@ -210,42 +210,6 @@ def test_apply_to_hits_passes_through_non_rag_hits():
     assert rag_parent_return.apply_to_hits("w", hits) == hits
 
 
-# ---- 実配線: lens_service.run_qa / chat_service._es_citations ----
-
-def test_run_qa_citations_show_table_not_kv_text(_xlsx_world):
-    from sherpa import lens_service
-    result = lens_service.run_qa("ITEM01", _xlsx_world)
-    assert result["citations"], result
-    quotes = [c["quote"] for c in result["citations"] if c["doc_id"] == _DOC_ID]
-    assert quotes, result["citations"]
-    assert any("| 項目ID | 状態 | 内部コード |" in q for q in quotes)
-    assert not any("項目ID: 「ITEM01」" in q for q in quotes)
-    assert any(c.get("excerpt_source") == "human_md" for c in result["citations"] if c["doc_id"] == _DOC_ID)
-
-
-def test_es_citations_excerpt_swap_and_tier(monkeypatch, _xlsx_world):
-    from sherpa import chat_service, documents, es_index
-    row = _first_row_for_sheet(_xlsx_world, "対象")
-    chunk_id = row["chunk_id"]
-    locator = row["citations"][0]["locator"]
-    section_path = row["section_path"]
-
-    def fake_search(world, query, scope_paths=None, k=8, vector=True, layer=None, **kw):
-        return ([{"doc_id": _DOC_ID, "line": None, "text": "項目ID: 「ITEM01」", "score": 3.0,
-                  "ext": ".xlsx", "chunk_id": chunk_id, "locator": locator,
-                  "section_path": section_path, "parent_id": row.get("parent_id")}], None)
-
-    monkeypatch.setattr(es_index, "search", fake_search)
-    monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {_DOC_ID})
-    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: set(rels) & ({_DOC_ID}))
-    cites = chat_service._es_citations(_xlsx_world, "ITEM01", None)
-    assert len(cites) == 1
-    c = cites[0]
-    assert c["excerpt_source"] == "human_md"
-    assert "| 項目ID | 状態 | 内部コード |" in c["quote"]
-    assert "項目ID: 「ITEM01」" not in c["quote"]
-    assert c["locator_hint"] == "シート「対象」A1:C4"
-    assert "locator" not in c and "chunk_id" not in c   # SC-3 の不変条件は継続
 
 
 # ---- agentic 経路は変更していないことの確認（byte-identical 契約）----

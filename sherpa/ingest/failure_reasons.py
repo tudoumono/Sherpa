@@ -59,7 +59,7 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
     # 文字の層が無いスキャン PDF の画像の読み取り（OCR）の状態（`scan_pdf_ocr_status`）
     "ocr_unavailable": {
         "label": "画像の読み取り（OCR）が動いていません",
-        "advice": "管理者に OCR の起動状態を確認してもらってください。"
+        "advice": "管理者に、管理画面の取り込みタブで OCR が入っているかと、OCR の処理が動いているかを確認してもらってください。"
                   "文字の層が無いスキャン PDF のため、読み取りが動くまで本文は検索に出ません。",
     },
     "ocr_failed": {
@@ -73,7 +73,7 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
     # 文字コード/内容の読み取り判定（`corpus_docs`/`text_encoding`/`ingest.text_kind` 由来）
     "encoding_undetermined": {
         "label": "文字コードを判別できない",
-        "advice": "UTF-8でもCP932（Shift-JIS系）でも文字化けするため読み取れません。"
+        "advice": "UTF-8・CP932（Shift-JIS系）・EUC-JPのどれでも文字化けするため読み取れません。"
                   "文字コードを確認し、UTF-8で保存し直してください。",
     },
     "binary": {
@@ -93,6 +93,11 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
     "archive_too_large": {
         "label": "未対応（大きすぎる）",
         "advice": "展開後の件数またはサイズが大きすぎるため取り込めません。アーカイブを分割してください。",
+    },
+    "archive_sync_failed": {
+        "label": "更新に失敗（前回の内容が残っています）",
+        "advice": "アーカイブを読み直せなかったため、検索には前回展開した内容が残っています。"
+                  "ファイルの権限や置き場所を確認し、もう一度更新してください。",
     },
     "other": {
         "label": "その他の失敗",
@@ -145,3 +150,9 @@ def describe(raw_reason: str | None) -> dict[str, str]:
     code = classify(raw_reason)
     info = REASON_CATALOG[code]
     return {"code": code, "label": info["label"], "advice": info["advice"], "detail": raw_reason or ""}
+
+
+def known_reasons() -> frozenset[str]:
+    """`classify` が `other` 以外にする生 reason の全体（完全一致）。"""
+    return _PASSTHROUGH | _WRITE_FAILED_ALIASES | frozenset(
+        f"document_ir_failed:{detail}" for detail in _DOCUMENT_IR_KNOWN_DETAILS)

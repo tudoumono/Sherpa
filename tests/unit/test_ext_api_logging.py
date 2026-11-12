@@ -1,4 +1,4 @@
-"""`sherpa.ext_api` の request_id ログ束縛（`_RequestIdLogFilter`）の単体テスト。実 DB には
+"""`sherpa.ext.request_id` の request_id ログ束縛（`_RequestIdLogFilter`）の単体テスト。実 DB には
 触れない（`sherpa.lifespan.lifespan()` の起動処理はここで monkeypatch により無効化する）。
 
 `logging.setLogRecordFactory()`（プロセス全体・永続的な副作用を持ち、再import/reload で多重化
@@ -23,7 +23,8 @@ import threading
 
 import pytest
 
-from sherpa import api, ext_api, store
+from sherpa import api, store
+from sherpa.ext import request_id
 from sherpa.ingest import background
 from sherpa.lifespan import lifespan as _lifespan_cm
 
@@ -80,11 +81,11 @@ def test_filter_applies_to_child_logger_via_root_handler(_temp_root_handler):
     レコードにも request_id が乗る（handler 側付与＝logger 名を問わない）。"""
     child = logging.getLogger("sherpa.ingest.office_md")
     child.setLevel(logging.INFO)
-    tok = ext_api._request_id_ctx.set("probe-child-logger")
+    tok = request_id._request_id_ctx.set("probe-child-logger")
     try:
         child.info("hello from child logger")
     finally:
-        ext_api._request_id_ctx.reset(tok)
+        request_id._request_id_ctx.reset(tok)
 
     out = _temp_root_handler.getvalue()
     assert "probe-child-logger|sherpa.ingest.office_md|hello from child logger" in out
@@ -95,11 +96,11 @@ def test_filter_does_not_overwrite_explicit_extra_request_id(_temp_root_handler)
     （`setLogRecordFactory` 方式で起きていた属性衝突/KeyError の心配が無いことの確認）。"""
     logger = logging.getLogger("sherpa.some.other.module")
     logger.setLevel(logging.INFO)
-    tok = ext_api._request_id_ctx.set("ambient-request-id")
+    tok = request_id._request_id_ctx.set("ambient-request-id")
     try:
         logger.info("explicit wins", extra={"request_id": "explicit-request-id"})
     finally:
-        ext_api._request_id_ctx.reset(tok)
+        request_id._request_id_ctx.reset(tok)
 
     out = _temp_root_handler.getvalue()
     assert "explicit-request-id|sherpa.some.other.module|explicit wins" in out
@@ -109,7 +110,7 @@ def test_filter_does_not_overwrite_explicit_extra_request_id(_temp_root_handler)
 def test_filter_falls_back_to_dash_outside_request_context(_temp_root_handler):
     """ContextVar 未設定（ext_api の処理外）では "-" になる（フォーマッタが %(request_id)s を
     参照しても KeyError にならないよう常に属性を持たせる）。"""
-    assert ext_api._request_id_ctx.get() is None
+    assert request_id._request_id_ctx.get() is None
     logger = logging.getLogger("sherpa.no.request.context")
     logger.setLevel(logging.INFO)
     logger.info("outside request")
@@ -123,19 +124,19 @@ def test_attach_request_id_filter_is_idempotent():
     （プロセス起動時に一度呼ばれる `_attach_request_id_filter()` が、モジュール再 import 等で
     再度呼ばれても filter が多重化しないことの固定）。付与対象は handler 単位（logger 自身へは
     付与しない・`_RequestIdLogFilter` の docstring 参照）なので `logging.lastResort` で見る。"""
-    ext_api._attach_request_id_filter()
-    ext_api._attach_request_id_filter()
-    ext_api._attach_request_id_filter()
-    assert logging.lastResort.filters.count(ext_api._request_id_log_filter) == 1
+    request_id._attach_request_id_filter()
+    request_id._attach_request_id_filter()
+    request_id._attach_request_id_filter()
+    assert logging.lastResort.filters.count(request_id._request_id_log_filter) == 1
 
 
 class _FakeLoggingModule:
     """`logging` モジュールの一部属性だけ差し替える薄い proxy。指定した属性は隠す
     （`AttributeError`）／上書きし、それ以外は実物の `logging` モジュールへ委譲する。
 
-    `ext_api._logging_module_lock()` が参照する名前は `ext_api` モジュール自身の名前空間に
+    `request_id._logging_module_lock()` が参照する名前は `request_id` モジュール自身の名前空間に
     束縛された `logging`（`import logging` で作られる参照）であり、`sys.modules["logging"]`
-    そのものとは別物——`monkeypatch.setattr(ext_api, "logging", fake)` は `ext_api` から見える
+    そのものとは別物——`monkeypatch.setattr(request_id, "logging", fake)` は `request_id` から見える
     参照だけを差し替え、stdlib 側（`logging.Handler.close()`/`removeHandler()`・pytest 自身の
     ロギング処理等、モジュール内部から直接 `_acquireLock()` を呼ぶコード）が使う実物の
     `logging` モジュールには一切触れない。実際に `monkeypatch.delattr(logging, "_acquireLock")`
@@ -164,8 +165,8 @@ def test_logging_module_lock_uses_acquire_release_functions_when_present(monkeyp
         "_acquireLock": lambda: calls.append("acquire"),
         "_releaseLock": lambda: calls.append("release"),
     })
-    monkeypatch.setattr(ext_api, "logging", fake)
-    with ext_api._logging_module_lock():
+    monkeypatch.setattr(request_id, "logging", fake)
+    with request_id._logging_module_lock():
         assert calls == ["acquire"]
     assert calls == ["acquire", "release"]
 
@@ -188,11 +189,11 @@ def test_logging_module_lock_falls_back_to_lock_object_when_functions_absent(mon
 
     fake = _FakeLoggingModule(hide={"_acquireLock", "_releaseLock"},
                               overrides={"_lock": _FakeLock()})
-    monkeypatch.setattr(ext_api, "logging", fake)
+    monkeypatch.setattr(request_id, "logging", fake)
     assert not hasattr(fake, "_acquireLock")
     assert not hasattr(fake, "_releaseLock")
 
-    with ext_api._logging_module_lock():
+    with request_id._logging_module_lock():
         assert entered == ["enter"]
     assert entered == ["enter", "exit"]
 
@@ -222,11 +223,11 @@ def test_filter_reaches_named_logger_with_own_handler_and_no_propagate(_temp_nam
     その logger 自身の handler へ filter が付与されて request_id が乗る（root の handlers だけ
     でなく `"sherpa"` 自身と配下の作成済み logger の handlers も列挙する）。"""
     buf, logger = _temp_named_handler_no_propagate
-    tok = ext_api._request_id_ctx.set("probe-no-propagate")
+    tok = request_id._request_id_ctx.set("probe-no-propagate")
     try:
         logger.info("hello from dedicated worker logger")
     finally:
-        ext_api._request_id_ctx.reset(tok)
+        request_id._request_id_ctx.reset(tok)
 
     out = buf.getvalue()
     assert "probe-no-propagate|sherpa.dedicated.worker|hello from dedicated worker logger" in out
@@ -289,7 +290,7 @@ def test_attach_request_id_filter_survives_concurrent_getlogger_calls():
     barrier = threading.Barrier(2)
     errors: list[Exception] = []
 
-    with ext_api._logging_module_lock():
+    with request_id._logging_module_lock():
         ancestor_snapshot = _snapshot_logger_dict_entries(ancestor_names)
 
     def _spawn_loggers():
@@ -303,13 +304,13 @@ def test_attach_request_id_filter_survives_concurrent_getlogger_calls():
         barrier.wait(timeout=5)   # attach 側もここで足並みを揃えてから走査を始める
         for _ in range(200):
             try:
-                ext_api._attach_request_id_filter()
+                request_id._attach_request_id_filter()
             except RuntimeError as e:
                 errors.append(e)
     finally:
         t.join(timeout=5)
         assert not t.is_alive(), "logger 生成スレッドが join 後もまだ生存している"
-        with ext_api._logging_module_lock():
+        with request_id._logging_module_lock():
             for name in names:
                 logging.Logger.manager.loggerDict.pop(name, None)   # 葉の後始末
             _restore_logger_dict_entries(ancestor_snapshot)          # 祖先 PlaceHolder の後始末

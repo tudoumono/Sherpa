@@ -12,6 +12,7 @@ import pytest
 from sherpa import lens_service
 from sherpa.ingest import world_graph, world_neo4j
 from _world_registry import register_test_world
+from tests._replace_row import offline_row
 
 WORLD = "s1b_unres_test"          # 使い捨て（テスト後に削除）
 
@@ -37,7 +38,7 @@ def _load_files(tmp_path, files: dict):
         p.write_text(text, encoding="utf-8")
     nodes, edges, flags = world_graph.build_world(tmp_path, WORLD)
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))
     register_test_world(WORLD)
     return nodes, edges, flags
 

@@ -12,6 +12,7 @@ const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;
 // ===== 範囲セレクタ =====
 // 明示選択した範囲を S.scope に持ち、送信時に scope_paths として送る。
 let _scopeAvail = false;                // 選べる範囲があるか
+let _scopeError = false;                // 範囲の取得に失敗している（範囲指定の欄は出したまま失敗を知らせる）
 // 既定はトップ階層のみ表示し、子持ち行のトグルで展開する。開閉・絞り込みはページ内メモリのみで、ツリー再取得ごとに初期化する。
 let _scopeOpen = new Set();             // 手動で開いたフォルダの path 集合
 let _scopeFilter = '';                  // 絞り込み入力の現在値
@@ -67,6 +68,14 @@ export function applyConversationScope(messages) {
   setToolsDetailsOpen(false);
   if (S.scopeTree) renderScopePanel(S.scopeTree);
   updateScopeHeader(sc);
+}
+// 回答待ちの質問がある会話を開いたとき、その質問で送った範囲を選択に戻す（最後の回答の範囲より優先する）。
+export function applyRunningTurnScope(paths) {
+  S.scope = paths.slice();
+  S.currentScopeMeta = { ...(S.currentScopeMeta || {}), scope_paths: S.scope.slice(),
+    source: S.scope.length ? 'explicit' : 'all' };
+  if (S.scopeTree) renderScopePanel(S.scopeTree);
+  setScopeLabel(scopeChipLabel());
 }
 function _scopeAncestors(path) {   // "a/b/c" → ["a","a/b"]（自分自身は含まない）
   const parts = path.split('/');
@@ -130,9 +139,10 @@ export function renderScopePanel(tree) {
     + `<div id="scope-rows">${_scopeRowsHtml()}</div>`;
 }
 function updateScopeVisibility() {   // 範囲セレクタは「ナレッジ参照オン」かつ「選べる範囲あり」のときだけ
-  $('scopesel').style.display = (S.kb && _scopeAvail) ? '' : 'none';
+  const showScope = S.kb && (_scopeAvail || _scopeError);
+  $('scopesel').style.display = showScope ? '' : 'none';
   // 調べ方ブロックの行も同じ条件で出し分ける（範囲＝参照ON＋選べる範囲あり・深さ＝参照ON）
-  $('scope-row').hidden = !(S.kb && _scopeAvail);
+  $('scope-row').hidden = !showScope;
   $('depth-row').hidden = !S.kb;
   refreshInquirySummary();
 }
@@ -158,11 +168,23 @@ $('personaltoggle').addEventListener('click', () => setPersonal(!S.personal));
 export async function loadScopes() {
   _scopeOpen.clear(); _scopeFilter = '';
   let tree = null;
-  try { tree = await getJSON('/scopes?world=' + encodeURIComponent($('version').value)); } catch (e) { }
+  _scopeError = false;
+  try { tree = await getJSON('/scopes?world=' + encodeURIComponent($('version').value)); } catch (e) { _scopeError = true; }
+  if (_scopeError) {
+    S.scopeTree = null; _scopeAvail = false;
+    const kept = S.scope.length ? `前に選んだ範囲（${esc(scopeChipLabel())}）のまま調べます。` : '範囲を選べないため、全体を対象に調べます。';   // 送る範囲と言葉をそろえる
+    $('scopepanel').innerHTML = `<div style="color:var(--danger);padding:6px 8px;font-size:var(--text-small)">参照範囲を読み込めませんでした。${kept}</div>`
+      + '<button class="scoperow" data-scope-retry="1">もう一度読み込む</button>';
+    setScopeLabel('範囲を読み込めません');
+    updateScopeVisibility();
+    return;
+  }
   const scopes = (tree && tree.scopes) || [];
-  const leaves = scopes.filter((s) => !scopes.some((o) => o.path !== s.path && o.path.startsWith(s.path + '/')));
+  // 範囲は祖先のフォルダを全部含むので、子を持つフォルダ＝いずれかの path の親
+  const parents = new Set(scopes.map((s) => (s.path.includes('/') ? s.path.slice(0, s.path.lastIndexOf('/')) : null)));
+  const leaves = scopes.filter((s) => !parents.has(s.path));
   _scopeAvail = leaves.length > 1;   // 選べる末端が1つ以下なら範囲指定は出さない
-  if (!_scopeAvail) { updateScopeVisibility(); return; }
+  if (!_scopeAvail) { $('scopepanel').innerHTML = ''; setScopeLabel(scopeChipLabel()); updateScopeVisibility(); return; }
   S.scopeTree = tree; S.scopeLabels = {}; scopes.forEach((s) => { S.scopeLabels[s.path] = s.label; });
   renderScopePanel(tree);
   if (S.currentScopeMeta) updateScopeHeader(S.currentScopeMeta);
@@ -175,6 +197,7 @@ $('scopebtn').addEventListener('click', (e) => {
   if (!pn.hidden && S.scopeTree) renderScopePanel(S.scopeTree);
 });
 $('scopepanel').addEventListener('click', (e) => {
+  if (e.target.closest('[data-scope-retry]')) { e.stopPropagation(); loadScopes(); return; }
   const tg = e.target.closest('[data-toggle]');
   if (tg) {   // 開閉のみ（選択は変えない）。#scope-rows だけ再描画する
     // stopPropagation 必須（再描画で外れたノードを外側クリックと誤判定してパネルが閉じる）

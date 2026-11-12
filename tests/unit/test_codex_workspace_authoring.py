@@ -91,7 +91,7 @@ def test_codex_clean_env_has_no_secrets_and_passes_proxy_only_when_set(monkeypat
     assert "PATH" in env and "CODEX_HOME" in env
     assert "SHERPA_MCP_LEDGER_DIR" not in env
     assert "OPENAI_API_KEY" not in env
-    assert not any(k in env for k in SB._CODEX_PASSTHROUGH_ENV)   # 未設定なのに透過しない
+    assert not any(k in env for k in SB._CODEX_PASSTHROUGH_ENV if "NO_PROXY" not in k.upper())   # 未設定なのに透過しない（NO_PROXY だけは社内の宛先で常に渡る）
 
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
     monkeypatch.setenv("no_proxy", "localhost,127.0.0.1")
@@ -100,7 +100,7 @@ def test_codex_clean_env_has_no_secrets_and_passes_proxy_only_when_set(monkeypat
     monkeypatch.setenv("HTTP_PROXY", "")                    # 空文字は未設定扱い
     env = SB._codex_clean_env(tmp_path / "ch", tmp_path / "tmp")
     assert env["HTTPS_PROXY"] == "http://proxy.internal:8080"
-    assert env["no_proxy"] == "localhost,127.0.0.1"
+    assert {"localhost", "127.0.0.1"} <= set(env["no_proxy"].split(","))
     assert env["SSL_CERT_FILE"] == env["NODE_EXTRA_CA_CERTS"] == "/etc/ssl/certs/corp.pem"
     assert "HTTP_PROXY" not in env and "ALL_PROXY" not in env
     assert "OPENAI_API_KEY" not in env and "NEO4J_PASSWORD" not in env
@@ -135,8 +135,10 @@ def test_resolve_mcp_budget_ceiling_and_plain_dict():
     result = _resolve_mcp_budget({})
     assert isinstance(result, dict)
     assert set(result) == {"SHERPA_MCP_TOOL_BUDGET_BYTES", "SHERPA_MCP_READER_BUDGET_BYTES",
-                           "SHERPA_MCP_TOOL_MAX_HITS", "SHERPA_MCP_TOOL_WINDOW_CAP"}
+                           "SHERPA_MCP_SEARCH_BUDGET_BYTES", "SHERPA_MCP_TOOL_MAX_HITS", "SHERPA_MCP_TOOL_WINDOW_CAP"}
     assert result["SHERPA_MCP_READER_BUDGET_BYTES"] == "30000"
+    assert result["SHERPA_MCP_SEARCH_BUDGET_BYTES"] == "36000"
+    assert small["SHERPA_MCP_SEARCH_BUDGET_BYTES"] == str(16 * 1024)
     assert small["SHERPA_MCP_READER_BUDGET_BYTES"] == str(16 * 1024)
 
 
@@ -753,8 +755,6 @@ def _ctx(uid: str, make_sources=None, lens: str = "qa", message: str = "消費�
     return A.Ctx(
         message=message, world="v1",
         route=lambda msg: {"lens": lens, "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline", "summary": {"total": 0}, "data": {}, "sources": []},
         knowledge=True, uid=uid, make_sources=make_sources, **kw)
 
 
@@ -1091,7 +1091,7 @@ def test_ctx_fields_and_compat_mode_uid_admin():
     assert fields["stop_event"].default is None
     from sherpa import auth, chat_service
     assert auth.auth_disabled()
-    assert "uid=user_id" in inspect.getsource(chat_service.stream_message)
+    assert "uid=user_id" in inspect.getsource(chat_service._build_turn_ctx)
 
 
 def test_office_libs_importable():
@@ -1168,8 +1168,9 @@ def test_personal_scope_invariants_by_source():
     assert "layer" not in inspect.signature(chat_service._personal_grep_hits).parameters
     assert "layer" not in grep_src
     stream_src = inspect.getsource(chat_service.stream_message)
-    assert "if personal:" in stream_src
-    assert "personal_hits = []" in stream_src or "personal_hits: list[dict] = []" in stream_src
+    ctx_src = inspect.getsource(chat_service._build_turn_ctx)
+    assert "if personal:" in stream_src and "if personal and knowledge:" in ctx_src
+    assert "personal_hits: list[dict] = []" in ctx_src
 
 
 def test_personal_workspace_flag_wiring_by_source():
@@ -1178,13 +1179,11 @@ def test_personal_workspace_flag_wiring_by_source():
     from sherpa import chat_service, store
     store_src = inspect.getsource(store.set_contains_personal_workspace)
     assert "contains_personal_workspace=TRUE" in store_src
-    for fn in (chat_service.stream_message,):
-        src = inspect.getsource(fn)
-        assert "set_contains_personal_workspace" in src and "codex_wrote_files" in src
-        idx_flag = src.find("set_contains_personal_workspace")
-        idx_msg2 = src.find("add_message", src.find("add_message") + 1)
-        assert idx_msg2 != -1 and idx_flag < idx_msg2, fn.__name__
-    assert "_used_personal" in inspect.getsource(chat_service.stream_message)
+    from sherpa import chat_finish
+    assert "codex_wrote_files" in inspect.getsource(chat_finish.resolve_used_personal)
+    src = inspect.getsource(chat_service._persist_result)
+    assert "resolve_used_personal" in src and "set_contains_personal_workspace" in src
+    assert 0 <= src.find("set_contains_personal_workspace") < src.find("add_message")
     # ナレッジ参照オフの素の会話でも、個人ファイルの事実は回答 env の個人由来の印（`_personal_facts`）として運ばれる。
     class _Plain:
         label = "test"
@@ -1193,7 +1192,7 @@ def test_personal_workspace_flag_wiring_by_source():
             return "本文"
 
     ctx = A.Ctx(message="こんにちは", world="w", route=lambda m: {"lens": "chat"},
-                dispatch=lambda *a, **k: None, knowledge=False, personal_facts="個人ヒット")
+                knowledge=False, personal_facts="個人ヒット")
     res = [e for e in BASE._plain_run(_Plain(), ctx) if e.get("type") == "_result"][0]
     assert res["env"]["_personal_facts"] == "個人ヒット" and res["env"]["headline"] == "本文"
 
@@ -1375,13 +1374,20 @@ def test_referenced_docs_block_promotes_verified_docs_to_sources(tmp_path, monke
     assert env["sources_verified"] == [_DOC]
 
 
-def test_referenced_docs_block_keeps_body_when_zero_verified(tmp_path, monkeypatch):
+def test_referenced_docs_block_is_removed_from_body_even_when_zero_verified(tmp_path, monkeypatch):
     answer = "消費税率は10%です。\n\n参照した資料:\n- 存在しない1.md\n- 存在しない2.md\n"
     _, env = _run_fake(tmp_path, monkeypatch, _PY + _msg(answer), "citation-zero-u1", make_sources=_make_sources)
     assert env["codex_referenced_docs"] == {"listed": 2, "verified": 0}
-    assert env["body"].strip() == answer.strip()         # 本文は書き換えず、確認できなかった旨は注記に出る
+    assert env["body"].strip() == "消費税率は10%です。"   # 参照の欄は本文から外し、通らなかった行は「確認できなかった資料」に出る
+    assert [r["path"] for r in env["sources_unverified"]] == ["存在しない1.md", "存在しない2.md"]
     assert [n["kind"] for n in env["notices"]] == ["sources_unverified"] and "2 件" in env["notices"][0]["text"]
     assert not env.get("sources") and "sources_verified" not in env
+
+
+def test_referenced_docs_block_stays_when_removing_it_would_empty_the_body(tmp_path, monkeypatch):
+    answer = "参照した資料:\n- 存在しない1.md\n"
+    _, env = _run_fake(tmp_path, monkeypatch, _PY + _msg(answer), "citation-empty-u1", make_sources=_make_sources)
+    assert env["body"].strip() == answer.strip()
 
 
 @pytest.mark.parametrize("tool,extra,verified", [
@@ -1577,12 +1583,13 @@ def test_context_window_exceeded_sets_budget_headline_and_stop_kind(tmp_path, mo
     assert any("codex turn failed" in r.message and "context_window_exceeded" in r.message for r in caplog.records)
 
 
-def test_turn_failed_generic_code_keeps_legacy_headline(tmp_path, monkeypatch):
+def test_turn_failed_generic_code_shows_code_not_connection_failure(tmp_path, monkeypatch):
     from sherpa import stop_kind
     body = _PY + _emit({"type": "turn.failed", "error": {"code": "boom"}})
     _, env = _run_fake(tmp_path, monkeypatch, body, "turn-failed-generic-u1")
     assert env.get("codex_silent_failure") is True and env.get("codex_error_code") == "boom"
-    assert "Codex に接続できませんでした" in env["headline"] and "codex.log" in env["headline"]
+    assert "回答を返せずに終了しました（コード: boom）" in env["headline"] and "codex.log" in env["headline"]
+    assert "接続できませんでした" not in env["headline"]
     assert not (env.get("limits") or {}).get("total_budget_hit")
     assert stop_kind.resolve(env) == "codex_silent"
 

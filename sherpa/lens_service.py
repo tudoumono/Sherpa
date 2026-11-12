@@ -1,32 +1,38 @@
 """別レンズ probe（薄い・read-only）。取り込み済み world のグラフ・文書・grep を再利用して、業務テーマを別レンズで問う。
 設計: docs/design/chat.md「1ターンの流れ」
-- トラブルシュート（`troubleshoot`）: 近傍（`INVOKES`/`RELATES_TO`/`DOCUMENTS` 含む）＋運用手順 grep → 原因候補カード。
-- 仕様問い合わせ（`qa`）: grep（仕様書）→ 該当節を引用（doc_id＝rel_path＋span）。
+- 近傍探索（`neighbor_cards`）: 近傍（`INVOKES`/`DOCUMENTS` 含む）＋運用手順 grep → 原因候補カード。
 厳密な依存影響は impact レンズ（impact_service／world_neo4j）。ここは近傍探索。範囲は world＋`scope_prefixes`（フォルダ prefix）。
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 
 from neo4j import Query
 from neo4j.exceptions import Neo4jError
 
-from . import citations, graph_coverage, scope
+from . import citations, graph_coverage, path_rules, scope
 from .env_int import env_int
 from .graph_coverage import Coverage
 from .grep_tool import grep_search
-from .impact_service import CATEGORY, plugin_failed_note, source_unparsed_note
+from .impact_service import CATEGORY
 from .ingest.world_neo4j import (
-    EDGE_SOURCE_FIELDS, EDGE_SOURCES_RETURN_DEFAULT, EDGE_SOURCES_RETURN_MAX, GraphQueryOverloadError, GraphSchemaEraError, _scope_pred,
-    _flow_edge_pred, _flow_node_path, _safe_flow_edge,
+    EDGE_SOURCE_FIELDS, EDGE_SOURCES_RETURN_DEFAULT, EDGE_SOURCES_RETURN_MAX, GraphQueryOverloadError, GraphSchemaEraError,
+    _member_visible_path, _scope_pred, _sensitive_name_params,
+    _flow_edge_pred, _flow_node_path, _generation_pred, _safe_flow_edge,
     check_schema_era, edge_view, limit_edge_sources, read_plugin_failures, read_unparsed_sources,
     read_unresolved)
+from .ingest.world_neo4j_exclude import exclude_edge_expr, exclude_node_expr, exclude_scope, member_scope_visible
 
 _log = logging.getLogger("sherpa")
 
+# 起点の絞り込み条件（Cypher）。症状文（`$text`）に名前が含まれる起点／たどる対象の status（近傍の探索 `neo4j_related` と同じ）。
+_ANCHOR_NAME_IN_TEXT = "size(n.name)>=2 AND toLower($text) CONTAINS toLower(n.name)"
+_ANCHOR_STATUS = "($incl OR coalesce(n.status,'active')='active')"
+
 # 近傍たどりのエッジ（実効語彙）。
-_RELATED_REL = "COPIES|CONTAINS|INVOKES|ACCESSES|DOCUMENTS|CORRESPONDS_TO|FLOWS_TO"
+_RELATED_REL = "COPIES|CONTAINS|INVOKES|ACCESSES|BUILT_FROM|DOCUMENTS|CORRESPONDS_TO|FLOWS_TO"
 
 _ROLE = {"Document": "関連文書", "Module": "実装", "Batch": "ジョブ"}
 _ROLE_RANK = {"Document": 1, "Batch": 2, "Module": 3}
@@ -39,10 +45,13 @@ _NEO4J_QUERY_TIMEOUT_S = env_int("SHERPA_NEO4J_QUERY_TIMEOUT_S", 30, 1, 600)
 _NEO4J_MAX_ROWS = 10000
 # 近傍カードの文書側の根拠として、起点名ごとに grep で取るヒットの上限（`grep_search` の既定 `max_hits`）
 _CARD_GREP_MAX_HITS = 50
-# トラブルシュート/近傍探索（neo4j_related）の既定深さ（管理画面の基準値が未設定のときに使う）。
+# `graph_neighbors` が、たどる前に許す起点の数の既定（超えたらたどらずに絞り込みを求める）。env `SHERPA_GRAPH_ANCHOR_MAX` で変える。
+GRAPH_ANCHOR_MAX_ENV = "SHERPA_GRAPH_ANCHOR_MAX"
+GRAPH_ANCHOR_MAX_DEFAULT = 50
+# 「広すぎる」応答に載せる起点の内訳（トップフォルダ別）の最大件数。超えた分は `(その他)` にまとめる
+BREADTH_FOLDERS_MAX = 30
+# 近傍探索（neo4j_related）の既定深さ。
 TROUBLESHOOT_GRAPH_DEPTH = 4
-# 調べる深さ（`depth_profile.scaled_depth`）が加算後に一度だけ適用する絶対上限。
-TROUBLESHOOT_GRAPH_DEPTH_ABS_MAX = 16
 
 # タイムアウト由来のサーバエラーコードを緩く判定する（`code` に "timeout"/"timedout" を含むか・大小文字無視）。
 _TIMEOUT_CODE_RE = re.compile(r"timedout|timeout", re.IGNORECASE)
@@ -87,34 +96,63 @@ def _run_capped(session, cypher: str, *, log_world: str, coverage: Coverage | No
         raise
 
 
-def emit_result(type_: str, world: str, **payload) -> dict:
-    """レンズ共通の出力エンベロープ。type は `impact`／`troubleshoot`／`qa`。"""
-    if type_ not in ("impact", "troubleshoot", "qa", "doc_check"):
-        raise ValueError(f"unknown result type: {type_}")
-    return {"type": type_, "world": world, **payload}
+def graph_anchor_max() -> int:
+    """`graph_neighbors` がたどる前に許す起点の数（env `SHERPA_GRAPH_ANCHOR_MAX`・既定 50・1〜1000）。"""
+    return env_int(GRAPH_ANCHOR_MAX_ENV, GRAPH_ANCHOR_MAX_DEFAULT, 1, 1000)
 
 
-def _truncated_search_note(doc_ids: list) -> str | None:
-    """`grep_search(truncated_docs=...)`（cap で打ち切られた文書の doc_id）→ 利用者向け平文の注記 1 件。打切りが無ければ `None`（`notes` キーを作らない）。
-    内部語彙（`file_truncated`／cap／バイト）は出さない。
-    """
-    if not doc_ids:
-        return None
-    if len(doc_ids) == 1:
-        return f"「{doc_ids[0]}」は大きすぎて全体を検索できていません（先頭部分のみ）。"
-    shown = "」「".join(doc_ids[:5])
-    more = f" ほか{len(doc_ids) - 5}件" if len(doc_ids) > 5 else ""
-    return f"次の資料は大きすぎて全体を検索できていません（先頭部分のみ）: 「{shown}」{more}"
+class AnchorsTooBroad(Exception):
+    """起点の数が上限を超えたため、たどらずに打ち切ったことを示す。`breadth`＝内訳 `{anchors, limit, by_folder, by_kind}`、
+    `coverage`＝そこまでに集めた申告。"""
+
+    def __init__(self, breadth: dict, coverage: Coverage):
+        super().__init__("graph anchors too broad")
+        self.breadth = breadth
+        self.coverage = coverage
 
 
-def _terms(text: str) -> list[str]:
-    """検索語を区切り＋汎用の助詞/問い掛け語で素朴に分割する（テーマ非依存）。"""
-    import re
-    sep = (r"[\s、。，．・/:：;；,.!?！？「」『』（）()\[\]【】〜~\-]"
-           r"|について|という|とは|どう\w*|なに|なん\w*|教えて\w*|でしょうか|ですか"
-           r"|から|まで|より|の|は|を|に|が|で|と|も|へ|や|か|ね|よ")
-    parts = re.split(rf"(?:{sep})+", text or "")
-    return [t for t in (p.strip() for p in parts) if len(t) >= 2]
+def _anchor_breadth(session, world, match_where: str, prefixes, kind, cap: int, coverage: Coverage,
+                    include_deprecated: bool = False, **params) -> dict:
+    """当てはまる起点（`match_where` を満たす範囲内・たどる status のノード）の件数を、トップフォルダごと・種類（ラベル）ごとに数える（集計だけでたどらない）。
+    数えられなかったとき（時間切れ）は `anchors` が None。"""
+    x_expr, x_params = exclude_node_expr(world, "n")  # 除外の資料のフォルダ名・件数を内訳に出さない（所属ごとに判定）
+    rows = _run_capped(
+        session,
+        "OPTIONAL MATCH (gm:SherpaMeta {world_id:$w}) WITH gm "
+        f"MATCH (n:Entity {{world_id:$w}}) WHERE {_generation_pred('n')} AND {member_scope_visible(world, 'n')} AND ($kind='' OR $kind IN labels(n)) "
+        f"AND {_ANCHOR_STATUS} AND ({match_where}) "
+        f"AND {x_expr} WITH n, {_member_visible_path('n', world)} AS vpath "
+        "RETURN CASE WHEN vpath IS NULL THEN '(不明)' WHEN vpath CONTAINS '/' THEN split(vpath,'/')[0] "
+        "  ELSE '(直下)' END AS folder, [l IN labels(n) WHERE l<>'Entity'][0] AS label, count(n) AS c",
+        log_world=world, w=world, prefixes=list(prefixes or []), kind=kind or "", incl=include_deprecated,
+        **_sensitive_name_params(), **x_params,
+        coverage=coverage, stage=graph_coverage.STAGE_ANCHOR, **params)
+    by_folder: dict[str, int] = {}
+    by_kind: dict[str, int] = {}
+    for r in rows:
+        by_folder[r["folder"]] = by_folder.get(r["folder"], 0) + r["c"]
+        by_kind[r["label"] or "(不明)"] = by_kind.get(r["label"] or "(不明)", 0) + r["c"]
+    top = sorted(by_folder.items(), key=lambda kv: (-kv[1], kv[0]))[:BREADTH_FOLDERS_MAX]
+    folders = dict(top)
+    if len(by_folder) > len(top):
+        folders["(その他)"] = sum(by_folder.values()) - sum(n for _, n in top)
+    return {"anchors": sum(by_folder.values()) if rows else None, "limit": cap, "by_folder": folders,
+            "by_kind": dict(sorted(by_kind.items(), key=lambda kv: (-kv[1], kv[0])))}
+
+
+def _raise_too_broad(session, world, match_where, prefixes, kind, cap, coverage, include_deprecated=False, **params):
+    """起点が `cap` を超えたとき、内訳を数えて `AnchorsTooBroad` を送出する（旧世代のグラフはここでも `GraphSchemaEraError`）。"""
+    breadth = _anchor_breadth(session, world, match_where, prefixes, kind, cap, coverage, include_deprecated, **params)
+    check_schema_era(session, world, lens="troubleshoot")
+    coverage.add(graph_coverage.KIND_NARROW_REQUIRED, graph_coverage.STAGE_ANCHOR)
+    raise AnchorsTooBroad(breadth, coverage)
+
+
+def _too_broad_cards(e: AnchorsTooBroad) -> "_Cards":
+    """『広すぎる』応答用の空のカード。内訳を `too_broad` に持つ。"""
+    out = _Cards([], e.coverage)
+    out.too_broad = e.breadth
+    return out
 
 
 def _public_grep(world, hits):
@@ -132,18 +170,22 @@ def _public_grep(world, hits):
     return out
 
 
-def resolve_anchor(session, text, world, scope_prefixes=None, coverage: Coverage | None = None):
-    """症状文 → グラフ上のアンカー `[(cid, name)]`（入力に現れるノード名で同定・範囲内）。"""
+def resolve_anchor(session, text, world, scope_prefixes=None, coverage: Coverage | None = None, kind: str | None = None,
+                   cap: int | None = None, include_deprecated: bool = False):
+    """症状文 → グラフ上のアンカー `[(cid, name)]`（入力に現れるノード名で同定・範囲内・たどる status）。`kind`＝種類（ラベル）で絞る。
+    名前の一致は Cypher 側で判定する。`cap` を渡すと一致する起点を `cap+1` 件だけ取る（呼び出し側が超過を見る）。"""
+    x_expr, x_params = exclude_node_expr(world, "n")  # 管理者の除外の資料のノードは起点にしない
     rows = _run_capped(
         session,
-        f"MATCH (n:Entity {{world_id:$w}}) WHERE {_scope_pred('n')} "
-        "RETURN DISTINCT n.canonical_id AS cid, n.name AS name",
-        log_world=world, w=world, prefixes=list(scope_prefixes or []),
+        "OPTIONAL MATCH (gm:SherpaMeta {world_id:$w}) WITH gm "
+        f"MATCH (n:Entity {{world_id:$w}}) WHERE {_generation_pred('n')} AND {member_scope_visible(world, 'n')} AND ($kind='' OR $kind IN labels(n)) "
+        f"AND {_ANCHOR_STATUS} AND {_ANCHOR_NAME_IN_TEXT} AND {x_expr} "
+        "RETURN DISTINCT n.canonical_id AS cid, n.name AS name" + (" LIMIT $lim" if cap is not None else ""),
+        log_world=world, w=world, prefixes=list(scope_prefixes or []), kind=kind or "", text=text or "",
+        incl=include_deprecated, lim=None if cap is None else cap + 1, **x_params,
         coverage=coverage, stage=graph_coverage.STAGE_ANCHOR,
     )
-    low = (text or "").lower()
-    return [(r["cid"], r["name"]) for r in rows
-            if r["name"] and len(r["name"]) >= 2 and r["name"].lower() in low]
+    return [(r["cid"], r["name"]) for r in rows]
 
 
 def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHOOT_GRAPH_DEPTH, include_deprecated=False,
@@ -165,43 +207,82 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
         _plugin_failures()
         return []
     from .ingest import text_kind
-    cy = (
-        "MATCH (a:Entity) WHERE a.canonical_id IN $anchors "
-        f"MATCH p=(a)-[r:{_RELATED_REL}*1..%(d)d]-(nb:Entity) "
-        f"WHERE nb.world_id=$world AND nb.canonical_id <> a.canonical_id "
-        f"  AND all(n IN nodes(p) WHERE n.world_id=$world AND "
-        f"CASE WHEN n:Dataset THEN {_flow_node_path('n')} IS NOT NULL ELSE {_scope_pred('n')} END) "  # 経路全体を範囲内に（scope 外を経由させない）
-        "  AND all(e IN relationships(p) WHERE type(e)<>'FLOWS_TO' OR "
-        f"({_flow_edge_pred()} AND {_flow_node_path('startNode(e)')} IS NOT NULL "
-        f"AND {_flow_node_path('endNode(e)')} IS NOT NULL)) "
-        "  AND ($incl OR all(n IN nodes(p) WHERE coalesce(n.status,'active')='active')) "
-        "  AND ($incl OR all(e IN relationships(p) WHERE coalesce(e.status,'active')='active')) "
-        "WITH nb, p ORDER BY length(p) "
-        "WITH nb, head(collect(p)) AS path "
-        "RETURN nb.canonical_id AS cid, nb.name AS name, "
-        "  [l IN labels(nb) WHERE l<>'Entity'][0] AS label, "
-        "  coalesce(nb.status,'active') AS status, "
-        "  [n IN nodes(path) | n.name] AS path_names, "
-        f"  [e IN relationships(path) | {{type:type(e), from:startNode(e).name, to:endNode(e).name, doc:e.doc, line:e.line, {EDGE_SOURCE_FIELDS}}}] AS edges, "
-        "  length(path) AS dist"
-    ) % {"d": int(depth)}
+    x_expr, x_params = exclude_node_expr(world, "n")  # 管理者の除外の資料のノードは、起点にも経路にもしない
+    x_edge, x_edge_params = exclude_edge_expr(world, "e")  # 代表の資料が除外でも、見える根拠が残る辺は通す（行数の天井の前）
+    x_params = {**x_params, **x_edge_params}
+    with exclude_scope(world):
+        cy = (
+            "OPTIONAL MATCH (gm:SherpaMeta {world_id:$world}) WITH gm "
+            "MATCH (a:Entity) WHERE a.canonical_id IN $anchors AND a.world_id=$world "
+            f"AND {_generation_pred('a')} "
+            f"MATCH p=(a)-[r:{_RELATED_REL}*1..%(d)d]-(nb:Entity) "
+            f"WHERE nb.world_id=$world AND nb.canonical_id <> a.canonical_id "
+            f"  AND {_generation_pred('nb')} "
+            f"  AND all(n IN nodes(p) WHERE n.world_id=$world AND {x_expr} AND "
+            f"{_generation_pred('n')} AND "
+            f"CASE WHEN n:Dataset THEN {_flow_node_path('n')} IS NOT NULL ELSE {_scope_pred('n')} END) "  # 経路全体を範囲内に（scope 外を経由させない）
+            f"  AND all(e IN relationships(p) WHERE {_generation_pred('e')} AND "
+            "(type(e)<>'FLOWS_TO' OR "
+            f"({_flow_edge_pred()} AND {_flow_node_path('startNode(e)')} IS NOT NULL "
+            f"AND {_flow_node_path('endNode(e)')} IS NOT NULL))) "
+            "  AND ($incl OR all(n IN nodes(p) WHERE coalesce(n.status,'active')='active')) "
+            "  AND ($incl OR all(e IN relationships(p) WHERE coalesce(e.status,'active')='active')) "
+            + (f"  AND all(e IN relationships(p) WHERE {x_edge}) " if x_edge != "true" else "") +
+            "WITH nb, p ORDER BY length(p) "
+            "WITH nb, head(collect(p)) AS path "
+            "RETURN nb.canonical_id AS cid, nb.name AS name, "
+            "  [l IN labels(nb) WHERE l<>'Entity'][0] AS label, "
+            "  coalesce(nb.status,'active') AS status, "
+            "  [n IN nodes(path) | n.name] AS path_names, "
+            f"  [e IN relationships(path) | {{type:type(e), from:startNode(e).name, to:endNode(e).name, doc:e.doc, line:e.line, {EDGE_SOURCE_FIELDS}}}] AS edges, "
+            "  length(path) AS dist"
+        ) % {"d": int(depth)}
     out = []
     rows = _run_capped(session, cy, log_world=world, anchors=list(anchors), world=world,
                        prefixes=list(scope_prefixes or []), incl=include_deprecated,
                        s_exact=sorted(text_kind._SENSITIVE_NAME_EXACT), s_pre=list(text_kind._SENSITIVE_NAME_PREFIXES),
-                       s_ext=sorted(text_kind.SENSITIVE_EXT),
+                       s_ext=sorted(text_kind.SENSITIVE_EXT), **x_params,
                        coverage=coverage, stage=graph_coverage.STAGE_NEIGHBORS)
     check_schema_era(session, world, lens="troubleshoot")
     _plugin_failures()
+    rules = path_rules.rules_for(world)
+    hide = bool(rules.exclude_paths)
+
+    def _clean(e: dict) -> dict:
+        """根拠（本文の抜粋 `evidence_text`・`from_def` を含む）を資料のパス単位で組み直す（`edge_view` が先頭を切る前に除く）。"""
+        if not (hide and e.get("sources")):
+            return e
+        try:
+            srcs = json.loads(e["sources"])
+        except (TypeError, ValueError):
+            srcs = []
+        srcs = [x for x in srcs if not path_rules.source_hidden(rules, x)]
+        # 保存済みの超過の数に除外の根拠が混ざっているか分からない＝捨てて、見える根拠の返す上限の超過だけを数える
+        return {**e, "sources": json.dumps(srcs, ensure_ascii=False) if srcs else None, "sources_overflow": 0}
+
     for r in rows:
+        edges, dropped = [], False
+        for raw in r["edges"]:
+            e = _clean(raw)
+            if hide and path_rules.hidden_doc(rules, raw.get("doc")):
+                # 代表の資料が除外でも、見える根拠が残る辺は、見える根拠の先頭から代表の資料・行を選び直す。無ければ行ごと落とす
+                try:
+                    vis = json.loads(e["sources"]) if e.get("sources") else []
+                except (TypeError, ValueError):
+                    vis = []
+                if not vis:
+                    dropped = True
+                    break
+                e = {**e, "doc": vis[0].get("doc_id") or vis[0].get("file"), "line": vis[0].get("line")}
+            edges.append(edge_view(_safe_flow_edge(e, scope_prefixes) if e["type"] == "FLOWS_TO" else e))
+        if dropped:
+            continue
         out.append({
             "cid": r["cid"], "name": r["name"], "label": r["label"],
             "category": CATEGORY.get(r["label"], r["label"]),
             "status": r["status"],
             "path": r["path_names"], "distance": r["dist"],
-            "edges": limit_edge_sources([
-                edge_view(_safe_flow_edge(e, scope_prefixes) if e["type"] == "FLOWS_TO" else e)
-                for e in r["edges"]], sources_limit),
+            "edges": limit_edge_sources(edges, sources_limit),
         })
     return out
 
@@ -216,35 +297,58 @@ class _Cards(list):
     unresolved: dict | None = None   # 起点の名前に一致する未解決の参照（`neighbor_cards*` だけが付ける・`world_neo4j.read_unresolved` の形）
     depth: dict | None = None
     dataitems_excluded: int = 0
+    too_broad: dict | None = None   # 起点が多すぎてたどらなかったときの内訳（`AnchorsTooBroad.breadth`）
+    deadline_exceeded: bool = False  # 起点名の grep が期限で止まった（文書側の根拠が途中まで）
 
     def __init__(self, items, coverage: Coverage):
         super().__init__(items)
         self.coverage = coverage
 
 
+def _card_order(c: dict) -> tuple:
+    """カードの並び（役割・距離・名前）。同順位は cid・経路で決め、取得のたびに並びが変わらないようにする（`graph_neighbors` の続きが重複も抜けも出さないため）。"""
+    return (_ROLE_RANK.get(c["label"], 9), c["distance"] if c["distance"] is not None else 99, c["name"],
+            c.get("cid") or "", "\x1f".join(str(x) for x in (c.get("path") or [])))
+
+
 def _troubleshoot_cards(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH, include_deprecated=False, scope_paths=None,
-                        sources_limit: int = EDGE_SOURCES_RETURN_DEFAULT):
-    """症状 → 原因候補カード（内部専用・`cid` 付き）。`run_troubleshoot`（`cid` 除去）と `neighbor_cards`（agentic `graph_neighbors`・`cid` 保持）が共有する。
+                        sources_limit: int = EDGE_SOURCES_RETURN_DEFAULT, anchor_cap: int | None = None,
+                        kind: str | None = None, deadline: float | None = None):
+    """症状 → 原因候補カード（内部専用・`cid` 付き）。`neighbor_cards`（agentic `graph_neighbors`・`cid` 保持）が使う。
     戻り値を直接 API・会話保存・共有・JSON 書き出しへ渡さない（内部専用フィールドが漏れる）。
-    戻り値は `(anchor_names, cards, truncated_docs)`。`truncated_docs` は `run_troubleshoot` が平文の注記にする。
+    戻り値は `(anchor_names, cards, truncated_docs)`。`truncated_docs` は文書探索の打ち切りの申告に使う。
     `cards` は `_Cards`（`.coverage`＝起点の解決・近傍の取得・文書の探索で見つかった打ち切り）。
+    `kind`＝起点を種類で絞る。`anchor_cap`＝起点の数の上限（超えたらたどらず `AnchorsTooBroad` を送出する）。
+    `deadline`＝起点名の grep の絶対期限（`time.monotonic()` 系）。超えたら例外にせず、そこまでに見つけた文書側の根拠でカードを組み、`.deadline_exceeded` を立てて `coverage` に `timeout`（stage `docs`）を足す。
     """
     sp = scope.normalize_scope_paths(scope_paths) or None
     coverage = Coverage()
-    pairs = resolve_anchor(session, symptom, world, sp, coverage=coverage)
+    pairs = resolve_anchor(session, symptom, world, sp, coverage=coverage, kind=kind, cap=anchor_cap,
+                           include_deprecated=include_deprecated)
     anchors = [c for c, _n in pairs]
+    if anchor_cap is not None and len(set(anchors)) > anchor_cap:
+        _raise_too_broad(session, world, _ANCHOR_NAME_IN_TEXT, sp, kind, anchor_cap, coverage, include_deprecated,
+                         text=symptom or "")
     anchor_names = {n for _c, n in pairs}
     related = neo4j_related(session, anchors, world, sp, depth, include_deprecated, coverage=coverage,
                             sources_limit=sources_limit)
 
     grep_by_doc: dict[str, list] = {}
     truncated_docs: list = []
+    deadline_exceeded = False
     for nm in anchor_names:
-        found = grep_search(nm, world, scope_paths=sp, truncated_docs=truncated_docs)
+        grep_stats: dict = {}
+        deadline_kw = ({"deadline": deadline, "stats": grep_stats, "partial_on_deadline": True}
+                       if deadline is not None else {})
+        found = grep_search(nm, world, scope_paths=sp, truncated_docs=truncated_docs, **deadline_kw)
         if len(found) >= _CARD_GREP_MAX_HITS:  # 起点名 1 つあたりのヒット上限に達した＝文書側の根拠が一部だけ
             coverage.add(graph_coverage.KIND_RESULT_CAP, graph_coverage.STAGE_DOCS)
         for h in found:
             grep_by_doc.setdefault(h["doc_id"], []).append(h)
+        if grep_stats.get("deadline_exceeded"):
+            deadline_exceeded = True
+            coverage.add(graph_coverage.KIND_TIMEOUT, graph_coverage.STAGE_DOCS)
+            break
 
     cards: list[dict] = []
     covered_docs: set[str] = set()
@@ -262,7 +366,7 @@ def _troubleshoot_cards(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH,
             "source": "both" if gh else "graph",
             "evidence": {"edges": nb["edges"], "grep": _public_grep(world, gh)},
             "cid": nb["cid"],  # 内部専用: Neo4j canonical_id
-                                # 同名 label/name の別ノードを区別する機械キー。公開経路（`run_troubleshoot`）は返す前に除去する。
+                                # 同名 label/name の別ノードを区別する機械キー。公開する前に除去する。
         })
     for doc_id, gh in grep_by_doc.items():  # グラフに無いが grep だけで出た文書（運用手順など）
         if doc_id in covered_docs:
@@ -273,58 +377,15 @@ def _troubleshoot_cards(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH,
             "source": "grep", "evidence": {"edges": [], "grep": _public_grep(world, gh)},
         })
 
-    cards.sort(key=lambda c: (_ROLE_RANK.get(c["label"], 9),
-                              c["distance"] if c["distance"] is not None else 99, c["name"]))
-    cards = scope.filter_items(cards, sp)
+    cards.sort(key=_card_order)
+    cards = scope.filter_items(cards, sp, path_rules.rules_for(world))
     if truncated_docs:
         coverage.add(graph_coverage.KIND_DOC_SEARCH_TRUNCATED, graph_coverage.STAGE_DOCS)
     out_cards = _Cards(cards, coverage)
     out_cards.depth = {"requested": int(depth), "truncated": None}
     out_cards.dataitems_excluded = dataitems_excluded
+    out_cards.deadline_exceeded = deadline_exceeded
     return anchor_names, out_cards, truncated_docs
-
-
-_GRAPH_LIMIT_NOTES = {
-    (graph_coverage.KIND_TIMEOUT, graph_coverage.STAGE_ANCHOR):
-        "症状に含まれる名前を関係グラフから探す検索が時間内に終わらず、起点を調べきれていません"
-        "（結果が空・一部のみの可能性があります）。範囲（フォルダ）を絞って再実行してください。",
-    (graph_coverage.KIND_TIMEOUT, graph_coverage.STAGE_NEIGHBORS):
-        "関係グラフのつながりを調べる検索が時間内に終わらず、調べきれていません"
-        "（結果が空・一部のみの可能性があります）。範囲（フォルダ）を絞って再実行してください。",
-    (graph_coverage.KIND_ROW_CAP, graph_coverage.STAGE_ANCHOR):
-        "症状に含まれる名前を関係グラフから探す検索が件数の上限に達し、起点の一部しか調べられていません。"
-        "範囲（フォルダ）を絞って再実行してください。",
-    (graph_coverage.KIND_ROW_CAP, graph_coverage.STAGE_NEIGHBORS):
-        "関係グラフのつながりを調べる検索が件数の上限に達し、一部しか調べられていません。"
-        "範囲（フォルダ）を絞って再実行してください。",
-}
-
-
-def graph_limit_notes(coverage: Coverage) -> list[str]:
-    """`coverage` の `timeout`／`row_cap`／`plugin_failed` → 利用者向け平文の注記（段階ごとに 1 件・`plugin_failed` は全プラグインで 1 件）。文書探索の打ち切りは `_truncated_search_note` が別に出す。"""
-    notes = [_GRAPH_LIMIT_NOTES[(lim["kind"], lim.get("stage"))] for lim in coverage.limits
-             if (lim["kind"], lim.get("stage")) in _GRAPH_LIMIT_NOTES]
-    extra = [n for n in (plugin_failed_note({"limits": coverage.limits}),
-                         source_unparsed_note({"limits": coverage.limits})) if n]
-    return notes + extra
-
-
-def run_troubleshoot(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH, include_deprecated=False, scope_paths=None):
-    """症状 → 原因候補カード（近傍グラフ＋運用手順 grep・根拠つき）。範囲で grep と候補を絞る。
-    公開経路のため内部専用 `cid` は含まない（`cid` 付きは `neighbor_cards`）。
-    `coverage`（`graph_coverage` の欄）で、時間切れ（空）・行数の天井（部分結果）・文書探索の打ち切りを「近傍なし」と区別して返す。
-    打ち切りがあれば `notes`（平文の注記）を添える。
-    """
-    anchor_names, cards, truncated_docs = _troubleshoot_cards(session, symptom, world, depth, include_deprecated, scope_paths)
-    public_cards = [{k: v for k, v in c.items() if k != "cid"} for c in cards]
-    coverage = getattr(cards, "coverage", None) or Coverage()
-    result = emit_result("troubleshoot", world, symptom=symptom,
-                         anchors=sorted(anchor_names), candidates=public_cards,
-                         coverage=coverage.as_dict())
-    notes = [n for n in (_truncated_search_note(truncated_docs), *graph_limit_notes(coverage)) if n]
-    if notes:
-        result["notes"] = notes
-    return result
 
 
 def _attach_unresolved(session, cards, world, anchor_names, scope_prefixes) -> None:
@@ -336,7 +397,9 @@ def _attach_unresolved(session, cards, world, anchor_names, scope_prefixes) -> N
     if cards.coverage.has(graph_coverage.KIND_TIMEOUT, graph_coverage.KIND_ROW_CAP):
         return
     try:
-        cards.unresolved = read_unresolved(session, world, sorted(anchor_names), scope_prefixes, fold_case=True)
+        cards.unresolved = path_rules.scrub_unresolved(
+            read_unresolved(session, world, sorted(anchor_names), scope_prefixes, fold_case=True),
+            path_rules.rules_for(world))  # 除外の資料が書いた未解決の参照は出さない
     except GraphQueryOverloadError as e:
         cards.coverage.add(graph_coverage.kind_of_overload(e.reason), graph_coverage.STAGE_NEIGHBORS)
 
@@ -356,9 +419,12 @@ class NeighborCardsFailure(list):
         self.error_code = error_code
 
 
-def neighbor_cards(world, term, scope_paths=None) -> list:
+def neighbor_cards(world, term, scope_paths=None, kind=None, deadline=None) -> list:
     """関係グラフの近傍カード（原因候補）を返す。agentic ツール `graph_neighbors` 専用で、自前で Neo4j セッションを開いて `_troubleshoot_cards` を呼ぶ（`cid` 付き）。
     戻り値のカードは `.coverage`（`Coverage`）を持つ（時間切れ・行数の天井・文書探索の打ち切り）。
+    `kind`＝起点を種類（ラベル）で絞る。起点が `graph_anchor_max()` を超えるときはたどらず、空のカードに内訳 `.too_broad` と
+    `narrow_required`（stage `anchor`）を付けて返す。
+    `deadline`＝起点名の grep の絶対期限。超えたらそこまでの根拠でカードを返し、`.deadline_exceeded` を真にする。
     Neo4j 不可・未解決は `[]`。捕捉した障害は `NeighborCardsFailure`（`error_code`）で返す:
     接続系（`DriverError`/`TransientError`）は `"graph_unavailable"`（回復可能）、それ以外は `"graph_internal_error"`（回復不可）。型名だけログに残す。
     `GraphSchemaEraError` だけは再送出する（呼び出し元が `graph_reingest_required` に変換）。
@@ -375,11 +441,15 @@ def neighbor_cards(world, term, scope_paths=None) -> list:
         with driver.session() as s:
             # 3 件目（truncated_docs）は無視（agentic 経路は `ripgrep_search` が別途申告する）。
             anchor_names, cards, _truncated_docs = _troubleshoot_cards(
-                s, term, world, scope_paths=scope_paths, sources_limit=EDGE_SOURCES_RETURN_MAX)
+                s, term, world, scope_paths=scope_paths, sources_limit=EDGE_SOURCES_RETURN_MAX,
+                anchor_cap=graph_anchor_max(), **({"kind": kind} if kind else {}),
+                **({"deadline": deadline} if deadline is not None else {}))
             _attach_unresolved(s, cards, world, anchor_names, scope.normalize_scope_paths(scope_paths) or None)
         return cards
     except GraphSchemaEraError:
         raise
+    except AnchorsTooBroad as e:
+        return _too_broad_cards(e)
     except GraphQueryOverloadError as e:
         return _overload_cards(e)
     except Exception as exc:
@@ -397,30 +467,35 @@ def neighbor_cards(world, term, scope_paths=None) -> list:
                 pass
 
 
-def _resolve_anchor_by_name(session, term, world, scope_prefixes=None, coverage: Coverage | None = None):
-    """起点をグラフから名前の一致で直接引く（素の Codex モード専用）。完全一致が 0 件のときだけ大文字小文字無視の一致を試す。範囲の述語は `resolve_anchor` と同じ。"""
+def _resolve_anchor_by_name(session, term, world, scope_prefixes=None, coverage: Coverage | None = None,
+                            kind: str | None = None, cap: int | None = None, include_deprecated: bool = False):
+    """起点をグラフから名前の一致で直接引く（素の Codex モード専用）。完全一致が 0 件のときだけ大文字小文字無視の一致を試す。範囲の述語は `resolve_anchor` と同じ。
+    `kind`＝種類（ラベル）で絞る。たどる status の起点だけを数える。`cap`＝起点の数の上限（`cap+1` 件で読むのを止め、超えたら内訳を数えて `AnchorsTooBroad` を送出する）。"""
     sp = list(scope_prefixes or [])
-    rows = _run_capped(
-        session,
-        f"MATCH (n:Entity {{world_id:$w}}) WHERE {_scope_pred('n')} AND n.name = $term "
-        "RETURN DISTINCT n.canonical_id AS cid, n.name AS name",
-        log_world=world, w=world, prefixes=sp, term=term,
-        coverage=coverage, stage=graph_coverage.STAGE_ANCHOR,
-    )
-    if not rows:
+    where = "n.name = $term"
+    x_expr, x_params = exclude_node_expr(world, "n")
+    for _ in range(2):
         rows = _run_capped(
             session,
-            f"MATCH (n:Entity {{world_id:$w}}) WHERE {_scope_pred('n')} AND toLower(n.name) = toLower($term) "
-            "RETURN DISTINCT n.canonical_id AS cid, n.name AS name",
-            log_world=world, w=world, prefixes=sp, term=term,
+            "OPTIONAL MATCH (gm:SherpaMeta {world_id:$w}) WITH gm "
+            f"MATCH (n:Entity {{world_id:$w}}) WHERE {_generation_pred('n')} AND {member_scope_visible(world, 'n')} AND ($kind='' OR $kind IN labels(n)) AND {_ANCHOR_STATUS} AND {where} "
+            "RETURN DISTINCT n.canonical_id AS cid, n.name AS name" + (" LIMIT $lim" if cap is not None else ""),
+            log_world=world, w=world, prefixes=sp, term=term, kind=kind or "", incl=include_deprecated, lim=None if cap is None else cap + 1, **x_params,
             coverage=coverage, stage=graph_coverage.STAGE_ANCHOR,
         )
+        if rows:
+            break
+        where = "toLower(n.name) = toLower($term)"
+    if cap is not None and len(rows) > cap:
+        _raise_too_broad(session, world, where, sp, kind, cap, coverage if coverage is not None else Coverage(),
+                         include_deprecated, term=term)
     return [(r["cid"], r["name"]) for r in rows]
 
 
-def neighbor_cards_graph_only(world, term, scope_paths=None) -> list:
+def neighbor_cards_graph_only(world, term, scope_paths=None, kind=None) -> list:
     """`neighbor_cards` のグラフだけ版（素の Codex モード）。grep はせず、起点は `_resolve_anchor_by_name`、近傍は `neo4j_related`。
     `evidence.grep` は常に空・`source` は常に `"graph"`。戻り値・失敗の扱いは `neighbor_cards` と同じ（`GraphSchemaEraError` は再送出）。
+    `kind`・起点が多すぎるときの扱いも `neighbor_cards` と同じ。
     """
     if not (term or "").strip():
         return []
@@ -434,7 +509,7 @@ def neighbor_cards_graph_only(world, term, scope_paths=None) -> list:
         sp = scope.normalize_scope_paths(scope_paths) or None
         with driver.session() as s:
             coverage = Coverage()
-            pairs = _resolve_anchor_by_name(s, term, world, sp, coverage=coverage)
+            pairs = _resolve_anchor_by_name(s, term, world, sp, coverage=coverage, kind=kind, cap=graph_anchor_max())
             anchors = [c for c, _n in pairs]
             related = neo4j_related(s, anchors, world, sp, coverage=coverage, sources_limit=EDGE_SOURCES_RETURN_MAX)
             probe = _Cards([], coverage)
@@ -453,15 +528,16 @@ def neighbor_cards_graph_only(world, term, scope_paths=None) -> list:
                 "evidence": {"edges": nb["edges"], "grep": []},
                 "cid": nb["cid"],
             })
-        cards.sort(key=lambda c: (_ROLE_RANK.get(c["label"], 9),
-                                  c["distance"] if c["distance"] is not None else 99, c["name"]))
-        result = _Cards(scope.filter_items(cards, sp), coverage)
+        cards.sort(key=_card_order)
+        result = _Cards(scope.filter_items(cards, sp, path_rules.rules_for(world)), coverage)
         result.unresolved = unresolved
         result.depth = {"requested": TROUBLESHOOT_GRAPH_DEPTH, "truncated": None}
         result.dataitems_excluded = dataitems_excluded
         return result
     except GraphSchemaEraError:
         raise
+    except AnchorsTooBroad as e:
+        return _too_broad_cards(e)
     except GraphQueryOverloadError as e:
         return _overload_cards(e)
     except Exception as exc:
@@ -476,41 +552,3 @@ def neighbor_cards_graph_only(world, term, scope_paths=None) -> list:
                 driver.close()
             except Exception:
                 pass
-
-
-def run_qa(question, world, max_hits=20, scope_paths=None, layer=None):
-    """検索語 → 仕様書の該当節を引用（doc_id＝rel_path＋span）。範囲（フォルダ prefix）で引用源を絞る。
-    `layer`（省略可・`None`＝`"both"`）は探す対象で、`grep_search` へそのまま渡す。
-    打ち切られた文書があれば `notes`（平文の注記 1 件）を添える。
-    """
-    sp = scope.normalize_scope_paths(scope_paths) or None
-    truncated_docs: list = []
-    hits = grep_search(question, world, max_hits=max_hits, scope_paths=sp, layer=layer,
-                       truncated_docs=truncated_docs)
-    if not hits:  # 自然文 → 語に分割し具体的な語から試す
-        for t in sorted(_terms(question), key=len, reverse=True):
-            found, seen = [], set()
-            for h in grep_search(t, world, max_hits=max_hits, scope_paths=sp, layer=layer,
-                                 truncated_docs=truncated_docs):
-                key = (h["doc_id"], tuple(h["span"]))
-                if key not in seen:
-                    seen.add(key)
-                    found.append(h)
-            if found:
-                hits = found
-                break
-    # quote を人間向け MD の該当節へ引き直す（match/ext は維持）。取れなければ grep 本文のまま。
-    from . import excerpts
-    cites = []
-    for h in hits:
-        c = citations.from_grep_hit(h)
-        disp = excerpts.display_quote(world, h["doc_id"], c["quote"], span=h.get("span"))
-        cites.append(citations.with_display_excerpt(
-            c, quote=disp["quote"], excerpt_source=disp["excerpt_source"],
-            locator_hint=disp["locator_hint"]))
-    result = emit_result("qa", world, question=question,
-                         answered=bool(cites), citations=cites)
-    note = _truncated_search_note(truncated_docs)
-    if note:
-        result["notes"] = [note]
-    return result

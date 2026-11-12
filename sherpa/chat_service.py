@@ -1,4 +1,4 @@
-"""チャット・オーケストレーション。会話メッセージ → ルーティング（chat_router）→ 既存レンズ（run_impact/run_troubleshoot/run_qa）→ 答えエンベロープ（見出し＝答え＋するべきこと／本体／出典フッター＝原本 DL）→ 会話に永続（store）。
+"""チャット・オーケストレーション。会話メッセージ → ルーティング（chat_router）→ 頭脳（provider）→ 答えエンベロープ（見出し＝答え＋するべきこと／本体／出典フッター＝原本 DL）→ 会話に永続（store）。
 設計: docs/design/chat.md「1ターンの流れ」
 `stream_message` は同じ流れを思考ステップとして逐次 yield する（SSE・右ペインの「思考の流れ」）。レンズ振り分けは利用者に見せず、出典は必ず付けて原本 DL リンクにする。
 """
@@ -7,18 +7,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import time
-from pathlib import Path
 from urllib.parse import quote
 
-from . import agent_constructs, agentic_search, answer_shape, app_version, exec_event, intent_llm, scope, store, text_encoding, worlds
+from . import agent_constructs, agentic_search, answer_shape, app_version, citations, documents, exec_event, intent_llm, path_rules, scope, store, worlds
 from . import depth_profile as depth_profile_mod
 from . import investigation_state as investigation_state_mod
 from . import layer as layer_mod
 from . import stop_kind as stop_kind_mod
 from . import tools_pref as tools_pref_mod
-from .ingest import importance, text_kind
+from .ingest import importance
 from .agents import AGENT_PROVIDERS, Ctx, get_provider
 from .providers import plain_provider_for
 from .chat_router import clarify_decision as _clarify_decision
@@ -27,26 +25,19 @@ from .chat_router import decision_for as _decision_for
 from .chat_router import extract_slash_lens as _extract_slash_lens
 from .chat_router import route as _heuristic_route
 from .chat_router import wants_confirm_first as _wants_confirm_first
-from .impact_service import IMPACT_MAX_DEPTH, IMPACT_MAX_DEPTH_ABS_MAX, run_impact
-from .ingest.analyzers import registry as _analyzer_registry
 from .ingest.world_neo4j import (
     GRAPH_OVERLOAD_USER_MESSAGE,
     GRAPH_SCHEMA_ERA_USER_MESSAGE,
     GraphQueryOverloadError,
     GraphSchemaEraError,
-    world_graph_is_empty,
+    _generation_pred,
 )
-from .lens_service import (
-    TROUBLESHOOT_GRAPH_DEPTH,
-    TROUBLESHOOT_GRAPH_DEPTH_ABS_MAX,
-    _run_capped,
-    run_qa,
-    run_troubleshoot,
-)
-from .store import investigation_records as store_investigation
-
-# qa レンズの `run_qa` が直接 grep する経路固有の既定ヒット上限（`agentic_search.MAX_HITS` とは別）。`_dispatch()` と管理画面基準値（`routers/system_extras.py::_admin_settings_view`）が参照する唯一の定義。
-QA_MAX_HITS_DEFAULT = 20
+from .lens_service import _run_capped
+from .chat_history import HistoryUnavailable, _HISTORY_CHAR_BUDGET, _HISTORY_MSG_CHARS, _HISTORY_TURNS, _HistoryList, _clip_history_msg, _history_pairs  # noqa: F401
+from .chat_personal import _PERSONAL_SEARCHABLE_EXT, _personal_citations, _personal_facts, _personal_grep_hits, _redact  # noqa: F401
+from .chat_finish import fail_before_run, note_stats_unsaved, resolve_used_personal, save_session_id
+from .chat_records import _mark_investigation_recorded, _save_investigation_record  # noqa: F401
+from .store import investigation_records as store_investigation  # noqa: F401
 
 _log = logging.getLogger("sherpa")
 
@@ -64,11 +55,6 @@ _MAX_TRACE_BYTES = 1_000_000
 # 集約ノード 1 件に載せる evidence_ids の上限。超過分は件数だけ `metrics.omitted_evidence_count` に残す。
 _MAX_TRACE_AGGREGATE_EVIDENCE_IDS = 20
 
-# 会話継続＝履歴 priming。追質問が前ターンを理解しない問題を避けるため、直近ターンの (user, assistant) 完全対を `Ctx.history` として全 provider に注入する（Codex ネイティブ resume は別経路）。
-# トークン計測ツールが無いため、対数キャップ＋文字予算の二重キャップで近似する。
-_HISTORY_TURNS = 6  # 直近 N 対（対数キャップ）
-_HISTORY_MSG_CHARS = 1200  # 1 メッセージの上限文字数
-_HISTORY_CHAR_BUDGET = 6000  # 履歴全体の文字予算
 
 
 def _trace_bytes(values) -> int:
@@ -337,6 +323,9 @@ def _resolve_lens(lens, message):
     return None, "auto", lens_block, message
 
 
+INTENT_FAILED_PROMPT = "調べ方の自動判定に失敗しました。どのやりたいことをしますか？（影響範囲／原因／仕様・内容／作成）"
+
+
 def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=None, scope_meta=None,
                   conversation_id=None, doc_focus=False):
     """hybrid intent ルータ。heuristic 確信 →（曖昧）LLM 分類 →（なお曖昧）clarify or qa fallback。
@@ -357,7 +346,7 @@ def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=N
     def _route(message):
         if message in cache:
             return cache[message]
-        # 「確認してから進めて」は provider/dispatch に入る前に確認カードを出す決定的ガード（既存 clarify と同経路）。確認ID 付き（回答の再送）では発動しない。`can_ask=False` は通常判定へ委ねる。
+        # 「確認してから進めて」は provider に入る前に確認カードを出す決定的ガード（既存 clarify と同経路）。確認ID 付き（回答の再送）では発動しない。`can_ask=False` は通常判定へ委ねる。
         if can_ask and _wants_confirm_first(message):
             sm = scope_meta or {}
             d = _confirm_first_decision(message, lens=explicit_lens, layer=sm.get("layer"),
@@ -375,9 +364,18 @@ def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=N
             # 簡易は管理者設定の AI（`simple_chat._resolve_llm`）以外へ送らないため、意図分類の LLM は呼ばず、曖昧な入力は確認も挟まず qa に固定する。
             d = _decision_for("qa", message, known, reason="曖昧なため既定（検索）")
         elif not d.get("confident"):  # 曖昧時だけ Tier2/3（コスト最小・大半は無料）
-            c = intent_llm.classify(message, settings, user_id=user_id, world=world,
-                                    conversation_id=conversation_id)  # Tier2: 安価 LLM 分類（未接続/失敗は None）
-            if c and c.get("lens") in _LENSES and c.get("confident", True):
+            try:
+                c = intent_llm.classify(message, settings, user_id=user_id, world=world,
+                                        conversation_id=conversation_id)  # Tier2: 安価 LLM 分類（未接続は None・失敗は例外）
+            except intent_llm.IntentClassifierError:
+                if not can_ask:
+                    raise   # 非対話は分類の失敗をそのまま返す（検索へ黙って進めない）
+                c = {"failed": True}
+            if c and c.get("failed"):
+                d = _clarify_decision(message)   # 障害であることを添えて、本人に調べ方を選んでもらう
+                d["question"]["prompt"] = INTENT_FAILED_PROMPT
+                d["reason"] = "意図分類に失敗（確認）"
+            elif c and c.get("lens") in _LENSES and c.get("confident", True):
                 d = _decision_for(c["lens"], message, known, reason="AI判定（意図分類）")
             elif can_ask:
                 d = _clarify_decision(message)  # Tier3: 本人に確認（ask_user と同経路）
@@ -393,12 +391,6 @@ _ROUTE_PATH = {"investigate": ["文書を検索"], "impact": ["関係を確認"]
                "author": ["文書を検索", "資料を作成"]}
 # 出典に出さない内部来歴マーカー（DL できる文書ではない）。`scope.NON_DOC` と共有する。
 _NON_DOC = scope.NON_DOC
-_SECRET_RE = re.compile(
-    r"(sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}"
-    r"|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}"
-    r"|-----BEGIN[^-]+PRIVATE KEY-----[\s\S]*?-----END[^-]+PRIVATE KEY-----)"
-)
-_KV_SECRET_RE = re.compile(r"(?i)\b(pass(?:word|wd)?|secret|api[_-]?key|token|authorization)\b(\s*[=:]\s*)(\S+)")
 
 
 _STREAM_PACE = 0.35  # 思考ステップ表示の間隔（秒）。テストは 0
@@ -416,116 +408,50 @@ def _known_terms(session, world) -> list:
     from neo4j.exceptions import DriverError, TransientError
     try:
         rows = _run_capped(
-            session, "MATCH (n:Entity {world_id:$v}) RETURN DISTINCT n.name AS name",
+            session, "OPTIONAL MATCH (gm:SherpaMeta {world_id:$v}) WITH gm "
+                     "MATCH (n:Entity {world_id:$v}) "
+                     f"WHERE {_generation_pred('n')} RETURN DISTINCT n.name AS name",
             log_world=world, v=world,
         )
     except (DriverError, TransientError) as e:
-        # 接続断・一時障害は、ターン全体を落とさず空で続ける（落とすとグラフ不調時の縮退へ到達できない）。実行本体（`_dispatch`）が同じ障害を別途分類して縮退／honest failure を決める。
+        # 接続断・一時障害は、ターン全体を落とさず空で続ける（落とすとグラフ不調時の縮退へ到達できない）。
         _log.warning("起点語ヒントの取得に失敗（グラフ接続断・空で続行・world=%s）: %s",
                     world, type(e).__name__)
         return []
     return [r["name"] for r in rows if r["name"]]
 
 
-def _src_url(doc: str, world: str, res: "importance.Resolution | None" = None) -> dict:
+def _src_url(doc: str, world: str, modified_at: str | None = None) -> dict:
     """出典 1 件 → 原本 DL リンク（doc は rel_path で slash を含むため query で渡す）。
-    `res`（省略可）: 登録者が `_重要度.txt` で付けた重要度の解決結果。あれば `importance`/`importance_reason` を追加する（`importance_source` は出さない）。無ければ従来どおり 2 キーのまま。
+    資料フォルダ直下のフォルダ（世代）は doc から、原本の更新時刻は `modified_at`（省略可）から `generation`/`modified_at` として足す（取れた欄だけ）。
     """
-    return {"doc_id": doc,
-            "download_url": f"/documents/download?world={quote(world)}&rel={quote(doc, safe='')}",
-            **importance.public_fields(res)}
+    return citations.with_provenance(
+        {"doc_id": doc,
+         "download_url": f"/documents/download?world={quote(world)}&rel={quote(doc, safe='')}"},
+        modified_at)
 
 
-def _sources(docs, world) -> list:
+def _sources(docs, world, scope_paths=None) -> list:
+    """出典の一覧。管理者の除外の資料は載せず、利用者の範囲の外にある「範囲の外でも読む」優先の資料には `note` を付ける。"""
+    from . import path_rules
+    rules = path_rules.rules_for(world)
     seen, filtered = set(), []
     for d in docs:
         if (d and d not in seen and d not in _NON_DOC  # 内部来歴は出典に出さない
-                and not importance.is_importance_control_path(d)):  # 重要度設定ファイル自体は出典に出さない
+                and not importance.is_importance_control_path(d)  # 重要度設定ファイル自体は出典に出さない
+                and not rules.excluded(d)):  # 管理者が検索から外している資料は出典に出さない
             seen.add(d)
             filtered.append(d)
-    # world 全体を 1 回だけ解決し（`resolve_many`）、対象の doc だけ引く。未登録 world は解決しない（2 キーのまま）。
-    wd = worlds.world_dir(world)
-    sig = None
-    # `sig` を渡さないと `resolve_for_world` が world 全体をもう一度全木走査する。registry の `last_sig`（`store.get_world_status_row`）を渡して省く。取得できなくても fail-closed にせず自前計算へ戻す。
-    if wd:
-        try:
-            row = store.get_world_status_row(world)
-            sig = (row or {}).get("last_sig") or None
-        except Exception:
-            sig = None
-    res_map = importance.resolve_many(world, filtered, root=wd, sig=sig) if wd else {}
-    return [_src_url(d, world, res_map.get(d)) for d in filtered]
+    wd = worlds.world_dir(world)  # 未登録 world は更新時刻を引かない
+    stamps = documents.modified_at_map(world, filtered) if wd else {}  # 資料ごとの原本の更新時刻（資料フォルダ全体の取り込み時刻ではない）
+    out = [_src_url(d, world, stamps.get(d)) for d in filtered]
+    for src in out:
+        note = rules.outside_note(src["doc_id"], scope_paths)
+        if note:
+            src["note"] = note
+    return out
 
 
-def _redact(text: str) -> str:
-    """外部 LLM/画面へ渡る検索抜粋の明らかな秘密を伏せる（agentic_search と同じ多層防御）。"""
-    t = _SECRET_RE.sub("[REDACTED]", text or "")
-    return _KV_SECRET_RE.sub(r"\1\2[REDACTED]", t)
-
-
-def _truncation_headline_suffix(result) -> str:
-    """レンズ結果の `notes`（`lens_service`/`impact_service` の打切り申告・平文）を headline へ足す。
-    `notes` は headline に出ないため、そのままだと「見つかりませんでした」が探せていないだけの場合にも断定的に出てしまう。打切りが無ければ空文字。
-    """
-    notes = result.get("notes") or []
-    return ("　⚠ " + " ".join(notes)) if notes else ""
-
-
-def _answer_impact(result, world):
-    """`items` は全件同格（構造的な影響として同じ扱い）。presumed（grep 共起の推定）だけは別枠のまま残す。"""
-    items = result["items"]
-    start = result["start"]
-    presumed = result.get("presumed") or []  # 構造的な影響が 0 件時の「資料からの関連推定」
-    candidates = result.get("candidates") or []  # データの流れ（ファイル受け渡しなど）で届いた候補。構造の影響とは別枠
-    code_silent = not items and not candidates  # 構造的な影響もデータの流れの候補も 0＝コードの少ない/無いフォルダのサイン
-    if items:
-        headline = f"「{start}」を変えると {len(items)}件に影響。"
-    elif presumed:  # 構造的な影響は無いが資料から関連を辿れた＝0 で突き放さない
-        names = "、".join(dict.fromkeys(p["name"] for p in presumed[:3]))
-        headline = (f"「{start}」に構造的な依存は見つかりませんでしたが、資料から"
-                    f"見つけた関連が {len(presumed)}件あります: {names} など。")
-    else:
-        headline = f"「{start}」の影響先は見つかりませんでした（表記ゆれ、または影響なし）。"
-    if code_silent:  # 次の一手＝検索へ素直に誘導（フォルダ起因と断定しない）
-        headline += "　▶ 資料の検索（仕様問い合わせ・トラブルシュート）で仕様/運用の記述を確認できます。"
-    docs = [e["doc"] for it in items for e in it.get("evidence", []) if e.get("doc")]
-    docs += [e.get("doc") for p in presumed for e in p.get("evidence", []) if e.get("doc")]
-    docs += [e["doc"] for c in candidates for e in c.get("evidence", []) if e.get("doc")]
-    if candidates:
-        headline += f"　データの流れ（ファイルの受け渡しなど）で届く候補が {len(candidates)}件あります。"
-    headline += _truncation_headline_suffix(result)
-    summary = {"total": len(items), "presumed": len(presumed), "code_silent": code_silent}
-    if candidates:
-        summary["candidates"] = len(candidates)
-    return {"headline": headline,
-            "summary": summary,
-            "data": result, "sources": _sources(docs, world),
-            # 検索へ誘導する次の一手（UI がボタン化できる・構造的な影響が無い時のみ）
-            "suggest": ({"lens": "qa", "query": start, "reason": "構造的な影響が見つからない"} if code_silent else None)}
-
-
-def _answer_troubleshoot(result, world):
-    cands = result.get("candidates", [])
-    top = [c["name"] for c in cands[:3]]
-    headline = ("症状に対応する原因候補は見つかりませんでした。起点となる名称を含めて言い換えてください。"
-                if not cands else f"原因候補 {len(cands)}件。確認すべき上位: {('、'.join(top))}。")
-    docs = []
-    for c in cands:
-        ev = c.get("evidence", {})
-        docs += [e.get("doc") for e in ev.get("edges", []) if e.get("doc")]
-        docs += [g.get("doc_id") for g in ev.get("grep", [])]
-    headline += _truncation_headline_suffix(result)
-    return {"headline": headline, "summary": {"total": len(cands)},
-            "data": result, "sources": _sources(docs, world)}
-
-
-def _answer_qa(result, world):
-    cites = result.get("citations", [])
-    headline = ("該当する記述は見つかりませんでした（確証なし）。検索語を変えて試してください。"
-                if not cites else f"該当箇所が {len(cites)}件見つかりました。")
-    headline += _truncation_headline_suffix(result)
-    return {"headline": headline, "summary": {"total": len(cites)},
-            "data": result, "sources": _sources([c["doc_id"] for c in cites], world)}
 
 
 def _resolve_scope(message, world, scope_paths, layer=None, lens_source="auto", lens_block=None,
@@ -553,219 +479,6 @@ def _resolve_scope(message, world, scope_paths, layer=None, lens_source="auto", 
     return sm
 
 
-def _es_hits(world, query, sp, k=8, redact=False, layer=None):
-    """ES（BM25）上位ヒットを、現 world に実在する doc だけに絞って返す。BM25 のみ（`vector=False`・クエリ埋め込みコストを避ける）。
-    現 world の実在集合は 1 回だけ作る（古い ES 索引由来のリンクを出さない）。`layer`（省略可）は qa 補完のときだけ渡す（troubleshoot 補完は渡さない）。
-    """
-    try:
-        from . import documents, es_index
-        valid = documents.world_rel_set(world)
-        # `es_index.search()` は (hits, reason)。BM25 実クエリ失敗はこの経路に degraded 報告の仕組みが無いため捨てる（構造化された degraded 集計は `fused_search._search_keyword()`）。
-        hits, _reason = es_index.search(world, query, scope_paths=sp, k=k, vector=False, layer=layer)
-    except Exception:
-        return []
-    out = []
-    for h in hits:
-        doc = h.get("doc_id")
-        # 秘匿名（更新前に索引化された `credentials.xlsx` 等）は facts/カードへ出さない。
-        if doc and doc in valid and scope.in_scope(doc, sp) and not text_kind.is_sensitive_doc_id(doc):
-            if redact:
-                h = {**h, "text": _redact(h.get("text", ""))[:500]}
-            out.append(h)
-    return out
-
-
-def _es_citations(world, query, sp, k=8, layer=None):
-    """ES（BM25）上位ヒットを citation 形にする（Codex/非 agentic も ES を参照できるよう facts に混ぜる）。
-    `rag_parent_return` で本文の完全性を上げたうえで、`excerpts.display_quote` で quote を人間向け MD の該当節へ引き直す。ES ヒットの選定自体は変えず、返す直前の後処理のみ。
-    """
-    from . import citations, excerpts, rag_parent_return
-    hits = rag_parent_return.apply_to_hits(world, _es_hits(world, query, sp, k=k, layer=layer))
-    out = []
-    for h in hits:
-        c = citations.from_es_hit(h, query)
-        disp = excerpts.display_quote(world, h["doc_id"], c["quote"], chunk_id=h.get("chunk_id"),
-                                      locator=h.get("locator"), section_path=h.get("section_path"))
-        out.append(citations.with_display_excerpt(
-            c, quote=disp["quote"], excerpt_source=disp["excerpt_source"],
-            locator_hint=disp["locator_hint"], tier=h.get("tier")))
-    return out
-
-
-def _merge_qa_with_es(result, world, query, sp, layer=None):
-    """`run_qa`(grep) の citations に ES ヒットを統合する。grep↔ES を交互に並べて（先頭付近に ES も入れる）doc_id+span で重複排除する。`layer` は qa の ES 補完にのみ渡す（troubleshoot 補完は `_merge_troubleshoot_with_es` が layer 無しで呼ぶ）。"""
-    from . import citations
-    grep = list(result.get("citations", []))
-    es = _es_citations(world, query, sp, layer=layer)
-    merged = citations.dedupe_round_robin_by_doc_span(grep, es)  # round-robin で先頭付近に ES も来る
-    return {**result, "citations": merged, "answered": bool(merged)}
-
-
-def _card_doc_spans(card: dict) -> set:
-    ev = card.get("evidence", {}) or {}
-    spans = set()
-    for g in ev.get("grep", []):
-        doc = g.get("doc_id")
-        if doc:
-            spans.add((doc, tuple(g.get("span") or [g.get("line"), g.get("line")])))
-    return spans
-
-
-def _dedupe_round_robin_cards(*groups) -> list:
-    """原因候補カードを group 順の round-robin で並べ、名前または doc_id+span で重複排除する。"""
-    gs = [list(g) for g in groups]
-    out, seen_names, seen_spans = [], set(), set()
-    for i in range(max((len(g) for g in gs), default=0)):
-        for g in gs:
-            if i >= len(g):
-                continue
-            card = g[i]
-            name_key = (card.get("name"), card.get("label"))
-            spans = _card_doc_spans(card)
-            if (name_key[0] and name_key in seen_names) or (spans and spans <= seen_spans):
-                continue
-            if name_key[0]:
-                seen_names.add(name_key)
-            seen_spans |= spans
-            out.append(card)
-    return out
-
-
-def _es_troubleshoot_cards(world, query, sp, k=8) -> list:
-    """ES ヒットから原因候補カードを組む。evidence.grep の `text` も `excerpts.display_quote` で人間向け MD の該当節へ引き直す（`_es_hits(redact=True)` が redact+clip 済みの `text` を fallback に渡すため、`excerpt_source=="rag"` は無変更・`"human_md"` のときだけ redact+clip をかけ直す）。
-    カードの UX 上限（500 字クリップ）は維持し、親返し（サイズ拡張）は適用しない（近傍 1 件＝1 カードの簡潔な一覧）。
-    """
-    from . import excerpts
-    by_doc, order = {}, []  # doc ごとに 1 カード・複数 span は evidence.grep に集約
-    for h in _es_hits(world, query, sp, k=k, redact=True):
-        doc, line = h["doc_id"], h.get("line")
-        disp = excerpts.display_quote(world, doc, h.get("text", ""), chunk_id=h.get("chunk_id"),
-                                      locator=h.get("locator"), section_path=h.get("section_path"))
-        text = _redact(disp["quote"])[:500] if disp["excerpt_source"] == "human_md" else disp["quote"]
-        ev = {"doc_id": doc, "line": line, "span": [line, line],
-              "text": text, "match": query, "score": h.get("score")}
-        if disp["locator_hint"]:
-            ev["locator_hint"] = disp["locator_hint"]
-        card = by_doc.get(doc)
-        if card is None:
-            by_doc[doc] = {
-                "name": doc, "label": "Document", "category": "文書",
-                "role": "関連文書", "distance": None, "path": [], "source": "es",
-                "evidence": {"edges": [], "grep": [ev]},
-            }
-            order.append(doc)
-        elif (line, line) not in {tuple(g["span"]) for g in card["evidence"]["grep"]}:
-            card["evidence"]["grep"].append(ev)  # 同一 doc の未見 span のみ追加
-    return [by_doc[d] for d in order]
-
-
-def _merge_troubleshoot_with_es(result, world, query, sp):
-    """`run_troubleshoot`(グラフ+grep) の原因候補に ES 文書候補を統合する（非 agentic 専用）。"""
-    base = list(result.get("candidates", []))
-    es_cards = _es_troubleshoot_cards(world, query, sp)
-    return {**result, "candidates": _dedupe_round_robin_cards(base, es_cards)}
-
-
-# 検索経路トグルの honest-failure envelope は `agentic_search.tools_blocked_env` が唯一の定義。非 agentic（`_dispatch`）・agentic（`providers/base._agentic_run`）が同じ固定文言・サイドカー契約を共有する。
-
-
-def _graph_empty_env(lens: str, eff: dict, qa_fallback_env) -> dict:
-    """グラフ未構築（接続可・`:Entity{world_id}` が 0 件）で主クエリが 0 件だったときの下地。grep／全文検索のどちらかが残っていれば grep 相当の下地＋縮退の印（通知のみ・統計の bool は立てない）。どちらも無ければ実行不能として、接続断と同じ明示エラーで終える。"""
-    if not (eff["grep"] or eff["fulltext"]):
-        return agentic_search.tools_blocked_env(lens)
-    env = qa_fallback_env()
-    env["graph_degraded"] = agentic_search.GRAPH_EMPTY_CODE
-    return env
-
-
-def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=None,
-             tools_availability=None):
-    """レンズ実行（＋範囲フィルタ）。範囲は world グラフ traversal(Cypher)＋grep/ES/根拠に効かせる。
-    - 層フィルタ（探す対象）は qa（author も qa 分岐）にのみ適用する。impact／troubleshoot は言及エッジ（DOCUMENTS via=mention）が木を跨いで繋ぐため適用せず、`env["scope"]["layer_applied"]` で明示する。
-    - 調べる深さ（`depth_profile`）: `run_impact`/`run_troubleshoot` の `depth`・`run_qa` の `max_hits` へ、実効基準値（`system_settings` → env → コード既定）に倍率を掛けた値を渡す。
-      `system_settings`（省略可）は呼び出し元（`stream_message`）が読んだスナップショットで、ここでは DB を読まない。`None` は基準値の上書きなし。`abs_max` は倍率適用後に一度だけ縛る絶対上限。
-    - 検索経路トグル（`scope_meta["tools"]`）: `agentic_search.dispatch_tools_for_lens` で実効ツール集合と実行可否を判定する。必須ツールが全て OFF/不達なら、OFF のツールへ黙ってフォールバックせず `agentic_search.tools_blocked_env` の明示エラーを返す。
-      qa/author は grep（`run_qa`）と fulltext（ES 補完）のどちらか一方でも実行し、troubleshoot はグラフ必須で fulltext 補完のみを追加で切り替える。
-      `tools_availability`（省略可）は呼び出し元がターンにつき 1 回計算した `agentic_search.tool_availability()` の結果で、ここでは計算しない。
-    """
-    scope_lens = lens
-    if lens == "investigate":  # 事前検索は qa と同じ下地（grep＋ES）
-        lens = "qa"
-    sp = (scope_meta or {}).get("scope_paths") or None
-    layer = layer_mod.effective_layer(scope_meta, lens)  # 非適用レンズは常に both（`layer.effective_layer` が判定）
-    profile = (scope_meta or {}).get("depth_profile")
-    sys_settings = system_settings
-    eff, blocked = agentic_search.dispatch_tools_for_lens(
-        lens, (scope_meta or {}).get("tools"), availability=tools_availability)
-
-    def _qa_fallback_env():
-        """grep（無ければ ES）だけで下地を組む qa 相当の縮退。グラフ不調で事前検索が実行できないときも、本体・清書がソースを直接調べる下地を渡す。"""
-        base_hits = depth_profile_mod.effective_base(sys_settings, "qa_max_hits", QA_MAX_HITS_DEFAULT)
-        max_hits = depth_profile_mod.scaled_ratio(base_hits, profile, abs_max=agentic_search.MAX_HITS_ABS_MAX)
-        if eff["grep"]:
-            qa_result = run_qa(payload, world, scope_paths=sp, layer=layer, max_hits=max_hits)
-            if eff["fulltext"]:
-                qa_result = _merge_qa_with_es(qa_result, world, payload, sp, layer=layer)
-        elif eff["fulltext"]:
-            es_cites = _es_citations(world, payload, sp, layer=layer)
-            qa_result = {"type": "qa", "question": payload, "answered": bool(es_cites), "citations": es_cites}
-        else:  # 資料を探す手段が 1 つも無い（グラフ縮退時のみ起こりうる）
-            qa_result = {"type": "qa", "question": payload, "answered": False, "citations": []}
-        return _answer_qa(qa_result, world)
-
-    if blocked and lens in agentic_search._DISPATCH_REQUIRES_GRAPH and (eff["grep"] or eff["fulltext"]):
-        # グラフ必須レンズでグラフだけが不達／OFF のときは、明示エラーで終わらせず grep 相当の下地へ縮退する。縮退の印が無いと Codex 経路で告知だけが消える。
-        env = _qa_fallback_env()
-        # 不達（未構築・接続断）由来なら統計にも残す（`graph_unavailable`）。利用者が自分で OFF にした場合は障害ではないので通知だけ（`blocked`）。
-        env["graph_degraded"] = (
-            "graph_unavailable"
-            if ((tools_availability or {}).get("graph") is False
-                and tools_pref_mod.normalize_tools_pref((scope_meta or {}).get("tools"))["graph"])
-            else "blocked")
-    elif blocked:
-        env = agentic_search.tools_blocked_env(lens)
-    elif lens in ("impact", "troubleshoot"):
-        # グラフ不調（世代不一致・接続断）は事前検索を落とさず、grep 相当の下地＋縮退の印で調査を続けさせる。縮退してよいのは回復可能な障害（`DriverError` と `TransientError`）だけで、`ConfigurationError`・`ClientError` は握り潰さず送出する（`lens_service.neighbor_cards`・`agentic_search._is_recoverable_tool_exception` と同じ分類）。
-        from neo4j.exceptions import ConfigurationError, DriverError, TransientError
-        try:
-            if lens == "impact":
-                base_depth = depth_profile_mod.effective_base(sys_settings, "impact_depth", IMPACT_MAX_DEPTH)
-                depth = depth_profile_mod.scaled_depth(base_depth, profile, abs_max=IMPACT_MAX_DEPTH_ABS_MAX)
-                result = run_impact(session, payload, world, scope_prefixes=sp, depth=depth)  # 範囲は Cypher で絞る
-                # 構造的な影響も推定も 0 件のとき、グラフ未構築なら「影響なし」と誤読させず、grep 相当の下地＋縮退の印へ切り替える。ヒットが 1 件でもあれば追加クエリを発行しない。
-                if not result["items"] and not result.get("presumed") and world_graph_is_empty(session, world):
-                    env = _graph_empty_env(lens, eff, _qa_fallback_env)
-                else:
-                    env = _answer_impact(result, world)
-            else:
-                base_depth = depth_profile_mod.effective_base(
-                    sys_settings, "troubleshoot_depth", TROUBLESHOOT_GRAPH_DEPTH)
-                depth = depth_profile_mod.scaled_depth(base_depth, profile, abs_max=TROUBLESHOOT_GRAPH_DEPTH_ABS_MAX)
-                res = run_troubleshoot(session, payload, world, depth=depth, scope_paths=sp)
-                res = _merge_troubleshoot_with_es(res, world, payload, sp) if eff["fulltext"] else res
-                if not res.get("candidates") and world_graph_is_empty(session, world):
-                    env = _graph_empty_env(lens, eff, _qa_fallback_env)
-                else:
-                    env = _answer_troubleshoot(res, world)
-        except (GraphSchemaEraError, DriverError, TransientError) as e:
-            if isinstance(e, ConfigurationError):
-                raise  # 非一時的な設定不備＝縮退しない
-            _degraded = (agentic_search.GRAPH_REINGEST_ERROR_CODE if isinstance(e, GraphSchemaEraError)
-                         else "graph_unavailable")
-            _log.warning("事前検索がグラフ不調で縮退（lens=%s・world=%s・%s）: %s",
-                        lens, world, _degraded, type(e).__name__)
-            if not (eff["grep"] or eff["fulltext"]):
-                # 資料を探す手段が 1 つも残っていない＝一度も検索できていない。完了扱いにせず入口ゲートと同じ明示エラーで終える（`graph_degraded` も付けない）。
-                env = agentic_search.tools_blocked_env(lens)
-            else:
-                env = _qa_fallback_env()
-                # 縮退の事実（閉じたコード・本文なし）。`providers/base.py::_gather` 経由の各 provider が通知文言・統計へ反映する。
-                env["graph_degraded"] = _degraded
-    else:  # qa: grep＋ES を統合（Codex/heuristic/非 agentic も ES 参照）
-        env = _qa_fallback_env()
-    # 参照中の範囲（D/監査）＋このレンズで層フィルタが実効したか（UI が非適用の注記を出すための 1 項目）。
-    env["scope"] = layer_mod.scope_with_layer(scope_meta, world=world, lens=scope_lens)
-    return env
 
 
 # 出典 0 件時の案内: 「絞られている軸だけ」を範囲→探す対象の順で 1 つの案内にまとめる（既に最も緩い設定の軸は含めない）。
@@ -776,7 +489,7 @@ _CODEX_NO_SOURCES_NOTICE = "確認できた出典はありません（内容は�
 
 def _no_genuine_results(env: dict) -> bool:
     """出典 0 件で、かつ通常の検索結果 envelope か。
-    AI 未接続・busy・下調べ設定不正・下調べ失敗・層を強制できない構成・Neo4j 安全弁（timeout/緊急天井）などの honest failure は `data: {}`（空 dict）で返る。通常の検索結果（0 件含む）は `run_qa`/`run_impact`/`run_troubleshoot` の返り値を `data` に積む非空 dict になる。
+    AI 未接続・busy・下調べ設定不正・下調べ失敗・層を強制できない構成・Neo4j 安全弁（timeout/緊急天井）などの honest failure は `data: {}`（空 dict）で返る。通常の検索結果（0 件含む）は検索の返り値を `data` に積む非空 dict になる。
     「出典 0 件」だけを見ると明示エラーにも再検索案内が付くため、`data` が空でないことも確認する。
     """
     return not env.get("sources") and bool(env.get("data"))
@@ -844,7 +557,7 @@ def _is_codex_stopped_early(env: dict) -> bool:
     return bool(env.get("codex_stopped_early"))
 
 
-# グラフ縮退（`_dispatch` の事前検索・Codex 本体の世代不一致検知）の閉じたコード → `answer.limits` の bool 項目（利用統計「打ち切りの内訳」）。
+# グラフ縮退（Codex 本体の世代不一致検知）の閉じたコード → `answer.limits` の bool 項目（利用統計「打ち切りの内訳」）。
 _GRAPH_DEGRADED_LIMIT_FIELD = {
     agentic_search.GRAPH_REINGEST_ERROR_CODE: "graph_reingest_required",
     "graph_unavailable": "backend_unavailable_graph",
@@ -863,6 +576,32 @@ def _apply_graph_degraded(env: dict) -> None:
     field = _GRAPH_DEGRADED_LIMIT_FIELD.get(code)
     if field:
         env["limits"] = {**(env.get("limits") or {}), field: True}
+
+
+_INGEST_INCOMPLETE_NOTICES = {
+    "whole": "この資料フォルダは取り込みが途中で止まっているため、検索の一部が古い内容のままの可能性があります。",
+    "doc": "この資料フォルダは取り込みが途中で止まっているため、一部の資料が古いままの可能性があります。",
+}
+_INGEST_STATE_TIMEOUT = 1.5   # 取り込みの状態を読む接続・文の上限（秒）
+
+
+def _apply_ingest_incomplete(env: dict) -> None:
+    """調べた資料フォルダの取り込みが途中で止まっていれば、古い内容が混ざりうる旨の注記を足す。
+    資料参照オフ・資料フォルダなし、および読み取りの失敗では足さない（失敗は警告にして回答は返す）。
+    設計: docs/design/chat.md「回答の形」
+    """
+    scope = env.get("scope") or {}
+    world = scope.get("world")
+    if not world or scope.get("source") == "off":
+        return
+    try:
+        state = store.unfinished_state(world, connect_timeout=_INGEST_STATE_TIMEOUT,
+                                       statement_timeout_ms=int(_INGEST_STATE_TIMEOUT * 1000))
+    except Exception:
+        _log.warning("取り込みの状態を読めませんでした（注記なしで回答を返す）: world=%s", world, exc_info=True)
+        return
+    if state in _INGEST_INCOMPLETE_NOTICES:
+        answer_shape.add_notice(env, "ingest_incomplete", _INGEST_INCOMPLETE_NOTICES[state])
 
 
 def _finalize(env, decision, message: str = ""):
@@ -898,10 +637,14 @@ def _finalize(env, decision, message: str = ""):
                 answer_shape.set_body(env, _NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE)
     # 縮退の告知は 0 件案内（headline の全置換）より後で前置する（先に付けると置換で消える）。
     _apply_graph_degraded(env)
+    _apply_ingest_incomplete(env)
     if _codex_stopped_early:
         # 「続きから調べ直せる」案内は、出典 0 件時の案内と同じボタン機構（retry_hints・data-retry-kind）に載せ、0 件案内とは独立に常に追加する。クリック時は kind="resume" 専用分岐（`web/chat.js`）が固定文言を送り、`codex_session_id` の継続に委ねる。
         env.setdefault("retry_hints", []).append(
             {"kind": "resume", "label": "続きを調べる", "action": {"message": "続きを調べて"}})
+    _world = (env.get("scope") or {}).get("world")
+    if _world:  # 外へ出る境界の最後の網（チャットの回答・Codex ジョブが通る）: 管理者の除外の資料を落とす。設定が無ければ何もしない
+        env = path_rules.filter_output(env, _world)
     return answer_shape.seal(env)
 
 
@@ -944,47 +687,9 @@ def _pop_evidence_committed(env: dict, trace_nodes: dict):
     return node
 
 
-def _mark_investigation_recorded(env: dict, investigation_record: dict | None) -> None:
-    """`investigation_record`（provider が `_result` の別項目として渡した台帳・`None`＝台帳ゲートが走らなかったターン）があれば、`env["investigation"]` へ `recorded` の印を立てる。
-    assistant message を `store.add_message` で保存する前に呼ぶこと（この印は `messages.answer` と一緒に永続化される・保存を試みる印であって保存成否ではない）。
-    """
-    if investigation_record is not None and isinstance(env.get("investigation"), dict):
-        env["investigation"]["recorded"] = True
 
 
-_INVESTIGATION_RECORD_SAVE_FAILED_NOTICE = ("調査の記録を保存できませんでした（回答は保存しています）。"
-                                            "調査の記録のダウンロードは使えません。")
-
-
-def _save_investigation_record(investigation_record: dict | None, message_id, conversation_id) -> dict | None:
-    """`investigation_record` を `investigation_records` 表へ保存する。assistant message を保存した直後（`message_id` が実在する状態）に呼ぶこと（`message_id` は `messages(id)` への FK）。
-    保存に失敗しても回答の保存は失敗させない（警告ログ）。失敗は回答の注記に残し、調査の記録のダウンロード導線を外す（`store.append_answer_notice`）。
-    戻り値は、注記を足して更新した assistant 行（失敗しなかった・`None` のときは `None`）。呼び出し側は配信する行をこれで差し替える。
-    """
-    if investigation_record is None:
-        return None
-    try:
-        store_investigation.save_investigation_record(
-            message_id, conversation_id,
-            complete=bool(investigation_record.get("complete")),
-            manifest=investigation_record.get("manifest"),
-            items=investigation_record.get("items") or {},
-            coverage=investigation_record.get("coverage") or {},
-            reviews=investigation_record.get("reviews") or [],
-            coverage_detail=investigation_record.get("coverage_detail") or {},
-            extras=investigation_record.get("extras") or {})
-        return None
-    except Exception as e:
-        _log.warning("investigation record save failed: %s", e)
-    try:
-        return store.append_answer_notice(message_id, "investigation_record_failed",
-                                          _INVESTIGATION_RECORD_SAVE_FAILED_NOTICE, unrecorded=True)
-    except Exception as e:
-        _log.warning("investigation record failure notice save failed: %s", e)
-        return None
-
-
-# 影響分析の Neo4j 安全弁（timeout＋緊急天井）に当たったときは fail-loud（偽陰性防止）: `_dispatch` の impact 分岐が `GraphQueryOverloadError` を送出したら、LLM 合成を経由させず固定文言の `_result` に差し替える。この例外は impact 以外では発生しない。
+# 影響分析の Neo4j 安全弁（timeout＋緊急天井）に当たったときは fail-loud（偽陰性防止）: impact 経路が `GraphQueryOverloadError` を送出したら、LLM 合成を経由させず固定文言の `_result` に差し替える。この例外は impact 以外では発生しない。
 def _impact_overload_result(message: str, world: str, scope_meta: dict | None) -> dict:
     """固定文言のエンベロープ（LLM 合成なし）。空/部分結果を LLM に渡すと「確実な波及は無い」という偽陰性の文言を生成しうるため、ここで完結させる。正常系と同じ `_result` 形で返す。"""
     return _fixed_lens_result("impact", GRAPH_OVERLOAD_USER_MESSAGE, "Neo4j 安全弁（timeout/緊急天井）",
@@ -1006,8 +711,7 @@ def _fixed_lens_result(lens: str, headline: str, reason: str, message: str, worl
 
 def _degrade_overload(gen, message: str, world: str, scope_meta: dict | None):
     """provider.run() のイテレーション中に `GraphQueryOverloadError`／`GraphSchemaEraError` が飛んだら、固定文言の `_result` イベントへ差し替えて終端する（stream_message のラッパー）。
-    `GraphSchemaEraError` は調査結果が届いた後の保険で、通常は検知時点で調査を止めない（`_dispatch` は grep 相当の下地へ縮退し、`agentic_search.run_tool` の `graph_neighbors` 分岐と Codex の MCP 経路は機械可読コードのツール結果へ変換する）。
-    例外は `providers/base.py::_gather` 内の `ctx.dispatch(...)` から上がり、`_gather` の呼び出し側はラップしていないため、捕まえた時点で LLM 事実合成は一度も実行されていない。
+    `GraphSchemaEraError` は調査結果が届いた後の保険で、通常は検知時点で調査を止めない（`agentic_search.run_tool` の `graph_neighbors` 分岐と Codex の MCP 経路は機械可読コードのツール結果へ変換する）。
     """
     try:
         yield from gen
@@ -1025,74 +729,6 @@ def _degrade_overload(gen, message: str, world: str, scope_meta: dict | None):
         yield {"type": "_result", **result}
 
 
-def _clip_history_msg(text: str) -> str:
-    """履歴の 1 メッセージを上限文字数で切り詰める（先頭を残し末尾を落とす）。"""
-    t = text or ""
-    if len(t) <= _HISTORY_MSG_CHARS:
-        return t
-    return t[:_HISTORY_MSG_CHARS] + "…（省略）"
-
-
-class _HistoryList(list):
-    """`_history_pairs` の戻り値。`note`＝履歴を減らした・読めなかったことの一言（Codex への文脈に添える・空なら無し）。"""
-
-    note: str = ""
-
-
-def _history_pairs(conversation_id) -> list[dict]:
-    """直近ターンの (user, assistant) 完全対を `Ctx.history` 形式で返す。
-    会話は交互とは限らない（途中停止・clarify・crash 補填）ため、user 行の直後（id 順）が assistant 行のときだけ対として採用し、不対行は捨てる。
-    二重キャップ: 直近 `_HISTORY_TURNS` 対＋`_HISTORY_CHAR_BUDGET`（新しい対から積み、超える対は捨てる）。メッセージ単体も `_HISTORY_MSG_CHARS` で切る。
-    呼び出しは `store.add_message(現在の user)` より前（in-flight の質問を履歴に含めない）。conversation_id が None・`_HISTORY_TURNS <= 0`・読み取り失敗は `[]`（fail-open）。
-    対数・文字予算で古い対を落としたとき、読み取りに失敗したときは、戻り値の `note` にその一言を持たせる。
-    """
-    if conversation_id is None or _HISTORY_TURNS <= 0:
-        return []
-    try:
-        limit = min(512, _HISTORY_TURNS * 2 + 8)
-        while True:
-            rows = store.recent_messages(conversation_id, limit=limit)
-            pairs = []
-            i = 0
-            while i < len(rows) - 1:
-                if rows[i]["role"] == "user" and rows[i + 1]["role"] == "assistant":
-                    pairs.append((rows[i], rows[i + 1]))
-                    i += 2
-                else:
-                    i += 1
-            # 不対行が堆積すると古い完全対が窓の外に押し出されるため、取得行数が limit に張り付いている間は窓を段階的に広げて再取得する。512 行で打ち切る（best-effort・全履歴走査はしない）。
-            if len(pairs) >= _HISTORY_TURNS or len(rows) < limit or limit >= 512:
-                break
-            limit = min(512, limit * 4)
-        found_pairs = len(pairs)
-        window_full = len(rows) >= limit  # 取得窓が満杯＝窓より古いやり取りが残っている
-        pairs = pairs[-_HISTORY_TURNS:]  # 直近 N 対（対数キャップ）
-        kept = []
-        budget = _HISTORY_CHAR_BUDGET
-        for u, a in reversed(pairs):  # 新しい対から積む
-            u_txt, a_txt = _clip_history_msg(u["content"]), _clip_history_msg(a["content"])
-            cost = len(u_txt) + len(a_txt)
-            if cost > budget:  # 文字予算超過＝この対（とこれより古い対）は捨てる
-                break
-            budget -= cost
-            kept.append((u_txt, a_txt))
-        out = _HistoryList()
-        for u_txt, a_txt in reversed(kept):  # 時系列順（古→新）に戻す
-            out.append({"role": "user", "content": u_txt})
-            out.append({"role": "assistant", "content": a_txt})
-        dropped = found_pairs - len(kept)
-        note = ""
-        if dropped > 0:
-            note = f"（これより前のやり取り{dropped}対は、長さの上限のため以下に含めていません）"
-        if window_full:
-            note += "（さらに古いやり取りが残っている可能性がありますが、読み取りの上限のため読んでいません）"
-        out.note = note
-        return out
-    except Exception as e:
-        _log.warning("history priming failed (degrade to no-history, turn continues): %s", e)
-        failed = _HistoryList()
-        failed.note = "（会話履歴を読み取れなかったため、前のやり取りは含めていません）"
-        return failed
 
 
 def _ensure_conversation(conversation_id, message, world, user_id):
@@ -1103,102 +739,6 @@ def _ensure_conversation(conversation_id, message, world, user_id):
     return conversation_id
 
 
-# 個人ファイル参照の許可拡張子（workspace upload 許可と同じ集合・`api.py` の `_WORKSPACE_SEARCHABLE_EXT` と同義）。`api.py` に依存しないためここで重複定義する。個人領域は共有 KB のアナライザ登録簿とは別の独立集合で、コード分は和集合に含める。
-_PERSONAL_SEARCHABLE_EXT = {
-    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml",
-    ".sql", ".py", ".sh", ".bat",
-} | _analyzer_registry.registered_extensions()
-
-
-def _personal_grep_hits(user_id: str, query: str, users_dir: str) -> list[dict]:
-    """ユーザーの個人 workspace を台帳基準で grep し、ヒット一覧を返す。
-    - 検索は `personal_workspace_files` 台帳上の status='uploaded' ファイルのみ（FS 残骸を拒否）。
-    - base は users_dir / uid / workspace / files に閉じ込める（symlink・パストラバーサル拒否）。
-    - ES/Neo4j・共有 KB には触れない。他ユーザーの uid は引数で分離する。
-    - 秘匿名（`text_kind.is_sensitive_doc_id`）のファイルは読まない。
-    """
-    if not query or not query.strip():
-        return []
-    q = query.strip()
-    q_lower = q.lower()
-    files_dir = (Path(users_dir).resolve() / user_id / "workspace" / "files")
-    # files/ ディレクトリ自体が symlink の場合は拒否（confinement 破壊防止）。
-    if files_dir.is_symlink() or not files_dir.is_dir():
-        return []
-    live_paths = store.live_workspace_rel_paths(user_id)
-    hits: list[dict] = []
-    seen: set[tuple] = set()
-    files_dir_resolved = files_dir.resolve()
-    for rel_path in sorted(live_paths):
-        raw = files_dir / rel_path
-        # symlink 脱出防止（pre-resolve チェック）。
-        if raw.is_symlink():
-            continue
-        target = (files_dir / rel_path).resolve()
-        try:
-            target.relative_to(files_dir_resolved)
-        except ValueError:
-            continue
-        if not target.is_file():
-            continue
-        if target.suffix.lower() not in _PERSONAL_SEARCHABLE_EXT:
-            continue
-        # 秘匿名のファイルは本文を推論へ渡さない（共有 KB と同じ判定）。
-        if text_kind.is_sensitive_doc_id(rel_path):
-            continue
-        try:
-            raw_bytes = target.read_bytes()
-            enc = text_encoding.detect_bytes(raw_bytes, complete=True)
-            lines = text_encoding.decode(raw_bytes, enc).splitlines()
-        except Exception:
-            continue
-        for i, ln in enumerate(lines):
-            if q_lower not in ln.lower():
-                continue
-            s = max(0, i - 1)
-            e = min(len(lines), i + 3)
-            key = (rel_path, s, e)
-            if key in seen:
-                continue
-            seen.add(key)
-            hits.append({
-                "rel_path": rel_path,
-                "line": i + 1,
-                "text": _redact("\n".join(lines[s:e]).strip()),
-                "match": q,
-                "source": "個人ファイル内ヒット",
-            })
-            if len(hits) >= 20:
-                break
-        if len(hits) >= 20:
-            break
-    return hits
-
-
-def _personal_facts(hits: list[dict], query: str) -> str:
-    """個人ファイルのヒットを LLM への事実テキストに整形する。このテキストは AI への入力のみで、ES/Neo4j には書かない。"""
-    if not hits:
-        return ""
-    parts = []
-    for h in hits[:8]:
-        parts.append(f"[個人ファイル: {h['rel_path']} 行{h['line']}] {h['text'][:200]}")
-    return "\n【個人ファイル内ヒット（本人のみ参照可・共有不可）】\n" + "\n".join(parts)
-
-
-def _personal_citations(hits: list[dict]) -> list[dict]:
-    """個人ファイルのヒットを citation 形式に変換する。`source` フィールドで共有 KB citation と区別し、DL リンクは付けない（個人 workspace 専用）。"""
-    seen_rel: set[str] = set()
-    cites: list[dict] = []
-    for h in hits:
-        rel = h["rel_path"]
-        if rel not in seen_rel:
-            seen_rel.add(rel)
-            cites.append({
-                "doc_id": rel,
-                "quote": h["text"][:80],
-                "source": "個人ファイル内ヒット",
-            })
-    return cites
 
 
 def _save_clarify_message(conversation_id, user_id, settings, message, trace_nodes, ev,
@@ -1239,17 +779,106 @@ def _save_clarify_message(conversation_id, user_id, settings, message, trace_nod
     return q_msg
 
 
-def _make_dispatch_with_personal(session, world, scope_meta, sys_settings, tools_availability, personal_hits):
-    """共有 KB dispatch の結果に個人ヒットを注入する dispatch を返す。"""
-    def _dispatch_with_personal(lens, inp):
-        env = _dispatch(session, lens, inp, world, scope_meta, sys_settings, tools_availability)
-        if personal_hits:
-            # 個人ヒットを facts に追記（AI への入力のみ・非永続化）。
-            env["_personal_facts"] = _personal_facts(personal_hits, inp)
-            # 個人 citation を別枠で追加（共有 KB citation とは分離）。
-            env.setdefault("personal_sources", []).extend(_personal_citations(personal_hits))
-        return env
-    return _dispatch_with_personal
+def _prepare_turn_settings(user_id, settings, sys_settings, web_search, tools_availability, knowledge):
+    """受付段階のスナップショット（settings／sys_settings／tools_availability）を使い、省略されたものだけここで読む。実行に使う `codex_web_search` はこのチャットの希望で上書きする（ローカル複製のみ・DB へは書き戻さない）。"""
+    settings = settings if settings is not None else store.get_settings(user_id)
+    settings = {**settings, "codex_web_search": bool(web_search)}
+    # `get_provider` と同じ fresh snapshot を使う。読み取り失敗は例外として伝播し、このターンを fail-closed にする。
+    sys_settings = sys_settings if sys_settings is not None else store._read_system_settings_fresh()
+    if tools_availability is None:
+        tools_availability = agentic_search.tool_availability() if knowledge else None
+    return settings, sys_settings, tools_availability
+
+
+def _select_provider(provider, knowledge, settings, sys_settings):
+    """呼び出し元が組み立てた Provider を優先する。資料参照オフは簡易と同じ AI を道具なしで呼ぶ（Codex 構成でも Codex を起動しない）。"""
+    if provider is None and not knowledge:
+        provider = plain_provider_for(settings, sys_settings)
+    if provider is None:
+        provider = get_provider(settings, system_settings=sys_settings)
+    return provider
+
+
+def _build_turn_ctx(message, world, *, user_id, knowledge, personal, users_dir, stop_event,
+                    scope_meta, known, settings, explicit_lens, doc_focus, history, conversation_id,
+                    codex_session_id, codex_usage_prev_total, tools_availability, t0):
+    """provider に渡す `Ctx` と個人ファイルのヒットを用意する。個人ファイルの grep は資料参照オンかつ個人ファイル参照 ON のときだけで、本人 uid の workspace 配下のみ（ES/Neo4j には書かない）。"""
+    personal_hits: list[dict] = []
+    if personal and knowledge:
+        personal_hits = _personal_grep_hits(user_id, message, users_dir)
+    focus = bool(doc_focus) and explicit_lens == "investigate"
+    ctx = Ctx(
+        message=message, world=world, pace=emit_pace(), knowledge=knowledge,
+        route=_build_router(known, world, settings, can_ask=True, user_id=user_id,
+                            explicit_lens=explicit_lens, scope_meta=scope_meta,
+                            conversation_id=conversation_id, doc_focus=focus),  # ストリーミング＝曖昧なら clarify で確認
+        scope_meta=scope_meta,
+        make_sources=((lambda docs: _sources(docs, world, (scope_meta or {}).get("scope_paths"))) if knowledge else None),
+        uid=user_id,
+        personal_facts=_personal_facts(personal_hits, message) if personal_hits else "",
+        personal=bool(personal),
+        stop_event=stop_event,
+        # 直前ターンの (user, assistant) 対（message には混ぜない・別チャネル）。conversation_id/codex_session_id は CodexProvider の resume 判定に使う。
+        history=history, conversation_id=conversation_id, codex_session_id=codex_session_id,
+        codex_usage_prev_total=codex_usage_prev_total,
+        tools_availability=tools_availability,
+        turn_started_mono=t0,  # activity.phases_ms.prepare の起点
+        doc_focus=focus,
+    )
+    return ctx, personal_hits
+
+
+def _persist_result(ev, *, ctx, message, conversation_id, user_id, settings, world, scope_meta, user_msg,
+                    personal, personal_hits, explicit_lens, trace_nodes, recovered_result, t0):
+    """provider の `_result` を整えて assistant メッセージとして保存し、監査まで残す。戻り値は (保存した行, 保存後にライブ配信するサイドカー node か None)。"""
+    if recovered_result is not None and "codex_multi_agent" in ev["env"]:
+        recovered_result.update(
+            result=ev, trace=trace_nodes,
+            personal=bool(personal or personal_hits or ev["env"].get("_personal_rounds")
+                          or ev["env"].get("wrote_files") or ev["env"].get("codex_wrote_files")),
+            stopped=ev["env"].get("_terminal") == "stopped")
+    if explicit_lens in answer_shape.HOW_MODES:
+        ev["env"]["how"] = {"mode": explicit_lens, "doc_focus": bool(ctx.doc_focus)}
+    env = _finalize(ev["env"], ev["decision"], message)
+    # `_result` のサイドカーを trace へ折り込む（孤児イベント防止・永続化後にライブ配信もする）。
+    committed_node = _pop_evidence_committed(env, trace_nodes)
+    # 終端 4 種の印と巡の個人由来累積（内部キー・保存・共有へは残さない）。
+    terminal = env.pop("_terminal", None)
+    round_personal = _pop_round_personal(env)
+    env["trace_version"] = 2
+    # CodexProvider が捕捉/更新した session id を会話に永続化する（次ターンの resume 用）。保存に失敗しても回答は成立させ、継続できないことを注記する。
+    save_session_id(conversation_id, env)
+    # 個人由来の判定・個人ファイルの出典と注記（busy 応答には添付しない）。判定できなければ個人扱いへ倒す。
+    used_personal = resolve_used_personal(env, conversation_id, personal=personal,
+                                          personal_hits=personal_hits, round_personal=round_personal)
+    # 個人コンテンツを使った場合は assistant message 保存の前にフラグを立てる。書き込みに失敗したら再 raise し（fail-closed）、個人内容を含む回答を保存しない。
+    if used_personal:
+        store.set_contains_personal_workspace(conversation_id)
+        store.set_message_personal(user_msg["id"])  # sanitized share: このターンの質問も個人扱い
+
+    env["duration_ms"] = round((time.monotonic() - t0) * 1000)
+    _finalize_activity_phases(env, env["duration_ms"])
+    investigation_record = ev.get("investigation_record")
+    _mark_investigation_recorded(env, investigation_record)
+    msg = store.add_message(conversation_id, "assistant", env["headline"],
+                            lens=ev["decision"]["lens"], route=env["route"], answer=env,
+                            trace=_cap_trace_v2(trace_nodes),
+                            personal=used_personal)
+    msg = note_stats_unsaved(msg)
+    if recovered_result is not None and recovered_result.get("result") is ev:
+        recovered_result["saved_message"] = msg
+    noted = _save_investigation_record(investigation_record, msg["id"], conversation_id, msg)
+    if noted is not None:
+        msg = noted
+        if recovered_result is not None and recovered_result.get("result") is ev:
+            recovered_result["saved_message"] = msg
+    # 停止終端は監査も停止として残す（assistant は保存済み）。
+    _audit_chat_turn(user_id, conversation_id, settings,
+                     lens=("stopped" if terminal == "stopped" else ev["decision"]["lens"]),
+                     user_msg_id=user_msg["id"], assistant_msg_id=msg["id"], world=world,
+                     scope_paths=(scope_meta or {}).get("scope_paths"), personal=used_personal,
+                     stopped=(terminal == "stopped"))
+    return msg, committed_node
 
 
 def stream_message(session, message, world="v1",
@@ -1264,7 +893,7 @@ def stream_message(session, message, world="v1",
     - `scope_paths`: 検索/分析をその範囲に絞る（knowledge 時のみ）。`layer`（既定 `None`＝`"both"`）: 探す対象。`lens`（既定 `None`＝自動）: 調べ方の明示指定で、メッセージ先頭のスラッシュ接頭辞が優先する（`_resolve_lens`）。
     - `personal=True`: 共有 KB に加え本人の個人ファイルも grep して事実+引用に含める。個人ファイルは ES/Neo4j に入れず、本人のみ参照可。
     - `web_search=False`（既定）: このチャットで Codex の Web 検索を希望するか。保存済みの個人設定 `codex_web_search` は実行には使わず、この値で上書きしてから provider を選ぶ。
-    - `depth_profile`（既定 `None`＝`"standard"`）: 調べる深さ。`_dispatch()`/agentic 探索の反復・ヒット上限・探索深さ・Codex 推論に倍率で効く（evaluator の巡数は `depth_profile.review_rounds_for`）。
+    - `depth_profile`（既定 `None`＝`"standard"`）: 調べる深さ。agentic 探索の反復・ヒット上限・探索深さ・Codex 推論に倍率で効く（evaluator の巡数は `depth_profile.review_rounds_for`）。
     - `doc_focus`（既定 False）: 資料を中心に調べる指定。`investigate` のターンだけ Codex への指示に効く（`Ctx.doc_focus`）。
     - `tools`（既定 `None`＝全 ON）: 検索経路トグル。agentic 探索が提示する grep/es_search/graph_neighbors を絞る（Codex は対象外）。
     - `tools_availability`（既定 `None`＝自分で計算）: 呼び出し元（`routers/chat.py`）が受付時の 422 判定と同時に計算した可用性 snapshot。渡されたらそれを使う（受付時と実行時で可用性が食い違わないように）。
@@ -1276,7 +905,14 @@ def stream_message(session, message, world="v1",
     explicit_lens, lens_source, lens_block, message = _resolve_lens(lens, message)
     conversation_id = _ensure_conversation(conversation_id, message, world, user_id)
     # 履歴は現在の質問を保存する前に取得する（in-flight の質問を履歴に含めない）。
-    history = _history_pairs(conversation_id)
+    try:
+        history = _history_pairs(conversation_id)
+    except HistoryUnavailable as e:
+        yield from fail_before_run(
+            conversation_id=conversation_id, user_id=user_id, settings=settings or store.get_settings(user_id),
+            message=message, personal=personal, world=world, scope_meta=None, on_user_saved=on_user_saved,
+            headline=str(e))
+        return
     # Codex ネイティブ resume: 直近ターンで捕捉済みの codex_session_id があれば CodexProvider に渡す（他 provider は無視）。history と同じく質問保存より前に読む。
     codex_session_id = store.get_session_id(conversation_id)
     # 直近 assistant メッセージが記録した Codex 累計 usage（resume ターンの usage をターン差分にするための前ターン値・CodexProvider だけが消費する）。
@@ -1287,68 +923,25 @@ def stream_message(session, message, world="v1",
         on_user_saved(_user_msg["id"], personal)
     if personal:
         store.set_contains_personal_workspace(conversation_id)
-    # フロントの階層描画（サブエージェント レーン・集約表示）は trace_version=2 のターンにだけ適用する。`env["trace_version"]` は `_result` 到達時にしか分からないため、ストリーム先頭で 1 回だけ軽量なマーカーを流す。
-    # `chat_turns.TurnBuffer` は先頭イベントを位置だけで保護するため、このマーカーは件数/バイト上限で間引かれない。未知の `type` を無視する既存フロントにも無害。
-    # 会話作成・質問保存（副作用）の後に出す（クライアントへ何か送る前に会話/質問が確定している境界を変えない）。
+    # フロントの階層描画は trace_version=2 のターンにだけ適用する。`env["trace_version"]` は `_result` 到達時にしか分からないため先頭で 1 回マーカーを流す。
+    # `chat_turns.TurnBuffer` は先頭イベントを位置だけで保護するため、このマーカーは件数/バイト上限で間引かれない。会話作成・質問保存の後に出す（この境界を変えない）。
     yield {"type": "trace_meta", "trace_version": 2}
     known = _known_terms(session, world) if knowledge else []  # オフ時は Neo4j も触らない
     scope_meta = (_resolve_scope(message, world, scope_paths, layer, lens_source, lens_block, web_search,
                                  depth_profile, tools, tools_explicit)
                  if knowledge else None)  # 明示 ＞ 全体
-    # settings/sys_settings は呼び出し元が受付段階で読んだスナップショットを使う（省略時のみここで読む）。
-    settings = settings if settings is not None else store.get_settings(user_id)
-    # 実行に使う web_search は保存済み個人設定でなくこのチャットの希望のみ（ローカル複製だけを上書きし、DB へは書き戻さない）。
-    settings = {**settings, "codex_web_search": bool(web_search)}
-    # `get_provider` と同じ fresh snapshot を `_dispatch`（調べる深さ）へも共有する（決定的レンズと agentic 経路が別世代の system_settings を見ないように）。読み取り失敗は例外として伝播し、このターンを fail-closed にする。
-    sys_settings = sys_settings if sys_settings is not None else store._read_system_settings_fresh()
-    # 非 agentic 経路が使う実効ツール判定用の可用性スナップショット。
-    if tools_availability is None:
-        tools_availability = agentic_search.tool_availability() if knowledge else None
-
-    # 個人ファイルを grep して事実テキスト/citation を準備する（資料参照オンかつ個人ファイル参照 ON で、ファイルが存在する場合。資料参照オフでは読まない）。grep は本人 uid の workspace 配下のみで、ES/Neo4j には書かない。
-    personal_hits: list[dict] = []
-    if personal and knowledge:
-        personal_hits = _personal_grep_hits(user_id, message, users_dir)
-
-    _dispatch_with_personal = _make_dispatch_with_personal(
-        session, world, scope_meta, sys_settings, tools_availability, personal_hits)
-
-    ctx = Ctx(
-        message=message, world=world, pace=emit_pace(), knowledge=knowledge,
-        route=_build_router(known, world, settings, can_ask=True, user_id=user_id,
-                            explicit_lens=explicit_lens, scope_meta=scope_meta,
-                            conversation_id=conversation_id,
-                            doc_focus=bool(doc_focus) and explicit_lens == "investigate"),  # ストリーミング＝曖昧なら clarify で確認
-        dispatch=_dispatch_with_personal if personal else
-                 (lambda lens, inp: _dispatch(session, lens, inp, world, scope_meta, sys_settings,
-                                              tools_availability)),
-        scope_meta=scope_meta,
-        make_sources=((lambda docs: _sources(docs, world)) if knowledge else None),
-        uid=user_id,
-        # agentic/plain 経路にも個人ヒットを伝搬する。
-        personal_facts=_personal_facts(personal_hits, message) if personal_hits else "",
-        personal=bool(personal),
-        stop_event=stop_event,
-        # 直前ターンの (user, assistant) 対（message には混ぜない・別チャネル）。conversation_id/codex_session_id は CodexProvider の resume 判定に使う。
-        history=history, conversation_id=conversation_id, codex_session_id=codex_session_id,
-        codex_usage_prev_total=codex_usage_prev_total,
-        # ターン先頭で 1 回だけ計算した可用性 snapshot を provider まで渡す。
-        tools_availability=tools_availability,
-        # activity.phases_ms.prepare の起点。provider 呼出し前の処理も prepare に含める。
-        turn_started_mono=_t0,
-        doc_focus=bool(doc_focus) and explicit_lens == "investigate",
-    )
-    # 「思考の流れ」を `messages.trace` に保存し、会話ロード時に右ペインへ静的復元する。node は id 単位で更新され得るため id で dedup し、最終状態のみ保持する。question は別カードで表示するため含めない。
+    settings, sys_settings, tools_availability = _prepare_turn_settings(
+        user_id, settings, sys_settings, web_search, tools_availability, knowledge)
+    ctx, personal_hits = _build_turn_ctx(
+        message, world, user_id=user_id, knowledge=knowledge, personal=personal,
+        users_dir=users_dir, stop_event=stop_event, scope_meta=scope_meta, known=known, settings=settings,
+        explicit_lens=explicit_lens, doc_focus=doc_focus, history=history, conversation_id=conversation_id,
+        codex_session_id=codex_session_id, codex_usage_prev_total=codex_usage_prev_total,
+        tools_availability=tools_availability, t0=_t0)
+    # 「思考の流れ」を `messages.trace` に保存する。node は id 単位で更新され得るため id で dedup し、最終状態のみ保持する。question は別カードで表示するため含めない。
     trace_nodes: dict = {}
-    # 停止を検知したが停止終端（未完了回答）をまだ受け取っていない状態。
-    _stopped_pending = False
-    # 呼び出し元が既に組み立てた Provider があればそれを使う。
-    # 資料参照オフは簡易と同じ AI を道具なしで呼ぶ（Codex 構成でも Codex を起動しない）。
-    _provider = provider
-    if _provider is None and not knowledge:
-        _provider = plain_provider_for(settings, sys_settings)
-    if _provider is None:
-        _provider = get_provider(settings, system_settings=sys_settings)
+    _stopped_pending = False  # 停止を検知したが停止終端（未完了回答）をまだ受け取っていない状態
+    _provider = _select_provider(provider, knowledge, settings, sys_settings)
     for ev in _degrade_overload(_provider.run(ctx), message, world, scope_meta):
         if stop_event is not None and stop_event.is_set() and not _is_stopped_terminal(ev):
             if ev.get("type") == "_result" and "codex_multi_agent" in ev["env"]:
@@ -1360,81 +953,14 @@ def stream_message(session, message, world="v1",
                 continue
         if ev["type"] == "_result":
             _stopped_pending = False
-            if recovered_result is not None and "codex_multi_agent" in ev["env"]:
-                recovered_result.update(
-                    result=ev, trace=trace_nodes,
-                    personal=bool(personal or personal_hits or ev["env"].get("_personal_rounds")
-                                  or ev["env"].get("wrote_files") or ev["env"].get("codex_wrote_files")),
-                    stopped=ev["env"].get("_terminal") == "stopped")
-            if explicit_lens in answer_shape.HOW_MODES:
-                ev["env"]["how"] = {"mode": explicit_lens, "doc_focus": bool(ctx.doc_focus)}
-            env = _finalize(ev["env"], ev["decision"], message)
-            # `_result` のサイドカーを trace へ折り込む（孤児イベント防止・永続化後にライブ配信もする）。
-            _ev_committed_node = _pop_evidence_committed(env, trace_nodes)
-            # 終端 4 種の印と巡の個人由来累積（内部キー・保存・共有へは残さない）。
-            _terminal = env.pop("_terminal", None)
-            _round_personal = _pop_round_personal(env)
-            env["trace_version"] = 2
-            # CodexProvider が捕捉/更新した session id を会話に永続化する（次ターンの resume 用）。fail-open（保存に失敗しても本ターンの回答は成立させる）。
-            _codex_sid = env.get("codex_session_id")
-            if _codex_sid:
-                try:
-                    store.set_session_id(conversation_id, _codex_sid)
-                except Exception as e:
-                    _log.warning("codex session id 保存に失敗（fail-open・次回は resume 不可で priming 継続）: %s", e)
-
-            # 個人 citation を answer envelope に統合する。busy 応答には添付しない。
-            _used_personal = False
-            if personal_hits and not env.get("busy"):
-                env["personal_sources"] = _personal_citations(personal_hits)
-                _used_personal = True
-
-            # Codex がファイルを書いた場合も contains_personal_workspace を立てる。
-            if env.get("codex_wrote_files"):
-                _used_personal = True
-            # 巡ループの累積と書込を個人由来として扱う。
-            if _round_personal or env.get("wrote_files"):
-                _used_personal = True
-            # 個人参照トグル ON のターンは hit が無くても質問にファイル名等が残り得るため個人扱い。
-            if personal:
-                _used_personal = True
-            # 会話が既に個人由来なら今回 personal=False でも個人扱いにし続ける。
-            if not _used_personal:
-                try:
-                    _used_personal = bool(store.conversation_is_personal_tainted(conversation_id))
-                except Exception:
-                    _used_personal = True  # 判定できなければ個人扱いへ倒す（fail-closed）
-
-            # 個人コンテンツを使った場合は assistant message 保存の前にフラグを立てる。書き込みに失敗したら再 raise し（fail-closed）、個人内容を含む回答を保存しない。
-            if _used_personal:
-                store.set_contains_personal_workspace(conversation_id)
-                store.set_message_personal(_user_msg["id"])  # sanitized share: このターンの質問も個人扱い
-
-            env["duration_ms"] = round((time.monotonic() - _t0) * 1000)
-            _finalize_activity_phases(env, env["duration_ms"])
-            _investigation_record = ev.get("investigation_record")
-            _mark_investigation_recorded(env, _investigation_record)
-            msg = store.add_message(conversation_id, "assistant", env["headline"],
-                                    lens=ev["decision"]["lens"], route=env["route"], answer=env,
-                                    trace=_cap_trace_v2(trace_nodes),
-                                    personal=_used_personal)
-            if recovered_result is not None and recovered_result.get("result") is ev:
-                recovered_result["saved_message"] = msg
-            _noted = _save_investigation_record(_investigation_record, msg["id"], conversation_id)
-            if _noted is not None:
-                msg = _noted
-                if recovered_result is not None and recovered_result.get("result") is ev:
-                    recovered_result["saved_message"] = msg
-            # 停止終端は監査も停止として残す（assistant は保存済み）。
-            _audit_chat_turn(user_id, conversation_id, settings,
-                             lens=("stopped" if _terminal == "stopped" else ev["decision"]["lens"]),
-                             user_msg_id=_user_msg["id"], assistant_msg_id=msg["id"], world=world,
-                             scope_paths=(scope_meta or {}).get("scope_paths"), personal=_used_personal,
-                             stopped=(_terminal == "stopped"))
-
-            # 永続化（`store.add_message`）が成功した後にだけライブ配信する（`_result` と不可分なサイドカーとして、保存が確定してから画面に見せる）。
-            if _ev_committed_node is not None:
-                yield _ev_committed_node
+            msg, committed_node = _persist_result(
+                ev, ctx=ctx, message=message, conversation_id=conversation_id, user_id=user_id,
+                settings=settings, world=world, scope_meta=scope_meta, user_msg=_user_msg,
+                personal=personal, personal_hits=personal_hits, explicit_lens=explicit_lens,
+                trace_nodes=trace_nodes, recovered_result=recovered_result, t0=_t0)
+            # 永続化（`store.add_message`）が成功した後にだけライブ配信する（保存が確定してから画面に見せる）。
+            if committed_node is not None:
+                yield committed_node
             yield {"type": "answer", "conversation_id": conversation_id, "message": msg}
         elif ev["type"] == "question":
             # 確認カードを assistant メッセージとして永続化する。

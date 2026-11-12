@@ -9,6 +9,7 @@ import pytest
 
 from sherpa.ingest import office_md
 from sherpa.ingest.arms import ooxml_arm
+from tests._replace_row import offline_row
 
 pytestmark = pytest.mark.unit
 
@@ -30,7 +31,7 @@ def test_build_writes_no_document_json_and_cache_skips_old_ones(tmp_path, monkey
     src.mkdir()
     _xlsx(src / "a.xlsx", A1="甲の値", B2="乙")
     der = tmp_path / "derived" / "md"
-    rep = office_md.build_derived(src, der, world_sig="sig1")
+    rep = office_md.build_derived(src, der, world_sig="sig1", row=offline_row("w"))
     assert rep["converted"] == 1 and rep["document_ir_generated"] == 1 and rep["document_ir_failed"] == 0
     root = der.parent
     assert not list(root.rglob("*.document.json"))
@@ -48,7 +49,7 @@ def test_build_writes_no_document_json_and_cache_skips_old_ones(tmp_path, monkey
         raise AssertionError("キャッシュから戻すはずの原本を変換し直した")
 
     monkeypatch.setattr(ooxml_arm.OoxmlArm, "convert", no_convert)
-    rep2 = office_md.build_derived(src, der, world_sig="sig1")
+    rep2 = office_md.build_derived(src, der, world_sig="sig1", row=offline_row("w"))
     assert rep2["converted"] == 1 and rep2["failed"] == 0
     second = {k: v for k, v in _tree(root).items() if not k.startswith("_conv_cache/")}
     assert second == first                                             # MD・rag.md・rag_chunks・evidence が同じ・document.json は戻らない
@@ -57,7 +58,7 @@ def test_build_writes_no_document_json_and_cache_skips_old_ones(tmp_path, monkey
 
     # 利用者が残りを手で消しても、作り直し・再変換は起きない
     (cache_dir / "a.xlsx.document.json").unlink(missing_ok=True)
-    assert office_md.build_derived(src, der, world_sig="sig1")["converted"] == 1
+    assert office_md.build_derived(src, der, world_sig="sig1", row=offline_row("w"))["converted"] == 1
     assert office_md.document_ir_sig_drift(der) is False
 
 
@@ -67,7 +68,7 @@ def test_settle_document_ir_sig_for_notices_without_document_json(tmp_path):
     _xlsx(src / "a.xlsx", A1="甲の値")
     (src / "broken.docx").write_bytes(b"not a zip")                    # 失敗の知らせになる
     der = tmp_path / "derived" / "md"
-    office_md.build_derived(src, der, world_sig="sig1")
+    office_md.build_derived(src, der, world_sig="sig1", row=offline_row("w"))
     assert office_md._md_is_failure_notice(der, "broken.docx")
     marker = der / office_md._DOCUMENT_IR_SIG_MARKER
     marker.unlink(missing_ok=True)                                      # 印の無い旧い派生

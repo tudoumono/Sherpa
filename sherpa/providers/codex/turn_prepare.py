@@ -7,7 +7,7 @@ import shutil
 import threading
 from pathlib import Path
 
-from ... import investigation_ledger
+from ... import investigation_ledger, path_rules
 from ... import layer as layer_mod
 from ..base import _log, _node
 from .codex_cli import build_launch, log_turn_start, resolve_reasoning
@@ -15,17 +15,14 @@ from . import sandbox, plan_ledger
 from ...env_int import env_int
 from .ledger_gate import (
     _FINAL_ANSWER_VOICE,
-    _investigation_tree_has_symlink,
     _required_extra_for_state,
     _scope_source_state,
-    _restore_investigation_ledger,
+    restore_previous_ledger,
 )
 from .sandbox import (
     _codex_sandbox_enabled,
     _direct_read_roots,
-    _remove_dir_best_effort,
     _safe_codex_sessions_home,
-    _scope_deny_entries,
     _venv_root,
 )
 from .turn_consts import _MCP_SIDECAR_NAME
@@ -92,12 +89,25 @@ def enter_conversation(self, ctx, st, decision):
     return False
 
 
+RESTORE_FAILED_MESSAGE = "前回の調査記録を復元できませんでした。記録は残しています。もう一度「続き」を送って再試行してください。"
+
+
+def _restore_failed_result(ctx, decision):
+    """前回の台帳を復元できなかった「続き」を、空の台帳で新規調査として走らせず、失敗として終える。"""
+    yield _node("codex", "think", "Codex が調べる", "前回の調査記録を復元できませんでした", "done")
+    yield {"type": "answer_delta", "text": RESTORE_FAILED_MESSAGE}
+    env = {"lens": decision["lens"], "headline": RESTORE_FAILED_MESSAGE, "summary": {"total": 0},
+           "data": {}, "sources": [], "agentic_failure": "error",
+           "scope": layer_mod.scope_with_layer(ctx.scope_meta, world=ctx.world, lens=decision["lens"])}
+    yield {"type": "_result", "env": env,
+           "decision": {"lens": decision["lens"], "input": ctx.message, "reason": "前回の調査台帳の復元に失敗"}}
+
+
 def prepare_run(self, ctx, st, decision):
     """Codex を起動する準備: 層・直読の可否の確認（失敗は正直に伝えて True＝終了）・作業領域・調査台帳の復元・推論の設定・プロンプト・起動引数・開始ログ。"""
     _plain = st._plain
     st._ledger_style = plan_ledger.effective_style(
-        plain=_plain, ollama=self._ollama_base_url is not None,
-        schema_level=env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 2, 0, 2))
+        plain=_plain, schema_level=env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 2, 0, 2))
     uid = st.uid
     users_dir = st.users_dir
     run_dir = st.run_dir
@@ -155,11 +165,8 @@ def prepare_run(self, ctx, st, decision):
     _direct_roots, _deny_roots = _base_roots, []
     _venv_for_deny = _venv_root()
     try:
-        _scope_deny = _scope_deny_entries(_base_roots, sp)
-        if _base_roots and all(r in _scope_deny for r in _base_roots):
-            raise RuntimeError("scope_enum_failed:no_scope_in_roots")  # 範囲がどの root にも無い
-        _sensitive_deny = _scope_deny + sandbox._enumerate_sensitive(
-            _base_roots + ([str(_venv_for_deny)] if _venv_for_deny else []))
+        st._rules = _rules = path_rules.rules_for(ctx.world)  # 管理者の優先・除外。この依頼の間は、この規則だけを使う（deny・strict の判定・MCP の子へ渡す env）。読めなければ直読みを止める
+        _sensitive_deny = sandbox.turn_deny(ctx.world, _base_roots, sp, _venv_for_deny, _rules)
         _direct_read_ok = True
     except RuntimeError as e:
         _direct_roots, _deny_roots, _sensitive_deny, _direct_read_ok = [], _base_roots, [], False
@@ -192,22 +199,9 @@ def prepare_run(self, ctx, st, decision):
     # 素の Codex（plain）は台帳を使わず、standard が退避した台帳を復元も削除も退避もしない。
     if st._session_persistence_enabled and not _plain and st._ledger_style == "json":
         st._ledger_home = _safe_codex_sessions_home(users_dir, uid, ctx.conversation_id)
-    if st._ledger_home is not None:
-        _retired_investigation = st._ledger_home / "investigation"
-        if _retired_investigation.is_dir():
-            # 退避先に symlink が1つでもあれば復元せず削除する（「続き」宣言かどうかに関わらず）。
-            if _investigation_tree_has_symlink(_retired_investigation):
-                _log.warning(
-                    "investigation ledger restore skipped: symlink detected in retired dir")
-                _remove_dir_best_effort(_retired_investigation)
-            elif (ctx.message or "").strip().startswith(("続き", "つづき", "続けて")):
-                if _restore_investigation_ledger(_retired_investigation, st._investigation_dir, _tmp):
-                    st._investigation_restored = True
-                else:
-                    # 復元が途中で失敗したターンでは、この run の退避（削除・置換）を一切行わず、元の退避台帳を保持する（次ターンの「続き」で再試行できる）。
-                    st._investigation_retire_done = True
-            else:
-                _remove_dir_best_effort(_retired_investigation)
+    if st._ledger_home is not None and not restore_previous_ledger(ctx, st, _tmp):
+        yield from _restore_failed_result(ctx, decision)
+        return True
     # 復元直後・まだ何も探していない時点の状態を控える（`apply_unverified_downgrades` の降格対象から除く id）。
     st._investigation_pre_turn_not_found_ids = frozenset(
         item_id for item_id, item in

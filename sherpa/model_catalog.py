@@ -50,8 +50,8 @@ _DEFAULT_CATALOG: dict[str, dict[str, dict[str, object]]] = {
         "extract": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
         "intent": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
         "subsearch": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
-        # 埋め込みの次元は固定（768）。allowed は次元互換のモデルだけを登録する。
-        "embed": {"allowed": ["nomic-embed-text"], "default": "nomic-embed-text"},
+        # 埋め込みの次元はモデルごとに実測で決まる（`embeddings.ollama_embed_dim`）。モデルを変えたら索引は作り直しになる。
+        "embed": {"allowed": ["bge-m3", "nomic-embed-text"], "default": "bge-m3"},
         # 空セルを置く。組み込み既定を空にして `resolve_model()` を `_USAGE_FALLBACK` へ倒すため、ここに既定値を入れない。
         "render": {"allowed": [], "default": ""},
     },

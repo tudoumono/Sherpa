@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# 失敗した OCR の仕事を積み直す（make ocr-retry）。運用環境の設定ファイル（SHERPA_ENV_FILE で差し替え可）を
+# 取り込んでから scripts/ocr_retry.py を実行する。設定ファイルの中身は端末に出さない。
+#   REASON=oom,timeout  失敗の理由で絞る（省略で全部。理由は scripts/ocr_report.sh の「失敗の理由」の左の語）
+#   WORLD=<名前>        1 つの資料フォルダに絞る
+#   YES=1               件数の確認を省いて実行する（既定は件数を出して yes を待つ）
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+_sherpa_env_file_explicit="${SHERPA_ENV_FILE:+1}"
+export SHERPA_ENV_FILE="${SHERPA_ENV_FILE:-$ROOT/.env}"
+if [ -n "$_sherpa_env_file_explicit" ] && [ ! -f "$SHERPA_ENV_FILE" ]; then
+  echo "指定された SHERPA_ENV_FILE が見つかりません（通常ファイルではありません）" >&2
+  exit 2
+fi
+# shellcheck source=scripts/run-common.sh
+. "$ROOT/scripts/run-common.sh"
+sherpa_source_dotenv "$SHERPA_ENV_FILE"
+
+if [ -x "$ROOT/.venv/bin/python" ]; then
+  PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python}"
+else
+  PYTHON_BIN="${PYTHON_BIN:-python3}"
+fi
+
+args=()
+[ -z "${REASON:-}" ] || args+=(--reason "$REASON")
+[ -z "${WORLD:-}" ] || args+=(--world "$WORLD")
+case "${YES:-0}" in 1|yes|true) args+=(--yes) ;; esac
+
+exec "$PYTHON_BIN" "$ROOT/scripts/ocr_retry.py" ${args[@]+"${args[@]}"}

@@ -13,6 +13,7 @@ import pytest
 
 from sherpa.ingest import failure_reasons, md_prefetch, mem_guard, office_md
 from sherpa.ingest.arms import legacy_convert, legacy_prefetch
+from tests._replace_row import offline_row
 
 _DOCX_XML = ('<?xml version="1.0"?>'
              '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
@@ -136,7 +137,7 @@ def test_memory_exceeded_fails_only_that_file_with_one_log_line(tmp_path, monkey
     _setup(tmp_path, monkeypatch)
     src = _src(tmp_path, {"普通.doc": b"ok", "巨大.doc": b"HUGE"})
     with caplog.at_level("INFO", logger="sherpa.ingest.convert"):
-        rep = office_md.build_derived(src, tmp_path / "d" / "w" / "md")
+        rep = office_md.build_derived(src, tmp_path / "d" / "w" / "md", row=offline_row("w"))
     assert rep["converted"] == 1 and rep["failed"] == 1
     assert rep["legacy_conversion_failures"] == [{"doc": "巨大.doc", "reason": "memory_exceeded"}]
     assert failure_reasons.classify("memory_exceeded") == "memory_exceeded"
@@ -152,7 +153,7 @@ def test_failed_batch_is_logged_and_culprit_file_is_named_by_single_conversion(t
     names = [f"旧{i}.doc" for i in range(4)]
     src = _src(tmp_path, {n: (b"BAD" if n == "旧2.doc" else n.encode()) for n in names})
     with caplog.at_level("INFO", logger="sherpa.ingest.convert"), caplog.at_level("INFO", logger="sherpa.convert.libreoffice"):
-        rep = office_md.build_derived(src, tmp_path / "d" / "w" / "md")
+        rep = office_md.build_derived(src, tmp_path / "d" / "w" / "md", row=offline_row("w"))
     assert rep["legacy_conversion_failures"] == [{"doc": "旧2.doc", "reason": "legacy_conversion_failed"}]
     msgs = _messages(caplog)
     batch = [m for m in msgs if "先変換のバッチが失敗" in m]
@@ -173,21 +174,21 @@ def test_timeout_memory_and_failed_conversions_are_not_retried_until_the_source_
     src = _src(tmp_path, {"重い.doc": body})
     derived = tmp_path / "d" / "w" / "md"
 
-    first = office_md.build_derived(src, derived)
+    first = office_md.build_derived(src, derived, row=offline_row("w"))
     assert first["legacy_conversion_failures"] == [{"doc": "重い.doc", "reason": reason}]
     if reason == "legacy_conversion_failed":                              # 変換の失敗は 2 回続いてから＝1 回目の後はもう一度試す
         n = len(_launches(launches))
-        office_md.build_derived(src, derived)
+        office_md.build_derived(src, derived, row=offline_row("w"))
         assert len(_launches(launches)) > n
     after_first = len(_launches(launches))
 
-    second = office_md.build_derived(src, derived)                       # 原本が同じ＝変換し直さない・失敗の一覧には理由つきで載る
+    second = office_md.build_derived(src, derived, row=offline_row("w"))                       # 原本が同じ＝変換し直さない・失敗の一覧には理由つきで載る
     assert len(_launches(launches)) == after_first
     assert second["failed"] == 1 and second["legacy_conversion_failures"] == first["legacy_conversion_failures"]
     assert (derived / "重い.doc.md").is_file()                            # 資料名だけが検索に出る知らせは残る
 
     (src / "重い.doc").write_bytes(b"\xd0\xcf\x11\xe0 " + body + b" changed")   # 原本が変わった＝もう一度試す
-    third = office_md.build_derived(src, derived)
+    third = office_md.build_derived(src, derived, row=offline_row("w"))
     assert len(_launches(launches)) > after_first
     assert third["legacy_conversion_failures"] == first["legacy_conversion_failures"]
 
@@ -197,10 +198,10 @@ def test_timeout_is_retried_when_the_limit_is_extended(tmp_path, monkeypatch):
     monkeypatch.setenv("SHERPA_LEGACY_TIMEOUT", "0.3")
     src = _src(tmp_path, {"遅い.doc": b"SLOW"})
     derived = tmp_path / "d" / "w" / "md"
-    office_md.build_derived(src, derived)
+    office_md.build_derived(src, derived, row=offline_row("w"))
     n = len(_launches(launches))
     monkeypatch.setenv("SHERPA_LEGACY_TIMEOUT", "0.5")                    # 時間切れの設定を延ばした
-    office_md.build_derived(src, derived)
+    office_md.build_derived(src, derived, row=offline_row("w"))
     assert len(_launches(launches)) > n
 
 
@@ -235,7 +236,7 @@ def test_legacy_prefetch_waits_then_runs_with_fewer_threads(tmp_path, monkeypatc
     names = [f"旧{i}.doc" for i in range(6)]
     src = _src(tmp_path, {n: n.encode() for n in names})
     with caplog.at_level("INFO", logger="sherpa.ingest.convert"):
-        rep = office_md.build_derived(src, tmp_path / "d" / "w" / "md")
+        rep = office_md.build_derived(src, tmp_path / "d" / "w" / "md", row=offline_row("w"))
     assert rep["converted"] == 6 and rep["failed"] == 0                  # 止まらず全件が済む
     assert reads["n"] > 0
     assert any("メモリの空きを待っています" in m for m in _messages(caplog))
@@ -282,7 +283,7 @@ def test_empty_legacy_files_are_logged_as_failed_not_completed(tmp_path, monkeyp
     for name in ("空.doc", "空.xls"):
         (src / name).write_bytes(b"")
     with caplog.at_level("INFO", logger="sherpa.ingest.convert"):
-        rep = office_md.build_derived(src, tmp_path / "d" / "w" / "md")
+        rep = office_md.build_derived(src, tmp_path / "d" / "w" / "md", row=offline_row("w"))
     assert {e["doc"] for e in rep["conversion_failures"]} == {"空.doc", "空.xls"}
     msgs = _messages(caplog)
     for name in ("空.doc", "空.xls"):

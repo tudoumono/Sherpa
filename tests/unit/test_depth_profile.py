@@ -2,8 +2,8 @@
 クイック/標準/深く/最大）。
 
 - `review_rounds_for`: 見直しの巡数（クイック 0／標準 2／深く 4／最大＝管理画面の共通上限）。
-- `scaled_ratio`/`scaled_depth`: 深さに応じて探索量を拡大する（
-  ヒット上限と読取窓 ×0.5/×1/×1.5/×2・たどる深さ +0/+0/+2/+4）。クイックだけ
+- `scaled_ratio`: 深さに応じて探索量を拡大する（
+  ヒット上限と読取窓 ×0.5/×1/×1.5/×2）。クイックだけ
   ×0.5（網羅性の強化と、クイックを本当に速くする・変更D①）で最低1を保証する。
   `abs_max` の絶対上限は倍率適用後に一度だけ効く。不正な depth_profile は fail-loud のまま。
 - `codex_reasoning_for`: 推論レベルはクイックだけ `CODEX_REASONING_LEVELS` を1段下げる
@@ -37,31 +37,25 @@ def test_normalize_depth_profile_invalid_raises():
 # ===== 深さ4段の対応表（巡数・倍率・加算・推論・引き上げ・usage）=====
 
 # 1行＝1つの深さ。`rounds`（`max_review_rounds` 既定 7 のとき）・反復上限（基準 12）・
-# ヒット上限（基準 30）・読取窓（基準 40）・影響の段数（基準 8）・推論（基準 medium）・
+# ヒット上限（基準 30）・読取窓（基準 40）・推論（基準 medium）・
 # 1段上の深さ。クイックだけ探索量が×0.5・推論が1段下（`low`）——他は基準値のまま。
 _DEPTH_MATRIX = [
-    # profile,    rounds, hits, window, depth, reasoning, escalated
-    ("quick",     0,      15,   20,     8,     "low",     "standard"),
-    ("standard",  2,      30,   40,     8,     "medium",  "deep"),
-    ("deep",      4,      45,   60,     10,    "medium",  "max"),
-    ("max",       7,      60,   80,     12,    "medium",  None),
+    # profile,    rounds, hits, window, reasoning, escalated
+    ("quick",     0,      15,   20,     "low",     "standard"),
+    ("standard",  2,      30,   40,     "medium",  "deep"),
+    ("deep",      4,      45,   60,     "medium",  "max"),
+    ("max",       7,      60,   80,     "medium",  None),
 ]
 
 
-@pytest.mark.parametrize("profile,rounds,hits,window,depth,reasoning,escalated", _DEPTH_MATRIX)
-def test_depth_matrix(profile, rounds, hits, window, depth, reasoning, escalated):
+@pytest.mark.parametrize("profile,rounds,hits,window,reasoning,escalated", _DEPTH_MATRIX)
+def test_depth_matrix(profile, rounds, hits, window, reasoning, escalated):
     """4段（クイック/標準/深く/最大）の期待値表を1本で固定する。"""
     assert D.review_rounds_for(profile) == rounds
     assert D.scaled_ratio(30, profile) == hits
     assert D.scaled_ratio(40, profile) == window
-    assert D.scaled_depth(8, profile) == depth
     assert D.codex_reasoning_for("medium", profile) == reasoning
     assert D.escalated_profile(profile) == escalated
-
-
-@pytest.mark.parametrize("profile,expected", [("quick", 3), ("standard", 3), ("deep", 5), ("max", 7)])
-def test_scaled_depth_adds_with_depth_troubleshoot(profile, expected):
-    assert D.scaled_depth(3, profile) == expected
 
 
 @pytest.mark.parametrize("base", ["low", "medium", "high", "xhigh", "bogus"])
@@ -152,12 +146,9 @@ def test_effective_base_codex_reasoning_non_string_falls_back_to_env_default():
     assert D.effective_base({"depth_base_codex_reasoning": 123}, "codex_reasoning", "low") == "low"
 
 
-def test_base_settings_keys_cover_all_six_knobs():
-    """admin-settings.html の基準値編集セクション（§3.2・§6 SC-6c）が扱う6項目。"""
-    assert set(D.BASE_SETTINGS_KEYS) == {
-        "grep_max_hits", "qa_max_hits", "read_window",
-        "impact_depth", "troubleshoot_depth", "codex_reasoning",
-    }
+def test_base_settings_keys_cover_all_three_knobs():
+    """admin-settings.html の基準値編集セクションが扱う3項目（使われなくなった内容の質問・影響・原因の3項目は戻さない）。"""
+    assert set(D.BASE_SETTINGS_KEYS) == {"grep_max_hits", "read_window", "codex_reasoning"}
 
 
 # ===== abs_max（倍率適用後に一度だけ効く絶対上限）=====
@@ -180,22 +171,6 @@ def test_scaled_ratio_abs_max_does_not_affect_values_within_bound():
 def test_scaled_ratio_abs_max_omitted_keeps_existing_behavior():
     """abs_max 省略（既定 None）はクランプなし（既存呼び出し元は無変更）。"""
     assert D.scaled_ratio(2000, "max") == 4000
-
-
-def test_scaled_depth_abs_max_clamps_after_addition():
-    assert D.scaled_depth(68, "max", abs_max=64) == 64
-    assert D.scaled_depth(63, "deep", abs_max=64) == 64
-    assert D.scaled_depth(64, "standard", abs_max=64) == 64   # 64 ちょうど（クランプ境界）
-
-
-def test_scaled_depth_abs_max_does_not_affect_values_within_bound():
-    assert D.scaled_depth(8, "standard", abs_max=64) == 8
-    assert D.scaled_depth(8, "deep", abs_max=64) == 10
-    assert D.scaled_depth(8, "max", abs_max=64) == 12
-
-
-def test_scaled_depth_abs_max_omitted_keeps_existing_behavior():
-    assert D.scaled_depth(68, "max") == 72
 
 
 # ===== STAT-3 S1（利用統計の拡充）: usage メタへ足す depth 由来のキー =====

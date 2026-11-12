@@ -188,7 +188,7 @@ def test_resolve_model_embed_covers_ollama_too(monkeypatch):
     """OpenAI だけでなく Ollama の埋め込みもカタログへ配線されている
     （`sherpa/embeddings.py::cfg` の L() が使う）。"""
     monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {})
-    assert model_catalog.resolve_model("ollama", "embed", None) == "nomic-embed-text"
+    assert model_catalog.resolve_model("ollama", "embed", None) == "bge-m3"
     monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {
         "model_catalog": {"ollama": {"embed": {"allowed": ["custom-embed"], "default": "custom-embed"}}}})
     assert model_catalog.resolve_model("ollama", "embed", None) == "custom-embed"

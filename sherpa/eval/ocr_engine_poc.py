@@ -236,19 +236,26 @@ def parse_paddle_result(result: Any) -> list[dict]:
 
 
 class PaddleEngine:
-    def __init__(self, cache_home: Path, *, detection_model: str, recognition_model: str):
+    """本体（`ocr_worker`）と同じ検出・認識の資源 profile で PaddleOCR を動かす。引数で上書きできる。"""
+
+    def __init__(self, cache_home: Path, *, detection_model: str, recognition_model: str,
+                 onednn: bool = False, cpu_threads: int | None = None, profile: Any = None):
+        from ..ingest import ocr_worker
+        self.profile = profile or ocr_worker.PADDLE_CPU_PROFILE
         os.environ["PADDLE_PDX_CACHE_HOME"] = str(cache_home)
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
         import paddle
         from paddleocr import PaddleOCR
         self.ocr = PaddleOCR(
             device="cpu",
-            enable_mkldnn=False,
+            enable_mkldnn=onednn,
+            **({"cpu_threads": cpu_threads} if cpu_threads else {}),
             text_detection_model_name=detection_model,
             text_recognition_model_name=recognition_model,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
+            **self.profile.inference_kwargs(),
         )
         model_root = cache_home / "official_models"
         models = {}
@@ -262,7 +269,10 @@ class PaddleEngine:
             "paddleocr_version": importlib.metadata.version("paddleocr"),
             "paddlepaddle_version": paddle.__version__,
             "device": "cpu",
-            "enable_mkldnn": False,
+            "enable_mkldnn": onednn,
+            "cpu_threads": cpu_threads,
+            "inference": self.profile.inference_kwargs(),
+            "engine_profile_hash": ocr_worker.profile_hash(self.profile),
             "document_orientation": False,
             "textline_orientation": False,
             "models": models,
@@ -341,7 +351,27 @@ def _args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--paddle-cache", type=Path, default=Path.home() / ".paddlex")
     parser.add_argument("--paddle-detection-model", default="PP-OCRv6_medium_det")
     parser.add_argument("--paddle-recognition-model", default="PP-OCRv6_medium_rec")
+    parser.add_argument("--paddle-onednn", action="store_true", help="enable_mkldnn=True（既定は無効）")
+    parser.add_argument("--paddle-cpu-threads", type=int, default=None)
+    parser.add_argument("--paddle-det-limit-type", choices=("max", "min"), help="既定は SHERPA_OCR_DET_LIMIT_TYPE（本体と同じ）")
+    parser.add_argument("--paddle-det-limit-side-len", type=int, help="既定は SHERPA_OCR_DET_LIMIT_SIDE_LEN")
+    parser.add_argument("--paddle-rec-batch-size", type=int, help="既定は SHERPA_OCR_REC_BATCH_SIZE")
     return parser.parse_args(argv)
+
+
+def _paddle_profile(args: argparse.Namespace) -> Any:
+    """本体の profile（環境変数から読む）に、引数で指定した資源だけを重ねる。"""
+    import dataclasses
+
+    from ..ingest import ocr_worker
+    overrides = {
+        "text_det_limit_type": args.paddle_det_limit_type,
+        "text_det_limit_side_len": args.paddle_det_limit_side_len,
+        "text_recognition_batch_size": args.paddle_rec_batch_size,
+    }
+    return dataclasses.replace(
+        ocr_worker.PADDLE_CPU_PROFILE, **{key: value for key, value in overrides.items() if value is not None},
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -364,6 +394,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.paddle_cache,
                 detection_model=args.paddle_detection_model,
                 recognition_model=args.paddle_recognition_model,
+                onednn=args.paddle_onednn,
+                cpu_threads=args.paddle_cpu_threads,
+                profile=_paddle_profile(args),
             )
         engines.append(evaluate_engine(engine, oracle))
     engines.extend(evaluate_external(path, oracle) for path in args.external)

@@ -1,19 +1,9 @@
-"""RV1是正（2026-09-01・finding #3/#4）: `preview_service.build_preview` の走査一本化＋
-GRA-1 キャッシュ共有。
+"""`preview_service` の画面を開いたとき（`build_preview`）と「関係を確認」（`build_preview_graph`）の分担。
 
-finding #3 是正: 旧テストは `_build` をスタブ化しており、`_build`（→`world_graph_service.
-build_effective_world`→`world_graph.build_world`）自身が行う実際の全木走査を消して false green に
-していた。ここでは `_build` をスタブせず、実際に `world_graph.build_world` まで通す小さな実
-fixture world（tmp_path）を使い、`scope_infer.safe_files`（モジュール属性を直接 monkeypatch・
-`world_graph.py`/`preview_service.py` どちらの import 経路からも同じオブジェクトを差し替える）の
-呼び出し回数で「files が `_build` まで貫通し、合計1回に統合されたか」を検証する。
-
-finding #4 是正: `build_preview` は `graph_view` と**同じ** `_GRAPH_VIEW_CACHE`（GRA-1）を
-共有するが、それはグラフ部分（entities/relations/issues/counts.entities 等）だけ——文書一覧・
-重要度解決・重要度診断は世代（`last_sig`）よりも細かい失効契約（制御ファイルの内容 hash・直近
-run の DB 状態）を持つため、**一切キャッシュしない**（毎回フレッシュに計算する）。ここでは
-`_重要度.txt` を sync を経ずに直接編集し、次回呼び出しへ即座に反映されることを実際に確認する
-（外側キャッシュに阻まれて次回 sync まで固定されない、という finding #4 の直接反証）。
+`build_preview` はグラフを組み立てず、台帳が空のとき（これらのテストの資料フォルダ）だけ資料フォルダを期限つきで歩いて
+文書一覧を作る。重要度の解決・診断は世代で使い回さない（走査結果の使い回しは別のテスト）。グラフは `build_preview_graph` が
+世代キャッシュ（`_GRAPH_VIEW_CACHE`）を共有して組み立てる。`_build` はスタブせず実際に `world_graph.build_world` まで通す
+小さな tmp 資料フォルダを使い、`scope_infer.safe_files` と `_build` の呼び出し回数で「歩く回数」を固定する。
 """
 from __future__ import annotations
 
@@ -60,6 +50,12 @@ def _clear_state():
 
 
 @pytest.fixture(autouse=True)
+def _no_active_run(monkeypatch):
+    """取り込み中の run は無い（DB を引かない）。取り込み中を検証するテストは個別に上書きする。"""
+    monkeypatch.setattr(ps.store, "get_latest_run_summary", lambda w, **kw: None)
+
+
+@pytest.fixture(autouse=True)
 def _resolved_by_default(monkeypatch):
     """既定では root 到達可否の判定をバイパスして True 扱いにする（`world_dir` 自体を monkeypatch
     済みのため pin の有無は結果に影響しない・GRA-1 のテストと同じ考え方）。"""
@@ -101,85 +97,83 @@ def _count_build(monkeypatch):
     return calls
 
 
-def test_cache_miss_walks_world_graph_and_documents_exactly_once(monkeypatch, tmp_path):
-    """finding #3: `_build`（実 `world_graph.build_world`）をスタブせず、cache miss の
-    `build_preview()` 1回で `scope_infer.safe_files` が実際に1回しか呼ばれないことを検証する
-    （files が `_build` まで貫通している証拠。以前は `_build` 内部で1回・preview 側でもう1回の
-    計2回だった）。"""
+def test_preview_does_not_build_graph_and_graph_walks_exactly_once(monkeypatch, tmp_path):
+    """`build_preview` は台帳が空のとき文書一覧のために 1 回だけ歩き、グラフは組み立てない。グラフは `build_preview_graph` が
+    実 `world_graph.build_world` まで通して 1 回だけ歩く。"""
     _world(monkeypatch, tmp_path)
     _patch_status(monkeypatch, _status("sig-a", "t1"))
+    build_calls = _count_build(monkeypatch)
     calls = _count_safe_files(monkeypatch)
 
     out = ps.build_preview("wtest")
 
     assert calls["n"] == 1
+    assert build_calls == []
     assert [d["name"] for d in out["documents"]] == ["a.md"]
-    assert out["documents"][0]["importance"] == "高"
+    assert not any(k.startswith("importance") for k in out["documents"][0])
     assert out["counts"]["documents"] == 1
-    assert out["importance_diagnostics"] == []
+    assert "importance_diagnostics" not in out
+    assert out["entities"] == [] and out["relations"] == [] and out["issues"] == []
+    assert "wtest" not in ps._GRAPH_VIEW_CACHE
+
+    calls["n"] = 0
+    graph = ps.build_preview_graph("wtest")
+
+    assert calls["n"] == 1 and len(build_calls) == 1
+    assert graph["graph_note"] is None
     assert "wtest" in ps._GRAPH_VIEW_CACHE               # グラフ部分は GRA-1 キャッシュへ公開された
 
 
-def test_cache_hit_skips_graph_build_but_still_walks_once_for_documents(monkeypatch, tmp_path):
-    """世代不変の2回目呼び出しはグラフ構築（`_build`）をスキップするが、文書一覧・重要度・診断は
-    キャッシュしない設計（finding #4）のため、そのぶんだけ `scope_infer.safe_files` を1回歩く
-    （0回にはしない）。RV2是正#b3②: `_build` 自体の呼び出し回数を forwarding wrapper で直接
-    数える——`safe_files` の呼び出し回数だけを見ると、「毎回グラフを再構築するが `files` を
-    使い回して歩かない」誤実装でも偽陽性で通ってしまう。"""
+def test_graph_cache_hit_skips_graph_build_and_walk(monkeypatch, tmp_path):
+    """世代不変の 2 回目の `build_preview_graph` はグラフ構築（`_build`）も資料フォルダの走査もしない。
+    `_build` 自体の呼び出し回数を forwarding wrapper で直接数える（`safe_files` の回数だけでは、毎回再構築するが
+    `files` を使い回して歩かない誤実装を見逃すため）。"""
     _world(monkeypatch, tmp_path)
     _patch_status(monkeypatch, _status("sig-a", "t1"))
     build_calls = _count_build(monkeypatch)
     calls = _count_safe_files(monkeypatch)
 
-    r1 = ps.build_preview("wtest")
+    r1 = ps.build_preview_graph("wtest")
     calls["n"] = 0
-    r2 = ps.build_preview("wtest")
+    r2 = ps.build_preview_graph("wtest")
 
-    assert len(build_calls) == 1                # グラフ構築（_build）自体は1回だけ＝2回目は再構築しない
-    assert calls["n"] == 1                       # グラフは再構築しないが文書一覧のため1回歩く
+    assert len(build_calls) == 1
+    assert calls["n"] == 0
     assert r1["entities"] == r2["entities"]
     assert r1["issues"] == r2["issues"]
 
 
-def test_graph_view_and_build_preview_share_graph_cache(monkeypatch, tmp_path):
-    """`graph_view()` が先に world を構築していれば、同じ世代の `build_preview()` はグラフを
-    再構築しない（同じ `_GRAPH_VIEW_CACHE` を共有する証拠・finding #4 是正の核）。RV2是正#b3②:
-    `_build` の呼び出し回数を forwarding wrapper で直接数え、`graph_view()`+`build_preview()`
-    2回の合計で1回だけ（＝2回目の `build_preview()` はグラフを再構築しない）ことを固定する。"""
+def test_graph_bundle_and_build_preview_graph_share_graph_cache(monkeypatch, tmp_path):
+    """`_get_graph_bundle()` が先に world を構築していれば、同じ世代の `build_preview_graph()` はグラフを
+    再構築しない（同じ `_GRAPH_VIEW_CACHE` を共有する証拠）。"""
     _world(monkeypatch, tmp_path)
     _patch_status(monkeypatch, _status("sig-a", "t1"))
     build_calls = _count_build(monkeypatch)
 
-    gv = ps.graph_view("wtest")
+    bundle = ps._get_graph_bundle("wtest")
     calls = _count_safe_files(monkeypatch)
-    pv = ps.build_preview("wtest")
+    pv = ps.build_preview_graph("wtest")
 
-    assert len(build_calls) == 1                # graph_view+build_preview 合計で1回だけ
-    assert calls["n"] == 1                       # 文書一覧のためだけの1回（グラフは共有キャッシュから）
-    assert gv["counts"]["entities"] == pv["counts"]["entities"]
+    assert len(build_calls) == 1                # 合計で1回だけ
+    assert calls["n"] == 0
+    assert len(bundle["raw_nodes"]) == pv["counts"]["entities"]
 
 
-def test_importance_edit_without_resync_is_reflected_next_call(monkeypatch, tmp_path):
-    """finding #4: 重要度（`_重要度.txt` の内容）は sig（世代）が変わらなくても次回呼び出しへ
-    即座に反映される——外側の `_GRAPH_VIEW_CACHE` を共有していても、文書一覧・重要度はそこから
-    一切読まない（毎回フレッシュに計算する）ことの直接証明。"""
+def test_importance_edit_does_not_change_the_document_list(monkeypatch, tmp_path):
+    """`_重要度.txt` の中身は一覧に影響しない（重要度は画面に使わない）。"""
     wd = _world(monkeypatch, tmp_path)
-    _patch_status(monkeypatch, _status("sig-a", "t1"))   # sig は両呼び出しで同一（sync していない想定）
+    _patch_status(monkeypatch, _status("sig-a", "t1"))
 
     out1 = ps.build_preview("wtest")
-    assert out1["documents"][0]["importance"] == "高"
-
-    _write(wd / "_重要度.txt", "*.md: 低")                # sync を経ずに直接編集
+    _write(wd / "_重要度.txt", "*.md: 低")
     out2 = ps.build_preview("wtest")
 
-    assert out2["documents"][0]["importance"] == "低"     # 次回 sync を待たず反映される
-    assert "wtest" in ps._GRAPH_VIEW_CACHE                 # グラフ部分は依然キャッシュ済み（再構築なし）
+    assert out1["documents"] == out2["documents"]
 
 
 def test_documents_and_importance_are_never_served_from_a_cache(monkeypatch, tmp_path):
-    """finding #4: `doc_ledger.preview_documents` は世代不変でも毎回実際に呼ばれる（外側の
-    bundle キャッシュから読まれることはない）——一時的な障害結果が公開キャッシュへ焼き付いて
-    次回まで残る、という懸念への直接証明。"""
+    """台帳が空のとき、`doc_ledger.preview_documents` は世代不変でも毎回実際に呼ばれる
+    （一時的な障害結果が公開キャッシュへ焼き付いて次回まで残らない）。"""
     _world(monkeypatch, tmp_path)
     _patch_status(monkeypatch, _status("sig-a", "t1"))
     calls: list[str] = []
@@ -197,39 +191,144 @@ def test_documents_and_importance_are_never_served_from_a_cache(monkeypatch, tmp
     assert len(calls) == 2                     # 2回とも実際に呼ばれている（外側キャッシュに阻まれない）
 
 
-def test_unregistered_world_not_cached(monkeypatch, tmp_path):
-    """未登録 world（`sig` 空・dev fixture 等）はキャッシュキーを持てないため毎回計算する。"""
+def _count_build_world(monkeypatch):
+    """グラフ構築の本体（`world_graph.build_world`）の呼び出し回数を数える（実体はそのまま実行する）。"""
+    from sherpa.ingest import world_graph
+    calls: list[str] = []
+    real = world_graph.build_world
+
+    def _counting(*a, **kw):
+        calls.append("call")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(world_graph, "build_world", _counting)
+    return calls
+
+
+def test_completed_world_builds_graph_and_reports_no_note(monkeypatch, tmp_path):
+    """一度取り込みが完了した資料フォルダ（`sig` あり・実行中の run なし）はグラフを組み立てて要素・件数を返す。"""
     _world(monkeypatch, tmp_path)
-    _patch_status(monkeypatch, _status("", None))
+    _patch_status(monkeypatch, _status("sig-a", "t1"))
+    build_world_calls = _count_build_world(monkeypatch)
 
-    ps.build_preview("wtest")
+    out = ps.build_preview_graph("wtest")
 
+    assert len(build_world_calls) == 1
+    assert out["graph_note"] is None
+    assert out["counts"]["entities"] == len(out["entities"])      # 組み立てたグラフからの件数（記録からの None ではない）
+    assert out["counts"]["deprecated"] == 0 and out["counts"]["hidden"] == 0
+
+
+@pytest.mark.parametrize("status", ["queued", "extracting"])
+def test_running_ingest_does_not_build_graph_and_counts_come_from_records(monkeypatch, tmp_path, status):
+    """取り込み中（最新の run が queued／extracting）は `build_world` を呼ばない。一覧は文書一覧を出し、
+    グラフは要素・関係を空にして理由を返す。件数は最後に完了した取り込みの記録から出す。"""
+    _world(monkeypatch, tmp_path)
+    _patch_status(monkeypatch, _status("sig-a", "t1"))
+    monkeypatch.setattr(ps.store, "get_latest_run_summary", lambda w, **kw: {"id": 7, "status": status})
+    monkeypatch.setattr(ps.store, "get_latest_published_run_summary",
+                        lambda w: {"published_snapshot": {"nodes": 120, "edges": 340}, "created_at": None})
+    build_world_calls = _count_build_world(monkeypatch)
+
+    out = ps.build_preview("wtest")
+    graph = ps.build_preview_graph("wtest")
+
+    assert build_world_calls == []
+    assert out["graph_note"] and "取り込み中" in out["graph_note"]
+    assert graph["graph_note"] == out["graph_note"]
+    assert out["entities"] == [] and out["relations"] == [] and out["issues"] == []
+    assert graph["entities"] == [] and graph["relations"] == [] and graph["issues"] == []
+    assert out["counts"] == {"entities": 120, "relations": 340, "deprecated": None, "hidden": None, "documents": 1}
+    assert graph["counts"]["entities"] == 120 and graph["counts"]["relations"] == 340
+    assert [d["name"] for d in out["documents"]] == ["a.md"]
     assert "wtest" not in ps._GRAPH_VIEW_CACHE
 
 
-def test_aba_sig_returns_to_same_value_forces_rebuild_for_preview_too(monkeypatch, tmp_path):
-    """ABA（GRA-1是正#1）は共有キャッシュのため `build_preview` にも及ぶ: `A→""→A` の往復後は
+def test_never_completed_world_does_not_build_graph(monkeypatch, tmp_path):
+    """一度も取り込みが完了していない資料フォルダ（`sig` 空）は、実行中の run が無くても `build_world` を
+    呼ばない。記録も無いので件数は不明（None）で、文書一覧は出す。"""
+    _world(monkeypatch, tmp_path)
+    _patch_status(monkeypatch, _status("", None))
+    monkeypatch.setattr(ps.store, "get_latest_published_run_summary", lambda w: None)
+    build_world_calls = _count_build_world(monkeypatch)
+
+    out = ps.build_preview("wtest")
+    graph = ps.build_preview_graph("wtest")
+
+    assert build_world_calls == []
+    assert out["graph_note"] and "完了していない" in out["graph_note"]
+    assert graph["graph_note"] == out["graph_note"]
+    assert out["entities"] == [] and out["relations"] == []
+    assert graph["entities"] == [] and graph["relations"] == []
+    assert out["counts"] == {"entities": None, "relations": None, "deprecated": None, "hidden": None, "documents": 1}
+    assert [d["name"] for d in out["documents"]] == ["a.md"]
+    assert "wtest" not in ps._GRAPH_VIEW_CACHE
+
+
+def test_unfinished_ingest_after_completed_one_says_last_ingest_not_finished(monkeypatch, tmp_path):
+    """署名が空でも、完了した取り込みの記録があれば「一度も完了していない」とは言わず、前回の取り込みが最後まで終わっていない旨を返す（組み立てない動きは同じ・件数は記録から）。"""
+    _world(monkeypatch, tmp_path)
+    _patch_status(monkeypatch, _status("", None))
+    monkeypatch.setattr(ps.store, "get_latest_published_run_summary",
+                        lambda w: {"published_snapshot": {"nodes": 120, "edges": 340}, "created_at": None})
+    build_world_calls = _count_build_world(monkeypatch)
+
+    out = ps.build_preview("wtest")
+    graph = ps.build_preview_graph("wtest")
+
+    assert build_world_calls == []
+    assert graph["graph_note"] == ps._NOTE_LAST_UNFINISHED
+    assert out["graph_note"] == ps._NOTE_LAST_UNFINISHED
+    assert "最後まで終わっていない" in out["graph_note"] and "完了していない" not in out["graph_note"]
+    assert out["counts"]["entities"] == 120 and out["counts"]["relations"] == 340
+
+
+def test_run_registered_after_hold_check_does_not_build_graph(monkeypatch, tmp_path):
+    """最初の判定のあと、キャッシュが無いままロックを取るまでの間に取り込みが queued になっても、`build_world` を呼ばず理由を返す。"""
+    _world(monkeypatch, tmp_path)
+    _patch_status(monkeypatch, _status("sig-a", "t1"))
+    latest = [None]
+    monkeypatch.setattr(ps.store, "get_latest_run_summary", lambda w, **kw: latest[0])
+    real_get = ps._get_graph_bundle
+
+    def _run_appears_then_get(world):
+        latest[0] = {"id": 8, "status": "queued"}
+        return real_get(world)
+
+    monkeypatch.setattr(ps, "_get_graph_bundle", _run_appears_then_get)
+    build_world_calls = _count_build_world(monkeypatch)
+
+    out = ps.build_preview_graph("wtest")
+
+    assert build_world_calls == []
+    assert out["graph_note"] == ps._NOTE_RUNNING
+    assert out["entities"] == [] and out["relations"] == []
+    assert "wtest" not in ps._GRAPH_VIEW_CACHE
+
+
+def test_aba_sig_returns_to_same_value_forces_rebuild_for_preview_graph_too(monkeypatch, tmp_path):
+    """ABA（GRA-1是正#1）は共有キャッシュのため `build_preview_graph` にも及ぶ: `A→""→A` の往復後は
     `synced_at` が変わっているため、sig だけ見た旧実装と違い必ず再構築する。"""
     _world(monkeypatch, tmp_path)
     status = {"v": _status("A", "t1")}
     monkeypatch.setattr(ps, "_current_world_status", lambda world, **kw: dict(status["v"]))
 
-    ps.build_preview("wtest")
+    ps.build_preview_graph("wtest")
     assert ps._GRAPH_VIEW_CACHE["wtest"]["synced_at"] == "t1"
     status["v"] = _status("A", "t2")          # 空文字を挟んだ後、sig は元に戻ったが世代は進んだ想定
-    ps.build_preview("wtest")
+    ps.build_preview_graph("wtest")
 
     assert ps._GRAPH_VIEW_CACHE["wtest"]["synced_at"] == "t2"
 
 
 def test_delete_race_with_in_flight_preview_build_does_not_resurrect_cache(monkeypatch, tmp_path):
-    """delete 競合（GRA-1是正RV2#3 と同型）: `build_preview` 経由の in-flight 構築
+    """delete 競合（GRA-1是正RV2#3 と同型）: `build_preview_graph` 経由の in-flight 構築
     （`_GRAPH_VIEW_LOCK` 保持中）の最中に world が削除されても、delete の pop は構築の公開後に
     直列実行され、最終的にキャッシュへ残らない——`need_files=True` の新しい構築経路でも既存の
     ロック規律が保たれることの確認。"""
     _world(monkeypatch, tmp_path)
     from sherpa import store, worlds as worlds_mod
-    from sherpa.ingest import worker as worker_mod
+    from sherpa.ingest import wipe
 
     class _FakeLock:
         def __enter__(self):
@@ -240,7 +339,7 @@ def test_delete_race_with_in_flight_preview_build_does_not_resurrect_cache(monke
 
     monkeypatch.setattr(store, "world_lock", lambda world_id, **kw: _FakeLock())
     monkeypatch.setattr(store, "delete_world_row", lambda world_id: True)
-    monkeypatch.setattr(worker_mod, "_wipe_locked", lambda world_id, reflect=True: None)
+    monkeypatch.setattr(wipe, "wipe_locked", lambda world_id, reflect=True, **_kw: None)
     _patch_status(monkeypatch, _status("sig-a", "t1"))
 
     entered_build = threading.Event()
@@ -254,7 +353,7 @@ def test_delete_race_with_in_flight_preview_build_does_not_resurrect_cache(monke
 
     monkeypatch.setattr(ps, "_build", _slow_build)
 
-    t_pv = threading.Thread(target=lambda: ps.build_preview("wtest"))
+    t_pv = threading.Thread(target=lambda: ps.build_preview_graph("wtest"))
     t_pv.start()
     assert entered_build.wait(timeout=5)
 

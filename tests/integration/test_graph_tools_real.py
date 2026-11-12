@@ -16,6 +16,7 @@ import pytest
 from sherpa import tool_dispatch
 from sherpa.ingest import world_graph, world_neo4j
 from _world_registry import register_test_world
+from tests._replace_row import offline_row
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 FIXTURE = ROOT / "fixtures" / "corpus" / "ana-s6"
@@ -66,7 +67,7 @@ def loaded():
                          from_def={"file": "mention/src/credentials.py", "key": "k"}),
                   source("mention/src/Last.java", 7)])]
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))
     register_test_world(WORLD)
     drv = GraphDatabase.driver(env["uri"], auth=(env["user"], env["pw"]))
     try:

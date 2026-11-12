@@ -2,6 +2,9 @@
 // 全ページ共通の favicon（各 HTML に <link> を書かず、読み込まれた時点で1回だけ挿入する）
 (function(){
   if (!document.querySelector('link[rel="icon"]')) {
+    var s = document.createElement('link');
+    s.rel = 'icon'; s.type = 'image/svg+xml'; s.href = 'favicon.svg';
+    document.head.appendChild(s);
     var l = document.createElement('link');
     l.rel = 'icon'; l.type = 'image/x-icon'; l.href = 'favicon.ico';
     document.head.appendChild(l);
@@ -363,6 +366,21 @@ const _analyzerLabel = (name) => {
   return Object.prototype.hasOwnProperty.call(_ANALYZER_LABEL, key) ? _ANALYZER_LABEL[key] : key;
 };
 
+// パス一覧の並び（a, b は { path, dir }）。階層ごとに比べ、各階層ではフォルダが先・次にファイル、数字は数として比べる。親は子の前に来る。
+const _pathCollator = new Intl.Collator('ja', { numeric: true });
+const _comparePath = (a, b) => {
+  const x = a.path.split('/'), y = b.path.split('/');
+  const n = Math.min(x.length, y.length);
+  for (let i = 0; i < n; i++) {
+    const xDir = i < x.length - 1 || !!a.dir, yDir = i < y.length - 1 || !!b.dir;
+    if (xDir !== yDir) return xDir ? -1 : 1;
+    const c = _pathCollator.compare(x[i], y[i]);
+    if (c !== 0) return c;
+    if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+  }
+  return x.length - y.length;
+};
+
 window.Sherpa = window.Sherpa || {
   $: (id) => document.getElementById(id),
   esc: _sherpaEsc,
@@ -373,4 +391,5 @@ window.Sherpa = window.Sherpa || {
   analyzerLabel: _analyzerLabel,
   mdLite: _mdLite,
   visibilityInterval: _sherpaVisibilityInterval,
+  comparePath: _comparePath,
 };

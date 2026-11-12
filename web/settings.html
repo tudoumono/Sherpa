@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sherpa — 個人設定</title>
+<title>Slouch — 個人設定</title>
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="fonts.css">
 <script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
@@ -21,7 +21,7 @@
   .grp h3{font-size:var(--text-label);margin:12px 0 0;color:var(--ink-2,#5b6573)}
   .testrow{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
   .tres{font-size:var(--text-small)} .ok{color:var(--ok,#16a34a)} .danger{color:var(--danger,#dc2626)} .muted{color:var(--ink-3,#8b95a3)}
-  .linkbtn{background:none;border:none;color:var(--accent-ink,#0f766e);cursor:pointer;font-size:var(--text-small);padding:0;margin-left:8px}
+  .linkbtn{background:none;border:none;color:var(--accent-ink,#152a50);cursor:pointer;font-size:var(--text-small);padding:0;margin-left:8px}
   .mini{min-height:36px;padding:0 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);font-size:var(--text-small);color:var(--ink-2);cursor:pointer}
   /* 保存アクションバー: ページ下端に固定。背景ぼかし＋上境界線のみの控えめな装飾。settings.js は #save/#msg の id のみ参照する。 */
   .action-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;
@@ -29,7 +29,7 @@
     border-top:1px solid var(--border);
     background:color-mix(in srgb,var(--surface) 88%,transparent);
     backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
-  .action-bar-inner{max-width:1052px;width:100%;display:flex;gap:10px;align-items:center}
+  .action-bar-inner{max-width:calc(min(90vw,1200px) - 48px);width:100%;display:flex;gap:10px;align-items:center}
   /* 固定バーの高さぶん、最後のカードが隠れないように余白を確保。 */
   .wrap2.frm{padding-bottom:76px}
   /* 外部連携（自分の API キー）カード */
@@ -48,7 +48,7 @@
     border-radius:var(--radius,8px);background:var(--surface-2);margin:10px 0}
   body{height:100dvh;display:flex;flex-direction:column;overflow:hidden}
   body > sherpa-topbar{flex:none}
-  body > .wrap{flex:1;min-height:0;overflow:auto;width:100%;max-width:1200px}
+  body > .wrap{flex:1;min-height:0;overflow:auto;width:100%}
   .wrap2.frm{padding-bottom:0}
   .frm > .card{padding:0 24px 24px}
   .frm > .card > .card-head{margin:0 -24px 20px;font-size:var(--text-section);font-weight:600}
@@ -121,7 +121,7 @@
     <!-- 利用者本人による API キー自己発行。管理者が「利用者のキー発行を許可する」を ON にしたときだけ表示する。 -->
     <div class="card" id="ext-keys-card" style="margin-top:16px" hidden>
       <div class="card-head">外部連携（自分の API キー）</div>
-      <div class="hint" style="margin:8px 0 0">他のアプリからこの Sherpa の検索・変換を、あなた専用のキーで呼び出せます。
+      <div class="hint" style="margin:8px 0 0">他のアプリからこの Slouch の検索・変換を、あなた専用のキーで呼び出せます。
         アクセスできる範囲はあなたの権限内に限られます。発行直後だけキー本体を表示します（以後は再表示できません）。</div>
       <div id="ext-keys-list" style="margin-top:8px"><!-- JS が描画 --></div>
       <div class="testrow">

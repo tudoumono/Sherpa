@@ -10,7 +10,7 @@ from . import plan_ledger
 from .activity import _is_child_session_meta
 from ..base import _log, _node
 from .codex_attempt import _absorb_last_message_fallback, _attempt
-from .codex_cli import release_codex_home, write_run_files
+from .codex_cli import RunFilesError, release_codex_home, write_run_files
 from .continuation import _CONTINUE_PROMPT, _CONTINUE_PROMPT_SCHEMA, _TOOL_ZERO_PROMPT, _TOOL_ZERO_PROMPT_SCHEMA
 from .ledger_gate import (
     _LEDGER_CONTINUE_CAP,
@@ -166,42 +166,6 @@ def _continue_until_done(self, ctx, st, decision):
             _ledger_prev_snapshot = _ledger_snapshot
             _ledger_prev_reviews = _ledger_reviews
         _has_candidate_final = _candidate_final(st) is not None
-        if (st._ledger_style == "plan_gate" and _schema_v2 and st._investigation_dir is not None
-                and _has_candidate_final and not st._turn_failed):
-            # ---- 計画書の受理判定（評価用 plan_gate）----
-            # final のたびに計画書の「## 母集団」を読み、差し戻す・見直しを頼む・受理するを決める（`plan_ledger.decide`）。
-            _plan_now = plan_ledger.read_plan(st._investigation_dir)
-            # 影響調査では、graph_impact の影響先（ID の集合）と採用候補の回答を照合し、欠落があれば見直しの枠で具体的に差し戻す。
-            _dry_run = plan_ledger.gate_dry_run()
-            _plan_target = plan_ledger.target_check_for_turn(
-                st, ctx.message, decision["lens"], (_candidate_final(st) or {}).get("answer"))
-            _plan_decision = plan_ledger.gate_step(
-                st._plan_gate, _plan_now, review_cap=st._plan_review_cap,
-                graph_incomplete=plan_ledger.graph_incomplete(st), target=_plan_target, dry_run=_dry_run)
-            if _plan_decision.action == "accept":
-                if st._plan_gate.unresolved and not _dry_run:
-                    st._answer_notices.append(
-                        ("target_unresolved", plan_ledger.unresolved_notice(st._plan_gate.unresolved)))
-                break
-            if _plan_decision.action == "review" and _plan_now is not None:
-                _cand_answer = ((_candidate_final(st) or {}).get("answer") or "").strip()
-                plan_ledger.dump_review_candidate(
-                    st, ctx, st._plan_gate.review_requests,
-                    plan_ledger.compose_with_model_answer(_plan_now, _cand_answer)[0] if _cand_answer
-                    else plan_ledger.compose_answer(_plan_now, ""))
-            st._structured_answers_valid_from = len(_structured_answers)
-            _plan_label = ("計画書の見直し" if _plan_decision.action == "review" else "調査計画書を確認")
-            yield _node(f"plan-{_plan_decision.action}-{st._plan_gate.continuations + st._plan_gate.review_requests}",
-                        "think", _plan_label,
-                        "確定する前に見直します" if _plan_decision.action == "review"
-                        else "グラフの結果が打ち切られているため補います" if _plan_decision.action == "reject_graph"
-                        else "影響先の一覧に欠けた対象があるため補います" if _plan_decision.action == "reject_targets"
-                        else "計画書に未完了の項目があるため続けます", "done")
-            yield from _attempt(self, ctx, st, decision, True, prompt_text=_plan_decision.prompt)
-            _absorb_last_message_fallback(st)
-            _update_structured_state(st)
-            _absorb_mcp_sidecar(st)
-            continue
         if _ledger_gate_active and _has_candidate_final:
             # ---- 台帳ゲート分岐（`_schema_v2` のときだけ効かせる）----
             if _ledger_verdict.complete:
@@ -401,6 +365,9 @@ def run_session(self, ctx, st, decision, env):
         _note_tool_zero(ctx, st)
         _revert_review_if_worse(st)
         _final_ledger_verdict(st)
+    except RunFilesError as exc:
+        st._stream_error = True
+        st._answer_notices.append(("run_files_failed", str(exc)))
     except Exception as exc:
         st._stream_error = True
         st._answer_notices.append(f"調査の共通処理でエラーが発生しました（{type(exc).__name__}）。")

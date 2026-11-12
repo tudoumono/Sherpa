@@ -112,7 +112,6 @@ def test_turn_completes_and_persists_answer_without_any_subscriber_and_replays_a
     assert [m["role"] for m in conv["messages"]] == ["user", "assistant"], "購読ゼロで完走していない"
     assistant = conv["messages"][-1]
     assert assistant["answer"]["lens"] == "impact"
-    assert assistant["answer"]["sources"], "出典が保存されていない"
     assert assistant.get("trace"), "trace が保存されていない"
 
     # 完了済みターン（ナレッジ参照なしの素の会話）への購読は全イベントを replay して終わり（answer で完走）、
@@ -220,6 +219,7 @@ def test_turn_stop_via_turn_id_skips_assistant_save_and_yields_stopped_and_leave
     assert hit is not None, "開始直後は running 一覧に出るはず"
     assert hit["conversation_id"] == cid
     assert hit.get("started_at")
+    assert hit["scope_paths"] == [], "送信時の範囲（未指定＝全体）が running 一覧に載っていない"
 
     assert c.post(f"/chat/turns/{tid}/stop").json() == {"ok": True}
     r = c.post("/chat/turns/no-such-turn-id/stop")

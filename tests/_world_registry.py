@@ -97,13 +97,14 @@ def cleanup_worlds(world_ids: list[str]) -> dict:
 
     from sherpa import es_index
     from sherpa.ingest import world_neo4j
+    from tests._replace_row import offline_row
 
     total_nodes = 0
     try:
         env = world_neo4j._env()
         for w in world_ids:
             try:
-                total_nodes += world_neo4j.delete_world(w, env["uri"], env["user"], env["pw"])
+                total_nodes += world_neo4j.delete_world(w, env["uri"], env["user"], env["pw"], row=offline_row(w))
             except Exception:
                 pass   # Neo4j 不到達等は best-effort（起動時 reconcile が backstop）
     except Exception:
@@ -111,7 +112,7 @@ def cleanup_worlds(world_ids: list[str]) -> dict:
 
     for w in world_ids:
         try:
-            es_index.delete_world(w)
+            es_index.delete_world(w, row=offline_row(w))
         except Exception:
             pass
 

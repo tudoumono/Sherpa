@@ -16,9 +16,9 @@ from typing import Iterator
 
 from ... import depth_profile as depth_profile_mod
 from ... import model_catalog
-from ..base import Ctx, Provider, _log, _node, _plain_run
+from ..base import CODEX_CLI_MISSING_HOWTO, Ctx, Provider, _log, _node, _plain_run
 from ..prompts import _kb_hint_abs
-from .ledger_gate import _retire_investigation_ledger
+from .ledger_gate import retire_ledger_for_turn
 from .sandbox import (
     _release_active_run_dir,
     _remove_dir_best_effort,
@@ -31,8 +31,6 @@ from .turn_loop import run_session
 from .turn_prepare import enter_conversation, prepare_run
 from .turn_state import CodexTurnState
 
-# Codex を起動する前の事前の下調べ（`_gather` の `ctx.dispatch`）を省くレンズ（全部の調べ方）。影響のたどりは Codex が道具で行う。
-_PRESEARCH_SKIP_LENSES = frozenset({"investigate", "qa", "impact", "troubleshoot", "author"})
 # モデルの文脈窓（`model_context_window`）は Codex CLI に渡さず、CLI 自身の判断に任せる（Sherpa 側で窓を判定・登録・上書きしない）。
 
 
@@ -141,8 +139,8 @@ class CodexProvider(Provider):
         }.get(layer, "")
         base = (
             "あなたは社内ナレッジ調査エージェントです。MCP サーバ『sherpa』のツール"
-            "（list_docs＝文書台帳の一覧/件数／ripgrep_search＝全文grep／glob_search＝ファイル名パターン／"
-            "doc_outline＝見出し構造／read_doc＝通読（続きは start_line）／read_around＝周辺精読／"
+            "（list_docs＝文書台帳の一覧/件数／name_lookup＝名前からソースの在り処を引く／ripgrep_search＝全文grep／glob_search＝ファイル名パターン／"
+            "doc_outline＝見出し構造／read_doc＝通読（続きは start_line。行の途中なら next_char を start_char に）／read_around＝周辺精読／"
             "graph_neighbors＝関係グラフの関連部品／graph_resolve＝起点の候補／graph_impact＝識別子からの影響先／es_search＝日本語全文検索／"
             "xlsx_sheets＝Excelのシート一覧／xlsx_range＝Excelのセル範囲／"
             "docx_paragraphs＝Wordの段落・表／pptx_slides＝PowerPointのスライド／"
@@ -155,9 +153,10 @@ class CodexProvider(Provider):
             "確定した事実と推定は分けて書く（詳細ルールは AGENTS.md）。"
             "検索ヒットや精読結果に text_truncated が付いていたら、その本文は途中で切れている。"
             "結論を出す前に read_around か read_doc で続きを読む。続きを取得する手段が無い打ち切り"
-            "（file_truncated・pdf_pages の text_truncated・compare_documents／graph_neighbors／glob_search／doc_outline の truncated・graph_resolve／graph_impact の truncated と coverage.complete:false（理由は coverage.limits）・folder_tree の folders_truncated・xlsx_sheets／es_search の truncated＝ヒット数上限）は"
+            "（file_truncated・pdf_pages の text_truncated・compare_documents／glob_search／doc_outline の truncated・graph_resolve／graph_impact の truncated と coverage.complete:false（理由は coverage.limits）・xlsx_sheets／es_search の truncated＝ヒット数上限）は"
             "その範囲を未確認として明示し、全件性を主張しない。"
             "ripgrep_search の truncated（ヒット数上限）は続きを取れる——next_offset をそのまま offset に渡す（next_offset が無い・limit_reached は絶対上限＝続きは取れない）。"
+            "graph_neighbors の truncated・folder_tree の folders_truncated も同じで、next_offset があれば offset に渡して続きを取る（無ければその範囲は未確認）。"
             "結果の欠落の印（section_truncated・fragment・unreadable_files・excluded_hits・unverified・excluded・no_text_layer・unread_shapes・unread_objects・formula_no_value・pages_remaining・pages_ignored・file_truncated・line_beyond_eof・window_clamped・candidates_total・title_truncated など）が付いた範囲も、確かめるまで未確認として扱う。"
             "**ドキュメント数・一覧・どんな資料があるか・フォルダ構成といった台帳質問は、まず list_docs を使う**"
             "（grep は本文中の一致しか探せず件数/一覧には答えられない）。フォルダ名・ファイル名はパスに含まれる"
@@ -170,17 +169,18 @@ class CodexProvider(Provider):
             "中断（利用者停止・通信エラー・予算到達）のときは確認済み／未確認／理由を分けて書き、"
             "部分結果を「全件」と断定しない。"
             "原因の手がかりや関連部品（呼び出し/コピー/参照/関連文書）をたどるときは graph_neighbors、"
-            "変更の影響先を調べるときは graph_resolve で起点を選んでから graph_impact を使う。"
+            "変更の影響先を調べるときは graph_resolve で起点を選んでから graph_impact を使う。""プログラム・部品のソースが見つからないと答える前に、必ず name_lookup でその名前を引く。近い名前の候補は確認していない候補として示す。"
             # 影響を問う質問の分解の型。症状語で検索を乱発させず、変更対象と影響先の「接続（経路）」の有無を根拠に答えさせる。
             "**影響を問う質問（「〜を変えたら」「〜に影響ある？」「〜が落ちる？」など）では、"
             "①変更対象（例: 税率）に依存する部品・記述を特定 → ②影響先（例: 夜間バッチ＝JCL/ジョブ）を特定 → "
-            "③両者の接続（COPIES／INVOKES／ACCESSES／CONTAINS＝構造的な依存の経路）を、graph_resolve で起点の"
+            "③両者の接続（COPIES／INVOKES／ACCESSES／CONTAINS／BUILT_FROM＝構造的な依存の経路）を、graph_resolve で起点の"
             "候補を選び（同名は path で見分ける）その canonical_id を graph_impact へ渡して当たる（補助に graph_neighbors）。"
             "graph_impact の route と graph_neighbors の近傍は辺の種類と向き（from→to）を返す——COPIES／INVOKES／"
-            "ACCESSES／CONTAINS だけで構成された経路は根拠にしてよい。影響は矢印をさかのぼる（A →COPIES→ B は"
+            "ACCESSES／CONTAINS／BUILT_FROM だけで構成された経路は根拠にしてよい。"
+            "種類 Executable は呼ばれる実行名で、BUILT_FROM の先がその材料のソース＝実行名は材料のソースとビルドの定義の行（path・line）を根拠に書く。影響は矢印をさかのぼる（A →COPIES→ B は"
             "B を変えると A が影響を受ける・変更対象から出ていく矢印の先は影響先ではない）。経路に DOCUMENTS"
             "（言及）・CORRESPONDS_TO の辺や unverified の辺（裏付け原本が実在確認できない）が 1 本でも含まれる"
-            "近傍は候補どまり＝原本で確認する。経路の先の"
+            "近傍は候補どまり＝原本で確認する。辺・経路の confirm が conditional のつながりは条件つき（assumption が理由）＝回答では条件つきと書く。経路の先の"
             "実際の記述を引用したいときだけ原本を開き、接続の有無を根拠として答える（向きは平易語で・"
             "内部のエッジ名は本文に出さない）。"
             "質問中の症状表現（落ちる/止まる/エラー/停止 等）をそのまま検索語にしない**"
@@ -237,7 +237,7 @@ class CodexProvider(Provider):
             "探すときは CP932 と確認したソースに `rg -E sjis` を使う（英数字の名前はそのままで当たる）。"
             "rg が無ければ `grep -rn` を使い、探す語を `iconv -t CP932` で変換してから探す。"
             "cat／sed で中身を読むときも CP932 のファイルだけ `iconv -f CP932 -t UTF-8` を通す"
-            "（UTF-8 のファイルには使わない）。\n"
+            "（UTF-8 のファイルには使わない）。EUC-JP のソースは `-E euc-jp`・`iconv -f EUC-JP` を使う。\n"
             "**指定された資料フォルダ・変換済みテキスト以外（このディレクトリの外・ユーザー"
             "workspace・秘匿名のファイル（.env／鍵／credentials 等）等）は絶対に読まない。**"
             f"{_BOTH_SIDES_SENTENCE}"
@@ -300,23 +300,22 @@ class CodexProvider(Provider):
         _turn_t0 = time.monotonic()  # `sherpa.usage` ログ 1 行の elapsed（このターン全体）
         # 素の Codex モード（`codex_mode`）はターンの最初に1回だけ決め、プロンプト・AGENTS.md・スキル配備・出力スキーマ・multi_agent・台帳・MCP env・codex.log 開始行・activity.settings で同じ値を使う。`standard`（既定）はこのフラグが常に偽。
         _plain = codex_mode(self._system_settings) == "plain"
-        # 下調べ（`_gather` の `ctx.dispatch`）を省くのは、Codex を起動する見込み（CLI が有る）で、レンズが `_PRESEARCH_SKIP_LENSES` のときだけ。
-        # `ws_authoring`/`run_dir`/`_codex_home_ok` はこの時点で計算できないため含めない。判定は `_gather` の前に1回だけ行い、後段（起動ガード・未応答時のノード文言）でも同じ値を使う。
-        _codex_bin = shutil.which("codex")
-        _skip_lenses = _PRESEARCH_SKIP_LENSES if _codex_bin else frozenset()
-        # `_gather` は `from sherpa import agents as _facade` を関数内で遅延 import し、facade 属性経由で実行時解決する（差し替えを効かせる・循環 import 回避）。
+        # 選択後〜実行開始の間に CLI が消えたときは、別の検索へ切り替えず、選択時と同じ「未接続」の案内で終える。
+        # `_gather`・`_UnwiredProvider` は facade 属性経由で実行時解決する（差し替えを効かせる・循環 import 回避）。
         from sherpa import agents as _facade
-        for ev in _facade._gather(ctx, skip_presearch_lenses=_skip_lenses):
+        if not shutil.which("codex"):
+            yield from _facade._UnwiredProvider("Codex", CODEX_CLI_MISSING_HOWTO).run(ctx)
+            return
+        for ev in _facade._gather(ctx):
             if isinstance(ev, dict) and ev.get("type") == "_env":
                 decision, env = ev["decision"], ev["env"]
             else:
                 yield ev
         if env is None:  # _gather が clarify question を出して停止＝確認待ち
             return
-        _skip_presearch = decision["lens"] in _skip_lenses
 
         yield _node("codex", "think", "Codex が調べる", "資料を調べています", "active")
-        st = CodexTurnState(ctx, turn_t0=_turn_t0, plain=_plain, skip_presearch=_skip_presearch)
+        st = CodexTurnState(ctx, turn_t0=_turn_t0, plain=_plain)
         codex_created_files = st.codex_created_files
         # 専用 authoring ディレクトリを cwd にする（個人アップロード files/ から分離・KB は絶対パスでプロンプトに渡す）。symlink が混入していると封じ込めが崩れるため `_safe_workspace_authoring` で symlink 拒否＋fail-closed。
         users_dir = Path(os.environ.get("SHERPA_USERS_DIR", "data/users")).resolve()
@@ -331,7 +330,7 @@ class CodexProvider(Provider):
             stop = yield from enter_conversation(self, ctx, st, decision)
             if stop:
                 return
-            if _codex_bin and ws_authoring is not None and run_dir is not None and st._codex_home_ok:
+            if ws_authoring is not None and run_dir is not None and st._codex_home_ok:
                 stop = yield from prepare_run(self, ctx, st, decision)
                 if stop:
                     return
@@ -356,11 +355,11 @@ class CodexProvider(Provider):
                     # 調査台帳の退避: run_dir 削除より前に、完了せずターンが終わった台帳だけ永続領域へコピーする。`_investigation_verdict`（本体ループが正常に完走したときだけ埋まる）には頼らない（yield で generator が close された場合に未完了台帳が失われるため）。通常終了時は env 構築の直前で退避済み（`_investigation_retire_done`）で、ここは切断・例外で先に到達しなかった場合だけのフォールバック（二重には実行しない）。
                     if (st._investigation_dir is not None and st._ledger_home is not None
                             and not st._investigation_retire_done):
-                        _retire_investigation_ledger(
-                            st._investigation_dir, st._ledger_home, required_extra=st._ledger_required_extra,
-                            require_review=st._ledger_require_review)
+                        retire_ledger_for_turn(st)
                     _release_active_run_dir(run_dir)
-                    if st._created_files_failed:
+                    if st._investigation_retire_failed:
+                        _log.warning("codex run dir kept: investigation ledger could not be retired: %s", run_dir.name)
+                    elif st._created_files_failed:
                         # 保存に失敗した成果物がある run_dir は削除せず回収用に残す（`_cleanup_stale_run_dirs` の24時間しきい値で最終的に掃除される）。
                         _log.warning(
                             "codex run dir kept for recovery due to created-file save failure: %s",

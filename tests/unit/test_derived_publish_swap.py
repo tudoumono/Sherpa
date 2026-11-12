@@ -16,7 +16,9 @@ import os
 
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 
+import pytest  # noqa: E402
 from sherpa.ingest import office_md  # noqa: E402
+from tests._replace_row import offline_row
 
 
 def test_staging_is_used_and_published_dir_untouched_until_swap(tmp_path, monkeypatch):
@@ -31,15 +33,15 @@ def test_staging_is_used_and_published_dir_untouched_until_swap(tmp_path, monkey
     seen: list[list[str]] = []
     real_publish = office_md._publish_staging
 
-    def _spy(staging, target):
+    def _spy(staging, target, **kw):
         # 差し替え直前まで公開中は旧内容のまま（＝検索が壊れない）。§8.1 三階層により
         # ir/rag/md の3層それぞれで独立に呼ばれる——ir/rag は今回の初回ビルドで公開先が
         # まだ存在しない（空扱い）。
         seen.append(sorted(p.name for p in target.iterdir()) if target.exists() else [])
-        return real_publish(staging, target)
+        return real_publish(staging, target, **kw)
 
     monkeypatch.setattr(office_md, "_publish_staging", _spy)
-    rep = office_md.build_derived(str(source), str(published))
+    rep = office_md.build_derived(str(source), str(published), row=offline_row("w"))
 
     assert rep.get("error") is None, rep
     assert seen == [[], [], ["既存.md"]], "差し替え前に公開中を書き換えている（順序: ir→rag→md）"
@@ -86,7 +88,7 @@ def test_a_few_failed_documents_do_not_block_publishing(tmp_path, monkeypatch):
 
     called = {"publish": 0}
     monkeypatch.setattr(office_md, "_publish_staging",
-                        lambda staging, target: called.__setitem__("publish", called["publish"] + 1))
+                        lambda staging, target, **kw: called.__setitem__("publish", called["publish"] + 1))
     real_build = office_md._build_derived_into_staging
 
     def _partial(wd, derived, *, progress=None, world=None):
@@ -95,7 +97,7 @@ def test_a_few_failed_documents_do_not_block_publishing(tmp_path, monkeypatch):
         return rep
 
     monkeypatch.setattr(office_md, "_build_derived_into_staging", _partial)
-    rep = office_md.build_derived(str(source), str(published))
+    rep = office_md.build_derived(str(source), str(published), row=offline_row("w"))
 
     assert not rep.get("error"), rep.get("error")
     assert rep["derived_partial"] == {"rag_failed": 3, "evidence_ir_failed": 1}
@@ -112,7 +114,7 @@ def test_many_failed_documents_still_publish_and_are_flagged(tmp_path, monkeypat
 
     called = {"publish": 0}
     monkeypatch.setattr(office_md, "_publish_staging",
-                        lambda staging, target: called.__setitem__("publish", called["publish"] + 1))
+                        lambda staging, target, **kw: called.__setitem__("publish", called["publish"] + 1))
     real_build = office_md._build_derived_into_staging
 
     def _mostly_failed(wd, derived, *, progress=None, world=None):
@@ -121,8 +123,58 @@ def test_many_failed_documents_still_publish_and_are_flagged(tmp_path, monkeypat
         return rep
 
     monkeypatch.setattr(office_md, "_build_derived_into_staging", _mostly_failed)
-    rep = office_md.build_derived(str(source), str(published))
+    rep = office_md.build_derived(str(source), str(published), row=offline_row("w"))
 
     assert not rep.get("error"), rep.get("error")
     assert rep["derived_partial"] == {"rag_failed": 11} and rep["derived_partial_many"] is True
     assert called["publish"] > 0
+
+
+def test_publish_writes_the_number_into_every_layer_and_marks_the_items_cleaned(tmp_path):
+    """3 層を差し替えると、各層の直下に取り込みの番号と設定の値が入り、層ごとに「古いものを消した」になる。"""
+    from sherpa.ingest import derived_numbers
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "資料.txt").write_text("本文", encoding="utf-8")
+    published = tmp_path / "md"
+    row = offline_row("w", ingest_no=7)
+    assert office_md.build_derived(str(source), str(published), row=row).get("error") is None
+    for layer in ("md", "rag", "ir"):
+        rec = derived_numbers.read(derived_numbers.layer_dir(published, layer))
+        assert rec is not None and rec["ingest_no"] == 7 and rec["settings_sig"]
+    assert row._offline == ["ir", "rag", "md"]
+
+
+def test_in_place_refresh_replaces_the_number_only_after_the_layer_is_written(tmp_path):
+    """その場で書き換える関数は、書き終えてから層の番号を置き換える。`error` で終わったときは置き換えない。"""
+    from sherpa.ingest import derived_numbers
+    layer = tmp_path / "rag"
+    layer.mkdir()
+    derived = tmp_path / "md"
+    derived.mkdir()
+    outcome = {"error": "setup"}
+
+    @derived_numbers.rewrites_layers("rag")
+    def refresh(wd, dmd, *, row):
+        derived_numbers.begin(row, "rag")
+        assert derived_numbers.read(layer) is None
+        return dict(outcome)
+
+    row = offline_row("w", ingest_no=9)
+    refresh(tmp_path, derived, row=row)
+    assert derived_numbers.read(layer) is None
+    outcome.clear()
+    refresh(tmp_path, derived, row=row)
+    assert derived_numbers.read(layer)["ingest_no"] == 9
+    with pytest.raises(TypeError):
+        refresh(tmp_path, derived)
+
+
+def test_refresh_that_refuses_before_writing_leaves_the_row_untouched(tmp_path):
+    """前提の確認で断った軽量再生成は、何も書き換えないので、行の項目を「入れ替えた」にしない。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    row = offline_row("w")
+    rep = office_md.refresh_rag(src, src / "md", row=row)
+    assert rep["error"] == "derived_overlaps_source"
+    assert row._offline == []

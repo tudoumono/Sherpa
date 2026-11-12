@@ -1,7 +1,8 @@
 """intent（レンズ）の LLM 分類。
 
 heuristic（`chat_router`）が確信を持てない曖昧時だけ chat_service が呼ぶ。安価モデルを使い、本文テキストのみ送信する。
-未接続・失敗・不正応答は None を返し、呼び元は clarify（ask_user 確認）へ縮退する。
+未接続（鍵・URL が無い）と「判断できない」は None を返し、呼び元は clarify（ask_user 確認）へ進む。
+通信・設定の解決・応答の形式の失敗は `IntentClassifierError` を送出する（呼び元は障害として扱い、質問の曖昧さと混ぜない）。
 HTTP/補完は `graph_extract.complete_json` を再利用する（`_complete` 経由で差し替え可）。
 """
 from __future__ import annotations
@@ -14,6 +15,10 @@ from . import llm
 _log = logging.getLogger("sherpa")
 
 _LENSES = ("impact", "troubleshoot", "qa", "author")
+
+
+class IntentClassifierError(RuntimeError):
+    """意図分類の AI を使えなかった（通信の失敗・設定の解決の失敗・応答が JSON や分類として不正）。"""
 _SYS = ("あなたは社内ナレッジ検索の意図分類器です。ユーザの発話を次の4つの『調べ方』のどれかに分類し、"
         'JSON だけを返す: {"lens":"impact|troubleshoot|qa|author","confident":true|false}。'
         "impact=変更したときの影響範囲（〜を変えたら何に波及するか）／"
@@ -75,9 +80,8 @@ def classify(message: str, settings: dict | None, *,
     try:
         cfg = _cfg(settings, system_settings=system_settings)
     except Exception as e:
-        _log.warning("intent_llm.classify: 設定解決に失敗しました（clarify へ縮退します）: %s",
-                     e.__class__.__name__)
-        return None
+        _log.warning("intent_llm.classify: 設定解決に失敗しました: %s", e.__class__.__name__)
+        raise IntentClassifierError("設定の解決に失敗しました") from e
     if not cfg:
         return None
     from . import metering
@@ -85,15 +89,16 @@ def classify(message: str, settings: dict | None, *,
     try:
         try:
             data = json.loads(_complete(_SYS, msg, cfg))
-            lens = data.get("lens") if isinstance(data, dict) else None
-            if lens in _LENSES:
-                conf = data.get("confident", True)
-                if isinstance(conf, str):
-                    conf = conf.strip().lower() in ("true", "1", "yes")
-                return {"lens": lens, "confident": bool(conf)}
-        except Exception:
-            return None
-        return None
+        except Exception as e:
+            _log.warning("intent_llm.classify: 分類に失敗しました: %s", e.__class__.__name__)
+            raise IntentClassifierError("分類の呼び出しに失敗しました") from e
+        lens = data.get("lens") if isinstance(data, dict) else None
+        if lens not in _LENSES:
+            raise IntentClassifierError("分類の応答が不正です")
+        conf = data.get("confident", True)
+        if isinstance(conf, str):
+            conf = conf.strip().lower() in ("true", "1", "yes")
+        return {"lens": lens, "confident": bool(conf)}
     finally:
         tokens, n = metering.acc_end()
         if n:

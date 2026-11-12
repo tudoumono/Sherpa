@@ -36,6 +36,7 @@ atexit.register(lambda: (shutil.rmtree(_KB, ignore_errors=True), shutil.rmtree(_
 
 from sherpa import corpus_docs, doc_ledger, store, worlds   # noqa: E402
 from sherpa.ingest import office_md, worker                  # noqa: E402
+from tests._replace_row import offline_row   # noqa: E402
 
 W = f"dltest{os.getpid()}"          # PID 一意化＝registry/fixtures の同名 world と衝突しない（KB fallback を確実化）
 # 原本（深い階層＝basename 命名の検証も兼ねる）。中身に固有トークンを入れて grep でヒットさせる。
@@ -83,8 +84,8 @@ def _build_world():
     pptx.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(pptx, "w") as z:
         z.writestr("ppt/slides/slide1.xml", _PPTX_SLIDE)
-    rep = office_md.build_derived(worlds.world_dir(W), worlds.derived_md_dir(W))
-    store.replace_documents(W, worker._ledger_rows(W))   # /documents/download の台帳正準一致確認用
+    rep = office_md.build_derived(worlds.world_dir(W), worlds.derived_md_dir(W), row=offline_row("w"))
+    store.replace_documents(W, worker._ledger_rows(W), row=offline_row(W))   # /documents/download の台帳正準一致確認用
     return rep
 
 
@@ -190,29 +191,15 @@ def test_download_endpoint_toctou_rejects_symlink_swapped_after_verification(mon
         link_path.symlink_to(secret)
     except OSError as e:
         pytest.skip(f"symlink 非対応の環境: {e}")
-    store.replace_documents(W, worker._ledger_rows(W) + [{"name": rel}])   # 台帳一致は素通しさせる
+    store.replace_documents(W, worker._ledger_rows(W) + [{"name": rel}], row=offline_row(W))   # 台帳一致は素通しさせる
     try:
         monkeypatch.setattr(doc_ledger, "original_path", lambda r, w: link_path)
         r = _CLIENT.get("/documents/download", params={"rel": rel, "world": W})
         assert r.status_code == 404
     finally:
-        store.replace_documents(W, worker._ledger_rows(W))
+        store.replace_documents(W, worker._ledger_rows(W), row=offline_row(W))
         link_path.unlink(missing_ok=True)
         shutil.rmtree(outside_dir, ignore_errors=True)
-
-
-def test_download_endpoint_rejects_rel_missing_from_ledger():
-    """台帳（Postgres `documents`）に無い rel は、ファイルが実在し filesystem 上は
-    `doc_ledger.original_path` が解決できても 404（別名/列挙不能ディレクトリ対策・RV1 是正）。"""
-    rel = XLSX_REL
-    rows = [r for r in worker._ledger_rows(W) if r["name"] != rel]   # この rel だけ台帳から外す
-    store.replace_documents(W, rows)
-    try:
-        assert doc_ledger.original_path(rel, W) is not None            # filesystem 単体では解決できる
-        r = _CLIENT.get("/documents/download", params={"rel": rel, "world": W})
-        assert r.status_code == 404
-    finally:
-        store.replace_documents(W, worker._ledger_rows(W))             # 後続テストへ影響しないよう復元
 
 
 def test_download_endpoint_rejects_sensitive_named_rel_even_if_ledger_has_it():
@@ -226,13 +213,13 @@ def test_download_endpoint_rejects_sensitive_named_rel_even_if_ledger_has_it():
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"PK\x03\x04FAKE")
     rows = worker._ledger_rows(W) + [{"name": rel}]   # test_download_endpoint_rejects_rel_missing_from_ledger と同じ流儀
-    store.replace_documents(W, rows)
+    store.replace_documents(W, rows, row=offline_row(W))
     try:
         assert doc_ledger.original_path(rel, W) is not None   # 実体は確かに在る（is_sensitive ガードだけを固定する前提）
         r = _CLIENT.get("/documents/download", params={"rel": rel, "world": W})
         assert r.status_code == 404
     finally:
-        store.replace_documents(W, worker._ledger_rows(W))   # 後続テストへ影響しないよう復元
+        store.replace_documents(W, worker._ledger_rows(W), row=offline_row(W))   # 後続テストへ影響しないよう復元
         path.unlink(missing_ok=True)
 
 

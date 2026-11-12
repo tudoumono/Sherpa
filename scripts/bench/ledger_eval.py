@@ -28,7 +28,9 @@ except ImportError:
     import ledger_scoring as scoring
 
 ROOT = Path(__file__).resolve().parents[2]
-STYLES = scoring.STYLES
+STYLES = tuple(s for s in scoring.STYLES if s != "plan_gate")
+# 製品に調査の方式を選ぶ口は無い（標準・OpenAI 系は C 固定）。A（json）はこの道具から回せない。
+RUNNABLE_STYLES = ("plan_main",)
 SYSTEMS = {"code": 10, "multihop": 15, "jemhop": 10}
 DEFAULT_MODEL = "gpt-5.6-sol"
 MODEL = DEFAULT_MODEL
@@ -528,18 +530,17 @@ def measure(answer: dict, stats: dict | None, timeline: dict | None) -> dict:
     plan = (stats or {}).get("plan") or {}
     style = (stats or {}).get("style")
     attempts = (stats or {}).get("attempts")
-    requests = (stats or {}).get("ledger_review_requests") if style == "json" else plan.get("review_requests")
+    requests = (stats or {}).get("ledger_review_requests") if style == "json" else None
     entries = (stats or {}).get("json_review_entries") if style == "json" else plan.get("plan_review_lines")
     return {"unconfirmed_rate": len(unconfirmed) / total
             if isinstance(unconfirmed, list) and total else None,
             "unconfirmed_count": len(unconfirmed) if isinstance(unconfirmed, list) else None,
             "population_count": total,
-            "review_requests": requests if style in ("json", "plan_gate") else None,
+            "review_requests": requests if style == "json" else None,
             "review_entries": entries if style in ("json", "plan_main") else None,
-            "review_count": requests if style == "plan_gate" else entries,
-            "review_rounds": (inv.get("review") or {}).get("rounds") if style == "json"
-            else plan.get("review_rounds") if style == "plan_gate" else plan.get("plan_review_lines"),
-            "review_growth_rounds": plan.get("review_rounds") if style == "plan_gate" else None,
+            "review_count": entries,
+            "review_rounds": (inv.get("review") or {}).get("rounds") if style == "json" else plan.get("plan_review_lines"),
+            "review_growth_rounds": None,
             "spawn_count": sum(v for k, v in tools.items() if k.endswith("spawn_agent")) if agents else None,
             "child_threads": sum(a.get("role") == "child" for a in agents) if agents else None,
             "auto_continue_count": (stats or {}).get("auto_continue_count"),
@@ -614,10 +615,11 @@ class Runner:
                 raise EvalError("--questions に未知の質問があります: " + ", ".join(sorted(set(self.only_questions) - known)))
             self.questions = [q for q in self.questions if str(q["id"]) in self.only_questions
                               or f'{q["system"]}/{q["id"]}' in self.only_questions]
-        self.styles = tuple(getattr(args, "styles", None) or STYLES)
+        self.styles = tuple(getattr(args, "styles", None) or RUNNABLE_STYLES)
+        if set(self.styles) - set(RUNNABLE_STYLES):
+            raise EvalError("--styles に回せない構成があります（回せるのは " + ", ".join(RUNNABLE_STYLES) + "）")
         self.rep = getattr(args, "rep", None)
         self.allow_dirty = bool(getattr(args, "allow_dirty", False))
-        self.gate_dry_run = bool(getattr(args, "gate_dry_run", False))
         self.model = getattr(args, "model", None) or DEFAULT_MODEL
         self.auth_mode = getattr(args, "auth_mode", None)
         self.codex_home = getattr(args, "codex_home", None)
@@ -682,8 +684,6 @@ class Runner:
         if self.allow_dirty:  # 指定しないときの指紋を変えないため、差分を許したときだけ条件に入れる
             conditions["diff_sha256"] = self.diff_sha256
             conditions["changed_files"] = dirty["changed_files"]
-        if self.gate_dry_run:  # 指定しないときの指紋を変えないため、指定したときだけ条件に入れる
-            conditions["gate_dry_run"] = True
         if self.auth_mode is not None:  # 既存の結果（記録なし）の指紋を変えないため、明示されたときだけ条件に入れる
             conditions["auth_mode"] = self.auth_mode
         fingerprint = hashlib.sha256(json.dumps(conditions, sort_keys=True).encode()).hexdigest()
@@ -708,13 +708,11 @@ class Runner:
         env = dict(self.env)
         if getattr(self.args, "review_cap", None) is not None:
             env["SHERPA_LEDGER_REVIEW_CAP"] = str(self.args.review_cap)
-        if getattr(self, "gate_dry_run", False):
-            env["SHERPA_LEDGER_GATE_DRYRUN"] = "1"
         return env
 
     def server_env(self, style: str) -> dict:
         """API サーバに渡す環境変数。"""
-        return {**self.base_env(), "SHERPA_LEDGER_STYLE": style, "SHERPA_LEDGER_EVAL_DIR": str(self.out / "records" / style)}
+        return {**self.base_env(), "SHERPA_LEDGER_EVAL_DIR": str(self.out / "records" / style)}
 
     def command(self, argv: list[str], *, timeout=180) -> str:
         result = subprocess.run(argv, cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=timeout)
@@ -804,10 +802,12 @@ class Runner:
         self.check_database()
         require_free_port(self.args.api_port)
         env = self.server_env(style)
-        with (self.state / f"api-{style}.log").open("ab") as log:
+        with (self.state / f"api-{style}.log").open("ab") as log, \
+                (self.state / f"ingest-worker-{style}.log").open("ab") as wlog:
             proc = subprocess.Popen([sys.executable, "-m", "uvicorn", "sherpa.api:app", "--host", "127.0.0.1",
                                      "--port", str(self.args.api_port), "--workers", "1", "--no-access-log"],
                                     cwd=ROOT, env=env, stdout=log, stderr=log)
+            worker = None
             try:
                 deadline = time.monotonic() + 120
                 while True:
@@ -821,11 +821,21 @@ class Runner:
                     if time.monotonic() > deadline:
                         raise EvalError("API 起動待ちが上限を超えました")
                     time.sleep(1)
+                # 取り込みは API とは別の取り込みワーカーが拾う
+                worker = subprocess.Popen([sys.executable, "-m", "sherpa.ingest.ingest_worker"],
+                                          cwd=ROOT, env=env, stdout=wlog, stderr=wlog)
                 self.api.login(self.secret)
                 dump(self.credential, self.secret)
                 self.credential.chmod(0o600)
                 yield
             finally:
+                if worker is not None:
+                    worker.terminate()
+                    try:
+                        worker.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        worker.kill()
+                        worker.wait()
                 proc.terminate()
                 try:
                     proc.wait(timeout=20)
@@ -867,7 +877,7 @@ class Runner:
         while time.monotonic() < deadline:
             runs = self.api.request("GET", f"/ingest/runs?world={self.world}")["runs"]
             row = next((r for r in runs if r["id"] == accepted["run_id"]), None)
-            if row and row.get("status") != "extracting":
+            if row and row.get("status") not in ("queued", "extracting"):
                 dump(self.out / "ingest.json", row)
                 if row["status"] not in ("auto_published", "auto_published_with_flags"):
                     raise EvalError("資料の取り込みが失敗しました（ingest.json 参照）")
@@ -1091,10 +1101,10 @@ class Runner:
                 rows = self.rows()
                 by_group = {(s, y): [r["wall_seconds"] for r in rows
                                     if r["style"] == s and r["system"] == y and r["counted"]]
-                            for s in STYLES for y in self.systems}
+                            for s in self.styles for y in self.systems}
                 estimate = sum(statistics.mean(times) * self.systems[y] for (s, y), times in by_group.items() if times)
                 dump(self.out / "pilot-estimate.json", {"fingerprint": self.fingerprint,
-                     "pilot_trials": sum(map(len, by_group.values())), "total_trials": len(STYLES) * sum(self.systems.values()),
+                     "pilot_trials": sum(map(len, by_group.values())), "total_trials": len(self.styles) * sum(self.systems.values()),
                      "estimated_total_seconds": estimate, "pilot_reused": True,
                      "estimated_remaining_seconds": max(0, estimate - sum(sum(v) for v in by_group.values())),
                      "group_mean_seconds": {f"{s}/{y}": statistics.mean(t) for (s, y), t in by_group.items() if t},
@@ -1253,12 +1263,10 @@ def main(argv=None) -> int:
                         help="認証の種類の明示（metadata に記録するだけ。認証ファイルの中身は見ない）")
     parser.add_argument("--allow-dirty", action="store_true",
                         help="追跡対象の未コミット変更を許す。HEAD と git diff HEAD の sha256・変更ファイルを条件に記録し、各段で同一を確かめる")
-    parser.add_argument("--gate-dry-run", action="store_true",
-                        help="B（plan_gate）の判定を記録だけして差し戻さない（SHERPA_LEDGER_GATE_DRYRUN=1 を API に渡す）。条件と指紋に入れる")
     parser.add_argument("--questions", type=id_list, default=None,
                         help="この起動で回す質問の id のコンマ区切り（system/id も可）。指紋には入れず、残りは同じ出力フォルダで後から回せる")
     parser.add_argument("--styles", type=style_list, default=None,
-                        help="回す構成と順番のコンマ区切り（例 json,plan_gate,plan_main。既定はこの順）")
+                        help="回す構成と順番のコンマ区切り（回せるのは plan_main だけ。既定も plan_main）")
     parser.add_argument("--rep", type=int, default=None, help="反復番号。metadata と各 result.json に記録する")
     parser.add_argument("--include-unreviewed", action="store_true",
                         help="needs_user_review の付いた問い（利用者の確認前の正解）も評価に含める")

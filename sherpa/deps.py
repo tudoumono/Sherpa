@@ -12,7 +12,7 @@ from pathlib import Path
 from fastapi import HTTPException, Request
 from pydantic import Field
 
-from sherpa import auth, store, worlds
+from sherpa import auth, path_rules, scope_infer, store, worlds
 from sherpa import scope as scope_mod
 
 _log = logging.getLogger("sherpa")
@@ -61,8 +61,16 @@ def _require_admin(user: dict) -> dict:
     return user
 
 
+# 台帳が無く資料フォルダを歩くしかない操作が、期限内に終わらなかったときの応答
+SCOPE_WALK_TIMEOUT_MESSAGE = "資料フォルダの一覧を時間内に取得できませんでした。取り込みが終わってから、もう一度お試しください"
+
+
 def _check_scope(world: str, scope_paths):
-    if not scope_mod.valid_scope_paths(world, scope_paths):
+    try:
+        ok = scope_mod.valid_scope_paths(world, scope_paths)
+    except scope_infer.ScopeWalkDeadlineExceeded:
+        raise HTTPException(503, SCOPE_WALK_TIMEOUT_MESSAGE) from None
+    if not ok:
         raise HTTPException(422, "不明な範囲（scope_paths）が指定されました")
 
 
@@ -104,25 +112,27 @@ def _remove_codex_session_dir(target: Path, base: Path) -> None:
     shutil.rmtree(target)
 
 
-def _delete_codex_sessions_for_conversation(uid: str, cid) -> None:
+def _delete_codex_sessions_for_conversation(uid: str, cid) -> bool:
     """会話削除に伴い、その会話の Codex resume セッション（`workspace/.codex-sessions/{cid}`）を即時削除する。
-    共有の soft delete 中でも削除する。fail-open（例外は投げずログ 1 行）。symlink はリンク自体だけ unlink する。
+    共有の soft delete 中でも削除する。例外は投げずログ 1 行を残し、消せなかったときは False を返す。symlink はリンク自体だけ unlink する。
     """
     try:
         udir = _USERS_DIR.resolve() / uid
         sessions_root = udir / "workspace" / ".codex-sessions"
         if sessions_root.is_symlink() or not sessions_root.is_dir():
-            return
+            return True
         sessions_root.resolve().relative_to(udir.resolve())
         target = sessions_root / str(cid)
         if target.is_symlink():
             target.unlink()
-            return
+            return True
         if not target.is_dir():
-            return
+            return True
         _remove_codex_session_dir(target, sessions_root)
+        return True
     except Exception as e:
         _log.warning("delete_codex_sessions_for_conversation: failed uid=%s cid=%s: %s", uid, cid, e)
+        return False
 
 
 def _ensure_initial_admin(ip_hash: str | None = None, user_agent: str | None = None) -> dict | None:
@@ -283,3 +293,13 @@ def neo4j_session():
     drv = _driver()
     with drv.session() as s:
         yield s
+
+
+def reject_excluded(world: str, rel: str, not_found_message: str) -> None:
+    """管理者が検索から外している資料は、台帳にあっても配らない（存在を示さず 404）。除外の設定を読めないときは 503。"""
+    try:
+        hidden = path_rules.rules_for(world).excluded(rel)
+    except path_rules.PathRulesUnavailable:
+        raise HTTPException(503, path_rules.UNAVAILABLE_MESSAGE) from None
+    if hidden:
+        raise HTTPException(404, not_found_message)

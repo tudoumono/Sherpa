@@ -11,11 +11,13 @@ OOXML を直接パースする（Office/LibreOffice 非依存）。
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import sqlite3
 import time
 import zipfile
 from collections import Counter
@@ -24,10 +26,20 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
 
-from .. import json_io
+from .. import derived_suffixes, json_io
 from ..env_int import env_int
-from . import background, encryption, mem_guard, substage
-from . import text_kind
+from ..store import replace_rows
+from ..store.replace_rows import ReplaceRow
+from . import background, derived_numbers, encryption, mem_guard, pptx_flat, substage
+from . import ocr_switch, text_kind
+from .observation_vocab import FILL_OPAQUE, FILL_UNKNOWN
+from .derived_carryover import keep_previous_outputs
+from .derived_swap import (
+    _RETIRED_SUFFIX, _STAGING_SUFFIX, PublishRollbackError, _move_into, _proc_rss_gib, _publish_staging,
+    _recover_interrupted_swap, _remove_path, derived_fail_warn_ratio)
+from .office_observation import (
+    _build_figure_texts, _build_observation_set, _build_vlm_observation_set, _load_ocr_observation_sets,
+    _merge_provenance_metadata, _vlm_observation_possible, build_observation_inputs, record_figure_notes)
 
 # MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
 _log = logging.getLogger("sherpa.ingest.convert")
@@ -426,10 +438,10 @@ def _current_human_md_sig() -> str:
 def _current_pdf_human_md_sig() -> str:
     """今の PDF 人向け MD（`human_md.render_pdf`／`render_pdf_without_text`）の版。PDF の変換キャッシュの鍵と、`rag_sidecars_missing` の再生成判定に使う。
 
-    OCR の有効/無効で文字の層が無いスキャン PDF の扱い（知らせの MD／失敗）が変わるため、版に含める。
+    OCR の形は環境変数だけで決める（`ocr_switch.convert_mode_on`）。管理画面の入切は含めない。
     """
     from . import human_md
-    return f"{human_md.PDF_HUMAN_MD_VERSION};ocr={'on' if ocr_enabled() else 'off'}"
+    return f"{human_md.PDF_HUMAN_MD_VERSION};ocr={'on' if ocr_switch.convert_mode_on() else 'off'}"
 
 
 _LEGACY_HUMAN_MD_EXT = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}
@@ -540,16 +552,52 @@ def _is_skipped_original(rp: Path, ext: str) -> bool:
     return _is_sensitive_original(rp, ext) or text_kind.is_noise(rp.name, ext)
 
 
+def _evidence_notes(path: Path, *, ir=None, slide_size=None, inline=False):
+    """人用 Markdown の注記（状態・関係・未解析／未対応の通知）の元になる Evidence IR を作る。作れなければ None（注記なしで続ける）。"""
+    from . import evidence_spike, human_md
+
+    try:
+        evidence = evidence_spike.extract(path, legacy_ir=ir)
+    except Exception:
+        _log.warning("人用 Markdown の注記に使う Evidence IR を作れませんでした: %s", path.name, exc_info=True)
+        return None
+    return human_md.EvidenceNotes(evidence, slide_size=slide_size, inline=inline)
+
+
+def _needs_object_notes(path: Path, ir, ext: str) -> bool:
+    """図形・画像・OLE・取り消し線のセルなど、注記を付ける対象が原本にありそうか（無いなら Evidence IR を作らない）。"""
+    try:
+        with zipfile.ZipFile(path) as z:
+            if ext == ".xlsx":
+                return (any(n.startswith(("xl/drawings/", "xl/embeddings/")) for n in z.namelist())
+                        or any(e.type == "strike_text"
+                               or (e.type == "table" and (e.source_map.get("hidden_rows") or e.source_map.get("hidden_columns")))
+                               for e in ir.elements))
+            data = z.read("word/document.xml")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return False
+    return any(token in data for token in (b"<w:drawing", b"<w:pict", b"<w:object", b"<mc:AlternateContent"))
+
+
 def _render_human_md(ir, path: Path, ext: str) -> str | None:
-    """docx/xlsx の document-ir から人間向け MD を作る（WMF/EMF 図の文字は原本パッケージから拾って添える）。"""
+    """docx/xlsx の document-ir から人間向け MD を作る（WMF/EMF 図の文字は原本パッケージから拾って添える）。
+
+    図形・画像・OLE などがあれば、Evidence IR から状態・関係・未解析／未対応の通知を作り、対象の位置に「※」の行で足す。
+    """
     from . import human_md, metafile_text
 
+    notes = _evidence_notes(path, ir=ir) if _needs_object_notes(path, ir, ext) else None
     if ext == ".docx":
-        return human_md.render_docx(ir, figure_texts=metafile_text.docx_figure_texts(path))
-    return human_md.render_xlsx(ir, figure_texts=metafile_text.xlsx_figure_texts(path))
+        docx_notes = None
+        if notes is not None:
+            with zipfile.ZipFile(path) as z:
+                docx_notes = human_md.docx_notes(z.read("word/document.xml"), notes)
+        return human_md.render_docx(ir, figure_texts=metafile_text.docx_figure_texts(path), notes=docx_notes)
+    return human_md.render_xlsx(ir, figure_texts=metafile_text.xlsx_figure_texts(path), notes=notes)
 
 
-def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
+@derived_numbers.rewrites_layers("md")
+def refresh_human_md(wd, derived, *, row: ReplaceRow, world: str | None = None) -> dict:
     """人間向け `{rel}.md` だけの軽量再生成。
 
     `human_md_sig_drift` が対象とする rel だけを選び、document-ir を作り直して `human_md.render_docx`/`render_xlsx` へ渡し、`{rel}.md` だけを書き換える
@@ -565,6 +613,7 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
 
     if "ooxml" not in _arms.enabled_arm_names():
         return {"human_md_generated": 0, "human_md_failed": 0, "human_md_failures": []}
+    derived_numbers.begin(row, "md")
     wd = Path(wd).resolve()
     dr = Path(derived)
     dr_rag = _sibling_layer_dir(dr, "rag")
@@ -754,15 +803,17 @@ def _archive_also_root(world: str | None) -> Path | None:
 
 
 def _resolve_ocr_observation_dir(world: str | None) -> Path | None:
-    """`world` の公開中 OCR 観測ディレクトリ（無効/未指定/未公開は None）。
+    """`world` の公開中 OCR 観測ディレクトリ（環境変数で OCR を止めている/未指定/未公開は None）。
 
+    入切どちらでも、公開中の世代と一致する観測があればそれを、無ければ最後に公開した観測を返す（新しい世代の観測が公開されるまで
+    印を動かさず、入切の切り替えだけで rag.md を作り直さない）。文書ごとの `source_content_hash` の照合は読む側が行う。
     `worlds.observation_dir` は `derived_dir` と物理 root を分ける（隔離 OCR worker への read-only 境界）ため、
     `world` 文字列でしか辿れない。循環を避けて `worlds` を遅延 import する。
     """
-    if not world or not ocr_enabled():
+    if not world or not ocr_switch.convert_mode_on():
         return None
     from .. import worlds
-    return worlds.observation_current_dir(world)
+    return worlds.observation_current_dir(world) or worlds.observation_latest_dir(world)
 
 
 def _ocr_observation_marker_for(obs_dir: Path | None) -> str | None:
@@ -926,153 +977,6 @@ def _extract_evidence_assets(
     return written
 
 
-def _build_figure_texts(extracted_evidence, assets_dir: Path,
-                        drops: dict | None = None) -> dict[str, list[list[str]]]:
-    """WMF/EMF の図の描画命令に載っている文字を、図（Evidence 要素）ごとに取り出す。
-    `drops`（省略可）を渡すと、行数・文字数の上限で落とした分と上限に達した図・除いたビットマップの数を足す（本文は変えない・図 1 つにつき 1 回数える）。
-
-    OCR の有効/無効や完了に依存せず、抽出済み assets だけから決定的に作る。失敗は「この文書の図の
-    文字なし」へ縮退し、rag.md の生成は止めない。
-    """
-    from . import metafile_text, ocr_router
-
-    try:
-        paths: dict[str, str] = {}
-        for binding in ocr_router.inventory_assets(assets_dir):
-            if binding.parent_sha256 is None and not binding.is_readable_raster():
-                paths.setdefault(binding.asset_sha256, binding.relative_path)
-        if not paths:
-            return {}
-        cache: dict[str, list[str]] = {}
-        result: dict[str, list[list[str]]] = {}
-        for element in extracted_evidence.elements:
-            for candidate in ocr_router._raster_candidates(element):
-                raw = candidate.get("asset_sha256")
-                if not isinstance(raw, str):
-                    continue
-                digest = raw.strip().lower()
-                digest = digest if digest.startswith("sha256:") else "sha256:" + digest
-                relative = paths.get(digest)
-                if relative is None:
-                    continue
-                if digest not in cache:
-                    content = metafile_text.read_asset_content(assets_dir.joinpath(*relative.split("/")))
-                    cache[digest] = content.lines if content is not None else []
-                    if drops is not None and content is not None:
-                        for key, n in (("lines_dropped", content.lines_dropped),
-                                       ("chars_dropped", content.chars_dropped),
-                                       ("figures_text_capped", int(content.text_items_capped)),
-                                       ("figures_bitmaps_capped", int(content.bitmaps_capped)),
-                                       ("bitmaps_excluded", content.bitmaps_excluded)):
-                            if n:
-                                drops[key] = drops.get(key, 0) + n
-                if cache[digest]:
-                    result.setdefault(element.element_id, []).append(cache[digest])
-        return result
-    except Exception:
-        _log.warning("図の中の文字の抽出に失敗しました（この文書では出さずに継続）", exc_info=True)
-        return {}
-
-
-def _vlm_observation_possible() -> bool:
-    """`vision` が有効アームにあり VLM が実効利用可か（False なら `_build_vlm_observation_set` は VLM を呼ばない）。"""
-    from . import arms as _arms
-    from .arms import vision_arm
-
-    return "vision" in set(_arms.enabled_arm_names()) and vision_arm.resolve_vlm() is not None
-
-
-def _build_vlm_observation_set(extracted_evidence, rel: str, assets_dir: Path):
-    """`vision` が有効かつ VLM 実効可のときだけ、canonical が読めない画像要素を補足観測する。
-
-    既定（`vision` が有効アームに無い、または VLM が実効利用不可）は None＝`evidence_render.render(observation_set=None)` と同じ。
-    候補選定は `ocr_router.build_manifest` を呼び直すだけで、`.ocr_route.json` とは独立。
-    `asset_root` は直前に抽出済みの `{rel}.assets/`。
-    """
-    from . import ocr_router
-    from .arms import vision_arm
-
-    if not _vlm_observation_possible():
-        return None
-    assets = ocr_router.inventory_assets(assets_dir)
-    if not assets:
-        return None
-    try:
-        manifest = ocr_router.build_manifest(extracted_evidence, source_rel_path=rel, assets=assets)
-    except ValueError:
-        return None
-    decisions = [
-        item for item in manifest.decisions if item.status == "selected" and item.input_kind == "asset"
-    ]
-    if not decisions:
-        return None
-    try:
-        return vision_arm.build_asset_observations(
-            extracted_evidence, decisions=decisions, asset_root=assets_dir)
-    except Exception:
-        # 補足観測は任意。VLM/Set 構築の想定外失敗で Canonical の rag.md 生成を巻き添えにしない
-        _log.warning(
-            "VLM 補足観測の生成に失敗しました（Canonical の生成は継続）: %s", rel, exc_info=True)
-        return None
-
-
-def _load_ocr_observation_sets(extracted_evidence, rel: str, obs_dir: Path | None) -> list:
-    """`obs_dir`（公開中 OCR 観測ディレクトリ）から、この `rel` 分の Observation Set 群を読む。
-
-    OCR は隔離 worker が非同期に書く別成果物（`{rel}.ai_observations.jsonl`・1 job＝1 行）。
-    各 Set は `ai_observation.from_json_str(..., ir=extracted_evidence)` で `source_content_hash` が今の Evidence と一致することを再検証し、
-    古い観測は弾く。読めない/検証失敗は「この文書の OCR 観測なし」へ縮退する。
-    """
-    if obs_dir is None:
-        return []
-    from . import ai_observation
-
-    rel_posix = PurePosixPath(rel.replace("\\", "/"))
-    base = obs_dir.joinpath(*rel_posix.parts)
-    jsonl_path = Path(str(base) + ".ai_observations.jsonl")
-    if not jsonl_path.is_file():
-        return []
-    sets = []
-    try:
-        with jsonl_path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                line = line.strip()
-                if not line:
-                    continue
-                sets.append(ai_observation.from_json_str(line, ir=extracted_evidence))
-    except (OSError, ValueError):
-        _log.warning(
-            "OCR 観測 Set の読込/検証に失敗しました（VLM のみで rag.md を生成します）: %s",
-            rel, exc_info=True)
-        return []
-    return sets
-
-
-def _build_observation_set(extracted_evidence, rel: str, assets_dir: Path, *, obs_dir: Path | None = None,
-                           with_vlm: bool = True):
-    """VLM（同期）と OCR（非同期・公開済み分）の観測 Set を合流し、`evidence_render.render` へ渡す 1 つの Set にする。
-    `with_vlm=False` は VLM を呼ばない（先読みの子用。親が VLM の補足観測が起きないと判定済みのとき）。
-
-    どちらも無ければ None。片方だけなら合成せずそのまま返す。両方あるときだけ `merge_sets` で畳み、合流が失敗したら VLM 単独へ縮退する。
-    """
-    vlm_set = _build_vlm_observation_set(extracted_evidence, rel, assets_dir) if with_vlm else None
-    ocr_sets = _load_ocr_observation_sets(extracted_evidence, rel, obs_dir)
-    candidates = list(ocr_sets)
-    if vlm_set is not None:
-        candidates.append(vlm_set)
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0]
-    from . import ai_observation
-    try:
-        return ai_observation.merge_sets(candidates, ir=extracted_evidence)
-    except Exception:
-        _log.warning(
-            "VLM/OCR 観測 Set の合流に失敗しました（VLM 単独へ縮退します）: %s", rel, exc_info=True)
-        return vlm_set
-
-
 def _render_evidence_for_prefetch(path: Path, rel: str, evidence, assets_dir: Path, obs_dir: Path | None):
     """先読みの子で動く。① evidence.json の gzip ② 素材の書出し ③ OCR 観測（VLM なし） ④ 図の中の文字 ⑤ 描画と chunks・context.json の直列化。
     ファイルは素材以外書かず、親が書く中身を返す（`_generate_evidence` と同じ順・同じ関数）。
@@ -1083,9 +987,9 @@ def _render_evidence_for_prefetch(path: Path, rel: str, evidence, assets_dir: Pa
 
     evidence_gz = evidence_ir.to_gzip_bytes(evidence)
     _extract_evidence_assets(path, path, evidence, assets_dir, rel)
-    observation_set = _build_observation_set(evidence, rel, assets_dir, obs_dir=obs_dir, with_vlm=False)
     figure_drops: dict = {}
-    figure_texts = _build_figure_texts(evidence, assets_dir, figure_drops)
+    observation_set, figure_texts = build_observation_inputs(
+        evidence, rel, assets_dir, obs_dir, figure_drops, with_vlm=False)
     rendered = evidence_render.render(
         evidence, source_name=rel, observation_set=observation_set, figure_texts=figure_texts)
     return Rendered(evidence_gz, rendered.markdown, evidence_render.chunks_gzip_bytes(rendered.chunks),
@@ -1153,8 +1057,6 @@ def _build_source_failure_evidence(source_path: Path, *, detail: dict | None = N
 # ---- 安全な差し替え（世代公開） ----
 # 公開中の派生ディレクトリを先に全消しせず、別ディレクトリへ作り切ってから改名 2 回で差し替える。
 # 失敗時はステージングを捨てるだけで公開中の内容は無傷。
-_STAGING_SUFFIX = ".staging"
-_RETIRED_SUFFIX = ".retired"
 
 
 # ---- 派生物の 3 層（md／rag／ir）----
@@ -1196,19 +1098,11 @@ _LAYER_FOR_SIDECAR_SUFFIX = {
 }
 # 公開中の派生物が「どの資料フォルダの内容から作られたか」を刻む印（`derived_generation` 参照）
 _WORLD_SIG_MARKER = ".world_sig"
-_OCR_ENABLED_ENV = "SHERPA_OCR_ENABLED"
 
 
 def ocr_enabled() -> bool:
-    """OCR 観測が有効か。既定 ON。
-
-    取り込み側で有効なのはルート生成（どのラスタを読むかを決めるだけ）。読み取り本体は隔離ワーカーが行う。
-    `SHERPA_OCR_ENABLED=0` で止められる。
-    """
-    raw = os.environ.get(_OCR_ENABLED_ENV)
-    if raw is None or not raw.strip():
-        return True
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    """OCR の対象づくり・予約が有効か（`ocr_switch.enabled`）。読み取り本体は隔離ワーカーが行う。"""
+    return ocr_switch.enabled()
 
 
 def write_ocr_route_sig_marker(dr) -> None:
@@ -1227,7 +1121,8 @@ def ocr_route_refresh_needed(derived) -> bool:
     return ocr_enabled() and ocr_router.ocr_route_sig_drift(derived)
 
 
-def refresh_ocr_routes(derived, *, world: str, generation_id: str) -> dict:
+@derived_numbers.rewrites_layers("ir", derived_at=0)
+def refresh_ocr_routes(derived, *, row: ReplaceRow, world: str, generation_id: str) -> dict:
     """ルート版が古い／欠けている `.ocr_route.json` だけを、公開中の Evidence と assets から作り直す。
 
     あわせて全ルートについて、「読めない画像形式」として対象外の入力に残っている過去の queued/failed job を cancelled へ終端する。
@@ -1239,6 +1134,7 @@ def refresh_ocr_routes(derived, *, world: str, generation_id: str) -> dict:
     dr = Path(derived)
     dr_ir = _sibling_layer_dir(dr, "ir")
     dr_rag = _sibling_layer_dir(dr, "rag")
+    derived_numbers.begin(row, "ir")
     rewritten = failed = unavailable = 0
     for evidence_path in sorted(dr_ir.rglob("*.evidence.json")):
         rel = evidence_path.relative_to(dr_ir).as_posix()[: -len(".evidence.json")]
@@ -1300,8 +1196,8 @@ def _write_ocr_routes(stage_ir: Path, stage_rag: Path) -> dict:
 
 
 def _pdf_ocr_route_inputs(dr_ir: Path, dr_rag: Path, rel: str) -> tuple[int, object | None]:
-    """OCR が有効なとき、生成済みの `{rel}.evidence.json` から OCR の対象（selected）の入力数と Evidence を返す。無効・読めないときは `(0, None)`。"""
-    if not ocr_enabled():
+    """生成済みの `{rel}.evidence.json` から OCR の対象（selected）の入力数と Evidence を返す。環境変数で OCR を止めている・読めないときは `(0, None)`。管理画面の入切には左右されない。"""
+    if not ocr_switch.convert_mode_on():
         return 0, None
     from . import evidence_ir, ocr_router
     try:
@@ -1313,78 +1209,7 @@ def _pdf_ocr_route_inputs(dr_ir: Path, dr_rag: Path, rel: str) -> tuple[int, obj
     return sum(1 for d in manifest.decisions if d.status == "selected"), ir
 
 
-def _recover_interrupted_swap(target: Path) -> None:
-    """改名 2 回の間で中断した場合（公開中が無く退避先だけがある）に、退避先を公開中へ戻す。
-
-    - target 有り: 何もしない。
-    - target 無し・retired 無し: 初回ビルドのため何もしない。
-    - target 無し・retired 有り: retired を target へ rename して復旧する。rename に失敗したら（二重障害）例外を送出する。
-      握り潰すと後続の `_publish_staging` が retired（唯一残った旧世代）を削除し、派生物が全消失する。
-    """
-    retired = target.with_name(target.name + _RETIRED_SUFFIX)
-    if not target.exists() and retired.is_dir():
-        try:
-            retired.rename(target)
-        except OSError:
-            _log.error(
-                "派生物の差し替え中断からの復旧に失敗しました"
-                "（retired を保持したまま build を打ち切ります）: %s", target, exc_info=True)
-            raise
-        _log.warning(
-            "派生物の差し替えが中断していたため復旧しました: %s", target)
-
-
-def _publish_staging(staging: Path, target: Path) -> None:
-    """ステージングを公開中へ差し替える（旧公開分は削除）。同一ファイルシステム内の改名のみ。
-
-    後半の改名（staging→target）が失敗したら、retired→target で即時ロールバックしてから例外を再送出する。
-    ロールバック自体が失敗した場合は旧内容が retired に残るため、その旨をログに残す（次回 build の `_recover_interrupted_swap` が復旧を試みる）。
-    """
-    retired = target.with_name(target.name + _RETIRED_SUFFIX)
-    shutil.rmtree(retired, ignore_errors=True)
-    target_existed = target.exists()
-    if target_existed:
-        target.rename(retired)          # ここから下の rename までが唯一の窓（ミリ秒）
-    try:
-        staging.rename(target)
-    except OSError:
-        if target_existed:
-            try:
-                retired.rename(target)
-            except OSError:
-                _log.error(
-                    "派生物の差し替えに失敗し、旧公開分の復元にも失敗しました"
-                    "（derived root が消失した可能性）: %s", target, exc_info=True)
-        raise
-    shutil.rmtree(retired, ignore_errors=True)
-
-
-
-def _proc_rss_gib() -> float | None:
-    """自プロセスの RSS（GiB）。/proc/self/status の VmRSS を読む（Linux 専用・読めなければ None）。重い変換の前後でログへ出す。"""
-    try:
-        with open("/proc/self/status", encoding="ascii", errors="replace") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / (1024 * 1024)
-    except OSError:
-        pass
-    return None
-
-_DERIVED_FAIL_WARN_RATIO_DEFAULT = 0.1
-
-
-def derived_fail_warn_ratio() -> float:
-    """作れなかった文書がこの割合（候補に対して）を超えたら、管理画面で知らせる。env `SHERPA_DERIVED_FAIL_WARN_RATIO`（0〜1・既定 0.1）。"""
-    raw = os.environ.get("SHERPA_DERIVED_FAIL_WARN_RATIO", "").strip()
-    try:
-        v = float(raw) if raw else _DERIVED_FAIL_WARN_RATIO_DEFAULT
-    except ValueError:
-        return _DERIVED_FAIL_WARN_RATIO_DEFAULT
-    return v if 0.0 <= v <= 1.0 else _DERIVED_FAIL_WARN_RATIO_DEFAULT
-
-
-def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = None,
+def build_derived(wd, derived, *, row: ReplaceRow, progress: Callable[[int, int], None] | None = None,
                   world_sig: str | None = None, world: str | None = None, walk=None) -> dict:
     """公開中の派生物を壊さずに作り直す薄いラッパ。
 
@@ -1428,7 +1253,7 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
         except OSError as e:                         # 署名が刻めなければ後段は「不明」として動かない
             rep["world_sig_error"] = f"{e.__class__.__name__}"
     # 完了 Gate: 縮退すらできなかった文書（rag/evidence/想定外の失敗）があっても公開して先（全文検索・埋め込み）へ進む。
-    # 作れなかった文書は失敗の一覧に載り、版の印を確定しないので次回 sync が作り直す。候補の一定割合を超えたら知らせる。
+    # 作れなかった文書は旧い派生物を引き継ぎ（無ければ欠く）、失敗の一覧に載せる。印を確定しないので次回 sync が作り直す。
     # `document_ir_failed` はここに含めない（failed notice へ縮退する正常系。`.document_ir_sig` を確定せず次回 sync が再試行する）。
     failing = {key: rep.get(key) or 0 for key in (
         "rag_failed", "evidence_ir_failed", "unhandled_failed") if rep.get(key)}
@@ -1436,17 +1261,20 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
         total = rep.get("candidate_total") or 0
         rep["derived_partial"] = dict(failing)
         rep["derived_partial_many"] = total <= 0 or sum(failing.values()) > total * derived_fail_warn_ratio()
-        _log.warning("一部の文書の派生物を作れませんでした（その文書だけ欠いたまま公開し、次の更新で作り直します）: %s・候補 %d 件",
-                     ",".join(f"{k}={v}" for k, v in sorted(failing.items())), total)
+        rep["derived_kept_previous"] = keep_previous_outputs(
+            rep, {"md": published, "rag": published_rag, "ir": published_ir},
+            {"md": staging, "rag": staging_rag, "ir": staging_ir}, lambda rel: _publish_targets(derived, rel)[1])
+        _log.warning("一部の文書の派生物を作れませんでした（旧い写しを残して公開し、次の更新で作り直します）: %s・候補 %d 件・旧い写しを残した %d 件",
+                     ",".join(f"{k}={v}" for k, v in sorted(failing.items())), total, len(rep["derived_kept_previous"]))
     # 3 層それぞれ独立に改名 2 回で差し替える。跨ぎでの原子性は無く、1 層だけ失敗した場合は次回 sync の drift 検知/全再構築が自己修復する。
     # 1 層の失敗が他層の公開試行を止めない（`try/except` を層ごとに独立させる）。
     publish_failures: list[str] = []
     publish_step = substage.begin("publish", "読める写しを公開しています")
-    for staging_dir, published_dir in (
-        (staging_ir, published_ir), (staging_rag, published_rag), (staging, published),
+    for staging_dir, published_dir, item in (
+        (staging_ir, published_ir, "ir"), (staging_rag, published_rag, "rag"), (staging, published, "md"),
     ):
         try:
-            _publish_staging(staging_dir, published_dir)
+            _publish_staging(staging_dir, published_dir, row=row, item=item)
         except OSError as e:
             # `_publish_staging` は後半 rename 失敗時に旧公開中（retired）を published へロールバックする。
             # ロールバックも失敗した場合は published が不在のまま（旧内容は retired に残る・`_recover_interrupted_swap` 参照）。
@@ -1464,9 +1292,9 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
 # 設計: docs/design/rag.md「失敗した資料のやり直し」
 # 公開中の md／rag／ir のうち 1 つの rel に属するファイル（`.derived.json` は最後に置き換えるので別に扱う）。
 _REL_FILE_SUFFIXES = {
-    "ir": (".document.json", ".evidence.json", ".context.json", ".ocr_route.json"),
-    "rag": (".rag.md", ".rag_chunks.jsonl"),
-    "md": (".md", ".md.meta.json"),
+    "ir": derived_suffixes.IR,
+    "rag": derived_suffixes.RAG,
+    "md": derived_suffixes.MD,
 }
 
 
@@ -1485,13 +1313,14 @@ def published_world_sig(derived) -> str | None:
         return None
 
 
-def drop_conversion_cache(derived, rel: str) -> bool:
+def drop_conversion_cache(derived, rel: str, *, row: ReplaceRow) -> bool:
     """`rel` の変換のキャッシュ（ファイルごとの変換結果と旧形式の変換）を消す。消せなければ False。"""
     from .arms import legacy_convert
     dr = Path(derived)
     meta_path, content_dir = _conv_cache_slot(_conv_cache_root_for(dr), rel)
     try:
         meta_path.unlink(missing_ok=True)
+        _conv_cache_index_remove(_conv_cache_root_for(dr), rel)
         for d in (content_dir, content_dir.with_name(content_dir.name + ".tmp")):
             if d.exists():
                 shutil.rmtree(d)
@@ -1519,7 +1348,7 @@ def discard_staging(derived) -> None:
         shutil.rmtree(d, ignore_errors=True)
 
 
-def derive_one(wd, derived, rp: Path, rel: str, *, world: str | None = None) -> dict:
+def derive_one(wd, derived, rp: Path, rel: str, *, row: ReplaceRow, world: str | None = None) -> dict:
     """1 ファイルだけを、全体の作り直しと同じファイルごとの処理でステージングへ変換する（公開中には触れない）。
 
     続けて呼び出し元が `publish_one`（公開）か `discard_staging`（破棄）を呼ぶ。返値は `build_derived` と同じ形の要約。
@@ -1537,24 +1366,6 @@ def derive_one(wd, derived, rp: Path, rel: str, *, world: str | None = None) -> 
 _RECONVERT_BACKUP_SUFFIX = ".reconvert-bak"
 
 
-class PublishRollbackError(OSError):
-    """1 ファイルの差し替えの途中で失敗し、前の状態へも戻せなかった。"""
-
-
-def _remove_path(p: Path) -> None:
-    """ファイルかディレクトリを消す（無ければ何もしない）。"""
-    if p.is_dir() and not p.is_symlink():
-        shutil.rmtree(p)
-    else:
-        p.unlink(missing_ok=True)
-
-
-def _move_into(src: Path, dst: Path) -> None:
-    """ステージングの新しい出力を公開中の場所へ移す（同じファイルシステムの中の改名）。"""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    src.rename(dst)
-
-
 def _publish_targets(derived, rel: str) -> tuple[dict, list]:
     """`publish_one` が置き換える公開中の層の場所と、rel の分の名前の並び（ir→rag→md、`.derived.json` は最後）。"""
     staging_md = _staging_dirs(derived)[0]
@@ -1562,14 +1373,14 @@ def _publish_targets(derived, rel: str) -> tuple[dict, list]:
     roots = {"md": published, "rag": _sibling_layer_dir(published, "rag"),
              "ir": _sibling_layer_dir(published, "ir")}
     names = [(layer, rel + suffix) for layer in ("ir", "rag", "md") for suffix in _REL_FILE_SUFFIXES[layer]]
-    names.insert(len(_REL_FILE_SUFFIXES["ir"]) + len(_REL_FILE_SUFFIXES["rag"]), ("rag", rel + ".assets"))
+    names.insert(len(_REL_FILE_SUFFIXES["ir"]) + len(_REL_FILE_SUFFIXES["rag"]), ("rag", rel + derived_suffixes.ASSETS))
     # 回答時に描いたページ画像（pdf_page_image の置き場所）も、差し替えで古い原本の分を残さない
-    names.insert(len(_REL_FILE_SUFFIXES["ir"]) + len(_REL_FILE_SUFFIXES["rag"]) + 1, ("rag", rel + ".pages"))
+    names.insert(len(_REL_FILE_SUFFIXES["ir"]) + len(_REL_FILE_SUFFIXES["rag"]) + 1, ("rag", rel + derived_suffixes.PAGES))
     names.append(("ir", rel + _DERIVED_MANIFEST_SUFFIX))
     return roots, names
 
 
-def restore_reconvert_backups(derived, rel: str) -> int:
+def restore_reconvert_backups(derived, rel: str, *, row: ReplaceRow) -> int:
     """前の差し替えが途中で止まって残った rel の控え（`*.reconvert-bak`）を、公開中の場所へ戻す（戻した数を返す）。
 
     控えがあれば、その場所の今のものを消して控えを元の名前へ戻す。失敗は OSError のまま伝える。
@@ -1586,24 +1397,26 @@ def restore_reconvert_backups(derived, rel: str) -> int:
     return restored
 
 
-def publish_one(derived, rel: str) -> None:
+def publish_one(derived, rel: str, *, row: ReplaceRow) -> None:
     """`derive_one` がステージングに作った rel の分で、公開中の md／rag／ir のその rel の分だけを置き換える。
 
     ① OCR が有効ならステージング上でルートを作る ② 層ごと（ir→rag→md、`.derived.json` は最後）に、公開中のものを
     同じ場所の控えへ改名してから新しい出力を移す（新しい出力に無いものは控えに退くだけで消える）
     ③ 途中で失敗したら、移した分を消して控えを全部元へ戻してから OSError を伝える（戻せなければ `PublishRollbackError`）
-    ④ 成功したら控えを消す ⑤ ステージングを捨てる。
+    ④ 成功したら控えを消す ⑤ ステージングを捨てる。層は ② の前に「入れ替えた」、④ の後に「古いものを消した」にする。
     """
     staging_md, staging_rag, staging_ir = _staging_dirs(derived)
     roots, names = _publish_targets(derived, rel)
     staged = {"md": staging_md, "rag": staging_rag, "ir": staging_ir}
     moved: list[tuple[Path, Path | None]] = []          # (公開中の場所, 控え〔元が無ければ None〕)
     try:
-        if ocr_enabled():
+        if ocr_switch.routes_wanted(derived):
             try:
                 _write_ocr_routes(staging_ir, staging_rag)
             except Exception:                        # OCR は任意＝変換の公開を巻き添えにしない
                 _log.warning("OCRルート生成に失敗しました（変換の公開は継続）: %s", rel, exc_info=True)
+        for layer in staged:
+            replace_rows.before_swap(row, row.world, layer)
         try:
             for layer, name in names:
                 src, dst = staged[layer] / name, roots[layer] / name
@@ -1635,6 +1448,8 @@ def publish_one(derived, rel: str) -> None:
                     _remove_path(bak)
                 except OSError:
                     _log.warning("差し替えの控えを消せませんでした: %s", bak, exc_info=True)
+        for layer in staged:
+            replace_rows.after_old_removed(row, row.world, layer)
     finally:
         discard_staging(derived)
 
@@ -1676,6 +1491,7 @@ def _check_partial_extraction(rp: Path, md: str, rel: str, document, out: list[d
 # ヒットしたら実変換を丸ごとスキップし、キャッシュ済みの派生一式をステージングへコピーする。
 # 失敗ファイル（notice へ縮退したもの）は対象外で、次回 sync が必ず再試行する。
 _CONV_CACHE_DIRNAME = "_conv_cache"
+_CONV_CACHE_CONTENT_INDEX = "content_index.sqlite3"
 # per-file キャッシュがミラーする sidecar 種別（`_LAYER_FOR_SIDECAR_SUFFIX` の部分集合）。
 # `.derived.json` は復元後に `_write_derived_sidecar_manifest` が毎回書き直し、`.ocr_route.json` は `build_derived` が資料フォルダ単位で書くため対象外。
 _CONV_CACHE_SIDECAR_SUFFIXES = (
@@ -1714,9 +1530,84 @@ def _conv_cache_source_key(rp: Path, pipeline_sig: str) -> str | None:
         st = rp.stat()
     except OSError:
         return None
-    if rp.suffix.lower() == ".pdf":
-        pipeline_sig = f"{pipeline_sig};pdf_human_md={_current_pdf_human_md_sig()}"
+    pipeline_sig = _conv_cache_pipeline_sig_for(rp, pipeline_sig)
     return f"{resolved}|{st.st_size}|{st.st_mtime_ns}|{st.st_ctime_ns}|{pipeline_sig}"
+
+
+def _conv_cache_pipeline_sig_for(rp: Path, pipeline_sig: str) -> str:
+    """原本種別固有の署名を含む、この原本の変換キャッシュ署名。"""
+    if rp.suffix.lower() == ".pdf":
+        return f"{pipeline_sig};pdf_human_md={_current_pdf_human_md_sig()}"
+    return pipeline_sig
+
+
+def _conv_cache_content_hash(rp: Path) -> str | None:
+    """原本 bytes の SHA-256。読めなければ内容一致キャッシュを使わない。"""
+    digest = hashlib.sha256()
+    try:
+        with rp.open("rb") as stream:
+            while block := stream.read(1024 * 1024):
+                digest.update(block)
+    except OSError:
+        return None
+    return "sha256:" + digest.hexdigest()
+
+
+def _conv_cache_index_connect(cache_root: Path, *, create: bool) -> sqlite3.Connection | None:
+    """内容ハッシュから現行スロットを引く二次索引。無い旧キャッシュは読み取り時に作らない。"""
+    path = cache_root / _CONV_CACHE_CONTENT_INDEX
+    if not create and not path.is_file():
+        return None
+    try:
+        if create:
+            cache_root.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path), timeout=5.0)
+        if create:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS slots ("
+                "content_hash TEXT NOT NULL, pipeline_sig TEXT NOT NULL, source_ext TEXT NOT NULL, "
+                "rel TEXT NOT NULL UNIQUE, PRIMARY KEY (content_hash, pipeline_sig, source_ext, rel))")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS slots_lookup "
+                "ON slots (content_hash, pipeline_sig, source_ext)")
+        return conn
+    except (OSError, sqlite3.Error):
+        _log.warning("変換結果キャッシュの内容索引を開けませんでした", exc_info=True)
+        return None
+
+
+def _conv_cache_index_put(cache_root: Path, rel: str, content_hash: str,
+                          pipeline_sig: str, source_ext: str) -> bool:
+    """rel の二次索引を最新の内容だけへ付け替える（best-effort）。"""
+    conn = _conv_cache_index_connect(cache_root, create=True)
+    if conn is None:
+        return False
+    try:
+        with conn:
+            conn.execute("DELETE FROM slots WHERE rel = ?", (rel,))
+            conn.execute(
+                "INSERT INTO slots (content_hash, pipeline_sig, source_ext, rel) VALUES (?, ?, ?, ?)",
+                (content_hash, pipeline_sig, source_ext, rel))
+        return True
+    except sqlite3.Error:
+        _log.warning("変換結果キャッシュの内容索引を更新できませんでした: %s", rel, exc_info=True)
+        return False
+    finally:
+        conn.close()
+
+
+def _conv_cache_index_remove(cache_root: Path, rel: str) -> None:
+    """rel を内容索引から外す（索引が無い旧キャッシュでは no-op）。"""
+    conn = _conv_cache_index_connect(cache_root, create=False)
+    if conn is None:
+        return
+    try:
+        with conn:
+            conn.execute("DELETE FROM slots WHERE rel = ?", (rel,))
+    except sqlite3.Error:
+        _log.warning("変換結果キャッシュの内容索引を削除できませんでした: %s", rel, exc_info=True)
+    finally:
+        conn.close()
 
 
 def _conv_cache_slot(cache_root: Path, rel: str) -> tuple[Path, Path]:
@@ -1734,6 +1625,11 @@ def _conv_cache_lookup(cache_root: Path, rel: str, want_key: str) -> tuple[dict,
     meta = json_io.read_json(meta_path, default=None)
     if not isinstance(meta, dict) or meta.get("key") != want_key:
         return None
+    return _conv_cache_validate_slot(meta, content_dir, rel)
+
+
+def _conv_cache_validate_slot(meta: dict, content_dir: Path, rel: str) -> tuple[dict, Path] | None:
+    """スロットのメタと内容が揃い、成功結果として再利用できるときだけ返す。"""
     rep_delta = meta.get("rep_delta")
     if not isinstance(rep_delta, dict) or not content_dir.is_dir():
         return None
@@ -1750,6 +1646,71 @@ def _conv_cache_lookup(cache_root: Path, rel: str, want_key: str) -> tuple[dict,
             and not rep_delta.get("password_protected") and legacy_failure is None):
         return None
     return rep_delta, content_dir
+
+
+def _conv_cache_content_lookup(cache_root: Path, content_hash: str, pipeline_sig: str,
+                               source_ext: str, *, exclude_rel: str | None = None) -> tuple[dict, Path, str] | None:
+    """内容・処理署名・拡張子が一致する現行スロットを返す。古い索引行は見つけた時点で外す。"""
+    conn = _conv_cache_index_connect(cache_root, create=False)
+    if conn is None:
+        return None
+    stale: list[str] = []
+    try:
+        rows = conn.execute(
+            "SELECT rel FROM slots WHERE content_hash = ? AND pipeline_sig = ? AND source_ext = ? ORDER BY rel",
+            (content_hash, pipeline_sig, source_ext)).fetchall()
+        for (slot_rel,) in rows:
+            if exclude_rel is not None and slot_rel == exclude_rel:
+                continue
+            meta_path, content_dir = _conv_cache_slot(cache_root, slot_rel)
+            meta = json_io.read_json(meta_path, default=None)
+            if (not isinstance(meta, dict) or meta.get("content_hash") != content_hash
+                    or meta.get("pipeline_sig") != pipeline_sig or meta.get("source_ext") != source_ext):
+                stale.append(slot_rel)
+                continue
+            hit = _conv_cache_validate_slot(meta, content_dir, slot_rel)
+            if hit is not None:
+                if stale:
+                    with conn:
+                        conn.executemany("DELETE FROM slots WHERE rel = ?", ((rel,) for rel in stale))
+                return hit[0], hit[1], slot_rel
+            stale.append(slot_rel)
+        if stale:
+            with conn:
+                conn.executemany("DELETE FROM slots WHERE rel = ?", ((rel,) for rel in stale))
+    except sqlite3.Error:
+        _log.warning("変換結果キャッシュの内容索引を読めませんでした", exc_info=True)
+    finally:
+        conn.close()
+    return None
+
+
+def _conv_cache_register_content(cache_root: Path, rel: str, content_hash: str,
+                                 pipeline_sig: str, source_ext: str, *, force_index: bool = False) -> bool:
+    """一次ヒットした旧スロットへ内容情報を補い、二次索引へ登録する。"""
+    meta_path, _content_dir = _conv_cache_slot(cache_root, rel)
+    meta = json_io.read_json(meta_path, default=None)
+    if not isinstance(meta, dict):
+        return False
+    rep_delta = meta.get("rep_delta")
+    if not isinstance(rep_delta, dict) or rep_delta.get("password_protected") or rep_delta.get("legacy_failure"):
+        return False
+    metadata_matches = (meta.get("content_hash") == content_hash
+                        and meta.get("pipeline_sig") == pipeline_sig
+                        and meta.get("source_ext") == source_ext)
+    if metadata_matches and not force_index:
+        return True
+    try:
+        if not _conv_cache_index_put(cache_root, rel, content_hash, pipeline_sig, source_ext):
+            return False
+        if not metadata_matches:
+            json_io.write_json_atomic(meta_path, {
+                **meta, "content_hash": content_hash, "pipeline_sig": pipeline_sig, "source_ext": source_ext,
+            })
+        return True
+    except OSError:
+        _log.warning("旧い変換結果キャッシュを内容索引へ登録できませんでした: %s", rel, exc_info=True)
+        return False
 
 
 # 旧形式の変換の失敗は、同じ原本でこの回数続けて失敗したときだけ、原本が変わるまでやり直さない（一時的な失敗は次の更新で再試行する）。
@@ -1812,6 +1773,58 @@ def _conv_cache_restore(content_dir: Path, rel: str, dr: Path, dr_rag: Path, dr_
         return False
 
 
+def _conv_cache_restore_content(content_dir: Path, cached_rel: str, rel: str,
+                                dr: Path, dr_rag: Path, dr_ir: Path, *, obs_dir: Path | None) -> bool:
+    """内容一致スロットのパス非依存物を共有し、パス依存物を rel 用に作り直す。"""
+    from . import context_ir, evidence_ir, evidence_render
+
+    targets = (
+        dr / (rel + ".md"), dr / (rel + ".md.meta.json"),
+        dr_rag / (rel + ".rag.md"), dr_rag / (rel + ".rag_chunks.jsonl"),
+        dr_ir / (rel + ".evidence.json"), dr_ir / (rel + ".context.json"),
+    )
+    assets_dst = dr_rag / (rel + ".assets")
+    try:
+        evidence_src = content_dir / "ir" / (cached_rel + ".evidence.json")
+        if not evidence_src.is_file():
+            return False
+        for suffix in (".md", ".md.meta.json"):
+            src = content_dir / "md" / (cached_rel + suffix)
+            if src.is_file():
+                dst = dr / (rel + suffix)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                _link_or_copy(src, dst)
+        evidence_dst = dr_ir / (rel + ".evidence.json")
+        evidence_dst.parent.mkdir(parents=True, exist_ok=True)
+        _link_or_copy(evidence_src, evidence_dst)
+        assets_src = content_dir / "rag" / (cached_rel + ".assets")
+        shutil.rmtree(assets_dst, ignore_errors=True)
+        if assets_src.is_dir():
+            shutil.copytree(assets_src, assets_dst, copy_function=_link_or_copy)
+        extracted = evidence_ir.read_json_file(evidence_dst)
+        observation_set = _build_observation_set(extracted, rel, assets_dst, obs_dir=obs_dir)
+        rendered = evidence_render.render(
+            extracted, source_name=rel, observation_set=observation_set,
+            figure_texts=_build_figure_texts(extracted, assets_dst))
+        rag_md = dr_rag / (rel + ".rag.md")
+        rag_md.parent.mkdir(parents=True, exist_ok=True)
+        json_io.write_text_atomic(rag_md, _stamp_rule_only_rag_markdown(rendered.markdown))
+        evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
+        context_ir.write_json_atomic(dr_ir / (rel + ".context.json"), rendered.context, extracted)
+        return True
+    except Exception:
+        _log.warning(
+            "内容一致の変換結果キャッシュを戻せませんでした（実変換へフォールバックします）: %s", rel,
+            exc_info=True)
+        for target in targets:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+        shutil.rmtree(assets_dst, ignore_errors=True)
+        return False
+
+
 def remove_document_json(derived_md_dir) -> tuple[int, int]:
     """公開中の `ir/` と変換結果キャッシュに残る `*.document.json` を消す。`(消した件数, 解放した大きさ)`。ハードリンクで同じ実体を共有するものは 1 つと数える。"""
     count = freed = 0
@@ -1833,7 +1846,8 @@ def remove_document_json(derived_md_dir) -> tuple[int, int]:
 
 
 def _conv_cache_store(cache_root: Path, rel: str, key: str, rep_delta: dict,
-                      dr: Path, dr_rag: Path, dr_ir: Path) -> None:
+                      dr: Path, dr_rag: Path, dr_ir: Path, *, content_hash: str | None = None,
+                      pipeline_sig: str | None = None, source_ext: str | None = None) -> None:
     """この rel の変換結果一式（成功時のみ呼ばれる）をキャッシュへ保存する（best-effort）。
 
     一時 dir へハードリンク（作れなければコピー）してから改名する。メタ JSON（鍵・rep_delta）は内容の改名が終わった後に書く（鍵一致だけがヒット判定の根拠のため）。
@@ -1843,6 +1857,7 @@ def _conv_cache_store(cache_root: Path, rel: str, key: str, rep_delta: dict,
     meta_path, content_dir = _conv_cache_slot(cache_root, rel)
     tmp_dir = content_dir.with_name(content_dir.name + ".tmp")
     try:
+        _conv_cache_index_remove(cache_root, rel)
         shutil.rmtree(tmp_dir, ignore_errors=True)
         wrote_any = False
         files: list[str] = []
@@ -1866,7 +1881,11 @@ def _conv_cache_store(cache_root: Path, rel: str, key: str, rep_delta: dict,
         meta_path.unlink(missing_ok=True)     # 守ること: 中身を入れ替える前に古い鍵を消す（途中で止まった枠を古い鍵で当てない）
         shutil.rmtree(content_dir, ignore_errors=True)
         tmp_dir.rename(content_dir)
-        json_io.write_json_atomic(meta_path, {"key": key, "rep_delta": rep_delta, "files": files})
+        meta = {"key": key, "rep_delta": rep_delta, "files": files}
+        if content_hash is not None and pipeline_sig is not None and source_ext is not None:
+            if _conv_cache_index_put(cache_root, rel, content_hash, pipeline_sig, source_ext):
+                meta.update(content_hash=content_hash, pipeline_sig=pipeline_sig, source_ext=source_ext)
+        json_io.write_json_atomic(meta_path, meta)
     except OSError:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         _log.warning(
@@ -1880,6 +1899,7 @@ def _conv_cache_drop(cache_root: Path, rel: str) -> None:
         meta_path.unlink(missing_ok=True)
     except OSError:
         return
+    _conv_cache_index_remove(cache_root, rel)
     shutil.rmtree(content_dir, ignore_errors=True)
     shutil.rmtree(content_dir.with_name(content_dir.name + ".tmp"), ignore_errors=True)
 
@@ -1916,11 +1936,7 @@ def _conv_cache_prune(cache_root: Path, seen_rels: set) -> None:
         rel = meta_path.relative_to(cache_root).as_posix()[: -len(".key.json")]
         if rel in seen_rels:
             continue
-        try:
-            meta_path.unlink(missing_ok=True)
-            shutil.rmtree(cache_root / (rel + ".d"), ignore_errors=True)
-        except OSError:
-            pass
+        _conv_cache_drop(cache_root, rel)
 
 
 def _measured(measured: dict | None, key: str, fn, rp: Path):
@@ -1933,14 +1949,16 @@ def _measured(measured: dict | None, key: str, fn, rp: Path):
 
 
 def _convert_summary_line(total: int, converted: int, cache_restored: int, failed: int, unsupported: int,
-                          failures: list[dict], document_ir_failures: list[dict]) -> str:
+                          failures: list[dict], document_ir_failures: list[dict], *,
+                          content_cache_restored: int = 0) -> str:
     """MD化の段の最後に出す 1 行。失敗は理由ごとの件数（利用者向けの理由名）で内訳を付ける。"""
     from .failure_reasons import REASON_CATALOG, classify
     counted = {f.get("doc") for f in failures}
     by_code: Counter = Counter(classify(f.get("reason")) for f in failures)
     by_code.update(classify(f.get("reason")) for f in document_ir_failures if f.get("doc") not in counted)
     breakdown = "・".join(f"{REASON_CATALOG[code]['label']} {n}" for code, n in by_code.most_common())
-    return (f"MD化が終わりました: 対象 {total} 件・変換 {converted} 件（うちキャッシュから {cache_restored} 件）"
+    return (f"MD化が終わりました: 対象 {total} 件・変換 {converted} 件（うちキャッシュから {cache_restored} 件・"
+            f"内容一致 {content_cache_restored} 件）"
             f"・失敗 {failed} 件{'（' + breakdown + '）' if breakdown else ''}・対象外 {unsupported} 件")
 
 
@@ -1973,17 +1991,21 @@ def _log_expected_failure(code: str, rel: str, detail: dict | None = None) -> No
         _log.warning("読み取れなかったため変換しません（種類: %s・資料名だけが検索に出ます）: %s", code, rel)
 
 
-def _precheck_target(rp: Path, ext: str, conv, measured: dict | None = None) -> tuple[str, str | None, dict | None]:
+def _precheck_target(rp: Path, ext: str, conv, measured: dict | None = None,
+                     *, password_protected: bool | None = None) -> tuple[str, str | None, dict | None]:
     """候補 1 件の変換前の判定。`("unsupported"|"guard"|"ok", 理由コード, 実測値)` を返す。
 
     `ext not in conv`＝未対応、サイズ/セル数/非圧縮サイズの入口ガードに掛かれば `guard`。ループ本体と先読みの計画が同じ判定を使う。
     `measured` は `_prefetch_heavy` と共有する測定結果の置き場（同じ原本の zip を 2 度開かない）。
+    `password_protected` は変換結果キャッシュの一次の鍵（パス・大きさ・更新時刻）が当たったときに、キャッシュに残した判定を渡す
+    （渡せば原本を開いて確かめない。None なら原本を読んで確かめる）。
     """
     if ext not in conv:
         return "unsupported", None, None
     if ext in OFFICE_EXT and _office_size_exceeded(rp, ext):
         return "guard", "size_exceeded", None
-    if ext in OFFICE_EXT and encryption.is_password_protected(rp, ext):
+    if ext in OFFICE_EXT and (password_protected if password_protected is not None
+                              else encryption.is_password_protected(rp, ext)):
         return "guard", "password_protected", None
     if ext == ".xlsx":
         # 圧縮爆弾ガード: st_size は圧縮後サイズのため、zip 内 dimension だけ見てセル数を見積もり、欠落/不正なら `<c ` の実カウントへフォールバックする。
@@ -2051,9 +2073,12 @@ def _plan_candidate(rp: Path, rel: str, ext: str, *, conv, cache_hit) -> tuple[b
         return False, None, None
 
 
-def _legacy_prefetch_items(targets, *, candidate, conv, cache_hit) -> list[tuple[Path, str]]:
-    """旧形式の先変換の対象（本体ループの順）。ループ本体と同じ判定（候補・秘匿/ノイズ・入口ガード・変換結果キャッシュのヒット）を通ったものだけ。"""
+def _legacy_prefetch_items(targets, *, candidate, conv, cache_hit, content_key=None) -> list[tuple[Path, str]]:
+    """旧形式の先変換の対象（本体ループの順）。ループ本体と同じ判定（候補・秘匿/ノイズ・入口ガード・変換結果キャッシュのヒット）を通ったものだけ。
+    `content_key` を渡すと、同じ（拡張子, 内容）は先頭だけを対象にする（後続は先頭の変換結果キャッシュを内容一致で使う）。
+    """
     items = []
+    seen: set[tuple[str, str]] = set()
     for rp, rel in targets:
         ext = rp.suffix.lower()
         if ext not in LEGACY_OFFICE_EXT or ext not in candidate or ext not in conv or _is_skipped_original(rp, ext):
@@ -2063,12 +2088,18 @@ def _legacy_prefetch_items(targets, *, candidate, conv, cache_hit) -> list[tuple
                 continue
         except Exception:
             continue                                      # 判定の失敗は本体ループが同じ判定で扱う
+        key = content_key(rp, rel) if content_key is not None else None
+        if key is not None:
+            if (ext, key) in seen:
+                continue
+            seen.add((ext, key))
         items.append((rp, rel))
     return items
 
 
-def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit, obs_dir=None, assets_root=None,
-                   threads: int = 1, precheck_memo: dict | None = None) -> list:
+def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit, content_key=None,
+                   obs_dir=None, assets_root=None, threads: int = 1,
+                   precheck_memo: dict | None = None) -> list:
     """先読みする対象。ループ本体と同じ判定（候補・ガード・変換キャッシュのヒット）を通り、ooxml／pdf_text が受理する前段変換なしのファイルだけ。
     重いファイル（`_prefetch_heavy`）は子へ渡さない。
 
@@ -2098,8 +2129,9 @@ def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit, obs_dir=None
             chunk = cands[i:i + _PLAN_CHUNK]
             for (rp, rel, ext), (ok, memo, size) in zip(
                     chunk, pool.map(_check, chunk) if pool is not None else map(_check, chunk)):
+                key = content_key(rp, rel) if ok and content_key is not None else None
                 if memo is not None and precheck_memo is not None:
-                    precheck_memo[rel] = memo
+                    precheck_memo[rel] = (*memo, key)
                 if not ok:
                     continue
                 try:
@@ -2111,7 +2143,8 @@ def _prefetch_jobs(targets, *, candidate, conv, enabled, cache_hit, obs_dir=None
                     jobs.append(Job(
                         rel=rel, path=str(rp), arm_name=arm.name, ext=ext, render=render,
                         assets_dir=str(assets_root / (rel + ".assets")) if render else None,
-                        obs_dir=str(obs_dir) if render and obs_dir is not None else None, size=size))
+                        obs_dir=str(obs_dir) if render and obs_dir is not None else None, size=size,
+                        content_key=f"{ext}\0{key}" if key is not None else None))
     return jobs
 
 
@@ -2150,13 +2183,14 @@ def _build_derived_staging_body(
     """`_build_derived_into_staging` の本体。`stack` には先読みのプールなど関数の終わりに閉じるものを積む。"""
     from .. import scope_infer as si
     # IRキーは早期 return（overlap/setup 失敗）でも同じ形で返す（レポート契約の一貫性）。
-    rep = {"converted": 0, "published_notice_count": 0, "failed": 0, "unsupported": 0,
+    rep = {"converted": 0, "content_cache_restored": 0,
+           "published_notice_count": 0, "failed": 0, "unsupported": 0,
            "unhandled_failed": 0, "unhandled_failures": [], "by_ext": {},
            "legacy_converted": 0, "legacy_conversion_failures": [], "conversion_failures": [],
            "partial_extraction_suspected": [],
            "document_ir_generated": 0, "document_ir_failed": 0, "document_ir_failures": [],
            "evidence_ir_generated": 0, "evidence_ir_failed": 0, "evidence_ir_failures": [],
-           "rag_generated": 0, "rag_failed": 0, "rag_failures": [],
+           "rag_generated": 0, "rag_failed": 0, "rag_failures": [], "observation_failures": [],
            "office_display_requested": 0, "office_display_applied": 0,
            "office_display_fallback_docs": 0, "office_display_profiles": []}
     wd = Path(wd).resolve()
@@ -2195,8 +2229,12 @@ def _build_derived_staging_body(
     from . import md_prefetch
     from .arms import legacy_convert
     from .arms import ooxml_arm
+    conversion_started = time.monotonic()
     converted = published_notice_count = failed = unsupported = unhandled_failed = cache_restored = 0
+    content_cache_restored = 0
     legacy_converted = 0   # 旧形式（.doc/.xls/.ppt）の前段変換成功数
+    actual_conversion_ms = cache_restore_ms = prefetch_child_ms = 0.0
+    prefetch_converted = 0
     unhandled_failures: list[dict] = []
     legacy_conversion_failures: list[dict] = []
     conversion_failures: list[dict] = []
@@ -2207,6 +2245,7 @@ def _build_derived_staging_body(
     evidence_ir_failures: list[dict] = []
     rag_generated = rag_failed = 0
     rag_failures: list[dict] = []
+    observation_failures: list[dict] = []
     office_display_requested = office_display_applied = office_display_fallback_docs = 0
     office_display_profiles: dict[str, dict] = {}
     obs_dir = _resolve_ocr_observation_dir(world)         # 1回だけ解決（文書ごとに解決し直さない）
@@ -2219,6 +2258,7 @@ def _build_derived_staging_body(
     legacy_cache = legacy_convert.cache_root_for(dr)     # 旧→新変換のキャッシュ（md/ の兄弟・再ビルドをまたいで残す）
     source_failure_notices: set[str] = set()
     conv_cache_root = _conv_cache_root_for(dr)           # per-file 変換結果キャッシュ（md/ の兄弟）
+    conv_cache_index_rebuild = not (conv_cache_root / _CONV_CACHE_CONTENT_INDEX).is_file()
     conv_cache_pipeline_sig = _current_conv_cache_pipeline_sig(ocr_observation_marker=ocr_observation_marker)
     conv_cache_seen_rels: set[str] = set()               # 剪定用「今回の原本一覧」（成否問わず候補に入った rel）
 
@@ -2301,14 +2341,11 @@ def _build_derived_staging_body(
                     figure_drops = prerendered.figure_drops
                 else:
                     _extract_evidence_assets(rp, actual, extracted_evidence, assets_dir, rel)
-                    observation_set = _build_observation_set(extracted_evidence, rel, assets_dir, obs_dir=obs_dir)
-                    figure_texts = _build_figure_texts(extracted_evidence, assets_dir, figure_drops)
+                    observation_set, figure_texts = build_observation_inputs(
+                        extracted_evidence, rel, assets_dir, obs_dir, figure_drops)
                 pending_meta.clear()
-                if figure_drops:   # 文字・画像を上限で落とした図の件数を来歴へ残す（rag.md の本文は変えない）
-                    if (dr / (rel + ".md.meta.json")).is_file():
-                        _merge_provenance_metadata(dr / (rel + ".md"), {"metafile_truncated": figure_drops})
-                    else:                                    # サイドカーはこの後の `_write_prov` が書くときに載せる
-                        pending_meta["metafile_truncated"] = figure_drops
+                observation_failures.extend(
+                    {"doc": rel, "reason": r} for r in record_figure_notes(dr, rel, pending_meta, figure_drops))
             if prerendered is not None:
                 markdown = prerendered.markdown
                 json_io.write_text_atomic(dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(markdown))
@@ -2438,6 +2475,17 @@ def _build_derived_staging_body(
         office_display_fallback_docs += delta["office_display_fallback_docs"]
         office_display_profiles.update(delta["office_display_profiles"])
 
+    def _conv_cache_rebind_rep_delta(delta: dict, cached_rel: str, rel: str) -> dict:
+        """内容一致で共有した集計の文書パスだけをコピー先へ付け替える。"""
+        rebound = dict(delta)
+        for key in ("document_ir_failures", "evidence_ir_failures", "rag_failures",
+                    "partial_extraction_suspected"):
+            rebound[key] = [
+                {**item, "doc": rel} if isinstance(item, dict) and item.get("doc") == cached_rel else item
+                for item in delta.get(key, [])
+            ]
+        return rebound
+
     def _conv_cache_store_if_eligible() -> None:
         """直前に処理した rel（ループ変数を閉包で参照）を per-file キャッシュへ保存する。
 
@@ -2453,7 +2501,9 @@ def _build_derived_staging_body(
         if any(rep_delta.get(k) for k in _CONV_CACHE_FAILED_DELTA_KEYS):
             return
         rep_delta["human_md_sig"] = human_md_sig_for_rel
-        _conv_cache_store(conv_cache_root, rel, conv_cache_key, rep_delta, dr, dr_rag, dr_ir)
+        _conv_cache_store(
+            conv_cache_root, rel, conv_cache_key, rep_delta, dr, dr_rag, dr_ir,
+            content_hash=conv_cache_content_hash, pipeline_sig=conv_cache_sig_for_rel, source_ext=ext)
 
     def _publish_failed_size_notice(rp: Path, rel: str, reason_code: str, detail: dict | None = None) -> None:
         """変換前（フルロード前）に諦めるサイズ/セル数系ガード（`size_exceeded`/`cell_count_exceeded`/`uncompressed_size_exceeded`）の共通処理。
@@ -2484,7 +2534,7 @@ def _build_derived_staging_body(
     def _restore_password_notice(rp: Path, rel: str) -> bool:
         """前回「パスワード付き」と確かめた原本（大きさ・更新時刻が同じ）なら、作り済みの知らせを戻して True。"""
         nonlocal failed, published_notice_count
-        key, hit = _conv_cache_hit(rp, rel)
+        key, hit = _conv_cache_primary_hit(rp, rel)
         if key is None or hit is None or not hit[0].get("password_protected"):
             return False
         rep_delta, content_dir = hit
@@ -2565,10 +2615,55 @@ def _build_derived_staging_body(
             if _also is not None and Path(_also).is_dir():
                 targets.extend(si.safe_files(_also))
 
-    def _conv_cache_hit(rp: Path, rel: str):
-        """per-file キャッシュ照合。返値 `(キー, ヒット|None)`。キー None＝キャッシュ対象外。ループ本体と先読みの計画が共有する。"""
+    content_hash_memo: dict[str, tuple[tuple | None, str | None]] = {}
+
+    def _content_hash(rp: Path, rel: str) -> str | None:
+        """先読み計画と本体で、同じ stat の原本ハッシュを共有する。"""
+        stat = md_prefetch.source_stat(rp)
+        memo = content_hash_memo.get(rel)
+        if memo is not None and memo[0] == stat:
+            return memo[1]
+        value = _conv_cache_content_hash(rp)
+        content_hash_memo[rel] = (stat, value)
+        return value
+
+    def _conv_cache_primary_hit(rp: Path, rel: str):
+        """一次のパス鍵を照合する。返値 `(キー, ヒット|None)`。"""
         key = _conv_cache_source_key(rp, conv_cache_pipeline_sig)
         return key, (_conv_cache_lookup(conv_cache_root, rel, key) if key is not None else None)
+
+    def _conv_cache_any_hit(rp: Path, rel: str, *, retire_stale: bool = False):
+        """一次を優先し、外れたときだけ内容一致の二次索引を照合する。"""
+        key, primary = _conv_cache_primary_hit(rp, rel)
+        sig = _conv_cache_pipeline_sig_for(rp, conv_cache_pipeline_sig)
+        source_ext = rp.suffix.lower()
+        if primary is not None:
+            meta = json_io.read_json(_conv_cache_slot(conv_cache_root, rel)[0], default=None)
+            content_hash = meta.get("content_hash") if isinstance(meta, dict) else None
+            if not isinstance(content_hash, str):
+                content_hash = _content_hash(rp, rel)
+            if isinstance(content_hash, str):
+                _conv_cache_register_content(
+                    conv_cache_root, rel, content_hash, sig, source_ext,
+                    force_index=conv_cache_index_rebuild)
+            return key, primary, None, content_hash, sig
+        content_hash = _content_hash(rp, rel)
+        content_hit = (_conv_cache_content_lookup(
+            conv_cache_root, content_hash, sig, source_ext) if content_hash is not None else None)
+        if retire_stale and (content_hit is None or content_hit[2] != rel):
+            _conv_cache_index_remove(conv_cache_root, rel)
+        return key, None, content_hit, content_hash, sig
+
+    def _conv_cache_hit_only(rp: Path, rel: str):
+        found = _conv_cache_any_hit(rp, rel)
+        return found[1] if found[1] is not None else found[2]
+
+    def _retire_changed_slot_index(rp: Path, rel: str) -> None:
+        """入口ガードで変換へ進まない場合も、内容が変わった rel を旧内容の一致先から外す。"""
+        key = _conv_cache_source_key(rp, conv_cache_pipeline_sig)
+        meta = json_io.read_json(_conv_cache_slot(conv_cache_root, rel)[0], default=None)
+        if isinstance(meta, dict) and meta.get("key") != key:
+            _conv_cache_index_remove(conv_cache_root, rel)
 
     candidate_total = sum(1 for rp, _rel in targets
                           if rp.suffix.lower() in candidate and not _is_skipped_original(rp, rp.suffix.lower()))
@@ -2582,9 +2677,11 @@ def _build_derived_staging_body(
     workers = md_prefetch.worker_count()
     if workers > 1 and candidate_total > 1:
         jobs = _prefetch_jobs(targets, candidate=candidate, conv=conv, enabled=enabled,
-                              cache_hit=lambda rp, rel: _conv_cache_hit(rp, rel)[1],
+                              cache_hit=_conv_cache_hit_only,
+                              content_key=lambda rp, rel: _content_hash(rp, rel),
                               obs_dir=obs_dir, assets_root=dr_rag,
                               threads=md_prefetch.plan_threads(), precheck_memo=precheck_memo)
+        jobs = md_prefetch.dedupe_jobs(jobs)
         if len(jobs) > 1:
             workers = min(workers, len(jobs))
             _log.info("MD化の重い計算を先読みします: %d件・ワーカー %d", len(jobs), workers)
@@ -2599,7 +2696,7 @@ def _build_derived_staging_body(
         from .arms import legacy_prefetch as _legacy_prefetch
         legacy_prefetch = _legacy_prefetch.start(
             _legacy_prefetch_items(targets, candidate=candidate, conv=conv,
-                                   cache_hit=lambda rp, rel: _conv_cache_hit(rp, rel)[1]),
+                                   cache_hit=_conv_cache_hit_only, content_key=_content_hash),
             legacy_cache)
         if legacy_prefetch is not None:
             stack.enter_context(legacy_prefetch)
@@ -2628,6 +2725,8 @@ def _build_derived_staging_body(
         # マニフェストの `asset_versions.human_md` として書き、レンダラ/抽出器の版だけが変わった時にこの asset だけを選択的に再生成できるようにする。
         human_md_sig_for_rel: str | None = None
         conv_cache_key: str | None = None    # 非None＝この rel はキャッシュ対象（`ext in conv`）
+        conv_cache_content_hash: str | None = None
+        conv_cache_sig_for_rel: str | None = None
         conv_cache_rep_before: dict | None = None
         _t0 = time.monotonic()
         _rss0 = _proc_rss_gib()
@@ -2643,8 +2742,18 @@ def _build_derived_staging_body(
             planned = precheck_memo.pop(rel, None)
             if planned is not None and md_prefetch.source_stat(rp) == planned[0]:
                 verdict, guard_code, guard_detail = planned[1]   # 計画で判定済み・原本は変わっていない
+                if len(planned) > 2:
+                    conv_cache_content_hash = planned[2]
             else:
-                verdict, guard_code, guard_detail = _precheck_target(rp, ext, conv)
+                cached_protection = None            # PDF は鍵の当たったキャッシュが「パスワード付きか」を覚えているので、原本の先頭と末尾を読み直さない
+                if ext == ".pdf":
+                    _key, primary = _conv_cache_primary_hit(rp, rel)
+                    if primary is not None:
+                        cached_protection = bool(primary[0].get("password_protected"))
+                verdict, guard_code, guard_detail = _precheck_target(
+                    rp, ext, conv, password_protected=cached_protection)
+            if verdict != "ok":
+                _retire_changed_slot_index(rp, rel)
             if verdict == "unsupported":                     # PDF(バックエンド無)/旧バイナリ/該当アーム無効は未対応
                 if ext in LEGACY_OFFICE_EXT:
                     unavailable_evidence = legacy_provenance.build_unavailable_evidence(
@@ -2679,7 +2788,9 @@ def _build_derived_staging_body(
             # per-file キャッシュ（`ext in conv` は直前の早期 continue で確定済み）: 原本 mtime/size と変換パイプライン署名が前回成功時と一致すれば、
             # アーム実行・Evidence 生成・LLM/VLM 呼び出しを丸ごとスキップし、キャッシュ済み派生一式をステージングへコピーする。
             # ミスは下の通常経路へ流れる。
-            conv_cache_key, hit = _conv_cache_hit(rp, rel)
+            conv_cache_key, hit, content_hit, found_hash, conv_cache_sig_for_rel = _conv_cache_any_hit(
+                rp, rel, retire_stale=True)
+            conv_cache_content_hash = conv_cache_content_hash or found_hash
             if hit is not None and hit[0].get("legacy_failure"):
                 if _restore_legacy_failure_notice(rel, hit):
                     _done_label = "完了（キャッシュ復元）"
@@ -2688,7 +2799,10 @@ def _build_derived_staging_body(
             if conv_cache_key is not None:
                 if hit is not None:
                     rep_delta, content_dir = hit
-                    if _conv_cache_restore(content_dir, rel, dr, dr_rag, dr_ir):
+                    restore_started = time.monotonic()
+                    restored = _conv_cache_restore(content_dir, rel, dr, dr_rag, dr_ir)
+                    cache_restore_ms += (time.monotonic() - restore_started) * 1000
+                    if restored:
                         _conv_cache_apply_rep_delta(rep_delta)
                         human_md_sig_for_rel = rep_delta.get("human_md_sig")
                         converted += 1
@@ -2696,6 +2810,22 @@ def _build_derived_staging_body(
                         _done_label = "完了（キャッシュ復元）"
                         continue
                 conv_cache_rep_before = _conv_cache_rep_snapshot()
+                if content_hit is not None:
+                    rep_delta, content_dir, cached_rel = content_hit
+                    if _conv_cache_restore_content(
+                            content_dir, cached_rel, rel, dr, dr_rag, dr_ir, obs_dir=obs_dir):
+                        rebound = _conv_cache_rebind_rep_delta(rep_delta, cached_rel, rel)
+                        _conv_cache_apply_rep_delta(rebound)
+                        human_md_sig_for_rel = rebound.get("human_md_sig")
+                        converted += 1
+                        cache_restored += 1
+                        content_cache_restored += 1
+                        _conv_cache_store(
+                            conv_cache_root, rel, conv_cache_key, rebound, dr, dr_rag, dr_ir,
+                            content_hash=conv_cache_content_hash, pipeline_sig=conv_cache_sig_for_rel,
+                            source_ext=ext)
+                        _done_label = "完了（内容一致キャッシュ復元）"
+                        continue
             # 単体PNG/JPEGはVLM armへ渡さず、OCR非依存のEvidence/RAGを通常成果物として作る。
             if ext in RASTER_EVIDENCE_EXT:
                 raster_md = _generate_evidence(rp, rel)
@@ -2722,15 +2852,19 @@ def _build_derived_staging_body(
             conv_path, extra_notes = rp, []
             legacy_conversion = None
             if ext in legacy_convert.LEGACY_EXT_MAP:         # 旧形式＝先に OOXML へ前段変換（LibreOffice 等）
+                prefetch_timed_out = False
                 if legacy_prefetch is not None:
                     legacy_prefetch.settle(rel)
-                materialized = legacy_convert.ensure_ooxml(rp, rel, legacy_cache)
+                    prefetch_timed_out = legacy_prefetch.timed_out(rel)   # 先変換が上限まで使って時間切れにしたものは変換し直さない
+                legacy_started = time.monotonic()
+                materialized = None if prefetch_timed_out else legacy_convert.ensure_ooxml(rp, rel, legacy_cache)
+                actual_conversion_ms += (time.monotonic() - legacy_started) * 1000
                 if materialized is None:
                     # `backend_ready=False`（バックエンド未設定/未到達）は失敗ではなく未対応（「失敗」と「対象外」を混ぜない）。
                     # `backend_ready=True` で変換を試みて失敗した場合だけ `failed` へ計上し、`take_conversion_failure_reason()` でタイムアウトかどうかを区別する。
                     backend_ready = ext in legacy_convert.legacy_exts()
                     if backend_ready:
-                        detail = legacy_convert.take_conversion_failure_reason()
+                        detail = "timeout" if prefetch_timed_out else legacy_convert.take_conversion_failure_reason()
                         status, reason = "failed", {
                             "timeout": "legacy_conversion_timeout", "memory": "memory_exceeded",
                         }.get(detail, "legacy_conversion_failed")
@@ -2785,8 +2919,14 @@ def _build_derived_staging_body(
             if pre is not None:
                 arm_name, result = pre.arm_name, pre.result
                 doc_present = pre.has_document
+                prefetch_child_ms += pre.elapsed_ms
+                actual_conversion_ms += pre.elapsed_ms
+                if result is not None and result.md is not None:
+                    prefetch_converted += 1
             else:
+                direct_started = time.monotonic()
                 arm_name, result = _convert_with_arms(conv_path, enabled)  # 最初に受理したアーム 1 本
+                actual_conversion_ms += (time.monotonic() - direct_started) * 1000
                 doc_present = result is not None and result.document is not None
             if result is None or result.md is None:
                 # fail-closed: docx/xlsx は document-ir 構築失敗が直接 md=None を招く（`OoxmlArm.convert()`）。
@@ -3021,8 +3161,10 @@ def _build_derived_staging_body(
         _remove_marker(dr, _RAG_SIG_MARKER)
     _log.info("%s", _convert_summary_line(
         candidate_total, converted, cache_restored, failed, unsupported,
-        [*conversion_failures, *legacy_conversion_failures, *unhandled_failures], document_ir_failures))
-    rep.update(converted=converted, published_notice_count=published_notice_count,
+        [*conversion_failures, *legacy_conversion_failures, *unhandled_failures], document_ir_failures,
+        content_cache_restored=content_cache_restored))
+    rep.update(converted=converted, content_cache_restored=content_cache_restored,
+               published_notice_count=published_notice_count,
                failed=failed, unsupported=unsupported, unhandled_failed=unhandled_failed,
                unhandled_failures=unhandled_failures, by_ext=dict(by),
                legacy_converted=legacy_converted,
@@ -3034,15 +3176,31 @@ def _build_derived_staging_body(
                evidence_ir_generated=evidence_ir_generated, evidence_ir_failed=evidence_ir_failed,
                evidence_ir_failures=evidence_ir_failures,
                rag_generated=rag_generated, rag_failed=rag_failed, rag_failures=rag_failures,
+               observation_failures=observation_failures,
                office_display_requested=office_display_requested,
                office_display_applied=office_display_applied,
                office_display_fallback_docs=office_display_fallback_docs,
                office_display_profiles=[office_display_profiles[key] for key in sorted(office_display_profiles)],
-               candidate_total=candidate_total)
+               candidate_total=candidate_total,
+               conversion_metrics={
+                   "targeted": candidate_total,
+                   "completed": converted,
+                   "actual": max(0, converted - cache_restored),
+                   "cache_restored": cache_restored,
+                   "by_format": dict(by),
+                   "wall_ms": round((time.monotonic() - conversion_started) * 1000),
+                   "actual_cumulative_ms": round(actual_conversion_ms),
+                   "cache_restore_ms": round(cache_restore_ms),
+                   "prefetch": {"converted": prefetch_converted,
+                                "child_cumulative_ms": round(prefetch_child_ms)},
+                   "content_cache_restored": {"count": None,
+                                              "unavailable_reason": "content_hash_cache_not_implemented"},
+               })
     return rep
 
 
-def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = True,
+@derived_numbers.rewrites_layers("ir")
+def refresh_document_ir(wd, derived, *, row: ReplaceRow, write_document_ir_sig_marker: bool = True,
                         world: str | None = None) -> dict:
     """IR だけの軽量再生成。`build_derived` と違い derived を全消去しない（MD／meta.json／`.arms_sig` には触れない）。
 
@@ -3069,6 +3227,7 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
     if _within(dr, wd) or _within(wd, dr) or _within(dr_ir, wd) or _within(wd, dr_ir):
         return {"document_ir_generated": 0, "document_ir_failed": 0, "document_ir_failures": [],
                 "error": "derived_overlaps_source"}
+    derived_numbers.begin(row, "ir")
     generated = failed = 0
     failures: list[dict] = []
     for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
@@ -3112,7 +3271,7 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
     return {"document_ir_generated": generated, "document_ir_failed": failed, "document_ir_failures": failures}
 
 
-_DERIVED_MANIFEST_SUFFIX = ".derived.json"
+_DERIVED_MANIFEST_SUFFIX = derived_suffixes.MANIFEST
 # `{rel}.derived.json` は原本ごとに、検索 consumer 側の設定（ES への RAG 反映の有無等）に関係なく常時生成する。
 # マニフェスト形式のバージョン（`sidecars`/`assets` キーの構成が変わったら上げる）。現行値と一致しないマニフェスト
 # （キー自体を持たない旧世代を含む）は `rag_sidecars_missing` が「欠落」として扱い、全再構築で書き直させる。
@@ -3217,7 +3376,8 @@ def rag_sidecars_missing(wd, derived, *, world: str | None = None) -> bool:
     return False
 
 
-def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world: str | None = None) -> dict:
+@derived_numbers.rewrites_layers("ir", "rag")
+def refresh_evidence_ir(wd, derived, *, row: ReplaceRow, write_rag_sig_marker: bool = True, world: str | None = None) -> dict:
     """XLSX/DOCX/PPTX/PDF の Evidence IR を clone 済み generation 上で軽量再生成する。
 
     原本が素の ``.xlsx``/``.docx`` で既存 MD の provenance が ``ooxml`` の文書だけを対象にする（旧形式の一時 OOXML に誤った source hash を付けない）。
@@ -3243,30 +3403,17 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
     if (_within(dr, wd) or _within(wd, dr)
             or _within(dr_rag, wd) or _within(wd, dr_rag)
             or _within(dr_ir, wd) or _within(wd, dr_ir)):
-        return {
-            "evidence_ir_generated": 0,
-            "evidence_ir_failed": 0,
-            "evidence_ir_failures": [],
-            "rag_generated": 0,
-            "rag_failed": 0,
-            "rag_failures": [],
-            "error": "derived_overlaps_source",
-        }
+        return {"evidence_ir_generated": 0, "evidence_ir_failed": 0, "evidence_ir_failures": [],
+                "rag_generated": 0, "rag_failed": 0, "rag_failures": [], "error": "derived_overlaps_source"}
     if not write_rag_sig_marker and not drop_rag_sig_marker(dr):
-        return {
-            "evidence_ir_generated": 0,
-            "evidence_ir_failed": 0,
-            "evidence_ir_failures": [],
-            "rag_generated": 0,
-            "rag_failed": 0,
-            "rag_failures": [],
-            "error": "rag_sig_unlink_failed",
-        }
-
+        return {"evidence_ir_generated": 0, "evidence_ir_failed": 0, "evidence_ir_failures": [],
+                "rag_generated": 0, "rag_failed": 0, "rag_failures": [], "error": "rag_sig_unlink_failed"}
+    derived_numbers.begin(row, "ir", "rag")
     generated = failed = 0
     failures: list[dict] = []
     rag_generated = rag_failed = 0
     rag_failures: list[dict] = []
+    observation_failures: list[dict] = []
     seen: set[str] = set()
     legacy_cache = legacy_convert.cache_root_for(dr)
     obs_dir = _resolve_ocr_observation_dir(world)          # 1回だけ解決
@@ -3347,14 +3494,16 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
                 asset_dir = dr_rag / (rel + ".assets")
                 shutil.rmtree(asset_dir, ignore_errors=True)
                 _extract_evidence_assets(rp, actual, extracted, asset_dir, rel)
-                observation_set = _build_observation_set(extracted, rel, asset_dir, obs_dir=obs_dir)
+                drops: dict = {}
+                observation_set, figure_texts = build_observation_inputs(extracted, rel, asset_dir, obs_dir, drops)
                 rendered = evidence_render.render(
-                    extracted, source_name=rel, observation_set=observation_set,
-                    figure_texts=_build_figure_texts(extracted, asset_dir))
+                    extracted, source_name=rel, observation_set=observation_set, figure_texts=figure_texts)
                 json_io.write_text_atomic(
                     dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(rendered.markdown))
                 evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
                 context_ir.write_json_atomic(dr_ir / (rel + ".context.json"), rendered.context, extracted)
+                observation_failures.extend(
+                    {"doc": rel, "reason": r} for r in record_figure_notes(dr, rel, {}, drops, refresh=True))
                 rag_generated += 1
             except OSError:
                 rag_failed += 1
@@ -3403,17 +3552,13 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
             _write_rag_sig_marker(dr, ocr_observation_marker=ocr_observation_marker)
     else:
         _remove_marker(dr, _RAG_SIG_MARKER)
-    return {
-        "evidence_ir_generated": generated,
-        "evidence_ir_failed": failed,
-        "evidence_ir_failures": failures,
-        "rag_generated": rag_generated,
-        "rag_failed": rag_failed,
-        "rag_failures": rag_failures,
-    }
+    return {"evidence_ir_generated": generated, "evidence_ir_failed": failed, "evidence_ir_failures": failures,
+            "rag_generated": rag_generated, "rag_failed": rag_failed, "rag_failures": rag_failures,
+            "observation_failures": observation_failures}
 
 
-def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | None = None) -> dict:
+@derived_numbers.rewrites_layers("rag")
+def refresh_rag(wd, derived, *, row: ReplaceRow, write_rag_sig_marker: bool = True, world: str | None = None) -> dict:
     """既存 Evidence 世代と同じ原本から pipe-free な Markdown/chunk/assets を再生成する。
 
     `write_rag_sig_marker=False` の契約は `refresh_evidence_ir` と同じ。
@@ -3437,25 +3582,14 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
     if (_within(dr, wd) or _within(wd, dr)
             or _within(dr_rag, wd) or _within(wd, dr_rag)
             or _within(dr_ir, wd) or _within(wd, dr_ir)):
-        return {
-            "rag_generated": 0,
-            "rag_failed": 0,
-            "rag_failures": [],
-            "error": "derived_overlaps_source",
-        }
+        return {"rag_generated": 0, "rag_failed": 0, "rag_failures": [], "error": "derived_overlaps_source"}
     if not write_rag_sig_marker and not drop_rag_sig_marker(dr):
-        return {
-            "rag_generated": 0,
-            "rag_failed": 0,
-            "rag_failures": [],
-            "error": "rag_sig_unlink_failed",
-        }
-    sources = {
-        rel: rp for rp, rel in si.safe_files(wd, also=_archive_also_root(world))
-        if rp.suffix.lower() in EVIDENCE_EXT
-    }
+        return {"rag_generated": 0, "rag_failed": 0, "rag_failures": [], "error": "rag_sig_unlink_failed"}
+    derived_numbers.begin(row, "rag")
+    sources = {rel: rp for rp, rel in si.safe_files(wd, also=_archive_also_root(world)) if rp.suffix.lower() in EVIDENCE_EXT}
     generated = failed = 0
     failures: list[dict] = []
+    observation_failures: list[dict] = []
     seen: set[str] = set()
     legacy_cache = legacy_convert.cache_root_for(dr)
     obs_dir = _resolve_ocr_observation_dir(world)          # 1回だけ解決
@@ -3505,12 +3639,11 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
                     source_path, extraction_path=actual, consume_legacy=True, legacy_conversion=conversion)
             asset_dir = dr_rag / (rel + ".assets")
             shutil.rmtree(asset_dir, ignore_errors=True)
-            observation_set = None
-            figure_texts = None
+            observation_set = figure_texts = None
+            drops: dict = {}
             if actual.suffix.lower() not in LEGACY_OFFICE_EXT:
                 _extract_evidence_assets(source_path, actual, ir, asset_dir, rel)
-                observation_set = _build_observation_set(ir, rel, asset_dir, obs_dir=obs_dir)
-                figure_texts = _build_figure_texts(ir, asset_dir)
+                observation_set, figure_texts = build_observation_inputs(ir, rel, asset_dir, obs_dir, drops)
             context_path = dr_ir / (rel + ".context.json")
             saved_context = context_ir.load_current(context_path, ir, source_name=rel)   # 同じ Evidence なら作り直さず読む
             rendered = evidence_render.render(
@@ -3521,6 +3654,8 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
             evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
             if saved_context is None:
                 context_ir.write_json_atomic(context_path, rendered.context, ir)
+            observation_failures.extend(
+                {"doc": rel, "reason": r} for r in record_figure_notes(dr, rel, {}, drops, refresh=True))
             generated += 1
         except OSError:
             failed += 1
@@ -3556,7 +3691,8 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
             _write_rag_sig_marker(dr, ocr_observation_marker=ocr_observation_marker)
     else:
         _remove_marker(dr, _RAG_SIG_MARKER)
-    return {"rag_generated": generated, "rag_failed": failed, "rag_failures": failures}
+    return {"rag_generated": generated, "rag_failed": failed, "rag_failures": failures,
+            "observation_failures": observation_failures}
 
 
 def _select_arm(path, enabled):
@@ -3601,22 +3737,6 @@ def _write_provenance(
         pass
 
 
-def _merge_provenance_metadata(md_path: Path, values: dict) -> None:
-    """既存MD来歴へ任意補完profileを追記する。sidecar未生成の経路はEvidence内profileだけを正本にする。"""
-    meta_path = md_path.parent / (md_path.name + ".meta.json")
-    if not meta_path.is_file():
-        return
-    try:
-        raw = json.loads(meta_path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            return
-        raw.update(values)
-        json_io.write_text_atomic(
-            meta_path, json.dumps(raw, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
-    except (OSError, ValueError):
-        pass
-
-
 def to_markdown(path) -> str | None:
     """Office ファイル → 決定的 Markdown 文字列。未対応形式・変換失敗は None。"""
     p = Path(path)
@@ -3641,7 +3761,9 @@ def to_markdown(path) -> str | None:
 # ---- .docx（word/document.xml 直読み）----
 
 def _para_text(p_el) -> str:
-    return "".join(t.text or "" for t in p_el.iter(f"{_W}t"))
+    """段落の本文。取り消し線・非表示の run は状態つきで書き、テキストボックスの中の文字は含めない（`ooxml.word.stated_text`）。"""
+    from .ooxml import word
+    return word.stated_text(p_el)
 
 
 def _heading_level(p_el) -> int | None:
@@ -3710,20 +3832,89 @@ def _slide_order(z) -> list[str]:
         return numeric
 
 
+# 注記を「対象の直後」へ差し込むための目印。図の文字の差し込み口（`figures`）に載せ、組み立ての後で注記の行へ置き換える
+_NOTE_MARK = "\x00note\x00"
+_NOTE_BLOCK_PREFIX = "図の中の文字（元の値）\n- " + _NOTE_MARK
+
+
+def _pptx_slide_notes(notes, slide_part: str, root) -> tuple[list[str], dict[int, list[str]]]:
+    """スライドの注記を `(スライドの見出し直後の行, spTree 直下の子の位置 → 注記の行)` にする。
+
+    入れ子の図形の注記は、それを含む最上位の図形の位置にまとめる。
+    """
+    from . import evidence_spike, human_md, observation_vocab
+
+    tree = root.find(f"{_PR}cSld/{_PR}spTree")
+    children = list(tree) if tree is not None else []
+    top_positions = [i for i, child in enumerate(children) if evidence_spike._ppt_kind(child) is not None]
+    heading_lines: list[str] = []
+    by_child: dict[int, list[str]] = {}
+    elements = notes.elements
+    for element in notes.evidence.elements:
+        if element.locator.part != slide_part:
+            continue
+        if element.type == "slide":
+            if element.visibility == "hidden":
+                label = observation_vocab.VISIBILITY_REASON_LABELS["hidden_slide"]
+                heading_lines.append(human_md.NOTE_PREFIX + observation_vocab.visibility_line(
+                    "hidden_slide", label, human=True, subject="このスライド"))
+            continue
+        if element.type not in human_md.OBJECT_TYPES or element.extension.get("origin") == "document-ir-v2-adapter":
+            continue
+        block = notes.block(element)
+        if not block:
+            continue
+        top = element
+        while top.parent_id in elements and elements[top.parent_id].type != "slide":
+            top = elements[top.parent_id]
+        z = top.extension.get("z_order")
+        if not isinstance(z, int) or not 1 <= z <= len(top_positions):
+            continue
+        by_child.setdefault(top_positions[z - 1], []).append(block)
+    return heading_lines, by_child
+
+
 def _pptx_md(p: Path) -> str | None:
+    """PPTX の人間向け MD。
+
+    図形・画像・OLE などの状態・関係・未解析／未対応の通知は、Evidence IR から作り、その図形の文字の直後に「※」の行で足す。
+    スライドの文字は従来どおり `_pptx_slide_texts_by_shape` が作る（失敗したスライドは `pptx_flat` が注記つきの平らな文字にする）。注記は図の文字と同じ差し込み口（`figures`）に載せて位置を決める。
+    """
     from . import metafile_text
+    from .ooxml import powerpoint
 
     out = []
     cache: dict[str, list[str]] = {}
     with zipfile.ZipFile(p) as z:
-        for i, n in enumerate(_slide_order(z), 1):
+        order = _slide_order(z)
+        notes = _pptx_notes(p, z)
+        for i, n in enumerate(order, 1):
             root = ET.fromstring(z.read(n))
             figures = metafile_text.pptx_slide_figures(p, n, cache)
-            texts = _pptx_slide_texts(root, figures)
-            if texts:
+            heading_lines: list[str] = []
+            if notes is not None:
+                heading_lines, by_child = _pptx_slide_notes(notes, n, root)
+                figures = {k: [list(block) for block in v] for k, v in figures.items()}
+                for index, blocks in by_child.items():
+                    figures.setdefault(index, []).extend([_NOTE_MARK + block] for block in blocks)
+            texts = pptx_flat.slide_texts(
+                lambda: _pptx_slide_texts_by_shape(root, figures, powerpoint.slide_picture_fills(z, n, root),
+                                                  powerpoint.slide_inherited_covers_bbox(z, n, root)),
+                root, figures, _figure_text_line, p, i)
+            if notes is not None:
+                texts = [t.removeprefix(_NOTE_BLOCK_PREFIX) if t.startswith(_NOTE_BLOCK_PREFIX) else t for t in texts]
+            if texts or heading_lines:
                 out.append(f"## スライド {i}")
+                out.extend(heading_lines)
                 out.extend(texts)
     return "\n\n".join(out) if out else None
+
+
+def _pptx_notes(p: Path, z: zipfile.ZipFile):
+    """PPTX の注記の元（Evidence IR）。作れなければ None。位置の言葉に使うスライドの大きさも渡す。"""
+    from .ooxml import powerpoint as pptx_ooxml
+
+    return _evidence_notes(p, slide_size=pptx_ooxml.slide_size(z), inline=True)
 
 
 # ---- 幾何オクルージョン（覆い図形の座標判定・pptx）----
@@ -3738,31 +3929,13 @@ def _figure_text_line(lines: list[str]) -> str:
     return "図の中の文字（元の値）\n" + "\n".join("- " + line for line in lines)
 
 
-def _pptx_slide_texts(root, figures: dict[int, list[list[str]]] | None = None) -> list[str]:
-    """1 スライド分のテキスト行（shape 単位・文書順・隠し候補マーカー付き）。
-
-    shape 単位の歩行が失敗したら例外を握って、フラット抽出（`root.iter(f"{_A}t")`）にフォールバックする（テキストの取りこぼしを起こさない）。
-    非隠しスライドは shape 単位でもフラット抽出とバイト単位で一致する。
-    """
-    try:
-        return _pptx_slide_texts_by_shape(root, figures)
-    except Exception:
-        flat = _pptx_slide_texts_flat(root)
-        # 位置を決められないときは、図の文字をスライド末尾へまとめる。
-        return flat + [_figure_text_line(lines) for blocks in (figures or {}).values() for lines in blocks]
-
-
-def _pptx_slide_texts_flat(root) -> list[str]:
-    """現行のフラット抽出（フォールバック・挙動不変）。"""
-    return [t.text.strip() for t in root.iter(f"{_A}t") if t.text and t.text.strip()]
-
-
 def _pptx_shape_texts_list(sp) -> list[str]:
-    """`p:txBody` 内の非空テキスト行（run 単位・順序保持）。"""
+    """`p:txBody` 内の非空テキスト行（run 単位・順序保持。取り消し線の run は `ooxml.powerpoint.text_lines` が括る）。"""
+    from .ooxml import powerpoint
     txbody = sp.find(f"{_PR}txBody")
     if txbody is None:
         return []
-    return [t.text.strip() for t in txbody.iter(f"{_A}t") if t.text and t.text.strip()]
+    return powerpoint.text_lines(txbody)
 
 
 def _pptx_bbox(sp) -> tuple[int, int, int, int] | None:
@@ -3788,14 +3961,43 @@ def _pptx_bbox(sp) -> tuple[int, int, int, int] | None:
     return (x, y, x + cx, y + cy)
 
 
-def _pptx_has_solid_fill(sp) -> bool:
-    """`p:spPr/a:solidFill` を持つか（`a:noFill` の場合は False）。"""
-    spPr = sp.find(f"{_PR}spPr")
-    if spPr is None:
-        return False
-    if spPr.find(f"{_A}noFill") is not None:
-        return False
-    return spPr.find(f"{_A}solidFill") is not None
+def _pptx_fill_kind(el, picture_fills: dict[str, str] | None = None, *, has_text: bool = False) -> str:
+    """`p:sp` と `p:pic` の塗りの区分（`observation_vocab.FILL_*`）。文字の有無にかかわらず塗りを読む。
+
+    opaque のときだけ背面の文字を覆う候補（［隠し候補］）になる。`has_text` は `p:sp` が文字を持つか（塗りなしで文字だけなら
+    none_with_text）。`picture_fills` は埋め込み画像の関係 ID → 区分
+    （`ooxml.powerpoint.slide_picture_fills`）。引けない画像は unknown。
+    """
+    from . import drawing_fill
+    if el.tag == f"{_PR}pic":
+        fills = picture_fills or {}
+        return drawing_fill.picture_fill_kind(
+            el, lambda embed, link: fills.get(embed, FILL_UNKNOWN) if embed else FILL_UNKNOWN)
+    return drawing_fill.shape_fill_kind(el.find(f"{_PR}spPr"), el.find(f"{_PR}style"), has_text=has_text)
+
+
+def _pptx_covers_bbox(el, inherited_covers_bbox: dict | None = None) -> bool:
+    """`p:sp`・`p:pic` が覆う範囲を外接矩形と同一視してよいか。
+
+    形状の指定が直接あればそれで決める（ドーナツ・楕円・カスタム形状などは False）。指定が無いプレースホルダーは、
+    レイアウト・マスターから受け継いだ形状（`inherited_covers_bbox`＝`ooxml.powerpoint.slide_inherited_covers_bbox`）で決め、
+    解決できなければ False。プレースホルダーでない図形の形状の指定が無ければ、図形は False・画像は True（`drawing_fill.covers_bounding_box`）。
+    """
+    from . import drawing_fill
+    from .ooxml import powerpoint
+    sp_pr = el.find(f"{_PR}spPr")
+    if drawing_fill.explicit_geometry_covers_bounding_box(sp_pr) is None:
+        placeholder = powerpoint._placeholder(el)
+        if placeholder is not None:
+            return (inherited_covers_bbox or {}).get(placeholder, False)
+    return drawing_fill.covers_bounding_box(sp_pr, picture=el.tag == f"{_PR}pic")
+
+
+def _pptx_hides_behind(el, picture_fills: dict[str, str] | None, inherited_covers_bbox: dict | None = None,
+                       *, has_text: bool = False) -> bool:
+    """この図形の外接矩形が重なる背面の文字を隠す候補にしてよいか（塗りが opaque で、形が外接矩形と同一視できる）。"""
+    return (_pptx_fill_kind(el, picture_fills, has_text=has_text) == FILL_OPAQUE
+            and _pptx_covers_bbox(el, inherited_covers_bbox))
 
 
 def _bbox_intersection_ratio(inner: tuple, outer: tuple) -> float:
@@ -3812,12 +4014,15 @@ def _bbox_intersection_ratio(inner: tuple, outer: tuple) -> float:
     return (dx * dy) / inner_area
 
 
-def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None = None) -> list[str]:
+def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None = None,
+                               picture_fills: dict[str, str] | None = None,
+                               inherited_covers_bbox: dict | None = None) -> list[str]:
     """`p:cSld/p:spTree` 直下を文書順（=z順・背面→前面）で歩き、shape 単位でテキストを取る。
 
-    各テキスト shape について、後（前面）にある occluder 候補（無地塗りの空 shape／画像）と bbox の交差比が閾値以上なら
+    各テキスト shape について、後（前面）にある occluder 候補（不透明に塗った空 shape／不透明の画像）と bbox の交差比が閾値以上なら
     「隠し候補」とマークし、直前に独立行のマーカーを出す。`p:grpSp`（グループ）内は幾何判定せず、テキストのみ再帰抽出する。
     """
+    from .ooxml import powerpoint
     cSld = root.find(f"{_PR}cSld")
     if cSld is None:
         raise ValueError("p:cSld が見つからない")               # フォールバックへ
@@ -3825,7 +4030,7 @@ def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None 
     if spTree is None:
         raise ValueError("p:spTree が見つからない")
 
-    # 文書順の子要素を分類: テキストshape候補（p:sp）／occluder候補（p:sp 無地塗り or p:pic）／グループ
+    # 文書順の子要素を分類: テキストshape候補（p:sp）／occluder候補（不透明に塗った p:sp or 不透明の p:pic）／グループ
     children = list(spTree)
     entries = []                                                # [{kind, sp, texts, bbox, occluder}]
     for el in children:
@@ -3834,23 +4039,24 @@ def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None 
             texts = _pptx_shape_texts_list(el)
             bbox = _pptx_bbox(el)
             has_text = bool(texts)
-            is_occluder = (not has_text) and _pptx_has_solid_fill(el) and bbox is not None
+            is_occluder = _pptx_hides_behind(el, picture_fills, inherited_covers_bbox, has_text=has_text) and bbox is not None
             entries.append({"kind": "sp", "texts": texts, "bbox": bbox,
                              "occluder": is_occluder, "has_text": has_text})
         elif tag == f"{_PR}pic":
             bbox = _pptx_bbox(el)
             entries.append({"kind": "pic", "texts": [], "bbox": bbox,
-                             "occluder": bbox is not None, "has_text": False})
+                             "occluder": bbox is not None and _pptx_hides_behind(el, picture_fills, inherited_covers_bbox),
+                             "has_text": False})
         elif tag == f"{_PR}grpSp":
             group_texts = _pptx_group_texts(el)
             entries.append({"kind": "grpSp", "texts": group_texts, "bbox": None,
                              "occluder": False, "has_text": bool(group_texts)})
         elif tag == f"{_PR}graphicFrame":
-            texts = [t.text.strip() for t in el.iter(f"{_A}t") if t.text and t.text.strip()]
+            texts = powerpoint.text_lines(el)
             entries.append({"kind": "graphicFrame", "texts": texts, "bbox": None,
                              "occluder": False, "has_text": bool(texts)})
         else:                                                   # p:cxnSp／未知要素等: テキストのみ拾う
-            texts = [t.text.strip() for t in el.iter(f"{_A}t") if t.text and t.text.strip()]
+            texts = powerpoint.text_lines(el)
             entries.append({"kind": "other", "texts": texts, "bbox": None,
                              "occluder": False, "has_text": bool(texts)})
 
@@ -3880,15 +4086,13 @@ def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None 
 def _pptx_group_texts(grp) -> list[str]:
     """`p:grpSp` 内のテキストのみ再帰抽出（幾何判定は行わない＝グループ内 shape は occluder 候補にも
     被occlude対象にもしない）。ネストした `p:grpSp` も辿る。"""
+    from .ooxml import powerpoint
     out: list[str] = []
     for el in grp:
-        tag = el.tag
-        if tag in (f"{_PR}sp", f"{_PR}pic", f"{_PR}graphicFrame"):
-            out.extend([t.text.strip() for t in el.iter(f"{_A}t") if t.text and t.text.strip()])
-        elif tag == f"{_PR}grpSp":
+        if el.tag == f"{_PR}grpSp":
             out.extend(_pptx_group_texts(el))
         else:
-            out.extend([t.text.strip() for t in el.iter(f"{_A}t") if t.text and t.text.strip()])
+            out.extend(powerpoint.text_lines(el))
     return out
 
 
@@ -4053,9 +4257,9 @@ def _pdf_quality_cache_key(p: Path) -> tuple[str, int, int] | None:
 
 
 def _pdf_quality_and_avg(p) -> tuple[str, float]:
-    """PDF テキスト層の品質（good/sparse/empty）とページ平均抽出文字数を計算する（メモ化）。
+    """PDF テキスト層の品質（good/sparse/empty/failed）とページ平均抽出文字数を計算する（メモ化）。
 
-    `_pdf_pages` の例外は握り、失敗時は `("empty", 0.0)` を返す（1 件の壊れた PDF が `build_derived` の 1 ファイルループ全体を止めないため）。
+    `_pdf_pages` の例外は握り、失敗時は `("failed", 0.0)` を返す（壊れた PDF 1 件でループを止めない・empty とは区別する）。
     """
     path = Path(p)
     key = _pdf_quality_cache_key(path)
@@ -4066,7 +4270,8 @@ def _pdf_quality_and_avg(p) -> tuple[str, float]:
         texts = [_normalize_pdf_text(raw) for raw in pages]
         total = sum(len(t) for t in texts)
     except Exception:
-        result = ("empty", 0.0)                              # 抽出失敗＝テキスト層ゼロと同様に扱う（fail-safe）
+        _log.warning("PDF の文字の層を読み取れませんでした: %s", path.name, exc_info=True)
+        result = ("failed", 0.0)                             # 抽出失敗は「文字の層が無い」ではない（視覚読み取りへ切り替えない）
     else:
         if total == 0:
             result = ("empty", 0.0)
@@ -4083,10 +4288,9 @@ def _pdf_quality_and_avg(p) -> tuple[str, float]:
 
 
 def pdf_text_quality(p) -> str:
-    """PDF テキスト層の品質を決定的に判定: "good"（十分）/"sparse"（少ない）/"empty"（テキスト層ゼロ）。
+    """PDF テキスト層の品質を決定的に判定: "good"（十分）/"sparse"（少ない）/"empty"（テキスト層ゼロ）/"failed"（抽出に失敗）。
 
-    全ページ抽出→整形後の総文字数とページ平均で分類する（`_pdf_quality_and_avg` でメモ化）。
-    バックエンド未導入・抽出例外は "empty" 扱い（`pdf_escalation_target` が上位アームへ委ねる）。
+    全ページ抽出→整形後の総文字数とページ平均で分類する（`_pdf_quality_and_avg` でメモ化）。バックエンド未導入は "empty" 扱い（`pdf_escalation_target` が上位アームへ委ねる）。抽出例外は "failed"（上位アームへは委ねない）。
     """
     return _pdf_quality_and_avg(p)[0]
 

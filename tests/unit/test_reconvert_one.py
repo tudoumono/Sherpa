@@ -12,6 +12,8 @@ import pytest
 
 from sherpa import json_io, store, worlds
 from sherpa.ingest import office_md, worker
+from sherpa.store import db, replace_rows
+from tests._replace_row import offline_row
 
 
 def _xlsx(path: pathlib.Path, value: str) -> None:
@@ -41,7 +43,7 @@ def world(tmp_path, monkeypatch):
         return real(source_path, **kw)
     with monkeypatch.context() as m:
         m.setattr(office_md, "_extract_canonical_evidence", fail_a)
-        rep = office_md.build_derived(src, der, world_sig="sig1")
+        rep = office_md.build_derived(src, der, world_sig="sig1", row=offline_row("w"))
     assert {"doc": "a.xlsx", "reason": "source_parse_failed"} in rep["conversion_failures"]
     w = f"rc-{uuid.uuid4().hex[:8]}"
     monkeypatch.setattr(worlds, "world_dir", lambda world_id: src)
@@ -51,8 +53,13 @@ def world(tmp_path, monkeypatch):
     manifest = {rel: [m, c, z] for rel, m, c, z in worker._scan_dir(src)}
     monkeypatch.setattr(store, "get_world", lambda world_id: {"world_id": world_id, "last_sig": "sig1",
                                                              "last_manifest": manifest})
+    store.upsert_world(w, str(src), label=w)
+    store.set_world_sig(w, "sig1", manifest)   # 1 文書の行が確定する前回取り込みの明細
     yield w, src, der
     store.clear_failed_docs(w)
+    with db._connect() as c:
+        replace_rows.drop_world_rows(c, w)
+        c.execute("DELETE FROM worlds WHERE world_id=%s", (w,))
 
 
 def _tree(root: pathlib.Path, rel: str) -> dict:
@@ -66,10 +73,10 @@ def test_derive_one_publishes_same_output_as_full_build_and_leaves_other_docs(wo
     layers = [der, der.parent / "rag", der.parent / "ir"]
     other_before = [_tree(d, "b.xlsx") for d in layers]
     other_cache = (office_md._conv_cache_root_for(der) / "b.xlsx.key.json").read_bytes()
-    assert office_md.drop_conversion_cache(der, "a.xlsx")
-    rep = office_md.derive_one(src, der, (src / "a.xlsx").resolve(), "a.xlsx")
+    assert office_md.drop_conversion_cache(der, "a.xlsx", row=offline_row("w"))
+    rep = office_md.derive_one(src, der, (src / "a.xlsx").resolve(), "a.xlsx", row=offline_row("w"))
     assert not rep.get("error") and not rep["conversion_failures"] and rep["converted"] == 1
-    office_md.publish_one(der, "a.xlsx")
+    office_md.publish_one(der, "a.xlsx", row=offline_row("w"))
     assert office_md.failure_notice_reason(json_io.read_json(der / "a.xlsx.md.meta.json")) is None
     assert "甲の値" in (der.parent / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8")
     assert [_tree(d, "b.xlsx") for d in layers] == other_before
@@ -78,7 +85,7 @@ def test_derive_one_publishes_same_output_as_full_build_and_leaves_other_docs(wo
     assert not any(d.with_name(d.name + ".staging").exists() for d in layers)
     # 全体の作り直し（キャッシュを使わない）と同じ中身
     full = tmp_path / "full" / "md"
-    office_md.build_derived(src, full, world_sig="sig1")
+    office_md.build_derived(src, full, world_sig="sig1", row=offline_row("w"))
     for layer, name in (("md", "a.xlsx.md"), ("rag", "a.xlsx.rag.md"), ("rag", "a.xlsx.rag_chunks.jsonl"),
                         ("ir", "a.xlsx.evidence.json"), ("ir", "a.xlsx.derived.json")):
         assert (der.parent / layer / name).read_bytes() == (full.parent / layer / name).read_bytes(), name
@@ -90,7 +97,7 @@ def test_reconvert_conversion_failure_keeps_published_and_updates_row(world, mon
     store.replace_failed_docs(w, {"a.xlsx": "source_parse_failed"})
     before = [_tree(d, "a.xlsx") for d in (der, der.parent / "rag", der.parent / "ir")]
     monkeypatch.setattr(office_md, "_extract_canonical_evidence", _boom)
-    monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite", lambda world: pytest.fail("グラフに触れない"))
+    monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite", lambda world, **_kw: pytest.fail("グラフに触れない"))
     res = worker.reconvert(w, "a.xlsx", run_id=store.start_ingest_run(w)["id"])
     assert res["status"] == "failed"
     assert [_tree(d, "a.xlsx") for d in (der, der.parent / "rag", der.parent / "ir")] == before
@@ -99,12 +106,14 @@ def test_reconvert_conversion_failure_keeps_published_and_updates_row(world, mon
 
 
 def test_reconvert_graph_failure_keeps_row_for_retry(world, monkeypatch):
-    """変換は成功してグラフの反映で失敗したら、失敗の一覧に「反映待ち」で残り、もう一度の再変換でやり直せる。"""
+    """変換は成功してグラフの反映で失敗したら、失敗の一覧は元の理由のまま、その文書の行が残り、もう一度の再変換でやり直せる。"""
     w, _src, der = world
     store.replace_failed_docs(w, {"a.xlsx": "source_parse_failed"})
     monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite", _boom)
     res = worker.reconvert(w, "a.xlsx", run_id=store.start_ingest_run(w)["id"])
     assert res["status"] == "failed"
     assert res["flags"][-1]["reason"] == "reconvert_graph_failed:RuntimeError"
-    assert {r["rel"]: r["reason"] for r in store.list_failed_docs(w)} == {"a.xlsx": "reconvert_reflect_failed"}
+    assert {r["rel"]: r["reason"] for r in store.list_failed_docs(w)} == {"a.xlsx": "source_parse_failed"}
+    assert store.unfinished_docs(w) == ["a.xlsx"]
     assert office_md.failure_notice_reason(json_io.read_json(der / "a.xlsx.md.meta.json")) is None
+

@@ -18,10 +18,12 @@ _CODEX_MCP_TOOL_BUDGET_CEILING_BYTES = 64 * 1024
 # 原本読取ツール（xlsx_sheets／xlsx_range／docx_paragraphs／pptx_slides／pdf_pages）の応答 1 件の上限（バイト）。
 # Codex CLI はモデルへ返す出力が約 40,000 バイトを超えると中央を落とすため、打ち切りの印（truncated 等）が消えない大きさに収める。
 _CODEX_MCP_READER_BUDGET_BYTES = 30_000
+# 検索ツール（ripgrep_search／es_search）の応答 1 件の上限（バイト）。ヒットの前後が消えないよう CLI の上限（約 40,000 バイト）に余裕を持たせる。
+_CODEX_MCP_SEARCH_BUDGET_BYTES = 36_000
 
 
 def _resolve_mcp_budget(system_settings: dict | None, depth_profile: str | None = None) -> dict[str, str]:
-    """MCP 子プロセスへ渡す `SHERPA_MCP_TOOL_BUDGET_BYTES`／`SHERPA_MCP_READER_BUDGET_BYTES`（原本読取ツール用）／`_MAX_HITS`/`_WINDOW_CAP` を1回だけ解決する。
+    """MCP 子プロセスへ渡す `SHERPA_MCP_TOOL_BUDGET_BYTES`／`SHERPA_MCP_READER_BUDGET_BYTES`（原本読取ツール用）／`SHERPA_MCP_SEARCH_BUDGET_BYTES`（検索ツール用）／`_MAX_HITS`/`_WINDOW_CAP` を1回だけ解決する。
     1件あたりのバイト予算は `agentic_search.effective_tool_result_max_bytes` の実効値と `_CODEX_MCP_TOOL_BUDGET_CEILING_BYTES` の min()。累計のバイト予算は持たない。
     hits/window は API 経路と同じ `depth_profile.scaled_ratio(depth_profile.effective_base(...), profile, abs_max=...)` で深さ連動込みの実効値を解決する。`depth_profile` は `ctx.scope_meta.get("depth_profile")` の値（`None`＝標準）。
     ツール呼び出し回数の上限は渡さない。
@@ -44,6 +46,7 @@ def _resolve_mcp_budget(system_settings: dict | None, depth_profile: str | None 
     return {
         "SHERPA_MCP_TOOL_BUDGET_BYTES": str(per_result),
         "SHERPA_MCP_READER_BUDGET_BYTES": str(min(per_result, _CODEX_MCP_READER_BUDGET_BYTES)),
+        "SHERPA_MCP_SEARCH_BUDGET_BYTES": str(min(per_result, _CODEX_MCP_SEARCH_BUDGET_BYTES)),
         "SHERPA_MCP_TOOL_MAX_HITS": str(max_hits),
         "SHERPA_MCP_TOOL_WINDOW_CAP": str(window_cap),
     }

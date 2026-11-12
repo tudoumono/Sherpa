@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 
 from fastapi import APIRouter, HTTPException, Request
@@ -85,7 +86,7 @@ def _openai_endpoint_kind(system_settings: dict | None = None) -> str:
 
 def _ollama_url_choice(s: dict, system_settings: dict | None = None) -> dict:
     """個人設定の Ollama 接続先 `<select>` の選択肢（`{"allowed": [...], "default": "..."}` 形＋`legacy`）。空文字は「管理者の既定を使う」。
-    `allowed` には許可ポリシー（loopback／admin allowlist）を満たす完全 URL（scheme 込み）だけを返す。利用者の現在の保存値が許可されていない場合は `allowed` に混ぜず `legacy` に別枠で返す。
+    `allowed` には許可ポリシー（loopback／中央の既定接続先／admin allowlist）を満たす完全 URL（scheme 込み）だけを返す。利用者の現在の保存値が許可されていない場合は `allowed` に混ぜず `legacy` に別枠で返す。
     scheme が分かっている実際の URL（中央既定・利用者の現在の保存値）を、admin allowlist からの合成エントリより先に追加する。同一 host:port が既にある場合は、後から来た URL が `https://` で既存が `https://` でないときだけ置換する（合成の `http://` が https を上書きしない）。
     `system_settings`（省略可）: `ollama_url`（中央既定）と `llm._allowlisted_hosts()` の解決に使う（省略時は自分で読む）。
     """
@@ -200,7 +201,7 @@ def settings_get(request: Request):
 @settings_router.put("/settings", tags=["設定"], response_model=SettingsResponse)
 def settings_put(req: SettingsReq, request: Request):
     """現在ユーザーの設定を更新する（未指定フィールドは変更しない）。
-    `agent` は許可された頭脳のみ（閉じた頭脳は 422）。`ollama_url` は宛先ポリシー（loopback／admin allowlist）に合わないと 422（到達可否の詳細は返さない）。管理画面で個人キーが許可されていない（`personal_api_keys_allowed` が偽）ときは、クラウド AI のキーを保存できず 422。
+    `agent` は許可された頭脳のみ（閉じた頭脳は 422）。`ollama_url` は宛先ポリシー（loopback／中央の既定接続先／admin allowlist）に合わないと 422（到達可否の詳細は返さない）。管理画面で個人キーが許可されていない（`personal_api_keys_allowed` が偽）ときは、クラウド AI のキーを保存できず 422。
     """
     u = _current_user(request)
     uid = u["uid"]
@@ -226,8 +227,8 @@ def settings_put(req: SettingsReq, request: Request):
         try:
             llm.assert_ollama_url_allowed(req.ollama_url, system_settings=sys_s)
         except llm.SsrfBlocked:
-            raise HTTPException(422, "指定された Ollama 接続先は許可されていません"
-                                     "（admin が allowlist に登録した host:port のみ保存できます）")
+            raise HTTPException(422, "この Ollama の接続先は保存できません"
+                                     "（既定の接続先か、管理者が「利用者が選べる接続先」に登録した接続先を選んでください）")
     fields = {k: v for k, v in req.model_dump().items() if v is not None}
     try:
         store.update_settings(uid, **fields)
@@ -259,11 +260,28 @@ def _audit_settings_update(uid: str, fields: dict) -> None:
                 outcome="success")
 
 
-def _round_ollama_probe_detail(detail: str) -> str:
-    """`POST /settings/test`（provider=ollama）の失敗理由を丸める。Connection refused/timeout/reset/DNS 失敗の区別を出さない（内部ホスト/ポートの生死判別に使われないため）。認証失敗（401 相当）だけは区別を残す（`graph_extract._http_detail` の `f"{e.code} ...: ..."` 形式に先頭一致する）。"""
+_OLLAMA_PROBE_CAUSES = (
+    (("name or service not known", "nodename nor servname", "gaierror", "getaddrinfo", "name resolution"),
+     "Ollama の接続先の名前からパソコンを見つけられません。接続先の綴りを確かめてください"),
+    (("refused",),
+     "Ollama に接続できません（接続を拒否されました）。相手で Ollama が起動しているかを確かめてください"),
+    (("timed out", "timeout"),
+     "Ollama から応答がありません（時間切れ）。接続先とファイアウォールを確かめてください"),
+)
+
+
+def _ollama_probe_detail(detail: str) -> str:
+    """`POST /settings/test`（provider=ollama）の失敗理由を、名前が引けない・接続を拒否された・時間切れの定型の文にする（許可済みの接続先だけがここへ来る）。認証失敗（401 相当）は元の理由を残し、HTTP 応答が返った失敗（`graph_extract._http_detail` の `f"{e.code} ..."`／`HTTP {e.code}` 形式）は状態番号だけ残す。"""
     if detail.startswith("401"):
         return detail
-    return "Ollama への接続に失敗しました（詳細は表示しません）"
+    m = re.match(r"(?:HTTP )?([1-5]\d\d)\b", detail)
+    if m:
+        return f"Ollama は応答しましたが、リクエストが失敗しました（HTTP {m.group(1)}）。モデルを取得済みか、接続先の設定を確認してください"
+    low = detail.lower()
+    for words, text in _OLLAMA_PROBE_CAUSES:
+        if any(w in low for w in words):
+            return text
+    return "Ollama への接続に失敗しました"
 
 
 class TestReq(BaseModel):
@@ -277,7 +295,7 @@ class TestReq(BaseModel):
 def settings_test(req: TestReq, request: Request):
     """API キー/モデルの接続テスト（1 回だけ最小リクエスト）。保存はしない。入力中のキーで試せる。
     返値 `{ok, provider, model, detail}`。ok=False の detail に実エラー（401=認証/429=クォータ/モデル不明 等）を載せる。
-    provider=ollama は宛先ポリシー（loopback／admin allowlist）に合わないと接続せず 422 を返す。接続後の失敗は、到達可否の区別を出さず丸める（401 相当の認証失敗だけ区別を残す）。
+    provider=ollama は宛先ポリシー（loopback／中央の既定接続先／admin allowlist）に合わないと接続せず 422 を返す。接続後の失敗は、到達可否の区別を出さず丸める（401 相当の認証失敗だけ区別を残す）。
     """
     from sherpa.ingest import graph_extract
     u = _current_user(request)
@@ -372,16 +390,15 @@ def settings_test(req: TestReq, request: Request):
         try:
             llm.assert_ollama_url_allowed(cfg["url"], system_settings=sys_s)
         except llm.SsrfBlocked:
-            raise HTTPException(422, "指定された Ollama 接続先は許可されていません"
-                                     "（admin が allowlist に登録した host:port のみ確認できます）")
+            raise HTTPException(422, "この Ollama の接続先は確かめられません"
+                                     "（既定の接続先か、管理者が「利用者が選べる接続先」に登録した接続先を選んでください）")
     else:
         raise HTTPException(422, "provider は openai / ollama / codex のいずれか")
     if prov == "openai" and not cfg.get("key"):
         return {"ok": False, "provider": prov, "model": cfg["model"], "detail": keys.NO_CENTRAL_KEY_MESSAGE}
     ok, detail = graph_extract._probe(cfg)
     if prov == "ollama" and not ok:
-        # Connection refused/timeout/reset/DNS の区別を出さない（401 相当の認証失敗だけ区別を残す）。
-        detail = _round_ollama_probe_detail(detail)
+        detail = _ollama_probe_detail(detail)
     return {"ok": ok, "provider": prov, "model": cfg["model"],
             "detail": "接続OK" if ok else detail}
 
@@ -413,7 +430,6 @@ def healthz():
             from sherpa import api as _api  # 循環回避のため関数内 import
             _api._seed_settings_from_env()
             _api._seed_ollama_url_from_env()
-            _api._warn_central_ollama_not_allowed()
             _api._seed_openai_endpoint_from_env()
             _api._seed_depth_profile_from_env()
             _api._seed_screen_settings_from_env()

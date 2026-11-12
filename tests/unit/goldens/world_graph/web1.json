@@ -1,0 +1,22 @@
+{
+  "counts": {
+    "edge_types": {
+      "ACCESSES": 3,
+      "CONTAINS": 2,
+      "INVOKES": 5
+    },
+    "edges": 10,
+    "flag_reasons": {
+      "dropped_syntax": 2,
+      "unresolved": 3
+    },
+    "flags": 5,
+    "node_labels": {
+      "Config": 3,
+      "Module": 7
+    },
+    "nodes": 10
+  },
+  "sha256": "aaa0f6c8def1766eedec54f44d3362cf9bff8085911b1cd9e7dbbe04b13f971e",
+  "world": "web1"
+}

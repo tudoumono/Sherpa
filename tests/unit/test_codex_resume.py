@@ -128,7 +128,9 @@ def test_session_id_persist_failure_is_fail_open(monkeypatch):
     monkeypatch.setattr(store, "set_session_id", _boom)
     events = list(CS.stream_message(session=None, message="失敗しても続く", conversation_id=cid, knowledge=False))
     answer = next(e for e in events if e.get("type") == "answer")
-    assert answer["message"]["content"] == "ok"
+    shaped = answer["message"]["answer"]
+    assert shaped["body"] == "ok"
+    assert [n["kind"] for n in shaped["notices"]] == ["session_unsaved"]   # 継続できないことを回答に残す
 
 
 # ===== C. CodexProvider 実プロセス管理（偽 codex） =====
@@ -209,10 +211,6 @@ def _ctx(uid: str, conversation_id=None, codex_session_id=None, message="R1b res
         message=message,
         world="v1",
         route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline",
-            "summary": {"total": 0}, "data": {}, "sources": [],
-        },
         knowledge=True,
         uid=uid,
         conversation_id=conversation_id,
@@ -291,7 +289,8 @@ def test_resume_failure_falls_back_to_fresh_session_once(tmp_path, monkeypatch, 
     # そのターン内で 1 回だけ resume 無しの新規セッションへフォールバックする。
     argv_log = _setup(tmp_path, monkeypatch, "users_resume_fail")
     env = _result_env(_run(A.CodexProvider(), _ctx("r1b-resume-fail", 303, sid, history=_HISTORY)))
-    assert env["headline"] == "fresh-ok", env
+    assert env["body"] == "fresh-ok", env
+    assert "resume_restarted" in [n["kind"] for n in env["notices"]]   # 新しく調べ直したことを回答に残す
     assert _history_flags(argv_log) == ["without", "with"]  # 作り直した新規セッションには履歴を入れる
     assert env.get("codex_session_id") == "TH-FRESH"
     calls = _read_argv_log(argv_log)

@@ -147,6 +147,26 @@ def test_page_render_is_selected_only_without_current_text_or_usable_image():
     assert without_current.decisions[0].page_render == {**ocr_router.PAGE_RENDER_PROFILE, "page_1_based": 1}
 
 
+def test_scan_page_render_outranks_every_embedded_image():
+    scan_page = _element("page-1", "page")
+    other_page = _element("page-2", "page", page=2)
+    large = _element("picture-large", "picture", page=2, extension={"asset_sha256": ASSET_HASH, "pixel_size": [4299, 3036]})
+    small = _element("picture-small", "image_fill", page=2, extension={"asset_sha256": ASSET_HASH, "pixel_size": [20, 10]})
+    hidden = _element(
+        "picture-hidden", "image_fill", page=2, extension={"asset_sha256": ASSET_HASH, "pixel_size": [20, 10]},
+        visibility="hidden",
+    )
+    manifest = ocr_router.build_manifest(
+        _ir(scan_page, other_page, large, small, hidden), source_rel_path="scan.pdf", assets=[_asset()],
+    )
+
+    pages = [item for item in manifest.decisions if item.input_kind == "page_render" and item.status == "selected"]
+    images = [item for item in manifest.decisions if item.input_kind == "asset" and item.status == "selected"]
+    assert len(pages) == 1 and len(images) == 3
+    assert pages[0].priority > max(item.priority for item in images)
+    assert max(item.priority for item in images) == ocr_router.RASTER_PRIORITY_MAX
+
+
 def test_missing_or_unbound_asset_is_explicit_failed_binding():
     page = _element("page-1", "page")
     missing_hash = _element("picture-1", "picture")

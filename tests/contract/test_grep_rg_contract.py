@@ -105,8 +105,8 @@ def test_paging_matches_python_engine_page_by_page(corpus_s, term):
         assert G.grep_search(term, roots=[corpus_s], max_hits=7, offset=offset) == ref
 
 
-def test_world_path_with_importance_matches_python_engine(monkeypatch, tmp_path, corpus_s, count_discover):
-    """重要度（`_重要度.txt`）がある world は rank 順に候補を開く。順位・打切りは参照実装と同じ。"""
+def test_world_path_with_importance_settings_matches_python_engine(monkeypatch, tmp_path, corpus_s, count_discover):
+    """重要度（`_重要度.txt`）は使わない＝設定がある world も、順位・打切りは参照実装と同じ（発見順）。"""
     root = tmp_path / "world"
     shutil.copytree(corpus_s, root)
     (root / "gold.json").unlink()
@@ -119,7 +119,7 @@ def test_world_path_with_importance_matches_python_engine(monkeypatch, tmp_path,
             got = G.grep_search(term, world=world, max_hits=max_hits, offset=offset)
             assert got == ref, (term, max_hits, offset)
     top = G.grep_search("PG00014", world=world, max_hits=3)
-    assert top[0]["doc_id"].endswith("PG00014.cbl") and top[0]["importance"] == "高"
+    assert top and not any(k.startswith("importance") for h in top for k in h)
     if rg_search.find_rg() is not None:
         assert count_discover["n"] >= 1
 
@@ -424,3 +424,89 @@ def test_vcs_dirs_hidden_files_and_ignore_files_do_not_change_the_candidate_set(
     got = G.grep_search("NEEDLE", roots=[tmp_path])
     assert got == G.grep_search("NEEDLE", roots=[tmp_path], engine="python")
     assert {h["doc_id"] for h in got} == {"ignored.txt", ".hidden.txt", "sub/x.txt"}
+
+
+# ===== (5) 非 ASCII の語は UTF-8・CP932・EUC-JP のバイト列を 1 回の走査で探す =====
+
+_needs_rg = pytest.mark.skipif(rg_search.find_rg() is None, reason="rg が無い環境では候補の絞り込みを使わない")
+
+# (検索語, CP932 か EUC-JP で書く行のバイト列)。大文字小文字の違い・JIS の符号の重複（NEC と IBM）・半角カナ・記号・補助漢字を含む。
+_CP932_CASES = [
+    ("テスト", "前テスト後".encode("cp932")),
+    ("ＡＢＣ", "ａｂｃ".encode("cp932")),
+    ("ΑΒΓ", "αβγ".encode("cp932")),
+    ("ПРИВЕТ", "привет".encode("cp932")),
+    ("Å", b"\x81\xf0"),  # Å（ラテン文字）で、CP932 のオングストローム記号に当たる
+    ("髙橋", b"\xfb\xfc\x8b\xb4"),  # IBM 拡張の髙
+    ("髙橋", b"\xee\xe0\x8b\xb4"),  # NEC 選定 IBM 拡張の髙
+    ("ｱｲｳ", "ｱｲｳ".encode("cp932")),
+    ("～", "～".encode("cp932")),
+    ("ⅰ", "Ⅰ".encode("cp932")),
+    ("No.１", "no.１".encode("cp932")),
+    ("テスト", "前テスト後".encode("euc_jp")),
+    ("ＡＢＣ", "ａｂｃ".encode("euc_jp")),
+    ("ΑΒΓ", "αβγ".encode("euc_jp")),
+    ("ｱｲｳ", "ｱｲｳ".encode("euc_jp")),
+    ("①", b"\xad\xa1"),  # NEC 特殊文字（13 区）
+    ("髙橋", b"\xfc\xe2\xb6\xb6"),  # NEC 選定 IBM 拡張の髙
+    ("～", b"\x8f\xa2\xb7"),  # 補助漢字の面のチルダ
+    ("丂", "丂".encode("euc_jp")),  # 補助漢字（3 バイト）
+]
+
+
+def _old_two_pass(term: str, root: pathlib.Path) -> set[str]:
+    """直す前の探し方（字面のまま 1 回目＋CP932・EUC-JP で解読する 2・3 回目）で当たるファイル。"""
+    rg = rg_search.find_rg()
+    found: set[str] = set()
+    for extra in ([], ["-E", "sjis"], ["-E", "euc-jp"]):
+        r = subprocess.run([rg, "-l", "-0", "-F", "-i", "--no-config", "--hidden", "--no-ignore", *extra,
+                            "-e", term, "--", str(root)], capture_output=True)
+        found |= {os.fsdecode(p) for p in r.stdout.split(b"\0") if p}
+    return found
+
+
+@_needs_rg
+@pytest.mark.parametrize("term, raw", _CP932_CASES, ids=[f"{i}" for i in range(len(_CP932_CASES))])
+def test_one_pass_finds_every_file_the_two_passes_found(tmp_path, term, raw):
+    (tmp_path / "legacy.txt").write_bytes(b"head\n" + raw + b"\ntail\n")
+    (tmp_path / "utf8.txt").write_text(f"x {term} y\n", encoding="utf-8")
+    (tmp_path / "other.txt").write_text("関係のない行\n", encoding="utf-8")
+    old = _old_two_pass(term, tmp_path)
+    assert str(tmp_path / "legacy.txt") in old and str(tmp_path / "utf8.txt") in old
+    one = rg_search.discover([term], [tmp_path], derived=False, first_only=True)
+    many = rg_search.discover([term, "ZZZ-NOSUCH"], [tmp_path], derived=False)
+    assert old <= set(one)
+    assert old <= {p for p, hit in many.items() if 0 in hit}  # 複数語のときも、この語に当たったファイルとして残る
+    assert G.grep_search(term, roots=[tmp_path]) == G.grep_search(term, roots=[tmp_path], engine="python")
+
+
+@_needs_rg
+def test_many_terms_with_cp932_files_equal_per_term_python_search(tmp_path):
+    (tmp_path / "a.cbl").write_bytes("      * 髙橋の計算\n      MOVE A TO B.\n".encode("cp932"))
+    (tmp_path / "b.cbl").write_bytes("      * テストの手順\n".encode("cp932"))
+    (tmp_path / "c.md").write_text("# 見出し\nテストと髙橋\n", encoding="utf-8")
+    terms = ["髙橋", "テスト", "MOVE", "ZZZ-NOSUCH"]
+    many = G.grep_search_many(terms, roots=[tmp_path], max_hits=50)
+    for t in terms:
+        assert many[t] == G.grep_search(t, roots=[tmp_path], max_hits=50, engine="python"), t
+    assert {h["doc_id"] for h in many["髙橋"]} == {"a.cbl", "c.md"}
+
+
+@_needs_rg
+def test_term_with_replacement_char_still_matches_python_search(tmp_path):
+    (tmp_path / "bad.txt").write_bytes(b"\x82\xa0\xff\n")
+    (tmp_path / "ok.txt").write_text("� 化けた字\n", encoding="utf-8")
+    for term in ("�", "� 化けた字"):
+        assert G.grep_search(term, roots=[tmp_path]) == G.grep_search(term, roots=[tmp_path], engine="python")
+
+
+@_needs_rg
+def test_candidates_open_in_the_same_order_as_python_scan(tmp_path):
+    """名前に `-` があるフォルダとの並び（`a-b/` と `a/`）でも、開く順は純 Python 走査と同じ。"""
+    for rel in ("d/a-b/x.txt", "d/a/b.txt", "d/a.txt", "d/a b/z.txt"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("NEEDLE\n", encoding="utf-8")
+    for max_hits in (1, 2, 3):
+        ref = G.grep_search("NEEDLE", roots=[tmp_path], max_hits=max_hits, engine="python")
+        assert G.grep_search("NEEDLE", roots=[tmp_path], max_hits=max_hits) == ref
+

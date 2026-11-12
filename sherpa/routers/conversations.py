@@ -44,7 +44,7 @@ def conversation_get(cid: int, request: Request):
 @router.delete("/conversations/{cid}", tags=["会話管理"])
 def conversation_delete(cid: int, request: Request):
     """会話を削除する（所有会話・受領ラッパーいずれも可）。
-    生きた受領ラッパーがこの会話を参照している場合は論理削除（自分の一覧からは消えるが受領側は引き続き読める）、無ければ物理削除する。どちらも Codex の継続セッションは即時に削除する。
+    生きた受領ラッパーがこの会話を参照している場合は論理削除（自分の一覧からは消えるが受領側は引き続き読める）、無ければ物理削除する。どちらも Codex の継続セッションは即時に削除し、消せなかったときは `sessions_removed: false` で知らせる。
     Codex が実行中の会話は DB に触れず 409 を返す（Codex の実行と同じ会話単位のロックを、DB を変える前に待たずに取る）。
     """
     u = _current_user(request)
@@ -54,10 +54,10 @@ def conversation_delete(cid: int, request: Request):
     try:
         if not store.delete_conversation(cid, u["uid"]):
             raise HTTPException(404, "会話が見つかりません")
-        _delete_codex_sessions_for_conversation(u["uid"], cid)
+        sessions_removed = _delete_codex_sessions_for_conversation(u["uid"], cid)
     finally:
         lock.release()
-    return {"ok": True, "id": cid}
+    return {"ok": True, "id": cid, "sessions_removed": sessions_removed}
 
 
 class PinReq(BaseModel):

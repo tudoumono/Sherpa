@@ -12,6 +12,7 @@ import pytest
 from sherpa import impact_service, lens_service
 from sherpa.ingest import world_graph, world_neo4j
 from _world_registry import register_test_world
+from tests._replace_row import offline_row
 
 WORLD = "s7_sources_test"          # 使い捨て（テスト後に削除）
 
@@ -37,7 +38,7 @@ def _load_files(tmp_path, files: dict):
         p.write_text(text, encoding="utf-8")
     nodes, edges, flags = world_graph.build_world(tmp_path, WORLD)
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))
     register_test_world(WORLD)
     return nodes, edges, flags
 
@@ -103,6 +104,6 @@ def test_a_graph_with_an_older_storage_version_is_refused_until_rebuilt(session,
     assert world_neo4j.check_graph_counts(WORLD, env["uri"], env["user"], env["pw"]) == "era_mismatch"
     with pytest.raises(world_neo4j.GraphSchemaEraError):
         world_neo4j.run_world_impact(session, "helper", WORLD)
-    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])      # 今すぐ更新での作り直し
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))      # 今すぐ更新での作り直し
     assert world_neo4j.check_graph_counts(WORLD, env["uri"], env["user"], env["pw"]) is None
     assert world_neo4j.run_world_impact(session, "helper", WORLD)["items"]

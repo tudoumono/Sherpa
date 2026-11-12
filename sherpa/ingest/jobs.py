@@ -2,7 +2,7 @@
 
 Web アプリは `background.submit` で操作名と引数を `ingest_runs` に積むだけで、ワーカーが `run_job` で同じ関数を呼ぶ。
 操作ごとの `payload` のキー: register＝`path`/`label`/`world_id`/`root`、rebind＝`path`/`label`、reconvert＝`rel`/`uid`、
-delete＝`uid`、refresh／rerun／rag_regenerate_rules＝なし。
+delete＝`uid`、refresh＝なし（OCR 観測の反映の自動予約だけ `ocr_catchup`＝観測の世代）、rerun／rag_regenerate_rules＝なし。
 設計: docs/design/operations.md「取り込みワーカーと版の照合」
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from .. import store, webhooks, world_admin_service, worlds
+from . import replace_guard
 from . import worker as ingest_worker
 
 _log = logging.getLogger("sherpa")
@@ -38,26 +39,28 @@ def _rerun(world: str, payload: dict, run_id: int) -> None:
 def _rag_regenerate_rules(wid: str, payload: dict, run_id: int) -> None:
     """LLM 成形キャッシュの一掃・rag.md の規則版への作り直し・ES 反映を `ingest_worker.regenerate_rag_rule_only` へ委譲する（`store.world_lock` は同関数が確保し、`_run_locked` は経由しない）。"""
     if not store.get_world(wid):
-        store.finish_ingest_run(run_id, status="failed", extraction_snapshot={
+        replace_guard.finish_run(wid, run_id, status="failed", nothing_swapped=True, extraction_snapshot={
             "flags": [{"doc": None, "action": "blocked", "reason": "world_not_found"}]})
         return
     if not worlds.world_dir(wid):
-        store.finish_ingest_run(run_id, status="failed", extraction_snapshot={
+        replace_guard.finish_run(wid, run_id, status="failed", nothing_swapped=True, extraction_snapshot={
             "flags": [{"doc": None, "action": "blocked", "reason": "world_dir_unreachable"}]})
         return
+    inherited = replace_guard.row_for_run(wid, run_id)
+    resumed = inherited is not None and inherited.source_state == "fixed"   # 止まった取り込みの行を受け継いだ回は、行を消さない
     try:
-        result = ingest_worker.regenerate_rag_rule_only(wid)
+        result = ingest_worker.regenerate_rag_rule_only(wid, run_id=run_id)
     except Exception as e:
-        store.finish_ingest_run(run_id, status="failed", extraction_snapshot={
+        replace_guard.finish_run(wid, run_id, status="failed", nothing_swapped=True, extraction_snapshot={
             "flags": [{"doc": None, "action": "blocked",
                       "reason": f"unexpected_error:{e.__class__.__name__}"}]})
         _log.warning("規則版への再生成が想定外の例外で失敗しました: world=%s", wid, exc_info=True)
         return
     if result.get("status") == "ok":
-        store.finish_ingest_run(run_id, status="auto_published", extraction_snapshot={
+        replace_guard.finish_run(wid, run_id, status="auto_published", replaces_all=not resumed, extraction_snapshot={
             "docs": result.get("rag_generated", 0)})
     else:
-        store.finish_ingest_run(run_id, status="failed", extraction_snapshot={
+        replace_guard.finish_run(wid, run_id, status="failed", nothing_swapped=True, extraction_snapshot={
             "flags": [{"doc": None, "action": "blocked", "reason": str(result.get("status"))}],
             "docs": result.get("rag_generated", 0)})
 

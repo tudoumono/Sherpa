@@ -1,0 +1,19 @@
+{
+  "counts": {
+    "edge_types": {
+      "INVOKES": 1
+    },
+    "edges": 1,
+    "flag_reasons": {
+      "dropped_syntax": 1,
+      "unresolved_qualifier": 1
+    },
+    "flags": 2,
+    "node_labels": {
+      "Module": 4
+    },
+    "nodes": 4
+  },
+  "sha256": "5875248be38e26e56930a88bc1dc2135326533eea180afb3c7da015bfe237d45",
+  "world": "ana-v1b"
+}

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+from tests._replace_row import offline_row
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 os.chdir(ROOT)
@@ -38,7 +39,7 @@ def test_via_lands_as_a_neo4j_edge_property():
     assert not any(f["reason"] == "unknown_via" for f in flags), flags
 
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))
     register_test_world(WORLD)
 
     drv = _driver()
@@ -73,7 +74,7 @@ def test_edge_without_via_has_null_property():
     assert flags == [] or all(f["reason"] != "unknown_via" for f in flags)
 
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))
     register_test_world(WORLD)
 
     drv = _driver()
@@ -96,7 +97,7 @@ def test_sql_table_schema_and_qualified_name_survive_the_neo4j_round_trip():
     fixture = ROOT / "fixtures" / "corpus" / "ana-s5"
     nodes, edges, _flags = world_graph.build_world(fixture, WORLD)
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))
     register_test_world(WORLD)
 
     drv = _driver()

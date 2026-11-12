@@ -308,3 +308,43 @@ def test_download_symlinked_files_dir_rejected():
     finally:
         (ws / "files").unlink()
         moved.rename(real_files)
+
+
+def test_delete_reports_physical_delete_failure(monkeypatch):
+    """実体の削除に失敗したら ok:true・成功監査にせず、消せなかったことを応答と監査に残す。"""
+    sfx = _sfx()
+    uid, _ = _new_login(sfx)
+    up = _upload_ok(f"keep_{sfx}.txt", b"stay")
+
+    def _deny(self, missing_ok=False):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(pathlib.Path, "unlink", _deny)
+    r = client.delete(f"/workspace/files/{up['id']}")
+    monkeypatch.undo()
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is False and body["physical_deleted"] is False
+    assert (_files_dir(uid) / up["rel_path"]).exists()
+    rows = store.list_audit(action="workspace.file_deleted", resource_id=f"pwf:{up['id']}")
+    assert rows and rows[0]["outcome"] == "error" and rows[0]["reason"] == "physical_delete_failed"
+
+
+def test_search_reports_unreadable_files():
+    """読めなかった個人ファイルは「一致なし」に混ぜず、検索できなかったファイルとして返す。"""
+    sfx = _sfx()
+    uid, _ = _new_login(sfx)
+    ok = _upload_ok(f"ok_{sfx}.txt", f"needle{sfx}".encode())
+    bad = _upload_ok(f"bad_{sfx}.txt", f"needle{sfx}".encode())
+    bad_path = _files_dir(uid) / bad["rel_path"]
+    bad_path.chmod(0)
+    try:
+        if os.access(bad_path, os.R_OK):
+            pytest.skip("権限を外しても読める環境（root）")
+        r = client.get("/workspace/search", params={"q": f"needle{sfx}"})
+    finally:
+        bad_path.chmod(0o600)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [h["rel_path"] for h in body["hits"]] == [ok["rel_path"]]
+    assert body["unsearched"] == [bad["rel_path"]]

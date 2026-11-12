@@ -17,12 +17,14 @@ import pytest  # noqa: E402
 import _metafile_builders as mb  # noqa: E402
 from sherpa import json_io  # noqa: E402
 from sherpa.ingest import evidence_ir, metafile_text, ocr_router, office_md  # noqa: E402
+from tests._replace_row import offline_row
 
 
 @pytest.fixture(autouse=True)
 def _no_libreoffice(monkeypatch, tmp_path):
     """この file は埋込ビットマップと文字の抽出が対象。全体描画（LibreOffice）は test_metafile_render.py で見る。"""
     monkeypatch.setenv("SHERPA_SOFFICE_BIN", str(tmp_path / "no-such-soffice"))
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})     # OCR の既定は切。この file は入れた状態の挙動を見る
 
 
 # ---- 文字（C） ------------------------------------------------------------------------------
@@ -121,7 +123,7 @@ def _build(monkeypatch, tmp_path: Path, emf: bytes | None = None):
     monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     wd = _docx_world(tmp_path, emf if emf is not None else _figure_emf())
     dmd = tmp_path / "derived" / "md"
-    rep = office_md.build_derived(wd, dmd, world="metafile-world")
+    rep = office_md.build_derived(wd, dmd, world="metafile-world", row=offline_row("metafile-world"))
     assert not rep.get("error") and rep["rag_failed"] == 0 and rep["evidence_ir_failed"] == 0, rep
     return wd, dmd
 
@@ -196,7 +198,7 @@ def _legacy_world(monkeypatch, tmp_path):
     monkeypatch.setattr(legacy_convert, "legacy_exts", lambda: {".doc"})
     monkeypatch.setattr(legacy_convert, "ensure_ooxml", lambda src, rel, cache_root: (converted, []))
     monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
-    rep = office_md.build_derived(wd, dmd)
+    rep = office_md.build_derived(wd, dmd, row=offline_row("w"))
     assert not rep.get("error") and rep["rag_failed"] == 0, rep
     key = Path(str(converted) + ".key")
     key.write_text(legacy_convert._source_key(wd / "old.doc"), encoding="utf-8")
@@ -221,7 +223,7 @@ def test_already_ingested_legacy_doc_gets_the_figure_text_from_the_cached_conver
 
     monkeypatch.setattr(legacy_convert, "convert_to_ooxml", _no_conversion)
     assert office_md.human_md_sig_drift(wd, dmd) is True
-    result = office_md.refresh_human_md(wd, dmd)
+    result = office_md.refresh_human_md(wd, dmd, row=offline_row("w"))
     assert result["human_md_failed"] == 0 and result["human_md_generated"] == 1
     text = md_path.read_text(encoding="utf-8")
     assert text.index("前の段落") < text.index("図の中の文字（元の値）\n- 帳票の見出し") < text.index("後の段落")
@@ -285,7 +287,7 @@ def test_already_ingested_legacy_ppt_gets_the_figure_text_from_the_cached_conver
     monkeypatch.setattr(legacy_convert, "legacy_exts", lambda: {".ppt"})
     monkeypatch.setattr(legacy_convert, "ensure_ooxml", lambda src, rel, cache_root: (converted, []))
     monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
-    office_md.build_derived(wd, dmd)
+    office_md.build_derived(wd, dmd, row=offline_row("w"))
     Path(str(converted) + ".key").write_text(legacy_convert._source_key(wd / "old.ppt"), encoding="utf-8")
     md_path = dmd / "old.ppt.md"
     assert "図の中の文字（元の値）" in md_path.read_text(encoding="utf-8")
@@ -298,7 +300,7 @@ def test_already_ingested_legacy_ppt_gets_the_figure_text_from_the_cached_conver
     monkeypatch.setattr(legacy_convert, "convert_to_ooxml", lambda *_a, **_k: (_ for _ in ()).throw(
         AssertionError("変換を再実行してはいけない")))
     assert office_md.human_md_sig_drift(wd, dmd) is True
-    assert office_md.refresh_human_md(wd, dmd)["human_md_generated"] == 1
+    assert office_md.refresh_human_md(wd, dmd, row=offline_row("w"))["human_md_generated"] == 1
     text = md_path.read_text(encoding="utf-8")
     assert text.index("前の文") < text.index("図の中の文字（元の値）") < text.index("後の文")
     assert office_md.human_md_sig_drift(wd, dmd) is False
@@ -314,12 +316,12 @@ def test_legacy_doc_without_cached_conversion_is_left_alone(monkeypatch, tmp_pat
     data.pop("asset_versions", None)
     manifest.write_text(json.dumps(data), encoding="utf-8")
     assert office_md.human_md_sig_drift(wd, dmd) is False            # 変換が要るので通常の取り込みまで据え置く
-    assert office_md.refresh_human_md(wd, dmd)["human_md_generated"] == 0
+    assert office_md.refresh_human_md(wd, dmd, row=offline_row("w"))["human_md_generated"] == 0
     assert md_path.read_text(encoding="utf-8") == "旧"
 
 
 def test_figure_text_is_independent_of_ocr_being_enabled(monkeypatch, tmp_path):
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "0")
+    monkeypatch.setenv("SHERPA_OCR_ENABLED", "0")
     _, dmd = _build(monkeypatch, tmp_path)
     rag = (dmd.parent / "rag" / "a.docx.rag.md").read_text(encoding="utf-8")
     assert "図の中の文字（元の値）" in rag
@@ -356,11 +358,11 @@ def test_already_ingested_folder_picks_up_children_and_text_once_without_changin
     assert office_md.rag_sig_drift(dmd) is True
 
     result = office_md.refresh_ocr_routes(
-        dmd, world="metafile-world", generation_id=derived_generation.generation_id_for("sig"))
+        dmd, world="metafile-world", generation_id=derived_generation.generation_id_for("sig"), row=offline_row("metafile-world"))
     assert result["ocr_routes_failed"] == 0 and result["ocr_routes_rewritten"] == 1
     assert any(item["status"] == "selected" for item in _route(dmd)["decisions"])
 
-    refreshed = office_md.refresh_rag(wd, dmd, write_rag_sig_marker=True, world="metafile-world")
+    refreshed = office_md.refresh_rag(wd, dmd, write_rag_sig_marker=True, world="metafile-world", row=offline_row("metafile-world"))
     assert refreshed.get("rag_failed", 0) == 0, refreshed
     new_bodies = set(_chunk_bodies(rag_path.read_text(encoding="utf-8")))
     old_bodies = set(_chunk_bodies(old.markdown))

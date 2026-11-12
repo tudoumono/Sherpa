@@ -22,17 +22,18 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .. import json_io
-from . import ai_observation, context_ir, evidence_ir, mermaid_render, pdf_chunking
+from . import ai_observation, context_ir, evidence_ir, mermaid_render, observation_vocab, pdf_chunking
 from .gc_relax import relaxed_gc
 
 
-RAG_RENDERER_VERSION = "evidence-rag-renderer-v1alpha13"
-RAG_CHUNKER_VERSION = "evidence-rag-chunker-v1alpha13"
+RAG_RENDERER_VERSION = "evidence-rag-renderer-v1alpha16"
+RAG_CHUNKER_VERSION = "evidence-rag-chunker-v1alpha16"
 # 関係の文に書く対象の名前の上限（字）。超えた分は対象の要素の本文に全文がある旨を明記する。
 _RELATION_TARGET_NAME_MAX = 2000
 MAX_GROUP_CHARS = 1800
 MAX_TEXT_SPAN_CHARS = 1200
 _BREAK_CHARS = frozenset({"\n", "。", "！", "？", ";", "；"})
+_STATED_OPEN_RE = re.compile(r"【(非表示・取り消し線|取り消し線|非表示)：")
 _CONTAINER_TYPES = frozenset({"sheet", "slide", "page", "table", "group"})
 _EXCEL_VALUE_KEYS = (
     "raw_value", "typed_value", "formula", "cached_value", "calculation_status", "style_id",
@@ -176,34 +177,40 @@ def _excel_value_is_material(metadata: dict[str, Any]) -> bool:
     return bool(display and display != _value_text(metadata.get("raw_value")))
 
 
-# 可視性・廃止表現の表示側: `extension["visibility_reason"]` の平文ラベル対応表。
-# ここに無い reason（None・未知値）は生の `visibility`/`lifecycle` 値に譲る。
-_VISIBILITY_REASON_LABELS: dict[str, str] = {
-    "occluded_by_picture": "画像に覆われている",
-    "occluded_by_shape": "図形に覆われている",
-    "occluded": "図形に覆われている",
-    "hidden_sheet": "シートが非表示",
-    "very_hidden": "シートが完全非表示",
-    "hidden_row": "行が非表示",
-    "hidden_column": "列が非表示",
-    "hidden_run": "非表示文字",
-    "hidden_slide": "スライドが非表示",
-    "hidden_slide_inherited": "非表示スライド内の要素",
-    "off_slide": "スライド範囲外",
-}
+# 全片へ付ける状態の行（改行を含む）の合計の上限。引用する値の長さはこの内側に収める。
+_STATE_NOTE_MAX_CHARS = MAX_TEXT_SPAN_CHARS // 4
+_STATE_QUOTE_MAX_CHARS = 80
+# 全片の注記を差し引いた後でも本文の分割幅がこれを下回らないようにする（注記は上限内なので通常は効かない）
+_MIN_SPLIT_BUDGET = MAX_TEXT_SPAN_CHARS // 4
 
 
-def _occlusion_kv_lines(extension: dict[str, Any]) -> list[str]:
+def _quoted(value: str) -> str:
+    """注記に引用する値。長いものは先頭 `_STATE_QUOTE_MAX_CHARS` 字と元の字数にする（全文は引用元の要素のチャンクにある）。"""
+    if len(value) <= _STATE_QUOTE_MAX_CHARS:
+        return value
+    return f"{value[:_STATE_QUOTE_MAX_CHARS]}…（全{len(value)}字）"
+
+
+def _occlusion_kv_lines(
+    extension: dict[str, Any],
+    budget: int = _STATE_NOTE_MAX_CHARS,
+    relation_lines: list[Any] | None = None,
+) -> list[str]:
     """`extension`（cell/element 共通のキー語彙）から可視性・廃止表現の key-value 行を作る。
 
     意味の断定はしない（`occluded_by`/`covered_by_text` の前面テキストをそのまま写す）。
-    生の reason 文字列（`occluded_by_picture` 等）は `_VISIBILITY_REASON_LABELS` で平文へ写像し、rag.md には出さない。
+    生の reason 文字列（`occluded_by_picture` 等）は `observation_vocab.VISIBILITY_REASON_LABELS` で平文へ写像し、rag.md には出さない。
+    `relation_lines` は関係（覆い・接続）の行の元（`observation_vocab.relation_block` が行にする）で、固定の行の残りの字数に収め、
+    `floating_anchors` の行より前に並べる。
+    行は全片へ付けるので、各行を `"\n" + 行` として足した合計が `budget` に収まるようにする。
+    可視性・取り消し線の行（固定の短い文）は必ず残す。重なり・関係・前面/背面図形の行は引用する値を `_quoted` で短くし、
+    収まらない分の行は出さずに末尾の1行へ件数だけ書く。
     """
-    lines: list[str] = []
+    lines: list[tuple[str, bool]] = []          # (行, 必ず残す行か)
     reason = extension.get("visibility_reason")
-    label = _VISIBILITY_REASON_LABELS.get(reason) if isinstance(reason, str) else None
+    label = observation_vocab.VISIBILITY_REASON_LABELS.get(reason) if isinstance(reason, str) else None
     if label:
-        lines.append(f"可視性: 「{label}」")
+        lines.append((observation_vocab.say("visibility", label=label), True))
     overlap_text = None
     for key in ("occluded_by", "covered_by_text"):
         candidate = extension.get(key)
@@ -211,9 +218,17 @@ def _occlusion_kv_lines(extension: dict[str, Any]) -> list[str]:
             overlap_text = candidate["text"]
             break
     if overlap_text:
-        lines.append(f"重なり: 「{overlap_text}」")
-    if reason == "strike":
-        lines.append("取り消し線: 「あり」")
+        lines.append((observation_vocab.say("overlap_text", value=_quoted(overlap_text)), False))
+    if observation_vocab.is_whole_strike(extension):
+        lines.append((observation_vocab.say("strike_whole"), True))
+    if relation_lines:
+        fixed_cost = sum(1 + len(line) for line, fixed in lines if fixed)
+        has_other = bool(
+            any(not fixed for _line, fixed in lines)
+            or any(isinstance(extension.get(key), list) and extension[key] for key in ("floating_anchors",)))
+        reserve_other = 1 + len(_omitted_line(99)) if has_other else 0
+        lines.extend((line, True) for line in observation_vocab.relation_block(
+            relation_lines, budget - fixed_cost - reserve_other))
     floating_anchors = extension.get("floating_anchors")
     if isinstance(floating_anchors, list):
         for anchor in floating_anchors:
@@ -222,29 +237,116 @@ def _occlusion_kv_lines(extension: dict[str, Any]) -> list[str]:
             value = anchor.get("text") or anchor.get("name")
             if not value:
                 continue
-            anchor_label = "背面図形" if anchor.get("behind_doc") else "前面図形"
-            lines.append(f"{anchor_label}: 「{value}」")
-    return lines
+            anchor_key = "anchor_behind" if anchor.get("behind_doc") else "anchor_front"
+            lines.append((observation_vocab.say(anchor_key, value=_quoted(str(value))), False))
+    optional = sum(1 for _line, fixed in lines if not fixed)
+    used = sum(1 + len(line) for line, fixed in lines if fixed)
+    total = used + sum(1 + len(line) for line, fixed in lines if not fixed)
+    if total <= budget:
+        return [line for line, _fixed in lines]
+    reserve = 1 + len(_omitted_line(optional))
+    kept: list[str] = []
+    shown = 0
+    for line, fixed in lines:
+        if fixed:
+            kept.append(line)
+        elif used + 1 + len(line) + reserve <= budget:
+            used += 1 + len(line)
+            shown += 1
+            kept.append(line)
+    kept.append(_omitted_line(optional - shown))
+    return kept
 
 
-def _split_exact(text: str) -> list[tuple[int, int, str]]:
-    """長大な1セル/1object本文を文字offsetつきで欠落なく分割する。"""
-    if len(text) <= MAX_TEXT_SPAN_CHARS:
+def _omitted_line(count: int) -> str:
+    return observation_vocab.say("state_lines_omitted", count=count)
+
+
+def _stated_brackets(text: str) -> list[tuple[int, int, str]]:
+    """本文中の状態つきの括り（`【取り消し線：…】` 等）の `(開始, 終了, ラベル)`。閉じが無ければ末尾まで。"""
+    if "【" not in text:
+        return []
+    out: list[tuple[int, int, str]] = []
+    pos = 0
+    while (m := _STATED_OPEN_RE.search(text, pos)) is not None:
+        close = text.find("】", m.end())
+        end = len(text) if close < 0 else close + 1
+        out.append((m.start(), end, m.group(1)))
+        pos = end
+    return out
+
+
+def _split_budget(note: str) -> int:
+    """全片へ付ける状態行 `note`（片の末尾へ足す文字列）の字数を引いた、本文1片の分割幅。状態行が無ければ `MAX_TEXT_SPAN_CHARS` のまま。
+    本文がこの幅に収まるときは分割しない（本文＋注記が `MAX_TEXT_SPAN_CHARS` を超えるときだけ分割する）。
+
+    設計: docs/design/rag.md「チャンク化の考え方」
+    """
+    return max(MAX_TEXT_SPAN_CHARS - len(note), _MIN_SPLIT_BUDGET)
+
+
+def _split_exact(text: str, budget: int = MAX_TEXT_SPAN_CHARS) -> list[tuple[int, int, str]]:
+    """長大な1セル/1object本文を文字offsetつきで欠落なく分割する。
+
+    `budget`（既定は `MAX_TEXT_SPAN_CHARS`、全片へ付ける状態行がある本文は `_split_budget`）以下は分割しない。分割するときの1片の幅も `budget`。
+    状態つきの括りの途中では切らない（括りの手前か後ろで切る）。括りが1片の上限より長いときだけ括りの中で切る（`_continued_part` が閉じ・開き直しを付ける）。
+    括りの中で切る片は、`_continued_part` が足す閉じ・開き直しの字数の分だけ短く切る（表示する片も `budget` 以下にする）。括りの中で切らない片の位置は変えない。
+    """
+    if len(text) <= budget:
         return [(0, len(text), text)]
+    brackets = _stated_brackets(text)
+
+    def marks(start: int, end: int) -> int:
+        """`_continued_part(text, start, end)` が足す字数（頭の `【ラベル（続き）：` と末尾の `】`）。"""
+        added = 0
+        for bracket_start, bracket_end, label in brackets:
+            if bracket_start < start < bracket_end:
+                added += len(f"【{label}（続き）：")
+            if bracket_start < end < bracket_end:
+                added += 1
+        return added
+
     spans: list[tuple[int, int, str]] = []
     start = 0
     while start < len(text):
-        hard_end = min(len(text), start + MAX_TEXT_SPAN_CHARS)
+        hard_end = min(len(text), start + budget)
         end = hard_end
         if hard_end < len(text):
-            floor = start + (MAX_TEXT_SPAN_CHARS * 3 // 5)
+            floor = start + (budget * 3 // 5)
             for pos in range(hard_end - 1, floor - 1, -1):
                 if text[pos] in _BREAK_CHARS:
                     end = pos + 1
                     break
+            for bracket_start, bracket_end, _label in brackets:
+                if bracket_start < end < bracket_end:
+                    if bracket_end <= hard_end:
+                        end = bracket_end
+                    elif bracket_start > start:
+                        end = bracket_start
+                    break
+        while end - start + marks(start, end) > budget and end - 1 > start:   # 括りの中で切った片は記号の分だけ短くする
+            end -= end - start + marks(start, end) - budget
+            for bracket_start, bracket_end, _label in brackets:
+                if start < bracket_start < end < bracket_end:   # 短くした先がこの片で始まる括りの中なら、括りの手前で切る
+                    end = bracket_start
+                    break
         spans.append((start, end, text[start:end]))
         start = end
     return spans
+
+
+def _continued_part(text: str, start: int, end: int) -> str:
+    """`text[start:end]` の表示用。括りの途中で切れた片は、終わりで括りを閉じ、次の片の頭で `【ラベル（続き）：` と開き直す。
+
+    括りの外で切れた片は `text[start:end]` のまま（`exact` は常に素の切り出し＝offset と一致）。
+    """
+    part = text[start:end]
+    for bracket_start, bracket_end, label in _stated_brackets(text):
+        if bracket_start < start < bracket_end:
+            part = f"【{label}（続き）：" + part
+        if bracket_start < end < bracket_end:
+            part += "】"
+    return part
 
 
 def _section(locator: evidence_ir.Locator) -> list[str]:
@@ -291,6 +393,47 @@ def _compact_locator(locator: evidence_ir.Locator) -> dict:
 def _compact_cell_locator(locator: evidence_ir.Locator) -> dict:
     """cell citationはchunk-levelのsheet/region文脈を参照し、セル範囲だけを繰り返す。"""
     return {"cell_range": locator.cell_range} if locator.cell_range else _compact_locator(locator)
+
+
+_REF_NAME_MAX = 40
+
+
+def _object_ref(element: evidence_ir.EvidenceElement) -> str:
+    """関係の相手を指す参照（名前・図形 ID・位置）。同名の対象が複数あっても ID と位置で区別できる。
+
+    相手の本文は引用しない。名前が無ければ種別で呼ぶ。名前は `_REF_NAME_MAX` 字で切り、ID と位置は必ず残す。
+    """
+    locator = element.locator
+    name = _value_text(element.extension.get("name")).strip()
+    if len(name) > _REF_NAME_MAX:
+        name = name[:_REF_NAME_MAX] + "…"
+    if element.type == "cell":
+        label = f"セル{locator.cell_range}" if locator.cell_range else "セル"
+    else:
+        label = name or element.type
+    parts: list[str] = []
+    if element.type != "cell" and locator.object_id not in (None, ""):
+        parts.append(f"図形 ID {locator.object_id}")
+    if locator.sheet:
+        range_text = f"のセル範囲 {locator.cell_range}" if locator.cell_range and element.type != "cell" else ""
+        parts.append(f"シート「{locator.sheet}」{range_text}")
+    elif locator.slide is not None:
+        parts.append(f"スライド{locator.slide}")
+    elif locator.page is not None:
+        parts.append(f"ページ{locator.page}")
+    return f"{label}（{'・'.join(parts)}）" if parts else label
+
+
+def _relation_notes(
+    ir: evidence_ir.EvidenceIR,
+    elements: Mapping[str, evidence_ir.EvidenceElement],
+) -> dict[str, list[str]]:
+    """関係（覆い・接続）を両端の要素の行にする（要素 ID → 行）。関係は Evidence に 1 本のまま、描画だけが両側へ書く。"""
+    def ref(element_id: str) -> str | None:
+        element = elements.get(element_id)
+        return _object_ref(element) if element is not None else None
+
+    return observation_vocab.relation_note_lines(ir.relations, ref)
 
 
 def _cell_row_column(element: evidence_ir.EvidenceElement) -> tuple[int | None, int | None]:
@@ -405,27 +548,33 @@ def _field_piece(
     allow_record_identity: bool = False,
     identifier_metadata: dict[str, Any] | None = None,
     excel_metadata: Any = _UNSET,
+    shown: str | None = None,
+    relation_lines: list[Any] | None = None,
 ) -> dict:
+    """セル1片の検索・表示用の項目を作る。`relation_lines` はこのセルが端になる関係（覆い）の行。`shown` は本文と body に書く文字（状態の括りの途中で切れた片は `_continued_part` で閉じ・開き直したもの）。
+    `exact`・`start`・`end` は原本の文字範囲のまま（`text_span` と識別子の位置に使う）。
+    """
     row, column = _cell_row_column(cell)
     field_label = label or "記載値"
+    shown = exact if shown is None else shown
     if excel_metadata is _UNSET:
         excel_metadata = _excel_value_metadata(cell)
     if span_count > 1:
-        semantic = f"{field_label}（{span_index + 1}/{span_count}）:\n{exact}"
+        semantic = f"{field_label}（{span_index + 1}/{span_count}）:\n{shown}"
     else:
-        semantic = f"{field_label}: 「{exact}」"
+        semantic = f"{field_label}: 「{shown}」"
     for relation in layout_relations:
         if relation["type"] == "continues":
             semantic += "（同じ縦結合ラベル内の前後記載と連続）"
         elif relation["type"] == "separate":
             semantic += "（隣接行と左ラベルが異なる別項目）"
-    occlusion_lines = _occlusion_kv_lines(cell.extension)
+    occlusion_lines = _occlusion_kv_lines(cell.extension, relation_lines=relation_lines)
     material = (span_index == 0 and excel_metadata is not None and _excel_value_is_material(excel_metadata))
     if span_index == 0:
         semantic += _excel_value_note(excel_metadata, material)
-        if occlusion_lines:
-            semantic += "\n" + "\n".join(occlusion_lines)
-    exact_lines = [f"{field_label}: {exact}"]
+    if occlusion_lines:
+        semantic += "\n" + "\n".join(occlusion_lines)
+    exact_lines = [f"{field_label}: {shown}"]
     if material:
         exact_lines.extend([
             f"{field_label}のExcel原値: {_value_text(excel_metadata.get('raw_value'))}",
@@ -434,8 +583,7 @@ def _field_piece(
         ])
         if excel_metadata.get("formula") is not None:
             exact_lines.append(f"{field_label}のExcel数式: {_value_text(excel_metadata.get('formula'))}")
-    if span_index == 0 and occlusion_lines:
-        exact_lines.extend(occlusion_lines)
+    exact_lines.extend(occlusion_lines)
     if identifier_metadata is None:
         identifier_metadata = _extract_identifier_metadata(
             exact,
@@ -449,6 +597,7 @@ def _field_piece(
         "semantic": semantic,
         "markdown": semantic,
         "exact": "\n".join(exact_lines),
+        "observation_line_count": sum(line.count("\n") + 1 for line in occlusion_lines),
         "evidence_id": cell.element_id,
         "locator": _compact_cell_locator(cell.locator),
         "header_path": label.split(" > ") if label else [],
@@ -479,6 +628,18 @@ def _pack_row(pieces: list[dict], context_prefix: str) -> list[list[dict]]:
     if current:
         groups.append(current)
     return groups
+
+
+def _observation_line_numbers(pieces: list[dict]) -> list[int]:
+    """本文（`exact_text`）の中で、描画が付けた状態・重なり・関係の行（観測の行）の 0 始まりの行番号。利用者の通常の値の行と区別するための出自。"""
+    numbers: list[int] = []
+    offset = 0
+    for piece in pieces:
+        total = piece["exact"].count("\n") + 1
+        count = piece.get("observation_line_count") or 0
+        numbers.extend(range(offset + total - count, offset + total))
+        offset += total
+    return numbers
 
 
 def _base_record(
@@ -522,6 +683,7 @@ def _base_record(
     markdown = "\n\n".join(part for part in (context_prefix, "\n\n".join(
         piece["markdown"] for piece in pieces)) if part)
     exact = "\n".join(piece["exact"] for piece in pieces)
+    observation_lines = _observation_line_numbers(pieces)
     record_id = _stable_id(
         "rag-record", source_hash, kind, logical_record_id, group_index, group_count,
         evidence_ids, [piece["text_span"] for piece in pieces], semantic,
@@ -565,6 +727,7 @@ def _base_record(
         "semantic_text": semantic,
         "markdown_text": markdown,
         "exact_text": exact,
+        "observation_lines": observation_lines,
         "evidence_ids": evidence_ids,
         "citations": citations,
         "relations": list({
@@ -945,7 +1108,10 @@ def _table_records(
     ir: evidence_ir.EvidenceIR,
     ctx: context_ir.ContextIR,
     aliases: dict[str, list[evidence_ir.EvidenceElement]],
+    relation_notes: dict[str, list[str]] | None = None,
 ) -> list[dict]:
+    relation_notes = relation_notes if relation_notes is not None else _relation_notes(
+        ir, {element.element_id: element for element in ir.elements})
     by_parent: dict[str, list[evidence_ir.EvidenceElement]] = defaultdict(list)
     for element in ir.elements:
         if element.type == "cell" and element.parent_id:
@@ -1025,7 +1191,12 @@ def _table_records(
                         header = _value_text(label.value) if label is not None else "記載値"
                     excel_metadata = _excel_value_metadata(cell)
                     exact = _cell_render_text(cell, excel_metadata)
-                    spans = _split_exact(exact)
+                    cell_relation_lines = relation_notes.get(cell.element_id)
+                    if len(exact) > MAX_TEXT_SPAN_CHARS - _STATE_NOTE_MAX_CHARS:
+                        state_lines = _occlusion_kv_lines(cell.extension, relation_lines=cell_relation_lines)
+                        spans = _split_exact(exact, _split_budget("\n" + "\n".join(state_lines) if state_lines else ""))
+                    else:
+                        spans = _split_exact(exact)
                     allow_identity = cell.element_id in key_evidence_ids
                     for span_index, (start, end, part) in enumerate(spans):
                         identifier_metadata = _extract_identifier_metadata(
@@ -1044,6 +1215,8 @@ def _table_records(
                             allow_record_identity=allow_identity,
                             identifier_metadata=identifier_metadata,
                             **({"excel_metadata": excel_metadata} if span_index == 0 else {}),
+                            shown=_continued_part(exact, start, end),
+                            relation_lines=cell_relation_lines,
                         )
                         if span_index == 0 and cell.element_id in aliases:
                             piece["extra_citations"] = [
@@ -1135,6 +1308,7 @@ def _element_piece(
     source_name: str,
     section_path: list[str] | None = None,
     include_native_metadata: bool = False,
+    relation_lines: list[Any] | None = None,
 ) -> dict | None:
     exact = _value_text(element.value)
     excel_metadata = _excel_value_metadata(element)
@@ -1143,6 +1317,7 @@ def _element_piece(
     # `_non_table_records` の長文分割で本文だけに上書きされた際、先頭 chunk へ引き継ぐための複製。
     metadata_tail = ""     # semanticへの追加分（markdownはこれ+markdown_tail）
     markdown_tail = ""     # markdown固有の追加分（画像リンク等・semanticには載せない）
+    state_tail = ""        # metadata_tail のうち要素に結び付いた状態・重なり・前面/背面図形の行。長文分割では全片に付ける
     section_text = "の".join(section_path) if section_path else _section(element.locator)[0]
     document_context = f"原本「{Path(source_name).name}」の{section_text}"
     outgoing = [relation for relation in relations if relation.source_id == element.element_id]
@@ -1165,15 +1340,18 @@ def _element_piece(
             target_label = target_label[:_RELATION_TARGET_NAME_MAX] + f"…（以下 {omitted} 字を省略）"
         if relation.type == "overlaps":
             if element.extension.get("alpha") == 0:
-                relation_texts.append(f"この要素は対象「{target_label}」の原本領域に重なっている")
+                relation_texts.append(observation_vocab.say("relation_overlaps_hidden_by_alpha", target=target_label))
             else:
-                relation_texts.append("この要素は別要素の原本領域に重なっている")
+                relation_texts.append(observation_vocab.say("relation_overlaps"))
         elif relation.type == "connects_to":
-            relation_texts.append(f"この要素は対象「{target_label}」へ接続している")
+            if relation.extension.get("direction") != observation_vocab.DIRECTION_ENDPOINT_ORDER_ONLY:
+                relation_texts.append(observation_vocab.say("relation_connects", target=target_label))
         elif relation.type == "covered_by":
-            relation_texts.append("このtext layerは後描画の全面画像に覆われており、現行回答に使用しない")
-        elif relation.type in {"covers", "painted_after"}:
-            relation_texts.append(f"この要素は対象要素と「{relation.type}」の関係にある")
+            relation_texts.append(observation_vocab.say("relation_covered_by"))
+        elif relation.type == "painted_after" or (
+                relation.type == observation_vocab.RELATION_COVERS
+                and relation.extension.get("basis") != observation_vocab.BASIS_GEOMETRY):
+            relation_texts.append(observation_vocab.say("relation_other", type=relation.type))
         rendered_relations.append({
             "type": relation.type,
             "source_id": relation.source_id,
@@ -1184,11 +1362,18 @@ def _element_piece(
             "extension": relation.extension,
         })
 
+    # 関係（覆い・接続）と未解析の通知は、本文を持たない要素でも要素自身の行に残す。上限は状態の行と同じ。
+    own_lines = list(relation_lines or ()) if include_native_metadata else []
+    if element.type == "ole_object":
+        name = _value_text(element.extension.get("name")) or _value_text(element.extension.get("prog_id")) or element.type
+        own_lines.append(observation_vocab.say("notice_ole", name=name))
+    own_note = "".join("\n" + line for line in _occlusion_kv_lines({}, relation_lines=own_lines)) if own_lines else ""
+
     if element.type in {"picture", "image_xobject"}:
         href = _asset_href(source_name, element)
         alt = element.extension.get("name") or f"画像 object {element.locator.object_id}"
         image_md = f"![{alt}（内容未解釈）]({href})" if href else f"画像「{alt}」（内容未解釈）"
-        semantic = f"{document_context}に画像「{alt}」が存在する。画像内容は未解釈である。"
+        semantic = observation_vocab.say("picture_uninterpreted", context=document_context, alt=alt)
         if element.type == "image_xobject" and not any(
             candidate.locator.page == element.locator.page
             and candidate.type in {"text_object", "positioned_text", "cell"}
@@ -1198,6 +1383,7 @@ def _element_piece(
             semantic += " このページはテキスト層を持たず、内容取得にはOCRまたは画像理解が必要である。"
         if relation_texts:
             semantic += " " + "。".join(relation_texts) + "。"
+        semantic += own_note
         markdown = image_md + "\n\n" + semantic
     elif exact:
         type_label = ({
@@ -1229,25 +1415,39 @@ def _element_piece(
         metadata_tail += _excel_value_note(excel_metadata)
         # `visibility_reason` に平文ラベルの対応があれば、生の `visibility` 値の代わりにそれを出す
         # （`occlusion_lines` が可視性行を持つ場合は `state_texts` 側の可視性行を出さない）
-        occlusion_lines = _occlusion_kv_lines(element.extension) if include_native_metadata else []
-        occlusion_has_visibility = any(line.startswith("可視性:") for line in occlusion_lines)
+        extension = element.extension
+        if (element.type == "strike_text" and extension.get("visibility_reason") is None
+                and "format_state" not in extension):
+            extension = {**extension, "format_state": observation_vocab.whole_strike_state()}
+        reason = extension.get("visibility_reason")
+        occlusion_has_visibility = isinstance(reason, str) and reason in observation_vocab.VISIBILITY_REASON_LABELS
         state_texts = []
         if element.visibility != "visible" and not occlusion_has_visibility:
-            state_texts.append(f"可視性: 「{element.visibility}」")
+            state_texts.append(observation_vocab.say("visibility", label=element.visibility))
         if element.lifecycle != "active":
-            state_texts.append(f"状態: 「{element.lifecycle}」")
+            state_texts.append(observation_vocab.say("lifecycle", value=element.lifecycle))
+        state_line = "\n" + " / ".join(state_texts) if state_texts else ""
+        occlusion_lines = (
+            _occlusion_kv_lines(extension, _STATE_NOTE_MAX_CHARS - len(state_line), relation_lines)
+            if include_native_metadata else [])
         if include_native_metadata and state_texts:
-            metadata_tail += "\n" + " / ".join(state_texts)
+            metadata_tail += state_line
+            state_tail += state_line
         if occlusion_lines:
             metadata_tail += "\n" + "\n".join(occlusion_lines)
+            state_tail += "".join("\n" + line for line in occlusion_lines)
         semantic = base_sentence + metadata_tail
         markdown = semantic
     elif relation_texts:
-        semantic = "。".join(relation_texts) + "。"
+        identity = ""   # 本文の無い要素も、どの要素の関係かを自分のチャンクで言う（出所と自身の参照）
+        if include_native_metadata:
+            identity = ("出所: " + " / ".join([f"原本「{Path(source_name).name}」", *(section_path or _section(element.locator))])
+                        + "\n" + observation_vocab.say("self_ref", ref=_object_ref(element)) + "\n")
+        semantic = identity + "。".join(relation_texts) + "。" + own_note
         markdown = semantic
     else:
         # 値も関係もないobjectは存在自体を落とさない。
-        semantic = f"{document_context}に{element.type}が存在する。"
+        semantic = f"{document_context}に{element.type}が存在する。" + own_note
         markdown = semantic
     if shape_fill_assets:
         asset_count = len(shape_fill_assets)
@@ -1294,6 +1494,7 @@ def _element_piece(
         "text_span": {"start": 0, "end": len(exact), "index": 1, "count": 1},
         "relations": rendered_relations,
         "metadata_tail": metadata_tail,
+        "state_tail": state_tail,
         "markdown_tail": markdown_tail,
         **_extract_identifier_metadata(
             exact,
@@ -1327,92 +1528,134 @@ def _element_section_path(
     return section
 
 
+_STATED_OPEN_ANY_RE = re.compile(r"【(?:非表示・取り消し線|取り消し線|非表示)(?:（続き）)?：")
+
+
+def _without_state_brackets(text: str) -> str:
+    """状態の括り（`【取り消し線：…】`・`【非表示：…】`・`【非表示・取り消し線：…】`と続きの表記）を外した文字。括りの無い文字はそのまま。"""
+    if "【" not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    while (m := _STATED_OPEN_ANY_RE.search(text, pos)) is not None:
+        out.append(text[pos:m.start()])
+        close = text.find("】", m.end())
+        out.append(text[m.end():] if close < 0 else text[m.end():close])
+        pos = len(text) if close < 0 else close + 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _textbox_comparison_text(text: str) -> str:
+    """textbox の文字を比べるための形。状態の括りと、改行・空白（全角を含む）を除く（段落のつなぎ方の違いを吸収する）。"""
+    return "".join(_without_state_brackets(text).split())
+
+
 def _docx_textbox_aliases(
     elements: dict[str, evidence_ir.EvidenceElement],
 ) -> tuple[dict[str, list[evidence_ir.EvidenceElement]], set[str]]:
-    """同一浮動textboxのDocument IR/VML多重表現を、幾何情報のある1recordへ束ねる。
+    """同一浮動textboxのDocument IR/VML多重表現を、1recordへ束ねる。
 
-    値だけで複数objectを誤同定しないよう、同文の子textboxが1個で、floating/VML候補も
-    同じhost partにそれぞれ最大1個の場合に限る。幾何・assetを持つVMLを最優先にし、ホスト段落は
-    子textboxと完全同文の場合だけaliasにする。
+    同じ原本の図形だと確かめられたものだけを束ねる。確かめる根拠は、Document IRのtextboxが持つ囲む図形の原本ID
+    （`document_ir_source_map.object_ids`＝docPr/@id・VMLのshape@id。`mc:AlternateContent`ならChoice/Fallback全体）と、
+    浮動textbox・VMLの原本IDの一致。同じ部品で、状態の括りと改行・空白を除いた文字が同じで、各候補が1個のときに限る。
+    IDを持たない・一致しない・候補が複数のとき、同じ候補を複数の子が名乗るときは束ねず、どれも別の原本要素として残す
+    （文字列の一致だけでは束ねない）。比べるための正規化と、表示に残す本文の選び方は別: 括り・関連付けの事実を持つ側、
+    または直接読む側が改行・空白を失っている（原文と一致しない）ときは、段落の区切りを保つDocument IR側を本文に残す。
+    本文の無い段落に置いたtextbox（`parent_id`が無い）も同じ条件で束ねる。
+    束ねた後は、本文に残さない側の幾何（位置・ID・名前）を引用先として付ける。原文が一致するときは、幾何・assetを持つVMLを最優先にする。
+    ホスト段落は本文として別の原本要素なので、子textboxと同文でも束ねない。
     """
-    floating_by_text: dict[str, list[evidence_ir.EvidenceElement]] = defaultdict(list)
-    child_by_text: dict[str, list[evidence_ir.EvidenceElement]] = defaultdict(list)
-    vml_by_text: dict[str, list[evidence_ir.EvidenceElement]] = defaultdict(list)
+    candidates: dict[tuple[str, str, str], list[evidence_ir.EvidenceElement]] = defaultdict(list)
     for element in elements.values():
-        text = _value_text(element.value)
-        if not text:
+        text = _textbox_comparison_text(_value_text(element.value))
+        if text and element.type in {"floating_textbox", "vml_shape"} and element.locator.object_id is not None:
+            candidates[(element.type, element.locator.part, text)].append(element)
+
+    # ① 子ごとに、同じ原本の図形と確かめられる直接読む側の候補を集める
+    matches: dict[str, tuple[list[evidence_ir.EvidenceElement], list[evidence_ir.EvidenceElement]]] = {}
+    for child in elements.values():
+        shown = _value_text(child.value)
+        if not shown or child.type != "textbox":
             continue
-        if element.type == "floating_textbox":
-            floating_by_text[text].append(element)
-        elif element.type == "textbox" and element.parent_id:
-            child_by_text[text].append(element)
-        elif element.type == "vml_shape":
-            vml_by_text[text].append(element)
+        source_map = child.locator.extension.get("document_ir_source_map")
+        ids = {str(i) for i in source_map.get("object_ids", [])} if isinstance(source_map, dict) else set()
+        if not ids:
+            continue
+        text = _textbox_comparison_text(shown)
+
+        def same_object(kind: str) -> list[evidence_ir.EvidenceElement]:
+            return [item for item in candidates.get((kind, child.locator.part, text), [])
+                    if str(item.locator.object_id) in ids]
+
+        floating, vml = same_object("floating_textbox"), same_object("vml_shape")
+        if len(floating) <= 1 and len(vml) <= 1 and (floating or vml):
+            matches[child.element_id] = (floating, vml)
+    # ② 同じ直接読む側の図形を複数の子が名乗るときは、どれと同じ図形か決められないので、どれも束ねない
+    claims = Counter(item.element_id for floating, vml in matches.values() for item in (*floating, *vml))
 
     aliases: dict[str, list[evidence_ir.EvidenceElement]] = defaultdict(list)
     suppressed: set[str] = set()
-    for text, children in child_by_text.items():
-        floating = floating_by_text.get(text, [])
-        if len(children) != 1 or len(floating) > 1:
+    for child_id, (floating, vml) in matches.items():
+        if any(claims[item.element_id] > 1 for item in (*floating, *vml)):
             continue
-        child = children[0]
-        matching_vml = [candidate for candidate in vml_by_text.get(text, [])
-                        if candidate.locator.part == child.locator.part]
-        if len(matching_vml) > 1:
-            continue
-        primary = matching_vml[0] if matching_vml else floating[0] if floating else child
-        for alias in [child, *floating]:
+        child = elements[child_id]
+        shown = _value_text(child.value)
+        natives = [*floating, *vml]
+        # 状態（括り・関連付けの事実）を持つ側、または直接読む側が段落の区切りを失っている側を本文に残す
+        if (_without_state_brackets(shown) != shown or child.extension.get("floating_anchors")
+                or any(_value_text(item.value) != shown for item in natives)):
+            primary, others = child, natives
+        else:
+            primary = vml[0] if vml else floating[0]
+            others = [child, *floating]
+        for alias in others:
             if alias.element_id == primary.element_id:
                 continue
             aliases[primary.element_id].append(alias)
             suppressed.add(alias.element_id)
-        parent = elements.get(child.parent_id or "")
-        if parent is not None and _value_text(parent.value) == text:
-            aliases[primary.element_id].append(parent)
-            suppressed.add(parent.element_id)
     return dict(aliases), suppressed
 
 
 def _pptx_object_aliases(
     elements: dict[str, evidence_ir.EvidenceElement],
 ) -> tuple[dict[str, list[evidence_ir.EvidenceElement]], set[str]]:
-    """Document IR由来shapeとnative DrawingML objectをslide/z位置で1つのRAG recordへ束ねる。"""
+    """Document IR由来shapeとnative DrawingML objectを、スライドと原本の図形ID（cNvPr/@id）で1つのRAG recordへ束ねる。
+
+    同じスライドに同じ図形IDが複数あるときは、どれが対応するか決められないので束ねない（元の図形を残す）。
+    """
     slide_ids = {
         element.element_id
         for element in elements.values()
         if element.type == "slide"
     }
     children: dict[str, list[evidence_ir.EvidenceElement]] = defaultdict(list)
-    native_by_slot: dict[tuple[int, int], evidence_ir.EvidenceElement] = {}
+    native_by_shape: dict[tuple[int, int], list[evidence_ir.EvidenceElement]] = defaultdict(list)
     adapted: list[tuple[evidence_ir.EvidenceElement, int]] = []
     for element in elements.values():
         if element.parent_id:
             children[element.parent_id].append(element)
         source_map = element.locator.extension.get("document_ir_source_map", {})
         if element.extension.get("origin") == "document-ir-v2-adapter" and element.type == "shape":
-            z_index = source_map.get("z_index") if isinstance(source_map, dict) else None
-            if isinstance(z_index, int):
-                adapted.append((element, z_index))
+            shape_id = source_map.get("shape_id") if isinstance(source_map, dict) else None
+            if isinstance(shape_id, int):
+                adapted.append((element, shape_id))
             continue
-        z_order = element.extension.get("z_order")
+        object_id = element.locator.object_id
         if (element.parent_id in slide_ids and element.locator.slide is not None
-                and isinstance(z_order, int)):
-            native_by_slot[(element.locator.slide, z_order)] = element
+                and isinstance(object_id, int)):
+            native_by_shape[(element.locator.slide, object_id)].append(element)
 
     aliases: dict[str, list[evidence_ir.EvidenceElement]] = defaultdict(list)
     suppressed: set[str] = set()
-    first_z = {
-        slide: min(z_index for alias, z_index in adapted if alias.locator.slide == slide)
-        for slide in {alias.locator.slide for alias, _z_index in adapted if alias.locator.slide is not None}
-    }
-    for alias, z_index in adapted:
+    for alias, shape_id in adapted:
         slide = alias.locator.slide
         if not isinstance(slide, int):
             continue
-        native = native_by_slot.get((slide, z_index - first_z[slide] + 1))
-        if native is None:
+        candidates = native_by_shape.get((slide, shape_id), [])
+        if len(candidates) != 1:
             continue
+        native = candidates[0]
         target = native
         if native.type in {"table", "group"}:
             # 束ね先は実際に RAG レコードとして出力される要素（本文を持つ要素）に限る。
@@ -1560,9 +1803,11 @@ def _non_table_records(
     ctx: context_ir.ContextIR,
     aliases: dict[str, list[evidence_ir.EvidenceElement]],
     suppressed: set[str],
+    relation_notes: dict[str, list[str]] | None = None,
 ) -> list[dict]:
     source_name = ctx.source_name
     elements = {element.element_id: element for element in ir.elements}
+    relation_notes = relation_notes if relation_notes is not None else _relation_notes(ir, elements)
     cell_ids = {element.element_id for element in ir.elements if element.type == "cell"}
     records: list[dict] = []
     merged_ids: set[str] = set()
@@ -1580,6 +1825,7 @@ def _non_table_records(
             source_name,
             section_path,
             include_native_metadata=ir.source.file_type in {"xlsx", "docx", "pptx", "pdf"},
+            relation_lines=relation_notes.get(element.element_id),
         )
         if raw_piece is None:
             continue
@@ -1598,17 +1844,18 @@ def _non_table_records(
         if extra_citations:
             raw_piece["extra_citations"] = extra_citations
         exact = raw_piece["exact"]
-        spans = _split_exact(exact) if exact else [(0, 0, "")]
+        spans = _split_exact(exact, _split_budget(raw_piece.get("state_tail", ""))) if exact else [(0, 0, "")]
         pieces: list[dict] = []
         if len(spans) == 1:
             pieces = [raw_piece]
         else:
             metadata_tail = raw_piece.get("metadata_tail", "")
+            state_tail = raw_piece.get("state_tail", "")
             markdown_tail = raw_piece.get("markdown_tail", "")
             for index, (start, end, part) in enumerate(spans):
                 semantic = (
                     f"原本「{Path(source_name).name}」の{'の'.join(section_path)}にある"
-                    f"{element.type}内容（{index + 1}/{len(spans)}）:\n{part}"
+                    f"{element.type}内容（{index + 1}/{len(spans)}）:\n{_continued_part(exact, start, end)}"
                 )
                 markdown = semantic
                 if index == 0:
@@ -1616,6 +1863,10 @@ def _non_table_records(
                     # 分割後の先頭 chunk にだけ引き継ぐ（markdown 固有の画像リンク等は `markdown_tail` で復元する）。
                     semantic += metadata_tail
                     markdown += metadata_tail + markdown_tail
+                else:
+                    # 状態・重なり・前面/背面図形の行は要素全体の観測なので、後続の片にも付ける（relation 叙述文などは先頭だけ）。
+                    semantic += state_tail
+                    markdown += state_tail
                 pieces.append({
                     **raw_piece,
                     "semantic": semantic,
@@ -1861,6 +2112,7 @@ def _flow_diagram_records(ir: evidence_ir.EvidenceIR, ctx: context_ir.ContextIR)
         connects_to = [
             relation for relation in ir.relations
             if relation.type == "connects_to"
+            and relation.extension.get("ends", observation_vocab.ENDS_BOTH) == observation_vocab.ENDS_BOTH
             and relation.source_id in container_ids and relation.target_id in container_ids
         ]
         overlaps = [
@@ -2002,7 +2254,7 @@ def _apply_hidden_sheet_visibility(records: list[dict], ir: evidence_ir.Evidence
         label = hidden.get(sheet) if isinstance(sheet, str) else None
         if not label:
             continue
-        line = f"シートの可視性: 「{label}」"
+        line = observation_vocab.say("sheet_visibility", label=label)
         for key in ("semantic_text", "markdown_text"):
             text = record.get(key)
             if isinstance(text, str) and line not in text:
@@ -2083,7 +2335,7 @@ def _finalize_chunks(
             "unclassified_identifier_values_exact": record.get("unclassified_identifier_values_exact", []),
         }
         for key in ("parent_id", "source_name", "document_context", "region_context", "record_keys",
-                    "related_record_ids", "context_confidence", "ai_observation"):
+                    "related_record_ids", "context_confidence", "ai_observation", "observation_lines"):
             value = record.get(key)
             if value not in (None, {}, []):
                 chunk[key] = value
@@ -2258,8 +2510,9 @@ def render(
         context = context_ir.build(ir, source_name=source_name)
     elements = {element.element_id: element for element in ir.elements}
     aliases, suppressed = _element_aliases(ir, elements)
-    records = _table_records(ir, context, aliases) + _non_table_records(
-        ir, context, aliases, suppressed)
+    relation_notes = _relation_notes(ir, elements)
+    records = _table_records(ir, context, aliases, relation_notes) + _non_table_records(
+        ir, context, aliases, suppressed, relation_notes)
     records.extend(_coverage_notice_records(ir, source_name))
     records.extend(_flow_diagram_records(ir, context))
     if figure_texts:

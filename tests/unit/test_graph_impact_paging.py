@@ -514,7 +514,8 @@ def test_merge_passes_legacy_results_errors_and_other_parts_through(env):
     assert out == [legacy, err]                                                 # 関連資料のページは影響先の集合に入らない
 
 
-def test_the_ledger_target_set_comes_from_all_pages_and_the_rules_do_not_change(env):
+def test_impact_results_merge_all_pages_into_one_result(env):
+    """計画書方式が読む影響の結果は、ページを分けて受け取っても 1 件にまとまり、呼び出しの数も 1 回と数える。"""
     from sherpa.providers.codex import plan_ledger as PL
     pages = _walk({"evidence_limit": 0})
 
@@ -526,19 +527,7 @@ def test_the_ledger_target_set_comes_from_all_pages_and_the_rules_do_not_change(
         _call_log_dir = None
         turn_uid = "t"
 
-    results = PL.graph_impact_results(St())
-    assert len(results) == 1
-    targets, calls = PL.required_targets(results)
-    assert {t["id"] for t in targets.values()} == {f"top/a{int(c[1:]) % 5}/N{c[1:]}.cbl" for c in EXPECTED_IDS}
-    assert len(calls) == 1 and PL.graph_incomplete(St()) is False
-    answer = "影響先:\n" + "\n".join(f"- {t['path']}" for t in list(targets.values())[:-1])
-    check = PL.check_targets(results, "この項目を変えたときの影響先を全て挙げて", answer)
-    assert check["status"] == "missing" and check["missing_count"] == 1 and check["coverage_complete"] is True
-    Merged.graph = _views(pages[:1])                                            # 先頭だけ受け取った状態
-    assert PL.graph_incomplete(St()) is True
-    partial = PL.check_targets(PL.graph_impact_results(St()), "影響先を全て挙げて", answer)
-    assert partial["coverage_complete"] is False
-    assert partial["required_count"] == len(pages[0]["impact"])                # 受け取っていない対象を必須にも読んだことにもしない
+    assert len(PL.graph_impact_results(St())) == 1
     assert PL._graph_stats(St())["impact_calls"] == 1
 
 

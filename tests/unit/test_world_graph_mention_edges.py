@@ -111,7 +111,7 @@ def test_min_len_filters_short_names_by_constant(tmp_path, monkeypatch):
     _, edges, _ = world_graph.build_world(wd, "w")
     assert _mention_edges(edges) == []
 
-    monkeypatch.setattr(world_graph, "_MENTION_MIN_LEN", 3)
+    monkeypatch.setattr("sherpa.ingest.graph.mention._MENTION_MIN_LEN", 3)
     _, edges, _ = world_graph.build_world(wd, "w")
     doc_edges = _mention_edges(edges)
     assert len(doc_edges) == 1
@@ -265,7 +265,7 @@ def test_mention_overflow_caps_edges_and_flags_the_excess(tmp_path, monkeypatch)
     })
     defs = {"g1/a.fk": _def("Module", "NAME-ONE"), "g1/b.fk": _def("Module", "NAME-TWO")}
     monkeypatch.setattr(registry, "_ANALYZERS", (_FakeAnalyzer(defs),))
-    monkeypatch.setattr(world_graph, "_MENTION_MAX_PER_DOC", 1)
+    monkeypatch.setattr("sherpa.ingest.graph.mention._MENTION_MAX_PER_DOC", 1)
 
     _, edges, flags = world_graph.build_world(wd, "w")
     doc_edges = _mention_edges(edges)
@@ -344,11 +344,11 @@ def test_world_signature_changes_with_mention_min_len_and_max_per_doc(monkeypatc
     sig_default = worker.world_signature_of_root(wd)
 
     with monkeypatch.context() as m:
-        m.setattr(world_graph, "_MENTION_MIN_LEN", 6)
+        m.setattr("sherpa.ingest.graph.mention._MENTION_MIN_LEN", 6)
         assert worker.world_signature_of_root(wd) != sig_default
     assert worker.world_signature_of_root(wd) == sig_default, "既定値へ戻せば署名も再現する"
 
     with monkeypatch.context() as m:
-        m.setattr(world_graph, "_MENTION_MAX_PER_DOC", 50)
+        m.setattr("sherpa.ingest.graph.mention._MENTION_MAX_PER_DOC", 50)
         assert worker.world_signature_of_root(wd) != sig_default
     assert worker.world_signature_of_root(wd) == sig_default

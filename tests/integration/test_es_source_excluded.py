@@ -14,6 +14,7 @@ import pytest
 from sherpa import corpus_docs, tool_dispatch, worlds
 from sherpa import es_index as es
 from sherpa.ingest import office_md, worker
+from tests._replace_row import offline_row
 
 ROOT = Path(__file__).resolve().parents[2]
 CORPUS = ROOT / "fixtures" / "corpus" / "v1"
@@ -35,11 +36,11 @@ def es_world(tmp_path, monkeypatch):
     real_world_dir = worlds.world_dir
     monkeypatch.setattr(worlds, "world_dir", lambda w: src if w == WORLD else real_world_dir(w))
     monkeypatch.setattr(es.embeddings, "cfg", lambda settings=None, **kw: None)
-    rep = office_md.build_derived(src, worlds.derived_md_dir(WORLD), world_sig="s1")
+    rep = office_md.build_derived(src, worlds.derived_md_dir(WORLD), world_sig="s1", row=offline_row("w"))
     assert rep.get("error") is None, rep
     register_test_world(WORLD)
     yield WORLD
-    es.delete_world(WORLD)
+    es.delete_world(WORLD, row=offline_row(WORLD))
 
 
 def _raw_search(world: str, query: dict, size: int = 2000) -> list:
@@ -62,7 +63,7 @@ def _index_with_source(world: str):
     real = es._is_source_doc
     es._is_source_doc = lambda d: False
     try:
-        return es.index_world(world)
+        return es.index_world(world, row=offline_row(world))
     finally:
         es._is_source_doc = real
 
@@ -76,7 +77,7 @@ def test_source_chunks_are_not_in_es_and_docs_results_do_not_change(es_world, mo
     assert source_chunks > 0 and n_before == before["chunks"]
     snap_before = _docs_snapshot(es_world)
 
-    after = es.index_world(es_world)
+    after = es.index_world(es_world, row=offline_row(es_world))
     n_after = es.count(es_world)
     assert after["chunks"] == n_after == n_before - source_chunks                # ソース分だけ減る
     assert not _raw_search(es_world, {"term": {"branch": "source"}})
@@ -92,7 +93,7 @@ def test_source_chunks_are_not_in_es_and_docs_results_do_not_change(es_world, mo
 
 
 def test_es_search_tool_notes_where_to_search_source(es_world):
-    es.index_world(es_world)
+    es.index_world(es_world, row=offline_row(es_world))
     both = tool_dispatch.run_tool("es_search", {"query": "TAXCALC"}, es_world, None)[0]
     assert "ripgrep_search" in both["notice"] and "error" not in both
     assert all(not h["doc_id"].endswith((".cbl", ".cpy", ".jcl")) for h in both["hits"])
@@ -106,7 +107,7 @@ def test_old_index_with_source_chunks_is_rebuilt_once_and_loses_them(es_world, m
     """ソースのチャンクが残った旧索引（`source_excluded` の印なし）は、次の更新で 1 回だけ入れ直されてソースが消える。"""
     def sync() -> bool:
         if es.needs_reindex(es_world, "sig-1", settings={}):
-            return worker.index_world_with_human_md_holdback(es_world, content_sig="sig-1", settings={}).get("error") is None
+            return worker.index_world_with_human_md_holdback(es_world, content_sig="sig-1", settings={}, row=offline_row(es_world)).get("error") is None
         return False
 
     real = es._is_source_doc

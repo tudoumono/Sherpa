@@ -1,0 +1,17 @@
+{
+  "counts": {
+    "edge_types": {
+      "CONTAINS": 14,
+      "INVOKES": 17
+    },
+    "edges": 31,
+    "flag_reasons": {},
+    "flags": 0,
+    "node_labels": {
+      "Module": 28
+    },
+    "nodes": 28
+  },
+  "sha256": "d9a5324fb820077ab8bb1bd19febc8cb438ace23892a7ce8b372c9b1c97d07ef",
+  "world": "ana-s2"
+}

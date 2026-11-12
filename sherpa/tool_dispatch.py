@@ -5,19 +5,33 @@ MCP・回答ループ・外部 API が共有する。
 """
 from __future__ import annotations
 
-from .parts.read import tools as read_tools
+from .parts.read import listing, name_lookup, tools as read_tools
 
 
 def run_tool(name: str, args: dict, world: str, scope_paths,
             deadline: float | None = None, layer=None,
             max_hits: int | None = None, window_cap: int | None = None,
             tool_result_max_bytes: int | None = None,
-            graph_only: bool = False) -> tuple[dict, set, list, list]:
+            graph_only: bool = False, partial_on_deadline: bool = False) -> tuple[dict, set, list, list]:
     """道具名で振り分けて実行する。戻り値は `(結果, 触れた doc_id 集合, 引用候補, 候補カード)`。"""
     args = args or {}
     return read_tools.run_tool(name, args, world, scope_paths, deadline=deadline, layer=layer,
                                max_hits=max_hits, window_cap=window_cap,
-                               tool_result_max_bytes=tool_result_max_bytes, graph_only=graph_only)
+                               tool_result_max_bytes=tool_result_max_bytes, graph_only=graph_only,
+                               partial_on_deadline=partial_on_deadline)
+
+
+def dedup_args(name: str, args):
+    """重複判定のキーに使う引数。`name_lookup`・`glob_search` だけ、省略と同じ意味の引数を落とす。ほかの道具は変えない。"""
+    if name == "name_lookup":
+        return name_lookup.canonical_args(args)
+    return listing.glob_canonical_args(args) if name == "glob_search" else args
+
+
+def allow_restart(args, result, drop_key) -> None:
+    """`name_lookup`・`glob_search` が世代の違いを返したとき、案内どおりの取り直し（先頭ページ）が重複拒否されないよう、その呼び出しの形ごとに `drop_key(引数)` を呼ぶ。"""
+    for variant in name_lookup.restart_args(args, result) + listing.glob_restart_args(args, result):
+        drop_key(variant)
 
 
 def pop_hit_scores() -> list:

@@ -107,10 +107,6 @@ def _ctx(uid: str) -> "A.Ctx":
         message="seed blocked ガードのテスト",
         world="v1",
         route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline",
-            "summary": {"total": 0}, "data": {}, "sources": [],
-        },
         knowledge=True,
         uid=uid,
         stop_event=None,

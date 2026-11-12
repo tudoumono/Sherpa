@@ -15,7 +15,7 @@ azure-identity==1.25.3
 beautifulsoup4==4.15.0
 certifi==2026.6.17
 cffi==2.1.0
-charset-normalizer==3.4.9
+charset-normalizer==3.5.2
 click==8.4.2
 cobble==0.1.4
 coverage==7.14.3

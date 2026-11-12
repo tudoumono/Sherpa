@@ -169,7 +169,7 @@ def test_resolve_agentic_failure_typed_transport_values_pass_through():
 def _plain_ctx():
     from sherpa.providers.base import Ctx
     return Ctx(message="こんにちは", world="w", route=lambda m: {"lens": "chat"},
-               dispatch=lambda *a, **k: None, knowledge=False)
+               knowledge=False)
 
 
 class _EmptyPlain:

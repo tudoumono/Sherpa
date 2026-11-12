@@ -15,10 +15,11 @@ from __future__ import annotations
 import json
 import logging
 import time
+import urllib.error
 from dataclasses import dataclass, field
 from typing import Iterator
 
-from . import agentic_search, keys, llm, metering, model_catalog, store
+from . import agentic_search, keys, llm, metering, model_catalog, path_rules, store
 from .parts.read.tools import verify_doc_exists
 from .tool_dispatch import run_tool
 
@@ -169,6 +170,30 @@ class LLMUnavailable(RuntimeError):
     """既定の AI が未設定・未接続、または送信に失敗した（503 相当）。"""
 
 
+EMPTY_ANSWER_MESSAGE = "AI から回答本文を受け取れませんでした。もう一度実行してください。"
+
+
+class ModelLacksTools(LLMUnavailable):
+    """接続先が「このモデルは道具の呼び出しに対応していない」と答えた。"""
+
+
+def says_no_tools(e: BaseException) -> bool:
+    """400 の応答の本文が「道具に対応していない」旨か（本文は判定にだけ使い、どこにも出さない）。"""
+    c = e
+    for _ in range(4):
+        if isinstance(c, urllib.error.HTTPError):
+            if c.code != 400:
+                return False
+            try:
+                return "does not support tools" in c.read(4096).decode("utf-8", "replace").lower()
+            except Exception:
+                return False
+        c = c.__cause__ or c.__context__
+        if c is None:
+            return False
+    return False
+
+
 class AnswerTimeout(RuntimeError):
     """リクエスト全体の絶対期限（`absolute_deadline`）を超過した（504 相当）。"""
 
@@ -243,6 +268,34 @@ def _check_deadline(absolute_deadline: float | None) -> float:
     return remaining
 
 
+def round_messages(system_prompt: str, query: str, *, history: list | None = None, extra_context: str = "") -> list:
+    """道具ループの最初の messages（system・直前までの会話・今回の質問）。`iter_tool_loop` とつながりの確認が共有する。"""
+    system = system_prompt + (("\n\n" + extra_context) if extra_context else "")
+    return [{"role": "system", "content": system}, *(history or []), {"role": "user", "content": query}]
+
+
+def round_body(provider: str, model: str, msgs: list, tools: list) -> dict:
+    """道具ループの 1 往復の本文。`iter_tool_loop` とつながりの確認が共有する。"""
+    body = {"model": model, "messages": msgs}
+    if tools:
+        body["tools"] = tools
+    if provider == "ollama":
+        body["stream"] = False
+        body["options"] = {"temperature": 0.2}
+    return body
+
+
+def round_message_raw(resp):
+    """1 往復の応答から assistant の message を取り出す（OpenAI 形式と Ollama 形式）。無ければ None。つながりの確認と `round_message` が共有する。"""
+    return ((resp.get("choices") or [{}])[0].get("message") if "choices" in resp
+            else resp.get("message"))
+
+
+def round_message(resp) -> dict:
+    """`iter_tool_loop` が使う assistant の message（無ければ空）。"""
+    return round_message_raw(resp) or {}
+
+
 def iter_tool_loop(state: LoopState, *, provider: str, model: str, endpoint: str, headers: dict,
                    system_prompt: str, query: str, world: str, scope_paths: list | None,
                    history: list | None = None, stop_event=None, extra_context: str = "",
@@ -263,40 +316,40 @@ def iter_tool_loop(state: LoopState, *, provider: str, model: str, endpoint: str
     tools = (_build_tools(availability if availability is not None else agentic_search.tool_availability())
              if offer_tools else [])
     offered_names = frozenset(_TOOL_DEFS.keys()) & {t["function"]["name"] for t in tools}
-    system = system_prompt + (("\n\n" + extra_context) if extra_context else "")
-    msgs = [{"role": "system", "content": system}, *(history or []),
-            {"role": "user", "content": query}]
+    msgs = round_messages(system_prompt, query, history=history, extra_context=extra_context)
     seen_docs = set(state.touched_docs)
 
     for _round in range(MAX_ROUND_TRIPS):
         if _stopped():
             state.stopped = True
             return
-        body = {"model": model, "messages": msgs}
-        if tools:
-            body["tools"] = tools
-        if provider == "ollama":
-            body["stream"] = False
-            body["options"] = {"temperature": 0.2}
+        body = round_body(provider, model, msgs, tools)
         try:
             resp = agentic_search._post(endpoint, headers, body, timeout=_per_call_timeout())
         except AnswerTimeout:
             raise
         except Exception as e:
+            no_tools = bool(tools) and says_no_tools(e)
             from .ingest.graph_extract import _log_masked_exception
             _log_masked_exception(_log, "simple_chat: LLM 送信に失敗", e)
             if _remaining_s(absolute_deadline) <= 0:
                 raise AnswerTimeout("回答の作成が制限時間内に完了しませんでした") from e
+            if no_tools:
+                _log.warning("simple_chat: 接続先が道具の呼び出しに対応していないと答えた")
+                raise ModelLacksTools(
+                    "既定の AI のモデルが道具の呼び出しに対応していません。"
+                    "管理者に「使えるモデル」の設定を確認してください。") from e
             raise LLMUnavailable("既定の AI に接続できませんでした。管理者に設定を確認してください。") from e
         state.llm_calls += 1
         agentic_search._acc_openai_usage(state.usage_acc, resp, provider == "ollama")
-        msg = ((resp.get("choices") or [{}])[0].get("message") if "choices" in resp
-              else resp.get("message")) or {}
+        msg = round_message(resp)
         calls = msg.get("tool_calls") or []
         if not calls or not offer_tools:   # 道具なしは 1 回で終える（tool call が返っても呼び直さない）
             state.final_text = agentic_search._openai_style_text(msg)
             return
         msgs.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
+        if (msg.get("content") or "").strip():
+            yield {"phase": "text", "text": msg["content"]}   # 道具を呼ぶ前の途中の本文（実行の記録が受け取る）
         for tc in calls[:MAX_TOOL_CALLS_PER_ROUND]:
             fn = tc.get("function") or {}
             name = fn.get("name")
@@ -352,6 +405,9 @@ def verify_sources(state: LoopState, world: str, scope_paths: list | None,
         if not verify_doc_exists(doc_id, world, scope_paths):
             continue
         source = {"doc_id": doc_id}
+        note = path_rules.rules_for(world).outside_note(doc_id, scope_paths)
+        if note:
+            source["note"] = note  # 範囲の外でも読む優先の資料に注記を付ける
         for c in state.cites:
             if c.get("doc_id") == doc_id:
                 locator = _locator_from_span(c.get("span"))
@@ -392,6 +448,8 @@ def answer(*, world: str, query: str, scope_paths: list | None, key_id: int | No
                             user_id=(f"ext:{key_id}" if key_id is not None else None),
                             world=world, calls=state.llm_calls)
 
+    if not state.hit_round_trip_limit and not (state.final_text or "").strip():
+        raise LLMUnavailable(EMPTY_ANSWER_MESSAGE)   # 空の本文を「回答しました」にしない（往復上限の未確認は別扱い）
     _check_deadline(absolute_deadline)  # 最後の道具実行で期限を越えたら 504 相当
     verified_sources = verify_sources(state, world, scope_paths, absolute_deadline)
     _check_deadline(absolute_deadline)  # 出典確認そのものが期限を越えた場合も 200 にしない

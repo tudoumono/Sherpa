@@ -164,3 +164,16 @@ def test_check_schema_era_probe_query_limits_existence_check_to_one_row():
     wn.check_schema_era(s, "w1")
     query, _params = s.calls[0]
     assert "LIMIT 1" in query
+
+
+def test_graph_built_before_period_and_confirm_fields_is_rejected(monkeypatch):
+    """期（`period`）と確かさ（`confirm`）を持たない版 3 のグラフは、現行の世代と違うので読まれない。"""
+    monkeypatch.setattr(wn, "GRAPH_STORAGE_VERSION", 3)
+    era_v3 = wn._compute_graph_schema_era()
+    monkeypatch.undo()
+    assert era_v3 != wn.GRAPH_SCHEMA_ERA
+    try:
+        wn.check_schema_era(_FakeSession(rows=[{"c": 3, "era": era_v3}]), "w1")
+        assert False, "版 3 のグラフは raise するはず"
+    except wn.GraphSchemaEraError as e:
+        assert e.stored_era == era_v3

@@ -28,7 +28,7 @@ def test_notifications_requires_login():
     assert anon.get("/notifications").status_code == 401
 
 
-def test_notifications_ingest_run_visible_to_everyone_llm_render_admin_only():
+def test_notifications_ingest_run_visible_to_everyone_and_llm_render_usage_is_not_a_completion():
     if not _try_init():
         pytest.skip("DB down")
     sfx = _sfx()
@@ -47,7 +47,7 @@ def test_notifications_ingest_run_visible_to_everyone_llm_render_admin_only():
         r_user = user.get("/notifications")
         assert r_user.status_code == 200, r_user.text
         user_items = [it for it in r_user.json()["notifications"] if it["world"] == wid]
-        assert [it["kind"] for it in user_items] == ["ingest_run"]   # llm_render は admin 限定
+        assert [it["kind"] for it in user_items] == ["ingest_run"]
         assert user_items[0]["status"] == "done"
         assert user_items[0]["admin_only"] is False
 
@@ -55,9 +55,7 @@ def test_notifications_ingest_run_visible_to_everyone_llm_render_admin_only():
         assert r_admin.status_code == 200, r_admin.text
         admin_items = [it for it in r_admin.json()["notifications"] if it["world"] == wid]
         kinds = {it["kind"] for it in admin_items}
-        assert kinds == {"ingest_run", "llm_render"}
-        render = next(it for it in admin_items if it["kind"] == "llm_render")
-        assert render["admin_only"] is True
+        assert kinds == {"ingest_run"}   # 利用量の記録は AI 整形の完了の証拠にならない
     finally:
         store.delete_world_row(wid)
 

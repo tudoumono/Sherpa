@@ -1,0 +1,10 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. STKCHK.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+           COPY STK-CPY.
+       PROCEDURE DIVISION.
+           IF STK-QTY < STK-SAFE-QTY
+               CALL 'STKALERT'
+           END-IF.
+           GOBACK.

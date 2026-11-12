@@ -325,8 +325,8 @@ def test_mcp_exposes_pdf_page_image_except_for_code_layer_and_counts_it_as_a_rea
     assert "pdf_page_image" not in _tool_names_for(monkeypatch, "code")
 
 
-@pytest.mark.parametrize("style", ["json", "plan_gate", "plan_main"])
-def test_agents_md_of_all_three_ledger_styles_carries_the_page_image_and_output_rules(tmp_path, style):
+@pytest.mark.parametrize("style", ["json", "plan_main"])
+def test_agents_md_of_both_ledger_styles_carries_the_page_image_and_output_rules(tmp_path, style):
     codex_agents_md.write_agents_md(tmp_path, output_schema=True, output_schema_v2=True, ledger_style=style,
                                     multi_agent=(style != "json"), review_rounds=1)
     text = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")

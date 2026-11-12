@@ -1,7 +1,7 @@
 """MD化の先読み（`md_prefetch`）の契約: ワーカー数を変えても派生物は 1 バイトも変わらない。
 
 直列（SHERPA_MD_WORKERS=1）と並列（=3）で同じ実コーパスを `office_md.build_derived` にかけ、
-全派生ファイル（md／rag／ir 層・サイドカー・マーカー）と返り値の rep が一致することを固定する。
+全派生ファイル（md／rag／ir 層・サイドカー・マーカー）と、実時間を除く返り値の rep が一致することを固定する。
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from sherpa.ingest import md_prefetch, office_md
+from tests._replace_row import offline_row
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "fixtures"
@@ -31,7 +32,7 @@ def _build(src: Path, out: Path, workers: int, monkeypatch, caplog) -> tuple[dic
     monkeypatch.setenv("SHERPA_MD_WORKERS", str(workers))
     caplog.clear()
     with caplog.at_level("INFO", logger="sherpa.ingest.convert"):
-        rep = office_md.build_derived(src, out / "md")
+        rep = office_md.build_derived(src, out / "md", row=offline_row("w"))
     assert any("先読みします" in r.getMessage() for r in caplog.records) is (workers > 1)
     if workers > 1:   # 先読みの結果が実際に使われた（全件が直列へ戻って一致しているだけではない）
         used = [r.args for r in caplog.records if r.getMessage().startswith("MD化の先読みを使いました")]
@@ -43,6 +44,22 @@ def _build(src: Path, out: Path, workers: int, monkeypatch, caplog) -> tuple[dic
         if p.is_file() and not p.relative_to(out).parts[0].startswith("_")   # `_conv_cache` 等は絶対パス・mtime を含む
     }
     return rep, files
+
+
+def _assert_same_report_except_measurements(left: dict, right: dict) -> None:
+    assert {key: value for key, value in left.items() if key != "conversion_metrics"} == {
+        key: value for key, value in right.items() if key != "conversion_metrics"}
+    stable = ("targeted", "completed", "actual", "cache_restored", "by_format",
+              "content_cache_restored")
+    assert {key: left["conversion_metrics"][key] for key in stable} == {
+        key: right["conversion_metrics"][key] for key in stable}
+    for report in (left, right):
+        metrics = report["conversion_metrics"]
+        assert metrics["actual"] + metrics["cache_restored"] == metrics["completed"]
+        assert metrics["wall_ms"] >= 0 and metrics["actual_cumulative_ms"] >= 0
+        assert metrics["cache_restore_ms"] >= 0
+        assert metrics["prefetch"]["converted"] >= 0
+        assert metrics["prefetch"]["child_cumulative_ms"] >= 0
 
 
 def test_workers_do_not_change_derived_bytes(tmp_path, monkeypatch, caplog):
@@ -59,7 +76,7 @@ def test_workers_do_not_change_derived_bytes(tmp_path, monkeypatch, caplog):
     assert not any(k.endswith(".document.json") for k in files1) and any(k.endswith(".evidence.json") for k in files1)
     assert sorted(files3) == sorted(files1)
     assert [k for k in files1 if files1[k] != files3[k]] == []
-    assert rep3 == rep1
+    _assert_same_report_except_measurements(rep3, rep1)
 
 
 def _jobs_for(src: Path, tmp_path: Path):
@@ -68,7 +85,24 @@ def _jobs_for(src: Path, tmp_path: Path):
     targets = [(p, p.name) for p in sorted(src.iterdir())]
     return office_md._prefetch_jobs(
         targets, candidate=office_md.OFFICE_EXT | office_md.convertible_exts(), conv=office_md.convertible_exts(),
-        enabled=arms.enabled_arms(), cache_hit=lambda rp, rel: None, obs_dir=None, assets_root=tmp_path / "rag")
+        enabled=arms.enabled_arms(), cache_hit=lambda rp, rel: None,
+        content_key=lambda rp, rel: office_md._conv_cache_content_hash(rp),
+        obs_dir=None, assets_root=tmp_path / "rag")
+
+
+def test_same_content_is_submitted_to_a_child_once(tmp_path):
+    """同じ内容の別パスは先読みの子を複数起動せず、先頭の保存後に内容キャッシュへ合流する。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    fixture = FIXTURES / "eval/office_ja/inputs/OJA-DOCX-HARD.docx"
+    shutil.copyfile(fixture, src / "a.docx")
+    shutil.copyfile(fixture, src / "b.docx")
+
+    jobs = _jobs_for(src, tmp_path)
+    unique = md_prefetch.dedupe_jobs(jobs)
+
+    assert len(jobs) == 2
+    assert [job.rel for job in unique] == ["a.docx"]
 
 
 def test_child_does_not_render_when_vlm_may_observe(tmp_path, monkeypatch):
@@ -264,7 +298,7 @@ def test_cache_hit_skips_zip_and_xlsx_inspection(tmp_path, monkeypatch):
 
 
 def test_plan_threads_do_not_change_derived_bytes(tmp_path, monkeypatch, caplog):
-    """計画のスレッド数（1 と 8）を変えても、変換結果（派生ファイルと rep）は 1 バイトも変わらない。"""
+    """計画のスレッド数（1 と 8）を変えても、派生ファイルと実時間以外の rep は変わらない。"""
     src = tmp_path / "src"
     src.mkdir()
     for name in CORPUS:
@@ -279,7 +313,7 @@ def test_plan_threads_do_not_change_derived_bytes(tmp_path, monkeypatch, caplog)
     assert rep1["converted"] >= len(CORPUS) - 1 and rep1["failed"] >= 1
     assert sorted(files8) == sorted(files1)
     assert [k for k in files1 if files1[k] != files8[k]] == []
-    assert rep8 == rep1
+    _assert_same_report_except_measurements(rep8, rep1)
 
 
 def test_stale_plan_is_not_used_when_source_changed(tmp_path, monkeypatch):
@@ -302,9 +336,9 @@ def test_stale_plan_is_not_used_when_source_changed(tmp_path, monkeypatch):
     calls = []
     real_pre = office_md._precheck_target
     monkeypatch.setattr(office_md, "_precheck_target",
-                        lambda rp, ext, conv, *a: calls.append(Path(rp).name) or real_pre(rp, ext, conv, *a))
+                        lambda rp, ext, conv, *a, **kw: calls.append(Path(rp).name) or real_pre(rp, ext, conv, *a, **kw))
 
-    rep = office_md.build_derived(src, tmp_path / "out" / "md")
+    rep = office_md.build_derived(src, tmp_path / "out" / "md", row=offline_row("w"))
 
     assert rep["converted"] == 2
     assert calls.count("a.docx") == 1          # 変わっていない原本は、計画の判定を本体ループが使い回す

@@ -5,7 +5,7 @@
 
 import { S, setChatExamples } from './state.js';
 import { setSimpleMode, setWebSearchEligible } from './inquiry.js';
-import { refreshWelcomeExamples, answerBody, answerNotices, unverifiedSourceRows, reconciliationRows, referencedDocRows, rangeText, impactListView, foundDocRows, howText, budgetNoteText, clipPersonalQuote } from './render.js';
+import { refreshWelcomeExamples, answerBody, answerNotices, unverifiedSourceRows, reconciliationRows, referencedDocRows, mentionedOnlyNote, rangeText, impactListView, foundDocRows, howText, budgetNoteText, clipPersonalQuote } from './render.js';
 import { toast } from '../chat.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;
@@ -24,13 +24,6 @@ function _syncWebSearchEligibility() {
   setWebSearchEligible(_webSearchAvailable && _constructId === 'codex_openai' && _openaiEndpointKind === 'openai');
 }
 
-// テーマ切替
-function applyThemeIcon() { $('themebtn').textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙'; }
-$('themebtn').addEventListener('click', () => {
-  const d = document.documentElement, next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-  d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
-});
-applyThemeIcon();
 
 // 頭脳バッジ＋設定
 function setBrainBadge(c) {
@@ -84,12 +77,8 @@ async function setConstruct(id) {
   if (!c) return;
   _constructId = id; _agent = c.agent;
   try {
-    const r = await fetch('/settings', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent: c.agent, codex_model_provider: c.codex_model_provider || null }),
-    });
-    if (!r.ok) throw new Error(r.status);
-  } catch (e) { toast('切替に失敗しました'); await loadConfig(); renderBrainMenu(); return; }  // 失敗時はサーバ状態へ戻す
+    await Sherpa.api('PUT', '/settings', { agent: c.agent, codex_model_provider: c.codex_model_provider || null });
+  } catch (e) { toast(e.message); await loadConfig(); renderBrainMenu(); return; }  // 失敗時はサーバ状態へ戻す
   await loadConfig(); toast('AIを切り替えました');
 }
 $('brainbadge').addEventListener('click', async (e) => {
@@ -185,7 +174,7 @@ document.addEventListener('focusin', (e) => {
 $('convlist').closest('.pane-body').addEventListener('scroll', () => closeConversationMenu(true));
 window.addEventListener('resize', () => closeConversationMenu(true));
 
-// ===== 書き出し（会話全体・回答単位／Markdown・テキスト・JSON・PDF(印刷)）=====
+// ===== 書き出し（会話全体・回答単位／Markdown・テキスト・JSON・PDF(印刷で保存)）=====
 function _stamp() {
   const d = new Date(), p = (n) => String(n).padStart(2, '0');
   return { human: `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`,
@@ -237,7 +226,7 @@ function _answerLines(ans, md, shared) {
   if (showCitations) (d.citations || []).forEach((c) => L.push(`${md ? '> ' : ''}${c.doc_id}（行${(c.span || [])[0]}-${(c.span || [])[1]}）: ${c.quote || ''}`));
   const recon = reconciliationRows(ans);
   if (recon.length) {
-    const ref = (sd) => sd.doc_id + (sd.line ? `:${sd.line}${sd.lineEnd ? `-${sd.lineEnd}` : ''}` : '');
+    const ref = (sd) => [sd.label, ...(sd.also || []).map((x) => x.label)].filter(Boolean).join('、');
     const cellText = (sd) => [sd.text, ref(sd) ? `（${ref(sd)}）` : ''].join('').replace(/\s+/g, ' ').replace(/\|/g, '/').trim();
     if (md) {
       L.push('**設計書とソースの照らし合わせ**', '', '| 項目 | 設計書の記述 | ソースの実装 | 判定 |', '| --- | --- | --- | --- |');
@@ -261,14 +250,14 @@ function _answerLines(ans, md, shared) {
   if (newRefs) {
     L.push(md ? '**参照した資料**' : '参照した資料');
     if (!ref.rows.length && !ref.hidden && !ref.more) L.push('参照した資料はありません');
-    const rangeNote = (r) => (r.ranges.length || r.rangesMore ? '（' + [r.ranges.length ? rangeText(r) : '', r.rangesMore ? `ほか ${r.rangesMore} か所` : ''].filter(Boolean).join('、') + '）' : '');
-    ref.rows.forEach((r) => L.push(`${bullet}${r.path}${rangeNote(r)}${r.unopened ? '（Codex の読み取り記録なし）' : ''}`));
+    const rangeNote = (r) => (r.ranges.length || r.rangesMore ? '（読み取り機能で開いた: ' + [r.ranges.length ? rangeText(r) : '', r.rangesMore ? `ほか ${r.rangesMore} か所` : ''].filter(Boolean).join('、') + '）' : '');
+    ref.rows.forEach((r) => L.push(`${bullet}${r.path}${rangeNote(r)}${r.unopened && !r.mentionedOnly ? '（読み取り機能で開いた記録なし）' : ''}${r.mentionedOnly ? mentionedOnlyNote(r) : ''}`));
     if (ref.more) L.push(`${bullet}ほか ${ref.more} 件`);
     if (ref.hidden) L.push(`${bullet}名前を表示できない資料 ${ref.hidden} 件`);
   }
   const fnd = foundDocRows(ans);
   if (fnd.rows.length || fnd.hidden || fnd.more) {
-    L.push(md ? '**ほかに見つかった資料（Codex の読み取り記録なし）**' : 'ほかに見つかった資料（Codex の読み取り記録なし）');
+    L.push(md ? '**ほかに見つかった資料（読み取り機能で開いた記録なし）**' : 'ほかに見つかった資料（読み取り機能で開いた記録なし）');
     fnd.rows.forEach((p) => L.push(`${bullet}${p}`));
     if (fnd.more) L.push(`${bullet}ほか ${fnd.more} 件（上限で省略）`);
     if (fnd.hidden) L.push(`${bullet}名前を表示できない資料 ${fnd.hidden} 件`);
@@ -313,14 +302,73 @@ function _download(name, content, mime) {
 }
 // 回答単位の書き出し（chat.js の data-export 委譲リスナーが呼ぶ）。
 export function exportMessages(title, messages, format, shared = false) {
-  if (format === 'pdf') { window.print(); return; }   // 印刷ダイアログから PDF 保存
   if (format === 'json') _download(_exportName(title, 'json'), JSON.stringify({ title, exported_at: _stamp().human, messages }, null, 2), 'application/json');
   else if (format === 'txt') _download(_exportName(title, 'txt'), _buildText(title, messages, false, shared), 'text/plain;charset=utf-8');
   else _download(_exportName(title, 'md'), _buildText(title, messages, true, shared), 'text/markdown;charset=utf-8');
   toast('エクスポートしました');
 }
+// 会話全体の PDF（印刷で保存）。画面に描かれた質問と回答カードを #print-root へ複製して印刷する。
+// 設計: docs/design/chat.md「会話全体の書き出し（PDF）」
+// 複製から除くもの（操作・思考の流れ・実行の詳細・入力欄）。
+const PRINT_DROP = 'button, input, textarea, select, .msg-feedback, .usage-meta, .provider-summary, .investigation-record, '
+  + '.created-files-link, .retry-hints, .pathbtn, .caret';
+function _printLabel(text) {
+  const d = document.createElement('div'); d.className = 'pr-label'; d.textContent = text; return d;
+}
+// 回答カード（.msg）を印刷用に複製する。畳まれた部分は開き、ボタン類は除く。
+function _printAnswer(msg, running) {
+  const wrap = document.createElement('div'); wrap.className = 'pr-a';
+  wrap.appendChild(_printLabel('回答'));
+  // 回答中のターン（考え中の表示・逐次表示中のカード）は「回答中」の一行にする。
+  if (running) {
+    const d = document.createElement('div'); d.className = 'pr-pending';
+    d.textContent = '（回答中です。この回答は含まれていません）';
+    wrap.appendChild(d); return wrap;
+  }
+  const clone = (msg.querySelector('.a-body') || msg).cloneNode(true);
+  clone.querySelectorAll('.cites-h').forEach((h) => {
+    const t = document.createElement('div'); t.className = 'cites-h';
+    t.textContent = h.textContent.replace('▾', '').trim(); h.replaceWith(t);
+  });
+  clone.querySelectorAll('.cites-body').forEach((b) => { b.hidden = false; });
+  clone.querySelectorAll('.ilist li').forEach((li) => li.classList.add('open'));
+  clone.querySelectorAll('details').forEach((d) => { d.open = true; });
+  clone.querySelectorAll(PRINT_DROP).forEach((el) => el.remove());
+  wrap.appendChild(clone);
+  return wrap;
+}
+let _printRoot = null;   // 書き出し中の #print-root（次の書き出しで前のものを消す）
+function printConversation(title) {
+  if (_printRoot) _printRoot.remove();
+  const root = document.createElement('div'); root.id = 'print-root';
+  const h = document.createElement('h1'); h.className = 'pr-title'; h.textContent = title;
+  const meta = document.createElement('div'); meta.className = 'pr-meta'; meta.textContent = `書き出し: ${_stamp().human}`;
+  root.append(h, meta);
+  const msgs = [...$('messages').querySelectorAll(':scope > .msg')].filter((m) => !m.classList.contains('welcome-msg'));
+  // 実行中（送信中・購読中）のときだけ、最後の回答カードを回答中とみなす（止めた・失敗した回答はそのまま載せる）
+  const last = msgs[msgs.length - 1];
+  const runningMsg = (S.es || S.sending) && last && !last.classList.contains('user')
+    && (last.querySelector('.thinking') || last === S.ansEl) ? last : null;
+  let n = 0;
+  msgs.forEach((msg) => {
+    n++;
+    if (msg.classList.contains('user')) {
+      const q = document.createElement('div'); q.className = 'pr-q';
+      const t = document.createElement('div'); t.className = 'pr-qtext';
+      t.textContent = (msg.querySelector('.bubble-user') || msg).textContent;
+      q.append(_printLabel('質問'), t); root.appendChild(q);
+    } else root.appendChild(_printAnswer(msg, msg === runningMsg));
+  });
+  if (!n) { toast('書き出す内容がありません'); return; }
+  document.body.appendChild(root);
+  _printRoot = root;
+  document.documentElement.classList.add('printing');
+  window.addEventListener('afterprint', () => { root.remove(); document.documentElement.classList.remove('printing'); }, { once: true });
+  window.print();
+}
 async function exportChat(format) {
   const title = $('conv-title').textContent || 'chat';
+  if (format === 'pdf') { printConversation(title); return; }
   let messages = [], shared = false;
   if (S.cid) {
     try {
@@ -334,7 +382,7 @@ async function exportChat(format) {
 }
 function renderExportMenu() {
   $('exportmenu').innerHTML = '<div class="bm-h">この会話を書き出し</div>'
-    + [['md', 'Markdown'], ['txt', 'テキスト'], ['json', 'JSON'], ['pdf', 'PDF（印刷）']].map(([f, l]) => `<button class="fontitem" data-exp="${f}">${l}</button>`).join('');
+    + [['md', 'Markdown'], ['txt', 'テキスト'], ['json', 'JSON'], ['pdf', 'PDF（印刷で保存）']].map(([f, l]) => `<button class="fontitem" data-exp="${f}">${l}</button>`).join('');
 }
 $('exportbtn').addEventListener('click', (e) => { e.stopPropagation(); renderExportMenu(); $('exportmenu').hidden = !$('exportmenu').hidden; });
 $('exportmenu').addEventListener('click', (e) => { const it = e.target.closest('[data-exp]'); if (!it) return; $('exportmenu').hidden = true; exportChat(it.dataset.exp); });

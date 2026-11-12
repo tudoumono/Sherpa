@@ -121,10 +121,11 @@ def ensure_v1():
     # S3（2026-09-04-グラフのソース正典化.md §4・K9-K11）: 意味層フル抽出・REALIZES 橋は撤去済み
     # ＝`build_world` は骨格（Pass1/Pass2）＋言及エッジ（Pass3）のみを構築する。
     nodes, edges, _flags = world_graph.build_world(wd, TEST_WORLD_ID)
+    from tests._replace_row import offline_row
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, TEST_WORLD_ID, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, TEST_WORLD_ID, env["uri"], env["user"], env["pw"], row=offline_row(TEST_WORLD_ID))
     # Neo4j 反映**直後**（PG 台帳書込より前）に登録する——ここで例外が飛ぶと Neo4j にはもう
     # 書き込み済みなのに登録簿に無いまま関数が抜け、session teardown の一括削除がその Neo4j
     # 残骸を拾えなくなる（PG 障害時の孤立データ漏れ防止）。
     register_test_world(TEST_WORLD_ID)   # セッション終了時にまとめて削除（tests/_world_registry.py）
-    store.replace_documents(TEST_WORLD_ID, worker._ledger_rows(TEST_WORLD_ID))
+    store.replace_documents(TEST_WORLD_ID, worker._ledger_rows(TEST_WORLD_ID), row=offline_row(TEST_WORLD_ID))

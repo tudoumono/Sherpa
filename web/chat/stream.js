@@ -6,7 +6,7 @@
 import { S } from './state.js';
 import {
   questionHTML, _renderDetail, appendAssistantRaw, appendUser,
-  ensureAnswerCard, finalizeAnswer, clearReveal, reveal,
+  ensureAnswerCard, finalizeAnswer, showAnswerText,
   TraceTreeV2, deriveTraceStopReason, stopReasonInfo, stopReasonCategoryFromError,
 } from './render.js';
 import { loadConversations, syncConvParam } from './history.js';
@@ -14,7 +14,7 @@ import { updateScopeHeader } from './scope.js';
 import { isSimpleMode, normalizeLens, setInquiryOpen, toolsForSend, toolsExplicitForSend } from './inquiry.js';
 import { updateShareButtonState } from '../chat.js';
 
-const $ = Sherpa.$, esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime;
+const $ = Sherpa.$, esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime, getJSON = Sherpa.getJSON;
 
 // ===== 思考の流れ（右ペイン） =====
 // 右ペイン見出しの状態表示を更新する（render.js からも呼ぶ）。
@@ -225,7 +225,6 @@ function onQuestion(thinking, q) {
 // ターンが異常終了したときの表示
 function onTurnFailed(thinking, message) {
   turnConcluded = true;
-  clearReveal();
   _stopThinkingTicker();
   _finalizeLiveTraceTree(stopReasonInfo(stopReasonCategoryFromError(message)));
   if (thinking && thinking.isConnected) thinking.remove();
@@ -304,18 +303,13 @@ async function stopStream() {
   pendingStopTraceTree = null;
   if (acknowledged) { $('send').disabled = false; return; }   // サーバの stopped イベントを待つ
   if (stopOnerrorFired) return;   // onerror が UI を戻し済み
-  // 停止要求が失敗/対象なしのときだけクライアント側で閉じる（成功時に閉じると stopped イベントを取りこぼす）
-  _stopThinkingTicker();
-  _finalizeLiveTraceTree(stopReasonInfo('error'));
-  if (S.es) { S.es.close(); S.es = null; }
-  S.turnId = null;
-  setRt('待機中', false);
-  setSendButtonStopping(false);
-  $('messages').setAttribute('aria-busy', 'false');
+  // 停止を確認できていない＝処理は続いている可能性がある。購読と turn ID を残し、もう一度停止できる状態に戻す。
+  stopState = null;
+  setRt('停止を確認できませんでした。処理は続いている可能性があります。もう一度「停止」を押してください', true);
+  $('send').disabled = false;
 }
 function onStopped(thinking) {
   turnConcluded = true;
-  clearReveal();
   _stopThinkingTicker();
   _finalizeLiveTraceTree(stopReasonInfo('stopped'));
   if (thinking && thinking.isConnected) thinking.remove();
@@ -343,7 +337,7 @@ export function subscribeTurn(thinking) {
     if (e.type === 'question') { onQuestion(thinking, e); return; }
     if (e.type === 'stopped') { onStopped(thinking); return; }
     if (e.type === 'error') { onTurnFailed(thinking, e.message); return; }
-    if (e.type === 'answer_delta') { ensureAnswerCard(thinking); reveal(e.text); return; }
+    if (e.type === 'answer_delta') { ensureAnswerCard(thinking); showAnswerText(e.text); return; }
     if (e.type === 'answer') {
       turnConcluded = true;
       S.cid = e.conversation_id;
@@ -375,13 +369,34 @@ export function subscribeTurn(thinking) {
     _stopThinkingTicker();
     const tree = _finalizeLiveTraceTree(stopReasonInfo(treatAsStopped ? 'stopped' : 'error'));
     if (wasPending) pendingStopTraceTree = tree;
-    setRt(treatAsStopped ? '停止しました' : '待機中', false); S.es.close(); S.es = null; S.turnId = null; clearReveal();
+    const lostTurnId = S.turnId, lostAnsEl = S.ansEl;
+    setRt(treatAsStopped ? '停止しました' : '待機中', false); S.es.close(); S.es = null; S.turnId = null;
     setSendButtonStopping(false); $('messages').setAttribute('aria-busy', 'false');
-    if (thinking.isConnected) {
-      const t = thinking.querySelector('.thinking');
-      if (t) t.textContent = treatAsStopped ? '（停止しました）' : '接続エラー。もう一度お試しください。';
+    if (treatAsStopped) {
+      const t = thinking.isConnected && thinking.querySelector('.thinking');
+      if (t) t.textContent = '（停止しました）';
+    } else {
+      showDisconnectNote(thinking, lostAnsEl, lostTurnId);
     }
   };
+}
+// 購読が切れたとき、回答がサーバーで続いているかを 1 回だけ見て文を選ぶ。
+async function showDisconnectNote(thinking, ansEl, turnId) {
+  let msg = '接続エラー。もう一度お試しください。';
+  try {
+    const running = await getJSON('/chat/turns/running');
+    if ((running.turns || []).some((t) => t.turn_id === turnId)) {
+      msg = '接続が切れました。回答は続いています。会話を開き直すと続きが見られます。';
+    }
+  } catch (_) { /* 確認できなければ今の文のまま */ }
+  const t = thinking.isConnected && thinking.querySelector('.thinking');
+  if (t) { t.textContent = msg; return; }
+  if (ansEl && ansEl.isConnected) {
+    const note = document.createElement('div');
+    note.className = 'muted';
+    note.textContent = msg;
+    ansEl.appendChild(note);
+  }
 }
 // 入力欄の質問を送信する（POST /chat/turns → SSE 購読）。
 // override（省略可）: {lens, scope_paths, depth_profile, tools, doc_focus} の指定キーだけ、この1回の送信でブロックの設定の代わりに使う（確認カードの回答再送用）。
@@ -393,9 +408,10 @@ export async function send(override) {
   S.sending = true;
   S.turnStartedAtMs = Date.now();
   $('input').value = '';
+  $('input').style.height = '';   // 広げた入力欄を 1 行に戻す
   const w = $('messages').querySelector('.welcome-msg'); if (w) w.remove();
   appendUser(message);
-  S.ansEl = null; S.ansHead = null; clearReveal();
+  S.ansEl = null; S.ansHead = null;
   setSendButtonStopping(true);
   $('send').disabled = true;
   $('messages').setAttribute('aria-busy', 'true');

@@ -19,6 +19,10 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, PlainSerializer, StrictInt, StrictStr
 
+from sherpa.schemas_embed import EmbedDimInfo, EmbedProviderInfo, EmbedRangeInfo
+from sherpa.schemas_ingest import OcrInfo, RagLlmRenderInfo
+from sherpa.schemas_resolve import WorldResolveSettingsResponse  # noqa: F401  再公開
+
 # 全 datetime フィールドの型。`PlainSerializer` で `.isoformat()` を明示し、response_model の有無で `Z` 表記と `+00:00` 表記が変わらないようにする
 WireDateTime = Annotated[datetime, PlainSerializer(lambda v: v.isoformat(), return_type=str)]
 
@@ -118,6 +122,20 @@ class SettingsTestResponse(BaseModel):
     provider: str
     model: str
     detail: str | None
+
+
+class AdminOllamaTestResponse(BaseModel):
+    """管理画面の Ollama 接続テストの結果（POST /admin/settings/ollama-test）。"""
+    ok: bool
+    # 試した接続先（host:port だけ）
+    host: str
+    # 接続先で取得済みのモデル名
+    models: list[str]
+    # 使えるモデル一覧の Ollama のモデルのうち、接続先で取得されていないもの
+    missing: list[str]
+    # 道具の呼び出しが要る用途のモデルのうち、接続先が「対応していない」と答えたもの
+    no_tools: list[str]
+    detail: str
 
 
 # ---- 管理者:全体設定 ----
@@ -280,14 +298,6 @@ class LegacyBackendInfo(BaseModel):
     office_com: OfficeComInfo
 
 
-class RagLlmRenderInfo(BaseModel):
-    """rag.md の LLM 成形トグル。"""
-    configured: str | None
-    effective: bool
-    default: bool
-    options: list[str]
-
-
 class VlmInfo(BaseModel):
     configured: dict[str, Any] | None
     effective: dict[str, Any]
@@ -364,34 +374,11 @@ class CodexModeInfo(BaseModel):
     options: list[str]
 
 
-class EmbedDimInfo(BaseModel):
-    """`embed_dim`（OpenAI の埋め込みの次元）。`default`=空欄のときの値（1536）、`model_max`=使っているモデルの最大、`min`/`max`=記入できる範囲、`applies`=偽なら Ollama で使われない。"""
-    configured: int | None
-    effective: int
-    default: int
-    model_max: int | None = None
-    min: int
-    max: int
-    applies: bool
-
-
-class EmbedProviderInfo(BaseModel):
-    """`embed_provider`（埋め込みの接続先）。`ollama_model` は "ollama" のとき使う埋め込みモデル名。"""
-    configured: str | None
-    effective: str
-    default: str
-    options: list[str]
-    ollama_model: str
-
-
 class DepthProfileAdminInfo(BaseModel):
     """GET・PUT /admin/settings の `depth_profile`。調べる深さ（クイック/標準/深く/最大）が掛ける倍率の基準値（クイック・標準時の値）のみを持つ（倍率表は固定）。
     `codex_reasoning` は深さで変わらない。"""
     grep_max_hits: DepthProfileBaseInfo
-    qa_max_hits: DepthProfileBaseInfo
     read_window: DepthProfileBaseInfo
-    impact_depth: DepthProfileBaseInfo
-    troubleshoot_depth: DepthProfileBaseInfo
     codex_reasoning: DepthProfileCodexReasoningInfo
 
 
@@ -426,6 +413,7 @@ class AdminSettingsView(BaseModel):
     legacy_backend: LegacyBackendInfo
     required_tools: list[RequiredToolInfo]
     rag_llm_render: RagLlmRenderInfo
+    ocr: OcrInfo
     vlm: VlmInfo
     ollama_allowlist: OllamaAllowlistInfo
     webhook_allowlist: WebhookAllowlistInfo
@@ -438,6 +426,9 @@ class AdminSettingsView(BaseModel):
     embed_parallel: DepthProfileBaseInfo
     embed_dim: EmbedDimInfo
     embed_provider: EmbedProviderInfo
+    # 1 回の要求の待ち時間（秒）と 1 回の件数の上限。`min`/`max` は記入できる範囲
+    embed_request_timeout_s: EmbedRangeInfo
+    embed_batch_size: EmbedRangeInfo
     # 「最大」の深さが許す査読の巡数。`DepthProfileBaseInfo` と同型
     max_review_rounds: DepthProfileBaseInfo
     # multi_agent の worker モデル
@@ -492,29 +483,12 @@ class AdminUsersListResponse(BaseModel):
     users: list[UserRow]
 
 
-class UserCreateRow(BaseModel):
-    """ユーザー作成の応答（`last_login_at` を持たない・`UserRow` と別形）。"""
-    uid: str
-    email: str | None
-    display_name: str | None
-    role: str
-    status: str
-    must_change_password: bool
-
-
-class AdminUserCreateResponse(BaseModel):
-    ok: bool
-    user: UserCreateRow
-
-
-class AdminUserImportResponse(BaseModel):
-    created: int
-    uids: list[str]
-
-
-class AdminUserPatchResponse(BaseModel):
-    ok: bool
-    uid: str
+from sherpa.schemas_admin_users import (  # noqa: E402,F401
+    AdminUserCreateResponse,
+    AdminUserImportResponse,
+    AdminUserPatchResponse,
+    UserCreateRow,
+)
 
 
 # ===== 管理者:監査ログ（sherpa/routers/audit_usage.py） =====
@@ -544,6 +518,7 @@ class AdminAuditListResponse(BaseModel):
     count: int
     offset: int
     limit: int
+    ext_audit_write_failures: int = 0
 
 
 # ---- 管理者:利用統計。全キーが常時存在するため response_model を付与する ----
@@ -1020,46 +995,16 @@ class AdminUsageStatsResponse(BaseModel):
     quality_runs: UsageQualityRuns
 
 
-# ===== 個人ワークスペース（sherpa/routers/workspace.py） =====
+# ===== 個人ワークスペース（sherpa/routers/workspace.py）。定義は schemas_workspace.py =====
 
-class WorkspaceFileRow(BaseModel):
-    """個人 workspace のファイル一覧（GET /workspace/files）。`created_at`/`expires_at` は文字列。"""
-    id: int
-    rel_path: str
-    size_bytes: int
-    created_at: str
-    expires_at: str | None
-
-
-class WorkspaceFilesListResponse(BaseModel):
-    files: list[WorkspaceFileRow]
-
-
-class WorkspaceFileUploadResponse(BaseModel):
-    ok: bool
-    id: int
-    rel_path: str
-    size_bytes: int
-    sha256: str
-
-
-class WorkspaceFileDeleteResponse(BaseModel):
-    ok: bool
-    id: int
-    rel_path: str
-
-
-class WorkspaceSearchHit(BaseModel):
-    rel_path: str
-    line: int
-    text: str
-    match: str
-
-
-class WorkspaceSearchResponse(BaseModel):
-    query: str
-    source: str
-    hits: list[WorkspaceSearchHit]
+from sherpa.schemas_workspace import (  # noqa: E402,F401
+    WorkspaceFileDeleteResponse,
+    WorkspaceFileRow,
+    WorkspaceFilesListResponse,
+    WorkspaceFileUploadResponse,
+    WorkspaceSearchHit,
+    WorkspaceSearchResponse,
+)
 
 
 # ===== 資料フォルダ管理（sherpa/routers/worlds.py） =====
@@ -1096,7 +1041,7 @@ class FsListResponse(BaseModel):
 
 
 # ---- GET /ingest/preview ----
-# response_model は付与しない（`documents[].provenance`・`documents[].importance` が条件付きキーのため。TypeAdapter 契約のみ）
+# response_model は付与しない（`documents[].provenance` が条件付きキーのため。TypeAdapter 契約のみ）
 
 class IngestPreviewDocument(BaseModel):
     name: str
@@ -1111,9 +1056,6 @@ class IngestPreviewDocument(BaseModel):
     label: str
     reason: str | None
     provenance: dict[str, Any] | None = None
-    importance: Literal["高", "中", "低"] | None = None
-    importance_reason: str | None = None
-    importance_source: str | None = None
 
 
 class IngestPreviewEntity(BaseModel):
@@ -1138,24 +1080,17 @@ class IngestPreviewRelation(BaseModel):
 
 
 class IngestPreviewCounts(BaseModel):
-    entities: int
-    relations: int
-    deprecated: int
-    hidden: int
+    """件数。グラフを組み立てないとき（`graph_note` あり）は取り込みの記録から出し、記録が無いもの・内訳は None（不明）。"""
+    entities: int | None
+    relations: int | None
+    deprecated: int | None
+    hidden: int | None
     documents: int
 
 
-class ImportanceDiagnostic(BaseModel):
-    """`_重要度.txt` の構文診断1件。"""
-    config_path: str
-    line: int | None
-    column: int
-    code: str
-    message: str
-
-
 class IngestPreviewResponse(BaseModel):
-    """取り込みのプレビュー（GET /ingest/preview）。response_model は付与しない（条件付きキーのため）。"""
+    """取り込みのプレビュー（GET /ingest/preview）。response_model は付与しない（条件付きキーのため）。
+    要素・関係・警告は常に空（`GET /ingest/preview/graph` が返す）。`documents_note` は一覧を出せない理由、`folders_partial` はフォルダの走査が期限で止まったこと。"""
     world: str
     label: str | None
     counts: IngestPreviewCounts
@@ -1163,7 +1098,20 @@ class IngestPreviewResponse(BaseModel):
     issues: list[Any]
     entities: list[IngestPreviewEntity]
     relations: list[IngestPreviewRelation]
-    importance_diagnostics: list[ImportanceDiagnostic]
+    graph_note: str | None = None
+    documents_note: str | None = None
+    folders_partial: bool = False
+    path_rules: list[dict[str, Any]] | None = None
+
+
+class IngestPreviewGraphResponse(BaseModel):
+    """資料フォルダのグラフ（GET /ingest/preview/graph）。response_model は付与しない（`GET /ingest/preview` と同じ）。"""
+    world: str
+    counts: IngestPreviewCounts
+    entities: list[IngestPreviewEntity]
+    relations: list[IngestPreviewRelation]
+    issues: list[Any]
+    graph_note: str | None = None
 
 
 class IngestBlockedDoc(BaseModel):
@@ -1176,6 +1124,20 @@ class IngestNotice(BaseModel):
     """`ingest_notices` の要素。取り込みで黙って落とした・粗くしたものの種類（`code`）と件数（`count`）。`count` は数えられない種類では 1。"""
     code: str
     count: int
+
+
+class IngestActionAvailability(BaseModel):
+    """取り込み画面の操作可否。`reason` は操作できないときに画面へそのまま出す平文。"""
+    allowed: bool
+    reason: str | None = None
+
+
+class IngestCompletedCounts(BaseModel):
+    """最後に最後まで終わった取り込みに対応する件数の集計。`as_of` 時点の値であり、現在値ではない。"""
+    as_of: str
+    scanned: int
+    indexed: int
+    office_failed: int
 
 
 class RunProgress(BaseModel):
@@ -1199,7 +1161,7 @@ class IngestSummaryFields(BaseModel):
     """資料フォルダの取り込み状況（スキャン結果のキャッシュ＋グラフ/ES 件数・最終実行状態）。
 
     `scanned`〜`unreadable` は sync 完走時と `POST /worlds/{wid}/recount` のときだけ更新されるキャッシュで、このエンドポイント自身はフォルダを歩かない。
-    `counts_as_of` はそのキャッシュの記録時刻（`None`＝未集計）。`sensitive_excluded`/`unreachable_as_text`/`unreachable_as_text_by_ext`/
+    `counts_as_of` はそのキャッシュの記録時刻（`None`＝件数未確認）。`sensitive_excluded`/`unreachable_as_text`/`unreachable_as_text_by_ext`/
     `unreachable_by_reason`（`"encoding_undetermined"`/`"binary"`）/`encoding_partial_count`（一部が化けている件数）も同じキャッシュ由来。
     `failed_files`/`partial_extraction_suspected`/`stage_summary` は最新 run の由来（無ければ `None`）。
     `failure_reason_catalog`/`partial_extraction_advice` は閉じた理由語彙の平文辞書。
@@ -1207,6 +1169,9 @@ class IngestSummaryFields(BaseModel):
     `ingest_notices`＝黙って落とした・粗くしたものの `{code, count}`（走査・関係グラフ・全文索引の各段から導出・名前は持たない。無ければ空）。
     `last_run_warnings`/`last_run_blocked` は flags を打ち切って導出したもの（`last_run_flags_total`=打切り前の総数・`last_run_flags_truncated`=打切りの有無）。
     `last_run_id`/`running_progress` は最新 run の id と実行中進捗（実行中でなければ `running_progress` は `None`）。
+    `last_completed_at` は最新の正常終了 run の時刻、`last_completed_counts` は別途記録された集計時点の件数。
+    `last_failure_retrying`＝直前の失敗の知らせを、今の取り込みの実行中も出し続けている間だけ true（今の run が正常終了すると消える）。
+    `actions` は背景受付と同じ queued/extracting 条件から返す操作可否で、画面は独自判定しない。
     """
     scanned: int
     indexed: int
@@ -1240,6 +1205,12 @@ class IngestSummaryFields(BaseModel):
     last_run_blocked: list[IngestBlockedDoc]
     last_run_flags_total: int
     last_run_flags_truncated: bool
+    last_completed_at: str | None
+    last_completed_counts: IngestCompletedCounts | None
+    last_failure_message: str | None
+    last_failure_retrying: bool = False
+    ingest_active: bool
+    actions: dict[str, IngestActionAvailability]
     failed_files: dict[str, Any] | None
     partial_extraction_suspected: dict[str, Any] | None
     stage_summary: dict[str, Any] | None
@@ -1272,23 +1243,6 @@ class WorldDiffResponse(BaseModel):
     indexed: int
 
 
-class WorldResolveSettingsResponse(BaseModel):
-    """資料フォルダの解決範囲の設定（GET/PUT /worlds/{wid}/resolve-settings）。
-
-    `copy_paths`＝COPY の取り込み元の場所（優先順・資料フォルダの root からの相対パス）。`path_aliases`＝パスの別名 → 場所。
-    `warnings` は資料フォルダの中に見つからない場所（保存は止めない）。`changed` は PUT で内容が変わったか
-    （変わると資料フォルダ全体を取り込み直す）。`refresh_started` は PUT でその取り込み直しを起こせたか（false で changed なら別の処理が実行中＝更新待ち）。GET では常に false。
-    """
-    ok: bool
-    world_id: str
-    copy_paths: list[str]
-    path_aliases: dict[str, str]
-    warnings: list[str]
-    changed: bool
-    refresh_started: bool
-    note: str
-
-
 class WorldIngestAcceptedResponse(BaseModel):
     """取り込み操作の受付結果（POST /worlds・POST /worlds/{wid}/refresh・POST /worlds/{wid}/reconvert・DELETE /worlds/{wid}・POST /worlds/{wid}/rebind・POST /ingest/rerun。HTTP 202）。
 
@@ -1304,87 +1258,9 @@ class WorldIngestAcceptedResponse(BaseModel):
 
 
 class WorldRecountResponse(IngestSummaryFields):
-    """再集計（POST /worlds/{wid}/recount）。スキャンを明示的に再実行してキャッシュし直し、取り込み状況をフラットに展開して返す（同期）。"""
+    """件数の数え直し（POST /worlds/{wid}/recount）。資料を明示的に数えて記録を更新し、取り込み状況をフラットに展開して返す（同期）。"""
     ok: bool
     world_id: str
-
-
-# ===== ナレッジグラフ（sherpa/routers/graph.py） =====
-
-class GraphNode(BaseModel):
-    """グラフのノード（GET /graph の nodes）。"""
-    id: str
-    name: str | None
-    type: str | None
-    type_ja: str | None
-    status: str
-    value: Any
-    top_scope: str | None
-    path: str | None
-
-
-class GraphEdge(BaseModel):
-    """グラフのエッジ（GET /graph の edges）。"""
-    source: str
-    target: str
-    type: str
-    status: str
-
-
-class GraphCounts(BaseModel):
-    """グラフの件数。"""
-    entities: int
-    relations: int
-    deprecated: int
-    hidden: int
-    documents: int
-
-
-class GraphResponse(BaseModel):
-    """グラフ全体（GET /graph）。"""
-    world: str
-    nodes: list[GraphNode]
-    edges: list[GraphEdge]
-    counts: GraphCounts
-    total_nodes: int
-    total_edges: int
-    truncated: bool
-
-
-class GraphFacetsResponse(BaseModel):
-    """グラフの絞り込み候補（GET /graph/facets）。"""
-    node_labels: list[str]
-    node_labels_ja: dict[str, str]
-    relationship_types: list[str]
-    condition_fields: list[str]
-
-
-class GraphSearchNode(BaseModel):
-    """検索結果のノード（GET /graph/search。`GraphNode` と別形で phase/category を持つ）。"""
-    id: str
-    name: str | None
-    type: str | None
-    type_ja: str | None
-    status: str
-    value: Any
-    top_scope: str | None
-    phase: str | None
-    category: str | None
-    path: str | None
-
-
-class GraphSearchCounts(BaseModel):
-    """検索結果の件数（`{"nodes":.., "edges":..}`・`GraphCounts` と別形）。"""
-    nodes: int
-    edges: int
-
-
-class GraphSearchResponse(BaseModel):
-    """グラフ検索の結果（GET /graph/search）。"""
-    world: str
-    nodes: list[GraphSearchNode]
-    edges: list[GraphEdge]
-    counts: GraphSearchCounts
 
 
 # ===== 範囲（sherpa/routers/impact.py::scopes） =====
@@ -1511,6 +1387,7 @@ class ChatTurnRunning(BaseModel):
     turn_id: str
     conversation_id: int
     started_at: str
+    scope_paths: list[str] | None = None  # 送信時の範囲（空＝全体・社内資料オフと `all=true` は null）
     uid: str | None = None  # `all=true`（管理者）のときだけ値が入る（それ以外は null）
 
 

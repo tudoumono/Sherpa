@@ -38,11 +38,17 @@ _JA_PARAGRAPH = ("これは架空の業務手順書です。毎月末に夜間�
                  "連絡してください。申請フォームの項目は氏名、所属部署、承認日を含みます。")
 
 
-def test_euc_jp_registered_extension_is_unreadable_with_encoding_undetermined_reason(monkeypatch, tmp_path):
-    """登録拡張子（`.txt`）でも、UTF-8/CP932 どちらで読んでも化ける（EUC-JP）原本は対象外になり、
+# どの符号でも読めない原本（EUC-JP の本文に不正なバイトを一定間隔で挟む＝strict な EUC にも通らず、行の過半が化ける）
+def _undecodable_bytes() -> bytes:
+    body = _JA_PARAGRAPH.encode("euc_jp")
+    return b"".join(body[i:i + 14] + b"\xff" for i in range(0, len(body), 14))
+
+
+def test_undecodable_registered_extension_is_unreadable_with_encoding_undetermined_reason(monkeypatch, tmp_path):
+    """登録拡張子（`.txt`）でも、UTF-8・CP932・EUC-JP のどれで読んでも化ける原本は対象外になり、
     台帳には `read_failed`/`size_exceeded` と同じ既存の出し方（`state="unreadable"`）で載る。"""
     wd, _der = _world(monkeypatch, tmp_path)
-    (wd / "guide.txt").write_bytes(_JA_PARAGRAPH.encode("euc_jp"))
+    (wd / "guide.txt").write_bytes(_undecodable_bytes())
 
     docs = corpus_docs.world_documents("w")
     assert [d["name"] for d in docs] == ["guide.txt"]
@@ -124,7 +130,7 @@ def test_scan_report_analyzer_declined_excludes_encoding_undetermined_registered
     `accepts()` が全滅）に数えない——対象外の理由は符号化であって、アナライザは何も拒否して
     いない（SRH-05是正・理由が二重に出ない）。"""
     wd, _der = _world(monkeypatch, tmp_path)
-    (wd / "prog.cbl").write_bytes(_JA_PARAGRAPH.encode("euc_jp"))
+    (wd / "prog.cbl").write_bytes(_undecodable_bytes())
 
     rep = corpus_docs.scan_report("w")
     assert rep["unreachable_by_reason"] == {"encoding_undetermined": 1}
@@ -204,7 +210,7 @@ def test_file_head_attaches_encoding_caution_for_partial_cp932_file(monkeypatch,
 def test_pass1_excludes_encoding_undetermined_source_from_graph(monkeypatch, tmp_path):
     """台帳・grep・精読が「文字コードを判別できない」として対象外にする登録コード原本は、
     グラフ（Pass1/Pass2）にもノード・エッジを作らない——読めない原本が印なしで影響調査の
-    裏付けとして出てしまう食い違いを防ぐ（SRH-05是正）。原本全体を EUC-JP にする（行の過半が
+    裏付けとして出てしまう食い違いを防ぐ（SRH-05是正）。原本全体を読めないバイト列にする（行の過半が
     化ける＝undetermined の条件を確実に満たす。COBOL 構文の要否は Pass1 の判定より前で
     弾かれるため無関係）。"""
     from sherpa.ingest import world_graph
@@ -212,7 +218,7 @@ def test_pass1_excludes_encoding_undetermined_source_from_graph(monkeypatch, tmp
     wd, _der = _world(monkeypatch, tmp_path)
     src = wd / "src"
     src.mkdir()
-    (src / "pgma01.cbl").write_bytes(_JA_PARAGRAPH.encode("euc_jp"))
+    (src / "pgma01.cbl").write_bytes(_undecodable_bytes())
 
     docs = corpus_docs.world_documents("w")
     assert [d["name"] for d in docs] == ["src/pgma01.cbl"]

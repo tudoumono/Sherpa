@@ -3,7 +3,7 @@
 
 - Codex の起動方法は新設せず、チャットと同じ実行経路（`agents.get_provider`→`CodexProvider.run(ctx)`）・サンドボックス・壁時計上限を使う。
   会話を DB に永続する `stream_message` は呼ばず、`chat_service` の `_resolve_scope`/`_finalize`/`_sources`/`_is_stopped_terminal` だけ借りる。
-- `Ctx.route` は常に `lens="qa"`。`Ctx.dispatch` は通常構成では呼ばれず、MCP 無効の構成でだけツール遮断の envelope を返す保険。
+- `Ctx.route` は常に `lens="qa"`。
 - uid は実在ユーザーと衝突しない技術 uid（`_CODEX_JOB_UID`）を常に渡す。Codex が作ったファイルは
   `data/users/{_CODEX_JOB_UID}/workspace/` に隔離される。
 - 同時実行は global 上限をチャットと合算で数える（`chat_turns.try_reserve_external`/`release_external`）。
@@ -16,8 +16,9 @@ import logging
 import threading
 import time
 
-from . import agentic_search, chat_service, chat_turns, store, worlds
+from . import agentic_search, chat_service, chat_turns, path_rules, store, worlds
 from . import scope as scope_mod
+from . import scope_infer
 from .agents import Ctx, CodexProvider, get_provider
 from .store import codex_jobs as store_jobs
 from .store import investigation_records as store_investigation
@@ -117,11 +118,6 @@ def _qa_route(msg: str) -> dict:
     return {"lens": "qa", "input": msg, "reason": "ext_codex_job", "confident": True}
 
 
-def _qa_dispatch_fallback(lens: str, _inp: str) -> dict:
-    """MCP 無効時の保険（通常構成では呼ばれない）。"""
-    return agentic_search.tools_blocked_env(lens)
-
-
 def _execute_job(job: dict, stop_event: threading.Event) -> None:
     """1 ジョブを実行し、終了状態を DB へ書く（`queued`→`running` は呼び出し元の `claim_queued_jobs()` が済み）。
     例外は内部で捕捉して `codex_failed` で終端化し、呼び出し元へ伝播させない。
@@ -150,7 +146,7 @@ def _execute_job(job: dict, stop_event: threading.Event) -> None:
                 if not scope_mod.valid_scope_paths(job["world"], job["scope_paths"], root=root, strict=True):
                     store_jobs.mark_failed(job_id, error_code="codex_failed")
                     return
-            except OSError:
+            except (OSError, scope_infer.ScopeWalkDeadlineExceeded):
                 store_jobs.mark_failed(job_id, error_code="codex_failed")
                 return
             scope_meta = chat_service._resolve_scope(
@@ -164,8 +160,8 @@ def _execute_job(job: dict, stop_event: threading.Event) -> None:
                 store_jobs.mark_failed(job_id, error_code="codex_failed")
                 return
             ctx = Ctx(message=job["query"], world=job["world"], route=_qa_route,
-                      dispatch=_qa_dispatch_fallback, knowledge=True, scope_meta=scope_meta,
-                      make_sources=lambda docs: chat_service._sources(docs, job["world"]),
+                      knowledge=True, scope_meta=scope_meta,
+                      make_sources=lambda docs: chat_service._sources(docs, job["world"], (scope_meta or {}).get("scope_paths")),
                       uid=_CODEX_JOB_UID, stop_event=stop_event,
                       tools_availability=agentic_search.tool_availability())
             result = None
@@ -192,7 +188,8 @@ def _execute_job(job: dict, stop_event: threading.Event) -> None:
                 return
             env = chat_service._finalize(result["env"], result["decision"], job["query"])
             elapsed_ms = round((time.monotonic() - t0) * 1000)
-            sources = [{"doc_id": s["doc_id"]} for s in (env.get("sources") or []) if s.get("doc_id")]
+            sources = [{"doc_id": s["doc_id"], **({"note": s["note"]} if s.get("note") else {})}
+                       for s in (env.get("sources") or []) if s.get("doc_id")]
             unconfirmed_items = list((env.get("investigation") or {}).get("unconfirmed_items") or [])
             # ジョブの結果にも調査の記録を載せる（チャット経路と同じ切り詰めルール・ジョブと一緒に期限切れで消える）。
             _investigation_record = result.get("investigation_record")
@@ -207,9 +204,10 @@ def _execute_job(job: dict, stop_event: threading.Event) -> None:
                                  "truncated": _truncated,
                                  "manifest": _manifest,
                                  "items": _items, "coverage": _coverage, "reviews": _reviews}
-            store_jobs.mark_completed(job_id, answer=env.get("headline") or "", sources=sources,
-                                      unconfirmed_items=unconfirmed_items, elapsed_ms=elapsed_ms,
-                                      investigation=investigation)
+            kept = path_rules.filter_output({"sources": sources, "unconfirmed_items": unconfirmed_items, "investigation": investigation}, job["world"])  # 保存の前の最後の網（管理者の除外の資料を落とす）
+            store_jobs.mark_completed(job_id, answer=env.get("headline") or "", sources=kept["sources"],
+                                      unconfirmed_items=kept["unconfirmed_items"], elapsed_ms=elapsed_ms,
+                                      investigation=kept["investigation"])
     except Exception:
         _log.exception("codex job: 予期しない例外で終端化します job_id=%s", job_id)
         try:

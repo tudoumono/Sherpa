@@ -1,0 +1,21 @@
+{
+  "counts": {
+    "edge_types": {
+      "CONTAINS": 4
+    },
+    "edges": 4,
+    "flag_reasons": {
+      "dropped_syntax": 1,
+      "unresolved": 2
+    },
+    "flags": 3,
+    "node_labels": {
+      "Copybook": 1,
+      "DataItem": 4,
+      "Module": 1
+    },
+    "nodes": 6
+  },
+  "sha256": "8c43aee79b15c3545003331ef6266380ec3287e5249af5156530be0f69c8d94c",
+  "world": "cobol-seq"
+}

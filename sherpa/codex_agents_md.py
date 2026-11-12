@@ -65,10 +65,11 @@ AGENTS_MD = f"""\
   完了としない。対象範囲（ファイル一覧なら台帳・本文中の項目一覧なら対象資料のシート/段落/ページ総数）
   の確認を終え、該当項目が回答にそろってから完了とする。`truncated`／`text_truncated`／`file_truncated`／
   `total > start+count` は続きを取得する。続きを取得する手段が無い打ち切り（`file_truncated`・
-  pdf_pages の `text_truncated`・compare_documents／graph_neighbors／glob_search／doc_outline の `truncated`・folder_tree の `folders_truncated`・xlsx_sheets／es_search の `truncated`＝ヒット数上限）は、その範囲を未確認として明示し全件性を主張しない。
+  pdf_pages の `text_truncated`・compare_documents／glob_search／doc_outline の `truncated`・xlsx_sheets／es_search の `truncated`＝ヒット数上限）は、その範囲を未確認として明示し全件性を主張しない。
   結果に付く欠落の印（`section_truncated`・`fragment`・`unreadable_files`・`excluded_hits`・`unverified`・`excluded`・`no_text_layer`・`unread_shapes`・`unread_objects`・`formula_no_value`・`pages_remaining`・`pages_ignored`・`line_beyond_eof`・`window_clamped`・`candidates_total`・`title_truncated` など）が付いた範囲も、確かめるまで未確認として扱う。
   ripgrep_search の `truncated`（ヒット数上限）は続きを取得できる——`next_offset` を
-  そのまま次回呼び出しの `offset` に渡す。
+  そのまま次回呼び出しの `offset` に渡す。graph_neighbors の `truncated`・folder_tree の `folders_truncated` も
+  同じで、`next_offset` があれば `offset` に渡して続きを取り、無ければその範囲は未確認。
   利用者停止・通信エラー・既存の反復／情報量予算への到達で
   中断するときは、確認済みの結果・未確認の範囲・理由を分けて書き、部分結果を「全件」「すべて」
   「該当なし」と断定しない。
@@ -84,7 +85,8 @@ AGENTS_MD = f"""\
   「未取得」と書く。確定した事実と推定は分けて書き、推定には『推定』と明示する。
   本文の中に出典の一覧は書かない（出典は Sherpa が末尾の『参照した資料:』から付与する。一覧の依頼に
   対する各項目のパス列挙は答えそのものであり、ここで言う出典の一覧ではない）。根拠の箇所（パス・
-  シート名・セル範囲・段落・ページ）は本文で示してよい。回答の最後に『参照した資料:』の行を置き、
+  シート名・セル範囲・段落・ページ）は本文で示してよい。本文で資料に触れるときは、資料名かパスを
+  インラインコード（例 `xxx.xlsx`）で囲む。回答の最後に『参照した資料:』の行を置き、
   実際に開いて根拠にした資料を1行1件、資料フォルダからの相対パス（例 `4期更改/02_設計/xxx.xlsx`）で
   列挙する。派生MD／rag.mdを見た場合も原本のパスで書く。
 - 回答は Markdown（太字・箇条書き・インラインコード）で書いてよい。
@@ -104,10 +106,13 @@ AGENTS_MD = f"""\
 _INVESTIGATE_SKILLS_PARAGRAPH = """\
 - 質問の型（資料一覧／仕様の問い合わせ／影響範囲／原因調査／比較）に合う `.agents/skills` の
   investigate-* スキルを読んで、その手順（ツールで当たり→原本の中身を確かめる→答える）どおりに進める。
-- `src/` のソースは CP932（Shift_JIS）のことがある。日本語の語で探す・読むときは
-  ripgrep_search／read_around を使う（UTF-8/CP932 を判定して読む）。シェルで探すなら、
+- `src/` のソースは CP932（Shift_JIS）や EUC-JP のことがある。日本語の語で探す・読むときは
+  ripgrep_search／read_around を使う（UTF-8/CP932/EUC-JP を判定して読む）。シェルで探すなら、
   CP932 と確認したソースに `rg -E sjis` を使う。cat／sed で読む場合もそのファイルだけ
   `iconv -f CP932 -t UTF-8` を通す。UTF-8 のファイルには適用しない。
+  EUC-JP のソースは `-E euc-jp`・`iconv -f EUC-JP` を使う。
+- 資料で見つけた識別子（表名・項目名・画面 ID・プログラム ID など）は、そこで止めず ripgrep_search で
+  そのままソースからも探し、使われている場所を確かめる（ソースは es_search に入らず、言語によってはソース中の SQL はグラフにも出ない。グラフに無くても未使用とは言えない。資料だけを探すターンでは ripgrep_search はソースを返さないので、0 件を未使用としない）。
 """
 
 # 本体自身のソース確認要件（深さに関わらず常時）。worker の主張を鵜呑みにせず、根拠のファイル:行を自分で開いて突き合わせる。
@@ -190,7 +195,10 @@ _STRUCTURED_RESPONSE_PARAGRAPH_V2 = f"""\
   `reconciliation` は設計書とソースの照らし合わせの表で、1行ずつ `item`（項目名）／`spec_text`（設計書の
   記述）／`spec_ref`／`source_text`（ソースの実装）／`source_ref`／`verdict` の6キーちょうどで書く。
   設計書とソースの両方を**実際に開いて確かめた項目だけ**を書き、確かめていない項目・片方しか見ていない
-  項目は書かない（該当が無ければ空配列）。`spec_ref`・`source_ref` は `資料のパス:行`（根拠の無い側は空文字）。
+  項目は書かない（該当が無ければ空配列）。`spec_ref`・`source_ref` は `資料のパス:位置`（根拠の無い側は空文字）。
+  位置は、その資料を読んだ道具が示した場所を書く——テキスト・ソースは行番号か行の範囲（`120`・`120-134`）、
+  Excel はシート名とセル範囲（`シート名!B3:D10`）。Word は `段落12`、PowerPoint は `スライド3`、PDF は `4ページ` のように何の番号かを付けて書く（数字だけの位置は行番号として確かめる）。
+  1 欄には 1 つの資料の 1 か所を書く。
   `verdict` は `match`（一致）／`mismatch`（食い違い・ソースを正とする）／`spec_missing`（設計書に記述なし・
   `source_ref` 必須）／`source_missing`（ソースに見当たらない・`spec_ref` 必須）の4つ。一致も書く。
   根拠の資料が登録範囲に無い・読めない行は、画面で「未確認」に下げられる。
@@ -336,7 +344,7 @@ _INVESTIGATION_REVIEW_PARAGRAPH = """\
 """
 
 
-# 評価用（環境変数 `SHERPA_LEDGER_STYLE`）: JSON の台帳の代わりに、調査計画書（Markdown 1 枚）を使う場合の段落。
+# JSON の台帳の代わりに、調査計画書（Markdown 1 枚）を使う場合の段落。
 _PLAN_TEMPLATE = """\
 # 調査計画: <質問の要約>
 ## 前提
@@ -372,23 +380,15 @@ def _plan_common_paragraph(review_cap: int) -> str:
   （どちらか一方にしか無い項目も落とさない）、1 行 1 要素にする。行は `- [ ]`（未着手）／`- [x]`（済）／
   `- [-]`（打ち切り）で始め、` · ` 区切りで id・種別・対象・要る根拠の種別（`要: source` など）を書く。
   `- [x]` の行で `要: source` を含むものには、直下に字下げして `- source: パス:行` を必ず付ける（付けないと
-  回答で「未確認」に下げられる）。`- [-]` の行には、直下に `- 範囲外:`／`- 読めない:`／`- 無い:` のいずれかで
+  「確かめられなかった」項目として数えられる）。`- [-]` の行には、直下に `- 範囲外:`／`- 読めない:`／`- 無い:` のいずれかで
   「何を試して届かなかったか」を書く。調査中に見つけた新しい対象は、行（母集団）や観点として足す。
 - 道具が返した候補はそのまま事実にしない。ソースの該当行を開いて突き合わせてから `- [x]` にする。
-- 「## 結論」は最後に書く。各文に根拠の行の id を添える。最終応答の `answer` には「## 結論」と同じ内容を書く
-  （利用者に出す回答は、Sherpa が計画書を 結論 → 前提 → 調べた範囲 → 参照した資料 の順に整える。
-  文章の要約や言い換えはされないので、結論は省略せず詳しく書く）。
+- 「## 結論」は最後に書く。各文に根拠の行の id を添える（これは計画書の中の記録で、利用者には見せない）。
+- 最終応答の `answer` は、利用者に向けた回答として別に書く。結論を先に、文章で書く。計画書の行の id（`[pgm-a]` など）
+  は付けない。計画書の書式（`- [x]` のチェックの印・母集団の行・「## 母集団」などの見出し）は持ち込まない。本文で名前を
+  出した資料は必ず末尾の「参照した資料:」に書く。回答は省略せず詳しく書く（Sherpa は回答を要約も言い換えもしない。
+  計画書の前提・範囲・件数は、調べた範囲の欄と調査の記録に Sherpa が別に載せる）。
 - 深さの見直しは最大 {review_cap} 回。
-"""
-
-
-def _plan_gate_paragraph(review_cap: int) -> str:
-    return _plan_common_paragraph(review_cap) + f"""\
-- 最終応答（`status: final`）を返すたびに、Sherpa が計画書の「## 母集団」を読む。節が無い、または未着手の行が
-  残っていて前回から進んでいるときは差し戻される（指定された行から調査を再開する）。未着手が無くなると、
-  見直し（最大 {review_cap} 回）を頼まれることがある。そのときは「## 分かったこと」を読み返し、母集団にも
-  「## 観点」にも無い要素を行・観点として足して調べる。足すものが無ければ「## 見直し」に「追加なし」と書いて
-  最終応答を返す。
 """
 
 
@@ -398,14 +398,6 @@ def _plan_main_paragraph(review_cap: int) -> str:
   最終応答を返す。見直しは最大 {review_cap} 回。見直しでは「## 分かったこと」を読み返し、母集団にも「## 観点」にも
   無い要素（新しい名前・つながり・次に見るべきもの）があれば行・観点として足して調べ、「## 見直し」に
   `- <回目>: 足した行・観点` を書く。足すものが無くなったらそこで終える。
-"""
-
-
-def _plan_gate_worker_paragraph(review_cap: int) -> str:
-    return "- " + _WORKER_USAGE_CONDITION + f"""
-  worker には計画書の担当行・前提を渡し、主張と根拠を返させる。計画書の更新は本体が行う。
-  見直しは Sherpa からの依頼に応じて最大 {review_cap} 回。依頼された見直しで必要なら evaluator に
-  観点を渡し、指摘を調査して計画書へ反映する。独自に追加の見直し巡を増やさない。
 """
 
 
@@ -534,7 +526,7 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
       `review_rounds_escalation` は `review_rounds > 0` かつ共通上限に余地があるときだけ、見直しをもう 1 回足してよい旨を足す。
     - 調査台帳の段落は `output_schema` と `output_schema_v2` が両方真のときだけ足す（multi_agent では `ledger_enabled` も渡す）。
     - `source_required`: provider.py の `required_extra` と同じ判定の値を渡す（ずれると完了できなくなる）。
-    - `ledger_style`: `plan_gate`／`plan_main`（評価用・環境変数 `SHERPA_LEDGER_STYLE`）のとき、JSON 台帳と見直しの段落の代わりに調査計画書の段落を出す。`json` は従来どおり。
+    - `ledger_style`: `plan_main` のとき、JSON 台帳と見直しの段落の代わりに調査計画書の段落を出す。`json` は従来どおり。
     書込は一時ファイルを `O_CREAT|O_EXCL|O_NOFOLLOW` で作り `os.replace()` で置換する（既存 AGENTS.md が symlink でも指す先へ書かない）。
     """
     if plain:
@@ -544,7 +536,7 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
         if output_schema:
             structured_paragraph = (_STRUCTURED_RESPONSE_PARAGRAPH_V2 if output_schema_v2
                                     else _STRUCTURED_RESPONSE_PARAGRAPH)
-        _plan_style = ledger_style in ("plan_gate", "plan_main") and bool(output_schema and output_schema_v2)
+        _plan_style = ledger_style == "plan_main" and bool(output_schema and output_schema_v2)
         _ledger_enabled = bool(output_schema and output_schema_v2 and mcp) and not _plan_style
         if output_schema and output_schema_v2:
             structured_paragraph += _CLAIM_ITEM_IDS_LEDGER if _ledger_enabled else _CLAIM_ITEM_IDS_EMPTY
@@ -554,10 +546,8 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
                    + (_investigation_ledger_paragraph(direct_read, layer, source_required)
                       + _INVESTIGATION_REVIEW_PARAGRAPH
                       if _ledger_enabled else "")
-                   + ((_plan_gate_paragraph(plan_review_cap) if ledger_style == "plan_gate"
-                       else _plan_main_paragraph(plan_review_cap)) if _plan_style else "")
-                   + ((_plan_main_worker_paragraph() if ledger_style == "plan_main"
-                       else _plan_gate_worker_paragraph(plan_review_cap)) if multi_agent and _plan_style else
+                   + (_plan_main_paragraph(plan_review_cap) if _plan_style else "")
+                   + (_plan_main_worker_paragraph() if multi_agent and _plan_style else
                       _multi_agent_role_paragraph(review_rounds, direct_read, layer,
                                                   escalate=review_rounds_escalation,
                                                   ledger_enabled=_ledger_enabled)

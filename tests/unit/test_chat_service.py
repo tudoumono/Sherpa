@@ -3,8 +3,8 @@
 - `_cap_trace_v2`: 実行イベント v2 の二段上限（ソフト→ハード→honest failure）。決定的・orphan 無し・
   不正 parent_id は親なしへ正規化。`_trace_bytes` は実保存（`ensure_ascii=True`）と同じ測り方。
 - 保存サイト（stream_message の answer・clarify）は store をフェイク差し替えして PG 不要で検証。
-- 履歴 priming（`_history_pairs`/`_clip_history_msg`）・調べ方/深さ/検索経路の `_dispatch` 配線・
-  `_resolve_scope`/`_resolve_lens`・`_retry_hints`/`_finalize`・グラフ縮退（S4）・個人由来の引き継ぎ。
+- 履歴 priming（`_history_pairs`/`_clip_history_msg`）・
+  `_resolve_scope`/`_resolve_lens`・`_retry_hints`/`_finalize`・グラフ縮退の告知・個人由来の引き継ぎ。
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import threading
 
 import pytest
 
-from sherpa import chat_service as CS
+from sherpa import chat_history, chat_service as CS
 from sherpa import exec_event as EE
 from sherpa import store
 
@@ -23,13 +23,6 @@ from sherpa import store
 def _no_plain_provider(monkeypatch):
     """資料参照オフの頭脳選択（`plain_provider_for`）は別テストで検証する。ここでは差し替えた `get_provider` を使う。"""
     monkeypatch.setattr(CS, "plain_provider_for", lambda *a, **k: None)
-
-
-@pytest.fixture(autouse=True)
-def _default_world_graph_not_empty(monkeypatch):
-    """`_dispatch` の impact/troubleshoot 分岐は 0 件時に `world_graph_is_empty` を呼ぶ。既定は
-    「実データがある」側に倒す（未構築の挙動を検証するテストが個別に上書きする）。"""
-    monkeypatch.setattr(CS, "world_graph_is_empty", lambda session, world: False)
 
 
 def _try_init():
@@ -48,30 +41,11 @@ _NODE = {"type": "node", "id": "understand", "kind": "think", "label": "質問�
          "detail": "内容を把握しました", "status": "done"}
 
 
-def test_sources_importance_and_control_file(monkeypatch):
-    from sherpa.ingest import importance as imp
-    # `_重要度.txt`（設定ファイル自体）は出典に出さない
-    assert {s["doc_id"] for s in CS._sources(["a.md", "_重要度.txt", "4期/_重要度.txt"], "v1")} == {"a.md"}
-    # 解決できれば importance/importance_reason を足す（importance_source は出さない）・解決の無い doc は持たない
-    monkeypatch.setattr(CS.worlds, "world_dir", lambda w: "/tmp/x")
-    res = imp.Resolution(value="高", reason="契約書", config_path="_重要度.txt", rule_line=1)
-    monkeypatch.setattr(CS.importance, "resolve_many", lambda w, rels, root=None, sig=None: {"a.md": res})
-    out = {s["doc_id"]: s for s in CS._sources(["a.md", "b.md"], "v1")}
-    assert out["a.md"]["importance"] == "高" and out["a.md"]["importance_reason"] == "契約書"
-    assert "importance_source" not in out["a.md"] and "importance" not in out["b.md"]
-
-
-def test_sources_unregistered_world_skips_resolve_call_and_stays_two_keys(monkeypatch):
-    called = {"n": 0}
-
-    def _boom(*a, **k):
-        called["n"] += 1
-        return {}
-
+def test_sources_exclude_control_file_and_carry_no_importance(monkeypatch):
+    # `_重要度.txt`（設定ファイル自体）は出典に出さない・重要度の欄は付けない
     monkeypatch.setattr(CS.worlds, "world_dir", lambda w: None)
-    monkeypatch.setattr(CS.importance, "resolve_many", _boom)
-    out = CS._sources(["a.md"], "v1")
-    assert called["n"] == 0 and set(out[0]) == {"doc_id", "download_url"}
+    out = CS._sources(["a.md", "_重要度.txt", "4期/_重要度.txt"], "v1")
+    assert [s["doc_id"] for s in out] == ["a.md"] and set(out[0]) == {"doc_id", "download_url"}
 
 
 # ---- _cap_trace_v2 の二段上限（純関数・DB 不要） ----
@@ -802,11 +776,10 @@ def test_history_pairs_clips_individual_message_over_char_limit():
     assert len(a["content"]) == CS._HISTORY_MSG_CHARS + len("…（省略）") and a["content"].endswith("…（省略）")
 
 
-def test_history_pairs_degrades_to_empty_on_read_failure(monkeypatch):
-    def _boom(conversation_id, limit):
-        raise RuntimeError("boom")
-    monkeypatch.setattr(store, "recent_messages", _boom)
-    assert CS._history_pairs(123) == []
+def test_history_pairs_raises_on_read_failure(monkeypatch):
+    monkeypatch.setattr(store, "recent_messages", lambda c, limit: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(chat_history.HistoryUnavailable):
+        CS._history_pairs(123)
 
 
 def test_history_pairs_survives_unpaired_row_pileup_pushing_window():
@@ -822,7 +795,7 @@ def test_history_pairs_survives_unpaired_row_pileup_pushing_window():
 def test_history_pairs_zero_turns_disables_priming(monkeypatch):
     cid = _new_conv()
     _add_pairs(cid, ("質問1", "回答1"))
-    monkeypatch.setattr(CS, "_HISTORY_TURNS", 0)
+    monkeypatch.setattr(chat_history, "_HISTORY_TURNS", 0)
     assert CS._history_pairs(cid) == []
 
 
@@ -849,145 +822,6 @@ def test_impact_overload_result_shape_is_fixed_and_preserves_scope_meta():
     assert decision["lens"] == "impact" and decision["input"] == "消費税率を変えたら"
     sm = {"world": "w1", "scope_paths": ["4期/設計"], "source": "explicit"}
     assert CS._impact_overload_result("m", "w1", sm)["env"]["scope"] == {**sm, "layer_applied": False}
-
-
-# ---- _dispatch の配線（layer・調べる深さ・検索経路） ----
-
-def _patch_runners(monkeypatch) -> dict:
-    """run_qa/run_impact/run_troubleshoot と ES 補完を差し替え、渡された引数を捕捉する。
-    impact/troubleshoot の固定シグネチャは layer を受け取らない（渡されたら TypeError で検出）。"""
-    cap: dict = {}
-
-    def run_qa(payload, world, scope_paths=None, layer=None, max_hits=None):
-        cap.update(run_qa_layer=layer, max_hits=max_hits)
-        return {"type": "qa", "question": payload, "answered": True, "citations": []}
-
-    def merge_qa(result, world, query, sp, layer=None):
-        cap["merge_layer"] = layer
-        return result
-
-    def run_impact(session, payload, world, scope_prefixes=None, depth=None):
-        cap["impact_depth"] = depth
-        return {"items": [], "presumed": [], "start": payload, "starts": []}
-
-    def run_ts(session, symptom, world, scope_paths=None, depth=None):
-        cap["ts_depth"] = depth
-        return {"type": "troubleshoot", "world": world, "symptom": symptom, "anchors": [], "candidates": []}
-
-    monkeypatch.setattr(CS, "run_qa", run_qa)
-    monkeypatch.setattr(CS, "_merge_qa_with_es", merge_qa)
-    monkeypatch.setattr(CS, "run_impact", run_impact)
-    monkeypatch.setattr(CS, "run_troubleshoot", run_ts)
-    monkeypatch.setattr(CS, "_merge_troubleshoot_with_es", lambda result, world, query, sp: result)
-    return cap
-
-
-def _sm(depth_profile=None, **extra):
-    return {"world": "w1", "scope_paths": [], "source": "all", "layer": "both",
-            "depth_profile": depth_profile, **extra}
-
-
-_PAYLOADS = {"qa": "消費税率とは", "impact": "消費税率", "troubleshoot": "夜間バッチ停止"}
-
-
-@pytest.mark.parametrize("lens,layer,applied", [("qa", "code", True), ("impact", "code", False),
-                                                ("troubleshoot", "docs", False)])
-def test_dispatch_layer_wiring(monkeypatch, lens, layer, applied):
-    cap = _patch_runners(monkeypatch)
-    env = CS._dispatch(None, lens, _PAYLOADS[lens], "w1",
-                       {"world": "w1", "scope_paths": [], "source": "all", "layer": layer})
-    assert env["scope"] == {"world": "w1", "scope_paths": [], "source": "all", "layer": layer,
-                            "layer_applied": applied}
-    if lens == "qa":
-        assert (cap["run_qa_layer"], cap["merge_layer"]) == (layer, layer)
-
-
-def test_dispatch_no_scope_meta_defaults_to_both_and_qa_applies(monkeypatch):
-    _patch_runners(monkeypatch)
-    env = CS._dispatch(None, "qa", "消費税率とは", "w1", None)
-    assert env["scope"] == {"world": "w1", "scope_paths": [], "source": "all", "layer": "both", "layer_applied": True}
-
-
-@pytest.mark.parametrize("lens,profile,settings,key,expected", [
-    ("impact", None, None, "impact_depth", 10), ("impact", "standard", None, "impact_depth", 10),
-    ("impact", "deep", None, "impact_depth", 12), ("impact", "max", None, "impact_depth", 14),
-    ("troubleshoot", None, None, "ts_depth", 4), ("troubleshoot", "standard", None, "ts_depth", 4),
-    ("troubleshoot", "deep", None, "ts_depth", 6), ("troubleshoot", "max", None, "ts_depth", 8),
-    ("qa", None, None, "max_hits", 20), ("qa", "standard", None, "max_hits", 20),
-    ("qa", "deep", None, "max_hits", 30), ("qa", "max", None, "max_hits", 40),
-    # 管理画面の基準値編集が env 既定より優先され、加算・倍率はその実効基準値に載る
-    ("impact", "deep", {"depth_base_impact_depth": 20}, "impact_depth", 22),
-    # 倍率・加算の適用後に絶対上限でクランプされる
-    ("impact", "max", {"depth_base_impact_depth": 68}, "impact_depth", 64),
-    ("troubleshoot", "max", {"depth_base_troubleshoot_depth": 20}, "ts_depth", 16),
-    ("qa", "max", {"depth_base_qa_max_hits": 2000}, "max_hits", 1000),
-])
-def test_dispatch_depth_profile_scales_base_and_clamps_at_abs_max(monkeypatch, lens, profile, settings, key, expected):
-    cap = _patch_runners(monkeypatch)
-    CS._dispatch(None, lens, _PAYLOADS[lens], "w1", _sm(profile), system_settings=settings)
-    assert cap[key] == expected
-
-
-def _raise_if_called(*_a, **_kw):
-    raise AssertionError("OFF/不達のツールが呼ばれてしまった（迂回封鎖のはずが実行された）")
-
-
-@pytest.mark.parametrize("lens,runner", [("impact", "run_impact"), ("troubleshoot", "run_troubleshoot")])
-def test_dispatch_graph_lens_degrades_when_graph_off_but_search_remains(monkeypatch, lens, runner):
-    """グラフ OFF/不達でも grep か全文が残っていれば明示エラーで終わらせず qa 相当の下地へ縮退する。"""
-    monkeypatch.setattr(CS, runner, _raise_if_called)
-    env = CS._dispatch(None, lens, _PAYLOADS[lens], "w1", _sm(tools={"grep": True, "fulltext": True, "graph": False}))
-    assert env["graph_degraded"] == "blocked" and env["data"]["type"] == "qa"
-
-
-def test_dispatch_impact_blocked_when_no_search_tool_remains(monkeypatch):
-    for name in ("run_impact", "run_qa", "_es_citations"):
-        monkeypatch.setattr(CS, name, _raise_if_called)
-    env = CS._dispatch(None, "impact", "消費税率", "w1", _sm(),
-                       tools_availability={"grep": False, "fulltext": False, "graph": False})
-    assert env["data"] == {} and env["sources"] == [] and "グラフ" in env["headline"]
-
-
-def test_dispatch_qa_blocked_when_grep_and_fulltext_off_returns_honest_failure(monkeypatch):
-    monkeypatch.setattr(CS, "run_qa", _raise_if_called)
-    monkeypatch.setattr(CS, "_es_citations", _raise_if_called)
-    env = CS._dispatch(None, "qa", "消費税率とは", "w1", _sm(tools={"grep": False, "fulltext": False, "graph": True}))
-    assert env["data"] == {} and env["sources"] == []
-
-
-def test_dispatch_qa_skips_es_merge_when_fulltext_off(monkeypatch):
-    monkeypatch.setattr(CS, "run_qa", lambda payload, world, scope_paths=None, layer=None, max_hits=None:
-                        {"type": "qa", "question": payload, "answered": True,
-                         "citations": [{"doc_id": "a.md", "quote": "x", "span": [1, 1]}]})
-    monkeypatch.setattr(CS, "_merge_qa_with_es", _raise_if_called)
-    assert CS._dispatch(None, "qa", "消費税率とは", "w1", _sm(tools={"fulltext": False}))["summary"]["total"] == 1
-
-
-def test_dispatch_qa_uses_es_only_when_grep_off(monkeypatch):
-    monkeypatch.setattr(CS, "run_qa", _raise_if_called)
-    monkeypatch.setattr(CS, "_es_citations", lambda world, query, sp, layer=None:
-                        [{"doc_id": "b.md", "quote": "y", "span": [2, 2]}])
-    env = CS._dispatch(None, "qa", "消費税率とは", "w1", _sm(tools={"grep": False}))
-    assert env["summary"]["total"] == 1 and env["data"]["citations"][0]["doc_id"] == "b.md"
-
-
-def test_dispatch_troubleshoot_skips_es_merge_when_fulltext_off(monkeypatch):
-    monkeypatch.setattr(CS, "run_troubleshoot", lambda session, symptom, world, scope_paths=None, depth=None:
-                        {"type": "troubleshoot", "world": world, "symptom": symptom, "anchors": [],
-                         "candidates": [{"name": "X", "label": "Program", "category": "コード", "role": "近傍",
-                                         "distance": 1, "path": [], "evidence": {}}]})
-    monkeypatch.setattr(CS, "_merge_troubleshoot_with_es", _raise_if_called)
-    assert CS._dispatch(None, "troubleshoot", "夜間バッチ停止", "w1", _sm(tools={"fulltext": False}))["summary"]["total"] == 1
-
-
-def test_dispatch_tools_availability_param_decides_regardless_of_pref(monkeypatch):
-    monkeypatch.setattr(CS, "run_impact", _raise_if_called)
-    env = CS._dispatch(None, "impact", "消費税率", "w1", _sm(),
-                       tools_availability={"grep": True, "fulltext": True, "graph": False})
-    assert env["graph_degraded"] == "graph_unavailable"          # 実接続の不達＝統計に残す側のコード
-    cap = _patch_runners(monkeypatch)                             # 省略時は全て利用可能扱い
-    CS._dispatch(None, "impact", "消費税率", "w1", _sm())
-    assert cap["impact_depth"] is not None
 
 
 # ---- _resolve_scope / _resolve_lens ----
@@ -1364,65 +1198,7 @@ def test_turn_lens_wires_into_ctx_route(monkeypatch, message, lens, source, rout
         assert _rows(saved, "user")[0]["content"] == saved_content   # 接頭辞は保存された質問からも除かれる
 
 
-# ---- 打切り申告・秘匿名・清書プロンプトの事実 ----
-
-def test_qa_headline_carries_truncation_note_on_zero_hits():
-    note = "「大規模一覧.xlsx」は大きすぎて全体を検索できていません（先頭部分のみ）。"
-    env = CS._answer_qa({"citations": [], "notes": [note]}, "w")
-    assert "見つかりませんでした" in env["headline"] and "大きすぎて全体を検索できていません" in env["headline"]
-    base = CS._answer_qa({"citations": []}, "w")["headline"]       # 打切りが無ければ headline は不変
-    assert base == CS._answer_qa({"citations": [], "notes": []}, "w")["headline"] and "⚠" not in base
-    assert note in CS._answer_troubleshoot({"candidates": [], "notes": [note]}, "w")["headline"]
-    assert note in CS._answer_impact({"items": [], "start": "契約", "notes": [note]}, "w")["headline"]
-
-
-def test_es_hits_excludes_sensitive_doc_ids(monkeypatch):
-    from sherpa import documents as documents_mod
-    from sherpa import es_index as es_index_mod
-    monkeypatch.setattr(documents_mod, "world_rel_set", lambda world: {"a/credentials.xlsx", "a/report.xlsx"})
-    monkeypatch.setattr(es_index_mod, "search", lambda world, query, scope_paths=None, k=8, vector=False, layer=None: (
-        [{"doc_id": "a/credentials.xlsx", "text": "secret"}, {"doc_id": "a/report.xlsx", "text": "ok"}], None))
-    assert [h["doc_id"] for h in CS._es_hits("w", "q", None)] == ["a/report.xlsx"]
-
-
-# ---- S4（縮退の可視化と計数）: 事前検索（グラフ）が不調でも調査を止めない ----
-# モックは外部境界（Neo4j セッション）だけ——`run_impact`/`run_troubleshoot` は差し替えない。
-
-_DEGRADE_SCOPE_META = {"world": "v1", "scope_paths": [], "source": "all"}
-_DEGRADE_TOOLS = {"grep": True, "fulltext": False, "graph": True}
-
-
-class _BoomSession:
-    def __init__(self, exc):
-        self.exc = exc
-
-    def run(self, query, **kw):
-        raise self.exc
-
-
-def test_dispatch_degrades_to_grep_on_recoverable_graph_failures():
-    from neo4j.exceptions import ServiceUnavailable
-    from sherpa.ingest.world_neo4j import GraphSchemaEraError
-    env = CS._dispatch(_BoomSession(ServiceUnavailable("down")), "impact", "消費税率を変えたい", "v1",
-                       scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
-    assert env["graph_degraded"] == "graph_unavailable" and env["data"]["type"] == "qa"
-    env = CS._dispatch(_BoomSession(GraphSchemaEraError("v1", "old-era", lens="troubleshoot")),
-                       "troubleshoot", "請求の不具合", "v1",
-                       scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
-    assert env["graph_degraded"] == "graph_reingest_required"
-
-
-@pytest.mark.parametrize("exc_name,lens,message", [
-    ("ClientError", "impact", "消費税率を変えたい"),             # Cypher のバグ等は握り潰さない
-    ("ConfigurationError", "troubleshoot", "請求の不具合"),     # 非一時的な設定不備＝回復不可
-])
-def test_dispatch_does_not_degrade_on_non_recoverable_graph_error(exc_name, lens, message):
-    import neo4j.exceptions as ne
-    exc = getattr(ne, exc_name)("bad")
-    with pytest.raises(getattr(ne, exc_name)):
-        CS._dispatch(_BoomSession(exc), lens, message, "v1", scope_meta=_DEGRADE_SCOPE_META,
-                     tools_availability=_DEGRADE_TOOLS)
-
+# ---- グラフ縮退の告知と計数（_finalize） ----
 
 def test_finalize_turns_graph_degraded_into_notice_and_limit():
     env = {"headline": "該当箇所が 3件見つかりました。", "summary": {"total": 3},
@@ -1452,110 +1228,6 @@ def test_finalize_graph_degraded_notice_survives_no_results_headline():
     assert out["limits"]["backend_unavailable_graph"] is True
 
 
-def test_dispatch_entry_degrade_counts_graph_unavailable_only_when_unreachable():
-    """入口の縮退は実接続の不達だけを統計に残す。利用者が自分で OFF にしただけなら計数しない。"""
-    sm_off = _sm(tools={"grep": True, "fulltext": True, "graph": False})
-    env_off = CS._dispatch(None, "impact", "消費税率", "w1", sm_off,
-                           tools_availability={"grep": True, "fulltext": True, "graph": True})
-    assert env_off["graph_degraded"] == "blocked" and CS._GRAPH_DEGRADED_LIMIT_FIELD.get("blocked") is None
-    env_both = CS._dispatch(None, "impact", "消費税率", "w1", sm_off,
-                            tools_availability={"grep": True, "fulltext": True, "graph": False})
-    assert env_both["graph_degraded"] == "blocked"
-    assert "backend_unavailable_graph" not in (CS._finalize(env_both, {"lens": "impact", "reason": "テスト"}).get("limits") or {})
-
-    env = CS._dispatch(None, "impact", "消費税率", "w1", _sm(),
-                       tools_availability={"grep": True, "fulltext": True, "graph": False})
-    assert env["graph_degraded"] == "graph_unavailable"
-    assert CS._finalize(env, {"lens": "impact", "reason": "テスト"})["limits"]["backend_unavailable_graph"] is True
-
-
-def test_dispatch_graph_failure_without_any_search_tool_stays_blocked():
-    from neo4j.exceptions import ServiceUnavailable
-    env = CS._dispatch(_BoomSession(ServiceUnavailable("down")), "impact", "消費税率を変えたい", "v1",
-                       scope_meta=_DEGRADE_SCOPE_META,
-                       tools_availability={"grep": False, "fulltext": False, "graph": True})
-    assert env["data"] == {} and "graph_degraded" not in env and env["agentic_failure"] == "error"
-
-
-# ---- 空グラフ（未構築）を「影響なし」と誤読させない ----
-
-def _use_real_graph_empty_check(monkeypatch):
-    from sherpa.ingest import world_neo4j
-    monkeypatch.setattr(CS, "world_graph_is_empty", world_neo4j.world_graph_is_empty)
-
-
-class _CountSession:
-    """`:Entity{world_id}` の存在確認クエリに `count(n)` を返す fake セッション。"""
-
-    def __init__(self, count: int):
-        self.count = count
-        self.queries: list = []
-
-    def run(self, query, **kw):
-        self.queries.append(query)
-        c = self.count
-
-        class _R:
-            @staticmethod
-            def data():
-                return [{"c": c}]
-        return _R()
-
-
-def _empty_graph_runners(monkeypatch):
-    monkeypatch.setattr(CS, "run_impact", lambda session, payload, world, scope_prefixes=None, depth=None:
-                        {"items": [], "presumed": [], "start": payload, "starts": []})
-    monkeypatch.setattr(CS, "run_troubleshoot", lambda session, symptom, world, scope_paths=None, depth=None:
-                        {"type": "troubleshoot", "world": world, "symptom": symptom, "anchors": [], "candidates": []})
-    _use_real_graph_empty_check(monkeypatch)
-
-
-@pytest.mark.parametrize("lens,message", [("impact", "消費税率を変えたい"), ("troubleshoot", "夜間バッチ停止")])
-def test_dispatch_degrades_when_world_graph_is_empty(monkeypatch, lens, message):
-    _empty_graph_runners(monkeypatch)
-    session = _CountSession(0)
-    env = CS._dispatch(session, lens, message, "v1", scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
-    assert any("Entity" in q for q in session.queries)
-    assert env["graph_degraded"] == "graph_empty" and env["data"]["type"] == "qa"
-
-
-def test_dispatch_impact_stays_no_results_when_graph_has_data(monkeypatch):
-    _empty_graph_runners(monkeypatch)
-    env = CS._dispatch(_CountSession(1), "impact", "消費税率を変えたい", "v1",
-                       scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
-    assert "graph_degraded" not in env and "影響先は見つかりませんでした" in env["headline"]
-
-
-def test_finalize_graph_empty_notice_has_no_limit_field():
-    env = {"headline": "該当箇所が 3件見つかりました。", "summary": {"total": 3},
-           "data": {"citations": [{"doc_id": "a.md"}]}, "sources": [], "graph_degraded": "graph_empty"}
-    out = CS._finalize(env, {"lens": "troubleshoot", "reason": "テスト"})
-    assert "graph_degraded" not in out
-    assert out["headline"].startswith("関係のつながりの情報がまだ作られていない")
-    assert out["headline"].endswith("該当箇所が 3件見つかりました。")
-    assert "limits" not in out or not out["limits"]
-
-
-# ---- グラフ接続断でターン全体が 500 にならず縮退へ進む ----
-
-class _DispatchingProvider:
-    def run(self, ctx):
-        env = ctx.dispatch("impact", ctx.message)
-        env.setdefault("headline", "回答")
-        yield {"type": "_result", "env": env, "decision": {"lens": "impact", "input": ctx.message, "reason": "テスト"}}
-
-
-def test_turn_degrades_instead_of_crashing_when_graph_connection_is_down(monkeypatch):
-    from neo4j.exceptions import ServiceUnavailable
-    saved = _mock_store_no_db(monkeypatch)
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _DispatchingProvider())
-    _turn("消費税率の影響は？", session=_BoomSession(ServiceUnavailable("down")), knowledge=True)
-    row = saved[-1]
-    assert row["role"] == "assistant"
-    assert row["answer"]["headline"].startswith("関係のつながりをたどる検索に接続できなかったため")
-    assert row["answer"]["limits"]["backend_unavailable_graph"] is True
-
-
 @pytest.mark.parametrize("message,shown", [("処理ごとの抽出条件を教えて", True), ("標準税率は何%ですか", False)])
 def test_coverage_hint_for_quick_even_when_results_exist(message, shown):
     """網羅性を求める質問をクイックで実行したときは、結果が有っても『標準以上で調べ直す』案内を出す
@@ -1570,11 +1242,6 @@ def test_coverage_hint_for_quick_even_when_results_exist(message, shown):
         assert hints[0]["action"] == {"depth_profile": "standard"}
     else:
         assert not hints
-
-
-def test_impact_headline_without_structural_items_has_no_grading_words():
-    h = CS._answer_impact({"items": [], "start": "税率", "presumed": [{"name": "TAXCALC", "evidence": []}]}, "w")["headline"]
-    assert "見つけた関連" in h and not any(w in h for w in ("確実", "推定", "要確認"))
 
 
 def test_history_note_does_not_claim_drop_when_window_only_filled_by_unpaired_rows():

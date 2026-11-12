@@ -211,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
     # 参照できず、クラス名で判定する（それ以外の予期しない失敗は隠さず再送出する）。
     try:
         from sherpa.ingest.analyzers import registry
-        from sherpa.ingest.analyzers import _base as base
+        import sherpa.ingest.analyzers as base
     except Exception as e:
         if "ExtensionAnalyzerError" not in {c.__name__ for c in type(e).__mro__}:  # FwPluginError を含む
             raise

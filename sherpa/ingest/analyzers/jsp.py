@@ -124,8 +124,6 @@ def _collect_tags(text: str) -> list:
 # 埋め込み・コメントの区間を、改行だけ残して空白にする変換表。
 _MASK_TABLE = bytes(10 if i == 10 else 32 for i in range(256))
 
-_DIRECTIVE_NODES = ("directive", "output_directive", "comment_directive", "ERROR")
-
 
 def _split_template(parsed: _ts.Parsed) -> tuple:
     """テンプレートを `(埋め込みを空白にしたテキスト, 指令, コードの塊)` に分ける。

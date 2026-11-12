@@ -10,6 +10,7 @@ import pytest
 from sherpa import documents, es_index
 from sherpa import tool_dispatch as TD
 from sherpa.ingest import text_kind
+from tests._replace_row import offline_row
 
 _STRUCT_KEYS = ("identifier_values", "record_identity_values", "labels", "region_context")
 
@@ -53,6 +54,7 @@ def test_mapping_has_structure_fields():
 def test_mapping_version_is_bumped_so_old_index_is_rebuilt(monkeypatch):
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "count", lambda w: 5)
+    monkeypatch.setattr(es_index, "_index_kind", lambda w: "alias")  # 稼働中の ES の実の索引に左右されない
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     monkeypatch.setattr(es_index, "_human_md_config_sig", lambda world: None)
@@ -141,7 +143,7 @@ def test_sensitive_named_office_file_is_never_indexed_with_structure_fields(monk
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
     monkeypatch.setattr(es_index, "_req", fake_req)
     monkeypatch.setattr(es_index.importance, "resolve_for_world", lambda *a, **k: {})
-    out = es_index.index_world("w")
+    out = es_index.index_world("w", row=offline_row("w"))
     assert out["indexed"] == 1 and out["chunks"] == 1
     bodies = [json.loads(ln) for p in sent for i, ln in enumerate(p.strip().split("\n")) if i % 2 == 1]
     assert [b["doc_id"] for b in bodies] == ["a.xlsx"]
@@ -177,11 +179,24 @@ _EXACT_CLAUSE = {"bool": {"should": [{"terms": {"identifier_values": ["A01", "B0
                           "minimum_should_match": 1}}
 
 
+_KNN_EXACT_CLAUSE = {"bool": {"should": [*_EXACT_CLAUSE["bool"]["should"],
+                                         {"terms": {"row_group_identifier_values": ["A01", "B02"]}}],
+                              "minimum_should_match": 1}}
+
+
+def _stub_embedding(monkeypatch):
+    monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: {"provider": "p", "model": "m", "dim": 2})
+    monkeypatch.setattr(es_index, "_index_meta_read", lambda w, idx=None: (es_index._index_meta(w), False))  # 読み取りの失敗種別は差し替えた `_index_meta` の値から
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: {
+        "embed_provider": "p", "embed_model": "m", "dim": 2, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
+    monkeypatch.setattr(es_index.embeddings, "embed", lambda texts, ec, **kw: [[0.1, 0.2]])
+
+
 def test_search_exact_builds_terms_filter_without_text_match(monkeypatch):
     captured = _capture(monkeypatch)
     hits, reason = es_index.search_exact("w", ["A01", "B02"], scope_paths=["設計"], k=5, layer="code")
     assert hits == [] and reason is None
-    q = captured["body"]["query"]["function_score"]["query"]["bool"]
+    q = captured["body"]["query"]["bool"]
     assert _EXACT_CLAUSE in q["filter"] and {"terms": {"scopes": ["設計"]}} in q["filter"]
     assert "must" not in q and '{"match"' not in json.dumps(captured["body"])
     assert q["should"] == [{"terms": {"record_identity_values": ["A01", "B02"]}}]   # 定義しているレコードを先に
@@ -196,25 +211,49 @@ def test_search_exact_empty_values_is_no_query(monkeypatch):
 def test_search_with_exact_and_query_is_and(monkeypatch):
     captured = _capture(monkeypatch)
     es_index.search("w", "表示名", vector=False, exact=["A01", "B02"])
-    q = captured["body"]["query"]["function_score"]["query"]["bool"]
-    assert q["must"] == [{"match": {"text": "表示名"}}]                       # 本文で順位付け
+    q = captured["body"]["query"]["bool"]
+    assert q["must"] == [es_index._keyword_clause("表示名")]                  # 本文（＋見出し系の欄）で順位付け
     assert q["filter"] == [_EXACT_CLAUSE]                                     # exact で絞る
 
 
 def test_search_without_exact_keeps_previous_query(monkeypatch):
     captured = _capture(monkeypatch)
     es_index.search("w", "表示名", vector=False)
-    assert captured["body"]["query"]["function_score"]["query"]["bool"]["filter"] == []
+    assert captured["body"]["query"]["bool"]["filter"] == []
 
 
 def test_knn_only_applies_exact_filter(monkeypatch):
     captured = _capture(monkeypatch)
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: {"provider": "p", "model": "m", "dim": 2})
+    monkeypatch.setattr(es_index, "_index_meta_read", lambda w, idx=None: (es_index._index_meta(w), False))  # 読み取りの失敗種別は差し替えた `_index_meta` の値から
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "embed_provider": "p", "embed_model": "m", "dim": 2, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
     monkeypatch.setattr(es_index.embeddings, "embed", lambda texts, ec, **kw: [[0.1, 0.2]])
     es_index.search_knn_only("w", "q", exact=["A01", "B02"])
-    assert captured["body"]["knn"]["filter"] == [_EXACT_CLAUSE]
+    assert captured["body"]["knn"]["filter"] == [_KNN_EXACT_CLAUSE]       # ベクトルは先頭にしか無い＝構成行の識別子にも当てる
+
+
+def test_hybrid_applies_group_identifiers_to_knn_side_only(monkeypatch):
+    bodies: list = []
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "_req", lambda method, path, body=None, **kw: (bodies.append(body) or {"hits": {"hits": []}}))
+    _stub_embedding(monkeypatch)
+    _hits, reason = es_index.search("w", "q", scope_paths=["設計"], exact=["A01", "B02"], settings={})
+    assert reason is None and len(bodies) == 2
+    bm25_filter = bodies[0]["query"]["bool"]["filter"]
+    knn_filter = bodies[1]["query"]["knn"]["filter"]
+    assert bm25_filter == [{"terms": {"scopes": ["設計"]}}, _EXACT_CLAUSE]                # BM25 側の exact は変えない
+    assert knn_filter == [{"terms": {"scopes": ["設計"]}}, _KNN_EXACT_CLAUSE]
+
+
+def test_hybrid_without_exact_has_same_filter_on_both_sides(monkeypatch):
+    bodies: list = []
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "_req", lambda method, path, body=None, **kw: (bodies.append(body) or {"hits": {"hits": []}}))
+    _stub_embedding(monkeypatch)
+    es_index.search("w", "q", settings={})
+    assert bodies[0]["query"]["bool"]["filter"] == []
+    assert bodies[1]["query"]["knn"]["filter"] == []
 
 
 # ===== es_search ツール =====

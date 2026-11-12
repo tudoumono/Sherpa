@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -9,6 +8,15 @@ from urllib.parse import parse_qs, urlparse
 
 WORLD = {"world_id": "w1", "label": "4期更改", "root_path": "/mnt/c/ProjectA",
          "storage_mode": "external_reference"}
+
+
+# 優先と除外（GET /admin/path-rules）の既定のフォルダの木と、フォルダ直下のファイル。
+PATH_RULES_FOLDERS = [
+    {"path": "4期", "label": "4期", "depth": 0, "count": 5},
+    {"path": "4期/02_設計", "label": "02_設計", "depth": 1, "count": 3},
+    {"path": "4期/03_開発", "label": "03_開発", "depth": 1, "count": 2},
+]
+PATH_RULES_FILES = {"": ["README.md"], "4期": ["4期/概要.md"]}
 
 
 def _ann_status(a: dict) -> str:
@@ -35,67 +43,24 @@ SCOPES = {
     ],
 }
 
-# S3: 実形状（sherpa/preview_service.py::graph_view）は世代/位置に top_scope・path を持つ（旧モックの
-# "parent" キーは実 API に存在しない＝実ドリフト是正。web/graph.js の `d.parent` 参照はレガシー耐性の
-# 防御コードで、未定義でも支障なし）。edges にも実際は status がある。
-# ソース正典化（`docs/archive/2026-09-04-グラフのソース正典化.md`・K9〜K13）: 意味層 LLM 抽出・
-# 概念ラベル（Parameter/Function 等）・REALIZES/IMPLEMENTED_BY・em（確実/要確認）は撤去済み。
-# 4ノードの旧「消費税率(Parameter)→TAX-RATE」REALIZES 橋は「税計算仕様書.md(Document) が
-# DOCUMENTS(via=mention) で TAX-RATE を言及」に置換（K3 の言及エッジ）。旧「請求機能(Function・
-# LLM由来)」は「請求機能(Batch) が INVOKES で TAXCALC を呼ぶ」という静的解析由来のノードに置換
-# （全ノード extraction_method=static・K12）。
-# 注記（並行バックエンドレーンとの突合が必要）: 実 API の counts/summary の最終形が未確定のため、
-# ここでは K12 の方針どおり「count のみ・judgement/em 無し」で組んでいる。
-GRAPH = {
-    "world": "w1",
-    "nodes": [
-        {"id": "doc:w1:taxspec", "name": "税計算仕様書.md", "type": "Document", "type_ja": "文書",
-         "status": "active", "value": None, "top_scope": "4期",
-         "path": "4期/02_設計/01_基本設計/税計算仕様書.md"},
-        {"id": "data:w1:TAX-RATE", "name": "TAX-RATE", "type": "DataItem", "type_ja": "項目",
-         "status": "active", "value": None, "top_scope": "4期",
-         "path": "4期/03_開発/01_ソース/TAXCALC.cbl"},
-        {"id": "module:w1:TAXCALC", "name": "TAXCALC", "type": "Module", "type_ja": "プログラム",
-         "status": "active", "value": None, "top_scope": "4期",
-         "path": "4期/03_開発/01_ソース/TAXCALC.cbl"},
-        {"id": "batch:w1:billing", "name": "請求機能", "type": "Batch", "type_ja": "バッチ",
-         "status": "active", "value": None, "top_scope": "4期", "path": None},
-    ],
-    "edges": [
-        {"source": "doc:w1:taxspec", "target": "data:w1:TAX-RATE", "type": "DOCUMENTS",
-         "status": "active"},
-        {"source": "module:w1:TAXCALC", "target": "data:w1:TAX-RATE", "type": "CONTAINS",
-         "status": "active"},
-        {"source": "batch:w1:billing", "target": "module:w1:TAXCALC", "type": "INVOKES",
-         "status": "active"},
-    ],
-    # GraphCounts と IngestPreviewCounts は同一の `preview_service.py::_counts()` が作る同一形。
-    "counts": {"entities": 4, "relations": 3,
-              "deprecated": 0, "hidden": 0, "documents": 3},
-    # ②graph 軽量化（段階読み込み）: 4 ノードは既定 limit に収まる＝非truncated（実 API と同じ応答形）。
-    "total_nodes": 4, "total_edges": 3, "truncated": False,
-}
-# ETag は GRAPH 本体の内容連動（実 API の内容署名を模す・②graph 軽量化 RV是正2026-07-08 Low#3）。
-_GRAPH_CONTENT_HASH = hashlib.sha1(json.dumps(GRAPH, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
-
 PREVIEW = {
-    # S3: 実形状（sherpa/preview_service.py::build_preview）は world/label/issues も持つ
-    # （旧モックは無かった＝実ドリフト是正）。issues は build_preview の `flags`（未解決の抽出警告）。
-    # 実 API（doc_ledger.control_diagnostics 経由）は importance_diagnostics も常に持つ
-    # （`_重要度.txt` の構文診断・無ければ空リスト）。
-    "world": "w1", "label": "4期更改", "issues": [], "importance_diagnostics": [],
-    # 資料の画面のツリー用のフォルダの一覧（資料の無いフォルダも含む）。
-    "folders": [], "folders_truncated": False,
+    # 実形状（sherpa/preview_service.py::build_preview）: 画面を開いたときの応答は要素・関係・警告を持たない
+    # （空で返る。中身は GET /ingest/preview/graph = PREVIEW_GRAPH）。
+    # S3: 実形状は world/label/issues も持つ。
+    "world": "w1", "label": "4期更改", "issues": [],
+    # グラフを今は組み立てられない理由（組み立てられるときは None）。
+    "graph_note": None,
+    # 一覧を出せない理由（台帳が空で、資料フォルダを歩く期限を超えたとき）。
+    "documents_note": None,
+    # 資料の画面のツリー用のフォルダの一覧（資料の無いフォルダも含む）。`folders_partial` は走査が期限で止まったこと。
+    "folders": [], "folders_truncated": False, "folders_partial": False,
+    # 表の印用の優先と除外（読み取りだけ）。読めないときは None。
+    "path_rules": [],
     "counts": {"entities": 4, "relations": 3,
                "deprecated": 0, "hidden": 0, "documents": 3},
     # フェーズ7-1: 実 doc（doc_ledger.py::preview_documents）は phase/category/label/reason も常に持つ
     # （旧モックは欠落＝実ドリフト是正。reason は失敗時のみ非 None・他は None）。
     "documents": [
-        # 重要度バッジ用フィールド（importance/importance_reason/importance_source）は、
-        # `_重要度.txt` の解決結果がある時だけ付く（無ければ3キーとも省略・real fixtures/corpus/v1
-        # には `_重要度.txt` が無いため、既定の PREVIEW はここでは付けない＝test_mock_api_contract
-        # の mock⊆実 契約を保つ。バッジ表示自体のe2eは test_ingest_ui.py 側でこの3キーを
-        # ローカルに追加した preview を個別に用意して確認する）。
         {"name": "4期/02_設計/01_基本設計/税計算仕様書.md", "folder": "4期/02_設計/01_基本設計",
          "branch": "office", "doctype": "md", "analyzer": None, "state": "ready", "top_scope": "4期",
          "phase": None, "category": "01_基本設計", "label": "使えます", "reason": None},
@@ -118,8 +83,16 @@ PREVIEW = {
          "phase": None, "category": "01_基本設計", "label": "使えます（画像OCR）", "reason": None,
          "provenance": {"method": "markitdown_ocr", "confidence": 0.4}},
     ],
+    "entities": [], "relations": [],
+}
+
+PREVIEW_GRAPH = {
+    # GET /ingest/preview/graph（sherpa/preview_service.py::build_preview_graph）の実形状。
+    "world": "w1", "issues": [], "graph_note": None,
+    "counts": {"entities": 4, "relations": 3,
+               "deprecated": 0, "hidden": 0, "documents": 3},
     # S3: 実形状（sherpa/preview_service.py::build_preview の entities）は top_scope/phase/path を
-    # 持つ（旧モックの "parent" キーは実 API に存在しない＝GRAPH と同じ実ドリフト是正）。
+    # 持つ（旧モックの "parent" キーは実 API に存在しない＝実ドリフト是正）。
     # `analyzer`＝担当アナライザの来歴（コード分のみ非 None・§7 裁定2）。ソース正典化（K12）で
     # extraction_method は撤去済み（全件 static＝表示不要）。「消費税率(Parameter・analyzer=None)」は
     # 「税計算仕様書.md(Document・analyzer=None＝Documentはコード分析対象外)」に置換。
@@ -545,8 +518,7 @@ def auth_me_response(current_user: dict) -> dict:
     }
 
 
-# フェーズ7-1 再RV（Codex MEDIUM・2026-07-16）: handler 内で動的に組み立てる応答（個人ワークスペース・
-# ナレッジグラフ）も関数へ抽出する（auth_me_response と同じ理由＝契約テストがこの実関数を実行して
+# フェーズ7-1 再RV（Codex MEDIUM・2026-07-16）: handler 内で動的に組み立てる応答（個人ワークスペース）も関数へ抽出する（auth_me_response と同じ理由＝契約テストがこの実関数を実行して
 # 実 API と突合できるようにする・literal のままだと mock drift を検知できない）。
 
 def workspace_upload_response(file_id: int, rel_path: str, size_bytes: int = 18,
@@ -573,14 +545,6 @@ def workspace_search_response(q: str) -> dict:
              "text": f"{q}: TAX-RATE は個人メモ側にも記載されています。", "match": q},
         ] if q else [],
     }
-
-
-def graph_search_response(nodes: list, edges: list, counts: dict) -> dict:
-    """GET /graph/search の mock 応答（実形状＝graph_admin.py::_rows_to_graph と同キー。nodes[] は
-    GET /graph（preview_service.py::graph_view）と別形＝ phase/category に加え em も持つ
-    （graph_admin.py::_node は S3 でも em を撤去していない）ため、呼び出し側で
-    `GRAPH["nodes"]` に `em`/`phase`/`category` を足してから渡すこと）。"""
-    return {"world": "w1", "nodes": nodes, "edges": edges, "counts": counts}
 
 
 def world_diff_response(path: str | None, world_id: str | None = None, label: str | None = None,
@@ -1009,7 +973,7 @@ def _default_model_catalog() -> dict:
             "extract": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
             "intent": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
             "subsearch": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
-            "embed": {"allowed": ["nomic-embed-text"], "default": "nomic-embed-text"},
+            "embed": {"allowed": ["bge-m3", "nomic-embed-text"], "default": "bge-m3"},
         },
         "codex": {"codex": {"allowed": ["gpt-5.5"], "default": "gpt-5.5"}},
     }
@@ -1108,7 +1072,7 @@ SYSTEM_SETTINGS_VIEW = {
          "detail": None},
     ],
     # L5（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1）: rag.md の LLM 成形トグル。既定 on。
-    "rag_llm_render": {"configured": None, "effective": True, "default": True, "options": ["on", "off"]},
+    "rag_llm_render": {"configured": None, "effective": True, "default": True, "options": ["on", "off"]}, "ocr": {"configured": None, "effective": False, "default": False, "env_override": None},
     # R2a-S2（2026-07-13 横断レビュー対応）: Ollama 接続先の SSRF allowlist。既定（未設定）は
     # loopback のみ許可＝配下 effective は空（loopback 自体は暗黙許可のためここには出ない）。
     "ollama_allowlist": {"configured": None, "effective": []},
@@ -1121,14 +1085,10 @@ SYSTEM_SETTINGS_VIEW = {
     # 是正＝旧モックはこのキーを欠いていた（実 GET /admin/settings は常に持つ）。
     "codex_session_retention_days": {"configured": None, "effective": 30, "default": 30},
     # SC-6c（調べる深さの基準値・調べ方ブロック §3.2）: 既定（未設定）は各モジュールの env 既定値
-    # （`sherpa/agentic_search.py`/`sherpa/impact_service.py`/`sherpa/lens_service.py`/
-    # `sherpa/chat_service.py::QA_MAX_HITS_DEFAULT`・Codex は `SHERPA_CODEX_REASONING` 既定 "low"）。
+    # （`sherpa/agentic_search.py`・Codex は `SHERPA_CODEX_REASONING` 既定 "low"）。
     "depth_profile": {
         "grep_max_hits": {"configured": None, "effective": 30, "default": 30},
-        "qa_max_hits": {"configured": None, "effective": 20, "default": 20},
         "read_window": {"configured": None, "effective": 40, "default": 40},
-        "impact_depth": {"configured": None, "effective": 8, "default": 8},
-        "troubleshoot_depth": {"configured": None, "effective": 3, "default": 3},
         "codex_reasoning": {"configured": None, "effective": "low", "default": "low",
                             "options": ["minimal", "low", "medium", "high", "xhigh"]},
     },
@@ -1138,15 +1098,15 @@ SYSTEM_SETTINGS_VIEW = {
     # `sherpa/embeddings.py::EMBED_PARALLEL_DEFAULT`（4）。env フォールバックは持たない。
     "embed_parallel": {"configured": None, "effective": 4, "default": 4},
     "embed_dim": {"configured": None, "effective": 1536, "default": 1536, "min": 64, "max": 4096, "applies": True},
-    "embed_provider": {"configured": None, "effective": "auto", "default": "auto",
-                       "options": ["auto", "ollama"], "ollama_model": "nomic-embed-text"},
+    "embed_provider": {"configured": None, "effective": "auto", "default": "auto", "options": ["auto", "ollama"], "ollama_model": "bge-m3"},
+    "embed_request_timeout_s": {"configured": None, "effective": 60, "default": 60, "min": 10, "max": 600},
+    "embed_batch_size": {"configured": None, "effective": 50, "default": 50, "min": 1, "max": 200},
     # 「最大」の深さが許す査読の巡数（`sherpa/depth_profile.py::MAX_REVIEW_ROUNDS_DEFAULT`＝7）。
     "max_review_rounds": {"configured": None, "effective": 7, "default": 7},
     # multi_agent（S6）の worker モデル（`sherpa/providers/codex/sandbox.py::_CODEX_WORKER_MODEL_FALLBACK`）。
     "codex_worker_model": {"configured": None, "effective": "gpt-5.6-sol", "default": "gpt-5.6-sol"},
     # 素の Codex モード（docs/archive/2026-09-24-素のCodexモード.md §1.1）。
-    "codex_mode": {"configured": None, "effective": "standard", "default": "standard",
-                   "options": ["standard", "plain"]},
+    "codex_mode": {"configured": None, "effective": "standard", "default": "standard", "options": ["standard", "plain"]},
     "chat_max_turns": {
         "per_user": {"configured": None, "effective": 2, "default": 2},
         "global": {"configured": None, "effective": 8, "default": 8},
@@ -1269,11 +1229,6 @@ SETTINGS_RESP = {"agent": "simple",   # construct_id="simple" と一致させる
 
 WORLD_OPTIONS_RESP = {"worlds": ["w1"], "labels": {"w1": "4期更改"}}
 
-GRAPH_FACETS_RESP = {"relationship_types": ["COPIES", "CONTAINS", "INVOKES", "DOCUMENTS"],
-                     "condition_fields": ["category", "phase", "role", "status"],
-                     "node_labels": ["Batch", "DataItem", "Document", "Module"],
-                     "node_labels_ja": {"Module": "プログラム", "Batch": "バッチ"}}
-
 # GET /worlds/{wid}/status（sherpa/routers/worlds.py::world_status）: last_synced_at/
 # last_run_status/last_run_warnings は旧モックに無かった（S3 実ドリフト是正）。
 # フェーズ7-1（response_model 実測）で発見した実ドリフト是正: 実 GET /worlds/{wid}/status
@@ -1302,6 +1257,12 @@ WORLD_STATUS_RESP = {"ok": True, "world_id": "w1", "label": "4期更改", "root_
                      "last_run_id": 500,
                      "last_run_status": "auto_published", "last_run_warnings": [], "last_run_blocked": [],
                      "last_run_interrupted": False, "last_run_flags_total": 0, "last_run_flags_truncated": False,
+                     "last_completed_at": "2026-07-03T09:00:00+00:00",
+                     "last_completed_counts": {"as_of": "2026-07-03T09:00:00+00:00", "scanned": 3,
+                                               "indexed": 3, "office_failed": 0},
+                     "last_failure_message": None, "ingest_active": False,
+                     "actions": {name: {"allowed": True, "reason": None} for name in
+                                 ("recount", "refresh", "rag_regenerate_rules", "delete", "reconvert")},
                      "failed_files": None, "partial_extraction_suspected": None, "stage_summary": None,
                      "running_progress": None,
                      "failure_reason_catalog": _FAILURE_REASON_CATALOG_MOCK,
@@ -1444,10 +1405,7 @@ _DEPTH_BASE_INT_BOUNDS = {
     "embed_parallel": (1, 16),
     "max_review_rounds": (1, 32),
     "depth_base_grep_max_hits": (1, 1000),
-    "depth_base_qa_max_hits": (1, 1000),
     "depth_base_read_window": (10, 400),
-    "depth_base_impact_depth": (1, 64),
-    "depth_base_troubleshoot_depth": (1, 16),
 }
 _DEPTH_BASE_CODEX_REASONING_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
 
@@ -1549,7 +1507,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                       system_settings: dict | None = None, settings: dict | None = None,
                       stream_events: list | None = None, extra_users: list | None = None,
                       tools_availability: dict | None = None, notifications: list | None = None,
-                      world_options: dict | None = None):
+                      world_options: dict | None = None, path_rules: list | None = None):
     current_user = user or USER_ADMIN
     # GET /admin/users の既定2件（admin/sato）に加え、呼び出し元が `extra_users=` で行を追加
     # できる（例: pending 状態のユーザーなど、既定の POST/PATCH mock 経路では作れない状態を
@@ -1587,6 +1545,8 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
     # で不達を模せる・既定は3経路とも到達可＝既存 e2e の「全チップ表示」前提を崩さない）。
     tools_availability_resp = tools_availability if tools_availability is not None else {
         "grep": True, "fulltext": True, "graph": True}
+    path_rules_saved: list = [dict(r) for r in (path_rules or [])]      # PUT /admin/path-rules で置き換わる（優先と除外）
+    build_marks_saved: list = []
     records = {
         "turn_starts": [],
         "turn_stream_urls": [],
@@ -1600,6 +1560,9 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         "world_register": [],
         "world_refresh": [],
         "resolve_settings_put": [],
+        "path_rules_get": [],
+        "path_rules_put": [],
+        "build_marks_put": [],
         "auth_login": [],
         "auth_logout": [],
         "share_create": [],
@@ -1624,6 +1587,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         "ext_key_self_create": [],
         "ext_key_self_revoke": [],
         "admin_openai_endpoint_test": [],
+        "admin_ollama_test": [],
     }
     # 発行済み API キーの簡易台帳（プレーンキーは発行応答にだけ含め、ここには保持しない）。
     # `owner_uid=None`＝admin 発行（従来どおり誰でも使えるシステムキー）・非 None＝利用者自己発行。
@@ -1829,10 +1793,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             # SC-6c: 調べる深さの基準値（簡易反映・null は default へ戻す）。
             if "depth_profile" in view:
                 for _key, _put in (("grep_max_hits", "depth_base_grep_max_hits"),
-                                   ("qa_max_hits", "depth_base_qa_max_hits"),
-                                   ("read_window", "depth_base_read_window"),
-                                   ("impact_depth", "depth_base_impact_depth"),
-                                   ("troubleshoot_depth", "depth_base_troubleshoot_depth")):
+                                   ("read_window", "depth_base_read_window")):
                     if _put in body:
                         _val = body[_put]
                         view["depth_profile"][_key]["configured"] = _val
@@ -1970,6 +1931,21 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             if _cross_err:
                 return _json(route, {"detail": _cross_err}, status=422)
             return _json(route, {"ok": True, "provider": provider, "model": model, "detail": "接続OK"})
+        if method == "POST" and path == "/admin/settings/ollama-test":
+            # 実サーバ `admin_ollama_test` と同じく保存はしない。形式だけ検証し、通れば接続OK を返す。
+            body = _post_json(request)
+            records["admin_ollama_test"].append(body)
+            if current_user.get("role") != "admin":
+                return _json(route, {"detail": "管理者権限が必要です"}, status=403)
+            url = (body.get("ollama_url") or "").strip() or "http://localhost:11434"
+            _op = urlparse(url)
+            if _op.scheme not in ("http", "https") or not _op.hostname or _op.username or _op.path not in ("", "/"):
+                return _json(route, {"detail": "Ollama の接続先は http://ホスト名:ポート の形で入力してください"},
+                             status=422)
+            host = f"{_op.hostname}:{_op.port or (443 if _op.scheme == 'https' else 80)}"
+            return _json(route, {"ok": True, "host": host, "models": ["qwen2.5:latest"],
+                                 "missing": ["nomic-embed-text"], "no_tools": ["gemma3:12b"],
+                                 "detail": "接続OK"})
         if method == "POST" and path == "/auth/login":
             body = _post_json(request)
             records["auth_login"].append(body)
@@ -2075,7 +2051,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             rows = _filtered_audit_rows(query)
             offset = int((query.get("offset") or ["0"])[0])
             limit = int((query.get("limit") or ["100"])[0])
-            return _json(route, {"rows": rows, "count": len(rows), "offset": offset, "limit": limit})
+            return _json(route, {"rows": rows, "count": len(rows), "offset": offset, "limit": limit, "ext_audit_write_failures": 0})
         if method == "GET" and path == "/admin/audit/export":
             records["audit_exports"].append(query)
             fmt = (query.get("format") or ["csv"])[0]
@@ -2572,30 +2548,12 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             return _json(route, {"ok": True, "share_id": 77, "expires_at": "2026-08-30T09:00:00+00:00"})
         if method == "GET" and path == "/scopes":
             return _json(route, SCOPES)
-        if method == "GET" and path == "/graph":
-            # ②graph 軽量化: ETag（未変更なら 304）を付ける（実 API と同じ再検証経路）。デモ4ノードは
-            # 既定 limit に収まるため常に非truncated＝全件（truncated 表示の検証は個別テストが上書き）。
-            # ETag は GRAPH 本体の内容ハッシュ＋表示範囲トークンで合成（内容連動・RV是正2026-07-08 Low#3）。
-            token = "all" if (query.get("limit") or [""])[0] == "0" else "default"
-            etag = f'"g.{_GRAPH_CONTENT_HASH}.{token}"'
-            if (request.headers or {}).get("if-none-match") == etag:
-                route.fulfill(status=304, headers={"ETag": etag})   # 304 は body なし（実 API と同じ再検証経路）
-                return
-            return _json(route, GRAPH, headers={"ETag": etag})
-        if method == "GET" and path == "/graph/facets":
-            return _json(route, GRAPH_FACETS_RESP)
-        if method == "GET" and path == "/graph/search":
-            # GET /graph/search の nodes[] は GET /graph（graph_view）と別形＝ phase/category を持つ。
-            # GRAPH["nodes"] を直接使い回さず個別に足してから graph_search_response へ渡す。
-            rel = (query.get("relationship") or [""])[0]
-            search_nodes = [{**n, "phase": None, "category": None} for n in GRAPH["nodes"]]
-            if rel:
-                return _json(route, graph_search_response(
-                    search_nodes[:2], GRAPH["edges"][:1], {"nodes": 2, "edges": 1}))
-            return _json(route, graph_search_response(
-                search_nodes[:1], [], {"nodes": 1, "edges": 0}))
+        if method == "GET" and path == "/ingest/workers":
+            return _json(route, {"ocr_message": None})
         if method == "GET" and path == "/ingest/preview":
-            return _json(route, PREVIEW)
+            return _json(route, {**PREVIEW, "path_rules": path_rules_saved})
+        if method == "GET" and path == "/ingest/preview/graph":
+            return _json(route, PREVIEW_GRAPH)
         if method == "GET" and path == "/admin/es/search":
             # S2: ヒットに由来（extraction_method）と照合差分（has_conflicts）を通す。
             q = (query.get("query") or [""])[0]
@@ -2627,17 +2585,38 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             records["world_register"].append(body)
             return _json(route, world_ingest_accepted_response(WORLD["world_id"]))
         if method == "GET" and path == "/worlds/w1/resolve-settings":
-            return _json(route, {"ok": True, "world_id": "w1", "copy_paths": [], "path_aliases": {},
+            return _json(route, {"ok": True, "world_id": "w1", "copy_paths": [], "path_aliases": {}, "name_rules": [],
                                  "warnings": [], "changed": False, "refresh_started": False, "note": ""})
         if method == "PUT" and path == "/worlds/w1/resolve-settings":
             body = _post_json(request)
             records["resolve_settings_put"].append(body)
             return _json(route, {"ok": True, "world_id": "w1", "copy_paths": body.get("copy_paths", []),
-                                 "path_aliases": body.get("path_aliases", {}),
+                                 "path_aliases": body.get("path_aliases", {}), "name_rules": body.get("name_rules", []),
                                  "warnings": [f"COPY の取り込み元の場所「{p}」は資料フォルダの中に見つかりません"
                                               for p in body.get("copy_paths", [])],
                                  "changed": True, "refresh_started": True,
                                  "note": "保存しました。資料を取り込み直しています（時間がかかります）。"})
+        if method == "GET" and path == "/admin/path-rules":
+            records["path_rules_get"].append(query)
+            return _json(route, {"world": "w1", "label": "4期更改", "rules": path_rules_saved, "removed_missing": 0,
+                                 "folders": PATH_RULES_FOLDERS})
+        if method == "GET" and path == "/admin/path-rules/files":
+            folder = (query.get("folder") or [""])[0]
+            files = PATH_RULES_FILES.get(folder, [])
+            return _json(route, {"folder": folder, "files": files, "truncated": False, "total": len(files),
+                                 "next_offset": None})
+        if method == "PUT" and path == "/admin/path-rules":
+            body = _post_json(request)
+            records["path_rules_put"].append(body)
+            path_rules_saved[:] = body.get("rules", [])
+            return _json(route, {"world": "w1", "rules": path_rules_saved, "dropped_children": []})
+        if method == "GET" and path == "/admin/build-marks":
+            return _json(route, {"world": "w1", "marks": build_marks_saved, "layout_folders": []})
+        if method == "PUT" and path == "/admin/build-marks":
+            body = _post_json(request)
+            records["build_marks_put"].append(body)
+            build_marks_saved[:] = body.get("marks", [])
+            return _json(route, {"world": "w1", "marks": build_marks_saved, "layout_folders": []})
         if method == "POST" and path == "/worlds/w1/refresh":
             records["world_refresh"].append(True)
             return _json(route, world_ingest_accepted_response("w1"))
@@ -2846,6 +2825,7 @@ MOCKED: list[tuple[str, str]] = [
     ("GET", "/admin/settings"),
     ("PUT", "/admin/settings"),
     ("POST", "/admin/settings/openai-endpoint-test"),
+    ("POST", "/admin/settings/ollama-test"),
     ("POST", "/auth/login"),
     ("POST", "/auth/logout"),
     ("GET", "/admin/users"),
@@ -2876,16 +2856,20 @@ MOCKED: list[tuple[str, str]] = [
     ("GET", "/conversations/{cid}/shares"),
     ("POST", "/conversation-shares/{share_id}/extend"),
     ("GET", "/scopes"),
-    ("GET", "/graph"),
-    ("GET", "/graph/facets"),
-    ("GET", "/graph/search"),
+    ("GET", "/ingest/workers"),
     ("GET", "/ingest/preview"),
+    ("GET", "/ingest/preview/graph"),
     ("GET", "/admin/es/search"),
     ("GET", "/fs/list"),
     ("GET", "/worlds/{wid}/status"),
     ("POST", "/worlds/diff"),
     ("POST", "/worlds"),
     ("POST", "/worlds/{wid}/refresh"),
+    ("GET", "/admin/path-rules"),
+    ("GET", "/admin/path-rules/files"),
+    ("PUT", "/admin/path-rules"),
+    ("GET", "/admin/build-marks"),
+    ("PUT", "/admin/build-marks"),
     ("GET", "/worlds/{wid}/resolve-settings"),
     ("PUT", "/worlds/{wid}/resolve-settings"),
     ("POST", "/chat/turns"),

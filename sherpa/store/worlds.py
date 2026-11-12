@@ -8,7 +8,7 @@ import time
 
 from psycopg.types.json import Json
 
-from .db import _KB_ID, _connect, _ensure
+from .db import _KB_ID, _connect, _connect_bounded, _ensure, _ensure_unless_bounded
 
 
 def upsert_world(world_id, root_path, label=None, storage_mode="external_reference") -> dict:
@@ -81,6 +81,12 @@ def get_world(world_id, *, connect_timeout: float | None = None,
             "last_manifest, last_doc_count, last_scan_report, last_scan_report_at, resolve_settings, resolve_applied_sig, "
             "created_at, updated_at "
             "FROM worlds WHERE kb_id=%s AND world_id=%s", (_KB_ID, world_id)).fetchone()
+
+
+def read_resolve_settings(conn, world_id) -> dict | None:
+    """接続 `conn` で world 登録行の `resolve_settings` だけを引く（別の接続を取らない）。行が無ければ `None`。"""
+    row = conn.execute("SELECT resolve_settings FROM worlds WHERE kb_id=%s AND world_id=%s", (_KB_ID, world_id)).fetchone()
+    return None if row is None else row["resolve_settings"]
 
 
 def get_world_root(world_id) -> dict | None:
@@ -173,6 +179,20 @@ def set_scan_report(world_id, report) -> None:
             (Json(report), _KB_ID, world_id))
 
 
+def set_scan_report_and_doc_count(world_id, report, doc_count, expected_sig) -> bool:
+    """集計（`last_scan_report`）と公開件数（`last_doc_count`）を 1 回の UPDATE で同時に書く（どちらか片方だけが書かれる状態を作らない）。
+    `expected_sig`（呼び出し元が world_lock 内で再確認した sig）が現在の `last_sig` と一致する場合のみ更新する。`last_synced_at` は触れない。
+    戻り値: 更新したら True（署名が古ければ False＝何も書かない）。
+    """
+    _ensure()
+    with _connect() as c:
+        n = c.execute(
+            "UPDATE worlds SET last_scan_report=%s, last_scan_report_at=now(), last_doc_count=%s "
+            "WHERE kb_id=%s AND world_id=%s AND last_sig=%s",
+            (Json(report), doc_count, _KB_ID, world_id, expected_sig)).rowcount
+    return n > 0
+
+
 def set_scan_report_if_unchanged(world_id, report, *, expected_root_path, expected_sig,
                                  expected_created_at, expected_updated_at,
                                  expected_last_synced_at, expected_last_scan_report_at) -> bool:
@@ -220,10 +240,12 @@ def backfill_manifest_and_doc_count(world_id, manifest, doc_count, expected_sig)
     return n > 0
 
 
-def list_worlds_db() -> list:
-    """登録 world の一括取得（`last_sig`/`last_synced_at`/`last_doc_count` も含む）。`{world_id: row}` を組み立てて、world ごとの `get_world()` を避けるために使う。外部への公開フィールドは `world_admin_service.public_world()` が絞る。"""
-    _ensure()
-    with _connect() as c:
+def list_worlds_db(*, connect_timeout: float | None = None, statement_timeout_ms: int | None = None) -> list:
+    """登録 world の一括取得（`last_sig`/`last_synced_at`/`last_doc_count` も含む）。`{world_id: row}` を組み立てて、world ごとの `get_world()` を避けるために使う。外部への公開フィールドは `world_admin_service.public_world()` が絞る。
+    `connect_timeout`/`statement_timeout_ms` を渡すと、プールを使わない専用接続で読み、サーバー側の `statement_timeout` で打ち切る。
+    """
+    _ensure_unless_bounded(connect_timeout, statement_timeout_ms)
+    with _connect_bounded(connect_timeout, statement_timeout_ms) as c:
         return c.execute(
             "SELECT world_id, root_path, label, storage_mode, last_sig, last_synced_at, "
             "  last_doc_count, created_at, updated_at "
@@ -236,4 +258,5 @@ def delete_world_row(world_id) -> bool:
     with _connect() as c:
         n = c.execute("DELETE FROM worlds WHERE kb_id=%s AND world_id=%s", (_KB_ID, world_id)).rowcount
         c.execute("DELETE FROM world_failed_docs WHERE world_id=%s", (world_id,))
+        c.execute("DELETE FROM ingest_replacements WHERE kb_id=%s AND world=%s", (_KB_ID, world_id))
     return n > 0

@@ -23,7 +23,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from sherpa import corpus_docs, ext_api, grep_tool, worlds
+from sherpa.ext import doc as ext_doc
 from sherpa.ingest import archive_extract, office_md
+from tests._replace_row import offline_row
 
 _DOCX_XML_TMPL = (
     '<?xml version="1.0"?>\n'
@@ -67,9 +69,9 @@ def test_zip_docx_converts_to_md_rag_ir_and_is_listed_and_searchable(monkeypatch
         zf.writestr("screen/doc1.docx", _docx_bytes("Needle12345"))
 
     root = worlds.world_dir(world)
-    archive_extract.sync_world_archives(world, root)
+    archive_extract.sync_world_archives(world, root, row=offline_row(world))
     dmd = worlds.derived_md_dir(world)
-    rep = office_md.build_derived(root, dmd, world=world)
+    rep = office_md.build_derived(root, dmd, world=world, row=offline_row(world))
     assert rep.get("error") is None
     assert rep["converted"] == 1 and rep["failed"] == 0
     assert rep["document_ir_generated"] == 1 and rep["document_ir_failed"] == 0
@@ -102,9 +104,9 @@ def test_archive_update_rebuilds_delete_removes_and_lightweight_refresh_preserve
         zf.writestr("doc1.docx", _docx_bytes("version1"))
 
     root = worlds.world_dir(world)
-    archive_extract.sync_world_archives(world, root)
+    archive_extract.sync_world_archives(world, root, row=offline_row(world))
     dmd = worlds.derived_md_dir(world)
-    office_md.build_derived(root, dmd, world=world)
+    office_md.build_derived(root, dmd, world=world, row=offline_row(world))
     rel = "a.zip/doc1.docx"
     md_path = dmd / (rel + ".md")
     ev_path = worlds.derived_ir_dir(world) / (rel + ".evidence.json")
@@ -114,24 +116,24 @@ def test_archive_update_rebuilds_delete_removes_and_lightweight_refresh_preserve
     # 孤児掃除の誤爆防止: 内容不変のまま軽量再生成（`world=` 配線）を呼んでも、展開先由来の
     # 派生物を「原本が消えた」と誤認して削除しない（検収で指摘された実害・直すまでは実際に消えていた）。
     assert office_md.rag_sidecars_missing(root, dmd, world=world) is False
-    doc_result = office_md.refresh_document_ir(root, dmd, write_document_ir_sig_marker=False, world=world)
+    doc_result = office_md.refresh_document_ir(root, dmd, write_document_ir_sig_marker=False, world=world, row=offline_row(world))
     assert doc_result.get("document_ir_failed", 0) == 0
-    ev_result = office_md.refresh_evidence_ir(root, dmd, world=world)
+    ev_result = office_md.refresh_evidence_ir(root, dmd, world=world, row=offline_row(world))
     assert ev_result.get("evidence_ir_failed", 0) == 0 and ev_result.get("rag_failed", 0) == 0
     assert md_path.is_file() and ev_path.is_file()      # 誤って消されていない
 
     # 更新（内容変化）→ 再展開＋再変換で中身が置き換わる。
     with zipfile.ZipFile(zpath, "w") as zf:
         zf.writestr("doc1.docx", _docx_bytes("version2"))
-    archive_extract.sync_world_archives(world, root)
-    rep2 = office_md.build_derived(root, dmd, world=world)
+    archive_extract.sync_world_archives(world, root, row=offline_row(world))
+    rep2 = office_md.build_derived(root, dmd, world=world, row=offline_row(world))
     assert rep2["converted"] == 1
     assert md_path.read_text(encoding="utf-8").strip() == "version2"
 
     # 削除（アーカイブごと消える）→ 派生物も消える（鏡）。
     zpath.unlink()
-    archive_extract.sync_world_archives(world, root)
-    office_md.build_derived(root, dmd, world=world)
+    archive_extract.sync_world_archives(world, root, row=offline_row(world))
+    office_md.build_derived(root, dmd, world=world, row=offline_row(world))
     assert not md_path.is_file()
     assert not ev_path.is_file()
 
@@ -146,12 +148,12 @@ def test_ext_doc_returns_extracted_copy_of_archive_inner_file(monkeypatch, tmp_p
         zf.writestr("x/y.txt", "payload-content\n")
 
     root = worlds.world_dir(world)
-    archive_extract.sync_world_archives(world, root)
+    archive_extract.sync_world_archives(world, root, row=offline_row(world))
 
     # `_enforce_world_scope`/`require_api_key` は DB（APIキー/スコープ）に依存する別契約のため、
     # ここではこの endpoint 固有のアーカイブ fallback ロジックだけを対象に、それ以外を無害化する
     # （`tests/api` 全体は別ゲートの対象・ここでは router を直接最小 app へ積んで DB 非依存にする）。
-    monkeypatch.setattr(ext_api, "_enforce_world_scope", lambda *a, **k: None)
+    monkeypatch.setattr(ext_doc, "_enforce_world_scope", lambda *a, **k: None)
     app = FastAPI()
     app.include_router(ext_api.router)
     app.dependency_overrides[ext_api.require_api_key] = lambda: {"id": "test"}

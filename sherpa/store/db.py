@@ -17,6 +17,8 @@ import time
 import psycopg
 from psycopg.rows import dict_row
 
+from .schema_ingest import INGEST_SCHEMA
+
 # `system_extras.py`/`ext_api.py` 等と共有するロガー。
 _log = logging.getLogger("sherpa")
 
@@ -101,93 +103,13 @@ _SCHEMA = [
     "ALTER TABLE worlds ADD COLUMN IF NOT EXISTS resolve_applied_sig TEXT",
     # 1 world = 1 参照元（双方向 1:1）。同じ root を別 world に二重登録させない。
     "CREATE UNIQUE INDEX IF NOT EXISTS worlds_root ON worlds(kb_id, root_path)",
-    # 取り込み・抽出の run 記録（ingest_runs）。グラフ反映境界を run 単位で持つ。version は documents.version と同じ自由文字列。共通 run は version=NULL＋layer=common。
-    """CREATE TABLE IF NOT EXISTS ingest_runs (
-        id SERIAL PRIMARY KEY,
-        kb_id TEXT NOT NULL DEFAULT 'global',
-        version TEXT,                              -- 単一版（共通 run は NULL）
-        layer TEXT NOT NULL DEFAULT 'version',     -- version / common
-        ingest_source_id INTEGER,                 -- 取込元（P1b・今は NULL）
-        scan_root TEXT,                            -- スキャンルート（P1b）
-        scope_mapping_overrides JSONB,            -- 階層自動判定のUI上書き（P1b）
-        source_doc_ids JSONB,                     -- 対象 documents.name[]
-        status TEXT NOT NULL DEFAULT 'extracting'  -- queued/extracting/auto_published/auto_published_with_flags/failed
-            CHECK (status IN ('queued','extracting','auto_published','auto_published_with_flags','failed')),
-        extraction_snapshot JSONB,                -- 抽出スナップショット（件数・検証フラグ）
-        published_snapshot JSONB,                 -- Neo4j 反映内容（差分・再反映の基準）
-        created_by TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        published_at TIMESTAMPTZ,
-        republished_at TIMESTAMPTZ,
-        progress JSONB                            -- 実行中 run の逐次進捗（段＋done/total/更新時刻）。`status` が queued/extracting の間だけ意味を持ち、完了時（`finish_ingest_run`）に NULL へ戻す
-    )""",
-    # 取り込みの依頼（Web アプリが queued で積み、取り込みワーカーが拾う）。op/payload＝実行する操作と引数、fingerprint＝合流判定、
-    # app_version＝依頼を受けた Web アプリの版（同じ版のワーカーだけが拾う）、arb_keys＝同時に 1 つしか動かさない単位（資料フォルダ・新規登録の枠）、
-    # claimed_by＝拾ったワーカー。
-    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS op TEXT",
-    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS payload JSONB",
-    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS fingerprint TEXT",
-    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS app_version TEXT",
-    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS arb_keys TEXT[]",
-    "ALTER TABLE ingest_runs ADD COLUMN IF NOT EXISTS claimed_by TEXT",
-    # 既存 DB の status 制約へ queued を足す（CREATE TABLE の制約は既存表に効かない）。足りているときは何もしない。
-    """DO $$ BEGIN
-      IF EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'ingest_runs_status_check' AND conrelid = 'ingest_runs'::regclass
-          AND pg_get_constraintdef(oid) NOT LIKE '%queued%'
-      ) THEN
-        ALTER TABLE ingest_runs DROP CONSTRAINT ingest_runs_status_check;
-        ALTER TABLE ingest_runs ADD CONSTRAINT ingest_runs_status_check
-          CHECK (status IN ('queued','extracting','auto_published','auto_published_with_flags','failed'));
-      END IF;
-    END $$""",
-    "CREATE INDEX IF NOT EXISTS run_queued ON ingest_runs(kb_id, id) WHERE status = 'queued'",
-    # 取り込み画面の版の照合・停止待ちの表示のための、Web アプリと取り込みワーカーの心拍（一定時間書かれない行は無視する）。
-    """CREATE TABLE IF NOT EXISTS ingest_workers (
-        worker_id TEXT PRIMARY KEY,
-        role TEXT NOT NULL CHECK (role IN ('web','ingest')),
-        app_version TEXT,
-        state TEXT NOT NULL DEFAULT 'idle' CHECK (state IN ('idle','running','waiting_version','stopping')),
-        run_id INTEGER,
-        current_file TEXT,
-        pid INTEGER,
-        started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        beat_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )""",
-    "CREATE INDEX IF NOT EXISTS run_ver ON ingest_runs(kb_id, version)",
-    # `store.ingest.get_latest_run_summary`/`get_latest_published_run_summary` が `ORDER BY id DESC LIMIT 1` で最新 1 件を引くための索引。反映済み run 用は部分索引（`published_at IS NOT NULL`）で小さく保つ。
-    "CREATE INDEX IF NOT EXISTS run_ver_id ON ingest_runs(kb_id, version, id DESC)",
-    "CREATE INDEX IF NOT EXISTS run_ver_published ON ingest_runs(kb_id, version, id DESC) "
-    "WHERE published_at IS NOT NULL",
-    # `store.ingest.get_latest_es_run_summary` 専用の部分索引（`extraction_snapshot` に es キーがある run だけ）。
-    "CREATE INDEX IF NOT EXISTS run_ver_published_es ON ingest_runs(kb_id, version, id DESC) "
-    "WHERE published_at IS NOT NULL AND extraction_snapshot ? 'es'",
-    # 取り込み元の登録（ingest_sources）。大量取り込みのスキャン元で、常時 watch しない。
-    """CREATE TABLE IF NOT EXISTS ingest_sources (
-        id SERIAL PRIMARY KEY,
-        kb_id TEXT NOT NULL DEFAULT 'global',
-        label TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('browser_upload','windows_path')),
-        source_uri TEXT,                          -- Windows/NAS 元パス（browser_upload は NULL）
-        wsl_path TEXT,                            -- /mnt に解決したスキャンルート
-        storage_mode TEXT NOT NULL DEFAULT 'managed_copy'
-            CHECK (storage_mode IN ('managed_copy','external_reference')),
-        status TEXT NOT NULL DEFAULT 'registered'
-            CHECK (status IN ('registered','scanning','scanned','failed')),
-        version TEXT NOT NULL,                    -- 取り込み先の版（documents.version と同じ自由文字列）
-        created_by TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        last_checked TIMESTAMPTZ
-    )""",
+    *INGEST_SCHEMA,
     """CREATE TABLE IF NOT EXISTS user_settings (
         user_id TEXT PRIMARY KEY,
         agent TEXT NOT NULL DEFAULT 'codex',
         openai_api_key TEXT,
         ollama_url TEXT NOT NULL DEFAULT '',      -- ''＝未設定（中央既定に従う）
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        gemini_api_key TEXT,
-        bedrock_api_key TEXT,
         codex_model_provider TEXT NOT NULL DEFAULT ''  -- Codex CLI の接続先（openai / ollama）。''＝openai として扱う
     )""",
     # 画面に出ない個人設定の列（実行経路が読まないもの）は起動時に撤去する。
@@ -209,6 +131,9 @@ _SCHEMA = [
     "ALTER TABLE user_settings DROP COLUMN IF EXISTS sub_planner",
     "ALTER TABLE user_settings DROP COLUMN IF EXISTS search_helper",
     "ALTER TABLE user_settings DROP COLUMN IF EXISTS search_helper_model",
+    # 閉じた AI 提供元（Gemini・Bedrock）の旧い鍵の列。値ごと撤去する。
+    "ALTER TABLE user_settings DROP COLUMN IF EXISTS gemini_api_key",
+    "ALTER TABLE user_settings DROP COLUMN IF EXISTS bedrock_api_key",
     # OCR（任意の視覚観測）: 取り込みとは独立したジョブキュー。`canonical_generation_id` には World署名（worlds.last_sig）を入れる（原本内容が変わればキーも変わる）。
     """CREATE TABLE IF NOT EXISTS ocr_jobs (
         id BIGSERIAL PRIMARY KEY,
@@ -238,13 +163,30 @@ _SCHEMA = [
         error_detail TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        finished_at TIMESTAMPTZ,
-        UNIQUE (world, canonical_generation_id, route_input_id, engine_profile_hash)
+        finished_at TIMESTAMPTZ
     )""",
     "ALTER TABLE ocr_jobs ADD COLUMN IF NOT EXISTS cache_input_fingerprint TEXT",
+    # 同じ内容の原本のコピーは route_input_id が同じになるため、観測の配布先（source_rel_path）を一意性に含めてコピーごとに job を持つ。
+    "CREATE UNIQUE INDEX IF NOT EXISTS ocr_jobs_dispatch_key "
+    "ON ocr_jobs(world, canonical_generation_id, source_rel_path, route_input_id, engine_profile_hash)",
+    # 配布先を含まない旧い一意制約（自動名）は列の組で探して外す。新しい索引を先に作るので、一意性の空白は生じない。
+    """DO $$ DECLARE legacy record; BEGIN
+      FOR legacy IN
+        SELECT con.conname FROM pg_constraint con
+        WHERE con.conrelid = 'ocr_jobs'::regclass AND con.contype = 'u'
+          AND (SELECT array_agg(att.attname::text ORDER BY att.attname)
+               FROM unnest(con.conkey) AS key(attnum)
+               JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = key.attnum)
+              = ARRAY['canonical_generation_id','engine_profile_hash','route_input_id','world']
+      LOOP
+        EXECUTE format('ALTER TABLE ocr_jobs DROP CONSTRAINT %I', legacy.conname);
+      END LOOP;
+    END $$""",
     "CREATE INDEX IF NOT EXISTS ocr_jobs_leaseable ON ocr_jobs(priority DESC, available_at, id) "
     "WHERE status IN ('queued','leased')",
     "CREATE INDEX IF NOT EXISTS ocr_jobs_world_generation ON ocr_jobs(world, canonical_generation_id, status)",
+    "CREATE INDEX IF NOT EXISTS ocr_jobs_active_profile ON ocr_jobs(engine_profile_hash) "
+    "WHERE status IN ('queued','leased')",
     # observation generation の公開は fetchall せず、この順序の keyset cursor で stream する。
     "CREATE INDEX IF NOT EXISTS ocr_jobs_publish_order "
     "ON ocr_jobs(world, canonical_generation_id, source_rel_path, result_observation_set_hash, id) "
@@ -279,6 +221,8 @@ _SCHEMA = [
     "WHERE status IN ('queued','leased')",
     "CREATE INDEX IF NOT EXISTS ocr_refresh_runs_world_generation "
     "ON ocr_refresh_runs(world, canonical_generation_id, status)",
+    "CREATE INDEX IF NOT EXISTS ocr_refresh_runs_active_profile ON ocr_refresh_runs(engine_profile_hash) "
+    "WHERE status IN ('queued','leased')",
     # 同じ World 内の同一前処理画像＋engine profile は先勝ち cache を共有する。payload は engine の生 OCR 行だけで、Evidence ID を持つ Observation Set は job ごとに再構築する。
     """CREATE TABLE IF NOT EXISTS ocr_result_cache (
         world TEXT NOT NULL,
@@ -690,12 +634,12 @@ _SCHEMA = [
     # 待ちジョブの取り出し（古い順）・鍵単位の一覧・期限切れ掃除がそれぞれ使う索引。
     "CREATE INDEX IF NOT EXISTS codex_jobs_queued ON codex_jobs(created_at) WHERE status='queued'",
     "CREATE INDEX IF NOT EXISTS codex_jobs_key_id ON codex_jobs(key_id)",
-    "CREATE INDEX IF NOT EXISTS codex_jobs_expires_at ON codex_jobs(expires_at) "
-    "WHERE status IN ('completed','failed','cancelled')",
+    "CREATE INDEX IF NOT EXISTS codex_jobs_expires_at ON codex_jobs(expires_at) WHERE status IN ('completed','failed','cancelled')",
     # ジョブ結果に載せる調査台帳の記録。本体（`answer` 等）と同じ 7 日保存で、`expire_due_jobs`/`expire_job_if_due` が一緒に NULL へ消す。
     "ALTER TABLE codex_jobs ADD COLUMN IF NOT EXISTS investigation JSONB",
     # 終了通知を受付時に希望したか（通知先は送信時に鍵から読む）。
     "ALTER TABLE codex_jobs ADD COLUMN IF NOT EXISTS webhook BOOLEAN NOT NULL DEFAULT false",
+    "ALTER TABLE codex_jobs ADD COLUMN IF NOT EXISTS queue_deadline TIMESTAMPTZ",
     # 調査台帳の記録。1 assistant message = 0〜1 行（台帳ゲートが実際に走ったターンだけ・`sherpa/providers/codex/provider.py::_investigation_record_payload`/`sherpa/chat_service.py` が assistant message 保存の直後に書く）。manifest/items/coverage は投稿時点の調査台帳の正規形をそのまま写したもので、本文・資料名は運ばない。`messages.trace` には入れない（JSONB の肥大を避けて分離する）。
     """CREATE TABLE IF NOT EXISTS investigation_records (
         message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
@@ -976,6 +920,26 @@ def _connect(**kw):
         return _PooledConnection(pool, pool.getconn())
     # kwargs 付き（`connect_timeout=`/`options=`）はプール非対応。従来どおり ad-hoc 接続。
     return psycopg.connect(_dsn(), row_factory=dict_row, **kw)
+
+
+def _connect_bounded(connect_timeout: float | None = None, statement_timeout_ms: int | None = None):
+    """読み取り1回ごとに閉じる専用接続（プールを使わない）。
+    どちらも None ならプールの `_connect()`。打ち切りはサーバー側の `statement_timeout` に任せ、クライアント側から例外を投げて接続を中断しない（中断した接続をプールへ戻すと次の問い合わせが壊れる）。
+    """
+    if connect_timeout is None and statement_timeout_ms is None:
+        return _connect()
+    kw: dict = {}
+    if connect_timeout is not None:
+        kw["connect_timeout"] = max(1, math.ceil(connect_timeout))
+    if statement_timeout_ms is not None:
+        kw["options"] = f"-c statement_timeout={int(statement_timeout_ms)}"
+    return psycopg.connect(_dsn(), row_factory=dict_row, **kw)
+
+
+def _ensure_unless_bounded(connect_timeout: float | None, statement_timeout_ms: int | None) -> None:
+    """上限付きの読み取り（状態コマンド）はスキーマ初期化を走らせない（schema の lock と DDL は上限の外で待つため）。引数なしの従来の呼び出しは `_ensure()`。"""
+    if connect_timeout is None and statement_timeout_ms is None:
+        _ensure()
 
 
 def _world_lock_key(world_id) -> int:

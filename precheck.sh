@@ -154,7 +154,7 @@ fi
 INSTALLED=0
 if [ "${DIR_OK}" = 1 ] && { [ -f "${DIR_ABS}/Sherpa/data/.installed" ] || [ -f "${DIR_ABS}/data/.installed" ]; }; then INSTALLED=1; fi
 
-echo "=== Sherpa 導入前の確認（読み取りだけ・何も入れません） ==="
+echo "=== Slouch 導入前の確認（読み取りだけ・何も入れません） ==="
 echo "表示の見かた:"
 echo "  OK:                              問題ありません"
 echo "  ・ パッケージが入れます           導入のときに自動で入ります（何もしなくてよい）"
@@ -348,7 +348,7 @@ case "${MEM_MB}" in
       r_must "メモリが足りません（${MEM_TEXT}・8GB 以上が必要）。" "${MEM_HINT}"
     elif [ "${MEM_JUDGE_MB}" -lt "${MEM_WARN_MB}" ]; then
       r_warn "メモリが少なめです（${MEM_TEXT}・16GB 以上を推奨）。" \
-        "画像内の文字の読み取り（OCR）は重いので、動きが悪いときは .env に SHERPA_OCR_ENABLED=0 と書いて OCR を止めてください。${MEM_HINT}"
+        "画像内の文字の読み取り（OCR）は重いので、OCR は管理画面の取り込みタブで入れたときだけ動きます（既定は切）。動きが悪いときは切のままにしてください。${MEM_HINT}"
     else
       r_ok "メモリ: ${MEM_TEXT}"
     fi ;;
@@ -627,7 +627,7 @@ else
   done
   if [ -n "${PORT_BUSY}" ]; then
     r_warn "使われているポートがあります:${PORT_BUSY}" \
-      "すでに Sherpa が動いている更新なら正常です。別のものが使っているなら、.env でポートを変えてください（SHERPA_PORT など）。手順書: INSTALL.md「確認して起動します」"
+      "すでに Slouch が動いている更新なら正常です。別のものが使っているなら、.env でポートを変えてください（SHERPA_PORT など）。手順書: INSTALL.md「確認して起動します」"
   else
     r_ok "必要なポート（${PORT_LIST# }）は空いています。"
   fi
@@ -818,9 +818,9 @@ if [ "${INSTALLED}" = 1 ]; then
   for rec in "${DIR_ABS}/Sherpa/data/.installed" "${DIR_ABS}/data/.installed"; do
     if [ -f "${rec}" ]; then INSTALLED_VER="$(grep -m1 '^version=' "${rec}" | cut -d= -f2-)"; break; fi
   done
-  r_info "すでに Sherpa が導入されています${INSTALLED_VER:+（版 ${INSTALLED_VER}）}。更新として扱われます。更新の前に make stop で止めてください。手順書: INSTALL.md「更新」"
+  r_info "すでに Slouch が導入されています${INSTALLED_VER:+（版 ${INSTALLED_VER}）}。更新として扱われます。更新の前に make stop で止めてください。手順書: INSTALL.md「更新」"
 else
-  r_info "Sherpa はまだ導入されていません。初回の導入として扱われます。"
+  r_info "Slouch はまだ導入されていません。初回の導入として扱われます。"
 fi
 
 finish

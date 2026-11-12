@@ -7,19 +7,20 @@ import logging
 import re
 
 
-# 影響たどりの既定深さ（管理画面の基準値が未設定のときに使う）
+# 影響たどりの既定深さ
 IMPACT_MAX_DEPTH = 10
-# 調べる深さ（`depth_profile.scaled_depth`）の絶対上限
+# 影響たどりの深さの絶対上限
 IMPACT_MAX_DEPTH_ABS_MAX = 64
 
 # 種別ラベル → 結果カテゴリ。world_neo4j/lens_service が再利用する
 CATEGORY = {
     "Module": "ソース", "Copybook": "ソース", "DataItem": "ソース",
     "Batch": "バッチ", "Document": "文書", "Table": "テーブル", "Config": "設定", "Dataset": "データセット",
+    "Executable": "実行モジュール",
 }
 
 # 推定トレースで拾う「コード成果物」ラベル（概念/文書は対象外）
-_CODE_LABELS = {"Module", "Copybook", "DataItem", "Batch", "Table", "Dataset"}
+_CODE_LABELS = {"Module", "Copybook", "DataItem", "Batch", "Table", "Dataset", "Executable"}
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")  # COBOL 風識別子（3文字以上）
 # 実在ノード名と一致しても「関連」と見なさない一般語
 _STOP = {"DATA", "CODE", "RATE", "TOTAL", "INPUT", "OUTPUT", "FILE", "DATE", "TIME", "NAME", "TYPE",
@@ -63,7 +64,9 @@ def presumed_impact(session, term, world, scope_prefixes=None, max_items=20, tru
     """
     from .grep_tool import grep_search
     from . import scope as scope_mod
-    from .ingest.world_neo4j import _run_read_capped, _scope_pred
+    from .ingest.world_neo4j import _generation_pred, _run_read_capped, _scope_pred
+    from .ingest.world_neo4j_exclude import exclude_node_expr
+    x_n, x_params = exclude_node_expr(world, "n")  # 管理者の除外の資料のノードは候補にも、同名の曖昧さの判定にも入れない
     sp = scope_mod.normalize_scope_paths(scope_prefixes) or None
     hits = grep_search(term, world, scope_paths=sp, max_hits=30, truncated_docs=truncated_docs)
     if not hits:
@@ -72,11 +75,13 @@ def presumed_impact(session, term, world, scope_prefixes=None, max_items=20, tru
     # `_run_read_capped` で timeout＋緊急天井を付ける（presumed は最善努力。超過は呼び出し元 `run_impact` が扱う）
     for r in _run_read_capped(
             session,
+            "OPTIONAL MATCH (gm:SherpaMeta {world_id:$w}) WITH gm "
             "MATCH (n:Entity {world_id:$w}) WHERE n.name IS NOT NULL "
-            f"  AND {_scope_pred('n')} "
+            f"  AND {_generation_pred('n')} "
+            f"  AND {_scope_pred('n')} AND {x_n} "
             "RETURN n.name AS name, [l IN labels(n) WHERE l<>'Entity'][0] AS label, "
             "  n.canonical_id AS cid, n.path AS path, n.top_scope AS top",
-            world=world, w=world, prefixes=list(scope_prefixes or [])):
+            world=world, w=world, prefixes=list(scope_prefixes or []), **x_params):
         if r["label"] not in _CODE_LABELS:
             continue
         node = {"name": r["name"], "label": r["label"], "cid": r["cid"],
@@ -214,4 +219,5 @@ def run_impact(session, term, world, scope_prefixes=None,
             result.setdefault("notes", []).append(note)
             if coverage is not None:
                 add_limit(coverage, KIND_DOC_SEARCH_TRUNCATED, STAGE_PRESUMED)
-    return result
+    from . import path_rules  # 遅延 import（循環回避）。結果の最後の 1 か所で、管理者の除外の資料を落とす
+    return path_rules.scrub_impact(result, path_rules.rules_for(world))

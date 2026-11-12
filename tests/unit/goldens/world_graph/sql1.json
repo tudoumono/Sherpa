@@ -1,0 +1,22 @@
+{
+  "counts": {
+    "edge_types": {
+      "ACCESSES": 3,
+      "CONTAINS": 8
+    },
+    "edges": 11,
+    "flag_reasons": {
+      "dropped_syntax": 3,
+      "unresolved": 1
+    },
+    "flags": 4,
+    "node_labels": {
+      "DataItem": 8,
+      "Module": 1,
+      "Table": 3
+    },
+    "nodes": 12
+  },
+  "sha256": "3b0f61d02a878f09bf1cd21703e44c1b286b4751bde773b849ed37b8d468f924",
+  "world": "sql1"
+}

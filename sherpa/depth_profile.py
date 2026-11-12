@@ -1,7 +1,7 @@
 """調べる深さ（quick / standard / deep / max）に応じた探索量・査読の巡数・Codex 推論レベルを決める。
 設計: docs/design/codex.md「調査台帳と回答前の関門」
 
-- 探索量: grep/ES のヒット上限・読み取り窓に倍率を掛ける（`scaled_ratio`）。影響たどり等の深さは加算（`scaled_depth`）。
+- 探索量: grep/ES のヒット上限・読み取り窓に倍率を掛ける（`scaled_ratio`）。
 - 査読の巡数: `review_rounds_for`。
 - Codex 推論レベル: `codex_reasoning_for`（クイックだけ 1 段下げる）。
 - 根拠種別が揃わないときの 1 段引き上げ: `escalated_profile`。
@@ -30,17 +30,12 @@ MAX_REVIEW_ROUNDS_MAX = 32
 # 管理画面の基準値編集が読み書きする system_settings のキー名（`routers/system_extras.py` と揃える）。
 BASE_SETTINGS_KEYS = {
     "grep_max_hits": "depth_base_grep_max_hits",
-    "qa_max_hits": "depth_base_qa_max_hits",
     "read_window": "depth_base_read_window",
-    "impact_depth": "depth_base_impact_depth",
-    "troubleshoot_depth": "depth_base_troubleshoot_depth",
     "codex_reasoning": "depth_base_codex_reasoning",
 }
 
 # grep/ES ヒット上限・読み取り窓に掛ける倍率。
 _RATIO_MULT = {"quick": 0.5, "standard": 1.0, "deep": 1.5, "max": 2.0}
-# 影響たどり／トラブルシュート近傍の深さは加算。
-_DEPTH_ADD = {"quick": 0, "standard": 0, "deep": 2, "max": 4}
 
 
 def normalize_depth_profile(v) -> str:
@@ -97,12 +92,6 @@ def scaled_ratio(base: int, profile, abs_max: int | None = None) -> int:
     `abs_max` は倍率適用後に一度だけ掛ける絶対上限。
     """
     v = max(int(base * _RATIO_MULT[normalize_depth_profile(profile)]), 1)
-    return min(v, abs_max) if abs_max is not None else v
-
-
-def scaled_depth(base_depth: int, profile, abs_max: int | None = None) -> int:
-    """影響たどり・トラブルシュート近傍の深さ（クイック/標準 +0・深く +2・最大 +4）。`abs_max` は加算後の上限。"""
-    v = int(base_depth) + _DEPTH_ADD[normalize_depth_profile(profile)]
     return min(v, abs_max) if abs_max is not None else v
 
 

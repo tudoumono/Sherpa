@@ -22,10 +22,6 @@ def _ctx(uid: str, message: str = "MCP 並走計測テスト") -> "A.Ctx":
         message=message,
         world="v1",
         route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline",
-            "summary": {"total": 0}, "data": {}, "sources": [],
-        },
         knowledge=True,
         uid=uid,
     )
@@ -237,10 +233,6 @@ def test_same_item_id_across_auto_continue_attempts_counts_total_two(tmp_path, m
     ctx = A.Ctx(
         message="自動継続 id 再利用テスト", world="v1",
         route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline",
-            "summary": {"total": 0}, "data": {}, "sources": [],
-        },
         knowledge=True, uid="mcpcnt-continue", conversation_id=909)
 
     with caplog.at_level(logging.INFO):

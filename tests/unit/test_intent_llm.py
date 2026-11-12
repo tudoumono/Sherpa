@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from sherpa import intent_llm as I
 
 _KEY = {"openai_api_key": "test-key"}   # _cfg が openai を選ぶ（鍵あり）
@@ -50,11 +52,12 @@ def test_classify_author_lens_valid():
         I._complete = orig
 
 
-def test_bad_or_unknown_lens_returns_none():
+def test_bad_or_unknown_lens_raises_classifier_error():
     for ret in ('{"lens":"bogus","confident":true}', '{not json', '{"x":1}', '"impact"'):
         orig = _with_complete(ret)
         try:
-            assert I.classify("なにか", _KEY) is None
+            with pytest.raises(I.IntentClassifierError):
+                I.classify("なにか", _KEY)
         finally:
             I._complete = orig
 
@@ -90,10 +93,9 @@ def test_cfg_returns_none_for_invalid_cloud_provider(monkeypatch, caplog):
     assert any("not-a-real-provider" in r.getMessage() for r in caplog.records)
 
 
-def test_classify_swallows_cfg_resolution_exception_and_returns_none(monkeypatch, caplog):
-    """RV1（FBK-1・境界回帰#6・2026-09-01）: `_cfg()` 自体が例外を送出（例: `store.
-    get_system_settings()` の DB 一時障害）しても `classify()` はチャット全体へ伝播させず None
-    （既存の clarify 縮退経路）に丸める。ログにはクラス名だけを残す（秘密や生の例外文言は残さない）。"""
+def test_classify_cfg_resolution_exception_raises_classifier_error(monkeypatch, caplog):
+    """`_cfg()` 自体が例外を送出（例: DB 一時障害）したら `IntentClassifierError` にして返す（曖昧さと混ぜない）。
+    ログにはクラス名だけを残す（秘密や生の例外文言は残さない）。"""
     import logging
 
     orig = I._cfg
@@ -104,7 +106,8 @@ def test_classify_swallows_cfg_resolution_exception_and_returns_none(monkeypatch
     I._cfg = _boom
     try:
         with caplog.at_level(logging.WARNING, logger="sherpa"):
-            assert I.classify("税率を変えたら何に響く？", {}) is None
+            with pytest.raises(I.IntentClassifierError):
+                I.classify("税率を変えたら何に響く？", {})
         assert any("RuntimeError" in r.getMessage() for r in caplog.records)
         assert not any("secret-token-should-not-leak" in r.getMessage() for r in caplog.records)
     finally:

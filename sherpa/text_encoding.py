@@ -1,6 +1,9 @@
-"""原本の UTF-8 / CP932 判定を検索・精読・取り込みで共有する。
-BOM を優先し、strict UTF-8 が通らない場合だけ置換文字の少ない符号化を選ぶ。判定は最大 64 MiB を固定長チャンクで読む。
-UTF-16・EUC-JP の自動判別は対象外（NUL は「化け」に数えるので ASCII 主体の UTF-16 は undetermined になる）。
+"""原本の UTF-8 / CP932 / EUC-JP 判定を検索・精読・取り込みで共有する。
+BOM を優先し、strict UTF-8 が通らない場合だけ置換文字の少ない符号化を選ぶ。CP932 で化けるのに strict な EUC-JP
+（`euc_jp`、NEC 特殊文字・利用者定義を含むときは `euc_jis_2004`）として読めるものは、その EUC の符号を返す。
+CP932 でも strict な EUC でも読める曖昧なものだけ、charset-normalizer に先頭 1 MiB（CP932・EUC の両方が文字の区切りにいる最後の位置で切る）を渡して決める
+（EUC 系と判断されれば EUC、それ以外は CP932）。CP932 で読むと半角カナ文字だけになるものは、渡さず CP932 のままにする。判定は最大 64 MiB を固定長チャンクで読む。
+UTF-16 の自動判別は対象外（NUL は「化け」に数えるので ASCII 主体の UTF-16 は undetermined になる）。
 設計: docs/design/rag.md「サイズガードと文字コード・対象外」
 """
 from __future__ import annotations
@@ -12,9 +15,22 @@ import re
 import threading
 from collections import OrderedDict
 
+try:
+    from charset_normalizer import from_bytes as _normalizer_from_bytes
+except ImportError:  # 無くても読み取りは落とさない（曖昧な符号は CP932 に倒す）
+    _normalizer_from_bytes = None
+
 DETECT_CAP_BYTES = 64 * 1024 * 1024
 _SCAN_CHUNK_BYTES = 64 * 1024
 _UTF8_SIG_BOM = b"\xef\xbb\xbf"
+
+# 判定の仕様の版。判定結果の保存（`search_cache`・取り込みの集計）を作り直す目印なので、判定を変えたら上げる
+DETECT_VERSION = 3
+# strict に読めたとき CP932 より優先する EUC の符号（euc_jp は NEC 特殊文字・利用者定義を拒否するため euc_jis_2004 を後ろに試す）
+_EUC_CODECS = ("euc_jp", "euc_jis_2004")
+# CP932 でも EUC でも strict に読める曖昧なとき、charset-normalizer に渡す先頭バイト数の上限と候補の符号化
+_NORMALIZER_HEAD_BYTES = 1024 * 1024
+_NORMALIZER_CODECS = ["cp932", *_EUC_CODECS]
 
 # 化け比率（置換文字＋NUL＋CP932 のありえない文字）がこれを超え、かつ空でない行の過半にも化けがあれば判別不能
 UNDETERMINED_RATIO = 0.02
@@ -189,17 +205,21 @@ def _looks_strict_utf8(chunks, complete: bool) -> tuple[bool, float, _LineGarble
 
 def _count_replacement_both(chunks, complete: bool):
     """同じ範囲を UTF-8・CP932 の両方で読み、置換文字・NUL・文字数・ありえない文字数・行トラッカーを返す。
-    戻り値 `(n_utf8, len_utf8, n_cp932, len_cp932, n_implausible, n_nul_utf8, tr_utf8, tr_cp932, euc_ok)`。
+    戻り値 `(n_utf8, len_utf8, n_cp932, len_cp932, n_implausible, n_nul_utf8, tr_utf8, tr_cp932, euc, head)`。
+    `euc` は strict に最後まで読めた EUC の符号（`_EUC_CODECS` の先頭側）で、読めなければ None。
+    `head` は読んだ範囲の先頭 `_NORMALIZER_HEAD_BYTES` バイト（曖昧な場合の charset-normalizer への入力）。
     """
     dec_utf8 = codecs.getincrementaldecoder("utf-8")(errors="replace")
     dec_cp932 = codecs.getincrementaldecoder("cp932")(errors="replace")
-    # euc_jp は NEC 特殊文字・利用者定義を拒否するため euc_jis_2004 も試す
-    dec_eucs = {name: codecs.getincrementaldecoder(name)(errors="strict") for name in ("euc_jp", "euc_jis_2004")}
+    dec_eucs = {name: codecs.getincrementaldecoder(name)(errors="strict") for name in _EUC_CODECS}
     n_utf8 = n_cp932 = len_utf8 = len_cp932 = n_implausible = n_nul_utf8 = 0
+    head = bytearray()
     tr_utf8 = _LineGarbleTracker(_UTF8_GARBLE_RE)
     tr_cp932 = _LineGarbleTracker(_CP932_GARBLE_RE, _PUA_RE, _KANA_RE)
     for chunk in itertools.chain(chunks, (None,)):
         last = chunk is None
+        if not last and len(head) < _NORMALIZER_HEAD_BYTES:
+            head += chunk[:_NORMALIZER_HEAD_BYTES - len(head)]
         t8 = dec_utf8.decode(b"" if last else chunk, final=complete if last else False)
         t932 = dec_cp932.decode(b"" if last else chunk, final=complete if last else False)
         for name in list(dec_eucs):
@@ -217,20 +237,72 @@ def _count_replacement_both(chunks, complete: bool):
         tr_cp932.feed(t932)
     tr_utf8.finish()
     tr_cp932.finish()
-    return n_utf8, len_utf8, n_cp932, len_cp932, n_implausible, n_nul_utf8, tr_utf8, tr_cp932, bool(dec_eucs)
+    euc = next(iter(dec_eucs), None)
+    return (n_utf8, len_utf8, n_cp932, len_cp932, n_implausible, n_nul_utf8, tr_utf8, tr_cp932,
+            euc, bytes(head))
+
+
+def _last_common_boundary(head: bytes, euc: str) -> int:
+    """`head` を前から CP932・EUC（`euc`）の両方の逐次デコーダで読み、両方が同時に文字の区切りにいる最後の位置を返す。無ければ 0。"""
+    dec_c = codecs.getincrementaldecoder("cp932")(errors="strict")
+    dec_e = codecs.getincrementaldecoder(euc)(errors="strict")
+    step = 256
+    last = 0
+    try:
+        for pos in range(0, len(head), step):
+            piece = head[pos:pos + step]
+            dec_c.decode(piece)
+            dec_e.decode(piece)
+            if not dec_c.getstate()[0] and not dec_e.getstate()[0]:
+                last = pos + len(piece)
+        if last == len(head):
+            return last
+        dec_c.reset()
+        dec_e.reset()
+        for pos in range(last, len(head)):
+            dec_c.decode(head[pos:pos + 1])
+            dec_e.decode(head[pos:pos + 1])
+            if not dec_c.getstate()[0] and not dec_e.getstate()[0]:
+                last = pos + 1
+    except UnicodeDecodeError:
+        pass
+    return last
+
+
+def _only_halfwidth_kana(head: bytes) -> bool:
+    """CP932 で読んだ非 ASCII がすべて半角カナ文字（U+FF66〜U+FF9F）か。非 ASCII が無い・読めないときは False。"""
+    text = head.decode("cp932", errors="replace")
+    non_ascii = [c for c in text if ord(c) > 0x7F]
+    return bool(non_ascii) and all("\uff66" <= c <= "\uff9f" for c in non_ascii)
+
+
+def _normalizer_prefers_euc(head: bytes, euc: str = "euc_jp") -> bool:
+    """CP932 でも EUC でも読める `head` を charset-normalizer が EUC 系と判断するか。判断できない（None）は False。
+    上限で切った先頭は、CP932・EUC の両方が文字の区切りにいる最後の位置までを渡す（多バイト文字を割らない）。区切りが無ければそのまま渡す。
+    """
+    if len(head) >= _NORMALIZER_HEAD_BYTES:
+        cut = _last_common_boundary(head, euc)
+        if cut:
+            head = head[:cut]
+    if _normalizer_from_bytes is None:
+        return False
+    best = _normalizer_from_bytes(head, cp_isolation=_NORMALIZER_CODECS).best()
+    return best is not None and best.encoding.startswith("euc")
 
 
 def _choose(n_utf8: int, len_utf8: int, n_cp932: int, len_cp932: int, n_implausible: int,
            n_nul_utf8: int, tr_utf8: _LineGarbleTracker, tr_cp932: _LineGarbleTracker,
-           euc_ok: bool = False) -> tuple[str, float, bool]:
+           euc: str | None = None, head: bytes = b"") -> tuple[str, float, bool]:
     """符号化と、その符号化での化け比率・行の過半化け判定を決める。
     採否は真の置換文字数の少なさだけで決める。選ばれた側の比率には NUL・（cp932 なら）ありえない文字も加算する。
+    strict な EUC として読め、かつ CP932 で本当の置換文字が出る（n_cp932 > 0）ときは、その EUC の符号を返す（strict で読めているので化けは 0）。
+    CP932 でも strict な EUC でも読める曖昧なときだけ、charset-normalizer が EUC 系と判断すれば EUC、それ以外は CP932 にする（CP932 で読んだ非 ASCII が半角カナだけなら判断に回さず CP932）。
     """
     if n_cp932 < n_utf8:
         ratio = (n_cp932 + n_implausible) / len_cp932 if len_cp932 else 0.0
-        # CP932 で化けるのに strict な EUC-JP として読める＝EUC-JP の原本。判別不能側に倒す
-        if euc_ok and ratio > 0:
-            return "cp932", 1.0, True
+        if euc is not None and (n_cp932 > 0
+                                or (not _only_halfwidth_kana(head) and _normalizer_prefers_euc(head))):
+            return euc, 0.0, False
         return "cp932", ratio, tr_cp932.majority_garbled
     ratio = (n_utf8 + n_nul_utf8) / len_utf8 if len_utf8 else 0.0
     return "utf-8", ratio, tr_utf8.majority_garbled
@@ -252,8 +324,8 @@ def detect_bytes_quality(raw: bytes, *, complete: bool) -> tuple[str, float, boo
 
 
 def detect_bytes(raw: bytes, *, complete: bool) -> str:
-    """ファイル先頭のバイト列から utf-8 / utf-8-sig / cp932 を判定する。
-    complete はファイル末尾まで含む場合だけ True。BOM、strict UTF-8 の順に判定し、それ以外は置換文字が真に少ない場合だけ CP932。同数なら UTF-8。
+    """ファイル先頭のバイト列から utf-8 / utf-8-sig / cp932 / euc_jp / euc_jis_2004 を判定する。
+    complete はファイル末尾まで含む場合だけ True。BOM、strict UTF-8 の順に判定し、それ以外は置換文字が真に少ない場合だけ CP932（CP932 で化けて strict な EUC なら EUC・両方で読める曖昧なものは charset-normalizer の判断）。同数なら UTF-8。
     """
     return detect_bytes_quality(raw, complete=complete)[0]
 
@@ -292,6 +364,24 @@ def seed_cache(st: os.stat_result, value: tuple[str, float, bool]) -> None:
 def detect_fd(fd: int) -> str:
     """開いた fd の先頭から最大 DETECT_CAP_BYTES を判定する。pread でファイル位置を保ち、I/O 失敗は呼出元へ伝える。"""
     return detect_fd_quality(fd)[0]
+
+
+def needs_redetect(scan_report) -> bool:
+    """取り込みの集計（`scan_report`）に記録した判定の版が、いまの `DETECT_VERSION` と違うか。
+    署名（ファイルの状態）が同じでも、更新で資料フォルダごとに 1 回だけ作り直す目印（作り直しの後はいまの版が記録される）。
+    集計が無い（None）資料フォルダは、どの版で判定したか分からないので 1 回だけ作り直す。
+    集計の計算が失敗したときも版だけの集計（`stamp_detect_version({})`）が残るので、作り直しは繰り返さず、集計だけが再試行される。
+    """
+    if scan_report is None:
+        return True
+    if not isinstance(scan_report, dict):
+        return False
+    return scan_report.get("encoding_detect_version") != DETECT_VERSION
+
+
+def stamp_detect_version(scan_report: dict) -> dict:
+    """集計に、いまの判定の版（`encoding_detect_version`）を付けて返す。"""
+    return {**scan_report, "encoding_detect_version": DETECT_VERSION}
 
 
 def decode(raw: bytes, enc: str) -> str:

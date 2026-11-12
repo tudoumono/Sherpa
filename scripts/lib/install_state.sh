@@ -15,7 +15,6 @@ PKG_MANIFEST_NAME="PACKAGE-MANIFEST.sha256"
 # ./install.sh が入れ替える実行物（ROOT からの相対パス）。
 PKG_SWAP_ITEMS=".venv tools/node tools/codex tools/marp/node_modules"
 
-pkg_data_dir()       { printf '%s\n' "$ROOT/data"; }
 pkg_installing_file() { printf '%s\n' "$ROOT/data/.installing"; }
 pkg_record_file()    { printf '%s\n' "$ROOT/data/.installed"; }
 pkg_record_prev_file() { printf '%s\n' "$ROOT/data/.installed.prev"; }

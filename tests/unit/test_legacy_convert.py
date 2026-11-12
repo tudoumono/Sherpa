@@ -5,7 +5,6 @@
   プロセスグループ kill・キャッシュ・transfer_mode（path/upload/auto）・probe。
 - build_derived 統合（旧形式 → OOXML 前段変換 → ①MD化 → provenance に来歴）。
 - deploy/office-com-worker.ps1 の契約はソーステキストの静的検査のみ（PowerShell は実行しない）。
-
 tests/unit/conftest.py の autouse が `store.get_system_settings` を空 dict に固定する（system 優先の検証は
 各テスト本体で上書きする）。
 """
@@ -29,6 +28,7 @@ import pytest
 from sherpa import json_io
 from sherpa.ingest import office_md
 from sherpa.ingest.arms import legacy_convert
+from tests._replace_row import offline_row
 
 _DOCX_XML = ('<?xml version="1.0"?>'
              '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
@@ -529,7 +529,7 @@ def test_build_derived_converts_legacy_via_backend(tmp_path, monkeypatch):
     monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     counter = _install_fake_soffice(tmp_path, monkeypatch)
     src, derived = _derived_setup(tmp_path, ["旧資料.doc"])
-    rep = office_md.build_derived(src, derived)
+    rep = office_md.build_derived(src, derived, row=offline_row("w"))
     assert rep["converted"] == 1 and rep["failed"] == 0 and rep["unsupported"] == 0
     assert rep["by_ext"] == {".doc": 1}
     assert rep["document_ir_generated"] == 0                           # 旧 .doc は document-ir-v2 を生成しない
@@ -545,7 +545,7 @@ def test_build_derived_converts_legacy_via_backend(tmp_path, monkeypatch):
     assert (derived.parent / "_legacy_cache" / "旧資料.doc.docx").is_file()      # キャッシュは md/ の兄弟
     assert (src / "旧資料.doc").read_bytes() == OLD                              # 原本は不変
     assert _count(counter) == 1
-    assert office_md.build_derived(src, derived)["converted"] == 1                # 再ビルドでもキャッシュヒット
+    assert office_md.build_derived(src, derived, row=offline_row("w"))["converted"] == 1                # 再ビルドでもキャッシュヒット
     assert _count(counter) == 1
 
 
@@ -558,7 +558,7 @@ def test_build_derived_legacy_conversion_failure_reason(tmp_path, monkeypatch, n
     src, derived = _derived_setup(tmp_path, names)
     _install_fake_soffice(tmp_path, monkeypatch, **fake)
     monkeypatch.setenv("SHERPA_LEGACY_TIMEOUT", "0.3")
-    rep = office_md.build_derived(src, derived)
+    rep = office_md.build_derived(src, derived, row=offline_row("w"))
     assert rep["unsupported"] == 0 and rep["failed"] == len(names)
     assert {e["doc"]: e["reason"] for e in rep["legacy_conversion_failures"]} == reasons
 
@@ -568,7 +568,7 @@ def test_build_derived_legacy_unsupported_when_backend_none(tmp_path, monkeypatc
     monkeypatch.delenv("SHERPA_MCP_LEGACY_BACKEND", raising=False)
     monkeypatch.delenv("SHERPA_SOFFICE_BIN", raising=False)
     src, derived = _derived_setup(tmp_path, ["旧資料.doc"])
-    rep = office_md.build_derived(src, derived)
+    rep = office_md.build_derived(src, derived, row=offline_row("w"))
     assert rep["unsupported"] == 1 and rep["converted"] == 0
     assert (derived / "旧資料.doc.md").is_file()              # source-level Evidence/coverage notice は検索可能な成果物
     evidence = json_io.read_json(derived.parent / "ir" / "旧資料.doc.evidence.json")

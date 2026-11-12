@@ -1,0 +1,1046 @@
+{
+ "fixtures/eval/deprecation_markers/inputs/DEP-DOCX-MARKERS.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 24,
+  "element_types": {
+   "deleted_text": 1,
+   "hidden_text": 1,
+   "paragraph": 3,
+   "strike_text": 2
+  },
+  "elements": 7,
+  "relations": 0,
+  "sha256": "e6504b10526adee6d7315164b1f75f7f98a275d97ce54f708cdf901e4cbc4f6e"
+ },
+ "fixtures/eval/deprecation_markers/inputs/DEP-PPTX-MARKERS.pptx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 132,
+  "element_types": {
+   "presentation_template_text": 73,
+   "shape": 11,
+   "slide": 4
+  },
+  "elements": 88,
+  "relations": 4,
+  "sha256": "5d77e3a7a6666b1f7abd086b0284c0729d5b0ab4c0d4f814ae095f9e92eb1334"
+ },
+ "fixtures/eval/deprecation_markers/inputs/DEP-XLSX-MARKERS.xlsx": {
+  "assets": 1,
+  "assets_sha256": "3adf3bf331c5e7b125679840620cc800accd5b1762669565dc60d502e85a87d3",
+  "coverage": 23,
+  "element_types": {
+   "cell": 15,
+   "picture": 1,
+   "sheet": 3,
+   "strike_text": 1,
+   "table": 3
+  },
+  "elements": 23,
+  "relations": 2,
+  "sha256": "a70b1c445e500b07d2fa5f38a526bd62e107144574e30f3749aa9de3dc651039"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-001.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 12,
+  "element_types": {
+   "cell": 7,
+   "sheet": 1,
+   "table": 2
+  },
+  "elements": 10,
+  "relations": 0,
+  "sha256": "9cdfcf2b4380fa43400ff0e7aa9344e9ef973ec27a817d5a80fc54c8ac57925f"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-002.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 11,
+  "element_types": {
+   "cell": 21,
+   "sheet": 1,
+   "table": 1
+  },
+  "elements": 23,
+  "relations": 0,
+  "sha256": "bafdb58005e91aca282fa27c0a97aa7a80a721316985bba8f2a9721780c9b359"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-003.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 19,
+  "element_types": {
+   "cell": 17,
+   "comment": 1,
+   "sheet": 1,
+   "table": 4,
+   "vml_shape": 1
+  },
+  "elements": 24,
+  "relations": 0,
+  "sha256": "fd4e851c58d44ae16c350b7a4dafd734fc921708bbec213b59256c183f042b62"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-004.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 11,
+  "element_types": {
+   "cell": 8,
+   "sheet": 1,
+   "table": 1
+  },
+  "elements": 10,
+  "relations": 0,
+  "sha256": "897751aa170eb81bbb8a2ab2328e5e3d240b422818570bd7f9df6c19e1c51aea"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-005.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 15,
+  "element_types": {
+   "cell": 2,
+   "formula": 2,
+   "sheet": 2,
+   "table": 1
+  },
+  "elements": 7,
+  "relations": 0,
+  "sha256": "28cc245803ef09cf6c9d6524acc696498f3e6cd9d06e8e9c8d2233a4f7de00c7"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-006.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 17,
+  "element_types": {
+   "cell": 15,
+   "sheet": 3,
+   "table": 3
+  },
+  "elements": 21,
+  "relations": 0,
+  "sha256": "28cf850f9ae96cd9a181371e2906d40aa0341c2d24c726b2b982c2b5f26aaeef"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-007.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 13,
+  "element_types": {
+   "cell": 3,
+   "sheet": 1,
+   "table": 3
+  },
+  "elements": 7,
+  "relations": 0,
+  "sha256": "18c7899a55c56e4f25412a10bf7da6faac1ab50d3fc81551c3cb164db1dd7e4f"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-008.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 13,
+  "element_types": {
+   "cell": 11,
+   "sheet": 1,
+   "table": 3
+  },
+  "elements": 15,
+  "relations": 0,
+  "sha256": "ed06a4624aa0ebbdbc1220d793bdd579cb8252237f62d1670f9d3d1c6fc1ee49"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-009.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 14,
+  "element_types": {
+   "cell": 40,
+   "sheet": 1,
+   "table": 1,
+   "textbox": 1
+  },
+  "elements": 43,
+  "relations": 2,
+  "sha256": "56b79d53f687377e8a940ad685d4d9eec86e44225062bb65119d689d4d04b3c5"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-010.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 14,
+  "element_types": {
+   "cell": 25,
+   "sheet": 1,
+   "table": 1,
+   "textbox": 1
+  },
+  "elements": 28,
+  "relations": 26,
+  "sha256": "ea7c1a0db51e539c7cdcf343ae684c4de5b33674acf5b7cf3c5c504ee813a84a"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-011.xlsx": {
+  "assets": 1,
+  "assets_sha256": "3adf3bf331c5e7b125679840620cc800accd5b1762669565dc60d502e85a87d3",
+  "coverage": 16,
+  "element_types": {
+   "cell": 16,
+   "picture": 1,
+   "sheet": 1,
+   "table": 1
+  },
+  "elements": 19,
+  "relations": 16,
+  "sha256": "0ee9044066e1cbb848d49814a69d1ab124381b5a9139e0f71f10f600f580ae69"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-012.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 15,
+  "element_types": {
+   "cell": 13,
+   "connector": 1,
+   "sheet": 1,
+   "table": 2
+  },
+  "elements": 17,
+  "relations": 3,
+  "sha256": "912a990598d6180f7a5d4a352efb7fb157131859c1433d5bfcc14c9819fabeb5"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-013.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 17,
+  "element_types": {
+   "cell": 5,
+   "shape": 1,
+   "sheet": 1,
+   "table": 2,
+   "textbox": 2
+  },
+  "elements": 11,
+  "relations": 6,
+  "sha256": "fc9922efe77f818421c8f77220067acbd361aae52831922520cd5f20f5eab9b1"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-014.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 17,
+  "element_types": {
+   "cell": 1,
+   "connector": 1,
+   "group": 1,
+   "shape": 2,
+   "sheet": 1,
+   "table": 1
+  },
+  "elements": 7,
+  "relations": 1,
+  "sha256": "f2de72f51160f5cb94bf96fba29890d0e5751dbda98fed0214af73fbcdab5dcd"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-015.xlsx": {
+  "assets": 1,
+  "assets_sha256": "fc25003d7b0bd89ba689f7e490d2303273e8bb068989df125c07ff064ba96d80",
+  "coverage": 16,
+  "element_types": {
+   "picture": 1,
+   "sheet": 1,
+   "textbox": 1
+  },
+  "elements": 3,
+  "relations": 0,
+  "sha256": "8e9b212089b81adee73e58bd59d93ff58378b51f92e4f66b904ac82976c214be"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-016.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 20,
+  "element_types": {
+   "cell": 33,
+   "sheet": 1,
+   "table": 3,
+   "textbox": 5
+  },
+  "elements": 42,
+  "relations": 18,
+  "sha256": "e0659eb99fc6bd79ad581b8d5f3dbe5e2430e64281e7d825a1241a7b59dd6712"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-017.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 18,
+  "element_types": {
+   "cell": 6,
+   "chart": 1,
+   "chart_data": 1,
+   "sheet": 1,
+   "table": 1
+  },
+  "elements": 10,
+  "relations": 0,
+  "sha256": "169c410bc08d65995e269637d3fba4d38053525f9924ff615028d72c4a03a09b"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-019.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 17,
+  "element_types": {
+   "cell": 33701,
+   "sheet": 3,
+   "table": 3
+  },
+  "elements": 33707,
+  "relations": 0,
+  "sha256": "962d1f1f3d5f3861656514435ba6518aea619c2d82b26f2564845eb4c72703af"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-020.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 45,
+  "element_types": {
+   "cell": 4629,
+   "connector": 1,
+   "group": 1,
+   "shape": 7,
+   "sheet": 6,
+   "table": 11,
+   "textbox": 1
+  },
+  "elements": 4656,
+  "relations": 1,
+  "sha256": "614deb4b061a7a1493c852148e10d0ba9f07ef50ab4fee6593687cd6b77f3604"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-021.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 62,
+  "element_types": {
+   "cell": 9111,
+   "comment": 2,
+   "connector": 2,
+   "group": 1,
+   "shape": 11,
+   "sheet": 1,
+   "table": 29,
+   "textbox": 1,
+   "vml_shape": 2
+  },
+  "elements": 9160,
+  "relations": 19,
+  "sha256": "b13d762a74efbc0821ddba5b5a2b828e950953891e61a93c09cfc5773163416c"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-022.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 11,
+  "element_types": {
+   "cell": 4,
+   "sheet": 1,
+   "table": 1
+  },
+  "elements": 6,
+  "relations": 0,
+  "sha256": "6ae021c5366bd48ca06bc78599a2982997ea18146b9e9e9712fc56c90990ac33"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-023.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 14,
+  "element_types": {
+   "cell": 63,
+   "sheet": 1,
+   "table": 4
+  },
+  "elements": 68,
+  "relations": 0,
+  "sha256": "a1b9aaf83804d88bc7a243fb6e0dd1194c372cc636701a2e6426cb25b33d6ef0"
+ },
+ "fixtures/eval/excel_ja/inputs/JPX-099.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 30,
+  "element_types": {
+   "cell": 34,
+   "connector": 1,
+   "formula": 2,
+   "group": 1,
+   "shape": 2,
+   "sheet": 3,
+   "table": 5,
+   "textbox": 1
+  },
+  "elements": 49,
+  "relations": 11,
+  "sha256": "f6941c5ce56223e52c13b2bdc914084bc270748c55b8571c1dcd4d3cb0b0c4fd"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-DOCX-EASY.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 21,
+  "element_types": {
+   "cell": 9,
+   "heading": 1,
+   "paragraph": 2,
+   "table": 1
+  },
+  "elements": 13,
+  "relations": 0,
+  "sha256": "9bbeae7d72c8d2ae5ba431cb4e614c97d90c2d29cecf3c7521e5a99ba4b49f9d"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-DOCX-HARD.docx": {
+  "assets": 1,
+  "assets_sha256": "fc25003d7b0bd89ba689f7e490d2303273e8bb068989df125c07ff064ba96d80",
+  "coverage": 668,
+  "element_types": {
+   "cell": 4104,
+   "comment": 1,
+   "floating_textbox": 2,
+   "heading": 2,
+   "paragraph": 640,
+   "picture": 1,
+   "table": 1,
+   "textbox": 2
+  },
+  "elements": 4753,
+  "relations": 1,
+  "sha256": "265b35ee01f1233d39e1228753ee5bf5415dbd09386c39a13f47e328ebcf2819"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-DOCX-LARGE-TABLE.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 18,
+  "element_types": {
+   "cell": 12005,
+   "table": 1
+  },
+  "elements": 12006,
+  "relations": 0,
+  "sha256": "e5551d17a0156087027beec01068f10db9d4cba5e780ca5a134e6db31c91b6c9"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-DOCX-LONG-DESIGN.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 18,
+  "element_types": {
+   "cell": 1,
+   "table": 1
+  },
+  "elements": 2,
+  "relations": 0,
+  "sha256": "24617db4e7e447f3b9ff3e57c50047a49b42547a8492ec28a6c315640d4a91ea"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-DOCX-MEDIUM.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 25,
+  "element_types": {
+   "cell": 20,
+   "floating_textbox": 1,
+   "heading": 1,
+   "paragraph": 3,
+   "table": 2,
+   "textbox": 1
+  },
+  "elements": 28,
+  "relations": 0,
+  "sha256": "94a0938f65ecc9bc43b394eacae61a550c30f6c31836206648ba7d6b0854f2c3"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-PDF-EASY.pdf": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 11,
+  "element_types": {
+   "cell": 9,
+   "page": 2,
+   "positioned_text": 4,
+   "table": 1,
+   "text_object": 2
+  },
+  "elements": 18,
+  "relations": 0,
+  "sha256": "2968cbe614e932d895d57bbca25562f7a4c9025f4577057404f872b3bc4c96de"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-PDF-HARD.pdf": {
+  "assets": 1,
+  "assets_sha256": "00b36afe0bd39a7888ab27ba2f481f06b654dfbb9f3e2b0b850e7aa3f99a00ea",
+  "coverage": 4,
+  "element_types": {
+   "image_xobject": 1,
+   "page": 1,
+   "text_object": 1
+  },
+  "elements": 3,
+  "relations": 3,
+  "sha256": "88537f255bdf906afbfecda8226c5c5d5628245e46547aa5f7bd2d6c5e5def45"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-PDF-LARGE-TABLE.pdf": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 300,
+  "element_types": {
+   "cell": 12300,
+   "page": 60,
+   "positioned_text": 60,
+   "table": 60,
+   "text_object": 60
+  },
+  "elements": 12540,
+  "relations": 0,
+  "sha256": "6eb815295d56b30737e1d4661627cb4153627fee10c7e3a428888f387f38af19"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-PDF-LONG-DESIGN.pdf": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 480,
+  "element_types": {
+   "page": 20,
+   "positioned_text": 420,
+   "text_object": 20
+  },
+  "elements": 460,
+  "relations": 0,
+  "sha256": "e4303570c41fb2605ff78d75f36d106bd2ddf034dee6a8b9f6d970d5f9977f8f"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-PDF-MEDIUM.pdf": {
+  "assets": 1,
+  "assets_sha256": "72e1a623db35739bbc0ba6cb25fbb23e99acdd214932d200a5a1dd01c5e64237",
+  "coverage": 3,
+  "element_types": {
+   "image_xobject": 1,
+   "page": 1
+  },
+  "elements": 2,
+  "relations": 0,
+  "sha256": "5d46e098b91fbcb593da4db5860aa5a3debf3c332ef322dbcbcfe4ac17f7d6bb"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-PPTX-EASY.pptx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 125,
+  "element_types": {
+   "cell": 9,
+   "presentation_template_text": 73,
+   "shape": 9,
+   "slide": 2,
+   "table": 1
+  },
+  "elements": 94,
+  "relations": 0,
+  "sha256": "f3709a33259a00d293219a0cbed0d6a51b4f938e02a3a614606161bc92e2eb1f"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-PPTX-HARD.pptx": {
+  "assets": 1,
+  "assets_sha256": "fc25003d7b0bd89ba689f7e490d2303273e8bb068989df125c07ff064ba96d80",
+  "coverage": 155,
+  "element_types": {
+   "connector": 1,
+   "group": 1,
+   "notes": 1,
+   "picture": 1,
+   "presentation_template_text": 80,
+   "shape": 20,
+   "slide": 3
+  },
+  "elements": 107,
+  "relations": 8,
+  "sha256": "b9e191eb2d161dc8f3b557191263a85e3ab891fe329b3417a59fdb3c350b1398"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-PPTX-LARGE-TABLE.pptx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 949,
+  "element_types": {
+   "cell": 12600,
+   "presentation_template_text": 73,
+   "shape": 360,
+   "slide": 120,
+   "table": 120
+  },
+  "elements": 13273,
+  "relations": 0,
+  "sha256": "ecfe71537155c8a94f39e423dbcf8592d632e76405cf5c05830ce4f53d4222c1"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-PPTX-LONG-DESIGN.pptx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 116,
+  "element_types": {
+   "presentation_template_text": 73,
+   "shape": 4,
+   "slide": 1
+  },
+  "elements": 78,
+  "relations": 0,
+  "sha256": "59f417db4a7995ab7e5a56b4932e34b5dce147c63d46206f058a2874c06b730d"
+ },
+ "fixtures/eval/office_ja/inputs/OJA-PPTX-MEDIUM.pptx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 122,
+  "element_types": {
+   "cell": 20,
+   "presentation_template_text": 73,
+   "shape": 8,
+   "slide": 1,
+   "table": 2
+  },
+  "elements": 104,
+  "relations": 0,
+  "sha256": "34eab4047bb251c9ab3c6d05b76660396b1492070cb545f8e7ba23e379141a48"
+ },
+ "fixtures/eval_v020/ポイント管理/02_設計/01_基本設計/ポイント付与仕様書.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 21,
+  "element_types": {
+   "cell": 46,
+   "sheet": 4,
+   "table": 5
+  },
+  "elements": 55,
+  "relations": 0,
+  "sha256": "5540001fbc549832fbac294d0493f4512f5230aab7262060484040b99cac300f"
+ },
+ "fixtures/eval_v020/ポイント管理/02_設計/01_基本設計/ポイント失効設計書.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 26,
+  "element_types": {
+   "heading": 5,
+   "paragraph": 4
+  },
+  "elements": 9,
+  "relations": 0,
+  "sha256": "64f150b8c5d02bb953acb32ebbbfb975480828d9c4a4ed98220a5ac880590275"
+ },
+ "fixtures/eval_v020/在庫管理/02_設計/01_基本設計/在庫引当設計書.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 29,
+  "element_types": {
+   "cell": 8,
+   "heading": 6,
+   "paragraph": 5,
+   "table": 1
+  },
+  "elements": 20,
+  "relations": 0,
+  "sha256": "4b3ef52ba27238f22f14b97f4547e18c18cc25c1ce2cfe6b1e00cfb37c7ead02"
+ },
+ "fixtures/eval_v020/在庫管理/02_設計/01_基本設計/在庫引当設計書_旧.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 25,
+  "element_types": {
+   "heading": 4,
+   "paragraph": 4
+  },
+  "elements": 8,
+  "relations": 0,
+  "sha256": "743d2ff42c10cd06f2fa0464842d09b0b321e2b606f9c14832f75ef033043a72"
+ },
+ "fixtures/eval_v020/在庫管理/02_設計/01_基本設計/在庫項目定義書.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 17,
+  "element_types": {
+   "cell": 57,
+   "sheet": 3,
+   "table": 3
+  },
+  "elements": 63,
+  "relations": 0,
+  "sha256": "a5e79dab096bb5640f7fba164d989635ce000fc30903dd5a43abed64143bbd94"
+ },
+ "fixtures/eval_v020/在庫管理_識別子置換/02_設計/01_基本設計/在庫引当設計書.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 29,
+  "element_types": {
+   "cell": 8,
+   "heading": 6,
+   "paragraph": 5,
+   "table": 1
+  },
+  "elements": 20,
+  "relations": 0,
+  "sha256": "c6f2a1fb71f637875266d96224a58de897d41a7587e385399c83019478130e71"
+ },
+ "fixtures/eval_v020/在庫管理_識別子置換/02_設計/01_基本設計/在庫引当設計書_旧.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 25,
+  "element_types": {
+   "heading": 4,
+   "paragraph": 4
+  },
+  "elements": 8,
+  "relations": 0,
+  "sha256": "743d2ff42c10cd06f2fa0464842d09b0b321e2b606f9c14832f75ef033043a72"
+ },
+ "fixtures/eval_v020/在庫管理_識別子置換/02_設計/01_基本設計/在庫項目定義書.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 17,
+  "element_types": {
+   "cell": 57,
+   "sheet": 3,
+   "table": 3
+  },
+  "elements": 63,
+  "relations": 0,
+  "sha256": "fbba75b979c0ee4188a9f261dfec34389e84684581a9904b96434d7b7f4ebdb9"
+ },
+ "fixtures/eval_v020/在庫管理_資料追加/02_設計/01_基本設計/勤怠集計設計書.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 22,
+  "element_types": {
+   "heading": 3,
+   "paragraph": 2
+  },
+  "elements": 5,
+  "relations": 0,
+  "sha256": "dce6a9380cc2a590df150293a89ed3d6f2f1282779b97b4874a32c86edc917a1"
+ },
+ "fixtures/eval_v020/在庫管理_資料追加/02_設計/01_基本設計/勤怠項目定義書.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 11,
+  "element_types": {
+   "cell": 24,
+   "sheet": 1,
+   "table": 1
+  },
+  "elements": 26,
+  "relations": 0,
+  "sha256": "23c900c105dd4ae8d7c009020d89c5fd72112a259eddd096b8a4227a62f1e438"
+ },
+ "fixtures/eval_v020/在庫管理_資料追加/02_設計/01_基本設計/在庫引当設計書.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 29,
+  "element_types": {
+   "cell": 8,
+   "heading": 6,
+   "paragraph": 5,
+   "table": 1
+  },
+  "elements": 20,
+  "relations": 0,
+  "sha256": "4b3ef52ba27238f22f14b97f4547e18c18cc25c1ce2cfe6b1e00cfb37c7ead02"
+ },
+ "fixtures/eval_v020/在庫管理_資料追加/02_設計/01_基本設計/在庫引当設計書_旧.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 25,
+  "element_types": {
+   "heading": 4,
+   "paragraph": 4
+  },
+  "elements": 8,
+  "relations": 0,
+  "sha256": "743d2ff42c10cd06f2fa0464842d09b0b321e2b606f9c14832f75ef033043a72"
+ },
+ "fixtures/eval_v020/在庫管理_資料追加/02_設計/01_基本設計/在庫項目定義書.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 17,
+  "element_types": {
+   "cell": 57,
+   "sheet": 3,
+   "table": 3
+  },
+  "elements": 63,
+  "relations": 0,
+  "sha256": "a5e79dab096bb5640f7fba164d989635ce000fc30903dd5a43abed64143bbd94"
+ },
+ "fixtures/eval_v020/経費精算/02_設計/01_基本設計/経費承認フロー設計書.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 24,
+  "element_types": {
+   "heading": 4,
+   "paragraph": 3
+  },
+  "elements": 7,
+  "relations": 0,
+  "sha256": "44ac0ff908d6dd1f036df32c38af7b0bf2cb6336c62bf3d57ab8785bbf350aa5"
+ },
+ "fixtures/eval_v020/経費精算/02_設計/01_基本設計/費目別限度額.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 14,
+  "element_types": {
+   "cell": 28,
+   "sheet": 2,
+   "table": 2
+  },
+  "elements": 32,
+  "relations": 0,
+  "sha256": "bc0058a868358883c6e8c1030a9c3444e0c481dc8877edf00a96dd3e2f989564"
+ },
+ "fixtures/eval_v020/配送料金/02_設計/01_基本設計/料金表.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 15,
+  "element_types": {
+   "cell": 33,
+   "sheet": 2,
+   "table": 3
+  },
+  "elements": 38,
+  "relations": 0,
+  "sha256": "d2e3c6e4733f9c92b6b4747862867e6e99386de545f38db508e26ef8b1e20b3e"
+ },
+ "fixtures/eval_v020/配送料金/02_設計/01_基本設計/配送料金計算設計書.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 28,
+  "element_types": {
+   "heading": 6,
+   "paragraph": 5
+  },
+  "elements": 11,
+  "relations": 0,
+  "sha256": "02d90164a86ff82496e40f026bcf62b956565679dec5c6a3d02255d786b2bffb"
+ },
+ "fixtures/eval_v020/配送料金_加算変更/02_設計/01_基本設計/料金表.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 15,
+  "element_types": {
+   "cell": 33,
+   "sheet": 2,
+   "table": 3
+  },
+  "elements": 38,
+  "relations": 0,
+  "sha256": "1a727dee4dc06edec2782fc7f0864702ed75b63ae1c54b3e618af622f65843c0"
+ },
+ "fixtures/eval_v020/配送料金_加算変更/02_設計/01_基本設計/配送料金計算設計書.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 28,
+  "element_types": {
+   "heading": 6,
+   "paragraph": 5
+  },
+  "elements": 11,
+  "relations": 0,
+  "sha256": "b9f467f66f6bde8fea16528677a15be5b4b58d707f941d28b8ffe953752c8de0"
+ },
+ "fixtures/eval_v020/配送料金_単位変更/02_設計/01_基本設計/料金表.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 15,
+  "element_types": {
+   "cell": 33,
+   "sheet": 2,
+   "table": 3
+  },
+  "elements": 38,
+  "relations": 0,
+  "sha256": "8d272dabd3eb26c5f6c1db1068227029e877d90fb1189215157a953a130ad169"
+ },
+ "fixtures/eval_v020/配送料金_単位変更/02_設計/01_基本設計/配送料金計算設計書.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 28,
+  "element_types": {
+   "heading": 6,
+   "paragraph": 5
+  },
+  "elements": 11,
+  "relations": 0,
+  "sha256": "006203d9b8543be0b655eebf57d1c1e78321cc14a44794ed9a588117e38c5544"
+ },
+ "fixtures/eval_v021/備品貸出/02_設計/01_基本設計/貸出条件の改定案.pptx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 118,
+  "element_types": {
+   "presentation_template_text": 73,
+   "shape": 6,
+   "slide": 1
+  },
+  "elements": 80,
+  "relations": 0,
+  "sha256": "39b7a1f7adc1afe49baa1c2416a52b0b615be0d7857432ccab080b97314447d1"
+ },
+ "fixtures/eval_v021/備品貸出/02_設計/01_基本設計/貸出条件書.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 27,
+  "element_types": {
+   "heading": 4,
+   "paragraph": 4,
+   "strike_text": 2
+  },
+  "elements": 10,
+  "relations": 0,
+  "sha256": "c89f8aeba35f0fba7679b871e43ead255e29fcde74bbc07abc0e4bf77ff30ae3"
+ },
+ "fixtures/eval_v021/備品貸出/02_設計/02_運用/運用手引き.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 26,
+  "element_types": {
+   "heading": 4,
+   "paragraph": 3,
+   "strike_text": 2
+  },
+  "elements": 9,
+  "relations": 0,
+  "sha256": "7352f7a91fb657f981b89c3a3c15283a9c4e50edbd1d3ce3f2e86e9cc872f677"
+ },
+ "fixtures/eval_v021/備品貸出/02_設計/03_画面/受付案内図.pptx": {
+  "assets": 1,
+  "assets_sha256": "d2b4e514286892d61c6c251545fadbb227c6f700ad8d6c4e6d27e79557ad74d2",
+  "coverage": 126,
+  "element_types": {
+   "picture": 1,
+   "presentation_template_text": 73,
+   "shape": 9,
+   "slide": 2
+  },
+  "elements": 85,
+  "relations": 4,
+  "sha256": "cd988ec380fbafafee958540fa72c4821eedab301889d357629bdd25611f94bb"
+ },
+ "fixtures/eval_v021/備品貸出/02_設計/03_画面/承認画面の構成.pptx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 120,
+  "element_types": {
+   "presentation_template_text": 73,
+   "shape": 8,
+   "slide": 1
+  },
+  "elements": 82,
+  "relations": 2,
+  "sha256": "a23d8e12a572d7023ee02c6dc89dfe40f335c0734a18836883a62e98219442a6"
+ },
+ "fixtures/eval_v021/備品貸出/02_設計/04_添付/機器一覧と添付.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 24,
+  "element_types": {
+   "heading": 1,
+   "ole_object": 1,
+   "paragraph": 2,
+   "vml_shape": 1
+  },
+  "elements": 5,
+  "relations": 0,
+  "sha256": "c49f2a6bd332605f715620656a6b35481e702c95c5a970a73bc29e8414a352dd"
+ },
+ "fixtures/eval_v021/備品貸出/02_設計/04_添付/貸出台帳の添付.pptx": {
+  "assets": 1,
+  "assets_sha256": "cd88b3b04f064ff1c8b28b8ac2d758c156c4214f7a9c7f50febcf6d0a785afdd",
+  "coverage": 119,
+  "element_types": {
+   "ole_object": 1,
+   "presentation_template_text": 73,
+   "shape": 4,
+   "slide": 1
+  },
+  "elements": 79,
+  "relations": 0,
+  "sha256": "65f9dba42fcc11dbc327d659db0dfdc592f7249c78794eb8cf69d4d5019faac8"
+ },
+ "fixtures/eval_v021/備品貸出/02_設計/05_検証/品目別の値.xlsx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 17,
+  "element_types": {
+   "cell": 6,
+   "shape": 4,
+   "sheet": 1,
+   "table": 1
+  },
+  "elements": 12,
+  "relations": 8,
+  "sha256": "01817361d2ef1e8d6d7f1a91620f60849734c46bd966aa079bdd3e3c528b43ab"
+ },
+ "fixtures/eval_v021/備品貸出/02_設計/05_検証/基準値の枠.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 22,
+  "element_types": {
+   "floating_textbox": 1,
+   "heading": 1,
+   "paragraph": 2,
+   "textbox": 1
+  },
+  "elements": 5,
+  "relations": 0,
+  "sha256": "978b47b9a467020b584d617ee0d8d5e7bab62de2e73f1a0a51d91fe2f9460fb4"
+ },
+ "fixtures/eval_v021/備品貸出/02_設計/05_検証/条件の比較図.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 26,
+  "element_types": {
+   "heading": 1,
+   "paragraph": 2,
+   "textbox": 2,
+   "vml_shape": 3
+  },
+  "elements": 8,
+  "relations": 0,
+  "sha256": "7b21fcae2a7d84a374e986ea5c653a8ef8a353898e9a190dd6c50f08c0e0e639"
+ },
+ "fixtures/eval_v021/備品貸出/02_設計/05_検証/避難経路の案内.pptx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 126,
+  "element_types": {
+   "presentation_template_text": 73,
+   "shape": 11,
+   "slide": 2
+  },
+  "elements": 86,
+  "relations": 4,
+  "sha256": "ed925122bcf55f33a58fc8d053026c6a5f86001572b36fb0edfddca5b0d1a93d"
+ },
+ "fixtures/pdf_export/OJA-DOCX-EASY.pdf": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 15,
+  "element_types": {
+   "page": 1,
+   "positioned_text": 12,
+   "text_object": 1
+  },
+  "elements": 14,
+  "relations": 0,
+  "sha256": "fbe1ca597c4e9d10ef25c8a87d72eaf05b1663deede6a8eba8a45c310e9b0a1d"
+ },
+ "fixtures/pdf_export/PDFX-MERGED.docx": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 20,
+  "element_types": {
+   "cell": 18,
+   "heading": 1,
+   "paragraph": 1,
+   "table": 1
+  },
+  "elements": 21,
+  "relations": 0,
+  "sha256": "8f05b3cd387f3871b1f49e7844f8c14f395926b9ebb5cec5b8efddb62bb713a3"
+ },
+ "fixtures/pdf_export/PDFX-MERGED.pdf": {
+  "assets": 0,
+  "assets_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "coverage": 6,
+  "element_types": {
+   "cell": 18,
+   "page": 1,
+   "positioned_text": 2,
+   "table": 1,
+   "text_object": 1
+  },
+  "elements": 23,
+  "relations": 0,
+  "sha256": "47734db16b5429f59bce1063d038a716b688755eea53a2ac781e9b01fca7da05"
+ }
+}

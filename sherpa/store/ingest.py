@@ -8,13 +8,13 @@ import time
 
 from psycopg.types.json import Json
 
-from .db import _KB_ID, _connect, _ensure
+from .db import _KB_ID, _connect, _connect_bounded, _ensure, _ensure_unless_bounded
 from .failed_docs import replace_failed_docs_in
+from .replace_rows import RUN_NS, ClaimedRun, RowLockLost, claim_row, drop_in, drop_world_rows, open_claim_connection
 
 
 def add_ingest_run(world, layer="version", status="auto_published", source_doc_ids=None,
-                   extraction_snapshot=None, published_snapshot=None, ingest_source_id=None,
-                   scan_root=None, scope_mapping_overrides=None, created_by="admin") -> dict:
+                   extraction_snapshot=None, published_snapshot=None, created_by="admin", op=None) -> dict:
     """完了した取り込み run を1行記録する。実際に Neo4j へ反映したときだけ `published_at` を入れる。
     列名 `version`・layer 値 `'version'` は DB 上の既存名で、引数は world 用語。
     """
@@ -22,61 +22,63 @@ def add_ingest_run(world, layer="version", status="auto_published", source_doc_i
     published = published_snapshot is not None  # 反映実体があるときだけ入れる（reflect=False/failed は NULL）。
     with _connect() as c:
         return c.execute(
-            "INSERT INTO ingest_runs (kb_id, version, layer, ingest_source_id, scan_root, scope_mapping_overrides, "
-            "  source_doc_ids, status, extraction_snapshot, published_snapshot, created_by, published_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, CASE WHEN %s THEN now() ELSE NULL END) "
+            "INSERT INTO ingest_runs (kb_id, version, layer, "
+            "  source_doc_ids, status, extraction_snapshot, published_snapshot, created_by, op, published_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, CASE WHEN %s THEN now() ELSE NULL END) "
             "RETURNING id, version, layer, status, source_doc_ids, extraction_snapshot, created_at, published_at",
-            (_KB_ID, world, layer, ingest_source_id, scan_root,
-             Json(scope_mapping_overrides) if scope_mapping_overrides else None,
+            (_KB_ID, world, layer,
              Json(source_doc_ids or []), status, Json(extraction_snapshot or {}),
              Json(published_snapshot) if published_snapshot is not None else None,
-             created_by, published)).fetchone()
+             created_by, op, published)).fetchone()
 
 
-def start_ingest_run(world, layer="version", scan_root=None, scope_mapping_overrides=None,
-                     ingest_source_id=None, created_by="admin", progress=None) -> dict:
+def start_ingest_run(world, layer="version", created_by="admin", progress=None) -> dict:
     """取り込み run を開始時点で1行 INSERT する（`status='extracting'`）。完了時は `finish_ingest_run`（同じ行の UPDATE）で締める。行の存在が「実行が始まった」事実になり、起動時の孤児 `extracting` 検知の前提になる。
     `progress` は INSERT と同時に確定する初期進捗（省略時 NULL）。戻り値は `id` を含み、呼び出し元が run_id として使う。
     """
     _ensure()
     with _connect() as c:
         return c.execute(
-            "INSERT INTO ingest_runs (kb_id, version, layer, ingest_source_id, scan_root, "
-            "  scope_mapping_overrides, status, progress, created_by) "
-            "VALUES (%s,%s,%s,%s,%s,%s,'extracting',%s,%s) "
+            "INSERT INTO ingest_runs (kb_id, version, layer, status, progress, created_by) "
+            "VALUES (%s,%s,%s,'extracting',%s,%s) "
             "RETURNING id, version, layer, status, progress, created_at",
-            (_KB_ID, world, layer, ingest_source_id, scan_root,
-             Json(scope_mapping_overrides) if scope_mapping_overrides else None,
+            (_KB_ID, world, layer,
              Json(progress) if progress is not None else None,
              created_by)).fetchone()
 
 
-def fail_close_if_extracting(run_id, *, reason: str) -> bool:
+def fail_close_if_extracting(run_id, *, reason: str, interrupted: bool = False, drop=None) -> bool:
     """`status='extracting'` のままの行だけを `failed` へ CAS で落とす。
     背景実行の最外周（`sherpa.ingest.background`）のセーフティネット専用: 各操作は自分の run を自分で terminal 化する契約で、果たされなかったときだけここが拾う。条件付き UPDATE にして、理由付きで確定済みの行を上書きしない。
-    戻り値は実際に更新したか。
+    `drop`（`replace_guard.refused_check` の戻り値）があれば、閉じたときだけ同じトランザクションで入れ替えの行も消す。戻り値は実際に更新したか。
     """
     _ensure()
     with _connect() as c:
         row = c.execute(
-            "UPDATE ingest_runs SET status='failed', progress=NULL, "
+            "UPDATE ingest_runs SET status='failed', "
             "  extraction_snapshot=jsonb_set("
             "    COALESCE(extraction_snapshot, '{}'::jsonb), '{flags}', "
             "    COALESCE(extraction_snapshot->'flags', '[]'::jsonb) || "
             "      jsonb_build_array(jsonb_build_object('doc', NULL, 'action', 'blocked', 'reason', %s::text)), "
             "    true) "
+            "  || CASE WHEN %s THEN '{\"interrupted\": true}'::jsonb ELSE '{}'::jsonb END "
             "WHERE kb_id=%s AND id=%s AND status='extracting' "
-            "RETURNING id", (reason, _KB_ID, run_id)).fetchone()
+            "RETURNING id", (reason, interrupted, _KB_ID, run_id)).fetchone()
+        if row is not None and drop is not None:
+            c.execute("DELETE FROM ingest_replacements WHERE id=%s AND lock_ns=%s AND lock_id=%s",
+                      (drop.id, drop.lock_ns, drop.lock_id))
         return row is not None
 
 
 def finish_ingest_run_and_confirm_world(run_id, world, *, status, extraction_snapshot=None,
                                         published_snapshot=None, source_doc_ids=None,
                                         sig=None, manifest=None, doc_count=None,
-                                        scan_report=None, resolve_sig=None, failed_docs=None) -> dict:
+                                        scan_report=None, resolve_sig=None, failed_docs=None, drop) -> dict:
     """run の完了確定と world 側の署名/manifest/doc_count/scan_report 確定を同一トランザクションで行う。
     `resolve_sig`＝このグラフが使った解決範囲の設定のハッシュ（`worlds.resolve_applied_sig` へ書く・None なら更新しない）。
     `failed_docs`（`{rel: 理由}`）を渡すと、失敗の一覧（`world_failed_docs`）も同じトランザクションで置き換える。
+    `drop`＝入れ替えの行を同じトランザクションで消す印（`replace_guard.final_check` の戻り値か、消さないなら None）。既定値は持たない。
+    回が `extracting` でなければ（lock を失い他で閉じられた回）何も確定せず `RowLockLost`。
     `sig` が None なら world 側の UPDATE は行わない。scan_report 等の計算は呼び出し前に済ませておくこと（トランザクション内は軽量な UPDATE 2本のみ）。
     """
     _ensure()
@@ -86,11 +88,13 @@ def finish_ingest_run_and_confirm_world(run_id, world, *, status, extraction_sna
             "UPDATE ingest_runs SET status=%s, extraction_snapshot=%s, published_snapshot=%s, "
             "  source_doc_ids=%s, progress=NULL, "
             "  published_at=CASE WHEN %s THEN now() ELSE published_at END "
-            "WHERE kb_id=%s AND id=%s "
+            "WHERE kb_id=%s AND id=%s AND status='extracting' "
             "RETURNING id, version, layer, status, source_doc_ids, extraction_snapshot, created_at, published_at",
             (status, Json(extraction_snapshot or {}),
              Json(published_snapshot) if published_snapshot is not None else None,
              Json(source_doc_ids or []), published, _KB_ID, run_id)).fetchone()
+        if rec is None:
+            raise RowLockLost(f"回が実行中ではありません（他の処理が閉じました）: run={run_id}")
         if sig is not None:
             sets = ["last_sig=%s", "last_synced_at=now()"]
             params: list = [sig]
@@ -111,22 +115,50 @@ def finish_ingest_run_and_confirm_world(run_id, world, *, status, extraction_sna
             c.execute(f"UPDATE worlds SET {', '.join(sets)} WHERE kb_id=%s AND world_id=%s", params)
         if failed_docs is not None:
             replace_failed_docs_in(c, world, failed_docs)
+        if drop is not None:
+            drop_in(c, drop)
         return rec
 
 
 def finish_ingest_run_and_delete_world(run_id, world, *, status, extraction_snapshot=None) -> tuple:
     """run の完了確定と world レジストリ行の削除を同一トランザクションで行う（`worlds.delete` 専用）。
-    派生物の wipe が成功した後だけ呼ぶ（失敗時は呼ばず world 行を残す）。戻り値は `(run の更新後の行, world 行が実際に削除されたか)`。
+    回が `extracting` でなければ world 行を消さず `RowLockLost`。派生物の wipe が成功した後だけ呼ぶ（失敗時は呼ばず world 行を残す）。その資料フォルダの入れ替えの行は 1 文書の行も含めて全部消す。戻り値は `(run の更新後の行, world 行が実際に削除されたか)`。
     """
     _ensure()
     with _connect() as c:
         rec = c.execute(
             "UPDATE ingest_runs SET status=%s, extraction_snapshot=%s, progress=NULL "
-            "WHERE kb_id=%s AND id=%s "
+            "WHERE kb_id=%s AND id=%s AND status='extracting' "
             "RETURNING id, version, layer, status, source_doc_ids, extraction_snapshot, created_at, published_at",
             (status, Json(extraction_snapshot or {}), _KB_ID, run_id)).fetchone()
+        if rec is None:
+            raise RowLockLost(f"回が実行中ではありません（他の処理が閉じました）: run={run_id}")
         n = c.execute("DELETE FROM worlds WHERE kb_id=%s AND world_id=%s", (_KB_ID, world)).rowcount
+        drop_world_rows(c, world)
         return rec, n > 0
+
+
+def finish_ingest_run_and_drop_row(run_id, *, drop, status, extraction_snapshot=None, published_snapshot=None,
+                                   source_doc_ids=None) -> dict:
+    """`finish_ingest_run` と同じ更新に、入れ替えの行を消す（`drop` は `replace_guard.final_check` の戻り値）を同じトランザクションで足す。
+    回が `extracting` でない、または行の lock の鍵が自分のものでなければ `RowLockLost` で、記録ごと取り消す。
+    """
+    _ensure()
+    published = published_snapshot is not None
+    with _connect() as c:
+        rec = c.execute(
+            "UPDATE ingest_runs SET status=%s, extraction_snapshot=%s, published_snapshot=%s, "
+            "  source_doc_ids=%s, progress=NULL, "
+            "  published_at=CASE WHEN %s THEN now() ELSE published_at END "
+            "WHERE kb_id=%s AND id=%s AND status='extracting' "
+            "RETURNING id, version, layer, status, source_doc_ids, extraction_snapshot, created_at, published_at",
+            (status, Json(extraction_snapshot or {}),
+             Json(published_snapshot) if published_snapshot is not None else None,
+             Json(source_doc_ids or []), published, _KB_ID, run_id)).fetchone()
+        if rec is None:
+            raise RowLockLost(f"回が実行中ではありません（他の処理が閉じました）: run={run_id}")
+        drop_in(c, drop)
+        return rec
 
 
 def update_ingest_run_progress(run_id, progress: dict) -> None:
@@ -137,10 +169,22 @@ def update_ingest_run_progress(run_id, progress: dict) -> None:
                   (Json(progress), _KB_ID, run_id))
 
 
+def update_ingest_run_snapshot(run_id, extraction_snapshot: dict) -> None:
+    """実行中 run の `extraction_snapshot` に段の途中までの観測をマージする。"""
+    _ensure()
+    with _connect() as c:
+        c.execute(
+            "UPDATE ingest_runs SET extraction_snapshot="
+            "  COALESCE(extraction_snapshot, '{}'::jsonb) || (%s)::jsonb "
+            "WHERE kb_id=%s AND id=%s AND status='extracting'",
+            (Json(extraction_snapshot), _KB_ID, run_id))
+
+
 def finish_ingest_run(run_id, *, status, extraction_snapshot=None, published_snapshot=None,
                       source_doc_ids=None) -> dict:
     """`start_ingest_run` が確保した行を完了状態へ更新する（UPDATE）。
     `published_snapshot` が None でないときだけ `published_at` を確定する。`progress` は完了時に NULL へ戻す。
+    `extracting` の回だけ更新し、閉じられた回には何もせず None を返す。
     """
     _ensure()
     published = published_snapshot is not None
@@ -149,7 +193,7 @@ def finish_ingest_run(run_id, *, status, extraction_snapshot=None, published_sna
             "UPDATE ingest_runs SET status=%s, extraction_snapshot=%s, published_snapshot=%s, "
             "  source_doc_ids=%s, progress=NULL, "
             "  published_at=CASE WHEN %s THEN now() ELSE published_at END "
-            "WHERE kb_id=%s AND id=%s "
+            "WHERE kb_id=%s AND id=%s AND status='extracting' "
             "RETURNING id, version, layer, status, source_doc_ids, extraction_snapshot, created_at, published_at",
             (status, Json(extraction_snapshot or {}),
              Json(published_snapshot) if published_snapshot is not None else None,
@@ -161,9 +205,10 @@ def downgrade_orphaned_extracting_runs(world=None, *, legacy_only=False, claimed
     `world=None` は全 world 一括。`world` 指定はその world だけ。
     `legacy_only=True` はワーカーに拾われていない行（`claimed_by IS NULL`＝0.18.x の Web アプリがプロセス内で動かしていたもの）だけ、
     `claimed_by` 指定はそのワーカーが拾った行だけを対象にする。どちらも無ければ全ての `extracting`。
+    強制終了直前までの `progress` と `extraction_snapshot` は診断用に保持する。
     """
     _ensure()
-    q = ("UPDATE ingest_runs SET status='failed', progress=NULL, "
+    q = ("UPDATE ingest_runs SET status='failed', "
         "  extraction_snapshot=COALESCE(extraction_snapshot, '{}'::jsonb) "
         "    || '{\"interrupted\": true}'::jsonb "
         "WHERE kb_id=%s AND status='extracting'")
@@ -181,6 +226,30 @@ def downgrade_orphaned_extracting_runs(world=None, *, legacy_only=False, claimed
         return [r["id"] for r in c.execute(q, params).fetchall()]
 
 
+_CLOSE_DEAD_SQL = (
+    "WITH cand AS MATERIALIZED (SELECT id FROM ingest_runs WHERE kb_id=%s AND status='extracting' "
+    "  AND claimed_by IS NOT NULL AND {scope}) "
+    "UPDATE ingest_runs r SET status='failed', "
+    "  extraction_snapshot=COALESCE(r.extraction_snapshot, '{{}}'::jsonb) || '{{\"interrupted\": true}}'::jsonb "
+    "FROM cand WHERE r.id=cand.id AND r.status='extracting' AND pg_try_advisory_xact_lock(%s, r.id) "
+    "RETURNING r.id")
+
+
+def close_dead_extracting(world, conn=None, *, keys=()) -> list:
+    """持ち主の居ない `extracting` の回を `failed`（中断）で閉じ、閉じた id を返す。拾われた回（`claimed_by`）だけが対象で、回の lock が取れたもの（持ち主が居ない）だけを閉じる。
+    動いている回は lock を持たれているので閉じない。`keys`＝同時に 1 つしか動かさない単位（`enqueue_ingest_run` の `keys`）も対象にする。
+    `conn` を渡すと、その接続のトランザクションの中で閉じる（`enqueue_ingest_run` が使う）。
+    """
+    q = _CLOSE_DEAD_SQL.format(scope="(version = ANY(%s) OR arb_keys && %s)")
+    ks = list(dict.fromkeys([world, *keys]))
+    args = (_KB_ID, ks, ks, RUN_NS)
+    if conn is not None:
+        return [r["id"] for r in conn.execute(q, args).fetchall()]
+    _ensure()
+    with _connect() as c:
+        return [r["id"] for r in c.execute(q, args).fetchall()]
+
+
 def note_ingest_run_op(run_id, op: str) -> None:
     """実行中の run の操作名（register/refresh/rerun 等）を `extraction_snapshot.op` へ足す。強制終了で `interrupted` へ格下げされた後も残り、起動時の自動再開の可否判定に使う。"""
     _ensure()
@@ -191,19 +260,22 @@ def note_ingest_run_op(run_id, op: str) -> None:
 
 
 def list_worlds_with_interrupted_latest_run() -> list:
-    """最新の run が「中断（`extraction_snapshot.interrupted`）」で終わっている登録済み world を `{world_id, run_id, op, stop_reason}` で返す。
+    """最新の run が「中断（`extraction_snapshot.interrupted`）」で終わっている登録済み world を `{world_id, run_id, op, stop_reason, payload, delete_pending}` で返す。
     最新の run だけを見る（その後に別の run が走っていれば再開済み）。world 行が無い（削除・登録解除済み）ものは含まない。`op` は記録が無ければ None。
+    `delete_pending`＝消す仕事の行（`kind='delete'`）が残っているか。
     """
     _ensure()
     with _connect() as c:
         rows = c.execute(
             "SELECT r.version AS world_id, r.id AS run_id, r.extraction_snapshot->>'op' AS op, "
-            "r.extraction_snapshot->>'stop_reason' AS stop_reason "
-            "FROM (SELECT DISTINCT ON (version) id, version, status, extraction_snapshot "
+            "r.extraction_snapshot->>'stop_reason' AS stop_reason, r.payload AS payload, "
+            "EXISTS (SELECT 1 FROM ingest_replacements d WHERE d.kb_id=%s AND d.world=r.version "
+            "        AND d.doc='' AND d.kind='delete') AS delete_pending "
+            "FROM (SELECT DISTINCT ON (version) id, version, status, extraction_snapshot, payload "
             "      FROM ingest_runs WHERE kb_id=%s AND version IS NOT NULL ORDER BY version, id DESC) r "
             "JOIN worlds w ON w.kb_id=%s AND w.world_id=r.version "
             "WHERE r.status='failed' AND r.extraction_snapshot->>'interrupted'='true' "
-            "ORDER BY r.version", (_KB_ID, _KB_ID)).fetchall()
+            "ORDER BY r.version", (_KB_ID, _KB_ID, _KB_ID)).fetchall()
     return list(rows)
 
 
@@ -237,10 +309,25 @@ def list_ingest_runs(world=None, limit=50, *, connect_timeout: float | None = No
         return c.execute(q, params).fetchall()
 
 
+def get_run_mark(world, run_id) -> dict | None:
+    """run 1 件の `id` と `status` だけを引く（履歴を読むほどでない「変わったか」の確認用）。無ければ None。"""
+    _ensure()
+    with _connect() as c:
+        return c.execute("SELECT id, status FROM ingest_runs WHERE kb_id=%s AND version=%s AND id=%s",
+                         (_KB_ID, world, run_id)).fetchone()
+
+
+# 書き換え（`op='llm_rewrite'`）の失敗の回は、その書き換えの最中に受け付けた別の依頼があるあいだ「最新の回」の選び方から外す（履歴には残る）。
+# 受け付けた依頼は書き換えの後に動くので、動いている間もその後の結果も、依頼の回を最新として見せる。
+_VISIBLE_RUN = ("NOT (op = 'llm_rewrite' AND EXISTS (SELECT 1 FROM ingest_runs a WHERE a.kb_id = ingest_runs.kb_id "
+                "AND a.version = ingest_runs.version AND a.op IS DISTINCT FROM 'llm_rewrite' AND a.id < ingest_runs.id "
+                "AND a.created_at >= (ingest_runs.extraction_snapshot->>'started_at')::timestamptz))")
+
+
 def get_latest_run_summary(world, *, connect_timeout: float | None = None,
                            statement_timeout_ms: int | None = None) -> dict | None:
     """最新 run（成否問わず）1件の軽量列（`id`/`status`/`extraction_snapshot`/`progress`/`created_at`）だけを引く（`source_doc_ids` を読まない）。
-    `progress` は `status='extracting'` の間だけ値を持つ。
+    `progress` は通常 `status='extracting'` の間だけ値を持つが、強制終了で格下げした run は最後の値を保持する。
     `connect_timeout`/`statement_timeout_ms` は `list_ingest_runs` と同じ方式。
     """
     budget_started = time.monotonic()
@@ -259,7 +346,19 @@ def get_latest_run_summary(world, *, connect_timeout: float | None = None,
             c.execute(f"SET LOCAL statement_timeout = '{remaining_ms}ms'")
         return c.execute(
             "SELECT id, status, extraction_snapshot, progress, created_at FROM ingest_runs "
-            "WHERE kb_id=%s AND version=%s ORDER BY id DESC LIMIT 1",
+            f"WHERE kb_id=%s AND version=%s AND {_VISIBLE_RUN} ORDER BY id DESC LIMIT 1",
+            (_KB_ID, world)).fetchone()
+
+
+def get_latest_ingest_metrics(world) -> dict | None:
+    """最新 run の段別時刻・計数と進捗だけを、状態確認用に軽量に読む。"""
+    _ensure()
+    with _connect() as c:
+        return c.execute(
+            "SELECT id, status, progress, created_at, "
+            "  extraction_snapshot->'stage_timings' AS stage_timings, "
+            "  extraction_snapshot->'counts' AS counts "
+            f"FROM ingest_runs WHERE kb_id=%s AND version=%s AND {_VISIBLE_RUN} ORDER BY id DESC LIMIT 1",
             (_KB_ID, world)).fetchone()
 
 
@@ -275,7 +374,7 @@ def get_latest_run_status(world, flags_limit: int) -> dict | None:
     with _connect() as c:
         row = c.execute(
             "WITH r AS (SELECT id, status, progress, extraction_snapshot AS es FROM ingest_runs "
-            "           WHERE kb_id=%s AND version=%s ORDER BY id DESC LIMIT 1), "
+            f"           WHERE kb_id=%s AND version=%s AND {_VISIBLE_RUN} ORDER BY id DESC LIMIT 1), "
             "fl AS (SELECT f, o FROM r, jsonb_array_elements(CASE WHEN jsonb_typeof(r.es->'flags')='array' "
             "                 THEN r.es->'flags' ELSE '[]'::jsonb END) WITH ORDINALITY AS t(f, o)) "
             "SELECT r.id, r.status, r.progress, "
@@ -307,6 +406,78 @@ def get_latest_run_status(world, flags_limit: int) -> dict | None:
                             "md_failed_many": int(md_many) if md_many == int(md_many) else float(md_many)}}
 
 
+def get_latest_terminal_run_failure(world, flags_limit: int) -> dict | None:
+    """実行中・待機中を除く最新 run の `id`/`status`/`flags_head` を引く。`flags_head` は `status='failed'` のときだけ、注意・停止の flag（`action` が `warn`/`blocked`）の先頭 `flags_limit` 件（それ以外は空）。
+    次の取り込みが走っている間も、直前の失敗の理由を出し続けるための読み取り。`flags` 全件は Python へ持ち込まない。
+    """
+    _ensure()
+    with _connect() as c:
+        row = c.execute(
+            "WITH r AS (SELECT id, status, extraction_snapshot->'flags' AS fl FROM ingest_runs "
+            f"           WHERE kb_id=%s AND version=%s AND status NOT IN ('queued','extracting') AND {_VISIBLE_RUN} "
+            "           ORDER BY id DESC LIMIT 1) "
+            "SELECT r.id, r.status, CASE WHEN r.status='failed' THEN "
+            "  (SELECT COALESCE(jsonb_agg(s.f ORDER BY s.o), '[]'::jsonb) FROM ("
+            "     SELECT f, o FROM jsonb_array_elements(CASE WHEN jsonb_typeof(r.fl)='array' "
+            "                        THEN r.fl ELSE '[]'::jsonb END) WITH ORDINALITY AS t(f, o) "
+            "     WHERE f->>'action' IN ('warn','blocked') ORDER BY o LIMIT %s) s) "
+            "  ELSE '[]'::jsonb END AS flags_head FROM r", (_KB_ID, world, flags_limit)).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "status": row["status"], "flags_head": row["flags_head"]}
+
+
+def get_latest_run_progress(world, *, connect_timeout: float | None = None,
+                            statement_timeout_ms: int | None = None) -> dict | None:
+    """最新 run（成否問わず）1件の `status`/`progress`/`created_at` だけを引く（状態コマンド専用・`extraction_snapshot` と `source_doc_ids` を読まない）。
+    `connect_timeout`/`statement_timeout_ms` は `get_latest_completed_run_at` と同じ方式。
+    """
+    _ensure_unless_bounded(connect_timeout, statement_timeout_ms)
+    with _connect_bounded(connect_timeout, statement_timeout_ms) as c:
+        return c.execute(
+            "SELECT status, progress, created_at FROM ingest_runs "
+            f"WHERE kb_id=%s AND version=%s AND {_VISIBLE_RUN} ORDER BY id DESC LIMIT 1", (_KB_ID, world)).fetchone()
+
+
+def get_last_finished_run_brief(world, classified_reasons=(), classified_prefixes=(), *,
+                                connect_timeout: float | None = None,
+                                statement_timeout_ms: int | None = None) -> dict | None:
+    """実行中・待機中を除く最新 run の `status`/`created_at` と、失敗の理由の判定に要る値だけを引く（状態コマンド専用）。
+    `status='failed'` のときだけ `snapshot` を持つ（`stop_reason`/`interrupted`/`flags`）。`flags` は全件を走査したうえで、`classified_reasons`（完全一致）か `classified_prefixes`（前方一致）に当たる最初の reason、無ければ最初の reason を1つだけ `{"reason": …}` で返す（reason が無ければ空）。
+    スナップショットがオブジェクトでなければ `snapshot` は None、`flags` が配列でなければ `snapshot` に `flags` キーを持たない。数万件の flags と `source_doc_ids` は Python へ持ち込まない。
+    """
+    _ensure_unless_bounded(connect_timeout, statement_timeout_ms)
+    with _connect_bounded(connect_timeout, statement_timeout_ms) as c:
+        row = c.execute(
+            "WITH r AS (SELECT status, created_at, "
+            "  CASE WHEN status='failed' AND jsonb_typeof(extraction_snapshot)='object' "
+            "       THEN extraction_snapshot END AS es "
+            f"  FROM ingest_runs WHERE kb_id=%s AND version=%s AND status NOT IN ('queued','extracting') AND {_VISIBLE_RUN} "
+            "  ORDER BY id DESC LIMIT 1), "
+            "fl AS (SELECT t.f->>'reason' AS reason, t.o FROM r, "
+            "  jsonb_array_elements(CASE WHEN jsonb_typeof(r.es->'flags')='array' "
+            "                       THEN r.es->'flags' ELSE '[]'::jsonb END) WITH ORDINALITY AS t(f, o) "
+            "  WHERE jsonb_typeof(t.f)='object' AND jsonb_typeof(t.f->'reason')='string') "
+            "SELECT r.status, r.created_at, r.es IS NOT NULL AS has_snapshot, "
+            "  r.es->'stop_reason' AS stop_reason, r.es->'interrupted' AS interrupted, "
+            "  COALESCE(jsonb_typeof(r.es->'flags')='array', false) AS has_flags, "
+            "  (SELECT reason FROM fl WHERE reason = ANY(%s::text[]) "
+            "     OR EXISTS (SELECT 1 FROM unnest(%s::text[]) AS p WHERE starts_with(fl.reason, p)) "
+            "   ORDER BY o LIMIT 1) AS classified_reason, "
+            "  (SELECT reason FROM fl ORDER BY o LIMIT 1) AS first_reason "
+            "FROM r",
+            (_KB_ID, world, list(classified_reasons), list(classified_prefixes))).fetchone()
+    if row is None:
+        return None
+    snapshot = None
+    if row["has_snapshot"]:
+        snapshot = {"stop_reason": row["stop_reason"], "interrupted": row["interrupted"]}
+        if row["has_flags"]:
+            reason = row["classified_reason"] if row["classified_reason"] is not None else row["first_reason"]
+            snapshot["flags"] = [] if reason is None else [{"reason": reason}]
+    return {"status": row["status"], "created_at": row["created_at"], "snapshot": snapshot}
+
+
 def get_latest_published_run_summary(world) -> dict | None:
     """最新の反映済み（`published_at IS NOT NULL`）run 1件の `published_snapshot` の `nodes`/`edges` と `created_at`。graph（Neo4j）件数専用で、ES は `get_latest_es_run_summary` を使う。
     直近の run が失敗していても Neo4j は直前の成功時点のままなので、これが現在の Neo4j の内容に最も近い。ES 段に触れていない run も拾いうるため ES 件数には流用しない。
@@ -323,6 +494,21 @@ def get_latest_published_run_summary(world) -> dict | None:
         return None
     return {"published_snapshot": {k: row[k] for k in ("nodes", "edges") if row[k] is not None},
             "created_at": row["created_at"]}
+
+
+def get_latest_completed_run_at(world, *, connect_timeout: float | None = None,
+                                statement_timeout_ms: int | None = None):
+    """正常終了（`auto_published`/`auto_published_with_flags`）で反映した最新 run の `published_at`。無ければ None。
+    `connect_timeout`/`statement_timeout_ms` を渡すと、プールを使わない専用接続で読み、サーバー側の `statement_timeout` で打ち切る。
+    """
+    _ensure_unless_bounded(connect_timeout, statement_timeout_ms)
+    with _connect_bounded(connect_timeout, statement_timeout_ms) as c:
+        row = c.execute(
+            "SELECT published_at FROM ingest_runs "
+            "WHERE kb_id=%s AND version=%s AND status IN ('auto_published','auto_published_with_flags') "
+            "AND published_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (_KB_ID, world)).fetchone()
+    return row["published_at"] if row else None
 
 
 def get_latest_es_run_summary(world) -> dict | None:
@@ -372,6 +558,7 @@ def enqueue_ingest_run(world, op, payload, fingerprint, app_version, *, keys=(),
     keys = list(dict.fromkeys([world, *keys]))
     with _connect() as c:
         c.execute("SELECT pg_advisory_xact_lock(%s)", (_ENQUEUE_LOCK_KEY,))
+        close_dead_extracting(world, c, keys=keys)   # 持ち主の居ない回に合流して、依頼が空振りしないようにする
         existing = c.execute(
             "SELECT id, version, status, COALESCE(op, extraction_snapshot->>'op') AS op, fingerprint "
             "FROM ingest_runs WHERE kb_id=%s AND status IN ('queued','extracting') "
@@ -390,20 +577,48 @@ def enqueue_ingest_run(world, op, payload, fingerprint, app_version, *, keys=(),
         return "created", row
 
 
-def claim_queued_run(worker_id, app_version) -> dict | None:
-    """自分と同じ版の依頼を古い順に 1 件 `extracting` へ進めて返す（`FOR UPDATE SKIP LOCKED`・無ければ None）。
-    操作名は `extraction_snapshot.op` にも残す（中断した run を起動時に再開してよいかの判定が読む）。
-    """
+def has_ocr_catchup_run(world, observation: str) -> bool:
+    """この観測の世代 `observation` について、最新の成功した登録・参照先の変更より後に反映を予約した run が（状態を問わず）あるか。"""
     _ensure()
     with _connect() as c:
-        return c.execute(
-            "UPDATE ingest_runs SET status='extracting', claimed_by=%s, "
-            "  extraction_snapshot=COALESCE(extraction_snapshot, '{}'::jsonb) || jsonb_build_object('op', op) "
-            "WHERE id = (SELECT id FROM ingest_runs WHERE kb_id=%s AND status='queued' "
-            "              AND app_version IS NOT DISTINCT FROM %s "
-            "            ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) "
-            "RETURNING id, version, op, payload, created_by",
-            (worker_id, _KB_ID, app_version)).fetchone()
+        row = c.execute(
+            "SELECT 1 FROM ingest_runs r WHERE r.kb_id=%s AND r.version=%s AND r.payload->>'ocr_catchup'=%s "
+            "AND r.id > COALESCE((SELECT max(b.id) FROM ingest_runs b WHERE b.kb_id=%s AND b.version=%s "
+            "  AND COALESCE(b.op, b.extraction_snapshot->>'op') IN ('register','rebind') "
+            "  AND b.status IN ('auto_published','auto_published_with_flags')), 0) LIMIT 1",
+            (_KB_ID, world, observation, _KB_ID, world)).fetchone()
+    return row is not None
+
+
+def claim_queued_run(worker_id, app_version) -> ClaimedRun | None:
+    """自分と同じ版の依頼を古い順に 1 件 `extracting` へ進め、その回の lock と入れ替えの行を付けて返す（無ければ None）。
+    ① 専用の接続（プール禁止）で `FOR UPDATE SKIP LOCKED` ② 回の lock（`RUN_NS`, id）③ `extracting` へ更新 ④ 行を作る（あれば受け継ぐ）を 1 トランザクションで行う。
+    操作名は `extraction_snapshot.op` にも残す（中断した run を起動時に再開してよいかの判定が読む）。接続を閉じるまで lock を持つ。
+    """
+    conn = open_claim_connection()
+    run = None
+    try:
+        with conn.transaction():
+            picked = conn.execute(
+                "SELECT id FROM ingest_runs WHERE kb_id=%s AND status='queued' "
+                "AND app_version IS NOT DISTINCT FROM %s ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1",
+                (_KB_ID, app_version)).fetchone()
+            if picked is not None:
+                conn.execute("SELECT pg_advisory_lock(%s, %s)", (RUN_NS, picked["id"]))
+                run = conn.execute(
+                    "UPDATE ingest_runs SET status='extracting', claimed_by=%s, "
+                    "  extraction_snapshot=COALESCE(extraction_snapshot, '{}'::jsonb) || jsonb_build_object('op', op) "
+                    "WHERE id=%s RETURNING id, version, op, payload, created_by",
+                    (worker_id, picked["id"])).fetchone()
+                claim_row(conn, run["version"], run["id"], run["op"],
+                          doc=(run["payload"] or {}).get("rel", "") if run["op"] == "reconvert" else "")
+    except BaseException:
+        conn.close()
+        raise
+    if run is None:
+        conn.close()
+        return None
+    return ClaimedRun(run, conn)
 
 
 def restamp_queued_runs(app_version) -> list:

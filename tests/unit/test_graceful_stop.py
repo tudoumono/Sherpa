@@ -17,6 +17,7 @@ import pytest
 from sherpa import corpus_docs, es_index, reconcile, store, webhooks, worlds
 from sherpa.ingest import background, ingest_worker, office_md, resume, world_neo4j, worker
 from sherpa.store import workers as store_workers
+from tests._replace_row import use_offline_rows, offline_row
 
 
 @pytest.fixture(autouse=True)
@@ -77,7 +78,7 @@ def test_stop_request_finishes_current_file_then_stops_without_publishing(monkey
 
     monkeypatch.setattr(office_md, "_convert_with_arms", counting)
     with _as_background_run(), pytest.raises(background.StopRequested):
-        office_md.build_derived(source, dmd, world_sig="s1")
+        office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
 
     assert calls == ["a.xlsx", "b.xlsx"]                       # c へは進まない
     cache = office_md._conv_cache_root_for(dmd)
@@ -89,13 +90,13 @@ def test_stop_request_finishes_current_file_then_stops_without_publishing(monkey
     # 再開: 済んだ a・b はキャッシュから取れ、c だけ変換する。通しでやった場合と派生物が同じ
     background._stop_event.clear()
     calls.clear()
-    office_md.build_derived(source, dmd, world_sig="s1")
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     assert calls == ["c.xlsx"]
     resumed = _snapshot("stop-w")
 
     ref = _make_source(tmp_path, monkeypatch, "stop-ref", names)
     monkeypatch.setattr(office_md, "_convert_with_arms", orig)
-    office_md.build_derived(ref, worlds.derived_md_dir("stop-ref"), world_sig="s1")
+    office_md.build_derived(ref, worlds.derived_md_dir("stop-ref"), world_sig="s1", row=offline_row("w"))
     full = {k.replace("stop-ref", "stop-w"): v for k, v in _snapshot("stop-ref").items()}
     assert resumed == full
 
@@ -103,12 +104,13 @@ def test_stop_request_finishes_current_file_then_stops_without_publishing(monkey
 def test_stop_request_is_ignored_outside_background_runs(monkeypatch, tmp_path):
     source = _make_source(tmp_path, monkeypatch, "stop-direct", ["a.xlsx"])
     background.request_stop()
-    rep = office_md.build_derived(source, worlds.derived_md_dir("stop-direct"), world_sig="s1")
+    rep = office_md.build_derived(source, worlds.derived_md_dir("stop-direct"), world_sig="s1", row=offline_row("w"))
     assert rep.get("error") is None and rep["converted"] == 1
 
 
 @pytest.fixture
 def _stub_pipeline(monkeypatch):
+    use_offline_rows(monkeypatch)
     monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig", {"a": [1, 2, 3]}))
     monkeypatch.setattr(worker, "build_world_graph", lambda world: ([], [], []))
     monkeypatch.setattr(worker, "_ledger_rows", lambda world, *, sig: [])
@@ -119,7 +121,9 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
     monkeypatch.setattr(corpus_docs, "scan_report", lambda world, expected_rels=None: {"document_count": 0})
     monkeypatch.setattr(store, "set_scan_report", lambda world, report: None)
-    monkeypatch.setattr(store, "replace_documents", lambda world, rows: 0)
+    monkeypatch.setattr(store, "replace_documents", lambda world, rows, **_kw: 0)
+    monkeypatch.setattr(store, "stage_ledger", lambda w, rows, names, **_kw: len(rows))
+    monkeypatch.setattr(store, "switch_ledger", lambda w, **_kw: None)
     monkeypatch.setattr(store, "update_ingest_run_progress", lambda run_id, progress: None)
     monkeypatch.setattr(store, "downgrade_orphaned_extracting_runs", lambda world=None: [])
     monkeypatch.setattr(store, "start_ingest_run", lambda world, **kw: {"id": 1})
@@ -194,6 +198,32 @@ def test_resume_starts_one_sync_per_interrupted_world(monkeypatch):
 
     assert resume.resume_interrupted() == ["w1", "w3"]
     assert started == [("w1", "refresh"), ("w3", "refresh")]
+
+
+def test_resume_requeues_an_interrupted_delete_only_while_its_delete_row_remains(monkeypatch):
+    """中断した削除は、消す仕事の行が残っているときだけ削除を積み直す（元の依頼の引数を引き継ぐ）。行が無い古い中断は再開しない。"""
+    monkeypatch.setattr(store, "list_worlds_with_interrupted_latest_run", lambda: [
+        {"world_id": "w1", "run_id": 5, "op": "delete", "delete_pending": True, "payload": {"uid": "u1"}},
+        {"world_id": "w2", "run_id": 6, "op": "delete", "delete_pending": False, "payload": {"uid": "u2"}}])
+    started = []
+    monkeypatch.setattr(background, "submit",
+                        lambda wid, op, fp, payload=None, **kw: started.append((wid, op, fp, payload)) or (1, False))
+
+    assert resume.resume_interrupted() == ["w1"]
+    assert started == [("w1", "delete", "{}", {"uid": "u1"})]
+
+
+@pytest.mark.parametrize("op", ["register", "sync", "rerun", "refresh"])
+def test_resume_of_an_interrupted_non_delete_run_queues_a_refresh(monkeypatch, op):
+    """中断した register・sync・rerun も、積むのは payload の要らない refresh（元の操作のまま積まない）。"""
+    monkeypatch.setattr(store, "list_worlds_with_interrupted_latest_run", lambda: [
+        {"world_id": "w1", "run_id": 5, "op": op, "delete_pending": False, "payload": {"path": "/x"}}])
+    started = []
+    monkeypatch.setattr(background, "submit",
+                        lambda wid, o, fp, payload=None, **kw: started.append((wid, o, payload)) or (1, False))
+
+    assert resume.resume_interrupted() == ["w1"]
+    assert started == [("w1", "refresh", None)]
 
 
 def test_resume_disabled_by_env(monkeypatch):

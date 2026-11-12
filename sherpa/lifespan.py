@@ -2,10 +2,11 @@
 
 起動時の順序（各処理の実体は `sherpa.api` 側）:
 ① ログ設定（`log_setup.configure_logging()`・request_id filter の再適用） ② スキーマ初期化 ③ 0.18.x の Web アプリがプロセス内で動かしていた取り込み run（ワーカーに拾われていない extracting）の中断への格下げと、前の版が積んだ queued の依頼の版の付け替え
-④ 監査 writer・Codex ジョブワーカーの起動 ⑤ env の初回シード ⑥ 起動検査（`_warn_*`・`CHANGE_ME` と既定 admin パスワードの検査は
+③' 実行中のまま残ったチャットの回収（中断にして、会話に途中までの記録と注記を残す）
+④ 監査 writer・配送待ちの送り手・Codex ジョブワーカーの起動 ⑤ env の初回シード ⑥ 起動検査（`_warn_*`・`CHANGE_ME` と既定 admin パスワードの検査は
 auth bootstrap より前に置く） ⑦ auth bootstrap・孤児 reconcile・TTL sweep（起動時 1 回＋定期）・`turn_metrics` 補完・Web アプリの心拍。
 取り込みはこのプロセスでは動かさない（取り込みワーカー `ingest.ingest_worker` が依頼を拾う）。中断した取り込みの再開もワーカーが行う。
-shutdown では新規の依頼の受付を止め（取り込みを持たないのですぐ終わる）、writer・ワーカー・PG プール・Neo4j driver をクローズする。
+shutdown では最初に実行中のチャットへ停止を求めて保存し（終わらないものは中断として記録）、新規の依頼の受付を止め（取り込みを持たないのですぐ終わる）、writer・ワーカー・PG プール・Neo4j driver をクローズする。
 循環 import を避けるため `sherpa.api` の参照は lifespan 実行時の遅延 import にする。
 設計: docs/design/operations.md「起動・停止・状態」
 """
@@ -16,9 +17,51 @@ import os
 import threading
 from contextlib import asynccontextmanager
 
-from sherpa import codex_jobs_worker, ext_api, log_setup, store
+from sherpa import codex_jobs_worker, ext_api, log_setup, outbox_sender, proxy_bypass, store, webhooks
+from sherpa.ext import AUDIT_OUTBOX_KIND
 
 _log = logging.getLogger("sherpa")
+
+
+def _reconcile_ingest_runs() -> None:
+    # ワーカーに拾われていない `status='extracting'` の run は、0.18.x の Web アプリがプロセス内で動かしていて強制死で残った孤児。
+    # failed（中断）へ格下げする。ワーカーが拾った run（claimed_by あり）はワーカーが生死を見て扱う
+    try:
+        downgraded = store.downgrade_orphaned_extracting_runs(legacy_only=True)
+        if downgraded:
+            _log.warning("起動時に中断された取り込み run を検知し failed へ格下げしました: ids=%s", downgraded)
+    except Exception as e:
+        _log.warning("起動時の孤児 run 格下げに失敗しました（DB 不達の可能性）: %s", e)
+    # 前の版の Web アプリが積んだまま拾われていない依頼（queued）の版を、この Web アプリの版に付け替える（同じ版のワーカーだけが拾うため、残すと誰も拾わず資料フォルダを塞ぐ）
+    try:
+        from sherpa import app_version
+        restamped = store.restamp_queued_runs(app_version.current())
+        if restamped:
+            _log.info("前の版が積んだ取り込みの依頼を、この版へ付け替えました: ids=%s", restamped)
+    except Exception as e:
+        _log.warning("取り込みの依頼の版の付け替えに失敗しました（DB 不達の可能性）: %s", e)
+
+
+def _recover_chats() -> None:
+    """前のプロセスが消えて「実行中」のまま残ったチャットを中断にし、会話に途中までの記録と注記を残す（単一 worker＝起動時に実行中のターンは無い）。"""
+    try:
+        from sherpa import chat_run_journal
+        recovered = chat_run_journal.recover_unfinished()
+        if recovered:
+            _log.warning("起動時に中断されたチャットを回収しました: turn_ids=%s", recovered)
+    except Exception as e:
+        _log.warning("起動時の中断チャットの回収に失敗しました（DB 不達の可能性）: %s", e)
+
+
+def _shutdown_chats() -> None:
+    """実行中のチャットに停止を求め、保存を待つ。終わらないものは中断として記録する（DB を閉じる前に呼ぶ）。"""
+    try:
+        from sherpa import chat_turns
+        interrupted = chat_turns.shutdown_turns()
+        if interrupted:
+            _log.warning("停止時に終わらなかったチャットを中断として記録しました: turn_ids=%s", interrupted)
+    except Exception as e:
+        _log.warning("実行中チャットの停止処理に失敗しました（best-effort）: %s", e)
 
 
 @asynccontextmanager
@@ -40,26 +83,18 @@ async def lifespan(app):
         store.init_schema()
     except Exception as e:
         _log.warning("起動時のスキーマ初期化に失敗しました（DB 不達の可能性・lazy 初期化にフォールバックします）: %s", e)
-    # ワーカーに拾われていない `status='extracting'` の run は、0.18.x の Web アプリがプロセス内で動かしていて強制死で残った孤児。
-    # failed（中断）へ格下げする。ワーカーが拾った run（claimed_by あり）はワーカーが生死を見て扱う
-    try:
-        downgraded = store.downgrade_orphaned_extracting_runs(legacy_only=True)
-        if downgraded:
-            _log.warning("起動時に中断された取り込み run を検知し failed へ格下げしました: ids=%s", downgraded)
-    except Exception as e:
-        _log.warning("起動時の孤児 run 格下げに失敗しました（DB 不達の可能性）: %s", e)
-    # 前の版の Web アプリが積んだまま拾われていない依頼（queued）の版を、この Web アプリの版に付け替える（同じ版のワーカーだけが拾うため、残すと誰も拾わず資料フォルダを塞ぐ）
-    try:
-        from sherpa import app_version
-        restamped = store.restamp_queued_runs(app_version.current())
-        if restamped:
-            _log.info("前の版が積んだ取り込みの依頼を、この版へ付け替えました: ids=%s", restamped)
-    except Exception as e:
-        _log.warning("取り込みの依頼の版の付け替えに失敗しました（DB 不達の可能性）: %s", e)
+    proxy_bypass.apply()
+    _reconcile_ingest_runs()
+    _recover_chats()
     # /ext/v1 監査書込み専用 writer スレッド。起動に失敗しても起動処理は止めず ERROR ログを残す（writer は自己回復する）
     if not ext_api._audit_writer.start():
         _log.error("ext_api audit writer の起動に失敗しました（旧世代のスレッドがまだ停止して"
                   "いない可能性）。旧世代の終了後、次回の submit()/start() で自己回復します。")
+    # 配送待ち（Webhook 通知・書けなかった外部 API 監査）の送り手。取り込みワーカーが終わった後の分もここが引き継ぐ。失敗しても起動は止めない
+    try:
+        outbox_sender.start({"webhook": webhooks.KIND, "ext_audit": AUDIT_OUTBOX_KIND})
+    except Exception as e:
+        _log.warning("配送待ちの送り手の起動に失敗しました（起動は続行します）: %s", e)
     # Codex ジョブの背景ディスパッチャ（前回 `running` のジョブは failed(interrupted) へ回収してから開始）。失敗しても起動は止めない
     try:
         codex_jobs_worker.start()
@@ -70,12 +105,12 @@ async def lifespan(app):
         from sherpa import api, model_catalog
         api._seed_settings_from_env()
         api._seed_ollama_url_from_env()  # OLLAMA_URL は独立マーカーで一度だけシード
-        api._warn_central_ollama_not_allowed()
         api._seed_openai_endpoint_from_env()
         api._seed_depth_profile_from_env()
         api._seed_screen_settings_from_env()
         api._seed_user_agent_from_env()
         api._seed_vlm_ollama_url_from_env()  # _seed_ollama_url_from_env の後
+        proxy_bypass.apply()  # シードで入った Ollama の接続先を例外へ足す
         model_catalog.seed_catalog_once()
         api._purge_personal_keys_if_disabled_on_startup()
         api._warn_change_me_placeholders()
@@ -98,6 +133,7 @@ async def lifespan(app):
         yield
     finally:
         _maintenance_stop.set()
+        _shutdown_chats()
         # 新規の依頼の受付を止める（積み済みの依頼は取り込みワーカーが続ける）
         try:
             from sherpa.ingest import background, worker_state
@@ -106,6 +142,7 @@ async def lifespan(app):
         except Exception as e:
             _log.warning("取り込み依頼の受付停止に失敗しました（best-effort）: %s", e)
         ext_api._audit_writer.stop()  # 新規受付を止め、既存 queue を回収してから終了する
+        outbox_sender.stop()
         try:
             codex_jobs_worker.stop()  # 新規 claim を止める（実行中ジョブは daemon のまま）
         except Exception as e:

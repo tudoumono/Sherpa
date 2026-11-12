@@ -17,9 +17,10 @@ import contextlib
 import pytest
 
 from _run_status_view import status_view
-from sherpa import corpus_docs, es_index, reconcile, store
+from sherpa import corpus_docs, es_index, reconcile, store, text_encoding
 from sherpa.ingest import resolve_settings, world_neo4j, worker
 from sherpa.routers import worlds as worlds_router
+from tests._replace_row import use_offline_rows
 
 
 # ===================================================================================
@@ -85,6 +86,7 @@ def _stub_pipeline(monkeypatch):
     `store.set_world_sig` を実際に検証したいので**差し替えず呼び出しを記録するだけ**にする
     （他の DB/Neo4j/ES 呼び出しは従来どおりスタブして DB 不要を保つ）。
     """
+    use_offline_rows(monkeypatch)
     monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig", {"a": [1, 2, 3]}))
     monkeypatch.setattr(resolve_settings, "load", lambda world: resolve_settings.empty())   # 設定の読み込みは DB（get_world）を使う
     monkeypatch.setattr(worker, "build_world_graph", lambda world: ([], [], []))
@@ -93,7 +95,7 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(worker, "_ledger_rows", lambda world, *, sig: [])
     monkeypatch.setattr(worker, "world_signature", lambda world: "sig")
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None: (0, 0))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None, **_kw: (0, 0))
     monkeypatch.setattr(es_index, "index_world",
                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 0, "chunks": 0})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
@@ -102,9 +104,11 @@ def _stub_pipeline(monkeypatch):
     def _noop_lock(world_id):
         yield
     monkeypatch.setattr(store, "world_lock", _noop_lock)
-    monkeypatch.setattr(store, "replace_documents", lambda world, rows: 0)
+    monkeypatch.setattr(store, "stage_ledger", lambda world, rows, names, **_kw: len(rows))
+    monkeypatch.setattr(store, "switch_ledger", lambda world, **_kw: None)
     monkeypatch.setattr(store, "downgrade_orphaned_extracting_runs", lambda world=None: [])
     monkeypatch.setattr(store, "update_ingest_run_progress", lambda run_id, progress: None)
+    monkeypatch.setattr(store, "update_ingest_run_snapshot", lambda run_id, snapshot: None)
     monkeypatch.setattr(store, "start_ingest_run",
                         lambda world, **kw: {"id": 1, "version": world, "status": "extracting"})
     monkeypatch.setattr(store, "finish_ingest_run", lambda run_id, **kw: {"id": run_id, **kw})
@@ -119,7 +123,7 @@ def _stub_pipeline(monkeypatch):
     # 新しい関数呼び出しから集める。
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None, drop=None):
         if sig is not None:
             calls["set_world_sig"].append({"world": world, "sig": sig, "doc_count": doc_count,
                                            "scan_report": scan_report})
@@ -136,7 +140,7 @@ def test_run_locked_success_folds_scan_report_into_sig_confirm(monkeypatch, _stu
     assert _stub_pipeline["scan_report"] == ["w"]
     confirm_calls = [c for c in _stub_pipeline["set_world_sig"] if c["sig"] == "sig"]
     assert len(confirm_calls) == 1
-    assert confirm_calls[0]["scan_report"] == {"indexed": 5}
+    assert confirm_calls[0]["scan_report"] == {"indexed": 5, "encoding_detect_version": text_encoding.DETECT_VERSION}
 
 
 def test_run_locked_failure_before_success_does_not_compute_scan_report(monkeypatch, _stub_pipeline):
@@ -149,16 +153,16 @@ def test_run_locked_failure_before_success_does_not_compute_scan_report(monkeypa
 
 
 def test_run_locked_scan_report_computation_failure_confirms_sig_without_report(monkeypatch, _stub_pipeline):
-    """`corpus_docs.scan_report()` 自体が失敗しても、取り込み結果（成功）や sig 確定は変えない
-    （best-effort・`scan_report=None` のまま `set_world_sig` を呼ぶ＝該当列は更新されず前回値が残る）。"""
-    def _boom(world):
+    """`corpus_docs.scan_report()` 自体が失敗しても、取り込み結果（成功）や sig 確定は変えない。
+    集計の中身は無く、読み直しを試した判定の版の印だけを `set_world_sig` に含める（次の更新は全体を取り込み直さない）。"""
+    def _boom(world, expected_rels=None):
         raise RuntimeError("scan failed")
     monkeypatch.setattr(corpus_docs, "scan_report", _boom)
     res = worker.run("w")
     assert res["status"] == "auto_published"
     confirm_calls = [c for c in _stub_pipeline["set_world_sig"] if c["sig"] == "sig"]
     assert len(confirm_calls) == 1
-    assert confirm_calls[0]["scan_report"] is None
+    assert confirm_calls[0]["scan_report"] == {"encoding_detect_version": text_encoding.DETECT_VERSION}
 
 
 def test_run_locked_wires_es_index_progress_to_ingest_run_progress(monkeypatch, _stub_pipeline):
@@ -219,7 +223,7 @@ def test_run_locked_success_records_stage_timings_and_counts(monkeypatch, _stub_
 
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None, drop=None):
         captured["extraction_snapshot"] = extraction_snapshot
         return {"id": run_id, "status": status}
     monkeypatch.setattr(store, "finish_ingest_run_and_confirm_world", _fake_finish_and_confirm)
@@ -239,11 +243,56 @@ def test_run_locked_success_records_stage_timings_and_counts(monkeypatch, _stub_
     # の受入条件は実データで確認する（`tests/integration/test_ingest_p1.py` 側）。ここでは各値が
     # スタブ通りに機械的に転記されることだけを確認する。
     counts = snap["counts"]
+    assert counts["scan_passes"] == 1
     assert counts["scanned"] == 1        # world_state のスタブ manifest={"a": [1,2,3]}
     assert counts["targeted"] == 0       # _ledger_rows のスタブは []
     assert counts["converted"] == 1 and counts["failed"] == 0 and counts["unsupported"] == 0
     assert counts["legacy_converted"] == 0 and counts["legacy_failed"] == 0
     assert counts["es_indexed"] == 0     # index_world のスタブ indexed=0
+
+
+def test_stage_timing_writer_persists_boundaries_and_heartbeats_every_running_stage(monkeypatch):
+    writes = []
+    monkeypatch.setattr(store, "update_ingest_run_snapshot",
+                        lambda run_id, snapshot: writes.append((run_id, snapshot)))
+    writer = worker._StageTimingWriter(9, "w")
+    try:
+        writer.start("scanning")
+        assert len(writes) == 1
+        writer._heartbeat_once()
+        assert len(writes) == 2
+
+        writer.replace_completed(
+            "scanning", started_at="2026-10-24T00:00:00+00:00",
+            finished_at="2026-10-24T00:00:01+00:00", elapsed_ms=1000)
+        assert len(writes) == 3
+        assert writes[-1][1]["stage_timings"]["scanning"]["elapsed_ms"] == 1000
+
+        writer.start("office_md")
+        assert len(writes) == 4
+        boundary = writes[-1][1]["stage_timings"]
+        assert boundary["scanning"]["finished_at"]
+        assert boundary["office_md"]["finished_at"] is None
+        assert boundary["office_md"]["observed_at"]
+
+        writer._heartbeat_once()
+        assert len(writes) == 5
+        assert writes[-1][1]["stage_timings"]["office_md"]["elapsed_ms"] >= 0
+
+        writer.start("graph_build")
+        assert len(writes) == 6
+        writer._heartbeat_once()
+        assert len(writes) == 7
+        running = writes[-1][1]["stage_timings"]["graph_build"]
+        assert running["finished_at"] is None and running["elapsed_ms"] >= 0
+
+        writer.finish()
+        completed = writer.payload()["stage_timings"]["graph_build"]
+        assert completed["finished_at"] and completed["elapsed_ms"] >= 0
+        writer._heartbeat_once()
+        assert len(writes) == 7     # 終えた段は周期の記録を書かない
+    finally:
+        writer.close()
 
 
 def test_counts_summary_folds_scan_report_unreachable_and_sensitive_counts():
@@ -310,7 +359,7 @@ def test_run_locked_sig_confirm_write_failure_propagates(monkeypatch, _stub_pipe
     （`finish_ingest_run_and_confirm_world`）——その書込自体が失敗すれば（PG断等）例外がそのまま
     伝播する（MED-1 と同じ契約：次回 sync が再試行する）。"""
     def _boom(run_id, world, *, status, extraction_snapshot=None, published_snapshot=None,
-             source_doc_ids=None, sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
+             source_doc_ids=None, sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None, drop=None):
         raise RuntimeError("db down")
     monkeypatch.setattr(store, "finish_ingest_run_and_confirm_world", _boom)
     with pytest.raises(RuntimeError, match="db down"):
@@ -436,16 +485,17 @@ def test_ingest_summary_db_failure_propagates_not_zeroes(monkeypatch):
 def test_scan_dir_reports_progress_counts(tmp_path):
     """走査段の件数進捗（2026-09-04・実環境「走査段が無音」対応）: `_scan_dir(progress=...)` が
     `_SCAN_PROGRESS_INTERVAL` 件ごと＋最後に走査済み件数を単調増加で報告する。"""
-    from sherpa.ingest import worker
+    from sherpa.ingest import source_scan
     for i in range(7):
         (tmp_path / f"f{i}.txt").write_text("x", encoding="utf-8")
     calls = []
     monkey_interval = 3
-    orig = worker._SCAN_PROGRESS_INTERVAL
-    worker._SCAN_PROGRESS_INTERVAL = monkey_interval
+    orig = source_scan._SCAN_PROGRESS_INTERVAL
+    source_scan._SCAN_PROGRESS_INTERVAL = monkey_interval
     try:
-        parts = worker._scan_dir(tmp_path, progress=calls.append)
+        parts = source_scan._scan_dir(tmp_path, progress=calls.append)
     finally:
-        worker._SCAN_PROGRESS_INTERVAL = orig
+        source_scan._SCAN_PROGRESS_INTERVAL = orig
     assert len(parts) == 7
     assert calls == [3, 6, 7]
+

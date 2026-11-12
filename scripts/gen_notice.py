@@ -66,6 +66,12 @@ BUNDLED: list[dict] = [
     {"name": "PP-OCRv6_medium_det / _rec (model weights)", "version": "PP-OCRv6", "license": "Apache-2.0",
      "source": "https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_det", "kind": "model",
      "note": "上流宣言を一次情報で確認済み（2026-08-17・HF API/モデルカード。gated=false・利用制限記述なし）。"},
+    {"name": "PP-OCRv6_small_det / _rec (model weights)", "version": "PP-OCRv6", "license": "Apache-2.0",
+     "source": "https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det", "kind": "model",
+     "note": "既定の軽い版。上流のモデルカードの宣言（license: apache-2.0）による。"},
+    {"name": "PP-OCRv5_mobile_det / _rec (model weights)", "version": "PP-OCRv5", "license": "Apache-2.0",
+     "source": "https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_det", "kind": "model",
+     "note": "SHERPA_OCR_MODEL=mobile で使う軽い版。上流のモデルカードの宣言（license: apache-2.0）による。"},
     {"name": "Debian base packages (python:3.12-slim-bookworm)", "version": "bookworm",
      "license": "各パッケージのライセンスに従う（GPL 系を含む）", "copyleft": True, "kind": "container",
      "source": "https://sources.debian.org/",
@@ -75,8 +81,6 @@ BUNDLED: list[dict] = [
      "note": "閉域キットに同梱（--skip-codex で除外可）。同梱の ripgrep 等の来歴は npm パッケージの LICENSE/NOTICE を参照。"},
     {"name": "marked", "version": "13.0.3", "license": "MIT", "kind": "web",
      "source": "https://github.com/markedjs/marked"},
-    {"name": "cytoscape.js", "version": "(vendored)", "license": "MIT", "kind": "web",
-     "source": "https://github.com/cytoscape/cytoscape.js"},
     {"name": "Swagger UI", "version": "5.32.14", "license": "Apache-2.0", "kind": "web",
      "source": "https://github.com/swagger-api/swagger-ui",
      "note": "web/vendor/swagger-ui-bundle.js が同梱する第三者コンポーネント個別ライセンスは"
@@ -150,7 +154,7 @@ def _ollama_models(kit: pathlib.Path) -> list[str]:
 def _render_notice(groups: dict[str, list[dict]]) -> str:
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip().split("+", 1)[0] if (ROOT / "VERSION").exists() else "0.0.0"
     lines = [
-        f"# Sherpa {version} — 第三者ソフトウェアの帰属表示（NOTICE）",
+        f"# Slouch {version} — 第三者ソフトウェアの帰属表示（NOTICE）",
         "",
         "本製品には以下の第三者ソフトウェアが含まれます。各ソフトウェアの著作権は各権利者に帰属し、",
         "それぞれのライセンス条件に従って利用・再配布されます。ライセンス全文は同梱の",
@@ -189,7 +193,7 @@ def _render_notice(groups: dict[str, list[dict]]) -> str:
 
 
 def _render_license_texts(groups: dict[str, list[dict]]) -> str:
-    parts = ["Sherpa — 第三者ソフトウェアのライセンス全文",
+    parts = ["Slouch — 第三者ソフトウェアのライセンス全文",
              "=" * 60,
              "本ファイルは scripts/gen_notice.py が生成します（手で編集しない）。",
              "Python 依存については、各配布物（wheel）が同梱するライセンス全文をそのまま連結しています。",

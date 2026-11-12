@@ -16,6 +16,7 @@ from pypdf import PdfWriter
 
 from sherpa import json_io
 from sherpa.ingest import office_md
+from tests._replace_row import offline_row
 
 _DOCX_XML = """<?xml version="1.0"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -214,10 +215,10 @@ def test_build_derived_pdf_buckets(tmp_path, pdf_stub):
     src, der = _dirs(tmp_path)
     _blank_pdf(src / "doc.pdf")
     pdf_stub(None)
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["unsupported"] == 1 and rep["converted"] == 0
     pdf_stub("pypdf", ["税率10%の説明"])
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["converted"] == 1 and rep["unsupported"] == 0
     assert "税率10%" in (der / "doc.pdf.md").read_text(encoding="utf-8")
 
@@ -229,7 +230,7 @@ def test_build_derived_reports_actual_candidate_progress(tmp_path, pdf_stub):
     (src / "broken.docx").write_bytes(b"not a zip")
     pdf_stub(None)
     observed: list[tuple[int, int]] = []
-    office_md.build_derived(src, der, progress=lambda processed, total: observed.append((processed, total)))
+    office_md.build_derived(src, der, progress=lambda processed, total: observed.append((processed, total)), row=offline_row("w"))
     assert observed[0] == (0, 2) and observed[-1] == (2, 2)
     assert [processed for processed, _total in observed] == [0, 1, 2]
 
@@ -243,7 +244,7 @@ def test_sensitive_docx_name_has_no_derived_and_never_flags_drift_or_missing(tmp
     src, der = _dirs(tmp_path)
     _zip(src / "id_rsa.docx", {"word/document.xml": _DOCX_XML})
     _zip(src / "normal.docx", {"word/document.xml": _DOCX_XML})
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["converted"] == 1                       # normal.docx のみ
     assert not (der / "id_rsa.docx.md").exists() and (der / "normal.docx.md").exists()
     assert "タイトル見出し" in (der / "normal.docx.md").read_text(encoding="utf-8")
@@ -252,7 +253,7 @@ def test_sensitive_docx_name_has_no_derived_and_never_flags_drift_or_missing(tmp
     for _ in range(2):
         assert office_md.rag_sidecars_missing(src, der) is False
         assert office_md.human_md_sig_drift(src, der) is False
-        office_md.build_derived(src, der)
+        office_md.build_derived(src, der, row=offline_row("w"))
 
 
 def test_refresh_evidence_ir_skips_sensitive_original_name(tmp_path, pdf_stub):
@@ -263,7 +264,7 @@ def test_refresh_evidence_ir_skips_sensitive_original_name(tmp_path, pdf_stub):
     _blank_pdf(src / "id_rsa.pdf")
     _blank_pdf(src / "note.pdf")
     pdf_stub("pypdf", ["秘密の本文テキスト"])
-    rep = office_md.refresh_evidence_ir(src, der)
+    rep = office_md.refresh_evidence_ir(src, der, row=offline_row("w"))
     assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
     assert rep["evidence_ir_generated"] == 1 and rep["rag_generated"] == 1     # note.pdf のみ
     for p in ("ir/id_rsa.pdf.evidence.json", "rag/id_rsa.pdf.rag.md", "ir/id_rsa.pdf.derived.json"):
@@ -277,14 +278,14 @@ def test_refresh_rag_skips_sensitive_original_with_stale_evidence_json(tmp_path)
     src, der = _dirs(tmp_path)
     _zip(src / "id_rsa.docx", {"word/document.xml": _DOCX_XML})
     _zip(src / "normal.docx", {"word/document.xml": _DOCX_XML})
-    office_md.build_derived(src, der)
+    office_md.build_derived(src, der, row=offline_row("w"))
     ir_dir, rag_dir = der.parent / "ir", der.parent / "rag"
     assert not (ir_dir / "id_rsa.docx.evidence.json").exists()
     shutil.copyfile(ir_dir / "normal.docx.evidence.json", ir_dir / "id_rsa.docx.evidence.json")
     shutil.copyfile(rag_dir / "normal.docx.rag.md", rag_dir / "id_rsa.docx.rag.md")
     shutil.copyfile(rag_dir / "normal.docx.rag_chunks.jsonl", rag_dir / "id_rsa.docx.rag_chunks.jsonl")
 
-    rep = office_md.refresh_rag(src, der)
+    rep = office_md.refresh_rag(src, der, row=offline_row("w"))
     assert rep["rag_failed"] == 0 and rep["rag_generated"] == 1                # normal.docx のみ
     assert not (rag_dir / "id_rsa.docx.rag.md").exists() and not (rag_dir / "id_rsa.docx.rag_chunks.jsonl").exists()
     assert (rag_dir / "normal.docx.rag.md").exists()
@@ -296,7 +297,7 @@ def test_refresh_human_md_skips_sensitive_original_name(tmp_path):
     der.mkdir()
     _xlsx(src / "id_rsa.xlsx", A1="秘密の値")
     _xlsx(src / "a.xlsx", A1="通常の値")
-    rep = office_md.refresh_human_md(src, der)
+    rep = office_md.refresh_human_md(src, der, row=offline_row("w"))
     assert rep["human_md_generated"] == 1 and rep["human_md_failed"] == 0      # a.xlsx のみ
     assert not (der / "id_rsa.xlsx.md").exists() and not (der.parent / "ir" / "id_rsa.xlsx.derived.json").exists()
     assert (der / "a.xlsx.md").exists()
@@ -310,7 +311,7 @@ def test_refresh_document_ir_skips_sensitive_original_name(tmp_path):
     _xlsx(src / "a.xlsx", A1="通常の値")
     (der / "id_rsa.xlsx.md").write_text("stale leftover", encoding="utf-8")
     (der / "a.xlsx.md").write_text("placeholder", encoding="utf-8")
-    rep = office_md.refresh_document_ir(src, der)
+    rep = office_md.refresh_document_ir(src, der, row=offline_row("w"))
     assert rep["document_ir_failed"] == 0 and rep["document_ir_generated"] == 1    # a.xlsx のみ
     assert not (der.parent / "ir" / "id_rsa.xlsx.document.json").exists()
     assert not (der.parent / "ir" / "a.xlsx.document.json").exists()          # 構築できるかを確かめるだけで書かない
@@ -355,7 +356,7 @@ def test_build_derived_broken_docx_notice_is_listed_and_does_not_block_ir_sig(tm
     知らせの文書の失敗は失敗の一覧で管理し、`.document_ir_sig` は刻む（次の更新が全件の作り直しにならない）。"""
     src, der = _dirs(tmp_path)
     (src / "broken.docx").write_bytes(b"not a zip")
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["failed"] == 1 and rep["document_ir_failed"] >= 1
     assert any(f["doc"] == "broken.docx" and f["reason"].startswith("document_ir_failed:")
                for f in rep["document_ir_failures"])
@@ -368,7 +369,7 @@ def test_build_derived_docx_without_body_element_publishes_failed_notice(tmp_pat
     failed notice を発行する（さもないと `{rel}.md` が書かれず文書が台帳・grep から消える）。"""
     src, der = _dirs(tmp_path)
     _zip(src / "nobody.docx", {"word/document.xml": '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:document>'})
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["document_ir_failed"] >= 1
     assert any(f["doc"] == "nobody.docx" and f["reason"] == "document_ir_failed:malformed_structure"
                for f in rep["document_ir_failures"])
@@ -449,7 +450,7 @@ def test_build_derived_input_guard_skips_conversion_with_failed_notice(tmp_path,
     if with_normal:
         _zip(src / "normal.docx", {"word/document.xml": _DOCX_XML})          # 上限未満＝通常どおり変換される
     doc, reason = guard(monkeypatch, src, tmp_path)
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["failed"] == 1
     assert {"doc": doc, "reason": reason} in rep["conversion_failures"]
     _notice_meta(der, doc, reason)
@@ -461,7 +462,7 @@ def test_build_derived_xlsx_within_cell_cap_converts_normally(tmp_path, monkeypa
     src, der = _dirs(tmp_path)
     _xlsx(src / "ok.xlsx", A1="値", B2="値2")                       # dimension は A1:B2（4セル）
     monkeypatch.setattr(office_md, "_XLSX_CELL_CAP", 4)             # ちょうど境界＝超過ではない
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["converted"] == 1 and rep["failed"] == 0 and (der / "ok.xlsx.md").is_file()
 
 
@@ -481,10 +482,10 @@ def test_build_derived_conv_cache_hit_does_not_bypass_size_guard(tmp_path, monke
     """入口ガードは CONV-CACHE の照合より前に評価する。署名不変のまま上限だけ引き下げられても、キャッシュ復元で迂回しない。"""
     src, der = _dirs(tmp_path)
     _xlsx(src / "wide.xlsx", A1="値", J20="値")
-    assert office_md.build_derived(src, der)["converted"] == 1
+    assert office_md.build_derived(src, der, row=offline_row("w"))["converted"] == 1
     assert (office_md._conv_cache_root_for(der) / "wide.xlsx.key.json").is_file()
     monkeypatch.setattr(office_md, "_XLSX_CELL_CAP", 100)
-    rep2 = office_md.build_derived(src, der)
+    rep2 = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep2["converted"] == 0 and rep2["failed"] == 1
     assert {"doc": "wide.xlsx", "reason": "cell_count_exceeded"} in rep2["conversion_failures"]
 
@@ -504,12 +505,12 @@ def test_conv_cache_skips_store_when_evidence_write_fails_then_recovers(tmp_path
         return orig_write(path, data)
     monkeypatch.setattr(evidence_ir, "write_json_atomic", flaky_write)
 
-    rep1 = office_md.build_derived(src, der)
+    rep1 = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep1["evidence_ir_failed"] == 1 and rep1["converted"] == 1      # md 自体は Evidence 書込失敗と独立に成功
     key_file = office_md._conv_cache_root_for(der) / "a.xlsx.key.json"
     assert not key_file.exists()
     should_fail["v"] = False
-    rep2 = office_md.build_derived(src, der)
+    rep2 = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep2["evidence_ir_failed"] == 0 and rep2["converted"] == 1
     assert key_file.is_file()
 
@@ -533,7 +534,7 @@ def test_xlsx_extractor_version_bump_triggers_document_ir_and_human_md_drift(tmp
     from sherpa.ingest.arms import ooxml_arm
     src, der = _dirs(tmp_path)
     _xlsx(src / "a.xlsx", A1="値")
-    assert office_md.build_derived(src, der)["converted"] == 1
+    assert office_md.build_derived(src, der, row=offline_row("w"))["converted"] == 1
     assert office_md.document_ir_sig_drift(der) is False and office_md.human_md_sig_drift(src, der) is False
     monkeypatch.setattr(ooxml_arm, "XLSX_EXTRACTOR_VERSION", "xlsx-ooxml-vX-test-bump")
     assert office_md.document_ir_sig_drift(der) is True and office_md.human_md_sig_drift(src, der) is True
@@ -544,13 +545,13 @@ def test_arms_sig_drift_marker(tmp_path, pdf_stub):
     src, der = _dirs(tmp_path)
     _blank_pdf(src / "doc.pdf")
     pdf_stub(None)
-    office_md.build_derived(src, der)
+    office_md.build_derived(src, der, row=offline_row("w"))
     marker = der / office_md._ARMS_SIG_MARKER
     assert marker.read_text(encoding="utf-8") == "arms=ooxml,pdf_text;pdf=none;legacy=none;vlm=none"
     assert office_md.arms_sig_drift(der) is False
     pdf_stub("pypdf", ["税率10%の説明"])
     assert office_md.arms_sig_drift(der) is True
-    office_md.build_derived(src, der)
+    office_md.build_derived(src, der, row=offline_row("w"))
     assert marker.read_text(encoding="utf-8") == "arms=ooxml,pdf_text;pdf=pypdf;legacy=none;vlm=none"
     assert office_md.arms_sig_drift(der) is False
     assert "税率10%" in (der / "doc.pdf.md").read_text(encoding="utf-8")
@@ -575,7 +576,7 @@ def test_empty_ooxml_has_no_md_but_manifest_and_refresh_regenerate_instead_of_de
     ならず、`refresh_evidence_ir()` も削除ではなく再生成する（`seen` の基準が `.md` の有無に依存しない）。"""
     src, der = _dirs(tmp_path)
     _zip(src / "empty.docx", {"word/document.xml": _EMPTY_DOCX_XML})
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
     assert not (der / "empty.docx.md").is_file()
     assert (der.parent / "ir" / "empty.docx.evidence.json").is_file()
@@ -583,7 +584,7 @@ def test_empty_ooxml_has_no_md_but_manifest_and_refresh_regenerate_instead_of_de
     assert manifest is not None and ".md" not in manifest["sidecars"]
     assert office_md.rag_sidecars_missing(src, der) is False
     for _ in range(2):                                                    # 2回目も安定して再生成
-        rep2 = office_md.refresh_evidence_ir(src, der)
+        rep2 = office_md.refresh_evidence_ir(src, der, row=offline_row("w"))
         assert rep2["evidence_ir_failed"] == 0 and rep2["rag_failed"] == 0
         assert rep2["evidence_ir_generated"] == 1 and rep2["rag_generated"] == 1
         for p in ("ir/empty.docx.evidence.json", "rag/empty.docx.rag.md", "rag/empty.docx.rag_chunks.jsonl"):
@@ -594,7 +595,7 @@ def test_rag_sidecars_missing_disabled_arm_extension_is_not_falsely_flagged(tmp_
     monkeypatch.setenv("SHERPA_MCP_ARMS", "pdf_text")                     # ooxml を含まない構成
     src, der = _dirs(tmp_path)
     _xlsx(src / "a.xlsx", A1="内容")
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["converted"] == 0 and rep["unsupported"] == 1
     manifest = json_io.read_json(der.parent / "ir" / "a.xlsx.derived.json", default=None)
     assert manifest == {"schema": office_md._DERIVED_MANIFEST_SCHEMA_VERSION, "sidecars": []}
@@ -610,7 +611,7 @@ def test_rag_sidecars_missing_legacy_backend_off_notice_tracked(tmp_path, monkey
     monkeypatch.setattr(legacy_convert, "legacy_exts", lambda: set())
     src, der = _dirs(tmp_path)
     (src / "old.doc").write_bytes(b"legacy binary stub")
-    assert office_md.build_derived(src, der)["published_notice_count"] == 1
+    assert office_md.build_derived(src, der, row=offline_row("w"))["published_notice_count"] == 1
     assert (der / "old.doc.md").is_file()
     manifest = json_io.read_json(der.parent / "ir" / "old.doc.derived.json", default=None)
     assert manifest is not None and set(manifest["sidecars"]) == FIVE_SIDECARS
@@ -628,7 +629,7 @@ def test_rag_sidecars_missing_raster_image_tracked(tmp_path):
     """単体 PNG/JPEG は Evidence/RAG が生成され（raster 経路）、5点が記録され `.evidence.json` の外部削除を検知できる。"""
     src, der = _dirs(tmp_path)
     _png(src / "scan.png", "red")
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["converted"] == 1 and rep["failed"] == 0
     manifest = json_io.read_json(der.parent / "ir" / "scan.png.derived.json", default=None)
     assert manifest is not None and set(manifest["sidecars"]) == FIVE_SIDECARS
@@ -642,7 +643,7 @@ def test_rag_sidecars_missing_normal_pdf_md_meta_deletion_detected(tmp_path, pdf
     src, der = _dirs(tmp_path)
     _blank_pdf(src / "note.pdf")
     pdf_stub("pypdf", ["本文テキスト"])
-    assert office_md.build_derived(src, der)["converted"] == 1
+    assert office_md.build_derived(src, der, row=offline_row("w"))["converted"] == 1
     assert (der / "note.pdf.md").is_file()
     assert office_md.rag_sidecars_missing(src, der) is False
     (der / "note.pdf.md").unlink()
@@ -654,7 +655,7 @@ def test_rag_sidecars_missing_asset_directory_deletion_detected(tmp_path):
     """`{rel}.assets/` の個々のファイル削除・ディレクトリ全体の削除のどちらも検知する。"""
     src, der = _dirs(tmp_path)
     _png(src / "scan.png", "blue")
-    office_md.build_derived(src, der)
+    office_md.build_derived(src, der, row=offline_row("w"))
     manifest = json_io.read_json(der.parent / "ir" / "scan.png.derived.json", default=None)
     assert manifest is not None and manifest.get("assets")
     assert office_md.rag_sidecars_missing(src, der) is False
@@ -662,7 +663,7 @@ def test_rag_sidecars_missing_asset_directory_deletion_detected(tmp_path):
     assert len(asset_files) == 1
     asset_files[0].unlink()
     assert office_md.rag_sidecars_missing(src, der) is True
-    office_md.build_derived(src, der)                                       # 健全な状態へ作り直す
+    office_md.build_derived(src, der, row=offline_row("w"))                                       # 健全な状態へ作り直す
     assert office_md.rag_sidecars_missing(src, der) is False
     shutil.rmtree(der.parent / "rag" / "scan.png.assets")
     assert office_md.rag_sidecars_missing(src, der) is True
@@ -672,7 +673,7 @@ def test_write_derived_sidecar_manifest_returns_false_on_asset_iterdir_failure(t
     """`{rel}.assets/` の `iterdir()` 失敗は例外を伝播させず False を返す（iterdir は try 節の中）。"""
     src, der = _dirs(tmp_path)
     _png(src / "scan.png", "green")
-    office_md.build_derived(src, der)
+    office_md.build_derived(src, der, row=offline_row("w"))
     original_iterdir = pathlib.Path.iterdir
 
     def _boom_iterdir(self):
@@ -690,7 +691,7 @@ def test_human_md_sig_drift_and_refresh_touch_only_the_md_asset(tmp_path, monkey
     （evidence/rag/document_ir とそれらの sig は無変更・マニフェスト schema は v1 のまま全再構築は誘発しない）。"""
     src, der = _dirs(tmp_path)
     _xlsx(src / "a.xlsx", A1="値")
-    assert office_md.build_derived(src, der)["converted"] == 1
+    assert office_md.build_derived(src, der, row=offline_row("w"))["converted"] == 1
     manifest = json_io.read_json(der.parent / "ir" / "a.xlsx.derived.json", default=None)
     assert manifest["schema"] == office_md._DERIVED_MANIFEST_SCHEMA_VERSION == "derived-sidecar-manifest-v1"
     assert manifest["asset_versions"]["human_md"] == office_md._current_human_md_sig()
@@ -701,7 +702,7 @@ def test_human_md_sig_drift_and_refresh_touch_only_the_md_asset(tmp_path, monkey
                    for m in (office_md._DOCUMENT_IR_SIG_MARKER, office_md._EVIDENCE_IR_SIG_MARKER)]
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "bumped-human-md-version")
     assert office_md.human_md_sig_drift(src, der) is True
-    rep2 = office_md.refresh_human_md(src, der)
+    rep2 = office_md.refresh_human_md(src, der, row=offline_row("w"))
     assert rep2["human_md_generated"] == 1 and rep2["human_md_failed"] == 0
     assert office_md.human_md_sig_drift(src, der) is False
 
@@ -726,7 +727,7 @@ def test_refresh_human_md_generates_md_for_previously_md_less_rel(tmp_path):
                               {"schema": office_md._DERIVED_MANIFEST_SCHEMA_VERSION, "sidecars": []})
     assert not (der / "empty.xlsx.md").is_file()
     assert office_md.human_md_sig_drift(src, der) is True
-    rep = office_md.refresh_human_md(src, der)
+    rep = office_md.refresh_human_md(src, der, row=offline_row("w"))
     assert rep["human_md_generated"] == 1 and rep["human_md_failed"] == 0
     assert "値のあるセルが見つかりませんでした" in (der / "empty.xlsx.md").read_text(encoding="utf-8")
     assert office_md.human_md_sig_drift(src, der) is False
@@ -740,11 +741,11 @@ def test_human_md_sig_drift_and_refresh_are_noop_when_ooxml_arm_disabled(tmp_pat
     der.mkdir()
     monkeypatch.setattr(_arms, "enabled_arm_names", lambda: ["pdf_text"])
     assert office_md.human_md_sig_drift(src, der) is False
-    assert office_md.refresh_human_md(src, der) == {"human_md_generated": 0, "human_md_failed": 0, "human_md_failures": []}
+    assert office_md.refresh_human_md(src, der, row=offline_row("w")) == {"human_md_generated": 0, "human_md_failed": 0, "human_md_failures": []}
     assert not (der / "a.xlsx.md").is_file() and not (der.parent / "ir" / "a.xlsx.derived.json").exists()
     monkeypatch.setattr(_arms, "enabled_arm_names", lambda: ["ooxml", "pdf_text"])
     assert office_md.human_md_sig_drift(src, der) is True
-    rep = office_md.refresh_human_md(src, der)
+    rep = office_md.refresh_human_md(src, der, row=offline_row("w"))
     assert rep["human_md_generated"] == 1 and rep["human_md_failed"] == 0
 
 
@@ -758,7 +759,7 @@ def test_human_md_partial_failure_keeps_es_meta_pending_until_fixed(monkeypatch,
     wd.mkdir()
     dmd = tmp_path / "derived"
     _xlsx(wd / "a.xlsx", A1="x")
-    assert office_md.build_derived(wd, dmd)["evidence_ir_failed"] == 0
+    assert office_md.build_derived(wd, dmd, row=offline_row("w"))["evidence_ir_failed"] == 0
     monkeypatch.setattr(worlds_mod, "world_dir", lambda w: wd)
     monkeypatch.setattr(worlds_mod, "derived_md_dir", lambda w: dmd)
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "human-md-vNEW")
@@ -772,11 +773,11 @@ def test_human_md_partial_failure_keeps_es_meta_pending_until_fixed(monkeypatch,
         return real_build_xlsx_ir(p)
     monkeypatch.setattr(ooxml_arm, "_build_xlsx_ir", _flaky_build)
 
-    assert office_md.refresh_human_md(wd, dmd)["human_md_failed"] == 1
+    assert office_md.refresh_human_md(wd, dmd, row=offline_row("w"))["human_md_failed"] == 1
     assert office_md.human_md_sig_drift(wd, dmd) is True
     assert es_index._human_md_config_sig("w") == es_index._HUMAN_MD_PENDING_SENTINEL
     should_fail["v"] = False
-    assert office_md.refresh_human_md(wd, dmd)["human_md_failed"] == 0
+    assert office_md.refresh_human_md(wd, dmd, row=offline_row("w"))["human_md_failed"] == 0
     assert office_md.human_md_sig_drift(wd, dmd) is False
     assert es_index._human_md_config_sig("w") == es_index._HUMAN_MD_PENDING_SENTINEL   # ES bulk 成功が未確認の間は pending
     assert office_md.confirm_human_md_es_sig(wd, dmd) is True
@@ -793,7 +794,7 @@ def test_build_derived_publishes_and_records_unhandled_exception(tmp_path, monke
     def _boom(*args, **kwargs):
         raise RuntimeError("simulated unhandled crash")
     monkeypatch.setattr(office_md, "_convert_with_arms", _boom)
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["unhandled_failed"] == 1 and not rep.get("error")
     assert rep["derived_partial"] == {"unhandled_failed": 1} and rep["derived_partial_many"] is True
     assert der.is_dir()
@@ -811,7 +812,7 @@ def test_build_derived_records_manifest_write_failure(tmp_path, monkeypatch):
             raise OSError("simulated manifest write failure")
         return original(path, *args, **kwargs)
     monkeypatch.setattr(office_md.json_io, "write_text_atomic", _boom)
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["unhandled_failed"] == 1 and not rep.get("error")
     assert rep["unhandled_failures"] == [{"doc": "a.xlsx", "reason": "manifest_write_failed"}]
 
@@ -820,7 +821,7 @@ def test_publish_failure_after_retire_rolls_back_old_derived_content(tmp_path, m
     """後半 rename（staging→target）が失敗しても、retired→target へ即時ロールバックして旧内容のまま残す。"""
     src, der = _dirs(tmp_path)
     _xlsx(src / "a.xlsx", A1="old")
-    assert not office_md.build_derived(src, der).get("error")
+    assert not office_md.build_derived(src, der, row=offline_row("w")).get("error")
     old_md = (der / "a.xlsx.md").read_text(encoding="utf-8")
     assert "old" in old_md
     _xlsx(src / "a.xlsx", A1="new")
@@ -832,7 +833,7 @@ def test_publish_failure_after_retire_rolls_back_old_derived_content(tmp_path, m
         return original_rename(self, target)
     monkeypatch.setattr(pathlib.Path, "rename", _boom_rename)
 
-    rep2 = office_md.build_derived(src, der)
+    rep2 = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep2["error"].startswith("derived_publish_failed:")
     assert der.is_dir() and (der / "a.xlsx.md").read_text(encoding="utf-8") == old_md
     assert not der.with_name(der.name + office_md._STAGING_SUFFIX).exists()
@@ -844,7 +845,7 @@ def test_double_rename_failure_preserves_retired_generation(tmp_path, monkeypatc
     全消失する）。障害が解消すれば次の build で retired から復旧できる。"""
     src, der = _dirs(tmp_path)
     _xlsx(src / "a.xlsx", A1="old")
-    assert not office_md.build_derived(src, der).get("error")
+    assert not office_md.build_derived(src, der, row=offline_row("w")).get("error")
     old_md = (der / "a.xlsx.md").read_text(encoding="utf-8")
     _xlsx(src / "a.xlsx", A1="new")
     original_rename = pathlib.Path.rename
@@ -856,13 +857,13 @@ def test_double_rename_failure_preserves_retired_generation(tmp_path, monkeypatc
         return original_rename(self, target)
     monkeypatch.setattr(pathlib.Path, "rename", _boom_rename)
 
-    assert office_md.build_derived(src, der)["error"].startswith("derived_publish_failed:")
+    assert office_md.build_derived(src, der, row=offline_row("w"))["error"].startswith("derived_publish_failed:")
     assert retired.is_dir() and (retired / "a.xlsx.md").read_text(encoding="utf-8") == old_md
     # 次回も同じ障害: 復旧 rename も失敗＝setup error で打ち切り、retired を無条件削除する `_publish_staging` へ進まない。
-    assert office_md.build_derived(src, der)["error"].startswith("derived_setup_failed:")
+    assert office_md.build_derived(src, der, row=offline_row("w"))["error"].startswith("derived_setup_failed:")
     assert retired.is_dir() and (retired / "a.xlsx.md").read_text(encoding="utf-8") == old_md
     assert not der.is_dir()
     monkeypatch.setattr(pathlib.Path, "rename", original_rename)             # 障害解消
-    assert not office_md.build_derived(src, der).get("error")
+    assert not office_md.build_derived(src, der, row=offline_row("w")).get("error")
     assert "new" in (der / "a.xlsx.md").read_text(encoding="utf-8")
     assert not retired.exists()

@@ -16,9 +16,9 @@ def test_no_base_branch_rebuilds_overlay_instead_of_reusing_stale_image():
     branch = up[start:up.index("\nelse\n", start)]
     assert "docker build" in branch and "Dockerfile.overlay" in branch
     assert "SHERPA_APP_VERSION" in branch
-    assert "up -d ocr-worker" in branch
+    assert "up -d --scale ocr-worker=\"$OCR_WORKERS\" ocr-worker" in branch
     # 通常経路（ベースあり）は従来どおりフルビルド
-    assert "up -d --build ocr-worker" in up
+    assert "up -d --build --scale ocr-worker=\"$OCR_WORKERS\" ocr-worker" in up
 
 
 def test_overlay_replaces_sherpa_tree_and_labels_version():
@@ -55,7 +55,7 @@ def test_failed_code_update_is_not_swallowed_and_status_compares_commit():
     assert "rev-parse --short HEAD" in status and "_cmp_img" in status
 
 
-def _run_overlay_with_fake_docker(tmp_path: Path, base_platform: str) -> list[str]:
+def _run_overlay_with_fake_docker(tmp_path: Path, base_platform: str, extra_env: dict[str, str] | None = None) -> list[str]:
     """偽の docker で載せ替え経路を最後まで流し、docker の呼び出し行を返す。"""
     import os
     import subprocess
@@ -66,6 +66,7 @@ def _run_overlay_with_fake_docker(tmp_path: Path, base_platform: str) -> list[st
     fake.write_text(
         "#!/bin/sh\n"
         'echo "ARGS $* COMPOSE_FILE=${COMPOSE_FILE:-}" >> "$FAKE_DOCKER_LOG"\n'
+        '[ "$1" = info ] && [ -n "${FAKE_DOCKER_MEM:-}" ] && echo "$FAKE_DOCKER_MEM"\n'
         'if [ "$1 $2" = "image inspect" ]; then\n'
         '  case "$*" in\n'
         '    *python:3.12-slim-bookworm*) exit 1 ;;\n'
@@ -88,6 +89,7 @@ def _run_overlay_with_fake_docker(tmp_path: Path, base_platform: str) -> list[st
         "SHERPA_OCR_WORLD_ROOT": str(tmp_path / "world"),
         "SHERPA_OBSERVATION_DIR": str(tmp_path / "obs"),
         "SHERPA_OCR_ENABLED": "1",
+        **(extra_env or {}),
     }
     subprocess.run(["bash", str(ROOT / "scripts/ocr-up.sh")], env=env, check=True, capture_output=True)
     return log.read_text(encoding="utf-8").splitlines()
@@ -99,6 +101,33 @@ def test_overlay_build_takes_platform_from_base_image_and_compose_keeps_version_
     assert len(build) == 1 and "--platform linux/amd64" in build[0]
     up = [ln for ln in lines if "up -d" in ln]
     assert len(up) == 1 and "compose.version.yml" in up[0] and "--build" not in up[0]
+
+
+
+
+def _empty_dotenv(tmp_path: Path) -> dict[str, str]:
+    """利用者の .env を読ませない（空の .env を SHERPA_ENV_FILE に指す）。"""
+    f = tmp_path / "empty.env"
+    f.write_text("", encoding="utf-8")
+    return {"SHERPA_ENV_FILE": str(f)}
+
+
+def test_ocr_up_scales_workers_to_the_resolved_count_and_defaults_to_one(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    no_dotenv = _empty_dotenv(tmp_path)
+    ups = [ln for ln in _run_overlay_with_fake_docker(tmp_path / "a", "linux/amd64", no_dotenv) if "up -d" in ln]
+    assert len(ups) == 1 and "--scale ocr-worker=1 " in ups[0]
+    resolved = {**no_dotenv, "SHERPA_NEO4J_HEAP_RESOLVED": "1228m", "SHERPA_OCR_WORKERS_RESOLVED": "3"}
+    ups = [ln for ln in _run_overlay_with_fake_docker(tmp_path / "b", "linux/amd64", resolved) if "up -d" in ln]
+    assert len(ups) == 1 and "--scale ocr-worker=3 " in ups[0]
+
+
+def test_ocr_up_reduces_requested_workers_to_what_the_memory_allows(tmp_path):
+    # Docker の VM が 8GB（ホストより小さい macOS の Docker Desktop を想定）なら、4 本の希望でも 1 本に減る。
+    env = {**_empty_dotenv(tmp_path), "SHERPA_OCR_WORKERS": "4", "FAKE_DOCKER_MEM": str(8 * 1024 ** 3)}
+    ups = [ln for ln in _run_overlay_with_fake_docker(tmp_path, "linux/amd64", env) if "up -d" in ln]
+    assert len(ups) == 1 and "--scale ocr-worker=1 " in ups[0]
 
 
 def test_overlay_platform_follows_base_image_architecture(tmp_path):
@@ -191,3 +220,26 @@ def test_stale_arch_image_kept_when_rebuild_fails(tmp_path):
 def test_matching_arch_keeps_existing_flow_without_removal(tmp_path):
     lines = _run_overlay_with_fake_docker(tmp_path, "linux/amd64")
     assert not any(ln.startswith(("ARGS rmi", "ARGS pull")) for ln in lines)
+
+
+def test_idle_unload_setting_reaches_the_container_and_status_shows_the_released_state():
+    compose = _read("docker-compose.yml")
+    worker = compose[compose.index("  ocr-worker:"):compose.index("command: [\"python\", \"-m\", \"sherpa.ingest.ocr_worker\"")]
+    assert "SHERPA_OCR_IDLE_UNLOAD_SECONDS: ${SHERPA_OCR_IDLE_UNLOAD_SECONDS:-}" in worker
+    assert "SHERPA_OCR_IDLE_UNLOAD_SECONDS" in _read(".env.example")
+    assert "待機中（モデルを解放済み）" in _read("scripts/status.sh")
+
+
+def test_tuning_settings_reach_the_container_and_both_model_sets_are_fetched_from_the_lock():
+    compose = _read("docker-compose.yml")
+    worker = compose[compose.index("  ocr-worker:"):compose.index("\nvolumes:\n")]
+    assert "SHERPA_OCR_MODEL: ${SHERPA_OCR_MODEL:-}" in worker
+    assert "SHERPA_OCR_ONEDNN: ${SHERPA_OCR_ONEDNN:-}" in worker
+    assert "SHERPA_OCR_THREADS: ${SHERPA_OCR_THREADS_RESOLVED:-}" in worker
+    assert "cpus: ${SHERPA_OCR_CPUS_RESOLVED:-1}" in worker
+    env_example = _read(".env.example")
+    for name in ("SHERPA_OCR_MODEL", "SHERPA_OCR_ONEDNN", "SHERPA_OCR_CPUS", "SHERPA_OCR_THREADS"):
+        assert name in env_example
+    fetch = _read("scripts/fetch_ocr_models.sh")
+    assert 'lock["sets"].items()' in fetch and "medium" in fetch and "mobile" in fetch
+    assert "SHERPA_OCR_CPUS SHERPA_OCR_THREADS" in _read("scripts/ocr-up.sh")

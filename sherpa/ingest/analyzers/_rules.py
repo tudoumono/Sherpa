@@ -57,7 +57,7 @@ ALLOWED_REFS = {
         "cics_xctl", "cics_link")},
     "copy": frozenset({("COPIES", "Copybook")}),
     "config_key": frozenset({("ACCESSES", "Config")}),
-    **{v: frozenset({("ACCESSES", "Table")}) for v in ("exec_sql", "mapper_sql", "vba_sql")},
+    **{v: frozenset({("ACCESSES", "Table")}) for v in ("exec_sql", "mapper_sql", "vba_sql", "string_sql")},
     **{v: frozenset({("INVOKES", "Batch")}) for v in ("exec_proc", "include_member")},
     "use": frozenset({("FLOWS_TO", "DataItem")}),
     "write_file": frozenset({("FLOWS_TO", "Dataset")}),

@@ -19,8 +19,9 @@ from pathlib import Path
 import openpyxl
 import pytest
 
-from sherpa import worlds
+from sherpa import es_index, json_io, worlds
 from sherpa.ingest import office_md
+from tests._replace_row import offline_row
 
 
 def _new_world(tmp_path, monkeypatch, world_id: str) -> Path:
@@ -64,6 +65,27 @@ def _snapshot_layers(world_id: str) -> dict:
     return out
 
 
+def _snapshot_rel(world_id: str, rel: str) -> dict[str, bytes]:
+    """1 rel の派生物と素材だけを層名つきで読む。"""
+    out: dict[str, bytes] = {}
+    for layer, layer_dir in (
+        ("md", worlds.derived_md_dir(world_id)),
+        ("rag", worlds.derived_rag_dir(world_id)),
+        ("ir", worlds.derived_ir_dir(world_id)),
+    ):
+        for p in sorted(layer_dir.rglob("*")):
+            if p.is_file() and p.relative_to(layer_dir).as_posix().startswith(rel):
+                out[f"{layer}/{p.relative_to(layer_dir).as_posix()}"] = p.read_bytes()
+    return out
+
+
+def _es_payload(world_id: str, rel: str):
+    rag = worlds.derived_rag_dir(world_id)
+    return es_index._validate_rag_chunks(
+        rag / (rel + ".rag_chunks.jsonl"), rag / (rel + ".rag.md"), rel,
+        {"doc_id": rel, "ext": Path(rel).suffix.lower()})
+
+
 def _wrap_convert_with_arms(monkeypatch):
     """`office_md._convert_with_arms`（実変換の入口・キャッシュヒット時は一切呼ばれない）を
     呼び出し記録付きに差し替える。素の実装は保持したまま呼ぶ（副作用は変えない）。"""
@@ -86,19 +108,22 @@ def test_cache_hit_byte_identical_and_rep_equivalent(monkeypatch, tmp_path):
     dmd = worlds.derived_md_dir(world_id)
     calls = _wrap_convert_with_arms(monkeypatch)
 
-    rep1 = office_md.build_derived(source, dmd, world_sig="s1")
+    rep1 = office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     assert rep1.get("error") is None, rep1
     assert sorted(calls) == ["a.xlsx", "b.xlsx", "c.xlsx"]     # 1回目は全件 実変換
     tree1 = _snapshot_layers(world_id)
 
     calls.clear()
-    rep2 = office_md.build_derived(source, dmd, world_sig="s1")
+    rep2 = office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     assert rep2.get("error") is None, rep2
     assert calls == []                                         # 2回目は実変換ゼロ（全件キャッシュヒット）
     tree2 = _snapshot_layers(world_id)
 
     assert tree1 == tree2                                       # 派生3層が byte-identical
+    m1, m2 = rep1.pop("conversion_metrics"), rep2.pop("conversion_metrics")
     assert rep1 == rep2                                          # rep 集計（converted/document_ir_*等）も一致
+    assert (m1["actual"], m1["cache_restored"]) == (3, 0)
+    assert (m2["actual"], m2["cache_restored"]) == (3 - 3, 3)
 
 
 def test_source_change_invalidates_only_that_file(monkeypatch, tmp_path):
@@ -109,7 +134,7 @@ def test_source_change_invalidates_only_that_file(monkeypatch, tmp_path):
     dmd = worlds.derived_md_dir(world_id)
     calls = _wrap_convert_with_arms(monkeypatch)
 
-    office_md.build_derived(source, dmd, world_sig="s1")
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     calls.clear()
 
     time.sleep(0.01)                        # st_mtime_ns を確実にずらす
@@ -117,21 +142,110 @@ def test_source_change_invalidates_only_that_file(monkeypatch, tmp_path):
     wb.active["A1"] = "CHANGED_NEEDLE"
     wb.save(source / "b.xlsx")
 
-    office_md.build_derived(source, dmd, world_sig="s1")
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     assert calls == ["b.xlsx"]               # a.xlsx/c.xlsx はキャッシュヒットで実変換されない
 
 
-def test_ctime_change_with_unchanged_size_and_mtime_invalidates_cache(monkeypatch, tmp_path):
+def test_same_content_at_another_path_restores_and_rebuilds_path_bound_outputs(monkeypatch, tmp_path):
+    """別パスの同じ bytes は実変換せず、コピー先を単独変換した結果と派生物・ES投入本文が一致する。"""
+    world_id = "convcache-content-copy"
+    ref_world_id = "convcache-content-copy-ref"
+    source = _new_world(tmp_path, monkeypatch, world_id)
+    _write_fixture_files(source, ["a.xlsx"])
+    copied = source / "copy" / "b.xlsx"
+    copied.parent.mkdir()
+    shutil.copyfile(source / "a.xlsx", copied)
+    monkeypatch.setenv("SHERPA_MD_WORKERS", "1")
+    calls = _wrap_convert_with_arms(monkeypatch)
+
+    rep = office_md.build_derived(source, worlds.derived_md_dir(world_id), world_sig="s1", row=offline_row("w"))
+
+    assert calls == ["a.xlsx"]
+    assert rep["content_cache_restored"] == 1
+
+    ref_source = _new_world(tmp_path, monkeypatch, ref_world_id)
+    ref_copy = ref_source / "copy" / "b.xlsx"
+    ref_copy.parent.mkdir()
+    shutil.copyfile(copied, ref_copy)
+    calls.clear()
+    office_md.build_derived(ref_source, worlds.derived_md_dir(ref_world_id), world_sig="s1", row=offline_row("w"))
+
+    rel = "copy/b.xlsx"
+    assert _snapshot_rel(world_id, rel) == _snapshot_rel(ref_world_id, rel)
+    assert _es_payload(world_id, rel) == _es_payload(ref_world_id, rel)
+    for suffix in (".rag.md", ".rag_chunks.jsonl"):
+        text = json_io.read_text_maybe_gzip(worlds.derived_rag_dir(world_id) / (rel + suffix))
+        assert "原本「a.xlsx」" not in text and "原本: a.xlsx" not in text
+    context = json_io.read_json(worlds.derived_ir_dir(world_id) / (rel + ".context.json"))
+    assert context["context"]["source_name"] == "b.xlsx"
+
+
+def test_old_cache_is_indexed_on_primary_hit_then_reused_after_move(monkeypatch, tmp_path):
+    """二次索引の無い旧スロットは変更なし取り込みで移行され、次の移動で内容一致復元できる。"""
+    world_id = "convcache-content-migrate"
+    source = _new_world(tmp_path, monkeypatch, world_id)
+    _write_fixture_files(source, ["a.xlsx"])
+    dmd = worlds.derived_md_dir(world_id)
+    calls = _wrap_convert_with_arms(monkeypatch)
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
+    cache_root = office_md._conv_cache_root_for(dmd)
+    (cache_root / office_md._CONV_CACHE_CONTENT_INDEX).unlink()
+    meta_path = cache_root / "a.xlsx.key.json"
+    meta = json_io.read_json(meta_path)
+    for key in ("content_hash", "pipeline_sig", "source_ext"):
+        meta.pop(key, None)
+    json_io.write_json_atomic(meta_path, meta)
+
+    calls.clear()
+    rep_unchanged = office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
+    assert calls == [] and rep_unchanged["content_cache_restored"] == 0
+    assert (cache_root / office_md._CONV_CACHE_CONTENT_INDEX).is_file()
+
+    (source / "moved").mkdir()
+    (source / "a.xlsx").rename(source / "moved" / "b.xlsx")
+    calls.clear()
+    rep_moved = office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
+
+    assert calls == [] and rep_moved["content_cache_restored"] == 1
+    assert (cache_root / "moved" / "b.xlsx.key.json").is_file()
+    assert not (cache_root / "a.xlsx.key.json").exists()
+
+
+def test_updated_slot_no_longer_indexes_old_content(monkeypatch, tmp_path):
+    """同じパスを別内容で上書きした後、そのスロットを旧内容の一致先として使わない。"""
+    world_id = "convcache-content-slot-update"
+    source = _new_world(tmp_path, monkeypatch, world_id)
+    _write_fixture_files(source, ["a.xlsx"])
+    old_bytes = (source / "a.xlsx").read_bytes()
+    dmd = worlds.derived_md_dir(world_id)
+    calls = _wrap_convert_with_arms(monkeypatch)
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
+
+    wb = openpyxl.Workbook()
+    wb.active["A1"] = "NEW_CONTENT"
+    wb.save(source / "a.xlsx")
+    calls.clear()
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
+    assert calls == ["a.xlsx"]
+
+    (source / "b.xlsx").write_bytes(old_bytes)
+    calls.clear()
+    rep = office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
+    assert calls == ["b.xlsx"]
+    assert rep["content_cache_restored"] == 0
+
+
+def test_ctime_change_with_unchanged_content_uses_content_cache(monkeypatch, tmp_path):
     """size・mtime が同一のまま ctime だけ進んだ原本（同一 size・mtime を保持したまま中身を
     上書きされたケースの再現）は、`_conv_cache_source_key` が ctime も材料に含めるため
-    キャッシュミスになる（size・mtime だけのキーだと見逃す穴の固定）。"""
+    一次の鍵は外れるが、内容一致の二次索引から戻る。"""
     world_id = "convcache-ctime-change"
     source = _new_world(tmp_path, monkeypatch, world_id)
     _write_fixture_files(source, ["a.xlsx", "b.xlsx"])
     dmd = worlds.derived_md_dir(world_id)
     calls = _wrap_convert_with_arms(monkeypatch)
 
-    office_md.build_derived(source, dmd, world_sig="s1")
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     calls.clear()
 
     target = source / "b.xlsx"
@@ -150,8 +264,9 @@ def test_ctime_change_with_unchanged_size_and_mtime_invalidates_cache(monkeypatc
         return real_stat(self, *a, **kw)
 
     monkeypatch.setattr(Path, "stat", fake_stat)
-    office_md.build_derived(source, dmd, world_sig="s1")
-    assert calls == ["b.xlsx"]               # size・mtime 不変でも ctime 差分だけでキャッシュミスする
+    rep = office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
+    assert calls == []
+    assert rep["content_cache_restored"] == 1
 
 
 def test_pipeline_sig_change_invalidates_all_files(monkeypatch, tmp_path):
@@ -163,12 +278,12 @@ def test_pipeline_sig_change_invalidates_all_files(monkeypatch, tmp_path):
     dmd = worlds.derived_md_dir(world_id)
     calls = _wrap_convert_with_arms(monkeypatch)
 
-    office_md.build_derived(source, dmd, world_sig="s1")
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     calls.clear()
 
     # レンダラ/抽出器の版が上がった、というシナリオを模擬（既存の署名部品の1つだけを差し替える）。
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "renderer=test-bumped")
-    office_md.build_derived(source, dmd, world_sig="s1")
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     assert sorted(calls) == ["a.xlsx", "b.xlsx"]
 
 
@@ -179,13 +294,13 @@ def test_deleted_source_pruned_after_completed_build(monkeypatch, tmp_path):
     _write_fixture_files(source, ["a.xlsx", "b.xlsx"])
     dmd = worlds.derived_md_dir(world_id)
 
-    office_md.build_derived(source, dmd, world_sig="s1")
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     cache_root = office_md._conv_cache_root_for(dmd)
     assert (cache_root / "a.xlsx.key.json").is_file()
     assert (cache_root / "b.xlsx.key.json").is_file()
 
     (source / "b.xlsx").unlink()
-    office_md.build_derived(source, dmd, world_sig="s1")
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
 
     assert (cache_root / "a.xlsx.key.json").is_file()            # 生きている rel は残る
     assert not (cache_root / "b.xlsx.key.json").exists()          # 消えた原本のキャッシュは剪定される
@@ -225,7 +340,7 @@ def test_mid_death_resume_reuses_cached_files_and_matches_full_rebuild(monkeypat
     monkeypatch.setattr(office_md, "_convert_with_arms", flaky)
 
     with pytest.raises(_SimulatedCrash):
-        office_md.build_derived(source, dmd, world_sig="s1")
+        office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     assert calls == ["a.xlsx", "b.xlsx", "c.xlsx"]                # d.xlsx にはまだ到達していない
 
     cache_root = office_md._conv_cache_root_for(dmd)
@@ -236,7 +351,7 @@ def test_mid_death_resume_reuses_cached_files_and_matches_full_rebuild(monkeypat
 
     crash_on.clear()                                              # 「再実行」＝原因が解消した状態を模擬
     calls.clear()
-    rep = office_md.build_derived(source, dmd, world_sig="s1")
+    rep = office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     assert rep.get("error") is None, rep
     assert calls == ["c.xlsx", "d.xlsx"]                          # a.xlsx/b.xlsx はキャッシュヒットで再変換されない
 
@@ -247,6 +362,6 @@ def test_mid_death_resume_reuses_cached_files_and_matches_full_rebuild(monkeypat
     # 比較が成立しない。原本ファイルをそのまま**バイトコピー**して同一性を保つ。
     for name in ("a.xlsx", "b.xlsx", "c.xlsx", "d.xlsx"):
         shutil.copyfile(source / name, ref_source / name)
-    office_md.build_derived(ref_source, worlds.derived_md_dir(ref_world_id), world_sig="s1")
+    office_md.build_derived(ref_source, worlds.derived_md_dir(ref_world_id), world_sig="s1", row=offline_row("w"))
 
     assert _snapshot_layers(world_id) == _snapshot_layers(ref_world_id)   # 最終出力は一括実変換と同一

@@ -41,5 +41,5 @@ def _kb_hint_abs(world: str, layout_hint: bool = True) -> str:
     return f"{base}/**/{world}/（設計書・仕様の決定的MD は md/ 配下、COBOL/JCL は src/ 配下）"
 
 
-# 下調べを省いたレンズ（`_PRESEARCH_SKIP_LENSES`）は、`_gather` がこの headline を持つ env を返す。Codex が回答できれば上書きされる。
+# `_gather` は検索せず、この headline を持つ env を返す。Codex が回答できれば上書きされる。
 _NO_PRESEARCH_HEADLINE = "回答をまとめられませんでした。もう一度お試しください。"

@@ -13,10 +13,13 @@ from ...store.investigation_records import trim_calls, trim_record
 from ... import layer as layer_mod
 from ...answer_shape import NO_TOOL_USE_NOTICE, STOPPED_EARLY_NOTICE, STOPPED_NOTICE, add_notice, seal, set_body
 from ..base import _evidence_gate_note, _log, _node, _verified_sources
-from .citations import parse_referenced_doc_lines, resolve_referenced_docs, resolve_referenced_docs_detail
-from .call_log import call_record_sections, call_stats, finalize_call_log, found_docs_for_answer, referenced_docs_for_answer
+from .citations import (MENTION_MAX, MENTION_SCAN_MAX, _name_index, extract_doc_tokens, normalize_doc_ref,
+                        parse_referenced_doc_lines, plausible_doc_tokens, resolve_referenced_docs,
+                        resolve_referenced_docs_detail, screen_by_layer, index_paths, REASON_AMBIGUOUS)
+from .call_log import (REFERENCED_DOCS_MAX, call_record_sections, call_stats, finalize_call_log, found_docs_for_answer,
+                       referenced_docs_for_answer)
 from .codex_cli import apply_codex_usage, log_turn_end
-from .ledger_gate import _format_unconfirmed_items_section, _retire_investigation_ledger, _scope_no_source_notice, _unconfirmed_items_list
+from .ledger_gate import _format_unconfirmed_items_section, _scope_no_source_notice, _unconfirmed_items_list, retire_ledger_for_turn
 from .mcp import _apply_codex_neighbors
 from .continuation import _pick_codex_headline
 from .impact_list import REASON_NO_RECORD, build_impact_list
@@ -156,10 +159,7 @@ def close_session(self, ctx, st, decision, env):
         _investigation_retained = False
         if st._ledger_home is not None and not st._investigation_retire_done:
             # 退避の判断は `_retire_investigation_ledger` 内部で `pending_continuation_review()` を直接使う（単一の純関数に一本化）。
-            _investigation_retained = _retire_investigation_ledger(
-                st._investigation_dir, st._ledger_home, required_extra=st._ledger_required_extra,
-                require_review=st._ledger_require_review)
-            st._investigation_retire_done = True
+            _investigation_retained = retire_ledger_for_turn(st)
         _ledger_id_report_limit = 50
         env["investigation"] = {
             "complete": st._investigation_verdict.complete,
@@ -172,6 +172,7 @@ def close_session(self, ctx, st, decision, env):
             "continuations": st._ledger_continuations,
             "stopped_reason": st._investigation_stopped_reason,
             "retained": _investigation_retained,
+            "retain_failed": st._investigation_retire_failed,
             "restored": st._investigation_restored,
             # 見直しの一巡の有無・回数・足した項目数（本文なし・件数だけ）。
             "review": {
@@ -395,11 +396,50 @@ def register_created_files(st):
                     run_dir.name, e)
 
 
+def _in_layer_safe(rel: str, layer) -> bool:
+    """`rel` が今回の層に入るか（判定できない名前は入らないとみなす）。"""
+    try:
+        return layer_mod.in_layer(rel, layer)
+    except ValueError:
+        return False
+
+
+def _flat_strings(v) -> list[str]:
+    """入れ子のリストの中の文字列を順に並べる（「参照した資料:」の行の候補群）。"""
+    if isinstance(v, str):
+        return [v]
+    return [x for item in (v if isinstance(v, (list, tuple)) else []) for x in _flat_strings(item)]
+
+
+def _is_sensitive_ref(ref: str, world: str) -> bool:
+    """資料名の候補が秘匿名の資料を指すか（指す資料が分からなければ候補の名前で判定する）。"""
+    from ...ingest import text_kind
+    try:
+        return text_kind.is_sensitive_doc_id(normalize_doc_ref(ref, world) or ref)
+    except ValueError:
+        return False
+
+
+def _verify_listed_docs(listed, seen: set, candidates: list, verified: list, world, sp, layer) -> list:
+    """一覧に出た資料のうち参照・精読で扱っていないものだけを確かめ、確かめ済み `verified` に足した一覧を返す（`seen`・`candidates` にも足す）。"""
+    new: list[str] = []
+    for r in listed:
+        if r and r not in seen:
+            seen.add(r)
+            candidates.append(r)
+            new.append(r)
+    out = list(verified)
+    if new:
+        for d in resolve_referenced_docs(new, world, sp, layer)[0]:
+            if d not in verified and d not in out:
+                out.append(d)
+    return out
+
+
 def assemble_result(self, ctx, st, decision, env):
     """env への合流（limits・縮退・usage・作成ファイル）・回答の組み立て・`answer_delta` と `_result` を出す。"""
     sp = st.sp
     _schema_on = st._schema_on
-    _skip_presearch = st._skip_presearch
     uid = st.uid
     _wall_clock_state = st._wall_clock_state
     _mcp_error_codes = st._mcp_error_codes
@@ -416,7 +456,7 @@ def assemble_result(self, ctx, st, decision, env):
         env["codex_multi_agent"] = st._multi_agent_enabled
     # グラフ・全文検索の縮退（親が検知した世代不一致＋子がサイドカーで報告した障害コード）を1つの印にまとめる。世代不一致が1件でもあれば「再取り込み待ち」を優先する。通知文言・グラフ側の計数は `chat_service._finalize`（`_apply_graph_degraded`）が env のこの印から組む。
     if isinstance(env, dict):
-        # 事前検索（`chat_service._dispatch`）が既に世代不一致を立てていれば、子の接続断で上書きしない（「再取り込み待ち」を優先する）。
+        # `env` に既に世代不一致が立っていれば、子の接続断で上書きしない（「再取り込み待ち」を優先する）。
         _era = (st._graph_schema_era_error is not None
                 or agentic_search.GRAPH_REINGEST_ERROR_CODE in _mcp_error_codes
                 or env.get("graph_degraded") == agentic_search.GRAPH_REINGEST_ERROR_CODE)
@@ -473,66 +513,144 @@ def assemble_result(self, ctx, st, decision, env):
         ]
     if st.answer:
         env["headline"] = st.answer
-        # 直読した資料は MCP の結果に載らず env["sources"] に反映されない。回答末尾の「参照した資料:」ブロックを解析し、read 系 MCP ツール引数から拾った doc_id（記載漏れの補完・出現順で後ろに合流）と合わせて機械検証（実在・文書種別・scope・秘匿名除外）を通ったものだけを sources の先頭へ足す（`_gather` 由来の既存 sources は後ろに残す・doc_id 重複は除外）。verified が0件なら参照ブロックの記載を消さず本文をそのまま残す。
+        # 直読した資料は MCP の結果に載らず env["sources"] に反映されない。回答末尾の「参照した資料:」ブロックを解析し、read 系 MCP ツール引数から拾った doc_id（記載漏れの補完・出現順で後ろに合流）と合わせて機械検証（実在・文書種別・scope・秘匿名除外）を通ったものだけを sources の先頭へ足す（`_gather` 由来の既存 sources は後ろに残す・doc_id 重複は除外）。参照ブロックは本文から外す（本文が空になるときだけ外さない）。
         _body, _listed_lines = parse_referenced_doc_lines(st.answer)
         _ref_candidates: list = list(_listed_lines)
+        _ref_layer = layer_mod.effective_layer(ctx.scope_meta, decision["lens"])
+        # ① 計画書の結論に書かれた資料を参照の候補に足す。② 本文（参照の欄を除く）に名前が出る資料を拾う（資料参照オンの作成以外のターンだけ）。
+        # 拾うのは、バッククォート・「」・『』で囲まれた名前と、範囲にある資料のパスとそのまま一致するものだけ。
+        _name_idx = None
+        _scope_idx: dict = {}
+        _layer_out: list = []
+        _want_mentions = bool(ctx.make_sources) and decision["lens"] != "author"
+        _mention_tokens: list = []
+        _conclusion_paths: list = []
+        _conc_text = plan_ledger.conclusion_text(st) if decision["lens"] != "author" else ""
+        _listed_strs = _flat_strings(_listed_lines)
+        _listed_text = "\n".join(_listed_strs)
+        _listed_docs = set(_listed_strs) | {d for d in (normalize_doc_ref(x, ctx.world) for x in _listed_strs) if d}
+        _maybe_names = lambda t: bool(t) and any(c in t for c in "`「『/")
+        if _maybe_names(_conc_text) or (_want_mentions and _maybe_names(_body)):
+            # パスの照らし合わせは範囲だけで行い（層の外のものは後の層の確かめで分ける）、名前の索引は今回の層に絞る
+            _scope_idx = _name_index(ctx.world, sp, "both")
+            _paths = index_paths(_scope_idx)
+            _name_idx = {}
+            for _n, _rels in _scope_idx.items():
+                _in = [r for r in _rels if _in_layer_safe(r, _ref_layer)]
+                if _in:
+                    _name_idx[_n] = _in
+            if _want_mentions:
+                _mention_tokens = extract_doc_tokens(_body, limit=MENTION_SCAN_MAX, paths=_paths)
+            # 結論の資料のうち、回答の「参照した資料:」に書かれているものは除く
+            _conclusion_paths = [t for t in extract_doc_tokens(_conc_text, limit=MENTION_SCAN_MAX, paths=_paths)
+                                 if t not in _listed_docs and normalize_doc_ref(t, ctx.world) not in _listed_docs]
+            _conclusion_paths, _layer_out = screen_by_layer(
+                plausible_doc_tokens(_conclusion_paths, _name_idx), ctx.world, _ref_layer)
+            _mention_tokens, _mention_layer_out = screen_by_layer(
+                plausible_doc_tokens(_mention_tokens, _name_idx), ctx.world, _ref_layer)
+            _layer_out += _mention_layer_out
+            _ref_candidates += [[[p]] for p in _conclusion_paths]
         _ref_seen: set[str] = set()
         for _r in _mcp_read_docs:
             if _r and _r not in _ref_seen:
                 _ref_seen.add(_r)
                 _ref_candidates.append(_r)
         # `xlsx_sheets`（シート一覧のみ）の doc_id も参照候補（sources）には合流させる。ただし「参照した資料:」にも書かれておらず本文精読ツール（`_mcp_read_docs`）でも読まれていない doc_id は、根拠ゲート（sources_verified）に数えない。参照ブロック＋本文精読ツールだけで確定する「精読済み」集合を先に確定させ、`xlsx_sheets` を足した後の verified との差分（`_listed_only_ids`）として区別する。
-        _ref_layer = layer_mod.effective_layer(ctx.scope_meta, decision["lens"])
-        _ref_detail = resolve_referenced_docs_detail(_ref_candidates, ctx.world, sp, _ref_layer)
+        _ref_detail = resolve_referenced_docs_detail(_ref_candidates, ctx.world, sp, _ref_layer, index=_name_idx)
         _verified_listed, _unverified_refs, _sensitive_refs = (
             _ref_detail["verified"], _ref_detail["unverified"], _ref_detail["hidden"])
         _verified_before_listed = set(_verified_listed)
-        for _r in _mcp_listed_docs:
-            if _r and _r not in _ref_seen:
-                _ref_seen.add(_r)
-                _ref_candidates.append(_r)
-        _verified_refs = resolve_referenced_docs(_ref_candidates, ctx.world, sp, _ref_layer)[0]
+        _verified_refs = _verify_listed_docs(_mcp_listed_docs, _ref_seen, _ref_candidates, _verified_listed,
+                                             ctx.world, sp, _ref_layer)
         _listed_only_ids = set(_verified_refs) - _verified_before_listed
+        # 本文に名前が出る資料: 参照に載った資料と同じ名前のものは除き、残りを同じ確かめにかける。通ったもので参照に無いものは「本文で名前が出た資料」として足す（根拠の区分には数えない）。
+        _mention_new: list[str] = []
+        _mention_unverified: list = []
+        _mention_hidden = 0
+        _verified_set = set(_verified_refs)
+        _layer_out = [r for r in _layer_out if r["path"] not in _verified_set]
+        _ref_names = {d.rsplit("/", 1)[-1] for d in _verified_refs}
+        # 「参照した資料:」に挙げて確かめられなかった資料も、本文の候補から先に除く（同じ資料を二度数えない）
+        _listed_failed = {r.get("path") for r in _unverified_refs if isinstance(r, dict)}
+        _mention_tokens = [t for t in _mention_tokens
+                           if t not in _verified_set and ("/" in t or t not in _ref_names)
+                           and t not in _listed_failed and normalize_doc_ref(t, ctx.world) not in _listed_failed
+                           and not (t in _listed_text and _is_sensitive_ref(t, ctx.world))]
+        # 確かめるのは先頭の MENTION_MAX 件まで。残りは「確認できなかった資料」の件数に入れる
+        _mention_skipped = max(0, len(_mention_tokens) - MENTION_MAX)
+        _mention_tokens = _mention_tokens[:MENTION_MAX]
+        # ファイル名だけの候補は、範囲で同じ名前が 2 つ以上あれば（資料フォルダ直下の同名を含む）どれにも当てない
+        _same_name = [t for t in _mention_tokens if "/" not in t and len(_scope_idx.get(t, [])) > 1]
+        _mention_tokens = [t for t in _mention_tokens if t not in _same_name]
+        if _mention_tokens:
+            _m_detail = resolve_referenced_docs_detail([[[t]] for t in _mention_tokens], ctx.world, sp, _ref_layer,
+                                                       index=_name_idx)
+            _mention_new = [d for d in _m_detail["verified"] if d not in _verified_set]
+            _mention_unverified, _mention_hidden = _m_detail["unverified"], _m_detail["hidden"]
+        _mention_unverified = list(_mention_unverified) + [{"path": t, "reason": REASON_AMBIGUOUS} for t in _same_name]
+        _ref_ids: set = set()
+        _ref_sources: list = []
         if _verified_refs and ctx.make_sources:
             _ref_sources, _ = _verified_sources(ctx.make_sources, set(_verified_refs), ctx.world, sp)
             # 参照ブロックの記載順（→ MCP 引数の順）に並べ直し、既存（`_gather` 由来）と重複する資料は先頭側（参照した資料）を残す。
             _order = {d: i for i, d in enumerate(_verified_refs)}
             _ref_sources = sorted(_ref_sources, key=lambda s: _order.get(s.get("doc_id"), len(_order)))
             _ref_ids = {s.get("doc_id") for s in _ref_sources}
-            env["sources"] = _ref_sources + [s for s in (env.get("sources") or [])
-                                             if s.get("doc_id") not in _ref_ids]
-            # 実際に開いて根拠にした資料＝API 経路の「精読済み」と同じ意味＝出典の 2 区分（根拠／参考）に載せる。`xlsx_sheets` だけで到達した doc_id（`_listed_only_ids`）は除く。
+        _mention_sources: list = []
+        if _mention_new and ctx.make_sources:
+            _mention_sources, _ = _verified_sources(ctx.make_sources, set(_mention_new), ctx.world, sp)
+            _order = {d: i for i, d in enumerate(_mention_new)}
+            _mention_sources = sorted((s for s in _mention_sources if s.get("doc_id") not in _ref_ids),
+                                      key=lambda s: _order.get(s.get("doc_id"), len(_order)))
+        if _ref_sources or _mention_sources:
+            _all_ids = _ref_ids | {s.get("doc_id") for s in _mention_sources}
+            env["sources"] = _ref_sources + _mention_sources + [s for s in (env.get("sources") or [])
+                                                               if s.get("doc_id") not in _all_ids]
+        if _verified_refs and ctx.make_sources:
+            # 実際に開いて根拠にした資料＝API 経路の「精読済み」と同じ意味＝出典の 2 区分（根拠／参考）に載せる。`xlsx_sheets` だけで到達した doc_id（`_listed_only_ids`）と、本文で触れただけの資料は除く。
             env["sources_verified"] = sorted(_ref_ids - _listed_only_ids)
         env["codex_referenced_docs"] = {"listed": len(_ref_candidates), "verified": len(_verified_refs)}
         if _ref_detail["mappings"]:  # 参照行の対応付け（入力・資料 ID・分類）。評価で分類ごとに数える
             env["codex_reference_resolution"] = _ref_detail["mappings"][:_SOURCES_UNVERIFIED_MAX * 5]
-        # 新しい形の「参照した資料」（資料ごとの開いた行の範囲）。資料参照がオンの作成以外のターンだけ・0 件でも欄を入れる。
+        # 新しい形の「参照した資料」（資料ごとの開いた行の範囲）。資料参照がオンの作成以外のターンだけ・0 件でも欄を入れる。本文で触れただけの資料は `mentioned_only` を付けて後ろに足す。
         if ctx.make_sources and decision["lens"] != "author":
             _ref_rows, _ref_more = referenced_docs_for_answer(st, _verified_refs)
+            if _mention_new:
+                _m_rows, _m_more = referenced_docs_for_answer(st, _mention_new)
+                _all_rows = _ref_rows + [{**r, "mentioned_only": True} for r in _m_rows]
+                _ref_more += _m_more + max(0, len(_all_rows) - REFERENCED_DOCS_MAX)
+                _ref_rows = _all_rows[:REFERENCED_DOCS_MAX]
             env["referenced_docs"] = _ref_rows
             if _ref_more:
                 env["referenced_docs_more"] = _ref_more
         # 検索で見つかったが Sherpa の読み取り道具で開かれず「参照した資料」にも無い資料（秘匿の資料名は件数）。
-        _found, _found_hidden, _found_more = found_docs_for_answer(st, [_verified_refs, _ref_candidates])
+        _found, _found_hidden, _found_more = found_docs_for_answer(st, [_verified_refs, _ref_candidates, _mention_new])
         if _found:
             env["found_docs"] = _found
         if _found_hidden:
             env["found_docs_hidden"] = _found_hidden
         if _found_more:
             env["found_docs_more"] = _found_more
-        # 「参照した資料」の行のうち検証を通らなかったもの（理由つき・秘匿名は名前を出さず件数だけ）。
+        # 「参照した資料」の行・本文に名前が出た資料のうち検証を通らなかったもの（理由つき・自由な文や解釈できない行だけ件数）。注記は「参照した資料」の行の分だけ数える。
         _unverified_total = len(_unverified_refs) + _sensitive_refs
+        _unverified_rows = list(_unverified_refs)
+        for _r in _layer_out + _mention_unverified:
+            if _r not in _unverified_rows:
+                _unverified_rows.append(_r)
+        _hidden_total = _sensitive_refs + _mention_hidden
+        if _unverified_rows or _hidden_total or _mention_skipped:
+            env["sources_unverified"] = _unverified_rows[:_SOURCES_UNVERIFIED_MAX]
+            if _hidden_total:
+                env["sources_unverified_hidden"] = _hidden_total
+            _more = max(0, len(_unverified_rows) - _SOURCES_UNVERIFIED_MAX) + _mention_skipped
+            if _more:
+                env["sources_unverified_more"] = _more
         if _unverified_total:
-            env["sources_unverified"] = _unverified_refs[:_SOURCES_UNVERIFIED_MAX]
-            if _sensitive_refs:
-                env["sources_unverified_hidden"] = _sensitive_refs
-            if len(_unverified_refs) > _SOURCES_UNVERIFIED_MAX:
-                env["sources_unverified_more"] = len(_unverified_refs) - _SOURCES_UNVERIFIED_MAX
             add_notice(env, "sources_unverified",
                        f"回答が出典として挙げた資料のうち {_unverified_total} 件は、確認できなかったため出典に載せていません"
                        "（出典の欄の下の「確認できなかった資料」を参照）"
                        + ("。名前を表示できない資料があります。" if _sensitive_refs else "。"))
-        env["headline"] = _body if (_verified_refs and _body.strip()) else st.answer  # 空本文には差し替えない
+        env["headline"] = _body if _body.strip() else st.answer  # 参照の欄は本文から外す（空本文には差し替えない）
         if _schema_on:
             # v2 のときだけ主張配列を持つ（v1 は常に空リスト）。区分と理由コードを envelope にも載せる（共有・監査で消えないよう `sherpa/store/shares.py::_safe_claim` が既知フィールドのみで再構築する）。
             _claims = _pick_structured_claims(st)
@@ -592,14 +710,14 @@ def assemble_result(self, ctx, st, decision, env):
                 env.setdefault("data", {})["reconciliation"] = _recon_rows
                 if _recon_meta["unverified"]:
                     add_notice(env, "reconciliation_unverified",
-                               f"設計書とソースの照らし合わせのうち {_recon_meta['unverified']} 件は、根拠の資料を確認できなかったため「未確認」にしています。")
+                               f"設計書とソースの照らし合わせのうち {_recon_meta['unverified']} 件は、根拠の資料か、その中の位置を確かめられなかったため「未確認」にしています。")
                 if _recon_meta["more"]:
                     add_notice(env, "reconciliation_more",
                                f"設計書とソースの照らし合わせは件数が多いため、{_recon_meta['more']} 件を表に出していません。")
             if _recon_invalid:
                 add_notice(env, "reconciliation_invalid",
                            f"設計書とソースの照らし合わせのうち {_recon_invalid} 件は形式が不正で、表に出せませんでした。")
-        # 実際に回答を生成できたターンは、`_dispatch` がツール遮断時に立てた `agentic_failure`（`agentic_search.tools_blocked_env`）を消す（Codex は遮断状態を見ずに調査を続行し得るため）。
+        # 実際に回答を生成できたターンは、`_gather` が最小 env に立てた `agentic_failure` を消す。
         env.pop("agentic_failure", None)
         # 「追加で調べますか？」: 最後の中間の見直しが mostly_answered かつ extra_perspectives を挙げていたら定型文を付ける（AI の自由記述はそのまま流さない・`_review_continuation_note_text` は観点を短く切って並べた決定的な文字列）。台帳は既に退避済みで、「続き」で復元されれば `_investigation_dir`／`reviews.jsonl` がそのまま戻る。
         if st._review_continuation_note_text:
@@ -615,8 +733,6 @@ def assemble_result(self, ctx, st, decision, env):
         # `_gather` が組み立てた決定的回答をそのまま返さず、利用者に「AI が答えていない」ことが伝わるよう `_UnwiredProvider` と同じ文体の正直な文言に上書きする。summary/sources は `_gather` の実結果のまま残すが、sources が空なら data も `{}` へ揃える（`chat_service._no_genuine_results` の honest failure 規約と一致させる）。
         # 無出力失敗はプロキシ/CA 証明書の不備・sandbox の起動失敗・CLI のクラッシュでも起きるため、認証だけに断定せず、観測事実（応答を返す前に終了）を述べて考えられる原因を複数挙げる。returncode は利用者向け本文には出さずログにだけ残す。stderr は破棄している。
         # `turn.failed`／`error` で閉じた attempt（agent_message 無し）は「回答を返せずに終了しました」とし、既存の無出力失敗と文言を分ける（スキーマ違反なども原因になり得るため）。
-        _reason = ("回答を返せずに終了しました" if st._turn_failed
-                  else "応答を返す前に終了しました")
         if st._turn_failed_code:
             # 閉集合ではない生の診断コード（統計・分類には使わない・管理者向け補助情報）。
             env["codex_error_code"] = st._turn_failed_code
@@ -627,9 +743,16 @@ def assemble_result(self, ctx, st, decision, env):
                 "範囲（フォルダ）を絞るか、質問を分けてやり直してください。"
             )
             env["limits"] = {**(env.get("limits") or {}), "total_budget_hit": True}
+        elif st._turn_failed:
+            _code = f"（コード: {st._turn_failed_code}）" if st._turn_failed_code else ""
+            env["headline"] = (
+                f"Codex が回答を返せずに終了しました{_code}。"
+                "利用上限やモデルの指定など、Codex 側の設定を管理者に確認してもらってください。"
+                "詳細は管理者向けの Codex ログ（codex.log）を参照してください。"
+            )
         else:
             env["headline"] = (
-                f"Codex に接続できませんでした（Codex CLI が{_reason}）。考えられる原因はいくつかあります: "
+                "Codex に接続できませんでした（Codex CLI が応答を返す前に終了しました）。考えられる原因はいくつかあります: "
                 "認証が設定されていない（`codex login`）／プロキシや CA 証明書などのネットワーク設定が"
                 "不足している／サンドボックスの起動に失敗した／Codex CLI 自体が異常終了した、のいずれかです。"
                 "管理者にログの確認を依頼してください。詳細は管理者向けの Codex ログ（codex.log）を参照してください。"
@@ -648,10 +771,7 @@ def assemble_result(self, ctx, st, decision, env):
             env["codex_silent_failure"] = True
         if st._codex_stopped_early:
             env["codex_stopped_early"] = True
-        # presearch を省いたターンは決定的回答へ「切替」ようが無い（下調べを実行していない）ため、決定的回答を使ったかのような文言にしない。
-        _no_answer_detail = ("（未応答のため回答を出せませんでした）" if _skip_presearch
-                             else "（未応答のため決定的回答に切替）")
-        yield _node("codex", "think", "Codex が調べる", _no_answer_detail, "done")
+        yield _node("codex", "think", "Codex が調べる", "（未応答のため回答を出せませんでした）", "done")
     # 範囲にソースが無い（または探す対象が資料だけ）ときは、止めず・格下げせず、必ずこの注記を出す。
     _no_source_text = _scope_no_source_notice(st._scope_source_state, st._layer)
     if _no_source_text:
@@ -702,6 +822,10 @@ def assemble_result(self, ctx, st, decision, env):
           "investigation_record": st._investigation_record_payload}
 
 
+RESUME_RESTARTED_NOTICE = ("前の調査セッションを再開できなかったため、保存済みの会話の履歴から新しく調べ直しました。"
+                           "前の調査の途中経過は引き継がれていません。")
+
+
 def _finish_partial_status(ctx, st, env):
     """回収済みの本文は書き換えず、注記を `answer.notices` へ足し、停止・部分回答の終端を記録して回答の形を確定する。"""
     if st._invalid_output_events:
@@ -712,6 +836,8 @@ def _finish_partial_status(ctx, st, env):
         add_notice(env, _kind, _text)
     if st._tool_zero_notice:
         add_notice(env, "no_tool_use", NO_TOOL_USE_NOTICE)
+    if st._resume_fallback_happened:
+        add_notice(env, "resume_restarted", RESUME_RESTARTED_NOTICE)
     if st._codex_stopped_early:
         add_notice(env, "stopped_early", STOPPED_EARLY_NOTICE)
     if st._trimmed:

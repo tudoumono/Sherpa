@@ -15,6 +15,7 @@ from _world_setup import TEST_WORLD_ID
 
 from sherpa import es_index
 from sherpa.parts.read import fused_search
+from tests._replace_row import offline_row
 
 
 def _es_or_skip():
@@ -44,7 +45,7 @@ def _index_v1():
     """TEST_WORLD_ID（fixtures/corpus/v1 のエイリアス）を ES に索引する（既存 test_es_index.py と同一手順）。"""
     from _world_registry import register_test_world
     register_test_world(TEST_WORLD_ID)
-    r = es_index.index_world(TEST_WORLD_ID)
+    r = es_index.index_world(TEST_WORLD_ID, row=offline_row(TEST_WORLD_ID))
     assert r["available"] and r["indexed"] > 0 and r["chunks"] > 0
     return r
 
@@ -76,7 +77,7 @@ def test_knn_only_no_bm25_leak(monkeypatch):
 
     es_index._req = _cap
     try:
-        es_index.index_world(TEST_WORLD_ID, settings={})   # dense_vector 付きで再索引（_meta 一致させる）
+        es_index.index_world(TEST_WORLD_ID, settings={}, row=offline_row(TEST_WORLD_ID))   # dense_vector 付きで再索引（_meta 一致させる）
         hits, reason = es_index.search_knn_only(TEST_WORLD_ID, "消費税", k=3, settings={})
         assert reason is None and hits
         assert bodies, "kNN クエリが発行されていない"
@@ -84,7 +85,7 @@ def test_knn_only_no_bm25_leak(monkeypatch):
         assert "knn" in body and "query" not in body   # 純 kNN（bool/match の BM25 節が無い）
     finally:
         embeddings.cfg, embeddings.embed, es_index._req = orig_cfg, orig_embed, orig_req
-        es_index.index_world(TEST_WORLD_ID, settings={})   # BM25 索引へ戻す（他テストへの影響防止）
+        es_index.index_world(TEST_WORLD_ID, settings={}, row=offline_row(TEST_WORLD_ID))   # BM25 索引へ戻す（他テストへの影響防止）
 
 
 def test_existing_search_unchanged():

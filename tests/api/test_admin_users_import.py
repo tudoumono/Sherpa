@@ -75,7 +75,7 @@ def test_import_creates_everyone_with_must_change_password():
     r = c.post("/admin/users/import", files=_csv(
         f"{u1},一,,user,Zq7!xW2mK9p", f"{u2},二,{u2}@x.local,admin,Rt5#vB8nL3q"))
     assert r.status_code == 200, r.text
-    assert r.json() == {"created": 2, "uids": [u1, u2]}
+    assert r.json() == {"created": 2, "uids": [u1, u2], "audit_recorded": True}
     for uid, role in ((u1, "user"), (u2, "admin")):
         row = store.get_user(uid)
         assert row["role"] == role and row["must_change_password"] is True

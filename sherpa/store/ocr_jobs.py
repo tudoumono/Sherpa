@@ -9,13 +9,14 @@ import re
 import uuid
 from dataclasses import asdict
 from pathlib import PurePosixPath
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import psycopg
 from psycopg.types.json import Json
 
-from .db import _connect, _ensure
+from .db import _connect, _connect_bounded, _ensure, _ensure_unless_bounded
+from .replace_rows import ReplaceRow, check_held_in
 
 
 _SHA256_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
@@ -48,6 +49,23 @@ def _world_id(value: str) -> str:
     if not world:
         raise ValueError("world is required")
     return world
+
+
+def _profile_filter(engine_profile_hash: str | None) -> tuple[str, list[str]]:
+    """現行 engine profile の行だけに絞る句と引数。None は絞らない。"""
+    if engine_profile_hash is None:
+        return "", []
+    return " AND engine_profile_hash=%s", [_tagged_hash(engine_profile_hash)]
+
+
+def _progressable_work(alias: str = "") -> str:
+    """queued/leased のうち、将来の lease または現在の有効 lease で進みうる行の条件。"""
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"(({prefix}status='queued' AND {prefix}attempts<{prefix}max_attempts) OR "
+        f"({prefix}status='leased' AND {prefix}lease_expires_at IS NOT NULL AND "
+        f"({prefix}attempts<{prefix}max_attempts OR {prefix}lease_expires_at>now())))"
+    )
 
 
 def _job_values(
@@ -89,7 +107,7 @@ def _insert_job(connection, values, priority: int, max_attempts: int) -> dict[st
         "INSERT INTO ocr_jobs (world, source_rel_path, canonical_generation_id, source_content_hash, "
         "route_manifest_hash, route_input_id, route_input, engine_profile_hash, priority, max_attempts) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-        "ON CONFLICT (world, canonical_generation_id, route_input_id, engine_profile_hash) DO UPDATE SET "
+        "ON CONFLICT (world, canonical_generation_id, source_rel_path, route_input_id, engine_profile_hash) DO UPDATE SET "
         "priority=GREATEST(ocr_jobs.priority, EXCLUDED.priority), updated_at=now() "
         "RETURNING *",
         (*values[:6], Json(values[6]), values[7], priority, max_attempts),
@@ -184,6 +202,7 @@ def enqueue_refresh_run(
 
     通常の重複呼出しは既存runをそのまま返す。明示的な``force``はterminal runだけを先頭から
     再queueし、処理中runのleaseやcursorは奪わない。
+    同じtransactionで、このworldの現行でないprofileの未着手の仕事を終端する（``retire_other_profile_work``）。
     """
     selected_world = _world_id(world)
     generation = _generation_id(canonical_generation_id)
@@ -192,6 +211,7 @@ def enqueue_refresh_run(
         raise ValueError("max_attempts must be positive")
     _ensure()
     with _connect() as connection:
+        _retire_other_profile_work(connection, profile, selected_world)
         inserted = connection.execute(
             "INSERT INTO ocr_refresh_runs (world, canonical_generation_id, engine_profile_hash, max_attempts) "
             "VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING *",
@@ -222,15 +242,19 @@ def lease_refresh_run(
     *,
     lease_seconds: int = 90,
     world: str | None = None,
+    engine_profile_hash: str | None = None,
 ) -> dict[str, Any] | None:
-    """manifest展開runを1件leaseする。cursorは期限切れ回収時にも維持する。"""
+    """manifest展開runを1件leaseする。cursorは期限切れ回収時にも維持する。``engine_profile_hash``を渡すとその profile の run だけを取る。"""
     if not worker_id.strip() or lease_seconds <= 0:
         raise ValueError("worker_id and positive lease_seconds are required")
     token = uuid.uuid4().hex
     world_clause = " AND world=%s" if world is not None else ""
+    profile_clause, profile_params = _profile_filter(engine_profile_hash)
+    world_clause += profile_clause
     params: list[Any] = []
     if world is not None:
         params.append(_world_id(world))
+    params.extend(profile_params)
     params.extend([worker_id.strip(), token, lease_seconds])
     _ensure()
     with _connect() as connection:
@@ -240,6 +264,8 @@ def lease_refresh_run(
             "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=now(), finished_at=now() "
             "WHERE status='leased' AND lease_expires_at<=now() AND attempts>=max_attempts"
         )
+        if engine_profile_hash is not None:
+            _retire_other_profile_work(connection, _tagged_hash(engine_profile_hash), None)
         return connection.execute(
             "WITH candidate AS (SELECT id FROM ocr_refresh_runs WHERE "
             "(status='queued' OR (status='leased' AND lease_expires_at<=now())) AND attempts<max_attempts" +
@@ -327,6 +353,27 @@ def fail_refresh_run(
         ).fetchone()
 
 
+def pause_refresh_run(
+    run_id: int,
+    lease_token: str,
+    *,
+    error_code: str,
+    error_detail: str | None = None,
+) -> dict[str, Any] | None:
+    """停止（切・ワーカー停止）でrunをqueuedへ戻す。leaseで増えたattemptsを戻し、cursorは保つ。"""
+    if not error_code.strip():
+        raise ValueError("refresh error_code is required")
+    _ensure()
+    with _connect() as connection:
+        return connection.execute(
+            "UPDATE ocr_refresh_runs SET status='queued', attempts=GREATEST(attempts-1, 0), "
+            "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, error_code=%s, error_detail=%s, "
+            "updated_at=now(), finished_at=NULL "
+            "WHERE id=%s AND status='leased' AND lease_token=%s RETURNING *",
+            (error_code.strip(), error_detail, run_id, lease_token),
+        ).fetchone()
+
+
 def mark_refresh_run_stale(run_id: int, lease_token: str) -> dict[str, Any] | None:
     _ensure()
     with _connect() as connection:
@@ -339,18 +386,32 @@ def mark_refresh_run_stale(run_id: int, lease_token: str) -> dict[str, Any] | No
         ).fetchone()
 
 
-def lease_next(worker_id: str, *, lease_seconds: int = 900, world: str | None = None) -> dict | None:
-    """優先度順に1件leaseする。期限切れleaseはattemptを増やして別workerが回収できる。"""
+def lease_next(
+    worker_id: str,
+    *,
+    lease_seconds: int = 900,
+    world: str | None = None,
+    engine_profile_hash: str | None = None,
+) -> dict | None:
+    """優先度順に1件leaseする。期限切れleaseはattemptを増やして別workerが回収できる。
+
+    ``engine_profile_hash``を渡すと、その profile の job だけを取る（別 profile の job に先を塞がれない）。
+    """
     if not worker_id.strip() or lease_seconds <= 0:
         raise ValueError("worker_id and positive lease_seconds are required")
     token = uuid.uuid4().hex
     world_clause = " AND world=%s" if world is not None else ""
+    profile_clause, profile_params = _profile_filter(engine_profile_hash)
+    world_clause += profile_clause
     params: list[Any] = []
     if world is not None:
         params.append(world)
+    params.extend(profile_params)
     params.extend([worker_id.strip(), token, lease_seconds])
     _ensure()
     with _connect() as connection:
+        if engine_profile_hash is not None:
+            _retire_other_profile_work(connection, _tagged_hash(engine_profile_hash), None)
         # 最終attemptのworkerがcrashしたjobは、期限切れ後もleasedのまま永久保留にしない。
         connection.execute(
             "UPDATE ocr_jobs SET status='failed', error_code=COALESCE(error_code,'lease_expired'), "
@@ -442,6 +503,51 @@ def fail_job(
         ).fetchone()
 
 
+def _failed_filter(error_codes: Sequence[str] | None, world: str | None) -> tuple[str, list[Any]]:
+    codes = None
+    if error_codes is not None:
+        codes = [str(code).strip() for code in error_codes]
+        if not codes or any(not code for code in codes):
+            raise ValueError("error_codes must be non-empty strings")
+    where = "status='failed'"
+    params: list[Any] = []
+    if codes is not None:
+        where += " AND error_code = ANY(%s)"
+        params.append(codes)
+    if world is not None:
+        where += " AND world=%s"
+        params.append(_world_id(world))
+    return where, params
+
+
+def count_failed_jobs(*, error_codes: Sequence[str] | None = None, world: str | None = None) -> dict[str, int]:
+    """failed の job 数を error_code 別に返す（理由なしは空文字）。`requeue_failed_jobs` と同じ絞り込み。"""
+    where, params = _failed_filter(error_codes, world)
+    _ensure()
+    with _connect() as connection:
+        rows = connection.execute(
+            f"SELECT COALESCE(error_code,'') AS error_code, count(*) AS count FROM ocr_jobs WHERE {where} "
+            "GROUP BY 1 ORDER BY 1", params,
+        ).fetchall()
+    return {str(row["error_code"]): int(row["count"]) for row in rows}
+
+
+def requeue_failed_jobs(*, error_codes: Sequence[str] | None = None, world: str | None = None) -> int:
+    """failed の job を queued へ戻し attempts を 0 にして、積み直した件数を返す。
+
+    `error_codes`（理由）・`world`（資料フォルダ）で絞れる。leased／queued／succeeded などは触らない。
+    """
+    where, params = _failed_filter(error_codes, world)
+    _ensure()
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE ocr_jobs SET status='queued', attempts=0, available_at=now(), "
+            "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, error_code=NULL, error_detail=NULL, "
+            f"updated_at=now(), finished_at=NULL WHERE {where}", params,
+        )
+        return int(cursor.rowcount)
+
+
 def cancel_unsupported_image_job(job_id: int, lease_token: str) -> dict | None:
     """読めない画像形式の job を、lease を確認した上で cancelled に終端する（失敗には数えない）。"""
     _ensure()
@@ -466,11 +572,47 @@ def mark_stale(job_id: int, lease_token: str, *, reason: str = "canonical_genera
         ).fetchone()
 
 
-def purge_world(world: str) -> dict[str, int]:
-    """World削除/rebind用。OCR本文を含むjob/cache/runを1 transactionで消去する。"""
+def _retire_other_profile_work(connection, engine_profile_hash: str, world: str | None) -> dict[str, int]:
+    # 守ること: ocr_refresh_runs → ocr_jobs の順に更新する（purge_world と同じ順）。
+    world_clause = " AND world=%s" if world is not None else ""
+    tail = [world] if world is not None else []
+    idle = "(status='queued' OR (status='leased' AND lease_expires_at<=now()))"
+    other = "(engine_profile_hash<%s OR engine_profile_hash>%s) AND status IN ('queued','leased')"
+    runs = connection.execute(
+        "UPDATE ocr_refresh_runs SET status='cancelled', lease_owner=NULL, lease_token=NULL, "
+        "lease_expires_at=NULL, error_code='stale_profile', error_detail='engine profile is no longer current', "
+        "updated_at=now(), finished_at=now() "
+        f"WHERE {other} AND {idle}{world_clause}",
+        [engine_profile_hash, engine_profile_hash, *tail],
+    )
+    jobs = connection.execute(
+        "UPDATE ocr_jobs SET status='stale', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, "
+        "error_code='stale_profile', error_detail='engine profile is no longer current', "
+        "updated_at=now(), finished_at=now() "
+        f"WHERE {other} AND {idle}{world_clause}",
+        [engine_profile_hash, engine_profile_hash, *tail],
+    )
+    return {"jobs": int(jobs.rowcount), "refresh_runs": int(runs.rowcount)}
+
+
+def retire_other_profile_work(engine_profile_hash: str, *, world: str | None = None) -> dict[str, int]:
+    """現行でない engine profile の未着手の仕事（queued・期限切れの leased）を終端する。
+
+    job は stale、refresh run は cancelled にする。失敗には数えない。実行中（期限内の lease）には触らない。
+    """
+    profile = _tagged_hash(engine_profile_hash)
+    selected_world = _world_id(world) if world is not None else None
+    _ensure()
+    with _connect() as connection:
+        return _retire_other_profile_work(connection, profile, selected_world)
+
+
+def purge_world(world: str, *, row: ReplaceRow) -> dict[str, int]:
+    """World削除/rebind用。OCR本文を含むjob/cache/runを1 transactionで消去する（消去の行を持つ呼び出しだけが呼べる）。"""
     selected_world = _world_id(world)
     _ensure()
     with _connect() as connection:
+        check_held_in(connection, row, selected_world)
         runs = connection.execute(
             "DELETE FROM ocr_refresh_runs WHERE world=%s", (selected_world,),
         )
@@ -480,31 +622,33 @@ def purge_world(world: str) -> dict[str, int]:
         cache = connection.execute(
             "DELETE FROM ocr_result_cache WHERE world=%s", (selected_world,),
         )
-        jobs_deleted = int(jobs.rowcount)
-        cache_deleted = int(cache.rowcount)
-        runs_deleted = int(runs.rowcount)
-    return {
-        "jobs": jobs_deleted,
-        "cache_entries": cache_deleted,
-        "refresh_runs": runs_deleted,
-    }
+        counts = {"jobs": int(jobs.rowcount), "cache_entries": int(cache.rowcount), "refresh_runs": int(runs.rowcount)}
+    return counts
 
 
-def generation_state(world: str, canonical_generation_id: str) -> dict[str, int | bool]:
-    """snapshot公開判定を1 DB snapshotで返す。refresh展開中はjobがゼロでもterminalではない。"""
+def generation_state(
+    world: str, canonical_generation_id: str, *, engine_profile_hash: str | None = None,
+) -> dict[str, int | bool]:
+    """snapshot公開判定を1 DB snapshotで返す。進行可能なrefresh展開中はjobがゼロでもterminalではない。
+
+    ``engine_profile_hash``を渡すと、その profile の job・refresh run だけを数える。期限切れの最終
+    lease など、既存状態からこれ以上進まない行は公開を止めない。
+    """
     selected_world = _world_id(world)
     generation = _generation_id(canonical_generation_id)
+    profile_clause, profile_params = _profile_filter(engine_profile_hash)
+    scope = (selected_world, generation, *profile_params)
     _ensure()
     with _connect() as connection:
         row = connection.execute(
             "SELECT "
             "(SELECT count(*) FROM ocr_jobs WHERE world=%s AND canonical_generation_id=%s "
-            " AND status IN ('queued','leased')) AS pending_jobs, "
+            f" AND {_progressable_work()}{profile_clause}) AS pending_jobs, "
             "(SELECT count(*) FROM ocr_jobs WHERE world=%s AND canonical_generation_id=%s "
-            " AND status='succeeded' AND artifact_published=false) AS unpublished_jobs, "
+            f" AND status='succeeded' AND artifact_published=false{profile_clause}) AS unpublished_jobs, "
             "(SELECT count(*) FROM ocr_refresh_runs WHERE world=%s AND canonical_generation_id=%s "
-            " AND status IN ('queued','leased')) AS pending_refresh_runs",
-            (selected_world, generation, selected_world, generation, selected_world, generation),
+            f" AND {_progressable_work()}{profile_clause}) AS pending_refresh_runs",
+            (*scope, *scope, *scope),
         ).fetchone()
     pending_jobs = int(row["pending_jobs"])
     pending_runs = int(row["pending_refresh_runs"])
@@ -517,8 +661,10 @@ def generation_state(world: str, canonical_generation_id: str) -> dict[str, int 
     }
 
 
-def generation_ready_for_publication(world: str, canonical_generation_id: str) -> bool:
-    state = generation_state(world, canonical_generation_id)
+def generation_ready_for_publication(
+    world: str, canonical_generation_id: str, *, engine_profile_hash: str | None = None,
+) -> bool:
+    state = generation_state(world, canonical_generation_id, engine_profile_hash=engine_profile_hash)
     return bool(state["terminal"] and state["unpublished_jobs"])
 
 
@@ -557,14 +703,43 @@ def status_summary(world: str, canonical_generation_id: str | None = None) -> di
     return {**summary, "counts": counts, "total": sum(counts.values()), "updated_at": last["updated_at"] if last else None}
 
 
+def get_progress_counts(
+    world: str,
+    canonical_generation_id: str | None = None,
+    *,
+    connect_timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> dict[str, int]:
+    """状態コマンド専用。`pending`（queued/leased）・`processed`（succeeded）・`failed`・`unpublished`（succeeded で未公開）を1回の集計で返す。
+    世代を渡さないときは world 全体の件数で、`unpublished` は 0。プールを使わない専用接続で読み、サーバー側の `statement_timeout` で打ち切る。
+    """
+    where = "world=%s"
+    params: list[Any] = [_world_id(world)]
+    unpublished = "0"
+    if canonical_generation_id is not None:
+        where += " AND canonical_generation_id=%s"
+        params.append(_generation_id(canonical_generation_id))
+        unpublished = "count(*) FILTER (WHERE status='succeeded' AND artifact_published=false)"
+    _ensure_unless_bounded(connect_timeout, statement_timeout_ms)
+    with _connect_bounded(connect_timeout, statement_timeout_ms) as connection:
+        row = connection.execute(
+            "SELECT count(*) FILTER (WHERE status IN ('queued','leased')) AS pending, "
+            "count(*) FILTER (WHERE status='succeeded') AS processed, "
+            "count(*) FILTER (WHERE status='failed') AS failed, "
+            f"{unpublished} AS unpublished FROM ocr_jobs WHERE {where}", params,
+        ).fetchone()
+    return {name: int(row[name]) for name in ("pending", "processed", "failed", "unpublished")}
+
+
 def iter_succeeded_results(
     world: str,
     canonical_generation_id: str,
     sort_key: Callable[[str], str],
     *,
     batch_size: int = 100,
+    engine_profile_hash: str | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """完了Setを、呼出側が渡す``sort_key``が決める順で有界に読む。
+    """完了Setを、呼出側が渡す``sort_key``が決める順で有界に読む。``engine_profile_hash``を渡すとその profile の結果だけを読む。
     ① ``id, source_rel_path, result_observation_set_hash``だけを全件読む（本体``result_payload``は含まない）。
     ② ``(sort_key(source_rel_path), result_observation_set_hash, id)``順にPython側で並べる。
     ③ その順に``batch_size``件ずつ``id = ANY(%s)``で本体を取り出し、並べた順にyieldする。
@@ -574,13 +749,14 @@ def iter_succeeded_results(
     generation = _generation_id(canonical_generation_id)
     if batch_size <= 0 or batch_size > 1000:
         raise ValueError("invalid OCR result batch size")
+    profile_clause, profile_params = _profile_filter(engine_profile_hash)
     _ensure()
     with _connect() as connection:
         light_rows = connection.execute(
             "SELECT id, source_rel_path, result_observation_set_hash FROM ocr_jobs "
             "WHERE world=%s AND canonical_generation_id=%s AND status='succeeded' "
-            "AND result_payload IS NOT NULL AND result_observation_set_hash IS NOT NULL",
-            (selected_world, generation),
+            f"AND result_payload IS NOT NULL AND result_observation_set_hash IS NOT NULL{profile_clause}",
+            (selected_world, generation, *profile_params),
         ).fetchall()
     ordered_ids = [
         int(row["id"])
@@ -598,8 +774,9 @@ def iter_succeeded_results(
         with _connect() as connection:
             body_rows = connection.execute(
                 "SELECT * FROM ocr_jobs WHERE world=%s AND canonical_generation_id=%s AND status='succeeded' "
-                "AND result_payload IS NOT NULL AND result_observation_set_hash IS NOT NULL AND id = ANY(%s)",
-                (selected_world, generation, batch_ids),
+                f"AND result_payload IS NOT NULL AND result_observation_set_hash IS NOT NULL{profile_clause} "
+                "AND id = ANY(%s)",
+                (selected_world, generation, *profile_params, batch_ids),
             ).fetchall()
         by_id = {int(row["id"]): row for row in body_rows}
         for row_id in batch_ids:
@@ -608,18 +785,21 @@ def iter_succeeded_results(
                 yield row
 
 
-def succeeded_results_snapshot(world: str, canonical_generation_id: str) -> dict[str, int | None]:
-    """完了Set集合の小さい不変性tokenを返す（result本文やID listを返さない）。"""
+def succeeded_results_snapshot(
+    world: str, canonical_generation_id: str, *, engine_profile_hash: str | None = None,
+) -> dict[str, int | None]:
+    """完了Set集合の小さい不変性tokenを返す（result本文やID listを返さない）。``engine_profile_hash``を渡すとその profile の結果だけを数える。"""
     selected_world = _world_id(world)
     generation = _generation_id(canonical_generation_id)
+    profile_clause, profile_params = _profile_filter(engine_profile_hash)
     _ensure()
     with _connect() as connection:
         row = connection.execute(
             "SELECT count(*) AS row_count, min(id) AS min_id, max(id) AS max_id, "
             "COALESCE(sum(id),0) AS id_sum FROM ocr_jobs "
             "WHERE world=%s AND canonical_generation_id=%s AND status='succeeded' "
-            "AND result_payload IS NOT NULL AND result_observation_set_hash IS NOT NULL",
-            (selected_world, generation),
+            f"AND result_payload IS NOT NULL AND result_observation_set_hash IS NOT NULL{profile_clause}",
+            (selected_world, generation, *profile_params),
         ).fetchone()
     return {
         "row_count": int(row["row_count"]),
@@ -629,23 +809,30 @@ def succeeded_results_snapshot(world: str, canonical_generation_id: str) -> dict
     }
 
 
-def list_unpublished_generations(*, limit: int = 100) -> list[dict[str, Any]]:
-    """worker再起動・artifact publish失敗後の自己修復候補を新しい順で返す。"""
+def list_unpublished_generations(
+    *, limit: int = 100, engine_profile_hash: str | None = None,
+) -> list[dict[str, Any]]:
+    """worker再起動・artifact publish失敗後の自己修復候補を新しい順で返す。``engine_profile_hash``を渡すとその profile の job・run だけを見る。"""
     if limit <= 0 or limit > 1000:
         raise ValueError("invalid unpublished generation limit")
+    profile_clause, profile_params = _profile_filter(engine_profile_hash)
+    candidate_clause = profile_clause.replace("engine_profile_hash", "candidate.engine_profile_hash")
+    pending_clause = profile_clause.replace("engine_profile_hash", "pending.engine_profile_hash")
+    refresh_clause = profile_clause.replace("engine_profile_hash", "refresh.engine_profile_hash")
     _ensure()
     with _connect() as connection:
         return connection.execute(
             "SELECT candidate.world, candidate.canonical_generation_id, max(candidate.updated_at) AS updated_at "
-            "FROM ocr_jobs AS candidate WHERE candidate.status='succeeded' AND candidate.artifact_published=false "
+            "FROM ocr_jobs AS candidate WHERE candidate.status='succeeded' AND candidate.artifact_published=false"
+            f"{candidate_clause} "
             "AND NOT EXISTS (SELECT 1 FROM ocr_jobs AS pending WHERE pending.world=candidate.world "
             " AND pending.canonical_generation_id=candidate.canonical_generation_id "
-            " AND pending.status IN ('queued','leased')) "
+            f" AND {_progressable_work('pending')}{pending_clause}) "
             "AND NOT EXISTS (SELECT 1 FROM ocr_refresh_runs AS refresh WHERE refresh.world=candidate.world "
             " AND refresh.canonical_generation_id=candidate.canonical_generation_id "
-            " AND refresh.status IN ('queued','leased')) "
+            f" AND {_progressable_work('refresh')}{refresh_clause}) "
             "GROUP BY candidate.world, candidate.canonical_generation_id ORDER BY updated_at DESC LIMIT %s",
-            (limit,),
+            (*profile_params, *profile_params, *profile_params, limit),
         ).fetchall()
 
 
@@ -653,6 +840,8 @@ def mark_snapshot_artifacts_published(
     world: str,
     canonical_generation_id: str,
     snapshot: dict[str, int | None],
+    *,
+    engine_profile_hash: str | None = None,
 ) -> int:
     """同じ完了Set集合のままなら、集合全体をID listなしで公開済みにする。
     集合照合とUPDATEは1 SQL statementのsnapshotで行い、並行して新しい成功jobが見えた場合は何もmarkしない（workerのself-repairに任せる）。
@@ -670,23 +859,25 @@ def mark_snapshot_artifacts_published(
             or (row_count == 0 and (min_id is not None or max_id is not None))
             or (row_count > 0 and (min_id is None or max_id is None))):
         raise ValueError("invalid succeeded OCR snapshot")
+    profile_clause, profile_params = _profile_filter(engine_profile_hash)
+    job_profile_clause = profile_clause.replace("engine_profile_hash", "job.engine_profile_hash")
     _ensure()
     with _connect() as connection:
         row = connection.execute(
             "WITH current AS MATERIALIZED ("
             " SELECT count(*) AS row_count, min(id) AS min_id, max(id) AS max_id, COALESCE(sum(id),0) AS id_sum"
             " FROM ocr_jobs WHERE world=%s AND canonical_generation_id=%s AND status='succeeded'"
-            " AND result_payload IS NOT NULL AND result_observation_set_hash IS NOT NULL"
+            f" AND result_payload IS NOT NULL AND result_observation_set_hash IS NOT NULL{profile_clause}"
             "), updated AS ("
             " UPDATE ocr_jobs AS job SET artifact_published=true, updated_at=now() FROM current"
             " WHERE job.world=%s AND job.canonical_generation_id=%s AND job.status='succeeded'"
-            " AND job.result_payload IS NOT NULL AND job.result_observation_set_hash IS NOT NULL"
+            f" AND job.result_payload IS NOT NULL AND job.result_observation_set_hash IS NOT NULL{job_profile_clause}"
             " AND job.artifact_published=false AND current.row_count=%s"
             " AND current.min_id IS NOT DISTINCT FROM %s AND current.max_id IS NOT DISTINCT FROM %s"
             " AND current.id_sum=%s RETURNING job.id"
             ") SELECT count(*) AS marked FROM updated",
             (
-                selected_world, generation, selected_world, generation,
+                selected_world, generation, *profile_params, selected_world, generation, *profile_params,
                 row_count, min_id, max_id, id_sum,
             ),
         ).fetchone()

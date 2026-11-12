@@ -1,0 +1,27 @@
+{
+  "counts": {
+    "edge_types": {
+      "ACCESSES": 2,
+      "CONTAINS": 9,
+      "COPIES": 4,
+      "INVOKES": 8
+    },
+    "edges": 23,
+    "flag_reasons": {
+      "copy_cycle": 1,
+      "dropped_syntax": 6,
+      "unresolved": 2
+    },
+    "flags": 9,
+    "node_labels": {
+      "Batch": 4,
+      "Copybook": 5,
+      "DataItem": 9,
+      "Module": 10,
+      "Table": 2
+    },
+    "nodes": 30
+  },
+  "sha256": "b7a47170983f7b9923ebca41ea24e39f72f31caa09386e10c4fdcefd7f8240a4",
+  "world": "ana-s4"
+}

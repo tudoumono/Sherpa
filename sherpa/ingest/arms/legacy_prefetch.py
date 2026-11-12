@@ -1,6 +1,7 @@
 """旧形式（.doc/.xls/.ppt）の先変換。MD 化の本体ループが旧形式へ着く前に、別スレッドから soffice をまとめて・並列に起動して OOXML への変換を済ませ、旧形式キャッシュ（`legacy_convert.ensure_ooxml` と同じ置き場・同じ鍵）へ入れておく。
 
-本体ループは今まで通り `ensure_ooxml` を呼び、キャッシュに当たって先へ進む。先変換が失敗・タイムアウト・出力欠落したものはキャッシュへ入れず放置する（本体ループが 1 件ずつ変換し、原因の資料の失敗の理由・ログもそこで出る）。バッチ全体の失敗・時間切れ・異常終了・メモリの上限超えは、バッチの件数と理由を警告 1 行で残す。
+本体ループは今まで通り `ensure_ooxml` を呼び、キャッシュに当たって先へ進む。先変換が失敗・出力欠落したものはキャッシュへ入れず放置する（本体ループが 1 件ずつ変換し、原因の資料の失敗の理由・ログもそこで出る）。バッチ全体の失敗・時間切れ・異常終了・メモリの上限超えは、バッチの件数と理由を警告 1 行で残す。
+時間切れでバッチを止めたとき、実際に変換を始めたと分かる資料（.xls は資料ごとの開始の印、--convert-to の経路はバッチが 1 件のとき）が 1 件分の上限（`SHERPA_LEGACY_TIMEOUT`）以上使っていたら、その資料は時間切れの確定として `timed_out` に残す＝本体ループは同じ資料を変換し直さず、時間切れの失敗として記録する。確定できないもの（開始が分からない・上限に満たない・まだ着手していない）は今まで通り本体ループが変換する。
 バッチを始める前に空きメモリを確かめ、下限を下回る間は短く待つ。最大まで待っても空かなければ並列を 1 つ減らして進める（本体ループの 1 件変換は待たない）。
 対象は libreoffice バックエンドだけ。1 バッチ＝同じ拡張子の最大 `SHERPA_LEGACY_BATCH` 件を 1 回の soffice 起動で変換し、`SHERPA_LEGACY_WORKERS` 本のスレッドがそれぞれ専用プロファイルでバッチを処理する（0 で先変換を行わない）。
 設計: docs/design/rag.md「アーム一覧」
@@ -11,6 +12,7 @@ import logging
 import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from sherpa.env_int import env_int
@@ -62,6 +64,7 @@ class LegacyPrefetcher:
         self._entries: dict[str, _Entry] = {}
         self._pending: dict[str, _Entry] = {}
         self._closed = False
+        self._timed_out: set[str] = set()
         self.planned = 0
         self.stored = 0
         self._workers = workers
@@ -118,6 +121,11 @@ class LegacyPrefetcher:
                 return
             while entry.state == "running" and not self._closed:
                 self._cond.wait(timeout=1.0)
+
+    def timed_out(self, rel: str) -> bool:
+        """`settle(rel)` の後に呼ぶ。先変換が 1 件分の上限まで使って時間切れにした原本か（本体ループは変換し直さない）。"""
+        with self._cond:
+            return rel in self._timed_out
 
     def close(self) -> None:
         with self._cond:
@@ -192,6 +200,31 @@ class LegacyPrefetcher:
                     self.stored += 1
             self._finish([entry])
 
+    def _mark_timed_out(self, batch: list[_Entry], indexes: list[int], outdir: str, ext: str, target_ext: str) -> None:
+        """時間切れで止めたバッチのうち、実際に変換を始めたと分かる 1 件が 1 件分の上限以上使っていたら `timed_out` に入れる。
+
+        .xls は資料ごとの開始の印があり、最後に始めた資料が未完了で、印の時刻から上限以上たっているときだけ。
+        --convert-to の経路は資料ごとの開始が分からないので、まとめた件数が 1 件のときだけ確定する。確定できないものは本体ループが変換する。
+        """
+        if ext == ".xls":
+            started = [i for i in indexes if _start_marker(outdir, i).is_file()]
+            if not started:
+                return
+            last = max(started)
+            try:
+                begun = _start_marker(outdir, last).stat().st_mtime
+            except OSError:
+                return
+            if _output_marker(outdir, last, ext, target_ext).is_file() or time.time() - begun < lc._timeout_sec():
+                return
+            culprit = last
+        elif len(indexes) == 1:
+            culprit = indexes[0]
+        else:
+            return
+        with self._cond:
+            self._timed_out.add(batch[culprit].rel)
+
     def _convert(self, batch: list[_Entry]) -> dict[int, bytes]:
         """バッチを 1 回の soffice 起動で変換して `{バッチ内の番号: OOXML のバイト列}`。原本は触らず、一時 dir に置いたコピーだけを渡す（LibreOffice はシンボリックリンクを辿って原本の横にロックファイルを作る）。"""
         ext = batch[0].ext
@@ -214,13 +247,15 @@ class LegacyPrefetcher:
             label = f"{ext} {len(links)}件のバッチ"
             if ext == ".xls":
                 lc._convert_xls_keep_values_batch(self._bin, work, profile, outdir, label, timeout, self._tracker)
-                done = {i for i in links if (Path(outdir) / f"{i}.ok").is_file()}
+                done = {i for i in links if _output_marker(outdir, i, ext, target_ext).is_file()}
             else:
                 cmd = [self._bin, "--headless", "--convert-to", target_ext.lstrip("."), "--outdir", outdir,
                        f"-env:UserInstallation={Path(profile).as_uri()}", *map(str, links.values())]
                 done = set(links) if lc._run_soffice(cmd, label, timeout=timeout, quiet=True,
                                                     tracker=self._tracker) else set()
             failure = lc.take_soffice_failure()
+            if failure == "timeout":
+                self._mark_timed_out(batch, sorted(links), outdir, ext, target_ext)
             if failure is not None:
                 _log.warning("旧形式の先変換のバッチが失敗しました（%s（理由: %s））。本体が 1 件ずつ変換し、原因の資料をログに残します",
                              label, _FAILURE_LABELS.get(failure, failure))
@@ -236,6 +271,16 @@ class LegacyPrefetcher:
         finally:
             for d in (work, profile, outdir):
                 shutil.rmtree(d, ignore_errors=True)
+
+
+def _output_marker(outdir: str, i: int, ext: str, target_ext: str) -> Path:
+    """バッチ内 `i` 番の変換が済んだ印のファイル（.xls はマクロが成功ごとに残す `.ok`、それ以外は出力そのもの）。"""
+    return Path(outdir) / (f"{i}.ok" if ext == ".xls" else f"{i}{target_ext}")
+
+
+def _start_marker(outdir: str, i: int) -> Path:
+    """.xls のバッチで `i` 番の変換を始めた印のファイル（マクロが読み込みの直前に残す。更新時刻が開始時刻）。"""
+    return Path(outdir) / f"{i}.start"
 
 
 def start(items: list[tuple[Path, str]], cache_root) -> LegacyPrefetcher | None:

@@ -20,8 +20,20 @@ import contextlib
 import openpyxl
 import pytest
 
-from sherpa import es_index, json_io, store, worlds
+from sherpa import corpus_docs, es_index, json_io, scope_infer, store, text_encoding, worlds
 from sherpa.ingest import office_md, worker, world_neo4j
+from tests._replace_row import use_offline_rows, offline_row
+
+
+@pytest.fixture(autouse=True)
+def _offline_rows(monkeypatch):
+    use_offline_rows(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _ocr_on(monkeypatch):
+    """OCR の既定は切。この file は OCR を入れた状態の挙動を見る。"""
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
 
 
 def _build_world(tmp_path):
@@ -34,7 +46,7 @@ def _build_world(tmp_path):
     ws["A1"], ws["B1"] = "No", "内容"
     ws["A2"], ws["B2"] = 1, "サンプル内容"
     wb.save(wd / "a.xlsx")
-    rep = office_md.build_derived(wd, dmd)
+    rep = office_md.build_derived(wd, dmd, row=offline_row("w"))
     assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
     return wd, dmd
 
@@ -73,18 +85,22 @@ def _flag_reasons(finished) -> list:
 def _stub(monkeypatch, tmp_path):
     """`sync()` を DB/Neo4j/ES 無しで駆動する。`office_md`/派生ファイルは実物のまま。"""
     wd, dmd = _build_world(tmp_path)
-    calls: dict[str, list] = {"run": [], "index_world": [], "needs_reindex": [], "reflect_graph": [],
+    calls: dict[str, list] = {"run": [], "world_state": [], "index_world": [], "needs_reindex": [], "reflect_graph": [],
                               "req": []}
 
     # Neo4j 反映（`_reflect_graph_after_rag_rewrite`）とグラフ修復（`check_graph_counts`）は実 Neo4j に
     # 触れるため差し替える（後者は整合済み None を返し、本ファイルの対象外の修復分岐を発火させない）。
     monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite",
-                        lambda world: calls["reflect_graph"].append(world))
+                        lambda world, **_kw: calls["reflect_graph"].append(world))
     monkeypatch.setattr(world_neo4j, "check_graph_counts", lambda *a, **kw: None)
 
-    monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
+    monkeypatch.setattr(
+        worker, "world_state",
+        lambda world, **kw: calls["world_state"].append(world) or ("sig", {}))
+    settled_report = text_encoding.stamp_detect_version(corpus_docs.empty_scan_report())
     monkeypatch.setattr(store, "get_world",
-                        lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
+                        lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0,
+                                       "last_scan_report": settled_report})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
     monkeypatch.setattr(worlds, "world_dir", lambda world: wd)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
@@ -93,6 +109,7 @@ def _stub(monkeypatch, tmp_path):
     def _noop_lock(world_id):
         yield
     monkeypatch.setattr(store, "world_lock", _noop_lock)
+    monkeypatch.setattr(store, "update_ingest_run_snapshot", lambda run_id, snapshot: None)
 
     monkeypatch.setattr(es_index, "_req", _fake_es_meta_req(calls["req"]))
 
@@ -106,7 +123,7 @@ def _stub(monkeypatch, tmp_path):
         return False
     monkeypatch.setattr(es_index, "needs_reindex", _needs_reindex)
     monkeypatch.setattr(es_index, "fill_missing_vectors",
-                        lambda world, settings=None: {"available": True, "filled": 0, "missing": 0})
+                        lambda world, settings=None, **kw: {"available": True, "filled": 0, "missing": 0})
 
     def _run(world, **kw):
         # `run()`（⓪①）と `_run_locked()`（sidecar 欠落）のどちらでも同じ形で記録する
@@ -159,10 +176,11 @@ def test_sync_rag_drift_only_regenerates_via_real_refresh_rag_and_confirms_marke
     assert office_md.evidence_ir_sig_drift(dmd) is False         # evidence 側は無関係
     assert _stub["calls"]["run"] == []
     assert res["status"] == "unchanged" and res["changed"] is False
+    assert _stub["calls"]["world_state"] == ["w"]
     assert _stub["calls"]["reflect_graph"] == ["w"]              # rag.md 書換え成功後にグラフも追随
     # 実 ES へは通信せず、フェイクの GET/PUT だけで confirm_human_md_meta が完結する
     mapping_path = f"/{es_index._index('w')}/_mapping"
-    assert _stub["calls"]["req"] == [("GET", mapping_path), ("PUT", mapping_path)]
+    assert _stub["calls"]["req"] == [("GET", mapping_path), ("PUT", mapping_path), ("GET", mapping_path)]   # 最後の GET は足し直しに渡す索引の番号
     assert _stub["calls"]["index_world"] == ["sig"]              # refresh 内部で content_sig 明示・1 回だけ
     assert _stub["calls"]["needs_reindex"] == ["sig"]            # 外側の明示チェックは False＝再索引しない
     marker = dmd / ".human_md_es_sig"                            # bulk 成功で human_md も確定
@@ -177,6 +195,7 @@ def test_sync_rag_drift_only_regenerates_via_real_refresh_rag_and_confirms_marke
         assert st["started_at"] and st["finished_at"]
         assert st["elapsed_ms"] >= 0
     assert snap["counts"]["es_indexed"] == 1
+    assert snap["counts"]["scan_passes"] == 1
     assert "embedded_chunks" not in snap["counts"]               # 返していない項目はキーごと省略
 
 
@@ -213,7 +232,7 @@ def _old_route_world_with_failed_wmf_job(_stub):
     wb.active["A1"] = "x"
     wb.active.add_image(XImage(str(png)), "B2")
     wb.save(wd / "a.xlsx")
-    assert office_md.build_derived(wd, dmd)["evidence_ir_failed"] == 0
+    assert office_md.build_derived(wd, dmd, row=offline_row("w"))["evidence_ir_failed"] == 0
     # 画像の実体を WMF のバイト列へ差し替え、Evidence の hash も合わせる（実環境の WMF 図と同じ状態）
     wmf = b"\xd7\xcd\xc6\x9a" + b"\x00" * 32
     asset = next((dmd.parent / "rag" / "a.xlsx.assets").iterdir())
@@ -263,7 +282,7 @@ def test_sync_rewrites_old_route_and_cancels_old_failed_job_without_touching_rag
     from sherpa.ingest import ocr_router
     from sherpa.store import ocr_jobs
 
-    ocr_jobs.purge_world("w")
+    ocr_jobs.purge_world("w", row=offline_row("w", kind="delete"))
     try:
         route, _rid, generation = _old_route_world_with_failed_wmf_job(_stub)
         rag_before = (_stub["dmd"].parent / "rag" / "a.xlsx.rag.md").read_bytes()
@@ -277,14 +296,14 @@ def test_sync_rewrites_old_route_and_cancels_old_failed_job_without_touching_rag
         assert (_stub["dmd"].parent / "rag" / "a.xlsx.rag.md").read_bytes() == rag_before
         assert _stub["calls"]["index_world"] == []
     finally:
-        ocr_jobs.purge_world("w")
+        ocr_jobs.purge_world("w", row=offline_row("w", kind="delete"))
 
 
 def test_route_marker_stays_unwritten_when_cancel_fails_and_next_sync_retries(_stub, monkeypatch):
     from sherpa.ingest import ocr_router
     from sherpa.store import ocr_jobs
 
-    ocr_jobs.purge_world("w")
+    ocr_jobs.purge_world("w", row=offline_row("w", kind="delete"))
     try:
         _route, _rid, generation = _old_route_world_with_failed_wmf_job(_stub)
         monkeypatch.setattr(ocr_jobs, "enqueue_refresh_run", lambda *a, **kw: {})
@@ -302,7 +321,7 @@ def test_route_marker_stays_unwritten_when_cancel_fails_and_next_sync_retries(_s
         assert _job_state(generation)["status"] == "cancelled"
         assert ocr_router.ocr_route_sig_drift(_stub["dmd"]) is False
     finally:
-        ocr_jobs.purge_world("w")
+        ocr_jobs.purge_world("w", row=offline_row("w", kind="delete"))
 
 
 def test_route_generation_failure_in_build_leaves_marker_unwritten_and_next_sync_creates_routes(
@@ -317,7 +336,7 @@ def test_route_generation_failure_in_build_leaves_marker_unwritten_and_next_sync
     def _boom(*a, **kw):
         raise RuntimeError("route failure")
     monkeypatch.setattr(office_md, "_write_ocr_routes", _boom)
-    worker._build_derived("w", world_sig="sig")
+    worker._build_derived("w", world_sig="sig", row=offline_row("w"))
     route = dmd.parent / "ir" / "a.xlsx.ocr_route.json"
     assert not route.exists()
     assert ocr_router.ocr_route_sig_drift(dmd) is True
@@ -354,6 +373,7 @@ def test_sync_unchanged_scan_report_backfill(_stub, monkeypatch, legacy):
                   "analyzer_declined_as_document": 0, "unreadable": 0}
     else:
         report = {**corpus_docs.empty_scan_report(), "scanned": 1, "indexed": 1}
+    report = text_encoding.stamp_detect_version(report)
     row = {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0, "last_scan_report": report}
     monkeypatch.setattr(store, "get_world", lambda world: row)
     calls = []
@@ -368,6 +388,184 @@ def test_sync_unchanged_scan_report_backfill(_stub, monkeypatch, legacy):
         assert {"sensitive_excluded", "unreachable_as_text", "unreachable_as_text_by_ext"} <= saved_report.keys()
     else:
         assert calls == []
+
+
+@pytest.mark.parametrize("version_matches, undetermined, runs", [
+    pytest.param(False, 1, True, id="old-detect-with-undetermined-reruns"),
+    pytest.param(True, 1, False, id="current-detect-not-rerun"),
+    pytest.param(False, 0, True, id="old-detect-without-undetermined-reruns"),
+])
+def test_sync_reruns_when_the_recorded_detect_version_is_old(_stub, monkeypatch,
+                                                                             version_matches, undetermined, runs):
+    """署名が同じでも、集計に記録した判定の版がいまと違う資料フォルダは、「判別できない」の件数に関係なく次の更新で作り直される。"""
+    from sherpa import corpus_docs, text_encoding
+    report = {**corpus_docs.empty_scan_report(), "unreachable_by_reason": (
+        {"encoding_undetermined": undetermined} if undetermined else {})}
+    if version_matches:
+        report["encoding_detect_version"] = text_encoding.DETECT_VERSION
+    row = {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0, "last_scan_report": report}
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+    monkeypatch.setattr(store, "set_scan_report", lambda world, rep: None)
+    worker.sync("w")
+    assert bool(_stub["calls"]["run"]) is runs
+
+
+def test_sync_without_saved_scan_report_reruns_once_then_settles(_stub, monkeypatch):
+    """前の集計が無い資料フォルダは 1 回だけ作り直される。版の付いた集計が保存されれば 2 回目は走らない。"""
+    row = {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0, "last_scan_report": None}
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+    monkeypatch.setattr(store, "set_scan_report", lambda world, rep: None)
+    worker.sync("w")
+    assert _stub["calls"]["run"]
+    _stub["calls"]["run"].clear()
+    row["last_scan_report"] = text_encoding.stamp_detect_version(corpus_docs.empty_scan_report())
+    worker.sync("w")
+    assert not _stub["calls"]["run"]
+
+
+def test_sync_reruns_old_detect_version_once_then_settles(_stub, monkeypatch):
+    """版 2 の集計（判別できない 0 件）は次の更新で 1 回だけ作り直され、いまの版が記録された 2 回目は走らない。"""
+    old = {**corpus_docs.empty_scan_report(), "encoding_detect_version": text_encoding.DETECT_VERSION - 1}
+    row = {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0, "last_scan_report": old}
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+    monkeypatch.setattr(store, "set_scan_report", lambda world, rep: None)
+    worker.sync("w")
+    assert len(_stub["calls"]["run"]) == 1
+    _stub["calls"]["run"].clear()
+    row["last_scan_report"] = text_encoding.stamp_detect_version(corpus_docs.empty_scan_report())
+    worker.sync("w")
+    assert not _stub["calls"]["run"]
+
+
+def _stamp_only_row(doc_count):
+    return {"last_sig": "sig", "last_manifest": {}, "last_doc_count": doc_count,
+            "last_scan_report": text_encoding.stamp_detect_version({})}
+
+
+def test_sync_failed_scan_retry_failing_again_saves_no_coarse_count(_stub, monkeypatch):
+    """版の印だけの資料フォルダで集計がまた失敗したら、粗い件数も集計も保存しない（未確認のまま）。"""
+    row = _stamp_only_row(None)
+    writes = []
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+    monkeypatch.setattr(store, "set_scan_report_and_doc_count", lambda w, rep, n, sig: writes.append(("both", rep, n, sig)))
+    monkeypatch.setattr(store, "backfill_manifest_and_doc_count", lambda *a, **kw: writes.append(("both", a)))
+
+    def _boom(*a, **kw):
+        raise RuntimeError("scan failed")
+    monkeypatch.setattr(corpus_docs, "scan_report", _boom)
+    worker.sync("w")
+    assert writes == [] and not _stub["calls"]["run"]
+
+
+def test_sync_failed_scan_retry_succeeding_saves_only_the_scanned_count(_stub, monkeypatch):
+    """版の印だけの資料フォルダで集計が成功したら、集計の件数だけを保存する（manifest の粗い件数は使わない）。"""
+    row = _stamp_only_row(None)
+    writes = []
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+    monkeypatch.setattr(store, "set_scan_report_and_doc_count", lambda w, rep, n, sig: writes.append(("both", rep, n, sig)))
+    monkeypatch.setattr(corpus_docs, "manifest_doctype_count_from_root",
+                        lambda *a, **kw: writes.append(("coarse", None)))
+    monkeypatch.setattr(corpus_docs, "scan_report", lambda w, **kw: {**corpus_docs.empty_scan_report(), "document_count": 7})
+    worker.sync("w")
+    assert [w[0] for w in writes] == ["both"]
+    assert writes[0][2:] == (7, "sig") and not _stub["calls"]["run"]
+
+
+def test_sync_failed_scan_retry_overwrites_the_older_published_count(_stub, monkeypatch):
+    """前の世代の件数が残っていても、再試行で確定した集計の件数で上書きする。"""
+    row = _stamp_only_row(5)
+    writes = []
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+    monkeypatch.setattr(store, "set_scan_report_and_doc_count", lambda w, rep, n, sig: writes.append(("both", rep, n, sig)))
+    monkeypatch.setattr(corpus_docs, "scan_report", lambda w, **kw: {**corpus_docs.empty_scan_report(), "document_count": 7})
+    worker.sync("w")
+    assert [w[2] for w in writes] == [7]
+
+
+def test_sync_failed_scan_retry_checks_generation_and_skips_mixed_result(_stub, monkeypatch):
+    """再試行は呼び出し側の manifest を世代の確かめに渡し、世代が混ざった集計（件数 None）は保存しない。"""
+    row = _stamp_only_row(5)
+    writes, seen = [], []
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+    monkeypatch.setattr(store, "set_scan_report_and_doc_count", lambda w, rep, n, sig: writes.append(("both", rep, n, sig)))
+
+    def _mixed(w, **kw):
+        seen.append(kw.get("expected_manifest"))
+        return {**corpus_docs.empty_scan_report(), "document_count": None}
+    monkeypatch.setattr(corpus_docs, "scan_report", _mixed)
+    worker.sync("w")
+    assert len(seen) == 1 and isinstance(seen[0], dict)
+    assert writes == []
+
+
+def _real_manifest(root):
+    from sherpa import scope_infer
+    out = {}
+    for rp, rel in scope_infer.safe_files(root):
+        st = rp.stat()
+        out[rel] = [st.st_mtime_ns, st.st_ctime_ns, st.st_size]
+    return out
+
+
+def _retry_with_mutation(tmp_path, monkeypatch, mutate):
+    from sherpa.ingest import scan_backfill
+    root = tmp_path / "w"
+    root.mkdir()
+    (root / "a.txt").write_text("alpha\n", encoding="utf-8")
+    monkeypatch.setattr(worlds, "world_dir", lambda world: root)
+    monkeypatch.setattr(worlds, "derived_md_dir", lambda world: tmp_path / "derived")
+    manifest = _real_manifest(root)
+    writes = []
+    monkeypatch.setattr(store, "set_scan_report_and_doc_count", lambda w, rep, n, sig: writes.append(n))
+    if mutate:
+        (root / "a.txt").write_text("alpha-changed-longer\n", encoding="utf-8")
+    scan_backfill._retry_failed_scan("w", {"last_manifest": manifest}, manifest, "sig")
+    return writes
+
+
+def test_failed_scan_retry_skips_save_when_a_same_path_file_was_updated(tmp_path, monkeypatch):
+    """再試行の間に同じパスの原本の中身が変わったら、古い署名の件数・集計は保存しない。"""
+    assert _retry_with_mutation(tmp_path, monkeypatch, True) == []
+
+
+def test_failed_scan_retry_does_not_save_zero_when_root_vanishes_after_check(tmp_path, monkeypatch):
+    """確かめの後に資料フォルダが解決できなくなっても、古い署名に 0 件を保存せず公開件数を上書きしない。"""
+    from sherpa.ingest import scan_backfill
+    root = tmp_path / "w"
+    root.mkdir()
+    (root / "a.txt").write_text("alpha\n", encoding="utf-8")
+    manifest = _real_manifest(root)
+    calls = iter([root, None])
+    monkeypatch.setattr(worlds, "world_dir", lambda world: next(calls))
+    writes = []
+    monkeypatch.setattr(store, "set_scan_report_and_doc_count", lambda w, rep, n, sig: writes.append(n))
+    scan_backfill._retry_failed_scan("w", {"last_manifest": manifest}, manifest, "sig")
+    assert writes == []
+
+
+def test_failed_scan_retry_saves_when_nothing_changed(tmp_path, monkeypatch):
+    assert len(_retry_with_mutation(tmp_path, monkeypatch, False)) == 1
+
+
+def test_failed_scan_retry_rewalks_and_skips_save_when_a_file_was_added(tmp_path, monkeypatch):
+    """再試行は最初の走査の列挙を使い回さず歩き直す。間にファイルが足されていたら、古い署名の件数・集計は保存しない。"""
+    from sherpa import scope_infer
+    from sherpa.ingest import scan_backfill
+    root = tmp_path / "w"
+    root.mkdir()
+    (root / "a.txt").write_text("alpha\n", encoding="utf-8")
+    monkeypatch.setattr(worlds, "world_dir", lambda world: root)
+    monkeypatch.setattr(worlds, "derived_md_dir", lambda world: tmp_path / "derived")
+    manifest = _real_manifest(root)
+    writes = []
+    monkeypatch.setattr(store, "set_scan_report_and_doc_count", lambda w, rep, n, sig: writes.append(n))
+    with scope_infer.walk_reuse_scope():
+        listed = list(scope_infer.safe_files(root))
+        scope_infer.reuse_walk(scope_infer.WalkSnapshot.from_walk(root, listed, {}))
+        (root / "b.txt").write_text("beta\n", encoding="utf-8")
+        scan_backfill._retry_failed_scan(
+            "w", {"last_manifest": manifest}, manifest, "sig")
+    assert writes == []
 
 
 def test_sync_human_md_only_drift_still_reaches_es_repair_same_call(_stub, monkeypatch):
@@ -388,7 +586,7 @@ def test_sync_unchanged_es_repair_progress_throttled_and_dedupes_same_value(_stu
     # unchanged 分岐の ES 自己修復の progress は `_run_locked` 側と同じ「100 件間隔の間引き＋同値抑止」を適用する。
     monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: True)
 
-    def _index_world_holdback(world, *, content_sig=None, run_id=None, progress=None):
+    def _index_world_holdback(world, *, content_sig=None, run_id=None, progress=None, **kw):
         for done in (0, 1, 1, 2, 150, 150, 300, 300):
             progress(done, 300)
         return {"available": True, "indexed": 300, "chunks": 300}
@@ -430,6 +628,7 @@ def test_sync_self_heal_success_confirms_human_md_markers_and_finalizes_run(_stu
     assert snap["stage_timings"]["scanning"]["elapsed_ms"] >= 0
     assert snap["counts"]["es_indexed"] == 1
     assert snap["counts"]["scanned"] == 0                   # `world_state` フェイクの manifest={} 由来
+    assert snap["counts"]["scan_passes"] == 1
     assert "embedded_chunks" not in snap["counts"]
 
 
@@ -480,12 +679,12 @@ def test_index_world_holdback_drops_marker_before_reindex_prevents_stale_confirm
 
     _index_world_returns(monkeypatch, error="bulk_errors")
     for _ in range(2):
-        esr = worker.index_world_with_human_md_holdback("w", content_sig="sig")
+        esr = worker.index_world_with_human_md_holdback("w", content_sig="sig", row=offline_row("w"))
         assert esr.get("error") == "bulk_errors"
         assert office_md.human_md_es_sig_drift(dmd) is True
 
     _index_world_returns(monkeypatch)
-    esr3 = worker.index_world_with_human_md_holdback("w", content_sig="sig")
+    esr3 = worker.index_world_with_human_md_holdback("w", content_sig="sig", row=offline_row("w"))
     assert not esr3.get("error")
     assert office_md.human_md_es_sig_drift(dmd) is False
 
@@ -706,6 +905,30 @@ def test_merge_es_runs_accumulates_embedding_and_elapsed_and_keeps_first_start()
     assert W._merge_es_runs(None, None, new_s, new_t) == (new_s, new_t)   # 初回が無ければ新しい値のまま
 
 
+def test_merge_es_runs_scale_takes_last_run_while_time_and_new_counts_accumulate():
+    from sherpa.ingest import worker as W
+    def _metrics(new, calls, wall):
+        return {"available": True, "bundle_count": 40, "distinct_inputs": 30, "new": new,
+                "new_input_tokens": new * 10, "api_calls": calls, "api_cumulative_ms": wall,
+                "wall_ms": {"api_wait": wall, "cache_lookup": 1, "other": 1, "total": wall + 2},
+                "reused": {"total": 5}}
+    prev_s = {"available": True, "embedded": 4, "reused": 0, "embed_elapsed_ms": 10,
+              "embed_metrics": _metrics(4, 2, 100)}
+    new_s = {"available": True, "embedded": 3, "reused": 4, "embed_elapsed_ms": 5,
+             "embed_metrics": _metrics(3, 1, 50)}
+    t = {"started_at": "a", "finished_at": "b", "elapsed_ms": 1}
+    s, _t = W._merge_es_runs(prev_s, t, new_s, t)
+    m = s["embed_metrics"]
+    assert m["bundle_count"] == 40 and m["distinct_inputs"] == 30      # 規模は加算しない
+    assert m["new"] == 7 and m["api_calls"] == 3 and m["api_cumulative_ms"] == 150
+    assert m["wall_ms"]["total"] == 102 + 52 and m["reused"]["total"] == 10
+
+    gone = {"available": False, "indexed": 0, "chunks": 0,
+            "embed_metrics": {"available": False, "unavailable_reason": "elasticsearch_unavailable"}}
+    s, _t = W._merge_es_runs(prev_s, t, gone, t)
+    assert s["embed_metrics"]["bundle_count"] == 40 and s["embed_metrics"]["distinct_inputs"] == 30
+
+
 @pytest.mark.parametrize("drift_attr, refresh_attr, refresh_result, reason_check", [
     pytest.param("rag_sig_drift", "refresh_rag", {"rag_failed": 1, "rag_regenerated": 0},
                  lambda r: r.startswith("rag_refresh_failed"), id="rag-refresh-failed"),
@@ -729,3 +952,37 @@ def test_sync_refresh_failure_with_run_id_finalizes_as_failed(
     assert len(finished) == 1 and finished[0]["run_id"] == 999
     assert finished[0]["status"] == "failed"
     assert any(r and reason_check(r) for r in _flag_reasons(finished))
+
+
+def test_sync_with_failed_scan_stamp_retries_only_the_scan(_stub, monkeypatch):
+    """集計が失敗して版の印だけが残る資料フォルダは、更新で全体を取り込み直さず、集計だけを試す。"""
+    row = {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0,
+           "last_scan_report": text_encoding.stamp_detect_version({})}
+    saved = []
+    manifest = _real_manifest(_stub["wd"])
+    monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", manifest))
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+    monkeypatch.setattr(store, "set_scan_report_and_doc_count", lambda world, rep, n, sig: saved.append(rep))
+    worker.sync("w")
+    assert not _stub["calls"]["run"]
+    assert len(saved) == 1 and saved[0]["encoding_detect_version"] == text_encoding.DETECT_VERSION
+    assert not corpus_docs.scan_report_missing_fields(saved[0])
+
+
+def test_scan_retry_save_is_one_atomic_call_and_failure_writes_nothing(_stub, monkeypatch):
+    """再試行の保存は集計と件数の 1 回の呼び出しだけ。それが失敗しても、別の書き込みで片方だけ残ることはない。"""
+    row = _stamp_only_row(5)
+    writes = []
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+    monkeypatch.setattr(store, "set_scan_report", lambda *a, **kw: writes.append("report"))
+    monkeypatch.setattr(store, "backfill_doc_count", lambda *a, **kw: writes.append("count"))
+
+    def _fail(*a, **kw):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(store, "set_scan_report_and_doc_count", _fail)
+    monkeypatch.setattr(corpus_docs, "scan_report", lambda w, **kw: {**corpus_docs.empty_scan_report(), "document_count": 7})
+    try:
+        worker.sync("w")
+    except RuntimeError:
+        pass
+    assert writes == []

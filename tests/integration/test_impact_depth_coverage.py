@@ -11,6 +11,7 @@ import pytest
 
 from sherpa.ingest import world_neo4j
 from _world_registry import register_test_world
+from tests._replace_row import offline_row
 
 WORLD = "depth_cov_test_a"          # 使い捨て（テスト後に削除）
 OTHER_WORLD = "depth_cov_test_b"
@@ -47,7 +48,7 @@ def _with_d(path="in/d.cbl", status="active", etype="INVOKES", edge_status="acti
 
 def _load(nodes, edges):
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))
     register_test_world(WORLD)
 
 
@@ -109,7 +110,7 @@ def test_remainder_in_another_world_is_not_a_remainder(session):
     _load(*_chain())
     env = world_neo4j._env()
     other = [_node(OTHER_WORLD, "D", "in/d.cbl")]
-    world_neo4j.load_world(other, [], OTHER_WORLD, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(other, [], OTHER_WORLD, env["uri"], env["user"], env["pw"], row=offline_row(OTHER_WORLD))
     register_test_world(OTHER_WORLD)
     session.run("MATCH (d:Entity {canonical_id:$d}), (c:Entity {canonical_id:$c}) "
                 "MERGE (d)-[r:INVOKES]->(c) SET r.world_id=$w, r.status='active'",

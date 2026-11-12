@@ -1,6 +1,6 @@
 # 完全オフライン（閉域）向け配布資材キット
 
-このページは、インターネットに一切出られない閉域ネットワークで Sherpa を動かすための手順です。
+このページは、インターネットに一切出られない閉域ネットワークで Slouch を動かすための手順です。
 対象は運用担当者（オンライン環境で資材を作る人／閉域環境にセットアップする人）です。
 
 > 資材の網羅方針・導入順序・コマンド規律の**正典は [docs/18-オフライン構築.md](../18-オフライン構築.md)**。
@@ -94,11 +94,11 @@ apt 系の資材（python3 系・Docker Engine・フォント・Chromium のシ�
 | Playwright Chromium 本体（Marp の PDF/PPTX 出力に必須） | 一時 venv で `playwright install chromium`（`chromium-*`系ディレクトリのみ tar 化） | `dist/offline-kit/chromium/ms-playwright-chromium.tar.gz` |
 | Playwright Chromium のシステム依存（libnss3 等） | playwright 公式の依存リスト（ubuntu24.04-x64・全21個）を素の対象OSコンテナで download-only | `dist/offline-kit/chromium/deps-debs/` |
 | LibreOffice（旧形式 Office 変換の選択肢の一つ） | 素の対象OSコンテナで `apt-get install --download-only`（依存込み・数百MB） | `dist/offline-kit/libreoffice/debs/` |
-| OCR ワーカーのイメージ（画像内文字の読み取り・既定ON） | `docker compose --profile ocr build` → `docker save`（約550MB） | `dist/offline-kit/ocr/ocr-worker-paddleocr-3.7.0-cpu.tar` |
+| OCR ワーカーのイメージ（画像内文字の読み取り・管理画面で入れたときに使う） | `docker compose --profile ocr build` → `docker save`（約550MB） | `dist/offline-kit/ocr/ocr-worker-paddleocr-3.7.0-cpu.tar` |
 | OCR の Python 依存（wheel一式） | `pip download -r requirements-ocr.txt`（コアとは**別**＝numpy の要求が両立しない） | `dist/offline-kit/ocr/wheels/`（+`SHA256SUMS`） |
 | **土台の閉包 .deb**（libc6/perl-base/zlib1g 等・収集コンテナに導入済みの全パッケージ） | 素の対象OSコンテナで `apt-get install --download-only --reinstall $(dpkg-query -W …)`（`--skip-base` で除外可）。収集イメージの土台は再ビルドで更新済みのことがあり、閉域ホスト（リリース版）より新しい＝依存が土台で満たされる前提が崩れるため同梱する | `dist/offline-kit/base/debs/` |
 | **repo 索引＋BASELINE**（`Packages`/`Packages.gz`/`Release`・`BASELINE`・各グループの `debs/PACKAGES`） | 素のコンテナで `apt-utils` を入れ `apt-ftparchive packages/release`。BASELINE は収集元の OS/版/arch/収集日/イメージ digest | `dist/offline-kit/` 直下 |
-| OCR モデル（PP-OCRv6 det/rec・Apache-2.0） | `scripts/fetch_ocr_models.sh` で取得し `docker/ocr-models.lock.json` と照合（約134MB） | `dist/offline-kit/ocr/models/` |
+| OCR モデル（small・medium=PP-OCRv6 と mobile=PP-OCRv5 の det/rec・Apache-2.0） | `scripts/fetch_ocr_models.sh` で取得し `docker/ocr-models.lock.json` と照合（約190MB） | `dist/offline-kit/ocr/models/` |
 | **Codex CLI**（Apache-2.0・固定版の package 一式＝本体＋bwrap・rg 等） | GitHub の公式リリースから固定版（`scripts/codex-version.env`）を取得し sha256 を照合（既定 Linux x86_64・`CODEX_PIN_KIT_PLATFORM` で変更・`--skip-codex` で除外） | `dist/offline-kit/codex/`（導入先 `tools/codex/`・実行ファイルは `bin/codex`） |
 
 ### なぜ apt 系の資材を「素のコンテナ内」で収集するか
@@ -150,13 +150,13 @@ PostgreSQL / Neo4j は素の公式イメージのままで日本語（UTF-8）�
 
 ### OCR（画像内文字の読み取り）
 
-**既定で有効**な機能なので、閉域でも使うなら3つそろえて搬入します。1つでも欠けると読み取りだけが
+既定は切で、管理画面の取り込みタブで入れたときだけ動く機能です。閉域で使うなら3つそろえて搬入します。1つでも欠けると読み取りだけが
 行われません（取り込みと検索は通常どおり動きます）。
 
 | 要るもの | 理由 |
 |---|---|
 | ワーカーのイメージ | 依存がアプリ本体と**両立しない**ため別プロセスで動かす（コア=numpy 2.5系／paddlex=numpy&lt;2.4 必須） |
-| モデル（約134MB） | 配布物に同梱していない（法務確認前・`docker/ocr-models.lock.json` の `distribution_policy`） |
+| モデル（約190MB） | 配布物に同梱していない（法務確認前・`docker/ocr-models.lock.json` の `distribution_policy`） |
 | 資料フォルダの読み取り専用マウント | ワーカーへ渡す範囲を `SHERPA_OCR_WORLD_ROOT` で明示する |
 
 モデルは**内容を固定してあり、起動時に照合**します。上流が更新して中身が変わると
@@ -205,6 +205,7 @@ Docker が使えない収集マシンの場合は `--skip-docker` を付けて D
 （その場合、Docker イメージは別途・別マシンで収集して同じ `dist/offline-kit/docker-images/` に合流させてください）。
 同様に、不要な資材は個別に除外できます: `--skip-docker-engine`（Docker Engine 本体）・
 `--skip-python-system`（python3 系）・`--skip-fonts`・`--skip-node`・`--skip-chromium`・`--skip-libreoffice`・
+`--skip-ocr`（画像内文字の読み取りの資材）・`--skip-codex`（Codex CLI）・
 `--skip-base`（土台の閉包。閉域ホストの土台がキットより古いと導入が unmet で止まるため、通常は省略しない）。
 
 収集結果は `dist/offline-kit/`（`dist/` は Git 管理外）にまとまり、`MANIFEST.txt` に内容一覧が記録されます。
@@ -277,9 +278,9 @@ Docker が使えない収集マシンの場合は `--skip-docker` を付けて D
    導入の流れは次のとおりです。展開したファイルの照合（`PACKAGE-MANIFEST.sha256`）→ このプラットフォームの指紋の
    項目の確認 → Python 実行系（python3/venv/pip）→ Docker Engine 本体（未導入の場合のみ・
    `systemctl enable --now docker` と `usermod -aG docker` を含む）→ Docker イメージの `docker load` →
-   `pip install --no-index`（`.venv` 作成込み）→ Node.js/marp-cli の展開 → Playwright Chromium
+   `pip install --no-index`（`.venv` 作成込み）→ Node.js/marp-cli の展開 → 同梱の Codex CLI の展開（`tools/codex/`）→ Playwright Chromium
    （本体＋システム依存 .deb）の展開 → LibreOffice/フォントの導入 → Ollama モデルデータのコピー →
-   **最終検証**（各資材の動作確認一覧）→ 導入後の環境の指紋とパッケージの指紋の照合 → 記録の更新。
+   OCR ワーカーのイメージの読み込みとモデルの配置（`data/ocr-models`）→ **最終検証**（各資材の動作確認一覧）→ 導入後の環境の指紋とパッケージの指紋の照合 → 記録の更新。
    収集済みの資材があるものだけ順に実行されます（未収集の資材は「スキップしました」と表示して次へ進みます）。
    今の `.venv` と `tools/` の実行物は `.prev` に退避してから最終の場所で作り直し、失敗したら元へ戻します。
 
@@ -478,8 +479,9 @@ OLLAMA_URL=http://127.0.0.1:11434
 ストアの起動・以降のアプリ起動は通常の本番手順と同じです（[40-運用](40-運用.md) の「本番展開の標準手順」）。
 `docker-compose.yml` の `POSTGRES_PASSWORD` / `NEO4J_PASSWORD` は Compose の変数展開なので、**シェル環境か
 `--env-file` で明示的に渡さない限り `/etc/sherpa/sherpa.env` を読みません**（プロジェクト直下の `.env` だけが
-既定で読まれる）。既定パスワードのまま起動してアプリ側 env と食い違う事故を避けるため、必ず
-`--env-file` を付けて起動してください。`docker load` 済みでタグ（`sherpa/es-kuromoji:8.19.20` 等）が
+既定で読まれる）。既定パスワードのまま起動してアプリ側 env と食い違う事故を避けるため、`make start` と各スクリプトは `SHERPA_ENV_FILE` で指した
+ファイルを `--env-file` として自動で渡します（`SHERPA_ENV_FILE=/etc/sherpa/sherpa.env make start`）。`docker compose` を手で叩くときだけ、
+必ず `--env-file` を付けてください。`docker load` 済みでタグ（`sherpa/es-kuromoji:8.19.20` 等）が
 ローカルに揃っていれば、pull もビルドも行わず既存イメージをそのまま使います。
 
 Elasticsearch の起動には `vm.max_map_count=262144` 以上が要ります（閉域実機報告・2026-08-18）。
@@ -490,7 +492,7 @@ sysctl vm.max_map_count
 ```
 
 **262144 以上ならそのままで構いません（下げないでください）**。同居する別製品がより大きい値を
-要求して既に設定している場合があり、Sherpa の都合で下げるとその製品が壊れます。既存の設定を
+要求して既に設定している場合があり、Slouch の都合で下げるとその製品が壊れます。既存の設定を
 探すには `grep -rn max_map_count /etc/sysctl.conf /etc/sysctl.d/` を使ってください。不足している
 ときだけ、新規ファイルとして追加します。
 
@@ -500,8 +502,8 @@ sudo sysctl --system
 ```
 
 `/etc/sysctl.d/` は**ファイル名の番号順に読まれ、後勝ち**です。同居製品が別ファイル（例
-`10-map-count.conf`）でより大きい値を設定している場合は、そちらが優先されるよう Sherpa 用の
-ファイルは置かないでください（どうしても両方置くなら、Sherpa 側を同居製品より小さい番号にします）。
+`10-map-count.conf`）でより大きい値を設定している場合は、そちらが優先されるよう Slouch 用の
+ファイルは置かないでください（どうしても両方置くなら、Slouch 側を同居製品より小さい番号にします）。
 
 ```bash
 # 以下は Sherpa/（パッケージを展開したフォルダ）の直下で実行
@@ -543,7 +545,7 @@ SHERPA_ENV_FILE=/etc/sherpa/sherpa.env make start          # 既定＝社内 LAN
       起動しない場合は `sysctl vm.max_map_count` を確認してください（`262144` 以上が必要）。
       不足しているときだけ上の「vm.max_map_count」節の手順で `99-sherpa-vm-max-map-count.conf` を
       追加してください（**既に 262144 以上ある場合や、同居製品がより大きい値を設定している場合は
-      Sherpa 側のファイルを追加しない**＝`/etc/sysctl.d/` は後勝ちのため、下げる方向の上書きを
+      Slouch 側のファイルを追加しない**＝`/etc/sysctl.d/` は後勝ちのため、下げる方向の上書きを
       避けます）。`./scripts/check-production.sh` もこの値を検査します。
 
 **外部到達が無いこと**
@@ -561,7 +563,7 @@ OpenAI は**そもそもネットワークへ出ません**（`sherpa/providers/
 - [ ] 利用者の個人設定（設定画面）に、移行前などに登録した古い OpenAI の API キーが
       残っていないか確認する。**キーが残っていると「未接続」にならず実際に外部接続を試みてしまう**
       （タイムアウト/接続エラーにはなるが、無用な外向き通信の試行が発生する）。
-- [ ] 閉域環境のネットワーク監視（ファイアウォールログ／プロキシログ等、組織の監視手段）で、Sherpa プロセスから
+- [ ] 閉域環境のネットワーク監視（ファイアウォールログ／プロキシログ等、組織の監視手段）で、Slouch プロセスから
       外部（80/443等）への送信が発生していないことを確認する。
 - [ ] `.env`（または `sherpa.env`）に `OPENAI_API_KEY` が設定されていないことを確認する（サーバ側にキーがあると、その頭脳を選んだユーザー全員が
       外部呼び出しを試みる余地になるため。キー一覧は [90-リファレンス](90-リファレンス.md) の設定表）。

@@ -12,11 +12,40 @@
       "license_declared_by_upstream": "Apache-2.0",
       "name": "PP-OCRv6_medium_rec",
       "tree_sha256": "a0e6515f7e4c2745c07de72ffa867836f68a7aec988989754b8afb0d019bf3db"
+    },
+    {
+      "cache_relative_path": "official_models/PP-OCRv6_small_det",
+      "license_declared_by_upstream": "Apache-2.0",
+      "name": "PP-OCRv6_small_det",
+      "tree_sha256": "ed4253a10d4eacc4102967902901c732b6326e09a290987a1591c8364bdb9103"
+    },
+    {
+      "cache_relative_path": "official_models/PP-OCRv6_small_rec",
+      "license_declared_by_upstream": "Apache-2.0",
+      "name": "PP-OCRv6_small_rec",
+      "tree_sha256": "36ba134a762676f41fbd47863b43a040a2ed84c2af6058fb6917871d37ad62ba"
+    },
+    {
+      "cache_relative_path": "official_models/PP-OCRv5_mobile_det",
+      "license_declared_by_upstream": "Apache-2.0",
+      "name": "PP-OCRv5_mobile_det",
+      "tree_sha256": "ebf54c9e3df9de9cb0bb724e3dd3319789592c95cd557b2bf65e73da8f20c0d6"
+    },
+    {
+      "cache_relative_path": "official_models/PP-OCRv5_mobile_rec",
+      "license_declared_by_upstream": "Apache-2.0",
+      "name": "PP-OCRv5_mobile_rec",
+      "tree_sha256": "2dfaa35e17a5e103c828e33a012050f970ebcaf573df773a1c8214c2c263e989"
     }
   ],
   "runtime_download_allowed": false,
   "schema": "sherpa-ocr-model-lock-v1",
+  "sets": {
+    "medium": ["PP-OCRv6_medium_det", "PP-OCRv6_medium_rec"],
+    "small": ["PP-OCRv6_small_det", "PP-OCRv6_small_rec"],
+    "mobile": ["PP-OCRv5_mobile_det", "PP-OCRv5_mobile_rec"]
+  },
   "tree_hash_excludes": [".cache"],
-  "relocked_at": "2026-08-16",
-  "relock_reason": "取得メタデータ（.cache/）を含めていたため再downloadで必ずhashが変わり、同一modelでも起動を拒んだ。model本体だけを対象に再計算した（精度は 2026-08-10 と完全一致＝語recall 61/65・macro CER 0.010722 を再現）。"
+  "relocked_at": "2026-11-12",
+  "relock_reason": "軽い v6 small（検出・認識）を組に加えた。既存の 4 モデルは再取得しても tree hash が変わらないことを確かめ、値は変えていない。"
 }

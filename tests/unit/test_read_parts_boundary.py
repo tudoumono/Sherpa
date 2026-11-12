@@ -16,7 +16,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from sherpa import ext_api, mcp_server, simple_chat, tool_dispatch
+from sherpa import mcp_server, simple_chat, tool_dispatch
+from sherpa.ext import search as ext_search
 from sherpa.parts.read import fused_search, tools as read_tools
 
 
@@ -36,10 +37,10 @@ def test_read_tool_dispatch_is_shared_across_mcp_and_simple_chat():
 
 
 def test_fused_search_is_shared_between_ext_api_and_parts_read():
-    """`/ext/v1/search`（`ext_api.py::ext_search`）が呼ぶ融合検索（ES＋Neo4j の RRF 融合）は、
+    """`/ext/v1/search`（`ext/search.py::ext_search`）が呼ぶ融合検索（ES＋Neo4j の RRF 融合）は、
     読み取り部品 `sherpa.parts.read.fused_search.search` と**同じ関数オブジェクト**。
     """
-    assert ext_api.fused_search.search is fused_search.search
+    assert ext_search.fused_search.search is fused_search.search
 
 
 def test_parts_read_modules_do_not_import_loop_modules():

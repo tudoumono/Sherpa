@@ -22,10 +22,11 @@ os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 import openpyxl
 import pytest
 
-from sherpa import es_index, json_io, store, worlds
+from sherpa import build_marks, es_index, json_io, store, worlds
 from sherpa.ingest import evidence_ir as IR
 from sherpa.ingest import evidence_render as R
 from sherpa.ingest import office_md, worker, world_graph, world_neo4j
+from tests._replace_row import offline_row
 
 
 def _build_world(tmp_path):
@@ -38,7 +39,7 @@ def _build_world(tmp_path):
     ws["A1"], ws["B1"] = "No", "内容"
     ws["A2"], ws["B2"] = 1, "サンプル内容"
     wb.save(wd / "a.xlsx")
-    rep = office_md.build_derived(wd, dmd)
+    rep = office_md.build_derived(wd, dmd, row=offline_row("w"))
     assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
     return wd, dmd
 
@@ -68,7 +69,7 @@ def _build_world_with_asset(tmp_path):
     wd, dmd = _build_world(tmp_path)
     from PIL import Image
     Image.new("RGB", (4, 4), color="blue").save(wd / "scan.png")
-    rep = office_md.build_derived(wd, dmd)
+    rep = office_md.build_derived(wd, dmd, row=offline_row("w"))
     assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
     return wd, dmd
 
@@ -109,6 +110,8 @@ def _apply_world_monkeypatches(monkeypatch, wd, dmd) -> list:
     # （ES 反映の成否そのものを見るテストは各テストが個別に上書きする）。
     monkeypatch.setattr(es_index, "index_world",
                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
+    monkeypatch.setattr(es_index, "fill_missing_vectors",
+                        lambda world, settings=None, **kw: {"available": True, "filled": 0, "missing": 0})
     # `index_world` を短絡しても、bulk 成功後の `confirm_human_md_meta`（`_meta.human_md_sig` の
     # 書き直し）は `es_index._req` で実 ES へ GET/PUT する別経路——通信の境界（`_req`）自体を
     # フェイクへ差し替え、実 ES の索引メタデータを書き換えないようにする（Codex RV 是正）。
@@ -272,6 +275,9 @@ def test_llm_rag_rewrite_reflects_mention_edges_in_graph(_world, monkeypatch):
     rag_md_path.write_text(rag_md_path.read_text(encoding="utf-8") + "\nSAMPLE を使う。\n", encoding="utf-8")
 
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
+    # グラフの持つ印を今の印に揃える（台帳の作り直しへ進まず、グラフの反映だけを見る）
+    monkeypatch.setattr(world_neo4j, "read_build_marks_sig",
+                        lambda world: world_graph.applied_marks_sig(wd, "w", build_marks.load("w")))
     load_calls = []
 
     def _fake_load_world(nodes, edges, world, uri, user, pw, **_kw):
@@ -279,7 +285,7 @@ def test_llm_rag_rewrite_reflects_mention_edges_in_graph(_world, monkeypatch):
         return (len(nodes), len(edges))
     monkeypatch.setattr(world_neo4j, "load_world", _fake_load_world)
 
-    ok = worker._reindex_after_rag_rewrite("w")
+    ok = worker._reindex_after_rag_rewrite("w", row=offline_row("w"))
     assert ok is True                                    # ES(index_world)成功（`_world` fixture の既定モック）
     assert len(load_calls) == 1                           # グラフ反映が実際に呼ばれた
     _nodes, edges = load_calls[0]
@@ -330,7 +336,7 @@ def test_sidecar_missing_falls_back_to_full_run_via_sync(_world, monkeypatch):
                          {"status": "auto_published", "ledger": 0, "flags": []})
     res = worker.sync("w")
     # `op`（PART-6・Webhook 通知の情報用途のみ）: `sync()` の既定 "sync" がそのまま転送される。
-    assert run_calls == [{"reflect": True, "created_by": "admin", "scan_root": None,
+    assert run_calls == [{"reflect": True, "created_by": "admin",
                           "run_id": None, "on_run_id": None, "op": "sync"}]
     assert res["changed"] is True
 
@@ -351,7 +357,7 @@ def test_old_schema_manifest_triggers_one_full_rebuild_then_stabilizes(_world, m
 
     def _simulated_full_rebuild(world, **kw):
         run_calls.append(kw)
-        rep = office_md.build_derived(_world["wd"], dmd)      # run()が実際にやり直す派生生成の中核
+        rep = office_md.build_derived(_world["wd"], dmd, row=offline_row("w"))      # run()が実際にやり直す派生生成の中核
         assert not rep.get("error")
         return {"status": "auto_published", "ledger": 0, "flags": []}
     monkeypatch.setattr(worker, "_run_locked", _simulated_full_rebuild)
@@ -379,8 +385,8 @@ def _clean_failed_docs_w():
 @pytest.mark.usefixtures("_clean_failed_docs_w")
 def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
         tmp_path, monkeypatch, build_fixture):
-    """正当に一部 sidecar が無いケース（空 OOXML の legacy `.md`・OCR が無効で変換失敗のままの image-only PDF の `.md`）を
-    sidecar 欠落として誤検知しないこと。OCR が有効な image-only PDF は人向け MD の知らせができる。
+    """正当に一部 sidecar が無いケース（空 OOXML の legacy `.md`・image-only PDF）を sidecar 欠落として誤検知しないこと。
+    image-only PDF は OCR の入切に関わらず人向け MD の知らせができる。
     2回連続 sync してもフルリビルドが起きないことを固定する（過検知は既定 OFF でも毎 sync の全再取り込みという実害を生むため）。
     """
     wd = tmp_path / "world"
@@ -394,7 +400,7 @@ def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
         import zipfile
         with zipfile.ZipFile(wd / "empty.docx", "w") as z:
             z.writestr("word/document.xml", docx_xml)
-        rep = office_md.build_derived(wd, dmd)
+        rep = office_md.build_derived(wd, dmd, row=offline_row("w"))
         assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
         assert not (dmd / "empty.docx.md").is_file()
     else:
@@ -405,9 +411,9 @@ def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
         image = Image.new("1", (600, 400), 1)
         ImageDraw.Draw(image).rectangle((40, 40, 300, 200), outline=0, width=4)
         image.save(wd / "scan.pdf", "PDF")
-        rep = office_md.build_derived(wd, dmd)
+        rep = office_md.build_derived(wd, dmd, row=offline_row("w"))
         assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
-        assert (dmd / "scan.pdf.md").is_file() == (build_fixture == "image_only_pdf")
+        assert (dmd / "scan.pdf.md").is_file()   # OCR の入切に関わらず同じ知らせの人用 MD（変換の出力を入切で変えない）
         assert office_md.rag_sidecars_missing(wd, dmd) is False
 
     monkeypatch.setattr(worlds, "world_dir", lambda world: wd)
@@ -431,9 +437,9 @@ def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
     for _ in range(2):                                    # 2回連続でフルリビルドが起きないことを固定
         res = worker.sync("w")
         assert res["status"] == "unchanged" and res["changed"] is False
-    # OCR が有効で worker が動いていない構成のスキャン PDF は、失敗の一覧に ocr_unavailable で載る（他は載らない）
+    # OCR の観測が無いスキャン PDF は、OCR が切でも（worker が動いていない構成でも）失敗の一覧に ocr_unavailable で載る（他は載らない）
     assert {r["rel"]: r["reason"] for r in store.list_failed_docs("w")} == (
-        {"scan.pdf": "ocr_unavailable"} if build_fixture == "image_only_pdf" else {})
+        {"scan.pdf": "ocr_unavailable"} if build_fixture.startswith("image_only_pdf") else {})
 
 
 def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_path, monkeypatch):
@@ -450,7 +456,7 @@ def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_
                 "<w:body></w:body></w:document>")
     with zipfile.ZipFile(wd / "empty.docx", "w") as z:
         z.writestr("word/document.xml", docx_xml)
-    rep = office_md.build_derived(wd, dmd)
+    rep = office_md.build_derived(wd, dmd, row=offline_row("w"))
     assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
     assert not (dmd / "empty.docx.md").is_file()
     assert (_ir(dmd) / "empty.docx.evidence.json").is_file()
@@ -476,6 +482,8 @@ def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_
     # 本ファイルの docstring が明言する「実 ES には接続しない」前提を保つ（§ _apply_world_monkeypatches 参照）。
     monkeypatch.setattr(es_index, "index_world",
                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
+    monkeypatch.setattr(es_index, "fill_missing_vectors",
+                        lambda world, settings=None, **kw: {"available": True, "filled": 0, "missing": 0})
     # `index_world` を短絡しても bulk 成功後の `confirm_human_md_meta` は `_req` で実 ES へ
     # GET/PUT する別経路——通信の境界自体をフェイクへ差し替える（Codex RV 是正・
     # `_fake_es_meta_req` docstring 参照）。
@@ -510,9 +518,9 @@ def test_render_covers_all_evidence_ir_values(tmp_path):
     """Evidence IR の値付き element が citation されること・値が chunk body に実在することを
     ID一致だけでなく本文レベルでも検証する。"""
     _, dmd = _build_world(tmp_path)
-    ir = IR.from_json_str((_ir(dmd) / "a.xlsx.evidence.json").read_text(encoding="utf-8"))
+    ir = IR.from_json_str(json_io.read_text_maybe_gzip(_ir(dmd) / "a.xlsx.evidence.json"))
     chunks = [json.loads(line) for line in
-              (_rag(dmd) / "a.xlsx.rag_chunks.jsonl").read_text(encoding="utf-8").splitlines()]
+              json_io.read_text_maybe_gzip(_rag(dmd) / "a.xlsx.rag_chunks.jsonl").splitlines()]
 
     cited_ids = {citation["evidence_id"] for chunk in chunks for citation in chunk["citations"]}
     value_element_ids = {el.element_id for el in ir.elements if _value_text(el.value)}
@@ -531,7 +539,7 @@ def test_render_value_lands_in_specific_chunk_with_expected_source_line(tmp_path
     索引本文は jsonl の`search_text`ではなくrag.mdのアンカーから取る（`es_index._parse_rag_md_chunks`）。"""
     _, dmd = _build_world(tmp_path)
     chunks = [json.loads(line) for line in
-              (_rag(dmd) / "a.xlsx.rag_chunks.jsonl").read_text(encoding="utf-8").splitlines()]
+              json_io.read_text_maybe_gzip(_rag(dmd) / "a.xlsx.rag_chunks.jsonl").splitlines()]
     assert all("search_text" not in c for c in chunks)   # D1: jsonlはもう索引本文を持たない
     rag_md_bodies, anchor_reason = es_index._parse_rag_md_chunks(
         (_rag(dmd) / "a.xlsx.rag.md").read_text(encoding="utf-8"))

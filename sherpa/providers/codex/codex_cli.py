@@ -177,8 +177,17 @@ def apply_codex_usage(ctx, st, env):
         _log_chat_usage(env["usage"], time.monotonic() - _turn_t0, ctx.world)
 
 
+RUN_FILES_FAILED_MESSAGE = "調査に必要な手順ファイルを準備できませんでした。今回は実行していません。"
+SKILLS_PARTIAL_NOTICE = "資料作成用の手順ファイルを準備できませんでした。ファイルの作成はできない場合があります。"
+
+
+class RunFilesError(RuntimeError):
+    """調査に必要な手順ファイル（AGENTS.md・調査用のスキル）を作業領域に置けなかった（Codex を起動しない）。"""
+
+
 def write_run_files(self, ctx, st):
-    """AGENTS.md・skills・`config.toml` を書く（AGENTS.md と skills は fail-open・設定の書き込みは fail-closed）。Web 検索の制限の注記ノードを出す。"""
+    """AGENTS.md・skills・`config.toml` を書く。AGENTS.md と調べる実行のスキルを置けなければ `RunFilesError`（手順なしで Codex を動かさない）。
+    素の Codex の資料作成用スキルだけは、置けなくても注記して続ける。設定の書き込みも失敗は例外。Web 検索の制限の注記ノードを出す。"""
     _plain = st._plain
     run_dir = st.run_dir
     uid = st.uid
@@ -198,7 +207,6 @@ def write_run_files(self, ctx, st):
     _deny_roots = st._deny_roots
     _sensitive_deny = st._sensitive_deny
     _mcp_budget_env = st._mcp_budget_env
-    # AGENTS.md はベストエフォート（書けなくても Codex 実行は継続・fail-open）。気づけるよう warning は残す（containment/grounding の短縮形はプロンプトにも置いてある）。
     try:
         if _plain:
             codex_agents_md.write_agents_md(run_dir, plain=True)
@@ -214,13 +222,17 @@ def write_run_files(self, ctx, st):
                                             ledger_style=st._ledger_style,
                                             plan_review_cap=st._plan_review_cap)
     except Exception as e:
-        _log.warning("AGENTS.md write failed (fail-open, prompt still has containment): %s", e)
-    # スキル配備もベストエフォート（fail-open）。knowledge=ON の Codex 実行全部で配備する（author に限定しない）。plain は investigate-* スキルを置かない（xlsx/docx/pptx/marp は配備する）。
+        _log.warning("AGENTS.md write failed: %s", type(e).__name__)
+        raise RunFilesError(RUN_FILES_FAILED_MESSAGE) from e
+    # スキルは knowledge=ON の Codex 実行全部で配備する（author に限定しない）。plain は investigate-* スキルを置かない（xlsx/docx/pptx/marp は配備する）。
     try:
         codex_skills.deploy_skills(run_dir, uid, users_dir,
                                    skip_prefix="investigate-" if _plain else None)
     except Exception as e:
-        _log.warning("skills deploy failed (fail-open): %s", e)
+        _log.warning("skills deploy failed: %s", type(e).__name__)
+        if not _plain:
+            raise RunFilesError(RUN_FILES_FAILED_MESSAGE) from e
+        st._answer_notices.append(("skills_unavailable", SKILLS_PARTIAL_NOTICE))
     # profile config はここで書く（FileExistsError 等は fail-closed で例外→answer=None→CODEX_HOME 削除→決定的回答）。marp/Chromium を read root に足す必要は無い（レンダは Sherpa 本体側）。
     # 会話ごとの CODEX_HOME は毎ターン再利用するため、前ターンの config.toml（creds を含む）の残骸が無いことを確認してから書く。
     if codex_home is not None:
@@ -241,7 +253,7 @@ def write_run_files(self, ctx, st):
             codex_home, _kb_read_roots(ctx.world), _reason,
             True, ctx.world, sp, self._web_search, _ask_disabled,
             ollama_base_url=self._ollama_base_url, system_settings=self._system_settings,
-            layer=_layer, direct_read_roots=_direct_roots, sensitive_deny=_sensitive_deny,
+            layer=_layer, direct_read_roots=_direct_roots, sensitive_deny=_sensitive_deny, rules=st._rules,
             sidecar_path=str(_sidecar_path),
             deny_roots=_deny_roots,
             multi_agent=st._multi_agent_enabled, orchestrator_model=self.model,
@@ -352,6 +364,21 @@ def resolve_reasoning(self, ctx, st, decision):
     st._review_rounds, st._review_rounds_escalation = _review_rounds, _review_rounds_escalation
 
 
+def sandboxed_exec_argv(*, last_message_path, run_dir, model: str, reasoning: str,
+                        multi_agent: bool, ephemeral: bool) -> list:
+    """サンドボックス有効の `codex exec` の共通の引数（本物のターンと「つながりの確認」の Codex が同じ並びで使う）。
+    `multi_agent` は管理者環境の既定値に依存させず明示する（無効でも false を書く）。
+    """
+    argv = ["codex", "exec", "--json", "--strict-config", "--skip-git-repo-check",
+            "-o", str(last_message_path),
+            "-C", str(run_dir), "-m", model,
+            "-c", f"model_reasoning_effort={reasoning}"]
+    argv += ["-c", f"features.multi_agent={'true' if multi_agent else 'false'}"]
+    if ephemeral:
+        argv.append("--ephemeral")
+    return argv
+
+
 def build_launch(self, ctx, st):
     """`codex exec` の起動引数・環境変数・`-o` の出力先・サイドカーの置き場・出力スキーマを決めて `st` へ置く。"""
     _plain = st._plain
@@ -372,8 +399,6 @@ def build_launch(self, ctx, st):
     # 評価用の計画書方式。標準モードの構造化出力（v2）のときだけ有効（それ以外は常に json＝従来の動作）。
     _style = st._ledger_style
     st._plan_review_cap = plan_ledger.review_cap_for((ctx.scope_meta or {}).get("depth_profile"))
-    if _style != "json":
-        st._plan_gate = plan_ledger.PlanGateState() if _style == "plan_gate" else None
     if _plain:
         # 素の Codex モード: MCP サーバへツールの絞り込みを渡す。台帳のディレクトリ・required_extra は渡さない（台帳ツール自体を出さない）。
         _mcp_budget_env["SHERPA_MCP_TOOLSET"] = "plain"
@@ -412,14 +437,9 @@ def build_launch(self, ctx, st):
         # 道具の呼び出しの記録の置き場。サンドボックスのシェルから書けない codex_home の中（ターンごとの名前・終わりに消す）。
         st._call_log_dir = codex_home / f"toolcalls-{st.turn_uid}"
         _mcp_budget_env[tool_call_log.ENV_DIR] = str(st._call_log_dir)
-        argv_base = ["codex", "exec", "--json", "--strict-config", "--skip-git-repo-check",
-                    "-o", str(_last_message_path),
-                    "-C", str(run_dir), "-m", self.model,
-                    "-c", f"model_reasoning_effort={_reason}"]
-        # 管理者環境の既定値に依存させず明示指定する。無効時（`codex_worker_model` 未設定の独自エンドポイント等）も明示的に false にする（`[agents.*]` の層が無いまま機能だけ有効になるのを防ぐ）。
-        argv_base += ["-c", f"features.multi_agent={'true' if st._multi_agent_enabled else 'false'}"]
-        if not st._session_persistence_enabled:
-            argv_base.append("--ephemeral")
+        argv_base = sandboxed_exec_argv(
+            last_message_path=_last_message_path, run_dir=run_dir, model=self.model, reasoning=_reason,
+            multi_agent=st._multi_agent_enabled, ephemeral=not st._session_persistence_enabled)
         # `self._openai_api_key` は Codex(OpenAI) 構成で接続先が Azure 等の時だけ `_select_provider` が渡す（それ以外は常に None＝env に渡さない）。
         popen_env = _codex_clean_env(codex_home, _tmp, openai_api_key=self._openai_api_key)
     else:
@@ -440,17 +460,17 @@ def build_launch(self, ctx, st):
         st._call_log_dir = _tmp / "toolcalls"
         _mcp_budget_env[tool_call_log.ENV_DIR] = os.path.realpath(st._call_log_dir)
         argv_base += _mcp_config_args(ctx.world, sp, _ask_disabled, layer=_layer,
-                                      extra_env={**_mcp_budget_env, **_sidecar_env})
-        popen_env = {**os.environ, **_mcp_env(ctx.world, sp, _ask_disabled, layer=_layer),
+                                      extra_env={**_mcp_budget_env, **_sidecar_env}, rules=st._rules)
+        popen_env = {**os.environ, **_mcp_env(ctx.world, sp, _ask_disabled, layer=_layer, rules=st._rules),
                     **_mcp_budget_env, **_sidecar_env}
         # `.tmp/` は run_dir 生成のたびに空から始まるため、前ターン残骸の事前 unlink は不要。ここで吸収を許可してよい。
         st._sidecar_init_ok = True
-    # 出力スキーマ: OpenAI 系構成のみ（Codex(Ollama) は対象外）。`SHERPA_CODEX_OUTPUT_SCHEMA=0` で無効化・`=1` で v1。既定は v2（`claims` 付き）。
+    # 出力スキーマ: Codex(OpenAI)・Codex(Ollama) とも。`SHERPA_CODEX_OUTPUT_SCHEMA=0` で無効化・`=1` で v1。既定は v2（`claims` 付き）。
     # plain は env の値に関わらず常に 0（平文の回答・`_pick_codex_headline` を使う）。台帳ゲート（`_schema_v2 and ...`）・claims の格下げ判定は `_schema_v2` が偽になることで無効になる。
     _schema_level = 0 if _plain else env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 2, 0, 2)
-    _schema_on = self._ollama_base_url is None and _schema_level >= 1
+    _schema_on = _schema_level >= 1
     _schema_v2 = _schema_on and _schema_level == 2
-    # ログ・利用統計には実際に効いている値を出す（Codex(Ollama) は出力スキーマを使わない＝0）。
+    # ログ・利用統計には実際に効いている値を出す。
     _schema_level_effective = 2 if _schema_v2 else (1 if _schema_on else 0)
     if _schema_on:
         argv_base += ["--output-schema",

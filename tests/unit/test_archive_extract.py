@@ -21,6 +21,7 @@ import pytest
 
 from sherpa import corpus_docs, documents, grep_tool, worlds
 from sherpa.ingest import archive_extract as ax
+from tests._replace_row import offline_row
 
 
 def _isolate_world_kb(monkeypatch, tmp_path) -> Path:
@@ -86,7 +87,7 @@ def test_zip_doc_id_prefix_and_member_safety(monkeypatch, tmp_path):
 
     root = worlds.world_dir(world)
     assert root == wd
-    summary = ax.sync_world_archives(world, root)
+    summary = ax.sync_world_archives(world, root, row=offline_row(world))
     s = summary["docs/design.zip"]
     assert s["status"] == "ok"
     assert s["extracted_count"] == 2            # screen/list.txt・readme.txt だけ
@@ -128,7 +129,7 @@ def test_targz_symlink_not_extracted_and_doc_id(monkeypatch, tmp_path):
         tf.addfile(link)
 
     root = worlds.world_dir(world)
-    summary = ax.sync_world_archives(world, root)
+    summary = ax.sync_world_archives(world, root, row=offline_row(world))
     s = summary["bundle.tar.gz"]
     assert s["status"] == "ok"
     assert s["extracted_count"] == 1
@@ -150,7 +151,7 @@ def test_shift_jis_zip_filename_decoded(tmp_path):
     zpath = tmp_path / "jp.zip"
     _write_minimal_zip(zpath, [(name_bytes, b"content\n", 0)])  # flag_bits=0=UTF-8フラグ無し
     dest = tmp_path / "dest"
-    result = ax.extract_archive(zpath, dest, work_root=tmp_path / "work", rel="jp.zip")
+    result = ax.extract_archive(zpath, dest, work_root=tmp_path / "work", rel="jp.zip", row=offline_row("w"))
     assert result["status"] == "ok"
     assert result["extracted_count"] == 1
     assert (dest / "設計書" / "一覧.txt").is_file()
@@ -162,7 +163,7 @@ def test_encrypted_zip_is_unsupported(tmp_path):
     zpath = tmp_path / "enc.zip"
     _write_minimal_zip(zpath, [(b"secret.txt", b"data\n", 0x1)])   # bit0=暗号化フラグ
     dest = tmp_path / "dest"
-    result = ax.extract_archive(zpath, dest, work_root=tmp_path / "work", rel="enc.zip")
+    result = ax.extract_archive(zpath, dest, work_root=tmp_path / "work", rel="enc.zip", row=offline_row("w"))
     assert result["status"] == "encrypted"
     assert result["reason"] == "archive_encrypted"
     assert result["extracted_count"] == 0
@@ -177,7 +178,7 @@ def test_uncompressed_size_limit_marks_too_large(monkeypatch, tmp_path):
     with zipfile.ZipFile(zpath, "w") as zf:
         zf.writestr("big.txt", "x" * 1000)
     dest = tmp_path / "dest"
-    result = ax.extract_archive(zpath, dest, work_root=tmp_path / "work", rel="bomb.zip")
+    result = ax.extract_archive(zpath, dest, work_root=tmp_path / "work", rel="bomb.zip", row=offline_row("w"))
     assert result["status"] == "too_large"
     assert result["reason"] == "archive_too_large"
     assert result["extracted_count"] == 0
@@ -194,7 +195,7 @@ def test_archive_update_replaces_and_delete_removes(monkeypatch, tmp_path):
     with zipfile.ZipFile(zpath, "w") as zf:
         zf.writestr("v1.txt", "version1\n")
     root = worlds.world_dir(world)
-    ax.sync_world_archives(world, root)
+    ax.sync_world_archives(world, root, row=offline_row(world))
     archives_root = worlds.archives_dir(world)
     assert (archives_root / "a.zip" / "v1.txt").is_file()
 
@@ -202,15 +203,44 @@ def test_archive_update_replaces_and_delete_removes(monkeypatch, tmp_path):
     time.sleep(0.01)
     with zipfile.ZipFile(zpath, "w") as zf:
         zf.writestr("v2.txt", "version2\n")
-    ax.sync_world_archives(world, root)
+    ax.sync_world_archives(world, root, row=offline_row(world))
     assert not (archives_root / "a.zip" / "v1.txt").exists()
     assert (archives_root / "a.zip" / "v2.txt").is_file()
 
     # アーカイブ自体を削除 → 展開先ごと消える（削除伝播）。
     zpath.unlink()
-    ax.sync_world_archives(world, root)
+    ax.sync_world_archives(world, root, row=offline_row(world))
     assert not (archives_root / "a.zip").exists()
     assert not worlds.archive_manifest_path(world).exists()
+
+
+def test_manifest_carries_the_row_number_but_the_returned_summary_does_not(monkeypatch, tmp_path):
+    """manifest の先頭の階層に取り込みの番号と設定の値を書く。展開結果の一覧（戻り値・次回の読み戻し）には混ぜない。"""
+    import json
+    kb = _isolate_world_kb(monkeypatch, tmp_path)
+    world = "arcw_no"
+    wd = kb / world
+    wd.mkdir(parents=True)
+    with zipfile.ZipFile(wd / "a.zip", "w") as zf:
+        zf.writestr("v1.txt", "version1\n")
+    row = offline_row(world, ingest_no=42)
+    result = ax.sync_world_archives(world, worlds.world_dir(world), row=row)
+    assert list(result) == ["a.zip"]
+    written = json.loads(worlds.archive_manifest_path(world).read_text(encoding="utf-8"))
+    assert written["ingest_no"] == 42 and written["settings_sig"] and "a.zip" in written
+    assert list(ax.sync_world_archives(world, worlds.world_dir(world), row=row)) == ["a.zip"]
+    assert row._offline == ["archives"]   # 2 回目は展開を飛ばすので入れ替えない
+
+
+def test_failed_extraction_of_the_whole_sync_marks_the_row_and_the_run_goes_on(monkeypatch, tmp_path):
+    """展開全体の例外は取り込みを止めず、行へ「失敗」を残す。"""
+    kb = _isolate_world_kb(monkeypatch, tmp_path)
+    world = "arcw_fail"
+    (kb / world).mkdir(parents=True)
+    monkeypatch.setattr(ax, "sync_world_archives", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    row = offline_row(world)
+    assert ax.sync_step(world, row=row) == [None]
+    assert row._offline == ["failed:archives"]
 
 
 # ---- G: 中のファイルのダウンロードは展開した写しを返す -----------------------------------------
@@ -224,7 +254,7 @@ def test_inner_file_download_resolves_extracted_copy(monkeypatch, tmp_path):
     with zipfile.ZipFile(zpath, "w") as zf:
         zf.writestr("x/y.txt", "payload\n")
     root = worlds.world_dir(world)
-    ax.sync_world_archives(world, root)
+    ax.sync_world_archives(world, root, row=offline_row(world))
 
     resolved = documents.resolve("d/b.zip/x/y.txt", world)
     assert resolved is not None
@@ -261,7 +291,7 @@ def test_sync_refuses_and_writes_nothing_when_root_overlaps_derived(monkeypatch,
     before = sorted(str(p.relative_to(wd)) for p in wd.rglob("*"))
 
     with pytest.raises(ax.ArchiveRootOverlapError):
-        ax.sync_world_archives(world, root)
+        ax.sync_world_archives(world, root, row=offline_row(world))
 
     after = sorted(str(p.relative_to(wd)) for p in wd.rglob("*"))
     assert before == after   # 原本（= この設定では派生領域と同じ場所）には何も書かれていない
@@ -280,7 +310,7 @@ def test_enumeration_failure_preserves_prior_manifest_and_extracted_content(monk
         zf.writestr("x.txt", "hi\n")
     root = worlds.world_dir(world)
 
-    first = ax.sync_world_archives(world, root)
+    first = ax.sync_world_archives(world, root, row=offline_row(world))
     assert first["a.zip"]["status"] == "ok"
     archives_root = worlds.archives_dir(world)
     manifest_path = worlds.archive_manifest_path(world)
@@ -293,7 +323,7 @@ def test_enumeration_failure_preserves_prior_manifest_and_extracted_content(monk
         yield   # pragma: no cover - ジェネレータにするためだけの到達しない yield
 
     monkeypatch.setattr(ax.scope_infer, "safe_files", _boom)
-    result = ax.sync_world_archives(world, root)
+    result = ax.sync_world_archives(world, root, row=offline_row(world))
 
     assert result == first               # 前回の manifest をそのまま返す（削除も書換えもしない）
     assert (archives_root / "a.zip" / "x.txt").is_file()    # 展開物は消えていない
@@ -311,7 +341,7 @@ def test_overflow_leaves_nothing_in_dest_and_clears_stale_content_on_update(monk
     with zipfile.ZipFile(zpath, "w") as zf:
         zf.writestr("small.txt", "hi\n")
     root = worlds.world_dir(world)
-    first = ax.sync_world_archives(world, root)
+    first = ax.sync_world_archives(world, root, row=offline_row(world))
     assert first["a.zip"]["status"] == "ok"
     archives_root = worlds.archives_dir(world)
     dest = archives_root / "a.zip"
@@ -322,7 +352,7 @@ def test_overflow_leaves_nothing_in_dest_and_clears_stale_content_on_update(monk
         zf.writestr("big.txt", "x" * 1000)
     monkeypatch.setattr(ax, "MAX_TOTAL_UNCOMPRESSED_BYTES", 10)
 
-    result = ax.sync_world_archives(world, root)
+    result = ax.sync_world_archives(world, root, row=offline_row(world))
     assert result["a.zip"]["status"] == "too_large"
     assert not dest.exists()                                           # 旧い展開物も消える（記録と中身を一致）
     work_root = worlds.archives_work_dir(world)
@@ -344,7 +374,7 @@ def test_extraction_read_failure_during_update_preserves_prior_content(monkeypat
     with zipfile.ZipFile(zpath, "w") as zf:
         zf.writestr("v1.txt", "version1\n")
     root = worlds.world_dir(world)
-    first = ax.sync_world_archives(world, root)
+    first = ax.sync_world_archives(world, root, row=offline_row(world))
     assert first["a.zip"]["status"] == "ok"
     archives_root = worlds.archives_dir(world)
     dest = archives_root / "a.zip"
@@ -358,7 +388,7 @@ def test_extraction_read_failure_during_update_preserves_prior_content(monkeypat
         raise OSError("simulated transient read failure")
     monkeypatch.setattr(ax, "_extract_zip", _boom)
 
-    result = ax.sync_world_archives(world, root)
+    result = ax.sync_world_archives(world, root, row=offline_row(world))
     assert result["a.zip"]["last_sync_error"] == "read_failed"
     assert result["a.zip"]["content_hash"] == first["a.zip"]["content_hash"]  # 前回のハッシュのまま
     assert (dest / "v1.txt").is_file()                 # 前回の展開物がそのまま残っている
@@ -382,14 +412,14 @@ def test_extracted_content_named_like_staging_sidecar_survives_resync(monkeypatc
     with zipfile.ZipFile(zpath, "w") as zf:
         zf.writestr("x/old.zip.staging/readme.txt", "legit content\n")
     root = worlds.world_dir(world)
-    first = ax.sync_world_archives(world, root)
+    first = ax.sync_world_archives(world, root, row=offline_row(world))
     assert first["a.zip"]["status"] == "ok"
     archives_root = worlds.archives_dir(world)
     target = archives_root / "a.zip" / "x" / "old.zip.staging" / "readme.txt"
     assert target.is_file()
 
     # 再同期（`_cleanup_archives_work` は毎回冒頭で呼ばれる＝異常終了の有無によらず経路を通る）。
-    result = ax.sync_world_archives(world, root)
+    result = ax.sync_world_archives(world, root, row=offline_row(world))
     assert result["a.zip"]["status"] == "ok"
     assert target.is_file()
     assert target.read_text(encoding="utf-8") == "legit content\n"
@@ -407,7 +437,7 @@ def test_sensitive_named_archive_is_never_extracted_or_exposed(monkeypatch, tmp_
         zf.writestr("readme.txt", "needle-sensitive-archive-inner\n")
     root = worlds.world_dir(world)
 
-    result = ax.sync_world_archives(world, root)
+    result = ax.sync_world_archives(world, root, row=offline_row(world))
     assert "credentials.zip" not in result                  # 展開対象に入らない（found に入れない）
     archives_root = worlds.archives_dir(world)
     assert not (archives_root / "credentials.zip").exists()  # 展開先には何も作られない

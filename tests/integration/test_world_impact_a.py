@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+from tests._replace_row import offline_row
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 os.chdir(ROOT)
@@ -47,7 +48,7 @@ def _load():
     nodes, edges, flags = world_graph.build_world(MIRROR, WORLD)
     assert flags == [], f"鏡 fixture は曖昧なく解決するはず: {flags}"
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))
     register_test_world(WORLD)   # 自前 _cleanup のバックストップ（tests/_world_registry.py）
 
 

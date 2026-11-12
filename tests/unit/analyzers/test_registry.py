@@ -78,7 +78,7 @@ def test_registered_extensions_is_union_of_known_analyzers():
     upstream_ext = frozenset().union(*(a.extensions for a in registry._UPSTREAM_ANALYZERS))
     assert upstream_ext == {".cbl", ".cob", ".cobol", ".cpy", ".copybook", ".jcl", ".java",
                             ".properties", ".yaml", ".yml", ".xml", ".sql",
-                            ".c", ".h", ".cs",
+                            ".c", ".h", ".pc", ".sqc", ".cs",
                             ".jsp", ".jspx", ".jspf", ".tag", ".tagx",
                             ".html", ".htm", ".xhtml", ".js", ".mjs", ".css",
                             ".sh", ".bash", ".ksh", ".zsh", ".bat", ".cmd",

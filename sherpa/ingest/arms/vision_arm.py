@@ -2,7 +2,7 @@
 
 - 既定はローカル（Ollama の視覚モデル・既定モデル `qwen2.5vl`・接続先は管理画面の中央の Ollama 接続先 `ollama_url` ＞ `http://localhost:11434`・許可リストの判定も同じ）。
 - クラウド（OpenAI）は管理者が `system_settings.vlm.cloud_allowed=true` にした場合のみ。false（既定）なら provider=openai が指定されていても画像を送らない。
-- Ollama の接続先は loopback か管理画面の Ollama 許可一覧にある宛先（IP・DNS 名とも）ならクラウド許可は不要。許可されていない宛先へは送らない（`_ollama_url_permitted`）。
+- Ollama の接続先は loopback・中央の Ollama 接続先・管理画面の Ollama 許可一覧にある宛先（IP・DNS 名とも）ならクラウド許可は不要。許可されていない宛先へは送らない（`_ollama_url_permitted`）。
 
 対象（`accepts`）: (a) ラスタ画像（`office_md.IMAGE_EXT`）を VLM へ（PNG・JPEG 以外は PNG にしてから送る・複数ページの TIFF はページごと）。(b) テキスト層ゼロの PDF（`office_md.pdf_escalation_target == "vision"`）を PDFium でページ画像化して VLM へ（`raster` を共用）。Office 文書は担当しない。
 出力: 先頭に `> [OCR抽出（AI視覚読み取り）: 信頼度=低〜中]`・`method="vision"`・confidence 0.4・notes に `vlm_provider`/`vlm_model`/`numeric_verified=false`（VLM は数値を誤りうる）。到達不可/失敗/未対応は None。
@@ -53,14 +53,29 @@ def _system_vlm() -> dict:
     return val if isinstance(val, dict) else {}
 
 
-def vlm_config() -> dict:
+class InvalidVlmProviderConfigError(ValueError):
+    """保存済みの `vlm.provider` が非空の不正値のとき、`vlm_config(strict=True)` が送出する。"""
+
+
+def invalid_vlm_provider() -> str | None:
+    """保存済みの `vlm.provider` が非空の不正値ならその文字列、未設定（なし・空）と正しい値は None（管理画面の警告用）。"""
+    raw = _system_vlm().get("provider")
+    if not raw or str(raw).strip().lower() in _KNOWN_PROVIDERS:
+        return None
+    return str(raw)
+
+
+def vlm_config(*, strict: bool = False) -> dict:
     """VLM の実効設定（provider/model/cloud_allowed/ollama_url）を解決する。
 
     provider＝system `vlm.provider` ＞ 既定 `ollama`、model＝system `vlm.model` ＞ 既定 `qwen2.5vl`。cloud_allowed＝system `vlm.cloud_allowed`（bool）のみ・既定 false（env フォールバックなし＝管理者の明示操作でのみ true）。ollama_url＝system `ollama_url`（中央の Ollama 接続先）＞ 既定。遮断前の生の解決結果を返す（openai×未許可でも provider=openai を返す）。
+    provider の保存値が非空の不正値なら、`strict=True` は `InvalidVlmProviderConfigError`、`strict=False`（既定・表示向け）は既定の `ollama` で返す。実際に送る入口（`resolve_vlm`）は `strict=True`。
     """
     sysv = _system_vlm()
     provider = str(sysv.get("provider") or _DEFAULT_PROVIDER).strip().lower()
     if provider not in _KNOWN_PROVIDERS:
+        if strict:
+            raise InvalidVlmProviderConfigError("vlm.provider の保存値が不正です")
         provider = _DEFAULT_PROVIDER
     model = str(sysv.get("model") or _DEFAULT_MODEL).strip() or _DEFAULT_MODEL
     cloud_allowed = bool(sysv.get("cloud_allowed"))  # system のみ・既定 false（env フォールバックなし）
@@ -122,7 +137,7 @@ def _cloud_allowed_now(system_settings: dict | None = None) -> bool:
 
 
 def _ollama_url_permitted(url: str) -> bool:
-    """`url` が Ollama の接続許可ポリシー（loopback＋管理画面の許可一覧＝回答用の Ollama と同じ `llm.assert_ollama_url_allowed`）を満たすか。I/O なし。不許可・不正 URL は False。"""
+    """`url` が Ollama の接続許可ポリシー（loopback＋中央の接続先＋管理画面の許可一覧＝回答用の Ollama と同じ `llm.assert_ollama_url_allowed`）を満たすか。I/O なし。不許可・不正 URL は False。"""
     from sherpa import llm
     hp = llm._canonical_host_port(url)
     if hp is not None and llm.is_loopback_host(hp[0]):
@@ -158,7 +173,11 @@ def resolve_vlm() -> dict | None:
     override = _vlm_usable_override()
     if override is not None:
         return vlm_config() if override else None
-    cfg = vlm_config()
+    try:
+        cfg = vlm_config(strict=True)
+    except InvalidVlmProviderConfigError:
+        _log.warning("VLM: provider の保存値が不正なため無効化します（画像は送信しません）。管理画面で接続先を選び直してください。")
+        return None
     if cfg["provider"] == "openai":
         if not cfg["cloud_allowed"]:
             _log.warning("VLM: provider=openai が指定されていますが、クラウド許可（cloud_allowed）が無いため"
@@ -507,7 +526,7 @@ def _read_ollama(image_path: Path, cfg: dict, timeout: float) -> str | None:
     from sherpa import llm, metering
     body = {"model": cfg["model"], "stream": False,
             "messages": [{"role": "user", "content": _VLM_PROMPT, "images": [_read_image_b64(image_path)]}]}
-    # 接続先は中央の Ollama 接続先と同じ許可リスト（loopback＋管理画面の許可一覧）で検証する。
+    # 接続先は回答用の Ollama と同じ許可リスト（loopback＋中央の接続先＋管理画面の許可一覧）で検証する。
     resp = llm.post_json(llm.ollama_url(url, "/api/chat"),
                          llm.JSON_HEADERS, body, timeout=max(1, int(timeout)))
     metering.acc_add(metering.usage_from_ollama_chat(resp))

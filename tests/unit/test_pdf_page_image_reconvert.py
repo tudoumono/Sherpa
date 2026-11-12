@@ -2,6 +2,7 @@
 import xlsxwriter
 
 from sherpa.ingest import office_md
+from tests._replace_row import offline_row
 
 
 def test_publish_one_removes_rendered_page_images_of_the_replaced_document(tmp_path):
@@ -11,12 +12,12 @@ def test_publish_one_removes_rendered_page_images_of_the_replaced_document(tmp_p
     wb = xlsxwriter.Workbook(src / "a.xlsx")
     wb.add_worksheet("s").write(0, 0, "甲の値")
     wb.close()
-    office_md.build_derived(src, der)
+    office_md.build_derived(src, der, row=offline_row("w"))
     pages = der.parent / "rag" / "a.xlsx.pages"
     pages.mkdir()
     (pages / "p0001.old.png").write_bytes(b"x")
-    rep = office_md.derive_one(src, der, (src / "a.xlsx").resolve(), "a.xlsx")
+    rep = office_md.derive_one(src, der, (src / "a.xlsx").resolve(), "a.xlsx", row=offline_row("w"))
     assert not rep.get("error")
-    office_md.publish_one(der, "a.xlsx")
+    office_md.publish_one(der, "a.xlsx", row=offline_row("w"))
     assert not pages.exists()
     assert "甲の値" in (der.parent / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8")

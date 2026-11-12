@@ -1,6 +1,6 @@
 r"""C アナライザ。`.c`/`.h` を全件受理し、ファイル自体を主体定義（`Module`・拡張子込みのファイル名）、トップレベルの関数定義（`.c`）／プロトタイプ宣言（`.h`）を子定義（`<ファイル名>.<関数名>`・extra `c_kind`）として返す。
 
-参照: `#include "x.h"` は `via=include`（`include_path` は `\` を `/` に正規化・始点はファイルの主体・パス区切りを含む相対パスは完全一致でしか解決せず、一致しなければ最近傍へ倒さず未解決＝`path_exact`）、関数呼び出しは `via=call`（他ファイルの関数 children を単純名で最近傍解決）。
+参照: `EXEC SQL ... ;` と文字列リテラルの SQL は表への `ACCESSES`（`via=exec_sql`／`string_sql`・読み取りは `_embedded_sql`・EXEC SQL の文は構文解析に渡さない）、`#include "x.h"` は `via=include`（`include_path` は `\` を `/` に正規化・始点はファイルの主体・パス区切りを含む相対パスは完全一致でしか解決せず、一致しなければ最近傍へ倒さず未解決＝`path_exact`）、関数呼び出しは `via=call`（他ファイルの関数 children を単純名で最近傍解決）。
 呼び出しの始点（`source_symbol_id`）は、その行を本体に含む関数定義（`<ファイル名>.<関数名>`）。関数の外の呼び出しはファイルの主体。同じ行に複数の定義がかかる行・定義の閉じ `}` の後ろに同じ行のコードが続く行の呼び出しは決められないので主体にし、`Dropped("ambiguous_source_symbol")` で申告する。
 読み取りは Tree-sitter（tree-sitter-c・`_ts`）。関数定義は複数行・K&R 形式・`extern "C" { }` の中・`#if` の枝の中も読む（K&R 形式は通常の定義として子定義・始点になる）。
 申告: 構文エラーの領域は `syntax_error`（`extern "C"` の括弧を `#ifdef __cplusplus` で分ける定型句は除く）、`.h` に C++ 専用の予約語（`class`/`namespace`/`template`）は `cxx_header`、同じファイルで `#define 名(...)` した関数形式マクロの呼び出しは `c_macro_call`（参照にしない）、呼び出し先が名前でない形（`(*fp)(x)`・`p->fn(x)`・`tbl[i](x)`）は `c_dynamic_call`。`#if` の条件式・マクロ本体の中は読まない。大文字小文字は区別する。
@@ -12,11 +12,11 @@ import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from . import _ts
+from . import _embedded_sql, _ts
 from ._base import Analyzer, DefItem, DefResult, Dropped, RefCandidate, RefResult
 
 
-C_EXT = frozenset({".c", ".h"})
+C_EXT = frozenset({".c", ".h", ".pc", ".sqc"})   # `.pc`・`.sqc` は SQL を埋め込んだ C
 
 # 制御構文キーワード（呼び出しから除外する）。
 _CONTROL_KEYWORDS = frozenset({"if", "for", "while", "switch", "return", "sizeof"})
@@ -177,7 +177,7 @@ def _blank_macro_noise(text: str) -> str:
 
 
 def _parse(text: str) -> _ts.Parsed:
-    return _ts.parse("c", _blank_macro_noise(text))
+    return _ts.parse("c", _blank_macro_noise(_embedded_sql.read_embedded_sql(text)[0]))
 
 
 def _members(node):
@@ -276,7 +276,7 @@ class CAnalyzer(Analyzer):
     extensions = C_EXT
     resolves_calls_by_simple_name = True
     doctype = "c"
-    version = 4
+    version = 5
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         filename = PurePosixPath(rel_path).name
@@ -353,4 +353,7 @@ class CAnalyzer(Analyzer):
             refs.append(RefCandidate("INVOKES", "Module", name, line, extra={"via": "call"},
                                      source_symbol_id=owner_of(line)))
 
-        return RefResult(refs=refs, dropped=dropped)
+        _code, sql_refs, sql_dropped = _embedded_sql.read_embedded_sql(text)
+        for r in sql_refs:
+            r.source_symbol_id = owner_of(r.line)
+        return RefResult(refs=refs + sql_refs, dropped=dropped + sql_dropped)

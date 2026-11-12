@@ -139,16 +139,13 @@ def test_router_picks_lens_and_start():
 # ---- 会話フロー（要 Neo4j＋Postgres） ----
 
 def test_chat_persists_and_answers_answer_first_and_routes_troubleshoot():
-    """業務語「消費税率」は構造的に解決しない（REALIZES 橋の撤去）ので、起点はコード自身の識別子を使う。"""
+    """調べ方（レンズ）の振り分けと会話の継続。調べる作業は Codex の道具が行うため、事前検索の答え（件数・出典）は持たない。"""
     ensure_v1()
     c = _client()
     r = _post_chat(c, "TAX-RATE を変えたい。影響は？")
     cid = r["conversation_id"]
     ans = r["message"]["answer"]
     assert ans["lens"] == "impact"
-    assert "影響" in ans["headline"] and ans["summary"]["total"] >= 1   # 答え先頭＋件数
-    assert ans["sources"], "出典（原本DL）が付いていない"
-    assert ans["sources"][0]["download_url"].startswith("/documents/")
 
     r2 = _post_chat(c, "端数処理の仕様は？", conversation_id=cid)   # 同じ会話を継続（別レンズ）
     assert r2["conversation_id"] == cid and r2["message"]["answer"]["lens"] == "qa"
@@ -156,7 +153,7 @@ def test_chat_persists_and_answers_answer_first_and_routes_troubleshoot():
     assert roles.count("user") == 2 and roles.count("assistant") == 2
 
     ts = _post_chat(c, "夜間バッチ NIGHTLY が ABEND。原因候補は？")["message"]["answer"]
-    assert ts["lens"] == "troubleshoot" and ts["summary"]["total"] >= 1
+    assert ts["lens"] == "troubleshoot"
 
 
 def test_chat_stream_dynamic_nodes_and_saved_trace():
@@ -164,8 +161,7 @@ def test_chat_stream_dynamic_nodes_and_saved_trace():
     ensure_v1()
     c = _client()
     nodes, ans = _stream(c, IMPACT_MSG)
-    assert [n for n, _ in nodes] == ["understand", "intent", "tool-graph", "compose"]   # 影響＝ツール1
-    assert any(k == "tool" for _, k in nodes)
+    assert [n for n, _ in nodes] == ["understand", "intent", "compose"]   # 事前検索のツールのノードは出ない
     assert ans and ans["message"]["answer"]["lens"] == "impact"
 
     # SSE で流れた node は messages.trace に保存され、会話再取得でも同じ trace が返る（user ターンには付かない）。
@@ -176,8 +172,8 @@ def test_chat_stream_dynamic_nodes_and_saved_trace():
     assert next(m for m in conv["messages"] if m["role"] == "assistant")["trace"] == trace
     assert not next(m for m in conv["messages"] if m["role"] == "user").get("trace")
 
-    t_nodes, _ = _stream(c, "夜間バッチ NIGHTLY が ABEND。原因は？")   # 使うツールが2つ＝ノードが動的に増える
-    assert [n for n, k in t_nodes if k == "tool"] == ["tool-graph", "tool-docs"]
+    t_nodes, _ = _stream(c, "夜間バッチ NIGHTLY が ABEND。原因は？")
+    assert not [n for n, k in t_nodes if k == "tool"]
 
 
 def test_chat_saves_trace_on_every_path_and_knowledge_off_is_plain_chat():

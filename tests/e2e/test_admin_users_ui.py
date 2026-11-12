@@ -262,3 +262,14 @@ def test_admin_users_mock_patch_matches_real_contract(page, web_base_url):
     expect(admin_row).to_contain_text("管理者")
     expect(admin_row).to_contain_text("有効")
     expect(page.locator("#user-tbody")).not_to_contain_text("変更名")
+
+
+def test_create_user_tells_admin_when_audit_was_not_recorded(page, web_base_url):
+    _open(page, web_base_url)
+    page.route("**/admin/users", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body='{"ok": true, "audit_recorded": false, "user": {"uid": "newu", "email": null, '
+             '"display_name": "新規", "role": "user", "status": "active", "must_change_password": true}}')
+        if route.request.method == "POST" else route.fallback())
+    _add_user(page, "newu", "新規", "Zq7!xW2mK9pA")
+    expect(page.locator("#toast")).to_contain_text("操作記録を保存できませんでした")

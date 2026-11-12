@@ -1,0 +1,22 @@
+{
+  "counts": {
+    "edge_types": {
+      "ACCESSES": 1,
+      "CONTAINS": 11,
+      "INVOKES": 7
+    },
+    "edges": 19,
+    "flag_reasons": {
+      "dropped_syntax": 2
+    },
+    "flags": 2,
+    "node_labels": {
+      "DataItem": 2,
+      "Module": 17,
+      "Table": 1
+    },
+    "nodes": 20
+  },
+  "sha256": "c8f38e9c1d12d7c36a83e52cd73b42cbb786d197a0c7284488993302938c17e1",
+  "world": "vb1"
+}

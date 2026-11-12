@@ -17,6 +17,7 @@ from sherpa.parts.read import tools as read_tools
 from sherpa import corpus_docs, es_index, grep_tool, worlds
 from sherpa.ingest.analyzers import registry
 from sherpa.ingest.analyzers._base import Analyzer, DefResult, RefResult
+from tests._replace_row import offline_row
 
 
 class _ConditionalTxtAnalyzer(Analyzer):
@@ -92,7 +93,7 @@ def test_accept_vs_decline_classification_agrees_across_grep_agentic_es(monkeypa
         return {}
 
     monkeypatch.setattr(es_index, "_req", fake_req)
-    r = es_index.index_world(world)
+    r = es_index.index_world(world, row=offline_row(world))
     assert r["indexed"] == 1                                 # ソース（受理）は ES に入れない。資料落ちだけが入る
     bodies = [json.loads(ln) for i, ln in enumerate(captured["bulk"].strip().split("\n")) if i % 2 == 1]
     by_doc = {b["doc_id"]: b for b in bodies}

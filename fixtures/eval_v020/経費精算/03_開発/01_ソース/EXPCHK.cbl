@@ -1,0 +1,11 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. EXPCHK.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+           COPY EXP-CPY.
+       PROCEDURE DIVISION.
+           IF EXP-AMOUNT > EXP-LODGING-MAX
+               DISPLAY 'OVER LIMIT'
+           END-IF.
+           CALL 'EXPAPPR'.
+           GOBACK.

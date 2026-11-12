@@ -53,9 +53,8 @@ def test_resume_and_review_metrics_preserve_actual_counts_and_missing_values():
         {"role": "parent", "tool": "es_search", "calls": 1}, {"role": "child", "tool": "es_search", "calls": 2},
         {"role": "child", "tool": "read_around", "calls": 2}]}
     answer = {"activity": activity, "call_stats": call_stats,
-              "investigation": {"rows": 4, "unconfirmed_items": [{"id": "i2"}]}}
-    stats = {"style": "plan_gate", "attempts": 5, "resume_count": 3,
-             "plan": {"review_requests": 1, "review_rounds": 0}}
+              "investigation": {"rows": 4, "unconfirmed_items": [{"id": "i2"}], "review": {"rounds": 0}}}
+    stats = {"style": "json", "attempts": 5, "resume_count": 3, "ledger_review_requests": 1}
     result = measure(answer, stats, None)
     assert result["resume_count"] == 3
     assert result["review_requests"] == 1
@@ -112,7 +111,7 @@ def test_output_credentials_cannot_be_written_inside_the_registered_corpus(tmp_p
 def test_plan_trials_reject_json_fallback_and_missing_stats_but_keep_missing_plans():
     answer = {"activity": {"settings": {"model": "gpt-5.6-sol", "depth": "standard",
                                         "mode": "standard", "schema_level": 2}}}
-    for style in ("plan_gate", "plan_main"):
+    for style in ("plan_main",):
         for stats in (None, {}, {"style": "json"}):
             with pytest.raises(EvalError, match="台帳構成"):
                 validate_run_conditions(answer, stats, style)

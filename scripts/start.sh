@@ -76,7 +76,7 @@ missing=0
 if ! command -v "$PY" >/dev/null 2>&1; then
   cat >&2 <<EOF
 ✗ Python3 が見つかりません（コマンド: ${PY}）。
-  Sherpa の起動には Python3 が必要です。
+  Slouch の起動には Python3 が必要です。
   Ubuntu / WSL2 での導入例:
     sudo apt update && sudo apt install -y python3 python3-venv python3-pip
   導入できたか確認:  python3 --version
@@ -97,7 +97,7 @@ docker_reachable() {
 if ! command -v docker >/dev/null 2>&1; then
   cat >&2 <<'EOF'
 ✗ Docker が見つかりません。
-  Sherpa は DB・検索ストアを Docker で動かします。
+  Slouch は DB・検索ストアを Docker で動かします。
   このリポジトリでは次で導入できます（Ubuntu/WSL2・sudo パスワードを1回入力）:
     make install-docker
   （または Docker Desktop を導入）。導入できたか確認:  docker --version
@@ -163,7 +163,7 @@ elif [ -f "$WORKER_PID_FILE" ]; then
   rm -f "$WORKER_PID_FILE"
 fi
 if [ "$app_running" = 1 ] && [ "$worker_running" = 1 ]; then
-  echo "Sherpa は既に起動しています（アプリ pid ${pid}・取り込みワーカー pid ${wpid}）。"
+  echo "Slouch は既に起動しています（アプリ pid ${pid}・取り込みワーカー pid ${wpid}）。"
   echo "  URL:    $CHAT_URL"
   echo "  状態:   make status"
   echo "  停止:   make stop"
@@ -310,16 +310,26 @@ fi
 # --- メモリの割り振り（ES・Neo4j・OCR の上限を全体のメモリから決める）。結果は RUN_DIR/mem_budget.json にも書く ---
 # shellcheck source=scripts/lib/mem_budget.sh
 . "$ROOT/scripts/lib/mem_budget.sh"
-sherpa_env_default SHERPA_OCR_MEMORY_LIMIT
+mem_budget_load_env
 mem_budget_apply
 if [ -n "${MB_TOTAL:-}" ]; then
   mem_budget_line
+  mem_budget_cpu_line
+  mem_budget_resources
   mem_budget_write_json "$RUN_DIR/mem_budget.json" || true
 fi
 
 # --- ストア（PostgreSQL / Elasticsearch / Neo4j）起動 → healthy 3つを待つ ---
-echo "ストア（PostgreSQL / Elasticsearch / Neo4j）を起動します..."
-sherpa_compose up -d
+# 取り込みを止めない再起動（make restart-web）では、動いているストアを作り直さない（設定の変更は make restart で反映する）。
+keep_stores=0
+if [ "${SHERPA_KEEP_RUNNING_STORES:-0}" = "1" ] \
+   && [ "$(sherpa_compose ps --status running --services 2>/dev/null | grep -c -E '^(postgres|elasticsearch|neo4j)$')" = "3" ]; then
+  keep_stores=1
+  echo "ストア（PostgreSQL / Elasticsearch / Neo4j）は動いているので、そのまま使います（設定の変更は make restart で反映します）"
+else
+  echo "ストア（PostgreSQL / Elasticsearch / Neo4j）を起動します..."
+  sherpa_compose up -d
+fi
 
 echo "ローカルデータを準備し、ストアの起動を待ちます..."
 # bootstrap.sh が .env 用意・ディレクトリ作成・3ストアの healthy 待ち（タイムアウト付き）を行う。
@@ -329,7 +339,7 @@ echo "ローカルデータを準備し、ストアの起動を待ちます..."
 # ストアが healthy になった後に呼ぶ。前提が足りなければ案内だけ出して起動は続行する。
 # 起動・更新に失敗（コード更新の失敗など）したときもアプリは起動を続け、最後に目立つ警告を出して非ゼロで終える。
 ocr_up_rc=0
-./scripts/ocr-up.sh || ocr_up_rc=$?
+[ "$keep_stores" = "1" ] || ./scripts/ocr-up.sh || ocr_up_rc=$?
 
 # OpenAI API キーの案内（未設定でもブロックしない）
 check_openai_key
@@ -344,7 +354,7 @@ fi
 # --- アプリをバックグラウンド起動 ---
 # 前回ログが非空なら退避してから空で作り直す（起動のたびに上書きしない・LOG-2）。
 sherpa_rotate_log "$APP_LOG"
-echo "Sherpa アプリを起動します（モード: ${MODE}・ログ: ${APP_LOG#$ROOT/}）..."
+echo "Slouch アプリを起動します（モード: ${MODE}・ログ: ${APP_LOG#$ROOT/}）..."
 launch_bg "$APP_LOG" "$APP_PID_FILE" ./scripts/run-api.sh "$MODE"
 
 # healthz が応答するまで待つ（既定30秒）。
@@ -383,7 +393,7 @@ done
 # 一致しなければ、別プロセスが同じポートで応答している（起動の途中で奪われた等）とみなし失敗させる。
 if ! live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE" >/dev/null; then
   cat >&2 <<EOF
-✗ healthz は応答しましたが、起動した Sherpa プロセス（pid ファイル）と一致しません。
+✗ healthz は応答しましたが、起動した Slouch プロセス（pid ファイル）と一致しません。
   ポート ${PORT} を別プロセスが使っている可能性があります。make status で確認してください。
 EOF
   exit 1
@@ -436,7 +446,7 @@ fi
 # --- 起動完了の案内 ---
 echo ""
 echo "──────────────────────────────────────────────"
-echo "Sherpa を起動しました（モード: ${MODE}）。"
+echo "Slouch を起動しました（モード: ${MODE}）。"
 echo "  ローカル:  $CHAT_URL"
 if [ "$LAN" = "1" ]; then
   if [ "$caddy_started" = 1 ]; then

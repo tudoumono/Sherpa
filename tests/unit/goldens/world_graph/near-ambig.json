@@ -1,0 +1,19 @@
+{
+  "counts": {
+    "edge_types": {
+      "INVOKES": 1
+    },
+    "edges": 1,
+    "flag_reasons": {
+      "ambiguous": 1,
+      "cross_scope": 1
+    },
+    "flags": 2,
+    "node_labels": {
+      "Module": 6
+    },
+    "nodes": 6
+  },
+  "sha256": "265c1cf60c52c69c183d618fe9518be23d9d33b3269d00c74fda5c01503de2c0",
+  "world": "near-ambig"
+}

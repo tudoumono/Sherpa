@@ -22,6 +22,8 @@ import uuid
 import zlib
 from pathlib import Path
 
+from . import derived_suffixes
+
 RENDER_VERSION = "v1"
 DPI_DEFAULT = 150
 DPI_MIN = 36
@@ -100,7 +102,7 @@ def pages_dir(rag_root: Path, doc_id: str) -> Path:
         raise RenderError("derived_missing", "派生領域を開けません") from None
     if not rr.is_dir():
         raise RenderError("derived_missing", "この資料フォルダの派生領域がありません（取り込み前）")
-    parts = (doc_id + ".pages").split("/")
+    parts = (doc_id + derived_suffixes.PAGES).split("/")
     cur = rr
     for i, part in enumerate(parts):
         cur = cur / part

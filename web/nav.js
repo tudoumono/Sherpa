@@ -1,7 +1,8 @@
 // 全ページ共通の上部ナビ（タブ）＝再利用コンポーネント。各ページは <sherpa-topbar></sherpa-topbar>
 // を置き、このファイルを <head> で読み込むだけ。現在の画面は URL から判定してタブを強調する。
-// テーマ切替ボタン(#themebtn)は要素だけ用意し、挙動は各ページのスクリプトが担う（ページ固有の
-// 再描画があるため）。リンク/ラベルはすべて固定値＝XSS 非該当。
+// テーマ切替ボタン(#themebtn)の印と切り替え（dataset.theme・localStorage）もここが担い、切り替えたら
+// document へ 'sherpa-themechange' を出す（別ドキュメントの埋め込み枠を持つ画面だけが受ける）。
+// リンク/ラベルはすべて固定値＝XSS 非該当。
 'use strict';
 
 (function () {
@@ -16,10 +17,9 @@
     ['workspace.html', 'マイワークスペース'],
   ];
   // admin 専用リンク（役割が admin のときのみ表示）。個別の管理系リンク（ユーザー管理/監査/利用統計/状態）は「システム管理」（admin-settings.html）に入口を集約している（右上ナビは2項）。
-  // 「資料」「ナレッジグラフ」は画面の全データ取得が admin 限定 API のため、一般ユーザーにはナビ表示しない。
+  // 「資料」は画面の全データ取得が admin 限定 API のため、一般ユーザーにはナビ表示しない。
   const ADMIN_LINKS = [
     ['ingest.html', '資料'],
-    ['graph.html', 'ナレッジグラフ'],
     ['admin-settings.html', 'システム管理'],
   ];
 
@@ -92,7 +92,7 @@
       const here = location.pathname.split('/').pop() || 'chat.html';
       this.className = 'topbar';
       this.innerHTML =
-        '<div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>'
+        '<div class="brand"><img class="brand-mark" src="slouch-mark.svg" alt="" height="24"><img class="brand-mark brand-mark-dark" src="slouch-mark-dark.svg" alt="" height="24"><span class="brand-name">Slouch</span> <small>業務AI基盤</small></div>'
         + '<nav class="nav" id="sherpa-nav" aria-label="ページ">'
         + '<div class="navlist" id="navlist">'
         + LINKS.map(([href, label]) => {
@@ -115,6 +115,20 @@
         + '<button class="umitem" id="um-logout" type="button" role="menuitem">ログアウト</button>'
         + '<div class="um-note" id="um-note" hidden>認証は無効です（開発モード）</div>'
         + '</div></div>';
+
+      const themeBtn = document.getElementById('themebtn');
+      const themeIcon = () => {
+        themeBtn.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙';
+      };
+      themeIcon();
+      themeBtn.addEventListener('click', () => {
+        const d = document.documentElement;
+        const next = d.dataset.theme === 'dark' ? 'light' : 'dark';
+        d.dataset.theme = next;
+        try { localStorage.setItem('sherpa-theme', next); } catch (e) { /* 保存できなくても切り替えは効く */ }
+        themeIcon();
+        document.dispatchEvent(new CustomEvent('sherpa-themechange'));
+      });
 
       // ユーザードロップダウン（全ページ共通）。開閉は #topbar-user クリックでトグル、外側クリック／Escape で閉じる（.brainmenu と同じ流儀＋a11y追加）。
       const userBtn = document.getElementById('topbar-user');
@@ -192,7 +206,14 @@
       const logoutBtn = document.getElementById('um-logout');
       if (logoutBtn) logoutBtn.addEventListener('click', async () => {
         if (!confirm('ログアウトしますか？')) return;
-        try { await fetch('/auth/logout', { method: 'POST' }); } catch (_) { /* best-effort */ }
+        // 401 は既に無効なセッション＝ログアウト済みとして扱う。それ以外の失敗ではログイン画面へ移らない。
+        try {
+          const r = await fetch('/auth/logout', { method: 'POST' });
+          if (!r.ok && r.status !== 401) throw new Error(String(r.status));
+        } catch (_) {
+          alert('ログアウトできませんでした。ログイン状態のままです。しばらくしてからもう一度お試しください。');
+          return;
+        }
         location.href = '/ui/login.html';
       });
       const changePwLink = document.getElementById('um-changepw');

@@ -42,7 +42,7 @@ class CodexTurnState:
         # ターンの外側（`_run_authoring` の先頭）
         "turn_uid", "_tool_use", "_call_log_dir", "_parent_mcp_tools", "call_log",
         "_tool_zero_nudged", "_tool_zero_notice",
-        "_turn_t0", "_plain", "_skip_presearch", "users_dir", "uid", "run_dir",
+        "_turn_t0", "_plain", "users_dir", "uid", "run_dir",
         "answer", "ran", "_codex_silent_failure", "_codex_stopped_early", "_stream_error",
         "codex_question", "codex_usage", "_agent_start_mono", "_agent_end_mono",
         "_wall_clock_limit_s", "_wall_clock_state", "_resume_fallback_happened", "_sidecar_init_ok",
@@ -65,7 +65,7 @@ class CodexTurnState:
         "_ledger_review_pre_attempt_msgs_start", "_ledger_review_pre_latest_structured",
         "_ledger_review_pre_msgs_len",
         "_ledger_review_pre_codex_question", "_ledger_review_reverted", "_investigation_stopped_reason",
-        "_investigation_retire_done", "_resume_count", "_ledger_style", "_plan_gate", "_plan_review_cap", "_plan_final",
+        "_investigation_retire_done", "_investigation_retire_failed", "_resume_count", "_ledger_style", "_plan_review_cap", "_plan_final",
         "_candidate_pick", "_compose_stats", "_adopted_answer", "_composed_answer",
         # 会話の継続と起動前の準備
         "_persist_session", "resume_sid", "thread_id", "_session_persistence_enabled",
@@ -73,7 +73,7 @@ class CodexTurnState:
         "_agent_msgs", "_agent_partial", "_latest_structured", "_structured_answers",
         "_structured_answers_valid_from", "sp", "_layer", "ws_files", "_before_ws_files",
         "_reason", "_usage_depth_extra", "_review_rounds", "_review_rounds_escalation",
-        "_direct_roots", "_deny_roots", "_sensitive_deny", "_direct_read_ok", "_tmp", "prompt", "prompt_with_history",
+        "_direct_roots", "_deny_roots", "_sensitive_deny", "_rules", "_direct_read_ok", "_tmp", "prompt", "prompt_with_history",
         "_last_message_path", "_mcp_budget_env", "codex_home", "_sidecar_path", "argv_base", "popen_env",
         "_schema_on", "_schema_v2", "_schema_level_effective", "_codex_run_started_at", "_turn_started_wall",
         "_activity_settings",
@@ -83,7 +83,7 @@ class CodexTurnState:
         "_answer_notices", "_invalid_output_events", "_trimmed",
     )
 
-    def __init__(self, ctx, *, turn_t0: float, plain: bool, skip_presearch: bool):
+    def __init__(self, ctx, *, turn_t0: float, plain: bool):
         self._turn_t0 = turn_t0  # `sherpa.usage` ログ 1 行の elapsed（このターン全体）
         # 利用者の 1 ターンの ID（MCP へ渡す）と、ターンを通した道具の使用の合算。何回目の実行かは `_attempt_no`（ターン内の通し番号）。
         self.turn_uid = uuid.uuid4().hex
@@ -95,7 +95,6 @@ class CodexTurnState:
         self._tool_zero_nudged = False  # 道具ゼロの促しを出したか（1 ターン 1 回まで）
         self._tool_zero_notice = False  # 促した後も道具ゼロだった（注記「資料を調べずに答えています」を付ける）
         self._plain = plain  # 素の Codex モード（ターンの最初に 1 回だけ決める）
-        self._skip_presearch = skip_presearch
         self.users_dir = None
         self.uid = None
         self.run_dir = None
@@ -212,11 +211,10 @@ class CodexTurnState:
         self._ledger_review_reverted = False
         self._investigation_stopped_reason = None
         # 通常終了時は `env["investigation"]` を組み立てる前に退避（`_retire_investigation_ledger`）を実行してこの flag を立てる。外側 finally の退避（切断・例外時のフォールバック）は flag が立っていれば実行しない。
-        self._investigation_retire_done = False
-        # 評価用の計画書方式（`SHERPA_LEDGER_STYLE`）: json／plan_gate／plan_main、plan_gate の判定状態、深さごとの見直し上限、整形に使った最終の計画書。
+        self._investigation_retire_done, self._investigation_retire_failed = False, False   # 後者＝退避が要るのにできなかった（作業データを消さずに残す）
+        # 調査の方式（json／plan_main）、深さごとの見直し上限、整形に使った最終の計画書。
         self._resume_count = 0
         self._ledger_style = "json"
-        self._plan_gate = None
         self._plan_review_cap = 0
         self._plan_final = None
         # 評価用の記録の材料（採用した候補の選び方・計画書の整形の結果・整形の前後の本文）。
@@ -252,7 +250,7 @@ class CodexTurnState:
         self._review_rounds_escalation = False
         self._direct_roots = None
         self._deny_roots = None
-        self._sensitive_deny = None
+        self._sensitive_deny = self._rules = None  # _rules＝依頼の準備で読んだ管理者の除外の規則（読めなかったときは None）
         self._direct_read_ok = False
         self._tmp = None
         self.prompt = None

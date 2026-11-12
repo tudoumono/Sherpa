@@ -8,19 +8,20 @@ from __future__ import annotations
 import os
 
 from sherpa import store
+from tests._replace_row import offline_row
 
 WORLD = f"doc_exists_test_{os.getpid()}"
 
 
 def _cleanup():
-    store.replace_documents(WORLD, [])
+    store.replace_documents(WORLD, [], row=offline_row(WORLD))
 
 
 def test_document_exists_exact_match_only():
     _cleanup()
     try:
         assert store.document_exists(WORLD, "a/b.txt") is False   # 台帳が空＝常に False
-        store.replace_documents(WORLD, [{"name": "a/b.txt"}])
+        store.replace_documents(WORLD, [{"name": "a/b.txt"}], row=offline_row(WORLD))
         assert store.document_exists(WORLD, "a/b.txt") is True
         assert store.document_exists(WORLD, "A/b.txt") is False   # 大文字小文字違いは別名＝False
         assert store.document_exists(WORLD, "a/b.TXT") is False
@@ -34,9 +35,9 @@ def test_document_exists_reflects_replace_documents_idempotently():
     """`replace_documents` は丸ごと入れ替え（冪等）——古い行は消え、新しい行だけが見える。"""
     _cleanup()
     try:
-        store.replace_documents(WORLD, [{"name": "old.md"}])
+        store.replace_documents(WORLD, [{"name": "old.md"}], row=offline_row(WORLD))
         assert store.document_exists(WORLD, "old.md") is True
-        store.replace_documents(WORLD, [{"name": "new.md"}])
+        store.replace_documents(WORLD, [{"name": "new.md"}], row=offline_row(WORLD))
         assert store.document_exists(WORLD, "old.md") is False
         assert store.document_exists(WORLD, "new.md") is True
     finally:

@@ -15,6 +15,7 @@ from sherpa import tool_dispatch
 from sherpa import corpus_docs, es_index, grep_tool, layer as layer_mod, worlds
 from sherpa.ingest import text_kind
 from sherpa.ingest.failure_reasons import REASON_CATALOG
+from tests._replace_row import offline_row
 
 # 本モジュールは上流構成の固定値（`.py`＝登録アナライザなし・コード側等）を前提にする——
 # フォークが正規の拡張アナライザを登録していても赤にならないよう、登録簿を上流限定に固定する
@@ -345,7 +346,7 @@ def test_es_index_skips_unreadable_oversize_doc(monkeypatch, tmp_path):
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
     monkeypatch.setattr(es_index, "_req", lambda *a, **k: {})
 
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert r["indexed"] == 0 and r["chunks"] == 0
 
 
@@ -375,7 +376,7 @@ def test_layer_and_branch_agree_across_grep_and_es_index(monkeypatch, tmp_path):
         return {}
 
     monkeypatch.setattr(es_index, "_req", fake_req)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert r["indexed"] == 1                                 # ソース（汎用コード）は ES に入れない。テキスト資料（第 2 段）は入れる
     bodies = [json.loads(ln) for i, ln in enumerate(captured["bulk"].strip().split("\n")) if i % 2 == 1]
     by_doc = {b["doc_id"]: b for b in bodies}

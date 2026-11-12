@@ -7,6 +7,7 @@
 # 取得したフォルダは**そのままコピーして配れる**。閉域（インターネットに出られない）環境へは、
 # ネットに出られる端末でこれを実行し、できたフォルダを丸ごと運んで同じ場所に置く。
 #
+# medium・small・mobile をすべて取る。どちらを使うかは SHERPA_OCR_MODEL（.env）で切り替える。
 # モデルは配布物に同梱していない（法務確認前・`docker/ocr-models.lock.json` の
 # distribution_policy 参照）。ここで取得するのは Apache-2.0 で公開されている公式モデル。
 set -euo pipefail
@@ -46,20 +47,28 @@ if ! "$VENV/bin/python" -c "import paddleocr" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$CACHE"
-echo "==> モデルを取得します（約134MB）: $CACHE"
-PADDLE_PDX_CACHE_HOME="$CACHE" "$VENV/bin/python" - <<'PY'
+echo "==> モデルを取得します（medium・small・mobile の全部・合計約190MB）: $CACHE"
+PADDLE_PDX_CACHE_HOME="$CACHE" "$VENV/bin/python" - "$LOCK" <<'PY'
+import json
 import os
+import sys
+from pathlib import Path
+
 from paddleocr import PaddleOCR
 
-# 名前を明示して取得する（既定モデルは版が変わりうるため、固定した2つだけを落とす）。
-PaddleOCR(
-    text_detection_model_name="PP-OCRv6_medium_det",
-    text_recognition_model_name="PP-OCRv6_medium_rec",
-    use_doc_orientation_classify=False,
-    use_doc_unwarping=False,
-    use_textline_orientation=False,
-    device="cpu",
-)
+# lock の sets に載せた det/rec を名前で明示して取得する（既定モデルは版が変わりうるため、固定したものだけを落とす）。
+# SHERPA_OCR_MODEL で切り替えても閉域でダウンロードしないよう、全部の組を最初に入れる。
+lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for label, (det, rec) in lock["sets"].items():
+    print(f"  {label}: {det} + {rec}")
+    PaddleOCR(
+        text_detection_model_name=det,
+        text_recognition_model_name=rec,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        device="cpu",
+    )
 print("downloaded into", os.environ["PADDLE_PDX_CACHE_HOME"])
 PY
 

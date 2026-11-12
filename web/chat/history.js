@@ -11,7 +11,7 @@ import {
   setSendButtonStopping, startFlow, subscribeTurn, resetFlow, _questionAnswerState, appendRestoredQuestion,
   invalidateStopContext, startThinkingTicker,
 } from './stream.js';
-import { renderScopePanel, setScopeLabel, applyConversationScope, setKb } from './scope.js';
+import { renderScopePanel, setScopeLabel, applyConversationScope, applyRunningTurnScope, setKb } from './scope.js';
 import { resetInquiryForNewConversation, applyInquiryOpenDefault } from './inquiry.js';
 import { toast, updateShareButtonState } from '../chat.js';
 
@@ -79,7 +79,7 @@ function _ownConvHTML(c) {
 }
 
 // 会話一覧を取得して描く。取得が重なったときは後から始めた取得の結果だけを描く。
-// 失敗時は今の一覧を残し、まだ何も描いていないときだけ空の案内を出す。
+// 失敗時は今の一覧を残し、まだ何も描いていないときだけ読み込み失敗の案内を出す。
 let _convListGen = 0, _convListShown = 0;
 export async function loadConversations() {
   const myGen = ++_convListGen;
@@ -87,7 +87,8 @@ export async function loadConversations() {
   try { list = await getJSON('/conversations'); } catch (e) { /* 下で扱う */ }
   if (list === null) {
     if (_convListShown || $('convlist').querySelector('.conv')) return;
-    list = [];
+    $('convlist').innerHTML = '<div role="alert" style="color:var(--danger);font-size:var(--text-small);padding:6px">会話の一覧を読み込めませんでした。ページを再読み込みしてください。</div>';
+    return;
   } else {
     if (myGen < _convListShown) return;
     _convListShown = myGen;
@@ -125,17 +126,20 @@ export async function loadConversations() {
 
 export async function deleteConversation(id) {                 // 確認してから削除（メッセージも消える）
   if (!confirm('このチャット履歴を削除します。元に戻せません。よろしいですか？')) return;
-  try { const r = await fetch('/conversations/' + id, { method: 'DELETE' }); if (!r.ok) throw new Error(r.status); }
-  catch (e) { toast('削除に失敗しました'); return; }
+  let body = null;
+  try { body = await Sherpa.api('DELETE', '/conversations/' + id); }
+  catch (e) { toast(e.message); return; }
   if (id === S.cid) newConversation(); else loadConversations();
+  if (body && body.sessions_removed === false) {
+    alert('履歴は削除しましたが、続きの調査に使う作業データを消せませんでした。管理者に連絡してください。');
+    return;
+  }
   toast('履歴を削除しました');
 }
 export async function togglePin(id, pinned) {                  // ピン止め/解除
   try {
-    const r = await fetch('/conversations/' + id + '/pin', { method: 'POST',
-      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pinned }) });
-    if (!r.ok) throw new Error(r.status);
-  } catch (e) { toast('変更に失敗しました'); return; }
+    await Sherpa.api('POST', '/conversations/' + id + '/pin', { pinned });
+  } catch (e) { toast(e.message); return; }
   loadConversations();
 }
 export async function renameConversation(id, current) {        // 履歴タイトルの変更
@@ -143,10 +147,8 @@ export async function renameConversation(id, current) {        // 履歴タイ�
   if (title == null) return;                            // キャンセル
   const t = title.trim(); if (!t) return;
   try {
-    const r = await fetch('/conversations/' + id, { method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: t }) });
-    if (!r.ok) throw new Error(r.status);
-  } catch (e) { toast('名前の変更に失敗しました'); return; }
+    await Sherpa.api('PATCH', '/conversations/' + id, { title: t });
+  } catch (e) { toast(e.message); return; }
   if (id === S.cid) $('conv-title').textContent = t;
   loadConversations(); toast('名前を変更しました');
 }
@@ -278,6 +280,7 @@ export async function resumeRunningTurn(cid, turns) {
   if (S.es && S.turnId === hit.turn_id) return;
   // 別の turnId を購読済みなら上書きしない
   if (S.es && S.turnId && S.turnId !== hit.turn_id) return;
+  if (Array.isArray(hit.scope_paths)) applyRunningTurnScope(hit.scope_paths);
   S.turnId = hit.turn_id;
   // 経過秒はサーバの started_at を起点にする
   S.turnStartedAtMs = Date.parse(hit.started_at) || Date.now();

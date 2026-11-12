@@ -30,7 +30,7 @@ if [ -z "$ROOT" ]; then
   _src="${BASH_SOURCE[0]:-$0}"
   ROOT="$(cd -P "$(dirname "$_src")/.." 2>/dev/null && pwd)"
 fi
-ROOT="$(cd -P "$ROOT" 2>/dev/null && pwd)" || { echo "Sherpa の置き場所が開けません" >&2; exit 2; }
+ROOT="$(cd -P "$ROOT" 2>/dev/null && pwd)" || { echo "Slouch の置き場所が開けません" >&2; exit 2; }
 
 TAB="$(printf '\t')"
 NOW_H="$(date '+%Y-%m-%d %H:%M')"
@@ -1036,12 +1036,12 @@ case "$OUTDIR" in
   *) DETF_SHOWN="(--out で指定した場所)/disk-report-$NOW_F-detail.txt" ;;
 esac
 {
-  printf '%s\n' "Sherpa 容量レポート $NOW_H  版 $VERSION_TXT"
+  printf '%s\n' "Slouch 容量レポート $NOW_H  版 $VERSION_TXT"
   cat "$TMP/sum"
   printf '%s\n' "詳細: $DETF_SHOWN"
 } >"$TMP/sum.final"
 {
-  printf '%s\n' "Sherpa 容量レポート（詳細）$NOW_H  版 $VERSION_TXT"
+  printf '%s\n' "Slouch 容量レポート（詳細）$NOW_H  版 $VERSION_TXT"
   [ "$DEEP" = 1 ] && printf '%s\n' "モード: --deep"
   echo
   cat "$TMP/det"

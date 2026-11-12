@@ -36,6 +36,7 @@ _ARCHIVE_DOCTYPE_LABEL = "アーカイブ(zip/tar)"
 def _archive_row(rel: str, world: str) -> dict:
     """アーカイブ自身の台帳 1 行。`archive_extract.sync_world_archives` が `worlds.archive_manifest_path(world)` へ書いたサマリから組み立てる。
     マニフェストに行が無ければ `state="unreadable"`／`reason="archive_pending"`（一覧から消さない）。
+    更新を読めず前回の展開物を残している行（`last_sync_error`）は `state="unreadable"`／`reason="archive_sync_failed"`（展開済みに見せない）。
     """
     manifest = json_io.read_json(worlds.archive_manifest_path(world), default={})
     summary = manifest.get(rel) if isinstance(manifest, dict) else None
@@ -44,6 +45,11 @@ def _archive_row(rel: str, world: str) -> dict:
                "analyzer": None, "state": "unreadable", "label": "展開待ち", "reason": "archive_pending",
                "md_path": None, **_scope_meta(rel)}
     status = summary.get("status")
+    if summary.get("last_sync_error"):                      # 更新を読めず、前回展開した内容を残している
+        from .ingest.failure_reasons import REASON_CATALOG as _RC
+        return {"name": rel, "path": rel, "doctype": _ARCHIVE_DOCTYPE_LABEL, "branch": "archive",
+               "analyzer": None, "state": "unreadable", "label": _RC["archive_sync_failed"]["label"],
+               "reason": "archive_sync_failed", "md_path": None, **_scope_meta(rel)}
     if status == "ok":
         extracted = summary.get("extracted_count", 0)
         skipped = (summary.get("skipped_sensitive", 0) + summary.get("skipped_nested", 0)
@@ -205,7 +211,7 @@ def reachable_as_text(rel_path: str, ext: str, read_head) -> bool:
 
 
 def _read_head(rp: Path, size: int = 4096) -> str:
-    """先頭 `size` バイトを読み UTF-8／CP932（不正バイトは置換）でデコードする（`registry.resolve_lazy` の内容判定用）。読めなければ `_HeadUnreadable`。
+    """先頭 `size` バイトを読み UTF-8／CP932／EUC-JP（不正バイトは置換）でデコードする（`registry.resolve_lazy` の内容判定用）。読めなければ `_HeadUnreadable`。
     バイナリで `size` バイトちょうど読んでからデコードする（`Analyzer.head_bytes` の宣言どおりのバイト境界を守るため）。
     """
     try:
@@ -236,12 +242,16 @@ def _verdict_to_payload(result: dict, quality) -> dict:
         a = result["analyzer"]
         out["_analyzer"] = a.name if a is not None else None
     out["_q"] = list(quality) if quality is not None else None
+    out["_v"] = text_encoding.DETECT_VERSION
     return out
 
 
 def _payload_to_verdict(payload: dict):
-    """`_verdict_to_payload` の逆。`(分類結果, 符号化の読み取り品質)`。アナライザを名前から戻せなければ None（キャッシュを使わない）。"""
-    result = {k: v for k, v in payload.items() if k not in ("_analyzer", "_q")}
+    """`_verdict_to_payload` の逆。`(分類結果, 符号化の読み取り品質)`。アナライザを名前から戻せない・判定の版（`_v`）がいまと違うなら None（キャッシュを使わない）。"""
+    result = {k: v for k, v in payload.items() if k not in ("_analyzer", "_q", "_v")}
+    # 古い判定の版で保存した分は、符号化の結果が変わりうるので使わず、判定し直す
+    if payload.get("_v") != text_encoding.DETECT_VERSION:
+        return None
     if "_analyzer" in payload:
         name = payload["_analyzer"]
         if name is None:
@@ -309,7 +319,7 @@ def encoding_caution_for(rp: Path) -> str | None:
 
 
 def read_full_text_and_raw(rp: Path) -> tuple[str, bytes]:
-    """ファイルをバイナリで 1 回だけ読み、全文（UTF-8／CP932・不正バイトは置換）と生バイト列の両方を返す。読めなければ `OSError`。
+    """ファイルをバイナリで 1 回だけ読み、全文（UTF-8／CP932／EUC-JP・不正バイトは置換）と生バイト列の両方を返す。読めなければ `OSError`。
     `ingest.world_graph` の Pass1 専用（構文解析用の全文と、アナライザごとの `head_bytes` でスライスする生バイト列を同一の読み取りから得る）。
     """
     raw = rp.read_bytes()
@@ -344,6 +354,24 @@ def status_document_doctype(rel_path: str, world: str, *, allow_content_sniff: b
         rel_path, ext, lambda size=4096: _read_head_for_status(world, rel_path, size),
         allow_content_sniff=allow_content_sniff)
     return _doctype_for_count(result, ext)
+
+
+def classify_by_name(rel_path: str) -> tuple[str, str] | None:
+    """名前（拡張子・パス）だけで決まる `(doctype, branch)`。ファイルの中身を読まないと決まらない・秘匿名・対象外は `None`。
+    台帳の行に doctype／branch が無いときの補完用（`branch` は `iter_world_documents` と同じ `source`／`office`）。
+    """
+    ext = Path(rel_path).suffix.lower()
+
+    def _no_read(size: int = 4096) -> str:
+        raise _HeadUnreadable("name_only")
+
+    result = classify_document(rel_path, ext, _no_read, allow_content_sniff=False)
+    if result["kind"] == "unreadable":
+        return None
+    doctype = _doctype_for_count(result, ext)
+    if doctype is None:
+        return None
+    return doctype, ("source" if result["kind"] == "code" else "office")
 
 
 def _doctype_for_count(result: dict, ext: str) -> str | None:
@@ -507,7 +535,10 @@ def provenance_summary(md_path) -> dict | None:
     - `confidence`（0.0〜1.0）＝アームの確信度。
     - `legacy_backend`（`libreoffice`／`office_com` 等）＝旧形式を前段変換したバックエンド名（notes の `legacy_backend=…`）。
     - `has_conflicts`（True のみ）＝決定的マージで「別の読み方で追加内容」が見つかった文書。
-    - `metafile_truncated`（該当時のみ）＝図（WMF/EMF）の文字・画像を上限で落とした記録（`lines_dropped`／`chars_dropped`／`figures_text_capped`／`figures_bitmaps_capped`／`bitmaps_excluded`）。
+    - `metafile_truncated`（該当時のみ）＝図（WMF/EMF）の文字・画像を上限で落とした記録（`lines_dropped`／`chars_dropped`／`figures_text_capped`／`figures_bitmaps_capped`／`bitmaps_excluded`）と、図の中の文字を最後まで読めなかった図の数（`figures_incomplete`）。
+    - `observation_issues`（該当時のみ）＝OCR・VLM の読み取り結果を読み切れなかった理由（`ocr_observation_unreadable`／`observation_merge_failed`）のリスト。
+    - `office_display`（該当時のみ）＝Excel の実際の表示値での補完が足りなかった記録（`status`＝`partial`／`fallback_linux`・`reason`・`requested_cells`・`applied_cells`）。足りないセルは基本方式で読んだ値のまま。
+    - `pptx_flat_slides`（該当時のみ）＝図形をたどれず平らな文字で取ったスライドの数（取り消し線・重なりを読み取れていない）。
     - `pdf_pages`（画像で読んだ PDF のみ）＝`{total, over_limit, budget_cut, unread}`（元の総ページ数／上限で読まなかった数／時間予算で読まなかった数／読み取りに失敗・空だったページ数）。0 の項目は載せない。
     `md_path` 無し・サイドカー欠落／型不正・method 欠落・読取失敗は None（バッジを出さない）。
     """
@@ -531,9 +562,32 @@ def provenance_summary(md_path) -> dict | None:
     pages = _pdf_pages_summary(raw.get("notes"))
     if pages:
         out["pdf_pages"] = pages
+    flat = _note_value(raw.get("notes"), "pptx_flat_slides")
+    if flat and flat.isdigit() and int(flat):
+        out["pptx_flat_slides"] = int(flat)
     mt = raw.get("metafile_truncated")
     if isinstance(mt, dict) and mt:  # 図（WMF/EMF）の文字・画像を上限で落とした記録（件数のみ）
         out["metafile_truncated"] = {k: v for k, v in mt.items() if isinstance(v, int) and not isinstance(v, bool)}
+    issues = raw.get("observation_issues")
+    if isinstance(issues, list) and issues:  # OCR・VLM の観測を読み切れなかった理由
+        out["observation_issues"] = [i for i in issues if isinstance(i, str)]
+    display = _office_display_gap(raw.get("office_display"))
+    if display:
+        out["office_display"] = display
+    return out
+
+
+def _office_display_gap(report) -> dict | None:
+    """Excel の実際の表示値での補完（`office_native_display`）が不足した文書の記録。補完できた・対象外・無効なら None。
+
+    返値は `{status, reason, requested_cells, applied_cells}`。`status` は `partial`（一部のセルだけ）／`fallback_linux`（基本方式の値のまま）。
+    """
+    if not (isinstance(report, dict) and report.get("enabled") and report.get("status") in ("partial", "fallback_linux")):
+        return None
+    out: dict = {"status": report["status"], "reason": report.get("reason")}
+    for key in ("requested_cells", "applied_cells"):
+        v = report.get(key)
+        out[key] = v if isinstance(v, int) and not isinstance(v, bool) else 0
     return out
 
 
@@ -597,10 +651,60 @@ def empty_scan_report() -> dict:
             "walk_skipped": {}, "document_count": 0}
 
 
-def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> dict:
+def _unresolved_scan_report(expected_rels, expected_manifest) -> dict:
+    """資料フォルダを解決できないときの集計。世代の確かめを頼まれていたら件数を `None`（保留）にし、確定した 0 件にしない。"""
+    rep = empty_scan_report()
+    if expected_rels is not None or expected_manifest is not None:
+        rep["document_count"] = None
+    return rep
+
+
+class _GenerationCheck:
+    """走査が呼び出し元の世代（rel の集合・manifest）と同じ木を歩いたかを確かめる。どちらも渡されなければ常に一致とする。"""
+
+    def __init__(self, expected_rels, expected_manifest):
+        self._rels, self._manifest = expected_rels, expected_manifest
+        self._seen: set = set()
+        self._stat_ok = True
+        self._first_ok = True
+
+    def add(self, rp, rel) -> None:
+        if self._rels is None and self._manifest is None:
+            return
+        self._seen.add(rel)
+        if self._manifest is not None:
+            try:
+                st = rp.stat()
+                now = [st.st_mtime_ns, st.st_ctime_ns, st.st_size]
+            except OSError:
+                now = [None, None, None]
+            self._stat_ok &= rel in self._manifest and list(self._manifest[rel]) == now
+
+    def _recheck(self, wd) -> None:
+        """集計が終わった後に木をもう一度 stat だけで歩き、集計中の更新・追加・削除を一致判定に反映する（本文は読まない）。"""
+        if self._rels is None and self._manifest is None:
+            return
+        self._first_ok = self._consistent_now()
+        self._seen, self._stat_ok = set(), True
+        for rp, rel in si.safe_files(wd):
+            self.add(rp, rel)
+
+    def _consistent_now(self) -> bool:
+        if self._rels is not None and self._seen != self._rels:
+            return False
+        return self._manifest is None or (self._stat_ok and self._seen == set(self._manifest))
+
+    def consistent(self, wd) -> bool:
+        self._recheck(wd)
+        return self._first_ok and self._consistent_now()
+
+
+def scan_report(world: str, *, expected_rels: frozenset[str] | None = None,
+                expected_manifest: dict | None = None) -> dict:
     """資料フォルダ走査の内訳（インデックス済み・未対応形式・拡張子別の件数）。
 
     `expected_rels`（省略可）: 呼び出し元が持つ rel 集合。本走査の rel 集合と一致した場合だけ `document_count` を実値で返し、不一致（走査中に増減＝世代混在）なら `None` にして更新を保留する。省略時は比較しない。
+    `expected_manifest`（省略可）: 取り込みの manifest（rel → [mtime_ns, ctime_ns, size]）。rel の集合も stat した各値も一致した場合だけ `document_count` を実値で返し、同じパスの更新も世代混在として `None` にする。
 
     - `indexed`＝検索対象になる本文（ソース／設計書／テキスト＋MD 化できた Office＋OCR できた画像）。
     - `office_md`＝そのうち検索可能な Office MD（明示 partial notice を含む）。`office_failed`／`skipped_office` は notice があっても内容抽出に失敗／未対応なら併記するので `indexed` と排他ではない。
@@ -617,7 +721,7 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
     """
     wd = worlds.world_dir(world)
     if not wd:
-        return empty_scan_report()
+        return _unresolved_scan_report(expected_rels, expected_manifest)
     derived = worlds.derived_md_dir(world)
     conv = _office_convertible()  # OOXML＋（バックエンド有なら）PDF
     image_exts = _image_convertible(conv)  # 画像（変換が有効なときのみ非空）
@@ -630,12 +734,10 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
     encoding_partial_count = 0  # 対象外にしない「一部が化けている」件数
     scanned = 0
     walk_skipped: dict = {}
-    # `expected_rels` 比較用（省略時は集めない）。manifest と同じ母集合にするため、下の `continue` より前で追加する
-    actual_rels: set | None = set() if expected_rels is not None else None
+    generation = _GenerationCheck(expected_rels, expected_manifest)
     for rp, rel in si.safe_files(wd, skipped=walk_skipped):
         scanned += 1
-        if actual_rels is not None:
-            actual_rels.add(rel)
+        generation.add(rp, rel)  # manifest と同じ母集合にするため、下の `continue` より前で渡す
         if importance.is_importance_control_path(rel):  # 重要度設定ファイル自体は検索可能数・by_doctype に数えない
             continue
         ext = rp.suffix.lower()
@@ -724,8 +826,8 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
             other += 1
             skipped_ext[ext or "(拡張子なし)"] += 1
             unreachable_ext[ext or "(拡張子なし)"] += 1
-    if expected_rels is not None and actual_rels != expected_rels:
-        doc_count = None  # 世代混在（走査中の増減）＝実値を確定できないので更新保留
+    if not generation.consistent(wd):
+        doc_count = None  # 世代混在（走査中の増減・同じパスの更新）＝実値を確定できないので更新保留
     return {"scanned": scanned, "indexed": indexed, "by_doctype": dict(by), "office_md": office_md_n,
             "skipped_office": office_skip, "office_failed": office_fail,
             "skipped_other": other, "skipped_ext": dict(skipped_ext),
@@ -741,20 +843,21 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
 
 
 def iter_world_documents(world: str, include_rag: bool = False, *, root=None, deadline: float | None = None,
-                         files=None):
+                         files=None, subset: bool = False):
     """資料フォルダの文書一覧（`_iter_world_documents` の本体を、ファイル分類の派生側ディスクキャッシュ越しに回す）。
     最後まで列挙し終えたときは、今回見なかったファイルのキャッシュ行を捨てる。引数と戻り値は `_iter_world_documents` と同じ。
+    `subset=True`: `files` が資料フォルダの一部だけのとき。キャッシュは 1 件ずつ引き、見なかった行を捨てない。
     設計: docs/design/data.md「ファイル」
     """
     from . import search_cache
-    cache = search_cache.ClassifyCache(world, preload=True)
+    cache = search_cache.ClassifyCache(world, preload=not subset)
     completed = False
     try:
         yield from _iter_world_documents(world, include_rag, root=root, deadline=deadline, files=files, cache=cache)
         completed = True
     finally:
         if cache is not None:
-            cache.flush(prune=completed)
+            cache.flush(prune=completed and not subset)
 
 
 def _iter_world_documents(world: str, include_rag: bool = False, *, root=None, deadline: float | None = None,

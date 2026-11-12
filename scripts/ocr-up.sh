@@ -13,7 +13,8 @@ skip() { echo "  OCR（画像内文字の読み取り）は起動しません: $
 # .env の設定を読む（読み方は scripts/run-common.sh に一本化: 明示指定 ＞ .env ＞ 既定）。
 # shellcheck source=scripts/run-common.sh
 . "$ROOT/scripts/run-common.sh"
-sherpa_env_default SHERPA_OCR_ENABLED SHERPA_OCR_WORLD_ROOT SHERPA_OCR_MODEL_CACHE SHERPA_DERIVED_DIR SHERPA_OBSERVATION_DIR
+sherpa_env_default SHERPA_OCR_ENABLED SHERPA_OCR_WORLD_ROOT SHERPA_OCR_MODEL_CACHE SHERPA_DERIVED_DIR SHERPA_OBSERVATION_DIR \
+  SHERPA_OCR_MEMORY_LIMIT SHERPA_OCR_MEMORY_FIXED SHERPA_OCR_WORKERS SHERPA_OCR_CPUS SHERPA_OCR_THREADS
 
 case "$(printf '%s' "${SHERPA_OCR_ENABLED:-1}" | tr '[:upper:]' '[:lower:]')" in
   0|false|no|off) skip "SHERPA_OCR_ENABLED で無効にしています" ;;
@@ -21,7 +22,7 @@ esac
 
 MODEL_CACHE="${SHERPA_OCR_MODEL_CACHE:-$ROOT/data/ocr-models}"
 if [ ! -d "$MODEL_CACHE/official_models" ]; then
-  skip "モデルが未取得です（./scripts/fetch_ocr_models.sh で取得できます・約134MB）"
+  skip "モデルが未取得です（./scripts/fetch_ocr_models.sh で取得できます・約190MB）"
 fi
 export SHERPA_OCR_MODEL_CACHE="$MODEL_CACHE"
 
@@ -58,7 +59,18 @@ if ! docker image inspect sherpa/ocr-worker:paddleocr-3.7.0-cpu >/dev/null 2>&1;
   echo "  OCR ワーカーのイメージを作ります（初回のみ・数分かかります）..."
 fi
 
-echo "  OCR（画像内文字の読み取り）ワーカーを起動します..."
+# 並べる本数はメモリの割り振り（1 本あたりの上限×本数）が決める。割り振り済みならその値をそのまま使う。
+# shellcheck source=scripts/lib/mem_budget.sh
+. "$ROOT/scripts/lib/mem_budget.sh"
+mem_budget_apply
+OCR_WORKERS="${SHERPA_OCR_WORKERS_RESOLVED:-1}"
+case "$OCR_WORKERS" in ""|*[!0-9]*|0) OCR_WORKERS=1 ;; esac
+_ocr_want_workers="${SHERPA_OCR_WORKERS:-1}"
+if [ "$_ocr_want_workers" -gt "$OCR_WORKERS" ] 2>/dev/null; then
+  echo "  OCR ワーカーは ${_ocr_want_workers} 本の希望をメモリか CPU が足りないため ${OCR_WORKERS} 本に減らします（make status で割り振りを確認できます。メモリを増やすか SHERPA_OCR_MEMORY_LIMIT を小さくするか、CPU を増やすか SHERPA_OCR_CPUS を小さくしてください）"
+fi
+
+echo "  OCR（画像内文字の読み取り）ワーカーを ${OCR_WORKERS} 本で起動します..."
 # ワーカーへ焼くコードの版（VERSION ＋ git のコミット・コミットが取れなければ VERSION のみ）。
 SHERPA_APP_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || echo unknown)"
 _ocr_commit="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)"
@@ -134,11 +146,11 @@ if [ -n "$_ocr_base" ] && ! docker image inspect "$_ocr_base" >/dev/null 2>&1 \
     exit 1
   fi
   COMPOSE_FILE="$ROOT/docker-compose.yml:$ROOT/docker/ocr/compose.version.yml" \
-    sherpa_compose --profile ocr up -d ocr-worker
+    sherpa_compose --profile ocr up -d --scale ocr-worker="$OCR_WORKERS" ocr-worker
 else
   # 版ラベルは別ファイルで重ねる（docker-compose.yml 本体は固定測定に束縛されるため触らない）。
   COMPOSE_FILE="$ROOT/docker-compose.yml:$ROOT/docker/ocr/compose.version.yml" \
-    sherpa_compose --profile ocr up -d --build ocr-worker
+    sherpa_compose --profile ocr up -d --build --scale ocr-worker="$OCR_WORKERS" ocr-worker
 fi
 echo "    資料フォルダ（読み取り専用）: $SHERPA_OCR_WORLD_ROOT"
 echo "    モデル（読み取り専用）      : $MODEL_CACHE"

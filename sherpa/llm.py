@@ -7,7 +7,7 @@ SDK 非依存（urllib）。OpenAI へは本文テキストのみ送信する（
 - `post_json` は HTTP エラー時に `urllib.error.HTTPError` を送出する（429 バックオフ等が依存）。
 
 SSRF 封じ: `ollama_url()` が単一チョークポイントで、全シンクがここで URL を組み立てる。許可は loopback と、admin が
-`system_settings` に登録した allowlist（`ollama_allowlist`・host:port 完全一致）のみ。`SsrfBlocked` は `ValueError` 派生で、各シンクの broad `except` で degrade する。
+`system_settings` に決めた中央の既定接続先（`ollama_url`）と allowlist（`ollama_allowlist`）の host:port 完全一致のみ。`SsrfBlocked` は `ValueError` 派生で、各シンクの broad `except` で degrade する。
 - ポート省略時は scheme の既定ポート（http=80・https=443）を補う（`_canonical_host_port`）。
 - `base` に path/query/fragment が混入した URL は解釈不能（None）として弾く。
 - `post_json`／`providers/ollama.py` のストリーミング／`health.py` の ollama ping は `urlopen_no_redirect` を使い、3xx を追跡しない。
@@ -36,7 +36,7 @@ class PreflightRejected(RuntimeError, ValueError):
 
 
 class SsrfBlocked(PreflightRejected):
-    """Ollama 接続先が宛先ポリシー（loopback／admin allowlist）を満たさない。`PreflightRejected` 派生で、各呼び出し側の既存 except に乗って degrade する。"""
+    """Ollama 接続先が宛先ポリシー（loopback／中央の既定接続先／admin allowlist）を満たさない。`PreflightRejected` 派生で、各呼び出し側の既存 except に乗って degrade する。"""
 
 
 
@@ -97,28 +97,32 @@ def is_loopback_host(host: str) -> bool:
 
 
 def _allowlisted_hosts(system_settings: dict | None = None) -> set[tuple[str, int]]:
-    """非 loopback 接続先の許可リスト（`(host, port)` の集合）。唯一の真実源は admin が `system_settings.ollama_allowlist` に登録した値。
+    """非 loopback 接続先の許可リスト（`(host, port)` の集合）。admin が管理画面で決めた値だけを使う＝中央の既定接続先 `ollama_url` と `system_settings.ollama_allowlist`。
     `OLLAMA_URL` の env はこの許可リストへ加算しない（初回シードだけ）。VLM の送信も同じ許可リストで検証する。
     `system_settings` を渡すとそのスナップショットを使う。
     """
     allowed: set[tuple[str, int]] = set()
     try:
-        if system_settings is not None:
-            entries = system_settings.get("ollama_allowlist") or []
-        else:
+        if system_settings is None:
             from . import store  # 遅延 import（循環回避）
-            entries = store.get_system_settings().get("ollama_allowlist") or []
+            system_settings = store.get_system_settings()
+        entries = system_settings.get("ollama_allowlist") or []
+        central = str(system_settings.get("ollama_url") or "").strip()
     except Exception:  # DB 未接続等でも fail-closed（allowlist 空扱い＝loopback 以外は拒否）
-        entries = []
+        entries, central = [], ""
     for entry in entries:
         hp = _canonical_host_port(f"http://{entry}")
+        if hp is not None:
+            allowed.add(hp)
+    if central:
+        hp = _canonical_host_port(central)
         if hp is not None:
             allowed.add(hp)
     return allowed
 
 
 def _assert_host_port_allowed(host: str, port: int, allowed: set[tuple[str, int]]) -> None:
-    """`(host, port)` が `allowed` に対して許可されるか（loopback は常に許可・それ以外は集合所属）。`assert_ollama_url_allowed`／`assert_ollama_url_allowed_in` の共有判定。"""
+    """`(host, port)` が `allowed` に対して許可されるか（loopback は常に許可・それ以外は集合所属）。`assert_ollama_url_allowed` の判定。"""
     if is_loopback_host(host):
         return
     if (host, port) in allowed:
@@ -140,18 +144,6 @@ def assert_ollama_url_allowed(base: str, *, extra_allowed: set[tuple[str, int]] 
     allowed = _allowlisted_hosts(system_settings)
     if extra_allowed:
         allowed = allowed | extra_allowed
-    _assert_host_port_allowed(hp[0], hp[1], allowed)
-
-
-def assert_ollama_url_allowed_in(base: str, allowed: set[tuple[str, int]]) -> None:
-    """`base` が呼び出し側の用意した `allowed` 集合だけに対して許可されるか検証する（DB の現行 `ollama_allowlist` は読まない・loopback は常に許可）。
-    admin が `ollama_url` と `ollama_allowlist` を同一 PUT で更新するとき、置換後の候補一覧を正本として渡すために使う（`routers/system_extras.py::_validate_central_ollama_url`）。
-    エラー文言に生の `base` は含めない。
-    """
-    hp = _canonical_host_port(base)
-    if hp is None:
-        safe = _redact_url_for_error(base) or "（解析できません）"
-        raise SsrfBlocked(f"不正な接続先 URL です: {safe}")
     _assert_host_port_allowed(hp[0], hp[1], allowed)
 
 
@@ -512,7 +504,7 @@ _no_proxy_ctx: contextvars.ContextVar[bool] = contextvars.ContextVar("_llm_no_pr
 @contextlib.contextmanager
 def no_proxy_requests():
     """`with` ブロック内の `urlopen_no_redirect()`（延いては `post_json()`）を、環境変数 HTTP(S)_PROXY を無視する専用 opener で行う。
-    ローカル/allowlist 済みの Ollama 宛リクエスト専用（現在の呼び出し元は `embeddings._embed_batch` の ollama 分岐）。OpenAI 宛は経由しない。
+    ローカル/allowlist 済みの Ollama 宛リクエスト専用（呼び出し元は `embeddings` の ollama 分岐と管理画面の Ollama 接続テスト）。OpenAI 宛は経由しない。
     """
     token = _no_proxy_ctx.set(True)
     try:

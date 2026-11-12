@@ -81,13 +81,13 @@ def test_login_html_does_not_redirect_loop(page, web_base_url):
 def test_login_form_posts_credentials_and_uses_safe_next(page, web_base_url):
     """ログイン成功時は /auth/login に資格情報を送り、安全な next へ遷移する。"""
     records = install_api_mocks(page)
-    page.goto(f"{web_base_url}/login.html?next=%2Fui%2Fgraph.html%3Ffrom%3Dlogin")
+    page.goto(f"{web_base_url}/login.html?next=%2Fui%2Fingest.html%3Ffrom%3Dlogin")
 
     page.locator("#username").fill("admin")
     page.locator("#password").fill("secret")
     page.locator("#submit").click()
 
-    page.wait_for_url("**/ui/graph.html?from=login", timeout=5000)
+    page.wait_for_url("**/ui/ingest.html?from=login", timeout=5000)
     assert records["auth_login"][-1] == {"username": "admin", "password": "secret"}
 
 

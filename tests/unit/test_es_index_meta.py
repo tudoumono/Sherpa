@@ -13,6 +13,7 @@ import pytest
 import _fresh_import as FI   # noqa: E402   # import-time 固定 env 定数の実プロセス検証
 from sherpa import es_index
 from sherpa.ingest import text_kind
+from tests._replace_row import offline_row
 
 
 _F32_013 = [42, 85, 127]   # ES へ送る値は [0.1, 0.2, 0.3] を最大の絶対値で割って 127 倍した整数
@@ -148,7 +149,7 @@ def test_index_world_carries_provenance_to_chunks(monkeypatch, tmp_path):
     bulk = _index_env(monkeypatch, docs, read=lambda w, d: (md.read_text(encoding="utf-8") if d["md_path"]
                                                            else "ソース本文1\nソース本文2"))
     monkeypatch.setattr(es_index.worlds, "derived_rag_dir", lambda w: tmp_path)   # rag_chunks 無し＝legacy 縮退
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert r["indexed"] == 2 and r["chunks"] == 2
     a_chunks, b_chunks = bulk.of("a.docx"), bulk.of("b.md")
     assert a_chunks and all(c["extraction_method"] == "markitdown" and c["confidence"] == 0.6
@@ -164,7 +165,7 @@ def test_index_world_carries_importance_meta_to_chunks(monkeypatch, tmp_path, re
     res = es_index.importance.Resolution(value="高", reason="契約書", config_path="_重要度.txt", rule_line=1)
     mapping = {"a.md": res} if resolved == "with_rule" else {}
     monkeypatch.setattr(es_index.importance, "resolve_for_world", lambda w, root=None: mapping)
-    assert es_index.index_world("w")["indexed"] == 2
+    assert es_index.index_world("w", row=offline_row("w"))["indexed"] == 2
     for doc_id in ("a.md", "b.md"):
         chunks = bulk.of(doc_id)
         assert chunks
@@ -174,32 +175,10 @@ def test_index_world_carries_importance_meta_to_chunks(monkeypatch, tmp_path, re
             assert all("importance" not in c and "importance_reason" not in c for c in chunks)
 
 
-def test_importance_boost_query_wraps_in_function_score_with_high_low_only():
-    wrapped = es_index._importance_boost_query({"bool": {"must": [{"match": {"text": "q"}}], "filter": []}})
-    fs = wrapped["function_score"]
-    assert fs["query"] == {"bool": {"must": [{"match": {"text": "q"}}], "filter": []}}
-    assert fs["score_mode"] == "first" and fs["boost_mode"] == "multiply"
-    assert {f["filter"]["term"]["importance"] for f in fs["functions"]} == {"高", "低"}
-
-
-def test_rerank_knn_by_importance(monkeypatch):
-    monkeypatch.setattr(es_index, "_ES_IMPORTANCE_BOOST_HIGH", 2.0)
-    monkeypatch.setattr(es_index, "_ES_IMPORTANCE_BOOST_LOW", 0.5)
-    hits = [{"doc_id": "a", "score": 1.0, "importance": "低"}, {"doc_id": "b", "score": 1.0},
-            {"doc_id": "c", "score": 1.0, "importance": "高"}]
-    out = es_index._rerank_knn_by_importance(hits)
-    assert [h["doc_id"] for h in out] == ["c", "b", "a"]
-    assert out[0]["score"] == 2.0 and out[2]["score"] == 0.5
-    # importance を誰も持たなければスコア・順序とも不変
-    plain = [{"doc_id": "a", "score": 3.0}, {"doc_id": "b", "score": 2.0}, {"doc_id": "c", "score": 1.0}]
-    out = es_index._rerank_knn_by_importance(list(plain))
-    assert [h["doc_id"] for h in out] == ["a", "b", "c"] and [h["score"] for h in out] == [3.0, 2.0, 1.0]
-
-
 def test_index_world_pass2_progress_resets_to_zero_and_advances_for_excluded_docs(monkeypatch):
     _index_env(monkeypatch, [_doc("skip.md", state="unreadable"), _doc("a.md")])
     calls = []
-    r = es_index.index_world("w", progress=lambda done, total: calls.append((done, total)))
+    r = es_index.index_world("w", progress=lambda done, total: calls.append((done, total)), row=offline_row("w"))
     assert r["indexed"] == 1
     assert calls[0] == (0, 2) and (1, 2) in calls and calls[-1] == (2, 2)
 
@@ -207,7 +186,7 @@ def test_index_world_pass2_progress_resets_to_zero_and_advances_for_excluded_doc
 def test_index_world_excludes_unreadable_documents_even_if_reread_succeeds(monkeypatch):
     bulk = _index_env(monkeypatch, [_doc("bad.cbl", state="unreadable"), _doc("ok.md")],
                       read=lambda w, d: "本文")
-    assert es_index.index_world("w")["indexed"] == 1
+    assert es_index.index_world("w", row=offline_row("w"))["indexed"] == 1
     assert {b["doc_id"] for b in bulk.bodies} == {"ok.md"}
 
 
@@ -226,7 +205,7 @@ def test_index_world_does_not_send_source(monkeypatch, tmp_path, docs, texts, ex
         return [[0.1, 0.2, 0.3] for _ in texts_]
 
     monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert bulk.of(excluded) == []                              # ES に送らない
     assert embed_calls == [[texts[kept]]]                       # 除外側のテキストは embed にも渡さない
     assert bulk.of(kept) and all(c.get("embedding") == _F32_013 for c in bulk.of(kept))
@@ -253,7 +232,7 @@ def test_index_world_sends_stage2_text_docs_without_embedding_them(monkeypatch, 
         return [[0.1, 0.2, 0.3] for _ in texts_]
 
     monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert "app.py" not in read_calls and set(read_calls) == {"data.csv", "note.md"}
     assert r["indexed"] == 2 and r["chunks"] == 2 and "error" not in r
     assert {b["doc_id"] for b in bulk.bodies} == {"data.csv", "note.md"}
@@ -272,7 +251,7 @@ def test_index_world_excludes_source_only_world_without_reading_them(monkeypatch
         return "本文"
 
     bulk = _index_env(monkeypatch, docs, read=fake_read)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert read_calls == []
     assert r["indexed"] == 0 and r["chunks"] == 0 and "error" not in r   # ソースだけの資料フォルダは異常（no_chunks）にしない
     assert bulk.bodies == []
@@ -283,7 +262,7 @@ def test_index_world_marks_index_as_source_excluded(monkeypatch):
     emeta_at_create = {}
     monkeypatch.setattr(es_index, "ensure_index",
                         lambda w, dim=None, emeta=None: emeta_at_create.update(emeta or {}) or True)
-    es_index.index_world("w")
+    es_index.index_world("w", row=offline_row("w"))
     assert emeta_at_create["source_excluded"] is True
 
 
@@ -316,7 +295,7 @@ def test_replace_document_for_source_deletes_leftover_chunks_and_adds_none(monke
     sent = []
     monkeypatch.setattr(es_index, "_send_bulk", lambda w, payloads: sent.extend(payloads))
     monkeypatch.setattr(es_index, "_req", lambda *a, **k: {})
-    r = es_index.replace_document("w", "a.cbl", src, content_sig="c1")
+    r = es_index.replace_document("w", "a.cbl", src, content_sig="c1", row=offline_row("w"))
     assert "error" not in r and r["chunks"] == 0 and r["deleted"] == 1
     assert len(sent) == 1 and '"delete"' in sent[0] and "a.cbl#1" in sent[0]
 
@@ -353,8 +332,8 @@ def test_embed_features_recorded_even_when_embedding_fails(monkeypatch, branch, 
 
     monkeypatch.setattr(es_index, "ensure_index", fake_ensure_index)
     monkeypatch.setattr(es_index, "_confirm_content_sig",
-                        lambda w, sig, idx=None: store.__setitem__("content_sig", sig) if sig else None)
-    r = es_index.index_world("w", content_sig="c1")
+                        lambda w, sig, idx=None, **kw: store.__setitem__("content_sig", sig) if sig else None)
+    r = es_index.index_world("w", content_sig="c1", row=offline_row("w"))
     assert r.get("error") is None
     assert bool(calls) is expect_embed_calls
     assert store["embed_provider"] == "openai" and store["dim"] == 1536
@@ -384,9 +363,41 @@ def test_index_world_embed_calls_bounded_by_flush_size_not_world_total(monkeypat
         return [[0.1, 0.2, 0.3] for _ in texts]
 
     monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
-    assert es_index.index_world("w").get("error") is None
+    assert es_index.index_world("w", row=offline_row("w")).get("error") is None
     assert call_sizes and max(call_sizes) <= 5
     assert sum(call_sizes) == 23
+
+
+def test_index_world_records_embedding_wall_and_api_metrics(monkeypatch, tmp_path):
+    _embed3_world(monkeypatch, tmp_path, n_docs=2, flush_chunks=5)
+
+    def fake_embed(texts, ec, **kw):
+        kw["metrics"].update({"api_calls": 2, "api_cumulative_ms": 12.4,
+                              "input_tokens": 17})
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+    monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
+    r = es_index.index_world("w", row=offline_row("w"))
+
+    metrics = r["embed_metrics"]
+    assert metrics["bundle_count"] == 2 and metrics["distinct_inputs"] == 2
+    assert metrics["new"] == 2 and metrics["new_input_tokens"] == 17
+    assert metrics["api_calls"] == 2 and metrics["api_cumulative_ms"] == 12
+    assert sum(metrics["wall_ms"][key] for key in ("api_wait", "cache_lookup", "other")) == metrics["wall_ms"]["total"]
+    assert metrics["wall_ms"]["total"] == r["embed_elapsed_ms"]
+    assert metrics["reused"]["unavailable_reason"] == "embed_cache_does_not_store_source_path"
+
+
+def test_embed_fill_bundle_count_adds_inputs_not_calls(monkeypatch):
+    monkeypatch.setattr(es_index, "_embed_cache_lookup_batch", lambda world, keys, dim: {})
+    monkeypatch.setattr(es_index, "_embed_cache_write_batch", lambda world, new_map, q_map: None)
+    monkeypatch.setattr(es_index.embeddings, "embed",
+                        lambda texts, ec, **kw: [[0.1, 0.2, 0.3] for _ in texts])
+    metrics: dict = {}
+    es_index._embed_fill("w", ["a", "b"], _EC, metrics=metrics)
+    assert metrics["bundle_count"] == 2
+    es_index._embed_fill("w", ["c"], _EC, metrics=metrics)
+    assert metrics["bundle_count"] == 3
 
 
 def test_index_world_embed_partial_failure_marks_only_the_failed_group_missing(monkeypatch, tmp_path):
@@ -398,7 +409,7 @@ def test_index_world_embed_partial_failure_marks_only_the_failed_group_missing(m
         return None if call_n["n"] == 2 else [[0.1, 0.2, 0.3] for _ in texts]
 
     monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert r.get("error") is None and r["vectors"] is True and "embed_degraded" not in r
     assert len(bulk.bodies) == 8
     missing = [b for b in bulk.bodies if b.get("vector_status") == "missing"]
@@ -419,10 +430,10 @@ def test_index_world_resumes_embed_cache_across_failed_and_retried_runs(monkeypa
         return [[0.1, 0.2, 0.3] for _ in texts]
 
     monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
-    assert es_index.index_world("w")["vectors_missing"] == 3
+    assert es_index.index_world("w", row=offline_row("w"))["vectors_missing"] == 3
     fail_second["on"] = False
     seen.clear()
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert r["vectors"] is True and "vectors_missing" not in r
     assert sum(len(t) for t in seen) == 3                        # 1 回目に成功したまとまり分はキャッシュヒット
 
@@ -437,7 +448,7 @@ def test_embed_guard_stops_calling_the_destination_after_consecutive_failures(mo
         return None
 
     monkeypatch.setattr(es_index.embeddings, "embed", fake_embed)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert r.get("error") is None and r["embed_degraded"] is True and r["vectors_missing"] == 30
     assert len(calls) == es_index._EMBED_GIVE_UP_AFTER
     assert len(bulk.bodies) == 30
@@ -454,10 +465,9 @@ def test_disable_embed_never_reads_system_settings(monkeypatch):
     monkeypatch.setattr("sherpa.store.get_system_settings", _boom_get_system_settings)
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index.corpus_docs, "world_documents", lambda w, **kw: [])
-    monkeypatch.setattr(es_index, "delete_world", lambda w: True)
     monkeypatch.setattr(es_index, "ensure_index", lambda w, dim=None, emeta=None: True)
     monkeypatch.setattr(es_index, "_req", lambda *a, **k: {"hits": {"hits": []}})
-    assert es_index.index_world("w").get("error") is None
+    assert es_index.index_world("w", row=offline_row("w")).get("error") is None
     assert es_index.search("w", "query") == ([], "embedding_not_configured")
     assert es_index.search_knn_only("w", "query") == ([], "embedding_not_configured")
 
@@ -467,9 +477,11 @@ def test_index_world_fails_before_delete_when_cloud_selected_but_unavailable(mon
     delete_calls = []
     monkeypatch.setattr(es_index, "delete_world", lambda w: delete_calls.append(w) or True)
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
-    monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: True)
-    assert es_index.index_world("w") == {
+    monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: True); r = es_index.index_world("w", row=offline_row("w"))
+    assert {key: r[key] for key in ("available", "indexed", "chunks", "error")} == {
         "available": True, "indexed": 0, "chunks": 0, "error": "embedding_cloud_unavailable"}
+    assert r["embed_metrics"] == {
+        "available": False, "unavailable_reason": "embedding_cloud_unavailable"}
     assert delete_calls == []
 
 
@@ -477,7 +489,7 @@ def test_index_world_does_not_abort_when_real_embed_call_fails_with_cloud_select
     """設定の段階で解決できたクラウドの埋め込みが実際に失敗しても、資料フォルダ全体は打ち切らない（全部ベクトル無しで入れる）。"""
     bulk = _index_env(monkeypatch, [_doc("a.md", branch="office")], read=lambda w, d: "本文", ec=_EC, tmp_path=tmp_path)
     monkeypatch.setattr(es_index.embeddings, "embed", lambda texts, ec, **kw: None)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert r.get("error") is None and r["vectors_missing"] == 1 and r["embed_degraded"] is True
     assert [b["vector_status"] for b in bulk.bodies] == ["missing"]
 
@@ -487,7 +499,7 @@ def test_index_world_still_graceful_when_embed_fails_and_cloud_never_selected(mo
     delete_calls = []
     monkeypatch.setattr(es_index, "delete_world", lambda w: delete_calls.append(w) or True)
     monkeypatch.setattr(es_index.embeddings, "embed", lambda texts, ec, **kw: None)
-    assert es_index.index_world("w").get("error") is None
+    assert es_index.index_world("w", row=offline_row("w")).get("error") is None
     assert delete_calls == []                                    # 古い索引は消さず、新しい物理索引へ入れて付け替える
     assert len(bulk.bodies) == 1
 
@@ -506,21 +518,21 @@ def test_search_knn_only_reacts_to_embed_algo_mismatch(monkeypatch):
     monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: False)
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: {
         "provider": "openai", "model": "m", "dim": 3})
-    monkeypatch.setattr(es_index, "_index_meta", lambda w: {
+    monkeypatch.setattr(es_index, "_index_meta_read", lambda w, idx=None: ({
         "embed_provider": "openai", "embed_model": "m", "dim": 3,
-        "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
-    monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None: [[0.1, 0.2, 0.3]])
+        "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT}, False))
+    monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None, **kw: [[0.1, 0.2, 0.3]])
     monkeypatch.setattr(es_index, "_req", lambda *a, **k: {"hits": {"hits": []}})
     assert es_index.search_knn_only("w", "query")[1] is None
-    monkeypatch.setattr(es_index, "_index_meta", lambda w: {
-        "embed_provider": "openai", "embed_model": "m", "dim": 3, "embed_algo": "old-algo-v0"})
+    monkeypatch.setattr(es_index, "_index_meta_read", lambda w, idx=None: ({
+        "embed_provider": "openai", "embed_model": "m", "dim": 3, "embed_algo": "old-algo-v0"}, False))
     assert es_index.search_knn_only("w", "query") == ([], "vector_feature_mismatch")
 
 
 @pytest.mark.parametrize("call", [
     lambda: es_index.search_knn_only("w", "query")[1],
     lambda: es_index.search("w", "query")[1],
-    lambda: es_index.index_world("w")["error"],
+    lambda: es_index.index_world("w", row=offline_row("w"))["error"],
 ], ids=["search_knn_only", "search", "index_world"])
 def test_one_system_settings_snapshot_shared_by_cfg_and_cloud_check(monkeypatch, call):
     """`store.get_system_settings()` は 1 回だけ読み、`cfg()` と `cloud_selected_but_unavailable()` へ
@@ -538,7 +550,7 @@ def test_one_system_settings_snapshot_shared_by_cfg_and_cloud_check(monkeypatch,
     monkeypatch.setattr("sherpa.store.get_system_settings", _spy)
     seen = []
 
-    def _fake_cfg(settings=None, *, system_settings=None):
+    def _fake_cfg(settings=None, *, system_settings=None, **_):
         seen.append(system_settings)
         return None
 
@@ -570,7 +582,7 @@ def test_search_hybrid_failure_with_bm25_success_is_hybrid_query_failed(monkeypa
             return {"idx": {"mappings": {"_meta": {
                 **_HYBRID_META, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT}}}}
         if method == "POST" and path.endswith("/_search"):
-            inner = (body or {}).get("query", {}).get("function_score", {}).get("query", {})
+            inner = (body or {}).get("query", {})
             if "knn" in inner:                          # hybrid の kNN 側のリクエスト
                 raise RuntimeError("hybrid query failed (dimension mismatch etc.)")
             return {"hits": {"hits": [{"_source": {"doc_id": "a.md", "line": 1, "text": "hit"}, "_score": 1.0}]}}
@@ -654,17 +666,17 @@ def test_search_hybrid_rrf_weight_follows_hybrid_weight(monkeypatch, weight):
     """BM25 だけの文書と kNN だけの文書が同順位のとき、重みの大きい側が上に来る（0.5＝対等）。"""
     monkeypatch.setattr(es_index, "_HYBRID_WEIGHT", weight)
     monkeypatch.setattr(es_index, "available", lambda: True)
-    monkeypatch.setattr(es_index, "_index_meta", lambda w: {
-        **_HYBRID_META, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT})
+    monkeypatch.setattr(es_index, "_index_meta_read", lambda w, idx=None: ({
+        **_HYBRID_META, "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID, "quant": es_index.embeddings.ES_VECTOR_QUANT}, False))
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: dict(
         provider="openai", model="m", dim=3))
-    monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None: [[0.1, 0.2, 0.3]])
+    monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None, **kw: [[0.1, 0.2, 0.3]])
 
     def hit(i):
         return {"_id": i, "_source": {"doc_id": f"{i}.md", "text": "t"}, "_score": 1.0}
 
     def fake_req(method, path, body=None, **kw):
-        inner = body["query"]["function_score"]["query"]
+        inner = body["query"]
         return {"hits": {"hits": [hit("v" if "knn" in inner else "k")]}}
 
     monkeypatch.setattr(es_index, "_req", fake_req)
@@ -691,7 +703,7 @@ def test_index_world_records_signatures_in_meta(monkeypatch, chunk_lines, expect
         return True
 
     monkeypatch.setattr(es_index, "ensure_index", fake_ensure_index)
-    es_index.index_world("w")
+    es_index.index_world("w", row=offline_row("w"))
     assert captured["mapping_version"] == es_index.ES_MAPPING_VERSION
     assert captured["arms_sig"] == "sig-xyz" and captured["analyzer_config_sig"] == "acfg-xyz"
     assert captured.get("chunk_lines") == expected                # 既定粒度は書かない
@@ -793,7 +805,7 @@ def test_stale_mapping_v4_index_triggers_reindex_once_then_stays_stable(monkeypa
     store = {"content_sig": "c1", "mapping_version": "4", "arms_sig": "sig-A"}
     monkeypatch.setattr(es_index, "_index_meta", lambda w: dict(store))
     monkeypatch.setattr(es_index, "_confirm_content_sig",
-                        lambda w, sig, idx=None: store.__setitem__("content_sig", sig) if sig else None)
+                        lambda w, sig, idx=None, **kw: store.__setitem__("content_sig", sig) if sig else None)
     ensure_calls = {"n": 0}
 
     def fake_ensure_index(w, dim=None, emeta=None):
@@ -804,7 +816,7 @@ def test_stale_mapping_v4_index_triggers_reindex_once_then_stays_stable(monkeypa
 
     monkeypatch.setattr(es_index, "ensure_index", fake_ensure_index)
     assert es_index.needs_reindex("w", "c1") is True
-    es_index.index_world("w", content_sig="c1")
+    es_index.index_world("w", content_sig="c1", row=offline_row("w"))
     assert ensure_calls["n"] == 1
     assert es_index.needs_reindex("w", "c1") is False
 
@@ -903,7 +915,7 @@ def test_confirm_content_sig_skips_put_when_meta_get_fails(monkeypatch):
     monkeypatch.setattr(es_index, "_index_meta", lambda w: None)
     put_calls: list[tuple] = []
     monkeypatch.setattr(es_index, "_req", lambda *a, **kw: put_calls.append(a) or {})
-    es_index._confirm_content_sig("w", "sig-A")
+    es_index._confirm_content_sig("w", "sig-A", row=offline_row("w"))
     assert put_calls == []
 
 
@@ -914,9 +926,9 @@ def test_discard_building_deletes_only_the_physical_index_in_progress(monkeypatc
     monkeypatch.setattr(es_index, "_req", lambda method, path, body=None, **kw: sent.append((method, path)) or {})
     es_index._building["w"] = es_index._index("w") + "-g123"
     es_index._discard_building("w")
-    assert sent == [("DELETE", "/" + es_index._index("w") + "-g123")]
+    assert [x for x in sent if x[0] == "DELETE"] == [("DELETE", "/" + es_index._index("w") + "-g123")]
     es_index._discard_building("w")                               # 2 回目は何もしない
-    assert len(sent) == 1
+    assert len([x for x in sent if x[0] == "DELETE"]) == 1
 
 
 def test_discard_building_never_touches_the_alias_name_and_swallows_errors(monkeypatch):
@@ -944,8 +956,8 @@ def test_content_sig_written_only_after_all_batches_succeed(monkeypatch):
 
     monkeypatch.setattr(es_index, "ensure_index", fake_ensure_index)
     confirmed = []
-    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig, idx=None: confirmed.append(sig))
-    es_index.index_world("w", content_sig="c1")
+    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig, idx=None, **kw: confirmed.append(sig))
+    es_index.index_world("w", content_sig="c1", row=offline_row("w"))
     assert "content_sig" not in emeta_at_create
     assert confirmed == ["c1"]
 
@@ -953,13 +965,13 @@ def test_content_sig_written_only_after_all_batches_succeed(monkeypatch):
 def test_content_sig_not_confirmed_when_a_batch_fails(monkeypatch):
     _index_env(monkeypatch, [_doc("a.md", branch="office")], read=lambda w, d: "本文")
     confirmed = []
-    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig, idx=None: confirmed.append(sig))
+    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig, idx=None, **kw: confirmed.append(sig))
 
     def boom(method, path, body=None, ndjson=False):
         raise RuntimeError("bulk down")
 
     monkeypatch.setattr(es_index, "_req", boom)
-    assert es_index.index_world("w", content_sig="c1").get("error") == "bulk_failed"
+    assert es_index.index_world("w", content_sig="c1", row=offline_row("w")).get("error") == "bulk_failed"
     assert confirmed == []
 
 
@@ -975,7 +987,7 @@ def test_bulk_exception_is_logged_once_with_type_and_short_message(monkeypatch, 
 
     monkeypatch.setattr(es_index, "_req", fake_req)
     with caplog.at_level("WARNING", logger="sherpa"):
-        assert es_index.index_world("w").get("error") == "bulk_failed"
+        assert es_index.index_world("w", row=offline_row("w")).get("error") == "bulk_failed"
     lines = [r for r in caplog.records if "ES への登録に失敗しました" in r.getMessage()]
     assert len(lines) == 1 and lines[0].exc_info is None
     msg = lines[0].getMessage()
@@ -1243,7 +1255,7 @@ def test_index_world_rag_chunks_preferred_legacy_fallback_source_unchanged(monke
         return docs
 
     monkeypatch.setattr(es_index.corpus_docs, "world_documents", fake_world_documents)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert r["indexed"] == 3
     assert r["rag_degraded"] == 0 and "rag_degraded_docs" not in r
     assert calls == [True]
@@ -1275,7 +1287,7 @@ def test_index_world_reports_rag_degraded_and_falls_back(monkeypatch, tmp_path, 
         (derived / "a.docx.rag.md").write_text(md_raw, encoding="utf-8")
     if max_rows is not None:
         monkeypatch.setattr(es_index, "_RAG_CHUNKS_MAX_ROWS", max_rows)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert r["indexed"] == 1                                       # 文書自体は legacy へ縮退して残る
     assert r["rag_degraded"] == 1
     assert r["rag_degraded_docs"] == [{"doc": "a.docx", "reason": reason}]
@@ -1395,7 +1407,7 @@ def test_index_world_sends_multiple_bulk_batches_refresh_only_last(monkeypatch):
         return {}
 
     monkeypatch.setattr(es_index, "_req", fake_req)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert r["indexed"] == 3 and r["chunks"] == 3 and r.get("error") is None
     assert [p.endswith("?refresh=true") for p, _ in calls] == [False, False, True]
     assert all(len(body.strip().split("\n")) == 2 for _, body in calls)
@@ -1426,7 +1438,7 @@ def test_index_world_bulk_in_parallel_and_refresh_after_all_in_flight(monkeypatc
         return {}
 
     monkeypatch.setattr(es_index, "_req", fake_req)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
     assert r["chunks"] == 6 and r.get("error") is None
     assert state["peak"] > 1                      # 直列に戻っていない
     assert state["done_at_refresh"] == 5          # refresh 付きは、先に出した 5 本が全部終わってから
@@ -1452,36 +1464,19 @@ def test_index_world_partial_batch_failure_discards_building_index_only(monkeypa
         return {}
 
     monkeypatch.setattr(es_index, "_req", fake_req)
-    r = es_index.index_world("w")
+    r = es_index.index_world("w", row=offline_row("w"))
+    embed_metrics = r.pop("embed_metrics")
     assert r == {"available": True, "indexed": 0, "chunks": 0, "error": error, "rag_degraded": 0}
+    assert embed_metrics["available"] is False
+    assert embed_metrics["unavailable_reason"] == "embedding_disabled"
     assert call_n["n"] == 2                                       # 3 バッチ目は送らない
     assert delete_calls == []                                     # 古い索引（エイリアス）は消さない
     assert discarded == ["w"]                                     # 作りかけの物理索引だけ捨てる
 
 
-def test_index_world_empty_text_only_world_converges_without_no_chunks(monkeypatch, tmp_path):
-    wd = tmp_path / "root"
-    wd.mkdir()
-    (wd / "a.md").write_text("   \n\t\n", encoding="utf-8")
-    (wd / "b.md").write_text("", encoding="utf-8")
-    monkeypatch.setattr(es_index.worlds, "world_dir", lambda w: wd)
-    monkeypatch.setattr(es_index.worlds, "derived_md_dir", lambda w: tmp_path / "derived" / "md")
-    monkeypatch.setattr(es_index.worlds, "derived_rag_dir", lambda w: tmp_path / "derived" / "rag")
-    confirmed = []
-    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig, idx=None: confirmed.append(sig))
-    monkeypatch.setattr(es_index, "_req", lambda *a, **k: {})
-    for _ in range(2):
-        r = es_index.index_world("w", content_sig="sig-x")
-        assert r.get("error") is None
-        assert r["indexed"] == 0 and r["chunks"] == 0
-        assert r["rag_degraded"] == 2
-        assert {d["reason"] for d in r["rag_degraded_docs"]} == {"empty_text"}
-    assert confirmed == ["sig-x", "sig-x"]
-
-
 def test_index_world_single_batch_default_thresholds_still_refreshes(monkeypatch):
     bulk = _index_env(monkeypatch, [_doc("a.md"), _doc("b.md")], read=lambda w, d: "本文")
-    assert es_index.index_world("w").get("error") is None
+    assert es_index.index_world("w", row=offline_row("w")).get("error") is None
     assert bulk.paths == [f"/{es_index._index('w')}/_bulk?refresh=true"]
 
 

@@ -12,6 +12,7 @@ import pytest
 
 from sherpa import corpus_docs, es_index, reconcile, store
 from sherpa.ingest import world_neo4j, worker
+from tests._replace_row import use_offline_rows
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +25,7 @@ def _stub_pipeline(monkeypatch):
     happy path（ES/reconcile の flag 化）を検証できるようにする。あわせて pre-invalidate/確定の
     `store.set_world_sig` も DB 無しで記録だけするようスタブする（`tests/unit` は外部サービス不要）。
     """
+    use_offline_rows(monkeypatch)
     monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig", {"a": [1, 2, 3]}))
     monkeypatch.setattr(worker, "build_world_graph", lambda world: ([], [], []))
     monkeypatch.setattr(worker, "_build_derived",
@@ -31,7 +33,7 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(worker, "_ledger_rows", lambda world, *, sig: [])
     monkeypatch.setattr(worker, "world_signature", lambda world: "sig")
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None: (0, 0))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None, **_kw: (0, 0))
 
     @contextlib.contextmanager
     def _noop_lock(world_id):
@@ -40,10 +42,10 @@ def _stub_pipeline(monkeypatch):
 
     captured = {"replace_documents_calls": 0, "set_world_sig_calls": []}
 
-    def _fake_replace_documents(world, rows):
+    def _fake_switch_ledger(world, **_kw):
         captured["replace_documents_calls"] += 1
-        return 3
-    monkeypatch.setattr(store, "replace_documents", _fake_replace_documents)
+    monkeypatch.setattr(store, "stage_ledger", lambda world, rows, names, **_kw: 3)
+    monkeypatch.setattr(store, "switch_ledger", _fake_switch_ledger)
 
     def _fake_set_world_sig(world, sig, manifest=None, doc_count=None, scan_report=None):
         captured["set_world_sig_calls"].append(sig)
@@ -79,7 +81,7 @@ def _stub_pipeline(monkeypatch):
     # `set_world_sig_calls`/`set_world_sig_doc_counts` の記録先も、この関数からのものを合流させる。
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None, drop=None):
         captured["extraction_snapshot"] = extraction_snapshot
         captured["status"] = status
         if sig is not None:

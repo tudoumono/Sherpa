@@ -1,0 +1,24 @@
+{
+  "counts": {
+    "edge_types": {
+      "CONTAINS": 15,
+      "COPIES": 8,
+      "DOCUMENTS": 29,
+      "FLOWS_TO": 5,
+      "INVOKES": 8
+    },
+    "edges": 65,
+    "flag_reasons": {},
+    "flags": 0,
+    "node_labels": {
+      "Batch": 2,
+      "Copybook": 5,
+      "DataItem": 15,
+      "Document": 10,
+      "Module": 7
+    },
+    "nodes": 39
+  },
+  "sha256": "e8e04b305451a8dbd63836dd11f96a482fc3d7d9c475c5957c48b26ad4551355",
+  "world": "v1"
+}

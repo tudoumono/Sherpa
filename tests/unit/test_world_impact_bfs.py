@@ -30,11 +30,11 @@ class _GraphSession:
     def run(self, query, **p):
         text = query.text if hasattr(query, "text") else query
         self.queries.append(text)
-        if "SherpaMeta" in text:
-            return _FakeResult([{"c": 1, "era": wn.GRAPH_SCHEMA_ERA}])
         if "s.canonical_id IN $starts" in text:
             return _FakeResult([{"cid": c, "name": self.nodes[c]["name"], "path": self.nodes[c]["path"]}
                                 for c in p["starts"] if c in self.nodes and self._ok(c, p)])
+        if "m.schema_era AS era" in text:
+            return _FakeResult([{"c": 1, "era": wn.GRAPH_SCHEMA_ERA}])
         rows = []
         out = "[e:FLOWS_TO]" in text           # 流れの段: frontier から出る FLOWS_TO。構造の段: frontier へ入る構造の辺
         for src, dst, typ, doc, line in self.edges:

@@ -25,6 +25,7 @@ import pytest
 
 from sherpa.ingest import ai_observation, evidence_ir as IR, llm_render, ocr_router, office_md
 from sherpa.ingest.arms import vision_arm
+from tests._replace_row import offline_row
 
 _ROOT = Path(__file__).resolve().parents[2]
 _XLSX_WITH_PICTURE = _ROOT / "fixtures" / "eval" / "deprecation_markers" / "inputs" / "DEP-XLSX-MARKERS.xlsx"
@@ -227,7 +228,7 @@ def _built_rag_md(monkeypatch, tmp_path, source: Path, *, arms: str = "ooxml,pdf
     wd.mkdir()
     shutil.copy(source, wd / source.name)
     dmd = tmp_path / "derived"
-    rep = office_md.build_derived(wd, dmd)
+    rep = office_md.build_derived(wd, dmd, row=offline_row("w"))
     assert not rep.get("error") and rep["rag_failed"] == 0, rep
     rag_path = dmd.parent / "rag" / f"{source.name}.rag.md"
     return rag_path.read_text(encoding="utf-8"), dmd

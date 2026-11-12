@@ -20,7 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from _test_users import register_test_uid
-from sherpa import auth, ext_api, store
+from sherpa import auth, codex_jobs_worker, store
 from sherpa.api import app
 from sherpa.store import codex_jobs as store_jobs
 
@@ -199,15 +199,25 @@ def _complete_directly(key_id: int, query: str, **mark_completed_kw) -> str:
 
 @pytest.fixture
 def sent_notices(monkeypatch):
-    """HTTP 送信（外部境界）だけを差し替え、キュー投入は同期で `_deliver` へ流す。"""
-    from sherpa import webhooks
-    sent: list[dict] = []
+    """HTTP 送信（外部境界）だけを差し替える。配送待ちへの保存は本物で、`deliver()` で送り手を1周させて送る。"""
+    from sherpa import outbox_sender, webhooks
+
+    class _Sent(list):
+        def deliver(self) -> "_Sent":
+            """配送待ちに保存済みの通知を送り手に1周させて送る。"""
+            outbox_sender.run_due({"webhook": webhooks.KIND})
+            return self
+
+        def of(self, *job_ids) -> list:
+            """この試験のジョブの通知だけ（共有の DB に残るほかの試験の通知は数えない）。"""
+            import json
+            return [n for n in self if json.loads(n["body"]).get("job_id") in job_ids]
+
+    sent = _Sent()
     monkeypatch.setattr(webhooks, "assert_webhook_url_allowed", lambda url, **kw: None)
     monkeypatch.setattr(webhooks, "_send_once",
                         lambda url, secret, body, rid, event: sent.append(
                             {"url": url, "secret": secret, "body": body, "rid": rid, "event": event}))
-    monkeypatch.setattr(webhooks, "_enqueue",
-                        lambda key_id, url, secret, payload: webhooks._deliver(key_id, url, secret, payload))
     return sent
 
 
@@ -222,8 +232,8 @@ def sent_notices(monkeypatch):
 def test_codex_job_submission_rejections(monkeypatch, case, payload, status):
     if case == "codex_unavailable":
         def _boom():
-            raise ext_api.codex_jobs_worker.CodexUnavailable("codex CLI が見つかりません")
-        monkeypatch.setattr(ext_api.codex_jobs_worker, "check_available", _boom)
+            raise codex_jobs_worker.CodexUnavailable("codex CLI が見つかりません")
+        monkeypatch.setattr(codex_jobs_worker, "check_available", _boom)
     issued = _new_keys(f"cj-{case}", allowed_worlds=["v1"] if case == "world_out_of_key_scope" else None)[0]
     r = _submit(payload, api_key=issued["key"])
     assert r.status_code == status, r.text
@@ -238,15 +248,15 @@ def test_codex_job_webhook_true_accepted_with_destination_and_notified_on_comple
     issued = _keyed("cj-wh-ok", with_destination=True)
     job_id = _submit_job(issued["key"], "通知テスト", webhook=True)
     assert store_jobs.get_job(job_id)["status"] == "queued"
-    assert sent_notices == []                      # 終了前には送らない
+    assert sent_notices.of(job_id) == []           # 終了前には送らない
 
     job = _dispatch_and_wait(job_id)
     assert job["status"] == "completed"
     deadline = time.monotonic() + 5                # 通知は状態の確定（commit）の後に送る＝少し遅れて届く
-    while not sent_notices and time.monotonic() < deadline:
+    while not sent_notices.deliver().of(job_id) and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert len(sent_notices) == 1                  # 遷移1回につき通知1回
-    n = sent_notices[0]
+    assert len(sent_notices.of(job_id)) == 1       # 遷移1回につき通知1回
+    n = sent_notices.of(job_id)[0]
     body = json.loads(n["body"])
     assert set(body) == {"event", "job_id", "status", "finished_at"}   # 回答本文は載せない
     assert body["event"] == "codex_job.completed" and body["status"] == "completed"
@@ -264,8 +274,8 @@ def test_codex_job_webhook_cancel_queued_and_failed_notify_once_each(fake_codex,
     _cancel(j1, issued["key"])                     # 冪等な再取消では再送しない
     j2 = _submit_job(issued["key"], "失敗", webhook=True)
     store_jobs.mark_failed(j2, error_code="codex_failed", from_status="queued")
-    events = [(json.loads(n["body"])["event"], json.loads(n["body"])["job_id"]) for n in sent_notices]
-    assert events == [("codex_job.cancelled", j1), ("codex_job.failed", j2)]
+    events = [(json.loads(n["body"])["event"], json.loads(n["body"])["job_id"]) for n in sent_notices.deliver().of(j1, j2)]
+    assert sorted(events) == sorted([("codex_job.cancelled", j1), ("codex_job.failed", j2)])
 
 
 def test_codex_job_webhook_not_sent_when_not_requested_or_destination_removed(fake_codex, sent_notices):
@@ -276,7 +286,7 @@ def test_codex_job_webhook_not_sent_when_not_requested_or_destination_removed(fa
     with store._connect() as c:
         c.execute("UPDATE api_keys SET webhook_url=NULL, webhook_secret=NULL WHERE id=%s", (issued["id"],))
     _cancel(j2, issued["key"])
-    assert sent_notices == []
+    assert sent_notices.deliver().of(j1, j2) == []
 
 
 # ===== 受付→状態→結果の一巡 =====
@@ -310,6 +320,23 @@ def test_codex_job_round_trip_completed(fake_codex):
     assert [s["doc_id"] for s in rbody["sources"]] == ["4期/04_運用/障害記録.md"]
     assert isinstance(rbody["unconfirmed_items"], list)
     assert isinstance(rbody["elapsed_ms"], int) and rbody["elapsed_ms"] >= 0
+
+
+def test_codex_job_keeps_outside_scope_note_and_drops_excluded_sources(fake_codex, monkeypatch):
+    """ジョブの保存・結果に、範囲の外の注記を保ち、除外の資料は出さない。"""
+    import json
+    from sherpa import path_rules
+    doc = "4期/04_運用/障害記録.md"
+    issued = _new_keys("cj-note")[0]
+    monkeypatch.setenv(path_rules.ENV_KEY, json.dumps(
+        {"v1": [{"path": "4期/04_運用", "kind": "priority", "outside_scope": True}]}))
+    job_id = _submit_job(issued["key"], "注記", scope_paths=["4期/01_標準"])
+    assert _dispatch_and_wait(job_id)["status"] == "completed"
+    assert _result(job_id, issued["key"]).json()["sources"] == [{"doc_id": doc, "note": path_rules.NOTE_OUTSIDE_SCOPE}]
+    monkeypatch.setenv(path_rules.ENV_KEY, json.dumps({"v1": [{"path": "4期/04_運用", "kind": "exclude", "outside_scope": False}]}))
+    job2 = _submit_job(issued["key"], "除外")
+    assert _dispatch_and_wait(job2)["status"] == "completed"
+    assert _result(job2, issued["key"]).json()["sources"] == []
 
 
 def test_codex_job_result_investigation_field_present_absent_and_cleared_on_expiry():

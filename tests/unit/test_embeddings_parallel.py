@@ -89,6 +89,26 @@ def test_embed_parallel_preserves_order_with_staggered_completion(monkeypatch):
         assert vector == [float(len(text))]
 
 
+def test_embed_parallel_reports_physical_calls_tokens_and_cumulative_api_time(monkeypatch):
+    texts = [f"t{i}" for i in range(120)]
+
+    def fake_embed_batch(batch, c):
+        metering.acc_add({"input_tokens": len(batch)})
+        return [[1.0] for _ in batch]
+
+    monkeypatch.setattr(embeddings, "_embed_batch", fake_embed_batch)
+    cfg_o = {"provider": "openai", "key": "k", "model": "text-embedding-3-small", "dim": 1,
+             "parallel": 4}
+    metrics = {}
+
+    vecs = embeddings.embed(texts, cfg_o, metrics=metrics)
+
+    assert vecs is not None and len(vecs) == len(texts)
+    assert metrics["api_calls"] == 3
+    assert metrics["input_tokens"] == len(texts)
+    assert metrics["api_cumulative_ms"] >= 0
+
+
 def test_embed_serial_when_parallel_not_configured(monkeypatch):
     """`c` に `parallel` が無い（省略時=1）呼び出し元は今までどおり直列（既存契約の回帰なし）。"""
     texts = [f"t{i}" for i in range(120)]
@@ -300,7 +320,7 @@ def test_ollama_no_proxy_propagates_to_parallel_worker(monkeypatch):
     def fake_post(url, hdrs, body, timeout):
         seen_no_proxy.append(llm._no_proxy_ctx.get())
         n = len(body["input"])
-        return {"embeddings": [[1.0] for _ in range(n)]}
+        return {"data": [{"index": i, "embedding": [1.0]} for i in range(n)]}
 
     monkeypatch.setattr(llm, "post_json", fake_post)
     texts = [f"t{i}" for i in range(120)]   # 3バッチ（_BATCH=50）

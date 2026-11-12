@@ -154,3 +154,28 @@ def test_get_latest_es_run_summary_select_requires_es_key_and_published(monkeypa
     assert "published_at IS NOT NULL" in sql
     assert "extraction_snapshot ? 'es'" in sql
     assert "ORDER BY id DESC LIMIT 1" in sql
+
+
+def test_set_scan_report_and_doc_count_writes_both_in_one_update_guarded_by_sig(monkeypatch):
+    """集計と件数は 1 回の UPDATE で同時に書き、今の署名と一致しなければ書かない（片方だけが残る状態を作らない）。"""
+    conn = _Connection()
+    monkeypatch.setattr(worlds_store, "_ensure", lambda: None)
+    monkeypatch.setattr(worlds_store, "_connect", lambda: conn)
+
+    assert worlds_store.set_scan_report_and_doc_count("w1", {"document_count": 7}, 7, "sig-now") is True
+
+    assert len(conn.calls) == 1
+    sql, params = conn.calls[0]
+    assert "last_scan_report=%s" in sql and "last_doc_count=%s" in sql and "last_sig=%s" in sql
+    assert params[1] == 7 and params[-1] == "sig-now"
+
+
+def test_set_scan_report_and_doc_count_returns_false_when_sig_is_stale(monkeypatch):
+    class _Stale(_Connection):
+        def execute(self, sql, params=None):
+            self.calls.append((sql, params))
+            return _Cursor(rowcount=0)
+    conn = _Stale()
+    monkeypatch.setattr(worlds_store, "_ensure", lambda: None)
+    monkeypatch.setattr(worlds_store, "_connect", lambda: conn)
+    assert worlds_store.set_scan_report_and_doc_count("w1", {}, 3, "old-sig") is False

@@ -14,6 +14,7 @@ import time
 import pytest
 from _corpus_helpers import _mk
 from _ingest_queue import drain_ingest_queue
+from _replace_row import row_for
 from _world_setup import driver
 
 from sherpa import store, worlds
@@ -165,7 +166,7 @@ def test_delete_neo4j_success_then_pg_failure_self_heals(sb, monkeypatch):
     sig0 = store.get_world(wid)["last_sig"]
     assert sig0
 
-    def _boom(world, rows):
+    def _boom(world, rows, **_kw):
         raise RuntimeError("pg replace fault (after neo4j delete commit)")
 
     with monkeypatch.context() as m:
@@ -279,17 +280,17 @@ def test_rebind_neo4j_committed_then_pg_replace_fails_restores_old_graph(sb, mon
     worlds.register(wid, str(_resolved(a)))
     assert sb.names(wid) == ["FOOPROG"]
 
-    real_replace = store.replace_documents
+    real_switch = store.switch_ledger
     calls = {"n": 0}
 
-    def _fail_first(world, rows):
+    def _fail_first(world, **_kw):
         calls["n"] += 1
-        if calls["n"] == 1:                                        # rebind の B に対する replace だけ失敗
+        if calls["n"] == 1:                                        # rebind の B に対する切り替えだけ失敗
             raise RuntimeError("pg replace fault (after neo4j commit)")
-        return real_replace(world, rows)                           # rollback の A 即時再構築は成功させる
+        return real_switch(world, **_kw)                           # rollback の A 即時再構築は成功させる
 
     with monkeypatch.context() as m:
-        m.setattr(store, "replace_documents", _fail_first)
+        m.setattr(store, "switch_ledger", _fail_first)
         with pytest.raises(RuntimeError, match="pg replace fault"):
             worlds.rebind(wid, str(_resolved(b)))
 
@@ -367,7 +368,8 @@ def test_rebind_run_id_recovery_success_finalizes_once_with_rolled_back_reason(s
             raise ValueError("rebind-primary (取り込み失敗)")
         return orig_run(*aa, **kk)                                 # 復旧（旧 root A）は本物を通す
 
-    run_id = store.start_ingest_run(wid, scan_root=None, created_by="admin")["id"]
+    run_id = store.start_ingest_run(wid, created_by="admin")["id"]
+    row_for(wid, "", lock_id=run_id)                               # 本番どおり、回を拾った worker がその回の lock と行を持つ
     monkeypatch.setattr(worker, "_run_locked", _run)
     with pytest.raises(ValueError, match="rebind-primary"):
         worlds.rebind(wid, str(_resolved(b)), run_id=run_id)
@@ -394,7 +396,8 @@ def test_rebind_run_id_recovery_failure_uses_rollback_failed_reason(sb, monkeypa
         calls["n"] += 1
         raise RuntimeError(f"boom-{calls['n']}")                   # 新 root 試行・復旧再構築ともに失敗
 
-    run_id = store.start_ingest_run(wid, scan_root=None, created_by="admin")["id"]
+    run_id = store.start_ingest_run(wid, created_by="admin")["id"]
+    row_for(wid, "", lock_id=run_id)                               # 本番どおり、回を拾った worker がその回の lock と行を持つ
     monkeypatch.setattr(worker, "_run_locked", _run)
     with pytest.raises(RuntimeError, match="boom-1"):
         worlds.rebind(wid, str(_resolved(b)), run_id=run_id)

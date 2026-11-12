@@ -5,7 +5,8 @@
 - HTTP（SSE）購読の有無に関わらず最後まで走り、messages/trace/監査は `chat_service` の既存ロジックで DB に永続する（薄いラッパー）。
 - SSE 購読（`GET /chat/turns/{id}/stream`）はバッファを cursor から replay→追従するだけ。切断してもターンは止まらない。
   明示停止は `stop_turn`（turn_id 宛て）。
-- レジストリ/バッファはプロセス内（uvicorn workers=1 前提）。完了ターンは TTL（`COMPLETED_TTL_SECONDS`）後に破棄する。
+- レジストリ/バッファはプロセス内（uvicorn workers=1 前提）。完了ターンは TTL（`COMPLETED_TTL_SECONDS`）後、または完了ターンの合計が `COMPLETED_MAX_BYTES` を超えたら古い順に破棄する（実行中は破棄しない）。
+- 実行の記録（開始・途中経過・終わりの状態）は `chat_run_journal` が DB に残す。プロセスが消えたときの回収は起動時（`lifespan`）、通常の停止は `shutdown_turns`。
 - ロック順序: `_REGISTRY_LOCK` → `TurnBuffer._cond` の順のみ。`TurnBuffer` のメソッドは `_REGISTRY_LOCK` を取らない。
 - 外部ジョブ（`codex_jobs_worker.py`）はレジストリに登録しないが、global 同時実行上限はチャットと合算で数える
   （`try_reserve_external`/`release_external`・`_EXTERNAL_RUNNING`）。
@@ -21,7 +22,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterator
 
-from . import memtrim
+from . import memtrim, stop_kind
+from .chat_run_journal import RunJournal
 
 _log = logging.getLogger("sherpa")
 
@@ -36,6 +38,10 @@ MAX_BUFFER_BYTES = 2_000_000
 
 # 完了ターンの buffer 保持時間（秒）。再接続の猶予のみ。
 COMPLETED_TTL_SECONDS = 600
+# 完了ターンのバッファ全体の保持上限（バイト）。超えたら完了の古い順に捨てる。
+COMPLETED_MAX_BYTES = 32_000_000
+# 通常の停止で、実行中のチャットの終了を待つ時間（秒）。
+SHUTDOWN_WAIT_SECONDS = 10.0
 
 class TurnLimitError(Exception):
     """同時実行数の上限超過（呼び出し側で 429 に変換する）。"""
@@ -82,6 +88,11 @@ class TurnBuffer:
                 self._total_bytes -= dropped.nbytes
             self._cond.notify_all()
 
+    @property
+    def total_bytes(self) -> int:
+        with self._cond:
+            return self._total_bytes
+
     def mark_done(self) -> None:
         with self._cond:
             self.done = True
@@ -113,6 +124,10 @@ class TurnRecord:
     conversation_id: int | None = None
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     buffer: TurnBuffer = field(default_factory=TurnBuffer)
+    # 送信時に指定された範囲（社内資料オフのターンは None）。実行中に会話を開き直したとき画面が範囲を戻すのに使う。
+    scope_paths: list[str] | None = None
+    journal: RunJournal | None = None
+    thread: threading.Thread | None = None
 
 
 _REGISTRY: dict[str, TurnRecord] = {}
@@ -123,7 +138,7 @@ _EXTERNAL_RUNNING = 0
 
 
 def _sweep_expired_locked() -> None:
-    """完了後 TTL を過ぎたターンをレジストリから外す（`_REGISTRY_LOCK` 保持済み前提）。経過時間でターンを打ち切ることはしない。"""
+    """完了後 TTL を過ぎたターン、および完了ターンの合計バイトが上限を超えた分（古い順）をレジストリから外す（`_REGISTRY_LOCK` 保持済み前提）。経過時間でターンを打ち切ることはしない。"""
     now = time.time()
     expired: list[str] = []
     for tid, rec in _REGISTRY.items():
@@ -132,6 +147,14 @@ def _sweep_expired_locked() -> None:
                 expired.append(tid)
     for tid in expired:
         _REGISTRY.pop(tid, None)
+    done = sorted(((r.buffer.completed_at or 0.0, tid, r.buffer.total_bytes)
+                   for tid, r in _REGISTRY.items() if r.buffer.done))
+    total = sum(n for _, _, n in done)
+    for _, tid, nbytes in done:
+        if total <= COMPLETED_MAX_BYTES:
+            break
+        _REGISTRY.pop(tid, None)
+        total -= nbytes
 
 
 def _clamped_setting_int(raw, lo: int, hi: int) -> int | None:
@@ -207,12 +230,14 @@ def start_turn(*, uid: str,
               conversation_factory: Callable[[], int],
               run_fn_factory: Callable[[int], Callable[[threading.Event, Callable[[dict], None]], None]],
               known_conversation_id: int | None = None,
+              scope_paths: list[str] | None = None,
               ) -> TurnRecord:
     """新規ターンを background thread で開始する（予約方式）。上限超過で弾かれるリクエストが会話だけ作る副作用を避ける。
     ① `_REGISTRY_LOCK` の中で枠を予約する（上限判定と登録は atomic・この時点で conversation_id は None）。上限超過は `TurnLimitError`（会話は作られない）。
     ② ロックの外で `conversation_factory()` を呼んで会話を確定する。失敗したら予約を取り消して re-raise する。
     ③ conversation_id を予約レコードへ書き、`run_fn_factory(conversation_id)` で実処理を組み立てて thread を起動する。
     `known_conversation_id` は既存会話への継続と分かっているときだけ渡す。同じ会話の未完了ターンがあれば `TurnLimitError("conversation")`。
+    `scope_paths` は送信時の範囲（社内資料オフは None）で、実行中一覧（`list_running`）にそのまま載る。
     `effective_limits()` はロック取得前に呼ぶ（DB I/O をロック保持中に行わない）。
     """
     max_per_user, max_global = effective_limits()
@@ -225,7 +250,8 @@ def start_turn(*, uid: str,
         turn_id = uuid.uuid4().hex
         # `known_conversation_id` は予約時点で確定させる（factory 実行中に同じ会話の 2 本目がすり抜けないように）。
         rec = TurnRecord(turn_id=turn_id, uid=uid, stop_event=threading.Event(),
-                         conversation_id=known_conversation_id)
+                         conversation_id=known_conversation_id,
+                         scope_paths=list(scope_paths) if scope_paths is not None else None)
         _REGISTRY[turn_id] = rec
 
     try:
@@ -244,19 +270,33 @@ def start_turn(*, uid: str,
             _REGISTRY.pop(turn_id, None)  # 予約取消（`_run` が起動しなければ `mark_done` は誰も呼ばない）
         raise
 
+    journal = RunJournal(turn_id=turn_id, conversation_id=conversation_id, user_id=uid,
+                         started_at=rec.started_at)
+    rec.journal = journal
+    journal.begin()
+
     def _run():
+        status, reason = "completed", None
         try:
-            run_fn(rec.stop_event, rec.buffer.append)
-        except Exception:
+            run_fn(rec.stop_event, journal.wrap(rec.buffer.append))
+        except Exception as e:
             # 未捕捉の例外でも枠を占有したまま残さない。DB への永続は呼び出し側（run_fn）の責務で、ここは buffer にエラーを積んで枠を解放するだけ。
             _log.exception("chat turn crashed: turn_id=%s uid=%s", turn_id, uid)
-            rec.buffer.append({"type": "error", "message": "内部エラーが発生しました。もう一度お試しください。"})
+            message = {"timeout": "回答の作成がタイムアウトしました。もう一度お試しください。",
+                       "transport_error": "AI との通信に失敗しました。時間をおいてもう一度お試しください。"
+                       }.get(stop_kind.from_exception(e), "内部エラーが発生しました。もう一度お試しください。")
+            rec.buffer.append({"type": "error", "message": message})
+            status, reason = "failed", type(e).__name__
         finally:
+            if status == "completed" and rec.stop_event.is_set():
+                status = "stopped"
+            journal.finish(status, reason)
             rec.buffer.mark_done()
             memtrim.release()   # 1 ターンで積んだ分のメモリを OS へ返す（Linux のみ・30 秒に 1 回まで）
 
     try:
-        threading.Thread(target=_run, daemon=True, name=f"sherpa-turn-{turn_id[:8]}").start()
+        rec.thread = threading.Thread(target=_run, daemon=True, name=f"sherpa-turn-{turn_id[:8]}")
+        rec.thread.start()
     except Exception:
         with _REGISTRY_LOCK:
             _REGISTRY.pop(turn_id, None)  # スレッド起動失敗の予約取消
@@ -287,6 +327,36 @@ def stop_turn(turn_id: str, uid: str, *, is_admin: bool = False) -> bool:
         return False
     rec.stop_event.set()
     return True
+
+
+def shutdown_turns(wait_seconds: float | None = None) -> list[str]:
+    """通常の停止で呼ぶ。実行中のチャットすべてに停止を求め、`wait_seconds` まで待つ。終わらなかったターンは、途中経過を保存して「中断」として記録し
+    （会話に注記を残す）、その turn_id を返す。呼び出しの後に DB を閉じてよい。
+    """
+    from . import chat_run_journal
+    from .store import chat_runs
+    deadline = time.monotonic() + (SHUTDOWN_WAIT_SECONDS if wait_seconds is None else wait_seconds)
+    with _REGISTRY_LOCK:
+        running = [r for r in _REGISTRY.values() if not r.buffer.done]
+    for r in running:
+        r.stop_event.set()
+    for r in running:
+        if r.thread is not None:
+            r.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    interrupted: list[str] = []
+    for r in running:
+        if r.buffer.done:
+            continue
+        try:
+            progress = r.journal.snapshot() if r.journal is not None else None   # 手元の途中経過を、中断の状態と同じ書き込みで残す
+            run = chat_runs.get_run(r.turn_id)
+            if run is not None and run["status"] == "running" \
+                    and chat_run_journal.interrupt_run(run, "shutdown", progress=progress):
+                interrupted.append(r.turn_id)
+        except Exception as e:
+            _log.warning("停止時のチャットの中断記録に失敗しました: turn_id=%s %s: %s",
+                         r.turn_id, type(e).__name__, e)
+    return interrupted
 
 
 def iter_sse(turn_id: str, uid: str, cursor: int, *, wait_timeout: float = 15.0) -> Iterator[str] | None:

@@ -28,6 +28,12 @@ _RE_ROUTERS = re.compile(r"^sherpa/routers/([^/]+)\.py$")
 _RE_WEB_CHAT = re.compile(r"^web/chat/")
 _RE_WEB_PAGE = re.compile(r"^web/([^/]+)\.[^/.]+$")
 _RE_TESTS = re.compile(r"^tests/")
+# 大きさ・依存の向きの検査（scripts/check_sizes.py）とその規則・基準は、自分の単体テストを選ぶ。
+_SIZE_CHECK_FILES = {
+    "scripts/check_sizes.py",
+    "scripts/arch_rules.toml",
+    "scripts/size_baseline.txt",
+}
 _RE_DOCS = re.compile(r"^docs/")
 _RE_ANY_MD = re.compile(r"\.md$", re.IGNORECASE)
 # conftest・共通ヘルパ・goldens はディレクトリ単位のテスト共通土台（そのディレクトリの
@@ -150,6 +156,14 @@ def _structural_candidates(file: str) -> tuple[bool, list[tuple[str, str]]]:
     if m:
         matched = True
         candidates.append(("dir", m.group(1)))
+
+    if file in _SIZE_CHECK_FILES:
+        matched = True
+        candidates.append(("glob", "unit/test_check_sizes.py"))
+
+    if file == "scripts/graph_golden.py":
+        matched = True
+        candidates.append(("glob", "unit/test_world_graph_golden.py"))
 
     if _RE_TESTS.match(file):
         matched = True

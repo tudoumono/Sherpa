@@ -113,7 +113,6 @@ def test_unwired_provider_run_includes_scope_in_env(_clean_env, monkeypatch):
     narrow_scope = {"world": "v1", "scope_paths": ["4期/"], "source": "scope"}
     ctx = Ctx(message="質問", world="v1", knowledge=True, scope_meta=narrow_scope,
              route=lambda m: {"lens": "qa", "reason": "t", "input": m},
-             dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}, "sources": []},
              make_sources=lambda docs: [{"doc_id": d} for d in docs])
     result = next(e for e in p.run(ctx) if e.get("type") == "_result")
     # qa 相当の honest failure は layer_applied=True を含む scope 契約を保持する。
@@ -130,7 +129,6 @@ def test_unwired_provider_preserves_requested_layer_value():
     p = _UnwiredProvider("Codex", "案内文")
     ctx = Ctx(message="質問", world="v1", knowledge=True, scope_meta=scope_meta,
              route=lambda m: {"lens": "qa", "reason": "t", "input": m},
-             dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}, "sources": []},
              make_sources=lambda docs: [{"doc_id": d} for d in docs])
     result = next(e for e in p.run(ctx) if e.get("type") == "_result")
     assert result["env"]["scope"]["layer"] == "code"

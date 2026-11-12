@@ -1,6 +1,6 @@
 """R3-S1/S2: worker の PG replace / Neo4j load 失敗時の記録＋自己修復（要 Postgres＋Neo4j）。
 
-`sherpa.ingest.worker._run_locked` の PG replace（`store.replace_documents`）・Neo4j load
+`sherpa.ingest.worker._run_locked` の PG の台帳の切り替え（`store.switch_ledger`）・Neo4j load
 （`world_neo4j.load_world`）ステップを fault injection で失敗させ、次を固定する:
   (a) 例外は握りつぶされず呼び出し元へ伝播する（API 側可視・従来どおり）。
   (b) `ingest_runs` に **best-effort** で failed（`degraded=True`・`stage="pg_replace"`）が記録される
@@ -31,6 +31,7 @@ from _world_setup import driver
 from sherpa import store, worlds
 from sherpa.ingest import worker
 from sherpa.store import documents as store_documents
+from sherpa.store import ledger_stage
 from sherpa.store import ingest as store_ingest
 
 W = "test_pg_replace_fault"
@@ -69,17 +70,17 @@ def test_pg_replace_failure_data_caused_is_recorded_and_self_heals():
 
         _mk(root, "案件A", "BARPROG")                          # 内容変更＝次回 sync が変更検知する
 
-        orig_replace = store.replace_documents
+        orig_replace = store.switch_ledger
 
-        def _boom(world, rows):
+        def _boom(world, **_kw):
             raise RuntimeError("duplicate key value violates unique constraint (fault injection)")
 
-        store.replace_documents = _boom
+        store.switch_ledger = _boom
         try:
             with pytest.raises(RuntimeError, match="fault injection"):
                 worker.sync(W)
         finally:
-            store.replace_documents = orig_replace
+            store.switch_ledger = orig_replace
 
         assert store.get_world(W)["last_sig"] == ""             # last_sig 無効化（R3-S2・次回 sync を必ず再構築させる番兵）
         latest = store.list_ingest_runs(W)[0]                  # 最新 run
@@ -141,14 +142,14 @@ def test_pg_replace_connection_failure_propagates_original_error_and_self_heals(
                 raise RuntimeError("record-write-fault (secondary must NOT mask primary)")
             return orig_ingest_connect(*a, **k)
 
-        store_documents._connect = _boom_replace
+        store_documents._connect = ledger_stage._connect = _boom_replace
         store_ingest._connect = _boom_record                    # finish_ingest_run の best-effort 記録を別種例外で失敗させる
         try:
             # 伝播するのは **replace の OperationalError**（record の RuntimeError ではない）。
             with pytest.raises(psycopg.OperationalError, match="replace-fault"):
                 worker.sync(W)
         finally:
-            store_documents._connect = orig_doc_connect
+            store_documents._connect = ledger_stage._connect = orig_doc_connect
             store_ingest._connect = orig_ingest_connect
 
         assert store.get_world(W)["last_sig"] == ""             # last_sig 無効化（R3-S2）
@@ -237,17 +238,17 @@ def test_unchanged_source_with_arm_drift_and_failed_run_forces_rebuild_next_sync
         assert marker.is_file(), "register で派生MDビルドが marker を書くはず"
         marker.write_text("arms=bogus;pdf=none;legacy=none;md=none;vlm=none", encoding="utf-8")  # drift を演出
 
-        orig_replace = store.replace_documents
+        orig_replace = store.switch_ledger
 
-        def _boom(world, rows):
+        def _boom(world, **_kw):
             raise RuntimeError("fault injection (arm-drift rebuild fails)")
 
-        store.replace_documents = _boom
+        store.switch_ledger = _boom
         try:
             with pytest.raises(RuntimeError, match="fault injection"):
                 worker.sync(wid)                                # ソース不変・drift のみ検知して再構築 → 失敗
         finally:
-            store.replace_documents = orig_replace
+            store.switch_ledger = orig_replace
 
         assert store.get_world(wid)["last_sig"] == ""           # last_sig 無効化（旧実装は sig0 のまま残り穴になった）
         # _build_derived は失敗前に marker を現構成へ更新済み＝drift はもう検知されない（バグの前提を確認）

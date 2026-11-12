@@ -1,0 +1,16 @@
+{
+  "counts": {
+    "edge_types": {},
+    "edges": 0,
+    "flag_reasons": {
+      "unresolved_qualifier": 1
+    },
+    "flags": 1,
+    "node_labels": {
+      "Module": 1
+    },
+    "nodes": 1
+  },
+  "sha256": "ee06713f034564a14d02c6fbbfba5ee687aad8e0f5dda00a3286bc740988fa53",
+  "world": "ana-v1c"
+}

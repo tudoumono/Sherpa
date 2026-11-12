@@ -36,18 +36,17 @@ from sherpa.routers import (
     audit_usage,
     chat,
     conversations,
+    connectivity_admin,
     feedback_admin,
-    graph,
-    impact,
-    improvement_log,
+    folder_check,
+    impact, ingest_run_mark,
+    improvement_log, path_rules_admin,
     shares,
     system,
     system_extras,
     workspace,
 )
-from sherpa.routers import auth as auth_routes
-from sherpa.routers import documents as documents_routes
-from sherpa.routers import worlds as worlds_routes
+from sherpa.routers import auth as auth_routes, documents as documents_routes, worlds as worlds_routes
 # 既存テストが `sherpa.api` 属性参照で取るため再エクスポートする
 from sherpa.routers.shares import conversation_share_create  # noqa: F401
 from sherpa.routers.workspace import (  # noqa: F401
@@ -84,13 +83,12 @@ _TAGS_METADATA = [
     {"name": "会話管理", "description": "会話履歴の一覧・取得・削除・ピン留め・改名。"},
     {"name": "文書", "description": "文書台帳の参照と原本ダウンロード。"},
     {"name": "資料フォルダ(World)管理", "description": "登録ディレクトリ（world）の登録・状態確認・差分・再取込・削除、フォルダ選択。"},
-    {"name": "ナレッジグラフ", "description": "ナレッジグラフの可視化データ・検索。"},
     {"name": "システム", "description": "ヘルスチェック・ルート・静的UI配信。"},
     {"name": "管理者:外部APIキー", "description": "外部連携 API（/ext/v1）のキー発行・一覧・失効（管理者のみ）。"},
 ]
 
 app = FastAPI(
-    title="Sherpa MVP",
+    title="Slouch MVP",
     description="社内文書向け Agentic RAG 基盤。取り込み→抽出→ナレッジグラフ→影響分析／チャット／トラブルシュートまでを提供するAPI。",
     openapi_tags=_TAGS_METADATA,
     lifespan=lifespan,
@@ -142,61 +140,30 @@ _auth_startup_audited = False
 
 
 
-app.include_router(auth_routes.auth_router)
-
-
-app.include_router(admin_users.router)
-
-
-app.include_router(audit_usage.audit_usage_router)
-
-
-app.include_router(improvement_log.improvement_log_router)
-
-
-app.include_router(feedback_admin.feedback_admin_router)
-
-
-app.include_router(shares.router)
-
-
-app.include_router(workspace.router)
-
-
-app.include_router(impact.impact_router)
-
-
-app.include_router(chat.chat_router)
-
-
-app.include_router(system.settings_router)
-
-
-app.include_router(conversations.router)
-
-
-app.include_router(documents_routes.download_router)
-
-
-app.include_router(worlds_routes.ingest_preview_router)
-
-
-app.include_router(documents_routes.documents_router)
-
-
-app.include_router(worlds_routes.worlds_router)
-
-
-app.include_router(graph.router)
-
-
-app.include_router(worlds_routes.ingest_runs_router)
-
-
-app.include_router(system.healthz_router)
-
-
-app.include_router(system_extras.extras_router)
+# ルート表 golden の定義順を保つため、この並びのまま登録する
+for _router in (
+    auth_routes.auth_router,
+    admin_users.router,
+    audit_usage.audit_usage_router,
+    improvement_log.improvement_log_router,
+    feedback_admin.feedback_admin_router,
+    connectivity_admin.connectivity_admin_router, path_rules_admin.path_rules_admin_router,
+    shares.router,
+    workspace.router,
+    impact.impact_router,
+    chat.chat_router,
+    system.settings_router,
+    conversations.router,
+    documents_routes.download_router,
+    worlds_routes.ingest_preview_router,
+    folder_check.router,
+    documents_routes.documents_router,
+    worlds_routes.worlds_router,
+    worlds_routes.ingest_runs_router, ingest_run_mark.router,
+    system.healthz_router,
+    system_extras.extras_router,
+):
+    app.include_router(_router)
 
 
 def _auth_bootstrap_on_startup():
@@ -477,8 +444,7 @@ def _seed_ollama_url_from_env():
 
     未設定なら正常としてマーカーだけ確定する。DB 到達不可・形式不正（userinfo/path/query 混入・不正 scheme 等）ならマーカーを立てず
     warning を残して return する（env を直せば次回起動で再評価）。
-    正当な値は host:port へ正規化して保存し、非 loopback ホストは同一トランザクションで `ollama_allowlist` へも追記する
-    （`ollama_url` を新規挿入できたときだけ・URL と認可を原子的に確定）。
+    正当な値は host:port へ正規化して保存する（中央の接続先は許可一覧への登録が要らない）。
     """
     from sherpa import llm, store
     log = logging.getLogger("sherpa")
@@ -505,36 +471,13 @@ def _seed_ollama_url_from_env():
         from urllib.parse import urlparse as _urlparse
         scheme = _urlparse(raw).scheme.lower()
         normalized = f"{scheme}://{llm.format_host_port(hp[0], hp[1])}"
-        ollama_host_entry = None if llm.is_loopback_host(hp[0]) else llm.format_host_port(hp[0], hp[1])
         candidate = {"ollama_url": normalized, _OLLAMA_URL_SEED_MARKER_KEY: _OLLAMA_URL_SEED_VERSION}
         applied, _conflicts = store.seed_system_settings_once(
-            candidate, guard_key=_OLLAMA_URL_SEED_MARKER_KEY,
-            ollama_allowlist_merge=("ollama_url", ollama_host_entry) if ollama_host_entry else None)
+            candidate, guard_key=_OLLAMA_URL_SEED_MARKER_KEY)
         if "ollama_url" in applied:
             log.info("起動時シード: env から system_settings へ取り込みました（ollama_url）")
     except Exception as e:
         log.warning("起動時シード（OLLAMA_URL）に失敗しました（DB 不達の可能性）: %s", e)
-
-
-def _warn_central_ollama_not_allowed():
-    """現在の中央 `ollama_url`（非 loopback）が `ollama_allowlist` に無ければ警告ログを1行残す（自動修復はせず、管理画面での手動追加へ誘導する）。"""
-    from sherpa import llm, store
-    log = logging.getLogger("sherpa")
-    try:
-        sysset = store.get_system_settings()
-    except Exception as e:
-        log.warning("起動時点検（ollama_allowlist）に失敗しました（DB 不達の可能性）: %s", e)
-        return
-    central = str(sysset.get("ollama_url") or "").strip()
-    if not central:
-        return
-    hp = llm._canonical_host_port(central)
-    if hp is None or llm.is_loopback_host(hp[0]):
-        return
-    entry = llm.format_host_port(hp[0], hp[1])
-    if entry not in (sysset.get("ollama_allowlist") or []):
-        log.warning(
-            "Ollama 中央接続先(%s)が許可一覧にありません。管理画面で追加してください。", entry)
 
 
 # OpenAI 接続先の env→system_settings 初回シード。独立した完了マーカーを持つ
@@ -602,20 +545,20 @@ def _env_int_in_range(name: str, lo: int, hi: int) -> int | None:
     return v if lo <= v <= hi else None
 
 
-# 調べる深さの基準値6項目の env→system_settings 初回シード。独立した完了マーカーを持つ。値は env（有効な値のみ）→各モジュールのコード既定の順で決め、
+# 調べる深さの基準値3項目の env→system_settings 初回シード。独立した完了マーカーを持つ。値は env（有効な値のみ）→各モジュールのコード既定の順で決め、
 # シード後は管理画面の基準値編集が唯一の真実源（実行時は env を読まない）。Codex 推論のみ env 由来の自由文字列のため語彙検証する
 _DEPTH_PROFILE_SEED_MARKER_KEY = "depth_profile_seed_version"
 _DEPTH_PROFILE_SEED_VERSION = 1
 
 
 def _seed_depth_profile_from_env():
-    """調べる深さの基準値6項目を system_settings へ一生に一度だけ取り込む。
+    """調べる深さの基準値3項目を system_settings へ一生に一度だけ取り込む。
 
     完了マーカー（`depth_profile_seed_version`）があれば env は読まない。DB 到達不可などで例外になったらマーカーを立てず return する。
     `SHERPA_CODEX_REASONING` は `strip().lower()` 正規化後に `depth_profile.CODEX_REASONING_LEVELS` に無ければエラーログのみ出し、
-    6項目・マーカーとも書かず終了する（env 修正後の次回起動または `healthz()` の再試行で確定する）。
+    3項目・マーカーとも書かず終了する（env 修正後の次回起動または `healthz()` の再試行で確定する）。
     """
-    from sherpa import agentic_search, chat_service, depth_profile, impact_service, lens_service
+    from sherpa import agentic_search, depth_profile
     log = logging.getLogger("sherpa")
     try:
         sysset = store.get_system_settings()
@@ -628,7 +571,7 @@ def _seed_depth_profile_from_env():
     if reasoning_env not in depth_profile.CODEX_REASONING_LEVELS:
         log.error(
             "起動時シード（depth_profile）を見送りました: SHERPA_CODEX_REASONING の値が不正です"
-            "（%r）。選べる値: %s。env を修正してください（基準値6項目は未シードのまま残り、"
+            "（%r）。選べる値: %s。env を修正してください（基準値3項目は未シードのまま残り、"
             "修正後の再起動または healthz の再試行で一括シードされます）。",
             reasoning_env, ", ".join(depth_profile.CODEX_REASONING_LEVELS))
         return
@@ -642,14 +585,8 @@ def _seed_depth_profile_from_env():
         candidate = {
             keys["grep_max_hits"]: _pick("SHERPA_GREP_MAX_HITS", 1, agentic_search.MAX_HITS_ABS_MAX,
                                          agentic_search.MAX_HITS),
-            keys["qa_max_hits"]: chat_service.QA_MAX_HITS_DEFAULT,
             keys["read_window"]: _pick("SHERPA_READ_WINDOW", 10, agentic_search.READ_WINDOW_ABS_MAX,
                                        agentic_search.READ_WINDOW),
-            keys["impact_depth"]: _pick("SHERPA_IMPACT_MAX_DEPTH", 1, impact_service.IMPACT_MAX_DEPTH_ABS_MAX,
-                                        impact_service.IMPACT_MAX_DEPTH),
-            keys["troubleshoot_depth"]: _pick("SHERPA_TROUBLESHOOT_GRAPH_DEPTH", 1,
-                                              lens_service.TROUBLESHOOT_GRAPH_DEPTH_ABS_MAX,
-                                              lens_service.TROUBLESHOOT_GRAPH_DEPTH),
             keys["codex_reasoning"]: reasoning_env,
             _DEPTH_PROFILE_SEED_MARKER_KEY: _DEPTH_PROFILE_SEED_VERSION,
         }
@@ -754,7 +691,7 @@ _VLM_OLLAMA_URL_SEED_VERSION = 1
 
 
 def _seed_vlm_ollama_url_from_env():
-    """旧 `SHERPA_VLM_OLLAMA_URL` を、中央の `ollama_url` が未保存のときだけ中央の値として一生に一度だけ保存する（非 loopback は許可一覧へも追記）。
+    """旧 `SHERPA_VLM_OLLAMA_URL` を、中央の `ollama_url` が未保存のときだけ中央の値として一生に一度だけ保存する。
     中央の値が既にあり旧値と違うときは警告を 1 行だけ残す（自動では変えない）。`_seed_ollama_url_from_env` の後に呼ぶ。env が無い・形式不正・DB 不達のときはマーカーを立てず return する。
     """
     from sherpa import llm
@@ -784,10 +721,8 @@ def _seed_vlm_ollama_url_from_env():
             return
         from urllib.parse import urlparse as _urlparse
         normalized = f"{_urlparse(raw).scheme.lower()}://{llm.format_host_port(hp[0], hp[1])}"
-        entry = None if llm.is_loopback_host(hp[0]) else llm.format_host_port(hp[0], hp[1])
         applied, _conflicts = store.seed_system_settings_once(
-            {"ollama_url": normalized, **marker}, guard_key=_VLM_OLLAMA_URL_SEED_MARKER_KEY,
-            ollama_allowlist_merge=("ollama_url", entry) if entry else None)
+            {"ollama_url": normalized, **marker}, guard_key=_VLM_OLLAMA_URL_SEED_MARKER_KEY)
         if "ollama_url" in applied:
             log.info("起動時シード: SHERPA_VLM_OLLAMA_URL を中央の Ollama 接続先へ取り込みました（ollama_url）")
     except Exception as e:

@@ -1,0 +1,20 @@
+{
+  "counts": {
+    "edge_types": {
+      "DOCUMENTS": 1,
+      "INVOKES": 13
+    },
+    "edges": 14,
+    "flag_reasons": {
+      "ambiguous": 1
+    },
+    "flags": 1,
+    "node_labels": {
+      "Document": 1,
+      "Module": 21
+    },
+    "nodes": 22
+  },
+  "sha256": "cd489263cb58e8a610e4a0d9f7976a4b74e7a7380d3cf0eca29d7d32153b30bb",
+  "world": "ana-s6"
+}

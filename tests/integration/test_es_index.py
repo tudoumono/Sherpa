@@ -11,6 +11,7 @@ import pytest
 from _world_setup import TEST_WORLD_ID
 
 from sherpa import es_index as es
+from tests._replace_row import offline_row
 
 V = TEST_WORLD_ID   # 旧固定 'v1' から移行（2026-07-03 インシデント対応 HIGH#2・_world_setup.py 参照）
 
@@ -45,7 +46,7 @@ def test_es_roundtrip_if_available():
         pytest.skip("ES 未起動")
     from _world_registry import register_test_world
     register_test_world(V)   # V の ES index をセッション終了時に削除（backstop・tests/_world_registry.py）
-    r = es.index_world(V)
+    r = es.index_world(V, row=offline_row(V))
     assert r["available"] and r["indexed"] > 0 and r["chunks"] > 0
     assert (es.count(V) or 0) > 0
     # RV3（FBK-1・2026-09-01）: es_index.search() は (hits, degrade_reason) を返す（実 ES が
@@ -79,7 +80,7 @@ def test_index_world_progress_callback():
     from _world_registry import register_test_world
     register_test_world(V)
     calls = []
-    r = es.index_world(V, progress=lambda done, total: calls.append((done, total)))
+    r = es.index_world(V, progress=lambda done, total: calls.append((done, total)), row=offline_row(V))
     assert r["available"] and r["indexed"] > 0
     assert calls, "文書がある world なら progress が最低1回は呼ばれる"
     totals = {t for _, t in calls}
@@ -109,18 +110,16 @@ def test_vector_hybrid_stubbed():
         return orq(method, path, body, **kw)
     es._req = cap
     try:
-        r = es.index_world(V, settings={})
+        r = es.index_world(V, settings={}, row=offline_row(V))
         assert r.get("vectors") is True and r["chunks"] > 0      # dense_vector 付きで索引（_meta も記録）
         hits, reason = es.search(V, "消費税", k=3, settings={})
         assert reason is None
-        # RV-FIX-4（2026-09-05）: hybrid は top-level knn から bool.should 内の query-level knn ＋
-        # function_score 包みへ変更（重要度係数が合成全体へ1回だけ効く形）。knn 節がクエリ本体の
-        # どこかに含まれていれば kNN 経路が実際に使われた、と判定する。
+        # knn 節がクエリ本体のどこかに含まれていれば kNN 経路が実際に使われた、と判定する。
         import json as _json
         assert hits and any('"knn"' in _json.dumps(b or {}) for b in bodies)
     finally:
         embeddings.cfg, embeddings.embed, es._req = oc, oe, orq
-        es.index_world(V, settings={})                        # BM25 索引へ戻す（DISABLE_EMBED）
+        es.index_world(V, settings={}, row=offline_row(V))                        # BM25 索引へ戻す（DISABLE_EMBED）
 
 
 def test_byte_vector_knn_roundtrip():
@@ -142,7 +141,7 @@ def test_byte_vector_knn_roundtrip():
     embeddings.cfg = lambda settings=None, **kw: {"provider": "stub", "key": "x", "model": "stub", "dim": 16}
     embeddings.embed = lambda texts, c, **kw: [vec_for(t) for t in texts]
     try:
-        r = es.index_world(V, settings={})
+        r = es.index_world(V, settings={}, row=offline_row(V))
         assert r.get("vectors") is True and r["chunks"] > 0
         mapping = next(iter(es._req("GET", f"/{es._index(V)}/_mapping").values()))["mappings"]
         assert mapping["properties"]["embedding"]["element_type"] == "byte"
@@ -158,32 +157,13 @@ def test_byte_vector_knn_roundtrip():
             assert reason is None and hits and hits[0]["text"] == src["text"]
     finally:
         embeddings.cfg, embeddings.embed = oc, oe
-        es.index_world(V, settings={})
-
-
-def test_qa_merge_brings_in_es():
-    """Codex/非agentic も ES を参照できる＝qa の facts(citations) に ES ヒットが統合される（stub・重複排除）。"""
-    from sherpa import chat_service, documents, es_index
-    o_s, o_r = es_index.search, documents.world_rel_set
-    # RV2（FBK-1・2026-09-01）: `es_index.search()` は (hits, degrade_reason) を返す。
-    es_index.search = lambda world, q, scope_paths=None, k=8, vector=True, layer=None, **kw: ([
-        {"doc_id": "案件/x.md", "line": 3, "text": "ES固有ヒット", "ext": ".md"},
-        {"doc_id": "案件/dup.md", "line": 1, "text": "重複", "ext": ".md"}], None)
-    documents.world_rel_set = lambda world=None, **kw: {"案件/x.md", "案件/dup.md"}      # 実在チェックを通す（stub）
-    try:
-        base = {"citations": [{"doc_id": "案件/dup.md", "span": [1, 1], "quote": "grep"}]}
-        merged = chat_service._merge_qa_with_es(base, V, "クエリ", None)
-        docs = [c["doc_id"] for c in merged["citations"]]
-        assert "案件/x.md" in docs                       # ES 固有ヒットが入る
-        assert docs.count("案件/dup.md") == 1           # doc_id+span で重複排除
-    finally:
-        es_index.search, documents.world_rel_set = o_s, o_r
+        es.index_world(V, settings={}, row=offline_row(V))
 
 
 def test_delete_missing_is_ok():
     if not es.available():
         pytest.skip("ES 未起動")
-    assert es.delete_world("no_such_world_xyz") is True   # 無いインデックス削除は成功扱い
+    assert es.delete_world("no_such_world_xyz", row=offline_row("no_such_world_xyz")) is True   # 無いインデックス削除は成功扱い
 
 
 def test_embed_cache_reuse():

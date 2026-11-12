@@ -2,6 +2,7 @@
 
 小さな段の始まりと終わりをログに 1 行ずつ出し、件数を数えられる段は 1 割ごと・1 分ごとに途中の行を出す。
 件数を出せない長い処理でも、一定の間隔（`HEARTBEAT_SEC`）で「まだ動いています」を出し、`ingest_runs.progress` の更新時刻を進める。
+同じ見張りが、その間隔でメモリの標本（`resource_meter.sample_if_due`）も取り、直近の標本を「まだ動いています」の行に添える。
 進み具合の書き先（`bind`）が無いとき（単体の呼び出し・テスト）はログだけを出す。記録の失敗で処理を止めない。
 設計: docs/design/operations.md「取り込みワーカーと版の照合」
 """
@@ -11,6 +12,8 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+
+from . import resource_meter
 
 _default_log = logging.getLogger("sherpa.ingest.convert")
 
@@ -121,6 +124,7 @@ def bind(write, stage_label=None) -> None:
     with _lock:
         _end_locked(quiet=True)
         _sink = (write, stage_label)
+        _ensure_heartbeat()
 
 
 def unbind(*, failed: bool = False) -> None:
@@ -220,6 +224,7 @@ def _heartbeat_loop() -> None:
     while True:
         _hb_wake.wait(_poll_sec())
         _hb_wake.clear()
+        resource_meter.sample_if_due(HEARTBEAT_SEC)
         try:
             with _lock:
                 st = _cur
@@ -229,8 +234,9 @@ def _heartbeat_loop() -> None:
                 if now - st.t_act < HEARTBEAT_SEC:
                     continue
                 stage = _stage_label()
-                st.log.info("まだ動いています: %s経過 %s",
-                            f"{stage}・{st.label}・" if stage else f"{st.label}・", _fmt_elapsed(now - st.t0))
+                st.log.info("まだ動いています: %s経過 %s%s",
+                            f"{stage}・{st.label}・" if stage else f"{st.label}・", _fmt_elapsed(now - st.t0),
+                            resource_meter.latest_note())
                 st.t_log = now
                 _write(st)
         except Exception:

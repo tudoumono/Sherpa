@@ -919,7 +919,7 @@ if [ "$FETCH" = 1 ] && [ "$SKIP_OCR" != 1 ]; then
   _pip_download_wheels requirements-ocr.txt "" "$OUT/ocr/wheels" >/dev/null
   ( cd "$OUT/ocr/wheels" && sha256sum ./* > SHA256SUMS )
   ok "OCR の wheel 一式: $OUT/ocr/wheels/"
-  # ③ モデル（約134MB・Apache-2.0。配布可否は docker/ocr-models.lock.json の方針欄を参照）
+  # ③ モデル（small・medium・mobile の全部で約190MB・Apache-2.0。配布可否は docker/ocr-models.lock.json の方針欄を参照）
   SHERPA_OCR_MODEL_CACHE="$OUT/ocr/models" "$ROOT/scripts/fetch_ocr_models.sh" >/dev/null
   cp "$ROOT/docker/ocr-models.lock.json" "$OUT/ocr/"
   ok "OCR のモデル: $OUT/ocr/models/（照合済み）"
@@ -928,7 +928,7 @@ elif [ "$SKIP_OCR" = 1 ]; then
 else
   note "[計画] OCR ワーカーのイメージを build → docker save（約550MB）"
   note "[計画] requirements-ocr.txt の wheel を pip download（約1.3GB 相当）"
-  note "[計画] PP-OCRv6 モデルを取得し docker/ocr-models.lock.json と照合（約134MB）"
+  note "[計画] OCR モデル（small・medium・mobile）を取得し docker/ocr-models.lock.json と照合（約190MB）"
   note "  → $OUT/ocr/"
   note "→ 実行するには --fetch を指定してください（--skip-ocr で除外可）。"
 fi
@@ -1026,7 +1026,7 @@ echo ""
 # ---------------------------------------------------------------------------
 MANIFEST="$OUT/MANIFEST.txt"
 {
-  echo "Sherpa offline-kit MANIFEST"
+  echo "Slouch offline-kit MANIFEST"
   echo "生成日時: $(date -Iseconds 2>/dev/null || date)"
   echo "SHERPA_VERSION: $SHERPA_VERSION"
   echo "APT_BASE_IMAGE: $APT_BASE_IMAGE"

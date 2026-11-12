@@ -1,0 +1,19 @@
+{
+  "counts": {
+    "edge_types": {
+      "CONTAINS": 1,
+      "INVOKES": 8
+    },
+    "edges": 9,
+    "flag_reasons": {
+      "unresolved": 2
+    },
+    "flags": 2,
+    "node_labels": {
+      "Module": 15
+    },
+    "nodes": 15
+  },
+  "sha256": "ebf7a3fb7bffbb83e4c9bd071d8a4f477ccc21a732e163b10f91e3ab2682a5df",
+  "world": "java1"
+}

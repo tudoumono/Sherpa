@@ -11,9 +11,15 @@ import uuid
 
 import pytest
 
-from sherpa import corpus_docs, es_index, store, worlds
-from sherpa.ingest import ai_observation, scan_pdf_ocr_status, world_neo4j, worker
+from sherpa import corpus_docs, es_index, store, text_encoding, worlds
+from sherpa.ingest import ai_observation, evidence_ir, ocr_worker, scan_pdf_ocr_status, world_neo4j, worker
 from sherpa.store import ocr_jobs
+from tests._replace_row import use_offline_rows
+
+
+@pytest.fixture(autouse=True)
+def _offline_rows(monkeypatch):
+    use_offline_rows(monkeypatch)
 
 SCAN = "scan/a.pdf"
 _HEX = "a" * 64
@@ -45,6 +51,22 @@ def _write_observation(obs_dir, rel, *, texts, confidence=0.9):
     path.write_text(ai_observation.to_json_str(obs_set) + "\n", encoding="utf-8")
 
 
+def _write_ir(ir_dir, rel, *, content_hash="sha256:" + _HEX):
+    """公開中の Evidence（`{rel}.evidence.json`）を書く。観測の入力が指す要素 e1 とその素材の hash を持つ。"""
+    locator = evidence_ir.Locator(part="p")
+    cid = evidence_ir.make_coverage_id("object", "image", locator)
+    element = evidence_ir.EvidenceElement(
+        element_id="e1", type="image", parent_id=None, order=0, value=None,
+        locator=locator, coverage_id=cid, extension={"asset_sha256": _HEX})
+    ir = evidence_ir.EvidenceIR(
+        schema_version=evidence_ir.EVIDENCE_IR_SCHEMA_VERSION, parser_profile="t",
+        source=evidence_ir.EvidenceSource(file_type="pdf", content_hash=content_hash), elements=[element],
+        coverage=[evidence_ir.CoverageItem(
+            coverage_id=cid, scope="object", detected_kind="image", locator=locator,
+            status="extracted", content_basis="pixel_only", reason_code="ok", parser_id="t", detail={})])
+    evidence_ir.write_json_atomic(ir_dir / (rel + ".evidence.json"), ir)
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """スキャン PDF 1件（SCAN）と通常の PDF 1件を持つ人向け MD の木・観測ツリー・OCR の外部状態（worker／job）を用意する。"""
@@ -55,11 +77,16 @@ def env(tmp_path, monkeypatch):
     _write_meta(dmd, "plain.pdf", "pdfplumber")
     monkeypatch.setattr(worlds, "derived_md_dir", lambda _w: dmd)
     monkeypatch.setattr(worlds, "observation_current_dir", lambda _w: obs)
+    monkeypatch.setattr(worlds, "derived_ir_dir", lambda _w: tmp_path / "ir")
+    _write_ir(tmp_path / "ir", SCAN)
     state = {"available": True, "terminal": False, "unpublished_jobs": 0}
     monkeypatch.setattr(ocr_jobs, "worker_availability_summary", lambda _h: {"available": state["available"]})
-    monkeypatch.setattr(ocr_jobs, "generation_state",
-                        lambda _w, _g: {"terminal": state["terminal"], "unpublished_jobs": state["unpublished_jobs"]})
-    monkeypatch.delenv("SHERPA_OCR_ENABLED", raising=False)
+    def generation_state(_w, _g, *, engine_profile_hash=None):
+        state["profile"] = engine_profile_hash
+        return {"terminal": state["terminal"], "unpublished_jobs": state["unpublished_jobs"]}
+
+    monkeypatch.setattr(ocr_jobs, "generation_state", generation_state)
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
     try:
         yield w, dmd, obs, state
     finally:
@@ -85,6 +112,13 @@ def test_terminal_generation_without_observation_is_listed_as_ocr_failed(env):
     assert _reasons(w) == {SCAN: "ocr_failed"}
 
 
+def test_publication_state_is_read_for_the_current_engine_profile_only(env):
+    w, _dmd, _obs, state = env
+    state["terminal"] = True
+    scan_pdf_ocr_status.settle(w, "sig-1")
+    assert state["profile"] == ocr_worker.profile_hash()
+
+
 def test_terminal_with_empty_observation_is_ocr_failed(env):
     w, _dmd, obs, state = env
     state["terminal"] = True
@@ -108,6 +142,17 @@ def test_published_observation_is_not_listed_and_clears_ocr_reasons(env):
     _write_observation(obs, SCAN, texts=["請求書 合計 1,000円"])
     scan_pdf_ocr_status.settle(w, "sig")
     assert _reasons(w) == {}
+
+
+def test_observation_of_a_changed_source_is_not_counted_as_published(env, tmp_path):
+    """原本が変わった（公開中の Evidence のハッシュと観測のハッシュが違う）文書は、観測が残っていても公開済みと数えず、失敗の記録を外さない。"""
+    w, _dmd, obs, state = env
+    state["available"] = False
+    store.record_failed_doc(w, SCAN, "ocr_unavailable")
+    _write_ir(tmp_path / "ir", SCAN, content_hash="sha256:" + "b" * 64)
+    _write_observation(obs, SCAN, texts=["古い原本の文字"])
+    scan_pdf_ocr_status.settle(w, "sig")
+    assert _reasons(w) == {SCAN: "ocr_unavailable"}
 
 
 def test_published_observation_keeps_other_failure_reason(env):
@@ -145,12 +190,13 @@ def test_non_scan_method_does_nothing(env):
     assert _reasons(w) == {}
 
 
-def test_ocr_disabled_does_nothing(env, monkeypatch):
-    w, _dmd, _obs, state = env
+def test_ocr_disabled_records_unavailable_even_when_worker_is_up(env, monkeypatch):
+    w, dmd, _obs, state = env
+    _write_meta(dmd, SCAN, scan_pdf_ocr_status.SCAN_OCR_METHOD)
     monkeypatch.setenv("SHERPA_OCR_ENABLED", "0")
-    state["available"] = False
+    state["available"] = True
     scan_pdf_ocr_status.settle(w, "sig")
-    assert _reasons(w) == {}
+    assert _reasons(w) == {SCAN: "ocr_unavailable"}
 
 
 def test_unexpected_error_is_swallowed(env, monkeypatch):
@@ -193,13 +239,14 @@ def test_unchanged_sync_settles_with_current_sig(monkeypatch, tmp_path):
         yield
     monkeypatch.setattr(store, "world_lock", _noop_lock)
     monkeypatch.setattr(store, "get_world",
-                        lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0, "last_scan_report": {}})
+                        lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0,
+                                       "last_scan_report": text_encoding.stamp_detect_version(corpus_docs.empty_scan_report())})
     monkeypatch.setattr(corpus_docs, "scan_report_missing_fields", lambda report: [])
     monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
     monkeypatch.setattr(worker, "_seed_failed_docs_locked", lambda world: False)
     monkeypatch.setattr(worker, "_settle_notice_markers", lambda world, sig: None)
-    monkeypatch.setattr(worker, "_refresh_derived_representations", lambda world, sig: (None, None, None))
+    monkeypatch.setattr(worker, "_refresh_derived_representations", lambda world, sig, **kw: (None, None, None))
     monkeypatch.setattr(world_neo4j, "check_graph_counts", lambda *a, **kw: None)
     monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: False)
     monkeypatch.setattr(worker, "run", lambda *a, **kw: pytest.fail("全件 run は走らない"))

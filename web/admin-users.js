@@ -10,10 +10,16 @@ if (new URLSearchParams(location.search).has('embed')) {
 
 const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON, api = Sherpa.api, fmtDateTime = Sherpa.fmtDateTime;
 
-function toast(msg) {
+function toast(msg, ms = 1800) {
   const t = $('toast'); if (!t) return;
   t.textContent = msg; t.classList.add('show');
-  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 1800);
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), ms);
+}
+
+// 操作は完了したが操作記録を保存できなかったときは、その旨を足す（記録は監査ログで確認できない）。
+function toastDone(msg, res) {
+  if (res && res.audit_recorded === false) toast(`${msg}。ただし操作記録を保存できませんでした。監査ログの保存状態を確認してください`, 10000);
+  else toast(msg);
 }
 
 function setButtonLoading(btn, on, label, loadingLabel) {
@@ -31,12 +37,24 @@ function passwordCharsetError(value) {
 }
 
 // ===== admin ガード: /auth/me でロールを確認 =====
+let _adminErr = '';
+// 戻り値は 'admin'／'denied'（401・403・管理者でない）／'unreachable'（判定できなかった。理由は _adminErr）。
 async function checkAdmin() {
   try {
     const u = await getJSON('/auth/me');
-    if (u && u.role === 'admin') return true;
-  } catch (_) { /* compat mode: admin 合成が返る */ }
-  return false;
+    return u && u.role === 'admin' ? 'admin' : 'denied';
+  } catch (e) {
+    if (e && (e.status === 401 || e.status === 403)) return 'denied';
+    _adminErr = (e && e.message) || '';
+    return 'unreachable';
+  }
+}
+
+function showUnreachable(denied) {
+  const d = denied && denied.querySelectorAll('div');
+  if (!d || d.length < 3) return;
+  d[1].textContent = '権限を確認できませんでした: ' + _adminErr;
+  d[2].textContent = '時間をおいて画面を開き直してください。';
 }
 
 // ===== ユーザー一覧の描画 =====
@@ -160,11 +178,11 @@ $('nu-submit').addEventListener('click', async () => {
   if (charsetError) { errEl.textContent = charsetError; return; }
   setButtonLoading($('nu-submit'), true, '追加', '追加中...');
   try {
-    await api('POST', '/admin/users', { uid, display_name: display_name || undefined, role, password });
+    const created = await api('POST', '/admin/users', { uid, display_name: display_name || undefined, role, password });
     // フォームをクリア
     $('nu-uid').value = ''; $('nu-name').value = ''; $('nu-pw').value = '';
     $('nu-role').value = 'user';
-    toast('ユーザーを追加しました');
+    toastDone('ユーザーを追加しました', created);
     await loadUsers();
   } catch (e) {
     errEl.textContent = String(e);
@@ -188,7 +206,7 @@ $('csv-submit').addEventListener('click', async () => {
     try { d = await r.json(); } catch (_) {}
     if (r.ok) {
       $('csv-file').value = '';
-      toast(`${d.created} 人を追加しました`);
+      toastDone(`${d.created} 人を追加しました`, d);
       await loadUsers();
     } else if (d && Array.isArray(d.errors)) {
       errEl.innerHTML = '<div>次の行を直してください（誰も追加されていません）</div><ul>' +
@@ -264,10 +282,10 @@ $('edit-submit').addEventListener('click', async () => {
   const disabling = patch.status === 'disabled';
   setButtonLoading($('edit-submit'), true, '保存', '保存中...');
   try {
-    await api('PATCH', `/admin/users/${encodeURIComponent(uid)}`, patch);
+    const saved = await api('PATCH', `/admin/users/${encodeURIComponent(uid)}`, patch);
     closeEditDialog();
     // 無効化した行は既定フィルターで一覧から消えるため、削除と誤認されないよう明示する（フィルターは自動で切り替えない）。
-    toast(disabling ? '無効化しました。『すべて』または『無効のみ』で確認できます' : '変更しました');
+    toastDone(disabling ? '無効化しました。『すべて』または『無効のみ』で確認できます' : '変更しました', saved);
     await loadUsers();
   } catch (e) {
     errEl.textContent = String(e);
@@ -294,31 +312,17 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !$('edit-overlay').hidden) closeEditDialog();
 });
 
-// テーマ切替
-function applyThemeIcon() {
-  const tb = $('themebtn');
-  if (tb) tb.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙';
-}
-const themebtn = $('themebtn');
-if (themebtn) {
-  themebtn.addEventListener('click', () => {
-    const d = document.documentElement;
-    const next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-    d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
-  });
-}
-applyThemeIcon();
-
 // ===== 初期化 =====
 (async () => {
   closeEditDialog();
   const isAdmin = await checkAdmin();
-  if (!isAdmin) {
+  if (isAdmin !== 'admin') {
     // admin でなければアクセス拒否メッセージを表示してコンテンツを隠す。
     const main = $('main-content');
     const denied = $('access-denied');
     if (main) main.style.display = 'none';
     if (denied) denied.style.display = 'block';
+    if (isAdmin === 'unreachable') showUnreachable(denied);
     return;
   }
   await loadUsers();

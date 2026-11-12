@@ -2,13 +2,14 @@
 
 2 段で使う: `graph_resolve` で同名を含む候補（`canonical_id`・種別・所属パス・表示名・修飾名）を見て起点を選び、
 `graph_impact` へ `canonical_id` を渡す。名前の曖昧さは呼び出し側が解く（`graph_neighbors` の名前の完全一致とは別の経路）。
-`graph_impact` は構造の辺（COPIES・CONTAINS・INVOKES・ACCESSES）だけをたどり、言及（DOCUMENTS）は影響に数えず
+`graph_impact` は構造の辺（COPIES・CONTAINS・INVOKES・ACCESSES・BUILT_FROM）だけをたどり、言及（DOCUMENTS）は影響に数えず
 関連文書として別に返す（層が both のときだけ）。データの流れ（FLOWS_TO・ファイル受け渡しなど）で届く先は影響に混ぜず `flow_candidates` に別に返す。層がソースに限定されている間も使える（コード同士の閉じた辺だけ・資料は一切返さない）。
 未探索（時間切れ・件数の天井・深さ・返却件数）は `coverage`（`graph_coverage.py` の欄）で申告する。
 契約: docs/design/interfaces.md「graph_resolve・graph_impact」・docs/proposals/2026-10-04-アナライザとグラフの改善.md S6・docs/proposals/2026-10-16-データフロー層.md §4。
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -17,11 +18,11 @@ import time
 from collections import Counter, OrderedDict
 from pathlib import Path
 
-from . import graph_coverage, layer as layer_mod, scope
+from . import graph_coverage, layer as layer_mod, path_rules, scope
 from .graph_coverage import Coverage
 from .ingest import text_kind
 from .ingest.model import NODE_LABELS
-from .ingest.world_neo4j import FLOW_DEPTH_DEFAULT, GraphQueryOverloadError, GraphSchemaEraError
+from .ingest.world_neo4j import FLOW_DEPTH_DEFAULT, GraphQueryOverloadError, GraphSchemaEraError, node_period
 
 _log = logging.getLogger("sherpa")
 
@@ -78,16 +79,20 @@ def json_bytes(obj) -> int:
     return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
 
+# `run` の間だけ入る管理者の優先・除外（`_sensitive_path` が除外の資料を結果に出さないために見る）
+_RULES: contextvars.ContextVar = contextvars.ContextVar("graph_tools_path_rules", default=path_rules.EMPTY)
+
+
 def _sensitive_path(path) -> bool:
-    """秘匿名のファイル（`text_kind.is_sensitive_doc_id`）か。パスが無いノードは対象外。"""
-    return bool(path) and text_kind.is_sensitive_doc_id(str(path))
+    """秘匿名のファイル（`text_kind.is_sensitive_doc_id`）、または管理者が検索から外している資料か。パスが無いノードは対象外。"""
+    return bool(path) and (text_kind.is_sensitive_doc_id(str(path)) or _RULES.get().excluded(str(path)))
 
 
 def _node_view(n: dict) -> dict:
     out = {"canonical_id": n["canonical_id"], "kind": n["label"], "name": n["name"], "path": n["path"]}
     if n.get("qualified_name"):
         out["qualified_name"] = n["qualified_name"]
-    return out
+    return {**out, **node_period(n)}
 
 
 def _flag_truncated(result: dict, coverage: dict) -> None:
@@ -118,6 +123,16 @@ def _open_driver():
 
 
 def run(name: str, args: dict, world: str, scope_paths, layer=None, max_bytes: int | None = None) -> dict:
+    """管理者の優先・除外（`path_rules`）を当てた `_run`。除外の資料は起点・経路・根拠・関連資料のどれにも出さず、「範囲の外でも読む」優先は範囲に足す。"""
+    rules = path_rules.rules_for(world)
+    token = _RULES.set(rules)
+    try:
+        return path_rules.filter_output(_run(name, args, world, rules.extend_scope(scope_paths), layer, max_bytes), world)
+    finally:
+        _RULES.reset(token)
+
+
+def _run(name: str, args: dict, world: str, scope_paths, layer=None, max_bytes: int | None = None) -> dict:
     """`graph_resolve`／`graph_impact` を実行して結果の辞書を返す（層 docs の拒否は呼び出し側）。
 
     `GraphSchemaEraError`（旧世代のグラフ）は再送出する（呼び出し側が `graph_reingest_required` のツール結果へ変換する）。
@@ -231,7 +246,6 @@ def _resolve(session, world, sp, code_only, *, name, path, kind, limit) -> dict:
         result = {"candidates": [], "count": None, "coverage": cov.as_dict(omitted=None)}
         _flag_truncated(result, result["coverage"])
         return result
-    rows = [r for r in rows if not _sensitive_path(r["path"])]  # 多層防御（Cypher の述語と同じ規則）
     capped = len(rows) > limit
     shown = rows[:limit]
     if capped:
@@ -288,6 +302,24 @@ def _offset_arg(args: dict):
     return v if v >= 0 else None
 
 
+def _confirm_of(edge: dict) -> dict:
+    """辺の確かさ（期を見分けた資料フォルダの構造エッジだけ）。`confirm`・条件つきの理由 `assumption`（配列）。"""
+    if not edge.get("confirm"):
+        return {}
+    return {"confirm": edge["confirm"], **({"assumption": list(edge["assumption"])} if edge.get("assumption") else {})}
+
+
+def _route_confirm(edges: list) -> dict:
+    """経路の確かさ。経路の辺に条件つきが 1 本でもあれば `conditional`（理由は和集合）。確かさを持つ辺が無ければ何も付けない。"""
+    marked = [e for e in edges if e.get("confirm")]
+    if not marked:
+        return {}
+    cond = [e for e in marked if e["confirm"] == "conditional"]
+    if not cond:
+        return {"confirm": "confirmed"}
+    return {"confirm": "conditional", "assumption": sorted({a for e in cond for a in e.get("assumption") or []})}
+
+
 def _route_doc(doc, sp, code_only=False):
     """辺の参照元の資料パス。秘匿名・範囲外は返さない（`None`）。層 code では、ソースでない（アナライザが担当しない拡張子の）パスも返さない。"""
     if not doc or _sensitive_path(doc) or (sp and not scope.in_scope(doc, sp)):
@@ -330,7 +362,9 @@ def _edge_evidence(raw_edges: list, cids: list, sp, evidence_limit: int, code_on
         e = edge_view(raw)
         if "sources" in e:
             e["sources"] = _safe_sources(e["sources"], sp, code_only)
-        ev = {"from": cids[i], "to": cids[i + 1], **{k: e[k] for k in ("via", "line", "rule") if k in e}}
+            if _RULES.get().exclude_paths:
+                e["sources_overflow_count"] = 0  # 保存済みの超過の数に除外の根拠が混ざっているか分からない＝捨てて、見える根拠の返す上限の超過だけを数える
+        ev = {"from": cids[i], "to": cids[i + 1], **{k: e[k] for k in ("via", "line", "rule", "confirm", "assumption") if k in e}}
         if "sources" in e:
             ev.update({k: v for k, v in limit_edge_sources([e], evidence_limit)[0].items()
                        if k in ("sources", "sources_overflow_count")})
@@ -344,12 +378,13 @@ def _impact_item(it: dict, sp, evidence_limit: int, code_only=False) -> dict:
     cids, edges = it["trace_cids"], it["edges"]
     if evidence_limit == 0:
         return {"canonical_id": it["canonical_id"], "kind": it["label"], "name": it["name"], "path": it["path"],
-                "distance": len(it["trace"]) - 1, "via": [e["type"] for e in edges]}
+                "distance": len(it["trace"]) - 1, "via": [e["type"] for e in edges], **node_period(it), **_route_confirm(edges)}
     route = [{"from": cids[i], "to": cids[i + 1], "type": e["type"], "doc": _route_doc(e.get("doc"), sp, code_only),
-              "line": e.get("line")} for i, e in enumerate(edges)]
+              "line": e.get("line"), **_confirm_of(e)} for i, e in enumerate(edges)]
     return {"canonical_id": it["canonical_id"], "kind": it["label"], "name": it["name"], "path": it["path"],
             "distance": len(it["trace"]) - 1, "trace": it["trace"], "route": route,
-            "evidence": _edge_evidence(edges, cids, sp, evidence_limit, code_only), "evidence_available": True}
+            "evidence": _edge_evidence(edges, cids, sp, evidence_limit, code_only), "evidence_available": True,
+            **node_period(it), **_route_confirm(edges)}
 
 
 def _flow_candidate_item(it: dict, sp, evidence_limit: int, code_only=False) -> dict:
@@ -482,7 +517,7 @@ def _slim_item(it: dict, budget: int) -> dict:
                                       for e in it["evidence"]], "item_slimmed": "sources"}
         if json_bytes(lighter) + 1 <= budget:
             return lighter
-    keep = ("canonical_id", "kind", "name", "path", "distance", "via", "line", "target", "flow_edges")
+    keep = ("canonical_id", "kind", "name", "path", "distance", "via", "line", "target", "flow_edges", "confirm", "assumption")
     out = {k: it[k] for k in keep if k in it}
     out["item_slimmed"] = "route"
     if json_bytes(out) + 1 > budget:
@@ -586,7 +621,6 @@ def _impact(session, world, sp, code_only, with_documents, out_dir=None, *, cano
                 session, [canonical_id] + [it["canonical_id"] for it in items], world, sp)
         except GraphQueryOverloadError as e:
             docs_overload = e
-        docs = [d for d in docs if not _sensitive_path(d["path"]) and not _sensitive_path(d["_target_path"])]
         for d in docs:
             d.pop("_target_path")
         docs.sort(key=_doc_sort_key)
@@ -614,7 +648,7 @@ def _impact(session, world, sp, code_only, with_documents, out_dir=None, *, cano
     if part == "impact" and offset == 0 and not cov.has(graph_coverage.KIND_TIMEOUT, graph_coverage.KIND_ROW_CAP):
         # 起点の名前に一致する未解決の参照（影響の起点の解決と同じ完全一致）。起点の調べが時間切れ・天井なら付けない
         try:
-            unresolved = world_neo4j.read_unresolved(session, world, [start["name"]], sp, fold_case=False)
+            unresolved = path_rules.scrub_unresolved(world_neo4j.read_unresolved(session, world, [start["name"]], sp, fold_case=False), _RULES.get())
             unresolved["items"] = [u for u in unresolved["items"] if _route_doc(u.get("path"), None, code_only)]
         except GraphQueryOverloadError as e:
             cov.add(graph_coverage.kind_of_overload(e.reason), graph_coverage.STAGE_IMPACT)

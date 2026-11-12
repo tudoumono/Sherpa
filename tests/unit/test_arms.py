@@ -16,6 +16,7 @@ from pypdf import PdfWriter
 
 from sherpa.ingest import arms, office_md
 from sherpa.ingest.arms import ooxml_arm, pdf_text_arm
+from tests._replace_row import offline_row
 
 # arms は system_settings > env > 既定 で解決する（S1）。tests/unit/conftest.py の autouse fixture が
 # 既定で `store.get_system_settings` を空 dict に固定する（DB 依存・他テスト残骸からの遮断・Low RV 対応）。
@@ -283,7 +284,7 @@ def test_provenance_sidecar_written_for_ooxml(monkeypatch):
     src = pathlib.Path(d) / "src"; src.mkdir()
     _docx(src, "doc.docx")
     der = pathlib.Path(d) / "derived"
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["converted"] == 1
     md = der / "doc.docx.md"
     side = der / "doc.docx.md.meta.json"
@@ -305,7 +306,7 @@ def test_provenance_sidecar_records_pdf_backend(monkeypatch):
     try:
         office_md._pdf_backend = lambda: "pypdf"
         office_md._pdf_pages = lambda p: ["税率10%の説明"]
-        office_md.build_derived(src, der)
+        office_md.build_derived(src, der, row=offline_row("w"))
         meta = json.loads((der / "doc.pdf.md.meta.json").read_text(encoding="utf-8"))
         assert meta == {"arm": "pdf_text", "method": "pdf_text",
                         "confidence": 0.9, "notes": ["backend=pypdf"]}
@@ -320,9 +321,9 @@ def test_provenance_sidecar_is_deterministic(monkeypatch):
     src = pathlib.Path(d) / "src"; src.mkdir()
     _docx(src, "doc.docx")
     der = pathlib.Path(d) / "derived"
-    office_md.build_derived(src, der)
+    office_md.build_derived(src, der, row=offline_row("w"))
     first = (der / "doc.docx.md.meta.json").read_bytes()
-    office_md.build_derived(src, der)                              # 全消去→再作成（鏡）でも同一 bytes
+    office_md.build_derived(src, der, row=offline_row("w"))                              # 全消去→再作成（鏡）でも同一 bytes
     assert (der / "doc.docx.md.meta.json").read_bytes() == first
 
 
@@ -333,7 +334,7 @@ def test_sidecar_not_grepped_or_ledgered(monkeypatch):
     src = pathlib.Path(d) / "src"; src.mkdir()
     _docx(src, "doc.docx")
     der = pathlib.Path(d) / "derived"
-    office_md.build_derived(src, der)
+    office_md.build_derived(src, der, row=offline_row("w"))
     # `.meta.json` はMarkdownではない。E3以降は通常MDと並行評価用RAG MDの2つが生成される
     # （§8.1 三階層のフォルダ分離により物理的には md/rag の別ディレクトリへ配置される）。
     from sherpa import grep_tool, worlds

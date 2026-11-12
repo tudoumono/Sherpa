@@ -1433,7 +1433,7 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
         return None
 
     try:
-        ec = embeddings.cfg(None, system_settings=sys_s)
+        ec = embeddings.cfg(None, system_settings=sys_s, probe=False)  # 接続先とモデルだけ見る（次元は測らない）
     except Exception:
         type_error = True
         ec = None

@@ -22,6 +22,7 @@ from openpyxl.styles.colors import Color
 from sherpa.ingest import office_md
 from sherpa.ingest.arms import ooxml_arm
 from sherpa.ingest.ooxml import excel
+from tests._replace_row import offline_row
 
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 _EVAL_XLSX_DIR = _ROOT / "fixtures" / "eval" / "excel_ja" / "inputs"
@@ -563,7 +564,7 @@ def test_upgrade_from_v1_signature_regenerates_v2_region_structure(tmp_path):
             ws.cell(row=r, column=c, value=f"B{r}{c}")
     wb.save(world / "a.xlsx")
 
-    office_md.build_derived(world, derived)
+    office_md.build_derived(world, derived, row=offline_row("w"))
     doc_path = derived.parent / "ir" / "a.xlsx.document.json"
     evidence_path = derived.parent / "ir" / "a.xlsx.evidence.json"
     assert not doc_path.exists()
@@ -582,8 +583,8 @@ def test_upgrade_from_v1_signature_regenerates_v2_region_structure(tmp_path):
     evidence_path.write_text('{"corrupted": "v1-era placeholder"}', encoding="utf-8")
     assert office_md.document_ir_sig_drift(derived) is True and office_md.evidence_ir_sig_drift(derived) is True
 
-    assert office_md.refresh_document_ir(world, derived)["document_ir_failed"] == 0
-    assert office_md.refresh_evidence_ir(world, derived)["evidence_ir_failed"] == 0
+    assert office_md.refresh_document_ir(world, derived, row=offline_row("w"))["document_ir_failed"] == 0
+    assert office_md.refresh_evidence_ir(world, derived, row=offline_row("w"))["evidence_ir_failed"] == 0
     assert office_md.document_ir_sig_drift(derived) is False and office_md.evidence_ir_sig_drift(derived) is False
     assert doc_marker.read_text(encoding="utf-8") == current_doc_sig
     assert evidence_marker.read_text(encoding="utf-8") == current_evidence_sig

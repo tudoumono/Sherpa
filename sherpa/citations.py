@@ -10,6 +10,7 @@
 守ること: citation dict はここで返す形のまま公開・保存される。rag_chunks 由来の `locator`/`chunk_id` を
 キーとして持たせない（出典フッターに内部表現を出さない）。
 加算フィールド `excerpt_source`・`locator_hint`・`tier` は `with_display_excerpt` が付与する（`quote` は利用者向けの本文に上書きされる）。
+加算フィールド `generation`（資料フォルダ直下のフォルダ＝世代）・`modified_at`（原本の更新時刻）は `with_provenance` が付与し、値の取れた欄だけキーを立てる。
 """
 from __future__ import annotations
 
@@ -103,6 +104,26 @@ def with_display_text(evidence: Mapping, *, text: str, excerpt_source: str,
     out = {**evidence, "text": text, "excerpt_source": excerpt_source}
     if locator_hint:
         out["locator_hint"] = locator_hint
+    return out
+
+
+def top_folder(doc_id) -> str | None:
+    """doc_id（資料フォルダ内の相対パス）の先頭のフォルダ名（世代）。資料フォルダの直下に置いた資料・文字列でない値は None。"""
+    if not isinstance(doc_id, str) or "/" not in doc_id:
+        return None
+    return doc_id.split("/", 1)[0] or None
+
+
+def with_provenance(item: Mapping, modified_at: str | None = None) -> dict:
+    """citation／出典の行に、世代（`item["doc_id"]` のトップフォルダ）と原本の更新時刻を足す。既存のキーは変えない。
+    世代が無い（資料フォルダ直下の資料）・更新時刻を取れないときは、その欄のキーを立てない。
+    """
+    out = dict(item)
+    generation = top_folder(item.get("doc_id"))
+    if generation:
+        out["generation"] = generation
+    if isinstance(modified_at, str) and modified_at:
+        out["modified_at"] = modified_at
     return out
 
 

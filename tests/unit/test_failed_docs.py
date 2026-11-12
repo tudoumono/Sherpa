@@ -12,6 +12,7 @@ import pytest
 
 from sherpa import json_io, store, worlds
 from sherpa.ingest import office_md, worker
+from tests._replace_row import offline_row
 
 
 def _dirs(tmp_path):
@@ -35,7 +36,7 @@ def degraded_xlsx(tmp_path, monkeypatch):
     def boom(*a, **kw):
         raise RuntimeError("injected")
     monkeypatch.setattr(office_md, "_extract_canonical_evidence", boom)
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     monkeypatch.undo()
     return src, der, rep
 
@@ -49,8 +50,8 @@ def test_degraded_doc_is_listed_not_cached_and_not_mixed_by_refresh(degraded_xls
     # 失敗の知らせは版の判定から外れ、軽量再生成は .md を書き換えない
     assert office_md.human_md_sig_drift(src, der) is False
     before = (der / "a.xlsx.md").read_bytes()
-    assert office_md.refresh_human_md(src, der)["human_md_generated"] == 0
-    assert office_md.refresh_document_ir(src, der)["document_ir_generated"] == 0
+    assert office_md.refresh_human_md(src, der, row=offline_row("w"))["human_md_generated"] == 0
+    assert office_md.refresh_document_ir(src, der, row=offline_row("w"))["document_ir_generated"] == 0
     assert (der / "a.xlsx.md").read_bytes() == before
     assert not (der.parent / "ir" / "a.xlsx.document.json").exists()
 
@@ -68,7 +69,7 @@ def test_conv_cache_lookup_misses_when_cached_md_is_failure_notice(tmp_path):
 def test_office_lock_file_is_not_converted(tmp_path):
     src, der = _dirs(tmp_path)
     _xlsx(src / "~$a.xlsx")
-    rep = office_md.build_derived(src, der)
+    rep = office_md.build_derived(src, der, row=offline_row("w"))
     assert rep["converted"] == 0 and rep["failed"] == 0 and not rep["conversion_failures"]
     assert not (der / "~$a.xlsx.md").exists()
 

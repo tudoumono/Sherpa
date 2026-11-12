@@ -11,6 +11,7 @@ import pytest
 
 from sherpa import es_index as es
 from sherpa.ingest import background
+from tests._replace_row import offline_row
 
 _EC = {"provider": "fake", "model": "m", "dim": 3}
 
@@ -44,10 +45,10 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(es.embeddings, "embed", fake_embed)
     monkeypatch.setattr(es, "_EMBED_FLUSH_CHUNKS", 3)
     es._embed_failed_at.clear()
-    es.delete_world(world)
+    es.delete_world(world, row=offline_row(world))
     yield world, state
     es._building.pop(world, None)
-    es.delete_world(world)
+    es.delete_world(world, row=offline_row(world))
 
 
 def _physicals(world):
@@ -69,7 +70,7 @@ def _stop_when(monkeypatch, flag):
 def test_rebuild_keeps_searching_the_old_index_until_the_alias_switch(env, monkeypatch):
     world, st = env
     st["texts"] = {"a.md": "alpha01 本文", "b.md": "alpha01 二つ目"}
-    assert es.index_world(world, content_sig="s1")["indexed"] == 2
+    assert es.index_world(world, content_sig="s1", row=offline_row(world))["indexed"] == 2
     old = es._alias_targets(world)
     assert len(old) == 1 and _hits(world, "alpha01") == ["a.md", "b.md"]
 
@@ -82,7 +83,7 @@ def test_rebuild_keeps_searching_the_old_index_until_the_alias_switch(env, monke
         return orig(self, ids, bodies, vec_by_idx)
 
     monkeypatch.setattr(es._StreamingBulkSender, "send_group", spy)
-    es.index_world(world, content_sig="s2")
+    es.index_world(world, content_sig="s2", row=offline_row(world))
     assert seen == [(["a.md", "b.md"], [], 2)]                   # 作り直しの間は古い索引が答える（新旧 2 つの物理索引が並ぶ）
     assert _hits(world, "alpha01") == [] and _hits(world, "beta02") == ["c.md", "d.md"]
     new = es._alias_targets(world)
@@ -93,7 +94,7 @@ def test_rebuild_keeps_searching_the_old_index_until_the_alias_switch(env, monke
 def test_stop_in_pass1_leaves_alias_old_index_and_markers_untouched(env, monkeypatch):
     world, st = env
     st["texts"] = {f"o{i}.md": f"old03 n{i}" for i in range(2)}
-    es.index_world(world, content_sig="s1")
+    es.index_world(world, content_sig="s1", row=offline_row(world))
     old = es._alias_targets(world)
     st["texts"] = {f"d{i}.md": f"new04 t{i}" for i in range(10)}
     flag = {"on": False}
@@ -106,7 +107,7 @@ def test_stop_in_pass1_leaves_alias_old_index_and_markers_untouched(env, monkeyp
 
     monkeypatch.setattr(es.embeddings, "embed", embed_then_stop)
     with pytest.raises(background.StopRequested):
-        es.index_world(world, content_sig="s2")
+        es.index_world(world, content_sig="s2", row=offline_row(world))
     assert es._alias_targets(world) == old and _physicals(world) == old
     assert _hits(world, "old03") == ["o0.md", "o1.md"]
     assert es._index_meta(world)["content_sig"] == "s1"          # 確定していない
@@ -116,7 +117,7 @@ def test_stop_in_pass1_leaves_alias_old_index_and_markers_untouched(env, monkeyp
 def test_stop_in_pass2_discards_the_building_index(env, monkeypatch):
     world, st = env
     st["texts"] = {"o.md": "old05"}
-    es.index_world(world, content_sig="s1")
+    es.index_world(world, content_sig="s1", row=offline_row(world))
     old = es._alias_targets(world)
     st["texts"] = {f"d{i}.md": f"new06 t{i}" for i in range(10)}
     flag = {"on": False}
@@ -130,7 +131,7 @@ def test_stop_in_pass2_discards_the_building_index(env, monkeypatch):
 
     monkeypatch.setattr(es, "ensure_index", ensure_then_flag)
     with pytest.raises(background.StopRequested):
-        es.index_world(world, content_sig="s2")
+        es.index_world(world, content_sig="s2", row=offline_row(world))
     assert es._alias_targets(world) == old and _physicals(world) == old   # 作りかけは消え、古い索引は無傷
     assert _hits(world, "old05") == ["o.md"] and es._index_meta(world)["content_sig"] == "s1"
 
@@ -138,7 +139,7 @@ def test_stop_in_pass2_discards_the_building_index(env, monkeypatch):
 def test_low_space_drops_the_old_index_first_and_search_is_empty_until_the_switch(env, monkeypatch, caplog):
     world, st = env
     st["texts"] = {"a.md": "gamma11 本文"}
-    es.index_world(world, content_sig="s1")
+    es.index_world(world, content_sig="s1", row=offline_row(world))
     old = es._alias_targets(world)
     assert es._store_bytes(old) > 0 and es._es_free_bytes() > 0
     monkeypatch.setattr(es, "_es_free_bytes", lambda: 1)       # ES の空きが古い索引の 2 倍に満たない
@@ -152,7 +153,7 @@ def test_low_space_drops_the_old_index_first_and_search_is_empty_until_the_switc
 
     monkeypatch.setattr(es._StreamingBulkSender, "send_group", spy)
     with caplog.at_level("WARNING", logger="sherpa"):
-        r = es.index_world(world, content_sig="s2")
+        r = es.index_world(world, content_sig="s2", row=offline_row(world))
     assert r["indexed"] == 1 and "error" not in r
     (bm25, knn, physicals), = seen
     assert bm25[0] == [] and knn == [] and old[0] not in physicals   # 古い索引は先に消え、検索は空（例外にしない）
@@ -163,7 +164,7 @@ def test_low_space_drops_the_old_index_first_and_search_is_empty_until_the_switc
 def test_stop_after_low_space_drop_leaves_no_index_and_the_next_update_rebuilds(env, monkeypatch):
     world, st = env
     st["texts"] = {"o.md": "old13"}
-    es.index_world(world, content_sig="s1")
+    es.index_world(world, content_sig="s1", row=offline_row(world))
     monkeypatch.setattr(es, "_es_free_bytes", lambda: 1)
     st["texts"] = {f"d{i}.md": f"new14 t{i}" for i in range(10)}
     flag = {"on": False}
@@ -177,12 +178,12 @@ def test_stop_after_low_space_drop_leaves_no_index_and_the_next_update_rebuilds(
 
     monkeypatch.setattr(es, "ensure_index", ensure_then_flag)
     with pytest.raises(background.StopRequested):
-        es.index_world(world, content_sig="s2")
+        es.index_world(world, content_sig="s2", row=offline_row(world))
     assert es._concrete_indices(world) == [] and es._alias_targets(world) == []
     assert es.search(world, "old13", k=5)[0] == [] and es.needs_reindex(world, "s2")
     monkeypatch.setattr(es, "ensure_index", orig_ensure)
     flag["on"] = False
-    assert es.index_world(world, content_sig="s2")["indexed"] == 10
+    assert es.index_world(world, content_sig="s2", row=offline_row(world))["indexed"] == 10
     assert len(_hits(world, "new14")) == 10 and not es.needs_reindex(world, "s2")
 
 
@@ -191,7 +192,7 @@ def test_bulk_progress_log_shows_es_free_space_and_warns_once_when_low(env, monk
     st["texts"] = {f"d{i}.md": f"free15 t{i}" for i in range(10)}
     monkeypatch.setattr(es, "_LOW_FREE_WARN_BYTES", 1 << 62)    # 実の空きが必ず下回る
     with caplog.at_level("INFO"):
-        assert es.index_world(world, content_sig="s1")["indexed"] == 10
+        assert es.index_world(world, content_sig="s1", row=offline_row(world))["indexed"] == 10
     progress = [m for m in caplog.messages if m.startswith("取り込みの進み具合: 全文索引に書き込んでいます ") and "件（" in m]
     assert progress and all("ES の空き" in m for m in progress)
     assert sum("5GB を切りました" in m for m in caplog.messages) == 1
@@ -228,7 +229,7 @@ def test_compaction_at_the_end_keeps_every_chunk(env, monkeypatch, caplog):
 
     monkeypatch.setattr(es, "_req", req)
     with caplog.at_level("INFO"):
-        r = es.index_world(world, content_sig="s1")
+        r = es.index_world(world, content_sig="s1", row=offline_row(world))
     assert r["indexed"] == 10 and "error" not in r and r["vectors"] is True
     assert calls == es._alias_targets(world) and len(merges) == 1  # 付け替える索引を、終わりに 1 回だけ畳む
     assert sum("検索の索引を詰めています を始めます" in m for m in caplog.messages) == 1
@@ -254,7 +255,7 @@ def test_compaction_failure_or_timeout_warns_once_and_the_ingest_succeeds(env, m
 
     monkeypatch.setattr(es, "_req", req)
     with caplog.at_level("WARNING", logger="sherpa"):
-        r = es.index_world(world, content_sig="s1")
+        r = es.index_world(world, content_sig="s1", row=offline_row(world))
     assert r["indexed"] == 4 and "error" not in r
     assert len(_hits(world, "compact17")) == 4 and es._index_meta(world)["content_sig"] == "s1"
     assert len([x for x in caplog.records if x.levelname == "WARNING" and "詰め" in x.getMessage()]) == 1
@@ -263,7 +264,7 @@ def test_compaction_failure_or_timeout_warns_once_and_the_ingest_succeeds(env, m
 def test_stop_while_waiting_to_compact_discards_the_building_index(env, monkeypatch):
     world, st = env
     st["texts"] = {"o.md": "old18"}
-    es.index_world(world, content_sig="s1")
+    es.index_world(world, content_sig="s1", row=offline_row(world))
     old = es._alias_targets(world)
     st["texts"] = {f"d{i}.md": f"new18 t{i}" for i in range(10)}
     _compact_small(monkeypatch, settle=30, segments=False)
@@ -280,7 +281,7 @@ def test_stop_while_waiting_to_compact_discards_the_building_index(env, monkeypa
     monkeypatch.setattr(es, "_req", req)
     t0 = time.monotonic()
     with pytest.raises(background.StopRequested):
-        es.index_world(world, content_sig="s2")
+        es.index_world(world, content_sig="s2", row=offline_row(world))
     assert time.monotonic() - t0 < 10                           # 待ち（30 秒）の途中で止まる
     assert es._alias_targets(world) == old and _physicals(world) == old
     assert _hits(world, "old18") == ["o.md"] and es._index_meta(world)["content_sig"] == "s1"
@@ -300,13 +301,13 @@ def test_resume_after_stop_does_not_ask_the_destination_for_cached_vectors(env, 
 
     monkeypatch.setattr(es.embeddings, "embed", embed_then_stop)
     with pytest.raises(background.StopRequested):
-        es.index_world(world, content_sig="s1")
+        es.index_world(world, content_sig="s1", row=offline_row(world))
     sent_first = [t for call in st["embed_calls"] for t in call]
     assert 0 < len(sent_first) < 10
     flag["on"] = False
     monkeypatch.setattr(es.embeddings, "embed", base)
     st["embed_calls"].clear()
-    r = es.index_world(world, content_sig="s1")
+    r = es.index_world(world, content_sig="s1", row=offline_row(world))
     sent_second = [t for call in st["embed_calls"] for t in call]
     assert not set(sent_first) & set(sent_second)                # キャッシュ済みの分は問い合わせない
     assert len(sent_first) + len(sent_second) == 10
@@ -317,7 +318,7 @@ def test_failed_group_is_indexed_without_vector_and_found_by_fulltext(env):
     world, st = env
     st["texts"] = {f"d{i}.md": f"partial08 uniq{i}x" for i in range(10)}
     st["embed_fail_calls"] = {2}                                # 2 つ目のまとまり（3 件）だけ失敗
-    r = es.index_world(world, content_sig="s1")
+    r = es.index_world(world, content_sig="s1", row=offline_row(world))
     assert r.get("error") is None and r["vectors_missing"] == 3 and "embed_degraded" not in r
     assert _count_where(world, {"match_all": {}}) == 10
     assert _count_where(world, {"term": {"vector_status": "missing"}}) == 3
@@ -335,12 +336,12 @@ def test_fill_missing_vectors_fills_once_without_duplicates(env):
     world, st = env
     st["texts"] = {f"d{i}.md": f"fill09 uniq{i}x" for i in range(10)}
     st["embed_fail_calls"] = {2}
-    es.index_world(world, content_sig="s1")
+    es.index_world(world, content_sig="s1", row=offline_row(world))
     texts_before = {h["_id"]: h["_source"]["text"] for h in es._scroll_hits(world, {"match_all": {}}, ["text"])}
     st["embed_fail_calls"] = set()
     st["embed_calls"].clear()
     es._embed_failed_at.clear()
-    r = es.fill_missing_vectors(world)
+    r = es.fill_missing_vectors(world, ingest_no=1)
     assert r == {"available": True, "filled": 3, "missing": 0}
     assert _count_where(world, {"match_all": {}}) == 10          # 二重に入らない
     assert _count_where(world, {"exists": {"field": "embedding"}}) == 10
@@ -348,7 +349,7 @@ def test_fill_missing_vectors_fills_once_without_duplicates(env):
     texts_after = {h["_id"]: h["_source"]["text"] for h in es._scroll_hits(world, {"match_all": {}}, ["text"])}
     assert texts_after == texts_before                           # 本文は触らない
     st["embed_calls"].clear()
-    assert es.fill_missing_vectors(world) == {"available": True, "filled": 0, "missing": 0}   # 2 回目は何もしない
+    assert es.fill_missing_vectors(world, ingest_no=1) == {"available": True, "filled": 0, "missing": 0}   # 2 回目は何もしない
     assert st["embed_calls"] == []
     assert _count_where(world, {"match_all": {}}) == 10
 
@@ -357,22 +358,22 @@ def test_fill_missing_vectors_leaves_unobtained_and_respects_cooldown_and_stop(e
     world, st = env
     st["texts"] = {f"d{i}.md": f"keep10 uniq{i}x" for i in range(4)}
     st["embed_all_fail"] = True
-    r = es.index_world(world, content_sig="s1")
+    r = es.index_world(world, content_sig="s1", row=offline_row(world))
     assert r["vectors_missing"] == 4 and r["embed_degraded"] is True
     st["embed_calls"].clear()
-    assert es.fill_missing_vectors(world)["skipped"] == "embed_recently_failed"   # 失敗の直後は叩き直さない
+    assert es.fill_missing_vectors(world, ingest_no=1)["skipped"] == "embed_recently_failed"   # 失敗の直後は叩き直さない
     assert st["embed_calls"] == []
     es._embed_failed_at.clear()
-    assert es.fill_missing_vectors(world) == {"available": True, "filled": 0, "missing": 4}   # 取れなければ missing のまま
+    assert es.fill_missing_vectors(world, ingest_no=1) == {"available": True, "filled": 0, "missing": 4}   # 取れなければ missing のまま
     st["embed_all_fail"] = False
     es._embed_failed_at.clear()
     flag = {"on": True}
     _stop_when(monkeypatch, flag)
     with pytest.raises(background.StopRequested):
-        es.fill_missing_vectors(world)
+        es.fill_missing_vectors(world, ingest_no=1)
     assert _count_where(world, {"term": {"vector_status": "missing"}}) == 4
     flag["on"] = False
-    assert es.fill_missing_vectors(world)["missing"] == 0
+    assert es.fill_missing_vectors(world, ingest_no=1)["missing"] == 0
 
 
 def test_migration_from_a_real_index_named_like_the_alias(env):
@@ -384,7 +385,7 @@ def test_migration_from_a_real_index_named_like_the_alias(env):
     assert es._index_kind(world) == "index" and es.needs_reindex(world, "s1") is True
     assert _hits(world, "legacy11") == ["legacy.md"]             # 作り直しが終わるまで旧索引で検索できる
     st["texts"] = {"n.md": "migrated12 本文"}
-    r = es.index_world(world, content_sig="s1")
+    r = es.index_world(world, content_sig="s1", row=offline_row(world))
     assert r["indexed"] == 1
     assert es._index_kind(world) == "alias"
     assert es._concrete_indices(world) == es._alias_targets(world)   # 旧索引と作りかけは消え、物理索引だけが残る
@@ -395,19 +396,36 @@ def test_migration_from_a_real_index_named_like_the_alias(env):
 def test_delete_world_removes_alias_and_every_physical_index(env):
     world, st = env
     st["texts"] = {"a.md": "del13 本文"}
-    es.index_world(world, content_sig="s1")
+    es.index_world(world, content_sig="s1", row=offline_row(world))
     es._req("PUT", f"/{es._index(world)}-g2", {})
-    assert es.delete_world(world) is True
+    assert es.delete_world(world, row=offline_row(world)) is True
     assert es._concrete_indices(world) == [] and es._alias_targets(world) == []
     assert es.count(world) is None
 
 
-def test_reconcile_keeps_generation_indices_of_a_registered_world(monkeypatch):
-    """世代付きの物理索引は、エイリアス名（登録 world の索引名）で所有者を判定して残す。ほかの索引は消さない（ES は共有しうるので一覧と削除は差し替える）。"""
+def test_delete_orphan_removes_the_alias_and_every_physical_index_of_the_orphan(env):
+    """孤児の索引はエイリアス名ごと、世代付きの物理索引も全部消える。別の索引は消さない。"""
+    world, st = env
+    st["texts"] = {"a.md": "orph21 本文"}
+    es.index_world(world, content_sig="s1", row=offline_row(world))
+    es._req("PUT", f"/{es._index(world)}-g2", {})
+    other = "alias-rebuild-other-" + world[-6:]
+    es._req("PUT", "/" + es._index(other), {})
+    try:
+        assert es._index(world) in es.orphan_indices([])
+        es.delete_orphan(es._index(world), row=offline_row(es._index(world), kind="cleanup"))
+        assert es._concrete_indices(world) == []
+        assert es._concrete_indices(other) == [es._index(other)]
+    finally:
+        es._req("DELETE", "/" + es._index(other))
+
+
+def test_orphan_indices_keep_generation_indices_of_a_registered_world(monkeypatch):
+    """世代付きの物理索引は、エイリアス名（登録 world の索引名）で所有者を判定して残す。ほかの索引は孤児としてエイリアス名で返し、一覧では消さない。"""
     alias = es._index("registered")
     stray = "sherpa-kb-orphan-0123456789-g5"
     monkeypatch.setattr(es, "list_kb_indices", lambda: [alias + "-g1700000000000", alias, stray])
     sent = []
     monkeypatch.setattr(es, "_req", lambda method, path, body=None, **kw: sent.append((method, path)) or {})
-    assert es.reconcile(["registered"]) == [stray]
-    assert sent == [("DELETE", "/" + stray)]
+    assert es.orphan_indices(["registered"]) == ["sherpa-kb-orphan-0123456789"]
+    assert sent == []

@@ -17,6 +17,7 @@ from openpyxl.styles import PatternFill
 from sherpa.ingest import context_ir, evidence_render, evidence_spike, excel_display, office_md
 from sherpa.ingest.arms import ooxml_arm
 from sherpa.ingest.ooxml import excel
+from tests._replace_row import offline_row
 
 _HEADER_FILL = PatternFill(fill_type="solid", fgColor="FFD9EAF7")
 
@@ -198,6 +199,47 @@ def test_plain_table_stays_one_record_per_row(tmp_path):
     assert "名称: 金額" in chunks[2]["body"]
 
 
+@pytest.mark.parametrize("rows,pairs", [
+    ([["タイムアウト", "30秒"], ["再試行回数", "3回"], ["接続先", "サーバーA"]],
+     [("タイムアウト", "30秒"), ("再試行回数", "3回"), ("接続先", "サーバーA")]),
+    ([["桁数", "10桁"], ["区分", 2], ["備考", "任意"]],
+     [("桁数", "10桁"), ("区分", "2"), ("備考", "任意")]),
+], ids=["単位付きの値", "単位付きと数値"])
+def test_headerless_vertical_item_value_table_keeps_each_row_pair(tmp_path, rows, pairs):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for row in rows:
+        ws.append(row)
+    result = _render(_save(wb, tmp_path))
+    assert [rg.mode for rg in result.context.regions] == ["coordinate_fallback"]
+    assert result.context.regions[0].header_row is None
+    for label, value in pairs:
+        record = _chunk_with(result.chunks, label, value)
+        assert f"{label}: {value}" in record["body"]
+    bodies = "\n".join(c["body"] for c in result.chunks)
+    for label, _ in pairs:
+        for other, _ in pairs:
+            if other != label:
+                assert f"{label}: {other}" not in bodies
+    assert not _kinds(result.chunks, "table_record")
+
+
+@pytest.mark.parametrize("rows", [
+    [["項目", "1月", "2月"], ["売上", 100, 200]],
+    [["項目", "2025年度"], ["売上", 100], ["原価", 80]],
+    [["項目", "2025"], ["売上", 100], ["原価", 80]],
+    [["品名", "単価"], ["りんご", 100], ["みかん", 80]],
+], ids=["月の見出し", "年度の見出し", "年の見出し", "文字の見出し"])
+def test_header_led_tables_with_calendar_or_text_headers_stay_header_records(tmp_path, rows):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for row in rows:
+        ws.append(row)
+    result = _render(_save(wb, tmp_path))
+    assert [rg.mode for rg in result.context.regions] == ["header_record"]
+    assert result.context.regions[0].header_row == 1
+
+
 def _grid(rows, cols, values):
     grid = [[None] * cols for _ in range(rows)]
     for (r, c), v in values.items():
@@ -250,7 +292,7 @@ def test_rebuilt_derived_files_carry_joined_record_into_rag_md_and_chunks(tmp_pa
     ws["A2"], ws["C2"] = "顧客ID", "10桁"
     wb.save(world / "a.xlsx")
     derived = tmp_path / "derived"
-    office_md.build_derived(world, derived)
+    office_md.build_derived(world, derived, row=offline_row("w"))
     rag_md = (tmp_path / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8")
     assert "項目名: 「顧客ID」\n\n説明: 「10桁」" in rag_md
     import gzip

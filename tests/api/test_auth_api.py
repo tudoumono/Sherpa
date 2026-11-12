@@ -448,3 +448,35 @@ def test_recipient_regains_access_after_extending_expired_share():
     rec = [c for c in store.list_conversations(invitee) if c["id"] == wid][0]
     assert rec["share_status"] == "active" and rec["share_expires_at"] is not None
     assert len(store.get_conversation_for_read(invitee, wid)["messages"]) == 1
+
+
+def test_admin_user_ops_report_when_audit_cannot_be_recorded(monkeypatch):
+    """ユーザーの作成・変更は完了しても、操作記録を保存できなかったら応答で audit_recorded:false を返す。"""
+    sfx = _sfx()
+    adm_uid, adm_pw = _mk_admin(sfx)
+    adm_cookies = _cookies(adm_uid, adm_pw)
+    real_audit = store.audit
+
+    def _audit(actor, action, *a, **kw):
+        if action == "user.created":
+            raise RuntimeError("audit down")
+        return real_audit(actor, action, *a, **kw)
+
+    monkeypatch.setattr(store, "audit", _audit)
+    new_uid = f"noaud{sfx}"
+    register_test_uid(new_uid)
+    cr = client.post("/admin/users", cookies=adm_cookies,
+                     json={"uid": new_uid, "role": "user", "password": "pass1234"})
+    assert cr.status_code == 200, cr.text
+    assert cr.json()["audit_recorded"] is False
+
+    real_connect = store._connect
+
+    def _broken():
+        raise RuntimeError("audit batch down")
+
+    monkeypatch.setattr(store, "_connect", _broken)
+    pr = client.patch(f"/admin/users/{new_uid}", json={"role": "admin"}, cookies=adm_cookies)
+    monkeypatch.setattr(store, "_connect", real_connect)
+    assert pr.status_code == 200, pr.text
+    assert pr.json()["audit_recorded"] is False

@@ -1,0 +1,21 @@
+{
+  "counts": {
+    "edge_types": {
+      "CONTAINS": 3,
+      "INVOKES": 7
+    },
+    "edges": 10,
+    "flag_reasons": {
+      "dropped_syntax": 2,
+      "mention_ambiguous_names": 1,
+      "unresolved_qualifier": 1
+    },
+    "flags": 4,
+    "node_labels": {
+      "Module": 14
+    },
+    "nodes": 14
+  },
+  "sha256": "2d7718578f02b310e541c4e9878a18d736f24b326899bb7c006353393f758d14",
+  "world": "cs1"
+}

@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+import _image_builders
 from sherpa.ingest import evidence_spike
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -65,6 +66,8 @@ def _structurally_marked(el) -> bool:
         return True
     if el.extension.get("visibility_reason"):
         return True
+    if el.extension.get("format_state"):
+        return True
     if el.extension.get("covered_by_text"):
         return True
     if el.extension.get("occluded_by"):
@@ -90,20 +93,42 @@ def test_xlsx_very_hidden_sheet_is_marked():
     assert sheet.extension.get("visibility_reason") == "very_hidden"
 
 
-def test_xlsx_cell_covered_by_image_is_marked():
-    """不透明画像（`廃止スタンプ.png` 相当）でセルを覆うと、覆われたセル要素が hidden になる。"""
-    elements = _elements(_DEP_INPUTS / "DEP-XLSX-MARKERS.xlsx")
-    cell = _cell(elements, "対象", "B3")
+def test_xlsx_cell_covered_by_image_is_marked(tmp_path):
+    """不透明画像でセルを覆うと、覆われたセル要素が hidden になる（同梱のスタンプ画像は透過を含むため不透明の画像に差し替えた複製で確かめる）。"""
+    src = _DEP_INPUTS / "DEP-XLSX-MARKERS.xlsx"
+    if not src.is_file():
+        pytest.skip(f"fixture が無い環境: {src}")
+    opaque = _image_builders.replace_media(src, tmp_path / "opaque.xlsx", _image_builders.opaque_png())
+    cell = _cell(_elements(opaque), "対象", "B3")
     assert cell.visibility == "hidden"
     assert cell.extension.get("visibility_reason") == "occluded_by_picture"
 
 
-def test_xlsx_cell_covered_by_image_real_fixture():
-    """実データ（JPX-011.xlsx・廃止スタンプ画像でセルを覆う実例）でも同じことを確認する。"""
-    elements = _elements(_XLSX_JPX011)
-    cell = _cell(elements, "帳票項目", "B2")
+def test_xlsx_cell_covered_by_image_real_fixture(tmp_path):
+    """実データ（JPX-011.xlsx・廃止スタンプ画像でセルを覆う実例）も、画像が不透明なら同じく hidden になる。"""
+    if not _XLSX_JPX011.is_file():
+        pytest.skip(f"fixture が無い環境: {_XLSX_JPX011}")
+    opaque = _image_builders.replace_media(_XLSX_JPX011, tmp_path / "opaque.xlsx", _image_builders.opaque_png())
+    cell = _cell(_elements(opaque), "帳票項目", "B2")
     assert cell.visibility == "hidden"
     assert cell.extension.get("visibility_reason") == "occluded_by_picture"
+
+
+@pytest.mark.parametrize("path,sheet,address", [
+    (_DEP_INPUTS / "DEP-XLSX-MARKERS.xlsx", "対象", "B3"),
+    (_XLSX_JPX011, "帳票項目", "B2"),
+])
+def test_xlsx_cell_under_transparent_stamp_is_not_hidden_but_keeps_the_cover(path, sheet, address):
+    """同梱のスタンプ画像は透過を含む画素があるため、セルは hidden にならず、重なりと covers（transparent_png）が残る。"""
+    if not path.is_file():
+        pytest.skip(f"fixture が無い環境: {path}")
+    ir = evidence_spike.extract(path)
+    cell = _cell(ir.elements, sheet, address)
+    assert cell.visibility == "visible"
+    assert not cell.extension.get("visibility_reason")
+    covers = [r for r in ir.relations if r.type == "covers" and r.target_id == cell.element_id]
+    assert [(r.extension["fill"], r.extension["occlusion"]) for r in covers] == [("transparent_png", "undetermined")]
+    assert any(r.type == "overlaps" and r.target_id == cell.element_id for r in ir.relations)
 
 
 def test_xlsx_strikethrough_cell_is_marked():

@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .. import agentic_search, answer_shape, layer as layer_mod
 from .. import simple_chat
-from .base import Ctx, Provider, _log_chat_usage, _node, _usage_meta
+from .base import Ctx, Provider, _answer_partial, _log_chat_usage, _node, _usage_meta
 
 LABEL = "簡易（検索して答える）"
 GUIDANCE = "網羅性・確証が要る質問は「Codex 調査」へ。"
@@ -58,6 +58,7 @@ class SimpleProvider(Provider):
         state = simple_chat.LoopState()
         t0 = time.monotonic()
         failure: str | None = None
+        no_tools = False
         try:
             for ev in simple_chat.iter_tool_loop(
                     state, provider=self.provider_id, model=self.model, endpoint=self._endpoint,
@@ -65,6 +66,10 @@ class SimpleProvider(Provider):
                     query=ctx.message, world=ctx.world, scope_paths=scope_paths,
                     history=self._history, stop_event=ctx.stop_event, extra_context=extra,
                     availability=ctx.tools_availability, layer=scope_meta.get("layer")):
+                if ev["phase"] == "text":
+                    if (partial := _answer_partial(ev["text"])):
+                        yield partial
+                    continue
                 nid = f"simple-{state.tool_calls_used + (1 if ev['phase'] == 'start' else 0)}"
                 label = _TOOL_LABELS.get(ev["name"], ev["name"])
                 if ev["phase"] == "start":
@@ -76,6 +81,7 @@ class SimpleProvider(Provider):
         except (simple_chat.LLMUnavailable, simple_chat.AnswerTimeout) as e:
             from .. import stop_kind as stop_kind_mod
             failure = stop_kind_mod.from_exception(e) or "error"
+            no_tools = isinstance(e, simple_chat.ModelLacksTools)
         finally:
             usage = (_usage_meta(self.provider_id, self.model,
                                  **(agentic_search._usage_or_none(state.usage_acc) or {}),
@@ -84,9 +90,20 @@ class SimpleProvider(Provider):
 
         if state.stopped or (ctx.stop_event is not None and ctx.stop_event.is_set()):
             return  # 停止時は `_result` を出さない
+        if failure is None and not state.hit_round_trip_limit and not (state.final_text or "").strip():
+            msg = simple_chat.EMPTY_ANSWER_MESSAGE
+            yield from self._finish(ctx, msg, [], None, "回答本文を受け取れません",
+                                    usage=usage, failure="error", elapsed=time.monotonic() - t0)
+            return
         if failure is not None:
-            msg = f"{LABEL} の AI に接続できませんでした。管理者に設定を確認してください。"
-            yield from self._finish(ctx, msg, [], None, "AI に接続できません",
+            if no_tools:
+                msg = (f"{LABEL} のモデルが道具の呼び出しに対応していません。"
+                       "管理者に「使えるモデル」の設定を確認してください。")
+                head = "モデルが道具の呼び出しに対応していません"
+            else:
+                msg = f"{LABEL} の AI に接続できませんでした。管理者に設定を確認してください。"
+                head = "AI に接続できません"
+            yield from self._finish(ctx, msg, [], None, head,
                                     usage=usage, failure=failure, elapsed=time.monotonic() - t0)
             return
 

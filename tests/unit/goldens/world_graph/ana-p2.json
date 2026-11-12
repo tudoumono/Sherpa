@@ -1,0 +1,19 @@
+{
+  "counts": {
+    "edge_types": {
+      "INVOKES": 40
+    },
+    "edges": 40,
+    "flag_reasons": {
+      "ambiguous": 2,
+      "unresolved": 4
+    },
+    "flags": 6,
+    "node_labels": {
+      "Module": 32
+    },
+    "nodes": 32
+  },
+  "sha256": "2f298f7c446aeb8d58f083368890210d82141c57daa7ea983ed22c6101661837",
+  "world": "ana-p2"
+}

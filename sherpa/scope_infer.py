@@ -3,10 +3,12 @@
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import os
 import stat as stat_mod
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .ingest import text_kind
@@ -14,6 +16,14 @@ from .ingest import text_kind
 
 class ScopeWalkDeadlineExceeded(Exception):
     """`safe_files(deadline=...)` が走査中に期限を超えたことを示す。"""
+
+
+USER_OP_WALK_SECONDS = 10.0  # 利用者の操作の中で、台帳が使えず資料フォルダを歩くときに許す秒数
+
+
+def user_op_deadline() -> float:
+    """利用者の操作の中の走査に付ける期限（`time.monotonic()` 系の絶対時刻）。"""
+    return time.monotonic() + USER_OP_WALK_SECONDS
 
 
 _DEADLINE_CHECK_ENTRIES = 256  # ディレクトリ内エントリ処理中に期限を再確認する間隔
@@ -47,6 +57,42 @@ def _lstat_kind(p: Path) -> str | None:
     return None
 
 
+def _still_plain_files(root: Path, listed, skip=None, *, strict: bool = False) -> list:
+    """使い回す列挙の各ファイルが、今も root の中の通常ファイルで、途中の階層も symlink でないものだけを返す。
+    strict なら読めない（lstat できない）ものは OSError を送出する。"""
+    out: list = []
+
+    def _skip(key: str) -> None:
+        if skip is not None:
+            skip(key)
+    dir_ok: dict = {"": True}
+
+    def _dir_plain(rel_dir: str) -> bool:
+        if rel_dir not in dir_ok:
+            parent = rel_dir.rpartition("/")[0]
+            try:
+                dir_ok[rel_dir] = _dir_plain(parent) and _lstat_kind(root / rel_dir) == "dir"
+            except OSError:
+                if strict:
+                    raise
+                dir_ok[rel_dir] = False
+        return dir_ok[rel_dir]
+
+    for path, rel in listed:
+        try:
+            kind = _lstat_kind(root / rel)
+        except OSError:
+            if strict:
+                raise
+            _skip("unreadable_file")
+            continue
+        if kind != "file" or not _dir_plain(rel.rpartition("/")[0]):
+            _skip("symlink" if kind == "symlink" else "unreadable_file")
+            continue
+        out.append((path, rel))
+    return out
+
+
 VCS_DIR_NAMES = frozenset({".svn", ".git", ".hg", ".bzr", "CVS"})  # 版管理の記録のフォルダ（取り込みの対象外）
 
 
@@ -73,15 +119,25 @@ def safe_files(root, *, strict: bool = False, deadline: float | None = None, als
     - `skipped`: 渡すと、走査で数えられなかったものの件数を `WALK_SKIPPED_KEYS` ごとに足す（`symlink`＝辿らなかったシンボリックリンク／
       `unreadable_dir`＝列挙できなかったフォルダ／`unreadable_file`＝種別・実体を取れなかったエントリ／`outside_root`＝root の外へ出る実体）。
       列挙の結果は変えない。名前は持たない（件数のみ）。
+    - `walk_reuse_scope()` の中で `reuse_walk()` が済んでいれば、同じ root の走査は歩かずその列挙を返す（`deadline` を渡す呼び出しは対象外）。
     """
     # `also` が実在するときだけ連結する（無ければ単一 root の走査のまま）。
     if also is not None and Path(also).is_dir():
         yield from safe_files(root, strict=strict, deadline=deadline, skipped=skipped)
         yield from safe_files(also, strict=strict, deadline=deadline, skipped=skipped)
         return
-    def _skip(key: str) -> None:
+    def _skip(key: str, n: int = 1) -> None:
         if skipped is not None:
-            skipped[key] = skipped.get(key, 0) + 1
+            skipped[key] = skipped.get(key, 0) + n
+
+    reuse = _walk_reuse.get()
+    if reuse is not None and reuse.snapshot is not None and deadline is None:
+        listed = reuse.snapshot.files_for(root, strict=strict, skip=_skip)
+        if listed is not None:
+            for key, n in reuse.snapshot.skipped.items():
+                _skip(key, n)
+            yield from listed
+            return
 
     root = Path(root)
     if deadline is not None and time.monotonic() > deadline:
@@ -162,32 +218,75 @@ class WalkSnapshot:
     """1 回の取り込みの中で共有する、登録フォルダ本体の `safe_files(root)`（非 strict）の列挙結果。
 
     `files`＝`(resolved_path, rel_posix)` の列（`safe_files` の出力と同じ並び）。`complete`＝読めなかったもの
-    （`unreadable_dir`/`unreadable_file`）が 1 件も無かった。取り込みをまたいで持ち越さない。
+    （`unreadable_dir`/`unreadable_file`）が 1 件も無かった。`skipped`＝数えなかったものの件数（`WALK_SKIPPED_KEYS` ごと）。
+    取り込みをまたいで持ち越さない。
     """
     root: Path
     files: list
     complete: bool
     walked: bool
+    skipped: dict = field(default_factory=dict)
+    root_resolved: Path | None = None   # 歩いたときの root の実体（後で root を差し替えられても、この実体でなければ使わない）
 
     @classmethod
     def from_walk(cls, root, files: list, skipped: dict) -> WalkSnapshot:
         root = Path(root)
         walked = root.is_dir() and not root.is_symlink()   # `safe_files` が実際に歩く root か
-        return cls(root=root, files=files, walked=walked,
+        try:
+            resolved = root.resolve()
+        except OSError:
+            resolved, walked = None, False
+        return cls(root=root, files=files, walked=walked, skipped=dict(skipped), root_resolved=resolved,
                    complete=not (skipped.get("unreadable_dir") or skipped.get("unreadable_file")))
 
-    def files_for(self, root, *, strict: bool = False) -> list | None:
-        """`root` を同じ規律で歩いた結果として使えるなら `files`、使えなければ None（呼び出し側が自分で歩く）。
+    def files_for(self, root, *, strict: bool = False, skip=None) -> list | None:
+        """`root` を同じ規律で歩いた結果として使えるなら `files`（今も通常ファイルのものだけ）、使えなければ None（呼び出し側が自分で歩く）。
 
         strict で歩く呼び出し元は、非 strict の走査で読めないものがあった（strict なら例外になったはずの）ときは使えない。
         """
         if not self.walked or (strict and not self.complete):
             return None
         try:
-            same = Path(root).resolve() == self.root.resolve()
+            same = (self.root_resolved is not None and _lstat_kind(self.root) == "dir"
+                    and self.root.resolve() == self.root_resolved and Path(root).resolve() == self.root_resolved)
         except OSError:
             return None
-        return self.files if same else None
+        return _still_plain_files(self.root, self.files, skip, strict=strict) if same else None
+
+
+class _WalkReuse:
+    snapshot: WalkSnapshot | None = None
+
+
+_walk_reuse: contextvars.ContextVar[_WalkReuse | None] = contextvars.ContextVar("sherpa_walk_reuse", default=None)
+
+
+@contextlib.contextmanager
+def walk_reuse_scope():
+    """取り込み 1 回の範囲。この中で `reuse_walk()` に渡した列挙を、同じ root の `safe_files` が歩き直さずに使う。範囲を出れば元に戻る。"""
+    token = _walk_reuse.set(_WalkReuse())
+    try:
+        yield
+    finally:
+        _walk_reuse.reset(token)
+
+
+@contextlib.contextmanager
+def fresh_walk_scope():
+    """この中の `safe_files` は、取り込みの冒頭の列挙を使い回さず木を歩き直す。範囲を出れば元に戻る。"""
+    token = _walk_reuse.set(None)
+    try:
+        yield
+    finally:
+        _walk_reuse.reset(token)
+
+
+def reuse_walk(snapshot: WalkSnapshot | None) -> None:
+    """今の `walk_reuse_scope()` に、取り込みの冒頭で歩いた登録フォルダ本体の列挙を渡す。範囲の外では何もしない。
+    列挙の後に原本が変わっても、その回は冒頭の列挙のまま進む（変わった分は次の取り込みの走査で拾う）。"""
+    reuse = _walk_reuse.get()
+    if reuse is not None:
+        reuse.snapshot = snapshot
 
 
 def unique_index(items, keyfn):

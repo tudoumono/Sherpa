@@ -1,7 +1,7 @@
 # Sherpa MVP — 起動・運用タスク
 #
 # `make` だけを打つと、下の一覧（help）が出ます。
-.PHONY: help embed-cache-migrate hooks dev-setup start stop restart restart-web restart-worker status check-ports up down ps logs l bootstrap install-docker ocr-models \
+.PHONY: help embed-cache-migrate graph-reset-for-downgrade hooks dev-setup start stop restart restart-web restart-worker status ingest-status check-ports up down ps logs l bootstrap install-docker ocr-models ocr-retry \
         api serve ingest-worker prod-check verify-kit verify-extension dist package-full package-app nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e \
         test-db-reset screenshots backup restore usage-backfill trace azure-smoke codex-compat doctor sandbox-check \
@@ -54,13 +54,13 @@ dev-setup:         ## 新しい貢献者向け: venv＋開発依存＋git フッ
 
 ifeq ($(LOGS_WORDS),)
 help:             ## このコマンド一覧を表示
-	@echo "Sherpa — make の使い方"
+	@echo "Slouch — make の使い方"
 	@echo
 	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) \
 		| sed -E 's/^([a-zA-Z0-9_-]+):[^#]*## /  \1|/' \
 		| awk -F'|' '{printf "  %-18s %s\n", $$1, $$2}'
 	@echo
-	@echo "  よく使う順: make start → make status → make stop"
+	@echo "  よく使う順: make start → make status → make ingest-status → make stop"
 endif
 
 start:            ## 利用者向け: 依存/ストア/アプリを一括起動（LAN=1 で LAN 公開・MODE=dev で開発モード）
@@ -73,16 +73,19 @@ restart:          ## 利用者向け: アプリ・取り込みワーカー（＋
 	KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
 	LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
-restart-web:      ## 利用者向け: アプリ（Web）だけ再起動（取り込みワーカーは止めない＝取り込みは続く。版を変えたときは make restart で両方）
+restart-web:      ## 利用者向け: アプリ（Web）だけ再起動（取り込みワーカーは止めない＝取り込みは続く。動いているストアは作り直さない。版を変えたときは make restart で両方）
 	STOP_ONLY=app KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
-	LAN="$(LAN)" ./scripts/start.sh $(MODE)
+	SHERPA_KEEP_RUNNING_STORES=1 LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
 restart-worker:   ## 利用者向け: 取り込みワーカーだけ再起動（アプリは止めない。処理中の 1 件の完了を待つ。FORCE=1 で待たずに強制終了）
 	STOP_ONLY=worker KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
 	LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
-status:           ## 利用者向け: 一枚看板の状態表示（ストア/アプリ/Caddy/URL）
+status:           ## 利用者向け: サーバーの状態（ストア/アプリ/ワーカー/Caddy/OCR/メモリ）
 	./scripts/status.sh
+
+ingest-status:    ## 利用者向け: 資料フォルダごとの取り込みと画像内文字の読み取りの状態
+	./scripts/ingest_status.sh
 
 check-ports:      ## ポートの整合（compose 公開⇔アプリ接続先）と占有（他プロセス）を検査
 	./scripts/check-ports.sh
@@ -109,8 +112,11 @@ up:                ## ストア起動（Postgres/Neo4j/ES）＋ OCR ワーカー
 	@bash -c '. scripts/run-common.sh && sherpa_compose up -d'
 	@./scripts/ocr-up.sh
 
-ocr-models:        ## OCR のモデルを取得（約134MB・閉域へはこのフォルダを丸ごとコピー）
+ocr-models:        ## OCR のモデルを取得（medium・small・mobile の全部・約190MB・閉域へはこのフォルダを丸ごとコピー）
 	./scripts/fetch_ocr_models.sh
+
+ocr-retry:         ## 失敗した OCR の仕事を積み直す（make ocr-retry [REASON=oom,timeout] [WORLD=<資料フォルダ>] [YES=1]・既定は対象の件数を出して yes を待つ・実行中と待ち中のものは触らない）
+	REASON="$(REASON)" WORLD="$(WORLD)" YES="$(YES)" ./scripts/ocr-retry.sh
 
 notice:            ## 帰属表示（NOTICE）・ライセンス全文・SBOM を生成（dist/notice/）
 	$(PY) scripts/gen_notice.py
@@ -167,6 +173,7 @@ test: test-unit test-api test-contract test-integration  ## 単体＋API＋契�
 # --- 開発ハーネスのゲート（段階表は docs/20-開発ハーネス.md §5） ------------------------------
 
 gate-slice:         ## 変更ファイルから該当テストを自動選択して実行（BASE=<ref> 既定 main）
+	$(PY) scripts/check_sizes.py
 	$(PY) scripts/gate_slice.py --base $(BASE)
 
 # set -euo pipefail を使う target の shell。bash の場所は OS で違う（macOS は /bin/bash）ので PATH から解決する。
@@ -175,6 +182,7 @@ gate-merge: SHELL := $(BASH_BIN)
 gate-merge:         ## マージ前ゲート（単体全件+契約＋変更領域の必須スイート。BASE=<ref> 既定 main）
 	set -euo pipefail; \
 	. scripts/lib/gate_budget.sh; \
+	$(PY) scripts/check_sizes.py ; \
 	ruff check . ; \
 	gate_run_unit_contract_budgeted "$(PY)" ; \
 	areas_out=$$($(PY) scripts/gate_slice.py --base $(BASE) --areas-only) ; \
@@ -200,6 +208,7 @@ gate-ci: SHELL := $(BASH_BIN)
 gate-ci:            ## CI用（ruff+単体全件+契約・予算チェック込み・Postgres serviceのみ前提）
 	set -euo pipefail; \
 	. scripts/lib/gate_budget.sh; \
+	$(PY) scripts/check_sizes.py ; \
 	ruff check . ; \
 	gate_run_unit_contract_budgeted "$(PY)"
 
@@ -226,6 +235,9 @@ serve:             ## FastAPI 起動（本番・fixtures 非参照。SHERPA_ENV=
 
 embed-cache-migrate: ## 埋め込みキャッシュを新しい形式（約 1/2〜1/5 の大きさ）へ手で写し替える（資料フォルダごとに前後の大きさを 1 行ずつ出す。取り込み中の資料フォルダは見送る。WORLD=<名前> で 1 つに絞る・空きが足りないときの最後の手段 DROP=1 は古いキャッシュを消すだけ＝次の取り込みで埋め込み API を呼び直す）
 	WORLD="$(WORLD)" DROP="$(DROP)" MODE="$(MODE)" PYTHON_BIN="$(if $(filter .venv/bin/python,$(PY)),$(abspath $(PY)),$(if $(findstring /,$(PY)),$(PY),))" ./scripts/embed-cache-migrate.sh
+
+graph-reset-for-downgrade: ## 世代で絞らない旧版へ戻す前に流す。全部の資料フォルダのグラフ（Entity）と世代の印（SherpaMeta）を消す（確認の y 入力あり・旧版の次の取り込みでグラフを作り直す）
+	PYTHON_BIN="$(if $(filter .venv/bin/python,$(PY)),$(abspath $(PY)),$(if $(findstring /,$(PY)),$(PY),))" ./scripts/graph-reset-for-downgrade.sh
 
 ingest-worker:     ## 取り込みワーカーを前面で起動（MODE=dev で開発モード・既定 serve）。api／serve の前面起動のときは、取り込みを進めるためにこれも別の端末で動かす（make start は両方を起動する）
 	./scripts/run-ingest-worker.sh $(if $(filter dev,$(MODE)),dev,serve)

@@ -12,11 +12,18 @@ import pathlib
 import tempfile
 import zipfile
 
+import _image_builders
 from sherpa.ingest import office_md
 
 _NS = (
     'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
-    'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"'
+    'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+)
+_IMAGE_RELS = (
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+    'Target="../media/image9.png"/></Relationships>'
 )
 
 # 基準テキスト shape: (0,0) - (4000000, 2000000) EMU
@@ -47,7 +54,7 @@ def _sp_solid_fill(x, y, cx, cy, rot: str | None = None, no_fill: bool = False) 
     fill = "<a:noFill/>" if no_fill else "<a:solidFill><a:srgbClr val=\"FFFFFF\"/></a:solidFill>"
     xfrm = f'<a:xfrm{rot_attr}><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
     return f"""<p:sp>
-  <p:spPr>{xfrm}{fill}</p:spPr>
+  <p:spPr>{xfrm}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>{fill}</p:spPr>
  </p:sp>"""
 
 
@@ -64,6 +71,7 @@ def _pic(x, y, cx, cy, rot: str | None = None) -> str:
     rot_attr = f' rot="{rot}"' if rot is not None else ""
     xfrm = f'<a:xfrm{rot_attr}><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
     return f"""<p:pic>
+  <p:blipFill><a:blip r:embed="rId9"/></p:blipFill>
   <p:spPr>{xfrm}</p:spPr>
  </p:pic>"""
 
@@ -80,7 +88,11 @@ def _slide_xml(shapes: str) -> str:
 def _md_for_slide(shapes: str) -> str:
     d = tempfile.mkdtemp()
     p = pathlib.Path(d) / "a.pptx"
-    _zip(p, {"ppt/slides/slide1.xml": _slide_xml(shapes)})
+    _zip(p, {
+        "ppt/slides/slide1.xml": _slide_xml(shapes),
+        "ppt/slides/_rels/slide1.xml.rels": _IMAGE_RELS,
+        "ppt/media/image9.png": _image_builders.opaque_png(),     # `_pic` の不透明な画像
+    })
     md = office_md.to_markdown(p)
     assert md is not None
     return md
@@ -160,19 +172,44 @@ def test_missing_xfrm_text_extracted_no_marker():
     assert "xfrmなしH" in md
 
 
-def test_broken_xml_falls_back_to_flat_extraction():
-    """壊れたXML → 例外にせず現行と同じフラット抽出にフォールバック（テキストは失われない）。"""
+def test_shape_walk_failure_keeps_flat_text_and_says_so(monkeypatch, caplog):
+    """図形の歩行が失敗したスライドは、平らな文字で残して注記を出し、来歴の数と警告ログに載せる（他のスライドは歩行のまま）。"""
+    from sherpa.ingest import pptx_flat
+    from sherpa.ingest.arms.ooxml_arm import OoxmlArm
+
     d = tempfile.mkdtemp()
     p = pathlib.Path(d) / "a.pptx"
-    broken = f"""<?xml version="1.0"?>
+    slide = f"""<?xml version="1.0"?>
 <p:sld {_NS}>
- <p:cSld><p:spTree><a:t>壊れていても拾えるテキストI</a:t></p:spTree></p:cSld>
+ <p:cSld><p:spTree><a:t>失敗しても文字は残る本文I</a:t></p:spTree></p:cSld>
 </p:sld>"""
-    _zip(p, {"ppt/slides/slide1.xml": broken})
-    md = office_md.to_markdown(p)
+    _zip(p, {"ppt/slides/slide1.xml": slide})
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("shape walk failed")
+
+    monkeypatch.setattr(office_md, "_pptx_slide_texts_by_shape", _boom)
+    with caplog.at_level("WARNING"):
+        md = office_md.to_markdown(p)
     assert md is not None
-    assert "壊れていても拾えるテキストI" in md
-    assert office_md._HIDDEN_MARKER not in md
+    assert "失敗しても文字は残る本文I" in md
+    assert md.count(pptx_flat.FLAT_NOTE) == 1
+    assert "取り消し線・重なりを読み取れていません" in md
+    assert any("a.pptx" in r.getMessage() and "スライド 1" in r.getMessage() and "RuntimeError" in r.getMessage()
+               for r in caplog.records)
+    assert OoxmlArm().convert(p).notes[:1] == ["pptx_flat_slides=1"]
+
+
+def test_provenance_summary_reports_flat_slides(tmp_path):
+    """来歴の notes にある平らに読んだスライドの数を、資料の画面向けの要約に載せる。"""
+    from sherpa import corpus_docs
+
+    md = tmp_path / "a.pptx.md"
+    (tmp_path / "a.pptx.md.meta.json").write_text(
+        '{"method": "ooxml", "confidence": 1.0, "notes": ["pptx_flat_slides=2"]}', encoding="utf-8")
+    assert corpus_docs.provenance_summary(md)["pptx_flat_slides"] == 2
+    (tmp_path / "a.pptx.md.meta.json").write_text('{"method": "ooxml", "notes": []}', encoding="utf-8")
+    assert "pptx_flat_slides" not in corpus_docs.provenance_summary(md)
 
 
 def test_pic_occluder_hides_text():

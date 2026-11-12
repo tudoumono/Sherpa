@@ -61,6 +61,12 @@ def env_default_enabled() -> bool:
     return _DEFAULT_ON == "on"
 
 
+def admin_view(sysset: dict) -> dict:
+    """管理画面（GET /admin/settings）の `rag_llm_render`。`configured` は生値（未設定=None＝既定に従う）、`default` は未設定に戻したときの実効（コード既定）。"""
+    return {"configured": sysset.get("rag_llm_render"), "effective": rag_llm_render_enabled(),
+            "default": env_default_enabled(), "options": ["on", "off"]}
+
+
 # ---- LLM 設定解決 ---------------------------------------------------------------------------
 
 def available(settings: dict | None = None) -> dict | None:
@@ -343,7 +349,18 @@ class RunResult:
         self.model: str | None = None
 
 
-def run_world_pass(world: str, *, settings: dict | None = None, should_stop=None) -> RunResult:
+def prepare(world: str, settings: dict | None = None) -> dict | None:
+    """書き換えを始めてよいか（トグル ON・LLM 接続済み・`rag` 層がある）。始めてよければ LLM の設定、でなければ None。"""
+    if not rag_llm_render_enabled():
+        return None
+    cfg = available(settings)
+    if not cfg or not worlds.derived_rag_dir(world).exists():
+        return None
+    return cfg
+
+
+def run_world_pass(world: str, *, settings: dict | None = None, should_stop=None, cfg: dict | None = None,
+                   row=None) -> RunResult:
     """資料フォルダ配下の未成形（`生成手段: 規則`）な `.rag.md` を LLM 成形する（背景処理の本体）。
 
     トグル OFF／LLM 未接続ならファイル I/O なしで即 return する。`should_stop()` が真なら次の文書へ進まずに止める（取り込みの依頼が待っているとき・停止要求のとき）。
@@ -355,16 +372,12 @@ def run_world_pass(world: str, *, settings: dict | None = None, should_stop=None
        `kind='rag_render'` の集約1行を記録する（`user_id` は付けない）。
     """
     result = RunResult()
-    if not rag_llm_render_enabled():
-        return result
-    cfg = available(settings)
+    cfg = cfg or prepare(world, settings)
     if not cfg:
         return result
     result.provider = cfg.get("provider")
     result.model = cfg.get("model")
     rag_dir = worlds.derived_rag_dir(world)
-    if not rag_dir.exists():
-        return result
     from .. import metering, store
     from . import office_md
     saved_sig = (store.get_world(world) or {}).get("last_sig")

@@ -90,6 +90,7 @@
 - 敵対 RV の前提3点（閉域LAN・最大20人・単一worker）・指摘の3分類（契約違反/データ破壊/セキュリティ＝採用・
   エッジは受容記録が既定・改善案は却下）。
 - テスト規範（要約）: 新規は実害の再現に限る・モックは外部境界だけ・単体テスト全件は壁時計上限あり。
+  是正ごとは関係する試験だけ（`make gate-slice`）、全件は RV クローズ後の最終コミットで1回。
 - 2エージェント同一チェックアウト禁止＝**worktree 分離**。Agent の worktree は `origin/main` 基点＝`make hooks`
   の post-checkout でローカル main へ揃える（レーン指示でも `git merge-base main HEAD` を確認）。詳細は 20 を参照。
 
@@ -110,6 +111,8 @@
   `metering.enabled()`）・**`SHERPA_EXEC_EVENT_V2`**（v1 平坦ログへの退避分岐）・
   **`SHERPA_AGENTIC_EVIDENCE_VERIFY`**（機械検証の明示 OFF 退避口）
   （TOGGLE-RM・2026-09-03＝実益のない切替の概念ごと撤去・常時ON化）・
+  **調査の方式 B（`plan_gate`・Sherpa が final ごとに受理を決める計画書方式）と方式の切り替え `SHERPA_LEDGER_STYLE`・
+  評価専用の `SHERPA_LEDGER_GATE_DRYRUN`・注記 `target_unresolved`**（2026-11-06＝C-check に固定・A の JSON 台帳は素の Codex 等の道で残る）・
   **意味層 LLM 抽出（`graph_extract.extract_world`/l_extract）・`concept_propose`/`auto_bridge`/`concepts.json`・
   `REALIZES`・概念ラベル7種（`Parameter`/`BusinessRule`/`Function`/`Screen`/`Report`/`Standard`/`Incident`）と
   概念エッジ7種（`USES`/`REFERENCES`/`IMPLEMENTED_BY`/`PRODUCED_BY`/`CONFORMS_TO`/`RELATES_TO`/`REALIZES`）・

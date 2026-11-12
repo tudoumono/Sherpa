@@ -306,9 +306,6 @@ def check_provider_turn(*, auth_header: str, api_version: str, label_suffix: str
                     world="v1",
                     route=lambda msg: {"lens": "qa", "input": msg, "reason": "codex-compat",
                                       "confident": True},
-                    dispatch=lambda lens_, inp: {
-                        "lens": lens_, "headline": "dispatch-headline",
-                        "summary": {"total": 0}, "data": {}, "sources": []},
                     knowledge=True, uid="codex-compat", conversation_id=None,
                 )
                 events = list(prov.run(ctx))

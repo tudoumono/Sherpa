@@ -1,13 +1,14 @@
 """思考プロバイダの共通基盤。
 
-`Ctx`（プロバイダへ渡す文脈）・`_node`/`_gather`（共通の前段＝理解→意図→実ツール取得）・`_plain_run`（ナレッジ参照オフの素の会話）・
-`_usage_meta`（usage メタの標準形）・`Provider`（頭脳の抽象基底）・`_TOOLS`/`_LENS_INTENT`・`_log` と、
+`Ctx`（プロバイダへ渡す文脈）・`_node`/`_gather`（共通の前段＝理解→意図の特定）・`_plain_run`（ナレッジ参照オフの素の会話）・
+`_usage_meta`（usage メタの標準形）・`Provider`（頭脳の抽象基底）・`_LENS_INTENT`・`_log` と、
 Codex 経路が使う証拠種別の判定（`_scope_evidence_kinds` 等）を集約する。
 `_gather` は `from sherpa import agents as _facade` で実行時解決して呼ぶ（`sherpa.agents` の差し替えを効かせるため）。
 設計: docs/design/chat.md「文脈と構成」
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading  # noqa: F401 -- Ctx.stop_event の型注釈（文字列 forward-ref）で参照（元コードのまま）
 import time
@@ -21,14 +22,9 @@ _log = logging.getLogger("sherpa")
 # Codex CLI 実行の専用ログ（`data/run/codex.log`）。実行1回につき開始/終了2行だけを INFO で書く（本文・資料名は書かない）。
 _log_codex = logging.getLogger("sherpa.codex")
 
-# レンズ→使うツールのノード（troubleshoot は2つ）。author は qa と同じ「文書を検索」。
-_TOOLS = {
-    "investigate": [("tool-docs", "文書を検索")],
-    "impact": [("tool-graph", "関係グラフを照会")],
-    "qa": [("tool-docs", "文書を検索")],
-    "troubleshoot": [("tool-graph", "関連を確認"), ("tool-docs", "運用手順を検索")],
-    "author": [("tool-docs", "文書を検索")],
-}
+# Codex CLI が見つからないときの案内（選択時の未接続と、実行直前に消えたときで同じ文言を使う）。
+CODEX_CLI_MISSING_HOWTO = "Codex CLI が見つかりません（閉域キットの tools/codex か npm で導入）"
+
 _LENS_INTENT = {"investigate": "資料とソースを調べます", "impact": "変更の影響をたどります", "troubleshoot": "原因の手がかりを集めます",
                 "qa": "仕様の記述を探します", "author": "作成の根拠を集めます"}
 
@@ -39,7 +35,6 @@ class Ctx:
     message: str
     world: str
     route: Callable[[str], dict]  # message -> {"lens","input","reason"}
-    dispatch: Callable[[str, str], dict]  # (lens, input) -> answer envelope（出典つき）
     pace: float = 0.0
     knowledge: bool = True  # False＝ナレッジ参照オフ＝検索せず素の会話
     scope_meta: dict | None = None  # 参照中の範囲（world/scope_paths/source）
@@ -71,15 +66,27 @@ def _node(id, kind, label, detail, status):
     return {"type": "node", "id": id, "kind": kind, "label": label, "detail": detail, "status": status}
 
 
+def _answer_partial(text):
+    """回答の途中の本文のイベント（実行の記録 `chat_run_journal` が受け取る。画面へは流れない）。
+    構造化出力（JSON）の本文は answer 欄だけを取り出す。空・読めない JSON は None。
+    """
+    text = (text or "").strip()
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            return None
+        text = str(obj.get("answer") or "").strip() if isinstance(obj, dict) else ""
+    return {"type": "answer_partial", "text": text} if text else None
+
+
             # 今回の呼び出しが不正なら `set_claims` は state.claims を変更しない（既存分を維持）。
     # `_remapped` が空でも既存分を維持する。
 
 
-def _gather(ctx: Ctx, *, skip_presearch_lenses: frozenset = frozenset()):
-    """共通の前段（理解→意図→実ツール取得）を node として流し、最後に `_env` を返す。
-    取得（Neo4j/grep）は全プロバイダ共通。
-    `ctx.dispatch` が実行不能と判定すると env に `_tools_blocked=True` が載る。pop して "done" ノードの文言を「使う検索が無効です」に切り替える。
-    `skip_presearch_lenses`（MCP 付き Codex 経路専用）に入るレンズは下調べを行わず、`agentic_failure="error"` 付きの最小 env を返す（`_NO_PRESEARCH_HEADLINE`）。
+def _gather(ctx: Ctx):
+    """共通の前段（理解→意図）を node として流し、最後に `_env` を返す。
+    調べる作業は Codex が道具で行うため、ここでは検索せず、`agentic_failure="error"` 付きの最小 env（`_NO_PRESEARCH_HEADLINE`）を返す。Codex が回答できれば上書きされる。
     """
     def pace():
         if ctx.pace:
@@ -99,24 +106,10 @@ def _gather(ctx: Ctx, *, skip_presearch_lenses: frozenset = frozenset()):
     pace()
     yield _node("intent", "think", "意図を特定", _LENS_INTENT.get(lens, ""), "done")
 
-    if lens in skip_presearch_lenses:
-        env = {"lens": lens, "headline": _NO_PRESEARCH_HEADLINE, "summary": {"total": 0},
-              "data": {}, "sources": [],
-              "agentic_failure": "error",  # 未実行のターン＝終了理由の分布で完了扱いにしない
-              "scope": layer_mod.scope_with_layer(ctx.scope_meta, world=ctx.world, lens=lens)}
-        yield {"type": "_env", "decision": decision, "env": env}
-        return
-
-    tools = _TOOLS.get(lens, [])
-    for tid, tlabel in tools:
-        yield _node(tid, "tool", tlabel, "照会しています", "active")
-    env = ctx.dispatch(lens, decision["input"])
-    blocked = env.pop("_tools_blocked", False)  # 使う検索が全て OFF/不達で未実行
-    total = env.get("summary", {}).get("total", 0)
-    for tid, tlabel in tools:
-        pace()
-        detail = "使う検索が無効です（詳細で ON にしてください）" if blocked else f"{total}件を確認"
-        yield _node(tid, "tool", tlabel, detail, "done")
+    env = {"lens": lens, "headline": _NO_PRESEARCH_HEADLINE, "summary": {"total": 0},
+          "data": {}, "sources": [],
+          "agentic_failure": "error",  # 未実行のターン＝終了理由の分布で完了扱いにしない
+          "scope": layer_mod.scope_with_layer(ctx.scope_meta, world=ctx.world, lens=lens)}
     yield {"type": "_env", "decision": decision, "env": env}
 
 
@@ -263,9 +256,10 @@ def _scope_kinds_cache_key(world: str, scope_paths, layer) -> tuple:
 def _scope_evidence_kinds(world: str, scope_paths, layer, *,
                           deadline: float | None = None) -> tuple[set, set] | None:
     """このターンの範囲に実在する根拠種別と、そのうち探す対象（層）で読める種別の2つ組 `(範囲内, 層内)`。
-    範囲は world root の実ファイル走査（`scope_infer.safe_files`）と同じ範囲・層フィルタで列挙する（台帳は Office 原本を派生MDが無いと載せないため使わない）。
-    走査失敗・期限超過は `None`（判定不能として必須種別を落とさない）。結果は `(world, 範囲, 層)` 単位で `_SCOPE_KINDS_CACHE_SECONDS` 秒だけ保持する。
+    文書は取り込みの台帳から列挙する（資料フォルダは歩かない。派生MDの無い Office 原本は台帳に載らない＝検索・精読できないので数えない）。
+    台帳が空・読めないときだけ `scope_infer.safe_files` で歩く。走査失敗・期限超過は `None`（判定不能として必須種別を落とさない）。結果は `(world, 範囲, 層)` 単位で `_SCOPE_KINDS_CACHE_SECONDS` 秒だけ保持する。
     """
+    from .. import doc_ledger
     from .. import investigation_state as _inv
     from .. import scope as scope_mod
     from .. import scope_infer as si
@@ -280,24 +274,27 @@ def _scope_evidence_kinds(world: str, scope_paths, layer, *,
             _hit = None
     if _hit is not None:
         return _hit[1]
-    if deadline is None:
-        deadline = time.monotonic() + _SCOPE_KINDS_WALK_SECONDS
-    wd = worlds.world_dir(world)
-    if not wd:
-        _log.warning("範囲内の根拠種別を判定できませんでした（world root 不明・必須種別はそのまま適用します）")
-        return None
-    try:
-        entries = list(si.safe_files(wd, deadline=deadline, also=worlds.archives_dir(world)))
-    except Exception:
-        _log.warning("範囲内の根拠種別を判定できませんでした（必須種別はそのまま適用します）",
-                     exc_info=True)
-        return None
-    if not entries:
-        # 0 件は root 解決失敗・マウント切断でも起こるため、必須種別を全部「該当なし」へ倒さない。
-        _log.warning("範囲内の文書を1件も列挙できませんでした（必須種別はそのまま適用します）")
-        return None
+    rels = doc_ledger.ledger_rels(world)  # 取り込みの台帳があれば資料フォルダは歩かない
+    if rels is None:
+        if deadline is None:
+            deadline = time.monotonic() + _SCOPE_KINDS_WALK_SECONDS
+        wd = worlds.world_dir(world)
+        if not wd:
+            _log.warning("範囲内の根拠種別を判定できませんでした（world root 不明・必須種別はそのまま適用します）")
+            return None
+        try:
+            entries = list(si.safe_files(wd, deadline=deadline, also=worlds.archives_dir(world)))
+        except Exception:
+            _log.warning("範囲内の根拠種別を判定できませんでした（必須種別はそのまま適用します）",
+                         exc_info=True)
+            return None
+        if not entries:
+            # 0 件は root 解決失敗・マウント切断でも起こるため、必須種別を全部「該当なし」へ倒さない。
+            _log.warning("範囲内の文書を1件も列挙できませんでした（必須種別はそのまま適用します）")
+            return None
+        rels = [rel for _rp, rel in entries]
     in_scope, in_layer = set(), set()
-    for _rp, rel in entries:
+    for rel in rels:
         if importance.is_importance_control_path(rel):  # 重要度設定ファイルは文書ではない（検索・精読も除外する）
             continue
         if text_kind.is_sensitive_doc_id(rel):  # 秘匿名: 根拠種別の判定対象に含めない

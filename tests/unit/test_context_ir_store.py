@@ -13,6 +13,7 @@ import pytest
 
 from sherpa import worlds
 from sherpa.ingest import context_ir, evidence_ir, evidence_render, office_md
+from tests._replace_row import offline_row
 
 ROOT = Path(__file__).resolve().parents[2]
 INPUTS = ROOT / "fixtures" / "eval"
@@ -100,7 +101,7 @@ def _write_book(path: Path, cell: str) -> None:
 def test_build_derived_writes_context_into_ir_layer_only(monkeypatch, tmp_path):
     source = _world(tmp_path, monkeypatch, "ctx-ir-layer", "現行顧客区分")
     dmd = worlds.derived_md_dir("ctx-ir-layer")
-    rep = office_md.build_derived(source, dmd, world_sig="s1")
+    rep = office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     assert rep.get("error") is None, rep
     ir_dir = worlds.derived_ir_dir("ctx-ir-layer")
     assert (ir_dir / "a.xlsx.context.json").is_file()
@@ -113,7 +114,7 @@ def test_build_derived_writes_context_into_ir_layer_only(monkeypatch, tmp_path):
 def test_refresh_rag_reuses_saved_context_and_rebuilds_when_source_changes(monkeypatch, tmp_path):
     source = _world(tmp_path, monkeypatch, "ctx-refresh", "現行顧客区分")
     dmd = worlds.derived_md_dir("ctx-refresh")
-    office_md.build_derived(source, dmd, world_sig="s1")
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     ir_dir, rag_dir = worlds.derived_ir_dir("ctx-refresh"), worlds.derived_rag_dir("ctx-refresh")
     before = (rag_dir / "a.xlsx.rag.md").read_bytes(), (rag_dir / "a.xlsx.rag_chunks.jsonl").read_bytes()
     saved = (ir_dir / "a.xlsx.context.json").read_bytes()
@@ -122,7 +123,7 @@ def test_refresh_rag_reuses_saved_context_and_rebuilds_when_source_changes(monke
     real_build = context_ir.build
     monkeypatch.setattr(context_ir, "build", lambda *a, **kw: built.append(1) or real_build(*a, **kw))
 
-    rep = office_md.refresh_rag(source, dmd, write_rag_sig_marker=True)
+    rep = office_md.refresh_rag(source, dmd, write_rag_sig_marker=True, row=offline_row("w"))
     assert rep["rag_failed"] == 0 and rep["rag_generated"] == 1
     assert built == []                                                    # 保存済みを読んだ（作り直していない）
     assert (rag_dir / "a.xlsx.rag.md").read_bytes() == before[0]
@@ -130,7 +131,7 @@ def test_refresh_rag_reuses_saved_context_and_rebuilds_when_source_changes(monke
     assert (ir_dir / "a.xlsx.context.json").read_bytes() == saved
 
     _write_book(source / "a.xlsx", "廃止予定項目")                        # 原本が変わった
-    rep = office_md.refresh_rag(source, dmd, write_rag_sig_marker=True)
+    rep = office_md.refresh_rag(source, dmd, write_rag_sig_marker=True, row=offline_row("w"))
     assert rep["rag_failed"] == 0
     assert built == [1]                                                   # 作り直した
     assert (ir_dir / "a.xlsx.context.json").read_bytes() != saved
@@ -141,9 +142,9 @@ def test_refresh_rag_rebuilds_when_saved_context_is_missing(monkeypatch, tmp_pat
     """保存前に取り込まれた資料（`context.json` が無い）は、再描画のときに作って保存する。"""
     source = _world(tmp_path, monkeypatch, "ctx-missing", "現行顧客区分")
     dmd = worlds.derived_md_dir("ctx-missing")
-    office_md.build_derived(source, dmd, world_sig="s1")
+    office_md.build_derived(source, dmd, world_sig="s1", row=offline_row("w"))
     target = worlds.derived_ir_dir("ctx-missing") / "a.xlsx.context.json"
     saved = target.read_bytes()
     target.unlink()
-    rep = office_md.refresh_rag(source, dmd, write_rag_sig_marker=True)
+    rep = office_md.refresh_rag(source, dmd, write_rag_sig_marker=True, row=offline_row("w"))
     assert rep["rag_failed"] == 0 and target.read_bytes() == saved

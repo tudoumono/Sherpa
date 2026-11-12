@@ -195,3 +195,38 @@ def test_history_search_katakana_hiragana_normalization_matches_title(page, web_
     page.locator("#hist-search").fill("ばっち処理")
 
     expect(page.locator("[data-open='301']")).to_be_visible()
+
+
+def test_history_load_failure_is_not_shown_as_no_conversations(page, web_base_url):
+    """初回の会話一覧の取得に失敗したら「会話はまだありません」とは出さず、読み込めなかったことを出す。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.route("**/conversations", lambda route: route.fulfill(
+        status=500, content_type="application/json", body='{"detail":"down"}'))
+    page.goto(f"{web_base_url}/chat.html")
+
+    expect(page.locator("#convlist")).to_contain_text("会話の一覧を読み込めませんでした")
+    expect(page.locator("#convlist")).not_to_contain_text("会話はまだありません")
+
+
+def test_delete_conversation_tells_user_when_session_data_remains(page, web_base_url):
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.route("**/conversations/101", lambda route: route.fulfill(
+        status=200, content_type="application/json", body='{"ok": true, "id": 101, "sessions_removed": false}')
+        if route.request.method == "DELETE" else route.fallback())
+    messages: list[str] = []
+
+    def on_dialog(d):
+        messages.append(d.message)
+        d.accept()
+
+    page.on("dialog", on_dialog)
+    page.goto(f"{web_base_url}/chat.html")
+    expect(page.locator("[data-open='101']")).to_be_visible()
+    page.locator("[data-conv-menu='101']").click()
+    page.locator("[data-del='101']").click()
+    page.wait_for_timeout(300)
+    assert any("作業データを消せませんでした" in m for m in messages), messages

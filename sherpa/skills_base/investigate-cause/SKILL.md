@@ -39,18 +39,11 @@ Excel の設定シート・パラメータ一覧などは `xlsx_sheets(doc_id=..
 
 ```python
 # 複数ファイルの同じキーの値を突き合わせる例（設定の食い違いが原因の場合に有効）。
-# 設定ファイル・ソースは CP932（Shift_JIS）のことがあるため、決め打ちで utf-8 置換読みにせず
-# 実際の符号化を判定してから読む。
+# 設定ファイル・ソースは CP932（Shift_JIS）や EUC-JP のことがある。文字コードを Python で推測せず、
+# UTF-8 で読めない原本は read_doc（Sherpa の共通の判定で読む）で読む。
 def read_src(p):
-    with open(p, "rb") as f:
-        b = f.read()
-    if b.startswith(b"\xef\xbb\xbf"):
-        return b[3:].decode("utf-8", "replace")
-    try:
-        return b.decode("utf-8")
-    except UnicodeDecodeError:
-        u, c = b.decode("utf-8", "replace"), b.decode("cp932", "replace")
-        return c if c.count("�") < u.count("�") else u
+    with open(p, encoding="utf-8-sig") as f:
+        return f.read()   # UnicodeDecodeError ＝ CP932・EUC-JP の原本。その原本は read_doc で読む
 
 values = {}
 for p in candidate_paths:
@@ -71,8 +64,8 @@ for k, v in values.items():
   「原因は資料からは特定できない（要確認）」と正直に答える（無理に断定しない）。
 - 関連部品を「すべて」洗い出すよう求められた場合は、上の「1箇所以上見つけたら提示してよい」は適用しない
   ——対象範囲（graph_neighbors の経路・該当フォルダ）を辿り切ってから答える（検索3回・根拠1件では終えない）。
-  `graph_neighbors` の結果に `truncated:true` が付いたら近傍は部分集合（`count` が総数・続きは取れない）
-  ＝その範囲を未確認として明示し「すべて」と書かない。
+  `graph_neighbors` の結果に `truncated:true` が付いたら近傍は部分集合（`count` が総数）
+  ＝`next_offset` があれば `offset` に渡して続きを取り、無ければ（時間切れ・取得の天井）その範囲を未確認として明示し「すべて」と書かない。
 - **中断**（利用者停止・通信エラー・既存の反復／情報量予算への到達）のときは、確認済みの仮説・
   未確認の範囲・中断理由を分けて書き、部分結果を断定的な原因と言い切らない。
 

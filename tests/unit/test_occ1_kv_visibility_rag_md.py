@@ -22,7 +22,9 @@ os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 
 import pytest
 
+import _image_builders
 from sherpa.ingest import office_md
+from tests._replace_row import offline_row
 
 _ROOT = Path(__file__).resolve().parents[2]
 _DEP_INPUTS = _ROOT / "fixtures" / "eval" / "deprecation_markers" / "inputs"
@@ -44,10 +46,13 @@ def _derived_dir():
     d = tempfile.mkdtemp()
     wd = Path(d) / "world"
     wd.mkdir()
-    for name in ("DEP-XLSX-MARKERS.xlsx", "DEP-DOCX-MARKERS.docx", "DEP-PPTX-MARKERS.pptx"):
+    for name in ("DEP-DOCX-MARKERS.docx", "DEP-PPTX-MARKERS.pptx"):
         shutil.copy(_DEP_INPUTS / name, wd / name)
+    # 同梱のスタンプ画像は透過を含み覆いを確定させないので、画像による覆いの行は不透明の画像に差し替えた複製で確かめる。
+    _image_builders.replace_media(_DEP_INPUTS / "DEP-XLSX-MARKERS.xlsx", wd / "DEP-XLSX-MARKERS.xlsx",
+                                  _image_builders.opaque_png())
     dmd = Path(d) / "derived"
-    rep = office_md.build_derived(wd, dmd)
+    rep = office_md.build_derived(wd, dmd, row=offline_row("w"))
     assert rep["rag_failed"] == 0, rep
     return dmd
 

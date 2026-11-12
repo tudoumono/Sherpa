@@ -7,6 +7,7 @@ Office／PDF は `{rel}.rag.md`（RAG 正本）をアンカー分割した本文
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -21,12 +22,22 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from . import corpus_docs, doc_text, embeddings, json_io, scope_infer, worlds
+from . import corpus_docs, doc_text, embeddings, es_priority, json_io, path_rules, scope_infer, worlds
 from . import layer as layer_mod
-from . import scope as scope_mod
 from .env_int import env_int
 from .ingest import importance, ocr_router, substage, text_kind
 from .ingest.analyzers import registry as analyzer_registry
+from . import es_publish
+from .store import replace_rows
+from .store.replace_rows import ReplaceRow
+from .es_query import classify_exception as _classify_query_exception
+from .es_query import run_search as _search_req
+from .es_publish import activate_index as _activate_index
+from .es_publish import delete_orphan, delete_world
+from .es_publish import read_ingest_no  # noqa: F401
+from .es_publish import discard_building as _discard_building
+from .es_publish import drop_stale_physicals as _drop_stale_physicals
+from .es_publish import rebuild_space_shortfall as _rebuild_space_shortfall
 
 _log = logging.getLogger("sherpa")
 
@@ -38,7 +49,7 @@ _CHUNK_LINES_DEFAULT = 40
 # `search()` が ES へ送る size の上限（資料検索のヒット数の既定 `parts.read.tools.MAX_HITS` を下回らない固定値）
 _ES_SEARCH_K_MAX = 50
 _TIMEOUT = 30
-ES_MAPPING_VERSION = "14"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
+ES_MAPPING_VERSION = "15"  # マッピング／チャンクメタの版。上げると次回 sync で全資料フォルダが自動 reindex する（`needs_reindex` 参照）
 # reindex のとき埋め込みはキャッシュから再利用される。
 # rag_chunks.jsonl 読み取りの安全弁: 1 行（1 チャンク）の大きさで判定する。桁違いに大きい行は破損とみなし、ファイル全体を無効にして legacy チャンクへ縮退する（`_validate_rag_chunks` 参照）。
 # ファイル全体の大きさは見ない（大きな表でも行ごとの切れを保つ）。読むときも上限＋1 文字で打ち切る
@@ -67,9 +78,17 @@ _ES_COMPACT_SETTLE_SEC = 35         # flush の後、ES が写しを捨ててよ
 _ES_COMPACT_TIMEOUT_SEC = 1800      # forcemerge の終わりを待つ上限（過ぎたら待たずに先へ進む）
 _ES_COMPACT_POLL_SEC = 5
 
-# 重要度スコアブースト: `高`／`低` の function_score 係数。`中`／未設定は等倍で、重要度制御ファイルの無い資料フォルダはスコア不変
-_ES_IMPORTANCE_BOOST_HIGH = 1.2
-_ES_IMPORTANCE_BOOST_LOW = 0.85
+
+
+# 検索の質問の埋め込みの総期限（秒）。env `SHERPA_SEARCH_EMBED_TIMEOUT_SEC`（1〜120・不正は既定）。過ぎたら BM25 だけで続ける（`query_embed_failed`）。取り込みの埋め込みの再送は変えない
+_SEARCH_EMBED_TIMEOUT_DEFAULT = 10.0
+_SEARCH_EMBED_TIMEOUT_MIN = 1.0
+_SEARCH_EMBED_TIMEOUT_MAX = 120.0
+
+# BM25 の対象欄と重み。本文 `text` が最も重く、見出し系（`labels`＝項目名など・`region_context`＝見出し・シート名）は控えめに足す。`tie_breaker` は複数欄に当たった文書をわずかに押し上げる
+_BM25_FIELDS = ("text", "labels", "region_context")
+_BM25_FIELD_BOOSTS = {"text": 1.0, "labels": 0.3, "region_context": 0.3}
+_BM25_TIE_BREAKER = 0.1
 
 
 # `search()` のハイブリッドにおける BM25(keyword) 対 kNN(vector) の配分（0.0＝vector 寄り〜1.0＝keyword 寄り・0.5＝boost キーを書かない）
@@ -115,6 +134,11 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
         # 表の行・本文のまとまりの先頭だけが持つ（設計: docs/design/rag.md「表の行・本文のまとまり」）。どちらも検索の対象にしない
         "vector_text": {"type": "text", "index": False},
         "row_group": {"type": "object", "enabled": False},
+        # まとまりの構成行（設計: docs/design/rag.md「表の行・本文のまとまり」）: 先頭以外の行＝先頭の chunk_id、先頭＝構成行の識別子の集合（kNN の exact が引く）と
+        # 行ごとの内訳（当たった行へ戻す表示用・検索の対象にしない）。`record_identity_values` には他の行の識別子を混ぜない
+        "row_group_head_chunk_id": {"type": "keyword"},
+        "row_group_identifier_values": {"type": "keyword"},
+        "row_group_identifier_rows": {"type": "object", "enabled": False},
     }
     if dim:
         props["embedding"] = {"type": "dense_vector", "dims": dim, "element_type": "byte", "index": True,
@@ -133,17 +157,24 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
     return m
 
 
+def _index_meta_read(world: str, idx: str | None = None) -> tuple[dict | None, bool]:
+    """`_index_meta` の本体。`(メタ, 読めなかったか)`。索引が無い（404）は `(None, False)`、404 以外の取得失敗は `(None, True)`。"""
+    try:
+        r = _req("GET", f"/{idx or _index(world)}/_mapping")
+        for v in r.values():
+            return (v.get("mappings") or {}).get("_meta") or {}, False
+        return {}, False
+    except urllib.error.HTTPError as exc:
+        return None, exc.code != 404
+    except Exception:
+        return None, True
+
+
 def _index_meta(world: str, idx: str | None = None) -> dict | None:
     """index に記録した埋め込み素性（`_meta`）。取得失敗（GET 例外・到達不可等）は `None`、index はあるが `_meta` が無い正当な不在は `{}` で区別する。
     既存 `_meta` を読み直して書き戻す PUT 系（`confirm_human_md_meta`／`_confirm_content_sig`／`_wipe_after_bulk_failure`）は `None` のとき PUT をスキップする（`_meta` は丸ごと置換のため、一時失敗で既存値を消さない）。
     """
-    try:
-        r = _req("GET", f"/{idx or _index(world)}/_mapping")
-        for v in r.values():
-            return (v.get("mappings") or {}).get("_meta") or {}
-        return {}
-    except Exception:
-        return None
+    return _index_meta_read(world, idx)[0]
 
 
 def _settings(s):
@@ -353,85 +384,6 @@ def _index_kind(world: str) -> str | None:
     return "index" if _index(world) in names else "none"
 
 
-def delete_world(world: str) -> bool:
-    """資料フォルダの索引を全部削除する（エイリアスの指す物理索引・作りかけの物理索引・0.18 以前の実の索引。無ければ無視）。wipe の派生物伝播で呼ぶ。"""
-    names = _concrete_indices(world)
-    if names is None:
-        return False
-    ok = True
-    for n in names:
-        try:
-            _req("DELETE", "/" + n)
-        except urllib.error.HTTPError as e:
-            ok = ok and e.code == 404  # 既に無い＝成功扱い
-        except Exception:
-            ok = False
-    return ok
-
-
-def _discard_building(world: str) -> None:
-    """作りかけの物理索引を消す（エイリアスと古い索引には触れない）。失敗は次の作り直しの前の掃除に任せる。"""
-    name = _building.pop(world, None)
-    if not name or name == _index(world):
-        return
-    try:
-        _req("DELETE", "/" + name)
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            _log.warning("es_index: 作りかけの索引を消せませんでした（次回の作り直しで掃除します）: %s", name)
-    except Exception:
-        _log.warning("es_index: 作りかけの索引を消せませんでした（次回の作り直しで掃除します）: %s", name)
-
-
-def _drop_stale_physicals(world: str) -> bool:
-    """エイリアスが指していない物理索引（前回落ちた作りかけ）を消す。一覧を取れなければ何も消さず False。"""
-    targets = _alias_targets(world)
-    names = _concrete_indices(world)
-    if targets is None or names is None:
-        return False
-    alias = _index(world)
-    for n in names:
-        if n == alias or n in targets:
-            continue
-        try:
-            _req("DELETE", "/" + n)
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                return False
-        except Exception:
-            return False
-    return True
-
-
-def _activate_index(world: str, new_idx: str) -> bool:
-    """エイリアスを `new_idx` へ原子的に付け替え、古い物理索引を消す。0.18 以前の実の索引は同じ `_aliases` の中で消して置き換える。"""
-    alias = _index(world)
-    if new_idx == alias:
-        return True
-    targets = _alias_targets(world)
-    names = _concrete_indices(world)
-    if targets is None or names is None:
-        return False
-    actions: list = [{"remove": {"index": t, "alias": alias}} for t in targets]
-    if not targets and alias in names:
-        actions.append({"remove_index": {"index": alias}})
-    actions.append({"add": {"index": new_idx, "alias": alias}})
-    try:
-        _req("POST", "/_aliases", {"actions": actions})
-    except Exception:
-        return False
-    _building.pop(world, None)
-    for t in targets:
-        try:
-            _req("DELETE", "/" + t)
-        except Exception:
-            _log.warning("es_index: 古い索引を消せませんでした（次回の作り直しで掃除します）: %s", t)
-    return True
-
-
-_REBUILD_FREE_FACTOR = 2  # 空きが古い索引の大きさのこの倍に満たなければ、作り直しの前に古い索引を消す
-
-
 def _es_free_bytes() -> int | None:
     """ES のデータ置き場の空き（`/_nodes/stats/fs` の available・ノードが複数なら最も少ないもの）。取れなければ None。"""
     try:
@@ -479,34 +431,7 @@ def _free_space_note(world: str):
     return note
 
 
-def _drop_old_for_space(world: str) -> bool:
-    """作り直しの前に、ES の空きが古い索引の大きさの `_REBUILD_FREE_FACTOR` 倍に満たなければ古い索引を先に消す。消したら True。
-    空き・大きさを取れないときは消さない（今まで通り新旧を持って付け替える）。
-    """
-    names = _concrete_indices(world)
-    if not names:
-        return False
-    size = _store_bytes(names)
-    free = _es_free_bytes()
-    if size is None or free is None or free >= size * _REBUILD_FREE_FACTOR:
-        return False
-    _log.warning("es_index: ES の空きが足りないため、古い索引を消してから作り直します（終わるまでこの資料フォルダは検索できません）"
-                 ": world=%s・空き %d バイト・古い索引 %d バイト", world, free, size)
-    dropped = False
-    for n in names:
-        try:
-            _req("DELETE", "/" + n)
-            dropped = True
-        except urllib.error.HTTPError as e:
-            dropped = dropped or e.code == 404
-            if e.code != 404:
-                _log.warning("es_index: 古い索引を消せませんでした: %s", n)
-        except Exception:
-            _log.warning("es_index: 古い索引を消せませんでした: %s", n)
-    return dropped
-
-
-def _confirm_content_sig(world: str, content_sig, idx: str | None = None) -> None:
+def _confirm_content_sig(world: str, content_sig, idx: str | None = None, *, row: ReplaceRow) -> None:
     """bulk が全バッチ成功した後（エイリアスの付け替えの前）に、新しい物理索引 `idx` の `_meta.content_sig`・`_meta.doc_count` を 1 回の read-modify-write で書く（Put Mapping API で `_meta` だけ更新）。
     `doc_count` は ES 側の実件数（`count(world)`）で、`needs_reindex` の実件数照合に使う。content_sig と同じ書き込みにまとめ、件数取得か書き込みが失敗すれば content_sig も書かない（次回 sync が fail-closed で 1 回張り直す）。
     """
@@ -524,6 +449,8 @@ def _confirm_content_sig(world: str, content_sig, idx: str | None = None) -> Non
         meta = dict(existing)
         meta["content_sig"] = content_sig
         meta["doc_count"] = n
+        meta["ingest_no"] = row.ingest_no
+        meta["settings_sig"] = replace_rows.settings_sig(row, "es")
         _req("PUT", f"/{idx or _index(world)}/_mapping", {"_meta": meta})
     except Exception:
         _log.warning("es_index: content_sig/doc_count の確定に失敗しました（次回 sync が1回だけ張り直す）: world=%s", world)
@@ -540,60 +467,41 @@ def _restore_refresh_interval(world: str, idx: str | None = None) -> None:
 
 
 def list_kb_indices() -> list:
-    """現存する Sherpa の KB 索引名（`sherpa-kb-*`）一覧。ES 不可は []（best-effort）。"""
-    try:
-        rows = _req("GET", "/_cat/indices/sherpa-kb-*?format=json&h=index")
-        return [r["index"] for r in (rows or []) if r.get("index")]
-    except Exception:
-        return []
+    """現存する Sherpa の KB 索引名（`sherpa-kb-*`）一覧。ES に届かないときは例外にする（空と区別する）。"""
+    rows = _req("GET", "/_cat/indices/sherpa-kb-*?format=json&h=index")
+    return [r["index"] for r in (rows or []) if r.get("index")]
 
 
-def reconcile(valid_worlds) -> list:
-    """孤児 ES 索引の自動掃除: `sherpa-kb-*` のうち、登録資料フォルダの現行索引名のいずれにも一致しないものを削除する。
-    `valid_worlds` は確実に取得できた登録 ID 集合（不確実なら呼ばない）。返り値は削除した索引名。ES 不可・個別失敗は握って続行する。
+def orphan_indices(valid_worlds) -> list:
+    """孤児 ES 索引の一覧: `sherpa-kb-*` のうち、登録資料フォルダの現行索引名のいずれにも一致しないもののエイリアス名（世代の接尾辞を除く）。
+    `valid_worlds` は確実に取得できた登録 ID 集合（不確実なら呼ばない）。ES に届かなければ例外。消すのは `delete_orphan`。
     """
     keep = {_index(w) for w in (valid_worlds or [])}
-    deleted = []
-    for idx in list_kb_indices():
-        if idx in keep or _physical_base(idx) in keep:  # 世代付きの物理索引は、エイリアス名で所有者を判定する
-            continue
-        try:
-            _req("DELETE", "/" + idx)
-            deleted.append(idx)
-        except Exception:
-            pass  # 個別失敗は次回リコンサイルで再試行
-    return deleted
+    return sorted({_physical_base(i) for i in list_kb_indices()} - keep)
 
 
-# 直近の `ensure_index()` が実際に作った索引のアナライザ（資料フォルダ ID → "kuromoji"／"standard"）。`index_world()` が取り出して
-# 標準への退避を結果へ載せる（`ensure_index()` の戻り値は bool のまま）。既存索引だった場合は入れない。
-_created_analyzer: dict[str, str] = {}
+# 直近の `ensure_index()` が失敗した理由（資料フォルダ ID → エラー名）。`index_world()` が取り出して結果の `error` にする（`ensure_index()` の戻り値は bool のまま）。
+_create_error: dict[str, str] = {}
 
 
 def ensure_index(world: str, dim=None, emeta=None) -> bool:
-    """新しい世代の物理索引を作る（作った名前は `_building`）。アナライザ不明（400）は standard で再試行する（作ったアナライザは `_created_analyzer`）。`dim`／`emeta` で kNN 用。"""
+    """新しい世代の物理索引を作る（作った名前は `_building`）。日本語アナライザ（kuromoji）を作れない 400 は標準へ切り替えず失敗にする（理由は `_create_error`＝`analyzer_unavailable`）。`dim`／`emeta` で kNN 用。"""
     name = _new_physical_name(world)
-    idx = "/" + name
-    _created_analyzer.pop(world, None)
-    for analyzer in ("kuromoji", "standard"):
+    _create_error.pop(world, None)
+    try:
+        _req("PUT", "/" + name, _mapping(dim, "kuromoji", emeta))
+        _building[world] = name
+        return True
+    except urllib.error.HTTPError as e:
         try:
-            _req("PUT", idx, _mapping(dim, analyzer, emeta))
-            _created_analyzer[world] = analyzer
-            _building[world] = name
-            return True
-        except urllib.error.HTTPError as e:
-            try:
-                txt = e.read().decode("utf-8", "replace")
-            except Exception:
-                txt = ""
-            if "resource_already_exists" in txt:  # 世代名の衝突（通常起きない）
-                return False
-            if e.code == 400 and analyzer == "kuromoji":
-                continue  # kuromoji 不明 → standard で再試行
-            return False  # それ以外の 400／エラーは失敗
+            txt = e.read().decode("utf-8", "replace").lower()
         except Exception:
-            return False
-    return False
+            txt = ""
+        if e.code == 400 and any(w in txt for w in ("kuromoji", "analyzer", "tokenizer")):
+            _create_error[world] = "analyzer_unavailable"
+        return False
+    except Exception:
+        return False
 
 
 # 埋め込みキャッシュのストア（SQLite の KV 1 ファイル）。資料フォルダ全体のベクトルを dict で持たず、フラッシュに含まれるキーだけを SELECT／INSERT する
@@ -790,6 +698,19 @@ def _live_keys_add(world: str, keys) -> None:
         conn.close()
 
 
+def _live_keys_count(world: str) -> int | None:
+    """今回の Pass1 で見た異なる埋め込み入力の数。読めなければ None。"""
+    conn = _embed_cache_connect(world, create=False)
+    if conn is None:
+        return None
+    try:
+        return int(conn.execute("SELECT count(*) FROM live").fetchone()[0])
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
 def _prune_embed_cache(world: str, valid_keys=None) -> None:
     """資料フォルダ全体の doc ストリームを一巡し終えた直後にだけ呼ぶ最終剪定。`live` 表に無い鍵を消す（SQL の差で行い、鍵の集合を Python に持たない）。`live` が空なら DB ごと削除する。
     `valid_keys` を渡すとそれを `live` 表に入れ直してから剪定する（呼び出し側が先に `_live_keys_add` で溜めたなら省略）。
@@ -899,7 +820,8 @@ class _EmbedGuard:
         _embed_failed_at[self.world] = time.monotonic()
 
 
-def _embed_fill(world: str, texts: list, ec, guard: _EmbedGuard | None = None, *, stop_points: bool = False) -> tuple:
+def _embed_fill(world: str, texts: list, ec, guard: _EmbedGuard | None = None, *,
+                stop_points: bool = False, metrics: dict | None = None) -> tuple:
     """チャンク埋め込みを内容ハッシュでキャッシュし、未変更チャンクの再 embed（API コスト）を省く。取れなかったチャンクだけ `None` にして続ける。
     返値 `(vectors, reused, embedded)`。`vectors` は `texts` と同じ長さで、取れなかった位置が `None`（再送を使い切ったまとまり・キャッシュ書込の失敗・`guard` の打ち切り後）。重複チャンクは 1 回だけ embed し、キャッシュ済みベクトルも形状を検証する（壊れは miss）。
     `texts` は呼び出し元が有界なバッチに分けて渡す。本関数はこのバッチのキーを追加／更新するだけで、剪定は呼び出し元が 1 回だけ `_prune_embed_cache()` で行う。`ec` が None・`texts` が空なら全部 `None`。
@@ -913,7 +835,11 @@ def _embed_fill(world: str, texts: list, ec, guard: _EmbedGuard | None = None, *
     key_text = {}  # distinct チャンク（重複本文は 1 回だけ embed）
     for k, t in zip(keys, texts):
         key_text.setdefault(k, t)
+    cache_started = time.monotonic()
     filled = _embed_cache_lookup_batch(world, list(key_text), dim)  # 形状検証済みの既存ベクトルだけ再利用
+    if metrics is not None:
+        metrics["bundle_count"] = metrics.get("bundle_count", 0) + len(texts)
+        metrics["cache_lookup_ms"] = metrics.get("cache_lookup_ms", 0.0) + (time.monotonic() - cache_started) * 1000
     need = [k for k in key_text if k not in filled]
     embedded = 0
     if need:
@@ -925,7 +851,18 @@ def _embed_fill(world: str, texts: list, ec, guard: _EmbedGuard | None = None, *
             if guard is not None and guard.gave_up:
                 break
             batch_keys = need[start:start + _EMBED_FLUSH_CHUNKS]
-            new = embeddings.embed([key_text[k] for k in batch_keys], ec, world=world)
+            api_metrics: dict = {}
+            api_started = time.monotonic()
+            new = embeddings.embed([key_text[k] for k in batch_keys], ec, world=world,
+                                   metrics=api_metrics)
+            if metrics is not None:
+                metrics["api_wait_ms"] = metrics.get("api_wait_ms", 0.0) + (time.monotonic() - api_started) * 1000
+                metrics["api_cumulative_ms"] = metrics.get("api_cumulative_ms", 0.0) + api_metrics.get("api_cumulative_ms", 0.0)
+                metrics["api_calls"] = metrics.get("api_calls", 0) + api_metrics.get("api_calls", 0)
+                if api_metrics.get("input_tokens_unavailable"):
+                    metrics["input_tokens_unavailable"] = True
+                if isinstance(api_metrics.get("input_tokens"), int):
+                    metrics["input_tokens"] = metrics.get("input_tokens", 0) + api_metrics["input_tokens"]
             new_map = {k: embeddings.to_vector(vec) for k, vec in zip(batch_keys, new)} if new else {}
             q_map = {k: q for k, q in ((k, embeddings.quantize_vector(v)) for k, v in new_map.items()) if q is not None}
             new_map = {k: new_map[k] for k in q_map}
@@ -1239,6 +1176,10 @@ _ROW_GROUP_ROW_MAX_BYTES = 300      # 値を並べた 1 行の上限（UTF-8）
 _ROW_GROUP_HEAD_MAX_BYTES = 600     # 出所・列名の行それぞれの上限
 _ROW_GROUP_MAX_BYTES = 7600         # まとまり 1 本の上限（埋め込みの 1 窓＝約 8000 バイトに収める）
 _ROW_GROUP_SEP = " | "
+_ROW_GROUP_STATE_MAX_CHARS = 60     # 状態・重なりの行の値の上限（超えた分は切るが、末尾の括弧書き・閉じ括弧は残す）
+_ROW_GROUP_QUOTE_MAX_CHARS = 14     # 部分的な状態の対象として引用する文字数の上限
+_ROW_GROUP_KEEP_HEAD_MIN_CHARS = 8  # 状態の行を詰めるときに、括弧書きの手前に残す文字数の下限
+_ROW_GROUP_PLAIN_MIN_BYTES = 6      # 状態を残すために通常の値を切り詰めるときの、1 つの値の下限（UTF-8）
 # 本文のまとまり（表の行でない連続するチャンクにベクトルを 1 本）。設計: docs/design/rag.md「表の行・本文のまとまり」
 _BODY_GROUP_MAX_CHARS = 1000        # まとまり 1 本の上限（文字）。UTF-8 で 4000 バイト以下＝埋め込みの 1 窓に収める
 _BODY_GROUP_TEXT_KINDS = frozenset({"paragraph", "heading"})   # 見出しと段落は同じ種類として束ねる
@@ -1308,27 +1249,160 @@ def _cut_value(v: str) -> str:
     return v if len(v) <= _ROW_GROUP_CELL_MAX_CHARS else v[:_ROW_GROUP_CELL_MAX_CHARS - 1] + _CUT_MARK
 
 
+_STATE_BRACKET_RE = re.compile(r"【(非表示・取り消し線|取り消し線|非表示)(?:（続き）)?：(.*?)】", re.DOTALL)
+_STATE_TAIL_RE = re.compile(r"（[^（）]{1,30}）$|」$")
+# 行の部品の種類: 通常の値／観測の行の値（切らずに残す）／切らない固定部分（区切り・位置・見出し）／部分的な状態の書き添え／値の中の状態の括り（括りごと残す）
+_PLAIN, _KEEP, _SEP, _NOTE, _INLINE = 0, 1, 2, 3, 4
+# 部品は `(文字, 種類, 組)`。`組` は状態と対象・観測の行と見出しを一組として外す単位（無ければ None）。
+
+
+def _value_parts(v: str, observed_group: int | None, groups) -> list:
+    """束の中の 1 つの値を `[(文字, 種類, 組)]` にする。
+    観測の行（描画が付けた状態・重なり・関係の行。`observed_group` を持つ）は上限を広げ、末尾の括弧書き（覆われているかは未確定）を残す。
+    通常の値は `_cut_value` で切る。値の中の状態の括り（`【取り消し線：…】` など）は、見える範囲に収まるものを括りごと一組の部品にし、
+    収まらないものは `（一部「…」に取り消し線）` の書き添えにする（セル全体の状態にはしない。括りを途中で切らない）。
+    """
+    if observed_group is not None:
+        if len(v) > _ROW_GROUP_STATE_MAX_CHARS:
+            tail = m.group(0) if (m := _STATE_TAIL_RE.search(v)) else ""
+            v = v[:_ROW_GROUP_STATE_MAX_CHARS - len(tail) - 1] + _CUT_MARK + tail
+        return [(v, _KEEP, observed_group)]
+    brackets = list(_STATE_BRACKET_RE.finditer(v))
+    if not brackets:
+        return [(_cut_value(v), _PLAIN, None)]
+    if len(v) <= _ROW_GROUP_CELL_MAX_CHARS:
+        shown, limit = v, len(v)
+    else:
+        limit = next((m.start() for m in brackets if m.start() < _ROW_GROUP_CELL_MAX_CHARS - 1 < m.end()),
+                     _ROW_GROUP_CELL_MAX_CHARS - 1)
+        shown = v[:limit] + _CUT_MARK
+    parts: list = []
+    pos = 0
+    hidden: list = []
+    for m in brackets:
+        if m.end() > limit:
+            hidden.append(m)
+            continue
+        if m.start() > pos:
+            parts.append((shown[pos:m.start()], _PLAIN, None))
+        parts.append((shown[m.start():m.end()], _INLINE, next(groups)))
+        pos = m.end()
+    if pos < len(shown):
+        parts.append((shown[pos:], _PLAIN, None))
+    notes: list = []
+    for m in hidden:
+        quote = m.group(2).strip()
+        if len(quote) > _ROW_GROUP_QUOTE_MAX_CHARS:
+            quote = quote[:_ROW_GROUP_QUOTE_MAX_CHARS - 1] + _CUT_MARK
+        note = f"（一部「{quote}」に{m.group(1)}）"
+        if note not in notes:
+            notes.append(note)
+    return parts + [(n, _NOTE, next(groups)) for n in notes]
+
+
+def _shrink_keep(text: str, over: int) -> str:
+    """残す部品を `over` バイト以上短くする。末尾の括弧書き・閉じ括弧は残し、手前を切る（切れなければそのまま）。"""
+    tail = m.group(0) if (m := _STATE_TAIL_RE.search(text)) else ""
+    head = text[:len(text) - len(tail)]
+    mark = len(_CUT_MARK.encode("utf-8"))
+    keep, saved = len(head), -mark
+    while keep > _ROW_GROUP_KEEP_HEAD_MIN_CHARS and saved < over:
+        keep -= 1
+        saved += len(head[keep].encode("utf-8"))
+    return text if keep == len(head) else head[:keep] + _CUT_MARK + tail
+
+
+def _summary(count: int) -> str:
+    """外した状態・観測の件数の要約。"""
+    return f"（ほか{count}件）"
+
+
+def _cut_share(text: str, limit: int) -> str:
+    """`limit` バイトに収める。「…」も入らない幅なら空にする。"""
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    return _cut_bytes(text, limit) if limit >= len(_CUT_MARK.encode("utf-8")) else ""
+
+
+def _fit_row(parts: list) -> str:
+    """部品を連結して 1 行の上限（`_ROW_GROUP_ROW_MAX_BYTES`）に収める。
+    ① 収まるならそのまま ② 状態の部品が無ければ従来どおり末尾を切る ③ 観測の行を詰める（括弧書きは残す）
+    ④ なお収まらなければ、組（状態と対象・観測の行と見出し）を後ろから外し、外した件数の要約を、外す前に予算へ確保して残す
+    ⑤ 通常の値を残りの幅へ均等に切る。通常の値の下限を守って収まる範囲では、状態を外さない。守れないほど幅が広い行は、状態を全部外して件数にし、残りは末尾を切る。
+    """
+    line = "".join(t for t, _k, _g in parts)
+    if len(line.encode("utf-8")) <= _ROW_GROUP_ROW_MAX_BYTES:
+        return line
+    if not any(g is not None for _t, _k, g in parts):
+        return _cut_bytes(line, _ROW_GROUP_ROW_MAX_BYTES)
+    parts = list(parts)
+    limit = _ROW_GROUP_ROW_MAX_BYTES
+
+    def fixed_bytes(dropped: set) -> int:
+        return sum(len(t.encode("utf-8")) for t, k, g in parts if k != _PLAIN and g not in dropped)
+
+    plain = [i for i, (t, k, _g) in enumerate(parts) if k == _PLAIN and t]
+    floor = _ROW_GROUP_PLAIN_MIN_BYTES * len(plain)
+    for i in sorted((i for i, (_t, k, _g) in enumerate(parts) if k == _KEEP), key=lambda j: -len(parts[j][0])):
+        over = fixed_bytes(set()) + floor - limit
+        if over <= 0:
+            break
+        parts[i] = (_shrink_keep(parts[i][0], over), _KEEP, parts[i][2])
+    groups = sorted({g for _t, _k, g in parts if g is not None})
+
+    def cost(count: int) -> int:
+        dropped = set(groups[len(groups) - count:]) if count else set()
+        return fixed_bytes(dropped) + (len(_summary(count).encode("utf-8")) if count else 0)
+
+    count = next((c for c in range(len(groups) + 1) if cost(c) + floor <= limit), None)
+    fits = count is not None
+    count = len(groups) if count is None else count
+    summary_at = -1   # 挿入した要約の部品の添字（原本の値が同じ文字でも取り違えない）
+    if count:
+        dropped = set(groups[len(groups) - count:])
+        summary_at = next(i for i, p in enumerate(parts) if p[2] in dropped)
+        parts = [(_summary(count), _KEEP, None) if i == summary_at else ("", _SEP, None) if p[2] in dropped else p
+                 for i, p in enumerate(parts)]
+    if not fits:
+        # 通常の値の下限を守れないほど幅が広い行: 状態を全部外して件数にし、残りは従来どおり末尾を切る（要約は切らない）。
+        body = "".join(t for i, (t, _k, _g) in enumerate(parts) if i != summary_at)
+        return _cut_bytes(body, limit - len(_summary(count).encode("utf-8"))) + _summary(count)
+    plain = [i for i, (t, k, _g) in enumerate(parts) if k == _PLAIN and t]
+    free = max(limit - fixed_bytes(set()), 0)
+    shares: dict = {}
+    for n, i in enumerate(sorted(plain, key=lambda j: len(parts[j][0].encode("utf-8")))):
+        size = len(parts[i][0].encode("utf-8"))
+        shares[i] = min(size, free // (len(plain) - n))
+        free -= shares[i]
+    return "".join(_cut_share(t, shares[i]) if i in shares else t for i, (t, _k, _g) in enumerate(parts))
+
+
 def _row_fields(row: dict, text: str) -> list:
-    """行の本文（`列名: 値` の並び）を `[(列名, 値), ...]` にする。Excel の付記の行は除き、続きの行は前の値へつなぐ。
+    """行の本文（`列名: 値` の並び）を `[(列名, 値, 観測の行か), ...]` にする。Excel の付記の行は除き、続きの行は前の値へつなぐ。
+    観測の行（描画が付けた状態・重なり・関係の行）かどうかは、描画が JSONL に記録した行番号（`observation_lines`）で決める（見出しと値の見た目では決めない）。
     `列名: 値` の行が無ければ rag.md の本文を値 1 つとして返す（列名は空）。
     """
     body = row.get("body")
+    numbers = row.get("observation_lines")
+    observed = {n for n in numbers if isinstance(n, int) and not isinstance(n, bool)} if isinstance(numbers, list) else set()
     fields: list = []
-    for line in (body if isinstance(body, str) else "").split("\n"):
+    for number, line in enumerate((body if isinstance(body, str) else "").split("\n")):
         m = _BODY_FIELD_RE.match(line)
         if m is not None:
-            fields.append(None if "のExcel" in m.group(1) else [m.group(1).strip(), m.group(2)])
+            fields.append(None if "のExcel" in m.group(1) else [m.group(1).strip(), m.group(2), number in observed])
+        elif number in observed and line.strip():
+            fields.append(["", line, True])
         elif fields and fields[-1] is not None and line.strip():
             fields[-1][1] += " " + line
-    fields = [(k, " ".join(v.split())) for k, v in (f for f in fields if f is not None)]
-    return fields or [("", " ".join(text.split()))]
+    fields = [(k, " ".join(v.split()), o) for k, v, o in (f for f in fields if f is not None)]
+    return fields or [("", " ".join(text.split()), False)]
 
 
 def _row_group_columns(fields: list) -> list:
     """列の並び（同じ列名が何度も出る表は何番目かで区別する）。"""
     seen: dict = {}
     out = []
-    for name, _v in fields:
+    for name, *_rest in fields:
         seen[name] = seen.get(name, 0) + 1
         out.append((name, seen[name]))
     return out
@@ -1352,20 +1426,40 @@ def _row_position(row: dict) -> str:
 
 
 def _row_group_line(row: dict, fields: list, columns: list | None) -> str:
-    """1 行を束の 1 行にする。値・行の長さは上限で切る。
-    表の行は値だけを見出しの列の順に区切り文字で並べる（見出しに無い列の値は後ろに足す）。
+    """1 行を束の 1 行にする。値・行の長さは上限で切る（状態と対象・観測の行は `_value_parts`・`_fit_row` が組で残し、外した分は件数で示す）。
+    表の行は値だけを見出しの列の順に区切り文字で並べる（見出しに無い列の観測の行は後ろに足し、見出しを添える）。
     見出しの無い配置の行（`columns is None`）は、列名の代わりにセルの位置と項目のラベルを値に添える。
+    `fields` の要素は `(列名, 値, 観測の行か)`（観測の行かを省いた `(列名, 値)` も受ける）。
     """
+    groups = itertools.count()
+    parts: list = []
+
+    def add(key: str, v: str, observed: bool, *, heading: bool) -> None:
+        group = next(groups) if observed else None
+        if heading and key:
+            parts.append((f"{key}: ", _SEP, group))
+        parts.extend(_value_parts(v, group, groups))
+
     if columns is None:
-        values = [(f"{k}: " if k and k != _COORD_DEFAULT_LABEL else "") + _cut_value(v) for k, v in fields]
-        line = " ".join(x for x in (_row_position(row), _ROW_GROUP_SEP.join(values)) if x)
-        return _cut_bytes(line, _ROW_GROUP_ROW_MAX_BYTES)
-    by_col = dict(zip(_row_group_columns(fields), (v for _k, v in fields)))
-    values = [by_col.pop(c, "") for c in columns] + list(by_col.values())
-    while values and not values[-1]:
-        values.pop()
-    line = _ROW_GROUP_SEP.join(_cut_value(v) for v in values)
-    return _cut_bytes(line, _ROW_GROUP_ROW_MAX_BYTES)
+        position = _row_position(row)
+        if position:
+            parts.append((position, _SEP, None))
+        for n, (k, v, *rest) in enumerate(fields):
+            if n:
+                parts.append((_ROW_GROUP_SEP, _SEP, None))
+            elif position:
+                parts.append((" ", _SEP, None))
+            add(k, v, bool(rest and rest[0]), heading=k != _COORD_DEFAULT_LABEL)
+        return _fit_row(parts)
+    by_col = {c: (v, bool(rest and rest[0])) for c, (_k, v, *rest) in zip(_row_group_columns(fields), fields)}
+    cells = [(c[0], *by_col.pop(c, ("", False)), False) for c in columns] + [(c[0], *by_col[c], True) for c in by_col]
+    while cells and not cells[-1][1]:
+        cells.pop()
+    for n, (k, v, observed, extra) in enumerate(cells):
+        if n:
+            parts.append((_ROW_GROUP_SEP, _SEP, None))
+        add(k, v, observed, heading=extra and observed)
+    return _fit_row(parts)
 
 
 def _row_group_head_lines(row: dict, text: str, fields: list) -> tuple:
@@ -1396,11 +1490,26 @@ def _body_group_line(text: str) -> str:
     return "\n".join(ln for ln in text.split("\n") if ln.strip() and not ln.startswith(_BODY_GROUP_TAIL_DROP))
 
 
+def _row_group_identifier_meta(group: list) -> dict:
+    """まとまりの構成行の識別子。`row_group_identifier_values`＝全行の識別子の集合（kNN の exact が引く）、
+    `row_group_identifier_rows`＝識別子を持つ行ごとの `{chunk_id, values}`（当たった行へ戻す）。識別子が無ければ空。
+    """
+    rows = []
+    for _i, body, _t, _r, _l in group:
+        values = list(dict.fromkeys(_str_list(body.get("identifier_values")) + _str_list(body.get("record_identity_values"))))
+        if values:
+            rows.append({"chunk_id": body["chunk_id"], "values": values})
+    if not rows:
+        return {}
+    return {"row_group_identifier_values": list(dict.fromkeys(v for r in rows for v in r["values"])),
+            "row_group_identifier_rows": rows}
+
+
 def _row_group_entries(group: list, head_lines: list):
     """連続する表の行・本文のチャンク `[(es_id, body, text, row, line), ...]` を `(es_id, body, text, skip_embed)` で返す。
-    先頭だけがまとまりの文字（`head_lines`＋各件の `line`）でベクトルを取り、`vector_text`・`row_group` を持つ。
+    先頭だけがまとまりの文字（`head_lines`＋各件の `line`）でベクトルを取り、`vector_text`・`row_group` と、構成行の識別子（`row_group_identifier_values`／`row_group_identifier_rows`）を持つ。
     表の行は出所・列名の行＋各行の値だけの行、本文は先頭の本文＋2 件目以降の本文（`_body_group_line`）。
-    2 件目以降はベクトルを取らない。1 件だけのまとまりは rag.md の本文のまま埋め込む。
+    2 件目以降はベクトルを取らず、先頭の chunk_id（`row_group_head_chunk_id`）を持つ。1 件だけのまとまりは rag.md の本文のまま埋め込む。
     """
     head_id, head_body, head_text, _head_row, _line = group[0]
     if len(group) == 1:
@@ -1411,9 +1520,10 @@ def _row_group_entries(group: list, head_lines: list):
     locator = _row_group_locator([row for _i, _b, _t, row, _l in group])
     if locator is not None:
         row_group["locator"] = locator
-    yield head_id, {**head_body, "vector_text": vector_text, "row_group": row_group}, vector_text, False
+    group_meta = {"vector_text": vector_text, "row_group": row_group, **_row_group_identifier_meta(group)}
+    yield head_id, {**head_body, **group_meta}, vector_text, False
     for es_id, body, text, _row, _l in group[1:]:
-        yield es_id, body, text, True
+        yield es_id, {**body, "row_group_head_chunk_id": head_body["chunk_id"]}, text, True
 
 
 def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: dict):
@@ -1785,14 +1895,15 @@ def _compact_building(world: str, idx: str) -> None:
 
 
 def index_world(world: str, settings: dict | None = None, content_sig: str | None = None,
-                progress: Callable[[int, int], None] | None = None) -> dict:
+                progress: Callable[[int, int], None] | None = None, *, row: ReplaceRow) -> dict:
     """資料フォルダを再索引する（新しい物理索引を作って全件入れ、エイリアスを付け替える）。埋め込み設定があればベクトルも付与する（kNN 用）。
     - 作り直しの間もエイリアスは古い索引を指し続け、検索は途切れない。途中の失敗・停止要求では作りかけの物理索引だけを消し、古い索引（とそのメタ）には触れない。
-      ただし ES の空きが古い索引の大きさの 2 倍に満たなければ、新しい物理索引を作る直前に古い索引を消す（`_drop_old_for_space`・終わるまで検索は空。途中で止まれば索引が無い状態になり、次の更新が作り直す）。
+      ES の空きが古い索引の大きさの 2 倍に満たなければ、古い索引に触れず作り直しを止める（`_rebuild_space_shortfall`・`error: insufficient_space` と足りない量。取り込みの実行中は `LowDiskStop`）。
+      付け替えの応答が届かず効いたか確かめられないときは、新旧どちらも消さず `error: alias_swap_unknown` で返す（次回の作り直しの前の掃除が、エイリアスの指していない側を消す）。
     - 埋め込みのまとまりが再送を使い切って取れなくても、資料フォルダ全体を降格・打ち切りにはしない。そのチャンクだけ、ベクトル無し・`vector_status: "missing"` で入れる（件数は戻り値の `vectors_missing`・`fill_missing_vectors` が後から足す）。埋め込みを選んだクラウドが設定の段階で解決できないときだけ、何も変えずに打ち切る（`embedding_cloud_unavailable`）。
     - `content_sig`＝索引時のフォルダ署名（`_meta` に保存・古い索引の検知に使う）。埋め込みは内容ハッシュキャッシュ（`_embed_fill`）経由で未変更チャンクの再 embed を省く。
     - Office／PDF（`{rel}.rag_chunks.jsonl` を持つ）はレコード単位チャンク、それ以外（テキスト資料、rag_chunks が無い／検証に失敗した Office／PDF）は 40 行チャンク。rag_chunks があるのに使えなかった文書と本文が空白のみの文書（reason="empty_text"）は、戻り値の `rag_degraded`（件数）・`rag_degraded_docs`（内訳）・`rag_degraded_by_reason`（理由別の件数）で報告する。本文を読めず索引から外した文書は reason="text_read_failed"。
-      ベクトルを持つチャンクが 1 件も無い索引になったときは `embed_degraded=True`、日本語アナライザを作れず標準で作り直したときは `analyzer_fallback=True`（どちらも取り込みの状態へ出す）。
+      ベクトルを持つチャンクが 1 件も無い索引になったときは `embed_degraded=True`（取り込みの状態へ出す）。日本語アナライザを作れないときは標準へ切り替えず `error: analyzer_unavailable` で止める。
     - ソース（`branch=="source"` の登録コードと、軽量テキスト枠の第 1 段の汎用コード）は索引に入れない（`_is_source_doc`・探すのは ripgrep_search）。軽量テキスト枠の第 2 段（csv・log などのテキスト資料）は索引に入れるが、埋め込みはしない（BM25 のみ）。索引の `_meta.source_excluded` に印を残し、印の無い旧索引は `needs_reindex` が張り直す。
     - ベクトルを持つ索引は、`_ES_COMPACT_MIN_CHUNKS` 件以上入れたら Pass2 の終わり（付け替えの前）に詰める（`_compact_building`・失敗・時間切れでも取り込みは続ける）。
       取り込みの途中では詰めない・refresh しない（forcemerge も refresh も、その後のマージで置き換わった古いセグメントを次の refresh まで残させる）。
@@ -1807,7 +1918,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     """
     _building.pop(world, None)
     try:
-        return _index_world(world, settings, content_sig, progress)
+        return _index_world(world, settings, content_sig, progress, row)
     except BaseException:  # 停止要求（StopRequested）・想定外の例外: 作りかけの物理索引を残さない
         _close_sender(world)
         _discard_building(world)
@@ -1818,18 +1929,18 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         substage.end()                       # 早く抜けても小さな段を残さない（「まだ動いています」を出し続けない）
 
 
-_ES_BULK_LABEL_DROPPED = "容量が足りないため、古い検索の索引を消して作り直しています（終わるまで検索できません）"
-
-
-def _index_world(world: str, settings, content_sig, progress) -> dict:
+def _index_world(world: str, settings, content_sig, progress, row: ReplaceRow) -> dict:
     if not available():
-        return {"available": False, "indexed": 0, "chunks": 0}
+        return {"available": False, "indexed": 0, "chunks": 0,
+                "embed_metrics": {"available": False,
+                                  "unavailable_reason": "elasticsearch_unavailable"}}
     # `cfg()` と `cloud_selected_but_unavailable()` を同じ system_settings スナップショットで呼ぶ（kill-switch 有効時は読まない）
     sys_s = _embed_system_settings_snapshot()
-    ec = embeddings.cfg(_settings(settings), system_settings=sys_s)
-    if ec is None and embeddings.cloud_selected_but_unavailable(system_settings=sys_s):
-        # 何も作る前に打ち切る（既存索引を BM25 のみで置き換えない）
-        return {"available": True, "indexed": 0, "chunks": 0, "error": "embedding_cloud_unavailable"}
+    ec, abort, keep_embed_cache = es_publish.resolve_embed_target(world, _settings(settings), sys_s)
+    if abort:  # 何も作る前に打ち切る（既存索引を BM25 のみで置き換えない）
+        return {"available": True, "indexed": 0, "chunks": 0, "error": "embedding_cloud_unavailable",
+                "embed_metrics": {"available": False,
+                                  "unavailable_reason": "embedding_cloud_unavailable"}}
 
     derived = worlds.derived_rag_dir(world)  # RAG 正本層
     rag_exts = _rag_chunk_source_exts()
@@ -1846,13 +1957,48 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
     embedded_total = 0
     embed_elapsed_ms = 0.0  # `_embed_fill()` 呼び出しの合計所要時間
     embed_calls_made = False  # 0（呼んだが瞬時）と未計測（一度も呼んでいない）を区別する
+    embed_measure: dict = {}
+    distinct_inputs: int | None = 0 if ec is None else None
+
+    def _embed_metrics(reason: str | None = None) -> dict:
+        if ec is None:
+            return {"available": False, "unavailable_reason": "embedding_disabled",
+                    "bundle_count": 0, "distinct_inputs": 0, "new": 0,
+                    "new_input_tokens": 0, "api_calls": 0, "api_cumulative_ms": 0,
+                    "wall_ms": {"api_wait": 0, "cache_lookup": 0, "other": 0, "total": 0},
+                    "reused": {"total": 0, "unchanged": None, "same_text_other_path": None,
+                               "unavailable_reason": "embedding_disabled"}}
+        total = round(embed_elapsed_ms)
+        cache = min(total, round(embed_measure.get("cache_lookup_ms", 0.0)))
+        api_wait = min(total - cache, round(embed_measure.get("api_wait_ms", 0.0)))
+        token_unknown = bool(embed_measure.get("input_tokens_unavailable"))
+        out = {"available": True,
+                "bundle_count": int(embed_measure.get("bundle_count", 0)),
+                "distinct_inputs": distinct_inputs,
+                "new": embedded_total,
+                "new_input_tokens": (None if token_unknown else int(embed_measure.get("input_tokens", 0))),
+                **({"new_input_tokens_unavailable_reason": "provider_usage_unavailable"} if token_unknown else {}),
+                "api_calls": int(embed_measure.get("api_calls", 0)),
+                "api_cumulative_ms": round(embed_measure.get("api_cumulative_ms", 0.0)),
+                "wall_ms": {"api_wait": api_wait, "cache_lookup": cache,
+                            "other": total - api_wait - cache, "total": total},
+                "reused": {"total": reused_total, "unchanged": None,
+                           "same_text_other_path": None,
+                           "unavailable_reason": "embed_cache_does_not_store_source_path"}}
+        if distinct_inputs is None:
+            out["distinct_inputs_unavailable_reason"] = "embed_cache_live_count_unavailable"
+        if reason is not None:
+            out["incomplete_reason"] = reason
+        return out
+
     guard = _EmbedGuard(world)
     if ec is not None:
         try:
             _live_keys_reset(world)
         except OSError:
             _embed_log.warning("es_index: embed キャッシュの準備に失敗（world=%s）——索引の作成前に中止する", world)
-            return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
+            return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed",
+                    "embed_metrics": _embed_metrics("embed_cache_write_failed")}
 
         def _flush_embed(buf: list) -> bool:
             """束ねたテキストを埋め込む（取れなかった分は飛ばす）。キャッシュ DB に書けなければ False。"""
@@ -1860,7 +2006,8 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
             _stop_point()
             _space_point(world)
             _t0 = time.monotonic()
-            _vecs, reused, embedded = _embed_fill(world, buf, ec, guard, stop_points=True)
+            _vecs, reused, embedded = _embed_fill(
+                world, buf, ec, guard, stop_points=True, metrics=embed_measure)
             embed_elapsed_ms += (time.monotonic() - _t0) * 1000
             embed_calls_made = True
             reused_total += reused
@@ -1888,7 +2035,8 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
                     if not _flush_embed(buf):
                         _embed_log.warning("es_index: embed キャッシュの書込に失敗（world=%s）"
                                            "——索引の作成前に中止する", world)
-                        return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
+                        return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed",
+                                "embed_metrics": _embed_metrics("embed_cache_write_failed")}
                     buf = []
             pass1_docs_done += 1
             pass1_step.tick(pass1_docs_done)
@@ -1899,27 +2047,32 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
             if not _flush_embed(buf):
                 _embed_log.warning("es_index: embed キャッシュの書込に失敗（world=%s）"
                                    "——索引の作成前に中止する", world)
-                return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
+                return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed",
+                        "embed_metrics": _embed_metrics("embed_cache_write_failed")}
+
+        distinct_inputs = _live_keys_count(world)
 
     # 埋め込みキャッシュの最終剪定／削除は、資料フォルダ全体の doc ストリームを一巡し終えた直後（ES 操作の前）に 1 回だけ行う
     substage.begin("embed_cache", "埋め込みのキャッシュを整理しています", logger=_embed_log)
-    if ec is None:
+    if ec is None and not keep_embed_cache:  # 接続先は決まって次元だけ測れなかったときは、次に埋め込めるよう残す
         _delete_embed_cache(world)
-    else:
+    elif ec is not None:
         try:
             _prune_embed_cache(world)
         except OSError:
             # DB 書込障害（ENOSPC 等）は成功扱いせず、索引の作成前に打ち切る（既存索引を残す）
             _embed_log.warning("es_index: embed キャッシュ剪定の書込に失敗（world=%s）"
                                "——索引の作成前に中止する", world)
-            return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
+            return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed",
+                    "embed_metrics": _embed_metrics("embed_cache_write_failed")}
 
     # `ec` が有効なら、埋め込み対象チャンクが無い・取れなかったチャンクがある資料フォルダも「この構成」の索引なので emeta に埋め込み素性を書く
     # （書かないと `needs_reindex()` が毎 sync 不一致になる）。取れなかったチャンクは `fill_missing_vectors` が後から足す
     embed_feature_applies = ec is not None
 
     if not _drop_stale_physicals(world):  # 前回落ちた作りかけを片付けられないまま新しく作らない
-        return {"available": True, "indexed": 0, "chunks": 0, "error": "delete_failed"}
+        return {"available": True, "indexed": 0, "chunks": 0, "error": "delete_failed",
+                "embed_metrics": _embed_metrics("delete_failed")}
 
     dim = ec["dim"] if embed_feature_applies else None
     human_md_sig = _human_md_config_sig(world)
@@ -1940,11 +2093,13 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
                       "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID,  # 前処理アルゴリズム版（`_chunk_key` と同じ材料）
                       "quant": embeddings.ES_VECTOR_QUANT})  # ES へ渡すベクトルの縮め方
     _space_point(world)  # 古い索引を消す前に空きを確かめる（対象が 0 件でも止める）
-    old_dropped = _drop_old_for_space(world)  # 空きが足りなければ古い索引を先に消す（終わるまで検索できない）
+    if (short := _rebuild_space_shortfall(world)):  # 空きが足りなければ古い索引に触れず止める
+        return {"available": True, "indexed": 0, "chunks": 0, "error": "insufficient_space", **short,
+                "embed_metrics": _embed_metrics("insufficient_space")}
     if not ensure_index(world, dim=dim, emeta=(emeta or None)):
-        return {"available": True, "indexed": 0, "chunks": 0, "error": "create_failed"}
+        err = _create_error.pop(world, "create_failed")
+        return {"available": True, "indexed": 0, "chunks": 0, "error": err, "embed_metrics": _embed_metrics(err)}
     new_idx = _building.get(world)  # ensure_index が作った物理索引（差し替えられた場合は None＝エイリアス名のまま）
-    analyzer_fallback = _created_analyzer.pop(world, None) == "standard"  # 日本語アナライザを作れず標準で作り直した
 
     # ---- Pass2: チャンクを 1 件ずつ受け取り、`_EMBED_FLUSH_CHUNKS` 件ごとにグループ化して bulk 送信する ----
     n_docs = 0
@@ -1958,7 +2113,7 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
     g_no_embed: list = []
     # `docs_done` は Pass2 が見終えた文書数（対象外の文書も含む）。`n_docs`（実際に索引した文書数）とは別に持ち、対象外が連続しても `total_docs` へ収束させる
     docs_done = 0
-    pass2_step = substage.begin("es_bulk", _ES_BULK_LABEL_DROPPED if old_dropped else "全文索引に書き込んでいます",
+    pass2_step = substage.begin("es_bulk", "全文索引に書き込んでいます",
                                 total=total_docs, logger=_embed_log, note=_free_space_note(world))
     if progress is not None:
         # Pass2 開始時に 0/total を明示通知する（間引きラッパーが Pass1 完走時の done を覚えているため）
@@ -2009,13 +2164,12 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
         rag_report["vectors_missing"] = sender.missing  # ベクトル無しで入れたチャンク（次の同期で足す）
     if ec is not None and had_embed_eligible and sender.missing >= eligible_chunks:
         rag_report["embed_degraded"] = True    # ベクトルを持つチャンクが 1 件も無い（全文検索のみ）
-    if analyzer_fallback:
-        rag_report["analyzer_fallback"] = True
 
     def _failure(error: str) -> dict:
         sender.close()
         _discard_building(world)  # 作りかけの物理索引だけ捨てる（エイリアスの指す古い索引はそのまま）
-        out = {"available": True, "indexed": 0, "chunks": 0, "error": error, **rag_report}
+        out = {"available": True, "indexed": 0, "chunks": 0, "error": error, **rag_report,
+               "embed_metrics": _embed_metrics(error)}
         if embed_calls_made:
             out["embed_elapsed_ms"] = round(embed_elapsed_ms)
         return out
@@ -2030,12 +2184,14 @@ def _index_world(world: str, settings, content_sig, progress) -> dict:
         _compact_building(world, sender.idx)
         substage.begin("es_swap", "全文索引を確定し、付け替えています", logger=_embed_log)
     _restore_refresh_interval(world, new_idx)  # 全バッチ成功＝最終 refresh で可視化済み・背景 refresh を通常へ戻す
-    _confirm_content_sig(world, content_sig, new_idx)  # 全バッチ成功後にだけ鮮度署名と実件数を確定する
-    if new_idx is not None and not _activate_index(world, new_idx):
-        return _failure("alias_swap_failed")
+    _confirm_content_sig(world, content_sig, new_idx, row=row)  # 全バッチ成功後にだけ鮮度署名と実件数を確定する
+    swap = _activate_index(world, new_idx, row=row) if new_idx is not None else es_publish.ACTIVATED
+    if swap != es_publish.ACTIVATED:
+        return _failure("alias_swap_failed" if swap == es_publish.NOT_ACTIVATED else "alias_swap_unknown")
     out = {"available": True, "indexed": n_docs, "chunks": total_chunks,
           "vectors": bool(embed_feature_applies and had_embed_eligible and sender.missing < eligible_chunks),
-          "embedded": embedded_total, "reused": reused_total, **rag_report}
+          "embedded": embedded_total, "reused": reused_total, **rag_report,
+          "embed_metrics": _embed_metrics()}
     if embed_calls_made:
         # `embed_elapsed_ms`: 埋め込み呼び出しの合計所要時間。一度も呼んでいなければキーを付けない（0 と欠落を区別する）
         out["embed_elapsed_ms"] = round(embed_elapsed_ms)
@@ -2179,7 +2335,21 @@ def _send_bulk(world: str, payloads: list) -> str | None:
     return None
 
 
-def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dict:
+def _drop_unused_embed_keys(world: str, rel: str, ec: dict, old_embedded: list, new_keys: set) -> None:
+    """入れ替えで使われなくなった古い切れ端の埋め込みのキャッシュのキーを、ほかの切れ端が同じ本文を使っていなければ消す。"""
+    candidates: dict = {}
+    for h in old_embedded:
+        if (h.get("_source") or {}).get("vector_text"):
+            continue  # まとまりの文字は本文の索引で同じものを確かめられない＝キーを残す（次の全体の作り直しで剪定される）
+        t = (h.get("_source") or {}).get("text")
+        if isinstance(t, str):
+            k = _chunk_key(ec, t)
+            if k not in new_keys:
+                candidates.setdefault(k, t)
+    _embed_cache_delete_keys(world, [k for k, t in candidates.items() if not _text_used_elsewhere(world, rel, t)])
+
+
+def replace_document(world: str, rel: str, rp: Path, *, row: ReplaceRow, content_sig: str) -> dict:
     """1 文書の切れ端だけを入れ替える（索引は消さない・ほかの文書の切れ端には触れない）。
     設計: docs/design/rag.md「失敗した資料のやり直し」
     ① 索引があり（切れ端が 0 件でもよい）、今の署名の世代で、埋め込みの素性が今の設定と同じか確かめる（違えば何も書かずに error）
@@ -2189,6 +2359,7 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
     ④ `content_sig` が今の署名と同じ索引なら `_meta.doc_count` を実件数に直す
     ⑤ 古い切れ端の埋め込みのキャッシュのキーを、ほかの切れ端が同じ本文を使っていなければ消す
     返値 `{available, error?, chunks, deleted, embedded, reused, doc_count}`（`chunks` はこの文書の切れ端の数・`doc_count` は索引全体）。
+    書き込みの前に行の `es` を「入れ替えた」にし、古い切れ端を消し終えたら「古いものを消した」にする。
     """
     if not available():
         return {"available": False, "error": "unavailable"}
@@ -2201,11 +2372,9 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
         return {"available": True, "error": "count_failed"}
     sys_s = _embed_system_settings_snapshot()
     ec = embeddings.cfg(_settings(None), system_settings=sys_s)
-    want = ((ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID, embeddings.ES_VECTOR_QUANT)
-            if ec else (None,) * 5)
-    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"), meta.get("quant"))
-    if want != have:
-        return {"available": True, "error": "embed_config_changed"}
+    ec, err = es_publish.update_embed_target(ec, meta)
+    if err:
+        return {"available": True, "error": err}
     with_vectors = ec is not None
     # ② 新しい切れ端
     wd = worlds.world_dir(world)
@@ -2245,6 +2414,7 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
     old_ids = [h["_id"] for h in old_hits]
     new_ids = set(ids)
     stale = [i for i in old_ids if i not in new_ids]
+    replace_rows.before_swap(row, world, "es")
     err = _send_bulk(world, _bulk_batches(ids, bodies, vec_by_idx)) if ids else None
     if err is None and stale:
         err = _send_bulk(world, _delete_payloads(stale))
@@ -2255,6 +2425,7 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
             return {"available": True, "error": f"{err}_rollback_failed"}
         return {"available": True, "error": err}
     old_embedded = [h for h in old_hits if h["_id"] in vec_ids]
+    replace_rows.after_old_removed(row, world, "es")
     # ④ 件数の印
     n = count(world)
     meta = _index_meta(world)
@@ -2265,20 +2436,8 @@ def replace_document(world: str, rel: str, rp: Path, *, content_sig: str) -> dic
             _req("PUT", f"/{_index(world)}/_mapping", {"_meta": {**meta, "doc_count": n}})
         except Exception:
             return {"available": True, "error": "meta_update_failed"}
-    # ⑤ 使われなくなった埋め込みのキャッシュのキー
     if with_vectors and old_embedded:
-        new_keys = {_chunk_key(ec, texts[i]) for i in embed_idx}
-        candidates: dict = {}
-        for h in old_embedded:
-            if (h.get("_source") or {}).get("vector_text"):
-                continue  # まとまりの文字は本文の索引で同じものを確かめられない＝キーを残す（次の全体の作り直しで剪定される）
-            t = (h.get("_source") or {}).get("text")
-            if isinstance(t, str):
-                k = _chunk_key(ec, t)
-                if k not in new_keys:
-                    candidates.setdefault(k, t)
-        _embed_cache_delete_keys(world, [k for k, t in candidates.items()
-                                         if not _text_used_elsewhere(world, rel, t)])
+        _drop_unused_embed_keys(world, rel, ec, old_embedded, {_chunk_key(ec, texts[i]) for i in embed_idx})   # ⑤
     return {"available": True, "chunks": len(ids), "deleted": len(stale),
             "embedded": embedded, "reused": reused, "doc_count": n}
 
@@ -2315,11 +2474,7 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
         return True
     if meta.get("analyzer_config_sig") != _analyzer_config_sig():
         return True
-    ec = embeddings.cfg(_settings(settings))
-    want = ((ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID, embeddings.ES_VECTOR_QUANT)
-            if ec else (None,) * 5)
-    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"), meta.get("quant"))
-    if want != have:
+    if not es_publish.embed_feature_matches(embeddings.cfg(_settings(settings)), meta):
         return True
     doc_count = meta.get("doc_count")
     return doc_count is not None and n != doc_count
@@ -2360,12 +2515,13 @@ def _vector_update_batches(ids: list, vecs: list) -> list:
     return out
 
 
-def fill_missing_vectors(world: str, settings: dict | None = None) -> dict:
+def fill_missing_vectors(world: str, settings: dict | None = None, *, ingest_no: int) -> dict:
     """ベクトル無しで入れたチャンク（`vector_status: missing`）の埋め込みを取り直し、ベクトルと `vector_status` だけを書き足す。取り込み（変更あり・なし）の最後に呼ぶ。
     設計: docs/design/rag.md「ベクトルの無いチャンク」
     ① 索引の埋め込み素性が今の設定と同じか確かめる（違えば何もしない＝再索引が作り直す） ② scroll で一度に `_EMBED_FLUSH_CHUNKS` 件ずつ読み、埋め込みを取る（キャッシュに入れる）
     ③ 取れたものだけ `_update` で書く（同じ ID への部分更新なので二重にならない）。取れなかったものは missing のまま次回へ。区切り（ページごと）で停止要求を確かめる。
     直近に埋め込みのまとまりが失敗していれば（`_EMBED_COOLDOWN_SEC`）送り先を叩き直さない。
+    `ingest_no` は呼び元が見ている索引の取り込みの番号。`_meta.ingest_no` と違えば（別の取り込みが入れ替えた索引へは）書かない。
     返値 `{available, filled, missing, error?, skipped?}`（`missing`＝終了後に残っている件数・取れなければ None）。
     """
     if not available():
@@ -2375,14 +2531,14 @@ def fill_missing_vectors(world: str, settings: dict | None = None) -> dict:
         return {"available": True, "filled": 0, "missing": before}
     sys_s = _embed_system_settings_snapshot()
     ec = embeddings.cfg(_settings(settings), system_settings=sys_s)
-    if ec is None:
+    if ec is None or ec.get("dim") is None:  # 次元が未実測なら埋め込めない
         return {"available": True, "filled": 0, "missing": before, "skipped": "embedding_not_configured"}
     meta = _index_meta(world)
     if meta is None:
         return {"available": True, "filled": 0, "missing": before, "error": "index_missing"}
-    want = (ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID, embeddings.ES_VECTOR_QUANT)
-    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"), meta.get("quant"))
-    if want != have:  # 設定が変わった索引は再索引が作り直す
+    if int(meta.get("ingest_no") or 0) != ingest_no:  # 別の取り込みが入れ替えた索引へは書かない
+        return {"available": True, "filled": 0, "missing": before, "skipped": "ingest_no_changed"}
+    if not es_publish.embed_feature_matches(ec, meta):  # 設定が変わった索引は再索引が作り直す
         return {"available": True, "filled": 0, "missing": before, "skipped": "embed_config_changed"}
     last_fail = _embed_failed_at.get(world)
     if last_fail is not None and time.monotonic() - last_fail < _EMBED_COOLDOWN_SEC:
@@ -2441,14 +2597,50 @@ def fill_missing_vectors(world: str, settings: dict | None = None) -> dict:
     return {"available": True, "filled": filled, "missing": count_missing_vectors(world)}
 
 
+def _search_embed_timeout_s() -> float:
+    """検索の質問の埋め込みの総期限（秒）。env `SHERPA_SEARCH_EMBED_TIMEOUT_SEC` が範囲外・数値でなければ既定。"""
+    raw = os.environ.get("SHERPA_SEARCH_EMBED_TIMEOUT_SEC", "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return _SEARCH_EMBED_TIMEOUT_DEFAULT
+    return v if _SEARCH_EMBED_TIMEOUT_MIN <= v <= _SEARCH_EMBED_TIMEOUT_MAX else _SEARCH_EMBED_TIMEOUT_DEFAULT
+
+
+def _embed_query(q: str, ec: dict, world: str):
+    """検索の質問 1 件の埋め込み。総期限（`_search_embed_timeout_s`）内に取れなければ None。`es_priority.prioritized` の中では同じ質問を 1 回しか埋め込まない。"""
+    return es_priority.embed_memo(q, ec, world, lambda: embeddings.embed([q], ec, world=world, deadline_s=_search_embed_timeout_s()))
+
+
+def _keyword_clause(q: str) -> dict:
+    """本文＋見出し系の欄を引く BM25 の節（本文が最も重い）。"""
+    return {"multi_match": {"query": q, "type": "best_fields", "tie_breaker": _BM25_TIE_BREAKER,
+                            "fields": [f"{f}^{_BM25_FIELD_BOOSTS[f]}" for f in _BM25_FIELDS]}}
+
+
+def _keyword_highlight() -> dict:
+    """当たった欄を知るためのハイライト（一致した欄だけが応答に出る）。"""
+    return {"fields": {f: {"fragment_size": 240 if f == "text" else 120, "number_of_fragments": 1}
+                       for f in _BM25_FIELDS}}
+
+
+def _matched_fields(highlight) -> list:
+    """ハイライトの応答から、語が当たった欄を `_BM25_FIELDS` の順で返す。"""
+    if not isinstance(highlight, dict):
+        return []
+    return [f for f in _BM25_FIELDS if highlight.get(f)]
+
+
 def _mark_keyword_all(hits: list) -> list:
     for h in hits:
         h["keyword_match"] = True
     return hits
 
 
-def _as_row_group_hit(hit: dict, src: dict) -> dict:
-    """意味検索で当たった表の行・本文のまとまりの先頭を、まとまりの本文・範囲に差し替える（`chunk_id` は先頭のまま）。"""
+def _as_row_group_hit(hit: dict, src: dict, exact: list | None = None) -> dict:
+    """意味検索で当たった表の行・本文のまとまりの先頭を、まとまりの本文・範囲に差し替える（`chunk_id` は先頭のまま）。
+    `exact` があれば、その識別子を持つ行の chunk_id を `row_group_exact_chunk_ids` に残す（先頭の行の識別子で当たった場合は先頭も含む）。
+    """
     group = src.get("row_group")
     vector_text = src.get("vector_text")
     if not isinstance(group, dict) or not isinstance(vector_text, str) or not vector_text:
@@ -2458,11 +2650,18 @@ def _as_row_group_hit(hit: dict, src: dict) -> dict:
         hit["locator"] = group["locator"]
     if isinstance(group.get("chunk_ids"), list):
         hit["row_group_chunk_ids"] = group["chunk_ids"]
+    rows = src.get("row_group_identifier_rows")
+    if exact and isinstance(rows, list):
+        wanted = set(exact)
+        matched = [r["chunk_id"] for r in rows
+                   if isinstance(r, dict) and isinstance(r.get("chunk_id"), str) and wanted.intersection(_str_list(r.get("values")))]
+        if matched:
+            hit["row_group_exact_chunk_ids"] = matched
     return hit
 
 
-def _parse_hits(res: dict, vector: bool = False) -> list:
-    """ES の応答をヒットの形にする。`vector=True`（kNN の応答）は表の行・本文のまとまりをまとまりの本文で返す。"""
+def _parse_hits(res: dict, vector: bool = False, exact: list | None = None) -> list:
+    """ES の応答をヒットの形にする。`vector=True`（kNN の応答）は表の行・本文のまとまりをまとまりの本文で返す（`exact` は `_as_row_group_hit` へ渡す）。"""
     out = []
     for h in res.get("hits", {}).get("hits", []):
         src = h.get("_source", {})
@@ -2470,64 +2669,21 @@ def _parse_hits(res: dict, vector: bool = False) -> list:
         frag = (h.get("highlight", {}).get("text") or [full])[0]
         hit = {"doc_id": src.get("doc_id"), "line": src.get("line"),
                "text": frag, "score": h.get("_score"), "ext": src.get("ext")}
-        # 抽出来歴・rag_chunks 由来メタ・重要度を表示用にそのまま渡す（無ければ付けない）。`parent_id` は親返しが読む。`importance_source` は出典には出さないので含めない
+        if h.get("highlight", {}).get("text"):
+            hit["highlight_fragment"] = True  # text は原本の行に合わない断片
+        matched = _matched_fields(h.get("highlight"))
+        if matched:
+            hit["matched_fields"] = matched  # 語が当たった欄（text／labels／region_context）
+        # 抽出来歴・rag_chunks 由来メタを表示用にそのまま渡す（無ければ付けない）。`parent_id` は親返しが読む
         for k in ("extraction_method", "confidence", "has_conflicts", "chunk_id", "locator",
-                  "previous_chunk_id", "next_chunk_id", "parent_id", "logical_record_id", "section_path",
-                  "importance", "importance_reason"):
+                  "previous_chunk_id", "next_chunk_id", "parent_id", "logical_record_id", "section_path"):
             if src.get(k) is not None:
                 hit[k] = src[k]
-        out.append(_as_row_group_hit(hit, src) if vector else hit)
+        out.append(_as_row_group_hit(hit, src, exact) if vector else hit)
     return out
 
 
-def _importance_boost_query(bool_query: dict) -> dict:
-    """`bool_query`（`{"bool": {...}}`）を function_score で包み、`importance` に応じてスコアを乗算する（`高`＝`_ES_IMPORTANCE_BOOST_HIGH` 倍・`低`＝`_ES_IMPORTANCE_BOOST_LOW` 倍）。
-    `importance` を持たない文書（`中`／未設定・重要度制御ファイルの無い資料フォルダ）はどちらの filter にも一致せず 1 倍＝スコア不変。`score_mode="first"`（`importance` は単一値）・`boost_mode="multiply"`。
-    """
-    return {"function_score": {
-        "query": bool_query,
-        "functions": [
-            {"filter": {"term": {"importance": "高"}}, "weight": _ES_IMPORTANCE_BOOST_HIGH},
-            {"filter": {"term": {"importance": "低"}}, "weight": _ES_IMPORTANCE_BOOST_LOW},
-        ],
-        "score_mode": "first", "boost_mode": "multiply",
-    }}
-
-
-def _importance_score_multiplier(v) -> float:
-    if v == "高":
-        return _ES_IMPORTANCE_BOOST_HIGH
-    if v == "低":
-        return _ES_IMPORTANCE_BOOST_LOW
-    return 1.0
-
-
-def _rerank_knn_by_importance(hits: list) -> list:
-    """純 kNN（`search_knn_only`）専用の取得後の再ランク。`knn` 節は function_score で包めないため、返ってきたスコアへ `_importance_boost_query` と同じ乗数を Python 側で掛け、安定ソートで並べ直す。
-    `importance` の無いヒット（重要度制御ファイルの無い資料フォルダ）は乗数 1.0 のままでスコア・順序とも不変。
-    """
-    for h in hits:
-        if h.get("score") is not None:
-            h["score"] = h["score"] * _importance_score_multiplier(h.get("importance"))
-    hits.sort(key=lambda h: -(h.get("score") or 0.0))
-    return hits
-
-
-def _classify_query_exception(exc: Exception) -> str:
-    """BM25 クエリ実行時の例外を固定コードへ分類する（呼び出し元が回復可否を区別できるよう、握りつぶす前に 1 回だけ判定する）。例外は再送出しない（`search()`／`search_knn_only()` は例外を投げず `(hits, degrade_reason)` を返す契約）。
-    - `HTTPError`: 404（索引未作成）・429・5xx は `es_query_failed`（回復可能）、それ以外の 4xx（クエリの拒否）は `es_query_rejected`（回復不可）。
-    - それ以外の `OSError`（接続断・タイムアウト等）は `es_query_failed`。
-    - 非通信例外（`JSONDecodeError`／`TypeError`／`KeyError` 等＝想定外の応答形）は `es_query_rejected`。
-    """
-    if isinstance(exc, urllib.error.HTTPError):
-        return ("es_query_failed" if (exc.code in (404, 429) or 500 <= exc.code <= 599)
-               else "es_query_rejected")
-    if isinstance(exc, OSError):
-        return "es_query_failed"
-    return "es_query_rejected"
-
-
-def _fuse_hybrid(bm25_res: dict, knn_res: dict, k: int) -> list:
+def _fuse_hybrid(bm25_res: dict, knn_res: dict, k: int, exact: list | None = None) -> list:
     """BM25 と kNN の ES 応答を RRF（`fused_search.fuse_rrf`）で融合し、`_parse_hits` の形で上位 k 件を返す。
     重みは `_HYBRID_WEIGHT`（keyword）と残り（vector）を合計 2.0 に配分（0.5＝対等＝各 1.0）。score は RRF の点数。
     `keyword_match` はここでは BM25 の上位に出たか（kNN だけのヒットは `_mark_keyword_matches` が語の一致で付け直す）。本文・ハイライトは BM25 側を優先し、kNN だけのヒットは kNN 側の本文（ハイライトなし）。`engine_ranks` に融合前の順位を残す。
@@ -2543,7 +2699,7 @@ def _fuse_hybrid(bm25_res: dict, knn_res: dict, k: int) -> list:
     weights = {"keyword": _HYBRID_WEIGHT * 2.0, "vector": (1.0 - _HYBRID_WEIGHT) * 2.0}
     out = []
     for m in fuse_rrf(per_engine, weights, k):
-        hit = _parse_hits({"hits": {"hits": [raw[m["doc_id"]]]}}, vector="vector" in m["sources"])[0]
+        hit = _parse_hits({"hits": {"hits": [raw[m["doc_id"]]]}}, vector="vector" in m["sources"], exact=exact)[0]
         hit["score"] = m["score"]
         hit["keyword_match"] = "keyword" in m["sources"]
         hit["engine_ranks"] = dict(m["sources"])
@@ -2553,22 +2709,25 @@ def _fuse_hybrid(bm25_res: dict, knn_res: dict, k: int) -> list:
 
 
 def _mark_keyword_matches(world: str, query: str, hits: list) -> list:
-    """融合の結果のうち BM25 の上位に出なかったヒットについて、語が一致するか（`match` に当たるか）を ES に問い合わせて `keyword_match` を付け直す。
-    問い合わせに失敗したら付け直さない（False のまま）。
+    """融合の結果のうち BM25 の上位に出なかったヒットについて、語が一致するか（本文・見出し系の欄のどれかに当たるか）を ES に問い合わせて `keyword_match`・`matched_fields` を付け直す。
+    問い合わせに失敗したら一致の有無が分からない＝`keyword_match` を None にする（False＝語を含まない、と見せない）。
     """
     es_ids = {id(h): h.pop("_es_id", None) for h in hits}
     ids = [es_ids[id(h)] for h in hits if not h.get("keyword_match") and es_ids[id(h)]]
     if not ids:
         return hits
-    body = {"size": len(ids), "_source": False,
-            "query": {"bool": {"filter": [{"ids": {"values": ids}}], "must": [{"match": {"text": query}}]}}}
+    body = {"size": len(ids), "_source": False, "highlight": _keyword_highlight(),
+            "query": {"bool": {"filter": [{"ids": {"values": ids}}], "must": [_keyword_clause(query)]}}}
     try:
-        matched = {h["_id"] for h in _req("POST", f"/{_index(world)}/_search", body).get("hits", {}).get("hits", [])}
+        matched = {h["_id"]: _matched_fields(h.get("highlight"))
+                   for h in _search_req(world, body).get("hits", {}).get("hits", [])}
     except Exception:
-        return hits
+        return [{**h, "keyword_match": None} if not h.get("keyword_match") else h for h in hits]
     for h in hits:
         if not h.get("keyword_match") and es_ids[id(h)] in matched:
             h["keyword_match"] = True
+            if matched[es_ids[id(h)]]:
+                h["matched_fields"] = matched[es_ids[id(h)]]
     return hits
 
 
@@ -2583,15 +2742,18 @@ def normalize_exact(exact) -> list:
     return list(dict.fromkeys(v for v in out if v and len(v) <= _EXACT_VALUE_MAX_CHARS))[:_EXACT_MAX_VALUES]
 
 
-def _exact_filter(exact: list) -> dict:
-    """識別子の完全一致（keyword の terms）。チャンクに出る識別子の全役割、またはそのレコードが定義している識別子のどちらかに一致すれば当たる。"""
-    return {"bool": {"should": [{"terms": {"identifier_values": exact}},
-                                {"terms": {"record_identity_values": exact}}],
-                     "minimum_should_match": 1}}
+def _exact_filter(exact: list, row_group: bool = False) -> dict:
+    """識別子の完全一致（keyword の terms）。チャンクに出る識別子の全役割、またはそのレコードが定義している識別子のどちらかに一致すれば当たる。
+    `row_group=True`（kNN 用・ベクトルはまとまりの先頭にしか無い）は、先頭が持つ構成行の識別子の集合（`row_group_identifier_values`）にも当たる。
+    """
+    should = [{"terms": {"identifier_values": exact}}, {"terms": {"record_identity_values": exact}}]
+    if row_group:
+        should.append({"terms": {"row_group_identifier_values": exact}})
+    return {"bool": {"should": should, "minimum_should_match": 1}}
 
 
 def search_exact(world: str, exact: list, scope_paths=None, k: int = 20, layer=None,
-                 k_ceiling: int | None = None) -> tuple[list, str | None]:
+                 k_ceiling: int | None = None, _prio_only: bool | None = None) -> tuple[list, str | None]:
     """識別子の完全一致だけで引く（本文検索を使わない）。`exact` は `normalize_exact` 済みの値。
     そのレコードが定義している識別子（`record_identity_values`）に当たるチャンクを先に並べる。範囲・層のフィルタは `search()` と同じ。
     返値 `(hits, degrade_reason|None)`（`search()` と同じ形・全ヒットに `keyword_match` を付ける）。
@@ -2600,32 +2762,32 @@ def search_exact(world: str, exact: list, scope_paths=None, k: int = 20, layer=N
         return [], None
     if not available():
         return [], "es_unavailable"
+    rules = path_rules.rules_for(world)
     k = max(1, min(k, k_ceiling if k_ceiling is not None else _ES_SEARCH_K_MAX))
-    flt = [_exact_filter(exact)]
-    sel = scope_mod.normalize_scope_paths(scope_paths)
-    if sel:
-        flt.append({"terms": {"scopes": sel}})
+    if _prio_only is None:
+        return es_priority.prioritized(rules, lambda only: search_exact(world, exact, scope_paths, k, layer, k_ceiling, only), k)
+    flt = [_exact_filter(exact), *es_priority.scope_filters(rules, scope_paths, _prio_only)]
     lfilt = layer_mod.es_filter(layer)
     if lfilt:
         flt.append(lfilt)
-    body = {"size": k, "query": _importance_boost_query(
-        {"bool": {"filter": flt, "should": [{"terms": {"record_identity_values": exact}}]}})}
+    body = {"size": k, "query": {"bool": {"filter": flt, "should": [{"terms": {"record_identity_values": exact}}]}}}
     try:
-        return _mark_keyword_all(_parse_hits(_req("POST", f"/{_index(world)}/_search", body))), None
+        return _mark_keyword_all(_parse_hits(_search_req(world, body))), None
     except Exception as exc:
         return [], _classify_query_exception(exc)
 
 
 def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict | None = None,
-          vector: bool = True, layer=None, k_ceiling: int | None = None, exact: list | None = None) -> tuple[list, str | None]:
+          vector: bool = True, layer=None, k_ceiling: int | None = None, exact: list | None = None, _prio_only: bool | None = None) -> tuple[list, str | None]:
     """検索。`vector=True` かつ埋め込み設定があれば kNN＋BM25 のハイブリッド、無ければ BM25。範囲フィルタ・graceful。
     `vector=False` は BM25 のみ（クエリ埋め込みを呼ばない・reason は常に None）。
     `k_ceiling`（省略可）: 呼び出し元が上限まで検証済みの `k` を渡す場合（`agentic_search.run_tool` の `es_search`）、`_ES_SEARCH_K_MAX` による再クランプを迂回してこちらを使う。
     `layer`（省略可・`"docs"|"code"|"both"`・既定 both）: `scopes` と同じ `filter` 節に `branch` の term／must_not フィルタを積む（`layer.es_filter`）。
     `exact`（省略可・`normalize_exact` 済み）: 識別子の完全一致で先に絞ってから本文で順位付けする（BM25・kNN の両方に同じフィルタを掛ける）。
-    各ヒットに `keyword_match`（語が一致したか）を付ける。hybrid は BM25 の上位に出たヒットは True、kNN だけで出たヒットは語の一致を問い合わせて付ける（問い合わせの失敗は False）・BM25 のみの経路は全件 True。
+    BM25 は本文に加え、見出し系の欄（`labels`・`region_context`）も本文より軽い重みで引き、語が当たった欄を `matched_fields` に示す。質問の埋め込みは総期限（`_search_embed_timeout_s`）内に取れなければ `query_embed_failed` で BM25 だけにする。
+    各ヒットに `keyword_match`（語が一致したか）を付ける。hybrid は BM25 の上位に出たヒットは True、kNN だけで出たヒットは語の一致を問い合わせて付ける（問い合わせの失敗は None＝不明）・BM25 のみの経路は全件 True。
     返値 `(hits, degrade_reason|None)`（`search_knn_only()` と同じ形）。degrade 時も BM25 の hits をそのまま返す（reason は「hybrid でなく BM25 だけになった理由」の注記）。`es_unavailable`／クエリ空は `[]`。
-    degrade_reason: `es_unavailable`／`embedding_not_configured`（埋め込み未設定）／`embedding_cloud_unavailable`／`vector_feature_mismatch`（索引の埋め込み素性が現在の設定と不一致＝再索引待ち）／`query_embed_failed`／`hybrid_query_failed`（hybrid が失敗し BM25 は成功）／`es_query_failed`（BM25 も失敗・一時的）／`es_query_rejected`（BM25 も失敗・クエリ不備）。`fused_search.DEGRADE_REASONS` と同一集合（増やすときは両方直す）。
+    degrade_reason: `es_unavailable`／`embedding_not_configured`（埋め込み未設定）／`embedding_cloud_unavailable`／`vector_feature_mismatch`（索引の埋め込み素性が現在の設定と不一致＝再索引待ち）／`query_embed_failed`／`hybrid_query_failed`（hybrid が失敗し BM25 は成功）／`es_query_failed`（BM25 も失敗・一時的。時間切れ・一部の分割の失敗・索引の素性を読めないときもこれ）／`es_query_rejected`（BM25 も失敗・クエリ不備）。`fused_search.DEGRADE_REASONS` と同一集合（増やすときは両方直す）。
     reason は呼び出し元が tool result 経由で思考の流れ（UI）へ表示する。
     """
     q = (query or "").strip()
@@ -2633,31 +2795,33 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
         return [], None
     if not available():
         return [], "es_unavailable"
+    rules = path_rules.rules_for(world)
     k = max(1, min(k, k_ceiling if k_ceiling is not None else _ES_SEARCH_K_MAX))
-    flt = []
-    sel = scope_mod.normalize_scope_paths(scope_paths)
-    if sel:
-        flt.append({"terms": {"scopes": sel}})  # 選択 prefix のいずれかを含む doc に限定
+    if _prio_only is None:
+        return es_priority.prioritized(rules, lambda only: search(world, query, scope_paths, k, settings, vector, layer, k_ceiling, exact, only), k)
+    flt = es_priority.scope_filters(rules, scope_paths, _prio_only)  # 選択 prefix のいずれかを含む doc に限定＋管理者の除外（＋優先の下だけ）
     lfilt = layer_mod.es_filter(layer)
     if lfilt:
         flt.append(lfilt)
+    knn_flt = flt + [_exact_filter(exact, row_group=True)] if exact else flt  # kNN だけ、まとまりの構成行の識別子にも当てる
     if exact:
         flt.append(_exact_filter(exact))
-    hl = {"fields": {"text": {"fragment_size": 240, "number_of_fragments": 1}}}
-    bm25 = {"size": k, "query": _importance_boost_query({"bool": {"must": [{"match": {"text": q}}], "filter": flt}}),
-           "highlight": hl}
+    bm25 = {"size": k, "query": {"bool": {"must": [_keyword_clause(q)], "filter": flt}},
+           "highlight": _keyword_highlight()}
     # `cfg()` と `cloud_selected_but_unavailable()` を同じ system_settings スナップショットで呼ぶ（kill-switch 有効時は読まない）
     sys_s = _embed_system_settings_snapshot() if vector else None
-    ec = embeddings.cfg(_settings(settings), system_settings=sys_s) if vector else None
+    meta, meta_failed = _index_meta_read(world) if vector else (None, False)  # 次元は索引のメタを正にする（検索の経路で Ollama へ測りに行かない）
+    ec = embeddings.cfg(_settings(settings), system_settings=sys_s, probe=False, index_dim=(meta or {}).get("dim")) if vector else None
     reason = None
-    if vector and ec is None:
-        if embeddings.cloud_selected_but_unavailable(system_settings=sys_s):
-            reason = "embedding_cloud_unavailable"
-            _log.warning("es_index.search: 選択中クラウドの埋め込みが解決できず world=%s は BM25 のみへ降格しました",
-                         world)
-        else:
-            reason = "embedding_not_configured"  # 埋め込み未設定＝BM25 だけで検索した（注記のみ・失敗ではない）
-    meta = (_index_meta(world) or {}) if ec else {}
+    if vector and (ec is None or ec.get("dim") is None):
+        reason = es_publish.no_embedding_reason(ec, meta_failed, sys_s)  # 未設定・次元不明＝BM25 だけで検索した（注記のみ・失敗ではない）
+        if reason == "es_query_failed":
+            return [], reason  # 索引のメタを読めない＝埋め込み未設定とは別の障害
+        if reason == "embedding_cloud_unavailable":
+            _log.warning("es_index.search: 埋め込みの接続先が使えず world=%s は BM25 のみへ降格しました", world)
+        ec = None
+    if ec and meta is None:
+        return [], "es_query_failed"  # 索引の素性を読めない＝ベクトル設定の不一致とは別の障害
     same = bool(ec) and (meta.get("embed_provider") == ec["provider"]
                          and meta.get("embed_model") == ec["model"] and meta.get("dim") == ec["dim"]
                          and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID
@@ -2666,29 +2830,28 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
         # 索引のベクトル素性が現在の埋め込み設定と合わない（再索引待ち）。kNN は打てないので BM25 のみへ縮退し、クエリ埋め込みも呼ばない。理由を返して静かな縮退にしない
         reason = "vector_feature_mismatch"
     if same:  # 索引のベクトル素性が一致する時だけ kNN
-        qv = embeddings.embed([q], ec, world=world)
+        qv = _embed_query(q, ec, world)
         qb = embeddings.vector_to_es_bytes(qv[0]) if qv else None
         if qb is not None:
             # ① BM25（ハイライト付き）を先に引く。失敗は kNN を打たず BM25 失敗の reason で返す
             try:
-                bm25_res = _req("POST", f"/{_index(world)}/_search", bm25)
+                bm25_res = _search_req(world, bm25)
             except Exception as exc:
                 return [], _classify_query_exception(exc)
-            # ② kNN（同じ filter・k・num_candidates）。重要度ブーストは function_score で kNN 側へ掛ける（重要度なしの資料フォルダでは不変）
+            # ② kNN（同じ k・num_candidates。filter は exact だけ構成行の識別子にも当てる）
             knn_clause = {"knn": {"field": "embedding", "query_vector": qb, "k": k,
-                                  "num_candidates": max(50, k * 5), "filter": flt}}
+                                  "num_candidates": max(50, k * 5), "filter": knn_flt}}
             try:
-                knn_res = _req("POST", f"/{_index(world)}/_search",
-                               {"size": k, "query": _importance_boost_query(knn_clause)})
+                knn_res = _search_req(world, {"size": k, "query": knn_clause})
             except Exception:
                 # kNN だけの失敗は BM25 の結果をそのまま返す（hits は空にならない＝`es_query_failed` とは別の reason）
                 return _mark_keyword_all(_parse_hits(bm25_res)), "hybrid_query_failed"
             # ③ アプリ側で RRF 融合（設計: docs/design/rag.md「融合検索（RRF）」）④ kNN だけで出たヒットにも語が一致するかを付け直す
-            return _mark_keyword_matches(world, q, _fuse_hybrid(bm25_res, knn_res, k)), None
+            return _mark_keyword_matches(world, q, _fuse_hybrid(bm25_res, knn_res, k, exact)), None
         else:
             reason = "query_embed_failed"  # クエリ埋め込みの通信失敗 → BM25 へ
     try:
-        return _mark_keyword_all(_parse_hits(_req("POST", f"/{_index(world)}/_search", bm25))), reason
+        return _mark_keyword_all(_parse_hits(_search_req(world, bm25))), reason
     except Exception as exc:
         # BM25 自体も失敗＝hits 空を最優先の理由で説明する
         return [], _classify_query_exception(exc)
@@ -2696,7 +2859,7 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
 
 def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
                     settings: dict | None = None, layer=None, k_ceiling: int = 50,
-                    exact: list | None = None) -> tuple[list, str | None]:
+                    exact: list | None = None, _prio_only: bool | None = None) -> tuple[list, str | None]:
     """純 kNN 検索（BM25 を混ぜない・fused_search の vector エンジン用）。`search()` は kNN＋BM25 のハイブリッド固定のため、engines=["vector"] 単独用に top-level `knn` のみのクエリを発行する。
     返値 `(hits, degrade_reason|None)`。hits は `_parse_hits` 形 `{doc_id, line, text, score, ext}`。
     degrade_reason: es_unavailable／embedding_not_configured／embedding_cloud_unavailable／vector_feature_mismatch／query_embed_failed／es_query_failed（一時的）／es_query_rejected（クエリ不備）（`parts/read/fused_search.py` の `DEGRADE_REASONS` と同一・増やすときは両方直す）。
@@ -2708,41 +2871,38 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
         return [], None
     if not available():
         return [], "es_unavailable"
+    rules = path_rules.rules_for(world)
     k = max(1, min(k, k_ceiling))
+    if _prio_only is None:
+        return es_priority.prioritized(rules, lambda only: search_knn_only(world, query, scope_paths, k, settings, layer, k_ceiling, exact, only), k)
     # `cfg()` と `cloud_selected_but_unavailable()` を同じ system_settings スナップショットで呼ぶ（`search()` と同じ）
     sys_s = _embed_system_settings_snapshot()
-    ec = embeddings.cfg(_settings(settings), system_settings=sys_s)
-    if not ec:
-        if embeddings.cloud_selected_but_unavailable(system_settings=sys_s):
-            return [], "embedding_cloud_unavailable"
-        return [], "embedding_not_configured"
-    meta = _index_meta(world) or {}  # GET 失敗は未設定相当＝ベクトル素性不一致として扱う
+    meta, meta_failed = _index_meta_read(world)  # 次元は索引のメタを正にする（検索の経路で Ollama へ測りに行かない）
+    ec = embeddings.cfg(_settings(settings), system_settings=sys_s, probe=False, index_dim=(meta or {}).get("dim"))
+    if ec is None or ec.get("dim") is None:
+        return [], es_publish.no_embedding_reason(ec, meta_failed, sys_s)
+    if meta is None:
+        return [], "es_query_failed"  # 索引の素性を読めない＝ベクトル設定の不一致とは別の障害
     if not (meta.get("embed_provider") == ec["provider"]
             and meta.get("embed_model") == ec["model"] and meta.get("dim") == ec["dim"]
             and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID
             and meta.get("quant") == embeddings.ES_VECTOR_QUANT):
         return [], "vector_feature_mismatch"  # 索引素性ズレ
-    qv = embeddings.embed([q], ec, world=world)
+    qv = _embed_query(q, ec, world)
     qb = embeddings.vector_to_es_bytes(qv[0]) if qv else None
     if qb is None:
         return [], "query_embed_failed"
-    flt = []
-    sel = scope_mod.normalize_scope_paths(scope_paths)
-    if sel:
-        flt.append({"terms": {"scopes": sel}})  # `search()` と同一の範囲フィルタ
+    flt = es_priority.scope_filters(rules, scope_paths, _prio_only)  # `search()` と同一の範囲フィルタ
     lfilt = layer_mod.es_filter(layer)
     if lfilt:
         flt.append(lfilt)
     if exact:
-        flt.append(_exact_filter(exact))
-    # 上位ちょうど `k` 件を取ってから重要度で並べ替えると、「高」のヒットが取得時点で落選して浮上できない。有界の overfetch（`k*3`・上限 `k+50`）で多めに取り、補正・再ソートの後に `k` 件へ切る（重要度なしの資料フォルダは補正が no-op で結果不変）
-    fetch_k = min(k * 3, k + 50)
-    body = {"size": fetch_k,
-            "knn": {"field": "embedding", "query_vector": qb, "k": fetch_k,
-                    "num_candidates": max(50, fetch_k * 5), "filter": flt}}
+        flt.append(_exact_filter(exact, row_group=True))  # ベクトルはまとまりの先頭にしか無い＝構成行の識別子にも当てる
+    # 候補数（num_candidates）は変えない
+    body = {"size": k,
+            "knn": {"field": "embedding", "query_vector": qb, "k": k,
+                    "num_candidates": max(50, min(k * 3, k + 50) * 5), "filter": flt}}
     try:
-        # 純 kNN は function_score で包めないため、取得後の再ランクで重要度ブーストを適用する
-        hits = _rerank_knn_by_importance(_parse_hits(_req("POST", f"/{_index(world)}/_search", body), vector=True))
-        return hits[:k], None
+        return _parse_hits(_search_req(world, body), vector=True, exact=exact), None
     except Exception as exc:
         return [], _classify_query_exception(exc)

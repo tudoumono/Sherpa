@@ -158,7 +158,7 @@ def test_admin_settings_get_shape(admin):
 
 
 def test_admin_settings_get_unset_defaults(admin):
-    from sherpa import agentic_search, chat_turns, depth_profile, impact_service, lens_service, chat_service
+    from sherpa import agentic_search, chat_turns, depth_profile
     from sherpa import chat_examples as ce
     body = admin.get(_ADMIN).json()
 
@@ -179,9 +179,7 @@ def test_admin_settings_get_unset_defaults(admin):
     assert set(dp.keys()) == set(depth_profile.BASE_SETTINGS_KEYS)
     for key, default in (
         ("grep_max_hits", agentic_search.MAX_HITS),
-        ("qa_max_hits", chat_service.QA_MAX_HITS_DEFAULT), ("read_window", agentic_search.READ_WINDOW),
-        ("impact_depth", impact_service.IMPACT_MAX_DEPTH),
-        ("troubleshoot_depth", lens_service.TROUBLESHOOT_GRAPH_DEPTH),
+        ("read_window", agentic_search.READ_WINDOW),
     ):
         assert dp[key] == {"configured": None, "effective": default, "default": default}, key
     assert dp["codex_reasoning"]["configured"] is None
@@ -235,13 +233,12 @@ _REJECTED_BODIES = [
     {"model_catalog": {"opneai": {"chat": {"allowed": ["x"], "default": "x"}}}},          # 未知 provider
     {"model_catalog": {"openai": {"bogus-usage": {"allowed": ["x"], "default": "x"}}}},   # 未知 usage
     # 真偽値・語彙
-    {"web_search_allowed": "yes"}, {"web_search_allowed": 1}, {"web_search_allowed": "true"},
+    {"web_search_allowed": "yes"}, {"web_search_allowed": 1}, {"web_search_allowed": "true"}, {"ocr_enabled": "yes"}, {"ocr_enabled": 1},
     {"research_default_provider": "gemini"},
     {"depth_base_codex_reasoning": "ultra"}, {"codex_mode": "invalid"},
     {"embed_provider": "gemini"}, {"embed_provider": ""}, {"embed_provider": 3},
     # 整数の範囲（StrictInt+Field(ge,le)）・非整数・bool
     {"depth_base_grep_max_hits": 0}, {"depth_base_grep_max_hits": 5000}, {"depth_base_read_window": 5},
-    {"depth_base_impact_depth": 100}, {"depth_base_troubleshoot_depth": 0},
     {"depth_base_grep_max_hits": "twelve"}, {"depth_base_grep_max_hits": True},
     *[{"embed_parallel": b} for b in (0, -1, 17, True, "3", 1.5)],
     *[{"embed_dim": b} for b in (0, 63, 4097, True, "512", 1.5)],
@@ -290,6 +287,18 @@ def test_admin_settings_retired_provider_keys_are_ignored(admin):
     assert "gemini_key_set" not in r.json()["cloud"] and "bedrock_key_set" not in r.json()["cloud"]
 
 
+def test_admin_settings_ignores_stored_values_of_retired_depth_keys(admin):
+    """廃止した影響・原因の段数と内容の質問の件数が DB に残っていても、画面の応答には出ず、別の項目の保存も通る。"""
+    for key, value in (("depth_base_qa_max_hits", 25), ("depth_base_impact_depth", 12),
+                       ("depth_base_troubleshoot_depth", 6), ("depth_base_read_window", 80)):
+        _insert_raw_setting(key, value)
+    store._invalidate_system_settings_cache()
+    dp = admin.get(_ADMIN).json()["depth_profile"]
+    assert set(dp) == {"grep_max_hits", "read_window", "codex_reasoning"}
+    assert dp["read_window"]["configured"] == 80
+    assert _put(admin, {"depth_base_grep_max_hits": 50}).status_code == 200
+
+
 def test_admin_settings_cloud_provider_raw_persists_even_when_equal_to_default(admin):
     """既定と同じ openai を明示 PUT しても生の保存値が残る（A7 の fail-loud 判定が効く前提）。"""
     assert admin.get(_ADMIN).json()["cloud"]["provider_raw"] is None
@@ -329,10 +338,7 @@ def test_put_settings_agent_codex_rejected_when_codex_cli_missing(monkeypatch, a
 # (PUT のキー, 値, 応答内の view への経路, null 後の既定値（None なら view["default"]）)
 _ROUNDTRIPS = [
     ("depth_base_grep_max_hits", 50, ("depth_profile", "grep_max_hits"), None),
-    ("depth_base_qa_max_hits", 25, ("depth_profile", "qa_max_hits"), None),
     ("depth_base_read_window", 80, ("depth_profile", "read_window"), None),
-    ("depth_base_impact_depth", 12, ("depth_profile", "impact_depth"), None),
-    ("depth_base_troubleshoot_depth", 6, ("depth_profile", "troubleshoot_depth"), None),
     ("depth_base_codex_reasoning", "high", ("depth_profile", "codex_reasoning"), None),
     ("chat_max_turns_per_user", 5, ("chat_max_turns", "per_user"), None),
     ("chat_max_turns_global", 30, ("chat_max_turns", "global"), None),
@@ -562,10 +568,24 @@ def test_admin_settings_ollama_url_and_allowlist_set_together_then_removable(adm
     assert r3.json()["ollama_allowlist"]["configured"] == ["10.9.9.8:11434"]
 
 
-def test_admin_settings_ollama_url_change_must_be_authorized_by_pending_allowlist_not_old(admin):
-    """新 URL は置換後の allowlist で検証する（旧一覧にだけ残るホストへ旧権限で変更できない）。"""
-    assert _put(admin, {"ollama_allowlist": ["10.9.9.9:11434"]}).status_code == 200
-    r = _put(admin, {"ollama_allowlist": ["10.9.9.8:11434"], "ollama_url": "http://10.9.9.9:11434"})
+def test_admin_settings_ollama_url_on_another_pc_saves_without_allowlist_and_is_usable(admin):
+    """別のパソコンの Ollama を既定の接続先にするとき、「利用者が選べる接続先」へ登録しなくても保存でき、
+    回答・埋め込み・画像の読み取りが使う宛先の判定も通る。"""
+    from sherpa import llm
+    assert _put(admin, {"ollama_allowlist": []}).status_code == 200
+    r = _put(admin, {"ollama_url": "http://10.9.9.7:11434"})
+    assert r.status_code == 200, r.text
+    assert r.json()["cloud"]["ollama_url"] == "http://10.9.9.7:11434"
+    assert r.json()["ollama_allowlist"]["configured"] is None
+    llm.assert_ollama_url_allowed("http://10.9.9.7:11434", system_settings=store.get_system_settings())
+    with pytest.raises(llm.SsrfBlocked):   # 既定以外の未登録の宛先は今までどおり通さない
+        llm.assert_ollama_url_allowed("http://10.9.9.6:11434", system_settings=store.get_system_settings())
+
+
+@pytest.mark.parametrize("url", ["http://user:pw@10.9.9.7:11434", "http://10.9.9.7:11434/api",
+                                 "http://10.9.9.7:11434/?x=1", "ftp://10.9.9.7:11434", "10.9.9.7:11434"])
+def test_admin_settings_ollama_url_rejects_malformed_url(admin, url):
+    r = _put(admin, {"ollama_url": url})
     assert r.status_code == 422, r.text
 
 
@@ -577,6 +597,7 @@ def test_admin_settings_ollama_url_unchanged_allowed_even_if_allowlist_narrowed_
     assert r2.status_code == 200, r2.text
     assert r2.json()["ollama_allowlist"]["configured"] is None
     assert r2.json()["cloud"]["ollama_url"] == "http://10.9.9.9:11434"
+    assert r2.json()["ollama_allowlist"]["effective"] == ["10.9.9.9:11434"]   # 一覧を空にしても既定の接続先は使える
 
 
 # ===== openai_endpoint_kind/openai_base_url のクロス検証（書込み直前の原子性） =====
@@ -747,34 +768,6 @@ def test_seed_system_settings_once_does_not_reinsert_key_deleted_after_marker_se
     assert store.get_system_settings().get("openai_api_key") is None
 
 
-def test_seed_system_settings_once_ollama_allowlist_merge_only_when_url_newly_inserted():
-    """URL を新規挿入できたときだけ既存 allowlist へ host:port を追記する。URL 行が既にあれば allowlist に触れない。"""
-    merge = ("ollama_url", "central.internal:11434")
-    store.set_system_settings("admin-uid", {"ollama_allowlist": ["10.1.1.1:11434"]})
-    applied, _ = store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434", "env_seed_version": 1},
-        guard_key="env_seed_version", ollama_allowlist_merge=merge)
-    assert applied["ollama_url"] == "http://central.internal:11434"
-    assert set(applied["ollama_allowlist"]) == {"10.1.1.1:11434", "central.internal:11434"}
-    assert set(store.get_system_settings()["ollama_allowlist"]) == {"10.1.1.1:11434", "central.internal:11434"}
-
-    _clear_system_settings()
-    store.set_system_settings("admin-uid", {"ollama_url": "http://already-set.internal:11434"})
-    applied, conflicts = store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434", "env_seed_version": 1},
-        guard_key="env_seed_version", ollama_allowlist_merge=merge)
-    assert "ollama_url" not in applied and "ollama_allowlist" not in applied
-    assert conflicts["ollama_url"] == "http://already-set.internal:11434"
-    assert store.get_system_settings().get("ollama_allowlist") is None
-
-
-def test_seed_system_settings_once_rejects_ollama_allowlist_in_updates_with_merge():
-    with pytest.raises(ValueError):
-        store.seed_system_settings_once(
-            {"ollama_url": "http://x:11434", "ollama_allowlist": ["x:11434"]},
-            guard_key="env_seed_version", ollama_allowlist_merge=("ollama_url", "x:11434"))
-
-
 # ===== A6: personal_api_keys_allowed=false → 個人キーの一括削除 =====
 
 def _user_with_key(prefix, key, **extra):
@@ -786,21 +779,15 @@ def _user_with_key(prefix, key, **extra):
 
 
 def test_put_personal_keys_off_purges_all_users_and_audits_count(admin):
-    """false 保存で全ユーザーの個人秘密キー（openai と閉じたプロバイダの旧キー列）が NULL になり、監査に削除件数が残る。"""
+    """false 保存で全ユーザーの個人の OpenAI キーが NULL になり、監査に削除件数が残る。"""
     u1 = _user_with_key("pkoff1", "sk-u1")
-    u2 = f"pkoff2{_sfx()}"
-    _mk_user(u2, f"pw-{u2}")
-    store.update_settings(u2, agent="simple")
-    with store._connect() as c:   # 閉じたプロバイダの旧キー列（アプリは書かない）を直接仕込む
-        c.execute("UPDATE user_settings SET bedrock_api_key=%s WHERE user_id=%s", ("bk-u2", u2))
+    u2 = _user_with_key("pkoff2", "sk-u2")
     assert store.get_settings(u1)["openai_api_key"] == "sk-u1"
 
     assert _put(admin, {"personal_api_keys_allowed": False}).status_code == 200
 
     assert store.get_settings(u1)["openai_api_key"] is None
-    with store._connect() as c:
-        legacy = c.execute("SELECT bedrock_api_key FROM user_settings WHERE user_id=%s", (u2,)).fetchone()
-    assert legacy["bedrock_api_key"] is None
+    assert store.get_settings(u2)["openai_api_key"] is None
     rows = store.list_audit(action="user_settings.personal_keys_purged", limit=5)
     assert rows, "監査行が記録されていない"
     assert rows[0]["detail"]["count"] >= 2
@@ -1142,13 +1129,13 @@ def test_seed_user_agent_from_env_fills_only_unselected_users(monkeypatch):
 
 
 def test_seed_vlm_ollama_url_from_env_only_when_central_unset(monkeypatch):
-    """旧 `SHERPA_VLM_OLLAMA_URL` は中央の `ollama_url` が未保存のときだけ中央の値（と許可一覧）へ取り込む。"""
+    """旧 `SHERPA_VLM_OLLAMA_URL` は中央の `ollama_url` が未保存のときだけ中央の値へ取り込む（許可一覧には足さない）。"""
     from sherpa import api as api_mod
     monkeypatch.setenv("SHERPA_VLM_OLLAMA_URL", "http://vlm-host.internal:11434")
     api_mod._seed_vlm_ollama_url_from_env()
     got = store.get_system_settings()
     assert got["ollama_url"] == "http://vlm-host.internal:11434"
-    assert got["ollama_allowlist"] == ["vlm-host.internal:11434"]
+    assert got.get("ollama_allowlist") is None
 
     _clear_system_settings()
     store.set_system_settings("admin-uid", {"ollama_url": "http://central.internal:11434"})

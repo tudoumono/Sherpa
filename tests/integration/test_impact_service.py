@@ -49,21 +49,6 @@ def test_business_term_has_no_structural_bridge_falls_back_to_presumed():
     assert {"BILLGEN", "TAXCALC"} <= presumed_names
 
 
-def test_code_silent_steers_to_search():
-    """構造的な影響が0件（presumed のみ/0件）なら検索へ誘導＋code_silent。構造的な影響ありなら誘導しない。純関数・DB不要。"""
-    from sherpa.chat_service import _answer_impact
-    silent = {"start": "夜間バッチ", "presumed": [], "starts": [], "items": []}
-    env = _answer_impact(silent, "test")
-    assert env["summary"]["code_silent"] is True and "検索" in env["headline"]
-    assert env["suggest"] and env["suggest"]["lens"] == "qa" and env["suggest"]["query"] == "夜間バッチ"
-    none_ = {"start": "未知語", "items": [], "presumed": [], "starts": []}
-    assert _answer_impact(none_, "test")["summary"]["code_silent"] is True
-    code = {"start": "TAX-RATE", "presumed": [], "starts": [],
-            "items": [{"name": "TAXCALC", "category": "ソース", "evidence": []}]}
-    env2 = _answer_impact(code, "test")
-    assert env2["summary"]["code_silent"] is False and "検索" not in env2["headline"] and env2["suggest"] is None
-
-
 def test_scope_bounds_impact():
     """範囲（フォルダ prefix）で絞ると影響は増えない（鏡＝フォルダ prefix・共通の自動合流はしない）。
     起点（TAX-RATE＝`4期/00_共通/標準コピーブック`）を含まない範囲は起点ごと引けず0件。

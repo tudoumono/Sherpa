@@ -241,6 +241,18 @@ def observation_current_dir(world_id: str) -> Path | None:
     return observation_render.active_observation_dir(base, canonical_generation_id=canonical)
 
 
+def observation_latest_dir(world_id: str) -> Path | None:
+    """最後に公開した OCR 観測のディレクトリ（無ければ None）。Canonical の世代との一致は求めない。
+    OCR を切っているあいだ、資料の更新で世代が進んでも読み取り済みの文字を残すために使う（文書ごとの `source_content_hash` の照合は読む側が行う）。
+    """
+    from .ingest import observation_render
+
+    try:
+        return observation_render.active_observation_dir(observation_dir(world_id))
+    except ValueError:
+        return None
+
+
 def _configured_ocr_world_root() -> Path:
     """OCR worker へ read-only で渡す、明示された参照元 root。広い既定値は持たない（未設定・相対・symlink・到達不可は設定エラー）。"""
     raw = os.environ.get("SHERPA_OCR_WORLD_ROOT", "").strip()
@@ -639,8 +651,8 @@ def register(world_id: str, root_path: str, label=None, storage_mode="external_r
     取り込みは `worker.run`（自前 lock）ではなく `worker._run_locked` を直接呼ぶ（`run` を呼ぶと自己デッドロックする）。署名の確定／無効化は `_run_locked` 内部に任せる。
     """
     import psycopg
-    from . import es_index, store
-    from .ingest import worker, world_neo4j
+    from . import store
+    from .ingest import wipe, worker
     with store.world_registry_lock(), store.world_lock(world_id):
         registered = store.list_worlds_db()
         if registered:
@@ -662,11 +674,10 @@ def register(world_id: str, root_path: str, label=None, storage_mode="external_r
             store.upsert_world(world_id, root_path, label=label, storage_mode=storage_mode)
         except psycopg.errors.UniqueViolation:  # 同一 root を同時に別 world_id で新規登録した競合
             raise WorldConflict(f"その参照元は既に別 world に登録済みです（同時登録の競合）")
-        import shutil
         registered_ok = False
         try:
             # `_run_locked` の失敗（`failed` の返却・途中の例外）はどちらも `finally` の cleanup 後に伝播させる（registry 行だけが残る孤児状態を作らない）
-            res = worker._run_locked(world_id, reflect=reflect, created_by="admin", scan_root=None,
+            res = worker._run_locked(world_id, reflect=reflect, created_by="admin",
                                      run_id=run_id, on_run_id=on_run_id)
             if res.get("interrupted"):  # 停止要求による中断は失敗ではない＝登録は残し、起動時の自動再開が続きを取り込む
                 registered_ok = True
@@ -676,48 +687,8 @@ def register(world_id: str, root_path: str, label=None, storage_mode="external_r
             registered_ok = True
             return res
         finally:
-            if not registered_ok:  # 取り込み失敗＝行も派生残骸も残さない（fail-closed）
-                # 補償削除（Neo4j・台帳・ES）は `worlds.delete` と同じ伝播を best-effort で行う。各段を独立した try で包み、cleanup 自身の失敗はログのみで re-raise しない
-                # （元の取り込み失敗の例外を置き換えない）。派生ディレクトリ・registry 行の削除は最後に行う
-                try:
-                    env = world_neo4j._env()
-                    world_neo4j.delete_world(world_id, env["uri"], env["user"], env["pw"])
-                except Exception:
-                    logging.getLogger(__name__).warning(
-                        "register 失敗時の Neo4j グラフ削除に失敗しました world_id=%s",
-                        world_id, exc_info=True)
-                try:
-                    store.replace_documents(world_id, [])
-                except Exception:
-                    logging.getLogger(__name__).warning(
-                        "register 失敗時の documents 台帳クリアに失敗しました world_id=%s",
-                        world_id, exc_info=True)
-                try:
-                    es_index.delete_world(world_id)
-                except Exception:
-                    logging.getLogger(__name__).warning(
-                        "register 失敗時の ES 索引削除に失敗しました world_id=%s",
-                        world_id, exc_info=True)
-
-                def _log_rmtree_error(function, path, exc):
-                    # 削除失敗は warning に残す（re-raise しない）。`FileNotFoundError` は正常系なので警告しない
-                    if isinstance(exc, FileNotFoundError):
-                        return
-                    logging.getLogger(__name__).warning(
-                        "register 失敗時の派生ディレクトリ削除でエラー path=%s: %s", path, exc)
-
-                try:
-                    shutil.rmtree(derived_dir(world_id), onexc=_log_rmtree_error)
-                except Exception:
-                    logging.getLogger(__name__).warning(
-                        "register 失敗時の派生ディレクトリ削除に失敗しました world_id=%s",
-                        world_id, exc_info=True)
-                try:
-                    store.delete_world_row(world_id)
-                except Exception:
-                    logging.getLogger(__name__).warning(
-                        "register 失敗時の registry 行削除に失敗しました world_id=%s",
-                        world_id, exc_info=True)
+            if not registered_ok:  # 取り込み失敗＝全段を消せたときだけ資料フォルダの行も消す（消せなければ行を残す）
+                wipe.compensate_failed_register(world_id, run_id, reflect=reflect)
 
 
 def _finalize_pending_run(run_id, world_id: str, pending: dict, *, status: str | None = None,
@@ -729,13 +700,15 @@ def _finalize_pending_run(run_id, world_id: str, pending: dict, *, status: str |
     st = status if status is not None else pending.get("status", "failed")
     snap = extraction_snapshot if extraction_snapshot is not None else pending.get("extraction_snapshot")
     if pending.get("confirm_sig") is not None:
+        from .ingest import replace_guard
+        drop = replace_guard.final_check(replace_guard.row_for_run(world_id, run_id)) if st.startswith("auto_published") else None
         rec = store.finish_ingest_run_and_confirm_world(
             run_id, world_id, status=st, extraction_snapshot=snap,
             published_snapshot=pending.get("published_snapshot"),
             source_doc_ids=pending.get("source_doc_ids"),
             sig=pending["confirm_sig"], manifest=pending.get("confirm_manifest"),
             doc_count=pending.get("confirm_doc_count"), scan_report=pending.get("confirm_scan_report"),
-            resolve_sig=pending.get("confirm_resolve_sig"),
+            resolve_sig=pending.get("confirm_resolve_sig"), drop=drop,
             **({"failed_docs": pending["failed_docs"]} if pending.get("failed_docs") is not None else {}))
         if pending.get("failed_docs") is not None:
             from .ingest import worker
@@ -778,6 +751,40 @@ def _select_rebind_pending(recovery_pending: dict | None, attempt_pending: dict 
     return dict(_REBIND_PENDING_FALLBACK)
 
 
+DERIVED_BACKUP_KEY = "derived_backup"   # 行の `old_things` に、付け替えが脇へ退避した旧派生の置き場を控えるキー
+
+
+def _set_aside_derived(der, backup, *, row) -> None:
+    """旧 root の派生 `der` を `backup` へ脇に移す（新 root の build はまっさらから）。退避先を行の `old_things` に控えてから改名する。前回失敗の残骸は先に消す。"""
+    import shutil
+
+    from .store import replace_rows
+    replace_rows.note_old(row, row.world, DERIVED_BACKUP_KEY, [str(backup)])
+    shutil.rmtree(backup, ignore_errors=True)
+    os.replace(der, backup)
+
+
+def _renumber_for_recovery(world_id: str, run_id) -> None:
+    """付け替えが失敗して旧 root から作り直す前に、失敗した試行の番号・原本の確定を捨てて、新しい番号で始め直す。"""
+    from .ingest import replace_guard
+    from .store import replace_rows
+    with replace_guard.held_row(world_id, run_id) as row:
+        replace_rows.renumber(row)
+
+
+def drop_set_aside_derived(row) -> None:
+    """止まった付け替えが脇に退避したまま残した旧派生（行の `old_things` が控えている）を消し、控えを外す。付け替えの退避の名前（`.…rebind-bak`）以外は消さない。"""
+    import shutil
+
+    from .store import replace_rows
+    paths = row.old_things.get(DERIVED_BACKUP_KEY) or []
+    for p in paths:
+        if Path(p).name.startswith(".") and Path(p).name.endswith(".rebind-bak"):
+            shutil.rmtree(p, ignore_errors=True)
+    if paths:
+        replace_rows.forget_old(row, row.world, DERIVED_BACKUP_KEY)
+
+
 def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, on_run_id=None) -> dict:
     """参照先パス変更＝その資料フォルダを全削除し、新パスから再作成する（差分でなく破棄→再作成・他の資料フォルダは無傷）。
     設計: docs/design/scope.md「資料フォルダの登録・解決・付け替え（registry）」
@@ -790,7 +797,7 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
     rebind 失敗時は採用した内部段の snapshot を残し、status を `failed`、reason を `rebind_failed_rolled_back`（bind 復元＋旧 root 再構築が成功）または `rebind_rollback_failed`（それ以外）にする。`on_run_id` は確保された run_id が判明した時点で呼ばれるコールバック。
     """
     from . import store
-    from .ingest import worker
+    from .ingest import replace_guard, worker
     from .store.worlds import rebind_bind_invalidate_sig  # 内部専用・facade に re-export しない
     with store.world_lock(world_id), store.world_swap_lock(world_id):
         old = store.get_world(world_id)
@@ -812,12 +819,11 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
         attempt_pending = None
         res = None
         try:
-            if backup is not None:  # 旧 root の派生は消さず退避する（失敗時に復元）
-                # 退避自体も try 内に置く（bind 更新後に失敗しても except の `restore_bind_invalidate_sig` で旧へ戻す）
-                shutil.rmtree(backup, ignore_errors=True)  # 前回失敗の残骸を掃除
-                _os.replace(der, backup)  # 脇へ移す＝新 root の build はまっさらから
+            if backup is not None:  # 旧 root の派生は消さず退避する（失敗時に復元）。退避自体も try 内に置く（bind 更新後に失敗しても except の `restore_bind_invalidate_sig` で旧へ戻す）
+                with replace_guard.held_row(world_id, run_id) as row:
+                    _set_aside_derived(der, backup, row=row)
             res = worker._run_locked(world_id, reflect=reflect,  # 新 root から build＋atomic 置換（lock-free 版）
-                                      created_by="admin", scan_root=None,  # 署名の確定は内部が行う
+                                      created_by="admin",  # 署名の確定は内部が行う
                                       run_id=run_id, on_run_id=on_run_id, finalize=not defer_finalize,
                                       op="rebind")
             if defer_finalize:
@@ -849,9 +855,10 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
                     except Exception:
                         pass
                 try:
+                    _renumber_for_recovery(world_id, run_id)
                     # 旧 root から即時再構築（Neo4j を旧へ戻す）。署名の確定／無効化は `_run_locked` 内部が行う（戻り値の sig 系は参照しない）
                     res2 = worker._run_locked(world_id, reflect=reflect,
-                                              created_by="admin", scan_root=None,
+                                              created_by="admin",
                                               run_id=run_id, on_run_id=on_run_id, finalize=not defer_finalize,
                                               op="rebind")
                     # 全文検索の索引を作り直せなかった復旧は「戻せた」と扱わない。
@@ -895,15 +902,16 @@ def rebind(world_id: str, new_root: str, label=None, reflect=True, run_id=None, 
 
 def delete(world_id: str, reflect=True, run_id=None) -> bool:
     """資料フォルダを完全削除する（派生物 wipe ＋ レジストリ行削除）。参照元（外部フォルダ）は消さない。
-    `_wipe_locked` は Neo4j 削除失敗時に例外を投げる（fail-closed）ので、グラフ削除に成功した時だけ行を削除する。
-    `world_lock` は外側で 1 回だけ取り、wipe と行削除を同じ区間に収める（lock-free の `_wipe_locked` を直接呼ぶ）。続けて `world_swap_lock` を取る（順序は rebind と同じ）。
+    `wipe_locked` は Neo4j 削除失敗時に例外を投げる（fail-closed）ので、グラフ削除に成功した時だけ行を削除する。
+    `world_lock` は外側で 1 回だけ取り、wipe と行削除を同じ区間に収める（lock-free の `wipe_locked` を直接呼ぶ）。続けて `world_swap_lock` を取る（順序は rebind と同じ）。
     `run_id`: 受付時に確保済みの `ingest_runs` 行。指定時は行の DELETE と run 完了 UPDATE を `store.finish_ingest_run_and_delete_world` で同一トランザクションにする。省略時は `store.delete_world_row`。
     行削除に成功したら、`preview_service._GRAPH_VIEW_LOCK` を取ってグラフ view キャッシュ（`build_preview` と共有）を破棄する（並行中の構築が古い view を再挿入するのを防ぐ）。
     """
     from . import store
-    from .ingest import worker
-    with store.world_lock(world_id), store.world_swap_lock(world_id):
-        worker._wipe_locked(world_id, reflect=reflect)  # 失敗なら例外＝行も run の terminal 化もしない
+    from .ingest import replace_guard, wipe
+    with (store.world_lock(world_id), store.world_swap_lock(world_id),
+          replace_guard.held_row(world_id, run_id, kind="delete") as row):   # 回が無くても消す行を持つ（資料フォルダの行の削除と一緒に消える）
+        wipe.wipe_locked(world_id, reflect=reflect, row=row)  # 失敗なら例外＝行も run の terminal 化もしない
         if run_id is not None:
             _rec, ok = store.finish_ingest_run_and_delete_world(
                 run_id, world_id, status="auto_published",

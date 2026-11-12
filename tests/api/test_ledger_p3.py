@@ -9,6 +9,7 @@ from __future__ import annotations
 from _world_setup import SPEC, TAXCALC, TAXCPY
 
 from sherpa import corpus_docs, doc_ledger
+from tests._replace_row import offline_row
 
 V = "v1"
 
@@ -47,7 +48,7 @@ def test_public_documents_page_hides_sensitive_ledger_rows_and_count():
         {"name": "report.xlsx", "layer": "version", "scope_path": None, "doctype": "表計算",
          "branch": "office", "original_path": None, "md_path": None, "status": "indexed"},
     ]
-    store.replace_documents(w, rows)
+    store.replace_documents(w, rows, row=offline_row(w))
     try:
         docs, total = doc_ledger.public_documents_page(w, limit=None)
         names = [d["name"] for d in docs]
@@ -55,7 +56,7 @@ def test_public_documents_page_hides_sensitive_ledger_rows_and_count():
         assert names == ["report.xlsx"]
         assert total == 1
     finally:
-        store.replace_documents(w, [])
+        store.replace_documents(w, [], row=offline_row(w))
 
 
 def test_dl_is_path_based():
@@ -96,15 +97,11 @@ def test_documents_endpoint_paginates_fallback_walk(auth_disabled):
 
 def test_documents_endpoint_uses_ledger_when_populated(auth_disabled):
     """S工事②/RV1是正#2: 台帳（`store.documents`）に行があれば、フォルダを歩かず狭い SELECT
-    だけでページング応答する（`store.count_documents`/`store.list_documents_page`）。importance
-    が台帳に materialize 済みならそのまま通し（無ければ3キーとも付けない・§2 truth table）。
+    だけでページング応答する（`store.count_documents`/`store.list_documents_page`）。台帳に importance 列が
+    入っていても、応答には出さない。
 
-    ここでは DB 行→API 応答のマッピング（`doc_ledger._ledger_row_to_public` 経由）だけを対象に
-    importance 3列を手投入する（DB 不要な範囲に留める・api マーカーのテスト）。ingest 時の実解決
-    （`ingest/worker.py::_ledger_rows`）から API 応答までの結線全体は
-    `tests/integration/test_importance_migration_rebuild.py::
-    test_documents_endpoint_reflects_importance_from_real_ingest`（要 PG+Neo4j+ES・RV2是正#b3③）
-    が実 ingest 経由で固定する。"""
+    ここでは DB 行→API 応答のマッピング（`doc_ledger._ledger_row_to_public` 経由）だけを対象にする
+    （DB 不要な範囲に留める・api マーカーのテスト）。"""
     from fastapi.testclient import TestClient
     from sherpa import store
     from sherpa.api import app
@@ -117,7 +114,7 @@ def test_documents_endpoint_uses_ledger_when_populated(auth_disabled):
     rows[0]["importance"] = "高"
     rows[0]["importance_reason"] = "一次資料"
     rows[0]["importance_source"] = "4期/_重要度.txt:1行目"
-    store.replace_documents(w, rows)
+    store.replace_documents(w, rows, row=offline_row(w))
     try:
         c = TestClient(app)
         r1 = c.get("/documents", params={"world": w, "limit": 2, "offset": 0})
@@ -128,17 +125,13 @@ def test_documents_endpoint_uses_ledger_when_populated(auth_disabled):
         d0 = body1["documents"][0]
         assert d0["top_scope"] == "4期" and d0["phase"] == "03_開発" and d0["category"] == "01_ソース"
         assert d0["status"] == "ready"                     # 台帳の "indexed" → 表示語彙 "ready"
-        assert d0["importance"] == "高"                     # ingest 時に materialize 済みならそのまま通す
-        assert d0["importance_reason"] == "一次資料"
-        assert d0["importance_source"] == "4期/_重要度.txt:1行目"
-        d1 = body1["documents"][1]
-        assert "importance" not in d1                       # materialize されていない行は3キーとも付けない
+        assert not any(k.startswith("importance") for d in body1["documents"] for k in d)
 
         r2 = c.get("/documents", params={"world": w, "limit": 2, "offset": 4})
         body2 = r2.json()
         assert len(body2["documents"]) == 1 and body2["has_more"] is False
     finally:
-        store.replace_documents(w, [])
+        store.replace_documents(w, [], row=offline_row(w))
 
 
 def test_documents_endpoint_no_limit_returns_all_and_omits_paging_keys(auth_disabled):
@@ -156,7 +149,7 @@ def test_documents_endpoint_no_limit_returns_all_and_omits_paging_keys(auth_disa
     rows = [{"name": f"f{i:04d}.md", "layer": "version", "scope_path": None, "doctype": "設計書",
              "branch": "office", "original_path": None, "md_path": None, "status": "indexed"}
             for i in range(n)]
-    store.replace_documents(w, rows)
+    store.replace_documents(w, rows, row=offline_row(w))
     try:
         c = TestClient(app)
         body = c.get("/documents", params={"world": w}).json()
@@ -164,7 +157,7 @@ def test_documents_endpoint_no_limit_returns_all_and_omits_paging_keys(auth_disa
         assert body["total"] == n and body["has_more"] is False
         assert "limit" not in body and "offset" not in body
     finally:
-        store.replace_documents(w, [])
+        store.replace_documents(w, [], row=offline_row(w))
 
 
 def test_documents_endpoint_explicit_limit_includes_effective_values(auth_disabled):
@@ -177,14 +170,14 @@ def test_documents_endpoint_explicit_limit_includes_effective_values(auth_disabl
     rows = [{"name": f"f{i:03d}.md", "layer": "version", "scope_path": None, "doctype": "設計書",
              "branch": "office", "original_path": None, "md_path": None, "status": "indexed"}
             for i in range(3)]
-    store.replace_documents(w, rows)
+    store.replace_documents(w, rows, row=offline_row(w))
     try:
         c = TestClient(app)
         body = c.get("/documents", params={"world": w, "limit": 2, "offset": 1}).json()
         assert body["limit"] == 2 and body["offset"] == 1
         assert len(body["documents"]) == 2 and body["total"] == 3
     finally:
-        store.replace_documents(w, [])
+        store.replace_documents(w, [], row=offline_row(w))
 
 
 def test_documents_endpoint_boundary_limit_and_offset_reject_422(auth_disabled):
@@ -207,13 +200,13 @@ def test_documents_endpoint_offset_past_total_is_empty_not_error(auth_disabled):
     w = "docpage-offset-overflow-test"
     store.replace_documents(w, [{"name": "a.md", "layer": "version", "scope_path": None,
                                  "doctype": "設計書", "branch": "office", "original_path": None,
-                                 "md_path": None, "status": "indexed"}])
+                                 "md_path": None, "status": "indexed"}], row=offline_row(w))
     try:
         c = TestClient(app)
         body = c.get("/documents", params={"world": w, "limit": 10, "offset": 100}).json()
         assert body["documents"] == [] and body["total"] == 1 and body["has_more"] is False
     finally:
-        store.replace_documents(w, [])
+        store.replace_documents(w, [], row=offline_row(w))
 
 
 def test_documents_endpoint_select_failure_propagates_not_silent_empty(auth_disabled, monkeypatch):
@@ -243,7 +236,7 @@ def test_documents_endpoint_does_not_wait_for_ingest_lock(auth_disabled):
     w = "docpage-ingestlock-test"
     store.replace_documents(w, [{"name": "a.md", "layer": "version", "scope_path": None,
                                  "doctype": "設計書", "branch": "office", "original_path": None,
-                                 "md_path": None, "status": "indexed"}])
+                                 "md_path": None, "status": "indexed"}], row=offline_row(w))
     entered, release = threading.Event(), threading.Event()
 
     def _hold_ingest():
@@ -261,7 +254,7 @@ def test_documents_endpoint_does_not_wait_for_ingest_lock(auth_disabled):
     finally:
         release.set()
         t.join(timeout=10)
-        store.replace_documents(w, [])
+        store.replace_documents(w, [], row=offline_row(w))
 
 
 def test_documents_endpoint_returns_503_while_swapping(auth_disabled, monkeypatch):
@@ -343,12 +336,12 @@ def test_documents_endpoint_ledger_queries_all_run_inside_swap_lock_scope(auth_d
     w = "docpage-lockdepth-test"
     store.replace_documents(w, [{"name": "a.md", "layer": "version", "scope_path": None,
                                  "doctype": "設計書", "branch": "office", "original_path": None,
-                                 "md_path": None, "status": "indexed"}])
+                                 "md_path": None, "status": "indexed"}], row=offline_row(w))
     try:
         r = TestClient(app).get("/documents", params={"world": w, "limit": 10})
         assert r.status_code == 200, r.text
     finally:
-        store.replace_documents(w, [])
+        store.replace_documents(w, [], row=offline_row(w))
 
     assert calls_inside == [("read", 1), ("blocked", 1)], (
         f"台帳の読み取り／blocked 突き合わせが入れ替えロック（深度1）の外で呼ばれている: {calls_inside}")
@@ -361,7 +354,7 @@ def test_count_and_list_documents_reads_one_snapshot():
     w = "docpage-snapshot-test"
     row = lambda n: {"name": n, "layer": "version", "scope_path": None, "doctype": "設計書",
                      "branch": "office", "original_path": None, "md_path": None, "status": "indexed"}
-    store.replace_documents(w, [row("a.md"), row("b.md")])
+    store.replace_documents(w, [row("a.md"), row("b.md")], row=offline_row(w))
     try:
         from sherpa.store import documents as sd
         orig = sd._connect
@@ -370,6 +363,10 @@ def test_count_and_list_documents_reads_one_snapshot():
             """COUNT の直後（ページ取得の前）に別接続で台帳を入れ替える。"""
             def __init__(self, c):
                 self._c, self._swapped = c, False
+
+            @property
+            def info(self):
+                return self._c.info
 
             def __enter__(self):
                 self._c.__enter__()
@@ -384,7 +381,7 @@ def test_count_and_list_documents_reads_one_snapshot():
                     self._swapped = True
                     cur = cur  # 結果は呼び出し側が先に fetch する
                     rows = cur.fetchall()
-                    store.replace_documents(w, [row("x.md"), row("y.md"), row("z.md")])
+                    store.replace_documents(w, [row("x.md"), row("y.md"), row("z.md")], row=offline_row(w))
 
                     class _R:
                         def fetchone(self_inner):
@@ -399,7 +396,7 @@ def test_count_and_list_documents_reads_one_snapshot():
             sd._connect = orig
         assert total == 2 and [r["name"] for r in rows] == ["a.md", "b.md"]
     finally:
-        store.replace_documents(w, [])
+        store.replace_documents(w, [], row=offline_row(w))
 
 
 def test_documents_endpoint_ledger_fast_path_reconciles_blocked_and_unknown(auth_disabled, monkeypatch):
@@ -421,7 +418,7 @@ def test_documents_endpoint_ledger_fast_path_reconciles_blocked_and_unknown(auth
              "branch": "source", "original_path": None, "md_path": None, "status": "indexed"},
             {"name": "c.docx", "layer": "version", "scope_path": None, "doctype": "設計書",
              "branch": "office", "original_path": None, "md_path": None, "status": "indexed"}]
-    store.replace_documents(w, rows)
+    store.replace_documents(w, rows, row=offline_row(w))
     try:
         c = TestClient(app)
 
@@ -442,4 +439,4 @@ def test_documents_endpoint_ledger_fast_path_reconciles_blocked_and_unknown(auth
         assert by_name2["b.cbl"]["status"] == "unknown"
         assert by_name2["c.docx"]["status"] == "ready"   # Office は誤って unknown にしない（b2是正の核）
     finally:
-        store.replace_documents(w, [])
+        store.replace_documents(w, [], row=offline_row(w))

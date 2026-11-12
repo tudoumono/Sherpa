@@ -67,17 +67,6 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def platform_key() -> str:
-    """uname に相当する値から、指紋のプラットフォーム名（scripts/lib/codex_pin.sh と同じ写像）を返す。"""
-    system, machine = os.uname().sysname, os.uname().machine
-    if system == "Linux":
-        return {"x86_64": "linux_x86_64", "amd64": "linux_x86_64",
-                "aarch64": "linux_aarch64", "arm64": "linux_aarch64"}.get(machine, "")
-    if system == "Darwin":
-        return {"arm64": "darwin_arm64", "x86_64": "darwin_x86_64"}.get(machine, "")
-    return ""
-
-
 def parse_env_pins(path: Path) -> dict[str, str]:
     """scripts/codex-version.env の KEY="value" 行を読む。"""
     pins: dict[str, str] = {}

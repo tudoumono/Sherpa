@@ -237,11 +237,11 @@ class _WorldSession:
     def run(self, query, **p):
         from test_world_neo4j_overload import _FakeResult
         text = query.text if hasattr(query, "text") else query
-        if "SherpaMeta" in text:
-            return _FakeResult([{"c": 1, "era": WN.GRAPH_SCHEMA_ERA}])
         if "s.canonical_id IN $starts" in text:
             return _FakeResult([{"cid": c, "name": self.nodes[c]["name"], "path": self.nodes[c]["path"]}
                                 for c in p["starts"] if c in self.nodes])
+        if "m.schema_era AS era" in text:
+            return _FakeResult([{"c": 1, "era": WN.GRAPH_SCHEMA_ERA}])
         out = "[e:FLOWS_TO]" in text
         rows = []
         for e in self.edges:

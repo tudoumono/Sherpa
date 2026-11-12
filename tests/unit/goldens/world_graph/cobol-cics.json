@@ -1,0 +1,19 @@
+{
+  "counts": {
+    "edge_types": {
+      "INVOKES": 3
+    },
+    "edges": 3,
+    "flag_reasons": {
+      "dropped_syntax": 2,
+      "unresolved": 1
+    },
+    "flags": 3,
+    "node_labels": {
+      "Module": 4
+    },
+    "nodes": 4
+  },
+  "sha256": "4040781c47ed14bdaf976b63b399e968cea9e91c33e3753cca5e293881e49525",
+  "world": "cobol-cics"
+}

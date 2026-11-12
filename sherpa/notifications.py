@@ -1,28 +1,20 @@
 """非同期処理の完了/要対応の通知。既存のイベント源を読み出すだけで、既読管理はしない（呼ぶたびに現在の状態から組み立てる）。
 
   a) 取り込み run の完了/失敗（`ingest_runs`）。全利用者に見せる。
-  b) LLM 成形パスの完了（`usage_events` の `kind="rag_render"`）。admin のみ（失敗は通知しない）。
-  c) OCR ジョブ群の完了＝rag.md への反映待ち（`ocr_jobs` の状態集計＋`.rag_sig` drift）。admin のみ。
-     反映待ちを検知したら `sherpa.ingest.background` の取り込みの依頼に乗せて軽量 sync を1回だけ予約する（`_trigger_ocr_catchup`）。
-  d) 自分が所有する共有の期限が近い通知。所有者のみ。
+  b) OCR ジョブ群の完了＝rag.md への反映待ち、または一部失敗（`ocr_jobs` の状態集計＋`.rag_sig` drift）。admin のみ。
+     反映待ちを検知したら、取り込み worker の待機周期と同じ関数（同じ観測の世代につき自動は1回）で軽量 sync を予約する。
+  c) 自分が所有する共有の期限が近い通知。所有者のみ。
+  AI 整形（rag.md の LLM 成形）の完了は通知しない。利用量の記録は整形の成否と独立で、完了の証拠にならない。
 admin 限定イベントは `list_notifications(is_admin=...)` が絞る。
 """
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timezone
 
 from . import store, worlds
-from .ingest import background as ingest_background
 from .ingest import office_md
 from .ingest import worker as ingest_worker
-from .store import ocr_jobs, usage_events
-
-_log = logging.getLogger("sherpa")
-
-# `POST /worlds/{wid}/refresh` と同じ固定 fingerprint（進行中の更新へ合流させ、多重予約しない）
-_REFRESH_FP = "{}"
-_LLM_RENDER_EVENT_LIMIT = 200  # usage_events(kind=rag_render) から遡って読む直近件数
+from .store import ocr_jobs
 
 
 def _iso(value) -> str | None:
@@ -73,60 +65,18 @@ def _ingest_run_notifications(labels: dict[str, str]) -> list[dict]:
             continue
         status = str(run.get("status") or "")
         failed = "failed" in status
+        flagged = status == "auto_published_with_flags"
         message = (f"「{label}」の取り込みに失敗しました。取り込み状況をご確認ください。" if failed
+                  else f"「{label}」の取り込みは終了しましたが、うまくいかなかった部分があります。取り込み状況をご確認ください。" if flagged
                   else f"「{label}」の取り込みが完了しました。")
         items.append(_item(
             kind="ingest_run", world=wid, world_label=label,
-            status="failed" if failed else "done", message=message,
+            status="failed" if failed else "warn" if flagged else "done", message=message,
             at=run.get("created_at"), admin_only=False))
     return items
 
 
-# ---- b) LLM 成形パスの完了（admin のみ） ----
-
-def _llm_render_notifications(labels: dict[str, str]) -> list[dict]:
-    latest: dict[str, dict] = {}
-    for row in usage_events.list_recent_events("rag_render", limit=_LLM_RENDER_EVENT_LIMIT):
-        wid = row.get("world")
-        if wid not in labels or wid in latest:  # world 単位で最新の1件だけ・削除済み world は除外
-            continue
-        latest[wid] = row
-    items = []
-    for wid, row in latest.items():
-        label = labels[wid]
-        items.append(_item(
-            kind="llm_render", world=wid, world_label=label, status="done",
-            message=f"「{label}」の文書のAI整形が完了しました。",
-            at=row.get("ts"), admin_only=True))
-    return items
-
-
-# ---- c) OCR ジョブ群の完了＝反映待ち（admin のみ・自動追いつき1回予約込み） ----
-
-def _trigger_ocr_catchup(world_id: str) -> None:
-    """OCR 完了の反映待ちを検知した world の軽量 sync を1回だけ予約する（best-effort）。
-
-    取り込みの依頼（`background.submit`）に乗せる＝同じ world で積み済み・実行中の更新があれば合流し、他の操作が進行中（`ConflictError`）なら静かに諦める。
-    """
-    try:
-        ingest_background.submit(
-            world_id, "refresh", _REFRESH_FP,
-            progress={"stage": "accepted", "stage_label": ingest_worker.STAGE_LABELS["accepted"],
-                     "done": None, "total": None, "updated_at": datetime.now(timezone.utc).isoformat()})
-    except (ingest_background.ConflictError, ingest_background.ShuttingDownError):
-        pass
-    except Exception:
-        _log.warning(
-            "OCR完了の反映（軽量sync）予約に失敗しました（次回検知時に再試行）: world=%s",
-            world_id, exc_info=True)
-
-
-def _stopped_for_low_disk(world_id: str) -> bool:
-    """最新の run が空きの不足で止まったものか（その場合は利用者が「更新」を押すまで自動で積み直さない）。"""
-    run = store.get_latest_run_summary(world_id)
-    snap = (run or {}).get("extraction_snapshot") or {}
-    return snap.get("stop_reason") == ingest_background.LOW_DISK_STOP_REASON
-
+# ---- b) OCR ジョブ群の完了＝反映待ち・一部失敗（admin のみ・自動追いつき1回予約込み） ----
 
 def _ocr_notifications(labels: dict[str, str]) -> list[dict]:
     if not office_md.ocr_enabled():
@@ -138,17 +88,22 @@ def _ocr_notifications(labels: dict[str, str]) -> list[dict]:
         summary = ocr_jobs.status_summary(wid)
         if summary["targets"] == 0 or summary["pending"] > 0:
             continue
-        dmd = worlds.derived_md_dir(wid)
-        if not office_md.rag_sig_drift(dmd, world=wid):
+        failed = summary.get("failed", 0)
+        drift = office_md.rag_sig_drift(worlds.derived_md_dir(wid), world=wid)
+        if not drift and not failed:
             continue
-        if not _stopped_for_low_disk(wid):
-            _trigger_ocr_catchup(wid)  # 自動追いつきを1回だけ予約（空きの不足で止めた直後は予約しない）
+        action = None
+        if drift:
+            ingest_worker.enqueue_ocr_catchup(wid)
+            action = {"label": "更新する", "method": "POST", "path": f"/worlds/{wid}/refresh", "confirm": False}
+        if not failed:
+            message = f"「{label}」の画像文字認識（OCR）が完了しました。反映には更新が必要です。"
+        else:
+            message = (f"「{label}」の画像文字認識（OCR）は{summary.get('processed', 0)}件成功、{failed}件失敗しました。"
+                       + ("成功した内容は更新すると反映されます。" if drift else "失敗した画像の文字は検索に出ません。"))
         items.append(_item(
-            kind="ocr_pending", world=wid, world_label=label, status="warn",
-            message=f"「{label}」の画像文字認識（OCR）が完了しました。反映には更新が必要です。",
-            at=summary.get("updated_at"), admin_only=True,
-            action={"label": "更新する", "method": "POST",
-                   "path": f"/worlds/{wid}/refresh", "confirm": False}))
+            kind="ocr_pending", world=wid, world_label=label, status="warn", message=message,
+            at=summary.get("updated_at"), admin_only=True, action=action))
     return items
 
 
@@ -156,7 +111,7 @@ _SHARE_LABEL = "会話の共有"
 
 
 def _share_expiry_notifications(uid: str) -> list[dict]:
-    """d) 自分が所有する共有の期限が近い（7 日以内）通知。所有者本人にだけ出す。"""
+    """c) 自分が所有する共有の期限が近い（7 日以内）通知。所有者本人にだけ出す。"""
     now = datetime.now(timezone.utc)
     items = []
     for r in store.list_expiring_shares_for_owner(uid):
@@ -172,13 +127,12 @@ def _share_expiry_notifications(uid: str) -> list[dict]:
 
 
 def list_notifications(*, is_admin: bool, uid: str | None = None) -> list[dict]:
-    """ホーム画面向けの通知一覧（新しい順）。`is_admin=False` は a)（＋uid 指定時は d）のみ返す。"""
+    """ホーム画面向けの通知一覧（新しい順）。`is_admin=False` は a)（＋uid 指定時は c）のみ返す。"""
     labels = _world_labels()
     items = _ingest_run_notifications(labels)
     if uid:
         items += _share_expiry_notifications(uid)
     if is_admin:
-        items += _llm_render_notifications(labels)
         items += _ocr_notifications(labels)
     items.sort(key=lambda it: it["created_at"], reverse=True)
     return items

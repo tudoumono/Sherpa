@@ -12,6 +12,7 @@ import importlib.metadata
 import io
 import json
 import logging
+import math
 import multiprocessing
 import os
 import queue
@@ -22,13 +23,15 @@ import tempfile
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Callable, Protocol
 
-from . import ai_observation, evidence_ir, observation_render, ocr_router, text_kind
+from . import ai_observation, evidence_ir, observation_render, ocr_image, ocr_router, ocr_settings, ocr_switch, ocr_workdir, text_kind
+from .ocr_settings import DEFAULT_OCR_MODEL, OCR_MODEL_SETS, OCRModelSet
+from ..env_int import env_int
 from ..store import ocr_jobs
 from ..store.db import world_lock
 
@@ -48,14 +51,31 @@ class PaddleCPUProfile:
     pypdfium2_version: str = "5.11.0"
     pillow_version: str = "12.3.0"
     device: str = "cpu"
-    enable_mkldnn: bool = False
-    detection_model: str = "PP-OCRv6_medium_det"
-    # model 本体だけの tree hash（取得メタデータ `.cache/` は除く）
-    detection_model_tree_sha256: str = "f74ebd70d463d5fe627dd1d0d235bc5097acda0ff1c05f527c363054bd6975ee"
-    recognition_model: str = "PP-OCRv6_medium_rec"
-    recognition_model_tree_sha256: str = "a0e6515f7e4c2745c07de72ffa867836f68a7aec988989754b8afb0d019bf3db"
+    # モデル・oneDNN も profile の一部＝変えると engine_profile_hash が変わり、同じ画像を読み直せる
+    enable_mkldnn: bool = field(default_factory=ocr_settings.onednn)
+    detection_model: str = field(default_factory=lambda: ocr_settings.model_set().detection)
+    detection_model_tree_sha256: str = field(default_factory=lambda: ocr_settings.model_set().detection_tree_sha256)
+    recognition_model: str = field(default_factory=lambda: ocr_settings.model_set().recognition)
+    recognition_model_tree_sha256: str = field(default_factory=lambda: ocr_settings.model_set().recognition_tree_sha256)
     runtime_model_download: bool = False
     max_input_seconds: int = 600
+    # 縮小・検出の資源の設定も profile の一部＝変えると engine_profile_hash が変わり、同じ画像を読み直せる
+    max_image_side: int = field(default_factory=ocr_settings.max_image_side)
+    max_image_pixels: int = field(default_factory=ocr_settings.max_image_pixels)
+    text_det_limit_type: str = field(default_factory=ocr_settings.det_limit_type)
+    text_det_limit_side_len: int = field(default_factory=ocr_settings.det_limit_side_len)
+    text_recognition_batch_size: int = field(default_factory=ocr_settings.rec_batch_size)
+    # 入力の上限。結果は変えないが、超過で失敗した入力を上限の変更で読み直せるよう profile に含める
+    max_input_pixels: int = field(default_factory=ocr_settings.max_input_pixels)
+    max_input_bytes: int = field(default_factory=ocr_settings.max_input_bytes)
+
+    def inference_kwargs(self) -> dict[str, Any]:
+        """`PaddleOCR(...)` へ渡す検出・認識の資源の引数。"""
+        return {
+            "text_det_limit_type": self.text_det_limit_type,
+            "text_det_limit_side_len": self.text_det_limit_side_len,
+            "text_recognition_batch_size": self.text_recognition_batch_size,
+        }
 
 
 PADDLE_CPU_PROFILE = PaddleCPUProfile()
@@ -232,14 +252,38 @@ class OCRBindingError(OCRWorkerError):
     retryable = False
 
 
+class OCRInputNotFoundError(OCRBindingError):
+    error_code = "input_not_found"
+
+
+class OCRInputEscapedError(OCRBindingError):
+    error_code = "input_path_escaped"
+
+
+class OCRInputSymlinkError(OCRBindingError):
+    error_code = "input_path_symlink"
+
+
 class OCRUnsupportedImageError(OCRWorkerError):
     error_code = ocr_router.UNSUPPORTED_IMAGE_FORMAT
+    retryable = False
+
+
+class OCRInputTooLargeError(OCRWorkerError):
+    """入力が画素数・バイト数の上限を超える。「文字なし」にせず、理由つきで再試行しない失敗にする。"""
+    error_code = "input_too_large"
     retryable = False
 
 
 class OCRInferenceProcessError(OCRWorkerError):
     error_code = "engine_process_failed"
     retryable = True
+
+
+class OCRResourceExhaustedError(OCRWorkerError):
+    """子が強制終了（SIGKILL）または cgroup の OOM で消えた。同じ入力・同じ profile では繰り返さない。"""
+    error_code = "engine_resource_exhausted"
+    retryable = False
 
 
 class OCRStoppingError(OCRWorkerError):
@@ -282,7 +326,10 @@ def _paddle_input_suffix(media_type: str) -> str:
 
 
 class PaddleOCREngine:
-    """offline cache 検証後だけ初期化できる固定 CPU PaddleOCR adapter。"""
+    """offline cache 検証後だけ初期化できる固定 CPU PaddleOCR adapter。
+
+    上限を超える画像は縮めて推論し、観測の bbox は縮める前の座標で返す。
+    """
 
     engine_profile_hash = profile_hash()
     model_revision = profile_hash()
@@ -294,27 +341,29 @@ class PaddleOCREngine:
         os.environ["PADDLE_PDX_CACHE_HOME"] = availability.cache_home
         os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
         from paddleocr import PaddleOCR
+        threads = ocr_settings.cpu_threads()
         self._ocr = PaddleOCR(
             device="cpu",
-            enable_mkldnn=False,
+            enable_mkldnn=PADDLE_CPU_PROFILE.enable_mkldnn,
+            **({"cpu_threads": threads} if threads else {}),
             text_detection_model_name=PADDLE_CPU_PROFILE.detection_model,
             text_recognition_model_name=PADDLE_CPU_PROFILE.recognition_model,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
+            **PADDLE_CPU_PROFILE.inference_kwargs(),
         )
 
-    def predict(self, image_bytes: bytes, *, media_type: str) -> OCRPrediction:
-        suffix = _paddle_input_suffix(media_type)
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(prefix="sherpa-ocr-", suffix=suffix, delete=False) as stream:
-                stream.write(image_bytes)
-                temporary_path = Path(stream.name)
-            results = list(self._ocr.predict(str(temporary_path)))
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+    def predict_file(self, image_path: Path, *, media_type: str) -> OCRPrediction:
+        """親が置いた入力ファイルを読む。縮めるときの縮め後ファイルは同じ置き場に作り、親が一緒に消す。"""
+        raw = image_path.read_bytes()
+        engine_image = ocr_image.downscale_for_engine(raw, media_type, PADDLE_CPU_PROFILE)
+        if engine_image.scale_x == 1.0 and engine_image.scale_y == 1.0:
+            results = list(self._ocr.predict(str(image_path)))
+        else:
+            scaled_path = image_path.with_suffix(".scaled" + _paddle_input_suffix(engine_image.media_type))
+            scaled_path.write_bytes(engine_image.image_bytes)
+            results = list(self._ocr.predict(str(scaled_path)))
         if len(results) != 1:
             raise ValueError(f"PaddleOCR returned {len(results)} results for one image")
         payload: Any = results[0].json if hasattr(results[0], "json") else results[0]
@@ -332,8 +381,11 @@ class PaddleOCREngine:
             raw_text = str(text)
             if not raw_text.strip():
                 continue
+            x1, y1, x2, y2 = _paddle_bbox(box)
             lines.append(EngineLine(
-                text=raw_text, confidence=round(float(score), 6), bbox=_paddle_bbox(box), line_id=str(index),
+                text=raw_text, confidence=round(float(score), 6), line_id=str(index),
+                bbox=[x1 * engine_image.scale_x, y1 * engine_image.scale_y,
+                      x2 * engine_image.scale_x, y2 * engine_image.scale_y],
             ))
         return OCRPrediction(lines)
 
@@ -352,7 +404,7 @@ def _paddle_inference_child(cache_home: str, request_queue: Any, response_queue:
             return
         request_id = str(request.get("request_id") or "")
         try:
-            prediction = engine.predict(request["image_bytes"], media_type=request["media_type"])
+            prediction = engine.predict_file(Path(request["image_path"]), media_type=request["media_type"])
             response_queue.put({"kind": "result", "request_id": request_id, "payload": prediction.to_payload()})
         except MemoryError:
             response_queue.put({"kind": "oom", "request_id": request_id})
@@ -376,8 +428,13 @@ class PaddleProcessSupervisor:
         *,
         start_method: str = "spawn",
         process_target: Callable[[str, Any, Any], None] = _paddle_inference_child,
+        work_root: Path | None = None,
     ):
         self.cache_home = str((cache_home or _default_cache_home()).expanduser().resolve())
+        self._work_root = Path(work_root) if work_root is not None else ocr_workdir.default_work_root()
+        ocr_workdir.reclaim_work_dirs(self._work_root)
+        self._work_dir = self._work_root / str(os.getpid())
+        self._child_ready = False
         self._context = multiprocessing.get_context(start_method)
         self._process_target = process_target
         self._process: Any = None
@@ -396,7 +453,35 @@ class PaddleProcessSupervisor:
             name="sherpa-paddle-inference",
             daemon=True,
         )
+        self._child_ready = False
         self._process.start()
+
+    def _write_input(self, image_bytes: bytes, media_type: str) -> Path:
+        self._work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = self._work_dir / f"{uuid.uuid4().hex}{_paddle_input_suffix(media_type)}"
+        path.write_bytes(image_bytes)
+        return path
+
+    def _exit_error(self, oom_before: int | None) -> OCRWorkerError:
+        """子が結果を返さずに終わった理由を分類する。強制終了（SIGKILL）または OOM の増分があれば資源不足。"""
+        exit_code = self._process.exitcode if self._process is not None else None
+        while True:  # 死ぬ前に送った ready がまだ読まれていないことがある
+            try:
+                if self._responses.get(timeout=0.2).get("kind") == "ready":
+                    self._child_ready = True
+            except (queue.Empty, AttributeError, OSError, EOFError):
+                break
+        oom_after = ocr_workdir.cgroup_oom_kills()
+        oom_delta = oom_after - oom_before if oom_after is not None and oom_before is not None else None
+        stage = "inference" if self._child_ready else "startup"
+        detail = (
+            f"Paddle inference child exited without a result "
+            f"(exitcode={exit_code}, stage={stage}, oom_kill_delta={oom_delta if oom_delta is not None else 'unknown'})"
+        )
+        _log.warning("ocr_worker: %s", detail)
+        if exit_code == -signal.SIGKILL or (oom_delta is not None and oom_delta > 0):
+            return OCRResourceExhaustedError(detail)
+        return OCRInferenceProcessError(detail)
 
     def _terminate(self) -> None:
         process = self._process
@@ -419,6 +504,7 @@ class PaddleProcessSupervisor:
             process.join(timeout=3)
         if process is not None and process.is_alive():
             self._terminate()
+        shutil.rmtree(self._work_dir, ignore_errors=True)
         for channel in (self._requests, self._responses):
             if channel is not None:
                 try:
@@ -442,9 +528,11 @@ class PaddleProcessSupervisor:
             raise ValueError("positive Paddle timeout and poll interval are required")
         self._start()
         request_id = uuid.uuid4().hex
-        self._requests.put({"request_id": request_id, "image_bytes": image_bytes, "media_type": media_type})
+        oom_before = ocr_workdir.cgroup_oom_kills()
+        image_path = self._write_input(image_bytes, media_type)
         deadline = time.monotonic() + timeout_seconds
         try:
+            self._requests.put({"request_id": request_id, "image_path": str(image_path), "media_type": media_type})
             while True:
                 on_tick()
                 remaining = deadline - time.monotonic()
@@ -454,10 +542,11 @@ class PaddleProcessSupervisor:
                     response = self._responses.get(timeout=min(poll_seconds, remaining))
                 except queue.Empty:
                     if self._process is None or not self._process.is_alive():
-                        raise OCRInferenceProcessError("Paddle inference child exited without a result")
+                        raise self._exit_error(oom_before)
                     continue
                 kind = response.get("kind")
                 if kind == "ready":
+                    self._child_ready = True
                     continue
                 if kind == "startup_error":
                     raise OCRInferenceProcessError(
@@ -477,6 +566,9 @@ class PaddleProcessSupervisor:
             self._terminate()
             self.close()
             raise
+        finally:
+            # 入力ファイルは親が作った親のもの。子の終了を確かめた後（または結果を受けた後）に消す
+            ocr_workdir.remove_input(image_path)
 
     def predict(self, image_bytes: bytes, *, media_type: str) -> OCRPrediction:
         """Protocol 互換。製品の `run_once` は `predict_monitored` を使う。"""
@@ -486,6 +578,43 @@ class PaddleProcessSupervisor:
             timeout_seconds=PADDLE_CPU_PROFILE.max_input_seconds,
             on_tick=lambda: None,
         )
+
+
+def _idle_unload_seconds() -> int:
+    """SHERPA_OCR_IDLE_UNLOAD_SECONDS。待ちがこの秒数続いたらモデルを手放す。既定 300・0 で無効・読めない値は既定。"""
+    return env_int("SHERPA_OCR_IDLE_UNLOAD_SECONDS", 300, 0, 604800)
+
+
+class IdleUnload:
+    """仕事の無い待ちが続いたら推論の子プロセス（モデルを載せたメモリ）を手放す。
+
+    手放した後の最初の仕事は `PaddleProcessSupervisor._start` が読み込み直す。時計は注入できる。
+    """
+
+    def __init__(self, seconds: int, *, clock: Callable[[], float] = time.monotonic):
+        self.seconds = seconds
+        self._clock = clock
+        self._idle_since: float | None = None
+        self.unloaded = False
+
+    def worked(self) -> None:
+        """仕事を取った（待ちが途切れた）。"""
+        self._idle_since = None
+        self.unloaded = False
+
+    def idle(self, engine: Any) -> bool:
+        """待ちを 1 回数える。今回手放したときだけ True。"""
+        if self.seconds <= 0 or self.unloaded:
+            return False
+        now = self._clock()
+        if self._idle_since is None:
+            self._idle_since = now
+            return False
+        if now - self._idle_since < self.seconds:
+            return False
+        engine.close()
+        self.unloaded = True
+        return True
 
 
 @dataclass(frozen=True)
@@ -578,28 +707,58 @@ def _read_bytes(path: Path, *, on_progress: Callable[[], None] | None = None) ->
     return bytes(payload)
 
 
+_EXIF_ORIENTATION_TAG = 0x0112
+
+
 def _image_size(raw: bytes) -> list[int]:
+    """EXIF の向きを反映した画像の大きさ。観測の bbox（向き補正後の座標）と同じ座標系。"""
     from PIL import Image, UnidentifiedImageError
     try:
         with Image.open(io.BytesIO(raw)) as image:
+            if image.getexif().get(_EXIF_ORIENTATION_TAG) in (5, 6, 7, 8):
+                return [image.height, image.width]
             return [image.width, image.height]
     except UnidentifiedImageError as exc:
         raise OCRUnsupportedImageError("image format is not readable") from exc
 
 
+def _resolve_inside_root(root: Path, candidate: Path, subject: str) -> Path:
+    """`candidate` を実在確認つきで解決し、root の外・symlink・不在を別の理由で拒否する。
+
+    `root` は解決済みであること。外を指すものは symlink より先に「外」として拒否する。
+    """
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        if _has_symlink(root, candidate):
+            raise OCRInputSymlinkError(f"{subject} path contains symlink") from exc
+        raise OCRInputNotFoundError(f"{subject} not found") from exc
+    except (OSError, RuntimeError) as exc:  # symlink の循環は Python の版で RuntimeError/OSError(ELOOP)
+        if _has_symlink(root, candidate):
+            raise OCRInputSymlinkError(f"{subject} path contains symlink") from exc
+        raise OCRBindingError(f"{subject} path cannot be resolved ({exc.__class__.__name__})") from exc
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise OCRInputEscapedError(f"{subject} path is outside the root") from exc
+    if _has_symlink(root, candidate):
+        raise OCRInputSymlinkError(f"{subject} path contains symlink")
+    return resolved
+
+
+def _has_symlink(root: Path, candidate: Path) -> bool:
+    current = candidate
+    while current != root and root in current.parents:
+        if current.is_symlink():
+            return True
+        current = current.parent
+    return False
+
+
 def _safe_asset(asset_root: Path, relative_path: str) -> Path:
     root = asset_root.resolve()
     candidate = root.joinpath(*Path(relative_path).parts)
-    try:
-        resolved = candidate.resolve(strict=True)
-        resolved.relative_to(root)
-    except (OSError, ValueError) as exc:
-        raise OCRBindingError("asset path escaped generation root") from exc
-    current = candidate
-    while current != root:
-        if current.is_symlink():
-            raise OCRBindingError("asset path contains symlink")
-        current = current.parent
+    resolved = _resolve_inside_root(root, candidate, "asset")
     if not resolved.is_file():
         raise OCRBindingError("asset is not a file")
     return resolved
@@ -633,6 +792,18 @@ def _clear_pdf_document_cache() -> None:
 atexit.register(_clear_pdf_document_cache)
 
 
+def _check_input_bytes(size: int) -> None:
+    if size > PADDLE_CPU_PROFILE.max_input_bytes:
+        raise OCRInputTooLargeError(
+            f"input is {size} bytes (limit {PADDLE_CPU_PROFILE.max_input_bytes}; SHERPA_OCR_MAX_INPUT_BYTES)")
+
+
+def _check_input_pixels(width: int, height: int) -> None:
+    if width * height > PADDLE_CPU_PROFILE.max_input_pixels:
+        raise OCRInputTooLargeError(
+            f"input is {width * height} pixels (limit {PADDLE_CPU_PROFILE.max_input_pixels}; SHERPA_OCR_MAX_PIXELS)")
+
+
 def _render_pdf_page(source_path: Path, render_profile: dict[str, Any]) -> bytes:
     global _PDF_DOCUMENT_CACHE, _PDF_DOCUMENT_CACHE_KEY
     if render_profile != {**ocr_router.PAGE_RENDER_PROFILE, "page_1_based": render_profile.get("page_1_based")}:
@@ -653,12 +824,16 @@ def _render_pdf_page(source_path: Path, render_profile: dict[str, Any]) -> bytes
             raise OCRBindingError("PDF page no longer exists")
         page = document[page_number - 1]
         try:
-            bitmap = page.render(scale=float(render_profile["dpi"]) / 72.0)
+            scale = float(render_profile["dpi"]) / 72.0
+            width_pt, height_pt = page.get_size()
+            _check_input_pixels(int(width_pt * scale + 1), int(height_pt * scale + 1))
+            bitmap = page.render(scale=scale)
             try:
                 image = bitmap.to_pil().convert("RGB")
                 buffer = io.BytesIO()
                 image.save(buffer, format="PNG", optimize=False)
                 raw = buffer.getvalue()
+                _check_input_bytes(len(raw))
             finally:
                 bitmap.close()
         finally:
@@ -689,14 +864,20 @@ def prepare_input(
     if decision.input_kind == "asset":
         if not decision.asset_rel_path or not decision.asset_sha256 or not decision.media_type:
             raise OCRBindingError("asset route is incomplete")
-        raw = _read_bytes(_safe_asset(asset_root, decision.asset_rel_path), on_progress=on_progress)
+        asset_path = _safe_asset(asset_root, decision.asset_rel_path)
+        _check_input_bytes(asset_path.stat().st_size)
+        if decision.pixel_size:
+            _check_input_pixels(int(decision.pixel_size[0]), int(decision.pixel_size[1]))
+        raw = _read_bytes(asset_path, on_progress=on_progress)
         if _sha256_bytes(raw) != decision.asset_sha256:
             raise OCRBindingError("asset hash mismatch")
         if ocr_router.raster_media_type(raw[:16]) is None:
             raise OCRUnsupportedImageError("image format is not readable")
+        pixel_size = _image_size(raw)
+        _check_input_pixels(int(pixel_size[0]), int(pixel_size[1]))
         return PreparedOCRInput(
             image_bytes=raw, asset_sha256=decision.asset_sha256, media_type=decision.media_type,
-            pixel_size=decision.pixel_size or _image_size(raw), input_kind="asset", render_profile=None,
+            pixel_size=pixel_size, input_kind="asset", render_profile=None,
         )
     if decision.input_kind == "page_render" and decision.page_render is not None:
         if source_path.suffix.lower() != ".pdf":
@@ -835,10 +1016,13 @@ def _publish_terminal_generation(
     job: dict[str, Any],
     publish_observation: Callable[[dict[str, Any], ai_observation.AIObservationSet | None], None] | None,
     observation_set: ai_observation.AIObservationSet | None,
+    engine_profile_hash: str,
 ) -> bool:
     if publish_observation is None:
         return False
-    if not ocr_jobs.generation_ready_for_publication(job["world"], job["canonical_generation_id"]):
+    if not ocr_jobs.generation_ready_for_publication(
+        job["world"], job["canonical_generation_id"], engine_profile_hash=engine_profile_hash,
+    ):
         return False
     publish_observation(job, observation_set)
     return True
@@ -864,7 +1048,9 @@ def run_once(
         raise ValueError("inference timeout and lease TTL must be positive")
     if lease_renew_interval_seconds <= 0 or lease_renew_interval_seconds >= lease_seconds:
         raise ValueError("lease monitor interval must be shorter than the lease TTL")
-    job = ocr_jobs.lease_next(worker_id, lease_seconds=lease_seconds)
+    job = ocr_switch.lease_next(
+        worker_id, lease_seconds=lease_seconds, engine_profile_hash=engine.engine_profile_hash,
+    )
     if job is None:
         return WorkerResult(status="idle")
     job_id, lease_token = int(job["id"]), str(job["lease_token"])
@@ -939,7 +1125,7 @@ def run_once(
         if completed is None:
             return WorkerResult(status="lease_lost", job_id=job_id, cache_hit=cache_hit)
         try:
-            _publish_terminal_generation(completed, publish_observation, observation_set)
+            _publish_terminal_generation(completed, publish_observation, observation_set, engine.engine_profile_hash)
         except Exception:
             # OCR 結果は DB へ完了済み。別観測 pointer の再構築は idle 時に再試行できる
             return WorkerResult(
@@ -963,7 +1149,7 @@ def run_once(
         cancelled = ocr_jobs.cancel_unsupported_image_job(job_id, lease_token)
         if cancelled is not None:
             try:
-                _publish_terminal_generation(cancelled, publish_observation, None)
+                _publish_terminal_generation(cancelled, publish_observation, None, engine.engine_profile_hash)
             except Exception:
                 pass
         return WorkerResult(status="cancelled", job_id=job_id, error_code=exc.error_code)
@@ -973,7 +1159,7 @@ def run_once(
         )
         if failed is not None and failed.get("status") == "failed":
             try:
-                _publish_terminal_generation(failed, publish_observation, None)
+                _publish_terminal_generation(failed, publish_observation, None, engine.engine_profile_hash)
             except Exception:
                 pass
         return WorkerResult(status="failed", job_id=job_id, error_code=exc.error_code)
@@ -983,7 +1169,7 @@ def run_once(
         )
         if failed is not None and failed.get("status") == "failed":
             try:
-                _publish_terminal_generation(failed, publish_observation, None)
+                _publish_terminal_generation(failed, publish_observation, None, engine.engine_profile_hash)
             except Exception:
                 pass
         return WorkerResult(status="failed", job_id=job_id, error_code="timeout")
@@ -993,7 +1179,7 @@ def run_once(
         )
         if failed is not None:
             try:
-                _publish_terminal_generation(failed, publish_observation, None)
+                _publish_terminal_generation(failed, publish_observation, None, engine.engine_profile_hash)
             except Exception:
                 pass
         return WorkerResult(status="failed", job_id=job_id, error_code="oom")
@@ -1003,7 +1189,7 @@ def run_once(
         )
         if failed is not None and failed.get("status") == "failed":
             try:
-                _publish_terminal_generation(failed, publish_observation, None)
+                _publish_terminal_generation(failed, publish_observation, None, engine.engine_profile_hash)
             except Exception:
                 pass
         return WorkerResult(status="failed", job_id=job_id, error_code="engine_failure")
@@ -1063,7 +1249,9 @@ def run_refresh_once(
     """1 refresh run を stream 展開する。HTTP request はこの走査を実行しない。"""
     if lease_seconds <= 0 or lease_renew_interval_seconds <= 0 or lease_renew_interval_seconds >= lease_seconds:
         raise ValueError("refresh lease interval must be shorter than the positive lease TTL")
-    run = ocr_jobs.lease_refresh_run(worker_id, lease_seconds=lease_seconds)
+    run = ocr_switch.lease_refresh_run(
+        worker_id, lease_seconds=lease_seconds, engine_profile_hash=engine_profile_hash,
+    )
     if run is None:
         return RefreshWorkerResult(status="idle")
     run_id, lease_token = int(run["id"]), str(run["lease_token"])
@@ -1112,6 +1300,8 @@ def run_refresh_once(
             counts = {"selected": 0, "excluded": 0, "failed_binding": 0}
             for decision in manifest.decisions:
                 counts[decision.status] += 1
+            if not ocr_switch.enabled():
+                raise OCRStoppingError("OCR was switched off during refresh")
             rows = ocr_jobs.enqueue_manifest_jobs(
                 world,
                 manifest,
@@ -1155,9 +1345,7 @@ def run_refresh_once(
             status="lease_lost", run_id=run_id, manifests_processed=processed, jobs_enqueued=jobs_enqueued,
         )
     except OCRStoppingError as exc:
-        ocr_jobs.fail_refresh_run(
-            run_id, lease_token, error_code=exc.error_code, error_detail=str(exc), retryable=True,
-        )
+        ocr_jobs.pause_refresh_run(run_id, lease_token, error_code=exc.error_code, error_detail=str(exc))
         return RefreshWorkerResult(
             status="stopping", run_id=run_id, manifests_processed=processed,
             jobs_enqueued=jobs_enqueued, error_code=exc.error_code,
@@ -1252,23 +1440,29 @@ def build_standard_publish_callback(
     canonical_is_current: Callable[[str, str], bool],
     load_ir: Callable[[dict[str, Any]], evidence_ir.EvidenceIR],
     on_published: Callable[[str, str], None] | None = None,
+    engine_profile_hash: str | None = None,
 ) -> Callable[[dict[str, Any], ai_observation.AIObservationSet | None], None]:
-    """全成功 job を snapshot 化して単一 pointer へ公開し、任意の後処理を行う callback を返す。
+    """現行 engine profile の全成功 job を snapshot 化して単一 pointer へ公開し、任意の後処理を行う callback を返す。
+
+    別 profile の成功結果は snapshot・列挙・公開済み印のいずれにも入れない（同じ観測 ID が衝突して公開が落ちるため）。
 
     `on_published` は world lock 取得後に Canonical generation を再確認してから同じ lock 内で呼ぶ
     （ES の delete→create→bulk を rebind/Canonical 公開と直列化し、旧 callback が新索引を壊さないため）。
     失敗または stale のときは job を artifact 公開済みにしない。
     """
+    profile = engine_profile_hash or profile_hash()
+
     def publish(job: dict[str, Any], _current_set: ai_observation.AIObservationSet | None) -> None:
         world = str(job["world"])
         canonical_generation_id = str(job["canonical_generation_id"])
-        snapshot = ocr_jobs.succeeded_results_snapshot(world, canonical_generation_id)
+        snapshot = ocr_jobs.succeeded_results_snapshot(world, canonical_generation_id, engine_profile_hash=profile)
 
         def records():
             previous_source: str | None = None
             current_ir: evidence_ir.EvidenceIR | None = None
             for row in ocr_jobs.iter_succeeded_results(
                 world, canonical_generation_id, observation_render._relative_source_path,
+                engine_profile_hash=profile,
             ):
                 source_rel = str(row["source_rel_path"])
                 # 更新前に成功した秘匿名ジョブの再公開経路。Evidence を読み直さず観測を保存しない
@@ -1299,7 +1493,8 @@ def build_standard_publish_callback(
             records=records(),
             canonical_is_current=lambda: canonical_is_current(world, canonical_generation_id),
             snapshot_is_current=lambda: (
-                ocr_jobs.succeeded_results_snapshot(world, canonical_generation_id) == snapshot
+                ocr_jobs.succeeded_results_snapshot(world, canonical_generation_id, engine_profile_hash=profile)
+                == snapshot
             ),
             publish_guard=lambda: world_lock(world),
         )
@@ -1314,7 +1509,9 @@ def build_standard_publish_callback(
                     resolve_derived_root(world),
                     active_canonical_generation_id=canonical_generation_id,
                 )
-                ocr_jobs.mark_snapshot_artifacts_published(world, canonical_generation_id, snapshot)
+                ocr_jobs.mark_snapshot_artifacts_published(
+                    world, canonical_generation_id, snapshot, engine_profile_hash=profile,
+                )
     return publish
 
 
@@ -1324,18 +1521,7 @@ def _safe_world_file(root: Path, relative: str) -> Path:
     if relative_path.is_absolute() or any(part in {"", ".", ".."} for part in relative_path.parts):
         raise OCRBindingError("world source path must be relative")
     candidate = resolved_root.joinpath(*relative_path.parts)
-    try:
-        resolved = candidate.resolve(strict=True)
-        resolved.relative_to(resolved_root)
-    except (OSError, ValueError) as exc:
-        raise OCRBindingError("world source path escaped root") from exc
-    current = candidate
-    while current != resolved_root:
-        if current.is_symlink():
-            raise OCRBindingError("world source path contains symlink")
-        if resolved_root not in current.parents:
-            raise OCRBindingError("world source path escaped root")
-        current = current.parent
+    resolved = _resolve_inside_root(resolved_root, candidate, "world source")
     if not resolved.is_file():
         raise OCRBindingError("world source path is not a regular non-symlink file")
     return resolved
@@ -1395,8 +1581,8 @@ def _runtime_callbacks():
         # Canonical 全再索引は行わない。世代の整合性だけを公開直後に再確認する
         if not current(world, canonical_generation_id):
             raise OCRBindingError("Canonical generation changed before observation reindex")
-        # ocr_worker は ES・human_md マーカーに触れない（隔離 profile では `/derived` が read-only で ES にも到達できない）。
-        # OCR 観測の rag.md への合流と ES 反映は、通常の sync（`worker._refresh_derived_representations` の `.rag_sig` OCR 観測次元）が行う
+        # ocr_worker は ES・human_md マーカーにも更新の予約にも触れない（コンテナには版が無く、ホストの取り込み worker が拾えない）。
+        # 公開済み観測の反映は、ホストの取り込み worker の待機周期（`worker.enqueue_published_observation_catchup`）が予約する
 
     publisher = build_standard_publish_callback(
         resolve_derived_root=lambda world: Path(worlds.observation_dir(world)),
@@ -1411,7 +1597,7 @@ def main(argv: list[str] | None = None) -> int:
     """隔離 Compose profile から起動する1-concurrency worker loop。"""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Sherpa offline PaddleOCR observation worker")
+    parser = argparse.ArgumentParser(description="Slouch offline PaddleOCR observation worker")
     parser.add_argument("--once", action="store_true", help="1件またはidleを処理して終了")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--worker-id", default=f"{socket.gethostname()}:{os.getpid()}")
@@ -1428,6 +1614,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--inference-timeout-seconds exceeds the fixed profile limit")
     availability = paddle_availability(args.paddle_cache)
     stopping = Event()
+    idle_unload = IdleUnload(_idle_unload_seconds())
 
     def request_stop(_signum: int, _frame: Any) -> None:
         stopping.set()
@@ -1450,6 +1637,7 @@ def main(argv: list[str] | None = None) -> int:
                 "pillow_version": availability.pillow_version,
                 "model_hashes": availability.model_hashes,
                 "cache_home": availability.cache_home,
+                "idle_unloaded": status == "idle" and idle_unload.unloaded,
             },
         )
 
@@ -1463,6 +1651,8 @@ def main(argv: list[str] | None = None) -> int:
     current, load_ir, resolve_source, resolve_assets, generation_root, publisher = _runtime_callbacks()
     last_printed: str | None = None
     try:
+        # 現行でない profile の未着手の仕事を、最初の lease の前に終端する
+        ocr_jobs.retire_other_profile_work(engine.engine_profile_hash)
         while not stopping.is_set():
             result = run_once(
                 args.worker_id, engine=engine, canonical_is_current=current, load_ir=load_ir,
@@ -1471,6 +1661,8 @@ def main(argv: list[str] | None = None) -> int:
                 inference_timeout_seconds=args.inference_timeout_seconds, heartbeat=heartbeat,
                 should_stop=stopping.is_set,
             )
+            if result.status != "idle":
+                idle_unload.worked()
             if not stopping.is_set():
                 heartbeat("idle")
             # 待機（idle）は続く間に 1 回だけ出す
@@ -1491,6 +1683,7 @@ def main(argv: list[str] | None = None) -> int:
                     should_stop=stopping.is_set,
                 )
                 if refresh_result.status != "idle":
+                    idle_unload.worked()
                     if not stopping.is_set():
                         heartbeat("idle")
                     print(_canonical(asdict(refresh_result)), flush=True)
@@ -1501,10 +1694,16 @@ def main(argv: list[str] | None = None) -> int:
                 if args.once:
                     return 0
                 # OCR 成功後に pointer 公開だけ失敗した場合や worker 再起動後も自己修復する
-                for candidate in ocr_jobs.list_unpublished_generations():
+                for candidate in ocr_jobs.list_unpublished_generations(
+                    engine_profile_hash=engine.engine_profile_hash,
+                ):
                     if current(candidate["world"], candidate["canonical_generation_id"]):
                         publisher(candidate, None)
                         break
+                if idle_unload.idle(engine):
+                    print(_canonical({"status": "idle_unloaded"}), flush=True)
+                    if not stopping.is_set():
+                        heartbeat("idle")
                 stopping.wait(args.poll_seconds)
         return 0
     finally:

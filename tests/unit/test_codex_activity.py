@@ -482,9 +482,6 @@ def _activity_ctx(uid: str, turn_started_mono: float | None = None):
         message="活動要約テスト用の質問",
         world="v1",
         route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline", "summary": {"total": 0},
-            "data": {}, "sources": []},
         knowledge=True, uid=uid, make_sources=lambda docs: [],
         turn_started_mono=turn_started_mono,
     )

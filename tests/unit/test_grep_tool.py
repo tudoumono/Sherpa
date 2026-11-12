@@ -1,7 +1,7 @@
 """grep_tool（直接 grep ツール）の契約テスト。
 
 読込バイト上限・ヒット引用バイト上限・打切り申告・ストリーミング走査のメモリ上界・deadline・
-重要度 top-K・layer・rag 優先の派生 MD・秘匿名/サイズ超過の除外を確かめる。
+先頭 K 件の選抜・layer・rag 優先の派生 MD・秘匿名/サイズ超過の除外を確かめる。
 """
 from __future__ import annotations
 
@@ -41,6 +41,8 @@ def _derived_world(monkeypatch, tmp_path, legacy=None, rag=None, obs=None, world
     monkeypatch.setattr(W, "derived_md_dir", lambda w: der)
     monkeypatch.setattr(W, "derived_rag_dir", lambda w: der_rag)
     monkeypatch.setattr(W, "observation_current_dir", lambda w: obs_root)
+    # 管理者の優先・除外（system_settings の DB 読み）は無し。deadline の確認回数を数える試験が DB 読みの時計の呼び出しに影響されないようにする
+    monkeypatch.setenv("SHERPA_MCP_PATH_RULES", "")
 
 
 def _clock_exceeding_after(monkeypatch, ok_calls: int):
@@ -140,13 +142,96 @@ def test_truncated_docs_deduped_and_empty_when_not_truncated(monkeypatch, tmp_pa
     assert hits and truncated == [] and all("file_truncated" not in h for h in hits)
 
 
-def test_line_overflow_reports_truncation_even_without_file_cap(monkeypatch, tmp_path):
-    """1 行が _GREP_LINE_MAX_BYTES を超えて改行が来ないとき、cap 内でも打切りを申告する。"""
+def test_term_at_the_end_of_an_overlong_line_is_found_with_its_line_number(monkeypatch, tmp_path):
+    """1 行が上限を超えていても、末尾の語を探せる。ヒットの行番号は行の数のとおりで、探せていない印は付かない。"""
     monkeypatch.setattr(G, "_GREP_LINE_MAX_BYTES", 100)
-    _write(tmp_path, "bigline.txt", "x" * 150 + "NEEDLE_TAIL\n")
+    _write(tmp_path, "bigline.txt", "first\n" + "x" * 5000 + "NEEDLE_TAIL" + "y" * 300 + "\nlast\n")
     truncated: list = []
-    assert G.grep_search("NEEDLE_TAIL", world="v1", roots=[tmp_path], truncated_docs=truncated) == []
-    assert truncated == ["bigline.txt"]
+    hits = G.grep_search("NEEDLE_TAIL", world="v1", roots=[tmp_path], truncated_docs=truncated)
+    assert [h["line"] for h in hits] == [2] and "NEEDLE_TAIL" in hits[0]["text"]
+    assert truncated == [] and "file_truncated" not in hits[0]
+
+
+def test_term_across_a_window_seam_of_an_overlong_line_is_found(monkeypatch, tmp_path):
+    """区切りの継ぎ目をまたぐ語も見つかる（区切りは語の長さぶん重ねる）。"""
+    monkeypatch.setattr(G, "_GREP_LINE_MAX_BYTES", 100)
+    monkeypatch.setattr(G, "_SCAN_CHUNK_BYTES", 37)
+    for pos in range(180, 330, 7):
+        _write(tmp_path, "seam.txt", "a" * pos + "ＮＥＥＤＬＥ語" + "b" * 400 + "\nz\n")
+        hits = G.grep_search("ＮＥＥＤＬＥ語", world="v1", roots=[tmp_path])
+        assert [h["line"] for h in hits] == [1], pos
+
+
+def test_hit_char_is_the_in_line_position_and_absent_for_a_window_of_an_overlong_line(monkeypatch, tmp_path):
+    monkeypatch.setattr(G, "_GREP_LINE_MAX_BYTES", 100)
+    _write(tmp_path, "a.txt", "ab NEEDLE\n" + "-\n" * 9 + "x" * 500 + "NEEDLE\n")
+    hits = {h["line"]: h for h in G.grep_search("needle", world="v1", roots=[tmp_path])}
+    assert hits[1]["char"] == 3 and "char" not in hits[11]
+
+
+def test_hit_char_is_an_index_into_the_original_line_even_when_lowercasing_changes_the_length(tmp_path):
+    _write(tmp_path, "case.txt", "\u0130xNEEDLE\n" + "-\n" * 9 + "abNEEDLE\n")
+    hits = {h["line"]: h for h in G.grep_search("needle", world="v1", roots=[tmp_path])}
+    assert hits[1]["char"] == 2 and hits[11]["char"] == 2
+
+
+def test_overlong_line_with_line_breaks_inside_is_not_windowed_and_is_marked_truncated(monkeypatch, tmp_path):
+    """CR で区切られた超過行は窓を使わず（行番号が狂うため）、先頭だけを返して探せていない印を付ける。"""
+    monkeypatch.setattr(G, "_GREP_LINE_MAX_BYTES", 100)
+    body = "NEEDLE\r" + "\r".join("r%d" % i for i in range(9)) + "\r" + "x\r" * 3000 + "NEEDLE"
+    _write(tmp_path, "cr.txt", body)
+    truncated: list = []
+    hits = G.grep_search("NEEDLE", world="v1", roots=[tmp_path], truncated_docs=truncated)
+    assert [h["line"] for h in hits] == [1] and truncated == ["cr.txt"] and hits[0].get("file_truncated")
+    _write(tmp_path, "cr.txt", "a\rb\r" + "x\r" * 3000 + "NEEDLE")
+    truncated = []
+    assert G.grep_search("NEEDLE", world="v1", roots=[tmp_path], truncated_docs=truncated) == []
+    assert truncated == ["cr.txt"]
+
+
+def test_cr_only_after_the_head_of_an_overlong_line_marks_truncated_and_keeps_line_numbers_honest(monkeypatch, tmp_path):
+    """先頭の保持部より後ろにだけ CR がある超過行でも、行番号が狂ったまま黙らず、先頭だけを返して印を付ける。末尾だけの CR（CRLF）は 1 行のまま。"""
+    monkeypatch.setattr(G, "_GREP_LINE_MAX_BYTES", 100)
+    _write(tmp_path, "late.txt", "a" * 150 + "\r" + "b" * 300 + "\nNEXT NEEDLE\n")
+    truncated: list = []
+    hits = G.grep_search("NEEDLE", world="v1", roots=[tmp_path], truncated_docs=truncated)
+    assert truncated == ["late.txt"] and all(h.get("file_truncated") for h in hits)
+    (tmp_path / "late.txt").unlink()
+    (tmp_path / "crlf.txt").write_bytes(b"a" * 150 + b"\r\nNEXT NEEDLE\n")
+    truncated = []
+    hits = G.grep_search("NEEDLE", world="v1", roots=[tmp_path], truncated_docs=truncated)
+    assert [h["line"] for h in hits if h["doc_id"] == "crlf.txt"] == [2] and "crlf.txt" not in truncated
+
+
+def test_overlong_line_without_the_term_is_not_reported_as_truncated(monkeypatch, tmp_path):
+    monkeypatch.setattr(G, "_GREP_LINE_MAX_BYTES", 100)
+    _write(tmp_path, "bigline.txt", "x" * 5000 + "\nNEEDLE\n")
+    truncated: list = []
+    hits = G.grep_search("NEEDLE", world="v1", roots=[tmp_path], truncated_docs=truncated)
+    assert [h["line"] for h in hits] == [2] and truncated == []
+
+
+def test_capped_reader_without_matcher_still_drops_the_overlong_remainder(tmp_path):
+    """読む側が使うときの振る舞い（超えた分を捨て、見られなかった印を立てる）は変わらない。"""
+    f = tmp_path / "x.txt"
+    f.write_bytes(b"x" * 150 + b"NEEDLE\nnext\n")
+    with f.open("rb") as fh:
+        r = G._CappedStreamReader(fh, line_max_bytes=100)
+        got = list(r.lines(cap=10_000))
+    assert got == [b"x" * 100, b"next"] and r.line_overflowed is True
+
+
+@pytest.mark.parametrize("enc", ["cp932", "euc_jp"])
+def test_overlong_line_break_check_uses_the_detected_encoding(monkeypatch, tmp_path, enc):
+    """UTF-8 では U+2028 になるバイト列も、cp932/EUC-JP では通常の文字。論理改行と誤認して末尾のヒットを落とさない。"""
+    monkeypatch.setattr(G, "_GREP_LINE_MAX_BYTES", 100)
+    body = "\u6f22\u5b57".encode(enc) + b"\xe2\x80\xa8" * 3 + b"x" * 300 + b"NEEDLE"
+    f = tmp_path / "x.bin"
+    f.write_bytes(body + b"\nnext\n")
+    with f.open("rb") as fh:
+        r = G._CappedStreamReader(fh, long_line_matcher=lambda b: b"NEEDLE" in b, seam_bytes=16, encoding=enc)
+        got = list(r.lines(cap=10_000))
+    assert r.line_overflowed is False and b"NEEDLE" in got[0] and got[1] == b"next"
 
 
 # ===== 引用クリップ・env 検証 =====
@@ -172,7 +257,7 @@ def test_normal_small_file_hit_shape(tmp_path):
     hits = G.grep_search("消費税率", world="v1", roots=[tmp_path])
     assert len(hits) == 1
     assert hits[0] == {"doc_id": "sub/doc.md", "path": hits[0]["path"], "ext": ".md", "line": 2,
-                       "span": [1, 3], "text": content.strip(), "match": "消費税率"}
+                       "span": [1, 3], "text": content.strip(), "match": "消費税率", "char": 0}
 
 
 def test_normal_source_file_context_window_unaffected(tmp_path):
@@ -364,14 +449,13 @@ def test_grep_search_stops_scanning_at_max_hits_when_imp_map_empty(monkeypatch, 
     assert [h["doc_id"] for h in hits] == ["a.md"] and calls["n"] == 5
 
 
-def test_grep_search_continues_scanning_past_max_hits_when_imp_map_nonempty(monkeypatch, tmp_path):
-    """_重要度.txt がある world は max_hits 到達後も全量走査する（2 文書目で期限超過すれば例外）。"""
+def test_grep_search_stops_scanning_at_max_hits_even_when_control_file_exists(monkeypatch, tmp_path):
+    """_重要度.txt があっても重要度は使わない＝max_hits 到達後は走査を打ち切る（全量走査しないので期限超過にならない）。"""
     _derived_world(monkeypatch, tmp_path, world_files={
         "a.md": "NEEDLE\n", "b.md": "NEEDLE\n", "_重要度.txt": "a.md: 中\n"})
-    calls = _clock_exceeding_after(monkeypatch, 6)
-    with pytest.raises(G.GrepDeadlineExceeded):
-        list(G.grep_search("NEEDLE", world="anyworld", max_hits=1, deadline=50.0, engine="python"))
-    assert calls["n"] >= 7
+    _clock_exceeding_after(monkeypatch, 6)
+    hits = G.grep_search("NEEDLE", world="anyworld", max_hits=1, deadline=50.0, engine="python")
+    assert [h["doc_id"] for h in hits] == ["a.md"]
 
 
 # ===== valid_world =====
@@ -413,7 +497,7 @@ def test_grep_search_layer_code_with_derived_office_md_is_always_zero_hits(monke
     assert len(docs_hits) == 1 and docs_hits[0]["doc_id"] == "report.docx"
 
 
-# ===== 重要度（_重要度.txt）の除外と top-K 選抜 =====
+# ===== 重要度設定ファイルの除外と、重要度を使わない選抜 =====
 
 def test_grep_search_excludes_importance_control_file(tmp_path):
     _write(tmp_path, "a.md", "NEEDLE here\n")
@@ -429,30 +513,13 @@ def test_grep_search_no_control_file_preserves_discovery_order(tmp_path):
     assert all("importance" not in h and "importance_reason" not in h for h in hits)
 
 
-def test_grep_search_prioritizes_high_importance_hit_discovered_after_max_hits(monkeypatch, tmp_path):
+def test_grep_search_ignores_importance_settings_and_keeps_discovery_order(monkeypatch, tmp_path):
     _derived_world(monkeypatch, tmp_path, world_files={
-        "a.md": "NEEDLE here\n", "b.md": "NEEDLE here\n", "z_important.md": "NEEDLE here\n",
-        "_重要度.txt": "z_important.md: 高\n"})
+        "a_low.md": "NEEDLE here\n", "b.md": "NEEDLE here\n", "z_high.md": "NEEDLE here\n",
+        "_重要度.txt": "z_high.md: 高  # 契約書\na_low.md: 低\n"})
     hits = G.grep_search("NEEDLE", world="anyworld", max_hits=2)
-    doc_ids = [h["doc_id"] for h in hits]
-    assert len(doc_ids) == 2 and doc_ids[0] == "z_important.md" and hits[0]["importance"] == "高"
-    assert "a.md" in doc_ids or "b.md" in doc_ids
-
-
-def test_grep_search_low_importance_hit_dropped_first_when_over_capacity(monkeypatch, tmp_path):
-    _derived_world(monkeypatch, tmp_path, world_files={
-        "a_low.md": "NEEDLE here\n", "b.md": "NEEDLE here\n", "c.md": "NEEDLE here\n",
-        "_重要度.txt": "a_low.md: 低\n"})
-    hits = G.grep_search("NEEDLE", world="anyworld", max_hits=2)
-    assert [h["doc_id"] for h in hits] == ["b.md", "c.md"]
-
-
-def test_grep_search_importance_reason_is_conditional_key(monkeypatch, tmp_path):
-    _derived_world(monkeypatch, tmp_path, world_files={
-        "a.md": "NEEDLE here\n", "b.md": "NEEDLE here\n", "_重要度.txt": "a.md: 高  # 契約書\nb.md: 低\n"})
-    hits = {h["doc_id"]: h for h in G.grep_search("NEEDLE", world="anyworld", max_hits=10)}
-    assert hits["a.md"]["importance"] == "高" and hits["a.md"]["importance_reason"] == "契約書"
-    assert hits["b.md"]["importance"] == "低" and "importance_reason" not in hits["b.md"]
+    assert [h["doc_id"] for h in hits] == ["a_low.md", "b.md"]
+    assert all("importance" not in h and "importance_reason" not in h for h in hits)
 
 
 # ===== ページング =====
@@ -556,3 +623,18 @@ def test_grep_search_size_exclusion_does_not_apply_to_registered_doc_extensions(
     truncated: list = []
     assert len(G.grep_search("NEEDLE", world="v1", roots=[tmp_path], truncated_docs=truncated)) == 1
     assert truncated == []
+
+
+def test_clip_keeps_the_query_when_lowercasing_changes_the_length():
+    from sherpa.parts.read.tools import _clip_es_hit_text
+    text = "İ" * 1000 + "NEEDLE" + "z" * 3000
+    clipped, pos = _clip_es_hit_text(text, "needle", 1, 100)
+    assert "NEEDLE" in clipped and len(clipped.encode("utf-8")) <= 100
+    assert pos == (1, 1000)
+    assert "NEEDLE" in G.clip_hit_text(text, "needle", 1, 100)
+
+
+def test_match_span_falls_back_to_none_when_the_match_cannot_be_mapped_back():
+    assert G.match_span("İxNEEDLE", "needle") == (2, 8)
+    assert G.match_span("abc", "x") is None
+    assert G.match_span("İ", "̇") is None

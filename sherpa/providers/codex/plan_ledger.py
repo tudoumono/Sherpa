@@ -1,5 +1,5 @@
-"""評価用の調査計画書（`.tmp/investigation/plan.md`）: 目録の節を読むパーサ・Sherpa 判定型（plan_gate）の受理判定・計画書から回答への整形。
-切り替えは環境変数 `SHERPA_LEDGER_STYLE`（plan_main＝既定の C-check／json＝JSON 台帳の A／plan_gate＝B）。json のときこのモジュールは何もしない。
+"""調査計画書（`.tmp/investigation/plan.md`）: 目録の節を読むパーサ・計画書から回答への整形・評価用の記録。
+方式は `effective_style`（plan_main＝C-check／json＝JSON 台帳の A）。json のときこのモジュールは何もしない。
 設計: docs/design/codex.md「1ターンの流れ」
 """
 from __future__ import annotations
@@ -7,30 +7,20 @@ from __future__ import annotations
 import os
 import re
 import stat
-from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import NamedTuple
 
 from ... import depth_profile as depth_profile_mod
 from ... import tool_call_log
-from .citations import _HEADING_RE as _REFS_HEADING_RE, _looks_like_ref
+from .citations import _HEADING_RE as _REFS_HEADING_RE, _looks_like_ref, code_block_lines, last_heading_index
 from .ledger_gate import _FINAL_ANSWER_VOICE
 
-STYLE_ENV = "SHERPA_LEDGER_STYLE"
 REVIEW_CAP_ENV = "SHERPA_LEDGER_REVIEW_CAP"
-GATE_DRYRUN_ENV = "SHERPA_LEDGER_GATE_DRYRUN"
-STYLES = ("json", "plan_gate", "plan_main")
-# 既定の調査の方式（C-check）。
-DEFAULT_STYLE = "plan_main"
 PLAN_FILE_NAME = "plan.md"
 PLAN_REL_PATH = ".tmp/investigation/plan.md"
 
-# 深さごとの見直しの上限（plan_gate は Sherpa が数え、plan_main は指示文で渡す）。
+# 深さごとの見直しの上限（指示文で渡す）。
 PLAN_REVIEW_CAPS = {"quick": 0, "standard": 1, "deep": 3, "max": 6}
-# 差し戻しの継続の総数の上限（json の台帳継続と同じ値）。
-PLAN_CONTINUE_CAP = 10
-_MISSING_RETRY_CAP = 2
 
 _MARKS = {" ": "unstarted", "x": "done", "-": "closed"}
 _ROW_RE = re.compile(r"^-\s*\[([ xX\-])\]\s*(.*)$")
@@ -46,24 +36,13 @@ _UNSTARTED_PHRASE = "調べ終わっていません"
 _NO_SOURCE_PHRASE = "ソースの根拠（パス:行）が記載されていないため未確認として扱います"
 _TAG_RE = re.compile(r"\s*\[([^\[\]\s]+)\]")
 _REF_RE = re.compile(r":\d+(?:-\d+)?(?:,\s*\d+(?:-\d+)?)*$")
-_PATH_TOKEN_RE = re.compile(r"(?:[\w\-.]+/)*[\w\-.]+\.[A-Za-z][A-Za-z0-9]{0,5}")
+_PATH_TOKEN_RE = re.compile(r"(?:[\w\-.]+/)*[\w\-.]+\.[A-Za-z][A-Za-z0-9]{0,15}")
 _PLAN_ONLY_PATHS_MAX = 50
 
 
-def ledger_style() -> str:
-    """`SHERPA_LEDGER_STYLE` の実効値。未設定・想定外は plan_main（C-check）。json（A）・plan_gate（B）は指定したときだけ。"""
-    v = os.environ.get(STYLE_ENV, "").strip().lower()
-    return v if v in STYLES else DEFAULT_STYLE
-
-
-def effective_style(*, plain: bool, ollama: bool, schema_level: int) -> str:
-    """計画書の評価方式は標準・OpenAI 系・構造化 v2 だけで使う。"""
-    return ledger_style() if not plain and not ollama and schema_level == 2 else "json"
-
-
-def gate_dry_run() -> bool:
-    """評価専用: `SHERPA_LEDGER_GATE_DRYRUN=1` のとき、plan_gate の判定を記録するだけで差し戻さない。"""
-    return os.environ.get(GATE_DRYRUN_ENV, "").strip() == "1"
+def effective_style(*, plain: bool, schema_level: int) -> str:
+    """調査の方式。標準モード（OpenAI 系・Codex(Ollama)）で出力スキーマ v2 なら plan_main（C-check）、それ以外は json（A）。"""
+    return "plan_main" if not plain and schema_level == 2 else "json"
 
 
 def review_cap_for(profile) -> int:
@@ -240,404 +219,20 @@ def read_plan(investigation_dir: Path) -> Plan | None:
         return None
 
 
-def _signature(plan: Plan | None) -> tuple:
-    if plan is None:
-        return ()
-    return (tuple(sorted((r.id, r.mark, r.kind, r.subject, r.needs, r.subs, r.malformed) for r in plan.rows)),
-            tuple(sorted(plan.perspectives)))
-
-
-def progressed(prev: Plan | None, curr: Plan) -> bool:
-    """前回 final 時から目録の内容・状態・根拠・観点が変わったか。"""
-    return _signature(prev) != _signature(curr)
-
-
-def _row_keys(plan: Plan) -> frozenset:
-    return frozenset((r.id, r.kind, r.subject) for r in plan.rows)
-
-
-# ---- 受理判定（plan_gate） ----
-
-_MISSING_PROMPT = (
-    f"調査計画書 `{PLAN_REL_PATH}` の「## 母集団」節に目録の行が見つかりません。"
-    "計画書を apply_patch で作る・直してください。母集団の各要素を "
-    "`- [ ] <id> · <種別> · <対象> · 要: source` の形で書き、調べ終えたら `- [x]`"
-    "（`- source: パス:行` の行を添える）か `- [-]`（`- 範囲外:`／`- 読めない:`／`- 無い:` の理由行を添える）に更新してから、"
-    "最終回答を返してください。台帳のツールは使わないでください。"
-    + _FINAL_ANSWER_VOICE
-)
-_REVIEW_PROMPT = (
-    "回答を確定する前の見直しです（調べ方を変える指示ではありません）。"
-    "計画書の「## 分かったこと」を読み返し、「## 母集団」にも「## 観点」にもまだ入っていない要素"
-    "（新しい名前・つながり・次に見るべきもの）が無いか確かめてください。"
-    "あれば「## 母集団」に `- [ ]` の行を足し、「## 観点」にも書き、調べて更新してください。"
-    "無ければ「## 見直し」に「追加なし」と書き、そのまま最終回答を返してください。"
-    "計画書は apply_patch で更新し、「## 結論」を最新にしてください。"
-    + _FINAL_ANSWER_VOICE
-)
-
-
-def _unstarted_prompt(rows: tuple[PlanRow, ...]) -> str:
-    ids = "、".join(r.id or r.subject or "(id 無し)" for r in rows)
-    return (
-        f"計画書の「## 母集団」に未着手または形式・理由が不正な行が残っています: {ids}。"
-        "調べて `- [x]`（`- source: パス:行` の行を添える）か `- [-]`（理由行を添える）に更新し、"
-        "「## 結論」を最新にしてから最終回答を返してください。"
-        + _FINAL_ANSWER_VOICE
-    )
-
-
-_GRAPH_TRUNCATED_PROMPT = (
-    "graph_impact の結果が上限で打ち切られています（coverage.complete=false）。"
-    "道具の上限は範囲外の理由になりません。depth や limit を上げて呼び直すか、"
-    "ripgrep_search・read_around で呼び出し元をたどって補ってください。"
-    "補ったうえで確かめた項目は [x] と source の行に、本当に確かめられない項目だけ [-] と理由の行にしてください。"
-    + _FINAL_ANSWER_VOICE
-)
-
-
-class Decision(NamedTuple):
-    action: str  # accept / reject_missing / reject_unstarted / reject_graph / reject_targets / review
-    prompt: str
-    reason: str  # accept のときの打ち切り理由
-
-
-@dataclass
-class PlanGateState:
-    prev: Plan | None = None
-    continuations: int = 0
-    missing_retries: int = 0
-    review_requests: int = 0
-    graph_nudges: int = 0  # グラフの打ち切りを理由にした差し戻しの回数（1 ターンに 1 回まで）
-    review_rounds: int = 0  # 見直しで行か観点が増えた回数
-    awaiting: tuple | None = None  # 見直しを頼んだ時点の (行の集合, 観点の集合)
-    stopped_reason: str | None = None
-    target_nudges: int = 0  # 欠けた対象を示した差し戻しの回数（見直しの枠を使う）
-    format_warnings: int = 0  # 書式不正だけを理由にした差し戻しをやめて警告にした回数
-    last_target: dict | None = None  # 直近の final での対象の照合（`check_targets`）
-    unresolved: dict | None = None  # 受理したが欠落が残った照合
-    log: list = field(default_factory=list)  # final ごとの判定の履歴
-    shadow: object = None  # dry-run で「本来の判定」を進める仮の状態
-
-
-def _pending_rows(plan: Plan) -> tuple[PlanRow, ...]:
-    """本当に未着手（`- [ ]` の行）の行。書式不正だけの行・本文の stray 行は含めない。"""
-    return tuple(r for r in plan.rows if r.mark == " " and not r.stray)
-
-
-def decide(state: PlanGateState, plan: Plan | None, *, review_cap: int,
-           continue_cap: int = PLAN_CONTINUE_CAP, graph_incomplete: bool = False,
-           target: dict | None = None) -> Decision:
-    """final が届くたびに呼ぶ。計画書の目録の節だけから、差し戻す・見直しを頼む・受理するを決める（純関数に近い・状態は `state` に積む）。
-    `graph_incomplete`＝このターンの graph_impact に打ち切られた結果があるとき、`[-]` の行が残る計画書を 1 回だけ差し戻す。
-    `target`＝対象の照合（`check_targets`）。欠落があれば見直しの枠 1 回を、欠けた対象を示す差し戻しに使う。"""
-    plan = plan or Plan()
-    missing_targets = bool(target) and target.get("status") == "missing"
-    if not plan.has_population or not plan.rows:
-        if state.continuations >= continue_cap or state.missing_retries >= _MISSING_RETRY_CAP:
-            state.stopped_reason = "plan_missing"
-            return Decision("accept", "", "plan_missing")
-        state.missing_retries += 1
-        state.continuations += 1
-        return Decision("reject_missing", _MISSING_PROMPT, "")
-    prog = progressed(state.prev, plan)
-    state.prev = plan
-    pending = _pending_rows(plan)
-    if plan.unstarted and not pending:
-        state.format_warnings += 1
-    grew_at_cap = False
-    graph_hit = (graph_incomplete and state.graph_nudges < 1 and state.continuations < continue_cap
-                 and any(r.mark == "-" for r in plan.rows))
-    if state.awaiting is not None:
-        rows_before, persp_before = state.awaiting
-        state.awaiting = None
-        grew = bool(_row_keys(plan) - rows_before) or bool(set(plan.perspectives) - persp_before)
-        if grew:
-            state.review_rounds += 1
-            grew_at_cap = state.review_requests >= review_cap
-        elif (not pending and not graph_hit
-              and not (missing_targets and state.review_requests < review_cap)):
-            state.stopped_reason = "complete"
-            return Decision("accept", "", "complete")
-    if pending:
-        if state.continuations >= continue_cap:
-            state.stopped_reason = "cap"
-            return Decision("accept", "", "cap")
-        if prog:
-            state.continuations += 1
-            return Decision("reject_unstarted", _unstarted_prompt(pending), "")
-        state.stopped_reason = "no_progress"
-        return Decision("accept", "", "no_progress")
-    if graph_hit:
-        state.graph_nudges += 1
-        state.continuations += 1
-        return Decision("reject_graph", _GRAPH_TRUNCATED_PROMPT, "")
-    if state.review_requests < review_cap:
-        state.review_requests += 1
-        state.awaiting = (_row_keys(plan), frozenset(plan.perspectives))
-        if missing_targets:
-            state.target_nudges += 1
-            return Decision("reject_targets", targets_prompt(target), "")
-        return Decision("review", _REVIEW_PROMPT, "")
-    reason = "review_cap" if grew_at_cap or (review_cap > 0 and state.review_requests >= review_cap
-                                                  and state.review_rounds > 0) else "complete"
-    state.stopped_reason = reason
-    return Decision("accept", "", reason)
-
-
-def gate_step(state: PlanGateState, plan: Plan | None, *, review_cap: int, graph_incomplete: bool = False,
-              target: dict | None = None, dry_run: bool = False) -> Decision:
-    """`decide` を 1 回呼び、判定を履歴に残す。dry_run のときは仮の状態で「本来の判定」だけ計算して記録し、常に受理を返す。
-    受理で欠落が残っていれば `state.unresolved` に控える。"""
-    if dry_run:
-        if state.shadow is None:
-            state.shadow = PlanGateState()
-        d = decide(state.shadow, plan, review_cap=review_cap, graph_incomplete=graph_incomplete, target=target)
-    else:
-        d = decide(state, plan, review_cap=review_cap, graph_incomplete=graph_incomplete, target=target)
-    state.last_target = target
-    state.log.append({
-        "n": len(state.log) + 1, "action": d.action, "reason": d.reason, "dry_run": dry_run,
-        "target_status": (target or {}).get("status"), "missing_count": (target or {}).get("missing_count", 0),
-        "unstarted_rows": len(_pending_rows(plan)) if plan is not None else 0,
-        "malformed_rows": sum(r.malformed for r in plan.rows) if plan is not None else 0,
-        "graph_incomplete": bool(graph_incomplete)})
-    if dry_run:
-        state.stopped_reason = "dry_run"
-        state.unresolved = None
-        return Decision("accept", "", "dry_run")
-    if d.action == "accept":
-        state.unresolved = target if target and target.get("status") == "missing" else None
-    return d
-
-
-# ---- 対象 ID の集合による欠落の照合（plan_gate・影響調査） ----
-
-# 依頼の条件を分ける語（質問 ID や特定の名前は埋め込まない）。
-_NARROW_WORDS = ("実行文", "使用している", "使っている", "参照している箇所", "だけ", "のみ")
-_DIRECT_WORDS = ("直接",)
-_COPY_WORDS = ("COPY", "取り込", "取込", "コピー句")
-# 回答の行が「除外」を述べているとみなす語と、使用の有無だけの理由・それ以外の理由を示す語。
-_EXCLUDE_WORDS = ("対象外", "除外", "含めない", "影響しない", "影響なし", "該当しない")
-_USE_ONLY_RE = re.compile(r"実行文では?(?:使|参照)|使用(?:して)?(?:い|なし)|未使用|使われて(?:い|お)|"
-                          r"使って(?:い|お)ない|参照(?:して)?(?:い|お)ない|使用なし")
-_OTHER_REASON_WORDS = ("廃止", "別システム", "別世代", "範囲外", "重複", "退役", "削除済", "存在しない", "コメント")
-TARGET_PROMPT_MAX = 40
-TARGET_RECORD_MAX = 50
-_SUPPLEMENT_HEAD_RE = re.compile(r"^##\s*調べた範囲")
-_H2_RE = re.compile(r"^#{1,2}(?!#)\s")
-
-
-def condition_mode(message: str | None) -> str:
-    """依頼の条件を 3 つに分ける。範囲を絞る語＝undeterminable／「直接」と COPY・取り込み＝direct_copies／それ以外＝default。"""
-    m = message or ""
-    if any(w in m for w in _NARROW_WORDS):
-        return "undeterminable"
-    if any(w in m for w in _DIRECT_WORDS) and any(w in m.upper() for w in _COPY_WORDS):
-        return "direct_copies"
-    return "default"
-
-
-def _row_id(r: dict) -> str:
-    return r.get("path") or r.get("cid") or r.get("name") or ""
-
-
-def required_targets(results: list[dict]) -> tuple[dict, list[dict]]:
-    """graph_impact の結果から必要な対象（id → 対象）を作る。このターン最初の（エラーでない）呼び出しと、起点がすでに含めた結果の影響先になっている呼び出しだけを含める。
-    戻り値＝（対象, 含めた呼び出し）。"""
-    targets: dict[str, dict] = {}
-    calls: list[dict] = []
-    reach_cids: set[str] = set()
-    reach_paths: set[str] = set()
-    for g in results:
-        if g.get("error"):
-            continue
-        start = g.get("start") or {}
-        if calls and not ((start.get("cid") and start["cid"] in reach_cids)
-                          or (start.get("path") and start["path"] in reach_paths)):
-            continue
-        calls.append(g)
-        for r in g.get("rows") or []:
-            rid = _row_id(r)
-            if not rid:
-                continue
-            if r.get("cid"):
-                reach_cids.add(r["cid"])
-            if r.get("path"):
-                reach_paths.add(r["path"])
-            dist = r.get("distance") if isinstance(r.get("distance"), int) else None
-            cur = targets.get(rid)
-            if cur is None:
-                targets[rid] = {"id": rid, "path": r.get("path") or "", "name": r.get("name") or "",
-                                "kind": r.get("kind") or "", "distance": dist,
-                                **{k: r[k] for k in ("doc", "line") if k in r}}
-            elif dist is not None and (cur["distance"] is None or dist < cur["distance"]):
-                cur["distance"] = dist
-    return targets, calls
-
-
-def _answer_lines(answer: str | None) -> list[str]:
-    """回答の本文の行。『参照した資料:』のブロックと補足の節（調べた範囲）は除く＝出典欄だけにあるものを拾わない。"""
-    body, _block = _split_ref_block(answer or "")
-    out: list[str] = []
-    skip = False
-    for ln in body.splitlines():
-        if _SUPPLEMENT_HEAD_RE.match(ln):
-            skip = True
-            continue
-        if skip and _H2_RE.match(ln):
-            skip = False
-        if not skip:
-            out.append(ln)
-    return out
-
-
-def _target_regexes(targets: dict) -> dict[str, re.Pattern]:
-    """対象ごとの照合パターン。パス全体のほか、一意なファイル名・語幹でも拾う（`ABC.cbl` の `ABC`）。"""
-    bases = Counter(); stems = Counter()
-    for t in targets.values():
-        p = t["path"] or t["name"]
-        base = p.rsplit("/", 1)[-1]
-        bases[base] += 1
-        stems[base.rsplit(".", 1)[0]] += 1
-    out = {}
-    for rid, t in targets.items():
-        p = t["path"] or t["name"]
-        base = p.rsplit("/", 1)[-1]
-        stem = base.rsplit(".", 1)[0]
-        alts = [p]
-        if bases[base] == 1 and len(base) >= 3:
-            alts.append(base)
-        if stems[stem] == 1 and len(stem) >= 3:
-            alts.append(stem)
-        out[rid] = re.compile(r"(?<![A-Za-z0-9_.\-])(?:" + "|".join(re.escape(a) for a in dict.fromkeys(alts))
-                              + r")(?![A-Za-z0-9_\-])", re.IGNORECASE)
-    return out
-
-
-def _exclusion_is_valid(line: str) -> bool:
-    """除外の理由が使用の有無だけなら無効（条件と合わない）。それ以外の理由があれば有効。"""
-    return not _USE_ONLY_RE.search(line) or any(w in line for w in _OTHER_REASON_WORDS)
-
-
-def check_targets(results: list[dict], message: str | None, answer: str | None) -> dict:
-    """graph_impact の影響先（ID の集合）と、採用した回答に書かれた対象を ID で比べる。
-    status＝not_applicable（対象集合なし）／undeterminable（依頼の条件を確定できない）／no_missing／missing。
-    missing＝必要 − 含めた − 受け入れた除外。retrieved_complete＝欠落が無い／coverage_complete＝含めた呼び出しの coverage がすべて完全。"""
-    out = {"status": "not_applicable", "condition_mode": None, "required_count": 0, "included_count": 0,
-           "excluded_count": 0, "excluded_invalid_count": 0, "missing_count": 0, "missing": [],
-           "retrieved_complete": None, "coverage_complete": None}
-    if not results:
-        return out
-    mode = condition_mode(message)
-    out["condition_mode"] = mode
-    targets, calls = required_targets(results)
-    if not calls:
-        return out
-    out["coverage_complete"] = all(
-        g.get("complete") is True and not (isinstance(g.get("count"), int) and g["count"] > len(g.get("rows") or []))
-        for g in calls)
-    if mode == "undeterminable":
-        out["status"] = "undeterminable"
-        return out
-    if mode == "direct_copies":
-        targets = {k: t for k, t in targets.items() if t["distance"] == 1}
-    if not targets:
-        return out
-    pats = _target_regexes(targets)
-    included: set[str] = set(); excluded: set[str] = set(); invalid: set[str] = set()
-    for ln in _answer_lines(answer):
-        if not ln.strip():
-            continue
-        hits = [rid for rid, pat in pats.items() if pat.search(ln)]
-        if not hits:
-            continue
-        if any(w in ln for w in _EXCLUDE_WORDS):
-            (excluded if _exclusion_is_valid(ln) else invalid).update(hits)
-        else:
-            included.update(hits)
-    excluded -= included
-    invalid -= included | excluded
-    missing = [t for rid, t in targets.items() if rid not in included and rid not in excluded]
-    out.update(required_count=len(targets), included_count=len(included), excluded_count=len(excluded),
-               excluded_invalid_count=len(invalid), missing_count=len(missing), missing=missing,
-               retrieved_complete=not missing, status="missing" if missing else "no_missing")
-    return out
-
-
-def target_check_for_turn(st, message: str | None, lens: str | None, answer: str | None) -> dict:
-    """影響調査のターン（lens が impact、または investigate で依頼に『影響』がある）で、このターンの graph_impact の結果があれば照合する。それ以外は対象集合なし。"""
-    if not (lens == "impact" or (lens == "investigate" and "影響" in (message or ""))):
-        return check_targets([], message, answer)
-    return check_targets(graph_impact_results(st), message, answer)
-
-
-def targets_prompt(check: dict) -> str:
-    """欠けた対象を具体的に示す差し戻しの文。最大 40 件を、関係・根拠つきで並べる。"""
-    miss = check.get("missing") or []
-    lines = []
-    for t in miss[:TARGET_PROMPT_MAX]:
-        bits = []
-        if t.get("distance") is not None:
-            bits.append(f"距離 {t['distance']}")
-        if t.get("kind"):
-            bits.append(f"種別 {t['kind']}")
-        if t.get("doc"):
-            bits.append(f"根拠 {t['doc']}" + (f":{t['line']}" if t.get("line") else ""))
-        lines.append(f"- {t['id']}" + (f"（{'・'.join(bits)}）" if bits else ""))
-    rest = len(miss) - len(lines)
-    cond = ("依頼の条件: 構造上の影響先をすべて対象にする（graph_impact の結果の全件）。"
-            if check.get("condition_mode") != "direct_copies"
-            else "依頼の条件: 直接取り込む対象（graph_impact の距離 1）をすべて対象にする。")
-    return (
-        f"回答を確定する前の照合です。graph_impact の結果にある影響先のうち、回答の一覧にも除外の説明にも書かれていない対象が"
-        f"{len(miss)} 件あります。\n{cond}\n欠けた対象:\n" + "\n".join(lines)
-        + (f"\n（ほか {rest} 件）" if rest > 0 else "")
-        + "\n各対象を、回答の一覧にパス付きで含めるか、依頼の条件と整合する理由で除外する旨を書いてください"
-          "（「実行文で使っていない」だけでは除外の理由になりません）。graph_impact の結果から外す根拠が"
-          "確かめられない対象は一覧に含めてください。調べ直しが必要なものは調べてから答えてください。"
-        + _FINAL_ANSWER_VOICE)
-
-
-def unresolved_notice(check: dict) -> str:
-    """見直しの枠を使い切っても欠落が残ったときの回答の注記。"""
-    miss = check.get("missing") or []
-    head = "、".join(t["id"] for t in miss[:5])
-    return (f"グラフの影響先のうち {len(miss)} 件が、回答の一覧にも除外の理由にも書かれていません"
-            f"（確認できていません）。先頭: {head}" + (" ほか" if len(miss) > 5 else ""))
-
-
-def target_check_record(state: PlanGateState | None, *, dry_run: bool) -> dict | None:
-    """評価用の記録 `target_check`。plan_gate 以外（状態なし）は None。"""
-    if state is None:
-        return None
-    t = state.last_target or check_targets([], None, None)
-    missing_now = t.get("status") == "missing"
-    if dry_run:
-        decision = "recorded_only" if missing_now else "none"
-    elif state.unresolved:
-        decision = "accepted_unresolved"
-    elif state.target_nudges:
-        decision = "reject_missing"
-    else:
-        decision = "none"
-    return {"status": t["status"], "condition_mode": t["condition_mode"], "required_count": t["required_count"],
-            "included_count": t["included_count"], "excluded_count": t["excluded_count"],
-            "excluded_invalid_count": t["excluded_invalid_count"], "missing_count": t["missing_count"],
-            "missing": [m["id"] for m in t["missing"][:TARGET_RECORD_MAX]],
-            "retrieved_complete": t["retrieved_complete"], "coverage_complete": t["coverage_complete"],
-            "decision": decision, "dry_run": dry_run}
-
-
 # ---- 計画書 → 回答 ----
 
 def unconfirmed_items(plan: Plan) -> list[dict]:
     """未確認の一覧（`{"item","reason"}`）。未着手・打ち切り・済でも「要: source」に `- source:` が無い行。理由行の文は転記する（言い換えない）。"""
+    return _unconfirmed_rows(plan.rows)
+
+
+def _unconfirmed_rows(rows) -> list[dict]:
+    """渡した行のうち未確認のものを `{"item","reason"}` にする。"""
     out = []
-    for r in plan.rows:
+    for r in rows:
         name = r.subject or r.id
         if r.malformed:
-            out.append({"item": name, "id": r.id, "reason": "計画書の形式・id または打ち切りの理由が不正です"})
+            out.append({"item": name, "id": r.id, "reason": "記載の形が読み取れず、確かめられませんでした"})
         elif r.mark == " ":
             out.append({"item": name, "id": r.id, "reason": _UNSTARTED_PHRASE})
         elif r.mark == "-":
@@ -676,9 +271,73 @@ def strip_refs_block(body: str) -> str:
     return body[:idx].rstrip() if idx >= 0 else body.rstrip()
 
 
+_CODE_SPAN_RE = re.compile(r"(?P<t>`+)(?:(?!(?P=t)).)+?(?P=t)")
+_ID_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
+_LINK_DEF_RE = re.compile(r"^ {0,3}\[[^\]\n]+\]:[ \t]*\S")
+_LINK_DEF_LABEL_RE = re.compile(r"^(?: {0,3}>)*(?: ?>)* {0,3}\[([^\]\n]+)\]:[ \t]*\S", re.M)
+_QUOTE_PREFIX_RE = re.compile(r"^ {0,3}>(?: ?>)* ?")
+_TASK_BOX_RE = re.compile(r"^\s*(?:>\s*)*(?:[-*+]|\d{1,9}[.)])\s+\[[ xX]\](?=\s|$)")
+
+
+def _strip_tags_in_text(text: str, ids: set[str]) -> str:
+    """コードの外の文字から、独立した引用の印として付いた id の `[id]`（`[A1][A2]` の連続を含む）だけを除く。
+    直前が英数字・`_`・`]`・`)` の `[…]`（添字・参照。数字だけの id は日本語の文字も含む）と、直後が `(`・`[`・英数字の `[…]`（リンク）は残す。"""
+    runs: list[list[re.Match]] = []
+    for m in _TAG_RE.finditer(text):
+        if m.group(1) not in ids:
+            continue
+        if runs and runs[-1][-1].end() == m.start():
+            runs[-1].append(m)
+        else:
+            runs.append([m])
+    out, pos = [], 0
+    for run in runs:
+        first, last = run[0], run[-1]
+        tag_start = first.start(1) - 1
+        before = text[tag_start - 1] if tag_start > 0 else ""
+        after = text[last.end()] if last.end() < len(text) else ""
+        # 数字だけの id は添字（`値[0]`）と区別できないので、日本語を含む文字の直後も外さない。英字を含む id は日本語の直後なら外す
+        numeric = first.group(1).isdigit()
+        word_char = (before.isalnum() or before == "_") if numeric else bool(_ID_CHAR_RE.match(before))
+        glued_before = not first.group(0)[:1].isspace() and before and (word_char or before in "])")
+        glued_after = after and (_ID_CHAR_RE.match(after) or after in "([")
+        if glued_before or glued_after:
+            continue
+        out.append(text[pos:first.start()])
+        pos = last.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _strip_id_tags(text: str, ids: set[str]) -> str:
-    """結論の各文に添えた根拠の行の id（`[id]`）だけを除く。id 以外の角括弧は残す。"""
-    return _TAG_RE.sub(lambda m: "" if m.group(1) in ids else m.group(0), text)
+    """回答の文に添えた根拠の行の id（`[id]`）だけを除く。id 以外の角括弧、コードスパン・コードブロック（字下げのものを含む）の中、添字やリンクに隣接する角括弧、行頭のチェックボックス（`- [x]`）・リンクの定義（`[a]: URL`）と、定義のある名前の `[a]`（リンク）は残す。"""
+    lines = text.splitlines(keepends=True)
+    codes = code_block_lines([ln.rstrip("\r\n") for ln in lines])
+    # リンクの定義はコードブロックの外のものだけを数える
+    defined = {m.group(1).casefold() for ln, code in zip(lines, codes) if not code
+               for m in _LINK_DEF_LABEL_RE.finditer(ln)}
+    ids = {i for i in ids if i.casefold() not in defined}
+    out: list[str] = []
+    for line, code in zip(lines, codes):
+        # コードブロック（囲み・字下げ・引用や箇条書きの中）の行は触らない
+        if code:
+            out.append(line)
+            continue
+        quote = _QUOTE_PREFIX_RE.match(line)
+        inner = line[quote.end():] if quote else line
+        if _LINK_DEF_RE.match(inner):
+            out.append(line)
+            continue
+        box = _TASK_BOX_RE.match(line)
+        head, line = (line[:box.end()], line[box.end():]) if box else ("", line)
+        parts, pos = [head], 0
+        for c in _CODE_SPAN_RE.finditer(line):
+            parts.append(_strip_tags_in_text(line[pos:c.start()], ids))
+            parts.append(c.group(0))
+            pos = c.end()
+        parts.append(_strip_tags_in_text(line[pos:], ids))
+        out.append("".join(parts))
+    return "".join(out)
 
 
 def _conclusion_line(line: str, ids: set[str], unknown: set[str]) -> str:
@@ -713,10 +372,7 @@ def plan_gaps(plan: Plan) -> tuple[list[dict], list[dict]]:
 def _split_ref_block(answer: str) -> tuple[str, list[str]]:
     """回答を（参照ブロックを除いた本文, ブロックの行）に分ける。ブロックの範囲は `citations.parse_referenced_doc_lines` と同じ（最後の見出し・続く参照らしい行まで）。ブロックが無ければ（本文, [])。"""
     lines = answer.splitlines()
-    idx = None
-    for i, line in enumerate(lines):
-        if _REFS_HEADING_RE.match(line):
-            idx = i
+    idx = last_heading_index(lines, _REFS_HEADING_RE)
     if idx is None:
         return answer.rstrip(), []
     j = idx + 1
@@ -773,36 +429,16 @@ def _plan_only_paths(plan: Plan, refs: dict[str, list[str]], model_answer: str) 
     return out[:_PLAN_ONLY_PATHS_MAX]
 
 
-def _plan_supplement(plan: Plan, fmt: list[dict], unverified: list[dict]) -> str:
-    """本文の後ろに付ける補足の節「調べた範囲（調査計画書）」。計画書の前提・範囲・目録の件数・未完了の2種を並べる。"""
-    parts = []
-    premise = (_section(plan.sections, "前提") or "").strip()
-    if premise:
-        parts.append("### 前提\n" + premise)
-    scope_text = (_section(plan.sections, "範囲") or "").strip()
-    if scope_text:
-        parts.append("### 範囲\n" + scope_text)
-    kinds: dict[str, int] = {}
-    for r in plan.rows:
-        kinds[r.kind or "種別なし"] = kinds.get(r.kind or "種別なし", 0) + 1
-    n_closed = sum(1 for r in plan.rows if r.mark == "-" and not r.malformed)
-    n_open = sum(1 for r in plan.rows if r.mark == " " and not r.malformed)
-    n_done = sum(1 for r in plan.rows if r.mark == "x" and not r.malformed
-                 and not ("source" in r.needs and not r.sources))
-    parts.append(
-        f"母集団 {len(plan.rows)} 件（" + "・".join(f"{k} {v} 件" for k, v in kinds.items()) + "）。"
-        f"確認済み {n_done} 件・確認できなかった {n_closed} 件・未着手 {n_open} 件"
-        + (f"・計画書の記載の不備 {len(fmt)} 件" if fmt else "") + "。")
-    if unverified:
-        parts.append("### 確認できなかった項目\n" + "\n".join(f"- {u['item']}（{u['reason']}）" for u in unverified))
-    if fmt:
-        parts.append("### 計画書の記載の不備\n" + "\n".join(f"- {u['item']}（{u['reason']}）" for u in fmt))
-    return "## 調べた範囲（調査計画書）\n\n" + "\n\n".join(parts)
+def conclusion_text(st) -> str:
+    """このターンの計画書の結論の節（無ければ空）。"""
+    plan = getattr(st, "_plan_final", None)
+    return (_section(plan.sections, "結論") or "") if plan is not None else ""
 
 
 def compose_with_model_answer(plan: Plan, model_answer: str) -> tuple[str, dict]:
-    """モデルの回答を本文のまま残し、計画書を補足の節と参照の追記で後ろに付ける（本文・参照行は書き換えない）。
-    順序は 本文 → 補足の節 → 「参照した資料:」（モデルの参照行 → 計画書にだけある参照）。戻り値＝（組んだ本文, 記録用の要約）。"""
+    """モデルの回答を本文にそのまま残し、計画書の source 行にだけある参照を「参照した資料:」に追記する。
+    順序は 本文 → 「参照した資料:」（モデルの参照行 → 計画書にだけある参照）。戻り値＝（組んだ本文, 記録用の要約）。
+    設計: docs/design/codex.md「評価用の計画書では誰が完了を決めるか」"""
     refs = _plan_refs(plan)
     fmt, unverified = plan_gaps(plan)
     body, block = _split_ref_block(model_answer)
@@ -812,7 +448,7 @@ def compose_with_model_answer(plan: Plan, model_answer: str) -> tuple[str, dict]
         new = [x for x in ranges if x not in known.get(p, set())]
         if new:
             added.append(f"- {p}:{', '.join(new)}")
-    parts = [body, _plan_supplement(plan, fmt, unverified)]
+    parts = [body]
     if block or added:
         parts.append("\n".join(block or ["参照した資料:"]) + ("\n" + "\n".join(added) if added else ""))
     parts = [x for x in parts if x]
@@ -824,7 +460,8 @@ def compose_with_model_answer(plan: Plan, model_answer: str) -> tuple[str, dict]
 
 
 def compose_answer(plan: Plan, fallback_body: str = "") -> str:
-    """計画書を回答に整える（結論 → 前提 → 調べた範囲 → 参照した資料）。機械的な並べ替えと id の除去だけで、文章は要約も言い換えもしない。"""
+    """計画書の結論を回答にする（結論 → 参照した資料。モデルの回答が空のときだけ）。機械的な並べ替えと id の除去だけで、文章は要約も言い換えもしない。
+    確認の状況（件数・確認できなかった項目）は本文に入れない（`turn_report` から回答の補足の欄と調査の記録に出る）。"""
     ids = {r.id for r in plan.rows if r.id}
     conclusion = (_section(plan.sections, "結論") or "").strip()
     if not conclusion:
@@ -832,32 +469,6 @@ def compose_answer(plan: Plan, fallback_body: str = "") -> str:
     unknown = {u["id"] for u in unconfirmed_items(plan)}
     conclusion = "\n".join(_conclusion_line(line, ids, unknown) for line in conclusion.splitlines()).strip()
     parts = [conclusion] if conclusion else []
-    premise = (_section(plan.sections, "前提") or "").strip()
-    if premise:
-        parts.append("## 前提\n" + premise)
-    scope_lines = []
-    scope_text = (_section(plan.sections, "範囲") or "").strip()
-    if scope_text:
-        scope_lines.append(scope_text)
-    if plan.rows:
-        kinds: dict[str, int] = {}
-        for r in plan.rows:
-            kinds[r.kind or "種別なし"] = kinds.get(r.kind or "種別なし", 0) + 1
-        unconf = unconfirmed_items(plan)
-        n_done = sum(1 for r in plan.rows if r.mark == "x" and not r.malformed
-                     and not ("source" in r.needs and not r.sources))
-        n_closed = sum(1 for r in plan.rows if r.mark == "-" and not r.malformed)
-        n_open = len(plan.unstarted)
-        scope_lines.append(
-            f"母集団 {len(plan.rows)} 件（" + "・".join(f"{k} {v} 件" for k, v in kinds.items()) + "）。"
-            f"確認済み {n_done} 件・確認できなかった {n_closed} 件・未着手 {n_open} 件"
-            + (f"・根拠の行が無く未確認に格下げ {len(unconf) - n_closed - n_open} 件" if len(unconf) > n_closed + n_open else "")
-            + "。")
-        if unconf:
-            scope_lines.append("確認できなかった項目:\n" + "\n".join(
-                f"- {u['item']}（{u['reason']}）" for u in unconf))
-    if scope_lines:
-        parts.append("## 調べた範囲\n" + "\n\n".join(scope_lines))
     refs: dict[str, list[str]] = {}
     for r in plan.rows:
         for s in r.sources:
@@ -875,7 +486,7 @@ def compose_answer(plan: Plan, fallback_body: str = "") -> str:
     return "\n\n".join(parts)
 
 
-# ---- グラフの結果（plan_gate の関門・評価用の記録） ----
+# ---- グラフの結果（評価用の記録） ----
 
 def graph_impact_page_results(st) -> list[dict]:
     """このターンの graph_impact の呼び出しごとの結果（ページ送りの 1 ページ 1 件・`tool_call_log.graph_view` ＋ call_id・tool・role）。記録のファイルは消さない。読めなければ空。"""
@@ -894,20 +505,16 @@ def graph_impact_results(st) -> list[dict]:
     return tool_call_log.merge_impact_pages(graph_impact_page_results(st))
 
 
-def graph_incomplete(st) -> bool:
-    """このターンの graph_impact に coverage が完全でない結果があるか。"""
-    return any(g.get("complete") is False for g in graph_impact_results(st))
-
-
 # ---- ターンの仕上げ・評価用の記録 ----
 
 EVAL_DIR_ENV = "SHERPA_LEDGER_EVAL_DIR"
 
 
 def compose_turn_answer(st) -> None:
-    """計画書方式のターンで、モデルの回答を本文のまま残して計画書の補足を後ろに付ける（モデルの回答が空のときだけ計画書の結論を本文にする。計画書に目録の行が無いときは何もしない）。"""
+    """計画書方式のターンで、モデルの回答を本文にそのまま残し、計画書にだけある参照を追記する（モデルの回答が空のときだけ計画書の結論を本文にする。計画書に目録の行が無いときは何もしない）。"""
     stats = {"applied": False, "body_source": "unchanged", "plan_present": False, "plan_rows": 0,
-             "format_issues": [], "unverified_items": [], "plan_only_paths": [], "refs_added_from_plan": 0}
+             "format_issues": [], "unverified_items": [], "plan_only_paths": [],
+             "refs_added_from_plan": 0}
     st._compose_stats = stats
     if st._ledger_style == "json" or st._investigation_dir is None:
         return
@@ -932,24 +539,30 @@ def compose_turn_answer(st) -> None:
 def turn_report(st) -> dict:
     """`env["investigation"]` に載せる計画書の要約（本文は載せない）。"""
     plan = st._plan_final if st._plan_final is not None else (read_plan(st._investigation_dir) if st._investigation_dir else None)
-    gate = st._plan_gate
     marks = {"unstarted": 0, "done": 0, "closed": 0}
     if plan is not None:
         for r in plan.rows:
             marks["unstarted" if r.malformed else _MARKS[r.mark]] += 1
     review_text = (_section(plan.sections, "見直し") or "") if plan is not None else ""
+    unconfirmed = unconfirmed_items(plan) if plan is not None else []
+    fmt, _unverified = plan_gaps(plan) if plan is not None else ([], [])
+    n_unstarted = sum(1 for r in plan.rows if r.mark == " " and not r.malformed) if plan is not None else 0
+    # 回答に出す件数と一覧の材料。目録の行だけを数える（本文の stray 行は目録の行ではない）
+    listed_rows = [r for r in plan.rows if not r.stray] if plan is not None else []
+    listed = _unconfirmed_rows(listed_rows)
+    n_total = len(listed_rows)
     return {
         "ledger": "plan", "style": st._ledger_style, "plan_present": plan is not None,
         "rows": len(plan.rows) if plan is not None else 0, "marks": marks,
-        "unconfirmed_items": unconfirmed_items(plan) if plan is not None else [],
+        "plan_counts": {"total": n_total, "confirmed": n_total - len(listed),
+                        "unconfirmed": len(listed) - n_unstarted, "unstarted": n_unstarted},
+        "plan_unverified_items": listed,
+        "plan_format_issues": fmt,
+        "unconfirmed_items": unconfirmed,
         "plan_review_lines": sum(1 for ln in review_text.splitlines() if ln.strip().startswith("-")),
-        "review_requests": gate.review_requests if gate else 0,
-        "review_rounds": gate.review_rounds if gate else 0,
-        "continuations": gate.continuations if gate else 0,
-        "stopped_reason": st._investigation_stopped_reason or (gate.stopped_reason if gate else None),
+        "stopped_reason": st._investigation_stopped_reason,
         "malformed_rows": sum(r.malformed for r in plan.rows) if plan else 0,
         "normalizations": list(plan.normalizations) if plan is not None else [],
-        "format_warnings": gate.format_warnings if gate else 0,
     }
 
 
@@ -967,8 +580,7 @@ def finish_report(st, ctx, env) -> None:
         elif st._codex_stopped_early:
             reason = "auto_continue_cap"
         else:
-            reason = st._plan_gate.stopped_reason if st._plan_gate else "self_final"
-            reason = reason or "no_resume"
+            reason = "self_final"
         st._investigation_stopped_reason = reason
         env["investigation"] = {**(env.get("investigation") or {}), **turn_report(st),
                                 "stopped_reason": reason, "resume_count": st._resume_count,
@@ -996,14 +608,13 @@ def _graph_stats(st) -> dict:
             "impact_depth_truncated": sum(1 for g in rows if g.get("depth_truncated") is True)}
 
 
-def _gate_stats(st, plan: Plan | None, graph: dict) -> dict:
+def _gate_stats(plan: Plan | None, graph: dict) -> dict:
     closed = []
     for r in (plan.rows if plan is not None else ()):
         if r.mark == "-":
             word, detail = r.reason or (None, "")
             closed.append({"id": r.id, "reason": word, "detail": detail})
-    return {"graph_nudges": st._plan_gate.graph_nudges if st._plan_gate else 0,
-            "accepted_with_graph_incomplete": bool(graph["impact_incomplete"] and closed),
+    return {"accepted_with_graph_incomplete": bool(graph["impact_incomplete"] and closed),
             "closed_rows": closed}
 
 
@@ -1023,14 +634,10 @@ def _compose_stats(st) -> dict:
 
 
 def _review_stats(st) -> dict:
-    """評価用: 見直しを Sherpa が数えて止めたか（A・B）、指示文の数字だけか（C）。"""
+    """評価用: 見直しを Sherpa が数えて止めたか（A）、指示文の数字だけか（C）。"""
     if st._ledger_style == "json":
         return {"app_gating": True, "app_review_cap": st._plan_review_cap,
                 "app_review_requests": st._ledger_review_requests, "instruction_review_cap": None}
-    if st._ledger_style == "plan_gate":
-        return {"app_gating": True, "app_review_cap": st._plan_review_cap,
-                "app_review_requests": st._plan_gate.review_requests if st._plan_gate else 0,
-                "instruction_review_cap": None}
     return {"app_gating": False, "app_review_cap": None, "app_review_requests": 0,
             "instruction_review_cap": st._plan_review_cap}
 
@@ -1052,8 +659,7 @@ def dump_eval_record(st, ctx) -> None:
             (out / f"{stem}.plan.md").write_text(plan.text, encoding="utf-8")
         else:
             (out / f"{stem}.plan.md").unlink(missing_ok=True)
-        reviews_asked = (st._plan_gate.review_requests if st._plan_gate else 0) if st._ledger_style != "json" \
-            else st._ledger_review_requests
+        reviews_asked = st._ledger_review_requests if st._ledger_style == "json" else 0
         for old in out.glob(f"{stem}.review-*.md"):
             k = old.name[len(stem) + len(".review-"):-len(".md")]
             if not k.isdigit() or int(k) > reviews_asked:
@@ -1078,10 +684,8 @@ def dump_eval_record(st, ctx) -> None:
             "codex_stopped_early": bool(st._codex_stopped_early),
             "plan": turn_report(st) if st._ledger_style != "json" else None,
             "review_cap": st._plan_review_cap, "graph": graph,
-            "gate": _gate_stats(st, plan, graph) if st._ledger_style != "json" else None,
+            "gate": _gate_stats(plan, graph) if st._ledger_style != "json" else None,
             "plan_normalizations": list(plan.normalizations) if plan is not None else [],
-            "target_check": target_check_record(st._plan_gate, dry_run=gate_dry_run()),
-            "gate_log": list(st._plan_gate.log) if st._plan_gate else None,
             "candidate": _candidate_stats(st), "compose": _compose_stats(st),
             "review": _review_stats(st), "composed_taken": "before_preamble_split",
             "trimmed": [{"kind": t.get("kind"), "chars": len(t.get("text") or "")} for t in st._trimmed],

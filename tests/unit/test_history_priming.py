@@ -31,7 +31,7 @@ _HISTORY = [{"role": "user", "content": "前回の質問です"}, {"role": "assi
 def test_codex_run_sets_history_attribute_before_knowledge_off_branch():
     p = A.CodexProvider()
     ctx = Ctx(message="hi", world="v1", knowledge=False,
-              route=lambda m: {}, dispatch=lambda l, i: {}, history=list(_HISTORY))
+              route=lambda m: {}, history=list(_HISTORY))
     list(p.run(ctx))
     assert p._history == _HISTORY
 

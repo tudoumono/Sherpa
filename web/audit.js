@@ -21,12 +21,24 @@ function toast(msg) {
 }
 
 // ===== admin ガード =====
+let _adminErr = '';
+// 戻り値は 'admin'／'denied'（401・403・管理者でない）／'unreachable'（判定できなかった。理由は _adminErr）。
 async function checkAdmin() {
   try {
     const u = await getJSON('/auth/me');
-    if (u && u.role === 'admin') return true;
-  } catch (_) { /* compat */ }
-  return false;
+    return u && u.role === 'admin' ? 'admin' : 'denied';
+  } catch (e) {
+    if (e && (e.status === 401 || e.status === 403)) return 'denied';
+    _adminErr = (e && e.message) || '';
+    return 'unreachable';
+  }
+}
+
+function showUnreachable(denied) {
+  const d = denied && denied.querySelectorAll('div');
+  if (!d || d.length < 3) return;
+  d[1].textContent = '権限を確認できませんでした: ' + _adminErr;
+  d[2].textContent = '時間をおいて画面を開き直してください。';
 }
 
 // ===== 検索クエリ組み立て =====
@@ -188,6 +200,16 @@ function updatePager(count, offset) {
   rc.textContent = count > 0 ? `（${count} 行取得）` : '';
 }
 
+// 外部 API の監査行を書けなかった件数。0 でなければ監査ログに欠けがあることを知らせる。
+function showExtAuditGap(n) {
+  const el = $('ext-audit-gap');
+  if (!el) return;
+  el.hidden = n <= 0;
+  el.textContent = n > 0
+    ? `外部連携の操作記録を保存できなかったものが ${n} 件あります（サーバーを起動してからの件数）。この期間の外部連携の記録には欠けがあります。`
+    : '';
+}
+
 // ===== 検索実行 =====
 async function search(offset) {
   _offset = offset;
@@ -196,6 +218,7 @@ async function search(offset) {
   try {
     const d = await getJSON('/admin/audit?' + buildParams(offset));
     _lastCount = (d.rows || []).length;
+    showExtAuditGap(d.ext_audit_write_failures || 0);
     renderRows(d.rows || []);
     updatePager(_lastCount, offset);
   } catch (e) {
@@ -250,29 +273,15 @@ $('export-jsonl').addEventListener('click', () => exportAudit('jsonl'));
   const el = $(id); if (el) el.addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter') search(0); });
 });
 
-// テーマ切替
-function applyThemeIcon() {
-  const tb = $('themebtn');
-  if (tb) tb.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙';
-}
-const themebtn = $('themebtn');
-if (themebtn) {
-  themebtn.addEventListener('click', () => {
-    const d = document.documentElement;
-    const next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-    d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
-  });
-}
-applyThemeIcon();
-
 // ===== 初期化 =====
 (async () => {
   const isAdmin = await checkAdmin();
-  if (!isAdmin) {
+  if (isAdmin !== 'admin') {
     const main = $('main-content');
     const denied = $('access-denied');
     if (main) main.style.display = 'none';
     if (denied) denied.style.display = 'block';
+    if (isAdmin === 'unreachable') showUnreachable(denied);
     return;
   }
   // ページロード時は最新100件を取得。

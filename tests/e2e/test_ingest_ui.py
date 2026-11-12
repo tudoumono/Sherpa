@@ -4,12 +4,15 @@ import json
 import re
 
 import pytest
-from mock_api import PREVIEW, USER_MEMBER, WORLD, WORLD_STATUS_RESP, install_api_mocks
+from mock_api import PREVIEW, PREVIEW_GRAPH, USER_MEMBER, WORLD, WORLD_STATUS_RESP, install_api_mocks
 from playwright.sync_api import expect
 
-RUNNING_PROGRESS = {"stage": "es_index", "stage_label": "全文索引に登録し、ベクトル化中",
+RUNNING_PROGRESS = {"stage": "es_index", "stage_label": "検索できるように登録中",
                     "done": 42, "total": 100, "updated_at": "2026-09-04T00:00:00+00:00"}
+BUSY_ACTIONS = {name: {"allowed": False, "reason": "取り込み中のため、この操作はできません。終わってからお試しください"}
+                for name in ("recount", "refresh", "rag_regenerate_rules", "delete", "reconvert")}
 ACCEPTED = "受け付けました。状況は取り込み状況でご確認ください。"
+_PREVIEW_URL = re.compile(r"/ingest/preview(\?|$)")   # 一覧の応答。`/ingest/preview/graph`（関係を確認）は含めない
 SCAN_PDF = "4期/02_設計/01_基本設計/スキャン図面.pdf"
 
 
@@ -21,13 +24,15 @@ def _route_json(page, pattern, body, status=200):
     page.route(pattern, lambda route: _fulfill(route, body, status))
 
 
-def _open(page, web_base_url, status=None, preview=None, **mock_kw):
-    """ingest.html を開く。status／preview を渡すと /worlds/w1/status・/ingest/preview の応答を差し替える。"""
+def _open(page, web_base_url, status=None, preview=None, graph=None, **mock_kw):
+    """ingest.html を開く。status／preview／graph を渡すと /worlds/w1/status・/ingest/preview・/ingest/preview/graph の応答を差し替える。"""
     records = install_api_mocks(page, **mock_kw)
     if status is not None:
         _route_json(page, "**/worlds/w1/status", {**WORLD_STATUS_RESP, **status})
     if preview is not None:
-        _route_json(page, "**/ingest/preview**", preview)
+        _route_json(page, _PREVIEW_URL, preview)
+    if graph is not None:
+        _route_json(page, "**/ingest/preview/graph**", graph)
     page.goto(f"{web_base_url}/ingest.html")
     return records
 
@@ -36,6 +41,11 @@ def _doc(name, **kw):
     return {"name": name, "path": name, "doctype": None, "branch": None, "analyzer": None,
             "state": "ready", "label": "使えます", "reason": None,
             "folder": "", "top_scope": "", "phase": "", "category": "", **kw}
+
+
+def _open_tab(page, name):
+    page.locator(f"#tabbtn-{name}").click()
+    expect(page.locator(f"#tab-{name}")).to_be_visible()
 
 
 def _pick_project_a(page):
@@ -50,7 +60,7 @@ def _pick_project_a(page):
       "last_run_warnings": ["office_md:derived_publish_failed:OSError",
                             "office_md_blocked:a:b.xlsx\tunhandled_exception:RuntimeError"]},
      # `:` を含むファイル名でも途切れない（doc と reason はタブ区切り）
-     ["前回の取り込みは失敗しました", "Office文書のテキスト化処理自体に問題がありました", "a:b.xlsx"]),
+     ["前回の取り込みは失敗しました", "Office 資料を読み取れませんでした", "a:b.xlsx"]),
     ({"analyzer_declined_as_document": 2, "analyzer_declined": 3},
      ["担当なし（資料扱い）2 件", "未対応 3 件"]),
     ({"unreachable_as_text": 5, "unreachable_by_reason": {"encoding_undetermined": 2, "binary": 1},
@@ -58,17 +68,16 @@ def _pick_project_a(page):
      ["本文が読めず対象外 5 件", "文字コード判別不能 2", "バイナリ 1", "一部が化けている（要確認） 4 件"]),
     ({"last_run_status": "failed", "last_run_warnings": ["unreadable_code_file"],
       "last_run_blocked": [{"doc": "PROG.cbl", "reason": "unreadable_code_file"}]},
-     ["取り込みを止めました", "PROG.cbl", "読み取れませんでした"]),
-    ({"ingest_notices": [{"code": "walk_unreadable_dir", "count": 2}, {"code": "graph_source_oversize", "count": 1},
-                         {"code": "es_analyzer_fallback", "count": 1}]},
-     ["2 件のフォルダを開けず", "1 件のソースは大きすぎて関係グラフに載せていません", "標準の解析器で全文検索を作りました"]),
+     ["前回の取り込みは失敗しました", "PROG.cbl", "取り込みを停止しました"]),
+    ({"ingest_notices": [{"code": "walk_unreadable_dir", "count": 2}, {"code": "graph_source_oversize", "count": 1}]},
+     ["2 件のフォルダを開けず", "1 件のソース資料は大きすぎるため、資料どうしの関係に含めていません"]),
 ], ids=["failed_and_generic_office_md", "analyzer_declined", "unreachable_breakdown", "unreadable_code_blocked",
         "silent_drops_noticed"])
 def test_status_summary_shows_run_failures_and_breakdowns(page, web_base_url, status, texts):
     """状況欄: 前回の失敗・汎用 office_md warning・アナライザ不採用の内訳・読めず対象外の理由別内訳・
     不可読コードによる停止（対象ファイル名付き）を平文で出す。"""
     _open(page, web_base_url, status=status)
-    stat = page.locator('[data-stat="w1"]')
+    stat = page.locator('#main-content')
     for text in texts:
         expect(stat).to_contain_text(text)
 
@@ -85,7 +94,7 @@ def test_status_summary_shows_run_failures_and_breakdowns(page, web_base_url, st
 ], ids=["unreadable", "unknown", "unreadable_code_file"])
 def test_document_list_shows_unreadable_and_unknown_as_distinct_from_ready(page, web_base_url, doc, texts):
     """`state=unreadable`／`unknown` は `STATE.ready` へ倒れず（黙って「使えます」にしない）専用の表示になり、
-    「⚠ 失敗」フィルタでも消えない。読み取り不可の行は理由と「やり直す」を出す。"""
+    「⚠ 失敗」フィルタでも消えない。表の行に「やり直す」は出さず、読み取り不可の行は元のファイルを直してからの「今すぐ更新」を案内する。"""
     _open(page, web_base_url, preview={**PREVIEW, "documents": [doc]})
 
     row = page.locator("#rows tr", has_text="PROG.cbl")
@@ -96,8 +105,9 @@ def test_document_list_shows_unreadable_and_unknown_as_distinct_from_ready(page,
 
     page.click('[data-state="failed"]')
     expect(row).to_be_visible()
+    expect(row.locator("[data-rerun]")).to_have_count(0)
     if doc["state"] == "unreadable":
-        expect(row.locator('button[data-rerun="PROG.cbl"]')).to_be_visible()
+        expect(row).to_contain_text("元のファイルを直してから「今すぐ更新」を押してください")
 
 
 def test_scanned_pdf_with_unread_pages_shows_warning_badge(page, web_base_url):
@@ -186,14 +196,14 @@ def test_register_success_resyncs_status_section(page, web_base_url):
         _fulfill(route, new_preview if (state["registered"] and "world=w2" in route.request.url) else PREVIEW)
 
     page.route("**/worlds", handle_worlds)
-    page.route("**/ingest/preview**", handle_preview)
+    page.route(_PREVIEW_URL, handle_preview)
     _route_json(page, "**/worlds/*/status",
                 {"ok": True, "indexed": 1, "office_md": 1, "skipped_office": 0, "office_failed": 0,
                  "skipped_other": 0, "graph_nodes": 0, "es_chunks": 1})
 
     page.goto(f"{web_base_url}/ingest.html")
     expect(page.locator("#regcard")).to_be_visible()
-    expect(page.locator("#version")).to_be_hidden()
+    expect(page.locator("#tabarea")).to_be_hidden()   # 未登録のあいだはタブごと出さない
 
     _pick_project_a(page)
     page.locator("#regbtn").click()
@@ -201,6 +211,7 @@ def test_register_success_resyncs_status_section(page, web_base_url):
     expect(page.locator("#regmsg")).to_contain_text("受け付けました")
     expect(page.locator("#rows")).to_contain_text("新フォルダ文書.md")
     expect(page.locator("#version")).to_have_value("w2")
+    expect(page.locator("#tabarea")).to_be_visible()
     expect(page.locator("#version")).to_be_hidden()   # 1件でも選択UIは出さない
 
 
@@ -246,12 +257,14 @@ def test_delete_returns_screen_to_unregistered_state(page, web_base_url):
 
     def handle_status(route):
         if not state["accepted"]:
-            _fulfill(route, {**counts, "running_progress": None})
+            _fulfill(route, {**counts, "running_progress": None, "ingest_active": False,
+                             "actions": WORLD_STATUS_RESP["actions"]})
         elif not state["done"]:
             state["done"] = True   # 次回ポーリングから完了（404）を返す
             _fulfill(route, {**counts, "running_progress": {
-                "stage": "deleting", "stage_label": "検索用データを削除しています",
-                "done": None, "total": None, "updated_at": "2026-09-01T00:00:00+00:00"}})
+                "stage": "deleting", "stage_label": "検索用データを削除中",
+                "done": None, "total": None, "updated_at": "2026-09-01T00:00:00+00:00"},
+                "ingest_active": True, "actions": BUSY_ACTIONS})
         else:
             _fulfill(route, {"detail": "資料フォルダが見つかりません"}, status=404)
 
@@ -265,21 +278,27 @@ def test_delete_returns_screen_to_unregistered_state(page, web_base_url):
     expect(page.locator("#list")).to_contain_text("4期更改")
     expect(page.locator("#regcard")).to_be_hidden()
 
+    _open_tab(page, "rules")
+    page.locator('[data-set="README.md"]').select_option("exclude")
+    expect(page.locator("#rules-dot")).to_be_visible()
+
     page.once("dialog", lambda d: d.accept())
     page.locator('[data-del="w1"]').click()
-    expect(page.locator('[data-stat="w1"]')).to_contain_text("検索用データを削除しています")
+    expect(page.locator('[data-stat="w1"]')).to_contain_text("検索用データを削除中")
 
     page.clock.fast_forward(3500)
     expect(page.locator("#regcard")).to_be_visible()
     expect(page.locator("#currentcard")).to_be_hidden()
     expect(page.locator("#list")).not_to_contain_text("4期更改")
+    expect(page.locator("#tabarea")).to_be_hidden()
+    assert page.evaluate("window.RulesTab.isDirty()") is False   # 消えた資料フォルダの下書きを次の登録へ持ち越さない
 
 
 def test_ingest_status_page_shows_loading_then_rows(page, web_base_url):
     """一覧・ツリーに読み込み中表示が出て、データ到着後に一覧へ切り替わる（応答を保留して決定的に観測）。"""
     install_api_mocks(page)
     pending: dict = {}
-    page.route("**/ingest/preview**", lambda route: pending.update(route=route))
+    page.route(_PREVIEW_URL, lambda route: pending.update(route=route))
     page.goto(f"{web_base_url}/ingest.html")
 
     expect(page.locator("#rows")).to_contain_text("読み込み中")
@@ -306,7 +325,7 @@ def test_preview_unavailable_shows_plain_state_not_stuck_spinner(page, web_base_
 
     if not registered:
         _route_json(page, "**/worlds", {"worlds": []})
-    page.route("**/ingest/preview**", handle_preview)
+    page.route(_PREVIEW_URL, handle_preview)
     page.goto(f"{web_base_url}/ingest.html")
 
     text = "取り込み状況を取得できません" if registered else "まだ資料フォルダが登録されていません"
@@ -403,40 +422,102 @@ def test_page_and_detail_button_admin_only(page, web_base_url):
     expect(page.locator("#detailbtn")).to_be_hidden()
 
 
-def test_importance_badge_and_diagnostics_banner(page, web_base_url):
-    """台帳（文書一覧）に `_重要度.txt` 由来の重要度バッジが出る（値・理由・由来はホバー・重要度が無い文書は空のまま）。
-    `_重要度.txt` の構文エラーはツリー付近の小さな警告バナーに出る（無ければ非表示）。"""
+def test_importance_is_not_shown_even_if_the_response_carries_it(page, web_base_url):
+    """重要度は画面に使わない＝応答に重要度の欄があっても、バッジ・列・警告バナーは出ない。"""
     preview_with_importance = {**PREVIEW, "importance_diagnostics": [
-        {"config_path": "4期/02_設計/_重要度.txt", "line": 3, "column": 1,
-         "code": "invalid_value", "message": "値が正しくありません。「高」「中」「低」「なし」のいずれかにしてください"},
+        {"config_path": "4期/02_設計/_重要度.txt", "line": 3, "column": 1, "code": "invalid_value", "message": "x"},
     ], "documents": [
-        ({**d, "importance": "高", "importance_reason": "税制改正の一次資料",
-          "importance_source": "4期/02_設計/_重要度.txt:1行目"}
+        ({**d, "importance": "高", "importance_reason": "税制改正の一次資料"}
          if d["name"] == "4期/02_設計/01_基本設計/税計算仕様書.md" else d)
         for d in PREVIEW["documents"]
     ]}
     _open(page, web_base_url, preview=preview_with_importance)
+    for folder in ("4期", "4期/02_設計", "4期/02_設計/01_基本設計"):
+        page.locator(f'#rows button[data-open-folder="{folder}"]').click()
 
-    badge = page.locator("#rows tr", has_text="税計算仕様書.md").locator(".impbadge")
-    expect(badge).to_have_text("高")
-    expect(badge).to_have_attribute("title", re.compile("重要度 高.*税制改正の一次資料.*_重要度\\.txt"))
-    expect(page.locator("#rows tr", has_text="TAXCALC.cbl").locator(".impbadge")).to_have_count(0)
-    banner = page.locator("#impdiag")
-    expect(banner).to_be_visible()
-    expect(banner).to_contain_text("_重要度.txt")
-    expect(banner).to_contain_text("4期/02_設計/_重要度.txt:3行目")
+    expect(page.locator("#rows tr", has_text="税計算仕様書.md")).to_be_visible()
+    expect(page.locator(".impbadge")).to_have_count(0)
+    expect(page.locator("#impdiag")).to_have_count(0)
+    expect(page.locator("thead")).not_to_contain_text("重要度")
 
-    _route_json(page, "**/ingest/preview**", PREVIEW)
-    page.goto(f"{web_base_url}/ingest.html")
-    expect(page.locator("#impdiag")).to_be_hidden()
+
+def test_detail_overlay_shows_why_graph_is_not_built(page, web_base_url):
+    """要素・関係を組み立てていないとき（取り込み中など）は、詳細の画面に理由を出し、記録の無い件数は「不明」と出す。"""
+    note = "取り込み中のため、要素と関係の詳細は取り込みが終わってから表示します。"
+    graph = {**PREVIEW_GRAPH, "graph_note": note, "entities": [], "relations": [], "issues": [],
+             "counts": {"entities": 120, "relations": None, "deprecated": None, "hidden": None, "documents": 3}}
+    _open(page, web_base_url, graph=graph)
+    page.locator("#detailbtn").click()
+    bar = page.locator("#pv-bar")
+    expect(bar).to_contain_text("120")
+    expect(bar).to_contain_text("不明")
+    expect(bar).to_contain_text(note)
+    expect(bar).not_to_contain_text("廃止/隠し")
+
+
+def test_detail_overlay_lists_entities_and_relations_from_graph(page, web_base_url):
+    """「詳細（管理）」を開いたときだけ関係の取得を呼び、要素と関係を一覧に出す（資料の一覧を開くだけでは呼ばない）。"""
+    calls = []
+    page.on("request", lambda r: calls.append(r.url) if "/ingest/preview/graph" in r.url else None)
+    _open(page, web_base_url)
+    expect(page.locator("#rows")).to_contain_text("4期")
+    assert calls == []
+
+    page.locator("#detailbtn").click()
+    expect(page.locator("#pv-ents .ent", has_text="TAX-RATE")).to_contain_text("解析: COBOL")
+    expect(page.locator("#pv-rels")).to_contain_text("DOCUMENTS")
+    assert len(calls) == 1
+
+
+def test_detail_overlay_shows_plain_error_when_graph_fails(page, web_base_url):
+    """「詳細（管理）」で関係の取得に失敗したら、読み込み中のまま止めず平文で出す。"""
+    _open(page, web_base_url)
+    _route_json(page, "**/ingest/preview/graph**", {"detail": "取り込み状況を読み込めませんでした"}, 503)
+    page.locator("#detailbtn").click()
+    bar = page.locator("#pv-bar")
+    expect(bar).to_contain_text("関係を取得できません")
+    expect(bar.locator(".spinner")).to_have_count(0)
+
+
+def test_partial_folder_scan_and_pending_list_are_shown_in_plain_words(page, web_base_url):
+    """フォルダの走査が期限で止まったときはツリーの下に、一覧を出せないときは一覧の空欄にその理由を平文で出す。"""
+    note = "まだ取り込みが終わっていないため、資料の一覧は取り込みのあとに出します。"
+    _open(page, web_base_url, preview={**PREVIEW, "documents": [], "documents_note": note, "folders_partial": True})
+    expect(page.locator("#tree")).to_contain_text("資料の無いフォルダは一部だけ確認しています")
+    expect(page.locator("#rows")).to_contain_text(note)
+
+
+def test_folder_tree_starts_collapsed_and_opens_on_click(page, web_base_url):
+    """ツリーは最上位だけを出して閉じておき、行で範囲を選んで開く。▸ は範囲を変えずに開閉する。"""
+    doc = {**_doc("製品A/設計/詳細/画面.xlsx"), "folder": "製品A/設計/詳細"}
+    _open(page, web_base_url, preview={**PREVIEW, "documents": [doc], "folders": []})
+    tree = page.locator("#tree")
+    row = lambda name: tree.locator(".tnode", has_text=name)
+    expect(row("製品A")).to_have_count(1)
+    expect(row("設計")).to_have_count(0)
+
+    row("製品A").click()
+    expect(page.locator("#count")).to_contain_text("範囲: 製品A")
+    expect(row("設計")).to_have_count(1)
+    expect(row("詳細")).to_have_count(0)
+
+    row("設計").locator("[data-tree-toggle]").click()
+    expect(row("詳細")).to_have_count(1)
+    expect(page.locator("#count")).not_to_contain_text("製品A/設計")
+
+    row("製品A").click()
+    expect(row("設計")).to_have_count(0)
+
+    page.locator("#rows button[data-open-folder='製品A/設計']").click()
+    expect(row("詳細")).to_have_count(1)
+    expect(row("設計")).to_have_class(re.compile(r"\bon\b"))
 
 
 def test_status_shows_counts_as_of_and_recount_button(page, web_base_url):
-    """件数の後ろに集計時刻を表示し、「再集計」ボタンで `POST /worlds/{id}/recount` を呼んで表示を更新する
-    （未集計＝`counts_as_of=None` は「（未集計）」）。"""
-    _open(page, web_base_url, status={"counts_as_of": None})
+    """完了時点の件数に集計時刻を表示し、「件数を数え直す」で更新する。"""
+    _open(page, web_base_url, status={"counts_as_of": None, "last_completed_counts": None})
     stat = page.locator('[data-stat="w1"]')
-    expect(stat).to_contain_text("（未集計）")
+    expect(stat).to_contain_text("件数はまだ数えていません")
 
     recount_calls = []
 
@@ -450,7 +531,7 @@ def test_status_shows_counts_as_of_and_recount_button(page, web_base_url):
 
     stat.locator('[data-recount="w1"]').click()
     expect(stat).to_contain_text("時点")
-    expect(stat).not_to_contain_text("未集計")
+    expect(stat).not_to_contain_text("件数はまだ数えていません")
     assert recount_calls == ["POST"]
 
 
@@ -488,7 +569,7 @@ def test_status_detail_shows_failed_files_and_reconvert_button_calls_endpoint(pa
     expect(details).to_contain_text("旧料金表.xls")
     expect(details).to_contain_text("タイムアウト")
     expect(details).to_contain_text("時間をおいて再試行してください")
-    expect(details).to_contain_text("MD変換")
+    expect(details).to_contain_text("資料の読み取り")
 
     btn = details.locator('[data-reconvert-wid="w1"][data-rel="旧料金表.xls"]')
     expect(btn).to_have_count(1)
@@ -503,7 +584,8 @@ def test_pickbtn_disabled_while_ingest_running(page, web_base_url):
     """登録ボタン（`pickbtn`）は、実行中の資料フォルダが1件でもあれば無効化し平文の理由（`title`）を添える
     （登録処理全体は長時間かつ排他のため、実行中に別の登録を投げると固まって見える）。実行中でなくなれば再び有効化される。
     登録済みのため `regcard` 自体は非表示だが、`disabled`/`title` は表示状態と独立に検証できる。"""
-    _open(page, web_base_url, status={"running_progress": RUNNING_PROGRESS})
+    _open(page, web_base_url, status={"running_progress": RUNNING_PROGRESS, "ingest_active": True,
+                                      "actions": BUSY_ACTIONS})
 
     pickbtn = page.locator("#pickbtn")
     expect(pickbtn).to_be_disabled()
@@ -511,12 +593,41 @@ def test_pickbtn_disabled_while_ingest_running(page, web_base_url):
     steps = page.locator(".ingest-steps")   # 取り込み系の段では 済✓/現在(件数付き)/残り が1行に並ぶ
     expect(steps).to_be_visible()
     expect(steps.locator(".step.done")).to_have_count(3)          # scanning/office_md/graph_build が済
-    expect(steps.locator(".step.now")).to_contain_text("全文索引・ベクトル化（42/100）")
+    expect(steps.locator(".step.now")).to_contain_text("検索できるように登録中（42/100）")
     expect(steps.locator(".step.todo")).to_have_count(1)          # finalize が残り
 
     _route_json(page, "**/worlds/w1/status", WORLD_STATUS_RESP)
     page.reload()
     expect(pickbtn).to_be_enabled()
+
+
+def test_status_separates_completed_available_and_running_and_uses_api_action_locks(page, web_base_url):
+    _open(page, web_base_url, status={
+        "indexed": 0, "scanned": 2, "es_chunks": 0,
+        "running_progress": RUNNING_PROGRESS, "ingest_active": True, "actions": BUSY_ACTIONS,
+    })
+    stat = page.locator('[data-stat="w1"]')
+    expect(stat).to_contain_text("最後に最後まで終わった取り込み")
+    expect(stat).to_contain_text("現在使える状態")
+    expect(stat).to_contain_text("進行中の取り込み")
+    expect(stat).to_contain_text("文字として読める資料の本文を直接探すことはできます")
+    expect(stat).to_contain_text("仕上げが終わるまで")
+    reason = "取り込み中のため、この操作はできません。終わってからお試しください"
+    expect(page.locator('.action-lock-note')).to_have_text(reason)
+    for selector in ('[data-recount="w1"]', '[data-refresh="w1"]', '[data-rag-rules="w1"]', '[data-del="w1"]'):
+        expect(page.locator(selector)).to_be_disabled()
+
+
+def test_top_notice_collects_previous_failure_and_failed_documents(page, web_base_url):
+    _open(page, web_base_url, status={
+        "last_run_status": "failed",
+        "last_failure_message": "前回の取り込みは失敗しました（資料どうしの関係を書き込めませんでした）",
+        "failed_files": {"items": [], "total": 3, "truncated": False},
+    })
+    notice = page.locator("#workerbanner")
+    expect(notice).to_be_visible()
+    expect(notice).to_contain_text("資料どうしの関係を書き込めませんでした")
+    expect(notice).to_contain_text("読み取れなかった資料が 3 件")
 
 
 def test_pickbtn_recovers_after_transient_status_failure_during_polling(page, web_base_url):
@@ -528,7 +639,8 @@ def test_pickbtn_recovers_after_transient_status_failure_during_polling(page, we
     def handle_status(route):
         state["calls"] += 1
         if state["calls"] == 1:
-            _fulfill(route, {**WORLD_STATUS_RESP, "running_progress": RUNNING_PROGRESS})
+            _fulfill(route, {**WORLD_STATUS_RESP, "running_progress": RUNNING_PROGRESS,
+                             "ingest_active": True, "actions": BUSY_ACTIONS})
         elif state["calls"] == 2:
             _fulfill(route, {"detail": "boom"}, status=500)
         else:
@@ -542,7 +654,7 @@ def test_pickbtn_recovers_after_transient_status_failure_during_polling(page, we
     expect(pickbtn).to_be_disabled()
 
     page.clock.fast_forward(3500)   # 2回目のポーリング＝一時的な500失敗（ポーリングは継続する）
-    expect(page.locator('[data-stat="w1"]')).to_contain_text("状況を取得できませんでした")
+    expect(page.locator('[data-stat="w1"]')).to_contain_text("状況を取得できません: boom")
     expect(pickbtn).to_be_disabled()
 
     page.clock.fast_forward(3500)   # 3回目のポーリング＝復旧して running_progress が無くなる
@@ -552,6 +664,7 @@ def test_pickbtn_recovers_after_transient_status_failure_during_polling(page, we
 def test_resolve_settings_save_confirms_and_shows_warning(page, web_base_url):
     """資料の探し方の設定: 保存は確認してから送り、取り込み直しの案内と見つからない場所の警告を出す。"""
     records = _open(page, web_base_url)
+    _open_tab(page, "setup")
     expect(page.locator("#resolvecard")).to_be_visible()
     page.wait_for_load_state("networkidle")              # 設定の読み込み（GET）が終わってから入力する
     page.once("dialog", lambda d: d.accept())
@@ -559,10 +672,180 @@ def test_resolve_settings_save_confirms_and_shows_warning(page, web_base_url):
     page.locator("#rs-save").click()
     expect(page.locator("#rs-msg")).to_contain_text("取り込み直しています")
     expect(page.locator("#rs-msg")).to_contain_text("SystemA/COPYLIB")
-    assert records["resolve_settings_put"] == [{"copy_paths": ["SystemA/COPYLIB"], "path_aliases": {}}]
+    assert records["resolve_settings_put"] == [{"copy_paths": ["SystemA/COPYLIB"], "path_aliases": {}, "name_rules": []}]
 
 
 def test_unreflected_resolve_settings_stay_visible_after_reload(page, web_base_url):
     """未反映の設定は、状況の API が返す限り画面を開き直しても「更新が必要」と出続ける。"""
     _open(page, web_base_url, status={"resolve_settings_pending": True})
-    expect(page.locator("#list")).to_contain_text("更新が必要です")
+    expect(page.locator("#workerbanner")).to_contain_text("まだ反映されていません")
+
+
+def test_folder_check_button_shows_three_levels_and_items(page, web_base_url):
+    """「フォルダの置き方を点検」を押すと、3 段の件数と、合わない・注意を先にした項目の表が出る。"""
+    check = {"root": "ProjectA", "ledger_at": "2026-11-05T01:02:03+00:00", "not_counted": ["未解決の参照を読めなかったため、点検していない。"],
+             "summary": {}, "items": [
+                 {"rule": "決まり1", "result": "合う", "path": "", "what": "PJ は root の直下にある", "treatment": "そのまま使う", "fix": "",
+                  "count": 2, "examples": [], "extra": {}},
+                 {"rule": "決まり4", "result": "注意", "path": "サブA", "what": "名前に番号がない", "treatment": "仮定つきで答える",
+                  "fix": "名前に期の番号を付ける", "count": 1, "examples": ["サブA/共通"], "extra": {}},
+                 {"rule": "決まり2", "result": "合わない", "path": "サブB", "what": "期が同じ高さにない", "treatment": "期として読まない",
+                  "fix": "期のフォルダを同じ高さに並べる", "count": 1, "examples": [], "extra": {}}]}
+    _open(page, web_base_url)
+    _route_json(page, re.compile(r"/worlds/w1/folder-check(\?|$)"), check)
+    _open_tab(page, "setup")
+    page.locator("#chk-btn").click()
+    out = page.locator("#chk-out")
+    expect(out).to_contain_text("合わない 1 件")
+    expect(out).to_contain_text("注意 1 件")
+    expect(out).to_contain_text("合う 1 件")
+    expect(out.locator("tbody tr").first).to_contain_text("サブB")
+    expect(out).to_contain_text("期のフォルダを同じ高さに並べる")
+    expect(out).to_contain_text("数えていないもの（1 件）")
+    expect(out.locator("#chk-md")).to_have_attribute("href", re.compile(r"/worlds/w1/folder-check\?format=md$"))
+
+
+def test_rules_tab_loads_on_open_and_its_dialog_does_not_clash_with_the_folder_picker(page, web_base_url):
+    """「優先と除外」は、タブを開いたとき（または #rules で開いたとき）だけ読み込む。保存の確認小窓とフォルダ選択の小窓は
+    同じ名前の部品を共有せず、どちらを開いてももう一方が開きっぱなしにならない。"""
+    records = _open(page, web_base_url)
+    expect(page.locator("#rows")).to_contain_text("4期")
+    assert records["path_rules_get"] == []                       # 画面を開いただけでは読まない（読むと書き込むことがある）
+    expect(page.locator("#tab-rules")).to_be_hidden()
+
+    _open_tab(page, "rules")
+    expect(page.locator("#rules-tree")).to_contain_text("README.md")
+    assert len(records["path_rules_get"]) == 1
+    expect(page.locator("#rules-dot")).to_be_hidden()
+
+    page.locator('[data-set="README.md"]').select_option("exclude")
+    expect(page.locator("#rules-dot")).to_be_visible()            # 保存していない変更がある印
+    page.locator("#savebtn").click()
+    expect(page.locator("#rules-ovl")).to_be_visible()
+    expect(page.locator("#ovl")).to_be_hidden()
+    page.locator("#okbtn").click()
+    expect(page.locator("#rules-ovl")).to_be_hidden()
+    expect(page.locator("#rules-dot")).to_be_hidden()
+    assert records["path_rules_put"] == [
+        {"world": "w1", "rules": [{"path": "README.md", "kind": "exclude", "outside_scope": False}]}]
+
+    page.goto(f"{web_base_url}/ingest.html?from=old#rules")
+    expect(page.locator("#tab-rules")).to_be_visible()
+    expect(page.locator("#rules-tree")).to_contain_text("README.md")
+    assert len(records["path_rules_get"]) == 2
+
+    _route_json(page, "**/worlds", {"worlds": []})                # 未登録: 登録カードのフォルダ選択の小窓
+    page.goto(f"{web_base_url}/ingest.html?unregistered=1")
+    page.locator("#pickbtn").click()
+    expect(page.locator("#ovl")).to_have_class(re.compile(r"\bopen\b"))
+    expect(page.locator("#ovl")).to_be_visible()
+    expect(page.locator("#rules-ovl")).to_be_hidden()
+
+
+def test_failed_list_retry_reconverts_one_file_and_never_rebuilds_the_whole_folder(page, web_base_url):
+    """失敗の一覧の「やり直す」は、その 1 件だけの読み取り直し（POST /worlds/{id}/reconvert）を呼ぶ。
+    資料フォルダ全体の作り直し（POST /ingest/rerun）は呼ばず、表の行にも「やり直す」を出さない。"""
+    requests = []
+    page.on("request", lambda r: requests.append((r.method, r.url.split("?")[0].split("/", 3)[3])))
+    _open(page, web_base_url, status={
+        "office_failed": 1,
+        "failed_files": {"items": [{"doc": "旧料金表.xls", "stage": "legacy_conversion", "reason": "legacy_conversion_timeout"}],
+                         "total": 1, "truncated": False},
+        "failure_reason_catalog": {"legacy_conversion_timeout": {"label": "タイムアウト", "advice": ""}},
+    })
+    _route_json(page, "**/worlds/w1/reconvert", {"ok": True, "world_id": "w1", "run_id": 7, "joined": False,
+                                                 "note": ACCEPTED}, status=202)
+
+    page.click('[data-state="failed"]')
+    expect(page.locator("#rows tr", has_text="BILLGEN.cbl")).to_be_visible()
+    expect(page.locator("#rows button", has_text="やり直す")).to_have_count(0)
+
+    stat = page.locator('[data-stat="w1"]')
+    stat.locator("details.adv summary").click()
+    btn = stat.locator('[data-reconvert-wid="w1"][data-rel="旧料金表.xls"]')
+    expect(btn).to_have_text("やり直す")
+    page.once("dialog", lambda d: d.accept())
+    btn.click()
+
+    page.wait_for_load_state("networkidle")
+    assert ("POST", "worlds/w1/reconvert") in requests
+    assert not [r for r in requests if r[1] == "ingest/rerun"]
+
+
+_MARK_RULES = [{"path": "4期/02_設計", "kind": "priority", "outside_scope": True},
+               {"path": "4期/03_開発/01_ソース/BILLGEN.cbl", "kind": "exclude", "outside_scope": False}]
+
+
+def test_status_table_marks_own_and_inherited_rules_without_reading_the_rules_api(page, web_base_url):
+    """表の行に、自分に付いた印と親から受けた印が出る。画面を開いただけでは設定の API を呼ばない（呼ぶと設定を書き換えることがある）。
+    「優先と除外」タブで変えて保存すると、戻った表の印が変わる。"""
+    records = _open(page, web_base_url, path_rules=_MARK_RULES)
+    page.locator("#q").fill("税計算")
+    inherited = page.locator("#rows tr", has_text="税計算仕様書.md")
+    expect(inherited.locator(".pill.pri")).to_have_text("優先")
+    expect(inherited.locator(".pill.pri")).to_have_attribute("title", re.compile("親の「02_設計」に従います"))
+    expect(inherited.locator(".pill.pri")).to_have_attribute("title", re.compile("範囲の外でも読みます"))
+    page.locator("#q").fill("BILLGEN")
+    expect(page.locator("#rows tr", has_text="BILLGEN.cbl").locator(".pill.exc")).to_have_text("除外")
+    assert records["path_rules_get"] == []
+
+    _open_tab(page, "rules")
+    expect(page.locator("#rules-tree")).to_contain_text("README.md")
+    page.locator("#rules-q").fill("BILLGEN")
+    page.locator('[data-set="4期/03_開発/01_ソース/BILLGEN.cbl"]').select_option("none")
+    page.locator("#savebtn").click()
+    page.locator("#okbtn").click()
+    expect(page.locator("#rules-ovl")).to_be_hidden()
+    _open_tab(page, "status")
+    expect(page.locator("#rows tr", has_text="BILLGEN.cbl")).to_be_visible()
+    expect(page.locator("#rows tr", has_text="BILLGEN.cbl").locator(".pill")).to_have_count(0)
+    page.locator("#q").fill("税計算")
+    expect(page.locator("#rows tr", has_text="税計算仕様書.md").locator(".pill.pri")).to_have_text("優先")
+
+
+def test_setting_button_reveals_the_row_even_when_it_is_not_on_the_first_page_and_filters_are_on(page, web_base_url):
+    """表の「設定」を押すと「優先と除外」タブへ移り、1 ページ目に無いファイルでも、絞り込み中でも、その行が見えて設定欄に焦点が行く。"""
+    target = "4期/02_設計/01_基本設計/税計算仕様書.md"
+
+    def files(route):
+        folder = (re.search(r"folder=([^&]*)", route.request.url) or [None, ""])[1]
+        from urllib.parse import unquote
+        folder = unquote(folder)
+        if folder == "4期/02_設計/01_基本設計":
+            _fulfill(route, {"folder": folder, "files": ["4期/02_設計/01_基本設計/a.md"], "truncated": False,
+                             "total": 2, "next_offset": 1})
+        else:
+            _fulfill(route, {"folder": folder, "files": [], "truncated": False, "total": 0, "next_offset": None})
+
+    records = _open(page, web_base_url)
+    page.route("**/admin/path-rules/files**", files)
+    _open_tab(page, "rules")
+    page.locator('.filterchip[data-f="pri"]').click()
+    page.locator("#rules-q").fill("zzz")
+    _open_tab(page, "status")
+    page.locator("#q").fill("税計算")
+    page.locator("#rows tr", has_text="税計算仕様書.md").locator("[data-rule-goto]").click()
+    expect(page.locator("#tab-rules")).to_be_visible()
+    row = page.locator("#rules-tree [data-row]").filter(has=page.locator(f'select[data-set="{target}"]'))
+    expect(row).to_have_class(re.compile(r"\breveal\b"))
+    expect(row.locator("select[data-set]")).to_be_focused()
+    expect(page.locator("#rules-q")).to_have_value("")
+    assert len(records["path_rules_get"]) == 2   # タブに入るたびに 1 回
+
+
+def test_folder_setting_button_does_not_open_the_folder_and_is_absent_for_empty_folders(page, web_base_url):
+    """フォルダの行の「設定」はフォルダを開かずタブだけ移す。資料が 0 件のフォルダの行には出さない。"""
+    _open(page, web_base_url, preview={**PREVIEW, "folders": ["4期/空き"]})
+    folder = page.locator('tr.folderrow[data-open-folder="4期"]')
+    folder.locator("[data-rule-goto]").click()
+    expect(page.locator("#tab-rules")).to_be_visible()
+    expect(page.locator('#rules-tree [data-row="4期"]')).to_have_class(re.compile(r"\breveal\b"))
+    _open_tab(page, "status")
+    expect(page.locator("#count")).not_to_contain_text("範囲:")
+    expect(folder).to_be_visible()
+
+    folder.locator("button", has_text="開く").click()
+    expect(page.locator("#count")).to_contain_text("範囲: 4期")
+    expect(page.locator('tr.folderrow[data-open-folder="4期/02_設計"] [data-rule-goto]')).to_have_count(1)
+    expect(page.locator('tr.folderrow[data-open-folder="4期/空き"]')).to_be_visible()
+    expect(page.locator('tr.folderrow[data-open-folder="4期/空き"] [data-rule-goto]')).to_have_count(0)

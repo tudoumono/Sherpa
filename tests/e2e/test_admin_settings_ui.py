@@ -1,7 +1,8 @@
 """システム管理画面（admin-settings.html）の e2e。
 
 - 保存は触った項目だけを PUT /admin/settings に載せる（未操作・元に戻した項目は送らない）。
-- タブ単位の「既定に戻す」は対象キーだけを null（または明示 false）で送り、他タブの未保存編集を消さない。
+- タブ単位の「既定に戻す」は欄を既定の値にするだけで PUT を送らず、保存で確定する（固定中の項目だけ null を送る）。
+  他タブの未保存編集は消さない。
 - 書込専用のキー欄は値を画面に出さず、削除は専用操作だけで行う。
 - 非 admin はアクセス拒否・ナビに「システム管理」が出ない。
 - 外部連携キー発行モーダル（管理画面・個人設定共通）は応答待ちの間閉じられず、曖昧な失敗は回復導線へ回す。
@@ -104,13 +105,13 @@ def _hold_first_put(page):
 
 def test_chat_examples_hint_matches_empty_save_is_hidden_contract(page, web_base_url):
     """空欄のまま保存すると質問例は「非表示」になる実契約と案内文言が一致する。未設定の初回描画は
-    基準値と一致し、プロバイダタブに未保存の丸印が付かない。"""
-    _admin(page, web_base_url)
+    基準値と一致し、チャットと個人ファイルのタブに未保存の丸印が付かない。"""
+    _admin(page, web_base_url, tab="chat")
 
     expect(page.locator("#chat-examples-card")).to_contain_text(
         "空欄のまま保存すると質問例は表示されません。組み込みの既定（4例）に戻すには、"
-        "下の「未設定に戻す」を使ってください。")
-    expect(page.locator("#tab-dot-provider")).to_be_hidden()
+        "下の「未設定に戻す」を押して、「保存」で確定してください。")
+    expect(page.locator("#tab-dot-chat")).to_be_hidden()
 
 
 def test_tab_selection_persists_across_reload_via_url_hash(page, web_base_url):
@@ -416,7 +417,7 @@ def test_vlm_renders_and_saves(page, web_base_url):
 
     page.locator("#vlm-provider").select_option("openai")
     expect(page.locator("#vlm-key-missing")).to_be_visible()
-    expect(page.locator("#vlm-key-missing")).to_contain_text("OPENAI_API_KEY")
+    expect(page.locator("#vlm-key-missing")).to_contain_text("「プロバイダ＋接続先」タブ")
     page.locator("#vlm-cloud-allowed").check()
     page.locator("#vlm-model").fill("gpt-4o")
     _save_ok(page)
@@ -426,79 +427,209 @@ def test_vlm_renders_and_saves(page, web_base_url):
 
 # ===== タブ単位の「既定に戻す」 =====
 
-@pytest.mark.parametrize("tab,patch,expected,exact,absent,field_after", [
-    ("ingest", None,
-     {"arms_enabled": None, "legacy_backend": None, "vlm": None, "rag_llm_render": None}, True, (), None),
-    ("models", None, {"model_catalog": None}, False, (), None),
-    ("extkeys",
-     lambda v: v["ext_keys"].update(
-         user_api_keys_allowed=True, self_issued_active_count=0,
-         research_default_provider={"configured": "openai", "effective": "openai", "default": "ollama"}),
-     {"user_api_keys_allowed": False, "user_api_keys_daily_quota_default": None,
-      "research_default_provider": None}, False, ("usage_chat_provider",),
+def _pin_ingest(v):
+    v["arms"].update(configured=["ooxml"], enabled=["ooxml"])
+    v["legacy_backend"] = {**_LEGACY_BASE, "configured": "libreoffice", "effective": "libreoffice",
+                           "options": ["none", "libreoffice"], "libreoffice": _LO_AVAIL}
+    v["vlm"]["configured"] = {"provider": "openai", "cloud_allowed": True}
+    v["vlm"]["effective"] = {**v["vlm"]["effective"], "provider": "openai", "cloud_allowed": True}
+    v["rag_llm_render"] = {"configured": "off", "effective": False, "default": True, "options": ["on", "off"]}
+    v["ocr"] = {"configured": True, "effective": True, "default": False, "env_override": None}
+
+
+def _pin_extkeys(v):
+    v["ext_keys"].update(user_api_keys_allowed=True, self_issued_active_count=0)
+    v["ext_keys"]["daily_quota_default"] = {"configured": 50, "effective": 50, "default": 100}
+
+
+def _pin_research(v):
+    v["ext_keys"]["research_default_provider"] = {"configured": "openai", "effective": "openai",
+                                                  "default": "ollama"}
+    v["depth_profile"]["grep_max_hits"] = {"configured": 20, "effective": 20, "default": 30}
+    v["embed_parallel"] = {"configured": 8, "effective": 8, "default": 4}
+
+
+def _pin_cloud_provider(v):
+    v["cloud"]["provider_raw"] = "openai"
+    v["openai_endpoint"]["configured"]["kind"] = "openai"
+
+
+@pytest.mark.parametrize("tab,patch,expected,field_after", [
+    ("ingest", _pin_ingest,
+     {"arms_enabled": None, "legacy_backend": None, "vlm": None, "rag_llm_render": None, "ocr_enabled": None},
+     ("#rag-llm-render", True)),
+    ("extkeys", _pin_extkeys,
+     {"user_api_keys_allowed": False, "user_api_keys_daily_quota_default": None},
+     ("#ext-keys-user-quota-default", "")),
+    ("research", _pin_research,
+     {"research_default_provider": None, "depth_base_grep_max_hits": None},
      ("#ext-research-default-provider", "ollama")),
-], ids=["ingest", "models", "extkeys"])
-def test_tab_reset_sends_only_that_tabs_keys(page, web_base_url, tab, patch, expected, exact, absent,
-                                             field_after):
-    """タブのリセットは対象キーだけを送る（ingest は4キー・external は実効既定と同値の明示 false）。"""
+    ("provider", _pin_cloud_provider, {"cloud_provider": None, "openai_endpoint_kind": None}, ("#embed-provider", "")),
+], ids=["ingest", "extkeys", "research", "provider"])
+def test_tab_reset_only_fills_fields_and_save_sends_null(page, web_base_url, tab, patch, expected, field_after):
+    """「このタブを既定に戻す」は欄を既定の値にして丸印と案内を出すだけで、PUT は送らない。
+    「保存」で初めて、固定中だった項目が null（真偽は明示 false）で送られ、案内は消える。"""
     view = _view()
-    if patch:
-        patch(view)
+    patch(view)
     records = _admin(page, web_base_url, tab=tab, system_settings=view)
+    expect(page.locator(f"#tab-dot-{tab}")).to_be_hidden()
 
     page.locator(f'[data-reset-tab="{tab}"]').click()
-    expect(page.locator(f"#tab-reset-res-{tab}")).to_contain_text("既定に戻しました")
+
+    expect(page.locator(f"#tab-reset-res-{tab}")).to_have_text("既定の値を入れました。下の「保存」で確定します")
+    expect(page.locator(f"#tab-dot-{tab}")).to_be_visible()
+    expect(page.locator("#unsaved-note")).to_be_visible()
+    assert records["admin_settings_put"] == []
+    sel, want = field_after
+    if isinstance(want, bool):
+        expect(page.locator(sel)).to_be_checked(checked=want)
+    else:
+        expect(page.locator(sel)).to_have_value(want)
+
+    _save_ok(page)
     put = _last_put(records)
-    if exact:
-        assert put == expected
     for key, value in expected.items():
-        assert put[key] == value and type(put[key]) is type(value)
-    for key in absent:
-        assert key not in put
-    if field_after:
-        expect(page.locator(field_after[0])).to_have_value(field_after[1])
+        assert key in put and put[key] == value and type(put[key]) is type(value)
+    expect(page.locator(f"#tab-reset-res-{tab}")).to_have_text("")
+    expect(page.locator(f"#tab-dot-{tab}")).to_be_hidden()
 
 
-@pytest.mark.parametrize("confirm", [True, False], ids=["accepted", "rejected"])
-def test_provider_tab_reset_confirms_when_personal_keys_in_use(page, web_base_url, confirm):
-    """個人キー保有者がいる状態のリセットは確認を経る。個人キー許可は null でなく明示 false を送る
-    （バックエンドの一括削除は厳密な false でだけ発火する）。棄却すると PUT 自体を送らない。"""
+def test_models_tab_reset_fills_cells_and_save_nulls_catalog(page, web_base_url):
+    view = _ollama_chat_view()
+    view["model_catalog"]["configured"] = {"openai": {"chat": {
+        "allowed": ["gpt-5.5", "gpt-5.4-mini"], "default": "gpt-5.4-mini"}}}
+    view["model_catalog"]["effective"]["openai"]["chat"]["default"] = "gpt-5.4-mini"
+    records = _admin(page, web_base_url, tab="models", system_settings=view)
+    expect(page.locator(OPENAI_CHAT_SEL)).to_have_value("gpt-5.4-mini")
+
+    page.locator('[data-reset-tab="models"]').click()
+
+    expect(page.locator("#tab-reset-res-models")).to_contain_text("既定の値を入れました")
+    expect(page.locator(OPENAI_CHAT_SEL)).to_have_value("gpt-5.5")
+    expect(page.locator(OLLAMA_CHAT_SEL)).to_have_value("qwen2.5")
+    assert records["admin_settings_put"] == []
+    _save_ok(page)
+    assert _last_put(records)["model_catalog"] is None
+
+
+def test_reset_then_changed_item_is_not_nulled(page, web_base_url):
+    """既定に戻した後で別の値へ選び直した項目は、null ではなく選んだ値で保存する。欄が既定のままの項目だけ null。"""
+    view = _view()
+    _pin_ingest(view)
+    view["arms"]["configured"] = ["ooxml", "pdf_text", "vision"]
+    view["arms"]["enabled"] = ["ooxml", "pdf_text", "vision"]
+    view["legacy_backend"]["options"] = ["none", "libreoffice", "office_com"]
+    records = _admin(page, web_base_url, tab="ingest", adv=True, system_settings=view)
+
+    page.locator('[data-reset-tab="ingest"]').click()
+    expect(page.locator("#legacy-radios input[data-legacy='none']")).to_be_checked()
+    page.locator("#arms-list input[data-arm='pdf_text']").uncheck()   # 既定（ooxml+pdf_text）から変える
+    page.locator("#legacy-radios input[data-legacy='libreoffice']").check()   # 固定中の値へ選び直す
+    expect(page.locator("#tab-dot-ingest")).to_be_visible()
+
+    _save_ok(page)
+    put = _last_put(records)
+    assert put["arms_enabled"] == ["ooxml"]
+    assert "legacy_backend" not in put   # 元の固定値と同じ＝送らない（null にもしない）
+    assert put["vlm"] is None and put["rag_llm_render"] is None
+
+
+def test_provider_tab_reset_does_not_touch_chat_tab_fields(page, web_base_url):
+    """接続先タブの「既定に戻す」は、同時実行の上限・個人ファイル・質問例（チャットと個人ファイルのタブ）に及ばない。"""
+    view = _view()
+    view["chat_max_turns"]["per_user"] = {"configured": 5, "effective": 5, "default": 2}
+    view["workspace"]["ttl_days"] = {"configured": 30, "effective": 30, "default": 90}
+    view["chat_examples"] = {"configured": {"enabled": True, "items": ["例1"]}, "effective": ["例1"],
+                             "default": ["既定1"]}
+    records = _admin(page, web_base_url, system_settings=view)
+
+    page.locator('[data-reset-tab="provider"]').click()
+    expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定の値を入れました")
+    open_tab(page, "chat")
+    expect(page.locator("#chat-max-turns-per-user")).to_have_value("5")
+    expect(page.locator("#workspace-ttl-days")).to_have_value("30")
+    expect(page.locator("#chat-examples-items")).to_have_value("例1")
+    expect(page.locator("#tab-dot-chat")).to_be_hidden()
+    expect(page.locator("#tab-reset-res-chat")).to_have_text("")
+
+    _save_ok(page)
+    put = _last_put(records)
+    assert not any(k.startswith(("chat_max_turns", "workspace_")) or k == "chat_examples" for k in put)
+    assert records["admin_settings_put"][0] == put
+
+
+def test_chat_examples_reset_fills_fields_and_save_nulls(page, web_base_url):
+    view = _view()
+    view["chat_examples"] = {"configured": {"enabled": False, "items": ["例1", "例2"]},
+                             "effective": [], "default": ["既定1"]}
+    records = _admin(page, web_base_url, tab="chat", system_settings=view)
+    expect(page.locator("#chat-examples-items")).to_have_value("例1\n例2")
+
+    page.locator("#chat-examples-reset").click()
+
+    expect(page.locator("#chat-examples-reset-res")).to_contain_text("下の「保存」で確定します")
+    expect(page.locator("#chat-examples-enabled")).to_be_checked()
+    expect(page.locator("#chat-examples-items")).to_have_value("")
+    expect(page.locator("#tab-dot-chat")).to_be_visible()
+    assert records["admin_settings_put"] == []
+    _save_ok(page)
+    assert _last_put(records)["chat_examples"] is None
+    expect(page.locator("#chat-examples-reset-res")).to_have_text("")
+
+
+@pytest.mark.parametrize("accept", [True, False], ids=["accepted", "rejected"])
+def test_provider_tab_reset_defers_personal_keys_confirm_to_save(page, web_base_url, accept):
+    """個人キー保有者がいる状態のリセットは確認を出さず PUT も送らない。確認は「保存」のときに出る
+    （個人キー許可は null でなく明示 false。棄却すると PUT 自体を送らない）。"""
     view = _view()
     view["cloud"]["personal_api_keys_allowed"] = True
     view["cloud"]["personal_keys_in_use_count"] = 3
     records = _admin(page, web_base_url, system_settings=view)
+    dialogs = _dialogs(page, accept)
 
-    if confirm:
-        page.once("dialog", lambda d: d.accept())
-    page.locator('[data-reset-tab="provider"]').click()   # 未登録＝既定で自動棄却
-    if confirm:
-        expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定に戻しました")
-        put = _last_put(records)
-        assert put["personal_api_keys_allowed"] is False
-        assert put["cloud_provider"] is None
+    page.locator('[data-reset-tab="provider"]').click()
+    expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定の値を入れました")
+    expect(page.locator("#personal-keys-allowed")).not_to_be_checked()
+    assert dialogs == [] and records["admin_settings_put"] == []
+
+    page.locator("#save").click()
+    if accept:
+        expect(page.locator("#msg")).to_contain_text("保存しました")
+        assert _last_put(records)["personal_api_keys_allowed"] is False
+        assert len(dialogs) == 1 and "3 人" in dialogs[0]
     else:
-        expect(page.locator("#tab-reset-res-provider")).not_to_contain_text("既定に戻しました")
+        expect(page.locator("#msg")).to_contain_text("保存を取り消しました")
         assert records["admin_settings_put"] == []
+        expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定の値を入れました")
 
 
-def test_extkeys_tab_reset_confirms_when_self_issued_keys_active(page, web_base_url):
+def test_extkeys_tab_reset_defers_self_issued_keys_confirm_to_save(page, web_base_url):
     view = _view()
     view["ext_keys"]["user_api_keys_allowed"] = True
     view["ext_keys"]["self_issued_active_count"] = 2
     records = _admin(page, web_base_url, tab="extkeys", system_settings=view)
+    messages = []
+    answer = {"accept": False}
+    page.on("dialog", lambda d: (messages.append(d.message), d.accept() if answer["accept"] else d.dismiss()))
 
-    page.locator('[data-reset-tab="extkeys"]').click()   # 未登録＝既定で自動棄却
-    expect(page.locator("#tab-reset-res-extkeys")).not_to_contain_text("既定に戻しました")
+    page.locator('[data-reset-tab="extkeys"]').click()
+    expect(page.locator("#ext-keys-user-allowed")).not_to_be_checked()
+    assert messages == [] and records["admin_settings_put"] == []
+
+    page.locator("#save").click()
+    expect(page.locator("#msg")).to_contain_text("保存を取り消しました")
+    assert messages and "2 件" in messages[0] and "失効" in messages[0]
     assert records["admin_settings_put"] == []
 
-    page.once("dialog", lambda d: d.accept())
-    page.locator('[data-reset-tab="extkeys"]').click()
-    expect(page.locator("#tab-reset-res-extkeys")).to_contain_text("既定に戻しました")
+    answer["accept"] = True
+    page.locator("#save").click()
+    expect(page.locator("#msg")).to_contain_text("保存しました")
     assert _last_put(records)["user_api_keys_allowed"] is False
 
 
-def test_research_tab_reset_nulls_all_keys_and_keeps_provider_draft(page, web_base_url):
-    """調査・回答タブのリセットは12キー全てを null で送り、プロバイダタブの未保存キー入力は残す。"""
+def test_research_tab_reset_clears_fields_and_keeps_provider_draft(page, web_base_url):
+    """調査・回答タブのリセットは調査の項目の欄を空にするだけで、プロバイダタブの未保存キー入力は残す。
+    保存で、固定中だった項目だけ null を送る。"""
     view = _view()
     view["depth_profile"]["grep_max_hits"] = {"configured": 20, "effective": 20, "default": 30}
     view["agentic_budget"]["per_result"] = {"configured": 100_000, "effective": 100_000, "default": 262144}
@@ -510,24 +641,20 @@ def test_research_tab_reset_nulls_all_keys_and_keeps_provider_draft(page, web_ba
     page.locator('#depth-base-codex-reasoning').select_option('high')
 
     page.locator('[data-reset-tab="research"]').click()
-    expect(page.locator('#tab-reset-res-research')).to_contain_text('既定に戻しました')
-    body = records['admin_settings_put'][-1]
-    assert len(body) == 12 and all(value is None for value in body.values())
-    assert set(body) == {
-        'depth_base_grep_max_hits', 'depth_base_qa_max_hits',
-        'depth_base_read_window', 'depth_base_impact_depth', 'depth_base_troubleshoot_depth',
-        'depth_base_codex_reasoning', 'embed_parallel',
-        'max_review_rounds', 'codex_worker_model', 'codex_session_retention_days',
-        'agentic_budget_per_result', 'codex_mode',
-    }
-    assert 'agentic_budget_total' not in body
-    assert 'openai_api_key' not in body and 'cloud_provider' not in body
+    expect(page.locator('#tab-reset-res-research')).to_contain_text('既定の値を入れました')
+    assert records['admin_settings_put'] == []
     expect(page.locator('#depth-base-grep-max-hits')).to_have_value('')
+    expect(page.locator('#depth-base-codex-reasoning')).to_have_value('')
     expect(page.locator("#agentic-budget-per-result")).to_have_value("")
-    expect(page.locator('#tab-dot-research')).to_be_hidden()
+    expect(page.locator('#tab-dot-research')).to_be_visible()
     open_tab(page, 'provider')
     expect(page.locator('#cloud-key')).to_have_value('sk-test-unsaved')
     expect(page.locator('#tab-dot-provider')).to_be_visible()
+
+    _save_ok(page)
+    body = _last_put(records)
+    assert body == {'depth_base_grep_max_hits': None, 'agentic_budget_per_result': None,
+                    'openai_api_key': 'sk-test-unsaved'}
 
 
 def test_tab_reset_preserves_other_tab_unsaved_draft_and_dirty_dot(page, web_base_url):
@@ -540,7 +667,7 @@ def test_tab_reset_preserves_other_tab_unsaved_draft_and_dirty_dot(page, web_bas
 
     open_tab(page, "research")
     page.locator('[data-reset-tab="research"]').click()
-    expect(page.locator("#tab-reset-res-research")).to_contain_text("既定に戻しました")
+    expect(page.locator("#tab-reset-res-research")).to_contain_text("既定の値を入れました")
 
     open_tab(page, "ingest")
     expect(page.locator(ARM_PDF)).not_to_be_checked()
@@ -560,8 +687,8 @@ def test_provider_reset_preserves_research_draft(page, web_base_url):
     page.locator('#depth-base-read-window').fill('50')
     open_tab(page, 'provider')
     page.locator('[data-reset-tab="provider"]').click()
-    expect(page.locator('#tab-reset-res-provider')).to_contain_text('既定に戻しました')
-    assert not any(key.startswith('depth_base_') for key in _last_put(records))
+    expect(page.locator('#tab-reset-res-provider')).to_contain_text('既定の値を入れました')
+    assert records['admin_settings_put'] == []
     open_tab(page, 'research')
     expect(page.locator('#depth-base-grep-max-hits')).to_have_value('20')
     expect(page.locator('#depth-base-read-window')).to_have_value('50')
@@ -577,8 +704,8 @@ def test_ingest_reset_preserves_research_budget_draft(page, web_base_url):
     expect(page.locator('#tab-dot-ingest')).to_be_hidden()
     open_tab(page, 'ingest')
     page.locator('[data-reset-tab="ingest"]').click()
-    expect(page.locator('#tab-reset-res-ingest')).to_contain_text('既定に戻しました')
-    assert 'agentic_budget_per_result' not in _last_put(records)
+    expect(page.locator('#tab-reset-res-ingest')).to_contain_text('既定の値を入れました')
+    assert records['admin_settings_put'] == []
     open_tab(page, 'research')
     expect(page.locator('#agentic-budget-per-result')).to_have_value('512')
     expect(page.locator('#tab-dot-research')).to_be_visible()
@@ -589,17 +716,19 @@ def test_ingest_reset_preserves_research_budget_draft(page, web_base_url):
 # ===== クラウド AI プロバイダの中央設定 =====
 
 def test_cloud_provider_renders_defaults(page, web_base_url):
-    """既定は OpenAI・キー未設定・個人キー許可 OFF・接続先は本家で詳細欄は隠れる。"""
+    """既定は OpenAI・キー未設定・個人キー許可 OFF・接続先は本家で詳細欄は隠れる。選べるクラウド AI が
+    1 つで保存値が未設定なら、ラジオは出さない。"""
     _admin(page, web_base_url)
 
-    expect(page.locator("input[data-cloud-provider='openai']")).to_be_checked()
-    expect(page.locator("input[data-cloud-provider]")).to_have_count(1)
+    expect(page.locator("input[data-cloud-provider]")).to_have_count(0)
+    expect(page.locator("#cloud-provider-radios")).to_be_empty()
     expect(page.locator("#cloud-key-label")).to_contain_text("OpenAI")
     expect(page.locator("#cloud-key")).to_have_value("")
     expect(page.locator("#cloud-key")).to_have_attribute("placeholder", "未設定")
     expect(page.locator("#cloud-key-clear")).to_be_disabled()
     expect(page.locator("#personal-keys-allowed")).not_to_be_checked()
-    expect(page.locator("#cloud-status")).to_contain_text("OpenAI")
+    expect(page.locator("#cloud-status")).to_contain_text("クラウド AI: OpenAI")
+    expect(page.locator("#cloud-status")).not_to_contain_text("現在選択中")
     expect(page.locator("#cloud-status")).to_contain_text("中央設定のみ")
     expect(page.locator("#cloud-ollama-url")).to_have_value("http://localhost:11434")
     expect(page.locator("#cloud-retired-warn")).to_be_hidden()
@@ -623,14 +752,37 @@ def test_cloud_provider_save_sends_only_touched_fields(page, web_base_url):
     assert "cloud_provider" not in put   # ラジオに触れていない保存で選択を作らない
 
 
-@pytest.mark.parametrize("raw", [None, "not-a-real-provider"], ids=["unset", "invalid-saved"])
-def test_cloud_provider_explicit_click_on_default_still_saves_raw_value(page, web_base_url, raw):
-    """既定の openai を明示クリックして保存すると、値が変わらなくても cloud_provider を送る
-    （生値が未設定・不正で丸め表示されている場合も、選び直しが保存対象から漏れない）。"""
+@pytest.mark.parametrize("raw", [" OpenAI ", "openai"], ids=["padded-case", "plain"])
+def test_cloud_provider_radios_hidden_when_saved_value_is_openai(page, web_base_url, raw):
+    """保存値が openai（前後の空白・大文字小文字は無視）なら、選択肢が 1 つのラジオは出さず、
+    保存でも cloud_provider を送らない。"""
     view = _view()
-    if raw:
-        view["cloud"]["provider"] = "openai"
-        view["cloud"]["provider_raw"] = raw
+    view["cloud"]["provider_raw"] = raw
+    records = _admin(page, web_base_url, system_settings=view)
+
+    expect(page.locator("input[data-cloud-provider]")).to_have_count(0)
+    page.locator("#cloud-key").fill("openai-secret-key")
+    _save_ok(page)
+    assert "cloud_provider" not in _last_put(records)
+
+
+def test_openai_endpoint_comes_before_key_field(page, web_base_url):
+    """「OpenAI の接続先」はカード先頭（説明文の直後・API キー欄の前）にある。"""
+    _admin(page, web_base_url)
+
+    order = page.evaluate("""() => {
+      const pos = (id) => document.getElementById(id).getBoundingClientRect().top;
+      return [pos('openai-endpoint-block'), pos('cloud-key-block')];
+    }""")
+    assert order[0] < order[1]
+
+
+def test_cloud_provider_explicit_click_on_invalid_saved_value_saves_raw_value(page, web_base_url):
+    """廃止済み・不正な保存値のときだけラジオを出す。openai を明示クリックして保存すると、
+    値が変わらなくても cloud_provider を送る（選び直しが保存対象から漏れない）。"""
+    view = _view()
+    view["cloud"]["provider"] = "openai"
+    view["cloud"]["provider_raw"] = "not-a-real-provider"
     records = _admin(page, web_base_url, system_settings=view)
 
     page.locator("input[data-cloud-provider='openai']").click()
@@ -720,7 +872,7 @@ def test_cloud_key_clear_preserves_unsaved_edits_dot_and_updates_vlm_warning(pag
 
     open_tab(page, "ingest")
     expect(page.locator("#vlm-key-missing")).to_be_visible()
-    expect(page.locator("#vlm-key-missing")).to_contain_text("OPENAI_API_KEY")
+    expect(page.locator("#vlm-key-missing")).to_contain_text("「プロバイダ＋接続先」タブ")
 
 
 def _start_pending_key_clear(page, web_base_url):
@@ -758,16 +910,6 @@ def test_cloud_key_clear_pending_message_cleared_after_save(page, web_base_url):
 
     page.locator("#cloud-key").fill("sk-saved-after-clear-started")
     _save_ok(page)
-    expect(page.locator("#cloud-key-clear-res")).to_have_text("")
-
-
-def test_cloud_key_clear_pending_message_cleared_by_other_tab_reset(page, web_base_url):
-    _start_pending_key_clear(page, web_base_url)
-
-    open_tab(page, "models")
-    page.locator('[data-reset-tab="models"]').click()
-    expect(page.locator("#tab-reset-res-models")).to_contain_text("既定に戻しました")
-    open_tab(page, "provider")
     expect(page.locator("#cloud-key-clear-res")).to_have_text("")
 
 
@@ -902,24 +1044,23 @@ def test_embed_deployment_single_change_event_lights_dot_immediately(page, web_b
     expect(page.locator("#tab-dot-provider")).to_be_visible()
 
 
-@pytest.mark.parametrize("reset_tab,other_draft", [
-    ("provider", lambda page: (open_tab(page, "models"),
-                               page.locator(OPENAI_CHAT_SEL).select_option("gpt-5.4-mini"))),
-    ("models", lambda page: page.locator("#openai-endpoint-embed-deployment").fill("unsaved-provider-draft")),
-], ids=["provider-reset", "models-reset"])
-def test_tab_reset_does_not_leak_other_tabs_unsaved_catalog_draft(page, web_base_url, reset_tab, other_draft):
-    """他タブの未保存の model_catalog 編集は、リセットの PUT に同送されない（null のまま）。"""
+def test_provider_tab_reset_keeps_other_tabs_unsaved_catalog_draft(page, web_base_url):
+    """接続先タブのリセットは、使えるモデルタブの未保存の編集を消さない。保存では両方が反映される。"""
     records = _admin(page, web_base_url, system_settings=_azure_kind_only_view())
+    open_tab(page, "models")
+    page.locator(OPENAI_CHAT_SEL).select_option("gpt-5.4-mini")
+    open_tab(page, "provider")
+    page.locator('[data-reset-tab="provider"]').click()
 
-    other_draft(page)
-    open_tab(page, reset_tab)
-    page.locator(f'[data-reset-tab="{reset_tab}"]').click()
+    expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定の値を入れました")
+    open_tab(page, "models")
+    expect(page.locator(OPENAI_CHAT_SEL)).to_have_value("gpt-5.4-mini")
+    expect(page.locator("#tab-dot-models")).to_be_visible()
+    _save_ok(page)
+    assert _last_put(records)["model_catalog"]["openai"]["chat"]["default"] == "gpt-5.4-mini"
 
-    expect(page.locator(f"#tab-reset-res-{reset_tab}")).to_contain_text("既定に戻しました")
-    assert _last_put(records)["model_catalog"] is None
 
-
-def test_provider_reset_clears_embed_and_preserves_other_saved_cells(page, web_base_url):
+def test_provider_reset_fills_embed_and_save_drops_it_but_keeps_other_saved_cells(page, web_base_url):
     view = _view()
     view["model_catalog"]["configured"] = {"openai": {
         "chat": {"allowed": ["gpt-5.5", "gpt-5.4-mini"], "default": "gpt-5.4-mini"},
@@ -933,10 +1074,14 @@ def test_provider_reset_clears_embed_and_preserves_other_saved_cells(page, web_b
     expect(page.locator("#openai-endpoint-embed-deployment")).to_have_value("custom-embed-deployment")
 
     page.locator('[data-reset-tab="provider"]').click()
-    expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定に戻しました")
+    expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定の値を入れました")
+    expect(page.locator("#openai-endpoint-embed-deployment")).to_have_value("text-embedding-3-small")
+    expect(page.locator("#tab-dot-provider")).to_be_visible()
+    assert records["admin_settings_put"] == []
+
+    _save_ok(page)
     assert _last_put(records)["model_catalog"] == {
         "openai": {"chat": {"allowed": ["gpt-5.5", "gpt-5.4-mini"], "default": "gpt-5.4-mini"}}}
-    expect(page.locator("#openai-endpoint-embed-deployment")).to_have_value("text-embedding-3-small")
 
 
 def _ollama_chat_view():
@@ -947,7 +1092,7 @@ def _ollama_chat_view():
 
 
 def test_normal_save_after_reset_does_not_refix_cleared_or_untouched_cells(page, web_base_url):
-    """リセットで未設定へ戻した embed や触っていないセルは、後の通常保存で既定値として明示固定されない。"""
+    """リセットで既定へ戻した embed や触っていないセルは、後の保存で既定値として明示固定されない。"""
     view = _ollama_chat_view()
     embed = {"allowed": ["text-embedding-3-small", "custom-embed-deployment"],
              "default": "custom-embed-deployment"}
@@ -956,8 +1101,8 @@ def test_normal_save_after_reset_does_not_refix_cleared_or_untouched_cells(page,
     records = _admin(page, web_base_url, system_settings=view)
 
     page.locator('[data-reset-tab="provider"]').click()
-    expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定に戻しました")
-    assert _last_put(records)["model_catalog"] is None
+    expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定の値を入れました")
+    assert records["admin_settings_put"] == []
 
     open_tab(page, "models")
     page.locator(OLLAMA_CHAT_SEL).select_option("llama3.1")
@@ -1004,6 +1149,22 @@ def test_openai_endpoint_test_button_sends_input_values_without_saving(page, web
     assert body["openai_endpoint_kind"] == "azure"
     assert body["openai_base_url"] == AZURE_URL
     assert records["settings_test"] == []
+    assert records["admin_settings_put"] == []
+
+
+def test_central_ollama_test_button_sends_input_url_without_saving(page, web_base_url):
+    """既定接続先の横の接続テストは、入力中の別のパソコンの URL をそのまま試し、保存しない。"""
+    records = _admin(page, web_base_url)
+
+    page.locator("#cloud-ollama-url").fill("http://10.9.9.21:11434")
+    page.locator("#cloud-ollama-test").click()
+
+    res = page.locator("#cloud-ollama-test-res")
+    expect(res).to_contain_text("接続OK（10.9.9.21:11434）")
+    expect(res).to_contain_text("qwen2.5:latest")
+    expect(res).to_contain_text("未取得: nomic-embed-text")
+    expect(res).to_contain_text("道具の呼び出しに対応していないモデル: gemma3:12b")
+    assert records["admin_ollama_test"][-1] == {"ollama_url": "http://10.9.9.21:11434"}
     assert records["admin_settings_put"] == []
 
 
@@ -1055,9 +1216,18 @@ def test_research_tab_groups_settings_and_saves_search_base(page, web_base_url):
     expect(page.locator('#search-investigation-card #depth-base-read-window')).to_be_visible()
     expect(page.locator('#codex-investigation-card #depth-base-codex-reasoning')).to_be_visible()
     expect(page.locator('#depth-base-max-turns')).to_have_count(0)
-    expect(page.locator('#search-investigation-card #depth-base-impact-depth')).to_have_count(1)
+    expect(page.locator('#depth-base-qa-max-hits, #depth-base-impact-depth, #depth-base-troubleshoot-depth')).to_have_count(0)
     expect(page.locator('#agentic-max-tools-per-turn')).to_have_count(0)
-    expect(page.locator('#research-api-heading')).not_to_contain_text('API 専用')
+    expect(page.locator('#research-api-heading')).to_have_count(0)
+    expect(page.locator('#tabpanel-research')).not_to_contain_text('共通')
+    expect(page.locator('#codex-codex-heading, #research-codex-heading')).to_contain_text('Codex の動かし方')
+    expect(page.locator('#research-codex-heading + #codex-mode-card')).to_have_count(1)
+    expect(page.locator('#research-codex-heading ~ #agentic-budget-card')).to_have_count(1)
+    expect(page.locator('#search-investigation-card')).to_contain_text('資料検索・関係探索の基準値')
+    expect(page.locator('#simple-answer-card #ext-research-default-provider')).to_be_visible()
+    expect(page.locator('#embed-parallel')).to_have_count(1)
+    expect(page.locator('#tabpanel-research #embed-parallel')).to_have_count(0)
+    expect(page.locator('#tabpanel-ingest #embed-dim')).to_have_count(1)
     page.locator('#depth-base-grep-max-hits').fill('6')
     expect(page.locator('#tab-dot-research')).to_be_visible()
     expect(page.locator('#tab-dot-provider')).to_be_hidden()
@@ -1087,9 +1257,9 @@ def test_codex_worker_model_default_placeholder_save_and_clear(page, web_base_ur
 
 
 def test_embed_parallel_saves_rejects_out_of_range_and_clears(page, web_base_url):
-    records = _admin(page, web_base_url, url="/admin-settings.html#research")
+    records = _admin(page, web_base_url, url="/admin-settings.html#ingest")
     page.locator('#embed-parallel').fill('8')
-    expect(page.locator('#tab-dot-research')).to_be_visible()
+    expect(page.locator('#tab-dot-ingest')).to_be_visible()
     _save_ok(page)
     assert _last_put(records) == {'embed_parallel': 8}
     page.reload()
@@ -1147,7 +1317,7 @@ def test_depth_profile_card_unset_then_saves_changed_fields_only(page, web_base_
     body = _last_put(records)
     assert body.get("depth_base_grep_max_hits") == 30
     assert body.get("depth_base_codex_reasoning") == "xhigh"
-    assert "depth_base_qa_max_hits" not in body
+    assert "depth_base_read_window" not in body
 
 
 def test_depth_profile_card_configured_values_and_clearing_send_null(page, web_base_url):
@@ -1171,19 +1341,18 @@ def test_depth_profile_card_configured_values_and_clearing_send_null(page, web_b
     body = _last_put(records)
     assert body.get("depth_base_read_window") is None
     assert body.get("depth_base_codex_reasoning") is None
-    assert "depth_base_qa_max_hits" not in body
     assert "depth_base_grep_max_hits" not in body
 
 
 @pytest.mark.parametrize("tab,selector,value,message", [
     ("research", "#depth-base-grep-max-hits", "1001", "資料検索のヒット件数上限は1〜1000の整数で指定してください"),
-    ("research", "#depth-base-troubleshoot-depth", "0", "原因調査でたどる段数は1〜16の整数で指定してください"),
+    ("research", "#depth-base-read-window", "9", "1回に読み取る前後の行数は10〜400の整数で指定してください"),
     ("research", "#agentic-budget-per-result", "8193",
      "ツール結果1件あたりの上限は1〜8192（KB）の整数で指定してください"),
     ("research", "#agentic-budget-per-result", "0",
      "ツール結果1件あたりの上限は1〜8192（KB）の整数で指定してください"),
-    (None, "#chat-max-turns-global", "65", "同時に実行できる質問の数（全員の合計）は1〜64の整数で指定してください"),
-], ids=["depth-hits", "depth-troubleshoot-zero", "budget-over", "budget-zero", "chat-turns-global"])
+    ("chat", "#chat-max-turns-global", "65", "同時に実行できる質問の数（全員の合計）は1〜64の整数で指定してください"),
+], ids=["depth-hits", "depth-read-window-low", "budget-over", "budget-zero", "chat-turns-global"])
 def test_out_of_range_numeric_input_rejected_client_side(page, web_base_url, tab, selector, value, message):
     """範囲外の値は日本語エラーを出して PUT 自体を送らない（422 の配列表示が読めなくなるのを防ぐ）。"""
     records = _admin(page, web_base_url, tab=tab)
@@ -1196,7 +1365,7 @@ def test_out_of_range_numeric_input_rejected_client_side(page, web_base_url, tab
 
 
 def test_chat_max_turns_card_unset_then_saves_changed_field_only(page, web_base_url):
-    records = _admin(page, web_base_url)
+    records = _admin(page, web_base_url, tab="chat")
     expect(page.locator("#chat-max-turns-per-user")).to_have_value("")
     expect(page.locator("#chat-max-turns-per-user-hint")).to_contain_text("未設定です")
     expect(page.locator("#chat-max-turns-global")).to_have_value("")
@@ -1210,10 +1379,11 @@ def test_chat_max_turns_card_unset_then_saves_changed_field_only(page, web_base_
 
 
 def test_chat_max_turns_card_configured_clear_and_tab_reset(page, web_base_url):
+    """同時実行の上限と個人ファイルの上限はチャットと個人ファイルのタブにあり、リセットはこのタブだけの欄を戻す。"""
     view = _view()
     view["chat_max_turns"]["per_user"] = {"configured": 5, "effective": 5, "default": 2}
     view["chat_max_turns"]["global"] = {"configured": 30, "effective": 30, "default": 8}
-    records = _admin(page, web_base_url, system_settings=view)
+    records = _admin(page, web_base_url, tab="chat", system_settings=view)
     expect(page.locator("#chat-max-turns-per-user")).to_have_value("5")
     expect(page.locator("#chat-max-turns-per-user-hint")).to_contain_text("この値で固定中")
     expect(page.locator("#chat-max-turns-global")).to_have_value("30")
@@ -1222,15 +1392,17 @@ def test_chat_max_turns_card_configured_clear_and_tab_reset(page, web_base_url):
     _save_ok(page)
     assert _last_put(records).get("chat_max_turns_global") is None
 
-    page.locator('[data-reset-tab="provider"]').click()
-    expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定に戻しました")
+    page.locator('[data-reset-tab="chat"]').click()
+    expect(page.locator("#tab-reset-res-chat")).to_contain_text("既定の値を入れました")
     expect(page.locator("#chat-max-turns-per-user")).to_have_value("")
+    assert len(records["admin_settings_put"]) == 1
+    _save_ok(page)
     body = _last_put(records)
     assert body.get("chat_max_turns_per_user") is None
-    assert body.get("chat_max_turns_global") is None
+    assert "chat_max_turns_global" not in body
 
 
-# ===== 外部連携タブ（利用者キー許可・簡易回答 AI） =====
+# ===== 外部連携タブ（利用者キー許可）・簡易回答 AI（調査・回答タブ） =====
 
 def test_user_api_keys_toggle_off_confirms_with_count_and_cancel_aborts(page, web_base_url):
     view = _view()
@@ -1270,7 +1442,7 @@ def test_research_default_provider_renders_saves_and_dirty_by_value(page, web_ba
     """簡易回答に使う AI は render 時の値との差で dirty 判定する（戻すと丸印が消える）。"""
     view = _view()
     view["cloud"]["openai_key_set"] = True   # 保存時 preflight を通す
-    records = _admin(page, web_base_url, tab="extkeys", system_settings=view)
+    records = _admin(page, web_base_url, tab="research", system_settings=view)
 
     sel = page.locator("#ext-research-default-provider")
     expect(sel).to_have_value("ollama")
@@ -1279,9 +1451,10 @@ def test_research_default_provider_renders_saves_and_dirty_by_value(page, web_ba
     expect(hint).to_contain_text("ローカル（Ollama）")
 
     sel.select_option("openai")
-    expect(page.locator("#tab-dot-extkeys")).to_be_visible()
-    sel.select_option("ollama")
+    expect(page.locator("#tab-dot-research")).to_be_visible()
     expect(page.locator("#tab-dot-extkeys")).to_be_hidden()
+    sel.select_option("ollama")
+    expect(page.locator("#tab-dot-research")).to_be_hidden()
 
     sel.select_option("openai")
     _save_ok(page)
@@ -1295,7 +1468,7 @@ def test_research_default_provider_invalid_saved_value_shown_not_rounded(page, w
     view = _view()
     view["ext_keys"]["research_default_provider"] = {
         "configured": "gemini", "effective": "(不正な保存値)", "default": "ollama"}
-    records = _admin(page, web_base_url, tab="extkeys", system_settings=view)
+    records = _admin(page, web_base_url, tab="research", system_settings=view)
 
     sel = page.locator("#ext-research-default-provider")
     expect(sel).to_have_value("__invalid__")
@@ -1329,6 +1502,7 @@ def test_put_rejected_by_research_provider_preflight_does_not_revoke_self_issued
     expect(page.locator("#ext-keys-list")).to_contain_text("有効")
 
     page.locator("#ext-keys-user-allowed").uncheck()
+    open_tab(page, "research")
     page.locator("#ext-research-default-provider").select_option("openai")
     page.once("dialog", lambda d: d.accept())
     page.locator("#save").click()
@@ -1842,7 +2016,7 @@ def test_mock_validate_depth_base_matches_real_api_ranges_and_error_shape():
     v = mock_api._mock_validate_depth_base
     for body in ({"depth_base_grep_max_hits": -1}, {"depth_base_grep_max_hits": 0},
                  {"depth_base_grep_max_hits": 1001}, {"depth_base_read_window": 9},
-                 {"depth_base_read_window": 401}, {"depth_base_troubleshoot_depth": 17}):
+                 {"depth_base_read_window": 401}):
         assert v(body) is not None, body
     for body in ({"depth_base_grep_max_hits": 1}, {"depth_base_grep_max_hits": 1000},
                  {"depth_base_read_window": 10}, {"depth_base_read_window": 400},
@@ -1906,3 +2080,19 @@ def test_mock_admin_put_normalizes_codex_reasoning_and_returns_422_for_out_of_ra
     page.reload()
     expect(page.locator("#depth-base-codex-reasoning")).to_have_value("high")
     expect(page.locator("#depth-base-grep-max-hits")).to_have_value("")
+
+
+@pytest.mark.parametrize("embed_effective,cloud,expected", [
+    ("auto", {"provider_raw": None, "openai_key_set": True}, "回答に使うクラウド（OpenAI）で埋め込みます。"),
+    ("auto", {"provider_raw": None, "openai_key_set": False}, "クラウドが未設定なので Ollama で埋め込みます"),
+    ("auto", {"provider_raw": "openai", "openai_key_set": False}, "埋め込みができません"),
+    ("auto", {"provider_raw": "gemini", "openai_key_set": True}, "埋め込みができません"),
+    ("ollama", {"provider_raw": None, "openai_key_set": False}, "ローカル（Ollama）で埋め込みます。使うモデル: bge-m3"),
+])
+def test_embed_provider_hint_says_where_embeddings_actually_go(page, web_base_url, embed_effective, cloud, expected):
+    """埋め込みの接続先の説明は、保存済みの設定で実際に埋め込む先を言う（既定でクラウド未設定なら Ollama）。"""
+    view = _view()
+    view["embed_provider"]["effective"] = embed_effective
+    view["cloud"].update(cloud)
+    _admin(page, web_base_url, tab="provider", system_settings=view)
+    expect(page.locator("#embed-provider-hint")).to_contain_text(expected)

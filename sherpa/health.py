@@ -160,7 +160,7 @@ def _check_ollama_embed_model(tags_response: object, sys_s: dict) -> None:
     """
     from . import embeddings
     try:
-        ec = embeddings.cfg(None, system_settings=sys_s)
+        ec = embeddings.cfg(None, system_settings=sys_s, probe=False)  # モデルの有無だけ見る（次元は測らない）
     except Exception:
         return
     if not ec or ec.get("provider") != "ollama":
@@ -471,8 +471,11 @@ def _search_probe_graph(world_id: str | None) -> str:
                               connection_timeout=_SEARCH_TIMEOUT,
                               connection_acquisition_timeout=_SEARCH_TIMEOUT) as driver:
         with driver.session() as session:
-            row = session.run(Query("MATCH (n:Entity {world_id: $world}) RETURN n LIMIT 1",
-                                    timeout=_SEARCH_TIMEOUT), world=world_id).single()
+            row = session.run(Query(
+                "OPTIONAL MATCH (gm:SherpaMeta {world_id:$world}) WITH gm "
+                "MATCH (n:Entity {world_id:$world}) "
+                f"WHERE {world_neo4j._generation_pred('n')} RETURN n LIMIT 1",
+                timeout=_SEARCH_TIMEOUT), world=world_id).single()
     return "ヒットあり" if row else "該当データが空です（未取り込み）"
 
 

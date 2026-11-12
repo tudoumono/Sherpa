@@ -1,7 +1,7 @@
-"""文書の重要度（解析＋階層継承＋除外契約＋台帳への接続・docs/03-鏡モデル.md）。
+"""文書の重要度（解析＋階層継承＋除外契約・docs/03-鏡モデル.md）。
 
 `_重要度.txt`（`パターン: 高|中|低|なし  # 理由`）の解析・階層継承の解決・除外契約
-（`is_importance_control_path` を全入口が呼ぶ）・台帳への接続を検証する。
+（`is_importance_control_path` を全入口が呼ぶ）を検証する。検索・回答・画面では使わない。
 """
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from sherpa import corpus_docs, doc_ledger, documents, es_index, preview_service, scope, store, worlds
+from sherpa import build_marks, corpus_docs, doc_ledger, documents, es_index, preview_service, scope, store, text_encoding, worlds
 from sherpa.ingest import importance as imp
-from sherpa.ingest import worker, world_neo4j
+from sherpa.ingest import worker, world_graph, world_neo4j
 
 # `.md`＝「設計書」の doctype を前提にするため、登録簿を上流限定に固定する。
 pytestmark = pytest.mark.usefixtures("upstream_only_registry")
@@ -348,7 +348,7 @@ def test_resolve_one_read_error_is_terminal_not_fallback_to_ancestor(tmp_path, m
     assert _resolve_one(tmp_path, "sub/a.md", [tmp_path / CTRL, tmp_path / "sub" / CTRL]) is None
 
 
-# ===== resolve_for_world / resolve_many / diagnostics_for_world =====
+# ===== resolve_for_world =====
 
 def test_resolve_for_world_applies_hierarchy_and_excludes_control_files(tmp_path, monkeypatch):
     _write(tmp_path / CTRL, "**: 中")
@@ -512,34 +512,6 @@ def test_resolve_for_world_cache_is_true_lru_updates_order_on_hit(tmp_path, monk
     assert _cached(first)
 
 
-def test_resolve_many_filters_to_requested_rels(tmp_path, monkeypatch):
-    _write(tmp_path / CTRL, "*.md: 高")
-    _write(tmp_path / "a.md", "x")
-    _write(tmp_path / "b.cbl", "x")
-    monkeypatch.setattr(worlds, "world_dir", lambda w: tmp_path)
-    assert set(imp.resolve_many("test-importance-w3", ["a.md", "b.cbl", "missing.md"])) == {"a.md"}
-
-
-def test_resolve_many_forwards_sig_and_files_to_resolve_for_world(tmp_path, monkeypatch):
-    _write(tmp_path / CTRL, "*.md: 高")
-    _write(tmp_path / "a.md", "x")
-    monkeypatch.setattr(worlds, "world_dir", lambda w: tmp_path)
-    calls = _count_computes(monkeypatch)
-    files = list(imp.scope_infer.safe_files(tmp_path))
-    out1 = imp.resolve_many("test-importance-many-sig", ["a.md"], sig="sig-x", files=files)
-    out2 = imp.resolve_many("test-importance-many-sig", ["a.md"], sig="sig-x", files=list(files))
-    assert calls["n"] == 1
-    assert set(out1) == set(out2) == {"a.md"}
-    assert out1["a.md"].value == "高" and out1["a.md"] is out2["a.md"]
-
-
-def test_diagnostics_for_world_reports_syntax_errors(tmp_path, monkeypatch):
-    _write(tmp_path / CTRL, "*.md: 高\n不正な行\n")
-    monkeypatch.setattr(worlds, "world_dir", lambda w: tmp_path)
-    diags = imp.diagnostics_for_world("test-importance-w4")
-    assert len(diags) == 1 and diags[0]["line"] == 2
-
-
 def test_resolve_for_world_unknown_world_is_empty(monkeypatch):
     monkeypatch.setattr(worlds, "world_dir", lambda w: None)
     assert imp.resolve_for_world("nope") == {}
@@ -582,7 +554,7 @@ def test_status_document_doctype_and_manifest_count_exclude_control_file():
     assert corpus_docs.manifest_doctype_count(manifest, "wtest") == 2
 
 
-def test_doc_ledger_public_and_preview_documents_carry_importance_and_exclude_control_file(monkeypatch, tmp_path):
+def test_doc_ledger_public_and_preview_documents_exclude_control_file_and_carry_no_importance(monkeypatch, tmp_path):
     wd = _world(monkeypatch, tmp_path)
     _write(wd / CTRL, "*.md: 高  # 一次資料")
     _write(wd / "a.md", "x")
@@ -590,18 +562,15 @@ def test_doc_ledger_public_and_preview_documents_carry_importance_and_exclude_co
 
     pub = {d["name"]: d for d in doc_ledger.public_documents("wtest")}
     assert set(pub) == {"a.md", "b.cbl"}
-    assert pub["a.md"]["importance"] == "高"
-    assert pub["a.md"]["importance_reason"] == "一次資料"
-    assert pub["a.md"]["importance_source"] == "_重要度.txt:1行目"
-    assert "importance" not in pub["b.cbl"]
+    assert not any(k.startswith("importance") for d in pub.values() for k in d)
 
     prev = {d["name"]: d for d in doc_ledger.preview_documents("wtest")}
-    assert prev["a.md"]["importance"] == "高"
-    assert "importance" not in prev["b.cbl"]
+    assert set(prev) == {"a.md", "b.cbl"}
+    assert not any(k.startswith("importance") for d in prev.values() for k in d)
 
 
-def test_public_documents_and_preview_documents_share_one_root_resolution(monkeypatch, tmp_path):
-    # 文書列挙と重要度解決で root を別々に解決すると、rebind の間隔で旧 root の一覧に新 root の重要度が付く。
+def test_public_documents_resolves_the_root_once(monkeypatch, tmp_path):
+    # root を複数回解決すると、rebind の間隔で旧 root の一覧に新 root の内容が混ざる。
     root_a = tmp_path / "a"
     root_b = tmp_path / "b"
     root_a.mkdir()
@@ -622,7 +591,7 @@ def test_public_documents_and_preview_documents_share_one_root_resolution(monkey
     monkeypatch.setattr(worlds, "world_dir", fake_world_dir)
     docs = {d["name"]: d for d in doc_ledger.public_documents("wtest")}
     assert calls["n"] == 1
-    assert docs["a.md"]["importance"] == "高"
+    assert set(docs) == {"a.md"}
 
 
 @pytest.mark.parametrize("fn", [doc_ledger.public_documents, doc_ledger.preview_documents])
@@ -639,19 +608,12 @@ def test_documents_fail_closed_when_root_unresolved(monkeypatch, fn):
     assert calls["n"] == 1
 
 
-def test_doc_ledger_control_diagnostics_surfaces_syntax_errors(monkeypatch, tmp_path):
-    wd = _world(monkeypatch, tmp_path)
-    _write(wd / CTRL, "*.md: 高\n不正な行\n")
-    diags = doc_ledger.control_diagnostics("wtest")
-    assert len(diags) == 1 and diags[0]["code"] == "no_colon"
-
-
-def test_preview_service_build_preview_includes_importance_diagnostics(monkeypatch, tmp_path):
+def test_preview_service_build_preview_has_no_importance_diagnostics(monkeypatch, tmp_path):
     wd = _world(monkeypatch, tmp_path)
     _write(wd / CTRL, "不正な行\n")
     monkeypatch.setattr(worlds, "world_label", lambda w: w)
     pv = preview_service.build_preview("wtest")
-    assert pv["importance_diagnostics"] and pv["importance_diagnostics"][0]["code"] == "no_colon"
+    assert "importance_diagnostics" not in pv
 
 
 # ===== スキーマ版は world 署名の材料（旧世代の台帳化は標準の署名不一致→全再構築に乗せる） =====
@@ -673,11 +635,14 @@ def test_sync_stays_on_unchanged_path_when_signature_matches(monkeypatch, tmp_pa
     _write(wd / "a.md", "x")
     sig = worker.world_signature("wtest")
     monkeypatch.setattr(store, "get_world",
-                        lambda w: {"last_sig": sig, "last_manifest": {"a.md": [1, 2, 3]}, "last_doc_count": 1})
+                        lambda w: {"last_sig": sig, "last_manifest": {"a.md": [1, 2, 3]}, "last_doc_count": 1,
+                                   "last_scan_report": text_encoding.stamp_detect_version(corpus_docs.empty_scan_report())})
     monkeypatch.setattr(worker, "_derived_stale", lambda w: False)
     monkeypatch.setattr(es_index, "needs_reindex", lambda w, s: False)
     monkeypatch.setattr(world_neo4j, "load_world", lambda *a, **kw: None)   # 実 Neo4j との境界だけを外す
     monkeypatch.setattr(world_neo4j, "check_graph_counts", lambda *a, **kw: None)
+    monkeypatch.setattr(world_neo4j, "read_build_marks_sig",   # グラフの持つ印を今の印に揃える（台帳の作り直しへ進ませない）
+                        lambda w: world_graph.applied_marks_sig(wd, "wtest", build_marks.load("wtest")))
     run_calls = []
     monkeypatch.setattr(worker, "run", lambda w, reflect=True: run_calls.append(w) or {})
     res = worker.sync("wtest")

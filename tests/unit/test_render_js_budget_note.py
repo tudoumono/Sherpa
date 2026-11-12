@@ -1,4 +1,4 @@
-"""STOP-1: `web/chat/render.js` の `budgetNoteHTML`（調査予算到達の明示表示）を実ファイルから
+"""STOP-1: `web/chat/render-answer.js` の `budgetNoteHTML`（調査予算到達の明示表示）を実ファイルから
 抽出して node で直接実行し固定する。
 
 `budgetNoteHTML` は DOM/`Sherpa` 名前空間に依存しない純粋関数だが、`esc`（`web/common.js::
@@ -19,7 +19,8 @@ import pytest
 pytestmark = pytest.mark.unit
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RENDER_JS = ROOT / "web" / "chat" / "render.js"
+TRACE_JS = ROOT / "web" / "chat" / "render-trace.js"
+ANSWER_JS = ROOT / "web" / "chat" / "render-answer.js"
 COMMON_JS = ROOT / "web" / "common.js"
 
 
@@ -39,11 +40,14 @@ def _extract_esc() -> str:
 def _extract_budget_note_snippet() -> str:
     """`const BUDGET_EXHAUSTED_STOP_REASONS = ...` から `function budgetNoteHTML(...) {...}` の
     閉じ括弧までを切り出す。"""
-    src = RENDER_JS.read_text(encoding="utf-8")
-    start = src.index("const BUDGET_EXHAUSTED_STOP_REASONS")
-    fn_start = src.index("function budgetNoteHTML")
-    end = src.index("\n}", fn_start) + len("\n}")
-    snippet = src[start:end]
+    trace = TRACE_JS.read_text(encoding="utf-8")
+    start = trace.index("export const BUDGET_EXHAUSTED_STOP_REASONS")
+    end = trace.index("export function deriveTraceStopReason")
+    answer = ANSWER_JS.read_text(encoding="utf-8")
+    note_start = answer.index("export function budgetNoteText")
+    fn_start = answer.index("function budgetNoteHTML")
+    fn_end = answer.index("\n}", fn_start) + len("\n}")
+    snippet = trace[start:end].replace("export const", "const") + "\n" + answer[note_start:fn_end].replace("export function", "function")
     assert "BUDGET_NOTE_TEXT" in snippet, "抽出範囲に BUDGET_NOTE_TEXT が含まれていない"
     return snippet
 

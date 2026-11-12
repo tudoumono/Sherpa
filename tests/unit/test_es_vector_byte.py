@@ -10,6 +10,7 @@ from array import array
 import pytest
 
 from sherpa import embeddings, es_index
+from tests._replace_row import offline_row
 
 
 def test_vector_to_es_bytes_is_deterministic_and_bounded():
@@ -66,7 +67,7 @@ def test_index_world_records_quant_and_rebuild_sends_the_same_bytes(monkeypatch,
         return {}
 
     monkeypatch.setattr(es_index, "_req", fake_req)
-    es_index.index_world("w")
+    es_index.index_world("w", row=offline_row("w"))
     first = list(sent)
     assert captured["quant"] == embeddings.ES_VECTOR_QUANT
     assert first and all(b["embedding"] == [42, -85, 127, 5] for b in first) and len(embed_calls) == 1
@@ -74,7 +75,7 @@ def test_index_world_records_quant_and_rebuild_sends_the_same_bytes(monkeypatch,
     assert es_index._embed_cache_db_path("w").name == "embed_cache.i8.sqlite3"
     assert es_index._embed_cache_lookup_batch("w", [key], 4)[key] == array("b", [42, -85, 127, 5])
     sent.clear()
-    es_index.index_world("w")
+    es_index.index_world("w", row=offline_row("w"))
     assert sent == first and len(embed_calls) == 1   # 作り直しは API を呼ばずキャッシュの値をそのまま送る
 
 
@@ -104,6 +105,7 @@ def _search_env(monkeypatch, meta):
     monkeypatch.setattr(es_index, "_req", fake_req)
     monkeypatch.setattr(es_index, "_embed_system_settings_snapshot", lambda: None)
     monkeypatch.setattr(embeddings, "cfg", lambda settings=None, **kw: ec)
+    monkeypatch.setattr(es_index, "_index_meta_read", lambda w, idx=None: (es_index._index_meta(w), False))  # 読み取りの失敗種別は差し替えた `_index_meta` の値から
     monkeypatch.setattr(es_index, "_index_meta", lambda world, idx=None: dict(meta))
     embed_calls: list = []
     monkeypatch.setattr(embeddings, "embed", lambda texts, c, **kw: embed_calls.append(texts) or [[0.1, 0.2, -0.3]])
@@ -119,7 +121,7 @@ def test_query_vectors_are_bytes_in_both_search_paths(monkeypatch):
     assert es_index.search_knn_only("w", "q", k=5)[1] is None
     assert bodies[-1]["knn"]["query_vector"] == [42, 85, -127]
     es_index.search("w", "q", k=5)
-    knn = bodies[-1]["query"]["function_score"]["query"]["knn"]
+    knn = bodies[-1]["query"]["knn"]
     assert knn["query_vector"] == [42, 85, -127]
 
 
@@ -150,6 +152,7 @@ def test_needs_reindex_on_quant_and_mapping_version(monkeypatch, over, expected)
             "analyzer_config_sig": "acfg-A", "source_excluded": True, **_CURRENT}
     meta.update(over)
     meta = {k: v for k, v in meta.items() if v is not None}
+    monkeypatch.setattr(es_index, "_index_meta_read", lambda w, idx=None: (es_index._index_meta(w), False))  # 読み取りの失敗種別は差し替えた `_index_meta` の値から
     monkeypatch.setattr(es_index, "_index_meta", lambda w, idx=None: dict(meta))
     assert es_index.needs_reindex("w", "c1") is expected
 
@@ -159,9 +162,9 @@ def test_fill_and_replace_skip_float_index(monkeypatch):
     old = {k: v for k, v in _CURRENT.items() if k != "quant"}
     _search_env(monkeypatch, {**old, "content_sig": "c1"})
     monkeypatch.setattr(es_index, "count_missing_vectors", lambda w: 3)
-    assert es_index.fill_missing_vectors("w")["skipped"] == "embed_config_changed"
+    assert es_index.fill_missing_vectors("w", ingest_no=0)["skipped"] == "embed_config_changed"
     monkeypatch.setattr(es_index, "count", lambda w: 5)
-    assert es_index.replace_document("w", "a.md", "a.md", content_sig="c1")["error"] == "embed_config_changed"
+    assert es_index.replace_document("w", "a.md", "a.md", content_sig="c1", row=offline_row("w"))["error"] == "embed_config_changed"
 
 
 # ===== 作り直しの途中の空きの安全弁 =====
@@ -182,7 +185,7 @@ def test_low_es_free_space_stops_index_world_and_discards_building(monkeypatch, 
     _bound_run()
     try:
         with pytest.raises(background.LowDiskStop) as ei:
-            es_index.index_world("w")
+            es_index.index_world("w", row=offline_row("w"))
     finally:
         background.unbind_run()
     assert isinstance(ei.value, background.StopRequested) and discarded == ["w"]
@@ -241,7 +244,7 @@ def test_run_followups_ends_low_disk_stop_with_one_log_and_no_retry(monkeypatch,
     assert sum("後追いをディスクの空き不足で止めました" in r.getMessage() for r in caplog.records) == 1
 
 
-def test_empty_world_checks_space_before_dropping_old_index(monkeypatch, tmp_path):
+def test_empty_world_checks_space_before_rebuilding(monkeypatch, tmp_path):
     """ベクトルの対象が 1 件も無い資料フォルダでも、古い索引を消す前に空きを確かめて止める。"""
     from sherpa.ingest import background
     dropped: list = []
@@ -252,11 +255,11 @@ def test_empty_world_checks_space_before_dropping_old_index(monkeypatch, tmp_pat
     monkeypatch.setattr(es_index.worlds, "semantic_dir", lambda w: tmp_path / w / "semantic")
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
     monkeypatch.setattr(es_index, "_es_free_bytes", lambda: 1024 ** 3)
-    monkeypatch.setattr(es_index, "_drop_old_for_space", lambda w: dropped.append(w) or True)
+    monkeypatch.setattr(es_index, "_rebuild_space_shortfall", lambda w: dropped.append(w) or None)
     _bound_run()
     try:
         with pytest.raises(background.LowDiskStop):
-            es_index.index_world("w")
+            es_index.index_world("w", row=offline_row("w"))
     finally:
         background.unbind_run()
     assert dropped == []
@@ -268,6 +271,6 @@ def test_resume_skips_run_stopped_for_low_disk(monkeypatch):
     monkeypatch.setattr(resume.store, "list_worlds_with_interrupted_latest_run", lambda: [
         {"world_id": "a", "run_id": 1, "op": "sync", "stop_reason": "low_disk"},
         {"world_id": "b", "run_id": 2, "op": "sync", "stop_reason": None}])
-    monkeypatch.setattr(resume, "_start_sync", lambda wid: started.append(wid) or True)
+    monkeypatch.setattr(resume, "_start_sync", lambda wid, op="refresh", payload=None: started.append(wid) or True)
     monkeypatch.setattr(resume, "enabled", lambda: True)
     assert resume.resume_interrupted() == ["b"] and started == ["b"]

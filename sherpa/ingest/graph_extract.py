@@ -542,25 +542,21 @@ def _safe_detail(e: Exception, *, secret: str | None = None,
 
     ① 先にマスク（`_mask_secrets`・`_redact_reflected_urls`）してから切断する（切断境界をまたぐ秘密を残さないため）。
     ② `_http_detail` の案内文は、本文を案内文の長さ分だけ切ってから連結し、必ず残す。
-    `system_settings`（送信時と同じスナップショット・`cfg["openai_endpoint_override"]`）は 404 案内判定と反射 URL の base URL 計算に使う。
+    `system_settings`（送信時と同じスナップショット・`cfg["openai_endpoint_override"]`）は 404 案内判定に使う。
     `secret` が文字列でない場合は `str()` 化して使う。"""
     if secret is not None and not isinstance(secret, str):
         secret = str(secret)
-    try:
-        base_url = llm.openai_base_url(system_settings)
-    except Exception:
-        base_url = None
     if isinstance(e, urllib.error.HTTPError):
         base, hint = _http_detail(e, system_settings)
         base = _mask_secrets(base, secret)
-        base = _redact_reflected_urls(base, base_url)
+        base = _redact_reflected_urls(base, None)
         if hint:
             reserved = max(_DETAIL_MAX_LEN_HTTP - len(hint), 0)
             return (base[:reserved] + hint)[:_DETAIL_MAX_LEN_HTTP]
         return base[:_DETAIL_MAX_LEN_HTTP]
     text = _error_detail(e)
     text = _mask_secrets(text, secret)
-    text = _redact_reflected_urls(text, base_url)
+    text = _redact_reflected_urls(text, None)
     return text[:_DETAIL_MAX_LEN_GENERIC]
 
 

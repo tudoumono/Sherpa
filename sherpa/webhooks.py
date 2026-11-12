@@ -1,8 +1,9 @@
 """Webhook 通知。取り込み run の完了・失敗（sync/refresh/rebind/rerun/delete）を、`api_keys.webhook_url` を登録したキー宛てに署名付き POST で通知する。
 
-配送は軽量型: 即時送信＋失敗時リトライ3回（2/8/30秒バックオフ）＋監査記録。実送信は単一の daemon worker スレッドが有界キュー
-（`_QUEUE_MAXSIZE`）を直列に消費し、`notify_run_terminal` はキューへ積むだけで返る。キューが溢れたらその1件だけ捨てて
-`webhook.dropped` を監査記録する。永続キューは持たない（プロセス終了で未送信分は消える）。
+配送は「先に保存してから送る」: 通知は宛先の鍵ごとに配送待ちの表（`store.outbox`）へ保存して返り、送り手（`outbox_sender`）が
+1回ずつ送って、送れたら完了にする。失敗は 2/8/30 秒空けて再送し（合計4回）、それでも届かなければ理由を残して諦める
+（`webhook.delivered`／`webhook.failed` を監査記録）。取り込みワーカーが終わっても残りは API のプロセスの送り手が引き継ぐ。
+配送待ちが上限なら保存せず `webhook.dropped` を監査記録する。宛先は送信のたびに鍵から引き直す。
 署名: `X-Sherpa-Signature: sha256=<hex(HMAC-SHA256(body_bytes, webhook_secret))>`。`webhook_secret` は登録時に生成し平文保管する。
 宛先ポリシー: path/query を許す宛先のため `_webhook_host_port()` で host:port を抽出する（userinfo 拒否・scheme 既定ポート補完・
 末尾ドット除去は `llm._canonical_host_port` と同じ）。loopback を含め既定は全拒否で、`system_settings.webhook_allowlist` に
@@ -15,20 +16,19 @@ import hashlib
 import hmac
 import json
 import logging
-import queue
-import threading
 import time
 import urllib.request
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from . import llm
+from . import llm, outbox_sender
+from .store import outbox
 
 _log = logging.getLogger(__name__)
 
 _TIMEOUT_SEC = 5
-# 即時送信の後に続くリトライ間隔（秒）。要素数3＝失敗時リトライ3回（合計4回試行）
+# 失敗後に続くリトライ間隔（秒）。要素数3＝失敗時リトライ3回（合計4回試行）
 _RETRY_DELAYS_SEC = (2, 8, 30)
 
 
@@ -122,128 +122,101 @@ def _host_port_for_audit(url: str) -> str:
     return llm.format_host_port(hp[0], hp[1]) if hp is not None else "（解析できません）"
 
 
-def _deliver(key_id: int, url: str, secret: str, payload: dict) -> None:
-    """1キー分の配送（即時送信＋失敗時リトライ3回）。単一 daemon worker の中で他キーの配送と直列に実行される。
+def _audit_detail(row: dict) -> dict:
+    """配送の監査 detail（secret／フル URL は含めない）。宛先は鍵の現在の登録から引く。"""
+    payload = row["payload"]
+    dest = _destination(row["key_id"])
+    detail = {"host_port": _host_port_for_audit(dest[0]) if dest else "（未解決）",
+              "world": payload.get("world"), "run_id": payload.get("run_id"),
+              "event": payload.get("event"), "attempts": row["attempts"]}
+    if "job_id" in payload:
+        detail["job_id"] = payload["job_id"]
+    return detail
 
-    監査は最終結果（成功／全滅）のみ1行記録する（detail に secret／フル URL は含めない）。
-    宛先ポリシー（`assert_webhook_url_allowed`）は試行ごとに再評価し、不許可は恒久的な失敗として打ち切る。
+
+def _destination(key_id: int) -> tuple[str, str] | None:
+    from . import store  # 遅延 import（循環回避）
+    dest = store.get_api_key_webhook(key_id)
+    if not dest or not dest.get("webhook_url") or not dest.get("webhook_secret"):
+        return None
+    return dest["webhook_url"], dest["webhook_secret"]
+
+
+def _deliver_row(row: dict) -> None:
+    """配送待ちの1行を1回送る。宛先は送信のたびに鍵から引き直し、許可リストで確かめる。
+
+    宛先が無い・不許可は再送しても直らないので `GiveUp`。それ以外の失敗は例外のまま伝え、送り手が再送を予約する。成功は `webhook.delivered` を監査記録する。
     """
     from . import store  # 遅延 import（循環回避）
-
-    # Codex ジョブの終了通知は各試行の直前に鍵の現在の宛先を引き直す（引けなければ配送を打ち切る）
-    resolve_each_attempt = str(payload.get("event", "")).startswith("codex_job.")
-    host_port = _host_port_for_audit(url) if url else "（未解決）"
-    detail_base = {"host_port": host_port, "world": payload.get("world"),
-                   "run_id": payload.get("run_id"), "event": payload.get("event")}
-    if "job_id" in payload:
-        detail_base["job_id"] = payload["job_id"]
-    body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
-    request_id = uuid.uuid4().hex
-    attempts = 0
-    last_error: Exception | None = None
-    delays = (0,) + _RETRY_DELAYS_SEC  # 先頭 0 ＝即時
-    for delay in delays:
-        if delay:
-            time.sleep(delay)
-        if resolve_each_attempt:
-            dest = store.get_api_key_webhook(key_id)
-            if not dest:
-                _log.info("Codex ジョブの終了通知を打ち切ります（通知先が無効になりました）: job_id=%s",
-                          payload.get("job_id"))
-                return
-            url, secret = dest["webhook_url"], dest["webhook_secret"]
-        try:
-            assert_webhook_url_allowed(url)
-        except WebhookUrlInvalid as e:
-            last_error = e
-            break
-        attempts += 1
-        try:
-            _send_once(url, secret, body, request_id, payload.get("event", ""))
-            try:
-                store.audit("system", "webhook.delivered", "webhook", str(key_id),
-                            detail={**detail_base, "attempts": attempts}, outcome="success")
-            except Exception:
-                _log.warning("Webhook 送信成功の監査記録に失敗しました（best-effort）", exc_info=True)
-            return
-        except Exception as e:
-            last_error = e
-            continue
+    payload = row["payload"]
+    dest = _destination(row["key_id"])
+    if dest is None:
+        raise outbox_sender.GiveUp("destination_removed")
+    url, secret = dest
     try:
-        store.audit("system", "webhook.failed", "webhook", str(key_id),
-                    detail={**detail_base, "attempts": attempts}, outcome="failure",
-                    severity="warning",
-                    reason=last_error.__class__.__name__ if last_error else "unknown")
+        assert_webhook_url_allowed(url)
+    except WebhookUrlInvalid:
+        raise outbox_sender.GiveUp("destination_not_allowed") from None
+    body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    request_id = uuid.uuid5(uuid.NAMESPACE_URL, f"sherpa-outbox:{row['id']}").hex  # 再送でも同じ ID
+    _send_once(url, secret, body, request_id, payload.get("event", ""))
+    try:
+        store.audit("system", "webhook.delivered", "webhook", str(row["key_id"]),
+                    detail=_audit_detail(row), outcome="success")
+    except Exception:
+        _log.warning("Webhook 送信成功の監査記録に失敗しました（best-effort）", exc_info=True)
+
+
+def _record_gave_up(row: dict, reason: str) -> None:
+    from . import store  # 遅延 import（循環回避）
+    _log.warning("Webhook を諦めました: key_id=%s reason=%s", row["key_id"], reason)
+    try:
+        store.audit("system", "webhook.failed", "webhook", str(row["key_id"]),
+                    detail=_audit_detail(row), outcome="failure", severity="warning", reason=reason)
     except Exception:
         _log.warning("Webhook 送信失敗の監査記録に失敗しました（best-effort）", exc_info=True)
 
 
-# 単一 daemon worker が有界キューを直列消費する。上限は 256（無制限の Thread 生成による OOM/FD 枯渇を防ぐ）
-_QUEUE_MAXSIZE = 256
-_queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAXSIZE)
-_worker_thread: threading.Thread | None = None
-_worker_lock = threading.Lock()
+KIND = outbox_sender.Kind(deliver=_deliver_row, delays=_RETRY_DELAYS_SEC, on_gave_up=_record_gave_up)
 
 
-def _process_queue_item(item: tuple) -> None:
-    """キューから取り出した1件を処理する（`_worker_loop` の本体）。想定外の例外で worker が落ちないよう最外周で捕捉する。"""
-    try:
-        _deliver(*item)
-    except Exception:
-        _log.warning("Webhook 配送処理で未捕捉の例外が発生しました（worker は継続します）",
-                     exc_info=True)
-
-
-def _worker_loop() -> None:
-    """単一 daemon worker 本体。キューから1件ずつ取り出し `_process_queue_item` を直列実行し続ける。"""
-    while True:
-        item = _queue.get()
-        try:
-            _process_queue_item(item)
-        finally:
-            _queue.task_done()
-
-
-def _ensure_worker_started() -> None:
-    """worker が未起動なら起こす（lazy start・1本しか起動しない）。"""
-    global _worker_thread
-    if _worker_thread is not None and _worker_thread.is_alive():
-        return
-    with _worker_lock:
-        if _worker_thread is not None and _worker_thread.is_alive():
-            return
-        _worker_thread = threading.Thread(target=_worker_loop, daemon=True,
-                                          name="sherpa-webhook-worker")
-        _worker_thread.start()
-
-
-def flush(timeout: float = 60.0) -> bool:
-    """積んだ通知が送り終わる（リトライ込み）まで待つ。送り終えたら True、`timeout` 秒で終わらなければ False。1 件で終わるプロセス（取り込みワーカー）が終了前に呼ぶ。"""
+def drain(timeout: float = 60.0) -> int:
+    """手元で今送れる Webhook の配送待ちを送る（1 件で終わるプロセス＝取り込みワーカーが終了前に呼ぶ）。今送れる行が無くなったら、`timeout` 秒より前でもすぐ終える。
+    再送待ちの行・他の送り手が貸出中の行は待たず、API のプロセスの送り手に任せる。残っている件数を返す。
+    """
     deadline = time.monotonic() + timeout
-    while _queue.unfinished_tasks > 0:
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.1)
-    return True
-
-
-def _enqueue(key_id: int, url: str, secret: str, payload: dict) -> None:
-    """1キー分の配送をキューへ積む。キューが飽和していれば即座に諦め、`webhook.dropped` を監査記録する。"""
-    _ensure_worker_started()
-    try:
-        _queue.put_nowait((key_id, url, secret, payload))
-        return
-    except queue.Full:
+    while time.monotonic() < deadline and outbox_sender.run_due({"webhook": KIND}, deadline=deadline):
         pass
-    _log.warning("Webhook 配送キューが飽和したため1件破棄しました: key_id=%s world=%s",
+    return outbox.pending_count(("webhook",))
+
+
+def _enqueue(key_id: int, payload: dict) -> None:
+    """1キー分の通知を配送待ちの表へ保存する。上限（`outbox.MAX_PENDING_PER_KIND`）なら保存せず `webhook.dropped` を監査記録する。"""
+    try:
+        outbox.add("webhook", payload, key_id=key_id)
+        return
+    except outbox.OutboxFull:
+        pass
+    except Exception:
+        _log.warning("Webhook の配送待ちへの保存に失敗しました（key_id=%s world=%s）",
+                     key_id, payload.get("world"), exc_info=True)
+        return
+    record_dropped(key_id, payload)
+
+
+def record_dropped(key_id: int, payload: dict) -> None:
+    """配送待ちが上限で保存できなかった通知を `webhook.dropped` として監査記録する。"""
+    _log.warning("Webhook の配送待ちが上限のため1件保存できませんでした: key_id=%s world=%s",
                 key_id, payload.get("world"))
     try:
         from . import store  # 遅延 import（循環回避）
+        dest = _destination(key_id)
         store.audit("system", "webhook.dropped", "webhook", str(key_id),
-                    detail={"host_port": _host_port_for_audit(url), "world": payload.get("world"),
-                           "run_id": payload.get("run_id"), "event": payload.get("event"),
+                    detail={"host_port": _host_port_for_audit(dest[0]) if dest else "（未解決）",
+                           "world": payload.get("world"), "run_id": payload.get("run_id"),
+                           "event": payload.get("event"),
                            **({"job_id": payload["job_id"]} if "job_id" in payload else {})},
-                    outcome="failure", severity="warning", reason="queue_full")
+                    outcome="failure", severity="warning", reason="outbox_full")
     except Exception:
         _log.warning("Webhook 破棄の監査記録に失敗しました（best-effort）", exc_info=True)
 
@@ -272,23 +245,12 @@ def notify_run_terminal(world: str, run_id: int | None, op: str, status: str, *,
                     "doc_count": doc_count, "at": at}
     for key in keys:
         payload = dict(payload_base)
-        _enqueue(key["id"], key["webhook_url"], key["webhook_secret"], payload)
+        _enqueue(key["id"], payload)
 
 
-def notify_codex_job_terminal(job_id: str, key_id: int, status: str, finished_at) -> None:
-    """Codex ジョブの終了（completed/failed/cancelled）を、受付時に `webhook: true` を指定した鍵の通知先へ1回積む。
-
-    署名・再送・監査は取り込み通知と同じ仕組み（`_enqueue`→`_deliver`）。本文は専用の4項目のみ（回答本文は載せない）。
-    宛先は送信時に鍵から読み、外されていれば送らずログだけ残す。例外は呼び出し元へ伝播させない。
+def codex_job_payload(job_id: str, status: str, finished_at) -> dict:
+    """Codex ジョブの終了通知の本文（専用の4項目のみ・回答本文は載せない）。保存は `store.codex_jobs` が終端化と同じトランザクションで行う。
+    宛先は送信時に鍵から読み、外されていれば `_deliver_row` が `destination_removed` で諦めて監査する。
     """
-    try:
-        from . import store
-        dest = store.get_api_key_webhook(key_id)
-        if not dest or not dest.get("webhook_url") or not dest.get("webhook_secret"):
-            _log.info("Codex ジョブの終了通知を送りません（通知先が未登録）: job_id=%s", job_id)
-            return
-        payload = {"event": f"codex_job.{status}", "job_id": job_id, "status": status,
-                   "finished_at": str(finished_at) if finished_at is not None else None}
-        _enqueue(key_id, dest["webhook_url"], "", payload)  # 宛先・secret は送信直前に引き直す
-    except Exception:
-        _log.warning("Codex ジョブの終了通知の準備に失敗しました（job_id=%s）", job_id, exc_info=True)
+    return {"event": f"codex_job.{status}", "job_id": job_id, "status": status,
+            "finished_at": str(finished_at) if finished_at is not None else None}

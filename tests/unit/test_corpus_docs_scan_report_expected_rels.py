@@ -59,3 +59,58 @@ def test_expected_rels_omitted_keeps_legacy_behavior(monkeypatch, tmp_path):
     rep = corpus_docs.scan_report("w")
 
     assert rep["document_count"] == 1
+
+
+def _manifest(wd, *names):
+    out = {}
+    for n in names:
+        st = (wd / n).stat()
+        out[n] = [st.st_mtime_ns, st.st_ctime_ns, st.st_size]
+    return out
+
+
+def test_expected_manifest_unchanged_returns_document_count(monkeypatch, tmp_path):
+    wd, _der = _world(monkeypatch, tmp_path)
+    (wd / "a.md").write_text("hello", encoding="utf-8")
+
+    rep = corpus_docs.scan_report("w", expected_manifest=_manifest(wd, "a.md"))
+
+    assert rep["document_count"] == 1
+
+
+def test_expected_manifest_update_after_classification_yields_none(monkeypatch, tmp_path):
+    """分類の後（集計の途中）に同じパスが更新されたら、最初の stat が一致していても保存しない。"""
+    wd, _der = _world(monkeypatch, tmp_path)
+    (wd / "a.md").write_text("hello", encoding="utf-8")
+    manifest = _manifest(wd, "a.md")
+    orig = corpus_docs.classify_document
+
+    def _classify_then_update(*a, **kw):
+        res = orig(*a, **kw)
+        (wd / "a.md").write_text("hello, changed", encoding="utf-8")
+        return res
+
+    monkeypatch.setattr(corpus_docs, "classify_document", _classify_then_update)
+
+    rep = corpus_docs.scan_report("w", expected_manifest=manifest)
+
+    assert rep["document_count"] is None
+
+
+def test_expected_manifest_file_added_to_walked_folder_yields_none(monkeypatch, tmp_path):
+    """歩き終えたフォルダにファイルが足されたら保存しない。"""
+    wd, _der = _world(monkeypatch, tmp_path)
+    (wd / "a.md").write_text("hello", encoding="utf-8")
+    manifest = _manifest(wd, "a.md")
+    orig = corpus_docs.classify_document
+
+    def _classify_then_add(*a, **kw):
+        res = orig(*a, **kw)
+        (wd / "b.md").write_text("new", encoding="utf-8")
+        return res
+
+    monkeypatch.setattr(corpus_docs, "classify_document", _classify_then_add)
+
+    rep = corpus_docs.scan_report("w", expected_manifest=manifest)
+
+    assert rep["document_count"] is None

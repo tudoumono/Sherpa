@@ -13,8 +13,10 @@ import threading
 import time
 from pathlib import Path
 
+from ... import path_rules
 from ..base import _log
-from .mcp import _mcp_env, _toml_str
+from .mcp import NETWORK_PASSTHROUGH_ENV, _mcp_env, _toml_str
+from .sandbox_exclude import _derived_read_roots, _exclude_deny_entries, strict_for, turn_deny  # noqa: F401  除外の deny（他の部品がここから引く）
 
 
 # ---- Codex authoring の permission-profile サンドボックス（読取封じ込め）----
@@ -300,20 +302,30 @@ def _enumerate_sensitive(roots: list, *, max_hits: int = 200, max_files: int = 2
     return sorted(out)
 
 
-def _prune_deny_paths(deny: list, read_roots: list) -> list:
+def _prune_deny_paths(deny: list, read_roots: list, strict: bool = False) -> list:
     """permission profile に書く deny 行を整える。重複・read 対象（root）配下に無いもの・実在しないもの・symlink・既に deny されるフォルダ配下の deny を落とす（bubblewrap が起動に失敗するため）。
     read root そのものへの deny（直読不許可・範囲が root に無い）は残す。
+    `strict`（管理者の除外の設定がある資料フォルダ）では、deny はすべて、確かめられない（EIO など）ときに黙って落とさず `RuntimeError`（直読み全体を止める。root の resolve の失敗も同じ）。
+    範囲の deny に含まれる除外の対象も、ここで守られる。`strict` でない（除外の設定が無い）ときは従来どおり、無い・確かめられないものは黙って落とす。
     """
     roots: list = []
     for r in read_roots:
         try:
             roots.append(Path(r).resolve())
-        except OSError:
+        except OSError as e:
+            if strict:
+                raise RuntimeError(f"deny_prune_failed:{type(e).__name__}") from e  # root を確かめられない: deny を落とさず直読み全体を止める
             continue
     cands: list = []
     for d in sorted(set(deny)):
         p = Path(d)
-        if p.is_symlink() or not p.exists():
+        try:
+            st = path_rules.lstat_or_none(p)
+        except OSError as e:
+            if strict:
+                raise RuntimeError(f"deny_prune_failed:{type(e).__name__}") from e  # 除外の設定がある資料フォルダの deny は黙って落とさない
+            continue  # 除外の設定が無いときは従来どおり落とす
+        if st is None or stat.S_ISLNK(st.st_mode):
             continue
         if not any(p == rp or rp in p.parents for rp in roots):
             continue
@@ -327,11 +339,7 @@ def _prune_deny_paths(deny: list, read_roots: list) -> list:
 
 
 # 親環境に設定されているときだけ Codex へ透過する変数（プロキシ・社内 CA）。接続経路の設定であって creds ではない。大文字・小文字の両方を見る。
-_CODEX_PASSTHROUGH_ENV: tuple[str, ...] = (
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
-    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
-)
+_CODEX_PASSTHROUGH_ENV: tuple[str, ...] = NETWORK_PASSTHROUGH_ENV
 
 
 def _tool_home(tmpdir: Path) -> Path:
@@ -360,6 +368,8 @@ def _codex_clean_env(codex_home: Path, tmpdir: Path, openai_api_key: str | None 
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "TMPDIR": str(tmpdir),
     }
+    from ... import proxy_bypass
+    proxy_bypass.apply()  # 子へ渡す NO_PROXY に社内の宛先を足してから読む
     for name in _CODEX_PASSTHROUGH_ENV:
         value = os.environ.get(name)
         if value:  # 空文字は「未設定」と同じ＝渡さない
@@ -450,7 +460,7 @@ def _web_search_endpoint_note(user_enabled: bool, endpoint_kind: str,
     """接続先が既定以外（Azure 等）のせいで web_search が強制 OFF になっている時だけ、ユーザー向けの一言を返す（それ以外は None）。条件は `_web_search_disabled_value` と二重管理しない。"""
     if endpoint_kind != "openai" and bool(user_enabled) and _web_search_admin_allowed(system_settings):
         return ("接続先が Azure OpenAI（または OpenAI 以外の互換エンドポイント）のため、"
-                "現在の Sherpa＋Codex 構成では Web 検索は未検証として無効にしています。")
+                "現在の Slouch＋Codex 構成では Web 検索は未検証として無効にしています。")
     return None
 
 
@@ -540,17 +550,51 @@ def _codex_install_root() -> Path | None:
     return real.parent
 
 
-def _codex_launcher_dir() -> Path | None:
-    """macOS で `codex` が symlink（Homebrew Cask 等）のとき、その symlink を置いたフォルダ。Seatbelt が symlink 側も読めないと拒むため。Linux（bubblewrap）は対象外。"""
+def _codex_link_dirs() -> list[Path]:
+    """macOS で `codex` へ辿り着くまでに通る symlink（起動用の `codex`・途中のフォルダの symlink）を置いたフォルダを、辿る順に返す。
+    Seatbelt は辿る途中の symlink も読めないと起動を拒むため。導入先の中にあるもの・それ自体が symlink を含むフォルダは除く。Linux（bubblewrap）は対象外。
+    起動用の `codex` を置いたフォルダは今までどおり読ませる。途中のフォルダの symlink を置いたフォルダは、導入先の 2 つ上までで、`/` から 3 段以上
+    深いものだけを読ませる（`/opt`・`/Applications` などの共有の場所を丸ごと読ませない）。どちらもホームのフォルダとその上は読ませない
+    （読取の封じ込めを破るため。その配置では Codex が起動できないまま止まる）。
+    """
     if sys.platform != "darwin":
-        return None
+        return []
     exe = shutil.which("codex")
-    if not exe or not Path(exe).is_symlink():
+    if not exe:
+        return []
+    root = _codex_install_root()
+    home = Path.home().resolve()
+    too_wide = {home, *home.parents}
+    out: list[Path] = []
+    path = Path(os.path.abspath(exe))
+    near_root = set(list(root.parents)[:2]) if root is not None else set()
+    for _hop in range(40):
+        parts = path.parts
+        cur = Path(parts[0])
+        for i, part in enumerate(parts[1:], start=1):
+            nxt = cur / part
+            if nxt.is_symlink():
+                launcher = _hop == 0 and i == len(parts) - 1  # 起動用の `codex` そのもの
+                narrow = launcher or (cur in near_root and len(cur.parts) >= 4)
+                if (narrow and cur.resolve() == cur and cur not in out and cur not in too_wide
+                        and not (root is not None and (cur == root or root in cur.parents))):
+                    out.append(cur)
+                target = Path(os.readlink(nxt))
+                path = Path(os.path.normpath((target if target.is_absolute() else cur / target).joinpath(*parts[i + 1:])))
+                break
+            cur = nxt
+        else:
+            break
+    return out
+
+
+def _codex_launcher_dir() -> Path | None:
+    """macOS で `codex` が symlink（Homebrew Cask 等）のとき、その symlink を置いたフォルダ（`_codex_link_dirs` の最初）。"""
+    exe = shutil.which("codex")
+    if sys.platform != "darwin" or not exe or not Path(exe).is_symlink():
         return None
-    d = Path(exe).parent
-    if d.resolve() != d or d == _codex_install_root():
-        return None
-    return d
+    first = Path(os.path.abspath(exe)).parent
+    return first if first in _codex_link_dirs() else None
 
 
 def _codex_bundled_rg_dir() -> Path | None:
@@ -580,14 +624,14 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
                                   sidecar_path: str | None = None,
                                   multi_agent: bool = False,
                                   orchestrator_model: str | None = None,
-                                  extra_mcp_env: dict | None = None,
+                                  extra_mcp_env: dict | None = None, rules=None,
                                   link_auth: bool = True) -> None:
     """per-request CODEX_HOME に permission profile（＋任意で MCP 設定）を書く。creds は config ファイル内に閉じる（コマンドライン `-c` に出さない）。auth.json は実 home から symlink。
     `layer`: `_mcp_env` へ転送するだけ。Codex は層の指定を強制せず、層のフィルタは MCP ツール側が担う。
     `direct_read_roots`: 渡されたとき `kb_roots` の代わりにそれを read する。明示的な空リスト `[]` は「直読は許可しない（MCP のみ）」で、`None`（従来どおり `kb_roots`）と区別する。
     `sensitive_deny`: 個別 `deny` にする絶対パス（秘匿ファイルと範囲外エントリ）。read 行より後に書き、`_prune_deny_paths` で整形する。
     `deny_roots`: `direct_read_roots == []` のときに明示 deny する root。
-    `extra_mcp_env`: `_mcp_env` の結果に上書きマージする追加 env（`mcp` が偽なら無視）。
+    `extra_mcp_env`: `_mcp_env` の結果に上書きマージする追加 env（`mcp` が偽なら無視）。`rules`: 1 回の依頼で `turn_prepare` が読んだ管理者の除外の規則（deny の strict の判定と MCP の子へ渡す env に同じものを使う。省略時は読む）。
     `sidecar_path`: MCP サーバ env に `SHERPA_MCP_SIDECAR` を足す（子の読取記録の唯一の観測経路）。codex_home 配下（`":root" = "deny"` の外側）に置くこと（run_dir 直下は shell が偽の行を書ける）。
     Python 実行環境（`_venv_root()`）は venv で動いているときだけ常に read で足す。
     `multi_agent`: 真のとき `[agents]`／`[agents.worker]`／`[agents.evaluator]` を足す（worker の model は `_codex_worker_model`、evaluator は `orchestrator_model`、推論レベルは `reason`）。層の実体は `_write_codex_agent_role_configs` が書く。
@@ -613,6 +657,7 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     lines = [
         'default_permissions = "sherpa-authoring"',
         'approval_policy = "never"',
+        'project_root_markers = []',  # 作業領域そのものを根にする（上の階層の `.git`・AGENTS.md を探しに行かない）
     ]
     # Codex(OpenAI) 構成のときだけ、実際の接続先が既定以外かを見る。
     _endpoint_kind = "openai" if ollama_base_url else _openai_endpoint_kind(system_settings)
@@ -646,13 +691,12 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
         '":root" = "deny"',  # FS 全体の読取を遮断
         '":minimal" = "read"',  # /usr,/bin,libs 等 実行最小限
     ]
-    # Codex はサンドボックス内で自分の実行ファイルを起動し直すため、導入先だけを read にする。
+    # Codex はサンドボックス内で自分の実行ファイルを起動し直すため、導入先と、辿る途中の symlink を置いたフォルダ（`_codex_link_dirs`）を read にする。
     _codex_root = _codex_install_root()
     if _codex_root is not None:
         lines.append(f'{_toml_str(str(_codex_root))} = "read"')
-    _codex_launcher = _codex_launcher_dir()
-    if _codex_launcher is not None:
-        lines.append(f'{_toml_str(str(_codex_launcher))} = "read"')
+    for _link_dir in _codex_link_dirs():
+        lines.append(f'{_toml_str(str(_link_dir))} = "read"')
     # Codex は層の指定を強制せず、直読は層に関係なく read。`direct_read_roots is not None` のときは `kb_roots` の代わりにそちらを read する（空リスト `[]` は直読を許可しない）。
     _read_roots = list(kb_roots) if direct_read_roots is None else list(direct_read_roots)
     _venv = _venv_root()
@@ -671,7 +715,7 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     else:
         _all_roots = _read_roots + ([str(_venv)] if _venv is not None else [])
         # read 行より後＝範囲外の兄弟・秘匿ファイルは個別 deny（具体パスほど優先）。整形は `_prune_deny_paths`。
-        _deny_lines = _prune_deny_paths(list(sensitive_deny or []), _all_roots)
+        _deny_lines = _prune_deny_paths(list(sensitive_deny or []), _all_roots, strict=strict_for(world, rules))  # 除外の設定がある資料フォルダでは strict（`rules` は 1 回の依頼で読んだものを使い、読み直さない）
         _deny_set = set(_deny_lines)
         for r in _all_roots:  # root ごと deny する root には read 行を書かない
             if r not in _deny_set:
@@ -688,7 +732,7 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     ]
     if mcp:
         py = sys.executable or "python3"
-        menv = _mcp_env(world, scope_paths, ask_disabled, layer=layer)
+        menv = _mcp_env(world, scope_paths, ask_disabled, layer=layer, rules=rules)
         if extra_mcp_env:
             menv.update(extra_mcp_env)
         if sidecar_path:

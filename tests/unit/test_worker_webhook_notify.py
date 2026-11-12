@@ -14,12 +14,14 @@ import pytest
 
 from sherpa import corpus_docs, store, webhooks
 from sherpa.ingest import world_neo4j, worker
+from tests._replace_row import use_offline_rows
 
 
 @pytest.fixture(autouse=True)
 def _stub_pipeline(monkeypatch):
     """`worker.run`/`worker.sync` を DB/Neo4j 無しで駆動できるよう周辺を差し替える（happy path 既定・
     `test_ingest_worker_flags.py::_stub_pipeline` と同型）。"""
+    use_offline_rows(monkeypatch)
     monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig", {"a": [1, 2, 3]}))
     monkeypatch.setattr(worker, "build_world_graph", lambda world: ([], [], []))
     monkeypatch.setattr(worker, "_build_derived",
@@ -27,13 +29,14 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(worker, "_ledger_rows", lambda world, *, sig: [])
     monkeypatch.setattr(worker, "world_signature", lambda world: "sig")
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None: (0, 0))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None, **_kw: (0, 0))
 
     @contextlib.contextmanager
     def _noop_lock(world_id):
         yield
     monkeypatch.setattr(store, "world_lock", _noop_lock)
-    monkeypatch.setattr(store, "replace_documents", lambda world, rows: 0)
+    monkeypatch.setattr(store, "stage_ledger", lambda world, rows, names, **_kw: len(rows))
+    monkeypatch.setattr(store, "switch_ledger", lambda world, **_kw: None)
     monkeypatch.setattr(store, "set_world_sig",
                         lambda world, sig, manifest=None, doc_count=None, scan_report=None: None)
     monkeypatch.setattr(store, "downgrade_orphaned_extracting_runs", lambda world=None: [])
@@ -51,10 +54,12 @@ def _stub_pipeline(monkeypatch):
     def _fake_finish_ingest_run(run_id, **kw):
         return {"id": run_id, **kw}
     monkeypatch.setattr(store, "finish_ingest_run", _fake_finish_ingest_run)
+    monkeypatch.setattr(store, "finish_ingest_run_and_drop_row",
+                        lambda run_id, *, drop, **kw: _fake_finish_ingest_run(run_id, **kw))
 
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None, drop=None):
         return {"id": run_id, "status": status}
     monkeypatch.setattr(store, "finish_ingest_run_and_confirm_world", _fake_finish_and_confirm)
 

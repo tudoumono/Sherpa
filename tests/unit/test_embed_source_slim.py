@@ -8,6 +8,7 @@ import json
 import pytest
 
 from sherpa import embeddings, es_index
+from tests._replace_row import offline_row
 
 
 def test_mapping_excludes_embedding_from_source_only_when_vectors_enabled():
@@ -96,7 +97,7 @@ def test_replace_document_rollback_restores_vectors_from_cache_without_api(monke
 
     monkeypatch.setattr(es_index, "_send_bulk", send)
     monkeypatch.setattr(es_index.embeddings, "embed", no_api)
-    r = es_index.replace_document("w", "a.md", src, content_sig="c1")
+    r = es_index.replace_document("w", "a.md", src, content_sig="c1", row=offline_row("w"))
     assert r == {"available": True, "error": "bulk_failed"}
     restore = [json.loads(ln) for p in sent[1] for i, ln in enumerate(p.strip().split("\n")) if i % 2 == 1]
     by_text = {b["text"]: b for b in restore if b["text"].startswith("古い")}
@@ -106,10 +107,10 @@ def test_replace_document_rollback_restores_vectors_from_cache_without_api(monke
 
 def test_validate_embed_dim_accepts_only_range():
     from fastapi import HTTPException
-    from sherpa.routers import system_extras as se
-    assert se._validate_embed_dim(None) is None
-    assert se._validate_embed_dim(64) == 64 and se._validate_embed_dim(4096) == 4096
+    from sherpa.routers import embed_tuning as se
+    assert se._validate_dim(None) is None
+    assert se._validate_dim(64) == 64 and se._validate_dim(4096) == 4096
     for bad in (0, 63, 4097):
         with pytest.raises(HTTPException) as ei:
-            se._validate_embed_dim(bad)
+            se._validate_dim(bad)
         assert ei.value.status_code == 422

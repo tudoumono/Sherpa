@@ -12,6 +12,13 @@ from pathlib import Path
 
 from sherpa import corpus_docs, es_index, reconcile, scope_infer, store, worlds
 from sherpa.ingest import scan_pdf_ocr_status, worker, world_neo4j
+import pytest
+from tests._replace_row import use_offline_rows
+
+
+@pytest.fixture(autouse=True)
+def _offline_rows(monkeypatch):
+    use_offline_rows(monkeypatch)
 
 _DOCX_XML = (
     '<?xml version="1.0"?>\n'
@@ -43,10 +50,12 @@ def _stub_external(monkeypatch, tmp_path):
     monkeypatch.setattr(store, "world_lock", _noop_lock)
     monkeypatch.setattr(store, "start_ingest_run", lambda w, **kw: {"id": 1, "status": "extracting"})
     monkeypatch.setattr(store, "update_ingest_run_progress", lambda run_id, progress: None)
+    monkeypatch.setattr(store, "update_ingest_run_snapshot", lambda run_id, snapshot: None)
     monkeypatch.setattr(store, "downgrade_orphaned_extracting_runs", lambda world=None: [])
     monkeypatch.setattr(store, "set_world_sig", lambda *a, **kw: None)
     monkeypatch.setattr(store, "set_scan_report", lambda world, report: None)
-    monkeypatch.setattr(store, "replace_documents", lambda world, rows: 0)
+    monkeypatch.setattr(store, "stage_ledger", lambda world, rows, names, **_kw: len(rows))
+    monkeypatch.setattr(store, "switch_ledger", lambda world, **_kw: None)
     monkeypatch.setattr(store, "finish_ingest_run", lambda run_id, **kw: {"id": run_id, **kw})
     monkeypatch.setattr(store, "finish_ingest_run_and_confirm_world", lambda run_id, world, **kw: {"id": run_id})
     monkeypatch.setattr(corpus_docs, "scan_report", lambda world, expected_rels=None: {"document_count": 0})

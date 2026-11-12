@@ -34,6 +34,7 @@ import pytest
 
 from sherpa.ingest import ai_observation, evidence_ir as IR, evidence_spike, llm_render, ocr_router, ocr_worker, office_md
 from sherpa.ingest.arms import vision_arm
+from tests._replace_row import offline_row
 
 _ROOT = Path(__file__).resolve().parents[2]
 _XLSX_WITH_PICTURE = _ROOT / "fixtures" / "eval" / "deprecation_markers" / "inputs" / "DEP-XLSX-MARKERS.xlsx"
@@ -287,7 +288,7 @@ def _build_derived_with_world(monkeypatch, tmp_path, source: Path, *, world: str
     wd.mkdir()
     shutil.copy(source, wd / source.name)
     dmd = tmp_path / "derived" / "md"
-    rep = office_md.build_derived(wd, dmd, world=world)
+    rep = office_md.build_derived(wd, dmd, world=world, row=offline_row(world))
     assert not rep.get("error") and rep["rag_failed"] == 0, rep
     rag_path = dmd.parent / "rag" / f"{source.name}.rag.md"
     return rag_path.read_text(encoding="utf-8"), dmd
@@ -296,6 +297,7 @@ def _build_derived_with_world(monkeypatch, tmp_path, source: Path, *, world: str
 @pytest.mark.skipif(not _XLSX_WITH_PICTURE.is_file(), reason="fixture が無い環境")
 def test_ocr_only_observation_appears_as_ai_observation_in_rag_md(monkeypatch, tmp_path):
     """契約2: OCR単独（VLM無し）でも「AI観測」ラベル付きレコードとしてrag.mdに出る。"""
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})   # 入のときは公開中の世代と一致する観測を合流する
     # build_derivedが内部で読む実IR/assetsと同じ内容から、実OCR呼び出し無しでSetを組む。
     probe_ir = evidence_spike.extract(_XLSX_WITH_PICTURE)
     ocr_set = _build_ocr_set(probe_ir, _XLSX_WITH_PICTURE.name, tmp_path / "probe-assets",
@@ -332,6 +334,7 @@ def test_low_confidence_ocr_observation_does_not_appear_as_ai_observation(monkey
 @pytest.mark.skipif(not _XLSX_WITH_PICTURE.is_file(), reason="fixture が無い環境")
 def test_vlm_and_ocr_coexist_in_rag_md(monkeypatch, tmp_path):
     """契約3: VLMとOCRが同一世代で併存すると、両方の観測がrag.mdに出る。"""
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})   # 入のときは公開中の世代と一致する観測を合流する
     monkeypatch.setattr(vision_arm, "resolve_vlm", lambda: {
         "provider": "ollama", "model": "qwen2.5vl", "cloud_allowed": False,
         "ollama_url": "http://localhost:11434",
@@ -356,6 +359,7 @@ def test_vlm_and_ocr_coexist_in_rag_md(monkeypatch, tmp_path):
 @pytest.mark.skipif(not _XLSX_WITH_PICTURE.is_file(), reason="fixture が無い環境")
 def test_llm_render_still_skips_ocr_origin_observation_record(monkeypatch, tmp_path):
     """契約5: OCR由来のAI観測レコードもllm_renderの成形対象外のまま（既存契約の維持確認）。"""
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})   # 入のときは公開中の世代と一致する観測を合流する
     probe_ir = evidence_spike.extract(_XLSX_WITH_PICTURE)
     ocr_set = _build_ocr_set(probe_ir, _XLSX_WITH_PICTURE.name, tmp_path / "probe-assets",
                              confidence=0.9, text="成形されてはいけない観測文字列")
@@ -411,6 +415,7 @@ def test_current_ocr_observation_marker_none_when_world_not_given():
 
 
 def test_current_ocr_observation_marker_reflects_published_generation(monkeypatch, tmp_path):
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})   # 入のときは公開中の世代と一致する観測を合流する
     obs_dir = tmp_path / "obs-root" / "canonical-a" / "observation-b"
     monkeypatch.setattr("sherpa.worlds.observation_current_dir", lambda _w: obs_dir)
     assert office_md.current_ocr_observation_marker("world-x") == "canonical-a/observation-b"

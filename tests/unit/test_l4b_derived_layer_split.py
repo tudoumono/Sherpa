@@ -20,6 +20,7 @@ import openpyxl
 from sherpa import corpus_docs, es_index, grep_tool, tool_dispatch, worlds
 from sherpa.ingest import office_md
 from sherpa.parts.read import tools as read_tools
+from tests._replace_row import offline_row
 
 _DOCX_XML = """<?xml version="1.0"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -58,7 +59,7 @@ def _build(world_id: str, source: Path) -> dict:
     _zip(source / "b.docx", {"word/document.xml": _DOCX_XML})
     _zip(source / "c.pptx", {"ppt/slides/slide1.xml": _PPTX_SLIDE})
 
-    rep = office_md.build_derived(source, worlds.derived_md_dir(world_id), world_sig="sig1")
+    rep = office_md.build_derived(source, worlds.derived_md_dir(world_id), world_sig="sig1", row=offline_row("w"))
     assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0, rep
     return rep
 
@@ -194,7 +195,7 @@ def test_old_layout_residue_does_not_crash_new_code(monkeypatch, tmp_path):
 # ---- 受け入れ条件7: 削除伝播が3層すべてを消す ----
 
 def test_deletion_propagation_removes_all_three_layers(monkeypatch, tmp_path):
-    """`shutil.rmtree(worlds.derived_dir(world))`（`worker._wipe_locked`／`worlds.register` の補償
+    """`shutil.rmtree(worlds.derived_dir(world))`（`wipe.wipe_locked`／`worlds.register` の補償
     処理と同じ操作）が md/rag/ir の3層とも一括で消す（world 削除時の一括伝播）。"""
     world_id = "l4b-delete-world"
     source = _real_world(monkeypatch, tmp_path, world_id)

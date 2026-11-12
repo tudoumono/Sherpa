@@ -73,17 +73,30 @@ def test_safe_share_answer_passes_scope_with_layer_wholesale():
     assert store._safe_share_answer({"lens": "qa", "headline": "h", "scope": scope})["scope"] == scope
 
 
-def test_importance_fields_kept_in_both_paths_but_not_source():
-    """importance/importance_reason は両経路（allowlist／denylist）で出し、importance_source は
-    allowlist 経路では出さない。"""
+@pytest.mark.parametrize("via", [_via_safe, _via_strip], ids=["sanitized_share", "received_share"])
+def test_importance_fields_not_shared_in_either_path(via):
+    """過去に保存された回答の出典に importance 系の欄があっても、両経路（allowlist／denylist）で出さない。"""
     answer = {"lens": "qa", "headline": "h",
               "sources": [{"doc_id": "real.md", "download_url": "/x", "importance": "高",
                            "importance_reason": "契約書", "importance_source": "_重要度.txt:1行目"}]}
-    s = _via_safe(answer)["sources"][0]
-    assert s["importance"] == "高" and s["importance_reason"] == "契約書"
-    assert "importance_source" not in s
-    stripped = _via_strip(answer)["sources"][0]
-    assert stripped["importance"] == "高" and stripped["importance_reason"] == "契約書"
+    s = via(answer)["sources"][0]
+    assert s["doc_id"] == "real.md"
+    assert not {"importance", "importance_reason", "importance_source"} & set(s)
+
+
+@pytest.mark.parametrize("via", [_via_safe, _via_strip], ids=["sanitized_share", "received_share"])
+def test_importance_fields_not_shared_from_answer_data_rows(via):
+    """過去に保存された回答の data（citations/candidates/items/presumed）の行に重要度の欄があっても、両経路で出さない。"""
+    imp = {"importance": "高", "importance_reason": "契約書", "importance_source": "x:1", "importance_mixed": True}
+    out = via({"lens": "impact", "headline": "h", "data": {
+        "citations": [{"doc_id": "real.md", **imp}],
+        "candidates": [{"name": "ORDER-MAIN", "source": "grep", "evidence": {"edges": [], "grep": []}, **imp}],
+        "items": [{"name": "ORDER-MAIN", "evidence": [], **imp}],
+        "presumed": [{"name": "BILLGEN", "evidence": [], **imp}]}})
+    data = out["data"]
+    for k in ("citations", "candidates", "items", "presumed"):
+        assert data[k] and not set(imp) & set(data[k][0]), k
+    assert data["items"][0]["name"] == "ORDER-MAIN"
 
 
 @pytest.mark.parametrize("via", [_via_safe, _via_strip], ids=["sanitized_share", "received_share"])
@@ -144,8 +157,7 @@ def test_strip_shared_message_keeps_answer_untouched_when_nothing_needs_filterin
 
 
 def test_safe_share_answer_troubleshoot_candidates_have_no_internal_cid():
-    """公開経路（run_troubleshoot）が除去済みの cid（内部専用の Neo4j canonical_id）を、共有の浅いコピーが
-    新たに持ち込まない。"""
+    """内部専用の Neo4j canonical_id（cid）を、共有の浅いコピーが新たに持ち込まない。"""
     out = store._safe_share_answer({
         "lens": "troubleshoot", "headline": "h", "sources": [],
         "data": {"candidates": [{"name": "ORDER-MAIN", "label": "Module", "role": "実装", "distance": 1,
@@ -471,63 +483,3 @@ def test_create_sanitized_snapshot_redacts_personal_turns_and_keeps_kb_turns():
     assert msgs[5]["content"] == "共有KBの一般回答"
     assert msgs[5]["route"] is None and msgs[5]["trace"] is None
     assert [s["doc_id"] for s in msgs[5]["answer"]["sources"]] == ["kb1"]   # 個人ヒット除去
-
-
-class _CidFakeRecord:
-    def __init__(self, d):
-        self._d = d
-
-    def data(self):
-        return dict(self._d)
-
-
-class _CidFakeResult:
-    def __init__(self, rows):
-        self._rows = rows
-
-    def __iter__(self):
-        return iter(_CidFakeRecord(r) for r in self._rows)
-
-    def consume(self):
-        pass
-
-    def data(self):
-        # check_schema_era は .data() で一括取得する。常に同じ cid 付き行を返すため形が合わず早期 return する。
-        return [dict(r) for r in self._rows]
-
-
-class _CidFakeSession:
-    """run_troubleshoot が呼ぶクエリに cid 付きの1行を返す最小スタブ（実 Neo4j 不要）。"""
-
-    def run(self, query, **params):
-        return _CidFakeResult([{
-            "cid": "module:v1:04_運用/order.cob#ORDER-MAIN", "name": "ORDER-MAIN", "label": "Module",
-            "status": "active", "path_names": ["ROOT", "ORDER-MAIN"],
-            "edges": [{"type": "USES", "doc": "order.md"}], "dist": 1,
-        }])
-
-
-def test_troubleshoot_answer_round_trip_has_no_cid_in_saved_read_or_shared_data(monkeypatch):
-    """cid 付きの Neo4j 行から出発し、run_troubleshoot（cid 除去）→ DB 保存 → 取得 → JSON 書き出し用 data →
-    sanitized 共有まで通して cid が一切残らない（end-to-end）。"""
-    from sherpa import lens_service
-
-    _try_init()
-    monkeypatch.setattr(lens_service, "grep_search", lambda *a, **k: [])
-    result = lens_service.run_troubleshoot(_CidFakeSession(), "ORDER-MAIN で ABEND", "v1")
-    assert result["candidates"] and "cid" not in result["candidates"][0]   # 発生源では既に無い
-
-    owner = f"unit-shares-owner-cid-{_sfx()}"
-    cid_conv = _mk_conv(owner, title="ORDER-MAIN で ABEND")
-    store.add_message(cid_conv, "user", content="ORDER-MAIN で ABEND")
-    store.add_message(cid_conv, "assistant", content="原因候補 1件。",
-                      answer={"headline": "原因候補 1件。", "lens": "troubleshoot", "sources": [], "data": result})
-
-    saved_data = store.get_conversation_for_read(owner, cid_conv)["messages"][-1]["answer"]["data"]
-    assert saved_data["candidates"] and "cid" not in saved_data["candidates"][0]
-    assert json.dumps(saved_data).find('"cid"') == -1
-
-    snap_cid = store.create_sanitized_snapshot(owner, cid_conv)
-    assert snap_cid is not None
-    shared_data = store.get_conversation_for_read(owner, snap_cid)["messages"][-1]["answer"]["data"]
-    assert shared_data["candidates"] and "cid" not in shared_data["candidates"][0]

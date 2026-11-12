@@ -11,6 +11,7 @@ import pytest
 from _world_registry import register_test_world
 
 from sherpa.ingest import world_neo4j
+from tests._replace_row import offline_row
 
 WORLD = "impact_bfs_test_a"          # 使い捨て（テスト後に削除）
 LAYERS, WIDTH = 6, 4
@@ -45,7 +46,7 @@ START = _cid("L0N0", "in/l0/n0.cbl")
 
 def _load(nodes, edges):
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, WORLD, env["uri"], env["user"], env["pw"], row=offline_row(WORLD))
     register_test_world(WORLD)
 
 

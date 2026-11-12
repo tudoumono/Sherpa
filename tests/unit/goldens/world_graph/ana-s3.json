@@ -1,0 +1,23 @@
+{
+  "counts": {
+    "edge_types": {
+      "CONTAINS": 20,
+      "INVOKES": 43
+    },
+    "edges": 63,
+    "flag_reasons": {
+      "ambiguous": 3,
+      "unresolved": 11,
+      "unresolved_qualifier": 7
+    },
+    "flags": 21,
+    "node_labels": {
+      "Batch": 1,
+      "Config": 5,
+      "Module": 94
+    },
+    "nodes": 100
+  },
+  "sha256": "111d4023ec75c5b6f4cd7fed7336274d432f83f32f11db2c728d475de3eb9730",
+  "world": "ana-s3"
+}

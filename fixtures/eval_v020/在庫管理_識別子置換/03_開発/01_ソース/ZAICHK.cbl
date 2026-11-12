@@ -1,0 +1,10 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. ZAICHK.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+           COPY ZAI-CPY.
+       PROCEDURE DIVISION.
+           IF ZAI-QTY < ZAI-SAFE-QTY
+               CALL 'ZAITSUCHI'
+           END-IF.
+           GOBACK.

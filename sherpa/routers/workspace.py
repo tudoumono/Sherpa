@@ -182,7 +182,8 @@ def workspace_file_delete(file_id: int, request: Request):
     row = store.delete_workspace_file(uid, file_id)
     if not row:
         raise HTTPException(404, "ファイルが見つかりません（または削除済み）")
-    # 物理ファイルを削除する（best-effort: 台帳は削除済みなので、ファイルが消えなくてもエラーにしない）。
+    # 物理ファイルを削除する。台帳は削除済みなので失敗してもエラーにはせず、消せなかったことを応答と監査に残す。
+    physical_deleted = True
     try:
         p = Path(row["original_path"])
         # relative_to で workspace/files 配下に収まることを確認してから削除する（symlink 脱出・prefix 衝突対策）。
@@ -192,16 +193,21 @@ def workspace_file_delete(file_id: int, request: Request):
             p.unlink(missing_ok=True)
         except ValueError:
             _log.warning("workspace delete: path outside files_dir, skipping unlink: %s", p)
+            physical_deleted = False
     except Exception as e:
         _log.warning("workspace file physical delete failed for uid=%s file_id=%s: %s", uid, file_id, e)
+        physical_deleted = False
     # 監査。
     try:
         store.audit(uid, "workspace.file_deleted", "workspace_file", f"pwf:{file_id}",
-                    detail={"rel_path": row["rel_path"]},
-                    outcome="success", severity="info")
+                    detail={"rel_path": row["rel_path"], "physical_deleted": physical_deleted},
+                    outcome="success" if physical_deleted else "error",
+                    reason=None if physical_deleted else "physical_delete_failed",
+                    severity="info" if physical_deleted else "warning")
     except Exception:
         _log.warning("audit write failed for workspace.file_deleted (best-effort)")
-    return {"ok": True, "id": file_id, "rel_path": row["rel_path"]}
+    return {"ok": physical_deleted, "id": file_id, "rel_path": row["rel_path"],
+            "physical_deleted": physical_deleted}
 
 
 @router.get("/workspace/files/{file_id}/download", tags=["個人ワークスペース"])
@@ -250,6 +256,7 @@ def workspace_search(request: Request, q: str = Query(..., min_length=1)):
     q_stripped = q.strip()
     q_lower = q_stripped.lower()
     hits = []
+    unsearched: list[str] = []  # 台帳にあるのに読めず、検索できなかったファイル。
     seen: set[tuple] = set()
     files_dir_resolved = files_dir.resolve()
     # 台帳に載っている live rel_path を直接イテレートして grep する（FS の rglob は使わない）。
@@ -258,19 +265,23 @@ def workspace_search(request: Request, q: str = Query(..., min_length=1)):
         raw = files_dir / rel_path
         if raw.is_symlink():
             _log.warning("workspace search: symlink rejected for uid=%s rel=%s", uid, rel_path)
+            unsearched.append(rel_path)
             continue
         p = _confined_path(files_dir, rel_path)
         if p is None:
             # パス閉じ込め違反（uid slug 制約と、rel_path が自アップロード由来のため通常は起きない）。
             _log.warning("workspace search: confined_path failed for uid=%s rel=%s", uid, rel_path)
+            unsearched.append(rel_path)
             continue
         if not p.is_file():
-            # 台帳にはあるが物理ファイルが消えている（best-effort 削除の逆パターン）。スキップする。
+            # 台帳にはあるが物理ファイルが消えている。検索できなかったものとして知らせる。
+            unsearched.append(rel_path)
             continue
         # symlink 脱出防止（二重確認）: resolve して files_dir 配下かを再確認する。
         try:
             p.resolve().relative_to(files_dir_resolved)
         except ValueError:
+            unsearched.append(rel_path)
             continue
         # workspace 専用の拡張子判定（`_WORKSPACE_SEARCHABLE_EXT`）。共有 KB の `grep_tool._TEXT_EXT` は使わない。
         ext = p.suffix.lower()
@@ -281,6 +292,8 @@ def workspace_search(request: Request, q: str = Query(..., min_length=1)):
             enc = text_encoding.detect_bytes(raw_bytes, complete=True)
             lines = text_encoding.decode(raw_bytes, enc).splitlines()
         except Exception:
+            _log.warning("workspace search: read failed for uid=%s rel=%s", uid, rel_path, exc_info=True)
+            unsearched.append(rel_path)
             continue
         for i, ln in enumerate(lines):
             if q_lower not in ln.lower():
@@ -303,4 +316,4 @@ def workspace_search(request: Request, q: str = Query(..., min_length=1)):
             break
 
     # このヒットは個人 workspace 専用（`live_paths` は personal_workspace_files 台帳のみ由来で ES/Neo4j は参照しない）。
-    return {"query": q_stripped, "source": "個人ファイル内ヒット", "hits": hits}
+    return {"query": q_stripped, "source": "個人ファイル内ヒット", "hits": hits, "unsearched": unsearched}

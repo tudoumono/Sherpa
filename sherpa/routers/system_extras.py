@@ -31,7 +31,9 @@ from sherpa import (
 from sherpa.agents import _web_search_admin_allowed
 from sherpa.providers.codex import sandbox as codex_sandbox
 from sherpa.deps import _current_user, _require_admin
+from sherpa.routers import embed_tuning
 from sherpa.schemas import (
+    AdminOllamaTestResponse,
     AnnouncementMutateResponse,
     AnnouncementsListResponse,
     ExtKeyCreatedResponse,
@@ -114,8 +116,9 @@ class SystemSettingsReq(BaseModel):
     legacy_backend: str | None = None  # 旧形式変換バックエンド: none|libreoffice|office_com。null は既定へ。
     # rag.md の LLM 成形トグル。on|off。null は既定 off へフォールバックする（`legacy_backend` と同型）。
     rag_llm_render: str | None = None
+    ocr_enabled: StrictBool | None = None  # OCR の入切（既定は切・環境変数 SHERPA_OCR_ENABLED=0 のときだけ切に固定）。null は既定へ。
     vlm: dict | None = None  # 視覚読み取りの VLM 設定 {provider,model,cloud_allowed}。null は既定へ。
-    # Ollama 接続先の SSRF allowlist（host:port の配列）。未設定(None)は loopback のみ許可（`llm.assert_ollama_url_allowed`）。null は未設定へ戻す。
+    # 利用者が個人設定で選べる Ollama 接続先（host:port の配列）。未設定(None)は loopback と中央の既定接続先だけ（`llm.assert_ollama_url_allowed`）。null は未設定へ戻す。
     ollama_allowlist: list[str] | None = None
     # Webhook 宛先の SSRF allowlist（host:port の配列）。`ollama_allowlist` と違い loopback も例外にせず、未設定(None)は全拒否（`webhooks.assert_webhook_url_allowed`）。null は未設定へ戻す。
     webhook_allowlist: list[str] | None = None
@@ -145,10 +148,7 @@ class SystemSettingsReq(BaseModel):
     # Ollama の許可ホスト一覧は既存の `ollama_allowlist` を使う。
     # 調べる深さ（標準/深く/最大）が掛ける倍率の基準値（標準時の値）。未指定(None)は各モジュールのコード既定値（`sherpa/depth_profile.py::BASE_SETTINGS_KEYS` が対応する定数を列挙）。null は未設定へ戻す。倍率表自体は固定でここでは編集しない。
     depth_base_grep_max_hits: StrictInt | None = Field(default=None, ge=1, le=1000)
-    depth_base_qa_max_hits: StrictInt | None = Field(default=None, ge=1, le=1000)
     depth_base_read_window: StrictInt | None = Field(default=None, ge=10, le=400)
-    depth_base_impact_depth: StrictInt | None = Field(default=None, ge=1, le=64)
-    depth_base_troubleshoot_depth: StrictInt | None = Field(default=None, ge=1, le=16)
     depth_base_codex_reasoning: str | None = None
     # 埋め込み HTTP の同時送信数（`sherpa.embeddings.embed()` の有界スレッドプール）。未指定(None)は `embeddings.EMBED_PARALLEL_DEFAULT`（4）。null は未設定へ戻す。
     embed_parallel: StrictInt | None = Field(default=None, ge=1, le=16)
@@ -156,6 +156,9 @@ class SystemSettingsReq(BaseModel):
     embed_dim: StrictInt | None = None
     # 埋め込みの接続先。"auto"（回答用に選んだクラウドに従う・既定）／"ollama"（常に中央 Ollama）。null は未設定（既定 auto）へ戻す。回答側の cloud_provider とは独立。
     embed_provider: str | None = None
+    # 埋め込みの 1 回の要求の待ち時間（秒・10〜600）と 1 回に送る件数の上限（1〜200）。未指定(None)・null は既定（60 秒・50 件）。型は StrictInt、範囲は `embed_tuning` が検証する。
+    embed_request_timeout_s: StrictInt | None = None
+    embed_batch_size: StrictInt | None = None
     # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・深く 4 は固定で、設定はこの 1 項目だけ。未指定(None)は `depth_profile.MAX_REVIEW_ROUNDS_DEFAULT`（7）。null は未設定へ戻す。
     max_review_rounds: StrictInt | None = Field(
         default=None, ge=depth_profile.MAX_REVIEW_ROUNDS_MIN, le=depth_profile.MAX_REVIEW_ROUNDS_MAX)
@@ -488,9 +491,9 @@ _ENDPOINT_TEST_TIMEOUT_S = 10  # 接続テスト専用の短いタイムアウ�
 
 def _admin_settings_view() -> dict:
     """GET/PUT 共通の応答。現行値（system_settings の生値）と実効値（既定込みの解決結果）を返す。`configured` は生値（未設定なら null）、`env_default`/`default` は未設定に戻したときの値で、UI の既定表示に使う。"""
-    from sherpa import agentic_search, chat_service, chat_turns, embeddings, impact_service, keys, lens_service, llm
+    from sherpa import agentic_search, chat_turns, embeddings, keys, llm
     from sherpa.ingest import arms as ingest_arms
-    from sherpa.ingest import llm_render
+    from sherpa.ingest import llm_render, ocr_switch
     from sherpa.ingest.arms import legacy_convert, vision_arm
     sysset = store.get_system_settings()
     # `sysset["openai_base_url"]`/`sysset["openai_endpoint_kind"]` は JSONB のため非文字列の破損値がありうる。`llm.openai_endpoint_kind()`/`llm.openai_base_url()` は判定より先に型検査して不正なら `ValueError` を送出するため、両方を同じ try で解決する。管理画面が生値を確認・修正できるよう、表示は落とさず固定文字列へ倒す（`system.py::_INVALID_SAVED_BASE_URL_LABEL` と同じ）。`openai_auth_header_style()`/`openai_api_version()` も内部で `openai_endpoint_kind()` を呼ぶため同じ try に含める。
@@ -594,16 +597,11 @@ def _admin_settings_view() -> dict:
         },
         # 外部の道具の導入状況（sherpa/required_tools.py・短時間キャッシュ）。
         "required_tools": required_tools.snapshot(),
-        # rag.md の LLM 成形トグル。既定 off。ON でも規則版と両立し、既存の成形版は残る。
-        "rag_llm_render": {
-            "configured": sysset.get("rag_llm_render"),  # 生値（未設定=None＝既定に従う）。
-            "effective": llm_render.rag_llm_render_enabled(),  # system>既定（bool）。
-            "default": llm_render.env_default_enabled(),  # 未設定に戻したときの実効（コード既定）。
-            "options": ["on", "off"],
-        },
+        "rag_llm_render": llm_render.admin_view(sysset),
+        "ocr": ocr_switch.admin_view(sysset),
         # 視覚読み取り（vision）の VLM 設定。既定＝ローカル（Ollama）。クラウド（OpenAI）は cloud_allowed=true（管理者が明示許可）のときだけ有効。
         "vlm": {
-            "configured": sysset.get("vlm"),  # 生値（未設定=None＝既定へ）。
+            "configured": sysset.get("vlm"), "invalid": vision_arm.invalid_vlm_provider() is not None,  # configured は生値（未設定=None＝既定へ）。
             # 解決結果（provider/model/cloud_allowed/ollama_url）。provider/model/ollama_url は system>既定（ollama_url は中央の Ollama 接続先）。
             "effective": vision_arm.vlm_config(),
             "default": vision_arm.env_default_vlm(),  # 未設定に戻したときの実効（cloud は常に false）。
@@ -611,10 +609,10 @@ def _admin_settings_view() -> dict:
             "providers": list(vision_arm._KNOWN_PROVIDERS),  # ローカル(ollama)/クラウド(openai)。
             "openai_key_present": bool(vision_arm._openai_key()),  # クラウド選択時のキー未設定案内用。
         },
-        # Ollama 接続先の SSRF allowlist。loopback（localhost・127.0.0.0/8・::1）は常に暗黙許可されるため、ここに出るのはそれ以外（RFC1918 含む）の許可先のみ（`llm.assert_ollama_url_allowed`）。
+        # Ollama 接続先の SSRF allowlist。loopback（localhost・127.0.0.0/8・::1）と中央の既定接続先は常に許可されるため、ここに登録するのはそれ以外に利用者へ選ばせる接続先だけ（`llm.assert_ollama_url_allowed`）。
         "ollama_allowlist": {
-            "configured": sysset.get("ollama_allowlist"),  # 生値（未設定=None＝loopback のみ許可）。
-            # 実際に許可される非 loopback 接続先（DB の admin allowlist のみ・env は初回シード時の一度きりの追加を除き影響しない・`llm._allowlisted_hosts()`）。host:port のみで秘密情報は含まない。
+            "configured": sysset.get("ollama_allowlist"),  # 生値（未設定=None＝loopback と中央の既定接続先だけ許可）。
+            # 実際に許可される非 loopback 接続先（中央の既定接続先＋DB の admin allowlist・env は初回シード時の一度きりの追加を除き影響しない・`llm._allowlisted_hosts()`）。host:port のみで秘密情報は含まない。
             "effective": sorted(f"{h}:{p}" for h, p in llm._allowlisted_hosts(sysset)),
         },
         # Webhook 宛先の SSRF allowlist。`ollama_allowlist` と型は同じだが loopback を暗黙許可せず、ここに出る host:port が許可先の全て（`webhooks.assert_webhook_url_allowed`）。
@@ -642,28 +640,10 @@ def _admin_settings_view() -> dict:
                 "effective": depth_profile.effective_base(sysset, "grep_max_hits", agentic_search.MAX_HITS),
                 "default": agentic_search.MAX_HITS,
             },
-            "qa_max_hits": {
-                "configured": sysset.get("depth_base_qa_max_hits"),
-                "effective": depth_profile.effective_base(
-                    sysset, "qa_max_hits", chat_service.QA_MAX_HITS_DEFAULT),
-                "default": chat_service.QA_MAX_HITS_DEFAULT,
-            },
             "read_window": {
                 "configured": sysset.get("depth_base_read_window"),
                 "effective": depth_profile.effective_base(sysset, "read_window", agentic_search.READ_WINDOW),
                 "default": agentic_search.READ_WINDOW,
-            },
-            "impact_depth": {
-                "configured": sysset.get("depth_base_impact_depth"),
-                "effective": depth_profile.effective_base(
-                    sysset, "impact_depth", impact_service.IMPACT_MAX_DEPTH),
-                "default": impact_service.IMPACT_MAX_DEPTH,
-            },
-            "troubleshoot_depth": {
-                "configured": sysset.get("depth_base_troubleshoot_depth"),
-                "effective": depth_profile.effective_base(
-                    sysset, "troubleshoot_depth", lens_service.TROUBLESHOOT_GRAPH_DEPTH),
-                "default": lens_service.TROUBLESHOOT_GRAPH_DEPTH,
             },
             "codex_reasoning": {
                 "configured": sysset.get("depth_base_codex_reasoning"),
@@ -674,20 +654,7 @@ def _admin_settings_view() -> dict:
             },
         },
         # 埋め込み HTTP の同時送信数（`embeddings.embed()` が `_window_batches` を並列送信する本数）。
-        "embed_provider": {
-            "configured": sysset.get("embed_provider"),
-            "effective": embeddings.effective_embed_provider(sysset),
-            "default": embeddings.EMBED_PROVIDER_DEFAULT,
-            "options": list(embeddings.EMBED_PROVIDERS),
-            "ollama_model": model_catalog.resolve_model("ollama", "embed", None, system_settings=sysset)
-                            or embeddings._MODELS["ollama"][0],
-        },
-        "embed_parallel": {
-            "configured": sysset.get("embed_parallel"),
-            "effective": embeddings.effective_embed_parallel(sysset),
-            "default": embeddings.EMBED_PARALLEL_DEFAULT,
-        },
-        "embed_dim": _embed_dim_view(sysset),
+        **embed_tuning.view(sysset),
         # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・深く 4 はコード固定で、設定はこの 1 項目だけ。
         "max_review_rounds": {
             "configured": sysset.get("max_review_rounds"),
@@ -833,7 +800,7 @@ def _validate_vlm(value):
 
 
 def _validate_ollama_allowlist(value):
-    """`ollama_allowlist` の検証。None/空リストは None（未設定＝loopback のみ許可・`llm.assert_ollama_url_allowed`）。
+    """`ollama_allowlist` の検証。None/空リストは None（未設定＝loopback と中央の既定接続先だけ許可・`llm.assert_ollama_url_allowed`）。
     各エントリは scheme・空白を含まない `host[:port]` の文字列のみ許可し、`llm._canonical_host_port` で `host:port` に正規化して保存する（読取側の比較を文字列一致で済ませ、表記ゆれで迂回できないようにする）。不正な形式・解釈不能なホストは 422。
     """
     if value is None:
@@ -909,12 +876,9 @@ def _validate_secret_key(value, field_label: str):
     return v or None
 
 
-def _validate_central_ollama_url(value, pending_allowlist: list[str] | None = None, *,
-                                 strict_pending: bool = False):
-    """中央既定の Ollama 接続先の検証。空文字/None は未設定（既定 localhost へ）。宛先ポリシーは個人設定の `ollama_url` と同じ `llm.assert_ollama_url_allowed`（loopback／admin allowlist）。
-    `pending_allowlist`（省略可）: 同じ PUT で `ollama_allowlist` も更新されるとき、検証済みの新しい候補値（`_validate_ollama_allowlist` の戻り値）を渡す（DB はまだ更新前のため）。
-    `strict_pending=True`（この PUT で `ollama_url` が実際に新しい値へ変わる場合だけ渡す・`admin_settings_put` 参照）: `pending_allowlist` を置換後の正本として `llm.assert_ollama_url_allowed_in` で検証し、DB の現行 allowlist は見ない。
-    `strict_pending=False`（既定）: DB の現行 allowlist に `extra_allowed` としてこの検証だけ重ねる（URL が変わらない再送を、同時の allowlist 縮小で 422 にしないための緩さ）。
+def _validate_central_ollama_url(value):
+    """中央既定の Ollama 接続先の検証。空文字/None は未設定（既定 localhost へ）。
+    admin が決めた接続先なので許可一覧への登録は要らない（`llm._allowlisted_hosts` が中央の接続先を含める）。形式は `http(s)://host:port` だけを受け付ける（userinfo・path・query は 422）。
     """
     if value is None:
         return None
@@ -924,26 +888,9 @@ def _validate_central_ollama_url(value, pending_allowlist: list[str] | None = No
     if not v:
         return None
     from sherpa import llm
-    try:
-        if strict_pending:
-            allowed = set()
-            for entry in (pending_allowlist or []):
-                hp = llm._canonical_host_port(f"http://{entry}")
-                if hp is not None:
-                    allowed.add(hp)
-            llm.assert_ollama_url_allowed_in(v, allowed)
-        else:
-            extra_allowed = None
-            if pending_allowlist is not None:
-                extra_allowed = set()
-                for entry in pending_allowlist:
-                    hp = llm._canonical_host_port(f"http://{entry}")
-                    if hp is not None:
-                        extra_allowed.add(hp)
-            llm.assert_ollama_url_allowed(v, extra_allowed=extra_allowed)
-    except llm.SsrfBlocked:
-        raise HTTPException(422, "指定された Ollama 接続先は許可されていません"
-                                 "（admin が allowlist に登録した host:port のみ保存できます）")
+    if llm._canonical_host_port(v) is None:
+        raise HTTPException(422, "Ollama の接続先は http://ホスト名:ポート の形で入力してください"
+                                 "（例: http://192.168.0.10:11434）")
     return v
 
 
@@ -986,47 +933,6 @@ def _validate_codex_worker_model(value):
         return None
     if any(ch < " " or ch == "\x7f" for ch in v):
         raise HTTPException(422, "codex_worker_model に制御文字は使えません")
-    return v
-
-
-def _embed_dim_view(sysset: dict) -> dict:
-    """設定画面の `embed_dim`。既定は使っている OpenAI 埋め込みモデルの次元。Ollama のときは `applies` が偽。"""
-    from sherpa import embeddings, llm, model_catalog
-    model = model_catalog.resolve_model("openai", "embed", None, system_settings=sysset) or embeddings._MODELS["openai"][0]
-    try:
-        ollama = (embeddings.effective_embed_provider(sysset) == "ollama"
-                  or llm.resolve_auto_provider(None, system_settings=sysset) == "ollama")
-    except Exception:
-        ollama = False
-    return {
-        "configured": sysset.get("embed_dim"),
-        "effective": embeddings.effective_embed_dim(sysset, model),
-        "default": embeddings.openai_model_default_dim(model),
-        "model_max": embeddings.openai_model_max_dim(model),
-        "min": embeddings.EMBED_DIM_MIN,
-        "max": embeddings.EMBED_DIM_MAX,
-        "applies": not ollama,
-    }
-
-
-def _validate_embed_dim(value):
-    """`embed_dim` の検証。None は未設定（1536）。64〜4096 以外は 422。"""
-    from sherpa import embeddings
-    if value is not None and not embeddings.EMBED_DIM_MIN <= value <= embeddings.EMBED_DIM_MAX:
-        raise HTTPException(422, f"embed_dim は {embeddings.EMBED_DIM_MIN}〜{embeddings.EMBED_DIM_MAX} の整数で指定してください")
-    return value
-
-
-def _validate_embed_provider(value):
-    """`embed_provider` の検証。None は未設定（既定 "auto"）。閉じた語彙以外は 422。"""
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise HTTPException(422, "embed_provider は文字列で指定してください")
-    from sherpa import embeddings
-    v = value.strip().lower()
-    if v not in embeddings.EMBED_PROVIDERS:
-        raise HTTPException(422, f"embed_provider は {'/'.join(embeddings.EMBED_PROVIDERS)} のいずれかで指定してください")
     return v
 
 
@@ -1156,7 +1062,7 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     - codex_session_retention_days: 0 以上の整数（0=無制限）。
     - openai_endpoint_kind/base_url/auth_header/api_version: 種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら実効 base_url が空でないことも確認する。
     - research_default_provider: ollama/openai のみ。"openai" への変更は適用後の実効設定で実送信可能性も確認する。
-    - depth_base_*: 整数 5 項目は範囲検証済み。depth_base_codex_reasoning は定義済みの推論レベルのみ。
+    - depth_base_*: 整数 2 項目は範囲検証済み。depth_base_codex_reasoning は定義済みの推論レベルのみ。
     - chat_max_turns_per_user/chat_max_turns_global: 1〜16／1〜64。agentic_budget_per_result: 1024〜8MiB。
     - workspace_max_bytes: 1MiB〜1GiB。workspace_ttl_days: 0〜3650（0=無期限）。
     - chat_examples: `{enabled, items}`（items は最大 8 件・各 1〜200 文字）。codex_worker_model: 文字列のみ（空文字/null は未設定へ戻す）。codex_mode: standard/plain のみ。
@@ -1184,36 +1090,23 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     # クラウド AI プロバイダの中央設定。
     if "cloud_provider" in provided:
         updates["cloud_provider"] = _validate_cloud_provider(provided["cloud_provider"])
-    if "personal_api_keys_allowed" in provided:
-        # StrictBool が型検証済み（非 bool は pydantic が 422 にする）。
-        updates["personal_api_keys_allowed"] = provided["personal_api_keys_allowed"]
-    if "web_search_allowed" in provided:
-        # StrictBool が型検証済み（非 bool は pydantic が 422 にする）。
-        updates["web_search_allowed"] = provided["web_search_allowed"]
-    if "user_api_keys_allowed" in provided:
-        # StrictBool が型検証済み（非 bool は pydantic が 422 にする）。
-        updates["user_api_keys_allowed"] = provided["user_api_keys_allowed"]
+    for key in ("personal_api_keys_allowed", "web_search_allowed", "user_api_keys_allowed", "ocr_enabled"):
+        if key in provided:
+            updates[key] = provided[key]  # StrictBool が型検証済み（非 bool は pydantic が 422 にする）。
     if "user_api_keys_daily_quota_default" in provided:
         # StrictInt・範囲（1〜1,000,000）は pydantic Field が型検証済み。
         updates["user_api_keys_daily_quota_default"] = provided["user_api_keys_daily_quota_default"]
     if "research_default_provider" in provided:
         updates["research_default_provider"] = _validate_research_default_provider(
             provided["research_default_provider"])
-    # 調べる深さの基準値（整数 5 項目は StrictInt+Field(ge,le) で範囲検証済み）。
-    for _k in ("depth_base_grep_max_hits", "depth_base_qa_max_hits",
-              "depth_base_read_window", "depth_base_impact_depth", "depth_base_troubleshoot_depth"):
+    # 調べる深さの基準値（整数 2 項目は StrictInt+Field(ge,le) で範囲検証済み）。
+    for _k in ("depth_base_grep_max_hits", "depth_base_read_window"):
         if _k in provided:
             updates[_k] = provided[_k]
     if "depth_base_codex_reasoning" in provided:
         updates["depth_base_codex_reasoning"] = _validate_depth_base_codex_reasoning(
             provided["depth_base_codex_reasoning"])
-    if "embed_provider" in provided:
-        updates["embed_provider"] = _validate_embed_provider(provided["embed_provider"])
-    if "embed_parallel" in provided:
-        # StrictInt・範囲（1〜16）は pydantic Field が型検証済み。
-        updates["embed_parallel"] = provided["embed_parallel"]
-    if "embed_dim" in provided:
-        updates["embed_dim"] = _validate_embed_dim(provided["embed_dim"])
+    updates.update(embed_tuning.validated_updates(provided))
     if "max_review_rounds" in provided:
         # StrictInt・範囲は pydantic Field が型検証済み。
         updates["max_review_rounds"] = provided["max_review_rounds"]
@@ -1239,15 +1132,7 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
         if _k in provided:
             updates[_k] = _validate_secret_key(provided[_k], _k)
     if "ollama_url" in provided:
-        # 同じ PUT で ollama_allowlist も更新される場合は、その新しい候補（検証済み）で ollama_url を検証する。
-        _pending_allowlist = updates["ollama_allowlist"] if "ollama_allowlist" in updates else None
-        # URL 自体が実際に新しい値へ変わる場合だけ、pending allowlist を置換後の正本として厳密検証する（strict_pending）。URL が変わらない再送は、同時の allowlist 縮小でそのホストが外れても拒否しない。
-        _strict_pending = False
-        if "ollama_allowlist" in provided and isinstance(provided["ollama_url"], str):
-            _cur_central = (store.get_system_settings().get("ollama_url") or "").strip()
-            _strict_pending = provided["ollama_url"].strip() != _cur_central
-        updates["ollama_url"] = _validate_central_ollama_url(
-            provided["ollama_url"], _pending_allowlist, strict_pending=_strict_pending)
+        updates["ollama_url"] = _validate_central_ollama_url(provided["ollama_url"])
     # OpenAI 互換 API の接続先（4 キー）。
     if "openai_endpoint_kind" in provided:
         updates["openai_endpoint_kind"] = _validate_openai_endpoint_kind(provided["openai_endpoint_kind"])
@@ -1380,6 +1265,124 @@ def admin_openai_endpoint_test(req: OpenaiEndpointTestReq, request: Request):
                                       "openai_endpoint_override": pending},
                                      timeout=_ENDPOINT_TEST_TIMEOUT_S)
     return {"ok": ok, "provider": "openai", "model": model, "detail": "接続OK" if ok else detail}
+
+
+class OllamaTestReq(BaseModel):
+    """管理画面「ローカル AI（Ollama）の既定接続先」の接続テスト（admin 専用・`POST /admin/settings/ollama-test`）。保存前の入力中の値でその場だけ試し、DB は書かない。"""
+    ollama_url: str | None = None  # 空・省略時は保存済みの中央の接続先（無ければ既定 localhost）。
+
+
+_OLLAMA_TEST_MAX_BYTES = 1_048_576
+_OLLAMA_SHOW_MAX_MODELS = 8  # 道具の呼び出しへの対応を確かめるモデル数の上限
+
+
+def _ollama_test_hint(e: Exception, port: int) -> str:
+    """Ollama の接続テストの失敗を、管理者向けの平文の手がかりにする（到達できない理由の区別は出す）。"""
+    import socket
+    import urllib.error
+    if isinstance(e, urllib.error.HTTPError):
+        return f"Ollama から HTTP {e.code} が返りました。接続先が Ollama か確かめてください"
+    reason = e.reason if isinstance(e, urllib.error.URLError) else e
+    if isinstance(reason, ConnectionRefusedError):
+        return ("接続を拒否されました。相手のパソコンで Ollama が起動しているか、"
+                "ほかのパソコンからの接続を受け付ける設定（OLLAMA_HOST=0.0.0.0）で起動しているかを確かめてください")
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return (f"応答がありません（時間切れ）。相手のパソコンのファイアウォールで"
+                f"ポート {port} への接続が許可されているかを確かめてください")
+    if isinstance(reason, socket.gaierror):
+        return "接続先の名前からパソコンを見つけられません。IP アドレスで入力してみてください"
+    if isinstance(e, (ValueError, TypeError)):
+        return "応答を Ollama の応答として読めませんでした。接続先が Ollama か確かめてください"
+    return f"接続できませんでした（{type(reason).__name__}）"
+
+
+@extras_router.post("/admin/settings/ollama-test", tags=["管理者:全体設定"],
+                    response_model=AdminOllamaTestResponse)
+def admin_ollama_test(req: OllamaTestReq, request: Request):
+    """ローカル AI（Ollama）の既定接続先を、保存前の入力中の値でその場だけ試す（admin 専用・`/api/tags` を 1 回と、簡易回答・Codex のモデルへ `/api/show` を数回読む・DB は書かない・プロキシを通さず直接つなぐ）。
+    実行を監査する（`ollama_endpoint.tested`・記録は host:port のみ）。監査の書き込みに失敗したら接続せず 500 で中断する。
+    """
+    import json as _json
+    import time
+    import urllib.request
+
+    from sherpa import keys, llm
+    u = _current_user(request)
+    _require_admin(u)
+    sys_s = store.get_system_settings()
+    # ① 接続先を決めて形式を検証する（入力中の値 → 保存済みの中央 → 既定 localhost・不正なら通信しない）
+    url = (_validate_central_ollama_url(req.ollama_url)
+           or str(keys.resolve_ollama_url(None, system_settings=sys_s) or "").strip())
+    hp = llm._canonical_host_port(url)
+    if hp is None:
+        raise HTTPException(422, "保存されている Ollama の接続先が不正です。接続先を入力し直してください")
+    host = llm.format_host_port(hp[0], hp[1])
+    # ② 接続の前に監査する（host:port だけ）
+    try:
+        store.audit(u["uid"], "ollama_endpoint.tested", "system_settings", None,
+                    detail={"host": host}, outcome="success", severity="info")
+    except Exception:
+        _log.critical("audit write failed for ollama_endpoint.tested (fail-closed) – probe を実行しません")
+        raise HTTPException(500, "接続テストの監査記録に失敗したため中断しました")
+    # ③ /api/tags を読む
+    try:
+        with llm.no_proxy_requests(), llm.urlopen_no_redirect(
+                llm.ollama_url(url, "/api/tags", extra_allowed={hp}, system_settings=sys_s),
+                timeout=_ENDPOINT_TEST_TIMEOUT_S) as r:
+            raw = r.read(_OLLAMA_TEST_MAX_BYTES + 1)
+        if len(raw) > _OLLAMA_TEST_MAX_BYTES:
+            raise ValueError("response too large")
+        data = _json.loads(raw)
+        listed = (data.get("models") if isinstance(data, dict) else None) or []
+        if not isinstance(data, dict) or not isinstance(listed, list):
+            raise TypeError("models is not a list")
+    except Exception as e:
+        return {"ok": False, "host": host, "models": [], "missing": [], "no_tools": [],
+                "detail": _ollama_test_hint(e, hp[1])}
+    names = sorted({str(m.get("name")) for m in listed if isinstance(m, dict) and m.get("name")})
+    # ④ 使えるモデル一覧の Ollama のモデルと突き合わせる（タグ無しは `:latest` とみなす）
+    wanted: set[str] = set()
+    for cell in (model_catalog.get_catalog(sys_s).get("ollama") or {}).values():
+        wanted.update(m for m in (cell.get("allowed") or []) if m)
+        if cell.get("default"):
+            wanted.add(cell["default"])
+    have = set(names)
+    missing = sorted(m for m in wanted if m not in have and f"{m}:latest" not in have)
+    # ⑤ 道具の呼び出しが要るモデル（簡易回答・Codex）のうち取得済みのものへ `/api/show` を送り、`tools` を持たないものを挙げる
+    catalog = model_catalog.get_catalog(sys_s)
+    needs_tools: set[str] = set()
+    defaults: set[str] = set()
+    for provider, usage in (("ollama", "subsearch"), ("codex", "codex")):
+        cell = (catalog.get(provider) or {}).get(usage) or {}
+        needs_tools.update(m for m in (cell.get("allowed") or []) if m)
+        default = cell.get("default") or model_catalog.hardcoded_fallback(provider, usage)
+        if default:
+            needs_tools.add(default)
+            defaults.add(default)
+    targets = sorted((m for m in needs_tools if m in have or f"{m}:latest" in have),
+                     key=lambda m: (m not in defaults, m))
+    no_tools: list[str] = []
+    started = time.monotonic()
+    for m in targets[:_OLLAMA_SHOW_MAX_MODELS]:
+        left = _ENDPOINT_TEST_TIMEOUT_S - (time.monotonic() - started)
+        if left <= 0:
+            break
+        try:
+            show_req = urllib.request.Request(
+                llm.ollama_url(url, "/api/show", extra_allowed={hp}, system_settings=sys_s),
+                data=_json.dumps({"model": m}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with llm.no_proxy_requests(), llm.urlopen_no_redirect(show_req, timeout=left) as r:
+                raw = r.read(_OLLAMA_TEST_MAX_BYTES + 1)
+            if len(raw) > _OLLAMA_TEST_MAX_BYTES:
+                continue
+            caps = _json.loads(raw).get("capabilities")
+        except Exception:
+            continue
+        if isinstance(caps, list) and "tools" not in caps:
+            no_tools.append(m)
+    return {"ok": True, "host": host, "models": names, "missing": missing, "no_tools": sorted(no_tools),
+            "detail": "接続OK"}
 
 
 def _validate_allowed_worlds_or_error(allowed_worlds: list[str] | None) -> None:

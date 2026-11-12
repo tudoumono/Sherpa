@@ -81,7 +81,7 @@ KNOWN_VIA = frozenset({
     "call", "extends", "implements", "inject", "field_type", "include", "import", "copy",
     "mention",
     "bean_class", "mapper_type", "mapper_namespace", "action_class", "config_value", "config_key",
-    "exec_sql", "exec_proc", "include_member", "cics_xctl", "cics_link", "mapper_sql", "vba_sql",
+    "exec_sql", "exec_proc", "include_member", "cics_xctl", "cics_link", "mapper_sql", "vba_sql", "string_sql",
     "use", "write_file", "read_file",
 })
 
@@ -90,7 +90,7 @@ VIA_PRIORITY = (
     "bean_class", "mapper_type", "mapper_namespace", "action_class", "config_key", "config_value",
     "cics_xctl", "cics_link",
     "call", "extends", "implements", "inject", "field_type", "include", "import", "copy", "exec_sql",
-    "vba_sql", "mapper_sql", "exec_proc", "include_member",
+    "string_sql", "vba_sql", "mapper_sql", "exec_proc", "include_member",
     "write_file", "read_file", "use",
 )
 
@@ -220,29 +220,6 @@ class RefResult:
     file_io: list = field(default_factory=list)
     dd_bindings: list = field(default_factory=list)
     proc_names: dict = field(default_factory=dict)
-
-
-def body_end_line(sanitized: str, decl_end: int, scan_limit: int = 4000) -> int:
-    """型宣言の本体 `{ ... }` の閉じ括弧の行（1 始まり）を返す。
-
-    `sanitized` はコメント・文字列を空白化した本文。`decl_end` 以降 `scan_limit` 文字の内で最初の `{` を本体の開きとし、対応する `}` の行を返す。
-    開きの前に `;` がある（本体の無い宣言）・開きが見つからない場合は宣言行、閉じない場合は最終行を返す。
-    """
-    window_end = min(len(sanitized), decl_end + scan_limit)
-    brace = sanitized.find("{", decl_end, window_end)
-    semi = sanitized.find(";", decl_end, window_end)
-    if brace == -1 or (semi != -1 and semi < brace):
-        return sanitized.count("\n", 0, decl_end) + 1
-    depth = 0
-    for i in range(brace, len(sanitized)):
-        ch = sanitized[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return sanitized.count("\n", 0, i) + 1
-    return sanitized.count("\n") + 1
 
 
 class Analyzer:

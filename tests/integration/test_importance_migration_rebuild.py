@@ -23,6 +23,7 @@ from _world_registry import register_test_world
 
 from sherpa import es_index, store, worlds
 from sherpa.ingest import worker, world_neo4j
+from tests._replace_row import offline_row
 
 WORLD = "importance_schema_version_rebuild_test"
 CONTROL_DOC = "4期/_重要度.txt"
@@ -44,7 +45,7 @@ def _cleanup_world(wid):
     実行での自然な上書きに頼れず、明示的に両方を後始末する。
     """
     try:
-        store.replace_documents(wid, [])
+        store.replace_documents(wid, [], row=offline_row(wid))
     except Exception:
         pass
     shutil.rmtree(worlds.derived_dir(wid), ignore_errors=True)
@@ -81,13 +82,13 @@ def test_legacy_world_first_sync_clears_control_file_from_ledger_and_neo4j():
              "branch": "source", "original_path": None, "md_path": None, "status": "indexed"},
             {"name": CONTROL_DOC, "layer": "version", "scope_path": "4期", "doctype": "テキスト",
              "branch": "office", "original_path": None, "md_path": None, "status": "indexed"},
-        ])
+        ], row=offline_row(wid))
         env = world_neo4j._env()
         world_neo4j.load_world(
             [{"cid": FAKE_RULE_CID, "label": "Document", "name": "偽ルール", "world_id": wid,
              "top_scope": "4期", "phase": None, "category": None, "path": None, "scope_path": None,
              "value": None, "status": "active"}],
-            [], wid, env["uri"], env["user"], env["pw"])
+            [], wid, env["uri"], env["user"], env["pw"], row=offline_row(wid))
 
         res = worker.sync(wid)
 
@@ -141,7 +142,7 @@ def test_importance_schema_version_bump_repopulates_null_columns_on_next_sync(mo
         store.replace_documents(wid, [
             {"name": "a.cpy", "layer": "version", "scope_path": None, "doctype": "copybook",
              "branch": "source", "original_path": None, "md_path": None, "status": "indexed"},
-        ])
+        ], row=offline_row(wid))
 
         res = worker.sync(wid)
 
@@ -153,7 +154,7 @@ def test_importance_schema_version_bump_repopulates_null_columns_on_next_sync(mo
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_documents_endpoint_reflects_importance_from_real_ingest(auth_disabled):
+def test_documents_endpoint_does_not_expose_importance_after_real_ingest(auth_disabled):
     """RV2是正#b3③: `tests/api/test_ledger_p3.py::test_documents_endpoint_uses_ledger_when_populated`
     は importance 3列を手投入しており、`_ledger_rows`（ingest 時の実解決・materialize）と
     既存デプロイの移行（旧行 importance=NULL → 次回 sync で再構築）を検証していなかった。
@@ -181,9 +182,7 @@ def test_documents_endpoint_reflects_importance_from_real_ingest(auth_disabled):
         c = TestClient(app)
         body = c.get("/documents", params={"world": wid}).json()
         by_name = {d["name"]: d for d in body["documents"]}
-        assert by_name["a.cpy"]["importance"] == "高"
-        assert by_name["a.cpy"]["importance_reason"] == "一次資料"
-        assert by_name["b.cpy"]["importance"] == "高"
+        assert not any(k.startswith("importance") for d in by_name.values() for k in d)
     finally:
         _cleanup_world(wid)
         shutil.rmtree(root, ignore_errors=True)
@@ -210,11 +209,11 @@ def test_es_mapping_version_bump_triggers_reindex_on_next_sync(monkeypatch):
         store.replace_documents(wid, [
             {"name": "a.md", "layer": "version", "scope_path": None, "doctype": "設計書",
              "branch": "source", "original_path": None, "md_path": None, "status": "indexed"},
-        ])
+        ], row=offline_row(wid))
 
         # ES へは旧マッピング版（"3"）で索引済みの状態を作る。
         monkeypatch.setattr(es_index, "ES_MAPPING_VERSION", "3")
-        setup_result = es_index.index_world(wid, content_sig=sig)
+        setup_result = es_index.index_world(wid, content_sig=sig, row=offline_row(wid))
         assert setup_result.get("available") is True and not setup_result.get("error"), \
             f"前提の索引セットアップ自体が失敗している: {setup_result}"
         meta_before = es_index._index_meta(wid)

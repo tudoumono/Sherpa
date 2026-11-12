@@ -4,7 +4,11 @@
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import json
 import math
+import os
 import time
 
 from psycopg.types.json import Json
@@ -30,8 +34,20 @@ class OpenAIEndpointSettingsConflict(ValueError):
     """`openai_endpoint_kind`/`openai_base_url` の書込み直前（advisory lock 取得後）に読み直した実効値が、kind が openai 以外なら base_url も必要という整合を満たさなかった（`admin_settings_put` が 422 に変換する）。"""
 
 
+CHILD_SNAPSHOT_ENV = "SHERPA_MCP_SETTINGS"
+
+
+def _child_snapshot() -> dict | None:
+    """調べものの道具の子プロセスが親から受け取った設定の写し（子以外は None）。"""
+    raw = os.environ.get(CHILD_SNAPSHOT_ENV)
+    return json.loads(raw) if raw else None
+
+
 def get_settings(user_id="admin") -> dict:
     """ユーザの頭脳/モデル/キー設定（行が無ければ既定）。キーも含むためサーバ内部用。"""
+    snapshot = _child_snapshot()
+    if snapshot is not None:
+        return {**_SETTINGS_DEFAULT, **snapshot["user"]}
     _ensure()
     with _connect() as c:
         row = c.execute(
@@ -104,6 +120,9 @@ def _read_system_settings_fresh(*, connect_timeout: float | None = None,
     """system_settings 全件を DB から直接読む（共有キャッシュ `_system_settings_cache` を参照も更新もしない）。
     `get_system_settings()` のキャッシュミス時の実体で、timeout 予算の配分は同一。`providers/__init__.py::get_provider` はこちらを直接呼び、他スレッドのキャッシュ状態に依らない値を得る。
     """
+    snapshot = _child_snapshot()
+    if snapshot is not None:
+        return dict(snapshot["system"])
     budget_started = time.monotonic()
     _ensure(connect_timeout=connect_timeout)
     connect_kwargs = {}
@@ -123,6 +142,24 @@ def _read_system_settings_fresh(*, connect_timeout: float | None = None,
     return {r["key"]: r["value"] for r in rows}
 
 
+_SYSTEM_SETTINGS_PINNED: contextvars.ContextVar = contextvars.ContextVar("system_settings_pinned", default=None)
+
+
+@contextlib.contextmanager
+def pinned_system_settings(snapshot: dict | None = None):
+    """with の間、`get_system_settings` が返す値を 1 つに固定する（取り込み 1 回の作りかけが途中で変わった設定を混ぜないため）。`snapshot` が無ければ今の値を始めに 1 回読む。"""
+    try:
+        pin = dict(snapshot) if snapshot is not None else get_system_settings()
+    except Exception:   # 設定を読めない文脈（DB 停止中）は固定せず、各呼び出しが従来どおり読めないことを扱う
+        yield
+        return
+    token = _SYSTEM_SETTINGS_PINNED.set(pin)
+    try:
+        yield
+    finally:
+        _SYSTEM_SETTINGS_PINNED.reset(token)
+
+
 def get_system_settings(*, connect_timeout: float | None = None,
                         statement_timeout_ms: int | None = None) -> dict:
     """全体設定（system_settings 全件）を `{key: value}` で返す（未設定キーは含まれない・admin 未設定なら空 dict）。短TTLキャッシュ付きで、返り値は都度コピー。value は JSONB の論理値。
@@ -130,6 +167,9 @@ def get_system_settings(*, connect_timeout: float | None = None,
     キャッシュに触れずに必ず DB から読みたい呼び出し元は、この関数のシグネチャを変えず `_read_system_settings_fresh()` を直接呼ぶ。
     """
     global _system_settings_cache, _system_settings_cache_ts
+    pin = _SYSTEM_SETTINGS_PINNED.get()
+    if pin is not None:
+        return dict(pin)
     now = time.monotonic()
     cached = _system_settings_cache
     if cached is not None and now - _system_settings_cache_ts < _SYSTEM_SETTINGS_CACHE_TTL:
@@ -259,7 +299,31 @@ def set_system_settings(uid, updates: dict, secret_keys: frozenset | None = None
         _facade._audit_insert(c, uid, "system_settings.updated", "system_settings", None,
                       before_state=audit_before, after_state=audit_after, severity="warning")
     _invalidate_system_settings_cache()
+    from sherpa import proxy_bypass  # 遅延 import（循環回避）。Ollama の接続先・許可リストの変更をプロキシの例外へ反映する
+    proxy_bypass.apply()
     return updates
+
+
+def modify_system_setting(uid, key: str, mutate) -> object:
+    """`system_settings` の 1 キーを、読み取り・変更・書き込みを 1 つのトランザクション（`_ENV_SEED_LOCK` の advisory lock と行ロック）の中で行う。
+    `mutate(現在の値 or None)` が新しい値（None は行の削除）を返す。同じキーを同時に保存する別の呼び出しの変更を失わない。
+    監査（`system_settings.updated`・before/after）と設定キャッシュの無効化は `set_system_settings` と同じ。戻り値は書いた値。
+    """
+    _ensure()
+    from sherpa import store as _facade
+    with _connect() as c:
+        c.execute("SELECT pg_advisory_xact_lock(%s)", (_ENV_SEED_LOCK,))
+        row = c.execute("SELECT value FROM system_settings WHERE key=%s FOR UPDATE", (key,)).fetchone()
+        before = row["value"] if row else None
+        new = mutate(before)
+        if new == before:
+            return new  # 変えるものが無ければ書かず、監査も残さない
+        _system_settings_apply(c, {key: new}, uid)
+        _facade._audit_insert(c, uid, "system_settings.updated", "system_settings", None,
+                              before_state=_redact_secret_settings({key: before}), after_state=_redact_secret_settings({key: new}),
+                              severity="warning")
+    _invalidate_system_settings_cache()
+    return new
 
 
 # 固定 advisory lock key（"SEED"）。env→system_settings シード試行を直列化し、`set_system_settings` にも同じ lock を取らせて、`ollama_url`/`ollama_allowlist` の行ロック取得順序が経路ごとに違ってもデッドロックしないようにする。
@@ -267,16 +331,12 @@ _ENV_SEED_LOCK = 0x53454544
 
 
 def seed_system_settings_once(updates: dict, guard_key: str,
-                              secret_keys: frozenset | None = None, *,
-                              ollama_allowlist_merge: tuple[str, str] | None = None) -> tuple[dict, dict]:
+                              secret_keys: frozenset | None = None) -> tuple[dict, dict]:
     """env→system_settings の初回シード専用の書込み（`sherpa.api._seed_settings_from_env`/`_seed_ollama_url_from_env` 専用）。
     `set_system_settings` と違い既存の行を上書きしない。各 INSERT は `guard_key`（完了マーカー）の行がその INSERT の時点で存在しない場合に限り実行する（`WHERE NOT EXISTS` を INSERT 文へ埋め込む）。`_ENV_SEED_LOCK` は `set_system_settings` とも共有し、複数行書込みの行ロック順序差によるデッドロックを防ぐ。
-    `ollama_allowlist_merge`（省略可）: `(url_key, host_entry)`。`url_key` が実際に新規 INSERT できたときだけ、`host_entry`（正規化済み host:port）を `ollama_allowlist` の現在値へ追記する（`SELECT ... FOR UPDATE` で最新値を読む）。`updates` に `ollama_allowlist` を含めると `ValueError`。
-    戻り値: `(applied, conflicts)`。`applied` は実際に INSERT/マージされた `{key: value}`、`conflicts` は INSERT がスキップされた `{key: 現在の DB 値（無ければ None）}`。
+    戻り値: `(applied, conflicts)`。`applied` は実際に INSERT された `{key: value}`、`conflicts` は INSERT がスキップされた `{key: 現在の DB 値（無ければ None）}`。
     """
     _ensure()
-    if ollama_allowlist_merge is not None and "ollama_allowlist" in updates:
-        raise ValueError("ollama_allowlist_merge 使用時は updates に ollama_allowlist を含められません")
     from sherpa import store as _facade
     applied: dict = {}
     conflicts: dict = {}
@@ -294,42 +354,22 @@ def seed_system_settings_once(updates: dict, guard_key: str,
             else:
                 cur = c.execute("SELECT value FROM system_settings WHERE key=%s", (k,)).fetchone()
                 conflicts[k] = cur["value"] if cur else None
-        before_allowlist = None
-        if ollama_allowlist_merge is not None:
-            url_key, host_entry = ollama_allowlist_merge
-            if url_key in applied and host_entry:
-                # 先に行を確保（ON CONFLICT DO NOTHING）してから `FOR UPDATE` する（行が無いままではロックできない）。
-                c.execute(
-                    "INSERT INTO system_settings (key, value, updated_by) VALUES "
-                    "('ollama_allowlist', '[]'::jsonb, 'system') ON CONFLICT (key) DO NOTHING")
-                al_row = c.execute(
-                    "SELECT value FROM system_settings WHERE key='ollama_allowlist' FOR UPDATE").fetchone()
-                current = list((al_row["value"] if al_row else None) or [])
-                before_allowlist = current
-                if host_entry not in current:
-                    merged = [*current, host_entry]
-                    c.execute(
-                        "UPDATE system_settings SET value=%s, updated_at=now(), updated_by='system' "
-                        "WHERE key='ollama_allowlist'", (Json(merged),))
-                    applied["ollama_allowlist"] = merged
         if applied:
-            audit_before = {"ollama_allowlist": before_allowlist} if before_allowlist is not None else None
             # `secret_keys` の有無に関わらず常に畳む（env シードで取り込む URL も生のまま audit_log へ残さない）。
             audit_after = _redact_secret_settings(applied, secret_keys)
             _facade._audit_insert(c, "system", "system_settings.env_seeded", "system_settings", None,
-                          before_state=audit_before, after_state=audit_after, severity="info")
+                          before_state=None, after_state=audit_after, severity="info")
     if applied:
         _invalidate_system_settings_cache()
     return applied, conflicts
 
 
 def count_users_with_personal_keys() -> int:
-    """個人秘密キー（openai か、閉じたプロバイダ gemini/bedrock の旧キー列）を保存中のユーザー数（`personal_api_keys_allowed` を OFF にする前の確認ダイアログ用）。"""
+    """個人の OpenAI キーを保存中のユーザー数（`personal_api_keys_allowed` を OFF にする前の確認ダイアログ用）。"""
     _ensure()
     with _connect() as c:
         row = c.execute(
-            "SELECT count(*) AS n FROM user_settings WHERE "
-            "openai_api_key IS NOT NULL OR gemini_api_key IS NOT NULL OR bedrock_api_key IS NOT NULL"
+            "SELECT count(*) AS n FROM user_settings WHERE openai_api_key IS NOT NULL"
         ).fetchone()
     return int(row["n"]) if row else 0
 
@@ -363,7 +403,7 @@ def seed_user_agent_once(agent: str, guard_key: str, version: int) -> int:
 
 
 def purge_personal_api_keys(actor: str = "system") -> int:
-    """`personal_api_keys_allowed` が偽のとき、全ユーザーの個人秘密キーを NULL へ一括削除する。呼び出し側（管理画面の保存時・起動時）が偽のときに呼ぶ。
+    """`personal_api_keys_allowed` が偽のとき、全ユーザーの個人の OpenAI キーを NULL へ一括削除する。呼び出し側（管理画面の保存時・起動時）が偽のときに呼ぶ。
     冪等: 既に NULL の行は対象外で、実際に変更した行数だけが `RETURNING` に乗る。0件のときは監査行も作らない。
     `_PERSONAL_KEY_LOCK` を `update_settings()` の個人キー書込みと共有する。
     """
@@ -372,9 +412,8 @@ def purge_personal_api_keys(actor: str = "system") -> int:
     with _connect() as c:
         c.execute("SELECT pg_advisory_xact_lock(%s)", (_PERSONAL_KEY_LOCK,))
         rows = c.execute(
-            "UPDATE user_settings SET openai_api_key=NULL, gemini_api_key=NULL, bedrock_api_key=NULL, "
-            "  updated_at=now() "
-            "WHERE openai_api_key IS NOT NULL OR gemini_api_key IS NOT NULL OR bedrock_api_key IS NOT NULL "
+            "UPDATE user_settings SET openai_api_key=NULL, updated_at=now() "
+            "WHERE openai_api_key IS NOT NULL "
             "RETURNING user_id").fetchall()
         count = len(rows)
         if count:

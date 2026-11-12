@@ -108,16 +108,17 @@ function renderTable(components) {
 }
 
 // バックエンドに到達できない場合（PostgreSQL/認証データベース停止等）のフォールバック表示。
-function renderUnreachable() {
+function renderUnreachable(e) {
   const pill = $('status-pill');
   pill.className = 'status-pill danger';
   pill.textContent = '接続不可';
   $('checked-at').textContent = '最終チェック: —';
   const tbody = $('health-tbody');
-  tbody.innerHTML = '<tr class="empty-row"><td colspan="5">'
-    + 'バックエンドに到達できません（PostgreSQL/認証データベース停止の可能性）。'
-    + 'ターミナルで make up を実行して復旧を確認してください。'
-    + '</td></tr>';
+  const reason = e && e.status && e.status !== 503
+    ? `状態を取得できませんでした: ${esc(e.message)}`
+    : 'バックエンドに到達できません（PostgreSQL/認証データベース停止の可能性）。'
+      + 'ターミナルで make up を実行して復旧を確認してください。';
+  tbody.innerHTML = `<tr class="empty-row"><td colspan="5">${reason}</td></tr>`;
 }
 
 // ===== 取得 =====
@@ -128,7 +129,7 @@ async function loadHealth(refresh) {
     renderBanner(d);
     renderTable(d.components || []);
   } catch (e) {
-    renderUnreachable();
+    renderUnreachable(e);
     toast('システム状態の取得に失敗しました');
   }
 }
@@ -147,21 +148,6 @@ $('recheck-btn').addEventListener('click', () => {
   showChecking();
   loadHealth(true).finally(() => { btn.disabled = false; btn.textContent = orig; });
 });
-
-// テーマ切替
-function applyThemeIcon() {
-  const tb = $('themebtn');
-  if (tb) tb.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙';
-}
-const themebtn = $('themebtn');
-if (themebtn) {
-  themebtn.addEventListener('click', () => {
-    const d = document.documentElement;
-    const next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-    d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
-  });
-}
-applyThemeIcon();
 
 // ===== 初期化 =====
 // タイマーは1つだけ保持（多重登録防止）。状態が確定するまでは init() 自体を再実行して

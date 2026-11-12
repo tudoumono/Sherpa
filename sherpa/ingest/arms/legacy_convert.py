@@ -1117,14 +1117,16 @@ def _build_convert_cmd(bin_path: str, fmt: str, outdir, profile, src: Path) -> l
             f"-env:UserInstallation={Path(profile).as_uri()}", str(Path(src).resolve())]
 
 
-# .xls の保存値を残す変換用の Basic マクロ。LibreOffice は .xls の読み込み後に数式セルを再計算する設定を持たず、自動計算が有効なまま保存すると保存値が再計算値に置き換わる。自動計算を切ってから保存する。
+# .xls の保存値を残す変換用の Basic マクロ。LibreOffice は .xls の読み込み後に数式セルを再計算する設定を持たず、自動計算が有効なまま保存すると保存値が再計算値に置き換わる。自動計算を切ってから保存する。読み込みでは外部リンクを更新せず（UpdateDocMode=NO_UPDATE）、資料内のマクロも実行しない（MacroExecutionMode=NEVER_EXECUTE）。保存値のまま、届かない共有先を待たない。
 _KEEP_VALUES_MODULE = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE script:module PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "module.dtd">
 <script:module xmlns:script="http://openoffice.org/2000/script" script:name="Module1" script:language="StarBasic">
 Sub ConvertXlsx(sIn As String, sOut As String)
-  Dim a(0) As New com.sun.star.beans.PropertyValue
+  Dim a(2) As New com.sun.star.beans.PropertyValue
   Dim b(0) As New com.sun.star.beans.PropertyValue
   a(0).Name = "Hidden" : a(0).Value = True
+  a(1).Name = "UpdateDocMode" : a(1).Value = 0
+  a(2).Name = "MacroExecutionMode" : a(2).Value = 0
   doc = StarDesktop.loadComponentFromURL(ConvertToURL(sIn), "_blank", 0, a())
   doc.enableAutomaticCalculation(False)
   b(0).Name = "FilterName" : b(0).Value = "Calc MS Excel 2007 XML"
@@ -1133,11 +1135,13 @@ Sub ConvertXlsx(sIn As String, sOut As String)
 End Sub
 
 Function ConvertOne(sIn As String, sOut As String) As Boolean
-  Dim a(0) As New com.sun.star.beans.PropertyValue
+  Dim a(2) As New com.sun.star.beans.PropertyValue
   Dim b(0) As New com.sun.star.beans.PropertyValue
   Dim doc As Object
   On Error GoTo Failed
   a(0).Name = "Hidden" : a(0).Value = True
+  a(1).Name = "UpdateDocMode" : a(1).Value = 0
+  a(2).Name = "MacroExecutionMode" : a(2).Value = 0
   doc = StarDesktop.loadComponentFromURL(ConvertToURL(sIn), "_blank", 0, a())
   doc.enableAutomaticCalculation(False)
   b(0).Name = "FilterName" : b(0).Value = "Calc MS Excel 2007 XML"
@@ -1157,6 +1161,8 @@ Sub ConvertXlsxBatch(sDir As String, sOutDir As String)
   Dim i As Long
   i = 0
   Do While FileExists(sDir &amp; "/" &amp; i &amp; ".xls")
+    Open sOutDir &amp; "/" &amp; i &amp; ".start" For Output As #1
+    Close #1
     If ConvertOne(sDir &amp; "/" &amp; i &amp; ".xls", sOutDir &amp; "/" &amp; i &amp; ".xlsx") Then
       Open sOutDir &amp; "/" &amp; i &amp; ".ok" For Output As #1
       Close #1
@@ -1191,9 +1197,9 @@ def _convert_xls_keep_values(bin_path: str, src: Path, profile: str, outdir: str
 
 def _convert_xls_keep_values_batch(bin_path: str, work: str, profile: str, outdir: str, label: str,
                                    timeout: float, tracker: "SofficeTracker") -> None:
-    """`work/{i}.xls`（i=0,1,…）を、保存値を再計算せず `outdir/{i}.xlsx` へまとめて変換する。1 件ごとに成功したものだけ `outdir/{i}.ok` を残す。
+    """`work/{i}.xls`（i=0,1,…）を、保存値を再計算せず `outdir/{i}.xlsx` へまとめて変換する。1 件ごとに、読み込みの直前に開始の印 `outdir/{i}.start` を、成功したものだけ `outdir/{i}.ok` を残す。
 
-    ① プロファイルを 1 回初期化 ② マクロを差し込む ③ マクロ 1 回の起動で全件を順に変換する。呼び出し側は `.ok` のあるものだけを採る（途中で止まっても済んだ分は使える）。
+    ① プロファイルを 1 回初期化 ② マクロを差し込む ③ マクロ 1 回の起動で全件を順に変換する。呼び出し側は `.ok` のあるものだけを採る（途中で止まっても済んだ分は使える）。`.start` の更新時刻が、その資料の変換の開始時刻。
     """
     uri = Path(profile).as_uri()
     if not _run_soffice([bin_path, "--headless", "--terminate_after_init", f"-env:UserInstallation={uri}"],

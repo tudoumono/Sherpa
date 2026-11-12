@@ -12,7 +12,7 @@ Sherpa 管理のベーススキル（自作）。型は「変更対象を特定�
 ## 1. 最初に開くもの（当たりの付け方）
 
 1. 変更対象（例: 税率・項目名・プログラム名）を `ripgrep_search(query=...)` で特定する（ソースを探せるのはこれだけ。
-   `es_search` は設計書などの資料が対象でソースは含まない）。名前が1つでも判明したら、以降は grep を反復するより関係グラフで辿るほうが早い。
+   `es_search` は設計書などの資料が対象でソースは含まない。資料で見つけた識別子もそのままソースから探す。言語によってはソース中の SQL はグラフに出ないので、グラフに無くても未使用とは言えない）。名前が1つでも判明したら、以降は grep を反復するより関係グラフで辿るほうが早い。
 2. 判明した名前を起点に、**2 段**で影響先を求める。①`graph_resolve(name=..., path=..., kind=...)` で起点の候補を並べ
    （同名の別ノードは別の候補＝`path` と `qualified_name` で見分ける）、正しい 1 件の `canonical_id` を選ぶ。②その
    `canonical_id` を `graph_impact(canonical_id=...)` へ渡すと、構造の依存（COPIES／CONTAINS／INVOKES／ACCESSES）だけを
@@ -40,19 +40,11 @@ CONTAINS だけで構成された経路は影響の根拠にしてよい。**向
 
 ```python
 # 影響先候補（例: JCL・COBOL ソース・設定ファイル）を直接開いて、変更対象の名前がどこでどう
-# 参照されているかを確認する。src/ は CP932（Shift_JIS）のことがあるため、決め打ちで utf-8
-# 置換読みにせず実際の符号化を判定してから読む（BOM・strict UTF-8 を優先し、
-# それ以外は置換文字が少ない場合だけ CP932 を選ぶ）。
+# 参照されているかを確認する。src/ は CP932（Shift_JIS）や EUC-JP のことがある。文字コードを Python で
+# 推測せず、UTF-8 で読めない原本は read_doc（Sherpa の共通の判定で読む）で読む。
 def read_src(p):
-    with open(p, "rb") as f:
-        b = f.read()
-    if b.startswith(b"\xef\xbb\xbf"):
-        return b[3:].decode("utf-8", "replace")
-    try:
-        return b.decode("utf-8")
-    except UnicodeDecodeError:
-        u, c = b.decode("utf-8", "replace"), b.decode("cp932", "replace")
-        return c if c.count("�") < u.count("�") else u
+    with open(p, encoding="utf-8-sig") as f:
+        return f.read()   # UnicodeDecodeError ＝ CP932・EUC-JP の原本。その原本は read_doc で読む
 
 target_name = "TAXRATE"   # 変更対象の名前（例）
 for i, line in enumerate(read_src(candidate_path).splitlines(), start=1):
@@ -86,8 +78,8 @@ Excel/Word/PowerPoint/PDF の設計書側に影響先の記述があるときは
 - 影響先候補が複数に割れて経路の有無だけでは決め手がないときは、`ask_user` で起点や影響先の絞り込みを
   確認してよい（1実行につき1回まで）。
 - 影響先を「すべて」求められた場合も同じ完了条件——波及経路を辿り切ってから答える（検索3回・根拠1件
-  では終えない）。`graph_neighbors` の結果に `truncated:true` が付いたら近傍は部分集合（`count` が総数・
-  続きは取れない）＝その範囲を未確認として明示し「すべて」「影響なし」と書かない。
+  では終えない）。`graph_neighbors` の結果に `truncated:true` が付いたら近傍は部分集合（`count` が総数）
+  ＝`next_offset` があれば `offset` に渡して続きを取り、無ければ（時間切れ・取得の天井）その範囲を未確認として明示し「すべて」「影響なし」と書かない。
 - **中断**（利用者停止・通信エラー・既存の反復／情報量予算への到達）のときは、確認済みの経路・
   未確認の範囲・中断理由を分けて書き、部分結果を「すべて」「影響なし」と断定しない。
 

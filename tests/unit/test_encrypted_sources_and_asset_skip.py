@@ -16,7 +16,9 @@ import pytest
 
 from sherpa import log_setup
 from sherpa.ingest import encryption, evidence_spike, failure_reasons, legacy_provenance, office_md
+from sherpa.ingest.evidence import api as evidence_api, pdf_xobject as evidence_pdf_xobject
 from sherpa.ingest.arms import legacy_convert
+from tests._replace_row import offline_row
 
 _BODY = "BODYTEXT_ALPHA_9137"
 
@@ -25,7 +27,7 @@ _BODY = "BODYTEXT_ALPHA_9137"
 def _env(monkeypatch):
     monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     monkeypatch.setenv("SHERPA_MD_WORKERS", "1")
-    monkeypatch.delenv(office_md._OCR_ENABLED_ENV, raising=False)
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
 
 
 def _pdf_with_image(path: Path, text: str = _BODY) -> Path:
@@ -140,7 +142,7 @@ def _plain_samples() -> dict[str, bytes]:
 
 
 def _build(src: Path, derived: Path) -> dict:
-    return office_md.build_derived(src, derived)
+    return office_md.build_derived(src, derived, row=offline_row("w"))
 
 
 def _rows(caplog) -> list[logging.LogRecord]:
@@ -323,7 +325,7 @@ def test_conversion_warning_appears_once_across_convert_log_and_run_log(tmp_path
 def test_image_hash_mismatch_drops_only_that_image_and_keeps_the_body(tmp_path, monkeypatch, caplog):
     src = tmp_path / "src"
     _pdf_with_image(src / "sub" / "photo.pdf")
-    real = evidence_spike._pdf_image_payload
+    real = evidence_pdf_xobject._pdf_image_payload
 
     def changed_on_reextract(xobject, name):
         import sys
@@ -332,7 +334,8 @@ def test_image_hash_mismatch_drops_only_that_image_and_keeps_the_body(tmp_path, 
             raw = b"\0" + raw                                                  # 取り直した bytes が控えと食い違う
         return image_name, raw, image
 
-    monkeypatch.setattr(evidence_spike, "_pdf_image_payload", changed_on_reextract)
+    monkeypatch.setattr(evidence_pdf_xobject, "_pdf_image_payload", changed_on_reextract)
+    monkeypatch.setattr(evidence_api, "_pdf_image_payload", changed_on_reextract)
     caplog.set_level(logging.INFO)
     derived = tmp_path / "out" / "md"
     rep = _build(src, derived)
@@ -364,6 +367,7 @@ def test_extract_assets_raises_without_a_skip_list_so_other_callers_keep_their_c
 
 def test_summary_line_counts_cache_restored_and_failures():
     line = office_md._convert_summary_line(
-        10, 8, 5, 2, 0, [{"doc": "a.xlsx", "reason": "size_exceeded"}, {"doc": "b.pdf", "reason": "password_protected"}], [])
-    assert line == ("MD化が終わりました: 対象 10 件・変換 8 件（うちキャッシュから 5 件）"
+        10, 8, 5, 2, 0, [{"doc": "a.xlsx", "reason": "size_exceeded"}, {"doc": "b.pdf", "reason": "password_protected"}], [],
+        content_cache_restored=3)
+    assert line == ("MD化が終わりました: 対象 10 件・変換 8 件（うちキャッシュから 5 件・内容一致 3 件）"
                     "・失敗 2 件（サイズ超過 1・パスワード保護／暗号化 1）・対象外 0 件")

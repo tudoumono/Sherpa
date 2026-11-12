@@ -1,17 +1,17 @@
 """R3-S3: worlds.rebind/delete の world_lock 直列化＋自己デッドロック非再発（要 Postgres＋Neo4j）。
 
 `worlds.rebind`/`worlds.delete` は外側で `store.world_lock` を**1回だけ**取り、内側では lock-free の
-`worker._run_locked`/`worker._wipe_locked` を直接呼ぶ（`worker.run`/`worker.wipe_world` は各自ロックを
+`worker._run_locked`/`wipe.wipe_locked` を直接呼ぶ（`worker.run` は自らロックを
 取るため、外側で既に保持している状態から呼ぶと session-level advisory lock は**別コネクション再入不可**
 ＝自己デッドロックする）。
 
 ここでは実際の `worker.run`/`worlds.rebind`/`worlds.delete` を**別スレッド**で走らせ、`store.replace_documents`
-（`_run_locked`/`_wipe_locked` の双方が world_lock 保持区間の終盤に必ず1回通る共通の差し込み点）を最初の
+（`_run_locked`/`wipe_locked` の双方が world_lock 保持区間の終盤に必ず1回通る共通の差し込み点）を最初の
 1呼び出しだけ意図的に足止めして「先着が world_lock を保持している最中」を確実に作る。後着はその間
 ブロックされ（`join(timeout=短)` で alive を確認）、足止め解除後に直列実行され、最終状態
 （台帳/Neo4j/world registry/派生dir）が後着の結果と整合することを固定する。
 
-自己デッドロック regression（rebind/delete が内側で `run`/`wipe_world` を再度呼んでしまう）が入ると、
+自己デッドロック regression（rebind/delete が内側で `run` を再度呼んでしまう）が入ると、
 後着スレッドは world_lock 待ちのまま**永久に**戻らない。`join` は必ずタイムアウト付きで呼び、
 テスト自体がハングしないことを担保する（後片付けも同様に bounded）。
 """
@@ -43,9 +43,9 @@ def _names(drv, wid=W):
 
 
 class _Stall:
-    """`store.replace_documents` の**最初の1回だけ**呼び出し中に足止めする。
+    """`store.replace_documents`（消す経路）・`store.switch_ledger`（取り込み・付け替えの経路）の**最初の1回だけ**呼び出し中に足止めする。
 
-    `_run_locked`（run/rebind 経路）・`_wipe_locked`（delete 経路）はどちらも world_lock 保持区間の終盤で
+    `_run_locked`（run/rebind 経路）・`wipe_locked`（delete 経路）はどちらも world_lock 保持区間の終盤で
     必ずこれを1回呼ぶ＝「先着がロックを保持している最中」を作る共通の差し込み点として使い回せる。
     """
 
@@ -53,19 +53,26 @@ class _Stall:
         self.acquired = threading.Event()   # 足止めに入った（＝先着がロックを保持中）
         self.release_ = threading.Event()   # 続行してよい合図
         self._n = 0
-        self._orig = store.replace_documents
+        self._orig = store.replace_documents, store.switch_ledger
 
-        def _stalling(world, rows):
+        def _stall():
             self._n += 1
             if self._n == 1:
                 self.acquired.set()
                 self.release_.wait(timeout=_LONG)
-            return self._orig(world, rows)
 
-        store.replace_documents = _stalling
+        def _stalling(world, rows, **kw):
+            _stall()
+            return self._orig[0](world, rows, **kw)
+
+        def _stalling_switch(world, **kw):
+            _stall()
+            return self._orig[1](world, **kw)
+
+        store.replace_documents, store.switch_ledger = _stalling, _stalling_switch
 
     def restore(self):
-        store.replace_documents = self._orig
+        store.replace_documents, store.switch_ledger = self._orig
 
 
 def _threaded(fn, *a, **kw):

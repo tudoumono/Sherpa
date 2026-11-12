@@ -114,7 +114,7 @@ python scripts/bench/ledger_eval.py all \
 ```
 
 この 1 コマンドでストア準備→通常 API 起動→資料取り込み→smoke 9 試行→pilot 18 試行まで進む。
-`pilot-estimate.json` の全 105 試行の見込みを報告書冒頭に記載してから本番へ進む。
+`pilot-estimate.json` の全試行（回す構成の数 × 問題数。今は計画書方式 C だけなので 35 試行）の見込みを報告書冒頭に記載してから本番へ進む。
 
 ```bash
 python scripts/bench/ledger_eval.py run \

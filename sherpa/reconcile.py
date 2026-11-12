@@ -11,12 +11,14 @@ fail-safe（破ると誤削除になる）:
 """
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from pathlib import Path
 
 from . import worlds
 
+_log = logging.getLogger("sherpa")
 _warned_test_db_isolated = False  # プロセス内で一度だけ warning を出す
 
 
@@ -79,56 +81,170 @@ def _derived_parent() -> Path:
     return Path(v) if v else worlds._repo_root() / "data" / "derived"
 
 
-def _reconcile_derived(valid: set, source_roots: list) -> list:
-    """`data/derived/{world}` のうち valid に無い dir を削除する。返り値＝削除した world id。
-
-    派生 parent がソース root と重なるなら何もしない。`valid_world` 名のみ対象（`.{world}.rebind-bak` 等は無視）。
+def _derived_orphans(valid: set, derived_ok: bool, failed: list | None = None) -> list:
+    """`data/derived/{world}` のうち valid に無い dir の world 名。`derived_ok` が False（派生先が原本と重なる）なら空。
+    `valid_world` 名のみ対象（`.{world}.rebind-bak` 等は無視）。置き場を読めなければ `failed` に `derived` を足す。
     """
     parent = _derived_parent()
-    if any(_overlaps(parent, sr) for sr in source_roots):  # 派生先が原本と重なる＝消さない
-        return []
-    deleted = []
+    out = []
+    if not derived_ok:
+        return out
     try:
         if not parent.is_dir():
-            return []
+            return out
         for d in parent.iterdir():
             if (d.is_dir() and not d.is_symlink() and worlds.valid_world(d.name)
                     and d.name not in valid):
-                shutil.rmtree(d, ignore_errors=True)
-                deleted.append(d.name)
+                out.append(d.name)
     except OSError:
+        _log.warning("派生物の置き場を読めませんでした: %s", parent, exc_info=True)
+        if failed is not None:
+            failed.append("derived")
+    return sorted(out)
+
+
+def _remove_derived(world: str) -> None:
+    """孤児の派生MD dir を消す（無ければ何もしない・symlink と `valid_world` でない名前は消さない）。消せなければ例外。"""
+    if not worlds.valid_world(world):
+        return
+    target = worlds.derived_dir(world)
+    if target.is_symlink():
+        return
+    try:
+        shutil.rmtree(target)
+    except FileNotFoundError:
         pass
-    return sorted(deleted)
 
 
-def _reconcile_documents(valid: set) -> list:
-    """`documents`（文書台帳・PG）のうち valid に無い world の行を削除する。
-
-     best-effort（個別失敗は次回に再試行）。削除は `replace_documents(world, [])` を再利用する。返り値＝削除した world id。
-    """
+def _documents_orphans(valid: set, failed: list | None = None) -> list:
+    """`documents`（文書台帳・PG）に残る、valid に無い world。一覧を読めなければ `failed` に `documents` を足して空を返す。"""
     from . import store
-    deleted = []
     try:
         present = store.list_document_worlds()
     except Exception:
+        _log.warning("文書台帳の world 一覧を読めませんでした", exc_info=True)
+        if failed is not None:
+            failed.append("documents")
+        return []
+    return sorted(w for w in present if w not in valid)
+
+
+def _stale_cleanup_keys() -> list:
+    """止まって lock が外れた掃除の行の鍵。読めなければ空（次回に回す）。"""
+    from .store import replace_rows
+    try:
+        return replace_rows.stale_cleanup_worlds()
+    except Exception:
+        _log.warning("止まった掃除の行を読めませんでした", exc_info=True)
+        return []
+
+
+def _reconcile_es(valid: set, failed: list) -> list:
+    """孤児の ES 索引を、索引ごとに掃除の行（`kind='cleanup'`・鍵は `ES_CLEANUP_PREFIX` + エイリアス名）を持って消す。返り値＝消せたエイリアス名。
+    止まった ES の掃除の行は、まだ孤児として見えている索引なら続きから消し、もう無い索引なら行だけ消す。
+    """
+    from . import es_index
+    from .ingest import replace_guard
+    from .store import replace_rows
+    prefix = replace_rows.ES_CLEANUP_PREFIX
+    deleted = []
+    try:
+        orphans = es_index.orphan_indices(valid)
+    except Exception:
+        _log.warning("ES の孤児の一覧を取れませんでした", exc_info=True)
+        failed.append("es")
         return deleted
-    for world in present:
-        if world in valid:
-            continue
+    stale = [k[len(prefix):] for k in _stale_cleanup_keys() if k.startswith(prefix)]
+    for alias in sorted(set(orphans) | set(stale)):
         try:
-            store.replace_documents(world, [])
-            deleted.append(world)
+            with replace_rows.begin_cleanup(prefix + alias) as row:
+                if row is None:
+                    continue   # 他が掃除中
+                if alias in orphans:
+                    es_index.delete_orphan(alias, row=row)
+                replace_guard.drop_own(row)
+            if alias in orphans:
+                deleted.append(alias)
+        except (Exception, replace_rows.ReplaceAborted):
+            _log.warning("孤児の ES 索引を削除できませんでした（次回に続きから消します）: %s", alias, exc_info=True)
+            failed.append(f"es:{alias}")
+    return deleted
+
+
+def cleanup_world(world: str, *, reflect: bool, derived: bool = True) -> dict | None:
+    """登録の無い孤児 world 1 つの派生物（Neo4j・文書台帳・派生MD・ES）を、掃除の行（`kind='cleanup'`）を持って消す。
+    他が掃除中なら何もせず None。止まって lock が外れた掃除の行は引き継いで続きから消す。全部消せたときだけ行を消す。
+    戻り値は `{"done": 消せたストアの名前, "failed": 失敗}`。
+    """
+    from . import es_index, store
+    from .ingest import replace_guard, wipe, world_neo4j
+    from .store import replace_rows
+    with replace_rows.begin_cleanup(world) as row:
+        if row is None:
+            return None
+        steps = []
+        if reflect:
+            def _graph():
+                env = world_neo4j._env()
+                world_neo4j.delete_world(world, env["uri"], env["user"], env["pw"], row=row)
+            steps.append(("neo4j", _graph))
+        steps.append(("documents", lambda: store.replace_documents(world, [], row=row)))
+        if derived:
+            steps.append(("derived", lambda: _remove_derived(world)))
+        steps.append(("es", lambda: wipe.delete_es_index(world, row=row)))
+        done, failed = [], []
+        for name, step in steps:
+            try:
+                step()
+                done.append(name)
+            except Exception:
+                _log.warning("孤児の掃除の一段に失敗しました（次回に続きから消します）: %s world=%s", name, world, exc_info=True)
+                failed.append(f"{name}:{world}")
+        if not failed:
+            replace_guard.drop_own(row)
+    return {"done": done, "failed": failed}
+
+
+def _reconcile_worlds(valid: set, source_roots: list, reflect: bool, failed: list) -> dict:
+    """孤児の Neo4j・文書台帳・派生MD と、止まって lock が外れた掃除の行を、world ごとに `cleanup_world` で消す。返り値＝ストアごとの消せた world。"""
+    from .ingest import world_neo4j
+    from .store import replace_rows
+    derived_ok = not any(_overlaps(_derived_parent(), sr) for sr in source_roots)   # 派生先が原本と重なる＝消さない
+    listed: dict = {"neo4j": [], "documents": [], "derived": []}
+    if reflect:
+        try:
+            env = world_neo4j._env()
+            listed["neo4j"] = world_neo4j.orphan_worlds(valid, env["uri"], env["user"], env["pw"])
         except Exception:
-            continue  # 個別失敗は次回に再試行
-    return sorted(deleted)
+            _log.warning("Neo4j の孤児の一覧を取れませんでした", exc_info=True)
+            failed.append("neo4j")
+    listed["documents"] = _documents_orphans(valid, failed)
+    listed["derived"] = _derived_orphans(valid, derived_ok, failed)
+    stale = [w for w in _stale_cleanup_keys() if w not in valid and not w.startswith(replace_rows.ES_CLEANUP_PREFIX)]
+    out: dict = {"neo4j": [], "documents": [], "derived": []}
+    for world in sorted({w for ws in listed.values() for w in ws} | set(stale)):
+        try:
+            res = cleanup_world(world, reflect=reflect, derived=derived_ok)
+        except (Exception, replace_rows.ReplaceAborted):
+            _log.warning("孤児の掃除を続けられませんでした（次回に続きから消します）: %s", world, exc_info=True)
+            failed.append(f"cleanup:{world}")
+            continue
+        if res is None:
+            continue   # 他が掃除中
+        failed.extend(res["failed"])
+        for name, ws in listed.items():
+            if world in ws and name in res["done"]:
+                out[name].append(world)
+    return out
 
 
 def reconcile_derivatives(reflect: bool = True) -> dict:
     """ES索引・Neo4j・派生MD・文書台帳(documents) の孤児を一括掃除する。不確実なら skip（何も消さない）。
 
-    各ストアは best-effort。`SHERPA_TEST_DB_ISOLATED` が立っている間は全面 skip する（レジストリがテスト用 DB を指す一方、
+    各ストアは best-effort。削除できなかったものは `failed`（`es`／`es:{索引}`／`neo4j`／`neo4j:{world}`／`derived`／`derived:{world}`／`documents`／`documents:{world}`／`cleanup:{world}`）に載せる（「対象なし」と区別する）。
+    孤児は掃除の行（`kind='cleanup'`）を持って消し、止まって lock が外れた行は次の掃除が続きから消す。`SHERPA_TEST_DB_ISOLATED` が立っている間は全面 skip する（レジストリがテスト用 DB を指す一方、
     Neo4j/ES/`data/derived` は実環境と共有のため、実世界を孤児と誤判定して消す事故を防ぐ）。
-    world 単体の削除（`worker.wipe_world`）はここを経由しない。
+    world 単体の削除（`wipe.wipe_locked`）はここを経由しない。
     """
     if os.environ.get("SHERPA_TEST_DB_ISOLATED"):
         _warn_test_db_isolated_once()
@@ -143,22 +259,7 @@ def reconcile_derivatives(reflect: bool = True) -> dict:
     except OSError:
         return {"skipped": "local_uncertain"}  # ローカル列挙が不確実なら全停止
     valid = {r["world_id"] for r in rows} | local
-    out: dict = {"es": [], "neo4j": [], "derived": [], "documents": []}
-    try:
-        from . import es_index
-        out["es"] = es_index.reconcile(valid)
-    except Exception:
-        pass
-    out["derived"] = _reconcile_derived(valid, _source_roots(rows))
-    try:
-        out["documents"] = _reconcile_documents(valid)
-    except Exception:
-        pass
-    if reflect:
-        try:
-            from .ingest import world_neo4j
-            env = world_neo4j._env()
-            out["neo4j"] = world_neo4j.reconcile(valid, env["uri"], env["user"], env["pw"])
-        except Exception:
-            pass
+    failed: list = []
+    out: dict = {"es": _reconcile_es(valid, failed), "neo4j": [], "derived": [], "documents": [], "failed": failed}
+    out.update(_reconcile_worlds(valid, _source_roots(rows), reflect, failed))
     return out

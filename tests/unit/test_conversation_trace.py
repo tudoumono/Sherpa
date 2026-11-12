@@ -184,9 +184,9 @@ def test_stages_tools_hits_and_token_deltas_in_time_order(tmp_path):
     assert "食い違う" not in out
     assert "not_found_in_scope → unverified へ自動で下げた" in out
     assert "/conversations/7/messages/11/investigation" in out
-    assert "secret.key" not in out and "（秘匿ファイル）" in out          # 句読点付きの秘匿名も伏せる
-    assert "app.key" not in out                                        # 行番号付きの秘匿名も伏せる
-    assert "server.pem" not in out and "架空の回答の先頭行" not in out
+    assert "secret.key" in out and "（秘匿ファイル）" not in out          # 秘匿名は出す（守るのは中身）
+    assert "app.key" in out
+    assert "架空の回答の先頭行" not in out
     assert "秘匿資料を含むため本文は出さない" in out
     assert "壊れた行（文字コードが壊れている・JSON として読めない・時刻が無い）を 2 行" in out
     assert "読めないセッションファイルを 1 本" in out
@@ -321,7 +321,7 @@ def test_jsonl_and_text_route_section_keep_masking_and_secrets_rules(tmp_path):
     t = rows[1]
     assert t["conv"] == 7 and t["answer_id"] == 11 and t["ledger"] == "none" and t["completion"] == "complete"
     assert t["route"][0]["docs"][0]["rank"] == 1 and t["route"][0]["docs"][0]["via"] == "vector"
-    assert "rank" not in t["route"][1]["docs"][0] and t["route"][0]["docs"][1]["doc"] == "（秘匿ファイル）"
+    assert "rank" not in t["route"][1]["docs"][0] and t["route"][0]["docs"][1]["doc"].startswith("資料#")  # 秘匿の資料も他と同じ伏せ字
     assert t["feedback"] == {"rating": "down", "tags": ["incomplete"], "has_comment": True}
     assert t["impact_list"]["states"] == {"used": 1} and t["tool_use"]["verdict"] == "used"
     for raw in (_QUERY, "架空資料", "app.key", "id_rsa", "架空の一言", "架空の回答の先頭行", "架空の質問", "架空部品"):
@@ -329,10 +329,10 @@ def test_jsonl_and_text_route_section_keep_masking_and_secrets_rules(tmp_path):
     assert CT.find_leaks(out, masker) == 0 and CT.find_leaks(out + "\n架空資料.cbl\n", masker) > 0
 
     plain = CT.build_jsonl([conv], CT.Masker(mask=False), meta={})
-    assert _DOC in plain and _QUERY in plain and "app.key" not in plain and "id_rsa" not in plain
+    assert _DOC in plain and _QUERY in plain and "conf/app.key" in plain and "keys/id_rsa" in plain   # 秘匿の資料の名前は出す
 
     text = CT.build_output([conv], CT.Masker(mask=False), tmp_path / "nothing")
-    assert "[調べた経路と見つかった資料]" in text and "順位 1 点数 0.5 vector" in text and "app.key" not in text
+    assert "[調べた経路と見つかった資料]" in text and "順位 1 点数 0.5 vector" in text and "app.key" in text
     assert "調査台帳]" not in text.split("[調べた経路と見つかった資料]")[1].split("[記録の欠け]")[0]
 
 
@@ -352,3 +352,9 @@ def test_since_selection_is_capped_and_arguments_are_exclusive(monkeypatch, caps
     assert start.utcoffset().total_seconds() == 9 * 3600 and (end - start).days == 2   # UNTIL はその日を含む
     for argv in (["--conv", "1", "--since", "2026-10-01"], [], ["--until", "2026-10-01"], ["--since", "10/01"]):
         assert CT.main(argv) == 2
+
+
+def test_note_all_does_not_trip_selfcheck_for_sensitive_names_without_mask():
+    masker = CT.Masker(mask=False, salt=b"s" * 16)
+    masker.note_all({"error": "conf/app.key", "items": ["keys/id_rsa"]})
+    assert CT.find_leaks("エラー: conf/app.key と keys/id_rsa", masker) == 0

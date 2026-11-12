@@ -21,8 +21,11 @@ from . import evidence_ir, metafile_text
 
 
 OCR_ROUTE_SCHEMA_VERSION = "ocr-route-manifest-v1"
-OCR_ROUTER_PROFILE = "evidence-raster-router-v6"
+OCR_ROUTER_PROFILE = "evidence-raster-router-v7"
 OCR_ROUTE_SIG_MARKER = ".ocr_route_sig"
+# 仕事は priority の高い順に取られる。本文の文字の層が無いスキャンページは、どの埋め込み画像より先に読む。
+RASTER_PRIORITY_MAX = 100
+SCAN_PAGE_PRIORITY = 200
 ROUTE_STATUSES = frozenset({"selected", "excluded", "failed_binding"})
 RASTER_ELEMENT_TYPES = frozenset({"picture", "image_xobject", "image", "standalone_image", "image_fill"})
 RASTER_ASSET_ROLES = frozenset({"picture_content", "shape_fill"})
@@ -231,7 +234,7 @@ def content_hash(manifest: OCRRouteManifest) -> str:
 
 
 def _priority(element: evidence_ir.EvidenceElement) -> int:
-    priority = 100
+    priority = RASTER_PRIORITY_MAX
     size = element.extension.get("pixel_size")
     if isinstance(size, list) and len(size) == 2 and all(isinstance(value, int) for value in size) \
             and min(size) < 32:
@@ -451,7 +454,7 @@ def build_manifest(
             status, reason = "selected", "scan_page_render_fallback"
         decisions.append(OCRRouteDecision(
             route_input_id=route_id, target_evidence_id=page_element.element_id, input_kind="page_render",
-            status=status, reason_code=reason, priority=90 if status == "selected" else 0,
+            status=status, reason_code=reason, priority=SCAN_PAGE_PRIORITY if status == "selected" else 0,
             media_type="image/png", page_render=render_profile,
             detail={"page": page, "source_rel_path": source_rel},
         ))

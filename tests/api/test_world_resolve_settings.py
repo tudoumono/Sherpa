@@ -79,10 +79,20 @@ def test_dispatch_failure_other_than_busy_restores_settings(client, stub):
 
 @pytest.mark.parametrize("payload", [
     {"copy_paths": ["G/lib"], "unknown": 1},
-    {"copy_paths": ["G/../H"]}, {"copy_paths": [""]}, {"path_aliases": {"a": "b/x", "b": "a/y"}}])
+    {"copy_paths": ["G/../H"]}, {"copy_paths": [""]}, {"path_aliases": {"a": "b/x", "b": "a/y"}},
+    {"name_rules": [{"from": "*0", "to": "1"}]}, {"name_rules": [{"from": "A0", "to": "a0"}]}, {"name_rules": [{"from": "A0"}]}])
 def test_put_rejects_invalid_settings(client, stub, payload):
     assert client.put("/worlds/w1/resolve-settings", json=payload).status_code == 422
     assert stub["row"]["resolve_settings"] is None
+
+
+def test_name_rules_roundtrip_keeps_order(client, stub):
+    rules = [{"from": "*0", "to": "*1"}, {"from": "ZZA0", "to": "ZZB0"}]
+    body = client.put("/worlds/w1/resolve-settings", json={"name_rules": rules}).json()
+    assert body["name_rules"] == rules and body["changed"] is True
+    assert stub["row"]["resolve_settings"]["name_rules"] == rules
+    assert client.get("/worlds/w1/resolve-settings").json()["name_rules"] == rules
+    assert client.put("/worlds/w1/resolve-settings", json={"name_rules": rules}).json()["changed"] is False
 
 
 def test_unknown_world_is_404(client, stub):
@@ -104,9 +114,10 @@ def test_store_roundtrip_changes_world_signature():
         # 設定が最後のグラフに反映済みかは、確定時に記録するハッシュとの比較で分かる
         row = store.get_world_status_row(wid)
         assert resolve_settings.signature_material(row["resolve_settings"]) != (row["resolve_applied_sig"] or "")
-        run = store.start_ingest_run(wid, scan_root=None, created_by="admin")
+        run = store.start_ingest_run(wid, created_by="admin")
         store.finish_ingest_run_and_confirm_world(run["id"], wid, status="auto_published", sig="s",
-                                                  resolve_sig=resolve_settings.signature_material(cfg))
+                                                  resolve_sig=resolve_settings.signature_material(cfg),
+                                                  drop=None)
         row = store.get_world_status_row(wid)
         assert resolve_settings.signature_material(row["resolve_settings"]) == row["resolve_applied_sig"]
         assert store.set_resolve_settings(wid, None) is True

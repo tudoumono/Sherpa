@@ -10,7 +10,7 @@ A = CAnalyzer()
 
 
 def test_extensions_and_name():
-    assert A.extensions == frozenset({".c", ".h"})
+    assert A.extensions == frozenset({".c", ".h", ".pc", ".sqc"})
     assert A.name == "c"
     assert A.doctype == "c"
 

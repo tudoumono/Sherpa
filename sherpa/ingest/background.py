@@ -13,6 +13,7 @@ import contextlib
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 
 _log = logging.getLogger("sherpa")
 
@@ -166,3 +167,44 @@ def submit(world_id: str, op: str, fingerprint: str, payload: dict | None = None
     if verdict == "conflict":
         raise ConflictError(row.get("version") or world_id, row.get("op") or "", row["id"])
     return row["id"], verdict == "joined"
+
+
+OCR_CATCHUP_REFRESH_FP = "{}"
+OCR_CATCHUP_STAGE_LABEL = "受け付けました"
+
+
+def enqueue_ocr_catchup(world: str, *, stage_label: str = OCR_CATCHUP_STAGE_LABEL) -> bool:
+    """公開済み OCR 観測を反映する refresh を、手動更新と同じ合流条件で予約する。
+
+    同じ観測の世代につき自動の予約は1回だけ（結果が失敗でも積み直さない＝利用者の「更新」を待つ）。
+    最新の run が空きの不足で止まっているときも積まない。予約した run の `payload.ocr_catchup` に観測の世代を残す。
+    """
+    from .. import store, worlds
+
+    try:
+        observation_dir = worlds.observation_current_dir(world)
+        if observation_dir is None:
+            return False
+        observation = f"{observation_dir.parent.name}/{observation_dir.name}"
+        latest = store.get_latest_run_summary(world)
+        snapshot = (latest or {}).get("extraction_snapshot") or {}
+        if snapshot.get("stop_reason") == LOW_DISK_STOP_REASON:
+            return False
+        if store.has_ocr_catchup_run(world, observation):
+            return False
+        submit(
+            world, "refresh", OCR_CATCHUP_REFRESH_FP, {"ocr_catchup": observation},
+            progress={
+                "stage": "accepted", "stage_label": stage_label,
+                "done": None, "total": None, "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return True
+    except (ConflictError, ShuttingDownError):
+        return False
+    except Exception:
+        _log.warning(
+            "OCR完了の反映（軽量sync）予約に失敗しました（次回検知時に再試行）: world=%s",
+            world, exc_info=True,
+        )
+        return False

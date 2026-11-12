@@ -15,9 +15,9 @@ from pathlib import Path
 import psycopg
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from sherpa import doc_ledger, safe_open, store, worlds
+from sherpa import doc_ledger, doc_reach, safe_open, scope_infer, store, worlds
 from sherpa import scope as scope_mod
-from sherpa.deps import _DEFAULT_WORLD, _WORLD_PATTERN, _current_user, _require_admin, _resolve_world, validated_scope
+from sherpa.deps import SCOPE_WALK_TIMEOUT_MESSAGE, _DEFAULT_WORLD, _WORLD_PATTERN, _current_user, _require_admin, _resolve_world, reject_excluded, validated_scope
 from sherpa.fd_response import FdFileResponse, FdOwner, content_disposition
 from sherpa.ingest import text_kind
 
@@ -44,14 +44,15 @@ def _swap_read(world: str):
 @download_router.get("/documents/download", tags=["文書"])
 def doc_download(request: Request, rel: str = Query(...), world: str = Query(_DEFAULT_WORLD, pattern=_WORLD_PATTERN)):
     """根拠の原本をダウンロードする。doc_id＝rel_path（world root 相対）。
-    台帳に載っているファイルだけが対象で、秘匿ファイル・台帳に無い名前・root 外は 404。アーカイブ取り込み（zip/tar(.gz)/tgz）の中のファイルは、展開した写しを返す（原本アーカイブそのものではない）。
+    対象は台帳に載っているファイル、または出典の確かめと同じ条件（`doc_reach.doc_reachable`＝実在・文書種別・取り込みが外すものでない）を満たすファイル。秘匿ファイル・それ以外の名前・root 外は 404（理由は区別しない）。アーカイブ取り込み（zip/tar(.gz)/tgz）の中のファイルは、展開した写しを返す（原本アーカイブそのものではない）。
     ダウンロードは監査に記録され、記録できなければ許可しない。
     """
     u = _current_user(request)
+    reject_excluded(world, rel, "原本が見つかりません（パス不一致／未実在）")
     # world_swap_lock_shared は台帳確認の直前から fd の fstat 完了まで保持し、root は取得後に一度だけ解決する
     with _swap_read(world):
-        # ① 台帳に完全一致で載っているか確認する（別名は落ちる）・秘匿名を塞ぐ
-        if not store.document_exists(world, rel):
+        # ① 台帳に完全一致で載っているか、出典の確かめと同じ条件を満たすか（別名は落ちる）・秘匿名を塞ぐ
+        if not (store.document_exists(world, rel) or doc_reach.doc_reachable(rel, world)):
             raise HTTPException(404, "原本が見つかりません（パス不一致／未実在）")
         if text_kind.is_sensitive_doc_id(rel):
             raise HTTPException(404, "原本が見つかりません（パス不一致／未実在）")
@@ -59,7 +60,6 @@ def doc_download(request: Request, rel: str = Query(...), world: str = Query(_DE
         if not root:
             raise HTTPException(404, "原本が見つかりません（パス不一致／未実在）")
         with worlds.pin_world_root(world, root):
-            # ② 実体を root からの lstat 降下で確認する（symlink 拒否・封じ込め）
             # ② 実体を root からの lstat 降下で確認する（symlink 拒否・封じ込め）
             p = doc_ledger.original_path(rel, world)
             if not p:
@@ -104,7 +104,7 @@ def documents_list(request: Request, world: str | None = Query(None, pattern=_WO
                    limit: int | None = Query(None, ge=1, le=1000), offset: int = Query(0, ge=0)):
     """文書台帳（doc_id＝rel_path＋フォルダ由来の範囲メタ）を返す。物理パスは出さない。
     ページング（`limit`/`offset`・上限 1000）は明示指定したときだけ有効で、省略時は全件を返す。応答の `world`/`documents` はそのままで、`total`/`has_more` を常に追加し、`limit`/`offset` を指定したときだけその実効値も追加する。
-    取り込み済みの文書台帳から返す。台帳が空の world だけはフォルダを走査して返す。
+    取り込み済みの文書台帳から返す。台帳が空の world だけはフォルダを（期限つきで）走査して返し、期限を超えたら 503。
     """
     _current_user(request)  # ログイン必須（auth 有効時）。
     w = _resolve_world(world)
@@ -112,10 +112,12 @@ def documents_list(request: Request, world: str | None = Query(None, pattern=_WO
         docs, total = doc_ledger.public_documents_page(w, limit=limit, offset=offset)
     except psycopg.errors.LockNotAvailable:
         raise HTTPException(503, _SWAP_BUSY_MESSAGE)
+    except scope_infer.ScopeWalkDeadlineExceeded:
+        raise HTTPException(503, SCOPE_WALK_TIMEOUT_MESSAGE) from None
     body = {"world": w, "documents": docs, "total": total, "has_more": offset + len(docs) < total}
     if limit is not None:
         body["limit"], body["offset"] = limit, offset
-    return body
+    return body  # 資料の一覧・総数には除外を当てない（名前が出るのは許す。除外は検索・読み取り・ダウンロードで拒否する）
 
 
 @documents_router.get("/admin/es/search", tags=["文書"])
@@ -125,17 +127,23 @@ def _admin_es_search_endpoint(request: Request,
                                scope_paths: list[str] = Query(default_factory=list),
                                k: int = Query(20, ge=1, le=50)):
     """管理者向けの ES 検索（読み取り専用）。クエリ param `world` は他の API と同じ取込ディレクトリ（world id）。"""
-    from sherpa import documents, es_index
+    from sherpa import documents, es_index, es_priority
     _require_admin(_current_user(request))
     w = _resolve_world(world)
     sp = validated_scope(w, scope_paths) or None
-    valid = documents.world_rel_set(w)
     hits = []
-    # `es_index.search()` は (hits, reason) のタプルを返す。この読み取り専用検索には degraded 報告が無いため BM25 失敗（es_query_failed）の reason は捨てる（構造化された degraded 集計が要る呼び出し元は `fused_search._search_keyword()`）。
-    es_hits, _reason = es_index.search(w, query, scope_paths=sp, k=k, vector=False)
+    es_hits, reason = es_index.search(w, query, scope_paths=sp, k=k, vector=False)
+    if reason in es_priority._ES_QUERY_FAILURES:
+        raise HTTPException(503, "全文検索のサービスを使えません。システム状態を確認してから、もう一度お試しください")
+    from sherpa import path_rules
+    sp_eff = path_rules.rules_for(w).extend_scope(sp)  # 「範囲の外でも読む」を足した範囲（ES が足したヒットを落とし直さない）
+    try:
+        valid = documents.existing_rels(w, [h.get("doc_id") for h in es_hits])  # 実在はヒットした doc だけを確かめる（木は歩かない）
+    except scope_infer.ScopeWalkDeadlineExceeded:
+        raise HTTPException(503, SCOPE_WALK_TIMEOUT_MESSAGE) from None
     for h in es_hits:
         doc = h.get("doc_id")
-        if not doc or doc not in valid or not scope_mod.in_scope(doc, sp):
+        if not doc or doc not in valid or not scope_mod.in_scope(doc, sp_eff):
             continue
         # 秘匿名（credentials.xlsx 等）の本文は、索引済みでも管理者検索で返さない。
         if text_kind.is_sensitive_doc_id(doc):

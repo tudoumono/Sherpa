@@ -392,7 +392,7 @@ def test_java1_edge_aggregation_preserves_the_src_type_dst_set(monkeypatch):
     """集約規則（`_aggregate_pass2_edges`）を無効化した「集約前」の生エッジと golden（集約後）を比べ、
     (1) 集約前14本・集約後9本（5組が重複）、(2) 残る `(src,type,dst)` の集合は集約前と完全一致
     （集約は重複を畳むだけで新しい組を作らず既存の組を消さない）ことを検証する。"""
-    monkeypatch.setattr(world_graph, "_aggregate_pass2_edges", lambda raw: raw)
+    monkeypatch.setattr("sherpa.ingest.graph.aggregate.aggregate_pass2_edges", lambda raw: raw)
     _nodes, before_edges, _flags = world_graph.build_world(
         ROOT / "fixtures" / "corpus" / "java1", JAVA1_WORLD_ID)
     monkeypatch.undo()

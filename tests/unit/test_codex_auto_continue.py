@@ -126,10 +126,6 @@ def _ctx(uid: str, conversation_id: int | None, message: str = "自動継続テ�
         message=message,
         world="v1",
         route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {
-            "lens": lens_, "headline": "dispatch-headline",
-            "summary": {"total": 0}, "data": {}, "sources": [],
-        },
         knowledge=True,
         uid=uid,
         conversation_id=conversation_id,

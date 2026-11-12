@@ -160,3 +160,16 @@ def test_audit_outcome_filter_includes_pending_and_failure(page, web_base_url):
     expect(page.locator("#audit-tbody")).not_to_contain_text("送信前記録")
     assert records["audit_queries"][-1]["outcome"] == ["failure"]
 
+
+
+def test_audit_log_warns_when_external_audit_writes_failed(page, web_base_url):
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.route("**/admin/audit?**", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body='{"rows": [], "count": 0, "offset": 0, "limit": 100, "ext_audit_write_failures": 2}'))
+    page.goto(f"{web_base_url}/audit.html")
+
+    expect(page.locator("#ext-audit-gap")).to_be_visible()
+    expect(page.locator("#ext-audit-gap")).to_contain_text("2 件")

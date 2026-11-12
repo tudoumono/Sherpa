@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from sherpa.ingest import background, worker
+from sherpa.ingest import background, es_reflect, worker
+from tests._replace_row import offline_row
 
 
 def test_holdback_passes_stop_request_through_without_recording_a_failure(monkeypatch):
@@ -16,9 +17,9 @@ def test_holdback_passes_stop_request_through_without_recording_a_failure(monkey
 
     monkeypatch.setattr(worker.es_index, "index_world", stop)
     recorded = []
-    monkeypatch.setattr(worker, "_record_es_index_failure", lambda *a, **k: recorded.append(a))
+    monkeypatch.setattr(es_reflect, "_record_es_index_failure", lambda *a, **k: recorded.append(a))
     with pytest.raises(background.StopRequested):
-        worker.index_world_with_human_md_holdback("w", content_sig="s")
+        worker.index_world_with_human_md_holdback("w", content_sig="s", row=offline_row("w"))
     assert recorded == []
 
 
@@ -31,8 +32,8 @@ def test_holdback_still_records_other_exceptions_as_failure(monkeypatch):
 
     monkeypatch.setattr(worker.es_index, "index_world", boom)
     recorded = []
-    monkeypatch.setattr(worker, "_record_es_index_failure", lambda *a, **k: recorded.append(a))
-    assert worker.index_world_with_human_md_holdback("w", content_sig="s")["error"] == "RuntimeError"
+    monkeypatch.setattr(es_reflect, "_record_es_index_failure", lambda *a, **k: recorded.append(a))
+    assert worker.index_world_with_human_md_holdback("w", content_sig="s", row=offline_row("w"))["error"] == "RuntimeError"
     assert recorded
 
 
@@ -60,18 +61,18 @@ def test_with_fill_overlays_the_remaining_and_filled_counts():
 
 
 def test_fill_step_is_best_effort_but_lets_a_stop_through(monkeypatch):
-    def boom(world):
+    def boom(world, **kw):
         raise RuntimeError("es down")
 
     monkeypatch.setattr(worker.es_index, "fill_missing_vectors", boom)
-    assert worker._fill_missing_vectors_step("w") is None
+    assert worker._fill_missing_vectors_step("w", 0) is None
 
-    def stop(world):
+    def stop(world, **kw):
         raise background.StopRequested()
 
     monkeypatch.setattr(worker.es_index, "fill_missing_vectors", stop)
     with pytest.raises(background.StopRequested):
-        worker._fill_missing_vectors_step("w")
+        worker._fill_missing_vectors_step("w", 0)
 
 
 def test_sync_records_low_disk_stop_so_that_resume_skips_it(monkeypatch):

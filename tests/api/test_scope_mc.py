@@ -11,7 +11,6 @@ from _world_setup import (OPS, S_DESIGN, S_OPS, S_SRC, SPEC, TAXCALC, TAXCPY,
 
 from sherpa import scope
 from sherpa.grep_tool import grep_search
-from sherpa.lens_service import run_qa
 
 V = TEST_WORLD_ID
 
@@ -123,12 +122,6 @@ def test_valid_scope_paths():
 def test_normalize_scope_paths():
     assert scope.normalize_scope_paths(None) == []
     assert scope.normalize_scope_paths([" a/b ", "a/b", "", "/a/b/"]) == ["a/b"]
-
-
-def test_qa_scoped_citations_within_scope():
-    full = {c["doc_id"] for c in run_qa("TAX-RATE", V)["citations"]}
-    scoped = {c["doc_id"] for c in run_qa("TAX-RATE", V, scope_paths=[S_DESIGN])["citations"]}
-    assert scoped == {SPEC} and scoped < full
 
 
 def test_scopes_endpoint():
@@ -283,7 +276,7 @@ def _capture_execution_provider(monkeypatch, endpoint, captured):
             self.turn_id = turn_id
             self.conversation_id = conversation_id
 
-    def _fake_start_turn(uid, conversation_factory, run_fn_factory, known_conversation_id=None):
+    def _fake_start_turn(uid, conversation_factory, run_fn_factory, known_conversation_id=None, scope_paths=None):
         return _Rec(turn_id="fake-turn-id", conversation_id=conversation_factory())
 
     monkeypatch.setattr(chat_router_mod, "_turn_run_fn", _fake_turn_run_fn)
@@ -352,8 +345,8 @@ def test_chat_settings_read_failure_propagates_as_500_not_swallowed(monkeypatch)
     assert calls["n"] == 1
 
 
-def test_impact_scoped_narrows():
-    """範囲を絞ると影響件数は増えない（要 Neo4j+PG）。"""
+def test_impact_scope_is_recorded_in_answer():
+    """範囲の指定が答えの `scope` に残る（影響件数が範囲で絞られることは `tests/integration/test_impact_service.py::test_scope_bounds_impact`）。"""
     from sherpa import chat_service
     from sherpa.deps import neo4j_session
 
@@ -374,9 +367,7 @@ def test_impact_scoped_narrows():
     except Exception as e:
         return _skip(f"infra down: {e}")
     assert ans is not None
-    ft = f["summary"]["total"]
-    s_total = ans["summary"]["total"]
-    assert ft >= 1 and s_total <= ft
+    assert f.get("scope", {}).get("scope_paths") == []
     assert ans.get("scope", {}).get("scope_paths") == [S_DESIGN]
     assert ans["scope"]["source"] == "explicit"
     assert all(scope.in_scope(src["doc_id"], [S_DESIGN]) for src in ans["sources"])

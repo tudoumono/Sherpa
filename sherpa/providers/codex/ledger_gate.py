@@ -332,15 +332,30 @@ def _restore_investigation_ledger(retired_dir: Path, investigation_dir: Path, tm
         return False
 
 
+RETIRE_RETAINED = "retained"
+RETIRE_NOT_NEEDED = "not_needed"
+RETIRE_FAILED = "failed"
+
+
 def _retire_investigation_ledger(investigation_dir: Path, ledger_home: Path,
                                  *, required_extra: tuple[str, ...] = (),
                                  require_review: bool = False) -> bool:
+    """`_retire_investigation_ledger_outcome` の結果が「退避した」なら `True`。"""
+    return _retire_investigation_ledger_outcome(
+        investigation_dir, ledger_home, required_extra=required_extra,
+        require_review=require_review) == RETIRE_RETAINED
+
+
+def _retire_investigation_ledger_outcome(investigation_dir: Path, ledger_home: Path,
+                                         *, required_extra: tuple[str, ...] = (),
+                                         require_review: bool = False) -> str:
     """未完了（または manifest 破損等で判定不能）の調査台帳を `ledger_home/investigation` へ退避する。complete なら退避先を削除する（ただし未解決の「追加の観点」の義務が残っていれば complete でも退避する）。
     `required_extra`: 台帳ゲートに渡したものと同じ値を渡すこと。`require_review`（既定 `False`）: 台帳ゲートと同じ値を渡すこと（`True` なら `reviews.jsonl` を読んで `ledger_complete(..., reviews=..., require_review=True)` で判定する）。
     退避の要否は `investigation_ledger.pending_continuation_review(reviews)` で内部で決める（回答末尾の定型文・継続プロンプト・完了判定と同じ純関数）。
     通常終了時は戻り値（実際に退避できたか）を `env["investigation"]["retained"]` に使う。
     「未作成の空ディレクトリ」と「作業データのある無効台帳」（manifest または items 配下にファイルがある）を区別し、後者は退避する。台帳ルート配下に symlink があれば退避を拒否する（`_investigation_tree_has_symlink`）。
-    fail-open。戻り値: 退避（コピー）を実際に行ったら `True`、delete のみ／何もしない場合は `False`。
+    戻り値: 退避（コピー）を実際に行ったら `RETIRE_RETAINED`、退避が要らない（delete のみ／何もしない）なら `RETIRE_NOT_NEEDED`、
+    退避が要るのにできなかった（コピー・置換の失敗、symlink の検出）なら `RETIRE_FAILED`。呼び出し側は `RETIRE_FAILED` のとき作業データを消さない。
     """
     retire_dir = ledger_home / "investigation"
     try:
@@ -352,15 +367,15 @@ def _retire_investigation_ledger(investigation_dir: Path, ledger_home: Path,
         if verdict.complete and not force_retain:
             if retire_dir.exists():
                 _remove_dir_best_effort(retire_dir)
-            return False
+            return RETIRE_NOT_NEEDED
         manifest_file_exists = (investigation_dir / "manifest.json").is_file()
         items_dir = investigation_dir / "items"
         has_any_item_file = items_dir.is_dir() and any(items_dir.glob("*.json"))
         if not (manifest_file_exists or has_any_item_file) or not investigation_dir.exists():
-            return False
+            return RETIRE_NOT_NEEDED
         if _investigation_tree_has_symlink(investigation_dir):
             _log.warning("investigation ledger retire skipped: symlink detected under investigation dir")
-            return False
+            return RETIRE_FAILED
         # 原子的な置換: 一時ディレクトリへ丸ごとコピーしてから `os.replace`（同一ファイルシステム上の rename）で置き換える。
         tmp_retire_dir = ledger_home / f".investigation.tmp-{os.getpid()}-{os.urandom(4).hex()}"
         if tmp_retire_dir.exists():
@@ -369,7 +384,45 @@ def _retire_investigation_ledger(investigation_dir: Path, ledger_home: Path,
         if retire_dir.exists():
             _remove_dir_best_effort(retire_dir)
         os.replace(tmp_retire_dir, retire_dir)
-        return True
+        return RETIRE_RETAINED
     except OSError as e:
         _log.warning("investigation ledger retire failed: %s", type(e).__name__)
-        return False
+        return RETIRE_FAILED
+
+
+RETIRE_FAILED_NOTICE = "調査記録の保存に失敗しました。作業データは保持していますが、続きから再開できることは未確認です。"
+
+
+def retire_ledger_for_turn(st) -> bool:
+    """このターンの調査台帳を退避し、退避済みの印を立てる。退避できたら `True`。
+    退避が要るのにできなかったときは `_investigation_retire_failed` を立て（作業データは消さない）、回答に注記を足す。
+    """
+    outcome = _retire_investigation_ledger_outcome(
+        st._investigation_dir, st._ledger_home, required_extra=st._ledger_required_extra,
+        require_review=st._ledger_require_review)
+    st._investigation_retire_done = True
+    if outcome == RETIRE_FAILED:
+        st._investigation_retire_failed = True
+        st._answer_notices.append(("ledger_retire_failed", RETIRE_FAILED_NOTICE))
+    return outcome == RETIRE_RETAINED
+
+
+def restore_previous_ledger(ctx, st, tmp_root: Path) -> bool:
+    """前ターンが退避した未完了台帳の扱い。「続き」の宣言なら復元し、それ以外なら退避先を消す（symlink を含む退避先は常に消す）。
+    復元に失敗したら `False`。元の退避台帳は残し、このターンでは退避も削除もしない（次の「続き」で再試行できる）。
+    """
+    retired = st._ledger_home / "investigation"
+    if not retired.is_dir():
+        return True
+    if _investigation_tree_has_symlink(retired):
+        _log.warning("investigation ledger restore skipped: symlink detected in retired dir")
+        _remove_dir_best_effort(retired)
+        return True
+    if not (ctx.message or "").strip().startswith(("続き", "つづき", "続けて")):
+        _remove_dir_best_effort(retired)
+        return True
+    if _restore_investigation_ledger(retired, st._investigation_dir, tmp_root):
+        st._investigation_restored = True
+        return True
+    st._investigation_retire_done = True
+    return False

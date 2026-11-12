@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sherpa — 資料</title>
+<title>Slouch — 資料</title>
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="fonts.css">
 <script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
@@ -27,6 +27,10 @@
   .folders .row .pth{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
     font-size:var(--text-small);color:var(--ink-3,#8b95a3)}
   .folders .rowstat{margin-top:6px;font-size:var(--text-small);color:var(--ink-2,#5b6573)}
+  .folders .status-sections{display:grid;gap:7px;margin-top:8px}
+  .folders .status-section{border-left:3px solid var(--border,#e3e6ea);padding-left:9px}
+  .folders .status-section b{display:block;color:var(--ink,#1f2937);font-size:var(--text-small)}
+  .folders .action-lock-note{margin:6px 0 0;font-size:var(--text-small);color:var(--ink-2,#5b6573)}
   .folders .mini{font-size:var(--text-small);padding:4px 10px}
   /* 差分チェック結果 */
   .diffout:empty{display:none}
@@ -57,12 +61,53 @@
   .picker .cur{flex:1;min-width:0;font-size:var(--text-small);color:var(--ink-3,#8b95a3);word-break:break-all}
   .picker .body{overflow:auto;padding:6px 8px}
   .fitem{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;cursor:pointer;color:var(--ink,#1f2937)}
-  .fitem:hover{background:var(--accent-weak,#ccfbf1)}
+  .fitem:hover{background:var(--accent-weak,#edf1f8)}
   .picker .pf{padding:12px 16px;border-top:1px solid var(--border,#e3e6ea);display:flex;gap:10px;justify-content:flex-end}
   /* admin ガード: この画面のデータ（`/worlds`・`/ingest/preview`・`/admin/es/search`）は全て admin 限定 API に依存するため、非 admin は access-denied だけ見せる。 */
   #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
   .folders .rowmain{flex-wrap:wrap}
   .folders .row .pth{flex-basis:220px}
+  .folders.wide{max-width:none}
+  /* タブ（取り込み状況／優先と除外／設定と点検） */
+  .tabs{display:flex;gap:4px;border-bottom:2px solid var(--border);margin-top:20px}
+  .tab{border:0;background:none;font:inherit;padding:9px 16px;color:var(--ink-2);cursor:pointer;border-bottom:3px solid transparent;margin-bottom:-2px;white-space:nowrap}
+  .tab[aria-selected="true"]{color:var(--accent-ink);font-weight:700;border-bottom-color:var(--accent-ink)}
+  .tab:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .tab .dot{color:var(--warn);margin-left:6px}
+  #tab-status .section-head{margin-top:16px}
+  /* 優先と除外。ほかのタブへ波及しないよう #tab-rules の下に閉じる。 */
+  #tab-rules .rules-lead{margin:16px 0 8px}
+  #tab-rules .layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}
+  #tab-rules .tasks{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0}
+  #tab-rules .task{display:flex;align-items:flex-start;gap:10px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px}
+  #tab-rules .task .q{font-weight:700}
+  #tab-rules .task .a{font-size:var(--text-small);color:var(--ink-2)}
+  #tab-rules .pill.pri,#tab-status .pill.pri{background:var(--ok-bg);color:var(--ok)}
+  #tab-rules .pill.exc,#tab-status .pill.exc{background:var(--danger-bg);color:var(--danger)}
+  #tab-rules .toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0;padding:0}
+  #tab-rules .toolbar input[type=search]{flex:1;min-width:180px;min-height:36px;padding:0 10px;border:1px solid var(--control-border);border-radius:var(--radius-sm);background:var(--surface);color:var(--ink);font:inherit}
+  #tab-rules .filterchip{min-height:32px;padding:0 12px;border:1px solid var(--border);border-radius:999px;background:var(--surface);color:var(--ink);font:inherit;font-size:var(--text-small);cursor:pointer}
+  #tab-rules .filterchip.on{background:var(--accent-weak);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+  #tab-rules .treehead,#tab-rules .trow{display:grid;grid-template-columns:minmax(0,1fr) 300px 230px;gap:10px;align-items:center;padding:5px 8px}
+  #tab-rules .treehead{font-size:var(--text-caption);color:var(--ink-3);border-bottom:2px solid var(--border)}
+  #tab-rules .trow{border-bottom:1px solid var(--border)}
+  #tab-rules .trow.reveal{background:var(--accent-weak)}
+  #tab-rules .trow.changed{background:var(--warn-bg)}
+  #tab-rules .tname{display:flex;gap:6px;align-items:center;min-width:0;word-break:break-all}
+  #tab-rules .tname .tog{border:none;background:transparent;cursor:pointer;color:var(--ink-3);font:inherit;padding:0 4px}
+  #tab-rules .tset{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:var(--text-small)}
+  #tab-rules .tset select{min-height:32px;border:1px solid var(--control-border);border-radius:var(--radius-sm);background:var(--surface);color:var(--ink);font:inherit}
+  #tab-rules .tnote{font-size:var(--text-caption);color:var(--ink-3)}
+  #tab-rules .side .item{display:flex;gap:6px;align-items:baseline;padding:4px 0;border-bottom:1px solid var(--border);font-size:var(--text-small);word-break:break-all}
+  #tab-rules .acts{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+  #tab-rules .banner{margin:8px 0;padding:8px 12px;border-radius:var(--radius-sm);background:var(--warn-bg);color:var(--warn);font-size:var(--text-label)}
+  #tab-rules .banner[hidden]{display:none}
+  #tab-rules .rules-ovl{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:50}
+  #tab-rules .rules-ovl[hidden]{display:none}
+  #tab-rules .dlg{background:var(--surface);color:var(--ink);border-radius:var(--radius);max-width:620px;width:92vw;max-height:80vh;display:flex;flex-direction:column;box-shadow:var(--shadow-lg)}
+  #tab-rules .dlg .dh{padding:14px 16px;font-weight:700;font-size:var(--text-section);border-bottom:1px solid var(--border)}
+  #tab-rules .dlg .db{padding:12px 16px;overflow:auto;font-size:var(--text-label)}
+  #tab-rules .dlg .df{padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:10px;justify-content:flex-end}
 </style>
 </head>
 <body>
@@ -83,20 +128,18 @@
     <a class="help-link" href="manual.html#register">この画面の使い方 →</a>
   </div>
 
-  <!-- 取り込みのワーカーが動いていない・版が Web アプリと違うときのお知らせ -->
+  <!-- 取り込みに関する注意は、この1か所へまとめる。 -->
   <div class="answer-notice" id="workerbanner" role="status" hidden style="margin:12px 0;padding:8px 12px;font-size:var(--text-label)"></div>
 
-  <!-- ===== 上: 資料フォルダ（登録・一覧） ===== -->
+  <!-- 登録（未登録のときだけ表示） -->
   <div class="folders">
-    <div class="section-head"><div class="section-title">資料フォルダ</div></div>
-
-    <!-- 登録（未登録のときだけ表示） -->
     <div class="card" id="regcard" hidden>
       <div class="card-head">資料フォルダを登録</div>
+      <div class="card-body">
       <div class="muted" style="font-size:var(--text-label);margin-bottom:8px">
         Windows のフォルダを指定すると、その中身をそのまま検索・分析できるようになります。
         <b>ファイルの追加・編集・削除は今までどおり Windows のエクスプローラーで</b>行ってください
-        （ここでフォルダを作ったりアップロードはしません。変更は「更新」か自動チェックで反映）。
+        （ここでフォルダを作ったりアップロードはしません。変更は「ファイルの状態を更新」か「今すぐ更新」で反映）。
         登録できるフォルダは<b>1つ</b>です。</div>
       <div class="formrow">
         <button class="btn-ghost" id="pickbtn">📁 フォルダを選ぶ…</button>
@@ -111,44 +154,42 @@
       <div class="note" id="regmsg"></div>
       <div class="diskbox" id="regdisk" role="status" hidden></div>
       <div class="diffout" id="diffout"></div>
+      </div>
     </div>
 
-    <!-- 登録中のフォルダ（登録済みのときだけ表示） -->
+  </div>
+
+  <!-- 登録中のフォルダ（登録済みのときだけ表示・タブの外に常に出す） -->
+  <div class="folders wide">
     <div class="card" id="currentcard" style="margin-top:16px" hidden>
       <div class="card-head">登録中の資料フォルダ</div>
+      <div class="card-body">
       <div id="list"><div class="muted">読み込み中…</div></div>
       <div class="muted" style="font-size:var(--text-small);margin-top:8px">
-        ※「更新」は変更があったファイルだけを取り込み直します。「削除」は Sherpa の
-        <b>検索用データ（索引・テキスト化した写し・関係グラフ）だけ</b>を消します。
+        ※「ファイルの状態を更新」はフォルダの中の増減を一覧に反映します。増えたファイルは AI が名前で見つけて開けますが、意味での検索と影響の分析は「今すぐ更新」の後です。「今すぐ更新」は変更があったファイルだけを取り込み直します。「削除」は Slouch の
+        <b>検索用データと資料どうしの関係だけ</b>を消します。
         元の Windows フォルダ・ファイルは一切消えません。</div>
       <div class="note" id="listmsg"></div>
       <div class="diskbox" id="listdisk" role="status" hidden></div>
       <div class="diffout" id="rowdiff"></div>
+      </div>
     </div>
 
-    <!-- 資料の探し方の設定（登録済みのときだけ表示） -->
-    <div class="card" id="resolvecard" style="margin-top:16px" hidden>
-      <div class="card-head">資料の探し方の設定</div>
-      <div class="muted" style="font-size:var(--text-small);margin-bottom:8px">
-        COPY で取り込む部品が、いちばん近い場所で 1 つに決まらないとき、ここに書いた場所を上から順に探します。
-        場所は資料フォルダの中の場所（例: SystemA/COPYLIB）で、資料フォルダの中の一番上のフォルダの下だけ指定できます（別の一番上のフォルダをまたぐ指定はできません）。</div>
-      <label for="rs-copy" style="display:block;font-weight:600">COPY で取り込む部品の置き場所（1 行に 1 つ・上が優先）</label>
-      <textarea id="rs-copy" rows="3" style="width:100%;box-sizing:border-box" placeholder="例: SystemA/COPYLIB"></textarea>
-      <label for="rs-alias" style="display:block;font-weight:600;margin-top:10px">場所の別名（1 行に 1 つ・「別名 = 場所」の形）</label>
-      <textarea id="rs-alias" rows="3" style="width:100%;box-sizing:border-box" placeholder="例: inc = SystemA/include"></textarea>
-      <div style="margin-top:8px"><button class="btn-primary mini" id="rs-save">設定を保存</button></div>
-      <div class="note" id="rs-msg" role="status"></div>
-      <div class="muted" style="font-size:var(--text-small);margin-top:8px">
-        ※ 保存すると資料フォルダを取り込み直します（時間がかかります）。</div>
-    </div>
   </div>
 
-  <!-- ===== 下: 取り込み状況（文書一覧・全文検索） ===== -->
+  <div id="tabarea" hidden>
+  <div class="tabs" role="tablist" aria-label="資料の画面の切り替え">
+    <button class="tab" role="tab" type="button" id="tabbtn-status" aria-controls="tab-status" aria-selected="true" data-tab="status">取り込み状況</button>
+    <button class="tab" role="tab" type="button" id="tabbtn-rules" aria-controls="tab-rules" aria-selected="false" data-tab="rules">優先と除外<span class="dot" id="rules-dot" hidden aria-label="まだ保存していません">●</span></button>
+    <button class="tab" role="tab" type="button" id="tabbtn-setup" aria-controls="tab-setup" aria-selected="false" data-tab="setup">設定と点検</button>
+  </div>
+
+  <!-- ===== 取り込み状況（文書一覧・全文検索） ===== -->
+  <div id="tab-status" role="tabpanel" aria-labelledby="tabbtn-status">
   <div class="section-head">
     <div><div class="section-title">取り込み状況</div>
-      <div class="sub" style="font-size:var(--text-small)">どの資料が使えるかを確認し、失敗したものをやり直します</div>
-      <div class="sub" id="curpath" style="font-size:var(--text-small)"></div>
-      <a class="help-link" href="graph.html">ナレッジグラフで見る →</a></div>
+      <div class="sub" style="font-size:var(--text-small)">どの資料が使えるかを確認します（読み取りに失敗した資料は、資料フォルダの「詳細を表示」の一覧からやり直せます）</div>
+      <div class="sub" id="curpath" style="font-size:var(--text-small)"></div></div>
     <div class="spacer"></div>
     <span class="field"><label>資料フォルダ</label><select id="version"><option value="v1">v1</option></select></span>
     <button class="btn-ghost" id="detailbtn" hidden>詳細（管理）</button>
@@ -158,7 +199,6 @@
     <!-- 副導線: フォルダツリー（構造把握＋範囲選択） -->
     <aside class="treeside">
       <div class="treehead">範囲</div>
-      <div id="impdiag" class="impdiag" hidden></div>
       <div id="tree"></div>
     </aside>
 
@@ -171,13 +211,14 @@
         <span class="lbl">状態:</span>
         <button class="filterchip on" data-state="all" onclick="setState(this)">すべて</button>
         <button class="filterchip" data-state="ready" onclick="setState(this)">✓ 使えます</button>
+        <button class="filterchip" data-state="partial" onclick="setState(this)">一部使えます</button>
         <button class="filterchip" data-state="processing" onclick="setState(this)">⏳ 処理中</button>
         <button class="filterchip" data-state="failed" onclick="setState(this)">⚠ 失敗</button>
         <span class="spacer"></span>
         <span class="lbl" id="count"></span>
       </div>
       <div class="card es-card">
-        <div class="card-head"><span class="ico">🔎</span><div><div class="title">全文検索</div>
+        <div class="card-head"><span class="ico">🔎</span><div><div class="title">資料の本文を検索</div>
           <div class="sub" id="es-scope">現在の資料フォルダ全体</div></div></div>
         <div class="es-searchbar">
           <span class="field" style="flex:1"><span>🔎</span>
@@ -189,30 +230,138 @@
       <div class="card" style="box-shadow:none">
         <table class="grid">
           <thead><tr><th>名前</th><th style="width:96px">種類</th><th style="width:150px">状態</th>
-            <th style="width:160px">場所（範囲）</th><th style="width:90px">重要度</th><th style="width:170px"></th></tr></thead>
+            <th style="width:160px">場所（範囲）</th><th style="width:190px"></th></tr></thead>
           <tbody id="rows"></tbody>
         </table>
       </div>
-      <div class="note">✓ 使えます＝検索・影響分析の対象 ／ ⏳ 処理中 ／ ⚠ 失敗＝理由を見て「やり直す」。
-        左の<b>範囲</b>（フォルダ）で絞れます（どの階層でも部分木を1範囲として検索）。共有資料は閲覧のみ。</div>
+      <div class="note">✓ 使えます＝検索・影響分析の対象 ／ 一部使えます＝増えたばかりで、名前では見つかります（「今すぐ更新」の後に使えます） ／ ⏳ 処理中 ／ ⚠ 失敗＝理由を見て、元のファイルを直してから「今すぐ更新」を押してください。
+        1 件だけやり直すときは、資料フォルダの「詳細を表示」にある失敗の一覧から行います。
+        <b>範囲</b>（フォルダの木）で絞れます（どの階層でも部分木を1範囲として検索）。共有資料は閲覧のみ。</div>
     </div>
   </div>
   </div>
+
+  <!-- ===== 優先と除外 ===== -->
+  <div id="tab-rules" role="tabpanel" aria-labelledby="tabbtn-rules" hidden>
+    <div class="sub rules-lead">質問に答えるとき、先に読ませたい資料と、検索に出したくない資料を選びます。設定できるのは管理者だけです。
+      <a class="help-link" href="manual.html#importance">この画面の使い方 →</a></div>
+
+    <div class="banner" id="removed-banner" role="status" hidden></div>
+
+    <div class="tasks">
+      <div class="task"><span class="pill pri">優先</span><div>
+        <div class="q">正本の設計書を、回答で先に使わせたい</div>
+        <div class="a">選んだ範囲の中で先に読み、上の方に出します。「範囲の外でも読む」を付けると、利用者がほかの範囲を選んでいても、その資料を探す対象に足します。</div></div></div>
+      <div class="task"><span class="pill exc">除外</span><div>
+        <div class="q">古い版や下書きを、回答に使わせたくない</div>
+        <div class="a">利用者が何を選んでいても、検索に出しません。Windows のフォルダ・ファイルは消えません。いつでも「なし」に戻せます。</div></div></div>
+    </div>
+    <div class="sub" style="margin-bottom:8px">「ビルドの定義」の列は検索の設定とは別です。ソースの組のフォルダ（src・source・sources・ソース・ソースコード）の下の Makefile・*.csproj などは、印を付けなくても読みます。違うときだけ印を付けます。次の「今すぐ更新」でグラフだけを作り直して効かせます。</div>
+
+    <div class="layout">
+      <div class="card" style="margin-bottom:0">
+        <div class="card-head"><div><div class="title" id="world-title">資料フォルダ</div>
+          <div class="sub">フォルダかファイルを 1 つずつ選びます。フォルダに付けると、中のフォルダ・ファイルすべてに効きます。</div></div></div>
+        <div class="card-body"><div class="toolbar">
+          <input type="search" id="rules-q" placeholder="フォルダ名・ファイル名で探す" aria-label="フォルダ名・ファイル名で探す">
+          <span class="muted">表示:</span>
+          <button class="filterchip on" type="button" data-f="all">すべて</button>
+          <button class="filterchip" type="button" data-f="pri">優先</button>
+          <button class="filterchip" type="button" data-f="exc">除外</button>
+          <button class="filterchip" type="button" data-f="unsaved">まだ保存していない</button>
+        </div></div>
+        <div class="treehead"><span>名前</span><span>設定</span><span>ビルドの定義</span></div>
+        <div id="rules-tree" aria-busy="true"></div>
+        <div id="rootmore" style="padding:8px"></div>
+      </div>
+
+      <aside class="card side" style="margin-bottom:0">
+        <div class="card-head"><div><div class="title">今の設定</div>
+          <div class="sub" id="sidesub"></div></div></div>
+        <div class="card-body"><div id="sidelist"></div>
+        <div class="acts">
+          <button class="btn-primary" type="button" id="savebtn" disabled>保存する…</button>
+          <button class="btn-ghost" type="button" id="discardbtn" disabled>まだ保存していない変更を取り消す</button>
+        </div></div>
+      </aside>
+    </div>
+
+    <div class="rules-ovl" id="rules-ovl" role="dialog" aria-modal="true" aria-labelledby="dlgh" hidden>
+      <div class="dlg">
+        <div class="dh" id="dlgh">この内容で保存しますか</div>
+        <div class="db" id="dlgbody"></div>
+        <div class="df">
+          <button class="btn-ghost" type="button" id="cancelbtn">キャンセル（保存しない）</button>
+          <button class="btn-primary" type="button" id="okbtn">保存する</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 設定と点検 ===== -->
+  <div id="tab-setup" role="tabpanel" aria-labelledby="tabbtn-setup" hidden>
+  <div class="folders">
+    <!-- 資料の探し方の設定 -->
+    <div class="card" id="resolvecard" style="margin-top:16px">
+      <div class="card-head">資料の探し方の設定</div>
+      <div class="card-body">
+      <div class="muted" style="font-size:var(--text-small);margin-bottom:8px">
+        COPY で取り込む部品が、いちばん近い場所で 1 つに決まらないとき、ここに書いた場所を上から順に探します。
+        場所は資料フォルダの中の場所（例: SystemA/COPYLIB）で、資料フォルダの中の一番上のフォルダの下だけ指定できます（別の一番上のフォルダをまたぐ指定はできません）。</div>
+      <label for="rs-copy" style="display:block;font-weight:600">COPY で取り込む部品の置き場所（1 行に 1 つ・上が優先）</label>
+      <textarea id="rs-copy" rows="3" style="width:100%;box-sizing:border-box" placeholder="例: SystemA/COPYLIB"></textarea>
+      <label for="rs-alias" style="display:block;font-weight:600;margin-top:10px">場所の別名（1 行に 1 つ・「別名 = 場所」の形）</label>
+      <textarea id="rs-alias" rows="3" style="width:100%;box-sizing:border-box" placeholder="例: inc = SystemA/include"></textarea>
+      <details style="margin-top:10px">
+        <summary class="muted" style="font-size:var(--text-small);cursor:pointer">名前の対応（ふつうは書かなくてよい）</summary>
+        <div class="muted" style="font-size:var(--text-small);margin:4px 0">
+          書かなくても、見つからない名前は回答で「番号だけが違う近い名前」として出し、ソースを開いて確かめます。
+          名前の付け方の決まりがはっきり分かっているときだけ書いてください。</div>
+        <label for="rs-names" style="display:block;font-weight:600;margin-top:6px">名前の対応（1 行に 1 つ・「参照の名前 = 定義の名前」の形）</label>
+        <div class="muted" style="font-size:var(--text-small)">
+          プログラムの中で呼ぶ名前と、定義されている名前が決まった形でずれているとき、つなぎ方を書きます。
+          「*」は名前の一部（1 文字以上）を表し、両側に 1 つずつ使えます。大文字と小文字は区別しません。上の行から順に試します。<br>
+          右側には「?」（ちょうど 1 文字）も書けます。例: 「*00 = *0?」は、末尾 00 の名前を、末尾 0 とあと 1 文字の名前のソース全部へつなぎます。</div>
+        <textarea id="rs-names" rows="3" style="width:100%;box-sizing:border-box" placeholder="例: *0 = *1"></textarea>
+      </details>
+      <div style="margin-top:8px"><button class="btn-primary mini" id="rs-save">設定を保存</button></div>
+      <div class="note" id="rs-msg" role="status"></div>
+      <div class="muted" style="font-size:var(--text-small);margin-top:8px">
+        ※ 保存すると資料フォルダを取り込み直します（時間がかかります）。</div>
+      </div>
+    </div>
+    <!-- フォルダの置き方の点検 -->
+    <div class="card" id="checkcard" style="margin-top:16px">
+      <div class="card-head">フォルダの置き方を点検</div>
+      <div class="card-body">
+      <div class="muted" style="font-size:var(--text-small);margin-bottom:8px">
+        登録した資料フォルダが、期ごとにフォルダを分ける置き方の決まりに合っているかを確かめます。見るだけで、資料は変わりません。
+        最後に取り込んだときの資料の名前で点検します。</div>
+      <button class="btn-primary mini" id="chk-btn">点検する</button>
+      <div id="chk-out" role="status" style="margin-top:10px"></div>
+      </div>
+    </div>
+  </div>
+  </div>
+  </div>
+
+  <div class="toast" id="toast" role="status"></div>
+  </div>
 </div>
 
-<!-- 詳細（管理）: 抽出プレビュー（関係・廃止ラベルの精度監査） -->
+<!-- 詳細（管理） -->
 <div class="overlay" id="overlay">
   <div class="rv">
     <div class="rv-h">
       <div><div class="hl">取り込み内容の詳細（管理）</div>
-        <div class="sub">関係・廃止ラベルの精度監査</div></div>
+        <div class="sub">資料どうしの関係と表示状態を確認します</div></div>
       <div class="spacer"></div>
       <button class="closebtn" onclick="closePrev()">✕</button>
     </div>
     <div class="rv-bar" id="pv-bar"></div>
     <div class="rv-cols">
       <div class="col left">
-        <h4>抽出された要素</h4><div id="pv-ents"></div>
+        <h4>見つかった要素</h4><div id="pv-ents"></div>
       </div>
       <div class="col"><h4>関係</h4><div id="pv-rels"></div></div>
     </div>
@@ -234,6 +383,11 @@
   </div>
 </div>
 
+<script src="ingest-prov-gaps.js"></script>
+<script src="ingest-resolve.js"></script>
+<script src="rules.js"></script>
+<script src="ingest-tabs.js"></script>
 <script src="ingest.js"></script>
+<script src="ingest-check.js"></script>
 </body>
 </html>

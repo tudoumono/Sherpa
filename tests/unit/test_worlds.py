@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from sherpa import store, worlds
+from tests._replace_row import use_offline_rows
 
 
 @pytest.fixture
@@ -356,6 +357,7 @@ def _register_stubs(monkeypatch):
     """`worlds.register` の外部境界（ロック・DB・Neo4j・ES）を無害化する。個別テストが上書きする。"""
     from sherpa import es_index
     from sherpa.ingest import world_neo4j
+    from sherpa.store import ocr_jobs
 
     @contextlib.contextmanager
     def _noop_lock(*a, **kw):
@@ -366,11 +368,18 @@ def _register_stubs(monkeypatch):
     monkeypatch.setattr(store, "get_world", lambda w: None)
     monkeypatch.setattr(store, "world_by_root", lambda root: None)
     monkeypatch.setattr(store, "upsert_world", lambda *a, **kw: None)
-    monkeypatch.setattr(store, "replace_documents", lambda w, rows: 0)
+    monkeypatch.setattr(store, "replace_documents", lambda w, rows, **_kw: 0)
+    monkeypatch.setattr(store, "stage_ledger", lambda w, rows, names, **_kw: len(rows))
+    monkeypatch.setattr(store, "switch_ledger", lambda w, **_kw: None)
     monkeypatch.setattr(store, "delete_world_row", lambda w: None)
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
-    monkeypatch.setattr(world_neo4j, "delete_world", lambda w, uri, user, pw: 0)
-    monkeypatch.setattr(es_index, "delete_world", lambda w: True)
+    monkeypatch.setattr(world_neo4j, "delete_world", lambda w, uri, user, pw, **_kw: 0)
+    monkeypatch.setattr(es_index, "delete_world", lambda w, **kw: True)
+    monkeypatch.setattr(store, "set_world_sig", lambda *a, **kw: None)
+    monkeypatch.setattr(store, "clear_failed_docs", lambda w: 0)
+    monkeypatch.setattr(ocr_jobs, "purge_world", lambda w, **kw: {})
+    monkeypatch.setattr(worlds, "observation_removal_target", lambda w: None)
+    use_offline_rows(monkeypatch)
 
 
 def _fail_run_locked(monkeypatch, message):
@@ -455,22 +464,25 @@ def test_register_cleanup_compensates_neo4j_documents_es_when_replace_documents_
 
     neo4j_load_calls = []
     monkeypatch.setattr(world_neo4j, "load_world",
-                        lambda nodes, edges, w, uri, user, pw, plugin_failures=None, unparsed_sources=None: neo4j_load_calls.append(w) or (0, 0))
+                        lambda nodes, edges, w, uri, user, pw, plugin_failures=None, unparsed_sources=None, **_kw: neo4j_load_calls.append(w) or (0, 0))
     neo4j_delete_calls = []
     monkeypatch.setattr(world_neo4j, "delete_world",
-                        lambda w, uri, user, pw: neo4j_delete_calls.append(w))
+                        lambda w, uri, user, pw, **_kw: neo4j_delete_calls.append(w))
 
     replace_calls = []
 
-    def _fake_replace(w, rows):
+    def _fake_replace(w, rows, **_kw):   # cleanup の補償クリア（空リスト）
         replace_calls.append((w, list(rows)))
-        if rows:   # `_run_locked` 自身の呼び出し（台帳を書こうとする）だけ失敗させる
-            raise RuntimeError("original worker failure: pg_replace")
-        return 0   # cleanup の補償クリア（空リスト）は成功させる
+        return 0
+
+    def _fail_switch(w, **_kw):   # `_run_locked` 自身の切り替え（Neo4j の入れ替えの後）だけ失敗させる
+        raise RuntimeError("original worker failure: pg_replace")
+    monkeypatch.setattr(store, "stage_ledger", lambda w, rows, names, **_kw: len(rows))
+    monkeypatch.setattr(store, "switch_ledger", _fail_switch)
     monkeypatch.setattr(store, "replace_documents", _fake_replace)
 
     es_delete_calls = []
-    monkeypatch.setattr(es_index, "delete_world", lambda w: es_delete_calls.append(w))
+    monkeypatch.setattr(es_index, "delete_world", lambda w, **kw: es_delete_calls.append(w) or True)
     delete_row_calls = []
     monkeypatch.setattr(store, "delete_world_row", lambda w: delete_row_calls.append(w))
 

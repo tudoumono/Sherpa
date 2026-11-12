@@ -27,6 +27,7 @@ import pytest
 
 from sherpa import compare_docs, mcp_server, tool_dispatch, worlds
 from sherpa.ingest import evidence_render, office_md
+from tests._replace_row import offline_row
 
 _WORLD = "gendiff-test"
 _XLSX_NAME = "代理店手数料機能設計書.xlsx"
@@ -73,7 +74,7 @@ def _world_dir():
 
     derived_root = d / "derived"
     os.environ["SHERPA_DERIVED_DIR"] = str(derived_root)
-    rep = office_md.build_derived(wd, worlds.derived_md_dir(_WORLD))
+    rep = office_md.build_derived(wd, worlds.derived_md_dir(_WORLD), row=offline_row("w"))
     assert rep["rag_failed"] == 0, rep
 
     # 表現バージョン不一致を検証するため、4期側の旧仕様書.rag.md だけヘッダの

@@ -26,11 +26,13 @@ import pytest
 
 from sherpa import corpus_docs, es_index, reconcile, store
 from sherpa.ingest import world_neo4j, worker
+from tests._replace_row import use_offline_rows
 
 
 @pytest.fixture(autouse=True)
 def _stub_pipeline(monkeypatch):
     """`worker.run` を DB/Neo4j 無しで駆動できるよう周辺を差し替える（happy path 既定）。"""
+    use_offline_rows(monkeypatch)
     monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig", {"a": [1, 2, 3]}))
     monkeypatch.setattr(worker, "build_world_graph", lambda world: ([], [], []))
     monkeypatch.setattr(worker, "_build_derived",
@@ -38,7 +40,7 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(worker, "_ledger_rows", lambda world, *, sig: [])
     monkeypatch.setattr(worker, "world_signature", lambda world: "sig")
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None: (0, 0))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None, **_kw: (0, 0))
     monkeypatch.setattr(es_index, "index_world",
                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 0, "chunks": 0})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
@@ -47,7 +49,8 @@ def _stub_pipeline(monkeypatch):
     def _noop_lock(world_id):
         yield
     monkeypatch.setattr(store, "world_lock", _noop_lock)
-    monkeypatch.setattr(store, "replace_documents", lambda world, rows: 0)
+    monkeypatch.setattr(store, "stage_ledger", lambda world, rows, names, **_kw: len(rows))
+    monkeypatch.setattr(store, "switch_ledger", lambda world, **_kw: None)
 
     captured = {"set_world_sig_calls": [], "set_world_sig_doc_counts": []}
 
@@ -84,7 +87,7 @@ def _stub_pipeline(monkeypatch):
     # 記録先（`captured["set_world_sig_calls"]`）は両方の呼び出し元から同じ形で集める。
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None, drop=None):
         if sig is not None:
             captured["set_world_sig_calls"].append(sig)
             captured["set_world_sig_doc_counts"].append(doc_count)
@@ -139,7 +142,7 @@ def test_record_failure_leaves_sig_unconfirmed(monkeypatch, _stub_pipeline):
 
 
 def test_pg_replace_failure_marks_exception_as_already_recorded(monkeypatch, _stub_pipeline):
-    """台帳更新（`store.replace_documents`）失敗時は理由付きで `ingest_runs` に記録した
+    """台帳の見せる番号の切り替え（`store.switch_ledger`）失敗時は理由付きで `ingest_runs` に記録した
     うえで、元の例外に `_sherpa_ingest_run_recorded` 属性を付けて re-raise する——
     呼び出し元（`routers/worlds.py::_run_worker_or_503` 等）が同じ失敗を汎用な理由で
     二重記録しないための目印（1回の取り込みで ingest_runs に2件残る事故を防ぐ）。
@@ -149,11 +152,12 @@ def test_pg_replace_failure_marks_exception_as_already_recorded(monkeypatch, _st
     `get_latest_published_run_summary` が返す「今実際に Neo4j にある内容」を、この run が新世代の
     まま止めてしまわないようにする。
     """
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None: (4, 6))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None, unparsed_sources=None, **_kw: (4, 6))
 
-    def _boom_replace(world, rows):
+    def _boom_switch(world, **_kw):
         raise RuntimeError("pg_replace fault")
-    monkeypatch.setattr(store, "replace_documents", _boom_replace)
+    monkeypatch.setattr(store, "stage_ledger", lambda world, rows, names, **_kw: len(rows))
+    monkeypatch.setattr(store, "switch_ledger", _boom_switch)
 
     recorded = []
 
@@ -191,8 +195,8 @@ def test_build_derived_error_blocks_downstream_and_leaves_sig_unconfirmed(monkey
     graph_calls = []
     monkeypatch.setattr(worker, "build_world_graph", lambda world: graph_calls.append(world) or ([], [], []))
     replace_calls = []
-    monkeypatch.setattr(store, "replace_documents",
-                        lambda world, rows: replace_calls.append(rows) or 0)
+    monkeypatch.setattr(store, "stage_ledger", lambda world, rows, names, **_kw: replace_calls.append(rows) or len(rows))
+    monkeypatch.setattr(store, "switch_ledger", lambda world, **_kw: None)
 
     res = worker.run("w")
 
@@ -219,8 +223,8 @@ def test_unreadable_code_file_blocks_downstream_and_leaves_sig_unconfirmed(monke
                         lambda world: ([], [], [{"doc": "案件A/BADPROG.cbl",
                                                  "reason": "unreadable_code_file", "action": "blocked"}]))
     replace_calls = []
-    monkeypatch.setattr(store, "replace_documents",
-                        lambda world, rows: replace_calls.append(rows) or 0)
+    monkeypatch.setattr(store, "stage_ledger", lambda world, rows, names, **_kw: replace_calls.append(rows) or len(rows))
+    monkeypatch.setattr(store, "switch_ledger", lambda world, **_kw: None)
 
     res = worker.run("w")
 
@@ -244,6 +248,34 @@ def test_graph_reflect_failure_reason_is_logged_as_one_error_line(monkeypatch, _
     assert len(lines) == 1 and "graph_reflect_failed:ConnectionError@" in lines[0] and "world=w" in lines[0]
 
 
+def test_graph_write_memory_exhaustion_reason_names_the_settings_to_raise(monkeypatch, _stub_pipeline, caplog):
+    """Neo4j の 1 回の書き込みがメモリの上限に当たった失敗は、失敗の記録・ログに『書き込みのメモリ不足』と上げる設定名を残す。"""
+    class _PoolExhausted(Exception):                 # Neo4j ドライバの TransientError（外部境界）の代わり
+        code = "Neo.TransientError.General.MemoryPoolOutOfMemoryError"
+
+    def _boom(*a, **k):
+        raise _PoolExhausted("The allocation of an extra 2.0 MiB would use more than the limit 896.0 MiB")
+    monkeypatch.setattr(world_neo4j, "load_world", _boom)
+
+    with caplog.at_level("ERROR", logger="sherpa.ingest.convert"):
+        res = worker.run("w")
+
+    assert res["status"] == "failed"
+    reason = res["flags"][0]["reason"]
+    assert reason.startswith("graph_reflect_failed:MemoryPoolOutOfMemoryError@")
+    assert "メモリが足りません" in reason and "SHERPA_NEO4J_HEAP_FIXED" in reason and "SHERPA_NEO4J_TX_MEMORY_MAX" in reason
+    lines = [r.getMessage() for r in caplog.records if r.levelname == "ERROR" and "取り込みが失敗しました" in r.getMessage()]
+    assert len(lines) == 1 and "SHERPA_NEO4J_HEAP_FIXED" in lines[0]
+
+
+def test_is_memory_pool_error_matches_code_or_message_only():
+    class _E(Exception):
+        code = "Neo.TransientError.General.MemoryPoolOutOfMemoryError"
+    assert world_neo4j.is_memory_pool_error(_E("x"))
+    assert world_neo4j.is_memory_pool_error(RuntimeError("Neo.TransientError.General.MemoryPoolOutOfMemoryError: ..."))
+    assert not world_neo4j.is_memory_pool_error(ConnectionError("down"))
+
+
 def test_build_derived_error_then_next_sync_retries(monkeypatch, _stub_pipeline):
     """(M) 1回目のsyncでbuild_derivedが失敗してsigが未確定のままだと、2回目のsyncは
     `prev != sig` により必ず全再構築（run）へ入り直す（既存派生A・更新原本Bのシナリオ）。"""
@@ -259,7 +291,7 @@ def test_build_derived_error_then_next_sync_retries(monkeypatch, _stub_pipeline)
     # pre-invalidate 専用に残る）——ここでも db_row への反映を模擬する。
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None, drop=None):
         if sig is not None:
             _stub_pipeline["set_world_sig_calls"].append(sig)
             db_row["last_sig"] = sig
@@ -308,7 +340,7 @@ def test_build_derived_publish_rename_failure_leaves_sig_unconfirmed_and_retries
 
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None, drop=None):
         if sig is not None:
             _stub_pipeline["set_world_sig_calls"].append(sig)
             db_row["last_sig"] = sig

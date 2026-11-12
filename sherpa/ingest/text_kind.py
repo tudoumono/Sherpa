@@ -17,13 +17,14 @@ from pathlib import Path
 # ---- 第1段: 拡張子マップ（固定表）----------------------------------------------------------
 # 一般言語＋設定ファイル系はコード側。言語アナライザ登録簿（`sherpa.ingest.analyzers.registry`）に
 # 専用アナライザがある拡張子はここに置かない。
-CODE_EXT = frozenset({
+LANG_EXT = frozenset({
     ".py", ".ts",
     ".cpp", ".hpp", ".pl", ".ps1", ".psm1",
     ".go", ".rb", ".php", ".kt", ".swift", ".scala", ".lua", ".r", ".awk",
-    # 設定ファイル系（key=value が支配的＝コード側）。環境変数ファイルは `SENSITIVE_EXT` に置く
-    ".ini", ".cfg", ".conf", ".json", ".toml",
 })
+# 設定ファイル系（key=value が支配的＝コード側）。環境変数ファイルは `SENSITIVE_EXT` に置く。ビルドの定義の読み取りは言語と設定を分けて扱う
+CONFIG_EXT = frozenset({".ini", ".cfg", ".conf", ".json", ".toml"})
+CODE_EXT = LANG_EXT | CONFIG_EXT
 
 # 資料側（自然文・表データ等）。
 DOCUMENT_EXT = frozenset({".csv", ".tsv", ".rtf", ".log"})

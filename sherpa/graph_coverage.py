@@ -1,7 +1,7 @@
 """グラフ読み取りの未完了・打ち切りの申告（`coverage`）。
 
-「関連なし」と「調べきれなかった」を区別するための共通の欄で、Codex の道具（`graph_neighbors`）・原因調査のレンズ
-（`lens_service.run_troubleshoot`）・影響レンズ（`impact_service.run_impact`）・外部 API の graph 検索が同じ語彙を使う。
+「関連なし」と「調べきれなかった」を区別するための共通の欄で、Codex の道具（`graph_neighbors`）・影響レンズ
+（`impact_service.run_impact`）・外部 API の graph 検索が同じ語彙を使う。
 契約: docs/design/interfaces.md「coverage（未完了・打ち切りの申告）」・docs/design/external-api.md（C-EXT-SEARCH-01）。
 このモジュールは他のモジュールを import しない（読み取り部品 `parts/read` からも使える）。
 """
@@ -17,11 +17,13 @@ KIND_CARD_CAP = "card_cap"                        # 近傍カードの件数・�
 KIND_GRAPH_UNAVAILABLE = "graph_unavailable"
 KIND_GRAPH_REINGEST_REQUIRED = "graph_reingest_required"
 KIND_PLUGIN_FAILED = "plugin_failed"              # FW プラグインの失敗（`limits[].plugin` にプラグイン名。欠けはそのプラグインを直して取り込み直すまで残る）
+KIND_NARROW_REQUIRED = "narrow_required"          # 起点の候補が多すぎるため、たどらずに絞り込みを求めた（`path_prefix`・`kind` で絞って聞き直す）
 KIND_SOURCE_UNPARSED = "source_unparsed"          # 構文を読み切れない／大きすぎるソースをグラフに入れていない（`limits[].count` にそのファイル数。「関係が無い」とは言えない）
 
 LIMIT_KINDS = (
     KIND_TIMEOUT, KIND_ROW_CAP, KIND_DEPTH, KIND_RESULT_CAP, KIND_DOC_SEARCH_TRUNCATED, KIND_CARD_CAP,
     KIND_GRAPH_UNAVAILABLE, KIND_GRAPH_REINGEST_REQUIRED, KIND_PLUGIN_FAILED, KIND_SOURCE_UNPARSED,
+    KIND_NARROW_REQUIRED,
 )
 
 # 処理の段階（`limits[].stage`・Codex の道具と各レンズだけが付ける。外部 API の `limits` には出さない）。

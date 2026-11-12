@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import pathlib
 import tempfile
+
+import pytest
 import types
 
-from sherpa import agentic_search, embeddings, graph_admin, intent_llm as I, llm, metering
+from sherpa import agentic_search, embeddings, intent_llm as I, llm, metering
 from sherpa.ingest import graph_extract as GE
 from sherpa.ingest.arms import vision_arm
 from sherpa.store import usage_events as ue
@@ -101,7 +103,8 @@ def test_intent_classify_records_even_on_json_parse_failure(monkeypatch):
         "usage": {"prompt_tokens": 8, "completion_tokens": 1}})
     _enable(monkeypatch)
     calls = _spy(monkeypatch)
-    assert I.classify("なにか", {}) is None
+    with pytest.raises(I.IntentClassifierError):
+        I.classify("なにか", {})
     assert len(calls) == 1 and calls[0]["input_tokens"] == 8
 
 
@@ -174,8 +177,6 @@ def test_openai_embed_restores_input_order_from_response_indices(monkeypatch):
 
     assert embeddings.embed(["first", "second"], config) == [[1.0, 1.0], [2.0, 2.0]]
 
-
-# ---- graph_admin.ask_graph ----
 
 # ---- vision_arm.VisionArm.convert（VLM）----
 

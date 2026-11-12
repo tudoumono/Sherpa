@@ -97,9 +97,34 @@ def test_run_records_stage_timings_and_counts_with_real_corpus():
             assert stage in st and st[stage]["finished_at"] and st[stage]["elapsed_ms"] >= 0
 
     counts = snap["counts"]
+    assert counts["scan_passes"] == 1
     assert counts["scanned"] >= counts["targeted"]
     assert counts["targeted"] >= counts["converted"] + counts["failed"] + counts["unsupported"]
     assert counts["legacy_converted"] >= 0 and counts["legacy_failed"] >= 0
+    conversion = counts["conversion"]
+    assert conversion["targeted"] >= conversion["completed"]
+    assert conversion["actual"] + conversion["cache_restored"] == conversion["completed"]
+    assert conversion["wall_ms"] >= 0 and conversion["actual_cumulative_ms"] >= 0
+    assert conversion["cache_restore_ms"] >= 0
+    assert conversion["prefetch"]["converted"] >= 0
+    assert conversion["prefetch"]["child_cumulative_ms"] >= 0
+    assert conversion["content_cache_restored"]["count"] is None
+    assert conversion["content_cache_restored"]["unavailable_reason"]
+    assert isinstance(counts["scale"]["formats"], dict)
+    assert counts["scale"]["graph"]["nodes"] >= 0
+    assert counts["scale"]["graph"]["edges"] >= 0
+    if "embedding" in counts:
+        embedding = counts["embedding"]
+        wall = embedding["wall_ms"]
+        assert wall["api_wait"] + wall["cache_lookup"] + wall["other"] == wall["total"]
+        if "embed_elapsed_ms" in counts:
+            assert wall["total"] == counts["embed_elapsed_ms"]
+        assert embedding["new"] >= 0 and embedding["api_cumulative_ms"] >= 0
+        assert embedding["reused"]["unavailable_reason"]
+        assert counts["scale"]["embedding"] == {
+            "bundles": embedding["bundle_count"],
+            "distinct_inputs": embedding["distinct_inputs"],
+        }
 
 
 def test_rerun_endpoint_and_runs(auth_disabled):

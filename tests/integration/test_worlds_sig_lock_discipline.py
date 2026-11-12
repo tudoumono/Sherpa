@@ -62,13 +62,13 @@ def _install_sig_confirm_spies(calls, doc_counts):
         return orig_set_sig(world, sig, manifest=manifest, doc_count=doc_count, scan_report=scan_report)
 
     def _spy_confirm(run_id, world, *, status, extraction_snapshot=None, published_snapshot=None, failed_docs=None,
-                     source_doc_ids=None, sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
+                     source_doc_ids=None, sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None, drop=None):
         if sig is not None:
             calls.append(sig)
             doc_counts.append(doc_count)
         return orig_confirm(run_id, world, status=status, extraction_snapshot=extraction_snapshot,
                             published_snapshot=published_snapshot, source_doc_ids=source_doc_ids,
-                            sig=sig, manifest=manifest, doc_count=doc_count, scan_report=scan_report)
+                            sig=sig, manifest=manifest, doc_count=doc_count, scan_report=scan_report, drop=drop)
 
     store.set_world_sig = _spy_set_sig
     store.finish_ingest_run_and_confirm_world = _spy_confirm

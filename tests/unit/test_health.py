@@ -674,12 +674,12 @@ def _tags_payload(*names: str) -> bytes:
     return json.dumps({"models": [{"name": n} for n in names]}).encode()
 
 
-_OLLAMA_EMBED = {"provider": "ollama", "url": "http://127.0.0.1:11434", "model": "nomic-embed-text", "dim": 768}
+_OLLAMA_EMBED = {"provider": "ollama", "url": "http://127.0.0.1:11434", "model": "bge-m3", "dim": 1024}
 
 
 @pytest.mark.parametrize("tags, embed_cfg, ok", [
     pytest.param(("qwen2.5:latest",), _OLLAMA_EMBED, False, id="embed-model-missing"),
-    pytest.param(("nomic-embed-text:latest",), _OLLAMA_EMBED, True, id="embed-model-present-with-latest"),
+    pytest.param(("bge-m3:latest",), _OLLAMA_EMBED, True, id="embed-model-present-with-latest"),
     pytest.param(("qwen2.5:latest",), None, True, id="embed-not-ollama-unaffected"),
 ])
 def test_ollama_ping_embed_model_check(monkeypatch, tags, embed_cfg, ok):
@@ -690,8 +690,21 @@ def test_ollama_ping_embed_model_check(monkeypatch, tags, embed_cfg, ok):
     out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
     assert out["ok"] is ok
     if not ok:
-        assert "nomic-embed-text" in out["detail"]
-        assert "ollama pull nomic-embed-text" in out["detail"]
+        assert "bge-m3" in out["detail"]
+        assert "ollama pull bge-m3" in out["detail"]
+
+
+def test_ollama_ping_detects_missing_embed_model_even_when_dim_is_unmeasurable(monkeypatch):
+    """次元を測れない（モデルが無いと測れない）ときも、埋め込みは Ollama を使っていると判定してモデル不足を検出する。"""
+    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
+    monkeypatch.setattr(embeddings, "_ollama_dim_cache", {})
+    monkeypatch.setattr(embeddings, "_ollama_dim_failed", {})
+    monkeypatch.setattr(store, "get_system_settings", lambda: {"ollama_url": "http://127.0.0.1:11434"})
+    monkeypatch.setattr(llm, "urlopen_no_redirect",
+                        lambda url, timeout=None: _FakeOllamaTagsResponse(_tags_payload("qwen2.5:latest")))
+    monkeypatch.setattr(llm, "post_json", lambda *a, **k: (_ for _ in ()).throw(OSError("model not found")))
+    out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
+    assert out["ok"] is False and "ollama pull bge-m3" in out["detail"]
 
 
 def test_ai_check_codex_ollama_requires_codex_model_pulled(monkeypatch):

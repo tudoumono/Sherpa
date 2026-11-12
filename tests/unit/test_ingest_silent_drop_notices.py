@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+import io
 import urllib.error
 
 import pytest
@@ -16,6 +17,7 @@ from sherpa import corpus_docs, es_index, graph_coverage, store, worlds
 from sherpa.ingest import office_md, text_kind, world_graph
 from sherpa.ingest.arms import ArmResult, vision_arm
 from sherpa.routers import worlds as worlds_router
+from tests._replace_row import offline_row
 
 pytestmark = pytest.mark.usefixtures("upstream_only_registry")
 
@@ -180,25 +182,22 @@ def _es_env(monkeypatch, tmp_path, docs, read):
         if method == "PUT":
             puts.append(body["mappings"]["properties"]["text"]["analyzer"])
             if puts[-1] == "kuromoji":
-                raise urllib.error.HTTPError(path, 400, "unknown analyzer", {}, None)
+                raise urllib.error.HTTPError(path, 400, "bad", {}, io.BytesIO(b'{"error":"Unknown tokenizer type [kuromoji_tokenizer]"}'))
         return {}
 
     monkeypatch.setattr(es_index, "_req", req)
     return puts
 
 
-def test_es_analyzer_fallback_is_reported(monkeypatch, tmp_path):
-    """日本語アナライザを作れず標準で索引を作り直したことが、索引の結果と状態の通知に出る。"""
+def test_es_japanese_analyzer_missing_stops_instead_of_switching_to_standard(monkeypatch, tmp_path):
+    """日本語アナライザを作れないとき、標準アナライザで作り直さず、止めて理由を返す（解析の方式を黙って変えない）。"""
     docs = [{"name": "a.md", "md_path": None, "top_scope": "t"}]
     puts = _es_env(monkeypatch, tmp_path, docs, lambda w, d: "本文")
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
-    res = es_index.index_world("w")
+    res = es_index.index_world("w", row=offline_row("w"))
 
-    assert puts == ["kuromoji", "standard"]
-    assert res["analyzer_fallback"] is True
-    _stub_runs(monkeypatch, es_snapshot={"available": True, "error": None, "chunks": 1, "analyzer_fallback": True})
-    summary = worlds_router._ingest_summary("w", _row())
-    assert {"code": "es_analyzer_fallback", "count": 1} in summary["ingest_notices"]
+    assert puts == ["kuromoji"]
+    assert res["error"] == "analyzer_unavailable" and res["indexed"] == 0 and "analyzer_fallback" not in res
 
 
 def test_es_degraded_docs_and_bm25_only_are_recorded_without_extra_embedding_calls(monkeypatch, tmp_path):
@@ -218,7 +217,7 @@ def test_es_degraded_docs_and_bm25_only_are_recorded_without_extra_embedding_cal
         return None
 
     monkeypatch.setattr(es_index.embeddings, "embed", failing_embed)
-    res = es_index.index_world("w")
+    res = es_index.index_world("w", row=offline_row("w"))
 
     assert res["rag_degraded_by_reason"] == {"text_read_failed": 1}
     assert res["embed_degraded"] is True and res["vectors"] is False

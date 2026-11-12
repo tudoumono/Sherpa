@@ -93,11 +93,13 @@ def test_embeddings_cfg_ignores_embed_provider_uses_auto(monkeypatch):
     到達可能）に従う。"""
     _no_env(monkeypatch)
     monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
+    monkeypatch.setattr(llm, "post_json", lambda *a, **k: {"data": [{"index": 0, "embedding": [0.1] * 768}]})
+    monkeypatch.setattr(embeddings, "_ollama_dim_cache", {})
     settings = {"extract_provider": "openai", "embed_provider": "openai",
                 "ollama_url": "http://localhost:11434"}
     cfg = embeddings.cfg(settings)
     assert cfg == {"provider": "ollama", "url": "http://localhost:11434",
-                   "model": "nomic-embed-text", "dim": 768, "parallel": 4}
+                   "model": "bge-m3", "dim": 768, "parallel": 4}
 
 
 def test_embeddings_cfg_openai_default_model_unchanged(monkeypatch):
@@ -147,6 +149,9 @@ def test_embeddings_cfg_ollama_embed_model_catalog_override(monkeypatch):
         "model_catalog": {"ollama": {"embed": {"allowed": ["my-ollama-embed"],
                                                "default": "my-ollama-embed"}}}})
     monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
+    monkeypatch.setattr(embeddings.llm, "post_json", lambda *a, **k: {"data": [{"index": 0, "embedding": [0.1] * 768}]})  # 次元の実測（Ollama の境界）
+    embeddings._ollama_dim_cache.clear()
+    embeddings._ollama_dim_failed.clear()
     cfg = embeddings.cfg({"extract_provider": "ollama", "ollama_url": "http://localhost:11434"})
     assert cfg == {"provider": "ollama", "url": "http://localhost:11434",
                    "model": "my-ollama-embed", "dim": 768, "parallel": 4}

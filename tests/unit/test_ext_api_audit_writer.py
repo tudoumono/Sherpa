@@ -1,4 +1,4 @@
-"""`sherpa.ext_api._AuditWriter`（監査DB書込み専用の単一 writer スレッド＋bounded queue）の
+"""`sherpa.ext.audit._AuditWriter`（監査DB書込み専用の単一 writer スレッド＋bounded queue）の
 状態遷移・キャンセル耐性の単体テスト。DB 不要（`_write_pending_audit` を monkeypatch する）。
 
 対象: RUNNING→STOPPING→STOPPED の admission 制御（stop() と submit() の競合防止）、
@@ -15,20 +15,20 @@ import time
 
 import pytest
 
-from sherpa import ext_api
+from sherpa.ext import audit
 
 
 @pytest.fixture
 def writer(monkeypatch):
     """DB に触れない `_write_pending_audit` へ差し替えた、独立の `_AuditWriter` インスタンス
-    （共有シングルトン `ext_api._audit_writer` には触れない）。"""
+    （共有シングルトン `audit._audit_writer` には触れない）。"""
     calls = []
 
     def _fake_write(pending, status_code, duration_ms, method, path, request_id):
         calls.append(request_id)
 
-    monkeypatch.setattr(ext_api, "_write_pending_audit", _fake_write)
-    w = ext_api._AuditWriter(maxsize=100)
+    monkeypatch.setattr(audit, "_write_pending_audit", _fake_write)
+    w = audit._AuditWriter(maxsize=100)
     w.calls = calls   # type: ignore[attr-defined]
     try:
         yield w
@@ -58,7 +58,7 @@ def test_submit_rejected_after_stop(writer):
     """`stop()` で状態が STOPPED になった後の `submit()` は None を返す（受け付けない）。"""
     writer.start()
     writer.stop(drain_timeout=2)
-    assert writer._state == ext_api._WRITER_STOPPED
+    assert writer._state == audit._WRITER_STOPPED
     assert _submit(writer) is None
 
 
@@ -89,7 +89,7 @@ def test_cancelled_future_does_not_kill_writer_thread(writer, monkeypatch):
             release.wait(timeout=5)   # writer がこの item を処理し始めてから、外側でキャンセルする猶予
         writer.calls.append(request_id)
 
-    monkeypatch.setattr(ext_api, "_write_pending_audit", _slow_then_normal)
+    monkeypatch.setattr(audit, "_write_pending_audit", _slow_then_normal)
 
     fut1 = _submit(writer, request_id="cancel-me")
     assert entered.wait(timeout=5), "writer が cancel-me の処理に入らなかった"
@@ -115,7 +115,7 @@ def test_start_waits_for_concurrent_stop_to_finish(writer, monkeypatch):
             release.wait(timeout=10)
         writer.calls.append(request_id)
 
-    monkeypatch.setattr(ext_api, "_write_pending_audit", _blocking_write)
+    monkeypatch.setattr(audit, "_write_pending_audit", _blocking_write)
     _submit(writer, request_id="blocker")
     assert entered.wait(timeout=5), "writer がブロッキング処理に入らなかった"
 
@@ -149,7 +149,7 @@ def test_start_waits_for_concurrent_stop_to_finish(writer, monkeypatch):
     t_stop.join(timeout=5)
     t_start.join(timeout=5)
     assert stop_done.is_set() and start_done.is_set()
-    assert writer._state == ext_api._WRITER_RUNNING   # start() が後勝ち・最終的に RUNNING で終わる
+    assert writer._state == audit._WRITER_RUNNING   # start() が後勝ち・最終的に RUNNING で終わる
 
     fut = _submit(writer, request_id="after-race")
     assert fut.result(timeout=5) is None
@@ -185,7 +185,7 @@ def test_concurrent_stop_calls_share_the_same_completion(writer, monkeypatch):
     assert len(results) == 5, "全ての stop() 呼び出しが完了しているはず"
     sentinel_puts = [c for c in put_calls if c is None]
     assert len(sentinel_puts) == 1, f"sentinel は一度だけ投入されるはず（実際 {len(sentinel_puts)} 回）"
-    assert writer._state == ext_api._WRITER_STOPPED
+    assert writer._state == audit._WRITER_STOPPED
 
 
 def test_stop_leaves_no_residual_sentinel_for_next_start(writer):
@@ -213,14 +213,14 @@ def test_stop_join_timeout_keeps_thread_reference(writer, monkeypatch):
         entered.set()
         release.wait(timeout=10)
 
-    monkeypatch.setattr(ext_api, "_write_pending_audit", _blocking_write)
+    monkeypatch.setattr(audit, "_write_pending_audit", _blocking_write)
     try:
         _submit(writer, request_id="blocker")
         assert entered.wait(timeout=5), "writer がブロッキング処理に入らなかった"
         thread_before = writer._thread
         writer.stop(drain_timeout=0.2)   # 処理中なのですぐには終わらない＝join timeout
         assert writer._thread is thread_before, "join timeout で thread 参照が失われている"
-        assert writer._state != ext_api._WRITER_STOPPED
+        assert writer._state != audit._WRITER_STOPPED
     finally:
         release.set()
         if writer._thread is not None:
@@ -237,7 +237,7 @@ def test_join_timeout_then_start_stop_retries_are_deterministic(writer, monkeypa
     - 旧世代が実際に終わった後は `start()` が新スレッドを正しく起動し、旧世代の item も
       新世代の item もどちらも処理されている。
     """
-    monkeypatch.setattr(ext_api, "_AUDIT_QUEUE_DRAIN_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(audit, "_AUDIT_QUEUE_DRAIN_TIMEOUT_S", 0.2)
     writer.start()
     release = threading.Event()
     entered = threading.Event()
@@ -248,13 +248,13 @@ def test_join_timeout_then_start_stop_retries_are_deterministic(writer, monkeypa
             release.wait(timeout=10)
         writer.calls.append(request_id)
 
-    monkeypatch.setattr(ext_api, "_write_pending_audit", _blocking_write)
+    monkeypatch.setattr(audit, "_write_pending_audit", _blocking_write)
     _submit(writer, request_id="blocker")
     assert entered.wait(timeout=5), "writer がブロッキング処理に入らなかった"
 
     old_thread = writer._thread
     writer.stop(drain_timeout=0.2)   # blocker がまだブロック中＝join timeout
-    assert writer._state == ext_api._WRITER_STOPPING
+    assert writer._state == audit._WRITER_STOPPING
     assert writer._thread is old_thread, "join timeout で thread 参照が失われている"
     assert writer._sentinel_put is True
     assert not writer._stopped_event.is_set()
@@ -263,7 +263,7 @@ def test_join_timeout_then_start_stop_retries_are_deterministic(writer, monkeypa
     # 新スレッドを起こさず諦める。
     writer.start()
     assert writer._thread is old_thread, "旧世代が終わっていないのに新スレッドが起動された"
-    assert writer._state == ext_api._WRITER_STOPPING
+    assert writer._state == audit._WRITER_STOPPING
 
     # stop() 再試行: sentinel は二重投入しない。
     put_calls = []
@@ -276,7 +276,7 @@ def test_join_timeout_then_start_stop_retries_are_deterministic(writer, monkeypa
     monkeypatch.setattr(writer._q, "put", _tracking_put)
     writer.stop(drain_timeout=0.2)   # 依然ブロック中＝再度 join timeout
     assert put_calls == [], f"sentinel が二重投入されている: {put_calls}"
-    assert writer._state == ext_api._WRITER_STOPPING
+    assert writer._state == audit._WRITER_STOPPING
 
     release.set()   # 旧世代の処理を完了させる（_run() の finally が _stopped_event.set() する）
     old_thread.join(timeout=5)
@@ -285,7 +285,7 @@ def test_join_timeout_then_start_stop_retries_are_deterministic(writer, monkeypa
     # start() 再試行: 旧世代の終了が確認できたので新スレッドを起動する。
     writer.start()
     assert writer._thread is not None and writer._thread is not old_thread
-    assert writer._state == ext_api._WRITER_RUNNING
+    assert writer._state == audit._WRITER_RUNNING
 
     fut = _submit(writer, request_id="after-generation")
     assert fut.result(timeout=5) is None
@@ -319,11 +319,11 @@ def test_audit_db_connect_does_not_call_store_ensure_and_passes_timeouts(monkeyp
         return _FakeConn()
 
     monkeypatch.setattr(psycopg, "connect", _fake_connect)
-    monkeypatch.setattr(ext_api, "_AUDIT_DB_CONNECT_TIMEOUT_S", 7.0)
-    monkeypatch.setattr(ext_api, "_AUDIT_DB_LOCK_TIMEOUT_MS", 1234)
-    monkeypatch.setattr(ext_api, "_AUDIT_DB_STATEMENT_TIMEOUT_MS", 5678)
+    monkeypatch.setattr(audit, "_AUDIT_DB_CONNECT_TIMEOUT_S", 7.0)
+    monkeypatch.setattr(audit, "_AUDIT_DB_LOCK_TIMEOUT_MS", 1234)
+    monkeypatch.setattr(audit, "_AUDIT_DB_STATEMENT_TIMEOUT_MS", 5678)
 
-    with ext_api._audit_db_connect():
+    with audit._audit_db_connect():
         pass
 
     assert ensure_calls == [], "_audit_db_connect() が store._ensure()（unbounded）を呼んでいる"
@@ -341,7 +341,7 @@ def test_start_failure_after_join_timeout_self_heals_so_submit_does_not_stay_non
     永久に None を返し続けることはない——`start()` を明示的に呼び直さなくても、次の submit()
     自身の lazy start が成功する（`_restart_requested` フラグを `_run()` の finally が見て
     state を STOPPED へ確定する）。"""
-    monkeypatch.setattr(ext_api, "_AUDIT_QUEUE_DRAIN_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(audit, "_AUDIT_QUEUE_DRAIN_TIMEOUT_S", 0.2)
     writer.start()
     release = threading.Event()
     entered_blocker = threading.Event()
@@ -352,13 +352,13 @@ def test_start_failure_after_join_timeout_self_heals_so_submit_does_not_stay_non
             release.wait(timeout=10)
         writer.calls.append(request_id)
 
-    monkeypatch.setattr(ext_api, "_write_pending_audit", _blocking_write)
+    monkeypatch.setattr(audit, "_write_pending_audit", _blocking_write)
     _submit(writer, request_id="blocker")
     assert entered_blocker.wait(timeout=5), "writer がブロッキング処理に入らなかった"
 
     old_thread = writer._thread
     writer.stop(drain_timeout=0.2)   # blocker がまだブロック中＝join timeout
-    assert writer._state == ext_api._WRITER_STOPPING
+    assert writer._state == audit._WRITER_STOPPING
 
     # start() 再試行: 旧世代が終わっていないので False（_restart_requested が立つ）。
     started = writer.start()
@@ -368,7 +368,7 @@ def test_start_failure_after_join_timeout_self_heals_so_submit_does_not_stay_non
 
     release.set()   # 旧世代の処理を完了させる
     old_thread.join(timeout=5)   # _run() の finally が state を STOPPED へ確定するまで待つ
-    assert writer._state == ext_api._WRITER_STOPPED
+    assert writer._state == audit._WRITER_STOPPED
     assert writer._restart_requested is False
 
     # start() を明示的に呼び直さなくても、submit() 自身の lazy start が成功する。
@@ -406,7 +406,7 @@ def test_write_pending_audit_does_not_call_store_ensure(monkeypatch):
     pending = {"actor": "ext:1", "action": "ext_api.search", "resource_type": "ext_search",
               "resource_id": "v1", "detail": {}, "reason": None, "severity": None,
               "outcome": None, "business_outcome": "ok"}
-    ext_api._write_pending_audit(pending, 200, 1.0, "GET", "/x", "rid-ensure-check")
+    audit._write_pending_audit(pending, 200, 1.0, "GET", "/x", "rid-ensure-check")
 
     assert ensure_calls == [], "_write_pending_audit() が store._ensure()（unbounded）を呼んでいる"
     assert len(insert_calls) == 1
@@ -434,13 +434,13 @@ def test_start_locked_rechecks_stopped_event_under_lock_after_timeout_race(write
             release.wait(timeout=10)
         writer.calls.append(request_id)
 
-    monkeypatch.setattr(ext_api, "_write_pending_audit", _blocking_write)
+    monkeypatch.setattr(audit, "_write_pending_audit", _blocking_write)
     _submit(writer, request_id="blocker")
     assert entered.wait(timeout=5), "writer がブロッキング処理に入らなかった"
 
     old_thread = writer._thread
     writer.stop(drain_timeout=0.2)   # blocker がまだブロック中＝join timeout
-    assert writer._state == ext_api._WRITER_STOPPING
+    assert writer._state == audit._WRITER_STOPPING
 
     barrier = threading.Barrier(2)   # `_stopped_event.wait()` の timeout 相当は monkeypatch で
     # 完全に上書きするため、実タイムアウト値（_AUDIT_QUEUE_DRAIN_TIMEOUT_S）はこのテストの
@@ -485,7 +485,7 @@ def test_start_locked_rechecks_stopped_event_under_lock_after_timeout_race(write
     assert result_holder.get("ok") is True, (
         "wait() タイムアウトと旧世代の完了がほぼ同時でも、lock 下の最終確認で拾って"
         "起動に成功するはず")
-    assert writer._state == ext_api._WRITER_RUNNING
+    assert writer._state == audit._WRITER_RUNNING
     assert writer._thread is not None and writer._thread is not old_thread
 
     fut = _submit(writer, request_id="after-race-recheck")

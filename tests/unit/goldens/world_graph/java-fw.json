@@ -1,0 +1,25 @@
+{
+  "counts": {
+    "edge_types": {
+      "ACCESSES": 9,
+      "CONTAINS": 30,
+      "INVOKES": 5
+    },
+    "edges": 44,
+    "flag_reasons": {
+      "dropped_syntax": 5,
+      "source_not_registered": 3,
+      "unresolved": 5
+    },
+    "flags": 13,
+    "node_labels": {
+      "Config": 32,
+      "DataItem": 7,
+      "Module": 8,
+      "Table": 3
+    },
+    "nodes": 50
+  },
+  "sha256": "30e81bd46baa9063c1d784de1c003bdb0f979ee0cc874334f6b74126d6c62dc8",
+  "world": "java-fw"
+}

@@ -20,8 +20,6 @@ import _fresh_import as FI   # noqa: E402   # import-time 固定 env 定数の�
 from sherpa import lens_service as ls
 from sherpa.ingest import world_neo4j
 
-TRUNC_NOTE = "「{}」は大きすぎて全体を検索できていません（先頭部分のみ）。"
-
 
 class _FakeRecord:
     def __init__(self, d):
@@ -76,10 +74,6 @@ def _timeout_error():
 
 def _other_error():
     return Neo4jError._hydrate_neo4j(code="Neo.ClientError.Statement.SyntaxError", message="bad cypher")
-
-
-def _hit(q, doc="a.md"):
-    return [{"doc_id": doc, "line": 1, "span": [1, 1], "text": "hit", "ext": ".md", "match": q}]
 
 
 def _patch_driver(monkeypatch, session):
@@ -216,7 +210,7 @@ def test_neo4j_related_empty_anchors_still_checks_schema_era():
     assert "LIMIT 1" in s.calls[0][0]   # 呼ばれたのは era プローブ
 
 
-# ---- cid（canonical_id）は内部専用: 公開 run_troubleshoot は除去する -------------------------------
+# ---- cid（canonical_id）は内部専用 -------------------------------
 
 def test_troubleshoot_cards_internal_helper_carries_cid(monkeypatch):
     monkeypatch.setattr(ls, "grep_search", lambda *a, **k: [])
@@ -226,27 +220,6 @@ def test_troubleshoot_cards_internal_helper_carries_cid(monkeypatch):
     assert len(cards) == 1
     assert cards[0]["cid"] == "module:w1:a/b#TAXCALC"
     assert truncated_docs == []
-
-
-_TROUBLESHOOT_GOLDEN = {
-    "type": "troubleshoot", "world": "w1", "symptom": "TAXCALC の ABEND",
-    "anchors": ["TAXCALC"],
-    "candidates": [{
-        "name": "TAXCALC", "label": "Module", "category": "ソース", "role": "実装",
-        "distance": 1, "path": ["ROOT", "TAXCALC"], "source": "graph",
-        "evidence": {"edges": [{"type": "USES", "doc": "a.md"}], "grep": []},
-    }],
-    "coverage": {"complete": True, "limits": [], "omitted": 0},
-}
-
-
-def test_run_troubleshoot_public_result_omits_cid_and_has_no_notes_without_truncation(monkeypatch):
-    # 直接 API・会話保存・共有・JSON 書き出しへ内部専用 cid を漏らさない（完全一致の golden）。
-    monkeypatch.setattr(ls, "grep_search", lambda *a, **k: [])
-    s = _FakeSession(rows=[_related_row("module:w1:a/b#TAXCALC", "TAXCALC")])
-    result = ls.run_troubleshoot(s, "TAXCALC の ABEND", "w1")
-    assert result == _TROUBLESHOOT_GOLDEN
-    assert "notes" not in result
 
 
 def test_neighbor_cards_agentic_path_preserves_cid(monkeypatch):
@@ -311,99 +284,15 @@ def test_troubleshoot_graph_depth_default_is_shared_by_signatures_and_ignores_en
         "import sherpa.lens_service as m\n"
         "print(json.dumps([m.TROUBLESHOOT_GRAPH_DEPTH] + [\n"
         "    inspect.signature(f).parameters['depth'].default\n"
-        "    for f in (m.neo4j_related, m._troubleshoot_cards, m.run_troubleshoot)]))\n"
+        "    for f in (m.neo4j_related, m._troubleshoot_cards)]))\n"
     )
-    assert json.loads(FI.run_script(script, env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": "5"})) == [4, 4, 4, 4]
+    assert json.loads(FI.run_script(script, env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": "5"})) == [4, 4, 4]
 
 
-# ---- run_qa の layer 転送（troubleshoot は layer を受け取らない設計） ----------------------------
-
-@pytest.mark.parametrize("kwargs, expected, has_hits", [
-    ({"layer": "code"}, "code", True),
-    ({}, None, False),   # 省略時は None のまま渡る（0 件で全語フォールバックも尽きる経路）
-])
-def test_run_qa_forwards_layer_to_grep_search_on_first_call(monkeypatch, kwargs, expected, has_hits):
-    captured = {}
-
-    def fake_grep(q, world, max_hits=20, scope_paths=None, layer=None, truncated_docs=None):
-        captured["layer"] = layer
-        return _hit(q) if has_hits else []
-
-    monkeypatch.setattr(ls, "grep_search", fake_grep)
-    ls.run_qa("消費税率", "w1", **kwargs)
-    assert "layer" in captured and captured["layer"] == expected
 
 
-def test_run_qa_forwards_layer_to_grep_search_in_term_split_fallback(monkeypatch):
-    calls = []
+# ---- grep 打切りの申告（`truncated_docs`） -------------------------------------------
 
-    def fake_grep(q, world, max_hits=20, scope_paths=None, layer=None, truncated_docs=None):
-        calls.append(layer)
-        return [] if q == "消費税率について" else _hit(q)   # 1発目は 0 件＝フォールバック誘発
-
-    monkeypatch.setattr(ls, "grep_search", fake_grep)
-    assert ls.run_qa("消費税率について", "w1", layer="docs")["answered"]
-    assert calls and all(v == "docs" for v in calls)
-
-
-# ---- grep 打切りの平文申告（`truncated_docs` → `notes`） -------------------------------------------
-
-def test_truncated_search_note_empty_is_none():
-    assert ls._truncated_search_note([]) is None
-
-
-def test_truncated_search_note_single_doc_is_plain_text():
-    note = ls._truncated_search_note(["設計/税率.md"])
-    assert note == TRUNC_NOTE.format("設計/税率.md")
-    for forbidden in ("file_truncated", "cap", "バイト", "byte"):   # 内部語彙を出さない
-        assert forbidden not in note
-
-
-def test_truncated_search_note_multiple_docs_joined():
-    assert ls._truncated_search_note(["a.md", "b.md"]) == \
-        "次の資料は大きすぎて全体を検索できていません（先頭部分のみ）: 「a.md」「b.md」"
-
-
-def test_truncated_search_note_caps_display_at_five():
-    note = ls._truncated_search_note([f"{i}.md" for i in range(7)])
-    assert "ほか2件" in note
-    assert "6.md" not in note
-
-
-def test_run_qa_truncated_docs_becomes_plain_note(monkeypatch):
-    def fake_grep(q, world, max_hits=20, scope_paths=None, layer=None, truncated_docs=None):
-        if truncated_docs is not None:
-            truncated_docs.append("大きい資料.md")
-        return _hit(q)
-
-    monkeypatch.setattr(ls, "grep_search", fake_grep)
-    assert ls.run_qa("消費税率", "w1")["notes"] == [TRUNC_NOTE.format("大きい資料.md")]
-
-
-def test_run_qa_truncated_docs_dedup_across_fallback_calls(monkeypatch):
-    # 1発目・フォールバックの複数回呼び出しで同じ list を渡す（重複排除が呼び出し間でも効く）。
-    seen_ids = []
-
-    def fake_grep(q, world, max_hits=20, scope_paths=None, layer=None, truncated_docs=None):
-        seen_ids.append(id(truncated_docs))
-        return [] if q == "消費税率について" else _hit(q)
-
-    monkeypatch.setattr(ls, "grep_search", fake_grep)
-    ls.run_qa("消費税率について", "w1")
-    assert len(seen_ids) >= 2 and len(set(seen_ids)) == 1
-
-
-def test_run_qa_no_truncation_output_unchanged(monkeypatch):
-    # 打切りが無ければ `notes` キーを持たない。quote は実ファイルが無く excerpt_source="rag"（fallback）。
-    monkeypatch.setattr(ls, "grep_search",
-                        lambda q, world, max_hits=20, scope_paths=None, layer=None, truncated_docs=None: _hit(q))
-    result = ls.run_qa("消費税率", "w1")
-    assert result == {
-        "type": "qa", "world": "w1", "question": "消費税率", "answered": True,
-        "citations": [{"doc_id": "a.md", "span": [1, 1], "quote": "hit", "ext": ".md", "match": "消費税率",
-                       "excerpt_source": "rag"}],
-    }
-    assert "notes" not in result
 
 
 def test_troubleshoot_cards_reuses_same_truncated_docs_list_across_anchor_calls(monkeypatch):
@@ -420,17 +309,3 @@ def test_troubleshoot_cards_reuses_same_truncated_docs_list_across_anchor_calls(
     ])
     ls._troubleshoot_cards(s, "TAXCALC TAXCALC2 の ABEND", "w1")
     assert len(seen_ids) == 2 and len(set(seen_ids)) == 1
-
-
-def test_run_troubleshoot_truncated_docs_becomes_plain_note(monkeypatch):
-    def fake_grep(nm, world, scope_paths=None, truncated_docs=None):
-        if truncated_docs is not None:
-            truncated_docs.append("運用手順.md")
-        return []
-
-    monkeypatch.setattr(ls, "grep_search", fake_grep)
-    s = _FakeSession(rows=[_related_row("module:w1:a/b#TAXCALC", "TAXCALC")])
-    result = ls.run_troubleshoot(s, "TAXCALC の ABEND", "w1")
-    assert result["notes"] == [TRUNC_NOTE.format("運用手順.md")]
-    for forbidden in ("file_truncated", "cap", "バイト", "byte"):
-        assert forbidden not in result["notes"][0]

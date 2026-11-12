@@ -1,0 +1,26 @@
+{
+  "counts": {
+    "edge_types": {
+      "ACCESSES": 7,
+      "CONTAINS": 15
+    },
+    "edges": 22,
+    "flag_reasons": {
+      "ambiguous": 2,
+      "dropped_syntax": 4,
+      "mention_ambiguous_names": 1,
+      "unresolved": 4,
+      "unresolved_qualifier": 2
+    },
+    "flags": 13,
+    "node_labels": {
+      "Config": 4,
+      "DataItem": 11,
+      "Module": 13,
+      "Table": 9
+    },
+    "nodes": 37
+  },
+  "sha256": "e174de2d1dfae9cc9bb896165c79ecb46e9ab27fc7ad2a4c830a796a550d6075",
+  "world": "ana-s5"
+}

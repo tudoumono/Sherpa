@@ -42,7 +42,10 @@ OCR_BOUND_FULL_FILES = (
     "constraints-ocr.txt",
     "docker/ocr-models.lock.json",
     "sherpa/ingest/ai_observation.py",
+    "sherpa/ingest/ocr_image.py",
+    "sherpa/ingest/ocr_settings.py",
     "sherpa/ingest/ocr_worker.py",
+    "sherpa/ingest/ocr_workdir.py",
     "sherpa/ingest/ocr_router.py",
     "sherpa/ingest/observation_render.py",
     "sherpa/store/ocr_jobs.py",
@@ -153,7 +156,7 @@ def compute_ocr_implementation_binding(root: Path) -> dict[str, str]:
 def test_e16_schema_and_fixed_profiles_are_public_contracts():
     assert ai_observation.AI_OBSERVATION_SCHEMA_VERSION == "ai-observation-set-v1alpha2"
     assert ocr_router.OCR_ROUTE_SCHEMA_VERSION == "ocr-route-manifest-v1"
-    assert ocr_router.OCR_ROUTER_PROFILE == "evidence-raster-router-v6"
+    assert ocr_router.OCR_ROUTER_PROFILE == "evidence-raster-router-v7"
     assert ocr_router.ocr_route_sig_value().startswith("sha256:")
     assert ocr_router.PAGE_RENDER_PROFILE == {
         "renderer": "pypdfium2",
@@ -187,10 +190,12 @@ def test_core_requirements_do_not_install_paddle_and_worker_requirements_are_pin
     model_lock = json.loads((ROOT / "docker/ocr-models.lock.json").read_text(encoding="utf-8"))
     locked = {item["name"]: item["tree_sha256"] for item in model_lock["models"]}
     assert locked == {
-        ocr_worker.PADDLE_CPU_PROFILE.detection_model:
-            ocr_worker.PADDLE_CPU_PROFILE.detection_model_tree_sha256,
-        ocr_worker.PADDLE_CPU_PROFILE.recognition_model:
-            ocr_worker.PADDLE_CPU_PROFILE.recognition_model_tree_sha256,
+        name: sha
+        for model_set in ocr_worker.OCR_MODEL_SETS.values()
+        for name, sha in (
+            (model_set.detection, model_set.detection_tree_sha256),
+            (model_set.recognition, model_set.recognition_tree_sha256),
+        )
     }
     assert model_lock["runtime_download_allowed"] is False
 
@@ -340,7 +345,10 @@ def test_database_contract_has_lease_token_generation_binding_and_world_cache():
     assert "CREATE TABLE IF NOT EXISTS ocr_jobs" in ddl
     assert "lease_token TEXT" in ddl
     assert "canonical_generation_id TEXT NOT NULL" in ddl
-    assert "UNIQUE (world, canonical_generation_id, route_input_id, engine_profile_hash)" in ddl
+    assert (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ocr_jobs_dispatch_key "
+        "ON ocr_jobs(world, canonical_generation_id, source_rel_path, route_input_id, engine_profile_hash)"
+    ) in ddl
     assert "CREATE TABLE IF NOT EXISTS ocr_result_cache" in ddl
     assert "PRIMARY KEY (world, input_fingerprint, engine_profile_hash)" in ddl
     assert "CREATE TABLE IF NOT EXISTS ocr_worker_heartbeats" in ddl

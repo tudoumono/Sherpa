@@ -376,9 +376,9 @@ def _runner_with(monkeypatch, tmp_path: Path, **args):
 def test_runner_narrows_questions_and_styles_without_changing_the_fingerprint(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(ledger_eval, "fixed_checkout", lambda root, expected=None: "head")
     full = _runner_with(monkeypatch, tmp_path, out=tmp_path / "a", rep=2)
-    narrow = _runner_with(monkeypatch, tmp_path, out=tmp_path / "b", questions=("q2",), styles=("plan_main", "json"))
-    assert [q["id"] for q in narrow.questions] == ["q2"] and narrow.styles == ("plan_main", "json")
-    assert full.styles == sc.STYLES and full.fingerprint == narrow.fingerprint
+    narrow = _runner_with(monkeypatch, tmp_path, out=tmp_path / "b", questions=("q2",), styles=("plan_main",))
+    assert [q["id"] for q in narrow.questions] == ["q2"] and narrow.styles == ("plan_main",)
+    assert full.styles == ledger_eval.RUNNABLE_STYLES and full.fingerprint == narrow.fingerprint
     meta = json.loads((tmp_path / "a" / "metadata.json").read_text(encoding="utf-8"))
     assert meta["rep"] == 2 and meta["sherpa_env"]["SHERPA_ES_PORT"] == "19201"
     assert "SHERPA_ADMIN_PASSWORD" in meta["sherpa_env_secret_names"] and len(meta["sherpa_env_sha256"]) == 64
@@ -454,16 +454,13 @@ def test_stage_summary_aggregates_totals_means_loss_threads_tokens_and_review_se
     assert "見直し上限: 試行に記録が無い" in old and "反復番号の記録なし" in old
 
 
-def test_gate_dry_run_goes_to_the_server_env_and_the_fingerprint_only_when_given(monkeypatch, tmp_path: Path):
+def test_styles_that_the_product_cannot_select_are_rejected(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(ledger_eval, "fixed_checkout", lambda root, expected=None, **kw: "head")
-    plain = _runner_with(monkeypatch, tmp_path, out=tmp_path / "a")
-    dry = _runner_with(monkeypatch, tmp_path, out=tmp_path / "b", gate_dry_run=True)
-    assert "SHERPA_LEDGER_GATE_DRYRUN" not in plain.server_env("plan_gate")
-    assert dry.server_env("plan_gate")["SHERPA_LEDGER_GATE_DRYRUN"] == "1"
-    assert dry.fingerprint != plain.fingerprint
-    meta = json.loads((tmp_path / "b" / "metadata.json").read_text(encoding="utf-8"))
-    assert meta["gate_dry_run"] is True and "gate_dry_run" not in json.loads((tmp_path / "a" / "metadata.json").read_text())
-    assert meta["sherpa_env"]["SHERPA_LEDGER_GATE_DRYRUN"] == "1"
+    for bad in ("json", "plan_gate"):
+        with pytest.raises(sc.EvalError, match="回せない構成"):
+            _runner_with(monkeypatch, tmp_path, out=tmp_path / bad, styles=(bad,))
+    env = _runner_with(monkeypatch, tmp_path, out=tmp_path / "ok").server_env("plan_main")
+    assert "SHERPA_LEDGER_STYLE" not in env and "SHERPA_LEDGER_GATE_DRYRUN" not in env
 
 
 def test_end_state_never_calls_stopped_or_missing_attempts_complete():

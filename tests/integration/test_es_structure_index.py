@@ -16,6 +16,7 @@ import pytest
 from sherpa import documents, embeddings, tool_dispatch, worlds
 from sherpa import es_index as es
 from sherpa.ingest import office_md, worker
+from tests._replace_row import offline_row
 
 ROOT = Path(__file__).resolve().parents[2]
 EXCEL = ROOT / "fixtures" / "eval" / "excel_ja" / "inputs"
@@ -54,11 +55,11 @@ def es_world(tmp_path, monkeypatch):
     real_world_dir = worlds.world_dir
     monkeypatch.setattr(worlds, "world_dir", lambda w: src if w == WORLD else real_world_dir(w))
     monkeypatch.setattr(es.embeddings, "cfg", lambda settings=None, **kw: None)
-    rep = office_md.build_derived(src, worlds.derived_md_dir(WORLD), world_sig="s1")
+    rep = office_md.build_derived(src, worlds.derived_md_dir(WORLD), world_sig="s1", row=offline_row("w"))
     assert rep.get("error") is None, rep
     register_test_world(WORLD)
     yield WORLD
-    es.delete_world(WORLD)
+    es.delete_world(WORLD, row=offline_row(WORLD))
 
 
 def _raw_search(world: str, query: dict, size: int = 200) -> list:
@@ -69,14 +70,14 @@ def _raw_search(world: str, query: dict, size: int = 200) -> list:
 def _snapshot(world: str) -> dict:
     out = {}
     for q in _QUERIES:
-        hits, reason = es.search(world, q, k=20, vector=False)
-        assert reason is None
-        out[q] = [(h["doc_id"], h.get("chunk_id"), round(h["score"], 4)) for h in hits]
+        res = es._req("POST", f"/{es._index(world)}/_search", {"size": 20, "query": {"match": {"text": q}}})
+        out[q] = [(h["_source"]["doc_id"], h["_source"].get("chunk_id"), round(h["_score"], 4))
+                  for h in res["hits"]["hits"]]
     return out
 
 
 def test_exact_finds_the_one_record_that_defines_the_id(es_world):
-    assert es.index_world(es_world)["chunks"] > 0
+    assert es.index_world(es_world, row=offline_row(es_world))["chunks"] > 0
     hits, reason = es.search_exact(es_world, ["A01"], k=20)
     assert reason is None
     assert [h["doc_id"] for h in hits] == ["JPX-016.xlsx"]                      # 該当 record は 1 件
@@ -95,7 +96,7 @@ def test_exact_finds_the_one_record_that_defines_the_id(es_world):
 
 
 def test_labels_and_region_context_are_searchable_fields(es_world):
-    es.index_world(es_world)
+    es.index_world(es_world, row=offline_row(es_world))
     labelled = _raw_search(es_world, {"match": {"labels": "顧客"}})
     assert labelled and all(s["doc_id"] in {"JPX-016.xlsx", "two.xlsx"} for s in labelled)
     region = _raw_search(es_world, {"match_phrase": {"region_context": "項目定義"}})
@@ -106,17 +107,17 @@ def test_existing_text_search_results_do_not_change_with_new_fields(es_world, mo
     """欄を足す前（構造の欄を ES へ送らない）と後で、本文検索のヒットの集合・順位・点数が同じ。"""
     with monkeypatch.context() as m:
         m.setattr(es, "_chunk_structure_meta", lambda chunk: {})
-        es.index_world(es_world)
+        es.index_world(es_world, row=offline_row(es_world))
         before = _snapshot(es_world)
     assert not _raw_search(es_world, {"exists": {"field": "identifier_values"}})
-    es.index_world(es_world)
+    es.index_world(es_world, row=offline_row(es_world))
     assert _raw_search(es_world, {"exists": {"field": "identifier_values"}})
     after = _snapshot(es_world)
     assert any(before.values()) and after == before
 
 
 def test_independent_tables_on_the_same_rows_do_not_mix_values(es_world):
-    es.index_world(es_world)
+    es.index_world(es_world, row=offline_row(es_world))
     records = [s for s in _raw_search(es_world, {"term": {"doc_id": "two.xlsx"}}) if s.get("record_identity_values")]
     left = [s for s in records if s["record_identity_values"][0].startswith("B")]
     right = [s for s in records if s["record_identity_values"][0].startswith("S")]
@@ -147,7 +148,7 @@ def test_mapping_version_bump_reindexes_once_and_reuses_embeddings(es_world, mon
     def sync() -> bool:
         """取り込みの更新と同じ経路（`needs_reindex` が真のときだけ、ワーカーの `index_world_with_human_md_holdback`）。"""
         if es.needs_reindex(es_world, "sig-1", settings={}):
-            return worker.index_world_with_human_md_holdback(es_world, content_sig="sig-1", settings={}).get("error") is None
+            return worker.index_world_with_human_md_holdback(es_world, content_sig="sig-1", settings={}, row=offline_row(es_world)).get("error") is None
         return False
 
     with monkeypatch.context() as m:
@@ -164,3 +165,30 @@ def test_mapping_version_bump_reindexes_once_and_reuses_embeddings(es_world, mon
     assert es.needs_reindex(es_world, "sig-1", settings={}) is False             # 以降の更新では入れ直さない
     assert sync() is False and calls == [1, 1]
     assert _raw_search(es_world, {"exists": {"field": "identifier_values"}})
+
+
+def test_exact_with_vector_finds_the_group_whichever_row_holds_the_id(es_world, monkeypatch):
+    """表の行のまとまりの先頭・中間・末尾のどの行の ID でも、exact と意味検索（mode=vector／hybrid）の併用でそのまとまりが候補に入り、当たった行の chunk_id が残る。"""
+    import hashlib
+
+    def vec_for(t):
+        h = hashlib.sha256(t.strip().encode("utf-8")).digest()
+        return [(b - 127.5) / 1000.0 for b in h[:16]]
+
+    monkeypatch.setattr(es.embeddings, "cfg", lambda settings=None, **kw: {"provider": "stub", "key": "x", "model": "stub", "dim": 16})
+    monkeypatch.setattr(es.embeddings, "embed", lambda texts, c, **kw: [vec_for(t) for t in texts])
+    assert es.index_world(es_world, settings={}, row=offline_row(es_world)).get("vectors") is True
+    left = [s for s in _raw_search(es_world, {"term": {"doc_id": "two.xlsx"}}) if (s.get("record_identity_values") or [""])[0].startswith("B")]
+    heads = [s for s in left if s.get("vector_text")]
+    assert len(heads) == 1 and len(left) == 3                                    # 3 行が 1 つのまとまり（ベクトルは先頭だけ）
+    head = heads[0]
+    assert head["row_group_identifier_values"] == ["B01", "B02", "B03"]
+    assert head["record_identity_values"] == ["B01"]                             # 他の行の ID は混ぜない
+    assert {s["row_group_head_chunk_id"] for s in left if s is not head} == {head["chunk_id"]}
+    row_chunk = {s["record_identity_values"][0]: s["chunk_id"] for s in left}
+    for value in ("B01", "B02", "B03"):                                          # 先頭・中間・末尾
+        for hits, reason in (es.search_knn_only(es_world, head["vector_text"], exact=[value], settings={}),
+                             es.search(es_world, head["vector_text"], exact=[value], settings={})):
+            assert reason is None
+            found = [h for h in hits if h["chunk_id"] == head["chunk_id"]]
+            assert len(found) == 1 and found[0]["row_group_exact_chunk_ids"] == [row_chunk[value]]

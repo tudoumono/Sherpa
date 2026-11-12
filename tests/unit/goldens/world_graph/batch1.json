@@ -1,0 +1,24 @@
+{
+  "counts": {
+    "edge_types": {
+      "ACCESSES": 5,
+      "CONTAINS": 7,
+      "INVOKES": 4
+    },
+    "edges": 16,
+    "flag_reasons": {
+      "dropped_syntax": 3,
+      "mention_ambiguous_names": 1,
+      "unresolved_qualifier": 1
+    },
+    "flags": 5,
+    "node_labels": {
+      "Batch": 4,
+      "Config": 8,
+      "Module": 2
+    },
+    "nodes": 14
+  },
+  "sha256": "030d3f583a1f67c49cc34f3b20c778712265cacf23917b0d7338cd909149de75",
+  "world": "batch1"
+}

@@ -11,6 +11,7 @@ import multiprocessing
 import os
 import shutil
 import sys
+import time
 from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..env_int import env_int
-from . import child_registry, mem_guard
+from . import child_registry, mem_guard, resource_meter
 
 _log = logging.getLogger("sherpa.ingest.convert")   # 変換ログ（make logs convert）と同じ名前
 
@@ -61,6 +62,20 @@ class Job:
     assets_dir: str | None = None
     obs_dir: str | None = None
     size: int | None = None
+    content_key: str | None = None
+
+
+def dedupe_jobs(jobs: list[Job]) -> list[Job]:
+    """同じ内容・種別の仕事は先頭だけを子へ渡す。後続は親が先頭の保存済みキャッシュを使う。"""
+    seen: set[str] = set()
+    unique: list[Job] = []
+    for job in jobs:
+        if job.content_key is not None:
+            if job.content_key in seen:
+                continue
+            seen.add(job.content_key)
+        unique.append(job)
+    return unique
 
 
 @dataclass
@@ -92,6 +107,7 @@ class Prefetched:
     guard_ok: bool = True
     rendered: Rendered | None = None
     max_rss_kb: int = 0
+    elapsed_ms: float = 0.0
 
 
 def source_stat(path) -> tuple | None:
@@ -116,7 +132,9 @@ def _max_rss_kb() -> int:
 def compute(path_str: str, arm_name: str, ext: str, rel: str, render: bool = False,
             assets_dir: str | None = None, obs_dir: str | None = None) -> Prefetched:
     """子プロセスで動く。結果に子の最大メモリを載せる（`_compute`）。"""
+    started = time.monotonic()
     got = _compute(path_str, arm_name, ext, rel, render, assets_dir, obs_dir)
+    got.elapsed_ms = (time.monotonic() - started) * 1000
     got.max_rss_kb = _max_rss_kb()
     return got
 
@@ -177,6 +195,7 @@ class Prefetcher:
     """
 
     def __init__(self, jobs: list[Job], workers: int):
+        jobs = dedupe_jobs(jobs)
         self._order = {j.rel: i for i, j in enumerate(jobs)}
         sizes = {j.rel: j.size if j.size is not None else (source_stat(j.path) or (0,))[0] for j in jobs}
         largest = sorted(jobs, key=lambda j: (-sizes[j.rel], j.rel))[:workers]
@@ -222,7 +241,9 @@ class Prefetcher:
             return True
         if not wait:
             return False
-        if not mem_guard.wait_for_free_memory("MD化の先読み"):
+        with resource_meter.waiting(resource_meter.RESOURCE, task="md_prefetch_memory"):
+            freed = mem_guard.wait_for_free_memory("MD化の先読み")
+        if not freed:
             self._parallel -= 1
             _log.warning("メモリの空きが戻らないため、MD化の先読みの並列を %d に減らして進めます", self._parallel)
         return True
@@ -276,7 +297,11 @@ class Prefetcher:
         self._known.discard(rel)
         self._pump()
         try:
-            got = fut.result()
+            if fut.done():
+                got = fut.result()
+            else:
+                with resource_meter.waiting(resource_meter.WORKING, task="md_prefetch_result"):
+                    got = fut.result()
         except Exception as exc:
             _log.warning("MD化の先読みに失敗しました（直列で計算し直します）: %s", exc.__class__.__name__)
             if isinstance(exc, BrokenProcessPool):

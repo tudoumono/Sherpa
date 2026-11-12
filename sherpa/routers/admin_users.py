@@ -94,6 +94,7 @@ def admin_user_create(req: UserCreateReq, request: Request):
     except Exception as ws_err:
         # workspace 作成の失敗はログだけにする（ユーザー作成自体は成功扱い・初回利用時に再度 ensure）。
         _log.warning("workspace provisioning failed for uid=%s: %s", uid, ws_err)
+    audit_recorded = True
     try:
         store.audit(actor["uid"], "user.created", "user", f"user:{uid}",
                     detail={"password_set": True, "created_via": "admin_ui"},
@@ -103,8 +104,9 @@ def admin_user_create(req: UserCreateReq, request: Request):
                                  "role": req.role, "status": "active"})
     except Exception:
         _log.critical("audit write failed for user.created")
-        # ユーザーは作成済みのため、監査に失敗しても 500 にはせず続行し、critical log に残す。
-    return {"ok": True, "user": row}
+        # ユーザーは作成済みのため 500 にはせず、記録できなかったことを応答で知らせる。
+        audit_recorded = False
+    return {"ok": True, "user": row, "audit_recorded": audit_recorded}
 
 
 _IMPORT_MAX_ROWS = 200
@@ -195,6 +197,7 @@ def admin_users_import(request: Request, file: UploadFile = File(...)):
     except Exception as e:
         _log.warning("user csv import failed: %s", type(e).__name__)
         raise HTTPException(409, "ユーザーの一括追加に失敗しました（1 人も追加されていません）。もう一度お試しください")
+    audit_recorded = True
     for t in todo:
         try:
             ensure_workspace(t["uid"])
@@ -209,7 +212,8 @@ def admin_users_import(request: Request, file: UploadFile = File(...)):
                                      "role": t["role"], "status": "active"})
         except Exception:
             _log.critical("audit write failed for user.created")
-    return {"created": len(todo), "uids": [t["uid"] for t in todo]}
+            audit_recorded = False
+    return {"created": len(todo), "uids": [t["uid"] for t in todo], "audit_recorded": audit_recorded}
 
 
 @router.patch("/admin/users/{uid}", tags=["管理者:ユーザー管理"], response_model=AdminUserPatchResponse)
@@ -291,6 +295,7 @@ def admin_user_patch(uid: str, req: UserPatchReq, request: Request):
 
     # 監査行群は「全部書けるか、1 件も残らないか」にする。主変更（upsert_user）は確定済みで、監査バッチの失敗では取り消さず 200 のまま返す。バッチ全体を 1 つの接続/トランザクションに載せ（`_audit_insert` は呼び出し側のトランザクションを受ける）、失敗したら丸ごとロールバックして、request_id・action 一覧・例外情報を critical ログへ 1 回だけ残す。
     request_id = uuid.uuid4().hex  # 同一 PATCH 内の複数監査行を対応付ける相関 ID。
+    audit_recorded = True
     try:
         with store._connect() as c:
             for ch in changes:
@@ -301,4 +306,5 @@ def admin_user_patch(uid: str, req: UserPatchReq, request: Request):
     except Exception:
         _log.critical("audit batch write failed for request_id=%s actions=%s",
                       request_id, [ch["action"] for ch in changes], exc_info=True)
-    return {"ok": True, "uid": uid}
+        audit_recorded = False
+    return {"ok": True, "uid": uid, "audit_recorded": audit_recorded}

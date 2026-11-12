@@ -1,0 +1,33 @@
+# 部品どうしの依存の向きの規則（検査: scripts/check_sizes.py・運用: docs/20-開発ハーネス.md §5）。
+# 部品＝`__init__.py` を持つパッケージ。`allow` に書いた部品だけを import してよい。
+# 部品の外からは、`__init__.py` に出した名前だけを使える（`_` 始まりと未公開の下位モジュールは不可）。
+# 検査するのは `scan` のディレクトリ（既定 sherpa と scripts。tests は対象外）。
+# `shims` は旧の入口（部品から名前を出し直すだけの薄いファイル）。非公開の名前の検査から外す。段 5 で旧の入口と一緒に消す。
+#
+# 書き方の例（分けた部品ができたら足す）:
+#
+# [components."sherpa.ingest.graph"]
+# allow = ["sherpa.ingest.names"]
+#
+# [components."sherpa.ingest.names"]
+# allow = []
+
+shims = ["sherpa.ext_api", "sherpa.ingest.evidence_spike"]
+
+[components."sherpa.ingest.graph"]
+allow = ["sherpa.ingest.analyzers", "sherpa.ingest.periods"]
+
+[components."sherpa.ingest.analyzers"]
+allow = []
+
+[components."sherpa.ingest.periods"]
+allow = []
+
+[components."sherpa.ingest.check"]
+allow = ["sherpa.ingest.periods"]
+
+[components."sherpa.ingest.evidence"]
+allow = []
+
+[components."sherpa.ext"]
+allow = ["sherpa.ingest.analyzers"]

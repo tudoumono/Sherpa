@@ -117,10 +117,10 @@ def test_toggle_marks_user_message_at_save_in_source():
             f"{fn.__name__}: user 保存時に personal=personal になっていない（in-flight 漏れ）"
         i_save = src.index('add_message(conversation_id, "user", message, personal=personal)')
         i_flag = src.index("set_contains_personal_workspace(conversation_id)", i_save)
-        # provider は `_provider = ... get_provider(...)` で解決してから `.run` する2行形
+        # provider は `_select_provider(...)` で解決してから `.run` する2行形
         # （サブエージェント並用の合流以降）。`.run` まで含めた単一文はもう存在しないため、
         # 解決行を提示に使う——解決は実行より必ず前なので「フラグ < 解決」は「フラグ < 実行」を含意する。
-        i_provider = src.index("get_provider(settings, system_settings=sys_settings)", i_save)
+        i_provider = src.index("_select_provider(provider", i_save)
         assert i_flag < i_provider, f"{fn.__name__}: 会話フラグが provider 実行より後（in-flight 漏れ）"
 
 
