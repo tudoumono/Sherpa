@@ -214,7 +214,7 @@ def fact_lines(facts: dict, dur_ms, dur) -> list[str]:
     if modes:
         degraded = modes["degraded"]
         parts = [f"{label} {modes[k]}" for k, label in _MODE_LABEL]
-        parts.append(f"キーワードに縮退 {sum(degraded.values())}"
+        parts.append(f"縮退・失敗 {sum(degraded.values())}"
                      + (f"（{' '.join(f'{r}={n}' for r, n in degraded.items())}）" if degraded else ""))
         parts.append(f"不明 {modes['unknown']}")
         lines.append("  全文検索の方式: " + "／".join(parts))
@@ -266,6 +266,6 @@ def total_lines(total: dict, tok, dur) -> list[str]:
         head += "  " + tok([toks[k] for k in TOKEN_KEYS]) + _partial(total, "token_turns")
     kinds = total.get("tool_kinds") or {}
     if kinds:
-        head += "  道具" + _partial(total, "tool_turns") + ": " + "／".join(f"{label} {kinds[k]['calls']} 回" + (f"（失敗 {kinds[k]['errors']}）" if "errors" in kinds[k] else "")
+        head += "  道具" + _partial(total, "tool_turns") + ": " + "／".join(f"{label} {kinds[k]['calls']} 回{_kind_text(kinds[k], dur)}"
                                    for k, label in KIND_LABEL if k in kinds)
     return [head]

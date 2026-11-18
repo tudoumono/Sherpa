@@ -399,10 +399,10 @@ def test_eval_fields_in_jsonl_and_text_from_session_records(tmp_path):
     assert "質問時刻" in head and "回答時刻" in head
     assert "時間の内訳: 回答全体 300s／道具 4.0s／シェル 2.0s／モデルの応答待ち" in text
     assert "全文検索 2 回（計 " in text and "文字列検索 1 回（計 1.0s・失敗 0・打切 1）" in text
-    assert "全文検索の方式: ハイブリッド 0／ベクトルのみ 0／キーワード指定 0／キーワードに縮退 0／不明 1" in text
+    assert "全文検索の方式: ハイブリッド 0／ベクトルのみ 0／キーワード指定 0／縮退・失敗 0／不明 1" in text
     assert "推論 32 実入力 240" in text
     assert text.rstrip().splitlines()[-1].startswith("[会話の合計]  ターン 1  回答の時間 300s")
-    assert "実入力 240" in text.rstrip().splitlines()[-1] and "そのほか 3 回（失敗 1）" in text
+    assert "実入力 240" in text.rstrip().splitlines()[-1] and "そのほか 3 回（失敗 1）" in text and "文字列検索 1 回（計 1.0s・失敗 0・打切 1）" in text.rstrip().splitlines()[-1]
 
 
 def test_eval_fields_omit_what_the_records_do_not_have(tmp_path):
@@ -466,7 +466,7 @@ def test_mask_hides_new_fields_values(tmp_path):
     assert "zz_custom_tool" not in out
     text = CT.build_output([conv], masker, tmp_path)
     assert "zz_odd_reason" not in text and "zz_custom_tool" not in text and "zz_secret_dir" not in text
-    assert "キーワードに縮退 2（" in text and CT.find_leaks(out, masker) == 0 and CT.find_leaks(text, masker) == 0
+    assert "縮退・失敗 2（" in text and CT.find_leaks(out, masker) == 0 and CT.find_leaks(text, masker) == 0
     assert CT.find_leaks(out + "\nzz_odd_reason\n", masker) > 0
 
 

@@ -310,7 +310,7 @@ restore:           ## バックアップから戻す（make restore FROM=data/ba
 usage-backfill:    ## 既存のassistantメッセージをturn_metrics/turn_tool_statsへ一度だけ移す（冪等・複数回実行可）
 	./scripts/usage-backfill.sh
 
-trace:             ## 会話の各ターンを段・道具の呼び出し（時刻・引数・件数・打ち切り）・調べた経路と見つかった資料・トークン・調査台帳の流れ・評価の材料（質問と回答の時刻・時間の内訳・検索の種類ごとの回数と時間と失敗・全文検索の方式・実入力・会話の合計）で書き出す（make trace CONV=<会話番号>[,<会話番号>...] か SINCE=<YYYY-MM-DD> [UNTIL=<YYYY-MM-DD>]（日本時間・どちらか片方・会話は 500 件まで）[FORMAT=text（人が読むテキスト・既定は jsonl＝1 行 1 ターンの分析用）] [MASK=1 [MASK_MODELS=1]] [OUT=<出力ファイル>]・読み取りだけ・MASK=1 で本文や資料名を伏せる・MASK_MODELS=1 でモデル名も伏せる）
+trace:             ## 会話の各ターンを段・道具の呼び出し（時刻・引数・件数・打ち切り）・調べた経路と見つかった資料・トークン・調査台帳の流れ・評価の材料（質問と回答の時刻・時間の内訳・検索の種類ごとの回数と時間と失敗・全文検索の方式・実入力・会話の合計）で書き出す（make trace CONV=<会話番号>[,<会話番号>...] か SINCE=<YYYY-MM-DD> [UNTIL=<YYYY-MM-DD>]（日本時間・どちらか片方・会話は 500 件まで）[FORMAT=text（人が読むテキスト・既定は jsonl＝分析用・1 ターン 1 行＋会話ごとの合計の行）] [MASK=1 [MASK_MODELS=1]] [OUT=<出力ファイル>]・読み取りだけ・MASK=1 で本文や資料名を伏せる・MASK_MODELS=1 でモデル名も伏せる）
 	@case "$${CONV:-}" in *[!0-9,]*) echo "使い方: make trace CONV=<会話番号>[,<会話番号>...]（会話番号は数字とカンマだけ）"; exit 2;; esac; \
 	case "$${SINCE:-}$${UNTIL:-}" in *[!0-9-]*) echo "使い方: SINCE・UNTIL は YYYY-MM-DD（日本時間）"; exit 2;; esac; \
 	case "$${FORMAT:-jsonl}" in text|jsonl) ;; *) echo "使い方: FORMAT は text か jsonl"; exit 2;; esac; \
