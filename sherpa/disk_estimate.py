@@ -1,7 +1,8 @@
 """取り込み前のディスク容量の見積もり（警告だけ・取り込みは止めない）。
 
 登録・更新のボタンを押したあと、始める前に「取り込みに必要な空き」と「今の空き」を見せる。
-原本は読み取り専用で歩く（stat のみ）。書き込み先ごとに必要量を出し、同じファイルシステムの分は合算して空きと比べる。
+原本は読み取り専用で歩く（stat と、docx／xlsx／pptx の ZIP の中の XML の要素数・字数を数えるだけ。本文は外へ出さない）。
+書き込み先ごとに必要量を出し、同じファイルシステムの分は合算して空きと比べる。
 設計: docs/design/operations.md「取り込み前のディスク容量の見積もり」
 """
 from __future__ import annotations
@@ -9,11 +10,13 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -21,6 +24,7 @@ from . import es_index, log_setup, scope_infer, store, worlds
 from .ingest import office_md, text_kind
 from .ingest.analyzers import registry as analyzer_registry
 from .ingest.archive_extract import archive_kind
+from .ingest.ooxml import word as ooxml_word
 
 _log = logging.getLogger("sherpa")
 
@@ -73,6 +77,32 @@ _ARCHIVE_EXPAND = 3.0
 _ARCHIVE_DERIVED_RATIO = 2.0
 _ARCHIVE_CHUNKS_PER_MB = 650.0
 _ARCHIVE_VEC_RATIO = 0.5
+
+# OOXML の中身を数える上限。XML 1 本・1 ファイルで読む量（展開後のバイト）を超えたら、読めた範囲の密度で全体へ外挿する。
+# 数える時間の合計を使い切ったら、残りのファイルは族の係数の式に戻す。
+_MEASURE_PART_BYTES = 8 * 1024 * 1024
+_MEASURE_FILE_BYTES = 32 * 1024 * 1024
+_MEASURE_READ_BYTES = 1024 * 1024
+_MEASURE_BUDGET_SEC = 120
+
+# 1 チャンクの本文の上限（字）。表の行（セルの並び）が _CHUNK_CHARS、段落・図形の文字列が _SPAN_CHARS を超えると複数のチャンクに分かれる。
+_CHUNK_CHARS = 1800
+_SPAN_CHARS = 1200
+# 表の 1 セルが rag.md に出るときの飾り（項目名・括弧）の目安（字）。
+_XLSX_CELL_DECOR_CHARS = 12
+
+# 数えた要素から派生物（md／rag／ir・assets 込み）のバイト数を出す係数。実際に変換した結果への当てはめを約 1 割安全側に丸めた固定値。
+# 字数あたりの値は日本語（UTF-8 で 1 字 3 バイト）の文書で当てはめたもので、英数字だけの文書では多めに見える。
+_XLSX_DERIVED_PER_CELL = 110
+_XLSX_DERIVED_PER_ROW = 340
+_XLSX_DERIVED_PER_CHAR = 8
+_DOCX_DERIVED_PER_PARA = 380
+_DOCX_DERIVED_PER_CELL = 60
+_DOCX_DERIVED_PER_ROW = 850
+_DOCX_DERIVED_PER_CHAR = 8
+_PPTX_DERIVED_PER_CHUNK = 620
+_PPTX_DERIVED_PER_ROW = 1000
+_PPTX_DERIVED_PER_CHAR = 8
 
 # 原本を歩く時間の上限（秒）。超えたら見積もりは失敗として扱い、取り込みは止めない。
 _WALK_DEADLINE_SEC = 600
@@ -127,10 +157,336 @@ PLACES = tuple(PLACE_LABELS)
 STATUS_ORDER = {"ok": 0, "unknown": 1, "tight": 2, "short": 3}
 
 
+# ---- OOXML の中身を数える ----
+# 設計: docs/design/operations.md「取り込み前のディスク容量の見積もり」
+
+_MEASURED_FAMILIES = ("docx", "xlsx", "pptx")
+
+
+class _MeasureTimeout(Exception):
+    """数える時間の上限を超えた。"""
+
+
+_XLSX_T_RE = re.compile(rb"<t(?: [^>]*)?>([^<]*)</t>")
+_XLSX_PHONETIC_RE = re.compile(rb"<rPh[ >].*?</rPh>", re.DOTALL)
+_DOCX_T_RE = re.compile(rb"<w:t(?: [^>]*)?>([^<]*)</w:t>")
+_DOCX_ROW_RE = re.compile(rb"<w:tr[ >]")
+_PPTX_T_RE = re.compile(rb"<a:t(?: [^>]*)?>([^<]*)</a:t>")
+_PPTX_ROW_RE = re.compile(rb"<a:tr[ >]")
+_PPTX_FRAME_RE = re.compile(rb"<p:graphicFrame[ >].*?</p:graphicFrame>", re.DOTALL)
+_XML_ENTITY_RE = re.compile(rb"&#?\w+;")
+
+
+def _text_chars(texts: list[bytes]) -> int:
+    """XML の文字列の字数（文字参照は 1 字。前後の空白は数えない）。"""
+    return len(_XML_ENTITY_RE.sub(b"x", b"".join(texts)).decode("utf-8", "ignore").strip())
+
+
+def _stream_parts(zf: zipfile.ZipFile, info: zipfile.ZipInfo, sep: bytes, step, *, cap: int,
+                  deadline: float) -> float:
+    """XML 1 本を先頭から `cap` バイトまで読み、`sep`（要素の終わり）で区切るたびに `step(区切り)` を呼ぶ。
+
+    戻り値は外挿の倍率（全体の大きさ ÷ 数えた範囲の大きさ。全体を読めたら 1.0）。本文はメモリに溜めず、区切り 1 つぶんだけ持つ。
+    """
+    read = consumed = 0
+    carry = b""
+    complete = False
+    with zf.open(info) as fh:
+        while read < cap:
+            if time.monotonic() > deadline:
+                raise _MeasureTimeout()
+            chunk = fh.read(min(_MEASURE_READ_BYTES, cap - read))
+            if not chunk:
+                complete = True
+                break
+            read += len(chunk)
+            parts = (carry + chunk).split(sep)
+            carry = parts.pop()
+            for seg in parts:
+                step(seg)
+                consumed += len(seg) + len(sep)
+    if complete or read >= info.file_size:
+        if carry:
+            step(carry)
+        return 1.0
+    if consumed <= 0:
+        raise ValueError("区切りが見つからない")
+    return info.file_size / consumed
+
+
+def _scan_parts(zf: zipfile.ZipFile, infos: list, sep: bytes, new_acc, step, deadline: float) -> dict:
+    """`infos` の XML を順に数える。XML ごとの倍率と、1 ファイルで読む合計の上限で読めなかった XML の分を掛けて合算する。
+
+    `_` で始まる項目は XML をまたがない作業用の値（倍率を掛けず合算もしない）。`_spent` は読んだバイト数（1 ファイルの上限を他の XML と分け合う）。
+    """
+    budget = _MEASURE_FILE_BYTES
+    total_size = scanned_size = 0
+    out = new_acc()
+    for info in infos:
+        total_size += info.file_size
+        if budget <= 0:
+            continue
+        cap = min(_MEASURE_PART_BYTES, budget)
+        acc = new_acc()
+        scale = _stream_parts(zf, info, sep, lambda seg, acc=acc: step(acc, seg), cap=cap, deadline=deadline)
+        budget -= min(info.file_size, cap)
+        scanned_size += info.file_size
+        for k, v in acc.items():
+            if not k.startswith("_"):
+                out[k] += v * scale
+    out["_spent"] = _MEASURE_FILE_BYTES - budget
+    if scanned_size and total_size > scanned_size:
+        rest = total_size / scanned_size
+        for k in out:
+            if not k.startswith("_"):
+                out[k] *= rest
+    return out
+
+
+def _scan_elements(zf: zipfile.ZipFile, groups: list, step, budget: int, deadline: float) -> tuple[dict, int, int]:
+    """本体以外の XML（`groups` は `(XML の一覧, 1 要素の終わり)` の並び）を、要素ごとに `step(acc, 区切り)` で数える。
+
+    戻り値は `(合算, 数えられなかった XML の ZIP 上の大きさ, 読んだバイト数)`。1 ファイルで読む合計の上限（`budget`）を使い切った後の XML と、
+    区切りが見つからず読めなかった XML は数えず、その大きさを返す（呼び出し側が族の係数の式で見積もる）。
+    """
+    out = {"chunks": 0.0, "paras": 0.0, "chars": 0.0}
+    uncounted = spent = 0
+    for infos, sep in groups:
+        for info in infos:
+            if budget <= 0:
+                uncounted += info.compress_size
+                continue
+            cap = min(_MEASURE_PART_BYTES, budget)
+            acc = dict.fromkeys(out, 0.0)
+            used = min(info.file_size, cap)
+            budget -= used
+            spent += used
+            try:
+                scale = _stream_parts(zf, info, sep, lambda seg, acc=acc: step(acc, seg), cap=cap, deadline=deadline)
+            except ValueError:
+                uncounted += info.compress_size
+                continue
+            for k, v in acc.items():
+                out[k] += v * scale
+    return out, uncounted, spent
+
+
+def _unique_media(zf: zipfile.ZipFile) -> tuple[int, int]:
+    """埋め込み画像の（個数, バイト数）。同じ中身（CRC と大きさが同じ）は 1 つと数える（派生物の assets は中身で重複を除く）。"""
+    seen: dict = {}
+    for info in zf.infolist():
+        if "/media/" in info.filename and not info.is_dir():
+            seen.setdefault((info.CRC, info.file_size), info.file_size)
+    return len(seen), sum(seen.values())
+
+
+def _xlsx_step(acc: dict, seg: bytes) -> None:
+    n = seg.count(b"</c>")
+    if not n:
+        return
+    acc["rows"] += 1
+    acc["cells"] += n
+    acc["strs"] += seg.count(b' t="s"')
+    if b"<is>" in seg:
+        acc["inline"] += _text_chars(_XLSX_T_RE.findall(seg))
+
+
+def _scan_xlsx(zf: zipfile.ZipFile, deadline: float) -> dict:
+    sheets = [i for i in zf.infolist() if i.filename.startswith("xl/worksheets/") and i.filename.lower().endswith(".xml")]
+    if not sheets:
+        raise ValueError("シートが無い")
+    acc = _scan_parts(zf, sheets, b"</row>", lambda: {"rows": 0.0, "cells": 0.0, "strs": 0.0, "inline": 0.0},
+                      _xlsx_step, deadline)
+    # 文字列セルの字数は、共有文字列表の 1 件あたりの平均字数 × 参照するセル数で見る（ふりがなは描画されないので除く）。
+    avg = 0.0
+    try:
+        shared = zf.getinfo("xl/sharedStrings.xml")
+    except KeyError:
+        shared = None
+    if shared is not None and shared.file_size:
+        tally = [0, 0]
+
+        def _si(seg: bytes) -> None:
+            tally[0] += 1
+            tally[1] += _text_chars(_XLSX_T_RE.findall(_XLSX_PHONETIC_RE.sub(b"", seg)))
+        _stream_parts(zf, shared, b"</si>", _si, cap=_MEASURE_PART_BYTES, deadline=deadline)
+        avg = tally[1] / tally[0] if tally[0] else 0.0
+    media_n, media_bytes = _unique_media(zf)
+    return {"rows": acc["rows"], "cells": acc["cells"], "text": acc["strs"] * avg + acc["inline"],
+            "media_n": media_n, "media_bytes": media_bytes}
+
+
+def _docx_step(acc: dict, seg: bytes) -> None:
+    acc["_depth"] = max(0, acc["_depth"] + seg.count(b"<w:tbl>") - seg.count(b"</w:tbl>"))
+    acc["trows"] += len(_DOCX_ROW_RE.findall(seg))
+    chars = _text_chars(_DOCX_T_RE.findall(seg))
+    if chars:
+        acc["chars"] += chars
+        if acc["_depth"]:
+            acc["tcells"] += 1
+        else:
+            acc["paras"] += 1
+            acc["chunks"] += math.ceil(chars / _SPAN_CHARS)
+
+
+def _docx_element_step(acc: dict, seg: bytes) -> None:
+    """ヘッダー・フッター（パートごと）、脚注・文末脚注・コメント（1 件ごと）は、段落をつないだ 1 要素として数える。"""
+    chars = _text_chars(_DOCX_T_RE.findall(seg))
+    if chars:
+        acc["paras"] += 1
+        acc["chars"] += chars
+        acc["chunks"] += math.ceil(chars / _SPAN_CHARS)
+
+
+def _docx_extra_parts(zf: zipfile.ZipFile) -> list:
+    """取り込みが本文のほかに読む部品（`ingest/ooxml/word.py` の `header_footer_names`・`footnotes`・`endnotes`・`comments`）。"""
+    headers, footers = ooxml_word.header_footer_names(zf)
+    names = set(zf.namelist())
+
+    def infos(parts: list) -> list:
+        return [zf.getinfo(n) for n in parts if n in names]
+    return [(infos(headers), b"</w:hdr>"), (infos(footers), b"</w:ftr>"),
+            (infos(["word/footnotes.xml"]), b"</w:footnote>"), (infos(["word/endnotes.xml"]), b"</w:endnote>"),
+            (infos(["word/comments.xml"]), b"</w:comment>")]
+
+
+def _scan_docx(zf: zipfile.ZipFile, deadline: float) -> dict:
+    acc = _scan_parts(zf, [zf.getinfo("word/document.xml")], b"</w:p>", lambda: {
+        "paras": 0.0, "chunks": 0.0, "tcells": 0.0, "trows": 0.0, "chars": 0.0, "_depth": 0}, _docx_step, deadline)
+    extra, uncounted, _ = _scan_elements(zf, _docx_extra_parts(zf), _docx_element_step,
+                                         _MEASURE_FILE_BYTES - acc["_spent"], deadline)
+    media_n, media_bytes = _unique_media(zf)
+    return {"paras": acc["paras"] + extra["paras"], "chunks": acc["chunks"] + extra["chunks"],
+            "tcells": acc["tcells"], "trows": acc["trows"], "text": acc["chars"] + extra["chars"],
+            "uncounted_bytes": uncounted, "media_n": media_n, "media_bytes": media_bytes}
+
+
+def _pptx_step(acc: dict, seg: bytes) -> None:
+    texts = _PPTX_T_RE.findall(seg)
+    if not texts:
+        return
+    acc["chars"] += _text_chars(texts)
+    if b"<a:tr" in seg:
+        acc["trows"] += len(_PPTX_ROW_RE.findall(seg))
+        texts = _PPTX_T_RE.findall(_PPTX_FRAME_RE.sub(b"", seg))
+    chars = _text_chars(texts) if texts else 0
+    if chars:
+        acc["chunks"] += math.ceil(chars / _SPAN_CHARS)
+
+
+def _scan_pptx_frames(zf: zipfile.ZipFile, infos: list, deadline: float, budget: int) -> tuple[float, int, int]:
+    """スライドの雛形（レイアウト・マスター・ノートマスター）に出る文字列のチャンク数。XML ごとに、同じ段落の文字列は 1 つと数える。
+
+    1 ファイルで読む合計の上限（`budget`）で読めなかった XML は、読めた XML の平均で見る。1 本も読めなかったときは数えられなかった XML の ZIP 上の大きさを返す。
+    戻り値は `(チャンク数, 数えられなかった大きさ, 読んだバイト数)`。
+    """
+    spent = 0
+    total = 0.0
+    done = 0
+    for info in infos:
+        if budget <= 0:
+            break
+        seen: set = set()
+
+        def paragraph(seg: bytes, seen=seen) -> None:
+            text = b"".join(_PPTX_T_RE.findall(seg)).strip()
+            if text:
+                seen.add(text)
+        scale = _stream_parts(zf, info, b"</a:p>", paragraph, cap=min(_MEASURE_PART_BYTES, budget), deadline=deadline)
+        used = min(info.file_size, _MEASURE_PART_BYTES)
+        budget -= used
+        spent += used
+        total += len(seen) * scale
+        done += 1
+    if not done:
+        return 0.0, sum(i.compress_size for i in infos), spent
+    return total * len(infos) / done, 0, spent
+
+
+def _pptx_note_step(acc: dict, seg: bytes) -> None:
+    """発表者ノートは、スライド 1 枚のノート全体を 1 要素として数える。"""
+    chars = _text_chars(_PPTX_T_RE.findall(seg))
+    if chars:
+        acc["chars"] += chars
+        acc["chunks"] += math.ceil(chars / _SPAN_CHARS)
+
+
+def _scan_pptx(zf: zipfile.ZipFile, deadline: float) -> dict:
+    names = zf.namelist()
+    slides = [zf.getinfo(n) for n in names if n.startswith("ppt/slides/") and n.endswith(".xml") and n.count("/") == 2]
+    frames = [zf.getinfo(n) for n in names if n.endswith(".xml") and n.count("/") == 2 and
+              n.startswith(("ppt/slideLayouts/", "ppt/slideMasters/", "ppt/notesMasters/"))]
+    notes = [zf.getinfo(n) for n in names if n.startswith("ppt/notesSlides/") and n.endswith(".xml") and n.count("/") == 2]
+    if not slides:
+        raise ValueError("スライドが無い")
+    on_slides = _scan_parts(zf, slides, b"</p:sp>", lambda: {"chunks": 0.0, "trows": 0.0, "chars": 0.0},
+                            _pptx_step, deadline)
+    budget = _MEASURE_FILE_BYTES - on_slides["_spent"]
+    frame_chunks, frames_uncounted, spent = _scan_pptx_frames(zf, frames, deadline, budget)
+    on_notes, notes_uncounted, _ = _scan_elements(zf, [(notes, b"</p:notes>")], _pptx_note_step, budget - spent, deadline)
+    media_n, media_bytes = _unique_media(zf)
+    return {"chunks": on_slides["chunks"] + on_notes["chunks"], "frame_chunks": frame_chunks,
+            "trows": on_slides["trows"], "text": on_slides["chars"] + on_notes["chars"],
+            "uncounted_bytes": frames_uncounted + notes_uncounted, "media_n": media_n, "media_bytes": media_bytes}
+
+
+def _estimate_xlsx(f: dict) -> tuple[float, float]:
+    rows, cells, text = f["rows"], f["cells"], f["text"]
+    splits = max(1, math.ceil((cells * _XLSX_CELL_DECOR_CHARS + text) / rows / _CHUNK_CHARS)) if rows else 1
+    derived = (cells * _XLSX_DERIVED_PER_CELL + rows * _XLSX_DERIVED_PER_ROW + text * _XLSX_DERIVED_PER_CHAR
+               + f["media_bytes"])
+    return derived, rows * splits + f["media_n"]
+
+
+def _uncounted(family: str, f: dict) -> tuple[float, float]:
+    """数えられなかった XML の分を、族の係数の式（ZIP 上の大きさあたり）で見積もった `(派生物のバイト数, チャンク数)`。"""
+    c = COEFS[family]
+    size = f.get("uncounted_bytes", 0)
+    return size * c.derived_ratio, size / MB * c.chunks_per_mb
+
+
+def _estimate_docx(f: dict) -> tuple[float, float]:
+    derived = (f["paras"] * _DOCX_DERIVED_PER_PARA + f["tcells"] * _DOCX_DERIVED_PER_CELL
+               + f["trows"] * _DOCX_DERIVED_PER_ROW + f["text"] * _DOCX_DERIVED_PER_CHAR + f["media_bytes"])
+    rest_derived, rest_chunks = _uncounted("docx", f)
+    return derived + rest_derived, f["chunks"] + f["trows"] + f["media_n"] + rest_chunks
+
+
+def _estimate_pptx(f: dict) -> tuple[float, float]:
+    chunks = f["chunks"] + f["frame_chunks"]
+    derived = (chunks * _PPTX_DERIVED_PER_CHUNK + f["trows"] * _PPTX_DERIVED_PER_ROW
+               + f["text"] * _PPTX_DERIVED_PER_CHAR + f["media_bytes"])
+    rest_derived, rest_chunks = _uncounted("pptx", f)
+    return derived + rest_derived, chunks + f["trows"] + f["media_n"] + rest_chunks
+
+
+_SCANNERS = {"xlsx": (_scan_xlsx, _estimate_xlsx), "docx": (_scan_docx, _estimate_docx),
+             "pptx": (_scan_pptx, _estimate_pptx)}
+
+
+def measure_ooxml(path, family: str, *, deadline: float) -> tuple[float, float] | None:
+    """docx／xlsx／pptx の ZIP の中の XML を軽く数えて、`(派生物のバイト数, チャンク数)` を見積もる。
+
+    数えるのは要素の数と文字数だけで、本文は外へ出さない。読む量・時間には上限があり（標本から外挿）、
+    開けない・壊れている・上限を超えたファイルは None（呼び出し側が族の係数の式に戻す）。例外は送出しない。
+    """
+    scan, estimate = _SCANNERS[family]
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return estimate(scan(zf, deadline))
+    except _MeasureTimeout:
+        return None
+    except Exception:
+        _log.debug("disk_estimate: 中身を数えられませんでした（係数の式で見積もります）", exc_info=True)
+        return None
+
+
 # ---- 原本を数える ----
 
 def _new_counts() -> dict:
-    return {"families": {f: [0, 0] for f in FAMILIES}, "legacy_max": 0}
+    # measured: 中身を数えられたファイルの [件数, 原本の大きさ, 派生物のバイト数, チャンク数]（族ごと）。
+    return {"families": {f: [0, 0] for f in FAMILIES}, "legacy_max": 0,
+            "measured": {f: [0, 0, 0.0, 0.0] for f in _MEASURED_FAMILIES}}
 
 
 def _family_sets() -> tuple[frozenset, frozenset]:
@@ -158,23 +514,35 @@ def family_of(rel: str, source_ext: frozenset, text_ext: frozenset) -> str:
     return "other"
 
 
-def _add(counts: dict, family: str, size: int) -> None:
+def _add(counts: dict, family: str, size: int, measured: tuple[float, float] | None = None) -> None:
     c = counts["families"][family]
     c[0] += 1
     c[1] += size
     if family == "legacy" and size > counts["legacy_max"]:
         counts["legacy_max"] = size
+    if measured is not None:
+        m = counts["measured"][family]
+        m[0] += 1
+        m[1] += size
+        m[2] += measured[0]
+        m[3] += measured[1]
 
 
 def count_sources(root, *, manifest: dict | None = None, deadline: float | None = None,
                   progress=None) -> tuple[dict, dict]:
-    """原本を stat だけで数える。戻り値は `(全体, 追加・変更分)`。
+    """原本を数える。戻り値は `(全体, 追加・変更分)`。
 
     ① 取り込みと同じ歩き方（`scope_infer.safe_files`）で列挙する ② 種類別に件数と大きさを足す
-    ③ `manifest`（前回取り込みの明細）があれば、無いもの・値が違うものを「追加・変更分」にも足す。
+    ③ docx／xlsx／pptx は ZIP の中の XML を軽く数えて派生物とチャンクの見積もりを添える（`measure_ooxml`・時間の上限つき）
+    ④ `manifest`（前回取り込みの明細）があれば、無いもの・値が違うものを「追加・変更分」にも足す。
+    原本には書かない。
     """
     source_ext, text_ext = _family_sets()
     total, delta = _new_counts(), _new_counts()
+    started = time.monotonic()
+    measure_until = started + _MEASURE_BUDGET_SEC
+    if deadline is not None:
+        measure_until = min(measure_until, started + max(0.0, deadline - started) / 2)
     n = 0
     for rp, rel in scope_infer.safe_files(root, deadline=deadline):
         try:
@@ -182,11 +550,17 @@ def count_sources(root, *, manifest: dict | None = None, deadline: float | None 
         except OSError:
             continue
         fam = family_of(rel, source_ext, text_ext)
-        _add(total, fam, st.st_size)
+        changed = False
         if manifest is not None:
             prev = manifest.get(rel)
-            if prev is None or list(prev) != [st.st_mtime_ns, st.st_ctime_ns, st.st_size]:
-                _add(delta, fam, st.st_size)
+            changed = prev is None or list(prev) != [st.st_mtime_ns, st.st_ctime_ns, st.st_size]
+        est = None
+        # 更新で変わっていないファイルは数えない（足すのは追加・変更ぶんだけ。ES は今の実測と比べる）。
+        if fam in _MEASURED_FAMILIES and (manifest is None or changed) and time.monotonic() < measure_until:
+            est = measure_ooxml(rp, fam, deadline=measure_until)
+        _add(total, fam, st.st_size, est)
+        if changed:
+            _add(delta, fam, st.st_size, est)
         n += 1
         if progress is not None and n % 500 == 0:
             progress(n)
@@ -228,8 +602,11 @@ def _family_needs(counts: dict, dim: int) -> dict:
             need["neo4j"] += n * _NEO4J_OTHER_FILE_BYTES
             continue
         c = COEFS[fam]
-        need["derived"] += c.derived_ratio * size + c.derived_file * n + c.cache_ratio * size
-        chunks = c.chunks_per_mb * mb + c.chunks_file * n
+        # 中身を数えられたファイルは数えた値、残りは族の係数の式で見る。
+        m_n, m_size, m_derived, m_chunks = counts.get("measured", {}).get(fam, (0, 0, 0.0, 0.0))
+        rest_n, rest_size = n - m_n, size - m_size
+        need["derived"] += (c.derived_ratio * rest_size + c.derived_file * n + c.cache_ratio * size + m_derived)
+        chunks = c.chunks_per_mb * rest_size / MB + c.chunks_file * rest_n + m_chunks
         vecs = chunks * c.vec_ratio if c.embedded else 0
         need["es"] += chunks * c.es_chunk_bytes + vecs * _ES_VECTOR_BYTES_PER_DIM * dim
         if vecs and dim:

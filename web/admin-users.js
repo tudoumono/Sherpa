@@ -31,12 +31,24 @@ function passwordCharsetError(value) {
 }
 
 // ===== admin ガード: /auth/me でロールを確認 =====
+let _adminErr = '';
+// 戻り値は 'admin'／'denied'（401・403・管理者でない）／'unreachable'（判定できなかった。理由は _adminErr）。
 async function checkAdmin() {
   try {
     const u = await getJSON('/auth/me');
-    if (u && u.role === 'admin') return true;
-  } catch (_) { /* compat mode: admin 合成が返る */ }
-  return false;
+    return u && u.role === 'admin' ? 'admin' : 'denied';
+  } catch (e) {
+    if (e && (e.status === 401 || e.status === 403)) return 'denied';
+    _adminErr = (e && e.message) || '';
+    return 'unreachable';
+  }
+}
+
+function showUnreachable(denied) {
+  const d = denied && denied.querySelectorAll('div');
+  if (!d || d.length < 3) return;
+  d[1].textContent = '権限を確認できませんでした: ' + _adminErr;
+  d[2].textContent = '時間をおいて画面を開き直してください。';
 }
 
 // ===== ユーザー一覧の描画 =====
@@ -294,31 +306,17 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !$('edit-overlay').hidden) closeEditDialog();
 });
 
-// テーマ切替
-function applyThemeIcon() {
-  const tb = $('themebtn');
-  if (tb) tb.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙';
-}
-const themebtn = $('themebtn');
-if (themebtn) {
-  themebtn.addEventListener('click', () => {
-    const d = document.documentElement;
-    const next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-    d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
-  });
-}
-applyThemeIcon();
-
 // ===== 初期化 =====
 (async () => {
   closeEditDialog();
   const isAdmin = await checkAdmin();
-  if (!isAdmin) {
+  if (isAdmin !== 'admin') {
     // admin でなければアクセス拒否メッセージを表示してコンテンツを隠す。
     const main = $('main-content');
     const denied = $('access-denied');
     if (main) main.style.display = 'none';
     if (denied) denied.style.display = 'block';
+    if (isAdmin === 'unreachable') showUnreachable(denied);
     return;
   }
   await loadUsers();

@@ -24,4 +24,4 @@ sudo usermod -aG docker "$USER"
 echo
 echo "OK. 反映するには新しいシェルを開く（または: newgrp docker）。"
 echo "確認: docker run --rm hello-world"
-echo "次:   make up   （Sherpa のストア起動）"
+echo "次:   make up   （Slouch のストア起動）"

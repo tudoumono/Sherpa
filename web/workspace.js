@@ -31,13 +31,13 @@ async function loadFiles() {
   const cnt = $('file-count');
   if (!el) return;
   el.setAttribute('aria-busy', 'true');
-  el.innerHTML = '<div class="loading" role="status" style="padding:16px 0"><span class="spinner spinner-sm"></span><span>個人ワークスペースを読み込んでいます...</span></div>';
+  el.innerHTML = '<div class="loading" role="status" style="padding:16px 20px"><span class="spinner spinner-sm"></span><span>個人ワークスペースを読み込んでいます...</span></div>';
   try {
     const data = await getJSON('/workspace/files');
     const files = data.files || [];
     if (cnt) cnt.textContent = `(${files.length} 件)`;
     if (!files.length) {
-      el.innerHTML = '<div class="muted" style="padding:16px 0;text-align:center">ファイルがありません</div>';
+      el.innerHTML = '<div class="muted" style="padding:16px 20px;text-align:center">ファイルがありません</div>';
       return;
     }
     // data-* 属性に ID を持たせて委譲クリックで削除（インラインハンドラなし）。
@@ -55,7 +55,7 @@ async function loadFiles() {
       <th>アップロード日時</th><th>有効期限</th><th></th>
     </tr></thead><tbody>${rows}</tbody></table>`;
   } catch (e) {
-    el.innerHTML = `<div class="muted" style="color:var(--danger);padding:12px 0">読み込みエラー: ${esc(e.message)}。ページを再読み込みするか、ログイン状態を確認してください。</div>`;
+    el.innerHTML = `<div class="muted" style="color:var(--danger);padding:12px 20px">読み込みエラー: ${esc(e.message)}。ページを再読み込みするか、ログイン状態を確認してください。</div>`;
   } finally {
     el.setAttribute('aria-busy', 'false');
   }
@@ -176,24 +176,9 @@ function initSearch() {
   if (inp) inp.addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter') doSearch(); });
 }
 
-// ===== テーマ切替（全ページ共通パターン）=====
-function initTheme() {
-  const btn = $('themebtn');
-  if (!btn) return;
-  const root = document.documentElement;
-  btn.addEventListener('click', () => {
-    const next = root.dataset.theme === 'light' ? 'dark' : 'light';
-    root.dataset.theme = next;
-    localStorage.setItem('sherpa-theme', next);
-    btn.textContent = next === 'dark' ? '☀️' : '🌙';
-  });
-  btn.textContent = root.dataset.theme === 'dark' ? '☀️' : '🌙';
-}
-
 // ===== 初期化 =====
 document.addEventListener('DOMContentLoaded', () => {
   initUpload();
   initSearch();
-  initTheme();
   loadFiles();
 });

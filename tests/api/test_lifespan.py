@@ -138,12 +138,8 @@ class _FakeSystemSettingsDB:
     def get_system_settings(self) -> dict:
         return dict(self.data)
 
-    def seed_system_settings_once(self, updates: dict, guard_key: str, secret_keys=None,
-                                  *, ollama_allowlist_merge=None):
-        self.seed_calls.append({"updates": dict(updates), "guard_key": guard_key, "secret_keys": secret_keys,
-                               "ollama_allowlist_merge": ollama_allowlist_merge})
-        if ollama_allowlist_merge is not None and "ollama_allowlist" in updates:
-            raise ValueError("ollama_allowlist_merge 使用時は updates に ollama_allowlist を含められません")
+    def seed_system_settings_once(self, updates: dict, guard_key: str, secret_keys=None):
+        self.seed_calls.append({"updates": dict(updates), "guard_key": guard_key, "secret_keys": secret_keys})
         applied: dict = {}
         conflicts: dict = {}
         marker_present = guard_key in self.data
@@ -153,14 +149,6 @@ class _FakeSystemSettingsDB:
             else:
                 self.data[k] = v
                 applied[k] = v
-        if ollama_allowlist_merge is not None:
-            url_key, host_entry = ollama_allowlist_merge
-            if url_key in applied and host_entry:
-                current = list(self.data.get("ollama_allowlist") or [])
-                if host_entry not in current:
-                    merged = [*current, host_entry]
-                    self.data["ollama_allowlist"] = merged
-                    applied["ollama_allowlist"] = merged
         return applied, conflicts
 
 
@@ -175,9 +163,8 @@ def _seed_recorder(monkeypatch, current=None):
     """`seed_system_settings_once` の呼び出し引数を記録する（現在の system_settings は `current`）。"""
     calls = []
 
-    def _fake(updates, guard_key=None, secret_keys=None, *, ollama_allowlist_merge=None):
-        calls.append({"updates": dict(updates), "guard_key": guard_key, "secret_keys": secret_keys,
-                      "ollama_allowlist_merge": ollama_allowlist_merge})
+    def _fake(updates, guard_key=None, secret_keys=None):
+        calls.append({"updates": dict(updates), "guard_key": guard_key, "secret_keys": secret_keys})
         return dict(updates), {}
 
     monkeypatch.setattr(store, "get_system_settings", lambda: dict(current or {}))
@@ -266,18 +253,15 @@ def test_seed_settings_from_env_aggregates_mismatch_warnings_into_one_line(monke
 _OLLAMA_MARKER = {api._OLLAMA_URL_SEED_MARKER_KEY: api._OLLAMA_URL_SEED_VERSION}
 
 
-@pytest.mark.parametrize("env_url, expected_updates, expected_merge", [
-    ("http://ollama-central.internal:11434",   # 非 loopback は allowlist へ原子的に追記
-     {"ollama_url": "http://ollama-central.internal:11434", **_OLLAMA_MARKER},
-     ("ollama_url", "ollama-central.internal:11434")),
-    ("http://localhost:11434", None, None),   # loopback は allowlist 不要
-    (None, _OLLAMA_MARKER, None),             # env 空はマーカーだけ確定
+@pytest.mark.parametrize("env_url, expected_updates", [
+    ("http://ollama-central.internal:11434",
+     {"ollama_url": "http://ollama-central.internal:11434", **_OLLAMA_MARKER}),
+    ("http://localhost:11434", None),
+    (None, _OLLAMA_MARKER),                   # env 空はマーカーだけ確定
     ("http://ollama-central.internal",        # ポート省略は scheme の既定ポートへ正規化
-     {"ollama_url": "http://ollama-central.internal:80", **_OLLAMA_MARKER},
-     ("ollama_url", "ollama-central.internal:80")),
+     {"ollama_url": "http://ollama-central.internal:80", **_OLLAMA_MARKER}),
 ])
-def test_seed_ollama_url_from_env_writes_url_marker_and_allowlist_atomically(
-        monkeypatch, env_url, expected_updates, expected_merge):
+def test_seed_ollama_url_from_env_writes_url_and_marker(monkeypatch, env_url, expected_updates):
     if env_url is None:
         monkeypatch.delenv("OLLAMA_URL", raising=False)
     else:
@@ -288,17 +272,6 @@ def test_seed_ollama_url_from_env_writes_url_marker_and_allowlist_atomically(
     assert calls[0]["guard_key"] == api._OLLAMA_URL_SEED_MARKER_KEY
     if expected_updates is not None:
         assert calls[0]["updates"] == expected_updates
-    assert calls[0]["ollama_allowlist_merge"] == expected_merge
-
-
-def test_seed_ollama_url_from_env_allowlist_not_merged_when_url_conflicts(monkeypatch):
-    """`ollama_url` 行が既にあり新規挿入できなければ allowlist へ何も追記しない（URL と送信先の認可を
-    常にペアで確定）。ollama_url 自体は競合してもマーカーは確定する。"""
-    monkeypatch.setenv("OLLAMA_URL", "http://ollama-central.internal:11434")
-    db = _use_fake_db(monkeypatch, {"ollama_url": "http://already-there:11434"})
-    api._seed_ollama_url_from_env()
-    assert "ollama_allowlist" not in db.data
-    assert api._OLLAMA_URL_SEED_MARKER_KEY in db.data
 
 
 @pytest.mark.parametrize("bad_url", [
@@ -314,19 +287,6 @@ def test_seed_ollama_url_from_env_rejects_malformed_url_and_does_not_confirm_mar
         api._seed_ollama_url_from_env()
     assert calls == []
     assert any("OLLAMA_URL" in r.message for r in caplog.records)
-
-
-def test_warn_central_ollama_not_allowed_warns_only_for_non_loopback_missing_from_allowlist(monkeypatch, caplog):
-    for url, allowlist, warns in (
-            ("http://central.internal:11434", [], True),
-            ("http://central.internal:11434", ["central.internal:11434"], False),
-            ("http://localhost:11434", [], False)):
-        db = _FakeSystemSettingsDB({"ollama_url": url, "ollama_allowlist": allowlist})
-        monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-        caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="sherpa"):
-            api._warn_central_ollama_not_allowed()
-        assert any("許可一覧にありません" in r.getMessage() for r in caplog.records) is warns, url
 
 
 # ---- OpenAI 接続先（`_openai_endpoint_seed_candidate` の原子性・明示 kind 優先） ----
@@ -516,7 +476,7 @@ def test_screen_settings_seed_from_env_then_workspace_limits_follow_db_only(monk
 
 _HEALTHZ_API_SEEDS = {
     "credential": "_seed_settings_from_env", "ollama_url": "_seed_ollama_url_from_env",
-    "ollama_allowlist": "_warn_central_ollama_not_allowed", "openai_endpoint": "_seed_openai_endpoint_from_env",
+    "openai_endpoint": "_seed_openai_endpoint_from_env",
     "depth_profile": "_seed_depth_profile_from_env", "screen": "_seed_screen_settings_from_env",
     "user_agent": "_seed_user_agent_from_env", "vlm_ollama_url": "_seed_vlm_ollama_url_from_env",
 }
@@ -671,7 +631,6 @@ def test_purge_personal_keys_on_startup_survives_db_unreachable(monkeypatch):
 _STARTUP_STEPS = [
     (api, "_seed_settings_from_env", "seed_settings"),
     (api, "_seed_ollama_url_from_env", "seed_ollama_url"),
-    (api, "_warn_central_ollama_not_allowed", "catchup_ollama_allowlist"),
     (api, "_seed_openai_endpoint_from_env", "seed_openai_endpoint"),
     (api, "_seed_depth_profile_from_env", "seed_depth_profile"),
     (api, "_seed_screen_settings_from_env", "seed_screen_settings"),
@@ -716,7 +675,7 @@ def test_lifespan_runs_startup_steps_in_order(monkeypatch, schema_fails):
         pass
     assert calls == [
         "attach_request_id_filter", *([] if schema_fails else ["schema"]),
-        "seed_settings", "seed_ollama_url", "catchup_ollama_allowlist", "seed_openai_endpoint",
+        "seed_settings", "seed_ollama_url", "seed_openai_endpoint",
         "seed_depth_profile", "seed_screen_settings", "model_catalog_seed", "purge_personal_keys",
         "warn_change_me", "warn_default_admin", "auth",
         "warn_fixtures", "warn_test_db_isolated", "warn_codex_sandbox", "warn_multi_worker", "warn_browse_roots",

@@ -35,6 +35,14 @@ def _patch(monkeypatch, rows):
                         lambda world, deadline=None: rows)
 
 
+def _budget_for(n, **build_kw):
+    """先頭 n 件のフォルダを返したページの JSON 実バイト数に少し足した、その件数だけが収まる予算。"""
+    import json
+    full = folder_tree.build("v1", {}, **build_kw)
+    page = {**full, "folders": full["folders"][:n], "folders_truncated": True, "next_offset": n}
+    return len(json.dumps(page, ensure_ascii=False).encode("utf-8")) + 8   # 次の 1 件は入らない余裕
+
+
 # ---- build(): 集計の形 ----
 
 def test_build_aggregates_direct_total_and_subfolder_counts(monkeypatch):
@@ -113,12 +121,57 @@ def test_build_entries_truncated_by_byte_budget_reports_total_count(monkeypatch)
     """RV是正（rv-periphery #2）: `tool_result_max_bytes` の実効値までエントリ単位で詰め、
     件数上限（`_MAX_FOLDERS`）に達していなくてもバイト予算超過で打ち切る。`count` は打切り前の
     総数のまま・`folders_truncated` はバイト打切りでも真になる（黙って一部だけ返さない）。"""
-    rows = _rows(*[f"f{i}/x.md" for i in range(5)])           # f0..f4 の5フォルダ（path はどれも2バイト）
+    rows = _rows(*[f"f{i}/x.md" for i in range(5)])           # f0..f4 の5フォルダ
     _patch(monkeypatch, rows)
-    res = folder_tree.build("v1", {}, tool_result_max_bytes=6)   # "f0"+"f1"+"f2" で丁度6バイト
+    res = folder_tree.build("v1", {}, tool_result_max_bytes=_budget_for(3))   # 3 件分の実バイト数
     assert res["count"] == 5                                    # 打ち切り前の総フォルダ数は不変
     assert len(res["folders"]) == 3                             # 3エントリ分でバイト予算を使い切る
     assert res["folders_truncated"] is True
+
+
+def _walk_pages(monkeypatch, n, **kw):
+    """next_offset を渡し直して最後まで取り、(取得した path 列, ページ数) を返す。"""
+    _patch(monkeypatch, _rows(*[f"f{i:02d}/x.md" for i in range(n)]))
+    seen, off, pages = [], 0, 0
+    while True:
+        res = folder_tree.build("v1", {"offset": off} if off else {}, **kw)
+        seen += [f["path"] for f in res["folders"]]
+        pages += 1
+        if res["next_offset"] is None:
+            assert res["folders_truncated"] is False
+            return seen, pages
+        assert res["folders_truncated"] is True
+        assert res["next_offset"] > off  # 進まない続きを返さない
+        off = res["next_offset"]
+
+
+def test_next_offset_continues_after_safety_valve_without_gap_or_duplicate(monkeypatch):
+    monkeypatch.setattr(folder_tree, "_MAX_FOLDERS", 3)
+    seen, pages = _walk_pages(monkeypatch, 8)
+    assert seen == [f"f{i:02d}" for i in range(8)] and pages == 3
+
+
+def test_next_offset_is_recomputed_when_byte_budget_cuts_the_page(monkeypatch):
+    _patch(monkeypatch, _rows(*[f"f{i:02d}/x.md" for i in range(8)]))
+    seen, pages = _walk_pages(monkeypatch, 8, tool_result_max_bytes=_budget_for(3))   # 1 ページ 3 件
+    assert seen == [f"f{i:02d}" for i in range(8)] and pages == 3
+
+
+def test_byte_budget_smaller_than_one_path_still_advances(monkeypatch):
+    seen, pages = _walk_pages(monkeypatch, 3, tool_result_max_bytes=1)
+    assert seen == ["f00", "f01", "f02"] and pages == 3
+
+
+def test_offset_past_the_end_returns_empty_without_next_offset(monkeypatch):
+    _patch(monkeypatch, _SAMPLE)
+    res = folder_tree.build("v1", {"offset": 99})
+    assert res["folders"] == [] and res["next_offset"] is None and res["count"] == 5
+
+
+def test_bad_offset_is_treated_as_zero(monkeypatch):
+    _patch(monkeypatch, _SAMPLE)
+    for bad in (-3, "x", None):
+        assert len(folder_tree.build("v1", {"offset": bad})["folders"]) == 5
 
 
 def test_build_default_byte_budget_used_when_not_specified(monkeypatch):
@@ -136,7 +189,7 @@ def test_run_tool_forwards_tool_result_max_bytes_to_folder_tree(monkeypatch):
     rows = _rows(*[f"f{i}/x.md" for i in range(5)])
     _patch(monkeypatch, rows)
     result, _docs, _cites, _cards = tool_dispatch.run_tool(
-        "folder_tree", {}, "v1", None, tool_result_max_bytes=6)
+        "folder_tree", {}, "v1", None, tool_result_max_bytes=_budget_for(3))
     assert result["count"] == 5
     assert len(result["folders"]) == 3
     assert result["folders_truncated"] is True
@@ -195,3 +248,24 @@ def test_mcp_tool_defs_es_search_still_placed_right_after_ripgrep_search(monkeyp
     assert names.index("es_search") == names.index("ripgrep_search") + 1
 
 
+
+
+def test_page_fits_the_byte_budget_by_serialized_entries(monkeypatch):
+    import json
+    _patch(monkeypatch, _rows(*[f"folder{i:04d}/x.md" for i in range(600)]))
+    seen, off = [], 0
+    while True:
+        res = folder_tree.build("v1", {"offset": off} if off else {}, tool_result_max_bytes=36000)
+        assert len(json.dumps(res, ensure_ascii=False).encode("utf-8")) <= 36000
+        seen += [f["path"] for f in res["folders"]]
+        if res["next_offset"] is None:
+            break
+        off = res["next_offset"]
+    assert seen == [f"folder{i:04d}" for i in range(600)]
+
+
+def test_mcp_search_budget_applies_to_folder_tree_and_graph_neighbors(monkeypatch):
+    monkeypatch.setenv("SHERPA_MCP_SEARCH_BUDGET_BYTES", "36000")
+    monkeypatch.delenv("SHERPA_MCP_TOOL_BUDGET_BYTES", raising=False)
+    assert mcp_server._tool_budget_bytes("folder_tree") == 36000
+    assert mcp_server._tool_budget_bytes("graph_neighbors") == 36000

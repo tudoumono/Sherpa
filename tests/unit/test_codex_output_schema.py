@@ -253,7 +253,7 @@ def test_turn_failed_without_agent_message_is_explicit_failure(tmp_path, monkeyp
                      ctx=helper._ctx(uid="schema-turnfailed", conversation_id=None,
                                      message="偽 codex turn.failed テスト"))
     assert env["headline"] != "dispatch-headline"
-    assert "接続できません" in env["headline"] and "回答を返せずに終了しました" in env["headline"]
+    assert "接続できません" not in env["headline"] and "回答を返せずに終了しました" in env["headline"]
     assert not env.get("codex_stopped_early") and not env.get("codex_timed_out")
     assert len(calls) == 1
 

@@ -74,7 +74,7 @@ fail()  { echo "✗ $*" >&2; }
 _LOG_FILE="$ROOT/data/install-logs/install-offline-$(date +%Y%m%d-%H%M%S).log"
 mkdir -p "$(dirname "$_LOG_FILE")"
 exec > >(tee -a "$_LOG_FILE") 2>&1
-echo "=== Sherpa オフライン導入 $(date -Iseconds) ==="
+echo "=== Slouch オフライン導入 $(date -Iseconds) ==="
 echo "版: $(cat "$ROOT/VERSION" 2>/dev/null || echo 不明) / host: $(uname -srm)"
 echo "ログ: $_LOG_FILE"
 echo ""
@@ -403,7 +403,7 @@ if [ -n "$CODEX_TARBALL" ] && [ -f "$CODEX_TARBALL" ]; then
       ok "Codex CLI の API キー認証を済ませました（$_CX_ENV の OPENAI_API_KEY・通信なし）"
     else
       note "  Codex CLI の認証は未実施（$_CX_ENV に OPENAI_API_KEY が無い等）。make start 時にキーがあれば自動で行います。"
-      note "  手動なら: printenv OPENAI_API_KEY | codex login --with-api-key（Sherpa を動かすユーザーで・通信不要）"
+      note "  手動なら: printenv OPENAI_API_KEY | codex login --with-api-key（Slouch を動かすユーザーで・通信不要）"
     fi
   else
     note "  認証は make start が .env の OPENAI_API_KEY で自動的に行います（通信不要）。"
@@ -628,8 +628,8 @@ echo "     不足しているときだけ、新規ファイルとして追加し
 echo "       echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-sherpa-vm-max-map-count.conf"
 echo "       sudo sysctl --system"
 echo "     /etc/sysctl.d/ はファイル名の番号順に読まれ後勝ちです。同居製品が別ファイル（例 10-*.conf）で"
-echo "     より大きい値を設定している場合は、そちらが優先されるよう Sherpa 用ファイルは置かないでください"
-echo "     （どうしても両方置くなら、Sherpa 側を同居製品より小さい番号にする）。"
+echo "     より大きい値を設定している場合は、そちらが優先されるよう Slouch 用ファイルは置かないでください"
+echo "     （どうしても両方置くなら、Slouch 側を同居製品より小さい番号にする）。"
 # 閉域実機報告⑦（2026-08-18）: 末尾の起動案内が docker compose up -d に続けて run-api.sh を素の
 # serve 引数で直接起動するだけ（127.0.0.1 待受固定）で、社内 LAN の他端末から使わせる前提なのに
 # LAN=1 の案内が無かった。起動はポート検査まで一括で行う make start（＝scripts/start.sh）を

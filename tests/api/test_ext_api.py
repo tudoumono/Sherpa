@@ -424,7 +424,7 @@ def test_search_degraded_all_engines_down(monkeypatch):
 
 
 def test_search_filters_nonexistent_docs(monkeypatch):
-    """削除直後の窓で ES 索引に古いまま残る doc_id は返さない（`documents.world_rel_set` の実在フィルタ）。"""
+    """削除直後の窓で ES 索引に古いまま残る doc_id は返さない（`documents.existing_rels` の実在フィルタ）。"""
     def _hit(rel):
         return {"key": rel, "doc_id": rel, "path": rel, "line": 1, "snippet": "s",
                 "engine_score": 1.0, "judgement": None, "paths": None}
@@ -432,8 +432,8 @@ def test_search_filters_nonexistent_docs(monkeypatch):
     monkeypatch.setattr(fused_search, "_search_keyword",
                         lambda world, query, sp, k, settings, layer=None: (
                             [_hit("real.md"), _hit("deleted.md")], None))
-    monkeypatch.setattr(documents, "world_rel_set",
-                        lambda world=None, root=None, strict=False, **kw: {"real.md"})
+    monkeypatch.setattr(documents, "existing_rels",
+                        lambda world, rels, **kw: {r for r in rels if r in {"real.md"}})
 
     r = _search({"world": "v1", "query": "x", "engines": ["keyword"]}, _key("realfilter")["key"])
     assert r.status_code == 200, r.text
@@ -460,7 +460,7 @@ def test_search_audit_written():
 
 def _stub_engines(monkeypatch, graph_result, keyword_docs=()):
     """keyword は固定ヒット、graph は `run_impact` 相当の結果を実の `_graph_hits` で変換する（ES/Neo4j は使わない）。"""
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, root=None, strict=False, **kw: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     monkeypatch.setattr(fused_search, "_search_keyword",
                         lambda world, query, sp, k, settings, layer=None: ([
                             {"key": d, "doc_id": d, "path": d, "line": 1, "snippet": "s",
@@ -473,11 +473,6 @@ def _stub_engines(monkeypatch, graph_result, keyword_docs=()):
 
     monkeypatch.setattr(fused_search, "_search_graph", _graph)
     return seen
-
-
-class _AllDocs:
-    def __contains__(self, item):
-        return True
 
 
 _GRAPH_RESULT = {
@@ -510,7 +505,7 @@ def test_search_coverage_shape_and_graph_origin(monkeypatch):
 def test_search_overload_is_degraded_detail_without_coverage(monkeypatch):
     from sherpa.ingest.world_neo4j import GraphQueryOverloadError
 
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, root=None, strict=False, **kw: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
 
     @contextmanager
     def _session():
@@ -759,6 +754,31 @@ def test_doc_download_roundtrip():
     # 非 ASCII ファイル名は RFC 5987 形式で返る。
     assert r.headers["content-disposition"] == f"attachment; filename*=utf-8''{quote('消費税法.md')}"
     assert r.headers["content-length"] == str(len(original))
+
+
+def test_search_boundary_drops_excluded_hits(monkeypatch):
+    """外部 API の検索の応答にも出口の濾過を通す（除外の資料のヒットは落ち、件数の欄は見える分で数え直す）。"""
+    import json as _json
+    from sherpa import path_rules
+    monkeypatch.setenv(path_rules.ENV_KEY, _json.dumps({"v1": [{"path": "4期/01_標準", "kind": "exclude", "outside_scope": False}]}))
+    hit = lambda d: {"doc_id": d, "path": d, "snippet": "s", "score": 1.0, "sources": {"keyword": 1}}  # noqa: E731
+    monkeypatch.setattr(fused_search, "search", lambda *a, **k: {
+        "hits": [hit(_TAX_DOC), hit("4期/04_運用/障害記録.md")], "engines_used": ["keyword"], "degraded": []})
+    r = _search({"world": "v1", "query": "税"}, _key("srchx")["key"])
+    assert r.status_code == 200, r.text
+    assert [h["doc_id"] for h in r.json()["hits"]] == ["4期/04_運用/障害記録.md"]
+
+
+def test_doc_refuses_admin_excluded_path(monkeypatch):
+    """管理者が検索から外した資料は、既知のパスでも配らない（404）。除外の設定を読めないときは 503。"""
+    import json as _json
+    from sherpa import path_rules
+    key = _key("docexcl")["key"]
+    monkeypatch.setenv(path_rules.ENV_KEY, _json.dumps({"v1": [{"path": "4期/01_標準", "kind": "exclude", "outside_scope": False}]}))
+    assert _doc("v1", _TAX_DOC, key).status_code == 404
+    assert _doc("v1", "4期/04_運用/../01_標準/消費税法.md", key).status_code == 404
+    monkeypatch.delenv(path_rules.ENV_KEY)
+    assert _doc("v1", _TAX_DOC, key).status_code == 200
 
 
 @pytest.mark.parametrize("world, path", [

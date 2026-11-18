@@ -58,6 +58,7 @@ class SimpleProvider(Provider):
         state = simple_chat.LoopState()
         t0 = time.monotonic()
         failure: str | None = None
+        no_tools = False
         try:
             for ev in simple_chat.iter_tool_loop(
                     state, provider=self.provider_id, model=self.model, endpoint=self._endpoint,
@@ -76,6 +77,7 @@ class SimpleProvider(Provider):
         except (simple_chat.LLMUnavailable, simple_chat.AnswerTimeout) as e:
             from .. import stop_kind as stop_kind_mod
             failure = stop_kind_mod.from_exception(e) or "error"
+            no_tools = isinstance(e, simple_chat.ModelLacksTools)
         finally:
             usage = (_usage_meta(self.provider_id, self.model,
                                  **(agentic_search._usage_or_none(state.usage_acc) or {}),
@@ -85,8 +87,14 @@ class SimpleProvider(Provider):
         if state.stopped or (ctx.stop_event is not None and ctx.stop_event.is_set()):
             return  # 停止時は `_result` を出さない
         if failure is not None:
-            msg = f"{LABEL} の AI に接続できませんでした。管理者に設定を確認してください。"
-            yield from self._finish(ctx, msg, [], None, "AI に接続できません",
+            if no_tools:
+                msg = (f"{LABEL} のモデルが道具の呼び出しに対応していません。"
+                       "管理者に「使えるモデル」の設定を確認してください。")
+                head = "モデルが道具の呼び出しに対応していません"
+            else:
+                msg = f"{LABEL} の AI に接続できませんでした。管理者に設定を確認してください。"
+                head = "AI に接続できません"
+            yield from self._finish(ctx, msg, [], None, head,
                                     usage=usage, failure=failure, elapsed=time.monotonic() - t0)
             return
 

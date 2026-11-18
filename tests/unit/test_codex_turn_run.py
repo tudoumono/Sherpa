@@ -563,20 +563,41 @@ def test_provider_processing_error_keeps_collected_body(tmp_path, monkeypatch, o
 
 # ===== 出典とファイルの欠落を伝える（COD-25 A3） =====
 
-def test_referenced_docs_that_failed_verification_are_listed_with_reason_and_secret_names_only_counted(
+def test_referenced_docs_that_failed_verification_are_listed_with_reason_and_secret_names_shown(
         tmp_path, monkeypatch):
-    """検証を通らなかった「参照した資料」の行は、理由つきで返し注記する。秘匿名は名前を出さず件数だけ。"""
+    """検証を通らなかった「参照した資料」の行は、理由つきで返し注記する。秘匿名も名前は出す（出典には載せない）。解釈できない行だけ件数。"""
+    from sherpa import documents as _documents
+    real_resolve = _documents.resolve
+    monkeypatch.setattr(_documents, "resolve", lambda doc, world: (doc if doc == ".env" else real_resolve(doc, world)))
     answer = (f"消費税率は10%です。\n\n参照した資料:\n- {H._DOC}\n- 存在しない.md\n- ../外へ出る.md\n- .env\n")
     _, env, _ = _run(tmp_path, monkeypatch, H._PY + H._msg(answer), "unverified-u1",
                      make_sources=H._make_sources)
     assert env["sources_verified"] == [H._DOC]
     from sherpa.providers.codex import citations as C
-    assert env["sources_unverified"] == [{"path": "存在しない.md", "reason": C.REASON_UNREADABLE}]
-    assert env["sources_unverified_hidden"] == 2      # 秘匿名と解釈できない行は件数だけ
-    assert ".env" not in str(env["sources_unverified"]) and ".env" not in env["headline"]
+    assert env["sources_unverified"] == [{"path": "存在しない.md", "reason": C.REASON_UNREADABLE},
+                                         {"path": ".env", "reason": C.REASON_SENSITIVE}]
+    assert env["sources_unverified_hidden"] == 1      # 解釈できない行だけ件数
+    assert ".env" not in env["sources_verified"] and ".env" not in [s.get("doc_id") for s in env.get("sources") or []]
     notice = next(n for n in env["notices"] if n["kind"] == "sources_unverified")
     assert "3 件" in notice["text"] and notice["text"] in env["headline"]
     assert env["completion"] == "complete"      # 出典の欠落は完了状態を変えない
+
+
+def test_bare_name_missing_from_ledger_walks_the_original_tree_once_per_turn(tmp_path, monkeypatch):
+    """台帳に無い名前だけの参照がある 1 ターンで、原本の木は 1 回しか歩かない（一覧だけで開いた資料があっても）。"""
+    from sherpa import documents
+    calls: list = []
+    real = documents.scope_rel_set
+
+    def counting(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+    monkeypatch.setattr(documents, "scope_rel_set", counting)
+    answer = f"確認しました。\n\n参照した資料:\n- 台帳にも原本にも無い名前.md\n- {H._DOC}\n"
+    body = H._PY + H._mcp_call("xlsx_sheets", {"doc_id": H._DOC2}, id="x1") + H._msg(answer)
+    _, env, _ = _run(tmp_path, monkeypatch, body, "walkonce-u1", make_sources=H._make_sources)
+    assert env["sources_verified"] == [H._DOC]
+    assert len(calls) == 1
 
 
 def test_files_made_outside_authoring_are_discarded_and_say_so(tmp_path, monkeypatch, registry):

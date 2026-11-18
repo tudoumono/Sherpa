@@ -804,10 +804,12 @@ class Runner:
         self.check_database()
         require_free_port(self.args.api_port)
         env = self.server_env(style)
-        with (self.state / f"api-{style}.log").open("ab") as log:
+        with (self.state / f"api-{style}.log").open("ab") as log, \
+                (self.state / f"ingest-worker-{style}.log").open("ab") as wlog:
             proc = subprocess.Popen([sys.executable, "-m", "uvicorn", "sherpa.api:app", "--host", "127.0.0.1",
                                      "--port", str(self.args.api_port), "--workers", "1", "--no-access-log"],
                                     cwd=ROOT, env=env, stdout=log, stderr=log)
+            worker = None
             try:
                 deadline = time.monotonic() + 120
                 while True:
@@ -821,11 +823,21 @@ class Runner:
                     if time.monotonic() > deadline:
                         raise EvalError("API 起動待ちが上限を超えました")
                     time.sleep(1)
+                # 取り込みは API とは別の取り込みワーカーが拾う
+                worker = subprocess.Popen([sys.executable, "-m", "sherpa.ingest.ingest_worker"],
+                                          cwd=ROOT, env=env, stdout=wlog, stderr=wlog)
                 self.api.login(self.secret)
                 dump(self.credential, self.secret)
                 self.credential.chmod(0o600)
                 yield
             finally:
+                if worker is not None:
+                    worker.terminate()
+                    try:
+                        worker.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        worker.kill()
+                        worker.wait()
                 proc.terminate()
                 try:
                     proc.wait(timeout=20)
@@ -867,7 +879,7 @@ class Runner:
         while time.monotonic() < deadline:
             runs = self.api.request("GET", f"/ingest/runs?world={self.world}")["runs"]
             row = next((r for r in runs if r["id"] == accepted["run_id"]), None)
-            if row and row.get("status") != "extracting":
+            if row and row.get("status") not in ("queued", "extracting"):
                 dump(self.out / "ingest.json", row)
                 if row["status"] not in ("auto_published", "auto_published_with_flags"):
                     raise EvalError("資料の取り込みが失敗しました（ingest.json 参照）")

@@ -142,6 +142,29 @@ def test_start_turn_releases_reservation_when_thread_start_fails(monkeypatch):
         assert not [r for r in CT._REGISTRY.values() if r.uid == "u1" and not r.buffer.done]
 
 
+def test_uncaught_timeout_and_transport_errors_get_their_own_message():
+    """未捕捉の例外は、型から timeout／通信失敗が分かるときだけ固定文を分ける（それ以外は従来の文）。"""
+    import socket
+    import time
+    import sherpa.chat_turns as CT
+
+    def _message(exc):
+        def _run(stop, emit):
+            raise exc
+        rec = CT.start_turn(uid="u-err", conversation_factory=lambda: 1, run_fn_factory=lambda cid: _run)
+        while not rec.buffer.wait_for_more(0, 5):
+            pass
+        for _ in range(500):
+            if rec.buffer.done:
+                break
+            time.sleep(0.01)
+        return [e.payload for e in rec.buffer.replay_from(0) if e.payload.get("type") == "error"][-1]["message"]
+
+    assert "タイムアウト" in _message(TimeoutError("t"))
+    assert "通信に失敗" in _message(socket.gaierror("dns"))
+    assert _message(ValueError("x")) == "内部エラーが発生しました。もう一度お試しください。"
+
+
 def test_admin_can_stop_other_users_turn_but_plain_user_cannot():
     import threading
     import sherpa.chat_turns as CT

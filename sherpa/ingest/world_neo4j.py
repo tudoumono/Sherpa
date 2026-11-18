@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -18,10 +20,10 @@ import uuid
 from neo4j import Query
 from neo4j.exceptions import Neo4jError
 
-from .. import graph_coverage, worlds                # 未完了の申告・資料フォルダの root 解決（重要度の解決に使う）
+from .. import graph_coverage                         # 未完了の申告
 from ..env_int import env_int
 from ..impact_service import CATEGORY                # 種別→結果カテゴリ
-from . import importance, substage                   # 文書の重要度（`_重要度.txt`）・小さな段の進み具合
+from . import substage                               # 小さな段の進み具合
 from .model import EDGE_TYPES, NODE_LABELS           # 閉じた語彙（Cypher 直埋めの allowlist）
 
 _log = logging.getLogger("sherpa")
@@ -31,7 +33,7 @@ WORLD_EDGE_TYPES = EDGE_TYPES | {"CORRESPONDS_TO"}
 
 # 影響たどりで辿るのは構造（コード依存）のエッジだけ。対応エッジ `CORRESPONDS_TO` と添付 `DOCUMENTS`（言及エッジ含む）は辿らない。
 # データの流れ `FLOWS_TO` は構造の影響に混ぜず、`world_impact` の第 2 段（`flow_depth`）で候補として別に辿る
-_IMPACT_REL = "COPIES|CONTAINS|INVOKES|ACCESSES"
+_IMPACT_REL = "COPIES|CONTAINS|INVOKES|ACCESSES|BUILT_FROM"
 _FLOW_REL = "FLOWS_TO"
 
 # 流れの候補を辿る段数の既定（道具・画面とも既定で出す）
@@ -62,19 +64,103 @@ def _compute_graph_schema_era() -> str:
     原本の変更で動く `ingest.worker._sig`（last_sig）とは別物で、保存済みグラフを読んでよい前提が崩れたときだけ動く。
     材料モジュールは循環 import を避けるため関数内で import し、呼び出しは module import 時の1回だけ。
     """
+    return _era_of(NODE_LABELS, EDGE_TYPES)
+
+
+def _era_of(labels, edge_types) -> str:
     from .analyzers.registry import CODE_ANALYZERS_SCHEMA_VERSION, config_signature
     from .world_graph import MENTION_SCHEMA_VERSION
     material = repr((CODE_ANALYZERS_SCHEMA_VERSION, config_signature(), MENTION_SCHEMA_VERSION,
-                     GRAPH_STORAGE_VERSION, tuple(sorted(NODE_LABELS)), tuple(sorted(EDGE_TYPES))))
+                     GRAPH_STORAGE_VERSION, tuple(sorted(labels)), tuple(sorted(edge_types))))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
 
 
 GRAPH_SCHEMA_ERA = _compute_graph_schema_era()
+# 実行名の語彙（`Executable`・`BUILT_FROM`）を足す前の世代。線が無いだけでそのまま読めるので読み取りの入口だけが許す。作り直しの判定（`check_graph_counts`）には使わない
+_READABLE_PRIOR_ERA = _era_of(NODE_LABELS - {"Executable"}, EDGE_TYPES - {"BUILT_FROM"})
 
 # 検索スコープ（フォルダ prefix）述語。`$prefixes` が空なら全体。ノードは全て `path` を持つので `path` の prefix 一致だけで判定する
 def _scope_pred(var: str) -> str:
     return (f"(size($prefixes)=0 OR any(pref IN $prefixes WHERE "
             f"{var}.path IS NOT NULL AND ({var}.path=pref OR {var}.path STARTS WITH pref+'/')))")
+
+
+def exclude_expr(world: str, path_expr: str) -> tuple[str, dict]:
+    """管理者の除外（`path_rules`）に当たらない、の Cypher 式と、その `$x_exact`・`$x_pre`。`path_expr` は対象のパスを返す式。
+    除外の設定が無ければ `("true", {})`（問い合わせの結果は従来と同じ）。起点の選び・経路の全ノード・`LIMIT` の前に掛けるために使う。"""
+    from .. import path_rules  # 遅延 import（循環回避）
+    paths = path_rules.rules_for(world).exclude_paths
+    if not paths:
+        return "true", {}
+    return (f"NOT coalesce(({path_expr} IN $x_exact OR any(x_pre IN $x_pre WHERE {path_expr} STARTS WITH x_pre)), false)",
+            {"x_exact": list(paths), "x_pre": [p + "/" for p in paths]})
+
+
+def exclude_edge_expr(world: str, var: str = "e") -> tuple[str, dict]:
+    """辺 `var` の参照元 `doc` が管理者の除外のとき、除外でない根拠（`sources` の `doc_id`）が 1 件でもある辺だけ通す式と、そのパラメータ。
+    集約された辺（同じ辺の複数の資料を `sources` に持つ）を、代表の `doc` だけで落とさないために、行数の天井の前に掛ける。設定が無ければ `("true", {})`。"""
+    from .. import path_rules  # 遅延 import（循環回避）
+    paths = path_rules.rules_for(world).exclude_paths
+    if not paths:
+        return "true", {}
+    alt = "|".join("\\Q" + p + "\\E" for p in paths)
+    return (f"(NOT coalesce(({var}.doc IN $x_exact OR any(x_pre IN $x_pre WHERE {var}.doc STARTS WITH x_pre)), false) "
+            f"OR ({var}.sources IS NOT NULL AND {var}.sources =~ $x_src_re))",
+            {"x_src_re": '(?s).*"doc_id": "(?!(?:' + alt + ')(?:/|"))[^"]*".*'})
+
+
+def exclude_node_expr(world: str, var: str) -> tuple[str, dict]:
+    """ノード `var` が管理者の除外に当たらない、の Cypher 式と `$x_exact`・`$x_pre`。所属パス（`membership_paths`）を持つノード（Dataset）は、
+    所属ごとに判定し、除外でない所属が 1 件でもあれば見える（全部が除外のときだけ外す）。設定が無ければ `("true", {})`。"""
+    from .. import path_rules  # 遅延 import（循環回避）
+    paths = path_rules.rules_for(world).exclude_paths
+    if not paths:
+        return "true", {}
+
+    def hit(p: str) -> str:
+        return f"coalesce(({p} IN $x_exact OR any(x_pre IN $x_pre WHERE {p} STARTS WITH x_pre)), false)"
+    mp = f"{var}.membership_paths"
+    return (f"(CASE WHEN {mp} IS NOT NULL AND size({mp}) > 0 THEN any(x_mp IN {mp} WHERE NOT {hit('x_mp')}) "
+            f"ELSE NOT {hit(var + '.path')} END)", {"x_exact": list(paths), "x_pre": [p + "/" for p in paths]})
+
+
+def member_scope_visible(world: str, var: str) -> str:
+    """ノード `var` が範囲の中で、かつ管理者の除外でない、の Cypher 式（`_member_scope_pred` の除外つき）。複数の資料に属するノード（Dataset）は、
+    同じ所属（`mpath`）が「範囲の中」かつ「除外でない」ときだけ通す（別々の所属で満たした候補を上限の前に入れない）。除外の設定が無ければ `_member_scope_pred` のまま。
+    `$x_exact`・`$x_pre`（`exclude_node_expr` と同じ）を使う。"""
+    from .. import path_rules  # 遅延 import（循環回避）
+    if not path_rules.rules_for(world).exclude_paths:
+        return _member_scope_pred(var)
+
+    def hit(p: str) -> str:
+        return f"coalesce(({p} IN $x_exact OR any(x_pre IN $x_pre WHERE {p} STARTS WITH x_pre)), false)"
+    mp = f"{var}.membership_paths"
+    inscope = "(size($prefixes)=0 OR any(pref IN $prefixes WHERE x_mp=pref OR x_mp STARTS WITH pref+'/'))"
+    return (f"(CASE WHEN {mp} IS NOT NULL AND size({mp}) > 0 THEN any(x_mp IN {mp} WHERE {inscope} AND NOT {hit('x_mp')}) "
+            f"ELSE ({_scope_pred(var)} AND NOT {hit(var + '.path')}) END)")
+
+
+def node_path_expr(var: str) -> str:
+    """ノードの代表のパス（Dataset は所属パスの先頭）。"""
+    return f"coalesce({var}.path, head(coalesce({var}.membership_paths, [])))"
+
+
+def _member_scope_pred(var: str) -> str:
+    """範囲の述語。`membership_paths`（Dataset の所属パス全部）を持つノードは、そのどれかが範囲内なら範囲内。持たないノードは `_scope_pred`。"""
+    mp = f"{var}.membership_paths"
+    return (f"(CASE WHEN {mp} IS NOT NULL THEN size($prefixes)=0 OR any(mpath IN {mp} WHERE "
+            "any(pref IN $prefixes WHERE mpath=pref OR mpath STARTS WITH pref+'/')) "
+            f"ELSE {_scope_pred(var)} END)")
+
+
+def _member_visible_path(var: str, excl: str = "") -> str:
+    """`_member_scope_pred` で範囲内と判定したノードの代表の所属パス。`membership_paths` があるときは、範囲内かつ秘匿名でない所属パスの先頭
+    （無ければ範囲内の先頭＝呼び出し側の秘匿名の除外に掛かる）。`membership_paths` が無いときは `path`。`$s_exact`・`$s_pre`・`$s_ext` を使う。"""
+    mp = f"{var}.membership_paths"
+    inscope = "(size($prefixes)=0 OR any(pref IN $prefixes WHERE mpath=pref OR mpath STARTS WITH pref+'/'))"
+    members = f"[mpath IN {mp} WHERE {inscope}" + (f" AND {excl}" if excl and excl != "true" else "")
+    return (f"(CASE WHEN {mp} IS NOT NULL THEN coalesce(head({members} AND {_not_sensitive_path('', path='mpath')}] + {members}]), {var}.path) "
+            f"ELSE {var}.path END)")
 
 
 # 影響分析の Neo4j 安全弁: per-query timeout・ストリーム反復・緊急天井（Cypher に LIMIT は入れない）。
@@ -120,7 +206,7 @@ class GraphSchemaEraError(RuntimeError):
             f"graph schema era mismatch: world={world} stored={stored_era!r} current={GRAPH_SCHEMA_ERA!r}")
 
 
-# 利用者向けの平文メッセージ（`routers/impact.py`・`routers/graph.py` の 503 と `chat_service` が共有する）
+# 利用者向けの平文メッセージ（`routers/impact.py` の 503 と `chat_service` が共有する）
 GRAPH_SCHEMA_ERA_USER_MESSAGE = (
     "この資料フォルダの検索用データが古い内部形式のままです（内部形式が更新されました）。"
     "管理者に『今すぐ更新』を依頼してください。"
@@ -131,8 +217,8 @@ def check_schema_era(session, world: str, *, lens: str | None = None) -> None:
     """資料フォルダの保存済みスキーマ世代を確認する（不一致なら `GraphSchemaEraError`）。
 
     実データ（`world_id` を持つ `:Entity`）のない資料フォルダは対象外。実データがあり、保存世代
-    （`:SherpaMeta{world_id}.schema_era`・未保存を含む）が現行 `GRAPH_SCHEMA_ERA` と違うときだけ raise する。
-    グラフ読み取りの入口（`world_impact`/`resolve_world_entity`/`lens_service.neo4j_related`/`graph_admin.graph_search`）が
+    （`:SherpaMeta{world_id}.schema_era`・未保存を含む）が現行 `GRAPH_SCHEMA_ERA` と違うときだけ raise する（語彙を足す前の世代 `_READABLE_PRIOR_ERA` は読める）。
+    グラフ読み取りの入口（`world_impact`/`resolve_world_entity`/`lens_service.neo4j_related`）が
     主クエリの後に1回ずつ呼ぶ。存在確認は `LIMIT 1` で打ち切る。
     世代プローブが `Neo4jError` で失敗したときは警告ログを残して re-raise する（黙って戻ると旧世代の検知が無効になる）。
     """
@@ -152,7 +238,7 @@ def check_schema_era(session, world: str, *, lens: str | None = None) -> None:
     if not row or not row.get("c"):
         return
     era = row.get("era")
-    if era != GRAPH_SCHEMA_ERA:
+    if era != GRAPH_SCHEMA_ERA and era != _READABLE_PRIOR_ERA:
         raise GraphSchemaEraError(world, era, lens=lens)
 
 
@@ -313,7 +399,38 @@ def limit_edge_sources(edges: list, limit: int) -> list:
     return out
 
 
-def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None, unparsed_sources=None):
+# グラフの書き込みのメモリ不足（Neo4j の 1 回の書き込みの上限）を失敗の理由に添える文言。変数名は .env の設定名（scripts/lib/mem_budget.sh）
+MEMORY_POOL_ERROR = "MemoryPoolOutOfMemoryError"
+MEMORY_POOL_HINT = ("グラフの書き込みのメモリが足りません（Neo4j の 1 回の書き込みの上限）。"
+                    ".env の SHERPA_NEO4J_HEAP_FIXED（Neo4j のヒープ）か SHERPA_NEO4J_TX_MEMORY_MAX（1 回の書き込みの上限）を上げて make restart してください")
+
+
+def is_memory_pool_error(exc: BaseException) -> bool:
+    """Neo4j の 1 回の書き込みがメモリの上限に当たった失敗か（`Neo.TransientError.General.MemoryPoolOutOfMemoryError`）。"""
+    return MEMORY_POOL_ERROR in str(getattr(exc, "code", "") or "") or MEMORY_POOL_ERROR in str(exc)
+
+
+_WRITE_ATTEMPTS = 2
+
+
+def _write_world(session, apply):
+    """`apply(tx)` を明示のトランザクションで書いて確定する。一時的な失敗は 1 回だけやり直す。
+
+    守ること: 1 回の書き込みのメモリの上限（MemoryPoolOutOfMemoryError）に当たったら、やり直さずにそのまま失敗にする。
+    """
+    for attempt in range(1, _WRITE_ATTEMPTS + 1):
+        try:
+            with session.begin_transaction() as tx:
+                result = apply(tx)
+                tx.commit()
+                return result
+        except Exception as exc:
+            retryable = callable(getattr(exc, "is_retryable", None)) and exc.is_retryable()
+            if is_memory_pool_error(exc) or not retryable or attempt == _WRITE_ATTEMPTS:
+                raise
+
+
+def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None, unparsed_sources=None, build_report=None):
     """資料フォルダのグラフ（dict）を Neo4j へクリーン rebuild する（削除→全ロードを1つの write tx で行う）。
 
     ① schema コマンドはデータ tx と混ぜられないので先に流す。
@@ -326,6 +443,7 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
     メタの `unresolved_stored` を立てる（`read_unresolved` が「申告の保存が無い」と「0 件」を区別する）。
     FW プラグインの失敗（`world_graph.plugin_failures_from_flags`）はメタの `plugin_failures`（JSON 文字列・失敗なしは `[]`）に同じ tx で保存する（`read_plugin_failures`）。
     グラフに入れなかったソースのファイル数（`world_graph.unparsed_sources_from_flags`）はメタの `unparsed_sources`（JSON 文字列）に同じ tx で保存する（`read_unparsed_sources`）。
+    ビルドの定義の読み取りの報告（`world_graph.pop_build_report`）はメタの `build_report`（JSON 文字列）に、当てはめた印の値は `build_marks_sig` に同じ tx で保存する。
     """
     from neo4j import GraphDatabase  # 遅延 import（解析だけなら不要）
 
@@ -351,7 +469,7 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
             for c in WORLD_CONSTRAINTS:
                 s.run(c)
             def _apply(tx):
-                loaded = 0                                   # 失敗時の再試行で最初からやり直すので、数え直す
+                loaded = 0                                   # やり直しのときは最初から数え直す
                 tx.run("MATCH (n:Entity {world_id:$w}) DETACH DELETE n", w=world_id)
                 for label, items in nodes_by_label.items():
                     node_cypher = (
@@ -398,12 +516,15 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
                 tx.run(
                     "MERGE (m:SherpaMeta {world_id:$w}) "
                     "SET m.schema_era=$era, m.node_count=$nc, m.edge_count=$ec, m.unresolved_stored=true, "
-                    "m.plugin_failures=$pf, m.unparsed_sources=$us, m.generation=$gen",
+                    "m.plugin_failures=$pf, m.unparsed_sources=$us, m.generation=$gen, "
+                    "m.build_report=$br, m.build_marks_sig=$bms",
+                    br=json.dumps(dict(build_report or {}), ensure_ascii=False),
+                    bms=(build_report or {}).get("marks_sig") or "",
                     w=world_id, era=GRAPH_SCHEMA_ERA, nc=node_count, ec=edge_count, gen=uuid.uuid4().hex[:16],
                     pf=json.dumps(list(plugin_failures or []), ensure_ascii=False),
                     us=json.dumps(dict(unparsed_sources or {}), ensure_ascii=False))
                 return len(nodes), len(edges)
-            result = s.execute_write(_apply)
+            result = _write_world(s, _apply)
             loaded_ok = True
             return result
     finally:
@@ -411,13 +532,14 @@ def load_world(nodes, edges, world_id, uri, user, password, plugin_failures=None
         step.end(failed=not loaded_ok)
 
 
-def check_graph_counts(world_id, uri, user, password) -> str | None:
+def check_graph_counts(world_id, uri, user, password, build_marks_sig: str = "") -> str | None:
     """保存済み `:SherpaMeta` の世代・件数スタンプを実際のグラフ内容と照合する（`load_world` が刻む値と対）。
 
     作り直しが要る理由コードを返す。整合していれば `None`。
     - `"no_stamp"`: `node_count`/`edge_count` が無い（`:SherpaMeta` 自体が無い場合を含む）
     - `"era_mismatch"`: 保存済み `schema_era` が現行 `GRAPH_SCHEMA_ERA` と不一致
     - `"count_mismatch"`: スタンプ済み件数と実物（`:Entity{world_id}` の数・その資料フォルダのノードから出る `r.world_id` 一致リレーションの数）が違う
+    - `"build_marks_changed"`: ビルドの定義を読む場所の印が、グラフを作ったときの印と違う（`build_marks_sig`）
     ドライバは自前で開閉し、接続/クエリ例外はそのまま呼び出し元へ伝播する。
     """
     from neo4j import GraphDatabase
@@ -426,7 +548,7 @@ def check_graph_counts(world_id, uri, user, password) -> str | None:
         with driver.session() as s:
             rows = s.run(
                 "MATCH (m:SherpaMeta {world_id:$w}) "
-                "RETURN m.schema_era AS era, m.node_count AS nc, m.edge_count AS ec",
+                "RETURN m.schema_era AS era, m.node_count AS nc, m.edge_count AS ec, m.build_marks_sig AS bms",
                 w=world_id,
             ).data()
             meta = rows[0] if rows else None
@@ -443,6 +565,8 @@ def check_graph_counts(world_id, uri, user, password) -> str | None:
             ).single()["c"]
             if actual_nc != meta["nc"] or actual_ec != meta["ec"]:
                 return "count_mismatch"
+            if (meta.get("bms") or "") != (build_marks_sig or ""):
+                return "build_marks_changed"
             return None
     finally:
         driver.close()
@@ -507,14 +631,22 @@ def resolve_world_entity(session, term, world_id, scope_prefixes=None,
     `check_schema_era` は呼ばない（唯一の呼び出し元 `run_world_impact` の `world_impact` が1回だけ確認する。単独で呼ぶ場合は呼び出し側でゲートを足す）。
     """
     prefixes = list(scope_prefixes or [])
+    x_n, x_params = exclude_node_expr(world_id, "n")  # 管理者の除外の資料のノードは起点にしない（同名の曖昧さにも数えない）
+    if x_params:
+        # 除外の設定があるときは、複数の資料に属するノード（Dataset）を所属ごとに見る（`get_world_entities` と同じ範囲・代表パス）
+        x_mem, _ = exclude_expr(world_id, "mpath")
+        scope_sql, path_sql = member_scope_visible(world_id, "n"), _member_visible_path("n", excl=x_mem)
+        extra = _sensitive_name_params()
+    else:
+        scope_sql, path_sql, extra = _scope_pred("n"), "n.path", {}
     rows = _run_read_capped(
         session,
         "MATCH (n:Entity {world_id:$w}) WHERE n.name=$name "
         "  AND ($incl OR coalesce(n.status,'active')='active') "
-        f"  AND {_scope_pred('n')} "
+        f"  AND {scope_sql} AND {x_n} "
         "RETURN n.canonical_id AS cid, [l IN labels(n) WHERE l<>'Entity'][0] AS label, "
-        "  n.name AS name, n.path AS path",
-        world=world_id, w=world_id, name=term, incl=include_deprecated, prefixes=prefixes,
+        f"  n.name AS name, {path_sql} AS path",
+        world=world_id, w=world_id, name=term, incl=include_deprecated, prefixes=prefixes, **x_params, **extra,
     )
     # `path`: 同名の起点候補を呼び出し側が区別できるようにする
     return [{"canonical_id": r["cid"], "label": r["label"], "name": r["name"], "path": r["path"]}
@@ -526,31 +658,55 @@ def resolve_world_entity(session, term, world_id, scope_prefixes=None,
 _IMPACT_FRONTIER_CHUNK = 300
 
 
-def _impact_edge_where(mv: str) -> str:
-    """影響たどりの 1 段で、広げた先のノード `mv` と辺 `e` に効かせる条件（資料フォルダ・範囲・status）。"""
+def _impact_edge_where(mv: str, x_expr: str = "true") -> str:
+    """影響たどりの 1 段で、広げた先のノード `mv` と辺 `e` に効かせる条件（資料フォルダ・範囲・status・管理者の除外）。除外は行数の天井の前に掛ける。"""
     return (
-        f"{mv}.world_id=$world AND {_scope_pred(mv)} "
+        f"{mv}.world_id=$world AND {_scope_pred(mv)} AND {x_expr} "
         f"  AND ($incl OR coalesce({mv}.status,'active')='active') "
         "  AND ($incl OR coalesce(e.status,'active')='active') "
     )
 
 
+def _sensitive_name_params() -> dict:
+    """`_not_sensitive_path` が使う秘匿名の規則（`text_kind`）のパラメータ。"""
+    from . import text_kind
+    return dict(s_exact=sorted(text_kind._SENSITIVE_NAME_EXACT), s_pre=list(text_kind._SENSITIVE_NAME_PREFIXES),
+                s_ext=sorted(text_kind.SENSITIVE_EXT))
+
+
 def _impact_start_nodes(session, start_cids, world_id, params) -> dict[str, dict]:
-    """起点のうち、資料フォルダ・範囲・status を満たすものの `cid → {name, path}`（満たさない起点からは何も届かない）。"""
+    """起点のうち、資料フォルダ・範囲・status・管理者の除外を満たすものの `cid → {name, path}`（満たさない起点からは何も届かない）。"""
+    x_s, _ = exclude_node_expr(world_id, "s")
     rows = _run_read_capped(
         session,
         "MATCH (s:Entity) WHERE s.canonical_id IN $starts AND s.world_id=$world "
-        f"  AND {_scope_pred('s')} AND ($incl OR coalesce(s.status,'active')='active') "
-        "RETURN s.canonical_id AS cid, s.name AS name, s.path AS path",
-        world=world_id, starts=list(start_cids), **params)
+        f"  AND {x_s} AND {member_scope_visible(world_id, 's')} AND ($incl OR coalesce(s.status,'active')='active') "
+        f"RETURN s.canonical_id AS cid, s.name AS name, {_member_visible_path('s', excl=exclude_expr(world_id, 'mpath')[0])} AS path",
+        world=world_id, starts=list(start_cids), **params, **_sensitive_name_params())
     return {r["cid"]: {"name": r["name"], "path": r["path"]} for r in rows}
 
 
+_X_PATHS: contextvars.ContextVar = contextvars.ContextVar("world_neo4j_exclude_paths", default=())
+
+
+@contextlib.contextmanager
+def exclude_scope(world: str):
+    """この間に組み立てる流れの述語（`_flow_path_pred`）へ、管理者の除外を入れる（呼び出し側が `$x_exact`・`$x_pre` を渡す）。"""
+    from .. import path_rules  # 遅延 import（循環回避）
+    token = _X_PATHS.set(tuple(path_rules.rules_for(world).exclude_paths))
+    try:
+        yield
+    finally:
+        _X_PATHS.reset(token)
+
+
 def _flow_path_pred(path: str) -> str:
-    """流れの所属・DD 結合元のパスを範囲と秘匿条件で絞る。"""
+    """流れの所属・DD 結合元のパスを範囲・秘匿条件・管理者の除外で絞る。"""
     scope = (f"(size($prefixes)=0 OR any(pref IN $prefixes WHERE "
              f"{path}=pref OR {path} STARTS WITH pref+'/'))")
-    return f"({path} IS NOT NULL AND {scope} AND {_not_sensitive_path('', path=path)})"
+    x = (f" AND NOT coalesce(({path} IN $x_exact OR any(x_pre IN $x_pre WHERE {path} STARTS WITH x_pre)), false)"
+         if _X_PATHS.get() else "")
+    return f"({path} IS NOT NULL AND {scope} AND {_not_sensitive_path('', path=path)}{x})"
 
 
 def _flow_node_path(var: str) -> str:
@@ -604,10 +760,12 @@ def _impact_expand_rows(session, frontier, world_id, params, sink: list, *, seen
             f"  n.canonical_id AS to_cid, {{type:type(e), doc:e.doc, line:e.line, {EDGE_SOURCE_FIELDS}}} AS edge")
         guard = ""
     pattern = f"(m:Entity)-[e:{rel}]->(n:Entity)" if direction == "in" else f"(n:Entity)-[e:{rel}]->(m:Entity)"
-    where = _impact_edge_where('m')
+    x_m, _ = exclude_node_expr(world_id, "m")
+    x_e, _ = exclude_edge_expr(world_id, "e")  # 根拠が除外の資料だけの辺は辿らない（行数の天井の前）
+    where = _impact_edge_where('m', f"{x_m} AND {x_e}")
     if flow:
         where = (
-            f"m.world_id=$world AND {path} IS NOT NULL AND {_flow_node_path('n')} IS NOT NULL "
+            f"m.world_id=$world AND {path} IS NOT NULL AND {_flow_node_path('n')} IS NOT NULL AND {x_m} AND {x_e} "
             "AND ($incl OR coalesce(m.status,'active')='active') "
             "AND ($incl OR coalesce(e.status,'active')='active') "
             f"AND {_flow_edge_pred()} ")
@@ -678,9 +836,17 @@ def _flow_stage(session, seeds, visited: set, world_id, params, flow_depth: int,
 
 def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPACT_MAX_DEPTH,
                  include_deprecated=False, info: dict | None = None, detail: bool = False, flow_depth: int = 0):
+    """管理者の除外を流れの述語にも入れて `_world_impact` を実行する（仕様は `_world_impact`）。"""
+    with exclude_scope(world_id):
+        return _world_impact(session, start_cids, world_id, scope_prefixes, depth, include_deprecated, info, detail,
+                             flow_depth)
+
+
+def _world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPACT_MAX_DEPTH,
+                  include_deprecated=False, info: dict | None = None, detail: bool = False, flow_depth: int = 0):
     """範囲フィルタ付きで影響ノードを 1 段ずつ広げて引き、構造化 item を返す（`impact_service.neo4j_impact` の資料フォルダ版）。
 
-    start・affected・経路の全ノードが `world_id` と `scope_prefixes` 内。骨格エッジ（`_IMPACT_REL`＝COPIES/CONTAINS/INVOKES/ACCESSES）
+    start・affected・経路の全ノードが `world_id` と `scope_prefixes` 内。骨格エッジ（`_IMPACT_REL`＝COPIES/CONTAINS/INVOKES/ACCESSES/BUILT_FROM）
     だけを辿る決定的な構造たどりで、全件を同格に扱う。
     ① 起点を確かめる ② 段 k ごとに frontier から逆向きに 1 段だけ問い、初めて届いたノードに最初の辺（親）を記録する
     ③ `check_schema_era`（旧世代の実データがあれば `GraphSchemaEraError`） ④ 深さの先に未到達のノードが残るかを 1 回だけ問う。
@@ -694,7 +860,8 @@ def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPAC
     `origin`（`structure`／`flow`）を足し、`info["flow_depth_truncated"]`（真偽・判定できなければ None と `flow_depth_check_limit`）と
     第 2 段の過負荷 `info["flow_overload"]` を立てる。構造の段が過負荷なら第 2 段は走らせない。0 のときは戻りも `info` も変わらない。
     """
-    params = {"incl": include_deprecated, "prefixes": list(scope_prefixes or [])}
+    params = {"incl": include_deprecated, "prefixes": list(scope_prefixes or []),
+              **exclude_node_expr(world_id, "n")[1], **exclude_edge_expr(world_id, "e")[1]}  # 管理者の除外のパラメータ（設定が無ければ空）
     d = int(depth)
     starts = _impact_start_nodes(session, start_cids, world_id, params)
     visited = set(starts)                       # 展開済み（起点を含む）
@@ -800,7 +967,6 @@ def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPAC
                 info["depth_check_limit"] = graph_coverage.kind_of_overload(e.reason)
         if flow_depth > 0:
             _flow_truncation(session, info, world_id, params, visited, flow_frontier, overload, flow_overload)
-    _attach_importance(items, world_id)
     return items
 
 
@@ -838,6 +1004,22 @@ def read_plugin_failures(session, world_id) -> list:
     if not rows or not rows[0].get("pf"):
         return []
     return json.loads(rows[0]["pf"])
+
+
+def read_build_report(world_id) -> dict | None:
+    """グラフを作ったときのビルドの定義の読み取りの報告。何も読まなかったグラフは空、グラフが無い・保存が無いときは None。接続の失敗は例外のまま伝える。"""
+    from neo4j import GraphDatabase
+    env = _env()
+    driver = GraphDatabase.driver(env["uri"], auth=(env["user"], env["pw"]), connection_timeout=5)
+    try:
+        with driver.session() as s:
+            rows = s.run("MATCH (m:SherpaMeta {world_id:$w}) RETURN m.build_report AS br", w=world_id).data()
+    finally:
+        driver.close()
+    if not rows or rows[0].get("br") is None:
+        return None
+    info = json.loads(rows[0]["br"])
+    return info if isinstance(info, dict) else None
 
 
 def read_generation(session, world_id) -> str | None:
@@ -878,18 +1060,20 @@ def read_unresolved(session, world_id, names, scope_prefixes=None, *, fold_case=
     if fold_case:
         names = list(dict.fromkeys(n.lower() for n in names))
     key = "toLower(x)" if fold_case else "x"
+    x_expr, x_params = exclude_node_expr(world_id, "n")  # 管理者の除外は collect と上限で切る前に掛ける
     rows = _run_read_capped(
         session,
         "MATCH (m:SherpaMeta {world_id:$w}) "
         "OPTIONAL MATCH (n:Entity {world_id:$w}) WHERE n.unresolved_names IS NOT NULL "
         f"  AND any(x IN n.unresolved_names WHERE {key} IN $names) "
-        f"  AND {_scope_pred('n')} "
+        f"  AND {_scope_pred('n')} AND {x_expr} "
         "WITH m, n ORDER BY n.path "
         "WITH m, collect(n) AS ns "
         "RETURN m.unresolved_stored AS stored, size(ns) AS node_total, "
         "  reduce(o=0, x IN ns | o + coalesce(x.unresolved_overflow_count,0)) AS ov_total, "
         "  [x IN ns[0..$cap] | {path:x.path, u:x.unresolved}] AS head",
-        world=world_id, w=world_id, names=names, prefixes=list(scope_prefixes or []), cap=UNRESOLVED_RETURN_MAX)
+        world=world_id, w=world_id, names=names, prefixes=list(scope_prefixes or []), cap=UNRESOLVED_RETURN_MAX,
+        **x_params)
     if not (rows and rows[0].get("stored")):
         return {"available": False, "items": [], "omitted": 0}
     row = rows[0]
@@ -921,35 +1105,39 @@ def list_world_candidates(session, name, world_id, scope_prefixes=None, *, kind=
                           exclude_documents: bool = False) -> list[dict]:
     """起点の候補（`graph_resolve` 用）。名前（表示名・修飾名の部分一致・大文字小文字無視）・種別（ラベル）・所属パスの一部で絞る。
     同名の複数候補はまとめず全て返す（並びは名前の完全一致 → 名前 → パス）。`match` は `exact`（名前または修飾名が一致）／`partial`。
-    範囲（`scope_prefixes`）・status は影響たどり（`world_impact`）と同じ述語。主クエリの後に `check_schema_era` を呼ぶ。
+    範囲（`scope_prefixes`）・status は影響たどり（`world_impact`）と同じ述語。`membership_paths` を持つノード（Dataset）は所属パスのどれかが範囲内なら範囲内で、返す `path` も範囲内の所属パス。主クエリの後に `check_schema_era` を呼ぶ。
     秘匿名のファイルに属するノードは返さない。`limit` を渡すと Cypher 側で上位 `limit` 件だけ取る（並びも Cypher で決める＝呼び出し側は
     `limit+1` を渡して超過の有無を見る）。`exclude_documents` が真なら資料（`Document`）を除く。
     過負荷は `GraphQueryOverloadError`（空・部分結果にしない）。
     """
     from . import text_kind
     term = (name or "").strip()
+    _x_expr, _x_params = exclude_node_expr(world_id, "n")  # 所属ごとに判定（見える所属が 1 件でもあれば候補に残す）
+    _x_mem, _ = exclude_expr(world_id, "mpath")  # 代表のパスは、除外でない所属から選ぶ
     rows = _run_read_capped(
         session,
         "MATCH (n:Entity {world_id:$w}) "
         "WHERE ($incl OR coalesce(n.status,'active')='active') "
-        f"  AND {_scope_pred('n')} "
+        f"  AND {member_scope_visible(world_id, 'n')} "
         "  AND ($name = '' OR toLower(n.name) CONTAINS toLower($name) "
         "       OR toLower(coalesce(n.qualified_name,'')) CONTAINS toLower($name)) "
         "  AND ($kind = '' OR $kind IN labels(n)) "
-        "  AND ($pp = '' OR toLower(coalesce(n.path,'')) CONTAINS toLower($pp)) "
         "  AND ($docs_ok OR NOT 'Document' IN labels(n)) "
-        f"  AND {_not_sensitive_path('n')} "
+        f"  AND {_x_expr} "
+        f"WITH n, {_member_visible_path('n', excl=_x_mem)} AS vpath "
+        "WHERE ($pp = '' OR toLower(coalesce(vpath,'')) CONTAINS toLower($pp)) "
+        f"  AND {_not_sensitive_path('n', path='vpath')} "
         "RETURN n.canonical_id AS cid, [l IN labels(n) WHERE l<>'Entity'][0] AS label, "
-        "  n.name AS name, n.path AS path, n.qualified_name AS qname, "
+        "  n.name AS name, vpath AS path, n.qualified_name AS qname, "
         "  coalesce(n.status,'active') AS status "
         "ORDER BY CASE WHEN toLower(n.name)=toLower($name) "
         "  OR toLower(coalesce(n.qualified_name,''))=toLower($name) THEN 0 ELSE 1 END, "
-        "  toLower(n.name), coalesce(n.path,''), n.canonical_id"
+        "  toLower(n.name), coalesce(vpath,''), n.canonical_id"
         + (" LIMIT $lim" if limit is not None else ""),
         world=world_id, w=world_id, name=term, kind=kind or "", pp=(path_part or "").strip(),
         incl=include_deprecated, prefixes=list(scope_prefixes or []), docs_ok=not exclude_documents,
         s_exact=sorted(text_kind._SENSITIVE_NAME_EXACT), s_pre=list(text_kind._SENSITIVE_NAME_PREFIXES),
-        s_ext=sorted(text_kind.SENSITIVE_EXT), lim=limit,
+        s_ext=sorted(text_kind.SENSITIVE_EXT), lim=limit, **_x_params,
     )
     check_schema_era(session, world_id)
     low = term.lower()
@@ -966,15 +1154,17 @@ def get_world_entities(session, cids, world_id, scope_prefixes=None, include_dep
     """識別子（canonical_id）でノードを引く（資料フォルダ・範囲・status の述語は影響たどりと同じ）。無いものは返らない。
     主クエリの後に `check_schema_era` を呼ぶ。
     """
+    x_n, x_params = exclude_node_expr(world_id, "n")  # 管理者の除外（所属ごと）。代表のパスは除外でない所属から選ぶ
+    x_mem, _ = exclude_expr(world_id, "mpath")
     rows = _run_read_capped(
         session,
         "MATCH (n:Entity {world_id:$w}) WHERE n.canonical_id IN $cids "
         "  AND ($incl OR coalesce(n.status,'active')='active') "
-        f"  AND {_scope_pred('n')} "
+        f"  AND {member_scope_visible(world_id, 'n')} AND {x_n} "
         "RETURN n.canonical_id AS cid, [l IN labels(n) WHERE l<>'Entity'][0] AS label, "
-        "  n.name AS name, n.path AS path, n.qualified_name AS qname",
+        f"  n.name AS name, {_member_visible_path('n', excl=x_mem)} AS path, n.qualified_name AS qname",
         world=world_id, w=world_id, cids=list(cids), incl=include_deprecated,
-        prefixes=list(scope_prefixes or []),
+        prefixes=list(scope_prefixes or []), **_sensitive_name_params(), **x_params,
     )
     check_schema_era(session, world_id)
     return [{"canonical_id": r["cid"], "label": r["label"], "name": r["name"], "path": r["path"],
@@ -988,11 +1178,13 @@ def world_related_documents(session, cids, world_id, scope_prefixes=None, includ
     `limit` を渡すと Cypher 側で上位 `limit` 件だけ取る（呼び出し側は上限＋1 を渡して超過の有無を見る）。
     """
     from . import text_kind
+    x_d, x_params = exclude_node_expr(world_id, "d")  # 管理者の除外の資料・対象は、LIMIT の前に外す
+    x_t, _ = exclude_node_expr(world_id, "t")
     rows = _run_read_capped(
         session,
         "MATCH (d:Entity {world_id:$w})-[r:DOCUMENTS]->(t:Entity {world_id:$w}) WHERE t.canonical_id IN $cids "
         "  AND ($incl OR (coalesce(d.status,'active')='active' AND coalesce(t.status,'active')='active')) "
-        f"  AND {_scope_pred('d')} "
+        f"  AND {_scope_pred('d')} AND {x_d} AND {x_t} "
         f"  AND {_not_sensitive_path('d')} AND {_not_sensitive_path('t')} "
         "RETURN d.canonical_id AS cid, d.name AS name, d.path AS path, "
         "  t.canonical_id AS tcid, t.name AS tname, t.path AS tpath, r.via AS via, r.line AS line "
@@ -1001,43 +1193,12 @@ def world_related_documents(session, cids, world_id, scope_prefixes=None, includ
         world=world_id, w=world_id, cids=list(cids), incl=include_deprecated,
         prefixes=list(scope_prefixes or []), lim=limit,
         s_exact=sorted(text_kind._SENSITIVE_NAME_EXACT), s_pre=list(text_kind._SENSITIVE_NAME_PREFIXES),
-        s_ext=sorted(text_kind.SENSITIVE_EXT),
+        s_ext=sorted(text_kind.SENSITIVE_EXT), **x_params,
     )
     rows.sort(key=lambda r: (r["path"] or "", r["tcid"]))
     return [{"canonical_id": r["cid"], "name": r["name"], "path": r["path"], "via": r["via"], "line": r["line"],
              "target": {"canonical_id": r["tcid"], "name": r["tname"]}, "_target_path": r["tpath"]}
             for r in rows]
-
-
-def _attach_importance(items: list, world_id: str) -> None:
-    """items へ `importance`/`importance_reason`/`importance_mixed` を条件付きで付与する。
-
-    候補は各 item の `path`（自身の所属文書）と `evidence[].doc`（根拠の来歴文書）。
-    未設定の候補は「中」と同格の順位（`importance.RANK_UNSET`・`importance.rank_of`）として最高位の計算と `importance_mixed` の判定に含める。
-    最高位の候補に実際の `Resolution`（`_重要度.txt` で明示解決されたもの）が1つも無ければ、3つとも付けない。
-    最高位に複数の実 Resolution が同着するときは `path` 優先→`evidence` の出現順で先頭を採る。
-    `_重要度.txt` の無い資料フォルダ（`resolve_for_world` が空 dict）は items を変更しない。
-    """
-    wd = worlds.world_dir(world_id)
-    res_map = importance.resolve_for_world(world_id, root=wd) if wd else {}
-    if not res_map:
-        return
-    for it in items:
-        candidates = [c for c in ([it.get("path")] + [e.get("doc") for e in (it.get("evidence") or [])]) if c]
-        if not candidates:
-            continue
-        pairs = [res_map.get(c) for c in candidates]              # None＝未解決（中相当）
-        best_rank = max(importance.rank_of(res) for res in pairs)
-        winners = [res for res in pairs if res is not None and importance.rank_of(res) == best_rank]
-        if not winners:
-            continue                                              # 最高位が全て未設定＝表示しない
-        best = winners[0]
-        it["importance"] = best.value
-        if best.reason:
-            it["importance_reason"] = best.reason
-        effective_values = {(res.value if res is not None else "中") for res in pairs}
-        if len(effective_values) > 1:
-            it["importance_mixed"] = True
 
 
 def run_world_impact(session, term, world_id, scope_prefixes=None,
@@ -1076,9 +1237,8 @@ def run_world_impact(session, term, world_id, scope_prefixes=None,
     graph_coverage.attach_plugin_failures(
         coverage, lambda: read_plugin_failures(session, world_id), graph_coverage.STAGE_IMPACT,
         read_unparsed=lambda: read_unparsed_sources(session, world_id))
-    # 第1ソートキーは重要度（`高`>`中`/未設定>`低`）。`_重要度.txt` の無い資料フォルダは全 item の rank が揃い、category・name だけの順になる
     def _order(x):
-        return (-importance.RANK.get(x.get("importance"), importance.RANK_UNSET), x["category"], x["name"])
+        return (x["category"], x["name"])
     items.sort(key=_order)
     out = {"type": "impact", "world_id": world_id, "scope_prefixes": list(scope_prefixes or []),
            "start": term, "include_deprecated": include_deprecated, "starts": starts, "items": items,

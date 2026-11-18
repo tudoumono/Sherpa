@@ -24,7 +24,7 @@ export function welcome() {
   $('messages').innerHTML = '';
   // 固定文言のみ（利用者入力を含まない）
   const steps =
-    '<div class="headline">ようこそ Sherpa へ</div>'
+    '<div class="headline">ようこそ Slouch へ</div>'
     + '<ol class="welcome-steps">'
     + '<li><b>資料フォルダを登録</b><br><span class="muted">管理画面で、調べたい社内資料フォルダを登録します。</span></li>'
     + '<li><b>チャットで質問</b><br><span class="muted">例:「消費税率を変えると何に影響する？」／「夜間バッチの異常終了の原因候補は？」</span></li>'
@@ -131,15 +131,6 @@ function verificationBadgeHTML(method) {
   if (!label) return ` <span class="verif-badge unknown">${esc('検証方法不明')}</span>`;
   const cls = method === 'span_unmatched' ? 'warn' : 'ok';
   return ` <span class="verif-badge ${cls}">${esc(label)}</span>`;
-}
-// 登録者重要度バッジ。出典の importance が「高」「低」のときだけ表示する（「中」・未設定は出さない）。importance_reason があれば title に添える。
-const IMPORTANCE_BADGE_LABEL = { '高': '登録者重要度：高', '低': '登録者重要度：低' };
-function importanceBadgeHTML(source) {
-  const v = source && source.importance;
-  if (v !== '高' && v !== '低') return '';
-  const cls = v === '高' ? 'high' : 'low';
-  const title = source.importance_reason ? ` title="${esc(source.importance_reason)}"` : '';
-  return ` <span class="importance-badge ${cls}"${title}>${esc(IMPORTANCE_BADGE_LABEL[v])}</span>`;
 }
 // doc ごとの verification_method を集める。source_path に加え、集計 Evidence の matched_doc_ids も見る。
 function _verificationMethodByDoc(evidencePacket) {
@@ -832,7 +823,7 @@ function answerHTML(answer, trace, feedback) {
     + budgetNoteHTML(answer.data && answer.data.evidence_packet)
     + investigationSummaryHTML(answer)
     + retryHintsHTML(answer.retry_hints) + body
-    + refGraphHTML(answer) + renderCreatedFiles(answer.created_files)
+    + renderCreatedFiles(answer.created_files)
     + renderReconciliation(answer)
     + renderImpactList(answer)
     + (hasReferencedDocs(answer) ? renderReferencedDocs(answer, evidencePacketForBadges)
@@ -919,52 +910,6 @@ function investigationSummaryHTML(answer) {
     `<div class="investigation-summary-item"><span class="investigation-summary-label">${esc(String(i.label || ''))}</span> ${esc(i.text)}</div>`).join('') + '</div>';
 }
 
-// 回答が参照したノード/関係から小さな部分グラフを組む（impact=経路、troubleshoot=近傍チェーン）
-function subgraphFromAnswer(a) {
-  const items = a.lens === 'impact' ? ((a.data && a.data.items) || [])
-    : a.lens === 'troubleshoot' ? ((a.data && a.data.candidates) || []) : [];
-  const nodes = new Map(), edges = new Set(), SEP = '';
-  const add = (name) => { if (name && !nodes.has(name)) nodes.set(name, { name }); return nodes.get(name); };
-  const ts = a.lens === 'troubleshoot';   // 経路の向きが逆（impact=影響→…→起点・troubleshoot=起点→…→候補）
-  for (const it of items) {
-    if (it.name) add(it.name).affected = true;
-    const path = (ts ? it.path : it.trace) || [];
-    path.forEach((nm, k) => { add(nm); if (k > 0 && path[k - 1] && nm) edges.add(path[k - 1] + SEP + nm); });
-    if (path.length) add(path[ts ? 0 : path.length - 1]).start = true;   // ts は先頭=起点／impact は末端=起点
-  }
-  return { nodes: [...nodes.values()], edges: [...edges].map((e) => e.split(SEP)) };
-}
-function refGraphHTML(answer) {   // 「参照したナレッジグラフ」の折りたたみ（impact/troubleshoot）
-  if (answer.lens !== 'impact' && answer.lens !== 'troubleshoot') return '';
-  const sub = subgraphFromAnswer(answer);
-  if (sub.nodes.length < 2) return '';
-  return `<div class="refgraph"><button class="refgraph-h" data-rg="${esc(JSON.stringify(sub))}">`
-    + `🕸 参照したナレッジグラフ（${sub.nodes.length}件・つながり${sub.edges.length}本）<span class="caret">▾</span></button>`
-    + '<div class="refgraph-body" hidden></div></div>';
-}
-export function initRefGraph(el, sub) {   // 部分グラフを cytoscape で描く（起点=オレンジ大／影響=teal）
-  const dark = document.documentElement.dataset.theme === 'dark';
-  const els = [
-    ...sub.nodes.map((n) => ({ data: { id: n.name, label: n.name, role: n.start ? 'start' : (n.affected ? 'affected' : 'mid') } })),
-    ...sub.edges.filter(([a, b]) => a && b).map(([a, b]) => ({ data: { source: a, target: b } })),
-  ];
-  const cy = cytoscape({
-    container: el, elements: els, wheelSensitivity: 0.2, maxZoom: 1.6, minZoom: 0.1,
-    style: [
-      { selector: 'node', style: { label: 'data(label)', 'font-size': 9, width: 16, height: 16,
-        'background-color': '#94a3b8', color: dark ? '#e6edf3' : '#1f2937', 'text-valign': 'bottom', 'text-margin-y': 2,
-        'text-outline-width': 2, 'text-outline-color': dark ? '#0f1419' : '#fff', 'text-max-width': 90, 'text-wrap': 'ellipsis' } },
-      { selector: 'node[role="start"]', style: { 'background-color': '#d97706', width: 22, height: 22 } },
-      { selector: 'node[role="affected"]', style: { 'background-color': '#0d9488' } },
-      { selector: 'edge', style: { width: 1.2, 'line-color': dark ? '#3a4550' : '#cbd5e1', 'target-arrow-shape': 'triangle',
-        'target-arrow-color': dark ? '#3a4550' : '#cbd5e1', 'curve-style': 'bezier', 'arrow-scale': 0.7 } },
-    ],
-    layout: { name: 'breadthfirst', directed: true, padding: 12, spacingFactor: 1.05,
-      roots: sub.nodes.filter((n) => n.start).map((n) => n.name) },
-  });
-  cy.one('layoutstop', () => cy.fit(undefined, 16));
-  return cy;
-}
 // 回答カードを追加する。
 export function appendAnswer(answer, messageId, trace, feedback) {
   const el = answer ? appendAssistantRaw(answerHTML(answer, trace, feedback)) : appendAssistantRaw('<div class="muted">（内容なし）</div>');
@@ -973,18 +918,11 @@ export function appendAnswer(answer, messageId, trace, feedback) {
   return el;
 }
 
-// 最終回答の段階表示（answer_delta を一定ペースで描く）
-let _revPending = '', _revTimer = null;
-export function clearReveal() { if (_revTimer) clearInterval(_revTimer); _revTimer = null; _revPending = ''; }
-export function reveal(text) {
-  _revPending += text;
-  if (_revTimer || !S.ansHead) return;
-  // 一括到着でも一定ペースで描くよう、1回の文字数に上限を設ける
-  _revTimer = setInterval(() => {
-    if (!_revPending) { clearInterval(_revTimer); _revTimer = null; return; }
-    const n = Math.max(2, Math.min(6, Math.ceil(_revPending.length / 40)));
-    S.ansHead.textContent += _revPending.slice(0, n); _revPending = _revPending.slice(n); scroll();
-  }, 20);
+// answer_delta で届いた回答を、そのまま一度に描く。
+export function showAnswerText(text) {
+  if (!S.ansHead) return;
+  S.ansHead.textContent += text;
+  scroll();
 }
 // 逐次表示用の回答カードを（無ければ）作る。
 export function ensureAnswerCard(thinking) {
@@ -995,7 +933,6 @@ export function ensureAnswerCard(thinking) {
 }
 // 逐次表示中のカードを確定した回答で置き換える（無ければ新規に追加し、trace があれば思考の流れボタンを添える）。
 export function finalizeAnswer(thinking, answer, turnId, messageId, trace) {
-  clearReveal();
   let el;
   if (!S.ansEl) {
     if (thinking) thinking.remove();
@@ -1030,7 +967,7 @@ const _WHY_VIA = {
   cics_xctl: 'を呼び出しています', cics_link: 'を呼び出しています', mapper_sql: 'の表を SQL で参照しています', vba_sql: 'の表を SQL で参照しています',
   write_file: 'に書き出されています', read_file: 'を読み込んでいます', use: 'を使っています',
 };
-const _WHY_TYPE = { INVOKES: 'を呼び出しています', COPIES: 'を取り込んでいます', ACCESSES: 'を参照しています', CONTAINS: 'を含んでいます' };
+const _WHY_TYPE = { INVOKES: 'を呼び出しています', COPIES: 'を取り込んでいます', ACCESSES: 'を参照しています', CONTAINS: 'を含んでいます', BUILT_FROM: 'を材料にして作られています' };
 const _WHY_RULE = {
   alias: '別名の指定で決まりました', single_import: 'import で指定された型に一致しました', same_package: '同じ package（名前空間）の名前に一致しました',
   wildcard: 'import（まとめて指定）の範囲で一致しました', qualified_name: '完全な名前で一致しました', path_exact: '書かれたパスのとおりに一致しました',
@@ -1038,6 +975,7 @@ const _WHY_RULE = {
   schema_unqualified: '名前が一致しました（定義側にスキーマ名なし）', table_name: '表の名前で一致しました', nearest_name: '一番近い場所の同じ名前に一致しました',
   di_qualifier: '注入で指定された名前が実装の名前に一致しました', di_primary: '実装のうち優先の指定が付いたものに決まりました',
   di_single_impl: '実装が 1 つだけでした',
+  build_definition: 'ビルドの定義に書かれた実行名と材料の組で決まりました',
   dd_name_match: 'プログラムのファイル名の指定と、ジョブのデータセットの指定が一致しました', copy_item_name: 'COPY で取り込んだ項目の名前に一致しました',
 };
 // 辺 1 本の「参照元」の平文（文書と行を複数・切った分は「ほか N 件」）。根拠（sources）のある辺だけ出す。
@@ -1123,12 +1061,24 @@ function renderTrouble(a) {
     ? `<details class="cand-more"><summary>${esc(label)}</summary>${rest.map(_candidateHTML).join('')}</details>`
     : `<div class="muted cand-more">${esc(label)}</div>`);
 }
+// 出典の世代（資料フォルダ直下のフォルダ）と原本の更新時刻。取れた欄だけ「（5期・2026-07-01 12:30 更新）」の形で添える。
+export function provenanceText(item) {
+  const gen = item && typeof item.generation === 'string' ? item.generation.trim() : '';
+  const at = item && typeof item.modified_at === 'string' ? fmtDateTime(item.modified_at) : '';
+  const parts = [gen, at ? `${at} 更新` : ''].filter(Boolean);
+  return parts.length ? `（${parts.join('・')}）` : '';
+}
+const provenanceHTML = (item) => {
+  const t = provenanceText(item);
+  const note = item && typeof item.note === 'string' && item.note ? `<span class="muted cite-prov">（${esc(item.note)}）</span>` : '';
+  return (t ? `<span class="muted cite-prov" title="資料フォルダ直下のフォルダと、原本の更新時刻">${esc(t)}</span>` : '') + note;
+};
 // 引用（該当箇所）カード。既定は折りたたみで、件数だけ見える見出しボタン＋hidden な本体にする。
 function renderQa(a) {
   const cites = (a.data && a.data.citations) || [];
   if (!cites.length) return '';
   const items = cites.map((c) =>
-    `<div class="cite"><span class="doc">${esc(c.doc_id)}</span><span class="sp">行 ${esc(c.span && c.span[0])}–${esc(c.span && c.span[1])}</span><pre>${esc(c.quote)}</pre></div>`).join('');
+    `<div class="cite"><span class="doc">${esc(c.doc_id)}</span>${provenanceHTML(c)}<span class="sp">行 ${esc(c.span && c.span[0])}–${esc(c.span && c.span[1])}</span><pre>${esc(c.quote)}</pre></div>`).join('');
   return `<div class="cites"><button class="cites-h" type="button" data-cites aria-expanded="false">`
     + `📄 該当箇所 (${cites.length})<span class="caret">▾</span></button>`
     + `<div class="cites-body" hidden>${items}</div></div>`;
@@ -1146,7 +1096,7 @@ function renderSources(sources, verifiedDocIds, evidencePacket) {
   const link = (s) => (s.download_url
     ? `<a href="${esc(s.download_url)}" data-dl>📄 ${esc(s.doc_id)}</a>`
     : `<span class="muted" title="この画面ではダウンロードできません">📄 ${esc(s.doc_id)}（ダウンロードできません）</span>`)
-    + `${verificationBadgeHTML(vmap.get(s.doc_id))}${importanceBadgeHTML(s)}`;
+    + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(s.doc_id))}`;
   // sources_verified（精読済み doc_id）があれば、出典を「根拠（精読済み）」と「参考（ヒットのみ）」に分ける（除外はしない）
   if (Array.isArray(verifiedDocIds)) {
     const verified = new Set(verifiedDocIds);
@@ -1208,7 +1158,7 @@ function renderReferencedDocs(answer, evidencePacket) {
     return (s.download_url
       ? `<a href="${esc(s.download_url)}" data-dl>📄 ${esc(r.path)}</a>`
       : `<span class="muted" title="この画面ではダウンロードできません">📄 ${esc(r.path)}（ダウンロードできません）</span>`)
-      + `${verificationBadgeHTML(vmap.get(r.path))}${importanceBadgeHTML(s)}`;
+      + `${provenanceHTML(s)}${verificationBadgeHTML(vmap.get(r.path))}`;
   };
   return head
     + rows.map((r) => `<div class="sources-unverified-row">${link(r)}${r.ranges.length ? `<span class="muted">（${esc(rangeText(r))}${r.rangesMore ? `、ほか ${r.rangesMore} か所` : ''}）</span>` : (r.rangesMore ? `<span class="muted">（ほか ${r.rangesMore} か所）</span>` : '')}`
@@ -1250,19 +1200,29 @@ const RECON_VERDICT_LABEL = { match: '一致', mismatch: '食い違い（ソー�
   source_missing: 'ソースに見当たらない', unverified: '未確認' };
 export function reconciliationRows(answer) {
   const list = answer && answer.data && Array.isArray(answer.data.reconciliation) ? answer.data.reconciliation : [];
-  const side = (v) => ({ text: v && typeof v.text === 'string' ? v.text : '',
-    doc_id: v && typeof v.doc_id === 'string' && v.doc_id ? v.doc_id : '',
-    line: v && Number.isInteger(v.line) && v.line > 0 ? v.line : 0,
-    lineEnd: v && Number.isInteger(v.line) && v.line > 0 && Number.isInteger(v.line_end) && v.line_end > v.line ? v.line_end : 0 });
+  const ref = (v) => {
+    const o = { doc_id: v && typeof v.doc_id === 'string' && v.doc_id ? v.doc_id : '',
+      loc: v && typeof v.loc === 'string' ? v.loc : '',
+      line: v && Number.isInteger(v.line) && v.line > 0 ? v.line : 0,
+      lineEnd: v && Number.isInteger(v.line) && v.line > 0 && Number.isInteger(v.line_end) && v.line_end > v.line ? v.line_end : 0 };
+    const pos = o.loc || (o.line ? `${o.line}${o.lineEnd ? `-${o.lineEnd}` : ''}` : '');
+    o.label = o.doc_id + (pos ? `:${pos}` : '');
+    return o;
+  };
+  const side = (v) => ({ text: v && typeof v.text === 'string' ? v.text : '', ...ref(v),
+    also: v && Array.isArray(v.also) ? v.also.map(ref).filter((x) => x.doc_id) : [] });
   return list.filter((r) => r && typeof r.item === 'string' && r.item.trim() && RECON_VERDICT_LABEL[r.verdict])
     .map((r) => ({ item: r.item, verdict: r.verdict, label: RECON_VERDICT_LABEL[r.verdict], spec: side(r.spec), source: side(r.source) }));
 }
+function _reconLinkHTML(sd, world) {
+  const fileName = sd.doc_id.split('/').filter(Boolean).pop() || 'download';
+  return world
+    ? `<a href="/documents/download?world=${encodeURIComponent(world)}&rel=${encodeURIComponent(sd.doc_id)}" data-dl data-name="${esc(fileName)}">📄 ${esc(sd.label)}</a>`
+    : `<span class="muted">📄 ${esc(sd.label)}</span>`;
+}
 function _reconRefHTML(sd, world) {
   if (!sd.doc_id) return '';
-  const name = sd.doc_id + (sd.line ? `:${sd.line}${sd.lineEnd ? `-${sd.lineEnd}` : ''}` : '');
-  return world
-    ? `<a href="/documents/download?world=${encodeURIComponent(world)}&rel=${encodeURIComponent(sd.doc_id)}" data-dl>📄 ${esc(name)}</a>`
-    : `<span class="muted">📄 ${esc(name)}</span>`;
+  return _reconLinkHTML(sd, world) + (sd.also || []).map((x) => `<div>${_reconLinkHTML(x, world)}</div>`).join('');
 }
 function renderReconciliation(answer) {
   const rows = reconciliationRows(answer);

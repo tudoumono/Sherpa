@@ -202,7 +202,7 @@ async function loadExtKeys() {
   } catch (e) {
     if (myGen !== _ekListGen) return;
     const wrap = $('ext-keys-list');
-    if (wrap) wrap.innerHTML = '<div class="hint danger">キー一覧を読み込めませんでした</div>';
+    if (wrap) wrap.innerHTML = `<div class="hint danger">キー一覧を読み込めませんでした: ${Sherpa.esc(e.message)}</div>`;
   }
 }
 
@@ -444,9 +444,7 @@ if (_extKeysList) _extKeysList.addEventListener('click', async (e) => {
 // save() はこれを見て「保存はできたが再読込に失敗した」ことを伝え分ける。
 async function load() {
   try {
-    const r = await fetch('/settings');
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const s = await r.json();
+    const s = await Sherpa.getJSON('/settings');
     renderConstructOptions(s.constructs_available, s.construct_id, s.agent, s.codex_model_provider);
     applyCloudKeyVisibility(!!s.personal_api_keys_allowed, s.cloud_provider || 'openai');
     // 管理者が許可したときだけ「外部連携」カードを出す。
@@ -462,7 +460,7 @@ async function load() {
     $('okey').placeholder = s.openai_key_set ? '設定済み（変更する時だけ入力）' : '未設定（sk-...）';
     return true;
   } catch (e) {
-    $('msg').innerHTML = '<span class="danger">設定を読み込めませんでした</span>';
+    $('msg').innerHTML = `<span class="danger">設定を読み込めませんでした: ${Sherpa.esc(e.message)}</span>`;
     return false;
   }
 }
@@ -535,11 +533,13 @@ async function test(provider) {
   }
   if (provider === 'codex') { const k = $('okey').value.trim(); if (k) body.openai_api_key = k; }
   try {
-    const d = await (await fetch('/settings/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
+    const r = await fetch('/settings/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const d = await r.json().catch(() => null);
+    if (!d) { res.className = 'tres danger'; res.textContent = `✗ サーバーが処理できませんでした（HTTP ${r.status}）`; return; }
     res.className = 'tres ' + (d.ok ? 'ok' : 'danger');
     res.textContent = (d.ok ? '✓ 接続OK' : '✗ ' + (d.detail || '失敗')) + (d.model ? `（${d.model}）` : '');
   } catch (e) {
-    res.className = 'tres danger'; res.textContent = '✗ テストに失敗しました';
+    res.className = 'tres danger'; res.textContent = '✗ 通信に失敗しました。ネットワークを確認してください';
   }
 }
 
@@ -558,11 +558,4 @@ document.addEventListener('keydown', (e) => {
 $('agent').addEventListener('change', showConstructHint);
 document.querySelectorAll('[data-test]').forEach((b) => b.addEventListener('click', () => test(b.dataset.test)));
 
-function applyThemeIcon() { const b = $('themebtn'); if (b) b.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙'; }
-document.addEventListener('click', (e) => {
-  if (!e.target.closest('#themebtn')) return;
-  const d = document.documentElement, next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-  d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
-});
-applyThemeIcon();
-load();
+load().then((ok) => { if (!ok) $('save').disabled = true; });

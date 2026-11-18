@@ -349,6 +349,26 @@ class _FakeBatchTx:
         return _FakeCountResult()
 
 
+class _FakeExplicitTx:
+    """`session.begin_transaction()` の最小スタブ。`commit()` で session.committed を立て、確定せずに抜けたら確定しない。"""
+
+    def __init__(self, session, inner):
+        self.session = session
+        self.inner = inner
+
+    def run(self, cypher, **params):
+        return self.inner.run(cypher, **params)
+
+    def commit(self):
+        self.session.committed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
 class _FakeBatchSession:
     def __init__(self, log, fail_on_call=None):
         self.log = log
@@ -364,6 +384,9 @@ class _FakeBatchSession:
         result = fn(tx)                           # 例外はそのまま伝播＝ committed は立たない
         self.committed = True
         return result
+
+    def begin_transaction(self):
+        return _FakeExplicitTx(self, _FakeBatchTx(self.log, self.fail_on_call))
 
     def __enter__(self):
         return self
@@ -464,3 +487,62 @@ def test_load_world_unknown_vocab_rejected_before_any_write(monkeypatch):
     with pytest.raises(ValueError):
         wn.load_world(nodes, [], "w1", "bolt://x", "u", "p")
     assert log == []                               # 検証前に落ちるので tx すら開始しない
+
+
+class _MemoryPoolError(Exception):
+    code = "Neo.TransientError.General.MemoryPoolOutOfMemoryError"
+
+    def is_retryable(self):
+        return True
+
+
+class _OtherTransientError(Exception):
+    code = "Neo.TransientError.Transaction.DeadlockDetected"
+
+    def is_retryable(self):
+        return True
+
+
+class _CommitFailingSession:
+    """確定（commit）で、渡された例外を順に投げる session。投げ終わったら確定する。"""
+
+    def __init__(self, errors):
+        self.errors = list(errors)
+        self.attempts = 0
+
+    def begin_transaction(self):
+        session = self
+
+        class _Tx:
+            def run(self, cypher, **params):
+                return _FakeCountResult()
+
+            def commit(self):
+                session.attempts += 1
+                if session.errors:
+                    raise session.errors.pop(0)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        return _Tx()
+
+
+def test_graph_write_is_not_retried_after_the_write_memory_limit():
+    session = _CommitFailingSession([_MemoryPoolError("limit"), _MemoryPoolError("limit")])
+    with pytest.raises(_MemoryPoolError):
+        wn._write_world(session, lambda tx: ("n", "m"))
+    assert session.attempts == 1
+
+
+def test_other_transient_graph_write_failures_are_retried_once():
+    session = _CommitFailingSession([_OtherTransientError("deadlock")])
+    assert wn._write_world(session, lambda tx: ("n", "m")) == ("n", "m")
+    assert session.attempts == 2
+    session = _CommitFailingSession([_OtherTransientError("a"), _OtherTransientError("b")])
+    with pytest.raises(_OtherTransientError):
+        wn._write_world(session, lambda tx: ("n", "m"))
+    assert session.attempts == 2

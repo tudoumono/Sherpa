@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterator
 
-from . import memtrim
+from . import memtrim, stop_kind
 
 _log = logging.getLogger("sherpa")
 
@@ -113,6 +113,8 @@ class TurnRecord:
     conversation_id: int | None = None
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     buffer: TurnBuffer = field(default_factory=TurnBuffer)
+    # 送信時に指定された範囲（社内資料オフのターンは None）。実行中に会話を開き直したとき画面が範囲を戻すのに使う。
+    scope_paths: list[str] | None = None
 
 
 _REGISTRY: dict[str, TurnRecord] = {}
@@ -207,12 +209,14 @@ def start_turn(*, uid: str,
               conversation_factory: Callable[[], int],
               run_fn_factory: Callable[[int], Callable[[threading.Event, Callable[[dict], None]], None]],
               known_conversation_id: int | None = None,
+              scope_paths: list[str] | None = None,
               ) -> TurnRecord:
     """新規ターンを background thread で開始する（予約方式）。上限超過で弾かれるリクエストが会話だけ作る副作用を避ける。
     ① `_REGISTRY_LOCK` の中で枠を予約する（上限判定と登録は atomic・この時点で conversation_id は None）。上限超過は `TurnLimitError`（会話は作られない）。
     ② ロックの外で `conversation_factory()` を呼んで会話を確定する。失敗したら予約を取り消して re-raise する。
     ③ conversation_id を予約レコードへ書き、`run_fn_factory(conversation_id)` で実処理を組み立てて thread を起動する。
     `known_conversation_id` は既存会話への継続と分かっているときだけ渡す。同じ会話の未完了ターンがあれば `TurnLimitError("conversation")`。
+    `scope_paths` は送信時の範囲（社内資料オフは None）で、実行中一覧（`list_running`）にそのまま載る。
     `effective_limits()` はロック取得前に呼ぶ（DB I/O をロック保持中に行わない）。
     """
     max_per_user, max_global = effective_limits()
@@ -225,7 +229,8 @@ def start_turn(*, uid: str,
         turn_id = uuid.uuid4().hex
         # `known_conversation_id` は予約時点で確定させる（factory 実行中に同じ会話の 2 本目がすり抜けないように）。
         rec = TurnRecord(turn_id=turn_id, uid=uid, stop_event=threading.Event(),
-                         conversation_id=known_conversation_id)
+                         conversation_id=known_conversation_id,
+                         scope_paths=list(scope_paths) if scope_paths is not None else None)
         _REGISTRY[turn_id] = rec
 
     try:
@@ -247,10 +252,13 @@ def start_turn(*, uid: str,
     def _run():
         try:
             run_fn(rec.stop_event, rec.buffer.append)
-        except Exception:
+        except Exception as e:
             # 未捕捉の例外でも枠を占有したまま残さない。DB への永続は呼び出し側（run_fn）の責務で、ここは buffer にエラーを積んで枠を解放するだけ。
             _log.exception("chat turn crashed: turn_id=%s uid=%s", turn_id, uid)
-            rec.buffer.append({"type": "error", "message": "内部エラーが発生しました。もう一度お試しください。"})
+            message = {"timeout": "回答の作成がタイムアウトしました。もう一度お試しください。",
+                       "transport_error": "AI との通信に失敗しました。時間をおいてもう一度お試しください。"
+                       }.get(stop_kind.from_exception(e), "内部エラーが発生しました。もう一度お試しください。")
+            rec.buffer.append({"type": "error", "message": message})
         finally:
             rec.buffer.mark_done()
             memtrim.release()   # 1 ターンで積んだ分のメモリを OS へ返す（Linux のみ・30 秒に 1 回まで）

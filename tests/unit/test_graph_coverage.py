@@ -262,13 +262,8 @@ def _kw(doc):
             "judgement": None, "paths": None}
 
 
-class _AllDocs:
-    def __contains__(self, item):
-        return True
-
-
 def _search(monkeypatch, graph_result, k, keyword_docs=(), **kw):
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kwa: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     monkeypatch.setattr(ss, "_search_keyword",
                         lambda w, q, sp, kk, s, layer=None: ([_kw(d) for d in keyword_docs], None))
     monkeypatch.setattr(ss, "_search_graph",
@@ -316,7 +311,7 @@ def test_overload_is_a_degraded_detail_not_a_coverage(monkeypatch, exc, detail):
 
     monkeypatch.setattr(ss, "_neo4j_session", _session)
     monkeypatch.setattr(ss, "run_impact", _boom)
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     res = ss.search("w", "q", engines=["graph"], k=3)
     assert res["degraded"] == [{"engine": "graph", "reason": "graph_query_failed", "detail": detail}]
     assert "graph" not in res["coverage"] and res["engines_used"] == []
@@ -333,7 +328,7 @@ def test_include_presumed_false_reaches_run_impact_only_when_changed(monkeypatch
     monkeypatch.setattr(ss, "_neo4j_session", _session)
     monkeypatch.setattr(ss, "run_impact", lambda s, q, w, scope_prefixes=None, depth=10, **kw: seen.append(kw) or
                         {"items": [], "presumed": []})
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _AllDocs())
+    monkeypatch.setattr(documents, "existing_rels", lambda world, rels, **kw: {r for r in rels if r})
     ss.search("w", "q", engines=["graph"])
     ss.search("w", "q", engines=["graph"], include_presumed=False)
     assert seen == [{"flow_depth": 0}, {"flow_depth": 0, "include_presumed": False}]
@@ -378,7 +373,6 @@ def test_depth_check_overload_keeps_main_result_and_marks_unknown(monkeypatch):
 
     monkeypatch.setattr(world_neo4j, "world_impact", _wi)
     monkeypatch.setattr(world_neo4j, "read_unresolved", lambda *a, **k: {"available": False, "items": [], "omitted": 0})
-    monkeypatch.setattr(world_neo4j.worlds, "world_dir", lambda w: None)
     res = world_neo4j.run_world_impact(object(), "A", "w", depth=3)
     assert res["items"] == items
     assert res["coverage"] == {"complete": False, "limits": [{"kind": "timeout", "stage": "impact"}],
@@ -397,7 +391,6 @@ def test_world_impact_converts_depth_check_overload_to_unknown(monkeypatch):
 
     monkeypatch.setattr(world_neo4j, "_run_read_capped", _run)
     monkeypatch.setattr(world_neo4j, "check_schema_era", lambda *a, **k: None)
-    monkeypatch.setattr(world_neo4j, "_attach_importance", lambda *a, **k: None)
     info: dict = {}
     items = world_neo4j.world_impact(object(), ["c"], "w", depth=1, info=info)
     assert len(items) == 1 and info == {"depth_truncated": None, "depth_check_limit": "timeout"}
@@ -446,7 +439,8 @@ def test_graph_neighbors_clip_below_required_fields_keeps_minimal_or_errors(monk
 
 
 def test_stale_graph_hits_are_not_counted_in_omitted_or_origin_counts(monkeypatch):
-    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: {"s0.cbl", "s2.cbl", "p0.md"})
+    monkeypatch.setattr(documents, "existing_rels",
+                        lambda world, rels, **kw: {r for r in rels if r in {"s0.cbl", "s2.cbl", "p0.md"}})
     monkeypatch.setattr(ss, "_search_graph",
                         lambda w, q, sp, k, d=10, **ex: (ss._graph_hits(_graph_result(n_structure=3, n_presumed=1), k), None))
     res = ss.search("w", "q", engines=["graph"], k=2)
@@ -479,3 +473,117 @@ def test_card_cap_after_partial_fetch_leaves_total_unknown(monkeypatch):
     assert res["count"] is None and res["truncated"] is True
     assert res["coverage"]["omitted"] is None
     assert [x["kind"] for x in res["coverage"]["limits"]] == ["row_cap", "card_cap"]
+
+
+# ---- graph_neighbors の続き（offset／next_offset） -----------------------------------------------------
+
+def _paging_cards(n):
+    """name・label・distance が同じ別ノード（cid だけ違う）を含むカード。"""
+    return [{"name": f"N{i // 2:03d}", "label": "Module", "category": "ソース", "role": "実装", "distance": 1,
+             "path": [], "source": "graph", "cid": f"c{i:03d}", "evidence": {"edges": [], "grep": []}}
+            for i in range(n)]
+
+
+def _paged_neighbors(monkeypatch, n, shuffles):
+    """取得のたびに入力の並びが変わる（Neo4j の同順位の並びが不定）状況で、next_offset を最後までたどる。"""
+    import random
+    cards = _paging_cards(n)
+    rng = random.Random(7)
+
+    def _fake(world, term, sp=None, **kw):
+        out = list(cards)
+        if shuffles:
+            rng.shuffle(out)
+        out.sort(key=ls._card_order)  # `neighbor_cards` が返す直前に行う並べ替え
+        return out
+
+    monkeypatch.setattr(ls, "neighbor_cards", _fake)
+    got, offset, pages = [], 0, 0
+    while True:
+        args = {"name": "TAXCALC", **({"offset": offset} if offset else {})}
+        res, *_ = TD.run_tool("graph_neighbors", args, "w1", None)
+        pages += 1
+        got += [(v["name"], v["distance"]) for v in res["neighbors"]]
+        if res.get("next_offset") is None:
+            return res, got, pages
+        assert res["truncated"] is True and res["next_offset"] > offset
+        offset = res["next_offset"]
+
+
+def test_graph_neighbors_next_offset_pages_without_gap_or_duplicate_even_if_fetch_order_varies(monkeypatch):
+    from sherpa.parts.read import tools as RT
+    n = RT._GRAPH_CARDS_MAX * 2 + 5
+    last, got, pages = _paged_neighbors(monkeypatch, n, shuffles=True)
+    assert pages == 3 and len(got) == n
+    assert got == sorted(got) and sorted(got) == sorted((f"N{i // 2:03d}", 1) for i in range(n))
+    assert last["count"] == n and "truncated" not in last and last["coverage"]["complete"] is True
+
+
+def test_graph_neighbors_tie_order_is_fixed_by_cid(monkeypatch):
+    cards = _paging_cards(4)
+    out = ls._Cards(list(reversed(cards)), ls.Coverage())
+    out.sort(key=ls._card_order)
+    assert [c["cid"] for c in out] == ["c000", "c001", "c002", "c003"]
+
+
+def test_graph_neighbors_offset_past_the_end_is_empty_without_continuation(monkeypatch):
+    monkeypatch.setattr(ls, "neighbor_cards", lambda world, term, sp=None, **kw: _paging_cards(3))
+    res, *_ = TD.run_tool("graph_neighbors", {"name": "TAXCALC", "offset": 50}, "w1", None)
+    assert res["neighbors"] == [] and res.get("next_offset") is None and res["count"] == 3
+
+
+def test_graph_neighbors_final_clip_continues_from_the_first_dropped_neighbor(monkeypatch):
+    monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "700")
+    nb = [{"name": f"N{i}", "path": ["x" * 40], "edges": []} for i in range(30)]
+    full = {"neighbors": nb, "offset": 30, "count": 60,
+            "coverage": {"complete": True, "limits": [], "omitted": 0}}
+    out, clipped = M._clip_tool_result(full, name="graph_neighbors", args={"name": "A", "offset": 30})
+    kept = len(out["neighbors"])
+    assert clipped and 0 < kept < 30
+    assert out["next_offset"] == 30 + kept and out["count"] == 60 and out["truncated"] is True
+
+
+def test_graph_neighbors_final_clip_after_unverified_drop_gives_no_ambiguous_continuation(monkeypatch):
+    monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "700")
+    nb = [{"name": f"N{i}", "path": ["x" * 40], "edges": []} for i in range(30)]
+    full = {"neighbors": nb, "unverified": {"cards": 2}, "next_offset": 32, "truncated": True, "count": 80,
+            "coverage": {"complete": False, "limits": [{"kind": "card_cap", "stage": "cards"}], "omitted": 48}}
+    out, _ = M._clip_tool_result(full, name="graph_neighbors", args={"name": "A"})
+    assert len(out["neighbors"]) < 30 and "next_offset" not in out and out["truncated"] is True
+
+
+def test_graph_neighbors_partial_fetch_gives_no_continuation(monkeypatch):
+    from sherpa.parts.read import tools as RT
+    for kind in (graph_coverage.KIND_ROW_CAP, graph_coverage.KIND_TIMEOUT):
+        cov = graph_coverage.Coverage()
+        cov.add(kind, graph_coverage.STAGE_NEIGHBORS)
+        monkeypatch.setattr(ls, "neighbor_cards", lambda world, term, sp=None, cov=cov, **kw: ls._Cards(
+            _paging_cards(RT._GRAPH_CARDS_MAX + 1), cov))
+        res, *_ = TD.run_tool("graph_neighbors", {"name": "TAXCALC"}, "w1", None)
+        assert res["truncated"] is True and "next_offset" not in res
+
+
+def test_graph_neighbors_final_clip_of_a_partial_fetch_gives_no_continuation(monkeypatch):
+    monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "700")
+    nb = [{"name": f"N{i}", "path": ["x" * 40], "edges": []} for i in range(30)]
+    full = {"neighbors": nb, "truncated": True, "count": None,
+            "coverage": {"complete": False, "limits": [{"kind": "timeout", "stage": "neighbors"}], "omitted": None}}
+    out, _ = M._clip_tool_result(full, name="graph_neighbors", args={"name": "A"})
+    assert len(out["neighbors"]) < 30 and "next_offset" not in out and out["truncated"] is True
+
+
+def test_graph_neighbors_page_is_cut_by_the_returned_form_not_the_raw_card(monkeypatch):
+    from sherpa.parts.read import tools as RT
+    cards = _paging_cards(100)
+    cards[3]["evidence"]["grep"] = [{"doc_id": "", "text": "g" * 60000}]  # AI へ返さない欄
+    monkeypatch.setattr(ls, "neighbor_cards", lambda world, term, sp=None, **kw: list(cards))
+    res, *_ = TD.run_tool("graph_neighbors", {"name": "TAXCALC"}, "w1", None, tool_result_max_bytes=40000)
+    assert len(res["neighbors"]) == RT._GRAPH_CARDS_MAX and res["next_offset"] == RT._GRAPH_CARDS_MAX
+
+
+def test_graph_neighbors_page_keeps_at_least_one_neighbor(monkeypatch):
+    cards = _paging_cards(5)
+    cards[0]["evidence"]["edges"] = [{"type": "CALLS", "from": "a", "to": "b", "rule": "r" * 5000}]
+    monkeypatch.setattr(ls, "neighbor_cards", lambda world, term, sp=None, **kw: list(cards))
+    res, *_ = TD.run_tool("graph_neighbors", {"name": "TAXCALC"}, "w1", None, tool_result_max_bytes=1000)
+    assert len(res["neighbors"]) == 1 and res["next_offset"] == 1

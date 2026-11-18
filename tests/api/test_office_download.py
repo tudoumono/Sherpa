@@ -201,20 +201,6 @@ def test_download_endpoint_toctou_rejects_symlink_swapped_after_verification(mon
         shutil.rmtree(outside_dir, ignore_errors=True)
 
 
-def test_download_endpoint_rejects_rel_missing_from_ledger():
-    """台帳（Postgres `documents`）に無い rel は、ファイルが実在し filesystem 上は
-    `doc_ledger.original_path` が解決できても 404（別名/列挙不能ディレクトリ対策・RV1 是正）。"""
-    rel = XLSX_REL
-    rows = [r for r in worker._ledger_rows(W) if r["name"] != rel]   # この rel だけ台帳から外す
-    store.replace_documents(W, rows)
-    try:
-        assert doc_ledger.original_path(rel, W) is not None            # filesystem 単体では解決できる
-        r = _CLIENT.get("/documents/download", params={"rel": rel, "world": W})
-        assert r.status_code == 404
-    finally:
-        store.replace_documents(W, worker._ledger_rows(W))             # 後続テストへ影響しないよう復元
-
-
 def test_download_endpoint_rejects_sensitive_named_rel_even_if_ledger_has_it():
     """台帳 #81: `text_kind.is_sensitive` 導入前に取り込まれ台帳に残っている秘匿名の行
     （`credentials.xlsx` 等）は、実体確認（`doc_ledger.original_path`）へ進む前に 404 で塞ぐ

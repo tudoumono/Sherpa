@@ -1,0 +1,12 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PTEXP.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+           COPY PT-CPY.
+       01  WS-MONTHS           PIC 9(2).
+       PROCEDURE DIVISION.
+           MOVE PT-EXPIRE-MONTHS TO WS-MONTHS.
+           IF WS-MONTHS > PT-CAMP-MONTHS
+               CALL 'PTNOTI'
+           END-IF.
+           GOBACK.

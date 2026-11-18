@@ -68,6 +68,14 @@ export function applyConversationScope(messages) {
   if (S.scopeTree) renderScopePanel(S.scopeTree);
   updateScopeHeader(sc);
 }
+// 回答待ちの質問がある会話を開いたとき、その質問で送った範囲を選択に戻す（最後の回答の範囲より優先する）。
+export function applyRunningTurnScope(paths) {
+  S.scope = paths.slice();
+  S.currentScopeMeta = { ...(S.currentScopeMeta || {}), scope_paths: S.scope.slice(),
+    source: S.scope.length ? 'explicit' : 'all' };
+  if (S.scopeTree) renderScopePanel(S.scopeTree);
+  setScopeLabel(scopeChipLabel());
+}
 function _scopeAncestors(path) {   // "a/b/c" → ["a","a/b"]（自分自身は含まない）
   const parts = path.split('/');
   const out = [];
@@ -160,7 +168,9 @@ export async function loadScopes() {
   let tree = null;
   try { tree = await getJSON('/scopes?world=' + encodeURIComponent($('version').value)); } catch (e) { }
   const scopes = (tree && tree.scopes) || [];
-  const leaves = scopes.filter((s) => !scopes.some((o) => o.path !== s.path && o.path.startsWith(s.path + '/')));
+  // 範囲は祖先のフォルダを全部含むので、子を持つフォルダ＝いずれかの path の親
+  const parents = new Set(scopes.map((s) => (s.path.includes('/') ? s.path.slice(0, s.path.lastIndexOf('/')) : null)));
+  const leaves = scopes.filter((s) => !parents.has(s.path));
   _scopeAvail = leaves.length > 1;   // 選べる末端が1つ以下なら範囲指定は出さない
   if (!_scopeAvail) { updateScopeVisibility(); return; }
   S.scopeTree = tree; S.scopeLabels = {}; scopes.forEach((s) => { S.scopeLabels[s.path] = s.label; });

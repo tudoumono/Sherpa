@@ -80,11 +80,9 @@ def test_preview_documents_without_sidecar_omit_provenance(auth_disabled):
             worlds.world_dir, worlds.derived_md_dir = old_world_dir, old_derived
 
 
-def test_ingest_preview_failure_returns_503_with_graph_message(auth_disabled, monkeypatch):
-    """RV1是正#6: `build_preview`（world 世代プローブ＝キャッシュの鍵読みを含む）が例外を出したら、
-    握り潰して生の 500 にせず、`/graph` と同じ固定文言・ログ付きで 503 にする（silent degradation
-    なしの家風・`sherpa/routers/graph.py::graph_get` と同型）。"""
-    from sherpa.routers import graph as graph_router
+def test_ingest_preview_failure_returns_503_with_fixed_message(auth_disabled, monkeypatch):
+    """`build_preview`（world 世代プローブ＝キャッシュの鍵読みを含む）が例外を出したら、
+    握り潰して生の 500 にせず、固定文言・ログ付きで 503 にする（silent degradation なしの家風）。"""
     from sherpa.routers import worlds as worlds_router
 
     def _boom(world):
@@ -94,4 +92,67 @@ def test_ingest_preview_failure_returns_503_with_graph_message(auth_disabled, mo
     c = TestClient(app)
     r = c.get("/ingest/preview", params={"world": W})
     assert r.status_code == 503
-    assert r.json()["detail"] == graph_router._GRAPH_UNAVAILABLE_MESSAGE
+    assert r.json()["detail"] == worlds_router._GRAPH_UNAVAILABLE_MESSAGE
+
+
+def test_ingest_preview_of_never_completed_world_does_not_build_graph(auth_disabled, monkeypatch, tmp_path):
+    """一度も取り込みが完了していない資料フォルダ（世代の記録なし）の /ingest/preview は、グラフを組み立てず
+    （`build_world` を呼ばず）、文書一覧と理由（`graph_note`）を返す。"""
+    from sherpa import worlds
+    from sherpa.ingest import world_graph
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "TAXCALC.cbl").write_text("       PROGRAM-ID. TAXCALC.\n", encoding="utf-8")
+    monkeypatch.setattr(worlds, "world_dir", lambda w: tmp_path if w == W else None)
+    calls: list[str] = []
+    real = world_graph.build_world
+
+    def _counting(*a, **kw):
+        calls.append("call")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(world_graph, "build_world", _counting)
+
+    r = TestClient(app, raise_server_exceptions=False).get("/ingest/preview", params={"world": W})
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert calls == []
+    assert body["graph_note"] and body["entities"] == [] and body["relations"] == []
+    assert body["counts"]["entities"] is None and body["counts"]["documents"] == 1
+    assert [d["name"] for d in body["documents"]] == ["src/TAXCALC.cbl"]
+
+
+def test_preview_returns_path_rules_read_only_and_survives_unreadable_rules(auth_disabled, monkeypatch):
+    """/ingest/preview は優先と除外を読み取りだけで返す（存在しない場所の設定を取り除く prune_world は呼ばない）。読めないときは path_rules が null で 200。"""
+    from sherpa import path_rules, worlds
+    old_world_dir, old_derived = worlds.world_dir, worlds.derived_md_dir
+    pruned = []
+    monkeypatch.setattr(path_rules, "prune_world", lambda *a, **k: pruned.append(a))
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as dd:
+        root, der = pathlib.Path(td), pathlib.Path(dd)
+        (root / "設計").mkdir()
+        (root / "設計" / "memo.txt").write_text("x", encoding="utf-8")
+        worlds.world_dir = lambda w: root if w == W else old_world_dir(w)
+        worlds.derived_md_dir = lambda w: der if w == W else old_derived(w)
+        try:
+            c = TestClient(app, raise_server_exceptions=False)
+            monkeypatch.setattr(path_rules, "rules_for", lambda w: path_rules.Rules([
+                path_rules.Rule("設計", path_rules.KIND_PRIORITY, True),
+                path_rules.Rule("消えた場所", path_rules.KIND_EXCLUDE)]))
+            r = c.get("/ingest/preview", params={"world": W})
+            assert r.status_code == 200, r.text
+            assert r.json()["path_rules"] == [
+                {"path": "設計", "kind": "priority", "outside_scope": True},
+                {"path": "消えた場所", "kind": "exclude", "outside_scope": False}]
+            assert pruned == []
+
+            def _boom(w):
+                raise path_rules.PathRulesUnavailable("読めない")
+            monkeypatch.setattr(path_rules, "rules_for", _boom)
+            r = c.get("/ingest/preview", params={"world": W})
+            assert r.status_code == 200, r.text
+            assert r.json()["path_rules"] is None
+            assert r.json()["documents"] is not None
+        finally:
+            worlds.world_dir, worlds.derived_md_dir = old_world_dir, old_derived

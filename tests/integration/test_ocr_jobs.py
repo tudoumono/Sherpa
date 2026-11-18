@@ -112,6 +112,51 @@ def test_ocr_refresh_run_lease_progress_and_world_purge():
         assert removed["refresh_runs"] == 1
 
 
+def test_refresh_run_pause_repeated_does_not_consume_attempts_and_keeps_cursor():
+    """切による停止を何度繰り返しても再試行回数を使い切らず、cursor を保ったまま残りを再開できる。"""
+    _init_or_skip()
+    world = "test-ocr-pause-" + uuid.uuid4().hex
+    generation, profile = "a" * 64, "sha256:" + "e" * 64
+    try:
+        queued = ocr_jobs.enqueue_refresh_run(world, generation, profile)
+        for _ in range(queued["max_attempts"] + 2):
+            leased = ocr_jobs.lease_refresh_run("worker-a", lease_seconds=60, world=world)
+            assert leased is not None and leased["id"] == queued["id"]
+            assert ocr_jobs.update_refresh_run_progress(
+                leased["id"], leased["lease_token"], cursor_rel_path="sub/a.xlsx.ocr_route.json",
+                selected_delta=1, excluded_delta=0, failed_binding_delta=0, jobs_delta=1, lease_seconds=60,
+            ) is True
+            paused = ocr_jobs.pause_refresh_run(
+                leased["id"], leased["lease_token"], error_code="ocr_stopping", error_detail="switched off")
+            assert paused["status"] == "queued" and paused["attempts"] == 0
+            assert paused["cursor_rel_path"] == "sub/a.xlsx.ocr_route.json" and paused["finished_at"] is None
+        resumed = ocr_jobs.lease_refresh_run("worker-a", lease_seconds=60, world=world)
+        assert resumed["cursor_rel_path"] == "sub/a.xlsx.ocr_route.json"
+        assert ocr_jobs.complete_refresh_run(resumed["id"], resumed["lease_token"])["status"] == "completed"
+    finally:
+        ocr_jobs.purge_world(world)
+
+
+def test_refresh_run_pause_after_lease_expired_still_returns_the_attempt():
+    """lease の期限が切れた直後の停止でも再試行回数を戻す（繰り返しても failed にならない）。"""
+    _init_or_skip()
+    world = "test-ocr-pause-expired-" + uuid.uuid4().hex
+    generation, profile = "a" * 64, "sha256:" + "e" * 64
+    try:
+        queued = ocr_jobs.enqueue_refresh_run(world, generation, profile)
+        for _ in range(queued["max_attempts"] + 2):
+            leased = ocr_jobs.lease_refresh_run("worker-a", lease_seconds=60, world=world)
+            assert leased is not None
+            with ocr_jobs._connect() as connection:
+                connection.execute(
+                    "UPDATE ocr_refresh_runs SET lease_expires_at=now()-interval '1 second' WHERE id=%s", (leased["id"],))
+            paused = ocr_jobs.pause_refresh_run(
+                leased["id"], leased["lease_token"], error_code="ocr_stopping", error_detail="switched off")
+            assert paused["status"] == "queued" and paused["attempts"] == 0
+    finally:
+        ocr_jobs.purge_world(world)
+
+
 def test_succeeded_results_stream_and_snapshot_mark_use_real_postgres():
     _init_or_skip()
     world = "test-ocr-publish-" + uuid.uuid4().hex

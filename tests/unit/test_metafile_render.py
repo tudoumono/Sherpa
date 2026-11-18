@@ -19,6 +19,12 @@ import _metafile_builders as mb  # noqa: E402
 from sherpa.ingest import derived_generation, metafile_render, metafile_text, ocr_router, office_md  # noqa: E402
 from sherpa.ingest.arms import legacy_convert  # noqa: E402
 
+@pytest.fixture(autouse=True)
+def _ocr_on(monkeypatch):
+    """OCR の既定は切。この file は OCR を入れた状態の挙動を見る。"""
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
+
+
 _FAKE = '''#!{python}
 import os, sys, time
 mode = os.environ.get("FAKE_SOFFICE_MODE", "ok")
@@ -146,11 +152,12 @@ def test_missing_libreoffice_is_recorded_as_unsupported_then_picked_up_when_it_a
 
 def test_pass_does_nothing_while_ocr_is_disabled(monkeypatch, tmp_path, fake_soffice):
     _, dmd, _ = _build(monkeypatch, tmp_path, _vector_emf())
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "0")
+    monkeypatch.setenv("SHERPA_OCR_ENABLED", "0")
     assert _pass(dmd) == {"rendered": 0, "failed": 0, "remaining": 0, "skipped": "ocr_disabled"}
     assert _calls(fake_soffice) == 0
     assert any(d["reason_code"] == ocr_router.METAFILE_RENDER_PENDING for d in _decisions(dmd))
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "1")
+    monkeypatch.delenv("SHERPA_OCR_ENABLED")
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
     assert _pass(dmd)["rendered"] == 1                                   # 状態は残っている＝有効に戻せば進む
 
 
@@ -262,7 +269,7 @@ def test_render_child_gets_a_queued_job_even_while_the_refresh_run_is_leased(mon
     _, dmd, _ = _build(monkeypatch, tmp_path, _vector_emf())
     (dmd / office_md._WORLD_SIG_MARKER).write_text("sig\n", encoding="utf-8")   # sync が公開時に書く署名
     generation = derived_generation.generation_id_for("sig")
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "1")
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
     try:
         ocr_jobs.enqueue_refresh_run(world, generation, ocr_worker.profile_hash())
         assert ocr_jobs.lease_refresh_run("w", world=world) is not None      # 処理中の run（再投入されない）

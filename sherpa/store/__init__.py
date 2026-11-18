@@ -98,8 +98,9 @@ from .failed_docs import (  # noqa: F401
 
 # documents・ingest の re-export。
 from .documents import (  # noqa: F401
-    count_and_list_documents, count_documents, document_exists, get_document, list_document_worlds, list_documents,
-    list_documents_page, replace_document, replace_documents,
+    apply_file_state_delta, count_and_list_documents, count_documents, document_exists, get_document,
+    list_document_names, list_document_worlds, list_documents, list_documents_page, ledger_stamp,
+    read_ledger_for_listing, replace_document, replace_documents,
 )
 from .ingest import (  # noqa: F401
     add_ingest_run,
@@ -111,9 +112,13 @@ from .ingest import (  # noqa: F401
     finish_ingest_run,
     finish_ingest_run_and_confirm_world,
     finish_ingest_run_and_delete_world,
+    get_last_finished_run_brief,
+    get_latest_completed_run_at,
     get_latest_es_run_summary,
+    get_latest_terminal_run_failure,
     get_recent_es_attempts,
     get_latest_published_run_summary,
+    get_latest_run_progress,
     get_latest_run_summary,
     get_latest_run_status,
     list_claimants_of_extracting_runs,
@@ -159,6 +164,7 @@ from .audit import (
 
 # settings の全名（私的名含む）を re-export する。`set_system_settings` 内の `_audit_insert` 呼び出しは facade 属性経由で実行時に解決する。`_system_settings_cache`/`_system_settings_cache_ts` は公開名一覧を保つためだけの re-export。
 from .settings import (
+    CHILD_SNAPSHOT_ENV,
     OpenAIEndpointSettingsConflict,
     PersonalKeysDisallowedError,
     _SETTINGS_FIELDS,
@@ -169,6 +175,7 @@ from .settings import (
     count_users_with_personal_keys,
     get_settings,
     get_system_settings,
+    modify_system_setting,
     purge_personal_api_keys,
     seed_user_agent_once,
     seed_system_settings_once,

@@ -8,7 +8,7 @@ os.environ.setdefault("SHERPA_DISABLE_EMBED", "1")
 
 def _patch(es_hits, base_candidates):
     from sherpa import chat_service, documents, es_index
-    old_rt, old_search, old_rel = chat_service.run_troubleshoot, es_index.search, documents.world_rel_set
+    old_rt, old_search, old_rel = chat_service.run_troubleshoot, es_index.search, documents.existing_rels
 
     def fake_rt(session, symptom, world, scope_paths=None, depth=None):
         return {"type": "troubleshoot", "world": world, "symptom": symptom,
@@ -17,13 +17,13 @@ def _patch(es_hits, base_candidates):
     chat_service.run_troubleshoot = fake_rt
     # RV2（FBK-1・2026-09-01）: `es_index.search()` は (hits, degrade_reason) を返す。
     es_index.search = lambda world, q, scope_paths=None, k=8, vector=True, layer=None, **kw: (list(es_hits), None)
-    documents.world_rel_set = lambda world, **kw: {"docs/ops.md", "docs/es.md", "docs/dup.md"}
+    documents.existing_rels = lambda world, rels, **kw: {r for r in rels if r in {"docs/ops.md", "docs/es.md", "docs/dup.md"}}
     return chat_service, (old_rt, old_search, old_rel)
 
 
 def _restore(saved):
     from sherpa import chat_service, documents, es_index
-    chat_service.run_troubleshoot, es_index.search, documents.world_rel_set = saved
+    chat_service.run_troubleshoot, es_index.search, documents.existing_rels = saved
 
 
 def test_dispatch_troubleshoot_adds_es_document_card_and_source():

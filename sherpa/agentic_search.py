@@ -73,7 +73,7 @@ _PARAMS_SEARCH = {"type": "object", "properties": {
               "description": "ヒットの開始位置（既定0）。truncated:true のときは next_offset をそのまま渡すと続きが取れる"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["query"]}
-# es_search は offset を持たない（kNN の候補集合はページ間で固定できず、ページを跨ぐと順位の入れ替わりで重複/欠落が起きる）。続きが必要なら max_hits（絶対上限まで）を増やす。
+# es_search は offset を持たない（kNN の候補集合はページ間で固定できず、ページを跨ぐと順位の入れ替わりで重複/欠落が起きる）。上限 max_hits は管理画面の調べる深さが決める内部の値で、AI が渡せる引数ではない。
 _PARAMS_ES_SEARCH = {"type": "object", "properties": {
     "query": {"type": "string", "description": "検索キーワード（型番・関数名・固有名詞など具体語が有効）。exact だけで引くときは省略できる"},
     "mode": {"type": "string", "enum": ["hybrid", "keyword", "vector"],
@@ -95,7 +95,7 @@ _PARAMS_LIST_DOCS = {"type": "object", "properties": {
                               "'Excel' では .xls を含まない。値が不明なら doctype なしで1回呼んで確認する）。省略可"},
     "state": {"type": "string",
              "description": "状態の完全一致で絞る（'ready'=使える・'unreadable'=読み取れない・"
-                            "'unknown'=直近確認が未実施）。省略可"},
+                            "'unknown'=直近確認が未実施か、台帳から種類が分からない＝kind_unknown の行）。省略可"},
     "limit": {"type": "integer", "description": "一覧に含める最大件数（既定200・上限500）。件数(count)は limit/offset と無関係に全件を返す"},
     "offset": {"type": "integer",
               "description": "一覧の開始位置（既定0）。truncated:true のときは next_offset をそのまま渡すと続きが取れる"},
@@ -105,6 +105,8 @@ _PARAMS_FOLDER_TREE = {"type": "object", "properties": {
     "path_prefix": {"type": "string",
                     "description": "この配下のフォルダ階層だけを見る（rel_path の先頭一致・例: '4期保守'）。省略可＝範囲全体"},
     "depth": {"type": "integer", "description": "列挙するフォルダの深さ上限（既定3・1〜10にクランプ）"},
+    "offset": {"type": "integer",
+              "description": "フォルダ一覧の開始位置（既定0）。folders_truncated:true のときは next_offset をそのまま渡すと続きが取れる"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": []}
 _PARAMS_READ = {"type": "object", "properties": {
@@ -118,6 +120,8 @@ _PARAMS_READ_DOC = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "list_docs/ripgrep_search 等が返した doc_id（資料の相対パス）"},
     "start_line": {"type": "integer",
                   "description": "読み始める行（既定1）。続きが必要なら前回の返却が示す次の行を指定して呼び直す"},
+    "start_char": {"type": "integer",
+                  "description": "start_line の行の中の読み始める文字位置（既定0）。前回の返却に next_char があれば、その行の続きとしてその値を渡す"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _PARAMS_OUTLINE = {"type": "object", "properties": {
@@ -136,6 +140,8 @@ _PARAMS_ASK = {"type": "object", "properties": {
     "allow_free_text": {"type": "boolean", "description": "自由入力も許可するか"}},
     "required": ["prompt", "mode", "options"]}
 _DESC_SEARCH = ("社内資料を全文 grep して当たりを付ける（doc_id と行番号つきのヒットを返す）。完全一致・固有名詞に強い。"
+                "ヒットの char は一致した語の行の中の文字位置（0 始まり）——read_doc の start_line に line、start_char に char を渡すと、その語から読み始められる"
+                "（極端に長い行の途中で見つけたときは付かない）。"
                 "file_truncated が付くヒットは、その文書がまだ検索し切れていない可能性がある——"
                 "read_doc で続きを確認する。text_truncated が付くヒットは本文が途中で切れている——"
                 "read_around（周辺）か read_doc（続き）で読む。"
@@ -147,7 +153,7 @@ _DESC_SEARCH = ("社内資料を全文 grep して当たりを付ける（doc_id
                 "unreadable_files は開けず・読めずに検索できなかったファイルの件数（名前は出さない・その分は未確認）。"
                 f"{_ITEM_PARAM_NOTE}")
 _DESC_READ = ("ヒット箇所の周辺行だけを精読する（全文は読まない）。doc_id と line を渡す。"
-             "text_truncated が付いたら本文が上限で切れている——read_doc で続き（次の開始行）を読む。"
+             "text_truncated が付いたら本文が上限で切れている——next_line を start_line（next_char があれば start_char）に渡して read_doc で続きを読む。"
              "file_truncated は読み取りの上限（ファイル 64MiB・1 行 2MiB。line_overflowed は 1 行が長すぎた）で一部を読めていない・"
              "window_clamped は窓を上限（200 行）に丸めた・line_beyond_eof は指定した行がファイルの末尾より後ろ（total_lines が総行数）。"
              f"{_ITEM_PARAM_NOTE}")
@@ -155,7 +161,8 @@ _DESC_READ_DOC = ("文書を開始行から連続して読む（通読向け・�
                   "doc_id と start_line（省略時1）を渡す。1回の返却行数には上限があり、"
                   "「全◯行中 X〜Y行目」を返すので、続きが必要なら次の開始行（end_line+1）を"
                   "指定して再度呼び出す（range 外の start_line はエラーで明示）。"
-                  "text_truncated が付くときは行内容が大きすぎて途中で切れている・"
+                  "text_truncated が付くときは行内容が大きすぎて途中で切れている——next_char があれば"
+                  "end_line の行の続きを start_line=end_line・start_char=next_char で読む・"
                   "file_truncated が付くときは文書自体が大きすぎて total_lines が過小申告の可能性がある。"
                   f"{_ITEM_PARAM_NOTE}")
 _DESC_OUTLINE = ("文書の見出し構造（Markdown の #/##/### 見出し・派生MDの表/シート見出しを含む）を"
@@ -167,18 +174,29 @@ _DESC_OUTLINE = ("文書の見出し構造（Markdown の #/##/### 見出し・�
 _DESC_LIST_DOCS = ("文書台帳の一覧・件数を返す（本文は読まない・grep しない）。"
                    "「ドキュメント数」「どんな資料があるか」「フォルダ構成」等の台帳質問はこれで答える。"
                    "path_prefix でフォルダ配下に絞り、name_pattern でパス（フォルダ名/ファイル名）の部分一致に絞れる。"
-                   "doctype（種別の完全一致・大文字小文字は無視）・state（'ready'/'unreadable'/'unknown' の"
+                   "doctype（種別の完全一致・大文字小文字は無視）・state（'ready'/'unreadable'/'unknown'/'partial' の"
                    "完全一致）でも絞れる。docs は常に rel_path の昇順で並ぶ（offset を進めても順序は変わらない）。"
                    "count は絞り込み後の全件数（limit/offset と無関係）、docs は offset から limit 件までの"
                    "一覧（rel_path/doctype/state）。truncated:true なら残りがある——次回呼び出しの offset に"
-                   "next_offset をそのまま渡して続きを取る。")
+                   "next_offset をそのまま渡して続きを取る。"
+                   "結果に ledger_at が付いていれば、最後に資料の状態を更新した時点の一覧（以降に変えた資料は含まない）。"
+                   "path_prefix を指定すると、そのフォルダに取り込みの後に置かれた資料（索引に入っていない）も"
+                   "after_ingest に出す。"
+                   "state:'partial' の資料（結果に partial と partial_notice が付く）は、ファイル名で見つかり読む道具で開けるが、"
+                   "意味の索引と資料どうしの関係には入っていない（Office・PDF は文字列の中身検索にも当たらない）。"
+                   "結果に kind_unknown（種類が分からない資料の件数。台帳から種類を補えない）と kind_unknown_notice が付くときは、"
+                   "層・種類（doctype）の絞り込みの件数や「該当なし」は確定しない（kind_unknown_dropped は doctype／state の絞り込みで落とした分）——"
+                   "その資料は state:'unknown' で絞って中身で確かめる。")
 # list_docs（フラット一覧）に対する tree 相当のツール。フォルダ名の意味解釈はせず、クエリ時に呼び出し元の LLM が解釈する。
 _DESC_FOLDER_TREE = ("world のフォルダ階層を、深さ上限つき・フォルダごとの件数つきで俯瞰する"
                      "（本文は読まない・grep しない・list_docs のフラット一覧では階層の形が掴めない"
                      "大規模な範囲で使う）。path_prefix でフォルダ配下に絞り、depth（既定3）で列挙する深さを決める。"
                      "フォルダごとに直下ファイル数・配下（再帰）ファイル数・直下サブフォルダ数を返す。"
                      "深さ上限でまだ配下があるフォルダは truncated:true（depth を上げて掘り下げる）。"
-                     "フォルダ件数自体が多すぎるときは folders_truncated:true（count が打ち切り前の総数）＝続きは取れないので、その範囲は未確認として扱う。")
+                     "フォルダ件数自体が多すぎるときは folders_truncated:true（count が全体の総数）＋next_offset＝同じ条件に offset=next_offset を付けて呼び直すと続きが取れる（並びは path 昇順で固定）。"
+                     "結果に ledger_at が付いていれば、最後に資料の状態を更新した時点の一覧（以降に変えた資料は含まない）。"
+                     "結果に partial（state が partial の資料の件数。意味の索引と資料どうしの関係には入っていない）が付くときは、ファイル名では見つかり開けるが意味での検索・影響の分析には出ない。"
+                     "結果に kind_unknown（種類が分からない資料の件数）が付くときは、層ごとの件数は確定しない（層が分からない資料はどの層にも数えている）——中身で確かめる。")
 _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素・意味の近さ・関連度ランキング）。"
             "対象は資料（Office・PDF など）で、ソース（コード）は索引に含まれない——ソースは ripgrep_search で探す。"
             "言い回しが揺れる概念・日本語の同義語・自然文クエリに強い。"
@@ -189,7 +207,14 @@ _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素�
             "read_doc（続き）で読む。fragment:true は本文が文書の断片（子チャンクだけ）。"
             "excluded_hits は結果から除いたヒットの件数（not_current＝現在の資料に無い・withheld＝秘匿のため。名前は出さない）。"
             "region_chunks_capped は領域のチャンク取得が上限（5000）に当たった・region_missing_chunks は領域の一部のチャンクが集まらなかった＝領域の本文は一部欠けている。"
-            "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。"
+            "row_group_text_cut は表の行の束の本文を予算のため省いた（chunks の行は read_around か read_doc で読む）。"
+            "row_group_exact_chunk_ids は exact で一致した束の中の行の chunk_id（束のどの行の識別子で当たったか）。"
+            "ingest_time_text は取り込み時点の本文で、今の原本との対応を確かめていない（変更中の資料の可能性がある・確定の根拠にする前に原本を読む）。"
+            "truncated:true は取得の上限に達した＝母集団の一部しか見ていない（続きは取れない）。上限は資料の数ではなく断片（チャンク）の数で、"
+            "同じ資料の断片で枠が埋まることがある——fetched_chunks（取得した断片の数）・returned_docs（返した資料の数）・fetch_cap（この呼び出しの取得の上限）で内訳を見る。"
+            "上限に当たったら、path_prefix でフォルダを絞る・exact で完全一致にする・mode を変える・具体語で言い換える・ripgrep_search のページ送りに切り替える、のどれかで探し直す。"
+            "意味検索は残りがあるだけで全部を読む必要はない——未解決の論点に合わせて、絞る・言い換える・別の道具で続きを取るを選び、読み切れない範囲は未確認として扱う"
+            "（全件が要る列挙は別）。"
             "es_search は候補の発見用——全件が必要な列挙は ripgrep_search"
             "（truncated:true なら next_offset を offset に渡して続きを取る）・list_docs・原本の読取で行う。"
             "項目ID・画面ID・帳票ID のような鍵付きの問いは exact で引く（Office・PDF の資料のレコードが対象・query は省略できる・query と併せると exact で絞ってから本文で順位付け）。"
@@ -202,25 +227,34 @@ _DESC_ASK = ("回答や検索条件を確定する前にユーザへ確認する
              "選択肢はラジオボタンまたはチェックボックスとして表示される。")
 _DESC_GRAPH = ("関係グラフから、ある名前（プログラム/コピーブック/ジョブ/データ項目/テーブルなど）の**関連部品**をたどる"
                "（コピー・呼び出し・参照・関連文書（言及）などの近傍を、つながりの経路つきで返す）。"
-               "各近傍の経路は**辺ごとの種類と向き（from→to）**付き。COPIES／INVOKES／ACCESSES／CONTAINS だけの"
+               "各近傍の経路は**辺ごとの種類と向き（from→to）**付き。COPIES／INVOKES／ACCESSES／CONTAINS／BUILT_FROM だけの"
                "経路は構造的な依存＝根拠にしてよい（影響は矢印をさかのぼる: A →COPIES→ B は B を変えると A が"
                "影響を受ける）。DOCUMENTS（言及）・CORRESPONDS_TO（同名の対応）を含む経路や `unverified` の辺（裏付け原本が"
-               "実在確認できない）を含む経路は候補＝原本で確認する。"
+               "実在確認できない）を含む経路は候補＝原本で確認する。種類 Executable は呼ばれる実行名で、BUILT_FROM の先が"
+               "材料のソース（実行名は材料のソースとビルドの定義の行を根拠に書く）。"
                "名前が一つでも判明したら、その関連の広がりは grep を反復するより先にこれで辿るほうが早い。"
                "原因の手がかり集め（トラブルシュート）に有効。grep で正確な名前を見つけてから渡すと精度が上がる。"
-               "近傍が上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。"
+               "近傍が上限で切られたときは truncated:true・count（総数）・next_offset が付く＝同じ条件に offset=next_offset を付けて呼び直すと続きが取れる（並びは固定）。truncated:true で next_offset が無いとき（時間切れ・取得の天井）は続きが取れないので、その範囲は未確認として扱う。"
                "coverage.complete が false のとき（時間切れ・件数の上限・文書探索の打ち切り・カード数の上限）は、近傍が空でも"
                "「近傍なし」とは言えない＝未確認（理由は coverage.limits[].kind）。"
                "unresolved は、この名前を参照しているのに接続先を決められなかった箇所（曖昧・未解決）の一覧＝"
                "接続が確認できていない参照として原本で確かめる（available が false なら申告を保存していない旧グラフ。candidates が null は 0 ではなく候補数を数えられなかった）。"
                "これは関連の近傍用（無向・言及を含む）。**変更の影響先を調べるときは graph_resolve で起点を選び graph_impact を使う**"
                "（構造の依存だけを矢印の逆向きにたどり、同名の別ノードを混ぜない）。"
+               "名前に当てはまる起点が多すぎる（既定 50 件超）ときは、関係をたどらずに too_broad（anchors＝起点の件数・"
+               "by_folder＝トップフォルダごと・by_kind＝種類ごとの件数）を返し、coverage に narrow_required が付く"
+               "＝近傍が空でも「近傍なし」ではない。**広すぎると返されたら、by_folder・by_kind を見て path_prefix（フォルダ）か kind（種類）で絞って聞き直す**。"
                "unverified は裏付け資料を確認できず一覧から除いたカード数（cards）・資料名を伏せた辺の数（edges）、"
                "excluded.data_items は粒度が細かすぎるため一覧に含めない DataItem の数、"
                "coverage.depth はたどる深さの上限（truncated が null は先に辺が残るか未判定）。"
                f"{_ITEM_PARAM_NOTE}")
 _PARAMS_GRAPH = {"type": "object", "properties": {
     "name": {"type": "string", "description": "関連をたどる起点の名前（プログラム名/データ項目名など・具体名）"},
+    "path_prefix": {"type": "string",
+                    "description": "フォルダで絞る（rel_path の先頭一致・例: '4期保守'）。選んだ範囲の内側だけを狭められ、範囲は広がらない。省略可"},
+    "kind": {"type": "string", "description": "起点を種類で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config／Dataset／Executable）。省略可"},
+    "offset": {"type": "integer",
+              "description": "近傍の開始位置（既定0）。truncated:true で next_offset が付いたときは、その値をそのまま渡すと続きが取れる"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["name"]}
 _DESC_GRAPH_RESOLVE = ("関係グラフから、名前（の一部）・種別・所属パス（の一部）に合う**起点の候補**を並べる。"
@@ -229,17 +263,19 @@ _DESC_GRAPH_RESOLVE = ("関係グラフから、名前（の一部）・種別�
                        "match（exact＝名前が一致／partial＝部分一致）を持つ。"
                        "影響を調べる前に、候補の path などから正しい起点を選び、その canonical_id を graph_impact へ渡す"
                        "（候補が複数あって選べないときは、ユーザーに ask_user で確認してよい）。"
-                       "候補が limit より多いときは count（総数）と coverage（complete:false・limits[].kind=result_cap・omitted）が付く"
-                       "＝path や kind で絞って呼び直す。coverage.complete が false のとき、候補が空でも「該当なし」とは言えない"
+                       "候補が limit より多いときは count が null（limit+1 件までしか取らないので総数は分からない）で、coverage（complete:false・limits[].kind=result_cap）が付く"
+                       "＝path・kind・path_prefix（フォルダ）で絞って呼び直す。coverage.complete が false のとき、候補が空でも「該当なし」とは言えない"
                        "（理由は coverage.limits[].kind）。"
                        f"{_ITEM_PARAM_NOTE}")
 _PARAMS_GRAPH_RESOLVE = {"type": "object", "properties": {
     "name": {"type": "string", "description": "名前の一部（大文字小文字を区別しない・修飾名も対象）。name と path のどちらかは必須"},
-    "kind": {"type": "string", "description": "種別で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config／Dataset）"},
+    "kind": {"type": "string", "description": "種別で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config／Dataset／Executable）"},
     "path": {"type": "string", "description": "所属パスの一部で絞る（例: 'billing/'）"},
     "limit": {"type": "integer", "description": "返す候補の最大数（既定 20・最大 50）"},
+    "path_prefix": {"type": "string",
+                    "description": "フォルダで絞る（rel_path の先頭一致・例: '4期保守'）。選んだ範囲の内側だけを狭められ、範囲は広がらない。省略可"},
     "item": _ITEM_PARAM_SCHEMA}}
-_DESC_GRAPH_IMPACT = ("**起点の canonical_id**（graph_resolve で選んだもの）から、構造の依存（COPIES／CONTAINS／INVOKES／ACCESSES）だけを"
+_DESC_GRAPH_IMPACT = ("**起点の canonical_id**（graph_resolve で選んだもの）から、構造の依存（COPIES／CONTAINS／INVOKES／ACCESSES／BUILT_FROM）だけを"
                       "矢印の逆向きにたどり、起点を変えたときに影響を受ける部品（影響先）を返す。名前は受け取らない"
                       "（同名の別ノードを混ぜないため）。各影響先は canonical_id・kind・path・distance（起点からの段数）・"
                       "trace（影響先から起点までのノード名）・route（辺ごとの種類 type と向き from→to・参照元の資料 doc と行 line）を持つ。"
@@ -273,7 +309,7 @@ _DESC_GRAPH_IMPACT = ("**起点の canonical_id**（graph_resolve で選んだ�
                       "coverage.depth.truncated が true）、transfer.complete＝探索した結果を最後まで受け取れたか。"
                       "探索が終わっていても続きのページが残っていれば transfer.complete は false、最後のページで true になる。"
                       "exploration.complete が false のときは影響先が空でも「影響なし」とは言えない＝未確認。"
-                      "depth を上げて呼び直すか、範囲を未確認と明記する。"
+                      "depth を上げて呼び直すか、範囲を未確認と明記する。時間切れ・件数の天井で届ききらないときは path_prefix（フォルダ）で範囲を狭めて呼び直せる。"
                       f"{_ITEM_PARAM_NOTE}")
 _PARAMS_GRAPH_IMPACT = {"type": "object", "properties": {
     "canonical_id": {"type": "string", "description": "起点の識別子（graph_resolve の candidates[].canonical_id）"},
@@ -285,6 +321,8 @@ _PARAMS_GRAPH_IMPACT = {"type": "object", "properties": {
     "generation": {"type": "string", "description": "続きの呼び出しで、前の応答の generation をそのまま渡す（取り込みの世代と条件の確認用）"},
     "evidence_limit": {"type": "integer", "description": "辺ごとに返す根拠（sources）の最大件数（既定 3・0〜10）。0 にすると trace・route・evidence の無い軽い一覧（via＝辺の種類の列だけ）になり、1 ページに多く入る。一覧は 0 で取り、根拠が要る対象だけ上げる"},
     "flow_depth": {"type": "integer", "description": "データの流れの候補をたどる段数（既定 3・最大 10・0 でたどらない）。候補は flow_candidates に別に返る"},
+    "path_prefix": {"type": "string",
+                    "description": "フォルダで絞る（rel_path の先頭一致・例: '4期保守'）。選んだ範囲の内側だけを狭められ、範囲は広がらない。省略可"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["canonical_id"]}
 _PARAMS_GLOB = {"type": "object", "properties": {
@@ -292,12 +330,21 @@ _PARAMS_GLOB = {"type": "object", "properties": {
                "description": ("ファイル名/パスのワイルドカードパターン。`*`/`?`/`[seq]` は1階層内のみ・"
                                "`**` は複数階層をまたぐ。スラッシュを含まなければファイル名として"
                                "どの階層でも探す（例: '*.jcl'・'*請求書*.xlsx'・'**/障害対応/*.md'）")},
+    "offset": {"type": "integer", "description": "続きの位置（既定 0）。前の応答の next_offset をそのまま渡す"},
+    "generation": {"type": "string", "description": "続き（offset が 1 以上）の呼び出しで、前の応答の generation をそのまま渡す（一覧が入れ替わっていないことの確認用）"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["pattern"]}
 _DESC_GLOB = ("ファイル名・フォルダ名のパターンで対象範囲内のファイルを列挙する（中身は読まない・パスのみ）。"
-             "大文字小文字は区別しない。該当パス一覧と総件数を返す（上限200件・超過分は打ち切り＝truncated:true。"
-             "続きは取れないので、その範囲は未確認として扱い count との差を全件と断定しない）。"
-             "『x/**』は x 自体にも一致する（配下だけに絞るなら『x/**/*』）。")
+             "大文字小文字は区別しない。該当パス一覧と総件数（count）を返す（1 ページ 200 件・パスの昇順。"
+             "残りがあれば truncated:true と next_offset が付く。**next_offset が null でないときは、同じ pattern に offset=next_offset と"
+             "応答の generation を付けて呼び直し**、next_offset が null になるまで続ける。続きを取るまでは一覧が途中であることを前提にし、"
+             "先頭のページだけで全件とは言わない）。generation が無いときは glob_generation_required、違うときは glob_generation_mismatch のエラーになる"
+             "（mismatch は資料が入れ替わった印＝generation を付けずに offset 0 から取り直す。required は generation を付けて呼び直す）。"
+             "『x/**』は x 自体にも一致する（配下だけに絞るなら『x/**/*』）。"
+             "結果に ledger_at が付いていれば、最後に資料の状態を更新した時点の一覧（以降に変えた資料は含まない）。"
+             "付いていない（generation が walk）ときは資料フォルダを歩いた一覧で、ページの間で一覧が変わることがある（notice）。"
+             "結果に partial_paths と partial_notice が付くときは、その資料は名前で見つかり開けるが意味の索引と資料どうしの関係には入っていない。"
+             "結果に kind_unknown（種類が分からない資料の件数。ページ内でなく全一致の件数）が付くときは、層の絞り込みの件数は確定しない（層が分からない資料はどの層にも含めている）——中身で確かめる。")
 # grep と同格の素朴な決定的ツール。2 文書の RAG 正本（.rag.md）の unified diff を返すだけで、レコード同定・業務キー対応付け・要約は呼び出し元の LLM が diff を読んで行う。
 _DESC_COMPARE = ("2つの文書のRAG正本（.rag.md）を突き合わせ、追加/削除/変更行の unified diff を返す"
                  "（grepと同格の決定的な文字列比較——要約や業務レコードの対応付けはしない・"
@@ -329,9 +376,10 @@ _PARAMS_XLSX_SHEETS = {"type": "object", "properties": {
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _DESC_XLSX_RANGE = ("Excel（.xlsx）原本のセル範囲を表で返す（原本を直接読む・派生ではない）。"
-                    "range 省略時は先頭から max_rows×max_cols（既定200行×50列）。逆順の範囲は正規化し、行・列が 0 の範囲は拒否する。"
+                    "range 省略時は先頭から max_rows×max_cols（既定200行×50列・指定は5000行×1000列まで）。逆順の範囲は正規化し、行・列が 0 の範囲は拒否する。"
                     "範囲が上限を超えたら切り詰めて truncated:true（range は実際に返した範囲）。応答の大きさにも上限があり、超えると byte_clipped:true で行が減る"
                     "（1行が大きいときは先頭の列だけ返して cols_clipped:true・それも入らなければエラー＝列を絞った range で読む）。"
+                    "どの切り詰めでも、続きは next_range（返した範囲の下の行）・next_cols_range（右の列）をそのまま range に渡して読む（全部返したときは付かない）。"
                     "セル値は書き換えない（cells_clipped は Excel の 1 セル上限を超えて切った件数・size_clipped は返却量の上限で行を打ち切った）。"
                     "値は保存された値。表示が値と違うセル（割合・日付・千円表示等）は display（セル→表示値）、表示値を作れない書式は display_format（書式コード）で返す"
                     "（display_clipped は載せきれなかった件数）。非表示の行・列は hidden_rows（行番号）・hidden_cols（列名）、結合セルは merged（値は左上のセルだけ）。"
@@ -342,8 +390,8 @@ _PARAMS_XLSX_RANGE = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .xlsx）"},
     "sheet": {"type": "string", "description": "シート名（xlsx_sheets が返す name）"},
     "range": {"type": "string", "description": "セル範囲（A1形式・例 'B3:D10'）。省略可＝先頭から既定サイズ"},
-    "max_rows": {"type": "integer", "description": "返す最大行数（既定200）"},
-    "max_cols": {"type": "integer", "description": "返す最大列数（既定50）"},
+    "max_rows": {"type": "integer", "description": "返す最大行数（既定200・上限5000）"},
+    "max_cols": {"type": "integer", "description": "返す最大列数（既定50・上限1000）"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id", "sheet"]}
 _DESC_DOCX_PARAGRAPHS = ("Word（.docx）原本の段落と表を返す（原本を直接読む・派生ではない）。"

@@ -118,9 +118,9 @@ def test_healthdot_polling_pauses_when_hidden_and_resumes_once_visible(page, web
 def test_topbar_nav_collapses_overflow_into_more_menu(page, web_base_url):
     """横幅に収まらないタブは右端の「その他 ▾」に畳む。<a> は移動するだけ（複製しない）＝href／現在ページの強調はそのまま。
     広げれば元のリストへ戻る。畳まれたタブはメニューから普通のリンクとして辿れる。"""
-    install_api_mocks(page)                       # 既定=admin＝タブ 8 本（一般 5＋管理 3）
+    install_api_mocks(page)                       # 既定=admin＝タブ 7 本（一般 5＋管理 2）
     page.set_viewport_size({"width": 800, "height": 720})
-    page.goto(f"{web_base_url}/graph.html")
+    page.goto(f"{web_base_url}/ingest.html")
 
     more = page.locator("#navmore")
     menu = page.locator("#navmenu")
@@ -131,7 +131,7 @@ def test_topbar_nav_collapses_overflow_into_more_menu(page, web_base_url):
     expect(page.locator('#navlist a[href="admin-settings.html"]')).to_have_count(0)
     expect(page.locator('.nav a[href="admin-settings.html"]')).to_have_count(1)
     expect(page.locator('#navlist a[href="home.html"]')).to_be_visible()   # 800px なら先頭は残る
-    expect(page.locator('#navmenu a[href="graph.html"]')).to_have_count(1)
+    expect(page.locator('#navmenu a[href="ingest.html"]')).to_have_count(1)
     expect(more).to_have_class(re.compile(r"\bon\b"))   # 現在ページが畳まれている間はボタン側を強調
     assert page.evaluate(
         "() => { const l = document.getElementById('navlist'); return l.scrollWidth <= l.clientWidth; }"
@@ -140,9 +140,9 @@ def test_topbar_nav_collapses_overflow_into_more_menu(page, web_base_url):
     more.click()
     expect(menu).to_be_visible()
     expect(more).to_have_attribute("aria-expanded", "true")
-    graph_item = page.locator('#navmenu a[href="graph.html"]')
-    expect(graph_item).to_be_visible()
-    expect(graph_item).to_have_class(re.compile(r"\bon\b"))
+    current_item = page.locator('#navmenu a[href="ingest.html"]')
+    expect(current_item).to_be_visible()
+    expect(current_item).to_have_class(re.compile(r"\bon\b"))
     box = menu.bounding_box()
     assert box["x"] >= 0 and box["x"] + box["width"] <= 800   # 画面内に収まる
 
@@ -159,7 +159,7 @@ def test_topbar_nav_collapses_overflow_into_more_menu(page, web_base_url):
     # 極端に狭くても「その他 ▾」自体は切れず、全タブがメニュー側へ移る
     page.set_viewport_size({"width": 320, "height": 720})
     expect(page.locator("#navlist a")).to_have_count(0)
-    expect(page.locator("#navmenu a")).to_have_count(8)
+    expect(page.locator("#navmenu a")).to_have_count(7)
     assert page.evaluate(
         "() => { const l = document.getElementById('navlist').getBoundingClientRect();"
         " const b = document.getElementById('navmore').getBoundingClientRect();"
@@ -169,9 +169,9 @@ def test_topbar_nav_collapses_overflow_into_more_menu(page, web_base_url):
     page.set_viewport_size({"width": 1366, "height": 900})   # 広げると全部リストへ戻る
     expect(more).to_be_hidden()
     expect(page.locator("#navmenu a")).to_have_count(0)
-    graph_tab = page.locator('#navlist a[href="graph.html"]')
-    expect(graph_tab).to_be_visible()
-    expect(graph_tab).to_have_class(re.compile(r"\bon\b"))
+    current_tab = page.locator('#navlist a[href="ingest.html"]')
+    expect(current_tab).to_be_visible()
+    expect(current_tab).to_have_class(re.compile(r"\bon\b"))
     expect(page.locator('#navlist a[href="admin-settings.html"]')).to_be_visible()
 
     page.set_viewport_size({"width": 800, "height": 720})   # 畳まれたタブはメニューから普通のリンクとして辿れる
@@ -201,5 +201,5 @@ def test_topbar_late_links_keep_order_when_already_folded(page, web_base_url):
     )
     assert hrefs == [
         "home.html", "chat.html", "manual.html", "settings.html",
-        "workspace.html", "ingest.html", "graph.html", "admin-settings.html",
+        "workspace.html", "ingest.html", "admin-settings.html",
     ]

@@ -251,7 +251,7 @@ command -v docker >/dev/null 2>&1 || { fail "docker が見つかりません（�
   [ -n "$IMAGE" ] || { fail "tar を実行するための既知の docker イメージがありません"; exit 1; }
 fi
 
-echo "=== Sherpa 復元 ==="
+echo "=== Slouch 復元 ==="
 echo "元:            ${SRC}（$(manifest_get version) / $(manifest_get created) / $(manifest_get host)）"
 echo "プロジェクト:  $PROJECT"
 for f in "${VOL_TARS[@]}"; do

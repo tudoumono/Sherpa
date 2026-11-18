@@ -15,7 +15,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Json
 
-from .db import _connect, _ensure
+from .db import _connect, _connect_bounded, _ensure, _ensure_unless_bounded
 
 
 _SHA256_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
@@ -327,6 +327,27 @@ def fail_refresh_run(
         ).fetchone()
 
 
+def pause_refresh_run(
+    run_id: int,
+    lease_token: str,
+    *,
+    error_code: str,
+    error_detail: str | None = None,
+) -> dict[str, Any] | None:
+    """停止（切・ワーカー停止）でrunをqueuedへ戻す。leaseで増えたattemptsを戻し、cursorは保つ。"""
+    if not error_code.strip():
+        raise ValueError("refresh error_code is required")
+    _ensure()
+    with _connect() as connection:
+        return connection.execute(
+            "UPDATE ocr_refresh_runs SET status='queued', attempts=GREATEST(attempts-1, 0), "
+            "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, error_code=%s, error_detail=%s, "
+            "updated_at=now(), finished_at=NULL "
+            "WHERE id=%s AND status='leased' AND lease_token=%s RETURNING *",
+            (error_code.strip(), error_detail, run_id, lease_token),
+        ).fetchone()
+
+
 def mark_refresh_run_stale(run_id: int, lease_token: str) -> dict[str, Any] | None:
     _ensure()
     with _connect() as connection:
@@ -555,6 +576,34 @@ def status_summary(world: str, canonical_generation_id: str | None = None) -> di
         "targets", "processed", "cached", "empty", "failed", "pending",
     )}
     return {**summary, "counts": counts, "total": sum(counts.values()), "updated_at": last["updated_at"] if last else None}
+
+
+def get_progress_counts(
+    world: str,
+    canonical_generation_id: str | None = None,
+    *,
+    connect_timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> dict[str, int]:
+    """状態コマンド専用。`pending`（queued/leased）・`processed`（succeeded）・`failed`・`unpublished`（succeeded で未公開）を1回の集計で返す。
+    世代を渡さないときは world 全体の件数で、`unpublished` は 0。プールを使わない専用接続で読み、サーバー側の `statement_timeout` で打ち切る。
+    """
+    where = "world=%s"
+    params: list[Any] = [_world_id(world)]
+    unpublished = "0"
+    if canonical_generation_id is not None:
+        where += " AND canonical_generation_id=%s"
+        params.append(_generation_id(canonical_generation_id))
+        unpublished = "count(*) FILTER (WHERE status='succeeded' AND artifact_published=false)"
+    _ensure_unless_bounded(connect_timeout, statement_timeout_ms)
+    with _connect_bounded(connect_timeout, statement_timeout_ms) as connection:
+        row = connection.execute(
+            "SELECT count(*) FILTER (WHERE status IN ('queued','leased')) AS pending, "
+            "count(*) FILTER (WHERE status='succeeded') AS processed, "
+            "count(*) FILTER (WHERE status='failed') AS failed, "
+            f"{unpublished} AS unpublished FROM ocr_jobs WHERE {where}", params,
+        ).fetchone()
+    return {name: int(row[name]) for name in ("pending", "processed", "failed", "unpublished")}
 
 
 def iter_succeeded_results(

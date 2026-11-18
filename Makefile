@@ -1,7 +1,7 @@
 # Sherpa MVP — 起動・運用タスク
 #
 # `make` だけを打つと、下の一覧（help）が出ます。
-.PHONY: help embed-cache-migrate hooks dev-setup start stop restart restart-web restart-worker status check-ports up down ps logs l bootstrap install-docker ocr-models \
+.PHONY: help embed-cache-migrate hooks dev-setup start stop restart restart-web restart-worker status ingest-status check-ports up down ps logs l bootstrap install-docker ocr-models \
         api serve ingest-worker prod-check verify-kit verify-extension dist package-full package-app nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e \
         test-db-reset screenshots backup restore usage-backfill trace azure-smoke codex-compat doctor sandbox-check \
@@ -54,13 +54,13 @@ dev-setup:         ## 新しい貢献者向け: venv＋開発依存＋git フッ
 
 ifeq ($(LOGS_WORDS),)
 help:             ## このコマンド一覧を表示
-	@echo "Sherpa — make の使い方"
+	@echo "Slouch — make の使い方"
 	@echo
 	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) \
 		| sed -E 's/^([a-zA-Z0-9_-]+):[^#]*## /  \1|/' \
 		| awk -F'|' '{printf "  %-18s %s\n", $$1, $$2}'
 	@echo
-	@echo "  よく使う順: make start → make status → make stop"
+	@echo "  よく使う順: make start → make status → make ingest-status → make stop"
 endif
 
 start:            ## 利用者向け: 依存/ストア/アプリを一括起動（LAN=1 で LAN 公開・MODE=dev で開発モード）
@@ -73,16 +73,19 @@ restart:          ## 利用者向け: アプリ・取り込みワーカー（＋
 	KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
 	LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
-restart-web:      ## 利用者向け: アプリ（Web）だけ再起動（取り込みワーカーは止めない＝取り込みは続く。版を変えたときは make restart で両方）
+restart-web:      ## 利用者向け: アプリ（Web）だけ再起動（取り込みワーカーは止めない＝取り込みは続く。動いているストアは作り直さない。版を変えたときは make restart で両方）
 	STOP_ONLY=app KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
-	LAN="$(LAN)" ./scripts/start.sh $(MODE)
+	SHERPA_KEEP_RUNNING_STORES=1 LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
 restart-worker:   ## 利用者向け: 取り込みワーカーだけ再起動（アプリは止めない。処理中の 1 件の完了を待つ。FORCE=1 で待たずに強制終了）
 	STOP_ONLY=worker KEEP_STORES=1 FORCE="$(FORCE)" ./scripts/stop.sh || true
 	LAN="$(LAN)" ./scripts/start.sh $(MODE)
 
-status:           ## 利用者向け: 一枚看板の状態表示（ストア/アプリ/Caddy/URL）
+status:           ## 利用者向け: サーバーの状態（ストア/アプリ/ワーカー/Caddy/OCR/メモリ）
 	./scripts/status.sh
+
+ingest-status:    ## 利用者向け: 資料フォルダごとの取り込みと画像内文字の読み取りの状態
+	./scripts/ingest_status.sh
 
 check-ports:      ## ポートの整合（compose 公開⇔アプリ接続先）と占有（他プロセス）を検査
 	./scripts/check-ports.sh

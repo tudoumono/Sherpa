@@ -283,7 +283,7 @@ def _capture_execution_provider(monkeypatch, endpoint, captured):
             self.turn_id = turn_id
             self.conversation_id = conversation_id
 
-    def _fake_start_turn(uid, conversation_factory, run_fn_factory, known_conversation_id=None):
+    def _fake_start_turn(uid, conversation_factory, run_fn_factory, known_conversation_id=None, scope_paths=None):
         return _Rec(turn_id="fake-turn-id", conversation_id=conversation_factory())
 
     monkeypatch.setattr(chat_router_mod, "_turn_run_fn", _fake_turn_run_fn)

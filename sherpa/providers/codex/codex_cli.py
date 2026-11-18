@@ -241,7 +241,7 @@ def write_run_files(self, ctx, st):
             codex_home, _kb_read_roots(ctx.world), _reason,
             True, ctx.world, sp, self._web_search, _ask_disabled,
             ollama_base_url=self._ollama_base_url, system_settings=self._system_settings,
-            layer=_layer, direct_read_roots=_direct_roots, sensitive_deny=_sensitive_deny,
+            layer=_layer, direct_read_roots=_direct_roots, sensitive_deny=_sensitive_deny, rules=st._rules,
             sidecar_path=str(_sidecar_path),
             deny_roots=_deny_roots,
             multi_agent=st._multi_agent_enabled, orchestrator_model=self.model,
@@ -352,6 +352,21 @@ def resolve_reasoning(self, ctx, st, decision):
     st._review_rounds, st._review_rounds_escalation = _review_rounds, _review_rounds_escalation
 
 
+def sandboxed_exec_argv(*, last_message_path, run_dir, model: str, reasoning: str,
+                        multi_agent: bool, ephemeral: bool) -> list:
+    """サンドボックス有効の `codex exec` の共通の引数（本物のターンと「つながりの確認」の Codex が同じ並びで使う）。
+    `multi_agent` は管理者環境の既定値に依存させず明示する（無効でも false を書く）。
+    """
+    argv = ["codex", "exec", "--json", "--strict-config", "--skip-git-repo-check",
+            "-o", str(last_message_path),
+            "-C", str(run_dir), "-m", model,
+            "-c", f"model_reasoning_effort={reasoning}"]
+    argv += ["-c", f"features.multi_agent={'true' if multi_agent else 'false'}"]
+    if ephemeral:
+        argv.append("--ephemeral")
+    return argv
+
+
 def build_launch(self, ctx, st):
     """`codex exec` の起動引数・環境変数・`-o` の出力先・サイドカーの置き場・出力スキーマを決めて `st` へ置く。"""
     _plain = st._plain
@@ -412,14 +427,9 @@ def build_launch(self, ctx, st):
         # 道具の呼び出しの記録の置き場。サンドボックスのシェルから書けない codex_home の中（ターンごとの名前・終わりに消す）。
         st._call_log_dir = codex_home / f"toolcalls-{st.turn_uid}"
         _mcp_budget_env[tool_call_log.ENV_DIR] = str(st._call_log_dir)
-        argv_base = ["codex", "exec", "--json", "--strict-config", "--skip-git-repo-check",
-                    "-o", str(_last_message_path),
-                    "-C", str(run_dir), "-m", self.model,
-                    "-c", f"model_reasoning_effort={_reason}"]
-        # 管理者環境の既定値に依存させず明示指定する。無効時（`codex_worker_model` 未設定の独自エンドポイント等）も明示的に false にする（`[agents.*]` の層が無いまま機能だけ有効になるのを防ぐ）。
-        argv_base += ["-c", f"features.multi_agent={'true' if st._multi_agent_enabled else 'false'}"]
-        if not st._session_persistence_enabled:
-            argv_base.append("--ephemeral")
+        argv_base = sandboxed_exec_argv(
+            last_message_path=_last_message_path, run_dir=run_dir, model=self.model, reasoning=_reason,
+            multi_agent=st._multi_agent_enabled, ephemeral=not st._session_persistence_enabled)
         # `self._openai_api_key` は Codex(OpenAI) 構成で接続先が Azure 等の時だけ `_select_provider` が渡す（それ以外は常に None＝env に渡さない）。
         popen_env = _codex_clean_env(codex_home, _tmp, openai_api_key=self._openai_api_key)
     else:
@@ -440,8 +450,8 @@ def build_launch(self, ctx, st):
         st._call_log_dir = _tmp / "toolcalls"
         _mcp_budget_env[tool_call_log.ENV_DIR] = os.path.realpath(st._call_log_dir)
         argv_base += _mcp_config_args(ctx.world, sp, _ask_disabled, layer=_layer,
-                                      extra_env={**_mcp_budget_env, **_sidecar_env})
-        popen_env = {**os.environ, **_mcp_env(ctx.world, sp, _ask_disabled, layer=_layer),
+                                      extra_env={**_mcp_budget_env, **_sidecar_env}, rules=st._rules)
+        popen_env = {**os.environ, **_mcp_env(ctx.world, sp, _ask_disabled, layer=_layer, rules=st._rules),
                     **_mcp_budget_env, **_sidecar_env}
         # `.tmp/` は run_dir 生成のたびに空から始まるため、前ターン残骸の事前 unlink は不要。ここで吸収を許可してよい。
         st._sidecar_init_ok = True

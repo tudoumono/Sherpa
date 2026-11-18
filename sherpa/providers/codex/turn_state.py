@@ -73,7 +73,7 @@ class CodexTurnState:
         "_agent_msgs", "_agent_partial", "_latest_structured", "_structured_answers",
         "_structured_answers_valid_from", "sp", "_layer", "ws_files", "_before_ws_files",
         "_reason", "_usage_depth_extra", "_review_rounds", "_review_rounds_escalation",
-        "_direct_roots", "_deny_roots", "_sensitive_deny", "_direct_read_ok", "_tmp", "prompt", "prompt_with_history",
+        "_direct_roots", "_deny_roots", "_sensitive_deny", "_rules", "_direct_read_ok", "_tmp", "prompt", "prompt_with_history",
         "_last_message_path", "_mcp_budget_env", "codex_home", "_sidecar_path", "argv_base", "popen_env",
         "_schema_on", "_schema_v2", "_schema_level_effective", "_codex_run_started_at", "_turn_started_wall",
         "_activity_settings",
@@ -253,6 +253,7 @@ class CodexTurnState:
         self._direct_roots = None
         self._deny_roots = None
         self._sensitive_deny = None
+        self._rules = None  # 依頼の準備で読んだ管理者の除外の規則（読めなかったときは None）
         self._direct_read_ok = False
         self._tmp = None
         self.prompt = None

@@ -6,6 +6,7 @@ Office／PDF は `{rel}.rag.md`（RAG 正本）をアンカー分割した本文
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -21,7 +22,7 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from . import corpus_docs, doc_text, embeddings, json_io, scope_infer, worlds
+from . import corpus_docs, doc_text, embeddings, json_io, path_rules, scope_infer, worlds
 from . import layer as layer_mod
 from . import scope as scope_mod
 from .env_int import env_int
@@ -67,9 +68,17 @@ _ES_COMPACT_SETTLE_SEC = 35         # flush の後、ES が写しを捨ててよ
 _ES_COMPACT_TIMEOUT_SEC = 1800      # forcemerge の終わりを待つ上限（過ぎたら待たずに先へ進む）
 _ES_COMPACT_POLL_SEC = 5
 
-# 重要度スコアブースト: `高`／`低` の function_score 係数。`中`／未設定は等倍で、重要度制御ファイルの無い資料フォルダはスコア不変
-_ES_IMPORTANCE_BOOST_HIGH = 1.2
-_ES_IMPORTANCE_BOOST_LOW = 0.85
+
+
+# 検索の質問の埋め込みの総期限（秒）。env `SHERPA_SEARCH_EMBED_TIMEOUT_SEC`（1〜120・不正は既定）。過ぎたら BM25 だけで続ける（`query_embed_failed`）。取り込みの埋め込みの再送は変えない
+_SEARCH_EMBED_TIMEOUT_DEFAULT = 10.0
+_SEARCH_EMBED_TIMEOUT_MIN = 1.0
+_SEARCH_EMBED_TIMEOUT_MAX = 120.0
+
+# BM25 の対象欄と重み。本文 `text` が最も重く、見出し系（`labels`＝項目名など・`region_context`＝見出し・シート名）は控えめに足す。`tie_breaker` は複数欄に当たった文書をわずかに押し上げる
+_BM25_FIELDS = ("text", "labels", "region_context")
+_BM25_FIELD_BOOSTS = {"text": 1.0, "labels": 0.3, "region_context": 0.3}
+_BM25_TIE_BREAKER = 0.1
 
 
 # `search()` のハイブリッドにおける BM25(keyword) 対 kNN(vector) の配分（0.0＝vector 寄り〜1.0＝keyword 寄り・0.5＝boost キーを書かない）
@@ -2441,6 +2450,51 @@ def fill_missing_vectors(world: str, settings: dict | None = None) -> dict:
     return {"available": True, "filled": filled, "missing": count_missing_vectors(world)}
 
 
+def _search_embed_timeout_s() -> float:
+    """検索の質問の埋め込みの総期限（秒）。env `SHERPA_SEARCH_EMBED_TIMEOUT_SEC` が範囲外・数値でなければ既定。"""
+    raw = os.environ.get("SHERPA_SEARCH_EMBED_TIMEOUT_SEC", "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return _SEARCH_EMBED_TIMEOUT_DEFAULT
+    return v if _SEARCH_EMBED_TIMEOUT_MIN <= v <= _SEARCH_EMBED_TIMEOUT_MAX else _SEARCH_EMBED_TIMEOUT_DEFAULT
+
+
+# 優先の検索（`_prioritized`）が、優先・通常の 2 本の問い合わせで同じ質問の埋め込みを 1 回で済ませるための入れ物（外側が立てる）
+_QV_MEMO: contextvars.ContextVar = contextvars.ContextVar("es_index_query_embedding_memo", default=None)
+
+
+def _embed_query(q: str, ec: dict, world: str):
+    """検索の質問 1 件の埋め込み。総期限（`_search_embed_timeout_s`）内に取れなければ None。`_prioritized` の中では同じ質問を 1 回しか埋め込まない。"""
+    memo = _QV_MEMO.get()
+    key = (q, world, ec.get("provider"), ec.get("model"))
+    if memo is not None and key in memo:
+        return memo[key]
+    qv = embeddings.embed([q], ec, world=world, deadline_s=_search_embed_timeout_s())
+    if memo is not None:
+        memo[key] = qv
+    return qv
+
+
+def _keyword_clause(q: str) -> dict:
+    """本文＋見出し系の欄を引く BM25 の節（本文が最も重い）。"""
+    return {"multi_match": {"query": q, "type": "best_fields", "tie_breaker": _BM25_TIE_BREAKER,
+                            "fields": [f"{f}^{_BM25_FIELD_BOOSTS[f]}" for f in _BM25_FIELDS]}}
+
+
+def _keyword_highlight() -> dict:
+    """当たった欄を知るためのハイライト（一致した欄だけが応答に出る）。"""
+    return {"fields": {f: {"fragment_size": 240 if f == "text" else 120, "number_of_fragments": 1}
+                       for f in _BM25_FIELDS}}
+
+
+def _matched_fields(highlight) -> list:
+    """ハイライトの応答から、語が当たった欄を `_BM25_FIELDS` の順で返す。"""
+    if not isinstance(highlight, dict):
+        return []
+    return [f for f in _BM25_FIELDS if highlight.get(f)]
+
+
 def _mark_keyword_all(hits: list) -> list:
     for h in hits:
         h["keyword_match"] = True
@@ -2470,47 +2524,18 @@ def _parse_hits(res: dict, vector: bool = False) -> list:
         frag = (h.get("highlight", {}).get("text") or [full])[0]
         hit = {"doc_id": src.get("doc_id"), "line": src.get("line"),
                "text": frag, "score": h.get("_score"), "ext": src.get("ext")}
-        # 抽出来歴・rag_chunks 由来メタ・重要度を表示用にそのまま渡す（無ければ付けない）。`parent_id` は親返しが読む。`importance_source` は出典には出さないので含めない
+        if h.get("highlight", {}).get("text"):
+            hit["highlight_fragment"] = True  # text は原本の行に合わない断片
+        matched = _matched_fields(h.get("highlight"))
+        if matched:
+            hit["matched_fields"] = matched  # 語が当たった欄（text／labels／region_context）
+        # 抽出来歴・rag_chunks 由来メタを表示用にそのまま渡す（無ければ付けない）。`parent_id` は親返しが読む
         for k in ("extraction_method", "confidence", "has_conflicts", "chunk_id", "locator",
-                  "previous_chunk_id", "next_chunk_id", "parent_id", "logical_record_id", "section_path",
-                  "importance", "importance_reason"):
+                  "previous_chunk_id", "next_chunk_id", "parent_id", "logical_record_id", "section_path"):
             if src.get(k) is not None:
                 hit[k] = src[k]
         out.append(_as_row_group_hit(hit, src) if vector else hit)
     return out
-
-
-def _importance_boost_query(bool_query: dict) -> dict:
-    """`bool_query`（`{"bool": {...}}`）を function_score で包み、`importance` に応じてスコアを乗算する（`高`＝`_ES_IMPORTANCE_BOOST_HIGH` 倍・`低`＝`_ES_IMPORTANCE_BOOST_LOW` 倍）。
-    `importance` を持たない文書（`中`／未設定・重要度制御ファイルの無い資料フォルダ）はどちらの filter にも一致せず 1 倍＝スコア不変。`score_mode="first"`（`importance` は単一値）・`boost_mode="multiply"`。
-    """
-    return {"function_score": {
-        "query": bool_query,
-        "functions": [
-            {"filter": {"term": {"importance": "高"}}, "weight": _ES_IMPORTANCE_BOOST_HIGH},
-            {"filter": {"term": {"importance": "低"}}, "weight": _ES_IMPORTANCE_BOOST_LOW},
-        ],
-        "score_mode": "first", "boost_mode": "multiply",
-    }}
-
-
-def _importance_score_multiplier(v) -> float:
-    if v == "高":
-        return _ES_IMPORTANCE_BOOST_HIGH
-    if v == "低":
-        return _ES_IMPORTANCE_BOOST_LOW
-    return 1.0
-
-
-def _rerank_knn_by_importance(hits: list) -> list:
-    """純 kNN（`search_knn_only`）専用の取得後の再ランク。`knn` 節は function_score で包めないため、返ってきたスコアへ `_importance_boost_query` と同じ乗数を Python 側で掛け、安定ソートで並べ直す。
-    `importance` の無いヒット（重要度制御ファイルの無い資料フォルダ）は乗数 1.0 のままでスコア・順序とも不変。
-    """
-    for h in hits:
-        if h.get("score") is not None:
-            h["score"] = h["score"] * _importance_score_multiplier(h.get("importance"))
-    hits.sort(key=lambda h: -(h.get("score") or 0.0))
-    return hits
 
 
 def _classify_query_exception(exc: Exception) -> str:
@@ -2553,22 +2578,25 @@ def _fuse_hybrid(bm25_res: dict, knn_res: dict, k: int) -> list:
 
 
 def _mark_keyword_matches(world: str, query: str, hits: list) -> list:
-    """融合の結果のうち BM25 の上位に出なかったヒットについて、語が一致するか（`match` に当たるか）を ES に問い合わせて `keyword_match` を付け直す。
+    """融合の結果のうち BM25 の上位に出なかったヒットについて、語が一致するか（本文・見出し系の欄のどれかに当たるか）を ES に問い合わせて `keyword_match`・`matched_fields` を付け直す。
     問い合わせに失敗したら付け直さない（False のまま）。
     """
     es_ids = {id(h): h.pop("_es_id", None) for h in hits}
     ids = [es_ids[id(h)] for h in hits if not h.get("keyword_match") and es_ids[id(h)]]
     if not ids:
         return hits
-    body = {"size": len(ids), "_source": False,
-            "query": {"bool": {"filter": [{"ids": {"values": ids}}], "must": [{"match": {"text": query}}]}}}
+    body = {"size": len(ids), "_source": False, "highlight": _keyword_highlight(),
+            "query": {"bool": {"filter": [{"ids": {"values": ids}}], "must": [_keyword_clause(query)]}}}
     try:
-        matched = {h["_id"] for h in _req("POST", f"/{_index(world)}/_search", body).get("hits", {}).get("hits", [])}
+        matched = {h["_id"]: _matched_fields(h.get("highlight"))
+                   for h in _req("POST", f"/{_index(world)}/_search", body).get("hits", {}).get("hits", [])}
     except Exception:
         return hits
     for h in hits:
         if not h.get("keyword_match") and es_ids[id(h)] in matched:
             h["keyword_match"] = True
+            if matched[es_ids[id(h)]]:
+                h["matched_fields"] = matched[es_ids[id(h)]]
     return hits
 
 
@@ -2592,6 +2620,62 @@ def _exact_filter(exact: list) -> dict:
 
 def search_exact(world: str, exact: list, scope_paths=None, k: int = 20, layer=None,
                  k_ceiling: int | None = None) -> tuple[list, str | None]:
+    """管理者の優先・除外（`path_rules`）を当てた `_search_exact`。除外は ES のフィルタで外し、優先の下のヒットを先に並べる。"""
+    rules = path_rules.rules_for(world)
+    kk = max(1, min(k, k_ceiling if k_ceiling is not None else _ES_SEARCH_K_MAX))
+    return _prioritized(rules, lambda only: _search_exact(world, exact, scope_paths, k, layer, k_ceiling, rules, only), kk)
+
+
+_ES_QUERY_FAILURES = frozenset({"es_unavailable", "es_query_failed", "es_query_rejected"})  # 問い合わせ自体の失敗（結果が空でも「無かった」ではない）
+
+
+def _hit_key(h: dict) -> tuple:
+    return (h.get("doc_id"), h.get("chunk_id"), h.get("line"), h.get("text"))
+
+
+def _prioritized(rules, run, k: int) -> tuple[list, str | None]:
+    """管理者の優先を、取った後の並べ替えでなく問い合わせの中で効かせる。優先の下の資料だけを同じ条件・同じ `k` で別に取り（`run(True)`）、
+    通常の取得（`run(False)`）の優先でないヒットと統合して、最後に `k` 件へ切る（優先が `k` に押し出されない）。優先が無ければ通常の取得をそのまま返す。"""
+    if not rules.priority_paths:
+        return run(False)
+    token = _QV_MEMO.set({})  # 質問の埋め込みは 1 回だけ（優先・通常の両方の問い合わせで使い回す）
+    try:
+        prio, prio_reason = run(True)
+        hits, reason = run(False)
+    finally:
+        _QV_MEMO.reset(token)
+    if prio_reason in _ES_QUERY_FAILURES:
+        # 優先だけの問い合わせが失敗したときは、通常の結果の優先のヒットを捨てず、優先を先に寄せて返す
+        return rules.prefer(hits)[:k], reason
+    seen, out = set(), []
+    for h in [*prio, *[h for h in hits if not rules.priority(h.get("doc_id"))]]:
+        key = _hit_key(h)
+        if key not in seen:
+            seen.add(key)
+            out.append(h)
+    return out[:k], reason
+
+
+def _prio_filter(rules, only: bool) -> list:
+    """優先の下だけに絞る `filter` 節（`only` が偽なら空）。"""
+    if not only:
+        return []
+    return [{"bool": {"should": rules.es_should(), "minimum_should_match": 1}}]
+
+
+def _scope_filters(rules, sel: list) -> list:
+    """範囲フィルタ＋管理者の除外のフィルタ（`filter` 節に積む）。設定が無ければ従来の `scopes` の terms だけ。"""
+    flt = []
+    if sel:
+        flt.append(rules.es_scope_clause(sel))
+    must_not = rules.es_must_not()
+    if must_not:
+        flt.append({"bool": {"must_not": must_not}})
+    return flt
+
+
+def _search_exact(world: str, exact: list, scope_paths, k: int, layer, k_ceiling, rules,
+                  prio_only: bool = False) -> tuple[list, str | None]:
     """識別子の完全一致だけで引く（本文検索を使わない）。`exact` は `normalize_exact` 済みの値。
     そのレコードが定義している識別子（`record_identity_values`）に当たるチャンクを先に並べる。範囲・層のフィルタは `search()` と同じ。
     返値 `(hits, degrade_reason|None)`（`search()` と同じ形・全ヒットに `keyword_match` を付ける）。
@@ -2602,14 +2686,12 @@ def search_exact(world: str, exact: list, scope_paths=None, k: int = 20, layer=N
         return [], "es_unavailable"
     k = max(1, min(k, k_ceiling if k_ceiling is not None else _ES_SEARCH_K_MAX))
     flt = [_exact_filter(exact)]
-    sel = scope_mod.normalize_scope_paths(scope_paths)
-    if sel:
-        flt.append({"terms": {"scopes": sel}})
+    sel = scope_mod.normalize_scope_paths(rules.extend_scope(scope_paths))
+    flt += _scope_filters(rules, sel) + _prio_filter(rules, prio_only)
     lfilt = layer_mod.es_filter(layer)
     if lfilt:
         flt.append(lfilt)
-    body = {"size": k, "query": _importance_boost_query(
-        {"bool": {"filter": flt, "should": [{"terms": {"record_identity_values": exact}}]}})}
+    body = {"size": k, "query": {"bool": {"filter": flt, "should": [{"terms": {"record_identity_values": exact}}]}}}
     try:
         return _mark_keyword_all(_parse_hits(_req("POST", f"/{_index(world)}/_search", body))), None
     except Exception as exc:
@@ -2618,11 +2700,22 @@ def search_exact(world: str, exact: list, scope_paths=None, k: int = 20, layer=N
 
 def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict | None = None,
           vector: bool = True, layer=None, k_ceiling: int | None = None, exact: list | None = None) -> tuple[list, str | None]:
+    """管理者の優先・除外（`path_rules`）を当てた `_search`。除外は ES のフィルタで外し、優先の下のヒットを先に並べる（範囲の外でも読む優先は範囲の条件に足す）。"""
+    rules = path_rules.rules_for(world)
+    kk = max(1, min(k, k_ceiling if k_ceiling is not None else _ES_SEARCH_K_MAX))
+    return _prioritized(rules, lambda only: _search(world, query, scope_paths, k, settings, vector, layer, k_ceiling,
+                                                    exact, rules, only), kk)
+
+
+def _search(world: str, query: str, scope_paths, k: int, settings: dict | None,
+            vector: bool, layer, k_ceiling: int | None, exact: list | None, rules,
+            prio_only: bool = False) -> tuple[list, str | None]:
     """検索。`vector=True` かつ埋め込み設定があれば kNN＋BM25 のハイブリッド、無ければ BM25。範囲フィルタ・graceful。
     `vector=False` は BM25 のみ（クエリ埋め込みを呼ばない・reason は常に None）。
     `k_ceiling`（省略可）: 呼び出し元が上限まで検証済みの `k` を渡す場合（`agentic_search.run_tool` の `es_search`）、`_ES_SEARCH_K_MAX` による再クランプを迂回してこちらを使う。
     `layer`（省略可・`"docs"|"code"|"both"`・既定 both）: `scopes` と同じ `filter` 節に `branch` の term／must_not フィルタを積む（`layer.es_filter`）。
     `exact`（省略可・`normalize_exact` 済み）: 識別子の完全一致で先に絞ってから本文で順位付けする（BM25・kNN の両方に同じフィルタを掛ける）。
+    BM25 は本文に加え、見出し系の欄（`labels`・`region_context`）も本文より軽い重みで引き、語が当たった欄を `matched_fields` に示す。質問の埋め込みは総期限（`_search_embed_timeout_s`）内に取れなければ `query_embed_failed` で BM25 だけにする。
     各ヒットに `keyword_match`（語が一致したか）を付ける。hybrid は BM25 の上位に出たヒットは True、kNN だけで出たヒットは語の一致を問い合わせて付ける（問い合わせの失敗は False）・BM25 のみの経路は全件 True。
     返値 `(hits, degrade_reason|None)`（`search_knn_only()` と同じ形）。degrade 時も BM25 の hits をそのまま返す（reason は「hybrid でなく BM25 だけになった理由」の注記）。`es_unavailable`／クエリ空は `[]`。
     degrade_reason: `es_unavailable`／`embedding_not_configured`（埋め込み未設定）／`embedding_cloud_unavailable`／`vector_feature_mismatch`（索引の埋め込み素性が現在の設定と不一致＝再索引待ち）／`query_embed_failed`／`hybrid_query_failed`（hybrid が失敗し BM25 は成功）／`es_query_failed`（BM25 も失敗・一時的）／`es_query_rejected`（BM25 も失敗・クエリ不備）。`fused_search.DEGRADE_REASONS` と同一集合（増やすときは両方直す）。
@@ -2634,18 +2727,16 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     if not available():
         return [], "es_unavailable"
     k = max(1, min(k, k_ceiling if k_ceiling is not None else _ES_SEARCH_K_MAX))
-    flt = []
-    sel = scope_mod.normalize_scope_paths(scope_paths)
-    if sel:
-        flt.append({"terms": {"scopes": sel}})  # 選択 prefix のいずれかを含む doc に限定
+    sel = scope_mod.normalize_scope_paths(rules.extend_scope(scope_paths))
+    flt = _scope_filters(rules, sel) + _prio_filter(rules, prio_only)  # 選択 prefix のいずれかを含む doc に限定＋管理者の除外（＋優先の下だけ）
     lfilt = layer_mod.es_filter(layer)
     if lfilt:
         flt.append(lfilt)
     if exact:
         flt.append(_exact_filter(exact))
-    hl = {"fields": {"text": {"fragment_size": 240, "number_of_fragments": 1}}}
-    bm25 = {"size": k, "query": _importance_boost_query({"bool": {"must": [{"match": {"text": q}}], "filter": flt}}),
-           "highlight": hl}
+    bool_q = {"must": [_keyword_clause(q)], "filter": flt}
+    bm25 = {"size": k, "query": {"bool": bool_q},
+           "highlight": _keyword_highlight()}
     # `cfg()` と `cloud_selected_but_unavailable()` を同じ system_settings スナップショットで呼ぶ（kill-switch 有効時は読まない）
     sys_s = _embed_system_settings_snapshot() if vector else None
     ec = embeddings.cfg(_settings(settings), system_settings=sys_s) if vector else None
@@ -2666,7 +2757,7 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
         # 索引のベクトル素性が現在の埋め込み設定と合わない（再索引待ち）。kNN は打てないので BM25 のみへ縮退し、クエリ埋め込みも呼ばない。理由を返して静かな縮退にしない
         reason = "vector_feature_mismatch"
     if same:  # 索引のベクトル素性が一致する時だけ kNN
-        qv = embeddings.embed([q], ec, world=world)
+        qv = _embed_query(q, ec, world)
         qb = embeddings.vector_to_es_bytes(qv[0]) if qv else None
         if qb is not None:
             # ① BM25（ハイライト付き）を先に引く。失敗は kNN を打たず BM25 失敗の reason で返す
@@ -2674,12 +2765,12 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
                 bm25_res = _req("POST", f"/{_index(world)}/_search", bm25)
             except Exception as exc:
                 return [], _classify_query_exception(exc)
-            # ② kNN（同じ filter・k・num_candidates）。重要度ブーストは function_score で kNN 側へ掛ける（重要度なしの資料フォルダでは不変）
+            # ② kNN（同じ filter・k・num_candidates）
             knn_clause = {"knn": {"field": "embedding", "query_vector": qb, "k": k,
                                   "num_candidates": max(50, k * 5), "filter": flt}}
             try:
                 knn_res = _req("POST", f"/{_index(world)}/_search",
-                               {"size": k, "query": _importance_boost_query(knn_clause)})
+                               {"size": k, "query": knn_clause})
             except Exception:
                 # kNN だけの失敗は BM25 の結果をそのまま返す（hits は空にならない＝`es_query_failed` とは別の reason）
                 return _mark_keyword_all(_parse_hits(bm25_res)), "hybrid_query_failed"
@@ -2697,6 +2788,15 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
 def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
                     settings: dict | None = None, layer=None, k_ceiling: int = 50,
                     exact: list | None = None) -> tuple[list, str | None]:
+    """管理者の優先・除外（`path_rules`）を当てた `_search_knn_only`。"""
+    rules = path_rules.rules_for(world)
+    kk = max(1, min(k, k_ceiling))
+    return _prioritized(rules, lambda only: _search_knn_only(world, query, scope_paths, k, settings, layer, k_ceiling,
+                                                             exact, rules, only), kk)
+
+
+def _search_knn_only(world: str, query: str, scope_paths, k: int, settings: dict | None, layer,
+                     k_ceiling: int, exact: list | None, rules, prio_only: bool = False) -> tuple[list, str | None]:
     """純 kNN 検索（BM25 を混ぜない・fused_search の vector エンジン用）。`search()` は kNN＋BM25 のハイブリッド固定のため、engines=["vector"] 単独用に top-level `knn` のみのクエリを発行する。
     返値 `(hits, degrade_reason|None)`。hits は `_parse_hits` 形 `{doc_id, line, text, score, ext}`。
     degrade_reason: es_unavailable／embedding_not_configured／embedding_cloud_unavailable／vector_feature_mismatch／query_embed_failed／es_query_failed（一時的）／es_query_rejected（クエリ不備）（`parts/read/fused_search.py` の `DEGRADE_REASONS` と同一・増やすときは両方直す）。
@@ -2722,27 +2822,22 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
             and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID
             and meta.get("quant") == embeddings.ES_VECTOR_QUANT):
         return [], "vector_feature_mismatch"  # 索引素性ズレ
-    qv = embeddings.embed([q], ec, world=world)
+    qv = _embed_query(q, ec, world)
     qb = embeddings.vector_to_es_bytes(qv[0]) if qv else None
     if qb is None:
         return [], "query_embed_failed"
-    flt = []
-    sel = scope_mod.normalize_scope_paths(scope_paths)
-    if sel:
-        flt.append({"terms": {"scopes": sel}})  # `search()` と同一の範囲フィルタ
+    sel = scope_mod.normalize_scope_paths(rules.extend_scope(scope_paths))
+    flt = _scope_filters(rules, sel) + _prio_filter(rules, prio_only)  # `search()` と同一の範囲フィルタ
     lfilt = layer_mod.es_filter(layer)
     if lfilt:
         flt.append(lfilt)
     if exact:
         flt.append(_exact_filter(exact))
-    # 上位ちょうど `k` 件を取ってから重要度で並べ替えると、「高」のヒットが取得時点で落選して浮上できない。有界の overfetch（`k*3`・上限 `k+50`）で多めに取り、補正・再ソートの後に `k` 件へ切る（重要度なしの資料フォルダは補正が no-op で結果不変）
-    fetch_k = min(k * 3, k + 50)
-    body = {"size": fetch_k,
-            "knn": {"field": "embedding", "query_vector": qb, "k": fetch_k,
-                    "num_candidates": max(50, fetch_k * 5), "filter": flt}}
+    # 候補数（num_candidates）は変えない
+    body = {"size": k,
+            "knn": {"field": "embedding", "query_vector": qb, "k": k,
+                    "num_candidates": max(50, min(k * 3, k + 50) * 5), "filter": flt}}
     try:
-        # 純 kNN は function_score で包めないため、取得後の再ランクで重要度ブーストを適用する
-        hits = _rerank_knn_by_importance(_parse_hits(_req("POST", f"/{_index(world)}/_search", body), vector=True))
-        return hits[:k], None
+        return _parse_hits(_req("POST", f"/{_index(world)}/_search", body), vector=True), None
     except Exception as exc:
         return [], _classify_query_exception(exc)

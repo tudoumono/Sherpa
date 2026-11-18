@@ -3,11 +3,13 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 
 from ... import investigation_ledger
 from ... import investigation_state
+from ... import worlds
 from ..base import _KINDS_OUTSIDE_LEDGER, _log, _scope_evidence_kinds
 
 
@@ -181,9 +183,20 @@ _RECON_MAX_ROWS = 40
 _RECON_TEXT_MAX = 300
 # 表の並び順（食い違い・設計書に記述なし・ソースに見当たらない・未確認を先に、一致を最後に）。
 _RECON_ORDER = {"mismatch": 0, "spec_missing": 1, "source_missing": 2, "unverified": 3, "match": 4}
-_RECON_REF_LINE = re.compile(r"^(.*?)(?::(\d+)(?:-(\d+))?)?$")
-# 行数を数えるときに読む原本の上限（バイト）。超えるものは行番号を確かめられない扱い。
-_RECON_LINECOUNT_MAX_BYTES = 20 * 1024 * 1024
+# 参照の区切り・位置の行の形（`N`・`N-M`。区切りごとに見る）・位置の長さの上限・1欄で採る参照の数。
+_RECON_REF_SEP = re.compile(r"([;；、，,\n])")
+_RECON_LINE = re.compile(r"^\s*(\d+)(?:\s*-\s*(\d+))?\s*$")
+_RECON_LOC_MAX = 120
+_RECON_REFS_MAX = 4
+# 欄の長さの上限・1断片で試す `:` の数・行の形の数字の桁数の上限。
+_RECON_REF_MAX = 600
+_RECON_COLONS_MAX = 8
+_RECON_DIGITS_MAX = 9
+# 1欄で、キャッシュに無い資料の実在確認を呼べる回数の上限。
+_RECON_VERIFY_MAX = 32
+# 確かめられた資料のパスに含まれない部分から ASCII のファイル名の並びを取り出す正規表現・絶対パスの形の候補の数の上限。
+_RECON_NAME_RUN = re.compile(r"[A-Za-z0-9._-]+")
+_RECON_ABS_CANDS_MAX = 16
 
 
 def _line_count(doc_id: str, world: str, scope_paths=None) -> int | None:
@@ -202,43 +215,171 @@ def _line_count(doc_id: str, world: str, scope_paths=None) -> int | None:
         f.close()
 
 
-def _verify_recon_ref(ref: str, world: str, scope_paths, cache: dict) -> tuple[dict | None, bool]:
-    """根拠の参照（`資料のパス:行`）1件を検証する。戻り値 `(参照 {doc_id, line?} か None, 秘匿の資料を指すか)`。空の参照・範囲外・実在しない・秘匿名・重要度設定ファイルは参照 None。`cache` は1ターン内で資料ごとの実在確認・行数を使い回す入れ物。"""
+def _recon_ref_segments(ref: str) -> list[tuple[str, str]]:
+    """参照の欄を区切り（`;` `；` `、` `，` `,` 改行）で `(手前の区切り, 断片)` に分ける。空の断片は捨てる。"""
+    parts = _RECON_REF_SEP.split(ref)
+    return [(parts[i - 1] if i else "", parts[i]) for i in range(0, len(parts), 2) if parts[i].strip()]
+
+
+def _recon_abs_cands(ref: str) -> int:
+    """断片ごとに「断片の全体」と「各 `:` の手前」のうち、絶対パスの形（前後の空白・引用符を除き `\\` を `/` に直して `/` で始まる）の数。"""
+    n = 0
+    for _sep, seg in _recon_ref_segments(ref):
+        for cand in [seg] + [seg[:i] for i, ch in enumerate(seg) if ch == ":"]:
+            if cand.strip().strip("`'\"“”‘’").strip().replace("\\", "/").startswith("/"):
+                n += 1
+    return n
+
+
+def _recon_rest_hits_guard(parts: list[str], world: str) -> tuple[bool, bool]:
+    """確かめられた資料のパスに含まれない部分（位置・採らなかった断片・切れない欄の全体）が、秘匿の名前か重要度設定ファイルの名前を含むか。戻り値 `(秘匿, 重要度設定)`。
+    ア 部分を改行でつないで ASCII のファイル名の並びを取り出して調べる。イ 部分ごとに区切りで分けた断片の全体と各 `:` の手前をパスとして調べる。"""
     from ...ingest import importance, text_kind
-    ref = ref.strip()
-    if not ref:
+    from .citations import normalize_doc_ref
+    sensitive = False
+    rest = "\n".join(parts)
+    for run in _RECON_NAME_RUN.findall(rest):
+        run = run.rstrip(".")
+        if run:
+            sensitive = sensitive or text_kind.is_sensitive_doc_id(run) or (run.startswith(".") and text_kind.is_sensitive_doc_id("x" + run))
+    control = importance.CONTROL_FILENAME in rest
+    for part in parts:
+        for _sep, seg in _recon_ref_segments(part):
+            for cand in [seg] + [seg[:i] for i, ch in enumerate(seg) if ch == ":"]:
+                doc = normalize_doc_ref(cand, world)
+                if doc:
+                    sensitive = sensitive or text_kind.is_sensitive_doc_id(doc)
+                    control = control or importance.is_importance_control_path(doc)
+    return sensitive, control
+
+
+class _ReconVerifyBudget(Exception):
+    """1欄で資料の実在確認を呼べる回数（`_RECON_VERIFY_MAX`）を超えた。"""
+
+
+def _recon_cut_ref(seg: str, world: str, scope_paths, cache: dict, budget: list[int]) -> tuple[str, str] | None:
+    """断片を `:` の左から順に（最大 `_RECON_COLONS_MAX` 個）試し、手前が範囲内に実在する資料になる最初の所で `(資料, 位置の文字列)` に切る。
+    キャッシュに無い実在確認は `budget[0]` を減らして呼び、尽きたら `_ReconVerifyBudget`。"""
+    from .citations import _verify_one
+    tried = 0
+    for i, ch in enumerate(seg):
+        if ch != ":":
+            continue
+        tried += 1
+        if tried > _RECON_COLONS_MAX:
+            break
+        if not seg[:i].strip():
+            continue
+        if ("v", seg[:i]) not in cache:
+            if budget[0] <= 0:
+                raise _ReconVerifyBudget
+            budget[0] -= 1
+            cache[("v", seg[:i])] = _verify_one(seg[:i], world, scope_paths)
+        if cache[("v", seg[:i])]:
+            return cache[("v", seg[:i])], seg[i + 1:]
+    return None
+
+
+def _recon_locate(doc: str, pos: str, world: str, scope_paths, cache: dict) -> dict | None:
+    """位置の文字列を確かめて `{doc_id, loc, line?, line_end?}` にする。区切りごとに見て、全部が行の形なら総行数の中にあることを確かめ、行の形が1つも無ければ文字列のまま位置に採る。行の形とそれ以外が混じる位置は不可。行の列挙は組み直した表示が `_RECON_LOC_MAX` 字を超えると不可。行でない位置は `_RECON_LOC_MAX` 字で切って採る。"""
+    parts = [p for p in _RECON_REF_SEP.split(pos)[::2] if p.strip()]
+    if not parts:
+        return None
+    shapes = [_RECON_LINE.match(p) for p in parts]
+    ranges = []
+    for m in shapes:
+        if m is None:
+            continue
+        if any(len(g) > _RECON_DIGITS_MAX for g in m.groups() if g):
+            return None
+        first = int(m.group(1))
+        ranges.append((first, int(m.group(2) or first)))
+    out = {"doc_id": doc}
+    if ranges:
+        if len(ranges) != len(parts):
+            return None
+        if ("n", doc) not in cache:
+            cache[("n", doc)] = _line_count(doc, world, scope_paths)
+        total = cache[("n", doc)]
+        if total is None or not all(1 <= a <= b <= total for a, b in ranges):
+            return None
+        loc = ",".join(str(int(m.group(1))) + (f"-{int(m.group(2))}" if m.group(2) else "") for m in shapes)
+        if len(loc) > _RECON_LOC_MAX:
+            return None
+        out["loc"] = loc
+        if len(parts) == 1:
+            out["line"] = ranges[0][0]
+            if ranges[0][1] > ranges[0][0]:
+                out["line_end"] = ranges[0][1]
+        return out
+    loc = re.sub(r"[\s\x00-\x1f\x7f]+", " ", pos.strip()).strip()[:_RECON_LOC_MAX]
+    return {**out, "loc": loc} if loc else None
+
+
+def _verify_recon_ref(ref: str, world: str, scope_paths, cache: dict) -> tuple[dict | None, bool]:
+    """根拠の参照（`資料のパス:位置`・1欄に複数可）を検証する。戻り値 `(参照 {doc_id, loc, line?, line_end?, also?} か None, 秘匿の資料を指すか)`。
+    ① 入口の不可（空・長すぎ・UTF-8 にできない・絶対パスの形の候補が多すぎる）② 参照の切り出し（実在確認は1欄で `_RECON_VERIFY_MAX` 回まで・超えたら不可）
+    ③ 守り（絶対パスの形の候補の上限は欄の全体と確かめられた資料のパスに含まれない部分の両方に掛かる。確かめられた資料のパスに含まれない部分に秘匿名・重要度設定ファイルの名前があれば側ごと None・切り出した資料が重要度設定ファイルでも None）④ 位置の確かめ（行が総行数の外・位置が空なら None）。複数のうち1つでも不可なら丸ごと None。
+    `cache` は1ターン内で資料ごとの実在確認・行数を使い回す入れ物。
+    """
+    try:
+        ref.encode("utf-8")
+    except UnicodeEncodeError:
         return None, False
-    m = _RECON_REF_LINE.match(ref)
-    path_part, line, line_end = (m.group(1), m.group(2), m.group(3)) if m else (ref, None, None)
-    from .citations import normalize_doc_ref, _verify_one
-    doc = normalize_doc_ref(path_part, world)
-    if doc and text_kind.is_sensitive_doc_id(doc):
+    if not ref.strip() or len(ref) > _RECON_REF_MAX or _recon_abs_cands(ref) > _RECON_ABS_CANDS_MAX:
+        return None, False
+    refs: list[tuple[str, str]] = []
+    dropped: list[str] = []
+    segs = _recon_ref_segments(ref)
+    budget = [_RECON_VERIFY_MAX]
+    i = 0
+    try:
+        while i < len(segs):
+            sep, seg = segs[i]
+            if not refs:
+                # 先頭の参照は、切れるまで次の断片を元の区切りでつないで試す（資料のパスに区切りの文字が入っていてもよい）。
+                cut = _recon_cut_ref(seg, world, scope_paths, cache, budget)
+                while cut is None and i + 1 < len(segs):
+                    i += 1
+                    seg += segs[i][0] + segs[i][1]
+                    cut = _recon_cut_ref(seg, world, scope_paths, cache, budget)
+                if cut is None:
+                    break
+                refs.append(cut)
+            else:
+                cut = _recon_cut_ref(seg, world, scope_paths, cache, budget)
+                if cut is not None:
+                    if len(refs) >= _RECON_REFS_MAX:
+                        dropped = [a + b for a, b in segs[i:]]
+                        break
+                    refs.append(cut)
+                else:
+                    refs[-1] = (refs[-1][0], refs[-1][1] + sep + seg)
+            i += 1
+    except _ReconVerifyBudget:
+        return None, False
+    from ...ingest import importance
+    rest = [pos for _doc, pos in refs] + dropped if refs else [ref]
+    if sum(_recon_abs_cands(p) for p in rest) > _RECON_ABS_CANDS_MAX:
+        return None, False
+    sensitive, control = _recon_rest_hits_guard(rest, world)
+    if sensitive:
         return None, True
-    if doc and importance.is_importance_control_path(doc):
+    if control or not refs or any(importance.is_importance_control_path(doc) for doc, _pos in refs):
         return None, False
-    if ("v", path_part) not in cache:
-        cache[("v", path_part)] = _verify_one(path_part, world, scope_paths)
-    verified = cache[("v", path_part)]
-    if not verified:
+    located = [_recon_locate(doc, pos, world, scope_paths, cache) for doc, pos in refs]
+    if any(x is None for x in located):
         return None, False
-    out = {"doc_id": verified}
-    if line:
-        first, last = int(line), int(line_end or line)
-        if ("n", verified) not in cache:
-            cache[("n", verified)] = _line_count(verified, world, scope_paths)
-        total = cache[("n", verified)]
-        if total is None or not 1 <= first <= last <= total:
-            return None, False
-        out["line"] = first
-        if last > first:
-            out["line_end"] = last
+    out = located[0]
+    if len(located) > 1:
+        out["also"] = located[1:]
     return out, False
 
 
 def verify_reconciliation(rows: list[dict], world: str, scope_paths) -> tuple[list[dict], dict]:
-    """照らし合わせの行ごとに、設計書側・ソース側の根拠が範囲内に実在し秘匿でないかを確かめる（主張の根拠の検証と同じ流儀）。
-    確かめられない参照は参照も記述も消し、欠けている側（設計書に記述なし・ソースに見当たらない）は参照・記述とも空に固定する。行番号（範囲）が原本の行数の中にあることも確かめる。その判定が成り立たない行は `unverified`（未確認）に下げる。
-    戻り値 `(表に出す行（並べ替え・上限適用済み）, {"unverified": 下げた件数, "more": 上限で省いた件数})`。行は `{item, verdict, spec: {text, doc_id?, line?, line_end?}, source: {...}}`。
+    """照らし合わせの行ごとに、設計書側・ソース側の根拠（`資料のパス:位置`）の資料が範囲内に実在し秘匿でないかを確かめる（主張の根拠の検証と同じ流儀）。
+    確かめられない参照は参照も記述も消し、欠けている側（設計書に記述なし・ソースに見当たらない）は参照・記述とも空に固定する。行・行の範囲・行の列挙は原本の行数の中にあることも確かめ（全角数字も行として扱い半角で表示する）、セル範囲・段落・ページなどの位置は文字列のまま採る。1欄に複数の参照があれば全部を確かめる。確かめられた資料のパスに含まれない部分（位置・採らなかった断片・先頭の参照が切れない欄の全体）に秘匿の名前・重要度設定ファイルの名前があれば、その側は丸ごと空にする。1欄の実在確認は `_RECON_VERIFY_MAX` 回まで（超えた欄は不可）。その判定が成り立たない行は `unverified`（未確認）に下げる。
+    戻り値 `(表に出す行（並べ替え・上限適用済み）, {"unverified": 下げた件数, "more": 上限で省いた件数})`。行は `{item, verdict, spec: {text, doc_id?, loc?, line?, line_end?, also?}, source: {...}}`。
     """
     # 上限は検証の前にかける（申告された判定の順に並べて先頭だけ検証する）。検証で未確認に下がった行は、残した行の中で並べ直す。
     ordered = sorted(rows, key=lambda r: _RECON_ORDER[r["verdict"]])
@@ -246,23 +387,26 @@ def verify_reconciliation(rows: list[dict], world: str, scope_paths) -> tuple[li
     cache: dict = {}
     out = []
     unverified = 0
-    for r in ordered[:_RECON_MAX_ROWS]:
-        verdict = r["verdict"]
-        need = {"match": ("spec", "source"), "mismatch": ("spec", "source"),
-                "spec_missing": ("source",), "source_missing": ("spec",)}[verdict]
-        sides = {}
-        for key in ("spec", "source"):
-            if key not in need:
-                sides[key] = {"text": ""}
-                continue
-            ref, _sensitive = _verify_recon_ref(r[f"{key}_ref"], world, scope_paths, cache)
-            text = r[f"{key}_text"].strip()[:_RECON_TEXT_MAX]
-            # 行番号つきで確かめられ、記述も空でない側だけ採る（それ以外は丸ごと空）。
-            sides[key] = {"text": text, **ref} if ref and "line" in ref and text else {"text": ""}
-        if any("doc_id" not in sides[k] for k in need):
-            verdict = "unverified"
-            unverified += 1
-        out.append({"item": r["item"].strip()[:_RECON_TEXT_MAX], "verdict": verdict, **sides})
+    # 資料フォルダの実パスは入口で1回だけ解き、全行の確かめをそのパスに固定する。
+    root = worlds.world_dir(world)
+    with worlds.pin_world_root(world, root) if root is not None else contextlib.nullcontext():
+        for r in ordered[:_RECON_MAX_ROWS]:
+            verdict = r["verdict"]
+            need = {"match": ("spec", "source"), "mismatch": ("spec", "source"),
+                    "spec_missing": ("source",), "source_missing": ("spec",)}[verdict]
+            sides = {}
+            for key in ("spec", "source"):
+                if key not in need:
+                    sides[key] = {"text": ""}
+                    continue
+                ref, _sensitive = _verify_recon_ref(r[f"{key}_ref"], world, scope_paths, cache)
+                text = r[f"{key}_text"].strip()[:_RECON_TEXT_MAX]
+                # 位置つきで確かめられ、記述も空でない側だけ採る（それ以外は丸ごと空）。
+                sides[key] = {"text": text, **ref} if ref and text else {"text": ""}
+            if any("doc_id" not in sides[k] for k in need):
+                verdict = "unverified"
+                unverified += 1
+            out.append({"item": r["item"].strip()[:_RECON_TEXT_MAX], "verdict": verdict, **sides})
     out.sort(key=lambda x: _RECON_ORDER[x["verdict"]])
     return out, {"unverified": unverified, "more": more}
 
@@ -411,14 +555,10 @@ def _claims_vs_ledger(claims: list[dict], snapshot: investigation_ledger.LedgerS
         out.append(c)
     stats = {"ledger": True, "checked": checked, "downgraded": downgraded,
              "unmatched_refs": unmatched_refs, "manifest_state": manifest_state}
-    # ① 全主張が item_ids を持つときだけ数える ② 秘匿名は名前を残さず件数にする。
+    # 全主張が item_ids を持つときだけ数える。
     if uses_item_ids and all(c.get("item_ids") is not None for c in claims):
-        from ...ingest import text_kind
-        names = [(snapshot.items[i].get("subject") or "").strip() or i for i in sorted(per_item) if i not in referenced]
-        shown = [n for n in names if not text_kind.is_sensitive_doc_id(n)]
-        stats["omitted_items"] = shown
-        if len(names) > len(shown):
-            stats["omitted_hidden"] = len(names) - len(shown)
+        stats["omitted_items"] = [(snapshot.items[i].get("subject") or "").strip() or i
+                                  for i in sorted(per_item) if i not in referenced]
     return out, stats
 
 

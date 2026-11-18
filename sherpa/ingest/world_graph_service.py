@@ -5,7 +5,7 @@ worker（Neo4j 反映）と preview_service（画面/件数）が共用する。
 """
 from __future__ import annotations
 
-from .. import worlds
+from .. import build_marks, worlds
 from . import resolve_settings, world_graph
 
 
@@ -18,4 +18,5 @@ def build_effective_world(world: str, *, files=None):
     wd = worlds.world_dir(world)
     if not wd:
         return [], [], [{"doc": None, "reason": "world_unresolved", "action": "blocked"}]
-    return world_graph.build_world(wd, world, files=files, resolve_config=resolve_settings.load(world))
+    return world_graph.build_world(wd, world, files=files, resolve_config=resolve_settings.load(world),
+                                  build_marks=build_marks.load(world))

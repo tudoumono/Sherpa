@@ -244,6 +244,34 @@ def test_graph_reflect_failure_reason_is_logged_as_one_error_line(monkeypatch, _
     assert len(lines) == 1 and "graph_reflect_failed:ConnectionError@" in lines[0] and "world=w" in lines[0]
 
 
+def test_graph_write_memory_exhaustion_reason_names_the_settings_to_raise(monkeypatch, _stub_pipeline, caplog):
+    """Neo4j の 1 回の書き込みがメモリの上限に当たった失敗は、失敗の記録・ログに『書き込みのメモリ不足』と上げる設定名を残す。"""
+    class _PoolExhausted(Exception):                 # Neo4j ドライバの TransientError（外部境界）の代わり
+        code = "Neo.TransientError.General.MemoryPoolOutOfMemoryError"
+
+    def _boom(*a, **k):
+        raise _PoolExhausted("The allocation of an extra 2.0 MiB would use more than the limit 896.0 MiB")
+    monkeypatch.setattr(world_neo4j, "load_world", _boom)
+
+    with caplog.at_level("ERROR", logger="sherpa.ingest.convert"):
+        res = worker.run("w")
+
+    assert res["status"] == "failed"
+    reason = res["flags"][0]["reason"]
+    assert reason.startswith("graph_reflect_failed:MemoryPoolOutOfMemoryError@")
+    assert "メモリが足りません" in reason and "SHERPA_NEO4J_HEAP_FIXED" in reason and "SHERPA_NEO4J_TX_MEMORY_MAX" in reason
+    lines = [r.getMessage() for r in caplog.records if r.levelname == "ERROR" and "取り込みが失敗しました" in r.getMessage()]
+    assert len(lines) == 1 and "SHERPA_NEO4J_HEAP_FIXED" in lines[0]
+
+
+def test_is_memory_pool_error_matches_code_or_message_only():
+    class _E(Exception):
+        code = "Neo.TransientError.General.MemoryPoolOutOfMemoryError"
+    assert world_neo4j.is_memory_pool_error(_E("x"))
+    assert world_neo4j.is_memory_pool_error(RuntimeError("Neo.TransientError.General.MemoryPoolOutOfMemoryError: ..."))
+    assert not world_neo4j.is_memory_pool_error(ConnectionError("down"))
+
+
 def test_build_derived_error_then_next_sync_retries(monkeypatch, _stub_pipeline):
     """(M) 1回目のsyncでbuild_derivedが失敗してsigが未確定のままだと、2回目のsyncは
     `prev != sig` により必ず全再構築（run）へ入り直す（既存派生A・更新原本Bのシナリオ）。"""

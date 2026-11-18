@@ -119,7 +119,7 @@ def test_query_vectors_are_bytes_in_both_search_paths(monkeypatch):
     assert es_index.search_knn_only("w", "q", k=5)[1] is None
     assert bodies[-1]["knn"]["query_vector"] == [42, 85, -127]
     es_index.search("w", "q", k=5)
-    knn = bodies[-1]["query"]["function_score"]["query"]["knn"]
+    knn = bodies[-1]["query"]["knn"]
     assert knn["query_vector"] == [42, 85, -127]
 
 

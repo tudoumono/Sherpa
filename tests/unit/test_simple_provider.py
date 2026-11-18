@@ -5,8 +5,10 @@ LLM は外部境界のため HTTP 層（`agentic_search._post`）だけを固定
 """
 from __future__ import annotations
 
+import io
 import os
 import threading
+import urllib.error
 
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 os.environ.setdefault("SHERPA_DISABLE_EMBED", "1")
@@ -164,6 +166,18 @@ def test_llm_failure_is_honest_and_not_counted_as_completed(monkeypatch):
     env = _result(list(_provider().run(_ctx())))["env"]
     assert env["agentic_failure"]
     assert "接続できませんでした" in env["headline"]
+
+
+def test_model_without_tools_is_named_as_such_without_the_model_name(monkeypatch):
+    def _boom(*a, **kw):
+        raise urllib.error.HTTPError("http://ollama-host:11434/v1/chat/completions", 400, "bad", {},
+                                     io.BytesIO(b'{"error":"zz-model does not support tools"}'))
+
+    monkeypatch.setattr(A, "_post", _boom)
+    env = _result(list(_provider().run(_ctx())))["env"]
+    assert env["agentic_failure"]
+    assert "道具の呼び出しに対応していません" in env["headline"]
+    assert "zz-model" not in env["headline"]
 
 
 def test_select_provider_unwired_when_simple_ai_cannot_be_resolved():

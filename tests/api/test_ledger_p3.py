@@ -96,15 +96,11 @@ def test_documents_endpoint_paginates_fallback_walk(auth_disabled):
 
 def test_documents_endpoint_uses_ledger_when_populated(auth_disabled):
     """S工事②/RV1是正#2: 台帳（`store.documents`）に行があれば、フォルダを歩かず狭い SELECT
-    だけでページング応答する（`store.count_documents`/`store.list_documents_page`）。importance
-    が台帳に materialize 済みならそのまま通し（無ければ3キーとも付けない・§2 truth table）。
+    だけでページング応答する（`store.count_documents`/`store.list_documents_page`）。台帳に importance 列が
+    入っていても、応答には出さない。
 
-    ここでは DB 行→API 応答のマッピング（`doc_ledger._ledger_row_to_public` 経由）だけを対象に
-    importance 3列を手投入する（DB 不要な範囲に留める・api マーカーのテスト）。ingest 時の実解決
-    （`ingest/worker.py::_ledger_rows`）から API 応答までの結線全体は
-    `tests/integration/test_importance_migration_rebuild.py::
-    test_documents_endpoint_reflects_importance_from_real_ingest`（要 PG+Neo4j+ES・RV2是正#b3③）
-    が実 ingest 経由で固定する。"""
+    ここでは DB 行→API 応答のマッピング（`doc_ledger._ledger_row_to_public` 経由）だけを対象にする
+    （DB 不要な範囲に留める・api マーカーのテスト）。"""
     from fastapi.testclient import TestClient
     from sherpa import store
     from sherpa.api import app
@@ -128,11 +124,7 @@ def test_documents_endpoint_uses_ledger_when_populated(auth_disabled):
         d0 = body1["documents"][0]
         assert d0["top_scope"] == "4期" and d0["phase"] == "03_開発" and d0["category"] == "01_ソース"
         assert d0["status"] == "ready"                     # 台帳の "indexed" → 表示語彙 "ready"
-        assert d0["importance"] == "高"                     # ingest 時に materialize 済みならそのまま通す
-        assert d0["importance_reason"] == "一次資料"
-        assert d0["importance_source"] == "4期/_重要度.txt:1行目"
-        d1 = body1["documents"][1]
-        assert "importance" not in d1                       # materialize されていない行は3キーとも付けない
+        assert not any(k.startswith("importance") for d in body1["documents"] for k in d)
 
         r2 = c.get("/documents", params={"world": w, "limit": 2, "offset": 4})
         body2 = r2.json()

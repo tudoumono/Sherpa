@@ -312,6 +312,23 @@ def test_codex_job_round_trip_completed(fake_codex):
     assert isinstance(rbody["elapsed_ms"], int) and rbody["elapsed_ms"] >= 0
 
 
+def test_codex_job_keeps_outside_scope_note_and_drops_excluded_sources(fake_codex, monkeypatch):
+    """ジョブの保存・結果に、範囲の外の注記を保ち、除外の資料は出さない。"""
+    import json
+    from sherpa import path_rules
+    doc = "4期/04_運用/障害記録.md"
+    issued = _new_keys("cj-note")[0]
+    monkeypatch.setenv(path_rules.ENV_KEY, json.dumps(
+        {"v1": [{"path": "4期/04_運用", "kind": "priority", "outside_scope": True}]}))
+    job_id = _submit_job(issued["key"], "注記", scope_paths=["4期/01_標準"])
+    assert _dispatch_and_wait(job_id)["status"] == "completed"
+    assert _result(job_id, issued["key"]).json()["sources"] == [{"doc_id": doc, "note": path_rules.NOTE_OUTSIDE_SCOPE}]
+    monkeypatch.setenv(path_rules.ENV_KEY, json.dumps({"v1": [{"path": "4期/04_運用", "kind": "exclude", "outside_scope": False}]}))
+    job2 = _submit_job(issued["key"], "除外")
+    assert _dispatch_and_wait(job2)["status"] == "completed"
+    assert _result(job2, issued["key"]).json()["sources"] == []
+
+
 def test_codex_job_result_investigation_field_present_absent_and_cleared_on_expiry():
     """`investigation` は記録がある完了ジョブにだけ付き（`response_model_exclude_none`）、保存期間（7日）
     経過で他の結果列と一緒に消える。"""

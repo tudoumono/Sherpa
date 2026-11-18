@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sherpa — マイワークスペース</title>
+<title>Slouch — マイワークスペース</title>
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="fonts.css">
 <script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
@@ -14,7 +14,7 @@
   /* アップロードゾーン */
   .upload-zone{border:2px dashed var(--border,#e3e6ea);border-radius:var(--radius);padding:28px 20px;
     text-align:center;cursor:pointer;transition:border-color .15s,background .15s;margin-bottom:18px}
-  .upload-zone.drag{border-color:var(--accent,#0f766e);background:var(--accent-weak,#f0fdf4)}
+  .upload-zone.drag{border-color:var(--accent,#1e3a6e);background:var(--accent-weak,#edf1f8)}
   .upload-zone input[type=file]{display:none}
   .upload-zone .hint{font-size:var(--text-small);color:var(--ink-2,#5b6573);margin-top:6px}
   .upload-zone .uh{font-size:var(--text-body);font-weight:600;color:var(--ink-2,#374151);margin-bottom:4px}
@@ -38,7 +38,7 @@
   .hit-card pre{margin:0;white-space:pre-wrap;word-break:break-all;font-size:var(--text-small);
     background:var(--surface);border-radius:4px;padding:6px 8px}
   /* アップロード進捗 */
-  .progress-bar{height:4px;border-radius:2px;background:var(--accent,#0f766e);transition:width .2s}
+  .progress-bar{height:4px;border-radius:2px;background:var(--accent,#1e3a6e);transition:width .2s}
   .progress-wrap{height:4px;background:var(--surface-2);border-radius:2px;margin-top:8px;display:none}
   /* ラベル */
   .personal-badge{display:inline-block;font-size:var(--text-caption);font-weight:700;padding:2px 7px;border-radius:4px;
@@ -77,6 +77,7 @@
     <!-- アップロードエリア -->
     <div class="card" style="margin-bottom:18px">
       <div class="card-head">ファイルをアップロード</div>
+      <div class="card-body">
       <div class="upload-zone" id="dropzone">
         <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.cbl,.cob,.cobol,.cpy,.copybook,.jcl,.sql,.py,.sh,.bat">
         <div class="uh">クリックまたはドラッグ＆ドロップ</div>
@@ -86,6 +87,7 @@
         <div class="progress-bar" id="progress-bar" style="width:0%"></div>
       </div>
       <div id="upload-msg" style="font-size:var(--text-small);margin-top:6px;min-height:16px"></div>
+      </div>
     </div>
 
     <!-- ファイル一覧 -->
@@ -104,6 +106,7 @@
     <!-- 個人 grep 検索 -->
     <div class="card">
       <div class="card-head">個人ファイル内を検索</div>
+      <div class="card-body">
       <div class="notice" style="margin-bottom:10px">
         この検索は <strong>あなたのファイルだけ</strong> を対象にします。
         社内資料の引用源にはなりません。
@@ -113,6 +116,7 @@
         <button class="btn-primary" id="search-btn">検索</button>
       </div>
       <div id="search-results"></div>
+      </div>
     </div>
   </div>
 </div>

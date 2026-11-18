@@ -86,7 +86,7 @@ _cleanup() {
 }
 trap _cleanup EXIT
 
-echo "=== Sherpa インストール（種類: ${KIND}・版: ${VERSION}・コミット: ${COMMIT}・環境: ${PLATFORM:-不明}）==="
+echo "=== Slouch インストール（種類: ${KIND}・版: ${VERSION}・コミット: ${COMMIT}・環境: ${PLATFORM:-不明}）==="
 
 # --- ② 動作中のアプリを見つけたら先へ進まない ---
 mkdir -p "$ROOT/data"
@@ -94,7 +94,7 @@ mkdir -p "$ROOT/data"
 . "$ROOT/scripts/run-common.sh"
 if pid="$(live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE" 2>/dev/null)" \
    || pid="$(live_matching_pid "$WORKER_PID_FILE" "$WORKER_PROC_NEEDLE" 2>/dev/null)"; then
-  fail "Sherpa が動いています（pid ${pid}）。make stop で止めてから ./install.sh を実行してください。"
+  fail "Slouch が動いています（pid ${pid}）。make stop で止めてから ./install.sh を実行してください。"
   exit 1
 fi
 active_units="$(pkg_systemd_active_units)"

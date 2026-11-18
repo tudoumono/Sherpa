@@ -225,7 +225,7 @@ def _content_filter_note(text: str) -> str | None:
     low = (text or "").lower()
     if any(m in low for m in _CONTENT_FILTER_MARKERS):
         return ("［コンテンツフィルタの疑い＝Azure 側のポリシーでブロックされました。"
-                "Sherpa 本体はこの応答種別をまだ扱っていません＝将来の実装課題として記録してください］")
+                "Slouch 本体はこの応答種別をまだ扱っていません＝将来の実装課題として記録してください］")
     return None
 
 
@@ -788,7 +788,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="azure_smoke.py",
         description=(
-            "Azure OpenAI（または他の OpenAI 互換エンドポイント）への実疎通を、Sherpa 本番コード"
+            "Azure OpenAI（または他の OpenAI 互換エンドポイント）への実疎通を、Slouch 本番コード"
             "（sherpa.llm / sherpa.embeddings / "
             "sherpa.agentic_search / sherpa.providers.codex.sandbox）をそのまま呼んで確認します。"),
         epilog=_HELP_EPILOG,

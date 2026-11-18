@@ -49,6 +49,14 @@ def test_prompt_default_output_contract():
     assert _run_prompt(args).stdout == _run_prompt(args).stdout   # 同じ引数なら同一出力
 
 
+def test_prompt_block_after_rethink_points_to_the_rethink_section():
+    first = _run_prompt(["--target", "HEAD", "--round", "1", *_INTENT]).stdout
+    assert "区切り" not in first   # 最初の区切りでは今までどおり
+    r = _run_prompt(["--target", "HEAD", "--block", "2", "--round", "1", *_INTENT])
+    assert r.returncode == 0, r.stderr
+    assert "2 区切り目の 1 巡目" in r.stdout and "「見直し」の節" in r.stdout
+
+
 def test_prompt_range_target_and_worktree_guidance():
     out = _run_prompt(["--target", "abc123..def456", *_INTENT]).stdout
     assert "`git diff abc123..def456`" in out and "`git show abc123..def456`" not in out

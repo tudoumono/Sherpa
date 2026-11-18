@@ -205,7 +205,7 @@ def reachable_as_text(rel_path: str, ext: str, read_head) -> bool:
 
 
 def _read_head(rp: Path, size: int = 4096) -> str:
-    """先頭 `size` バイトを読み UTF-8／CP932（不正バイトは置換）でデコードする（`registry.resolve_lazy` の内容判定用）。読めなければ `_HeadUnreadable`。
+    """先頭 `size` バイトを読み UTF-8／CP932／EUC-JP（不正バイトは置換）でデコードする（`registry.resolve_lazy` の内容判定用）。読めなければ `_HeadUnreadable`。
     バイナリで `size` バイトちょうど読んでからデコードする（`Analyzer.head_bytes` の宣言どおりのバイト境界を守るため）。
     """
     try:
@@ -309,7 +309,7 @@ def encoding_caution_for(rp: Path) -> str | None:
 
 
 def read_full_text_and_raw(rp: Path) -> tuple[str, bytes]:
-    """ファイルをバイナリで 1 回だけ読み、全文（UTF-8／CP932・不正バイトは置換）と生バイト列の両方を返す。読めなければ `OSError`。
+    """ファイルをバイナリで 1 回だけ読み、全文（UTF-8／CP932／EUC-JP・不正バイトは置換）と生バイト列の両方を返す。読めなければ `OSError`。
     `ingest.world_graph` の Pass1 専用（構文解析用の全文と、アナライザごとの `head_bytes` でスライスする生バイト列を同一の読み取りから得る）。
     """
     raw = rp.read_bytes()
@@ -344,6 +344,24 @@ def status_document_doctype(rel_path: str, world: str, *, allow_content_sniff: b
         rel_path, ext, lambda size=4096: _read_head_for_status(world, rel_path, size),
         allow_content_sniff=allow_content_sniff)
     return _doctype_for_count(result, ext)
+
+
+def classify_by_name(rel_path: str) -> tuple[str, str] | None:
+    """名前（拡張子・パス）だけで決まる `(doctype, branch)`。ファイルの中身を読まないと決まらない・秘匿名・対象外は `None`。
+    台帳の行に doctype／branch が無いときの補完用（`branch` は `iter_world_documents` と同じ `source`／`office`）。
+    """
+    ext = Path(rel_path).suffix.lower()
+
+    def _no_read(size: int = 4096) -> str:
+        raise _HeadUnreadable("name_only")
+
+    result = classify_document(rel_path, ext, _no_read, allow_content_sniff=False)
+    if result["kind"] == "unreadable":
+        return None
+    doctype = _doctype_for_count(result, ext)
+    if doctype is None:
+        return None
+    return doctype, ("source" if result["kind"] == "code" else "office")
 
 
 def _doctype_for_count(result: dict, ext: str) -> str | None:

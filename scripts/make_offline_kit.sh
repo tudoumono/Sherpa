@@ -1026,7 +1026,7 @@ echo ""
 # ---------------------------------------------------------------------------
 MANIFEST="$OUT/MANIFEST.txt"
 {
-  echo "Sherpa offline-kit MANIFEST"
+  echo "Slouch offline-kit MANIFEST"
   echo "生成日時: $(date -Iseconds 2>/dev/null || date)"
   echo "SHERPA_VERSION: $SHERPA_VERSION"
   echo "APT_BASE_IMAGE: $APT_BASE_IMAGE"

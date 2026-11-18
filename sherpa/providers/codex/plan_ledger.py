@@ -439,7 +439,16 @@ def condition_mode(message: str | None) -> str:
 
 
 def _row_id(r: dict) -> str:
+    if r.get("kind") == "Executable":      # 実行名のノードは 1 つのビルドの定義に複数ある（path では見分けられない）
+        return r.get("cid") or r.get("name") or ""
     return r.get("path") or r.get("cid") or r.get("name") or ""
+
+
+def _target_name(t: dict, exec_names: Counter) -> str:
+    """回答の本文で探す名前。実行名のノードの path はビルドの定義なので実行名で探す（同じ実行名が複数の定義にあるときだけ定義のパスで見分ける）。"""
+    if t.get("kind") == "Executable" and t.get("name") and exec_names[t["name"]] == 1:
+        return t["name"]
+    return t["path"] or t["name"]
 
 
 def required_targets(results: list[dict]) -> tuple[dict, list[dict]]:
@@ -495,20 +504,22 @@ def _answer_lines(answer: str | None) -> list[str]:
 def _target_regexes(targets: dict) -> dict[str, re.Pattern]:
     """対象ごとの照合パターン。パス全体のほか、一意なファイル名・語幹でも拾う（`ABC.cbl` の `ABC`）。"""
     bases = Counter(); stems = Counter()
+    exec_names = Counter(t["name"] for t in targets.values() if t.get("kind") == "Executable")
     for t in targets.values():
-        p = t["path"] or t["name"]
+        p = _target_name(t, exec_names)
         base = p.rsplit("/", 1)[-1]
         bases[base] += 1
         stems[base.rsplit(".", 1)[0]] += 1
     out = {}
     for rid, t in targets.items():
-        p = t["path"] or t["name"]
+        p = _target_name(t, exec_names)
         base = p.rsplit("/", 1)[-1]
         stem = base.rsplit(".", 1)[0]
         alts = [p]
-        if bases[base] == 1 and len(base) >= 3:
+        full_path_only = t.get("kind") == "Executable" and exec_names[t["name"]] > 1
+        if not full_path_only and bases[base] == 1 and len(base) >= 3:
             alts.append(base)
-        if stems[stem] == 1 and len(stem) >= 3:
+        if not full_path_only and stems[stem] == 1 and len(stem) >= 3:
             alts.append(stem)
         out[rid] = re.compile(r"(?<![A-Za-z0-9_.\-])(?:" + "|".join(re.escape(a) for a in dict.fromkeys(alts))
                               + r")(?![A-Za-z0-9_\-])", re.IGNORECASE)

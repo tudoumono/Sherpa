@@ -178,12 +178,15 @@ def test_xlsx_range_truncates_when_exceeding_max_rows_cols(tmp):
     assert len(r["rows"]) == 3 and all(len(row) == 2 for row in r["rows"])
 
 
-def test_xlsx_range_max_rows_cols_are_clamped_even_if_caller_asks_for_more(tmp):
+def test_xlsx_range_default_is_200x50_and_larger_max_is_honored(tmp):
     p = tmp / "a.xlsx"
     _make_xlsx(p, rows=300, cols=60)
-    r = DR.xlsx_range(_open(p), "Sheet1", max_rows=10_000, max_cols=10_000)
+    r = DR.xlsx_range(_open(p), "Sheet1")
     assert len(r["rows"]) == 200 and all(len(row) == 50 for row in r["rows"])
-    assert r["truncated"] is True
+    assert r["truncated"] is True and r["next_range"] == "A201:BH300" and r["next_cols_range"] == "AY1:BH200"
+    r = DR.xlsx_range(_open(p), "Sheet1", max_rows=10_000, max_cols=10_000)
+    assert len(r["rows"]) == 300 and all(len(row) == 60 for row in r["rows"])
+    assert r["truncated"] is False and "next_range" not in r
 
 
 def test_xlsx_range_none_cell_becomes_empty_string(tmp):

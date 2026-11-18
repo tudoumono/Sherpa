@@ -144,7 +144,7 @@ report_leftovers() {  # $1=停止前に控えた pid の一覧（空白区切り
     if kill -0 "$p" 2>/dev/null; then left="$left $p"; fi
   done
   [ -n "$left" ] || return 0
-  echo "  次のプロセスがアプリの停止後も残っています（この Sherpa が起動したもの）。不要なら kill してください:" >&2
+  echo "  次のプロセスがアプリの停止後も残っています（この Slouch が起動したもの）。不要なら kill してください:" >&2
   for p in $left; do
     ps -o pid=,ppid=,etime=,args= -p "$p" 2>/dev/null | cut -c1-200 | sed 's/^/    /' >&2 || true
   done
@@ -290,7 +290,7 @@ stop_pid() {  # $1=表示名  $2=pidファイル  $3=コマンドライン照合
 
 stop_systemd_units
 if [ "$STOP_ONLY" != "worker" ]; then
-  stop_pid "Sherpa アプリ" "$APP_PID_FILE" "$APP_PROC_NEEDLE" app
+  stop_pid "Slouch アプリ" "$APP_PID_FILE" "$APP_PROC_NEEDLE" app
 fi
 if [ "$STOP_ONLY" != "app" ]; then
   stop_pid "取り込みワーカー" "$WORKER_PID_FILE" "$WORKER_PROC_NEEDLE" worker

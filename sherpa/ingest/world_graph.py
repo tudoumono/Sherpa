@@ -22,7 +22,7 @@ from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
 from .. import corpus_docs, doc_text, scope_infer, text_encoding, worlds
-from . import importance, resolve_settings, substage, text_kind
+from . import build_link, importance, resolve_settings, substage, text_kind
 from .analyzers import registry as analyzer_registry
 from .analyzers import _vb_project as vb_project
 from .analyzers._base import FileContext, RefResult, TypeCandidate, TypeLookup, TypeRelations
@@ -498,6 +498,7 @@ EDGE_RULES = frozenset({
     "dictionary_match",      # 資料の本文と定義名の辞書突合（言及）
     "dd_name_match",         # COBOL の `ASSIGN TO` の DD 名と、JCL の `DD` 文の DSN の一致
     "copy_item_name",        # 手続き部の名前が、COPY で取り込んだコピーブックの項目名に一致
+    "build_definition",      # ビルドの定義に書かれた実行名と材料の組
 })
 
 
@@ -912,6 +913,21 @@ def unparsed_sources_from_flags(flags) -> dict:
             oversize.add(f.get("from"))
     return {"syntax": len(syntax), "size_exceeded": len(oversize)}
 
+BUILD_REPORT_REASON = "build_report"
+
+
+def pop_build_report(flags: list) -> tuple:
+    """`build_world` の `flags` から、ビルドの定義の読み取りの報告を取り出す。`(報告・無ければ空, 残りの flags)` を返す（報告は取り込みの注意に数えない）。"""
+    report: dict = {}
+    rest: list = []
+    for f in flags:
+        if f.get("reason") == BUILD_REPORT_REASON:
+            report = f.get("report") or {}
+        else:
+            rest.append(f)
+    return report, rest
+
+
 USE_AMBIGUOUS_NAMES_MAX = 5   # `use_ambiguous` の申告に載せる名前の上限
 
 def _dataset_value(bindings: list) -> str | None:
@@ -1037,7 +1053,7 @@ def _dataflow_pass(world_id: str, nodes: dict, link_edges: list, io_by_rel: dict
     return new_nodes, raw, flags, unresolved
 
 
-def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
+def build_world(world_dir, world_id: str, *, files=None, resolve_config=None, build_marks=None):
     """資料フォルダ（登録ディレクトリ）を `(nodes, edges, flags)` にする。パス同一性＋同 top_scope 内の最近傍解決。
 
     骨格（Pass1/Pass2＝COPIES/CONTAINS/INVOKES/ACCESSES）と言及エッジ（Pass3）だけを決定的に構築する。
@@ -1045,6 +1061,7 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
     `_重要度.txt` はここで除外する。
     `resolve_config`（省略可）: 資料フォルダの解決範囲の設定 `{copy_paths, path_aliases}`（`resolve_settings` で正規化済み）。
     最近傍で決まらない COPY を `copy_paths` で、`#include` の別名を `path_aliases` で解く。無ければ今までの解決だけ。
+    `build_marks`（省略可）: ビルドの定義を読む場所の印 `{パス: read|skip}`（`build_marks.load`）。
     """
     from .analyzers import _ts
     _ts.require()   # Tree-sitter の本体と文法が読めなければ、ここで取り込みを失敗させる（ファイルごとの失敗に散らさない）
@@ -1515,6 +1532,7 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
     io_by_rel: dict = {}           # COBOL の rel -> (Module の cid, [FileIo])（データの流れの段の入力）
     dd_by_rel: dict = {}           # JCL の rel -> [DdBinding]
     names_by_rel: dict = {}        # COBOL の rel -> (Module の cid, 手続き部に出るコピーブックの項目名 -> 最初の行)
+    exec_calls: list = []          # 実行物の呼び出しのうち、今つながらないもの（ビルドの定義の段の入力）
     item_names = {n["name"] for n in nodes.values() if n["label"] == "DataItem"}
 
     def _with_global_imports(analyzer, rel, file_context):
@@ -1673,6 +1691,10 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
                     item["candidates"] = f["candidates"]
                 unresolved_by_rel.setdefault(rel, []).append(item)
                 unresolved_subject[rel] = file_src
+                if (ref.edge_type == "INVOKES" and ref.kind == "Module" and not ref.reverse
+                        and f["reason"] in build_link.UNLINKED_REASONS and build_link.is_exec_call(analyzer.name, ref.extra)):
+                    exec_calls.append(build_link.Call(rel, src, str(ref.name), ref.line, (ref.extra or {}).get("via"),
+                                                      from_def, f, item))
 
     # データの流れ（ファイル経由の受け渡し・コピーブック項目の使用）を、集約の前に候補として足す
     flow_nodes, flow_edges, flow_flags, flow_unresolved = _dataflow_pass(
@@ -1683,6 +1705,23 @@ def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
     for rel, items in flow_unresolved.items():
         unresolved_by_rel.setdefault(rel, []).extend(items)
         unresolved_subject[rel] = io_by_rel[rel][0]
+
+    # ビルドの定義の段（データの流れの後）: つながらない実行物の呼び出しを実行名のノードへ張り、つないだ分の未解決の申告を取り消す
+    built = build_link.link_builds(world_id, files, exec_calls, rel_name, build_marks)
+    nodes.update(built.nodes)
+    link_edges.extend(built.edges)
+    if built.linked:
+        linked_flags = {id(c.flag) for c in built.linked}
+        linked_items = {id(c.item) for c in built.linked}
+        flags[:] = [f for f in flags if id(f) not in linked_flags]
+        for rel in {c.rel for c in built.linked}:
+            kept = [it for it in unresolved_by_rel[rel] if id(it) not in linked_items]
+            if kept:
+                unresolved_by_rel[rel] = kept
+            else:
+                del unresolved_by_rel[rel]
+    if built.report:
+        flags.append({"reason": BUILD_REPORT_REASON, "report": built.report})
 
     # 同一 (src,type,dst) の複数候補を 1 本へ集約してから確定する（全 Pass2 エッジに適用・nodes/flags は不変）
     edges.extend(_aggregate_pass2_edges(link_edges))

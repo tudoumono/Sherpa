@@ -7,6 +7,8 @@
 - `ask_user` は Codex にも公開する。質問カードはラッパー（`agents._run_authoring`）が届け、ここは「届いた・調査をやめて要約せよ」のツール結果を返すだけ。
   1 実行 1 回の上限は本サーバのプロセス寿命で数える（エージェント＝MCP 接続ごとに別プロセスなので、multi_agent の子は親と別カウント）。
 - `SHERPA_MCP_ASK_DISABLED=1`（確認ID 付き再送）では `ask_user` を tools/list から外す。それでも呼ばれたら初回でも `_ASK_RESULT_AGAIN` を返す（質問カードを出さないまま調査を打ち切らせない）。
+- 道具 1 回ごとに期限（`SHERPA_MCP_TOOL_DEADLINE_SEC`・既定 120 秒）を付ける。サーバーは 1 行ずつ同期で処理するため、1 件が止まると後続の呼び出しも待たされる。
+  `ripgrep_search`／`graph_neighbors` は期限までに見つけた分を `deadline_exceeded: true`・`notice` つきで返し、それ以外で期限を超えた道具は `{"error": "tool_deadline_exceeded"}`（`isError`）の通常の結果にする。
 - `SHERPA_MCP_SIDECAR`（JSONL パス・codex_home 配下など model-shell の書込許可領域の外）が設定されていれば、読取系ツールの doc_id と ask_user の質問だけを本文なしで追記する。
   multi_agent の子の MCP 呼出は親の `--json` に現れないため、`providers/codex/provider.py` が codex exec 終了後にこのファイルを読み、子が読んだ資料を出典へ・子の ask_user を確認カードへ合流させる。未設定なら何もしない。
 """
@@ -14,13 +16,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import agentic_search, es_index, graph_coverage, graph_tools, investigation_ledger, tool_call_log, tool_dispatch
+from . import (agentic_search, es_index, graph_coverage, graph_tools, grep_tool, investigation_ledger, proxy_bypass,
+               scope_infer, tool_call_log, tool_dispatch)
 from .ingest.world_neo4j import GraphSchemaEraError
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -38,6 +42,12 @@ _ASK_RESULT_FIRST = "質問はユーザーに届きました。追加調査は�
 _ASK_RESULT_AGAIN = "既に質問済みです。調査を続けて回答をまとめてください。"
 
 _LEDGER_TOOLS = frozenset({"ledger_manifest_set", "ledger_item_put", "ledger_status", "ledger_review_put"})
+
+# 道具 1 回あたりの期限（秒）。Codex CLI の MCP 道具の待ち上限（300 秒）より必ず短くする。
+_TOOL_DEADLINE_DEFAULT_SEC = 120.0
+_TOOL_DEADLINE_MAX_SEC = 280.0
+_TOOL_DEADLINE_NOTICE = ("時間内に探し終えられませんでした。検索語をより具体的な語に絞るか、範囲を選び直すか、"
+                         "別の道具（es_search や、name_pattern で名前を絞れる list_docs など）で調べてください")
 
 # 素の Codex モード（`plain`）で公開するツールの全体。`_tool_defs()`・`handle()` のどちらもこの集合だけを見る。
 _PLAIN_TOOLSET = frozenset({"graph_neighbors", "ask_user"})
@@ -205,10 +215,12 @@ def _toolset() -> str:
 _DESC_GRAPH_PLAIN = (
     "関係グラフから、ある名前（プログラム/コピーブック/ジョブ/データ項目/テーブルなど）の関連部品"
     "（コピー・呼び出し・参照・関連文書（言及）の近傍）を、辺ごとの種類と向き（from→to）付きの経路で返す。"
-    "COPIES／INVOKES／ACCESSES／CONTAINS だけの経路は構造的な依存＝根拠にしてよい（影響は矢印をさかのぼる: "
+    "COPIES／INVOKES／ACCESSES／CONTAINS／BUILT_FROM だけの経路は構造的な依存＝根拠にしてよい（影響は矢印をさかのぼる: "
     "A →COPIES→ B は B を変えると A が影響を受ける）。DOCUMENTS（言及）・CORRESPONDS_TO（同名の対応）や "
-    "`unverified` の辺を含む経路は候補＝原本で確認する。名前は完全一致で引く（シェルで正確な名前を見つけてから"
-    "渡す）。近傍が上限で切られたときは truncated:true と count（総数）が付く＝その範囲は未確認として扱う。"
+    "`unverified` の辺を含む経路は候補＝原本で確認する。種類 Executable は呼ばれる実行名で、BUILT_FROM の先が材料のソース"
+    "（実行名は材料のソースとビルドの定義の行を根拠に書く）。名前は完全一致で引く（シェルで正確な名前を見つけてから"
+    "渡す）。名前に当てはまる起点が多すぎる（既定 50 件超）ときは、関係をたどらずに too_broad（anchors・by_folder・by_kind の件数）を"
+    "返す＝path_prefix（フォルダ）か kind（種類）で絞って聞き直す。近傍が上限で切られたときは truncated:true・count（総数）・next_offset が付く＝同じ条件に offset=next_offset を付けて呼び直すと続きが取れる。truncated:true で next_offset が無いときは続きが取れない＝その範囲は未確認として扱う。"
     "coverage.complete が false のとき（時間切れ・件数の上限・文書探索の打ち切り・カード数の上限）は、近傍が空でも"
     "「近傍なし」とは言えない＝未確認（理由は coverage.limits[].kind）。"
 )
@@ -417,6 +429,8 @@ def _coverage_outcome(name: str, result, is_error: bool) -> str | None:
     if not isinstance(result, dict):
         return "error"
     if is_error:
+        if result.get("error") == "tool_deadline_exceeded":
+            return "timeout"
         if name in _ITEM_READ_TOOLS:
             if result.get("error_code") == agentic_search._READ_INVALID_ARGS_ERROR_CODE:
                 return None  # 呼び出し側の引数誤り（範囲外・型不正）は読めない扱いにしない
@@ -442,7 +456,7 @@ def _coverage_outcome(name: str, result, is_error: bool) -> str | None:
             return "truncated"
         return "hit"
     if name in _ITEM_LIST_TOOLS:
-        return "truncated" if result.get("truncated") else "hit"
+        return "truncated" if (result.get("truncated") or result.get("next_offset") is not None) else "hit"
     if name in ("graph_resolve", "graph_impact"):
         if result.get("error_code"):  # `graph_unavailable`/`graph_internal_error`（isError ではない縮退）
             return "error"
@@ -506,7 +520,7 @@ def _coverage_detail(name: str, args) -> dict:
     elif name in READ_DOC_TOOLS or name in LISTED_DOC_TOOLS:
         detail["doc"] = _s("doc_id")
         if name == "read_doc":
-            detail["range"] = f"{_n('start_line') or 1} 行目から"
+            detail["range"] = f"{_n('start_line') or 1} 行目" + (f"の {_n('start_char')} 文字目" if _n("start_char") else "") + "から"
         elif name == "read_around":
             line, window = _n("line"), _n("window")
             if line is not None:
@@ -525,11 +539,7 @@ def _coverage_detail(name: str, args) -> dict:
         elif name == "file_head":
             mb = _n("max_bytes")
             detail["range"] = f"先頭 {mb if mb is not None else 65536} バイト"
-    # 資料名は秘匿名なら記録しない。検索語・グラフの名前は、個人ファイルを使ったターン（`SHERPA_MCP_COVERAGE_NO_QUERY`）では記録しない。
-    from .ingest import text_kind
-    if detail.get("doc"):
-        names = [d for d in detail["doc"].split(" ⇔ ") if not text_kind.is_sensitive_doc_id(d)]
-        detail["doc"] = " ⇔ ".join(names)
+    # 検索語・グラフの名前は、個人ファイルを使ったターン（`SHERPA_MCP_COVERAGE_NO_QUERY`）では記録しない。
     if os.environ.get("SHERPA_MCP_COVERAGE_NO_QUERY") == "1":
         detail.pop("query", None)
     return {k: v for k, v in detail.items() if v}
@@ -587,15 +597,19 @@ def _env_int_override(var_name: str) -> int | None:
     return v if v > 0 else None
 
 
-# 原本読取ツール 5 本。応答 1 件を Codex CLI が中央を落とす上限（約 40,000 バイト）より小さくするため、`SHERPA_MCP_READER_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
-_READER_BUDGET_TOOLS = frozenset({"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"})
+# 原本読取ツール 7 本（`read_doc`／`read_around` を含む）。応答 1 件を Codex CLI が中央を落とす上限（約 40,000 バイト）より小さくするため、`SHERPA_MCP_READER_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
+_READER_BUDGET_TOOLS = frozenset({"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "read_doc", "read_around"})
+# 検索ツール 4 本（`folder_tree`・`graph_neighbors` を含む）。同じく CLI が中央を落とさない大きさにするため、`SHERPA_MCP_SEARCH_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
+_SEARCH_BUDGET_TOOLS = frozenset({"ripgrep_search", "es_search", "folder_tree", "graph_neighbors"})
 
 
 def _tool_budget_bytes(name: str) -> int | None:
-    """`run_tool` へ渡す 1 件あたりのバイト予算。原本読取ツールだけ `SHERPA_MCP_READER_BUDGET_BYTES` との小さい方（未設定なら全ツール共通の予算）。"""
+    """`run_tool` へ渡す 1 件あたりのバイト予算。原本読取ツールは `SHERPA_MCP_READER_BUDGET_BYTES`、検索ツールは `SHERPA_MCP_SEARCH_BUDGET_BYTES` との小さい方（未設定なら全ツール共通の予算）。"""
     base = _env_int_override("SHERPA_MCP_TOOL_BUDGET_BYTES")
-    if name in _READER_BUDGET_TOOLS:
-        cap = _env_int_override("SHERPA_MCP_READER_BUDGET_BYTES")
+    cap_var = ("SHERPA_MCP_READER_BUDGET_BYTES" if name in _READER_BUDGET_TOOLS
+               else "SHERPA_MCP_SEARCH_BUDGET_BYTES" if name in _SEARCH_BUDGET_TOOLS else None)
+    if cap_var:
+        cap = _env_int_override(cap_var)
         if cap:
             return min(base, cap) if base else cap
     return base
@@ -709,25 +723,33 @@ def _clip_hits_field(result: dict, max_bytes: int, *, offset: int, allow_next_of
     return _clip_hits_partial_first_hit(result, max_bytes, offset=offset, allow_next_offset=allow_next_offset)
 
 
-_PARTIAL_LINE_NOTE_TMPL = "先頭行が長すぎるため行の途中まで。以降は start_line={next_start} から"
+_PARTIAL_LINE_NOTE_TMPL = "行の途中まで。続きは start_line={line}・start_char={next_char} から"
 
 
 def _clip_read_doc_partial_first_line(result: dict, max_bytes: int, first_line: str, start_line: int):
-    """`_clip_read_doc_field` で 1 行も丸ごとは残せないときの最終手段。先頭行の本文をバイト単位で縮めて、空文字を返さない。
-    `end_line=start_line`（その行を消費済み扱い）にして進捗を保証する（進捗ゼロだと続きが重複拒否で進まない）。行の残りは読めない（`partial_line=true`・`note` で明示）。
+    """`_clip_read_doc_field` で 1 行も丸ごとは残せないときの最終手段。先頭行の本文を文字単位で縮める（毎回 1 文字以上進める）。
+    返した分だけを読んだ扱いにし、`next_char`（その行の続きの位置）と `partial_line=true` を付ける。
     """
-    first_bytes = first_line.encode("utf-8")
+    m = re.match(r"\d+: ", first_line)
+    prefix = m.group(0) if m else ""
+    content = first_line[len(prefix):]
+    base = result.get("start_char") if isinstance(result.get("start_char"), int) else 0
 
-    def _build(byte_len: int) -> dict:
+    def _build(n_chars: int) -> dict:
         r = dict(result)
-        r["text"] = agentic_search._clip_utf8_bytes(first_line, byte_len)
+        r["text"] = prefix + content[:n_chars]
         r["truncated"] = True
-        r["partial_line"] = True
         r["end_line"] = start_line
-        r["note"] = _PARTIAL_LINE_NOTE_TMPL.format(next_start=start_line + 1)
+        if n_chars < len(content):
+            r["partial_line"] = True
+            r["next_char"] = base + n_chars
+            r["note"] = _PARTIAL_LINE_NOTE_TMPL.format(line=start_line, next_char=base + n_chars)
+        else:
+            r.pop("next_char", None)
+            r.pop("partial_line", None)
         return r
 
-    lo, hi, best = 0, len(first_bytes), -1
+    lo, hi, best = 1, len(content), 0
     while lo <= hi:
         mid = (lo + hi) // 2
         if _json_bytes(_build(mid)) <= max_bytes:
@@ -735,7 +757,7 @@ def _clip_read_doc_partial_first_line(result: dict, max_bytes: int, first_line: 
             lo = mid + 1
         else:
             hi = mid - 1
-    if best < 0:
+    if best < 1:
         return None
     return _build(best), True
 
@@ -788,6 +810,8 @@ def _clip_graph_neighbors(result: dict, max_bytes: int):
     if not isinstance(neighbors, list):
         return None
     kept = list(neighbors)
+    offset = result.get("offset") if isinstance(result.get("offset"), int) else 0
+    unverified_cards = (result.get("unverified") or {}).get("cards", 0)
     up = result.get("coverage") or {}
     unknown = not up.get("complete", True) and up.get("omitted") is None  # 上流が部分結果で総数が不明
 
@@ -809,6 +833,11 @@ def _clip_graph_neighbors(result: dict, max_bytes: int):
             r["coverage"] = _cov(dropped)
             r["truncated"] = True
             r["count"] = count
+            # 続きは最初に落とした近傍から。確認できず除いたカードがある・取得が部分結果のときは元の位置を数えられないので、続きの位置は付けない
+            if unverified_cards or unknown or not kept:
+                r.pop("next_offset", None)
+            else:
+                r["next_offset"] = offset + len(kept)
         if _json_bytes(r) <= max_bytes:
             return r, True
         if not kept:
@@ -816,11 +845,36 @@ def _clip_graph_neighbors(result: dict, max_bytes: int):
         kept.pop()
     # 近傍を 0 件にしても収まらない: 固定欄だけの最小形、それも入らなければ明示のエラー（`hit` に分類させない）
     minimal = {"neighbors": [], "truncated": True, "count": count, "coverage": _cov(len(neighbors))}
+    if offset:
+        minimal["offset"] = offset
     if result.get("error_code"):
         minimal["error_code"] = result["error_code"]
     if _json_bytes(minimal) <= max_bytes:
         return minimal, True
     err = {"error": "tool_result_budget_too_small"}
+    return (err, True) if _json_bytes(err) <= max_bytes else None
+
+
+def _clip_glob_paths(result: dict, max_bytes: int):
+    """`glob_search` の結果を、`count`・`generation` などの固定欄を残したまま `paths` の末尾から削って収める。
+    `next_offset` は「そのページの offset＋残した件数」に計算し直す（続きで重複も欠けも出さない）。1 件も収まらなければ `tool_result_budget_too_small`（続きの位置は返さない）。
+    """
+    paths = result.get("paths")
+    if not isinstance(paths, list):
+        return None
+    offset = result.get("offset") if isinstance(result.get("offset"), int) else 0
+    for keep in range(len(paths), 0, -1):
+        r = dict(result)
+        r["paths"] = paths[:keep]
+        if keep < len(paths):
+            r["truncated"] = True
+            r["next_offset"] = offset + keep
+        if _json_bytes(r) <= max_bytes:
+            return r, True
+    if not paths:
+        return None
+    # 1 件も収まらない: 進まない続きの位置は返さず、予算不足として返す
+    err = {"error": "tool_result_budget_too_small", "hint": _TOOL_RESULT_BUDGET_TOO_SMALL_HINT, "offset": offset}
     return (err, True) if _json_bytes(err) <= max_bytes else None
 
 
@@ -835,8 +889,7 @@ def _clip_tool_result(result, name: str | None = None, args: dict | None = None)
     """
     if not isinstance(result, dict):
         return result, False
-    max_bytes = _env_int_override("SHERPA_MCP_TOOL_BUDGET_BYTES") \
-        or agentic_search.effective_tool_result_max_bytes()
+    max_bytes = _tool_budget_bytes(name) or agentic_search.effective_tool_result_max_bytes()
     size = _json_bytes(result)
     if size <= max_bytes:
         return result, False
@@ -847,6 +900,8 @@ def _clip_tool_result(result, name: str | None = None, args: dict | None = None)
         structured = graph_tools.fit_to_bytes(result, max_bytes)
     if structured is None and name == "graph_neighbors":
         structured = _clip_graph_neighbors(result, max_bytes)
+    if structured is None and name == "glob_search":
+        structured = _clip_glob_paths(result, max_bytes)
     if structured is None:
         structured = _clip_read_doc_field(result, max_bytes)
     if structured is not None:
@@ -887,11 +942,32 @@ _DUPLICATE_CHECK_EXEMPT_TOOLS = frozenset({"ask_user"}) | _BUDGET_EXEMPT_TOOLS
 _DUPLICATE_REPLAY_TOOLS = frozenset({"graph_impact", "pdf_page_image"})
 
 
+def _glob_key_args(args: dict) -> dict:
+    """`glob_search` の重複のキー用の引数。検索と同じ形にする（pattern は検索と同じ検証・照合の形・offset 0 では offset も generation も見ない）。"""
+    from .parts.read import tools as read_tools
+    out = {k: args[k] for k in ("pattern", "offset", "generation") if k in args}   # 検索が使う引数だけ（未定義の引数は無視する）
+    if isinstance(out.get("pattern"), str):
+        valid = read_tools._validate_glob_pattern(out["pattern"])
+        out["pattern"] = read_tools._glob_match_pattern(valid).lower() if valid is not None else out["pattern"]
+    try:
+        offset = int(out.get("offset") or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    if offset <= 0:
+        out.pop("generation", None)
+        out.pop("offset", None)
+    else:
+        out["offset"] = offset
+    return out
+
+
 def _dedup_key(name: str, args) -> tuple | None:
     """重複判定と結果区分キャッシュが共有する正規化キー。`item`（台帳の項目 id）は除く。直列化できない引数は `None`（同一性を判定できない・fail-open）。"""
     try:
         _key_args = ({k: v for k, v in args.items() if k != "item"}
                     if isinstance(args, dict) else args)
+        if name == "glob_search" and isinstance(_key_args, dict):
+            _key_args = _glob_key_args(_key_args)
         return (name, json.dumps(_key_args, sort_keys=True, ensure_ascii=False))
     except TypeError:
         return None
@@ -911,6 +987,17 @@ def _is_duplicate_tool_call(name: str, args: dict) -> bool:
     if len(_seen_tool_calls) > _DUPLICATE_CALL_CACHE_MAX:
         _seen_tool_calls.popitem(last=False)
     return False
+
+
+def _forget_glob_first_page(args: dict) -> None:
+    """`glob_search` が generation の違いを返したとき、先頭ページ（offset 0・generation なし）の重複のキーを消し、取り直しを通す。ほかの呼び出しのキーは消さない。"""
+    if not isinstance(args, dict):
+        return
+    base = {k: v for k, v in args.items() if k not in ("offset", "generation")}
+    for cand in (base, {**base, "offset": 0}):
+        key = _dedup_key("glob_search", cand)
+        if key is not None:
+            _seen_tool_calls.pop(key, None)
 
 
 def _record_duplicate_item_coverage(name: str, args: dict) -> None:
@@ -938,6 +1025,18 @@ def _ok(rid, result: dict) -> dict:
 
 def _err(rid, code: int, msg: str) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
+
+
+def _tool_deadline_sec() -> float:
+    """`SHERPA_MCP_TOOL_DEADLINE_SEC`（秒）。未設定・不正値・0 以下は既定、上限は `_TOOL_DEADLINE_MAX_SEC`。"""
+    raw = os.environ.get("SHERPA_MCP_TOOL_DEADLINE_SEC", "").strip()
+    try:
+        v = float(raw) if raw else _TOOL_DEADLINE_DEFAULT_SEC
+    except ValueError:
+        return _TOOL_DEADLINE_DEFAULT_SEC
+    if not (v > 0) or v == float("inf"):
+        return _TOOL_DEADLINE_DEFAULT_SEC
+    return min(v, _TOOL_DEADLINE_MAX_SEC)
 
 
 def _handle_tool_call(rid, params: dict) -> dict:
@@ -982,6 +1081,7 @@ def _handle_tool_call(rid, params: dict) -> dict:
                    "hint": "同じ条件の検索は既に実行済みです。条件を変えてください。"}
         return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                          "isError": True})
+    deadline = time.monotonic() + _tool_deadline_sec()
     try:
         # 調べる深さ連動込みの実効 hits/window（`SHERPA_MCP_TOOL_MAX_HITS`/`_WINDOW_CAP`）とバイト予算を `run_tool()` の内部クリップにも渡す。env 未設定/不正値は `None`＝`run_tool()` の既定。後段の `_clip_tool_result` は最終形を保証する多層防御。
         result, _docs, _cites, _cards = tool_dispatch.run_tool(
@@ -989,7 +1089,14 @@ def _handle_tool_call(rid, params: dict) -> dict:
             max_hits=_env_int_override("SHERPA_MCP_TOOL_MAX_HITS"),
             window_cap=_env_int_override("SHERPA_MCP_TOOL_WINDOW_CAP"),
             tool_result_max_bytes=_tool_budget_bytes(name),
-            graph_only=(_toolset() == "plain"))
+            graph_only=(_toolset() == "plain"), deadline=deadline, partial_on_deadline=True)
+    except (grep_tool.GrepDeadlineExceeded, scope_infer.ScopeWalkDeadlineExceeded):
+        # 期限を超えた道具は JSON-RPC のエラーにせず通常の道具の失敗として返し、サーバーは次の行へ進む。
+        err_body = {"error": "tool_deadline_exceeded", "notice": _TOOL_DEADLINE_NOTICE}
+        _sidecar_append({"kind": "limit", "field": "search_truncated", "ts": time.time()})
+        _record_item_coverage(name, args, err_body, True)
+        return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
+                         "isError": True})
     except GraphSchemaEraError as e:
         # `graph_neighbors` が検知した旧世代グラフは、JSON-RPC のプロトコルエラーにせず通常のツール結果（`isError` あり・`content[].text` に機械可読コード）で返す。`providers/codex/mcp.py::_graph_schema_era_from_item` が `GraphSchemaEraError` を再構成する。
         err_body = {"error": agentic_search.GRAPH_REINGEST_ERROR_CODE,
@@ -999,6 +1106,8 @@ def _handle_tool_call(rid, params: dict) -> dict:
         return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                          "isError": True})
     is_error = bool(isinstance(result, dict) and result.get("error"))
+    if name == "glob_search" and is_error and result.get("error") == "glob_generation_mismatch":
+        _forget_glob_first_page(args)
     _sidecar_error_code(name, result)
     # `run_tool()` 自身が内部で行った打ち切りをサイドカーへ記録する（API 経路の `agentic_search._SEARCH_TRUNCATED_TOOLS`/`_BYTE_CLIP_TOOLS` と同じ判定キー・語彙）。`_tool_result_clipped_recorded` は 1 回の呼び出しで `tool_result_clipped` を二重に書かないためのフラグ。
     _tool_result_clipped_recorded = False
@@ -1031,9 +1140,18 @@ def _handle_tool_call(rid, params: dict) -> dict:
         is_error = is_error or bool(isinstance(result, dict) and result.get("error"))
     # `item` 付き呼出しの結果区分を台帳へ記録する（Codex へ返す最終形＝クリップ後の `result`/`is_error` を使う）。
     _record_item_coverage(name, args, result, is_error)
-    # MCP 標準＝content[].text。Codex が読む本文は run_tool の結果。
+    # MCP 標準＝content[].text。Codex が読む本文は run_tool の結果。外へ出る最後の網として、管理者の除外の資料を落とす（設定が無ければそのまま）。
+    from . import path_rules
+    result = path_rules.filter_output(result, _world())
+    _recount_returned_docs(result)
     text = json.dumps(result, ensure_ascii=False)
     return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": is_error})
+
+
+def _recount_returned_docs(result) -> None:
+    """最終のクリップと管理者の除外の濾過の後に `returned_docs` を数え直す（`parts.read.tools.recount_returned_docs`）。"""
+    from .parts.read.tools import recount_returned_docs
+    recount_returned_docs(result)
 
 
 _call_log_writer: tool_call_log.CallLogWriter | None = None
@@ -1174,4 +1292,5 @@ def serve(stdin=None, stdout=None) -> None:
 
 
 if __name__ == "__main__":
+    proxy_bypass.apply({})  # 設定 DB には繋がない（親が組んだ NO_PROXY を使う）
     serve()

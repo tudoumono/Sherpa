@@ -24,6 +24,12 @@ from sherpa import es_index, json_io, store, worlds
 from sherpa.ingest import office_md, worker, world_neo4j
 
 
+@pytest.fixture(autouse=True)
+def _ocr_on(monkeypatch):
+    """OCR の既定は切。この file は OCR を入れた状態の挙動を見る。"""
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
+
+
 def _build_world(tmp_path):
     wd = tmp_path / "world"
     wd.mkdir()
@@ -729,3 +735,18 @@ def test_sync_refresh_failure_with_run_id_finalizes_as_failed(
     assert len(finished) == 1 and finished[0]["run_id"] == 999
     assert finished[0]["status"] == "failed"
     assert any(r and reason_check(r) for r in _flag_reasons(finished))
+
+
+def test_sync_unchanged_keeps_prior_encoding_undetermined_report_without_rerun(_stub, monkeypatch):
+    # 文字コードの判定を直しても、前回の集計に「判別できない」が残る資料フォルダは、原本が変わっていなければ取り込み直さない。
+    from sherpa import corpus_docs
+    report = {**corpus_docs.empty_scan_report(), "scanned": 3, "indexed": 2, "unreachable_as_text": 1,
+              "unreachable_by_reason": {"encoding_undetermined": 1}}
+    row = {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0, "last_scan_report": report}
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+    saved = []
+    monkeypatch.setattr(store, "set_scan_report", lambda world, rep: saved.append(rep))
+
+    res = worker.sync("w")
+    assert res["status"] == "unchanged" and res["changed"] is False
+    assert _stub["calls"]["run"] == [] and saved == []

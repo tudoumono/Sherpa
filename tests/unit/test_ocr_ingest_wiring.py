@@ -1,8 +1,8 @@
 """取り込みとOCRの接続（2026-08-16 S3-C）。
 
-OCRは**既定ON**（決定 2026-08-16「初期から組み込む」）。この suite が固定するのは4点。
+OCRは**既定OFF**（管理画面の設定か環境変数で入れる）。この suite が固定するのは4点。
 
-  1. 既定でルートが作られ、`SHERPA_OCR_ENABLED=0` で止められる
+  1. 既定ではルートを作らず、入れるとルートが作られ、`SHERPA_OCR_ENABLED=0` で止められる
   2. OCRルートは**公開前のステージング内**で作られる（Evidenceとルートが食い違う瞬間を作らない）
   3. OCR側の失敗は取り込み本体を巻き添えにしない（任意観測なので）
   4. 世代IDは投入側と照合側で同じ写像を通る（片方だけ生の署名を使うと永久に処理されない）
@@ -28,9 +28,23 @@ def _world(tmp_path: Path) -> tuple[Path, Path]:
     return source, tmp_path / "md"
 
 
-def test_ocr_runs_by_default(tmp_path, monkeypatch):
-    """既定（env 未設定）で OCR ルートが作られる。"""
-    monkeypatch.delenv(office_md._OCR_ENABLED_ENV, raising=False)
+def test_ocr_is_off_by_default(tmp_path, monkeypatch):
+    """既定（env 未設定・設定なし）ではルートを作らず、再実行の予約もしない。"""
+    monkeypatch.delenv("SHERPA_OCR_ENABLED", raising=False)
+    source, published = _world(tmp_path)
+
+    called = {"routes": 0}
+    monkeypatch.setattr(office_md, "_write_ocr_routes",
+                        lambda stage_ir, stage_rag: called.__setitem__("routes", called["routes"] + 1) or {})
+    rep = office_md.build_derived(str(source), str(published))
+
+    assert office_md.ocr_enabled() is False
+    assert called["routes"] == 0 and "ocr_routes" not in rep
+
+
+def test_ocr_runs_when_on(tmp_path, monkeypatch):
+    """入のとき OCR ルートが作られる。"""
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
     source, published = _world(tmp_path)
 
     called = {"routes": 0}
@@ -39,12 +53,12 @@ def test_ocr_runs_by_default(tmp_path, monkeypatch):
     office_md.build_derived(str(source), str(published))
 
     assert office_md.ocr_enabled() is True
-    assert called["routes"] == 1, "既定ONなのにOCRルートを作っていない"
+    assert called["routes"] == 1, "ONなのにOCRルートを作っていない"
 
 
 def test_ocr_can_be_turned_off(tmp_path, monkeypatch):
     """`SHERPA_OCR_ENABLED=0` で完全に止まる（ルートも作らない）。"""
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "0")
+    monkeypatch.setenv("SHERPA_OCR_ENABLED", "0")
     source, published = _world(tmp_path)
 
     called = {"routes": 0}
@@ -61,7 +75,7 @@ def test_ocr_can_be_turned_off(tmp_path, monkeypatch):
 def test_ocr_routes_are_written_into_staging_before_publish(tmp_path, monkeypatch):
     """有効時、ルートは公開前のステージングにできる＝公開と同時に切り替わる。
     `.ocr_route.json`/`.evidence.json` はいずれも ir 層（§8.1 三階層）に同居する。"""
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "1")
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
     source, published = _world(tmp_path)
     published_ir = published.parent / "ir"
     staging_ir = published_ir.with_name(published_ir.name + office_md._STAGING_SUFFIX)
@@ -90,7 +104,7 @@ def test_ocr_routes_are_written_into_staging_before_publish(tmp_path, monkeypatc
 
 def test_ocr_route_failure_does_not_block_canonical_publication(tmp_path, monkeypatch):
     """OCRは任意観測＝ルート生成が失敗しても本体の公開は止めない。"""
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "1")
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
     source, published = _world(tmp_path)
 
     def _boom(stage_ir, stage_rag):
@@ -139,7 +153,7 @@ def test_ingest_enqueues_with_a_valid_generation_id(tmp_path, monkeypatch):
     from sherpa.ingest import worker as ingest_worker
     from sherpa.store import ocr_jobs
 
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "1")
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
     seen: dict = {}
 
     def _enqueue(world, generation, profile, **kw):

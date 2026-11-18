@@ -16,7 +16,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 
-from sherpa import codex_jobs_worker, ext_api, log_setup, store
+from sherpa import codex_jobs_worker, ext_api, log_setup, proxy_bypass, store
 
 _log = logging.getLogger("sherpa")
 
@@ -40,6 +40,7 @@ async def lifespan(app):
         store.init_schema()
     except Exception as e:
         _log.warning("起動時のスキーマ初期化に失敗しました（DB 不達の可能性・lazy 初期化にフォールバックします）: %s", e)
+    proxy_bypass.apply()
     # ワーカーに拾われていない `status='extracting'` の run は、0.18.x の Web アプリがプロセス内で動かしていて強制死で残った孤児。
     # failed（中断）へ格下げする。ワーカーが拾った run（claimed_by あり）はワーカーが生死を見て扱う
     try:
@@ -70,12 +71,12 @@ async def lifespan(app):
         from sherpa import api, model_catalog
         api._seed_settings_from_env()
         api._seed_ollama_url_from_env()  # OLLAMA_URL は独立マーカーで一度だけシード
-        api._warn_central_ollama_not_allowed()
         api._seed_openai_endpoint_from_env()
         api._seed_depth_profile_from_env()
         api._seed_screen_settings_from_env()
         api._seed_user_agent_from_env()
         api._seed_vlm_ollama_url_from_env()  # _seed_ollama_url_from_env の後
+        proxy_bypass.apply()  # シードで入った Ollama の接続先を例外へ足す
         model_catalog.seed_catalog_once()
         api._purge_personal_keys_if_disabled_on_startup()
         api._warn_change_me_placeholders()

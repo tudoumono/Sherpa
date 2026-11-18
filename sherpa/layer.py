@@ -58,6 +58,15 @@ def in_layer_code(is_code: bool, layer) -> bool:
     return lv == "both" or layer_of_code(is_code) == lv
 
 
+def in_layer_row(row: dict, layer) -> bool:
+    """一覧の行（`branch`／`state`）の層一致。台帳から種類を補えなかった行（`branch` 空・`state="unknown"`）は層が決まらないので、どの層の絞り込みにも残す。
+    それ以外は `in_layer_code(branch=="source")`（歩いたときの行と同じ）。
+    """
+    if row.get("branch") is None and row.get("state") == "unknown":
+        return True
+    return in_layer_code(row.get("branch") == "source", layer)
+
+
 def es_filter(layer):
     """`es_index.search()`/`search_knn_only()` 用の層フィルタ節。`"both"` は `None`（フィルタなし）。
 

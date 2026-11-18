@@ -1,5 +1,5 @@
-"""GRA-1: `preview_service.graph_view` のプロセス内キャッシュ（world の `last_sig`＋`last_synced_at`
-を複合キーにした limit 適用前の全体 view キャッシュ）。`_build`（原本木＋意味層の再構築——Neo4j を
+"""GRA-1: `preview_service._get_graph_bundle` のプロセス内キャッシュ（world の `last_sig`＋`last_synced_at`
+を複合キーにしたグラフ構築結果のキャッシュ）。`_build`（原本木＋意味層の再構築——Neo4j を
 直接読み返す処理ではない）が呼ばれる回数を monkeypatch でカウントして検証する（外部サービス不要）。
 """
 from __future__ import annotations
@@ -43,7 +43,7 @@ def _resolved_by_default(monkeypatch):
 
 
 def _patch_build(monkeypatch, calls):
-    def _build(world):
+    def _build(world, files=None):
         calls.append(world)
         return _nodes_edges()
     monkeypatch.setattr(ps, "_build", _build)
@@ -67,12 +67,11 @@ def test_same_generation_uses_cache_build_called_once(monkeypatch):
     _patch_build(monkeypatch, calls)
     _patch_status(monkeypatch, _status("sig-a", "t1"))
 
-    r1 = ps.graph_view("w1")
-    r2 = ps.graph_view("w1")
+    r1 = ps._get_graph_bundle("w1")
+    r2 = ps._get_graph_bundle("w1")
 
     assert len(calls) == 1                       # 2回目は _build を呼ばない
-    assert r1["signature"] == r2["signature"]
-    assert r1["nodes"] == r2["nodes"]
+    assert r1["raw_nodes"] == r2["raw_nodes"]
 
 
 def test_sig_change_triggers_rebuild(monkeypatch):
@@ -81,16 +80,16 @@ def test_sig_change_triggers_rebuild(monkeypatch):
     status = {"v": _status("sig-a", "t1")}
     monkeypatch.setattr(ps, "_current_world_status", lambda world, **kw: dict(status["v"]))
 
-    ps.graph_view("w1")
+    ps._get_graph_bundle("w1")
     status["v"] = _status("sig-b", "t2")          # sync/rebind 相当で内容と世代の両方が変わる
-    ps.graph_view("w1")
+    ps._get_graph_bundle("w1")
 
     assert len(calls) == 2
 
 
 def test_aba_sig_returns_to_same_value_without_intervening_get_forces_rebuild(monkeypatch):
     """GRA-1是正#1（ABA）: concepts/extract 等の再実行は成功時に原本由来の同じ last_sig（`A`）へ
-    戻りうる（`A→""→A`）。その空文字を挟む窓の間に一度も `graph_view()` が呼ばれなくても、
+    戻りうる（`A→""→A`）。その空文字を挟む窓の間に一度も `_get_graph_bundle()` が呼ばれなくても、
     `last_synced_at`（pre-invalidate/確定のたびに必ず進む・`set_world_sig` の契約）が複合キーに
     入っていれば、sig だけが元に戻った再構築後の呼び出しはキャッシュを再利用せず必ず再構築する
     （sig 単独の旧実装なら1回のままで恒久ヒットするバグ）。
@@ -98,26 +97,25 @@ def test_aba_sig_returns_to_same_value_without_intervening_get_forces_rebuild(mo
     calls: list[str] = []
     _patch_build(monkeypatch, calls)
     # 呼び出し元（このテスト）の視点では "" を挟む窓の間に GET が来ない＝sig="A" の2つの異なる
-    # 世代（synced_at が違う）だけが見える。1回の graph_view() の miss 経路は「outer pre-check→
+    # 世代（synced_at が違う）だけが見える。1回の _get_graph_bundle() の miss 経路は「outer pre-check→
     # lock 内 recheck→post-build verify」で _current_world_status を3回呼ぶ（GRA-1是正RV2#2）。
     _patch_status_sequence(monkeypatch, [
         _status("A", "t1"), _status("A", "t1"), _status("A", "t1"),   # 1回目の呼び出し
         _status("A", "t2"), _status("A", "t2"), _status("A", "t2"),   # 2回目: sig は A に戻ったが世代（synced_at）は進んでいる
     ])
 
-    ps.graph_view("w1")
-    ps.graph_view("w1")
+    ps._get_graph_bundle("w1")
+    ps._get_graph_bundle("w1")
 
     assert len(calls) == 2
 
 
-def test_empty_sig_evicts_existing_entry_before_building(monkeypatch):
-    """GRA-1是正#6: 未同期/pre-invalidate 中（`sig` 空）は構築**前**に既存キャッシュを破棄し、
-    構築してもキャッシュしない（従来どおりの挙動）。"""
+def test_empty_sig_evicts_existing_entry_and_does_not_build(monkeypatch):
+    """署名が空（未同期・取り込みの事前の無効化・失敗のあと）なら、既存のキャッシュを捨て、グラフを組み立てずに理由を返す。"""
     calls: list[str] = []
     cache_had_entry_at_build_time: list[bool] = []
 
-    def _build(world):
+    def _build(world, files=None):
         cache_had_entry_at_build_time.append("w1" in ps._GRAPH_VIEW_CACHE)
         calls.append(world)
         return _nodes_edges()
@@ -125,30 +123,17 @@ def test_empty_sig_evicts_existing_entry_before_building(monkeypatch):
     monkeypatch.setattr(ps, "_build", _build)
 
     _patch_status(monkeypatch, _status("sig-a", "t1"))
-    ps.graph_view("w1")
+    ps._get_graph_bundle("w1")
     assert "w1" in ps._GRAPH_VIEW_CACHE           # 前提: 一度キャッシュされている
 
     _patch_status(monkeypatch, _status("", None))
-    ps.graph_view("w1")
+    monkeypatch.setattr(ps, "_running_note", lambda world, probe_timeout=None: None)   # 最新の run は実行中でない（失敗など）
+    monkeypatch.setattr(ps.store, "get_latest_published_run_summary", lambda world: {"published_snapshot": {}})
+    out = ps._get_graph_bundle("w1")
 
-    assert cache_had_entry_at_build_time == [False, False]   # 2回目の構築時点では既に破棄済み
+    assert out == {"graph_note": ps._NOTE_LAST_UNFINISHED}
     assert "w1" not in ps._GRAPH_VIEW_CACHE
-    assert len(calls) == 2
-
-
-def test_limit_variants_share_single_build(monkeypatch):
-    """limit 違い（絞り込み→全件の逆順でも）キャッシュは共有され、_build は1回だけ。"""
-    calls: list[str] = []
-    _patch_build(monkeypatch, calls)
-    _patch_status(monkeypatch, _status("sig-a", "t1"))
-
-    limited = ps.graph_view("w1", limit=1)
-    full = ps.graph_view("w1", limit=0)
-
     assert len(calls) == 1
-    assert full["total_nodes"] == 2 and full["truncated"] is False
-    assert limited["truncated"] is True and len(limited["nodes"]) == 1
-    assert full["signature"] == limited["signature"]   # 署名は limit 非依存・呼び出し順にも依存しない
 
 
 def test_different_worlds_do_not_share_cache(monkeypatch):
@@ -156,8 +141,8 @@ def test_different_worlds_do_not_share_cache(monkeypatch):
     _patch_build(monkeypatch, calls)
     _patch_status(monkeypatch, _status("sig-a", "t1"))
 
-    ps.graph_view("w1")
-    ps.graph_view("w2")
+    ps._get_graph_bundle("w1")
+    ps._get_graph_bundle("w2")
 
     assert calls == ["w1", "w2"]
 
@@ -171,15 +156,15 @@ def test_unresolved_root_is_not_cached_and_self_heals(monkeypatch):
     _patch_status(monkeypatch, _status("sig-a", "t1"))
     monkeypatch.setattr(ps, "_resolved_root", lambda root_path: False)   # 一時的に未解決
 
-    ps.graph_view("w1")
+    ps._get_graph_bundle("w1")
     assert "w1" not in ps._GRAPH_VIEW_CACHE
-    ps.graph_view("w1")
+    ps._get_graph_bundle("w1")
     assert len(calls) == 2                        # 未解決の間は毎回再構築（キャッシュされていない証拠）
 
     monkeypatch.setattr(ps, "_resolved_root", lambda root_path: True)    # 復旧
-    ps.graph_view("w1")
+    ps._get_graph_bundle("w1")
     assert "w1" in ps._GRAPH_VIEW_CACHE
-    ps.graph_view("w1")
+    ps._get_graph_bundle("w1")
     assert len(calls) == 3                        # 復旧後はキャッシュが効いて4回目は再構築しない
 
 
@@ -192,7 +177,7 @@ def test_generation_moved_during_build_is_not_published(monkeypatch):
     _patch_build(monkeypatch, calls)
     _patch_status_sequence(monkeypatch, [_status("A", "t1"), _status("A", "t1"), _status("B", "t2")])
 
-    ps.graph_view("w1")
+    ps._get_graph_bundle("w1")
 
     assert "w1" not in ps._GRAPH_VIEW_CACHE
 
@@ -202,7 +187,7 @@ def test_concurrent_misses_are_single_flighted(monkeypatch):
     1回だけ呼ばれる（並行 stampede を防ぐ）。"""
     calls: list[str] = []
 
-    def _build(world):
+    def _build(world, files=None):
         calls.append(world)
         time.sleep(0.05)          # 他スレッドがロック待ちで並ぶ時間を作る
         return _nodes_edges()
@@ -214,7 +199,7 @@ def test_concurrent_misses_are_single_flighted(monkeypatch):
     results_lock = threading.Lock()
 
     def _call():
-        r = ps.graph_view("w1")
+        r = ps._get_graph_bundle("w1")
         with results_lock:
             results.append(r)
 
@@ -226,14 +211,13 @@ def test_concurrent_misses_are_single_flighted(monkeypatch):
 
     assert len(calls) == 1
     assert len(results) == 20
-    sig0 = results[0]["signature"]
-    assert all(r["signature"] == sig0 for r in results)
+    nodes0 = results[0]["raw_nodes"]
+    assert all(r["raw_nodes"] == nodes0 for r in results)
 
 
 def test_delete_evicts_cache_entry(monkeypatch):
     """GRA-1是正#6: world 削除成功時にキャッシュ entry を破棄する（`worlds.delete`）。"""
-    ps._GRAPH_VIEW_CACHE["w1"] = {"sig": "sig-a", "synced_at": "t1", "out_nodes": [], "out_edges": [],
-                                  "counts": {}, "total_nodes": 0, "total_edges": 0, "signature": "x"}
+    ps._GRAPH_VIEW_CACHE["w1"] = {"sig": "sig-a", "synced_at": "t1", "raw_nodes": [], "raw_edges": [], "raw_flags": []}
     from sherpa import store, worlds as worlds_mod
     from sherpa.ingest import worker as worker_mod
 
@@ -268,7 +252,7 @@ def test_current_world_status_missing_row_returns_empty_generation(monkeypatch):
 
 def test_current_world_status_does_not_swallow_store_exceptions(monkeypatch):
     """GRA-1是正#3: store 例外は握り潰さない（silent degradation なし・router 側がログ付き503へ
-    変換する契約——`sherpa/routers/graph.py::graph_get` 参照）。"""
+    変換する契約——`sherpa/routers/worlds.py::ingest_preview` 参照）。"""
     def _boom(w, **kw):
         raise RuntimeError("db down")
     monkeypatch.setattr(ps.store, "get_world_status_row", _boom)
@@ -276,7 +260,7 @@ def test_current_world_status_does_not_swallow_store_exceptions(monkeypatch):
     with pytest.raises(RuntimeError):
         ps._current_world_status("w1")
     with pytest.raises(RuntimeError):
-        ps.graph_view("w1")
+        ps._get_graph_bundle("w1")
 
 
 def test_current_world_status_forwards_timeout_kwargs(monkeypatch):
@@ -323,7 +307,7 @@ def test_post_probe_failure_does_not_repeat_heavy_build_across_waiters(monkeypat
 
     def _call():
         try:
-            r = ps.graph_view("w1")
+            r = ps._get_graph_bundle("w1")
             with out_lock:
                 results.append(r)
         except Exception as e:
@@ -366,8 +350,7 @@ def test_delete_pop_is_serialized_with_publish_via_graph_view_lock(monkeypatch):
         with ps._GRAPH_VIEW_LOCK:
             entered_publish.set()
             release_publish.wait(timeout=5)
-            ps._GRAPH_VIEW_CACHE["w1"] = {"sig": "sig-a", "synced_at": "t1", "out_nodes": [], "out_edges": [],
-                                          "counts": {}, "total_nodes": 0, "total_edges": 0, "signature": "x"}
+            ps._GRAPH_VIEW_CACHE["w1"] = {"sig": "sig-a", "synced_at": "t1", "raw_nodes": [], "raw_edges": [], "raw_flags": []}
             order.append("publish")
 
     t_pub = threading.Thread(target=_slow_publish)
@@ -389,3 +372,19 @@ def test_delete_pop_is_serialized_with_publish_via_graph_view_lock(monkeypatch):
 
     assert order == ["publish", "delete"]        # delete の pop は publish の完了後に実行された
     assert "w1" not in ps._GRAPH_VIEW_CACHE      # delete が publish 後の entry を正しく破棄した
+
+
+def test_completed_record_lookup_runs_outside_the_graph_lock(monkeypatch):
+    """署名が空のときの完了の記録の照会は、グラフの組み立てのロックを持たずに行う。"""
+    monkeypatch.setattr(ps, "_build", lambda world, files=None: _nodes_edges())
+    _patch_status(monkeypatch, _status("", None))
+    monkeypatch.setattr(ps, "_running_note", lambda world, probe_timeout=None: None)
+    held: list[bool] = []
+
+    def _summary(world):
+        held.append(ps._GRAPH_VIEW_LOCK.locked())
+        return None
+
+    monkeypatch.setattr(ps.store, "get_latest_published_run_summary", _summary)
+    assert ps._get_graph_bundle("w1") == {"graph_note": ps._NOTE_NOT_COMPLETED}
+    assert held == [False]

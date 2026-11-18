@@ -70,9 +70,11 @@ def _evidence_paths(env) -> tuple[set[str], bool]:
                 out.add(parsed[0])
     for r in recon:
         for side in ("spec", "source"):
-            doc = r.get(side, {}).get("doc_id") if isinstance(r, dict) and isinstance(r.get(side), dict) else None
-            if isinstance(doc, str) and doc:
-                out.add(_norm(doc))
+            sd = r.get(side) if isinstance(r, dict) and isinstance(r.get(side), dict) else {}
+            also = sd.get("also") if isinstance(sd.get("also"), list) else []
+            for ref in [sd, *[e for e in also if isinstance(e, dict)]]:
+                if isinstance(ref.get("doc_id"), str) and ref["doc_id"]:
+                    out.add(_norm(ref["doc_id"]))
     return out, bool(claims or recon)
 
 

@@ -5,11 +5,12 @@
 """
 from __future__ import annotations
 
+import contextvars
 import difflib
 import re
 from pathlib import Path
 
-from . import corpus_docs, doc_ledger, documents, scope as scope_mod, worlds
+from . import corpus_docs, doc_ledger, documents, path_rules, scope as scope_mod, scope_infer, worlds
 from .env_int import env_int
 from .ingest import evidence_render
 
@@ -83,7 +84,13 @@ def _generation_and_suffix(doc_id: str) -> tuple[str, str]:
     return gen, suffix
 
 
+# `compare` の間だけ入る管理者の除外。完全一致・曖昧な候補・読む直前のすべてが `_in_scope` を通るので、ここで拒否する
+_RULES: contextvars.ContextVar = contextvars.ContextVar("compare_docs_path_rules", default=path_rules.EMPTY)
+
+
 def _in_scope(doc_id: str, scope_paths) -> bool:
+    if _RULES.get().excluded(doc_id):
+        return False
     return scope_paths is None or scope_mod.in_scope(doc_id, scope_paths)
 
 
@@ -92,7 +99,8 @@ def _basename_candidates(world: str, source_doc_id: str, target_generation: str,
     """厳密一致が0件のときの対応文書候補の列挙（`difflib.get_close_matches` による basename 類似度・順位付けはしない）。
     戻り `(候補（先頭 `_CANDIDATES_MAX` 件）, 類似の閾値を超えた候補の総数)`。"""
     try:
-        rows = doc_ledger.documents_for(world, deadline=deadline)
+        rows = doc_ledger.listing_documents(
+            world, deadline=deadline if deadline is not None else scope_infer.user_op_deadline()).rows
     except Exception:
         return [], 0
     names = []
@@ -141,10 +149,19 @@ def _discover(world: str, source_doc_id: str, target_generation: str, scope_path
 
 
 def compare(world: str, args: dict, *, scope_paths=None, deadline: float | None = None) -> dict:
+    """管理者の除外（`path_rules`）を当てた `_compare`。"""
+    token = _RULES.set(path_rules.rules_for(world))
+    try:
+        return _compare(world, args, scope_paths=scope_paths, deadline=deadline)
+    finally:
+        _RULES.reset(token)
+
+
+def _compare(world: str, args: dict, *, scope_paths=None, deadline: float | None = None) -> dict:
     """`compare_documents` ツール本体（決定的・LLM 呼び出しなし）。
 
     引数は明示ペア（`left_doc_id`+`right_doc_id`・最優先）か世代発見（`source_doc_id`+`target_generation`）のどちらか。
-    `scope_paths` で範囲外の doc_id は拒否する。`deadline` は `doc_ledger.documents_for` の走査へ転送する。
+    `scope_paths` で範囲外の doc_id は拒否する。`deadline` は台帳が無いときの走査（`doc_ledger.listing_documents`）へ転送する。
 
     戻り値の `status`: `"comparable"`（`diff`/`notices`/`compare_conditions`）／`"needs_disambiguation"`（`candidates[]`）／
     `"unsupported"`（片側以上に `.rag.md` が無い）。引数不備・範囲外は `{"error": ...}`。

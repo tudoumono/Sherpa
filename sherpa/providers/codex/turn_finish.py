@@ -487,11 +487,17 @@ def assemble_result(self, ctx, st, decision, env):
         _verified_listed, _unverified_refs, _sensitive_refs = (
             _ref_detail["verified"], _ref_detail["unverified"], _ref_detail["hidden"])
         _verified_before_listed = set(_verified_listed)
+        _new_listed: list[str] = []
         for _r in _mcp_listed_docs:
             if _r and _r not in _ref_seen:
                 _ref_seen.add(_r)
                 _ref_candidates.append(_r)
-        _verified_refs = resolve_referenced_docs(_ref_candidates, ctx.world, sp, _ref_layer)[0]
+                _new_listed.append(_r)
+        _verified_refs = list(_verified_listed)
+        if _new_listed:
+            for _d in resolve_referenced_docs(_new_listed, ctx.world, sp, _ref_layer)[0]:
+                if _d not in _verified_before_listed and _d not in _verified_refs:
+                    _verified_refs.append(_d)
         _listed_only_ids = set(_verified_refs) - _verified_before_listed
         if _verified_refs and ctx.make_sources:
             _ref_sources, _ = _verified_sources(ctx.make_sources, set(_verified_refs), ctx.world, sp)
@@ -520,7 +526,7 @@ def assemble_result(self, ctx, st, decision, env):
             env["found_docs_hidden"] = _found_hidden
         if _found_more:
             env["found_docs_more"] = _found_more
-        # 「参照した資料」の行のうち検証を通らなかったもの（理由つき・秘匿名は名前を出さず件数だけ）。
+        # 「参照した資料」の行のうち検証を通らなかったもの（理由つき・自由な文や解釈できない行だけ件数）。
         _unverified_total = len(_unverified_refs) + _sensitive_refs
         if _unverified_total:
             env["sources_unverified"] = _unverified_refs[:_SOURCES_UNVERIFIED_MAX]
@@ -592,7 +598,7 @@ def assemble_result(self, ctx, st, decision, env):
                 env.setdefault("data", {})["reconciliation"] = _recon_rows
                 if _recon_meta["unverified"]:
                     add_notice(env, "reconciliation_unverified",
-                               f"設計書とソースの照らし合わせのうち {_recon_meta['unverified']} 件は、根拠の資料を確認できなかったため「未確認」にしています。")
+                               f"設計書とソースの照らし合わせのうち {_recon_meta['unverified']} 件は、根拠の資料か、その中の位置を確かめられなかったため「未確認」にしています。")
                 if _recon_meta["more"]:
                     add_notice(env, "reconciliation_more",
                                f"設計書とソースの照らし合わせは件数が多いため、{_recon_meta['more']} 件を表に出していません。")
@@ -615,8 +621,6 @@ def assemble_result(self, ctx, st, decision, env):
         # `_gather` が組み立てた決定的回答をそのまま返さず、利用者に「AI が答えていない」ことが伝わるよう `_UnwiredProvider` と同じ文体の正直な文言に上書きする。summary/sources は `_gather` の実結果のまま残すが、sources が空なら data も `{}` へ揃える（`chat_service._no_genuine_results` の honest failure 規約と一致させる）。
         # 無出力失敗はプロキシ/CA 証明書の不備・sandbox の起動失敗・CLI のクラッシュでも起きるため、認証だけに断定せず、観測事実（応答を返す前に終了）を述べて考えられる原因を複数挙げる。returncode は利用者向け本文には出さずログにだけ残す。stderr は破棄している。
         # `turn.failed`／`error` で閉じた attempt（agent_message 無し）は「回答を返せずに終了しました」とし、既存の無出力失敗と文言を分ける（スキーマ違反なども原因になり得るため）。
-        _reason = ("回答を返せずに終了しました" if st._turn_failed
-                  else "応答を返す前に終了しました")
         if st._turn_failed_code:
             # 閉集合ではない生の診断コード（統計・分類には使わない・管理者向け補助情報）。
             env["codex_error_code"] = st._turn_failed_code
@@ -627,9 +631,16 @@ def assemble_result(self, ctx, st, decision, env):
                 "範囲（フォルダ）を絞るか、質問を分けてやり直してください。"
             )
             env["limits"] = {**(env.get("limits") or {}), "total_budget_hit": True}
+        elif st._turn_failed:
+            _code = f"（コード: {st._turn_failed_code}）" if st._turn_failed_code else ""
+            env["headline"] = (
+                f"Codex が回答を返せずに終了しました{_code}。"
+                "利用上限やモデルの指定など、Codex 側の設定を管理者に確認してもらってください。"
+                "詳細は管理者向けの Codex ログ（codex.log）を参照してください。"
+            )
         else:
             env["headline"] = (
-                f"Codex に接続できませんでした（Codex CLI が{_reason}）。考えられる原因はいくつかあります: "
+                "Codex に接続できませんでした（Codex CLI が応答を返す前に終了しました）。考えられる原因はいくつかあります: "
                 "認証が設定されていない（`codex login`）／プロキシや CA 証明書などのネットワーク設定が"
                 "不足している／サンドボックスの起動に失敗した／Codex CLI 自体が異常終了した、のいずれかです。"
                 "管理者にログの確認を依頼してください。詳細は管理者向けの Codex ログ（codex.log）を参照してください。"

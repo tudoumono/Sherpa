@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 import pytest
 
 from sherpa.providers.codex import citations as C
@@ -395,15 +396,85 @@ def test_parse_quoted_multi_item_line_is_a_reference_line():
     assert refs == ["a.md"] and "systemctl" in body
 
 
-def test_unverified_references_list_only_plain_document_paths_others_are_counted(monkeypatch):
-    """検証を通らなかった参照のうち、名前を出すのは秘匿名でない資料パスだけ。自由な文・解釈できない行・秘匿名は件数だけ。"""
-    from sherpa import agentic_search as A
-    monkeypatch.setattr(A, "verify_doc_exists", lambda d, w, sp=None: False)
+@pytest.fixture
+def _secret_world(monkeypatch, tmp_path):
+    """秘匿名・空白入りの名前を持つ実ファイルの資料フォルダ（架空の名前）。"""
+    from sherpa import worlds
+    root = tmp_path / "secret_world"
+    for rel in [".env", "設計/.env", "秘密 鍵/app.key", "credentials 一覧.xlsx", "設計.xlsx", "docs/設計.xlsx", "memo.txt"]:
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(worlds, "world_dir", lambda w: root)
+    return root
+
+
+def test_unverified_references_list_document_paths_incl_secret_names_others_are_counted(_secret_world):
+    """検証を通らなかった参照のうち、名前を出すのは資料パス（秘匿名も出す）。自由な文・解釈できない行は件数だけ。"""
     sentence = "田中太郎さんの住所は東京都千代田区1-1です"
     refs = [[["存在しない.md"]], [[sentence]], [[".env"]], [["../外.md"]]]
     verified, rows, hidden = C.resolve_referenced_docs(refs, "v1")
-    assert verified == [] and rows == [{"path": "存在しない.md", "reason": C.REASON_UNREADABLE}]
-    assert hidden == 3
+    assert verified == [] and rows == [{"path": "存在しない.md", "reason": C.REASON_UNREADABLE},
+                                       {"path": ".env", "reason": C.REASON_SENSITIVE}]
+    assert hidden == 2
+
+
+def test_sensitive_free_sentence_is_counted_not_named(monkeypatch):
+    """秘匿名を含む自由な文は、資料パスの形（空白・制御文字なしで拡張子で終わる）でなければ名前の行にも input にも出さない。"""
+    from sherpa import agentic_search as A
+    monkeypatch.setattr(A, "verify_doc_exists", lambda d, w, sp=None: False)
+    lines = ["- credentials の初期パスワードは Fake-Pw-12345 です",
+             "- `.env.production` の DB_PASSWORD=fake-token-999",
+             "- credentials.xlsx ※ 初期パスワードは Fake-Pw-12345",
+             "- トークン fake-token-999 の置き場は server.pem"]
+    _, groups = C.parse_referenced_doc_lines("x\n参照した資料:\n" + "\n".join(lines))
+    d = C.resolve_referenced_docs_detail(groups, "v1")
+    dump = json.dumps(d, ensure_ascii=False)
+    assert "Fake-Pw" not in dump and "fake-token" not in dump
+    assert d["hidden"] + len(d["unverified"]) == 4
+    assert all(" " not in r["path"] for r in d["unverified"])
+    assert all(m["input"] == "" or " " not in m["input"] for m in d["mappings"])
+
+
+def test_sensitive_sentences_without_spaces_are_counted_not_named(_secret_world):
+    """空白が無く末尾が .英数字 の文は、形では名前と区別できない。実在する資料のときだけ行にし、他は件数に回す。"""
+    sentences = ["パスワードFake-Pw-12345はserver.pem", ".env.production:DB_PASSWORD=fake.token999",
+                 "credentials：Fake.Pw12345", "`.env.production`:DB_PASSWORD=fake.token999",
+                 "`トークンfake-token-999の置き場はserver.pem`", "DB_PASSWORD=fake-token-999.pem",
+                 "credentials(Fake-Pw-12345).pem"]
+    d = C.resolve_referenced_docs_detail([[[x]] for x in sentences], "v1")
+    dump = json.dumps(d, ensure_ascii=False)
+    assert "Fake" not in dump and "fake" not in dump
+    assert d["unverified"] == [] and d["hidden"] == len(sentences)
+
+
+def test_existing_secret_paths_with_spaces_are_named(_secret_world):
+    d = C.resolve_referenced_docs_detail([[["秘密 鍵/app.key"]], [["credentials 一覧.xlsx"]], [["設計/.env"]]], "v1")
+    assert [r["path"] for r in d["unverified"]] == ["秘密 鍵/app.key", "credentials 一覧.xlsx", "設計/.env"]
+    assert all(r["reason"] == C.REASON_SENSITIVE for r in d["unverified"]) and d["hidden"] == 0
+
+
+def test_secret_path_out_of_scope_is_counted(_secret_world):
+    d = C.resolve_referenced_docs_detail([[["設計/.env"]], [["秘密 鍵/app.key"]]], "v1", ["設計"])
+    assert [r["path"] for r in d["unverified"]] == ["設計/.env"] and d["hidden"] == 1
+
+
+def test_sentence_with_spaces_ending_in_plain_extension_is_counted_not_named(_secret_world):
+    """空白を含む候補は索引で 1 件に決まったときだけ採る。当たらない文は件数に回す。"""
+    sentences = ["パスワードは Fake-Pw-12345 の置き場は memo.txt", ".env: DB_PASSWORD=fake-token-999.abc"]
+    d = C.resolve_referenced_docs_detail([[[x]] for x in sentences], "v1")
+    dump = json.dumps(d, ensure_ascii=False)
+    assert "Fake" not in dump and "fake" not in dump
+    assert d["unverified"] == [] and d["hidden"] == 2
+
+
+def test_note_after_path_does_not_remain_in_mapping_input(_secret_world):
+    """行の path が決まる行は、注記の値を対応付けの記録に残さない。"""
+    _, groups = C.parse_referenced_doc_lines(
+        "x\n参照した資料:\n- 設計.xlsx ※ 初期パスワードは Fake-Pw-12345\n- docs/設計.xlsx（初期パスワード Fake-Pw-12345）\n- 無い.md ※ 初期パスワード Fake-Pw-12345")
+    d = C.resolve_referenced_docs_detail(groups, "v1")
+    assert "Fake" not in json.dumps(d, ensure_ascii=False)
+    assert [m["input"] for m in d["mappings"]] == ["設計.xlsx", "docs/設計.xlsx", "無い.md"]
 
 
 # ===== ファイル名だけの参照の対応付け =====
@@ -477,10 +548,11 @@ def test_bare_name_with_no_scope_searches_the_whole_world(_name_world):
     assert d["verified"] == ["外/only_outside.md"] and _classes(d) == [C.RES_UNIQUE, C.RES_AMBIGUOUS]
 
 
-def test_bare_name_sensitive_stays_hidden(_name_world):
-    d = _detail([[".env"]])
-    assert d["verified"] == [] and d["unverified"] == [] and d["hidden"] == 1
-    assert d["mappings"] == [{"input": "", "doc_id": None, "class": C.RES_HIDDEN}]
+def test_bare_name_sensitive_is_named_but_not_verified(_name_world):
+    d = _detail([["設計/.env"]])
+    assert d["verified"] == [] and d["hidden"] == 0
+    assert d["unverified"] == [{"path": "設計/.env", "reason": C.REASON_SENSITIVE}]
+    assert d["mappings"] == [{"input": "設計/.env", "doc_id": None, "class": C.RES_SENSITIVE}]
 
 
 def test_bare_name_respects_layer(_name_world):

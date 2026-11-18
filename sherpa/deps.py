@@ -12,7 +12,7 @@ from pathlib import Path
 from fastapi import HTTPException, Request
 from pydantic import Field
 
-from sherpa import auth, store, worlds
+from sherpa import auth, scope_infer, store, worlds
 from sherpa import scope as scope_mod
 
 _log = logging.getLogger("sherpa")
@@ -61,8 +61,16 @@ def _require_admin(user: dict) -> dict:
     return user
 
 
+# 台帳が無く資料フォルダを歩くしかない操作が、期限内に終わらなかったときの応答
+SCOPE_WALK_TIMEOUT_MESSAGE = "資料フォルダの一覧を時間内に取得できませんでした。取り込みが終わってから、もう一度お試しください"
+
+
 def _check_scope(world: str, scope_paths):
-    if not scope_mod.valid_scope_paths(world, scope_paths):
+    try:
+        ok = scope_mod.valid_scope_paths(world, scope_paths)
+    except scope_infer.ScopeWalkDeadlineExceeded:
+        raise HTTPException(503, SCOPE_WALK_TIMEOUT_MESSAGE) from None
+    if not ok:
         raise HTTPException(422, "不明な範囲（scope_paths）が指定されました")
 
 

@@ -19,10 +19,11 @@ from pathlib import Path
 
 import psycopg
 
-from .. import corpus_docs, es_index, json_io, scope_infer, store, webhooks, worlds
+from .. import build_marks, corpus_docs, es_index, json_io, scope_infer, store, webhooks, worlds
 from . import (
     archive_extract,
     background,
+    build_link,
     failure_reasons,
     importance,
     office_md,
@@ -129,6 +130,7 @@ def _reflect_graph_after_rag_rewrite(world: str) -> tuple[int, int]:
     返値は反映したノード数・関係数。
     """
     nodes, edges, flags = build_world_graph(world)
+    build_report, flags = world_graph.pop_build_report(flags)
     blocked = [f for f in flags if f.get("action") == "blocked"]
     if blocked:
         # `_run_locked` と同じく、不可読/途中で変わったコードがあるときは部分グラフで既存グラフを置換せず、例外で run を失敗として記録する
@@ -137,7 +139,8 @@ def _reflect_graph_after_rag_rewrite(world: str) -> tuple[int, int]:
     env = world_neo4j._env()
     return world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"],
                                   plugin_failures=world_graph.plugin_failures_from_flags(flags),
-                                  unparsed_sources=world_graph.unparsed_sources_from_flags(flags))
+                                  unparsed_sources=world_graph.unparsed_sources_from_flags(flags),
+                                  **({"build_report": build_report} if build_report else {}))
 
 
 # `office_md.build_derived()` の per-file 失敗リスト（`[{"doc": rel, "reason": str}]`）のキー。末尾の `_failures` を落とした残りを stage 名にする
@@ -673,6 +676,7 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
     # `build_world_graph` は時間がかかりうるので、入る前に段を「関係グラフを構築中」へ進める
     _progress("graph_build")
     nodes, edges, flags = build_world_graph(world)
+    build_report, flags = world_graph.pop_build_report(flags)
 
     if any(f.get("action") == "blocked" for f in flags):    # blocked＝world 未解決 or 不可読コード
         # 反映も台帳書込もしない（部分グラフを確定しない）
@@ -694,13 +698,19 @@ def _run_locked_body_impl(world, *, reflect, created_by, scan_root, run_id=None,
         env = world_neo4j._env()
         n, m = world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"],
                                       plugin_failures=world_graph.plugin_failures_from_flags(flags),
-                                      unparsed_sources=world_graph.unparsed_sources_from_flags(flags))
+                                      unparsed_sources=world_graph.unparsed_sources_from_flags(flags),
+                                      **({"build_report": build_report} if build_report else {}))
     except Exception as e:
-        # 失敗理由に接続先（ホスト:ポート）を含める（認証情報は含めない）。失敗した段も stage summary に所要時間とエラーを残す
-        return _record("failed", extra_flags=[{"doc": None, "action": "blocked",
-                       "reason": f"graph_reflect_failed:{e.__class__.__name__}@{_target_of(env['uri'] if env else '')}"}],
+        # 失敗理由に接続先（ホスト:ポート）を含める（認証情報は含めない）。失敗した段も stage summary に所要時間とエラーを残す。
+        # 書き込みのメモリ不足は、上げる設定名を理由に添える
+        target = _target_of(env["uri"] if env else "")
+        mem = world_neo4j.is_memory_pool_error(e)
+        name = world_neo4j.MEMORY_POOL_ERROR if mem else e.__class__.__name__
+        reason = f"graph_reflect_failed:{name}@{target}" + (f"（{world_neo4j.MEMORY_POOL_HINT}）" if mem else "")
+        return _record("failed", extra_flags=[{"doc": None, "action": "blocked", "reason": reason}],
                        drep=drep,
-                       neo4j_summary={"error": f"{e.__class__.__name__}@{_target_of(env['uri'] if env else '')}",
+                       neo4j_summary={"error": f"{name}@{target}",
+                                     **({"hint": world_neo4j.MEMORY_POOL_HINT} if mem else {}),
                                      "duration_sec": round(time.monotonic() - neo4j_t0, 3)})
     neo4j_duration_sec = time.monotonic() - neo4j_t0
     rows = _ledger_rows_step(world, sig)                    # ⑤ 台帳（派生 .md ができた後）
@@ -1591,7 +1601,8 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                 try:
                     genv = world_neo4j._env()
                     graph_repair_reason = world_neo4j.check_graph_counts(
-                        world, genv["uri"], genv["user"], genv["pw"])
+                        world, genv["uri"], genv["user"], genv["pw"],
+                        build_link.marks_signature(build_marks.load(world)))
                     if graph_repair_reason is not None:
                         _t_graph0 = time.monotonic()
                         _graph_repair_started_at = datetime.now(timezone.utc).isoformat()

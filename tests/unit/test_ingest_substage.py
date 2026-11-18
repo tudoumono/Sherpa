@@ -36,7 +36,7 @@ def _capture_progress(monkeypatch) -> list[dict]:
 
 def test_ocr_route_step_reports_count_and_logs_start_middle_end(tmp_path, monkeypatch, caplog):
     """MD 化の後の OCR の対象の決定が、小さな段として件数つきで progress とログに出る（途中の行も出る）。"""
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "1")
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
     monkeypatch.setattr(substage, "WRITE_EVERY", 1)
     monkeypatch.setattr(substage, "WRITE_MIN_SEC", 0.0)
     payloads = _capture_progress(monkeypatch)
@@ -118,5 +118,5 @@ def test_status_api_running_progress_carries_step_and_counts(monkeypatch):
 
     out = RunProgress.model_validate(summary["running_progress"]).model_dump()
     assert (out["step"], out["step_label"], out["step_done"], out["step_total"]) == (
-        "neo4j_load", "Neo4j に反映しています", 300, 500)
+        "neo4j_load", "資料どうしの関係を保存しています", 300, 500)
     assert out["stage"] == "graph_build" and out["step_started_at"]

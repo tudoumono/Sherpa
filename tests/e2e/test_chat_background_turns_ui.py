@@ -7,6 +7,7 @@ tests/api/test_chat_turns_api.py が担当する。
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -245,3 +246,68 @@ def _wait_until(predicate, timeout_ms=5000, interval_ms=20, page=None, message="
     while not predicate():
         assert time.monotonic() < deadline, message
         page.wait_for_timeout(interval_ms)
+
+
+@pytest.mark.parametrize("how", ["reload", "click"])
+@pytest.mark.parametrize("prior_answers", [0, 1])
+def test_reopening_conversation_while_waiting_keeps_sent_scope(page, web_base_url, how, prior_answers):
+    """回答待ちの間に会話を開き直しても（再読み込み・一覧から選び直し）、範囲は送った範囲のまま残り、
+    次の質問も同じ範囲で送られる。前の回答が別の範囲でも、待っている質問の範囲を優先する。"""
+    from playwright.sync_api import expect
+
+    sent = ["4期/02_設計", "4期/03_開発"]
+    messages = []
+    for i in range(prior_answers):
+        messages += [{"id": 10 + 2 * i, "role": "user", "content": f"前の質問{i + 1}"},
+                     {"id": 11 + 2 * i, "role": "assistant", "content": "",
+                      "answer": {**IMPACT_ANSWER, "scope": {"world": "w1", "scope_paths": ["4期/02_設計/01_基本設計"],
+                                                            "source": "explicit"}}}]
+    messages.append({"id": 99, "role": "user", "content": "質問"})
+    pending = {}
+    subscribed = []
+
+    def handle_stream(route):
+        subscribed.append(route.request.url)
+        pending["route"] = route
+
+    def handle_running(route):
+        turns = [{"turn_id": "turn-101", "conversation_id": 101, "started_at": "2026-07-03T09:00:00+00:00",
+                  "scope_paths": sent}] if "route" in pending else []
+        route.fulfill(content_type="application/json", body=json.dumps({"turns": turns}, ensure_ascii=False))
+
+    records = install_api_mocks(page)
+    page.route("**/chat/turns/*/stream?**", handle_stream)
+    page.route("**/conversations/101", lambda route: route.fulfill(content_type="application/json", body=json.dumps(
+        {"conversation": {"id": 101, "title": "会話", "origin": "own"}, "messages": messages}, ensure_ascii=False)))
+    page.route("**/chat/turns/running", handle_running)
+
+    page.goto(f"{web_base_url}/chat.html")
+    expect(page.locator("#scopesel")).to_be_visible()
+    page.locator("#scopebtn").click()
+    page.locator("#scopepanel [data-toggle='4期']").click()
+    for p in sent:
+        page.locator(f"#scopepanel [data-scope='{p}']").click()
+    page.locator("#input").fill("質問")
+    page.locator("#send").click()
+    _wait_until(lambda: "route" in pending, page=page, message="回答の購読が始まらなかった")
+
+    if how == "click":
+        page.locator("#convlist .conv[data-open='101'] .cmain").first.click()
+    else:
+        page.goto(f"{web_base_url}/chat.html?conv=101")
+    _wait_until(lambda: len(subscribed) >= 2, page=page, message="開き直した後の再購読が届かなかった")
+    expect(page.locator("#scopelabel")).to_have_text("02_設計・03_開発")
+    expect(page.locator("#inquiry-chip-label")).to_contain_text("02_設計・03_開発")
+    page.locator("#scopebtn").click()
+    for p in sent:
+        expect(page.locator(f"#scopepanel [data-scope='{p}']")).to_have_class(re.compile(r"\bon\b"))
+
+    pending.pop("route").fulfill(status=200, headers={"Content-Type": "text/event-stream"}, body="".join(
+        f"data: {json.dumps(e, ensure_ascii=False)}\n\n" for e in [{"type": "answer", "conversation_id": 101,
+            "message": {"id": 100, "answer": {**IMPACT_ANSWER, "scope": {"world": "w1", "scope_paths": sent,
+                                                                          "source": "explicit"}}}}]))
+    expect(page.locator("#rt")).to_contain_text("完了")
+    page.locator("#input").fill("次の質問")
+    page.locator("#send").click()
+    _wait_until(lambda: len(records["turn_starts"]) >= 2, page=page, message="2回目の送信が届かなかった")
+    assert records["turn_starts"][-1]["scope_paths"] == sent

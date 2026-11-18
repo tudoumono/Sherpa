@@ -158,3 +158,30 @@ def test_dedupe_still_collapses_identical_null_span_quote():
 # ==== extra_quotes（統合で消える本文を evidence_meta 側に残す）====
 
 
+# ==== top_folder / with_provenance（世代と原本の更新時刻の加算） ====
+
+def test_top_folder_is_first_segment_and_none_for_root_level_docs():
+    assert citations.top_folder("4期/02_設計/仕様書.md") == "4期"
+    assert citations.top_folder("4期/仕様書.md") == "4期"
+    assert citations.top_folder("直下.md") is None
+    assert citations.top_folder("") is None
+    assert citations.top_folder(None) is None
+    assert citations.top_folder("/先頭スラッシュ.md") is None
+
+
+def test_with_provenance_adds_keys_without_touching_existing_ones():
+    c = {"doc_id": "4期/a.md", "span": [3, 3], "quote": "本文", "ext": ".md", "match": "q"}
+    out = citations.with_provenance(c, "2026-07-01T03:04:05Z")
+    assert out == {**c, "generation": "4期", "modified_at": "2026-07-01T03:04:05Z"}
+    assert "generation" not in c and "modified_at" not in c  # 入力は変えない
+
+
+def test_with_provenance_root_level_doc_has_no_generation_key():
+    out = citations.with_provenance({"doc_id": "直下.md", "quote": "x"}, "2026-07-01T03:04:05Z")
+    assert out == {"doc_id": "直下.md", "quote": "x", "modified_at": "2026-07-01T03:04:05Z"}
+
+
+def test_with_provenance_without_timestamp_adds_only_generation():
+    assert citations.with_provenance({"doc_id": "4期/a.md"}) == {"doc_id": "4期/a.md", "generation": "4期"}
+    assert citations.with_provenance({"doc_id": "直下.md"}, None) == {"doc_id": "直下.md"}
+    assert citations.with_provenance({"doc_id": "直下.md"}, "") == {"doc_id": "直下.md"}

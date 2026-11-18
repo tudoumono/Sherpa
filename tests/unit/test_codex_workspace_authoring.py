@@ -91,7 +91,7 @@ def test_codex_clean_env_has_no_secrets_and_passes_proxy_only_when_set(monkeypat
     assert "PATH" in env and "CODEX_HOME" in env
     assert "SHERPA_MCP_LEDGER_DIR" not in env
     assert "OPENAI_API_KEY" not in env
-    assert not any(k in env for k in SB._CODEX_PASSTHROUGH_ENV)   # 未設定なのに透過しない
+    assert not any(k in env for k in SB._CODEX_PASSTHROUGH_ENV if "NO_PROXY" not in k.upper())   # 未設定なのに透過しない（NO_PROXY だけは社内の宛先で常に渡る）
 
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
     monkeypatch.setenv("no_proxy", "localhost,127.0.0.1")
@@ -100,7 +100,7 @@ def test_codex_clean_env_has_no_secrets_and_passes_proxy_only_when_set(monkeypat
     monkeypatch.setenv("HTTP_PROXY", "")                    # 空文字は未設定扱い
     env = SB._codex_clean_env(tmp_path / "ch", tmp_path / "tmp")
     assert env["HTTPS_PROXY"] == "http://proxy.internal:8080"
-    assert env["no_proxy"] == "localhost,127.0.0.1"
+    assert {"localhost", "127.0.0.1"} <= set(env["no_proxy"].split(","))
     assert env["SSL_CERT_FILE"] == env["NODE_EXTRA_CA_CERTS"] == "/etc/ssl/certs/corp.pem"
     assert "HTTP_PROXY" not in env and "ALL_PROXY" not in env
     assert "OPENAI_API_KEY" not in env and "NEO4J_PASSWORD" not in env
@@ -135,8 +135,10 @@ def test_resolve_mcp_budget_ceiling_and_plain_dict():
     result = _resolve_mcp_budget({})
     assert isinstance(result, dict)
     assert set(result) == {"SHERPA_MCP_TOOL_BUDGET_BYTES", "SHERPA_MCP_READER_BUDGET_BYTES",
-                           "SHERPA_MCP_TOOL_MAX_HITS", "SHERPA_MCP_TOOL_WINDOW_CAP"}
+                           "SHERPA_MCP_SEARCH_BUDGET_BYTES", "SHERPA_MCP_TOOL_MAX_HITS", "SHERPA_MCP_TOOL_WINDOW_CAP"}
     assert result["SHERPA_MCP_READER_BUDGET_BYTES"] == "30000"
+    assert result["SHERPA_MCP_SEARCH_BUDGET_BYTES"] == "36000"
+    assert small["SHERPA_MCP_SEARCH_BUDGET_BYTES"] == str(16 * 1024)
     assert small["SHERPA_MCP_READER_BUDGET_BYTES"] == str(16 * 1024)
 
 
@@ -1577,12 +1579,13 @@ def test_context_window_exceeded_sets_budget_headline_and_stop_kind(tmp_path, mo
     assert any("codex turn failed" in r.message and "context_window_exceeded" in r.message for r in caplog.records)
 
 
-def test_turn_failed_generic_code_keeps_legacy_headline(tmp_path, monkeypatch):
+def test_turn_failed_generic_code_shows_code_not_connection_failure(tmp_path, monkeypatch):
     from sherpa import stop_kind
     body = _PY + _emit({"type": "turn.failed", "error": {"code": "boom"}})
     _, env = _run_fake(tmp_path, monkeypatch, body, "turn-failed-generic-u1")
     assert env.get("codex_silent_failure") is True and env.get("codex_error_code") == "boom"
-    assert "Codex に接続できませんでした" in env["headline"] and "codex.log" in env["headline"]
+    assert "回答を返せずに終了しました（コード: boom）" in env["headline"] and "codex.log" in env["headline"]
+    assert "接続できませんでした" not in env["headline"]
     assert not (env.get("limits") or {}).get("total_budget_hit")
     assert stop_kind.resolve(env) == "codex_silent"
 
@@ -1644,3 +1647,10 @@ def test_author_lens_keeps_its_own_reasoning_under_quick(tmp_path, monkeypatch):
         route=lambda msg: {"lens": "author", "input": msg, "reason": "test", "confident": True})
     list(A.CodexProvider().run(ctx))
     assert "model_reasoning_effort=medium" in next(tmp_path.rglob("argv.txt")).read_text()
+
+
+def test_workspace_itself_is_the_project_root(tmp_path):
+    """作業領域が git の中にあっても、Codex は上の階層の `.git`・AGENTS.md を探しに行かない（macOS では読めずに起動が止まり、開発者向けの AGENTS.md も混ざり得る）。"""
+    import tomllib
+    cfg = tomllib.loads(_cfg(tmp_path))
+    assert cfg["project_root_markers"] == []

@@ -50,7 +50,7 @@ def test_admin_model_catalog_table_and_default_save(page, web_base_url):
     expect(table).to_contain_text("OpenAI")
     expect(table).to_contain_text("ローカル（Ollama）")
     expect(table).to_contain_text("Codex")
-    expect(table).to_contain_text("チャット")
+    expect(table).to_contain_text("接続テスト用")
     sel = table.locator(CHAT_SEL)
     expect(sel).to_have_value("gpt-5.5")
 
@@ -94,7 +94,7 @@ def test_admin_model_catalog_edit_allowed_list_via_modal(page, web_base_url):
     page.locator("button.mc-edit[data-provider='ollama'][data-usage='chat']").click()
     overlay = page.locator("#mc-overlay")
     expect(overlay).to_have_class("overlay open")
-    expect(page.locator("#mc-modal-title")).to_contain_text("チャット")
+    expect(page.locator("#mc-modal-title")).to_contain_text("接続テスト用")
 
     page.locator("#mc-modal-textarea").fill("qwen2.5\nllama3.1")
     page.locator("#mc-modal-save").click()

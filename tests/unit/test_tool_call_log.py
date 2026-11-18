@@ -83,7 +83,7 @@ def test_parent_is_the_process_whose_calls_match_the_parent_events(tmp_path):
     assert {r["role"] for r in twin.rows} == {"undetermined"}
 
 
-def test_mcp_entry_records_one_line_per_call_and_keeps_response_and_hides_sensitive_names(tmp_path, monkeypatch):
+def test_mcp_entry_records_one_line_per_call_and_keeps_response_and_records_names_without_bodies(tmp_path, monkeypatch):
     monkeypatch.setenv(T.ENV_DIR, str(tmp_path))
     monkeypatch.setenv("SHERPA_MCP_TURN_ID", TURN)
     monkeypatch.setenv("SHERPA_MCP_CONVERSATION_ID", "7")
@@ -104,8 +104,9 @@ def test_mcp_entry_records_one_line_per_call_and_keeps_response_and_hides_sensit
     assert (row["tool"], row["attempt"], row["conv"], row["status"], row["count"]) == (
         "ripgrep_search", 2, "7", "ok", 2)
     assert row["call_id"] == f"{os.getpid()}:1" and row["args"] == {"query": "TAX"}
-    assert row["docs"] == [{"doc": "a.md", "range": "3", "rank": 1}] and row["docs_hidden"] == 1
-    assert "server.pem" not in (next(tmp_path.glob("calls-*.jsonl"))).read_text(encoding="utf-8")
+    assert row["docs"] == [{"doc": "a.md", "range": "3", "rank": 1}, {"doc": "server.pem", "range": "1", "rank": 2}]
+    assert "docs_hidden" not in row
+    assert '"text"' not in (next(tmp_path.glob("calls-*.jsonl"))).read_text(encoding="utf-8")
 
 
 def test_server_log_has_one_key_value_line_per_call_without_sensitive_names_and_diag_masks_it():
@@ -119,7 +120,7 @@ def test_server_log_has_one_key_value_line_per_call_without_sensitive_names_and_
     line = CL._call_line(st, SimpleNamespace(conversation_id=7), row)
     assert line.startswith("tool_call conv=7 turn=turn-aaa attempt=1 call=5:1 role=parent tool=read_doc")
     assert 'query="請求 締め"' in line and 'range="シート1!A1:C9"' in line
-    assert line.endswith("doc=顧客/請求書.xlsx@10-20") and "server.pem" not in line
+    assert line.endswith("doc=顧客/請求書.xlsx@10-20, server.pem")
     masked = D._mask_body(line)
     for secret in ("請求", "シート1", "顧客"):
         assert secret not in masked
@@ -187,8 +188,9 @@ def test_search_rows_keep_rank_via_and_score_and_show_in_download_table(tmp_path
         {"doc_id": "a.md", "line": 3, "keyword_match": False},
         {"doc_id": "b.md", "line": 5, "keyword_match": True}]}
     out = T.summarize_result("es_search", {}, body, False, {}, scores=[0.9, 0.81234, 0.5], ranks=[1, 2, 3])
-    assert out["mode"] == "hybrid" and out["docs_hidden"] == 1
-    assert out["docs"] == [{"doc": "a.md", "range": "3", "rank": 2, "score": 0.8123, "via": "vector"},
+    assert out["mode"] == "hybrid" and "docs_hidden" not in out
+    assert out["docs"] == [{"doc": "secret.pem", "range": "1", "rank": 1, "score": 0.9, "via": "keyword"},
+                           {"doc": "a.md", "range": "3", "rank": 2, "score": 0.8123, "via": "vector"},
                            {"doc": "b.md", "range": "5", "rank": 3, "score": 0.5, "via": "keyword"}]
     kw = T.summarize_result("es_search", {}, {"mode_used": "keyword", "hits": [{"doc_id": "a.md", "line": 1}]}, False, {})
     assert kw["docs"][0]["via"] == "keyword_only_search" and "score" not in kw["docs"][0]
@@ -200,6 +202,6 @@ def test_search_rows_keep_rank_via_and_score_and_show_in_download_table(tmp_path
     _write(d, "calls-1-1.jsonl", [_row(1, 1, "es_search", 1.0, args={"query": "q"}, **out)])
     merged = T.merge_call_logs(str(d), TURN)
     route, _ = T.route_rows(merged)
-    assert route[0]["mode"] == "hybrid" and route[0]["docs"][0]["rank"] == 2
+    assert route[0]["mode"] == "hybrid" and route[0]["docs"][1]["rank"] == 2
     text = "\n".join(R._calls_section({"calls": 1, "route": route, "found": []}))
     assert "a.md 3（#2・ベクトル・0.8123）" in text

@@ -95,7 +95,7 @@ def _intersect_sources_verified(sv, sources):
 
 
 def _redact_importance_from_answer_data(data):
-    """`answer.data` から重要度設定ファイル由来の citation/evidence 参照を落とす（`data.citations`・Evidence Packet の `source_path`/`matched_doc_ids`・troubleshoot 候補・impact の items/presumed）。`_safe_share_answer` と `_strip_shared_message` が共用する。`data` が dict でなければそのまま返す。"""
+    """`answer.data` から重要度設定ファイル由来の citation/evidence 参照と、既知の行の重要度の欄を落とす（`data.citations`・Evidence Packet の `source_path`/`matched_doc_ids`・troubleshoot 候補・impact の items/presumed）。`_safe_share_answer` と `_strip_shared_message` が共用する。`data` が dict でなければそのまま返す。"""
     if not isinstance(data, dict):
         return data
     out = dict(data)
@@ -109,12 +109,23 @@ def _redact_importance_from_answer_data(data):
         out["items"] = _filter_importance_from_impact_items(out["items"])
     if isinstance(out.get("presumed"), list):
         out["presumed"] = _filter_importance_from_impact_items(out["presumed"])
+    for k in ("citations", "candidates", "items", "presumed"):
+        if isinstance(out.get(k), list):
+            out[k] = _drop_importance_keys(out[k])
     if isinstance(out.get("claims"), list):
         # 区分（確定/推定/不明）と理由コードを allowlist で再構築する。
         out["claims"] = [x for x in (_safe_claim(c) for c in out["claims"]) if x is not None]
     if isinstance(out.get("reconciliation"), list):
         out["reconciliation"] = [x for x in (_safe_reconciliation_row(r) for r in out["reconciliation"]) if x is not None]
     return out
+
+
+_IMPORTANCE_KEYS = ("importance", "importance_reason", "importance_source", "importance_mixed")
+
+
+def _drop_importance_keys(srcs: list) -> list:
+    """出典の各行から重要度の欄を外す（過去に保存された回答に欄があっても共有には出さない）。"""
+    return [{k: v for k, v in c.items() if k not in _IMPORTANCE_KEYS} if isinstance(c, dict) else c for c in srcs]
 
 
 def _strip_shared_message(m: dict) -> dict:
@@ -130,7 +141,7 @@ def _strip_shared_message(m: dict) -> dict:
         needs_copy = any(k in a for k in _drop)
         # 通常の受領共有は元会話の answer をそのまま読むため、`sources[]`・`data.citations[]`・Evidence Packet の `source_path`/`matched_doc_ids` から重要度設定ファイルへの参照をここでも落とす。
         srcs = a.get("sources")
-        filtered_sources = _filter_importance_from_citations(srcs) if isinstance(srcs, list) else srcs
+        filtered_sources = _drop_importance_keys(_filter_importance_from_citations(srcs)) if isinstance(srcs, list) else srcs
         if isinstance(srcs, list) and filtered_sources != srcs:
             needs_copy = True
         # フィルタで sources から消えた doc_id を sources_verified からも外す。
@@ -360,17 +371,32 @@ _RECON_VERDICTS = ("match", "mismatch", "spec_missing", "source_missing", "unver
 
 
 def _safe_reconciliation_side(side) -> dict:
-    """照らし合わせの片側（`{text, doc_id?, line?}`）を既知の形だけで再構築する。重要度設定ファイルを指す参照は落とす。"""
+    """照らし合わせの片側（`{text, doc_id?, loc?, line?, line_end?, also?}`）を既知の形だけで再構築する。重要度設定ファイルを指す参照は落とす。"""
     out = {"text": side["text"] if isinstance(side, dict) and isinstance(side.get("text"), str) else ""}
-    if isinstance(side, dict) and isinstance(side.get("doc_id"), str) and side["doc_id"] \
-            and not importance.is_importance_control_path(side["doc_id"]):
-        out["doc_id"] = side["doc_id"]
-        line = side.get("line")
-        if isinstance(line, int) and not isinstance(line, bool) and line > 0:
-            out["line"] = line
-            end = side.get("line_end")
-            if isinstance(end, int) and not isinstance(end, bool) and end > line:
-                out["line_end"] = end
+    out.update(_safe_reconciliation_ref(side))
+    also = side.get("also") if isinstance(side, dict) and "doc_id" in out else None
+    if isinstance(also, list):
+        kept = [x for x in (_safe_reconciliation_ref(e) for e in also[:4]) if x]
+        if kept:
+            out["also"] = kept
+    return out
+
+
+def _safe_reconciliation_ref(ref) -> dict:
+    """照らし合わせの参照 1 件（`{doc_id, loc?, line?, line_end?}`）を既知の欄だけで作り直す。資料が無い・重要度設定ファイルなら空。"""
+    if not isinstance(ref, dict) or not isinstance(ref.get("doc_id"), str) or not ref["doc_id"] \
+            or importance.is_importance_control_path(ref["doc_id"]):
+        return {}
+    out = {"doc_id": ref["doc_id"]}
+    loc = ref.get("loc")
+    if isinstance(loc, str) and loc:
+        out["loc"] = loc[:120]
+    line = ref.get("line")
+    if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+        out["line"] = line
+        end = ref.get("line_end")
+        if isinstance(end, int) and not isinstance(end, bool) and end > line:
+            out["line_end"] = end
     return out
 
 
@@ -431,15 +457,13 @@ def _share_summary(summary: dict) -> dict:
 
 
 def _share_sources_unverified(answer: dict) -> dict:
-    """確認できなかった資料を共有向けに写す。資料パスは秘匿名でないものだけ、それ以外は件数に回す。"""
-    from ..ingest import text_kind
+    """確認できなかった資料を共有向けに写す。型の正しい行だけ写し、それ以外は件数に回す。"""
     rows = answer.get("sources_unverified")
     if not isinstance(rows, list):
         return {}
     kept, hidden = [], 0
     for r in rows:
-        if (isinstance(r, dict) and isinstance(r.get("path"), str) and isinstance(r.get("reason"), str)
-                and not text_kind.is_sensitive_doc_id(r["path"])):
+        if isinstance(r, dict) and isinstance(r.get("path"), str) and isinstance(r.get("reason"), str):
             kept.append({"path": r["path"], "reason": r["reason"]})
         else:
             hidden += 1
@@ -457,7 +481,7 @@ def _share_sources_unverified(answer: dict) -> dict:
 
 
 def _share_new_shape_fields(answer: dict) -> dict:
-    """新しい欄を共有向けにする（秘匿の資料の名前・パスは出さず件数に回す・`answer_shape.safe_new_fields`）。"""
+    """新しい欄を共有向けにする（`answer_shape.safe_new_fields`）。"""
     out = answer_shape.safe_new_fields(answer)
     if isinstance(out.get("referenced_docs"), list):  # 共有の出典から外れる資料（重要度設定ファイル）は参照した資料の行からも外す
         out["referenced_docs"] = [r for r in out["referenced_docs"] if not importance.is_importance_control_path(r["path"])]
@@ -567,10 +591,12 @@ def _safe_share_answer(answer):
         non_personal = [s for s in srcs if isinstance(s, dict) and s.get("source") != "個人ファイル内ヒット"]
         # 重要度設定ファイル自体は共有 snapshot の出典にも出さない（`_strip_shared_message` と共有する実装）。
         importance_filtered = _filter_importance_from_citations(non_personal)
-        # `importance`/`importance_reason` は通し、`importance_source` は出さない。
-        out["sources"] = [{k: s[k] for k in ("doc_id", "quote", "source", "title", "path",
-                                              "importance", "importance_reason") if k in s}
+        out["sources"] = [{k: s[k] for k in ("doc_id", "quote", "source", "title", "path") if k in s}
                           for s in importance_filtered]
+        for row, src in zip(out["sources"], importance_filtered):  # 世代（トップフォルダ）と原本の更新時刻は文字列のときだけ通す
+            for k in ("generation", "modified_at", "note"):  # note＝範囲の外の注記
+                if isinstance(src.get(k), str) and src[k]:
+                    row[k] = src[k]
         for row, src in zip(out["sources"], importance_filtered):
             url = _safe_download_url(src.get("download_url"), src.get("doc_id"),
                                       (answer.get("scope") or {}).get("world") if isinstance(answer.get("scope"), dict) else None)

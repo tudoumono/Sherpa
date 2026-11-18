@@ -79,7 +79,7 @@ while [ "$stopping" = 0 ]; do
   # 見張りの起動後にファイルが別の版へ置き換えられたら、新しいワーカーを起動しない（版の混ざったコードで動かさない）。
   now_version="$(cat "$ROOT/VERSION" 2>/dev/null || true)"
   if [ "$now_version" != "$started_version" ]; then
-    echo "Sherpa のファイルが別の版（${now_version:-不明}）に置き換えられたため、取り込みワーカーの見張りを終えます（起動時の版: ${started_version:-不明}）。make restart で起動し直してください。" >&2
+    echo "Slouch のファイルが別の版（${now_version:-不明}）に置き換えられたため、取り込みワーカーの見張りを終えます（起動時の版: ${started_version:-不明}）。make restart で起動し直してください。" >&2
     break
   fi
   # 前のワーカーが突然消えた（SIGKILL・OOM・停電）ときに残った子（先読み・soffice）を、新しいワーカーの前に片付ける。

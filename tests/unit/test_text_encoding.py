@@ -1,4 +1,4 @@
-"""原本の UTF-8 / CP932 判定と読み取り境界の回帰テスト。"""
+"""原本の UTF-8 / CP932 / EUC-JP 判定と読み取り境界の回帰テスト。"""
 from __future__ import annotations
 
 import os
@@ -202,11 +202,11 @@ def test_short_file_single_bad_byte_stays_partial_despite_high_ratio():
     assert TE.quality_of(ratio, majority) == "partial"
 
 
-def test_multiline_euc_jp_with_short_japanese_is_not_readable():
-    """行ごとの日本語が短い EUC-JP（CSV など）も、CP932 として「要確認」で使わせず対象外にする。"""
+def test_multiline_euc_jp_with_short_japanese_is_read_as_euc_jp():
+    """行ごとの日本語が短い EUC-JP（CSV など）は、CP932 として化けさせず EUC-JP として読む。"""
     csv = "コード,名称,区分\n0001,東京支店,1\n0002,大阪支店,2\n" * 10
     enc, ratio, majority = TE.detect_bytes_quality(csv.encode("euc_jp"), complete=True)
-    assert TE.quality_of(ratio, majority) == "undetermined"
+    assert (enc, TE.quality_of(ratio, majority)) == ("euc_jp", "ok")
     enc, ratio, majority = TE.detect_bytes_quality(csv.encode("cp932"), complete=True)
     assert (enc, TE.quality_of(ratio, majority)) == ("cp932", "ok")
 
@@ -226,12 +226,12 @@ def test_fixed_length_ebcdic_without_control_chars_is_not_readable():
     assert TE.quality_of(ratio, majority) == "undetermined"
 
 
-def test_euc_jp_with_nec_special_chars_is_not_readable():
-    """Python の euc_jp が拒否する NEC 特殊文字（13 区）を含む EUC-JP も対象外にする。"""
+def test_euc_jp_with_nec_special_chars_is_read_as_euc_jis_2004():
+    """Python の euc_jp が拒否する NEC 特殊文字（13 区）を含む EUC-JP は euc_jis_2004 で読む。"""
     csv = ("コード,名称,区分\n0001,東京支店,1\n0002,大阪支店,2\n" * 10).encode("euc_jp")
     raw = csv + b"0003," + b"\xad\xea" + "札幌,3\n".encode("euc_jp")
     enc, ratio, majority = TE.detect_bytes_quality(raw, complete=True)
-    assert TE.quality_of(ratio, majority) == "undetermined"
+    assert (enc, TE.quality_of(ratio, majority)) == ("euc_jis_2004", "ok")
 
 
 def test_cp932_gaiji_table_without_kana_stays_readable():
@@ -239,3 +239,48 @@ def test_cp932_gaiji_table_without_kana_stays_readable():
     rows = b"".join(b"F0%02X," % i + b"\xf0" + bytes([0x40 + i]) + ",\x8d\x82\n".encode("latin-1") for i in range(20))
     enc, ratio, majority = TE.detect_bytes_quality(rows, complete=True)
     assert (enc, TE.quality_of(ratio, majority)) == ("cp932", "partial")
+
+
+def test_euc_jp_jcl_without_kana_is_read_as_euc_jp():
+    """かなを含まない正しい EUC-JP の JCL（漢字のコメントだけ）を CP932 として化けさせない。"""
+    raw = "//STEP1 EXEC PGM=ZZAPROG00\n//* 売上集計\n".encode("euc_jp")
+    assert TE.detect_bytes_quality(raw, complete=True) == ("euc_jp", 0.0, False)
+
+
+def test_euc_jp_hiragana_sentence_and_short_word_are_read_as_euc_jp():
+    for text in ("これはテストの文章です。日本語を含みます。\n", "あいうえお"):
+        assert TE.detect_bytes(text.encode("euc_jp"), complete=True) == "euc_jp"
+
+
+def test_cp932_gaiji_and_half_width_kana_are_not_taken_as_euc():
+    """EUC としても読めてしまう CP932（外字だけ・半角カナだけ）は CP932 のまま。"""
+    cases = [("売上集計".encode("cp932") + b"\xf9\xfc" + "処理\n".encode("cp932")) * 20,   # 外字（IBM 拡張）入り
+             "ｱｲｳｴｵ".encode("cp932") * 20,
+             ("ｺｰﾄﾞ ﾒｲｼｮｳ ｸﾌﾞﾝ\n" * 20).encode("cp932"),
+             "売上集計処理を行う。顧客コードを取得する。\n".encode("cp932") * 3,
+             "//ZZJOB01 JOB (A),'X'\n//* ﾃﾞｰﾀ\n//STEP1 EXEC PGM=ZZAPROG\n".encode("cp932"),
+             "MOVE 'ｺｰﾄﾞ' TO WK-A.\nMOVE 'ｶﾅ' TO WK-B.\n".encode("cp932")]
+    assert [TE.detect_bytes(raw, complete=True) for raw in cases] == ["cp932"] * len(cases)
+
+
+def test_large_euc_jp_without_kana_is_judged_from_head_cut_at_line_end(tmp_path):
+    """判定へ渡す先頭の上限で多バイト文字が割れても、末尾から戻って切るので EUC のまま読める。"""
+    raw = ("//* 売上集計\n" * 200000).encode("euc_jp")
+    p = tmp_path / "big.jcl"
+    p.write_bytes(raw)
+    assert len(raw) > TE._NORMALIZER_HEAD_BYTES
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        assert TE.detect_fd(fd) == "euc_jp"
+    finally:
+        os.close(fd)
+
+
+def test_euc_jp_with_no_common_boundary_in_last_16_bytes_is_read_as_euc_jp():
+    """CP932 と EUC の共通の文字の区切りが先頭 1 MiB の末尾 16 バイト以内に無くても、手前の区切りで切って EUC と判断する。"""
+    fill_len = TE._NORMALIZER_HEAD_BYTES - 31
+    body = "あいうえお".encode("euc_jp")
+    fill = body * (fill_len // len(body))
+    fill += b"\n" * (fill_len - len(fill))
+    raw = fill + b"\x8f\xa2\xed" * 20 + b"\x8e\xa1"
+    assert TE.detect_bytes(raw, complete=False) == "euc_jp"

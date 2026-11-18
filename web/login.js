@@ -59,8 +59,13 @@ form.addEventListener('submit', async (e) => {
         window.location.href = nextUrl();
       }
     } else {
-      // 401 / その他はすべて汎用メッセージ（サーバ側のユーザー存在情報を漏らさない）。
-      showErr('ユーザー名またはパスワードが正しくありません');
+      // 401 は利用者の有無を漏らさない固定の文。それ以外はサーバーの理由を出す。
+      if (r.status === 401) {
+        showErr('ユーザー名またはパスワードが正しくありません');
+      } else {
+        const body = await r.json().catch(() => null);
+        showErr((body && typeof body.detail === 'string' && body.detail) || `ログインできませんでした（HTTP ${r.status}）`);
+      }
     }
   } catch (_) {
     showErr('通信エラーが発生しました。ページを再読み込みしてもう一度お試しください。');

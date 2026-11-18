@@ -234,7 +234,7 @@ class _CsvStream:
 
 def _readme_text(period: dict, retrieved_at: datetime, app_ver: str | None) -> str:
     lines = [
-        "Sherpa 利用明細エクスポート",
+        "Slouch 利用明細エクスポート",
         "",
         f"期間: {period.get('start')} 〜 {period.get('end')}（JST 暦日・両日を含む）",
         f"実際に使った半開区間: {period.get('from')} 〜 {period.get('to')}",

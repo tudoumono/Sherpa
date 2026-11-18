@@ -23,6 +23,7 @@ from sherpa.ingest import evidence_ir, metafile_text, ocr_router, office_md  # n
 def _no_libreoffice(monkeypatch, tmp_path):
     """この file は埋込ビットマップと文字の抽出が対象。全体描画（LibreOffice）は test_metafile_render.py で見る。"""
     monkeypatch.setenv("SHERPA_SOFFICE_BIN", str(tmp_path / "no-such-soffice"))
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})     # OCR の既定は切。この file は入れた状態の挙動を見る
 
 
 # ---- 文字（C） ------------------------------------------------------------------------------
@@ -319,7 +320,7 @@ def test_legacy_doc_without_cached_conversion_is_left_alone(monkeypatch, tmp_pat
 
 
 def test_figure_text_is_independent_of_ocr_being_enabled(monkeypatch, tmp_path):
-    monkeypatch.setenv(office_md._OCR_ENABLED_ENV, "0")
+    monkeypatch.setenv("SHERPA_OCR_ENABLED", "0")
     _, dmd = _build(monkeypatch, tmp_path)
     rag = (dmd.parent / "rag" / "a.docx.rag.md").read_text(encoding="utf-8")
     assert "図の中の文字（元の値）" in rag

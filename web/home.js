@@ -382,21 +382,6 @@ if (notifList) {
   });
 }
 
-// テーマ切替
-function applyThemeIcon() {
-  const tb = $('themebtn');
-  if (tb) tb.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙';
-}
-const themebtn = $('themebtn');
-if (themebtn) {
-  themebtn.addEventListener('click', () => {
-    const d = document.documentElement;
-    const next = d.dataset.theme === 'dark' ? 'light' : 'dark';
-    d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
-  });
-}
-applyThemeIcon();
-
 // ===== 初期化 =====
 (async () => {
   _isAdmin = await checkAdmin();

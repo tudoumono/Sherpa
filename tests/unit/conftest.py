@@ -59,6 +59,13 @@ def _hermetic_system_settings(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _ocr_on_for_worker_suite(request, monkeypatch):
+    """OCR の既定は切。ワーカーの試験（`test_ocr_worker.py`）は OCR を入れた状態の挙動を見る。"""
+    if request.module.__name__.rsplit(".", 1)[-1] == "test_ocr_worker":
+        monkeypatch.setattr("sherpa.store.get_system_settings", lambda **kw: {"ocr_enabled": True})
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_metering_record(monkeypatch):
     """TOGGLE-RM（2026-09-03）: `sherpa.metering.record()` は常時 DB に書く（旧 `usage_metering`
     トグルの ON/OFF ゲートを撤去済み）。従来、unit テストが実 DB へ書き込まない防御は

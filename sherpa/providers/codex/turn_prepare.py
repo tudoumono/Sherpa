@@ -7,7 +7,7 @@ import shutil
 import threading
 from pathlib import Path
 
-from ... import investigation_ledger
+from ... import investigation_ledger, path_rules
 from ... import layer as layer_mod
 from ..base import _log, _node
 from .codex_cli import build_launch, log_turn_start, resolve_reasoning
@@ -155,11 +155,22 @@ def prepare_run(self, ctx, st, decision):
     _direct_roots, _deny_roots = _base_roots, []
     _venv_for_deny = _venv_root()
     try:
-        _scope_deny = _scope_deny_entries(_base_roots, sp)
+        # 管理者の優先・除外（`path_rules`）: 「範囲の外でも読む」は読める範囲に足し、除外の場所は範囲に関わらず deny に足す
+        _rules = path_rules.rules_for(ctx.world)
+        st._rules = _rules  # この依頼の間は、この規則だけを使う（deny・strict の判定・MCP の子へ渡す env）
+        _scope_deny = _scope_deny_entries(_base_roots, _rules.extend_scope(sp))
         if _base_roots and all(r in _scope_deny for r in _base_roots):
             raise RuntimeError("scope_enum_failed:no_scope_in_roots")  # 範囲がどの root にも無い
+        _scope_deny = _scope_deny + sandbox._exclude_deny_entries(
+            _base_roots, _rules, _scope_deny,
+            derived_roots=sandbox._derived_read_roots(ctx.world, strict=bool(_rules.exclude_paths)))
         _sensitive_deny = _scope_deny + sandbox._enumerate_sensitive(
             _base_roots + ([str(_venv_for_deny)] if _venv_for_deny else []))
+        if _rules.exclude_paths:
+            # 除外の設定がある資料フォルダでは、deny はすべて strict: 最終の整形（permission profile を書くときの `_prune_deny_paths`）で
+            # 確かめられずに落ちる deny が無いことを、ここで先に確かめる（範囲の deny に含まれる除外の対象も含む。起きれば直読みを止める）
+            sandbox._prune_deny_paths(_sensitive_deny, _base_roots + ([str(_venv_for_deny)] if _venv_for_deny else []),
+                                      strict=True)
         _direct_read_ok = True
     except RuntimeError as e:
         _direct_roots, _deny_roots, _sensitive_deny, _direct_read_ok = [], _base_roots, [], False

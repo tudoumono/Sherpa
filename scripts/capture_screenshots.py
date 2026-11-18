@@ -42,7 +42,7 @@ from mock_api import install_api_mocks  # noqa: E402
 
 DEFAULT_PORT = 8901
 DEFAULT_VIEWPORT = (1280, 800)
-WIDE_VIEWPORT = (1440, 900)   # 3 カラムの全体像・グラフ系向け
+WIDE_VIEWPORT = (1440, 900)   # 3 カラムの全体像向け
 
 # 決定性: アニメーション/トランジション無効化＋キャレット非表示（再実行で画素を安定させる）。
 _ANIM_OFF_CSS = (
@@ -204,25 +204,6 @@ def _scene_scope_brain(page):
     page.wait_for_selector("#brainmenu .brainitem", state="visible", timeout=5000)
 
 
-def _scene_graph(page):
-    page.wait_for_function(
-        "() => (document.getElementById('gcount')?.textContent || '').includes('ノード')",
-        timeout=15000)
-
-
-def _scene_graph_search(page):
-    page.wait_for_function(
-        "() => (document.getElementById('gcount')?.textContent || '').includes('ノード')",
-        timeout=15000)
-    page.locator(".gconditions summary").click()
-    page.wait_for_selector("#relfilter option[value='COPIES']", state="attached", timeout=10000)
-    page.select_option("#relfilter", "COPIES")
-    page.click("#gfilter")
-    page.wait_for_function(
-        "() => (document.getElementById('gcount')?.textContent || '').includes('検索結果')",
-        timeout=10000)
-
-
 def _scene_settings(page):
     # 「読み込み済み」の実データ信号で待つ（#agent は静的 HTML に最初からあり visible では不十分・RV Med）。
     # load() 完了＝キー欄の placeholder が /settings 応答（openai_key_set）で置き換わる。
@@ -303,13 +284,7 @@ SCENES: list[Scene] = [
     Scene("20-ingest-status", "ingest.html",
           "「資料」画面の下部＝取り込み状況（一覧・状態・フォルダツリー）を表示",
           setup=_scene_ingest_status, crop=".ingestwrap"),
-    # --- 21. 管理：グラフと検索 ---
-    Scene("21-graph", "graph.html",
-          "ナレッジグラフ（cytoscape）を読み込み、レイアウト安定後に全体を撮る",
-          setup=_scene_graph, viewport=WIDE_VIEWPORT, settle_ms=1800),
-    Scene("21-graph-search", "graph.html",
-          "関係=COPIES で絞り込み検索し、検索結果グラフを撮る",
-          setup=_scene_graph_search, viewport=WIDE_VIEWPORT, settle_ms=1800),
+    # --- 21. 管理：全文検索 ---
     Scene("21-es-search", "ingest.html",
           "取り込み状況内の全文検索パネルで検索し、ヒット一覧カードを切り出す",
           setup=_scene_es_search, crop=".es-card", routes=routes_es_search),

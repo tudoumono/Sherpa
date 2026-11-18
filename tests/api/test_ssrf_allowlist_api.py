@@ -300,3 +300,11 @@ def test_settings_test_ollama_probe_auth_failure_detail_is_not_rounded(monkeypat
     d = r.json()
     assert d["ok"] is False
     assert d["detail"].startswith("401")
+
+
+def test_round_ollama_probe_detail_keeps_http_status_only():
+    from sherpa.routers.system import _round_ollama_probe_detail
+    assert "HTTP 404" in _round_ollama_probe_detail("HTTP 404")
+    assert "HTTP 500" in _round_ollama_probe_detail("500 server_error: secret-host")
+    assert "secret-host" not in _round_ollama_probe_detail("500 server_error: secret-host")
+    assert "接続に失敗" in _round_ollama_probe_detail("Connection refused")

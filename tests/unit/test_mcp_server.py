@@ -447,9 +447,21 @@ def test_tools_call_graph_neighbors_stubbed(monkeypatch):
     from sherpa import lens_service
     fake = [{"name": "BILLINGJOB", "label": "Module", "category": "プログラム", "role": "実装",
              "distance": 2, "path": ["請求", "BILLINGJOB"], "evidence": {"edges": [], "grep": []}}]
-    monkeypatch.setattr(lens_service, "neighbor_cards", lambda world, term, sp=None: list(fake))
+    monkeypatch.setattr(lens_service, "neighbor_cards", lambda world, term, sp=None, **kw: list(fake))
     n = _body(_call("graph_neighbors", {"name": "請求"}))["neighbors"][0]
     assert n["name"] == "BILLINGJOB" and n["role"] == "実装" and n["path"]
+
+
+def test_graph_neighbors_continuation_is_not_rejected_as_duplicate(monkeypatch):
+    from sherpa import lens_service
+    cards = [{"name": f"N{i:03d}", "label": "Module", "category": "プログラム", "role": "実装", "distance": 1,
+              "path": [], "evidence": {"edges": [], "grep": []}} for i in range(40)]
+    monkeypatch.setattr(lens_service, "neighbor_cards", lambda world, term, sp=None, **kw: list(cards))
+    first = _body(_call("graph_neighbors", {"name": "請求"}))
+    assert first["truncated"] is True and first["next_offset"] == len(first["neighbors"])
+    second = _body(_call("graph_neighbors", {"name": "請求", "offset": first["next_offset"]}))
+    assert "error" not in second and second["neighbors"][0]["name"] == "N%03d" % first["next_offset"]
+    assert _body(_call("graph_neighbors", {"name": "請求"}))["error"] == "duplicate_tool_call"
 
 
 def test_graph_schema_era_error_is_structured_tool_error_with_sidecar_code_and_coverage(tmp_path, monkeypatch):
@@ -827,7 +839,7 @@ def test_clip_tool_result_read_doc_single_long_line_keeps_partial_text_and_progr
     assert was_clipped is True and _final_bytes(clipped) <= 40000
     assert clipped["text"] != "" and clipped["end_line"] == 5
     assert clipped["partial_line"] is True and clipped["truncated"] is True
-    assert "start_line=6" in clipped["note"]
+    assert clipped["next_char"] > 0 and "start_char=%d" % clipped["next_char"] in clipped["note"]
 
 
 def test_clip_tool_result_unknown_shape_falls_back_with_note(monkeypatch):
@@ -980,16 +992,34 @@ def test_office_and_pdf_reads_are_recorded_in_coverage_with_range_and_write_fail
     assert {"kind": "limit", "field": "coverage_write_failed"}.items() <= _entries(sidecar)[-1].items()
 
 
-def test_coverage_detail_never_stores_sensitive_doc_names_and_drops_queries_for_personal_turns(tmp_path, monkeypatch):
-    """秘匿名の資料は coverage に記録しない。個人ファイルを使うターンでは検索語も記録しない。"""
+def test_coverage_detail_stores_doc_names_and_drops_queries_for_personal_turns(tmp_path, monkeypatch):
+    """資料の名前は秘匿名でも coverage に記録する（本文は持たない）。個人ファイルを使うターンでは検索語は記録しない。"""
     directory = tmp_path / "investigation"
     monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
-    _stub_run_tool(monkeypatch, {"text": "x"})
+    _stub_run_tool(monkeypatch, {"text": "BODYMARK"})
     assert not _call("read_doc", {"doc_id": "鍵/server.pem", "item": "s"})["result"]["isError"]
     _stub_run_tool(monkeypatch, {"hits": [{"doc_id": "a.md", "text": "x"}]})
     assert not _call("ripgrep_search", {"query": "COVNOQ-1", "item": "s"})["result"]["isError"]
     monkeypatch.setenv("SHERPA_MCP_COVERAGE_NO_QUERY", "1")
     assert not _call("ripgrep_search", {"query": "COVNOQ-2", "item": "s"})["result"]["isError"]
     text = (directory / "coverage.jsonl").read_text(encoding="utf-8")
-    assert "server.pem" not in text and "COVNOQ-1" in text and "COVNOQ-2" not in text
+    assert "鍵/server.pem" in text and "BODYMARK" not in text and "COVNOQ-1" in text and "COVNOQ-2" not in text
 
+
+
+def test_clip_tool_result_read_doc_long_line_next_char_advances_from_start_char(monkeypatch):
+    """行の途中から読んだ結果をさらに縮めても、next_char は読んだ分だけ進む（start_char 起点・毎回 1 文字以上）。"""
+    monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "1000")
+    result = {"doc_id": "a.md", "start_line": 5, "start_char": 40, "end_line": 5, "total_lines": 100,
+              "text": "5: " + "x" * 5000}
+    clipped, was_clipped = M._clip_tool_result(result)
+    assert was_clipped is True and _final_bytes(clipped) <= 1000
+    n = len(clipped["text"]) - len("5: ")
+    assert n >= 1 and clipped["next_char"] == 40 + n and clipped["partial_line"] is True
+    assert "start_char=%d" % clipped["next_char"] in clipped["note"]
+
+
+def test_dedup_key_differs_when_only_start_char_differs():
+    a = M._dedup_key("read_doc", {"doc_id": "a.md", "start_line": 2, "start_char": 100})
+    b = M._dedup_key("read_doc", {"doc_id": "a.md", "start_line": 2, "start_char": 200})
+    assert a != b

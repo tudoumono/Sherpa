@@ -102,6 +102,21 @@ def test_xlsx_range_row_larger_than_budget_returns_leading_columns_not_empty_row
     assert out["range"] == f"A1:{openpyxl.utils.get_column_letter(n)}1" and out["locator"] == f"大!{out['range']}"
 
 
+def test_xlsx_range_cols_clipped_keeps_display_for_window_starting_right_of_a(tmp):
+    p = tmp / "disp.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "大"
+    for c in range(1, 41):
+        ws.cell(1, c, 0.25 if c % 2 else "x" * 2500)
+        if c % 2:
+            ws.cell(1, c).number_format = "0.0%"
+    wb.save(p)
+    raw = DR.xlsx_range(_open(p), "大", range_a1="N1:AQ1")
+    out = RT._finish_reader_result("xlsx_range", raw, "disp.xlsx", 30000)
+    assert out["cols_clipped"] is True and len(out["display"]) == len(out["rows"][0]) // 2
+
+
 def test_xlsx_range_single_cell_larger_than_budget_is_an_error_not_empty_rows(tmp):
     p = tmp / "huge.xlsx"
     _wide_row_xlsx(p, cell_chars=32000, cols=2)
@@ -125,6 +140,8 @@ def test_mcp_reader_tools_use_the_smaller_reader_budget(monkeypatch):
     monkeypatch.setenv("SHERPA_MCP_READER_BUDGET_BYTES", "30000")
     assert mcp_server._tool_budget_bytes("pdf_pages") == 30000
     assert mcp_server._tool_budget_bytes("xlsx_range") == 30000
+    assert mcp_server._tool_budget_bytes("read_doc") == 30000
+    assert mcp_server._tool_budget_bytes("read_around") == 30000
     assert mcp_server._tool_budget_bytes("ripgrep_search") == 65536
     monkeypatch.delenv("SHERPA_MCP_READER_BUDGET_BYTES")
     assert mcp_server._tool_budget_bytes("pdf_pages") == 65536
@@ -280,3 +297,67 @@ def test_xlsx_range_row_clip_drops_extras_of_removed_rows():
     out = RT._finish_reader_result("xlsx_range", result, "a.xlsx", 8192)
     n = len(out["rows"])
     assert 0 < n < 40 and out["hidden_rows"] == [2] and out["display"] == {"B1": "1%"} and out["merged"] == ["A1:B1"]
+
+
+# ===== xlsx_range: 切り詰めた続きを最後まで読める =====
+
+def test_xlsx_range_continuation_ranges_read_every_cell_beyond_50_cols_and_200_rows(tmp):
+    from openpyxl.utils.cell import range_boundaries
+    p = tmp / "wide.xlsx"
+    rows, cols = 230, 130
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "S"
+    for r in range(1, rows + 1):
+        for c in range(1, cols + 1):
+            ws.cell(r, c, f"r{r}c{c}")
+    wb.save(p)
+
+    seen: dict[tuple[int, int], str] = {}
+    todo = [None]
+    guard = 0
+    while todo:
+        guard += 1
+        assert guard < 200
+        rng = todo.pop()
+        raw = DR.xlsx_range(_open(p), "S", rng, max_rows=5000, max_cols=1000, budget_chars=3000) if rng else \
+            DR.xlsx_range(_open(p), "S", budget_chars=3000)
+        out = RT._finish_reader_result("xlsx_range", raw, "wide.xlsx", 6000)
+        assert "error" not in out and _size(out) <= 6000
+        c0, r0, _c1, _r1 = range_boundaries(out["range"])
+        for i, row in enumerate(out["rows"]):
+            for j, v in enumerate(row):
+                assert (r0 + i, c0 + j) not in seen
+                seen[(r0 + i, c0 + j)] = v
+        todo += [out[k] for k in ("next_range", "next_cols_range") if out.get(k)]
+    assert len(seen) == rows * cols and all(v == f"r{r}c{c}" for (r, c), v in seen.items())
+
+
+def test_xlsx_range_has_no_continuation_when_everything_is_returned(tmp):
+    p = tmp / "small.xlsx"
+    _wide_row_xlsx(p, cell_chars=5, cols=3)
+    out = RT._finish_reader_result("xlsx_range", DR.xlsx_range(_open(p), "大"), "small.xlsx", 30000)
+    assert "next_range" not in out and "next_cols_range" not in out and out["truncated"] is False
+
+
+def test_xlsx_range_first_row_columns_result_survives_mcp_clip_with_next_cols_range(tmp):
+    p = tmp / "mid.xlsx"
+    _wide_row_xlsx(p, cell_chars=46, cols=120)
+    raw = DR.xlsx_range(_open(p), "大", "A1:DP1", max_rows=5000, max_cols=120)
+    out = RT._finish_reader_result("xlsx_range", raw, "mid.xlsx", 3000)
+    assert _size(out) <= 3000 and out["cols_clipped"] is True and out.get("next_cols_range")
+    clipped, was_clipped = mcp_server._clip_tool_result(out, name="xlsx_range", args={})
+    assert not was_clipped and clipped["next_cols_range"] == out["next_cols_range"]
+
+
+def test_xlsx_range_sparse_wide_sheet_stops_early_instead_of_stacking_empty_cells(tmp):
+    p = tmp / "sparse.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "S"
+    for r in range(1, 301):
+        ws.cell(r, 1, "a")
+        ws.cell(r, 700, "z")
+    wb.save(p)
+    out = DR.xlsx_range(_open(p), "S", max_rows=5000, max_cols=1000, budget_chars=3000)
+    assert len(out["rows"]) < 20 and out["next_range"]
