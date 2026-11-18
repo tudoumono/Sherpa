@@ -384,13 +384,14 @@ def test_eval_fields_in_jsonl_and_text_from_session_records(tmp_path):
     assert kinds["string"] == {"calls": 1, "ms": 1000, "errors": 0, "truncated": 1}
     assert kinds["fulltext"] == {"calls": 2, "ms": 30, "errors": 1, "truncated": 0}
     assert kinds["other"] == {"calls": 3, "errors": 1}                                 # 記録に無い欄（時間・打切）は足さない
-    assert isinstance(t["result_errors"], dict)
+    assert set(t["result_errors"]) == {"checked", "unknown", "kinds"}
     assert t["es_modes"] == {"hybrid": 0, "vector": 0, "keyword": 0, "degraded": {}, "unknown": 1}   # 方式が載っていない
     assert t["scope"] == "wld-sample" and t["scope_paths"] == ["src/sample"] and t["scope_whole"] is False
     total = rows[-1]
     assert total["kind"] == "conversation" and total["conv"] == 7 and total["turns"] == 1
     assert total["duration_ms"] == 300000 and total["tokens"]["uncached_input"] == 240 and total["tokens"]["output"] == 73
-    assert total["tool_kinds"]["other"] == {"calls": 3, "errors": 1}
+    assert total["tool_kinds"]["other"] == {"calls": 3, "errors": 1} and total["tool_turns"] == 1
+    assert total["tool_kinds"]["string"] == {"calls": 1, "ms": 1000, "errors": 0, "truncated": 1}
     assert rows[0]["turns"] == 1                                                         # meta の turns は turn の行の数
 
     text = CT.build_output([conv], CT.Masker(mask=False, salt=b"s" * 16), tmp_path)
@@ -476,8 +477,17 @@ def test_eval_fields_keep_missing_apart_from_zero():
     # 道具の集計はアプリの記録だけから作る（記録が無ければ欄ごと出さない）。失敗の印の無い不調は別の欄に数える
     assert ev.kind_stats(None) == {} and ev.kind_stats({"tools": [{"tool": "es_search"}]}) == {}
     calls = [NS(name="graph_neighbors"), NS(name="graph_neighbors"), NS(name="es_search")]
-    results = iter([{"error_code": "graph_unavailable"}, {"nodes": []}, {"error": "x"}])
-    assert ev.result_errors(calls, lambda c: next(results)) == {"graph": 1, "fulltext": 1}
+    results = iter([{"error_code": "graph_unavailable"}, None, {"error": "x"}])
+    assert ev.result_errors(calls, lambda c: next(results)) == {"checked": 2, "unknown": 1, "kinds": {"graph": 1, "fulltext": 1}}
+    two = ev.conversation_total([{"tool_kinds": {"fulltext": {"calls": 2, "ms": 30, "errors": 1, "truncated": 1}}}, {}])
+    assert two["tool_kinds"]["fulltext"] == {"calls": 2, "ms": 30, "errors": 1, "truncated": 1} and two["tool_turns"] == 1
+    assert "道具（1 ターン分）" in ev.total_lines(two, lambda row: "tok", lambda ms: "t")[0]
+
+    # 終わりの記録が無い呼び出しがあれば、時間の内訳にその件数を添える
+    started = [NS(subagent=False, parent_tid=None, events=[(0.5, {"type": "event_msg", "payload": {"type": "task_started"}})])]
+    facts = ev.turn_facts(asked_at=None, answer={}, calls=[NS(name="es_search", duration_ms=None)], threads=started,
+                          window=(0.0, 2.0), masker=CT.Masker(mask=False), parsed=lambda c: None)
+    assert facts["time"]["no_end_calls"] == 1 and facts["result_errors"] == {"checked": 0, "unknown": 1, "kinds": {}}
 
     # 壊れたセッション記録（時間が文字列）は時間の内訳を出さないだけで、落ちない
     broken = [NS(subagent=False, parent_tid=None, events=[

@@ -119,13 +119,18 @@ def kind_stats(call_stats) -> dict:
 
 
 def result_errors(calls, parsed) -> dict:
-    """結果に `error`／`error_code` の欄があった呼び出しの数（検索の種類ごと）。道具が失敗の印を付けずに返した不調も入る。"""
-    out: dict = {}
+    """結果に `error`／`error_code` の欄があった呼び出しの数（`kinds`＝検索の種類ごと）。道具が失敗の印を付けずに返した不調も入る。
+    `checked` は結果を読めた呼び出しの数、`unknown` は結果が無い・読めない呼び出しの数。"""
+    out: dict = {"checked": 0, "unknown": 0, "kinds": {}}
     for c in calls:
         p = parsed(c)
-        if isinstance(p, dict) and ("error" in p or "error_code" in p):
+        if not isinstance(p, dict):
+            out["unknown"] += 1
+            continue
+        out["checked"] += 1
+        if "error" in p or "error_code" in p:
             k = kind_of(c.name)
-            out[k] = out.get(k, 0) + 1
+            out["kinds"][k] = out["kinds"].get(k, 0) + 1
     return out
 
 
@@ -157,6 +162,9 @@ def turn_facts(*, asked_at, answer: dict, calls, threads, window, masker, parsed
         out["asked_at"] = asked_at
     tm = timing(threads, *window) if threads else None
     if tm:
+        open_calls = sum(1 for c in calls if not _is_int(c.duration_ms))
+        if open_calls:
+            tm["no_end_calls"] = open_calls
         out["time"] = tm
     kinds = kind_stats(answer.get("call_stats"))
     if kinds:
@@ -190,14 +198,18 @@ def fact_lines(facts: dict, dur_ms, dur) -> list[str]:
     if tm:
         lines.append(f"  時間の内訳: 回答全体 {dur(dur_ms)}／道具 {dur(tm['tools_ms'])}／シェル {dur(tm['shell_ms'])}"
                      f"／モデルの応答待ち {dur(tm['model_wait_ms'])}"
-                     + (f"（本体の分。下調べ役 {tm['sub_threads']} の道具 {dur(tm['sub_tools_ms'])} は別）" if "sub_threads" in tm else ""))
+                     + (f"（本体の分。下調べ役 {tm['sub_threads']} の道具 {dur(tm['sub_tools_ms'])} は別）" if "sub_threads" in tm else "")
+                     + (f"（終わりの記録が無い呼び出し {tm['no_end_calls']} 件は時間に入っていない）" if "no_end_calls" in tm else ""))
     kinds = facts.get("tool_kinds") or {}
     if kinds:
         lines.append("  検索の種類: " + "／".join(f"{label} {kinds[k]['calls']} 回{_kind_text(kinds[k], dur)}"
                                               for k, label in KIND_LABEL if k in kinds))
-    soft = facts.get("result_errors") or {}
+    soft = facts.get("result_errors")
     if soft:
-        lines.append("  結果に不調の印があった呼び出し: " + "／".join(f"{label} {soft[k]}" for k, label in KIND_LABEL if k in soft))
+        kinds_e = soft["kinds"]
+        lines.append("  結果に不調の印があった呼び出し: "
+                     + ("／".join(f"{label} {kinds_e[k]}" for k, label in KIND_LABEL if k in kinds_e) or "なし")
+                     + f"（結果を読めた {soft['checked']} 件のうち・読めない {soft['unknown']} 件）")
     modes = facts.get("es_modes")
     if modes:
         degraded = modes["degraded"]
@@ -211,7 +223,7 @@ def fact_lines(facts: dict, dur_ms, dur) -> list[str]:
 
 def conversation_total(entries: list[dict]) -> dict:
     """会話 1 本の合計。entries は {duration_ms, tokens, tool_kinds} の並び（ターンごと）。
-    `duration_turns`・`token_turns`・`uncached_input_turns` は、その合計に入ったターンの数（`turns` より少なければ記録の無いターンがある）。"""
+    `duration_turns`・`token_turns`・`uncached_input_turns`・`tool_turns` は、その合計に入ったターンの数（`turns` より少なければ記録の無いターンがある）。"""
     out: dict = {"turns": len(entries)}
     durs = [e["duration_ms"] for e in entries if _is_int(e.get("duration_ms"))]
     if durs:
@@ -226,14 +238,16 @@ def conversation_total(entries: list[dict]) -> dict:
             out["tokens"]["uncached_input"] = sum(known)
             out["uncached_input_turns"] = len(known)
     kinds: dict = {}
-    for e in entries:
-        for k, s in (e.get("tool_kinds") or {}).items():
+    with_tools = [e["tool_kinds"] for e in entries if e.get("tool_kinds")]
+    for tk in with_tools:
+        for k, s in tk.items():
             slot = kinds.setdefault(k, {"calls": 0})
-            slot["calls"] += s["calls"]
-            if "errors" in s:
-                slot["errors"] = slot.get("errors", 0) + s["errors"]
+            for key in _KIND_KEYS:
+                if key in s:
+                    slot[key] = slot.get(key, 0) + s[key]
     if kinds:
         out["tool_kinds"] = kinds
+        out["tool_turns"] = len(with_tools)
     return out
 
 
@@ -252,6 +266,6 @@ def total_lines(total: dict, tok, dur) -> list[str]:
         head += "  " + tok([toks[k] for k in TOKEN_KEYS]) + _partial(total, "token_turns")
     kinds = total.get("tool_kinds") or {}
     if kinds:
-        head += "  道具: " + "／".join(f"{label} {kinds[k]['calls']} 回" + (f"（失敗 {kinds[k]['errors']}）" if "errors" in kinds[k] else "")
+        head += "  道具" + _partial(total, "tool_turns") + ": " + "／".join(f"{label} {kinds[k]['calls']} 回" + (f"（失敗 {kinds[k]['errors']}）" if "errors" in kinds[k] else "")
                                    for k, label in KIND_LABEL if k in kinds)
     return [head]
