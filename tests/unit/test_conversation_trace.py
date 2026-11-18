@@ -345,7 +345,7 @@ def test_since_selection_is_capped_and_arguments_are_exclusive(monkeypatch, caps
 
     monkeypatch.setattr(CT, "_query", fake_query)
     monkeypatch.setattr(CT, "load_conversation", lambda cid: {"id": cid, "conversation": None, "errors": []})
-    assert CT.main(["--since", "2026-10-01", "--until", "2026-10-02", "--format", "jsonl"]) == 0
+    assert CT.main(["--since", "2026-10-01", "--until", "2026-10-02"]) == 0
     first = json.loads(capsys.readouterr().out.splitlines()[0])
     assert first["truncated"] is True and first["conversations"] == CT.CONV_LIMIT and "上限" in first["note"]
     start, end = seen["params"][0], seen["params"][1]

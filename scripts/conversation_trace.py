@@ -1,5 +1,5 @@
-"""会話の各ターンを、段・道具の呼び出し・トークン・調査台帳の流れとして 1 本のテキストに書き出す
-（`make trace CONV=<番号>[,<番号>...] | SINCE=<日付> [UNTIL=<日付>] [FORMAT=jsonl] [MASK=1] [OUT=<ファイル>]`）。
+"""会話の各ターンを、段・道具の呼び出し・トークン・調査台帳の流れとして 1 本の JSONL（1 行 1 ターン）かテキストに書き出す
+（`make trace CONV=<番号>[,<番号>...] | SINCE=<日付> [UNTIL=<日付>] [FORMAT=text] [MASK=1] [OUT=<ファイル>]`）。
 設計: docs/design/usage.md「§8 利用者別・会話別の見え方」
 
 守ること:
@@ -2070,7 +2070,7 @@ def select_conversation_ids(since: date, until: date) -> tuple[list[int], bool]:
 
 
 _USAGE = ("使い方: make trace CONV=<会話番号>[,<会話番号>...] または SINCE=<YYYY-MM-DD> [UNTIL=<YYYY-MM-DD>]"
-          "（どちらか片方）[FORMAT=jsonl] [MASK=1] [OUT=<出力ファイル>]")
+          "（どちらか片方）[FORMAT=text] [MASK=1] [OUT=<出力ファイル>]")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2078,7 +2078,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--conv", help="会話番号（カンマ区切りで複数）")
     ap.add_argument("--since", help="期間の開始日（YYYY-MM-DD・日本時間）")
     ap.add_argument("--until", help="期間の終了日（YYYY-MM-DD・その日を含む・省略時は今日）")
-    ap.add_argument("--format", choices=("text", "jsonl"), default="text", help="出力の形（既定は text）")
+    ap.add_argument("--format", choices=("text", "jsonl"), default="jsonl", help="出力の形（既定は jsonl）")
     ap.add_argument("--mask", action="store_true", help="伏せ字にする")
     ap.add_argument("--mask-models", action="store_true", help="伏せ字でモデル名も伏せる（公開のモデル名だけ出す）")
     ap.add_argument("--out", help="出力ファイル（省略時は標準出力）")

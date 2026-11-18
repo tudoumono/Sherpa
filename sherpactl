@@ -13,8 +13,8 @@ usage() {
 道具:
   logs    全ログ（アプリ＋ストア）を1画面で追う
           ./sherpactl logs [名前…] [-n 行数] [-m] [-r] [-h]
-  trace   会話の流れを時刻順に書き出す（読み取りだけ）
-          ./sherpactl trace <会話ID[,ID…]> | --since 日付 [--until 日付] [--format jsonl] [--mask] [--mask-models] [-o 出力] [-h]
+  trace   会話の流れを時刻順に書き出す（読み取りだけ・既定は 1 行 1 ターンの JSONL・--format text で人が読むテキスト）
+          ./sherpactl trace <会話ID[,ID…]> | --since 日付 [--until 日付] [--format text] [--mask] [--mask-models] [-o 出力] [-h]
   diag    解析用のログ回収バンドルを作る（dist/diag/・機密は含めない）
           ./sherpactl diag [--days N] [--out ファイル] [--dry-run] [-h]
   doctor  導入先の統合セットアップ検査（読み取り専用）
@@ -23,7 +23,7 @@ usage() {
 例:
   ./sherpactl logs convert embed -n 100   取り込みの2つのログを末尾100行から追う
   ./sherpactl logs -h                     指定できる名前の一覧
-  ./sherpactl trace 136,137 --mask -o trace.txt
+  ./sherpactl trace 136,137 --mask -o trace.jsonl
   ./sherpactl diag --dry-run
   ./sherpactl doctor --probe-cloud        課金プロバイダの実接続も確かめる
 
@@ -78,7 +78,7 @@ case "$tool" in
     else
       case "$conv" in
         ""|*[!0-9,]*)
-          echo "使い方: ./sherpactl trace <会話ID[,ID…]> | --since 日付 [--until 日付] [--format jsonl] [--mask] [--mask-models] [-o 出力]（会話番号は数字とカンマだけ・会話番号と期間はどちらか片方）" >&2
+          echo "使い方: ./sherpactl trace <会話ID[,ID…]> | --since 日付 [--until 日付] [--format text] [--mask] [--mask-models] [-o 出力]（会話番号は数字とカンマだけ・会話番号と期間はどちらか片方）" >&2
           exit 2 ;;
       esac
       if [ -n "$since$until" ]; then echo "会話番号と期間はどちらか片方で指定してください" >&2; exit 2; fi
