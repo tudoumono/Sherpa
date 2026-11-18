@@ -54,6 +54,8 @@ _ekRecoverFromAmbiguousIssue
 _ekSetBackgroundInert
 _ekSleep
 _embedDimBaseline
+_embedOllamaTest
+_embedOllamaUrlBaseline
 _embedParallelBaseline
 _embedProviderBaseline
 _embedTuningBaseline
@@ -135,6 +137,7 @@ collectVlm
 collectWorkspace
 depthProfileChanged
 embedDimChanged
+embedOllamaUrlChanged
 embedParallelChanged
 embedProviderChanged
 embedProviderHint

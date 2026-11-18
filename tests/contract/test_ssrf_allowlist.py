@@ -136,9 +136,8 @@ def _only_ollama_candidate(monkeypatch):
 
 def test_embeddings_degrades_without_network_for_unlisted_url(monkeypatch, _no_network_by_default):
     _only_ollama_candidate(monkeypatch)
-    c = embeddings.cfg({"ollama_url": _UNLISTED_LAN})
-    assert c is not None and c["provider"] == "ollama"
-    assert embeddings.embed(["hello"], c) is None            # ベクトル無効へ degrade（BM25 のみ）
+    c = embeddings.cfg({"ollama_url": _UNLISTED_LAN}, probe=False)  # 個人の接続先は埋め込みに使わない
+    assert c is not None and c["provider"] == "ollama" and _UNLISTED_LAN not in c["url"]
     assert _no_network_by_default.calls == []
 
 
@@ -454,7 +453,7 @@ def test_embeddings_ollama_sends_post_json_body_within_no_proxy_requests_context
 
     monkeypatch.setattr(llm._NO_REDIRECT_NO_PROXY_OPENER, "open", _fake_open)
 
-    c = embeddings.cfg({"ollama_url": "http://127.0.0.1:11434"})
+    c = embeddings.cfg(None, system_settings={"ollama_embed_url": "http://127.0.0.1:11434"})
     assert c is not None and c["provider"] == "ollama"
     c = {**c, "dim": 2}   # フェイク応答のベクトル長に合わせる
     assert embeddings.embed(["hello"], c) == [array("f", [0.25, 0.5])]

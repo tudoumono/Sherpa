@@ -226,3 +226,14 @@ def test_ollama_test_checks_builtin_default_when_catalog_default_is_empty(monkey
     body = admin_client.post(_URL, json={"ollama_url": _LAN}).json()
 
     assert body["ok"] is True and body["no_tools"] == [builtin]
+
+
+def test_ollama_test_embed_purpose_uses_embed_url_and_checks_the_embed_model(monkeypatch, admin_client):
+    _patch_sys_settings(monkeypatch, {"ollama_url": "http://10.9.9.20:11434", "ollama_embed_url": _LAN})
+    seen = _stub_tags(monkeypatch, names=["bge-m3:latest"], show={"bge-m3": {"capabilities": ["embedding"]}})
+    ok = admin_client.post(_URL, json={"purpose": "embed"}).json()
+    assert ok["ok"] and ok["host"] == "10.9.9.21:11434" and ok["missing"] == []
+    assert seen == [f"{_LAN}/api/tags", f"{_LAN}/api/show"]
+    seen = _stub_tags(monkeypatch, names=["other:latest"])
+    assert admin_client.post(_URL, json={"purpose": "embed"}).json()["missing"] == ["bge-m3"]
+    assert admin_client.post(_URL, json={"purpose": "x"}).status_code == 422

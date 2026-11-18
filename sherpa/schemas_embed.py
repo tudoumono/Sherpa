@@ -31,3 +31,6 @@ class EmbedProviderInfo(BaseModel):
     default: str
     options: list[str]
     ollama_model: str
+    # 埋め込みだけの接続先の保存値（未設定は null＝中央の接続先に従う）と、埋め込みが実際に使う接続先
+    ollama_embed_url: str | None = None
+    ollama_embed_url_effective: str = ""

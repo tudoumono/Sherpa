@@ -98,7 +98,7 @@ def internal_hosts(system_settings: dict | None = None) -> list[str]:
 
     def ollama():
         ss = settings()
-        hosts = (host_of(x) for x in (ss.get("ollama_url") or "", *(ss.get("ollama_allowlist") or [])))
+        hosts = (host_of(x) for x in (ss.get("ollama_url") or "", ss.get("ollama_embed_url") or "", *(ss.get("ollama_allowlist") or [])))
         return [f"[{h}]" if ":" in h else h for h in hosts if h and _is_plain_host(h)]
 
     hosts: list[str] = []

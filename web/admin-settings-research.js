@@ -55,6 +55,12 @@ function renderEmbedProvider(ep, cloud) {
   _embedProviderBaseline = ep.configured || '';
   $('embed-provider').value = _embedProviderBaseline;
   $('embed-provider-hint').textContent = embedProviderHint(ep, cloud || {});
+  _embedOllamaUrlBaseline = ep.ollama_embed_url || '';
+  $('embed-ollama-url').value = _embedOllamaUrlBaseline;
+}
+
+function embedOllamaUrlChanged() {
+  return $('embed-ollama-url').value.trim() !== _embedOllamaUrlBaseline;
 }
 
 function embedProviderChanged() {

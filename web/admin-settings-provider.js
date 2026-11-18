@@ -274,15 +274,20 @@ async function testOpenaiEndpoint() {
 
 // Ollama の接続テスト（POST /admin/settings/ollama-test）。入力中の既定接続先で1回だけ試し、保存しない。
 let _ollamaTestBusy = false;   // 多重クリック防止
-async function testCentralOllama() {
+async function testCentralOllama(purpose) {
   if (_ollamaTestBusy) return;
   _ollamaTestBusy = true;
-  const btn = $('cloud-ollama-test');
+  const embed = purpose === 'embed';
+  const btn = $(embed ? 'embed-ollama-test' : 'cloud-ollama-test');
   if (btn) btn.disabled = true;
-  const res = $('cloud-ollama-test-res');
+  const res = $(embed ? 'embed-ollama-test-res' : 'cloud-ollama-test-res');
   res.className = 'tres muted';
   res.innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>接続を確認中...</span></span>';
-  const body = { ollama_url: (($('cloud-ollama-url') || {}).value || '').trim() };
+  const central = (($('cloud-ollama-url') || {}).value || '').trim();
+  const own = embed ? (($('embed-ollama-url') || {}).value || '').trim() : central;
+  // 埋め込みの欄が空なら、保存後に使う接続先＝入力中の Ollama の接続先を試す
+  const body = { ollama_url: own || central };
+  if (embed) body.purpose = 'embed';
   try {
     const r = await fetch('/admin/settings/ollama-test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const d = await r.json().catch(() => null);
@@ -290,6 +295,12 @@ async function testCentralOllama() {
     if (!d.ok) {
       res.className = 'tres danger';
       res.textContent = '✗ ' + (typeof d.detail === 'string' ? d.detail : '失敗');
+      return;
+    }
+    if (embed) {
+      const bad = (d.missing || []).length || /対応していない/.test(d.detail || '');
+      res.className = 'tres ' + (bad ? 'danger' : 'ok');
+      res.textContent = `${bad ? '△' : '✓'} ${d.detail}（${d.host}）` + ((d.missing || []).length ? `。相手のパソコンで ollama pull ${d.missing[0]} を実行してください` : '');
       return;
     }
     const models = d.models || [];
@@ -547,6 +558,8 @@ const _cloudKeyInput = $('cloud-key');
 if (_cloudKeyInput) _cloudKeyInput.addEventListener('input', () => _invalidateCloudKeyClear());
 
 const _cloudOllamaTest = $('cloud-ollama-test');
-if (_cloudOllamaTest) _cloudOllamaTest.addEventListener('click', testCentralOllama);
+if (_cloudOllamaTest) _cloudOllamaTest.addEventListener('click', () => testCentralOllama());
+const _embedOllamaTest = $('embed-ollama-test');
+if (_embedOllamaTest) _embedOllamaTest.addEventListener('click', () => testCentralOllama('embed'));
 const _openaiEndpointTest = $('openai-endpoint-test');
 if (_openaiEndpointTest) _openaiEndpointTest.addEventListener('click', testOpenaiEndpoint);

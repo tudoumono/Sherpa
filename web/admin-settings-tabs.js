@@ -57,7 +57,7 @@ window.addEventListener('hashchange', () => activateTab(location.hash.replace('#
 // （埋め込みデプロイ名欄は物理的に「プロバイダ＋接続先」タブにあるため、そちらで判定する）。
 const TAB_DIRTY = {
   provider: () => cloudChanged() || ollamaAllowlistChanged() || webhookAllowlistChanged()
-    || openaiEndpointChanged() || mcEmbedChanged() || embedProviderChanged() || nullPlanActive('provider'),
+    || openaiEndpointChanged() || mcEmbedChanged() || embedProviderChanged() || embedOllamaUrlChanged() || nullPlanActive('provider'),
   research: () => depthProfileChanged() || maxReviewRoundsChanged()
     || codexWorkerModelChanged() || codexSessionRetentionDaysChanged() || agenticBudgetChanged() || codexModeChanged()
     || extKeysResearchProviderChanged() || nullPlanActive('research'),

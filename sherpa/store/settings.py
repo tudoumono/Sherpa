@@ -204,7 +204,7 @@ def _system_settings_apply(conn, updates: dict, uid) -> None:
 
 
 # 接続先 URL を持つキーは、監査（audit_log・JSONB・平文）には host 表現（`llm._redact_url_for_error`）だけを残す。`secret_keys` の有無に関わらず常に畳む。
-_URL_SETTINGS_KEYS = frozenset({"openai_base_url", "ollama_url"})
+_URL_SETTINGS_KEYS = frozenset({"openai_base_url", "ollama_url", "ollama_embed_url"})
 
 
 def _redact_secret_settings(state: dict, secret_keys: frozenset | None = None) -> dict:

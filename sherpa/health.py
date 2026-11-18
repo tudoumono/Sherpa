@@ -88,6 +88,14 @@ class _OllamaEmbedModelMissing(RuntimeError):
         super().__init__(model)
 
 
+class _OllamaEmbedUnreachable(RuntimeError):
+    """埋め込み用の Ollama の接続先（中央と別）に届かない。`_classify()` が理由つきの案内文にする。"""
+
+    def __init__(self, cause: BaseException):
+        self.cause = cause
+        super().__init__("embed ollama unreachable")
+
+
 def _active_user_codex_rows() -> list[dict]:
     """有効な利用者の `agent`・`codex_model_provider`（Ollama 利用の判定用・読み取りのみ）。"""
     from .store.db import _connect
@@ -142,15 +150,43 @@ def _ping_ollama() -> None:
         raise _NotInUse("使っていません")
     configured = bool(sys_s.get("ollama_url"))  # 中央設定に接続先があるか（既定 localhost は「未設定」扱い）
     base = keys.resolve_ollama_url(None, system_settings=sys_s)
+    embed_base = keys.resolve_ollama_url(None, system_settings=sys_s, purpose="embed")
+    separate = embed_base.rstrip("/") != base.rstrip("/") and _embed_uses_ollama(sys_s)
+    embed_err: Exception | None = None
+    if separate:
+        try:
+            with llm.urlopen_no_redirect(llm.ollama_url(embed_base, "/api/tags"), timeout=_TIMEOUT) as r:
+                _check_ollama_embed_model(json.loads(r.read()), sys_s)
+        except _OllamaEmbedModelMissing:
+            raise
+        except Exception as e:
+            embed_err = e
     try:
         with llm.urlopen_no_redirect(llm.ollama_url(base, "/api/tags"), timeout=_TIMEOUT) as r:
             data = json.loads(r.read())
     except Exception as e:
+        if embed_err is not None:
+            raise _OllamaEmbedUnreachable(embed_err) from e  # 中央も届かない
         if not configured:
             # 接続先を設定していない環境で既定の localhost に応答が無いのは正常＝対象外。設定済みで落ちていれば失敗
             raise _NotApplicable(f"接続先が未設定（既定 {base} にも応答なし）") from e
         raise
-    _check_ollama_embed_model(data, sys_s)
+    if embed_err is not None:
+        raise _OllamaEmbedUnreachable(embed_err) from embed_err
+    if not separate:
+        _check_ollama_embed_model(data, sys_s)
+
+
+def _embed_uses_ollama(sys_s: dict) -> bool:
+    """埋め込みが Ollama に解決される構成か（`SHERPA_DISABLE_EMBED` のときは偽）。"""
+    from . import embeddings
+    if os.environ.get("SHERPA_DISABLE_EMBED"):
+        return False
+    try:
+        ec = embeddings.cfg(None, system_settings=sys_s, probe=False)
+    except Exception:
+        return False
+    return bool(ec) and ec.get("provider") == "ollama"
 
 
 def _check_ollama_embed_model(tags_response: object, sys_s: dict) -> None:
@@ -203,6 +239,8 @@ def _classify(e: BaseException) -> str:
     """例外を短い日本語分類に正規化する。接続情報が `str(e)` に含まれうるため、生の例外文字列は出さず分類ラベルのみ返す。
     `URLError` の `__cause__` / `reason` も1段見る。
     """
+    if isinstance(e, _OllamaEmbedUnreachable):
+        return f"埋め込み用の Ollama に届きません（{_classify(e.cause)}）。管理画面の「埋め込み用の Ollama の接続先」を確かめてください"
     if isinstance(e, _OllamaEmbedModelMissing):
         return (f"埋め込みモデル {e.model} が Ollama にありません（ollama pull {e.model}）。"
                 "このままではベクトル検索が使えずキーワード検索だけになります")
@@ -336,6 +374,16 @@ def _ai_check_ollama(settings: dict, system_settings: dict | None = None) -> Non
     base = keys.resolve_ollama_url(settings, system_settings=system_settings)
     with llm.urlopen_no_redirect(llm.ollama_url(base, "/api/tags"), timeout=_AI_TIMEOUT) as r:
         json.loads(r.read())
+    embed_base = keys.resolve_ollama_url(None, system_settings=system_settings, purpose="embed")
+    if embed_base.rstrip("/") == base.rstrip("/") or not _embed_uses_ollama(system_settings):
+        return
+    try:
+        with llm.urlopen_no_redirect(llm.ollama_url(embed_base, "/api/tags"), timeout=_AI_TIMEOUT) as r:
+            _check_ollama_embed_model(json.loads(r.read()), system_settings or {})
+    except _OllamaEmbedModelMissing as e:
+        raise RuntimeError(_classify(e)) from None
+    except Exception as e:
+        raise RuntimeError(_classify(_OllamaEmbedUnreachable(e))) from None
 
 
 def _ai_check_codex(settings: dict, system_settings: dict | None = None) -> None:

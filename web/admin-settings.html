@@ -277,6 +277,16 @@
                 </select>
               </label>
               <div class="hint" id="embed-provider-hint" style="margin:-8px 0 6px"></div>
+              <label class="vlm-field"><span class="vlm-l">埋め込み用の Ollama の接続先</span>
+                <input type="text" id="embed-ollama-url" placeholder="空なら上の Ollama の接続先を使う" style="max-width:360px">
+              </label>
+              <div class="testrow">
+                <button class="mini" id="embed-ollama-test" type="button">接続テスト</button>
+                <span class="tres muted" id="embed-ollama-test-res"></span>
+              </div>
+              <div class="hint">埋め込みだけを別のパソコンの Ollama で動かすときに入力します（例: http://192.168.0.20:11434）。
+                空のときは、上の「ローカル AI（Ollama）の既定接続先」を使います。回答の AI・画像の読み取りの接続先は変わりません。
+                接続テストでは、埋め込みのモデルがそのパソコンにあるかも確かめます。</div>
               <div class="hint">切り替えると、埋め込みをすべて作り直します。時間はかかりますが、ローカルなら API の費用はかかりません。
                 ローカルを選ぶ場合は、日本語に対応した多言語の埋め込みモデルをおすすめします（使うモデルは「使えるモデル」タブの「埋め込み」の行、Ollama の列で決めます）。
                 切り替えた後は、各資料フォルダで「今すぐ更新」を実行してください（実行しなくても、次の取り込み・更新のときに作り直されます）。</div>

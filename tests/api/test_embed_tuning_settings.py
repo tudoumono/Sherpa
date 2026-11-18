@@ -24,3 +24,11 @@ def test_saved_value_is_effective_and_null_returns_to_default(admin, field, valu
     assert store.get_system_settings()[field] == value
     v = _put(admin, {field: None}).json()[field]
     assert v["configured"] is None and v["effective"] == default
+
+
+def test_ollama_embed_url_saves_shows_effective_and_rejects_bad_format(admin):
+    assert _put(admin, {"ollama_embed_url": "ftp://x"}).status_code == 422
+    assert _put(admin, {"ollama_embed_url": "http://10.9.9.7:11434/path"}).status_code == 422
+    ep = _put(admin, {"ollama_embed_url": "http://10.9.9.7:11434"}).json()["embed_provider"]
+    assert ep["ollama_embed_url"] == ep["ollama_embed_url_effective"] == "http://10.9.9.7:11434"
+    assert _put(admin, {"ollama_embed_url": ""}).json()["embed_provider"]["ollama_embed_url"] is None

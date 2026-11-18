@@ -304,7 +304,10 @@ def cfg(settings: dict | None = None, *, system_settings: dict | None = None,
         return {"provider": "openai", "key": key, "model": model, "dim": d, "parallel": parallel, **tuning,
                 "system_settings": sys_s}  # `_embed_batch` の接続先解決へ引き継ぐ
 
-    def L(url):
+    def L(_personal_url=None):
+        # 接続先は管理者の埋め込みの接続先で決める（select_provider が渡す個人の接続先は使わない）
+        from . import keys as _k
+        url = _k.resolve_ollama_url(None, system_settings=sys_s, purpose="embed")
         model = _ollama_model(sys_s)
         timeout_s = effective_embed_request_timeout(sys_s)
         dim = ollama_embed_dim(url, model, probe=probe, index_dim=index_dim, timeout_s=timeout_s)  # 実測が正。測れなければ None（768 を仮定しない）
@@ -318,8 +321,7 @@ def cfg(settings: dict | None = None, *, system_settings: dict | None = None,
         _log.warning("embeddings.cfg: embed_provider の保存値が不正なため埋め込みを無効化しました。管理画面で接続先を選び直してください")
         return None
     if embed_provider == "ollama":
-        from . import keys as _k
-        return L(_k.resolve_ollama_url(None, system_settings=sys_s))
+        return L()
 
     # `cloud_provider` が不正値のときは、黙って既定キーで送信しない（fail-closed）。None は「埋め込み未設定」として扱われる
     from . import keys as _keys

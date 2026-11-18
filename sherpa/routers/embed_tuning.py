@@ -34,7 +34,7 @@ def dim_view(sysset: dict) -> dict:
 
 def view(sysset: dict) -> dict:
     """設定画面の埋め込み 5 項目（`embed_provider`・`embed_parallel`・`embed_dim`・`embed_request_timeout_s`・`embed_batch_size`）。"""
-    from sherpa import embeddings, model_catalog
+    from sherpa import embeddings, keys, model_catalog
     out = {
         "embed_provider": {
             "configured": sysset.get("embed_provider"), "invalid": embeddings.invalid_embed_provider(sysset) is not None,
@@ -43,6 +43,8 @@ def view(sysset: dict) -> dict:
             "options": list(embeddings.EMBED_PROVIDERS),
             "ollama_model": model_catalog.resolve_model("ollama", "embed", None, system_settings=sysset)
                             or embeddings._MODELS["ollama"][0],
+            "ollama_embed_url": sysset.get("ollama_embed_url") or None,
+            "ollama_embed_url_effective": keys.resolve_ollama_url(None, system_settings=sysset, purpose="embed"),
         },
         "embed_parallel": {
             "configured": sysset.get("embed_parallel"),
@@ -84,6 +86,9 @@ def validated_updates(provided: dict) -> dict:
     out: dict = {}
     if "embed_provider" in provided:
         out["embed_provider"] = _validate_provider(provided["embed_provider"])
+    if "ollama_embed_url" in provided:
+        from sherpa.routers.system_extras import _validate_central_ollama_url
+        out["ollama_embed_url"] = _validate_central_ollama_url(provided["ollama_embed_url"], "ollama_embed_url")
     if "embed_parallel" in provided:
         out["embed_parallel"] = provided["embed_parallel"]
     if "embed_dim" in provided:

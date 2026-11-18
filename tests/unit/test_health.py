@@ -707,6 +707,28 @@ def test_ollama_ping_detects_missing_embed_model_even_when_dim_is_unmeasurable(m
     assert out["ok"] is False and "ollama pull bge-m3" in out["detail"]
 
 
+def test_ollama_ping_names_the_unreachable_embed_server_and_checks_model_there(monkeypatch):
+    sysset = {"ollama_url": "http://127.0.0.1:11434", "ollama_embed_url": "http://127.0.0.1:11435"}
+    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
+    monkeypatch.setattr(store, "get_system_settings", lambda: sysset)
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: {**_OLLAMA_EMBED, "url": "http://127.0.0.1:11435"})
+    served = {"11434": _tags_payload("qwen2.5:latest"), "11435": None}
+
+    def _open(url, timeout=None):
+        body = served[url.split(":")[2].split("/")[0]]
+        if body is None:
+            raise ConnectionRefusedError("down")
+        return _FakeOllamaTagsResponse(body)
+    monkeypatch.setattr(llm, "urlopen_no_redirect", _open)
+    out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
+    assert out["ok"] is False and "埋め込み用の Ollama に届きません" in out["detail"]
+    ai = health._check_one_ai("ollama", "o", "none", lambda: health._ai_check_ollama({}, sysset), "hint")
+    assert ai["ok"] is False and "埋め込み用の Ollama に届きません" in ai["detail"]   # システム状態の画面の行も同じ
+    served["11435"] = _tags_payload("bge-m3:latest")  # 中央にモデルが無くても、確かめるのは埋め込み用のサーバー
+    assert health._check_one("ollama", "o", "none", health._ping_ollama, "hint")["ok"] is True
+    assert health._check_one_ai("ollama", "o", "none", lambda: health._ai_check_ollama({}, sysset), "hint")["ok"] is True
+
+
 def test_ai_check_codex_ollama_requires_codex_model_pulled(monkeypatch):
     monkeypatch.setattr(health.shutil, "which", lambda _: "/usr/bin/codex")
     cat = {"model_catalog": {"codex": {"codex": {"allowed": ["gpt-oss:20b"], "default": "gpt-oss:20b"}}}}

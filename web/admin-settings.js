@@ -120,6 +120,7 @@ let _codexSessionRetentionDaysBaseline = '';
 let _codexModeBaseline = '';
 let _embedParallelBaseline = '';   // 埋め込みの同時送信数
 let _embedDimBaseline = '';   // 埋め込みの細かさ（''=既定）
+let _embedOllamaUrlBaseline = '';   // 埋め込み用の Ollama の接続先（''=中央の接続先に従う）
 let _embedProviderBaseline = '';   // 埋め込みの接続先（''=回答と同じクラウド・既定）
 
 // 同時実行の上限（effective_limits）。_DEPTH_BASE_FIELDS と同型（GET は view.chat_max_turns.<view>・PUT は body.<put>）。
@@ -353,6 +354,9 @@ async function save() {
   if (embedProviderChanged()) {
     body.embed_provider = $('embed-provider').value || null;
   }
+  if (embedOllamaUrlChanged()) {
+    body.ollama_embed_url = $('embed-ollama-url').value.trim() || null;
+  }
   if (codexModeChanged()) {
     body.codex_mode = $('codex-mode').value || null;
   }
@@ -440,6 +444,7 @@ function resetProviderTab() {
   _setVal('cloud-ollama-allowlist', '');
   _setVal('webhook-allowlist', '');
   _setVal('embed-provider', '');
+  _setVal('embed-ollama-url', '');
   const kind = document.querySelector('#openai-endpoint-radios input[data-openai-endpoint-kind="openai"]');
   if (kind) kind.checked = true;
   _setVal('openai-endpoint-base-url', '');

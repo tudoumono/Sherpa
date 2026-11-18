@@ -97,7 +97,7 @@ def is_loopback_host(host: str) -> bool:
 
 
 def _allowlisted_hosts(system_settings: dict | None = None) -> set[tuple[str, int]]:
-    """非 loopback 接続先の許可リスト（`(host, port)` の集合）。admin が管理画面で決めた値だけを使う＝中央の既定接続先 `ollama_url` と `system_settings.ollama_allowlist`。
+    """非 loopback 接続先の許可リスト（`(host, port)` の集合）。admin が管理画面で決めた値だけを使う＝中央の既定接続先 `ollama_url`・埋め込みの接続先 `ollama_embed_url`・`system_settings.ollama_allowlist`。
     `OLLAMA_URL` の env はこの許可リストへ加算しない（初回シードだけ）。VLM の送信も同じ許可リストで検証する。
     `system_settings` を渡すとそのスナップショットを使う。
     """
@@ -107,17 +107,18 @@ def _allowlisted_hosts(system_settings: dict | None = None) -> set[tuple[str, in
             from . import store  # 遅延 import（循環回避）
             system_settings = store.get_system_settings()
         entries = system_settings.get("ollama_allowlist") or []
-        central = str(system_settings.get("ollama_url") or "").strip()
+        centrals = [str(system_settings.get(k) or "").strip() for k in ("ollama_url", "ollama_embed_url")]
     except Exception:  # DB 未接続等でも fail-closed（allowlist 空扱い＝loopback 以外は拒否）
-        entries, central = [], ""
+        entries, centrals = [], []
     for entry in entries:
         hp = _canonical_host_port(f"http://{entry}")
         if hp is not None:
             allowed.add(hp)
-    if central:
-        hp = _canonical_host_port(central)
-        if hp is not None:
-            allowed.add(hp)
+    for central in centrals:
+        if central:
+            hp = _canonical_host_port(central)
+            if hp is not None:
+                allowed.add(hp)
     return allowed
 
 

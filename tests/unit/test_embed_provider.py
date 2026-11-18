@@ -119,3 +119,16 @@ def test_provider_switch_changes_cache_key_and_triggers_reindex(monkeypatch):
     assert es_index.needs_reindex("w", "c1") is False
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: ol)
     assert es_index.needs_reindex("w", "c1") is True
+
+
+def test_embed_ollama_url_applies_to_embedding_only_and_empty_keeps_central(monkeypatch):
+    from sherpa import keys
+    monkeypatch.setattr(llm, "post_json", lambda *a, **k: _v1(768))
+    central = {"ollama_url": "http://10.0.0.1:11434"}
+    both = {**central, "ollama_embed_url": "http://10.0.0.2:11434"}
+    for provider in ("ollama", "auto"):
+        s = {**both, "embed_provider": provider}
+        assert embeddings.cfg({"ollama_url": "http://personal:11434"}, system_settings=s)["url"] == "http://10.0.0.2:11434"
+    assert keys.resolve_ollama_url(None, system_settings=both) == "http://10.0.0.1:11434"
+    assert llm._canonical_host_port("http://10.0.0.2:11434") in llm._allowlisted_hosts(both)
+    assert embeddings.cfg(None, system_settings={**central, "embed_provider": "ollama", "ollama_embed_url": ""})["url"] == "http://10.0.0.1:11434"

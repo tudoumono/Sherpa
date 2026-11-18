@@ -31,7 +31,7 @@ from sherpa import (
 from sherpa.agents import _web_search_admin_allowed
 from sherpa.providers.codex import sandbox as codex_sandbox
 from sherpa.deps import _current_user, _require_admin
-from sherpa.routers import embed_tuning
+from sherpa.routers import embed_tuning, ollama_probe
 from sherpa.schemas import (
     AdminOllamaTestResponse,
     AnnouncementMutateResponse,
@@ -138,6 +138,7 @@ class SystemSettingsReq(BaseModel):
     research_default_provider: str | None = None
     openai_api_key: str | None = None
     ollama_url: str | None = None
+    ollama_embed_url: str | None = None  # 埋め込みだけの接続先。空・null は中央の `ollama_url` に従う。
     # OpenAI 互換 API の接続先（ラジオ・本家以外のときの base URL・認証ヘッダ形式・API バージョン）。null は未設定へ戻す。意味検証・実効値の解決は `sherpa/llm.py` が唯一の真実源。
     openai_endpoint_kind: str | None = None  # openai(既定)/azure/custom。
     openai_base_url: str | None = None
@@ -876,14 +877,14 @@ def _validate_secret_key(value, field_label: str):
     return v or None
 
 
-def _validate_central_ollama_url(value):
-    """中央既定の Ollama 接続先の検証。空文字/None は未設定（既定 localhost へ）。
+def _validate_central_ollama_url(value, key: str = "ollama_url"):
+    """中央既定の Ollama 接続先（`ollama_embed_url` も同じ形式）の検証。空文字/None は未設定（`ollama_url` は既定 localhost へ・`ollama_embed_url` は中央の接続先へ）。
     admin が決めた接続先なので許可一覧への登録は要らない（`llm._allowlisted_hosts` が中央の接続先を含める）。形式は `http(s)://host:port` だけを受け付ける（userinfo・path・query は 422）。
     """
     if value is None:
         return None
     if not isinstance(value, str):
-        raise HTTPException(422, "ollama_url は文字列で指定してください")
+        raise HTTPException(422, f"{key} は文字列で指定してください")
     v = value.strip()
     if not v:
         return None
@@ -1269,31 +1270,12 @@ def admin_openai_endpoint_test(req: OpenaiEndpointTestReq, request: Request):
 
 class OllamaTestReq(BaseModel):
     """管理画面「ローカル AI（Ollama）の既定接続先」の接続テスト（admin 専用・`POST /admin/settings/ollama-test`）。保存前の入力中の値でその場だけ試し、DB は書かない。"""
-    ollama_url: str | None = None  # 空・省略時は保存済みの中央の接続先（無ければ既定 localhost）。
+    ollama_url: str | None = None  # 空・省略時は保存済みの接続先（用途が回答なら中央の接続先・無ければ既定 localhost）。
+    purpose: str | None = Field(default=None, pattern="^embed$")  # embed＝埋め込みの接続先を試し、埋め込みのモデルがあるかも確かめる
 
 
 _OLLAMA_TEST_MAX_BYTES = 1_048_576
 _OLLAMA_SHOW_MAX_MODELS = 8  # 道具の呼び出しへの対応を確かめるモデル数の上限
-
-
-def _ollama_test_hint(e: Exception, port: int) -> str:
-    """Ollama の接続テストの失敗を、管理者向けの平文の手がかりにする（到達できない理由の区別は出す）。"""
-    import socket
-    import urllib.error
-    if isinstance(e, urllib.error.HTTPError):
-        return f"Ollama から HTTP {e.code} が返りました。接続先が Ollama か確かめてください"
-    reason = e.reason if isinstance(e, urllib.error.URLError) else e
-    if isinstance(reason, ConnectionRefusedError):
-        return ("接続を拒否されました。相手のパソコンで Ollama が起動しているか、"
-                "ほかのパソコンからの接続を受け付ける設定（OLLAMA_HOST=0.0.0.0）で起動しているかを確かめてください")
-    if isinstance(reason, (TimeoutError, socket.timeout)):
-        return (f"応答がありません（時間切れ）。相手のパソコンのファイアウォールで"
-                f"ポート {port} への接続が許可されているかを確かめてください")
-    if isinstance(reason, socket.gaierror):
-        return "接続先の名前からパソコンを見つけられません。IP アドレスで入力してみてください"
-    if isinstance(e, (ValueError, TypeError)):
-        return "応答を Ollama の応答として読めませんでした。接続先が Ollama か確かめてください"
-    return f"接続できませんでした（{type(reason).__name__}）"
 
 
 @extras_router.post("/admin/settings/ollama-test", tags=["管理者:全体設定"],
@@ -1312,7 +1294,7 @@ def admin_ollama_test(req: OllamaTestReq, request: Request):
     sys_s = store.get_system_settings()
     # ① 接続先を決めて形式を検証する（入力中の値 → 保存済みの中央 → 既定 localhost・不正なら通信しない）
     url = (_validate_central_ollama_url(req.ollama_url)
-           or str(keys.resolve_ollama_url(None, system_settings=sys_s) or "").strip())
+           or str(keys.resolve_ollama_url(None, system_settings=sys_s, purpose=req.purpose) or "").strip())
     hp = llm._canonical_host_port(url)
     if hp is None:
         raise HTTPException(422, "保存されている Ollama の接続先が不正です。接続先を入力し直してください")
@@ -1320,7 +1302,7 @@ def admin_ollama_test(req: OllamaTestReq, request: Request):
     # ② 接続の前に監査する（host:port だけ）
     try:
         store.audit(u["uid"], "ollama_endpoint.tested", "system_settings", None,
-                    detail={"host": host}, outcome="success", severity="info")
+                    detail={"host": host, **({"purpose": "embed"} if req.purpose else {})}, outcome="success", severity="info")
     except Exception:
         _log.critical("audit write failed for ollama_endpoint.tested (fail-closed) – probe を実行しません")
         raise HTTPException(500, "接続テストの監査記録に失敗したため中断しました")
@@ -1338,8 +1320,10 @@ def admin_ollama_test(req: OllamaTestReq, request: Request):
             raise TypeError("models is not a list")
     except Exception as e:
         return {"ok": False, "host": host, "models": [], "missing": [], "no_tools": [],
-                "detail": _ollama_test_hint(e, hp[1])}
+                "detail": ollama_probe.test_hint(e, hp[1])}
     names = sorted({str(m.get("name")) for m in listed if isinstance(m, dict) and m.get("name")})
+    if req.purpose:
+        return ollama_probe.embed_test_result(url, hp, host, names, sys_s, _ENDPOINT_TEST_TIMEOUT_S, _OLLAMA_TEST_MAX_BYTES)
     # ④ 使えるモデル一覧の Ollama のモデルと突き合わせる（タグ無しは `:latest` とみなす）
     wanted: set[str] = set()
     for cell in (model_catalog.get_catalog(sys_s).get("ollama") or {}).values():

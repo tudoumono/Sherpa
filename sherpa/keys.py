@@ -127,11 +127,16 @@ def resolve_api_key(provider: str, user_settings: dict | None,
     return central or None
 
 
-def resolve_ollama_url(user_settings: dict | None, system_settings: dict | None = None) -> str:
-    """Ollama 接続先（常時併用）。個人保存 → 中央既定 → 組み込み既定の順。env は読まない。"""
+def resolve_ollama_url(user_settings: dict | None, system_settings: dict | None = None,
+                       purpose: str | None = None) -> str:
+    """Ollama 接続先（常時併用）。個人保存 → 中央既定 → 組み込み既定の順。env は読まない。
+    `purpose="embed"`（埋め込み）は個人の接続先を読まず、管理者の埋め込みの接続先（`ollama_embed_url`）→ 中央既定 → 組み込み既定の順。
+    """
+    sys_s = system_settings if system_settings is not None else _system_settings()
+    if purpose == "embed":
+        return sys_s.get("ollama_embed_url") or sys_s.get("ollama_url") or DEFAULT_OLLAMA_URL
     us = user_settings or {}
     personal = us.get("ollama_url")
     if personal:
         return personal
-    sys_s = system_settings if system_settings is not None else _system_settings()
     return sys_s.get("ollama_url") or DEFAULT_OLLAMA_URL

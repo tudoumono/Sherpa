@@ -3901,6 +3901,18 @@
               }
             ],
             "title": "Ollama Url"
+          },
+          "purpose": {
+            "anyOf": [
+              {
+                "pattern": "^embed$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Purpose"
           }
         },
         "title": "OllamaTestReq",
@@ -5222,6 +5234,17 @@
               }
             ],
             "title": "Ollama Allowlist"
+          },
+          "ollama_embed_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ollama Embed Url"
           },
           "ollama_url": {
             "anyOf": [
