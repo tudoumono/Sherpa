@@ -83,12 +83,15 @@ def timing(threads, w_start: float, w_end: float) -> dict | None:
     """ターンの時間帯の道具・シェル・モデルの応答待ちの合計（ms）。数え方は `turn_timeline.analyze` と同じ。実行の記録が無ければ None。"""
     shaped = [{"subagent": bool(t.subagent or t.parent_tid),
                "events": [(ep, rec) for ep, rec in t.events if w_start <= ep <= w_end]} for t in threads]
-    res = turn_timeline.analyze(shaped)
-    if not res["attempts"]:
+    try:
+        res = turn_timeline.analyze(shaped)
+        if not res["attempts"]:
+            return None
+        total = res["total"]
+        return {"tools_ms": round(total["mcp_ms"]), "shell_ms": round(total["exec_ms"]),
+                "model_wait_ms": round(total["model_wait_ms"])}
+    except (AttributeError, KeyError, TypeError, ValueError):
         return None
-    total = res["total"]
-    return {"tools_ms": round(total["mcp_ms"]), "shell_ms": round(total["exec_ms"]),
-            "model_wait_ms": round(total["model_wait_ms"])}
 
 
 def kind_of(name) -> str:
@@ -100,13 +103,17 @@ def _kind_slot(out: dict, name) -> dict:
 
 
 def kind_stats(calls, truncated, parsed) -> dict:
-    """道具の呼び出しを検索の種類ごとに数える（回数・時間の合計・失敗・打ち切り）。"""
+    """道具の呼び出しを検索の種類ごとに数える（回数・時間の合計・失敗・打ち切り）。
+    時間が記録されていない呼び出し（終わりの記録が無いもの）は `no_duration` に数え、時間の合計には入れない。"""
     out: dict = {}
     for c in calls:
         p = parsed(c)
         s = _kind_slot(out, c.name)
         s["calls"] += 1
-        s["ms"] += c.duration_ms or 0
+        if _is_int(c.duration_ms):
+            s["ms"] += c.duration_ms
+        else:
+            s["no_duration"] = s.get("no_duration", 0) + 1
         s["errors"] += 1 if c.is_error or (isinstance(p, dict) and "error" in p) else 0
         s["truncated"] += 1 if truncated(c) else 0
     return out
@@ -160,8 +167,8 @@ def turn_facts(*, asked_at, answer: dict, calls, threads, window, masker, trunca
     if modes is not None:
         out["es_modes"] = modes
     scope = answer.get("scope")
-    if isinstance(scope, dict):
-        paths = scope.get("scope_paths") if isinstance(scope.get("scope_paths"), list) else []
+    if isinstance(scope, dict) and isinstance(scope.get("scope_paths"), list):
+        paths = scope["scope_paths"]
         out["scope_paths"] = [masker.scope(p) for p in paths if isinstance(p, str)]
         out["scope_whole"] = not paths
     return out
@@ -172,6 +179,8 @@ def _kind_text(s: dict, dur) -> str:
     parts.append(f"失敗 {s['errors']}")
     if "truncated" in s:
         parts.append(f"打切 {s['truncated']}")
+    if s.get("no_duration"):
+        parts.append(f"時間の記録なし {s['no_duration']}")
     return "（" + "・".join(parts) + "）"
 
 
@@ -198,13 +207,16 @@ def fact_lines(facts: dict, dur_ms, dur) -> list[str]:
 
 
 def conversation_total(entries: list[dict]) -> dict:
-    """会話 1 本の合計。entries は {duration_ms, tokens, tool_kinds} の並び（ターンごと）。"""
+    """会話 1 本の合計。entries は {duration_ms, tokens, tool_kinds} の並び（ターンごと）。
+    `duration_turns`・`token_turns` は、その合計に入ったターンの数（`turns` より少なければ記録の無いターンがある）。"""
     out: dict = {"turns": len(entries)}
     durs = [e["duration_ms"] for e in entries if _is_int(e.get("duration_ms"))]
     if durs:
         out["duration_ms"] = sum(durs)
+        out["duration_turns"] = len(durs)
     toks = [e["tokens"] for e in entries if isinstance(e.get("tokens"), dict)]
     if toks:
+        out["token_turns"] = len(toks)
         out["tokens"] = {k: sum(t.get(k) or 0 for t in toks) for k in TOKEN_KEYS}
         if any("uncached_input" in t for t in toks):
             out["tokens"]["uncached_input"] = sum(t.get("uncached_input") or 0 for t in toks)
@@ -219,14 +231,19 @@ def conversation_total(entries: list[dict]) -> dict:
     return out
 
 
+def _partial(total: dict, key: str) -> str:
+    n = total.get(key)
+    return f"（{n} ターン分）" if _is_int(n) and n < total["turns"] else ""
+
+
 def total_lines(total: dict, tok, dur) -> list[str]:
     """テキスト用の会話の合計。tok は [入力, キャッシュ, 出力, 推論] の表記、dur は ms の表記。"""
     head = f"[会話の合計]  ターン {total['turns']}"
     if "duration_ms" in total:
-        head += f"  回答の時間 {dur(total['duration_ms'])}"
+        head += f"  回答の時間 {dur(total['duration_ms'])}" + _partial(total, "duration_turns")
     toks = total.get("tokens")
     if toks:
-        head += "  " + tok([toks[k] for k in TOKEN_KEYS])
+        head += "  " + tok([toks[k] for k in TOKEN_KEYS]) + _partial(total, "token_turns")
     kinds = total.get("tool_kinds") or {}
     if kinds:
         head += "  道具: " + "／".join(f"{label} {kinds[k]['calls']} 回（失敗 {kinds[k]['errors']}）"

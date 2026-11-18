@@ -460,3 +460,30 @@ def test_mask_hides_new_fields_values(tmp_path):
     assert "zz_odd_reason" not in text and "zz_custom_tool" not in text and "zz_secret_dir" not in text
     assert "キーワードに縮退 2（" in text and CT.find_leaks(out, masker) == 0 and CT.find_leaks(text, masker) == 0
     assert CT.find_leaks(out + "\nzz_odd_reason\n", masker) > 0
+
+
+def test_eval_fields_keep_missing_apart_from_zero():
+    ev = CT._ev
+    from types import SimpleNamespace as NS
+
+    # 終わりの記録が無い呼び出しは時間の合計に入れず、件数で分かるようにする
+    calls = [NS(name="es_search", duration_ms=None, is_error=False), NS(name="es_search", duration_ms=40, is_error=False)]
+    kinds = ev.kind_stats(calls, lambda c: False, lambda c: None)
+    assert kinds["fulltext"] == {"calls": 2, "ms": 40, "errors": 0, "truncated": 0, "no_duration": 1}
+
+    # 壊れたセッション記録（時間が文字列）は時間の内訳を出さないだけで、落ちない
+    broken = [NS(subagent=False, parent_tid=None, events=[
+        (0.5, {"type": "event_msg", "payload": {"type": "task_started"}}),
+        (1.0, {"type": "event_msg", "payload": {"type": "mcp_tool_call_end", "call_id": "c1", "duration": "oops"}})])]
+    assert ev.timing(broken, 0.0, 2.0) is None
+
+    # 一部のターンにしか記録が無い合計は、入ったターンの数を添える
+    total = ev.conversation_total([{"duration_ms": 100, "tokens": {"input": 10, "cached_input": 4, "output": 2, "reasoning": 0}},
+                                   {"duration_ms": None, "tokens": None}])
+    assert total["turns"] == 2 and total["duration_turns"] == 1 and total["token_turns"] == 1
+    assert "（1 ターン分）" in ev.total_lines(total, lambda row: "tok", lambda ms: "t")[0]
+
+    # 範囲の記録が欠けたターンを「全体」と出さない
+    facts = ev.turn_facts(asked_at=None, answer={"scope": {"world": "wld-sample"}}, calls=[], threads=[], window=(0, 0),
+                          masker=CT.Masker(mask=False), truncated=lambda c: False, parsed=lambda c: None)
+    assert "scope_paths" not in facts and "scope_whole" not in facts
