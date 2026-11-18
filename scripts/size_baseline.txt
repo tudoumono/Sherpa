@@ -5,8 +5,8 @@ scripts/bench/prepare_self_corpus.py	1064
 scripts/bench/prepare_self_corpus.py::build_questions	108
 scripts/collect_diagnostics.py	1474
 scripts/collect_diagnostics.py::_mask_path_spans	126
-scripts/conversation_trace.py	2146
-scripts/conversation_trace.py::render_turn	173
+scripts/conversation_trace.py	2138
+scripts/conversation_trace.py::render_turn	168
 scripts/disk_report.sh	1058
 scripts/doctor_checks.py	2074
 scripts/doctor_checks.py::check_cloud_llm_probes	123
