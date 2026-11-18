@@ -29,6 +29,7 @@ DEGRADE_REASONS = frozenset({
 _WINDOW_BEFORE_S = 1.0
 _WINDOW_AFTER_S = 2.0
 _MODES = ("hybrid", "vector", "keyword")
+_KIND_KEYS = ("calls", "ms", "errors", "truncated")
 _MODE_LABEL = (("hybrid", "ハイブリッド"), ("vector", "ベクトルのみ"), ("keyword", "キーワード指定"))
 
 
@@ -81,16 +82,20 @@ def token_dict(row, usage=None) -> dict | None:
 
 
 def timing(threads, w_start: float, w_end: float) -> dict | None:
-    """ターンの時間帯の道具・シェル・モデルの応答待ちの合計（ms）。数え方は `turn_timeline.analyze` と同じ。実行の記録が無ければ None。"""
+    """ターンの時間帯の道具・シェル・モデルの応答待ちの合計（ms）。数え方は `turn_timeline.analyze` と同じで、この 3 つは本体の分だけ。
+    下調べ役がいれば、その数と道具の時間を `sub_threads`・`sub_tools_ms` に分けて出す。実行の記録が無い・読めなければ None。"""
     shaped = [{"subagent": bool(t.subagent or t.parent_tid),
                "events": [(ep, rec) for ep, rec in t.events if w_start <= ep <= w_end]} for t in threads]
     try:
         res = turn_timeline.analyze(shaped)
         if not res["attempts"]:
             return None
-        total = res["total"]
-        return {"tools_ms": round(total["mcp_ms"]), "shell_ms": round(total["exec_ms"]),
-                "model_wait_ms": round(total["model_wait_ms"])}
+        total, sub = res["total"], res["children"]
+        out = {"tools_ms": round(total["mcp_ms"]), "shell_ms": round(total["exec_ms"]),
+               "model_wait_ms": round(total["model_wait_ms"])}
+        if sub["threads"]:
+            out.update(sub_threads=sub["threads"], sub_tools_ms=round(sub["mcp_ms"]))
+        return out
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
 
@@ -99,36 +104,28 @@ def kind_of(name) -> str:
     return TOOL_KIND.get(name, "other") if isinstance(name, str) else "other"
 
 
-def _kind_slot(out: dict, name) -> dict:
-    return out.setdefault(kind_of(name), {"calls": 0, "ms": 0, "errors": 0, "truncated": 0})
-
-
-def kind_stats(calls, truncated, parsed) -> dict:
-    """道具の呼び出しを検索の種類ごとに数える（回数・時間の合計・失敗・打ち切り）。
-    時間が記録されていない呼び出し（終わりの記録が無いもの）は `no_duration` に数え、時間の合計には入れない。"""
+def kind_stats(call_stats) -> dict:
+    """回答の `call_stats.tools`（アプリが記録した道具ごとの累計）を検索の種類ごとにまとめる。
+    回数・時間・失敗・打ち切りの数え方はアプリの記録のまま。記録に無い欄は足さない。"""
     out: dict = {}
-    for c in calls:
-        p = parsed(c)
-        s = _kind_slot(out, c.name)
-        s["calls"] += 1
-        if _is_int(c.duration_ms):
-            s["ms"] += c.duration_ms
-        else:
-            s["no_duration"] = s.get("no_duration", 0) + 1
-        s["errors"] += 1 if c.is_error or (isinstance(p, dict) and "error" in p) else 0
-        s["truncated"] += 1 if truncated(c) else 0
+    for t in (call_stats.get("tools") if isinstance(call_stats, dict) else None) or []:
+        if not isinstance(t, dict) or not _is_int(t.get("calls")):
+            continue
+        s = out.setdefault(kind_of(t.get("tool")), {"calls": 0})
+        for key in _KIND_KEYS:
+            if _is_int(t.get(key)):
+                s[key] = s.get(key, 0) + t[key]
     return out
 
 
-def kind_stats_from_call_stats(call_stats) -> dict:
-    """セッション記録が無いとき、回答の `call_stats.tools`（道具ごとの累計）から同じ形にまとめる。"""
+def result_errors(calls, parsed) -> dict:
+    """結果に `error`／`error_code` の欄があった呼び出しの数（検索の種類ごと）。道具が失敗の印を付けずに返した不調も入る。"""
     out: dict = {}
-    for t in (call_stats.get("tools") if isinstance(call_stats, dict) else None) or []:
-        if not isinstance(t, dict):
-            continue
-        s = _kind_slot(out, t.get("tool"))
-        for k, key in (("calls", "calls"), ("ms", "ms"), ("errors", "errors"), ("truncated", "truncated")):
-            s[k] += t[key] if _is_int(t.get(key)) else 0
+    for c in calls:
+        p = parsed(c)
+        if isinstance(p, dict) and ("error" in p or "error_code" in p):
+            k = kind_of(c.name)
+            out[k] = out.get(k, 0) + 1
     return out
 
 
@@ -153,7 +150,7 @@ def search_modes(calls, parsed, masker) -> dict | None:
     return out
 
 
-def turn_facts(*, asked_at, answer: dict, calls, threads, window, masker, truncated, parsed) -> dict:
+def turn_facts(*, asked_at, answer: dict, calls, threads, window, masker, parsed) -> dict:
     """1 ターンの評価の欄。記録が無い欄は出さない。"""
     out: dict = {}
     if asked_at:
@@ -161,9 +158,11 @@ def turn_facts(*, asked_at, answer: dict, calls, threads, window, masker, trunca
     tm = timing(threads, *window) if threads else None
     if tm:
         out["time"] = tm
-    kinds = kind_stats(calls, truncated, parsed) if calls else kind_stats_from_call_stats(answer.get("call_stats"))
+    kinds = kind_stats(answer.get("call_stats"))
     if kinds:
         out["tool_kinds"] = kinds
+    if calls:
+        out["result_errors"] = result_errors(calls, parsed)
     modes = search_modes(calls, parsed, masker)
     if modes is not None:
         out["es_modes"] = modes
@@ -177,12 +176,11 @@ def turn_facts(*, asked_at, answer: dict, calls, threads, window, masker, trunca
 
 def _kind_text(s: dict, dur) -> str:
     parts = [f"計 {dur(s['ms'])}"] if "ms" in s else []
-    parts.append(f"失敗 {s['errors']}")
+    if "errors" in s:
+        parts.append(f"失敗 {s['errors']}")
     if "truncated" in s:
         parts.append(f"打切 {s['truncated']}")
-    if s.get("no_duration"):
-        parts.append(f"時間の記録なし {s['no_duration']}")
-    return "（" + "・".join(parts) + "）"
+    return "（" + "・".join(parts) + "）" if parts else ""
 
 
 def fact_lines(facts: dict, dur_ms, dur) -> list[str]:
@@ -191,11 +189,15 @@ def fact_lines(facts: dict, dur_ms, dur) -> list[str]:
     tm = facts.get("time")
     if tm:
         lines.append(f"  時間の内訳: 回答全体 {dur(dur_ms)}／道具 {dur(tm['tools_ms'])}／シェル {dur(tm['shell_ms'])}"
-                     f"／モデルの応答待ち {dur(tm['model_wait_ms'])}")
+                     f"／モデルの応答待ち {dur(tm['model_wait_ms'])}"
+                     + (f"（本体の分。下調べ役 {tm['sub_threads']} の道具 {dur(tm['sub_tools_ms'])} は別）" if "sub_threads" in tm else ""))
     kinds = facts.get("tool_kinds") or {}
     if kinds:
         lines.append("  検索の種類: " + "／".join(f"{label} {kinds[k]['calls']} 回{_kind_text(kinds[k], dur)}"
                                               for k, label in KIND_LABEL if k in kinds))
+    soft = facts.get("result_errors") or {}
+    if soft:
+        lines.append("  結果に不調の印があった呼び出し: " + "／".join(f"{label} {soft[k]}" for k, label in KIND_LABEL if k in soft))
     modes = facts.get("es_modes")
     if modes:
         degraded = modes["degraded"]
@@ -226,9 +228,10 @@ def conversation_total(entries: list[dict]) -> dict:
     kinds: dict = {}
     for e in entries:
         for k, s in (e.get("tool_kinds") or {}).items():
-            slot = kinds.setdefault(k, {"calls": 0, "errors": 0})
+            slot = kinds.setdefault(k, {"calls": 0})
             slot["calls"] += s["calls"]
-            slot["errors"] += s["errors"]
+            if "errors" in s:
+                slot["errors"] = slot.get("errors", 0) + s["errors"]
     if kinds:
         out["tool_kinds"] = kinds
     return out
@@ -249,6 +252,6 @@ def total_lines(total: dict, tok, dur) -> list[str]:
         head += "  " + tok([toks[k] for k in TOKEN_KEYS]) + _partial(total, "token_turns")
     kinds = total.get("tool_kinds") or {}
     if kinds:
-        head += "  道具: " + "／".join(f"{label} {kinds[k]['calls']} 回（失敗 {kinds[k]['errors']}）"
+        head += "  道具: " + "／".join(f"{label} {kinds[k]['calls']} 回" + (f"（失敗 {kinds[k]['errors']}）" if "errors" in kinds[k] else "")
                                    for k, label in KIND_LABEL if k in kinds)
     return [head]

@@ -1247,7 +1247,7 @@ def _eval_facts(turn: dict, data: dict, threads: list[Thread], masker: Masker) -
     held = [t for t in threads if any(w_start <= ep <= w_end for ep, _ in t.events)]
     return _ev.turn_facts(asked_at=_iso(_epoch(u.get("created_at"))) if u else None, answer=answer,
                           calls=collect_calls(held, w_start, w_end) if held else [], threads=held,
-                          window=(w_start, w_end), masker=masker, truncated=truncation, parsed=_parsed_result)
+                          window=(w_start, w_end), masker=masker, parsed=_parsed_result)
 
 
 def render_turn(no: int, turn: dict, data: dict, threads: list[Thread], masker: Masker) -> list[str]:

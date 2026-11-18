@@ -360,6 +360,12 @@ def test_note_all_does_not_trip_selfcheck_for_sensitive_names_without_mask():
     assert CT.find_leaks("エラー: conf/app.key と keys/id_rsa", masker) == 0
 
 
+_CALL_STATS = {"v": 1, "calls": 6, "missing": 0, "tools": [
+    {"tool": "ripgrep_search", "role": "parent", "calls": 1, "found": 2, "ms": 1000, "errors": 0, "truncated": 1},
+    {"tool": "es_search", "role": "child", "calls": 2, "found": 0, "ms": 30, "errors": 1, "truncated": 0},
+    {"tool": "exec", "role": "parent", "calls": 3, "errors": 1}]}
+
+
 def _jsonl(conv, users_dir, *, mask=False):
     masker = CT.Masker(mask=mask, salt=b"s" * 16)
     out = CT.build_jsonl([conv], masker, meta={}, users_dir=users_dir)
@@ -368,16 +374,17 @@ def _jsonl(conv, users_dir, *, mask=False):
 
 def test_eval_fields_in_jsonl_and_text_from_session_records(tmp_path):
     _sessions(tmp_path)
-    rows, _, _ = _jsonl(_conv(), tmp_path)
+    conv = _conv(call_stats=_CALL_STATS)
+    rows, _, _ = _jsonl(conv, tmp_path)
     t = next(r for r in rows if r["kind"] == "turn")
     assert t["asked_at"] == "2026-10-01T09:00:00+09:00" and t["at"] == "2026-10-01T09:05:00+09:00"
     assert t["tokens"]["input"] == 730 and t["tokens"]["uncached_input"] == 730 - 490
     assert t["time"]["tools_ms"] == 4000 and t["time"]["shell_ms"] == 2000 and t["time"]["model_wait_ms"] >= 0
-    kinds = t["tool_kinds"]
+    kinds = t["tool_kinds"]                                                            # アプリの記録（call_stats）を種類ごとに足しただけ
     assert kinds["string"] == {"calls": 1, "ms": 1000, "errors": 0, "truncated": 1}
-    assert kinds["fulltext"]["calls"] == 1 and kinds["fulltext"]["truncated"] == 1     # 下調べ役の呼び出しも数える
-    assert kinds["list"]["calls"] == 1 and kinds["read"]["calls"] == 1
-    assert kinds["other"]["calls"] == 3 and kinds["other"]["errors"] == 1              # exec×2・台帳×1・exit 1 が失敗
+    assert kinds["fulltext"] == {"calls": 2, "ms": 30, "errors": 1, "truncated": 0}
+    assert kinds["other"] == {"calls": 3, "errors": 1}                                 # 記録に無い欄（時間・打切）は足さない
+    assert isinstance(t["result_errors"], dict)
     assert t["es_modes"] == {"hybrid": 0, "vector": 0, "keyword": 0, "degraded": {}, "unknown": 1}   # 方式が載っていない
     assert t["scope"] == "wld-sample" and t["scope_paths"] == ["src/sample"] and t["scope_whole"] is False
     total = rows[-1]
@@ -386,11 +393,11 @@ def test_eval_fields_in_jsonl_and_text_from_session_records(tmp_path):
     assert total["tool_kinds"]["other"] == {"calls": 3, "errors": 1}
     assert rows[0]["turns"] == 1                                                         # meta の turns は turn の行の数
 
-    text = CT.build_output([_conv()], CT.Masker(mask=False, salt=b"s" * 16), tmp_path)
+    text = CT.build_output([conv], CT.Masker(mask=False, salt=b"s" * 16), tmp_path)
     head = next(ln for ln in text.splitlines() if ln.startswith("--- ターン 1"))
     assert "質問時刻" in head and "回答時刻" in head
     assert "時間の内訳: 回答全体 300s／道具 4.0s／シェル 2.0s／モデルの応答待ち" in text
-    assert "全文検索 1 回（計 " in text and "文字列検索 1 回（計 1.0s・失敗 0・打切 1）" in text
+    assert "全文検索 2 回（計 " in text and "文字列検索 1 回（計 1.0s・失敗 0・打切 1）" in text
     assert "全文検索の方式: ハイブリッド 0／ベクトルのみ 0／キーワード指定 0／キーワードに縮退 0／不明 1" in text
     assert "推論 32 実入力 240" in text
     assert text.rstrip().splitlines()[-1].startswith("[会話の合計]  ターン 1  回答の時間 300s")
@@ -455,7 +462,7 @@ def test_mask_hides_new_fields_values(tmp_path):
     assert t["es_modes"]["hybrid"] == 1 and t["es_modes"]["degraded"]["hybrid_query_failed"] == 1
     assert "zz_odd_reason" not in out and any(k.startswith("値#") for k in t["es_modes"]["degraded"])
     assert all(p.startswith("範囲#") for p in t["scope_paths"]) and len(t["scope_paths"]) == 2
-    assert t["tool_kinds"]["other"]["calls"] == 1 and "zz_custom_tool" not in out
+    assert "zz_custom_tool" not in out
     text = CT.build_output([conv], masker, tmp_path)
     assert "zz_odd_reason" not in text and "zz_custom_tool" not in text and "zz_secret_dir" not in text
     assert "キーワードに縮退 2（" in text and CT.find_leaks(out, masker) == 0 and CT.find_leaks(text, masker) == 0
@@ -466,10 +473,11 @@ def test_eval_fields_keep_missing_apart_from_zero():
     ev = CT._ev
     from types import SimpleNamespace as NS
 
-    # 終わりの記録が無い呼び出しは時間の合計に入れず、件数で分かるようにする
-    calls = [NS(name="es_search", duration_ms=None, is_error=False), NS(name="es_search", duration_ms=40, is_error=False)]
-    kinds = ev.kind_stats(calls, lambda c: False, lambda c: None)
-    assert kinds["fulltext"] == {"calls": 2, "ms": 40, "errors": 0, "truncated": 0, "no_duration": 1}
+    # 道具の集計はアプリの記録だけから作る（記録が無ければ欄ごと出さない）。失敗の印の無い不調は別の欄に数える
+    assert ev.kind_stats(None) == {} and ev.kind_stats({"tools": [{"tool": "es_search"}]}) == {}
+    calls = [NS(name="graph_neighbors"), NS(name="graph_neighbors"), NS(name="es_search")]
+    results = iter([{"error_code": "graph_unavailable"}, {"nodes": []}, {"error": "x"}])
+    assert ev.result_errors(calls, lambda c: next(results)) == {"graph": 1, "fulltext": 1}
 
     # 壊れたセッション記録（時間が文字列）は時間の内訳を出さないだけで、落ちない
     broken = [NS(subagent=False, parent_tid=None, events=[
@@ -485,7 +493,7 @@ def test_eval_fields_keep_missing_apart_from_zero():
 
     # 範囲の記録が欠けたターンを「全体」と出さない
     facts = ev.turn_facts(asked_at=None, answer={"scope": {"world": "wld-sample"}}, calls=[], threads=[], window=(0, 0),
-                          masker=CT.Masker(mask=False), truncated=lambda c: False, parsed=lambda c: None)
+                          masker=CT.Masker(mask=False), parsed=lambda c: None)
     assert "scope_paths" not in facts and "scope_whole" not in facts
 
     # キャッシュの欄が無い記録からは実入力を作らず、合計には実入力が入ったターンの数を添える
