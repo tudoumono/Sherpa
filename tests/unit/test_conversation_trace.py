@@ -317,7 +317,7 @@ def test_jsonl_and_text_route_section_keep_masking_and_secrets_rules(tmp_path):
     masker = CT.Masker(mask=True, salt=b"s" * 16)
     out = CT.build_jsonl([conv], masker, meta={})
     rows = [json.loads(ln) for ln in out.splitlines()]
-    assert rows[0]["kind"] == "meta" and len(rows) == 2          # 個人の資料を参照したターンは出さない
+    assert rows[0]["kind"] == "meta" and len([r for r in rows if r["kind"] == "turn"]) == 1   # 個人の資料を参照したターンは出さない
     t = rows[1]
     assert t["conv"] == 7 and t["answer_id"] == 11 and t["ledger"] == "none" and t["completion"] == "complete"
     assert t["route"][0]["docs"][0]["rank"] == 1 and t["route"][0]["docs"][0]["via"] == "vector"
@@ -358,3 +358,105 @@ def test_note_all_does_not_trip_selfcheck_for_sensitive_names_without_mask():
     masker = CT.Masker(mask=False, salt=b"s" * 16)
     masker.note_all({"error": "conf/app.key", "items": ["keys/id_rsa"]})
     assert CT.find_leaks("エラー: conf/app.key と keys/id_rsa", masker) == 0
+
+
+def _jsonl(conv, users_dir, *, mask=False):
+    masker = CT.Masker(mask=mask, salt=b"s" * 16)
+    out = CT.build_jsonl([conv], masker, meta={}, users_dir=users_dir)
+    return [json.loads(ln) for ln in out.splitlines()], out, masker
+
+
+def test_eval_fields_in_jsonl_and_text_from_session_records(tmp_path):
+    _sessions(tmp_path)
+    rows, _, _ = _jsonl(_conv(), tmp_path)
+    t = next(r for r in rows if r["kind"] == "turn")
+    assert t["asked_at"] == "2026-10-01T09:00:00+09:00" and t["at"] == "2026-10-01T09:05:00+09:00"
+    assert t["tokens"]["input"] == 730 and t["tokens"]["uncached_input"] == 730 - 490
+    assert t["time"]["tools_ms"] == 4000 and t["time"]["shell_ms"] == 2000 and t["time"]["model_wait_ms"] >= 0
+    kinds = t["tool_kinds"]
+    assert kinds["string"] == {"calls": 1, "ms": 1000, "errors": 0, "truncated": 1}
+    assert kinds["fulltext"]["calls"] == 1 and kinds["fulltext"]["truncated"] == 1     # 下調べ役の呼び出しも数える
+    assert kinds["list"]["calls"] == 1 and kinds["read"]["calls"] == 1
+    assert kinds["other"]["calls"] == 3 and kinds["other"]["errors"] == 1              # exec×2・台帳×1・exit 1 が失敗
+    assert t["es_modes"] == {"hybrid": 0, "vector": 0, "keyword": 0, "degraded": {}, "unknown": 1}   # 方式が載っていない
+    assert t["scope"] == "wld-sample" and t["scope_paths"] == ["src/sample"] and t["scope_whole"] is False
+    total = rows[-1]
+    assert total["kind"] == "conversation" and total["conv"] == 7 and total["turns"] == 1
+    assert total["duration_ms"] == 300000 and total["tokens"]["uncached_input"] == 240 and total["tokens"]["output"] == 73
+    assert total["tool_kinds"]["other"] == {"calls": 3, "errors": 1}
+    assert rows[0]["turns"] == 1                                                         # meta の turns は turn の行の数
+
+    text = CT.build_output([_conv()], CT.Masker(mask=False, salt=b"s" * 16), tmp_path)
+    head = next(ln for ln in text.splitlines() if ln.startswith("--- ターン 1"))
+    assert "質問時刻" in head and "回答時刻" in head
+    assert "時間の内訳: 回答全体 300s／道具 4.0s／シェル 2.0s／モデルの応答待ち" in text
+    assert "全文検索 1 回（計 " in text and "文字列検索 1 回（計 1.0s・失敗 0・打切 1）" in text
+    assert "全文検索の方式: ハイブリッド 0／ベクトルのみ 0／キーワード指定 0／キーワードに縮退 0／不明 1" in text
+    assert "推論 32 実入力 240" in text
+    assert text.rstrip().splitlines()[-1].startswith("[会話の合計]  ターン 1  回答の時間 300s")
+    assert "実入力 240" in text.rstrip().splitlines()[-1] and "そのほか 3 回（失敗 1）" in text
+
+
+def test_eval_fields_omit_what_the_records_do_not_have(tmp_path):
+    conv = _conv()
+    conv["messages"][1]["answer"]["usage"].update(input_tokens=5, cached_input_tokens=10)
+    conv["audits"][0]["detail"].pop("message_id_user")      # 質問と対にできない
+    conv["messages"][1]["answer"]["call_stats"] = {"calls": 3, "tools": [
+        {"tool": "es_search", "calls": 2, "ms": 30, "errors": 1, "truncated": 0},
+        {"tool": "zz_unlisted_tool", "calls": 1, "ms": 5, "errors": 0, "truncated": 1}]}
+    rows, _, _ = _jsonl(conv, tmp_path / "nothing")
+    t = next(r for r in rows if r["kind"] == "turn")
+    assert "asked_at" not in t and "time" not in t and "es_modes" not in t       # 0 を出さない
+    assert "uncached_input" not in t["tokens"]                                   # 入力 < キャッシュは負にしない
+    assert t["tool_kinds"] == {"fulltext": {"calls": 2, "ms": 30, "errors": 1, "truncated": 0},
+                               "other": {"calls": 1, "ms": 5, "errors": 0, "truncated": 1}}
+    assert "uncached_input" not in rows[-1]["tokens"]
+    text = CT.build_output([conv], CT.Masker(mask=False, salt=b"s" * 16), tmp_path / "nothing")
+    head = next(ln for ln in text.splitlines() if ln.startswith("--- ターン 2"))
+    assert "質問時刻" not in head and "回答時刻" in head and "時間の内訳" not in text
+    assert "実入力" not in text.rstrip().splitlines()[-1]
+
+
+def _call(name, result, **kw):
+    return CT.Call(ts=0.0, thread=None, call_id=None, name=name,
+                   result_text=None if result is None else json.dumps(result), **kw)
+
+
+def test_search_modes_count_hybrid_and_degraded_reasons_and_unknown():
+    masker = CT.Masker(mask=False)
+    calls = [_call("es_search", {"hits": [], "mode_used": "hybrid"}),
+             _call("es_search", {"hits": [], "mode_used": "keyword"}),
+             _call("es_search", {"hits": [], "mode_used": "keyword", "degrade_reason": "query_embed_failed"}),
+             _call("es_search", {"hits": [], "mode_used": "keyword", "degrade_reason": "query_embed_failed"}),
+             _call("es_search", {"hits": [], "mode_used": "hybrid", "degrade_reason": "es_unavailable"}),
+             _call("es_search", {"hits": []}), _call("es_search", {"error": "x"}), _call("es_search", None),
+             _call("ripgrep_search", {"hits": []})]
+    got = CT._ev.search_modes(calls, CT._parsed_result, masker)
+    assert got == {"hybrid": 1, "vector": 0, "keyword": 1,
+                   "degraded": {"query_embed_failed": 2, "es_unavailable": 1}, "unknown": 3}
+    assert CT._ev.search_modes(calls[-1:], CT._parsed_result, masker) is None
+    assert CT._ev.kind_of("es_search") == "fulltext" and CT._ev.kind_of("graph_impact") == "graph"
+    assert CT._ev.kind_of("my_es_search_wrapper") == "other"                         # 名前の一部では判定しない
+
+
+def test_mask_hides_new_fields_values(tmp_path):
+    base = tmp_path / "u1" / "workspace" / ".codex-sessions" / "7" / "sessions" / "2026" / "10" / "01"
+    events = [_ev(5, "event_msg", {"type": "task_started"}),
+              *_mcp(10, "k1", "es_search", {"query": _QUERY}, {"hits": [], "mode_used": "keyword", "degrade_reason": "zz_odd_reason"}),
+              *_mcp(12, "k2", "es_search", {"query": _QUERY}, {"hits": [], "mode_used": "hybrid"}),
+              *_mcp(14, "k3", "es_search", {"query": _QUERY}, {"hits": [], "mode_used": "keyword",
+                                                              "degrade_reason": "hybrid_query_failed"}),
+              *_mcp(16, "k4", "zz_custom_tool", {"query": _QUERY}, {"count": 0, "paths": []})]
+    _write(base / "rollout-p.jsonl", {"id": "p1", "thread_source": "user", "model_provider": "openai"}, events)
+    conv = _conv()
+    conv["messages"][1]["answer"]["scope"]["scope_paths"] = ["src/sample", "zz_secret_dir/app"]
+    rows, out, masker = _jsonl(conv, tmp_path, mask=True)
+    t = next(r for r in rows if r["kind"] == "turn")
+    assert t["es_modes"]["hybrid"] == 1 and t["es_modes"]["degraded"]["hybrid_query_failed"] == 1
+    assert "zz_odd_reason" not in out and any(k.startswith("値#") for k in t["es_modes"]["degraded"])
+    assert all(p.startswith("範囲#") for p in t["scope_paths"]) and len(t["scope_paths"]) == 2
+    assert t["tool_kinds"]["other"]["calls"] == 1 and "zz_custom_tool" not in out
+    text = CT.build_output([conv], masker, tmp_path)
+    assert "zz_odd_reason" not in text and "zz_custom_tool" not in text and "zz_secret_dir" not in text
+    assert "キーワードに縮退 2（" in text and CT.find_leaks(out, masker) == 0 and CT.find_leaks(text, masker) == 0
+    assert CT.find_leaks(out + "\nzz_odd_reason\n", masker) > 0

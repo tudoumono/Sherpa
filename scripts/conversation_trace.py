@@ -32,6 +32,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from scripts import trace_eval_fields as _ev  # noqa: E402
+from scripts import trace_public_names as _pub  # noqa: E402
 from sherpa import answer_shape as _as  # noqa: E402
 from sherpa import investigation_ledger as _il  # noqa: E402
 from sherpa import investigation_record_render as _irr  # noqa: E402
@@ -42,8 +44,6 @@ from sherpa.store.feedback import MESSAGE_FEEDBACK_TAGS  # noqa: E402
 from sherpa.turn_activity_format import _OTHER, _VERSION_UNSAFE, _kib, _n, label_agents  # noqa: E402
 
 _TOKEN_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
-_WINDOW_BEFORE_S = 1.0
-_WINDOW_AFTER_S = 2.0
 _CLIP = 120
 CONV_LIMIT = 500
 _JST = timezone(timedelta(hours=9))
@@ -160,6 +160,7 @@ _VOCAB = {
     "call_status": frozenset(_irr._CALL_STATUS_LABELS),
     "via": frozenset({"keyword", "vector", "keyword_only_search"}),
     "search_mode": frozenset({"hybrid", "keyword", "vector"}),
+    "degrade_reason": _ev.DEGRADE_REASONS,
     "completion": frozenset(_as.COMPLETIONS),
     "lens": frozenset({"impact", "troubleshoot", "qa", "author", "investigate"}),
     "how_mode": frozenset(_as.HOW_MODES),
@@ -173,21 +174,6 @@ _VOCAB = {
 }
 _WORD_LABEL = {"tool": "道具", "error": "エラー", "provider": "接続先"}
 _LOOSE_WORD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}$")
-_OPENAI_PUBLIC_MODELS = frozenset({
-    "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini",
-    "gpt-4.1-nano", "gpt-4.5-preview", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-codex", "gpt-5.1",
-    "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max", "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex",
-    "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.6", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-astra",
-    "gpt-6-luna", "o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini", "codex-mini-latest",
-    "gpt-oss-20b", "gpt-oss-120b", "text-embedding-3-small", "text-embedding-3-large",
-    "text-embedding-ada-002",
-    "gpt-4o-2024-05-13", "gpt-4o-2024-08-06", "gpt-4o-2024-11-20", "gpt-4o-mini-2024-07-18",
-    "gpt-4-turbo-2024-04-09", "gpt-4.1-2025-04-14", "gpt-4.1-mini-2025-04-14", "gpt-4.1-nano-2025-04-14",
-    "o1-2024-12-17", "o1-mini-2024-09-12", "o3-2025-04-16", "o3-mini-2025-01-31", "o4-mini-2025-04-16",
-    "gpt-5-2025-08-07", "gpt-5-mini-2025-08-07", "gpt-5-nano-2025-08-07",
-})
-_OLLAMA_TAGS = frozenset({"latest", "0.5b", "1b", "1.5b", "2b", "3b", "4b", "7b", "8b", "9b", "12b", "13b",
-                          "14b", "20b", "27b", "32b", "34b", "70b", "72b", "120b", "235b", "671b"})
 # 打ち切りの印（結果の上の階層とヒットの中の両方で見る）。
 _TRUNC_KEYS = (("truncated", "件数の上限"), ("next_offset", "続きあり"), ("text_truncated", "本文の切詰め"),
                ("byte_clipped", "大きさの切詰め"), ("clipped_bytes", "大きさの切詰め"),
@@ -208,14 +194,6 @@ _TRACE_LABELS = frozenset({
     "原本を読む（先頭）", "調査台帳に項目を登録", "調査台帳の項目を更新", "調査台帳の状態を確認",
     "コマンド実行", "ファイルを参照", "ファイルを検索（grep）", "ファイル一覧",
 })
-# 伏せ字でもそのまま付けてよい拡張子（小文字で比べる）。
-_PUBLIC_EXTS = frozenset({
-    ".md", ".txt", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml", ".html", ".htm", ".pdf", ".doc",
-    ".docx", ".docm", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx", ".rtf", ".log", ".ini", ".cfg", ".conf",
-    ".properties", ".sql", ".ddl", ".cbl", ".cob", ".cpy", ".jcl", ".java", ".js", ".ts", ".py", ".c",
-    ".h", ".cpp", ".hpp", ".cs", ".vb", ".bas", ".sh", ".bat", ".ps1", ".go", ".rb", ".php", ".kt",
-    ".pl", ".toml", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".vsd", ".vsdx", ".zip",
-})
 _SENSITIVE_STRIP = " \t\r\n\"'`()（）[]{}<>「」『』【】:;,.、。，！？!?"
 _LIST_RESULT_KEYS = ("hits", "docs", "paths", "neighbors", "headings", "entries", "nodes", "children",
                      "results", "sheets", "paragraphs", "slides", "pages", "rows", "matches")
@@ -223,22 +201,10 @@ _READ_TOOLS = frozenset({"read_around", "read_doc", "file_head"})
 _LEDGER_TOOLS = frozenset({"ledger_manifest_set", "ledger_item_put", "ledger_status", "ledger_review_put"})
 _EXEC_TOOLS = frozenset({"exec", "exec_command", "shell", "local_shell"})
 _GREP_PROGRAMS = frozenset({"rg", "grep", "egrep", "fgrep"})
-_PUBLIC_PROGRAMS = frozenset({
-    "rg", "grep", "egrep", "fgrep", "sed", "awk", "cat", "head", "tail", "ls", "find", "wc", "nl", "sort",
-    "uniq", "cut", "tr", "file", "stat", "du", "git", "jq", "diff", "echo", "printf", "pwd", "cd", "test",
-    "xargs", "iconv", "nkf", "od", "xxd", "strings", "bash", "sh", "zsh", "perl", "python", "python3",
-    "node", "timeout", "env", "true", "mkdir", "cp", "mv", "rm", "tree", "realpath", "basename",
-    "dirname", "date", "sha256sum", "md5sum", "cmp", "comm", "column", "tee", "touch", "readlink",
-    "unzip", "zip", "tar", "gzip", "zcat", "pdftotext", "fd", "less", "more",
-})
 _PROG_RE = re.compile(r"^[A-Za-z0-9_.+-]{1,32}$")
 _EXEC_CMD_RE = re.compile(r'"cmd"\s*:\s*("(?:[^"\\]|\\.)*")')
 _SELFCHECK_SPLIT = re.compile(r"[\s/\\、。，,（）()\[\]{}:=;\"'<>|「」『』・→←]+")
 _PIECE_SPLIT = re.compile(r"[\s/\\]+")
-_OLLAMA_PUBLIC = frozenset({"llama3", "llama3.1", "llama3.2", "llama3.3", "llama4", "qwen2.5", "qwen2.5-coder", "qwen3",
-                  "qwen3-coder", "gemma2", "gemma3", "mistral", "mistral-nemo", "mixtral", "phi3", "phi4",
-                  "deepseek-r1", "deepseek-coder-v2", "codellama", "command-r", "granite3.3", "nomic-embed-text",
-                  "mxbai-embed-large", "bge-m3", "gpt-oss"})
 _MIN_NEEDLE = 3
 _ASCII_SUBSTR_MIN = 8
 
@@ -277,13 +243,6 @@ def _sensitive(value: str) -> bool:
         return bool(bare) and is_sensitive_doc_id(bare)
     except Exception:
         return True
-
-
-def _public_model(value: str) -> bool:
-    if value in _OPENAI_PUBLIC_MODELS:
-        return True
-    name, sep, tag = value.partition(":")
-    return name in _OLLAMA_PUBLIC and (not sep or tag in _OLLAMA_TAGS)
 
 
 def _known(kind: str, value: str) -> bool:
@@ -358,10 +317,10 @@ class Masker:
 
     def model(self, value) -> str:
         """モデル名。伏せ字でもそのまま出す（コスト計算に使う）。mask_models のときだけ公開のモデル名
-        （`_public_model`）以外を記号にし、自己検査に入れる。"""
+        （`public_model`）以外を記号にし、自己検査に入れる。"""
         if not isinstance(value, str) or not value:
             return "-"
-        if not self.mask_models or _public_model(value):
+        if not self.mask_models or _pub.public_model(value):
             shown = _clip(value, 80)
             self.vocab.add(value)
             return shown
@@ -393,7 +352,7 @@ class Masker:
         ext = Path(value.strip().rstrip("/")).suffix
         if not ext:
             return self._sym("資料", value.strip())
-        if ext.lower() in _PUBLIC_EXTS:
+        if ext.lower() in _pub.PUBLIC_EXTS:
             return self._sym("資料", value.strip()) + ext
         self.needles.add(ext)
         return self._sym("資料", value.strip()) + "." + self._sym("拡張子", ext)
@@ -491,10 +450,10 @@ def _fixed_text() -> str:
     """このスクリプトと台帳の表示が使う固定の文言（自己検査の照合から外す）。"""
     parts: list[str] = []
     try:
-        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                parts.append(node.value)
+        for src in (__file__, _ev.__file__, _pub.__file__):
+            for node in ast.walk(ast.parse(Path(src).read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    parts.append(node.value)
     except (OSError, SyntaxError):
         pass
     for table in (_irr._STATUS_LABELS, _irr._EVIDENCE_KIND_LABELS, _irr._COVERAGE_LABELS,
@@ -1069,7 +1028,7 @@ def _size(b) -> str:
 
 
 def _tok(row) -> str:
-    return (f"入力 {_n(row[0])}（キャッシュ {_n(row[1])}） 出力 {_n(row[2])} 推論 {_n(row[3])}")
+    return (f"入力 {_n(row[0])}（キャッシュ {_n(row[1])}） 出力 {_n(row[2])} 推論 {_n(row[3])}" + _ev.uncached_text(row, _n))
 
 
 def _sum_rows(rows) -> list:
@@ -1118,7 +1077,7 @@ def _args_summary(call: Call, masker: Masker) -> str:
         if call.command is None:
             return "コマンド -"
         prog = _program(call.command)
-        prog_out = prog if prog in _PUBLIC_PROGRAMS or (not masker.mask and prog and _PROG_RE.match(prog)) \
+        prog_out = prog if prog in _pub.PUBLIC_PROGRAMS or (not masker.mask and prog and _PROG_RE.match(prog)) \
             else "（コマンド）"
         if prog_out == prog and prog:
             masker.vocab.add(prog)
@@ -1278,6 +1237,19 @@ def _in_window(ts, start: float, end: float) -> bool:
     return ep is not None and start <= ep <= end
 
 
+def _eval_facts(turn: dict, data: dict, threads: list[Thread], masker: Masker) -> dict:
+    """1 ターンの評価の欄（質問の時刻・時間の内訳・検索の種類・全文検索の方式・範囲）。個人の資料のターンと回答なしは空。"""
+    u, a, audit = turn["user"], turn["assistant"], turn["audit"]
+    if a is None or _personal(u) or _personal(a):
+        return {}
+    answer = a.get("answer") if isinstance(a.get("answer"), dict) else {}
+    _, _, w_start, w_end = _ev.turn_window(u, a, audit, answer, _epoch)
+    held = [t for t in threads if any(w_start <= ep <= w_end for ep, _ in t.events)]
+    return _ev.turn_facts(asked_at=_iso(_epoch(u.get("created_at"))) if u else None, answer=answer,
+                          calls=collect_calls(held, w_start, w_end) if held else [], threads=held,
+                          window=(w_start, w_end), masker=masker, truncated=truncation, parsed=_parsed_result)
+
+
 def render_turn(no: int, turn: dict, data: dict, threads: list[Thread], masker: Masker) -> list[str]:
     u, a, audit = turn["user"], turn["assistant"], turn["audit"]
     cid = data["id"]
@@ -1286,16 +1258,10 @@ def render_turn(no: int, turn: dict, data: dict, threads: list[Thread], masker: 
     answer = a.get("answer") if a and isinstance(a.get("answer"), dict) else {}
     gaps: list[str] = []
     tok_bad: list = []
-    start = _epoch((u or {}).get("created_at")) if u else None
-    end = _epoch(a.get("created_at")) if a else _epoch((audit or {}).get("created_at"))
+    start, end, w_start, w_end = _ev.turn_window(u, a, audit, answer, _epoch)
     dur = answer.get("duration_ms") if isinstance(answer.get("duration_ms"), int) else None
-    if start is None and end is not None and dur is not None:
-        start = end - dur / 1000
-    if start is None:
-        start = end
-    w_start = (start or 0) - _WINDOW_BEFORE_S
-    w_end = end + _WINDOW_AFTER_S if end is not None else w_start - 1
-    lines = [f"--- ターン {no}  質問 #{(u or {}).get('id', '-')}  回答 #{(a or {}).get('id', '-')}"]
+    lines = [f"--- ターン {no}  質問 #{(u or {}).get('id', '-')}  回答 #{(a or {}).get('id', '-')}"
+             + _ev.heading_times(u, a, _epoch, _ymdhms)]
     if u is None:
         gaps.append("監査に質問との対応付けが無い（質問を出せません）")
     if a is None:
@@ -1433,7 +1399,8 @@ def render_turn(no: int, turn: dict, data: dict, threads: list[Thread], masker: 
 
     lines.extend(_token_section(rounds, stages, answer, data.get("turn_metrics", {}).get((a or {}).get("id")),
                                 usage_rows, act, gaps, masker, tok_bad))
-    lines.extend(_tool_totals_section(act, stages, calls, masker, tok_bad))
+    lines.extend(_tool_totals_section(act, stages, calls, masker, tok_bad)
+                 + _ev.fact_lines(_eval_facts(turn, data, threads, masker), dur, _dur))
     if tok_bad:
         gaps.append(f"数値でないトークンの値（DB・活動記録）を {len(tok_bad)} 件読み飛ばした（合計に入っていない）")
     lines.extend(_route_section(data.get("investigations", {}).get((a or {}).get("id")), masker, gaps))
@@ -1749,12 +1716,17 @@ def _note_conversation(data: dict, masker: Masker) -> None:
         masker.note((data.get("world") or {}).get(k))
 
 
-def turn_row(no: int, turn: dict, data: dict, masker: Masker) -> dict | None:
+def _countable(turn: dict) -> bool:
+    """行・合計に数えるターン（返答がある・個人の資料を参照していない・確認カード＝回答ではない、を除く）。"""
+    a = turn["assistant"]
+    return not (a is None or _personal(turn["user"]) or _personal(a)
+                or (isinstance(a.get("answer"), dict) and a["answer"].get("question")))
+
+
+def turn_row(no: int, turn: dict, data: dict, masker: Masker, threads: list[Thread] | None = None) -> dict | None:
     """assistant の返答 1 件ぶんの行（回答・質問・道具の結果の本文は入れない）。返答が無い・個人の資料を参照したターンは None。"""
-    u, a, audit = turn["user"], turn["assistant"], turn["audit"]
-    if a is None or _personal(u) or _personal(a):
-        return None
-    if isinstance(a.get("answer"), dict) and a["answer"].get("question"):  # 確認カード（回答ではない）は出さない
+    a, audit = turn["assistant"], turn["audit"]
+    if not _countable(turn):
         return None
     conv = data.get("conversation") or {}
     answer = a.get("answer") if isinstance(a.get("answer"), dict) else {}
@@ -1787,13 +1759,14 @@ def turn_row(no: int, turn: dict, data: dict, masker: Masker) -> dict | None:
         "completion": masker.word(answer.get("completion"), "completion") if answer.get("completion") else None,
         "stop_kind": masker.word(answer.get("stop_kind"), "stop_kind") if answer.get("stop_kind") else None,
         "duration_ms": answer.get("duration_ms") if _is_count(answer.get("duration_ms")) else None,
-        "tokens": dict(zip(("input", "cached_input", "output", "reasoning"), tokens)) if tokens else None,
+        "tokens": _ev.token_dict(tokens),
         "ledger": (None if not isinstance(record, dict) else
                    "none" if detail.get("ledger") == "none" or inv.get("ledger") == "none" else "present"),
         "calls": {k: v for k, v in view.items() if k not in ("route", "found")} or None,
         "route": view.get("route"), "found": view.get("found"),
     }
     row["ai"] = {k: v for k, v in row["ai"].items() if v is not None} or None
+    row.update(_eval_facts(turn, data, threads or [], masker))
     safe = _as.safe_new_fields(answer)
     refs = []
     for r in safe.get("referenced_docs") or []:
@@ -1831,22 +1804,32 @@ def turn_row(no: int, turn: dict, data: dict, masker: Masker) -> dict | None:
     return row
 
 
-def build_jsonl(convs: list[dict], masker: Masker, *, meta: dict, period: tuple[float, float] | None = None) -> str:
-    """1 行目に meta、続けて 1 ターン 1 行。期間があるときは返答がその期間にあるターンだけ。伏せ残しを確かめる（残っていれば LeakError）。"""
+def build_jsonl(convs: list[dict], masker: Masker, *, meta: dict, period: tuple[float, float] | None = None,
+                users_dir: Path | None = None) -> str:
+    """1 行目に meta、続けて 1 ターン 1 行、会話ごとの最後に合計の行（`kind: conversation`）。期間があるときは返答がその期間にあるターンだけ。
+    伏せ残しを確かめる（残っていれば LeakError）。"""
     rows = []
+    turns = 0
     for data in convs:
         if not data.get("conversation"):
             continue
         _note_conversation(data, masker)
+        threads, _ = _session_threads(data, users_dir)
+        mine = []
         for no, t in enumerate(_turn_pairs(data), 1):
             ep = _epoch(((t["assistant"] or {}).get("created_at")))
             if period is not None and (ep is None or not (period[0] <= ep < period[1])):
                 continue
-            row = turn_row(no, t, data, masker)
+            row = turn_row(no, t, data, masker, threads)
             if row is not None:
-                rows.append({k: v for k, v in row.items() if v is not None})
+                mine.append({k: v for k, v in row.items() if v is not None})
+        rows += mine
+        turns += len(mine)
+        if mine:
+            rows.append({"kind": "conversation", "conv": data["id"], **_ev.conversation_total(
+                [{k: r.get(k) for k in ("duration_ms", "tokens", "tool_kinds")} for r in mine])})
     head = {"kind": "meta", "exported_at": _iso(datetime.now().timestamp()), "version": _app_version(),
-            "mask": masker.mask, "mask_models": masker.mask_models, "turns": len(rows), **meta}
+            "mask": masker.mask, "mask_models": masker.mask_models, "turns": turns, **meta}
     text = "\n".join(json.dumps(r, ensure_ascii=False, separators=(",", ":")) for r in [head] + rows) + "\n"
     leaks = find_leaks(text, masker)
     if leaks:
@@ -1969,24 +1952,34 @@ def render_conversation(data: dict, threads: list[Thread] | None, masker: Masker
         lines.append(f"（{name} を読めませんでした）")
     for i, t in enumerate(turns, 1):
         lines.extend(render_turn(i, t, data, threads or [], masker))
-    return lines
+    entries = [{"duration_ms": t["assistant"]["answer"].get("duration_ms") if isinstance(t["assistant"].get("answer"), dict) else None,
+                "tokens": _ev.token_dict(_usage_row((t["assistant"].get("answer") or {}).get("usage"))),
+                "tool_kinds": _eval_facts(t, data, threads or [], masker).get("tool_kinds")}
+               for t in turns if _countable(t)]
+    return lines + (_ev.total_lines(_ev.conversation_total(entries), _tok, _dur) if entries else [])
+
+
+def _session_threads(data: dict, users_dir: Path | None) -> tuple[list[Thread], str]:
+    """会話のセッション記録（Codex の rollout）を読む。戻り値は (スレッド, 状態の表記)。読めなかった数は data に残す。"""
+    threads: list[Thread] = []
+    state = "なし"
+    uid = ((data.get("conversation") or {}).get("user_id"))
+    if users_dir is not None and isinstance(uid, str) and re.match(r"^[A-Za-z0-9_.@-]{1,128}$", uid):
+        conv_dir = users_dir / uid / "workspace" / ".codex-sessions" / str(data["id"])
+        if conv_dir.is_dir() and not conv_dir.is_symlink():
+            threads, skipped = read_threads(conv_dir)
+            data["skipped_session_files"] = skipped
+            state = f"あり（{len(threads)} 本）" if threads else "なし（フォルダはあるがファイルが無い）"
+        else:
+            state = "なし（保持期限で消えた・会話の削除・Codex 以外の経路）"
+    return threads, state
 
 
 def build_output(convs: list[dict], masker: Masker, users_dir: Path | None, *, notes: tuple = ()) -> str:
     """書き出す本文を組み立て、伏せ残りを確かめる（残っていれば LeakError）。notes は先頭に添える注記の行。"""
     out = [f"# 会話トレース  書き出し {_ymdhms(datetime.now().timestamp())}  版 {_app_version()}", *notes]
     for data in convs:
-        threads: list[Thread] = []
-        state = "なし"
-        uid = ((data.get("conversation") or {}).get("user_id"))
-        if users_dir is not None and isinstance(uid, str) and re.match(r"^[A-Za-z0-9_.@-]{1,128}$", uid):
-            conv_dir = users_dir / uid / "workspace" / ".codex-sessions" / str(data["id"])
-            if conv_dir.is_dir() and not conv_dir.is_symlink():
-                threads, skipped = read_threads(conv_dir)
-                data["skipped_session_files"] = skipped
-                state = f"あり（{len(threads)} 本）" if threads else "なし（フォルダはあるがファイルが無い）"
-            else:
-                state = "なし（保持期限で消えた・会話の削除・Codex 以外の経路）"
+        threads, state = _session_threads(data, users_dir)
         out.extend(render_conversation(data, threads, masker, sessions_state=state))
         out.append("")
     text = "\n".join(out) + "\n"
@@ -2126,7 +2119,7 @@ def main(argv: list[str] | None = None) -> int:
     convs = [load_conversation(int(s)) for s in ids]
     try:
         if ns.format == "jsonl":
-            text = build_jsonl(convs, masker, meta=meta, period=period)
+            text = build_jsonl(convs, masker, meta=meta, period=period, users_dir=_users_dir())
         else:
             text = build_output(convs, masker, _users_dir(), notes=tuple(notes))
     except LeakError as e:

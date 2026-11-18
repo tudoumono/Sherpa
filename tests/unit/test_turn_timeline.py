@@ -28,3 +28,14 @@ def test_attempts_split_by_task_started(tmp_path: Path):
     assert res["children"]["threads"] == 1 and res["children"]["tool_calls"] == 1
     text = tl.render(res)
     assert "attempts=3" in text and "架空" not in text  # 本文・検索語は出さない
+
+
+def test_trace_time_breakdown_uses_the_same_counting(tmp_path: Path):
+    tct._sessions(tmp_path)
+    conv_dir = tmp_path / "u1" / "workspace" / ".codex-sessions" / "7"
+    total = tl.analyze(tl.read_threads(conv_dir))["total"]
+    threads, _ = tct.CT.read_threads(conv_dir)
+    got = tct.CT._ev.timing(threads, 0.0, 1e12)
+    assert got == {"tools_ms": round(total["mcp_ms"]), "shell_ms": round(total["exec_ms"]),
+                   "model_wait_ms": round(total["model_wait_ms"])}
+    assert tct.CT._ev.timing(threads, 0.0, 1.0) is None
