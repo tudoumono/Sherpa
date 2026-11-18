@@ -1297,7 +1297,7 @@ def render_turn(no: int, turn: dict, data: dict, threads: list[Thread], masker: 
             + ("（実際のモデル: 記録なし）" if st.get("config") == "azure" else "")
             + f"  推論: {masker.word(usage.get('reasoning') or st.get('reasoning'), 'reasoning')}"
             f"  深さ: {masker.word(usage.get('depth_profile') or st.get('depth') or scope.get('depth_profile'), 'depth')}"
-            f"  範囲: {masker.scope(scope.get('world'))}" + (f"（{scope_txt}）" if paths else "（全体）"))
+            f"  範囲: {masker.scope(scope.get('world'))}" + (f"（{scope_txt}）" if paths else "（全体）" if isinstance(scope.get("scope_paths"), list) else "（範囲の指定: 記録なし）"))
         knobs = " ".join(f"{k}={st[k]}" for k in _SETTING_KEYS if isinstance(st.get(k), (int, bool)))
         version = act.get("app_version")
         if knobs or isinstance(version, str):
@@ -1759,7 +1759,7 @@ def turn_row(no: int, turn: dict, data: dict, masker: Masker, threads: list[Thre
         "completion": masker.word(answer.get("completion"), "completion") if answer.get("completion") else None,
         "stop_kind": masker.word(answer.get("stop_kind"), "stop_kind") if answer.get("stop_kind") else None,
         "duration_ms": answer.get("duration_ms") if _is_count(answer.get("duration_ms")) else None,
-        "tokens": _ev.token_dict(tokens),
+        "tokens": _ev.token_dict(tokens, usage),
         "ledger": (None if not isinstance(record, dict) else
                    "none" if detail.get("ledger") == "none" or inv.get("ledger") == "none" else "present"),
         "calls": {k: v for k, v in view.items() if k not in ("route", "found")} or None,
@@ -1953,7 +1953,8 @@ def render_conversation(data: dict, threads: list[Thread] | None, masker: Masker
     for i, t in enumerate(turns, 1):
         lines.extend(render_turn(i, t, data, threads or [], masker))
     entries = [{"duration_ms": t["assistant"]["answer"].get("duration_ms") if isinstance(t["assistant"].get("answer"), dict) else None,
-                "tokens": _ev.token_dict(_usage_row((t["assistant"].get("answer") or {}).get("usage"))),
+                "tokens": _ev.token_dict(_usage_row((t["assistant"].get("answer") or {}).get("usage")),
+                                         (t["assistant"].get("answer") or {}).get("usage")),
                 "tool_kinds": _eval_facts(t, data, threads or [], masker).get("tool_kinds")}
                for t in turns if _countable(t)]
     return lines + (_ev.total_lines(_ev.conversation_total(entries), _tok, _dur) if entries else [])

@@ -69,11 +69,12 @@ def uncached_text(row, fmt) -> str:
     return f" 実入力 {fmt(u)}" if u is not None else ""
 
 
-def token_dict(row) -> dict | None:
+def token_dict(row, usage=None) -> dict | None:
+    """トークンの行を欄の名前つきにする。実入力は、元の記録にキャッシュの欄があるときだけ足す。"""
     if not row:
         return None
     out = dict(zip(TOKEN_KEYS, row))
-    u = uncached(row)
+    u = uncached(row) if isinstance(usage, dict) and _is_int(usage.get("cached_input_tokens")) else None
     if u is not None:
         out["uncached_input"] = u
     return out
@@ -208,7 +209,7 @@ def fact_lines(facts: dict, dur_ms, dur) -> list[str]:
 
 def conversation_total(entries: list[dict]) -> dict:
     """会話 1 本の合計。entries は {duration_ms, tokens, tool_kinds} の並び（ターンごと）。
-    `duration_turns`・`token_turns` は、その合計に入ったターンの数（`turns` より少なければ記録の無いターンがある）。"""
+    `duration_turns`・`token_turns`・`uncached_input_turns` は、その合計に入ったターンの数（`turns` より少なければ記録の無いターンがある）。"""
     out: dict = {"turns": len(entries)}
     durs = [e["duration_ms"] for e in entries if _is_int(e.get("duration_ms"))]
     if durs:
@@ -218,8 +219,10 @@ def conversation_total(entries: list[dict]) -> dict:
     if toks:
         out["token_turns"] = len(toks)
         out["tokens"] = {k: sum(t.get(k) or 0 for t in toks) for k in TOKEN_KEYS}
-        if any("uncached_input" in t for t in toks):
-            out["tokens"]["uncached_input"] = sum(t.get("uncached_input") or 0 for t in toks)
+        known = [t["uncached_input"] for t in toks if "uncached_input" in t]
+        if known:
+            out["tokens"]["uncached_input"] = sum(known)
+            out["uncached_input_turns"] = len(known)
     kinds: dict = {}
     for e in entries:
         for k, s in (e.get("tool_kinds") or {}).items():

@@ -487,3 +487,16 @@ def test_eval_fields_keep_missing_apart_from_zero():
     facts = ev.turn_facts(asked_at=None, answer={"scope": {"world": "wld-sample"}}, calls=[], threads=[], window=(0, 0),
                           masker=CT.Masker(mask=False), truncated=lambda c: False, parsed=lambda c: None)
     assert "scope_paths" not in facts and "scope_whole" not in facts
+
+    # キャッシュの欄が無い記録からは実入力を作らず、合計には実入力が入ったターンの数を添える
+    assert "uncached_input" not in ev.token_dict([100, 0, 5, 0], {"input_tokens": 100, "output_tokens": 5})
+    full = ev.token_dict([100, 40, 5, 0], {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 5})
+    part = ev.conversation_total([{"tokens": full}, {"tokens": ev.token_dict([100, 0, 5, 0], {"input_tokens": 100})}])
+    assert part["tokens"]["uncached_input"] == 60 and part["uncached_input_turns"] == 1 and part["token_turns"] == 2
+
+
+def test_text_scope_says_no_record_when_scope_paths_is_missing(tmp_path):
+    conv = _conv()
+    conv["messages"][1]["answer"]["scope"] = {"world": "wld-sample"}
+    text = CT.build_output([conv], CT.Masker(mask=False), tmp_path / "nothing")
+    assert "（範囲の指定: 記録なし）" in text and "（全体）" not in text
