@@ -310,7 +310,7 @@ def settings_test(req: TestReq, request: Request):
         from sherpa import llm as _llm
         # 実行時（`_select_provider`）と同じ共通 resolver（`agent_constructs.codex_model_provider`）を通す。
         try:
-            codex_provider_choice = agent_constructs.codex_model_provider(s)
+            codex_provider_choice = agent_constructs.codex_model_provider(s, system_settings=sys_s)
         except agent_constructs.InvalidCodexModelProviderError as e:
             return {"ok": False, "provider": "codex", "model": model, "detail": str(e)}
         # Ollama 分岐を先に見る（`_select_provider` と同じ順序）。先に `openai_endpoint_kind` を評価すると、OpenAI 系設定の型破損で ValueError になり接続テストが偽陰性になる。

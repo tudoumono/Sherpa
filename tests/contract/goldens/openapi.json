@@ -4955,6 +4955,17 @@
             ],
             "title": "Cloud Provider"
           },
+          "codex_default_model_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Codex Default Model Provider"
+          },
           "codex_mode": {
             "anyOf": [
               {
@@ -10318,7 +10329,7 @@
         ]
       },
       "put": {
-        "description": "全体設定を部分更新する（admin のみ・検証・監査・fail-closed）。応答は GET と同形。\n未指定キーは変更せず、`null` は未設定へ戻す（コードの既定へ戻る）。検証:\n- arms_enabled: 既知アーム名のみ。legacy_backend: none|libreoffice|office_com。rag_llm_render: on|off。vlm: provider/model/cloud_allowed の型。\n- ollama_allowlist/webhook_allowlist: 各エントリを host:port に正規化して保存（不正は 422）。\n- codex_session_retention_days: 0 以上の整数（0=無制限）。\n- openai_endpoint_kind/base_url/auth_header/api_version: 種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら実効 base_url が空でないことも確認する。\n- research_default_provider: ollama/openai のみ。\"openai\" への変更は適用後の実効設定で実送信可能性も確認する。\n- depth_base_*: 整数 5 項目は範囲検証済み。depth_base_codex_reasoning は定義済みの推論レベルのみ。\n- chat_max_turns_per_user/chat_max_turns_global: 1〜16／1〜64。agentic_budget_per_result: 1024〜8MiB。\n- workspace_max_bytes: 1MiB〜1GiB。workspace_ttl_days: 0〜3650（0=無期限）。\n- chat_examples: `{enabled, items}`（items は最大 8 件・各 1〜200 文字）。codex_worker_model: 文字列のみ（空文字/null は未設定へ戻す）。codex_mode: standard/plain のみ。\n設定変更と監査は同一トランザクションで行い、監査に失敗すれば設定変更も取り消されて 500 を返す。",
+        "description": "全体設定を部分更新する（admin のみ・検証・監査・fail-closed）。応答は GET と同形。\n未指定キーは変更せず、`null` は未設定へ戻す（コードの既定へ戻る）。検証:\n- arms_enabled: 既知アーム名のみ。legacy_backend: none|libreoffice|office_com。rag_llm_render: on|off。vlm: provider/model/cloud_allowed の型。\n- ollama_allowlist/webhook_allowlist: 各エントリを host:port に正規化して保存（不正は 422）。\n- codex_session_retention_days: 0 以上の整数（0=無制限）。\n- openai_endpoint_kind/base_url/auth_header/api_version: 種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら実効 base_url が空でないことも確認する。\n- research_default_provider／codex_default_model_provider: ollama/openai のみ（codex_default_model_provider は空文字・null で未設定）。\"openai\" への変更は適用後の実効設定で実送信可能性も確認する。\n- depth_base_*: 整数 5 項目は範囲検証済み。depth_base_codex_reasoning は定義済みの推論レベルのみ。\n- chat_max_turns_per_user/chat_max_turns_global: 1〜16／1〜64。agentic_budget_per_result: 1024〜8MiB。\n- workspace_max_bytes: 1MiB〜1GiB。workspace_ttl_days: 0〜3650（0=無期限）。\n- chat_examples: `{enabled, items}`（items は最大 8 件・各 1〜200 文字）。codex_worker_model: 文字列のみ（空文字/null は未設定へ戻す）。codex_mode: standard/plain のみ。\n設定変更と監査は同一トランザクションで行い、監査に失敗すれば設定変更も取り消されて 500 を返す。",
         "operationId": "admin_settings_put_admin_settings_put",
         "requestBody": {
           "content": {

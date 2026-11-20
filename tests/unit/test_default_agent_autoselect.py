@@ -1,14 +1,10 @@
-"""既定の頭脳の自動選択と Codex CLI 不在時の正直な「未接続」（閉域実機の是正・2026-08-18）。
-
-不具合: 既定が codex_openai のため、設定を忘れると既定＝Codex になり、Codex CLI が無い
-閉域ホストでは provider.py の `shutil.which("codex")` 分岐が外れて決定的回答（定型文）だけが返っていた。
+"""既定の頭脳の自動選択と Codex CLI 不在時の正直な「未接続」。
 
 契約:
 - 環境変数 `SHERPA_AGENT` は読まない。個人設定が未選択のときは自動選択する。
-- 自動選択は「codex CLI があり、かつ使える認証がある」→codex（CLI の有無だけでは、オフラインキット
-  同梱の CLI がキーも認証も無いホストで必ず選ばれてしまうため）。使える認証＝解決済みの中央 OpenAI
-  キー（`sherpa.keys.resolve_api_key`）または `~/.codex/auth.json`（`CODEX_HOME` を尊重）の存在。
-  条件を満たさなければ次点: 中央 OpenAI キー（実キー）あり→openai／どちらも無し→ollama。
+- 自動選択は「codex CLI がある」→codex、無ければ simple（認証の有無は見ない）。Codex の接続先は
+  `codex_model_provider()` が決める（認証＝解決済みの中央 OpenAI キーまたは `~/.codex/auth.json`
+  （`CODEX_HOME` を尊重）があれば openai、無ければ ollama）。
 - `_select_provider` は agent=codex で CLI が無いとき `_UnwiredProvider` を返す（ごまかさない）。
 """
 from __future__ import annotations
@@ -54,34 +50,41 @@ def test_auto_default_falls_to_ollama_when_nothing(_clean_env, monkeypatch):
     assert AC.default_agent() == "simple"
 
 
-# ===== RV HIGH（2026-08-18 Codex RV 2巡目 指摘2）: CLI の有無だけでなく「使える認証」も条件にする =====
-
-def test_auto_default_skips_codex_when_cli_present_but_no_auth_at_all(_clean_env, monkeypatch):
-    """オフラインキットが Codex CLI を同梱するようになったため、CLI はあるがキーも auth.json も無い
-    ホスト（＝OPENAI_API_KEY 未設定で `codex login` もしていない）では codex を選ばず、次点（この
-    ケースは実キーも無いので ollama）へ落ちること。"""
+def test_auto_default_selects_codex_when_cli_present_but_no_auth_at_all(_clean_env, monkeypatch):
+    """CLI があれば認証が無くても codex を選ぶ（接続先はローカル LLM になる）。"""
     monkeypatch.setattr(shutil, "which", _which({"codex": "/opt/tools/codex/bin/codex"}))
-    assert AC.default_agent() == "simple"
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {})
+    assert AC.default_agent() == "codex"
+    assert AC.construct_id({}, system_settings={}) == "codex_ollama"
 
 
-def test_auto_default_rejects_placeholder_key_as_codex_auth(_clean_env, monkeypatch):
-    """`sk-REPLACE_ME`（`.env.example` のプレースホルダ）は「使える認証」に数えない
-    （auth.json も無ければ codex を選ばない）。"""
+def test_unselected_user_follows_admin_default_provider(_clean_env, monkeypatch):
     monkeypatch.setattr(shutil, "which", _which({"codex": "/opt/tools/codex/bin/codex"}))
-    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"openai_api_key": "sk-REPLACE_ME"})
-    assert AC.default_agent() == "simple"
+    for value in ("openai", "ollama"):
+        sys_s = {"codex_default_model_provider": value}
+        assert AC.codex_model_provider({}, system_settings=sys_s) == value
+        assert AC.construct_id({}, system_settings=sys_s) == f"codex_{value}"
 
 
-def test_auto_default_selects_codex_via_auth_json_without_any_api_key(_clean_env, monkeypatch, tmp_path):
-    """`codex login`（サブスクリプション方式）で `~/.codex/auth.json` があれば、OPENAI_API_KEY が
-    無くても codex を選ぶこと（auth_mode は問わない・中身は見ない＝存在だけを見る）。`CODEX_HOME` を
-    尊重すること（実 `~/.codex/auth.json` には一切触れない）。"""
-    monkeypatch.setattr(shutil, "which", _which({"codex": "/opt/tools/codex/bin/codex"}))
+def test_auto_provider_is_openai_when_key_or_auth_json_exists(_clean_env, monkeypatch, tmp_path):
+    assert AC.codex_model_provider({}, system_settings={"openai_api_key": "sk-x"}) == "openai"
     codex_home = tmp_path / "codex_home_with_auth"
     codex_home.mkdir()
     (codex_home / "auth.json").write_text('{"tokens": {}}', encoding="utf-8")
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    assert AC.default_agent() == "codex"
+    assert AC.codex_model_provider({}, system_settings={}) == "openai"
+
+
+def test_own_choice_beats_admin_default(_clean_env):
+    sys_s = {"codex_default_model_provider": "ollama"}
+    assert AC.codex_model_provider({"codex_model_provider": "openai"}, system_settings=sys_s) == "openai"
+
+
+def test_invalid_admin_default_raises(_clean_env):
+    for bad in ("anthropic", 3):
+        with pytest.raises(AC.InvalidCodexModelProviderError):
+            AC.codex_model_provider({}, system_settings={"codex_default_model_provider": bad})
+    assert AC.construct_id({"agent": "codex"}, system_settings={"codex_default_model_provider": "x"}) == "codex_invalid"
 
 
 def test_sherpa_agent_env_is_ignored(_clean_env, monkeypatch):
@@ -145,5 +148,5 @@ def test_select_provider_codex_with_cli_builds_codex_provider(_clean_env, monkey
             self.args = a
     monkeypatch.setattr(shutil, "which", _which({"codex": "/usr/bin/codex"}))
     monkeypatch.setattr(facade, "CodexProvider", _FakeCodex)
-    p = providers._select_provider({"agent": "codex"})
+    p = providers._select_provider({"agent": "codex", "codex_model_provider": "openai"})
     assert isinstance(p, _FakeCodex)

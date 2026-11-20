@@ -347,6 +347,21 @@
             <div class="hint danger" id="ext-research-default-provider-invalid" hidden style="margin:-8px 0 14px"><!-- JS が描画: 保存値が不正な場合の案内 --></div>
           </div>
         </div>
+        <div class="card sec" id="codex-default-provider-card">
+          <div class="card-head"><span class="title">Codex 調査の既定の接続先</span></div>
+          <div class="body">
+            <label class="vlm-field">
+              <span class="vlm-l">利用者が自分で選んでいないときに使います</span>
+              <select id="ext-codex-default-provider" style="max-width:360px">
+                <option value="">自動（OpenAI のキーがあれば OpenAI、無ければ Ollama）</option>
+                <option value="openai">OpenAI</option>
+                <option value="ollama">Ollama</option>
+              </select>
+            </label>
+            <div class="hint" id="ext-codex-default-provider-hint" style="margin:-8px 0 14px"></div>
+            <div class="hint danger" id="ext-codex-default-provider-invalid" hidden style="margin:-8px 0 14px"><!-- JS が描画: 保存値が不正な場合の案内 --></div>
+          </div>
+        </div>
         <section class="research-group" aria-labelledby="research-codex-heading">
           <h2 id="research-codex-heading">Codex の動かし方</h2>
           <div class="card sec" id="codex-mode-card">
