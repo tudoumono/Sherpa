@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import io
 import json
-import logging
 import threading
 import time
 import urllib.error
@@ -86,8 +85,6 @@ def patch_search(monkeypatch):
     pytest.param((), "ok", id="all-success"),
     pytest.param(("elasticsearch",), "degraded", id="elasticsearch-degraded"),
     pytest.param(("postgres",), "down", id="postgres-down"),
-    # impact=none は status に影響しないが components には ok=False と hint が残る
-    pytest.param(("codex", "openai", "ollama"), "ok", id="none-impact-stay-ok"),
 ])
 def test_snapshot_status_and_failed_components(patch_components, failing, status):
     patch_components(_failing(*failing))
@@ -140,8 +137,8 @@ def test_detail_does_not_leak_raw_exception_text(patch_components):
 # ===== ai_snapshot =====
 
 def test_ai_components_cover_only_supported_providers():
-    assert [c[0] for c in health._AI_COMPONENTS] == ["openai", "ollama", "codex"]
-    assert all(c[0] not in ("gemini", "bedrock") for c in health.COMPONENTS)
+    assert [c[0] for c in health._AI_COMPONENTS] == ["answer_ai", "codex", "embed"]
+    assert [c[0] for c in health.COMPONENTS] == ["postgres", "neo4j", "elasticsearch"]
 
 
 def test_ai_snapshot_passes_per_user_settings_to_each_check(patch_ai):
@@ -164,15 +161,15 @@ def test_ai_snapshot_failure_recorded_with_hint_but_no_secret_leak(patch_ai):
     def _fail_key(settings, system_settings=None):
         raise RuntimeError(f"401 unauthorized for key={settings.get('openai_api_key')}")
 
-    patch_ai({"openai": _fail_key})
+    patch_ai({"answer_ai": _fail_key})
     rows = health.ai_snapshot("admin", {"openai_api_key": "sk-should-not-leak"}, force=True)
-    row = next(c for c in rows if c["id"] == "openai")
+    row = next(c for c in rows if c["id"] == "answer_ai")
     assert row["ok"] is False
     assert row["hint"]
     assert "sk-should-not-leak" not in row["detail"], "detail にキー値が漏れている"
 
 
-def _ai_failure_row(patch_ai, caplog, exc_message, comp_id="ollama"):
+def _ai_failure_row(patch_ai, caplog, exc_message, comp_id="answer_ai"):
     def _fail_msg(settings, system_settings=None):
         raise RuntimeError(exc_message)
 
@@ -218,8 +215,8 @@ def test_ai_snapshot_shows_detailed_reason_instead_of_generic_classification(pat
     def _fail_reason(settings, system_settings=None):
         raise RuntimeError(reason)
 
-    patch_ai({"openai": _fail_reason})
-    row = next(c for c in health.ai_snapshot("admin", {}, force=True) if c["id"] == "openai")
+    patch_ai({"answer_ai": _fail_reason})
+    row = next(c for c in health.ai_snapshot("admin", {}, force=True) if c["id"] == "answer_ai")
     assert row["ok"] is False
     assert row["detail"] == reason
     assert "エラー（RuntimeError）" not in row["detail"]
@@ -231,7 +228,7 @@ def test_ai_snapshot_caches_per_uid_and_force_bypasses(patch_ai):
     def _count(_settings, _system_settings=None):
         calls["n"] += 1
 
-    patch_ai({"openai": _count})
+    patch_ai({"answer_ai": _count})
     health.ai_snapshot("admin", {}, force=True)
     assert calls["n"] == 1
     health.ai_snapshot("admin", {}, force=False)         # キャッシュ内
@@ -260,106 +257,23 @@ def test_ai_snapshot_marks_probe_exceeding_deadline_as_timeout(patch_ai, monkeyp
     def _hang(_settings, _system_settings=None):
         release.wait(timeout=5)
 
-    patch_ai({"openai": _hang})
+    patch_ai({"answer_ai": _hang})
     monkeypatch.setattr(health, "_AI_DEADLINE", 0.2)
     try:
         t0 = time.monotonic()
         rows = health.ai_snapshot("admin", {}, force=True)
         elapsed = time.monotonic() - t0
         assert elapsed < 1.0, f"deadline 超過後もブロックしている（{elapsed:.2f}s）"
-        row = next(c for c in rows if c["id"] == "openai")
+        row = next(c for c in rows if c["id"] == "answer_ai")
         assert row["ok"] is False
         assert "タイムアウト" in row["detail"]
     finally:
         release.set()
 
 
-# ===== _ai_check_openai / _ping_openai / _ai_check_codex =====
+# ===== 用途別の軽い確認（回答の AI・埋め込み・Codex） =====
 
-def test_ai_check_openai_passes_short_explicit_timeout_to_probe(monkeypatch):
-    from sherpa.ingest import graph_extract
-
-    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"personal_api_keys_allowed": True})
-    captured = {}
-
-    def fake_probe(cfg, timeout=None):
-        captured["timeout"] = timeout
-        return True, ""
-
-    monkeypatch.setattr(graph_extract, "_probe", fake_probe)
-    health._ai_check_openai({"openai_api_key": "sk-test"})
-    assert captured["timeout"] == health._AI_TIMEOUT
-
-
-def test_ai_check_openai_strict_rejects_invalid_cloud_provider_without_probing(monkeypatch):
-    # 不正な cloud_provider のまま実 API probe（課金）を送らない。
-    from sherpa.ingest import graph_extract
-
-    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {
-        "personal_api_keys_allowed": True, "cloud_provider": "not-a-real-provider"})
-    probe_calls = []
-    monkeypatch.setattr(graph_extract, "_probe", lambda cfg, timeout=None: (probe_calls.append(cfg) or (True, "")))
-    with pytest.raises(keys.InvalidCloudProviderConfigError, match="not-a-real-provider"):
-        health._ai_check_openai({"openai_api_key": "sk-test"})
-    assert probe_calls == []
-
-
-def test_ai_check_openai_does_not_leak_reflected_url_into_health_log(monkeypatch, caplog):
-    from sherpa.ingest import graph_extract
-
-    sys_s = {"openai_endpoint_kind": "azure",
-             "openai_base_url": "https://myres.openai.azure.com/openai/deployments/my-secret-deploy",
-             "openai_api_key": "sk-test"}
-    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: sys_s)
-    fp = io.BytesIO(json.dumps({"error": {"message": (
-        "bad request to https://myres.openai.azure.com/openai/deployments/my-secret-deploy/"
-        "chat/completions?api-version=2024-01-01")}}).encode("utf-8"))
-    exc = urllib.error.HTTPError("https://myres.openai.azure.com/openai/v1/chat/completions",
-                                 400, "error", {}, fp)
-    monkeypatch.setattr(graph_extract, "complete_json", lambda *a, **k: (_ for _ in ()).throw(exc))
-
-    with caplog.at_level("WARNING", logger="sherpa.health"):
-        rows = health.ai_snapshot("admin", {}, force=True)
-    row = next(c for c in rows if c["id"] == "openai")
-    assert row["ok"] is False
-    assert "my-secret-deploy" not in row["detail"]
-    logged_text = " ".join(r.getMessage() for r in caplog.records)
-    assert "my-secret-deploy" not in logged_text
-    assert "api-version" not in logged_text
-
-
-def _set_central_openai_key(monkeypatch, value):
-    monkeypatch.setattr("sherpa.store.get_system_settings",
-                        lambda: {"openai_api_key": value} if value is not None else {})
-
-
-def test_ping_openai_rejects_placeholder_exact_match_not_substring(monkeypatch):
-    # プレースホルダ判定は完全一致ベース（"REPLACE_ME" を部分文字列に含むだけの実キーは弾かない）。
-    _set_central_openai_key(monkeypatch, "sk-REPLACE_ME")
-    with pytest.raises(RuntimeError, match="設定してください"):
-        health._ping_openai()
-
-    _set_central_openai_key(monkeypatch, None)
-    with pytest.raises(RuntimeError, match="設定してください"):
-        health._ping_openai()
-
-    _set_central_openai_key(monkeypatch, "sk-proj-REPLACE_ME_IS_NOT_MY_WHOLE_KEY-abc123")
-    health._ping_openai()   # 例外なし＝未設定扱いされていない
-
-
-def test_ai_check_openai_rejects_placeholder_without_calling_probe(monkeypatch):
-    from sherpa.ingest import graph_extract
-
-    called = {"n": 0}
-
-    def _should_not_be_called(cfg, timeout=None):
-        called["n"] += 1
-        return True, ""
-
-    monkeypatch.setattr(graph_extract, "_probe", _should_not_be_called)
-    with pytest.raises(RuntimeError, match="設定してください"):
-        health._ai_check_openai({"openai_api_key": "sk-REPLACE_ME"})
-    assert called["n"] == 0, "プレースホルダなのに _probe（実API呼び出し）まで進んでいる"
+_OPENAI = {"codex_model_provider": "openai"}
 
 
 def test_ai_check_codex_uses_key_auth_on_azure_endpoint(monkeypatch):
@@ -375,12 +289,12 @@ def test_ai_check_codex_uses_key_auth_on_azure_endpoint(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _no_subprocess)
     monkeypatch.setattr(health.keys, "resolve_api_key",
                         lambda provider, settings, system_settings=None, **kw: "sk-test")
-    health._ai_check_codex({}, {})
+    health._ai_check_codex(_OPENAI, {})
 
     monkeypatch.setattr(health.keys, "resolve_api_key",
                         lambda provider, settings, system_settings=None, **kw: None)
     with pytest.raises(RuntimeError, match=keys.NO_CENTRAL_KEY_MESSAGE[:12]):
-        health._ai_check_codex({}, {})
+        health._ai_check_codex(_OPENAI, {})
 
 
 def test_ai_check_codex_direct_openai_still_uses_login_status(monkeypatch):
@@ -396,14 +310,8 @@ def test_ai_check_codex_direct_openai_still_uses_login_status(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: (calls.append(a), _R())[1])
-    health._ai_check_codex({}, {})
+    health._ai_check_codex(_OPENAI, {})
     assert calls, "直結構成では login status を確認する"
-
-
-def test_ping_openai_hint_points_to_admin_not_env():
-    hint = next(c[4] for c in health.COMPONENTS if c[0] == "openai")
-    assert ".env" not in hint
-    assert keys.NO_CENTRAL_KEY_MESSAGE in hint
 
 
 # ===== ES/グラフ 実クエリ検索プローブ =====
@@ -586,8 +494,8 @@ def test_search_snapshot_marks_probe_exceeding_deadline_as_timeout(patch_search,
         return "ヒットあり"
 
     patch_search(components=[
-        ("es_search", "ES検索（実クエリ）", "none", _hang, "h"),
-        ("graph_search", "グラフ検索（実クエリ）", "none", lambda _w: "ヒットあり", "h"),
+        ("es_search", "全文検索（1 件読めるか）", "none", _hang, "h"),
+        ("graph_search", "つながりの検索（1 件読めるか）", "none", lambda _w: "ヒットあり", "h"),
     ])
     monkeypatch.setattr(health, "_SEARCH_DEADLINE", 0.2)
     try:
@@ -602,59 +510,7 @@ def test_search_snapshot_marks_probe_exceeding_deadline_as_timeout(patch_search,
         release.set()
 
 
-# ===== 対象外（_NotApplicable）: 未設定のプロバイダを WARNING にしない =====
-
-@pytest.mark.parametrize("settings, ok, warns", [
-    pytest.param({}, True, False, id="ollama-unconfigured-not-applicable"),
-    pytest.param({"ollama_url": "http://127.0.0.1:11434"}, False, True, id="ollama-configured-still-warns"),
-])
-def test_ollama_connection_refused(monkeypatch, caplog, settings, ok, warns):
-    monkeypatch.setattr(store, "get_system_settings", lambda: settings)
-
-    def _boom(*a, **kw):
-        raise OSError("Connection refused")
-
-    monkeypatch.setattr(llm, "urlopen_no_redirect", _boom)
-    with caplog.at_level(logging.DEBUG, logger="sherpa.health"):
-        out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
-    assert out["ok"] is ok
-    if ok:
-        assert "対象外" in out["detail"]
-    assert bool([r for r in caplog.records if r.levelno >= logging.WARNING]) is warns
-
-
-_AZURE_ONLY = {"cloud_provider": "openai", "research_default_provider": "openai", "embed_provider": "auto"}
-
-
-def test_ollama_not_in_use_skips_ping_and_logs_nothing(monkeypatch, caplog):
-    monkeypatch.setattr(store, "get_system_settings", lambda: _AZURE_ONLY)
-    monkeypatch.setattr(health, "_active_user_codex_rows", lambda: [])
-    monkeypatch.setattr("sherpa.ingest.arms.enabled_arm_names", lambda: ["ooxml"])
-
-    def _must_not_call(*a, **kw):
-        raise AssertionError("Ollama を問い合わせてはいけない")
-
-    monkeypatch.setattr(llm, "urlopen_no_redirect", _must_not_call)
-    with caplog.at_level(logging.DEBUG, logger="sherpa.health"):
-        out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
-    assert out["ok"] is True and "使っていません" in out["detail"]
-    assert not caplog.records
-
-
-@pytest.mark.parametrize("sys_s, rows", [
-    pytest.param({**_AZURE_ONLY, "embed_provider": "ollama"}, [], id="embed-ollama"),
-    pytest.param(_AZURE_ONLY, [{"agent": "codex", "codex_model_provider": "ollama"}], id="codex-oss-user"),
-    pytest.param({**_AZURE_ONLY, "research_default_provider": "ollama", "ollama_url": "http://h:11434"}, [],
-                 id="simple-ollama"),
-    pytest.param({**_AZURE_ONLY, "research_default_provider": "ollama"}, [], id="simple-ollama-without-url"),
-])
-def test_ollama_in_use_when_any_purpose_uses_it(monkeypatch, sys_s, rows):
-    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
-    monkeypatch.setattr("sherpa.ingest.arms.enabled_arm_names", lambda: ["ooxml"])
-    assert health.ollama_in_use(sys_s, rows) is True
-
-
-# ===== 埋め込みモデル未取得の検出 =====
+# ===== 用途別の接続先（他の用途の接続先を見に行かない） =====
 
 class _FakeOllamaTagsResponse:
     def __init__(self, payload: bytes):
@@ -674,59 +530,103 @@ def _tags_payload(*names: str) -> bytes:
     return json.dumps({"models": [{"name": n} for n in names]}).encode()
 
 
-_OLLAMA_EMBED = {"provider": "ollama", "url": "http://127.0.0.1:11434", "model": "bge-m3", "dim": 1024}
+_CATALOG = {"model_catalog": {
+    "ollama": {"subsearch": {"allowed": ["chat-sample:8b"], "default": "chat-sample:8b"},
+               "embed": {"allowed": ["embed-sample"], "default": "embed-sample"}},
+    "codex": {"codex": {"allowed": ["code-sample:20b"], "default": "code-sample:20b"}},
+}}
+_OLLAMA_ALL = {**_CATALOG, "cloud_provider": "ollama", "research_default_provider": "ollama",
+               "codex_default_model_provider": "ollama", "embed_provider": "ollama",
+               "ollama_url": "http://127.0.0.1:11434", "ollama_embed_url": "http://127.0.0.1:11435"}
 
 
-@pytest.mark.parametrize("tags, embed_cfg, ok", [
-    pytest.param(("qwen2.5:latest",), _OLLAMA_EMBED, False, id="embed-model-missing"),
-    pytest.param(("bge-m3:latest",), _OLLAMA_EMBED, True, id="embed-model-present-with-latest"),
-    pytest.param(("qwen2.5:latest",), None, True, id="embed-not-ollama-unaffected"),
-])
-def test_ollama_ping_embed_model_check(monkeypatch, tags, embed_cfg, ok):
-    monkeypatch.setattr(store, "get_system_settings", lambda: {"ollama_url": "http://127.0.0.1:11434"})
-    monkeypatch.setattr(llm, "urlopen_no_redirect",
-                        lambda url, timeout=None: _FakeOllamaTagsResponse(_tags_payload(*tags)))
-    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: embed_cfg)
-    out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
-    assert out["ok"] is ok
-    if not ok:
-        assert "bge-m3" in out["detail"]
-        assert "ollama pull bge-m3" in out["detail"]
-
-
-def test_ollama_ping_detects_missing_embed_model_even_when_dim_is_unmeasurable(monkeypatch):
-    """次元を測れない（モデルが無いと測れない）ときも、埋め込みは Ollama を使っていると判定してモデル不足を検出する。"""
-    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
-    monkeypatch.setattr(embeddings, "_ollama_dim_cache", {})
-    monkeypatch.setattr(embeddings, "_ollama_dim_failed", {})
-    monkeypatch.setattr(store, "get_system_settings", lambda: {"ollama_url": "http://127.0.0.1:11434"})
-    monkeypatch.setattr(llm, "urlopen_no_redirect",
-                        lambda url, timeout=None: _FakeOllamaTagsResponse(_tags_payload("qwen2.5:latest")))
-    monkeypatch.setattr(llm, "post_json", lambda *a, **k: (_ for _ in ()).throw(OSError("model not found")))
-    out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
-    assert out["ok"] is False and "ollama pull bge-m3" in out["detail"]
-
-
-def test_ollama_ping_names_the_unreachable_embed_server_and_checks_model_there(monkeypatch):
-    sysset = {"ollama_url": "http://127.0.0.1:11434", "ollama_embed_url": "http://127.0.0.1:11435"}
-    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
-    monkeypatch.setattr(store, "get_system_settings", lambda: sysset)
-    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: {**_OLLAMA_EMBED, "url": "http://127.0.0.1:11435"})
-    served = {"11434": _tags_payload("qwen2.5:latest"), "11435": None}
+@pytest.fixture
+def ollama_servers(monkeypatch):
+    """Ollama の外部境界（urlopen_no_redirect）だけを差し替える。`served` の port -> 取得済みモデル名（None は落ちている）。"""
+    served = {"11434": ("chat-sample:8b", "code-sample:20b"), "11435": ("embed-sample:latest",)}
+    hits = []
 
     def _open(url, timeout=None):
-        body = served[url.split(":")[2].split("/")[0]]
-        if body is None:
+        hits.append(url)
+        names = served[url.split(":")[2].split("/")[0]]
+        if names is None:
             raise ConnectionRefusedError("down")
-        return _FakeOllamaTagsResponse(body)
+        return _FakeOllamaTagsResponse(_tags_payload(*names))
+
     monkeypatch.setattr(llm, "urlopen_no_redirect", _open)
-    out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
-    assert out["ok"] is False and "埋め込み用の Ollama に届きません" in out["detail"]
-    ai = health._check_one_ai("ollama", "o", "none", lambda: health._ai_check_ollama({}, sysset), "hint")
-    assert ai["ok"] is False and "埋め込み用の Ollama に届きません" in ai["detail"]   # システム状態の画面の行も同じ
-    served["11435"] = _tags_payload("bge-m3:latest")  # 中央にモデルが無くても、確かめるのは埋め込み用のサーバー
-    assert health._check_one("ollama", "o", "none", health._ping_ollama, "hint")["ok"] is True
-    assert health._check_one_ai("ollama", "o", "none", lambda: health._ai_check_ollama({}, sysset), "hint")["ok"] is True
+    monkeypatch.setattr(health.shutil, "which", lambda _: "/usr/bin/codex")
+    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
+    monkeypatch.setattr(health, "_ai_cache", {})
+    return served, hits
+
+
+def _rows(sys_s, settings=None):
+    orig = store.get_system_settings
+    store.get_system_settings = lambda *a, **k: sys_s
+    try:
+        return {r["id"]: r for r in health.ai_snapshot("admin", settings or {}, force=True)}
+    finally:
+        store.get_system_settings = orig
+
+
+def test_only_embed_row_fails_when_only_the_embed_server_is_down(ollama_servers):
+    served, _hits = ollama_servers
+    served["11435"] = None
+    rows = _rows(_OLLAMA_ALL, {"codex_model_provider": "ollama"})
+    assert rows["answer_ai"]["ok"] is True
+    assert rows["codex"]["ok"] is True
+    assert rows["embed"]["ok"] is False and "埋め込み用の Ollama に届きません" in rows["embed"]["detail"]
+
+
+def test_embed_row_reports_missing_embed_model_on_the_embed_server(ollama_servers):
+    served, _hits = ollama_servers
+    served["11435"] = ("other-sample:latest",)
+    rows = _rows(_OLLAMA_ALL, {"codex_model_provider": "ollama"})
+    assert rows["embed"]["ok"] is False and "ollama pull embed-sample" in rows["embed"]["detail"]
+    assert rows["answer_ai"]["ok"] is True
+
+
+def test_chat_on_openai_does_not_look_at_the_central_ollama_when_only_embed_uses_ollama(ollama_servers, monkeypatch):
+    import subprocess
+    _served, hits = ollama_servers
+    sys_s = {**_CATALOG, "cloud_provider": "openai", "research_default_provider": "openai", "openai_api_key": "sk-sample-key",
+             "codex_default_model_provider": "openai", "embed_provider": "ollama",
+             "ollama_url": "http://127.0.0.1:11434", "ollama_embed_url": "http://127.0.0.1:11435"}
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    rows = _rows(sys_s)
+    assert all(r["ok"] for r in rows.values()), rows
+    assert hits and all(":11435/" in u for u in hits), "チャット用（中央）の Ollama の接続先を見に行っている"
+
+
+def test_light_check_neither_sends_to_ai_nor_writes(ollama_servers, monkeypatch):
+    from sherpa import agentic_search, es_index
+    from sherpa.ingest import graph_extract
+
+    def _forbidden(*a, **k):
+        raise AssertionError("軽い確認が送信・書き込みをしている")
+
+    monkeypatch.setattr(graph_extract, "_probe", _forbidden)
+    monkeypatch.setattr(graph_extract, "complete_json", _forbidden)
+    monkeypatch.setattr(agentic_search, "_post", _forbidden)
+    monkeypatch.setattr(es_index, "_req", _forbidden)
+    monkeypatch.setattr(llm, "post_json", _forbidden)
+    monkeypatch.setattr(embeddings, "embed_with_failure", _forbidden)
+    rows = _rows(_OLLAMA_ALL, {"codex_model_provider": "ollama"})
+    assert all(r["ok"] for r in rows.values()), rows
+
+
+def test_embed_row_not_in_use_when_disabled(ollama_servers, monkeypatch):
+    monkeypatch.setenv("SHERPA_DISABLE_EMBED", "1")
+    rows = _rows(_OLLAMA_ALL, {"codex_model_provider": "ollama"})
+    assert rows["embed"]["ok"] is True and "使っていません" in rows["embed"]["detail"]
+
+
+def test_answer_row_openai_needs_a_real_key(monkeypatch):
+    base = {"cloud_provider": "openai", "research_default_provider": "openai", "model_catalog": {
+        "openai": {"subsearch": {"allowed": ["chat-sample"], "default": "chat-sample"}}}}
+    with pytest.raises(RuntimeError, match=keys.NO_CENTRAL_KEY_MESSAGE[:12]):
+        health._ai_check_answer({}, {**base, "openai_api_key": "sk-REPLACE_ME"})
+    health._ai_check_answer({}, {**base, "openai_api_key": "sk-sample-key"})
 
 
 def test_ai_check_codex_ollama_requires_codex_model_pulled(monkeypatch):

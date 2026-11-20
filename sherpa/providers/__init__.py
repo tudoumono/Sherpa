@@ -173,7 +173,7 @@ def _select_provider(s: dict, system_settings: dict | None = None) -> Provider:
         ollama_base_url = None
         openai_api_key = None
         try:
-            codex_provider_choice = agent_constructs.codex_model_provider(s)
+            codex_provider_choice = agent_constructs.codex_model_provider(s, system_settings=sys_s)
         except agent_constructs.InvalidCodexModelProviderError as e:
             return _facade._UnwiredProvider("Codex", str(e))
         if codex_provider_choice == "ollama":

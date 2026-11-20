@@ -1,5 +1,6 @@
-// システム状態画面（admin 専用）。GET /admin/health でコンポーネント別の健全性を取得。
-// 設計: docs/design/operations.md「構成（運用の仕組み）」
+// システム状態画面（admin 専用）。GET /admin/health の軽い確認（保存先・資料の中身・AI）と、
+// ボタンで流す POST /admin/connectivity/check の実際に送る確認（経路ごとの結果）を 1 画面に出す。
+// 設計: docs/design/operations.md「システム状態とつながりの確認」
 // セキュリティ: server data（label/detail/hint）は全て esc()。
 'use strict';
 
@@ -59,15 +60,12 @@ function bannerLabel(status) {
   return '停止';
 }
 
-// 表示順: 失敗×down → 失敗×degraded → 失敗×none → 正常（止まっているものが常に最上部）。
-function rank(c) {
-  if (!c.ok) {
-    if (c.impact === 'down') return 0;
-    if (c.impact === 'degraded') return 1;
-    return 2;
-  }
-  return 3;
-}
+// 並べ方: 保存先 → 資料の中身 → AI の順（まとまりの中はサーバーの順）。
+const GROUPS = [
+  { title: '保存先', ids: ['postgres', 'elasticsearch', 'neo4j'] },
+  { title: '資料の中身', ids: ['es_search', 'graph_search'] },
+  { title: 'AI', ids: ['answer_ai', 'codex', 'embed'] },
+];
 
 function stateCell(c) {
   if (c.ok) return { text: '● 正常', color: 'var(--ok)' };
@@ -84,27 +82,35 @@ function renderBanner(d) {
   $('checked-at').textContent = '最終チェック: ' + fmtTime(d.checked_at);
 }
 
-function renderTable(components) {
-  const tbody = $('health-tbody');
-  if (!components.length) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="5">コンポーネント情報がありません</td></tr>';
-    return;
-  }
-  const sorted = components.slice().sort((a, b) => rank(a) - rank(b));
-  tbody.innerHTML = sorted.map((c) => {
-    const st = stateCell(c);
-    const label = esc(c.label || c.id || '');
-    const latency = c.latency_ms != null ? esc(String(c.latency_ms)) : '—';
-    const detail = c.detail ? esc(c.detail) : '';
-    const hint = c.hint ? esc(c.hint) : '';
-    return `<tr>
+function rowHtml(c) {
+  const st = stateCell(c);
+  const label = esc(c.label || c.id || '');
+  const latency = c.latency_ms != null ? esc(String(c.latency_ms)) : '—';
+  const detail = c.detail ? esc(c.detail) : '';
+  const hint = c.hint ? esc(c.hint) : '';
+  return `<tr>
       <td class="state-cell" style="color:${st.color}">${st.text}</td>
       <td>${label}</td>
       <td class="latency-cell">${latency}</td>
       <td class="detail-cell">${detail}</td>
       <td class="hint-cell">${hint}</td>
     </tr>`;
-  }).join('');
+}
+
+function renderTable(components) {
+  const tbody = $('health-tbody');
+  if (!components.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="5">コンポーネント情報がありません</td></tr>';
+    return;
+  }
+  const known = new Set(GROUPS.flatMap((g) => g.ids));
+  const groups = GROUPS.map((g) => ({
+    title: g.title, rows: components.filter((c) => g.ids.includes(c.id)),
+  }));
+  const rest = components.filter((c) => !known.has(c.id));
+  if (rest.length) groups.push({ title: 'その他', rows: rest });
+  tbody.innerHTML = groups.filter((g) => g.rows.length).map((g) =>
+    `<tr class="group-row"><td colspan="5">${esc(g.title)}</td></tr>` + g.rows.map(rowHtml).join('')).join('');
 }
 
 // バックエンドに到達できない場合（PostgreSQL/認証データベース停止等）のフォールバック表示。
@@ -147,6 +153,83 @@ $('recheck-btn').addEventListener('click', () => {
   btn.innerHTML = '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>確認中...</span></span>';
   showChecking();
   loadHealth(true).finally(() => { btn.disabled = false; btn.textContent = orig; });
+});
+
+// ===== 実際に送って確かめる =====
+function sendStateCell(r) {
+  if (r.status === 'ok') return { text: '● つながる', color: 'var(--ok)' };
+  if (r.status === 'ng') return { text: '● つながらない', color: 'var(--danger)' };
+  if (r.status === 'incomplete') return { text: '▲ 確かめきれなかった', color: 'var(--warn)' };
+  return { text: '○ 確かめていない', color: 'var(--ink-3)' };
+}
+
+function renderPath(p) {
+  const rows = (p.results || []).map((r) => {
+    const st = sendStateCell(r);
+    const label = esc(r.label || r.id || '') + (r.paid ? ' <span class="hint">（有料）</span>' : '');
+    const note = r.note ? ' <span class="hint">' + esc(r.note) + '</span>' : '';
+    return `<tr>
+      <td>${label}${note}</td>
+      <td class="host-cell">${esc(r.host || '—')}</td>
+      <td>${esc(r.route || '—')}</td>
+      <td class="state-cell" style="color:${st.color}">${st.text}</td>
+      <td class="time-cell">${r.status === 'skipped' ? '—' : esc(String(r.elapsed_ms)) + ' ms'}</td>
+      <td class="reason-cell">${esc(r.reason || '')}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="card" style="overflow-x:auto">
+    <div class="card-head"><div><div class="title">${esc(p.label || p.path)}</div></div></div>
+    <table>
+      <thead><tr><th>確認するもの</th><th>宛先</th><th>経路</th><th>結果</th><th>時間</th><th>理由</th></tr></thead>
+      <tbody>${rows || '<tr class="empty-row"><td colspan="6">確認結果がありません</td></tr>'}</tbody>
+    </table>
+  </div>`;
+}
+
+let _sending = false;
+
+// 前回の表を残さず、今回は確認できなかったことを出す。
+function showSendFailed(reason) {
+  $('paths').innerHTML = `<div class="hint">確認できませんでした: ${esc(String(reason))}</div>`;
+  $('send-checked-at').textContent = '最終確認: 失敗（' + fmtTime(new Date().toISOString()) + '）';
+  toast('確認に失敗しました');
+}
+
+async function runSendCheck(includePaid) {
+  if (_sending) return;
+  _sending = true;
+  const free = $('check-free-btn'), paid = $('check-paid-btn');
+  const origFree = free.textContent, origPaid = paid.textContent;
+  free.disabled = true; paid.disabled = true;
+  (includePaid ? paid : free).innerHTML =
+    '<span class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>確認中...</span></span>';
+  try {
+    const r = await fetch('/admin/connectivity/check', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ include_paid: includePaid }),
+    });
+    if (r.status === 409) { toast('ほかの確認が実行中です。終わってからもう一度お試しください'); return; }
+    if (!r.ok) {
+      const body = await r.json().catch(() => null);
+      showSendFailed((body && typeof body.detail === 'string' && body.detail) || `HTTP ${r.status}`);
+      return;
+    }
+    const d = await r.json();
+    $('paths').innerHTML = (d.paths || []).map(renderPath).join('');
+    $('send-checked-at').textContent = '最終確認: ' + fmtTime(new Date().toISOString());
+  } catch (e) {
+    showSendFailed((e && e.message) || '通信に失敗しました');
+  } finally {
+    free.textContent = origFree; paid.textContent = origPaid;
+    free.disabled = false; paid.disabled = false;
+    _sending = false;
+  }
+}
+
+$('check-free-btn').addEventListener('click', () => runSendCheck(false));
+$('check-paid-btn').addEventListener('click', () => {
+  if (!confirm('OpenAI に短い文を送ります（埋め込み・回答の AI・Codex の分。数円程度）。続けますか？')) return;
+  runSendCheck(true);
 });
 
 // ===== 初期化 =====

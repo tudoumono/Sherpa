@@ -29,11 +29,9 @@ def embed_test_result(url: str, hp: tuple, host: str, names: list[str], sys_s: d
     import json as _json
     import urllib.request
 
-    from sherpa import embeddings, llm
+    from sherpa import ai_targets, embeddings, llm
     model = embeddings._ollama_model(sys_s)
-    have = set(names)
-    present = model in have or f"{model}:latest" in have
-    if not present:
+    if not ai_targets.model_installed(model, set(names)):
         return {"ok": True, "host": host, "models": names, "missing": [model], "no_tools": [],
                 "detail": "接続OK（埋め込みのモデルがこのサーバーにありません）"}
     no_embed: list[str] = []

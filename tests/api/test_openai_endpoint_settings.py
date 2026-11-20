@@ -75,6 +75,12 @@ def _stub_codex_cli(monkeypatch, *, login=None):
     """codex CLI を見つかる状態にする。`login` は `codex login status` の (rc, stdout, stderr)。
     None なら `codex login status` が呼ばれたら失敗。"""
     monkeypatch.delenv("SHERPA_CODEX_SANDBOX", raising=False)
+    # 認証あり（auth.json）の環境＝未選択の接続先が openai に自動で決まる。
+    import tempfile
+    from pathlib import Path
+    home = Path(tempfile.mkdtemp(prefix="codexhome-"))
+    (home / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(home))
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
     if login is None:
         monkeypatch.setattr(subprocess, "run", _forbid("codex login status を呼ぶべきではない"))

@@ -31,6 +31,12 @@
   .latency-cell{text-align:right;color:var(--ink-3);font-variant-numeric:tabular-nums}
   #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
   .empty-row td{text-align:center;color:var(--ink-3);padding:24px}
+  .group-row td{font-weight:700;color:var(--ink-2);background:var(--surface-2);padding:6px 10px}
+  /* 実際に送って確かめる */
+  .host-cell{font-family:var(--font-code,monospace);font-size:var(--text-caption);color:var(--ink-3);overflow-wrap:anywhere}
+  .reason-cell{max-width:360px;font-size:var(--text-caption);color:var(--ink-3)}
+  .time-cell{text-align:right;color:var(--ink-3);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .btnrow{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 </style>
 </head>
 <body>
@@ -47,7 +53,7 @@
       <div>
         <a class="crumb" href="admin-settings.html">← システム管理</a>
         <h1>システム状態</h1>
-        <div class="sub">何が止まっているのかを一目で把握し、対処を計画できます。</div>
+        <div class="sub">保存先・資料の中身・AI が使える状態かを一目で確かめ、止まっているところの対処を計画できます。</div>
       </div>
     </div>
 
@@ -81,6 +87,24 @@
           <tbody id="health-tbody"></tbody>
         </table>
       </div>
+
+      <!-- 実際に送って確かめる -->
+      <div class="card">
+        <div class="card-head">
+          <span class="ico">🔌</span>
+          <div>
+            <div class="title">実際の経路での確認</div>
+            <div class="sub" id="send-checked-at">まだ確かめていません</div>
+          </div>
+          <div class="spacer"></div>
+          <div class="btnrow">
+            <button class="btn-secondary" id="check-free-btn">実際に送って確かめる</button>
+            <button class="btn-secondary" id="check-paid-btn">お金のかかる分も確かめる</button>
+          </div>
+        </div>
+        <div class="card-body"><div class="hint">上の表は、つながるか・モデルがあるか・キーがあるかを見るだけで、AI への送信も書き込みもしません。ここでは、画面・回答・調べものの道具・取り込みの係・Codex が実際に使う経路で、短い文を送ったり、確認専用の領域に書いて引けるかを確かめます。「実際に送って確かめる」は無料の分だけです。調べものの道具は、道具のサーバーを実際に起動して、資料の一覧・検索・読み取りなどを 1 回ずつ呼べるかも確かめます（お金はかかりません）。お金のかかる分（埋め込み・回答の AI・Codex を OpenAI で使う場合）は、短い文を 1 回ずつ送ります。Codex が道具を呼べるかの確認も、この有料の分に入ります。</div></div>
+      </div>
+      <div id="paths"></div>
     </div>
   </div>
 </div>

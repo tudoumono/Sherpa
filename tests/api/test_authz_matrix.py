@@ -367,7 +367,7 @@ def test_policy_covers_all_routes():
     # admin=ナレッジグラフ画面の廃止（GET /graph・/graph/facets・/graph/search）3件撤去で43、資料フォルダのグラフ（GET /ingest/preview/graph）で44。
     # admin=管理画面の Ollama 接続テスト（POST /admin/settings/ollama-test）1件追加で45。
     # admin=フォルダの置き方の点検（GET /worlds/{wid}/folder-check）1件追加で46。
-    # admin=管理画面の「つながりの確認」（POST /admin/connectivity/check）1件追加で47。
+    # admin=システム状態の「実際に送って確かめる」（POST /admin/connectivity/check）1件追加で47。
     # admin=資料の優先と除外（GET/PUT /admin/path-rules・GET /admin/path-rules/files）3件追加で50。
     # admin=ファイルの状態を更新（POST /worlds/{wid}/file-state）1件・ビルドの定義の印（GET/PUT /admin/build-marks）2件・取り込み run の確認（GET /ingest/runs/mark）1件追加で54。
     assert len(ADMIN_ROUTES) == 54

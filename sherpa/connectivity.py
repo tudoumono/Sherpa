@@ -1,17 +1,15 @@
-"""つながりの確認（管理画面「つながりの確認」タブ）。アプリが実際に使う経路ごとに、決まった確認だけを流す。
+"""つながりの確認（システム状態画面の「実際に送って確かめる」）。アプリが実際に使う経路ごとに、決まった確認だけを流す。
 
 各確認は実際の処理と同じ関数・同じ送り方を通す。任意の URL・コマンドは受けない。
 結果には鍵・トークン・パスワード・URL の資格情報・応答の本文を出さない（理由は決まった言葉だけ）。
 `python -m sherpa.connectivity --json [--paid]` はそのプロセスで流した結果を JSON で出す（子プロセスの経路用）。
 取り込みの係の経路は、取り込みワーカーが自分のプロセスで流す（`sherpa/ingest/connectivity_relay.py`）。
-設計: docs/design/operations.md「つながりの確認」
+設計: docs/design/operations.md「システム状態とつながりの確認」
 """
 from __future__ import annotations
 
 import json
 import os
-import socket
-import ssl
 import subprocess
 import sys
 import tempfile
@@ -21,111 +19,14 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from . import connectivity_roundtrip
+from .connectivity_base import (  # noqa: F401  確認の共通部品（他の部品・試験がここから引く）
+    _DIRECT, _PROXY, _Incomplete, _Ng, _Skip, _embed_failure_reason, classify, host_of, resolve_embed, route_for,
+)
+
 CHILD_TIMEOUT_S = 60.0
 _ES_TIMEOUT = 5
-_OLLAMA_TIMEOUT = 5
 _EMBED_DEADLINE_S = 15
-
-_DIRECT = "直接"
-_PROXY = "プロキシ経由"
-
-
-class _Skip(Exception):
-    """「流さない」の申告（reason が表示になる）。"""
-
-    def __init__(self, reason: str, *, paid: bool = False, route=None, host=None):
-        super().__init__(reason)
-        self.reason, self.paid, self.route, self.host = reason, paid, route, host
-
-
-class _Incomplete(Exception):
-    """確かめきれなかった（設定を読めない等）。"""
-
-
-class _Ng(Exception):
-    """決まった言葉の理由つきの失敗。"""
-
-    def __init__(self, reason: str, *, route=None, host=None, paid=None):
-        super().__init__(reason)
-        self.reason, self.route, self.host, self.paid = reason, route, host, paid
-
-
-def host_of(value) -> str | None:
-    """URL・`host:port` からホスト名だけを取り出す（資格情報・パス・クエリは捨てる）。"""
-    v = str(value or "").strip()
-    if not v:
-        return None
-    try:
-        return urllib.parse.urlsplit(v if "://" in v else "//" + v).hostname or None
-    except ValueError:
-        return None
-
-
-def route_for(url_or_host, scheme: str = "https") -> str:
-    """urllib が実際に選ぶ経路。プロキシが設定され、宛先が例外に当たらなければプロキシ経由。
-    例外の照合は urllib の送信と同じ値（URL なら `Request(url).host`＝資格情報があれば含む `host:port`）で行う。
-    """
-    if not host_of(url_or_host):
-        return _DIRECT
-    v = str(url_or_host).strip()
-    if "://" in v:
-        scheme = urllib.parse.urlsplit(v).scheme or scheme
-        try:
-            target = urllib.request.Request(v).host
-        except ValueError:
-            return _DIRECT
-    else:
-        target = v
-    if urllib.request.getproxies().get(scheme) and not urllib.request.proxy_bypass(target):
-        return _PROXY
-    return _DIRECT
-
-
-def classify(e: BaseException) -> str:
-    """例外を決まった言葉の理由にする。例外の文言は出さない。"""
-    from . import llm
-    seen = set()
-    stack = [e]
-    while stack:
-        c = stack.pop()
-        if c is None or id(c) in seen:
-            continue
-        seen.add(id(c))
-        if isinstance(c, llm.SsrfBlocked):
-            return "宛先が許可されていない"
-        if isinstance(c, urllib.error.HTTPError):
-            if c.code in (401, 403):
-                return f"認証に失敗（{c.code}）"
-            if c.code == 404:
-                return "モデルまたは宛先が見つからない（404）"
-            if c.code == 429:
-                return "利用の上限に達している（429）"
-            return f"相手がエラーを返した（{c.code}）"
-        if isinstance(c, ssl.SSLCertVerificationError):
-            return "証明書の検証に失敗"
-        if isinstance(c, (TimeoutError, socket.timeout)):
-            return "時間切れ"
-        if isinstance(c, ConnectionRefusedError):
-            return "接続を拒否された"
-        if isinstance(c, socket.gaierror):
-            return "名前を引けない"
-        text = str(c).lower()
-        name = type(c).__name__
-        if name in ("AuthError", "Unauthorized") or "password authentication failed" in text \
-                or "authentication failed" in text:
-            return "認証に失敗"
-        if "certificate" in text:
-            return "証明書の検証に失敗"
-        if "connection refused" in text or "refused" in text:
-            return "接続を拒否された"
-        if "could not translate host" in text or "name or service not known" in text \
-                or "nodename nor servname" in text or "temporary failure in name resolution" in text:
-            return "名前を引けない"
-        if "timeout" in text or "timed out" in text:
-            return "時間切れ"
-        stack.extend([getattr(c, "__cause__", None), getattr(c, "__context__", None),
-                      getattr(c, "reason", None)])
-    return "つながらない"
 
 
 class _Ctx:
@@ -134,6 +35,7 @@ class _Ctx:
     def __init__(self, unreadable_reason: str = "設定を読めなかった（DB に届かない）"):
         from . import store
         self.uid: str | None = None
+        self.path = "api"
         self.sys: dict | None = None
         self.error: str | None = None
         try:
@@ -185,70 +87,10 @@ def _check_neo4j(ctx: _Ctx, paid: bool) -> dict:
     return {"route": _DIRECT, "host": host}
 
 
-def _check_ollama(ctx: _Ctx, paid: bool) -> dict:
-    from . import health, keys, llm
-    sys_s = ctx.need()
-    if not health.ollama_in_use(sys_s):
-        raise _Skip("Ollama を使っていない")
-    base = keys.resolve_ollama_url(None, system_settings=sys_s)
-    host = host_of(base)
-    route = route_for(base, "http")
-    try:
-        with llm.urlopen_no_redirect(llm.ollama_url(base, "/api/tags"), timeout=_OLLAMA_TIMEOUT) as r:
-            json.loads(r.read())
-    except Exception as e:
-        raise _Ng(classify(e), route=route, host=host)
-    return {"route": route, "host": host}
-
-
-def _embed_failure_reason(failure, dim, timeout_s=None) -> str:
-    if failure is not None and failure.kind == "timeout":
-        return (f"時間切れ（1 回の要求の待ち時間 {timeout_s} 秒。管理画面の埋め込みの待ち時間を延ばす）"
-                if timeout_s else "時間切れ")
-    if failure is None:
-        return "応答を得られなかった（時間切れの可能性）"
-    if failure.kind == "dimension":
-        return f"次元が合わない（設定 {dim}・応答 {failure.got_dim}）"
-    if failure.kind == "invalid":
-        return "応答の形が正しくない"
-    if failure.kind == "deadline":
-        return "時間切れ"
-    status, etype = failure.status, str(failure.error_type)
-    if status in (401, 403):
-        return f"認証に失敗（{status}）"
-    if status == 404:
-        return "モデルが無い（404）"
-    if status == 429:
-        return "利用の上限に達している（429）"
-    if status is not None:
-        return f"相手がエラーを返した（{status}）"
-    low = etype.lower()
-    if "timeout" in low:
-        return "時間切れ"
-    if "ssl" in low or "certificate" in low:
-        return "証明書の検証に失敗"
-    if "ssrf" in low or "preflight" in low:
-        return "宛先が許可されていない"
-    if "connectionrefused" in low:
-        return "接続を拒否された"
-    if "urlerror" in low or "connection" in low:
-        return "つながらない（拒否・名前を引けない・証明書のいずれか。詳しくは API のログ）"
-    return "つながらない"
-
-
 def _check_embed(ctx: _Ctx, paid: bool) -> dict:
     from . import embeddings, llm
     sys_s = ctx.need()
-    if os.environ.get("SHERPA_DISABLE_EMBED"):
-        raise _Skip("埋め込みを使わない設定になっている")
-    try:
-        ec = embeddings.cfg(None, system_settings=sys_s)
-    except Exception:
-        raise _Ng("埋め込みの設定を解決できない")
-    if ec is None:
-        if embeddings.cloud_selected_but_unavailable(sys_s):
-            raise _Ng("埋め込みの設定を解決できない（選んだ接続先のキー・接続先・モデルを確認）")
-        raise _Skip("埋め込みは使っていない")
+    ec = resolve_embed(sys_s).cfg
     provider = ec.get("provider")
     if provider == "ollama":
         host, route = host_of(ec.get("url")), _DIRECT  # 実際の送信が `llm.no_proxy_requests()` で常に直結
@@ -287,20 +129,20 @@ def _check_answer_ai(ctx: _Ctx, paid: bool) -> dict:
     `agentic_search._post`・1 送信の上限時間・応答の取り出し `round_message_raw`）で 1 往復送り、assistant の message があるときだけ成功にする。OpenAI に送るときは有料（`paid` のときだけ）。Ollama は無料で送る。
     簡易の回答は API のプロセスで動くので、この確認は API の経路だけで流す。
     """
-    from . import agentic_search, keys, llm, simple_chat
+    from . import agentic_search, ai_targets, llm, simple_chat
     sys_s = ctx.need()
     try:
-        provider = simple_chat.resolve_model_and_provider(None, sys_s)[0]
+        target = ai_targets.answer_target(sys_s)
     except simple_chat._LLMResolveError:
         raise _Ng("回答の AI の設定を解決できない（既定の AI・使えるモデルを確認）")
-    is_paid = provider == "openai"
+    is_paid = target.provider == "openai"
     if is_paid:
         try:
             url = llm.openai_url("chat/completions", system_settings=sys_s)
         except Exception:
             url = None
     else:
-        url = keys.resolve_ollama_url(None, system_settings=sys_s)
+        url = target.base
     host = host_of(url)
     route = route_for(url, "https" if is_paid else "http") if url else None
     if is_paid and not paid:
@@ -331,6 +173,9 @@ def _check_answer_ai(ctx: _Ctx, paid: bool) -> dict:
 
 
 _CODEX_TIMEOUT_S = 90
+_CODEX_TOOLS_TIMEOUT_S = 150
+_TOOLS_TURN_ID = "connectivity-check"
+_TOOLS_PROMPT = "list_docs を 1 回だけ呼び、返ってきた資料の件数（count）の数字だけを答えてください。"
 
 _CODEX_FAILURES = (
     (r"(?:sandbox-exec|bwrap):.{0,40}execvp",
@@ -359,32 +204,47 @@ def _codex_failure_reason(text: str) -> str:
     return "つながらない（Codex が応答を返さなかった）"
 
 
-def _run_codex_once(argv: list, env: dict, cwd: Path) -> tuple[int | None, str]:
+def _run_codex_once(argv: list, env: dict, cwd: Path, *, prompt: str = "OK とだけ返してください。",
+                    timeout_s: float = _CODEX_TIMEOUT_S) -> tuple[int | None, str]:
     """`codex exec` を 1 回起こして（返り値, 出力の全文）を返す。上限を超えたらプロセスグループごと止めて返り値 None。"""
     import signal
     p = subprocess.Popen(argv, env=env, cwd=str(cwd), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, start_new_session=True)
-    try:
-        out, err = p.communicate("OK とだけ返してください。", timeout=_CODEX_TIMEOUT_S)
-        return p.returncode, (out or "") + "\n" + (err or "")
-    except subprocess.TimeoutExpired:
+    def stop() -> None:
         try:
             os.killpg(p.pid, signal.SIGKILL)
         except OSError:
             pass
+    try:
+        out, err = p.communicate(prompt, timeout=timeout_s)
+        return p.returncode, (out or "") + "\n" + (err or "")
+    except subprocess.TimeoutExpired:
+        stop()
         out, err = p.communicate()
         return None, (out or "") + "\n" + (err or "")
+    except BaseException:   # 途中の例外でも、Codex とその先の道具のサーバーをプロセスグループごと残さない
+        stop()
+        p.wait()
+        raise
 
 
-def _check_codex(ctx: _Ctx, paid: bool) -> dict:
-    """回答を作る Codex CLI を、本物のターンと同じ選び方（`providers._select_provider`）・同じ env の洗い方（`sandbox._codex_clean_env`）・
-    同じ設定ファイルの書き方（`sandbox._write_codex_authoring_config`・道具なし）・同じ引数（`codex_cli.sandboxed_exec_argv`）で、最小の 1 往復を流す。
-    確認を押した管理者自身の実効の設定で流す。OpenAI 系は有料（`paid` のときだけ）。Ollama は無料で流す。
-    """
+class _CodexTarget:
+    """Codex の確認が使う、本物のターンと同じ選び方の提供元・宛先・有料か。"""
+
+    def __init__(self, provider, user_s: dict, sys_s: dict, is_paid: bool, route, host, note: str):
+        self.provider, self.user_s, self.sys_s = provider, user_s, sys_s
+        self.is_paid, self.route, self.host, self.note = is_paid, route, host, note
+
+    def ng(self, reason: str) -> _Ng:
+        return _Ng(reason, route=self.route, host=self.host, paid=self.is_paid)
+
+
+def _codex_target(ctx: _Ctx, paid: bool) -> _CodexTarget:
+    """本物のターンと同じ選び方（`providers._select_provider`）で Codex の提供元を決める。有料で `paid` でなければ「流さない」。"""
     import shutil
-    from . import agent_constructs, llm, store
+    from . import ai_targets, llm, store
     from .providers import _select_provider
-    from .providers.codex import codex_cli, sandbox
+    from .providers.codex import sandbox
     from .providers.codex.provider import CodexProvider
     sys_s = ctx.need()
     if not ctx.uid:
@@ -414,57 +274,136 @@ def _check_codex(ctx: _Ctx, paid: bool) -> dict:
         host = route = None
     if is_paid and not paid:
         raise _Skip("有料のため流していない", paid=True, route=route, host=host)
-    note = f"{agent_constructs.codex_model_provider(user_s)} / {provider.model}"
+    note = f"{ai_targets.codex_target(user_s, sys_s).provider} / {provider.model}"
+    return _CodexTarget(provider, user_s, sys_s, is_paid, route, host, note)
+
+
+class _CodexRun:
+    """Codex を 1 回起こした結果（終了コード・出力の全文・返事があったか・道具の呼び出しの記録）。出力は判定にだけ使いどこにも出さない。"""
+
+    def __init__(self, code, text: str, answered: bool, calls):
+        self.code, self.text, self.answered, self.calls = code, text, answered, calls
+
+
+def _codex_exec(target: _CodexTarget, *, tools: bool = False, prompt: str = "", timeout_s: float = 0.0) -> _CodexRun:
+    """使い捨ての作業フォルダで Codex を 1 回起こす。本物のターンと同じ洗い方の env・設定ファイルの書き方・引数。
+    `tools` が真なら本物のターンと同じ道具の登録（台帳なし・質問なし）を足し、道具の呼び出しの記録を確認専用の置き場へ向けて、終わりにまとめて返す。
+    作業フォルダは必ず消す。
+    """
+    import shutil
+    from . import tool_call_log
+    from .providers.codex import codex_cli, sandbox
+    provider = target.provider
+    base = provider._ollama_base_url
     root = Path(tempfile.mkdtemp(prefix="sherpa-codexchk-"))
     try:
         codex_home, run_dir = root / "codexhome", root / "run"
         tmp = run_dir / ".tmp"
         tmp.mkdir(parents=True)
+        calls_dir = codex_home / "toolcalls"
+        extra_env = None
+        if tools:
+            extra_env = {"SHERPA_MCP_TOOLSET": "plan", tool_call_log.ENV_DIR: str(calls_dir.resolve()),
+                         "SHERPA_MCP_TURN_ID": _TOOLS_TURN_ID}
         try:
             sandbox._write_codex_authoring_config(
-                codex_home, [], "low", False, "", None, False, True,
+                codex_home, [], "low", tools, _mcp_world() if tools else "", None, False, True,
                 ollama_base_url=base, system_settings=provider._system_settings,
-                direct_read_roots=[], orchestrator_model=provider.model)
+                direct_read_roots=[], orchestrator_model=provider.model, extra_mcp_env=extra_env)
         except Exception:
-            raise _Ng("Codex の設定を組み立てられない（接続先・キーの確かめで止まった）", route=route, host=host, paid=is_paid)
+            raise target.ng("Codex の設定を組み立てられない（接続先・キーの確かめで止まった）")
         last = tmp / "last-message.txt"
         argv = codex_cli.sandboxed_exec_argv(
             last_message_path=last, run_dir=run_dir, model=provider.model, reasoning="low",
             multi_agent=False, ephemeral=True) + ["-"]
         env = sandbox._codex_clean_env(codex_home, tmp, openai_api_key=provider._openai_api_key)
         try:
-            code, text = _run_codex_once(argv, env, run_dir)
+            if tools:
+                code, text = _run_codex_once(argv, env, run_dir, prompt=prompt, timeout_s=timeout_s)
+            else:
+                code, text = _run_codex_once(argv, env, run_dir)
         except OSError:
-            raise _Ng("Codex を起動できなかった", route=route, host=host, paid=is_paid)
-        if code is None:
-            raise _Ng("時間切れ（90 秒）", route=route, host=host, paid=is_paid)
+            raise target.ng("Codex を起動できなかった")
         try:
             answered = bool(last.read_text(encoding="utf-8").strip())
         except OSError:
             answered = False
-        if code != 0 or not answered:
-            raise _Ng(_codex_failure_reason(text), route=route, host=host, paid=is_paid)
+        calls = tool_call_log.merge_call_logs(calls_dir, _TOOLS_TURN_ID) if tools else None
+        return _CodexRun(code, text, answered, calls)
     finally:
         shutil.rmtree(root, ignore_errors=True)
-    return {"route": route, "host": host, "note": note, "paid": is_paid}
+
+
+def _check_codex(ctx: _Ctx, paid: bool) -> dict:
+    """回答を作る Codex CLI を、本物のターンと同じ起動（`_codex_exec`・道具なし）で最小の 1 往復を流す。
+    確認を押した管理者自身の実効の設定で流す。OpenAI 系は有料（`paid` のときだけ）。Ollama は無料で流す。
+    """
+    target = _codex_target(ctx, paid)
+    run = _codex_exec(target)
+    if run.code is None:
+        raise target.ng("時間切れ（90 秒）")
+    if run.code != 0 or not run.answered:
+        raise target.ng(_codex_failure_reason(run.text))
+    return {"route": target.route, "host": target.host, "note": target.note, "paid": target.is_paid}
+
+
+def _mcp_events(text: str) -> list[dict]:
+    """Codex の実行イベント（`--json` の 1 行 1 件）から、道具の呼び出し（`mcp_tool_call`）の item だけを取り出す。"""
+    out = []
+    for line in text.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        item = ev.get("item") if isinstance(ev, dict) else None
+        if isinstance(item, dict) and item.get("type") == "mcp_tool_call":
+            out.append(item)
+    return out
+
+
+def _check_codex_tools(ctx: _Ctx, paid: bool) -> dict:
+    """本物のターンと同じ道具の登録で Codex を 1 回起こし、`list_docs` を呼ばせる。呼ばれたかは返事の文でなく、
+    道具のサーバーが書く呼び出しの記録（なければ Codex の実行イベント）で判定する。
+    設計: docs/design/operations.md「システム状態とつながりの確認」
+    """
+    target = _codex_target(ctx, paid)
+    run = _codex_exec(target, tools=True, prompt=_TOOLS_PROMPT, timeout_s=_CODEX_TOOLS_TIMEOUT_S)
+    if run.code is None:
+        raise target.ng(f"時間切れ（{int(_CODEX_TOOLS_TIMEOUT_S)} 秒）")
+    rows = [r for r in run.calls.rows if r.get("tool") == "list_docs"]
+    good = [r for r in rows if r.get("status") in ("ok", "truncated")]
+    if good:
+        return {"route": target.route, "host": target.host, "note": target.note, "paid": target.is_paid}
+    if rows:
+        kind = rows[-1].get("error_kind")
+        raise target.ng("道具がエラーを返した" + (f"（{kind}）" if isinstance(kind, str) else ""))
+    if any(i.get("tool") == "list_docs" for i in _mcp_events(run.text)):
+        raise target.ng("道具のサーバーを起こせなかった、または呼び出しに失敗した（呼び出しの記録が無い）")
+    if run.code != 0 or not run.answered:
+        raise target.ng(_codex_failure_reason(run.text))
+    raise target.ng("道具を呼ばなかった（使えるモデルが道具の呼び出しに対応しているか確認）")
 
 
 _CHECKS = (
     ("postgres", "会話・ユーザーの保存先（PostgreSQL）", False, _check_postgres),
     ("elasticsearch", "全文検索（Elasticsearch）", False, _check_elasticsearch),
     ("neo4j", "つながりの検索（Neo4j）", False, _check_neo4j),
-    ("ollama", "手元の AI（Ollama）", False, _check_ollama),
     ("embed", "埋め込み（意味での検索）", None, _check_embed),
+    ("store_roundtrip_es", "全文検索に書いて引けるか", False, connectivity_roundtrip.check_es),
+    ("store_roundtrip_vector", "意味での検索に書いて引けるか", None, connectivity_roundtrip.check_vector),
+    ("store_roundtrip_graph", "つながりの検索に書いて引けるか", False, connectivity_roundtrip.check_graph),
     ("answer_ai", "回答の AI（簡易の回答）", None, _check_answer_ai),
     ("codex", "Codex（回答を作る AI の実行）", None, _check_codex),
+    ("codex_tools", "Codex から道具を呼べるか", None, _check_codex_tools),
 )
 
-# 経路ごとに流す確認。道具の子は DB の資格情報を持たない・簡易の回答は API のプロセスで動く・取り込みの係は回答の AI を使わない。
+# 経路ごとに流す確認。道具の子は DB の資格情報を持たず書き込みもしない・簡易の回答は API のプロセスで動く・取り込みの係は回答の AI を使わず、索引とグラフへ書く唯一の経路。
 _PATH_CHECKS = {
-    "api": ("postgres", "elasticsearch", "neo4j", "ollama", "embed", "answer_ai"),
-    "mcp": ("elasticsearch", "neo4j", "ollama", "embed"),
-    "ingest": ("postgres", "elasticsearch", "neo4j", "ollama", "embed"),
-    "codex": ("codex",),
+    "api": ("postgres", "elasticsearch", "neo4j", "embed", "answer_ai"),
+    "mcp": ("elasticsearch", "neo4j", "embed"),
+    "ingest": ("postgres", "elasticsearch", "neo4j", "embed",
+               "store_roundtrip_es", "store_roundtrip_vector", "store_roundtrip_graph"),
+    "codex": ("codex", "codex_tools"),
 }
 
 
@@ -482,7 +421,7 @@ def run_checks(include_paid: bool = False, *, path: str = "api", uid: str | None
     `uid` は Codex の確認が「誰の設定で流すか」（確認を押した管理者）。
     """
     ctx = _Ctx(_MCP_UNREADABLE if path == "mcp" else "設定を読めなかった（DB に届かない）")
-    ctx.uid = uid
+    ctx.uid, ctx.path = uid, path
     wanted = _PATH_CHECKS[path]
     out = []
     for cid, label, paid, fn in _CHECKS:

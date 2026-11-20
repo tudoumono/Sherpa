@@ -1,7 +1,7 @@
 """つながりの確認の「取り込みの係」の経路。取り込みの埋め込みなどはワーカーのプロセスで動くので、確認もワーカーの中で流す。
 やり取りは `log_setup.run_dir()`（ワーカーの状態ファイルと同じ置き場）の 2 つのファイル:
 API が頼み（`connectivity_request.json`）を書き、ワーカーが心拍（`_Beat`）のたびに見て、別のスレッドで確認を流して結果（`connectivity_result_ingest.json`）を書く。
-設計: docs/design/operations.md「つながりの確認」
+設計: docs/design/operations.md「システム状態とつながりの確認」
 """
 from __future__ import annotations
 

@@ -180,9 +180,8 @@ def test_admin_health_200_with_components_for_admin():
 
 
 def test_admin_health_merges_ai_snapshot_without_duplicates():
-    """UI フィードバック4（2026-07-03）: /admin/health の openai/ollama/codex は
-    health.ai_snapshot（管理者本人の設定での実接続確認）の結果に差し替わる（COMPONENTS 側の軽量
-    チェックと重複表示されない）。閉じたプロバイダ（gemini/bedrock）の行は出ない。"""
+    """/admin/health は保存先（COMPONENTS）・資料の中身（search_snapshot）・AI の用途別の軽い確認
+    （ai_snapshot＝回答の AI・Codex・埋め込み）を重複なく並べる。「Ollama」「OpenAI API キー」の行は出ない。"""
     if not _try_init():
         pytest.skip("infra down")
     original = _patch_components()
@@ -197,8 +196,9 @@ def test_admin_health_merges_ai_snapshot_without_duplicates():
         data = r.json()
         ids = [comp["id"] for comp in data["components"]]
         assert len(ids) == len(set(ids)), f"component id が重複している: {ids}"
-        assert "gemini" not in ids and "bedrock" not in ids, "閉じたプロバイダの行が出ている"
-        for expected in ("postgres", "neo4j", "elasticsearch", "openai", "ollama", "codex"):
+        assert "openai" not in ids and "ollama" not in ids, "提供元ごとの行が出ている"
+        for expected in ("postgres", "neo4j", "elasticsearch", "es_search", "graph_search",
+                         "answer_ai", "codex", "embed"):
             assert expected in ids, f"{expected} が components から消えている"
     finally:
         _restore_components(original)
@@ -222,8 +222,8 @@ def test_admin_health_includes_search_probe_rows():
         by_id = {comp["id"]: comp for comp in data["components"]}
         assert "es_search" in by_id, "es_search が components から消えている"
         assert "graph_search" in by_id, "graph_search が components から消えている"
-        assert by_id["es_search"]["label"] == "ES検索（実クエリ）"
-        assert by_id["graph_search"]["label"] == "グラフ検索（実クエリ）"
+        assert by_id["es_search"]["label"] == "全文検索（1 件読めるか）"
+        assert by_id["graph_search"]["label"] == "つながりの検索（1 件読めるか）"
         assert by_id["es_search"]["ok"] is True
         assert by_id["graph_search"]["ok"] is True
     finally:

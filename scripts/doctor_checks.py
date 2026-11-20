@@ -5,9 +5,9 @@
 
   - `sherpa.health`: `COMPONENTS`／`_check_one`（Postgres・Neo4j 疎通・例外の安全な分類）・
     `_ai_check_codex`（Codex CLI ログイン確認）をそのまま使う。OpenAI の最小プローブは
-    `health._ai_check_openai` を経由せず、`_run_raw_llm_probe()` が `graph_extract.complete_json()` を直接呼ぶ（失敗理由を
+    `health` の AI の軽い確認を経由せず、`_run_raw_llm_probe()` が `graph_extract.complete_json()` を直接呼ぶ（失敗理由を
     自由文へ変換する `_probe`／`_safe_detail` を経由すると fail-closed な構造化分類ができない
-    ため・`_classify_llm_probe_failure()` 参照）。Ollama も `_ai_check_ollama` を使わず
+    ため・`_classify_llm_probe_failure()` 参照）。Ollama も `health` の AI の軽い確認を使わず
     `sherpa.llm.urlopen_no_redirect`／`ollama_url` を直接呼ぶ＝下記参照。中央既定 URL の疎通
     だけでなく、個人の接続先上書き・用途別モデルの実在確認まで必要なため。対象は
     chat／Codex(Ollama backing)／検索ヘルパー／embed（埋め込み・`sherpa.embeddings.cfg()` が
@@ -368,7 +368,7 @@ def _fetch_system_settings_readonly() -> dict:
 
 
 def _read_active_user_configs_readonly() -> list[dict]:
-    """有効な（`users.status='active'`）利用者の `user_settings` を DDL 抜きで読む（読み取り専用
+    """有効な（`users.status='active'`）利用者の `user_settings` を DDL 抜きで読む（個人設定を保存していない利用者も未選択の行として含める・読み取り専用
     SELECT のみ・理由は `_fetch_system_settings_readonly` と同じ）。無効化済み利用者の残存設定を
     要否判定に混入させない。`user_id` は読まない（個々の利用者名は出力に使わない・件数のみ扱う）。
 
@@ -389,7 +389,7 @@ def _read_active_user_configs_readonly() -> list[dict]:
         rows = c.execute(
             "SELECT us.agent, us.codex_model_provider, us.ollama_url, "
             "(us.openai_api_key IS NOT NULL AND us.openai_api_key <> '') AS has_openai_key "
-            "FROM user_settings us JOIN users u ON u.uid = us.user_id "
+            "FROM users u LEFT JOIN user_settings us ON us.user_id = u.uid "
             "WHERE u.status = 'active'",
         ).fetchall()
     return [dict(r) for r in rows]
@@ -613,7 +613,7 @@ def _chat_or_codex_consumes(selected: str, sys_s: dict, rows: list[dict] | None)
     if _actually_routes_to(default_eff):
         return True
     if (selected == "openai" and default_eff is not _INDETERMINATE
-            and _codex_consumes_openai(default_eff, agent_constructs.codex_model_provider(None))):
+            and _codex_consumes_openai(default_eff, agent_constructs.codex_model_provider(None, system_settings=sys_s))):
         return True
     if rows is None:
         return True
@@ -626,7 +626,7 @@ def _chat_or_codex_consumes(selected: str, sys_s: dict, rows: list[dict] | None)
         if _actually_routes_to(eff):
             return True
         if (selected == "openai" and eff is not _INDETERMINATE
-                and _codex_consumes_openai(eff, agent_constructs.codex_model_provider(settings))):
+                and _codex_consumes_openai(eff, agent_constructs.codex_model_provider(settings, system_settings=sys_s))):
             return True
     return False
 
@@ -1080,7 +1080,7 @@ def _run_raw_llm_probe(provider: str, sys_s: dict, *, purpose: str = "chat") -> 
 
     `graph_extract.complete_json()` を`_probe`／`_safe_detail` を経由せず**直接**呼ぶ（`_probe` は
     失敗時に理由を自由文へ変換してから返す設計のため、そちらを経由すると生の例外が手に入らない）。
-    `complete_json` 自体は `health._ai_check_openai` が内部で使っているのと
+    `complete_json` 自体は `graph_extract._probe` が内部で使っているのと
     同じ本番関数＝挙動の重複実装ではない（cfg の組み立てだけをここで行う）。
 
     `purpose`（`model_catalog.resolve_model` の用途区分）: `check_cloud_llm_probes` は "chat"
@@ -1109,7 +1109,7 @@ def _run_raw_llm_probe(provider: str, sys_s: dict, *, purpose: str = "chat") -> 
             model = model_catalog.resolve_model(provider, purpose, None, system_settings=sys_s)
         cfg = {"provider": provider, "key": key, "model": model}
         if provider == "openai":
-            cfg["openai_endpoint_override"] = sys_s   # Azure/custom 接続先も対象にする（_ai_check_openai と同じ）
+            cfg["openai_endpoint_override"] = sys_s   # Azure/custom 接続先も対象にする（`graph_extract._probe` と同じ）
         complete_json(_LLM_PROBE_SYSTEM, _LLM_PROBE_USER, cfg, timeout=_CODEX_TIMEOUT)
         return None
     except Exception as e:
@@ -1271,7 +1271,7 @@ def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | 
     ollama_used = False    # Codex(Ollama) が1箇所でも使われているか
     try:
         eff0 = agent_constructs.effective_agent(None, system_settings=sys_s)
-        cmp0 = agent_constructs.codex_model_provider(None)
+        cmp0 = agent_constructs.codex_model_provider(None, system_settings=sys_s)
         if eff0 == "codex":
             used = True
             openai_used = openai_used or cmp0 != "ollama"
@@ -1287,7 +1287,7 @@ def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | 
             settings = {"agent": row.get("agent"), "codex_model_provider": row.get("codex_model_provider")}
             try:
                 eff = agent_constructs.effective_agent(settings, system_settings=sys_s)
-                cmp = agent_constructs.codex_model_provider(settings)
+                cmp = agent_constructs.codex_model_provider(settings, system_settings=sys_s)
             except Exception:
                 used = True
                 openai_used = True
@@ -1363,14 +1363,14 @@ def _codex_required(sys_s: dict | None, rows: list[dict] | None) -> tuple[bool, 
     backing_kinds: set[str] = set()
     try:
         if agent_constructs.effective_agent(None, system_settings=sys_s) == "codex":
-            backing_kinds.add(agent_constructs.codex_model_provider(None))
+            backing_kinds.add(agent_constructs.codex_model_provider(None, system_settings=sys_s))
     except Exception:
         return True, True, _INDETERMINATE_NOTE
     for row in rows:
         settings = {"agent": row.get("agent"), "codex_model_provider": row.get("codex_model_provider")}
         try:
             if agent_constructs.effective_agent(settings, system_settings=sys_s) == "codex":
-                backing_kinds.add(agent_constructs.codex_model_provider(settings))
+                backing_kinds.add(agent_constructs.codex_model_provider(settings, system_settings=sys_s))
         except Exception:
             return True, True, _INDETERMINATE_NOTE
     required = bool(backing_kinds)
@@ -1454,12 +1454,12 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
             url = None
         try:
             eff = agent_constructs.effective_agent(row_settings, system_settings=sys_s)
+            codex_to = agent_constructs.codex_model_provider(row_settings, system_settings=sys_s) if eff == "codex" else None
         except Exception:
-            # この利用者行が実際に簡易／Codex(Ollama) を使うか自体を判定できない＝「使っていない」
-            # に丸めず判定不能（`type_error`）にする（本 docstring 末尾の段落参照）。
+            # この利用者行が Codex(Ollama) を使うか自体を判定できない＝「使っていない」に丸めず判定不能にする。
             type_error = True
-            eff = None
-        if eff == "codex" and row.get("codex_model_provider") == "ollama":
+            codex_to = None
+        if codex_to == "ollama":
             _add(url, codex_model, "Codex(Ollama) 実行モデル")
 
     if simple_used:

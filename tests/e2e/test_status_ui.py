@@ -3,22 +3,70 @@ from __future__ import annotations
 from mock_api import install_api_mocks
 
 
-def test_status_page_shows_ai_components(page, web_base_url):
-    """UI フィードバック4（2026-07-03）: システム状態ページに AI 各プロバイダ（OpenAI/Ollama/Codex）が
-    表示される。閉じたプロバイダ（Gemini/Bedrock）の行は出ない。"""
+def test_status_page_groups_rows_by_purpose_and_shows_only_the_failing_use(page, web_base_url):
+    """システム状態ページは保存先・資料の中身・AI のまとまりで並び、AI は用途ごとの行（回答の AI・Codex・埋め込み）。
+    「Ollama」「OpenAI API キー」の行は出ない。失敗した用途にだけ対処ヒントが出る。"""
     from playwright.sync_api import expect
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/status.html")
 
     tbody = page.locator("#health-tbody")
-    expect(tbody).to_contain_text("OpenAI API")
-    expect(tbody).to_contain_text("ローカルLLM（Ollama）")
-    expect(tbody).to_contain_text("Codex CLI（AIエージェント）")
-    expect(tbody).not_to_contain_text("Gemini")
-    expect(tbody).not_to_contain_text("Bedrock")
-    # 失敗した項目には対処ヒントが出る（ollama は既定モックで接続拒否にしてある）。
-    expect(tbody).to_contain_text("接続拒否")
+    for title in ("保存先", "資料の中身", "AI"):
+        expect(tbody.locator(".group-row", has_text=title)).to_have_count(1)
+    for label in ("回答の AI（簡易の回答）", "Codex 調査", "埋め込み（意味での検索）", "全文検索（1 件読めるか）"):
+        expect(tbody).to_contain_text(label)
+    expect(tbody).not_to_contain_text("OpenAI API")
+    expect(tbody).not_to_contain_text("ローカルLLM")
+    expect(tbody.locator("tr", has_text="埋め込み（意味での検索）")).to_contain_text("埋め込み用の Ollama に届きません")
+    expect(tbody.locator("tr", has_text="回答の AI（簡易の回答）")).not_to_contain_text("届きません")
+
+
+def test_status_page_sends_nothing_on_open_and_checks_only_when_the_button_is_pressed(page, web_base_url):
+    """開いたときは軽い確認（GET /admin/health）だけが流れ、実際に送る確認（POST /admin/connectivity/check）は呼ばない。
+    ボタンを押すと呼び、経路ごとの結果を出す。有料を含める確認は確認ダイアログの後だけ。"""
+    from playwright.sync_api import expect
+
+    import json
+
+    install_api_mocks(page)
+    sent = []
+
+    def handle_check(route):
+        sent.append(json.loads(route.request.post_data))
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({"paths": [
+            {"path": "api", "label": "画面と回答の受付", "results": [
+                {"id": "answer_ai", "label": "回答の AI（簡易の回答）", "status": "skipped", "route": None,
+                 "host": None, "elapsed_ms": 0, "reason": "有料のため流していない", "paid": True}]},
+            {"path": "ingest", "label": "取り込みの係", "results": [
+                {"id": "store_roundtrip_es", "label": "全文検索に書いて引けるか", "status": "ok", "route": "直接",
+                 "host": "es.example", "elapsed_ms": 80, "reason": None, "paid": False}]}]}))
+
+    page.route("**/admin/connectivity/check", handle_check)
+    page.goto(f"{web_base_url}/status.html")
+    expect(page.locator("#health-tbody")).to_contain_text("PostgreSQL")
+    page.wait_for_timeout(300)
+    assert sent == [], "開いただけで実際に送る確認が流れている"
+
+    page.locator("#check-free-btn").click()
+    expect(page.locator("#paths")).to_contain_text("画面と回答の受付")
+    expect(page.locator("#paths")).to_contain_text("全文検索に書いて引けるか")
+    assert sent == [{"include_paid": False}]
+
+    dialogs, accept = [], {"v": False}
+
+    def on_dialog(d):
+        dialogs.append(d.message)
+        d.accept() if accept["v"] else d.dismiss()
+
+    page.on("dialog", on_dialog)
+    page.locator("#check-paid-btn").click()
+    page.wait_for_timeout(200)
+    assert dialogs and sent == [{"include_paid": False}], "取り消したのに送っている"
+    accept["v"] = True
+    page.locator("#check-paid-btn").click()
+    expect(page.locator("#send-checked-at")).to_contain_text("最終確認")
+    assert sent[-1] == {"include_paid": True}
 
 
 def test_status_recheck_button_shows_checking_state_then_result(page, web_base_url):
@@ -63,14 +111,14 @@ def test_status_recheck_button_shows_checking_state_then_result(page, web_base_u
                        "components": [
                            {"id": "postgres", "label": "PostgreSQL", "impact": "down",
                             "ok": True, "detail": None, "latency_ms": 3},
-                           {"id": "openai", "label": "OpenAI API", "impact": "none",
+                           {"id": "answer_ai", "label": "回答の AI（簡易の回答）", "impact": "none",
                             "ok": True, "detail": None, "latency_ms": 150},
                        ]})
     pending["route"].fulfill(status=200, content_type="application/json", body=body)
 
     expect(btn).not_to_be_disabled()
     expect(btn).to_have_text("再チェック")
-    expect(page.locator("#health-tbody")).to_contain_text("OpenAI API")
+    expect(page.locator("#health-tbody")).to_contain_text("回答の AI（簡易の回答）")
 
 
 def test_status_polling_pauses_when_hidden_and_resumes_once_visible(page, web_base_url):

@@ -152,7 +152,6 @@ class CloudInfo(BaseModel):
     # 保存済みの `cloud_provider` が閉じたプロバイダ（gemini/bedrock）のときだけその名前。それ以外は null
     retired_provider: str | None
     personal_keys_in_use_count: int
-    # Codex の Web 検索を管理者が許可しているか（既定 false）
     web_search_allowed: bool
 
 
@@ -164,7 +163,7 @@ class ExtKeysDailyQuotaDefaultInfo(BaseModel):
 
 
 class ExtKeysResearchProviderInfo(BaseModel):
-    """外部からの簡易回答（POST /ext/v1/answer）の既定 AI（`configured`=管理者の生値・`effective`=実際に適用される値・`default`=組み込みの既定値）。"""
+    """既定の提供元の設定（簡易回答の AI・Codex 調査の接続先）。`configured`=管理者の生値・`effective`=実際に適用される値・`default`=組み込みの既定値（Codex の接続先は自動選択＝"auto"）。"""
     configured: str | None
     effective: str
     default: str
@@ -176,6 +175,7 @@ class ExtKeysAdminInfo(BaseModel):
     self_issued_active_count: int
     daily_quota_default: ExtKeysDailyQuotaDefaultInfo
     research_default_provider: ExtKeysResearchProviderInfo
+    codex_default_model_provider: ExtKeysResearchProviderInfo
 
 
 # ---- 外部連携 API キー管理（POST/GET/DELETE /ext/v1/admin/keys・POST/GET/DELETE /ext/v1/keys で共通の形） ----

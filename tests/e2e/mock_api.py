@@ -703,16 +703,16 @@ _HEALTH_COMPONENTS_DEFAULT = [
      "ok": True, "detail": None, "latency_ms": 6},
     {"id": "elasticsearch", "label": "Elasticsearch（全文検索）", "impact": "degraded",
      "ok": True, "detail": None, "latency_ms": 5},
-    {"id": "openai", "label": "OpenAI API", "impact": "none", "ok": True, "detail": None, "latency_ms": 320},
-    {"id": "ollama", "label": "ローカルLLM（Ollama）", "impact": "none", "ok": False,
-     "detail": "接続拒否（サービス停止の可能性）（URLError）", "latency_ms": 50,
-     "hint": "ollama serve の起動を確認してください（使わない構成なら対応不要）"},
-    {"id": "codex", "label": "Codex CLI（AIエージェント）", "impact": "none", "ok": True,
-     "detail": None, "latency_ms": 900},
-    {"id": "es_search", "label": "ES検索（実クエリ）", "impact": "none", "ok": True,
+    {"id": "es_search", "label": "全文検索（1 件読めるか）", "impact": "none", "ok": True,
      "detail": "ヒットあり", "latency_ms": 40},
-    {"id": "graph_search", "label": "グラフ検索（実クエリ）", "impact": "none", "ok": True,
+    {"id": "graph_search", "label": "つながりの検索（1 件読めるか）", "impact": "none", "ok": True,
      "detail": "ヒットあり", "latency_ms": 60},
+    {"id": "answer_ai", "label": "回答の AI（簡易の回答）", "impact": "none", "ok": True,
+     "detail": None, "latency_ms": 20},
+    {"id": "codex", "label": "Codex 調査", "impact": "none", "ok": True, "detail": None, "latency_ms": 900},
+    {"id": "embed", "label": "埋め込み（意味での検索）", "impact": "none", "ok": False,
+     "detail": "埋め込み用の Ollama に届きません（接続拒否（サービス停止の可能性））", "latency_ms": 50,
+     "hint": "埋め込みの接続先とモデル（またはキー）を確認してください（使わない構成なら対応不要）"},
 ]
 
 # バッチ3（2026-07-03）: GET /admin/usage/stats の既定応答（「利用の傾向」全指標を含む）。
@@ -1012,7 +1012,7 @@ SYSTEM_SETTINGS_VIEW = {
     "ext_keys": {"user_api_keys_allowed": False, "self_issued_active_count": 0,
                 "daily_quota_default": {"configured": None, "effective": 100, "default": 100},
                 "research_default_provider": {"configured": None, "effective": "ollama",
-                                              "default": "ollama"}},
+                                              "default": "ollama"}, "codex_default_model_provider": {"configured": None, "effective": "ollama", "default": "auto"}},
     # SET-2c: OpenAI 互換 API の接続先（本家／Azure OpenAI／その他 OpenAI 互換）。既定は本家・未設定。
     "openai_endpoint": {
         "configured": {"kind": None, "base_url": None, "auth_header": None, "api_version": None},

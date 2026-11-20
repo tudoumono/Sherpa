@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
-from sherpa import agent_constructs, chat_examples, keys, llm, model_catalog, required_tools, store
+from sherpa import agent_constructs, ai_targets, chat_examples, keys, llm, model_catalog, required_tools, store
 from sherpa.agents import (
     AGENT_PROVIDERS,
     _web_search_admin_allowed,
@@ -173,12 +173,11 @@ def _codex_ollama_probe(s: dict, sys_s: dict, model: str | None) -> dict:
                 "detail": "設定のローカルAIの接続先が許可されていません。設定画面で確認してください"}
     try:
         with llm.urlopen_no_redirect(llm.ollama_url(base, "/api/tags"), timeout=10) as r:
-            names = {m.get("name") for m in (_json.loads(r.read()).get("models") or [])
-                     if isinstance(m, dict)}
+            names = ai_targets.installed_names(_json.loads(r.read()))
     except Exception as e:
         return {"ok": False, "provider": "codex", "model": model,
                 "detail": f"ローカルAI（Ollama）に接続できません（{type(e).__name__}）"}
-    if model and model not in names and f"{model}:latest" not in names:
+    if not ai_targets.model_installed(model, names):
         return {"ok": False, "provider": "codex", "model": model,
                 "detail": f"ローカルAI（Ollama）にモデル {model} がありません（ollama pull で取得してください）"}
     return {"ok": True, "provider": "codex", "model": model,
@@ -324,7 +323,7 @@ def settings_test(req: TestReq, request: Request):
         from sherpa import llm as _llm
         # 実行時（`_select_provider`）と同じ共通 resolver（`agent_constructs.codex_model_provider`）を通す。
         try:
-            codex_provider_choice = agent_constructs.codex_model_provider(s)
+            codex_provider_choice = agent_constructs.codex_model_provider(s, system_settings=sys_s)
         except agent_constructs.InvalidCodexModelProviderError as e:
             return {"ok": False, "provider": "codex", "model": model, "detail": str(e)}
         # Ollama 分岐を先に見る（`_select_provider` と同じ順序）。先に `openai_endpoint_kind` を評価すると、OpenAI 系設定の型破損で ValueError になり接続テストが偽陰性になる。

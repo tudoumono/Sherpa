@@ -68,7 +68,7 @@ def update_settings(user_id="admin", **fields) -> dict:
     merged = {**cur, **upd}
     # `agent` は明示された値（今回の `fields` に含まれる、または既存行にある）だけを保存する。選ばれていなければ空文字 `''` のままにして、解決済みの頭脳名を DB へ焼き付けない（読み出し側が `default_agent()` で都度解決する）。
     merged["agent"] = merged["agent"] or ""  # 列は NOT NULL（未設定は空文字＝読み出し時に自動選択）。
-    merged["codex_model_provider"] = merged["codex_model_provider"] or ""  # 列は NOT NULL（''＝未設定＝openai）。
+    merged["codex_model_provider"] = merged["codex_model_provider"] or ""  # 列は NOT NULL（''＝未選択）。
     # 列は NOT NULL（''＝未設定＝`keys.resolve_ollama_url` が中央既定/組み込み既定へ解決する）。
     merged["ollama_url"] = merged["ollama_url"] or ""
     # 個人キー列は、この呼び出しの `fields` に明示的に含まれていた（クリアの "" も含む）列だけを触れた列として扱い、触れていない列は SET から除外する。SQL に埋め込む列名は固定タプルの静的文字列のみ。

@@ -102,7 +102,7 @@ _KNOWN_SINK_MODULES = {
     "embeddings.py": "embeddings（ES kNN 用ベクトル埋め込み）",
     "simple_chat.py": "simple_chat._resolve_llm（簡易の AI の接続先）",
     "ingest/graph_extract.py": "graph_extract.complete_json（intent_llm.classify も再利用）",
-    "health.py": "health（状態ドット／AI 再チェック）",
+    "ai_targets.py": "ai_targets（状態の軽い確認・接続テストが共有する Ollama の読み取り）",
     "ingest/arms/vision_arm.py": "vision_arm（VLM 画像読取）",
 }
 
@@ -200,20 +200,24 @@ def test_select_provider_wires_same_system_settings_object_into_simple_provider(
     assert captured[0] is sentinel, "入口で読んだ system_settings と別オブジェクトが渡された"
 
 
-def test_health_ping_ollama_degrades_without_network_for_malformed_central_url(monkeypatch, _no_network_by_default):
-    """DB に不正な中央設定が残っていても `_ping_ollama` は通信せず ok=False に倒れる（多層防御）。"""
-    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"ollama_url": "not a url"})
-    out = health._check_one("ollama", "ローカルLLM（Ollama）", "none", health._ping_ollama, "hint")
+_OLLAMA_ANSWER = {"research_default_provider": "ollama", "model_catalog": {
+    "ollama": {"subsearch": {"allowed": ["chat-sample:8b"], "default": "chat-sample:8b"}}}}
+
+
+def test_health_answer_check_degrades_without_network_for_malformed_central_url(monkeypatch, _no_network_by_default):
+    """DB に不正な中央設定が残っていても、回答の AI の軽い確認は通信せず ok=False に倒れる（多層防御）。"""
+    sys_s = {**_OLLAMA_ANSWER, "ollama_url": "not a url"}
+    out = health._check_one_ai("answer_ai", "回答の AI", "none", lambda: health._ai_check_answer({}, sys_s), "hint")
     assert out["ok"] is False
     assert _no_network_by_default.calls == []
 
 
-def test_health_ai_check_ollama_degrades_without_network_for_unlisted_url(monkeypatch, _no_network_by_default):
-    """per-user 設定の `_ai_check_ollama` は env の暗黙 allowlist を持たず、未登録の接続先は ok=False。"""
+def test_health_codex_check_degrades_without_network_for_unlisted_url(monkeypatch, _no_network_by_default):
+    """個人設定の Ollama の接続先は env の暗黙 allowlist を持たず、未登録の接続先は ok=False（Codex の行）。"""
     monkeypatch.delenv("OLLAMA_URL", raising=False)
-    settings = {"ollama_url": _UNLISTED_LAN}
-    out = health._check_one("ollama", "ローカルLLM（Ollama）", "none",
-                            lambda: health._ai_check_ollama(settings), "hint")
+    monkeypatch.setattr(health.shutil, "which", lambda _: "/usr/bin/codex")
+    settings = {"codex_model_provider": "ollama", "ollama_url": _UNLISTED_LAN}
+    out = health._check_one_ai("codex", "Codex 調査", "none", lambda: health._ai_check_codex(settings, {}), "hint")
     assert out["ok"] is False
     assert _no_network_by_default.calls == []
 

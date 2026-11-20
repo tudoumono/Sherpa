@@ -60,6 +60,42 @@ function renderResearchDefaultProvider(rdp) {
   _extKeysResearchProviderBaseline = rdpKnown ? rdp.effective : _RESEARCH_PROVIDER_INVALID;
 }
 
+// Codex 調査の既定の接続先（自動／openai／ollama）。保存値がどれでもない場合は、select の一時的な選択肢とヒントでその旨を示す。
+function renderCodexDefaultProvider(cdp) {
+  cdp = cdp || {};
+  const configured = cdp.configured == null ? '' : String(cdp.configured);
+  const known = configured === '' || configured === 'openai' || configured === 'ollama';
+  const sel = $('ext-codex-default-provider');
+  if (sel) {
+    let invalidOpt = sel.querySelector(`option[value="${_RESEARCH_PROVIDER_INVALID}"]`);
+    if (!known) {
+      if (!invalidOpt) {
+        invalidOpt = document.createElement('option');
+        invalidOpt.value = _RESEARCH_PROVIDER_INVALID;
+        sel.insertBefore(invalidOpt, sel.firstChild);
+      }
+      invalidOpt.textContent = configured;
+      sel.value = _RESEARCH_PROVIDER_INVALID;
+    } else {
+      if (invalidOpt) invalidOpt.remove();
+      sel.value = configured;
+    }
+  }
+  const hint = $('ext-codex-default-provider-hint');
+  const invalid = $('ext-codex-default-provider-invalid');
+  if (invalid) {
+    invalid.hidden = known;
+    if (!known) invalid.textContent = '保存されている値が正しくありません。自動・OpenAI・Ollama のどれかを選び直して保存してください。';
+  }
+  if (hint) {
+    const label = (v) => (v === 'openai' ? 'OpenAI' : 'Ollama');
+    if (!known) hint.textContent = '';
+    else if (configured) hint.textContent = `${label(configured)} で固定中です。`;
+    else hint.textContent = `自動で決めています（今は ${label(cdp.effective)}）。`;
+  }
+  _extKeysCodexProviderBaseline = known ? configured : _RESEARCH_PROVIDER_INVALID;
+}
+
 function extKeyStatus(row) {
   if (row.revoked_at) return { cls: 'ek-revoked', label: '失効済み' };
   if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) {

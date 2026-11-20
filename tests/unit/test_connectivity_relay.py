@@ -31,7 +31,6 @@ def boundaries(monkeypatch):
     monkeypatch.setattr(store, "get_system_settings", lambda **k: dict(sys_s))
     monkeypatch.setattr(health, "_ping_postgres", lambda: None)
     monkeypatch.setattr(health, "_ping_neo4j", lambda: None)
-    monkeypatch.setattr(health, "ollama_in_use", lambda s, rows=None: False)
     monkeypatch.setattr(llm, "assert_openai_io_allowed", lambda: None)
     monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
     monkeypatch.setenv("ES_URL", "http://localhost:9200")
@@ -117,8 +116,10 @@ def test_ingest_path_runs_embed_but_not_answer_ai_and_free_run_sends_nothing(run
         worker.poll(); _drain(worker)
     rows = relay.request_and_wait(False, wait_s=30, sleep=sleep)
     by_id = {x["id"]: x for x in rows}
-    assert set(by_id) == {"postgres", "elasticsearch", "neo4j", "ollama", "embed"}
+    assert set(by_id) == {"postgres", "elasticsearch", "neo4j", "embed",
+                          "store_roundtrip_es", "store_roundtrip_vector", "store_roundtrip_graph"}
     assert by_id["embed"]["status"] == "skipped" and by_id["embed"]["paid"] is True
+    assert by_id["store_roundtrip_vector"]["status"] == "skipped" and by_id["store_roundtrip_vector"]["paid"] is True
     assert by_id["elasticsearch"]["status"] == "ng"
     assert boundaries == []
 
@@ -128,7 +129,7 @@ def test_ingest_path_paid_run_embeds_with_the_workers_embedding(run_dir, boundar
     worker = relay.Relay()
     rows = relay.request_and_wait(True, wait_s=30, sleep=lambda s: (worker.poll(), _drain(worker)))
     assert {x["id"]: x for x in rows}["embed"]["status"] == "ng"
-    assert boundaries == ["embed"]
+    assert boundaries == ["embed", "embed"]   # 埋め込みの確認と、書いて引けるかの確認（意味での検索）の 2 回
     assert KEY not in json.dumps(rows)
 
 
@@ -175,9 +176,11 @@ def test_codex_check_launches_like_a_real_turn(tmp_path, monkeypatch, boundaries
 
     monkeypatch.setattr(store, "get_settings", lambda uid="admin": {"agent": "simple", "codex_model_provider": "openai"})
     monkeypatch.setattr("sherpa.keys.selected_cloud_provider", lambda *a, **k: "openai")
-    (row,) = connectivity.run_checks(True, path="codex", uid="adm")
+    rows = {x["id"]: x for x in connectivity.run_checks(True, path="codex", uid="adm")}
+    row = rows["codex"]
     assert row["status"] == "ok" and row["paid"] is True, row
-    chk = json.loads(rec.read_text().splitlines()[-1])
+    chk, tools = (json.loads(x) for x in rec.read_text().splitlines()[-2:])
+    assert rows["codex_tools"]["status"] == "ng" and "道具を呼ばなかった" in rows["codex_tools"]["reason"]
 
     head = ["exec", "--json", "--strict-config", "--skip-git-repo-check", "-o", "<v>", "-C", "<v>", "-m", "<v>",
             "-c", "model_reasoning_effort=<v>", "-c", "features.multi_agent=<v>", "--ephemeral"]
@@ -189,6 +192,11 @@ def test_codex_check_launches_like_a_real_turn(tmp_path, monkeypatch, boundaries
     assert 'default_permissions = "sherpa-authoring"' in turn["config"]
     assert not os.path.exists(chk["cwd"])
     assert KEY not in json.dumps(row)
+    assert _shape(tools["argv"]) == head + ["-"] and set(tools["env_keys"]) == set(chk["env_keys"])
+    assert "[mcp_servers.sherpa]" in tools["config"] and '"plan"' in tools["config"]
+    assert "SHERPA_MCP_CALL_LOG_DIR" in tools["config"] and "SHERPA_MCP_LEDGER_DIR" not in tools["config"]
+    assert "SHERPA_MCP_SIDECAR" not in tools["config"] and "SHERPA_MCP_ASK_DISABLED" in tools["config"]
+    assert not os.path.exists(tools["cwd"])
 
 
 def test_restarted_or_second_worker_does_not_run_a_claimed_request_again(run_dir, monkeypatch):

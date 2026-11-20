@@ -1,5 +1,5 @@
-"""管理者の「つながりの確認」（`POST /admin/connectivity/check`）。確認の中身は `sherpa/connectivity.py`。`sherpa.api` を import しない。
-設計: docs/design/operations.md「つながりの確認」
+"""管理者の「実際に送って確かめる」確認（システム状態画面・`POST /admin/connectivity/check`）。確認の中身は `sherpa/connectivity.py`。`sherpa.api` を import しない。
+設計: docs/design/operations.md「システム状態とつながりの確認」
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from sherpa import connectivity, store
+from sherpa import connectivity, connectivity_tools, store
 from sherpa.deps import _current_user, _require_admin
 from sherpa.ingest import connectivity_relay
 
@@ -40,7 +40,7 @@ class ConnectivityPath(BaseModel):
 
 
 class ConnectivityCheckResponse(BaseModel):
-    """つながりの確認の結果（POST /admin/connectivity/check）。"""
+    """実際に送る確認の結果（POST /admin/connectivity/check）。"""
     paths: list[ConnectivityPath]
 
 
@@ -56,7 +56,7 @@ def admin_connectivity_check(req: ConnectivityCheckRequest, request: Request):
     u = _current_user(request)
     _require_admin(u)
     if not _running.acquire(blocking=False):
-        raise HTTPException(409, "つながりの確認が実行中です。終わってからもう一度お試しください")
+        raise HTTPException(409, "実際に送る確認が実行中です。終わってからもう一度お試しください")
     try:
         if req.include_paid:
             try:
@@ -65,12 +65,14 @@ def admin_connectivity_check(req: ConnectivityCheckRequest, request: Request):
             except Exception:
                 _log.critical("audit write failed for admin.connectivity_check_paid – fail-closed")
                 raise HTTPException(500, "監査ログの記録に失敗しました（fail-closed）")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:  # 4 つの経路を同時に流す
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:  # 4 つの経路と、道具のサーバーへの直接の確認を同時に流す
             child = pool.submit(connectivity.run_mcp_child, req.include_paid)
             ingest = pool.submit(connectivity_relay.request_and_wait, req.include_paid)
             codex = pool.submit(connectivity.run_checks, req.include_paid, path="codex", uid=u["uid"])
+            tools = pool.submit(connectivity_tools.run_server_checks)
             api_rows = connectivity.run_checks(req.include_paid)
-            mcp_rows, ingest_rows, codex_rows = child.result(), ingest.result(), codex.result()
+            mcp_rows = child.result() + tools.result()
+            ingest_rows, codex_rows = ingest.result(), codex.result()
         return {"paths": [
             {"path": "api", "label": "画面と回答の受付", "results": api_rows},
             {"path": "mcp", "label": "調べものの道具（Codex から呼ぶ）", "results": mcp_rows},

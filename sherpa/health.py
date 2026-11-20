@@ -1,7 +1,8 @@
 """バックエンド健全性チェック（ナビの状態ドット＋管理者のシステム状態画面）。
 
 - 各コンポーネントを短いタイムアウトで ping し、結果を TTL キャッシュ（既定 15 秒）する。
-- 全体 status は落ちたときの影響を集約する: Postgres → down／Neo4j・Elasticsearch → degraded／Codex・OpenAI・Ollama → 影響なし（参考情報のみ）。
+- 全体 status は落ちたときの影響を集約する: Postgres → down／Neo4j・Elasticsearch → degraded／AI（回答の AI・Codex・埋め込み）→ 影響なし（参考情報のみ）。
+- 軽い確認だけを流す（届くか・モデルが取得済みか・キーがあるか・1 件読めるか）。AI への送信も書き込みもしない。実際に送る確認は `connectivity`。
 設計: docs/design/operations.md「起動・停止・状態」
 """
 from __future__ import annotations
@@ -18,7 +19,7 @@ import time
 import urllib.error
 import urllib.request
 
-from . import keys  # トップレベル import 安全（keys.py はモジュールレベルで sherpa 内を import しない）
+from . import agent_constructs, ai_targets, embeddings, keys, llm  # keys.py はモジュールレベルで sherpa 内を import しない
 
 _TTL = 15.0
 # 既定は短めに固定する（不達時に lock 内で直列 ping する全コンポーネント分の待ち時間上限になるため）
@@ -59,19 +60,6 @@ def _ping_es() -> None:
         json.loads(r.read())
 
 
-def _ping_codex() -> None:
-    if not shutil.which("codex"):
-        raise RuntimeError("codex CLI が見つかりません")
-
-
-def _ping_openai() -> None:
-    # 判定は `agent_constructs.is_real_api_key` に揃え、キーは `sherpa.keys.resolve_api_key`（中央設定）経由で読む
-    from . import agent_constructs, keys
-    key = keys.resolve_api_key("openai", None, strict=True)
-    if not agent_constructs.is_real_api_key(key):
-        raise RuntimeError("OpenAI の API キーが未設定です（管理画面で設定してください）")
-
-
 class _NotApplicable(RuntimeError):
     """「対象外（未設定/未選択）」の申告用。`_check_one` はこれを ok=True・detail「対象外（…）」・DEBUG ログとして扱う（失敗とは区別する）。"""
 
@@ -80,155 +68,11 @@ class _NotInUse(_NotApplicable):
     """Ollama を使わない構成の申告（`_check_one` は対象外と同じ扱いでログも出さない）。"""
 
 
-class _OllamaEmbedModelMissing(RuntimeError):
-    """埋め込みが Ollama 構成に解決されているのに、その埋め込みモデルが Ollama 未取得。`_classify()` が案内文をそのまま使う。"""
-
-    def __init__(self, model: str):
-        self.model = model
-        super().__init__(model)
-
-
-class _OllamaEmbedUnreachable(RuntimeError):
-    """埋め込み用の Ollama の接続先（中央と別）に届かない。`_classify()` が理由つきの案内文にする。"""
-
-    def __init__(self, cause: BaseException):
-        self.cause = cause
-        super().__init__("embed ollama unreachable")
-
-
-def _active_user_codex_rows() -> list[dict]:
-    """有効な利用者の `agent`・`codex_model_provider`（Ollama 利用の判定用・読み取りのみ）。"""
-    from .store.db import _connect
-    # 短い期限つきの直接接続（プールを待たない）。読めない・時間切れは呼び出し側が「使っている」に倒す
-    with _connect(connect_timeout=2, options="-c statement_timeout=2000") as c:
-        rows = c.execute(
-            "SELECT us.agent, us.codex_model_provider FROM user_settings us "
-            "JOIN users u ON u.uid = us.user_id WHERE u.status = 'active'").fetchall()
-    return [dict(r) for r in rows]
-
-
-def ollama_in_use(system_settings: dict, user_rows: list[dict] | None = None) -> bool:
-    """Ollama を使う構成か（定期点検・取り込みの警告を出すかの判定）。判定できないときは使っている側に倒す。
-
-    次のどれかが Ollama なら使っている:
-    ① 回答の AI（クラウド未選択で OpenAI のキーも無く Ollama に解決される構成）・簡易の既定 AI（明示 ollama のときだけ）
-    ② Codex（`--oss`）＝実効の頭脳が codex で `codex_model_provider` が ollama の有効な利用者がいる
-    ③ 埋め込み（`embed_provider` が ollama、または auto で Ollama に解決される構成・`SHERPA_DISABLE_EMBED` のときは除く）
-    ④ 画像を読む AI＝vision アームが有効で VLM の provider が ollama
-    """
-    from . import agent_constructs, llm
-    from .ingest.arms import enabled_arm_names, vision_arm
-    try:
-        if llm.resolve_auto_provider(None, system_settings=system_settings) == "ollama":
-            return True
-        from . import embeddings
-        simple = (system_settings or {}).get("research_default_provider")
-        if simple == "ollama":
-            return True  # 簡易の既定に Ollama を明示している（未設定は使っていない扱い）
-        if not os.environ.get("SHERPA_DISABLE_EMBED") and \
-                embeddings.effective_embed_provider(system_settings) == "ollama":
-            return True
-        if "vision" in enabled_arm_names() and vision_arm.vlm_config()["provider"] == "ollama":
-            return True
-        rows = user_rows if user_rows is not None else _active_user_codex_rows()
-        for row in rows:
-            if row.get("codex_model_provider") != "ollama":
-                continue
-            if agent_constructs.effective_agent(row, system_settings=system_settings) == "codex":
-                return True
-    except Exception:
-        return True
-    return False
-
-
-def _ping_ollama() -> None:
-    # 接続先は `llm.ollama_url` 経由で組み立て（SSRF 宛先ポリシーを通す）、送信は `llm.urlopen_no_redirect`。
-    # ブロック時の `SsrfBlocked` は `_check_one` の broad except に乗る。env `OLLAMA_URL` は直接読まない
-    from . import keys, llm, store
-    sys_s = store.get_system_settings()
-    if not ollama_in_use(sys_s):
-        raise _NotInUse("使っていません")
-    configured = bool(sys_s.get("ollama_url"))  # 中央設定に接続先があるか（既定 localhost は「未設定」扱い）
-    base = keys.resolve_ollama_url(None, system_settings=sys_s)
-    embed_base = keys.resolve_ollama_url(None, system_settings=sys_s, purpose="embed")
-    separate = embed_base.rstrip("/") != base.rstrip("/") and _embed_uses_ollama(sys_s)
-    embed_err: Exception | None = None
-    if separate:
-        try:
-            with llm.urlopen_no_redirect(llm.ollama_url(embed_base, "/api/tags"), timeout=_TIMEOUT) as r:
-                _check_ollama_embed_model(json.loads(r.read()), sys_s)
-        except _OllamaEmbedModelMissing:
-            raise
-        except Exception as e:
-            embed_err = e
-    try:
-        with llm.urlopen_no_redirect(llm.ollama_url(base, "/api/tags"), timeout=_TIMEOUT) as r:
-            data = json.loads(r.read())
-    except Exception as e:
-        if embed_err is not None:
-            raise _OllamaEmbedUnreachable(embed_err) from e  # 中央も届かない
-        if not configured:
-            # 接続先を設定していない環境で既定の localhost に応答が無いのは正常＝対象外。設定済みで落ちていれば失敗
-            raise _NotApplicable(f"接続先が未設定（既定 {base} にも応答なし）") from e
-        raise
-    if embed_err is not None:
-        raise _OllamaEmbedUnreachable(embed_err) from embed_err
-    if not separate:
-        _check_ollama_embed_model(data, sys_s)
-
-
-def _embed_uses_ollama(sys_s: dict) -> bool:
-    """埋め込みが Ollama に解決される構成か（`SHERPA_DISABLE_EMBED` のときは偽）。"""
-    from . import embeddings
-    if os.environ.get("SHERPA_DISABLE_EMBED"):
-        return False
-    try:
-        ec = embeddings.cfg(None, system_settings=sys_s, probe=False)
-    except Exception:
-        return False
-    return bool(ec) and ec.get("provider") == "ollama"
-
-
-def _check_ollama_embed_model(tags_response: object, sys_s: dict) -> None:
-    """`/api/tags` の応答から、埋め込みが Ollama 構成に解決されている場合だけ、その埋め込みモデルが導入済みかを確認する。
-
-    未取得のままだとベクトル検索が BM25 のみへ縮退する。タグ無し参照は `:latest` とみなす。
-    """
-    from . import embeddings
-    try:
-        ec = embeddings.cfg(None, system_settings=sys_s, probe=False)  # モデルの有無だけ見る（次元は測らない）
-    except Exception:
-        return
-    if not ec or ec.get("provider") != "ollama":
-        return
-    model = ec.get("model")
-    if not isinstance(model, str) or not model:
-        return
-    names: set[str] = set()
-    if isinstance(tags_response, dict):
-        raw_models = tags_response.get("models")
-        if isinstance(raw_models, list):
-            for entry in raw_models:
-                name = entry.get("name") if isinstance(entry, dict) else None
-                if isinstance(name, str) and name:
-                    names.add(name)
-    wanted = model if ":" in model else f"{model}:latest"
-    if wanted not in names:
-        raise _OllamaEmbedModelMissing(model)
-
-
 # (id, 表示名, 落ちたときの全体への影響, ping, 対処ヒント)
 COMPONENTS = [
     ("postgres", "PostgreSQL（会話・ユーザー・台帳）", "down", _ping_postgres, _STORE_HINT),
     ("neo4j", "Neo4j（ナレッジグラフ・影響分析）", "degraded", _ping_neo4j, _STORE_HINT),
     ("elasticsearch", "Elasticsearch（全文検索）", "degraded", _ping_es, _STORE_HINT),
-    ("codex", "Codex CLI（AIエージェント）", "none", _ping_codex,
-     "codex CLI の導入とログインを確認してください（使わない構成なら対応不要）"),
-    # ヒントは env でなく管理画面へ誘導する（`keys.NO_CENTRAL_KEY_MESSAGE` を共有）
-    ("openai", "OpenAI API キー", "none", _ping_openai,
-     keys.NO_CENTRAL_KEY_MESSAGE + "（Codex/ローカルLLM 利用なら対応不要）"),
-    ("ollama", "ローカルLLM（Ollama）", "none", _ping_ollama,
-     "ollama serve の起動を確認してください（使わない構成なら対応不要）"),
 ]
 
 _lock = threading.Lock()
@@ -239,11 +83,6 @@ def _classify(e: BaseException) -> str:
     """例外を短い日本語分類に正規化する。接続情報が `str(e)` に含まれうるため、生の例外文字列は出さず分類ラベルのみ返す。
     `URLError` の `__cause__` / `reason` も1段見る。
     """
-    if isinstance(e, _OllamaEmbedUnreachable):
-        return f"埋め込み用の Ollama に届きません（{_classify(e.cause)}）。管理画面の「埋め込み用の Ollama の接続先」を確かめてください"
-    if isinstance(e, _OllamaEmbedModelMissing):
-        return (f"埋め込みモデル {e.model} が Ollama にありません（ollama pull {e.model}）。"
-                "このままではベクトル検索が使えずキーワード検索だけになります")
     for c in (e, getattr(e, "__cause__", None), getattr(e, "reason", None)):
         if c is None:
             continue
@@ -338,98 +177,106 @@ def summary(force: bool = False) -> dict:
     return {"status": s["status"], "checked_at": s["checked_at"]}
 
 
-# ---- 管理者の「システム状態」画面専用（AI・実接続確認） ----
-# 上の `_ping_*` は状態ドット向けの軽量チェック（実際には AI へ繋がない）。ここは管理者の「再チェック」専用に、
-# 管理者本人の設定（user_settings）も含めて実際に1回だけ AI へ接続する。状態ドット（summary/snapshot）には混ぜず、
-# per-uid の別キャッシュ（既定60秒）で実 API 呼び出しの連発を防ぐ。
+# ---- 管理者の「システム状態」画面専用（AI の軽い確認） ----
+# 用途ごと（回答の AI・Codex・埋め込み）が実際に使う接続先・モデル・キーだけを見る。AI へは送らない。
+# 管理者本人の設定（user_settings）も含めて見るので、状態ドット（summary/snapshot）には混ぜず、per-uid の別キャッシュ（既定60秒）に持つ。
 _AI_TTL = 60.0
-# 各プローブは短いタイムアウトを明示で渡し、`ai_snapshot()` が全プローブを並列実行＋全体 deadline で打ち切る（再チェックの応答性を優先）
+# 各確認は短いタイムアウトを明示で渡し、`ai_snapshot()` が全プローブを並列実行＋全体 deadline で打ち切る（再チェックの応答性を優先）
 _AI_TIMEOUT = float(os.environ.get("SHERPA_HEALTH_AI_TIMEOUT", "8"))
 _AI_DEADLINE = _AI_TIMEOUT + 4.0  # 並列実行のスケジューリング余裕
 _ai_lock = threading.Lock()
 _ai_cache: dict = {}  # uid -> {"at": float, "data": [components]}
 
 
-def _ai_check_openai(settings: dict, system_settings: dict | None = None) -> None:
-    from . import agent_constructs, keys, model_catalog
-    from .ingest.graph_extract import _probe
-    # strict=True: 実 API 呼び出し（課金）を伴うため、不正な `cloud_provider` のとき既定（openai）へ倒れたキーで実送信しない
+def _tags_or_raise(base: str, system_settings: dict, what: str) -> dict:
+    """Ollama の取得済みモデルの一覧を読む。届かなければ用途名つきの理由で失敗にする（接続情報は出さない）。"""
+    try:
+        return ai_targets.fetch_tags(base, _AI_TIMEOUT, system_settings=system_settings)
+    except Exception as e:
+        raise RuntimeError(f"{what}の Ollama に届きません（{_classify(e)}）") from None
+
+
+def _need_model(model: str | None, tags: dict, what: str) -> None:
+    if not ai_targets.model_installed(model, ai_targets.installed_names(tags)):
+        raise RuntimeError(f"{what}に使うモデル {model} が Ollama にありません（ollama pull {model} で取得してください）")
+
+
+def _need_openai_key(settings: dict | None, system_settings: dict) -> None:
     key = keys.resolve_api_key("openai", settings, system_settings=system_settings, strict=True)
-    # プレースホルダのままのキーは実 API 呼び出しへ進まず、正直な文言で早期に返す
     if not agent_constructs.is_real_api_key(key):
         raise RuntimeError(keys.NO_CENTRAL_KEY_MESSAGE)
-    model = model_catalog.resolve_model("openai", "chat", None, system_settings=system_settings)
-    # キー・モデル・接続先は `ai_snapshot()` が入口で読んだ同じ `system_settings` で揃える
-    ok, detail = _probe({"provider": "openai", "key": key, "model": model,
-                         "openai_endpoint_override": system_settings}, timeout=_AI_TIMEOUT)
-    if not ok:
-        raise RuntimeError(detail or "接続に失敗しました")
 
 
-def _ai_check_ollama(settings: dict, system_settings: dict | None = None) -> None:
-    # 接続先は `llm.ollama_url` 経由で構築し、送信は `llm.urlopen_no_redirect`。env `OLLAMA_URL` は直接読まない
-    from . import keys, llm
-    if not ollama_in_use(system_settings or {}):
-        raise _NotInUse("使っていません")
-    base = keys.resolve_ollama_url(settings, system_settings=system_settings)
-    with llm.urlopen_no_redirect(llm.ollama_url(base, "/api/tags"), timeout=_AI_TIMEOUT) as r:
-        json.loads(r.read())
-    embed_base = keys.resolve_ollama_url(None, system_settings=system_settings, purpose="embed")
-    if embed_base.rstrip("/") == base.rstrip("/") or not _embed_uses_ollama(system_settings):
-        return
+def _ai_check_answer(settings: dict, system_settings: dict | None = None) -> None:
+    """回答の AI（簡易の回答）。Ollama なら中央の接続先に届くか＋モデルが取得済みか、OpenAI ならキーが実在するか。"""
+    sys_s = system_settings or {}
     try:
-        with llm.urlopen_no_redirect(llm.ollama_url(embed_base, "/api/tags"), timeout=_AI_TIMEOUT) as r:
-            _check_ollama_embed_model(json.loads(r.read()), system_settings or {})
-    except _OllamaEmbedModelMissing as e:
-        raise RuntimeError(_classify(e)) from None
-    except Exception as e:
-        raise RuntimeError(_classify(_OllamaEmbedUnreachable(e))) from None
+        t = ai_targets.answer_target(sys_s)
+    except Exception:
+        raise RuntimeError("回答の AI の設定を解決できません（既定の AI・使えるモデルを確認）") from None
+    if t.provider == "openai":
+        _need_openai_key(None, sys_s)
+        return
+    _need_model(t.model, _tags_or_raise(t.base, sys_s, "回答の AI"), "回答の AI")
+
+
+def _ai_check_embed(settings: dict, system_settings: dict | None = None) -> None:
+    """埋め込み。Ollama なら埋め込み用の接続先に届くか＋埋め込みモデルが取得済みか、OpenAI ならキーが実在するか。使っていなければ対象外。"""
+    sys_s = system_settings or {}
+    try:
+        t = ai_targets.embed_target(sys_s)
+    except Exception:
+        raise RuntimeError("埋め込みの設定を解決できません") from None
+    if t is None:
+        if embeddings.cloud_selected_but_unavailable(sys_s):
+            raise RuntimeError("埋め込みの設定が成立していません（選んだ接続先のキー・接続先・モデルを確認）")
+        raise _NotInUse("使っていません")
+    if t.provider == "openai":
+        if not agent_constructs.is_real_api_key(t.cfg.get("key")):
+            raise RuntimeError(keys.NO_CENTRAL_KEY_MESSAGE)
+        return
+    tags = _tags_or_raise(t.base, sys_s, "埋め込み用")
+    if not ai_targets.model_installed(t.model, ai_targets.installed_names(tags)):
+        raise RuntimeError(f"埋め込みモデル {t.model} が Ollama にありません（ollama pull {t.model}）。"
+                           "このままでは意味での検索が使えず、語の一致の検索だけになります")
 
 
 def _ai_check_codex(settings: dict, system_settings: dict | None = None) -> None:
+    """Codex 調査。CLI の有無と、実効の接続先ごとの判定（Ollama は届くか＋モデル、互換接続先はキー、OpenAI 本家はログイン状態）。"""
     import subprocess
+    sys_s = system_settings or {}
     if not shutil.which("codex"):
         raise RuntimeError("codex CLI が見つかりません")
-    # Codex(Ollama) は codex login を使わず Ollama へ直接つなぐ＝Ollama へ届くかを見る
-    from . import agent_constructs
-    if agent_constructs.codex_model_provider(settings) == "ollama":
-        from . import keys as _keys, llm as _llm, model_catalog
-        base = _keys.resolve_ollama_url(settings, system_settings=system_settings)
-        with _llm.urlopen_no_redirect(_llm.ollama_url(base, "/api/tags"), timeout=_AI_TIMEOUT) as r:
-            tags = json.loads(r.read())
-        # 届くだけでなく、Codex に使うモデルが Ollama に取得済みかも見る
-        model = model_catalog.resolve_model("codex", "codex", None, system_settings=system_settings)
-        names = {m.get("name") for m in (tags.get("models") or []) if isinstance(m, dict)} \
-            if isinstance(tags, dict) else set()
-        if model and model not in names and f"{model}:latest" not in names:
-            raise RuntimeError(f"Codex に使うモデル {model} が Ollama にありません（ollama pull で取得するか、"
+    t = ai_targets.codex_target(settings, sys_s)
+    if t.provider == "ollama":
+        tags = _tags_or_raise(t.base, sys_s, "Codex 用")
+        if t.model and not ai_targets.model_installed(t.model, ai_targets.installed_names(tags)):
+            raise RuntimeError(f"Codex に使うモデル {t.model} が Ollama にありません（ollama pull で取得するか、"
                                "使えるモデルの Codex の列を Ollama のモデル名にしてください）")
         return
-    # Azure/互換接続先の Codex(OpenAI) 構成は ChatGPT ログインでなく `OPENAI_API_KEY`（`keys.resolve_api_key("openai")`）で認証するため、チャットと同じ材料で判定する
-    from . import llm as _llm
-    keys.selected_cloud_provider(system_settings, strict=True)
-    if _llm.openai_endpoint_kind(system_settings) != "openai":
-        if keys.resolve_api_key("openai", settings, system_settings=system_settings):
-            return  # CLI 導入済み＋キー解決可＝チャットの Codex 実行と同じ材料が揃っている
+    keys.selected_cloud_provider(sys_s, strict=True)
+    if llm.openai_endpoint_kind(sys_s) != "openai":
+        if keys.resolve_api_key("openai", settings, system_settings=sys_s):
+            return  # Azure/互換接続先の Codex は ChatGPT ログインでなくキーで認証する
         raise RuntimeError(keys.NO_CENTRAL_KEY_MESSAGE)
     r = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=_AI_TIMEOUT)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout or "未ログイン（codex login が必要）").strip()[:200])
 
 
-# (id, 表示名, 落ちたときの全体への影響, check(settings), 対処ヒント)。ヒント文言は `keys.NO_CENTRAL_KEY_MESSAGE` を共有する
+# (id, 表示名, 落ちたときの全体への影響, check(settings, system_settings), 対処ヒント)。ヒント文言は `keys.NO_CENTRAL_KEY_MESSAGE` を共有する
 _AI_COMPONENTS = [
-    ("openai", "OpenAI API", "none", _ai_check_openai,
-     keys.NO_CENTRAL_KEY_MESSAGE + "（または個人設定でキーを入力してください）"),
-    ("ollama", "ローカルLLM（Ollama）", "none", _ai_check_ollama,
-     "ollama serve の起動を確認してください（使わない構成なら対応不要）"),
-    ("codex", "Codex CLI（AIエージェント）", "none", _ai_check_codex,
-     "codex CLI の導入とログイン（codex login）を確認してください（使わない構成なら対応不要）"),
+    ("answer_ai", "回答の AI（簡易の回答）", "none", _ai_check_answer,
+     "管理画面の既定の AI・使えるモデル・接続先（またはキー）を確認してください"),
+    ("codex", "Codex 調査", "none", _ai_check_codex,
+     "codex CLI の導入とログイン（codex login）、または Ollama の接続先とモデルを確認してください（使わない構成なら対応不要）"),
+    ("embed", "埋め込み（意味での検索）", "none", _ai_check_embed,
+     "埋め込みの接続先とモデル（またはキー）を確認してください（使わない構成なら対応不要）"),
 ]
 
 
 def ai_snapshot(uid: str, settings: dict, force: bool = False) -> list[dict]:
-    """管理者本人の設定を使って AI 各プロバイダへ実接続確認する（システム状態ページの「再チェック」専用）。
+    """管理者本人の設定を使って、用途ごとの AI（回答の AI・Codex・埋め込み）の軽い確認を流す（システム状態ページ用・AI へは送らない）。
 
     per-uid キャッシュ（既定60秒）。各プローブを ThreadPoolExecutor で並列実行し、全体 deadline（`_AI_DEADLINE`）を超えたものは
     「確認できませんでした（タイムアウト）」として打ち切る。
@@ -466,7 +313,7 @@ def ai_snapshot(uid: str, settings: dict, force: bool = False) -> list[dict]:
     return components
 
 
-# ---- 管理者の「システム状態」画面専用（ES/グラフの実クエリ検索テスト） ----
+# ---- 管理者の「システム状態」画面専用（資料の中身: ES/グラフの 1 件読み） ----
 # 登録 world の索引/グラフへ実際に検索クエリを1発打ち、AI 側と検索基盤側の切り分けに使う。
 # 「再チェック」は force=True で最新化し、自動ポーリングは per-uid TTL 内なら再実行しない。
 _SEARCH_TTL = 60.0
@@ -529,9 +376,9 @@ def _search_probe_graph(world_id: str | None) -> str:
 
 # (id, 表示名, 落ちたときの全体への影響, probe(world_id), 対処ヒント)。impact="none" は参考情報（page 全体の status を変えない）
 _SEARCH_COMPONENTS = [
-    ("es_search", "ES検索（実クエリ）", "none", _search_probe_es,
+    ("es_search", "全文検索（1 件読めるか）", "none", _search_probe_es,
      "Elasticsearch の起動・索引の取り込み状況を確認してください"),
-    ("graph_search", "グラフ検索（実クエリ）", "none", _search_probe_graph,
+    ("graph_search", "つながりの検索（1 件読めるか）", "none", _search_probe_graph,
      "Neo4j の起動・取り込み状況を確認してください"),
 ]
 

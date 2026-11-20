@@ -73,9 +73,9 @@ sherpa/providers/codex/turn_loop.py::_continue_until_done	168
 sherpa/providers/codex/turn_prepare.py::prepare_run	147
 sherpa/providers/codex/turn_state.py::CodexTurnState.__init__	197
 sherpa/routers/system.py::settings_test	109
-sherpa/routers/system_extras.py	1703
-sherpa/routers/system_extras.py::_admin_settings_view	221
-sherpa/routers/system_extras.py::admin_settings_put	112
+sherpa/routers/system_extras.py	1681
+sherpa/routers/system_extras.py::_admin_settings_view	214
+sherpa/routers/system_extras.py::admin_settings_put	110
 sherpa/routers/worlds.py	1033
 sherpa/schemas.py	1460
 sherpa/scope_infer.py::safe_files	105

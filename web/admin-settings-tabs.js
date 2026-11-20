@@ -4,7 +4,7 @@
 // ===== タブ切り替え（URL ハッシュで記憶）・未保存タブの丸印 =====
 const TAB_KEYS = ['provider', 'research', 'chat', 'models', 'ingest', 'extkeys'];
 // 埋め込みタブ（管理系ページを iframe で表示）。保存対象がないため TAB_DIRTY を持たず、切替に未保存確認は挟まない。
-const EMBED_TAB_KEYS = ['users', 'usage-page', 'feedback', 'audit', 'status', 'connectivity'];
+const EMBED_TAB_KEYS = ['users', 'usage-page', 'feedback', 'audit', 'status'];
 const ALL_TAB_KEYS = TAB_KEYS.concat(EMBED_TAB_KEYS);
 function activateTab(tabKey, opts) {
   if (tabKey === 'agentic-budget-card') {
@@ -60,7 +60,7 @@ const TAB_DIRTY = {
     || openaiEndpointChanged() || mcEmbedChanged() || embedProviderChanged() || embedOllamaUrlChanged() || nullPlanActive('provider'),
   research: () => depthProfileChanged() || maxReviewRoundsChanged()
     || codexWorkerModelChanged() || codexSessionRetentionDaysChanged() || agenticBudgetChanged() || codexModeChanged()
-    || extKeysResearchProviderChanged() || nullPlanActive('research'),
+    || extKeysResearchProviderChanged() || extKeysCodexProviderChanged() || nullPlanActive('research'),
   chat: () => chatMaxTurnsChanged() || workspaceChanged() || chatExamplesChanged() || nullPlanActive('chat'),
   models: () => mcCatalogChangedExcludingEmbed(),
   ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged() || ocrSwitchChanged()
@@ -156,6 +156,7 @@ function applyConfigChangedHighlights(view) {
   mark($('ext-keys-user-quota-default'), quota.effective !== quota.default);
   const rdp = (view.ext_keys || {}).research_default_provider || {};
   mark($('ext-research-default-provider'), rdp.effective !== rdp.default);
+  mark($('ext-codex-default-provider'), !!((view.ext_keys || {}).codex_default_model_provider || {}).configured);
 }
 
 $('save').addEventListener('click', save);

@@ -178,8 +178,7 @@
         <button class="tab-btn" type="button" role="tab" data-tab="usage-page" aria-selected="false" id="tab-btn-usage-page" title="利用の傾向・トークンの集計。" aria-controls="tabpanel-usage-page" tabindex="-1">利用統計</button>
         <button class="tab-btn" type="button" role="tab" data-tab="feedback" aria-selected="false" id="tab-btn-feedback" title="利用者が回答に付けた 👍👎・理由・一言。" aria-controls="tabpanel-feedback" tabindex="-1">回答への評価</button>
         <button class="tab-btn" type="button" role="tab" data-tab="audit" aria-selected="false" id="tab-btn-audit" title="誰が・いつ・何をしたかの記録。" aria-controls="tabpanel-audit" tabindex="-1">監査ログ</button>
-        <button class="tab-btn" type="button" role="tab" data-tab="status" aria-selected="false" id="tab-btn-status" title="各サービス（DB・検索・AI）の稼働状況。" aria-controls="tabpanel-status" tabindex="-1">システム状態</button>
-        <button class="tab-btn" type="button" role="tab" data-tab="connectivity" aria-selected="false" id="tab-btn-connectivity" title="画面・回答・調べものの道具が各サービスにつながるかの確認。" aria-controls="tabpanel-connectivity" tabindex="-1">つながりの確認</button>
+        <button class="tab-btn" type="button" role="tab" data-tab="status" aria-selected="false" id="tab-btn-status" title="各サービス（DB・検索・AI）の稼働状況と、実際に送って確かめる確認。" aria-controls="tabpanel-status" tabindex="-1">システム状態</button>
       </div>
 
       <div class="admin-panels">
@@ -354,6 +353,21 @@
             </label>
             <div class="hint" id="ext-research-default-provider-hint" style="margin:-8px 0 14px"></div>
             <div class="hint danger" id="ext-research-default-provider-invalid" hidden style="margin:-8px 0 14px"><!-- JS が描画: 保存値が不正な場合の案内 --></div>
+          </div>
+        </div>
+        <div class="card sec" id="codex-default-provider-card">
+          <div class="card-head"><span class="title">Codex 調査の既定の接続先</span></div>
+          <div class="body">
+            <label class="vlm-field">
+              <span class="vlm-l">利用者が自分で選んでいないときに使います</span>
+              <select id="ext-codex-default-provider" style="max-width:360px">
+                <option value="">自動（OpenAI のキーがあれば OpenAI、無ければ Ollama）</option>
+                <option value="openai">OpenAI</option>
+                <option value="ollama">Ollama</option>
+              </select>
+            </label>
+            <div class="hint" id="ext-codex-default-provider-hint" style="margin:-8px 0 14px"></div>
+            <div class="hint danger" id="ext-codex-default-provider-invalid" hidden style="margin:-8px 0 14px"><!-- JS が描画: 保存値が不正な場合の案内 --></div>
           </div>
         </div>
         <section class="research-group" aria-labelledby="research-codex-heading">
@@ -723,9 +737,6 @@
       </div>
       <div class="tabpanel tabpanel-embed" id="tabpanel-status" data-tabpanel="status" role="tabpanel" aria-labelledby="tab-btn-status" tabindex="0" hidden>
         <iframe class="embed-frame" id="embed-frame-status" title="システム状態" data-src="status.html?embed=1"></iframe>
-      </div>
-      <div class="tabpanel tabpanel-embed" id="tabpanel-connectivity" data-tabpanel="connectivity" role="tabpanel" aria-labelledby="tab-btn-connectivity" tabindex="0" hidden>
-        <iframe class="embed-frame" id="embed-frame-connectivity" title="つながりの確認" data-src="connectivity.html?embed=1"></iframe>
       </div>
       </div>
     </div>

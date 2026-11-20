@@ -4,6 +4,7 @@
 // 「調査・回答」タブは接続設定と独立して描画・リセットする。
 function renderResearchTab(view) {
   renderResearchDefaultProvider((view.ext_keys || {}).research_default_provider);
+  renderCodexDefaultProvider((view.ext_keys || {}).codex_default_model_provider);
   renderAgenticBudget(view.agentic_budget);   // ツール結果バイト予算
   renderCodexMode(view.codex_mode);
   renderDepthProfile(view.depth_profile);

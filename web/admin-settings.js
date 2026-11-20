@@ -100,6 +100,7 @@ let _ragLlmRenderBaseline = true;
 let _extKeysAllowedBaseline = false;
 let _extKeysQuotaBaseline = '';
 let _extKeysResearchProviderBaseline = 'ollama';
+let _extKeysCodexProviderBaseline = '';
 // 保存値が ollama/openai のどちらでもないときに select へ挿入する専用オプションの値（保存では送らない）。
 const _RESEARCH_PROVIDER_INVALID = '__invalid__';
 
@@ -273,6 +274,10 @@ function extKeysResearchProviderChanged() {
   return v !== _extKeysResearchProviderBaseline;
 }
 
+function extKeysCodexProviderChanged() {
+  return _val('ext-codex-default-provider') !== _extKeysCodexProviderBaseline;
+}
+
 // ===== 保存 =====
 async function save() {
   // 埋め込みデプロイ名欄は保存直前にも確定させる（フォーカスが残ったまま保存した場合の安全網）。
@@ -342,6 +347,11 @@ async function save() {
     const v = ($('ext-research-default-provider') || {}).value || 'ollama';
     // 破損状態を示す一時的な選択肢（"__invalid__"）が選ばれていたら送らない。
     if (v !== _RESEARCH_PROVIDER_INVALID) body.research_default_provider = v;
+  }
+  if (extKeysCodexProviderChanged()) {
+    const v = _val('ext-codex-default-provider');
+    // 破損状態を示す一時的な選択肢が選ばれていたら送らない。空（自動）は未設定へ戻す。
+    if (v !== _RESEARCH_PROVIDER_INVALID) body.codex_default_model_provider = v === '' ? null : v;
   }
   collectDepthProfile(body);   // 調べる深さの基準値（変わった項目だけ送る）
   if (maxReviewRoundsChanged()) {
@@ -495,6 +505,10 @@ function resetResearchTab() {
   _setVal('ext-research-default-provider', def);
   if (rdp.configured) {
     _planNull('research', 'research_default_provider', () => _val('ext-research-default-provider') === def);
+  }
+  _setVal('ext-codex-default-provider', '');
+  if (((((_view || {}).ext_keys || {}).codex_default_model_provider) || {}).configured) {
+    _planNull('research', 'codex_default_model_provider', () => _val('ext-codex-default-provider') === '');
   }
   _markResetDone('tab-reset-res-research');
 }

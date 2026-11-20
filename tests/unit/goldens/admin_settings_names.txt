@@ -62,6 +62,7 @@ _embedTuningBaseline
 _endpointTestBusy
 _extKeys
 _extKeysAllowedBaseline
+_extKeysCodexProviderBaseline
 _extKeysList
 _extKeysQuotaBaseline
 _extKeysResearchProviderBaseline
@@ -144,6 +145,7 @@ embedProviderHint
 embedTuningChanged
 extKeyStatus
 extKeysAllowedChanged
+extKeysCodexProviderChanged
 extKeysQuotaChanged
 extKeysResearchProviderChanged
 legacyChanged
@@ -178,6 +180,7 @@ renderCloud
 renderCloudKeyBlock
 renderCloudProviderRadios
 renderCloudStatus
+renderCodexDefaultProvider
 renderCodexMode
 renderDepthProfile
 renderEmbedProvider

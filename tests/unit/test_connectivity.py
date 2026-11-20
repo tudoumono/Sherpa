@@ -5,11 +5,12 @@ import io
 import json
 import subprocess
 import urllib.error
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from sherpa import connectivity, embeddings, health, llm, store
+from sherpa import connectivity, connectivity_tools, embeddings, health, llm, store
 from sherpa.api import app
 from sherpa.ingest import worker_status
 from sherpa.routers import connectivity_admin
@@ -38,7 +39,6 @@ def boundaries(monkeypatch):
     monkeypatch.setattr(store, "get_system_settings", lambda **k: dict(sys_s))
     monkeypatch.setattr(health, "_ping_postgres", lambda: None)
     monkeypatch.setattr(health, "_ping_neo4j", lambda: None)
-    monkeypatch.setattr(health, "ollama_in_use", lambda s, rows=None: False)
     monkeypatch.setattr(llm, "assert_openai_io_allowed", lambda: None)
 
     def fake_urlopen(*a, **k):
@@ -62,7 +62,10 @@ def boundaries(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda name, *a, **k: "/usr/bin/" + name if name == "codex" else None)
     monkeypatch.setattr(store, "get_settings", lambda uid="admin": {"agent": "simple", "codex_model_provider": "openai"})
 
-    def fake_codex(argv, env, cwd):
+    monkeypatch.setattr(connectivity_tools, "run_server_checks",
+                        lambda **k: connectivity_tools.rows_incomplete("確かめきれなかった（偽）"))
+
+    def fake_codex(argv, env, cwd, **k):
         codex_runs.append((argv, env))
         return 1, "401 Unauthorized " + KEY
     monkeypatch.setattr(connectivity, "_run_codex_once", fake_codex)
@@ -71,6 +74,10 @@ def boundaries(monkeypatch):
 
 def _post(client, paid=False):
     return client.post("/admin/connectivity/check", json={"include_paid": paid})
+
+
+def _codex_rows(resp) -> dict:
+    return {x["id"]: x for x in {p["path"]: p for p in resp.json()["paths"]}["codex"]["results"]}
 
 
 def test_non_admin_is_403(monkeypatch):
@@ -281,7 +288,7 @@ def test_child_path_does_not_run_answer_check(monkeypatch):
     monkeypatch.setattr(connectivity, "_CHECKS", tuple(
         (cid, label, paid, lambda ctx, p: {"route": None}) for cid, label, paid, _fn in connectivity._CHECKS))
     rows = connectivity.run_checks(False, path="mcp")
-    assert {r["id"] for r in rows} == {"elasticsearch", "neo4j", "ollama", "embed"}
+    assert {r["id"] for r in rows} == {"elasticsearch", "neo4j", "embed"}
 
 
 @pytest.mark.parametrize("resp", [[], "text", {"choices": ["x"]}, {"message": "x"}, {"choices": []}, {"message": None}, {}])
@@ -300,20 +307,22 @@ def test_response_has_four_paths_and_free_run_sends_nothing_from_codex(client, b
     paths = {p["path"]: p for p in r.json()["paths"]}
     assert list(paths) == ["api", "mcp", "ingest", "codex"]
     assert paths["ingest"]["label"] == "取り込みの係"
-    (codex,) = paths["codex"]["results"]
-    assert codex["id"] == "codex" and codex["status"] == "skipped" and codex["paid"] is True
+    assert [x["id"] for x in paths["codex"]["results"]] == ["codex", "codex_tools"]
+    assert all(x["status"] == "skipped" and x["paid"] is True for x in paths["codex"]["results"])
     assert boundaries["codex"] == [] and boundaries["sent"] == []
-    assert {x["id"] for x in paths["ingest"]["results"]} == {"postgres", "elasticsearch", "neo4j", "ollama", "embed"}
+    assert {x["id"] for x in paths["ingest"]["results"]} == {
+        "postgres", "elasticsearch", "neo4j", "embed",
+        "store_roundtrip_es", "store_roundtrip_vector", "store_roundtrip_graph"}
     assert all(x["status"] == "incomplete" and "動いていない" in x["reason"] for x in paths["ingest"]["results"])
 
 
 def test_paid_codex_failure_reason_is_fixed_wording_without_output(client, boundaries):
     """Codex の出力（鍵を含む）は判定にだけ使い、結果には決まった言葉だけを出す。起動した子の env に DB・ES の資格情報は無い。"""
     r = _post(client, paid=True)
-    (codex,) = {p["path"]: p for p in r.json()["paths"]}["codex"]["results"]
+    codex = _codex_rows(r)["codex"]
     assert codex["status"] == "ng" and codex["reason"] == "認証に失敗（401/403）" and codex["paid"] is True
     assert KEY not in r.text and "espass-secret" not in r.text
-    (argv, env), = boundaries["codex"]
+    argv, env = boundaries["codex"][0]
     assert argv[:3] == ["codex", "exec", "--json"] and argv[-1] == "-" and "--ephemeral" in argv
     assert "ES_URL" not in env and "OPENAI_API_KEY" not in env
 
@@ -328,14 +337,14 @@ def test_codex_timeout_and_ollama_is_free(client, boundaries, monkeypatch):
     monkeypatch.setattr(llm, "assert_ollama_url_allowed", lambda *a, **k: None)
     from sherpa import model_catalog
     monkeypatch.setattr(model_catalog, "resolve_model", lambda *a, **k: "gpt-oss:20b")
-    (codex,) = {p["path"]: p for p in _post(client, paid=False).json()["paths"]}["codex"]["results"]
+    codex = _codex_rows(_post(client, paid=False))["codex"]
     assert codex["paid"] is False and codex["status"] == "ng" and codex["reason"].startswith("時間切れ")
     assert codex["host"] == "localhost"
 
 
 def test_codex_on_openai_shows_the_builtin_endpoint_host(client, boundaries):
     """OpenAI 本家で動かす Codex も、宛先（組み込みの接続先のホスト）と経路を出す。"""
-    (codex,) = {p["path"]: p for p in _post(client, paid=False).json()["paths"]}["codex"]["results"]
+    codex = _codex_rows(_post(client, paid=False))["codex"]
     assert codex["host"] == "api.openai.com" and codex["route"] in ("直接", "プロキシ経由")
 
 
@@ -361,3 +370,82 @@ def test_answer_check_fails_on_an_empty_reply(client, boundaries, monkeypatch, r
 def test_codex_failure_reason_names_real_codex_messages(text, expect):
     """本物の Codex が出す、サンドボックスが自身を起動できない・モデルがその使い方では使えない、の文言を決まった理由に振り分ける。"""
     assert expect in connectivity._codex_failure_reason(text)
+
+
+def _fake_tool_turn(monkeypatch, *, rows=(), answer=True, events=()):
+    """道具ありの Codex の起動の偽物。道具のサーバーが書く呼び出しの記録（rows）と、Codex の実行イベントだけを返す。"""
+    def run(argv, env, cwd, **k):
+        if not k:
+            return 0, ""
+        calls = Path(env["CODEX_HOME"]) / "toolcalls"
+        calls.mkdir(parents=True, exist_ok=True)
+        with open(calls / "calls-1-1.jsonl", "w", encoding="utf-8") as f:
+            for i, r in enumerate(rows, 1):
+                f.write(json.dumps({"v": 1, "turn": "connectivity-check", "proc": 1, "seq": i, "call_id": f"1:{i}",
+                                    "ts": 1.0 + i, "tool": "list_docs", **r}) + "\n")
+        if answer:
+            Path(argv[argv.index("-o") + 1]).write_text("3", encoding="utf-8")
+        return 0, "\n".join(json.dumps({"type": "item.completed", "item": e}) for e in events)
+    monkeypatch.setattr(connectivity, "_run_codex_once", run)
+
+
+def _tools_row(client):
+    return _codex_rows(_post(client, paid=True))["codex_tools"]
+
+
+def test_codex_tools_ok_when_the_tool_server_logged_a_successful_call(client, boundaries, monkeypatch):
+    _fake_tool_turn(monkeypatch, rows=[{"status": "ok", "count": 3}])
+    row = _tools_row(client)
+    assert row["status"] == "ok" and row["paid"] is True and row["reason"] is None
+
+
+def test_codex_tools_ng_when_the_model_answered_without_calling_the_tool(client, boundaries, monkeypatch):
+    """返事の文は見ない。呼び出しの記録が無ければ、返事があっても「呼ばなかった」。"""
+    _fake_tool_turn(monkeypatch, rows=[], answer=True)
+    row = _tools_row(client)
+    assert row["status"] == "ng" and row["reason"].startswith("道具を呼ばなかった")
+
+
+def test_codex_tools_ng_when_the_tool_failed_or_the_server_never_started(client, boundaries, monkeypatch):
+    _fake_tool_turn(monkeypatch, rows=[{"status": "error", "error_kind": "read_failed"}])
+    assert "道具がエラーを返した（read_failed）" == _tools_row(client)["reason"]
+    _fake_tool_turn(monkeypatch, rows=[], events=[{"type": "mcp_tool_call", "tool": "list_docs", "status": "failed"}])
+    assert "道具のサーバーを起こせなかった" in _tools_row(client)["reason"]
+
+
+def test_codex_tools_times_out_and_leaves_no_work_folder(client, boundaries, monkeypatch):
+    seen = []
+    monkeypatch.setattr(connectivity, "_run_codex_once", lambda argv, env, cwd, **k: seen.append(cwd) or (None, ""))
+    row = _tools_row(client)
+    assert row["status"] == "ng" and row["reason"].startswith("時間切れ")
+    assert seen and not Path(seen[0]).exists()
+
+
+def test_codex_process_group_is_killed_when_reading_its_output_fails(monkeypatch, tmp_path):
+    """Codex の出力を読む途中で例外が出ても、Codex が先に終わっていても、同じプロセスグループの子（道具のサーバー）を残さない。"""
+    import os
+    import sys
+    import time
+    pid_file = tmp_path / "child.pid"
+    parent = ("import subprocess, sys; c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],"
+              " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL);"
+              f" open({str(pid_file)!r}, 'w').write(str(c.pid))")
+    real_popen = subprocess.Popen
+
+    class Broken(real_popen):
+        def communicate(self, *a, **k):
+            real_popen.communicate(self, *a, **k)   # 親は終わっている
+            raise ValueError("boom")
+    monkeypatch.setattr(connectivity.subprocess, "Popen", Broken)
+    with pytest.raises(ValueError):
+        connectivity._run_codex_once([sys.executable, "-c", parent], dict(os.environ), tmp_path)
+    child = int(pid_file.read_text())
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except OSError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(child, 9)
+        pytest.fail("同じプロセスグループの子が残っている")
