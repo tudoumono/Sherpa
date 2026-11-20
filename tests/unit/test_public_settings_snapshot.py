@@ -157,14 +157,9 @@ def test_public_settings_shares_one_system_settings_snapshot_with_unset_agent(mo
 
 
 def test_effective_agent_unset_reads_once_via_default_agent_chain(monkeypatch):
-    """`agent` 未設定（`None`／空文字＝最も一般的な経路）のとき、`effective_agent` が一度だけ
-    materialize したスナップショットが `default_agent()` の解決チェーン全体（
-    `_auto_default_agent`→`_codex_auth_available`）に渡ることを固定する
-    （`store.get_system_settings()` は1回だけ）。codex CLI が PATH にある環境を模し、
-    `_codex_auth_available()` 自体（`shutil.which` の短絡で素通りしない経路）を実際に通す。
-    `_codex_auth_available` を spy して実際に呼ばれたこと・受け取った引数を直接確認し
-    （呼ばれずに済んでしまう false green を防ぐ）、結果も `enabled_agents()` 所属という弱い
-    assert ではなく期待する具体値（"ollama"）で固定する。"""
+    """`agent` 未設定のとき、`effective_agent` は `store.get_system_settings()` を一度だけ読み、
+    codex CLI があれば codex を返す（認証は見ない）。接続先の自動選択（`codex_model_provider`）は
+    渡されたスナップショットで認証の有無を見る。"""
     from sherpa import agent_constructs
 
     monkeypatch.delenv("SHERPA_AGENT", raising=False)   # 明示指定なし＝自動選択の経路を確定させる
@@ -192,9 +187,12 @@ def test_effective_agent_unset_reads_once_via_default_agent_chain(monkeypatch):
     monkeypatch.setattr(agent_constructs, "_codex_auth_available", _spy_codex_auth_available)
 
     result = agent_constructs.effective_agent(None)
-
-    assert result == "simple", f"自動選択の結果が想定と異なる: {result!r}"
+    assert result == "codex", f"自動選択の結果が想定と異なる: {result!r}"
     assert read_calls == [1], f"store.get_system_settings() が {len(read_calls)} 回呼ばれた（期待は1回）"
+    assert auth_calls == [], "頭脳の自動選択は認証の有無を見ない"
+
+    # 接続先の自動選択は同じスナップショットで認証の有無を見る（認証なし＝ollama）。
+    assert agent_constructs.codex_model_provider({}, system_settings=sentinel) == "ollama"
     assert len(auth_calls) == 1, (
         "_codex_auth_available の呼び出し回数が想定と異なる"
         "（shutil.which の短絡で素通りした場合は0回になりうる）: "

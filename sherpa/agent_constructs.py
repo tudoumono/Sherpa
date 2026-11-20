@@ -7,7 +7,7 @@
     codex_ollama  同上で実行モデルが Ollama
 
 `codex` / `simple` 以外の保存値（`openai`/`ollama`/`gemini`/`bedrock`/`heuristic` など）はチャットで選べない（`_select_provider` が選び直しを案内する）。
-Codex 構成だけが `codex_model_provider` を持ち、Codex CLI の接続先モデルを決める。
+Codex 構成だけが `codex_model_provider` を持ち、Codex CLI の接続先モデルを決める（未選択は管理者の既定→自動）。
 """
 from __future__ import annotations
 
@@ -64,10 +64,10 @@ def _codex_auth_available(system_settings: dict | None = None) -> bool:
 
 def _auto_default_agent(system_settings: dict | None = None) -> str:
     """個人設定が未選択のときに、この環境で使える頭脳を選ぶ。
-    Codex CLI が PATH にあり使える認証がある（`_codex_auth_available`）→ codex、無ければ simple。
+    Codex CLI が PATH にあり使える → codex、無ければ simple。接続先は `codex_model_provider()` が決める。
     """
     from sherpa import required_tools
-    if shutil.which("codex") and _codex_auth_available(system_settings) and not required_tools.codex_cli_missing():
+    if shutil.which("codex") and not required_tools.codex_cli_missing():
         return "codex"
     return "simple"
 
@@ -149,21 +149,12 @@ def construct_id(settings: dict | None, *, system_settings: dict | None = None) 
     s = settings or {}
     agent = effective_agent(s, system_settings=system_settings)
     if agent == "codex":
-        # `codex_model_provider()` と同じく strip+lowercase して比較する。
-        raw = s.get("codex_model_provider")
-        if raw is None or raw == "":
-            provider = ""
-        elif not isinstance(raw, str):
-            # 文字列以外の非 None（設定破損）は、実行時の失敗と表示を揃えるため一覧に無い id を返す。
+        # 実行時と同じ `codex_model_provider()` を通す。非空の不正値は一覧に無い id を返し、実行時の失敗と表示を揃える。
+        try:
+            provider = codex_model_provider(s, system_settings=system_settings)
+        except InvalidCodexModelProviderError:
             return "codex_invalid"
-        else:
-            provider = raw.strip().lower()
-        if not provider or provider == "openai":
-            return "codex_openai"
-        if provider == "ollama":
-            return "codex_ollama"
-        # 非空の不正値は一覧に無い id（`codex_invalid`）を返し、実行時の失敗と表示を揃える。
-        return "codex_invalid"
+        return f"codex_{provider}"
     for c in CONSTRUCTS:
         if c["agent"] == agent:
             return c["id"]
@@ -174,24 +165,38 @@ class InvalidCodexModelProviderError(ValueError):
     """`codex_model_provider` が非空の不正値のとき `codex_model_provider()` が送出する。"""
 
 
-def codex_model_provider(settings: dict | None) -> str:
-    """Codex CLI が接続するモデル提供元（未設定は既定 openai）。
-    非空の不正値は `InvalidCodexModelProviderError`（黙って openai へ倒さない）。呼び出し元は `_select_provider`。
-    """
-    raw = (settings or {}).get("codex_model_provider")
+def _valid_codex_provider(raw: Any, key: str) -> str:
+    """保存値を検証して小文字化して返す（空は ""）。文字列でない値・選べない値は `InvalidCodexModelProviderError`。"""
     # 文字列以外の非 None（設定破損）は truthiness 判定の前に拒否する。
     if raw is not None and not isinstance(raw, str):
         raise InvalidCodexModelProviderError(
-            f"codex_model_provider の値が不正です（{raw!r}）。"
+            f"{key} の値が不正です（{raw!r}）。"
             f"選べる値: {', '.join(sorted(CODEX_MODEL_PROVIDERS))}。設定画面で選び直してください。")
     value = str(raw or "").strip().lower()
-    if not value:
-        return "openai"
-    if value not in CODEX_MODEL_PROVIDERS:
+    if value and value not in CODEX_MODEL_PROVIDERS:
         raise InvalidCodexModelProviderError(
-            f"codex_model_provider の値が不正です（{value!r}）。"
+            f"{key} の値が不正です（{value!r}）。"
             f"選べる値: {', '.join(sorted(CODEX_MODEL_PROVIDERS))}。設定画面で選び直してください。")
     return value
+
+
+def codex_model_provider(settings: dict | None, *, system_settings: dict | None = None) -> str:
+    """Codex CLI が接続するモデル提供元の実効値。
+    ① 利用者の `codex_model_provider`（非空）② 管理者の `codex_default_model_provider`（非空）
+    ③ 自動（OpenAI の認証があれば openai、無ければ ollama）。
+    非空の不正値は `InvalidCodexModelProviderError`（黙って倒さない）。
+    設計: docs/design/chat.md「2つの頭脳と、頭脳の選び方」
+    """
+    from sherpa import store
+    own = _valid_codex_provider((settings or {}).get("codex_model_provider"), "codex_model_provider")
+    if own:
+        return own
+    sys_s = system_settings if system_settings is not None else store.get_system_settings()
+    admin = _valid_codex_provider((sys_s or {}).get("codex_default_model_provider"),
+                                  "codex_default_model_provider")
+    if admin:
+        return admin
+    return "openai" if _codex_auth_available(sys_s) else "ollama"
 
 
 def is_local(provider_id: str | None, *, codex_model_provider: str | None = None,

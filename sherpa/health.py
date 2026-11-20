@@ -89,13 +89,13 @@ class _OllamaEmbedModelMissing(RuntimeError):
 
 
 def _active_user_codex_rows() -> list[dict]:
-    """有効な利用者の `agent`・`codex_model_provider`（Ollama 利用の判定用・読み取りのみ）。"""
+    """有効な利用者の `agent`・`codex_model_provider`（Ollama 利用の判定用・読み取りのみ）。個人設定を保存していない利用者も未選択の行として含める。"""
     from .store.db import _connect
     # 短い期限つきの直接接続（プールを待たない）。読めない・時間切れは呼び出し側が「使っている」に倒す
     with _connect(connect_timeout=2, options="-c statement_timeout=2000") as c:
         rows = c.execute(
-            "SELECT us.agent, us.codex_model_provider FROM user_settings us "
-            "JOIN users u ON u.uid = us.user_id WHERE u.status = 'active'").fetchall()
+            "SELECT us.agent, us.codex_model_provider FROM users u "
+            "LEFT JOIN user_settings us ON us.user_id = u.uid WHERE u.status = 'active'").fetchall()
     return [dict(r) for r in rows]
 
 
@@ -104,7 +104,7 @@ def ollama_in_use(system_settings: dict, user_rows: list[dict] | None = None) ->
 
     次のどれかが Ollama なら使っている:
     ① 回答の AI（クラウド未選択で OpenAI のキーも無く Ollama に解決される構成）・簡易の既定 AI（明示 ollama のときだけ）
-    ② Codex（`--oss`）＝実効の頭脳が codex で `codex_model_provider` が ollama の有効な利用者がいる
+    ② Codex（`--oss`）＝実効の頭脳が codex で Codex の接続先の実効値が ollama の有効な利用者がいる（未選択は管理者の既定→自動）
     ③ 埋め込み（`embed_provider` が ollama、または auto で Ollama に解決される構成・`SHERPA_DISABLE_EMBED` のときは除く）
     ④ 画像を読む AI＝vision アームが有効で VLM の provider が ollama
     """
@@ -124,9 +124,9 @@ def ollama_in_use(system_settings: dict, user_rows: list[dict] | None = None) ->
             return True
         rows = user_rows if user_rows is not None else _active_user_codex_rows()
         for row in rows:
-            if row.get("codex_model_provider") != "ollama":
+            if agent_constructs.effective_agent(row, system_settings=system_settings) != "codex":
                 continue
-            if agent_constructs.effective_agent(row, system_settings=system_settings) == "codex":
+            if agent_constructs.codex_model_provider(row, system_settings=system_settings) == "ollama":
                 return True
     except Exception:
         return True
@@ -344,7 +344,7 @@ def _ai_check_codex(settings: dict, system_settings: dict | None = None) -> None
         raise RuntimeError("codex CLI が見つかりません")
     # Codex(Ollama) は codex login を使わず Ollama へ直接つなぐ＝Ollama へ届くかを見る
     from . import agent_constructs
-    if agent_constructs.codex_model_provider(settings) == "ollama":
+    if agent_constructs.codex_model_provider(settings, system_settings=system_settings) == "ollama":
         from . import keys as _keys, llm as _llm, model_catalog
         base = _keys.resolve_ollama_url(settings, system_settings=system_settings)
         with _llm.urlopen_no_redirect(_llm.ollama_url(base, "/api/tags"), timeout=_AI_TIMEOUT) as r:

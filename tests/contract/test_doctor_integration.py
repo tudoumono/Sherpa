@@ -302,7 +302,7 @@ def test_read_active_user_configs_sql_contract(monkeypatch):
     doctor_checks._read_active_user_configs_readonly()
     assert len(executed) == 1
     sql = executed[0].lower()
-    assert "join users" in sql and "status" in sql and "active" in sql   # 無効な利用者は除外
+    assert "from users u left join user_settings" in sql and "status" in sql and "active" in sql   # 無効な利用者は除外・個人設定の行が無い利用者も含める
     assert "has_openai_key" in sql and "gemini" not in sql and "bedrock" not in sql
     assert "select us.openai_api_key," not in sql   # キーの値そのものは SELECT しない
     # 本番の truthy 判定（NULL／空文字以外は「あり」）と一致させる
