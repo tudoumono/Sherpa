@@ -1303,11 +1303,7 @@ def admin_ollama_test(req: OllamaTestReq, request: Request):
     if req.purpose:
         return ollama_probe.embed_test_result(url, hp, host, names, sys_s, _ENDPOINT_TEST_TIMEOUT_S, _OLLAMA_TEST_MAX_BYTES)
     # ④ 使えるモデル一覧の Ollama のモデルと突き合わせる（タグ無しは `:latest` とみなす）
-    wanted: set[str] = set()
-    for cell in (model_catalog.get_catalog(sys_s).get("ollama") or {}).values():
-        wanted.update(m for m in (cell.get("allowed") or []) if m)
-        if cell.get("default"):
-            wanted.add(cell["default"])
+    wanted = ollama_probe.wanted_models(sys_s, hp)
     have = set(names)
     missing = ai_targets.missing_models(wanted, have)
     # ⑤ 道具の呼び出しが要るモデル（簡易回答・Codex）のうち取得済みのものへ `/api/show` を送り、`tools` を持たないものを挙げる

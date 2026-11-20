@@ -237,3 +237,34 @@ def test_ollama_test_embed_purpose_uses_embed_url_and_checks_the_embed_model(mon
     seen = _stub_tags(monkeypatch, names=["other:latest"])
     assert admin_client.post(_URL, json={"purpose": "embed"}).json()["missing"] == ["bge-m3"]
     assert admin_client.post(_URL, json={"purpose": "x"}).status_code == 422
+
+
+def test_central_test_does_not_ask_for_the_embed_model_that_lives_on_another_server(monkeypatch, admin_client):
+    """埋め込みの接続先を分けているとき、中央の接続テストは埋め込みのモデルを「未取得」に数えない。分けていなければ数える。"""
+    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
+    central = "http://10.9.9.20:11434"
+    base = {"ollama_url": central, "embed_provider": "ollama",
+            "model_catalog": {"ollama": {"chat": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
+                                         "embed": {"allowed": ["bge-m3", "nomic-embed-text"], "default": "bge-m3"}}}}
+    _stub_tags(monkeypatch, names=["qwen2.5:latest"])
+
+    _patch_sys_settings(monkeypatch, {**base, "ollama_embed_url": _LAN})
+    assert admin_client.post(_URL, json={"ollama_url": central}).json()["missing"] == []
+
+    _patch_sys_settings(monkeypatch, base)
+    assert admin_client.post(_URL, json={"ollama_url": central}).json()["missing"] == ["bge-m3", "nomic-embed-text"]
+
+    _patch_sys_settings(monkeypatch, {**base, "embed_provider": "openai", "openai_api_key": "sk-x"})
+    assert admin_client.post(_URL, json={"ollama_url": central}).json()["missing"] == []
+
+
+def test_central_test_survives_a_broken_saved_ollama_url(monkeypatch, admin_client):
+    """保存済みの中央の接続先が壊れていても、入力中の正しい接続先の接続テストは 500 にならない。"""
+    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
+    _patch_sys_settings(monkeypatch, {"ollama_url": 123, "embed_provider": "ollama"})
+    _stub_tags(monkeypatch, names=["qwen2.5:latest"])
+    r = admin_client.post(_URL, json={"ollama_url": _LAN})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    _patch_sys_settings(monkeypatch, {"ollama_url": "broken", "embed_provider": "ollama"})
+    body = admin_client.post(_URL, json={"ollama_url": _LAN}).json()
+    assert body["ok"] is True and "bge-m3" not in body["missing"]   # 判定できない保存値では埋め込みの分を数えない

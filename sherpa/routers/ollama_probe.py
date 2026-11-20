@@ -24,6 +24,33 @@ def test_hint(e: Exception, port: int) -> str:
     return f"接続できませんでした（{type(reason).__name__}）"
 
 
+def wanted_models(sys_s: dict, hp: tuple) -> set[str]:
+    """この接続先（`hp`）に取得済みであるべき Ollama のモデル。使えるモデル一覧に登録したモデルのうち、回答・Codex などの用途の分と、
+    埋め込みがこの接続先を使うときだけ埋め込みの欄の分（埋め込みが別の接続先・Ollama 以外のときは数えない）。
+    """
+    from sherpa import ai_targets, keys, llm, model_catalog
+
+    def listed(cell: dict) -> set[str]:
+        return {m for m in [*(cell.get("allowed") or []), cell.get("default")] if m}
+    cells = model_catalog.get_catalog(sys_s).get("ollama") or {}
+    wanted: set[str] = set()
+    for usage, cell in cells.items():
+        if usage != "embed":
+            wanted |= listed(cell)
+    # 埋め込みの接続先を分けていない（中央と同じ）ときは、試している接続先が保存後に埋め込みにも使われる。判定できない設定では数えない
+    try:
+        target = ai_targets.embed_target(sys_s)
+        if target is None or target.provider != "ollama":
+            return wanted
+        central = llm._canonical_host_port(keys.resolve_ollama_url(None, system_settings=sys_s))
+        embed = llm._canonical_host_port(target.base)
+    except Exception:
+        return wanted
+    if embed is not None and central is not None and (embed == central or embed == hp):
+        wanted |= listed(cells.get("embed") or {}) | ({target.model} if target.model else set())
+    return wanted
+
+
 def embed_test_result(url: str, hp: tuple, host: str, names: list[str], sys_s: dict, timeout: float, max_bytes: int) -> dict:
     """埋め込みの接続先の確かめ。埋め込みのモデルが取得済みか（`/api/tags`）と、埋め込みに対応しているか（`/api/show`）を見る。"""
     import json as _json
