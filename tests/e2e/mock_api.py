@@ -1012,7 +1012,7 @@ SYSTEM_SETTINGS_VIEW = {
     "ext_keys": {"user_api_keys_allowed": False, "self_issued_active_count": 0,
                 "daily_quota_default": {"configured": None, "effective": 100, "default": 100},
                 "research_default_provider": {"configured": None, "effective": "ollama",
-                                              "default": "ollama"}},
+                                              "default": "ollama"}, "codex_default_model_provider": {"configured": None, "effective": "ollama", "default": "auto"}},
     # SET-2c: OpenAI 互換 API の接続先（本家／Azure OpenAI／その他 OpenAI 互換）。既定は本家・未設定。
     "openai_endpoint": {
         "configured": {"kind": None, "base_url": None, "auth_header": None, "api_version": None},

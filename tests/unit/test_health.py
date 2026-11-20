@@ -362,6 +362,9 @@ def test_ai_check_openai_rejects_placeholder_without_calling_probe(monkeypatch):
     assert called["n"] == 0, "プレースホルダなのに _probe（実API呼び出し）まで進んでいる"
 
 
+_OPENAI = {"codex_model_provider": "openai"}
+
+
 def test_ai_check_codex_uses_key_auth_on_azure_endpoint(monkeypatch):
     # Azure/互換接続先は env_key 認証＝`codex login status`（subprocess）を呼ばない。
     import subprocess
@@ -375,12 +378,12 @@ def test_ai_check_codex_uses_key_auth_on_azure_endpoint(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _no_subprocess)
     monkeypatch.setattr(health.keys, "resolve_api_key",
                         lambda provider, settings, system_settings=None, **kw: "sk-test")
-    health._ai_check_codex({}, {})
+    health._ai_check_codex(_OPENAI, {})
 
     monkeypatch.setattr(health.keys, "resolve_api_key",
                         lambda provider, settings, system_settings=None, **kw: None)
     with pytest.raises(RuntimeError, match=keys.NO_CENTRAL_KEY_MESSAGE[:12]):
-        health._ai_check_codex({}, {})
+        health._ai_check_codex(_OPENAI, {})
 
 
 def test_ai_check_codex_direct_openai_still_uses_login_status(monkeypatch):
@@ -396,7 +399,7 @@ def test_ai_check_codex_direct_openai_still_uses_login_status(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: (calls.append(a), _R())[1])
-    health._ai_check_codex({}, {})
+    health._ai_check_codex(_OPENAI, {})
     assert calls, "直結構成では login status を確認する"
 
 
@@ -652,6 +655,22 @@ def test_ollama_in_use_when_any_purpose_uses_it(monkeypatch, sys_s, rows):
     monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
     monkeypatch.setattr("sherpa.ingest.arms.enabled_arm_names", lambda: ["ooxml"])
     assert health.ollama_in_use(sys_s, rows) is True
+
+
+def test_ollama_in_use_for_unselected_user_whose_effective_provider_is_ollama(monkeypatch, tmp_path):
+    """Codex の接続先を選んでいない利用者だけがいて、実効が Ollama（管理者の既定・または認証なしの自動）のとき使っている扱い。"""
+    from sherpa import required_tools
+    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty"))
+    monkeypatch.setattr("sherpa.ingest.arms.enabled_arm_names", lambda: ["ooxml"])
+    monkeypatch.setattr(health.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr(required_tools, "codex_cli_missing", lambda: False)
+    rows = [{"agent": "", "codex_model_provider": ""}]
+    key = {"openai_api_key": "sk-x"}
+    assert health.ollama_in_use({**_AZURE_ONLY, **key, "codex_default_model_provider": "ollama"}, rows) is True
+    assert health.ollama_in_use(_AZURE_ONLY, rows) is True   # 認証なし＝自動で ollama
+    assert health.ollama_in_use({**_AZURE_ONLY, **key}, rows) is False
+    assert health.ollama_in_use({**_AZURE_ONLY, "codex_default_model_provider": "openai"}, rows) is False
 
 
 # ===== 埋め込みモデル未取得の検出 =====
