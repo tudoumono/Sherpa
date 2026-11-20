@@ -368,7 +368,7 @@ def _fetch_system_settings_readonly() -> dict:
 
 
 def _read_active_user_configs_readonly() -> list[dict]:
-    """有効な（`users.status='active'`）利用者の `user_settings` を DDL 抜きで読む（読み取り専用
+    """有効な（`users.status='active'`）利用者の `user_settings` を DDL 抜きで読む（個人設定を保存していない利用者も未選択の行として含める・読み取り専用
     SELECT のみ・理由は `_fetch_system_settings_readonly` と同じ）。無効化済み利用者の残存設定を
     要否判定に混入させない。`user_id` は読まない（個々の利用者名は出力に使わない・件数のみ扱う）。
 
@@ -389,7 +389,7 @@ def _read_active_user_configs_readonly() -> list[dict]:
         rows = c.execute(
             "SELECT us.agent, us.codex_model_provider, us.ollama_url, "
             "(us.openai_api_key IS NOT NULL AND us.openai_api_key <> '') AS has_openai_key "
-            "FROM user_settings us JOIN users u ON u.uid = us.user_id "
+            "FROM users u LEFT JOIN user_settings us ON us.user_id = u.uid "
             "WHERE u.status = 'active'",
         ).fetchall()
     return [dict(r) for r in rows]
@@ -613,7 +613,7 @@ def _chat_or_codex_consumes(selected: str, sys_s: dict, rows: list[dict] | None)
     if _actually_routes_to(default_eff):
         return True
     if (selected == "openai" and default_eff is not _INDETERMINATE
-            and _codex_consumes_openai(default_eff, agent_constructs.codex_model_provider(None))):
+            and _codex_consumes_openai(default_eff, agent_constructs.codex_model_provider(None, system_settings=sys_s))):
         return True
     if rows is None:
         return True
@@ -626,7 +626,7 @@ def _chat_or_codex_consumes(selected: str, sys_s: dict, rows: list[dict] | None)
         if _actually_routes_to(eff):
             return True
         if (selected == "openai" and eff is not _INDETERMINATE
-                and _codex_consumes_openai(eff, agent_constructs.codex_model_provider(settings))):
+                and _codex_consumes_openai(eff, agent_constructs.codex_model_provider(settings, system_settings=sys_s))):
             return True
     return False
 
@@ -1271,7 +1271,7 @@ def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | 
     ollama_used = False    # Codex(Ollama) が1箇所でも使われているか
     try:
         eff0 = agent_constructs.effective_agent(None, system_settings=sys_s)
-        cmp0 = agent_constructs.codex_model_provider(None)
+        cmp0 = agent_constructs.codex_model_provider(None, system_settings=sys_s)
         if eff0 == "codex":
             used = True
             openai_used = openai_used or cmp0 != "ollama"
@@ -1287,7 +1287,7 @@ def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | 
             settings = {"agent": row.get("agent"), "codex_model_provider": row.get("codex_model_provider")}
             try:
                 eff = agent_constructs.effective_agent(settings, system_settings=sys_s)
-                cmp = agent_constructs.codex_model_provider(settings)
+                cmp = agent_constructs.codex_model_provider(settings, system_settings=sys_s)
             except Exception:
                 used = True
                 openai_used = True
@@ -1363,14 +1363,14 @@ def _codex_required(sys_s: dict | None, rows: list[dict] | None) -> tuple[bool, 
     backing_kinds: set[str] = set()
     try:
         if agent_constructs.effective_agent(None, system_settings=sys_s) == "codex":
-            backing_kinds.add(agent_constructs.codex_model_provider(None))
+            backing_kinds.add(agent_constructs.codex_model_provider(None, system_settings=sys_s))
     except Exception:
         return True, True, _INDETERMINATE_NOTE
     for row in rows:
         settings = {"agent": row.get("agent"), "codex_model_provider": row.get("codex_model_provider")}
         try:
             if agent_constructs.effective_agent(settings, system_settings=sys_s) == "codex":
-                backing_kinds.add(agent_constructs.codex_model_provider(settings))
+                backing_kinds.add(agent_constructs.codex_model_provider(settings, system_settings=sys_s))
         except Exception:
             return True, True, _INDETERMINATE_NOTE
     required = bool(backing_kinds)
@@ -1454,12 +1454,12 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
             url = None
         try:
             eff = agent_constructs.effective_agent(row_settings, system_settings=sys_s)
+            codex_to = agent_constructs.codex_model_provider(row_settings, system_settings=sys_s) if eff == "codex" else None
         except Exception:
-            # この利用者行が実際に簡易／Codex(Ollama) を使うか自体を判定できない＝「使っていない」
-            # に丸めず判定不能（`type_error`）にする（本 docstring 末尾の段落参照）。
+            # この利用者行が Codex(Ollama) を使うか自体を判定できない＝「使っていない」に丸めず判定不能にする。
             type_error = True
-            eff = None
-        if eff == "codex" and row.get("codex_model_provider") == "ollama":
+            codex_to = None
+        if codex_to == "ollama":
             _add(url, codex_model, "Codex(Ollama) 実行モデル")
 
     if simple_used:

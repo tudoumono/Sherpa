@@ -31,6 +31,7 @@ from sherpa import (
 from sherpa.agents import _web_search_admin_allowed
 from sherpa.providers.codex import sandbox as codex_sandbox
 from sherpa.deps import _current_user, _require_admin
+from sherpa.routers import provider_defaults
 from sherpa.schemas import (
     AdminOllamaTestResponse,
     AnnouncementMutateResponse,
@@ -135,6 +136,8 @@ class SystemSettingsReq(BaseModel):
     user_api_keys_daily_quota_default: StrictInt | None = Field(default=None, ge=1, le=1_000_000)
     # 簡易回答に使う AI のプロバイダ（"ollama"/"openai"）。チャットの簡易と外部 API（POST /ext/v1/answer）が共通で読む（管理画面の表示名は「簡易回答に使う AI」）。未設定(None)は "ollama"。`sherpa.simple_chat.resolve_model_and_provider` が読む。
     research_default_provider: str | None = None
+    # 個人設定で Codex の接続先を選んでいない利用者の既定（"openai"/"ollama"）。空・null は未設定（自動選択）。
+    codex_default_model_provider: str | None = None
     openai_api_key: str | None = None
     ollama_url: str | None = None
     # OpenAI 互換 API の接続先（ラジオ・本家以外のときの base URL・認証ヘッダ形式・API バージョン）。null は未設定へ戻す。意味検証・実効値の解決は `sherpa/llm.py` が唯一の真実源。
@@ -506,11 +509,6 @@ def _admin_settings_view() -> dict:
         eff_openai_base_url = "(不正な保存値)"
         eff_openai_auth_header = "(不正な保存値)"
         eff_openai_api_version = "(不正な保存値)"
-    # `research_default_provider` も型検査を判定より先に行い ValueError を送出する。保存後に壊れた値があっても管理画面全体を 500 にしない。
-    try:
-        eff_research_default_provider = simple_chat.default_research_provider(sysset)
-    except ValueError:
-        eff_research_default_provider = "(不正な保存値)"
     return {
         # クラウド AI プロバイダの中央設定。key_set はキー値そのものではなく有無のみ。`provider` は現在の選択、`providers` は選べる値の一覧（画面の `<select>` 用）。
         "cloud": {
@@ -537,11 +535,9 @@ def _admin_settings_view() -> dict:
                 "default": store.SELF_ISSUED_DAILY_QUOTA_DEFAULT_FALLBACK,
             },
             # 外部からの簡易回答（POST /ext/v1/answer）の既定 AI（`configured`＝管理者の生値・`effective`＝未設定時のフォールバック込みの適用値・`default`＝組み込みのフォールバック値）。
-            "research_default_provider": {
-                "configured": sysset.get("research_default_provider"),
-                "effective": eff_research_default_provider,
-                "default": "ollama",
-            },
+            "research_default_provider": provider_defaults.research_info(sysset),
+            # 個人設定で接続先を選んでいない利用者の Codex の接続先（`effective` は未設定のときの自動選択込み）。
+            "codex_default_model_provider": provider_defaults.codex_info(sysset),
         },
         # OpenAI 互換 API の接続先（本家／Azure OpenAI／その他 OpenAI 互換）。`configured` は admin が保存した生値（未設定なら None）、`effective` は `sherpa/llm.py` による解決結果。base URL は管理画面の入力欄そのものなので伏せない（個人設定の読み取り専用表示はホスト名のみ）。
         "openai_endpoint": {
@@ -930,21 +926,6 @@ def _validate_central_ollama_url(value):
     return v
 
 
-def _validate_research_default_provider(value):
-    """`research_default_provider` の検証。None は未設定（`simple_chat.default_research_provider()` の既定 "ollama"）。"""
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise HTTPException(422, "research_default_provider は文字列で指定してください")
-    v = value.strip().lower()
-    if not v:
-        return None
-    if v not in simple_chat.RESEARCH_PROVIDERS:
-        options = "/".join(sorted(simple_chat.RESEARCH_PROVIDERS))
-        raise HTTPException(422, f"research_default_provider は {options} のいずれかで指定してください")
-    return v
-
-
 def _validate_depth_base_codex_reasoning(value):
     """`depth_base_codex_reasoning` の検証。None は未設定（コードの既定）。既知の語彙（`sherpa.depth_profile.CODEX_REASONING_LEVELS`）以外は 422。"""
     if value is None:
@@ -1138,7 +1119,7 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     - ollama_allowlist/webhook_allowlist: 各エントリを host:port に正規化して保存（不正は 422）。
     - codex_session_retention_days: 0 以上の整数（0=無制限）。
     - openai_endpoint_kind/base_url/auth_header/api_version: 種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら実効 base_url が空でないことも確認する。
-    - research_default_provider: ollama/openai のみ。"openai" への変更は適用後の実効設定で実送信可能性も確認する。
+    - research_default_provider／codex_default_model_provider: ollama/openai のみ（codex_default_model_provider は空文字・null で未設定）。"openai" への変更は適用後の実効設定で実送信可能性も確認する。
     - depth_base_*: 整数 5 項目は範囲検証済み。depth_base_codex_reasoning は定義済みの推論レベルのみ。
     - chat_max_turns_per_user/chat_max_turns_global: 1〜16／1〜64。agentic_budget_per_result: 1024〜8MiB。
     - workspace_max_bytes: 1MiB〜1GiB。workspace_ttl_days: 0〜3650（0=無期限）。
@@ -1181,9 +1162,7 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     if "user_api_keys_daily_quota_default" in provided:
         # StrictInt・範囲（1〜1,000,000）は pydantic Field が型検証済み。
         updates["user_api_keys_daily_quota_default"] = provided["user_api_keys_daily_quota_default"]
-    if "research_default_provider" in provided:
-        updates["research_default_provider"] = _validate_research_default_provider(
-            provided["research_default_provider"])
+    updates.update(provider_defaults.validated(provided))
     # 調べる深さの基準値（整数 5 項目は StrictInt+Field(ge,le) で範囲検証済み）。
     for _k in ("depth_base_grep_max_hits", "depth_base_qa_max_hits",
               "depth_base_read_window", "depth_base_impact_depth", "depth_base_troubleshoot_depth"):

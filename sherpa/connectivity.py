@@ -400,7 +400,7 @@ def _check_codex(ctx: _Ctx, paid: bool) -> dict:
         host = route = None
     if is_paid and not paid:
         raise _Skip("有料のため流していない", paid=True, route=route, host=host)
-    note = f"{agent_constructs.codex_model_provider(user_s)} / {provider.model}"
+    note = f"{agent_constructs.codex_model_provider(user_s, system_settings=sys_s)} / {provider.model}"
     root = Path(tempfile.mkdtemp(prefix="sherpa-codexchk-"))
     try:
         codex_home, run_dir = root / "codexhome", root / "run"

@@ -67,23 +67,29 @@ def test_closed_agents_are_never_selectable_blocked_or_defaulted(monkeypatch):
 
 
 def test_construct_id_distinguishes_codex_model_provider():
-    assert AC.construct_id({"agent": "codex"}) == "codex_openai"                      # 未設定は openai
-    assert AC.construct_id({"agent": "codex", "codex_model_provider": "openai"}) == "codex_openai"
-    assert AC.construct_id({"agent": "codex", "codex_model_provider": "ollama"}) == "codex_ollama"
+    ss = {"openai_api_key": "sk-x"}
+    assert AC.construct_id({"agent": "codex"}, system_settings=ss) == "codex_openai"   # 未選択は自動（キーあり＝openai）
+    assert AC.construct_id({"agent": "codex"}, system_settings={}) in ("codex_openai", "codex_ollama")
+    assert AC.construct_id({"agent": "codex", "codex_model_provider": "openai"}, system_settings=ss) == "codex_openai"
+    assert AC.construct_id({"agent": "codex", "codex_model_provider": "ollama"}, system_settings=ss) == "codex_ollama"
 
 
 def test_construct_id_strips_whitespace_around_codex_model_provider():
     """`codex_model_provider()`（実行時の共通resolver）と同じく strip+lowercase してから
     比較する。" OLLAMA " のような値を誤って codex_openai 表示にしない
     （黙って構成を上書き表示しない）。"""
-    assert AC.construct_id({"agent": "codex", "codex_model_provider": " OLLAMA "}) == "codex_ollama"
-    assert AC.construct_id({"agent": "codex", "codex_model_provider": " openai "}) == "codex_openai"
+    assert AC.construct_id({"agent": "codex", "codex_model_provider": " OLLAMA "}, system_settings={}) == "codex_ollama"
+    assert AC.construct_id({"agent": "codex", "codex_model_provider": " openai "}, system_settings={}) == "codex_openai"
 
 
-def test_codex_model_provider_falls_back_to_openai_only_when_unset():
-    assert AC.codex_model_provider({"agent": "codex"}) == "openai"
-    assert AC.codex_model_provider({"codex_model_provider": ""}) == "openai"
-    assert AC.codex_model_provider({"codex_model_provider": "ollama"}) == "ollama"
+def test_codex_model_provider_unset_follows_admin_then_auto(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty"))
+    assert AC.codex_model_provider({"agent": "codex"}, system_settings={"openai_api_key": "sk-x"}) == "openai"
+    assert AC.codex_model_provider({"codex_model_provider": ""}, system_settings={}) == "ollama"
+    assert AC.codex_model_provider({"codex_model_provider": ""},
+                                   system_settings={"codex_default_model_provider": "openai"}) == "openai"
+    assert AC.codex_model_provider({"codex_model_provider": "ollama"},
+                                   system_settings={"openai_api_key": "sk-x"}) == "ollama"
 
 
 def test_codex_model_provider_raises_for_unknown_nonempty_value():
@@ -225,7 +231,7 @@ def test_is_local_codex_depends_on_codex_model_provider():
     分からない（見ずに「クラウド」と決め打つと Codex(Ollama) 構成を誤分類する）。"""
     assert AC.is_local("codex", codex_model_provider="ollama") == "local"
     assert AC.is_local("codex", codex_model_provider="openai", system_settings={}) == "cloud"
-    assert AC.is_local("codex", system_settings={}) == "cloud"   # 未指定＝ codex_model_provider() の「既定 openai」と同じ仕様
+    assert AC.is_local("codex", system_settings={}) == "cloud"   # 接続先が渡されない呼び出しは openai 側として扱う
     assert AC.is_local("codex", codex_model_provider="openai", system_settings={
         "openai_endpoint_kind": "custom", "openai_base_url": "http://10.0.0.5:8000/v1"}) == "on_prem"
     assert AC.is_local("codex", codex_model_provider="openai", system_settings={

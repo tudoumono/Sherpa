@@ -100,6 +100,7 @@ let _ragLlmRenderBaseline = true;
 let _extKeysAllowedBaseline = false;
 let _extKeysQuotaBaseline = '';
 let _extKeysResearchProviderBaseline = 'ollama';
+let _extKeysCodexProviderBaseline = '';
 // 保存値が ollama/openai のどちらでもないときに select へ挿入する専用オプションの値（保存では送らない）。
 const _RESEARCH_PROVIDER_INVALID = '__invalid__';
 
@@ -960,6 +961,42 @@ function renderResearchDefaultProvider(rdp) {
   _extKeysResearchProviderBaseline = rdpKnown ? rdp.effective : _RESEARCH_PROVIDER_INVALID;
 }
 
+// Codex 調査の既定の接続先（自動／openai／ollama）。保存値がどれでもない場合は、select の一時的な選択肢とヒントでその旨を示す。
+function renderCodexDefaultProvider(cdp) {
+  cdp = cdp || {};
+  const configured = cdp.configured == null ? '' : String(cdp.configured);
+  const known = configured === '' || configured === 'openai' || configured === 'ollama';
+  const sel = $('ext-codex-default-provider');
+  if (sel) {
+    let invalidOpt = sel.querySelector(`option[value="${_RESEARCH_PROVIDER_INVALID}"]`);
+    if (!known) {
+      if (!invalidOpt) {
+        invalidOpt = document.createElement('option');
+        invalidOpt.value = _RESEARCH_PROVIDER_INVALID;
+        sel.insertBefore(invalidOpt, sel.firstChild);
+      }
+      invalidOpt.textContent = configured;
+      sel.value = _RESEARCH_PROVIDER_INVALID;
+    } else {
+      if (invalidOpt) invalidOpt.remove();
+      sel.value = configured;
+    }
+  }
+  const hint = $('ext-codex-default-provider-hint');
+  const invalid = $('ext-codex-default-provider-invalid');
+  if (invalid) {
+    invalid.hidden = known;
+    if (!known) invalid.textContent = '保存されている値が正しくありません。自動・OpenAI・Ollama のどれかを選び直して保存してください。';
+  }
+  if (hint) {
+    const label = (v) => (v === 'openai' ? 'OpenAI' : 'Ollama');
+    if (!known) hint.textContent = '';
+    else if (configured) hint.textContent = `${label(configured)} で固定中です。`;
+    else hint.textContent = `自動で決めています（今は ${label(cdp.effective)}）。`;
+  }
+  _extKeysCodexProviderBaseline = known ? configured : _RESEARCH_PROVIDER_INVALID;
+}
+
 function extKeyStatus(row) {
   if (row.revoked_at) return { cls: 'ek-revoked', label: '失効済み' };
   if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) {
@@ -1295,6 +1332,7 @@ function renderChatTab(view) {
 // 「調査・回答」タブは接続設定と独立して描画・リセットする。
 function renderResearchTab(view) {
   renderResearchDefaultProvider((view.ext_keys || {}).research_default_provider);
+  renderCodexDefaultProvider((view.ext_keys || {}).codex_default_model_provider);
   renderAgenticBudget(view.agentic_budget);   // ツール結果バイト予算
   renderCodexMode(view.codex_mode);
   renderDepthProfile(view.depth_profile);
@@ -1803,6 +1841,10 @@ function extKeysResearchProviderChanged() {
   return v !== _extKeysResearchProviderBaseline;
 }
 
+function extKeysCodexProviderChanged() {
+  return _val('ext-codex-default-provider') !== _extKeysCodexProviderBaseline;
+}
+
 // ===== 保存 =====
 async function save() {
   // 埋め込みデプロイ名欄は保存直前にも確定させる（フォーカスが残ったまま保存した場合の安全網）。
@@ -1872,6 +1914,11 @@ async function save() {
     const v = ($('ext-research-default-provider') || {}).value || 'ollama';
     // 破損状態を示す一時的な選択肢（"__invalid__"）が選ばれていたら送らない。
     if (v !== _RESEARCH_PROVIDER_INVALID) body.research_default_provider = v;
+  }
+  if (extKeysCodexProviderChanged()) {
+    const v = _val('ext-codex-default-provider');
+    // 破損状態を示す一時的な選択肢が選ばれていたら送らない。空（自動）は未設定へ戻す。
+    if (v !== _RESEARCH_PROVIDER_INVALID) body.codex_default_model_provider = v === '' ? null : v;
   }
   collectDepthProfile(body);   // 調べる深さの基準値（変わった項目だけ送る）
   if (maxReviewRoundsChanged()) {
@@ -2020,6 +2067,10 @@ function resetResearchTab() {
   _setVal('ext-research-default-provider', def);
   if (rdp.configured) {
     _planNull('research', 'research_default_provider', () => _val('ext-research-default-provider') === def);
+  }
+  _setVal('ext-codex-default-provider', '');
+  if (((((_view || {}).ext_keys || {}).codex_default_model_provider) || {}).configured) {
+    _planNull('research', 'codex_default_model_provider', () => _val('ext-codex-default-provider') === '');
   }
   _markResetDone('tab-reset-res-research');
 }
@@ -2176,7 +2227,7 @@ const TAB_DIRTY = {
     || openaiEndpointChanged() || mcEmbedChanged() || embedProviderChanged() || nullPlanActive('provider'),
   research: () => depthProfileChanged() || maxReviewRoundsChanged()
     || codexWorkerModelChanged() || codexSessionRetentionDaysChanged() || agenticBudgetChanged() || codexModeChanged()
-    || extKeysResearchProviderChanged() || nullPlanActive('research'),
+    || extKeysResearchProviderChanged() || extKeysCodexProviderChanged() || nullPlanActive('research'),
   chat: () => chatMaxTurnsChanged() || workspaceChanged() || chatExamplesChanged() || nullPlanActive('chat'),
   models: () => mcCatalogChangedExcludingEmbed(),
   ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged() || ocrSwitchChanged()
@@ -2272,6 +2323,7 @@ function applyConfigChangedHighlights(view) {
   mark($('ext-keys-user-quota-default'), quota.effective !== quota.default);
   const rdp = (view.ext_keys || {}).research_default_provider || {};
   mark($('ext-research-default-provider'), rdp.effective !== rdp.default);
+  mark($('ext-codex-default-provider'), !!((view.ext_keys || {}).codex_default_model_provider || {}).configured);
 }
 
 // #cloud-provider-radios は render() の度に innerHTML が入れ替わるため委譲リスナー1本にする。プロバイダを切り替えたらキー欄を再描画し、前のプロバイダ向けのキー値を誤って送らない。
