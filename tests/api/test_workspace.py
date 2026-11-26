@@ -225,7 +225,7 @@ def test_upload_size_limit():
     assert r.status_code == 413, r.status_code
 
 
-@pytest.mark.parametrize("bad_ext", [".exe", ".dll", ".zip", ".pdf"])
+@pytest.mark.parametrize("bad_ext", [".exe", ".dll", ".zip", ".xls", ".doc", ".ppt"])
 def test_disallowed_extension(bad_ext):
     _new_login()
     r = _upload(f"badfile{bad_ext}", b"content", "application/octet-stream")
@@ -248,8 +248,79 @@ def test_ledger_based_search_excludes_fs_residue():
 
 def test_allowed_exts_are_the_searchable_exts():
     from sherpa.api import _WORKSPACE_ALLOWED_EXT, _WORKSPACE_SEARCHABLE_EXT
-    assert _WORKSPACE_SEARCHABLE_EXT is _WORKSPACE_ALLOWED_EXT
-    assert _WORKSPACE_ALLOWED_EXT == _WORKSPACE_SEARCHABLE_EXT
+    assert _WORKSPACE_ALLOWED_EXT <= _WORKSPACE_SEARCHABLE_EXT
+
+
+def _pdf_bytes(text: str) -> bytes:
+    """本文 1 行だけの 1 ページの PDF。"""
+    data = f"BT /F1 12 Tf 20 150 Td ({text}) Tj ET".encode("latin-1")
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [5 0 R] /Count 1 >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            b"<< /Length %d >>\nstream\n" % len(data) + data + b"\nendstream",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 200] /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>"]
+    out, offsets = bytearray(b"%PDF-1.4\n"), []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1) + b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+    return bytes(out)
+
+
+def _office_bytes(marker: str) -> dict:
+    import docx
+    import openpyxl
+    import pptx
+    out = {}
+    wb = openpyxl.Workbook()
+    wb.active.title = "集計"
+    wb.active["B3"] = f"{marker} の表"
+    buf = io.BytesIO()
+    wb.save(buf)
+    out["xlsx"] = buf.getvalue()
+    doc = docx.Document()
+    doc.add_paragraph("はじめに")
+    doc.add_paragraph(f"{marker} の段落")
+    buf = io.BytesIO()
+    doc.save(buf)
+    out["docx"] = buf.getvalue()
+    prs = pptx.Presentation()
+    prs.slides.add_slide(prs.slide_layouts[1]).shapes.title.text = "表紙"
+    prs.slides.add_slide(prs.slide_layouts[1]).shapes.title.text = f"{marker} のスライド"
+    buf = io.BytesIO()
+    prs.save(buf)
+    out["pptx"] = buf.getvalue()
+    out["pdf"] = _pdf_bytes(f"{marker} page")
+    return out
+
+
+def test_office_and_pdf_uploads_are_searchable_and_readable_by_the_personal_tools():
+    """上げた Office・PDF を、画面の検索と個人ファイルの道具（区切り 1 の部品）が中の文字で探して読める。"""
+    from sherpa.parts.read import personal
+    from sherpa.providers.codex import personal_tools
+    sfx = _sfx()
+    uid, _ = _new_login(sfx)
+    marker = f"OFFICEMARK{sfx}"
+    for ext, data in _office_bytes(marker).items():
+        _upload_ok(f"doc{sfx}.{ext}", data)
+    where = {h["rel_path"]: h["where"] for h in _search_hits(marker)}
+    assert where == {f"doc{sfx}.xlsx": "シート「集計」の B3", f"doc{sfx}.docx": "2 段落目",
+                     f"doc{sfx}.pptx": "2 枚目のスライド", f"doc{sfx}.pdf": "1 ページ"}
+    ctx = personal.PersonalContext(pathlib.Path(os.path.realpath(_files_dir(uid))),
+                                   frozenset(personal_tools.allowed_files(uid)))
+    sheet, _, _, _ = personal.run_tool("personal_read", {"id": f"personal:doc{sfx}.xlsx", "sheet": "集計"}, ctx)
+    assert [c for row in sheet["rows"] for c in row if c] == [f"{marker} の表"]
+    page, _, _, _ = personal.run_tool("personal_read", {"id": f"personal:doc{sfx}.pdf"}, ctx)
+    assert page["pages"][0]["text"] == f"{marker} page"
+
+
+def test_search_masks_key_values_like_the_personal_tools():
+    sfx = _sfx()
+    _new_login(sfx)
+    _upload_ok(f"conf{sfx}.txt", f"KEYMARK{sfx}\napi_key = sk-{'a' * 24}\n".encode())
+    text = "\n".join(h["text"] for h in _search_hits(f"KEYMARK{sfx}"))
+    assert "sk-" + "a" * 24 not in text and "KEYMARK" in text
 
 
 @pytest.mark.parametrize("ext, tmpl", [

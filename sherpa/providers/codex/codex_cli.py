@@ -11,7 +11,7 @@ import time
 from ... import codex_agents_md, codex_skills, image_input, investigation_ledger, metering, tool_call_log
 from ... import depth_profile as depth_profile_mod
 from ..base import _log, _log_chat_usage, _log_codex, _node, _usage_meta
-from . import sandbox
+from . import personal_tools, sandbox
 from .activity import exec_failure_counts as _codex_exec_failure_counts
 from .activity import summarize_turn as _summarize_codex_activity
 from .mcp import _mcp_config_args, _mcp_env
@@ -209,7 +209,7 @@ def write_run_files(self, ctx, st):
     _mcp_budget_env = st._mcp_budget_env
     try:
         if _plain:
-            codex_agents_md.write_agents_md(run_dir, plain=True)
+            codex_agents_md.write_agents_md(run_dir, plain=True, personal_only=st._personal.only)
         else:
             codex_agents_md.write_agents_md(run_dir, output_schema=_schema_on,
                                             direct_read=_direct_read_ok,
@@ -221,12 +221,13 @@ def write_run_files(self, ctx, st):
                                             source_required="source" in st._ledger_required_extra,
                                             ledger_style=st._ledger_style,
                                             plan_review_cap=st._plan_review_cap,
+                                            personal_tools=st._personal.offered,
                                             image_input=image_input.codex_image_input(
                                                 self._system_settings, ollama=self._ollama_base_url is not None))
     except Exception as e:
         _log.warning("AGENTS.md write failed: %s", type(e).__name__)
         raise RunFilesError(RUN_FILES_FAILED_MESSAGE) from e
-    # スキルは knowledge=ON の Codex 実行全部で配備する（author に限定しない）。plain は investigate-* スキルを置かない（xlsx/docx/pptx/marp は配備する）。
+    # スキルは Codex 実行全部で配備する（author に限定しない）。plain と個人ファイルだけのターンは investigate-* スキルを置かない（xlsx/docx/pptx/marp は配備する）。
     try:
         codex_skills.deploy_skills(run_dir, uid, users_dir,
                                    skip_prefix="investigate-" if _plain else None)
@@ -314,6 +315,7 @@ def release_codex_home(ctx, st, env):
         except Exception as _act_exc:
             _log.warning("codex activity summarize failed: %s errno=%s",
                         type(_act_exc).__name__, getattr(_act_exc, "errno", None))
+    personal_tools.cleanup(st)
     if st._persist_session:
         # セッション実体（`sessions/` の JSONL）は次ターンの resume のために保持する。creds を含む config.toml・`auth.json`（実 `~/.codex/auth.json` への symlink）・サイドカーは毎ターン削除する（次ターンは再作成する・前ターンの読取記録を持ち越さない）。
         try:
@@ -402,8 +404,8 @@ def build_launch(self, ctx, st):
     _style = st._ledger_style
     st._plan_review_cap = plan_ledger.review_cap_for((ctx.scope_meta or {}).get("depth_profile"))
     if _plain:
-        # 素の Codex モード: MCP サーバへツールの絞り込みを渡す。台帳のディレクトリ・required_extra は渡さない（台帳ツール自体を出さない）。
-        _mcp_budget_env["SHERPA_MCP_TOOLSET"] = "plain"
+        # 素の Codex モード・個人ファイルだけのターン: MCP サーバへツールの絞り込みを渡す。台帳のディレクトリ・required_extra は渡さない（台帳ツール自体を出さない）。
+        _mcp_budget_env["SHERPA_MCP_TOOLSET"] = personal_tools.toolset(st)
     else:
         # 解決済み（realpath）のパスを渡す（MCP サーバ側が書込のたびに「書込先の経路に symlink が無い」ことを検査するため）。計画書方式では台帳のツールを公開せず、台帳のディレクトリも渡さない。
         if _style == "json":
@@ -415,9 +417,6 @@ def build_launch(self, ctx, st):
         # `ledger_status`（mcp_server.py）の自己確認も provider 側のゲートと同じ required_extra を見られるようにする（ターンの最初に決めた値・カンマ区切り・空なら空文字列）。
         if _style == "json":
             _mcp_budget_env["SHERPA_MCP_LEDGER_REQUIRED_EXTRA"] = ",".join(st._ledger_required_extra)
-        # 個人ファイル参照トグルが ON のターンは、ヒットの有無に関わらず台帳の coverage に検索語を記録しない（個人の内容が混ざり得るため）。
-        if ctx.personal or ctx.personal_facts:
-            _mcp_budget_env["SHERPA_MCP_COVERAGE_NO_QUERY"] = "1"
     # Sherpa 側の ID（会話・ターン）を MCP サーバーへ渡す。何回目の実行かは `_build_argv` が実行ごとに足す。
     if ctx.conversation_id is not None:
         _mcp_budget_env["SHERPA_MCP_CONVERSATION_ID"] = str(ctx.conversation_id)
@@ -436,6 +435,7 @@ def build_launch(self, ctx, st):
             codex_home = users_dir / uid / "workspace" / f".codexhome-{_rand}"
         # codex_home（`:root deny`＝model-shell から不可視・MCP サーバは別プロセスなので書ける）配下に置く。run_dir 直下だと Codex の shell ツールが偽の `{"kind":"read",...}`/`{"kind":"ask_user",...}` 行を追記でき、未読資料を根拠ゲートへ通したり任意の確認カードでターンを潰せてしまう。
         _sidecar_path = codex_home / _MCP_SIDECAR_NAME
+        _mcp_budget_env.update(personal_tools.mcp_env(ctx, st, codex_home))  # 個人ファイルの一覧もサイドカーと同じ置き場
         # 道具の呼び出しの記録の置き場。サンドボックスのシェルから書けない codex_home の中（ターンごとの名前・終わりに消す）。
         st._call_log_dir = codex_home / f"toolcalls-{st.turn_uid}"
         _mcp_budget_env[tool_call_log.ENV_DIR] = str(st._call_log_dir)
@@ -457,7 +457,7 @@ def build_launch(self, ctx, st):
         argv_base += _web_search_c_args(self._web_search, self._system_settings)
         argv_base += sandbox.external_features_c_args()
         # `.tmp/`（run_dir 配下）はこの経路では model-shell からも見える（封じ込めが無い前提の経路）。`_sidecar_append` が書く内容は doc_id／ツール名／種別／時刻（と ask_user の質問）だけで本文は書かないが、shell が偽の行を追記できる可能性は残る。
-        _sidecar_env = {"SHERPA_MCP_SIDECAR": str(_sidecar_path)}
+        _sidecar_env = {"SHERPA_MCP_SIDECAR": str(_sidecar_path), **personal_tools.mcp_env(ctx, st, _tmp)}
         # 封じ込めの無い経路（SHERPA_CODEX_SANDBOX=0）はシェルからも書ける＝ターンの作業フォルダの中に置く。
         st._call_log_dir = _tmp / "toolcalls"
         _mcp_budget_env[tool_call_log.ENV_DIR] = os.path.realpath(st._call_log_dir)

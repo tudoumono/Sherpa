@@ -168,7 +168,7 @@ async function doSearch() {
     res.innerHTML = `<div style="font-size:var(--text-small);color:var(--ink-3);margin-bottom:8px">${badge}${esc(String(hits.length))} 件</div>${gap}`
       + hits.map((h) =>
         `<div class="hit-card">
-          <div class="hit-meta">${esc(h.rel_path)} — ${esc(String(h.line))} 行目</div>
+          <div class="hit-meta">${esc(h.rel_path)} — ${h.where ? esc(h.where) : esc(String(h.line)) + ' 行目'}</div>
           <pre>${esc(h.text)}</pre>
         </div>`
       ).join('');

@@ -14,7 +14,7 @@ from ... import layer as layer_mod
 from ...answer_shape import NO_TOOL_USE_NOTICE, STOPPED_EARLY_NOTICE, STOPPED_NOTICE, add_notice, seal, set_body
 from ..base import _evidence_gate_note, _log, _node, _verified_sources
 from .citations import (MENTION_MAX, MENTION_SCAN_MAX, _name_index, extract_doc_tokens, normalize_doc_ref,
-                        parse_referenced_doc_lines, plausible_doc_tokens, resolve_referenced_docs,
+                        plausible_doc_tokens, resolve_referenced_docs,
                         resolve_referenced_docs_detail, screen_by_layer, index_paths, REASON_AMBIGUOUS)
 from .call_log import (REFERENCED_DOCS_MAX, call_record_sections, call_stats, finalize_call_log, found_docs_for_answer,
                        referenced_docs_for_answer)
@@ -25,7 +25,7 @@ from .continuation import _pick_codex_headline
 from .impact_list import REASON_NO_RECORD, build_impact_list
 from .process import _CONTEXT_WINDOW_EXCEEDED_CODE, _masked_run_dir_path, _read_last_message_fallback
 from .sandbox import _detect_chrome_path, _marp_bin
-from . import plan_ledger
+from . import personal_tools, plan_ledger
 from .structured import _DEMOTED_CLAIMS_NOTE, _INVALID_CLAIMS_NOTE, split_review_preamble, _apply_codex_evidence_gate, _claims_vs_ledger, verify_reconciliation
 from .turn_candidates import _continuation_pending, _pick_structured_claims, _pick_structured_claims_invalid, _pick_structured_headline, _pick_structured_reconciliation
 from .turn_consts import (_CREATED_FILES_FAILURE_NOTE, _MARP_FAILURE_NOTE, _MCP_SIDECAR_NAME, _SKILLS_BASE,
@@ -514,7 +514,7 @@ def assemble_result(self, ctx, st, decision, env):
     if st.answer:
         env["headline"] = st.answer
         # 直読した資料は MCP の結果に載らず env["sources"] に反映されない。回答末尾の「参照した資料:」ブロックを解析し、read 系 MCP ツール引数から拾った doc_id（記載漏れの補完・出現順で後ろに合流）と合わせて機械検証（実在・文書種別・scope・秘匿名除外）を通ったものだけを sources の先頭へ足す（`_gather` 由来の既存 sources は後ろに残す・doc_id 重複は除外）。参照ブロックは本文から外す（本文が空になるときだけ外さない）。
-        _body, _listed_lines = parse_referenced_doc_lines(st.answer)
+        _body, _listed_lines = personal_tools.take_answer_refs(st, env, st.answer)  # 個人ファイルの行は外し、個人の枠へ
         _ref_candidates: list = list(_listed_lines)
         _ref_layer = layer_mod.effective_layer(ctx.scope_meta, decision["lens"])
         # ① 計画書の結論に書かれた資料を参照の候補に足す。② 本文（参照の欄を除く）に名前が出る資料を拾う（資料参照オンの作成以外のターンだけ）。
@@ -540,9 +540,9 @@ def assemble_result(self, ctx, st, decision, env):
                 if _in:
                     _name_idx[_n] = _in
             if _want_mentions:
-                _mention_tokens = extract_doc_tokens(_body, limit=MENTION_SCAN_MAX, paths=_paths)
+                _mention_tokens = personal_tools.drop_refs(extract_doc_tokens(_body, limit=MENTION_SCAN_MAX, paths=_paths), st)
             # 結論の資料のうち、回答の「参照した資料:」に書かれているものは除く
-            _conclusion_paths = [t for t in extract_doc_tokens(_conc_text, limit=MENTION_SCAN_MAX, paths=_paths)
+            _conclusion_paths = [t for t in personal_tools.drop_refs(extract_doc_tokens(_conc_text, limit=MENTION_SCAN_MAX, paths=_paths), st)
                                  if t not in _listed_docs and normalize_doc_ref(t, ctx.world) not in _listed_docs]
             _conclusion_paths, _layer_out = screen_by_layer(
                 plausible_doc_tokens(_conclusion_paths, _name_idx), ctx.world, _ref_layer)
@@ -556,9 +556,9 @@ def assemble_result(self, ctx, st, decision, env):
                 _ref_seen.add(_r)
                 _ref_candidates.append(_r)
         # `xlsx_sheets`（シート一覧のみ）の doc_id も参照候補（sources）には合流させる。ただし「参照した資料:」にも書かれておらず本文精読ツール（`_mcp_read_docs`）でも読まれていない doc_id は、根拠ゲート（sources_verified）に数えない。参照ブロック＋本文精読ツールだけで確定する「精読済み」集合を先に確定させ、`xlsx_sheets` を足した後の verified との差分（`_listed_only_ids`）として区別する。
-        _ref_detail = resolve_referenced_docs_detail(_ref_candidates, ctx.world, sp, _ref_layer, index=_name_idx)
-        _verified_listed, _unverified_refs, _sensitive_refs = (
-            _ref_detail["verified"], _ref_detail["unverified"], _ref_detail["hidden"])
+        _ref_detail = personal_tools.drop_shadowed(st, resolve_referenced_docs_detail(
+            _ref_candidates, ctx.world, sp, _ref_layer, index=_name_idx))
+        _verified_listed, _unverified_refs, _sensitive_refs = (_ref_detail[k] for k in ("verified", "unverified", "hidden"))
         _verified_before_listed = set(_verified_listed)
         _verified_refs = _verify_listed_docs(_mcp_listed_docs, _ref_seen, _ref_candidates, _verified_listed,
                                              ctx.world, sp, _ref_layer)
@@ -583,8 +583,8 @@ def assemble_result(self, ctx, st, decision, env):
         _same_name = [t for t in _mention_tokens if "/" not in t and len(_scope_idx.get(t, [])) > 1]
         _mention_tokens = [t for t in _mention_tokens if t not in _same_name]
         if _mention_tokens:
-            _m_detail = resolve_referenced_docs_detail([[[t]] for t in _mention_tokens], ctx.world, sp, _ref_layer,
-                                                       index=_name_idx)
+            _m_detail = personal_tools.drop_shadowed(st, resolve_referenced_docs_detail(
+                [[[t]] for t in _mention_tokens], ctx.world, sp, _ref_layer, index=_name_idx))
             _mention_new = [d for d in _m_detail["verified"] if d not in _verified_set]
             _mention_unverified, _mention_hidden = _m_detail["unverified"], _m_detail["hidden"]
         _mention_unverified = list(_mention_unverified) + [{"path": t, "reason": REASON_AMBIGUOUS} for t in _same_name]
@@ -634,7 +634,7 @@ def assemble_result(self, ctx, st, decision, env):
         # 「参照した資料」の行・本文に名前が出た資料のうち検証を通らなかったもの（理由つき・自由な文や解釈できない行だけ件数）。注記は「参照した資料」の行の分だけ数える。
         _unverified_total = len(_unverified_refs) + _sensitive_refs
         _unverified_rows = list(_unverified_refs)
-        for _r in _layer_out + _mention_unverified:
+        for _r in personal_tools.drop_unverified(st, _layer_out + _mention_unverified):
             if _r not in _unverified_rows:
                 _unverified_rows.append(_r)
         _hidden_total = _sensitive_refs + _mention_hidden
@@ -661,7 +661,7 @@ def assemble_result(self, ctx, st, decision, env):
                 _claims, _gate_meta, _gate_missing, _gate_unavailable = _apply_codex_evidence_gate(
                     _claims, lens=decision["lens"], world=ctx.world, scope_paths=sp,
                     layer=layer_mod.effective_layer(ctx.scope_meta, decision["lens"]),
-                    personal_facts=ctx.personal_facts)
+                    personal_read=bool(st._personal.read_rels))
                 # 台帳突合（claims は台帳からの投影）は根拠種別ゲートの後に適用する（両方の格下げが独立に効く）。
                 _claims_ledger_check = {}
                 if st._ledger_style == "json":

@@ -18,7 +18,7 @@ from . import stop_kind as stop_kind_mod
 from . import tools_pref as tools_pref_mod
 from .ingest import importance
 from .agents import AGENT_PROVIDERS, Ctx, get_provider
-from .providers import plain_provider_for
+from .providers import personal_only_provider_for, plain_provider_for
 from .chat_router import clarify_decision as _clarify_decision
 from .chat_router import confirm_first_decision as _confirm_first_decision
 from .chat_router import decision_for as _decision_for
@@ -796,10 +796,11 @@ def _prepare_turn_settings(user_id, settings, sys_settings, web_search, tools_av
     return settings, sys_settings, tools_availability
 
 
-def _select_provider(provider, knowledge, settings, sys_settings):
-    """呼び出し元が組み立てた Provider を優先する。資料参照オフは簡易と同じ AI を道具なしで呼ぶ（Codex 構成でも Codex を起動しない）。"""
+def _select_provider(provider, knowledge, settings, sys_settings, personal=False):
+    """呼び出し元が組み立てた Provider を優先する。資料参照オフは簡易と同じ AI を道具なしで呼ぶ（Codex を起動しない）。
+    ただし個人ファイルオンで Codex 構成（サンドボックス有効）なら、個人ファイルの道具だけを持つ Codex で答える。"""
     if provider is None and not knowledge:
-        provider = plain_provider_for(settings, sys_settings)
+        provider = (personal and personal_only_provider_for(settings, sys_settings)) or plain_provider_for(settings, sys_settings)
     if provider is None:
         provider = get_provider(settings, system_settings=sys_settings)
     return provider
@@ -807,10 +808,11 @@ def _select_provider(provider, knowledge, settings, sys_settings):
 
 def _build_turn_ctx(message, world, *, user_id, knowledge, personal, users_dir, stop_event,
                     scope_meta, known, settings, explicit_lens, doc_focus, history, conversation_id,
-                    codex_session_id, codex_usage_prev_total, tools_availability, t0):
-    """provider に渡す `Ctx` と個人ファイルのヒットを用意する。個人ファイルの grep は資料参照オンかつ個人ファイル参照 ON のときだけで、本人 uid の workspace 配下のみ（ES/Neo4j には書かない）。"""
+                    codex_session_id, codex_usage_prev_total, tools_availability, t0, presearch=True):
+    """provider に渡す `Ctx` と個人ファイルのヒットを用意する。個人ファイルの grep は資料参照オンかつ個人ファイル参照 ON かつ `presearch`（頭脳が個人ファイルの道具を持たない）のときだけで、
+    本人 uid の workspace 配下のみ（ES/Neo4j には書かない）。道具を持つ頭脳は回答前に探さず、頭脳が名前の一覧と道具で探して読む（資料参照オフは道具を持つ Codex だけが読み、他の頭脳は素の会話）。"""
     personal_hits: list[dict] = []
-    if personal and knowledge:
+    if personal and knowledge and presearch:
         personal_hits = _personal_grep_hits(user_id, message, users_dir)
     focus = bool(doc_focus) and explicit_lens == "investigate"
     ctx = Ctx(
@@ -897,7 +899,7 @@ def stream_message(session, message, world="v1",
     provider が `node`（動的に何個でも）を流し、最後に内部 `_result` を返す。本関数は会話の用意・永続だけを担い、`_result` を `answer` イベントに変換して返す。
     - `knowledge=False`（既定）: 検索せず素の会話（資料参照オフ）。`True` で社内資料を参照する（レンズ＋出典）。
     - `scope_paths`: 検索/分析をその範囲に絞る（knowledge 時のみ）。`layer`（既定 `None`＝`"both"`）: 探す対象。`lens`（既定 `None`＝自動）: 調べ方の明示指定で、メッセージ先頭のスラッシュ接頭辞が優先する（`_resolve_lens`）。
-    - `personal=True`: 共有 KB に加え本人の個人ファイルも grep して事実+引用に含める。個人ファイルは ES/Neo4j に入れず、本人のみ参照可。
+    - `personal=True`: 共有 KB に加え本人の個人ファイルも参照する（Codex は名前の一覧と道具で探して読み、道具を持たない頭脳は質問の文で grep したヒットを事実+引用に含める）。資料参照オフでは Codex（サンドボックス有効）だけが個人ファイルの道具だけを持つ形で読み、他の頭脳は素の会話。個人ファイルは ES/Neo4j に入れず、本人のみ参照可。
     - `web_search=False`（既定）: このチャットで Codex の Web 検索を希望するか。保存済みの個人設定 `codex_web_search` は実行には使わず、この値で上書きしてから provider を選ぶ。
     - `depth_profile`（既定 `None`＝`"standard"`）: 調べる深さ。agentic 探索の反復・ヒット上限・探索深さ・Codex 推論に倍率で効く（evaluator の巡数は `depth_profile.review_rounds_for`）。
     - `doc_focus`（既定 False）: 資料を中心に調べる指定。`investigate` のターンだけ Codex への指示に効く（`Ctx.doc_focus`）。
@@ -938,16 +940,17 @@ def stream_message(session, message, world="v1",
                  if knowledge else None)  # 明示 ＞ 全体
     settings, sys_settings, tools_availability = _prepare_turn_settings(
         user_id, settings, sys_settings, web_search, tools_availability, knowledge)
+    _provider = _select_provider(provider, knowledge, settings, sys_settings, personal=personal)
     ctx, personal_hits = _build_turn_ctx(
         message, world, user_id=user_id, knowledge=knowledge, personal=personal,
         users_dir=users_dir, stop_event=stop_event, scope_meta=scope_meta, known=known, settings=settings,
         explicit_lens=explicit_lens, doc_focus=doc_focus, history=history, conversation_id=conversation_id,
         codex_session_id=codex_session_id, codex_usage_prev_total=codex_usage_prev_total,
-        tools_availability=tools_availability, t0=_t0)
+        tools_availability=tools_availability, t0=_t0,
+        presearch=not getattr(_provider, "uses_personal_tools", lambda: False)())
     # 「思考の流れ」を `messages.trace` に保存する。node は id 単位で更新され得るため id で dedup し、最終状態のみ保持する。question は別カードで表示するため含めない。
     trace_nodes: dict = {}
     _stopped_pending = False  # 停止を検知したが停止終端（未完了回答）をまだ受け取っていない状態
-    _provider = _select_provider(provider, knowledge, settings, sys_settings)
     for ev in _degrade_overload(_provider.run(ctx), message, world, scope_meta):
         if stop_event is not None and stop_event.is_set() and not _is_stopped_terminal(ev):
             if ev.get("type") == "_result" and "codex_multi_agent" in ev["env"]:

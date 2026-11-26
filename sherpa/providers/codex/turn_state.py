@@ -8,6 +8,7 @@ import re
 import uuid
 
 from ...env_int import env_int
+from .personal_tools import TurnPersonal
 from .usage import _CHILD_USAGE_KEYS
 
 TOOL_USE_USED = "used"
@@ -48,7 +49,7 @@ class CodexTurnState:
         "_wall_clock_limit_s", "_wall_clock_state", "_resume_fallback_happened", "_sidecar_init_ok",
         "_graph_schema_era_error", "_mcp_error_codes", "_mcp_tool_result_clipped", "_mcp_total_budget_hit",
         "_mcp_duplicate_tool_call", "_mcp_search_truncated", "_mcp_tool_calls_exhausted", "_mcp_coverage_write_failed",
-        "_ask_disabled",
+        "_ask_disabled", "_personal",
         "mcp_neighbors", "mcp_graph_results", "_mcp_read_docs", "_mcp_listed_docs", "_mcp_calls", "_event_type_counts",
         "_child_thread_ids", "_all_parent_thread_ids", "_child_usage_totals", "_child_usage_found",
         "_child_usage_missing", "_child_usage_detected", "codex_created_files",
@@ -95,9 +96,8 @@ class CodexTurnState:
         self._tool_zero_nudged = False  # 道具ゼロの促しを出したか（1 ターン 1 回まで）
         self._tool_zero_notice = False  # 促した後も道具ゼロだった（注記「資料を調べずに答えています」を付ける）
         self._plain = plain  # 素の Codex モード（ターンの最初に 1 回だけ決める）
-        self.users_dir = None
-        self.uid = None
-        self.run_dir = None
+        self.users_dir = self.uid = self.run_dir = None
+        self._personal = TurnPersonal()  # 個人ファイルの道具（開いてよい一覧・置き場・読んだファイル）
         self.answer, self.ran = None, False
         # 回答の注記（文字列、または (kind, 文) の組）。仕上げで `answer.notices` へ移す。
         self._answer_notices: list = []

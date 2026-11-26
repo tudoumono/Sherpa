@@ -54,7 +54,7 @@ def test_codex_plain_text_is_uniform_regardless_of_message():
     texts = {p._plain_text(msg) for msg in ("消費税率の一覧をExcelで作って", "こんにちは、元気？", "")}
     assert len(texts) == 1
     txt = texts.pop()
-    assert "常に社内資料を参照" in txt
+    assert "社内資料か個人ファイルを参照" in txt
     assert "OpenAI" in txt
 
 

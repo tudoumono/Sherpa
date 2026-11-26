@@ -213,6 +213,10 @@ class Provider:
         return ("ナレッジ参照はオフです。社内資料は参照していません。資料に基づく回答が必要なら、"
                 "入力欄の「ナレッジ参照」をオンにしてください。")
 
+    def uses_personal_tools(self) -> bool:
+        """個人ファイルを道具（`personal_search`・`personal_read`）で探して読ませるか。偽なら回答前に質問の文で個人ファイルを探してヒットを渡す。"""
+        return False
+
     def _agentic_target_check(self) -> None:
         """`tool_availability` より前に呼ぶ、接続先の I/O-free 許可判定（SSRF チョークポイント）。
         既定は no-op。接続先が設定依存の provider はオーバーライドし、不許可の宛先なら例外で fail-closed に止める。

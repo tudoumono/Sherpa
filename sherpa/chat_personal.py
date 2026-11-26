@@ -27,7 +27,7 @@ def _redact(text: str) -> str:
     return _KV_SECRET_RE.sub(r"\1\2[REDACTED]", t)
 
 
-# 個人ファイル参照の許可拡張子（workspace upload 許可と同じ集合・`api.py` の `_WORKSPACE_SEARCHABLE_EXT` と同義）。`api.py` に依存しないためここで重複定義する。個人領域は共有 KB のアナライザ登録簿とは別の独立集合で、コード分は和集合に含める。
+# 個人ファイルのうち、テキストとして行で探せる拡張子（回答前の事前検索が使う）。Office・PDF は含めない（道具と画面の検索が読む形式は `parts/read/personal.READABLE_EXT`＝これに Office・PDF を足したもの）。個人領域は共有 KB のアナライザ登録簿とは別の独立集合で、コード分は和集合に含める。
 _PERSONAL_SEARCHABLE_EXT = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml",
     ".sql", ".py", ".sh", ".bat",

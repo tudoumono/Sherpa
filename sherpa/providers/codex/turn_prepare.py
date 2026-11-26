@@ -11,7 +11,7 @@ from ... import investigation_ledger, path_rules
 from ... import layer as layer_mod
 from ..base import _log, _node
 from .codex_cli import build_launch, log_turn_start, resolve_reasoning
-from . import sandbox, plan_ledger
+from . import personal_tools, sandbox, plan_ledger
 from ...env_int import env_int
 from .ledger_gate import (
     _FINAL_ANSWER_VOICE,
@@ -103,6 +103,21 @@ def _restore_failed_result(ctx, decision):
            "decision": {"lens": decision["lens"], "input": ctx.message, "reason": "前回の調査台帳の復元に失敗"}}
 
 
+def _direct_read_plan(ctx, st, sp) -> tuple:
+    """原本直読の `(read root, 明示 deny の root, 秘匿・範囲外の deny, 直読の可否)` を決め、管理者の優先・除外を `st._rules` に置く。
+    秘匿の列挙に失敗（RuntimeError）したら直読不可に揃える。個人ファイルだけのターンは資料フォルダを読ませない（root ごと deny・規則は空）。"""
+    _base_roots = _direct_read_roots(ctx.world)
+    if st._personal.only:
+        st._rules = path_rules.EMPTY
+        return [], _base_roots, [], False
+    try:
+        st._rules = _rules = path_rules.rules_for(ctx.world)  # この依頼の間は、この規則だけを使う（deny・strict の判定・MCP の子へ渡す env）。読めなければ直読みを止める
+        return _base_roots, [], sandbox.turn_deny(ctx.world, _base_roots, sp, _venv_root(), _rules), True
+    except RuntimeError as e:
+        _log.warning("codex direct read disabled: %s", e)
+        return [], _base_roots, [], False
+
+
 def prepare_run(self, ctx, st, decision):
     """Codex を起動する準備: 層・直読の可否の確認（失敗は正直に伝えて True＝終了）・作業領域・調査台帳の復元・推論の設定・プロンプト・起動引数・開始ログ。"""
     _plain = st._plain
@@ -143,7 +158,7 @@ def prepare_run(self, ctx, st, decision):
         yield {"type": "_result", "env": env,
               "decision": {"lens": decision["lens"], "input": ctx.message, "reason": _reason}}
         return True
-    # authoring/ = Codex の書込先（cwd）。files/ = ユーザーアップロード（cwd 外・Codex から隔離）。files/ の symlink チェックはアップロード grep 側（`chat_service._personal_grep_hits`）で行う。
+    # authoring/ = Codex の書込先（cwd）。files/ = ユーザーアップロード（cwd 外・シェルから隔離・個人ファイルの道具だけが開く）。files/ の symlink は道具の準備（`personal_tools.prepare`）でも拒む。
     ws_files = users_dir / uid / "workspace" / "files"
     if ws_files.is_symlink():
         ws_files = None  # type: ignore[assignment]
@@ -160,18 +175,9 @@ def prepare_run(self, ctx, st, decision):
             and not ({".tmp", ".agents"} & set(p.relative_to(run_dir).parts))
         }
     resolve_reasoning(self, ctx, st, decision)
-    # 原本直読の read root と秘匿 deny の列挙は、プロンプトの文言（direct_read フラグ）と permission profile（`_write_codex_authoring_config`）の両方が使うため、プロンプト組立の前に1回だけ計算する。列挙失敗（RuntimeError＝fail-closed）時は両方とも「直読不可」に揃える。
-    _base_roots = _direct_read_roots(ctx.world)
-    _direct_roots, _deny_roots = _base_roots, []
-    _venv_for_deny = _venv_root()
-    try:
-        st._rules = _rules = path_rules.rules_for(ctx.world)  # 管理者の優先・除外。この依頼の間は、この規則だけを使う（deny・strict の判定・MCP の子へ渡す env）。読めなければ直読みを止める
-        _sensitive_deny = sandbox.turn_deny(ctx.world, _base_roots, sp, _venv_for_deny, _rules)
-        _direct_read_ok = True
-    except RuntimeError as e:
-        _direct_roots, _deny_roots, _sensitive_deny, _direct_read_ok = [], _base_roots, [], False
-        _log.warning("codex direct read disabled: %s", e)
-    if not _direct_read_ok and _plain:
+    # 原本直読の read root と秘匿 deny の列挙は、プロンプトの文言（direct_read フラグ）と permission profile（`_write_codex_authoring_config`）の両方が使うため、プロンプト組立の前に1回だけ計算する。
+    _direct_roots, _deny_roots, _sensitive_deny, _direct_read_ok = _direct_read_plan(ctx, st, sp)
+    if not _direct_read_ok and _plain and not st._personal.only:
         # 素の Codex（plain）は直接参照だけが資料を読む手段のため、直読を許可しないと何も調べられない。黙って空振りの回答を返さず、実行前に正直に失敗する（利用者向け文言は専門用語ゼロ）。
         msg = "この資料フォルダは今回読み取りの準備ができませんでした。管理者に確認を依頼してください。"
         yield _node("codex", "think", "Codex が調べる", "資料の読み取り準備に失敗", "done")
@@ -226,14 +232,13 @@ def prepare_run(self, ctx, st, decision):
                     f"前回の見直しで追加に調べられるとした観点: {_extras_text}。"
                     "これを新しい調査項目として ledger_manifest_set に足してから調べて"
                     "ください。" + _FINAL_ANSWER_VOICE)
-    # personal_facts を注入したプロンプトを組む。
-    _codex_msg = ctx.message
-    if ctx.personal_facts:
-        _codex_msg = (f"{ctx.message}\n\n"
-                      f"【個人ファイル内ヒット（本人のみ・共有不可）】\n{ctx.personal_facts}")
+    # 個人ファイル（事前検索のヒット、または道具で探して読める名前の一覧）を足したプロンプトを組む。
+    _codex_msg = personal_tools.prepare(ctx, st)
     if _continuation_review_note:
         _codex_msg = f"{_codex_msg}\n\n【前回の続き】\n{_continuation_review_note}"
     def _build_prompt(with_history: bool) -> str:
+        if st._personal.only:
+            return self._prompt_personal(_codex_msg, with_history=with_history)
         if _plain:
             return self._prompt_plain(_codex_msg, decision["lens"], ctx.world, with_history=with_history,
                                       doc_focus=ctx.doc_focus)

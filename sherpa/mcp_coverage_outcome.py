@@ -5,10 +5,11 @@ from __future__ import annotations
 
 from . import agentic_search
 
-_ITEM_HITS_TOOLS = frozenset({"ripgrep_search", "es_search"})  # `hits` 配列を持つ形
+_ITEM_HITS_TOOLS = frozenset({"ripgrep_search", "es_search", "personal_search"})  # `hits` 配列を持つ形
 # 単一文書読取の形（原本の Office／PDF の読み取り・見出し・比較を含む）。
 _ITEM_READ_TOOLS = frozenset({"read_doc", "read_around", "file_head", "doc_outline", "compare_documents",
-                              "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "pdf_page_image"})
+                              "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "pdf_page_image",
+                              "personal_read"})
 _ITEM_LIST_TOOLS = frozenset({"list_docs", "glob_search", "folder_tree"})  # 一覧の形（打ち切りだけを区分にする）
 # 単一文書読取の error は「その doc_id を読めなかった」とみなす。検索・グラフ系の error は、`error_code` が既知の「読めない」系コードのときだけ unreadable にする。
 _ITEM_UNREADABLE_ERROR_CODES = frozenset({"read_io_failed"})
@@ -42,13 +43,13 @@ def coverage_outcome(name: str, result, is_error: bool) -> str | None:
             return "error"
         if result.get("truncated"):
             return "limit"
-        if result.get("truncated_docs"):
+        if result.get("truncated_docs") or result.get("partial_files"):
             return "truncated"
         hits = result.get("hits")
         if isinstance(hits, list) and len(hits) == 0:
             if name == "es_search" and result.get("degrade_reason") in _ES_SEMANTIC_FAILED_REASONS:
                 return "error"
-            if name == "ripgrep_search" and (result.get("unreadable_files") or result.get("unreadable_dirs")):
+            if name in ("ripgrep_search", "personal_search") and (result.get("unreadable_files") or result.get("unreadable_dirs")):
                 return "unreadable"  # 読めない場所が範囲にあるので、0 件は「見つからない」の根拠にしない
             return "no_hits"
         if isinstance(hits, list) and any(

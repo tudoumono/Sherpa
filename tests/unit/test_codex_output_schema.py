@@ -513,10 +513,10 @@ def _claim(cid, status, kinds, refs=("ev-1",), reason="", reason_code="") -> dic
             "reason": reason, "reason_code": reason_code, "evidence_kinds": kinds}
 
 
-def _gate(monkeypatch, tmp_path, world, files, claims, lens="qa", personal_facts=""):
+def _gate(monkeypatch, tmp_path, world, files, claims, lens="qa", personal_read=False):
     _isolate_world_kb(monkeypatch, tmp_path, world, files)
     return STRUCT._apply_codex_evidence_gate(
-        claims, lens=lens, world=world, scope_paths=[], layer="both", personal_facts=personal_facts)
+        claims, lens=lens, world=world, scope_paths=[], layer="both", personal_read=personal_read)
 
 
 def test_evidence_gate_demotes_confirmed_claim_missing_required_kind(monkeypatch, tmp_path):
@@ -554,11 +554,11 @@ def test_evidence_gate_scope_absent_kind_is_not_counted_as_missing(monkeypatch, 
     assert meta["missing_codes"] == []
 
 
-def test_evidence_gate_personal_hits_satisfy_log_config(monkeypatch, tmp_path):
-    """個人ファイルの grep ヒットがあれば、範囲にログ・設定が無くても充足済みとして格下げ・不足計上しない。"""
+def test_evidence_gate_personal_read_satisfies_log_config(monkeypatch, tmp_path):
+    """このターンで個人ファイルの道具で個人ファイルを読んだら、範囲にログ・設定が無くても充足済みとして格下げ・不足計上しない。"""
     out, meta, missing, unavailable = _gate(monkeypatch, tmp_path, "gw4", _SRC_ONLY,
                                             [_claim("c1", "confirmed", ["source"])],
-                                            lens="troubleshoot", personal_facts="grep ヒットあり")
+                                            lens="troubleshoot", personal_read=True)
     assert unavailable == () and missing == ()
     assert meta["missing_codes"] == []
     assert out[0]["status"] == "confirmed"

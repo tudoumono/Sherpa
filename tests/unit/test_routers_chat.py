@@ -19,7 +19,7 @@ def test_chat_turns_start_uses_slash_stripped_message_for_conversation_title(mon
     # `_prepare_agentic_snapshot` から受け取る（`_knowledge_for` はもう呼ばない）——ここでは
     # 要求どおりの knowledge をそのまま返し、Provider 系はすべて未使用（DB 不要）にする。
     monkeypatch.setattr(RC, "_prepare_agentic_snapshot",
-                        lambda uid, requested, web_search: (requested, None, None, None, None))
+                        lambda uid, requested, web_search, personal: (requested, None, None, None, None))
     monkeypatch.setattr(RC, "validated_scope", lambda w, sp: None)
 
     def fake_ensure_conversation(conversation_id, message, world, user_id):
@@ -57,7 +57,7 @@ def test_chat_turns_start_no_slash_message_unchanged(monkeypatch):
     # `_prepare_agentic_snapshot` から受け取る（`_knowledge_for` はもう呼ばない）——ここでは
     # 要求どおりの knowledge をそのまま返し、Provider 系はすべて未使用（DB 不要）にする。
     monkeypatch.setattr(RC, "_prepare_agentic_snapshot",
-                        lambda uid, requested, web_search: (requested, None, None, None, None))
+                        lambda uid, requested, web_search, personal: (requested, None, None, None, None))
     monkeypatch.setattr(RC, "validated_scope", lambda w, sp: None)
 
     def fake_ensure_conversation(conversation_id, message, world, user_id):

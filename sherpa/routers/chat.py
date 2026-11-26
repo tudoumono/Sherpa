@@ -19,7 +19,7 @@ from sherpa import agentic_search, answer_shape, chat_turns, llm, store
 from sherpa import stop_kind as stop_kind_mod
 from sherpa import tools_pref as tools_pref_mod
 from sherpa.agents import get_provider
-from sherpa.providers import plain_provider_for
+from sherpa.providers import personal_only_provider_for, plain_provider_for
 from sherpa.chat_router import extract_slash_lens as _extract_slash_lens
 from sherpa.chat_service import _ensure_conversation, _save_investigation_record, stream_message
 from sherpa.deps import _USERS_DIR, _WorldField, _current_user, _resolve_world, neo4j_session, validated_scope
@@ -111,13 +111,14 @@ def _validate_tools_availability(tools: dict | None, availability: dict | None =
             422, f"検索経路 {', '.join(bad)} は現在利用できません（接続を確認してください）")
 
 
-def _prepare_agentic_snapshot(uid: str, requested_knowledge: bool, web_search: bool):
+def _prepare_agentic_snapshot(uid: str, requested_knowledge: bool, web_search: bool, personal: bool = False):
     """`/chat/turns` の準備手順。
     ① ユーザ設定を一度だけ読み、knowledge の実効値（`_knowledge_for_settings`）と Provider 構築の両方へ同じスナップショットを渡す。
     ② 同一のスナップショットから Provider を一度だけ組み立てる。
     ③ `_agentic_target_check`（接続先の I/O-free allowlist 検証）→ `tool_availability`（ES/Neo4j への実接続チェック）の順で呼ぶ（不許可の接続先へ通信する前に拒否するため）。
     返り値 `(knowledge, provider, settings, sys_settings, tools_availability)`。`knowledge` は各エンドポイントの分岐へ、残り 3 つは実行本体（`_turn_run_fn`）へそのまま渡す。
-    `store.get_settings` の失敗は捕捉せず伝播させる（500 で停止）。knowledge の実効値が False のときは接続先検証・可用性確認を行わず、`(False, plain_provider_for の結果, settings, sys_settings, None)` を返す。
+    `store.get_settings` の失敗は捕捉せず伝播させる（500 で停止）。knowledge の実効値が False のときは可用性確認を行わず、`(False, 頭脳, settings, sys_settings, None)` を返す。
+    頭脳は、個人ファイルオンで Codex 構成（サンドボックス有効）なら個人ファイルの道具だけを持つ Codex（接続先検証をする）、それ以外は `plain_provider_for` の結果。
     `_agentic_target_check` が `llm.PreflightRejected`（`SsrfBlocked` を含む）を送出した場合は捕捉し、固定文言の `HTTPException(422)` に変換する（例外の生文言は応答に含めない）。それ以外の例外は伝播して 500 のままにする。
     """
     settings = store.get_settings(uid)
@@ -125,7 +126,13 @@ def _prepare_agentic_snapshot(uid: str, requested_knowledge: bool, web_search: b
     if not knowledge:
         # 資料参照オフも受付時の設定の写しから頭脳（`PlainChatProvider`）を作り、実行本体へ渡す（実行時に設定を読み直さない）。
         sys_settings = store._read_system_settings_fresh()
-        return False, plain_provider_for(settings, sys_settings), settings, sys_settings, None
+        provider = personal_only_provider_for(settings, sys_settings) if personal else None
+        if provider is not None:
+            try:
+                provider._agentic_target_check()
+            except llm.PreflightRejected:
+                raise HTTPException(422, "AI の接続先が許可されていません（設定画面で確認してください）")
+        return False, provider or plain_provider_for(settings, sys_settings), settings, sys_settings, None
     # `stream_message` と同じ上書き（実行時にも同じ値で冪等に上書きされる）。
     settings = {**settings, "codex_web_search": bool(web_search)}
     sys_settings = store._read_system_settings_fresh()
@@ -318,7 +325,7 @@ def chat_turns_start(req: ChatReq, request: Request):
     w = _resolve_world(req.world)
     # settings を一度だけ読み、knowledge の実効値と Provider を同じスナップショットから準備する。接続先検証→可用性チェックの順で行い、受付（422判定）と背景実行本体（`_turn_run_fn`）へ同じ Provider/settings/snapshot を渡す。
     knowledge, provider, settings, sys_settings, tools_availability = _prepare_agentic_snapshot(
-        uid, req.knowledge, req.web_search)
+        uid, req.knowledge, req.web_search, req.personal)
     turn_scope = None
     if knowledge:
         turn_scope = validated_scope(w, req.scope_paths)  # 実在 world のみ＋scope 検証（開始前に弾く）。

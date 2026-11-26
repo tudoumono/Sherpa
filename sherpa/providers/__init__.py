@@ -152,6 +152,20 @@ def plain_provider_for(settings: dict | None, system_settings: dict) -> Provider
     return PlainChatProvider(llm_provider, llm_model, endpoint, headers, system_settings=system_settings)
 
 
+def personal_only_provider_for(settings: dict | None, system_settings: dict) -> Provider | None:
+    """社内資料オフ・個人ファイルオンのターンの頭脳。Codex 構成でサンドボックスが有効なら、個人ファイルの道具だけを持つ形で動く Codex（`get_provider` と同じ・Web 検索は使わない）を返す。
+    それ以外（簡易・サンドボックス無し＝シェルから資料フォルダが見える）は `None`（呼び出し側が `plain_provider_for` の素の会話にする）。"""
+    from sherpa import agent_constructs
+    from .codex.sandbox import _codex_sandbox_enabled
+    try:
+        agent = agent_constructs.effective_agent(settings or {}, system_settings=system_settings)
+    except Exception:
+        return None
+    if agent != "codex" or not _codex_sandbox_enabled():
+        return None
+    return get_provider({**(settings or {}), "codex_web_search": False}, system_settings=system_settings)
+
+
 def _select_provider(s: dict, system_settings: dict | None = None) -> Provider:
     from sherpa import agent_constructs
     from sherpa import agents as _facade  # 実行時解決

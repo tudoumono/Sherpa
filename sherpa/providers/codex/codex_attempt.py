@@ -11,7 +11,7 @@ import time
 
 from ...mcp_server import _LEDGER_TOOLS, COMPARE_DOC_ID_ARGS, LISTED_DOC_TOOLS, READ_DOC_TOOLS
 from ..base import _answer_partial, _log, _node
-from . import process
+from . import personal_tools, process
 from .ledger_gate import _LEDGER_TOOL_DETAILS
 from .mcp import (
     GRAPH_SUMMARY_MAX_CHARS, _codex_ask_capture, _graph_schema_era_from_item, _graph_tool_failure, _graph_tool_summary, _mcp_neighbors_from,
@@ -27,6 +27,29 @@ from .process import (
     _strip_control_markers,
 )
 from .usage import _accumulate_codex_usage, _usage_from_turn_completed
+
+
+# 思考ノードに出す道具の名前。folder_tree/compare_documents は MCP 経由で Codex にも公開済み（`mcp_server.py::_tool_defs`）のため、ここにも対応を持たせる。
+# agentic_search の `_ORIGINAL_READ_LABELS`／改善ログの `_TOOL_CALL_LABELS` と同じ文言（`xlsx_sheets` はシート一覧のみで `xlsx_range` とは別ラベル・`_FILES_READ_LABEL` からも外れる）。
+_TOOL_LABELS = {"graph_neighbors": "関係グラフをたどる", "graph_resolve": "影響調査の起点を探す",
+                "graph_impact": "影響先をたどる", "ripgrep_search": "資料を検索（語句そのまま）",
+                "es_search": "資料を検索（全文）", "read_around": "該当箇所を精読",
+                "list_docs": "資料の一覧を確認", "folder_tree": "フォルダ構成を確認", "name_lookup": "名前からソースを探す",
+                "compare_documents": "世代間の差分を比較",
+                "read_doc": "文書を通読", "doc_outline": "見出し構造を確認",
+                "glob_search": "ファイル名で検索",
+                "xlsx_sheets": "原本のシート一覧を確認", "xlsx_range": "原本を読む（Excel）",
+                "docx_paragraphs": "原本を読む（Word）",
+                "pptx_slides": "原本を読む（PowerPoint）",
+                "pdf_pages": "原本を読む（PDF）",
+                "pdf_page_image": "原本のページを画像で確認（PDF）",
+                "file_head": "原本を読む（先頭）",
+                "personal_search": "個人ファイルを検索", "personal_read": "個人ファイルを読む",
+                # 調査台帳の MCP ツール（`mcp_server._LEDGER_TOOLS`）。引数の本文は出さず、件数・状態語彙（閉集合）だけを表示する。
+                "ledger_manifest_set": "調査台帳に項目を登録",
+                "ledger_item_put": "調査台帳の項目を更新",
+                "ledger_status": "調査台帳の状態を確認",
+                "ledger_review_put": "回答前に中間の見直しを記録"}
 
 
 def _compare_status(item: dict):
@@ -239,6 +262,8 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                         _d = a.get("doc_id")
                         if isinstance(_d, str) and _d:
                             _mcp_listed_docs.append(_d)
+                    elif tool in personal_tools.TOOL_NAMES:
+                        personal_tools.note_parent_read(st, tool, a, item)
                     elif tool == "compare_documents" and _compare_status(item) == "comparable":
                         for _k in COMPARE_DOC_ID_ARGS:
                             _d = a.get(_k)
@@ -270,33 +295,13 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                     if codex_question is not None:
                         break
                     continue
-                # folder_tree/compare_documents は MCP 経由で Codex にも公開済み（`mcp_server.py::_tool_defs`）のため、表示用ラベル辞書にも対応を持たせる。
-                tlabel = {"graph_neighbors": "関係グラフをたどる", "graph_resolve": "影響調査の起点を探す",
-                          "graph_impact": "影響先をたどる", "ripgrep_search": "資料を検索（語句そのまま）",
-                          "es_search": "資料を検索（全文）", "read_around": "該当箇所を精読",
-                          "list_docs": "資料の一覧を確認", "folder_tree": "フォルダ構成を確認", "name_lookup": "名前からソースを探す",
-                          "compare_documents": "世代間の差分を比較",
-                          "read_doc": "文書を通読", "doc_outline": "見出し構造を確認",
-                          "glob_search": "ファイル名で検索",
-                          # agentic_search の `_ORIGINAL_READ_LABELS`／改善ログの `_TOOL_CALL_LABELS` と同じ文言（`xlsx_sheets` はシート一覧のみで `xlsx_range` とは別ラベル・`_FILES_READ_LABEL` からも外れる）。
-                          "xlsx_sheets": "原本のシート一覧を確認", "xlsx_range": "原本を読む（Excel）",
-                          "docx_paragraphs": "原本を読む（Word）",
-                          "pptx_slides": "原本を読む（PowerPoint）",
-                          "pdf_pages": "原本を読む（PDF）",
-                          "pdf_page_image": "原本のページを画像で確認（PDF）",
-                          "file_head": "原本を読む（先頭）",
-                          # 調査台帳の MCP ツール（`mcp_server._LEDGER_TOOLS`）。引数の本文は出さず、件数・状態語彙（閉集合）だけを表示する。
-                          "ledger_manifest_set": "調査台帳に項目を登録",
-                          "ledger_item_put": "調査台帳の項目を更新",
-                          "ledger_status": "調査台帳の状態を確認",
-                          "ledger_review_put": "回答前に中間の見直しを記録"}.get(
-                              tool, "その他の処理")
+                tlabel = _TOOL_LABELS.get(tool, "その他の処理")
                 if tool in _LEDGER_TOOL_DETAILS:
                     detail = _LEDGER_TOOL_DETAILS[tool](a)
                 elif tool == "graph_impact":
                     detail = ""  # 起点の識別子は検証を通った結果の起点（パス）だけを、完了時に記録する
                 else:
-                    detail = "「" + str(a.get("name") or a.get("query") or a.get("doc_id")
+                    detail = "「" + str(a.get("name") or a.get("query") or a.get("doc_id") or a.get("id")
                                         or a.get("path_prefix") or a.get("name_pattern")
                                         or a.get("pattern") or "") + "」"
                 if done and tool in ("graph_neighbors", "graph_resolve", "graph_impact") and item.get("status") == "completed":

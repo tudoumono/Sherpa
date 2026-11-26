@@ -34,7 +34,8 @@ class WorkspaceFileDeleteResponse(BaseModel):
 
 class WorkspaceSearchHit(BaseModel):
     rel_path: str
-    line: int
+    line: int | None = None
+    where: str | None = None
     text: str
     match: str
 

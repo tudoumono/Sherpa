@@ -261,3 +261,19 @@ def test_conversation_created_when_id_is_none(monkeypatch):
     events = list(CS.stream_message(None, "  新しい話題  ", world="v1", conversation_id=None, user_id="u1"))
     assert created == [{"user_id": "u1", "world": "v1", "title": "新しい話題"}]
     assert events[-1]["conversation_id"] == 55 and saved[0]["conversation_id"] == 55
+
+
+def test_codex_turn_with_personal_does_not_grep_with_the_question(monkeypatch):
+    """個人ファイルの道具を持つ頭脳には、質問の文で探した個人ファイルの行を渡さない（頭脳が名前の一覧と道具で探す）。"""
+    _mock_store_no_db(monkeypatch)
+    monkeypatch.setattr(CS, "_known_terms", lambda session, world: [])
+    monkeypatch.setattr(CS, "_resolve_scope", lambda *a: {"world": "v1", "scope_paths": [], "source": "all"})
+    monkeypatch.setattr(CS.agentic_search, "tool_availability", lambda: {"grep": True})
+    monkeypatch.setattr(CS, "_personal_grep_hits",
+                        lambda *a: pytest.fail("道具を持つ頭脳のターンで事前検索した"))
+    prov = _CtxProvider([_fixed_result("個人あり")])
+    prov.uses_personal_tools = lambda: True
+    _use_provider(monkeypatch, prov)
+    events = _turn("個人も見て", knowledge=True, personal=True)
+    assert prov.ctx.personal is True and prov.ctx.personal_facts == ""
+    assert events[-1]["message"]["personal"] is True

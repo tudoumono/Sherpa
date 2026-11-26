@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (agentic_search, es_index, graph_coverage, graph_tools, grep_tool, image_input, investigation_ledger, path_rules, proxy_bypass,
-               scope_infer, tool_call_log, tool_dispatch)
+               mcp_personal, scope_infer, tool_call_log, tool_dispatch)
 from .ingest.world_neo4j import GraphSchemaEraError
 from .mcp_coverage_outcome import coverage_outcome as _coverage_outcome
 PROTOCOL_VERSION = "2025-06-18"
@@ -206,28 +206,9 @@ def _run_ledger_tool(name: str, args: dict) -> dict:
 
 
 def _toolset() -> str:
-    """MCP が公開するツールの絞り込み（`SHERPA_MCP_TOOLSET`）。`"plain"` は最小構成、`"plan"` はJSON台帳の道具を除いた構成。それ以外はフル公開。"""
+    """MCP が公開するツールの絞り込み（`SHERPA_MCP_TOOLSET`）。`"plain"` は最小構成、`"plan"` はJSON台帳の道具を除いた構成、`"personal"` は個人ファイルの道具と ask_user だけ。それ以外はフル公開。"""
     v = os.environ.get("SHERPA_MCP_TOOLSET", "").strip().lower()
-    return v if v in ("plain", "plan") else "full"
-
-
-# plain で公開するグラフの説明。standard 用の説明は plain で公開しないツールの使用を指示するため使わない。es_search は plain では出さない。
-_DESC_GRAPH_PLAIN = (
-    "関係グラフから、ある名前（プログラム/コピーブック/ジョブ/データ項目/テーブルなど）の関連部品"
-    "（コピー・呼び出し・参照・関連文書（言及）の近傍）を、辺ごとの種類と向き（from→to）付きの経路で返す。"
-    "COPIES／INVOKES／ACCESSES／CONTAINS／BUILT_FROM だけの経路は構造的な依存＝根拠にしてよい（影響は矢印をさかのぼる: "
-    "A →COPIES→ B は B を変えると A が影響を受ける）。DOCUMENTS（言及）・CORRESPONDS_TO（同名の対応）や "
-    "`unverified` の辺を含む経路は候補＝原本で確認する。種類 Executable は呼ばれる実行名で、BUILT_FROM の先が材料のソース"
-    "（実行名は材料のソースとビルドの定義の行を根拠に書く）。名前は完全一致で引く（シェルで正確な名前を見つけてから"
-    "渡す）。名前に当てはまる起点が多すぎる（既定 50 件超）ときは、関係をたどらずに too_broad（anchors・by_folder・by_kind の件数）を"
-    "返す＝path_prefix（フォルダ）か kind（種類）で絞って聞き直す。近傍が上限で切られたときは truncated:true・count（総数）・next_offset が付く＝同じ条件に offset=next_offset を付けて呼び直すと続きが取れる。truncated:true で next_offset が無いときは続きが取れない＝その範囲は未確認として扱う。"
-    "coverage.complete が false のとき（時間切れ・件数の上限・文書探索の打ち切り・カード数の上限）は、近傍が空でも"
-    "「近傍なし」とは言えない＝未確認（理由は coverage.limits[].kind）。"
-)
-# plain は台帳を持たないため `item` を除いたコピーを使う（`name` の schema/説明は共有する）。
-_PARAMS_GRAPH_PLAIN = {**agentic_search._PARAMS_GRAPH,
-                      "properties": {k: v for k, v in agentic_search._PARAMS_GRAPH["properties"].items()
-                                     if k != "item"}}
+    return v if v in ("plain", "plan", mcp_personal.TOOLSET) else "full"
 
 
 def _without_item_param(d: dict) -> dict:
@@ -242,13 +223,13 @@ def _tool_defs() -> list:
     並びは「構造を掴む→通読→精読」（ripgrep_search の直後に glob_search、read_around の直前に doc_outline・read_doc）。
     `SHERPA_MCP_ASK_DISABLED=1` の実行では ask_user を外す。探す対象（層）が限定されている間は `graph_neighbors` を外す（`run_tool` の拒否と多層防御）。
     `graph_resolve`・`graph_impact` は層が資料のみ（docs）のときだけ外す（ソース限定の層では出す）。plain には出さない。
-    `_toolset()` が `"plain"` のときは `_PLAIN_TOOLSET`（graph_neighbors・ask_user）だけを返す（出す条件は同じ）。`handle()` 側も同じ集合だけを許可する。
+    `_toolset()` が `"plain"` のときは `_PLAIN_TOOLSET`（graph_neighbors・ask_user）だけ、`"personal"` のときは個人ファイルの道具と ask_user だけを返す（出す条件は同じ）。`handle()` 側も同じ集合だけを許可する。
     """
-    if _toolset() == "plain":
-        defs = []
-        if _layer() in (None, "both"):
-            defs.append({"name": "graph_neighbors", "description": _DESC_GRAPH_PLAIN,
-                        "inputSchema": _PARAMS_GRAPH_PLAIN})
+    if _toolset() in ("plain", mcp_personal.TOOLSET):
+        defs = mcp_personal.tool_defs(_toolset())
+        if _layer() in (None, "both") and _toolset() == "plain":
+            defs.append({"name": "graph_neighbors", "description": agentic_search._DESC_GRAPH_PLAIN,
+                        "inputSchema": agentic_search._PARAMS_GRAPH_PLAIN})
         if not _ask_disabled():
             defs.append({"name": "ask_user", "description": agentic_search._DESC_ASK,
                         "inputSchema": agentic_search._PARAMS_ASK})
@@ -307,6 +288,7 @@ def _tool_defs() -> list:
         _idx = next(i for i, d in enumerate(defs) if d["name"] == "ripgrep_search") + 1
         defs.insert(_idx, {"name": "es_search", "description": agentic_search._DESC_ES,
                            "inputSchema": agentic_search._PARAMS_ES_SEARCH})
+    defs += mcp_personal.tool_defs(_toolset())  # 個人ファイルを使うターンだけ
     if _toolset() == "plan":
         return [_without_item_param(d) for d in defs]
     return defs + _ledger_tool_defs()
@@ -410,7 +392,8 @@ def _sidecar_error_code(name, result) -> None:
 _ITEM_PARAM_TOOLS = frozenset({
     "ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors",
     "graph_resolve", "graph_impact", "doc_outline", "compare_documents", "xlsx_sheets", "xlsx_range",
-    "docx_paragraphs", "pptx_slides", "pdf_pages", "pdf_page_image", "list_docs", "glob_search", "folder_tree", "name_lookup"})
+    "docx_paragraphs", "pptx_slides", "pdf_pages", "pdf_page_image", "list_docs", "glob_search", "folder_tree", "name_lookup",
+    "personal_search", "personal_read"})
 
 
 def _coverage_detail(name: str, args) -> dict:
@@ -523,9 +506,10 @@ def _env_int_override(var_name: str) -> int | None:
 
 
 # 原本読取ツール 7 本（`read_doc`／`read_around` を含む）。応答 1 件を Codex CLI が中央を落とす上限（約 40,000 バイト）より小さくするため、`SHERPA_MCP_READER_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
-_READER_BUDGET_TOOLS = frozenset({"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "read_doc", "read_around"})
+_READER_BUDGET_TOOLS = frozenset({"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "read_doc", "read_around",
+                                  "personal_read"})
 # 検索ツール 4 本（`folder_tree`・`graph_neighbors` を含む）。同じく CLI が中央を落とさない大きさにするため、`SHERPA_MCP_SEARCH_BUDGET_BYTES` があれば他のツールより小さい予算を使う。
-_SEARCH_BUDGET_TOOLS = frozenset({"ripgrep_search", "es_search", "folder_tree", "graph_neighbors"})
+_SEARCH_BUDGET_TOOLS = frozenset({"ripgrep_search", "es_search", "folder_tree", "graph_neighbors", "personal_search"})
 
 
 def _tool_budget_bytes(name: str) -> int | None:
@@ -907,12 +891,31 @@ def _tool_deadline_sec() -> float:
     return min(v, _TOOL_DEADLINE_MAX_SEC)
 
 
+def _sidecar_record_reads(name: str, args: dict, result) -> None:
+    """成功した読取の呼び出しで読んだ資料をサイドカーへ書く（本文は書かない）。個人ファイルは資料フォルダの `read` と別の種類（`personal_read`）で書く。"""
+    if name in READ_DOC_TOOLS:
+        d = args.get("doc_id")
+        if isinstance(d, str) and d:
+            _sidecar_append({"kind": "read", "tool": name, "doc_id": d, "ts": time.time()})
+    elif name in LISTED_DOC_TOOLS:
+        d = args.get("doc_id")
+        if isinstance(d, str) and d:
+            _sidecar_append({"kind": "listed", "tool": name, "doc_id": d, "ts": time.time()})
+    elif name == "compare_documents" and isinstance(result, dict) and result.get("status") == "comparable":
+        for k in COMPARE_DOC_ID_ARGS:
+            d = args.get(k)
+            if isinstance(d, str) and d:
+                _sidecar_append({"kind": "read", "tool": name, "doc_id": d, "ts": time.time()})
+    for entry in mcp_personal.sidecar_entries(name, args, result):
+        _sidecar_append(entry)
+
+
 def _handle_tool_call(rid, params: dict) -> dict:
     """`tools/call` 1 件を処理して応答を返す（台帳・ask_user・重複拒否・通常の道具）。"""
     name = params.get("name")
     args = params.get("arguments") or {}
-    if _toolset() == "plain" and name not in _PLAIN_TOOLSET:
-        # plain は es_search・graph_neighbors・ask_user だけ。tools/list に出していなくても、直接呼ばれたら存在しないツールと同じエラーで拒否する（fail-closed）。
+    if (_toolset() == "plain" and name not in _PLAIN_TOOLSET) or mcp_personal.refused(name, _toolset()):
+        # plain は graph_neighbors・ask_user だけ。個人ファイルの道具は個人ファイルを使うターンだけ。個人ファイルだけの形は個人ファイルの道具・ask_user だけ。出していない道具は存在しない道具と同じエラーで拒む（fail-closed）。
         err_body = {"error": f"unknown tool: {name}"}
         return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                          "isError": True})
@@ -957,7 +960,8 @@ def _handle_tool_call(rid, params: dict) -> dict:
             max_hits=_env_int_override("SHERPA_MCP_TOOL_MAX_HITS"),
             window_cap=_env_int_override("SHERPA_MCP_TOOL_WINDOW_CAP"),
             tool_result_max_bytes=_tool_budget_bytes(name),
-            graph_only=(_toolset() == "plain"), deadline=deadline, partial_on_deadline=True)
+            graph_only=(_toolset() == "plain"), deadline=deadline, partial_on_deadline=True,
+            personal_ctx=mcp_personal.context(name, _toolset()))
     except (grep_tool.GrepDeadlineExceeded, scope_infer.ScopeWalkDeadlineExceeded):
         # 期限を超えた道具は JSON-RPC のエラーにせず通常の道具の失敗として返し、サーバーは次の行へ進む。
         err_body = {"error": "tool_deadline_exceeded", "notice": _TOOL_DEADLINE_NOTICE}
@@ -984,20 +988,7 @@ def _handle_tool_call(rid, params: dict) -> dict:
             _sidecar_append({"kind": "limit", "field": "tool_result_clipped", "ts": time.time()})
             _tool_result_clipped_recorded = True
     if not is_error:
-        # 子が読んだ doc_id をサイドカーへ（本文は書かない・失敗した呼出は数えない）。
-        if name in READ_DOC_TOOLS:
-            d = args.get("doc_id")
-            if isinstance(d, str) and d:
-                _sidecar_append({"kind": "read", "tool": name, "doc_id": d, "ts": time.time()})
-        elif name in LISTED_DOC_TOOLS:
-            d = args.get("doc_id")
-            if isinstance(d, str) and d:
-                _sidecar_append({"kind": "listed", "tool": name, "doc_id": d, "ts": time.time()})
-        elif name == "compare_documents" and isinstance(result, dict) and result.get("status") == "comparable":
-            for k in COMPARE_DOC_ID_ARGS:
-                d = args.get(k)
-                if isinstance(d, str) and d:
-                    _sidecar_append({"kind": "read", "tool": name, "doc_id": d, "ts": time.time()})
+        _sidecar_record_reads(name, args, result)
     if name not in _BUDGET_EXEMPT_TOOLS:
         result, _clipped = _clip_tool_result(result, name=name, args=args)
         if _clipped and not _tool_result_clipped_recorded:
@@ -1006,8 +997,10 @@ def _handle_tool_call(rid, params: dict) -> dict:
         is_error = is_error or bool(isinstance(result, dict) and result.get("error"))
     # `item` 付き呼出しの結果区分を台帳へ記録する（Codex へ返す最終形＝クリップ後の `result`/`is_error` を使う）。
     _record_item_coverage(name, args, result, is_error)
-    # MCP 標準＝content[].text。Codex が読む本文は run_tool の結果（外へ出る最後の網として、管理者の除外の資料を落とす）。
-    text = json.dumps(path_rules.recount_returned_docs(path_rules.filter_output(result, _world())), ensure_ascii=False)
+    # MCP 標準＝content[].text。Codex が読む本文は run_tool の結果（外へ出る最後の網として、管理者の除外の資料を落とす・個人ファイルの道具にはかけない）。
+    if name not in mcp_personal.TOOL_NAMES:
+        result = path_rules.recount_returned_docs(path_rules.filter_output(result, _world()))
+    text = json.dumps(result, ensure_ascii=False)
     return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": is_error})
 
 

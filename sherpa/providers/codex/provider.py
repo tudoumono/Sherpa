@@ -19,7 +19,9 @@ from ... import model_catalog
 from ..base import CODEX_CLI_MISSING_HOWTO, Ctx, Provider, _log, _node, _plain_run
 from ..prompts import _kb_hint_abs
 from .ledger_gate import retire_ledger_for_turn
+from . import personal_tools
 from .sandbox import (
+    _codex_sandbox_enabled,
     _release_active_run_dir,
     _remove_dir_best_effort,
     _safe_run_authoring,
@@ -282,31 +284,53 @@ class CodexProvider(Provider):
                 f"{self._history_block(with_history)}【依頼】{message}")
         return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block(with_history)}{_DOC_FOCUS_SENTENCE if doc_focus else ''}【質問】{message}"
 
+    def _prompt_personal(self, message, with_history: bool = True):
+        """社内資料オフで個人ファイルの道具だけを持つターンのプロンプト。資料フォルダの場所・調べ方は渡さない（`message` に個人ファイルの名前の一覧が付く）。"""
+        sysp = (self.system_prompt + "\n\n") if self.system_prompt else ""
+        base = (
+            "あなたは利用者本人の個人ファイル（アップロードしたファイル）を調べて答えるアシスタントです。"
+            "このターンは社内資料を参照しません。資料フォルダ・このディレクトリの外・秘匿名のファイルは読まない。"
+            "個人ファイルは personal_search（語で探す）・personal_read（読む）の道具だけで読む（シェルでは開かない）。"
+            "個人ファイルで確かめたことと一般的な知識で答えたことは分けて書き、確かめられなかったことはそう書く。"
+            "回答に『参照した資料:』の行は書かない（読んだ個人ファイルは Sherpa が個人ファイルの欄に出す）。"
+            "確認しないと結果が大きく変わる場合だけ ask_user でユーザに確認する（1実行につき1回まで・"
+            "依頼に「確認ID:」が含まれる場合は前の質問への回答なので ask_user は使わない）。"
+            "利用者向けに整理して日本語で答えてください。"
+        )
+        return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block(with_history)}【質問】{message}"
+
     def _plain_text(self, message: str = "") -> str:
-        # ナレッジ参照オフでは Codex CLI を起動しない（read-only でも KB を覗けてしまうため）。通常この経路には来ない（資料参照オフは `chat_service.stream_message` が `PlainChatProvider` で答える）。内部経路が knowledge=False で直接呼んだ場合の安全網。
-        return ("Codex は常に社内資料を参照して回答します。"
-                "資料を参照しない雑談は OpenAI／ローカルLLM を選んでください。")
+        # 社内資料も個人ファイルも参照しないターン・サンドボックス無しの個人ファイルだけのターンでは Codex CLI を起動しない（シェルから資料フォルダを覗けてしまうため）。通常この経路には来ない（`chat_service.stream_message` が `PlainChatProvider` で答える）。内部経路が直接呼んだ場合の安全網。
+        return ("Codex は社内資料か個人ファイルを参照して回答します。"
+                "どちらも参照しない雑談は OpenAI／ローカルLLM を選んでください。")
+
+    def uses_personal_tools(self) -> bool:
+        """素の Codex 以外は個人ファイルを道具で探して読ませる（素の Codex は道具を持たないため回答前のヒットを渡す）。"""
+        return codex_mode(self._system_settings) != "plain"
 
     def run(self, ctx: Ctx) -> Iterator[dict]:
         # 分岐前に確定させる（`_prompt_mcp` が `_run_authoring` から参照する）。
         self._history = list(ctx.history or [])
         self._history_note = str(getattr(ctx.history, "note", "") or "")
-        if not ctx.knowledge:  # ナレッジ参照オフ＝素の会話（Codex を grep なしで・authoring 不使用）
+        if not ctx.knowledge:  # ナレッジ参照オフ＝個人ファイルだけの形（サンドボックス有効のときだけ）か、素の会話（Codex を起動しない）
+            if ctx.personal and _codex_sandbox_enabled():
+                yield from self._run_authoring(ctx, personal_only=True); return
             yield from _plain_run(self, ctx); return
         yield from self._run_authoring(ctx)
 
-    def _run_authoring(self, ctx: Ctx) -> Iterator[dict]:
+    def _run_authoring(self, ctx: Ctx, personal_only: bool = False) -> Iterator[dict]:
         decision = env = None
         _turn_t0 = time.monotonic()  # `sherpa.usage` ログ 1 行の elapsed（このターン全体）
         # 素の Codex モード（`codex_mode`）はターンの最初に1回だけ決め、プロンプト・AGENTS.md・スキル配備・出力スキーマ・multi_agent・台帳・MCP env・codex.log 開始行・activity.settings で同じ値を使う。`standard`（既定）はこのフラグが常に偽。
-        _plain = codex_mode(self._system_settings) == "plain"
+        # 個人ファイルだけのターン（`personal_only`）も素の形（台帳・出力スキーマ・multi_agent・調べ方のスキルなし）で動かす。
+        _plain = personal_only or codex_mode(self._system_settings) == "plain"
         # 選択後〜実行開始の間に CLI が消えたときは、別の検索へ切り替えず、選択時と同じ「未接続」の案内で終える。
         # `_gather`・`_UnwiredProvider` は facade 属性経由で実行時解決する（差し替えを効かせる・循環 import 回避）。
         from sherpa import agents as _facade
         if not shutil.which("codex"):
             yield from _facade._UnwiredProvider("Codex", CODEX_CLI_MISSING_HOWTO).run(ctx)
             return
-        for ev in _facade._gather(ctx):
+        for ev in (personal_tools.gather_only(ctx) if personal_only else _facade._gather(ctx)):
             if isinstance(ev, dict) and ev.get("type") == "_env":
                 decision, env = ev["decision"], ev["env"]
             else:
@@ -316,6 +340,7 @@ class CodexProvider(Provider):
 
         yield _node("codex", "think", "Codex が調べる", "資料を調べています", "active")
         st = CodexTurnState(ctx, turn_t0=_turn_t0, plain=_plain)
+        st._personal.only = personal_only
         codex_created_files = st.codex_created_files
         # 専用 authoring ディレクトリを cwd にする（個人アップロード files/ から分離・KB は絶対パスでプロンプトに渡す）。symlink が混入していると封じ込めが崩れるため `_safe_workspace_authoring` で symlink 拒否＋fail-closed。
         users_dir = Path(os.environ.get("SHERPA_USERS_DIR", "data/users")).resolve()

@@ -32,6 +32,7 @@ _TOOL_CALL_LABELS = frozenset({
     "原本のシート一覧を確認",
     "原本を読む（Excel）", "原本を読む（Word）", "原本を読む（PowerPoint）", "原本を読む（PDF）",
     "原本を読む（先頭）",
+    "個人ファイルを検索", "個人ファイルを読む",
     "調査台帳に項目を登録", "調査台帳の項目を更新", "調査台帳の状態を確認",
     "回答前に中間の見直しを記録",
     "ユーザに確認",
@@ -40,7 +41,7 @@ _TOOL_CALL_LABELS = frozenset({
 _FILES_READ_LABEL = frozenset({
     "該当箇所を精読", "文書を通読",
     "原本を読む（Excel）", "原本を読む（Word）", "原本を読む（PowerPoint）", "原本を読む（PDF）",
-    "原本を読む（先頭）",
+    "原本を読む（先頭）", "個人ファイルを読む",
 })
 # v1 trace の要約ノードの id（保存済みの過去メッセージを読むために残す）
 _V1_TRACE_OMITTED_NODE_ID = "trace-omitted"

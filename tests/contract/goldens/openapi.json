@@ -8066,8 +8066,15 @@
       "WorkspaceSearchHit": {
         "properties": {
           "line": {
-            "title": "Line",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line"
           },
           "match": {
             "title": "Match",
@@ -8080,11 +8087,21 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "where": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Where"
           }
         },
         "required": [
           "rel_path",
-          "line",
           "text",
           "match"
         ],
@@ -14964,7 +14981,7 @@
     },
     "/workspace/search": {
       "get": {
-        "description": "個人 workspace の全文 grep（current user のみ）。検索範囲は current user の workspace/files/ 配下だけで、共有 KB は混ぜない。返り値は「個人ファイル内ヒット」として明示ラベルを付ける（RAG citation ではない）。\n台帳上 status='uploaded' のファイルだけを対象にし、対象の拡張子はアップロードで許可される拡張子と同じ。",
+        "description": "個人 workspace の全文検索（current user のみ）。検索範囲は current user の workspace/files/ 配下だけで、共有 KB は混ぜない。返り値は「個人ファイル内ヒット」として明示ラベルを付ける（RAG citation ではない）。\n探し方は個人ファイルの道具（`personal_search`）と同じ部品で、テキストは行を、Office・PDF は中の文字を見る。台帳上 status='uploaded' で、秘匿名でなく読める形式のファイルだけを対象にし、鍵らしい値は伏せる。\n設計: docs/design/users.md「個人の作業領域（workspace）」",
         "operationId": "workspace_search_workspace_search_get",
         "parameters": [
           {
