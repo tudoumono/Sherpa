@@ -277,7 +277,7 @@ def _search(args: dict, ctx: PersonalContext, deadline, max_bytes: int) -> dict:
 def search_files(ctx: PersonalContext, terms: list[str], *, deadline, max_bytes: int, hits_max: int = _HITS_MAX,
                  targets: list[str] | None = None, skipped: list[str] | None = None) -> dict:
     """一覧のファイル（`targets` を渡せばその中だけ）から、語のどれかを含む行・セルなどを探す。テキストは行を、Office・PDF は中の文字を見る。
-    `skipped` を渡すと、開けなかった・期限で見られなかったファイルの rel_path をそこへ足す。"""
+    `skipped` を渡すと、開けなかった・期限や上限で途中までしか見られなかったファイルの rel_path をそこへ足す。"""
     lowered = [t.lower() for t in terms]
     targets = sorted(ctx.allowed) if targets is None else targets
     hits: list[dict] = []
@@ -325,6 +325,8 @@ def search_files(ctx: PersonalContext, terms: list[str], *, deadline, max_bytes:
         out["files_searched"] += 1
         if partial:
             partial_files.append(doc_id)
+            if skipped is not None:
+                skipped.append(rel)
         if out["truncated"]:
             break
     out["count"] = len(hits)

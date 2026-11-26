@@ -189,6 +189,14 @@ def test_personal_search_reports_the_file_cut_by_the_deadline_as_unsearched(pers
     assert skipped == ["多.xlsx"]
 
 
+def test_personal_search_reports_the_file_cut_by_the_sheet_limit_as_unsearched(personal_turn):
+    """シートの上限で途中までしか見なかった xlsx も、画面の検索の「探せなかった」に入れる。"""
+    ctx = _many_sheets(personal_turn, n=21)
+    skipped: list[str] = []
+    out = personal.search_files(ctx, ["架空の果物"], deadline=time.monotonic() + 60, max_bytes=1 << 20, skipped=skipped)
+    assert out["partial_files"] == ["personal:多.xlsx"] and skipped == ["多.xlsx"]
+
+
 def _personal_codex(log: Path, answer: str) -> str:
     """呼ばれた時の道具のサーバーの env と一覧を `log` に写し、個人ファイルを読んだ道具の呼び出しと回答を出す偽 codex。"""
     result = {"content": [{"type": "text", "text": json.dumps(
