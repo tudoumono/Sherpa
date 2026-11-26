@@ -149,16 +149,22 @@ async function doSearch() {
     const params = new URLSearchParams({ q });
     const data = await getJSON(`/workspace/search?${params}`);
     const hits = data.hits || [];
+    const unsearched = data.unsearched || [];
+    const gap = unsearched.length
+      ? `<div style="color:var(--danger);font-size:var(--text-small);padding:8px 0">読み取れなかったファイルが ${esc(String(unsearched.length))} 件あり、検索できていません: ${esc(unsearched.join('、'))}</div>`
+      : '';
     if (!hits.length) {
-      res.innerHTML = '<div class="muted" style="padding:8px 0">一致なし</div>';
+      res.innerHTML = unsearched.length
+        ? `<div class="muted" style="padding:8px 0">検索できたファイルに一致はありません</div>${gap}`
+        : '<div class="muted" style="padding:8px 0">一致なし</div>';
       return;
     }
     // 個人ファイル内ヒットバッジ付きで表示。
     const badge = '<span class="personal-badge" style="margin-right:6px">個人ファイル内ヒット</span>';
-    res.innerHTML = `<div style="font-size:var(--text-small);color:var(--ink-3);margin-bottom:8px">${badge}${esc(String(hits.length))} 件</div>`
+    res.innerHTML = `<div style="font-size:var(--text-small);color:var(--ink-3);margin-bottom:8px">${badge}${esc(String(hits.length))} 件</div>${gap}`
       + hits.map((h) =>
         `<div class="hit-card">
-          <div class="hit-meta">${esc(h.rel_path)} — ${esc(String(h.line))} 行目</div>
+          <div class="hit-meta">${esc(h.rel_path)} — ${h.where ? esc(h.where) : esc(String(h.line)) + ' 行目'}</div>
           <pre>${esc(h.text)}</pre>
         </div>`
       ).join('');

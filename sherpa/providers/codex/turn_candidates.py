@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import re
 
-from . import usage
+from . import personal_tools, usage
 from .continuation import _needs_continuation
 from .process import _read_last_message_fallback
 from .structured import _parse_structured, _parse_structured_v2
@@ -185,6 +185,7 @@ def _absorb_mcp_sidecar(st) -> None:
                 st._mcp_listed_docs.append(_d)
         if st.codex_question is None and _sc_ask is not None and not st._ledger_review_reverted:
             st.codex_question = _sc_ask
+        personal_tools.absorb_sidecar(st)  # 子が個人ファイルの道具で読んだファイル（資料フォルダの read とは別の行）
     # `_read_mcp_sidecar` は毎回先頭から全件を読み直すため、`+=` で加算せず最新の全量スナップショットで上書きする（二重計上しない）。
     st._mcp_tool_result_clipped = _sc_limits.get("tool_result_clipped", 0)
     if _sc_limits.get("total_budget_hit"):

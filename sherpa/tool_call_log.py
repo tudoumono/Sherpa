@@ -22,6 +22,7 @@ FILE_PREFIX = "calls-"
 FILE_SUFFIX = ".jsonl"
 GRAPH_PREFIX = "graph-"
 GRAPH_TOOLS = ("graph_resolve", "graph_impact")
+PERSONAL_TOOLS = ("personal_search", "personal_read")  # 個人ファイルの道具。件数と結果だけを残し、ファイルの名前と範囲は書かない
 GRAPH_MAX_ROWS = 200  # 1 回の呼び出しの結果から残す影響先の行の上限（道具の返却上限と同じ）
 GRAPH_BYTES_CAP = 4 * 1024 * 1024  # 1 プロセスのグラフの結果のファイルの上限（超えたら書かない）
 SCHEMA_VERSION = 1
@@ -100,6 +101,8 @@ def summarize_result(name: str, args, result, is_error: bool, detail: dict, scor
                 break
     if count is not None:
         out["count"] = count
+    if name in PERSONAL_TOOLS:
+        return out
     docs: list[dict] = []
     hits = res.get("hits")
     if isinstance(hits, list):

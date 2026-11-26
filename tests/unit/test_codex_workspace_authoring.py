@@ -1170,7 +1170,7 @@ def test_personal_scope_invariants_by_source():
     assert "layer" not in inspect.signature(chat_service._personal_grep_hits).parameters
     assert "layer" not in grep_src
     stream_src = inspect.getsource(chat_service.stream_message)
-    assert "if personal:" in stream_src
+    assert "if personal:" in stream_src and "if personal and knowledge and presearch:" in stream_src
     assert "personal_hits = []" in stream_src or "personal_hits: list[dict] = []" in stream_src
 
 

@@ -1074,7 +1074,8 @@ class WorkspaceFileDeleteResponse(BaseModel):
 
 class WorkspaceSearchHit(BaseModel):
     rel_path: str
-    line: int
+    line: int | None = None
+    where: str | None = None
     text: str
     match: str
 
@@ -1083,6 +1084,7 @@ class WorkspaceSearchResponse(BaseModel):
     query: str
     source: str
     hits: list[WorkspaceSearchHit]
+    unsearched: list[str] = []
 
 
 # ===== 資料フォルダ管理（sherpa/routers/worlds.py） =====

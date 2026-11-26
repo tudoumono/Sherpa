@@ -422,7 +422,7 @@ export async function send(override) {
   const thinking = appendAssistantRaw('<div class="thinking loading-inline" role="status"><span class="spinner spinner-sm"></span><span>回答を準備しています...</span></div>');
   startThinkingTicker(thinking);
   startFlow(message);
-  const body = { message, world: $('version').value, knowledge: !!S.kb, personal: !!S.personal && !!S.kb };   // 社内資料オフでは個人ファイルも読まない
+  const body = { message, world: $('version').value, knowledge: !!S.kb, personal: !!S.personal };   // 社内資料オフでも個人ファイルの指定は送る（読めるかは AI の構成しだい）
   if (S.cid) body.conversation_id = S.cid;
   // Web 検索は true のときだけ載せる
   if (S.kb && S.webSearch && !isSimpleMode()) body.web_search = true;

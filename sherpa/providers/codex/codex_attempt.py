@@ -11,7 +11,7 @@ import time
 
 from ...mcp_server import _LEDGER_TOOLS, COMPARE_DOC_ID_ARGS, LISTED_DOC_TOOLS, READ_DOC_TOOLS
 from ..base import _log, _node
-from . import process
+from . import personal_tools, process
 from .ledger_gate import _LEDGER_TOOL_DETAILS
 from .mcp import (
     GRAPH_SUMMARY_MAX_CHARS, _codex_ask_capture, _graph_schema_era_from_item, _graph_tool_failure, _graph_tool_summary, _mcp_neighbors_from,
@@ -239,6 +239,8 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                         _d = a.get("doc_id")
                         if isinstance(_d, str) and _d:
                             _mcp_listed_docs.append(_d)
+                    elif tool in personal_tools.TOOL_NAMES:
+                        personal_tools.note_parent_read(st, tool, a, item)
                     elif tool == "compare_documents" and _compare_status(item) == "comparable":
                         for _k in COMPARE_DOC_ID_ARGS:
                             _d = a.get(_k)
@@ -285,6 +287,7 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                           "pdf_pages": "原本を読む（PDF）",
                           "pdf_page_image": "原本のページを画像で確認（PDF）",
                           "file_head": "原本を読む（先頭）",
+                          "personal_search": "個人ファイルを検索", "personal_read": "個人ファイルを読む",
                           # 調査台帳の MCP ツール（`mcp_server._LEDGER_TOOLS`）。引数の本文は出さず、件数・状態語彙（閉集合）だけを表示する。
                           "ledger_manifest_set": "調査台帳に項目を登録",
                           "ledger_item_put": "調査台帳の項目を更新",
@@ -296,7 +299,7 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                 elif tool == "graph_impact":
                     detail = ""  # 起点の識別子は検証を通った結果の起点（パス）だけを、完了時に記録する
                 else:
-                    detail = "「" + str(a.get("name") or a.get("query") or a.get("doc_id")
+                    detail = "「" + str(a.get("name") or a.get("query") or a.get("doc_id") or a.get("id")
                                         or a.get("path_prefix") or a.get("name_pattern")
                                         or a.get("pattern") or "") + "」"
                 if done and tool in ("graph_neighbors", "graph_resolve", "graph_impact") and item.get("status") == "completed":

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,8 +17,9 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
 
-from sherpa import store, text_encoding, workspace_limits
+from sherpa import store, workspace_limits
 from sherpa.deps import _current_user, ensure_workspace
+from sherpa.parts.read import personal
 from sherpa.schemas import (
     WorkspaceFileDeleteResponse,
     WorkspaceFilesListResponse,
@@ -29,15 +32,19 @@ _log = logging.getLogger("sherpa")
 # router に tags を持たせない（各デコレータの tags と二重になりルート表 golden が一致しなくなる）。
 router = APIRouter()
 
-# 個人 workspace のアップロード許可拡張子＝grep 検索対象の一元定義。全て平文テキストのみ。
-# アップロード許可と grep 対象を同じ集合にして、上げたのに検索に掛からない状態をなくす。workspace 専用の判定で、共有 KB grep（`grep_tool._TEXT_EXT`）とは独立（workspace を RAG に索引化しない）。
+# 個人 workspace のアップロード許可拡張子。テキストと、Office（xlsx・docx・pptx）・PDF。Office・PDF は原本のまま置き MD にしない（古い形式 xls・doc・ppt は読む部品が無いので受け付けない）。
+# 上げたものは必ず検索・個人ファイルの道具で読める（許可 ⊆ 検索対象）。workspace 専用の判定で、共有 KB grep（`grep_tool._TEXT_EXT`）とは独立（workspace を RAG に索引化しない）。
 _WORKSPACE_ALLOWED_EXT = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml",
     ".cbl", ".cob", ".cobol", ".cpy", ".copybook", ".jcl",
     ".sql", ".py", ".sh", ".bat",
+    ".xlsx", ".docx", ".pptx", ".pdf",
 }
-# grep 対象＝アップロード許可と同じ集合。
-_WORKSPACE_SEARCHABLE_EXT = _WORKSPACE_ALLOWED_EXT
+# 検索対象＝個人ファイルの道具が読める形式（`parts/read/personal.READABLE_EXT`）。
+_WORKSPACE_SEARCHABLE_EXT = personal.READABLE_EXT
+_SEARCH_HITS_MAX = 50
+_SEARCH_MAX_BYTES = 256 * 1024
+_SEARCH_DEADLINE_SEC = 30.0
 # アップロードファイル名の安全チェック（パス成分・制御文字を拒否）。
 _SAFE_FILENAME_CHARS = set("._-() ")
 
@@ -231,8 +238,9 @@ def workspace_file_download(file_id: int, request: Request):
 
 @router.get("/workspace/search", tags=["個人ワークスペース"], response_model=WorkspaceSearchResponse)
 def workspace_search(request: Request, q: str = Query(..., min_length=1)):
-    """個人 workspace の全文 grep（current user のみ）。検索範囲は current user の workspace/files/ 配下だけで、共有 KB は混ぜない。返り値は「個人ファイル内ヒット」として明示ラベルを付ける（RAG citation ではない）。
-    台帳上 status='uploaded' のファイルだけを対象にし、対象の拡張子はアップロードで許可される拡張子と同じ。
+    """個人 workspace の全文検索（current user のみ）。検索範囲は current user の workspace/files/ 配下だけで、共有 KB は混ぜない。返り値は「個人ファイル内ヒット」として明示ラベルを付ける（RAG citation ではない）。
+    探し方は個人ファイルの道具（`personal_search`）と同じ部品で、テキストは行を、Office・PDF は中の文字を見る。台帳上 status='uploaded' で、秘匿名でなく読める形式のファイルだけを対象にし、鍵らしい値は伏せる。
+    設計: docs/design/users.md「個人の作業領域（workspace）」
     """
     u = _current_user(request)
     uid = u["uid"]
@@ -241,66 +249,32 @@ def workspace_search(request: Request, q: str = Query(..., min_length=1)):
         raise HTTPException(422, "検索語が空です")
     ensure_workspace(uid)  # 存在しない場合は冪等に作成する。
     files_dir = _workspace_files_dir(uid)
-    if not files_dir.is_dir():
-        return {"query": q, "source": "個人ファイル内ヒット", "hits": []}
-
-    # 台帳から「生きた」rel_path 集合を取得し、この集合外（論理削除済みを含む）のファイルは検索しない。
-    live_paths = store.live_workspace_rel_paths(uid)
-
     q_stripped = q.strip()
-    q_lower = q_stripped.lower()
-    hits = []
-    seen: set[tuple] = set()
-    files_dir_resolved = files_dir.resolve()
-    # 台帳に載っている live rel_path を直接イテレートして grep する（FS の rglob は使わない）。
-    for rel_path in sorted(live_paths):
-        # symlink 脱出防止: resolve 前の raw パスで `is_symlink()` を確認する（`_confined_path` は内部で resolve するため symlink alias を弾けない可能性がある）。
-        raw = files_dir / rel_path
-        if raw.is_symlink():
-            _log.warning("workspace search: symlink rejected for uid=%s rel=%s", uid, rel_path)
-            continue
-        p = _confined_path(files_dir, rel_path)
-        if p is None:
-            # パス閉じ込め違反（uid slug 制約と、rel_path が自アップロード由来のため通常は起きない）。
-            _log.warning("workspace search: confined_path failed for uid=%s rel=%s", uid, rel_path)
-            continue
-        if not p.is_file():
-            # 台帳にはあるが物理ファイルが消えている（best-effort 削除の逆パターン）。スキップする。
-            continue
-        # symlink 脱出防止（二重確認）: resolve して files_dir 配下かを再確認する。
-        try:
-            p.resolve().relative_to(files_dir_resolved)
-        except ValueError:
-            continue
-        # workspace 専用の拡張子判定（`_WORKSPACE_SEARCHABLE_EXT`）。共有 KB の `grep_tool._TEXT_EXT` は使わない。
-        ext = p.suffix.lower()
-        if ext not in _WORKSPACE_SEARCHABLE_EXT:
-            continue
-        try:
-            raw_bytes = p.read_bytes()
-            enc = text_encoding.detect_bytes(raw_bytes, complete=True)
-            lines = text_encoding.decode(raw_bytes, enc).splitlines()
-        except Exception:
-            continue
-        for i, ln in enumerate(lines):
-            if q_lower not in ln.lower():
-                continue
-            s = max(0, i - 1)
-            e = min(len(lines), i + 3)
-            key = (str(p), s, e)
-            if key in seen:
-                continue
-            seen.add(key)
-            hits.append({
-                "rel_path": rel_path,  # 台帳の rel_path（ファイル名のみ・物理パスは出さない）。
-                "line": i + 1,
-                "text": "\n".join(lines[s:e]).strip(),
-                "match": q_stripped,
-            })
-            if len(hits) >= 50:
-                break
-        if len(hits) >= 50:
-            break
+    if not files_dir.is_dir():
+        return {"query": q_stripped, "source": "個人ファイル内ヒット", "hits": []}
+    # 台帳の「生きた」rel_path だけを対象にする（FS の残骸・論理削除済みは探さない）。開くときの symlink 拒否・files/ への封じ込めは部品が行う。
+    allowed = frozenset(r for r in store.live_workspace_rel_paths(uid) if personal.valid_rel(r))
+    ctx = personal.PersonalContext(Path(os.path.realpath(files_dir)), allowed)
+    unsearched: list[str] = []  # 台帳にあるのに読めず、検索できなかったファイル。
+    out = personal.search_files(ctx, [q_stripped], deadline=time.monotonic() + _SEARCH_DEADLINE_SEC,
+                                max_bytes=_SEARCH_MAX_BYTES, hits_max=_SEARCH_HITS_MAX, skipped=unsearched)
+    hits = [{"rel_path": personal.rel_of(h["id"]) or "", "line": h["loc"].get("line"),
+             "where": _hit_where(h["loc"]), "text": h["text"].strip(), "match": q_stripped}
+            for h in out["hits"]]
+    # このヒットは個人 workspace 専用（`personal_workspace_files` 台帳のみ由来で ES/Neo4j は参照しない）。
+    return {"query": q_stripped, "source": "個人ファイル内ヒット", "hits": hits, "unsearched": sorted(unsearched)}
 
-    # このヒットは個人 workspace 専用（`live_paths` は personal_workspace_files 台帳のみ由来で ES/Neo4j は参照しない）。
-    return {"query": q_stripped, "source": "個人ファイル内ヒット", "hits": hits}
+
+def _hit_where(loc: dict) -> str | None:
+    """Office・PDF のヒットの位置を画面向けの言葉にする（テキストは行番号で示すので None）。"""
+    if loc.get("cell"):
+        return f"シート「{loc.get('sheet') or ''}」の {loc['cell']}"
+    if loc.get("paragraph") is not None:
+        return f"{int(loc['paragraph']) + 1} 段落目"
+    if loc.get("table") is not None:
+        return f"{int(loc['table']) + 1} 番目の表の {int(loc.get('row') or 0) + 1} 行目"
+    if loc.get("slide") is not None:
+        return f"{loc['slide']} 枚目のスライド"
+    if loc.get("page") is not None:
+        return f"{loc['page']} ページ"
+    return None
