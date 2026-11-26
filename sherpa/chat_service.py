@@ -20,7 +20,7 @@ from . import stop_kind as stop_kind_mod
 from . import tools_pref as tools_pref_mod
 from .ingest import importance, text_kind
 from .agents import AGENT_PROVIDERS, Ctx, get_provider
-from .providers import plain_provider_for
+from .providers import personal_only_provider_for, plain_provider_for
 from .chat_router import clarify_decision as _clarify_decision
 from .chat_router import confirm_first_decision as _confirm_first_decision
 from .chat_router import decision_for as _decision_for
@@ -1110,11 +1110,21 @@ def _ensure_conversation(conversation_id, message, world, user_id):
     return conversation_id
 
 
-# 個人ファイル参照の許可拡張子（workspace upload 許可と同じ集合・`api.py` の `_WORKSPACE_SEARCHABLE_EXT` と同義）。`api.py` に依存しないためここで重複定義する。個人領域は共有 KB のアナライザ登録簿とは別の独立集合で、コード分は和集合に含める。
+# 個人ファイルのうち、テキストとして行で探せる拡張子（回答前の事前検索が使う・`parts/read/personal.TEXT_EXT` と同じ集合）。Office・PDF は含めない（道具と画面の検索が読む形式は `parts/read/personal.READABLE_EXT`＝これに Office・PDF を足したもの）。個人領域は共有 KB のアナライザ登録簿とは別の独立集合で、コード分は和集合に含める。
 _PERSONAL_SEARCHABLE_EXT = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml",
     ".sql", ".py", ".sh", ".bat",
 } | _analyzer_registry.registered_extensions()
+
+
+def _select_provider(provider, knowledge, settings, sys_settings, personal=False):
+    """呼び出し元が組み立てた Provider を優先する。資料参照オフは簡易と同じ AI を道具なしで呼ぶ（Codex を起動しない）。
+    ただし個人ファイルオンで Codex 構成（サンドボックス有効）なら、個人ファイルの道具だけを持つ Codex で答える。"""
+    if provider is None and not knowledge:
+        provider = (personal and personal_only_provider_for(settings, sys_settings)) or plain_provider_for(settings, sys_settings)
+    if provider is None:
+        provider = get_provider(settings, system_settings=sys_settings)
+    return provider
 
 
 def _personal_grep_hits(user_id: str, query: str, users_dir: str) -> list[dict]:
@@ -1269,7 +1279,7 @@ def stream_message(session, message, world="v1",
     provider が `node`（動的に何個でも）を流し、最後に内部 `_result` を返す。本関数は会話の用意・永続だけを担い、`_result` を `answer` イベントに変換して返す。
     - `knowledge=False`（既定）: 検索せず素の会話（資料参照オフ）。`True` で社内資料を参照する（レンズ＋出典）。
     - `scope_paths`: 検索/分析をその範囲に絞る（knowledge 時のみ）。`layer`（既定 `None`＝`"both"`）: 探す対象。`lens`（既定 `None`＝自動）: 調べ方の明示指定で、メッセージ先頭のスラッシュ接頭辞が優先する（`_resolve_lens`）。
-    - `personal=True`: 共有 KB に加え本人の個人ファイルも grep して事実+引用に含める。個人ファイルは ES/Neo4j に入れず、本人のみ参照可。
+    - `personal=True`: 共有 KB に加え本人の個人ファイルも参照する（Codex は名前の一覧と道具で探して読み、道具を持たない頭脳は質問の文で grep したヒットを事実+引用に含める）。資料参照オフでは Codex（サンドボックス有効）だけが個人ファイルの道具だけを持つ形で読み、他の頭脳は素の会話。個人ファイルは ES/Neo4j に入れず、本人のみ参照可。
     - `web_search=False`（既定）: このチャットで Codex の Web 検索を希望するか。保存済みの個人設定 `codex_web_search` は実行には使わず、この値で上書きしてから provider を選ぶ。
     - `depth_profile`（既定 `None`＝`"standard"`）: 調べる深さ。`_dispatch()`/agentic 探索の反復・ヒット上限・探索深さ・Codex 推論に倍率で効く（evaluator の巡数は `depth_profile.review_rounds_for`）。
     - `doc_focus`（既定 False）: 資料を中心に調べる指定。`investigate` のターンだけ Codex への指示に効く（`Ctx.doc_focus`）。
@@ -1312,9 +1322,12 @@ def stream_message(session, message, world="v1",
     if tools_availability is None:
         tools_availability = agentic_search.tool_availability() if knowledge else None
 
-    # 個人ファイルを grep して事実テキスト/citation を準備する（資料参照オンかつ個人ファイル参照 ON で、ファイルが存在する場合。資料参照オフでは読まない）。grep は本人 uid の workspace 配下のみで、ES/Neo4j には書かない。
+    _provider = _select_provider(provider, knowledge, settings, sys_settings, personal=personal)
+    # 個人ファイルを grep して事実テキスト/citation を準備する（資料参照オンかつ個人ファイル参照 ON で、頭脳が個人ファイルの道具を持たない場合）。grep は本人 uid の workspace 配下のみで、ES/Neo4j には書かない。
+    # 道具を持つ頭脳は回答前に探さず、頭脳が名前の一覧と道具で探して読む（資料参照オフは道具を持つ Codex だけが読み、他の頭脳は素の会話）。
+    presearch = not getattr(_provider, "uses_personal_tools", lambda: False)()
     personal_hits: list[dict] = []
-    if personal and knowledge:
+    if personal and knowledge and presearch:
         personal_hits = _personal_grep_hits(user_id, message, users_dir)
 
     _dispatch_with_personal = _make_dispatch_with_personal(
@@ -1349,13 +1362,6 @@ def stream_message(session, message, world="v1",
     trace_nodes: dict = {}
     # 停止を検知したが停止終端（未完了回答）をまだ受け取っていない状態。
     _stopped_pending = False
-    # 呼び出し元が既に組み立てた Provider があればそれを使う。
-    # 資料参照オフは簡易と同じ AI を道具なしで呼ぶ（Codex 構成でも Codex を起動しない）。
-    _provider = provider
-    if _provider is None and not knowledge:
-        _provider = plain_provider_for(settings, sys_settings)
-    if _provider is None:
-        _provider = get_provider(settings, system_settings=sys_settings)
     for ev in _degrade_overload(_provider.run(ctx), message, world, scope_meta):
         if stop_event is not None and stop_event.is_set() and not _is_stopped_terminal(ev):
             if ev.get("type") == "_result" and "codex_multi_agent" in ev["env"]:

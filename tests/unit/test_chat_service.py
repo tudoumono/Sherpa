@@ -1566,3 +1566,18 @@ def test_history_note_does_not_claim_drop_when_window_only_filled_by_unpaired_ro
     _add_pairs(cid, *[(f"止められた質問{i}", None) for i in range(8)])
     note = CS._history_pairs(cid).note
     assert "対は" not in note
+
+
+def test_codex_turn_with_personal_does_not_grep_with_the_question(monkeypatch):
+    """個人ファイルの道具を持つ頭脳には、質問の文で探した個人ファイルの行を渡さない（頭脳が名前の一覧と道具で探す）。"""
+    _mock_store_no_db(monkeypatch)
+    captured: dict = {}
+    prov = _FakeCtxCaptureProvider(captured)
+    prov.uses_personal_tools = lambda: True
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: prov)
+    monkeypatch.setattr(CS, "_known_terms", lambda session, world: [])
+    monkeypatch.setattr(CS, "_personal_grep_hits",
+                        lambda *a: pytest.fail("道具を持つ頭脳のターンで事前検索した"))
+    events = _turn("個人も見て", knowledge=True, personal=True)
+    assert captured["ctx"].personal is True and captured["ctx"].personal_facts == ""
+    assert _answer_message(events)["personal"] is True

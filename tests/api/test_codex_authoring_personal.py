@@ -5,8 +5,8 @@
      その会話で contains_personal_workspace=true になる（codex_wrote_files 経由）。
      ※ Full Codex e2e はサブプロセス起動のため手動確認。ここでは mock で代替。
 
-  B: personal=True のチャットで個人ファイルが facts/citation に出る。
-     personal=False では出ない。
+  B: 社内資料オフ・personal=True のチャットは、頭脳が簡易なら素の会話のまま（個人ファイルの出典を出さない）。
+     personal=False でも出ない。Codex（個人ファイルの道具だけの形）は tests/unit/test_personal_file_tools.py。
      ユーザー B のチャットにユーザー A の personal_sources が漏れない（越境不可）。
      個人ヒットが ES/Neo4j に入らない（不変条件）: personal_workspace_files 台帳は
      /documents の一覧・ES 索引に含まれないことを確認。
@@ -72,42 +72,34 @@ def _upload(filename: str, content: bytes) -> dict:
 
 
 def _chat_personal(uid: str, message: str, personal: bool = True, cid: int | None = None) -> dict:
-    """personal フラグ付きの 1 ターンを `stream_message` で直接実行し、answer イベントを返す（ナレッジ参照 OFF・personal 指定）。"""
+    """personal フラグ付きの 1 ターンを `stream_message` で直接実行し、answer イベントを返す（ナレッジ参照 OFF・personal 指定・頭脳は簡易）。"""
     from sherpa import chat_service
     from sherpa.deps import _USERS_DIR
     events = list(chat_service.stream_message(
         None, message, "v1", conversation_id=cid, knowledge=False, personal=personal,
-        user_id=uid, users_dir=str(_USERS_DIR)))
+        user_id=uid, users_dir=str(_USERS_DIR), settings={**store.get_settings(uid), "agent": "simple"}))
     return next(e for e in events if e["type"] == "answer")
 
 
 # ===== テスト =====
 
-def test_personal_on_returns_personal_sources():
-    """personal=True で個人ファイル内ヒットが answer に含まれる。"""
+def test_personal_on_with_knowledge_off_on_simple_brain_stays_plain_chat():
+    """社内資料オフ・personal=True でも頭脳が簡易なら素の会話のまま（事前検索の出典を出さない）で、会話は個人扱いになる。"""
     if not _try_init():
         pytest.skip("DB down")
     sfx = _sfx()
     uid, pw = _mk_user(sfx)
     _login(uid, pw)
 
-    # ファイルをアップロード。
     content = b"UNIQUE_KEYWORD_XYZ_TESTING personal data"
     r = _upload(f"personal_{sfx}.txt", content)
     assert r.status_code == 200, r.text
 
-    # personal=True でチャット（ナレッジ参照OFF）。
     ans = _chat_personal(uid, "UNIQUE_KEYWORD_XYZ_TESTING", personal=True)
     answer_env = ans["message"]["answer"]
-
-    # personal_sources が含まれている（個人ファイルがヒットした場合）。
-    # ヒットが出ない場合は personal_sources がない/空になる可能性もあるが、
-    # 今回はアップロードしたファイルにキーワードが確実に含まれる。
-    assert "personal_sources" in answer_env, \
-        f"personal_sources が answer に含まれない: {answer_env.keys()}"
-    assert len(answer_env["personal_sources"]) > 0, "personal_sources が空"
-    assert answer_env["personal_sources"][0]["source"] == "個人ファイル内ヒット", \
-        f"source ラベルが不正: {answer_env['personal_sources'][0].get('source')}"
+    assert answer_env["lens"] == "chat"
+    assert not answer_env.get("personal_sources"), answer_env.get("personal_sources")
+    assert store.get_conversation_for_read(uid, ans["conversation_id"])["conversation"]["contains_personal_workspace"] is True
 
     _logout()
 

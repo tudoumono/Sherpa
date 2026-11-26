@@ -414,11 +414,11 @@ def verify_reconciliation(rows: list[dict], world: str, scope_paths) -> tuple[li
 # Codex は自分の MCP/直読の履歴を残さないため、主張自身が申告する `evidence_kinds`（`_parse_claim` が検証）を根拠種別の唯一の入力にする。
 # 確定に要る種別（ソースだけ）・「範囲に無い」の除外・確定の格下げ文言は API 側と同じ語彙・文言（`investigation_state.demote_reason_for_missing_kinds`）を使う。
 def _apply_codex_evidence_gate(claims: list[dict], *, lens: str, world: str, scope_paths,
-                               layer, personal_facts: str) -> tuple[list[dict], dict, tuple, tuple]:
+                               layer, personal_read: bool) -> tuple[list[dict], dict, tuple, tuple]:
     """確定主張のうち必須の根拠種別を欠くものを推定へ格下げし、ターン単位の不足も併せて返す。
     戻り値: `(格下げ済みの claims コピー, envelope 用 evidence_gate meta, ターン単位の不足種別, 範囲に無い種別)`。後2つは headline 注記（`_evidence_gate_note`）用の生の種別名。
     `unavailable`: 登録範囲にその種別が存在しない（該当なし＝不足に数えない）。
-    `personal_facts` があれば `log_config` は主張単位・ターン単位の両方で充足済みとして扱う。
+    `personal_read`（このターンで個人ファイルの道具で個人ファイルを読んだ）が真なら `log_config` は主張単位・ターン単位の両方で充足済みとして扱う。
     meta の `applied`: 未申告（`evidence_kinds is None`）の主張が無く、ターン単位の判定を確定的に行えたか（1件でも未申告があれば `missing_codes` は空のまま `applied=False`）。
     meta の `demoted`: 格下げした主張の件数。呼び出し側はこの件数で「一部の主張は推定に留めた」注記を前置する。
     """
@@ -427,9 +427,9 @@ def _apply_codex_evidence_gate(claims: list[dict], *, lens: str, world: str, sco
     unavailable = tuple(
         k for k in required_all
         if scope_kinds is not None and k not in scope_kinds[0]
-        and not (k in _KINDS_OUTSIDE_LEDGER and personal_facts))
+        and not (k in _KINDS_OUTSIDE_LEDGER and personal_read))
     required = tuple(k for k in required_all if k not in unavailable)
-    outside_ledger_seen = set(_KINDS_OUTSIDE_LEDGER) if personal_facts else set()
+    outside_ledger_seen = set(_KINDS_OUTSIDE_LEDGER) if personal_read else set()
     declared_union: set = set(outside_ledger_seen)
     any_undeclared = False
     demoted = 0

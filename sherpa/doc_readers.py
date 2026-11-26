@@ -206,6 +206,27 @@ def _zip_actual_size_error(f) -> dict | None:
     return None
 
 
+_PRECHECKED: "contextvars.ContextVar[set | None]" = contextvars.ContextVar("office_prechecked", default=None)
+
+
+@contextlib.contextmanager
+def precheck_once():
+    """このブロックの間、同じ実体（dev・ino・mtime・ctime・size が同じ）への zip の確かめを、通った 1 回だけにする（サイズの確かめは毎回）。"""
+    token = _PRECHECKED.set(set())
+    try:
+        yield
+    finally:
+        _PRECHECKED.reset(token)
+
+
+def _fd_key(f) -> tuple | None:
+    try:
+        st = os.fstat(f.fileno())
+    except (OSError, AttributeError, ValueError):
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+
+
 def _precheck_office(f) -> dict | None:
     """xlsx／docx／pptx 共通の事前検査（サイズ→zip 展開上限の見積もり→展開上限の実測）。reject する場合は `f` を close してエラー dict を返す。問題なければ None。
     検査が想定外の例外（zip 内のファイル名を含みうる）を送出しても、固定文言に丸めて member 名を外部へ漏らさない。
@@ -213,6 +234,10 @@ def _precheck_office(f) -> dict | None:
     if _too_big_fd(f):
         _close_quiet(f)
         return dict(_SIZE_ERROR)
+    done = _PRECHECKED.get()
+    key = _fd_key(f) if done is not None else None
+    if key is not None and key in done:
+        return None
     try:
         err = _zip_bounds_error(f)
         if err is not None:
@@ -225,6 +250,8 @@ def _precheck_office(f) -> dict | None:
     except Exception:
         _close_quiet(f)
         return dict(_OFFICE_OPEN_ERROR)
+    if key is not None:
+        done.add(key)
     return None
 
 

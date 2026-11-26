@@ -464,6 +464,45 @@ _PARAMS_FILE_HEAD = {"type": "object", "properties": {
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 
+# 個人ファイルの道具（本人の個人ファイルだけ・個人ファイルを使うターンだけ公開する）。実装は `parts/read/personal.py`。
+_DESC_PERSONAL_SEARCH = ("利用者本人の個人ファイル（アップロードしたファイル）を語で探す。terms の語のどれかを含む箇所を"
+                         "大文字小文字を区別せずに返す（社内資料は探さない＝社内資料は ripgrep_search／es_search）。"
+                         "テキストは行、Excel はシートとセル、Word は段落（paragraph）か表の行、PowerPoint はスライド、PDF はページの位置と、"
+                         "前後の数行を返す。id（例 'personal:メモ.txt'）を渡すとそのファイルだけを探す。"
+                         "hits[].id と loc をそのまま personal_read に渡して続きを読む。"
+                         "truncated:true は件数・大きさ・時間の上限で途中までしか返していない（語を絞るか id で絞る）。"
+                         "unreadable_files は読めなかったファイルの件数、partial_files は上限で一部しか探せなかったファイル（その分は未確認）。"
+                         f"{_ITEM_PARAM_NOTE}")
+_PARAMS_PERSONAL_SEARCH = {"type": "object", "properties": {
+    "terms": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "string"},
+              "description": "探す語（1〜10 個・どれかを含む箇所を返す）"},
+    "id": {"type": "string", "description": "探すファイルを 1 つに絞るときの id（personal: で始まる）。省略時は全部の個人ファイル"},
+    "item": _ITEM_PARAM_SCHEMA},
+    "required": ["terms"]}
+_DESC_PERSONAL_READ = ("利用者本人の個人ファイルを 1 つ読む（原本を直接読む）。id は personal: で始まる"
+                       "（personal_search の hits[].id か、依頼に添えた個人ファイルの一覧の名前に personal: を付けたもの）。"
+                       "テキストは start_line から最大 200 行（返す形は read_doc と同じ・続きは end_line+1）。"
+                       "Excel は sheet を省くとシート一覧、sheet（と range・max_rows・max_cols）でセル範囲（xlsx_range と同じ形）。"
+                       "Word は start・count で段落（docx_paragraphs と同じ形）、PowerPoint は pages でスライド（pptx_slides と同じ形）、"
+                       "PDF は pages（と text_offset）でページ（pdf_pages と同じ形）。切り詰めの印と続きの読み方はそれぞれの道具と同じ。"
+                       "回答で個人ファイルに触れるときは名前で示す（『参照した資料:』には書かない・Sherpa が個人ファイルの欄に出す）。"
+                       f"{_ITEM_PARAM_NOTE}")
+_PARAMS_PERSONAL_READ = {"type": "object", "properties": {
+    "id": {"type": "string", "description": "個人ファイルの id（personal: で始まる）"},
+    "start_line": {"type": "integer", "description": "テキストの読み始める行（既定1）"},
+    "sheet": {"type": "string", "description": "Excel のシート名（省くとシート一覧）"},
+    "range": {"type": "string", "description": "Excel のセル範囲（A1形式・例 'B3:D10'）"},
+    "max_rows": {"type": "integer", "description": "Excel の返す最大行数（既定200）"},
+    "max_cols": {"type": "integer", "description": "Excel の返す最大列数（既定50）"},
+    "start": {"type": "integer", "description": "Word の読み始める段落（既定0）"},
+    "count": {"type": "integer", "description": "Word の読む段落数（既定200）"},
+    "table_start": {"type": "integer", "description": "Word の表の開始インデックス（既定0）"},
+    "table_row_start": {"type": "integer", "description": "Word の各表の開始行（既定0）"},
+    "pages": {"type": "string", "description": "PowerPoint のスライド・PDF のページの指定（例 '3'・'2-5'）"},
+    "text_offset": {"type": "integer", "description": "PDF でページを1つだけ指定したときの本文の開始文字位置（next_text_offset の値）"},
+    "item": _ITEM_PARAM_SCHEMA},
+    "required": ["id"]}
+
 # `graph_neighbors`（`lens_service.neighbor_cards`）が内部で捕捉した障害の固定コード（本文・例外メッセージは持たない）。`_record_tool_result_error_code` が拾って `InvestigationState` へ反映する。
 _GRAPH_NEIGHBORS_RECOVERABLE_ERROR_CODE = "graph_unavailable"
 # グラフが使えないまま調べ続けたターンの通知（平文・専門用語ゼロ・資料名や本文を含まない）。
@@ -526,12 +565,12 @@ def _question_from_args(args: dict) -> dict:
 # search_truncated（利用統計「打ち切りの内訳」対象）: 検索系ツールが母集団の一部しか返さなかった呼び出し。`result["truncated"]` をそのまま数える（計測のみ・制限は変えない）。
 _SEARCH_TRUNCATED_TOOLS = frozenset({
     "ripgrep_search", "es_search", "glob_search", "graph_neighbors", "graph_resolve", "graph_impact",
-    "list_docs", "doc_outline"})
+    "list_docs", "doc_outline", "personal_search"})
 # tool_result_clipped（同）: 1 件あたりのバイト予算で本文が切り詰められた呼び出し。判定キーは `text_truncated`（read_around/read_doc の逐次クリップ・ripgrep_search/es_search のヒット単位クリップ）と `byte_clipped`（`_finish_reader_result` の原本読取ツール・compare_documents の diff）。読取ツールの `truncated` は行数/ページ数の上限でも立つため使わない。
 # ripgrep_search/es_search は `search_truncated` と `tool_result_clipped` が独立に起こりうる。doc_outline/graph_neighbors/list_docs/glob_search は `search_truncated` のみで数える。
 _BYTE_CLIP_TOOLS = frozenset({
     "read_around", "read_doc", "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides",
-    "pdf_pages", "file_head", "compare_documents", "ripgrep_search", "es_search"})
+    "pdf_pages", "file_head", "compare_documents", "ripgrep_search", "es_search", "personal_read"})
 
 
 def _post(url: str, headers: dict, body: dict, timeout: int = 90) -> dict:

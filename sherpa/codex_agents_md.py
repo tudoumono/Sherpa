@@ -114,6 +114,14 @@ _INVESTIGATE_SKILLS_PARAGRAPH = """\
   そのままソースからも探し、使われている場所を確かめる（ソースは es_search に入らず、言語によってはソース中の SQL はグラフにも出ない。グラフに無くても未使用とは言えない。資料だけを探すターンでは ripgrep_search はソースを返さないので、0 件を未使用としない）。
 """
 
+# 個人ファイルの道具を出すターンだけ足す段落（出さないターンでは個人ファイルに触れない）。
+_PERSONAL_TOOLS_PARAGRAPH = """\
+- このターンは利用者本人の個人ファイル（アップロードしたファイル）も調べてよい。個人ファイルは
+  personal_search（語で探す）・personal_read（読む）の道具だけで読む（シェルや他の道具では開かない）。
+  id は `personal:` で始まる。個人ファイルから分かったことは社内資料の根拠と分けて書き、回答では名前で示す。
+  個人ファイルは『参照した資料:』に書かない（Sherpa が個人ファイルの欄に出す）。
+"""
+
 # 本体自身のソース確認要件（深さに関わらず常時）。worker の主張を鵜呑みにせず、根拠のファイル:行を自分で開いて突き合わせる。
 # 根拠が無い主張は「未確認」に分類して残す。
 # `direct_read` で文言を切り替える（直読不可のターンで「直接読む」と指示しない）。
@@ -525,14 +533,30 @@ AGENTS_MD_PLAIN = """\
 """
 
 
+# 社内資料オフで個人ファイルの道具だけを持つターン専用の最小形。資料フォルダを読まない・個人ファイルは道具だけで読む・出典は Sherpa が個人の枠に出す。
+AGENTS_MD_PERSONAL = """\
+# Sherpa 共通ルール（Codex 実行時・個人ファイルだけ）
+
+- このターンは社内資料（資料フォルダ）を参照しない。資料フォルダ・派生フォルダ・このディレクトリの外・
+  秘匿名のファイル（.env／鍵／credentials 等）は読まない。
+- 利用者本人の個人ファイル（アップロードしたファイル）は personal_search（語で探す）・personal_read（読む）の
+  道具だけで読む（シェルでは開かない）。id は `personal:` で始まる。
+- 個人ファイルで確かめたことと、一般的な知識で答えたことは分けて書き、個人ファイルは回答の中で名前で示す。
+  確かめられなかったことはそう書く。
+- この依頼ではファイルを作らない（作業用のファイルは `.tmp/` の下に作る・終われば消える）。
+- 『参照した資料:』の行は書かない（読んだ個人ファイルは Sherpa が個人ファイルの欄に出す）。
+"""
+
+
 def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: bool = True,
                     output_schema_v2: bool = False, multi_agent: bool = False,
                     review_rounds: int = 0, layer: str | None = None,
                     review_rounds_escalation: bool = False, mcp: bool = True,
                     source_required: bool = False, plain: bool = False,
-                    ledger_style: str = "json", plan_review_cap: int = 1) -> None:
+                    ledger_style: str = "json", plan_review_cap: int = 1,
+                    personal_tools: bool = False, personal_only: bool = False) -> None:
     """authoring 直下へ AGENTS.md を書く（リクエストごと・冪等・上書き）。呼び出し側で try/except すること（書込失敗でも Codex 実行は継続できる＝fail-open）。
-    - `plain`: 真なら他の引数を見ず `AGENTS_MD_PLAIN` だけを書く。
+    - `plain`: 真なら他の引数を見ず `AGENTS_MD_PLAIN` だけを書く（`personal_only` も真なら `AGENTS_MD_PERSONAL`）。
     - `mcp`: MCP 接続（台帳ツール）があるか。無ければ台帳の段落を出さない。
     - `direct_read`／`layer`: ソース確認要件（`_source_verification_paragraph`・multi_agent 時は `_multi_agent_role_paragraph` も）の文言を切り替える。
       `direct_read` が偽のときは調査スキルへの誘導段落も落とす。
@@ -542,10 +566,11 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
     - 調査台帳の段落は `output_schema` と `output_schema_v2` が両方真のときだけ足す（multi_agent では `ledger_enabled` も渡す）。
     - `source_required`: provider.py の `required_extra` と同じ判定の値を渡す（ずれると完了できなくなる）。
     - `ledger_style`: `plan_gate`／`plan_main`（評価用・環境変数 `SHERPA_LEDGER_STYLE`）のとき、JSON 台帳と見直しの段落の代わりに調査計画書の段落を出す。`json` は従来どおり。
+    - `personal_tools`: 真（個人ファイルの道具を出すターン）のときだけ個人ファイルの道具の使い方の段落を足す。
     書込は一時ファイルを `O_CREAT|O_EXCL|O_NOFOLLOW` で作り `os.replace()` で置換する（既存 AGENTS.md が symlink でも指す先へ書かない）。
     """
     if plain:
-        content = AGENTS_MD_PLAIN
+        content = AGENTS_MD_PERSONAL if personal_only else AGENTS_MD_PLAIN
     else:
         structured_paragraph = ""
         if output_schema:
@@ -557,6 +582,7 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
             structured_paragraph += _CLAIM_ITEM_IDS_LEDGER if _ledger_enabled else _CLAIM_ITEM_IDS_EMPTY
         content = (AGENTS_MD + _source_verification_paragraph(direct_read, layer)
                    + (_INVESTIGATE_SKILLS_PARAGRAPH if direct_read else "")
+                   + (_PERSONAL_TOOLS_PARAGRAPH if personal_tools else "")
                    + structured_paragraph
                    + (_investigation_ledger_paragraph(direct_read, layer, source_required)
                       + _INVESTIGATION_REVIEW_PARAGRAPH
